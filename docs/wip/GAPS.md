@@ -1,6 +1,6 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
-> **The anchor kills live daemons on a busy machine (found 2026-11-06, audit step 7; open, to be assigned).** Under the
+> **The anchor kills live daemons on a busy machine (found 2026-11-06, audit step 7; fixed by A-228, Windows CI owed).** Under the
 > A/B bar's load, two spinners a logical CPU (8 on CI's 4-CPU Windows runners), the anchor killed daemons that were
 > alive and serving because their heartbeat lapsed its 1,000 ms liveness budget. A busy machine is the normal case
 > (Ada's rule), so a starved but live daemon must not be killed.
@@ -26,7 +26,21 @@
 >   42080252187). Neither that arm nor the normal one lapsed there, each alone beside the spinners. It was not adopted
 >   because it cost x86_64's loaded p50s. **The heartbeat alone at a raised priority was never tried, and cannot be as
 >   built:** it is a task on a shard, not a thread of its own.
-> - Not fixed on the Step 7 branches; to be assigned.
+> - **Fixed by A-228** (2026-11-06): the beat is written by an owned watchdog thread pinned to no core, which judges
+>   each shard in its own CPU time (A-65's rule): stuck once a window passes with no step and no CPU progress, or with a
+>   window's CPU run; starved otherwise, and alive. The anchor holds the beat to the window plus its own measured
+>   lateness p99. Tests, each failing first where it can: `crates/server/tests/liveness.rs` — a starved control-shard
+>   poll gapped the beat 1.53 s on main and 0.26 s with A-228 (macOS arm64, load 54–70); a wedged non-control shard
+>   and a spinning one never stopped main's beat, and with A-228 stop it (1.007 s after the wedge; after 1,063 ms of the
+>   spinner's CPU, 2.98 s of wall at load 56). A half-window block and two spinners a core beside the daemon keep the
+>   beat under the window on both. The real-process frozen-daemon test still kills at the lapse (1,045 ms old against a
+>   1,044 ms bound: the window plus a 44 ms lateness p99). Owed: the Windows runners under the bar's load (diag branch),
+>   then macOS and Linux beside them. Record: `docs/bugs/2026-11-06-the-anchor-killed-live-daemons-on-a-busy-machine.md`.
+>
+> **`LIVENESS_BUDGET_NS` is still a fixed second (R3 debt, 2026-11-06; follow-on, not A-228).** It is A-228's window and
+> the reply-deadline unit of about 60 files (the client's and the server's deadlines, observations, the scatter's room
+> wait). A-228 judges the window in each shard's own CPU time, which keeps a starved daemon alive, but the window's length
+> is still the `Shape:` constant "a second", not measured.
 
 > **A-190's purge client leaves the daemon's process (2026-11-06, fixed); the sweep for the rest (open).** No daemon
 > thread opens a path on a volume the daemon serves (§4.6). The coherent purge's opens, writes and reads now run in a
