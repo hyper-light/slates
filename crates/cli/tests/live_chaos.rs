@@ -1287,10 +1287,41 @@ fn judge_healed(
   verdict.check("NoLoss", no_loss(owner, volume, outcomes));
 }
 
+/// Shape: the bound a healed candidate catches up within, from its resume to holding the owner's head at that moment:
+/// one liveness budget for the owner to find its old link dead and dial afresh (`live_ship::lose_links`, the record
+/// link's handshake within the same budget), and one more for the exchange that catches it up (the entries it lacks,
+/// or an install of the last whole record when it lags past the retained tail).
+const CATCH_UP: Duration = Duration::from_nanos(2 * slates_server::daemon::LIVENESS_BUDGET_NS);
+
+/// Waits for `candidate` to hold `owner`'s head as it stood at the call: how long that took, or `None` past twice the
+/// catch-up bound (so a failure shows how far past it the candidate was).
+fn caught_up_after(owner: &str, candidate: &str, volume: &str) -> Option<Duration> {
+  let began = Instant::now();
+  let head = |instance: &str, holding: bool| {
+    live_states(instance, volume)
+      .unwrap_or_default()
+      .into_iter()
+      .find(|state| state.holding == holding)
+      .and_then(|state| state.head)
+  };
+  let target = head(owner, false)?;
+  while began.elapsed() < 2 * CATCH_UP {
+    if head(candidate, true).is_some_and(|held| held >= target) {
+      return Some(began.elapsed());
+    }
+    pause();
+  }
+  None
+}
+
 /// A-200 with candidates partitioned in turn mid-stream: do stream writes to a live volume and stop each candidate's
 /// process (SIGSTOP) for [`PARTITION`] in turn, the stream running throughout, then resume it. Expect every write
 /// acknowledged (durable through whichever candidate answers), none lost, both candidates caught up once healed, and one
-/// chain identity at every head any copy reported.
+/// chain identity at every head any copy reported; and, since one candidate is always reachable, no write waits for
+/// the stopped one (each under the liveness budget, which a wait on a holder that never answers lasts), and each healed
+/// candidate holds the owner's head at its resume within [`CATCH_UP`]. Before the holders were shipped to concurrently,
+/// a write waited up to a liveness budget for the stopped holder before the healthy one was asked (2026-11-06: p50
+/// 1.01 s, p99 5.5 s in one run; a healed candidate at head 45 against the owner's 130 for over 40 s in another).
 #[test]
 fn candidates_partitioned_in_turn_mid_stream_lose_nothing() {
   /// Shape: how long each candidate is partitioned: past the liveness budget (1 s), so its sessions are found dead.
@@ -1304,6 +1335,7 @@ fn candidates_partitioned_in_turn_mid_stream_lose_nothing() {
   let candidates = candidates_of(&fleet, owner_index);
   let volume = create_volume(&owner, "rolling", true);
   let mut verdict = Verdict::new("candidates partitioned in turn mid-stream");
+  let mut catch_ups = Vec::new();
   let (outcomes, samples) = stream_through(
     &fleet.instances,
     &owner,
@@ -1316,11 +1348,13 @@ fn candidates_partitioned_in_turn_mid_stream_lose_nothing() {
         let stopped = began.elapsed();
         sleep(PARTITION);
         fleet.resume(index);
+        let resumed = began.elapsed();
+        let caught = caught_up_after(&owner, &fleet.instances[index], &volume);
         verdict.note(format!(
-          "{} partitioned from {stopped:?} to {:?}",
+          "{} partitioned from {stopped:?} to {resumed:?}, caught up after {caught:?}",
           fleet.instances[index],
-          began.elapsed()
         ));
+        catch_ups.push((fleet.instances[index].clone(), caught));
       }
       after_writes(&owner, &volume, BETWEEN_EVENTS);
     },
@@ -1329,6 +1363,23 @@ fn candidates_partitioned_in_turn_mid_stream_lose_nothing() {
   verdict.check(
     "every write acknowledged",
     refused.iter().map(|o| format!("{o:?}")).collect(),
+  );
+  let liveness = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
+  verdict.check(
+    "no write waited for the stopped candidate",
+    outcomes
+      .iter()
+      .filter(|outcome| outcome.took >= liveness)
+      .map(|outcome| format!("{outcome:?}"))
+      .collect(),
+  );
+  verdict.check(
+    "each healed candidate caught up within the bound",
+    catch_ups
+      .iter()
+      .filter(|(_, caught)| caught.is_none_or(|caught| caught > CATCH_UP))
+      .map(|(candidate, caught)| format!("{candidate}: {caught:?} against {CATCH_UP:?}"))
+      .collect(),
   );
   judge_healed(
     &mut verdict,
