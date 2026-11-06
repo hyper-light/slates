@@ -1,0 +1,290 @@
+## probe separate process 1, 2026-11-06T01:43:46Z
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded twox-hash v2.1.4
+  Downloaded find-msvc-tools v0.1.12
+  Downloaded serde_core v1.0.229
+  Downloaded serde v1.0.229
+  Downloaded shlex v2.0.1
+  Downloaded zmij v1.0.23
+  Downloaded cfg-if v1.0.4
+  Downloaded tinyvec_macros v0.1.1
+  Downloaded pkg-config v0.3.34
+  Downloaded proc-macro2 v1.0.107
+  Downloaded lz4_flex v0.11.6
+  Downloaded zstd v0.13.3
+  Downloaded getrandom v0.4.3
+  Downloaded memmap2 v0.9.11
+  Downloaded unicode-ident v1.0.24
+  Downloaded cc v1.4.5
+  Downloaded blake3 v1.8.7
+  Downloaded syn v3.0.5
+  Downloaded syn v2.0.119
+  Downloaded zstd-sys v2.1.0+zstd.1.5.7
+  Downloaded windows_aarch64_msvc v0.53.1
+  Downloaded tinyvec v1.13.2
+  Downloaded itoa v1.0.18
+  Downloaded serde_derive v1.0.229
+  Downloaded constant_time_eq v0.4.2
+  Downloaded windows-targets v0.53.5
+  Downloaded zstd-safe v7.3.0
+  Downloaded memchr v2.8.3
+  Downloaded serde_json v1.0.151
+  Downloaded unicode-normalization v0.1.25
+  Downloaded arrayvec v0.7.8
+  Downloaded quote v1.0.47
+  Downloaded windows-sys v0.60.2
+  Downloaded jobserver v0.1.35
+   Compiling getrandom v0.4.3
+   Compiling cfg-if v1.0.4
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.12
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling serde_core v1.0.229
+   Compiling windows_aarch64_msvc v0.53.1
+   Compiling zmij v1.0.23
+   Compiling jobserver v0.1.35
+   Compiling cc v1.4.5
+   Compiling serde_json v1.0.151
+   Compiling arrayvec v0.7.8
+   Compiling syn v3.0.5
+   Compiling serde v1.0.229
+   Compiling constant_time_eq v0.4.2
+   Compiling windows-targets v0.53.5
+   Compiling memchr v2.8.3
+   Compiling blake3 v1.8.7
+   Compiling itoa v1.0.18
+   Compiling windows-sys v0.60.2
+   Compiling serde_derive v1.0.229
+   Compiling pkg-config v0.3.34
+   Compiling memmap2 v0.9.11
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+   Compiling syn v2.0.119
+   Compiling zstd-safe v7.3.0
+   Compiling tinyvec_macros v0.1.1
+   Compiling twox-hash v2.1.4
+   Compiling lz4_flex v0.11.6
+   Compiling tinyvec v1.13.2
+   Compiling unicode-normalization v0.1.25
+   Compiling slates-image v0.1.0 (C:\a\slates\slates\crates\image)
+   Compiling slates-machine v0.1.0 (C:\a\slates\slates\crates\machine)
+   Compiling slates-wire-derive v0.1.0 (C:\a\slates\slates\crates\wire-derive)
+   Compiling slates-mem v0.1.0 (C:\a\slates\slates\crates\mem)
+   Compiling slates-wire v0.1.0 (C:\a\slates\slates\crates\wire)
+   Compiling slates-rt v0.1.0 (C:\a\slates\slates\crates\rt)
+   Compiling slates-ipc v0.1.0 (C:\a\slates\slates\crates\ipc)
+   Compiling slates-anchor v0.1.0 (C:\a\slates\slates\crates\anchor)
+   Compiling zstd v0.13.3
+   Compiling slates-db v0.1.0 (C:\a\slates\slates\crates\db)
+   Compiling slates-archive v0.1.0 (C:\a\slates\slates\crates\archive)
+   Compiling slates-vfs v0.1.0 (C:\a\slates\slates\crates\vfs)
+   Compiling slates-bridge-core v0.1.0 (C:\a\slates\slates\crates\bridge-core)
+   Compiling slates-bridge-winfsp v0.1.0 (C:\a\slates\slates\crates\bridge-winfsp)
+    Finished `release` profile [optimized] target(s) in 1m 15s
+     Running unittests src\lib.rs (target-separate\release\deps\slates_bridge_winfsp-16999a794a6af591.exe)
+
+running 3 tests
+test probe::tests::a_probe_whose_open_fails_ends_its_workers_and_leaves_no_volume ... ok
+test probe::tests::a_stopped_probe_ends_at_its_first_open_and_leaves_no_volume ... slates-winfsp: the receive-worker probe stopped after 0 ms, its worker told to end
+WINFSP PROBE: a stopped probe ended in 397.9µs
+ok
+test probe::tests::the_probe_measures_every_count_in_every_round_and_derives_one_of_them ... slates-winfsp: receive workers = 1: median open-and-close of each round, in ns, by waiting workers from one: [[96300, 114600, 103200, 97800, 105900, 106400, 100000, 96600, 95400], [97200, 101100, 104300, 106100, 102700, 101300, 99700, 97800, 100700]]; more workers only where every round beats every round of fewer; probe took 418 ms
+WINFSP PROBE: count 1 from medians [[96300, 114600, 103200, 97800, 105900, 106400, 100000, 96600, 95400], [97200, 101100, 104300, 106100, 102700, 101300, 99700, 97800, 100700]] ns
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 86 filtered out; finished in 1.43s
+
+## probe separate process 1 exit 0
+## probe separate process 2, 2026-11-06T01:45:03Z
+    Finished `release` profile [optimized] target(s) in 0.15s
+     Running unittests src\lib.rs (target-separate\release\deps\slates_bridge_winfsp-16999a794a6af591.exe)
+
+running 3 tests
+test probe::tests::a_probe_whose_open_fails_ends_its_workers_and_leaves_no_volume ... ok
+test probe::tests::a_stopped_probe_ends_at_its_first_open_and_leaves_no_volume ... slates-winfsp: the receive-worker probe stopped after 0 ms, its worker told to end
+WINFSP PROBE: a stopped probe ended in 389.9µs
+ok
+test probe::tests::the_probe_measures_every_count_in_every_round_and_derives_one_of_them ... slates-winfsp: receive workers = 1: median open-and-close of each round, in ns, by waiting workers from one: [[98500, 104500, 104100, 103100, 100300, 98400, 98100, 95600, 93700], [101100, 105000, 102600, 102200, 97000, 97000, 98400, 97100, 95200]]; more workers only where every round beats every round of fewer; probe took 410 ms
+WINFSP PROBE: count 1 from medians [[98500, 104500, 104100, 103100, 100300, 98400, 98100, 95600, 93700], [101100, 105000, 102600, 102200, 97000, 97000, 98400, 97100, 95200]] ns
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 86 filtered out; finished in 1.41s
+
+## probe separate process 2 exit 0
+## probe separate process 3, 2026-11-06T01:45:04Z
+    Finished `release` profile [optimized] target(s) in 0.14s
+     Running unittests src\lib.rs (target-separate\release\deps\slates_bridge_winfsp-16999a794a6af591.exe)
+
+running 3 tests
+test probe::tests::a_probe_whose_open_fails_ends_its_workers_and_leaves_no_volume ... ok
+test probe::tests::a_stopped_probe_ends_at_its_first_open_and_leaves_no_volume ... slates-winfsp: the receive-worker probe stopped after 0 ms, its worker told to end
+WINFSP PROBE: a stopped probe ended in 399.3µs
+ok
+test probe::tests::the_probe_measures_every_count_in_every_round_and_derives_one_of_them ... slates-winfsp: receive workers = 1: median open-and-close of each round, in ns, by waiting workers from one: [[94300, 113500, 99300, 98000, 103800, 106200, 102600, 94400, 97600], [97200, 103400, 95400, 100200, 98800, 92700, 100300, 98800, 99600]]; more workers only where every round beats every round of fewer; probe took 411 ms
+WINFSP PROBE: count 1 from medians [[94300, 113500, 99300, 98000, 103800, 106200, 102600, 94400, 97600], [97200, 103400, 95400, 100200, 98800, 92700, 100300, 98800, 99600]] ns
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 86 filtered out; finished in 1.43s
+
+## probe separate process 3 exit 0
+## probe separate process 4, 2026-11-06T01:45:06Z
+    Finished `release` profile [optimized] target(s) in 0.15s
+     Running unittests src\lib.rs (target-separate\release\deps\slates_bridge_winfsp-16999a794a6af591.exe)
+
+running 3 tests
+test probe::tests::a_probe_whose_open_fails_ends_its_workers_and_leaves_no_volume ... ok
+test probe::tests::a_stopped_probe_ends_at_its_first_open_and_leaves_no_volume ... slates-winfsp: the receive-worker probe stopped after 0 ms, its worker told to end
+WINFSP PROBE: a stopped probe ended in 389.8µs
+ok
+test probe::tests::the_probe_measures_every_count_in_every_round_and_derives_one_of_them ... slates-winfsp: receive workers = 1: median open-and-close of each round, in ns, by waiting workers from one: [[91900, 97300, 94300, 96600, 95800, 92700, 96400, 93100, 92900], [89000, 96800, 96100, 97600, 95600, 93000, 93900, 95700, 96300]]; more workers only where every round beats every round of fewer; probe took 391 ms
+WINFSP PROBE: count 1 from medians [[91900, 97300, 94300, 96600, 95800, 92700, 96400, 93100, 92900], [89000, 96800, 96100, 97600, 95600, 93000, 93900, 95700, 96300]] ns
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 86 filtered out; finished in 1.41s
+
+## probe separate process 4 exit 0
+## probe separate process 5, 2026-11-06T01:45:08Z
+    Finished `release` profile [optimized] target(s) in 0.15s
+     Running unittests src\lib.rs (target-separate\release\deps\slates_bridge_winfsp-16999a794a6af591.exe)
+
+running 3 tests
+test probe::tests::a_probe_whose_open_fails_ends_its_workers_and_leaves_no_volume ... ok
+test probe::tests::a_stopped_probe_ends_at_its_first_open_and_leaves_no_volume ... slates-winfsp: the receive-worker probe stopped after 0 ms, its worker told to end
+WINFSP PROBE: a stopped probe ended in 386.2µs
+ok
+test probe::tests::the_probe_measures_every_count_in_every_round_and_derives_one_of_them ... slates-winfsp: receive workers = 1: median open-and-close of each round, in ns, by waiting workers from one: [[95700, 109800, 99500, 99400, 98800, 105900, 97000, 94200, 95000], [100400, 103200, 101700, 101200, 96800, 98300, 95100, 96000, 95900]]; more workers only where every round beats every round of fewer; probe took 408 ms
+WINFSP PROBE: count 1 from medians [[95700, 109800, 99500, 99400, 98800, 105900, 97000, 94200, 95000], [100400, 103200, 101700, 101200, 96800, 98300, 95100, 96000, 95900]] ns
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 86 filtered out; finished in 1.43s
+
+## probe separate process 5 exit 0
+## probe combined process 1, 2026-11-06T01:45:10Z
+   Compiling getrandom v0.4.3
+   Compiling cfg-if v1.0.4
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.12
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling jobserver v0.1.35
+   Compiling serde_core v1.0.229
+   Compiling cc v1.4.5
+   Compiling windows_aarch64_msvc v0.53.1
+   Compiling zmij v1.0.23
+   Compiling syn v3.0.5
+   Compiling serde_json v1.0.151
+   Compiling serde v1.0.229
+   Compiling arrayvec v0.7.8
+   Compiling constant_time_eq v0.4.2
+   Compiling windows-targets v0.53.5
+   Compiling blake3 v1.8.7
+   Compiling memchr v2.8.3
+   Compiling itoa v1.0.18
+   Compiling windows-sys v0.60.2
+   Compiling pkg-config v0.3.34
+   Compiling serde_derive v1.0.229
+   Compiling memmap2 v0.9.11
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+   Compiling syn v2.0.119
+   Compiling zstd-safe v7.3.0
+   Compiling twox-hash v2.1.4
+   Compiling tinyvec_macros v0.1.1
+   Compiling tinyvec v1.13.2
+   Compiling lz4_flex v0.11.6
+   Compiling unicode-normalization v0.1.25
+   Compiling slates-image v0.1.0 (C:\a\_temp\combined\crates\image)
+   Compiling slates-wire-derive v0.1.0 (C:\a\_temp\combined\crates\wire-derive)
+   Compiling slates-machine v0.1.0 (C:\a\_temp\combined\crates\machine)
+   Compiling slates-mem v0.1.0 (C:\a\_temp\combined\crates\mem)
+   Compiling slates-wire v0.1.0 (C:\a\_temp\combined\crates\wire)
+   Compiling slates-rt v0.1.0 (C:\a\_temp\combined\crates\rt)
+   Compiling zstd v0.13.3
+   Compiling slates-ipc v0.1.0 (C:\a\_temp\combined\crates\ipc)
+   Compiling slates-archive v0.1.0 (C:\a\_temp\combined\crates\archive)
+   Compiling slates-vfs v0.1.0 (C:\a\_temp\combined\crates\vfs)
+   Compiling slates-anchor v0.1.0 (C:\a\_temp\combined\crates\anchor)
+   Compiling slates-db v0.1.0 (C:\a\_temp\combined\crates\db)
+   Compiling slates-bridge-core v0.1.0 (C:\a\_temp\combined\crates\bridge-core)
+   Compiling slates-bridge-winfsp v0.1.0 (C:\a\_temp\combined\crates\bridge-winfsp)
+    Finished `release` profile [optimized] target(s) in 1m 07s
+     Running unittests src\lib.rs (C:\a\slates\slates/target-combined\release\deps\slates_bridge_winfsp-16999a794a6af591.exe)
+
+running 3 tests
+test probe::tests::a_probe_whose_open_fails_ends_its_workers_and_leaves_no_volume ... ok
+test probe::tests::a_stopped_probe_ends_at_its_first_open_and_leaves_no_volume ... slates-winfsp: the receive-worker probe stopped after 0 ms, its worker told to end
+WINFSP PROBE: a stopped probe ended in 394µs
+ok
+test probe::tests::the_probe_measures_every_count_in_every_round_and_derives_one_of_them ... slates-winfsp: receive workers = 1: median open-and-close of each round, in ns, by waiting workers from one: [[101500, 106000, 107000, 110800, 104600, 107900, 105100, 108100, 105100], [97300, 96900, 102400, 100200, 97200, 96000, 100100, 100000, 97800]]; more workers only where every round beats every round of fewer; probe took 421 ms
+WINFSP PROBE: count 1 from medians [[101500, 106000, 107000, 110800, 104600, 107900, 105100, 108100, 105100], [97300, 96900, 102400, 100200, 97200, 96000, 100100, 100000, 97800]] ns
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 87 filtered out; finished in 1.44s
+
+## probe combined process 1 exit 0
+## probe combined process 2, 2026-11-06T01:46:19Z
+    Finished `release` profile [optimized] target(s) in 0.15s
+     Running unittests src\lib.rs (C:\a\slates\slates/target-combined\release\deps\slates_bridge_winfsp-16999a794a6af591.exe)
+
+running 3 tests
+test probe::tests::a_probe_whose_open_fails_ends_its_workers_and_leaves_no_volume ... ok
+test probe::tests::a_stopped_probe_ends_at_its_first_open_and_leaves_no_volume ... slates-winfsp: the receive-worker probe stopped after 0 ms, its worker told to end
+WINFSP PROBE: a stopped probe ended in 360.9µs
+ok
+test probe::tests::the_probe_measures_every_count_in_every_round_and_derives_one_of_them ... slates-winfsp: receive workers = 1: median open-and-close of each round, in ns, by waiting workers from one: [[102900, 104100, 106600, 100200, 103800, 100000, 98100, 95500, 100500], [93000, 95400, 97200, 94600, 91000, 92600, 87700, 90400, 96400]]; more workers only where every round beats every round of fewer; probe took 399 ms
+WINFSP PROBE: count 1 from medians [[102900, 104100, 106600, 100200, 103800, 100000, 98100, 95500, 100500], [93000, 95400, 97200, 94600, 91000, 92600, 87700, 90400, 96400]] ns
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 87 filtered out; finished in 1.41s
+
+## probe combined process 2 exit 0
+## probe combined process 3, 2026-11-06T01:46:21Z
+    Finished `release` profile [optimized] target(s) in 0.14s
+     Running unittests src\lib.rs (C:\a\slates\slates/target-combined\release\deps\slates_bridge_winfsp-16999a794a6af591.exe)
+
+running 3 tests
+test probe::tests::a_probe_whose_open_fails_ends_its_workers_and_leaves_no_volume ... ok
+test probe::tests::a_stopped_probe_ends_at_its_first_open_and_leaves_no_volume ... slates-winfsp: the receive-worker probe stopped after 0 ms, its worker told to end
+WINFSP PROBE: a stopped probe ended in 356.1µs
+ok
+test probe::tests::the_probe_measures_every_count_in_every_round_and_derives_one_of_them ... slates-winfsp: receive workers = 2: median open-and-close of each round, in ns, by waiting workers from one: [[95900, 97300, 99500, 98800, 99700, 99200, 96400, 95500, 96800], [90900, 89500, 89300, 92900, 94600, 90200, 91300, 91800, 90300]]; more workers only where every round beats every round of fewer; probe took 387 ms
+WINFSP PROBE: count 2 from medians [[95900, 97300, 99500, 98800, 99700, 99200, 96400, 95500, 96800], [90900, 89500, 89300, 92900, 94600, 90200, 91300, 91800, 90300]] ns
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 87 filtered out; finished in 1.42s
+
+## probe combined process 3 exit 0
+## probe combined process 4, 2026-11-06T01:46:23Z
+    Finished `release` profile [optimized] target(s) in 0.14s
+     Running unittests src\lib.rs (C:\a\slates\slates/target-combined\release\deps\slates_bridge_winfsp-16999a794a6af591.exe)
+
+running 3 tests
+test probe::tests::a_probe_whose_open_fails_ends_its_workers_and_leaves_no_volume ... ok
+test probe::tests::a_stopped_probe_ends_at_its_first_open_and_leaves_no_volume ... slates-winfsp: the receive-worker probe stopped after 0 ms, its worker told to end
+WINFSP PROBE: a stopped probe ended in 352.6µs
+ok
+test probe::tests::the_probe_measures_every_count_in_every_round_and_derives_one_of_them ... slates-winfsp: receive workers = 2: median open-and-close of each round, in ns, by waiting workers from one: [[97300, 97500, 95700, 100000, 99700, 105300, 105200, 101000, 98700], [89400, 88300, 89100, 90200, 88000, 89500, 93100, 91100, 92800]]; more workers only where every round beats every round of fewer; probe took 389 ms
+WINFSP PROBE: count 2 from medians [[97300, 97500, 95700, 100000, 99700, 105300, 105200, 101000, 98700], [89400, 88300, 89100, 90200, 88000, 89500, 93100, 91100, 92800]] ns
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 87 filtered out; finished in 1.42s
+
+## probe combined process 4 exit 0
+## probe combined process 5, 2026-11-06T01:46:24Z
+    Finished `release` profile [optimized] target(s) in 0.15s
+     Running unittests src\lib.rs (C:\a\slates\slates/target-combined\release\deps\slates_bridge_winfsp-16999a794a6af591.exe)
+
+running 3 tests
+test probe::tests::a_probe_whose_open_fails_ends_its_workers_and_leaves_no_volume ... ok
+test probe::tests::a_stopped_probe_ends_at_its_first_open_and_leaves_no_volume ... slates-winfsp: the receive-worker probe stopped after 0 ms, its worker told to end
+WINFSP PROBE: a stopped probe ended in 335.8µs
+ok
+test probe::tests::the_probe_measures_every_count_in_every_round_and_derives_one_of_them ... slates-winfsp: receive workers = 1: median open-and-close of each round, in ns, by waiting workers from one: [[92600, 97800, 96700, 98100, 98800, 96800, 96900, 95600, 94600], [86800, 88400, 91300, 91100, 94300, 90600, 91400, 92200, 87900]]; more workers only where every round beats every round of fewer; probe took 383 ms
+WINFSP PROBE: count 1 from medians [[92600, 97800, 96700, 98100, 98800, 96800, 96900, 95600, 94600], [86800, 88400, 91300, 91100, 94300, 90600, 91400, 92200, 87900]] ns
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 87 filtered out; finished in 1.41s
+
+## probe combined process 5 exit 0
