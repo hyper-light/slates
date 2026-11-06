@@ -9,6 +9,20 @@
 >   records, so a resend after a restart was answered `DuplicateRequest` for an applied create. The watermark now
 >   stops below the first request with no reply (`an_acknowledgement_never_covers_a_request_still_awaited`;
 >   `docs/bugs/2026-11-06-an-acknowledgement-covered-requests-still-awaited.md`).
+> - **Forwards to one owner went one at a time** (the network load test's fault one, below). The origin borrowed
+>   the session to the owner for each forward's round trip, and the owner served one request of a session at a
+>   time. Now they share the session through a per-peer lane, and the owner runs each forwarded verb on its own
+>   task. A forward to a free shard, behind one waiting on a held shard: 471.8 ms before, 1.77 to 2.41 ms after
+>   (`forwards_to_one_owner_never_wait_behind_each_other`;
+>   `docs/bugs/2026-11-06-forwards-to-one-owner-went-one-at-a-time.md`). A sibling is fixed with it: three
+>   borrowers abandoned the session's newest exchange on a failure, which on a shared session can be a forward's
+>   (`Endpoint::abandon_begun_since`).
+>
+> Sanity rungs, Mac, in-process daemon, loaded arm (load 46 to 62 on 18 CPUs, the fleet suite running): 10 and 100
+> clients over `kernel/`, at one and ten logical clients a connection, oracle and own files 0 failures, no
+> backpressure, no starved clients. The latencies measure the box, not slates: the worker threads were descheduled
+> for up to 147 ms between drains of one ring (`max_drain_gap_ns`), so the quiet arm is on the Studio. Seen, not
+> yet explained: `rebase_conflicts` was exactly 100 at 100 clients in both forms (0 at 10).
 
 > **The anchor kills live daemons on a busy machine (found 2026-11-06, audit step 7; open, to be assigned).** Under the
 > A/B bar's load, two spinners a logical CPU (8 on CI's 4-CPU Windows runners), the anchor killed daemons that were
@@ -87,7 +101,7 @@
 >   f = 0, loopback; the harness at the client node against the server's green over `kernel/`):** 100, 300 and 1,000
 >   clients, the oracle and every own file 0 failures. The server pays about 1.2 to 1.4 MB a client at peak (121,096 to
 >   484,900 KiB at 300), the client node about 64 to 100 KB a local client (30,180 to 59,828 KiB at 300). Three faults:
->   - **Forwards to one owner go one at a time.** `forward_batch_over_leader_session` (`crates/server/src/fleet.rs`)
+>   - **Forwards to one owner go one at a time** (fixed 2026-11-06 by agents/loadtest-scale, above). `forward_batch_over_leader_session` (`crates/server/src/fleet.rs`)
 >     takes the peer's one session for a forward's whole round trip, so a client node's verbs to its server serialize:
 >     a forwarded `CreateWork` p50 1.71 s at 300 clients and 4.30 s at 1,000 (45 µs on the owner's own node).
 >   - **A forward queued past the failover bound is refused `OwnerUnreachable`** though the owner is alive and served

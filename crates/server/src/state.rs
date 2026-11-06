@@ -629,6 +629,8 @@ pub struct ShardState {
   pub nfs_service: crate::nfs::ServiceTimes,
   /// The NFSv4.1 back channels of the connections this shard serves (`crate::callback`).
   pub(crate) callbacks: crate::callback::Callbacks,
+  /// The forwards to each peer, multiplexed over its record session (`crate::forward_lane`; the control shard's).
+  pub(crate) forward_lanes: crate::forward_lane::ForwardLanes,
   /// The staging buffers of edits too large for one request, for the works this shard owns (`crate::staging`).
   pub(crate) staging: crate::staging::Staging,
   /// This start's random nonce, announced with its derived member id on SWIM contact (§4.8).

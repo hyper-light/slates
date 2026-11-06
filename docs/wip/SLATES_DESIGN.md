@@ -5201,6 +5201,16 @@ context. A name is not a host pathname or a bearer capability. Fleet-wide enumer
 owners, each answer linearizable at its owner and the whole labelled with the configuration
 version.
 
+> **Status (2026-11-06, forwards to one owner share its session).** A forward borrowed the record session to its owner
+> for its whole round trip, and the owner served one request of a session at a time. So a client node's forwards
+> went one at a time: a forwarded `CreateWork` took 4.30 s at the median at 1,000 clients, against 45 µs on the
+> owner. A forward waiting on a held owner shard made a forward to a free shard of the same owner wait 471.8 ms.
+> Now each peer has a forward lane in the control shard's state. The waiting forwarders drive it a turn at a time,
+> each turn beginning every queued forward as its own exchange on the session and taking every reply that has come;
+> between turns the session is free for other borrowers. The owner runs each forwarded verb on its own task. The same
+> read now takes 1.8 to 2.4 ms (`crate::forward_lane`; `forwards_to_one_owner_never_wait_behind_each_other`;
+> `docs/bugs/2026-11-06-forwards-to-one-owner-went-one-at-a-time.md`).
+
 > **Status (2026-10-07, same-region lookups).** A lookup by id now reaches its creator from any node of the
 > creator's own region, not only from another region. Before, the server forwarded only a volume homed in another
 > region, and a client of another node in the owner's region was answered `NotFound` (found on two Docker
