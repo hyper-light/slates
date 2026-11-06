@@ -40,6 +40,17 @@ thread_local! {
   static CURRENT_HINT: Cell<u64> = const { Cell::new(0) };
   /// Void Cleanup/Close callbacks still carry their typed refusal into this operation's kernel response.
   static TERMINAL_REFUSAL: Cell<i32> = const { Cell::new(0) };
+  /// Set while recovery runs a dead daemon's captured Cleanup or Close again, so the shard can find its effect done.
+  static REPLAYING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Diagnostics only (diag-winfsp-overlap-32): the replayed Cleanups and Closes recovery's responses refused.
+pub(crate) static DIAG_REPLAY_REFUSED: std::sync::atomic::AtomicU64 =
+  std::sync::atomic::AtomicU64::new(0);
+
+/// Whether this worker is replaying a dead daemon's captured Cleanup or Close (`crate::host::Request`).
+pub(crate) fn replaying() -> bool {
+  REPLAYING.get()
 }
 
 pub(crate) fn private_path(path: &str) -> Result<Option<crate::purge::PrivatePath>, i32> {
@@ -394,6 +405,16 @@ fn operation(
   inflight::finish_response(&mut packet.0, status).map_err(WinFspError::Capture)
 }
 
+/// Counts a replayed Cleanup's or Close's response whose status is not success (diagnostics only).
+fn count_replay_refusal(response: &[u8]) {
+  if response
+    .get(STATUS_AT..STATUS_END)
+    .is_some_and(|status| status.iter().any(|byte| *byte != 0))
+  {
+    DIAG_REPLAY_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+  }
+}
+
 fn settle(
   file_system: *mut FileSystem,
   batch: &mut inflight::capture::Batch<'_>,
@@ -423,12 +444,16 @@ fn settle(
         request.kind(),
         inflight::CLEANUP_KIND | inflight::CLOSE_KIND
       ) {
-        let length = operation(file_system, &request, owned)?;
+        REPLAYING.set(true);
+        let length = operation(file_system, &request, owned);
+        REPLAYING.set(false);
+        let length = length?;
         let response = owned
           .response
           .0
           .get(..length)
           .ok_or(WinFspError::Capture(Refusal::Length))?;
+        count_replay_refusal(response);
         if saved.is_none() {
           batch
             .record_response(&request, response)
@@ -553,7 +578,10 @@ fn receive_loop(
       &mut owned,
       bound,
     )?;
-    slates_machine::log_line!("slates-winfsp: settled {count} captured requests before receiving");
+    slates_machine::log_line!(
+      "slates-winfsp: settled {count} captured requests before receiving, {} of them a replayed cleanup or close refused",
+      DIAG_REPLAY_REFUSED.load(std::sync::atomic::Ordering::Relaxed)
+    );
     outcomes
       .send(crate::host::Outcome::Recovered(count))
       .map_err(|_| WinFspError::MountThread)?;
