@@ -23,7 +23,7 @@
 //! do not hold. Holders that never answer make the writer wait: backpressure, never a false success.
 //!
 //! **Every other durability claim waits for the same position.** A transport's sync reply is held on [`durability`]
-//! (FUSE `fsync`, a virtio-fs or vhost-user `FSYNC`, a Shards stream's `FSYNC`) or [`wait_durable`] (an NFS stable write or `COMMIT`, v3 and v4 alike),
+//! (FUSE `fsync`, a virtio-fs or vhost-user `FSYNC`, a WinFsp flush, a Shards stream's `FSYNC`) or [`wait_durable`] (an NFS stable write or `COMMIT`, v3 and v4 alike),
 //! answered "not durable" past the liveness budget; a deferred verb that changes the volume (a writable map's
 //! `MapSync`, a checkout) completes through [`defer`] as a recorded verb does.
 //!
@@ -288,9 +288,8 @@ pub(crate) fn durability(
 }
 
 /// Derived: how long a held reply waits for durability before its transport answers that it is not (NFS `JUKEBOX`,
-/// FUSE and virtio-fs `EIO`): [`DURABLE_WAIT_NS`]. Asked by the FUSE and virtio-fs transports, so compiled where they
-/// are.
-#[cfg(unix)]
+/// FUSE and virtio-fs `EIO`, WinFsp `STATUS_UNEXPECTED_IO_ERROR`): [`DURABLE_WAIT_NS`]. Asked by those transports, so
+/// compiled where they are.
 pub(crate) const fn durable_wait_ns() -> u64 {
   DURABLE_WAIT_NS
 }
@@ -400,9 +399,9 @@ fn awaiting_bound(state: &ShardState) -> usize {
   awaiting_bound_of(&state.config)
 }
 
-/// Derived: the replies one FUSE mount may hold for durability: the bound a shard's held verbs use
-/// ([`awaiting_bound`]). Compiled where FUSE is, its only caller.
-#[cfg(target_os = "linux")]
+/// Derived: the replies one FUSE or WinFsp mount may hold for durability: the bound a shard's held verbs use
+/// ([`awaiting_bound`]). Compiled where those transports are, its only callers.
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) fn reply_hold_bound(state: &ShardState) -> usize {
   awaiting_bound_of(&state.config)
 }
