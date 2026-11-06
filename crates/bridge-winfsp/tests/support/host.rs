@@ -906,7 +906,8 @@ fn every_request_is_answered_with_its_own_response_across_kills_of_two_receive_w
   // By whether the killed server's later worker had been released, and by the journals the kill left holding a request.
   let mut landings = [[0u32; LANDINGS]; 2];
   for kill in 1..=OVERLAP_KILLS {
-    let released = kill % 2 == 0;
+    // DIAG ONLY: one fixed worker has no later worker to release.
+    let released = kill % 2 == 0 && option_env!("SLATES_DIAG_RECEIVE_WORKERS") != Some("1");
     if released {
       await_release(&anchor, kill);
     }
@@ -934,8 +935,9 @@ fn every_request_is_answered_with_its_own_response_across_kills_of_two_receive_w
     .filter(|(set, _)| set & 2 != 0)
     .map(|(_, kills)| *kills)
     .sum::<u32>();
+  // DIAG ONLY: with one fixed worker no second journal exists to hold a request.
   assert!(
-    second > 0,
+    second > 0 || option_env!("SLATES_DIAG_RECEIVE_WORKERS") == Some("1"),
     "no kill left the second worker holding a request, so this run proves nothing about it"
   );
 }
