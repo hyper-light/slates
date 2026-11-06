@@ -76,8 +76,12 @@
 > on a free as well as an allocation, so a delete takes its burst's reserve with it
 > (`a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it`: the content object fell back to 204,800 bytes
 > after the delete, against 16,793,600 before the fix), and its arena test skips under Miri only the count of pages
-> given back, which Miri cannot model. Owed before it is handed over: A-205's give-back on both Windows lanes, Miri on
-> `slates-mem`, the full server suite, and the incumbent harness again. Before the revert, the incumbent harness on
+> given back, which Miri cannot model. Verified on the re-landing (`c9b971aa`): A-205's give-back on both Windows lanes
+> (diagnostics run 42129821506: 92% and 104% of the deleted bytes left the working set on windows-latest, 110% and 205% on
+> windows-11-arm, every byte read back), Miri on `slates-mem`, `slates-wire` and the runtime's simulation tests in the
+> same run, and the full server suite here (787 passed). The incumbent harness on the M5 Max (six interleaved rounds
+> against main `f5396e3b`, load 12–44, 2026-11-05 23:37Z): best of eighteen 1,278.1 MiB/s against main's 1,021.9;
+> 895.6–981.5 against 715.3–868.7 at 4 workers, beyond the spread. Before the revert, the incumbent harness on
 > the M5 Max (six interleaved rounds, load 6–10, 2026-11-05 16:23Z) wrote the 64 MiB file at up to 1,286.0 MiB/s with
 > A-214, against 1,033.9 before it and step 11's 967, beyond the spread at 4 and 16 workers. Write p99s at 16 workers overlap with no direction. Profiled through Linux's NFSv4.2 client on CI (run
 > 41986870989), the one busy shard had spent 41.5% of its samples faulting in fresh pages of the anchor's shared

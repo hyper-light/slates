@@ -4043,6 +4043,31 @@ write, MiB/s at 1, 4 and 16 workers:
   1,284–1,479 / 1,291–1,435. They overlap.
 - The tick-only first build was dead even on the same harness (run 42058939194: 531–556 against 534–551 MiB/s).
 
+**Re-landed after the revert (2026-11-05).** Main reverted A-214 (CI 42119714654: A-205's give-back on both Windows
+lanes, and the arena test under Miri). The re-landing (`c9b971aa`) ends a busy period on a free as well as an
+allocation, so a delete takes its reserve with it:
+- `a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it` (Linux): before the write the content object held
+  12,288 bytes, with the file and its reserve 33,759,232, and after the delete 204,800 (16,793,600 before the fix);
+- A-205's give-back (diagnostics run 42129821506), deleted bytes that left the working set: windows-latest 92% in
+  1.61 s and 104%; windows-11-arm 110% in 1.13 s and 205% in 1.05 s (the reserve's pages go back with the files);
+- the incumbent harness on the M5 Max, main `f5396e3b` (A) against `c9b971aa` (B), six rounds each A then B,
+  2026-11-05 23:37–23:41Z, load 12–44 from other sessions, MiB/s at 1, 4 and 16 workers:
+
+  | round | A | B |
+  |---|---|---|
+  | 1 | 934.9 / 745.4 / 973.3 | 983.9 / 970.9 / 1,221.8 |
+  | 2 | 962.6 / 868.7 / 1,016.3 | 934.7 / 951.6 / 1,211.5 |
+  | 3 | 931.6 / 787.4 / 954.2 | 944.2 / 963.0 / 1,238.3 |
+  | 4 | 818.4 / 767.6 / 905.3 | 826.1 / 981.5 / 988.5 |
+  | 5 | 918.3 / 715.3 / 1,021.9 | 933.3 / 899.9 / 1,183.9 |
+  | 6 | 1,002.8 / 796.3 / 925.4 | 945.8 / 895.6 / 1,278.1 |
+
+  Best of eighteen: B 1,278.1, A 1,021.9; step 11 asks 967. Beyond the spread at 4 workers (B's lowest 895.6 against
+  A's highest 868.7); at 16 workers B led every round but one round's 988.5 sits under A's 1,021.9; at 1 worker the arms
+  overlap. Write p99 at 16 workers, µs (create / overwrite / append): A 2,621–4,590 / 1,394–2,989 / 1,238–3,415; B
+  2,831–3,962 / 1,731–3,359 / 1,647–3,607, overlapping at this load. nfsd wrote 1,428–1,817 MiB/s. The volume's shard
+  counted 358,875,136 bytes pre-faulted in every B run.
+
 **The resident cost per shard.** An idle shard holds at most its last burst's net growth of free pages, and never more
 than its memory share (`reserve_per_shard`: 1,073,741,824 bytes on the Mac's daemon, logged at boot). A shard whose
 last busy period grew nothing holds none: a written and deleted file nets zero, and A-105's give-back test passes

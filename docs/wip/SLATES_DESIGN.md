@@ -13128,6 +13128,9 @@ Applied in the same change to: §4.16 (status), `docs/wip/merge-service.md` (the
 >   a change to its rule.
 > - The arena test asserted the bytes the purge gave back, which Miri, modelling no `madvise`, never gives back; under
 >   Miri it now skips that count alone.
+> Verified (diagnostics run 42129821506): A-205's give-back on windows-latest and windows-11-arm, and Miri on the mem,
+> wire and runtime tests; on the incumbent harness the 64 MiB write's best of eighteen was 1,278.1 MiB/s against main's
+> 1,021.9 (BENCHMARKS).
 
 Status: accepted 2026-11-05 (Ada's decision through the supervisor: option (a) of GAPS' large-file write gap); built
 2026-11-05. It amends A-105's "every free block back at the first idle tick". Applied in the same change to:
