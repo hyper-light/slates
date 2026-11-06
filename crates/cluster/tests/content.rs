@@ -149,7 +149,7 @@ impl Room {
 
   /// A room of `blocks` pages.
   fn with_blocks(blocks: usize) -> Room {
-    let page = rustix::param::page_size();
+    let page = usize::try_from(slates_machine::facts::Facts::page_bytes()).unwrap();
     let mut arena = ChunkArena::new(page);
     arena
       .add_region(slates_mem::region::Region::map(page * blocks, page, false).unwrap())

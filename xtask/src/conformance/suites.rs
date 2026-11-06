@@ -152,6 +152,11 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   if !verdict.ok {
     notes.push(format!("fsx output tail: {}", verdict.detail));
   }
+  let (alive, live_note) = session.alive_and_shipped();
+  if !alive {
+    notes.push("the daemon stopped answering, or a live-shipped run did not ship".to_owned());
+  }
+  notes.extend(live_note);
   notes.extend(session.size_note.clone());
   drop(session);
   Ok(SuiteResult {
@@ -177,7 +182,7 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     ),
     expected_failure_list: Some(digest),
     notes,
-    ok: judgement.acceptable(),
+    ok: judgement.acceptable() && alive,
   })
 }
 
@@ -275,7 +280,7 @@ pub(crate) fn run_fsstress(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     output.as_bytes(),
   )?;
   let verdict = judge_fsstress(success, &output);
-  let alive = session.daemon_alive();
+  let (alive, live_note) = session.alive_and_shipped();
   let ok = verdict.ok && alive;
   let mut notes = vec![
     built.built.note,
@@ -290,6 +295,7 @@ pub(crate) fn run_fsstress(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       session.anchor_log_tail()
     ));
   }
+  notes.extend(live_note);
   notes.extend(session.size_note.clone());
   drop(session);
   Ok(SuiteResult {
@@ -636,7 +642,7 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     }
     parsed.push(parse_file(&relative, &output, &runner));
   }
-  let alive = session.daemon_alive();
+  let (alive, live_note) = session.alive_and_shipped();
   let daemon_note = (!alive).then(|| {
     format!(
       "the daemon stopped answering during the run; anchor log tail:\n{}",
@@ -654,6 +660,7 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   );
   let mut notes = vec![tree.note];
   notes.extend(daemon_note);
+  notes.extend(live_note);
   notes.extend(size_note);
   judged_pjdfstest(
     run,

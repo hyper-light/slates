@@ -42,6 +42,7 @@
 
 pub mod capability;
 pub mod civil;
+pub mod differential;
 pub mod exerciser;
 pub mod expected;
 pub mod matrix;

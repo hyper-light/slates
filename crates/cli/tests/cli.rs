@@ -568,6 +568,11 @@ fn strict_volume_or_typed_refusal(instance: &str) -> Option<String> {
 /// (`SIGSTOP`: alive and silent), and wait for another daemon to answer. Expect the frozen one gone, killed once, and the
 /// new one answering no sooner than the liveness budget less one heartbeat after the freeze (the lapse runs from the last
 /// beat, which may precede the freeze by a beat) and within the suite's start wait after that.
+///
+/// Since A-228 the beat is the daemon's watchdog thread's, and a frozen process stops every thread at once, the watchdog
+/// with them, so nothing in the daemon can say it is only starved. A stopped process is indistinguishable from a hung one,
+/// and the kill here is the intended outcome: measured 2026-11-06 on macOS arm64 at load 54, killed at 1,045 ms against a
+/// 1,044 ms bound (the liveness window plus the anchor's own lateness p99 of 44 ms over 15 waits).
 #[test]
 fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
   if std::env::var_os("SLATES_TEST_CLI").is_none() {
@@ -3231,6 +3236,14 @@ fn assert_formed(views: &[Option<FleetView>]) -> Vec<String> {
             "fleet.plane.announce_lends:",
             "fleet.plane.announcements_sent:",
             "content.purged_bytes:",
+            // The reap tick's record of what a shard was doing (A-214: sealing, deferred, busy, idle) and the
+            // bytes an idle shard kept pre-faulted for its next write burst: events of a shard's ordinary
+            // ticks, counted during formation like `content.purged_bytes` (main CI 42172125695, macos-latest).
+            "content.ticks.sealing:",
+            "content.ticks.deferred:",
+            "content.ticks.busy:",
+            "content.ticks.idle:",
+            "content.prefaulted_bytes:",
             // A record link dropped because its anchor's learned member became another incarnation
             // (`fleet::LINK_INVALID_MEMBER_CHANGED`). Incarnations change as the fleet comes up, so this is
             // superseded link work — exactly what this assertion permits — and it is counted during formation

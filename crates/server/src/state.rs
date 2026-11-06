@@ -55,6 +55,9 @@ pub struct ClientSlot {
   /// to its window when a batch is delivered, and credited with the client when it goes — so a batch whose reply
   /// was never carried home (`crate::xshard::send_back`) holds its charge no longer than its client.
   pub(crate) read_ahead_pending: u64,
+  /// The volumes of other hosts this client asked for an attachment of in the record form (A-222), so its reap ends
+  /// them at their owners (`crate::remote_attach::reap_at_owners`). Bounded by `crate::remote_attach::bound`.
+  pub(crate) remote_volumes: Vec<slates_ipc::protocol::VolumeId>,
 }
 
 impl std::fmt::Debug for ClientSlot {

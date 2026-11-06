@@ -446,16 +446,20 @@ fn scattered_with_the_other_shard_full(
   (shard, reply, took)
 }
 
-/// The answer a scatter must give when a part cannot be sent to `shard`: the typed refusal, inside the hold. The part
-/// waits for room for half the liveness budget first, so the answer comes after that and before the hold ends.
+/// The answer a scatter must give when a part cannot be sent to `shard`: the typed refusal, decided inside the hold — had
+/// the part waited past it, the drained channel would have taken it and the scatter would have answered in full. The
+/// part waits for room for half the liveness budget first, so the answer comes after that, and within the client's reply
+/// deadline. The answer's delivery is not held to the hold: on a busy shard it takes longer, and only the decision's
+/// moment is the design's (2026-11-06).
 fn check_typed_refusal(verb: &str, (other, reply, took): (usize, ReplyBody, Duration)) {
   assert!(
     matches!(reply, ReplyBody::Refused { refusal: Refusal::Overloaded { shard } } if usize::from(shard) == other),
     "{verb} with the other shard's control channel full: {reply:?}"
   );
   assert!(
-    took >= HOLD / 2 && took < HOLD,
-    "{verb} was answered in {took:?}: after its part waited half the liveness budget for room, inside the {HOLD:?} hold"
+    took >= HOLD / 2 && took < Duration::from_nanos(DEADLINE_NS),
+    "{verb} was answered in {took:?}: after its part waited half the liveness budget for room, within the client's reply \
+     deadline"
   );
 }
 
@@ -490,4 +494,60 @@ fn a_daemon_status_whose_part_cannot_be_sent_is_refused_overloaded() {
     "status",
     scattered_with_the_other_shard_full("status-full", &RequestBody::DaemonStatus),
   );
+}
+
+/// Shape: how long the starver keeps the client's own shard busy at a time: twice the room wait's pause (10 ms), so each
+/// of the part's pauses runs late by more than it lasts.
+const STARVED_FOR: Duration = Duration::from_millis(20);
+
+/// §4.9, §4.14, the busy machine (Ada's rule: the normal case). Do: as `a_daemon_status_whose_part_cannot_be_sent_…`,
+/// with the client's own shard, where the status's part waits for room, kept busy 20 ms at a time back to back
+/// meanwhile. Expect: the typed refusal still comes after half the liveness budget and inside the hold. The part's wait
+/// for room is a span of time, so a shard whose every pause runs late still waits its budget and not much more. Before,
+/// it was 51 tries of a 10 ms pause each, and on a busy shard each try lasted a pause plus a busy poll: the wait ran past
+/// the hold, as it did once at load 62–68 on macOS (2026-11-06).
+#[test]
+fn a_status_on_a_starved_shard_is_refused_overloaded_on_time() {
+  static HELD: AtomicBool = AtomicBool::new(false);
+  static STARVING: AtomicBool = AtomicBool::new(false);
+  let (daemon, instance) = daemon("status-starved");
+  let mut client = Client::connect(&instance);
+  let mine = serving(&daemon, client.client);
+  let other = 1 - mine;
+  let holding = hold(&daemon, other, HOLD, &HELD);
+  let flooded = daemon.flood_control_channel_of(other).unwrap();
+  STARVING.store(true, Ordering::Release);
+  let caller = std::thread::spawn(move || {
+    let started = Instant::now();
+    let (_, reply) = client.call(&RequestBody::DaemonStatus);
+    let took = started.elapsed();
+    STARVING.store(false, Ordering::Release);
+    (reply, took)
+  });
+  let shard_of_client = daemon.shards()[mine];
+  // Until the call ends, however it ends: a call that panics never lowers the flag.
+  while STARVING.load(Ordering::Acquire) && !caller.is_finished() {
+    let starved = daemon
+      .observation(
+        Some(shard_of_client),
+        OBSERVE_BUDGET_NS,
+        |_: &mut ShardState| {
+          // A busy poll of a fixed length: a spin, since a short sleep on macOS under a launchd job's timer policy
+          // comes back several times late (CLAUDE.md, the loop-responsiveness gotcha).
+          let began = Instant::now();
+          while began.elapsed() < STARVED_FOR {
+            std::hint::spin_loop();
+          }
+        },
+      )
+      .unwrap();
+    let _ = starved.wait();
+  }
+  let (reply, took) = caller.join().unwrap();
+  holding.join().unwrap();
+  let shard = usize::from(daemon.shards()[other].0);
+  daemon.stop();
+  assert!(flooded > 0, "the other shard's control channel was filled");
+  println!("status on a starved shard answered in {took:?}");
+  check_typed_refusal("status on a starved shard", (shard, reply, took));
 }
