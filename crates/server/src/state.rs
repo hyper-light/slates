@@ -683,6 +683,9 @@ pub struct ShardState {
   /// carried the message. The acceptor's authority owner is the socket's TLS-authenticated peer, so a
   /// record whose owner field is not that peer is refused. Empty on a laptop (no fleet loop runs).
   pub holder_records: BTreeMap<ObjectId, Acceptor>,
+  /// Live shipping (§4.10, A-200; [`crate::live_ship`]): the live volumes this shard owns and ships, and on the control
+  /// shard what this node holds of others' as a candidate.
+  pub(crate) live: crate::live_ship::LiveState,
   /// This node's takeovers in progress (§4.8 "Promotion and takeover"; [`crate::takeover`]): for each kept
   /// retirement whose survivors include this node and that it has not confirmed its share of yet, the round —
   /// its epoch, each asked member's progress, the objects learned and adopted. Only the control shard drives it;

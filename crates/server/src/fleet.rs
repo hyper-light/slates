@@ -820,6 +820,20 @@ fn consensus_budget(slowest_tail_ns: Option<u64>) -> CommitBudget {
   round_budget(&ROUND_ANCHORS, slowest_tail_ns)
 }
 
+/// The budget a live-shipped entry's exchange runs under (A-200): a hard deadline of the daemon's liveness budget, past
+/// which a holder that has not answered is not a live one to wait for (its link is dropped and dialed afresh,
+/// `live_ship::lose_links`), with the record plane's poll between wake-ups (a reply wakes the collector at once).
+/// Derived: `LIVENESS_BUDGET_NS`, `HEARTBEAT_NS / POLL_PER_PERIOD`. Not the consensus round's budget: that is derived
+/// from the slowest path's tail, which a paused holder inflates, so one exchange to it held the holder's only session
+/// past a 40 s wait and the resumed holder never caught up (2026-11-05, `live_fleet`, 1 of 2 runs). A holder is not a
+/// voter; each answers on its own.
+pub(crate) fn live_budget() -> CommitBudget {
+  CommitBudget::hard(
+    crate::daemon::LIVENESS_BUDGET_NS,
+    (HEARTBEAT_NS / POLL_PER_PERIOD).max(1),
+  )
+}
+
 /// The bound on one record-plane exchange: the measured control-plane round budget's full span, the bound every
 /// record-plane exchange runs under.
 pub(crate) fn record_exchange_budget_ns() -> u64 {
@@ -1369,6 +1383,22 @@ async fn serve_peer_records(
               crate::mirror::serve_promise(s, local, peer_host, &request)
             })
             .unwrap_or_default(),
+            slates_cluster::live::LIVE_ENTRY_STREAM => state::with_state(|s| {
+              let peer_host = s
+                .learned_members
+                .get(&peer_anchor)
+                .map_or(seed, |learned| learned.host);
+              crate::live_ship::serve_entry(s, local, peer_host, &request)
+            })
+            .unwrap_or_default(),
+            slates_cluster::live::LIVE_STATE_STREAM => state::with_state(|s| {
+              let peer_host = s
+                .learned_members
+                .get(&peer_anchor)
+                .map_or(seed, |learned| learned.host);
+              crate::live_ship::serve_state(s, local, peer_host, &request)
+            })
+            .unwrap_or_default(),
             crate::mirror::MIRROR_RECORD_STREAM => state::with_state(|s| {
               let peer_host = s
                 .learned_members
@@ -1639,6 +1669,8 @@ fn after_held_record(state: &mut ShardState, record: &Record) {
   }
   if let Some(value) = crate::tombstone::TombstoneValue::from_record_bytes(&record.value) {
     crate::tombstone::on_held(state, record.object, value);
+    // A destroyed volume's live log goes with it (A-200): no owner ships to it again.
+    crate::live_ship::let_go(state, record.object);
   } else {
     // A newer head or ledger position may supersede content held for the object (AUD-29-43).
     crate::content_retention::retain_object(state, record.object);
@@ -3591,6 +3623,28 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
     }
     None => return,
   };
+  // A live-shipped volume is served from its live log, which holds every acknowledged write (A-200): phase one over its
+  // candidates under the takeover's epoch, the greatest head adopted. A volume whose log was never shipped has none and
+  // is served from its placed seal as before.
+  let live = if catalog.live_shipped {
+    let mut candidates = placed.placement.candidates.clone();
+    let current =
+      state::with_state(|s| s.fleet.configuration().place(object).candidates).unwrap_or_default();
+    for host in current {
+      if !candidates.contains(&host) {
+        candidates.push(host);
+      }
+    }
+    match crate::live_ship::fetch(object, placed.epoch, candidates).await {
+      Ok(fetched) => fetched,
+      Err(waits) => {
+        count_refusal(waits);
+        return;
+      }
+    }
+  } else {
+    None
+  };
   let region = head.content_holders.clone();
   // The successor's own copy of the volume's lineage key (A-92 piece 4c), unwrapped here on the control shard, which
   // holds the pair keys, and handed to the owner shard wrapped under this node's root.
@@ -3623,6 +3677,17 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
         }
         adopted
       });
+      // The live log, when the volume has one: it is the volume as acknowledged, rebuilt here (A-200).
+      if let Some(fetched) = &live {
+        let rebuilt = crate::live_ship::archive_from_live(s, id, &catalog.owner, fetched)?;
+        past_the_pressure_hold(s, |s| {
+          verbs::materialize_taken_over(s, id, &taken, region, Some(&rebuilt))
+        })
+        .map_err(|refusal| materialize_refusal_counter(&refusal))?;
+        s.placed_heads.insert(object, placed);
+        s.placed_heads.insert(object.catalog(), catalog_placed);
+        return Ok(());
+      }
       // Open a content archive (a sealed one needs the lineage key); a contentless volume has none to open.
       let opened = match archive {
         Some(archive) => match opened_archive(s, id, &catalog.owner, adopted, archive) {
@@ -6549,6 +6614,9 @@ async fn run_record_period(
   }
   deliver_pairs(origin, shard, local, budget).await;
   ship_shard_heads(origin, shard, local, budget, owner_acceptor, in_flight).await;
+  // Live volumes' entries a holder still lacks (A-200): writes ship at their barrier; this catches up a lost message or
+  // a holder that was away.
+  crate::live_ship::period(origin, shard).await;
   // Record durably each seal whose content and head have both placed.
   crate::xshard::run_on_counted(origin, shard, record_placed_seals);
   crate::xshard::run_on_counted(origin, shard, record_mirrored_seals);
@@ -6968,6 +7036,9 @@ fn record_acks_in(
       entry.placement.acked.push(host);
     }
   }
+  // A live volume's writes wait for its head's placement as well as their own durability (A-200): answer those it was
+  // the last thing they waited for.
+  crate::live_ship::resolve(state, object.0);
 }
 
 /// Borrows out of the shard state the live sessions of the holders satisfying `wanted`, leaving each borrowed

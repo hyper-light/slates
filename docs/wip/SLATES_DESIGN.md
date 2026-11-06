@@ -1304,7 +1304,11 @@ served ring request, forwarded verb, mount call or guest pass; a timer's work op
 the shard's wake estimate — asking the rings, the pollers, the timers and the driver on each turn (a socket's
 readiness is known only to the driver, so the spin polls it without blocking; A-39), then park in
 the driver. Every non-blocking harvest is one that never sleeps: on epoll that is `epoll_wait` with a
-zero timeout (A-39; the same rule held for io_uring's `io_uring_enter` before A-136 removed it).
+zero timeout (A-39; the same rule held for io_uring's `io_uring_enter` before A-136 removed it). On macOS the
+zero-timeout `kevent` this driver makes sleeps about 15 µs a call (macOS 26.4.1, measured 2026-11-05), so a macOS shard's
+spin is a nap of that length a turn. That is kept by measurement: a true spin (`KEVENT_FLAG_IMMEDIATE`, about 180 ns)
+cut the single-client p50 from 60–95 µs to 13–22 µs but lost every tail once the host had no idle core, and no policy
+measured kept both (A-218, measured and rejected; BENCHMARKS "The spin policy, measured and rejected").
 Cancellation: dropping a future releases nothing it did not own (resources live in arenas
 keyed by handle and are released by the owning operation's terminal step), so every operation is
 cancel-safe by construction; a cancellation request is a message that guarantees a terminal
@@ -5612,10 +5616,150 @@ first window after attach (window derived from the measured attach-to-first-buil
 next attach of the same base prefetches that set in the background, bounded by the attachment's
 budget; the policy is observe-first until a minimum number of attaches has been seen.
 
-**Live shipping (opt-in).** A volume created with policy `live-shipped` ships its op log to f+1
+**Live shipping (opt-in; A-200 states the log, its acknowledgement and its takeover).** A volume created with policy `live-shipped` ships its op log to f+1
 of its candidates and acknowledges writes at f+1; the backups apply entries in order and the
 takeover successor is one of them, so promotion has no loss window; replica lag beyond a window
 derived from the measured apply rate applies credit backpressure to that volume's writers only.
+
+> **Status (2026-11-04, the log built and checked; not yet on the wire or in the daemon).** A-200's log is
+> `crates/db/src/live.rs`: `Shipper` (the owner's chain, credit, retained tail and durable position), `Replica` (a
+> holder's fence and head, guard-then-apply), `adopt` (phase one's choice), and the entry, install and reply
+> encodings with hostile-input tests. `crates/db/tests/live.rs` runs it under a nemesis (loss, duplication,
+> reordering, partitions, holder crashes, owner loss with takeover, a superseded owner shipping on, holders that learn
+> a takeover late) for 200 seeds × 3,000 steps at f=1 and f=2, checking Agreement, NoLoss and StaleNeverCommits after
+> every step and Convergence after healing. All held, with 110 and 241 takeovers, 231 and 416 installs, 2,020 and 5,431
+> stale-epoch refusals, and 4,600 and 2,871 durable positions. Red-checked by mutation: adopting the lowest-ranked
+> report fails NoLoss at once, and removing both the fence and the owner check fails StaleNeverCommits. The
+> stale-refusal counter found one defect before any history check did: a holder refused a superseded owner as
+> unauthorized before checking its fence, so that owner never learned it was fenced and shipped on. The fence is now
+> checked first.
+>
+> **On the transport (2026-11-04).** `crates/cluster/src/live.rs`: `ship` sends an entry or install to each holder
+> over its warm session (kinds 22 and 23) and folds the replies until the write is durable, through the
+> wake-on-reply collector; `serve_entry` and `serve_install` are the holder's answer. Measured over real loopback
+> endpoints with the daemon's derived runtime (`replication_bench`; BENCHMARKS "Live shipping over the transport"): a
+> 64-byte write durable on two hosts in 16.6–20.3 µs at the median and 28.7–32.5 µs at p99, a 4 KiB write in
+> 22.6–27.2 µs and 37.9–71.8 µs, a 64 KiB write in 108–149 µs and 160–292 µs; unchanged with one holder dead. A test
+> over the simulated fabric (`crates/cluster/tests/live.rs`) found that `ship` sent nothing when its position was
+> already durable, so the owner's period never caught a holder up; it always sends now, and a late holder is
+> installed once and then follows. Owed: the daemon's publications shipped through it, with barriers answered at
+> durability and phase one in the takeover round; real-process chaos.
+>
+> **In the daemon, slice one (2026-11-05): the owner ships and the candidates keep.** `crates/server/src/live_ship.rs`.
+> Each publication of a live-shipped volume that commits (`publish_shard`) is appended on the volume's own shard, so
+> positions follow publication order inside the barrier; its payload is the record the journal took (or the whole
+> image after a checkpoint) and the content of every extent it names, read through `Volume::read` and sealed under
+> the lineage key. A task of that shard sends what each candidate lacks over the control shard's sessions
+> (`slates_cluster::live::exchange`) and folds the replies there. Candidates check chain and fence, keep the sealed
+> entries since the last whole one within twice the volume's size, and answer with their head (record kinds 22, 23).
+> A publication that cannot become an entry (the credit full, a read or seal refused) leaves the volume owing a whole
+> record, which the next publication or the record period appends. `status` reports each live log
+> (`shard N live shipping|held VOLUME head= durable= owed=`). Across three real daemon processes
+> (`crates/cli/tests/live_fleet.rs`, `SLATES_TEST_CLI=1`), five writes end with the owner durable at its head, nothing
+> owed and both candidates at that head, 4 of 4 runs. Two defects that run found are fixed in the slice: a refusal was
+> re-shipped at once, so a holder that did not hold the volume's catalog yet looped with its owner (982 and 5,501
+> refusals in one five-write run, 0 to 20 after); and a burst that outran the credit left its last writes unshipped
+> until another write came.
+>
+> **Slice two (2026-11-05): barriers wait for durability.** A recorded verb that changes a live-shipped volume commits
+> its effects, then neither records its completion nor answers until its publication's position is durable
+> (`live_ship::durable_target`, `defer`, `resolve`; a retry joins the wait, `live_ship::join`), as a green's submit
+> waits for its merge record; a stable NFS `WRITE` or `COMMIT` waits after its barrier (`nfs::stable_once_durable`), at
+> most the daemon's liveness budget, then answers `NFS3ERR_JUKEBOX` and never a stability it does not have. Holders
+> that never answer make writers wait: backpressure, never a false success. Across three real daemon processes
+> (`crates/cli/tests/live_fleet.rs`): five `slates write`s each deferred (`fleet.live.awaited` 5), the owner's log
+> durable at its head with nothing owed the moment the last returns; five `FILE_SYNC` NFS writes each waited
+> (`fleet.live.resolved`), the log durable at each write's own position right after its reply (1, 2, 3, 4, 5), none
+> late. Red-checked: with the control-verb wait removed the last write returned at head 1, durable none, owed
+> (3 of 3); with the NFS wait removed the counter is zero and the race shows an undurable reply in 2 of 3.
+>
+> **Slice three (2026-11-05): takeover from the live log.** The whole-state kind (23) carries a successor's fetch beside
+> installs, by tag (`slates_db::live::Fetch`). A takeover that adopts a live-shipped volume's head runs phase one for
+> its log (`live_ship::fetch`): every candidate of the head's placement raises its fence to the head's placed epoch,
+> takes the successor as owner, and answers with its head and the sealed entries it keeps; the greatest head among at
+> least `f + 1` answers is adopted (`slates_db::live::adopt`). Whole entries carry the volume's lineage key wrapped for
+> each neighbour (the `sealing` a head carries), so the successor opens the log whether or not the volume ever sealed;
+> it replays the whole image and the deltas after it (`VolumeImage::apply`) and serves the volume as an archive of
+> that image and the content runs (`live_ship::archive_from_live`, the export's layout), through the same
+> `materialize_taken_over` a seal's takeover uses. A log that cannot be rebuilt whole is refused, counted
+> (`fleet.live.takeover_refused`), never silently replaced by an older seal. The successor keeps the volume
+> live-shipped (its catalog carries the flag) and ships under the head's epoch, above the dead owner's. Across three
+> real daemon processes (`a_live_volumes_acknowledged_writes_survive_its_owners_death`): five writes, each answered at
+> durability, no snapshot ever taken, the owner killed with SIGKILL; a survivor serves all five files byte for byte
+> after 2.27, 2.05, 1.85 and 1.83 s (4 of 4). Red-checked: with the live log not read, the successor serves the volume
+> empty (every file `NotFound`), the loss the log closes. Found on the way and closed in the same slice: a volume whose
+> owner died before its creation head was placed at `f + 1` (the record period, up to 100 ms) was unknown to any
+> takeover, so writes it had acknowledged were lost with it (2 of 2 runs killed right after the writes served nothing,
+> `OwnerUnreachable`). A live write now waits for its volume's head placement as well as its own durability
+> (`live_ship::head_placed`; `fleet::record_acks_in` answers the waits it completes), and the flow kills the owner the
+> moment the last write returns: served whole in 1.93, 1.93 and 2.17 s (3 of 3). Also owed: FUSE `fsync`, a
+> candidate's copy across its own daemon's restart, hard links (an archive carries each name as its own file), and
+> extended attributes in the rebuilt volume.
+>
+> **Chaos across real processes (2026-11-05).** SIGSTOP is the unprivileged partition (a stopped daemon answers
+> nothing and keeps its ports; SIGCONT returns it with every timer late, as a healed partition or a long stall does);
+> netem and network namespaces need privileges this project never takes. `crates/cli/tests/live_fleet.rs`:
+> - *A candidate partitioned away, then healed*: writes stay durable through the other candidate (client-seen 3–16 ms
+>   but the first, about 103 ms, the session finding the stopped peer), the log durable at its head when the last
+>   returns; the healed candidate catches up to the owner's head within about 1–2 s (4 of 4).
+> - *Latency injected*: both candidates stopped 30 ms of every 60 ms, out of phase, so for 15 ms of each both are
+>   stopped: 30 writes, client-seen p50 3.0–3.8 ms, p90 32.6–33.6 ms, max 35.1–47.4 ms, every one durable at its return,
+>   none refused for room, both candidates at the owner's head afterwards.
+> The partition found a defect: a live exchange's deadline came from the consensus round's budget, which is derived
+> from the slowest path's tail, and a stopped peer inflates it, so one exchange held the peer's only session past a
+> 40 s wait and the healed candidate never caught up (1 of 2 runs at first; 0 of 8 since). Live exchanges now run under
+> the daemon's liveness budget (`fleet::live_budget`), and an exchange no holder answered drops that link to be dialed
+> afresh (`live_ship::lose_links`), as an unanswered discovery exchange does.
+>
+> **Chaos, continued (2026-11-05).** Three more flows, and two more defects they found:
+> - *A superseded owner resumed*: the owner stopped until the survivors took the volume over (served whole after
+>   1.8–2.1 s), two more writes made on the successor, then the old owner resumed and a write tried through it: never
+>   acknowledged within the 40 s wait, never on the successor (`a_superseded_owner_resumed_after_its_takeover_is_fenced`).
+>   The first run of it hung on the successor's own first write: a holder off the new chain was offered entries from
+>   its last on-chain head, which it refused, forever, because the shipper's `pending` did not know the holder was owed
+>   an install. The model, driven as the daemon drives it (re-ship only what `pending` says), failed Convergence the
+>   same way; `Shipper` now remembers holders owed an install, the model passes again (f=1: 309 installs, f=2: 455).
+>   And an install at a checkpoint a holder already holds is refreshed by a new whole record, which may go one entry
+>   past the credit (`Shipper::append_checkpoint`): with both candidates behind, waiting for credit no laggard could
+>   free deadlocked the stall flow.
+> - *Clients cut off mid-write*: ten writers SIGKILLed right after starting, between finished writes: the log whole on
+>   every candidate, every deferred reply resolved (awaited 10, resolved 10).
+> - *A live volume destroyed*: its candidates let their copy of its log go once the tombstone reaches them
+>   (`live_ship::let_go`); before, they kept it forever (red without the release, 1 of 1).
+> All eight flows pass together in 55 s.
+>
+> **The tail and three more defects (2026-11-05).** All nine process flows pass together in 4.1–4.2 s (twice), each
+> flow's fleet in its own directory: one directory per test process had let parallel fleets overwrite each other's
+> manifest, and eight of nine daemons were handed another fleet's ports.
+> - *The rare 100 ms write*: two causes, each a wait for the record period. A send that found its holder's session lent
+>   was dropped (`borrow_session` now waits for it, within the liveness budget). A write the credit turned away waited
+>   for the next write or the period to append the whole record it owed (the reply that frees the credit now appends
+>   it). The worst live stable write went from 86–276 ms to 0.47–1.87 ms (BENCHMARKS "The 100 ms tail").
+> - *A superseded owner was never told*: after the takeover the configuration names the successor, so a holder refused
+>   the old owner's entries `Unauthorized` before it reached the fence. The old owner could not tell that from a
+>   passing refusal and held the write unanswered for the whole 40 s wait. A holder now answers a message below the fence
+>   its copy promised `StaleEpoch` (`not_served`, read from the header by `live::epoch_of`). The owner keeps the
+>   volume marked fenced: it refuses every write waiting on it and every later one `StaleEpoch`, and a parked stable NFS
+>   write answers "try again", never "durable". Before, the fence dropped the shipper, and a parked reply read "no
+>   shipper" as nothing to wait for. The flow now requires the refusal: the stale write exits 1 at once, and the flow
+>   takes 3.9 s instead of 43 s.
+> - *A destroyed volume's shipper was kept on its owner*, with a whole copy of the volume (`live_ship::forget` at the
+>   teardown's end and in the orphan sweep: waiting verbs refused `NotFound`, parked replies woken to "not durable").
+>   The destroy flow now holds the owner to it too (red first, 1 of 1).
+>
+> **FUSE `fsync` at durability (2026-11-05).** A FUSE mount answered `fsync` at the owner's own barrier, so on a
+> live-shipped volume it claimed what no candidate held: with both candidates' processes stopped it returned success in
+> 19 µs (`a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it`, red first). An `fsync` (or `fsyncdir`)
+> whose barrier published a live volume not yet durable is now held on its mount (`fuse::hold_fsync`), and the mount's
+> task serves the kernel's other requests meanwhile. FUSE answers a request out of order, and an `fsync` reply grants the
+> kernel nothing, so the held reply is sent from its own bytes. The task answers it once the log is durable where the
+> barrier put it, or `EIO` once the liveness budget has passed or the volume is destroyed or its owner superseded
+> (`fuse::settle_held`; the check is `live_ship::durability`, which the NFS wait now uses too). Unlike `crate::told`'s
+> wait it cannot deadlock: it waits on candidates over the network, never on another mount's kernel lock. Held replies
+> are bounded per mount by the shard's bound on held verbs; past it an `fsync` is answered `EIO`, counted. Measured in
+> the flow: with both candidates stopped the `fsync` fails `EIO` after 1.0006 s (the liveness budget); healthy and after
+> the candidates resume, it succeeds.
+
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
 writer's ring to its local owner shard is the latency floor. When write-intent attachments from
@@ -12929,6 +13073,25 @@ support), GAPS, `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-sca
   and an acknowledgement's own refusal on the client's shard, which is still its reply.
 - **Next lever (C, GAPS):** carry the watermark in every request, so no separate acknowledgement is needed at all.
 
+### A-218 — The macOS idle spin's policy (measured and rejected 2026-11-05; main's spin stays)
+Applied in the same change to: §4.3 (its "Loop" paragraph: on macOS the zero-timeout harvest sleeps about 15 µs, kept),
+GAPS, BENCHMARKS ("The spin policy, measured and rejected").
+- **What was asked.** On macOS the idle spin's zero-timeout `kevent` sleeps about 15 µs a call (14.6–15.5 µs, one
+  involuntary switch, macOS 26.4.1), where `KEVENT_FLAG_IMMEDIATE` takes 180–186 ns. A true spin cut the single-client
+  p50 from 60–95 µs to 13–22 µs at every load and lost every tail once the host had no idle core. A-218 was to find a
+  derived spin policy keeping both, with no regression against main at any load.
+- **Why none was accepted.** The competitive spin [A: Karlin, Manasse, McGeoch & Owicki 1994] assumes the spinner's
+  processor has no other use; once the host is oversubscribed it does, and on macOS's scheduler a true spinner holds a
+  core a woken thread waits for. Each candidate is rejected by its numbers: the shard's own turn gaps (it rarely sees
+  the waiting thread), yielding (a yield does not reach a thread queued elsewhere), macOS's CPU idle counters (unusable),
+  a frozen wake estimate, idle windows of 10 and 1 times the wake (ratio 1 lost R9 on CI's Linux arm64 and both Windows
+  runners), and napping past the competitive spin against the live wake estimate (under load nap and wake measure the
+  same queueing, to the nanosecond; busy p99 0 of 4 on every row), and with naps forced (busy 8-client p99 15.1 against
+  3.46 ms).
+- **What stays.** Main's macOS spin: a nap of about 15 µs at each driver harvest, busy steps included, which is what
+  keeps its tails under load. The decision rests on Ada's rule that p99 under load is the target. The true spin's change
+  is kept on record, not landed (`agents/clients-spin`, a75f9213).
+
 ### A-209 — Windows conformance is WinFsp's own two suites over the slates drive in both Windows lanes, with a reviewed list and stated differences; the POSIX suites run on arm64 Linux (accepted 2026-11-05, Step 10 of the VFS and DAX plan)
 Applied in the same change to: Part 6 ("Conformance"), §4.6 ("Windows" and its status), GAPS, `docs/wip/platforms.md`,
 `docs/wip/conformance.md`, `crates/conformance` (the `winfstest` suite, its reply parser, the capability table, the WinFsp
@@ -13452,6 +13615,92 @@ Status: built 2026-11-04. It closes the Windows owed items of A-105, A-110 and A
   leaked the handle. It did not: `view` closed it. 200 refused adoptions moved the handle count by 0 on unchanged code,
   and by 200 with that close removed (`crates/mem/tests/held_section.rs`). The adoption now maps first and takes
   ownership only of a view that exists, so `view` no longer closes what it was lent.
+
+### A-200 — Live shipping ships the owner's publications as a fenced, hash-chained log, acknowledged when f holders and the owner hold it (accepted 2026-11-04; Ada's goal of 2026-11-04, "run replicas of the filesystem server … replication <1 ms")
+
+**Why.** §4.10 says a `live-shipped` volume "ships its op log to f+1 of its candidates and acknowledges writes at f+1",
+and AC-8.3 holds such a volume to no loss window. The design does not say what the op log is, what an
+acknowledgement binds, how a replica that missed entries catches up, or how a takeover picks the replica to promote.
+This amendment says so before any of it is built. Nothing of live shipping exists in code (GAPS, 2026-11-04).
+
+**What is shipped.** The owner's own barrier stream for the volume: each publication `publish_shard` makes of it
+(a delta, A-68, or a checkpoint image), together with the bytes of the chunk windows the publication names that the
+replica does not hold. That is the stream a restart already replays from the anchor (D-18), and its two encodings are
+already held equal by the publication oracle (`check_publication`), so a replica applies exactly what the owner's
+own recovery would. The vfs journal (§4.5) is not the op log here: it carries no bytes.
+
+**The log.** Entries are numbered densely from a checkpoint at position 0. Entry `n` carries the owner's host epoch
+`e`, the identity of entry `n − 1`, and its payload; its identity is the BLAKE3 of all four. A holder accepts entry
+`n` only under an epoch at least its fence for that owner's host (§4.8), and only on top of an entry `n − 1` whose
+identity matches; a checkpoint is accepted at any position under the same fence. A holder never rewrites what it
+applied: an entry whose predecessor does not match is refused with the holder's last position and identity, and the
+owner answers with its next checkpoint. An acknowledgement names the holder, the position and the identity it holds
+there, so by the chain it vouches for the whole prefix.
+
+**When a write is promised.** Every entry is sent to all `2f` other candidates, as a record is (§4.8). It is durable
+once the owner and `f` of them hold it (`f + 1` of the `2f + 1` candidates, §4.8's commit rule), so §4.10's "f+1"
+counts the owner among them. The barrier that produced it (an NFS `COMMIT`, an `fsync`, a control verb's
+publication) answers only then. A write no barrier covered was never promised to survive the owner (§4.6), and
+still is not. No consensus or coordination call is on this path (D-14): the owner is the single writer under its
+epoch, as for every register.
+
+**Backpressure (AC-8.9).** Entries not yet durable are bounded by a credit derived from the measured apply rate and
+the measured holder round trip (Little's law: the entries in flight are the rate times the time to acknowledge). A
+publication past the credit waits for credit; it is never queued without bound. A holder that falls further behind
+than the owner's retained tail is caught up by a checkpoint, never by an unbounded tail.
+
+**Takeover.** The group's takeover (§4.8 "Promotion and takeover") names the successor among the candidates. In its
+phase one every answering holder raises its fence to the new epoch and reports, per live-shipped volume, the epoch of
+its last entry, its position and that entry's identity. The successor adopts the report with the greatest
+(last epoch, position), which is Raft's up-to-date rule (Ongaro, thesis §3.6.1). A durable entry is held by `f + 1`
+candidates and phase one's answers come from `f + 1` candidates, so the two sets meet in at least one live holder of
+it whenever at most `f` candidates are lost (the owner among them); a holder whose last entry is under a later epoch received a log its owner adopted the same way. The successor
+serves from the adopted replica, which loses no acknowledged write (AC-8.3), and re-ships from there under its own
+epoch: a holder holding an entry the old owner never made durable fails the chain and takes a checkpoint.
+
+**The policy.** A volume is live-shipped when its policy says so (`PolicyRecord::live_shipped`), set by the
+`LiveShip` verb (`slates live-ship ID [--off]`, `admin` on the volume required), not at `create`. A request field on
+`create` would have changed every caller of the create path at once; a separate recorded operation
+(`Op::LiveShippingChanged`) is additive, and since a log starts from an install (its first entry is the owner's
+whole state), turning shipping on after creation needs nothing more. The flag rides the catalog register
+(`CatalogValue::live_shipped`), so a successor keeps shipping, and `list` shows it.
+
+**In the daemon (decided 2026-11-04 from the code as it stands).** Four facts of the daemon shape the wiring:
+
+- A publication names its content by arena block (A-64), and a sealed chunk's arena bytes are ciphertext under this
+  daemon life's own key (A-99), so no arena byte means anything on another node. An entry therefore carries the
+  volume's publication record (as `publish_delta_into` or the checkpoint encodes it) together with the content of
+  every chunk the record's inode images name, read in the clear through the one read chokepoint (`read_extent`).
+- Held content is sealed by the owner under the volume's lineage key, and a holder keeps ciphertext and holds no key
+  (A-92; `slates_cluster::sealed`). So the owner seals each entry's payload under the lineage key before it ships it,
+  and a holder never opens one: it checks the chain and the fence (`slates_db::live::Replica`), stores the sealed
+  entry, and answers. A holder's replica is a sealed copy of the owner's own journal for the volume (a checkpoint and
+  the deltas after it), and is bounded as that journal is: each checkpoint the owner publishes is shipped as an entry
+  after which the holder drops everything before it.
+- The barrier is synchronous within one shard step, and the owner's sessions to its candidates live on the control
+  shard. So the owner shard hands each live entry to the control shard over a bounded outbox (its bound the shipper's
+  credit), the control shard ships it (`slates_cluster::live::ship`), and the barrier's reply waits on the existing
+  deferral seams: NFS's await after its barrier (`told::wait`), the deferred reply of a control verb
+  (`acceptance_deferred`, as a green's submit waits for its merge record), FUSE's held replies.
+- A successor opens held envelopes once it has adopted the volume's lineage keys (A-92 piece 4c,
+  `fleet::opened_archive`). So the takeover round carries each live replica's head (`HostPromise`), the successor
+  adopts by `slates_db::live::adopt`, fetches the adopted holder's sealed journal, opens it, and rebuilds the volume as
+  local recovery does (`Journal::recover`, `Volume::from_image`), with the chunk contents placed in its own arena.
+
+The slices, each verified before the next: the owner ships and holders keep (replication lag measured, barriers not
+yet waiting); barriers wait for durability; takeover from a live replica (loss window zero for acknowledged writes,
+AC-8.3); then real processes under chaos.
+
+**Laptop degenerate.** `f = 0`: no holders, every entry durable at the owner's own publication; the same code (R8).
+
+**Testing.** The pure log (owner, holder, phase one) is a sans-io module tested against a model under a deterministic
+nemesis (loss, duplication, reordering, delay, partitions, holder and owner crashes, takeovers), with the register
+invariants as history checks: TotalOrder (every holder's chain is a prefix of the one history of durable entries),
+NoLoss (every durable entry survives every takeover), StaleNeverCommits (no entry of a fenced epoch becomes durable).
+Then the real transport, measured; then the daemon and real processes under chaos.
+
+**Applied in the same change to:** this log only. §4.10's "Live shipping" paragraph, AC-8.3 and AC-8.9 are read
+through it; their status notes follow each built slice.
 
 ### A-212 — What a live WinFsp receive reads and clears, and what a rename visits (2026-11-05)
 
