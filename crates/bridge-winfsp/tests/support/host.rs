@@ -78,8 +78,12 @@ const OVERLAP_PAUSES: u32 = 4;
 /// Format: a private Released marker base: a successor's reading of which journals the kill left a batch in, plus a
 /// set with bit `n` for worker `n`'s journal.
 const LANDING: u64 = SUCCESSOR_READY + 1;
-/// Format: every set of journals holding a batch, one bit a worker.
+/// Format: every set of journals holding a request, one bit a worker.
 const LANDINGS: usize = 1 << crate::inflight::capture::MAX_WORKERS;
+/// Format: a private Released marker: the serving process's later worker began serving once its probe measured (A-219).
+const WORKER_RELEASED: u64 = LANDING + LANDINGS as u64;
+/// Format: a private Released marker: the probing role has made its probe volume and is measuring on it.
+const PROBE_VOLUME_MADE: u64 = WORKER_RELEASED + 1;
 /// Format: a reader's inherited stop event, as a hex handle value, and the index of its first file.
 const STOP: &str = "SLATES_WINFSP_REQUEST_STOP";
 /// Format: see STOP.
@@ -448,11 +452,13 @@ fn serve_mounted(
   }
   let mut names = OpenNames::new();
   let mut recovery_counted = false;
+  let mut release_reported = false;
   loop {
     let request = receive
       .recv_timeout(ROLE_WAIT)
       .expect("the fixture's next request");
     count_recovery(role, &request, mount, &mut recovery_counted);
+    report_release(role, channel, mount, &mut release_reported);
     if role == "first" && matches!(request.op, Op::Read { .. }) {
       channel
         .send(&HandleMessage::Released { id: READ_TAKEN }, WAIT_MS)
@@ -467,6 +473,33 @@ fn serve_mounted(
         .serve(bridge, cx, &mut names, &mut ready.ledger)
         .send()
     );
+  }
+}
+
+/// The kill oracle's servers tell the parent when their later worker began serving (A-219), so it can kill after it.
+fn report_release(role: &str, channel: &Channel, mount: &mut MountThread, reported: &mut bool) {
+  if (role != "serving" && role != "taking") || *reported {
+    return;
+  }
+  while let Some(outcome) = mount.outcome() {
+    match outcome {
+      Outcome::Released(workers) => {
+        eprintln!("WINFSP OVERLAP SERVER: {workers} receive workers serve");
+        channel
+          .send(
+            &HandleMessage::Released {
+              id: WORKER_RELEASED,
+            },
+            WAIT_MS,
+          )
+          .unwrap();
+        *reported = true;
+        return;
+      }
+      Outcome::Failed(error) => panic!("a receive worker failed: {error}"),
+      Outcome::Stopped => panic!("the mount stopped while serving the kill oracle"),
+      _ => {}
+    }
   }
 }
 
@@ -571,6 +604,9 @@ fn request_role() {
   if role == "hammer" {
     hammer(&drive);
   }
+  if role == "probing" {
+    probing();
+  }
   if role != "reader" && role != "probe" {
     serve(&role, &drive);
   }
@@ -598,8 +634,8 @@ fn request_role() {
   std::process::exit(ROLE_EXIT);
 }
 
-/// Which workers' journals the dead server left holding a batch, read from a copy before this successor adopts them
-/// (A-219): bit `n` for worker `n`.
+/// Which workers' journals the dead server left holding a request, read from a copy before this successor adopts them
+/// (A-219): bit `n` for worker `n`. A journal waiting in a receive with nothing delivered holds none.
 fn journals_holding_a_batch(ledger: &OwnedHandle) -> u64 {
   let bound = slates_bridge_core::volume_bridge::MAX_OPEN_HANDLES;
   let memory = SparseObject::from_held_handle(
@@ -621,7 +657,7 @@ fn journals_holding_a_batch(ledger: &OwnedHandle) -> u64 {
       .unwrap()
       .resume()
       .unwrap()
-      .is_some()
+      .is_some_and(|batch| !batch.hints().is_empty())
     {
       holding |= 1 << worker;
     }
@@ -713,9 +749,11 @@ fn hammer(drive: &str) -> ! {
 }
 
 /// A-219. Do: keep three processes reading their own files through the held drive, each read going to the server's
-/// two receive workers, and kill the serving process forty times, each successor taking over the held volume and both
-/// journals. Expect: every read returns its own file's bytes or the driver's cancellation, none waits past WAIT, and
-/// some kills left the second worker's journal holding a batch, as each successor reports from the journals it adopts.
+/// receive workers, and kill the serving process forty times, each successor taking over the held volume and both
+/// journals. Each server's second worker serves only once its probe has measured, so every other kill waits for that
+/// release first and the rest fall before it, mostly during the probe. Expect: every read returns its own file's bytes
+/// or the driver's cancellation, none waits past WAIT, and some kills after a release left the second worker's journal
+/// holding a request, as each successor reports from the journals it adopts.
 #[test]
 fn every_request_is_answered_with_its_own_response_across_kills_of_two_receive_workers() {
   if std::env::var_os("WINFSP_TEST_MOUNT").is_none() {
@@ -747,10 +785,15 @@ fn every_request_is_answered_with_its_own_response_across_kills_of_two_receive_w
   // SAFETY: CreateEventW returned this fresh handle; the value takes its ownership once.
   let stop = unsafe { OwnedHandle::from_raw_handle(event) };
   start_readers(&mut scenario, &stop, &drive);
-  let mut landings = [0u32; LANDINGS];
+  // By whether the killed server's later worker had been released, and by the journals the kill left holding a request.
+  let mut landings = [[0u32; LANDINGS]; 2];
   for kill in 1..=OVERLAP_KILLS {
+    let released = kill % 2 == 0;
+    if released {
+      await_release(&anchor, kill);
+    }
     let landing = kill_and_take_over(&mut scenario, &anchor, &daemon, &drive, kill);
-    landings[landing] += 1;
+    landings[usize::from(released)][landing] += 1;
   }
   // SAFETY: the event is owned and live.
   assert_ne!(unsafe { SetEvent(stop.as_raw_handle()) }, 0);
@@ -761,12 +804,13 @@ fn every_request_is_answered_with_its_own_response_across_kills_of_two_receive_w
       "a reader saw a request lost (exit {LOST_EXIT}) or answered wrong (exit {WRONG_EXIT})"
     );
   }
+  let [early, late] = landings.map(|by_set| by_set.iter().copied().enumerate().collect::<Vec<_>>());
   eprintln!(
-    "WINFSP OVERLAP: {OVERLAP_KILLS} kills by the journals left holding a batch (bit n: worker n): {:?}; every \
-     reader's requests answered with their own bytes or cancelled",
-    landings.iter().enumerate().collect::<Vec<_>>()
+    "WINFSP OVERLAP: {OVERLAP_KILLS} kills by the journals left holding a request (bit n: worker n): before the later \
+     worker's release was awaited {early:?}, after it {late:?}; every reader's requests answered with their own bytes \
+     or cancelled"
   );
-  let second = landings
+  let second = landings[1]
     .iter()
     .enumerate()
     .filter(|(set, _)| set & 2 != 0)
@@ -774,7 +818,19 @@ fn every_request_is_answered_with_its_own_response_across_kills_of_two_receive_w
     .sum::<u32>();
   assert!(
     second > 0,
-    "no kill left the second worker holding a batch, so this run proves nothing about it"
+    "no kill left the second worker holding a request, so this run proves nothing about it"
+  );
+}
+
+/// Waits until the current server's later worker serves (A-219): the first server's, or the last successor's, whose
+/// readiness was the last message.
+fn await_release(anchor: &Channel, kill: u32) {
+  assert_eq!(
+    anchor.recv(WAIT_MS).unwrap(),
+    Some(HandleMessage::Released {
+      id: WORKER_RELEASED
+    }),
+    "kill {kill}: the server's later worker must serve once its probe has measured"
   );
 }
 
@@ -829,11 +885,19 @@ fn kill_and_take_over(
     &handoff.handles(),
   ));
   drop(handoff);
-  let landing = match anchor.recv(WAIT_MS).unwrap() {
-    Some(HandleMessage::Released { id }) if (LANDING..LANDING + LANDINGS as u64).contains(&id) => {
-      usize::try_from(id - LANDING).unwrap()
+  // A release the killed server reported unawaited comes first, before its successor's landing.
+  let landing = loop {
+    match anchor.recv(WAIT_MS).unwrap() {
+      Some(HandleMessage::Released {
+        id: WORKER_RELEASED,
+      }) => {}
+      Some(HandleMessage::Released { id })
+        if (LANDING..LANDING + LANDINGS as u64).contains(&id) =>
+      {
+        break usize::try_from(id - LANDING).unwrap();
+      }
+      other => panic!("kill {kill}: the successor's landing, got {other:?}"),
     }
-    other => panic!("kill {kill}: the successor's landing, got {other:?}"),
   };
   assert_eq!(
     anchor.recv(WAIT_MS).unwrap(),
@@ -843,4 +907,84 @@ fn kill_and_take_over(
     "kill {kill}: the successor must serve"
   );
   landing
+}
+
+/// A-219's probing role: makes a probe volume, tells the parent, and measures on it until the parent kills it.
+fn probing() -> ! {
+  let value = u64::from_str_radix(&std::env::var(CHANNEL).unwrap(), 16).unwrap();
+  let channel = Channel::adopt(inherited_handle(value));
+  let (_sender, mut intents) = crate::purge_intents::channel(1).unwrap();
+  let volume = crate::probe::ProbeVolume::new(crate::ffi::api().unwrap()).unwrap();
+  channel
+    .send(
+      &HandleMessage::Released {
+        id: PROBE_VOLUME_MADE,
+      },
+      WAIT_MS,
+    )
+    .unwrap();
+  // A whole probe runs far past the parent's kill; one that ended first would leave this process to exit on its own.
+  loop {
+    crate::probe::measure_on(&volume, &volume.probe_path(), &mut intents[0], &|| false).unwrap();
+  }
+}
+
+/// A-219. Do: start a process that makes a receive-worker probe volume and measures on it, and kill it mid-probe.
+/// Expect: the volume's device appears while it probes and is gone after the kill, since a WinFsp volume lives on its
+/// control handle, which the process's death closes.
+#[test]
+fn a_probe_killed_mid_measure_leaves_no_volume() {
+  if std::env::var_os("WINFSP_TEST_MOUNT").is_none() {
+    eprintln!("SKIP: the killed-probe oracle needs WINFSP_TEST_MOUNT=1 and WinFsp installed");
+    return;
+  }
+  let before = crate::probe::tests::device_entries();
+  let (anchor, daemon) = channel().unwrap();
+  let inherited = duplicate_inheritable(daemon.raw()).unwrap();
+  let value = format!("{:x}", handle_value(inherited.raw()));
+  let mut child = spawn(
+    "probing",
+    "",
+    &[(OsStr::new(CHANNEL), OsStr::new(&value))],
+    &[inherited.raw()],
+  );
+  drop(inherited);
+  assert_eq!(
+    anchor.recv(WAIT_MS).unwrap(),
+    Some(HandleMessage::Released {
+      id: PROBE_VOLUME_MADE
+    })
+  );
+  let made: Vec<String> = crate::probe::tests::device_entries()
+    .difference(&before)
+    .cloned()
+    .collect();
+  assert!(!made.is_empty(), "the probe's volume device must appear");
+  #[allow(clippy::disallowed_methods)]
+  std::thread::sleep(POLL * 2);
+  assert!(
+    child.process.try_wait().unwrap().is_none(),
+    "the probe must still be measuring when killed"
+  );
+  child.kill_and_reap();
+  let started = Instant::now();
+  loop {
+    let left: Vec<&String> = made
+      .iter()
+      .filter(|entry| crate::probe::tests::device_entries().contains(*entry))
+      .collect();
+    if left.is_empty() {
+      break;
+    }
+    assert!(
+      started.elapsed() < WAIT,
+      "{left:?} outlived the killed probe"
+    );
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(POLL);
+  }
+  eprintln!(
+    "WINFSP PROBE: {made:?} appeared while the probe measured and went within {:?} of its kill",
+    started.elapsed()
+  );
 }

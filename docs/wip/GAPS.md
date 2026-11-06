@@ -6,12 +6,16 @@
 > every step of every worker, alone and twice, under four schedules: 4,255 scenarios, 0 lost, 0 wrong, 0 twice, 0 wrong
 > contexts. It saw 16,713 cross-worker address reuses, 2,533 pass-overs and 1,045 unstamped batches. Red: answering
 > every journal whole gives 202 wrong, keeping the oldest delivery 415. The ledger keeps one unconfirmed open a worker.
-> Built since: the workers in the dispatcher, worker 0 recovering every journal before any worker receives; purge
-> intents to every worker; and the count, derived at a process's first mount by `crate::probe`, which times one waiting
-> worker against two on a hidden volume of its own and takes two only beyond both spreads. **Owed:**
-> - the probe's first rounds and counts on both lanes;
-> - the live 40-kill oracle with two workers on both lanes;
-> - the final A/B against 71cf09ac.
+> Built since: the workers in the dispatcher, worker 0 recovering every journal and serving at once; purge intents to
+> every worker still receiving; and the count, measured off the mount's path by the second worker before it serves
+> (`crate::probe`): one waiting worker against two on a hidden volume of its own, an open-and-close timed, two taken only
+> beyond both spreads. Run 42130583401 on both lanes: the 40-kill oracle with two workers 0 lost, 0 wrong. Its first
+> probe, an absent-name open, found no second-worker win and took 105-216 ms on the mount's path, so it moved off the path
+> and to the open-and-close. **Owed:**
+> - the open-and-close probe's rounds and counts on both lanes;
+> - the kill oracle with the later worker released late, and the probe volume gone however the probe ends;
+> - a process's first mount against main's (no probe) and the probe-on-path build, quiet and loaded;
+> - the final A/B against 71cf09ac and 98000d56, after main's next merge.
 
 > **A-214, A-217 and A-207's port reverted from main (2026-11-05, by the supervisor); their re-landing is owed.** Main CI
 > 42119714654 on b502cf96 failed six jobs, all from this pairing of landed changes, each green on its own branch:

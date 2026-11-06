@@ -1,4 +1,5 @@
-//! How many receive workers a mount runs (A-219), measured from this machine once a process, never named.
+//! How many receive workers a mount runs (A-219), measured from this machine once a process, never named, and never on
+//! the mount's path.
 //!
 //! A second worker pays only when it is already waiting in the kernel as the first sends its response, so the next
 //! request is handed to a waiting thread rather than to one still on its way back into the call. Whether that wins is
@@ -6,12 +7,22 @@
 //! about 7 us an IRP slower on its x86_64 one (audit step 7, BENCHMARKS "What a successful open costs under each serving
 //! pattern"). So the probe measures that hand-off itself. It makes a hidden WinFsp volume with no drive and no file
 //! system behind it, which no other process knows the name of. It serves the volume with one waiting worker, then with
-//! two, in interleaved rounds, and times one client opening an absent name through the volume's device path. The probe
+//! two, in interleaved rounds, and times one client opening and closing a file through the volume's device path: a
+//! Create answered "opened" and the Cleanup and Close that follow it, the closest requests a client sends. The probe
 //! serves through the receive worker's own calls ([`crate::dispatcher::receive_batch`],
 //! [`crate::dispatcher::send_response`]) and its own journal. Each request is answered at once, so the rounds differ
 //! only in how many workers wait. More workers are taken only where every round with more beats every round with
-//! fewer ([`crate::inflight::capture::workers_beyond_spread`]). The rounds and the count are logged. The probe
-//! writes nothing to disk.
+//! fewer ([`crate::inflight::capture::workers_beyond_spread`]). The rounds and the count are logged.
+//!
+//! An open of an absent name, one request with nothing behind it, was the first probe. It showed no second-worker win
+//! on either lane (diagnostics run 42130583401, 35 processes a lane), because the worker was back in its receive long
+//! before the client's next open; the one x86_64 process that derived two met a shift between that runner's two regimes
+//! of open time (near 42 and near 58 us), not a win.
+//!
+//! The probe runs on the mount's second worker before that worker serves (`crate::dispatcher`), so a mount is answered
+//! by its first worker at once. The probe took 105-216 ms on CI's runners, ten times the whole mount (A-213: 10-19 ms).
+//! A stopped worker ends the probe at its next open. The probe volume is deleted however the probe ends, and with the
+//! process when it is killed (the volume lives on its control handle). The probe writes nothing to disk.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -26,58 +37,104 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use crate::ffi::{self, FileSystem, Interface};
 use crate::host::WinFspError;
-use crate::inflight::{self, Refusal, capture};
+use crate::inflight::{self, RESPONSE_BASE, Refusal, Request, capture};
 use crate::purge_intents::Intents;
 
 /// Shape: the rounds of each worker count, interleaved and rotated, so a drifting load lands on every count alike and the
-/// spread of a count is the range of five medians.
-const ROUNDS: usize = 5;
-/// Shape: the timed opens of a round, enough that one scheduling delay cannot move its median.
+/// spread of a count is the range of nine medians. Five let one x86_64 probe of 35 meet a shift between that runner's
+/// two regimes of open time and take two (run 42130583401); off the mount's path, more rounds cost a mount nothing.
+const ROUNDS: usize = 9;
+/// Shape: the timed open-and-closes of a round, enough that one scheduling delay cannot move its median.
 const OPENS: usize = 200;
-/// Shape: the untimed opens that begin each round, while its fresh threads first wait.
+/// Shape: the untimed open-and-closes that begin each round, while its fresh threads first wait.
 const WARM: usize = 20;
-/// Format: the absent name every probe open asks for, under the probe volume's root.
-const ABSENT: &str = "\\slates-receive-probe";
+/// Format: the one name every probe open asks for, under the probe volume's root.
+const PROBE_NAME: &str = "\\slates-receive-probe";
 /// Format: the Win32 prefix that names a device by its NT path, as WinFsp's own tests open an unmounted volume.
 const GLOBALROOT: &str = "\\\\?\\GLOBALROOT";
+/// Format: offsets in a Create response (`FSP_FSCTL_TRANSACT_RSP`, WinFsp v2.1 `inc/winfsp/fsctl.h`):
+/// `IoStatus.Information`, then in `Rsp.Create.Opened` the per-open `UserContext2`, `GrantedAccess` and `FileInfo`, whose
+/// `FileAttributes` comes first and `IndexNumber` 56 bytes in.
+const INFORMATION_AT: usize = 16;
+/// Format: see INFORMATION_AT.
+const CONTEXT_AT: usize = 32;
+/// Format: see INFORMATION_AT.
+const GRANTED_AT: usize = 40;
+/// Format: see INFORMATION_AT.
+const FILE_INFO_AT: usize = 48;
+/// Format: see INFORMATION_AT.
+const INDEX_AT: usize = FILE_INFO_AT + 56;
+/// Format: `Req.Create.DesiredAccess` in a Create request (fsctl.h), granted as asked.
+const DESIRED_ACCESS_AT: usize = 48;
+/// Format: `FILE_OPENED`, a successful open's `IoStatus.Information`.
+const FILE_OPENED: u32 = 1;
+/// Format: `FILE_ATTRIBUTE_ARCHIVE`, a regular file's attributes as slates reports them.
+const ARCHIVE: u32 = 0x20;
+
+/// What a probe measured: the count it derived, and each round's median open-and-close, in nanoseconds, by waiting
+/// workers (the first row one worker).
+pub(crate) type Measured = (usize, Vec<Vec<u64>>);
 
 /// The probe volume's interface: no callback, since the probe answers every request itself and the DLL dispatches none.
 static PROBE_INTERFACE: Interface = Interface::EMPTY;
 
-/// The receive workers each mount of this process runs, measured at the first mount. Two first mounts racing may each
-/// measure; the first to finish sets the count for the process.
-#[cfg(not(test))]
-pub(crate) fn receive_workers() -> Result<usize, WinFspError> {
+/// The receive workers this process's mounts run, measured once, on the first caller's thread, while `stopped` stays
+/// false; `None` when it turned true first. Two first callers racing may each measure; the first to finish sets the
+/// count. `intents` is the calling worker's own channel, which the probe keeps draining.
+pub(crate) fn receive_workers(
+  intents: &mut Intents,
+  stopped: &dyn Fn() -> bool,
+) -> Result<Option<usize>, WinFspError> {
   static WORKERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
   if let Some(count) = WORKERS.get() {
-    return Ok(*count);
+    return Ok(Some(decided(*count)));
   }
-  let (count, _medians) = measure()?;
-  Ok(*WORKERS.get_or_init(|| count))
+  let Some((count, _medians)) = measure(intents, stopped)? else {
+    return Ok(None);
+  };
+  Ok(Some(decided(*WORKERS.get_or_init(|| count))))
 }
 
-/// The library's own tests run every mount with the most workers, so the live kill oracles prove the multi-worker
-/// recovery on every lane whatever its probe derives (A-219); the probe itself is tested on its own below, and the CLI's
-/// mount tests run the derived count.
+/// The count a mount runs: the measured one.
+#[cfg(not(test))]
+fn decided(measured: usize) -> usize {
+  measured
+}
+
+/// The library's own tests run every mount with the most workers, the later ones released only once the probe has
+/// measured, so the live kill oracle proves the multi-worker recovery and the late release on every lane whatever its
+/// probe derives (A-219). The probe itself is tested below; the CLI's mount tests run the measured count.
 #[cfg(test)]
-pub(crate) fn receive_workers() -> Result<usize, WinFspError> {
-  Ok(capture::MAX_WORKERS)
+fn decided(_measured: usize) -> usize {
+  capture::MAX_WORKERS
 }
 
-/// Measures one waiting worker against each larger count up to [`capture::MAX_WORKERS`] and derives the count, logging
-/// both. Returns the count and each round's median open, in nanoseconds, by waiting workers (the first row one worker).
-pub(crate) fn measure() -> Result<(usize, Vec<Vec<u64>>), WinFspError> {
-  let started = Instant::now();
+/// Measures on a probe volume of its own (see [`measure_on`]).
+pub(crate) fn measure(
+  intents: &mut Intents,
+  stopped: &dyn Fn() -> bool,
+) -> Result<Option<Measured>, WinFspError> {
   let api = ffi::api().map_err(|_| WinFspError::NotInstalled)?;
   crate::host::checked_dll(api)?;
   let volume = ProbeVolume::new(api)?;
-  let path = volume.absent_path();
-  // The sender stays alive for the probe: a worker's wait drains its intent channel, and a closed one is a failure.
-  let (_sender, mut intents) = crate::purge_intents::channel(capture::MAX_WORKERS)?;
-  crate::dispatcher::announce_ready(
-    volume.control(),
-    intents.first_mut().ok_or(WinFspError::MountThread)?,
-  )?;
+  measure_on(&volume, &volume.probe_path(), intents, stopped)
+}
+
+/// Measures one waiting worker against each larger count up to [`capture::MAX_WORKERS`] on `volume`, timing opens of
+/// `path`, and derives the count, logging both. Returns the count and each round's median open-and-close, in
+/// nanoseconds, by waiting workers (the first row one worker); `None` when `stopped` turned true first.
+pub(crate) fn measure_on(
+  volume: &ProbeVolume,
+  path: &[u16],
+  intents: &mut Intents,
+  stopped: &dyn Fn() -> bool,
+) -> Result<Option<Measured>, WinFspError> {
+  let started = Instant::now();
+  // The other probe workers' channels; their sender stays alive for the probe, since a closed channel is a failure.
+  let (_sender, mut others) =
+    crate::purge_intents::channel(capture::MAX_WORKERS.saturating_sub(1))?;
+  crate::dispatcher::announce_ready(volume.control(), intents)?;
+  let mut channels: Vec<&mut Intents> = std::iter::once(intents).chain(others.iter_mut()).collect();
   let mut journals: Vec<Vec<u8>> = (0..capture::MAX_WORKERS)
     .map(|_| vec![0; capture::BYTES])
     .collect();
@@ -93,7 +150,14 @@ pub(crate) fn measure() -> Result<(usize, Vec<Vec<u64>>), WinFspError> {
       let waiting = arm
         .checked_add(1)
         .ok_or(WinFspError::Capture(Refusal::Length))?;
-      let median = serve_round(&volume, &path, waiting, &mut intents, &mut journals)?;
+      let Some(median) = serve_round(volume, path, waiting, &mut channels, &mut journals, stopped)?
+      else {
+        slates_machine::log_line!(
+          "slates-winfsp: the receive-worker probe stopped after {} ms, its worker told to end",
+          started.elapsed().as_millis()
+        );
+        return Ok(None);
+      };
       medians
         .get_mut(arm)
         .ok_or(WinFspError::Capture(Refusal::Length))?
@@ -102,15 +166,15 @@ pub(crate) fn measure() -> Result<(usize, Vec<Vec<u64>>), WinFspError> {
   }
   let count = capture::workers_beyond_spread(&medians);
   slates_machine::log_line!(
-    "slates-winfsp: receive workers = {count}: median open of each round, in ns, by waiting workers from one: {medians:?}; \
-     more workers only where every round beats every round of fewer; probe took {} ms",
+    "slates-winfsp: receive workers = {count}: median open-and-close of each round, in ns, by waiting workers from one: \
+     {medians:?}; more workers only where every round beats every round of fewer; probe took {} ms",
     started.elapsed().as_millis()
   );
-  Ok((count, medians))
+  Ok(Some((count, medians)))
 }
 
 /// A hidden WinFsp volume with no mount point, deleted on drop. Only the probe's own threads transact on it.
-struct ProbeVolume {
+pub(crate) struct ProbeVolume {
   api: &'static ffi::Api,
   file_system: *mut FileSystem,
   control: HANDLE,
@@ -119,7 +183,7 @@ struct ProbeVolume {
 }
 
 impl ProbeVolume {
-  fn new(api: &'static ffi::Api) -> Result<Self, WinFspError> {
+  pub(crate) fn new(api: &'static ffi::Api) -> Result<Self, WinFspError> {
     let file_system =
       crate::host::create_file_system(api, &crate::host::volume_params(true), &PROBE_INTERFACE)?;
     // SAFETY: FspFileSystemCreate returned this initialized public prefix: the volume's control handle, owned by the
@@ -138,14 +202,21 @@ impl ProbeVolume {
     self.control
   }
 
-  /// The absent name's path through the volume's device: `\\?\GLOBALROOT\Device\Volume{...}\slates-receive-probe`.
-  fn absent_path(&self) -> Vec<u16> {
+  /// The probe's file through the volume's device: `\\?\GLOBALROOT\Device\Volume{...}\slates-receive-probe`.
+  pub(crate) fn probe_path(&self) -> Vec<u16> {
     GLOBALROOT
       .encode_utf16()
       .chain(self.name.iter().copied())
-      .chain(ABSENT.encode_utf16())
+      .chain(PROBE_NAME.encode_utf16())
       .chain(Some(0))
       .collect()
+  }
+
+  /// The volume's entry in the object manager's `\Device` directory (`Volume{...}`), for the tests that it is gone.
+  #[cfg(test)]
+  pub(crate) fn device_entry(&self) -> String {
+    let name = String::from_utf16_lossy(&self.name);
+    name.rsplit('\\').next().unwrap_or_default().to_owned()
   }
 }
 
@@ -159,24 +230,25 @@ impl Drop for ProbeVolume {
 /// How a round tells its workers to end. A transact waits inside the call (WinFsp v2.1 `src/sys/fsctl.c:95-99`), so a
 /// worker is ended by a request, never by cancelling its wait.
 struct Ending {
-  /// Set once the round's timed opens are done: a worker ends once it has answered a request received after this.
+  /// Set once the round's timed opens are done: a worker answers any Create received after this "not found" and ends.
   stop: AtomicBool,
-  /// The workers that have ended or are ending: each counts itself before it sends its last response, so the client
-  /// knows, when that open returns, whether another worker still waits for one.
+  /// The workers that have ended or are ending: each counts itself before it sends that Create's response, so when the
+  /// client's open returns it knows whether another worker still waits for one.
   ended: AtomicUsize,
   /// Set when the round failed with no open outstanding: a worker then ends at any return, its idle timeout too.
   abandoned: AtomicBool,
 }
 
-/// One round: `waiting` workers serve while this thread times its opens; then each worker is ended by one more open and
-/// joined. Returns the round's median open.
+/// One round: `waiting` workers serve while this thread times its open-and-closes; then each worker is ended by one
+/// more open and joined. Returns the round's median, `None` when `stopped` turned true first.
 fn serve_round(
   volume: &ProbeVolume,
   path: &[u16],
   waiting: usize,
-  intents: &mut [Intents],
+  channels: &mut [&mut Intents],
   journals: &mut [Vec<u8>],
-) -> Result<u64, WinFspError> {
+  stopped: &dyn Fn() -> bool,
+) -> Result<Option<u64>, WinFspError> {
   // A handle is a value, carried to the workers as one.
   let control = volume.control().addr();
   let ending = Ending {
@@ -187,8 +259,9 @@ fn serve_round(
   std::thread::scope(|scope| {
     let mut threads = Vec::with_capacity(waiting);
     let mut spawned = Ok(());
-    for (intents, journal) in intents.iter_mut().zip(journals.iter_mut()).take(waiting) {
+    for (intents, journal) in channels.iter_mut().zip(journals.iter_mut()).take(waiting) {
       let ending = &ending;
+      let intents = &mut **intents;
       match std::thread::Builder::new()
         .name("slates-winfsp-receive-probe".to_owned())
         .spawn_scoped(scope, move || {
@@ -201,15 +274,18 @@ fn serve_round(
         }
       }
     }
-    let timed = spawned.and_then(|()| time_opens(path)).and_then(|median| {
-      // No open is outstanding: each returned once its response was taken. Every open from here ends the worker that
-      // answers it, and one is made only while a worker has not counted itself ending, so some worker receives it.
-      ending.stop.store(true, Ordering::Release);
-      while ending.ended.load(Ordering::Acquire) < threads.len() {
-        open_absent(path)?;
-      }
-      Ok(median)
-    });
+    let timed = spawned
+      .and_then(|()| time_cycles(path, stopped))
+      .and_then(|median| {
+        // No open is outstanding: each returned once its response was taken (a Close may still be queued, which ends no
+        // worker). Every Create from here ends the worker that answers it, and one is made only while a worker has not
+        // counted itself ending, so some worker receives it.
+        ending.stop.store(true, Ordering::Release);
+        while ending.ended.load(Ordering::Acquire) < threads.len() {
+          open_ending(path)?;
+        }
+        Ok(median)
+      });
     if timed.is_err() {
       ending.abandoned.store(true, Ordering::Release);
     }
@@ -227,8 +303,9 @@ fn serve_round(
   })
 }
 
-/// One waiting worker: receive into its journal, answer each request at once (a Create "not found", anything else
-/// cancelled), send each response alone, until it has answered a request after the round's stop.
+/// One waiting worker: receive into its journal, answer each request at once (a Create "opened", or "not found" once the
+/// round stops; a Cleanup and a Close done; anything else cancelled), send each response alone, until it has answered a
+/// Create after the round's stop.
 fn serve_waiting(
   control: usize,
   journal: &mut [u8],
@@ -239,6 +316,8 @@ fn serve_waiting(
   let not_found = crate::ntstatus(&slates_vfs::VfsError::NotFound).as_i32();
   // What this worker's last batch filled; its first receive clears the whole buffer.
   let mut used = None;
+  // Each open's context, as a mount's ledger tokens are: small, distinct, never zero.
+  let mut context = 0u64;
   loop {
     let mut receiving = capture::Capture::new(&mut *journal)
       .and_then(|capture| capture.begin(used))
@@ -252,51 +331,117 @@ fn serve_waiting(
     let mut batch = receiving
       .received(reported, crate::dispatcher::performance_counter()?)
       .map_err(WinFspError::Capture)?;
-    let mut answered = false;
+    let mut ends = false;
     while let Some(request) = batch.next_request().map_err(WinFspError::Capture)? {
       let mut response = request.cancelled_response().map_err(WinFspError::Capture)?;
-      if request.kind() == inflight::CREATE_KIND {
-        inflight::finish_response(&mut response, not_found).map_err(WinFspError::Capture)?;
+      match request.kind() {
+        inflight::CREATE_KIND if stopping => {
+          inflight::finish_response(&mut response, not_found).map_err(WinFspError::Capture)?;
+          if !ends {
+            ending.ended.fetch_add(1, Ordering::Release);
+            ends = true;
+          }
+        }
+        inflight::CREATE_KIND => {
+          context = context.saturating_add(1);
+          opened(&mut response, &request, context)?;
+        }
+        inflight::CLEANUP_KIND | inflight::CLOSE_KIND => {
+          inflight::finish_response(&mut response, 0).map_err(WinFspError::Capture)?;
+        }
+        _ => {}
       }
       batch
         .record_response(&request, &response)
         .map_err(WinFspError::Capture)?;
-      if stopping && !answered {
-        ending.ended.fetch_add(1, Ordering::Release);
-      }
-      answered = true;
       crate::dispatcher::send_response(control, &response, intents)?;
       batch
         .acknowledge(request.hint())
         .map_err(WinFspError::Capture)?;
     }
-    if stopping && answered {
+    if ends {
       return Ok(());
     }
   }
 }
 
-/// Opens the absent name WARM and then OPENS times, and returns the timed opens' median.
-fn time_opens(path: &[u16]) -> Result<u64, WinFspError> {
+/// A Create's success, in place: the file opened with what it asked for granted, `context` its per-open context and
+/// index number, a regular file's attributes and an empty size.
+fn opened(
+  response: &mut [u8; RESPONSE_BASE],
+  request: &Request<'_>,
+  context: u64,
+) -> Result<(), WinFspError> {
+  let desired: [u8; size_of::<u32>()] = request
+    .bytes()
+    .get(DESIRED_ACCESS_AT..DESIRED_ACCESS_AT.saturating_add(size_of::<u32>()))
+    .and_then(|bytes| bytes.try_into().ok())
+    .ok_or(WinFspError::Capture(Refusal::Length))?;
+  put(response, INFORMATION_AT, &FILE_OPENED.to_le_bytes())?;
+  put(response, CONTEXT_AT, &context.to_le_bytes())?;
+  put(response, GRANTED_AT, &desired)?;
+  put(response, FILE_INFO_AT, &ARCHIVE.to_le_bytes())?;
+  put(response, INDEX_AT, &context.to_le_bytes())?;
+  inflight::finish_response(response, 0)
+    .map(|_| ())
+    .map_err(WinFspError::Capture)
+}
+
+fn put(response: &mut [u8], at: usize, bytes: &[u8]) -> Result<(), WinFspError> {
+  let end = at
+    .checked_add(bytes.len())
+    .ok_or(WinFspError::Capture(Refusal::Length))?;
+  response
+    .get_mut(at..end)
+    .ok_or(WinFspError::Capture(Refusal::Length))?
+    .copy_from_slice(bytes);
+  Ok(())
+}
+
+/// Opens and closes the probe's file WARM and then OPENS times, and returns the timed ones' median; `None` as soon as
+/// `stopped` is true.
+fn time_cycles(path: &[u16], stopped: &dyn Fn() -> bool) -> Result<Option<u64>, WinFspError> {
   let mut times = Vec::with_capacity(OPENS);
-  for open in 0..WARM.saturating_add(OPENS) {
-    let took = open_absent(path)?;
-    if open >= WARM {
-      times.push(took);
+  for cycle in 0..WARM.saturating_add(OPENS) {
+    if stopped() {
+      return Ok(None);
+    }
+    let began = Instant::now();
+    let handle = create(path).map_err(|code| WinFspError::Os {
+      call: "open the receive probe's file",
+      code,
+    })?;
+    close(handle)?;
+    if cycle >= WARM {
+      times.push(u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX));
     }
   }
   times.sort_unstable();
   times
     .get(times.len() / 2)
     .copied()
+    .map(Some)
     .ok_or(WinFspError::Capture(Refusal::Length))
 }
 
-/// One open of the absent name, which must be answered "not found"; returns its time in nanoseconds. Any other answer is
-/// a refusal: the probe would be timing something else.
-fn open_absent(path: &[u16]) -> Result<u64, WinFspError> {
-  let began = Instant::now();
-  // SAFETY: a NUL-terminated path; no security attributes or template; a returned handle is closed below.
+/// One open made after the round's stop, which a worker must answer "not found" as it ends.
+fn open_ending(path: &[u16]) -> Result<(), WinFspError> {
+  match create(path) {
+    Ok(handle) => {
+      close(handle)?;
+      Err(WinFspError::Capture(Refusal::State))
+    }
+    Err(code) if code == i32::try_from(ERROR_FILE_NOT_FOUND).ok() => Ok(()),
+    Err(code) => Err(WinFspError::Os {
+      call: "end a receive-probe worker",
+      code,
+    }),
+  }
+}
+
+/// Opens `path` for its attributes alone; the system's error code when refused.
+fn create(path: &[u16]) -> Result<HANDLE, Option<i32>> {
+  // SAFETY: a NUL-terminated path; no security attributes or template; a returned handle is closed by the caller.
   let handle = unsafe {
     CreateFileW(
       path.as_ptr(),
@@ -308,36 +453,123 @@ fn open_absent(path: &[u16]) -> Result<u64, WinFspError> {
       std::ptr::null_mut(),
     )
   };
-  let took = began.elapsed();
-  if handle != INVALID_HANDLE_VALUE {
-    // SAFETY: the handle just opened, closed once.
-    unsafe { CloseHandle(handle) };
-    return Err(WinFspError::Capture(Refusal::State));
+  if handle == INVALID_HANDLE_VALUE {
+    return Err(std::io::Error::last_os_error().raw_os_error());
   }
-  let code = std::io::Error::last_os_error().raw_os_error();
-  if code != i32::try_from(ERROR_FILE_NOT_FOUND).ok() {
+  Ok(handle)
+}
+
+fn close(handle: HANDLE) -> Result<(), WinFspError> {
+  // SAFETY: a handle `create` just returned, closed once.
+  if unsafe { CloseHandle(handle) } == 0 {
     return Err(WinFspError::Os {
-      call: "open the receive probe's absent name",
-      code,
+      call: "close the receive probe's file",
+      code: std::io::Error::last_os_error().raw_os_error(),
     });
   }
-  Ok(u64::try_from(took.as_nanos()).unwrap_or(u64::MAX))
+  Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-  #![allow(clippy::unwrap_used, clippy::expect_used)]
+pub(crate) mod tests {
+  #![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation
+  )]
   use super::*;
+  use std::collections::BTreeSet;
+  use std::time::Duration;
+
+  /// `OBJECT_DIRECTORY_INFORMATION`: one entry of an object-manager directory, as `NtQueryDirectoryObject` returns it.
+  #[repr(C)]
+  struct DirectoryEntry {
+    name: windows_sys::Win32::Foundation::UNICODE_STRING,
+    type_name: windows_sys::Win32::Foundation::UNICODE_STRING,
+  }
+
+  /// Every entry of the object manager's `\Device` directory: a WinFsp volume is one (`Volume{...}`) while it lives.
+  pub(crate) fn device_entries() -> BTreeSet<String> {
+    use windows_sys::Wdk::Foundation::{NtClose, OBJECT_ATTRIBUTES};
+    use windows_sys::Wdk::Storage::FileSystem::{NtOpenDirectoryObject, NtQueryDirectoryObject};
+    /// Format: DIRECTORY_QUERY, the right to list a directory object.
+    const DIRECTORY_QUERY: u32 = 1;
+    let mut path: Vec<u16> = "\\Device".encode_utf16().collect();
+    let bytes = u16::try_from(path.len() * 2).unwrap();
+    let name = windows_sys::Win32::Foundation::UNICODE_STRING {
+      Length: bytes,
+      MaximumLength: bytes,
+      Buffer: path.as_mut_ptr(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+      Length: u32::try_from(std::mem::size_of::<OBJECT_ATTRIBUTES>()).unwrap(),
+      ObjectName: &name,
+      ..OBJECT_ATTRIBUTES::default()
+    };
+    let mut directory = std::ptr::null_mut();
+    // SAFETY: the attributes and the name they point at live through the call; the handle is closed below.
+    let status = unsafe { NtOpenDirectoryObject(&mut directory, DIRECTORY_QUERY, &attributes) };
+    assert_eq!(status, 0, "open the \\Device directory");
+    let mut entries = BTreeSet::new();
+    let mut buffer = vec![0u64; 512];
+    let mut context = 0u32;
+    loop {
+      let mut returned = 0u32;
+      // SAFETY: the buffer is owned and its length given in bytes; one entry a call, its strings inside the buffer.
+      let status = unsafe {
+        NtQueryDirectoryObject(
+          directory,
+          buffer.as_mut_ptr().cast(),
+          u32::try_from(buffer.len() * size_of::<u64>()).unwrap(),
+          true,
+          false,
+          &mut context,
+          &mut returned,
+        )
+      };
+      if status != 0 {
+        break;
+      }
+      // SAFETY: a successful query wrote one entry at the buffer's start, eight-byte aligned, its name's buffer within
+      // ours and its length in bytes.
+      let name = unsafe {
+        let entry = &*buffer.as_ptr().cast::<DirectoryEntry>();
+        std::slice::from_raw_parts(entry.name.Buffer, usize::from(entry.name.Length) / 2)
+      };
+      entries.insert(String::from_utf16_lossy(name));
+    }
+    // SAFETY: the directory handle opened above, closed once.
+    unsafe { NtClose(directory) };
+    entries
+  }
+
+  fn never() -> bool {
+    false
+  }
 
   /// A-219. Do: run the receive-worker probe on a WinFsp volume of its own. Expect: every worker count measured in
-  /// every round, each round's median a real time, and a derived count between one and the most, printed with the rounds.
+  /// every round, each round's median a real time, a derived count between one and the most, printed with the rounds,
+  /// and the probe's volume gone once it returns.
   #[test]
   fn the_probe_measures_every_count_in_every_round_and_derives_one_of_them() {
     if std::env::var_os("WINFSP_TEST_MOUNT").is_none() {
       eprintln!("SKIP: the receive-worker probe needs WINFSP_TEST_MOUNT=1 and WinFsp installed");
       return;
     }
-    let (count, medians) = measure().unwrap();
+    let (_sender, mut intents) = crate::purge_intents::channel(1).unwrap();
+    let api = ffi::api().unwrap();
+    let volume = ProbeVolume::new(api).unwrap();
+    let entry = volume.device_entry();
+    assert!(
+      device_entries().contains(&entry),
+      "the probe's volume {entry}"
+    );
+    let (count, medians) = measure_on(&volume, &volume.probe_path(), &mut intents[0], &never)
+      .unwrap()
+      .unwrap();
+    drop(volume);
     eprintln!("WINFSP PROBE: count {count} from medians {medians:?} ns");
     assert_eq!(medians.len(), capture::MAX_WORKERS);
     for rounds in &medians {
@@ -345,5 +577,64 @@ mod tests {
       assert!(rounds.iter().all(|median| *median > 0));
     }
     assert!((1..=capture::MAX_WORKERS).contains(&count));
+    assert!(
+      !device_entries().contains(&entry),
+      "{entry} outlived its probe"
+    );
+  }
+
+  /// A-219. Do: run the probe on its own volume with a client path no volume answers, so its first open fails. Expect:
+  /// the probe refuses, its workers end at their idle return, and its volume is gone once it drops.
+  #[test]
+  fn a_probe_whose_open_fails_ends_its_workers_and_leaves_no_volume() {
+    if std::env::var_os("WINFSP_TEST_MOUNT").is_none() {
+      eprintln!("SKIP: the receive-worker probe needs WINFSP_TEST_MOUNT=1 and WinFsp installed");
+      return;
+    }
+    let (_sender, mut intents) = crate::purge_intents::channel(1).unwrap();
+    let volume = ProbeVolume::new(ffi::api().unwrap()).unwrap();
+    let entry = volume.device_entry();
+    let nowhere: Vec<u16> = "\\\\?\\GLOBALROOT\\Device\\slates-no-such-device\\file"
+      .encode_utf16()
+      .chain(Some(0))
+      .collect();
+    let refused = measure_on(&volume, &nowhere, &mut intents[0], &never);
+    assert!(
+      matches!(refused, Err(WinFspError::Os { .. })),
+      "the probe's open must be refused, got {:?}",
+      refused.map(|measured| measured.map(|(count, _)| count))
+    );
+    drop(volume);
+    assert!(
+      !device_entries().contains(&entry),
+      "{entry} outlived its failed probe"
+    );
+  }
+
+  /// A-219. Do: start the probe with its worker already told to stop. Expect: it ends at its first open, well within one
+  /// transaction timeout (no worker waits one out), and its volume is gone once it drops.
+  #[test]
+  fn a_stopped_probe_ends_at_its_first_open_and_leaves_no_volume() {
+    if std::env::var_os("WINFSP_TEST_MOUNT").is_none() {
+      eprintln!("SKIP: the receive-worker probe needs WINFSP_TEST_MOUNT=1 and WinFsp installed");
+      return;
+    }
+    let (_sender, mut intents) = crate::purge_intents::channel(1).unwrap();
+    let volume = ProbeVolume::new(ffi::api().unwrap()).unwrap();
+    let entry = volume.device_entry();
+    let began = Instant::now();
+    let stopped = measure_on(&volume, &volume.probe_path(), &mut intents[0], &|| true).unwrap();
+    let took = began.elapsed();
+    drop(volume);
+    eprintln!("WINFSP PROBE: a stopped probe ended in {took:?}");
+    assert!(stopped.is_none());
+    assert!(
+      took < Duration::from_millis(u64::from(crate::dispatcher::TRANSACT_TIMEOUT_MS)),
+      "a stopped probe took {took:?}"
+    );
+    assert!(
+      !device_entries().contains(&entry),
+      "{entry} outlived its stopped probe"
+    );
   }
 }

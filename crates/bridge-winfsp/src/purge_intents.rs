@@ -71,22 +71,29 @@ pub(crate) fn channel(workers: usize) -> Result<(Sender, Vec<Intents>), WinFspEr
 }
 
 impl Sender {
-  /// Publishes `intent` to every worker, in turn; each worker drains its own bounded channel.
+  /// Publishes `intent` to every worker still receiving, in turn; each worker drains its own bounded channel. A worker
+  /// whose channel is closed has ended and takes no Create, as one does when the probe's count stops short of it
+  /// (A-219); refused only when no worker is left, since then the mount's receiving has ended.
   pub(crate) fn publish(&self, intent: Option<Purge>) -> Result<(), WinFspError> {
+    let mut reached = false;
     for (messages, event) in &self.workers {
       match messages.try_send(intent.clone()) {
         Ok(()) => {}
         Err(TrySendError::Full(intent)) => {
           // Wake before a blocking send: a rejected drive open may have produced no callback at all.
           signal(event)?;
-          messages
-            .send(intent)
-            .map_err(|_| WinFspError::MountThread)?;
+          if messages.send(intent).is_err() {
+            continue;
+          }
         }
-        Err(TrySendError::Disconnected(_)) => return Err(WinFspError::MountThread),
+        Err(TrySendError::Disconnected(_)) => continue,
       }
+      reached = true;
       // Signal after publication as well: the reader may have drained the prior full queue before this send finished.
       signal(event)?;
+    }
+    if !reached {
+      return Err(WinFspError::MountThread);
     }
     Ok(())
   }
@@ -225,5 +232,22 @@ mod tests {
       assert_eq!(intents.progress().unwrap(), 1);
       assert_eq!(intents.current(), None);
     }
+  }
+
+  /// A-219. Do: end one of two workers (its intents dropped, as when the probe's count stops short of it), publish, then
+  /// end the other and publish again. Expect: the first publish reaches the worker still receiving; the second is
+  /// refused, since no worker is left to take a private Create.
+  #[test]
+  fn a_publish_skips_an_ended_worker_and_is_refused_once_none_is_left() {
+    let (sender, mut readers) = channel(2).unwrap();
+    let mut serving = readers.remove(0);
+    drop(readers);
+    sender.publish(None).unwrap();
+    assert_eq!(serving.progress().unwrap(), 1);
+    drop(serving);
+    assert!(matches!(
+      sender.publish(None),
+      Err(WinFspError::MountThread)
+    ));
   }
 }

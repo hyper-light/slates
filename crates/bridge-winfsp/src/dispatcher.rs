@@ -114,8 +114,9 @@ pub(crate) fn announce_ready(
 }
 
 /// The receive workers (A-219), each on its own thread with its own journal. Their owner closes every stop channel and joins
-/// every thread before freeing the DLL object. Worker 0 recovers every journal before any worker receives, then releases
-/// the others.
+/// every thread before freeing the DLL object. Worker 0 recovers every journal before any worker receives and serves at
+/// once, so the mount is answered without waiting for the probe. Each further worker first runs the receive-worker probe
+/// (`crate::probe`) and serves, after worker 0's recovery, only where the count reaches it; otherwise it ends.
 pub(crate) struct Worker {
   stops: Vec<SyncSender<()>>,
   threads: Vec<JoinHandle<Result<(), WinFspError>>>,
@@ -157,7 +158,7 @@ impl Worker {
       let start = if index == 0 {
         Start::Recover(releases.take().unwrap_or_default())
       } else {
-        Start::Wait(waits.next().ok_or(WinFspError::MountThread)?)
+        Start::Probe(waits.next().ok_or(WinFspError::MountThread)?)
       };
       let (outcomes, wake, confirmations) = (outcomes.clone(), wake.clone(), confirmations.clone());
       let thread = std::thread::Builder::new()
@@ -212,11 +213,11 @@ impl Worker {
   }
 }
 
-/// How a worker begins: worker 0 recovers every journal and then releases the others; each other worker waits for that
-/// release (or for worker 0's end, which drops it) before its first receive (A-219).
+/// How a worker begins: worker 0 recovers every journal and then releases the others; each other worker probes, and if
+/// the count reaches it waits for that release (or for worker 0's end, which drops it) before its first receive (A-219).
 enum Start {
   Recover(Vec<SyncSender<()>>),
-  Wait(Receiver<()>),
+  Probe(Receiver<()>),
 }
 
 /// A view of the held section. Only the receive suffix is borrowed: the shard independently owns the disjoint open
@@ -649,11 +650,26 @@ fn receive_loop(
         release.send(()).map_err(|_| WinFspError::MountThread)?;
       }
     }
-    Start::Wait(wait) => {
+    Start::Probe(wait) => {
+      // The probe keeps this worker's intent channel drained; a stop ends it at its next open.
+      let Some(workers) =
+        crate::probe::receive_workers(&mut owned.private.intents, &|| is_stopped(&stopped))?
+      else {
+        return Ok(());
+      };
+      // The count stops short of this worker: it ends, and its intent channel closes with it.
+      if worker >= workers {
+        return Ok(());
+      }
       // Worker 0 dropping the release without sending it ended the mount first: nothing to serve.
       if wait.recv().is_err() {
         return Ok(());
       }
+      slates_machine::log_line!("slates-winfsp: receive worker {worker} serves, after the probe");
+      outcomes
+        .send(crate::host::Outcome::Released(worker.saturating_add(1)))
+        .map_err(|_| WinFspError::MountThread)?;
+      wake.wake_by_ref();
     }
   }
   serve_loop(file_system, &mut view, worker, &stopped, &shard, &mut owned)

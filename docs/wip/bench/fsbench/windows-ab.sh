@@ -9,6 +9,9 @@
 #   OLD_SLATES=old/slates.exe NEW_SLATES=new/slates.exe BENCH=new/mount_bench.exe \
 #     OLD_NAME=dll NEW_NAME=receiver RUNS=5 SPINNERS_PER_CPU=2 bash docs/wip/bench/fsbench/windows-ab.sh
 #
+# MID_SLATES (named MID_NAME) adds a third build, measured the same way beside the other two; the build started first
+# then rotates over all three.
+#
 # Each run ends with the line `## run N of M done` (or `FAILED`), and AFTER_RUN, if set, is a command run then (CI publishes the
 # output so far with it). FILES and ROUNDS shrink the workload for a smoke run; recorded numbers use the program's
 # defaults. Each daemon's error output is printed after its run.
@@ -16,6 +19,8 @@ set -euo pipefail
 : "${OLD_SLATES:?the older build's slates.exe}" "${NEW_SLATES:?the newer build's slates.exe}" "${BENCH:?mount_bench.exe}"
 OLD_NAME=${OLD_NAME:-old}
 NEW_NAME=${NEW_NAME:-new}
+MID_SLATES=${MID_SLATES:-}
+MID_NAME=${MID_NAME:-mid}
 RUNS=${RUNS:-5}
 SPINNERS_PER_CPU=${SPINNERS_PER_CPU:-2}
 W=${RUNNER_TEMP:-${TEMP:-.}}/fsbench-ab-$$
@@ -23,14 +28,17 @@ mkdir -p "$W"
 
 # The pid, instance, drive and binary of each side of the current run; both sides are torn down however a run ends.
 OLD_ANCHOR= NEW_ANCHOR= OLD_DRIVE= NEW_DRIVE= OLD_INSTANCE= NEW_INSTANCE=
+MID_ANCHOR= MID_DRIVE= MID_INSTANCE=
 
 teardown() {
   set +e
   if [ -n "$OLD_DRIVE" ] && [ -e "$OLD_DRIVE/" ]; then "$OLD_SLATES" --instance "$OLD_INSTANCE" unmount "$OLD_DRIVE"; fi
   if [ -n "$NEW_DRIVE" ] && [ -e "$NEW_DRIVE/" ]; then "$NEW_SLATES" --instance "$NEW_INSTANCE" unmount "$NEW_DRIVE"; fi
+  if [ -n "$MID_DRIVE" ] && [ -e "$MID_DRIVE/" ]; then "$MID_SLATES" --instance "$MID_INSTANCE" unmount "$MID_DRIVE"; fi
   if [ -n "$OLD_ANCHOR" ]; then kill "$OLD_ANCHOR" 2>/dev/null; wait "$OLD_ANCHOR" 2>/dev/null; fi
   if [ -n "$NEW_ANCHOR" ]; then kill "$NEW_ANCHOR" 2>/dev/null; wait "$NEW_ANCHOR" 2>/dev/null; fi
-  OLD_ANCHOR= NEW_ANCHOR= OLD_DRIVE= NEW_DRIVE=
+  if [ -n "$MID_ANCHOR" ]; then kill "$MID_ANCHOR" 2>/dev/null; wait "$MID_ANCHOR" 2>/dev/null; fi
+  OLD_ANCHOR= NEW_ANCHOR= MID_ANCHOR= OLD_DRIVE= NEW_DRIVE= MID_DRIVE=
   set -e
 }
 
@@ -49,7 +57,8 @@ trap cleanup EXIT
 
 free_drive() {
   for letter in S T U V W X Y Z; do
-    if [ ! -e "$letter:/" ] && [ "$letter:" != "$OLD_DRIVE" ] && [ "$letter:" != "$NEW_DRIVE" ]; then
+    if [ ! -e "$letter:/" ] && [ "$letter:" != "$OLD_DRIVE" ] && [ "$letter:" != "$NEW_DRIVE" ] \
+      && [ "$letter:" != "$MID_DRIVE" ]; then
       echo "$letter:"
       return 0
     fi
@@ -103,9 +112,23 @@ start_new() {
   mount_volume "$NEW_SLATES" "$NEW_INSTANCE" "$NEW_DRIVE"
 }
 
+start_mid() {
+  MID_INSTANCE=fsb-$$-$1-mid
+  start_anchor "$MID_SLATES" "$MID_INSTANCE" MID_ANCHOR
+  MID_DRIVE=$(free_drive)
+  mount_volume "$MID_SLATES" "$MID_INSTANCE" "$MID_DRIVE"
+}
+
 for run in $(seq 1 "$RUNS"); do
   echo "## run $run of $RUNS, $(date -u +%FT%TZ)"
-  if [ $((run % 2)) -eq 1 ]; then
+  if [ -n "$MID_SLATES" ]; then
+    case $((run % 3)) in
+      1) start_old "$run"; start_mid "$run"; start_new "$run"; first=$OLD_NAME ;;
+      2) start_mid "$run"; start_new "$run"; start_old "$run"; first=$MID_NAME ;;
+      *) start_new "$run"; start_old "$run"; start_mid "$run"; first=$NEW_NAME ;;
+    esac
+    echo "# $first started first: $OLD_NAME=$OLD_DRIVE $MID_NAME=$MID_DRIVE $NEW_NAME=$NEW_DRIVE"
+  elif [ $((run % 2)) -eq 1 ]; then
     start_old "$run"
     start_new "$run"
     echo "# $OLD_NAME started first: $OLD_NAME=$OLD_DRIVE $NEW_NAME=$NEW_DRIVE"
@@ -117,15 +140,16 @@ for run in $(seq 1 "$RUNS"); do
   # A run that fails is said to have failed and its logs printed, and the next run goes on: under load the anchor may
   # kill a daemon that missed its heartbeat, and a failed run is a result to record, not a reason to lose the rest.
   outcome=done
-  "$BENCH" --arm "$OLD_NAME=$OLD_DRIVE/" --arm "$NEW_NAME=$NEW_DRIVE/" --spinners-per-cpu "$SPINNERS_PER_CPU" \
+  "$BENCH" --arm "$OLD_NAME=$OLD_DRIVE/" ${MID_SLATES:+--arm "$MID_NAME=$MID_DRIVE/"} --arm "$NEW_NAME=$NEW_DRIVE/" \
+    --spinners-per-cpu "$SPINNERS_PER_CPU" \
     ${FILES:+--files "$FILES"} ${ROUNDS:+--rounds "$ROUNDS"} || outcome=FAILED
   # After the teardown, so a daemon's last words are in it.
   teardown
-  for side in "$OLD_INSTANCE" "$NEW_INSTANCE"; do
+  for side in "$OLD_INSTANCE" "$NEW_INSTANCE" ${MID_SLATES:+"$MID_INSTANCE"}; do
     echo "# $side's error output, $(wc -l < "$W/$side.err") lines:"
     cat "$W/$side.err"
   done
-  rm -f "$W/$OLD_INSTANCE.err" "$W/$NEW_INSTANCE.err"
+  rm -f "$W/$OLD_INSTANCE.err" "$W/$NEW_INSTANCE.err" ${MID_SLATES:+"$W/$MID_INSTANCE.err"}
   echo "## run $run of $RUNS $outcome, $(date -u +%FT%TZ)"
   if [ -n "${AFTER_RUN:-}" ]; then "$AFTER_RUN"; fi
 done

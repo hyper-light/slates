@@ -174,8 +174,9 @@ const VOLUME_INFO_TIMEOUT_VALID: u32 = 1 << 0;
 /// Shape: the one receiver waits for its current callback's answer before sending another request to the shard.
 pub const REQUEST_BOUND: usize = 1;
 /// Shape: the outcomes the mount thread can have unread at once: a command's (the task sends at most one command, a
-/// round or a purge, before reading its outcome) or the mount's, and the stop's after either.
-const OUTCOME_BOUND: usize = 4;
+/// round or a purge, before reading its outcome) or the mount's, the recovery's, a later worker's release (A-219), and
+/// the stop's after any.
+const OUTCOME_BOUND: usize = 5;
 /// Shape: commands queued to the mount thread: one round out at a time.
 const COMMAND_BOUND: usize = 1;
 /// Format: the default permission bits a created file takes (`rw-r--r--`); the mount presents Windows
@@ -2245,6 +2246,8 @@ pub enum Outcome {
   Failed(WinFspError),
   /// The receive journal was settled before any fresh receive. The owner counts it; the taken-read oracle requires it.
   Recovered(u64),
+  /// A further receive worker began serving once the probe measured that it wins (A-219): how many now serve.
+  Released(usize),
   /// The file system is unmounted and deleted; the thread is ending.
   Stopped,
 }
@@ -2361,8 +2364,8 @@ fn run_mount(
     wake.wake_by_ref();
   };
   let confirmations = requests.clone();
-  // How many receive workers, measured once a process (A-219), and one intent channel for each.
-  let channels = crate::probe::receive_workers().and_then(crate::purge_intents::channel);
+  // One intent channel for each receive worker the mount may run (A-219).
+  let channels = crate::purge_intents::channel(crate::inflight::capture::MAX_WORKERS);
   let (purge_intents, mut readers) = match channels {
     Ok(channel) => channel,
     Err(error) => {

@@ -13497,22 +13497,44 @@ the second wins. The crash rule is extended to keep A-198's guarantee across wor
 8. **A death during recovery.** Passing over writes nothing, and the plan depends only on stamps and addresses. So a
    second recovery plans the same. Answering follows A-198's save-then-send.
 
-**The count is derived, never named per architecture** (R3, R8). At the first mount in a process the receiver measures
-the hand-off itself (`crates/bridge-winfsp/src/probe.rs`). It makes a hidden WinFsp volume with no drive and no file
-system behind it, created with a mount's own parameters. It serves it with one waiting worker and then with two, through the
-worker's own receive and send calls and its own journal, in five interleaved rounds of each whose order rotates. A client
-on the probing thread opens an absent name through the volume's device path (`\\?\GLOBALROOT\Device\Volume{...}`),
-200 timed opens a round after 20 untimed, each Create answered "not found" at once. So the rounds differ only in how many
-workers wait. A transact waits inside the call (`src/sys/fsctl.c:95-99`), so a round ends its workers by requests, not
-by cancelling their waits. After the timed opens the client keeps opening until every worker has ended; a worker ends
-once it answers a request received after that point, and counts itself ending before it sends that response, so no open
-is made with no worker left to receive it. The count is the larger only where every one of its rounds'
-medians is below every round's median with fewer (`capture::workers_beyond_spread`, tested on every host), so beyond both
-spreads, and one otherwise. The probe logs every round's median and the count, and the process keeps the count. Any other
-answer to a probe open refuses the mount, since the probe would be timing something else. The library's own tests run
-every mount with the most workers, so the live kill oracle proves the two-worker recovery on both lanes whatever their
-probe derives. The CLI's tests and the A/B run the derived count. On run 42123092900's data the rule gives two on arm64
-and one on x86_64, without the code naming either.
+**The count is derived, never named per architecture** (R3, R8), **and never on the mount's path.** The mount's first
+worker recovers every journal and serves at once. Each further worker first runs the probe
+(`crates/bridge-winfsp/src/probe.rs`), once a process. It serves only where the measured count reaches it; worker 0's
+release after recovery still comes before its first receive. Otherwise it ends, and its intent channel closes with it
+(a publish skips an ended worker and is refused only when none is left).
+
+The probe makes a hidden WinFsp volume with a mount's own parameters and no drive. It serves it with one waiting worker
+and then with two, in nine interleaved rounds of each whose order rotates, through the worker's own receive and send
+calls and its own journal. A client on the probing worker's thread opens and closes a file through the volume's device
+path (`\\?\GLOBALROOT\Device\Volume{...}`), 200 timed cycles a round after 20 untimed. Each request is answered at
+once: the Create "opened", the Cleanup and Close done. So the rounds differ only in how many workers wait, and the Cleanup
+arrives right behind the Create's response, which is where a second waiting worker can win.
+
+A transact waits inside the call (`src/sys/fsctl.c:95-99`), so a round ends its workers by requests, not by cancelling
+their waits. After the timed cycles the client opens until every worker has ended. A worker answers a Create received
+after that point "not found" and counts itself ending before it sends that response, so no open is made with no worker
+left to receive it. The client checks its worker's stop channel before every cycle, so an unmount during the probe waits
+for one cycle, not a round.
+
+The count is the larger only where every one of its rounds' medians is below every round's median with fewer
+(`capture::workers_beyond_spread`, tested on every host), so beyond both spreads, and one otherwise. The probe logs every
+round's median and the count, and the process keeps the count. Any other answer to a probe open is a refusal.
+
+The probe volume is deleted however the probe ends: on success, on a refusal (its workers leave at their idle return),
+when stopped, and with the process when it is killed, since a WinFsp volume lives on its control handle. Each is a
+test, judged by the volume's entry in the object manager's `\Device` directory.
+
+The library's own tests run every mount with the most workers, the later ones released only once their probe has
+measured. So the live kill oracle proves the two-worker recovery and the late release on both lanes, whatever their
+probe derives. The CLI's tests and the A/B run the measured count.
+
+**What the probe measured first.** An absent-name open, one request with nothing behind it, showed no second-worker win
+(diagnostics run 42130583401, 35 processes a lane). Round medians on arm64: one waiting worker 53.6-81.8 µs, two
+57.6-83.0 µs, every process deriving one. On x86_64: 30.2-62.2 against 41.6-62.9 µs. The worker was back in its receive
+long before the client's next open. One x86_64 process of 35 derived two from a regime shift, not a win: that runner's
+opens sit near 42 µs or near 58 µs. Four of its five one-worker rounds fell in the slow mode and all five two-worker rounds
+in the fast one. That probe took 105-216 ms on the mount's path, against A-213's 10-19 ms mount. So the probe moved off
+the path, and to the open-and-close.
 
 **No operation guard.** Two workers call the DLL's operation table at once, as the DLL's own dispatcher threads do.
 WinFsp's guard (`src/dll/fsop.c`, `FspFileSystemOpEnter`) orders only a file system's own namespace work. Each slates
@@ -13522,7 +13544,10 @@ callback is one message to the shard, which serves one at a time, so the guard w
 - A model oracle: two workers interleaved over one serial model of the driver's queues, a freed address handed to the next
   IRP, the daemon killed at every step of every worker, alone and together. Each IRP must be completed once with its own
   identity, none lost, and each kept open must be one the kernel holds.
-- The live 40-kill oracle on both Windows lanes with two workers.
+- The live 40-kill oracle on both Windows lanes with two workers, every other kill after the later worker's release and
+  the rest before it, mostly during its probe.
+- The probe volume gone after a probe that succeeds, is refused, is stopped, or is killed mid-measure.
+- A process's first mount no slower than before the probe, quiet and loaded, on both lanes.
 - The final A/B against 71cf09ac.
 
 Applied in the same change to: §4.6's Windows status, GAPS, `crates/bridge-winfsp/src/inflight/capture.rs` (the stamp and
