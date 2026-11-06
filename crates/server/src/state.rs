@@ -394,6 +394,11 @@ pub struct ShardState {
   /// first request and revoked when the attachment ends (`verbs::end_attachment`). Bounded by the
   /// partition's attachment cap: one entry per live catalog attachment at most.
   pub mount_attachments: BTreeMap<u64, MountAttachment>,
+  /// The volumes this shard's catalog holds that recovery could not rebuild, and why (§4.8): each is listed, and every
+  /// verb on it answers `Refusal::NotRecovered` with its cause (`verbs::find`). Bounded by the partition's volume cap:
+  /// one entry per catalog volume at most, made once at the shard's start.
+  pub(crate) unrecovered:
+    BTreeMap<slates_db::catalog::VolumeId, slates_ipc::protocol::RecoveryCause>,
   /// The Linux FUSE mounts this shard serves, by attachment (§4.6 "Linux"; AUD-29-64; `crate::fuse`). Bounded
   /// by the partition's attachment cap: one entry per live FUSE attachment at most.
   #[cfg(target_os = "linux")]

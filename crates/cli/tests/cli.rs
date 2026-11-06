@@ -11459,7 +11459,7 @@ fn a_base_a_kept_mount_covers_is_not_reacquired_through_it() {
     pause();
   };
   assert!(
-    refused.contains("on a mount this daemon serves"),
+    refused.contains("BaseOnOwnMount"),
     "the covered base is refused as the daemon's own mount: {refused}"
   );
   let successor = await_daemon(&instance, Some(stopped), &[]);
@@ -11474,4 +11474,64 @@ fn a_base_a_kept_mount_covers_is_not_reacquired_through_it() {
   drop(mount);
   let _ = Command::new("rmdir").arg(&base).output();
   let _ = Command::new("rmdir").arg(&point).output();
+}
+
+/// Bug (2026-11-06, found by A-227's reacquire test): a volume recovery could not rebuild stays in the catalog, and
+/// `volume list` shows it, while `status` answered `NotFound`, as if it were not there. A listed volume answers its real
+/// state: the recovery refusal by kind. Do: create a volume over a host directory, remove the directory, and restart the
+/// daemon in order (no kernel mount is involved). Expect: `volume list` still shows the volume, and its `status` is
+/// refused `NotRecovered`, naming the missing base.
+#[cfg(unix)]
+#[test]
+fn a_volume_recovery_could_not_rebuild_is_listed_and_its_status_names_why() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the unrecovered volume's status: set SLATES_TEST_CLI=1 to run it (starts daemons)"
+    );
+    return;
+  }
+  let instance = format!("cli-unrecovered-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-unrecovered"),
+  };
+  let base = format!("{}/base", scratch.path);
+  shell(&format!("mkdir {base}"));
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "unrecovered",
+      "--bounded",
+      "8MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  shell(&format!("rmdir {base}"));
+  let stopped = daemon_pid(&instance).expect("the daemon answers");
+  assert!(
+    Command::new("kill")
+      .args(["-TERM", &stopped.to_string()])
+      .status()
+      .unwrap()
+      .success(),
+    "SIGTERM sent"
+  );
+  await_daemon(&instance, Some(stopped), &[]);
+  let (code, out, err) = run(&instance, &["volume", "list"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    out.contains("unrecovered"),
+    "the catalog still lists the volume: {out}"
+  );
+  let (code, out, err) = run(&instance, &["status", &id]);
+  assert_ne!(code, 0, "the volume was not rebuilt: {out}");
+  assert!(
+    err.contains("NotRecovered") && err.contains("BaseMissing") && err.contains(&base),
+    "a listed volume's status names why recovery could not rebuild it, by kind: {err}"
+  );
 }

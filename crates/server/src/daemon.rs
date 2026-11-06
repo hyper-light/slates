@@ -3306,6 +3306,7 @@ fn init_shard(
     next_attachment,
     attachments: slates_bridge_core::Attachments::new(),
     mount_attachments: std::collections::BTreeMap::new(),
+    unrecovered: std::collections::BTreeMap::new(),
     #[cfg(target_os = "linux")]
     fuse_mounts: std::collections::BTreeMap::new(),
     #[cfg(target_os = "linux")]
