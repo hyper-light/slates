@@ -61,6 +61,11 @@ const READ_TAKEN: u64 = ENTRY + 1;
 const SUCCESSOR_READY: u64 = READ_TAKEN + 1;
 /// Format: this module's full libtest role name; exact filtering must execute it, never zero tests.
 const ROLE_TEST: &str = "host::tests::request_role";
+/// Format: a private Released marker: a purge's open reached the purging server, which retains it unanswered.
+const PURGE_TAKEN: u64 = SUCCESSOR_READY + 1;
+/// Derived: the rule's bound (§4.6, 2026-11-06): a killed daemon exits within one transaction timeout, the longest its
+/// receive worker's control wait lasts (`crate::dispatcher::TRANSACT_TIMEOUT_MS`).
+const EXIT_WITHIN_MS: u32 = crate::dispatcher::TRANSACT_TIMEOUT_MS;
 
 struct Child {
   process: Process,
@@ -70,6 +75,17 @@ impl Child {
   fn wait(&mut self) -> Option<i32> {
     // SAFETY: the process handle stays owned throughout this bounded wait.
     let waited = unsafe { WaitForSingleObject(self.process.raw_handle(), WAIT_MS) };
+    if waited == WAIT_TIMEOUT {
+      return None;
+    }
+    assert_eq!(waited, WAIT_OBJECT_0);
+    self.process.try_wait().unwrap()
+  }
+
+  /// The exit code once the process ended within `ms`, or `None`.
+  fn wait_within(&mut self, ms: u32) -> Option<i32> {
+    // SAFETY: the process handle stays owned throughout this bounded wait.
+    let waited = unsafe { WaitForSingleObject(self.process.raw_handle(), ms) };
     if waited == WAIT_TIMEOUT {
       return None;
     }
@@ -232,6 +248,62 @@ fn a_read_taken_before_the_kill_is_settled_after_takeover() {
   );
 }
 
+/// The rule of 2026-11-06 (§4.6 Windows; A-190's purge, the open sibling of
+/// `docs/bugs/2026-11-06-a-daemons-own-io-on-its-volume-strands-its-exit.md`). Do: mount, hold the volume with the
+/// anchor, purge a file, retain the purge's open unanswered in the serving process, and kill that process. Expect: it
+/// exits within one transaction timeout. A daemon thread's own open of its volume would sit in WinFsp's processing
+/// queue, never cancelled, and its process could not exit while the anchor holds the volume.
+#[test]
+fn a_daemon_killed_while_its_purges_open_is_delivered_exits_within_a_transaction_timeout() {
+  if std::env::var_os("WINFSP_TEST_MOUNT").is_none() {
+    eprintln!("SKIP: the purge kill oracle needs WINFSP_TEST_MOUNT=1 and WinFsp installed");
+    return;
+  }
+  let drive = free_drive();
+  let (anchor, daemon) = channel().unwrap();
+  let inherited = duplicate_inheritable(daemon.raw()).unwrap();
+  let value = format!("{:x}", handle_value(inherited.raw()));
+  let mut scenario = Scenario {
+    servers: Vec::with_capacity(1),
+    held: Some(Held::new(1)),
+    reader: None,
+    probe: None,
+  };
+  scenario.servers.push(spawn(
+    "purger",
+    &drive,
+    &[(OsStr::new(CHANNEL), OsStr::new(&value))],
+    &[inherited.raw()],
+  ));
+  drop(inherited);
+  let message = anchor.recv(WAIT_MS).unwrap().expect("the purger's hold");
+  let answer = scenario
+    .held
+    .as_mut()
+    .unwrap()
+    .apply(scenario.servers[0].process.raw_handle(), message);
+  assert_eq!(answer, Some(HandleMessage::Held { id: ENTRY }));
+  anchor.send(&answer.unwrap(), WAIT_MS).unwrap();
+  assert_eq!(
+    anchor.recv(WAIT_MS).unwrap(),
+    Some(HandleMessage::Released { id: PURGE_TAKEN })
+  );
+  eprintln!("WINFSP PURGE KILL: the purge's open is delivered and retained; killing the server");
+  let killed = Instant::now();
+  scenario.servers[0].process.kill().unwrap();
+  let exited = scenario.servers[0].wait_within(EXIT_WITHIN_MS);
+  let waited = killed.elapsed();
+  if exited.is_none() {
+    // Delete the volume first so the stranded server can end and the fixture can reap it.
+    scenario.held = None;
+  }
+  eprintln!("WINFSP PURGE KILL: exited {exited:?} after {waited:?}");
+  assert!(
+    exited.is_some(),
+    "a daemon killed while its purge's open was delivered did not exit within {EXIT_WITHIN_MS} ms"
+  );
+}
+
 fn fixed_volume(store: &mut Store) -> (Volume, OpContext) {
   let mut volume = Volume::create(
     store,
@@ -271,7 +343,7 @@ fn fixed_volume(store: &mut Store) -> (Volume, OpContext) {
 }
 
 fn inherited_controls(role: &str) -> (Channel, Option<Inherited>) {
-  if role == "first" {
+  if role == "first" || role == "purger" {
     let value = u64::from_str_radix(&std::env::var(CHANNEL).unwrap(), 16).unwrap();
     (Channel::adopt(inherited_handle(value)), None)
   } else {
@@ -353,7 +425,7 @@ fn serve_mounted(
   cx: &OpContext,
 ) -> ! {
   let mut ready = await_ready(mount);
-  if role == "first" {
+  if role == "first" || role == "purger" {
     channel
       .send(
         &HandleMessage::Hold {
@@ -381,11 +453,32 @@ fn serve_mounted(
   }
   let mut names = OpenNames::new();
   let mut recovery_counted = false;
+  if role == "purger" {
+    let root = ObjectId::new(bridge.root(cx).unwrap(), 0);
+    let file = bridge.lookup(root, cx, "file").unwrap();
+    mount
+      .purge(vec![crate::purge::Purge {
+        object: ObjectId::new(file.ino, file.generation),
+        path: "\\file".to_owned(),
+        offset: 0,
+        len: u64::try_from(PAGE).unwrap(),
+      }])
+      .unwrap();
+  }
   loop {
     let request = receive
       .recv_timeout(ROLE_WAIT)
       .expect("the fixture's next request");
     count_recovery(role, &request, mount, &mut recovery_counted);
+    if role == "purger" && matches!(request.op, Op::PurgeOpen { .. }) {
+      channel
+        .send(&HandleMessage::Released { id: PURGE_TAKEN }, WAIT_MS)
+        .unwrap();
+      // Retain the purge's open, its reply sender included, until the parent kills this process.
+      let _retained = request;
+      let answer = channel.recv(WAIT_MS).unwrap();
+      panic!("the purger should have died while retaining the purge's open, got {answer:?}");
+    }
     if role == "first" && matches!(request.op, Op::Read { .. }) {
       channel
         .send(&HandleMessage::Released { id: READ_TAKEN }, WAIT_MS)
