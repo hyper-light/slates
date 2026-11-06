@@ -1484,6 +1484,11 @@ impl<H: LandFs> Landing<'_, H> {
           window_ns: None,
         }
       }
+      // An entry below the target on a mount this daemon serves (A-227): refused before any open, that entry alone.
+      Err(WriteFailure::Host(HostError::OwnMount(errno))) => Written {
+        outcome: Outcome::Failed { errno },
+        window_ns: None,
+      },
       Err(WriteFailure::Host(HostError::NotFound | HostError::NotDirectory)) => Written {
         outcome: Outcome::Skipped(SkipReason::ParentMissing),
         window_ns: None,

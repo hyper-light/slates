@@ -3429,6 +3429,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::MapShareExhausted { .. } => "map_share_exhausted",
     Refusal::HolderPending => "holder_pending",
     Refusal::MapsHeld { .. } => "maps_held",
+    Refusal::OwnMount { .. } => "own_mount",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",
@@ -4870,11 +4871,19 @@ fn open_base(
   config: VolumeConfig,
 ) -> Result<(Volume, Option<OsHost>), Box<ReplyBody>> {
   let (mut host, root) = OsHost::open_root(std::path::Path::new(path)).map_err(|e| {
-    Box::new(refused(Refusal::BaseUnavailable {
-      path: path.to_owned(),
-      errno: match e {
-        slates_vfs::host::HostError::Unavailable(code) => code,
-        _ => 0,
+    Box::new(refused(match e {
+      // A-227: a base on one of this daemon's own mounts, refused before anything opened it.
+      slates_vfs::host::HostError::OwnMount(_) => Refusal::OwnMount {
+        path: path.to_owned(),
+        used_as: slates_ipc::protocol::OwnMountUse::Base,
+      },
+      slates_vfs::host::HostError::Unavailable(code) => Refusal::BaseUnavailable {
+        path: path.to_owned(),
+        errno: code,
+      },
+      _ => Refusal::BaseUnavailable {
+        path: path.to_owned(),
+        errno: 0,
       },
     }))
   })?;
