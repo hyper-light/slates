@@ -284,6 +284,45 @@ fn wait_formed(instances: &[String]) -> Vec<String> {
   }
 }
 
+/// Waits until the bootstrapped fleet is whole on every node: all three members voting in the council, all three in the
+/// committed configuration, and a record session to each peer. A test that kills or stops a node before then can take
+/// the council below its quorum (the third member is promoted to voter about 1.5 s after the bootstrap when quiet, later
+/// under load) or find no session to a candidate: under load at 36–46 a killed owner left a council of two voters that
+/// never elected again, and an owner found no session to its only reachable candidate (2026-11-05, `live_fleet`).
+fn wait_settled(instances: &[String]) {
+  let deadline = Instant::now() + FLEET_WAIT;
+  loop {
+    let views: Vec<(String, String, usize)> = instances
+      .iter()
+      .map(|instance| {
+        let (_, out, _) = run(instance, &["status"]);
+        let sessions = out
+          .lines()
+          .filter(|line| line.starts_with("fleet_session "))
+          .count();
+        (
+          value_of(&out, "fleet_council_voters"),
+          value_of(&out, "fleet_configuration_members"),
+          sessions,
+        )
+      })
+      .collect();
+    let whole = views.iter().all(|(voters, members, sessions)| {
+      voters.trim() == FLEET_NODES.len().to_string()
+        && members.trim() == FLEET_NODES.len().to_string()
+        && *sessions == FLEET_NODES.len() - 1
+    });
+    if whole {
+      return;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "the fleet settled (council voters, configuration members, record sessions): {views:?}"
+    );
+    pause();
+  }
+}
+
 /// The sum over every shard of the daemon's counter `kind` (`shard N refused KIND: COUNT` in `status`).
 /// Every `fleet.live.*` counter `instance` reports, summed over its shards, by name.
 fn live_counters(instance: &str) -> std::collections::BTreeMap<String, u64> {
@@ -371,6 +410,7 @@ fn start_fleet(tag: &str) -> Fleet {
     .unwrap();
   let (code, _, error) = run(&instances[bootstrap], &["bootstrap", "root"]);
   assert_eq!(code, 0, "one bootstrap of the fresh fleet: {error}");
+  wait_settled(&instances);
   Fleet {
     scratch,
     daemons,
@@ -388,13 +428,9 @@ fn write_live_volume(owner: &str, files: usize) -> String {
   let (code, out, err) = run(owner, &["live-ship", &id]);
   assert_eq!(code, 0, "live-ship: {err}");
   assert!(out.contains("live-shipped"), "{out}");
-  let attachment = value_of(&run_ready(owner, &["attach", &id, "--write"]), "attachment");
-  for file in 0..files {
-    let body = live_body(file);
-    let path = format!("/file-{file}");
-    let (code, err) = run_with_stdin(owner, &["write", &id, &attachment, &path], body.as_bytes());
-    assert_eq!(code, 0, "write {path}: {err}");
-  }
+  // An attachment a write, as `write_files` makes them: one attachment held across the writes was reaped under load
+  // and a later write refused `NotFound` (2 of 11 flows in one run at load 43, 2026-11-05).
+  write_files(owner, &id, 0..files);
   id
 }
 
