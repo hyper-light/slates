@@ -22,6 +22,15 @@ mod nfs;
 #[path = "../../server/tests/common/nfs4.rs"]
 #[allow(dead_code)]
 mod nfs4;
+// The vhost-user front end a VMM speaks, over the guest driver it rides (`super::guest`), for the virtio-fs flow.
+#[cfg(target_os = "linux")]
+#[path = "../../server/tests/common/guest.rs"]
+#[allow(dead_code)]
+mod guest;
+#[cfg(target_os = "linux")]
+#[path = "../../server/tests/common/vhost_front_end.rs"]
+#[allow(dead_code)]
+mod vhost_front_end;
 
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -2045,4 +2054,191 @@ fn an_nfs_v4_commit_and_stable_write_to_a_live_volume_answer_only_once_a_candida
     "once the candidates are back, COMMIT succeeds: {:?}",
     status(&resumed)
   );
+}
+
+/// Format: the environment variable that makes this test binary the VMM `slates vhost-user` runs, and the argument
+/// prefix the device's socket descriptor arrives in (`{fd}`, which libtest takes as a name filter matching nothing).
+#[cfg(target_os = "linux")]
+const VHOST_ROLE: &str = "SLATES_LIVE_TEST_VHOST_ROLE";
+/// Format: see [`VHOST_ROLE`].
+#[cfg(target_os = "linux")]
+const VHOST_FD_ARG: &str = "vhost-fd=";
+/// Format: this flow's test name, which the re-invoked binary is told to run (`--exact`), so the run plays the VMM.
+#[cfg(target_os = "linux")]
+const VHOST_FSYNC_TEST: &str =
+  "a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it";
+/// Format: the request queue a vhost-user guest's driver submits FUSE requests on (virtio-fs: queue 0 is hiprio).
+#[cfg(target_os = "linux")]
+const VHOST_REQUEST_QUEUE: usize = 1;
+
+/// The VMM's guest over the device `slates vhost-user` handed it: one FUSE request at a time on the request queue.
+#[cfg(target_os = "linux")]
+struct VhostGuest {
+  front: vhost_front_end::FrontEnd,
+  guest: guest::Guest<slates_bridge_virtiofs::vhost_user::GuestRegions>,
+  unique: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl VhostGuest {
+  /// One request, kicked, its interrupt awaited: the reply.
+  fn ask(&mut self, opcode: slates_bridge_fuse::abi::Opcode, node: u64, body: &[u8]) -> Vec<u8> {
+    self.unique += 1;
+    let head = self.guest.submit(
+      &guest::message(opcode.to_wire(), self.unique, node, body),
+      guest::REPLY_CAP,
+    );
+    self.front.kick_and_wait(VHOST_REQUEST_QUEUE);
+    let (id, len) = self
+      .guest
+      .reap()
+      .expect("a used element after the interrupt");
+    assert_eq!(id, head, "the request's own element");
+    self.guest.reply_of(head, len)
+  }
+
+  /// A `WRITE` of `data` at the file's start through `handle`, then an `FSYNC`: the `FSYNC`'s errno and its time.
+  fn write_and_fsync(&mut self, (node, handle): (u64, u64), data: &[u8]) -> (i32, Duration) {
+    let written = self.ask(
+      slates_bridge_fuse::abi::Opcode::Write,
+      node,
+      &guest::write_body(handle, data),
+    );
+    assert_eq!(guest::reply_error(&written), 0, "WRITE");
+    self.fsync((node, handle))
+  }
+
+  /// An `FSYNC` of `handle`: its errno (positive) and its time.
+  fn fsync(&mut self, (node, handle): (u64, u64)) -> (i32, Duration) {
+    let mut body = handle.to_le_bytes().to_vec();
+    body.extend_from_slice(&[0u8; 8]);
+    let began = Instant::now();
+    let reply = self.ask(slates_bridge_fuse::abi::Opcode::FSync, node, &body);
+    (-guest::reply_error(&reply), began.elapsed())
+  }
+}
+
+/// The VMM's side of [`a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it`]: adopts the device's
+/// socket, hands it the guest's memory and queues, opens `/file-0` for writing, then writes and syncs once healthy, once
+/// after the test's first line (the candidates stopped) and syncs once more after its second (the candidates resumed),
+/// printing each `FSYNC` as the Shards flow does.
+#[cfg(target_os = "linux")]
+fn vhost_fsyncer() {
+  use slates_bridge_fuse::abi::{OUT_HEADER_LEN, Opcode};
+  use std::io::{BufRead, Write};
+  use std::os::fd::FromRawFd;
+  let number: i32 = std::env::args()
+    .find_map(|arg| arg.strip_prefix(VHOST_FD_ARG).map(str::to_owned))
+    .unwrap()
+    .parse()
+    .unwrap();
+  // SAFETY: `slates vhost-user` placed the device's socket at this number before the exec; nothing in this process
+  // opened it, so this is its one owner.
+  let socket = unsafe { std::os::fd::OwnedFd::from_raw_fd(number) };
+  let front = vhost_front_end::FrontEnd::over(socket);
+  let ram = vhost_front_end::guest_ram(true);
+  let guest = vhost_front_end::guest_over(&ram);
+  assert_eq!(
+    front.negotiate_memory(&ram),
+    0,
+    "the memory table is accepted"
+  );
+  front.configure_queues(&guest);
+  let mut vm = VhostGuest {
+    front,
+    guest,
+    unique: 0,
+  };
+  let found = vm.ask(Opcode::Lookup, ROOT_NODE, b"file-0\0");
+  assert_eq!(guest::reply_error(&found), 0, "LOOKUP");
+  let node = guest::u64_at(&found, OUT_HEADER_LEN);
+  let mut open = READ_WRITE.to_le_bytes().to_vec();
+  open.extend_from_slice(&0u32.to_le_bytes());
+  let opened = vm.ask(Opcode::Open, node, &open);
+  assert_eq!(guest::reply_error(&opened), 0, "OPEN");
+  let file = (node, guest::u64_at(&opened, OUT_HEADER_LEN));
+  let report = |phase: &str, (errno, took): (i32, Duration)| {
+    println!("{FSYNC_TAG}{phase} {errno} {}", took.as_micros());
+    std::io::stdout().flush().unwrap();
+  };
+  let mut line = String::new();
+  report("healthy", vm.write_and_fsync(file, b"held by a candidate"));
+  println!("{READY_TAG}");
+  std::io::stdout().flush().unwrap();
+  std::io::stdin().lock().read_line(&mut line).unwrap();
+  report("alone", vm.write_and_fsync(file, b"then by no one"));
+  println!("{READY_TAG}");
+  std::io::stdout().flush().unwrap();
+  std::io::stdin().lock().read_line(&mut line).unwrap();
+  report("resumed", vm.fsync(file));
+}
+
+/// A-200 over virtio-fs (§4.6, A-9): a guest's `fsync` is its device's `FSYNC`, which a vhost-user device answers once
+/// the owner's barrier has published it, and on a live volume only once `f` candidates hold it. Do: on a live volume,
+/// run `slates vhost-user ID -- <this test binary> vhost-fd={fd}` playing the VMM and its guest; write and `FSYNC`
+/// through it once healthy, once with both candidates' processes stopped (SIGSTOP), and once more after they resume.
+/// Expect: healthy, `0`; stopped, `EIO` after the liveness budget, never `0`; resumed, `0`. Linux only, where vhost-user
+/// is built.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it() {
+  use std::io::{BufRead, Write};
+  if std::env::var_os(VHOST_ROLE).is_some() {
+    vhost_fsyncer();
+    return;
+  }
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping virtio-fs fsync flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-vhost");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let id = create_live_volume(&owner, "vhost-fsynced");
+  write_files(&owner, &id, 0..1);
+  let mut vmm = slates()
+    .args(["--instance", &owner, "vhost-user", &id, "--"])
+    .arg(std::env::current_exe().unwrap())
+    .args(["--exact", VHOST_FSYNC_TEST, "--nocapture"])
+    .arg(format!("{VHOST_FD_ARG}{{fd}}"))
+    .env(VHOST_ROLE, "fsyncer")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let mut input = vmm.stdin.take().unwrap();
+  let mut lines = std::io::BufReader::new(vmm.stdout.take().unwrap()).lines();
+  let healthy = fsync_report(&line_after(&mut lines, FSYNC_TAG), "healthy");
+  line_after(&mut lines, READY_TAG);
+  signal_candidates(&fleet, owner_index, rustix::process::Signal::STOP);
+  writeln!(input).unwrap();
+  let alone = fsync_report(&line_after(&mut lines, FSYNC_TAG), "alone");
+  line_after(&mut lines, READY_TAG);
+  signal_candidates(&fleet, owner_index, rustix::process::Signal::CONT);
+  writeln!(input).unwrap();
+  let resumed = fsync_report(&line_after(&mut lines, FSYNC_TAG), "resumed");
+  drop(input);
+  let ended = vmm.wait().unwrap();
+  let counters = live_counters(&owner);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!(
+    "live vhost fsync: healthy {healthy:?}; candidates stopped {alone:?}; resumed {resumed:?}; vmm {ended:?}; \
+     owner's live counters {counters:?}"
+  );
+  assert_eq!(healthy.0, 0, "an FSYNC a candidate holds succeeds");
+  assert_eq!(
+    alone.0,
+    rustix::io::Errno::IO.raw_os_error(),
+    "an FSYNC no candidate can hold fails EIO, not success, after {:?}",
+    alone.1
+  );
+  assert!(
+    alone.1 >= Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS),
+    "at the liveness budget: {:?}",
+    alone.1
+  );
+  assert_eq!(resumed.0, 0, "once the candidates are back, FSYNC succeeds");
 }
