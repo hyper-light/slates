@@ -14002,9 +14002,20 @@ own-mount records, `check_mount_point`, the refusals' mapping), `crates/bridge-w
   mount came to cover is not rebuilt, its log naming the daemon's own mount. 4 passed in 31.6 s. With the successor's
   learning removed, the restart test got "no reply within 1000000000 ns" and the reacquire never finished; the two
   bind-time tests still passed.
-- **The kept mounts on Linux and Windows** are proven by `a_base_a_kept_mount_covers_is_not_reacquired_through_it`
-  (Linux FUSE) and `a_base_a_held_drive_covers_is_not_reacquired_through_it` (WinFsp, a junction pointed at the drive)
-  on CI: see GAPS for the runs.
+- **The kept mounts on Linux.** A daemon stopped in order ends its FUSE connections (its mount then answers `ENOTCONN`,
+  run 42167684399), so a Linux mount is kept only across a killed daemon, whose device the anchor holds (A-61); the
+  Linux tests kill it, and macOS's stop in order. On ubuntu-latest (diag-slabs-13, run 42170240376) the five A-227 tests
+  passed, and the CLI's whole Linux flow, 85 passed. With the kept mounts learned after the reacquire, the old order
+  (diag-slabs-14, run 42170240677), `a_base_a_kept_mount_covers_is_not_reacquired_through_it` failed: the successor never
+  finished reacquiring the covered base.
+- **The kept mounts on Windows.** `a_base_a_held_drive_covers_is_not_reacquired_through_it` points a directory symbolic
+  link under a base at the drive (`mklink /J` refuses a WinFsp drive: "Local volumes are required") and kills the
+  daemon. Under the fix (diag-slabs-13, run 42170240452) every A-227 assertion held on both runners: the successor
+  served the held drive, the covered volume was not rebuilt, and the drive still listed `project`; with the drive
+  detached by its attachment, the whole WinFsp CLI suite passed, 15 on each runner (diag-slabs-15, run 42171800738).
+  With the held volume
+  recorded at its adoption, the old order (diag-slabs-14, run 42170240630), no successor served after the kill on either
+  runner.
 
 ### A-198 — A WinFsp mount outlives its daemon: the anchor holds the volume's control handle, the drive's link and the mount's ledger, and the next daemon serves the held volume (accepted 2026-11-01, Step 9 of the VFS and DAX plan; built and measured 2026-11-02)
 Applied in the same change to: GAPS (gap 2 of the platform inventory). The build applies it to §4.6 "Windows",

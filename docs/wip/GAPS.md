@@ -9,9 +9,10 @@
 > mount at bind by the kernel's filesystem id and compares the kernel's path of each crossing. A successor learns its
 > kept mounts before any base is reacquired. Proven: Linux red on main (run 42161480656), green (run 42161730984; a
 > checked base open costs 1.25 µs more, BENCHMARKS); Windows red on main, green and red-checked (diag-slabs-8/9/10, runs
-> 42163139473, 42163139554, 42163139568); macOS 4 tests green, and red with the successor's learning removed (A-227).
+> 42163139473, 42163139554, 42163139568); macOS 4 tests green, and red with the successor's learning removed; the kept
+> mounts on Linux green (run 42170240376) and red in the old order (run 42170240677), on Windows green with the whole
+> WinFsp suite, 15 on each runner (run 42171800738), and red in the old order (run 42170240630) (A-227).
 > Open:
-> - **The kept-mount tests on Linux and Windows CI** (a base a kept mount covers, after a restart): pending their runs.
 > - **The macOS check's cost** with a mount recorded (one `F_GETPATH` a directory crossing) did not resolve from the
 >   noise at load 51 to 54 on 18 cores (BENCHMARKS, "The own-mount check on macOS"): a quiet re-measure is owed. With no
 >   mount recorded the check is one atomic load.
