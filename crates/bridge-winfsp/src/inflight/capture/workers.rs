@@ -18,13 +18,16 @@ mod oracle {
     clippy::cognitive_complexity
   )]
 
-  use super::super::super::{CREATE_KIND, REQUEST_BASE, opened_context};
+  use super::super::super::{CLOSE_KIND, CREATE_KIND, REQUEST_BASE, opened_context};
   use super::super::*;
   use std::collections::{BTreeMap, BTreeSet, VecDeque};
   use std::sync::{Condvar, Mutex};
 
   /// Shape: the model's IRPs: enough for several batches a worker and a freed address reused across workers.
   const IRPS: u64 = 12;
+  /// Shape: the stride of a successor's crash step, after every first crash step. With Closes in the model a life is
+  /// about three times longer; every 13th step keeps every non-vacuity counter moving at half the run time of every 7th.
+  const SECOND_CRASH_STRIDE: usize = 13;
   /// Shape: the workers, A-219's most.
   const WORKERS: usize = MAX_WORKERS;
   /// Format: where a model request carries its IRP's identity, and a model response the identity it answers.
@@ -42,6 +45,8 @@ mod oracle {
   struct Irp {
     id: u64,
     address: u64,
+    /// The open a Close ends; `None` for a Create.
+    closes: Option<u64>,
   }
 
   /// The driver's queues, the ledger's opens and the clock, shared by the workers.
@@ -69,6 +74,12 @@ mod oracle {
     /// Saved responses of a hand-off that delivered nothing, passed over because the other worker's newer delivery
     /// holds their address: the case a second worker adds to A-215's.
     passed_handed_off: u64,
+    /// Closes the clients made: each successful Create's client closes its open once it has the response.
+    closes_made: u64,
+    /// Opens a served Close has ended, as the shard retires them.
+    closed: BTreeSet<u64>,
+    /// Confirmations that came after their open's Close: the shard refuses them `Stale` and the worker ends.
+    stale: u64,
   }
 
   impl World {
@@ -81,6 +92,7 @@ mod oracle {
         self.pending.push_back(Irp {
           id: self.arrived,
           address,
+          closes: None,
         });
         self.arrived += 1;
       }
@@ -97,7 +109,9 @@ mod oracle {
           .try_into()
           .unwrap(),
       );
-      let outcome = if status == 0 {
+      let outcome = if status == 0 && irp.closes.is_some() {
+        None
+      } else if status == 0 {
         let answered = u32::from_le_bytes(
           response[INFORMATION_AT..INFORMATION_AT + 4]
             .try_into()
@@ -118,6 +132,19 @@ mod oracle {
       }
       self.free.push(irp.address);
       self.freed_by.insert(irp.address, worker);
+      // The client has its open the moment the response completes it, and closes it at once: the next IRP it makes.
+      if let Some(context) = outcome {
+        let address = self
+          .free
+          .pop()
+          .unwrap_or(0x1000 * (IRPS + self.closes_made + 1));
+        self.pending.push_back(Irp {
+          id: IRPS + self.closes_made,
+          address,
+          closes: Some(context),
+        });
+        self.closes_made += 1;
+      }
     }
 
     fn deliver(&mut self, worker: usize, output: &mut [u8]) -> usize {
@@ -128,9 +155,15 @@ mod oracle {
         };
         let frame = &mut output[at..at + REQUEST_BASE];
         frame[2..4].copy_from_slice(&u16::try_from(REQUEST_BASE).unwrap().to_le_bytes());
-        frame[4..8].copy_from_slice(&CREATE_KIND.to_le_bytes());
+        let kind = if irp.closes.is_some() {
+          CLOSE_KIND
+        } else {
+          CREATE_KIND
+        };
+        frame[4..8].copy_from_slice(&kind.to_le_bytes());
         frame[8..16].copy_from_slice(&irp.address.to_le_bytes());
         frame[ID_AT..ID_AT + 8].copy_from_slice(&irp.id.to_le_bytes());
+        frame[ID_AT + 8..ID_AT + 16].copy_from_slice(&irp.closes.unwrap_or(0).to_le_bytes());
         if self
           .freed_by
           .get(&irp.address)
@@ -244,6 +277,14 @@ mod oracle {
     let id = u64::from_le_bytes(request.bytes()[ID_AT..ID_AT + 8].try_into().unwrap());
     let mut response = request.cancelled_response().unwrap().to_vec();
     response[STATUS_FIELD_AT..STATUS_FIELD_AT + 4].fill(0);
+    if request.kind() == CLOSE_KIND {
+      // The shard retires the open, confirmed or not; a confirmation that comes later finds it gone.
+      let context = u64::from_le_bytes(request.bytes()[ID_AT + 8..ID_AT + 16].try_into().unwrap());
+      let mut world = world.lock().unwrap();
+      world.unconfirmed.retain(|(pending, _)| *pending != context);
+      world.closed.insert(context);
+      return response;
+    }
     response[INFORMATION_AT..INFORMATION_AT + 4]
       .copy_from_slice(&u32::try_from(id).unwrap().to_le_bytes());
     // A context unique to this open, never reused, as the ledger's generations make it.
@@ -261,6 +302,10 @@ mod oracle {
   fn confirm(response: &[u8], world: &Mutex<World>) {
     if let Some((_, context)) = opened_context(response).unwrap() {
       let mut world = world.lock().unwrap();
+      if world.closed.contains(&context) {
+        world.stale += 1;
+        return;
+      }
       let before = world.unconfirmed.len();
       world.unconfirmed.retain(|(pending, _)| *pending != context);
       assert_eq!(
@@ -332,6 +377,9 @@ mod oracle {
         if batch.is_last() {
           gate.pass(worker)?;
           let mut hand_off = batch.hand_off(&request, &mut fill).unwrap();
+          // The hand-off's confirmation is posted before the call, as the dispatcher posts it (A-215).
+          gate.pass(worker)?;
+          confirm(&response, world);
           gate.pass(worker)?;
           {
             let mut world = world.lock().unwrap();
@@ -346,11 +394,12 @@ mod oracle {
             world.lock().unwrap().deliver(worker, buffer)
           };
           gate.pass(worker)?;
-          confirm(&response, world);
-          gate.pass(worker)?;
           next = Next::Take(reported);
           break;
         }
+        // Confirmed before the response is sent, as the dispatcher confirms every open.
+        gate.pass(worker)?;
+        confirm(&response, world);
         gate.pass(worker)?;
         {
           let mut world = world.lock().unwrap();
@@ -359,8 +408,6 @@ mod oracle {
           world.calls += 1;
           world.arrive(1 - call % 2);
         }
-        gate.pass(worker)?;
-        confirm(&response, world);
         gate.pass(worker)?;
         batch.acknowledge(request.hint()).unwrap();
       }
@@ -478,6 +525,8 @@ mod oracle {
     passed_over: u64,
     unstamped: u64,
     passed_handed_off: u64,
+    closes: u64,
+    stale: u64,
   }
 
   /// Kills the daemon after each of `crashes` steps in turn, the last life living; returns that life's steps.
@@ -497,7 +546,9 @@ mod oracle {
     assert!(life(&mut memories, &world, &gate).is_ok());
     let world = world.into_inner().unwrap();
     tally.scenarios += 1;
-    tally.lost += IRPS - u64::try_from(world.completed.len()).unwrap();
+    tally.lost += IRPS + world.closes_made - u64::try_from(world.completed.len()).unwrap();
+    tally.closes += world.closes_made;
+    tally.stale += world.stale;
     tally.wrong += world.wrong;
     tally.twice += world.twice;
     tally.bogus += world.bogus;
@@ -530,22 +581,29 @@ mod oracle {
       let steps = scenario(schedule, &[], &mut tally);
       for first in 0..steps {
         scenario(schedule, &[first], &mut tally);
-        for second in (0..steps).step_by(7) {
+        for second in (0..steps).step_by(SECOND_CRASH_STRIDE) {
           scenario(schedule, &[first, second], &mut tally);
         }
       }
     }
     eprintln!("A-219 model: {tally:?}");
     assert_eq!(
-      (tally.lost, tally.wrong, tally.twice, tally.wrong_context),
-      (0, 0, 0, 0),
+      (
+        tally.lost,
+        tally.wrong,
+        tally.twice,
+        tally.wrong_context,
+        tally.stale
+      ),
+      (0, 0, 0, 0, 0),
       "{tally:?}"
     );
     assert!(
       tally.reused_across > 0
         && tally.passed_over > 0
         && tally.unstamped > 0
-        && tally.passed_handed_off > 0,
+        && tally.passed_handed_off > 0
+        && tally.closes > 0,
       "{tally:?}"
     );
   }

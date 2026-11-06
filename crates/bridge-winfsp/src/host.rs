@@ -1138,14 +1138,6 @@ impl Confirming {
   }
 }
 
-pub(crate) fn confirm_open(
-  requests: &SyncSender<Request>,
-  wake: &Waker,
-  context: u64,
-) -> Result<(), WinFspError> {
-  post_confirm(requests, wake, context).finish()
-}
-
 /// Once the complete successful response is retained, update one context per owner turn. A second crash replays
 /// that response and finishes these idempotent updates before the kernel can rename its node or receive fresh work.
 pub(crate) fn rename_open_names(

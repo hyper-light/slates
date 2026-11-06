@@ -806,9 +806,17 @@ fn serve_batch(
       }
       return Ok(Some(Next::Take(reported)));
     }
+    // Every open is confirmed before its response is sent, as a hand-off's is. Its client may close it the moment the
+    // response completes its Create, and with two workers that Close can reach the shard through the other worker
+    // first: a confirmation sent after the response then found its open retired, "open ledger: Stale", and ended this
+    // worker (diagnostics run 42155161568, arm64). The response is saved, so a death before the send still hands the
+    // kernel this context: recovery sends the saved Create again.
+    let confirming = inflight::opened_context(response)
+      .map_err(WinFspError::Capture)?
+      .map(|(_, context)| crate::host::post_confirm(shard.confirmations, shard.wake, context));
     send_response(control, response, &mut owned.private.intents)?;
-    if let Some((_, context)) = inflight::opened_context(response).map_err(WinFspError::Capture)? {
-      crate::host::confirm_open(shard.confirmations, shard.wake, context)?;
+    if let Some(confirming) = confirming {
+      confirming.finish()?;
     }
     batch
       .acknowledge(request.hint())
