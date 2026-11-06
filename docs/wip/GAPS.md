@@ -1705,6 +1705,31 @@ still fails `-D clippy::disallowed-methods` with the flag in place, and the plan
 
 ### 8a-launcher-ci. `slates exec` writes its own userns maps, which two kernels refuse (2026-10-20, OPEN — a defect, not a runner setting)
 
+> **Re-diagnosed 2026-11-05 (bug-sweep): the refusal is fixed; the rest is a host setting after all, which slates
+> cannot lift unprivileged.** The entry below drew its conclusion from a probe that execs a shell, and an exec'd process
+> in a namespace with no maps is refused its own `/proc/self` files on every kernel. The launcher's own in-process
+> sequence (`unshare`, self-written maps, rprivate, bind) binds on Linux 6.12 in a container, and `slates exec` ran
+> there for the first time anywhere.
+> - **On CI's runners it is AppArmor.** Diagnostics run 42169647315 (`ubuntu-latest` and `ubuntu-24.04-arm`, Linux
+>   7.0.0-1017-azure) read `kernel.apparmor_restrict_unprivileged_userns = 1`. Its `unprivileged_userns` profile denies
+>   the namespace `sys_admin` (`apparmor="DENIED" operation="capable"`), whoever writes the maps: `unshare --map-user`
+>   and `-Urm` fail too. So the fork the entry planned would bind nothing there. The first "AppArmor" reading was
+>   right; `unshare -U true` succeeding is how that restriction behaves.
+> - **Fixed:** on such a host the launcher's refusal names the sysctl and both ways an administrator can lift it,
+>   where it said `open /proc/self/setgroups: code 13`.
+>   `the_launcher_binds_a_volume_or_names_the_host_setting_that_forbids_it` (`crates/cli/tests/cli.rs`) needs no
+>   daemon. `gates` runs it on x86_64; `linux-arm64` runs no CLI test, so arm64 has only the diagnostics runs.
+>   - Red over main's `exec.rs`: run 42173280983, `diag-bug-sweep-2`.
+>   - Green with the fix: run 42173285810, `diag-bug-sweep-3`. Both runs covered x86_64 and arm64.
+>   - Its bind path passes in a container (Linux 6.12, seccomp unconfined), and its outright-refusal path passes under
+>     Docker's default seccomp.
+> - The FUSE flow's gate now asks the sysctl (`the_launcher_can_bind_here`). Still owed: the full FUSE `slates exec`
+>   flow runs on no lane, since every Linux runner here confines user namespaces. A lane needs a host without the
+>   restriction (a container with seccomp unconfined has no `/dev/fuse` mount route), or Ada's AppArmor profile.
+>   Record: `docs/bugs/2026-10-20-the-launcher-writes-its-own-userns-maps.md`, "Correction (2026-11-05)".
+>
+> The entry as found:
+
 **This entry said the wrong thing when it was written, and the correction is the finding.** It claimed the
 runner denies the user namespace the launcher needs — Ubuntu 24.04's
 `kernel.apparmor_restrict_unprivileged_userns=1` — and asked Ada for one `sysctl` line before the step. That

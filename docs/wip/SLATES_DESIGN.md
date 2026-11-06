@@ -4081,7 +4081,10 @@ spike measures whether open files recover or must be reopened); macOS NFS fallba
 hang or soft-mount `EIO` until the restarted server answers the retried RPCs (Degraded); Windows:
 the volume disappears and reappears (Degraded, open handles error). Extension crash on macOS:
 FSKit unmounts the volume; the daemon's state is intact; the anchor re-mounts (Degraded).
-Unprivileged user namespaces disabled: Refused for the launcher form with the exact remedy.
+Unprivileged user namespaces disabled: Refused for the launcher form with the exact remedy. That includes
+a host whose AppArmor confines them (Ubuntu 24.04's `kernel.apparmor_restrict_unprivileged_userns=1`): `unshare`
+succeeds there, but the namespace gets no capability, so the launcher names that sysctl, or an AppArmor profile
+granting `userns,` to the binary, as the operator's remedy (2026-11-05; GAPS `8a-launcher-ci`).
 `allow_other` requested but not permitted: Refused with the `/etc/fuse.conf` line. FSKit module
 not enabled: Refused with the exact System Settings path. Any separately selected limited
 NFS form reports its weaker semantics and cannot satisfy a full-POSIX request. Base
