@@ -30,7 +30,11 @@ pub(crate) async fn sweep(silence_ns: u64) -> usize {
   };
   let mut reaped: usize = 0;
   for (handle, client_id) in clients {
-    let result = remove_on_owners(origin, &shards, batch, client_id, silence_ns).await;
+    let result = match remove_on_owners(origin, &shards, batch, client_id, silence_ns).await {
+      // Then its attachments of other hosts' volumes, at their owners (A-222).
+      Ok(()) => crate::remote_attach::reap_at_owners(origin, handle, client_id, silence_ns).await,
+      Err(refusal) => Err(refusal),
+    };
     state::with_state(|state| match result {
       Ok(()) => {
         if finish(state, handle, client_id) {

@@ -145,10 +145,10 @@ fn mint_identity(dir: &str, node: &str) {
   std::fs::write(format!("{dir}/{node}.key.der"), key.serialize_der()).unwrap();
 }
 
-/// The manifest: both nodes on loopback at their held bases, at `f = 0`.
+/// The manifest: every node on loopback at its held base, at `f = 0`.
 #[allow(clippy::disallowed_methods)]
-fn write_manifest(dir: &str, bases: &[u16]) -> String {
-  let nodes: Vec<serde_json::Value> = NODES
+fn write_manifest(dir: &str, nodes: &[&str], bases: &[u16]) -> String {
+  let nodes: Vec<serde_json::Value> = nodes
     .iter()
     .zip(bases)
     .map(|(node, base)| {
@@ -237,28 +237,47 @@ fn seed_project(dir: &str) {
   std::fs::write(format!("{dir}/src/two.txt"), "two: original line").unwrap();
 }
 
-/// The two nodes up and formed: (scratch, the server's and the client's instances, the daemons). The server's
-/// instance bootstraps the root group, which forms when both members are configured.
-fn two_node_fleet() -> (Scratch, [String; 2], Vec<Daemon>) {
-  let dir = scratch("fs-server-fleet");
-  for node in NODES {
+/// The nodes of `nodes` up and formed, from one manifest: (scratch, each node's instance in order, the daemons), named
+/// by `tag` so the tests of this file run side by side. The first node's instance bootstraps the root group, which forms
+/// when every member is configured.
+fn fleet(tag: &str, nodes: &[&str]) -> (Scratch, Vec<String>, Vec<Daemon>) {
+  let dir = scratch(&format!("fs-server-{tag}"));
+  for node in nodes {
     mint_identity(&dir.path, node);
   }
   let offset = std::process::id() % u32::from(PORT_SPAN);
-  let first = free_port_block(u16::try_from(u32::from(PORT_FLOOR) + offset).unwrap());
-  let second = free_port_block(first.base.checked_add(PORTS_PER_NODE).unwrap_or(PORT_FLOOR));
-  let manifest = write_manifest(&dir.path, &[first.base, second.base]);
+  let mut from = u16::try_from(u32::from(PORT_FLOOR) + offset).unwrap();
+  let mut blocks = Vec::with_capacity(nodes.len());
+  for _ in nodes {
+    let held = free_port_block(from);
+    from = held.base.checked_add(PORTS_PER_NODE).unwrap_or(PORT_FLOOR);
+    blocks.push(held);
+  }
+  let bases: Vec<u16> = blocks.iter().map(|held| held.base).collect();
+  let manifest = write_manifest(&dir.path, nodes, &bases);
   let pid = std::process::id();
-  let instances = NODES.map(|node| format!("cli-fs-{node}-{pid}"));
-  let daemons = vec![
-    start(&instances[0], &manifest, NODES[0], &first),
-    start(&instances[1], &manifest, NODES[1], &second),
-  ];
+  let instances: Vec<String> = nodes
+    .iter()
+    .map(|node| format!("cli-fs-{tag}-{node}-{pid}"))
+    .collect();
+  let daemons: Vec<Daemon> = nodes
+    .iter()
+    .zip(&instances)
+    .zip(&blocks)
+    .map(|((node, instance), held)| start(instance, &manifest, node, held))
+    .collect();
   for instance in &instances {
     eventually(instance, &["volume", "list"]);
   }
   eventually(&instances[0], &["bootstrap", "root"]);
   (dir, instances, daemons)
+}
+
+/// The server and client nodes up and formed: (scratch, [server, client], the daemons).
+fn two_node_fleet(tag: &str) -> (Scratch, [String; 2], Vec<Daemon>) {
+  let (dir, instances, daemons) = fleet(tag, &NODES);
+  let [server, client] = <[String; 2]>::try_from(instances).unwrap();
+  (dir, [server, client], daemons)
 }
 
 /// The server's overlay of `project`, pinned and snapshotted, and a green over the snapshot: (volume, snapshot,
@@ -320,7 +339,7 @@ fn a_client_node_pushes_files_to_a_server_nodes_green_and_the_server_presents_th
     );
     return;
   }
-  let (dir, [server, client], daemons) = two_node_fleet();
+  let (dir, [server, client], daemons) = two_node_fleet("green");
   let project = format!("{}/project", dir.path);
   seed_project(&project);
   let (volume, snapshot, green) = server_green(&server, &project);
@@ -420,4 +439,415 @@ fn the_server_checks_out_and_presents(
     on_disk, "one: original line",
     "nothing lands without a grant"
   );
+}
+
+/// Runs a verb at `instance` with `input` on its stdin; (exit code, stdout, stderr).
+fn run_with_stdin(instance: &str, args: &[&str], input: &[u8]) -> (i32, String, String) {
+  use std::io::Write;
+  let mut child = slates()
+    .arg("--instance")
+    .arg(instance)
+    .args(args)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  child.stdin.take().unwrap().write_all(input).unwrap();
+  let output = child.wait_with_output().unwrap();
+  (
+    output.status.code().unwrap_or(-1),
+    String::from_utf8_lossy(&output.stdout).into_owned(),
+    String::from_utf8_lossy(&output.stderr).into_owned(),
+  )
+}
+
+/// §4.10 "Ownership follows the writer", D-16 (remote write attachment). Do: a server node overlays its project; from
+/// the client node, attach the server's volume for writing, write two files through that attachment, then detach it
+/// and write once more through it. Expect: the attach answers with an attachment and a lease epoch; both writes answer
+/// and the server reads the client's bytes in its own volume; the detach answers; the write after it is refused, and
+/// the server's file keeps the bytes written before. Before this, the client node's attach was refused `NotFound`
+/// (the fs-server lab, 2026-11-04). Gated like the other process flows (`SLATES_TEST_CLI=1`).
+#[test]
+fn a_client_node_attaches_a_server_volume_for_writing_and_writes_through_it() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the two-node remote write attachment: set SLATES_TEST_CLI=1 to run it (two daemons)"
+    );
+    return;
+  }
+  let (dir, [server, client], daemons) = two_node_fleet("attach");
+  let project = format!("{}/project", dir.path);
+  seed_project(&project);
+  let volume = id_of(&ok(
+    &server,
+    &[
+      "volume",
+      "create",
+      "project",
+      "--dynamic",
+      "64MiB",
+      "--base",
+      &project,
+      "--json",
+    ],
+  ));
+  // The client holds one session for its work, as an agent does (A-222: a CLI `attach` and a later `write` are two
+  // processes, and the first's client is reaped within two liveness budgets of its exit).
+  let mut session = sdk(&client);
+  let id = volume_id(&volume);
+  assert_eq!(
+    eventually(&client, &["read", &volume, "README"]),
+    "readme original"
+  );
+  let attached = session
+    .attach(id, None, slates_client::Intent::Write)
+    .unwrap();
+  assert!(
+    attached.lease_epoch.is_some(),
+    "a write attachment carries its lease epoch: {attached:?}"
+  );
+  for (path, bytes) in [
+    ("src/one.txt", "one: written from the client node"),
+    ("src/three.txt", "three: made by the client node"),
+  ] {
+    session
+      .fs_write((id, attached.attachment), path, bytes.as_bytes(), 0o644)
+      .unwrap();
+    assert_eq!(ok(&server, &["read", &volume, path]), bytes);
+  }
+  ok(
+    &client,
+    &[
+      "detach",
+      &attached.attachment.to_string(),
+      "--volume",
+      &volume,
+    ],
+  );
+  let after = session.fs_write(
+    (id, attached.attachment),
+    "src/one.txt",
+    b"after the detach",
+    0o644,
+  );
+  assert!(
+    after.is_err(),
+    "a write through a detached attachment is refused: {after:?}"
+  );
+  assert_eq!(
+    ok(&server, &["read", &volume, "src/one.txt"]),
+    "one: written from the client node"
+  );
+  drop(daemons);
+  drop(dir);
+}
+
+/// Format: the variable that makes this test binary, re-invoked, the holder process of the reap test: its value is
+/// `INSTANCE VOLUME`.
+const HOLDER_ROLE: &str = "SLATES_FS_SERVER_HOLDER";
+/// Format: the tag of the holder's one line, found anywhere in a line (libtest prints its banner first).
+const HOLDER_TAG: &str = "HOLDER-ATTACHED ";
+
+/// The holder role: a client of `INSTANCE` that attaches `VOLUME` (another host's) for writing, prints the attachment,
+/// and waits to be killed. Runs only when the variable names it; a no-op test otherwise.
+#[test]
+fn holder_role() {
+  let Some(value) = std::env::var_os(HOLDER_ROLE) else {
+    return;
+  };
+  let value = value.to_string_lossy().into_owned();
+  let (instance, volume) = value.split_once(' ').unwrap();
+  let volume = volume_id(volume);
+  let mut client = sdk(instance);
+  let attached = client
+    .attach(volume, None, slates_client::Intent::Write)
+    .unwrap();
+  println!("{HOLDER_TAG}{}", attached.attachment);
+  loop {
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(Duration::from_secs(1));
+  }
+}
+
+/// The volume's `attachments` and `lease_epoch` as its owner's `status` reports them.
+fn holders(server: &str, volume: &str) -> (u64, Option<u64>) {
+  let status: serde_json::Value =
+    serde_json::from_str(&ok(server, &["status", volume, "--json"])).unwrap();
+  (
+    status["attachments"].as_u64().unwrap(),
+    status["lease_epoch"].as_u64(),
+  )
+}
+
+/// Waits until `done` holds of the owner's (attachments, lease epoch), within `bound`; how long it took.
+fn until(
+  server: &str,
+  volume: &str,
+  bound: Duration,
+  done: impl Fn(u64, Option<u64>) -> bool,
+) -> Duration {
+  let started = Instant::now();
+  loop {
+    let (attachments, lease) = holders(server, volume);
+    if done(attachments, lease) {
+      return started.elapsed();
+    }
+    assert!(
+      started.elapsed() < bound,
+      "still {attachments} attachments, lease {lease:?}, after {bound:?}"
+    );
+    pause();
+  }
+}
+
+/// Derived: the bound on a silent remote holder (A-222): its node's reap within two liveness budgets (1 s each,
+/// `LIVENESS_BUDGET_NS`), its write lease at its term (`failover_slo_ns`, 10 s by default, `FAILOVER_SLO_NS`), and a
+/// liveness budget of the owner's lease sweep after it.
+const SILENT_HOLDER_BOUND: Duration = Duration::from_secs(10 + 2 + 1);
+
+/// A-222 (c), D-16. Do: from the client node, a separate holder process attaches the server's volume for writing; then
+/// `kill -9` that process. Expect: the owner records the attachment and the write lease while the holder lives; after
+/// the kill, the client node's reap ends the attachment at the owner (attachments 0), and the silent holder's lease
+/// ends within its term (`failover_slo_ns`) plus the sweeps' cadence. Gated (`SLATES_TEST_CLI=1`).
+#[test]
+fn a_killed_remote_holder_is_reaped_at_the_owner_and_its_lease_ends_within_its_term() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() || std::env::var_os(HOLDER_ROLE).is_some() {
+    eprintln!("skipping the remote holder's reap: set SLATES_TEST_CLI=1 to run it (two daemons)");
+    return;
+  }
+  let (dir, [server, client], daemons) = two_node_fleet("reap");
+  let project = format!("{}/project", dir.path);
+  seed_project(&project);
+  let volume = id_of(&ok(
+    &server,
+    &[
+      "volume",
+      "create",
+      "project",
+      "--dynamic",
+      "64MiB",
+      "--base",
+      &project,
+      "--json",
+    ],
+  ));
+  assert_eq!(
+    eventually(&client, &["read", &volume, "README"]),
+    "readme original"
+  );
+  let mut holder = Command::new(std::env::current_exe().unwrap())
+    .args(["--exact", "holder_role", "--nocapture", "--test-threads=1"])
+    .env(HOLDER_ROLE, format!("{client} {volume}"))
+    .stdout(Stdio::piped())
+    .stderr(Stdio::inherit())
+    .spawn()
+    .unwrap();
+  let mut lines = std::io::BufRead::lines(std::io::BufReader::new(holder.stdout.take().unwrap()));
+  let attachment = loop {
+    let line = lines
+      .next()
+      .expect("the holder printed its attachment")
+      .unwrap();
+    if let Some(at) = line.find(HOLDER_TAG) {
+      break line[at + HOLDER_TAG.len()..].trim().to_owned();
+    }
+  };
+  let (attachments, lease) = holders(&server, &volume);
+  assert_eq!(
+    attachments, 1,
+    "the owner records the remote attachment {attachment}"
+  );
+  assert!(lease.is_some(), "and its write lease");
+  let killed = Instant::now();
+  holder.kill().unwrap();
+  holder.wait().unwrap();
+  let reaped = until(&server, &volume, SILENT_HOLDER_BOUND, |attachments, _| {
+    attachments == 0
+  });
+  let released = until(&server, &volume, SILENT_HOLDER_BOUND, |_, lease| {
+    lease.is_none()
+  });
+  eprintln!(
+    "remote holder killed: its attachment ended at the owner after {reaped:?}, its lease {:?} after the kill",
+    killed.elapsed().min(reaped + released)
+  );
+  drop(daemons);
+  drop(dir);
+}
+
+/// A-222 hostile forward. Do: the server attaches its own volume for writing, locally; from the client node, write and
+/// detach through that attachment's id. Expect: both refused `Forbidden` (a forward may act only through its own
+/// host's attachment), and the server's attachment and file unchanged.
+#[test]
+fn a_forward_naming_another_hosts_attachment_is_refused() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() || std::env::var_os(HOLDER_ROLE).is_some() {
+    eprintln!("skipping the hostile forward: set SLATES_TEST_CLI=1 to run it (two daemons)");
+    return;
+  }
+  let (dir, [server, client], daemons) = two_node_fleet("hostile");
+  let project = format!("{}/project", dir.path);
+  seed_project(&project);
+  let volume = id_of(&ok(
+    &server,
+    &[
+      "volume",
+      "create",
+      "project",
+      "--dynamic",
+      "64MiB",
+      "--base",
+      &project,
+      "--json",
+    ],
+  ));
+  let local: serde_json::Value =
+    serde_json::from_str(&ok(&server, &["attach", &volume, "--write", "--json"])).unwrap();
+  let attachment = local["attachment"].to_string();
+  assert_eq!(
+    eventually(&client, &["read", &volume, "README"]),
+    "readme original"
+  );
+  let (code, out, err) = run_with_stdin(
+    &client,
+    &["write", &volume, &attachment, "README", "--json"],
+    b"stolen",
+  );
+  assert_eq!(code, 1, "{out}{err}");
+  assert!(
+    err.contains("Forbidden"),
+    "the write is refused Forbidden: {out}{err}"
+  );
+  let (code, out, err) = run(
+    &client,
+    &["detach", &attachment, "--volume", &volume, "--json"],
+  );
+  assert_eq!(code, 1, "{out}{err}");
+  assert!(
+    err.contains("Forbidden"),
+    "the detach is refused Forbidden: {out}{err}"
+  );
+  assert_eq!(ok(&server, &["read", &volume, "README"]), "readme original");
+  assert_eq!(
+    holders(&server, &volume).0,
+    1,
+    "the server's attachment stands"
+  );
+  an_oci_bind_from_another_host_is_refused_by_kind(&client, &volume, &project);
+  drop(daemons);
+  drop(dir);
+}
+
+/// Shape: how long a retired node takes to leave the configuration on loopback: the three-process CLI flow's phase wait
+/// (`FLEET_WAIT` in `tests/cli.rs`: a few protocol periods, widened for daemons booting on a shared machine).
+const RETIREMENT_WAIT: Duration = Duration::from_secs(40);
+
+/// A-222, the retired-host sweep. Do: a three-node fleet (server, client, witness); from the client node a holder
+/// process attaches the server's volume for writing; then kill the client node's daemon, so no reap of its clients can
+/// come. Expect: the owner holds the remote attachment until the fleet retires the client node, then ends it
+/// (attachments 0) within the retirement wait. Gated (`SLATES_TEST_CLI=1`).
+#[test]
+fn a_retired_hosts_attachments_end_at_the_owner() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() || std::env::var_os(HOLDER_ROLE).is_some() {
+    eprintln!("skipping the retired-host sweep: set SLATES_TEST_CLI=1 to run it (three daemons)");
+    return;
+  }
+  let (dir, instances, mut daemons) = fleet("retired", &["server", "client", "witness"]);
+  let (server, client) = (instances[0].clone(), instances[1].clone());
+  let project = format!("{}/project", dir.path);
+  seed_project(&project);
+  let volume = id_of(&ok(
+    &server,
+    &[
+      "volume",
+      "create",
+      "project",
+      "--dynamic",
+      "64MiB",
+      "--base",
+      &project,
+      "--json",
+    ],
+  ));
+  assert_eq!(
+    eventually(&client, &["read", &volume, "README"]),
+    "readme original"
+  );
+  let mut holder = Command::new(std::env::current_exe().unwrap())
+    .args(["--exact", "holder_role", "--nocapture", "--test-threads=1"])
+    .env(HOLDER_ROLE, format!("{client} {volume}"))
+    .stdout(Stdio::piped())
+    .stderr(Stdio::inherit())
+    .spawn()
+    .unwrap();
+  let mut lines = std::io::BufRead::lines(std::io::BufReader::new(holder.stdout.take().unwrap()));
+  loop {
+    let line = lines
+      .next()
+      .expect("the holder printed its attachment")
+      .unwrap();
+    if line.contains(HOLDER_TAG) {
+      break;
+    }
+  }
+  assert_eq!(
+    holders(&server, &volume).0,
+    1,
+    "the owner records the remote attachment"
+  );
+  let killed = Instant::now();
+  drop(daemons.remove(1));
+  let ended = until(&server, &volume, RETIREMENT_WAIT, |attachments, _| {
+    attachments == 0
+  });
+  eprintln!(
+    "client node killed: its holder's attachment ended at the owner after {ended:?} ({:?} since the kill)",
+    killed.elapsed()
+  );
+  holder.kill().unwrap();
+  holder.wait().unwrap();
+  drop(daemons);
+  drop(dir);
+}
+
+/// From the client node, an OCI bind of the server's volume: refused by its kind, `AttachmentUnsupported { Oci,
+/// OwnedByAnotherHost }`, since the form hands the client something of the owner's host (A-222 (e)).
+fn an_oci_bind_from_another_host_is_refused_by_kind(client: &str, volume: &str, project: &str) {
+  let (code, out, err) = run(
+    client,
+    &[
+      "attach",
+      volume,
+      "--write",
+      "--oci-source",
+      project,
+      "--oci-destination",
+      "/work",
+      "--json",
+    ],
+  );
+  assert_eq!(code, 1, "{out}{err}");
+  assert!(
+    err.contains("OwnedByAnotherHost") && err.contains("Oci"),
+    "an OCI bind of another host's volume is refused by its kind: {out}{err}"
+  );
+}
+
+/// A volume id from its 32 hexadecimal characters (the CLI's text form).
+fn volume_id(text: &str) -> slates_client::VolumeId {
+  let mut bytes = [0u8; 16];
+  for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().chunks(2)) {
+    *byte = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
+  }
+  slates_client::VolumeId { bytes }
+}
+
+/// An SDK session with the daemon at `instance`, under the product's deadlines.
+fn sdk(instance: &str) -> slates_client::Client {
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  slates_client::Client::connect(instance, deadlines).unwrap()
 }

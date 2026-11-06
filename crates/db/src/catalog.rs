@@ -388,6 +388,16 @@ pub enum Consumer {
   /// the record's principal names. It ends with the device: the guest's hangup, a revocation, a detach, the
   /// volume's destroy, and the daemon's process (recovery ends it, as it ends a FUSE mount). Appended.
   Guest,
+  /// A client of another host, its attachment recorded on this owner (§4.10, A-222): `host` is the forwarding peer's
+  /// authenticated member id, never a claim of the request's. It ends with a detach routed by its volume, its host's
+  /// reap of `client` (`RemoteReap`), the host's retirement, and the volume's destroy; a silent holder's write lease
+  /// ends at its term (D-16). Appended.
+  Remote {
+    /// The member id of the client's host.
+    host: u64,
+    /// The client's id on that host.
+    client: u32,
+  },
 }
 
 /// The form of an attachment. Append-only.

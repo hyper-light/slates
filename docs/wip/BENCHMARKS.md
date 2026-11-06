@@ -4043,6 +4043,31 @@ write, MiB/s at 1, 4 and 16 workers:
   1,284–1,479 / 1,291–1,435. They overlap.
 - The tick-only first build was dead even on the same harness (run 42058939194: 531–556 against 534–551 MiB/s).
 
+**Re-landed after the revert (2026-11-05).** Main reverted A-214 (CI 42119714654: A-205's give-back on both Windows
+lanes, and the arena test under Miri). The re-landing (`c9b971aa`) ends a busy period on a free as well as an
+allocation, so a delete takes its reserve with it:
+- `a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it` (Linux): before the write the content object held
+  12,288 bytes, with the file and its reserve 33,759,232, and after the delete 204,800 (16,793,600 before the fix);
+- A-205's give-back (diagnostics run 42129821506), deleted bytes that left the working set: windows-latest 92% in
+  1.61 s and 104%; windows-11-arm 110% in 1.13 s and 205% in 1.05 s (the reserve's pages go back with the files);
+- the incumbent harness on the M5 Max, main `f5396e3b` (A) against `c9b971aa` (B), six rounds each A then B,
+  2026-11-05 23:37–23:41Z, load 12–44 from other sessions, MiB/s at 1, 4 and 16 workers:
+
+  | round | A | B |
+  |---|---|---|
+  | 1 | 934.9 / 745.4 / 973.3 | 983.9 / 970.9 / 1,221.8 |
+  | 2 | 962.6 / 868.7 / 1,016.3 | 934.7 / 951.6 / 1,211.5 |
+  | 3 | 931.6 / 787.4 / 954.2 | 944.2 / 963.0 / 1,238.3 |
+  | 4 | 818.4 / 767.6 / 905.3 | 826.1 / 981.5 / 988.5 |
+  | 5 | 918.3 / 715.3 / 1,021.9 | 933.3 / 899.9 / 1,183.9 |
+  | 6 | 1,002.8 / 796.3 / 925.4 | 945.8 / 895.6 / 1,278.1 |
+
+  Best of eighteen: B 1,278.1, A 1,021.9; step 11 asks 967. Beyond the spread at 4 workers (B's lowest 895.6 against
+  A's highest 868.7); at 16 workers B led every round but one round's 988.5 sits under A's 1,021.9; at 1 worker the arms
+  overlap. Write p99 at 16 workers, µs (create / overwrite / append): A 2,621–4,590 / 1,394–2,989 / 1,238–3,415; B
+  2,831–3,962 / 1,731–3,359 / 1,647–3,607, overlapping at this load. nfsd wrote 1,428–1,817 MiB/s. The volume's shard
+  counted 358,875,136 bytes pre-faulted in every B run.
+
 **The resident cost per shard.** An idle shard holds at most its last burst's net growth of free pages, and never more
 than its memory share (`reserve_per_shard`: 1,073,741,824 bytes on the Mac's daemon, logged at boot). A shard whose
 last busy period grew nothing holds none: a written and deleted file nets zero, and A-105's give-back test passes
@@ -8199,6 +8224,41 @@ the discard calls replaced by a refusal in a diagnostics commit):
   limit the daemon test passed 5 of 5 on each architecture (run 41979650557).
 - Linux and Mac fmt, clippy, docs, `cargo xtask check` and the mem tests, and Miri over mem's tests: passed on run
   41975260339.
+
+## A rebase that costs what changed, and where a merge's tail goes (A-202 part 3; 2026-11-06 UTC)
+
+Environment: adas-macbook-pro-2 (Apple M5 Max, 18 cores, 128 GiB, macOS 26.4.1), shared with other agents' builds; the
+load average is given for every invocation. Rust 1.98.1, release; the daemon derived 5 shards; the client spins up to
+1 ms for a reply. Harness: `crates/client/examples/edit_merge_bench.rs` (its new `rebase` form: a lagging work's
+disjoint edit is rebased onto the head, timed in the submit's place, then submitted untimed; the rebased file and the
+head after the submit are checked against the model). Arms: R0 = main `2f343fcd` with the form, R1 = the fix; saved
+release binaries run interleaved R0 R1 × 3; each invocation 3 runs × 1,000 samples (a run stops at 20 s, at least 200).
+
+Command: `edit_merge_bench_$arm --form rebase --files 10 --files 1000 --files 10000` (quiet, then loaded: one spinning
+thread per core). Total (edit + rebase) p50 per round, then p99:
+
+| Arm, shape | quiet p50 (p99) | loaded p50 (p99) |
+|---|---|---|
+| R0, 10 files | 42, 53, 65 µs (0.15, 0.16, 0.56 ms) | 66, 83, 98 µs (7.9, 8.6, 10.0 ms) |
+| R1, 10 files | 45, 44, 45 µs (0.16, 0.18, 0.17 ms) | 57, 56, 55 µs (10.5, 10.9, 8.6 ms) |
+| R0, 1,000 files | 0.61, 1.16, 1.23 ms (1.2, 1.7, 2.1 ms) | 1.35, 1.33, 1.35 ms (39.6, 29.3, 51.3 ms) |
+| R1, 1,000 files | 44, 44, 45 µs (0.13, 0.19, 0.33 ms) | 97, 99, 95 µs (10.7, 11.8, 10.4 ms) |
+| R0, 10,000 files | 7.89, 12.35, 14.70 ms (14.1, 16.3, 19.7 ms) | 34.0, 31.9, 36.9 ms (101, 87, 99 ms) |
+| R1, 10,000 files | 45, 52, 45 µs (0.20, 0.21, 0.14 ms) | 87, 99, 114 µs (10.7, 11.0, 11.4 ms) |
+
+Loads at the rounds' starts: 8.5, 26.3, 26.6, 27.2, 29.4, 27.7. The first measurement of the form on R0 (17:53 UTC, load
+26 to 29) gave p50 74 µs, 1.25 ms and 19.1 ms at 10, 1,000 and 10,000 files: the regression the fix was made against.
+R1 is flat in the green's size quiet and loaded. Both arms' loaded p99 sits at 8.6 to 11.8 ms whatever the shape, which
+is not the rebase.
+
+**Where the time goes (§4.14 spans).** The harness now drains every shard's spans after each sample (a shard's span
+ring holds as many spans as a client region has slots, so every sample; 0 shed, 0 unmatched) and, for each timed call,
+splits the client's time into the ring span on the shard that read its slot (read to reply written), the shard ops of
+its verb and the merge verdict. What the client saw beyond the ring is its own time and the wake: the doorbell, the
+shard's wake from its park and the client's wake. `edit_merge_bench --quiet-only --files 10 --form accept`, 2026-11-06,
+load about 20: median samples: client 62 µs, ring 28 µs (shard ops 25 µs, verdict 4 µs), outside the ring 34 µs; samples
+at or above p99: client 506 µs, ring 41 µs, outside the ring 416 µs. The tail is waiting to be woken and served, not
+the merge.
 
 ## The client's edit and merge latency, and a merge that grows with its green (RQ-4, §4.16; 2026-11-05)
 
