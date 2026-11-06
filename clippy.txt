@@ -1,0 +1,249 @@
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded crc32c v0.6.8
+  Downloaded cfg-if v1.0.4
+  Downloaded windows-targets v0.53.5
+  Downloaded cc v1.4.5
+  Downloaded cpufeatures v0.3.1
+  Downloaded windows-link v0.2.1
+  Downloaded rustc_version v0.4.1
+  Downloaded subtle v2.6.1
+  Downloaded bit-set v0.8.0
+  Downloaded time-core v0.1.9
+  Downloaded tinyvec_macros v0.1.1
+  Downloaded itoa v1.0.18
+  Downloaded fnv v1.0.7
+  Downloaded quick-error v1.2.3
+  Downloaded num-conv v0.2.2
+  Downloaded errno v0.3.14
+  Downloaded powerfmt v0.2.0
+  Downloaded rand_xorshift v0.4.0
+  Downloaded wait-timeout v0.2.1
+  Downloaded unarray v0.1.4
+  Downloaded dunce v1.0.5
+  Downloaded thiserror v2.0.21
+  Downloaded zmij v1.0.23
+  Downloaded thiserror-impl v2.0.21
+  Downloaded shlex v2.0.1
+  Downloaded bit-vec v0.8.0
+  Downloaded jobserver v0.1.35
+  Downloaded zstd v0.13.3
+  Downloaded pkg-config v0.3.34
+  Downloaded rand_chacha v0.9.0
+  Downloaded fastrand v2.5.0
+  Downloaded rusty-fork v0.3.1
+  Downloaded zstd-safe v7.3.0
+  Downloaded fs_extra v1.3.0
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded deranged v0.5.8
+  Downloaded untrusted v0.9.0
+  Downloaded cmake v0.1.58
+  Downloaded constant_time_eq v0.4.2
+  Downloaded find-msvc-tools v0.1.12
+  Downloaded zeroize v1.9.0
+  Downloaded autocfg v1.5.1
+  Downloaded arrayvec v0.7.8
+  Downloaded lz4_flex v0.11.6
+  Downloaded once_cell v1.21.4
+  Downloaded rand_core v0.9.5
+  Downloaded memmap2 v0.9.11
+  Downloaded rustls-pki-types v1.15.1
+  Downloaded twox-hash v2.1.4
+  Downloaded semver v1.0.28
+  Downloaded yasna v0.5.2
+  Downloaded getrandom v0.2.17
+  Downloaded bitflags v2.13.1
+  Downloaded serde_core v1.0.229
+  Downloaded quote v1.0.47
+  Downloaded unicode-ident v1.0.24
+  Downloaded getrandom v0.3.4
+  Downloaded tempfile v3.27.0
+  Downloaded num-traits v0.2.19
+  Downloaded serde v1.0.229
+  Downloaded serde_derive v1.0.229
+  Downloaded proc-macro2 v1.0.107
+  Downloaded rcgen v0.13.2
+  Downloaded tinyvec v1.13.2
+  Downloaded getrandom v0.4.3
+  Downloaded rustls-webpki v0.103.15
+  Downloaded memchr v2.8.3
+  Downloaded rand v0.9.5
+  Downloaded unicode-normalization v0.1.25
+  Downloaded serde_json v1.0.151
+  Downloaded blake3 v1.8.7
+  Downloaded proptest v1.11.0
+  Downloaded zerocopy v0.8.56
+  Downloaded time v0.3.55
+  Downloaded syn v2.0.119
+  Downloaded syn v3.0.5
+  Downloaded regex-syntax v0.8.11
+  Downloaded rustls v0.23.44
+  Downloaded rustix v1.1.4
+  Downloaded zstd-sys v2.1.0+zstd.1.5.7
+  Downloaded windows_x86_64_msvc v0.53.1
+  Downloaded ring v0.17.14
+  Downloaded windows-sys v0.61.2
+  Downloaded windows-sys v0.60.2
+   Compiling getrandom v0.4.3
+   Compiling cfg-if v1.0.4
+   Compiling find-msvc-tools v0.1.12
+   Compiling shlex v2.0.1
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling windows_x86_64_msvc v0.53.1
+   Compiling serde_core v1.0.229
+    Checking windows-targets v0.53.5
+   Compiling jobserver v0.1.35
+    Checking windows-sys v0.60.2
+   Compiling cc v1.4.5
+    Checking cpufeatures v0.3.1
+   Compiling zmij v1.0.23
+    Checking constant_time_eq v0.4.2
+   Compiling syn v3.0.5
+    Checking arrayvec v0.7.8
+   Compiling blake3 v1.8.7
+   Compiling serde_json v1.0.151
+   Compiling serde v1.0.229
+   Compiling serde_derive v1.0.229
+    Checking itoa v1.0.18
+    Checking memchr v2.8.3
+    Checking memmap2 v0.9.11
+   Compiling pkg-config v0.3.34
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+   Compiling syn v2.0.119
+   Compiling zstd-safe v7.3.0
+   Compiling cmake v0.1.58
+   Compiling dunce v1.0.5
+    Checking twox-hash v2.1.4
+   Compiling fs_extra v1.3.0
+   Compiling aws-lc-sys v0.45.0 (D:\a\slates\slates\vendor\aws-lc-sys)
+    Checking slates-machine v0.1.0 (D:\a\slates\slates\crates\machine)
+    Checking lz4_flex v0.11.6
+    Checking slates-mem v0.1.0 (D:\a\slates\slates\crates\mem)
+    Checking tinyvec_macros v0.1.1
+    Checking tinyvec v1.13.2
+    Checking unicode-normalization v0.1.25
+   Compiling slates-wire-derive v0.1.0 (D:\a\slates\slates\crates\wire-derive)
+   Compiling aws-lc-rs v1.18.1 (D:\a\slates\slates\vendor\aws-lc-rs)
+    Checking slates-image v0.1.0 (D:\a\slates\slates\crates\image)
+    Checking slates-wire v0.1.0 (D:\a\slates\slates\crates\wire)
+    Checking zeroize v1.9.0
+    Checking slates-ipc v0.1.0 (D:\a\slates\slates\crates\ipc)
+    Checking slates-rt v0.1.0 (D:\a\slates\slates\crates\rt)
+   Compiling getrandom v0.3.4
+    Checking once_cell v1.21.4
+    Checking slates-anchor v0.1.0 (D:\a\slates\slates\crates\anchor)
+   Compiling semver v1.0.28
+   Compiling rustc_version v0.4.1
+    Checking slates-db v0.1.0 (D:\a\slates\slates\crates\db)
+    Checking rustls-pki-types v1.15.1
+    Checking bitflags v2.13.1
+   Compiling zerocopy v0.8.56
+    Checking rand_core v0.9.5
+   Compiling crc32c v0.6.8
+   Compiling rustls v0.23.44
+   Compiling rustix v1.1.4
+   Compiling autocfg v1.5.1
+   Compiling thiserror v2.0.21
+    Checking untrusted v0.9.0
+   Compiling num-traits v0.2.19
+    Checking errno v0.3.14
+   Compiling thiserror-impl v2.0.21
+    Checking zstd v0.13.3
+    Checking subtle v2.6.1
+    Checking slates-archive v0.1.0 (D:\a\slates\slates\crates\archive)
+    Checking windows-link v0.2.1
+    Checking fastrand v2.5.0
+    Checking tempfile v3.27.0
+    Checking slates-vfs v0.1.0 (D:\a\slates\slates\crates\vfs)
+    Checking windows-sys v0.61.2
+    Checking ppv-lite86 v0.2.21
+    Checking quick-error v1.2.3
+    Checking num-conv v0.2.2
+    Checking deranged v0.5.8
+    Checking powerfmt v0.2.0
+    Checking bit-vec v0.8.0
+    Checking time-core v0.1.9
+    Checking hyper-timing v0.1.0 (D:\a\slates\slates\vendor\hyper-raft\hyper-timing)
+    Checking fnv v1.0.7
+    Checking wait-timeout v0.2.1
+    Checking rusty-fork v0.3.1
+    Checking hyper-swim v0.1.0 (D:\a\slates\slates\vendor\hyper-raft\hyper-swim)
+    Checking slates-base v0.1.0 (D:\a\slates\slates\crates\base)
+    Checking slates-bridge-core v0.1.0 (D:\a\slates\slates\crates\bridge-core)
+    Checking time v0.3.55
+    Checking bit-set v0.8.0
+    Checking rand_chacha v0.9.0
+    Checking rand_xorshift v0.4.0
+    Checking rand v0.9.5
+    Checking unarray v0.1.4
+    Checking regex-syntax v0.8.11
+    Checking yasna v0.5.2
+    Checking slates-bridge-winfsp v0.1.0 (D:\a\slates\slates\crates\bridge-winfsp)
+    Checking slates-bridge-fuse v0.1.0 (D:\a\slates\slates\crates\bridge-fuse)
+    Checking slates-bridge-nfs v0.1.0 (D:\a\slates\slates\crates\bridge-nfs)
+    Checking slates-land v0.1.0 (D:\a\slates\slates\crates\land)
+    Checking slates-merge v0.1.0 (D:\a\slates\slates\crates\merge)
+    Checking proptest v1.11.0
+    Checking slates-client v0.1.0 (D:\a\slates\slates\crates\client)
+    Checking slates-conformance v0.1.0 (D:\a\slates\slates\crates\conformance)
+    Checking slates-test-seeds v0.1.0 (D:\a\slates\slates\crates\test-seeds)
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_PREBUILT_NASM': '0'
+warning: aws-lc-sys@0.45.0: Value: 0 is false.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-pc-windows-msvc'
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' failed - Err(Error { kind: ToolExecError, message: "command did not execute successfully (status code exit code: 2): \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Tools\\\\MSVC\\\\14.51.36231\\\\bin\\\\HostX64\\\\x64\\\\cl.exe\" \"-nologo\" \"-MD\" \"-Z7\" \"-Brepro\" \"-WX\" \"-W4\" \"-FoD:\\\\a\\\\slates\\\\slates\\\\target\\\\debug\\\\build\\\\aws-lc-sys-adc05d15a5129420\\\\out\\\\out-stdalign_check\\\\e1bacabfea35bee3-stdalign_check.o\" \"-c\" \"D:\\\\a\\\\slates\\\\slates\\\\vendor\\\\aws-lc-sys\\\\aws-lc\\\\tests\\\\compiler_features_tests\\\\stdalign_check.c\"" }).
+    Checking rustls-webpki v0.103.15
+    Checking hyper-seal v0.1.0 (D:\a\slates\slates\vendor\hyper-raft\hyper-seal)
+    Checking hyper-datagram v0.1.0 (D:\a\slates\slates\vendor\hyper-raft\hyper-datagram)
+    Checking rcgen v0.13.2
+    Checking slates-transport v0.1.0 (D:\a\slates\slates\crates\transport)
+    Checking slates-cluster v0.1.0 (D:\a\slates\slates\crates\cluster)
+    Checking slates-server v0.1.0 (D:\a\slates\slates\crates\server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 00s
+    Checking slates-machine v0.1.0 (D:\a\slates\slates\crates\machine)
+   Compiling aws-lc-rs v1.18.1 (D:\a\slates\slates\vendor\aws-lc-rs)
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_PREBUILT_NASM': '0'
+warning: aws-lc-sys@0.45.0: Value: 0 is false.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-pc-windows-msvc'
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' failed - Err(Error { kind: ToolExecError, message: "command did not execute successfully (status code exit code: 2): \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Tools\\\\MSVC\\\\14.51.36231\\\\bin\\\\HostX64\\\\x64\\\\cl.exe\" \"-nologo\" \"-MD\" \"-Z7\" \"-Brepro\" \"-WX\" \"-W4\" \"-FoD:\\\\a\\\\slates\\\\slates\\\\target\\\\debug\\\\build\\\\aws-lc-sys-adc05d15a5129420\\\\out\\\\out-stdalign_check\\\\e1bacabfea35bee3-stdalign_check.o\" \"-c\" \"D:\\\\a\\\\slates\\\\slates\\\\vendor\\\\aws-lc-sys\\\\aws-lc\\\\tests\\\\compiler_features_tests\\\\stdalign_check.c\"" }).
+   Compiling rustix v1.1.4
+    Checking slates-guest-probe v0.1.0 (D:\a\slates\slates\crates\guest-probe)
+   Compiling rustls v0.23.44
+    Checking slates-mem v0.1.0 (D:\a\slates\slates\crates\mem)
+    Checking slates-wire v0.1.0 (D:\a\slates\slates\crates\wire)
+    Checking rustls-webpki v0.103.15
+    Checking hyper-datagram v0.1.0 (D:\a\slates\slates\vendor\hyper-raft\hyper-datagram)
+    Checking hyper-seal v0.1.0 (D:\a\slates\slates\vendor\hyper-raft\hyper-seal)
+    Checking rcgen v0.13.2
+    Checking slates-ipc v0.1.0 (D:\a\slates\slates\crates\ipc)
+    Checking slates-rt v0.1.0 (D:\a\slates\slates\crates\rt)
+    Checking slates-vfs v0.1.0 (D:\a\slates\slates\crates\vfs)
+    Checking slates-anchor v0.1.0 (D:\a\slates\slates\crates\anchor)
+    Checking slates-client v0.1.0 (D:\a\slates\slates\crates\client)
+    Checking slates-mcp v0.1.0 (D:\a\slates\slates\crates\mcp)
+    Checking slates-db v0.1.0 (D:\a\slates\slates\crates\db)
+    Checking slates-transport v0.1.0 (D:\a\slates\slates\crates\transport)
+    Checking slates-base v0.1.0 (D:\a\slates\slates\crates\base)
+    Checking slates-bridge-core v0.1.0 (D:\a\slates\slates\crates\bridge-core)
+    Checking slates-land v0.1.0 (D:\a\slates\slates\crates\land)
+    Checking slates-cluster v0.1.0 (D:\a\slates\slates\crates\cluster)
+    Checking slates-bridge-winfsp v0.1.0 (D:\a\slates\slates\crates\bridge-winfsp)
+    Checking slates-bridge-nfs v0.1.0 (D:\a\slates\slates\crates\bridge-nfs)
+    Checking slates-bridge-fuse v0.1.0 (D:\a\slates\slates\crates\bridge-fuse)
+    Checking slates-server v0.1.0 (D:\a\slates\slates\crates\server)
+    Checking slates-cli v0.1.0 (D:\a\slates\slates\crates\cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.80s
+## clippy exit 0
