@@ -701,6 +701,7 @@ impl Partition {
       | Op::VolumeAccounted { id, .. }
       | Op::VolumeHeadAdvanced { id, .. }
       | Op::AccessChanged { id, .. }
+      | Op::LiveShippingChanged { id, .. }
       | Op::VolumeRebased { id, .. } => self.volume(*id).map(|_| ()).ok_or(DbError::NotFound),
       Op::SnapshotTaken { record } => {
         self.volume(record.volume).ok_or(DbError::NotFound)?;
@@ -958,6 +959,11 @@ impl Partition {
       }),
       Op::AccessChanged { id, access } => self.update_volume(*id, |v| {
         v.access = access.clone();
+        v.catalog_version = v.catalog_version.saturating_add(1);
+      }),
+      // The catalog register carries the flag (a successor keeps shipping), so its version moves as an access change's.
+      Op::LiveShippingChanged { id, live_shipped } => self.update_volume(*id, |v| {
+        v.policy.live_shipped = *live_shipped;
         v.catalog_version = v.catalog_version.saturating_add(1);
       }),
       Op::VolumeDestroyed { id } => {

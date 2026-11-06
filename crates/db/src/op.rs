@@ -355,6 +355,13 @@ pub enum Op {
     /// The purge.
     record: crate::catalog::NfsPurgeRecord,
   },
+  /// A volume's live shipping was turned on or off (§4.10, A-200; 2026-11-04). Appended.
+  LiveShippingChanged {
+    /// The volume.
+    id: VolumeId,
+    /// Whether it is live-shipped now.
+    live_shipped: bool,
+  },
 }
 
 impl Op {
@@ -414,6 +421,7 @@ impl Op {
       Op::NfsCallsCleared { .. } => "nfs_calls_cleared",
       Op::NfsPurgeOwed { .. } => "nfs_purge_owed",
       Op::NfsPurgeSettled { .. } => "nfs_purge_settled",
+      Op::LiveShippingChanged { .. } => "live_shipping_changed",
     }
   }
 }

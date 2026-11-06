@@ -745,6 +745,15 @@ pub enum RequestBody {
     /// The caller's write attachment of `base.volume`.
     attachment: u64,
   },
+  /// Turn a volume's live shipping on or off (§4.10, A-200): while on, each publication of the volume is shipped to its
+  /// candidates and a barrier answers only once the owner and `f` of them hold it. `admin` on the volume is required.
+  /// Appended.
+  LiveShip {
+    /// The volume.
+    volume: VolumeId,
+    /// Whether it is live-shipped from now on.
+    live_shipped: bool,
+  },
 }
 
 /// Format: the name of the image file in an image volume's root (§4.6, A-160): what a VMM is pointed at.
@@ -1186,6 +1195,27 @@ pub struct ShardReport {
   /// The attachments this shard's registry holds: admitted and not yet drained, by every transport. One that outlives
   /// its transport is a slot no later attach can take. Appended.
   pub registry_attachments: u64,
+  /// Live shipping on this shard (A-200): each live volume it ships, and on the control shard each it holds as a
+  /// candidate. Appended.
+  pub live: Vec<LiveReport>,
+}
+
+/// One live-shipped volume's log as a shard sees it (A-200): as its owner (`holding` false: the head it appended and
+/// the position the owner and `f` candidates hold) or as a candidate (`holding` true: the head it holds; `durable` is
+/// then unknown, `None`).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct LiveReport {
+  /// The volume.
+  pub volume: VolumeId,
+  /// Whether this is a candidate's copy, not the owner's log.
+  pub holding: bool,
+  /// The head position (`None`: nothing yet).
+  pub head: Option<u64>,
+  /// The durable position, on the owner.
+  pub durable: Option<u64>,
+  /// On the owner: publications are owed to the log (a burst outran the credit, or one could not be shipped), so its
+  /// head is behind the volume until the whole record it owes is appended.
+  pub owed: bool,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.
@@ -1321,7 +1351,7 @@ impl RequestBody {
       | RequestBody::Enroll { .. }
       | RequestBody::Attest { .. }
       | RequestBody::Revoke { .. } => None,
-      RequestBody::Share { volume, .. } => Some(*volume),
+      RequestBody::Share { volume, .. } | RequestBody::LiveShip { volume, .. } => Some(*volume),
     }
   }
 
@@ -1344,6 +1374,7 @@ impl RequestBody {
         | RequestBody::Snapshot { .. }
         | RequestBody::DestroySnapshot { .. }
         | RequestBody::Share { .. }
+        | RequestBody::LiveShip { .. }
         | RequestBody::Enroll { .. }
         | RequestBody::Revoke { .. }
         | RequestBody::FsWrite { .. }
@@ -1679,6 +1710,8 @@ pub struct VolumeSummary {
   pub unique_bytes: u64,
   /// Whether it is an overlay.
   pub overlay: bool,
+  /// Whether it is live-shipped (A-200). Appended.
+  pub live_shipped: bool,
 }
 
 /// A merge conflict window (§4.16): the file, the range in base coordinates that met an intervening
@@ -3234,6 +3267,11 @@ pub enum ReplyBody {
     version: u64,
     /// What the checkout changed in the clone of the base, by kind.
     report: CheckoutReport,
+  },
+  /// A volume's live shipping was set (`LiveShip`, A-200). Appended.
+  LiveShippingSet {
+    /// Whether it is live-shipped now.
+    live_shipped: bool,
   },
 }
 
