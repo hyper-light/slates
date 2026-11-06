@@ -2620,12 +2620,51 @@ mod tests {
   /// status report counts five, then one.
   #[test]
   fn a_take_releases_the_leases_whose_terms_have_ended() {
-    crate::daemon::audit_on_shard(|state| {
+    takes_release_the_leases_whose_terms_have_ended(false);
+  }
+
+  /// The same history on a machine slow enough that the short leases' takes outlast their term (GAPS, "a lease test
+  /// assumes five takes finish inside a 20 ms term": CI run 40077995650 counted 4 where 5 were due). Do: stall past
+  /// the term before the last short take. Expect: the history still holds, since the count before the pause is judged
+  /// by the time the takes measured, and the final take still leaves its own lease alone.
+  #[test]
+  fn a_take_releases_the_leases_whose_terms_have_ended_when_the_takes_outlast_the_term() {
+    takes_release_the_leases_whose_terms_have_ended(true);
+  }
+
+  /// Takes `TARGETS` short leases (stalling past the term before the last when `stalled`), counts them, pauses past
+  /// the term, and takes one long lease, which must release every short one.
+  ///
+  /// The count before the pause is judged by the takes' own clock, not the test's speed: a take releases each lease
+  /// whose term ended at or before its reading, and a short take's reading is its lease's expiry less the term. So
+  /// the leases held after the last short take are exactly those expiring after its reading: all of them on a machine
+  /// that took them inside a term, fewer on one that did not (a stalled history must show fewer, or it stalled
+  /// nothing).
+  // A history's helper: a refused take is a failed test, as in the `#[test]` bodies.
+  #[allow(clippy::unwrap_used)]
+  fn takes_release_the_leases_whose_terms_have_ended(stalled: bool) {
+    crate::daemon::audit_on_shard(move |state| {
       let deadline = far(state);
+      let mut taken = Vec::new();
       for inode in 0..TARGETS {
-        take_target_lease(state, target(inode), inode, SHORT_TERM_NS, deadline).unwrap();
+        if stalled && inode + 1 == TARGETS {
+          pause_past_a_short_term();
+        }
+        taken
+          .push(take_target_lease(state, target(inode), inode, SHORT_TERM_NS, deadline).unwrap());
       }
-      assert_eq!(crate::verbs::shard_report(state).target_leases, TARGETS);
+      let last_reading = taken
+        .last()
+        .map_or(0, |lease| lease.expires_ns.saturating_sub(SHORT_TERM_NS));
+      let held = taken
+        .iter()
+        .filter(|lease| lease.expires_ns > last_reading)
+        .count();
+      let held = u64::try_from(held).unwrap();
+      if stalled {
+        assert!(held < TARGETS, "the stall outlasted no term: {held} held");
+      }
+      assert_eq!(crate::verbs::shard_report(state).target_leases, held);
       pause_past_a_short_term();
       take_target_lease(state, target(TARGETS), TARGETS, LONG_TERM_NS, deadline).unwrap();
       assert_eq!(crate::verbs::shard_report(state).target_leases, 1);

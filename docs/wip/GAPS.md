@@ -13371,7 +13371,17 @@ commit's run passed. Owed, failing test first: size the landing by what the prop
 its term with a slice after that point, read from the daemon rather than the client's clock), then judge whether the
 renewal rule itself is right.
 
-### 2026-10-24: a lease test assumes five takes finish inside a 20 ms term — open
+### 2026-10-24: a lease test assumes five takes finish inside a 20 ms term — fixed 2026-11-05 (bug-sweep)
+
+**Fixed.** The count before the pause is now judged by the takes' own clock. A short take reads the clock at its
+lease's expiry less the term, and it releases every lease whose term ended at or before that reading. So the leases
+held after the last short take are exactly those that expire after its reading: all five on a machine that took them
+inside the term, fewer on one that did not. That count is what the report must show.
+`a_take_releases_the_leases_whose_terms_have_ended_when_the_takes_outlast_the_term` (`crates/server/src/landing.rs`)
+stalls past the term before the last take. Under the old count it was red (`left: 1, right: 5`), and it is green
+after; the plain test is green too. With the expired-lease release disabled, both fail (`left: 5`/`6`, `right: 1`).
+The record as found:
+
 
 CI run 40077995650 (commit `6d993fdc`, the macOS lane) failed `landing::tests::a_take_releases_the_leases_whose_terms_
 have_ended` (`crates/server/src/landing.rs`): `left: 4, right: 5` at the count taken right after five leases of
