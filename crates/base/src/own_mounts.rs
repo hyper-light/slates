@@ -170,47 +170,77 @@ fn recorded(set: &Set, id: u64) -> bool {
     .any(|slot| slot.load(Ordering::Acquire) == id)
 }
 
-/// The shards of this process still learning the mounts they keep across a restart (A-227), and the budget a check
-/// waits for them. A successor learns its predecessor's surviving mounts from each shard's catalog as the shard
-/// starts, and one shard's base may lie under another's mount, so no crossing is judged until every shard has learned.
-#[cfg(unix)]
-static LEARNING: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg(unix)]
-static LEARNING_BUDGET_NS: AtomicU64 = AtomicU64::new(0);
-
-/// One shard's learning of the mounts it keeps: taken before the shard starts, let go once its kept mounts are
-/// recorded (or its start fails), so a crossing checked meanwhile anywhere in the process waits for it.
+/// One daemon's learning gate (A-227): its shards still learning the mounts they keep across a restart, and how long
+/// a check waits for them. A successor learns its predecessor's surviving mounts from each shard's catalog as the shard
+/// starts, and one shard's base may lie under another's mount, so none of the daemon's crossings is judged until every
+/// shard of that daemon has learned. The gate is the daemon's, never the process's: a check waits on its own daemon's
+/// shards alone (a process that starts many daemons, as a test binary does, once made every check wait on every
+/// starting daemon's shards, 1.00 s at a time).
 #[cfg(unix)]
 #[derive(Debug)]
-pub struct Learning(());
+pub struct Gate {
+  learning: AtomicUsize,
+  budget_ns: u64,
+}
+
+#[cfg(unix)]
+thread_local! {
+  /// The gate of the daemon whose shard this thread is ([`Gate::enter`]); none on any other thread, whose checks wait
+  /// on nothing.
+  static GATE: std::cell::Cell<Option<&'static Gate>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(unix)]
+impl Gate {
+  /// A daemon's gate, made once at its start; a check waits at most `budget_ns` (the daemon's liveness budget: a start
+  /// that takes longer is a daemon the anchor replaces). It lives as long as the process, which starts one daemon
+  /// outside tests.
+  pub fn new(budget_ns: u64) -> &'static Self {
+    Box::leak(Box::new(Self {
+      learning: AtomicUsize::new(0),
+      budget_ns,
+    }))
+  }
+
+  /// One shard's [`Learning`], taken before it starts by a shard that may keep a mount.
+  pub fn learning(&'static self) -> Learning {
+    self.learning.fetch_add(1, Ordering::AcqRel);
+    Learning(self)
+  }
+
+  /// Makes this thread's crossing checks wait on this gate: each of the daemon's shard threads, as it starts.
+  pub fn enter(&'static self) {
+    GATE.set(Some(self));
+  }
+}
+
+/// One shard's learning of the mounts it keeps: taken before the shard starts, let go once its kept mounts are
+/// recorded (or its start fails), so a crossing its daemon checks meanwhile waits for it.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct Learning(&'static Gate);
 
 #[cfg(unix)]
 impl Drop for Learning {
   fn drop(&mut self) {
-    LEARNING.fetch_sub(1, Ordering::AcqRel);
+    self.0.learning.fetch_sub(1, Ordering::AcqRel);
   }
 }
 
-/// A shard's [`Learning`], taken before it starts; a check waits at most `budget_ns` for every shard's (the daemon's
-/// liveness budget: a start that takes longer is a daemon the anchor replaces).
-#[cfg(unix)]
-pub fn learning(budget_ns: u64) -> Learning {
-  LEARNING_BUDGET_NS.fetch_max(budget_ns, Ordering::AcqRel);
-  LEARNING.fetch_add(1, Ordering::AcqRel);
-  Learning(())
-}
-
-/// Waits until no shard is learning its kept mounts, so a crossing is judged against every mount this daemon serves;
-/// refused `EAGAIN` past the budget, never judged against a partial record.
+/// Waits until no shard of this thread's daemon is learning its kept mounts, so a crossing is judged against every
+/// mount the daemon serves; refused `EAGAIN` past the budget, never judged against a partial record. A thread that is
+/// no daemon's shard waits on nothing.
 #[cfg(unix)]
 fn await_learned() -> Result<(), HostError> {
-  if LEARNING.load(Ordering::Acquire) == 0 {
+  let Some(gate) = GATE.get() else {
+    return Ok(());
+  };
+  if gate.learning.load(Ordering::Acquire) == 0 {
     return Ok(());
   }
-  let budget = std::time::Duration::from_nanos(LEARNING_BUDGET_NS.load(Ordering::Acquire));
+  let budget = std::time::Duration::from_nanos(gate.budget_ns);
   let started = std::time::Instant::now();
-  while LEARNING.load(Ordering::Acquire) > 0 {
+  while gate.learning.load(Ordering::Acquire) > 0 {
     if started.elapsed() >= budget {
       return Err(HostError::Unavailable(
         rustix::io::Errno::AGAIN.raw_os_error(),
