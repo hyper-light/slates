@@ -3231,6 +3231,14 @@ fn assert_formed(views: &[Option<FleetView>]) -> Vec<String> {
             "fleet.plane.announce_lends:",
             "fleet.plane.announcements_sent:",
             "content.purged_bytes:",
+            // The reap tick's record of what a shard was doing (A-214: sealing, deferred, busy, idle) and the
+            // bytes an idle shard kept pre-faulted for its next write burst: events of a shard's ordinary
+            // ticks, counted during formation like `content.purged_bytes` (main CI 42172125695, macos-latest).
+            "content.ticks.sealing:",
+            "content.ticks.deferred:",
+            "content.ticks.busy:",
+            "content.ticks.idle:",
+            "content.prefaulted_bytes:",
             // A record link dropped because its anchor's learned member became another incarnation
             // (`fleet::LINK_INVALID_MEMBER_CHANGED`). Incarnations change as the fleet comes up, so this is
             // superseded link work — exactly what this assertion permits — and it is counted during formation
