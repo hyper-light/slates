@@ -5946,24 +5946,20 @@ fn rebase(state: &mut ShardState, principal: &Principal, work: VolumeId) -> Repl
   match engine.rebase(&inc) {
     slates_merge::engine::Rebased::Rebased {
       version,
-      files,
+      changed,
       journal,
     } => {
-      // The work moves onto the head; the green is untouched. The engine restates the work's whole content there,
-      // and the work keeps only what differs from the head (`crate::work_files`). Its new footprint is charged
-      // first: refused, the work stays where it was. `build_increment` proved the work exists, so this lookup finds
-      // it. (The rebase's cost still follows the green's files: the engine's restatement is whole, owed.)
-      let Some(engine) = state.greens.get(&green_id) else {
-        return refused(Refusal::NotFound);
-      };
-      let held = crate::work_files::WorkFiles::restated_footprint((engine, version), &files);
-      let wanted = crate::work_charge::journal_footprint(&journal).saturating_add(held);
+      // The work moves onto the head; the green is untouched. The engine returns only what the work's mapped edits
+      // leave different from the head (`Rebased::changed`), which becomes the work's delta over its new base
+      // (`crate::work_files`): O(what the work changed). Its new footprint is charged first: refused, the work stays
+      // where it was. `build_increment` proved the work exists, so this lookup finds it.
+      let changed = crate::work_files::WorkFiles::from_changed(changed);
+      let wanted = crate::work_charge::footprint(&changed, &journal);
       if let Err(available) = crate::work_charge::set_to(state, work_id, wanted) {
         return refused(Refusal::BudgetExceeded { available });
       }
-      let (works, greens) = (&mut state.works, &state.greens);
-      if let (Some(w), Some(engine)) = (works.get_mut(&work_id), greens.get(&green_id)) {
-        w.files.restate((engine, version), files);
+      if let Some(w) = state.works.get_mut(&work_id) {
+        w.files = changed;
         w.base_version = version;
         w.journal = journal;
         w.revision = w.revision.wrapping_add(1);

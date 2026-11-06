@@ -13,7 +13,8 @@
 //!   submits; its base is the head, so the fast path accepts), `ranged` (a second work's base lags the head by the
 //!   first's accept on the same file; its disjoint range is mapped and swept), `identical` (the lagging work writes
 //!   the bytes the head already holds there; pass two's memcmp accepts it with no effect) and `conflict` (it writes
-//!   different bytes there; the green does not move, and the work is replaced afterwards, untimed). Every sample is
+//!   different bytes there; the green does not move, and the work is replaced afterwards, untimed) and `rebase` (the
+//!   lagging work's disjoint edit is rebased onto the head in the submit's place, then submitted untimed). Every sample is
 //!   checked against a model of the green: the verdict the design's rule gives, the head, and the edited file read
 //!   back from the head. A wrong answer ends the run with exit 1, so no number is printed for a path that answered
 //!   wrongly.
@@ -45,7 +46,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use slates_client::{Client, ClientError, Deadlines, ReadAt, Submitted, VolumeId};
+use slates_client::{Client, ClientError, Deadlines, ReadAt, Rebased, Submitted, VolumeId};
 use slates_machine::{MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
@@ -114,10 +115,17 @@ enum Form {
   Ranged,
   Identical,
   Conflict,
+  Rebase,
 }
 
 impl Form {
-  const ALL: [Form; 4] = [Form::Accept, Form::Ranged, Form::Identical, Form::Conflict];
+  const ALL: [Form; 5] = [
+    Form::Accept,
+    Form::Ranged,
+    Form::Identical,
+    Form::Conflict,
+    Form::Rebase,
+  ];
 
   fn key(self) -> &'static str {
     match self {
@@ -125,6 +133,7 @@ impl Form {
       Form::Ranged => "ranged",
       Form::Identical => "identical",
       Form::Conflict => "conflict",
+      Form::Rebase => "rebase",
     }
   }
 }
@@ -134,6 +143,10 @@ impl Form {
 struct Sample {
   edit: u64,
   submit: u64,
+  /// The edit's request sequence (`Client::last_request`), to find its spans.
+  edit_request: u32,
+  /// The submit's (or rebase's) request sequence.
+  submit_request: u32,
 }
 
 /// A green, its model and the works that edit it.
@@ -310,14 +323,18 @@ impl Fixture {
           .edit(leader, &path, 0, EDIT_BYTES as u64, &bytes)
           .unwrap();
         let edited = Instant::now();
+        let edit_request = self.client.last_request().sequence;
         let answer = self.client.submit(leader).unwrap();
         let done = Instant::now();
+        let submit_request = self.client.last_request().sequence;
         self.expect_accept(answer, "an edit based on the head");
         self.model_overwrite(&path, 0, &bytes);
         self.check(&path);
         Sample {
           edit: ns(edited - started),
           submit: ns(done - edited),
+          edit_request,
+          submit_request,
         }
       }
       Form::Ranged => {
@@ -331,14 +348,18 @@ impl Fixture {
           .edit(follower, &path, SECOND_RANGE, EDIT_BYTES as u64, &bytes)
           .unwrap();
         let edited = Instant::now();
+        let edit_request = self.client.last_request().sequence;
         let answer = self.client.submit(follower).unwrap();
         let done = Instant::now();
+        let submit_request = self.client.last_request().sequence;
         self.expect_accept(answer, "a disjoint edit behind the head");
         self.model_overwrite(&path, SECOND_RANGE, &bytes);
         self.check(&path);
         Sample {
           edit: ns(edited - started),
           submit: ns(done - edited),
+          edit_request,
+          submit_request,
         }
       }
       Form::Identical => {
@@ -351,14 +372,18 @@ impl Fixture {
           .edit(follower, &path, 0, EDIT_BYTES as u64, &lead)
           .unwrap();
         let edited = Instant::now();
+        let edit_request = self.client.last_request().sequence;
         let answer = self.client.submit(follower).unwrap();
         let done = Instant::now();
+        let submit_request = self.client.last_request().sequence;
         // An identical edit accepts at a new version with no effect: the model's bytes stay.
         self.expect_accept(answer, "an identical edit behind the head");
         self.check(&path);
         Sample {
           edit: ns(edited - started),
           submit: ns(done - edited),
+          edit_request,
+          submit_request,
         }
       }
       Form::Conflict => {
@@ -372,8 +397,10 @@ impl Fixture {
           .edit(follower, &path, 0, EDIT_BYTES as u64, &bytes)
           .unwrap();
         let edited = Instant::now();
+        let edit_request = self.client.last_request().sequence;
         let answer = self.client.submit(follower).unwrap();
         let done = Instant::now();
+        let submit_request = self.client.last_request().sequence;
         match answer {
           Submitted::Conflict(windows)
             if windows
@@ -388,6 +415,52 @@ impl Fixture {
         Sample {
           edit: ns(edited - started),
           submit: ns(done - edited),
+          edit_request,
+          submit_request,
+        }
+      }
+      Form::Rebase => {
+        // The lagging work's disjoint edit is rebased onto the head (timed in the submit's place), then
+        // submitted (untimed): the rebase must move it onto the head with its edit kept, so the submit
+        // accepts at the next version by the fast path and the file reads back with both edits.
+        let lead = fresh_bytes(self.next_stamp());
+        self.lead(&path, &lead);
+        let bytes = fresh_bytes(self.next_stamp());
+        let follower = self.follower;
+        let started = Instant::now();
+        self
+          .client
+          .edit(follower, &path, SECOND_RANGE, EDIT_BYTES as u64, &bytes)
+          .unwrap();
+        let edited = Instant::now();
+        let edit_request = self.client.last_request().sequence;
+        let answer = self.client.rebase(follower).unwrap();
+        let done = Instant::now();
+        let submit_request = self.client.last_request().sequence;
+        if answer != Rebased::Rebased(self.head) {
+          wrong(&format!(
+            "a disjoint edit behind the head rebased as {answer:?}, not onto {}",
+            self.head
+          ));
+        }
+        let read = self.client.read(follower, &path, ReadAt::Head).unwrap();
+        let mut expected = self.model.get(&path).cloned().unwrap_or_default();
+        let at = usize::try_from(SECOND_RANGE).unwrap();
+        expected[at..at + bytes.len()].copy_from_slice(&bytes);
+        if read != expected {
+          wrong(&format!(
+            "{path} in the rebased work is not the head with its edit"
+          ));
+        }
+        let answer = self.client.submit(follower).unwrap();
+        self.expect_accept(answer, "a rebased edit");
+        self.model_overwrite(&path, SECOND_RANGE, &bytes);
+        self.check(&path);
+        Sample {
+          edit: ns(edited - started),
+          submit: ns(done - edited),
+          edit_request,
+          submit_request,
         }
       }
     }
@@ -411,19 +484,119 @@ fn percentiles(mut samples: Vec<u64>) -> Vec<(&'static str, u64)> {
 }
 
 /// One form on one green shape: per part, per percentile, the per-run values.
+/// One request's server-side time, from its spans (§4.14): the ring span on the shard that read its slot (read to
+/// reply written), the shard ops of its verb on the shards that ran it, and the merge verdict inside a submit.
+#[derive(Clone, Copy, Default)]
+struct Served {
+  ring: u64,
+  op: u64,
+  verdict: u64,
+}
+
+/// Every span of this client's requests the shards hold, drained (each drain is bounded, so a shard is drained until
+/// it holds no more), keyed by request sequence; and the spans the shards shed before a drain.
+fn drain(client: &mut Client, shards: u16, into: &mut BTreeMap<u32, Served>) -> u64 {
+  let me = client.client_id();
+  let mut shed = 0u64;
+  for partition in 0..shards {
+    loop {
+      let report = client.telemetry(partition).unwrap();
+      shed = shed.saturating_add(report.shed_before);
+      let name = |point: u32| {
+        report
+          .chokepoints
+          .get(usize::try_from(point).unwrap_or(usize::MAX))
+          .map(|c| c.name.clone())
+          .unwrap_or_default()
+      };
+      for span in &report.spans {
+        if span.request_client != me {
+          continue;
+        }
+        let took = span.end_ns.saturating_sub(span.start_ns);
+        let served = into.entry(span.request_sequence).or_default();
+        match name(span.point).as_str() {
+          "ring.request" => served.ring = served.ring.saturating_add(took),
+          "shard.op" => served.op = served.op.saturating_add(took),
+          "merge.verdict" => served.verdict = served.verdict.saturating_add(took),
+          _ => {}
+        }
+      }
+      if report.remaining == 0 {
+        break;
+      }
+    }
+  }
+  shed
+}
+
+/// The median of `values` (0 for none).
+fn median(mut values: Vec<u64>) -> u64 {
+  values.sort_unstable();
+  values.get(values.len() / 2).copied().unwrap_or(0)
+}
+
+/// Where a form's time went (§4.14 spans): for its median samples and for its samples at or above p99 of the total,
+/// the median of the client's total, of the ring spans (the server's time from reading the slot to writing the
+/// reply), of the shard ops and of the verdicts. The total less the ring is the client's own time and the wake: the
+/// doorbell, the shard's wake from its park and the client's wake.
+fn attribute(key: &str, samples: &[(Sample, Served, Served)], shed: u64) {
+  let total = |s: &(Sample, Served, Served)| s.0.edit.saturating_add(s.0.submit);
+  let mut totals: Vec<u64> = samples.iter().map(total).collect();
+  totals.sort_unstable();
+  let at = |permille: usize| {
+    totals
+      .get(totals.len().saturating_sub(1) * permille / 1000)
+      .copied()
+      .unwrap_or(0)
+  };
+  let (p49, p51, p99) = (at(490), at(510), at(990));
+  let unmatched = samples
+    .iter()
+    .filter(|s| s.1.ring == 0 || s.2.ring == 0)
+    .count();
+  for (band, keep) in [
+    (
+      "median",
+      Box::new(|t: u64| t >= p49 && t <= p51) as Box<dyn Fn(u64) -> bool>,
+    ),
+    ("p99_tail", Box::new(|t: u64| t >= p99)),
+  ] {
+    let chosen: Vec<&(Sample, Served, Served)> =
+      samples.iter().filter(|s| keep(total(s))).collect();
+    let pick =
+      |f: &dyn Fn(&(Sample, Served, Served)) -> u64| median(chosen.iter().map(|s| f(s)).collect());
+    let client = pick(&|s| total(s));
+    let ring = pick(&|s| s.1.ring.saturating_add(s.2.ring));
+    let op = pick(&|s| s.1.op.saturating_add(s.2.op));
+    let verdict = pick(&|s| s.2.verdict);
+    let outside = pick(&|s| total(s).saturating_sub(s.1.ring.saturating_add(s.2.ring)));
+    println!(
+      "attrib\tmerge.{key}_{band}: {} samples; client {client} ns, ring {ring} ns, shard ops {op} ns, verdict {verdict} ns, outside the ring {outside} ns (median of each); spans shed {shed}, samples unmatched {unmatched}",
+      chosen.len()
+    );
+  }
+}
+
+/// One form on one green shape: per part, per percentile, the per-run values; the attribution lines are printed.
 fn measure(
   instance: &str,
-  form: Form,
-  files: usize,
-  load: &str,
+  (form, files, load): (Form, usize, &str),
+  shards: u16,
 ) -> Result<BTreeMap<String, Vec<u64>>, String> {
   let mut rows: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+  let mut attributed: Vec<(Sample, Served, Served)> = Vec::new();
+  let mut shed = 0u64;
   for run in 0..RUNS {
     let tag = format!("{}-{files}-{load}-{run}", form.key());
     let mut fixture = Fixture::new(instance, &tag, files)?;
     let mut edits = Vec::with_capacity(SAMPLES);
     let mut submits = Vec::with_capacity(SAMPLES);
     let mut totals = Vec::with_capacity(SAMPLES);
+    let mut run_samples: Vec<Sample> = Vec::with_capacity(SAMPLES);
+    let mut served: BTreeMap<u32, Served> = BTreeMap::new();
+    // What the shards held before this run is not this run's.
+    drain(&mut fixture.client, shards, &mut BTreeMap::new());
     let started = Instant::now();
     for n in 0..SAMPLES {
       if n >= MIN_SAMPLES && started.elapsed() > RUN_BUDGET {
@@ -433,6 +606,23 @@ fn measure(
       edits.push(sample.edit);
       submits.push(sample.submit);
       totals.push(sample.edit.saturating_add(sample.submit));
+      run_samples.push(sample);
+      // Drained after every sample (untimed): a shard's span ring holds as many spans as a client region has slots
+      // (`crates/server/src/daemon.rs`, `telemetry_capacity`), fewer than a few samples emit; the shed count printed
+      // with each form says whether that was enough.
+      shed = shed.saturating_add(drain(&mut fixture.client, shards, &mut served));
+    }
+    shed = shed.saturating_add(drain(&mut fixture.client, shards, &mut served));
+    for sample in run_samples {
+      let edit = served
+        .get(&sample.edit_request)
+        .copied()
+        .unwrap_or_default();
+      let submit = served
+        .get(&sample.submit_request)
+        .copied()
+        .unwrap_or_default();
+      attributed.push((sample, edit, submit));
     }
     rows
       .entry("samples".to_owned())
@@ -447,6 +637,11 @@ fn measure(
     fixture.client.destroy(fixture.follower).unwrap();
     fixture.client.destroy(fixture.green).unwrap();
   }
+  attribute(
+    &format!("{}_f{files}_{load}", form.key()),
+    &attributed,
+    shed,
+  );
   Ok(rows)
 }
 
@@ -605,27 +800,44 @@ fn against_goal(p99: u64) -> &'static str {
 
 /// What the command line selects: the shapes and forms to run, and whether to run the loaded sweep.
 struct Selection {
+  /// The daemon's shards, whose spans the attribution drains.
+  shards: u16,
   shapes: Vec<usize>,
   forms: Vec<Form>,
   growth: Vec<Growth>,
   loaded: bool,
+  /// Whether the quiet sweep runs (`--loaded-only` skips it).
+  quiet: bool,
+  /// Spinning threads per core in the loaded form (`--spinners-per-core N`).
+  spinners_per_core: usize,
 }
 
 impl Selection {
-  /// `--quiet-only`, `--files N` (repeatable; the shapes instead of [`GREEN_FILES`]) and `--form NAME`
-  /// (repeatable; `accept`, `ranged`, `identical`, `conflict`, `new_file`, `one_file`): a profile run selects one
+  /// `--quiet-only`, `--loaded-only`, `--spinners-per-core N` (the loaded form's spinners, one by default),
+  /// `--files N` (repeatable; the shapes instead of [`GREEN_FILES`]) and `--form NAME`
+  /// (repeatable; `accept`, `ranged`, `identical`, `conflict`, `rebase`, `new_file`, `one_file`): a profile run selects one
   /// form on one shape. With no `--form`, every form runs.
   fn parse() -> Selection {
     let mut selection = Selection {
+      shards: 0,
       shapes: Vec::new(),
       forms: Vec::new(),
       growth: Vec::new(),
       loaded: true,
+      quiet: true,
+      spinners_per_core: 1,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
       match arg.as_str() {
         "--quiet-only" => selection.loaded = false,
+        "--loaded-only" => selection.quiet = false,
+        "--spinners-per-core" => {
+          selection.spinners_per_core = args
+            .next()
+            .and_then(|n| n.parse().ok())
+            .expect("--spinners-per-core takes a count");
+        }
         "--files" => selection.shapes.push(
           args
             .next()
@@ -639,7 +851,7 @@ impl Selection {
           } else if let Some(form) = Growth::ALL.into_iter().find(|form| form.key() == name) {
             selection.growth.push(form);
           } else {
-            panic!("--form is accept, ranged, identical, conflict, new_file or one_file");
+            panic!("--form is accept, ranged, identical, conflict, rebase, new_file or one_file");
           }
         }
         other => panic!("unknown argument {other}"),
@@ -661,7 +873,7 @@ fn sweep(instance: &str, load: &str, selection: &Selection) {
   for files in &selection.shapes {
     for form in selection.forms.iter().copied() {
       let key = format!("{}_f{files}_{load}", form.key());
-      let rows = match measure(instance, form, *files, load) {
+      let rows = match measure(instance, (form, *files, load), selection.shards) {
         Ok(rows) => rows,
         Err(refused) => {
           println!("goal\tmerge.{key}: refused at capacity, not measured: {refused}");
@@ -709,14 +921,20 @@ fn main() {
     std::env::consts::OS,
     std::env::consts::ARCH
   );
-  let selection = Selection::parse();
-  sweep(&instance, "quiet", &selection);
-  growth_sweep(&instance, &selection);
+  let mut selection = Selection::parse();
+  selection.shards = shards;
+  if selection.quiet {
+    sweep(&instance, "quiet", &selection);
+    growth_sweep(&instance, &selection);
+  }
   if selection.loaded {
-    // The loaded form: one spinning thread per core this process can run, owned and joined here.
+    // The loaded form: `spinners_per_core` spinning threads per core this process can run (one by default; Ada's
+    // controlled load is two), owned and joined here.
     let stop = AtomicBool::new(false);
+    let spinners = cores.saturating_mul(selection.spinners_per_core);
+    println!("loaded: {spinners} spinning threads on {cores} cores");
     std::thread::scope(|scope| {
-      for _ in 0..cores {
+      for _ in 0..spinners {
         scope.spawn(|| {
           while !stop.load(Ordering::Relaxed) {
             std::hint::spin_loop();

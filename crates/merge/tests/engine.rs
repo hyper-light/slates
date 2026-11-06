@@ -718,7 +718,7 @@ fn rebase_maps_a_clean_work_forward_and_commits_nothing() {
   );
   let Rebased::Rebased {
     version,
-    files,
+    changed,
     journal,
   } = rebased
   else {
@@ -726,10 +726,11 @@ fn rebase_maps_a_clean_work_forward_and_commits_nothing() {
   };
   assert_eq!(version, 2, "the work is now based on the head");
   assert_eq!(
-    files.get("f").map(Vec::as_slice),
+    changed.get("f").cloned().flatten().as_deref(),
     Some(b"AB01234567YY".as_slice()),
     "the head's file with the tail overwrite mapped two bytes forward"
   );
+  assert_eq!(changed.len(), 1, "only the file the work changed");
   assert_eq!(
     journal,
     vec![VolumeOp::Overwrite {

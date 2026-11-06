@@ -170,7 +170,8 @@
 > 400 MB green (chain checkpointing owed). Quiet Linux CI (load 1.1–1.6): p50 12–21 µs, p99 43–98 µs at
 > 10 to 100,000 files on x86_64 and aarch64, against main's 4.0–66 ms (BENCHMARKS). **Open:** p99/p999 tails up to 1.1 ms
 > and one 570 ms max on CI; the preferred 50 µs on the shared Mac (the fixed cost of the two round trips); the two-machine path (fs-server); the rebase
-> restates whole. Since A-202 (2026-11-05) the head identity a holder recomputes is a set hash brought up to date when
+> restated whole until 2026-11-06 (A-202 part 3: a rebase now costs what the work changed, 45–52 µs at 10,000 files
+> quiet against 7.9–14.7 ms). Since A-202 (2026-11-05) the head identity a holder recomputes is a set hash brought up to date when
 > read, so a record at `f > 0` costs what its version changed; its format changed (golden vector in
 > `crates/merge/tests/origin.rs`), so records written before it would not match a newer holder. A daemon `SIGKILL`ed six times mid-merge
 > loses no told version and tells none twice (`crates/cli/tests/merge_kill.rs`, red with the durable append removed).

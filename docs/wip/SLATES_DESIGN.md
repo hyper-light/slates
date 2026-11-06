@@ -7205,7 +7205,7 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > below says (it had left both out, and a second work's identical edit was answered with the first work's version;
 > `docs/bugs/2026-11-04-the-same-edit-from-two-works-was-one-increment.md`). Since A-202 (2026-11-05) the head
 > identity is a set hash over the green's entries, brought up to date when read, so a record at `f > 0` costs what its
-> version changed. Owed: the rebase's whole restatement.
+> version changed. Since part 3 (2026-11-06) a clean rebase returns only what the work changed over the head.
 
 > **Status (2026-11-04, A-201: a green's head lands through a checkout).** `checkout GREEN VOLUME ATTACHMENT
 > --snapshot N` writes the green's head into the volume it was created from (the server's overlay of the directory
@@ -13260,8 +13260,8 @@ edit_merge_bench.rs` (its verdict forms), `crates/client/tests/merge_identity.rs
   adas-macbook-pro-2 2026-11-05 with `SLATES_TEST_CLI=1`; red with the accepted version's durable append removed,
   where the successor's chain was empty and versions 1 to 20 had each been told six times).
 - **Owed.** At `f > 0` every accept still made the head identity over every byte (part 2 below makes it
-  O(changed)). The rebase's restatement is whole (the
-  engine returns every file). `PathTable::intern` searches linearly, so composing one increment of n paths is O(n²).
+  O(changed)). The rebase's restatement was whole (the
+  engine returned every file; part 3 below). `PathTable::intern` searches linearly, so composing one increment of n paths is O(n²).
   The engine keeps each current file twice (its content map and its history). The growth forms of
   `edit_merge_bench` (the clients agent's, folded into one harness with these forms) no longer grow: the last hundred
   of a thousand new-file merges' medians 6.8 to 22.5 µs at load 23 to 25, against 529 to 684 µs before.
@@ -13305,6 +13305,23 @@ Applied in the same change to: §4.16 (status), `docs/wip/merge-service.md` (the
   scratch at every read (red with the fold's guard removed: the first generated case failed); one state reached in
   two orders has one identity; a byte, a mode bit or a kind changes it and restoring the byte restores it. The
   fleet's holder-recompute, mismatch and takeover tests pass unchanged (BENCHMARKS, GAPS).
+
+**Part 3 — A rebase costs what the work changed (accepted and built 2026-11-06).** A clean rebase
+(`Green::rebase`) cloned the head's whole content, applied the work's mapped effects, and the server then compared every
+file with the head to find what the work holds; a rebase cost O(the green). Now the engine returns `Rebased::changed`,
+each path whose bytes the rebase leaves different from the head's (or `None` where it removes a file the head holds), and
+the server takes it as the work's delta over its new base (`WorkFiles::from_changed`), charged by its own footprint.
+- **Measured first** (the regression, before the fix): the harness's new `rebase` form (a lagging work's disjoint edit
+  rebased, then submitted untimed, every answer checked against the model), adas-macbook-pro-2 at load 26 to 29:
+  p50 74 µs at 10 files, 1.25 ms at 1,000, 19.1 ms at 10,000, while `accept` stayed at 42 to 86 µs.
+- **A/B** (interleaved R0 R1 × 3, load 8 to 29, 3 × 1,000 samples a run): quiet, 10,000 files, p50 7.89, 12.35, 14.70 ms
+  → 45, 52, 45 µs; loaded (one spinner a core), 10,000 files, 34.0, 31.9, 36.9 ms → 87, 99, 114 µs. Both arms' loaded
+  p99 is 8.6 to 11.8 ms even at 10 files: that tail is the wake under load (BENCHMARKS), not the rebase.
+- **Proven.** `crates/merge/tests/rebase.rs`: over 20,000 generated twin greens and a generated work from a generated older
+  base, the rebase and the twin's submit give the same verdict, the rebasing green is unchanged, and the head with the
+  rebase's changes over it equals the twin's head after the accept, every change differing from the head (red with
+  the changes under `d` dropped: the first case failed); a one-file edit of a thousand-file green rebases to that file
+  alone. The server's library, daemon and client suites pass.
 
 ### A-214 — An idle shard keeps its last write burst's worth of free content pages pre-faulted (accepted 2026-11-05, VFS plan step 11; amends A-105)
 
