@@ -297,3 +297,19 @@ slates-winfsp: reply spin window = 48000 ns: the median one-way channel wake of 
 slates-winfsp: reply spin window = 7400 ns: the median one-way channel wake of 15 (the 2-competitive spin)
 slates-winfsp: receive worker 1 serves, after the probe
 ## run 1 of 5 FAILED, 2026-11-06T03:59:12Z
+remote: 
+remote: Create a pull request for 'diag-winfsp-overlap-results-42155161568-windows-11-arm' on GitHub by visiting:        
+remote:      https://github.com/hyper-light/slates/pull/new/diag-winfsp-overlap-results-42155161568-windows-11-arm        
+remote: 
+To https://github.com/hyper-light/slates
+ * [new branch]      7a3c251b431f77641901e2ca9055696ee0017f28 -> diag-winfsp-overlap-results-42155161568-windows-11-arm
+## run 2 of 5, 2026-11-06T03:59:14Z
+# sep1 started first: dll=W: sep1=S: sep2=T: comb1=U: comb2=V:
+# host: windows 0x23f00206 on windows processor architecture 12 level 3401 revision 0 (aarch64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 1048576 B, cache line 64 B
+# workload: 10 rounds of 1000 files of 4096 B per arm and pass, arms interleaved, first arm rotating
+# arm dll: W:/d
+# arm sep1: S:/d
+# arm sep2: T:/d
+# arm comb1: U:/d
+# arm comb2: V:/d
+# warm-up: one untimed round per arm (1000 files each)
