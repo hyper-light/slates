@@ -1,5 +1,25 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **WinFsp receiver: Step 7's regression against the DLL stands (2026-11-06, audit step 7; open).** Diagnostics run
+> 42130583401 (BENCHMARKS, "Step 7's measured state") measured main's one-worker receiver against `71cf09ac`'s DLL
+> dispatcher, five runs a runner, quiet and loaded. It was beyond the DLL's spread in 13 cells on arm64 (quiet stat p50
+> 147.3 against at most 117.1 µs; loaded write p50 212.0 against 102.6) and in 15 on x86_64.
+> - A-219's second worker found no win in any form timed. Its probe, run off the mount's path, put the daemon's own I/O
+>   on a volume the daemon serves, and a kill then strands it. WinFsp's processing queue is never cancelled
+>   (`FSP_IOQ_PROCESS_NO_CANCEL`), so every killed probing role outlived the 10 s reap. So A-219's runtime (`e070f31e`,
+>   `5b5f7ba1`) is off main. **Rule: a daemon never sends I/O to a volume it serves itself.**
+> - **A-190's coherent purge breaks the same rule on main (open, sibling found 2026-11-06).** The command thread opens the
+>   daemon's own drive (`crates/bridge-winfsp/src/host.rs`, `CreateFileW` near line 2038) and writes and reads each
+>   purged range through it. A kill while one of those requests is delivered strands the daemon as the probe did, for one
+>   purge's request rather than a whole probe; no run has been seen to hit it. The fix is to run the purge's client in a
+>   child process. Bug record: `docs/bugs/2026-11-06-a-daemons-own-io-on-its-volume-strands-its-exit.md`.
+> - **Owed:** the five-arm A/B with every worker count fixed at build time and no probe: the DLL, the separate form at
+>   one and two workers, and A-215's combined form at one and two (diagnostics run on `diag-winfsp-overlap-24`, with the
+>   combined form's live oracles at both counts).
+>   - If combined + 2 is within the DLL's spread at the p50 and p99 on both runners, quiet and loaded, it replaces the
+>     separate form.
+>   - If no one form passes both runners, the per-machine form question goes to Ada with that table.
+
 > **A-214, A-217 and A-207's port reverted from main (2026-11-05, by the supervisor); their re-landing is owed.** Main CI
 > 42119714654 on b502cf96 failed six jobs, all from this pairing of landed changes, each green on its own branch:
 > - **A-217 against A-201's checkout.** A-217 records a green's origin as a reference to its base snapshot, and

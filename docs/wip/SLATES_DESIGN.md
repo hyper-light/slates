@@ -2913,6 +2913,18 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 > looks: five holds under a 4 s pause were answered in 3,990–4,020 ms before, on both CI lanes, and under 1 ms after
 > (runs 41984349301 and 41985213489).
 
+**No daemon thread opens a path on a volume the daemon serves (2026-11-06).** A request a daemon sends to its own volume
+is answered only by that daemon's receive workers. Once delivered it sits in WinFsp's processing queue, which is never
+cancelled or expired (`FSP_IOQ_PROCESS_NO_CANCEL`, WinFsp v2.1 `src/sys/ioq.c:572-575`). A dying thread waits for its
+cancelled IRPs, and Windows gives up on them only after 5 minutes (Microsoft Learn, "Canceling IRPs"). The volume's
+control handle closes only after every thread has exited. So a daemon killed with such a request outstanding cannot
+exit. A-219's probe client did this, and every daemon killed or stopped during it outlived its reap: 10 s in the
+library kill oracles, 75-90 minutes in the CLI suites (`docs/bugs/2026-11-06-a-daemons-own-io-on-its-volume-strands-its-exit.md`).
+Anything that needs a client of a slates volume (a measurement, a check) runs that client in a child process.
+- **Open violation: A-190's coherent purge.** The command thread opens the drive under its private marker and writes
+  and reads each purged range through it, so a kill inside one of those requests strands the daemon the same way. Its
+  window is one purge's request. It is in GAPS until the purge's client leaves the daemon's process.
+
 **Base reads on macOS and Windows.** As on Linux, the daemon reads untouched base files through its own descriptor or
 handle into evictable cache chunks (one copy, `pread`/`ReadFile` on the owner shard's driver) and
 replies from arena pages as for any chunk. Listings use `getattrlistbulk` and
