@@ -1,0 +1,220 @@
+# arm main-fix at f291ac9d3076dda7a47a212bb76875176574f6be; keep bug '', workers ''
+image win11-vs2026-arm64 20261101.203.1; 4 CPUs; ARM64 ARMv8 (64-bit) Family 8 Model D49 Revision   0, MICROSOFT CORPORATION; WinFsp 2.1.25156
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded arrayvec v0.7.8
+  Downloaded cfg-if v1.0.4
+  Downloaded quote v1.0.47
+  Downloaded windows-targets v0.53.5
+  Downloaded itoa v1.0.18
+  Downloaded shlex v2.0.1
+  Downloaded cc v1.4.5
+  Downloaded find-msvc-tools v0.1.12
+  Downloaded lz4_flex v0.11.6
+  Downloaded serde_derive v1.0.229
+  Downloaded constant_time_eq v0.4.2
+  Downloaded getrandom v0.4.3
+  Downloaded tinyvec_macros v0.1.1
+  Downloaded zmij v1.0.23
+  Downloaded zstd v0.13.3
+  Downloaded zstd-safe v7.3.0
+  Downloaded pkg-config v0.3.34
+  Downloaded serde v1.0.229
+  Downloaded unicode-ident v1.0.24
+  Downloaded jobserver v0.1.35
+  Downloaded memmap2 v0.9.11
+  Downloaded proc-macro2 v1.0.107
+  Downloaded serde_core v1.0.229
+  Downloaded tinyvec v1.13.2
+  Downloaded twox-hash v2.1.4
+  Downloaded memchr v2.8.3
+  Downloaded serde_json v1.0.151
+  Downloaded blake3 v1.8.7
+  Downloaded unicode-normalization v0.1.25
+  Downloaded syn v2.0.119
+  Downloaded syn v3.0.5
+  Downloaded zstd-sys v2.1.0+zstd.1.5.7
+  Downloaded windows_aarch64_msvc v0.53.1
+  Downloaded windows-sys v0.60.2
+   Compiling getrandom v0.4.3
+   Compiling cfg-if v1.0.4
+   Compiling find-msvc-tools v0.1.12
+   Compiling shlex v2.0.1
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling serde_core v1.0.229
+   Compiling windows_aarch64_msvc v0.53.1
+   Compiling zmij v1.0.23
+   Compiling jobserver v0.1.35
+   Compiling cc v1.4.5
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling syn v3.0.5
+   Compiling arrayvec v0.7.8
+   Compiling constant_time_eq v0.4.2
+   Compiling windows-targets v0.53.5
+   Compiling memchr v2.8.3
+   Compiling blake3 v1.8.7
+   Compiling itoa v1.0.18
+   Compiling windows-sys v0.60.2
+   Compiling serde_derive v1.0.229
+   Compiling pkg-config v0.3.34
+   Compiling memmap2 v0.9.11
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+   Compiling syn v2.0.119
+   Compiling zstd-safe v7.3.0
+   Compiling twox-hash v2.1.4
+   Compiling tinyvec_macros v0.1.1
+   Compiling tinyvec v1.13.2
+   Compiling lz4_flex v0.11.6
+   Compiling unicode-normalization v0.1.25
+   Compiling slates-image v0.1.0 (C:\a\slates\slates\crates\image)
+   Compiling slates-machine v0.1.0 (C:\a\slates\slates\crates\machine)
+   Compiling slates-mem v0.1.0 (C:\a\slates\slates\crates\mem)
+   Compiling slates-wire-derive v0.1.0 (C:\a\slates\slates\crates\wire-derive)
+   Compiling slates-wire v0.1.0 (C:\a\slates\slates\crates\wire)
+   Compiling slates-rt v0.1.0 (C:\a\slates\slates\crates\rt)
+   Compiling slates-ipc v0.1.0 (C:\a\slates\slates\crates\ipc)
+   Compiling slates-anchor v0.1.0 (C:\a\slates\slates\crates\anchor)
+   Compiling slates-db v0.1.0 (C:\a\slates\slates\crates\db)
+   Compiling zstd v0.13.3
+   Compiling slates-archive v0.1.0 (C:\a\slates\slates\crates\archive)
+   Compiling slates-vfs v0.1.0 (C:\a\slates\slates\crates\vfs)
+   Compiling slates-bridge-core v0.1.0 (C:\a\slates\slates\crates\bridge-core)
+   Compiling slates-bridge-winfsp v0.1.0 (C:\a\slates\slates\crates\bridge-winfsp)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 48.96s
+     Running unittests src\lib.rs (target\debug\deps\slates_bridge_winfsp-8fe6656da1370d73.exe)
+
+running 82 tests
+test dll_version::tests::any_other_version_is_refused_with_its_number ... ok
+test dll_version::tests::the_version_the_receiver_was_written_from_is_admitted ... ok
+test held::tests::a_malformed_record_cannot_select_a_drive_or_volume ... ok
+test held::tests::the_mount_record_keeps_its_volume_drive_and_access ... ok
+test host::tests::a_close_served_before_the_kill_is_answered_done_after_takeover ... 
+running 1 test
+slates-winfsp: reply spin window = 9400 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+
+running 1 test
+WINFSP CLOSE: the client's CloseHandle succeeded
+WINFSP CLOSE: the server ended the open and holds the Close's reply; killing it
+
+running 1 test
+slates-winfsp: reply spin window = 9300 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+
+thread 'host::tests::a_close_served_before_the_kill_is_answered_done_after_takeover' (2644) panicked at crates\bridge-winfsp\src\..\tests\support\host.rs:817:14:
+the successor's recovery report, got None
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test host::tests::a_daemon_killed_while_its_purges_open_is_delivered_exits_within_a_transaction_timeout ... 
+running 1 test
+slates-winfsp: reply spin window = 9100 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+
+running 1 test
+WINFSP PURGE KILL: the purge's open is delivered and retained; killing the server
+WINFSP PURGE KILL: exited Some(1) after 2.8377ms
+ok
+test host::tests::a_read_taken_before_the_kill_is_settled_after_takeover ... 
+running 1 test
+slates-winfsp: reply spin window = 9500 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+
+running 1 test
+WINFSP INFLIGHT: first server took the read; killing it before its reply
+
+running 1 test
+slates-winfsp: reply spin window = 9400 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+slates-winfsp: settled 1 captured requests before receiving, 0 of them a replayed cleanup or close refused
+WINFSP INFLIGHT: successor counted 1 settled captured requests
+WINFSP INFLIGHT: reader read completed with its file's bytes
+
+running 1 test
+WINFSP INFLIGHT: probe read completed with its file's bytes
+WINFSP INFLIGHT: successor answered a fresh read on the original volume
+ok
+test host::tests::a_replayed_cleanup_cannot_unlink_the_file_that_replaced_its_open ... ok
+test host::tests::purge_client_role ... ignored, a process role for the purge client
+test host::tests::request_role ... ignored, a process role for the live taken-request oracle
+test host::transact_bench::open_cost ... ignored, a timing harness, run by name in release on a machine with WinFsp
+test host::transact_bench::transact_cost ... ignored, a timing harness, run by name in release on a machine with WinFsp
+test inflight::capture::tests::a_crash_while_clearing_a_settled_buffer_cannot_revive_its_requests ... ok
+test inflight::capture::tests::a_live_receive_reads_only_the_bytes_the_driver_reported ... ok
+test inflight::capture::tests::a_reported_length_past_the_buffer_is_refused ... ok
+test inflight::capture::tests::a_response_completed_before_the_crash_is_replayed_before_a_fresh_receive ... ok
+test inflight::capture::tests::a_saved_result_in_the_middle_of_a_batch_survives_a_second_crash ... ok
+test inflight::capture::tests::a_shorter_batch_after_a_longer_one_recovers_alone ... ok
+test inflight::capture::tests::an_unpublished_or_foreign_acknowledgement_cannot_admit_a_new_receive ... ok
+test inflight::tests::a_captured_batch_cancels_its_original_reads_and_no_other_request ... ok
+test inflight::tests::a_completed_hint_cannot_cancel_its_recycled_pending_request ... ok
+test inflight::tests::a_hostile_capture_cannot_complete_a_kernel_request ... ok
+test inflight::tests::a_hostile_saved_rename_cannot_change_an_opens_name ... ok
+test inflight::tests::a_rename_of_a_long_path_is_read_whole ... ok
+test inflight::tests::a_reused_packet_sends_no_byte_of_an_earlier_response ... ok
+test inflight::tests::a_saved_rename_recovers_only_its_successful_inline_names ... ok
+test notify::tests::a_directory_rename_visits_everything_beneath_it_and_no_sibling ... ok
+test notify::tests::a_name_longer_than_a_record_can_count_is_counted_not_truncated ... ok
+test notify::tests::a_name_past_a_thousand_units_is_told ... ok
+test notify::tests::a_rename_that_would_lengthen_a_held_name_past_the_limit_does_not_fit ... ok
+test notify::tests::a_rename_visits_only_the_opens_it_renames ... ok
+test notify::tests::an_entrys_change_names_the_entry_under_each_open_name_of_its_directory ... ok
+test notify::tests::an_inodes_change_names_every_path_it_is_open_under ... ok
+test notify::tests::an_overrun_names_every_open_name_after_closes_and_renames ... ok
+test notify::tests::records_are_laid_out_as_the_kernel_walks_them ... ok
+test opens::names::tests::a_corrupt_tail_is_refused ... ok
+test opens::names::tests::a_short_name_never_reaches_the_tail_region ... ok
+test opens::names::tests::a_torn_kernel_rename_keeps_a_complete_name_and_resumes ... ok
+test opens::names::tests::a_torn_rename_of_a_long_name_keeps_a_complete_name ... ok
+test opens::names::tests::names_follow_slot_generations_and_component_boundaries ... ok
+test opens::names::tests::names_up_to_the_drivers_limit_are_kept_whole ... ok
+test opens::tests::a_recovered_handle_cannot_name_the_successors_first_open_of_the_same_file ... ok
+test opens::tests::a_reused_slot_never_revives_its_previous_context ... ok
+test opens::tests::a_saved_open_is_retained_and_a_confirmed_open_needs_no_old_hint ... ok
+test opens::tests::a_torn_record_is_quarantined_instead_of_becoming_some_other_open ... ok
+test opens::tests::an_open_and_a_purge_open_survive_the_process_that_issued_them ... ok
+test opens::tests::an_open_never_handed_to_the_kernel_cannot_pin_its_files_sibling ... ok
+test opens::tests::recovering_opens_never_rewrites_the_shared_header ... ok
+test opens::tests::the_whole_name_reserve_of_a_mount_is_made_and_used ... WINFSP RESERVE: 2133147696 bytes of section at 65536 slots, made in 2.0204ms, 4166312 bytes of paged pool charged
+ok
+test purge::tests::a_change_is_widened_to_the_whole_sectors_it_touches ... ok
+test purge::tests::a_page_nobody_cached_is_taken_and_a_refused_write_is_refused ... ok
+test purge::tests::a_private_purge_addresses_its_file_and_only_its_ancestors ... ok
+test purge::tests::a_purge_never_reaches_past_the_files_last_sector ... ok
+test purge::tests::a_purge_whose_pages_windows_drops_is_taken ... ok
+test purge::tests::a_purge_windows_could_not_drop_a_page_of_is_untaken ... ok
+test purge::tests::a_range_is_cut_into_writes_that_cover_it_exactly ... ok
+test purge::tests::extreme_offsets_and_sizes_plan_without_overflow ... ok
+test purge::tests::one_page_windows_could_not_drop_makes_the_purge_untaken_and_the_rest_drop ... ok
+test purge_client::tests::a_request_and_a_marker_survive_their_encodings ... ok
+test purge_intents::tests::private_purges_make_progress_without_a_kernel_callback ... ok
+test purge_token::tests::a_private_marker_survives_a_security_copy_and_is_mount_specific ... ok
+test reply::tests::a_closed_channel_ends_a_wait_whichever_way_it_waits ... ok
+test reply::tests::a_reply_past_the_window_is_delivered_by_parking ... ok
+test reply::tests::a_reply_within_the_window_is_taken_without_parking ... ok
+test reply::tests::only_the_thread_that_measured_spins ... slates-winfsp: reply spin window = 9400 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+ok
+test retry::tests::a_purge_kept_with_the_list_full_is_given_up_and_the_owed_ones_stay ... ok
+test retry::tests::a_purge_windows_keeps_is_made_again_after_a_tick_then_twice_as_long_each_time ... ok
+test retry::tests::a_purge_windows_keeps_past_the_horizon_is_given_up_and_nothing_more_is_owed ... ok
+test retry::tests::a_purge_windows_takes_at_a_later_attempt_is_owed_nothing_more ... ok
+test retry::tests::a_refused_attempt_is_owed_nothing_more ... ok
+test retry::tests::a_taken_purge_covering_an_owed_range_drops_it_and_other_ranges_stay_owed ... ok
+test retry::tests::a_zero_first_wait_never_brings_an_attempt_back_to_back ... ok
+test retry::tests::a_zero_horizon_gives_a_kept_purge_up_at_once ... ok
+test retry::tests::an_endless_horizon_still_ends_a_purges_attempts ... ok
+test retry::tests::instants_at_the_clocks_end_saturate_without_overflow ... ok
+test retry::tests::owed_purges_come_due_earliest_first ... ok
+test tests::a_refusal_is_never_success ... ok
+test tests::a_set_filetime_converts_to_the_volumes_time ... ok
+test tests::each_kind_maps_to_its_file_attribute ... ok
+test tests::each_refusal_maps_to_its_ntstatus ... ok
+test tests::ipc_names_report_unsupported ... ok
+test tests::unix_time_converts_to_filetime ... ok
+
+failures:
+
+failures:
+    host::tests::a_close_served_before_the_kill_is_answered_done_after_takeover
+
+test result: FAILED. 77 passed; 1 failed; 4 ignored; 0 measured; 0 filtered out; finished in 10.65s
+
+error: test failed, to rerun pass `-p slates-bridge-winfsp --lib`
+## bridge, main-fix, exit 101
