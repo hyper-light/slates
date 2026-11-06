@@ -557,6 +557,8 @@ impl Agent {
         self.round += 1;
         self.step = if self.round < self.rounds.len() {
           Step::Edit(0)
+        } else if keep_works() {
+          Step::Done
         } else {
           Step::Destroy
         };
@@ -630,6 +632,13 @@ fn record(tally: &mut Tally, kind: Kind, elapsed: u64) {
 /// one, unless `--reply-patience <n>` asks more (to tell a late reply from one never sent).
 fn reply_patience() -> u64 {
   arg("--reply-patience").map_or(1, |n| n.parse().expect("--reply-patience n"))
+}
+
+/// Whether each client keeps its work after its last round (`--keep-works`) instead of destroying it, so the daemon's
+/// memory with every work in place can be read after the level (each client a volume it keeps, as the goal's clients
+/// do).
+fn keep_works() -> bool {
+  std::env::args().any(|a| a == "--keep-works")
 }
 
 /// How many logical clients share one connection (`--per-connection <k>`, default one): each keeps its own work
