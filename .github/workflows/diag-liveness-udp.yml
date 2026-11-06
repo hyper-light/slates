@@ -1,0 +1,119 @@
+name: diag-liveness-udp
+
+# Diagnostics only, never on main (the Windows UDP reset, conformance run 42150662467): on both Windows runners, the
+# failing test on the red arm, the fix's rt, transport and cluster suites, and the conformance harness's three-node
+# live fleet (`--live-ship`, fsx) on the conformance branch f2f807db as it is and with the fix laid over it. Each job
+# pushes its result lines to diag-results/liveness-3-<os> with the Actions token, read by git fetch.
+on:
+  push:
+    branches: ["diag-liveness-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RED_SHA: 77eb9acd
+  CONF_SHA: f2f807db
+  CONFFIX_SHA: 6a5a29d0bad6f03be29f51a98abd7ca0133e175a
+  WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+  WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+
+jobs:
+  windows:
+    name: UDP reset (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 170
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: The failing test on the red arm
+        run: |
+          R=../results.txt
+          echo "runner ${{ matrix.os }}, $NUMBER_OF_PROCESSORS CPUs, $(date -u)" > $R
+          git worktree add ../src-red "$RED_SHA"
+          status=0
+          ( cd ../src-red && CARGO_TARGET_DIR=../target-red cargo test --locked -p slates-rt --test udp -- a_socket_that_sent ) > ../red.log 2>&1 || status=$?
+          grep -E '^test |test result|panicked|failed|left|right' ../red.log | cut -c1-500 | tee -a $R
+          echo "== red exit $status" | tee -a $R
+      - name: The fix's rt, transport and cluster suites
+        if: ${{ !cancelled() }}
+        run: |
+          R=../results.txt
+          for pkg in "slates-rt --test udp" "slates-rt --lib" "slates-transport" "slates-cluster"; do
+            status=0
+            cargo test --locked -p $pkg > ../suite.log 2>&1 || status=$?
+            grep -E '^test .*FAILED|test result|panicked|Running' ../suite.log | cut -c1-300 | tee -a $R
+            echo "== fix suite $pkg exit $status" | tee -a $R
+          done
+      - name: Install WinFsp (pinned, as ci.yml)
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi
+          $found = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
+          $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: The three-node live fleet, the conformance branch as it is and with the fix, twice each
+        if: ${{ !cancelled() }}
+        timeout-minutes: 100
+        run: |
+          R=../results.txt
+          for arm in conf conffix; do
+            case $arm in conf) sha=$CONF_SHA;; conffix) sha=$CONFFIX_SHA;; esac
+            git worktree add "../src-$arm" "$sha"
+          done
+          for round in 1 2; do
+            for arm in conf conffix; do
+              echo "== live $arm round $round at $(date -u +%H:%M:%S) UTC" | tee -a $R
+              status=0
+              ( cd "../src-$arm" && CARGO_TARGET_DIR="../target-$arm" timeout 1500 cargo xtask conformance run --suite fsx --live-ship --records "../live-$arm-$round/records" --scratch "../live-$arm-$round/scratch" --keep ) > ../live.log 2>&1 || status=$?
+              grep -E -i 'live fleet|did not form|formed|fleet_peers|10054|WSAE|refused|verdict|passed|failed|error' ../live.log | cut -c1-600 | head -40 | tee -a $R
+              for log in ../live-$arm-$round/scratch/*/*.log; do
+                [ -f "$log" ] && grep -E -i '10054|WSAE|recvfrom|peer' "$log" | head -5 | sed "s#^#  $(basename "$log"): #" | cut -c1-400 | tee -a $R
+              done
+              echo "== live $arm round $round exit $status" | tee -a $R
+            done
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/liveness-3-${{ matrix.os }}"
+          git config user.name "diag-liveness"
+          git config user.email "diag-liveness@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-liveness-3 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
