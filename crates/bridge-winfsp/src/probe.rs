@@ -85,6 +85,11 @@ pub(crate) fn receive_workers(
   intents: &mut Intents,
   stopped: &dyn Fn() -> bool,
 ) -> Result<Option<usize>, WinFspError> {
+  // DIAG ONLY, never for main: the A/B fixes each arm's worker count at build time, with no probe running.
+  if let Some(fixed) = option_env!("SLATES_DIAG_RECEIVE_WORKERS") {
+    let _ = (&intents, &stopped);
+    return fixed.parse().map(Some).map_err(|_| WinFspError::MountThread);
+  }
   static WORKERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
   if let Some(count) = WORKERS.get() {
     return Ok(Some(decided(*count)));
