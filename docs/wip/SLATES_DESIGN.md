@@ -13325,8 +13325,19 @@ the server takes it as the work's delta over its new base (`WorkFiles::from_chan
 
 ### A-214 — An idle shard keeps its last write burst's worth of free content pages pre-faulted (accepted 2026-11-05, VFS plan step 11; amends A-105)
 
-> **Status (2026-11-05): reverted from main.** Its reserve kept deleted files' pages resident, against A-205's
-> give-back on both Windows lanes, and its arena test fails under Miri (main CI 42119714654; GAPS). Re-landing owed.
+> **Status (2026-11-05): reverted from main, then re-landed on `agents/nfs-write` with two fixes.** Main CI 42119714654
+> found its reserve keeping deleted files' pages resident, against A-205's give-back on both Windows lanes, and its
+> arena test failing under Miri.
+> - The burst ended only when the arena's allocation count moved, and a free does not move it. A delete-only busy
+>   period left the reserve the written file's size, and the reserve was the deleted file's own pages, next on the free
+>   lists. Now a period ends on any change of allocated bytes. One that grew the content sets the burst; one that
+>   shrank it takes what it freed off the burst, so a delete takes its reserve with it, and A-205's test holds without
+>   a change to its rule.
+> - The arena test asserted the bytes the purge gave back, which Miri, modelling no `madvise`, never gives back; under
+>   Miri it now skips that count alone.
+> Verified (diagnostics run 42129821506): A-205's give-back on windows-latest and windows-11-arm, and Miri on the mem,
+> wire and runtime tests; on the incumbent harness the 64 MiB write's best of eighteen was 1,278.1 MiB/s against main's
+> 1,021.9 (BENCHMARKS).
 
 Status: accepted 2026-11-05 (Ada's decision through the supervisor: option (a) of GAPS' large-file write gap); built
 2026-11-05. It amends A-105's "every free block back at the first idle tick". Applied in the same change to:
