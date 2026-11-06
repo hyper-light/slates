@@ -2930,7 +2930,8 @@ Anything that needs a client of a slates volume (a measurement, a check) runs th
   (A-190's amendment of 2026-11-06).
 - **A base directory, a landing's target and a FUSE mount point (A-227).** The sweep of 2026-11-06 found three host
   paths the daemon opens itself. Each is now refused, before any open, when it lies on a mount this daemon serves, and
-  every crossing below a base is checked. Built and proven on Linux; Windows and macOS are owed (GAPS).
+  every crossing below a base is checked, a successor's kept mounts included: each is recorded before any base is
+  reacquired. Built on Linux, Windows and macOS (A-227; GAPS for what each platform's proof still owes).
 
 **Base reads on macOS and Windows.** As on Linux, the daemon reads untouched base files through its own descriptor or
 handle into evictable cache chunks (one copy, `pread`/`ReadFile` on the owner shard's driver) and
@@ -13960,8 +13961,23 @@ own-mount records, `check_mount_point`, the refusals' mapping), `crates/bridge-w
     alone. `/proc/self/mountinfo` is world-readable, so it carries neither the rendezvous instance name nor an
     attachment id; it answers only "is this mount this daemon's". A mount adopted from a predecessor (A-61) keeps the
     predecessor's tag and is recorded by its mount point at adoption.
-  - **macOS.** No format change: the NFS mount's source names this daemon's export host and port, which
-    `getfsstat(MNT_NOWAIT)` reads without an RPC.
+  - **macOS (supervisor, 2026-11-06: option (a)).** No format change. The NFS source `slates:/<volume name>` names no
+    daemon, so the daemon's own record is the one source of truth: each mount is recorded when the CLI binds it, by the
+    kernel's filesystem id for it (`getfsstat(MNT_NOWAIT)`, no RPC, the entry at exactly the bound point whose source
+    is the volume's), never by a path prefix. The CLI binds the path the kernel records (`canonicalize`, as on Linux),
+    and a bind the table does not confirm is refused, so the CLI takes the mount down. A crossing is the kernel's path
+    of the parent (`F_GETPATH`, on a filesystem that is not ours, since every crossing to it was checked) with the
+    entry's name, compared exactly with each recorded mount's point; a thread reads the points once and again only
+    when the set changes (a generation word).
+  - **A successor's kept mounts (supervisor's condition, 2026-11-06).** The record covers mounts the daemon did not
+    bind itself. Recovery reacquired bases before a shard adopted the mounts its predecessor kept, so a base under a
+    kept mount was entered before the mount was this daemon's, on every platform. Each shard now learns its kept
+    mounts from its catalog (Linux FUSE by point and the `slates:` prefix, macOS NFS by point and source) before it
+    reacquires any base or resumes any landing; a shard's base can lie under another shard's mount, so every crossing
+    check in the process waits until every shard has learned (a ticket per shard, taken before it starts; bounded by
+    the liveness budget, refused `EAGAIN` past it). Windows learns its held volumes before any shard starts, from the
+    records the anchor hands over. The set is a multiset: a learned record handed to its mount is never forgotten
+    under it.
   - **Windows.** A process-wide registry of this daemon's WinFsp volume device names, published by the mount threads
     (fixed capacity from the most mounts the daemon can make, atomic slots in the runtime registry's publication pattern,
     a typed refusal at the bound). A path's drive is named by `QueryDosDeviceW`, which asks the object manager, never the
@@ -13975,8 +13991,20 @@ own-mount records, `check_mount_point`, the refusals' mapping), `crates/bridge-w
   mount point was refused untyped (its `statat` that run was answered from the kernel's cache of the directory just
   made, so it hangs only when that cache has expired). Green under the fix (CI run 42161730984): the three tests, and
   the CLI's whole Linux flow, 83 passed. The cost: a listing of files unchanged, a checked open 1.25 µs more
-  (BENCHMARKS, "The own-mount check on the base plane's lookups"). Owed: Windows' registry and walk, and macOS, whose
-  NFS source is `slates:/<volume name>` and names no daemon, so its identity is still to be chosen.
+  (BENCHMARKS, "The own-mount check on the base plane's lookups").
+- **Built on Windows (2026-11-06).** `a_base_on_the_daemons_own_drive_is_refused_before_any_open`, one shard, on
+  windows-latest and windows-11-arm: red on main (diag-slabs-8, run 42163139473: "no reply within 1000000000 ns", exit
+  4, and the step stranded to its 25-minute timeout), green under the fix with the whole WinFsp CLI suite (diag-slabs-9,
+  run 42163139554: 14 passed on each runner), red again with the check removed (diag-slabs-10, run 42163139568).
+- **Built on macOS (2026-11-06).** Four tests over real NFS mounts on jupiter, no daemon killed under a mount: a base and
+  a landing target on the daemon's own mount refused `OwnMount`; after an orderly restart (`SIGTERM`: the daemon drains,
+  the anchor holds the mount and starts a successor), a base on the kept mount refused `OwnMount`; and a base the kept
+  mount came to cover is not rebuilt, its log naming the daemon's own mount. 4 passed in 31.6 s. With the successor's
+  learning removed, the restart test got "no reply within 1000000000 ns" and the reacquire never finished; the two
+  bind-time tests still passed.
+- **The kept mounts on Linux and Windows** are proven by `a_base_a_kept_mount_covers_is_not_reacquired_through_it`
+  (Linux FUSE) and `a_base_a_held_drive_covers_is_not_reacquired_through_it` (WinFsp, a junction pointed at the drive)
+  on CI: see GAPS for the runs.
 
 ### A-198 — A WinFsp mount outlives its daemon: the anchor holds the volume's control handle, the drive's link and the mount's ledger, and the next daemon serves the held volume (accepted 2026-11-01, Step 9 of the VFS and DAX plan; built and measured 2026-11-02)
 Applied in the same change to: GAPS (gap 2 of the platform inventory). The build applies it to §4.6 "Windows",

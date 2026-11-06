@@ -1809,3 +1809,92 @@ fn a_base_on_the_daemons_own_drive_is_refused_before_any_open() {
   let (code, _, err) = run(&instance, &["unmount", &drive]);
   assert_eq!(code, 0, "unmount: {err}");
 }
+
+/// Runs `cmd /C` with `args`, asserting it succeeded: the Windows shell's own `mkdir`, `mklink` and `rmdir`, so the test
+/// makes its host directories and junctions without a file write of its own.
+fn cmd(args: &[&str]) {
+  let made = Command::new("cmd").arg("/C").args(args).output().unwrap();
+  assert!(
+    made.status.success(),
+    "cmd /C {}: {}{}",
+    args.join(" "),
+    String::from_utf8_lossy(&made.stdout),
+    String::from_utf8_lossy(&made.stderr)
+  );
+}
+
+/// A-227, recovery's reacquire on Windows (§4.6, §4.8): a base that a drive of the daemon's own came to cover is never
+/// entered when a successor reacquires it. Do: on a one-shard daemon, create a volume over `link\project`, where `link`
+/// is a junction to a directory holding `project`; mount a second volume at a drive, make `project` on it, and point
+/// the junction at the drive's root, so the base is now the drive's; kill the daemon. Expect: the successor serves the
+/// held drive again within the takeover bound (it learned the held volume as its own before any shard started, so its
+/// shard's reacquire refused the base rather than open it through the drive nobody served yet), the covered volume is
+/// not rebuilt, and the drive still lists `project`.
+#[test]
+fn a_base_a_held_drive_covers_is_not_reacquired_through_it() {
+  if !live_mount_runs() {
+    return;
+  }
+  let instance = instance("ownreacq");
+  let _anchor = start_anchor_of(&instance, ONE_SHARD);
+  let scratch = format!(
+    "{}\\ownreacq-{}",
+    env!("CARGO_TARGET_TMPDIR").replace('/', "\\"),
+    std::process::id()
+  );
+  let real = format!("{scratch}\\real");
+  let link = format!("{scratch}\\link");
+  cmd(&["mkdir", &format!("{real}\\project")]);
+  cmd(&["mklink", "/J", &link, &real]);
+  let base = format!("{link}\\project");
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "covered",
+      "--bounded",
+      "8MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  let covered = value_of(&out, "id");
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "cover", "--bounded", "64MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let cover = value_of(&out, "id");
+  let drive = free_drive_letter();
+  let (code, _, err) = run(&instance, &["mount", &cover, &drive]);
+  assert_eq!(code, 0, "mount: {err}");
+  let root = format!("{drive}\\");
+  wait_ready(&root);
+  cmd(&["mkdir", &format!("{drive}\\project")]);
+  cmd(&["rmdir", &link]);
+  cmd(&["mklink", "/J", &link, &root]);
+  let original = drive_target(&drive).unwrap();
+  let killed = daemon_pid(&instance).unwrap();
+  kill_daemon(killed);
+  wait_for_successor(&instance, &drive, &original, killed, 1);
+  let (code, out, err) = run(&instance, &["status", &covered]);
+  assert_ne!(
+    code, 0,
+    "the covered volume is not rebuilt through the drive: {out}"
+  );
+  eprintln!("WINFSP OWN REACQUIRE: the covered volume's status: exit {code}: {err}");
+  let listed = Command::new("cmd")
+    .args(["/C", "dir", "/B", &root])
+    .output()
+    .unwrap();
+  assert_eq!(
+    String::from_utf8_lossy(&listed.stdout).trim(),
+    "project",
+    "the held drive still serves"
+  );
+  cmd(&["rmdir", &link]);
+  let (code, _, err) = run(&instance, &["unmount", &drive]);
+  assert_eq!(code, 0, "unmount: {err}");
+}
