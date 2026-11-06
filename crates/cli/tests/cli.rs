@@ -5201,35 +5201,26 @@ fn linux_fuse_mount_runs() -> bool {
   true
 }
 
-/// Whether a process can write **its own** user-namespace maps — which is what `slates exec` does today,
-/// and what neither host measured will allow. A loud skip otherwise.
+/// Whether this host lets the launcher bind at all: a loud skip where AppArmor confines unprivileged user
+/// namespaces, whose `unprivileged_userns` profile denies the namespace every capability, the mount one among them
+/// (Ubuntu 24.04's `kernel.apparmor_restrict_unprivileged_userns=1`, CI's runners; diagnostics run 42169647315).
+/// There the launcher's refusal is itself the test (`the_launcher_binds_a_volume_or_names_the_host_setting_that_forbids_it`).
 ///
-/// The first version of this gate asked whether unprivileged user namespaces are permitted at all. That was
-/// the wrong question and it never fired: `unshare -U true` succeeds on GitHub's `ubuntu-latest` *and* on the
-/// x86_64 box, and the launcher failed anyway with `open /proc/self/setgroups: code 13`. Measured on the box
-/// 2026-10-20, inside a fresh namespace with no maps written: `setgroups` reads `allow`, `uid_map` is empty,
-/// and writing either is **denied** — while `unshare --map-user`, where the *parent* writes the child's maps,
-/// works and lands uid 1000 inside. So the capability is there and the launcher asks for it the one way these
-/// kernels refuse.
-///
-/// That makes this a skip over a **defect**, not over a missing host feature, and it is recorded as one:
-/// `docs/bugs/2026-10-20-the-launcher-writes-its-own-userns-maps.md`. The gate exists so the lane reports the
-/// defect once, in the ledger, rather than as a red test on every run; when the launcher forks and has the
-/// parent write the maps, this gate goes away with it.
+/// This gate once asked whether `unshare -U sh -c 'echo deny > /proc/self/setgroups'` succeeds. That probe execs a
+/// shell, and an exec'd process in a namespace with no maps is refused its own `/proc/self` files on every kernel
+/// (Linux 6.12 in a container refuses it too, where the launcher's own in-process sequence binds), so the gate skipped
+/// everywhere and named a defect that was not the launcher's
+/// (`docs/bugs/2026-10-20-the-launcher-writes-its-own-userns-maps.md`).
 #[cfg(target_os = "linux")]
-fn a_process_can_write_its_own_userns_maps() -> bool {
-  let permitted = Command::new("unshare")
-    .args(["-U", "sh", "-c", "echo deny > /proc/self/setgroups"])
-    .output()
-    .map(|o| o.status.success())
-    .unwrap_or(false);
-  if !permitted {
+fn the_launcher_can_bind_here() -> bool {
+  let confined = apparmor_confines_user_namespaces();
+  if confined {
     eprintln!(
-      "SKIP: this host refuses a process writing its own user-namespace maps, which is how `slates exec` \
-       sets up today (docs/bugs/2026-10-20-the-launcher-writes-its-own-userns-maps.md)"
+      "SKIP: this host's AppArmor confines unprivileged user namespaces (kernel.apparmor_restrict_unprivileged_userns=1), \
+       so `slates exec` cannot bind; its refusal is tested on its own"
     );
   }
-  permitted
+  !confined
 }
 
 /// `slates mount ID DIR` on Linux reports the mount point, and the kernel lists a `fuse.slates` mount there
@@ -6541,7 +6532,7 @@ const ROOT_ENV: &str = "SLATES_ROOT";
 #[cfg(target_os = "linux")]
 #[test]
 fn the_launcher_refuses_a_path_it_would_have_to_create_and_leaves_the_host_untouched() {
-  if !linux_fuse_mount_runs() || !a_process_can_write_its_own_userns_maps() {
+  if !linux_fuse_mount_runs() || !the_launcher_can_bind_here() {
     return;
   }
   let instance = format!("cli-exec-{}", std::process::id());
@@ -6607,6 +6598,59 @@ fn the_launcher_refuses_a_path_it_would_have_to_create_and_leaves_the_host_untou
     !still_mounted,
     "the launcher's bind propagated back to the host"
   );
+}
+
+/// Format: the sysctl through which Ubuntu's AppArmor confines every unprivileged user namespace to its
+/// `unprivileged_userns` profile, which denies the namespace every capability, the mount one among them.
+#[cfg(target_os = "linux")]
+const APPARMOR_USERNS_SYSCTL: &str = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
+
+/// Whether this host's AppArmor confines unprivileged user namespaces (the sysctl reads 1).
+#[cfg(target_os = "linux")]
+fn apparmor_confines_user_namespaces() -> bool {
+  std::fs::read_to_string(APPARMOR_USERNS_SYSCTL).is_ok_and(|value| value.trim() == "1")
+}
+
+/// §4.6 "The launcher" (AC-3.5), with no daemon: a plain directory stands in for the daemon's root mount, since the
+/// launcher only binds `<root>/<volume>` onto the chosen path. Do: `slates exec --volume vol --at DIR -- sh -c 'cat
+/// DIR/marker'` with `SLATES_ROOT` at that directory. Expect, by what the host allows:
+/// - where AppArmor confines unprivileged user namespaces (`kernel.apparmor_restrict_unprivileged_userns=1`, Ubuntu
+///   24.04 and CI's runners), a refusal (exit 4) naming that setting, since the namespace gets no capability whoever
+///   writes its maps (diagnostics run 42169647315: `apparmor="DENIED" operation="capable" profile="unprivileged_userns"
+///   capname="sys_admin"`) — not the bare `open /proc/self/setgroups: code 13` it answered before;
+/// - where user namespaces are refused outright, a refusal naming how to enable them;
+/// - elsewhere, the command reading the volume's marker through the bind, with the chosen path empty on the host after.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_launcher_binds_a_volume_or_names_the_host_setting_that_forbids_it() {
+  let root = build_output_dir("slates-exec-root");
+  let at = build_output_dir("slates-exec-at");
+  shell(&format!("mkdir -p {root}/vol && printf through-the-bind > {root}/vol/marker"));
+  let output = slates()
+    .args(["exec", "--volume", "vol", "--at", &at, "--", "sh", "-c"])
+    .arg(format!("cat {at}/marker"))
+    .env(ROOT_ENV, &root)
+    .output()
+    .unwrap();
+  let code = output.status.code().unwrap_or(-1);
+  let saw = String::from_utf8_lossy(&output.stdout).into_owned();
+  let err = String::from_utf8_lossy(&output.stderr).into_owned();
+  let left = shell(&format!("ls -A {at}"));
+  shell(&format!("rm -rf {root} {at}"));
+  if apparmor_confines_user_namespaces() {
+    assert_eq!(code, 4, "a confined host refuses the launcher: {err}");
+    assert!(
+      err.contains("kernel.apparmor_restrict_unprivileged_userns"),
+      "the refusal names the setting that forbids it: {err}"
+    );
+  } else if err.contains("cannot create a user+mount namespace") {
+    eprintln!("SKIP: this host refuses unprivileged user namespaces outright: {err}");
+    assert_eq!(code, 4, "{err}");
+  } else {
+    assert_eq!(code, 0, "the launcher runs the command: {err}");
+    assert_eq!(saw.trim(), "through-the-bind", "the command reads the volume through the bind");
+  }
+  assert_eq!(left.trim(), "", "the host sees nothing at the chosen path");
 }
 
 /// AUD-29-76 (`slates mount --subtree`). Do: through the real binary against a real anchor-supervised daemon,
