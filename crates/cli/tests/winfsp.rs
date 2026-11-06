@@ -1825,8 +1825,8 @@ fn cmd(args: &[&str]) {
 
 /// A-227, recovery's reacquire on Windows (§4.6, §4.8): a base that a drive of the daemon's own came to cover is never
 /// entered when a successor reacquires it. Do: on a one-shard daemon, create a volume over `link\project`, where `link`
-/// is a junction to a directory holding `project`; mount a second volume at a drive, make `project` on it, and point
-/// the junction at the drive's root, so the base is now the drive's; kill the daemon. Expect: the successor serves the
+/// is a junction to a directory holding `project`; mount a second volume at a drive, make `project` on it, and make
+/// `link` a directory symbolic link to the drive's root, so the base is now the drive's; kill the daemon. Expect: the successor serves the
 /// held drive again within the takeover bound (it learned the held volume as its own before any shard started, so its
 /// shard's reacquire refused the base rather than open it through the drive nobody served yet), the covered volume is
 /// not rebuilt, and the drive still lists `project`.
@@ -1873,8 +1873,10 @@ fn a_base_a_held_drive_covers_is_not_reacquired_through_it() {
   let root = format!("{drive}\\");
   wait_ready(&root);
   cmd(&["mkdir", &format!("{drive}\\project")]);
+  // A junction names local volumes only, which a WinFsp drive is not to `mklink`; a directory symbolic link (a name
+  // surrogate too, followed by the same walk) names it.
   cmd(&["rmdir", &link]);
-  cmd(&["mklink", "/J", &link, &root]);
+  cmd(&["mklink", "/D", &link, &root]);
   let original = drive_target(&drive).unwrap();
   let killed = daemon_pid(&instance).unwrap();
   kill_daemon(killed);

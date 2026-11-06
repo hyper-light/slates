@@ -11300,33 +11300,42 @@ fn a_fuse_mount_point_on_one_of_the_daemons_own_mounts_is_refused_before_any_ope
   assert_eq!(code, 0, "the daemon still answers: {err}");
 }
 
-/// Stops the instance's daemon in order (`SIGTERM`: it drains and exits, the anchor holding its kernel mounts and
-/// connections, and starting a successor), returning the stopped daemon's pid. No daemon is killed under a mount.
+/// Format: the signal that ends the instance's daemon with its kernel mounts kept for a successor. macOS: `SIGTERM`, an
+/// orderly stop (the daemon drains and exits; the anchor holds the NFS mount's connections, A-113), since no daemon is
+/// killed under a macOS kernel mount. Linux: `SIGKILL`, since a daemon stopped in order ends its FUSE connections (its
+/// mounts then answer `ENOTCONN`) and the anchor holds a FUSE device only across a daemon that did not end it (A-61).
+#[cfg(target_os = "macos")]
+const KEEPING_SIGNAL: &str = "-TERM";
+#[cfg(target_os = "linux")]
+const KEEPING_SIGNAL: &str = "-KILL";
+
+/// Ends the instance's daemon with its kernel mounts kept ([`KEEPING_SIGNAL`]), returning its pid; the anchor starts a
+/// successor.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn stop_in_order(instance: &str) -> u32 {
-  let stopped = daemon_pid(instance).expect("the daemon answers");
+fn end_keeping_mounts(instance: &str) -> u32 {
+  let ended = daemon_pid(instance).expect("the daemon answers");
   assert!(
     Command::new("kill")
-      .args(["-TERM", &stopped.to_string()])
+      .args([KEEPING_SIGNAL, &ended.to_string()])
       .status()
       .unwrap()
       .success(),
-    "SIGTERM sent"
+    "{KEEPING_SIGNAL} sent"
   );
-  stopped
+  ended
 }
 
-/// [`stop_in_order`], then the anchor's successor's pid once it answers.
+/// [`end_keeping_mounts`], then the anchor's successor's pid once it answers.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn restart_in_order(instance: &str) -> u32 {
-  let stopped = stop_in_order(instance);
-  await_daemon(instance, Some(stopped), &[])
+fn restart_keeping_mounts(instance: &str) -> u32 {
+  let ended = end_keeping_mounts(instance);
+  await_daemon(instance, Some(ended), &[])
 }
 
 /// A-227, a restart (§4.6: no daemon thread opens a path on a volume the daemon serves, its predecessor's mounts
-/// included). Do: on a one-shard daemon, mount a volume (FUSE on Linux, NFS on macOS) and make a directory in it; stop
-/// the daemon in order under the live mount and wait for the anchor's successor; then create a second volume with that
-/// directory as its base. Expect: refused at once as the daemon's own mount (exit 1, `OwnMount`): the successor
+/// included). Do: on a one-shard daemon, mount a volume (FUSE on Linux, NFS on macOS) and make a directory in it; end
+/// the daemon with the mount kept ([`KEEPING_SIGNAL`]: an orderly stop on macOS) and wait for the anchor's successor;
+/// then create a second volume with that directory as its base. Expect: refused at once as the daemon's own mount (exit 1, `OwnMount`): the successor
 /// learned the mount it kept from its catalog before it served. Then the mount still serves, and the daemon answers.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
@@ -11348,7 +11357,7 @@ fn a_base_on_a_mount_the_daemon_kept_across_a_restart_is_refused_by_kind() {
   own_mount_and_check(&instance, &id, &mount.path);
   let base = format!("{}/project", mount.path);
   shell(&format!("mkdir {base}"));
-  restart_in_order(&instance);
+  restart_keeping_mounts(&instance);
   let created = [
     "volume",
     "create",
@@ -11387,7 +11396,7 @@ const KEPT_RECOVERY_ANSWER: Duration = OWN_MOUNT_ANSWER;
 /// A-227, recovery's reacquire (§4.6, §4.8): a base that a mount of the daemon's own came to cover is never entered when
 /// a successor reacquires it. Do: on a one-shard daemon, create a volume over an empty directory `D/project`, then mount
 /// a second volume over `D` (FUSE on Linux, NFS on macOS) and make `project` in it, so `D/project` is now the mount's;
-/// stop the daemon in order under the live mount. Expect: the successor answers within the bound, the first volume is
+/// end the daemon with the mount kept ([`KEEPING_SIGNAL`]). Expect: the successor answers within the bound, the first volume is
 /// not rebuilt and its log names the daemon's own mount, and the mount still serves. Before, the successor's one shard
 /// opened the base through the mount it had yet to serve again and waited on itself.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -11429,7 +11438,7 @@ fn a_base_a_kept_mount_covers_is_not_reacquired_through_it() {
   let cover = value_of(&out, "id");
   own_mount_and_check(&instance, &cover, &mount.path);
   shell(&format!("mkdir {base}"));
-  let stopped = stop_in_order(&instance);
+  let stopped = end_keeping_mounts(&instance);
   let started = Instant::now();
   let mut log = Vec::new();
   let refused = loop {

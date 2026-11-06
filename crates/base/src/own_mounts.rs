@@ -25,7 +25,7 @@
 //! directory (`F_GETPATH`, the name cache, on a filesystem that is not ours) with the entry's name, compared exactly
 //! with the mount point the table names for each recorded id, read once a thread and again only when the set changes.
 //!
-//! **Windows.** Each WinFsp volume's kernel name is recorded by its id ([`volume_id`]); the base plane names a path's
+//! **Windows.** Each WinFsp volume's kernel name is recorded by its id (`volume_id`); the base plane names a path's
 //! drive by `QueryDosDeviceW` and compares (`crate::windows`).
 
 use std::sync::OnceLock;
