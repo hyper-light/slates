@@ -3454,8 +3454,6 @@ fn init_shard(
   // The mounts a predecessor kept that this partition's catalog names, recorded as this daemon's own before anything
   // below reacquires a base or resumes a landing (A-227); then this shard's learning ends, and the process's crossing
   // checks, which wait for every shard's, go on.
-  #[cfg(target_os = "linux")]
-  crate::fuse::learn_kept(&mut state).map_err(ServerError::Refused)?;
   #[cfg(target_os = "macos")]
   crate::own_nfs::learn(&mut state).map_err(ServerError::Refused)?;
   #[cfg(unix)]
@@ -3484,6 +3482,9 @@ fn init_shard(
     };
   }
   let rebuilt = verbs::rebuild_recovered(&mut state);
+  // RED-CHECK (diag only): the kept FUSE mounts learned after the reacquire, the order before A-227's fix.
+  #[cfg(target_os = "linux")]
+  crate::fuse::learn_kept(&mut state).map_err(ServerError::Refused)?;
   if rebuilt.skipped > 0 {
     RECOVERY_SKIPPED.fetch_add(
       u64::try_from(rebuilt.skipped).unwrap_or(u64::MAX),
