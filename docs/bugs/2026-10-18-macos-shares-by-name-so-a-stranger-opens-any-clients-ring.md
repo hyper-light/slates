@@ -4,7 +4,10 @@
 - **Area:** `crates/ipc/src/rendezvous.rs` (the macOS/Windows bootstrap-object rendezvous),
   `crates/server/src/daemon.rs` (`ClientRegion::create`'s name), `crates/mem/src/shared.rs`
   (`object_name`, `shm_open`)
-- **Status:** **measured, not fixed** — this is the known open gap **GAP-A9-9 ("same-uid isolation
+- **Status (2026-11-06):** **the client rings are fixed (A-220): a region crosses only as a Mach fileport through the
+  owner's token, its name unlinked before the answer.** Still open: the anchor's segment and content objects, the
+  bootstrap object and Windows (GAPS, the GAP-A9-9 entry at the top).
+- **Status (as found):** **measured, not fixed** — this is the known open gap **GAP-A9-9 ("same-uid isolation
   owed")**, measured concretely for the first time. The fix is a platform decision (below) and is
   Ada's.
 - **Class:** missing capability on a shared resource; predictable-name disclosure and injection

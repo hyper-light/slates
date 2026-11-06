@@ -13084,6 +13084,41 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
+### A-220 — macOS hands a client its region as a Mach fileport, never by a name a stranger could open (accepted 2026-11-06, GAP-A9-9's ring half)
+Applied in the same change to: §4.7 (the macOS rendezvous), GAPS (GAP-A9-9), `crates/ipc` (`mach_claim.rs`, new;
+`owner_name.rs`: the token's port and its look-up; `rendezvous.rs`: the macOS `Owner` serves the token, the answer names
+nothing, the claimant fetches its region; `region.rs`: a region from a descriptor, a second mapping by a duplicate, its
+name unlinked; `completion.rs`: the bridge's mappings by duplicate), `crates/mem` (`SharedObject::from_descriptor`,
+`unlink_name`), `unsafe-budget.toml`, and the bug record of 2026-10-18.
+- **What was wrong.** The macOS rendezvous wrote each client's region name into the bootstrap object's claim slot, which
+  any same-uid process maps. A stranger that never connected read every request and reply another client exchanged and
+  wrote into them (measured 2026-10-18). Since A-176 the names carry a per-start key, but a stranger that connected once
+  learns the key from its own region's name, and any stranger reads each name from the slot as it is published.
+- **The rule.** The daemon unlinks a region's name before it answers, so no process opens it by name. The region crosses
+  only as a fileport, through the instance owner's Mach token, which launchd refuses to any other process while its
+  holder lives (A-178). The owner serves the token on a thread of its own and keeps a region only from its own process or
+  a child of it. It hands that region only to the process whose audit token sent the fetch and whose pid the slot names.
+- **Why each piece.**
+  - A name taken from the slot would not authenticate the owner: the slot is shared writable memory, so a forged answer
+    could point a client at a name a stranger registered.
+  - A keep from any process would let a stranger plant a region of its own for a victim to fetch.
+  - A fetch answered to any process would hand one client's region to another.
+  - A stranger that rewrites a victim's slot pid before the answer gets a fresh region the victim never uses, and the
+    victim's claim fails: the refusal a slot's writer could always cause, never another client's ring.
+- **Evidence.**
+  - Red first: `a_stranger_finds_no_clients_region_by_name` (`rendezvous.rs`): the slot named the region and a stranger
+    opened it. Green after.
+  - `mach_claim`'s tests: a fetch is handed over once; a region kept for another process is refused to this one; a
+    stranger's keep is refused. That last one runs a non-child process, and with the parent check disabled the victim
+    fetched the stranger's region.
+  - `slates-ipc` 38 lib tests and its cross-process rendezvous suite, `slates-client` 60, and the anchor-supervised CLI
+    flows on macOS: `the_anchor_supervises_…`, `slates_run_…`, `nfs_held`. The CLI flows put the daemon in a child process
+    of the anchor and restart it under the anchor.
+- **What it does not change.** The claim protocol and its restart rules (AUD-29-09/19, A-114, A-143, A-176), Linux (a
+  descriptor over the abstract socket since 2026-09), and Windows, which still hands a region over by name and is GAP-A9-9's
+  other half. Nor the anchor's segment and the bootstrap object, which are still opened by name; the segment's name is the
+  macOS issuer surface (§4.13), whose closing is a decision recorded in GAPS.
+
 ### A-216 — An acknowledgement is answered once the client's own shard has released its records (accepted 2026-11-05)
 Applied in the same change to: §4.9 (its status), `crates/server/src/verbs.rs` (`scatter_acknowledge`,
 `gather_acknowledge`), `crates/server/src/state.rs` (`ack_scatters`), `Daemon::flood_control_channel_on` (test

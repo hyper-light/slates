@@ -112,6 +112,27 @@ impl SharedObject {
     Ok(SharedObject { inner, len, words })
   }
 
+  /// Maps the object behind a descriptor another process handed this one (macOS, GAP-A9-9: a client's region arrives as
+  /// a Mach fileport, never by a name), expecting `len` bytes laid out with `words`. The object owns the descriptor.
+  #[cfg(unix)]
+  pub fn from_descriptor(
+    fd: std::os::fd::OwnedFd,
+    len: usize,
+    words: Words,
+  ) -> Result<SharedObject, MemError> {
+    let words = words.layout(len)?;
+    let inner = platform::from_descriptor(fd, len)?;
+    Ok(SharedObject { inner, len, words })
+  }
+
+  /// Removes this object's name (macOS), keeping its mapping and descriptor: from here no process can open it by name,
+  /// and only a descriptor this process hands on reaches it (GAP-A9-9). An object that has no name, or whose name is
+  /// gone already, is left as it is.
+  #[cfg(target_os = "macos")]
+  pub fn unlink_name(&mut self) -> Result<(), MemError> {
+    self.inner.unlink_name()
+  }
+
   /// This object with `words` declared: for an opener that learns the layout from a header it first read
   /// by copy (a client region's rings). By value, so no atomic view of the old layout can outlive the
   /// change; the new layout is checked like a created one, so a hostile header that would overlap or
@@ -1010,6 +1031,32 @@ mod platform {
 
   pub(super) fn open(handoff: &Handoff, len: usize) -> Result<Inner, MemError> {
     open_range(handoff, 0, len)
+  }
+
+  /// The object behind `fd`, which this process was handed, mapped whole; it carries no name, so nothing is unlinked at
+  /// its drop.
+  pub(super) fn from_descriptor(fd: OwnedFd, len: usize) -> Result<Inner, MemError> {
+    let map = map(&fd, 0, len, Access::ReadWrite)?;
+    Ok(Inner {
+      map,
+      fd,
+      #[cfg(target_os = "macos")]
+      name: String::new(),
+      #[cfg(target_os = "macos")]
+      creator: false,
+    })
+  }
+
+  #[cfg(target_os = "macos")]
+  impl Inner {
+    /// Unlinks the name this process created the object under, once: the drop has nothing left to unlink.
+    pub(super) fn unlink_name(&mut self) -> Result<(), MemError> {
+      if !self.creator {
+        return Ok(());
+      }
+      self.creator = false;
+      rustix::shm::unlink(self.name.as_str()).map_err(|e| refused("shm_unlink", e))
+    }
   }
 
   /// `[offset, offset + len)` of the object `handoff` names, mapped on its own.

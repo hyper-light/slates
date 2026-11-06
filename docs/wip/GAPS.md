@@ -1,5 +1,30 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **GAP-A9-9 on macOS, the ring half: a client's region crosses as a Mach fileport, never by name (2026-11-06, A-220,
+> bug-sweep; the rest open).** A same-uid stranger could open any client's ring by the name the claim slot published
+> (measured 2026-10-18). Now:
+> - The daemon unlinks a region's name before it answers, and the region reaches its claimant only as a fileport through
+>   the owner's Mach token, which launchd refuses to any other process while its holder lives.
+> - The owner keeps a region only from itself or its child, and hands it only to the claimant's audit-token pid.
+>
+> Red first: `a_stranger_finds_no_clients_region_by_name` (the slot named the region and the stranger opened it), then
+> green. `mach_claim`'s stranger test was red-checked with the parent check disabled. Still open:
+> - **The anchor's segment and content objects are opened by name** (`/slates-seg-…`, `/slates-con-…`). A stranger maps
+>   the daemon's whole RAM read-write: the largest exposure. Closing them is easy, since the daemon can inherit the
+>   descriptor as on Linux. But the segment's name is also macOS's issuer surface: `slates grant` and the other issuer
+>   verbs read the issuer secret through it. Options sent to the supervisor for Ada:
+>   1. close it as Linux does, the issuer verbs then working only from the anchor's children (recommended);
+>   2. accept that same-uid processes are trusted with the daemon's RAM;
+>   3. build the issuer surface as a Mach service first.
+> - **The bootstrap object** stays named: its doorbell (writing it was measured harmless) and its claim slots, which a
+>   stranger can scribble to refuse claims. That is a denial of service, never a ring.
+> - **Windows**, the same shape by name (`Local\` sections with the default DACL); the fix is a section DACL and handle
+>   duplication, as `delivery.rs` already does.
+> - **Found on the way, every platform: a wanted client id is granted to whoever asks while it is not live.** In
+>   `Listener::accept_pending`, `wanted != 0 && !in_use(wanted)` assigns it. Ids are small integers, so a same-uid
+>   process that reconnects with a dead client's id in a restart's window takes that client's seat and its retained
+>   completion records. Not yet fixed or measured; reported to the supervisor.
+
 > **The anchor kills live daemons on a busy machine (found 2026-11-06, audit step 7; open, to be assigned).** Under the
 > A/B bar's load, two spinners a logical CPU (8 on CI's 4-CPU Windows runners), the anchor killed daemons that were
 > alive and serving because their heartbeat lapsed its 1,000 ms liveness budget. A busy machine is the normal case
@@ -9018,6 +9043,9 @@ advertisement-gated and **not** harness-only — every Linux `MapRead` served by
   `docs/bugs/2026-10-18-a-read-handed-the-peer-the-whole-content-arena.md`.
 
 ### 2026-10-18: GAP-A9-9 measured — on macOS a same-uid stranger opens any client's ring, by name
+
+> **2026-11-06: the ring half fixed by A-220** (the entry at the top of this file); the segment, the bootstrap object
+> and Windows stay open there.
 
 The ledger has carried "same-uid isolation (GAP-A9-9) owed" since §4.7 was written. This is the first
 **measurement** of what that costs, and it is worse on macOS than the wording suggests.

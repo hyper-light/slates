@@ -304,13 +304,49 @@ impl ClientRegion {
 
   /// The client opens the region the daemon handed over.
   pub fn open(handoff: &Handoff, len: usize) -> Result<ClientRegion, IpcError> {
+    Self::check_len(len)?;
+    Self::from_object(SharedObject::open(handoff, len, Words::new())?)
+  }
+
+  /// The client maps the region whose descriptor the daemon handed over (macOS: a Mach fileport, GAP-A9-9).
+  #[cfg(unix)]
+  pub fn from_descriptor(fd: std::os::fd::OwnedFd, len: usize) -> Result<ClientRegion, IpcError> {
+    Self::check_len(len)?;
+    Self::from_object(SharedObject::from_descriptor(fd, len, Words::new())?)
+  }
+
+  /// A second, independent mapping of this region, through a duplicate of its descriptor: what a holder of the region
+  /// maps it again by, now that a macOS region has no name to open (GAP-A9-9).
+  #[cfg(unix)]
+  pub fn open_again(&self) -> Result<ClientRegion, IpcError> {
+    let fd =
+      rustix::io::fcntl_dupfd_cloexec(self.object.as_fd(), 0).map_err(|e| IpcError::OsRefused {
+        call: "fcntl(F_DUPFD_CLOEXEC)",
+        code: Some(e.raw_os_error()),
+      })?;
+    Self::from_descriptor(fd, self.object.len())
+  }
+
+  /// Removes the region's name (macOS), so only a descriptor the daemon hands on reaches it (GAP-A9-9).
+  #[cfg(target_os = "macos")]
+  pub fn unlink_name(&mut self) -> Result<(), IpcError> {
+    Ok(self.object.unlink_name()?)
+  }
+
+  /// Refuses a length that cannot hold the header and the words.
+  fn check_len(len: usize) -> Result<(), IpcError> {
     if len < RINGS_OFFSET {
       return Err(IpcError::Layout {
         reason: "a region shorter than its header and words",
       });
     }
+    Ok(())
+  }
+
+  /// The region over `object`, its rings found from the header it carries.
+  fn from_object(object: SharedObject) -> Result<ClientRegion, IpcError> {
+    let len = object.len();
     // The header first, by copy, before any word is declared: the rings' places come from it.
-    let object = SharedObject::open(handoff, len, Words::new())?;
     let mut header = [0u8; HEADER_BYTES];
     object.read(0, &mut header)?;
     let bytes = &header[..];
