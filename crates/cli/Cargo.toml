@@ -44,9 +44,8 @@ rustix = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
-
-[target.'cfg(windows)'.dev-dependencies]
-# `notify::MAX_PATH_UNITS`: the name reserve the live ladder holds equal to the limit it measures on the driver (A-206).
+# The WinFsp mounts' purge client, a role of this binary (§4.6: no daemon thread opens a volume it serves); the tests
+# also read `notify::MAX_PATH_UNITS`, the name reserve the live ladder holds equal to the limit it measures (A-206).
 slates-bridge-winfsp = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

@@ -56,7 +56,7 @@ pub(crate) fn private_path(path: &str) -> Result<Option<crate::purge::PrivatePat
   })
 }
 
-/// The command thread brackets one purge at a time. Its bounded channel carries the old End and next Begin; the
+/// The command thread brackets one purge at a time, each naming the purge client's process. Its bounded channel carries the old End and next Begin; the
 /// receiver drains it before each callback and while control I/O waits: a refused drive open may produce no callback.
 pub(crate) struct PrivateOpens {
   marker: crate::purge_token::Marker,
@@ -76,8 +76,13 @@ impl PrivateOpens {
     request: &Request<'_>,
   ) -> Result<Option<crate::purge::Purge>, WinFspError> {
     self.intents.progress()?;
+    // Only the purge client's process makes a purge's opens (`crate::purge_client`); no daemon thread opens its own
+    // volume (§4.6). Without a purge in progress, or from any other process, a Create is a program's.
+    let Some(client) = self.intents.current().map(|intent| intent.client) else {
+      return Ok(None);
+    };
     if request.kind() != inflight::CREATE_KIND
-      || request.process_id().map_err(WinFspError::Capture)? != std::process::id()
+      || request.process_id().map_err(WinFspError::Capture)? != client
     {
       return Ok(None);
     }
@@ -95,7 +100,7 @@ impl PrivateOpens {
     self
       .intents
       .current()
-      .cloned()
+      .map(|intent| intent.purge.clone())
       .map(Some)
       .ok_or(WinFspError::Capture(Refusal::State))
   }

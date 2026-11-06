@@ -18,19 +18,26 @@ const BOUND: usize = 2;
 /// Format: the intent event follows the control completion event in WaitForMultipleObjects' array.
 const INTENT_READY: u32 = WAIT_OBJECT_0 + 1;
 
+/// One purge in progress: the purge, and the process id of the client making its opens (`crate::purge_client`).
+#[derive(Clone, Debug)]
+pub(crate) struct Intent {
+  pub(crate) purge: Purge,
+  pub(crate) client: u32,
+}
+
 /// The command thread's end: one bounded channel and wake event per receive worker, since any worker may receive the
 /// private Create (A-219).
 pub(crate) struct Sender {
-  workers: Vec<(SyncSender<Option<Purge>>, OwnedHandle)>,
+  workers: Vec<(SyncSender<Option<Intent>>, OwnedHandle)>,
 }
 
 pub(crate) struct Intents {
-  messages: Receiver<Option<Purge>>,
+  messages: Receiver<Option<Intent>>,
   event: OwnedHandle,
   /// The one completion event of this receiver's control transactions, which run one at a time. Every transaction
   /// names it in its OVERLAPPED, and the system clears it as each begins, so none makes its own (A-212).
   completed: OwnedHandle,
-  current: Option<Purge>,
+  current: Option<Intent>,
 }
 
 /// A new unnamed event, initially unsignalled, its reset automatic or by hand as `manual_reset` says.
@@ -74,7 +81,7 @@ impl Sender {
   /// Publishes `intent` to every worker still receiving, in turn; each worker drains its own bounded channel. A worker
   /// whose channel is closed has ended and takes no Create, as one does when the probe's count stops short of it
   /// (A-219); refused only when no worker is left, since then the mount's receiving has ended.
-  pub(crate) fn publish(&self, intent: Option<Purge>) -> Result<(), WinFspError> {
+  pub(crate) fn publish(&self, intent: Option<Intent>) -> Result<(), WinFspError> {
     let mut reached = false;
     for (messages, event) in &self.workers {
       match messages.try_send(intent.clone()) {
@@ -108,7 +115,7 @@ fn signal(event: &OwnedHandle) -> Result<(), WinFspError> {
 }
 
 impl Intents {
-  pub(crate) fn current(&self) -> Option<&Purge> {
+  pub(crate) fn current(&self) -> Option<&Intent> {
     self.current.as_ref()
   }
 
@@ -178,11 +185,14 @@ mod tests {
       let mut intents = readers.pop().unwrap();
       let publisher = scope.spawn(move || {
         for _ in 0..PURGES {
-          sender.publish(Some(Purge {
-            object: slates_bridge_core::ObjectId::new(1, 0),
-            path: "\\file".to_owned(),
-            offset: 0,
-            len: 4096,
+          sender.publish(Some(Intent {
+            purge: Purge {
+              object: slates_bridge_core::ObjectId::new(1, 0),
+              path: "\\file".to_owned(),
+              offset: 0,
+              len: 4096,
+            },
+            client: std::process::id(),
           }))?;
           sender.publish(None)?;
         }
@@ -211,8 +221,8 @@ mod tests {
     });
   }
 
-  /// A-219. Do: publish a Begin and an End to two workers' intents. Expect: each worker reads both, in order, so the
-  /// private Create is authenticated whichever worker receives it.
+  /// A-219. Do: publish a Begin and an End to two workers' intents. Expect: each worker reads both, in order, the purge
+  /// and its client's process id alike, so the private Create is authenticated whichever worker receives it.
   #[test]
   fn every_worker_reads_every_private_intent() {
     let (sender, mut readers) = channel(2).unwrap();
@@ -222,15 +232,24 @@ mod tests {
       offset: 0,
       len: 4096,
     };
-    sender.publish(Some(purge.clone())).unwrap();
+    sender
+      .publish(Some(Intent {
+        purge: purge.clone(),
+        client: std::process::id(),
+      }))
+      .unwrap();
     for intents in &mut readers {
       assert_eq!(intents.progress().unwrap(), 1);
-      assert_eq!(intents.current(), Some(&purge));
+      let current = intents.current().unwrap();
+      assert_eq!(
+        (&current.purge, current.client),
+        (&purge, std::process::id())
+      );
     }
     sender.publish(None).unwrap();
     for intents in &mut readers {
       assert_eq!(intents.progress().unwrap(), 1);
-      assert_eq!(intents.current(), None);
+      assert!(intents.current().is_none());
     }
   }
 

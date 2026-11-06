@@ -75,9 +75,9 @@ const OVERLAP_READERS: usize = 3;
 const OVERLAP_FILES: usize = 4;
 /// Shape: the steps of the pause before each kill, in POLLs, so kills fall at different points of a cycle.
 const OVERLAP_PAUSES: u32 = 4;
-/// Format: a private Released marker base: a successor's reading of which journals the kill left a batch in, plus a
-/// set with bit `n` for worker `n`'s journal.
-const LANDING: u64 = SUCCESSOR_READY + 1;
+/// Format: a private Released marker base, after the purge oracle's PURGE_TAKEN: a successor's reading of which journals
+/// the kill left a batch in, plus a set with bit `n` for worker `n`'s journal.
+const LANDING: u64 = PURGE_TAKEN + 1;
 /// Format: every set of journals holding a request, one bit a worker.
 const LANDINGS: usize = 1 << crate::inflight::capture::MAX_WORKERS;
 /// Format: a private Released marker: the serving process's later worker began serving once its probe measured (A-219).
@@ -95,6 +95,13 @@ const LOST_EXIT: i32 = ROLE_EXIT + 1;
 const WRONG_EXIT: i32 = ROLE_EXIT + 2;
 /// Format: this module's full libtest role name; exact filtering must execute it, never zero tests.
 const ROLE_TEST: &str = "host::tests::request_role";
+/// Format: a private Released marker: a purge's open reached the purging server, which retains it unanswered.
+const PURGE_TAKEN: u64 = SUCCESSOR_READY + 1;
+/// Derived: the rule's bound (§4.6, 2026-11-06): a killed daemon exits within one transaction timeout, the longest its
+/// receive worker's control wait lasts (`crate::dispatcher::TRANSACT_TIMEOUT_MS`).
+const EXIT_WITHIN_MS: u32 = crate::dispatcher::TRANSACT_TIMEOUT_MS;
+/// Format: the purge client role's full libtest name (`crate::purge_client::serve_from_env` in a test binary).
+const PURGE_CLIENT_TEST: &str = "host::tests::purge_client_role";
 
 struct Child {
   process: Process,
@@ -104,6 +111,17 @@ impl Child {
   fn wait(&mut self) -> Option<i32> {
     // SAFETY: the process handle stays owned throughout this bounded wait.
     let waited = unsafe { WaitForSingleObject(self.process.raw_handle(), WAIT_MS) };
+    if waited == WAIT_TIMEOUT {
+      return None;
+    }
+    assert_eq!(waited, WAIT_OBJECT_0);
+    self.process.try_wait().unwrap()
+  }
+
+  /// The exit code once the process ended within `ms`, or `None`.
+  fn wait_within(&mut self, ms: u32) -> Option<i32> {
+    // SAFETY: the process handle stays owned throughout this bounded wait.
+    let waited = unsafe { WaitForSingleObject(self.process.raw_handle(), ms) };
     if waited == WAIT_TIMEOUT {
       return None;
     }
@@ -273,6 +291,63 @@ fn a_read_taken_before_the_kill_is_settled_after_takeover() {
   );
 }
 
+/// The rule of 2026-11-06 (§4.6 Windows; A-190's purge, the open sibling of
+/// `docs/bugs/2026-11-06-a-daemons-own-io-on-its-volume-strands-its-exit.md`). Do: mount, hold the volume with the
+/// anchor, purge a file, retain the purge's open unanswered in the serving process, and kill that process. Expect: it
+/// exits within one transaction timeout. A daemon thread's own open of its volume would sit in WinFsp's processing
+/// queue, never cancelled, and its process could not exit while the anchor holds the volume.
+#[test]
+fn a_daemon_killed_while_its_purges_open_is_delivered_exits_within_a_transaction_timeout() {
+  if std::env::var_os("WINFSP_TEST_MOUNT").is_none() {
+    eprintln!("SKIP: the purge kill oracle needs WINFSP_TEST_MOUNT=1 and WinFsp installed");
+    return;
+  }
+  let drive = free_drive();
+  let (anchor, daemon) = channel().unwrap();
+  let inherited = duplicate_inheritable(daemon.raw()).unwrap();
+  let value = format!("{:x}", handle_value(inherited.raw()));
+  let mut scenario = Scenario {
+    servers: Vec::with_capacity(1),
+    held: Some(Held::new(1)),
+    reader: None,
+    probe: None,
+    readers: Vec::new(),
+  };
+  scenario.servers.push(spawn(
+    "purger",
+    &drive,
+    &[(OsStr::new(CHANNEL), OsStr::new(&value))],
+    &[inherited.raw()],
+  ));
+  drop(inherited);
+  let message = anchor.recv(WAIT_MS).unwrap().expect("the purger's hold");
+  let answer = scenario
+    .held
+    .as_mut()
+    .unwrap()
+    .apply(scenario.servers[0].process.raw_handle(), message);
+  assert_eq!(answer, Some(HandleMessage::Held { id: ENTRY }));
+  anchor.send(&answer.unwrap(), WAIT_MS).unwrap();
+  assert_eq!(
+    anchor.recv(WAIT_MS).unwrap(),
+    Some(HandleMessage::Released { id: PURGE_TAKEN })
+  );
+  eprintln!("WINFSP PURGE KILL: the purge's open is delivered and retained; killing the server");
+  let killed = Instant::now();
+  scenario.servers[0].process.kill().unwrap();
+  let exited = scenario.servers[0].wait_within(EXIT_WITHIN_MS);
+  let waited = killed.elapsed();
+  if exited.is_none() {
+    // Delete the volume first so the stranded server can end and the fixture can reap it.
+    scenario.held = None;
+  }
+  eprintln!("WINFSP PURGE KILL: exited {exited:?} after {waited:?}");
+  assert!(
+    exited.is_some(),
+    "a daemon killed while its purge's open was delivered did not exit within {EXIT_WITHIN_MS} ms"
+  );
+}
+
 fn fixed_volume(store: &mut Store) -> (Volume, OpContext) {
   let mut volume = Volume::create(
     store,
@@ -331,7 +406,7 @@ fn overlap_byte(index: usize) -> u8 {
 }
 
 fn inherited_controls(role: &str) -> (Channel, Option<Inherited>) {
-  if role == "first" || role == "serving" {
+  if role == "first" || role == "serving" || role == "purger" {
     let value = u64::from_str_radix(&std::env::var(CHANNEL).unwrap(), 16).unwrap();
     (Channel::adopt(inherited_handle(value)), None)
   } else {
@@ -368,6 +443,7 @@ fn await_ready(mount: &mut MountThread) -> Box<Ready> {
 
 fn serve(role: &str, drive: &str) -> ! {
   let (channel, inherited) = inherited_controls(role);
+  install_purge_client();
   if role == "taking" {
     let landing = journals_holding_a_batch(&inherited.as_ref().unwrap().ledger);
     channel
@@ -424,7 +500,7 @@ fn serve_mounted(
   cx: &OpContext,
 ) -> ! {
   let mut ready = await_ready(mount);
-  if role == "first" || role == "serving" {
+  if role == "first" || role == "serving" || role == "purger" {
     channel
       .send(
         &HandleMessage::Hold {
@@ -453,12 +529,33 @@ fn serve_mounted(
   let mut names = OpenNames::new();
   let mut recovery_counted = false;
   let mut release_reported = false;
+  if role == "purger" {
+    let root = ObjectId::new(bridge.root(cx).unwrap(), 0);
+    let file = bridge.lookup(root, cx, "file").unwrap();
+    mount
+      .purge(vec![crate::purge::Purge {
+        object: ObjectId::new(file.ino, file.generation),
+        path: "\\file".to_owned(),
+        offset: 0,
+        len: u64::try_from(PAGE).unwrap(),
+      }])
+      .unwrap();
+  }
   loop {
     let request = receive
       .recv_timeout(ROLE_WAIT)
       .expect("the fixture's next request");
     count_recovery(role, &request, mount, &mut recovery_counted);
     report_release(role, channel, mount, &mut release_reported);
+    if role == "purger" && matches!(request.op, Op::PurgeOpen { .. }) {
+      channel
+        .send(&HandleMessage::Released { id: PURGE_TAKEN }, WAIT_MS)
+        .unwrap();
+      // Retain the purge's open, its reply sender included, until the parent kills this process.
+      let _retained = request;
+      let answer = channel.recv(WAIT_MS).unwrap();
+      panic!("the purger should have died while retaining the purge's open, got {answer:?}");
+    }
     if role == "first" && matches!(request.op, Op::Read { .. }) {
       channel
         .send(&HandleMessage::Released { id: READ_TAKEN }, WAIT_MS)
@@ -593,6 +690,27 @@ fn cleanup_once(
       .send()
   );
   let _reply = answer.recv().unwrap();
+}
+
+/// This test binary as a mount's purge client, the role `slates winfsp-purge-client` plays for the daemon.
+fn install_purge_client() {
+  crate::purge_client::install(crate::purge_client::Program {
+    program: std::env::current_exe().unwrap().into_os_string(),
+    args: ["--ignored", "--exact", PURGE_CLIENT_TEST, "--nocapture"]
+      .into_iter()
+      .map(OsString::from)
+      .collect(),
+  });
+}
+
+/// The rule of 2026-11-06. The re-invoked purge client: its exit is the role's own.
+#[test]
+#[ignore = "a process role for the purge client"]
+fn purge_client_role() {
+  if std::env::var_os(crate::purge_client::PURGE_CLIENT_ENV).is_none() {
+    return;
+  }
+  std::process::exit(crate::purge_client::serve_from_env());
 }
 
 /// A-198. The re-invoked mount server and reader; the parent requires the distinct ROLE_EXIT for a completed read.

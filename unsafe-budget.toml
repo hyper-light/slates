@@ -472,8 +472,11 @@ slates-bridge-fskit = 9
 # handle and name once, deletes the volume, and opens its absent name with `CreateFileW`, closing a handle that should
 # never come back. (135 -> 139, the same day) the probe's tests list the object manager's `\Device` directory to show
 # its volume gone however the probe ends: `NtOpenDirectoryObject`, `NtQueryDirectoryObject`, the entry's name read from
-# the query's own buffer, and `NtClose`.
-slates-bridge-winfsp = 139
+# the query's own buffer, and `NtClose`. (139 -> 140, 2026-11-06, the merge of main 28359a75) main's A-190 purge client
+# moved its sites to `purge_client.rs`, and this branch adds 13 to main's count: the delivery stamp (`dispatcher.rs`), the
+# probe's 8 (`probe.rs`, 4 shipped and 4 in its tests), and the two-worker kill oracle's and killed-probe test's 4
+# (`tests/support/host.rs`).
+slates-bridge-winfsp = 140
 # Raised 3 -> 5 on 2026-10-19 for `udmabuf.rs` (the `UDMABUF_CREATE` ioctl and the descriptor it returns), which
 # confined a guest's DAX window to a descriptor covering only that window
 # (docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md). Lowered 5 -> 3 on 2026-10-25

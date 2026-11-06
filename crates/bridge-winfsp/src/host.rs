@@ -50,16 +50,9 @@ use slates_bridge_core::{Bridge, NodeAttr, ObjectId, OpContext, RenameFlags, Set
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
 
-use windows_sys::Win32::Foundation::{
-  GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree,
-};
+use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::GetSecurityDescriptorLength;
-use windows_sys::Win32::Storage::FileSystem::{
-  CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_NO_BUFFERING, FILE_FLAG_WRITE_THROUGH,
-  FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile, WriteFile,
-};
-use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use crate::ffi::{
   self, Api, Boolean, DirInfo, FileInfo, FileSystem, Interface, Ntstatus, PSecurityDescriptor,
@@ -71,7 +64,7 @@ use crate::held::{
 };
 use crate::notify::OpenNames;
 use crate::opens::{Ledger, Open, RESTORED_HANDLE};
-use crate::purge::{Purge, PurgeOutcome, PurgeTarget, purge_through};
+use crate::purge::{Purge, PurgeOutcome};
 use crate::{STATUS_SUCCESS, file_attributes, filetime_from_unix_ns, ntstatus};
 use slates_mem::SparseObject;
 
@@ -1799,7 +1792,10 @@ struct Mounted {
   drive: Option<Drive>,
   record: Record,
   worker: Option<crate::dispatcher::Worker>,
-  purge_token: crate::purge_token::PurgeToken,
+  /// This mount's private marker, which the purge client's opens carry (`crate::purge_token`).
+  purge_marker: crate::purge_token::Marker,
+  /// The child process that makes the purges' opens: no daemon thread opens this volume (§4.6).
+  purge_client: crate::purge_client::Client,
   purge_intents: crate::purge_intents::Sender,
 }
 
@@ -1842,7 +1838,7 @@ impl Mounted {
     }
     let api = ffi::api().map_err(|_| WinFspError::NotInstalled)?;
     checked_dll(api)?;
-    let purge_token = crate::purge_token::PurgeToken::new()?;
+    let purge_marker = crate::purge_token::Marker::fresh()?;
     let security_descriptor = everyone_security_descriptor()?;
     let handler = Box::into_raw(Box::new(Handler {
       requests,
@@ -1872,7 +1868,8 @@ impl Mounted {
         read_only,
       },
       worker: None,
-      purge_token,
+      purge_marker,
+      purge_client: crate::purge_client::Client::new(purge_marker),
       purge_intents,
     };
     // SAFETY: `file_system` is the DLL's live full object. Only its stable public prefix is accessed here.
@@ -1964,158 +1961,38 @@ impl Mounted {
     }
   }
 
-  /// Purges each file's changed range from Windows' cache and from every view mapped of it (`crate::purge`): opens the
-  /// file through the drive unbuffered and writes the range, a piece at a time, from a zeroed buffer. WinFsp flushes and
-  /// purges each piece's range with `CcCoherencyFlushAndPurgeCache` before the write reaches the host, which answers the
-  /// write without applying it (its open carries the private restricting SID and expected file identity). Each piece is
-  /// then read back through Windows' cache and around it, and a purge whose pages Windows kept comes back untaken, for the server to owe it again
-  /// (`crate::retry`). A missing or foreign private token never authorizes a purge write.
-  fn purge(&self, purges: &[Purge]) -> Result<Purged, WinFspError> {
+  /// Purges each file's changed range from Windows' cache and from every view mapped of it (`crate::purge`), through the
+  /// purge client, a child process (`crate::purge_client`): it opens the file through the drive unbuffered and writes the
+  /// range, a piece at a time, from a zeroed buffer. WinFsp flushes and purges each piece's range with
+  /// `CcCoherencyFlushAndPurgeCache` before the write reaches the host, which answers the write without applying it (its
+  /// open is the client's and carries the private restricting SID and expected file identity). Each piece is then read
+  /// back through Windows' cache and around it, and a purge whose pages Windows kept comes back untaken, for the server to
+  /// owe it again (`crate::retry`). This thread only asks the child and reads its answer, so it holds no request on the
+  /// volume (§4.6, the rule of 2026-11-06). With no client program installed each purge is counted unavailable.
+  fn purge(&mut self, purges: &[Purge]) -> Result<Purged, WinFspError> {
     if purges.is_empty() {
       return Ok(Purged::default());
     }
     let piece = purge_piece();
-    let piece_bytes = usize::try_from(piece).unwrap_or(0);
-    let zeros = AlignedBytes::new(piece_bytes, usize::from(SECTOR_SIZE));
-    let mut aligned = AlignedBytes::new(piece_bytes, usize::from(SECTOR_SIZE));
-    let outcomes = purges
-      .iter()
-      .map(|purge| {
-        self.purge_intents.publish(Some(purge.clone()))?;
-        let outcome = self
-          .purge_token
-          .during(|| Ok(self.purge_one(purge, zeros.bytes(), &mut aligned, piece)));
-        self.purge_intents.publish(None)?;
-        outcome.map(|outcome| (purge.clone(), outcome))
-      })
-      .collect::<Result<_, _>>()?;
-    Ok(Purged {
-      outcomes,
-      unavailable: 0,
-    })
-  }
-
-  /// One file's purge (`crate::purge::purge_through`) through an unbuffered open of it, which writes the range and reads
-  /// it around Windows' cache, and a cached open made for the read through the cache.
-  fn purge_one(
-    &self,
-    purge: &Purge,
-    zeros: &[u8],
-    aligned: &mut AlignedBytes,
-    piece: u32,
-  ) -> PurgeOutcome {
-    let path = wide_nul(&format!("\\\\?\\{}{}", self.mount_point, purge.path));
-    let Some(unbuffered) = open_through_drive(
-      &path,
-      GENERIC_READ | GENERIC_WRITE,
-      FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
-    ) else {
-      return PurgeOutcome::Refused;
-    };
-    let mut file = DriveFile {
-      path: &path,
-      unbuffered,
-      cached: None,
-      zeros,
-      aligned,
-    };
-    purge_through(&mut file, purge, piece)
-  }
-}
-
-/// Opens the file at `path` (a NUL-terminated UTF-16 path through the drive) with `access` and `flags`, sharing it
-/// whole: its handle, or `None` when Windows refused the open.
-fn open_through_drive(path: &[u16], access: u32, flags: u32) -> Option<OwnedHandle> {
-  // SAFETY: `path` is a live NUL-terminated UTF-16 string for the call; no security attributes and no template.
-  let raw = unsafe {
-    CreateFileW(
-      path.as_ptr(),
-      access,
-      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-      std::ptr::null(),
-      OPEN_EXISTING,
-      flags,
-      std::ptr::null_mut(),
-    )
-  };
-  if raw == INVALID_HANDLE_VALUE || raw.is_null() {
-    return None;
-  }
-  // SAFETY: a handle the call above just opened and nothing else holds; owned from here and closed on drop.
-  Some(unsafe { OwnedHandle::from_raw_handle(raw) })
-}
-
-/// A file a purge works on through the drive ([`PurgeTarget`]): its unbuffered open, which writes the purge and reads
-/// around Windows' cache into a sector-aligned buffer, and a cached open for the read through the cache, made at the
-/// first such read.
-struct DriveFile<'p> {
-  path: &'p [u16],
-  unbuffered: OwnedHandle,
-  cached: Option<OwnedHandle>,
-  zeros: &'p [u8],
-  aligned: &'p mut AlignedBytes,
-}
-
-impl PurgeTarget for DriveFile<'_> {
-  fn write_zeros(&mut self, offset: u64, len: u32) -> bool {
-    write_zeros_at(&self.unbuffered, self.zeros, offset, len)
-  }
-
-  fn read_cached(&mut self, offset: u64, len: u32, out: &mut Vec<u8>) -> bool {
-    if self.cached.is_none() {
-      self.cached = open_through_drive(self.path, GENERIC_READ, FILE_ATTRIBUTE_NORMAL);
+    let mut purged = Purged::default();
+    for purge in purges {
+      let Some(client) = self.purge_client.ready()? else {
+        purged.unavailable = purged.unavailable.saturating_add(1);
+        continue;
+      };
+      self
+        .purge_intents
+        .publish(Some(crate::purge_intents::Intent {
+          purge: purge.clone(),
+          client,
+        }))?;
+      let path = format!("\\\\?\\{}{}", self.mount_point, purge.path);
+      let outcome = self.purge_client.purge(&path, purge, piece);
+      self.purge_intents.publish(None)?;
+      purged.outcomes.push((purge.clone(), outcome));
     }
-    let Some(handle) = self.cached.as_ref() else {
-      return false;
-    };
-    out.clear();
-    out.resize(usize::try_from(len).unwrap_or(0), 0);
-    let Some(read) = read_at(handle, out, offset) else {
-      return false;
-    };
-    out.truncate(read);
-    true
+    Ok(purged)
   }
-
-  fn read_uncached(&mut self, offset: u64, len: u32, out: &mut Vec<u8>) -> bool {
-    let Some(buffer) = usize::try_from(len)
-      .ok()
-      .and_then(|len| self.aligned.bytes_mut().get_mut(..len))
-    else {
-      return false;
-    };
-    let Some(read) = read_at(&self.unbuffered, buffer, offset) else {
-      return false;
-    };
-    out.clear();
-    out.extend_from_slice(buffer.get(..read).unwrap_or_default());
-    true
-  }
-}
-
-/// Reads into `buffer` at `offset` through `handle`, synchronously: how many bytes were read, or `None` when Windows
-/// refused the read.
-fn read_at(handle: &OwnedHandle, buffer: &mut [u8], offset: u64) -> Option<usize> {
-  let len = u32::try_from(buffer.len()).ok()?;
-  let mut overlapped = OVERLAPPED::default();
-  overlapped.Anonymous.Anonymous.Offset = u32::try_from(offset & u64::from(u32::MAX)).unwrap_or(0);
-  overlapped.Anonymous.Anonymous.OffsetHigh = u32::try_from(offset >> u32::BITS).unwrap_or(0);
-  let mut read = 0u32;
-  // SAFETY: a live handle opened synchronously, a buffer of `len` writable bytes, and an OVERLAPPED on this frame that
-  // only names the offset (a synchronous handle completes the read before the call returns).
-  let done = unsafe {
-    ReadFile(
-      handle.as_raw_handle(),
-      buffer.as_mut_ptr(),
-      len,
-      &mut read,
-      &mut overlapped,
-    )
-  };
-  if done == 0 {
-    return None;
-  }
-  usize::try_from(read).ok()
 }
 
 /// Format: the bytes of a purge write's piece when the system names no allocation granularity: one sector.
@@ -2132,65 +2009,6 @@ fn purge_piece() -> u32 {
     .and_then(|sectors| sectors.checked_mul(sector))
     .filter(|piece| *piece > 0)
     .unwrap_or(PURGE_PIECE_FLOOR)
-}
-
-/// A buffer, zeroed when made, whose first byte lies at a multiple of the alignment an unbuffered transfer asks (a
-/// sector), found within a larger allocation, so no allocator call needs to be unsafe: a purge's zeros, and the bytes
-/// an unbuffered read lands in.
-struct AlignedBytes {
-  storage: Vec<u8>,
-  start: usize,
-  len: usize,
-}
-
-impl AlignedBytes {
-  /// `len` zeroed bytes aligned to `align`.
-  fn new(len: usize, align: usize) -> AlignedBytes {
-    let storage = vec![0u8; len.saturating_add(align)];
-    let start = storage.as_ptr().align_offset(align).min(align);
-    AlignedBytes {
-      storage,
-      start,
-      len,
-    }
-  }
-
-  /// The aligned bytes (empty if the allocation could not hold them).
-  fn bytes(&self) -> &[u8] {
-    self
-      .storage
-      .get(self.start..self.start.saturating_add(self.len))
-      .unwrap_or(&[])
-  }
-
-  /// The aligned bytes, to write into (empty if the allocation could not hold them).
-  fn bytes_mut(&mut self) -> &mut [u8] {
-    let end = self.start.saturating_add(self.len);
-    self.storage.get_mut(self.start..end).unwrap_or_default()
-  }
-}
-
-/// Writes `len` bytes of `zeros` at `offset` through `handle`, synchronously: whether the whole length was written.
-fn write_zeros_at(handle: &OwnedHandle, zeros: &[u8], offset: u64, len: u32) -> bool {
-  let Some(buffer) = usize::try_from(len).ok().and_then(|len| zeros.get(..len)) else {
-    return false;
-  };
-  let mut overlapped = OVERLAPPED::default();
-  overlapped.Anonymous.Anonymous.Offset = u32::try_from(offset & u64::from(u32::MAX)).unwrap_or(0);
-  overlapped.Anonymous.Anonymous.OffsetHigh = u32::try_from(offset >> u32::BITS).unwrap_or(0);
-  let mut written = 0u32;
-  // SAFETY: a live handle opened synchronously, a buffer of `len` bytes, and an OVERLAPPED on this frame that only
-  // names the offset (a synchronous handle completes the write before the call returns).
-  let done = unsafe {
-    WriteFile(
-      handle.as_raw_handle(),
-      buffer.as_ptr(),
-      len,
-      &mut written,
-      &mut overlapped,
-    )
-  };
-  done != 0 && written == len
 }
 
 impl Drop for Mounted {
@@ -2229,8 +2047,9 @@ pub struct Purged {
   /// Windows' cache served bytes the host no longer holds, so Windows kept a page and the purge is owed again,
   /// `crate::retry`), or refused (its open, a write or a read back, as for a file renamed or removed since).
   pub outcomes: Vec<(Purge, PurgeOutcome)>,
-  /// Purges not made because WinFsp cannot name an open's process, so the host could not tell a purge's write from a
-  /// program's (`FspFileSystemOperationProcessIdF` absent).
+  /// Purges not made because no purge client could run: this process installed no client program
+  /// (`crate::purge_client::install`), so no process may make the purge's opens (no daemon thread opens its own volume,
+  /// §4.6).
   pub unavailable: u64,
 }
 
@@ -2499,7 +2318,7 @@ fn run_mount(
       section,
     ))
   })();
-  let mounted = match prepared {
+  let mut mounted = match prepared {
     Ok((mut mounted, ready, section)) => {
       report(Outcome::Mounted(Ok(Box::new(ready))));
       match crate::dispatcher::Worker::start(
@@ -2511,9 +2330,7 @@ fn run_mount(
         confirmations,
         readers
           .into_iter()
-          .map(|intents| {
-            crate::dispatcher::PrivateOpens::new(mounted.purge_token.marker(), intents)
-          })
+          .map(|intents| crate::dispatcher::PrivateOpens::new(mounted.purge_marker, intents))
           .collect(),
       ) {
         Ok(worker) => mounted.worker = Some(worker),

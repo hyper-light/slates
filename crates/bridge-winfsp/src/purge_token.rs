@@ -1,6 +1,6 @@
 //! A private coherence open's caller (A-190/A-198, §4.6 Windows). PID alone also matches ordinary I/O made by an
-//! embedding application. The owned mount thread instead uses a restricted copy of its own token with a fresh SID
-//! marker. WinFsp copies this effective token into Create.AccessToken (sys/create.c); its restricting SIDs survive
+//! embedding application. The mount's purge client, a child process (`crate::purge_client`), instead uses a restricted
+//! copy of its own token carrying the mount's fresh SID marker, which the mount makes and hands it. WinFsp copies this effective token into Create.AccessToken (sys/create.c); its restricting SIDs survive
 //! that copy, whereas TokenId does not. The receiver requires both its own PID and this mount's marker before using
 //! a pending identity-addressed purge. No privilege is enabled: CreateRestrictedToken removes privileges and
 //! ImpersonateLoggedOnUser permits the caller's own authenticated identity (Microsoft's API contracts).
@@ -24,6 +24,8 @@ const RESTRICTING_SIDS: usize = 2;
 const MARKER_WORDS: usize = 5;
 /// Format: SECURITY_NT_NON_UNIQUE (winnt.h), the domain SID prefix before its random subauthorities.
 const DOMAIN_SID_PREFIX: u32 = 21;
+/// Format: the base a marker's text is written in.
+const HEX: u32 = 16;
 /// Format: the four random subauthorities' bytes.
 const RANDOM_BYTES: usize = (MARKER_WORDS - 1) * size_of::<u32>();
 /// Format: TOKEN_GROUPS with two SID_AND_ATTRIBUTES entries and two maximum-size SID bodies, aligned for pointers.
@@ -105,11 +107,11 @@ impl Marker {
 /// Owned only on the mount's command thread, separate from the receiver's immutable marker.
 pub(crate) struct PurgeToken {
   token: OwnedHandle,
-  marker: Marker,
 }
 
-impl PurgeToken {
-  pub(crate) fn new() -> Result<Self, WinFspError> {
+impl Marker {
+  /// A fresh mount-specific marker: a domain SID of four random subauthorities.
+  pub(crate) fn fresh() -> Result<Self, WinFspError> {
     let mut random = [0u8; RANDOM_BYTES];
     // SAFETY: the system-preferred generator fills exactly this live output array; no algorithm handle is borrowed.
     let status = unsafe {
@@ -126,6 +128,10 @@ impl PurgeToken {
         status,
       });
     }
+    Self::from_random(random)
+  }
+
+  fn from_random(random: [u8; RANDOM_BYTES]) -> Result<Self, WinFspError> {
     let mut subauthorities = [0; MARKER_WORDS];
     *subauthorities
       .first_mut()
@@ -137,12 +143,44 @@ impl PurgeToken {
     {
       *word = u32::from_le_bytes(*bytes);
     }
-    let marker = Marker(Sid {
+    Ok(Marker(Sid {
       revision: 1,
       count: u8::try_from(MARKER_WORDS).map_err(|_| error("purge SID count"))?,
       authority: [0, 0, 0, 0, 0, 5],
       subauthorities,
-    });
+    }))
+  }
+
+  /// The marker's random part as hexadecimal text, for the purge client this mount spawns (A-203's A-190 move): the
+  /// child builds its own restricted token carrying the same marker.
+  pub(crate) fn to_hex(self) -> String {
+    self
+      .0
+      .subauthorities
+      .iter()
+      .skip(1)
+      .flat_map(|word| word.to_le_bytes())
+      .map(|byte| format!("{byte:02x}"))
+      .collect()
+  }
+
+  /// The marker [`Marker::to_hex`] wrote; `None` for any other text.
+  pub(crate) fn from_hex(text: &str) -> Option<Self> {
+    let mut random = [0u8; RANDOM_BYTES];
+    if text.len() != RANDOM_BYTES.saturating_mul(2) || !text.is_ascii() {
+      return None;
+    }
+    for (byte, pair) in random.iter_mut().zip(text.as_bytes().chunks(2)) {
+      *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, HEX).ok()?;
+    }
+    Self::from_random(random).ok()
+  }
+}
+
+impl PurgeToken {
+  /// A less privileged copy of this process's token restricted to Everyone and `marker`: the daemon's receiver
+  /// recognizes the purge client's opens by it.
+  pub(crate) fn with_marker(marker: Marker) -> Result<Self, WinFspError> {
     let everyone = Sid {
       revision: 1,
       count: 1,
@@ -196,11 +234,7 @@ impl PurgeToken {
     if !marker.matches(token.as_handle())? {
       return Err(error("restricted purge token lost its marker"));
     }
-    Ok(Self { token, marker })
-  }
-
-  pub(crate) fn marker(&self) -> Marker {
-    self.marker
+    Ok(Self { token })
   }
 
   /// Calls only private drive I/O under the less privileged token and restores before the command thread continues.
@@ -264,8 +298,9 @@ mod tests {
   /// Expect: the copy retains its own marker, never the other's, without relying on the token object's identity.
   #[test]
   fn a_private_marker_survives_a_security_copy_and_is_mount_specific() {
-    let own = PurgeToken::new().unwrap();
-    let other = PurgeToken::new().unwrap();
+    let marker = Marker::fresh().unwrap();
+    let own = PurgeToken::with_marker(marker).unwrap();
+    let other = Marker::fresh().unwrap();
     let mut copied = std::ptr::null_mut();
     // SAFETY: this owned token has duplication rights, the output is writable, and no thread impersonation changes.
     let duplicated = unsafe {
@@ -278,8 +313,8 @@ mod tests {
     assert_ne!(duplicated, 0);
     // SAFETY: the successful duplication returned one fresh owned handle.
     let copied = unsafe { OwnedHandle::from_raw_handle(copied) };
-    assert!(own.marker.matches(copied.as_handle()).unwrap());
-    assert!(!other.marker.matches(copied.as_handle()).unwrap());
+    assert!(marker.matches(copied.as_handle()).unwrap());
+    assert!(!other.matches(copied.as_handle()).unwrap());
     own.during(|| Ok(())).unwrap();
   }
 }

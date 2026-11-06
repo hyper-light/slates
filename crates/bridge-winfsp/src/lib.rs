@@ -60,6 +60,8 @@ pub mod purge;
 #[cfg(windows)]
 mod probe;
 #[cfg(windows)]
+pub mod purge_client;
+#[cfg(windows)]
 mod purge_intents;
 #[cfg(windows)]
 mod purge_token;

@@ -105,6 +105,7 @@ fn volume(n: u64, name: &str) -> VolumeRecord {
       names: NamePolicy::Exact,
       require_locked: false,
       role: Role::Plain,
+      live_shipped: false,
     },
     base: BaseRecord::Scratch,
     head: SnapshotId { value: 0 },
