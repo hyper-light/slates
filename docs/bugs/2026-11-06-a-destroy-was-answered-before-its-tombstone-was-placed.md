@@ -67,6 +67,15 @@ flow):
   afterwards;
 - no destroy is told `NotFound`.
 
+**Red-check** (2026-11-06 06:41-06:46 UTC, the fix disabled by making `verbs::replicated_waits` skip the destroy's
+branch, so a destroy takes the old path): 3 of the 5 flows fail.
+- The destroy-wait flow: the destroy is told `NotFound` (exit 1).
+- The live unheard destroy and the plain unheard destroy: each exits 0 with both candidates stopped, "a destroy no
+  candidate could hold is never answered done".
+
+The two heard flows pass either way. In this run neither survivor served a destroyed volume within its 8 s window,
+so the red is on the answer. The resurrection itself was seen once, at 06:06.
+
 Not yet proven: whether a takeover serves the acknowledged writes of a live volume whose destroy was never answered.
 The flow now checks NoLoss there (8 s after the loss neither survivor served it: one `NotFound`, one `Overloaded`); its
 result is owed.
