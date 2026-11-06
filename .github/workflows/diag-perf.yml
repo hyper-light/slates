@@ -1,0 +1,123 @@
+name: diag-perf
+
+# The edit-and-merge harness (`crates/client/examples/edit_merge_bench.rs`, A-202), two builds interleaved: `base` (the
+# commit named in `.github/diag-perf-base`) and `fix` (this commit's parent tree). Linux under the controlled load the
+# supervisor set (two spinning threads a core, two CPUs, 256 MB, a sibling writer that fsyncs), then quiet, then each
+# build's daemon idle at rest (its threads' switches and CPU over a minute). Each line of `.github/diag-perf-arms` is
+# `<base|fix> <harness flags>`. A diagnostics lane run only from `diag-perf-*` branches (never main).
+
+on:
+  push:
+    branches: ["diag-perf-*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  merge-under-load:
+    name: merge under load (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build both harnesses
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          fix=$(git rev-parse HEAD)
+          base=$(cat .github/diag-perf-base)
+          cp .github/diag-perf-arms "$RUNNER_TEMP/arms"
+          git -c advice.detachedHead=false checkout -q "$base"
+          cargo build --release -p slates-client --example edit_merge_bench
+          cargo build --release -p slates-cli --bin slates
+          cp target/release/examples/edit_merge_bench "$RUNNER_TEMP/bin/base"
+          cp target/release/slates "$RUNNER_TEMP/bin/slates-base"
+          git -c advice.detachedHead=false checkout -q "$fix"
+          cargo build --release -p slates-client --example edit_merge_bench
+          cargo build --release -p slates-cli --bin slates
+          cp target/release/examples/edit_merge_bench "$RUNNER_TEMP/bin/fix"
+          cp target/release/slates "$RUNNER_TEMP/bin/slates-fix"
+          echo "base $base fix $fix"
+      - name: The constraint this runner can apply
+        run: |
+          nproc; free -m | head -2; uname -a; cat /sys/kernel/debug/sched/base_slice_ns 2>/dev/null || true
+          if systemd-run --user --scope -p MemoryMax=256M -p AllowedCPUs=0-1 true 2>/dev/null; then
+            echo "constraint: systemd-run --user --scope, AllowedCPUs=0-1, MemoryMax=256M" | tee "$RUNNER_TEMP/constraint"
+          else
+            echo "constraint: taskset -c 0,1 only (no user systemd manager; memory not capped)" | tee "$RUNNER_TEMP/constraint"
+          fi
+      - name: Interleaved arms under the controlled load
+        run: |
+          cat > "$RUNNER_TEMP/loaded.sh" <<'EOS'
+          #!/bin/bash
+          # The sibling writer: 16 MiB written and fsynced, again and again, beside the harness in the same cgroup.
+          ( while true; do dd if=/dev/zero of="$RUNNER_TEMP/fsync.bin" bs=1M count=16 conv=fsync status=none; done ) &
+          writer=$!
+          bin=$1; shift
+          "$RUNNER_TEMP/bin/$bin" --loaded-only --spinners-per-core 2 "$@" \
+            --files 10 --files 1000 --form accept --form conflict
+          status=$?
+          kill $writer; wait $writer 2>/dev/null
+          exit $status
+          EOS
+          chmod +x "$RUNNER_TEMP/loaded.sh"
+          export RUNNER_TEMP
+          for round in 1 2 3; do
+            while read -r arm; do
+              echo "== round $round arm [$arm] $(date -u +%FT%TZ) $(uptime) $(cat "$RUNNER_TEMP/constraint")"
+              if grep -q systemd-run "$RUNNER_TEMP/constraint"; then
+                timeout 900 systemd-run --user --scope -q -p MemoryMax=256M -p AllowedCPUs=0-1 \
+                  -E RUNNER_TEMP="$RUNNER_TEMP" "$RUNNER_TEMP/loaded.sh" $arm </dev/null | grep -E 'goal|WRONG|loaded:|refused|sched:|pulse|shard slice'
+              else
+                timeout 900 taskset -c 0,1 "$RUNNER_TEMP/loaded.sh" $arm </dev/null | grep -E 'goal|WRONG|loaded:|refused|sched:|pulse|shard slice'
+              fi
+            done < "$RUNNER_TEMP/arms"
+          done
+      - name: Quiet and paced, the same arms, for the contrast
+        run: |
+          for round in 1 2 3; do
+            while read -r bin rest; do
+              for pace in 2000000 0; do
+                flag=""; [ "$pace" != 0 ] && flag="--pause-ns $pace"
+                echo "== quiet round $round arm [$bin $rest] pause $pace $(date -u +%FT%TZ) $(uptime)"
+                "$RUNNER_TEMP/bin/$bin" --quiet-only $rest $flag --files 10 --files 1000 \
+                  --form accept --form conflict </dev/null | grep -E 'goal|WRONG|sched:|pulse|shard slice'
+              done
+            done < "$RUNNER_TEMP/arms"
+          done
+      - name: Idle at rest, each build's daemon, interleaved
+        run: |
+          counts() {
+            local voluntary=0 involuntary=0 ticks=0
+            for task in /proc/$1/task/*; do
+              voluntary=$((voluntary + $(awk '/^voluntary_ctxt_switches/{print $2}' $task/status)))
+              involuntary=$((involuntary + $(awk '/^nonvoluntary_ctxt_switches/{print $2}' $task/status)))
+              ticks=$((ticks + $(awk '{print $14 + $15}' $task/stat)))
+            done
+            echo "$voluntary $involuntary $ticks"
+          }
+          for round in 1 2; do
+            for bin in base fix; do
+              instance="idle-$bin-$round-$$"
+              "$RUNNER_TEMP/bin/slates-$bin" --instance "$instance" daemon --quick > "$RUNNER_TEMP/idle-$instance.log" 2>&1 &
+              pid=$!
+              sleep 20
+              before=$(counts $pid)
+              sleep 60
+              after=$(counts $pid)
+              threads=$(ls /proc/$pid/task | wc -l)
+              set -- $before $after
+              echo "idle round $round [$bin]: $threads threads, over 60 s: voluntary switches $(( $4 - $1 )), involuntary $(( $5 - $2 )), CPU $(( $6 - $3 )) ticks (CLK_TCK $(getconf CLK_TCK)); $(uptime)"
+              grep -h 'shard slice' "$RUNNER_TEMP/idle-$instance.log" || echo "  (no slice line)"
+              kill $pid; wait $pid 2>/dev/null
+            done
+          done
