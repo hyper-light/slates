@@ -1,0 +1,187 @@
+# transaction wait forms at ca4b84413faa9849a072fbc7c0e89d3b74a87324; 2026-11-06T08:53:13Z
+image win25-vs2026 20261030.294.1; 4 CPUs; AMD64 AMD64 Family 25 Model 17 Stepping 1, AuthenticAMD; WinFsp 2.1.25156
+## run 1
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded cfg-if v1.0.4
+  Downloaded find-msvc-tools v0.1.12
+  Downloaded quote v1.0.47
+  Downloaded cpufeatures v0.3.1
+  Downloaded arrayvec v0.7.8
+  Downloaded cc v1.4.5
+  Downloaded tinyvec_macros v0.1.1
+  Downloaded itoa v1.0.18
+  Downloaded windows-targets v0.53.5
+  Downloaded constant_time_eq v0.4.2
+  Downloaded shlex v2.0.1
+  Downloaded zstd-safe v7.3.0
+  Downloaded jobserver v0.1.35
+  Downloaded pkg-config v0.3.34
+  Downloaded zstd v0.13.3
+  Downloaded twox-hash v2.1.4
+  Downloaded lz4_flex v0.11.6
+  Downloaded zmij v1.0.23
+  Downloaded memmap2 v0.9.11
+  Downloaded serde_core v1.0.229
+  Downloaded tinyvec v1.13.2
+  Downloaded serde_derive v1.0.229
+  Downloaded unicode-ident v1.0.24
+  Downloaded getrandom v0.4.3
+  Downloaded proc-macro2 v1.0.107
+  Downloaded serde v1.0.229
+  Downloaded memchr v2.8.3
+  Downloaded unicode-normalization v0.1.25
+  Downloaded serde_json v1.0.151
+  Downloaded blake3 v1.8.7
+  Downloaded syn v2.0.119
+  Downloaded syn v3.0.5
+  Downloaded zstd-sys v2.1.0+zstd.1.5.7
+  Downloaded windows_x86_64_msvc v0.53.1
+  Downloaded windows-sys v0.60.2
+   Compiling getrandom v0.4.3
+   Compiling cfg-if v1.0.4
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.12
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling serde_core v1.0.229
+   Compiling windows_x86_64_msvc v0.53.1
+   Compiling zmij v1.0.23
+   Compiling jobserver v0.1.35
+   Compiling cc v1.4.5
+   Compiling constant_time_eq v0.4.2
+   Compiling syn v3.0.5
+   Compiling cpufeatures v0.3.1
+   Compiling arrayvec v0.7.8
+   Compiling serde_json v1.0.151
+   Compiling serde v1.0.229
+   Compiling windows-targets v0.53.5
+   Compiling memchr v2.8.3
+   Compiling blake3 v1.8.7
+   Compiling itoa v1.0.18
+   Compiling windows-sys v0.60.2
+   Compiling serde_derive v1.0.229
+   Compiling memmap2 v0.9.11
+   Compiling pkg-config v0.3.34
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+   Compiling syn v2.0.119
+   Compiling zstd-safe v7.3.0
+   Compiling twox-hash v2.1.4
+   Compiling tinyvec_macros v0.1.1
+   Compiling tinyvec v1.13.2
+   Compiling lz4_flex v0.11.6
+   Compiling unicode-normalization v0.1.25
+   Compiling slates-image v0.1.0 (D:\a\slates\slates\crates\image)
+   Compiling slates-machine v0.1.0 (D:\a\slates\slates\crates\machine)
+   Compiling slates-wire-derive v0.1.0 (D:\a\slates\slates\crates\wire-derive)
+   Compiling slates-mem v0.1.0 (D:\a\slates\slates\crates\mem)
+   Compiling slates-wire v0.1.0 (D:\a\slates\slates\crates\wire)
+   Compiling slates-rt v0.1.0 (D:\a\slates\slates\crates\rt)
+   Compiling slates-ipc v0.1.0 (D:\a\slates\slates\crates\ipc)
+   Compiling zstd v0.13.3
+   Compiling slates-archive v0.1.0 (D:\a\slates\slates\crates\archive)
+   Compiling slates-anchor v0.1.0 (D:\a\slates\slates\crates\anchor)
+   Compiling slates-db v0.1.0 (D:\a\slates\slates\crates\db)
+   Compiling slates-vfs v0.1.0 (D:\a\slates\slates\crates\vfs)
+   Compiling slates-bridge-core v0.1.0 (D:\a\slates\slates\crates\bridge-core)
+   Compiling slates-bridge-winfsp v0.1.0 (D:\a\slates\slates\crates\bridge-winfsp)
+    Finished `release` profile [optimized] target(s) in 1m 23s
+     Running unittests src\lib.rs (target\release\deps\slates_bridge_winfsp-0f7bef3cd5629080.exe)
+
+running 1 test
+WINFSP TRANSACT batch output 16384 bytes: Err(122) (Win32 122 is the driver's STATUS_BUFFER_TOO_SMALL)
+WINFSP TRANSACT batch output 4096 bytes: Err(122) (Win32 122 is the driver's STATUS_BUFFER_TOO_SMALL)
+WINFSP TRANSACT mode=single-buffered-16320 call n=20000 p50=29.8 p99=54.8 p999=81.2 max=380.1 | client open n=21989 p50=29.5 p99=55.4 p999=88.9 max=553.5
+WINFSP TRANSACT mode=batch-direct-64k-private call n=20000 p50=29.3 p99=51.0 p999=76.1 max=174.4 | client open n=21990 p50=28.9 p99=51.2 p999=97.9 max=387.8
+WINFSP TRANSACT mode=batch-direct-64k-section call n=20000 p50=29.6 p99=53.0 p999=83.9 max=346.3 | client open n=21989 p50=29.2 p99=52.3 p999=81.9 max=229.3
+WINFSP TRANSACT mode=batch-direct-128k-section call n=20000 p50=30.2 p99=53.9 p999=164.0 max=688.3 | client open n=21989 p50=29.8 p99=54.2 p999=162.9 max=643.2
+WINFSP TRANSACT mode=batch-direct-256k-section call n=20000 p50=31.6 p99=181.2 p999=366.1 max=564.8 | client open n=21981 p50=31.2 p99=177.6 p999=340.8 max=564.6
+WINFSP TRANSACT mode=single-buffered-16320-handle-wait call n=20000 p50=29.6 p99=51.4 p999=76.1 max=138.1 | client open n=21989 p50=29.2 p99=50.0 p999=75.6 max=172.0
+WINFSP TRANSACT mode=batch-direct-64k-section-handle-wait call n=20000 p50=29.3 p99=51.1 p999=81.8 max=346.9 | client open n=21989 p50=28.9 p99=50.7 p999=89.5 max=302.6
+WINFSP TRANSACT mode=batch-direct-64k-section-two-event-wait call n=20000 p50=29.2 p99=52.8 p999=81.6 max=214.5 | client open n=21989 p50=28.8 p99=51.7 p999=83.1 max=195.0
+test host::transact_bench::transact_cost ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 97 filtered out; finished in 6.69s
+
+## run 1 exit 0
+## run 2
+    Finished `release` profile [optimized] target(s) in 0.11s
+     Running unittests src\lib.rs (target\release\deps\slates_bridge_winfsp-0f7bef3cd5629080.exe)
+
+running 1 test
+WINFSP TRANSACT batch output 16384 bytes: Err(122) (Win32 122 is the driver's STATUS_BUFFER_TOO_SMALL)
+WINFSP TRANSACT batch output 4096 bytes: Err(122) (Win32 122 is the driver's STATUS_BUFFER_TOO_SMALL)
+WINFSP TRANSACT mode=single-buffered-16320 call n=20000 p50=29.9 p99=54.9 p999=90.0 max=204.1 | client open n=21989 p50=29.4 p99=54.1 p999=93.2 max=415.0
+WINFSP TRANSACT mode=batch-direct-64k-private call n=20000 p50=29.6 p99=54.4 p999=128.6 max=379.6 | client open n=21990 p50=29.1 p99=52.7 p999=137.6 max=295.7
+WINFSP TRANSACT mode=batch-direct-64k-section call n=20000 p50=29.6 p99=57.3 p999=150.0 max=291.9 | client open n=21989 p50=29.0 p99=56.1 p999=146.7 max=318.7
+WINFSP TRANSACT mode=batch-direct-128k-section call n=20000 p50=30.4 p99=58.4 p999=139.9 max=1189.2 | client open n=21989 p50=29.8 p99=56.1 p999=122.4 max=1195.2
+WINFSP TRANSACT mode=batch-direct-256k-section call n=20000 p50=31.3 p99=53.2 p999=101.4 max=715.7 | client open n=21989 p50=30.8 p99=51.7 p999=99.4 max=728.6
+WINFSP TRANSACT mode=single-buffered-16320-handle-wait call n=20000 p50=29.7 p99=53.4 p999=87.7 max=204.4 | client open n=21989 p50=29.2 p99=52.9 p999=89.4 max=240.0
+WINFSP TRANSACT mode=batch-direct-64k-section-handle-wait call n=20000 p50=29.5 p99=53.5 p999=105.6 max=324.5 | client open n=21989 p50=28.9 p99=52.3 p999=104.0 max=321.1
+WINFSP TRANSACT mode=batch-direct-64k-section-two-event-wait call n=20000 p50=29.6 p99=55.7 p999=166.5 max=417.1 | client open n=21989 p50=29.0 p99=54.0 p999=163.8 max=315.5
+test host::transact_bench::transact_cost ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 97 filtered out; finished in 6.59s
+
+## run 2 exit 0
+## run 3
+    Finished `release` profile [optimized] target(s) in 0.11s
+     Running unittests src\lib.rs (target\release\deps\slates_bridge_winfsp-0f7bef3cd5629080.exe)
+
+running 1 test
+WINFSP TRANSACT batch output 16384 bytes: Err(122) (Win32 122 is the driver's STATUS_BUFFER_TOO_SMALL)
+WINFSP TRANSACT batch output 4096 bytes: Err(122) (Win32 122 is the driver's STATUS_BUFFER_TOO_SMALL)
+WINFSP TRANSACT mode=single-buffered-16320 call n=20000 p50=29.6 p99=51.5 p999=79.9 max=216.5 | client open n=21989 p50=29.1 p99=51.9 p999=88.5 max=359.7
+WINFSP TRANSACT mode=batch-direct-64k-private call n=20000 p50=29.4 p99=80.2 p999=211.9 max=381.9 | client open n=21990 p50=28.9 p99=76.9 p999=201.5 max=352.0
+WINFSP TRANSACT mode=batch-direct-64k-section call n=20000 p50=29.3 p99=56.6 p999=85.1 max=197.4 | client open n=21989 p50=28.9 p99=55.1 p999=85.2 max=202.6
+WINFSP TRANSACT mode=batch-direct-128k-section call n=20000 p50=30.2 p99=55.6 p999=150.7 max=298.8 | client open n=21989 p50=29.7 p99=54.5 p999=159.5 max=303.4
+WINFSP TRANSACT mode=batch-direct-256k-section call n=20000 p50=31.3 p99=54.7 p999=93.7 max=1230.1 | client open n=21989 p50=30.8 p99=53.2 p999=93.3 max=1249.6
+WINFSP TRANSACT mode=single-buffered-16320-handle-wait call n=20000 p50=29.6 p99=52.0 p999=95.9 max=651.4 | client open n=21989 p50=29.1 p99=51.4 p999=94.1 max=648.5
+WINFSP TRANSACT mode=batch-direct-64k-section-handle-wait call n=20000 p50=29.3 p99=50.9 p999=82.1 max=130.8 | client open n=21989 p50=28.8 p99=50.7 p999=82.5 max=131.3
+WINFSP TRANSACT mode=batch-direct-64k-section-two-event-wait call n=20000 p50=29.4 p99=52.0 p999=94.9 max=187.7 | client open n=21989 p50=28.9 p99=50.4 p999=93.0 max=225.6
+test host::transact_bench::transact_cost ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 97 filtered out; finished in 6.57s
+
+## run 3 exit 0
+## run 4
+    Finished `release` profile [optimized] target(s) in 0.11s
+     Running unittests src\lib.rs (target\release\deps\slates_bridge_winfsp-0f7bef3cd5629080.exe)
+
+running 1 test
+WINFSP TRANSACT batch output 16384 bytes: Err(122) (Win32 122 is the driver's STATUS_BUFFER_TOO_SMALL)
+WINFSP TRANSACT batch output 4096 bytes: Err(122) (Win32 122 is the driver's STATUS_BUFFER_TOO_SMALL)
+WINFSP TRANSACT mode=single-buffered-16320 call n=20000 p50=29.7 p99=53.0 p999=94.2 max=286.7 | client open n=21989 p50=29.2 p99=56.5 p999=113.4 max=961.4
+WINFSP TRANSACT mode=batch-direct-64k-private call n=20000 p50=29.4 p99=53.3 p999=86.8 max=1139.7 | client open n=21990 p50=28.9 p99=51.5 p999=87.4 max=1134.5
+WINFSP TRANSACT mode=batch-direct-64k-section call n=20000 p50=29.4 p99=50.7 p999=79.3 max=825.8 | client open n=21989 p50=28.9 p99=50.1 p999=82.4 max=815.9
+WINFSP TRANSACT mode=batch-direct-128k-section call n=20000 p50=30.2 p99=52.9 p999=84.3 max=172.0 | client open n=21989 p50=29.6 p99=51.6 p999=85.0 max=165.5
+WINFSP TRANSACT mode=batch-direct-256k-section call n=20000 p50=31.3 p99=53.0 p999=82.2 max=153.0 | client open n=21989 p50=30.8 p99=51.9 p999=82.4 max=158.8
+WINFSP TRANSACT mode=single-buffered-16320-handle-wait call n=20000 p50=29.6 p99=55.3 p999=190.0 max=483.5 | client open n=21989 p50=29.0 p99=53.9 p999=182.1 max=529.1
+WINFSP TRANSACT mode=batch-direct-64k-section-handle-wait call n=20000 p50=29.4 p99=51.4 p999=97.3 max=454.8 | client open n=21989 p50=28.9 p99=50.9 p999=92.3 max=485.5
+WINFSP TRANSACT mode=batch-direct-64k-section-two-event-wait call n=20000 p50=29.4 p99=50.7 p999=83.0 max=190.7 | client open n=21989 p50=28.9 p99=49.8 p999=82.7 max=186.2
+test host::transact_bench::transact_cost ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 97 filtered out; finished in 6.54s
+
+## run 4 exit 0
+## run 5
+    Finished `release` profile [optimized] target(s) in 0.11s
+     Running unittests src\lib.rs (target\release\deps\slates_bridge_winfsp-0f7bef3cd5629080.exe)
+
+running 1 test
+WINFSP TRANSACT batch output 16384 bytes: Err(122) (Win32 122 is the driver's STATUS_BUFFER_TOO_SMALL)
+WINFSP TRANSACT batch output 4096 bytes: Err(122) (Win32 122 is the driver's STATUS_BUFFER_TOO_SMALL)
+WINFSP TRANSACT mode=single-buffered-16320 call n=20000 p50=29.8 p99=53.6 p999=98.8 max=271.8 | client open n=21989 p50=29.4 p99=55.2 p999=102.3 max=508.7
+WINFSP TRANSACT mode=batch-direct-64k-private call n=20000 p50=29.6 p99=53.8 p999=90.0 max=475.0 | client open n=21990 p50=29.1 p99=53.5 p999=89.0 max=530.5
+WINFSP TRANSACT mode=batch-direct-64k-section call n=20000 p50=29.5 p99=52.6 p999=86.6 max=532.2 | client open n=21989 p50=29.0 p99=51.7 p999=88.3 max=767.5
+WINFSP TRANSACT mode=batch-direct-128k-section call n=20000 p50=30.2 p99=52.7 p999=83.7 max=283.6 | client open n=21989 p50=29.7 p99=52.4 p999=85.8 max=1186.2
+WINFSP TRANSACT mode=batch-direct-256k-section call n=20000 p50=31.4 p99=56.0 p999=92.1 max=356.8 | client open n=21989 p50=30.9 p99=55.7 p999=89.9 max=377.9
+WINFSP TRANSACT mode=single-buffered-16320-handle-wait call n=20000 p50=29.6 p99=52.4 p999=89.3 max=316.7 | client open n=21989 p50=29.2 p99=51.9 p999=98.1 max=344.6
+WINFSP TRANSACT mode=batch-direct-64k-section-handle-wait call n=20000 p50=29.4 p99=53.2 p999=84.3 max=348.0 | client open n=21989 p50=28.9 p99=53.7 p999=90.8 max=357.7
+WINFSP TRANSACT mode=batch-direct-64k-section-two-event-wait call n=20000 p50=29.6 p99=54.2 p999=83.9 max=135.0 | client open n=21989 p50=29.1 p99=53.7 p999=86.3 max=160.0
+test host::transact_bench::transact_cost ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 97 filtered out; finished in 6.60s
+
+## run 5 exit 0
