@@ -21,10 +21,11 @@ slates-wire = { workspace = true }
 # a purge's write (A-190).
 slates-machine = { workspace = true }
 windows-sys = { workspace = true, features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_SystemServices"] }
+# The purge client's process (A-190 moved out of the daemon, §4.6): its spawn into a kill-on-close job and its pipe.
+slates-ipc = { workspace = true }
 
 [target.'cfg(windows)'.dev-dependencies]
 slates-anchor = { workspace = true }
-slates-ipc = { workspace = true }
 slates-db = { workspace = true }
 
 [lints]

@@ -115,6 +115,15 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   #[cfg(windows)]
   slates_ipc::process_access::confine_current_holder()
     .map_err(|error| failed("process handle authority", error))?;
+  // The WinFsp mounts' purge client is this binary's own role in a child process (§4.6: no daemon thread opens a
+  // volume it serves).
+  #[cfg(windows)]
+  slates_bridge_winfsp::purge_client::install(slates_bridge_winfsp::purge_client::Program {
+    program: std::env::current_exe()
+      .map_err(|error| failed("the purge client's program", error))?
+      .into_os_string(),
+    args: vec![slates_bridge_winfsp::purge_client::ROLE_ARG.into()],
+  });
   // Before anything shows the process: its own name, not the kernel's `exe` from the anchor's restart (A-145).
   #[cfg(target_os = "linux")]
   name_this_process();

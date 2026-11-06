@@ -18,18 +18,25 @@ const BOUND: usize = 2;
 /// Format: the intent event follows the control completion event in WaitForMultipleObjects' array.
 const INTENT_READY: u32 = WAIT_OBJECT_0 + 1;
 
+/// One purge in progress: the purge, and the process id of the client making its opens (`crate::purge_client`).
+#[derive(Clone, Debug)]
+pub(crate) struct Intent {
+  pub(crate) purge: Purge,
+  pub(crate) client: u32,
+}
+
 pub(crate) struct Sender {
-  messages: SyncSender<Option<Purge>>,
+  messages: SyncSender<Option<Intent>>,
   event: OwnedHandle,
 }
 
 pub(crate) struct Intents {
-  messages: Receiver<Option<Purge>>,
+  messages: Receiver<Option<Intent>>,
   event: OwnedHandle,
   /// The one completion event of this receiver's control transactions, which run one at a time. Every transaction
   /// names it in its OVERLAPPED, and the system clears it as each begins, so none makes its own (A-212).
   completed: OwnedHandle,
-  current: Option<Purge>,
+  current: Option<Intent>,
 }
 
 /// A new unnamed event, initially unsignalled, its reset automatic or by hand as `manual_reset` says.
@@ -69,7 +76,7 @@ pub(crate) fn channel() -> Result<(Sender, Intents), WinFspError> {
 }
 
 impl Sender {
-  pub(crate) fn publish(&self, intent: Option<Purge>) -> Result<(), WinFspError> {
+  pub(crate) fn publish(&self, intent: Option<Intent>) -> Result<(), WinFspError> {
     match self.messages.try_send(intent) {
       Ok(()) => {}
       Err(TrySendError::Full(intent)) => {
@@ -96,7 +103,7 @@ impl Sender {
 }
 
 impl Intents {
-  pub(crate) fn current(&self) -> Option<&Purge> {
+  pub(crate) fn current(&self) -> Option<&Intent> {
     self.current.as_ref()
   }
 
@@ -165,11 +172,14 @@ mod tests {
       let (sender, mut intents) = channel().unwrap();
       let publisher = scope.spawn(move || {
         for _ in 0..PURGES {
-          sender.publish(Some(Purge {
-            object: slates_bridge_core::ObjectId::new(1, 0),
-            path: "\\file".to_owned(),
-            offset: 0,
-            len: 4096,
+          sender.publish(Some(Intent {
+            purge: Purge {
+              object: slates_bridge_core::ObjectId::new(1, 0),
+              path: "\\file".to_owned(),
+              offset: 0,
+              len: 4096,
+            },
+            client: std::process::id(),
           }))?;
           sender.publish(None)?;
         }
