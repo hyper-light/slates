@@ -56,6 +56,12 @@ const EXIT_FAILED: u8 = 4;
 
 fn main() -> ExitCode {
   let arguments: Vec<String> = std::env::args().skip(1).collect();
+  // The daemon's WinFsp purge client, a role only a daemon starts (no daemon thread opens its own volume, §4.6).
+  #[cfg(windows)]
+  if arguments.first().map(String::as_str) == Some(slates_bridge_winfsp::purge_client::ROLE_ARG) {
+    let code = slates_bridge_winfsp::purge_client::serve_from_env();
+    return ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX));
+  }
   let command = match args::parse(&arguments) {
     Ok(command) => command,
     Err(ParseError::Help) => {

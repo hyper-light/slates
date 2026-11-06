@@ -57,6 +57,8 @@ pub mod notify;
 pub mod opens;
 pub mod purge;
 #[cfg(windows)]
+pub mod purge_client;
+#[cfg(windows)]
 mod purge_intents;
 #[cfg(windows)]
 mod purge_token;
