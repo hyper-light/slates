@@ -7265,7 +7265,10 @@ write, or write-and-rename) composes to one `Delete` of the base length and one 
 new bytes. Composition of declared operations is arithmetic on facts; comparing file states to
 reconstruct operations is inference and does not exist in slates. The same journal yields the
 same ops document on every platform (its identity is the test). Paths under the work volume's
-excluded subtrees are left out; the filter id is part of the increment identity.
+excluded subtrees are left out; the filter id is part of the increment identity. The composition
+needs every record since the base: when the journal's retention has dropped any of them, the
+derivation is refused `JournalIncomplete` (naming the sequence it needed and the oldest the journal
+holds), never composed from what is left (`Volume::records_since`; 2026-11-05).
 
 **Position mapping.** Through the canonical deltas in (base, head], one direction, per path: an
 intervening size-changing operation at position p with delta d shifts the increment's ranges

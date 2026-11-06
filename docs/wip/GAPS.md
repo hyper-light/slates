@@ -11907,7 +11907,14 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
   daemon's journals start at a page and ended at 4,096–16,896 bytes on the measured workloads (BENCHMARKS, A-157), so
   the copy is small there. A reader lagging by 100,000 records would make one append copy 17.6 MB. The fix is a ring
   that grows a segment at a time, the shape of `slates_image::Segments` with a front that pops.
-- **The deriver reads the journal with no completeness check (open, 2026-10-23; latent).** `Volume::records_since`
+- **The deriver reads the journal with no completeness check (open, 2026-10-23; latent; fixed 2026-11-05,
+  bug-sweep).** `Volume::records_since` now refuses `VfsError::JournalIncomplete { needed, oldest }` when the journal's
+  oldest record is past the one after the snapshot's sequence. `a_derivation_over_a_journal_that_dropped_part_of_the_work_is_refused`
+  (`crates/vfs/tests/derive.rs`) was red first: a 4-record journal under 16 creates derived a document of 3 files with no
+  error. It is green after the fix, and its 1 MiB-journal control still names all 16. The other journal readers already
+  check (`unchanged_since`, the FUSE and NFS write-back cursors in `volume_bridge.rs` and `nfs_writeback.rs`). The
+  snapshot is still not held as a reader, so a derivation over a long work is refused rather than kept possible; that
+  stays owed with the deriver's wiring. The record as found: `Volume::records_since`
   returns the records retained after a snapshot's sequence. When retention has dropped some of them, the ops document
   (§4.16) is derived from part of the work without a word. No production path calls the deriver yet (tests only). A
   journal that keeps only what live readers owe (A-157) makes the gap wider. A snapshot is not a reader, so its records
