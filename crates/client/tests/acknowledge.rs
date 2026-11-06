@@ -304,87 +304,11 @@ fn an_acknowledgement_never_covers_a_request_still_awaited() {
   let rendezvous = HeldRendezvous::hold(&instance).unwrap();
   let first = daemon_over(&profile, &config, (&segment, &rendezvous));
   let started = Instant::now();
-  let mut client = loop {
-    match Client::connect(&instance, deadlines()) {
-      Ok(client) => break client,
-      Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
-        if started.elapsed() < HOLD.saturating_mul(10) =>
-      {
-        std::thread::yield_now();
-      }
-      Err(e) => panic!("{e}"),
-    }
-  };
-  let mine = serving_shard(&first, client.client_id());
-  let other_index = 1 - mine;
-  let other = first.shards()[other_index];
-  let hold = first
-    .observation(Some(other), OBSERVE_BUDGET_NS, move |_: &mut ShardState| {
-      HELD_AWAITED.store(true, Ordering::Release);
-      // The held shard's thread does nothing else for the hold: the create it owns waits.
-      #[allow(clippy::disallowed_methods)]
-      std::thread::sleep(HOLD);
-    })
-    .unwrap();
-  let holder = std::thread::spawn(move || hold.wait());
-  while !HELD_AWAITED.load(Ordering::Acquire) {
-    assert!(
-      started.elapsed() < HOLD.saturating_mul(10),
-      "the hold began"
-    );
-    std::thread::yield_now();
-  }
-  let awaited_name = name_owned_by(other_index, "awaited");
-  let awaited_body = create_body(&awaited_name);
-  let awaited = client.begin(&awaited_body).unwrap().word();
-  for tag in ["mine-a", "mine-b"] {
-    let word = client
-      .begin(&create_body(&name_owned_by(mine, tag)))
-      .unwrap()
-      .word();
-    assert!(
-      matches!(take_reply(&mut client, word), Ok(ReplyBody::Created { .. })),
-      "the own shard's create is answered inside the hold"
-    );
-    client.begin_ack_if_due().unwrap();
-  }
-  holder.join().unwrap().unwrap();
-  // Another client sees the held create applied, so the first daemon served it before it stops.
-  let mut observer = Client::connect(&instance, deadlines()).unwrap();
-  let applied = loop {
-    if let Some(volume) = observer
-      .list()
-      .unwrap()
-      .into_iter()
-      .find(|volume| volume.name == awaited_name)
-    {
-      break volume.id;
-    }
-    assert!(
-      started.elapsed() < HOLD.saturating_mul(10),
-      "the held create is applied"
-    );
-  };
-  // Every shard has served what was sent before this (a scatter reaches each), the acknowledgement's release too.
-  observer.list().unwrap();
-  drop(observer);
+  let mut client = connect_within(&instance, started);
+  let (awaited, applied) = acknowledge_past_a_held_create(&first, &mut client, started);
   first.stop();
   let second = daemon_over(&profile, &config, (&segment, &rendezvous));
-  while !client.try_reconnect().unwrap() {
-    assert!(
-      started.elapsed() < HOLD.saturating_mul(20),
-      "the client reconnects"
-    );
-    std::thread::yield_now();
-  }
-  while !client.resend_awaited(awaited).unwrap() {
-    assert!(
-      started.elapsed() < HOLD.saturating_mul(20),
-      "the resend goes"
-    );
-    std::thread::yield_now();
-  }
-  let reply = take_reply(&mut client, awaited);
+  let reply = resend_after_restart(&mut client, awaited, started);
   eprintln!(
     "acknowledged up to {}, the awaited create's resend answered {reply:?}",
     client.acknowledged()
@@ -396,4 +320,125 @@ fn an_acknowledgement_never_covers_a_request_still_awaited() {
   );
   drop(client);
   second.stop();
+}
+
+/// A client of `instance`, retrying while the daemon comes up.
+fn connect_within(instance: &str, started: Instant) -> Client {
+  loop {
+    match Client::connect(instance, deadlines()) {
+      Ok(client) => return client,
+      Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
+        if started.elapsed() < HOLD.saturating_mul(10) =>
+      {
+        std::thread::yield_now();
+      }
+      Err(e) => panic!("{e}"),
+    }
+  }
+}
+
+/// Holds the shard that does not serve `client`, begins a create it owns, takes two own-shard creates' replies and
+/// sends the acknowledgement the client finds due; once the hold ends and another client sees the held create applied,
+/// returns the held create's word (its reply never taken) and the volume it made.
+fn acknowledge_past_a_held_create(
+  daemon: &Daemon,
+  client: &mut Client,
+  started: Instant,
+) -> (u64, VolumeId) {
+  let mine = serving_shard(daemon, client.client_id());
+  let other_index = 1 - mine;
+  let hold = daemon
+    .observation(
+      daemon.shards().get(other_index).copied(),
+      OBSERVE_BUDGET_NS,
+      move |_: &mut ShardState| {
+        HELD_AWAITED.store(true, Ordering::Release);
+        // The held shard's thread does nothing else for the hold: the create it owns waits.
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(HOLD);
+      },
+    )
+    .unwrap();
+  let holder = std::thread::spawn(move || hold.wait());
+  while !HELD_AWAITED.load(Ordering::Acquire) {
+    assert!(
+      started.elapsed() < HOLD.saturating_mul(10),
+      "the hold began"
+    );
+    std::thread::yield_now();
+  }
+  let awaited_name = name_owned_by(other_index, "awaited");
+  let awaited = client.begin(&create_body(&awaited_name)).unwrap().word();
+  for tag in ["mine-a", "mine-b"] {
+    let word = client
+      .begin(&create_body(&name_owned_by(mine, tag)))
+      .unwrap()
+      .word();
+    assert!(
+      matches!(take_reply(client, word), Ok(ReplyBody::Created { .. })),
+      "the own shard's create is answered inside the hold"
+    );
+    client.begin_ack_if_due().unwrap();
+  }
+  holder.join().unwrap().unwrap();
+  (
+    awaited,
+    listed_volume(&daemon_instance(daemon), &awaited_name, started),
+  )
+}
+
+/// The instance a daemon serves.
+fn daemon_instance(daemon: &Daemon) -> String {
+  daemon.instance().to_owned()
+}
+
+/// The id of the volume named `name`, once another client of `instance` lists it; then one more listing, so every
+/// shard has served what was sent before it (a scatter reaches each), the acknowledgement's release too.
+fn listed_volume(instance: &str, name: &str, started: Instant) -> VolumeId {
+  let mut observer = Client::connect(instance, deadlines()).unwrap();
+  let id = loop {
+    if let Some(volume) = observer
+      .list()
+      .unwrap()
+      .into_iter()
+      .find(|volume| volume.name == name)
+    {
+      break volume.id;
+    }
+    assert!(
+      started.elapsed() < HOLD.saturating_mul(10),
+      "the held create is applied"
+    );
+  };
+  observer.list().unwrap();
+  id
+}
+
+/// Reconnects `client` under its id to the restarted daemon and resends `awaited` under its own id: its reply.
+fn resend_after_restart(
+  client: &mut Client,
+  awaited: u64,
+  started: Instant,
+) -> Result<ReplyBody, ClientError> {
+  while !client
+    .try_reconnect()
+    .unwrap_or_else(|e| panic!("reconnect: {e}"))
+  {
+    assert!(
+      started.elapsed() < HOLD.saturating_mul(20),
+      "the client reconnects"
+    );
+    std::thread::yield_now();
+  }
+  while !client
+    .resend_awaited(awaited)
+    .unwrap_or_else(|e| panic!("resend: {e}"))
+  {
+    assert!(
+      started.elapsed() < HOLD.saturating_mul(20),
+      "the resend goes"
+    );
+    std::thread::yield_now();
+  }
+  take_reply(client, awaited)
 }
