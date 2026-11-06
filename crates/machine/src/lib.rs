@@ -53,6 +53,7 @@ pub mod probes;
 pub mod profile;
 pub mod segment;
 pub mod stats;
+pub mod switches;
 pub mod wake;
 
 pub use derived::Derived;

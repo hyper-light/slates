@@ -32,8 +32,11 @@ use crate::{derived, probes, wake};
 /// (docs/bugs/2026-09-29-every-daemon-under-a-cpu-quota-pinned-its-shard-to-cpu-1.md). 4 (2026-11-05): each
 /// core names the physical core it is a hardware thread of ([`crate::facts::CoreFacts::physical`]), and the
 /// placement counts shards in physical cores, as §4.1 says (A-208); version 3 counted every hardware thread.
+/// 5 (2026-11-05): the wake confirms its waiter asleep on Windows too, by its cycle count, and counts the wakes
+/// it dropped because the waiter had run before its kick ([`crate::wake::WakeLatency::woke_running`], A-223);
+/// version 4's Windows wake let the waiter's announcement stand in.
 /// Format: the version this build writes and the only one it reads.
-pub const PROFILE_VERSION: u32 = 4;
+pub const PROFILE_VERSION: u32 = 5;
 
 /// How to take a profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

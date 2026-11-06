@@ -921,6 +921,16 @@ A microbenchmark exceeding its wall-time bound: Degraded, widened interval recor
 **Refusals.** `ProfileUnavailable` (segment unreadable), `ProfileStale` (identity mismatch while a
 volume requires a matching profile), `MeasurementTimeout`.
 
+> **Status (2026-11-06, A-223: the Windows wake is a confirmed sleeper's too).** Windows has no per-thread wait
+> state short of a system-wide snapshot. So the probe's waker kicks a waiter only once it has announced its park and
+> two reads of its cycle count (`QueryThreadCycleTime`) agree. It drops and counts (`WakeLatency::woke_running`) a wake
+> whose count moved again before the kick, or across whose wait the waiter's own context-switch count
+> (`ReadThreadProfilingData`, `slates_machine::switches`) did not move. The cycle count alone is no proof: a spinning
+> thread read the same twice in 2.4–18 % of back-to-back pairs on CI's x86_64 runner. The shards' online estimate drops
+> a Windows park that never switched out by the same count, as Linux does by its voluntary switches. Before this, the
+> announcement stood in: the probe read 0.14–0.85 µs, and the window, quantum and spin derived from it were a hundred
+> times too small. Now it reads 6.0–9.1 µs on CI's quiet runners. The idle window this now scales is GAPS' open entry.
+
 > **Status (2026-09-25, the wake probe measures one event and reports its mean).** The probe timed every park/unpark round trip, so it mixed an on-CPU handoff (about 0.45 µs, the waiter still running or on the waker's CPU) with a real wake (about 10 µs); thread placement holds for a run, so runs split between the two (median 416 ns or 10,041 ns on the same two container cores, a minute apart), and it stopped on the median's interval while its consumers read the p99 — often the maximum of 64 samples (667 ns to 511,042 ns). Now the waiter is confirmed asleep (Linux `/proc` state, macOS `thread_info`; Windows the waiter's announcement, reported unconfirmed), the pair is placed as production is (the control core waking a shard core where the OS pins; unpinned on macOS, with the same-CPU share recorded), the probe converges the mean — the spin-then-park rule's threshold is the expected cost of parking, and a spinning waiter on the same pinned cores never saw the tail (p99 ≤ 209 ns) while a parked one did (285–639 µs) — and five fresh-thread rounds are compared by their medians (a disagreement lists the probe degraded, `wake.rounds`). Measured on a quiet host: the median held at 8.9–10.8 µs over ten container runs and the mean at 15.1–17.6 µs on four CPUs; macOS's mean held at 2.03–2.49 µs. The spin window, the step quantum and the timer tick now read the mean, the runtime's inbound ring the p99 at its overflow target, the guest credit's kick round trip the mean; a profile of another format version is refused by name, and a daemon handed one by an older anchor measures its own. The boot mean is quick on a virtual machine (±20–30 % in 250 ms at a coefficient of variation of five to seven); since A-31 (2026-09-25) it is only the prior of each shard's and each client's online estimate, refined from the confirmed wakes they pay (§4.3 and §4.7 status), and the long-step count attributes each long poll to its task or to the host rather than reading wall time. Record: `docs/bugs/2026-09-22-wake-probe-mixes-two-events-and-reports-an-unconverged-tail.md`.
 
 **Derived constants.** Spin window = wake_ns.mean (Karlin: the 2-competitive threshold is the
@@ -13097,6 +13107,22 @@ support), GAPS, `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-sca
 - **What it does not change.** The bound (`2 × slots`), `AcknowledgementOwed`, the client's cadence and its watermark,
   and an acknowledgement's own refusal on the client's shard, which is still its reply.
 - **Next lever (C, GAPS):** carry the watermark in every request, so no separate acknowledgement is needed at all.
+
+### A-223 — The Windows wake estimate confirms its sleeper (accepted and built 2026-11-06)
+Applied in the same change to: §4.1 (a status note), §4.3 (the online estimate's unslept filter on Windows), GAPS,
+`crates/machine` (`switches.rs`, `wake.rs`, profile format 5), `crates/rt` (`attribution.rs`), the workspace's
+`windows-sys` features, `unsafe-budget.toml`, and the bug record of 2026-11-06.
+- **The defect.** On Windows both wake measurements took a handoff for a wake. The probe trusted the waiter's
+  announcement; the shards learned kicks that landed before their thread blocked. jupiter's shards read 0.62–0.83 µs.
+  Their owner parked during 221–546 of 2,000 single-client creates, and 20–21 of each run's 21 slowest creates had
+  their owner park during the create.
+- **The decision.** The waiter's own context-switch count is the Windows proof of a sleep, per wait, at 14–49 ns a
+  read. The cycle count of the waiter is the waker's gate before a kick, which keeps the dropped wakes few (0–2 a
+  profile). The supervisor's plan named the cycle count; CI showed it is not proof alone, so both are used.
+- **Measured.** At two shards on both CI Windows runners, owner parks per 1,000 single-client creates fell to 0–1, and
+  the quiet single-client p99 fell by 4–32 %. The 8-client p99 moved within 7 %. CPU with no client stayed 0–0.005 core.
+- **Not decided here.** The idle window's ratio to the wake now costs 0.21–0.38 core under a client paced at 1 ms, and
+  follows a loaded shard's run-queue wait. GAPS holds it open.
 
 ### A-218 — The macOS idle spin's policy (measured and rejected 2026-11-05; main's spin stays)
 Applied in the same change to: §4.3 (its "Loop" paragraph: on macOS the zero-timeout harvest sleeps about 15 µs, kept),

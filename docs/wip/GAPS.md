@@ -1,5 +1,23 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **The Windows wake estimate (A-223, found 2026-11-05 on jupiter, fixed 2026-11-06; the idle window it scales, open).**
+> The boot probe let a Windows waiter's announcement stand in for its sleep, and the shards' online estimate learned
+> kicks that met a thread not yet blocked. Both measured a handoff, 0.14–0.85 µs, so the idle window (100 times it) was
+> 14–80 µs and owner shards parked between a single client's creates. Now the probe kicks only once the waiter's cycle
+> count stands still, and it drops a wake its waiter's own switch count shows it never slept through. The shards judge
+> their parks by that switch count too (`slates_machine::switches`; the bug record of 2026-11-06).
+> - **Measured on CI at two shards** (`diag-liveness-2`, three quiet runs a runner): owner parks per 1,000
+>   single-client creates fell from 30–88 to 0–1 per shard on x86_64 and from 2–7 to 0–1 on arm64. The single-client
+>   p99 went from 45.5–49.3 to 33.3–37.7 µs (x86_64) and from 32.8–35.0 to 28.9–31.4 µs (arm64). The 8-client p99 stayed
+>   within 7 % (495–503 against 511–519 µs; 474–494 against 499–531 µs). The probe reads 7.1–9.1 µs, confirmed.
+> - **Open: the idle window's rule.** `IDLE_WINDOW_RATIO` (100, §5) now multiplies a real wake: 0.71–0.91 ms at boot.
+>   - A client paced at 1 ms keeps its shards spinning: 0.21–0.38 core of CPU, against 0.03–0.06 on main. With no
+>     client, 0–0.005 core either way.
+>   - Under two spinners a logical CPU, each shard's estimate counts the run-queue wait its own spinning causes
+>     (0.2–6.1 ms), and the window follows it to hundreds of milliseconds.
+>   - The rule needs a measured bound before the spin's cost is acceptable. A measured floor for the window was the
+>     other candidate the supervisor named; it is not built.
+
 > **The anchor kills live daemons on a busy machine (found 2026-11-06, audit step 7; open, to be assigned).** Under the
 > A/B bar's load, two spinners a logical CPU (8 on CI's 4-CPU Windows runners), the anchor killed daemons that were
 > alive and serving because their heartbeat lapsed its 1,000 ms liveness budget. A busy machine is the normal case

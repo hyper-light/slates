@@ -1385,9 +1385,9 @@ impl ShardContext {
 
   /// Folds a park's measured wake into the online estimate (§4.3): the kick-to-running latency of a park
   /// a kick ended asleep ([`Woken::latency_ns`]) — the event the boot probe times, a sleeper woken. A
-  /// stamp from before the park's announcement is counted stale; one from the park's setup, or (Linux) a
-  /// wait across which the thread never switched out (`switches_before_wait` against now), found the
-  /// shard awake and is counted unslept; both are dropped. A park a timer or a completion ended teaches
+  /// stamp from before the park's announcement is counted stale; one from the park's setup, or (Linux, and
+  /// Windows since A-223) a wait across which the thread never switched out (`switches_before_wait` against
+  /// now), found the shard awake and is counted unslept; both are dropped. A park a timer or a completion ended teaches
   /// nothing. Only a tracking shard on a real clock learns: the simulation's clock is not the kicker's.
   fn note_wake(&self, entry: &Entry, woken: Woken, switches_before_wait: Option<u64>) {
     let Some(mut estimate) = self.wake.get() else {
