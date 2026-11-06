@@ -35,7 +35,7 @@ const POLL_MS: u64 = 20;
 /// Shape: shards for the test daemon.
 const SHARDS: &str = "2";
 /// Shape: shards for a direct-map test's daemon ([`start_one_shard_anchor`]).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const ONE_SHARD: &str = "1";
 /// Shape: exit code 3 — the daemon was unavailable (the client never reached it).
 const EXIT_UNAVAILABLE: i32 = 3;
@@ -157,7 +157,7 @@ fn start_anchor_with_environment(
 /// handed to a client of any shard since A-188 (`crates/client/tests/client.rs`,
 /// `a_client_of_another_shard_maps_a_file_read_and_write`); before it, which shard a container's client landed on, its
 /// id's residue, decided whether it was handed one.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn start_one_shard_anchor(instance: &str) -> AnchorProcess {
   start_anchor_of(instance, &[], ONE_SHARD)
 }
@@ -11083,16 +11083,16 @@ fn a_command_whose_output_reader_went_away_fails_without_a_panic() {
 
 /// Shape: how long a refusal of a path on the daemon's own mount may take to come back (A-227): the verb's own work and
 /// one round trip, far under a client's stall deadline, so a daemon waiting on its own mount fails here, not later.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const OWN_MOUNT_ANSWER: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Shape: the cadence of [`run_within`]'s polls of its child.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const RUN_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Runs a client verb as [`run`] does, but gives up after `limit`: `None` (the client killed and reaped) when it had not
 /// answered by then, for a verb that would wait on a daemon blocked on itself.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_within(
   instance: &str,
   args: &[&str],
@@ -11124,14 +11124,44 @@ fn run_within(
   ))
 }
 
+/// Whether this host runs the own-mount tests (A-227): a real kernel mount the daemon serves, FUSE on Linux and the
+/// loopback NFS mount on macOS; skipped loudly otherwise.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn own_mount_tests_run() -> bool {
+  #[cfg(target_os = "linux")]
+  {
+    linux_fuse_mount_runs()
+  }
+  #[cfg(target_os = "macos")]
+  {
+    if std::env::var_os("SLATES_TEST_CLI").is_none() {
+      eprintln!(
+        "skipping the own-mount flow: set SLATES_TEST_CLI=1 to run it (a real kernel mount)"
+      );
+      return false;
+    }
+    mount_nfs_available()
+  }
+}
+
+/// Mounts volume `id` at `path` the host's way, checked: FUSE on Linux, the loopback NFS mount on macOS.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn own_mount_and_check(instance: &str, id: &str, path: &str) {
+  #[cfg(target_os = "linux")]
+  fuse_mount_and_check(instance, id, path);
+  #[cfg(target_os = "macos")]
+  mount_and_check(instance, id, path);
+}
+
 /// A-227, the base plane (§4.6: no daemon thread opens a path on a volume the daemon serves). Do: on a one-shard daemon,
-/// mount a volume through FUSE, make a directory in it, and create a second volume with that directory as its base.
-/// Expect: the create refused at once (exit 1, `OwnMount`), nothing created, and the daemon still answering. Before
-/// A-227 the shard opened the base through its own mount and waited on the request only it could answer.
-#[cfg(target_os = "linux")]
+/// mount a volume (FUSE on Linux, NFS on macOS), make a directory in it, and create a second volume with that directory
+/// as its base. Expect: the create refused at once (exit 1, `OwnMount`), nothing created, and the daemon still
+/// answering. Before A-227 the shard opened the base through its own mount and waited on the request only it could
+/// answer.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_base_on_one_of_the_daemons_own_mounts_is_refused_before_any_open() {
-  if !linux_fuse_mount_runs() {
+  if !own_mount_tests_run() {
     return;
   }
   let instance = format!("cli-ownbase-{}", std::process::id());
@@ -11145,7 +11175,7 @@ fn a_base_on_one_of_the_daemons_own_mounts_is_refused_before_any_open() {
   let mount = MountPoint {
     path: fresh_mount_point(),
   };
-  fuse_mount_and_check(&instance, &id, &mount.path);
+  own_mount_and_check(&instance, &id, &mount.path);
   let base = format!("{}/project", mount.path);
   shell(&format!("mkdir {base}"));
   let created = [
@@ -11177,13 +11207,13 @@ fn a_base_on_one_of_the_daemons_own_mounts_is_refused_before_any_open() {
 }
 
 /// A-227, a landing's target (§4.6: no daemon thread opens a path on a volume the daemon serves). Do: on a one-shard
-/// daemon, mount a volume through FUSE, make a directory in it, and present a landing of a second volume into that
-/// directory. Expect: refused at once (exit 1, `OwnMount`), the directory untouched, and the daemon still answering.
-/// Before A-227 the shard walked the target through its own mount and waited on itself.
-#[cfg(target_os = "linux")]
+/// daemon, mount a volume (FUSE on Linux, NFS on macOS), make a directory in it, and present a landing of a second
+/// volume into that directory. Expect: refused at once (exit 1, `OwnMount`), the directory untouched, and the daemon
+/// still answering. Before A-227 the shard walked the target through its own mount and waited on itself.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_landing_target_on_one_of_the_daemons_own_mounts_is_refused_before_any_open() {
-  if !linux_fuse_mount_runs() {
+  if !own_mount_tests_run() {
     return;
   }
   let instance = format!("cli-ownland-{}", std::process::id());
@@ -11198,7 +11228,7 @@ fn a_landing_target_on_one_of_the_daemons_own_mounts_is_refused_before_any_open(
   let mount = MountPoint {
     path: fresh_mount_point(),
   };
-  fuse_mount_and_check(&instance, &mounted, &mount.path);
+  own_mount_and_check(&instance, &mounted, &mount.path);
   let target = format!("{}/target", mount.path);
   shell(&format!("mkdir {target}"));
   let landing = ["land", &landed, &target, "--json"];
@@ -11268,4 +11298,171 @@ fn a_fuse_mount_point_on_one_of_the_daemons_own_mounts_is_refused_before_any_ope
   assert!(mountinfo_at(&point).is_none(), "nothing is mounted there");
   let (code, _, err) = run(&instance, &["volume", "list"]);
   assert_eq!(code, 0, "the daemon still answers: {err}");
+}
+
+/// Stops the instance's daemon in order (`SIGTERM`: it drains and exits, the anchor holding its kernel mounts and
+/// connections, and starting a successor), returning the stopped daemon's pid. No daemon is killed under a mount.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stop_in_order(instance: &str) -> u32 {
+  let stopped = daemon_pid(instance).expect("the daemon answers");
+  assert!(
+    Command::new("kill")
+      .args(["-TERM", &stopped.to_string()])
+      .status()
+      .unwrap()
+      .success(),
+    "SIGTERM sent"
+  );
+  stopped
+}
+
+/// [`stop_in_order`], then the anchor's successor's pid once it answers.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn restart_in_order(instance: &str) -> u32 {
+  let stopped = stop_in_order(instance);
+  await_daemon(instance, Some(stopped), &[])
+}
+
+/// A-227, a restart (§4.6: no daemon thread opens a path on a volume the daemon serves, its predecessor's mounts
+/// included). Do: on a one-shard daemon, mount a volume (FUSE on Linux, NFS on macOS) and make a directory in it; stop
+/// the daemon in order under the live mount and wait for the anchor's successor; then create a second volume with that
+/// directory as its base. Expect: refused at once as the daemon's own mount (exit 1, `OwnMount`): the successor
+/// learned the mount it kept from its catalog before it served. Then the mount still serves, and the daemon answers.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_base_on_a_mount_the_daemon_kept_across_a_restart_is_refused_by_kind() {
+  if !own_mount_tests_run() {
+    return;
+  }
+  let instance = format!("cli-ownkept-{}", std::process::id());
+  let _anchor = start_one_shard_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "kept", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  own_mount_and_check(&instance, &id, &mount.path);
+  let base = format!("{}/project", mount.path);
+  shell(&format!("mkdir {base}"));
+  restart_in_order(&instance);
+  let created = [
+    "volume",
+    "create",
+    "inner",
+    "--bounded",
+    "8MiB",
+    "--base",
+    &base,
+  ];
+  let Some((code, _, err)) = run_within(&instance, &created, OWN_MOUNT_ANSWER) else {
+    panic!(
+      "the successor did not answer a base on the mount it kept within {OWN_MOUNT_ANSWER:?}: it opened the base \
+       through its own mount and waits on itself"
+    );
+  };
+  assert_eq!(code, 1, "a base on the kept mount is refused: {err}");
+  assert!(
+    err.contains("OwnMount"),
+    "refused as the daemon's own mount: {err}"
+  );
+  assert_eq!(
+    shell(&format!("ls {}", mount.path)).trim(),
+    "project",
+    "the kept mount still serves"
+  );
+  let (code, out, err) = run(&instance, &["volume", "list"]);
+  assert_eq!(code, 0, "the daemon still answers: {err}");
+  assert!(!out.contains("inner"), "nothing was created: {out}");
+}
+
+/// Shape: how long a successor may take to answer after a restart whose recovery meets a kept mount (A-227): its start
+/// and one refusal, the same bound as one answer.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const KEPT_RECOVERY_ANSWER: Duration = OWN_MOUNT_ANSWER;
+
+/// A-227, recovery's reacquire (§4.6, §4.8): a base that a mount of the daemon's own came to cover is never entered when
+/// a successor reacquires it. Do: on a one-shard daemon, create a volume over an empty directory `D/project`, then mount
+/// a second volume over `D` (FUSE on Linux, NFS on macOS) and make `project` in it, so `D/project` is now the mount's;
+/// stop the daemon in order under the live mount. Expect: the successor answers within the bound, the first volume is
+/// not rebuilt and its log names the daemon's own mount, and the mount still serves. Before, the successor's one shard
+/// opened the base through the mount it had yet to serve again and waited on itself.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_base_a_kept_mount_covers_is_not_reacquired_through_it() {
+  if !own_mount_tests_run() {
+    return;
+  }
+  let instance = format!("cli-ownreacq-{}", std::process::id());
+  let (mut anchor, mut stderr) =
+    spawn_anchor_from(env!("CARGO_BIN_EXE_slates"), &instance, &[], ONE_SHARD);
+  await_serving(&mut stderr, &instance, false);
+  let (lines, forwarding) = forward_lines(stderr);
+  anchor.drain = Some(forwarding);
+  await_stable_daemon(&instance, true);
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let base = format!("{}/project", mount.path);
+  shell(&format!("mkdir {base}"));
+  let (code, _, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "covered",
+      "--bounded",
+      "8MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "cover", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let cover = value_of(&out, "id");
+  own_mount_and_check(&instance, &cover, &mount.path);
+  shell(&format!("mkdir {base}"));
+  let stopped = stop_in_order(&instance);
+  let started = Instant::now();
+  let mut log = Vec::new();
+  let refused = loop {
+    while let Ok(line) = lines.try_recv() {
+      log.push(line);
+    }
+    if let Some(line) = log
+      .iter()
+      .find(|line| line.contains("volume covered not rebuilt"))
+    {
+      break line.clone();
+    }
+    assert!(
+      started.elapsed() < START_WAIT + KEPT_RECOVERY_ANSWER,
+      "the successor never finished reacquiring the covered base: it opened it through the mount it kept and waits \
+       on itself"
+    );
+    pause();
+  };
+  assert!(
+    refused.contains("on a mount this daemon serves"),
+    "the covered base is refused as the daemon's own mount: {refused}"
+  );
+  let successor = await_daemon(&instance, Some(stopped), &[]);
+  assert_ne!(successor, stopped);
+  assert_eq!(
+    shell(&format!("ls {}", mount.path)).trim(),
+    "project",
+    "the kept mount still serves"
+  );
+  // The covered directory beneath the mount point, removed once the mount is gone, then the point itself.
+  let point = mount.path.clone();
+  drop(mount);
+  let _ = Command::new("rmdir").arg(&base).output();
+  let _ = Command::new("rmdir").arg(&point).output();
 }

@@ -136,19 +136,14 @@ fn target_component_refusal(
 }
 
 /// Refuses a target component on one of this daemon's own mounts before the walk enters it (A-227): on Linux the
-/// component is opened `O_PATH` and its mount compared (`slates_base::own_mounts`).
-#[cfg(target_os = "linux")]
+/// component is opened `O_PATH` and its mount compared; on macOS the kernel's path of `dir` with the component is
+/// compared with the kernel's mount point of each mount this daemon serves (`slates_base::own_mounts`).
 fn check_crossing(dir: BorrowedFd<'_>, name: &str) -> Result<(), TargetRefusal> {
   slates_base::own_mounts::check_child(dir, std::ffi::OsStr::new(name)).map_err(|error| match error
   {
     HostError::OwnMount(_) => TargetRefusal::OwnMount,
     other => TargetRefusal::Unavailable(other),
   })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn check_crossing(_dir: BorrowedFd<'_>, _name: &str) -> Result<(), TargetRefusal> {
-  Ok(())
 }
 
 /// Walks an absolute target path from `/` one component at a time (no `..`, no symlink: containment), checks

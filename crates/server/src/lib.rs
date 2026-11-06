@@ -61,6 +61,9 @@ mod fs_verbs;
 mod fuse;
 #[cfg(target_os = "linux")]
 mod fuse_hold;
+// The macOS NFS mounts this daemon serves, recorded as its own (A-227).
+#[cfg(target_os = "macos")]
+mod own_nfs;
 // A writable direct map's copy that outlives its daemon: held by the anchor, taken back by the successor (A-197).
 mod checkout;
 pub mod head;

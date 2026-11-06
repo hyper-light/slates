@@ -153,24 +153,13 @@ fn kind_of(file_type: FileType) -> HostKind {
   }
 }
 
-/// The base directory's descriptor. On Linux every component is walked first and none on a mount this daemon serves is
+/// The base directory's descriptor: every component is walked first and none that is a mount this daemon serves is
 /// entered (`crate::own_mounts`, A-227).
-#[cfg(target_os = "linux")]
 fn open_root_fd(path: &Path) -> Result<OwnedFd, HostError> {
   crate::own_mounts::open_checked_root(
     path,
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
   )
-}
-
-#[cfg(not(target_os = "linux"))]
-fn open_root_fd(path: &Path) -> Result<OwnedFd, HostError> {
-  rustix::fs::open(
-    path,
-    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-    Mode::empty(),
-  )
-  .map_err(refusal)
 }
 
 /// The mount id of a directory this host just opened, read once (A-227); zero where none is kept.
@@ -195,13 +184,15 @@ fn check_crossing(
   crate::own_mounts::check_child_in(dir, dir_mount, name.as_ref())
 }
 
-#[cfg(not(target_os = "linux"))]
+/// macOS names a crossing by the kernel's path of `dir` and the mount points of this daemon's own mounts, so the
+/// directory's mount (none kept) plays no part.
+#[cfg(target_os = "macos")]
 fn check_crossing(
-  _dir: BorrowedFd<'_>,
+  dir: BorrowedFd<'_>,
   _dir_mount: u64,
-  _name: &(impl AsRef<std::ffi::OsStr> + ?Sized),
+  name: &(impl AsRef<std::ffi::OsStr> + ?Sized),
 ) -> Result<(), HostError> {
-  Ok(())
+  crate::own_mounts::check_child(dir, name.as_ref())
 }
 
 /// Whether a listed entry can be a mount root: this daemon mounts only directories (`check_mount_point`), so only a

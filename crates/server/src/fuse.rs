@@ -43,6 +43,7 @@
 
 use std::collections::BTreeMap;
 
+use slates_base::own_mounts::Unrecorded;
 use slates_bridge_core::volume_bridge::new_handle_store;
 use slates_bridge_core::{AttachmentId, LostWrites, Rights, View, VolumeBridge};
 use slates_bridge_fuse::channel::{
@@ -184,27 +185,49 @@ impl OwnMountRecord {
     Self::of(mount_point, |source| own.as_deref() == Some(source))
   }
 
-  /// A mount this daemon adopts from its predecessor (A-61), which carries the predecessor's tag.
-  fn of_adopted(mount_point: &str) -> Result<Self, Refusal> {
-    Self::of(mount_point, |source| {
+  /// A mount a predecessor kept (A-61), which carries the predecessor's tag: learned as the shard starts.
+  fn of_kept(mount_point: &str) -> Result<Self, Unrecorded> {
+    slates_base::own_mounts::record_at(mount_point, |source| {
       source.starts_with(slates_base::own_mounts::SOURCE_PREFIX)
     })
+    .map(Self)
   }
 
   fn of(mount_point: &str, wanted: impl Fn(&str) -> bool) -> Result<Self, Refusal> {
-    let refused = |reason: String| Refusal::TargetUnavailable {
-      reason: format!("the FUSE mount at {mount_point} {reason}"),
-    };
-    let id = slates_base::own_mounts::mount_id_at(mount_point, wanted)
-      .ok_or_else(|| refused("is not in the kernel's mount table".to_owned()))?;
-    slates_base::own_mounts::record(id).map_err(|full| {
-      refused(format!(
-        "is past the {} mounts this daemon records as its own",
-        full.capacity
-      ))
-    })?;
-    Ok(Self(id))
+    slates_base::own_mounts::record_at(mount_point, wanted)
+      .map(Self)
+      .map_err(|why| own_refusal(why, mount_point))
   }
+}
+
+/// The refusal of a FUSE mount at `mount_point` this daemon could not record as its own.
+fn own_refusal(why: Unrecorded, mount_point: &str) -> Refusal {
+  Refusal::TargetUnavailable {
+    reason: format!("the FUSE mount at {mount_point} {why}"),
+  }
+}
+
+/// Learns the FUSE mounts a predecessor kept that this shard's catalog names and the kernel's table still holds,
+/// recorded as this daemon's own before the shard reacquires any base or resumes any landing (A-227); each mount's
+/// adoption takes its record ([`adopt_held`]). A record the table does not hold is a mount that went while no daemon
+/// ran. Refused at the set's bound, which is the most attachments the shards hold, so a start that meets it is refused
+/// rather than serve a mount it does not record.
+pub(crate) fn learn_kept(s: &mut ShardState) -> Result<(), Refusal> {
+  let mut learned = Vec::new();
+  for volume in s.db.partition().volumes() {
+    for record in s.db.partition().attachments_of(volume.id) {
+      let Some(point) = record.form.fuse_mount_point() else {
+        continue;
+      };
+      match OwnMountRecord::of_kept(point) {
+        Ok(own) => learned.push((record.id, own)),
+        Err(Unrecorded::NotMounted) => {}
+        Err(why @ Unrecorded::Full(_)) => return Err(own_refusal(why, point)),
+      }
+    }
+  }
+  s.learned_fuse.extend(learned);
+  Ok(())
 }
 
 impl Drop for OwnMountRecord {
@@ -1219,11 +1242,15 @@ pub(crate) fn adopt_held() {
   for (record, held) in kept {
     let _ = state::with_state_counted(move |s| adopt_one(s, record, held));
   }
+  // A kept mount no adoption took has no device served again: its requests fail, so it is no longer this daemon's.
+  let _ = state::with_state(|s| s.learned_fuse.clear());
 }
 
 /// Serves one kept mount again, or ends it.
 fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hold::HeldDevice) {
   let attachment = record.id;
+  // The mount's record, learned as the shard started (A-227): let go with any refusal below.
+  let learned = s.learned_fuse.remove(&attachment);
   let mount_point = record
     .form
     .fuse_mount_point()
@@ -1259,7 +1286,7 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hol
   s.attachments
     .set_coherence(registry, slates_bridge_core::CacheCoherence::Invalidated);
   s.attachments.set_owner(registry, attachment);
-  let Ok(own) = OwnMountRecord::of_adopted(&mount_point) else {
+  let Some(own) = learned else {
     s.attachments.revoke(registry);
     s.attachments.drain(registry);
     return end(s);

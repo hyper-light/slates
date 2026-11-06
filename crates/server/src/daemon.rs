@@ -733,6 +733,10 @@ impl Daemon {
           None
         },
       );
+      // This shard's learning of the mounts it keeps, taken before it starts so no crossing anywhere in the process is
+      // judged before the shard has recorded them (A-227).
+      #[cfg(unix)]
+      let learning = slates_base::own_mounts::learning(LIVENESS_BUDGET_NS);
       runtime.spawn_on(*shard, async move {
         // How long a shard's start takes (its recovery included) is in the boot log: the control loop's first call to
         // each shard queues behind it (GAPS, boot, 2026-10-05).
@@ -754,6 +758,8 @@ impl Daemon {
           (held, copies),
           #[cfg(windows)]
           windows_holds,
+          #[cfg(unix)]
+          learning,
         );
         let took_us = started.elapsed().as_micros();
         match outcome {
@@ -3112,6 +3118,7 @@ fn init_shard(
     Vec<crate::winfsp::InheritedMount>,
     Option<std::os::windows::io::OwnedHandle>,
   ),
+  #[cfg(unix)] learning: slates_base::own_mounts::Learning,
 ) -> Result<(), ServerError> {
   let (handoff, len) = handoff_of(env)?;
   let mut segment = AnchorSegment::attach(&handoff, len, identity)?;
@@ -3301,6 +3308,10 @@ fn init_shard(
     mount_attachments: std::collections::BTreeMap::new(),
     #[cfg(target_os = "linux")]
     fuse_mounts: std::collections::BTreeMap::new(),
+    #[cfg(target_os = "linux")]
+    learned_fuse: std::collections::BTreeMap::new(),
+    #[cfg(target_os = "macos")]
+    own_nfs_mounts: std::collections::BTreeMap::new(),
     #[cfg(windows)]
     winfsp_mounts: std::collections::BTreeMap::new(),
     #[cfg(windows)]
@@ -3440,6 +3451,15 @@ fn init_shard(
     fenced_greens: std::collections::BTreeMap::new(),
     pending_green_materializations: std::collections::BTreeMap::new(),
   };
+  // The mounts a predecessor kept that this partition's catalog names, recorded as this daemon's own before anything
+  // below reacquires a base or resumes a landing (A-227); then this shard's learning ends, and the process's crossing
+  // checks, which wait for every shard's, go on.
+  #[cfg(target_os = "linux")]
+  crate::fuse::learn_kept(&mut state).map_err(ServerError::Refused)?;
+  #[cfg(target_os = "macos")]
+  crate::own_nfs::learn(&mut state).map_err(ServerError::Refused)?;
+  #[cfg(unix)]
+  drop(learning);
   // The landing counter starts past every landing recovered with the partition (its records are
   // durable and the guard refuses a duplicate id), as the attachment counter does.
   state.landing.next_landing = verbs::next_landing_counter(state.db.partition());

@@ -185,6 +185,7 @@ pub(crate) struct WinFspMount {
 
 /// A WinFsp volume's id in the process's set of its own mounts (`slates_base::own_mounts`, A-227): its kernel name's,
 /// the same name its drive letter's DOS device names, so a base path on the drive is refused before any open.
+#[derive(Debug)]
 struct OwnVolumeRecord(u64);
 
 impl OwnVolumeRecord {
@@ -519,7 +520,23 @@ fn established(
     crate::verbs::release_unrecorded_lease(s, &pending.record);
     crate::verbs::refused(refusal)
   };
-  if let Err((refusal, thread)) = keep(s, &pending.record, thread, requests, waker, ready, false) {
+  // The volume is this daemon's own from here (A-227).
+  let own = match OwnVolumeRecord::of(&ready.offer.record.volume) {
+    Ok(own) => own,
+    Err(refusal) => {
+      drop(requests);
+      return (refused(s, refusal), Some(thread));
+    }
+  };
+  if let Err((refusal, thread)) = keep(
+    s,
+    &pending.record,
+    thread,
+    requests,
+    waker,
+    (ready, own),
+    false,
+  ) {
     return (refused(s, refusal), Some(thread));
   }
   if let Err(e) = s.db.mutate(&mut s.segment, &op, now) {
@@ -547,7 +564,7 @@ fn keep(
   thread: MountThread,
   requests: Receiver<Request>,
   waker: std::task::Waker,
-  ready: Ready,
+  (ready, own): (Ready, OwnVolumeRecord),
   takeover: bool,
 ) -> Result<(), (Refusal, MountThread)> {
   let registry = match s.attachments.attach(
@@ -577,15 +594,6 @@ fn keep(
     "winfsp.ledger_quarantined",
     u64::try_from(ready.ledger.quarantined()).unwrap_or(u64::MAX),
   );
-  let own = match OwnVolumeRecord::of(&ready.offer.record.volume) {
-    Ok(own) => own,
-    Err(refusal) => {
-      drop(requests);
-      s.attachments.revoke(registry);
-      s.attachments.drain(registry);
-      return Err((refusal, thread));
-    }
-  };
   drop(ready.offer);
   s.winfsp_mounts.insert(
     record.id,
@@ -628,6 +636,9 @@ fn keep(
 pub(crate) struct InheritedMount {
   pub(crate) attachment: u64,
   held: Option<Inherited>,
+  /// The held volume recorded as this daemon's own before any shard starts, so no shard reacquires a base or resumes a
+  /// landing on its drive before its adoption (A-227); taken by the adoption, let go with any refusal.
+  own: Option<OwnVolumeRecord>,
 }
 
 impl InheritedMount {
@@ -648,9 +659,22 @@ pub(crate) fn split_held(
   let mut split: Vec<Vec<InheritedMount>> = (0..partitions).map(|_| Vec::new()).collect();
   for mount in handed {
     let attachment = mount.attachment;
+    let (held, own) = match checked_inherited(mount) {
+      Some(held) => match OwnVolumeRecord::of(&held.record.volume) {
+        Ok(own) => (Some(held), Some(own)),
+        Err(refusal) => {
+          slates_machine::log_line!(
+            "slates-server: held mount {attachment} could not be recorded as this daemon's own: {refusal:?}"
+          );
+          (None, None)
+        }
+      },
+      None => (None, None),
+    };
     let held = InheritedMount {
       attachment,
-      held: checked_inherited(mount),
+      held,
+      own,
     };
     let partition = usize::from(crate::verbs::owner_of_attachment(attachment));
     let target = if partition < partitions { partition } else { 0 };
@@ -727,7 +751,8 @@ pub(crate) fn adopt_held() {
 
 async fn adopt_mount(record: AttachmentRecord, held: InheritedMount) {
   let attachment = record.id;
-  let Some(held) = held.held else {
+  let InheritedMount { held, own, .. } = held;
+  let (Some(held), Some(own)) = (held, own) else {
     let _ = state::with_state_counted(|s| {
       refuse_adoption(s, &record, "the held mount record is unusable")
     });
@@ -748,7 +773,7 @@ async fn adopt_mount(record: AttachmentRecord, held: InheritedMount) {
     Err(error) => Err((error.to_string(), None)),
   };
   let adopted = state::with_state_counted(|s| match mounted {
-    Ok((thread, ready)) => match keep(s, &record, thread, requests, waker, ready, true) {
+    Ok((thread, ready)) => match keep(s, &record, thread, requests, waker, (ready, own), true) {
       Ok(()) => {
         s.count("winfsp.adopted", 1);
         Ok(())

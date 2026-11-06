@@ -7165,6 +7165,13 @@ fn bind_mount(
       reason: "a mount point is a non-empty path within the OS limit".to_owned(),
     });
   }
+  // The mount the CLI just made is this daemon's own from here (A-227): the kernel's table names it at exactly the
+  // bound path, the one the kernel records, or the bind is refused and the CLI takes the mount down again.
+  #[cfg(target_os = "macos")]
+  let own = match crate::own_nfs::bound(state, &record, path) {
+    Ok(own) => own,
+    Err(refusal) => return refused(refusal),
+  };
   let now = state.clock.monotonic_ns();
   match state.db.mutate(
     &mut state.segment,
@@ -7174,7 +7181,11 @@ fn bind_mount(
     },
     now,
   ) {
-    Ok(_) => ReplyBody::MountBound,
+    Ok(_) => {
+      #[cfg(target_os = "macos")]
+      state.own_nfs_mounts.insert(attachment, own);
+      ReplyBody::MountBound
+    }
     Err(e) => refused(refusal_of_db(&e)),
   }
 }
@@ -7266,6 +7277,10 @@ pub(crate) fn end_attachment(
   // write by path to reach, so nothing is exposed by removing it (§4.6 "Windows").
   #[cfg(windows)]
   crate::winfsp::end_if_mounted(state, record.id);
+  // A macOS NFS mount is no longer this daemon's once its attachment ends: its requests are refused under the revoked
+  // registry attachment below, and a path on it is a stranger's (A-227).
+  #[cfg(target_os = "macos")]
+  state.own_nfs_mounts.remove(&record.id);
   // The registry attachment a mount's requests rode ends with the record: revoked so no later request
   // is admitted under it, drained so its slot is reused (GAP-A9-4).
   if let Some(mount) = state.mount_attachments.remove(&record.id) {

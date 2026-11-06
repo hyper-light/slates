@@ -19,8 +19,14 @@
 //! differs from its parent's is checked against the set. A symbolic link along a root path is read on the filesystem
 //! that holds it (never ours: its own mount was checked) and followed by hand, within the kernel's own bound.
 //!
-//! Elsewhere the set holds nothing yet and no path is refused: macOS and Windows identify their mounts their own way
-//! (A-227), each in its own change.
+//! **macOS.** The NFS mount's source (`slates:/<volume>`) names no daemon, so a mount is recorded when the CLI binds it
+//! (`BindMount`) and when a successor adopts its record: the kernel's table (`getfsstat(MNT_NOWAIT)`, no RPC) names the
+//! mount at the bound point, and its filesystem id is recorded. A crossing is then the kernel's path of the parent
+//! directory (`F_GETPATH`, the name cache, on a filesystem that is not ours) with the entry's name, compared exactly
+//! with the mount point the table names for each recorded id, read once a thread and again only when the set changes.
+//!
+//! **Windows.** Each WinFsp volume's kernel name is recorded by its id ([`volume_id`]); the base plane names a path's
+//! drive by `QueryDosDeviceW` and compares (`crate::windows`).
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -38,6 +44,8 @@ pub struct Full {
 struct Set {
   slots: Box<[AtomicU64]>,
   high: AtomicUsize,
+  /// Moves on at every record and forget, so a thread's cache of the set's mount points knows to refresh (macOS).
+  generation: AtomicU64,
 }
 
 static SET: OnceLock<Set> = OnceLock::new();
@@ -56,6 +64,7 @@ pub fn install(capacity: usize) -> Result<bool, HostError> {
     .set(Set {
       slots: (0..capacity.max(1)).map(|_| AtomicU64::new(0)).collect(),
       high: AtomicUsize::new(0),
+      generation: AtomicU64::new(0),
     })
     .is_ok();
   let _ = TAG.set(tag);
@@ -67,14 +76,16 @@ pub fn fsname() -> Option<String> {
   TAG.get().map(|tag| format!("{SOURCE_PREFIX}{tag:016x}"))
 }
 
-/// Records `id` as one of this daemon's own mounts; refused [`Full`] at the bound, and nothing recorded. An id already
-/// recorded is recorded once. Before [`install`] nothing is recorded (a process that serves no mounts).
+/// Records `id` as one of this daemon's own mounts; refused [`Full`] at the bound, and nothing recorded. Each record
+/// takes a slot of its own and each [`forget`] frees one, so every holder of a record (a mount learned at a restart,
+/// then kept by its mount) owns its own and none forgets another's. Before [`install`] nothing is recorded (a process
+/// that serves no mounts).
 pub fn record(id: u64) -> Result<(), Full> {
   SET.get().map_or(Ok(()), |set| record_into(set, id))
 }
 
 fn record_into(set: &Set, id: u64) -> Result<(), Full> {
-  if id == 0 || recorded(set, id) {
+  if id == 0 {
     return Ok(());
   }
   for (at, slot) in set.slots.iter().enumerate() {
@@ -83,12 +94,46 @@ fn record_into(set: &Set, id: u64) -> Result<(), Full> {
       .is_ok()
     {
       set.high.fetch_max(at.saturating_add(1), Ordering::AcqRel);
+      set.generation.fetch_add(1, Ordering::AcqRel);
       return Ok(());
     }
   }
   Err(Full {
     capacity: set.slots.len(),
   })
+}
+
+/// Why a mount was not recorded as this daemon's own.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unrecorded {
+  /// The kernel's table names no such mount at the point.
+  NotMounted,
+  /// The set holds as many mounts as it can.
+  Full(Full),
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for Unrecorded {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::NotMounted => write!(f, "is not in the kernel's mount table"),
+      Self::Full(full) => write!(
+        f,
+        "is past the {} mounts this daemon records as its own",
+        full.capacity
+      ),
+    }
+  }
+}
+
+/// Records the mount at exactly `point` in the kernel's table whose source `wanted` takes ([`mount_id_at`], nothing
+/// opened), returning its id for the caller's [`forget`].
+#[cfg(unix)]
+pub fn record_at(point: &str, wanted: impl Fn(&str) -> bool) -> Result<u64, Unrecorded> {
+  let id = mount_id_at(point, wanted).ok_or(Unrecorded::NotMounted)?;
+  record(id).map_err(Unrecorded::Full)?;
+  Ok(id)
 }
 
 /// Forgets `id`, a mount of this daemon's that has ended.
@@ -104,6 +149,7 @@ fn forget_in(set: &Set, id: u64) {
       .compare_exchange(id, 0, Ordering::AcqRel, Ordering::Acquire)
       .is_ok()
     {
+      set.generation.fetch_add(1, Ordering::AcqRel);
       return;
     }
   }
@@ -120,6 +166,57 @@ fn recorded(set: &Set, id: u64) -> bool {
     .iter()
     .take(set.high.load(Ordering::Acquire))
     .any(|slot| slot.load(Ordering::Acquire) == id)
+}
+
+/// The shards of this process still learning the mounts they keep across a restart (A-227), and the budget a check
+/// waits for them. A successor learns its predecessor's surviving mounts from each shard's catalog as the shard
+/// starts, and one shard's base may lie under another's mount, so no crossing is judged until every shard has learned.
+#[cfg(unix)]
+static LEARNING: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(unix)]
+static LEARNING_BUDGET_NS: AtomicU64 = AtomicU64::new(0);
+
+/// One shard's learning of the mounts it keeps: taken before the shard starts, let go once its kept mounts are
+/// recorded (or its start fails), so a crossing checked meanwhile anywhere in the process waits for it.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct Learning(());
+
+#[cfg(unix)]
+impl Drop for Learning {
+  fn drop(&mut self) {
+    LEARNING.fetch_sub(1, Ordering::AcqRel);
+  }
+}
+
+/// A shard's [`Learning`], taken before it starts; a check waits at most `budget_ns` for every shard's (the daemon's
+/// liveness budget: a start that takes longer is a daemon the anchor replaces).
+#[cfg(unix)]
+pub fn learning(budget_ns: u64) -> Learning {
+  LEARNING_BUDGET_NS.fetch_max(budget_ns, Ordering::AcqRel);
+  LEARNING.fetch_add(1, Ordering::AcqRel);
+  Learning(())
+}
+
+/// Waits until no shard is learning its kept mounts, so a crossing is judged against every mount this daemon serves;
+/// refused `EAGAIN` past the budget, never judged against a partial record.
+#[cfg(unix)]
+fn await_learned() -> Result<(), HostError> {
+  if LEARNING.load(Ordering::Acquire) == 0 {
+    return Ok(());
+  }
+  let budget = std::time::Duration::from_nanos(LEARNING_BUDGET_NS.load(Ordering::Acquire));
+  let started = std::time::Instant::now();
+  while LEARNING.load(Ordering::Acquire) > 0 {
+    if started.elapsed() >= budget {
+      return Err(HostError::Unavailable(
+        rustix::io::Errno::AGAIN.raw_os_error(),
+      ));
+    }
+    std::thread::yield_now();
+  }
+  Ok(())
 }
 
 /// The refusal of a path on this daemon's own mount, with the errno the platform names it by: a deadlock avoided.
@@ -195,7 +292,7 @@ pub use linux::{check_child, check_child_in, mount_id_at, mount_id_of, open_chec
 
 #[cfg(target_os = "linux")]
 mod linux {
-  use super::{SET, fsname, recorded, refusal};
+  use super::{SET, await_learned, fsname, recorded, refusal};
   use rustix::fs::{AtFlags, FileType, Mode, OFlags};
   use slates_vfs::host::HostError;
   use std::cell::RefCell;
@@ -261,15 +358,16 @@ mod linux {
   }
 
   /// Whether mount `id` is this daemon's: recorded, or (not yet recorded) named by its tag in the kernel's table.
-  fn is_own(id: u64) -> bool {
+  fn is_own(id: u64) -> Result<bool, HostError> {
+    await_learned()?;
     if SET.get().is_some_and(|set| recorded(set, id)) {
-      return true;
+      return Ok(true);
     }
     if FOREIGN.with_borrow(|foreign| foreign.contains(&id)) {
-      return false;
+      return Ok(false);
     }
     let Some(own) = fsname() else {
-      return false;
+      return Ok(false);
     };
     let tagged = table_entry(|entry| entry.id == id).is_some_and(|entry| entry.source == own);
     if !tagged {
@@ -280,7 +378,7 @@ mod linux {
         foreign.push(id);
       });
     }
-    tagged
+    Ok(tagged)
   }
 
   /// One line of `/proc/self/mountinfo` (proc(5)): the mount's id, where it is mounted, and its source.
@@ -360,7 +458,7 @@ mod linux {
       return Ok(());
     };
     let below = mount_id_of(child.as_fd())?;
-    if below != dir_mount && is_own(below) {
+    if below != dir_mount && is_own(below)? {
       return Err(refusal());
     }
     Ok(())
@@ -383,7 +481,7 @@ mod linux {
   /// Refuses when `child` is on a mount other than `parent`'s that is this daemon's own.
   fn crossing(parent: BorrowedFd<'_>, child: BorrowedFd<'_>) -> Result<(), HostError> {
     let below = mount_id_of(child)?;
-    if below != mount_id_of(parent)? && is_own(below) {
+    if below != mount_id_of(parent)? && is_own(below)? {
       return Err(refusal());
     }
     Ok(())
@@ -509,6 +607,177 @@ mod linux {
   }
 }
 
+#[cfg(target_os = "macos")]
+pub use macos::{check_child, mount_id_at, open_checked_root};
+
+#[cfg(target_os = "macos")]
+mod macos {
+  use super::{SET, await_learned, recorded, refusal};
+  use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+  use slates_vfs::host::HostError;
+  use std::cell::RefCell;
+  use std::ffi::{OsStr, OsString};
+  use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+  use std::os::unix::ffi::OsStrExt;
+  use std::path::Path;
+  use std::sync::atomic::Ordering;
+
+  /// Format: the filesystem type the macOS NFS client records for a mount (`statfs.f_fstypename`).
+  const NFS_FSTYPE: &str = "nfs";
+
+  /// Derived: the most symbolic links a root path's walk follows, the kernel's own bound (`MAXSYMLINKS`, 32,
+  /// `sys/param.h`): a path the kernel would refuse `ELOOP` is refused the same.
+  const MAX_SYMLINKS: usize = 32;
+
+  thread_local! {
+    /// The mount points of this daemon's own mounts as the kernel's table names them, with the set's generation they
+    /// were read at.
+    static POINTS: RefCell<(u64, Vec<String>)> = const { RefCell::new((u64::MAX, Vec::new())) };
+  }
+
+  fn unavailable(e: rustix::io::Errno) -> HostError {
+    match e {
+      rustix::io::Errno::NOENT => HostError::NotFound,
+      rustix::io::Errno::NOTDIR => HostError::NotDirectory,
+      other => HostError::Unavailable(other.raw_os_error()),
+    }
+  }
+
+  /// The id a mount's table entry is recorded under: its filesystem id's two words.
+  fn id_of(entry: &slates_bridge_oci::mount_table::MountEntry) -> u64 {
+    (entry.identity.device << u32::BITS) | (entry.identity.mount & u64::from(u32::MAX))
+  }
+
+  /// The id of the NFS mount at exactly `point` (the kernel's own path) whose source `wanted` takes, from the kernel's
+  /// table without contacting any filesystem: how a mount the CLI bound, or a successor adopts, is named for
+  /// [`super::record`].
+  pub fn mount_id_at(point: &str, wanted: impl Fn(&str) -> bool) -> Option<u64> {
+    let table = slates_bridge_oci::mount_table::mount_table().ok()?;
+    table
+      .iter()
+      .rev()
+      .find(|entry| {
+        entry.mount_point == point && entry.fstype == NFS_FSTYPE && wanted(&entry.source)
+      })
+      .map(id_of)
+  }
+
+  /// Lends the mount points of this daemon's own mounts to `judge`, read from the kernel's table again only when the set
+  /// has changed since this thread last read them.
+  fn with_own_points<R>(judge: impl FnOnce(&[String]) -> R) -> R {
+    let Some(set) = SET.get() else {
+      return judge(&[]);
+    };
+    let generation = set.generation.load(Ordering::Acquire);
+    POINTS.with_borrow_mut(|(seen, points)| {
+      if *seen != generation {
+        *points = slates_bridge_oci::mount_table::mount_table()
+          .map(|table| {
+            table
+              .iter()
+              .filter(|entry| recorded(set, id_of(entry)))
+              .map(|entry| entry.mount_point.clone())
+              .collect()
+          })
+          .unwrap_or_default();
+        *seen = generation;
+      }
+      judge(points)
+    })
+  }
+
+  /// `name` in the directory the kernel names `parent`.
+  fn joined(parent: &str, name: &OsStr) -> String {
+    let separator = if parent.ends_with('/') { "" } else { "/" };
+    format!("{parent}{separator}{}", name.to_string_lossy())
+  }
+
+  /// Refuses [`refusal`] when the entry `name` in `dir` is one of this daemon's own mount points, before anything opens
+  /// it: the kernel's path of `dir` (on a filesystem that is not ours, since every crossing to it was checked) with
+  /// `name`, compared exactly with the kernel's mount point of each own mount.
+  pub fn check_child(dir: BorrowedFd<'_>, name: &OsStr) -> Result<(), HostError> {
+    await_learned()?;
+    with_own_points(|points| {
+      if points.is_empty() {
+        return Ok(());
+      }
+      let parent = rustix::fs::getpath(dir).map_err(unavailable)?;
+      let candidate = joined(&parent.to_string_lossy(), name);
+      if points.contains(&candidate) {
+        return Err(refusal());
+      }
+      Ok(())
+    })
+  }
+
+  /// Opens the directory at `path` with `flags`, every component checked first, so no component that is one of this
+  /// daemon's own mount points is ever entered; symbolic links along the way are followed by hand within the kernel's
+  /// bound, and the last component is opened with `flags` itself.
+  pub fn open_checked_root(path: &Path, flags: OFlags) -> Result<OwnedFd, HostError> {
+    let mut at = open_start(path.is_absolute())?;
+    let mut pending = components(path);
+    pending.reverse();
+    let mut followed = 0usize;
+    while let Some(name) = pending.pop() {
+      check_child(at.as_fd(), &name)?;
+      if pending.is_empty() {
+        return rustix::fs::openat(&at, name.as_os_str(), flags, Mode::empty())
+          .map_err(unavailable);
+      }
+      let stat = rustix::fs::statat(&at, name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(unavailable)?;
+      if FileType::from_raw_mode(stat.st_mode) == FileType::Symlink {
+        followed = followed.saturating_add(1);
+        if followed > MAX_SYMLINKS {
+          return Err(HostError::Unavailable(
+            rustix::io::Errno::LOOP.raw_os_error(),
+          ));
+        }
+        let target =
+          rustix::fs::readlinkat(&at, name.as_os_str(), Vec::new()).map_err(unavailable)?;
+        let target = Path::new(OsStr::from_bytes(target.as_bytes()));
+        let mut parts = components(target);
+        parts.reverse();
+        pending.extend(parts);
+        if target.is_absolute() {
+          at = open_start(true)?;
+        }
+        continue;
+      }
+      at = rustix::fs::openat(
+        &at,
+        name.as_os_str(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+      )
+      .map_err(unavailable)?;
+    }
+    rustix::fs::openat(&at, c".", flags, Mode::empty()).map_err(unavailable)
+  }
+
+  fn open_start(absolute: bool) -> Result<OwnedFd, HostError> {
+    let start = if absolute { c"/" } else { c"." };
+    rustix::fs::open(
+      start,
+      OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+      Mode::empty(),
+    )
+    .map_err(unavailable)
+  }
+
+  /// The components of `path` that name an entry (`.` dropped; `..` kept, which the kernel resolves).
+  fn components(path: &Path) -> Vec<OsString> {
+    path
+      .components()
+      .filter_map(|component| match component {
+        std::path::Component::Normal(name) => Some(name.to_os_string()),
+        std::path::Component::ParentDir => Some(OsString::from("..")),
+        _ => None,
+      })
+      .collect()
+  }
+}
+
 #[cfg(test)]
 mod tests {
   #![allow(clippy::unwrap_used)]
@@ -521,6 +790,7 @@ mod tests {
     let set = Set {
       slots: (0..2).map(|_| AtomicU64::new(0)).collect(),
       high: AtomicUsize::new(0),
+      generation: AtomicU64::new(0),
     };
     record_into(&set, 7).unwrap();
     record_into(&set, 9).unwrap();
