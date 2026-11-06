@@ -1,0 +1,68 @@
+name: DIAG loadtest-scale pin -- what a whole-base pin of the kernel's trees holds on Linux, in the overlay and in the daemon (not for main)
+
+# Throwaway probes on a diagnostics branch only: crates/base/tests/pin_probe.rs (a counting allocator around
+# Overlay::pin over the real host) and a load_bench patched to wait for its pin. Linux v7.4-rc1 is cloned in the job.
+# Each job publishes its results as one commit on diag-loadtest-scale-pin-results-<run>-<runner>, read with git.
+
+on:
+  push:
+    branches: ['diag-loadtest-scale-pin-[0-9]*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest]
+    name: pin probe on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      RESULTS_BRANCH: diag-loadtest-scale-pin-results-${{ github.run_id }}-${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: probes
+        shell: bash
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "false"
+        run: |
+          set -u +e +o pipefail
+          out="$RUNNER_TEMP/results.txt"; : > "$out"
+          echo "tested $(git rev-parse HEAD^) on $(uname -m), $(nproc) cpus, $(free -g | awk '/Mem/{print $2}') GB, load $(cut -d' ' -f1-3 /proc/loadavg)" >> "$out"
+          K="$RUNNER_TEMP/linux"; git clone -q --depth 1 --branch v7.4-rc1 https://github.com/torvalds/linux.git "$K"; echo "kernel $(git -C $K rev-parse HEAD)" >> "$out"
+          cargo build --release -p slates-client --example load_bench >> "$RUNNER_TEMP/build.log" 2>&1; echo "build exit $?" >> "$out"
+          for t in kernel fs Documentation arch; do
+            PIN_PROBE_TREE="$K/$t" timeout 900 cargo test --release -p slates-base --test pin_probe -- --nocapture 2>&1 | grep -E "PROBE|panicked|^error" >> "$out"
+          done
+          for t in Documentation arch; do
+            ( target/release/examples/load_bench --tree "$K/$t" --clients 1 --rounds 1 --hot-files 1 > "$RUNNER_TEMP/bench-$t.log" 2>&1 & echo $! > "$RUNNER_TEMP/pid" )
+            P=$(cat "$RUNNER_TEMP/pid"); peak=0; trace=""
+            for i in $(seq 1 600); do
+              kill -0 $P 2>/dev/null || break
+              r=$(awk '/VmRSS/{print $2}' /proc/$P/status 2>/dev/null); r=${r:-0}
+              [ $r -gt $peak ] && peak=$r; [ $((i % 5)) -eq 0 ] && trace="$trace ${i}s:$((r/1024))MB"
+              if [ $r -gt 10485760 ]; then echo "  $t KILLED at rss $r KiB after ${i}s" >> "$out"; kill -9 $P; break; fi
+              sleep 1
+            done
+            kill -9 $P 2>/dev/null
+            echo "server $t peak_kib $peak after ${i}s trace$trace" >> "$out"
+            grep -E "^setup|panicked|longest poll" "$RUNNER_TEMP/bench-$t.log" | cut -c1-300 | head -12 | sed "s/^/  $t: /" >> "$out"
+          done
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          blob=$(git hash-object -w "$out")
+          tree=$(printf '100644 blob %s\tresults.txt\n' "$blob" | git mktree)
+          commit=$(git commit-tree "$tree" -m "results of run $GITHUB_RUN_ID on ${{ matrix.runner }}")
+          git push origin "$commit:refs/heads/$RESULTS_BRANCH" || echo "::warning::could not publish the results"

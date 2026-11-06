@@ -1033,7 +1033,15 @@ fn seed_green(client: &mut Client, tree: &str, tag: &str) -> VolumeId {
     .unwrap();
   println!("setup\tcreate_overlay_ns\t{}", step.elapsed().as_nanos());
   let step = Instant::now();
-  let pinned = client.pin(overlay, None).unwrap();
+  // DIAGNOSTIC ONLY (not committed): wait for the pin however long it takes.
+  let word = client.begin(&RequestBody::Pin { volume: overlay, paths: None }).unwrap().word();
+  let pinned = loop {
+    match client.poll_reply_word(word).unwrap() {
+      Some(ReplyBody::Pinned { entries }) => break entries,
+      Some(other) => panic!("pin: {other:?}"),
+      None => std::thread::yield_now(),
+    }
+  };
   println!(
     "setup\tpin_whole_ns\t{}\tentries\t{pinned}",
     step.elapsed().as_nanos()
