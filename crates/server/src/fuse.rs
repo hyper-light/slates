@@ -185,12 +185,18 @@ impl OwnMountRecord {
     Self::of(mount_point, |source| own.as_deref() == Some(source))
   }
 
-  /// A mount a predecessor kept (A-61), which carries the predecessor's tag: learned as the shard starts.
-  fn of_kept(mount_point: &str) -> Result<Self, Unrecorded> {
-    slates_base::own_mounts::record_at(mount_point, |source| {
+  /// The id of a mount a predecessor kept at `mount_point` (A-61), which carries the predecessor's tag, or `None`.
+  fn kept_at(mount_point: &str) -> Option<u64> {
+    slates_base::own_mounts::mount_id_at(mount_point, |source| {
       source.starts_with(slates_base::own_mounts::SOURCE_PREFIX)
     })
-    .map(Self)
+  }
+
+  /// Records kept mount `id` and holds it. Its drop forgets the mount, so each mount has one holder: [`learn_kept`]
+  /// makes none for a mount it already holds.
+  fn of_kept(id: u64) -> Result<Self, Unrecorded> {
+    slates_base::own_mounts::record(id).map_err(Unrecorded::Full)?;
+    Ok(Self(id))
   }
 
   fn of(mount_point: &str, wanted: impl Fn(&str) -> bool) -> Result<Self, Refusal> {
@@ -219,11 +225,20 @@ pub(crate) fn learn_kept(s: &mut ShardState) -> Result<(), Refusal> {
       let Some(point) = record.form.fuse_mount_point() else {
         continue;
       };
-      match OwnMountRecord::of_kept(point) {
-        Ok(own) => learned.push((record.id, own)),
-        Err(Unrecorded::NotMounted) => {}
-        Err(why @ Unrecorded::Full(_)) => return Err(own_refusal(why, point)),
+      // Two records naming one point find one mount, which has one holder.
+      let Some(id) = OwnMountRecord::kept_at(point) else {
+        continue;
+      };
+      if learned
+        .iter()
+        .any(|(_, own): &(u64, OwnMountRecord)| own.0 == id)
+      {
+        continue;
       }
+      learned.push((
+        record.id,
+        OwnMountRecord::of_kept(id).map_err(|why| own_refusal(why, point))?,
+      ));
     }
   }
   s.learned_fuse.extend(learned);

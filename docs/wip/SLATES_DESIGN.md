@@ -13976,8 +13976,10 @@ own-mount records, `check_mount_point`, the refusals' mapping), `crates/bridge-w
     reacquires any base or resumes any landing; a shard's base can lie under another shard's mount, so every crossing
     check in the process waits until every shard has learned (a ticket per shard, taken before it starts; bounded by
     the liveness budget, refused `EAGAIN` past it). Windows learns its held volumes before any shard starts, from the
-    records the anchor hands over. The set is a multiset: a learned record handed to its mount is never forgotten
-    under it.
+    records the anchor hands over. A mount is recorded once (a repeat takes no slot) and has one holder, which forgets
+    it in every slot it lies in. A learned record is moved to its mount, a bind made again keeps the holder it has, and
+    two catalog records naming one point learn it once. (Until the fix of 2026-11-06 a repeat took a second slot, so a
+    mount learned again filled the set; `own_mounts`' own unit test caught it at the stack's gate.)
   - **Windows.** A process-wide registry of this daemon's WinFsp volume device names, published by the mount threads
     (fixed capacity from the most mounts the daemon can make, atomic slots in the runtime registry's publication pattern,
     a typed refusal at the bound). A path's drive is named by `QueryDosDeviceW`, which asks the object manager, never the
