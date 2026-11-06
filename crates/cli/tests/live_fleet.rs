@@ -701,9 +701,14 @@ fn write_files(owner: &str, id: &str, files: std::ops::Range<usize>) -> Vec<Dura
       );
       assert_eq!(code, 0, "write /file-{file}: {err}");
       let elapsed = began.elapsed();
-      // Let the attachment go, or a long run meets the volume's attachment bound before the reap does.
+      // Let the attachment go, or a long run meets the volume's attachment bound before the reap does. The `attach`
+      // process that made it has exited, so the reap may let it go first (a write that waited out a paused candidate, a
+      // loaded host: macOS at load 23-27, 2026-11-05); that is the same release, answered `NotFound`.
       let (code, _, err) = run(owner, &["detach", &attachment]);
-      assert_eq!(code, 0, "detach: {err}");
+      assert!(
+        code == 0 || err.contains("refused: NotFound"),
+        "detach: {err}"
+      );
       elapsed
     })
     .collect()
