@@ -74,6 +74,13 @@ const GOAL_REQUIRED_NS: u64 = 1_000_000;
 /// Shape: how long the client spins for a reply before it parks: past the goal, so a reply inside
 /// the goal is taken without a wake (the provisioning bench's spinning form, AC-2.1).
 const SPIN_NS: u64 = GOAL_REQUIRED_NS;
+
+/// The client's spin for this invocation: [`SPIN_NS`], or what `--client-spin-ns N` sets (set once, in `main`).
+static CLIENT_SPIN_NS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+fn client_spin_ns() -> u64 {
+  CLIENT_SPIN_NS.get().copied().unwrap_or(SPIN_NS)
+}
 /// Format: the percentiles reported, in parts per thousand.
 const PERCENTILES: &[(&str, u64)] = &[("p50", 500), ("p99", 990), ("p999", 999)];
 /// Format: parts per thousand.
@@ -198,7 +205,7 @@ impl Fixture {
   /// chain or the shard's budget cannot hold the seed): a measured answer, printed in the shape's place.
   fn new(instance: &str, tag: &str, files: usize) -> Result<Fixture, String> {
     let mut client = connect(instance);
-    client.spin_for(Some(SPIN_NS));
+    client.spin_for(Some(client_spin_ns()));
     let green = client.create_green(&format!("{tag}-green"), false).unwrap();
     let (seed, _) = client.create_work(green, &format!("{tag}-seed")).unwrap();
     let mut model = BTreeMap::new();
@@ -748,7 +755,7 @@ fn print_growth(run: usize, key: &str, samples: &[u64]) {
 /// Every selected growth form, its runs, its rows and its goal lines.
 fn growth_sweep(instance: &str, selection: &Selection) {
   let mut client = connect(instance);
-  client.spin_for(Some(SPIN_NS));
+  client.spin_for(Some(client_spin_ns()));
   for form in selection.growth.iter().copied() {
     let mut rows: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     for index in 0..RUNS {
@@ -832,6 +839,13 @@ impl Selection {
       match arg.as_str() {
         "--quiet-only" => selection.loaded = false,
         "--loaded-only" => selection.quiet = false,
+        "--client-spin-ns" => {
+          let spin = args
+            .next()
+            .and_then(|n| n.parse().ok())
+            .expect("--client-spin-ns takes nanoseconds");
+          let _ = CLIENT_SPIN_NS.set(spin);
+        }
         "--spinners-per-core" => {
           selection.spinners_per_core = args
             .next()
@@ -916,13 +930,15 @@ fn main() {
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
   let cores = profile.facts.cpus_at_once();
-  println!(
-    "edit and merge latency: {} {}, {shards} shards, {cores} cores, client spin {SPIN_NS} ns, {SAMPLES} samples x {RUNS} runs, edits of {EDIT_BYTES} B in files of {FILE_BYTES} B",
-    std::env::consts::OS,
-    std::env::consts::ARCH
-  );
+
   let mut selection = Selection::parse();
   selection.shards = shards;
+  println!(
+    "edit and merge latency: {} {}, {shards} shards, {cores} cores, client spin {} ns, {SAMPLES} samples x {RUNS} runs, edits of {EDIT_BYTES} B in files of {FILE_BYTES} B",
+    std::env::consts::OS,
+    std::env::consts::ARCH,
+    client_spin_ns()
+  );
   if selection.quiet {
     sweep(&instance, "quiet", &selection);
     growth_sweep(&instance, &selection);
