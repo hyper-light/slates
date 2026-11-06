@@ -7044,8 +7044,10 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > itself is still refused `land`. Proven by `crates/server/tests/checkout.rs` (a real daemon over a real directory:
 > two merged pushes and an overlapping one refused with its window; the granted landing writes every merged byte; an
 > outsider's edit of a merged file is the presentation's only conflict; a wrong or moved base refused; three of three
-> red with the base check and the writes removed) and across a container by the fs-server lab (the client on the
-> host, the green's node in Docker, everything up to the grant; see A-201).
+> red with the base check and the writes removed), by `crates/cli/tests/fs_server.rs` (two `slates daemon --fleet`
+> processes, up to the presentation), and across two machines on 2026-11-05: a client on Linux pushed to a green on a
+> macOS server, whose human granted the landing at its anchor, and the merged files landed on the server's disk
+> (GAPS). A Linux server stops at the presentation: its CLI cannot issue a grant (A-201).
 
 **Role.** Let many agents work on clones of one shared volume and fold their work back into it
 with no locks, no last-writer-wins, and no inferred merge. Each agent's work becomes an
