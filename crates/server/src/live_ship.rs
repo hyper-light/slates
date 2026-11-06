@@ -22,8 +22,12 @@
 //! ([`resolve`]), and a retry meanwhile joins the wait ([`join`]), so no client reads a success that `f` candidates
 //! do not hold. Holders that never answer make the writer wait: backpressure, never a false success.
 //!
-//! Not yet: NFS `COMMIT` and FUSE `fsync` replies do not wait yet, a holder's replicas do not survive its own daemon's
-//! restart, and a takeover does not read them.
+//! **Every other durability claim waits for the same position.** A transport's sync reply is held on [`durability`]
+//! (FUSE `fsync`, a Shards stream's `FSYNC`) or [`wait_durable`] (an NFS stable write or `COMMIT`, v3 and v4 alike),
+//! answered "not durable" past the liveness budget; a deferred verb that changes the volume (a writable map's
+//! `MapSync`, a checkout) completes through [`defer`] as a recorded verb does.
+//!
+//! Not yet: a holder's replicas do not survive its own daemon's restart.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -249,7 +253,7 @@ pub(crate) enum Durability {
 
 /// Whether `volume`'s log is durable at `target` on this (its owner) shard; when it is not yet and `waker` is given,
 /// parks it on the volume. Shared by every transport that holds a reply for durability: an NFS stable write or `COMMIT`
-/// ([`wait_durable`]) and a FUSE `fsync` (`crate::fuse`).
+/// and a Shards stream's `FSYNC` ([`wait_durable`]), and a FUSE `fsync` (`crate::fuse`).
 pub(crate) fn durability(
   state: &mut ShardState,
   volume: slates_db::catalog::VolumeId,

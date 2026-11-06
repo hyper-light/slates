@@ -5778,6 +5778,22 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > the flow: with both candidates stopped the `fsync` fails `EIO` after 1.0006 s (the liveness budget); healthy and after
 > the candidates resume, it succeeds.
 >
+> **Every other durability claim (2026-11-05, the sibling sweep of FUSE `fsync`).** Each place a client is told data is
+> durable on a live volume now waits for the position its barrier published, and the same failing test holds each to
+> it across three real daemon processes (`crates/cli/tests/live_fleet.rs`): with both candidates' processes stopped
+> the claim fails or waits, never succeeds; healthy and after they resume, it succeeds.
+> - *A Shards stream's `FSYNC`* (`crate::shards`; its DAX compare-back runs before it): answered `0` in 337 µs with
+>   both candidates stopped, red first; now held until durable, `EIO` after 1.0011–1.0025 s (3 of 3).
+> - *A writable map's `MapSync`* and a writable `ReleaseMap` (`crate::direct_map`): a deferred verb, which the recorded
+>   verb's wait passed over, answered `MapSynced` in 683 µs with the log durable at none; now completed through
+>   `live_ship::defer`, so it waits as `slates write` does: unanswered through three liveness budgets stopped,
+>   answered at once after the resume with the log durable at its head (3 of 3).
+> - *A green's `checkout`* into its live base (`crate::checkout`, `image::complete_once_durable`): answered `CheckedOut`
+>   with both stopped, red first; now waits the same way (3 of 3).
+> - *NFSv4 `COMMIT` and stable `WRITE`* need no change: the v4 front end serves each through the v3 procedure
+>   (`RoutedBackend::call_v3` → `serve_v3`), whose wait is `stable_once_durable`.
+> Owed in this sweep: virtio-fs and vhost-user `FSYNC`, WinFsp's flush.
+
 > **Phase one with a candidate that holds no copy (2026-11-05).** Every candidate's report counts toward `f + 1`, an empty
 > one too, and every reporter raises its fence to the takeover's epoch, an empty one too: a candidate with no copy makes
 > an empty copy fenced at that epoch (`live_ship::fenced_copy`, at the successor's own report and at a remote
