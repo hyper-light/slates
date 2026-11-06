@@ -981,5 +981,19 @@ fn main() {
       stop.store(true, Ordering::Relaxed);
     });
   }
+  // Each shard's pulse as the runtime holds it (§4.14): its longest step tells a request held behind a long task from
+  // one whose shard was woken late; its overrun says how late its timed waits ran.
+  for pulse in daemon.shard_pulses() {
+    println!(
+      "pulse\tshard {}: steps {}, waits {}, longest step {} ns, scheduler overrun {} ns, wake cost {} ns, kicks skipped {}",
+      pulse.shard,
+      pulse.steps,
+      pulse.waits,
+      pulse.longest_step_ns,
+      pulse.scheduler_overrun_ns,
+      pulse.wake_cost_ns,
+      pulse.kicks_skipped
+    );
+  }
   daemon.stop();
 }
