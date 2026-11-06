@@ -237,7 +237,7 @@ pub(crate) fn deliver(state: &mut ShardState, reply: ReplyBody, route: Option<Re
 
 /// Publishes the shard so the new volume's image precedes its completion (§4.8, AUD-05), as `dispatch` does for a
 /// create; refused when the publication did not capture it.
-fn publish_new_volume(state: &mut ShardState, id: DbVolumeId) -> Result<(), Refusal> {
+pub(crate) fn publish_new_volume(state: &mut ShardState, id: DbVolumeId) -> Result<(), Refusal> {
   match crate::verbs::publish_shard(state) {
     Ok(published) if !published.captured(id) && !published.destroying(id) => {
       Err(refusal_of_vfs(&slates_vfs::VfsError::RecoveryIncomplete))

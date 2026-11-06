@@ -5994,14 +5994,14 @@ fn clone(
   if !rights_of(&record, principal).write {
     return forbidden("clone");
   }
-  if state.db.partition().volume_by_name(name).is_some() {
-    let existing = state
-      .db
-      .partition()
-      .volume_by_name(name)
-      .map(|v| to_wire_volume(v.id))
-      .unwrap_or_default();
+  if let Some(existing) = name_held(state, name) {
     return refused(Refusal::AlreadyExists { existing });
+  }
+  // A name that hashes to another partition is held there by an alias of the clone, which lives here beside its origin
+  // for copy-on-write (A-229, §4.8 "Lookup"): the clone is made across the two partitions by the alias protocol.
+  let name_partition = owner_of_name(name, state.shards.len());
+  if name_partition != state.partition {
+    return clone_named_elsewhere(state, principal, (volume, snapshot, name), name_partition);
   }
   let admitted = match admit_clone(state, handle, &record, snapshot) {
     Ok(admitted) => admitted,
@@ -6020,6 +6020,178 @@ fn clone(
     },
     Err(refusal) => refused(refusal),
   }
+}
+
+/// The volume holding `name` on this partition: one of its own volumes, or one another partition holds under an alias
+/// here (A-229), confirmed or reserved.
+fn name_held(state: &ShardState, name: &str) -> Option<VolumeId> {
+  let partition = state.db.partition();
+  partition
+    .volume_by_name(name)
+    .map(|volume| to_wire_volume(volume.id))
+    .or_else(|| {
+      partition
+        .name_alias(name)
+        .map(|alias| to_wire_volume(alias.volume))
+    })
+}
+
+/// Records one step of a name alias on this, the name's, partition (A-229): its own durable record.
+pub(crate) fn alias_step(state: &mut ShardState, op: &Op) -> Result<(), Refusal> {
+  let now = state.clock.monotonic_ns();
+  state
+    .db
+    .mutate(&mut state.segment, op, now)
+    .map(drop)
+    .map_err(|e| refusal_of_db(&e))
+}
+
+/// Format: the status counter of alias steps whose name's shard did not take them (A-229): a reserved alias left for
+/// the next recovery to confirm or release, so the name resolves nothing until then.
+const ALIAS_STEP_UNTAKEN: &str = "names.alias_step_untaken";
+
+/// Makes a clone whose name hashes to `name_partition`, another partition (A-229, `slates_db::alias::CLONE_STEPS`):
+/// the alias reserved at the name's partition, the clone made here beside its origin with its completion record, and
+/// the alias confirmed (or released, when the clone could not be made) before the reply. The reply is deferred to a
+/// task of this shard, so a retry meanwhile joins it.
+fn clone_named_elsewhere(
+  state: &mut ShardState,
+  principal: &Principal,
+  (volume, snapshot, name): (VolumeId, SnapshotId, &str),
+  name_partition: u16,
+) -> ReplyBody {
+  let Some(request) = state.current_request else {
+    return refused(Refusal::Unsupported {
+      feature: "a clone outside a recorded request".to_owned(),
+    });
+  };
+  let Some(name_shard) = shard_of_partition(state, name_partition) else {
+    return refused(Refusal::NotFound);
+  };
+  let Some(id) = fresh_volume_id(state) else {
+    return refused(ids_exhausted());
+  };
+  let this = state.shard;
+  let principal = principal.clone();
+  let name = name.to_owned();
+  crate::image::defer(state, async move {
+    let reservation = Op::NameAliasReserved {
+      record: slates_db::catalog::NameAliasRecord {
+        name: name.clone(),
+        volume: id,
+        confirmed: false,
+      },
+    };
+    let reserved = crate::xshard::call_within(
+      this,
+      name_shard,
+      move |s| alias_step(s, &reservation),
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await
+    .unwrap_or_else(|| {
+      Err(Refusal::Unpublished {
+        reason: "the name's shard did not answer its reservation".to_owned(),
+      })
+    });
+    let made = crate::state::with_state(|s| {
+      crate::image::complete(s, request, |s| match &reserved {
+        Err(refusal) => refused(refusal.clone()),
+        Ok(()) => clone_as(s, &principal, (volume, snapshot, &name), id),
+      })
+    });
+    let Some((reply, route)) = made else {
+      return;
+    };
+    if reserved.is_ok() {
+      let settle = if matches!(reply, ReplyBody::Cloned { .. }) {
+        Op::NameAliasConfirmed { name }
+      } else {
+        Op::NameAliasReleased { name }
+      };
+      let settled = crate::xshard::call_within(
+        this,
+        name_shard,
+        move |s| alias_step(s, &settle),
+        crate::daemon::LIVENESS_BUDGET_NS,
+      )
+      .await;
+      if !matches!(settled, Some(Ok(()))) {
+        let _ = crate::state::with_state(|s| s.count(ALIAS_STEP_UNTAKEN, 1));
+      }
+    }
+    let _ = crate::state::with_state(|s| crate::image::deliver(s, reply, route));
+  })
+}
+
+/// The clone step of [`clone_named_elsewhere`], on the origin's partition with the name reserved: the origin found and
+/// the caller's right checked again (the volume could have gone while the reservation was asked for), the clone made
+/// under the id the alias names, and published before its completion; the reply.
+fn clone_as(
+  state: &mut ShardState,
+  principal: &Principal,
+  (volume, snapshot, name): (VolumeId, SnapshotId, &str),
+  id: DbVolumeId,
+) -> ReplyBody {
+  use crate::merge_service::{StoreVerb, find_store_backed};
+  let (handle, record) = match find_store_backed(state, volume, StoreVerb::Clone) {
+    Ok(x) => x,
+    Err(r) => return *r,
+  };
+  if !rights_of(&record, principal).write {
+    return forbidden("clone");
+  }
+  if let Some(existing) = state.db.partition().volume_by_name(name) {
+    return refused(Refusal::AlreadyExists {
+      existing: to_wire_volume(existing.id),
+    });
+  }
+  let admitted = match admit_clone(state, handle, &record, snapshot) {
+    Ok(admitted) => admitted,
+    Err(reply) => return *reply,
+  };
+  match publish_clone_as(
+    state,
+    principal,
+    handle,
+    &record,
+    (snapshot, name),
+    admitted,
+    id,
+  )
+  .and_then(|id| crate::image::publish_new_volume(state, id).map(|()| id))
+  {
+    Ok(id) => ReplyBody::Cloned {
+      id: to_wire_volume(id),
+    },
+    Err(refusal) => refused(refusal),
+  }
+}
+
+/// Releases the alias the name's partition holds for `id`, a volume of this partition destroyed under `name` (A-229,
+/// `slates_db::alias::DESTROY_STEPS`). Nothing when the name hashes here, which holds no alias for it. The release is a
+/// message to the name's shard, which takes it only while its alias still names `id`; one not taken (refused,
+/// counted) is the next recovery's to release.
+pub(crate) fn release_name_alias(state: &ShardState, id: DbVolumeId, name: &str) {
+  let name_partition = owner_of_name(name, state.shards.len());
+  if name_partition == state.partition {
+    return;
+  }
+  let Some(name_shard) = shard_of_partition(state, name_partition) else {
+    return;
+  };
+  let name = name.to_owned();
+  crate::xshard::run_on_counted(state.shard, name_shard, move |s| {
+    if s
+      .db
+      .partition()
+      .name_alias(&name)
+      .is_some_and(|alias| alias.volume == id)
+      && alias_step(s, &Op::NameAliasReleased { name }).is_err()
+    {
+      s.count(ALIAS_STEP_UNTAKEN, 1);
+    }
+  });
 }
 
 /// Admits a clone of `record`'s volume (in slot `handle`) at `snapshot` (§4.2: every credit reserved, or none) and
@@ -6193,6 +6365,28 @@ pub(crate) fn publish_clone(
     discard_clone(state, origin, snapshot, admitted);
     return Err(ids_exhausted());
   };
+  publish_clone_as(
+    state,
+    principal,
+    origin,
+    record,
+    (snapshot, name),
+    admitted,
+    id,
+  )
+}
+
+/// [`publish_clone`] under an id chosen before (A-229: the id the name's alias already names).
+#[allow(clippy::too_many_arguments)] // publish_clone's arguments and the id it would choose
+pub(crate) fn publish_clone_as(
+  state: &mut ShardState,
+  principal: &Principal,
+  origin: Handle<VolumeSlot>,
+  record: &VolumeRecord,
+  (snapshot, name): (SnapshotId, &str),
+  admitted: Admitted,
+  id: DbVolumeId,
+) -> Result<DbVolumeId, Refusal> {
   let now = state.clock.monotonic_ns();
   let mut new_record = record.clone();
   new_record.id = id;
@@ -7627,6 +7821,11 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
           },
         );
       let now = state.clock.monotonic_ns();
+      let name = state
+        .db
+        .partition()
+        .volume(id)
+        .map(|record| record.name.clone());
       if let Err(e) = state
         .db
         .mutate(&mut state.segment, &Op::VolumeDestroyed { id }, now)
@@ -7639,6 +7838,10 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
         continue;
       }
       any = true;
+      // A clone whose name hashes elsewhere gives its alias back there (A-229).
+      if let Some(name) = name {
+        release_name_alias(state, id, &name);
+      }
       if let Some((origin_volume, origin_snapshot)) = origin_pin
         && let Some(origin_handle) = state.by_id.get(&origin_volume).copied()
       {
@@ -9304,12 +9507,21 @@ fn complete_recovered_destroys(state: &mut ShardState) -> usize {
   let now = state.clock.monotonic_ns();
   let mut completed: usize = 0;
   for id in destroying {
+    let name = state
+      .db
+      .partition()
+      .volume(id)
+      .map(|record| record.name.clone());
     if state
       .db
       .mutate(&mut state.segment, &Op::VolumeDestroyed { id }, now)
       .is_ok()
     {
       completed = completed.saturating_add(1);
+      // A clone whose name hashes elsewhere gives its alias back there (A-229).
+      if let Some(name) = name {
+        release_name_alias(state, id, &name);
+      }
     }
   }
   retire_local_tombstones(state);

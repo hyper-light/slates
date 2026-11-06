@@ -31,7 +31,7 @@ use slates_anchor::{AnchorSegment, RegionKind};
 use slates_client::{
   Client, ClientError, CreateSpec, Deadlines, NamePolicy, SizeClass, SnapshotId, VolumeId,
 };
-use slates_ipc::protocol::{Filter, ReplyBody, RequestBody};
+use slates_ipc::protocol::{Filter, Refusal, ReplyBody, RequestBody};
 use slates_machine::MachineProfile;
 use slates_server::{BootFault, BootFaultKind, Daemon, DaemonConfig};
 use slates_wire::request::RequestId;
@@ -402,6 +402,117 @@ fn acknowledged_content_and_its_snapshot_survive_a_daemon_restart_byte_for_byte(
   );
   second.stop();
   drop(anchor);
+}
+
+/// A clone name that routes, by name, to a partition other than its origin `origin_name`'s, on a daemon of
+/// `partitions` (A-229): the case a clone's alias exists for. With one partition every name routes to the origin's,
+/// so the stem is taken as it is: the same history, the degenerate case (R8).
+fn clone_name_elsewhere(origin_name: &str, stem: &str, partitions: u16) -> String {
+  let partitions = usize::from(partitions);
+  let origin = slates_server::verbs::owner_of_name(origin_name, partitions);
+  (0..64)
+    .map(|suffix| format!("{stem}-{suffix}"))
+    .find(|candidate| {
+      partitions == 1 || slates_server::verbs::owner_of_name(candidate, partitions) != origin
+    })
+    .unwrap_or_else(|| stem.to_owned())
+}
+
+/// What one run of [`a_clone_named_on_another_partition_is_reached_by_name_and_held_once`] saw, compared between one
+/// partition and two.
+#[derive(Debug, PartialEq, Eq)]
+struct CloneNameSeen {
+  read: Vec<u8>,
+  second_create_refused: bool,
+  read_after_restart: Vec<u8>,
+  second_create_refused_after_restart: bool,
+  created_after_destroy: bool,
+}
+
+/// One run of the clone-name history on a daemon of `shards` shards (see the test).
+fn clone_name_history(shards: u16) -> CloneNameSeen {
+  let profile = common::machine_profile();
+  let instance = format!("srv-clone-name-{shards}-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(shards));
+  let anchor = held_anchor(&format!("clone-name-{shards}"), &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let origin = client.create(&scratch("clone-origin")).unwrap();
+  {
+    let mut stream = nfs_stream(&first);
+    let root = mount(&mut stream, &capability_path(&first, "clone-origin"), 1);
+    let file = create(&mut stream, &root, "f", 2);
+    write(&mut stream, &file, BEFORE, 3);
+  }
+  let snapshot = client.snapshot(origin).unwrap();
+  let name = clone_name_elsewhere("clone-origin", "the-clone", shards);
+  let clone = client.clone_snapshot(origin, snapshot, &name).unwrap();
+  let read = read_file(&first, &name, "f");
+  let second_create_refused = matches!(
+    client.create(&scratch(&name)),
+    Err(ClientError::Refused(Refusal::AlreadyExists { .. }))
+  );
+  first.stop();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let read_after_restart = read_file(&second, &name, "f");
+  let second_create_refused_after_restart = matches!(
+    client.create(&scratch(&name)),
+    Err(ClientError::Refused(Refusal::AlreadyExists { .. }))
+  );
+  client.destroy(clone).unwrap();
+  let started = Instant::now();
+  let created_after_destroy = loop {
+    match client.create(&scratch(&name)) {
+      Ok(_) => break true,
+      Err(ClientError::Refused(Refusal::AlreadyExists { .. }))
+        if started.elapsed() < START_WAIT =>
+      {
+        #[allow(clippy::disallowed_methods)] // a test waiting out the destroy's slices
+        std::thread::sleep(Duration::from_millis(10));
+      }
+      Err(_) => break false,
+    }
+  };
+  second.stop();
+  drop(anchor);
+  CloneNameSeen {
+    read,
+    second_create_refused,
+    read_after_restart,
+    second_create_refused_after_restart,
+    created_after_destroy,
+  }
+}
+
+/// A-229 (§4.8 "Lookup"; `docs/bugs/2026-09-13-clone-name-not-routable-by-hash.md`), with its N=1 differential (R8).
+/// Do: on a daemon of two shards, clone a snapshot under a name that routes to the other partition; read the clone's
+/// file through an NFS mount by that name; create a volume of the name; restart the daemon over the same anchor RAM and
+/// do both again; destroy the clone and create the name once more. Then the same history on one shard. Expect: the
+/// clone read by name, every second create refused `AlreadyExists`, both after the restart too, the name free once the
+/// clone is destroyed, and the one-shard daemon seeing exactly the same. Before A-229 the clone answered `NOENT` by
+/// name on two shards and a second volume of its name was created.
+#[test]
+fn a_clone_named_on_another_partition_is_reached_by_name_and_held_once() {
+  let fleet_like = clone_name_history(TEST_SHARDS);
+  assert_eq!(fleet_like.read, BEFORE, "the clone is read by its name");
+  assert!(
+    fleet_like.second_create_refused,
+    "a second volume of the clone's name is refused"
+  );
+  assert_eq!(fleet_like.read_after_restart, BEFORE, "and after a restart");
+  assert!(
+    fleet_like.second_create_refused_after_restart,
+    "and after a restart"
+  );
+  assert!(
+    fleet_like.created_after_destroy,
+    "the name is free once the clone is destroyed"
+  );
+  let laptop = clone_name_history(1);
+  assert_eq!(laptop, fleet_like, "one partition sees what two do (R8)");
 }
 
 /// A one-file archive of `bytes` as one raw chunk, with the format's own header bounds — the replica the

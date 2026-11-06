@@ -704,6 +704,61 @@ fn route(program: u32, procedure: u32, args: &[u8]) -> Option<u16> {
   .flatten()
 }
 
+/// [`route`], with a call that names a volume by its mount name (a root `LOOKUP`, a `MNT`, a `UMNT`) asked of the
+/// name's partition first (A-229): that partition holds the name, as a volume of its own or as an alias of a clone
+/// another partition holds beside its origin, and says which partition serves it.
+async fn routed(this: u16, program: u32, procedure: u32, args: &[u8]) -> Option<u16> {
+  let Some(name) = root_mount_name(program, procedure, args) else {
+    return route(program, procedure, args);
+  };
+  let (name_partition, name_shard, here) = state::with_state(|s| {
+    let partition = owner_of_name(&name, s.shards.len());
+    (
+      partition,
+      s.shards.get(usize::from(partition)).copied(),
+      partition == s.partition,
+    )
+  })?;
+  let served = if here {
+    state::with_state(|s| served_partition(s, &name))?
+  } else {
+    let name_shard = name_shard?;
+    crate::xshard::call_within(
+      this,
+      name_shard,
+      move |s| served_partition(s, &name),
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await
+    // Unanswered, the call goes to the name's own shard, as it did before aliases: a clone's name then misses there.
+    .unwrap_or(name_partition)
+  };
+  state::with_state(|s| {
+    if served == s.partition {
+      return None;
+    }
+    s.shards.get(usize::from(served)).copied()
+  })
+  .flatten()
+}
+
+/// The partition that serves the volume `name` names, as its name's partition (this one) holds it (A-229): this one
+/// when it holds a volume of that name or nothing for it (a lookup then misses here), the clone's when a confirmed
+/// alias names one. A reserved alias resolves nothing until confirmed, so a lookup of it misses here, by kind.
+fn served_partition(s: &mut ShardState, name: &str) -> u16 {
+  let partition = s.db.partition();
+  if partition.volume_by_name(name).is_none()
+    && let Some(volume) = partition
+      .name_alias(name)
+      .and_then(slates_db::alias::resolve)
+  {
+    return owner_of(slates_ipc::protocol::VolumeId {
+      bytes: volume.bytes,
+    });
+  }
+  s.partition
+}
+
 /// The shard for the partition that owns `name` (`owner_of_name` over `state.shards.len()`, the same
 /// count the create used), or `None` when that partition is this shard's. A friendly-name root
 /// `LOOKUP`/`MNT` routes here to the shard holding the named volume, which resolves the name against
@@ -1505,7 +1560,7 @@ async fn serve_v3(
   }
   let started = slates_machine::clock::monotonic_ns();
   let started_cpu = thread_cpu_ns();
-  let (forwarded, served) = match route(program, procedure, &args) {
+  let (forwarded, served) = match routed(this, program, procedure, &args).await {
     Some(owner) => (
       true,
       serve_remote(owner, this, requester, xid, program, procedure, args, port).await,

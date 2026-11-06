@@ -5204,6 +5204,20 @@ context. A name is not a host pathname or a bearer capability. Fleet-wide enumer
 owners, each answer linearizable at its owner and the whole labelled with the configuration
 version.
 
+> **Status (2026-11-06, A-229: a clone's name at its name's partition).** Within a daemon a name routes by its hash to
+> one partition (`owner_of_name`), where it is looked up and where its uniqueness is decided. A clone lives beside its
+> origin, for copy-on-write, so when its name hashes elsewhere, the name's partition holds an alias pointing at the
+> clone (`slates_db::catalog::NameAliasRecord`). A lookup by name still routes by hash, and the name's partition says
+> where the name is served: its own volume, or the clone's partition through a confirmed alias (`nfs::routed`). A
+> second create of the name meets the alias there and is refused `AlreadyExists`. The clone is made by a reservation
+> protocol over the two partitions (`slates_db::alias`): reserve the alias, make the clone, confirm the alias. A
+> reserved alias holds the name and resolves nothing until it is confirmed. A refused clone releases its reservation,
+> a destroyed clone releases its alias, and a recovery reconciles every alias against the clone it names, before any
+> client is admitted. Proven by a crash at every step of both protocols (`crates/db/tests/alias.rs`) and by a
+> two-partition history and its one-partition differential (R8), restart included
+> (`a_clone_named_on_another_partition_is_reached_by_name_and_held_once`, `crates/server/tests/recovery.rs`). With one
+> partition no alias is ever made.
+
 > **Status (2026-10-07, same-region lookups).** A lookup by id now reaches its creator from any node of the
 > creator's own region, not only from another region. Before, the server forwarded only a volume homed in another
 > region, and a client of another node in the owner's region was answered `NotFound` (found on two Docker
@@ -13083,6 +13097,45 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Arm64 Windows proven** since (2026-10-27): the direct-map client tests, 20 of 20, on CI's `windows-11-arm` (run
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
+
+### A-229 — A clone's name is held at its name's partition by an alias, made by a reservation protocol (accepted 2026-11-06, the supervisor's decision: option 3)
+Applied in the same change to: §4.8 "Lookup" (its status), GAPS, the bug record of 2026-09-13
+(`clone-name-not-routable-by-hash`), `crates/db` (`alias.rs`, new; `catalog::NameAliasRecord`; three appended ops,
+`NameAliasReserved`, `NameAliasConfirmed`, `NameAliasReleased`; the partition's alias table, its guards, its snapshot
+field, appended; `tests/alias.rs`, new), and `crates/server` (`verbs.rs`: the clone across two partitions, the alias's
+release at each destroy; `nfs.rs`: a name-routed call asks the name's partition where it is served; `daemon.rs`: the
+recovery's reconcile, and `mount_capability` follows the alias; `image.rs`: `publish_new_volume` shared;
+`tests/recovery.rs`: the history and its N=1 differential).
+- **What was wrong.** A clone lives on its origin's partition, since it shares the origin's copy-on-write tree, but a
+  name is looked up, and kept unique, on the partition its hash names. A clone whose name hashed elsewhere answered
+  `NOENT` by name over the mount transport, and a second volume of its name could be created.
+- **The rule.** The name's partition holds the name, as a volume of its own or as an alias of a clone another partition
+  holds. A lookup routes by hash, and the name's partition answers where the name is served. A create of a held name is
+  refused by kind there.
+- **The protocol** (`slates_db::alias::CLONE_STEPS`, each step one durable operation on one partition):
+  1. reserve the alias at the name's partition, refused `AlreadyExists` when the name is held;
+  2. make the clone at the origin's partition under the id the alias names, with its completion record;
+  3. confirm the alias, or release it when the clone was refused, before the reply.
+
+  A destroy releases the alias after the clone's record goes, and only while the alias still names it.
+- **Crash safety.** A reserved alias holds the name and resolves nothing. A recovery reconciles each alias against the
+  volume its id names (`slates_db::alias::reconcile`): it confirms one whose clone exists under its name and releases
+  the rest. It runs before any client is admitted, the one moment no clone is between its steps; a reconcile while one
+  was would release its reservation. After a crash at any step and its recovery, the name belongs to no one or
+  resolves to the clone that holds it.
+- **Rejected:** refusing a clone name that hashes elsewhere (a rule a user cannot predict), and scattering a lookup
+  over every partition on a miss (against D-14's "ids route to owners" at fleet scale).
+- **Evidence.**
+  - `crates/db/tests/alias.rs`: a crash after every step of the clone and of the destroy, with both partitions dropped
+    and recovered from the segment, checks the unreconciled name, then the reconciled one; a refused clone gives its
+    name back; a name is held once by a volume or an alias.
+  - `a_clone_named_on_another_partition_is_reached_by_name_and_held_once`: two shards and one, restart included. Red at
+    main (`00e5269c`: no volume by the clone's name on its name's partition). Red again with the alias routing
+    disabled (`MNT` answered `NOENT`). Green after.
+  - slates-db 124/0 (the alias suite 5); slates-server lib, daemon, recovery and nfs_mount 294/0.
+- **What it does not change.** Lookups by id, and a create whose name hashes to its own partition. The siblings found
+  are left as they were: `ImageBuild` and `ImageMerge` make a named volume on the origin's partition with the same
+  local-only name check, and a fleet takeover that moves a clone off its host is outside this daemon's partitions.
 
 ### A-220 — macOS hands a client its region as a Mach fileport, never by a name a stranger could open (accepted 2026-11-06, GAP-A9-9's ring half)
 Applied in the same change to: §4.7 (the macOS rendezvous), GAPS (GAP-A9-9), `crates/ipc` (`mach_claim.rs`, new;

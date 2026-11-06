@@ -1071,6 +1071,8 @@ pub(crate) fn destroy_merge_volume(
       return Some(refused(refusal_of_db(&e)));
     }
   }
+  // A volume whose name hashes elsewhere gives its alias back there (A-229).
+  crate::verbs::release_name_alias(state, id, &record.name);
   crate::verbs::retire_local_tombstones(state);
   // A retired work may have held the oldest reachable version of its green: fold and credit. A
   // destroyed green credits everything it charged as retention.

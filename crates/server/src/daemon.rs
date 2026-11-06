@@ -2608,7 +2608,23 @@ impl Daemon {
   /// not a wire surface); the typed refusal when the name's owner shard could not be observed, `Ok(None)`
   /// when no volume has that name there or the secure random could not mint a token.
   pub fn mount_capability(&self, name: &str) -> Result<Option<String>, ObserveError> {
+    // The name's partition says where its volume is served: its own, or a clone's beside its origin (A-229).
     let partition = verbs::owner_of_name(name, self.shards.len());
+    let asked = name.to_owned();
+    let partition = self.observe(self.shards.get(usize::from(partition)).copied(), move |s| {
+      let held = s.db.partition();
+      match held.volume_by_name(&asked) {
+        Some(_) => s.partition,
+        None => held
+          .name_alias(&asked)
+          .and_then(slates_db::alias::resolve)
+          .map_or(s.partition, |volume| {
+            verbs::owner_of(slates_ipc::protocol::VolumeId {
+              bytes: volume.bytes,
+            })
+          }),
+      }
+    })?;
     let name = name.to_owned();
     self.observe(self.shards.get(usize::from(partition)).copied(), move |s| {
       let record = s.db.partition().volume_by_name(&name)?.clone();
@@ -4118,6 +4134,69 @@ async fn restore_client_ids(listener: &mut Listener, origin: u16, shards: &[Shar
   true
 }
 
+/// A recovery's reconciliation of every name alias (A-229, `slates_db::alias::reconcile`): each shard's aliases asked
+/// for, the volume each names asked of its partition, and the alias confirmed when that volume holds the name, released
+/// when it does not. Run before any client is admitted, when no clone is between its steps. An alias whose question is
+/// unanswered is left as it is, for the next start: a reserved one resolves nothing meanwhile. The aliases reconciled.
+async fn reconcile_name_aliases(origin: u16, shards: &[ShardId]) -> usize {
+  let mut reconciled = 0usize;
+  for shard in shards {
+    let Some(aliases) = crate::xshard::call_within(
+      origin,
+      shard.0,
+      |s| s.db.partition().name_aliases().cloned().collect::<Vec<_>>(),
+      LIVENESS_BUDGET_NS,
+    )
+    .await
+    else {
+      continue;
+    };
+    for alias in aliases {
+      let partition = crate::verbs::owner_of(slates_ipc::protocol::VolumeId {
+        bytes: alias.volume.bytes,
+      });
+      let id = alias.volume;
+      let volume = match shards.get(usize::from(partition)) {
+        Some(owner) => {
+          let Some(volume) = crate::xshard::call_within(
+            origin,
+            owner.0,
+            move |s| s.db.partition().volume(id).cloned(),
+            LIVENESS_BUDGET_NS,
+          )
+          .await
+          else {
+            continue;
+          };
+          volume
+        }
+        // A partition this daemon does not have holds nothing.
+        None => None,
+      };
+      let op = match slates_db::alias::reconcile(&alias, volume.as_ref()) {
+        slates_db::alias::Reconciled::Keep => continue,
+        slates_db::alias::Reconciled::Confirm => {
+          slates_db::Op::NameAliasConfirmed { name: alias.name }
+        }
+        slates_db::alias::Reconciled::Release => {
+          slates_db::Op::NameAliasReleased { name: alias.name }
+        }
+      };
+      let settled = crate::xshard::call_within(
+        origin,
+        shard.0,
+        move |s| crate::verbs::alias_step(s, &op).is_ok(),
+        LIVENESS_BUDGET_NS,
+      )
+      .await;
+      if settled == Some(true) {
+        reconciled = reconciled.saturating_add(1);
+      }
+    }
+  }
+  reconciled
+}
+
 /// Shard `shard`'s retained client-id high-water mark. The question is asked once and awaited one liveness window at a
 /// time for as long as the shard is still working: it queues behind the shard's start, which runs recovery as one step
 /// and may outlast a window (GAPS boot, 2026-10-05). After a window with no answer, the shard's thread must have used
@@ -4237,6 +4316,14 @@ async fn control_loop(
       "slates-server: the boot is refused; the heartbeat stops so the anchor restarts this daemon"
     );
     return;
+  }
+  // Every shard has recovered and no client is admitted yet, so no clone is between its steps: the names' aliases are
+  // reconciled with the clones they name (A-229).
+  let reconciled = reconcile_name_aliases(control, &shards).await;
+  if reconciled > 0 {
+    slates_machine::log_line!(
+      "slates-server: {reconciled} name alias(es) reconciled with their clones at recovery"
+    );
   }
   // Clients this daemon handed out, so a wanted id that is live is not given twice; bounded
   // by the daemon's client capacity, refused typed beyond it (AC-2.6). A client's shard is

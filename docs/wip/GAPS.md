@@ -1,5 +1,17 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A clone's name is held at its name's partition (2026-11-06, A-229, bug-sweep; the supervisor's option 3).** A clone
+> whose name hashed to another partition than its origin's was unreachable by name over the mount transport, and its
+> name could be created twice (bug record of 2026-09-13).
+> - Now the name's partition holds an alias pointing at the clone. It is made by a reservation protocol (reserve, make
+>   the clone, confirm), released on a refused clone and on a destroy, and reconciled at every recovery before clients
+>   are admitted.
+> - `crates/db/tests/alias.rs` crashes at every step. `a_clone_named_on_another_partition_is_reached_by_name_and_held_once`
+>   runs two shards and its one-shard differential, restart included; it was red at main and red with the routing off.
+> - **Siblings open:** `ImageBuild` and `ImageMerge` make a named volume on the origin's partition with a local-only
+>   name check, the same bug class. Also, an alias step the name's shard did not take (`names.alias_step_untaken`)
+>   leaves a reserved alias that resolves nothing until the next recovery.
+
 > **GAP-A9-9 on macOS, the ring half: a client's region crosses as a Mach fileport, never by name (2026-11-06, A-220,
 > bug-sweep; the rest open).** A same-uid stranger could open any client's ring by the name the claim slot published
 > (measured 2026-10-18). Now:
