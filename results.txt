@@ -1,0 +1,96 @@
+runner windows-latest, 4 CPUs, Fri Nov  6 06:52:09 UTC 2026, fix 45c079ed9a4377e30bb9ecc03425b49fd3ff1e8e
+test a_winfsp_flush_on_a_live_volume_answers_only_once_a_candidate_holds_it has been running for over 60 seconds
+thread 'a_winfsp_flush_on_a_live_volume_answers_only_once_a_candidate_holds_it' (816) panicked at crates\cli\tests\live_winfsp.rs:277:5:
+test a_winfsp_flush_on_a_live_volume_answers_only_once_a_candidate_holds_it ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 60.82s
+== red exit 101
+live winfsp flush: healthy Ok(()); candidates suspended Err(Os { code: 1117, kind: Uncategorized, message: "The request could not be performed because of an I/O device error." }) after 1.0283979s; resumed Ok(()); owner's live counters {"fleet.live.appended": 6, "fleet.live.durable": 5, "fleet.live.no_session": 65, "fleet.live.refused": 4, "fleet.live.unanswered": 41, "winfsp.live_flush_held": 3, "winfsp.live_flush_refused": 1}
+test a_winfsp_flush_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.37s
+== fix 1 exit 0
+test a_winfsp_flush_on_a_live_volume_answers_only_once_a_candidate_holds_it has been running for over 60 seconds
+thread 'a_winfsp_flush_on_a_live_volume_answers_only_once_a_candidate_holds_it' (2840) panicked at crates\cli\tests\live_winfsp.rs:245:5:
+test a_winfsp_flush_on_a_live_volume_answers_only_once_a_candidate_holds_it ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 60.43s
+== fix 2 exit 101
+test a_winfsp_flush_on_a_live_volume_answers_only_once_a_candidate_holds_it has been running for over 60 seconds
+thread 'a_winfsp_flush_on_a_live_volume_answers_only_once_a_candidate_holds_it' (9072) panicked at crates\cli\tests\live_winfsp.rs:245:5:
+test a_winfsp_flush_on_a_live_volume_answers_only_once_a_candidate_holds_it ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 60.37s
+== fix 3 exit 101
+  fix-tail: slates daemon: log_bytes_per_partition = 715598336: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+  fix-tail: slates daemon: snapshot_bytes_per_partition = 1431196672: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+  fix-tail: slates daemon: archive_slice_bytes = 4155: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+  fix-tail: slates daemon: memcpy_bytes_per_second = 5574196292: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+  fix-tail: slates daemon: copy_slice_bytes = 5044: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+  fix-tail: slates daemon: codec = lz4 false, zstd levels [], byte worth 179 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+  fix-tail: slates daemon: seal_key_slots = 256: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+  fix-tail: slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+  fix-tail: slates daemon: max_inodes = 1242358: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+  fix-tail: slates daemon: max_dirs = 937260: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+  fix-tail: slates daemon: max_chunks = 698826: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+  fix-tail: slates daemon: metadata_class_bytes = 2862393344: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+  fix-tail: slates daemon: digest_cache_entries = 116471: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+  fix-tail: slates daemon: spin_shift = 14: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+  fix-tail: slates daemon: clients_per_shard = 2647: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+  fix-tail: slates daemon: direct_maps_per_shard = 698826: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "ma
+  fix-tail: slates daemon: landings_awaiting_per_shard = 5294: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+  fix-tail: slates daemon: tasks_per_shard = 5299: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+  fix-tail: slates daemon: idle_window_ns = 181000: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+  fix-tail: slates daemon: guest_listing_entries = 0: none: a Windows guest's stream ends with its daemon, so no number it holds outlives a restart (anchors [])
+  fix-tail: slates daemon: inode_reserve = 18876: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+  fix-tail: slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+  fix-tail: slates daemon: nfs_v4_clients = 2632: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+  fix-tail: slates daemon: nfs_v4_record_bytes = 357799168: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+  fix-tail: slates daemon: nfs_v4_opens = 2484716: max_inodes × shards (anchors ["max_inodes", "shards"])
+  fix-tail: slates daemon: nfs_v4_locks = 2484716: max_inodes × shards (anchors ["max_inodes", "shards"])
+  fix-tail: slates daemon: fleet_sessions_per_plane = 1986: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+  fix-tail: slates daemon: fleet_session_receive_bytes = 120107: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+  fix-tail: slates daemon: read_ahead_bytes = 79510834: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+  fix-tail: slates daemon: fleet_tasks_per_shard = 5301: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+  fix-tail: slates daemon: instance lwa6700 serving on 2 shards under the anchor
+  fix-tail: slates-server: shard 1 initialized in 1598 µs
+  fix-tail: slates-server: shard 0 initialized in 8694 µs
+  fix-tail: slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, ex
+  fix-tail: slates-cluster: fleet: HostId(10298874889496065361) holds HostId(3326385440238418952) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates\server\src\fleet.rs:587:7
+  fix-tail: slates-cluster: fleet: HostId(3326385440238418952) holds HostId(10298874889496065361) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates\server\src\fleet.rs:587:7
+  fix-tail: slates-cluster: fleet: HostId(10575914148289358443) holds HostId(10298874889496065361) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates\server\src\fleet.rs:587:7
+  fix-tail: slates-cluster: fleet: HostId(10298874889496065361) holds HostId(10575914148289358443) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates\server\src\fleet.rs:587:7
+  fix-tail: slates-cluster: fleet: HostId(10298874889496065361) holds HostId(10575914148289358443) alive: None -> MemberState { liveness: Alive, incarnation: 0slates-cluster: fleet:  }, folded at crates\server\src\member_task.rs:616:9
+  fix-tail: HostId(10575914148289358443) holds HostId(10298874889496065361) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates\server\src\member_task.rs:616:9
+  fix-tail: slates-server: fleet: a serve socket's receive loop ended: Io(DriverRefused { call: "recvfrom", code: Some(10054) })
+  fix-tail: slates-cluster: fleet: HostId(10575914148289358443) holds HostId(3326385440238418952) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates\server\src\fleet.rs:587:7
+  fix-tail: slates-cluster: fleet: HostId(3326385440238418952) holds HostId(10575914148289358443) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates\server\src\fleet.rs:587:7
+  fix-tail: slates-server: fleet: no reply from 127.0.0.1:36903 through 2 handshake budgets; dialing afresh from a new port
+  fix-tail: slates-server: fleet: no reply from 127.0.0.1:36903 through 2 handshake budgets; dialing afresh from a new port
+  fix-tail: test a_winfsp_flush_on_a_live_volume_answers_only_once_a_candidate_holds_it has been running for over 60 seconds
+  fix-tail: 
+  fix-tail: thread 'a_winfsp_flush_on_a_live_volume_answers_only_once_a_candidate_holds_it' (9072) panicked at crates\cli\tests\live_winfsp.rs:245:5:
+  fix-tail: the fleet formed: [Some(("10298874889496065361", 3, 1)), Some(("3326385440238418952", 3, 0)), Some(("10575914148289358443", 3, 1))]
+  fix-tail: note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+  fix-tail: test a_winfsp_flush_on_a_live_volume_answers_only_once_a_candidate_holds_it ... FAILED
+  fix-tail: 
+  fix-tail: failures:
+  fix-tail: 
+  fix-tail: failures:
+  fix-tail:     a_winfsp_flush_on_a_live_volume_answers_only_once_a_candidate_holds_it
+  fix-tail: 
+  fix-tail: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 60.37s
+  fix-tail: 
+  fix-tail: [1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_winfsp`
+test a_cached_read_through_a_winfsp_mount_shows_another_paths_change ... slates-server: shard 1 initialized in 2393 µs
+test a_file_at_a_two_thousand_unit_path_is_served_across_a_killed_daemon ... slates-server: shard 0 initialized in 8089 µs
+test a_mapped_view_through_a_winfsp_mount_after_another_paths_change ... slates-server: shard 0 initialized in 7961 µs
+test a_process_outside_the_anchor_cannot_take_either_holders_mount_handles ... slates-server: shard 0 initialized in 8510 µs
+test a_refused_mount_time_hold_leaves_nothing_mounted ... slates-server: shard 0 initialized in 9734 µs
+test a_release_the_anchor_does_not_answer_leaves_no_drive_held ... slates-server: shard 0 initialized in 7939 µs
+test a_second_daemon_cannot_take_an_instance_with_a_live_winfsp_drive ... slates-server: shard 0 initialized in 7590 µs
+test a_volume_mounted_through_winfsp_is_read_and_written_by_windows_programs ... slates-server: shard 0 initialized in 8408 µs
+test a_winfsp_drive_handle_and_view_survive_twenty_killed_daemons ... slates-server: shard 0 initialized in 8544 µs
+test a_winfsp_folder_bound_into_a_process_isolated_container ... ok
+test a_winfsp_view_follows_its_file_after_an_sdk_rename ... slates-server: shard 1 initialized in 2321 µs
+test a_winfsp_view_of_a_renamed_file_follows_its_successor ... slates-server: shard 0 initialized in 8107 µs
+test foreign_process_role ... ignored, the independent Windows access probe, re-invoked by its parent
+test opens_past_a_thousand_units_are_refused_only_by_the_winfsp_driver ... slates-server: shard 0 initialized in 8018 µs
+test result: ok. 13 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 115.28s
+== winfsp suite exit 0
