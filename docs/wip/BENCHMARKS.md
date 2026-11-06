@@ -8330,6 +8330,56 @@ At 3 to 5 runnable threads a core, both arms' tails are the host's: in B's run, 
 had under 1 ms of CPU. So the table is informational; the CPU count is the measurement. Still owed: the boot's two
 whole give-backs a shard, to be sliced; the latency again on a quiet Mac; and Linux and Windows (diag-perf-5).
 
+**A-226 and the scheduling slice on CI (diag-perf-5, run 42173825162, 2026-11-06 06:25 to 06:56 UTC).** Three builds
+from one workflow (`.github/workflows/diag-perf.yml` on branch `diag-perf-5`, never main), interleaved × 3. base =
+`83803328`; fix = `cd582843` (A-226); and fix with each slates thread asking EEVDF for a 100 µs slice
+(`--sched-slice-ns 100000`, harness-only, read back as held). All with the product's client spin. Linux was run
+under the controlled load (`systemd-run --user --scope -p AllowedCPUs=0-1 -p MemoryMax=256M`, two spinners a core, a
+sibling `dd conv=fsync` writer; kernel 7.0.0-1017-azure) and then quiet, paced (`--pause-ns 2000000`) and unpaced.
+Windows (no cgroup to confine it) was quiet only, paced and unpaced. 10 and 1,000 files; p99 and max ranges over the
+three rounds, in ms:
+
+| Runner, run | base | fix (A-226) | fix + 100 µs slice |
+|---|---|---|---|
+| ubuntu-latest, loaded, accept | p99 5.36–7.06, max 10.9–15.9 | 6.07–15.4, 15.1–22.0 | **1.88–3.95, 2.36–5.62** |
+| ubuntu-latest, loaded, conflict | 4.53–15.9, 10.3–22.1 | 6.08–18.3, 13.0–23.0 | **1.91–3.08, 3.00–4.79** |
+| ubuntu-24.04-arm, loaded, accept | 9.00–35.0, 16.0–37.1 | 20.2–34.9, 35.0–44.0 | **2.15–9.98, 3.49–12.0** |
+| ubuntu-24.04-arm, loaded, conflict | 7.67–34.9, 17.7–37.1 | 24.1–35.0, 35.0–37.1 | **2.20–9.99, 4.32–13.0** |
+| ubuntu-latest, paced / unpaced, accept | 0.09–0.17 / 0.04–0.06 | 0.11–0.13 / 0.04–0.06 | 0.07–0.12 / 0.04–0.08 |
+| ubuntu-24.04-arm, paced / unpaced, accept | 0.05–0.09 / 0.04–0.05 | 0.04–0.08 / 0.04–0.05 | 0.05–0.06 / 0.04–0.05 |
+| windows-latest, paced, accept | **1.21–1.40**, max 20.8–34.3 | **0.42–0.76**, 30.7–34.0 | (not run) |
+| windows-latest, unpaced, accept | 0.12–0.15 | 0.12–0.15 | (not run) |
+| windows-11-arm, paced, accept | 0.52–0.67, max 1.6–9.2 | 0.48–0.70, 2.9–4.1 | (not run) |
+| windows-11-arm, unpaced, accept | 0.06–0.08 | 0.06–0.07 | (not run) |
+
+- A-226 on Linux: even, under load and quiet. Linux's give-back is a hole punch, and its loaded tail is the
+  scheduler's. On Windows x86_64 the paced accept p99 halved and fell under 1 ms. Every paced Windows x86_64 run of
+  either build also keeps a p999 and max of 20 to 34 ms, a tail of its own, not yet traced.
+- The slice cuts the loaded p99 3 to 4 times and the max 3 to 5 times on both Linux architectures, against the same
+  build without it, every round. It costs the loaded p50 (accept at 10 files 81 to 393 µs on x86_64, against 19 to 21
+  µs; arm64 38 to 514 µs, one 1,000-file round 5.2 ms), and nothing quiet. A loaded arm64 run of base or fix stopped
+  short of 1,000 samples in several rounds (the 20 s budget), and none with the slice. By the supervisor's rule this
+  makes A-224.
+- The arms of base and fix that stopped short (arm64, loaded) are counted as run; their percentiles are over the
+  samples taken (at least 200).
+
+**Edit and submit in one request, across two machines (A-225, 2026-11-06 07:49 to 07:59 UTC).** The fleet of "Across two
+machines" again. Server node: adas-macbook-pro-2 at 192.168.1.71. Client node: kiln-a094a12d at 192.168.1.72, load 6.2
+to 10.0. Both are on Wi-Fi; ICMP RTT was 3.92/8.48/58.7 ms (min/avg/max) before and 3.83/5.33/7.41 ms after. Both
+nodes ran release builds of this tree, the client's built in a capped `systemd-run --user` unit. The green: 100 files
+of 4 KiB on the server node, shared with the client's uid. Command on the client machine: `edit_merge_bench --instance
+perf-cli --green ID --shards 2 --quiet-only --files 100 --form ping --form accept --form accept_one` (round 2 with the
+two accept forms in the other order). 3 runs × up to 1,000 samples; a run stops at 20 s:
+
+| round | ping p50 | accept (edit + submit) p50 | of which edit, submit | accept_one p50 |
+|---|---|---|---|---|
+| 1 | 6.13 ms | 14.1 ms | 6.88, 7.06 ms | 6.93 ms |
+| 2 | 7.74 ms | 18.6 ms | 8.67, 8.04 ms | 7.81 ms |
+| 3 | 7.66 ms | 14.8 ms | 7.07, 7.04 ms | 7.03 ms |
+
+One request is one forwarded round trip: `accept_one` costs a ping. The p99 is the link's: accept 138 to 158 ms,
+accept_one 70 to 132 ms.
+
 **Across two machines (item 2, 2026-11-06 03:14 to 03:21 UTC).** A two-node fleet from one manifest (`f = 0`): the server
 node on adas-macbook-pro-2 (192.168.1.71, Wi-Fi, load 15 to 24) and the client node on kiln-a094a12d (Fedora, x86_64,
 32 cores, 192.168.1.72, Wi-Fi, load 6 to 42), each `slates daemon --quick --shards 2 --fleet fleet.json --node N`, release

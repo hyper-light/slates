@@ -233,6 +233,9 @@ enum Form {
   /// A `versions` call on the green, timed in the submit's place with no edit: one round trip to the green's owner
   /// and almost no work there, so across machines it is the network's share of a submit (`--form ping`).
   Ping,
+  /// `accept` as one request (A-225): `Client::edit_and_submit`, the edit and the submit in one round trip, timed as
+  /// the submit with no edit of its own (`--form accept_one`).
+  AcceptOne,
 }
 
 impl Form {
@@ -244,13 +247,14 @@ impl Form {
     Form::Rebase,
   ];
   /// Every form `--form` may name.
-  const NAMED: [Form; 6] = [
+  const NAMED: [Form; 7] = [
     Form::Accept,
     Form::Ranged,
     Form::Identical,
     Form::Conflict,
     Form::Rebase,
     Form::Ping,
+    Form::AcceptOne,
   ];
 
   fn key(self) -> &'static str {
@@ -261,6 +265,7 @@ impl Form {
       Form::Conflict => "conflict",
       Form::Rebase => "rebase",
       Form::Ping => "ping",
+      Form::AcceptOne => "accept_one",
     }
   }
 }
@@ -499,6 +504,30 @@ impl Fixture {
           edit_request,
           submit_request,
           host: [started_host, edited_host, done_host],
+        }
+      }
+      Form::AcceptOne => {
+        let bytes = fresh_bytes(self.next_stamp());
+        let leader = self.leader;
+        let started = Instant::now();
+        let started_host = slates_machine::clock::monotonic_ns();
+        let answer = self
+          .client
+          .edit_and_submit((leader, &path), 0, EDIT_BYTES as u64, &bytes, &[])
+          .unwrap();
+        let done = Instant::now();
+        let done_host = slates_machine::clock::monotonic_ns();
+        let submit_request = self.client.last_request().sequence;
+        self.expect_accept(answer, "an edit and submit based on the head");
+        self.model_overwrite(&path, 0, &bytes);
+        self.check(&path);
+        // One request: sequence 0 for the edit, which no request carries, so its spans are the submit's alone.
+        Sample {
+          edit: 0,
+          submit: ns(done - started),
+          edit_request: 0,
+          submit_request,
+          host: [started_host, started_host, done_host],
         }
       }
       Form::Ranged => {
@@ -1139,7 +1168,7 @@ impl Selection {
             selection.growth.push(form);
           } else {
             panic!(
-              "--form is accept, ranged, identical, conflict, rebase, ping, new_file or one_file"
+              "--form is accept, ranged, identical, conflict, rebase, ping, accept_one, new_file or one_file"
             );
           }
         }
