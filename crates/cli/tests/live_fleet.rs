@@ -655,10 +655,15 @@ fn a_live_volumes_acknowledged_writes_survive_its_owners_death() {
     .iter()
     .map(|survivor| counter(survivor, "fleet.live.fetched"))
     .sum();
+  let survivor_counters: Vec<_> = survivors
+    .iter()
+    .map(|survivor| ((*survivor).clone(), live_counters(survivor)))
+    .collect();
   drop(fleet.daemons);
   drop(fleet.scratch);
   eprintln!(
-    "live takeover: served whole by {successor} after {took:?}; taken_over={taken_over} fetched={fetched}"
+    "live takeover: served whole by {successor} after {took:?}; taken_over={taken_over} fetched={fetched}; \
+     {survivor_counters:?}"
   );
   assert!(
     taken_over >= 1,
@@ -1252,5 +1257,129 @@ fn a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it() {
   assert!(
     resumed.is_ok(),
     "once the candidates are back, fsync succeeds: {resumed:?}"
+  );
+}
+
+/// The survivor that takes `volume` over when `owner` dies, as the configuration ranks it: the rendezvous winner for the
+/// volume's object among the other members (`RegionalConfiguration::successor` over a three-node fleet, whose recovery
+/// cohort is every survivor).
+fn successor_of(fleet: &Fleet, owner: &str, volume: &str) -> String {
+  let mut bytes = [0u8; 16];
+  for (byte, pair) in bytes.iter_mut().zip(volume.as_bytes().chunks(2)) {
+    *byte = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
+  }
+  let mut survivors: Vec<(slates_db::register::HostId, String)> = fleet
+    .instances
+    .iter()
+    .filter(|instance| *instance != owner)
+    .map(|instance| {
+      let (host, _, _) = fleet_view(instance).unwrap();
+      (
+        slates_db::register::HostId(host.parse().unwrap()),
+        instance.clone(),
+      )
+    })
+    .collect();
+  survivors.sort_by_key(|(host, _)| host.0);
+  let hosts: Vec<slates_db::register::HostId> = survivors.iter().map(|(host, _)| *host).collect();
+  let first =
+    slates_db::register::rendezvous_first(&hosts, slates_db::register::ObjectId(bytes)).unwrap();
+  survivors
+    .into_iter()
+    .find(|(host, _)| *host == first)
+    .map(|(_, instance)| instance)
+    .unwrap()
+}
+
+/// A-200 phase one with a successor that holds no copy of the log: do create a live volume, stop the process of the
+/// candidate that will take it over (the configuration's successor for the volume) while the owner writes, each write
+/// durable on the owner and the other candidate, then kill the owner (SIGKILL) and resume the successor. Expect the
+/// successor to take the volume over and serve every acknowledged write: its own empty report counts toward phase one's
+/// `f + 1`, since any `f + 1` of the `2f` other candidates include a holder, and it raises its fence. Found 2026-11-05
+/// under load: a successor that held nothing never counted itself and waited for its quorum without end
+/// (`fleet.live.takeover_waits_quorum` 370 and 371, the volume never served; Linux and macOS).
+#[test]
+fn a_successor_that_holds_no_copy_still_takes_a_live_volume_over() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping empty-successor flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let mut fleet = start_fleet("live-empty");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let id = create_live_volume(&owner, "empty-successor");
+  let successor = successor_of(&fleet, &owner, &id);
+  let successor_index = fleet
+    .instances
+    .iter()
+    .position(|instance| *instance == successor)
+    .unwrap();
+  signal(
+    &fleet.daemons[successor_index],
+    rustix::process::Signal::STOP,
+  );
+  // The writes are durable on the owner and the other candidate; given the fleet wait, so a candidate that refuses
+  // the owner fails the test with its counters rather than hanging it (one run hung 58 minutes, 2026-11-05).
+  let (done_tx, done_rx) = std::sync::mpsc::channel();
+  let written = std::thread::scope(|scope| {
+    let (owner, id) = (owner.clone(), id.clone());
+    scope.spawn(move || {
+      write_files(&owner, &id, 0..FILES);
+      let _ = done_tx.send(());
+    });
+    let written = done_rx.recv_timeout(FLEET_WAIT).is_ok();
+    if !written {
+      let counters: Vec<_> = fleet
+        .instances
+        .iter()
+        .map(|instance| (instance.clone(), live_counters(instance)))
+        .collect();
+      // Resumed, the stopped candidate lets the writes finish, so the scope can end.
+      signal(
+        &fleet.daemons[successor_index],
+        rustix::process::Signal::CONT,
+      );
+      eprintln!("live empty successor: writes not durable with {successor} stopped: {counters:?}");
+    }
+    written
+  });
+  assert!(
+    written,
+    "with the successor stopped, every write became durable on the owner and the other candidate"
+  );
+  drop(fleet.daemons.remove(owner_index));
+  let successor_index = if successor_index > owner_index {
+    successor_index - 1
+  } else {
+    successor_index
+  };
+  signal(
+    &fleet.daemons[successor_index],
+    rustix::process::Signal::CONT,
+  );
+  let survivors: Vec<String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| **instance != owner)
+    .cloned()
+    .collect();
+  let served = std::panic::catch_unwind(|| {
+    let refs: Vec<&String> = survivors.iter().collect();
+    wait_served_whole(&refs, &id, FILES).0
+  })
+  .ok();
+  let counters: Vec<_> = survivors
+    .iter()
+    .map(|survivor| (survivor.clone(), live_counters(survivor)))
+    .collect();
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!("live empty successor {successor}: served by {served:?}; {counters:?}");
+  assert_eq!(
+    served.as_ref(),
+    Some(&successor),
+    "the successor, which held no copy, served every acknowledged write: {counters:?}"
   );
 }

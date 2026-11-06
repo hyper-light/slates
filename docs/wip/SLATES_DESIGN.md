@@ -5771,6 +5771,13 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > are bounded per mount by the shard's bound on held verbs; past it an `fsync` is answered `EIO`, counted. Measured in
 > the flow: with both candidates stopped the `fsync` fails `EIO` after 1.0006 s (the liveness budget); healthy and after
 > the candidates resume, it succeeds.
+>
+> **Phase one with a candidate that holds no copy (2026-11-05).** Every candidate's report counts toward `f + 1`, an empty
+> one too, and every reporter raises its fence to the takeover's epoch, an empty one too: a candidate with no copy makes
+> an empty copy fenced at that epoch (`live_ship::fenced_copy`, at the successor's own report and at a remote
+> candidate's). Before, the successor counted itself only when it held a copy (a takeover could wait for its quorum for
+> good), and a remote candidate's empty report raised no fence, which the nemesis model shows breaks StaleNeverCommits
+> (10 seeds; bug record `docs/bugs/2026-11-05-a-live-takeover-counted-no-empty-report-and-fenced-no-empty-copy.md`).
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
