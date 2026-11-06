@@ -425,11 +425,11 @@
 >   check` (run 42048582138), and seven addons each landed in their package (run 42055543098).
 > - **Owed to Ada:** a release is published only when a maintainer pushes a real tag `v<version>` and publishes its
 >   draft (`docs/publish.md`). The test draft is never to be published.
-> - **Open, found by the smoke test: the anchor aborts when its stderr closes.** `slates anchor 2>&1 >/dev/null | head
->   -n 1` exits 134 (SIGABRT) once `head` has exited (2026-11-04, this Mac). The next diagnostic line meets EPIPE,
->   which `eprintln!` turns into a panic, and `panic = "abort"` makes that an abort. The smoke test's own first
->   version stopped reading the anchor's stderr after the serving line, and 8 of 10 runs aborted. Owed, in
->   `crates/cli`: a failing test, then diagnostics that survive a closed stderr.
+> - **Closed 2026-11-05 by 68b9cb05 (A-213): the anchor aborted when its stderr closed** (found by the smoke test,
+>   2026-11-04: `slates anchor 2>&1 >/dev/null | head -n 1` exited 134, because `eprintln!` panics on EPIPE under
+>   `panic = "abort"`). Every shipped print site now writes through `slates_machine::log`, which counts a refused line
+>   and drops it. The failing-first test is `an_anchor_whose_log_reader_went_away_keeps_supervising`
+>   (`crates/cli/tests/cli.rs`). Record: `docs/bugs/2026-11-05-a-closed-log-pipe-ended-the-anchor.md`.
 > - **Reproducible from the tag (2026-11-05, AC-9.5).** Every target is built twice on separate runners, and the
 >   release is refused unless the two copies are the same bytes. The four Linux binaries already were. The Windows
 >   ones differed in 20 bytes, the linker's timestamps and PDB GUID (run 42046848954), until `/Brepro`; with it, all six
@@ -13049,7 +13049,7 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   **Open, reported:** a claim the rendezvous refuses for another uid, or for a peer it cannot read, is closed without
   telling the client why. The client reads "the daemon closed the rendezvous before answering the claim"; only the
   capacity refusal is typed on the wire.
-- **The Windows binary needs the Visual C++ runtime (open, owed to the release pipeline, seen 2026-10-27).** Built as
+- **The Windows binary needs the Visual C++ runtime (closed 2026-11-04 by c0c8d28c, A-210; seen 2026-10-27).** Built as
   the workspace builds it, with the C runtime linked dynamically (`x86_64-pc-windows-msvc`'s default; neither
   `.cargo/config.toml` nor `release.yml` sets `+crt-static` for Windows), `slates.exe` needs `vcruntime140.dll`, which
   Windows does not ship and Nano Server and Server Core images lack: in a process-isolated `nanoserver:ltsc2025` container

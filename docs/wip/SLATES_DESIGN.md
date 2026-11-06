@@ -5644,7 +5644,8 @@ of its candidates and acknowledges writes at f+1; the backups apply entries in o
 takeover successor is one of them, so promotion has no loss window; replica lag beyond a window
 derived from the measured apply rate applies credit backpressure to that volume's writers only.
 
-> **Status (2026-11-04, the log built and checked; not yet on the wire or in the daemon).** A-200's log is
+> **Status (2026-11-04, the log built and checked; on the wire since 74bf2db7 and in the daemon since
+> 10a73e92 and 53124cf0, below; header reconciled 2026-11-06).** A-200's log is
 > `crates/db/src/live.rs`: `Shipper` (the owner's chain, credit, retained tail and durable position), `Replica` (a
 > holder's fence and head, guard-then-apply), `adopt` (phase one's choice), and the entry, install and reply
 > encodings with hostile-input tests. `crates/db/tests/live.rs` runs it under a nemesis (loss, duplication,
@@ -11431,6 +11432,9 @@ Status: built 2026-10-05 (condition 13, §4.12 `slates.fs`).
   up instead). Suites: mcp 12, client 16, daemon 19, bridge-core 76, bridge-nfs 153.
 
 ### A-98 — A shard's arena grows from a shared extent pool (2026-10-05)
+Applied in the same change to: GAPS (dbbd8bc8). Built across 690247e3 (piece 1: the pool's owner words, `crates/anchor`)
+and f989cc54 (pieces 2–5: `crates/mem`, `crates/vfs`, `crates/server`, `crates/archive`, `crates/cluster`, GAPS); measured
+in 22f655fa (BENCHMARKS, GAPS). Reconciled 2026-11-06 (VFS plan Step 15): the entry had no such list.
 Status: designed and built 2026-10-05 (pieces 1–5); the measurement and the crash-during-growth test owed (piece 6). Measured cause in BENCHMARKS ("The daemon under a container
 memory cap") and GAPS.
 - Why: a volume lives on one shard, and a shard's content arena is a fixed slice of the anchor's content object,
@@ -11528,6 +11532,10 @@ memory cap") and GAPS.
        `docs/bugs/2026-10-05-pressure-hold-counted-the-daemons-own-growth.md`).
 
 ### A-99 — Idle content sealed in RAM (2026-10-05, built)
+Applied in the same change to: nothing else (1fa3e543, the design alone). Built across 24b536aa (piece 1: every content read
+through `ChunkStore::read_extent_into`, `crates/vfs`) and 86958f9b (the sealing root in the anchor: `crates/anchor`,
+`crates/mem`, `crates/server`, `crates/ipc`, `crates/client`, `crates/cli`, `crates/mcp`, GAPS); measured in 37af1fe2
+(BENCHMARKS, GAPS). Reconciled 2026-11-06 (VFS plan Step 15): the entry had no such list.
 Status: designed 2026-10-05; pieces 1–4 built and measured the same day; live in every daemon whose node has a
 sealing root. It realizes A-92's decision from piece 5's measurement: idle RAM is
 sealed under the volume's version key (condition 9, "encrypted at rest when not being modified or read").
