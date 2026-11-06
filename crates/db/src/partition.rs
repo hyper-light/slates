@@ -416,6 +416,17 @@ impl Partition {
       .collect()
   }
 
+  /// The attachments other hosts' clients hold here (§4.10, A-222: those of a host that left the configuration end).
+  /// A walk of the table, bounded by its cap; a configuration's install asks, never a hot path.
+  pub fn remote_attachments(&self) -> Vec<&AttachmentRecord> {
+    self
+      .attachments
+      .iter()
+      .filter(|(_, a)| matches!(a.consumer, Consumer::Remote { .. }))
+      .map(|(_, a)| a)
+      .collect()
+  }
+
   /// The attachments of a volume (a walk of the table, bounded by its cap; a detach and a
   /// recovery ask, never a hot path).
   pub fn attachments_of(&self, volume: VolumeId) -> Vec<&AttachmentRecord> {
