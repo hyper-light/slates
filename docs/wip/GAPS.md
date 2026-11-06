@@ -463,7 +463,14 @@
 > adopted the takeover (`fleet.takeover.adopted` 2) waited for its live log's quorum for the whole 40 s
 > (`fleet.live.takeover_waits_quorum` 370, `fleet.live.hold_refused` 14) and refused every read `Overloaded`, while the
 > other candidate answered its fetches (`fleet.live.fetched` 400) and held the log at head 2. No acknowledged write was
-> lost (the candidate held all three); the volume went unserved. Owner: raft, before any other live-shipping work.
+> lost (the candidate held all three); the volume went unserved. The same signature on macOS (load 13–21), in
+> `a_live_volumes_acknowledged_writes_survive_its_owners_death`, 1 of 9 runs: the successor waited 371 times
+> (`fleet.takeover.adopted` 2, `fleet.live.hold_refused` 28) while the other candidate answered 421 fetches holding head
+> 4. In both, the successor holds no copy of the log (no `live held` line; it had refused the owner's entries). A
+> hypothesis from the counters and the code, not yet confirmed by a log line: `live_ship::fetch` adds the successor's
+> own report only when it holds a copy, while a remote candidate that holds nothing answers `None` and counts, so a
+> successor holding nothing never counts itself and `f + 1` is out of reach once the owner is gone. Owner: raft,
+> before any other live-shipping work.
 
 > **VFS plan step 14, Shards' WHP window's three edge cases (2026-11-05): done, patches with the owner's folder.** Six
 > real-guest tests and one fix for Shards' owner, in `docs/wip/shards-patches/` (never pushed to Shards; README there), and
