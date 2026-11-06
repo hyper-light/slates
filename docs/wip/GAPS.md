@@ -1,5 +1,26 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A-190's purge client leaves the daemon's process (2026-11-06, fixed); the sweep for the rest (open).** No daemon
+> thread opens a path on a volume the daemon serves (§4.6). The coherent purge's opens, writes and reads now run in a
+> child process of the daemon's own binary (`slates winfsp-purge-client`), in a kill-on-close job, asked over a pipe
+> (A-190's amendment of 2026-11-06). The purge kill oracle requires a server killed while it holds the purge's open to
+> exit within one transaction timeout (1,000 ms): the fix 1.74 ms on x86_64 and 2.89 ms on arm64 (run 42155196630, with
+> the bridge's 77, the CLI's 13 and `winfsp_semantics`' 7 green on each); main's code did not exit in 1,000 ms on either runner, nor
+> after the anchor let the volume go (run 42155020781), and nor did the fix with the in-process open put back (run
+> 42155197023). The sweep found three more places a daemon thread opens a host path it does not check against its own mounts.
+> Each is open, and each is a hang or a stranded exit only when that path lies on a volume this daemon serves:
+> - **A base directory** (`OsHost::open_root`, `crates/server/src/verbs.rs` `open_base` and the recovery's reacquire):
+>   a volume over a base on a slates drive or mount this daemon serves is read by its shard threads through that mount,
+>   for every lookup and read of the base.
+> - **A landing's target** (`OsLand::open_target`, `crates/server/src/landing.rs`): the granted landing's writes and its
+>   barrier thread (A-132) run in the daemon.
+> - **A FUSE mount point's check** (`check_mount_point`, `crates/server/src/fuse.rs`, `statat` on the shard): a mount
+>   point inside another of this daemon's FUSE mounts makes the shard ask its own mount.
+> - Not found elsewhere: FUSE mounts and unmounts run in `fusermount3`, macOS's NFS `mount(2)` runs in the CLI's
+>   process, the WinFsp drive link is `DefineDosDeviceW` (no request on the volume), and A-219's probe is off main.
+> - Owed for each: a refusal (typed) of a path on a mount this daemon serves, decided before any open, with a test that
+>   asks for one.
+
 > **WinFsp receiver: Step 7's regression against the DLL stands (2026-11-06, audit step 7; open).** Diagnostics run
 > 42130583401 (BENCHMARKS, "Step 7's measured state") measured main's one-worker receiver against `71cf09ac`'s DLL
 > dispatcher, five runs a runner, quiet and loaded. It was beyond the DLL's spread in 13 cells on arm64 (quiet stat p50
@@ -8,7 +29,8 @@
 >   on a volume the daemon serves, and a kill then strands it. WinFsp's processing queue is never cancelled
 >   (`FSP_IOQ_PROCESS_NO_CANCEL`), so every killed probing role outlived the 10 s reap. So A-219's runtime (`e070f31e`,
 >   `5b5f7ba1`) is off main. **Rule: a daemon never sends I/O to a volume it serves itself.**
-> - **A-190's coherent purge breaks the same rule on main (open, sibling found 2026-11-06).** The command thread opens the
+> - **A-190's coherent purge broke the same rule on main (sibling found 2026-11-06; fixed the same day, the entry
+>   above).** The command thread opens the
 >   daemon's own drive (`crates/bridge-winfsp/src/host.rs`, `CreateFileW` near line 2038) and writes and reads each
 >   purged range through it. A kill while one of those requests is delivered strands the daemon as the probe did, for one
 >   purge's request rather than a whole probe; no run has been seen to hit it. The fix is to run the purge's client in a
