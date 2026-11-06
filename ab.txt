@@ -1246,3 +1246,9 @@ slates daemon: instance fsb-1940-1-comb1 serving on 3 shards under the anchor
 slates-server: shard 1 initialized in 2798 µs
 slates-server: shard 2 initialized in 2825 µs
 slates-server: shard 0: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected ## run 1 of 1 done, 2026-11-06T07:24:36Z
+remote: 
+remote: Create a pull request for 'diag-winfsp-overlap-results-42178889880-profile-x86-shards3-1' on GitHub by visiting:        
+remote:      https://github.com/hyper-light/slates/pull/new/diag-winfsp-overlap-results-42178889880-profile-x86-shards3-1        
+remote: 
+To https://github.com/hyper-light/slates
+ * [new branch]      0091dd84bebaf0212507ddf730df2e0433087dbd -> diag-winfsp-overlap-results-42178889880-profile-x86-shards3-1
