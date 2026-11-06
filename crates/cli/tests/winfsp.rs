@@ -115,6 +115,11 @@ impl Drop for OwnedProcess {
 /// Starts `slates --instance INSTANCE anchor --quick --shards SHARDS`, waits for its daemon to serve and answer a
 /// streak of verbs, and bootstraps its consensus group.
 fn start_anchor(instance: &str) -> OwnedProcess {
+  start_anchor_of(instance, SHARDS)
+}
+
+/// [`start_anchor`] with `shards` shards.
+fn start_anchor_of(instance: &str, shards: &str) -> OwnedProcess {
   let mut child = slates()
     .args([
       "--instance",
@@ -122,7 +127,7 @@ fn start_anchor(instance: &str) -> OwnedProcess {
       "anchor",
       "--quick",
       "--shards",
-      SHARDS,
+      shards,
     ])
     .stdout(Stdio::null())
     .stderr(Stdio::piped())
@@ -1707,6 +1712,100 @@ fn a_winfsp_folder_bound_into_a_process_isolated_container() {
     !bound, CONTAINER_BIND_REFUSED,
     "the WinFsp folder's bind does what the matrix records; if it binds, step 4 owes the map through it"
   );
+  let (code, _, err) = run(&instance, &["unmount", &drive]);
+  assert_eq!(code, 0, "unmount: {err}");
+}
+
+/// Format: one shard, where a request the daemon sends its own drive waits on the shard that must answer it (A-227).
+const ONE_SHARD: &str = "1";
+
+/// Shape: how long a refusal of a base on the daemon's own drive may take to come back (A-227): the verb's own work and
+/// one round trip, far under a client's stall deadline.
+const OWN_MOUNT_ANSWER: Duration = Duration::from_secs(10);
+
+/// Runs a client verb as [`run`] does, but gives up after `limit`: `None` (the client killed and reaped) when it had not
+/// answered by then, for a verb that would wait on a daemon blocked on itself.
+fn run_within(instance: &str, args: &[&str], limit: Duration) -> Option<(i32, String, String)> {
+  let mut child = slates()
+    .arg("--instance")
+    .arg(instance)
+    .args(args)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let started = Instant::now();
+  while child.try_wait().unwrap().is_none() {
+    if started.elapsed() > limit {
+      child.kill().unwrap();
+      child.wait().unwrap();
+      return None;
+    }
+    pause();
+  }
+  let output = child.wait_with_output().unwrap();
+  Some((
+    output.status.code().unwrap_or(-1),
+    String::from_utf8_lossy(&output.stdout).into_owned(),
+    String::from_utf8_lossy(&output.stderr).into_owned(),
+  ))
+}
+
+/// A-227, the base plane on Windows (§4.6: no daemon thread opens a path on a volume the daemon serves). Do: on a
+/// one-shard daemon, mount a volume at a free drive, make a directory on it, and create a second volume with that
+/// directory as its base. Expect: refused at once (exit 1, `OwnMount`), nothing created, and the daemon still answering.
+/// Before A-227 the shard opened the base through its own drive and waited on the request only it could answer; a kill
+/// then could not end it (A-190's amendment).
+#[test]
+fn a_base_on_the_daemons_own_drive_is_refused_before_any_open() {
+  if !live_mount_runs() {
+    return;
+  }
+  let instance = instance("ownbase");
+  let _anchor = start_anchor_of(&instance, ONE_SHARD);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "outer", "--bounded", "64MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let drive = free_drive_letter();
+  let (code, _, err) = run(&instance, &["mount", &id, &drive]);
+  assert_eq!(code, 0, "mount: {err}");
+  let root = format!("{drive}\\");
+  wait_ready(&root);
+  let base = format!("{drive}\\project");
+  let made = Command::new("cmd")
+    .args(["/C", "mkdir", &base])
+    .output()
+    .unwrap();
+  assert!(made.status.success(), "mkdir {base}");
+  let created = [
+    "volume",
+    "create",
+    "inner",
+    "--bounded",
+    "8MiB",
+    "--base",
+    &base,
+  ];
+  let Some((code, _, err)) = run_within(&instance, &created, OWN_MOUNT_ANSWER) else {
+    panic!(
+      "the daemon did not answer a base on its own drive within {OWN_MOUNT_ANSWER:?}: it opened the base through \
+       its own drive and waits on itself"
+    );
+  };
+  assert_eq!(
+    code, 1,
+    "a base on the daemon's own drive is refused: {err}"
+  );
+  assert!(
+    err.contains("OwnMount"),
+    "refused as the daemon's own mount: {err}"
+  );
+  let (code, out, err) = run(&instance, &["volume", "list"]);
+  assert_eq!(code, 0, "the daemon still answers: {err}");
+  assert!(!out.contains("inner"), "nothing was created: {out}");
   let (code, _, err) = run(&instance, &["unmount", &drive]);
   assert_eq!(code, 0, "unmount: {err}");
 }
