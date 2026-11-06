@@ -1,5 +1,21 @@
 # Transport conformance evidence (AC-9.7 / T-9.1; GAP-A9-15)
 
+> **Live-shipped volumes do not yet conform as plain ones do (2026-11-06, A-200; OPEN, owner raft).** `--live-ship`
+> runs a suite over a volume live-shipped on an `f = 1` fleet: three anchors from one manifest, the volume created and
+> mounted on node a, `slates live-ship ID`. A run fails unless the owner's log is durable at its head and both
+> candidates hold it, and its record carries the `fleet.live` counters. `compare` holds a live run to a plain one on the
+> same host, case by case, since this Mac's unprivileged pjdfstest cannot pass the root-reviewed list. Pair on this Mac
+> (macOS 26.4.1, NFS loopback, load averages 14 to 36):
+> - Plain: fsx 10,000 operations passed (21.1 s), fsstress 4 × 500 passed, pjdfstest 238 files, 8,686 cases.
+> - Live-shipped: fsx failed after the owner missed its heartbeat and a takeover moved the volume off the mounted node;
+>   fsstress logged 319 of 2,000; pjdfstest's calls answered `ETIMEDOUT`, the owner's log at `head=2 durable=none` from
+>   the start. `compare`: 8,647 differences.
+> - The deterministic red, `a_live_shipped_volume_makes_a_writer_wait_for_stopped_candidates_rather_than_fail`
+>   (`xtask/src/conformance/live_fleet.rs`): with both candidates stopped, a size change failed `ETIMEDOUT` after 57.1 s
+>   through the soft mount (§4.6), where A-200 says the writer waits.
+> GAPS ("A live-shipped volume fails a waiting writer…") holds the evidence; the lists are unchanged, since a live
+> volume must conform as a plain one does and no list may grow for it.
+
 > **Windows conformance, and the suites on arm64 Linux (2026-11-05, A-209).** The Windows transport's cells run: WinFsp's
 > winfstest (a Rust transcription of its Python 2.7 scripts over upstream's C driver, held to them by a golden of 733
 > cases) and the WinFsp fsx port, over `slates mount ID E:` in `windows-lint` and `windows-arm64`. winfstest's 628
@@ -491,6 +507,9 @@ have no runnable form in the harness yet; every transport's two cells say so.
 cargo xtask conformance plan                      # skip records for every cell this host cannot run
 cargo xtask conformance run --suite fsx           # one suite over this host's native transport
 cargo xtask conformance run --suite winfstest     # Windows: WinFsp's winfstest over a slates drive (A-209)
+cargo xtask conformance run --suite fsx --live-ship --records L/records --scratch L/scratch --keep
+                                                  # the suite over a live-shipped volume on an f = 1 fleet (A-200)
+cargo xtask conformance compare --plain P --live L  # two runs case by case; non-zero on any difference
 cargo xtask conformance all                       # plan, then every runnable suite, continuing past failures
 cargo xtask conformance matrix --write            # regenerate §2 from the tracked records
 cargo test -p slates-conformance --test matrix    # the doc-truth tests
