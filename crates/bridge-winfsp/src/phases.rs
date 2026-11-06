@@ -38,8 +38,10 @@ pub(crate) const HOP_IN: usize = 12;
 pub(crate) const SERVE: usize = 13;
 /// From the shard's send of the reply to the callback's having it.
 pub(crate) const TO_ANSWER: usize = 14;
+/// Our interface callback alone, from its entry to its return (the DLL's op function calls it).
+pub(crate) const INTERFACE: usize = 15;
 /// Shape: the phases above.
-const PHASES: usize = 15;
+const PHASES: usize = 16;
 /// Format: each phase's printed name, in order.
 const NAMES: [&str; PHASES] = [
   "stamp",
@@ -57,13 +59,56 @@ const NAMES: [&str; PHASES] = [
   "hop_in",
   "serve",
   "to_answer",
+  "interface",
 ];
 /// Format: the first operation slot; the receiver's slot for a request of no kind is one below it.
 pub(crate) const OP_BASE: usize = 32;
 /// Format: the receiver's slot for work not tied to one request (a receive's stamp and capture).
 pub(crate) const RECEIVER: usize = OP_BASE - 1;
-/// Shape: receiver slots and operation slots.
-const SLOTS: usize = OP_BASE * 2;
+/// Format: the first interface-callback slot.
+pub(crate) const CALLBACK_BASE: usize = OP_BASE * 2;
+/// Format: each interface callback's printed name, from CALLBACK_BASE, in the order both arms define them.
+const CALLBACK_NAMES: [&str; 16] = [
+  "cb_get_volume_info",
+  "cb_get_security_by_name",
+  "cb_create",
+  "cb_open",
+  "cb_overwrite",
+  "cb_cleanup",
+  "cb_close",
+  "cb_read",
+  "cb_write",
+  "cb_flush",
+  "cb_get_file_info",
+  "cb_set_basic_info",
+  "cb_set_file_size",
+  "cb_can_delete",
+  "cb_rename",
+  "cb_read_directory",
+];
+/// Shape: receiver slots, operation slots and interface-callback slots.
+const SLOTS: usize = OP_BASE * 3;
+
+/// Times one interface callback from its creation to its drop.
+pub(crate) struct Timer {
+  slot: usize,
+  start: u64,
+}
+
+impl Timer {
+  pub(crate) fn start(callback: usize) -> Self {
+    Self {
+      slot: CALLBACK_BASE + callback,
+      start: now(),
+    }
+  }
+}
+
+impl Drop for Timer {
+  fn drop(&mut self) {
+    record(self.slot, INTERFACE, self.start, now());
+  }
+}
 /// Shape: 100 ns buckets below 20 µs, 1 µs buckets below 200 µs, 25 µs buckets below 5 ms, and one above.
 const FINE: u64 = 20_000;
 /// Shape: see FINE.
@@ -139,6 +184,10 @@ pub(crate) fn dump(ops: &[&str]) {
   for (slot, phases) in CELLS.iter().enumerate() {
     let name = if slot < OP_BASE {
       format!("irp{slot}")
+    } else if slot >= CALLBACK_BASE {
+      CALLBACK_NAMES
+        .get(slot - CALLBACK_BASE)
+        .map_or_else(|| format!("cb{slot}"), |name| (*name).to_owned())
     } else {
       ops
         .get(slot - OP_BASE)
