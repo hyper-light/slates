@@ -660,8 +660,9 @@ pub(crate) fn split_held(
   for mount in handed {
     let attachment = mount.attachment;
     let (held, own) = match checked_inherited(mount) {
-      Some(held) => match OwnVolumeRecord::of(&held.record.volume) {
-        Ok(own) => (Some(held), Some(own)),
+      // RED-CHECK (diag only): the held volume recorded at its adoption, the order before A-227's fix.
+      Some(held) => match Ok::<(), Refusal>(()) {
+        Ok(()) => (Some(held), None),
         Err(refusal) => {
           slates_machine::log_line!(
             "slates-server: held mount {attachment} could not be recorded as this daemon's own: {refusal:?}"
@@ -752,6 +753,11 @@ pub(crate) fn adopt_held() {
 async fn adopt_mount(record: AttachmentRecord, held: InheritedMount) {
   let attachment = record.id;
   let InheritedMount { held, own, .. } = held;
+  let own = own.or_else(|| {
+    held
+      .as_ref()
+      .and_then(|held| OwnVolumeRecord::of(&held.record.volume).ok())
+  });
   let (Some(held), Some(own)) = (held, own) else {
     let _ = state::with_state_counted(|s| {
       refuse_adoption(s, &record, "the held mount record is unusable")
