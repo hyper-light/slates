@@ -2216,6 +2216,13 @@ fn a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it() {
   writeln!(input).unwrap();
   let alone = fsync_report(&line_after(&mut lines, FSYNC_TAG), "alone");
   line_after(&mut lines, READY_TAG);
+  // Where the owner's log stood when the stopped FSYNC was answered, and what the device's hold did, before the
+  // candidates resume: an FSYNC answered 0 here must be explained by these (CI's x86_64 lane, 1 of 3, 2026-11-06).
+  let log_alone = live_line(&owner, "shipping", &id);
+  let held_alone = (
+    counter(&owner, "virtiofs.live_fsync_waited"),
+    counter(&owner, "virtiofs.live_fsync_refused"),
+  );
   signal_candidates(&fleet, owner_index, rustix::process::Signal::CONT);
   writeln!(input).unwrap();
   let resumed = fsync_report(&line_after(&mut lines, FSYNC_TAG), "resumed");
@@ -2225,8 +2232,8 @@ fn a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it() {
   drop(fleet.daemons);
   drop(fleet.scratch);
   eprintln!(
-    "live vhost fsync: healthy {healthy:?}; candidates stopped {alone:?}; resumed {resumed:?}; vmm {ended:?}; \
-     owner's live counters {counters:?}"
+    "live vhost fsync: healthy {healthy:?}; candidates stopped {alone:?} (log {log_alone:?}, hold (waited, refused) \
+     {held_alone:?}); resumed {resumed:?}; vmm {ended:?}; owner's live counters {counters:?}"
   );
   assert_eq!(healthy.0, 0, "an FSYNC a candidate holds succeeds");
   assert_eq!(
@@ -2239,6 +2246,11 @@ fn a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it() {
     alone.1 >= Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS),
     "at the liveness budget: {:?}",
     alone.1
+  );
+  // The non-vacuity counter: the stopped FSYNC's EIO is the hold's, not another refusal's.
+  assert!(
+    held_alone.1 >= 1,
+    "the device's hold answered the stopped FSYNC: {held_alone:?}"
   );
   assert_eq!(resumed.0, 0, "once the candidates are back, FSYNC succeeds");
 }
