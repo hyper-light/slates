@@ -13832,8 +13832,9 @@ Applied in the same change to: §4.5 (data model), `crates/vfs/src/{dirblocks,di
 
 ### A-217 — A green's origin is a reference to the base snapshot it holds, not a copy of the tree in the partition (accepted 2026-11-05, the supervisor's decision (a))
 
-> **Status (2026-11-05): reverted from main, with A-207's port.** Checkout (A-201) compares the recorded origin's
-> bytes, so every checkout was refused `ConsistentBaseUnavailable` (main CI 42119714654; GAPS). Re-landing owed.
+> **Status (2026-11-05): reverted from main with A-207's port (`f5396e3b`), then re-landed.** Checkout (A-201) had
+> compared the recorded origin's bytes, which a held origin does not keep, so every checkout was refused
+> `ConsistentBaseUnavailable` (main CI 42119714654). The checkout now compares origin identities (A-201's entry).
 
 Applied in the same change to: §4.16's status, A-9's "recorded durably" (now: recorded as a reference and held), GAPS
 (the load-test blockquote), BENCHMARKS, `crates/db` (`Op::GreenOriginHeld`, `OriginRef`,
