@@ -1,5 +1,15 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **The many-client load test from 10,000 to 100,000 clients (loadtest-scale; 2026-11-06): in progress.** The
+> harness (`crates/client/examples/load_bench.rs`) multiplexes logical clients over connections
+> (`--per-connection k`). Each logical client keeps its own work volume, rounds, merges and conflicts, and has one
+> request in flight. A sweep drains every connection's ring before it moves any client on, so a latency is stamped
+> when its reply arrives, not when the harness reaches the client. Fixed, failing test first:
+> - **An acknowledgement covered requests still awaited.** A client with several in flight released their completion
+>   records, so a resend after a restart was answered `DuplicateRequest` for an applied create. The watermark now
+>   stops below the first request with no reply (`an_acknowledgement_never_covers_a_request_still_awaited`;
+>   `docs/bugs/2026-11-06-an-acknowledgement-covered-requests-still-awaited.md`).
+
 > **The anchor kills live daemons on a busy machine (found 2026-11-06, audit step 7; open, to be assigned).** Under the
 > A/B bar's load, two spinners a logical CPU (8 on CI's 4-CPU Windows runners), the anchor killed daemons that were
 > alive and serving because their heartbeat lapsed its 1,000 ms liveness budget. A busy machine is the normal case

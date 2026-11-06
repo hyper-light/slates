@@ -1688,12 +1688,25 @@ impl Client {
   /// The highest sequence the client may acknowledge now: everything it has received, unless a verb
   /// answered `Unpublished` awaits its retry — then the sequence just below the lowest such id, so
   /// the daemon keeps the ids above it new and the retry re-executes rather than meeting
-  /// `DuplicateRequest` (AC-2.3; AUD-06).
+  /// `DuplicateRequest` (AC-2.3; AUD-06). And never at or past a request still awaited whose reply has not come
+  /// (§4.9 "Exactly-once"; RIFL's first incomplete RPC, Lee et al., SOSP 2015): its completion record is what its
+  /// resend after a lost channel meets, and what a deferred verb (a fleet forward, a submit awaiting its commit)
+  /// records into when it ends, refused `StaleCompletion` below the watermark. A client with several requests in
+  /// flight had acknowledged them all: an applied create resent after a restart was answered `DuplicateRequest`
+  /// (`an_acknowledgement_never_covers_a_request_still_awaited`). A reply already drained into `pending` is received,
+  /// and its own poll answers from there first.
   fn ack_watermark(&self) -> u32 {
-    self
+    let received = self
       .unpublished
       .first()
-      .map_or(self.sequence, |&lowest| lowest.saturating_sub(1))
+      .map_or(self.sequence, |&lowest| lowest.saturating_sub(1));
+    let first_incomplete = self
+      .awaited
+      .keys()
+      .filter(|word| !self.pending.iter().any(|(held, _)| held == *word))
+      .map(|word| RequestId::from_word(*word).sequence)
+      .min();
+    first_incomplete.map_or(received, |lowest| received.min(lowest.saturating_sub(1)))
   }
 
   /// Notes what `word`'s reply means for the retryable set: an `Unpublished` refusal keeps the id

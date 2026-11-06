@@ -5547,6 +5547,17 @@ provisioning is therefore safe to retry after any failure.
 > unretried, which holds its acknowledgement back; it retries that id first. Regression
 > `a_client_that_never_acknowledges_is_refused_at_its_bound_and_served_once_it_acknowledges`.
 
+> **Status (2026-11-06, the watermark stops below the first request still awaited).** The client's acknowledgement
+> covered every sequence it had sent, so a client with several requests in flight (any async caller; the load
+> harness multiplexing logical clients over one connection) acknowledged requests whose replies had not come. Their
+> completion records were then released, so a resend after a restart was answered `DuplicateRequest` for a create
+> that had been applied, and a deferred verb (a fleet forward, a submit awaiting its commit) recording after the
+> watermark was refused `StaleCompletion`. The watermark is now RIFL's: just below the first request with no reply
+> (Lee et al., SOSP 2015), as well as below an `Unpublished` id. A client that keeps sending past an old request still
+> awaited therefore meets `AcknowledgementOwed` at the `2 × slots` bound, as backpressure until that request answers
+> (`slates_client` `ack_watermark`; `an_acknowledgement_never_covers_a_request_still_awaited`;
+> `docs/bugs/2026-11-06-an-acknowledgement-covered-requests-still-awaited.md`).
+
 > **Status (2026-11-05, A-216: an acknowledgement is answered once its own shard has released).** An `Acknowledge
 > { up_to }` releases the client's records at or below `up_to` on every partition that may hold them. Its reply now
 > promises one thing: the client's own shard has released them. The other shards' releases run as tasks the shard
