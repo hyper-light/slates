@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Memory::{
   MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile, VirtualAlloc,
   VirtualFree,
 };
-use windows_sys::Win32::System::Threading::CreateEventW;
+use windows_sys::Win32::System::Threading::{CreateEventW, INFINITE, WaitForMultipleObjects};
 
 /// Format: CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 0x800 + 't', METHOD_OUT_DIRECT, FILE_ANY_ACCESS), fsctl.h:104.
 const TRANSACT_BATCH: u32 = (9 << 16) | ((0x800 + b't' as u32) << 2) | 2;
@@ -60,40 +60,162 @@ struct Mode {
   code: u32,
   bytes: usize,
   section: bool,
+  wait: Wait,
 }
 
-const MODES: [Mode; 5] = [
+/// How a call that pends is waited for (DIAG, diag-winfsp-overlap-39).
+#[derive(Clone, Copy)]
+enum Wait {
+  /// The OVERLAPPED's own event, through `GetOverlappedResult` (this harness's form until now).
+  Event,
+  /// `WaitForMultipleObjects` over the completion event and a second, idle one, then `GetOverlappedResult`: the
+  /// receiver's form (`crate::purge_intents::Intents::wait`, the second event its purge intents').
+  Multiple,
+  /// No OVERLAPPED at all, so the call itself waits on the volume handle: WinFsp's own `FspFsctlTransact`
+  /// (`src/dll/fsctl.c`), the DLL dispatcher's form.
+  Handle,
+}
+
+const MODES: [Mode; 8] = [
   Mode {
     name: "single-buffered-16320",
     code: TRANSACT_SINGLE,
     bytes: SINGLE_BYTES,
     section: false,
+    wait: Wait::Event,
   },
   Mode {
     name: "batch-direct-64k-private",
     code: TRANSACT_BATCH,
     bytes: BATCH_MIN,
     section: false,
+    wait: Wait::Event,
   },
   Mode {
     name: "batch-direct-64k-section",
     code: TRANSACT_BATCH,
     bytes: BATCH_MIN,
     section: true,
+    wait: Wait::Event,
   },
   Mode {
     name: "batch-direct-128k-section",
     code: TRANSACT_BATCH,
     bytes: BATCH_MIN * 2,
     section: true,
+    wait: Wait::Event,
   },
   Mode {
     name: "batch-direct-256k-section",
     code: TRANSACT_BATCH,
     bytes: LARGEST,
     section: true,
+    wait: Wait::Event,
+  },
+  Mode {
+    name: "single-buffered-16320-handle-wait",
+    code: TRANSACT_SINGLE,
+    bytes: SINGLE_BYTES,
+    section: false,
+    wait: Wait::Handle,
+  },
+  Mode {
+    name: "batch-direct-64k-section-handle-wait",
+    code: TRANSACT_BATCH,
+    bytes: BATCH_MIN,
+    section: true,
+    wait: Wait::Handle,
+  },
+  Mode {
+    name: "batch-direct-64k-section-two-event-wait",
+    code: TRANSACT_BATCH,
+    bytes: BATCH_MIN,
+    section: true,
+    wait: Wait::Multiple,
   },
 ];
+
+/// One call in `wait`'s form; `idle` is the second, never-signalled event `Wait::Multiple` waits on as well.
+fn transact_waiting(
+  control: HANDLE,
+  event: HANDLE,
+  idle: HANDLE,
+  wait: Wait,
+  code: u32,
+  input: &[u8],
+  output: &mut [u8],
+) -> Result<usize, i32> {
+  match wait {
+    Wait::Event => transact(control, event, code, input, output),
+    Wait::Handle => {
+      let mut done = 0u32;
+      // SAFETY: both buffers stay owned and unmoved for the synchronous call; with no OVERLAPPED the call returns only
+      // once the I/O has completed (it waits on the handle itself, as FspFsctlTransact does).
+      let accepted = unsafe {
+        DeviceIoControl(
+          control,
+          code,
+          if input.is_empty() {
+            std::ptr::null()
+          } else {
+            input.as_ptr().cast()
+          },
+          input.len() as u32,
+          output.as_mut_ptr().cast(),
+          output.len() as u32,
+          &mut done,
+          std::ptr::null_mut(),
+        )
+      };
+      if accepted == 0 {
+        return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+      }
+      Ok(done as usize)
+    }
+    Wait::Multiple => {
+      let mut overlapped = OVERLAPPED {
+        hEvent: event,
+        ..OVERLAPPED::default()
+      };
+      let mut done = 0u32;
+      // SAFETY: both buffers and the overlapped block stay owned and unmoved until the call has settled below.
+      let accepted = unsafe {
+        DeviceIoControl(
+          control,
+          code,
+          if input.is_empty() {
+            std::ptr::null()
+          } else {
+            input.as_ptr().cast()
+          },
+          input.len() as u32,
+          output.as_mut_ptr().cast(),
+          output.len() as u32,
+          &mut done,
+          &mut overlapped,
+        )
+      };
+      if accepted == 0 {
+        let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if u32::try_from(error).ok() != Some(ERROR_IO_PENDING) {
+          return Err(error);
+        }
+        let events = [event, idle];
+        // SAFETY: both events are owned for the wait; the outstanding call's buffers stay owned until it settles.
+        let waited = unsafe { WaitForMultipleObjects(2, events.as_ptr(), 0, INFINITE) };
+        if waited != windows_sys::Win32::Foundation::WAIT_OBJECT_0 {
+          // The idle event is never signalled, so any other answer is the wait's own failure.
+          return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+        }
+        // SAFETY: the same outstanding call, its event already signalled.
+        if unsafe { GetOverlappedResult(control, &overlapped, &mut done, 1) } == 0 {
+          return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+        }
+      }
+      Ok(done as usize)
+    }
+  }
+}
 
 fn transact(
   control: HANDLE,
@@ -265,6 +387,7 @@ fn refusals(control: HANDLE, event: HANDLE, buffers: &mut Buffers) {
       code: TRANSACT_BATCH,
       bytes: refused,
       section: true,
+      wait: Wait::Event,
     };
     let answer = transact(control, event, TRANSACT_BATCH, &[], buffers.output(&mode));
     eprintln!(
@@ -325,10 +448,22 @@ fn serve(
   let chosen = &MODES[index];
   let mut kept = calls;
   let mut served = 0;
+  // SAFETY: an unnamed manual-reset event, never signalled; closed below.
+  let idle = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+  assert!(!idle.is_null());
   while served < PER_ROUND {
     let output = buffers.output(chosen);
     let started = Instant::now();
-    let delivered = transact(control, event, chosen.code, responses, output).unwrap();
+    let delivered = transact_waiting(
+      control,
+      event,
+      idle,
+      chosen.wait,
+      chosen.code,
+      responses,
+      output,
+    )
+    .unwrap();
     let took = started.elapsed().as_nanos() as u64;
     let creates = answer(&output[..delivered], responses);
     if creates > 0
@@ -338,6 +473,8 @@ fn serve(
     }
     served += creates;
   }
+  // SAFETY: the event made above, closed once.
+  unsafe { CloseHandle(idle) };
 }
 
 /// Answers whatever the client sent until it has stopped, so its last open is refused and it sees `stop`.
