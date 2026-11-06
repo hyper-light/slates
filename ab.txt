@@ -830,3 +830,5 @@ slates-server: shard 1 initialized in 3141 µs
 slates-winfsp: receive workers = 1: median open of each round, in ns, by waiting workers from one: [[21800, 22200, 22600, 23500, 22800], [23000, 22500, 23100, 22500, 21400]]; more workers only where every round beats every round of fewer; probe took 60 ms
 slates-winfsp: reply spin window = 11800 ns: the median one-way channel wake of 15 (the 2-competitive spin)
 ## run 5 of 5 done, 2026-11-06T00:38:12Z
+To https://github.com/hyper-light/slates
+   f8c51fb..a41fb42  a41fb428da5ee8551b99142375d0430f46f7c861 -> diag-winfsp-overlap-results-42130583401-windows-11-arm
