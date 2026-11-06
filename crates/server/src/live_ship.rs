@@ -983,14 +983,21 @@ fn content_runs(
 /// owed at a checkpoint the holder already holds cannot move it, so instead the volume is marked to owe a fresh whole
 /// record (its next publication or the period appends one, and the install is made from that).
 fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
+  let object = ObjectId(volume);
+  let catalogued = catalogued_holders(state, object);
   let Some(live) = state.live.shipping.get_mut(&volume) else {
     return Vec::new();
   };
-  let object = ObjectId(volume);
   let mut sends = Vec::new();
   let mut stale_checkpoint = false;
   let mut state_counts = Vec::new();
   for holder in live.shipper.holders() {
+    // A holder that has not acknowledged the volume's catalog refuses the log (its bound is the catalog's size,
+    // `hold_bound`): the record plane places the catalog there first, re-shipped each period, and the next dispatch after
+    // that ships it the log.
+    if !catalogued.contains(holder) {
+      continue;
+    }
     match live.shipper.pending(*holder) {
       Next::Entries(entries) => {
         for entry in entries {
@@ -1042,6 +1049,20 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
     state.count(LIVE_INSTALL_BYTES, u64::try_from(bytes).unwrap_or(u64::MAX));
   }
   sends
+}
+
+/// The candidates that have acknowledged `object`'s catalog record: the holders that take its live log ([`hold_bound`]
+/// is derived from the catalog). Shipped to every candidate before, a candidate the record plane had not yet placed the
+/// catalog on refused each entry and each install (`fleet.live.hold_refused.no_catalog`, 116 and 119 refusals on the two
+/// candidates of one run), and its installs, the whole volume each, held its one session against the record plane's
+/// re-ship of the very catalog it lacked: one candidate held the log alone, and partitioning it stalled every write
+/// (`live_chaos`'s rolling partition, 2026-11-06: 1,785 installs, 2.3 GB, in one run).
+fn catalogued_holders(state: &ShardState, object: ObjectId) -> Vec<HostId> {
+  state
+    .placed_heads
+    .get(&object.catalog())
+    .map(|placed| placed.placement.acked.clone())
+    .unwrap_or_default()
 }
 
 /// Counter: installs sent to a holder off the chain or behind the retained tail.
