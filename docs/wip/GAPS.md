@@ -27,6 +27,19 @@
 >   the growth came after the pin. A pin past its volume's quota is refused `NoSpace`
 >   (`docs/bugs/2026-11-06-a-pin-held-its-shard-for-the-whole-tree.md`).
 >
+> - **The whole kernel as the workload: the pin holds, creating the green does not** (open; reported to fixtures, A-217's
+>   re-lander, 2026-11-06). In-process daemon on the Mac (loaded arm, load 30 to 47), Linux v7.4-rc1 whole (97,229
+>   files on APFS, 1.67 GB), the sliced pin:
+>   - pin 64.4 s, RSS 42 MB to 3.4 GB (the content, granule-rounded);
+>   - snapshot 0.71 s;
+>   - `CreateGreen` 69.05 s as one shard poll of 69,028 ms, RSS 3.4 to 17.8 GB, holding 10 GB after: the origin
+>     `seed_origin` copies whole (`walk_origin`), unsliced.
+>
+>   A 10-client rung then ran (1.93 s; Edit p50 91 µs, p99 1.20 s; SubmitAccepted p99 645 ms) while the shard's polls
+>   stayed at 509 to 717 ms. Then the process peaked at 24.07 GB and was gone at 652 s before its oracle: no panic,
+>   with heartbeats 2.5 to 4.2 s late and unattributed (memory pressure is the inference, not proven). Owed:
+>   `CreateGreen` sliced, and its origin held by reference (A-217), before the rungs use the whole kernel.
+>
 > The topology launcher is `crates/cli/tests/load_scale.rs`. It runs one primary and two replica server nodes in
 > region 0 at `f = 1`, and client nodes in region 1, so the client nodes are never the green's holders. One harness
 > drives every client node (`--instance a,b,…`), so one oracle judges every submit. It is portable (`ps`, `pgrep`),
