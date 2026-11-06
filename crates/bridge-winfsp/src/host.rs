@@ -2483,8 +2483,10 @@ fn run_mount(
       },
     }
   }
-  drop(mounted);
+  // DIAG ONLY: dumped before the mount is dropped, which waits for the anchor's release; the bench's teardown may end
+  // the anchor first and the daemon with it.
   dump_phases();
+  drop(mounted);
   report(Outcome::Stopped);
 }
 
