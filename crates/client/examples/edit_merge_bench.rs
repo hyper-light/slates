@@ -79,6 +79,82 @@ const GOAL_REQUIRED_NS: u64 = 1_000_000;
 /// stretched its tails (BENCHMARKS, "A rebase that costs what changed").
 static CLIENT_SPIN_NS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
 
+/// The scheduling experiment of item 1 (2026-11-06): what this process's threads ask the scheduler for, so that a
+/// thread woken under oversubscription runs before the spinners that never sleep. Set on the main thread before the
+/// in-process daemon starts, so its shard threads and the client inherit it; each spinner resets its own.
+mod sched {
+  /// Linux's `struct sched_attr` (`include/uapi/linux/sched/types.h`), the form `sched_setattr(2)` takes.
+  #[cfg(target_os = "linux")]
+  #[repr(C)]
+  #[derive(Default)]
+  struct SchedAttr {
+    size: u32,
+    policy: u32,
+    flags: u64,
+    nice: i32,
+    priority: u32,
+    runtime: u64,
+    deadline: u64,
+    period: u64,
+    util_min: u32,
+    util_max: u32,
+  }
+
+  /// Asks EEVDF for a slice of `slice_ns` (Linux 6.12+: a thread with a shorter slice gets an earlier deadline and so
+  /// preempts on its wake-up; no privilege is needed for `SCHED_OTHER`), and reads back what the kernel holds. `0` is
+  /// the default slice. Returns the slice read back.
+  #[cfg(target_os = "linux")]
+  pub(crate) fn set_slice(slice_ns: u64) -> u64 {
+    let mut attr = SchedAttr {
+      size: u32::try_from(std::mem::size_of::<SchedAttr>()).unwrap(),
+      runtime: slice_ns,
+      ..SchedAttr::default()
+    };
+    // SAFETY: `sched_setattr(0, &attr, 0)` reads one `sched_attr` of the size it names from a live, initialized value
+    // and changes only this thread's scheduling; `sched_getattr` writes at most `size` bytes into the same value.
+    unsafe {
+      let set = libc::syscall(libc::SYS_sched_setattr, 0, &attr as *const SchedAttr, 0);
+      assert_eq!(set, 0, "sched_setattr: {}", std::io::Error::last_os_error());
+      let size = attr.size;
+      let got = libc::syscall(
+        libc::SYS_sched_getattr,
+        0,
+        &mut attr as *mut SchedAttr,
+        size,
+        0,
+      );
+      assert_eq!(got, 0, "sched_getattr: {}", std::io::Error::last_os_error());
+    }
+    attr.runtime
+  }
+
+  /// No custom slice off Linux.
+  #[cfg(not(target_os = "linux"))]
+  pub(crate) fn set_slice(_slice_ns: u64) -> u64 {
+    panic!("--sched-slice-ns is Linux's (EEVDF's custom slice)");
+  }
+
+  /// Sets this thread's QoS class (macOS: `USER_INTERACTIVE` for slates' threads, `DEFAULT` for a spinner); threads
+  /// it creates inherit it.
+  #[cfg(target_os = "macos")]
+  pub(crate) fn set_qos(interactive: bool) {
+    let class = if interactive {
+      libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE
+    } else {
+      libc::qos_class_t::QOS_CLASS_DEFAULT
+    };
+    // SAFETY: `pthread_set_qos_class_self_np` changes only the calling thread's QoS class; it takes values, no memory.
+    let set = unsafe { libc::pthread_set_qos_class_self_np(class, 0) };
+    assert_eq!(set, 0, "pthread_set_qos_class_self_np: {set}");
+  }
+
+  /// No QoS classes off macOS.
+  #[cfg(not(target_os = "macos"))]
+  pub(crate) fn set_qos(_interactive: bool) {
+    panic!("--qos-interactive is macOS's");
+  }
+}
+
 /// The green the forms run over when `--green ID` names one (set once, in `main`).
 static ATTACHED_GREEN: std::sync::OnceLock<VolumeId> = std::sync::OnceLock::new();
 
@@ -968,6 +1044,10 @@ struct Selection {
   seed_green: Option<String>,
   /// The shards to drain spans from when attached (`--shards N`; none by default).
   attached_shards: u16,
+  /// The scheduling slice slates' threads ask for (`--sched-slice-ns N`, Linux).
+  sched_slice_ns: Option<u64>,
+  /// Whether slates' threads take the interactive QoS class (`--qos-interactive`, macOS).
+  qos_interactive: bool,
 }
 
 impl Selection {
@@ -987,12 +1067,23 @@ impl Selection {
       instance: None,
       seed_green: None,
       attached_shards: 0,
+      sched_slice_ns: None,
+      qos_interactive: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
       match arg.as_str() {
         "--quiet-only" => selection.loaded = false,
         "--loaded-only" => selection.quiet = false,
+        "--sched-slice-ns" => {
+          selection.sched_slice_ns = Some(
+            args
+              .next()
+              .and_then(|n| n.parse().ok())
+              .expect("--sched-slice-ns takes nanoseconds"),
+          );
+        }
+        "--qos-interactive" => selection.qos_interactive = true,
         "--instance" => selection.instance = Some(args.next().expect("--instance takes a name")),
         "--seed-green" => {
           selection.seed_green = Some(args.next().expect("--seed-green takes a name"))
@@ -1086,6 +1177,17 @@ fn main() {
   })
   .expect("the machine profile measures");
   let mut selection = Selection::parse();
+  // The scheduling experiment, set before any daemon thread exists so they all inherit it.
+  if let Some(slice) = selection.sched_slice_ns {
+    println!(
+      "sched: slates' threads ask for a {slice} ns slice; the kernel holds {} ns",
+      sched::set_slice(slice)
+    );
+  }
+  if selection.qos_interactive {
+    sched::set_qos(true);
+    println!("sched: slates' threads take the user-interactive QoS class");
+  }
   // Attached (`--instance`): a running daemon, perhaps a fleet node whose green another node owns; otherwise one
   // started here, in this process, as `slates` runs it.
   let (instance, shards, daemon) = match selection.instance.clone() {
@@ -1138,7 +1240,19 @@ fn main() {
     println!("loaded: {spinners} spinning threads on {cores} cores");
     std::thread::scope(|scope| {
       for _ in 0..spinners {
-        scope.spawn(|| {
+        let reset = (
+          selection.sched_slice_ns.is_some(),
+          selection.qos_interactive,
+        );
+        let stop = &stop;
+        scope.spawn(move || {
+          // A spinner is the load, not slates: it takes the default slice and class back.
+          if reset.0 {
+            sched::set_slice(0);
+          }
+          if reset.1 {
+            sched::set_qos(false);
+          }
           while !stop.load(Ordering::Relaxed) {
             std::hint::spin_loop();
           }
