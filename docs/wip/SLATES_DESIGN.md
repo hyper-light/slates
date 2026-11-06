@@ -5791,7 +5791,10 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > - *A green's `checkout`* into its live base (`crate::checkout`, `image::complete_once_durable`): answered `CheckedOut`
 >   with both stopped, red first; now waits the same way (3 of 3).
 > - *NFSv4 `COMMIT` and stable `WRITE`* need no change: the v4 front end serves each through the v3 procedure
->   (`RoutedBackend::call_v3` → `serve_v3`), whose wait is `stable_once_durable`.
+>   (`RoutedBackend::call_v3` → `serve_v3`), whose wait is `stable_once_durable`. Held to it now: with both candidates
+>   stopped a `COMMIT` answers `NFS4ERR_DELAY` after 1.0008–1.0024 s (3 of 3); red-checked with the wait removed, it
+>   and a `FILE_SYNC` write answered `NFS4_OK` in 285 and 349 µs. Once the candidates' confirmations lapse, the
+>   owner's lease fence (AUD-29-83) answers every call `NFS4ERR_DELAY` at once until a heartbeat after they resume.
 > Owed in this sweep: virtio-fs and vhost-user `FSYNC`, WinFsp's flush.
 
 > **Phase one with a candidate that holds no copy (2026-11-05).** Every candidate's report counts toward `f + 1`, an empty
