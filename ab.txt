@@ -476,3 +476,80 @@ slates daemon: nfs_v4_opens = 2484716: max_inodes × shards (anchors ["max_inode
 slates daemon: nfs_v4_locks = 2484716: max_inodes × shards (anchors ["max_inodes", "shards"])
 slates daemon: instance fsb-1596-1-comb2 serving on 1 shards under the anchor
 ## run 1 of 5 FAILED, 2026-11-06T03:40:07Z
+remote: 
+remote: Create a pull request for 'diag-winfsp-overlap-results-42155161568-windows-latest' on GitHub by visiting:        
+remote:      https://github.com/hyper-light/slates/pull/new/diag-winfsp-overlap-results-42155161568-windows-latest        
+remote: 
+To https://github.com/hyper-light/slates
+ * [new branch]      f227c5a8a2e6ff5e01754cec7330be5eb1436e6c -> diag-winfsp-overlap-results-42155161568-windows-latest
+## run 2 of 5, 2026-11-06T03:40:08Z
+# sep1 started first: dll=W: sep1=S: sep2=T: comb1=U: comb2=V:
+# host: windows 0x23f00206 on windows processor architecture 9 level 25 revision 4353 (x86_64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 1048576 B, cache line 64 B
+# workload: 10 rounds of 1000 files of 4096 B per arm and pass, arms interleaved, first arm rotating
+# arm dll: W:/d
+# arm sep1: S:/d
+# arm sep2: T:/d
+# arm comb1: U:/d
+# arm comb2: V:/d
+# warm-up: one untimed round per arm (1000 files each)
+# pass quiet: spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 25.8 µs, p99 45.5 µs, p999 128.7 µs, max 1013.9 µs over 19366 probes; 101.1 s
+fsbench	quiet	dll	create	10000	639600	1131200	1614600	30395400
+fsbench	quiet	dll	write	10000	49900	112200	299700	604700
+fsbench	quiet	dll	fsync	10000	80700	138900	338900	558300
+fsbench	quiet	dll	close	10000	36800	71400	305100	391900
+fsbench	quiet	dll	stat	10000	156000	368800	1822400	14832900
+fsbench	quiet	dll	open	10000	90700	163000	488600	2188300
+fsbench	quiet	dll	read	10000	8100	12100	31000	95400
+fsbench	quiet	dll	rename	10000	326800	483100	859500	29826100
+fsbench	quiet	dll	unlink	10000	194700	451400	637900	29513500
+fsbench	quiet	sep1	create	10000	657400	1142200	5604400	58714400
+fsbench	quiet	sep1	write	10000	76000	137800	349100	32316000
+fsbench	quiet	sep1	fsync	10000	90200	158900	244500	33506700
+fsbench	quiet	sep1	close	10000	40400	92900	317100	789000
+fsbench	quiet	sep1	stat	10000	180200	269000	592200	29438800
+fsbench	quiet	sep1	open	10000	118800	190400	1104300	32772800
+fsbench	quiet	sep1	read	10000	8900	12800	35600	92000
+fsbench	quiet	sep1	rename	10000	393300	684200	2606900	29922300
+fsbench	quiet	sep1	unlink	10000	220200	499300	595900	2628900
+fsbench	quiet	sep2	create	10000	745500	2755300	21327100	35275000
+fsbench	quiet	sep2	write	10000	54000	929100	1075100	31498500
+fsbench	quiet	sep2	fsync	10000	78300	135000	996100	30042600
+fsbench	quiet	sep2	close	10000	40400	76900	933700	2530000
+fsbench	quiet	sep2	stat	10000	168900	1051500	3122300	12587500
+fsbench	quiet	sep2	open	10000	102400	991300	1778500	33292300
+fsbench	quiet	sep2	read	10000	9000	15400	37000	80700
+fsbench	quiet	sep2	rename	10000	364200	1229800	2060000	33783000
+fsbench	quiet	sep2	unlink	10000	212000	626900	1096900	33188400
+fsbench	quiet	comb1	create	10000	674900	1180600	3909900	52978000
+fsbench	quiet	comb1	write	10000	76300	144300	346600	32330900
+fsbench	quiet	comb1	fsync	10000	89600	171400	478500	29270900
+fsbench	quiet	comb1	close	10000	40600	105000	320700	29119100
+fsbench	quiet	comb1	stat	10000	190400	283800	916900	22307000
+fsbench	quiet	comb1	open	10000	117800	192900	587100	29250100
+fsbench	quiet	comb1	read	10000	8500	13400	28600	36500
+fsbench	quiet	comb1	rename	10000	424800	580400	991000	52324800
+fsbench	quiet	comb1	unlink	10000	238000	569000	710800	52825600
+fsbench	quiet	comb2	create	10000	683700	1174400	20650000	53052200
+fsbench	quiet	comb2	write	10000	76200	137000	354700	20424000
+fsbench	quiet	comb2	fsync	10000	91500	155400	394800	32325800
+fsbench	quiet	comb2	close	10000	40800	90700	305800	366200
+fsbench	quiet	comb2	stat	10000	194900	287800	6446800	30288800
+fsbench	quiet	comb2	open	10000	114100	177200	587900	29310900
+fsbench	quiet	comb2	read	10000	8500	12700	27900	49000
+fsbench	quiet	comb2	rename	10000	430700	625000	1793700	29836300
+fsbench	quiet	comb2	unlink	10000	263000	606900	1184300	53902000
+
+**quiet** (spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 25.8 µs, p99 45.5 µs, p999 128.7 µs, max 1013.9 µs over 19366 probes; 101.1 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | dll | sep1 | sep2 | comb1 | comb2 |
+|---|---|---|---|---|---|
+| create | 639.6 · 1131.2 · 1614.6 · 30395.4 | 657.4 · 1142.2 · 5604.4 · 58714.4 | 745.5 · 2755.3 · 21327.1 · 35275.0 | 674.9 · 1180.6 · 3909.9 · 52978.0 | 683.7 · 1174.4 · 20650.0 · 53052.2 |
+| write | 49.9 · 112.2 · 299.7 · 604.7 | 76.0 · 137.8 · 349.1 · 32316.0 | 54.0 · 929.1 · 1075.1 · 31498.5 | 76.3 · 144.3 · 346.6 · 32330.9 | 76.2 · 137.0 · 354.7 · 20424.0 |
+| fsync | 80.7 · 138.9 · 338.9 · 558.3 | 90.2 · 158.9 · 244.5 · 33506.7 | 78.3 · 135.0 · 996.1 · 30042.6 | 89.6 · 171.4 · 478.5 · 29270.9 | 91.5 · 155.4 · 394.8 · 32325.8 |
+| close | 36.8 · 71.4 · 305.1 · 391.9 | 40.4 · 92.9 · 317.1 · 789.0 | 40.4 · 76.9 · 933.7 · 2530.0 | 40.6 · 105.0 · 320.7 · 29119.1 | 40.8 · 90.7 · 305.8 · 366.2 |
+| stat | 156.0 · 368.8 · 1822.4 · 14832.9 | 180.2 · 269.0 · 592.2 · 29438.8 | 168.9 · 1051.5 · 3122.3 · 12587.5 | 190.4 · 283.8 · 916.9 · 22307.0 | 194.9 · 287.8 · 6446.8 · 30288.8 |
+| open | 90.7 · 163.0 · 488.6 · 2188.3 | 118.8 · 190.4 · 1104.3 · 32772.8 | 102.4 · 991.3 · 1778.5 · 33292.3 | 117.8 · 192.9 · 587.1 · 29250.1 | 114.1 · 177.2 · 587.9 · 29310.9 |
+| read | 8.1 · 12.1 · 31.0 · 95.4 | 8.9 · 12.8 · 35.6 · 92.0 | 9.0 · 15.4 · 37.0 · 80.7 | 8.5 · 13.4 · 28.6 · 36.5 | 8.5 · 12.7 · 27.9 · 49.0 |
+| rename | 326.8 · 483.1 · 859.5 · 29826.1 | 393.3 · 684.2 · 2606.9 · 29922.3 | 364.2 · 1229.8 · 2060.0 · 33783.0 | 424.8 · 580.4 · 991.0 · 52324.8 | 430.7 · 625.0 · 1793.7 · 29836.3 |
+| unlink | 194.7 · 451.4 · 637.9 · 29513.5 | 220.2 · 499.3 · 595.9 · 2628.9 | 212.0 · 626.9 · 1096.9 · 33188.4 | 238.0 · 569.0 · 710.8 · 52825.6 | 263.0 · 606.9 · 1184.3 · 53902.0 |
+
