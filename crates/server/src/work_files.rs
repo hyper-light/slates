@@ -225,41 +225,10 @@ impl WorkFiles {
     Ok(())
   }
 
-  /// Restates the work as `files` over `green` at `version` (a clean rebase's full content): the delta becomes
-  /// exactly the files that differ from the green there and the green's files `files` lacks.
-  pub fn restate(&mut self, (green, version): (&Green, u64), files: BTreeMap<String, Vec<u8>>) {
-    let mut changed: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
-    for (path, _) in green.files_at(version) {
-      if !files.contains_key(path) {
-        changed.insert(path.to_owned(), None);
-      }
-    }
-    for (path, bytes) in files {
-      if green.content_ref_at(&path, version) != Some(bytes.as_slice()) {
-        changed.insert(path, Some(bytes));
-      }
-    }
-    self.changed = changed;
-  }
-
-  /// What [`WorkFiles::restate`] to `files` over `green` at `version` would hold (its footprint), before it is
-  /// applied.
-  pub fn restated_footprint(
-    (green, version): (&Green, u64),
-    files: &BTreeMap<String, Vec<u8>>,
-  ) -> u64 {
-    let mut total = 0u64;
-    for (path, _) in green.files_at(version) {
-      if !files.contains_key(path) {
-        total = total.saturating_add(crate::work_charge::file_footprint(path, 0));
-      }
-    }
-    for (path, bytes) in files {
-      if green.content_ref_at(path, version) != Some(bytes.as_slice()) {
-        total = total.saturating_add(crate::work_charge::file_footprint(path, bytes.len()));
-      }
-    }
-    total
+  /// A work's delta as a clean rebase leaves it (`Rebased::changed`): per path its bytes where they differ from the
+  /// new base, `None` where it removes the base's file.
+  pub fn from_changed(changed: BTreeMap<String, Option<Vec<u8>>>) -> WorkFiles {
+    WorkFiles { changed }
   }
 
   /// Forgets every change: the work now equals its (new) base.

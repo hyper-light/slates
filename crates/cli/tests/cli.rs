@@ -568,6 +568,11 @@ fn strict_volume_or_typed_refusal(instance: &str) -> Option<String> {
 /// (`SIGSTOP`: alive and silent), and wait for another daemon to answer. Expect the frozen one gone, killed once, and the
 /// new one answering no sooner than the liveness budget less one heartbeat after the freeze (the lapse runs from the last
 /// beat, which may precede the freeze by a beat) and within the suite's start wait after that.
+///
+/// Since A-228 the beat is the daemon's watchdog thread's, and a frozen process stops every thread at once, the watchdog
+/// with them, so nothing in the daemon can say it is only starved. A stopped process is indistinguishable from a hung one,
+/// and the kill here is the intended outcome: measured 2026-11-06 on macOS arm64 at load 54, killed at 1,045 ms against a
+/// 1,044 ms bound (the liveness window plus the anchor's own lateness p99 of 44 ms over 15 waits).
 #[test]
 fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
   if std::env::var_os("SLATES_TEST_CLI").is_none() {
@@ -3231,6 +3236,14 @@ fn assert_formed(views: &[Option<FleetView>]) -> Vec<String> {
             "fleet.plane.announce_lends:",
             "fleet.plane.announcements_sent:",
             "content.purged_bytes:",
+            // The reap tick's record of what a shard was doing (A-214: sealing, deferred, busy, idle) and the
+            // bytes an idle shard kept pre-faulted for its next write burst: events of a shard's ordinary
+            // ticks, counted during formation like `content.purged_bytes` (main CI 42172125695, macos-latest).
+            "content.ticks.sealing:",
+            "content.ticks.deferred:",
+            "content.ticks.busy:",
+            "content.ticks.idle:",
+            "content.prefaulted_bytes:",
             // A record link dropped because its anchor's learned member became another incarnation
             // (`fleet::LINK_INVALID_MEMBER_CHANGED`). Incarnations change as the fleet comes up, so this is
             // superseded link work — exactly what this assertion permits — and it is counted during formation
@@ -11013,13 +11026,56 @@ fn an_anchor_whose_log_reader_went_away_keeps_supervising() {
   );
 }
 
+/// A pipe whose two ends are close-on-exec. `rustix::pipe::pipe` is a bare `pipe(2)`: a child another test spawns
+/// while the ends are open inherits them for its whole life, so a read end the test has dropped still has a reader and
+/// a write to it succeeds (main CI 42152000416, ubuntu-latest: exit 0 where 4 was due). Linux has `pipe2`; Apple has
+/// none, so `fcntl` marks both ends at once, as `slates-ipc`'s delivery pipe does.
+fn close_on_exec_pipe() -> (rustix::fd::OwnedFd, rustix::fd::OwnedFd) {
+  #[cfg(target_os = "linux")]
+  let ends = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
+  #[cfg(not(target_os = "linux"))]
+  let ends = {
+    let (reader, writer) = rustix::pipe::pipe().unwrap();
+    rustix::io::fcntl_setfd(&reader, rustix::io::FdFlags::CLOEXEC).unwrap();
+    rustix::io::fcntl_setfd(&writer, rustix::io::FdFlags::CLOEXEC).unwrap();
+    (reader, writer)
+  };
+  ends
+}
+
+/// Waits, within [`WAIT_FOR`], until no process holds the pipe's read end, which the write end reports as an error or a
+/// hang-up: a child forked by another test before the drop keeps a copy until its own `exec` closes it.
+fn wait_until_no_reader(writer: &rustix::fd::OwnedFd) {
+  let deadline = Instant::now() + WAIT_FOR;
+  loop {
+    let mut fds = [rustix::event::PollFd::new(
+      writer,
+      rustix::event::PollFlags::OUT,
+    )];
+    let left = deadline.saturating_duration_since(Instant::now());
+    let timeout = rustix::time::Timespec::try_from(left).unwrap();
+    let _ = rustix::event::poll(&mut fds, Some(&timeout));
+    if fds[0]
+      .revents()
+      .intersects(rustix::event::PollFlags::ERR | rustix::event::PollFlags::HUP)
+    {
+      return;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "the pipe's read end is still held after {WAIT_FOR:?}"
+    );
+  }
+}
+
 /// The panic rule, for a command's output (A-213). Do: run `slates --help` with its standard output a pipe whose reader
 /// has already gone, as `slates status | head -n 1` leaves a command once `head` has its line. Expect: exit 4 (failed),
 /// with a line saying the output could not be written, not a panic.
 #[test]
 fn a_command_whose_output_reader_went_away_fails_without_a_panic() {
-  let (reader, writer) = rustix::pipe::pipe().unwrap();
+  let (reader, writer) = close_on_exec_pipe();
   drop(reader);
+  wait_until_no_reader(&writer);
   let output = slates()
     .arg("--help")
     .stdout(Stdio::from(writer))

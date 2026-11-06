@@ -2899,6 +2899,186 @@ fn a_sealed_files_block_is_trimmed_to_its_pages_and_survives_a_restart() {
   );
 }
 
+/// A-214 (VFS plan step 11). Do: on a one-shard daemon over a held anchor, write a file of many chunks (the shard's
+/// write burst), publish, and leave the shard idle for two reap ticks (`content.ticks.idle`), by which its idle work, the
+/// reserve's refill, has finished, or until the bound passes; then write a second file of the same size, watching the content object's allocated bytes across that
+/// write. Expect the second burst to land on pages already resident: the object grows by less than a quarter of the
+/// file during the write, and the idle pre-fault is counted (`content.prefaulted_bytes`). Before A-214 the idle purge
+/// left no free page resident, so the second file's every page was allocated, and faulted fresh, during its write: the
+/// object grew by the whole file (one `shmem_fault` a page, the 41.5% of a large NFS write's samples that CI run
+/// 41986870989 measured). The object's allocation is the content's own measure; the process's minor faults also
+/// count the client's buffers and the shard's receive buffer (12,278 and about 4,200 of 20,619 on main).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted() {
+  const MARKER: &[u8] = b"SLATES-PREFAULT-A214-3c0d";
+  /// Shape: each file is this many chunk-sized blocks, so its pages dwarf the faults of anything else in the process.
+  const CHUNKS: usize = 256;
+  /// Shape: the bound on the idle shard's pre-fault: several reap ticks (one to see no allocation, the next to refill).
+  const PREFAULT_WAIT: Duration = Duration::from_secs(20);
+  let profile = common::machine_profile();
+  let instance = format!("srv-prefault-{}", std::process::id());
+  // One shard, so the burst and the reserve are this volume's alone.
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let chunk = slates_vfs::content::chunk_bytes(config.page).get();
+  let tag = format!("prefault-{}", std::process::id());
+  let anchor = held_anchor(&tag, &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let body = MARKER.repeat(chunk * CHUNKS / MARKER.len());
+  let mut spec = scratch("prefault");
+  // Room for both files and the reserve between them.
+  spec.size = SizeClass::Bounded {
+    limit: u64::try_from(body.len()).unwrap() * 4,
+  };
+  let volume = client.create(&spec).unwrap();
+  let attachment = client
+    .attach(volume, None, slates_ipc::protocol::Intent::Write)
+    .unwrap()
+    .attachment;
+  client
+    .fs_write((volume, attachment), "first", &body, 0o644)
+    .unwrap();
+  daemon.publish_every_shard().unwrap();
+  let prefaulted = || {
+    daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get("content.prefaulted_bytes")
+      .copied()
+      .unwrap_or(0)
+  };
+  let file = u64::try_from(body.len()).unwrap();
+  let content = format!("slates-con-{tag}");
+  // The refill is the shard's idle work, so once the shard has been idle a whole reap tick it has finished: wait for two
+  // idle ticks after the first write (`content.ticks.idle`), or the bound.
+  let idle_ticks = || {
+    daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get("content.ticks.idle")
+      .copied()
+      .unwrap_or(0)
+  };
+  let ticks_before = idle_ticks();
+  let started = Instant::now();
+  while idle_ticks() < ticks_before + 2 && started.elapsed() < PREFAULT_WAIT {
+    std::thread::yield_now();
+  }
+  let reserved = prefaulted();
+  let before = allocated_in_content(&content);
+  client
+    .fs_write((volume, attachment), "second", &body, 0o644)
+    .unwrap();
+  let grew = allocated_in_content(&content).saturating_sub(before);
+  eprintln!(
+    "a burst after idle: the content object grew {grew} bytes during a {}-byte write, {} bytes pre-faulted at idle",
+    body.len(),
+    prefaulted()
+  );
+  let read_back = client
+    .read(volume, "second", slates_ipc::protocol::ReadAt::Head)
+    .unwrap();
+  daemon.stop();
+  drop(anchor);
+  assert!(read_back == body, "the second file reads back as written");
+  assert!(
+    grew * 4 < file,
+    "the burst after idle landed on resident pages: the content object grew {grew} bytes during a {file}-byte write"
+  );
+  assert!(
+    reserved >= file / 2,
+    "the idle shard pre-faulted most of its last burst: {reserved} of {file} bytes"
+  );
+}
+
+/// A-214 with A-105 and A-205 (VFS plan steps 11 and 12). Do: on a one-shard daemon over a held anchor, write a file of
+/// many chunks, publish, and leave the shard idle for two reap ticks, so the burst closes and its reserve is pre-faulted;
+/// then delete the file, publish, and leave the shard idle. Expect the content object to fall back to within a quarter of
+/// the file of what it held before the write, within the bound: the delete's busy period nets the burst away, so the
+/// reserve goes and every page goes back. Before this was fixed the burst ended only when the arena's allocation count
+/// moved, which a delete does not move: the reserve stayed the written file's size, kept the deleted file's own pages
+/// resident, and the working set did not fall (A-205's test on both Windows lanes, main CI 42119714654).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it() {
+  const MARKER: &[u8] = b"SLATES-RESERVE-RETURNED-9b41";
+  /// Shape: the file is this many chunk-sized blocks, so its pages dwarf the object's metadata and image pages.
+  const CHUNKS: usize = 256;
+  /// Shape: the bound on the idle shard's work: several reap ticks.
+  const IDLE_WAIT: Duration = Duration::from_secs(20);
+  let profile = common::machine_profile();
+  let instance = format!("srv-reserve-back-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let chunk = slates_vfs::content::chunk_bytes(config.page).get();
+  let tag = format!("reserve-back-{}", std::process::id());
+  let anchor = held_anchor(&tag, &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let body = MARKER.repeat(chunk * CHUNKS / MARKER.len());
+  let mut spec = scratch("reserve-back");
+  spec.size = SizeClass::Bounded {
+    limit: u64::try_from(body.len()).unwrap() * 4,
+  };
+  let volume = client.create(&spec).unwrap();
+  let attachment = client
+    .attach(volume, None, slates_ipc::protocol::Intent::Write)
+    .unwrap()
+    .attachment;
+  let content = format!("slates-con-{tag}");
+  let idle_ticks = || {
+    daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get("content.ticks.idle")
+      .copied()
+      .unwrap_or(0)
+  };
+  let file = u64::try_from(body.len()).unwrap();
+  let before = allocated_in_content(&content);
+  client
+    .fs_write((volume, attachment), "big", &body, 0o644)
+    .unwrap();
+  daemon.publish_every_shard().unwrap();
+  let ticks = idle_ticks();
+  let started = Instant::now();
+  while idle_ticks() < ticks + 2 && started.elapsed() < IDLE_WAIT {
+    std::thread::yield_now();
+  }
+  let held = allocated_in_content(&content);
+  client.fs_remove((volume, attachment), "big").unwrap();
+  daemon.publish_every_shard().unwrap();
+  let started = Instant::now();
+  let mut after = allocated_in_content(&content);
+  while after.saturating_sub(before) * 4 >= file && started.elapsed() < IDLE_WAIT {
+    std::thread::yield_now();
+    after = allocated_in_content(&content);
+  }
+  daemon.stop();
+  drop(anchor);
+  eprintln!(
+    "a deleted file's reserve: the content object held {before} bytes before the write, {held} with the file and \
+     its reserve, {after} after the delete"
+  );
+  assert!(
+    held.saturating_sub(before) >= file,
+    "the file was written: the object grew {} bytes for a {file}-byte file",
+    held.saturating_sub(before)
+  );
+  assert!(
+    after.saturating_sub(before) * 4 < file,
+    "the deleted file's pages and its reserve went back: the object holds {} bytes more than before the write, for a \
+     {file}-byte file",
+    after.saturating_sub(before)
+  );
+}
+
 /// Memory, a deleted file's RAM: do write a file of many chunks, publish, delete it and leave the shard idle. Expect
 /// the daemon to count most of the file given back to the OS within the bound (`content.purged_bytes`: an idle
 /// shard's free blocks go back, A-105, on macOS as reusable pages, A-110), and on Linux the content object's allocated

@@ -1573,6 +1573,7 @@ pub fn unsupported_reason_name(reason: UnsupportedReason) -> &'static str {
     UnsupportedReason::MountNotShared => "mount_not_shared",
     UnsupportedReason::DescriptorRouteNotBuilt => "descriptor_route_not_built",
     UnsupportedReason::WinFspNotInstalled => "winfsp_not_installed",
+    UnsupportedReason::OwnedByAnotherHost => "owned_by_another_host",
   }
 }
 

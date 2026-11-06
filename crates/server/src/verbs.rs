@@ -930,9 +930,8 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
       None => None,
     }
   } else {
-    Some(refused(Refusal::Unsupported {
-      feature: "forwarded verb".to_owned(),
-    }))
+    // A peer's reap of its dead client (A-222) is the one verb served here that is neither; any other is refused.
+    Some(crate::remote_attach::serve_unforwardable(control, shard, origin_host, body).await)
   };
   encode_body(&reply.unwrap_or_else(|| refused(Refusal::NotFound)))
 }
@@ -1426,7 +1425,7 @@ fn join_batch(
 
 /// The bytes of `body` forwarded over the fleet under this client's request id, with the completion watermark
 /// its client acknowledged (every partition holds it: acknowledgements are scattered to every shard).
-fn forwarded_request(
+pub(crate) fn forwarded_request(
   state: &ShardState,
   request: u64,
   principal: Principal,
@@ -1449,7 +1448,7 @@ fn forwarded_request(
 /// read-ahead batch of windows, sent together. Returns the owner's reply to the first, or
 /// `OwnerUnreachable` when no owner was found or none answered within the takeover bound, with the decoded replies to the rest that came back
 /// (in order, up to the first that did not), and the route to cache when the owner served.
-async fn resolve_and_forward(
+pub(crate) async fn resolve_and_forward(
   volume: VolumeId,
   region: u64,
   cached: Option<crate::owner_location::CachedRoute>,
@@ -1700,6 +1699,13 @@ pub(crate) fn owned_unmaterialized(state: &mut ShardState, volume: VolumeId) -> 
 pub(crate) struct OwnerReplies {
   first: ReplyBody,
   later: Vec<ReplyBody>,
+}
+
+impl OwnerReplies {
+  /// The owner's reply to the first request.
+  pub(crate) fn first(&self) -> &ReplyBody {
+    &self.first
+  }
 }
 
 /// The region and volume of a verb this node must send to another host of its own region (§4.8 "Lookup": a lookup
@@ -1982,6 +1988,14 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
   if let RequestBody::Acknowledge { up_to } = body {
     return scatter_acknowledge(state, client.index(), request.request, client_id, up_to);
   }
+  // An attach of another host's volume is remembered with its client here, on the client's own shard, before it is
+  // sent anywhere, so the client's reap reaches the owner (A-222).
+  if let Some(refusal) = crate::remote_attach::foreign_attach(state, &body) {
+    return Served::Reply(record_completion(state, origin, id, refused(refusal)));
+  }
+  if let Err(refusal) = crate::remote_attach::remember(state, client, &body) {
+    return Served::Reply(record_completion(state, origin, id, refused(refusal)));
+  }
   // A foreign-home verb resolves its owner from the creator, a cached successful route or a
   // read-only exchange with actual home-region holders. The write itself is forwarded once,
   // carrying the original completion key. A single-region request keeps the local fast path.
@@ -2051,7 +2065,7 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
 
 /// Format: the client id a verb forwarded from another node is dispatched under (`serve_forward`): no client of this
 /// node.
-const FORWARDED_CLIENT: u32 = 0;
+pub(crate) const FORWARDED_CLIENT: u32 = 0;
 
 /// The most bytes one read-ahead window carries (`RequestBody::ReadWindow`): as many pages as a client may hold in
 /// flight on its ring, half its slots (the half `slates_client` acknowledges at), so a window replaces the round
@@ -2179,12 +2193,9 @@ fn run_recorded(
   let mut deferred = std::mem::take(&mut state.acceptance_deferred);
   // A verb on a live-shipped volume answers once its publication is durable on `f` candidates (A-200): like a deferred
   // acceptance, its effects commit now and its completion and reply follow (`crate::live_ship::resolve`).
-  let live_target = live_volume
-    .filter(|_| label == 1 && !deferred && !matches!(reply, ReplyBody::Refused { .. }))
-    .and_then(|volume| {
-      crate::live_ship::durable_target(state, volume).map(|target| (volume, target))
-    });
-  deferred |= live_target.is_some();
+  let (live_target, destroy_target) =
+    replicated_waits(state, live_volume.filter(|_| !deferred), label, &reply);
+  deferred |= live_target.is_some() || destroy_target.is_some();
   let reply = if deferred {
     reply
   } else {
@@ -2219,6 +2230,11 @@ fn run_recorded(
   {
     return crate::live_ship::defer(state, live_target, (origin, id), route, reply);
   }
+  if let Some(destroy_target) = destroy_target
+    && !matches!(reply, ReplyBody::Refused { .. })
+  {
+    return crate::live_ship::defer_destroy(state, destroy_target, (origin, id), route, reply);
+  }
   if deferred && !matches!(reply, ReplyBody::Refused { .. }) {
     return None;
   }
@@ -2235,6 +2251,36 @@ fn run_recorded(
       Some(reply)
     }
   }
+}
+
+/// A volume and the position (a live log's) or sequence (a tombstone's) a verb's reply waits for.
+type ReplicatedWait = (DbVolumeId, u64);
+
+/// What a verb that just committed on `volume` must wait for before it answers, beyond its own partition: a mutation of
+/// a live-shipped volume, its log durable where its publication put it (A-200; `live_ship::durable_target`); a destroy,
+/// its tombstone placed at `f + 1` (`live_ship::tombstone_target`). A destroy never waits on the live log: it publishes
+/// no content to make durable, and its teardown refuses whatever waits on the log `NotFound`, which had told a client
+/// its successful destroy had not happened; and answered before its tombstone was placed, an owner lost at once left a
+/// takeover that served the volume again (2026-11-06, `crates/cli/tests/live_chaos.rs`).
+fn replicated_waits(
+  state: &ShardState,
+  volume: Option<DbVolumeId>,
+  label: u32,
+  reply: &ReplyBody,
+) -> (Option<ReplicatedWait>, Option<ReplicatedWait>) {
+  let Some(volume) = volume else {
+    return (None, None);
+  };
+  if matches!(reply, ReplyBody::Destroyed) {
+    let destroy =
+      crate::live_ship::tombstone_target(state, volume).map(|sequence| (volume, sequence));
+    return (None, destroy);
+  }
+  if label != 1 || matches!(reply, ReplyBody::Refused { .. }) {
+    return (None, None);
+  }
+  let live = crate::live_ship::durable_target(state, volume).map(|target| (volume, target));
+  (live, None)
 }
 
 /// The owner's side of a forwarded verb: its own completion window first (a retry of a
@@ -3429,6 +3475,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::MapShareExhausted { .. } => "map_share_exhausted",
     Refusal::HolderPending => "holder_pending",
     Refusal::MapsHeld { .. } => "maps_held",
+    Refusal::RemoteAttachmentsFull { .. } => "remote_attachments_full",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",
@@ -3749,6 +3796,13 @@ fn dispatch_inner(
       form,
     } => attach(state, client_id, principal, volume, snapshot, intent, form),
     RequestBody::Detach { attachment } => detach(state, principal, attachment),
+    RequestBody::DetachOf { volume, attachment } => {
+      detach_of(state, principal, Some(volume), attachment)
+    }
+    // A peer's reap is served in `serve_forward`, under the peer's authenticated id; no client sends one.
+    RequestBody::RemoteReap { .. } => refused(Refusal::BadRequest {
+      reason: "a remote reap is a fleet peer's, never a client's".to_owned(),
+    }),
     RequestBody::BindMount { attachment, path } => bind_mount(state, principal, attachment, &path),
     RequestBody::Resize { volume, size } => resize(state, principal, volume, size),
     RequestBody::Destroy { volume } => destroy(state, principal, volume),
@@ -5946,24 +6000,20 @@ fn rebase(state: &mut ShardState, principal: &Principal, work: VolumeId) -> Repl
   match engine.rebase(&inc) {
     slates_merge::engine::Rebased::Rebased {
       version,
-      files,
+      changed,
       journal,
     } => {
-      // The work moves onto the head; the green is untouched. The engine restates the work's whole content there,
-      // and the work keeps only what differs from the head (`crate::work_files`). Its new footprint is charged
-      // first: refused, the work stays where it was. `build_increment` proved the work exists, so this lookup finds
-      // it. (The rebase's cost still follows the green's files: the engine's restatement is whole, owed.)
-      let Some(engine) = state.greens.get(&green_id) else {
-        return refused(Refusal::NotFound);
-      };
-      let held = crate::work_files::WorkFiles::restated_footprint((engine, version), &files);
-      let wanted = crate::work_charge::journal_footprint(&journal).saturating_add(held);
+      // The work moves onto the head; the green is untouched. The engine returns only what the work's mapped edits
+      // leave different from the head (`Rebased::changed`), which becomes the work's delta over its new base
+      // (`crate::work_files`): O(what the work changed). Its new footprint is charged first: refused, the work stays
+      // where it was. `build_increment` proved the work exists, so this lookup finds it.
+      let changed = crate::work_files::WorkFiles::from_changed(changed);
+      let wanted = crate::work_charge::footprint(&changed, &journal);
       if let Err(available) = crate::work_charge::set_to(state, work_id, wanted) {
         return refused(Refusal::BudgetExceeded { available });
       }
-      let (works, greens) = (&mut state.works, &state.greens);
-      if let (Some(w), Some(engine)) = (works.get_mut(&work_id), greens.get(&green_id)) {
-        w.files.restate((engine, version), files);
+      if let Some(w) = state.works.get_mut(&work_id) {
+        w.files = changed;
         w.base_version = version;
         w.journal = journal;
         w.revision = w.revision.wrapping_add(1);
@@ -6310,7 +6360,8 @@ fn attach(
     Err(refusal) => return refused(refusal),
   };
   let resolved = binding.as_ref().map_or_else(
-    || consumer_of(&form, client_id).map(|consumer| (consumer, false)),
+    // Another host's client's attachment names its host and client (A-222); a local client's is its own.
+    || crate::remote_attach::consumer(state, &form, client_id).map(|consumer| (consumer, false)),
     |binding| {
       binding.consumer(
         state.db.partition(),
@@ -7106,10 +7157,25 @@ fn take_write_lease(
 }
 
 fn detach(state: &mut ShardState, principal: &Principal, attachment: u64) -> ReplyBody {
+  detach_of(state, principal, None, attachment)
+}
+
+/// `detach`, and `DetachOf` (A-222), which names the attachment's volume so another host's attachment routes to its
+/// owner: refused `NotFound` for an attachment of another volume, and `Forbidden` for one the requester's host does
+/// not hold (`remote_attach::may_use`), so a forward cannot end another host's attachment or this node's.
+fn detach_of(
+  state: &mut ShardState,
+  principal: &Principal,
+  volume: Option<VolumeId>,
+  attachment: u64,
+) -> ReplyBody {
   let Some(record) = state.db.partition().attachment(attachment).cloned() else {
     return refused(Refusal::NotFound);
   };
-  if &record.principal != principal {
+  if volume.is_some_and(|volume| to_db_volume(volume) != record.volume) {
+    return refused(Refusal::NotFound);
+  }
+  if &record.principal != principal || !crate::remote_attach::may_use(state, &record) {
     return forbidden("detach");
   }
   // A writable direct map's stores reach its file only through the attachment it was made under (§4.6, A-186): the

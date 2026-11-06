@@ -179,6 +179,11 @@ pub(crate) struct LiveState {
   awaiting: BTreeMap<([u8; 16], u64), Vec<Awaiting>>,
   /// The awaiting verbs by request, so a retry joins its wait ([`join`]).
   awaiting_by_request: BTreeMap<(u64, u32, u32), ([u8; 16], u64)>,
+  /// Destroys whose reply waits for their volume's tombstone to be placed at `f + 1` ([`defer_destroy`]): by volume, the
+  /// tombstone's sequence and the verbs. Any volume's, live-shipped or not. Bounded with [`LiveState::awaiting`].
+  destroys: BTreeMap<[u8; 16], (u64, Vec<Awaiting>)>,
+  /// The waiting destroys by request, so a retry joins its wait ([`join`]).
+  destroys_by_request: BTreeMap<(u64, u32, u32), [u8; 16]>,
   /// What the transport barrier that just ran on this shard published of a live volume, for its caller to wait on
   /// ([`note_barrier`], [`take_barrier`]): set and taken within one synchronous serve.
   barrier: Option<(slates_db::catalog::VolumeId, u64)>,
@@ -415,8 +420,7 @@ pub(crate) fn defer(
     state.count(LIVE_FENCED, 1);
     return Some(stale_epoch(current));
   }
-  let held: usize = state.live.awaiting.values().map(Vec::len).sum();
-  if held >= awaiting_bound(state) {
+  if held_replies(state) >= awaiting_bound(state) {
     state.count(LIVE_OVER_BOUND, 1);
     return Some(slates_ipc::protocol::ReplyBody::Refused {
       refusal: slates_ipc::protocol::Refusal::Overloaded { shard: state.shard },
@@ -447,6 +451,26 @@ pub(crate) fn join(
   origin: u64,
   id: slates_wire::request::RequestId,
 ) -> bool {
+  if let Some(volume) = state
+    .live
+    .destroys_by_request
+    .get(&(origin, id.client, id.sequence))
+    .copied()
+  {
+    let route = state.reply_route.take();
+    if let (Some((_, waiting)), Some(route)) = (state.live.destroys.get_mut(&volume), route)
+      && let Some(first) = waiting.first()
+    {
+      let (origin, id, reply) = (first.origin, first.id, first.reply.clone());
+      waiting.push(Awaiting {
+        route: Some(route),
+        origin,
+        id,
+        reply,
+      });
+    }
+    return true;
+  }
   let Some(key) = state
     .live
     .awaiting_by_request
@@ -503,10 +527,108 @@ pub(crate) fn resolve(state: &mut ShardState, volume: [u8; 16]) {
   }
 }
 
+/// The replies this shard holds for durability or a tombstone's placement, which [`awaiting_bound`] bounds together.
+fn held_replies(state: &ShardState) -> usize {
+  let live: usize = state.live.awaiting.values().map(Vec::len).sum();
+  let destroys: usize = state
+    .live
+    .destroys
+    .values()
+    .map(|(_, waiting)| waiting.len())
+    .sum();
+  live.saturating_add(destroys)
+}
+
+/// The tombstone sequence a destroy of `volume` that just committed must see placed at `f + 1` before it answers, or
+/// `None` when it need not wait: at `f = 0` (a laptop's tombstone retires with its destroy, R8), or when the volume has
+/// no tombstone to place. Until its tombstone is region-placed a destroy is not durable: a takeover after the owner's
+/// loss adopts the last live head and serves the volume again (§4.4 destroy, AUD-29-43), so a destroy answered before
+/// then told its client what the takeover undid (2026-11-06, `crates/cli/tests/live_chaos.rs`: both candidates stopped,
+/// the destroy answered done, the owner killed, a survivor listed the volume and served its file).
+pub(crate) fn tombstone_target(
+  state: &ShardState,
+  volume: slates_db::catalog::VolumeId,
+) -> Option<u64> {
+  let sequence = state.db.partition().tombstone_sequence(volume)?;
+  (!tombstone_placed(state, volume.bytes, sequence)).then_some(sequence)
+}
+
+/// Whether `volume`'s register is region-placed at `sequence` or past it (always at `f = 0`).
+fn tombstone_placed(state: &ShardState, volume: [u8; 16], sequence: u64) -> bool {
+  let configuration = state.fleet.configuration();
+  configuration.quorum.f == 0
+    || state
+      .placed_heads
+      .get(&ObjectId(volume))
+      .is_some_and(|head| head.sequence >= sequence && configuration.region_placed(&head.placement))
+}
+
+/// Holds a destroy's reply until its volume's tombstone is placed at `f + 1` ([`tombstone_target`]): its effects are
+/// committed; its completion is recorded and its reply delivered then ([`resolve_destroys`]): `None`. `Overloaded` now
+/// instead (counted, nothing recorded, so a retry runs the verb again) at the shard's bound of held replies.
+pub(crate) fn defer_destroy(
+  state: &mut ShardState,
+  (volume, sequence): (slates_db::catalog::VolumeId, u64),
+  (origin, id): (u64, slates_wire::request::RequestId),
+  route: Option<crate::merge_service::ReplyRoute>,
+  reply: slates_ipc::protocol::ReplyBody,
+) -> Option<slates_ipc::protocol::ReplyBody> {
+  if held_replies(state) >= awaiting_bound(state) {
+    state.count(LIVE_OVER_BOUND, 1);
+    return Some(slates_ipc::protocol::ReplyBody::Refused {
+      refusal: slates_ipc::protocol::Refusal::Overloaded { shard: state.shard },
+    });
+  }
+  let (target, waiting) = state
+    .live
+    .destroys
+    .entry(volume.bytes)
+    .or_insert_with(|| (sequence, Vec::new()));
+  *target = (*target).max(sequence);
+  waiting.push(Awaiting {
+    route,
+    origin,
+    id,
+    reply,
+  });
+  state
+    .live
+    .destroys_by_request
+    .insert((origin, id.client, id.sequence), volume.bytes);
+  state.count(DESTROY_AWAITED, 1);
+  None
+}
+
+/// Answers the destroys waiting on `volume` once its tombstone is region-placed ([`defer_destroy`]).
+pub(crate) fn resolve_destroys(state: &mut ShardState, volume: [u8; 16]) {
+  let Some((sequence, _)) = state.live.destroys.get(&volume) else {
+    return;
+  };
+  if !tombstone_placed(state, volume, *sequence) {
+    return;
+  }
+  let Some((_, waiting)) = state.live.destroys.remove(&volume) else {
+    return;
+  };
+  for entry in waiting {
+    let reply = entry.reply.clone();
+    answer(state, entry, reply);
+  }
+}
+
+/// Counter: destroys whose reply waited for their tombstone's placement at `f + 1`.
+const DESTROY_AWAITED: &str = "fleet.destroy.awaited";
+
 /// Refuses every verb waiting on `volume` `StaleEpoch` once a holder has fenced its owner at `current`: each refusal is
 /// recorded as the verb's completion, so a retry meets it, and delivered as a resolved reply is.
 fn refuse_awaiting(state: &mut ShardState, volume: [u8; 16], current: HostEpoch) {
-  for entry in take_awaiting(state, volume) {
+  let destroys = state
+    .live
+    .destroys
+    .remove(&volume)
+    .map(|(_, waiting)| waiting)
+    .unwrap_or_default();
+  for entry in take_awaiting(state, volume).into_iter().chain(destroys) {
     state.count(LIVE_FENCED, 1);
     answer(state, entry, stale_epoch(current));
   }
@@ -552,6 +674,10 @@ fn answer(state: &mut ShardState, entry: Awaiting, reply: slates_ipc::protocol::
   state
     .live
     .awaiting_by_request
+    .remove(&(entry.origin, entry.id.client, entry.id.sequence));
+  state
+    .live
+    .destroys_by_request
     .remove(&(entry.origin, entry.id.client, entry.id.sequence));
   state.db.begin();
   let recorded = crate::verbs::record_completion(state, entry.origin, entry.id, reply);
@@ -1117,6 +1243,9 @@ pub(crate) fn reports(state: &ShardState) -> Vec<slates_ipc::protocol::LiveRepor
         head: live.shipper.head().map(|head| head.position),
         durable: live.shipper.durable(),
         owed: live.owes_whole,
+        head_epoch: live.shipper.head().map(|head| head.epoch.0),
+        head_identity: live.shipper.head().map(|head| head.identity),
+        fence: live.shipper.epoch().0,
       });
   let held = state
     .live
@@ -1128,6 +1257,9 @@ pub(crate) fn reports(state: &ShardState) -> Vec<slates_ipc::protocol::LiveRepor
       head: held.replica.head().map(|head| head.position),
       durable: None,
       owed: false,
+      head_epoch: held.replica.head().map(|head| head.epoch.0),
+      head_identity: held.replica.head().map(|head| head.identity),
+      fence: held.replica.fence().0,
     });
   shipping.chain(held).collect()
 }

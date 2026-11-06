@@ -25,8 +25,8 @@ context refusal, and would count it in any refusal tally a test or an operator r
 
 ## Root cause
 
-Recovery replays every Cleanup and Close a dead worker's journal held unacknowledged (`settle_recovered` in
-`crates/bridge-winfsp/src/dispatcher.rs`, `settle` on main). The replay runs the request through the shard again
+Recovery replays every Cleanup and Close a dead worker's journal held unacknowledged (`settle` in
+`crates/bridge-winfsp/src/dispatcher.rs`; `settle_recovered` in A-219's combined form). The replay runs the request through the shard again
 (`crate::host::Request::serve`, which binds the request's context to an open in the open ledger).
 
 The dead daemon may have served that Close already. It ended the open on the shard, which retires it from the ledger,
@@ -35,8 +35,9 @@ the successor replays it. The ledger has no such open now, `bind` answers `Refus
 turns it into `STATUS_INVALID_HANDLE`.
 
 Both forms take this path: main's one-worker form (`settle` → `operation` → `Request::serve`) and the combined form.
-There is no variant one form has and the other does not. The combined form's fix below fixes both, because the shared
-code is `Request::serve`.
+There is no variant one form has and the other does not. The fix below is in the shared code, `Request::serve`, so it
+fixes both; this change lands it on main, and the combined form's branch (`agents/winfsp-overlap-7`, `dc2b9e4b` and
+`45f048b6`) carries the same fix.
 
 ## Impact
 
@@ -72,7 +73,9 @@ No open is leaked: the dead daemon ended it.
   went on. The role now serves while it watches for the outcome (`next_request`, `report_close_recovery`). That run
   also showed the client's CloseHandle return before the kill, which is why the first test's account above says the
   Close follows CloseHandle.
-- **The red check.** Diagnostics run `diag-winfsp-overlap-33` runs both tests on both runners: on main's form without
-  the fix, on the combined form without the fix (the `replayed && ends_open` arm kept out), and with the fix on main's
-  form and on the combined form at one and at two fixed workers. Red must show `refused` above zero; the fixed arms
-  must show zero.
+- **The red check.** Diagnostics run 42172708947 (`diag-winfsp-overlap-33`, 2026-11-06), both tests in each job:
+  - **Without the fix**, on main's form (`97f42a58`) and on the combined form at two fixed workers, on both runners:
+    the replayed-Close test failed every time, `the successor settled 1 captured requests, 1 refused`. The held-open
+    test passed every time, so the handle open across the kill was never refused in either form, fix or no fix.
+  - **With the fix**, on main's form and on the combined form at one and at two fixed workers, on both runners: `0
+    refused`, and each bridge suite passed whole, main's form 79 of 79 and the combined form 90 of 90.
