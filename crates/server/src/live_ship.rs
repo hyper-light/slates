@@ -855,6 +855,10 @@ pub(crate) fn published(
       if whole {
         let head = entry.head();
         live.shipper.mark_checkpoint(head);
+        // Derived: the retained tail's byte bound is this whole record's size, the install a laggard would be sent
+        // instead: shipping it the entries it lacks never costs more than installing it (`Shipper::retain_up_to`).
+        // The owner keeps at most that much again beside the record it already keeps.
+        live.shipper.retain_up_to(payload.len());
         live.whole = Some((head, payload));
       }
       state.count(LIVE_APPENDED, 1);
@@ -985,6 +989,7 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
   let object = ObjectId(volume);
   let mut sends = Vec::new();
   let mut stale_checkpoint = false;
+  let mut state_counts = Vec::new();
   for holder in live.shipper.holders() {
     match live.shipper.pending(*holder) {
       Next::Entries(entries) => {
@@ -1017,11 +1022,13 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
           head: *head,
           state: payload.clone(),
         };
+        let bytes = install.encode();
+        state_counts.push(bytes.len());
         sends.push(Send {
           object,
           holder: *holder,
           stream: slates_cluster::live::LIVE_STATE_STREAM,
-          bytes: install.encode(),
+          bytes,
         });
       }
       Next::Nothing | Next::Fenced(_) => {}
@@ -1030,8 +1037,19 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
   if stale_checkpoint {
     live.owes_whole = true;
   }
+  for bytes in state_counts {
+    state.count(LIVE_INSTALL_SENT, 1);
+    state.count(LIVE_INSTALL_BYTES, u64::try_from(bytes).unwrap_or(u64::MAX));
+  }
   sends
 }
+
+/// Counter: installs sent to a holder off the chain or behind the retained tail.
+const LIVE_INSTALL_SENT: &str = "fleet.live.install_sent";
+/// Counter: the bytes of those installs.
+const LIVE_INSTALL_BYTES: &str = "fleet.live.install_bytes";
+/// Counter: installs a holder did not answer within the exchange's budget.
+const LIVE_INSTALL_UNANSWERED: &str = "fleet.live.install_unanswered";
 
 /// Ships `sends` from the control shard and folds the replies on this (the owner) shard, in a task of this shard: the
 /// barrier that called it does not wait for it (the barrier's reply waits on [`durability`] instead). The task is
@@ -1197,12 +1215,20 @@ async fn ship_lane(
 ) -> bool {
   for send in sends {
     let sessions = borrow_session(holder, budget.max_deadline_ns()).await;
+    // Each message under its own budget: the liveness budget plus its transfer on the session it rides, so an install
+    // of the whole volume is not given up the moment an entry would be (`exchange_budget`).
+    let exchange = exchange_budget(send.bytes.len(), &sessions);
     let exchanged =
-      slates_cluster::live::exchange((send.stream, &send.bytes), sessions, budget, |_, _| true)
+      slates_cluster::live::exchange((send.stream, &send.bytes), sessions, exchange, |_, _| true)
         .await;
     let answered = !exchanged.replies.is_empty();
     if !answered {
-      let _ = state::with_state(|s| s.count(LIVE_UNANSWERED, 1));
+      let _ = state::with_state(|s| {
+        s.count(LIVE_UNANSWERED, 1);
+        if send.stream == slates_cluster::live::LIVE_STATE_STREAM {
+          s.count(LIVE_INSTALL_UNANSWERED, 1);
+        }
+      });
     }
     lose_links(&exchanged.unanswered);
     crate::fleet::return_sessions(exchanged.reusable);
@@ -1221,6 +1247,36 @@ async fn ship_lane(
     }
   }
   true
+}
+
+/// The budget one message to one holder gets: the liveness budget a reply gets, plus the time its bytes take at the
+/// session's window-limited rate. Derived: `bytes × smoothed RTT / congestion window` (one window a round trip, the
+/// slowest a sender in congestion avoidance moves), so an install of the whole volume is given its transfer and an
+/// entry, a few kilobytes, about nothing more. Under the liveness budget alone an install of 1.5 MB never finished
+/// over a session a partition had left at an initial window and a 100–240 ms smoothed RTT: each was cut off, its link
+/// dropped and dialed afresh, at an initial window again, and the whole volume sent again, 1,391 times (2.06 GB) while
+/// both candidates already held the owner's head, and no write became durable (2026-11-06, `live_chaos.rs`).
+fn exchange_budget(
+  bytes: usize,
+  sessions: &[(HostId, slates_transport::endpoint::Endpoint)],
+) -> slates_cluster::CommitBudget {
+  let live = crate::fleet::live_budget();
+  let transfer_ns = sessions.first().map_or(0, |(_, endpoint)| {
+    // Before any sample the smoothed RTT reads zero; the probe timeout, twice the initial RTT then, stands in.
+    let round_trip = match endpoint.smoothed_rtt() {
+      0 => endpoint.pto(),
+      measured => measured,
+    };
+    u64::try_from(bytes)
+      .unwrap_or(u64::MAX)
+      .saturating_mul(round_trip)
+      .checked_div(endpoint.congestion_window().max(1))
+      .unwrap_or(0)
+  });
+  slates_cluster::CommitBudget::hard(
+    live.deadline_ns.saturating_add(transfer_ns),
+    live.poll_interval_ns,
+  )
 }
 
 /// Borrows `holder`'s record session, waiting for it while another dispatch has it out, one timer tick at a time,

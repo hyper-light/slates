@@ -8,11 +8,11 @@
 //!
 //! 1. The slates image, the netem init image and the lane's probe image (`deploy/kind/pod-probe.Dockerfile`, which
 //!    carries `crates/cli/examples/pod_live_probe.rs`) are built and loaded.
-//! 2. For each profile, unshaped first and then each of the lane's WAN profiles ([`super::NETEM_PROFILES`]: 80 ms ±
+//! 2. For each profile, unshaped first and then each of the lane's WAN profiles (`NETEM_PROFILES` in `kind.rs`: 80 ms ±
 //!    20 ms one way on pods 0 and 1; the same with 1 % loss; 350 ms), a fresh three-replica install, bootstrapped and
 //!    formed. Pod 2 is never shaped, so a volume it owns ships to two candidates whose every reply is delayed.
-//! 3. A live-shipped volume on pod 2, and the probe, as an ephemeral container of pod 2, streams [`writes_for`] writes
-//!    of [`WRITE_BYTES`] to it, each answered only once a candidate holds it, and prints the client-seen p50, p99, p999
+//! 3. A live-shipped volume on pod 2, and the probe, as an ephemeral container of pod 2, streams `writes_for` writes
+//!    of `WRITE_BYTES` to it, each answered only once a candidate holds it, and prints the client-seen p50, p99, p999
 //!    and max.
 //! 4. The register invariants, read from every pod's `slates status`: **Convergence** (both candidates hold the
 //!    owner's head, same epoch, position and chain identity, and the owner's log is durable at its head with nothing

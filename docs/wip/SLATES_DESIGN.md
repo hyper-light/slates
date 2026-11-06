@@ -6684,6 +6684,17 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 
 *Content-freedom.* No metric, span or health signal carries a path, a name or file content; the audit log carries the paths a landing touched and nothing else; a test in the observability crate asserts every emitted label against this rule.
 
+> **Status (2026-11-06, A-228): `daemon.alive` judges a shard in its own CPU time.** The beat's writer is the daemon's
+> watchdog, an owned thread pinned to no core (`crates/server/src/watchdog.rs`), not a task on the control shard. Each
+> beat it judges every shard by A-65's rule (`crate::observe`'s `ShardTime`): a shard that is not parked and has
+> completed no step is stuck once a whole window passes with no CPU progress (wedged: a deadlock, or a host call that
+> never returns) or once it has run a window of CPU (spinning: a task that never yields). A starved shard, given a
+> little CPU at a time, is alive. The watchdog withholds the beat while a shard is stuck or the control loop has ended.
+> The anchor holds the beat to the window plus its own measured lateness p99 over its last 100 timed waits
+> (`crates/cli/src/anchor.rs`, `Lateness`). The window is the existing liveness budget, still a fixed number (GAPS, R3
+> debt). Proven by `crates/server/tests/liveness.rs`: a starved control-shard poll, which gapped the beat 1.53 s on main,
+> keeps it under 0.26 s; a wedged or spinning non-control shard, which main never saw, stops it.
+
 > **Telemetry oracle correction (2026-09-20, AC-0.11).** A drain request itself emits spans.
 > The daemon integration oracle now derives convergence from the reply quota minus the
 > maximum spans a drain emits, and checks progress on each batch. A four-span reply scenario
@@ -13309,6 +13320,33 @@ GAPS, BENCHMARKS ("The spin policy, measured and rejected").
 - **What stays.** Main's macOS spin: a nap of about 15 µs at each driver harvest, busy steps included, which is what
   keeps its tails under load. The decision rests on Ada's rule that p99 under load is the target. The true spin's change
   is kept on record, not landed (`agents/clients-spin`, a75f9213).
+
+### A-228 — A daemon's liveness is judged in its shards' own CPU time, by an owned watchdog thread (accepted and built 2026-11-06)
+Applied in the same change to: §4.14 (its status on `daemon.alive`), `crates/server/src/watchdog.rs` (new),
+`crates/server/src/daemon.rs` (`Daemon::start`, `stop_parts`, `control_loop`, `heartbeat_loop`), `crates/cli/src/anchor.rs`
+(`Lateness`, the lapse bound), GAPS, `docs/bugs/2026-11-06-the-anchor-killed-live-daemons-on-a-busy-machine.md`, and the
+tests named below.
+- **Why.** The beat was a task on the control shard, a pinned thread, and the anchor killed a daemon once its beat was
+  older than a fixed second. Under the A/B bar's two spinners a logical CPU on CI's 4-CPU Windows runners, the control
+  shard ran 2–4 steps in about a second, its longest poll 503–576 ms, and the anchor killed live daemons serving their
+  mounts (diagnostics runs 42161838327, 42130583401, 42080252187; GAPS). And a wedged or spinning shard other than the
+  control shard never stopped the beat, so the anchor could not see it.
+- **The rule.** The competitive question is "starved or hung", and A-65 already answers it for observations: judge a
+  shard in its own CPU time. A shard is alive while it is parked or stepping; with no step, it is stuck once a whole
+  window passes with no CPU progress (wedged) or once it has run a window of CPU (spinning); otherwise it is starved, and
+  alive. The window is the liveness budget. The beat is written by a watchdog thread outside the runtime, owned by the
+  daemon and joined after its shards, which reads the pulse's step count and parking flag and the shard's thread clock
+  (`slates_rt::registry::shard_cpu`; cycles on Windows). It withholds the beat while a shard is stuck or the control loop
+  has ended (A-100's refused boot still restarts the daemon).
+- **The one new bound.** The anchor finds a beat lapsed once it is older than the window plus its own measured lateness
+  p99 (the last 100 timed waits that ran their pause; 100 is the fewest whose p99 is one reading). A machine that starves
+  the watchdog starves the anchor about as much, since neither is pinned.
+- **What it does not change.** `LIVENESS_BUDGET_NS` stays the window, and stays the reply-deadline unit of about 60
+  files: R3 debt, recorded in GAPS as a follow-on.
+- **Tests:** `crates/server/tests/liveness.rs` (starved control-shard poll; wedged and spinning non-control shards; a
+  half-window block not killed; two spinners a core beside the daemon), the rule's unit tests in
+  `crates/server/src/watchdog.rs`, the lateness tests in `crates/cli/src/anchor.rs`, and the real-process frozen-daemon
+  test in `crates/cli/tests/cli.rs`.
 
 ### A-209 — Windows conformance is WinFsp's own two suites over the slates drive in both Windows lanes, with a reviewed list and stated differences; the POSIX suites run on arm64 Linux (accepted 2026-11-05, Step 10 of the VFS and DAX plan)
 Applied in the same change to: Part 6 ("Conformance"), §4.6 ("Windows" and its status), GAPS, `docs/wip/platforms.md`,

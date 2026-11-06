@@ -1,6 +1,6 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
-> **The anchor kills live daemons on a busy machine (found 2026-11-06, audit step 7; open, to be assigned).** Under the
+> **The anchor kills live daemons on a busy machine (found 2026-11-06, audit step 7; fixed by A-228, Windows CI owed).** Under the
 > A/B bar's load, two spinners a logical CPU (8 on CI's 4-CPU Windows runners), the anchor killed daemons that were
 > alive and serving because their heartbeat lapsed its 1,000 ms liveness budget. A busy machine is the normal case
 > (Ada's rule), so a starved but live daemon must not be killed.
@@ -26,7 +26,21 @@
 >   42080252187). Neither that arm nor the normal one lapsed there, each alone beside the spinners. It was not adopted
 >   because it cost x86_64's loaded p50s. **The heartbeat alone at a raised priority was never tried, and cannot be as
 >   built:** it is a task on a shard, not a thread of its own.
-> - Not fixed on the Step 7 branches; to be assigned.
+> - **Fixed by A-228** (2026-11-06): the beat is written by an owned watchdog thread pinned to no core, which judges
+>   each shard in its own CPU time (A-65's rule): stuck once a window passes with no step and no CPU progress, or with a
+>   window's CPU run; starved otherwise, and alive. The anchor holds the beat to the window plus its own measured
+>   lateness p99. Tests, each failing first where it can: `crates/server/tests/liveness.rs` — a starved control-shard
+>   poll gapped the beat 1.53 s on main and 0.26 s with A-228 (macOS arm64, load 54–70); a wedged non-control shard
+>   and a spinning one never stopped main's beat, and with A-228 stop it (1.007 s after the wedge; after 1,063 ms of the
+>   spinner's CPU, 2.98 s of wall at load 56). A half-window block and two spinners a core beside the daemon keep the
+>   beat under the window on both. The real-process frozen-daemon test still kills at the lapse (1,045 ms old against a
+>   1,044 ms bound: the window plus a 44 ms lateness p99). Owed: the Windows runners under the bar's load (diag branch),
+>   then macOS and Linux beside them. Record: `docs/bugs/2026-11-06-the-anchor-killed-live-daemons-on-a-busy-machine.md`.
+>
+> **`LIVENESS_BUDGET_NS` is still a fixed second (R3 debt, 2026-11-06; follow-on, not A-228).** It is A-228's window and
+> the reply-deadline unit of about 60 files (the client's and the server's deadlines, observations, the scatter's room
+> wait). A-228 judges the window in each shard's own CPU time, which keeps a starved daemon alive, but the window's length
+> is still the `Shape:` constant "a second", not measured.
 
 > **A-190's purge client leaves the daemon's process (2026-11-06, fixed); the sweep for the rest (open).** No daemon
 > thread opens a path on a volume the daemon serves (§4.6). The coherent purge's opens, writes and reads now run in a
@@ -69,6 +83,48 @@
 >   - If combined + 2 is within the DLL's spread at the p50 and p99 on both runners, quiet and loaded, it replaces the
 >     separate form.
 >   - If no one form passes both runners, the per-machine form question goes to Ada with that table.
+
+> **A live-shipped volume fails a waiting writer when its candidates are slow (2026-11-05, A-200; OPEN, owner raft).**
+> A-200 says holders that do not answer "make the writer wait: backpressure, never a false success". A stable reply on a
+> live-shipped volume waits at most the daemon's liveness budget (1 s, `live_ship::DURABLE_WAIT_NS`) and is then answered
+> `NFS3ERR_JUKEBOX` (NFS) or `EIO` (a held FUSE reply, `fuse.rs`). The macOS mount is `soft,intr` (§4.6), so its client
+> turns repeated "try again" into `ETIMEDOUT`. The writer's call fails instead of waiting. Found by the conformance
+> suites over a live-shipped volume (`cargo xtask conformance run --live-ship`, this Mac, 2026-11-05): at load averages
+> 26 to 37, fsx failed `Operation timed out` at its first `open(O_CREAT|O_TRUNC)` and in another run at operation 40's
+> `ftruncate`. The owner's `fleet.live.durable_late` was 14 and the candidates' `hold_refused` 2 and 4 (a refused entry
+> waits for the record period's re-ship), where the plain volume passed the same 1,000 operations in 19.2 s at load 44.
+> At load 22 the live run passed (41.6 s, `durable_late` 0). Held deterministically by the red test
+> `a_live_shipped_volume_makes_a_writer_wait_for_stopped_candidates_rather_than_fail`
+> (`xtask/src/conformance/live_fleet.rs`): with both candidates stopped (anchor, then daemon), a size change failed
+> `ETIMEDOUT` after 57.07 s and 57.09 s in two runs; the same call on a plain volume returns at once. Gated on
+> `SLATES_TEST_LIVE_CONFORMANCE=1` and `SLATES_TEST_BINARY` until raft's fix, when it joins a CI step. Owner: raft
+> (`crates/server/src/live_ship.rs`, the barrier waits; `crates/server/src/nfs.rs` `stable_once_durable`; `fuse.rs`'s
+> held replies).
+> - **The same suites found two more faults, 2026-11-06, this Mac, each a fresh fleet a suite (OPEN, raft).** Plain:
+>   fsx 10,000 operations passed in 21.1 s, fsstress 4 × 500 in about 11 s, pjdfstest's 238 files in about 5.5 minutes.
+>   Live-shipped:
+>   - fsstress (319 of 2,000 operations logged) and pjdfstest (16 files in 10 minutes, its calls answered `ETIMEDOUT`,
+>     `tests/chmod/00.t:2` "create … got ETIMEDOUT") ran against a log that never shipped: the owner's `live shipping`
+>     line stood at `head=2 durable=none owed=true` from the start, with `fleet.live.refused` 137 and 52 (a publication
+>     that could not be appended, so the next ships the whole volume) and `durable_late` 305 and 74, while both
+>     candidates held no live log at all.
+>   - fsx: the owner's daemon missed its heartbeat under the run ("the daemon's heartbeat lapsed; killing it", load
+>     average about 14), its anchor restarted it, and the fleet took the volume over to candidate c (`taken_over` 1,
+>     b `fetched` 1). The mount stayed on node a, whose restarted daemon recovered the volume from its own image ("held
+>     0 replicas again"), so fsx failed.
+>   `cargo xtask conformance compare --plain … --live …` names 8,647 differences. The commands and records:
+>   `docs/wip/conformance.md` (the live-shipped pair).
+> - **Linux and Windows, diagnostics run 42150662467 (2026-11-06; OPEN, raft).** On `ubuntu-latest` the live fsx passed
+>   on all three transports, its log durable at its head and held by both candidates (head 6801 or 4422), as plain. The
+>   live fsstress over the NFSv3 adapter then hung for over three hours until the run was cancelled, so no live fsstress
+>   or pjdfstest result exists for Linux; plain, all three transports passed every suite against their lists. On
+>   Windows, where no fleet test had run before:
+>   - `windows-latest`: the live fleet did not form within 40 s in either run. Each node counted 3 members (one 2)
+>     but probed only 1 or 2 peers, after a handshake's `recvfrom` failed with Winsock error 10054 (WSAECONNRESET), and
+>     the node dialed afresh from a new port. `compare`: winfstest's 628 cases absent.
+>   - `windows-11-arm`: the fleet did not form for fsx. It formed for winfstest, whose 628 cases matched plain exactly
+>     (0 differing), but shipping failed: candidate b held no live log, the owner counted `no_session` 7,663,
+>     `unanswered` 5,596 and `refused` 138, and only candidate c held entries (4,741).
 
 > **A-214, A-217 and A-207's port reverted from main (2026-11-05, by the supervisor); their re-landing is owed.** Main CI
 > 42119714654 on b502cf96 failed six jobs, all from this pairing of landed changes, each green on its own branch:

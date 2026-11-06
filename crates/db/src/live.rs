@@ -647,6 +647,8 @@ pub struct Shipper {
   holders: Vec<HostId>,
   credit: u64,
   retain: usize,
+  /// The payload bytes kept for laggards beyond `retain` entries ([`Shipper::retain_up_to`]); zero keeps `retain` alone.
+  retain_bytes: usize,
   /// The head the owner started from (a takeover's adopted head), which it holds and every holder may report.
   start: Option<Head>,
   /// The owner's head: its last entry, or `start` before its first.
@@ -688,6 +690,7 @@ impl Shipper {
         .collect(),
       credit: credit.max(1),
       retain: retain.max(1),
+      retain_bytes: 0,
       start,
       head: start,
       retained: VecDeque::new(),
@@ -940,14 +943,29 @@ impl Shipper {
       .map(|holder| self.held.get(holder).map(|head| head.position))
       .min()
       .flatten();
+    let mut bytes = self
+      .retained
+      .iter()
+      .fold(0usize, |sum, entry| sum.saturating_add(entry.payload.len()));
     while let Some(oldest) = self.retained.front() {
       let held_by_all = everyone.is_some_and(|position| oldest.position <= position);
-      if held_by_all || self.retained.len() > self.retain {
-        self.retained.pop_front();
-      } else {
+      let over = self.retained.len() > self.retain && bytes > self.retain_bytes;
+      if !(held_by_all || over) {
         break;
       }
+      bytes = bytes.saturating_sub(oldest.payload.len());
+      self.retained.pop_front();
     }
+  }
+
+  /// Keeps entries for laggards up to `bytes` of payload as well as the `retain` entries: whichever keeps more.
+  /// Derived (by the caller): `bytes` is the size of the whole state an install would send, the owner's last whole
+  /// record; then a laggard is sent the entries it lacks for as long as they cost no more than an install. Kept to a count alone, an owner writing faster than an install's
+  /// round trip left a holder it had just installed behind the tail again, and installed it again without end
+  /// (2026-11-06, `crates/cli/tests/live_chaos.rs`: 803 installs, 571 MB, in one run).
+  pub fn retain_up_to(&mut self, bytes: usize) {
+    self.retain_bytes = bytes;
+    self.trim();
   }
 
   /// The highest position the owner and `f` holders hold: the `f`-th highest holder position, capped at the owner's

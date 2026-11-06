@@ -365,6 +365,9 @@ pub struct Request {
   op: Op<u64>,
   reply: SyncSender<Reply>,
   hint: u64,
+  /// Whether recovery is replaying this request from a dead daemon's journal (`crate::dispatcher`), so a Close the
+  /// dead daemon already applied may be found done.
+  replayed: bool,
 }
 
 impl Request {
@@ -420,6 +423,10 @@ impl Request {
       Op::Release { object } => Some(*object),
       _ => None,
     };
+    // A replayed Release (a Close) ends an open the dead daemon may already have ended: it served the Close, retired
+    // the open, and died before acknowledging it. Its open being gone is then the Close done, not a refusal. A Cleanup
+    // retires nothing, so a replayed Cleanup's stale context stays a refusal.
+    let ends_open = closed.is_some();
     let refused = admission_refusal(&self.op, names, ledger);
     let bound = bind(self.op, ledger);
     let barrier = bound.as_ref().is_ok_and(|op| {
@@ -433,6 +440,12 @@ impl Request {
       (Ok(_op), Some(refusal)) => Reply::Err(ntstatus(&refusal).as_i32()),
       (Ok(op), None) => {
         run(bridge, cx, op).unwrap_or_else(|error| Reply::Err(ntstatus(&error).as_i32()))
+      }
+      (Err(crate::opens::Refusal::Stale), _) if self.replayed && ends_open => {
+        slates_machine::log_line!(
+          "slates-winfsp: a replayed close found its open already ended: answered done"
+        );
+        Reply::Ok
       }
       (Err(error), _) => {
         slates_machine::log_line!("slates-winfsp: context refused: {error}");
@@ -1112,6 +1125,7 @@ fn call_on(requests: &SyncSender<Request>, wake: &Waker, op: Op<u64>) -> Reply {
       op,
       reply,
       hint: crate::dispatcher::current_hint(),
+      replayed: crate::dispatcher::replaying(),
     })
     .is_err()
   {
@@ -2123,8 +2137,15 @@ pub enum Outcome {
   Purged(Purged),
   /// The receive worker ended before the mount was intentionally stopped.
   Failed(WinFspError),
-  /// The receive journal was settled before any fresh receive. The owner counts it; the taken-read oracle requires it.
-  Recovered(u64),
+  /// The receive journal was settled before any fresh receive: how many captured requests were answered, and how many
+  /// of those were a replayed Cleanup or Close the file system refused. The owner counts both; the taken-request
+  /// oracles require the first and the replayed-Close oracle requires the second to be zero.
+  Recovered {
+    /// Captured requests answered.
+    settled: u64,
+    /// Of those, the replayed Cleanups and Closes the file system refused.
+    refused: u64,
+  },
   /// The file system is unmounted and deleted; the thread is ending.
   Stopped,
 }
