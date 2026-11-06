@@ -13359,7 +13359,20 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   refused on macOS and was counted `shards.end_refused`, so a real failed end could not be told from it. Found by the
   new destroy test, which asserts none; a stream is now ended once.
 
-### 2026-10-24: a renewal test reads the client's wall clock as the lease's — open
+### 2026-10-24: a renewal test reads the client's wall clock as the lease's — fixed 2026-11-05 (bug-sweep)
+
+**Fixed.** The test no longer reads the client's clock as the lease's. It doubles the landing until the daemon counts
+two renewals in that one landing (`RENEWALS_PAST_THE_TERM`). A renewal is made at a slice boundary only once half a
+term has passed, so the second comes at least a whole term after the lease was taken. A landing that ends with
+entries lost to its term ends the loop as the failure it is. Run here (macOS arm64, 2026-11-05):
+- 1,231 files took 1.62 s on the client's clock with 1 renewal, so they did not qualify; under the old gate they
+  would have.
+- 2,462 files renewed 3 times and were done whole.
+- With `keep_lease_alive` disabled, it failed: 2,163 files, 0 renewals, 1,136 written, `partial`.
+
+Whether the renewal rule itself is right is unchanged: a slice longer than half a term would still lose entries, and
+this test would report it. The record as found:
+
 
 CI run 40095492759 (commit `3acca40a`, the Linux test lane) failed `a_landing_longer_than_its_lease_term_renews_it_
 and_lands_everything` (`crates/server/tests/landing_fairness.rs`): 6,833 files landed in 1.011 s of the client's time

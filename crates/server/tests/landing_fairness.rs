@@ -385,10 +385,22 @@ fn files_to_outlast(
 /// stall, `docs/wip/BENCHMARKS.md`, 2026-10-01).
 const SHORT_TERM_NS: u64 = 1_000_000_000;
 
+/// Shape: the renewals one landing must count before it is known, on the daemon's clock, to have outlasted the term
+/// it began under. A landing renews once half its lease's term has passed, at a slice boundary
+/// (`RENEW_AT_REMAINING_PERMILLE`), so its first renewal is at least half a term after the lease was taken and its
+/// second at least half the renewed term after that: a whole term past the take.
+const RENEWALS_PAST_THE_TERM: u64 = 2;
+
 /// AUD-29-25 (the lease keepalive). Do: on a daemon whose landing lease term is one second, land enough files
-/// to last twice the term on this machine (a calibration landing measures the per-file cost) under a grant. Expect: the landing is done with every file written, having renewed
-/// its lease between slices at least once; without the renewal its entries past the term were skipped
-/// (`LeaseEnded`) and it ended partial.
+/// to last twice the term on this machine (a calibration landing measures the per-file cost) under a grant, doubling
+/// the files until one landing renews its lease [`RENEWALS_PAST_THE_TERM`] times, which places its leased run past
+/// the term it began under. Expect: that landing is done with every file written; without the renewal its entries
+/// past the term were skipped (`LeaseEnded`) and it ended partial.
+///
+/// The test once judged "outlasted" by the client's whole call (CI run 40095492759: 6,833 files in 1.011 s under a
+/// 1 s term, 0 renewals, done). That clock also holds the request, the plan and the checks before the lease, and the
+/// reply, so a landing past the term on it could end its leased slices before the renewal point: a landing that never
+/// needed a renewal, counted as one that failed to make one.
 #[test]
 fn a_landing_longer_than_its_lease_term_renews_it_and_lands_everything() {
   let profile = common::machine_profile();
@@ -420,7 +432,15 @@ fn a_landing_longer_than_its_lease_term_renews_it_and_lands_everything() {
   // and the landing made again — the landing's cost grows faster than its file count (measured 2026-10-01), so
   // no calibration alone sizes it — up to the most files, past which the disk outruns the test.
   let mut files = estimate;
-  let (outcome, took, renewed) = loop {
+  let renewals = |daemon: &Daemon| {
+    daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get("landing.lease_renewed")
+      .copied()
+      .unwrap_or(0)
+  };
+  let outcome = loop {
     let name = format!("{VOLUME}-{files}");
     let Some(volume) = create_sized(&mut client, &name, files) else {
       daemon.stop();
@@ -429,40 +449,36 @@ fn a_landing_longer_than_its_lease_term_renews_it_and_lands_everything() {
     write_files(&daemon, &name, files);
     let target = target_dir();
     let grant = approve(&mut client, &secret, volume, None, &target.path);
+    let renewed_before = renewals(&daemon);
     let began = Instant::now();
     let landed = client.land(volume, None, &target.path, Filter::default(), Some(grant));
     let took = began.elapsed();
-    let renewed = daemon
-      .refusals_on_every_shard()
-      .unwrap()
-      .get("landing.lease_renewed")
-      .copied()
-      .unwrap_or(0);
+    let renewed = renewals(&daemon).saturating_sub(renewed_before);
     let Ok(Landing::Landed(outcome)) = landed else {
       panic!("the granted landing: {landed:?}");
     };
     eprintln!(
-      "landing of {files} files: {took:?} under a {SHORT_TERM_NS} ns term, {renewed} renewals: {} written, {}",
+      "landing of {files} files: {took:?} on the client's clock under a {SHORT_TERM_NS} ns term, {renewed} renewals: {} written, {}",
       outcome.written, outcome.state
     );
-    if took > term {
-      break (outcome, took, renewed);
+    // A landing that lost entries to its term is the failure itself, whatever its renewals; one that renewed past
+    // the term is the proof. Either ends the loop.
+    if renewed >= RENEWALS_PAST_THE_TERM || outcome.state != "done" {
+      break outcome;
     }
     client.destroy(volume).unwrap();
     files = files.saturating_mul(2);
     if files > MOST_FILES {
       daemon.stop();
       eprintln!(
-        "SKIP: no landing of up to {MOST_FILES} files outlasted a {SHORT_TERM_NS} ns term here"
+        "SKIP: no landing of up to {MOST_FILES} files renewed its lease {RENEWALS_PAST_THE_TERM} times under a {SHORT_TERM_NS} ns term here"
       );
       return;
     }
   };
   daemon.stop();
-  assert!(took > term, "the landing outlasted its term ({took:?})");
   assert_eq!(outcome.state, "done");
   assert_eq!(outcome.written, u64::try_from(files).unwrap());
-  assert!(renewed >= 1, "the lease was renewed between slices");
 }
 
 /// Shape: the volume an impatient call lands beside the patient one.
