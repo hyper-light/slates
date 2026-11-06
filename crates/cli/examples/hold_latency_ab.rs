@@ -10,6 +10,11 @@
 //! `slates` command is timed from its start to its exit. Rounds rotate which arm goes first, so a load that drifts lands
 //! on every arm alike, and one untimed mount and unmount per arm runs first.
 //!
+//! With `--first-mount`, every round starts each arm's anchor afresh and times its daemon's first mount, which is where
+//! the WinFsp receive-worker probe ran until A-219 took it off the mount's path; the anchor is ended after its round.
+//! With `--spinners-per-cpu N`, N busy threads per logical CPU spin through the timed rounds, the load mount_bench's
+//! contended phase uses.
+//!
 //! Output: rows `hold_latency\t<arm>\t<round>\t<mount ns>\t<unmount ns>`; then, per arm and verb, every round's time in
 //! milliseconds, sorted, with the best and the median. Nothing here gates; the A/B in `docs/wip/BENCHMARKS.md` is two
 //! builds of `slates`, before and after, given to one run of this program.
@@ -62,6 +67,12 @@ mod windows {
   const SERVING_LINE: &str = "slates daemon: instance ";
   /// Format: milliseconds in a second, for the summary.
   const MS_PER_S: f64 = 1_000.0;
+
+  /// How a run is made: whether every round is a fresh daemon's first mount, and the spinners per logical CPU.
+  struct Mode {
+    first_mount: bool,
+    spinners_per_cpu: usize,
+  }
 
   /// One build under test: its name, its binary, its anchor (killed and reaped on drop), and its volume.
   struct Arm {
@@ -129,8 +140,8 @@ mod windows {
 
   /// Starts `binary`'s anchor on its own instance, waits for its daemon to serve and settle, bootstraps it and makes
   /// one volume.
-  fn start(name: &str, binary: &str) -> Arm {
-    let instance = format!("hl{name}{}", std::process::id());
+  fn start(name: &str, binary: &str, generation: usize) -> Arm {
+    let instance = format!("hl{name}{}g{generation}", std::process::id());
     let mut anchor = Command::new(binary)
       .args(["--instance", &instance, "anchor", "--quick"])
       .stdout(Stdio::null())
@@ -227,46 +238,91 @@ mod windows {
     );
   }
 
-  fn run_arms(arms: &mut [Arm]) {
-    for arm in arms.iter() {
+  fn record(arm: &mut Arm, round_number: usize, (mount, unmount): (Duration, Duration)) {
+    arm.mounts.push(nanos(mount));
+    arm.unmounts.push(nanos(unmount));
+    println!(
+      "hold_latency\t{}\t{round_number}\t{}\t{}",
+      arm.name,
+      nanos(mount),
+      nanos(unmount)
+    );
+  }
+
+  fn run_arms(builds: &[(String, String)], mode: &Mode) {
+    let mut arms: Vec<Arm> = builds
+      .iter()
+      .map(|(name, binary)| start(name, binary, 0))
+      .collect();
+    for arm in &arms {
       round(arm);
     }
-    for round_number in 0..ROUNDS {
-      let first = round_number % arms.len();
-      for offset in 0..arms.len() {
-        let index = (first + offset) % arms.len();
-        let (mount, unmount) = round(&arms[index]);
-        let arm = &mut arms[index];
-        arm.mounts.push(nanos(mount));
-        arm.unmounts.push(nanos(unmount));
-        println!(
-          "hold_latency\t{}\t{round_number}\t{}\t{}",
-          arm.name,
-          nanos(mount),
-          nanos(unmount)
-        );
+    let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+      // The contended phase's load: busy threads that spin until the timed rounds are done.
+      for _ in 0..cpus * mode.spinners_per_cpu {
+        scope.spawn(|| {
+          while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            std::hint::spin_loop();
+          }
+        });
       }
-    }
-    for arm in arms.iter() {
+      for round_number in 0..ROUNDS {
+        let first = round_number % arms.len();
+        for offset in 0..arms.len() {
+          let index = (first + offset) % arms.len();
+          if mode.first_mount {
+            let (name, binary) = &builds[index];
+            let fresh = start(name, binary, round_number + 1);
+            let mut old = std::mem::replace(&mut arms[index], fresh);
+            // The finished times move to the fresh anchor's arm; the old anchor ends here.
+            arms[index].mounts = std::mem::take(&mut old.mounts);
+            arms[index].unmounts = std::mem::take(&mut old.unmounts);
+            drop(old);
+          }
+          let took = round(&arms[index]);
+          record(&mut arms[index], round_number, took);
+        }
+      }
+      stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    for arm in &arms {
       summary(&arm.name, "mount", &arm.mounts);
       summary(&arm.name, "unmount", &arm.unmounts);
     }
   }
 
   pub(super) fn run() {
-    let mut arms = Vec::new();
+    let mut builds = Vec::new();
+    let mut mode = Mode {
+      first_mount: false,
+      spinners_per_cpu: 0,
+    };
+    let usage = "usage: [--first-mount] [--spinners-per-cpu N] --arm NAME=PATH (repeated)";
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
-      assert_eq!(flag, "--arm", "usage: --arm NAME=PATH (repeated)");
-      let arm = args.next().expect("--arm NAME=PATH");
-      let (name, binary) = arm.split_once('=').expect("--arm NAME=PATH");
-      arms.push(start(name, binary));
+      match flag.as_str() {
+        "--first-mount" => mode.first_mount = true,
+        "--spinners-per-cpu" => {
+          mode.spinners_per_cpu = args.next().expect(usage).parse().expect(usage);
+        }
+        "--arm" => {
+          let arm = args.next().expect(usage);
+          let (name, binary) = arm.split_once('=').expect(usage);
+          builds.push((name.to_owned(), binary.to_owned()));
+        }
+        _ => panic!("{usage}"),
+      }
     }
-    assert!(!arms.is_empty(), "usage: --arm NAME=PATH (repeated)");
+    assert!(!builds.is_empty(), "{usage}");
     println!(
-      "# hold_latency_ab: {ROUNDS} rounds per arm, interleaved, the first arm rotating; host {}",
+      "# hold_latency_ab: {ROUNDS} rounds per arm, interleaved, the first arm rotating; first mounts {}; {} spinners per \
+       logical CPU; host {}",
+      mode.first_mount,
+      mode.spinners_per_cpu,
       std::env::var("COMPUTERNAME").unwrap_or_default()
     );
-    run_arms(&mut arms);
+    run_arms(&builds, &mode);
   }
 }
