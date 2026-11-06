@@ -1,5 +1,36 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A live-shipped volume fails a waiting writer when its candidates are slow (2026-11-05, A-200; OPEN, owner raft).**
+> A-200 says holders that do not answer "make the writer wait: backpressure, never a false success". A stable reply on a
+> live-shipped volume waits at most the daemon's liveness budget (1 s, `live_ship::DURABLE_WAIT_NS`) and is then answered
+> `NFS3ERR_JUKEBOX` (NFS) or `EIO` (a held FUSE reply, `fuse.rs`). The macOS mount is `soft,intr` (§4.6), so its client
+> turns repeated "try again" into `ETIMEDOUT`. The writer's call fails instead of waiting. Found by the conformance
+> suites over a live-shipped volume (`cargo xtask conformance run --live-ship`, this Mac, 2026-11-05): at load averages
+> 26 to 37, fsx failed `Operation timed out` at its first `open(O_CREAT|O_TRUNC)` and in another run at operation 40's
+> `ftruncate`. The owner's `fleet.live.durable_late` was 14 and the candidates' `hold_refused` 2 and 4 (a refused entry
+> waits for the record period's re-ship), where the plain volume passed the same 1,000 operations in 19.2 s at load 44.
+> At load 22 the live run passed (41.6 s, `durable_late` 0). Held deterministically by the red test
+> `a_live_shipped_volume_makes_a_writer_wait_for_stopped_candidates_rather_than_fail`
+> (`xtask/src/conformance/live_fleet.rs`): with both candidates stopped (anchor, then daemon), a size change failed
+> `ETIMEDOUT` after 57.07 s and 57.09 s in two runs; the same call on a plain volume returns at once. Gated on
+> `SLATES_TEST_LIVE_CONFORMANCE=1` and `SLATES_TEST_BINARY` until raft's fix, when it joins a CI step. Owner: raft
+> (`crates/server/src/live_ship.rs`, the barrier waits; `crates/server/src/nfs.rs` `stable_once_durable`; `fuse.rs`'s
+> held replies).
+> - **The same suites found two more faults, 2026-11-06, this Mac, each a fresh fleet a suite (OPEN, raft).** Plain:
+>   fsx 10,000 operations passed in 21.1 s, fsstress 4 × 500 in about 11 s, pjdfstest's 238 files in about 5.5 minutes.
+>   Live-shipped:
+>   - fsstress (319 of 2,000 operations logged) and pjdfstest (16 files in 10 minutes, its calls answered `ETIMEDOUT`,
+>     `tests/chmod/00.t:2` "create … got ETIMEDOUT") ran against a log that never shipped: the owner's `live shipping`
+>     line stood at `head=2 durable=none owed=true` from the start, with `fleet.live.refused` 137 and 52 (a publication
+>     that could not be appended, so the next ships the whole volume) and `durable_late` 305 and 74, while both
+>     candidates held no live log at all.
+>   - fsx: the owner's daemon missed its heartbeat under the run ("the daemon's heartbeat lapsed; killing it", load
+>     average about 14), its anchor restarted it, and the fleet took the volume over to candidate c (`taken_over` 1,
+>     b `fetched` 1). The mount stayed on node a, whose restarted daemon recovered the volume from its own image ("held
+>     0 replicas again"), so fsx failed.
+>   `cargo xtask conformance compare --plain … --live …` names 8,647 differences. The commands and records:
+>   `docs/wip/conformance.md` (the live-shipped pair).
+
 > **A-214, A-217 and A-207's port reverted from main (2026-11-05, by the supervisor); their re-landing is owed.** Main CI
 > 42119714654 on b502cf96 failed six jobs, all from this pairing of landed changes, each green on its own branch:
 > - **A-217 against A-201's checkout.** A-217 records a green's origin as a reference to its base snapshot, and
