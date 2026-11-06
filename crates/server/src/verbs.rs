@@ -7183,7 +7183,9 @@ fn bind_mount(
   ) {
     Ok(_) => {
       #[cfg(target_os = "macos")]
-      state.own_nfs_mounts.insert(attachment, own);
+      if let Some(own) = own {
+        state.own_nfs_mounts.insert(attachment, own);
+      }
       ReplyBody::MountBound
     }
     Err(e) => refused(refusal_of_db(&e)),

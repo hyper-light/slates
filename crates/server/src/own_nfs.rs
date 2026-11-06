@@ -29,16 +29,28 @@ fn source_of(volume_name: &str) -> String {
   format!("slates:/{volume_name}")
 }
 
-/// One NFS mount of this daemon's, recorded as its own while this value lives.
+/// One NFS mount of this daemon's, recorded as its own while this value lives. Its drop forgets the mount, so each
+/// mount has exactly one: a second for a mount already held is never made ([`held`]).
 #[derive(Debug)]
 pub(crate) struct OwnNfsMount(u64);
 
 impl OwnNfsMount {
-  /// The mount of the volume named `volume_name` at exactly `mount_point` in the kernel's table, recorded.
-  fn of(mount_point: &str, volume_name: &str) -> Result<Self, Unrecorded> {
-    let source = source_of(volume_name);
-    slates_base::own_mounts::record_at(mount_point, |named| named == source).map(Self)
+  /// Records mount `id` and holds it.
+  fn record(id: u64) -> Result<Self, Unrecorded> {
+    slates_base::own_mounts::record(id).map_err(Unrecorded::Full)?;
+    Ok(Self(id))
   }
+}
+
+/// The id of the mount of the volume named `volume_name` at exactly `mount_point` in the kernel's table, or `None`.
+fn id_at(mount_point: &str, volume_name: &str) -> Option<u64> {
+  let source = source_of(volume_name);
+  slates_base::own_mounts::mount_id_at(mount_point, |named| named == source)
+}
+
+/// Whether this shard already holds mount `id`.
+fn held(state: &ShardState, id: u64) -> bool {
+  state.own_nfs_mounts.values().any(|own| own.0 == id)
 }
 
 impl Drop for OwnNfsMount {
@@ -59,18 +71,26 @@ fn mount_of<'a>(state: &'a ShardState, record: &'a AttachmentRecord) -> Option<(
 
 /// Records the mount the CLI just bound for `record` at `mount_point`, before the bind is committed: refused when the
 /// kernel's table names no mount of the volume there (the path the kernel records, which the CLI binds), or at the
-/// bound of mounts this daemon records.
+/// bound of mounts this daemon records. `None` when this shard holds the mount already (a bind made again), whose
+/// holder stays.
 pub(crate) fn bound(
   state: &ShardState,
   record: &AttachmentRecord,
   mount_point: &str,
-) -> Result<OwnNfsMount, Refusal> {
+) -> Result<Option<OwnNfsMount>, Refusal> {
   let volume = state
     .db
     .partition()
     .volume(record.volume)
     .ok_or(Refusal::NotFound)?;
-  OwnNfsMount::of(mount_point, &volume.name).map_err(|why| refusal(why, mount_point))
+  let id =
+    id_at(mount_point, &volume.name).ok_or_else(|| refusal(Unrecorded::NotMounted, mount_point))?;
+  if held(state, id) {
+    return Ok(None);
+  }
+  OwnNfsMount::record(id)
+    .map(Some)
+    .map_err(|why| refusal(why, mount_point))
 }
 
 /// Learns the mounts this shard's catalog names that the kernel's table still holds, a predecessor's that outlived
@@ -84,11 +104,21 @@ pub(crate) fn learn(state: &mut ShardState) -> Result<(), Refusal> {
       let Some((point, name)) = mount_of(state, record) else {
         continue;
       };
-      match OwnNfsMount::of(point, name) {
-        Ok(own) => learned.push((record.id, own)),
-        Err(Unrecorded::NotMounted) => {}
-        Err(why @ Unrecorded::Full(_)) => return Err(refusal(why, point)),
+      // Two records naming one point find one mount, which has one holder.
+      let Some(id) = id_at(point, name) else {
+        continue;
+      };
+      if held(state, id)
+        || learned
+          .iter()
+          .any(|(_, own): &(u64, OwnNfsMount)| own.0 == id)
+      {
+        continue;
       }
+      learned.push((
+        record.id,
+        OwnNfsMount::record(id).map_err(|why| refusal(why, point))?,
+      ));
     }
   }
   state.own_nfs_mounts.extend(learned);

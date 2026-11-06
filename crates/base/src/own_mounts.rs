@@ -76,16 +76,16 @@ pub fn fsname() -> Option<String> {
   TAG.get().map(|tag| format!("{SOURCE_PREFIX}{tag:016x}"))
 }
 
-/// Records `id` as one of this daemon's own mounts; refused [`Full`] at the bound, and nothing recorded. Each record
-/// takes a slot of its own and each [`forget`] frees one, so every holder of a record (a mount learned at a restart,
-/// then kept by its mount) owns its own and none forgets another's. Before [`install`] nothing is recorded (a process
-/// that serves no mounts).
+/// Records `id` as one of this daemon's own mounts; refused [`Full`] at the bound, and nothing recorded. An id already
+/// recorded is recorded once, so a repeat (a successor learning a kept mount again) takes no slot. [`forget`] clears the
+/// id wherever it is, so each mount has exactly one holder that forgets it: a record learned at a restart is moved to
+/// its mount, never copied. Before [`install`] nothing is recorded (a process that serves no mounts).
 pub fn record(id: u64) -> Result<(), Full> {
   SET.get().map_or(Ok(()), |set| record_into(set, id))
 }
 
 fn record_into(set: &Set, id: u64) -> Result<(), Full> {
-  if id == 0 {
+  if id == 0 || recorded(set, id) {
     return Ok(());
   }
   for (at, slot) in set.slots.iter().enumerate() {
@@ -144,14 +144,16 @@ pub fn forget(id: u64) {
 }
 
 fn forget_in(set: &Set, id: u64) {
+  // Every slot holding `id`: two threads recording one id at once can each take a slot (both saw it absent), and a
+  // forget must leave neither behind.
+  let mut cleared = false;
   for slot in set.slots.iter().take(set.high.load(Ordering::Acquire)) {
-    if slot
+    cleared |= slot
       .compare_exchange(id, 0, Ordering::AcqRel, Ordering::Acquire)
-      .is_ok()
-    {
-      set.generation.fetch_add(1, Ordering::AcqRel);
-      return;
-    }
+      .is_ok();
+  }
+  if cleared {
+    set.generation.fetch_add(1, Ordering::AcqRel);
   }
 }
 
@@ -801,5 +803,51 @@ mod tests {
     assert!(!recorded(&set, 7));
     record_into(&set, 11).unwrap();
     assert!(recorded(&set, 11));
+  }
+
+  /// Shape: rounds of the concurrent record below; each starts the two threads together, so some rounds interleave
+  /// their check and their slot.
+  const RACE_ROUNDS: usize = 1_000;
+
+  /// A-227. Do: two threads record one id into a set at once (both may see it absent and each take a slot), then one
+  /// forget; many rounds. Expect: after the forget the id is never recorded, and the set has room for two others.
+  #[test]
+  fn a_forget_after_two_threads_record_one_id_at_once_leaves_it_unrecorded() {
+    for _ in 0..RACE_ROUNDS {
+      let set = Set {
+        slots: (0..2).map(|_| AtomicU64::new(0)).collect(),
+        high: AtomicUsize::new(0),
+        generation: AtomicU64::new(0),
+      };
+      let start = std::sync::Barrier::new(2);
+      std::thread::scope(|scope| {
+        for _ in 0..2 {
+          scope.spawn(|| {
+            start.wait();
+            record_into(&set, 5).unwrap();
+          });
+        }
+      });
+      assert!(recorded(&set, 5));
+      forget_in(&set, 5);
+      assert!(!recorded(&set, 5), "a forget leaves no slot holding the id");
+      record_into(&set, 6).unwrap();
+      record_into(&set, 8).unwrap();
+    }
+  }
+
+  /// A-227. Do: hold one id in both slots, the state two concurrent records can leave, then forget it once. Expect: it is
+  /// not recorded, and both slots are free again.
+  #[test]
+  fn a_forget_clears_every_slot_holding_its_id() {
+    let set = Set {
+      slots: (0..2).map(|_| AtomicU64::new(5)).collect(),
+      high: AtomicUsize::new(2),
+      generation: AtomicU64::new(0),
+    };
+    forget_in(&set, 5);
+    assert!(!recorded(&set, 5));
+    record_into(&set, 6).unwrap();
+    record_into(&set, 8).unwrap();
   }
 }
