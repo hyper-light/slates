@@ -626,7 +626,15 @@ fn receive_loop(
         wake.wake_by_ref();
       }
       for release in releases {
-        release.send(()).map_err(|_| WinFspError::MountThread)?;
+        // A refused release is that worker's own end: its count stopped short of it, or it was stopped first, and it
+        // dropped its end of the channel. Worker 0 serves on either way. Ending here instead left nothing serving the
+        // drive whenever the count was known before recovery finished (diagnostics run 42147337198, one fixed worker:
+        // 12 of 13 CLI mount tests "never answered within 10s").
+        if release.send(()).is_err() {
+          slates_machine::log_line!(
+            "slates-winfsp: a receive worker had ended before worker 0 released it"
+          );
+        }
       }
     }
     Start::Probe(wait) => {
