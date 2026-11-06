@@ -1,5 +1,16 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A volume recovery could not rebuild (2026-11-06): its status names why, and Windows unmount passes over it
+> (fixed); destroying it (open).** Such a volume stays in the catalog and in `volume list`, but every verb on it answered
+> `NotFound`. It now answers `Refusal::NotRecovered { cause }`, a closed `RecoveryCause` kept from recovery
+> (`docs/bugs/2026-11-06-a-listed-volume-recovery-could-not-rebuild-answered-not-found.md`). Windows `slates unmount`
+> asked each volume's status and stopped at the first refusal, so one such volume blocked every drive; it now asks every
+> volume, names a refused one on standard error by kind, and releases the drive any volume reports. macOS and Linux
+> unmount is the OS's own and asks no volume; no other client loop asks a status per volume. Proven: the status test red
+> on macOS and Linux with the fix removed (and on macOS before it) and green on both, CI runs RUNS_PENDING. Open:
+> - **Destroying such a volume.** `destroy` goes through the same lookup, so it is refused `NotRecovered` (before, `NotFound`)
+>   and the catalog record stays: a destroy must be able to remove a record with no live slot.
+
 > **A path on a volume this daemon serves is refused before any open (A-227, 2026-11-06): built on Linux, Windows and
 > macOS.** A base directory and every lookup below it, a landing's target and a FUSE mount point are refused typed
 > (`HostError::OwnMount`, `TargetRefusal::OwnMount`, the wire's `Refusal::OwnMount`) when they lie on a mount this
@@ -16,9 +27,7 @@
 > - **The macOS check's cost** with a mount recorded (one `F_GETPATH` a directory crossing) did not resolve from the
 >   noise at load 51 to 54 on 18 cores (BENCHMARKS, "The own-mount check on macOS"): a quiet re-measure is owed. With no
 >   mount recorded the check is one atomic load.
-> - **Windows `slates unmount` stops at the first volume whose status refuses** (`crates/cli/src/verbs.rs`
->   `unmount_verb`): a volume recovery refused (`NotFound`) keeps every drive from being unmounted by its letter until
->   it is destroyed. Found by A-227's reacquire test, which detaches by the attachment's id instead; not fixed here.
+> - **Windows `slates unmount` stopped at the first volume whose status refused**: fixed (the entry above this one).
 
 > **A-190's purge client leaves the daemon's process (2026-11-06, fixed); the sweep for the rest (open).** No daemon
 > thread opens a path on a volume the daemon serves (§4.6). The coherent purge's opens, writes and reads now run in a
