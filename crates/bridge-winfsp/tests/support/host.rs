@@ -827,6 +827,8 @@ fn cleanup_once(
     reply,
     hint: 0,
     replayed: false,
+    posted: 0,
+    slot: 0,
   };
   assert!(
     request

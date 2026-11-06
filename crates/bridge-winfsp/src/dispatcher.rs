@@ -47,6 +47,9 @@ thread_local! {
   static TERMINAL_REFUSAL: Cell<i32> = const { Cell::new(0) };
   /// Set while recovery runs a dead daemon's captured Cleanup or Close again, so the shard can find its effect done.
   static REPLAYING: Cell<bool> = const { Cell::new(false) };
+  /// DIAG ONLY: when this worker's last transaction returned, and the profile slot of the request it last served.
+  static LAST_RETURN: Cell<u64> = const { Cell::new(0) };
+  static LAST_KIND: Cell<usize> = const { Cell::new(crate::phases::RECEIVER) };
 }
 
 pub(crate) fn private_path(path: &str) -> Result<Option<crate::purge::PrivatePath>, i32> {
@@ -310,6 +313,24 @@ fn transaction(
   output: &mut [u8],
   intents: &mut crate::purge_intents::Intents,
 ) -> Result<usize, WinFspError> {
+  let called = crate::phases::now();
+  let last = LAST_RETURN.replace(0);
+  if last != 0 {
+    crate::phases::record(LAST_KIND.get(), crate::phases::SERVICE, last, called);
+  }
+  let done = transaction_untimed(control, code, input, output, intents);
+  LAST_RETURN.set(crate::phases::now());
+  LAST_KIND.set(crate::phases::RECEIVER);
+  done
+}
+
+fn transaction_untimed(
+  control: HANDLE,
+  code: u32,
+  input: &[u8],
+  output: &mut [u8],
+  intents: &mut crate::purge_intents::Intents,
+) -> Result<usize, WinFspError> {
   let mut overlapped = OVERLAPPED {
     hEvent: intents.completion_event(),
     ..OVERLAPPED::default()
@@ -467,6 +488,7 @@ fn operation(
   };
   PRIVATE_PURGE.set(purge);
   CURRENT_HINT.set(request.hint());
+  let called = crate::phases::now();
   // SAFETY: callback is the DLL's initialized operation for this checked kind; both packet addresses have native
   // eight-byte alignment and protocol maximum capacity, and file_system stays live throughout the synchronous call.
   let callback_status = unsafe {
@@ -476,6 +498,12 @@ fn operation(
       packet.0.as_mut_ptr().cast(),
     )
   };
+  crate::phases::record(
+    crate::phases::kind_slot(request.kind()),
+    crate::phases::CALLBACK,
+    called,
+    crate::phases::now(),
+  );
   let terminal_status = TERMINAL_REFUSAL.replace(0);
   let status = if callback_status == 0 {
     terminal_status
@@ -776,14 +804,48 @@ fn serve_loop(
         if is_stopped(stopped) {
           return Ok(());
         }
-        receiving
-          .received(reported, &mut fill, performance_counter()?)
-          .map_err(WinFspError::Capture)?
+        let begun = crate::phases::now();
+        let counter = performance_counter()?;
+        let stamped = crate::phases::now();
+        crate::phases::record(
+          crate::phases::RECEIVER,
+          crate::phases::STAMP,
+          begun,
+          stamped,
+        );
+        let batch = receiving
+          .received(reported, &mut fill, counter)
+          .map_err(WinFspError::Capture)?;
+        crate::phases::record(
+          crate::phases::RECEIVER,
+          crate::phases::CAPTURE,
+          stamped,
+          crate::phases::now(),
+        );
+        batch
       }
-      Next::Take(reported) => view
-        .capture(worker)?
-        .handed_off(reported, &mut fill, performance_counter()?)
-        .map_err(WinFspError::Capture)?,
+      Next::Take(reported) => {
+        let begun = crate::phases::now();
+        let counter = performance_counter()?;
+        let stamped = crate::phases::now();
+        crate::phases::record(
+          crate::phases::RECEIVER,
+          crate::phases::STAMP,
+          begun,
+          stamped,
+        );
+        let batch = view
+          .capture(worker)?
+          .handed_off(reported, &mut fill, counter)
+          .map_err(WinFspError::Capture)?;
+        crate::phases::record(
+          crate::phases::RECEIVER,
+          crate::phases::CAPTURE,
+          stamped,
+          crate::phases::now(),
+        );
+        batch
+      }
     };
     let Some(following) = serve_batch(file_system, control, batch, shard, owned, &mut fill)? else {
       return Ok(());
@@ -806,8 +868,18 @@ fn serve_batch(
   owned: &mut Owned,
   fill: &mut inflight::capture::Fill,
 ) -> Result<Option<Next>, WinFspError> {
-  while let Some(request) = batch.next_request().map_err(WinFspError::Capture)? {
+  loop {
+    let begun = crate::phases::now();
+    let Some(request) = batch.next_request().map_err(WinFspError::Capture)? else {
+      break;
+    };
+    let kind = crate::phases::kind_slot(request.kind());
+    LAST_KIND.set(kind);
+    let decoded = crate::phases::now();
+    crate::phases::record(kind, crate::phases::DECODE, begun, decoded);
     let length = operation(file_system, &request, owned)?;
+    let operated = crate::phases::now();
+    crate::phases::record(kind, crate::phases::OPERATION, decoded, operated);
     let response = owned
       .response
       .0
@@ -816,6 +888,7 @@ fn serve_batch(
     batch
       .record_response(&request, response)
       .map_err(WinFspError::Capture)?;
+    crate::phases::record(kind, crate::phases::RECORD, operated, crate::phases::now());
     if let Some((from, to)) = request
       .successful_rename(response)
       .map_err(WinFspError::Capture)?
@@ -823,18 +896,36 @@ fn serve_batch(
       crate::host::rename_open_names(shard.confirmations, shard.wake, &from, &to, shard.bound)?;
     }
     if batch.is_last() {
+      let handing = crate::phases::now();
       let mut hand_off = batch
         .hand_off(&request, fill)
         .map_err(WinFspError::Capture)?;
+      crate::phases::record(kind, crate::phases::HAND_OFF, handing, crate::phases::now());
+      let posting = crate::phases::now();
       // Once the hand-off is recorded, every death still hands the kernel this context (the call consumed the response,
       // or recovery sends the saved Create again), so its confirmation is posted before the call (A-215).
       let confirming = inflight::opened_context(hand_off.response())
         .map_err(WinFspError::Capture)?
         .map(|(_, context)| crate::host::post_confirm(shard.confirmations, shard.wake, context));
+      if confirming.is_some() {
+        crate::phases::record(
+          kind,
+          crate::phases::CONFIRM_POST,
+          posting,
+          crate::phases::now(),
+        );
+      }
       let (response, buffer) = hand_off.transaction();
       let reported = send_and_receive(control, response, buffer, &mut owned.private.intents)?;
       if let Some(confirming) = confirming {
+        let finishing = crate::phases::now();
         confirming.finish()?;
+        crate::phases::record(
+          kind,
+          crate::phases::CONFIRM_FINISH,
+          finishing,
+          crate::phases::now(),
+        );
       }
       return Ok(Some(Next::Take(reported)));
     }
@@ -843,12 +934,30 @@ fn serve_batch(
     // first: a confirmation sent after the response then found its open retired, "open ledger: Stale", and ended this
     // worker (diagnostics run 42155161568, arm64). The response is saved, so a death before the send still hands the
     // kernel this context: recovery sends the saved Create again.
+    let posting = crate::phases::now();
     let confirming = inflight::opened_context(response)
       .map_err(WinFspError::Capture)?
       .map(|(_, context)| crate::host::post_confirm(shard.confirmations, shard.wake, context));
+    let sending = crate::phases::now();
+    if confirming.is_some() {
+      crate::phases::record(kind, crate::phases::CONFIRM_POST, posting, sending);
+    }
     send_response(control, response, &mut owned.private.intents)?;
+    crate::phases::record(
+      kind,
+      crate::phases::SEND_ALONE,
+      sending,
+      crate::phases::now(),
+    );
     if let Some(confirming) = confirming {
+      let finishing = crate::phases::now();
       confirming.finish()?;
+      crate::phases::record(
+        kind,
+        crate::phases::CONFIRM_FINISH,
+        finishing,
+        crate::phases::now(),
+      );
     }
     batch
       .acknowledge(request.hint())

@@ -364,12 +364,90 @@ pub struct Request {
   /// Whether recovery is replaying this request from a dead daemon's journal (`crate::dispatcher`), so a Close the
   /// dead daemon already applied may be found done.
   replayed: bool,
+  /// DIAG ONLY: when it was posted, and its operation's profile slot.
+  posted: u64,
+  slot: usize,
+}
+
+/// DIAG ONLY: each operation's profile name, from `crate::phases::OP_BASE`.
+const OP_NAMES: [&str; 21] = [
+  "RenameName",
+  "Confirm",
+  "VolumeInfo",
+  "Resolve",
+  "Open",
+  "PurgeResolve",
+  "PurgeOpen",
+  "Create",
+  "Read",
+  "Write",
+  "Info",
+  "ReadDir",
+  "SetSize",
+  "Truncate",
+  "Rename",
+  "SetAllocation",
+  "SetTimes",
+  "CanDelete",
+  "Flush",
+  "Cleanup",
+  "Release",
+];
+
+/// DIAG ONLY: an operation's profile slot.
+fn op_slot<T>(op: &Op<T>) -> usize {
+  let index = match op {
+    Op::RenameName { .. } => 0,
+    Op::Confirm { .. } => 1,
+    Op::VolumeInfo { .. } => 2,
+    Op::Resolve { .. } => 3,
+    Op::Open { .. } => 4,
+    Op::PurgeResolve { .. } => 5,
+    Op::PurgeOpen { .. } => 6,
+    Op::Create { .. } => 7,
+    Op::Read { .. } => 8,
+    Op::Write { .. } => 9,
+    Op::Info { .. } => 10,
+    Op::ReadDir { .. } => 11,
+    Op::SetSize { .. } => 12,
+    Op::Truncate { .. } => 13,
+    Op::Rename { .. } => 14,
+    Op::SetAllocation { .. } => 15,
+    Op::SetTimes { .. } => 16,
+    Op::CanDelete { .. } => 17,
+    Op::Flush { .. } => 18,
+    Op::Cleanup { .. } => 19,
+    Op::Release { .. } => 20,
+  };
+  crate::phases::OP_BASE + index
+}
+
+/// DIAG ONLY: the profile's dump at a mount's end.
+fn dump_phases() {
+  crate::phases::dump(&OP_NAMES);
 }
 
 impl Request {
   /// Serves on the owner shard. Kernel contexts are resolved here, never on a foreign dispatcher thread. Opens are
   /// recorded before their contexts are returned; only a successful close retires a token.
   pub fn serve(
+    self,
+    bridge: &mut dyn Bridge,
+    cx: &OpContext,
+    names: &mut OpenNames,
+    ledger: &mut Ledger<SparseObject>,
+  ) -> Served {
+    let (slot, posted) = (self.slot, self.posted);
+    let entered = crate::phases::now();
+    if posted != 0 {
+      crate::phases::record(slot, crate::phases::HOP_IN, posted, entered);
+    }
+    let served = self.serve_untimed(bridge, cx, names, ledger);
+    crate::phases::record(slot, crate::phases::SERVE, entered, crate::phases::now());
+    served
+  }
+
+  fn serve_untimed(
     self,
     bridge: &mut dyn Bridge,
     cx: &OpContext,
@@ -671,6 +749,7 @@ impl Served {
 
   /// Sends the reply to the waiting dispatcher thread. `false` when that thread is gone (the mount is being torn down).
   pub fn send(self) -> bool {
+    crate::phases::LAST_SENT.store(crate::phases::now(), std::sync::atomic::Ordering::Relaxed);
     self.sender.send(self.reply).is_ok()
   }
 }
@@ -1101,19 +1180,31 @@ impl Handler {
 }
 
 fn call_on(requests: &SyncSender<Request>, wake: &Waker, op: Op<u64>) -> Reply {
-  answer_of(post_on(requests, wake, op))
+  let slot = op_slot(&op);
+  let start = crate::phases::now();
+  let reply = answer_of(post_on(requests, wake, op));
+  let end = crate::phases::now();
+  crate::phases::record(slot, crate::phases::ROUND, start, end);
+  let sent = crate::phases::LAST_SENT.load(std::sync::atomic::Ordering::Relaxed);
+  if sent >= start {
+    crate::phases::record(slot, crate::phases::TO_ANSWER, sent, end);
+  }
+  reply
 }
 
 /// Sends one operation to the shard and returns where its answer will arrive, without waiting for it; `None` when the
 /// shard's channel has closed.
 fn post_on(requests: &SyncSender<Request>, wake: &Waker, op: Op<u64>) -> Option<Receiver<Reply>> {
   let (reply, answer) = sync_channel(1);
+  let slot = op_slot(&op);
   requests
     .send(Request {
       op,
       reply,
       hint: crate::dispatcher::current_hint(),
       replayed: crate::dispatcher::replaying(),
+      posted: crate::phases::now(),
+      slot,
     })
     .ok()?;
   wake.wake_by_ref();
@@ -2232,6 +2323,7 @@ fn run_mount(
     Ok(channel) => channel,
     Err(error) => {
       report(Outcome::Mounted(Err(error)));
+      dump_phases();
       report(Outcome::Stopped);
       return;
     }
@@ -2351,6 +2443,7 @@ fn run_mount(
         Err(error) => {
           report(Outcome::Failed(error));
           drop(mounted);
+          dump_phases();
           report(Outcome::Stopped);
           return;
         }
@@ -2359,6 +2452,7 @@ fn run_mount(
     }
     Err(error) => {
       report(Outcome::Mounted(Err(error)));
+      dump_phases();
       report(Outcome::Stopped);
       return;
     }
@@ -2390,6 +2484,7 @@ fn run_mount(
     }
   }
   drop(mounted);
+  dump_phases();
   report(Outcome::Stopped);
 }
 
