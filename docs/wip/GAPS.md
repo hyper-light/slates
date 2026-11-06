@@ -100,6 +100,17 @@
 >     0 replicas again"), so fsx failed.
 >   `cargo xtask conformance compare --plain … --live …` names 8,647 differences. The commands and records:
 >   `docs/wip/conformance.md` (the live-shipped pair).
+> - **Linux and Windows, diagnostics run 42150662467 (2026-11-06; OPEN, raft).** On `ubuntu-latest` the live fsx passed
+>   on all three transports, its log durable at its head and held by both candidates (head 6801 or 4422), as plain. The
+>   live fsstress over the NFSv3 adapter then hung for over three hours until the run was cancelled, so no live fsstress
+>   or pjdfstest result exists for Linux; plain, all three transports passed every suite against their lists. On
+>   Windows, where no fleet test had run before:
+>   - `windows-latest`: the live fleet did not form within 40 s in either run. Each node counted 3 members (one 2)
+>     but probed only 1 or 2 peers, after a handshake's `recvfrom` failed with Winsock error 10054 (WSAECONNRESET), and
+>     the node dialed afresh from a new port. `compare`: winfstest's 628 cases absent.
+>   - `windows-11-arm`: the fleet did not form for fsx. It formed for winfstest, whose 628 cases matched plain exactly
+>     (0 differing), but shipping failed: candidate b held no live log, the owner counted `no_session` 7,663,
+>     `unanswered` 5,596 and `refused` 138, and only candidate c held entries (4,741).
 
 > **A-214, A-217 and A-207's port reverted from main (2026-11-05, by the supervisor); their re-landing is owed.** Main CI
 > 42119714654 on b502cf96 failed six jobs, all from this pairing of landed changes, each green on its own branch:
