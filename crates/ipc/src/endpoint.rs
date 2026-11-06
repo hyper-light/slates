@@ -556,8 +556,9 @@ impl ClientEnd {
 
 /// Format: whether the daemon's wake reports finding the client asleep, so a stamp is learned only once
 /// confirmed. Windows' auto-reset Event cannot tell a signal that met a sleeper from one that will be
-/// consumed later, so there a stamp inside the wait is learned unconfirmed — the stand-in the boot probe
-/// uses there too (`WakeLatency::asleep_confirmed`).
+/// consumed later, so there a stamp inside the wait is learned unconfirmed. The boot probe no longer
+/// takes that stand-in: since A-223 it confirms its Windows waiter by its cycle count
+/// (`WakeLatency::asleep_confirmed`), which this wait, judged by the client alone, has no peer to read.
 const WAKER_CONFIRMS: bool = !cfg!(windows);
 
 /// The client's parked flag for a park that names `slot`.

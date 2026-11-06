@@ -77,8 +77,18 @@ pub(crate) fn voluntary_switches_now() -> Option<u64> {
   voluntary_switches()
 }
 
-/// No per-thread voluntary switch count here (macOS, Windows), and none under Miri.
-#[cfg(any(miri, not(target_os = "linux")))]
+/// Windows: the calling thread's own context switches (`slates_machine::switches`, `ReadThreadProfilingData`), what
+/// tells a kicked park that slept from one whose wait found the kick pending (A-223). Windows counts a preemption too,
+/// so this answers only the wake's question, never the long poll's (Windows reads no [`ThreadAccount`]). Without it a
+/// kick landing between the wait's entry stamp and its block in `GetQueuedCompletionStatusEx` was learned as a wake of
+/// 0.6–0.8 µs, and every shard's estimate, and the idle window a hundred times it, sat there (jupiter, 2026-11-05).
+#[cfg(all(windows, not(miri)))]
+pub(crate) fn voluntary_switches_now() -> Option<u64> {
+  slates_machine::switches::switches_now()
+}
+
+/// No per-thread switch count here (macOS), and none under Miri.
+#[cfg(any(miri, not(any(target_os = "linux", windows))))]
 pub(crate) fn voluntary_switches_now() -> Option<u64> {
   None
 }

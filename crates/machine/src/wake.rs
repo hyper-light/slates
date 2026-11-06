@@ -7,9 +7,18 @@
 //! (`docs/bugs/2026-09-22-wake-probe-mixes-two-events-and-reports-an-unconverged-tail.md`):
 //!
 //! - **One event: a sleeping thread woken.** Before each wake the waiter is confirmed asleep in the
-//!   kernel — its `/proc` state `S` on Linux, `thread_info`'s `TH_STATE_WAITING` on macOS; Windows has no
-//!   per-thread query short of a system-wide snapshot, so there the waiter's own announcement stands in and
-//!   the result says so. The probe it replaces timed every park/unpark round trip, whether the waiter was
+//!   kernel — its `/proc` state `S` on Linux, `thread_info`'s `TH_STATE_WAITING` on macOS. Windows names a
+//!   thread's wait state only in a system-wide snapshot, so there the waker watches the waiter's cycle count
+//!   (`QueryThreadCycleTime`, which a blocked thread does not advance [B: Microsoft Learn,
+//!   "QueryThreadCycleTime"]): the waiter is asleep once it has announced its park and two reads of its count
+//!   agree; and a wake whose count moved again before the kick, or across whose wait the waiter's own
+//!   switch count did not move ([`crate::switches`]), is counted ([`WakeLatency::woke_running`]) and dropped
+//!   (A-223). The cycle count alone is not proof: a running thread's count read the same twice in 16–18 % of
+//!   back-to-back read pairs on CI's quiet x86_64 runner (run of 2026-11-06, `diag-liveness-1`), each read
+//!   about 6.5 µs; the switch count is, per wake. Until 2026-11-05 the announcement alone stood in there: a waiter caught between its
+//!   announcement and its wait answered at once, and the probe measured 0.6–0.8 µs on jupiter, so the
+//!   idle window derived from it (100 times it) was about 58 µs and owner shards parked between a single
+//!   client's creates. The probe it replaces timed every park/unpark round trip, whether the waiter was
 //!   still running or asleep, and on the waker's CPU or another, so it mixed an on-CPU handoff (about
 //!   0.45 µs) with a real wake (about 10 µs); thread placement holds for a whole run, so whole runs split
 //!   between the two (a median of 417 ns and of 10,041 ns on the same two cores, a minute apart).
@@ -93,8 +102,13 @@ pub struct WakeLatency {
   /// How the waker and waiter were placed, the weakest over the rounds.
   pub placement: Pinning,
   /// Whether the waiter was confirmed asleep in the kernel before every wake, rather than having only
-  /// announced its park (Windows, or a thread query the OS refused).
+  /// announced its park (a thread query the OS refused).
   pub asleep_confirmed: bool,
+  /// Wakes dropped because the waiter was running when it was kicked: its cycle count, still across the
+  /// confirmation's two reads, had moved by the kick, or its own switch count shows it never switched out
+  /// across the wait (Windows; zero where the state query confirms). A wake of a running thread is the
+  /// on-CPU handoff, not the event, so it is counted rather than averaged in.
+  pub woke_running: u32,
   /// True when the budget ended before the pooled mean's interval converged.
   pub quick: bool,
 }
@@ -196,6 +210,20 @@ const UNKNOWN_CPU: u32 = u32::MAX;
 /// Format: the thread id a waiter has not yet published (no OS numbers a thread `u64::MAX`).
 const UNPUBLISHED: u64 = u64::MAX;
 
+/// Format: the `slept` word's three states — no count here, the waiter switched out across its wait, it did not.
+const SLEEP_UNKNOWN: u32 = 0;
+const SLEPT: u32 = 1;
+const DID_NOT_SLEEP: u32 = 2;
+
+/// The `slept` word for a wait across which the waiter's own switch count went from `before` to `after`.
+pub fn slept_word(before: Option<u64>, after: Option<u64>) -> u32 {
+  match (before, after) {
+    (Some(before), Some(after)) if after > before => SLEPT,
+    (Some(_), Some(_)) => DID_NOT_SLEEP,
+    _ => SLEEP_UNKNOWN,
+  }
+}
+
 /// Format: the `turn` word's three states — the waiter idle, the waker's go, the waiter's done.
 const IDLE: u32 = 0;
 const GO: u32 = 1;
@@ -226,6 +254,7 @@ pub fn wake(budget: Duration, placement: &Placement) -> Result<WakeLatency, Mach
   let mut placement = Pinning::Pinned;
   let mut same_cpu_samples = 0u32;
   let mut asleep_confirmed = true;
+  let mut woke_running = 0u32;
   let mut rounds = 0u32;
   let began = Instant::now();
   // A zero budget doubles to zero: no round could measure, so the wall extension is not given to it.
@@ -250,6 +279,7 @@ pub fn wake(budget: Duration, placement: &Placement) -> Result<WakeLatency, Mach
     placement = weaker(placement, outcome.placement);
     same_cpu_samples = same_cpu_samples.saturating_add(outcome.same_cpu);
     asleep_confirmed &= outcome.asleep_confirmed;
+    woke_running = woke_running.saturating_add(outcome.woke_running);
     if outcome.samples.len() >= MIN_SAMPLES
       && let Some(interval) = bootstrap_interval(&Sample::new(outcome.samples.clone()), &mut rng)
     {
@@ -274,6 +304,7 @@ pub fn wake(budget: Duration, placement: &Placement) -> Result<WakeLatency, Mach
       placement,
       same_cpu_samples,
       asleep_confirmed,
+      woke_running,
       rounds,
     },
     &mut rng,
@@ -285,6 +316,7 @@ struct Tally {
   placement: Pinning,
   same_cpu_samples: u32,
   asleep_confirmed: bool,
+  woke_running: u32,
   /// The rounds run: [`WAKE_ROUNDS`], or more when the planned ones stayed under the floor.
   rounds: u32,
 }
@@ -312,6 +344,7 @@ fn summarize(
     rounds_agree: pooled_median.and_then(|pooled| rounds_agree(round_medians, &pooled)),
     placement: tally.placement,
     asleep_confirmed: tally.asleep_confirmed,
+    woke_running: tally.woke_running,
     quick: !converged_mean(&pooled),
   }
 }
@@ -361,6 +394,7 @@ struct Round {
   same_cpu: u32,
   placement: Pinning,
   asleep_confirmed: bool,
+  woke_running: u32,
 }
 
 /// The words the waker and the waiter share for one round.
@@ -379,6 +413,9 @@ struct Shared {
   waiter_cpu: AtomicU32,
   /// The waiter's pin, as a code.
   waiter_pin: AtomicU32,
+  /// Whether the waiter switched out across its last wait: [`SLEPT`], [`DID_NOT_SLEEP`], or [`SLEEP_UNKNOWN`] where
+  /// the OS counts no switches for it ([`crate::switches`]).
+  slept: AtomicU32,
 }
 
 /// One round: a fresh waiter, pinned with the waker to `pair` when there is one, timed until its mean
@@ -394,6 +431,7 @@ fn wake_round(pair: Option<(u32, u32)>, budget: Duration, rng: &mut Xorshift) ->
     waiter: AtomicU64::new(UNPUBLISHED),
     waiter_cpu: AtomicU32::new(UNKNOWN_CPU),
     waiter_pin: AtomicU32::new(pinning_code(Pinning::Refused)),
+    slept: AtomicU32::new(SLEEP_UNKNOWN),
   };
   let epoch = Instant::now();
   let waker = std::thread::current();
@@ -402,6 +440,7 @@ fn wake_round(pair: Option<(u32, u32)>, budget: Duration, rng: &mut Xorshift) ->
     same_cpu: 0,
     placement: waker_pin,
     asleep_confirmed: true,
+    woke_running: 0,
   };
   std::thread::scope(|scope| {
     let waiter = scope.spawn(|| waiter_loop(&shared, pair, epoch, &waker));
@@ -410,6 +449,8 @@ fn wake_round(pair: Option<(u32, u32)>, budget: Duration, rng: &mut Xorshift) ->
       waiter.thread().unpark();
       return;
     };
+    // Held for the round: the waiter outlives it (joined when the scope ends), so its id names it throughout.
+    let watch = platform::Watch::open(id);
     let waiter_pin = pinning_from_code(shared.waiter_pin.load(Ordering::Acquire));
     round.placement = weaker(waker_pin, waiter_pin);
     // Only a pair pinned to two distinct cores defines the event as cross-CPU; unpinned (or one core),
@@ -417,15 +458,27 @@ fn wake_round(pair: Option<(u32, u32)>, budget: Duration, rng: &mut Xorshift) ->
     let two_cores = pair.is_some_and(|(a, b)| a != b) && round.placement == Pinning::Pinned;
     let mut next_check = MIN_SAMPLES;
     while started.elapsed() < budget {
-      let Some(confirmed) = await_asleep(&shared, id, started, budget) else {
+      let Some(asleep) = await_asleep(&shared, id, watch.as_ref(), started, budget) else {
         break;
       };
-      round.asleep_confirmed &= confirmed;
-      let Some((latency, one_cpu)) =
-        time_one_wake(&shared, waiter.thread(), started, budget, epoch)
-      else {
+      round.asleep_confirmed &= asleep.confirmed;
+      let Some(woke) = time_one_wake(
+        &shared,
+        waiter.thread(),
+        Kick {
+          watch: watch.as_ref(),
+          still_at: asleep.still_at,
+        },
+        Bound { started, budget },
+        epoch,
+      ) else {
         break;
       };
+      if woke.ran_before_kick {
+        round.woke_running = round.woke_running.saturating_add(1);
+        continue;
+      }
+      let (latency, one_cpu) = (woke.latency, woke.one_cpu);
       if one_cpu {
         round.same_cpu = round.same_cpu.saturating_add(1);
         if two_cores {
@@ -462,6 +515,7 @@ fn waiter_loop(
     .waiter
     .store(platform::thread_id(), Ordering::Release);
   loop {
+    let switches_before = crate::switches::switches_now();
     while shared.turn.load(Ordering::Acquire) != GO {
       if shared.stop.load(Ordering::Acquire) {
         return;
@@ -471,6 +525,10 @@ fn waiter_loop(
       shared.parking.store(false, Ordering::Release);
     }
     let woke = nanos(epoch.elapsed());
+    shared.slept.store(
+      slept_word(switches_before, crate::switches::switches_now()),
+      Ordering::Release,
+    );
     shared.waiter_cpu.store(
       platform::current_cpu().unwrap_or(UNKNOWN_CPU),
       Ordering::Release,
@@ -498,14 +556,66 @@ fn await_waiter(shared: &Shared, started: Instant, budget: Duration) -> Option<u
   }
 }
 
-/// Waits until the waiter is asleep: confirmed by the OS (`Some(true)`), or — where the OS cannot be
-/// asked — announced by the waiter itself (`Some(false)`). `None` when the round's budget ends first.
-fn await_asleep(shared: &Shared, id: u64, started: Instant, budget: Duration) -> Option<bool> {
+/// How the waker knew the waiter was asleep.
+struct Asleep {
+  /// Confirmed by the OS (its state query, or the waiter's cycle count standing still), rather than only
+  /// announced by the waiter.
+  confirmed: bool,
+  /// The cycle count that stood still, where that was the confirmation: the kick checks it again.
+  still_at: Option<u64>,
+}
+
+/// Whether two successive reads of a thread's cycle count show it stood still between them: both read,
+/// and equal. A blocked thread accrues no cycles. A running one usually shows some between two reads, but not
+/// always (16–18 % of back-to-back pairs read alike on CI's x86_64 runner), so this is the kick's gate, and the
+/// waiter's own switch count is the proof ([`slept_word`]).
+pub fn stood_still(first: Option<u64>, second: Option<u64>) -> bool {
+  first.is_some() && first == second
+}
+
+/// Whether the thread ran between its confirmation and its kick: its count stood still at `still_at` and
+/// reads differently now. `false` when there is nothing to compare (no watch, or a read the OS refused).
+pub fn ran_since(still_at: Option<u64>, now: Option<u64>) -> bool {
+  matches!((still_at, now), (Some(still), Some(now)) if still != now)
+}
+
+/// Waits until the waiter is asleep: confirmed by the OS's state query; or, where there is none, announced
+/// by the waiter and confirmed by its cycle count standing still across two reads (Windows); or, where
+/// neither can be asked, announced alone (unconfirmed). `None` when the round's budget ends first.
+fn await_asleep(
+  shared: &Shared,
+  id: u64,
+  watch: Option<&platform::Watch>,
+  started: Instant,
+  budget: Duration,
+) -> Option<Asleep> {
   loop {
     match platform::is_waiting(id) {
-      Some(true) => return Some(true),
+      Some(true) => {
+        return Some(Asleep {
+          confirmed: true,
+          still_at: None,
+        });
+      }
       Some(false) => {}
-      None if shared.parking.load(Ordering::Acquire) => return Some(false),
+      None if shared.parking.load(Ordering::Acquire) => match watch {
+        None => {
+          return Some(Asleep {
+            confirmed: false,
+            still_at: None,
+          });
+        }
+        Some(watch) => {
+          let first = watch.cycles();
+          let second = watch.cycles();
+          if stood_still(first, second) && shared.parking.load(Ordering::Acquire) {
+            return Some(Asleep {
+              confirmed: true,
+              still_at: second,
+            });
+          }
+        }
+      },
       None => {}
     }
     if started.elapsed() >= budget {
@@ -515,17 +625,43 @@ fn await_asleep(shared: &Shared, id: u64, started: Instant, budget: Duration) ->
   }
 }
 
-/// Wakes the sleeping waiter and waits for its answer: the latency it measured and whether it woke on
-/// the waker's CPU. `None` when the answer does not come within the round's budget (the waker's wait is
-/// bounded, never an open park).
+/// What the kick checks before it is sent: the waiter's watch and the count that stood still.
+struct Kick<'a> {
+  watch: Option<&'a platform::Watch>,
+  still_at: Option<u64>,
+}
+
+/// A round's start and budget, which bound every wait in it.
+#[derive(Clone, Copy)]
+struct Bound {
+  started: Instant,
+  budget: Duration,
+}
+
+/// One wake's answer.
+struct Woke {
+  /// The latency the waiter measured.
+  latency: u64,
+  /// Whether it woke on the waker's CPU.
+  one_cpu: bool,
+  /// Whether its cycle count moved between its confirmation and the kick (it was running).
+  ran_before_kick: bool,
+}
+
+/// Wakes the sleeping waiter and waits for its answer: the latency it measured, whether it woke on the
+/// waker's CPU, and whether it had run again since its confirmation. `None` when the answer does not come
+/// within the round's budget (the waker's wait is bounded, never an open park).
 fn time_one_wake(
   shared: &Shared,
   waiter: &std::thread::Thread,
-  started: Instant,
-  budget: Duration,
+  kick: Kick<'_>,
+  bound: Bound,
   epoch: Instant,
-) -> Option<(u64, bool)> {
+) -> Option<Woke> {
+  let Bound { started, budget } = bound;
   let waker_cpu = platform::current_cpu();
+  // Read before the stamp, so the read's own cost is not timed as the wake.
+  let ran_before_kick = ran_since(kick.still_at, kick.watch.and_then(platform::Watch::cycles));
   shared
     .stamp
     .store(nanos(epoch.elapsed()), Ordering::Release);
@@ -539,10 +675,17 @@ fn time_one_wake(
     std::thread::park_timeout(remaining);
   }
   let latency = shared.stamp.load(Ordering::Acquire);
+  // The waiter's own count is the per-wake proof (Windows): a wait it never switched out of found the kick pending.
+  let ran_before_kick =
+    ran_before_kick || shared.slept.load(Ordering::Acquire) == DID_NOT_SLEEP;
   let woke_on = shared.waiter_cpu.load(Ordering::Acquire);
   shared.turn.store(IDLE, Ordering::Release);
   let one_cpu = waker_cpu.is_some_and(|cpu| cpu != UNKNOWN_CPU && cpu == woke_on);
-  Some((latency, one_cpu))
+  Some(Woke {
+    latency,
+    one_cpu,
+    ran_before_kick,
+  })
 }
 
 #[cfg(target_os = "linux")]
@@ -564,6 +707,21 @@ mod platform {
     let text = std::fs::read_to_string(format!("/proc/self/task/{id}/stat")).ok()?;
     let (_, rest) = text.rsplit_once(") ")?;
     Some(rest.starts_with('S'))
+  }
+
+  /// No cycle-count watch here: the state query confirms (or nothing can).
+  pub(super) struct Watch;
+
+  impl Watch {
+    /// No watch is opened here.
+    pub(super) fn open(_id: u64) -> Option<Watch> {
+      None
+    }
+
+    /// No count here.
+    pub(super) fn cycles(&self) -> Option<u64> {
+      None
+    }
   }
 }
 
@@ -620,6 +778,21 @@ mod platform {
     };
     (rc == libc::KERN_SUCCESS).then_some(info.run_state == libc::TH_STATE_WAITING)
   }
+
+  /// No cycle-count watch here: the state query confirms (or nothing can).
+  pub(super) struct Watch;
+
+  impl Watch {
+    /// No watch is opened here.
+    pub(super) fn open(_id: u64) -> Option<Watch> {
+      None
+    }
+
+    /// No count here.
+    pub(super) fn cycles(&self) -> Option<u64> {
+      None
+    }
+  }
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
@@ -638,6 +811,21 @@ mod platform {
   pub(super) fn is_waiting(_id: u64) -> Option<bool> {
     None
   }
+
+  /// No cycle-count watch here: the state query confirms (or nothing can).
+  pub(super) struct Watch;
+
+  impl Watch {
+    /// No watch is opened here.
+    pub(super) fn open(_id: u64) -> Option<Watch> {
+      None
+    }
+
+    /// No count here.
+    pub(super) fn cycles(&self) -> Option<u64> {
+      None
+    }
+  }
 }
 
 #[cfg(windows)]
@@ -648,15 +836,51 @@ mod platform {
     Some(unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessorNumber() })
   }
 
-  /// No per-thread state query is used on Windows, so no id is needed.
+  use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+  use windows_sys::Win32::System::Threading::{
+    GetCurrentThreadId, OpenThread, THREAD_QUERY_LIMITED_INFORMATION,
+  };
+  use windows_sys::Win32::System::WindowsProgramming::QueryThreadCycleTime;
+
+  /// The calling thread's id, which the waker opens a query handle by (no thread has id zero).
   pub(super) fn thread_id() -> u64 {
-    0
+    // SAFETY: takes no argument and answers the calling thread's id.
+    u64::from(unsafe { GetCurrentThreadId() })
   }
 
-  /// Windows names a thread's wait state only in a system-wide process snapshot; the waiter's own
-  /// announcement stands in, and the result reports the wait as unconfirmed.
+  /// Windows names a thread's wait state only in a system-wide process snapshot, too slow to take before
+  /// every wake; the waiter's cycle count confirms instead ([`Watch`]).
   pub(super) fn is_waiting(_id: u64) -> Option<bool> {
     None
+  }
+
+  /// A query handle to the waiter, for its cycle count; closed when the round ends.
+  pub(super) struct Watch(HANDLE);
+
+  impl Watch {
+    /// Opens thread `id` of this process with query rights only; `None` when the OS refuses.
+    pub(super) fn open(id: u64) -> Option<Watch> {
+      let id = u32::try_from(id).ok().filter(|id| *id != 0)?;
+      // SAFETY: opens a thread by id with query rights only; a refusal is a null handle, checked here.
+      let handle = unsafe { OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, id) };
+      (!handle.is_null()).then_some(Watch(handle))
+    }
+
+    /// The cycles the thread has run, which only running advances; `None` when the read is refused.
+    pub(super) fn cycles(&self) -> Option<u64> {
+      let mut cycles = 0u64;
+      // SAFETY: this value's own live handle, opened with the limited query right `QueryThreadCycleTime`
+      // accepts, and this frame's own count; the status is checked before the count is read.
+      let read = unsafe { QueryThreadCycleTime(self.0, &mut cycles) };
+      (read != 0).then_some(cycles)
+    }
+  }
+
+  impl Drop for Watch {
+    fn drop(&mut self) {
+      // SAFETY: the handle is this value's own, opened by `OpenThread` and closed only here.
+      unsafe { CloseHandle(self.0) };
+    }
   }
 }
 
@@ -797,6 +1021,7 @@ mod tests {
       rounds_agree: None,
       placement: Pinning::Pinned,
       asleep_confirmed: true,
+      woke_running: 0,
       quick: false,
     };
     // A coefficient of variation of six: (1.96 × 6 / 0.05)² = 235.2² → 236² = 55,696.
@@ -846,6 +1071,89 @@ mod tests {
     if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
       assert!(w.asleep_confirmed, "{w:?}");
     }
+  }
+
+  /// Shape: how long the watch test lets a thread spin or sleep between its two reads: long enough that a spinner
+  /// is scheduled within it on a busy machine (two spinners a core), short beside the suite.
+  const WATCH_SPAN: Duration = Duration::from_millis(20);
+
+  /// A-223 (the Windows confirmation, by use): do read a parked thread's cycle count, wait, and read it again, then
+  /// the same of a spinning thread. Expect the parked thread's count to have stood still and the spinner's to have
+  /// moved; where no watch can be opened (Linux, macOS, whose state query confirms) the test skips loudly.
+  #[test]
+  #[allow(clippy::disallowed_methods)] // a test's wait between two reads: the span is what is watched.
+  fn a_parked_threads_cycle_count_stands_still_and_a_spinning_ones_moves() {
+    let stop = AtomicBool::new(false);
+    let id = AtomicU64::new(UNPUBLISHED);
+    std::thread::scope(|scope| {
+      let sleeper = scope.spawn(|| {
+        id.store(platform::thread_id(), Ordering::Release);
+        while !stop.load(Ordering::Acquire) {
+          std::thread::park();
+        }
+      });
+      while id.load(Ordering::Acquire) == UNPUBLISHED {
+        std::thread::yield_now();
+      }
+      let Some(watch) = platform::Watch::open(id.load(Ordering::Acquire)) else {
+        eprintln!(
+          "skipped: no cycle-count watch on this platform (its state query confirms a sleeper)"
+        );
+        stop.store(true, Ordering::Release);
+        sleeper.thread().unpark();
+        return;
+      };
+      // Let the sleeper reach its park, then watch it across the span.
+      std::thread::sleep(WATCH_SPAN);
+      let first = watch.cycles();
+      std::thread::sleep(WATCH_SPAN);
+      let second = watch.cycles();
+      assert!(
+        stood_still(first, second),
+        "a parked thread ran: {first:?} → {second:?}"
+      );
+      stop.store(true, Ordering::Release);
+      sleeper.thread().unpark();
+    });
+    let stop = AtomicBool::new(false);
+    let id = AtomicU64::new(UNPUBLISHED);
+    std::thread::scope(|scope| {
+      scope.spawn(|| {
+        id.store(platform::thread_id(), Ordering::Release);
+        let mut spin = 0u64;
+        while !stop.load(Ordering::Acquire) {
+          spin = std::hint::black_box(spin.wrapping_add(1));
+        }
+      });
+      while id.load(Ordering::Acquire) == UNPUBLISHED {
+        std::thread::yield_now();
+      }
+      let watch = platform::Watch::open(id.load(Ordering::Acquire));
+      let first = watch.as_ref().and_then(platform::Watch::cycles);
+      std::thread::sleep(WATCH_SPAN);
+      let second = watch.as_ref().and_then(platform::Watch::cycles);
+      stop.store(true, Ordering::Release);
+      if watch.is_some() {
+        assert!(
+          ran_since(first, second),
+          "a spinning thread stood still: {first:?} → {second:?}"
+        );
+      }
+    });
+  }
+
+  /// A-223, the decision by use: two equal reads stood still and two different ones did not; a read the OS refused
+  /// confirms nothing; a count that moved after it stood still ran, and nothing to compare is not a run.
+  #[test]
+  fn a_count_stands_still_only_when_both_reads_agree() {
+    assert!(stood_still(Some(7), Some(7)));
+    assert!(!stood_still(Some(7), Some(8)));
+    assert!(!stood_still(None, None));
+    assert!(!stood_still(Some(7), None));
+    assert!(ran_since(Some(7), Some(9)));
+    assert!(!ran_since(Some(7), Some(7)));
+    assert!(!ran_since(None, Some(9)));
+    assert!(!ran_since(Some(7), None));
   }
 
   /// A wake that was measured: at least the planned rounds, at least the stopping rule's floor of samples,
