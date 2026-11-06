@@ -1,0 +1,22 @@
+name: DIAG bug-sweep 1, slates exec's user namespace on ubuntu (not for main)
+
+# A diagnostics branch, never merged: why the launcher's in-process user-namespace setup is refused on
+# ubuntu-latest (docs/bugs/2026-10-20-the-launcher-writes-its-own-userns-maps.md). Linux 6.12 (linuxkit) in a
+# container takes the same in-process sequence, so the probe asks the runner directly.
+
+on:
+  push:
+    branches: [diag-bug-sweep-1]
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: The user-namespace probe
+        run: sh ci/diag/userns-probe.sh
