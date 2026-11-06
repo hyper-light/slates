@@ -1,0 +1,48 @@
+runner ubuntu-latest, 4 CPUs, Fri Nov  6 07:21:43 UTC 2026, fix f0dc41089c8c0d62f9d4ff7439ccd8eea9f3459a
+live vhost fsync: healthy (0, 645µs); candidates stopped (0, 368µs); resumed (0, 135µs); vmm ExitStatus(unix_wait_status(0)); owner's live counters {"appended": 3, "awaited": 1, "durable": 1, "resolved": 1}
+thread 'a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it' (5393) panicked at crates/cli/tests/live_fleet.rs:2232:3:
+assertion `left == right` failed: an FSYNC no candidate can hold fails EIO, not success, after 368µs
+  left: 0
+ right: 5
+test a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 1.42s
+== red exit 101
+live vhost fsync: healthy (0, 3.007ms); candidates stopped (5, 1.000931s) (log Some(("2", "1", "false")), hold (waited, refused) (1, 1)); resumed (0, 102.973ms); vmm ExitStatus(unix_wait_status(0)); owner's live counters {"appended": 3, "awaited": 1, "durable": 3, "link_lost": 1, "no_session": 23, "resolved": 1, "unanswered": 13}
+test a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 2.61s
+== fix 1 exit 0
+live vhost fsync: healthy (0, 89.173ms); candidates stopped (5, 1.000663s) (log Some(("2", "1", "false")), hold (waited, refused) (1, 1)); resumed (0, 186.883ms); vmm ExitStatus(unix_wait_status(0)); owner's live counters {"appended": 3, "awaited": 1, "durable": 3, "link_lost": 1, "no_session": 11, "resolved": 1, "unanswered": 6}
+test a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 3.59s
+== fix 2 exit 0
+live vhost fsync: healthy (0, 87.762ms); candidates stopped (5, 1.001565s) (log Some(("2", "1", "false")), hold (waited, refused) (1, 1)); resumed (0, 217.633ms); vmm ExitStatus(unix_wait_status(0)); owner's live counters {"appended": 3, "awaited": 1, "durable": 3, "link_lost": 2, "no_session": 29, "resolved": 1, "unanswered": 27}
+test a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 2.82s
+== fix 3 exit 0
+live vhost fsync: healthy (0, 3.175ms); candidates stopped (5, 1.001201s) (log Some(("2", "1", "false")), hold (waited, refused) (1, 1)); resumed (0, 13.406ms); vmm ExitStatus(unix_wait_status(0)); owner's live counters {"appended": 3, "awaited": 1, "durable": 3, "link_lost": 1, "no_session": 18, "resolved": 1, "unanswered": 11}
+test a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 2.56s
+== fix 4 exit 0
+live vhost fsync: healthy (0, 2.46ms); candidates stopped (5, 1.000585s) (log Some(("2", "1", "false")), hold (waited, refused) (1, 1)); resumed (0, 8.264ms); vmm ExitStatus(unix_wait_status(0)); owner's live counters {"appended": 3, "awaited": 1, "durable": 3, "link_lost": 1, "no_session": 18, "resolved": 1, "unanswered": 12}
+test a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 2.40s
+== fix 5 exit 0
+live vhost fsync: healthy (0, 2.409ms); candidates stopped (5, 1.000625s) (log Some(("2", "1", "false")), hold (waited, refused) (1, 1)); resumed (0, 14.373ms); vmm ExitStatus(unix_wait_status(0)); owner's live counters {"appended": 3, "awaited": 1, "durable": 3, "link_lost": 1, "no_session": 19, "resolved": 1, "unanswered": 12}
+test a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 2.64s
+== fix 6 exit 0
+live vhost fsync: healthy (0, 2.429ms); candidates stopped (5, 1.000954s) (log Some(("2", "1", "false")), hold (waited, refused) (1, 1)); resumed (0, 12.579ms); vmm ExitStatus(unix_wait_status(0)); owner's live counters {"appended": 3, "awaited": 1, "durable": 3, "link_lost": 1, "no_session": 22, "resolved": 1, "unanswered": 12}
+test a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 2.61s
+== fix 7 exit 0
+live vhost fsync: healthy (0, 2.765ms); candidates stopped (5, 1.000761s) (log Some(("2", "1", "false")), hold (waited, refused) (1, 1)); resumed (0, 7.448ms); vmm ExitStatus(unix_wait_status(0)); owner's live counters {"appended": 3, "awaited": 1, "durable": 3, "link_lost": 1, "no_session": 18, "resolved": 1, "unanswered": 12}
+test a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 3.28s
+== fix 8 exit 0
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== bridge-virtiofs exit 0
