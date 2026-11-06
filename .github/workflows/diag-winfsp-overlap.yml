@@ -1,9 +1,10 @@
-name: DIAG the per-phase profile, the DLL arm against the combined form, quiet, product-derived and equal shard counts (not for main)
+name: DIAG the per-phase profile with each interface callback timed, arm64, quiet (not for main)
 
 # The supervisor's profile (2026-11-06): where each IRP's time goes, the combined form (comb2 on windows-11-arm, comb1
 # on windows-latest) against the DLL arm, mount_bench's quiet pass only, five runs a lane. Both arms carry the same
-# profile (crates/bridge-winfsp/src/phases.rs): the DLL arm 71cf09ac at 018fa83f, the combined form 45f048b6 at
-# 61f8b7de. Each daemon prints `phases <slot> <phase> <count> <p50> <p90> <p99> <mean>` in ns, and the round trip's
+# profile (crates/bridge-winfsp/src/phases.rs): the DLL arm 71cf09ac at 61db5d62, the combined form 45f048b6 at
+# 814d66ef, each also timing every interface callback from entry to return (`interface`), to place diag-36's
+# unattributed ~8 µs a stat on arm64. Each daemon prints `phases <slot> <phase> <count> <p50> <p90> <p99> <mean>` in ns, and the round trip's
 # and the reply's way back's whole histograms (`phases_hist`), at its mount's end.
 #
 # Lanes: each runner with the shard count each build derives (what users get: on windows-latest 71cf09ac derives 3
@@ -20,7 +21,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: never
-  OLD_COMMIT: 018fa83f09b4c3176c151cb3ad62e4716b30ffa1
+  OLD_COMMIT: 61db5d6256b97df8634567a4643a7acf1a42fe7a
   FIX_COMMIT: 3f12103dcb5e40c1cc9dbf45a6eb46cbdb89e615
   MAIN_COMMIT: 28359a7512ba9fd544550d12743294afd3e50eff
   WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
@@ -31,7 +32,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [arm-product, x86-product, x86-shards1, x86-shards3]
+        lane: [arm-product]
         run: [1, 2, 3, 4, 5]
         include:
           - lane: arm-product
