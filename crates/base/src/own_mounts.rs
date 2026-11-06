@@ -608,7 +608,7 @@ mod linux {
 }
 
 #[cfg(target_os = "macos")]
-pub use macos::{check_child, mount_id_at, open_checked_root};
+pub use macos::{check_child, mount_id_at, open_checked_root, table_id};
 
 #[cfg(target_os = "macos")]
 mod macos {
@@ -644,7 +644,7 @@ mod macos {
   }
 
   /// The id a mount's table entry is recorded under: its filesystem id's two words.
-  fn id_of(entry: &slates_bridge_oci::mount_table::MountEntry) -> u64 {
+  pub fn table_id(entry: &slates_bridge_oci::mount_table::MountEntry) -> u64 {
     (entry.identity.device << u32::BITS) | (entry.identity.mount & u64::from(u32::MAX))
   }
 
@@ -659,7 +659,7 @@ mod macos {
       .find(|entry| {
         entry.mount_point == point && entry.fstype == NFS_FSTYPE && wanted(&entry.source)
       })
-      .map(id_of)
+      .map(table_id)
   }
 
   /// Lends the mount points of this daemon's own mounts to `judge`, read from the kernel's table again only when the set
@@ -675,7 +675,7 @@ mod macos {
           .map(|table| {
             table
               .iter()
-              .filter(|entry| recorded(set, id_of(entry)))
+              .filter(|entry| recorded(set, table_id(entry)))
               .map(|entry| entry.mount_point.clone())
               .collect()
           })

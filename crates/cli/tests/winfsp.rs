@@ -1897,6 +1897,17 @@ fn a_base_a_held_drive_covers_is_not_reacquired_through_it() {
     "the held drive still serves"
   );
   cmd(&["rmdir", &link]);
-  let (code, _, err) = run(&instance, &["unmount", &drive]);
-  assert_eq!(code, 0, "unmount: {err}");
+  // The drive's own attachment, detached by its id: `slates unmount` scans every volume's status for the drive and
+  // stops at the first refusal, which the covered volume, not rebuilt, now is (GAPS).
+  let (code, out, err) = run(&instance, &["status", &cover]);
+  assert_eq!(code, 0, "status: {err}");
+  let attachment = out
+    .lines()
+    .filter_map(|line| line.strip_prefix("mount: "))
+    .find_map(|line| line.split_once(" (attachment "))
+    .and_then(|(_, rest)| rest.strip_suffix(')'))
+    .expect("the cover's status names its drive's attachment")
+    .to_owned();
+  let (code, _, err) = run(&instance, &["detach", &attachment]);
+  assert_eq!(code, 0, "detach: {err}");
 }

@@ -12,8 +12,12 @@
 > 42163139473, 42163139554, 42163139568); macOS 4 tests green, and red with the successor's learning removed (A-227).
 > Open:
 > - **The kept-mount tests on Linux and Windows CI** (a base a kept mount covers, after a restart): pending their runs.
-> - **The macOS check's cost** on the base plane's lookups with a mount recorded (one `F_GETPATH` a directory crossing)
->   is not yet measured; with no mount recorded it is one atomic load.
+> - **The macOS check's cost** with a mount recorded (one `F_GETPATH` a directory crossing) did not resolve from the
+>   noise at load 51 to 54 on 18 cores (BENCHMARKS, "The own-mount check on macOS"): a quiet re-measure is owed. With no
+>   mount recorded the check is one atomic load.
+> - **Windows `slates unmount` stops at the first volume whose status refuses** (`crates/cli/src/verbs.rs`
+>   `unmount_verb`): a volume recovery refused (`NotFound`) keeps every drive from being unmounted by its letter until
+>   it is destroyed. Found by A-227's reacquire test, which detaches by the attachment's id instead; not fixed here.
 
 > **A-190's purge client leaves the daemon's process (2026-11-06, fixed); the sweep for the rest (open).** No daemon
 > thread opens a path on a volume the daemon serves (§4.6). The coherent purge's opens, writes and reads now run in a

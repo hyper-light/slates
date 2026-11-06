@@ -2157,6 +2157,26 @@ item), a block naming its buffer by class and handle: XFS's progression from in-
 forms (Sweeney et al., USENIX 1996) without the global allocator. Built 2026-11-05 (A-203, "Directory blocks in size
 classes" above): AC-1.5 350,460,030 → 292,914,814 B.
 
+### The own-mount check on macOS (§4.6, A-227; 2026-11-06) — unresolved under load
+
+On macOS a crossing below a base is compared with the mount points of this daemon's own NFS mounts: with none recorded
+the check is one atomic load, and with one recorded it is the kernel's path of the parent (`F_GETPATH`) and a string
+comparison. `cargo build --release -p slates-base --example base_bench`, at `agents/slabs-siblings` after `ca5ba635`,
+whose last rows repeat the lookups with one mount recorded (`/dev`, which the directory does not lie on, so nothing is
+refused). The two arms run in one process, unrecorded first. The directory holds 810 files (alternating 4 KiB and
+128 KiB, made for the run). Apple M5 Max, 18 cores, macOS 26.4.1, shared with other agents' builds: 1-minute load 51
+to 54 (5-minute 71). Five runs; each run's median in ns:
+
+| row | none recorded | one recorded |
+|---|---|---|
+| list, per entry | 2,728, 2,317, 2,423, 2,484, 2,475 | 2,406, 2,730, 2,897, 2,645, 2,853 |
+| open and `fstat` a file | 31,542, 30,958, 32,666, 14,000, 16,041 | 35,542, 36,875, 27,333, 15,958, 34,708 |
+
+The load hides the difference. Each open's change, run by run, is +4.0, +5.9, −5.3, +2.0 and +18.7 µs, against opens
+that themselves range from 14.0 to 32.7 µs. A listing of files checks no entry, since only directories can be mount
+points, so the listings' +161 to +474 ns in four of five runs is the fixed order (the recorded arm runs second), not
+the check. Owed: the same rows at a quiet load. Linux's figures are in the section below.
+
 ### The own-mount check on the base plane's lookups (§4.6, A-227; 2026-11-06, Linux)
 
 Every lookup below a base now opens the entry `O_PATH | O_NOFOLLOW` and reads its mount id from `/proc/self/fdinfo`
