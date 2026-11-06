@@ -1770,3 +1770,9 @@ slates-server: shard 1 initialized in 1933 µs
 slates-server: shard 2 initialized in 2064 µs
 slates daemon: instance fsb-1022-1-comb1 serving on 3 shards under the anchor
 ## run 1 of 1 done, 2026-11-06T07:19:58Z
+remote: 
+remote: Create a pull request for 'diag-winfsp-overlap-results-42178889880-profile-x86-shards3-5' on GitHub by visiting:        
+remote:      https://github.com/hyper-light/slates/pull/new/diag-winfsp-overlap-results-42178889880-profile-x86-shards3-5        
+remote: 
+To https://github.com/hyper-light/slates
+ * [new branch]      10633fe42b635cf147d16409ad544b365e4d8cf7 -> diag-winfsp-overlap-results-42178889880-profile-x86-shards3-5
