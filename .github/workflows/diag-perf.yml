@@ -1,0 +1,75 @@
+name: diag-perf
+
+# The edit-and-merge harness (`crates/client/examples/edit_merge_bench.rs`, A-202) under the controlled load the
+# supervisor set on 2026-11-06 (Ada: p99 under load is the target): two spinning threads a core, two CPUs, 256 MB, and a
+# sibling writer that fsyncs, every arm interleaved. A diagnostics lane run only from `diag-perf-*` branches (never
+# main); Linux only (macOS is measured natively on the development Macs).
+
+on:
+  push:
+    branches: ["diag-perf-*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  merge-under-load:
+    name: merge under load (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the harness
+        run: |
+          cargo build --release -p slates-client --example edit_merge_bench
+          mkdir -p "$RUNNER_TEMP/bin"
+          cp target/release/examples/edit_merge_bench "$RUNNER_TEMP/bin/edit_merge_bench"
+      - name: The constraint this runner can apply
+        run: |
+          nproc; free -m | head -2; uname -a; cat /sys/kernel/debug/sched/base_slice_ns 2>/dev/null || true
+          if systemd-run --user --scope -p MemoryMax=256M -p AllowedCPUs=0-1 true 2>/dev/null; then
+            echo "constraint: systemd-run --user --scope, AllowedCPUs=0-1, MemoryMax=256M" | tee "$RUNNER_TEMP/constraint"
+          else
+            echo "constraint: taskset -c 0,1 only (no user systemd manager; memory not capped)" | tee "$RUNNER_TEMP/constraint"
+          fi
+      - name: Interleaved arms under the controlled load
+        run: |
+          cat > "$RUNNER_TEMP/loaded.sh" <<'EOS'
+          #!/bin/bash
+          # The sibling writer: 16 MiB written and fsynced, again and again, beside the harness in the same cgroup.
+          ( while true; do dd if=/dev/zero of="$RUNNER_TEMP/fsync.bin" bs=1M count=16 conv=fsync status=none; done ) &
+          writer=$!
+          "$RUNNER_TEMP/bin/edit_merge_bench" --loaded-only --spinners-per-core 2 "$@" \
+            --files 10 --files 1000 --form accept --form conflict
+          status=$?
+          kill $writer; wait $writer 2>/dev/null
+          exit $status
+          EOS
+          chmod +x "$RUNNER_TEMP/loaded.sh"
+          export RUNNER_TEMP
+          for round in 1 2 3; do
+            while read -r arm; do
+              echo "== round $round arm [$arm] $(date -u +%FT%TZ) $(uptime) $(cat "$RUNNER_TEMP/constraint")"
+              if grep -q systemd-run "$RUNNER_TEMP/constraint"; then
+                timeout 900 systemd-run --user --scope -q -p MemoryMax=256M -p AllowedCPUs=0-1 \
+                  -E RUNNER_TEMP="$RUNNER_TEMP" "$RUNNER_TEMP/loaded.sh" $arm </dev/null | grep -E 'goal|attrib|WRONG|loaded:|refused|sched:'
+              else
+                timeout 900 taskset -c 0,1 "$RUNNER_TEMP/loaded.sh" $arm </dev/null | grep -E 'goal|attrib|WRONG|loaded:|refused|sched:'
+              fi
+            done < .github/diag-perf-arms
+          done
+      - name: Quiet, the same arms, for the contrast
+        run: |
+          while read -r arm; do
+            echo "== quiet arm [$arm] $(date -u +%FT%TZ) $(uptime)"
+            "$RUNNER_TEMP/bin/edit_merge_bench" --quiet-only $arm --files 10 --files 1000 \
+              --form accept --form conflict </dev/null | grep -E 'goal|attrib|WRONG|sched:'
+          done < .github/diag-perf-arms

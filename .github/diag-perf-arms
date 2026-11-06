@@ -1,0 +1,2 @@
+--client-spin-ns default
+--client-spin-ns default --sched-slice-ns 100000
