@@ -703,7 +703,13 @@ fn latency_line(outcomes: &[Outcome]) -> String {
   let slow: Vec<String> = outcomes
     .iter()
     .filter(|outcome| outcome.took > SLOW_WRITE)
-    .map(|outcome| format!("{:.2}s+{:.0}ms", outcome.sent.as_secs_f64(), outcome.took.as_secs_f64() * 1e3))
+    .map(|outcome| {
+      format!(
+        "{:.2}s+{:.0}ms",
+        outcome.sent.as_secs_f64(),
+        outcome.took.as_secs_f64() * 1e3
+      )
+    })
     .collect();
   format!(
     "{} writes, {} acknowledged: p50 {p50:.0} us, p99 {p99:.0} us, p999 {p999:.0} us, max {max:.0} us; {} over \
@@ -895,7 +901,10 @@ fn converged(owner: &str, candidates: &[&str], volume: &str) -> (bool, String) {
       let mut line = format!("owner {shipping:?}; candidates {held:?}");
       if !whole {
         for instance in std::iter::once(&owner).chain(candidates) {
-          line.push_str(&format!("\n    {instance}: {:?}", counters(instance, "fleet.live.")));
+          line.push_str(&format!(
+            "\n    {instance}: {:?}",
+            counters(instance, "fleet.live.")
+          ));
         }
       }
       return (whole, line);
@@ -1015,7 +1024,9 @@ fn stream_through<F: FnOnce(&Instant)>(
       }
     }
     let stop = StopAll(&stop_stream, &stop_sampling);
-    chaos(&began);
+    // The chaos's own failure is passed on only after the stream is in hand, or a write never answered would hang the
+    // scope's join behind it (one run did until its timeout, 2026-11-06).
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| chaos(&began))).err();
     drop(stop);
     // A write the daemon never answers would hang the join for good (one run hung 20 minutes, 2026-11-06): past the
     // fleet wait, the fleet is shown whole and its daemons killed, so the client is told and the flow fails.
@@ -1037,6 +1048,9 @@ fn stream_through<F: FnOnce(&Instant)>(
       pause();
     }
     let outcomes = streamer.join().unwrap();
+    if let Some(failure) = failed {
+      std::panic::resume_unwind(failure);
+    }
     assert!(
       !UNANSWERED.with(std::cell::Cell::get),
       "a write on {owner} was never answered (the fleet's state is printed above): {:?}",
@@ -1575,10 +1589,31 @@ fn a_live_volume_destroyed_with_writes_waiting_refuses_them_and_keeps_nothing() 
       }
       // Let the stream's write be sent and wait.
       sleep(Duration::from_millis(200));
-      let (code, _, err) = run(&owner, &["volume", "destroy", &volume]);
+      // The destroy as its own client, since it now waits for its tombstone, which no stopped candidate can hold.
+      let mut destroy = slates()
+        .arg("--instance")
+        .arg(&owner)
+        .args(["volume", "destroy", &volume])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
       destroyed_at = began.elapsed();
+      sleep(Duration::from_millis(200));
+      let answered_while_stopped = destroy.try_wait().unwrap().map(|status| status.code());
+      for index in fleet.others(owner_index) {
+        fleet.resume(index);
+      }
+      let code = destroy.wait_timeout_or_kill(FLEET_WAIT).unwrap_or(-1);
+      let mut err = String::new();
+      {
+        use std::io::Read;
+        let _ = destroy.stderr.take().unwrap().read_to_string(&mut err);
+      }
       verdict.note(format!(
-        "destroyed at {destroyed_at:?}: exit {code} {}",
+        "destroy sent at {destroyed_at:?}: answered while the candidates were stopped {answered_while_stopped:?}; \
+         exit {code} at {:?} {}",
+        began.elapsed(),
         err.trim()
       ));
       // Until 2026-11-06 the destroy itself waited on the write before it and was then refused `NotFound` by its own
@@ -1591,10 +1626,6 @@ fn a_live_volume_destroyed_with_writes_waiting_refuses_them_and_keeps_nothing() 
           vec![format!("exit {code}: {}", err.trim())]
         },
       );
-      sleep(Duration::from_millis(200));
-      for index in fleet.others(owner_index) {
-        fleet.resume(index);
-      }
     },
   );
   verdict.note(latency_line(&outcomes));
@@ -1644,7 +1675,8 @@ fn a_live_volume_destroyed_with_writes_waiting_refuses_them_and_keeps_nothing() 
     "nothing of the destroyed volume kept",
     kept.iter().map(|kept| format!("{kept:?}")).collect(),
   );
-  let awaited = counter(&owner, "fleet.live.awaited");
+  // Every wait the owner holds, a live write's or a destroy's, ends through one answer, counted `resolved`.
+  let awaited = counter(&owner, "fleet.live.awaited") + counter(&owner, "fleet.destroy.awaited");
   let resolved = counter(&owner, "fleet.live.resolved");
   let unrecorded = counter(&owner, "fleet.live.unrecorded");
   verdict.note(format!(
@@ -1767,7 +1799,8 @@ fn clients_killed_while_their_writes_wait_leave_no_reply_held() {
   let mut every = cut;
   every.extend(outcomes.iter().cloned());
   judge_healed(&mut verdict, &owner, &candidates, &volume, &every, &samples);
-  let awaited = counter(&owner, "fleet.live.awaited");
+  // Every wait the owner holds, a live write's or a destroy's, ends through one answer, counted `resolved`.
+  let awaited = counter(&owner, "fleet.live.awaited") + counter(&owner, "fleet.destroy.awaited");
   let resolved = counter(&owner, "fleet.live.resolved");
   let unrecorded = counter(&owner, "fleet.live.unrecorded");
   verdict.note(format!(
@@ -1787,43 +1820,97 @@ fn clients_killed_while_their_writes_wait_leave_no_reply_held() {
   verdict.judge();
 }
 
-/// A destroy no candidate has heard of, then the owner lost (§4.10, D-16; a client is never told an outcome a takeover
-/// undoes): do write to a volume (live-shipped, or plain with a snapshot placed), let every candidate hold it, stop both
-/// candidates' processes, destroy the volume on the owner, kill the owner's process (SIGKILL) at once, and resume the
-/// candidates. Expect the destroy either refused, or answered done and the volume never served again by the survivors.
-fn a_destroy_then_the_owners_loss(live: bool) {
-  let tag = if live {
-    "destroy-loss-live"
-  } else {
-    "destroy-loss-plain"
+/// A destroy, then the owner lost (§4.4 destroy, AUD-29-43; a client is never told an outcome a takeover undoes): do
+/// write to a volume (live-shipped, or plain with a snapshot), let every candidate hold it, destroy the volume on the
+/// owner (with both candidates' processes stopped when `unheard`, so no candidate can hold its tombstone), kill the
+/// owner's process (SIGKILL) a moment later, and resume the candidates. Expect a destroy answered done never undone (no
+/// survivor lists or serves the volume again), a destroy that could not be placed never answered done, and a healthy
+/// destroy answered done. Until 2026-11-06 the unheard destroy was answered done and a survivor served the volume
+/// again after the takeover.
+fn a_destroy_then_the_owners_loss(live: bool, unheard: bool) {
+  let tag = match (live, unheard) {
+    (true, true) => "destroy-loss-live",
+    (true, false) => "destroy-loss-live-heard",
+    (false, true) => "destroy-loss-plain",
+    (false, false) => "destroy-loss-plain-heard",
   };
   let mut fleet = Fleet::start(tag, Supervision::Bare);
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
   let volume = create_volume(&owner, tag, live);
-  let mut verdict = Verdict::new(if live {
-    "a live volume's destroy, then its owner's loss"
-  } else {
-    "a plain volume's destroy, then its owner's loss"
+  let mut verdict = Verdict::new(match (live, unheard) {
+    (true, true) => "a live volume's unheard destroy, then its owner's loss",
+    (true, false) => "a live volume's destroy, then its owner's loss",
+    (false, true) => "a plain volume's unheard destroy, then its owner's loss",
+    (false, false) => "a plain volume's destroy, then its owner's loss",
   });
-  let began = Instant::now();
+  let outcomes = held_before_destroy(&owner, &candidates, &volume, live, &mut verdict);
+  let destroyed = destroy_across_the_loss(&mut fleet, owner_index, &volume, unheard);
+  verdict.note(format!(
+    "destroy (candidates stopped: {unheard}): answered before the owner's loss {:?}; exit {} {}",
+    destroyed.before_the_loss,
+    destroyed.code,
+    destroyed.stderr.trim()
+  ));
+  // Give the survivors the time a takeover takes (1.8–3.2 s measured) twice over, then ask each for the volume.
+  sleep(Duration::from_secs(8));
+  let views = survivor_views(&candidates, &volume);
+  verdict.note(format!(
+    "written: {}; survivors: {views:?}",
+    latency_line(&outcomes)
+  ));
+  judge_destroy(&mut verdict, unheard, &destroyed, &views);
+  // A live volume whose destroy was never answered done keeps every write that was: no tombstone was placed, so the
+  // survivors take it over and must serve them all (NoLoss).
+  if live && destroyed.code != 0 {
+    let survivors: Vec<&str> = candidates.iter().map(String::as_str).collect();
+    match wait_serving(&survivors, &volume, &outcomes) {
+      Some((successor, took)) => {
+        verdict.note(format!("the undestroyed volume taken over by {successor} after {took:?} more"));
+        verdict.check("NoLoss (successor)", no_loss(successor, &volume, &outcomes));
+      }
+      None => verdict.check(
+        "NoLoss (successor)",
+        vec![format!(
+          "no survivor served the acknowledged writes of a volume whose destroy was never answered done: {:?}",
+          survivors
+            .iter()
+            .map(|survivor| (*survivor, counters(survivor, "fleet.")))
+            .collect::<Vec<_>>()
+        )],
+      ),
+    }
+  }
+  drop(fleet);
+  verdict.judge();
+}
+
+/// Writes five files to `volume` on `owner` and waits until every candidate holds them (a live volume's log converged,
+/// or a plain volume's snapshot placed): the writes' outcomes.
+fn held_before_destroy(
+  owner: &str,
+  candidates: &[String],
+  volume: &str,
+  live: bool,
+  verdict: &mut Verdict,
+) -> Vec<Outcome> {
   let never = AtomicBool::new(false);
   let outcomes = Stream {
-    instance: &owner,
-    volume: volume_id_of(&volume),
-    began,
+    instance: owner,
+    volume: volume_id_of(volume),
+    began: Instant::now(),
   }
   .run(0..5, &never);
   if live {
     let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
-    let (caught_up, last) = converged(&owner, &refs, &volume);
+    let (caught_up, last) = converged(owner, &refs, volume);
     assert!(
       caught_up,
       "the candidates held the log before the destroy: {last}"
     );
   } else {
-    let (code, out, err) = run(&owner, &["snapshot", &volume]);
+    let (code, out, err) = run(owner, &["volume", "snapshot", volume]);
     verdict.note(format!(
       "snapshot: exit {code} {} {}",
       out.trim(),
@@ -1832,21 +1919,85 @@ fn a_destroy_then_the_owners_loss(live: bool) {
     // The snapshot placed at f + 1 (the record period, up to 100 ms, then its commit).
     sleep(Duration::from_secs(2));
   }
-  for index in fleet.others(owner_index) {
-    fleet.stop(index);
+  outcomes
+}
+
+/// What a destroy's client was told.
+struct Destroyed {
+  /// Its exit code if it ended before the owner was lost (`Some(None)`: by a signal), `None` if it was still waiting.
+  before_the_loss: Option<Option<i32>>,
+  /// Its exit code in the end (-1: killed or signalled).
+  code: i32,
+  stderr: String,
+}
+
+/// Destroys `volume` through its own client process (with both candidates stopped when `unheard`), gives it a moment,
+/// kills the owner's node, and resumes the candidates: what the client was told.
+fn destroy_across_the_loss(
+  fleet: &mut Fleet,
+  owner_index: usize,
+  volume: &str,
+  unheard: bool,
+) -> Destroyed {
+  /// Shape: how long the destroy is given before the owner is lost: far past a healthy tombstone's placement (the
+  /// record period and a loopback round), so a destroy the candidates can hold is answered by then.
+  const ASKED_WAIT: Duration = Duration::from_secs(3);
+  if unheard {
+    for index in fleet.others(owner_index) {
+      fleet.stop(index);
+    }
   }
-  let (code, _, err) = run(&owner, &["volume", "destroy", &volume]);
-  verdict.note(format!(
-    "destroy with both candidates stopped: exit {code} {}",
-    err.trim()
-  ));
+  let mut destroy = slates()
+    .arg("--instance")
+    .arg(&fleet.instances[owner_index])
+    .args(["volume", "destroy", volume])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let asked = Instant::now();
+  let before_the_loss = loop {
+    if let Some(status) = destroy.try_wait().unwrap() {
+      break Some(status.code());
+    }
+    if asked.elapsed() > ASKED_WAIT {
+      break None;
+    }
+    pause();
+  };
   fleet.kill_node(owner_index);
-  for index in fleet.others(owner_index) {
-    fleet.resume(index);
+  if unheard {
+    for index in fleet.others(owner_index) {
+      fleet.resume(index);
+    }
   }
-  // Give the survivors the time a takeover takes (1.8–3.2 s measured) twice over, then ask each for the volume.
-  sleep(Duration::from_secs(8));
-  let served: Vec<(String, String)> = candidates
+  let code = match before_the_loss {
+    Some(code) => code.unwrap_or(-1),
+    // Its daemon is gone: the client is told so, or is killed here.
+    None => destroy.wait_timeout_or_kill(FLEET_WAIT).unwrap_or(-1),
+  };
+  let mut stderr = String::new();
+  {
+    use std::io::Read;
+    let _ = destroy.stderr.take().unwrap().read_to_string(&mut stderr);
+  }
+  Destroyed {
+    before_the_loss,
+    code,
+    stderr,
+  }
+}
+
+/// A survivor's view of a destroyed volume: whether it lists it, and what reading its first file through it gives.
+#[derive(Debug)]
+struct SurvivorView {
+  instance: String,
+  listed: bool,
+  read: Option<Result<usize, String>>,
+}
+
+fn survivor_views(candidates: &[String], volume: &str) -> Vec<SurvivorView> {
+  candidates
     .iter()
     .map(|candidate| {
       let (_, listed, _) = run(candidate, &["volume", "list"]);
@@ -1855,57 +2006,128 @@ fn a_destroy_then_the_owners_loss(live: bool) {
         .map(|mut client| {
           client
             .read(
-              volume_id_of(&volume),
+              volume_id_of(volume),
               &format!("/{}", chaos_path(0)),
               ReadAt::Head,
             )
             .map(|bytes| bytes.len())
+            .map_err(|error| error.to_string())
         });
-      (
-        candidate.clone(),
-        format!("listed {}; read {read:?}", listed.contains(&volume)),
+      SurvivorView {
+        instance: candidate.clone(),
+        listed: listed.contains(volume),
+        read,
+      }
+    })
+    .collect()
+}
+
+/// The destroy flow's checks: an answered destroy never undone, an unheard one never answered done, a heard one
+/// answered done, and none told `NotFound`.
+fn judge_destroy(
+  verdict: &mut Verdict,
+  unheard: bool,
+  destroyed: &Destroyed,
+  views: &[SurvivorView],
+) {
+  let resurrected: Vec<String> = views
+    .iter()
+    .filter(|view| view.listed || matches!(view.read, Some(Ok(_))))
+    .map(|view| {
+      format!(
+        "{} serves the destroyed volume again: {view:?}",
+        view.instance
       )
     })
     .collect();
-  verdict.note(format!(
-    "written: {}; survivors: {served:?}",
-    latency_line(&outcomes)
-  ));
-  let resurrected: Vec<String> = served
-    .iter()
-    .filter(|(_, seen)| seen.contains("Ok(Ok("))
-    .map(|(candidate, seen)| format!("{candidate} serves the destroyed volume: {seen}"))
-    .collect();
   verdict.check(
     "a destroy answered done is never undone",
-    if code == 0 { resurrected } else { Vec::new() },
+    if destroyed.code == 0 {
+      resurrected
+    } else {
+      Vec::new()
+    },
+  );
+  let answered_done = destroyed.before_the_loss == Some(Some(0));
+  verdict.check(
+    "a destroy no candidate could hold is never answered done",
+    if unheard && answered_done {
+      vec!["the unheard destroy exited 0 before the owner's loss".to_owned()]
+    } else {
+      Vec::new()
+    },
   );
   verdict.check(
-    "a destroy is answered done or refused for a reason it can be retried for, never NotFound",
-    if err.contains("NotFound") {
+    "a destroy the candidates hold is answered done",
+    if !unheard && !answered_done {
       vec![format!(
-        "the destroy of an existing volume was answered: {}",
-        err.trim()
+        "the healthy destroy: {:?}, exit {}",
+        destroyed.before_the_loss, destroyed.code
       )]
     } else {
       Vec::new()
     },
   );
-  drop(fleet);
-  verdict.judge();
+  verdict.check(
+    "a destroy is never told NotFound",
+    if destroyed.stderr.contains("NotFound") {
+      vec![format!(
+        "the destroy of an existing volume was answered: {}",
+        destroyed.stderr.trim()
+      )]
+    } else {
+      Vec::new()
+    },
+  );
+}
+
+#[test]
+fn a_live_volumes_unheard_destroy_then_its_owners_loss() {
+  if gated("destroy-loss-live") {
+    a_destroy_then_the_owners_loss(true, true);
+  }
+}
+
+#[test]
+fn a_plain_volumes_unheard_destroy_then_its_owners_loss() {
+  if gated("destroy-loss-plain") {
+    a_destroy_then_the_owners_loss(false, true);
+  }
 }
 
 #[test]
 fn a_live_volumes_destroy_then_its_owners_loss() {
-  if gated("destroy-loss-live") {
-    a_destroy_then_the_owners_loss(true);
+  if gated("destroy-loss-live-heard") {
+    a_destroy_then_the_owners_loss(true, false);
   }
 }
 
 #[test]
 fn a_plain_volumes_destroy_then_its_owners_loss() {
-  if gated("destroy-loss-plain") {
-    a_destroy_then_the_owners_loss(false);
+  if gated("destroy-loss-plain-heard") {
+    a_destroy_then_the_owners_loss(false, false);
+  }
+}
+
+/// Waits for a child within a bound, killing it past the bound: its exit code (`None`: killed or signalled).
+trait WaitOrKill {
+  fn wait_timeout_or_kill(&mut self, bound: Duration) -> Option<i32>;
+}
+
+impl WaitOrKill for Child {
+  fn wait_timeout_or_kill(&mut self, bound: Duration) -> Option<i32> {
+    let began = Instant::now();
+    loop {
+      if let Some(status) = self.try_wait().unwrap() {
+        return status.code();
+      }
+      if began.elapsed() > bound {
+        let _ = self.kill();
+        let _ = self.wait();
+        return None;
+      }
+      pause();
+    }
   }
 }
 
@@ -1972,6 +2194,204 @@ fn a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover() {
     None => verdict.check(
       "NoLoss (successor)",
       vec!["no survivor served the volume within the fleet wait".to_owned()],
+    ),
+  }
+  drop(fleet);
+  verdict.judge();
+}
+
+/// The control for every chaos flow's latency: do stream writes to a live volume on a fleet nothing disturbs, for
+/// `QUIET` past the first durable writes. Expect every write acknowledged, none lost, both candidates converged, one
+/// identity at every head; the client-seen p50, p99, p999 and max are this machine's floor for the flows above (and the
+/// slow writes listed, by when they were sent, are what the machine itself costs).
+#[test]
+fn writes_stream_on_a_quiet_fleet() {
+  /// Shape: how long the quiet stream runs.
+  const QUIET: Duration = Duration::from_secs(10);
+  if !gated("quiet") {
+    return;
+  }
+  let fleet = Fleet::start("quiet", Supervision::Bare);
+  let owner_index = fleet.owner_index();
+  let owner = fleet.instances[owner_index].clone();
+  let candidates = candidates_of(&fleet, owner_index);
+  let volume = create_volume(&owner, "quiet", true);
+  let mut verdict = Verdict::new("writes on a quiet fleet");
+  let (outcomes, samples) =
+    stream_through(&fleet.instances, &owner, &volume, 0..STREAM_FILES, |_| {
+      after_writes(&owner, &volume, BETWEEN_EVENTS);
+      sleep(QUIET);
+    });
+  let refused: Vec<String> = outcomes
+    .iter()
+    .filter(|outcome| outcome.refused.is_some())
+    .map(|outcome| format!("{outcome:?}"))
+    .collect();
+  verdict.check("every write acknowledged", refused);
+  judge_healed(
+    &mut verdict,
+    &owner,
+    &candidates,
+    &volume,
+    &outcomes,
+    &samples,
+  );
+  drop(fleet);
+  verdict.judge();
+}
+
+/// The head version `green` reports through `instance`, or `None` while it does not answer.
+fn green_head(instance: &str, green: &str) -> Option<u64> {
+  let (code, out, _) = run(instance, &["versions", green]);
+  if code != 0 {
+    return None;
+  }
+  out
+    .lines()
+    .find_map(|line| line.strip_prefix("head: "))
+    .and_then(|head| head.trim().parse().ok())
+}
+
+/// Whether `instance` serves each round's file at `green`'s head with the bytes that round's submit wrote.
+fn green_files(instance: &str, green: &str, rounds: usize) -> BTreeMap<usize, bool> {
+  (0..rounds)
+    .map(|round| {
+      let (code, out, _) = run(instance, &["read", green, &format!("/merge-{round}")]);
+      (
+        round,
+        code == 0 && out == format!("submitted in round {round}"),
+      )
+    })
+    .collect()
+}
+
+/// §4.16 and AUD-11 under clients cut off mid-merge, in a fleet: do create a green on one daemon process and, `ROUNDS`
+/// times, make a work that adds one file, start a `slates submit` of it and SIGKILL that client a few milliseconds in
+/// (before its request, while its acceptance waits for the fleet's commit, or after); then make one more submit whose
+/// client lives, and finally kill the green's owner (SIGKILL). Expect: every version a client was told is in the
+/// chain; the head counts exactly the files present (each cut submit is in whole or not at all, never a version without
+/// its edit nor an edit without its version); and a survivor takes the green over with the same head and the same files.
+#[test]
+fn clients_cut_off_mid_merge_leave_the_green_whole_across_a_takeover() {
+  /// Shape: the submits whose clients are killed.
+  const ROUNDS: usize = 12;
+  if !gated("cut-merge") {
+    return;
+  }
+  let mut fleet = Fleet::start("cut-merge", Supervision::Bare);
+  let owner_index = fleet.owner_index();
+  let owner = fleet.instances[owner_index].clone();
+  let candidates = candidates_of(&fleet, owner_index);
+  let mut verdict = Verdict::new("clients cut off mid-merge");
+  let green = value_of(&run_ready(&owner, &["green", "cut-merge"]), "id");
+  let base = green_head(&owner, &green).unwrap_or(0);
+  let mut told: Vec<(usize, u64)> = Vec::new();
+  for round in 0..=ROUNDS {
+    let work = value_of(
+      &run_ready(&owner, &["work", &green, &format!("cut-{round}")]),
+      "id",
+    );
+    let text = format!("submitted in round {round}");
+    run_ready(
+      &owner,
+      &["edit", &work, &format!("/merge-{round}"), "0", "0", &text],
+    );
+    let mut submit = slates()
+      .arg("--instance")
+      .arg(&owner)
+      .args(["submit", &work])
+      .stdout(Stdio::piped())
+      .stderr(Stdio::null())
+      .spawn()
+      .unwrap();
+    // The last round's client lives; the others are killed 0, 2, 4 or 6 ms in.
+    if round < ROUNDS {
+      sleep(Duration::from_millis(2 * u64::try_from(round % 4).unwrap()));
+      let _ = submit.kill();
+    }
+    let output = submit.wait_with_output().unwrap();
+    if let Some(version) = String::from_utf8_lossy(&output.stdout)
+      .lines()
+      .find_map(|line| line.strip_prefix("accepted: "))
+      .and_then(|version| version.trim().parse::<u64>().ok())
+    {
+      told.push((round, version));
+    }
+  }
+  verdict.note(format!("told (round, version): {told:?}"));
+  verdict.check(
+    "the living client was told its version",
+    if told.iter().any(|(round, _)| *round == ROUNDS) {
+      Vec::new()
+    } else {
+      vec!["the last submit, whose client lived, was not told a version".to_owned()]
+    },
+  );
+  // The chain settles: a cut submit's acceptance may still be committing.
+  sleep(Duration::from_secs(2));
+  let head = green_head(&owner, &green).unwrap_or(0);
+  let files = green_files(&owner, &green, ROUNDS + 1);
+  let present = files.values().filter(|present| **present).count();
+  verdict.note(format!(
+    "head {head} from base {base}; files present {present} of {}",
+    ROUNDS + 1
+  ));
+  verdict.check(
+    "every told version is in the chain with its file",
+    told
+      .iter()
+      .filter(|(round, version)| *version > head || !files.get(round).copied().unwrap_or(false))
+      .map(|(round, version)| {
+        format!(
+          "round {round} told {version}, head {head}, file {:?}",
+          files.get(round)
+        )
+      })
+      .collect(),
+  );
+  verdict.check(
+    "each version has its edit and each edit its version",
+    if u64::try_from(present).unwrap() == head.saturating_sub(base) {
+      Vec::new()
+    } else {
+      vec![format!(
+        "head {head} - base {base} versions, {present} files"
+      )]
+    },
+  );
+  fleet.kill_node(owner_index);
+  let deadline = Instant::now() + FLEET_WAIT;
+  let taken = loop {
+    let served = candidates
+      .iter()
+      .find(|candidate| green_head(candidate, &green) == Some(head));
+    if served.is_some() || Instant::now() >= deadline {
+      break served.cloned();
+    }
+    pause();
+  };
+  match taken {
+    Some(successor) => {
+      let after = green_files(&successor, &green, ROUNDS + 1);
+      verdict.note(format!("taken over by {successor} at head {head}"));
+      verdict.check(
+        "the successor serves the same files (NoLoss, Agreement)",
+        if after == files {
+          Vec::new()
+        } else {
+          vec![format!("owner {files:?}, successor {after:?}")]
+        },
+      );
+    }
+    None => verdict.check(
+      "a survivor serves the green at its head",
+      vec![format!(
+        "none within the fleet wait: {:?}",
+        candidates
+          .iter()
+          .map(|candidate| (candidate.clone(), green_head(candidate, &green)))
+          .collect::<Vec<_>>()
+      )],
     ),
   }
   drop(fleet);
