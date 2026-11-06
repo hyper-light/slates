@@ -136,6 +136,7 @@ lacks, giving its line (`xtask/src/named_tests.rs`). After a named test moves,
 - `an_oci_container_consumes_the_host_attachment_through_the_runtime_bind`: `crates/cli/tests/cli.rs`
 - `slates_shards_hands_a_program_a_working_handle_and_the_attachment_ends_with_it`: `crates/cli/tests/shards.rs`
 - `the_anchor_and_its_daemon_exclude_themselves_from_core_dumps`: `crates/cli/tests/cli.rs`
+- `the_launcher_binds_a_volume_or_names_the_host_setting_that_forbids_it`: `crates/cli/tests/cli.rs`
 - `the_launcher_refuses_a_path_it_would_have_to_create_and_leaves_the_host_untouched`: `crates/cli/tests/cli.rs`
 - `the_typed_verbs_drive_the_lifecycle_and_refusals_are_typed`: `crates/client/tests/client.rs`
 - Shards' `a_microvm_maps_a_slates_file_with_dax_and_each_side_sees_the_others_writes`: another project's test, not looked for
