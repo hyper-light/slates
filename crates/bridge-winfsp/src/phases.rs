@@ -40,8 +40,11 @@ pub(crate) const SERVE: usize = 13;
 pub(crate) const TO_ANSWER: usize = 14;
 /// Our interface callback alone, from its entry to its return (the DLL's op function calls it).
 pub(crate) const INTERFACE: usize = 15;
+/// From this thread's last interface callback's return to this one's entry: inside one request, the DLL's op function
+/// between our two callbacks (the access check between the security lookup and the open).
+pub(crate) const BETWEEN: usize = 16;
 /// Shape: the phases above.
-const PHASES: usize = 16;
+const PHASES: usize = 17;
 /// Format: each phase's printed name, in order.
 const NAMES: [&str; PHASES] = [
   "stamp",
@@ -60,6 +63,7 @@ const NAMES: [&str; PHASES] = [
   "serve",
   "to_answer",
   "interface",
+  "between",
 ];
 /// Format: the first operation slot; the receiver's slot for a request of no kind is one below it.
 pub(crate) const OP_BASE: usize = 32;
@@ -95,18 +99,28 @@ pub(crate) struct Timer {
   start: u64,
 }
 
+thread_local! {
+  /// When this thread's last interface callback returned.
+  static LAST_EXIT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl Timer {
   pub(crate) fn start(callback: usize) -> Self {
-    Self {
-      slot: CALLBACK_BASE + callback,
-      start: now(),
+    let slot = CALLBACK_BASE + callback;
+    let start = now();
+    let last = LAST_EXIT.replace(0);
+    if last != 0 {
+      record(slot, BETWEEN, last, start);
     }
+    Self { slot, start }
   }
 }
 
 impl Drop for Timer {
   fn drop(&mut self) {
-    record(self.slot, INTERFACE, self.start, now());
+    let end = now();
+    record(self.slot, INTERFACE, self.start, end);
+    LAST_EXIT.set(end);
   }
 }
 /// Shape: 100 ns buckets below 20 µs, 1 µs buckets below 200 µs, 25 µs buckets below 5 ms, and one above.
