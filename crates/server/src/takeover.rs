@@ -52,6 +52,9 @@ pub(crate) const TAKEOVER_STREAM: u64 = 16;
 /// request, a request whose asker is not the session's peer, or one naming a host this holder has no kept
 /// retirement for. Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 const TAKEOVER_REFUSED: &str = "fleet.takeover.refused";
+/// The status count of takeover pages and adopted records a holder refused `ConfigurationStale`, each of which made this
+/// node fetch the committed configuration. Format: a refusal name in the daemon's status report.
+const TAKEOVER_STALE_CONFIGURATION: &str = "fleet.takeover.stale_configuration";
 /// The status count of takeover rounds refused because no epoch could supersede what they must fence — a
 /// holder's fence or a held record at `u64::MAX` (AUD-29-26's sibling): the round never reuses an epoch.
 const TAKEOVER_EPOCH_EXHAUSTED: &str = "fleet.takeover.epoch_exhausted";
@@ -623,7 +626,13 @@ async fn ask_pages(
   let (replied, stragglers) = broadcast(outgoing, TAKEOVER_STREAM, Priority::Control, budget).await;
   let mut recovered = Vec::with_capacity(replied.len());
   let mut answers = Vec::new();
+  let mut stale = None;
   for (host, reply, endpoint) in replied {
+    if let Some(slates_db::register::Refusal::ConfigurationStale { version }) =
+      slates_db::register::decode_refusal(&reply.bytes)
+    {
+      stale = stale.max(Some(version));
+    }
     if let Ok(promise) = HostPromise::decode(&reply.bytes)
       && promise.holder == host
       && wanted
@@ -636,7 +645,18 @@ async fn ask_pages(
   }
   let dispatch = Dispatch::new(sent, &recovered, stragglers, LateReplies::Discard);
   return_sessions(recovered);
-  state::with_state(|s| fold_answers(s, departed, answers));
+  state::with_state(|s| {
+    // A holder on a newer configuration refused the page `ConfigurationStale` (`serve_host_prepare`): this node is
+    // behind, so it fetches the committed configuration next period and its round starts over under it, as a
+    // record's sender does (`fleet::ship_head`). Dropped before 2026-11-05, a learner successor one version behind,
+    // whose own membership view matched its configuration and so gave it no cause to fetch, asked every period and
+    // was refused every period (2026-11-05, the forming-fleet takeover flows in `crates/cli/tests/live_fleet.rs`).
+    if stale.is_some_and(|version| version > s.council.configuration().version) {
+      s.config_refresh_wanted = true;
+      s.count(TAKEOVER_STALE_CONFIGURATION, 1);
+    }
+    fold_answers(s, departed, answers);
+  });
   Some(dispatch)
 }
 
@@ -829,6 +849,19 @@ async fn adopt(
     budget,
   )
   .await;
+  // A holder on a newer configuration refused the adopted record `ConfigurationStale`: this node fetches the committed
+  // configuration next period and adopts under it, as an owner shipping a head does (`fleet::ship_head`). Dropped before
+  // 2026-11-05, a learner successor one version behind the council's sole voter had its adoption refused every period
+  // and never fetched, since its membership view matched its configuration (`NotPlaced` each period, the volume never
+  // served; `a_live_volume_made_while_its_successor_was_stopped_is_served_by_it` under the forming-fleet soak).
+  if let Some(version) = committed.stale_version {
+    let _ = state::with_state(|s| {
+      if version > s.council.configuration().version {
+        s.config_refresh_wanted = true;
+        s.count(TAKEOVER_STALE_CONFIGURATION, 1);
+      }
+    });
+  }
   let dispatch = Dispatch::new(
     taken,
     &committed.reusable,

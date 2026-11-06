@@ -1,5 +1,36 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A forming fleet lost its takeovers (live-fixes, 2026-11-05, A-200 and §4.8; three fixed, for raft).** raft's soak
+> found that a fleet acting before it settled could leave a killed owner's volume unserved; the tests were made to wait
+> (d91464cf) and the product stayed unfixed. Bootstrapping three real processes and acting at once found three defects,
+> each fixed with a failing test first (bug record `docs/bugs/2026-11-05-a-forming-fleet-lost-its-takeovers.md`):
+> - **Fixed: the council sat at two voters**, which can lose neither, so an owner killed then left both survivors at
+>   term 1 with no takeover. The council now grows only by steps that raise the failures it tolerates, unless the step
+>   seats every member, and a member that cannot catch up is passed over for a free seat
+>   (`slates_cluster::config_group::widening`, `RegionalCouncil::passed_over`). The first form of the rule failed 7 of
+>   89 fleet-suite tests that the base passed; corrected, those seven pass 7 of 7 (59 s against the base's 57 s). `an_owner_killed_while_its_fleet_still_forms_is_taken_over` was red 1 of
+>   1 (two voters at the kill, no leader for 40 s) and is green in every run that started (macOS, load 45 to 96).
+> - **Fixed: a live log sealed before a candidate's pair carried no key for it**, and that candidate as successor
+>   refused the rebuild without end. A live write is now durable only once the log's last whole entry covers every
+>   candidate, and the owner checkpoints again once the missing pairs are delivered (`live_ship::covers_candidates`).
+>   `a_live_volume_made_while_its_successor_was_stopped_is_served_by_it` was red 3 of 3 with the check forced off and is
+>   green 12 of 12. A candidate stopped before its pairs came now holds live writes back until it returns or is retired,
+>   as it already held a sealed head back.
+> - **Fixed: a takeover dropped `ConfigurationStale`**, so a learner successor one version behind never fetched and
+>   never served (`takeover::ask_pages`, `takeover::adopt`; counted `fleet.takeover.stale_configuration`). Red 1 of 8
+>   with the edits off, green 8 of 8.
+> - The live fleet suite's settled wait now also waits for every node's pair keys (`fleet.seal.pair_served`).
+> - **Open: a killed owner was never condemned** in one forming-fleet run: both survivors' detectors held it with one
+>   suspicion and no condemnation for 40 s (`configured=false`, `CorrelationUnmeasured`). About 1 run in 20.
+> - **Open: a live dispatch's replies are dropped with its whole task** (`live_ship::send_from_control` returns its
+>   replies only at the end, bounded by twice one session wait, while each message to a holder whose session is out on
+>   loan waits a whole session wait). Seen once: the owner at `durable=0` while the other candidate held every entry
+>   (`fleet.live.held` 237; owner `fleet.live.no_session` 447). A per-holder rewrite was reverted: no test could show it
+>   red, so the mechanism is not confirmed.
+> - **Not reproduced: raft's other two formation findings** (an owner with no session to its only reachable candidate
+>   for 249 tries; a candidate refusing `no_catalog` for good). Eight full live fleet suites with the settled wait
+>   removed, with these fixes: no such stall; each first `no_catalog` refusal was followed by holding.
+
 > **The anchor kills live daemons on a busy machine (found 2026-11-06, audit step 7; open, to be assigned).** Under the
 > A/B bar's load, two spinners a logical CPU (8 on CI's 4-CPU Windows runners), the anchor killed daemons that were
 > alive and serving because their heartbeat lapsed its 1,000 ms liveness budget. A busy machine is the normal case

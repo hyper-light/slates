@@ -145,6 +145,10 @@ pub(crate) struct LiveVolume {
   owes_whole: bool,
   /// The last whole entry's payload, and its head: what an install sends.
   whole: Option<(Head, Vec<u8>)>,
+  /// The anchors whose copy of the volume's lineage key the last whole entry carries (`None`: its body is in the
+  /// clear, which any successor opens): a successor opens the log only through its own key entry there, so the log
+  /// is durable only once that entry covers every remote candidate ([`covers_candidates`]).
+  whole_anchors: Option<Vec<u64>>,
   /// The later epoch a holder answered with: this owner was superseded (a takeover placed the volume elsewhere), ships
   /// no more of it, and refuses every write waiting on it or made after (`Refusal::StaleEpoch`). Kept, not dropped with
   /// the shipper: dropped, the writes waiting on it were never answered (the resumed old owner held one for the fence
@@ -262,11 +266,7 @@ pub(crate) fn durability(
   }
   let durable = head_placed(state, volume.bytes)
     && state.live.shipping.get(&volume.bytes).is_none_or(|live| {
-      !live.owes_whole
-        && live
-          .shipper
-          .durable()
-          .is_some_and(|durable| durable >= target)
+      !live.owes_whole && answerable(state, volume.bytes).is_some_and(|durable| durable >= target)
     });
   if durable {
     return Durability::Durable;
@@ -393,8 +393,7 @@ pub(crate) fn durable_target(
   } else {
     head?
   };
-  let durable = live.shipper.durable();
-  if !live.owes_whole && durable.is_some_and(|durable| durable >= target) {
+  if !live.owes_whole && answerable(state, volume.bytes).is_some_and(|durable| durable >= target) {
     return None;
   }
   Some(target)
@@ -475,15 +474,7 @@ pub(crate) fn join(
 /// submit is (`merge_service::resolve_accepted`).
 pub(crate) fn resolve(state: &mut ShardState, volume: [u8; 16]) {
   wake_parked(state, volume);
-  if !head_placed(state, volume) {
-    return;
-  }
-  let Some(durable) = state
-    .live
-    .shipping
-    .get(&volume)
-    .and_then(|live| live.shipper.durable())
-  else {
+  let Some(durable) = answerable(state, volume) else {
     return;
   };
   let keys: Vec<([u8; 16], u64)> = state
@@ -658,6 +649,7 @@ pub(crate) fn published(
       ),
       owes_whole: true,
       whole: None,
+      whole_anchors: None,
       fenced: None,
     });
   let whole = live.owes_whole || record.is_none();
@@ -670,7 +662,7 @@ pub(crate) fn published(
     refuse(state, id);
     return;
   };
-  let Some(payload) = payload(state, id, whole, record) else {
+  let Some((payload, anchors)) = payload(state, id, whole, record) else {
     refuse(state, id);
     return;
   };
@@ -690,6 +682,7 @@ pub(crate) fn published(
         let head = entry.head();
         live.shipper.mark_checkpoint(head);
         live.whole = Some((head, payload));
+        live.whole_anchors = anchors;
       }
       state.count(LIVE_APPENDED, 1);
       resolve(state, id.bytes);
@@ -722,20 +715,21 @@ fn whole_record(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> Opt
 }
 
 /// The entry payload of `record`: its kind and body byte, then the body (the record and its content runs), sealed
-/// under the volume's lineage key where this node seals.
+/// under the volume's lineage key where this node seals; and, for a sealed whole entry, the anchors its copies of the
+/// lineage key are wrapped for (`None` for a clear body).
 fn payload(
   state: &mut ShardState,
   id: slates_db::catalog::VolumeId,
   whole: bool,
   record: Vec<u8>,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, Option<Vec<u64>>)> {
   let runs = content_runs(state, id, &record)?;
   let body = LivePublication { record, runs }.to_bytes();
   let kind = if whole { KIND_WHOLE } else { KIND_DELTA };
   if state.seal_root.is_none() {
     let mut payload = vec![kind, BODY_CLEAR];
     payload.extend_from_slice(&body);
-    return Some(payload);
+    return Some((payload, None));
   }
   let account = crate::seal_keys::tenant_of(&state.db.partition().volume(id)?.owner);
   let lineage = crate::seal_keys::lineage(state, id, account).ok()?;
@@ -749,6 +743,9 @@ fn payload(
   } else {
     None
   };
+  let anchors = sealing.as_ref().map_or_else(Vec::new, |sealing| {
+    sealing.keys.iter().map(|key| key.anchor).collect()
+  });
   let mut payload = vec![kind, BODY_SEALED];
   payload.extend_from_slice(
     &SealedBody {
@@ -758,7 +755,64 @@ fn payload(
     }
     .to_bytes(),
   );
-  Some(payload)
+  Some((payload, Some(anchors)))
+}
+
+/// Whether a successor among `volume`'s remote candidates (those still in the neighbourhood) can open its log: its
+/// last whole entry is in the clear, or carries a copy of the lineage key for each one's anchor (A-92 piece 4c), as a
+/// sealed head must before it ships (`fleet::sealing_covers`). Every candidate at once, since any may succeed. A whole
+/// entry sealed before a candidate's pair was delivered (the candidate stopped as the volume was made) carried none for
+/// it, and that candidate, the successor, refused the rebuild 145 times and never served the volume (2026-11-05;
+/// `a_live_volume_made_while_its_successor_was_stopped_is_served_by_it` in `crates/cli/tests/live_fleet.rs`).
+fn covers_candidates(state: &ShardState, volume: [u8; 16]) -> bool {
+  let Some(live) = state.live.shipping.get(&volume) else {
+    return true;
+  };
+  let Some(anchors) = &live.whole_anchors else {
+    return live.whole.is_some();
+  };
+  remote_candidates(state, volume).all(|candidate| {
+    state
+      .member_anchors
+      .get(&candidate)
+      .is_some_and(|anchor| anchors.contains(anchor))
+  })
+}
+
+/// `volume`'s candidates other than this node that are still in its neighbourhood.
+fn remote_candidates(state: &ShardState, volume: [u8; 16]) -> impl Iterator<Item = HostId> + '_ {
+  let configuration = state.fleet.configuration();
+  let local = configuration.owner;
+  configuration
+    .place(ObjectId(volume))
+    .candidates
+    .into_iter()
+    .filter(move |candidate| *candidate != local && configuration.neighbourhood.contains(candidate))
+}
+
+/// Whether a whole entry made now would cover every remote candidate that the last one does not: this shard has
+/// delivered its pair to each one's anchor (`seal_keys::head_sealing` wraps the key for exactly those). The period
+/// then owes one ([`period`]), so the log is checkpointed again once the pairs are there.
+fn coverable_now(state: &ShardState, volume: [u8; 16]) -> bool {
+  remote_candidates(state, volume).all(|candidate| {
+    state
+      .member_anchors
+      .get(&candidate)
+      .is_some_and(|anchor| state.pairs_delivered.contains(anchor))
+  })
+}
+
+/// The position up to which `volume`'s log is durable for its writers here: the shipper's durable position, once the
+/// fleet knows the volume ([`head_placed`]) and a successor could open the log at it ([`covers_candidates`]: the last
+/// whole entry covers every candidate, and is itself durable). `None` until then.
+fn answerable(state: &ShardState, volume: [u8; 16]) -> Option<u64> {
+  let live = state.live.shipping.get(&volume)?;
+  let durable = live.shipper.durable()?;
+  if !head_placed(state, volume) || !covers_candidates(state, volume) {
+    return None;
+  }
+  let whole = live.whole.as_ref().map(|(head, _)| head.position)?;
+  (durable >= whole).then_some(durable)
 }
 
 /// The content of every extent `record`'s inode images name, read through the volume (sealed chunks open into the
@@ -1089,6 +1143,14 @@ pub(crate) async fn period(origin: u16, shard: u16) {
       // A volume that owes a whole record ships one once its credit allows: a burst that outran the credit left its
       // last writes unshipped until another write came, and none might (three of five writes, `live_fleet`).
       for volume in &volumes {
+        // A log whose last whole entry no successor among the candidates could open is checkpointed again once this
+        // shard has delivered the pairs that would let it ([`covers_candidates`]).
+        if !covers_candidates(s, *volume)
+          && coverable_now(s, *volume)
+          && let Some(live) = s.live.shipping.get_mut(volume)
+        {
+          live.owes_whole = true;
+        }
         if owes_whole_within_credit(s, *volume) {
           published(s, slates_db::catalog::VolumeId { bytes: *volume }, None);
         }

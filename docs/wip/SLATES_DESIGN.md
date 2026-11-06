@@ -4927,6 +4927,16 @@ reconnaissance because the touched partitions are named up front).
 > committed in the first round after losing a voter instead of after 21. The safety explorer now explores
 > membership changes, including a removed leader stepping down (§4.2.2), with no violation at full scale.
 > The groups' `voters()` is the voter set; `replication_targets()` is what the drive replicates to.
+>
+> **A council widens only by steps that raise what it tolerates (2026-11-05).** `n` voters tolerate `⌊(n − 1) / 2⌋`
+> failures, so a step that only adds voters, and leaves a member unseated, is taken only when that number rises: to an
+> odd count, dropping its highest added id, or not at all (`config_group::widening`, applied to the full target and to
+> the partial promotion of the members caught up). A step that seats every member is taken as proposed (a two-member
+> region keeps two copies of its log for quorum-loss recovery), and so is one that removes a voter. A member whose
+> staging stalls is passed over for a free seat, so another alive member is staged in its place. Before, a council formed by its first node went
+> to two voters whenever its third member caught up late, and two voters can lose neither: an owner killed then was
+> never taken over (bug record `docs/bugs/2026-11-05-a-forming-fleet-lost-its-takeovers.md`). The root group is
+> unchanged; its voters are region representatives.
 
 > **Priority elections (2026-09-28; `docs/wip/research/consensus-enhancements.md`, slice 7).** A voter's
 > election priority is its measured quorum round trip: the `⌊n/2⌋`-th smallest smoothed round trip to the
@@ -5784,6 +5794,15 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > candidate's). Before, the successor counted itself only when it held a copy (a takeover could wait for its quorum for
 > good), and a remote candidate's empty report raised no fence, which the nemesis model shows breaks StaleNeverCommits
 > (10 seeds; bug record `docs/bugs/2026-11-05-a-live-takeover-counted-no-empty-report-and-fenced-no-empty-copy.md`).
+>
+> **A live log is durable only once every candidate could open it (2026-11-05, A-92 piece 4c).** A successor opens the
+> log through its own copy of the lineage key in the last whole entry, so a write is answered only once that entry
+> carries a key for every remote candidate in the neighbourhood and is itself durable (`live_ship::answerable`); a log
+> whose whole entry lacks one is checkpointed again once the owner's shard has delivered the missing pair. A sealed head
+> waits for the same coverage (`fleet::sealing_covers`). Before, a volume made while a candidate was stopped kept a whole
+> entry with no key for it, and that candidate, the successor, never served the volume. A takeover also acts on a
+> holder's `ConfigurationStale` now (pages and the adopted record), so a learner successor one version behind fetches
+> the configuration rather than asking under it for good (same bug record).
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
