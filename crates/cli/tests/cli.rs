@@ -11147,7 +11147,7 @@ fn a_base_on_one_of_the_daemons_own_mounts_is_refused_before_any_open() {
   };
   fuse_mount_and_check(&instance, &id, &mount.path);
   let base = format!("{}/project", mount.path);
-  std::fs::create_dir(&base).unwrap();
+  shell(&format!("mkdir {base}"));
   let created = [
     "volume",
     "create",
@@ -11200,7 +11200,7 @@ fn a_landing_target_on_one_of_the_daemons_own_mounts_is_refused_before_any_open(
   };
   fuse_mount_and_check(&instance, &mounted, &mount.path);
   let target = format!("{}/target", mount.path);
-  std::fs::create_dir(&target).unwrap();
+  shell(&format!("mkdir {target}"));
   let landing = ["land", &landed, &target, "--json"];
   let Some((code, out, err)) = run_within(&instance, &landing, OWN_MOUNT_ANSWER) else {
     panic!(
@@ -11249,7 +11249,7 @@ fn a_fuse_mount_point_on_one_of_the_daemons_own_mounts_is_refused_before_any_ope
   };
   fuse_mount_and_check(&instance, &outer, &mount.path);
   let point = format!("{}/nested", mount.path);
-  std::fs::create_dir(&point).unwrap();
+  shell(&format!("mkdir {point}"));
   let nested = ["mount", &inner, &point];
   let Some((code, out, err)) = run_within(&instance, &nested, OWN_MOUNT_ANSWER) else {
     panic!(
