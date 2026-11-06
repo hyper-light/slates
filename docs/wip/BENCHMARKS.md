@@ -9800,8 +9800,8 @@ killed a starting daemon (never beat) and lapsed running ones (2 and 1). The bra
 anchor killed 5 starting daemons, some before they logged "serving"; in the other it lapsed 5. So at this load the
 anchor's fixed 1 s budgets kill daemons on main too, before any recovery. The comparison of restart cost did not
 complete.
-A pin over about 1 s answering `Stalled` is main's client behaviour: on `agents/loadtest-scale-1` (`9c7442d9`, not yet
-pushed to main) Pin is a deferred reply sliced on its owner shard (loadtest-scale).
+A pin over about 1 s answering `Stalled` is main's client behaviour. loadtest-scale is making Pin a deferred reply
+sliced on its owner shard, to land on `agents/loadtest-scale-1` as its own commit (not yet committed on 2026-11-06).
 
 ### What a successful open costs under each serving pattern: arm64's remainder is the DLL's second waiting thread (2026-11-05)
 
