@@ -1,0 +1,580 @@
+runner windows-latest, 4 CPUs, Fri Nov  6 05:59:49 UTC 2026
+test wake::tests::rounds_in_two_modes_disagree_and_rounds_of_one_do_not ... ok
+test wake::tests::the_estimate_window_follows_the_probes_spread ... ok
+test wake::tests::the_online_estimate_tracks_the_mean_without_rounding_drift ... ok
+test wake::tests::the_pairs_follow_the_runtimes_shard_placement ... ok
+test wake::tests::a_probe_that_measured_no_wake_refuses_rather_than_report_a_mean ... ok
+test wake::tests::a_budget_too_short_for_its_rounds_extends_to_the_full_probe_budget ... ok
+test wake::tests::a_wake_is_a_confirmed_sleepers_wake_on_the_production_placement ... FAILED
+thread 'wake::tests::a_wake_is_a_confirmed_sleepers_wake_on_the_production_placement' (5340) panicked at crates\machine\src\wake.rs:847:7:
+WakeLatency { mean_ns: 769, mean_lower_ns: 571, mean_upper_ns: 994, p50_ns: 200, p99_ns: 13700, sd_ns: 3524, samples: 1026, same_cpu_samples: 0, rounds: 5, rounds_agree: Some(true), placement: Pinned, asleep_confirmed: false, quick: true }
+test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 51 filtered out; finished in 0.51s
+test attribution::tests::the_tracker_arms_on_an_unattributed_poll_and_disarms_after_a_quiet_busy_period ... ok
+test attribution::tests::a_wait_closes_the_window_and_the_runtimes_yield_marks_it_blocked ... ok
+test attribution::tests::a_window_attributes_a_long_poll_by_the_bounds_on_its_cpu ... ok
+test attribution::tests::a_thread_that_blocked_reads_a_higher_switch_count_where_shards_judge_their_wakes_by_it ... FAILED
+thread 'attribution::tests::a_thread_that_blocked_reads_a_higher_switch_count_where_shards_judge_their_wakes_by_it' (4052) panicked at crates\rt\src\attribution.rs:453:5:
+None → None
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 38 filtered out; finished in 0.00s
+== tests red exit 101
+[1m[92m     Running[0m unittests src\lib.rs (../target-fix\debug\deps\slates_machine-ae11c98cfa1c7110.exe)
+test profile::tests::a_profile_whose_wake_was_not_measured_is_refused ... ok
+test profile::tests::a_refused_wake_re_measure_keeps_the_measured_wake ... ok
+test switches::tests::a_blocked_thread_switched_and_a_running_one_did_not ... ok
+test wake::tests::a_budget_too_short_for_its_rounds_extends_to_the_full_probe_budget ... ok
+test wake::tests::a_count_stands_still_only_when_both_reads_agree ... ok
+test wake::tests::a_parked_threads_cycle_count_stands_still_and_a_spinning_ones_moves ... ok
+test wake::tests::a_probe_that_measured_no_wake_refuses_rather_than_report_a_mean ... ok
+test wake::tests::rounds_in_two_modes_disagree_and_rounds_of_one_do_not ... ok
+test wake::tests::the_estimate_window_follows_the_probes_spread ... ok
+test wake::tests::the_online_estimate_tracks_the_mean_without_rounding_drift ... ok
+test wake::tests::the_pairs_follow_the_runtimes_shard_placement ... ok
+test wake::tests::a_wake_is_a_confirmed_sleepers_wake_on_the_production_placement ... ok
+test result: ok. 61 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.21s
+[1m[92m     Running[0m unittests src\lib.rs (../target-fix\debug\deps\slates_rt-25be29f55163e8d9.exe)
+test attribution::tests::the_tracker_arms_on_an_unattributed_poll_and_disarms_after_a_quiet_busy_period ... ok
+test attribution::tests::a_wait_closes_the_window_and_the_runtimes_yield_marks_it_blocked ... ok
+test attribution::tests::a_window_attributes_a_long_poll_by_the_bounds_on_its_cpu ... ok
+test attribution::tests::a_thread_that_blocked_reads_a_higher_switch_count_where_shards_judge_their_wakes_by_it ... ok
+test parking::tests::a_wake_is_measured_only_from_the_kick_that_ended_this_park ... ok
+test queue::tests::a_wake_during_a_drain_lands_in_the_next_batch ... ok
+test registry::tests::a_wake_from_a_foreign_thread_lands_in_the_target_ring ... ok
+test registry::tests::a_wake_to_an_exited_holders_full_ring_is_counted_stale_not_spun_on ... ok
+test runtime::wake_ring_tests::a_derived_one_slot_wake_ring_is_raised_to_the_smallest_the_ring_admits ... ok
+test driver::tests::the_os_driver_wakes_on_a_kick_and_delivers_a_nop ... ok
+test waker::tests::a_waker_carries_its_word_and_clones_for_free ... ok
+test pipe_state::tests::a_read_side_hands_out_exactly_what_its_reads_delivered_and_wakes_its_waiter ... ok
+test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s
+[1m[92m     Running[0m tests\admission.rs (../target-fix\debug\deps\admission-3b18582202dfc327.exe)
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[1m[92m     Running[0m tests\burst.rs (../target-fix\debug\deps\burst-414db453835b3589.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[1m[92m     Running[0m tests\cross_shard.rs (../target-fix\debug\deps\cross_shard-965884d214c4b70f.exe)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[1m[92m     Running[0m tests\differential.rs (../target-fix\debug\deps\differential-05244cee3524f569.exe)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+[1m[92m     Running[0m tests\foreign_wake.rs (../target-fix\debug\deps\foreign_wake-ce3dc98ee490e198.exe)
+test a_waker_fired_from_another_thread_wakes_the_task_it_was_made_for ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[1m[92m     Running[0m tests\idle_spin.rs (../target-fix\debug\deps\idle_spin-2ee1ab7627d273dc.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.82s
+[1m[92m     Running[0m tests\lifecycle.rs (../target-fix\debug\deps\lifecycle-b8425958628c2173.exe)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+[1m[92m     Running[0m tests\memory.rs (../target-fix\debug\deps\memory-e3762776c3358242.exe)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[1m[92m     Running[0m tests\overrun.rs (../target-fix\debug\deps\overrun-2431399c9e9173e3.exe)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s
+[1m[92m     Running[0m tests\ownership.rs (../target-fix\debug\deps\ownership-2a80322fc6331c32.exe)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[1m[92m     Running[0m tests\pipe.rs (../target-fix\debug\deps\pipe-4b06455cd7994921.exe)
+test a_disconnected_end_wakes_its_reader_with_the_end_of_the_stream ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+[1m[92m     Running[0m tests\placement.rs (../target-fix\debug\deps\placement-e7b467eebbc1836b.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[1m[92m     Running[0m tests\pollers.rs (../target-fix\debug\deps\pollers-f7a8a2c920b5a5a4.exe)
+test a_ring_during_the_idle_spin_wakes_a_consuming_poller ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+[1m[92m     Running[0m tests\readiness.rs (../target-fix\debug\deps\readiness-c354bf2a4f9258a2.exe)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+[1m[92m     Running[0m tests\reclaim.rs (../target-fix\debug\deps\reclaim-5b77f5233ac4e812.exe)
+test a_shard_slot_whose_wake_generations_are_spent_retires_and_is_not_reissued ... ok
+test a_wake_minted_for_a_dead_shard_is_refused_by_the_slots_new_holder ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+[1m[92m     Running[0m tests\registry_contention.rs (../target-fix\debug\deps\registry_contention-8e80dbea85efb15b.exe)
+test registrations_wakes_and_unregistrations_interleave_without_a_fault ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[1m[92m     Running[0m tests\sim_memory.rs (../target-fix\debug\deps\sim_memory-7a7205ecbb5152c7.exe)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[1m[92m     Running[0m tests\sim_path.rs (../target-fix\debug\deps\sim_path-88195cdb20b1428b.exe)
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+[1m[92m     Running[0m tests\tcp.rs (../target-fix\debug\deps\tcp-5436a9411f8e02a8.exe)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.01s
+[1m[92m     Running[0m tests\timer_allocations.rs (../target-fix\debug\deps\timer_allocations-9d42560ce43546fe.exe)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[1m[92m     Running[0m tests\timers.rs (../target-fix\debug\deps\timers-a39140b7ecc613b3.exe)
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[1m[92m     Running[0m tests\udp.rs (../target-fix\debug\deps\udp-233afc485d0c1cc0.exe)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+[1m[92m     Running[0m tests\wake_estimate.rs (../target-fix\debug\deps\wake_estimate-ee1dae34ee019215.exe)
+test a_tracking_shard_learns_its_wake_from_the_parks_its_kicks_ended ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+== tests fix exit 0
+c9457d02 diag only (A-223): main 00e5269c with the diag example, the bench's a223 lines and DIAG_SHARDS
+505de850 diag only (A-223): the cycle-only fix of diag-liveness-1 with the diag example and DIAG_SHARDS
+577fc62c diag only (A-223): the fix with the waiter's and the shards' switch counts, the wake_watch example and the bench's a223 lines; not for main
+== watch quiet main at 06:13:53 UTC
+iocp unpinned A announced: switched 2000 (p50 9200 p99 17300 mean 9651 ns), not switched 0 (p50 0 p99 0 mean 0 ns), cycles moved at post 0
+iocp unpinned B cycles-still: switched 2000 (p50 9200 p99 20200 mean 9728 ns), not switched 0 (p50 0 p99 0 mean 0 ns), cycles moved at post 0, gave up 0
+iocp unpinned: ReadThreadProfilingData 21 ns a read; wait-reason bits seen 0x8000
+iocp pinned waker 1 waiter 2 A announced: switched 2000 (p50 9100 p99 22800 mean 28789 ns), not switched 0 (p50 0 p99 0 mean 0 ns), cycles moved at post 0
+iocp pinned waker 1 waiter 2 B cycles-still: switched 2000 (p50 9100 p99 22800 mean 10249 ns), not switched 0 (p50 0 p99 0 mean 0 ns), cycles moved at post 0, gave up 0
+iocp pinned waker 1 waiter 2: ReadThreadProfilingData 14 ns a read; wait-reason bits seen 0x8000
+watch.spinner: 2414 of 100000 back-to-back read pairs stood still; 0 remote reads behind the thread's own; one read p50 6600 ns p99 9600 ns
+watch.parked: 0 of 2000 read pairs 100 us apart moved
+wake.probe 0: WakeLatency { mean_ns: 169, mean_lower_ns: 166, mean_upper_ns: 172, p50_ns: 200, p99_ns: 200, sd_ns: 409, samples: 73728, same_cpu_samples: 0, rounds: 5, rounds_agree: Some(false), placement: Pinned, asleep_confirmed: false, quick: false }
+wake.probe 1: WakeLatency { mean_ns: 152, mean_lower_ns: 149, mean_upper_ns: 156, p50_ns: 100, p99_ns: 200, sd_ns: 467, samples: 81920, same_cpu_samples: 0, rounds: 5, rounds_agree: Some(true), placement: Pinned, asleep_confirmed: false, quick: false }
+wake.probe 2: WakeLatency { mean_ns: 181, mean_lower_ns: 172, mean_upper_ns: 193, p50_ns: 200, p99_ns: 200, sd_ns: 1344, samples: 71128, same_cpu_samples: 0, rounds: 5, rounds_agree: Some(false), placement: Pinned, asleep_confirmed: false, quick: true }
+wake.probe 3: WakeLatency { mean_ns: 230, mean_lower_ns: 160, mean_upper_ns: 368, p50_ns: 100, p99_ns: 200, sd_ns: 18300, samples: 73728, same_cpu_samples: 0, rounds: 5, rounds_agree: Some(false), placement: Pinned, asleep_confirmed: false, quick: true }
+wake.probe 4: WakeLatency { mean_ns: 183, mean_lower_ns: 178, mean_upper_ns: 189, p50_ns: 200, p99_ns: 300, sd_ns: 759, samples: 72794, same_cpu_samples: 0, rounds: 5, rounds_agree: Some(false), placement: Pinned, asleep_confirmed: false, quick: false }
+== watch quiet main exit 0
+== watch quiet fix at 06:14:03 UTC
+iocp unpinned A announced: switched 2000 (p50 9200 p99 15400 mean 9535 ns), not switched 0 (p50 0 p99 0 mean 0 ns), cycles moved at post 0
+iocp unpinned B cycles-still: switched 2000 (p50 9200 p99 13400 mean 9505 ns), not switched 0 (p50 0 p99 0 mean 0 ns), cycles moved at post 0, gave up 0
+iocp unpinned: ReadThreadProfilingData 22 ns a read; wait-reason bits seen 0x8000
+iocp pinned waker 1 waiter 2 A announced: switched 2000 (p50 9200 p99 18700 mean 9926 ns), not switched 0 (p50 0 p99 0 mean 0 ns), cycles moved at post 0
+iocp pinned waker 1 waiter 2 B cycles-still: switched 2000 (p50 9200 p99 15500 mean 10202 ns), not switched 0 (p50 0 p99 0 mean 0 ns), cycles moved at post 0, gave up 0
+iocp pinned waker 1 waiter 2: ReadThreadProfilingData 16 ns a read; wait-reason bits seen 0x8000
+watch.spinner: 2360 of 100000 back-to-back read pairs stood still; 0 remote reads behind the thread's own; one read p50 6600 ns p99 9400 ns
+watch.parked: 0 of 2000 read pairs 100 us apart moved
+wake.probe 0: WakeLatency { mean_ns: 7286, mean_lower_ns: 7150, mean_upper_ns: 7462, p50_ns: 6700, p99_ns: 12900, sd_ns: 1997, samples: 608, same_cpu_samples: 0, rounds: 5, rounds_agree: Some(true), placement: Pinned, asleep_confirmed: true, woke_running: 1, quick: false }
+wake.probe 1: WakeLatency { mean_ns: 10181, mean_lower_ns: 9382, mean_upper_ns: 10998, p50_ns: 6800, p99_ns: 113500, sd_ns: 17201, samples: 1706, same_cpu_samples: 0, rounds: 5, rounds_agree: Some(true), placement: Pinned, asleep_confirmed: true, woke_running: 1, quick: true }
+wake.probe 2: WakeLatency { mean_ns: 14438, mean_lower_ns: 12588, mean_upper_ns: 16460, p50_ns: 6900, p99_ns: 138500, sd_ns: 35044, samples: 1264, same_cpu_samples: 0, rounds: 5, rounds_agree: Some(true), placement: Pinned, asleep_confirmed: true, woke_running: 3, quick: true }
+wake.probe 3: WakeLatency { mean_ns: 7227, mean_lower_ns: 7101, mean_upper_ns: 7361, p50_ns: 6800, p99_ns: 11400, sd_ns: 1465, samples: 432, same_cpu_samples: 0, rounds: 5, rounds_agree: Some(true), placement: Pinned, asleep_confirmed: true, woke_running: 1, quick: false }
+wake.probe 4: WakeLatency { mean_ns: 7233, mean_lower_ns: 7103, mean_upper_ns: 7388, p50_ns: 6800, p99_ns: 11700, sd_ns: 1578, samples: 480, same_cpu_samples: 0, rounds: 5, rounds_agree: Some(true), placement: Pinned, asleep_confirmed: true, woke_running: 0, quick: false }
+== watch quiet fix exit 0
+== watch busy main at 06:14:08 UTC
+iocp unpinned A announced: switched 2000 (p50 49451900 p99 65205100 mean 49445554 ns), not switched 0 (p50 0 p99 0 mean 0 ns), cycles moved at post 0
+iocp unpinned B cycles-still: switched 2000 (p50 49447400 p99 65177100 mean 49553735 ns), not switched 0 (p50 0 p99 0 mean 0 ns), cycles moved at post 0, gave up 0
+iocp unpinned: ReadThreadProfilingData 38 ns a read; wait-reason bits seen 0x80008000
+iocp pinned waker 1 waiter 2 A announced: switched 2000 (p50 31622400 p99 67189900 mean 30797792 ns), not switched 0 (p50 0 p99 0 mean 0 ns), cycles moved at post 0
+iocp pinned waker 1 waiter 2 B cycles-still: switched 2000 (p50 31621600 p99 74639400 mean 30984685 ns), not switched 0 (p50 0 p99 0 mean 0 ns), cycles moved at post 0, gave up 0
+iocp pinned waker 1 waiter 2: ReadThreadProfilingData 29 ns a read; wait-reason bits seen 0x80008000
+watch.spinner: 94374 of 100000 back-to-back read pairs stood still; 0 remote reads behind the thread's own; one read p50 300 ns p99 9200 ns
+watch.parked: 0 of 2000 read pairs 100 us apart moved
+wake.probe 0: WakeLatency { mean_ns: 2673, mean_lower_ns: 1960, mean_upper_ns: 3405, p50_ns: 200, p99_ns: 14100, sd_ns: 5170, samples: 191, same_cpu_samples: 0, rounds: 7, rounds_agree: None, placement: Pinned, asleep_confirmed: false, quick: true }
+wake.probe 1: WakeLatency { mean_ns: 1736, mean_lower_ns: 1364, mean_upper_ns: 2170, p50_ns: 200, p99_ns: 13200, sd_ns: 4256, samples: 476, same_cpu_samples: 0, rounds: 7, rounds_agree: None, placement: Pinned, asleep_confirmed: false, quick: true }
+wake.probe 2: WakeLatency { mean_ns: 1648, mean_lower_ns: 1298, mean_upper_ns: 1991, p50_ns: 200, p99_ns: 14100, sd_ns: 3976, samples: 438, same_cpu_samples: 0, rounds: 7, rounds_agree: None, placement: Pinned, asleep_confirmed: false, quick: true }
+wake.probe 3: WakeLatency { mean_ns: 1685, mean_lower_ns: 1344, mean_upper_ns: 2017, p50_ns: 200, p99_ns: 12400, sd_ns: 4075, samples: 536, same_cpu_samples: 0, rounds: 7, rounds_agree: None, placement: Pinned, asleep_confirmed: false, quick: true }
+wake.probe 4: WakeLatency { mean_ns: 1498, mean_lower_ns: 1201, mean_upper_ns: 1798, p50_ns: 200, p99_ns: 11800, sd_ns: 3524, samples: 590, same_cpu_samples: 0, rounds: 7, rounds_agree: None, placement: Pinned, asleep_confirmed: false, quick: true }
+== watch busy main exit 0
+== watch busy fix at 06:27:02 UTC
+iocp unpinned A announced: switched 2000 (p50 49398800 p99 65140700 mean 49495545 ns), not switched 0 (p50 0 p99 0 mean 0 ns), cycles moved at post 0
+iocp unpinned B cycles-still: switched 2000 (p50 49516200 p99 65066500 mean 49432403 ns), not switched 0 (p50 0 p99 0 mean 0 ns), cycles moved at post 0, gave up 0
+iocp unpinned: ReadThreadProfilingData 37 ns a read; wait-reason bits seen 0x80008000
+iocp pinned waker 1 waiter 2 A announced: switched 2000 (p50 31648300 p99 67547200 mean 32510674 ns), not switched 0 (p50 0 p99 0 mean 0 ns), cycles moved at post 0
+iocp pinned waker 1 waiter 2 B cycles-still: switched 2000 (p50 31673400 p99 69234300 mean 32784614 ns), not switched 0 (p50 0 p99 0 mean 0 ns), cycles moved at post 0, gave up 0
+iocp pinned waker 1 waiter 2: ReadThreadProfilingData 31 ns a read; wait-reason bits seen 0x80008000
+watch.spinner: 97721 of 100000 back-to-back read pairs stood still; 0 remote reads behind the thread's own; one read p50 300 ns p99 8300 ns
+watch.parked: 0 of 2000 read pairs 100 us apart moved
+wake.probe 0: WakeLatency { mean_ns: 11923, mean_lower_ns: 10876, mean_upper_ns: 13246, p50_ns: 10600, p99_ns: 22400, sd_ns: 3520, samples: 30, same_cpu_samples: 0, rounds: 7, rounds_agree: None, placement: Pinned, asleep_confirmed: true, woke_running: 1, quick: true }
+wake.probe 1: WakeLatency { mean_ns: 10875, mean_lower_ns: 10528, mean_upper_ns: 11390, p50_ns: 10500, p99_ns: 17400, sd_ns: 1776, samples: 64, same_cpu_samples: 0, rounds: 8, rounds_agree: None, placement: Pinned, asleep_confirmed: true, woke_running: 0, quick: false }
+wake.probe 2: WakeLatency { mean_ns: 11037, mean_lower_ns: 10656, mean_upper_ns: 11543, p50_ns: 10700, p99_ns: 11900, sd_ns: 975, samples: 16, same_cpu_samples: 0, rounds: 7, rounds_agree: None, placement: Pinned, asleep_confirmed: true, woke_running: 0, quick: false }
+wake.probe 3: WakeLatency { mean_ns: 10881, mean_lower_ns: 10534, mean_upper_ns: 11531, p50_ns: 10600, p99_ns: 11400, sd_ns: 1520, samples: 32, same_cpu_samples: 0, rounds: 7, rounds_agree: None, placement: Pinned, asleep_confirmed: true, woke_running: 0, quick: false }
+wake.probe 4: WakeLatency { mean_ns: 11800, mean_lower_ns: 10555, mean_upper_ns: 13460, p50_ns: 10400, p99_ns: 17900, sd_ns: 3321, samples: 20, same_cpu_samples: 0, rounds: 7, rounds_agree: None, placement: Pinned, asleep_confirmed: true, woke_running: 0, quick: true }
+== watch busy fix exit 0
+== bench quiet round 1: main at 06:40:14 UTC
+provisioning histogram: 2 shards, spin window 255 ns, floor 50000 ns
+a223.profile wake: WakeLatency { mean_ns: 255, mean_lower_ns: 210, mean_upper_ns: 337, p50_ns: 200, p99_ns: 300, sd_ns: 9494, samples: 56677, same_cpu_samples: 0, rounds: 5, rounds_agree: Some(false), placement: Pinned, asleep_confirmed: false, quick: true }; idle window at boot 25500 ns
+a223.rest: 5 thousandths of a core over 3009 ms with no client
+  provision.spinning_1 parks per 1000 creates: shard 0: 72 (wake 256 ns), shard 1: 39 (wake 255 ns)
+  provision.spinning_1_p50: 15300 ns [14900, 18900] over 3 runs: [14900, 18900, 15300]
+  provision.spinning_1_p99: 47900 ns [45800, 50200] over 3 runs: [45800, 47900, 50200]
+  provision.spinning_1_p999: 116200 ns [86000, 136300] over 3 runs: [136300, 86000, 116200]
+ac-2.1: 1 client spinning (4 cores, 2 shards), provisioning p99 47900 ns vs floor 50000 ns: ok
+  provision.spinning_8 parks per 1000 creates: shard 0: 49 (wake 265 ns), shard 1: 50 (wake 264 ns)
+  provision.spinning_8_p50: 157700 ns [156200, 159300] over 3 runs: [157700, 156200, 159300]
+  provision.spinning_8_p99: 495300 ns [495100, 513800] over 3 runs: [513800, 495300, 495100]
+  provision.spinning_8_p999: 3649100 ns [3616400, 3688700] over 3 runs: [3616400, 3649100, 3688700]
+ac-2.1: 8 clients oversubscribes 2 runnable core(s); p99 495300 ns reported, not gated here
+  provision.spinning_64 parks per 1000 creates: shard 0: 3 (wake 269 ns), shard 1: 1 (wake 266 ns)
+ac-2.1: 64 clients oversubscribes 2 runnable core(s); p99 5272100 ns reported, not gated here
+a223.paced: 35 thousandths of a core over 14048 ms of one client paced 1000 us (client included)
+  provision.parked_1 parks per 1000 creates: shard 0: 1886 (wake 273 ns), shard 1: 1462 (wake 277 ns)
+  provision.parked_1_p50: 123100 ns [118100, 131200] over 3 runs: [131200, 118100, 123100]
+  provision.parked_1_p99: 244900 ns [209100, 276600] over 3 runs: [244900, 276600, 209100]
+  provision.parked_1_p999: 734500 ns [722600, 858100] over 3 runs: [722600, 858100, 734500]
+ac-2.1: 1 client parked (paced 1000 µs), create p99 244900 ns: reported, not gated
+== bench quiet round 1: main exit 0
+== bench quiet round 1: cyc at 06:40:55 UTC
+provisioning histogram: 2 shards, spin window 7162 ns, floor 50000 ns
+a223.profile wake: WakeLatency { mean_ns: 7162, mean_lower_ns: 6998, mean_upper_ns: 7368, p50_ns: 6700, p99_ns: 13700, sd_ns: 1477, samples: 256, same_cpu_samples: 0, rounds: 5, rounds_agree: Some(true), placement: Pinned, asleep_confirmed: true, woke_running: 0, quick: false }; idle window at boot 716200 ns
+a223.rest: 0 thousandths of a core over 3000 ms with no client
+  provision.spinning_1 parks per 1000 creates: shard 0: 1 (wake 7467 ns), shard 1: 0 (wake 7634 ns)
+  provision.spinning_1_p50: 15700 ns [12900, 17400] over 3 runs: [17400, 12900, 15700]
+  provision.spinning_1_p99: 29100 ns [26500, 33900] over 3 runs: [33900, 26500, 29100]
+  provision.spinning_1_p999: 49800 ns [41400, 122800] over 3 runs: [122800, 41400, 49800]
+ac-2.1: 1 client spinning (4 cores, 2 shards), provisioning p99 29100 ns vs floor 50000 ns: ok
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 8045 ns), shard 1: 0 (wake 9083 ns)
+  provision.spinning_8_p50: 165900 ns [158900, 168900] over 3 runs: [168900, 165900, 158900]
+  provision.spinning_8_p99: 567700 ns [522300, 643700] over 3 runs: [643700, 567700, 522300]
+  provision.spinning_8_p999: 3626300 ns [3497700, 3650300] over 3 runs: [3497700, 3626300, 3650300]
+ac-2.1: 8 clients oversubscribes 2 runnable core(s); p99 567700 ns reported, not gated here
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 11631 ns), shard 1: 0 (wake 14735 ns)
+ac-2.1: 64 clients oversubscribes 2 runnable core(s); p99 5209400 ns reported, not gated here
+a223.paced: 201 thousandths of a core over 15573 ms of one client paced 1000 us (client included)
+  provision.parked_1 parks per 1000 creates: shard 0: 1411 (wake 12197 ns), shard 1: 1142 (wake 12719 ns)
+  provision.parked_1_p50: 129000 ns [123200, 140500] over 3 runs: [140500, 123200, 129000]
+  provision.parked_1_p99: 251700 ns [210800, 294100] over 3 runs: [294100, 210800, 251700]
+  provision.parked_1_p999: 802100 ns [762300, 881000] over 3 runs: [881000, 762300, 802100]
+ac-2.1: 1 client parked (paced 1000 µs), create p99 251700 ns: reported, not gated
+== bench quiet round 1: cyc exit 0
+== bench quiet round 1: fix at 06:41:35 UTC
+provisioning histogram: 2 shards, spin window 7260 ns, floor 50000 ns
+a223.profile wake: WakeLatency { mean_ns: 7260, mean_lower_ns: 7113, mean_upper_ns: 7429, p50_ns: 6800, p99_ns: 11000, sd_ns: 1025, samples: 176, same_cpu_samples: 0, rounds: 5, rounds_agree: Some(true), placement: Pinned, asleep_confirmed: true, woke_running: 0, quick: false }; idle window at boot 726000 ns
+a223.rest: 0 thousandths of a core over 3005 ms with no client
+  provision.spinning_1 parks per 1000 creates: shard 0: 1 (wake 7972 ns), shard 1: 0 (wake 8052 ns)
+  provision.spinning_1_p50: 16900 ns [12900, 17300] over 3 runs: [17300, 16900, 12900]
+  provision.spinning_1_p99: 37700 ns [28800, 38200] over 3 runs: [37700, 38200, 28800]
+  provision.spinning_1_p999: 74100 ns [50800, 117400] over 3 runs: [117400, 74100, 50800]
+ac-2.1: 1 client spinning (4 cores, 2 shards), provisioning p99 37700 ns vs floor 50000 ns: ok
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 9284 ns), shard 1: 0 (wake 9929 ns)
+  provision.spinning_8_p50: 161500 ns [160600, 163000] over 3 runs: [161500, 160600, 163000]
+  provision.spinning_8_p99: 516300 ns [497100, 545700] over 3 runs: [497100, 516300, 545700]
+  provision.spinning_8_p999: 3751900 ns [3681700, 3832400] over 3 runs: [3681700, 3751900, 3832400]
+ac-2.1: 8 clients oversubscribes 2 runnable core(s); p99 516300 ns reported, not gated here
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 14661 ns), shard 1: 0 (wake 16938 ns)
+ac-2.1: 64 clients oversubscribes 2 runnable core(s); p99 5530600 ns reported, not gated here
+a223.paced: 241 thousandths of a core over 16106 ms of one client paced 1000 us (client included)
+  provision.parked_1 parks per 1000 creates: shard 0: 1404 (wake 12760 ns), shard 1: 1138 (wake 12774 ns)
+  provision.parked_1_p50: 129600 ns [125800, 146600] over 3 runs: [146600, 125800, 129600]
+  provision.parked_1_p99: 436000 ns [332900, 729900] over 3 runs: [332900, 729900, 436000]
+  provision.parked_1_p999: 807500 ns [779900, 862800] over 3 runs: [779900, 807500, 862800]
+ac-2.1: 1 client parked (paced 1000 µs), create p99 436000 ns: reported, not gated
+== bench quiet round 1: fix exit 0
+== bench quiet round 2: main at 06:42:17 UTC
+provisioning histogram: 2 shards, spin window 149 ns, floor 50000 ns
+a223.profile wake: WakeLatency { mean_ns: 149, mean_lower_ns: 145, mean_upper_ns: 154, p50_ns: 100, p99_ns: 200, sd_ns: 549, samples: 61440, same_cpu_samples: 0, rounds: 5, rounds_agree: Some(true), placement: Pinned, asleep_confirmed: false, quick: false }; idle window at boot 14900 ns
+a223.rest: 0 thousandths of a core over 3000 ms with no client
+  provision.spinning_1 parks per 1000 creates: shard 0: 88 (wake 350 ns), shard 1: 56 (wake 290 ns)
+  provision.spinning_1_p50: 16100 ns [15500, 16800] over 3 runs: [15500, 16100, 16800]
+  provision.spinning_1_p99: 49300 ns [46000, 76700] over 3 runs: [76700, 49300, 46000]
+  provision.spinning_1_p999: 108100 ns [95800, 118700] over 3 runs: [108100, 95800, 118700]
+ac-2.1: 1 client spinning (4 cores, 2 shards), provisioning p99 49300 ns vs floor 50000 ns: ok
+  provision.spinning_8 parks per 1000 creates: shard 0: 18 (wake 755 ns), shard 1: 20 (wake 758 ns)
+  provision.spinning_8_p50: 159000 ns [158300, 159500] over 3 runs: [159000, 158300, 159500]
+  provision.spinning_8_p99: 495600 ns [495300, 500500] over 3 runs: [495300, 500500, 495600]
+  provision.spinning_8_p999: 3640900 ns [3607400, 3897500] over 3 runs: [3640900, 3897500, 3607400]
+ac-2.1: 8 clients oversubscribes 2 runnable core(s); p99 495600 ns reported, not gated here
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 891 ns), shard 1: 0 (wake 867 ns)
+ac-2.1: 64 clients oversubscribes 2 runnable core(s); p99 5340200 ns reported, not gated here
+a223.paced: 39 thousandths of a core over 14722 ms of one client paced 1000 us (client included)
+  provision.parked_1 parks per 1000 creates: shard 0: 1450 (wake 1088 ns), shard 1: 1166 (wake 947 ns)
+  provision.parked_1_p50: 130900 ns [122700, 131500] over 3 runs: [131500, 122700, 130900]
+  provision.parked_1_p99: 205900 ns [203500, 219700] over 3 runs: [205900, 219700, 203500]
+  provision.parked_1_p999: 825900 ns [767700, 1391900] over 3 runs: [767700, 1391900, 825900]
+ac-2.1: 1 client parked (paced 1000 µs), create p99 205900 ns: reported, not gated
+== bench quiet round 2: main exit 0
+== bench quiet round 2: cyc at 06:42:59 UTC
+provisioning histogram: 2 shards, spin window 7095 ns, floor 50000 ns
+a223.profile wake: WakeLatency { mean_ns: 7095, mean_lower_ns: 6936, mean_upper_ns: 7284, p50_ns: 6700, p99_ns: 10700, sd_ns: 1343, samples: 240, same_cpu_samples: 0, rounds: 5, rounds_agree: Some(true), placement: Pinned, asleep_confirmed: true, woke_running: 0, quick: false }; idle window at boot 709500 ns
+a223.rest: 0 thousandths of a core over 3000 ms with no client
+  provision.spinning_1 parks per 1000 creates: shard 0: 1 (wake 7663 ns), shard 1: 0 (wake 8087 ns)
+  provision.spinning_1_p50: 13700 ns [13400, 15300] over 3 runs: [13400, 13700, 15300]
+  provision.spinning_1_p99: 30800 ns [28800, 35200] over 3 runs: [28800, 30800, 35200]
+  provision.spinning_1_p999: 51700 ns [47800, 569200] over 3 runs: [569200, 47800, 51700]
+ac-2.1: 1 client spinning (4 cores, 2 shards), provisioning p99 30800 ns vs floor 50000 ns: ok
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 8722 ns), shard 1: 0 (wake 9822 ns)
+  provision.spinning_8_p50: 163500 ns [157900, 163600] over 3 runs: [157900, 163500, 163600]
+  provision.spinning_8_p99: 527900 ns [493400, 529200] over 3 runs: [493400, 527900, 529200]
+  provision.spinning_8_p999: 3676800 ns [3656000, 3809800] over 3 runs: [3676800, 3809800, 3656000]
+ac-2.1: 8 clients oversubscribes 2 runnable core(s); p99 527900 ns reported, not gated here
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 13951 ns), shard 1: 0 (wake 18640 ns)
+ac-2.1: 64 clients oversubscribes 2 runnable core(s); p99 5373700 ns reported, not gated here
+a223.paced: 242 thousandths of a core over 15869 ms of one client paced 1000 us (client included)
+  provision.parked_1 parks per 1000 creates: shard 0: 1380 (wake 12024 ns), shard 1: 1114 (wake 12768 ns)
+  provision.parked_1_p50: 132900 ns [127000, 138200] over 3 runs: [138200, 127000, 132900]
+  provision.parked_1_p99: 364300 ns [229800, 621000] over 3 runs: [229800, 621000, 364300]
+  provision.parked_1_p999: 751400 ns [717900, 785600] over 3 runs: [717900, 751400, 785600]
+ac-2.1: 1 client parked (paced 1000 µs), create p99 364300 ns: reported, not gated
+== bench quiet round 2: cyc exit 0
+== bench quiet round 2: fix at 06:43:40 UTC
+provisioning histogram: 2 shards, spin window 7141 ns, floor 50000 ns
+a223.profile wake: WakeLatency { mean_ns: 7141, mean_lower_ns: 7028, mean_upper_ns: 7268, p50_ns: 6800, p99_ns: 11000, sd_ns: 981, samples: 256, same_cpu_samples: 0, rounds: 5, rounds_agree: Some(true), placement: Pinned, asleep_confirmed: true, woke_running: 2, quick: false }; idle window at boot 714100 ns
+a223.rest: 0 thousandths of a core over 3010 ms with no client
+  provision.spinning_1 parks per 1000 creates: shard 0: 0 (wake 7722 ns), shard 1: 0 (wake 8143 ns)
+  provision.spinning_1_p50: 16800 ns [14200, 17500] over 3 runs: [17500, 14200, 16800]
+  provision.spinning_1_p99: 33300 ns [31900, 33900] over 3 runs: [31900, 33900, 33300]
+  provision.spinning_1_p999: 81700 ns [46700, 109500] over 3 runs: [109500, 46700, 81700]
+ac-2.1: 1 client spinning (4 cores, 2 shards), provisioning p99 33300 ns vs floor 50000 ns: ok
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 9245 ns), shard 1: 0 (wake 9646 ns)
+  provision.spinning_8_p50: 162200 ns [161700, 164300] over 3 runs: [164300, 162200, 161700]
+  provision.spinning_8_p99: 511000 ns [507900, 513800] over 3 runs: [513800, 507900, 511000]
+  provision.spinning_8_p999: 3879600 ns [3787100, 4128100] over 3 runs: [4128100, 3787100, 3879600]
+ac-2.1: 8 clients oversubscribes 2 runnable core(s); p99 511000 ns reported, not gated here
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 13332 ns), shard 1: 0 (wake 17679 ns)
+ac-2.1: 64 clients oversubscribes 2 runnable core(s); p99 5078200 ns reported, not gated here
+a223.paced: 254 thousandths of a core over 15620 ms of one client paced 1000 us (client included)
+  provision.parked_1 parks per 1000 creates: shard 0: 1393 (wake 12088 ns), shard 1: 1128 (wake 12300 ns)
+  provision.parked_1_p50: 131000 ns [124300, 144900] over 3 runs: [144900, 124300, 131000]
+  provision.parked_1_p99: 591500 ns [570600, 691400] over 3 runs: [591500, 570600, 691400]
+  provision.parked_1_p999: 801200 ns [754800, 828400] over 3 runs: [754800, 801200, 828400]
+ac-2.1: 1 client parked (paced 1000 µs), create p99 591500 ns: reported, not gated
+== bench quiet round 2: fix exit 0
+== bench quiet round 3: main at 06:44:21 UTC
+provisioning histogram: 2 shards, spin window 203 ns, floor 50000 ns
+a223.profile wake: WakeLatency { mean_ns: 203, mean_lower_ns: 199, mean_upper_ns: 208, p50_ns: 200, p99_ns: 300, sd_ns: 534, samples: 45056, same_cpu_samples: 0, rounds: 5, rounds_agree: Some(false), placement: Pinned, asleep_confirmed: false, quick: false }; idle window at boot 20300 ns
+a223.rest: 0 thousandths of a core over 3000 ms with no client
+  provision.spinning_1 parks per 1000 creates: shard 0: 45 (wake 410 ns), shard 1: 30 (wake 349 ns)
+  provision.spinning_1_p50: 15000 ns [14800, 15600] over 3 runs: [15600, 14800, 15000]
+  provision.spinning_1_p99: 45500 ns [41500, 49600] over 3 runs: [49600, 45500, 41500]
+  provision.spinning_1_p999: 96800 ns [92700, 118800] over 3 runs: [118800, 92700, 96800]
+ac-2.1: 1 client spinning (4 cores, 2 shards), provisioning p99 45500 ns vs floor 50000 ns: ok
+  provision.spinning_8 parks per 1000 creates: shard 0: 12 (wake 952 ns), shard 1: 13 (wake 925 ns)
+  provision.spinning_8_p50: 159000 ns [158000, 160900] over 3 runs: [158000, 160900, 159000]
+  provision.spinning_8_p99: 502500 ns [478900, 520800] over 3 runs: [478900, 520800, 502500]
+  provision.spinning_8_p999: 3661200 ns [3612300, 3698600] over 3 runs: [3612300, 3698600, 3661200]
+ac-2.1: 8 clients oversubscribes 2 runnable core(s); p99 502500 ns reported, not gated here
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 1129 ns), shard 1: 0 (wake 1177 ns)
+ac-2.1: 64 clients oversubscribes 2 runnable core(s); p99 5405000 ns reported, not gated here
+a223.paced: 58 thousandths of a core over 15062 ms of one client paced 1000 us (client included)
+  provision.parked_1 parks per 1000 creates: shard 0: 1440 (wake 1522 ns), shard 1: 1161 (wake 1341 ns)
+  provision.parked_1_p50: 129600 ns [122400, 132600] over 3 runs: [132600, 122400, 129600]
+  provision.parked_1_p99: 356900 ns [255200, 429100] over 3 runs: [429100, 356900, 255200]
+  provision.parked_1_p999: 810400 ns [753600, 873800] over 3 runs: [753600, 810400, 873800]
+ac-2.1: 1 client parked (paced 1000 µs), create p99 356900 ns: reported, not gated
+== bench quiet round 3: main exit 0
+== bench quiet round 3: cyc at 06:45:02 UTC
+provisioning histogram: 2 shards, spin window 7104 ns, floor 50000 ns
+a223.profile wake: WakeLatency { mean_ns: 7104, mean_lower_ns: 6958, mean_upper_ns: 7287, p50_ns: 6700, p99_ns: 12500, sd_ns: 2116, samples: 624, same_cpu_samples: 0, rounds: 5, rounds_agree: Some(true), placement: Pinned, asleep_confirmed: true, woke_running: 0, quick: false }; idle window at boot 710400 ns
+a223.rest: 0 thousandths of a core over 2999 ms with no client
+  provision.spinning_1 parks per 1000 creates: shard 0: 1 (wake 7305 ns), shard 1: 0 (wake 7419 ns)
+  provision.spinning_1_p50: 18100 ns [16600, 18200] over 3 runs: [16600, 18100, 18200]
+  provision.spinning_1_p99: 35600 ns [35600, 39000] over 3 runs: [39000, 35600, 35600]
+  provision.spinning_1_p999: 67600 ns [53100, 162300] over 3 runs: [162300, 53100, 67600]
+ac-2.1: 1 client spinning (4 cores, 2 shards), provisioning p99 35600 ns vs floor 50000 ns: ok
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 7692 ns), shard 1: 0 (wake 8041 ns)
+  provision.spinning_8_p50: 160100 ns [158100, 163000] over 3 runs: [158100, 160100, 163000]
+  provision.spinning_8_p99: 504100 ns [499600, 526600] over 3 runs: [499600, 504100, 526600]
+  provision.spinning_8_p999: 3998800 ns [3733300, 4028200] over 3 runs: [3733300, 3998800, 4028200]
+ac-2.1: 8 clients oversubscribes 2 runnable core(s); p99 504100 ns reported, not gated here
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 9895 ns), shard 1: 0 (wake 13110 ns)
+ac-2.1: 64 clients oversubscribes 2 runnable core(s); p99 5312000 ns reported, not gated here
+a223.paced: 215 thousandths of a core over 15842 ms of one client paced 1000 us (client included)
+  provision.parked_1 parks per 1000 creates: shard 0: 1412 (wake 12096 ns), shard 1: 1158 (wake 12484 ns)
+  provision.parked_1_p50: 128800 ns [122900, 147200] over 3 runs: [147200, 122900, 128800]
+  provision.parked_1_p99: 511700 ns [320700, 700800] over 3 runs: [320700, 511700, 700800]
+  provision.parked_1_p999: 813900 ns [803500, 847000] over 3 runs: [803500, 847000, 813900]
+ac-2.1: 1 client parked (paced 1000 µs), create p99 511700 ns: reported, not gated
+== bench quiet round 3: cyc exit 0
+== bench quiet round 3: fix at 06:45:43 UTC
+provisioning histogram: 2 shards, spin window 7321 ns, floor 50000 ns
+a223.profile wake: WakeLatency { mean_ns: 7321, mean_lower_ns: 7159, mean_upper_ns: 7504, p50_ns: 6900, p99_ns: 10700, sd_ns: 1172, samples: 176, same_cpu_samples: 0, rounds: 5, rounds_agree: Some(true), placement: Pinned, asleep_confirmed: true, woke_running: 1, quick: false }; idle window at boot 732100 ns
+a223.rest: 5 thousandths of a core over 3000 ms with no client
+  provision.spinning_1 parks per 1000 creates: shard 0: 1 (wake 8333 ns), shard 1: 0 (wake 8191 ns)
+  provision.spinning_1_p50: 16500 ns [16000, 17200] over 3 runs: [16000, 16500, 17200]
+  provision.spinning_1_p99: 37300 ns [35000, 37900] over 3 runs: [37900, 37300, 35000]
+  provision.spinning_1_p999: 101200 ns [53100, 106300] over 3 runs: [106300, 101200, 53100]
+ac-2.1: 1 client spinning (4 cores, 2 shards), provisioning p99 37300 ns vs floor 50000 ns: ok
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 9342 ns), shard 1: 0 (wake 9968 ns)
+  provision.spinning_8_p50: 162400 ns [161100, 162900] over 3 runs: [162900, 161100, 162400]
+  provision.spinning_8_p99: 518800 ns [509100, 559300] over 3 runs: [559300, 509100, 518800]
+  provision.spinning_8_p999: 3784400 ns [3763100, 3798600] over 3 runs: [3784400, 3763100, 3798600]
+ac-2.1: 8 clients oversubscribes 2 runnable core(s); p99 518800 ns reported, not gated here
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 14368 ns), shard 1: 0 (wake 19775 ns)
+ac-2.1: 64 clients oversubscribes 2 runnable core(s); p99 5294200 ns reported, not gated here
+a223.paced: 249 thousandths of a core over 15514 ms of one client paced 1000 us (client included)
+  provision.parked_1 parks per 1000 creates: shard 0: 1368 (wake 12836 ns), shard 1: 1072 (wake 12772 ns)
+  provision.parked_1_p50: 129500 ns [120400, 140600] over 3 runs: [140600, 120400, 129500]
+  provision.parked_1_p99: 246700 ns [199300, 686300] over 3 runs: [246700, 686300, 199300]
+  provision.parked_1_p999: 751200 ns [715100, 793500] over 3 runs: [715100, 793500, 751200]
+ac-2.1: 1 client parked (paced 1000 µs), create p99 246700 ns: reported, not gated
+== bench quiet round 3: fix exit 0
+== bench busy round 1: main at 06:46:26 UTC
+provisioning histogram: 2 shards, spin window 470 ns, floor 50000 ns
+a223.profile wake: WakeLatency { mean_ns: 470, mean_lower_ns: 391, mean_upper_ns: 544, p50_ns: 200, p99_ns: 10700, sd_ns: 1865, samples: 2278, same_cpu_samples: 0, rounds: 7, rounds_agree: None, placement: Pinned, asleep_confirmed: false, quick: true }; idle window at boot 47000 ns
+a223.rest: 0 thousandths of a core over 3055 ms with no client
+  provision.spinning_1 parks per 1000 creates: shard 0: 31 (wake 197973 ns), shard 1: 29 (wake 231779 ns)
+  provision.spinning_1_p50: 16400 ns [16300, 18000] over 3 runs: [18000, 16300, 16400]
+  provision.spinning_1_p99: 45533400 ns [99300, 88110200] over 3 runs: [88110200, 45533400, 99300]
+  provision.spinning_1_p999: 96821000 ns [91031500, 98228700] over 3 runs: [96821000, 98228700, 91031500]
+ac-2.1: 1 client spinning (4 cores, 2 shards), provisioning p99 45533400 ns vs floor 50000 ns: FAIL
+  provision.spinning_8 parks per 1000 creates: shard 0: 1 (wake 288515 ns), shard 1: 1 (wake 316798 ns)
+  provision.spinning_8_p50: 264100 ns [258100, 290200] over 3 runs: [290200, 258100, 264100]
+  provision.spinning_8_p99: 60336100 ns [41344300, 63608000] over 3 runs: [60336100, 63608000, 41344300]
+  provision.spinning_8_p999: 98463100 ns [82168500, 98478600] over 3 runs: [98463100, 98478600, 82168500]
+ac-2.1: 8 clients oversubscribes 2 runnable core(s); p99 60336100 ns reported, not gated here
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 340472 ns), shard 1: 0 (wake 348329 ns)
+ac-2.1: 64 clients oversubscribes 2 runnable core(s); p99 85785000 ns reported, not gated here
+a223.paced: 753 thousandths of a core over 109869 ms of one client paced 1000 us (client included)
+  provision.parked_1 parks per 1000 creates: shard 0: 57 (wake 449653 ns), shard 1: 32 (wake 416683 ns)
+  provision.parked_1_p50: 16116500 ns [8199700, 22016600] over 3 runs: [8199700, 16116500, 22016600]
+  provision.parked_1_p99: 124468100 ns [121269500, 126344500] over 3 runs: [124468100, 126344500, 121269500]
+  provision.parked_1_p999: 125357200 ns [125144600, 128930000] over 3 runs: [125357200, 128930000, 125144600]
+ac-2.1: 1 client parked (paced 1000 µs), create p99 124468100 ns: reported, not gated
+== bench busy round 1: main exit 1
+== bench busy round 1: cyc at 06:50:43 UTC
+provisioning histogram: 2 shards, spin window 10975 ns, floor 50000 ns
+a223.profile wake: WakeLatency { mean_ns: 10975, mean_lower_ns: 10518, mean_upper_ns: 11587, p50_ns: 10500, p99_ns: 12200, sd_ns: 1126, samples: 16, same_cpu_samples: 0, rounds: 7, rounds_agree: None, placement: Pinned, asleep_confirmed: true, woke_running: 0, quick: false }; idle window at boot 1097500 ns
+a223.rest: 0 thousandths of a core over 3057 ms with no client
+  provision.spinning_1 parks per 1000 creates: shard 0: 0 (wake 3568359 ns), shard 1: 0 (wake 3408485 ns)
+  provision.spinning_1_p50: 16100 ns [15900, 16500] over 3 runs: [16500, 16100, 15900]
+  provision.spinning_1_p99: 82500 ns [71300, 86300] over 3 runs: [71300, 82500, 86300]
+  provision.spinning_1_p999: 25652700 ns [171500, 92763100] over 3 runs: [92763100, 171500, 25652700]
+ac-2.1: 1 client spinning (4 cores, 2 shards), provisioning p99 82500 ns vs floor 50000 ns: FAIL
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 3568359 ns), shard 1: 0 (wake 3408485 ns)
+  provision.spinning_8_p50: 170700 ns [107500, 175000] over 3 runs: [107500, 170700, 175000]
+  provision.spinning_8_p99: 6708600 ns [1137500, 52804900] over 3 runs: [1137500, 52804900, 6708600]
+  provision.spinning_8_p999: 72719900 ns [69436200, 94726600] over 3 runs: [72719900, 94726600, 69436200]
+ac-2.1: 8 clients oversubscribes 2 runnable core(s); p99 6708600 ns reported, not gated here
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 3568359 ns), shard 1: 0 (wake 3408485 ns)
+ac-2.1: 64 clients oversubscribes 2 runnable core(s); p99 77557700 ns reported, not gated here
+a223.paced: 783 thousandths of a core over 69839 ms of one client paced 1000 us (client included)
+  provision.parked_1 parks per 1000 creates: shard 0: 0 (wake 3568359 ns), shard 1: 0 (wake 3408485 ns)
+  provision.parked_1_p50: 368600 ns [178500, 14212800] over 3 runs: [14212800, 368600, 178500]
+  provision.parked_1_p99: 96004700 ns [89803800, 127561500] over 3 runs: [96004700, 127561500, 89803800]
+  provision.parked_1_p999: 134955800 ns [130811900, 139058600] over 3 runs: [134955800, 139058600, 130811900]
+ac-2.1: 1 client parked (paced 1000 µs), create p99 96004700 ns: reported, not gated
+== bench busy round 1: cyc exit 1
+== bench busy round 1: fix at 06:53:52 UTC
+provisioning histogram: 2 shards, spin window 12016 ns, floor 50000 ns
+a223.profile wake: WakeLatency { mean_ns: 12016, mean_lower_ns: 10766, mean_upper_ns: 13966, p50_ns: 10600, p99_ns: 19300, sd_ns: 4093, samples: 24, same_cpu_samples: 0, rounds: 7, rounds_agree: None, placement: Pinned, asleep_confirmed: true, woke_running: 0, quick: true }; idle window at boot 1201600 ns
+a223.rest: 5 thousandths of a core over 3040 ms with no client
+  provision.spinning_1 parks per 1000 creates: shard 0: 1 (wake 911158 ns), shard 1: 1 (wake 965058 ns)
+  provision.spinning_1_p50: 16800 ns [16600, 18000] over 3 runs: [18000, 16600, 16800]
+  provision.spinning_1_p99: 80439400 ns [108000, 80972900] over 3 runs: [80439400, 108000, 80972900]
+  provision.spinning_1_p999: 94784300 ns [89223700, 96627600] over 3 runs: [94784300, 89223700, 96627600]
+ac-2.1: 1 client spinning (4 cores, 2 shards), provisioning p99 80439400 ns vs floor 50000 ns: FAIL
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 911158 ns), shard 1: 0 (wake 1219418 ns)
+  provision.spinning_8_p50: 194500 ns [153200, 292600] over 3 runs: [292600, 153200, 194500]
+  provision.spinning_8_p99: 68190000 ns [48222800, 79825700] over 3 runs: [48222800, 79825700, 68190000]
+  provision.spinning_8_p999: 92923500 ns [83084800, 93287300] over 3 runs: [83084800, 93287300, 92923500]
+ac-2.1: 8 clients oversubscribes 2 runnable core(s); p99 68190000 ns reported, not gated here
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 911158 ns), shard 1: 0 (wake 1518458 ns)
+ac-2.1: 64 clients oversubscribes 2 runnable core(s); p99 89465500 ns reported, not gated here
+a223.paced: 771 thousandths of a core over 74966 ms of one client paced 1000 us (client included)
+  provision.parked_1 parks per 1000 creates: shard 0: 8 (wake 1503163 ns), shard 1: 4 (wake 1683523 ns)
+  provision.parked_1_p50: 10173900 ns [170400, 16033700] over 3 runs: [10173900, 16033700, 170400]
+  provision.parked_1_p99: 114380800 ns [86977000, 128791600] over 3 runs: [128791600, 114380800, 86977000]
+  provision.parked_1_p999: 129965800 ns [106466400, 134990400] over 3 runs: [134990400, 129965800, 106466400]
+ac-2.1: 1 client parked (paced 1000 µs), create p99 114380800 ns: reported, not gated
+== bench busy round 1: fix exit 1
+== bench busy round 2: main at 06:57:53 UTC
+provisioning histogram: 2 shards, spin window 1267 ns, floor 50000 ns
+a223.profile wake: WakeLatency { mean_ns: 1267, mean_lower_ns: 964, mean_upper_ns: 1629, p50_ns: 200, p99_ns: 12500, sd_ns: 4704, samples: 768, same_cpu_samples: 0, rounds: 7, rounds_agree: None, placement: Pinned, asleep_confirmed: false, quick: true }; idle window at boot 126700 ns
+a223.rest: 0 thousandths of a core over 3039 ms with no client
+  provision.spinning_1 parks per 1000 creates: shard 0: 34 (wake 317604 ns), shard 1: 31 (wake 333873 ns)
+  provision.spinning_1_p50: 17800 ns [16800, 19200] over 3 runs: [17800, 16800, 19200]
+  provision.spinning_1_p99: 88314400 ns [83290300, 144956000] over 3 runs: [83290300, 88314400, 144956000]
+  provision.spinning_1_p999: 169965200 ns [102606300, 174172600] over 3 runs: [102606300, 169965200, 174172600]
+ac-2.1: 1 client spinning (4 cores, 2 shards), provisioning p99 88314400 ns vs floor 50000 ns: FAIL
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 349640 ns), shard 1: 0 (wake 377235 ns)
+  provision.spinning_8_p50: 263000 ns [235500, 313500] over 3 runs: [263000, 313500, 235500]
+  provision.spinning_8_p99: 106373300 ns [88818000, 114359700] over 3 runs: [88818000, 114359700, 106373300]
+  provision.spinning_8_p999: 136797600 ns [132135700, 141685400] over 3 runs: [136797600, 141685400, 132135700]
+ac-2.1: 8 clients oversubscribes 2 runnable core(s); p99 106373300 ns reported, not gated here
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 392815 ns), shard 1: 0 (wake 407855 ns)
+ac-2.1: 64 clients oversubscribes 2 runnable core(s); p99 93371500 ns reported, not gated here
+a223.paced: 748 thousandths of a core over 112634 ms of one client paced 1000 us (client included)
+  provision.parked_1 parks per 1000 creates: shard 0: 62 (wake 508658 ns), shard 1: 33 (wake 474272 ns)
+  provision.parked_1_p50: 540400 ns [227000, 12020600] over 3 runs: [12020600, 227000, 540400]
+  provision.parked_1_p99: 124998500 ns [124988800, 125679200] over 3 runs: [125679200, 124998500, 124988800]
+  provision.parked_1_p999: 128818400 ns [128530200, 139014800] over 3 runs: [139014800, 128530200, 128818400]
+ac-2.1: 1 client parked (paced 1000 µs), create p99 124998500 ns: reported, not gated
+== bench busy round 2: main exit 1
+== bench busy round 2: cyc at 07:03:02 UTC
+provisioning histogram: 2 shards, spin window 13648 ns, floor 50000 ns
+a223.profile wake: WakeLatency { mean_ns: 13648, mean_lower_ns: 11263, mean_upper_ns: 17059, p50_ns: 10600, p99_ns: 37300, sd_ns: 10225, samples: 47, same_cpu_samples: 0, rounds: 7, rounds_agree: None, placement: Pinned, asleep_confirmed: true, woke_running: 0, quick: true }; idle window at boot 1364800 ns
+a223.rest: 0 thousandths of a core over 3046 ms with no client
+  provision.spinning_1 parks per 1000 creates: shard 0: 2 (wake 447149 ns), shard 1: 1 (wake 405506 ns)
+  provision.spinning_1_p50: 17100 ns [16700, 18200] over 3 runs: [18200, 17100, 16700]
+  provision.spinning_1_p99: 88500 ns [87600, 107900] over 3 runs: [87600, 88500, 107900]
+  provision.spinning_1_p999: 65114000 ns [63217100, 85438200] over 3 runs: [63217100, 65114000, 85438200]
+ac-2.1: 1 client spinning (4 cores, 2 shards), provisioning p99 88500 ns vs floor 50000 ns: FAIL
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 447149 ns), shard 1: 0 (wake 621201 ns)
+  provision.spinning_8_p50: 290500 ns [235900, 294000] over 3 runs: [294000, 290500, 235900]
+  provision.spinning_8_p99: 58042800 ns [31463500, 84244200] over 3 runs: [58042800, 84244200, 31463500]
+  provision.spinning_8_p999: 94412900 ns [86971300, 94609500] over 3 runs: [94609500, 94412900, 86971300]
+ac-2.1: 8 clients oversubscribes 2 runnable core(s); p99 58042800 ns reported, not gated here
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 667501 ns), shard 1: 0 (wake 807781 ns)
+ac-2.1: 64 clients oversubscribes 2 runnable core(s); p99 89443600 ns reported, not gated here
+a223.paced: 771 thousandths of a core over 74703 ms of one client paced 1000 us (client included)
+  provision.parked_1 parks per 1000 creates: shard 0: 14 (wake 1227308 ns), shard 1: 8 (wake 1161573 ns)
+  provision.parked_1_p50: 145600 ns [140800, 197600] over 3 runs: [197600, 140800, 145600]
+  provision.parked_1_p99: 126960100 ns [112882200, 128237700] over 3 runs: [112882200, 128237700, 126960100]
+  provision.parked_1_p999: 130321300 ns [121421300, 134414400] over 3 runs: [121421300, 130321300, 134414400]
+ac-2.1: 1 client parked (paced 1000 µs), create p99 126960100 ns: reported, not gated
+== bench busy round 2: cyc exit 1
+== bench busy round 2: fix at 07:07:00 UTC
+provisioning histogram: 2 shards, spin window 10806 ns, floor 50000 ns
+a223.profile wake: WakeLatency { mean_ns: 10806, mean_lower_ns: 10515, mean_upper_ns: 11290, p50_ns: 10500, p99_ns: 13200, sd_ns: 1053, samples: 32, same_cpu_samples: 0, rounds: 7, rounds_agree: None, placement: Pinned, asleep_confirmed: true, woke_running: 0, quick: false }; idle window at boot 1080600 ns
+a223.rest: 67 thousandths of a core over 3031 ms with no client
+  provision.spinning_1 parks per 1000 creates: shard 0: 0 (wake 6145723 ns), shard 1: 0 (wake 2682169 ns)
+  provision.spinning_1_p50: 16400 ns [15900, 16700] over 3 runs: [16700, 16400, 15900]
+  provision.spinning_1_p99: 86800 ns [85500, 97500] over 3 runs: [85500, 97500, 86800]
+  provision.spinning_1_p999: 55580400 ns [17627500, 63297200] over 3 runs: [63297200, 55580400, 17627500]
+ac-2.1: 1 client spinning (4 cores, 2 shards), provisioning p99 86800 ns vs floor 50000 ns: FAIL
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 6145723 ns), shard 1: 0 (wake 2682169 ns)
+  provision.spinning_8_p50: 175700 ns [148300, 194200] over 3 runs: [148300, 175700, 194200]
+  provision.spinning_8_p99: 4001800 ns [1906200, 80718700] over 3 runs: [1906200, 4001800, 80718700]
+  provision.spinning_8_p999: 78863900 ns [67030500, 94883500] over 3 runs: [78863900, 67030500, 94883500]
+ac-2.1: 8 clients oversubscribes 2 runnable core(s); p99 4001800 ns reported, not gated here
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 6145723 ns), shard 1: 0 (wake 2682169 ns)
+ac-2.1: 64 clients oversubscribes 2 runnable core(s); p99 83409900 ns reported, not gated here
+a223.paced: 784 thousandths of a core over 68487 ms of one client paced 1000 us (client included)
+  provision.parked_1 parks per 1000 creates: shard 0: 0 (wake 6145723 ns), shard 1: 1 (wake 5480515 ns)
+  provision.parked_1_p50: 771700 ns [138000, 10201600] over 3 runs: [771700, 138000, 10201600]
+  provision.parked_1_p99: 121150000 ns [87116100, 124948500] over 3 runs: [124948500, 87116100, 121150000]
+  provision.parked_1_p999: 130992900 ns [128857100, 140894000] over 3 runs: [140894000, 128857100, 130992900]
+ac-2.1: 1 client parked (paced 1000 µs), create p99 121150000 ns: reported, not gated
+== bench busy round 2: fix exit 1
+== bench busy round 3: main at 07:10:27 UTC
+provisioning histogram: 2 shards, spin window 427 ns, floor 50000 ns
+a223.profile wake: WakeLatency { mean_ns: 427, mean_lower_ns: 396, mean_upper_ns: 463, p50_ns: 200, p99_ns: 10600, sd_ns: 1650, samples: 8192, same_cpu_samples: 0, rounds: 7, rounds_agree: None, placement: Pinned, asleep_confirmed: false, quick: true }; idle window at boot 42700 ns
+a223.rest: 0 thousandths of a core over 3035 ms with no client
+  provision.spinning_1 parks per 1000 creates: shard 0: 30 (wake 187085 ns), shard 1: 28 (wake 215400 ns)
+  provision.spinning_1_p50: 16300 ns [16100, 16800] over 3 runs: [16800, 16100, 16300]
+  provision.spinning_1_p99: 61942200 ns [88800, 84703500] over 3 runs: [84703500, 61942200, 88800]
+  provision.spinning_1_p999: 96775300 ns [91044300, 100631200] over 3 runs: [100631200, 96775300, 91044300]
+ac-2.1: 1 client spinning (4 cores, 2 shards), provisioning p99 61942200 ns vs floor 50000 ns: FAIL
+  provision.spinning_8 parks per 1000 creates: shard 0: 1 (wake 287544 ns), shard 1: 1 (wake 312648 ns)
+  provision.spinning_8_p50: 264400 ns [217100, 266700] over 3 runs: [266700, 264400, 217100]
+  provision.spinning_8_p99: 61427600 ns [50848500, 63367800] over 3 runs: [63367800, 61427600, 50848500]
+  provision.spinning_8_p999: 96765400 ns [95523800, 98641700] over 3 runs: [96765400, 95523800, 98641700]
+ac-2.1: 8 clients oversubscribes 2 runnable core(s); p99 61427600 ns reported, not gated here
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 361440 ns), shard 1: 0 (wake 357454 ns)
+ac-2.1: 64 clients oversubscribes 2 runnable core(s); p99 89226100 ns reported, not gated here
+a223.paced: 750 thousandths of a core over 100074 ms of one client paced 1000 us (client included)
+  provision.parked_1 parks per 1000 creates: shard 0: 58 (wake 469478 ns), shard 1: 32 (wake 422875 ns)
+  provision.parked_1_p50: 6363800 ns [233200, 12407100] over 3 runs: [12407100, 233200, 6363800]
+  provision.parked_1_p99: 122932400 ns [121055900, 123642600] over 3 runs: [122932400, 121055900, 123642600]
+  provision.parked_1_p999: 130758100 ns [126880100, 130930700] over 3 runs: [126880100, 130758100, 130930700]
+ac-2.1: 1 client parked (paced 1000 µs), create p99 122932400 ns: reported, not gated
+== bench busy round 3: main exit 1
+== bench busy round 3: cyc at 07:14:55 UTC
+provisioning histogram: 2 shards, spin window 12685 ns, floor 50000 ns
+a223.profile wake: WakeLatency { mean_ns: 12685, mean_lower_ns: 11245, mean_upper_ns: 14377, p50_ns: 10800, p99_ns: 27300, sd_ns: 4993, samples: 35, same_cpu_samples: 0, rounds: 7, rounds_agree: None, placement: Pinned, asleep_confirmed: true, woke_running: 0, quick: true }; idle window at boot 1268500 ns
+a223.rest: 10 thousandths of a core over 3038 ms with no client
+  provision.spinning_1 parks per 1000 creates: shard 0: 1 (wake 766047 ns), shard 1: 0 (wake 562857 ns)
+  provision.spinning_1_p50: 17000 ns [16700, 17100] over 3 runs: [17000, 17100, 16700]
+  provision.spinning_1_p99: 107900 ns [101300, 79489900] over 3 runs: [101300, 107900, 79489900]
+  provision.spinning_1_p999: 72147200 ns [35293000, 93308200] over 3 runs: [72147200, 35293000, 93308200]
+ac-2.1: 1 client spinning (4 cores, 2 shards), provisioning p99 107900 ns vs floor 50000 ns: FAIL
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 766047 ns), shard 1: 0 (wake 1139100 ns)
+  provision.spinning_8_p50: 287600 ns [264000, 298600] over 3 runs: [287600, 298600, 264000]
+  provision.spinning_8_p99: 76330100 ns [56799900, 86238900] over 3 runs: [56799900, 76330100, 86238900]
+  provision.spinning_8_p999: 93129400 ns [92195000, 96613700] over 3 runs: [92195000, 93129400, 96613700]
+ac-2.1: 8 clients oversubscribes 2 runnable core(s); p99 76330100 ns reported, not gated here
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 766047 ns), shard 1: 0 (wake 1693304 ns)
+ac-2.1: 64 clients oversubscribes 2 runnable core(s); p99 81680500 ns reported, not gated here
+a223.paced: 778 thousandths of a core over 63285 ms of one client paced 1000 us (client included)
+  provision.parked_1 parks per 1000 creates: shard 0: 7 (wake 1544200 ns), shard 1: 2 (wake 1812830 ns)
+  provision.parked_1_p50: 752200 ns [123600, 12221100] over 3 runs: [123600, 752200, 12221100]
+  provision.parked_1_p99: 116926400 ns [116358500, 125150300] over 3 runs: [116358500, 116926400, 125150300]
+  provision.parked_1_p999: 128910500 ns [122116600, 132983600] over 3 runs: [128910500, 122116600, 132983600]
+ac-2.1: 1 client parked (paced 1000 µs), create p99 116926400 ns: reported, not gated
+== bench busy round 3: cyc exit 1
+== bench busy round 3: fix at 07:18:20 UTC
+provisioning histogram: 2 shards, spin window 11019 ns, floor 50000 ns
+a223.profile wake: WakeLatency { mean_ns: 11019, mean_lower_ns: 10655, mean_upper_ns: 11489, p50_ns: 10500, p99_ns: 22200, sd_ns: 2426, samples: 128, same_cpu_samples: 0, rounds: 8, rounds_agree: None, placement: Pinned, asleep_confirmed: true, woke_running: 1, quick: false }; idle window at boot 1101900 ns
+a223.rest: 20 thousandths of a core over 3049 ms with no client
+  provision.spinning_1 parks per 1000 creates: shard 0: 1 (wake 873066 ns), shard 1: 0 (wake 1084149 ns)
+  provision.spinning_1_p50: 16600 ns [15900, 16600] over 3 runs: [16600, 15900, 16600]
+  provision.spinning_1_p99: 15202800 ns [133200, 67784900] over 3 runs: [15202800, 133200, 67784900]
+  provision.spinning_1_p999: 89070400 ns [88997500, 92068300] over 3 runs: [89070400, 88997500, 92068300]
+ac-2.1: 1 client spinning (4 cores, 2 shards), provisioning p99 15202800 ns vs floor 50000 ns: FAIL
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 873066 ns), shard 1: 0 (wake 1981800 ns)
+  provision.spinning_8_p50: 281800 ns [143900, 290800] over 3 runs: [143900, 281800, 290800]
+  provision.spinning_8_p99: 41934900 ns [27105600, 74535100] over 3 runs: [27105600, 41934900, 74535100]
+  provision.spinning_8_p999: 87251900 ns [83843700, 94563900] over 3 runs: [87251900, 83843700, 94563900]
+ac-2.1: 8 clients oversubscribes 2 runnable core(s); p99 41934900 ns reported, not gated here
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 873066 ns), shard 1: 0 (wake 2511889 ns)
+ac-2.1: 64 clients oversubscribes 2 runnable core(s); p99 79426800 ns reported, not gated here
+a223.paced: 778 thousandths of a core over 67550 ms of one client paced 1000 us (client included)
+  provision.parked_1 parks per 1000 creates: shard 0: 6 (wake 1278429 ns), shard 1: 1 (wake 2827682 ns)
+  provision.parked_1_p50: 225400 ns [207800, 14231400] over 3 runs: [225400, 14231400, 207800]
+  provision.parked_1_p99: 124935500 ns [75511200, 126849900] over 3 runs: [75511200, 124935500, 126849900]
+  provision.parked_1_p999: 130875800 ns [87343400, 130994900] over 3 runs: [87343400, 130875800, 130994900]
+ac-2.1: 1 client parked (paced 1000 µs), create p99 124935500 ns: reported, not gated
+== bench busy round 3: fix exit 1
