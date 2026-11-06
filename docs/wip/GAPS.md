@@ -1,5 +1,33 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **The anchor kills live daemons on a busy machine (found 2026-11-06, audit step 7; open, to be assigned).** Under the
+> A/B bar's load, two spinners a logical CPU (8 on CI's 4-CPU Windows runners), the anchor killed daemons that were
+> alive and serving because their heartbeat lapsed its 1,000 ms liveness budget. A busy machine is the normal case
+> (Ada's rule), so a starved but live daemon must not be killed.
+> - **Seen:**
+>   - Diagnostics run 42161838327 (`diag-winfsp-overlap-28`, four daemons beside the spinners), x86_64 run 1: the
+>     anchor killed sep1 (main `28359a75`, unchanged receiver) and comb1, logging `the daemon's heartbeat lapsed;
+>     killing it`. That run's late heartbeats (gaps of half the budget or more): sep1 16, comb2 13, comb1 11. The DLL
+>     build (`71cf09ac`) does not log them.
+>   - Run 42130583401 (`diag-winfsp-overlap-20`, two daemons) lost x86_64 run 3 the same way, to the DLL arm's daemon.
+>   - Run 42080252187 (winfsp-bench, `eb0983ec`'s entry) lost one run likewise, the DLL arm's on x86_64.
+>   - A killed daemon's drive dies, and `mount_bench` fails that run's whole loaded phase for every arm.
+> - **The budget is a fixed number, not derived:** `slates_server::daemon::LIVENESS_BUDGET_NS = 1_000_000_000`, a
+>   `Shape:` constant documented as "a second; the supervisor's input until the CLI takes the operator's value". The beat
+>   cadence is a tenth of it (`HEARTBEAT_NS`, 100 ms), so nine beats fit in it. Nothing in it is measured from the
+>   machine or its load.
+> - **What misses is the shard, not a heartbeat thread.** The heartbeat is a task, `heartbeat_loop`, on the control
+>   shard's own executor (`crates/server/src/daemon.rs`), so a beat misses whenever that shard's thread does not run.
+>   `log_late_beat` shows what it did in each gap. In the run 1 above the shard ran 2-4 steps in 974-1,036 ms. Its
+>   longest poll was 503-576 ms, with all 3-5 of the gap's polls unattributed (none counted as a task's own CPU,
+>   blocked in the kernel, or preempted by the host), and its timer overrun was 42-92 ms. That reads as the thread kept
+>   off the CPU. That Windows reports that preemption as unattributed is a hypothesis, not checked.
+> - **What was tried:** winfsp-bench's `eb0983ec` measured every shard thread at `THREAD_PRIORITY_ABOVE_NORMAL` (run
+>   42080252187). Neither that arm nor the normal one lapsed there, each alone beside the spinners. It was not adopted
+>   because it cost x86_64's loaded p50s. **The heartbeat alone at a raised priority was never tried, and cannot be as
+>   built:** it is a task on a shard, not a thread of its own.
+> - Not fixed on the Step 7 branches; to be assigned.
+
 > **A-190's purge client leaves the daemon's process (2026-11-06, fixed); the sweep for the rest (open).** No daemon
 > thread opens a path on a volume the daemon serves (§4.6). The coherent purge's opens, writes and reads now run in a
 > child process of the daemon's own binary (`slates winfsp-purge-client`), in a kill-on-close job, asked over a pipe
