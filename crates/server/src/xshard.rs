@@ -181,7 +181,7 @@ impl<T: 'static> Future for CrossShardCall<T> {
 
 /// Sends `back`, the task that carries a result home to `origin` (a reply to its client, an awaited call's answer), and
 /// waits for room when the origin's control channel is full: retried at [`REPLY_PACE_NS`] for at most
-/// [`REPLY_ROOM_ATTEMPTS`] attempts, one coordinator period. A full channel drains as the origin turns, so a burst no
+/// [`REPLY_ROOM_NS`] of time, one coordinator period. A full channel drains as the origin turns, so a burst no
 /// longer costs the reply; a reply still refused after the period, or whose origin is gone, is counted on this shard
 /// (`xshard.reply_dropped`) and its waiter's own deadline answers it (the client's reply deadline; `call_within`'s).
 /// Before 2026-10-07 every refusal dropped the reply at once and unseen.
@@ -191,23 +191,10 @@ pub async fn send_back(origin: u16, back: SpawnRequest) {
   }
 }
 
-/// Sends `message` to `target`, waiting out a full channel: asked again every [`REPLY_PACE_NS`] for one coordinator
-/// period. Whether it was sent; `false` past that, or at once for a shard gone.
-async fn given_room(target: u16, mut message: Control) -> bool {
-  for _ in 0..REPLY_ROOM_ATTEMPTS {
-    match registry::send_control_or_return(target, message) {
-      Ok(()) => return true,
-      Err(registry::RefusedControl {
-        error: RtError::ControlFull { .. },
-        message: Some(unsent),
-      }) => {
-        message = unsent;
-        let _ = slates_rt::futures::sleep(REPLY_PACE_NS).await;
-      }
-      Err(_) => return false,
-    }
-  }
-  false
+/// Sends `message` to `target`, waiting out a full channel for one coordinator period of time ([`REPLY_ROOM_NS`]), as
+/// [`given_room_within`] waits: whether it was sent; `false` past that, or at once for a shard gone.
+async fn given_room(target: u16, message: Control) -> bool {
+  given_room_within(target, message, REPLY_ROOM_NS).await
 }
 
 /// [`run_on`] for work whose loss would leave state behind on `shard` (a closed connection's byte states, A-192): a
@@ -252,37 +239,50 @@ pub fn run_on_waiting(
   }
 }
 
-/// Sends `message` to `target`, waiting out a full channel for at most `budget_ns`, asked again every
-/// [`REPLY_PACE_NS`]: whether it was sent. `false` past the budget, or at once for a shard gone. A scatter's part waits
-/// this way (`crate::verbs::send_part`), within a budget its client can still hear the answer in.
+/// Sends `message` to `target`, waiting out a full channel for at most `budget_ns` of time, asked again every
+/// [`REPLY_PACE_NS`] and never past the budget's deadline: whether it was sent. `false` past the deadline, at once for a
+/// shard gone, or once a pause is refused (off a shard, where no wait can succeed; counted). A scatter's part waits this
+/// way (`crate::verbs::send_part`), within a budget its client can still hear the answer in. The budget is a span of the
+/// shard's clock, not a count of tries: until 2026-11-06 it was `budget / pace + 1` tries of one pause each, and on a
+/// starved shard every pause ran late, so the wait stretched with the starvation (51 tries took 1.54 s against a
+/// 500 ms budget with the shard kept off its CPU 20 ms at a time; `a_status_on_a_starved_shard_is_refused_overloaded_on_time`
+/// in `crates/server/tests/ack_release.rs`).
 pub(crate) async fn given_room_within(target: u16, mut message: Control, budget_ns: u64) -> bool {
-  let attempts = budget_ns
-    .checked_div(REPLY_PACE_NS)
-    .unwrap_or(0)
-    .saturating_add(1);
-  for _ in 0..attempts {
+  let deadline = slates_rt::futures::now_ns().saturating_add(budget_ns);
+  loop {
     match registry::send_control_or_return(target, message) {
       Ok(()) => return true,
       Err(registry::RefusedControl {
         error: RtError::ControlFull { .. },
         message: Some(unsent),
-      }) => {
-        message = unsent;
-        let _ = slates_rt::futures::sleep(REPLY_PACE_NS).await;
-      }
+      }) => message = unsent,
       Err(_) => return false,
     }
+    let left = deadline.saturating_sub(slates_rt::futures::now_ns());
+    if left == 0 {
+      return false;
+    }
+    if slates_rt::futures::sleep(left.min(REPLY_PACE_NS))
+      .await
+      .is_err()
+    {
+      state::with_state_counted(|s| s.count(ROOM_PAUSE_REFUSED, 1));
+      return false;
+    }
   }
-  false
 }
+
+/// Counter: a scatter part's pause for room refused ([`given_room_within`]): only off a shard, so a tripwire.
+pub(crate) const ROOM_PAUSE_REFUSED: &str = "xshard.room_pause_refused";
 
 /// Shape: the pace of a reply's retries for room — a tenth of a coordinator period, the collection loops' cadence
 /// (`crate::fleet::POLL_PER_PERIOD`), so a waiting reply asks about as often as the shard's loops turn.
 const REPLY_PACE_NS: u64 = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
 
-/// Shape: the attempts a reply makes for room: one coordinator period at [`REPLY_PACE_NS`] (the period the daemon's
-/// own loops tolerate a stall for before acting), plus the first.
-const REPLY_ROOM_ATTEMPTS: u64 = crate::fleet::POLL_PER_PERIOD + 1;
+/// Derived: how long a result carried home waits for room: one coordinator period (`HEARTBEAT_NS`), the period the
+/// daemon's own loops tolerate a stall for before acting. A span of the shard's clock, not a count of tries (until
+/// 2026-11-06 it was `POLL_PER_PERIOD + 1` tries of [`REPLY_PACE_NS`], which a starved shard stretched).
+const REPLY_ROOM_NS: u64 = crate::daemon::HEARTBEAT_NS;
 
 /// Format: the status counter of results that could not be carried home ([`send_back`]).
 pub(crate) const REPLY_DROPPED: &str = "xshard.reply_dropped";
@@ -481,7 +481,7 @@ mod tests {
     // enough: on a loaded shared runner they are not, and this failed with the daemon behaving correctly
     // (CI run 39073360651, macOS lane). The assertion that matters is the next one — the reply arrived once
     // there was room — and it keeps its bound.
-    let room = std::time::Duration::from_nanos(REPLY_PACE_NS * REPLY_ROOM_ATTEMPTS);
+    let room = std::time::Duration::from_nanos(REPLY_ROOM_NS.saturating_add(REPLY_PACE_NS));
     assert!(receiver.recv_timeout(room).is_ok(), "the filler");
     let carried = receiver.recv_timeout(room);
     assert!(
@@ -539,6 +539,97 @@ mod tests {
       ended_seen.recv_timeout(REPORT_WAIT).is_ok(),
       "the future ran to its end past the call's deadline"
     );
+    daemon.stop();
+  }
+
+  /// The wait for room is a span of time on a busy shard too (2026-11-06). Do: on a shard, fill a stand-in slot's
+  /// one-message channel and never drain it; keep the shard busy 20 ms at a time back to back with a task that spins and
+  /// yields; and wait for room for a result carried home there. Expect: the wait gives up about one
+  /// coordinator period after it began, not much more. Before, it was a count of tries of one pause each, and each try
+  /// lasted a pause plus the shard's busy poll.
+  #[test]
+  // The test thread waits for the result off the shard.
+  #[allow(clippy::disallowed_methods)]
+  fn a_result_sent_home_to_a_full_channel_waits_its_period_in_time_on_a_starved_shard() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    /// Shape: how long the starver keeps the shard busy at a time: twice the room wait's pause.
+    const STARVED_FOR_NS: u64 = 2 * REPLY_PACE_NS;
+    static DONE: AtomicBool = AtomicBool::new(false);
+    static WAITED_NS: AtomicU64 = AtomicU64::new(0);
+    static SENT: AtomicBool = AtomicBool::new(true);
+    static LONGEST_POLL_NS: AtomicU64 = AtomicU64::new(0);
+    DONE.store(false, Ordering::Release);
+    LONGEST_POLL_NS.store(0, Ordering::Release);
+    let daemon = crate::daemon::audit_daemon();
+    let (registration, receiver) = crate::daemon::observe_first(&daemon, |_state| {
+      let (registration, receiver) = registry::register(
+        4,
+        1,
+        registry::RegisterKick::Kick(slates_rt::driver::Kick::none()),
+      )
+      .unwrap();
+      let home = registration.shard();
+      let filler = SpawnRequest::new(Box::pin(async {}), None);
+      registry::send_control(home, Control::Spawn(Box::new(filler))).unwrap();
+      let starver = slates_rt::futures::spawn(async {
+        while !DONE.load(Ordering::Acquire) {
+          // A busy poll of a fixed length: a spin, since a short sleep on macOS under a launchd job's timer policy
+          // comes back several times late (CLAUDE.md, the loop-responsiveness gotcha).
+          let began = std::time::Instant::now();
+          while began.elapsed() < std::time::Duration::from_nanos(STARVED_FOR_NS) {
+            std::hint::spin_loop();
+          }
+          // How long the poll really held the shard, preemption by the host included: the wait's overshoot past its
+          // deadline is at most the poll under way then, so the bound is measured, not assumed.
+          let held = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+          LONGEST_POLL_NS.fetch_max(held, Ordering::AcqRel);
+          slates_rt::futures::yield_now().await;
+        }
+      })
+      .unwrap();
+      slates_rt::futures::detach(starver).unwrap();
+      let waiter = slates_rt::futures::spawn(async move {
+        let began = slates_rt::futures::now_ns();
+        let sent = given_room(
+          home,
+          Control::Spawn(Box::new(SpawnRequest::new(Box::pin(async {}), None))),
+        )
+        .await;
+        WAITED_NS.store(
+          slates_rt::futures::now_ns().saturating_sub(began),
+          Ordering::Release,
+        );
+        SENT.store(sent, Ordering::Release);
+        DONE.store(true, Ordering::Release);
+      })
+      .unwrap();
+      slates_rt::futures::detach(waiter).unwrap();
+      (registration, receiver)
+    });
+    let started = std::time::Instant::now();
+    while !DONE.load(Ordering::Acquire) {
+      assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the wait ended"
+      );
+      std::thread::sleep(std::time::Duration::from_nanos(REPLY_PACE_NS));
+    }
+    let waited = WAITED_NS.load(Ordering::Acquire);
+    let longest = LONGEST_POLL_NS.load(Ordering::Acquire);
+    // The budget, then at most the busy poll under way at the deadline and the waiter's own next turn behind another,
+    // and one pause: a deadline overshoots by that, where a count of tries overshoots by a poll for every try.
+    let bound = REPLY_ROOM_NS + 2 * longest + REPLY_PACE_NS;
+    println!(
+      "a result's wait for room on a busy shard: {waited} ns (longest busy poll {longest} ns, bound {bound} ns)"
+    );
+    assert!(!SENT.load(Ordering::Acquire), "the channel never had room");
+    assert!(
+      waited < bound,
+      "the wait for room took {waited} ns on a busy shard, against a {REPLY_ROOM_NS} ns budget and a {longest} ns \
+       longest poll"
+    );
+    drop(receiver);
+    drop(registration);
     daemon.stop();
   }
 

@@ -344,6 +344,13 @@
 > Windows), after measuring what each delivers. The true spin's change stays on record, not landed (`agents/clients-spin`,
 > a75f9213), with its test (`a_spinning_shard_answers_sooner_than_a_parked_one`).
 
+> **A wait for room counted tries, not time (2026-11-06, §4.9, §4.14; fixed).** A scatter part's wait for room
+> (`xshard::given_room_within`, 51 tries) and a result's carried home (`send_back`, 11 tries) were counts of a 10 ms
+> pause. On a busy shard each try lasted a pause plus a busy poll. Measured on macOS arm64 with the shard busy 20 ms a
+> poll: a status answered in 1.96 s, past the hold, and was not refused; a result's 100 ms wait gave up after 986 ms.
+> Both are now deadlines on the shard's clock: 542–724 ms and 102–127 ms. Swept: no other counted wait. Record:
+> `docs/bugs/2026-11-06-a-wait-for-room-counted-tries-not-time.md`.
+
 > **A scatter whose part could not be sent never answered (2026-11-05, §4.9, §4.14; fixed).** `scatter_acknowledge`,
 > `scatter_list`, `scatter_grants` and `scatter_status`, the server's four scatter tables, settled a part whose spawn
 > the other shard's full control channel refused by calling their gather inside `serve`. The nested state borrow is
