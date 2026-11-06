@@ -1,0 +1,179 @@
+   Compiling cfg-if v1.0.4
+   Compiling syn v3.0.5
+   Compiling serde_core v1.0.229
+   Compiling windows_x86_64_msvc v0.53.1
+   Compiling getrandom v0.4.3
+   Compiling cpufeatures v0.3.1
+   Compiling constant_time_eq v0.4.2
+   Compiling jobserver v0.1.35
+   Compiling arrayvec v0.7.8
+   Compiling cc v1.4.5
+   Compiling windows-targets v0.53.5
+   Compiling zmij v1.0.23
+   Compiling memchr v2.8.3
+   Compiling itoa v1.0.18
+   Compiling windows-sys v0.60.2
+   Compiling blake3 v1.8.7
+   Compiling serde_json v1.0.151
+   Compiling serde_derive v1.0.229
+   Compiling memmap2 v0.9.11
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+   Compiling slates-wire-derive v0.1.0 (D:\a\slates\slates\crates\wire-derive)
+   Compiling twox-hash v2.1.4
+   Compiling tinyvec_macros v0.1.1
+   Compiling tinyvec v1.13.2
+   Compiling lz4_flex v0.11.6
+   Compiling unicode-normalization v0.1.25
+   Compiling serde v1.0.229
+   Compiling slates-image v0.1.0 (D:\a\slates\slates\crates\image)
+   Compiling zstd-safe v7.3.0
+   Compiling zstd v0.13.3
+   Compiling slates-archive v0.1.0 (D:\a\slates\slates\crates\archive)
+   Compiling slates-machine v0.1.0 (D:\a\slates\slates\crates\machine)
+   Compiling slates-mem v0.1.0 (D:\a\slates\slates\crates\mem)
+   Compiling slates-wire v0.1.0 (D:\a\slates\slates\crates\wire)
+   Compiling slates-ipc v0.1.0 (D:\a\slates\slates\crates\ipc)
+   Compiling slates-rt v0.1.0 (D:\a\slates\slates\crates\rt)
+   Compiling slates-vfs v0.1.0 (D:\a\slates\slates\crates\vfs)
+   Compiling slates-anchor v0.1.0 (D:\a\slates\slates\crates\anchor)
+   Compiling slates-db v0.1.0 (D:\a\slates\slates\crates\db)
+   Compiling slates-bridge-core v0.1.0 (D:\a\slates\slates\crates\bridge-core)
+   Compiling slates-bridge-winfsp v0.1.0 (D:\a\slates\slates\crates\bridge-winfsp)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 39.79s
+     Running unittests src\lib.rs (target\debug\deps\slates_bridge_winfsp-68e58da83a217bfc.exe)
+
+running 79 tests
+test dll_version::tests::any_other_version_is_refused_with_its_number ... ok
+test dll_version::tests::the_version_the_receiver_was_written_from_is_admitted ... ok
+test held::tests::a_malformed_record_cannot_select_a_drive_or_volume ... ok
+test held::tests::the_mount_record_keeps_its_volume_drive_and_access ... ok
+test host::tests::a_daemon_killed_while_its_purges_open_is_delivered_exits_within_a_transaction_timeout ... 
+running 1 test
+slates-winfsp: reply spin window = 13300 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+WINFSP PURGE KILL: the purge's open is delivered and retained; killing the server
+WINFSP PURGE KILL: exited None after 999.9508ms
+
+thread 'host::tests::a_daemon_killed_while_its_purges_open_is_delivered_exits_within_a_transaction_timeout' (5256) panicked at crates\bridge-winfsp\src\..\tests\support\host.rs:301:3:
+a daemon killed while its purge's open was delivered did not exit within 1000 ms
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'host::tests::a_daemon_killed_while_its_purges_open_is_delivered_exits_within_a_transaction_timeout' (5256) panicked at crates\bridge-winfsp\src\..\tests\support\host.rs:98:27:
+called `Result::unwrap()` on an `Err` value: OsRefused { call: "TerminateProcess", code: Some(5) }
+stack backtrace:
+   0:     0x7ff6e63e7c09 - std::backtrace_rs::backtrace::win64::trace
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\..\..\backtrace\src\backtrace\win64.rs:85
+   1:     0x7ff6e63e7c09 - std::backtrace_rs::backtrace::trace_unsynchronized
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\..\..\backtrace\src\backtrace\mod.rs:66
+   2:     0x7ff6e63e7c09 - std::sys::backtrace::_print_fmt
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\sys\backtrace.rs:74
+   3:     0x7ff6e63e7c09 - std::sys::backtrace::impl$0::print::impl$0::fmt
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\sys\backtrace.rs:44
+   4:     0x7ff6e63f82b1 - core::fmt::write
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\core\src\fmt\mod.rs:0
+   5:     0x7ff6e63ec944 - std::io::default_write_fmt
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\io\mod.rs:626
+   6:     0x7ff6e63ec944 - std::io::Write::write_fmt<std::sys::stdio::windows::Stderr>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\io\mod.rs:1730
+   7:     0x7ff6e63cf995 - std::sys::backtrace::BacktraceLock::print
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\sys\backtrace.rs:47
+   8:     0x7ff6e63cf995 - std::panicking::default_hook::closure$0
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\panicking.rs:292
+   9:     0x7ff6e63e0e78 - std::panicking::default_hook
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\panicking.rs:319
+  10:     0x7ff6e63e1253 - std::panicking::panic_with_hook
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\panicking.rs:815
+  11:     0x7ff6e63cfa6e - std::panicking::panic_handler::closure$0
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\panicking.rs:688
+  12:     0x7ff6e63cdbaf - std::sys::backtrace::__rust_end_short_backtrace<std::panicking::panic_handler::closure_env$0,never$>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\sys\backtrace.rs:182
+  13:     0x7ff6e63d028e - std::panicking::panic_handler
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\panicking.rs:679
+  14:     0x7ff6e64c52fd - core::panicking::panic_fmt
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\core\src\panicking.rs:80
+  15:     0x7ff6e64c5057 - core::result::unwrap_failed
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\core\src\result.rs:1870
+  16:     0x7ff6e6000423 - enum2$<core::result::Result<tuple$<>,enum2$<slates_ipc::error::IpcError> > >::unwrap
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\core\src\result.rs:1231
+  17:     0x7ff6e6000423 - slates_bridge_winfsp::host::tests::Child::kill_and_reap
+                               at D:\a\slates\slates\crates\bridge-winfsp\tests\support\host.rs:98
+  18:     0x7ff6e60188a6 - slates_bridge_winfsp::host::tests::impl$2::drop
+                               at D:\a\slates\slates\crates\bridge-winfsp\tests\support\host.rs:153
+  19:     0x7ff6e5fa9a0f - core::ptr::drop_glue<slates_bridge_winfsp::host::tests::Scenario>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\core\src\ptr\mod.rs:823
+  20:     0x7ff6e600b02d - slates_bridge_winfsp::host::tests::a_daemon_killed_while_its_purges_open_is_delivered_exits_within_a_transaction_timeout
+                               at D:\a\slates\slates\crates\bridge-winfsp\tests\support\host.rs:305
+  21:     0x7ffbeda3bb00 - _CxxFrameHandler3
+  22:     0x7ffbeda23a9d - is_exception_typeof
+  23:     0x7ffbeda3ae8d - _C_specific_handler
+  24:     0x7ffbeda22ce2 - is_exception_typeof
+  25:     0x7ffbeda3b8f8 - _CxxFrameHandler3
+  26:     0x7ffbfcee6a7f - _chkstk
+  27:     0x7ffbfcd8eca3 - RtlUnwindEx
+  28:     0x7ffbeda3b3d6 - _C_specific_handler
+  29:     0x7ffbeda21c20 - is_exception_typeof
+  30:     0x7ffbeda22dd8 - is_exception_typeof
+  31:     0x7ffbeda3b8f8 - _CxxFrameHandler3
+  32:     0x7ffbfcee69ff - _chkstk
+  33:     0x7ffbfcd92a37 - RtlLocateExtendedFeature
+  34:     0x7ffbfcd8b071 - RtlRaiseException
+  35:     0x7ffbfa7c7d9a - RaiseException
+  36:     0x7ffbeda255a9 - CxxThrowException
+  37:     0x7ff6e63ecd6d - panic_unwind::imp::throw_exception
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\panic_unwind\src\seh.rs:368
+  38:     0x7ff6e63ecc45 - panic_unwind::imp::panic
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\panic_unwind\src\seh.rs:302
+  39:     0x7ff6e63ecc45 - panic_unwind::__rust_start_panic
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\panic_unwind\src\lib.rs:103
+  40:     0x7ff6e63d003f - std::panicking::rust_panic
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\panicking.rs:887
+  41:     0x7ff6e63e12ce - std::panicking::panic_with_hook
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\panicking.rs:840
+  42:     0x7ff6e63cfa6e - std::panicking::panic_handler::closure$0
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\panicking.rs:688
+  43:     0x7ff6e63cdbaf - std::sys::backtrace::__rust_end_short_backtrace<std::panicking::panic_handler::closure_env$0,never$>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\sys\backtrace.rs:182
+  44:     0x7ff6e63d028e - std::panicking::panic_handler
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\panicking.rs:679
+  45:     0x7ff6e64c52fd - core::panicking::panic_fmt
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\core\src\panicking.rs:80
+  46:     0x7ff6e600ae2c - slates_bridge_winfsp::host::tests::a_daemon_killed_while_its_purges_open_is_delivered_exits_within_a_transaction_timeout
+                               at D:\a\slates\slates\crates\bridge-winfsp\tests\support\host.rs:301
+  47:     0x7ff6e5fff558 - slates_bridge_winfsp::host::tests::a_daemon_killed_while_its_purges_open_is_delivered_exits_within_a_transaction_timeout::closure$0
+                               at D:\a\slates\slates\crates\bridge-winfsp\tests\support\host.rs:257
+  48:     0x7ff6e5fb4042 - core::ops::function::FnOnce::call_once<slates_bridge_winfsp::host::tests::a_daemon_killed_while_its_purges_open_is_delivered_exits_within_a_transaction_timeout::closure_env$0,tuple$<> >
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\core\src\ops\function.rs:250
+  49:     0x7ff6e60bba60 - core::ops::function::FnOnce::call_once
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\core\src\ops\function.rs:250
+  50:     0x7ff6e60bba60 - test::__rust_begin_short_backtrace<enum2$<core::result::Result<tuple$<>,alloc::string::String> >,enum2$<core::result::Result<tuple$<>,alloc::string::String> > (*)()>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\test\src\lib.rs:724
+  51:     0x7ff6e60c992b - test::run_test_in_process
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\test\src\lib.rs:747
+  52:     0x7ff6e60c992b - test::run_test::closure$0
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\test\src\lib.rs:668
+  53:     0x7ff6e60c430d - test::run_test::closure$1
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\test\src\lib.rs:698
+  54:     0x7ff6e60c430d - std::sys::backtrace::__rust_begin_short_backtrace<test::run_test::closure_env$1,tuple$<> >
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\sys\backtrace.rs:166
+  55:     0x7ff6e60cd975 - std::thread::lifecycle::spawn_unchecked::closure$1::closure$0
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\thread\lifecycle.rs:70
+  56:     0x7ff6e60cd975 - core::panic::unwind_safe::impl$25::call_once
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\core\src\panic\unwind_safe.rs:275
+  57:     0x7ff6e60cd975 - std::panicking::catch_unwind::do_call
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\panicking.rs:576
+  58:     0x7ff6e60cd975 - std::panicking::catch_unwind
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\panicking.rs:544
+  59:     0x7ff6e60cd975 - std::panic::catch_unwind
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\panic.rs:359
+  60:     0x7ff6e60cd975 - std::thread::lifecycle::spawn_unchecked::closure$1
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\thread\lifecycle.rs:68
+  61:     0x7ff6e60cd975 - core::ops::function::FnOnce::call_once<std::thread::lifecycle::spawn_unchecked::closure_env$1<test::run_test::closure_env$1,tuple$<> >,tuple$<> >
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\core\src\ops\function.rs:250
+  62:     0x7ff6e63e6e93 - std::sys::thread::windows::impl$0::new::thread_start
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\sys\thread\windows.rs:58
+  63:     0x7ffbfbe2dd37 - BaseThreadInitThunk
+  64:     0x7ffbfcdbf2bc - RtlUserThreadStart
+error: test failed, to rerun pass `-p slates-bridge-winfsp --lib`
+
+Caused by:
+  process didn't exit successfully: `D:\a\slates\slates\target\debug\deps\slates_bridge_winfsp-68e58da83a217bfc.exe --test-threads=1 --nocapture` (exit code: 0xc0000409, STATUS_STACK_BUFFER_OVERRUN)
+## bridge oracles exit 127
