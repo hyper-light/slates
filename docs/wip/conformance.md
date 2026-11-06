@@ -13,6 +13,10 @@
 > - The deterministic red, `a_live_shipped_volume_makes_a_writer_wait_for_stopped_candidates_rather_than_fail`
 >   (`xtask/src/conformance/live_fleet.rs`): with both candidates stopped, a size change failed `ETIMEDOUT` after 57.1 s
 >   through the soft mount (§4.6), where A-200 says the writer waits.
+> - Linux and Windows (diagnostics run 42150662467). `ubuntu-latest`: the live fsx passed on all three transports, as
+>   plain; the live fsstress hung over three hours until cancelled. `windows-latest`: the live fleet never formed
+>   (WSAECONNRESET on a handshake). `windows-11-arm`: the fleet formed for winfstest, whose 628 cases matched plain, but
+>   one candidate held nothing; it did not form for fsx.
 > GAPS ("A live-shipped volume fails a waiting writer…") holds the evidence; the lists are unchanged, since a live
 > volume must conform as a plain one does and no list may grow for it.
 
