@@ -3863,6 +3863,11 @@ daemon through the rendezvous's socket file (A-187).
 > in-process form is served (the libkrun and vhost-user bindings are owed), the guest form is not
 > yet on the `attach`/`status` wire, and the conformance evidence is the simulated guest driver
 > until a live Linux guest runs (AC-9.7). Record: `docs/wip/virtiofs.md`.
+>
+> **Reconciled 2026-11-06 (VFS plan Step 15).** The vhost-user binding is built (1dc69e13), its guest form is on the
+> attach verb (ff9964df, A-169), and a live Linux guest runs the conformance roster through it (557dd1e1, 5ad111d3;
+> AUD-29-64/68/78 closed, 9edd0681). Still owed: the in-process (libkrun) binding and its guest form on the wire
+> (`SeamNotOnWire`).
 
 > **Status (OCI handoff and the capability report, 2026-09-14).** `attach` and `status` report every
 > transport with the six facts above (`crates/server/src/transports.rs`, pure over one platform seam;
@@ -3902,6 +3907,10 @@ daemon through the rendezvous's socket file (A-187).
 > `BindingNotBuilt`; the vhost-user form (`AttachRequest::VhostUserFs`, A-169) is the exception, its
 > device's socket end handed to the client, which gives it to the VMM (`slates vhost-user`). Owed: the bind on Linux once the daemon serves the FUSE mount; a live guest for
 > AC-9.7. Record: `docs/wip/oci-handoff.md`.
+>
+> **Reconciled 2026-11-06 (VFS plan Step 15).** The Linux bind over the daemon's FUSE mount and the container lane run
+> on a real kernel in CI (6ba06780, f7c88d2f; 9edd0681), and a live guest is AC-9.7's evidence on the vhost-user route
+> (5ad111d3). Still owed: a live guest of the in-process route.
 
 **A VMM with no folder sharing: the disk-image form (A-160).** A volume reaches a VM as a host mount shared in by the
 VMM (`docs/wip/virtiofs.md` §8 item 7). Firecracker shares no folder: it has only block and pmem devices backed by
@@ -4661,8 +4670,13 @@ hard links and snapshot versions. No live kernel endpoint state is part of the i
 >
 > Evidence: `crates/cluster/tests/member_plane.rs` (5 tests, the takeover acceptance test ported), the server's unit
 > tests, and the fleet suite over the plane (`crates/server/tests/fleet.rs`).
+>
+> **Reconciled 2026-11-06 (VFS plan Step 15).** The owed re-vendor of hyper-raft c875028 is done (d50f3190).
 
 > **Status (2026-09-14, the KIND lane).** The KIND lane runs the fleet on real Linux pods over a real network, installed by the Helm chart — the WAN status owed exactly this. It proves the image, the chart and its render, per-pod DNS resolution, cross-node UDP, mutual-TLS session establishment on both planes, fleet formation (peers probed, one council leader, election timing derived from the measured cross-node RTT tail, ≈ 3.6–6 ms), content placement at f + 1, and the SIGKILL takeover (the owner's pod deleted, the survivors retire it in ≈ 7 s, the successor serves the volume). It found five real defects the loopback and simulation harnesses never reached — four fixed on the lane's branch: the anchored-first-boot generation off-by-one that blocked all fleet formation, the epoll one-shot re-add, the core-matrix affinity leak, and the segment-handoff double-close; the fifth root-caused there with its failing test written — a fleet node's own tasks outside its task budget (`clients_per_shard × 2 + 5`, 25 at 1 GiB, against `5 + 6 × peers` fleet tasks), a client admission the runtime refuses dropped unrun, the client's id leaked until the node refuses every client, one pod of five never Ready — and fixed on main the same day by the fleet's derived task share (`DaemonConfig::with_fleet`, the §4.3 status of this date), with that test green on the merged tree; the id leak on a refused admission is closed separately (a drop guard on the admission future) — and built DNS-name dialing. Measured on main the same day once the task share landed (18:24–18:47): five replicas install and form in 7.5 s (`f = 2`, every pod probing four peers, one leader), and the `tc netem` profiles hold their leader for a three-minute window each with the election base derived from the measured tails (20 periods at 80 ms ± 20 ms, 24–25 with 1 % loss, 77–79 at the 350 ms ceiling — the numbers in the WAN-timing status above). Owed: a whole-pod restart rejoining — the lane's diagnostics show the replacement forms no probe session to its peers though all three pods are published Service endpoints and its self-refutation is correct in isolation, so this is a session-formation diagnosis (the demultiplexer's session lifecycle on a peer's IP change), not the incarnation design question first recorded (`docs/wip/kind-lane.md`); and a mount read-back inside a pod. Record: `docs/wip/kind-lane.md`. **Found by the merge (2026-09-14):** the lane's 38-peer test could not be dialed on main either, for a different reason than the task budget — a server's handshake flight carried the roster (rustls's certificate-authority hints: 3,024 bytes at 64 peers against the 2,048-byte receive buffer) and was truncated at the dialer; the roster verifier now sends no hints, an oversize flight is refused typed at the sender, and the test is green in 1.57 s (`docs/bugs/2026-09-14-servers-handshake-flight-grows-with-its-roster.md`).
+>
+> **Reconciled 2026-11-06 (VFS plan Step 15).** A whole-pod restart rejoins (8a3bc497; GAPS, CI job 105312670637).
+> Still owed: a mount's read-back inside a pod after a takeover.
 
 > **Correction (2026-09-17, KIND rejoin).** The session-formation diagnosis marked owed above
 > is closed by the retirement/re-dial lifecycle and fresh-member work. The September 15 lane
@@ -4719,6 +4733,9 @@ struct Neighbourhood { hosts: SmallVec<HostId> /* the scatter width S, across fa
 > Leadership or configuration changes cancel the round. The append wire format carries the context.
 > The separate service owner-lease gate is now built (AUD-08, 2026-09-19); see the "Leases and reads"
 > status below.
+>
+> **Reconciled 2026-11-06 (VFS plan Step 15).** Overlay recovery is built and proven through the daemon (0e5a4b55);
+> its in-place refinement stays owed.
 
 > **Status (2026-09-14, AUD-07; supersedes the counter-derived identity claims above).**
 > Every daemon start now has a random boot nonce and a fresh member id. Both configuration groups
@@ -6145,6 +6162,8 @@ the format floor.
 >   resource bound: restore keys entries by path, so a chain `d` deep costs `O(d²)`
 >   (`docs/bugs/2026-09-30-an-export-past-the-manifest-depth-bound-emitted-an-unreadable-archive.md`).
 > - **Still owed.** Restore's output is dense (AUD-29-57).
+>
+> **Reconciled 2026-11-06 (VFS plan Step 15).** A restore's output is sparse again (5106abc2; AUD-29-57 closed, A-55).
 
 ### 4.12 Agent surfaces (D-19)
 
@@ -6164,6 +6183,10 @@ the format floor.
 > server-side grant records/control transport; same-uid human authority remains unestablished.
 > MCP, Python/TypeScript SDKs, generated surface parity and user-facing merge/guest flows are
 > planned. Descriptions below are required interfaces, not commands verified to work today.
+>
+> **Reconciled 2026-11-06 (VFS plan Step 15).** Built since: MCP (30d34e2d, e82ce2e4), the Python and Node SDKs
+> (d44e2962, cbb9562d), `slates grant` (596bfb04), and the merge and guest flows (93176ff7, ff9964df). Still owed: one
+> operation descriptor generating every surface (schema parity is kept by hand; GAP-A9-10).
 
 > **Status (2026-09-14, publish lane).** Both SDKs are publishable under the names §2.4 gives:
 > `slates` on PyPI (the wheel and the sdist; the name was free on 2026-09-14) and
@@ -6374,6 +6397,9 @@ that the current uid-based implementation enforces them.
 > verbs, the delegated consumer scope over the fleet transport, MCP servable roots against the access
 > list, and the harness-owned delivery of the capability (an inherited descriptor is the
 > recommendation). Record: `docs/wip/enrollment.md`.
+>
+> **Reconciled 2026-11-06 (VFS plan Step 15).** `enroll`, `revoke` and `share` (762bc91f) and the harness's capability
+> delivery on an inherited descriptor (1e81737, 2a9d2ac, 762bc91f) are built.
 
 > **Status (2026-09-14).** The harness delivery channel is built, as the inherited descriptor
 > (`agent/consumer-capability`: `1e81737`, `2a9d2ac`, `762bc91`): a harness writes the consumer id and
@@ -6602,6 +6628,10 @@ No copy-up, hashing, archive or landing step opens a host special file as regula
 > Base data/metadata behavior is not fully connected to every mounted operation (BUG-5 and
 > sibling audit), and restart does not yet recover complete volume contents (BUG-11).
 > Historical tests in GAPS §8c/§8d were not rerun for this amendment.
+>
+> **Reconciled 2026-11-06 (VFS plan Step 15).** BUG-5 is swept (991c84e; GAP-A9-3), apart from the base entries' owner
+> fields and the mounted conformance run. BUG-11 is closed (9c97ce6b, 5127b4b3). `slates grant` issues a grant
+> (596bfb04); the Linux issuer surface stays owed (GAPS).
 
 > **Status (2026-10-01, AUD-29-62: contained base access on every platform).** The Windows base host is
 > descriptor-relative like the Unix one: it retains a handle per opened directory and opens each entry with
@@ -7015,6 +7045,8 @@ stays in the overlay.
 > dropped by the reaper (`crates/client/tests/presentation.rs`; it outlived the client before), and a
 > presentation past the bound is refused with nothing allocated or recorded. Record:
 > `docs/bugs/2026-09-29-landing-presentations-were-never-consumed-or-bounded.md`.
+>
+> **Reconciled 2026-11-06 (VFS plan Step 15).** The shard-step percentile lane is built (b111244e; AUD-29-25 closed).
 
 > **Status (2026-09-29, A-45, AUD-29-05).** A landing advances only entries that reached the durability
 > boundary, and says what it achieved. Before, a directory that failed to open for its sync was skipped
@@ -7064,6 +7096,10 @@ stays in the overlay.
 > - **Owed:** the unsliced finish, the directory syncs, the metadata calls, the base plane's cold reads, and a thread
 >   kept for the landing. GAPS holds each, with its measurement.
 > - Record: `docs/bugs/2026-10-10-a-landings-durability-waits-held-its-shard-on-a-busy-machine.md`.
+>
+> **Reconciled 2026-11-06 (VFS plan Step 15).** The landing's finish is sliced (864ec139, A-133). Still owed:
+> directory syncs and metadata calls off the shard; the base plane's cold reads are deferred until a slow disk shows
+> them; a thread kept for the landing was measured and rejected (GAPS).
 
 > **Status (2026-10-11, A-133).** A landing's finish is sliced; its advance no longer holds the shard.
 > - **How:** the advance runs one entry a unit under the step budget, driven by the server between yields, the report's
@@ -7184,6 +7220,11 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > (a work is not a VFS volume; the VFS journal as the one declaration path, the bridge's `EROFS`), the
 > extent-backed green chain, cooperative slicing of the origin seed, pipelined and hedged merge records,
 > green takeover and a late holder's catch-up.
+>
+> **Reconciled 2026-11-06 (VFS plan Step 15).** Green takeover materializes a taken-over green from the successor's
+> accepted records (40aa3de7, AUD-14); a successor with a short prefix waits for GAP-A9-7's ledger-prefix transfer. A
+> late holder's catch-up is built (AUD-13, below). Still owed: mounted work and green volumes, the extent-backed green
+> chain, pipelined and hedged merge records.
 
 > **Status (2026-09-18, AUD-14: a taken-over green is servable).** The generic takeover promoted one adopted record and materialized content only for a plain volume's `HeadValue`; a green's adopted `MergeRecordValue` left the successor with a holder replica and nothing to serve — no catalog record, origin, chain, engine or placed version. Now the record value carries the green's name, evidence policy and owner (from the catalog, at `enqueue_record`), the takeover completion routes an adopted merge record to `pending_green_materializations`, and `materialize_pending_greens` gathers the chain from the successor's **own accepted records** (its holder acceptor's persisted positions give every version's input manifest; the held content gives the origin and each increment, `recover_green_inputs`) and materializes it on the shard the id routes to (`materialize_taken_over_green`): the catalog entry, the origin and every increment re-recorded durably, the engine replayed by the boot derivation and its head identity checked against the adopted record's — a mismatch refuses the green loudly — then the head placed. A successor whose accepted prefix is shorter than the adopted head stays pending, counted (`merge.takeover_incomplete`): the ledger-prefix transfer is GAP-A9-7's contract. Regression: three-node `f = 1`, three versions, owner dies, the successor's chain identities equal the owner's, `versions`/reads/a new submit and its retry serve through the public client (`docs/bugs/2026-09-18-green-takeover-left-no-servable-chain.md`).
 
