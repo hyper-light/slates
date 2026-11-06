@@ -59,6 +59,8 @@ const RETAIN: usize = 4;
 /// Counter: a live volume's publication that could not be shipped as an entry, because its content could not be read,
 /// sealed or appended; its next publication ships the whole volume.
 const LIVE_REFUSED: &str = "fleet.live.refused";
+/// Counter: whole records appended to a live log, each a copy of the volume's content.
+const LIVE_WHOLE: &str = "fleet.live.whole";
 /// Counter: entries appended to a live volume's log on this owner shard.
 const LIVE_APPENDED: &str = "fleet.live.appended";
 /// Counter: entries a holder refused to keep (over its bound, unauthorized, malformed).
@@ -579,13 +581,10 @@ fn answer(state: &mut ShardState, entry: Awaiting, reply: slates_ipc::protocol::
   }
 }
 
-/// Notes each live-shipped volume of a committed checkpoint, whose whole image ships ([`ship_captured`]).
+/// Keeps, of the live records taken for a committed checkpoint (`verbs::capture_live_changes`), those of the volumes it
+/// carried: a volume it left out stays dirty and publishes again, record and all.
 pub(crate) fn note_checkpoint(state: &mut ShardState, volumes: &[slates_db::catalog::VolumeId]) {
-  for id in volumes {
-    if is_live(state, *id) {
-      state.live.captured.push((*id, None));
-    }
-  }
+  state.live.captured.retain(|(id, _)| volumes.contains(id));
 }
 
 /// Ships what the publication that just committed recorded of each live-shipped volume ([`published`]).
@@ -667,11 +666,11 @@ pub(crate) fn published(
     record.map(<[u8]>::to_vec)
   };
   let Some(record) = built else {
-    refuse(state, id);
+    refuse(state, id, "fleet.live.refused.no_record");
     return;
   };
   let Some(payload) = payload(state, id, whole, record) else {
-    refuse(state, id);
+    refuse(state, id, "fleet.live.refused.no_payload");
     return;
   };
   let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
@@ -692,17 +691,21 @@ pub(crate) fn published(
         live.whole = Some((head, payload));
       }
       state.count(LIVE_APPENDED, 1);
+      if whole {
+        state.count(LIVE_WHOLE, 1);
+      }
       resolve(state, id.bytes);
       let sends = pending_sends(state, id.bytes);
       dispatch(state, sends);
     }
-    Err(_) => refuse(state, id),
+    Err(_) => refuse(state, id, "fleet.live.refused.no_credit"),
   }
 }
 
 /// A publication that could not become an entry: counted, and the volume owes a whole record next.
-fn refuse(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
+fn refuse(state: &mut ShardState, id: slates_db::catalog::VolumeId, why: &'static str) {
   state.count(LIVE_REFUSED, 1);
+  state.count(why, 1);
   if let Some(live) = state.live.shipping.get_mut(&id.bytes) {
     live.owes_whole = true;
   }

@@ -524,7 +524,9 @@
 > status "The tail and three more defects"). Open: the added median is the cross-shard dispatch round (50 µs not met);
 > p999 under 1 ms at load 30. Open: one exchange per message to every holder starved the second holder (never
 > accepted an entry, in six of nine process flows) and was rejected; why is not pinned down. Open, toward a filesystem
-> server replicated per write in under 1 ms: AC-8.9's credit backpressure; a candidate's copy kept across its own
+> server replicated per write in under 1 ms: AC-8.9's credit backpressure (since 2026-11-05 a local checkpoint ships a
+> live volume's changes, not a whole copy: 1 whole record in 2,051 where main made about 420; the credit itself is
+> still the fixed two, not yet derived from the measured apply rate and round trip); a candidate's copy kept across its own
 > restart; real-process chaos
 > (partitions, injected latency, volume failure, client disconnect). `put_wal` and the
 > loss-window report are unbuilt; a head still waits up to the 100 ms record period before its commit starts.

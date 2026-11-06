@@ -1103,6 +1103,52 @@ fn a_superseded_owner_resumed_after_its_takeover_is_fenced() {
   );
 }
 
+/// A-200, AC-8.9: a live log ships a write's change, not the volume. Do make `WRITES` stable NFS writes, one at a time,
+/// to a live-shipped volume. Expect one whole record, the log's first: a whole record copies every byte of the volume.
+/// Until 2026-11-05 every local checkpoint shipped one, and a shard checkpoints once its deltas reach the size of its
+/// metadata, so one write in four copied the volume's content (532 whole records in 2,050 writes, and the ones behind
+/// them refused for credit, 431).
+#[test]
+fn a_live_volumes_writes_ship_their_changes_not_the_volume() {
+  /// Shape: enough writes for the shard's journal to checkpoint many times over.
+  const WRITES: u32 = 200;
+  /// Shape: each write's bytes, a page.
+  const WRITE_BYTES: usize = 4096;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping change-only flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-changes");
+  let owner = &fleet.instances[(fleet.bootstrap + 1) % fleet.instances.len()];
+  let (mut live, file, _) = stable_session(owner, "changes", true);
+  let data = vec![0x5a_u8; WRITE_BYTES];
+  for write in 0..WRITES {
+    nfs::write(&mut live, &file, &data, 100 + write);
+  }
+  let counters = live_counters(owner);
+  drop(live);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!("live changes: {WRITES} writes: {counters:?}");
+  let of = |name: &str| counters.get(name).copied().unwrap_or(0);
+  assert!(
+    of("appended") >= u64::from(WRITES),
+    "every write reached the log: {counters:?}"
+  );
+  assert_eq!(
+    of("whole"),
+    1,
+    "only the log's first record is whole: {counters:?}"
+  );
+  assert_eq!(
+    of("refused"),
+    0,
+    "a sequential writer stays within its credit: {counters:?}"
+  );
+}
+
 /// A stable-write NFS session to a fresh volume's export on `owner`: the stream, the file, and the volume's id.
 fn stable_session(owner: &str, name: &str, live: bool) -> (std::net::TcpStream, Vec<u8>, String) {
   let id = value_of(

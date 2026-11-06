@@ -5784,6 +5784,17 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > candidate's). Before, the successor counted itself only when it held a copy (a takeover could wait for its quorum for
 > good), and a remote candidate's empty report raised no fence, which the nemesis model shows breaks StaleNeverCommits
 > (10 seeds; bug record `docs/bugs/2026-11-05-a-live-takeover-counted-no-empty-report-and-fenced-no-empty-copy.md`).
+>
+> **A checkpoint ships a live volume's changes, not the volume (2026-11-05).** A live log's whole record copies every
+> byte of the volume; it is owed only when a delta would not apply to what the candidates hold (the log's first record,
+> a holder behind the retained tail, a publication that could not be shipped). A shard's local checkpoint is none of
+> those: it restarts the recovery journal once the deltas reach the size of the shard's metadata, and it had been mapped
+> to a whole record, so one write in three copied the volume (68 of 201 records) and the record behind it was refused
+> for credit (431 of 2,395). Now the checkpoint takes each changed live volume's record as a delta publication does
+> (`verbs::capture_live_changes`) and ships it once the checkpoint commits, for the volumes the checkpoint carried
+> (`live_ship::note_checkpoint`). Held by `a_live_volumes_writes_ship_their_changes_not_the_volume` (red first: 68 whole;
+> after: 1, the log's first). Interleaved with main, the stable-write latency is unchanged (BENCHMARKS "What a
+> checkpoint shipped"); the whole copies and the credit refusals are gone.
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the

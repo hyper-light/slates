@@ -9837,6 +9837,7 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
     .collect();
   keyed.sort_by_key(|(key, _)| *key);
   let handles: Vec<_> = keyed.iter().map(|(_, handle)| *handle).collect();
+  capture_live_changes(state, &handles)?;
   let (_, end) = state.content_range;
   match state.content.as_ref() {
     None => return Err(slates_vfs::VfsError::RecoveryIncomplete),
@@ -9986,9 +9987,44 @@ fn stream_checkpoint(
     Ok(frame_bytes) => published.frame_bytes = frame_bytes,
     Err(e) => return Ok(Streamed::Refused(e)),
   }
-  // A checkpoint ships each live-shipped volume's whole image once it commits (A-200, `crate::live_ship`).
+  // What a live volume changed ships once the checkpoint commits, for the volumes it carried (A-200,
+  // `crate::live_ship`).
   crate::live_ship::note_checkpoint(state, &published.volumes);
   Ok(Streamed::Committed(published))
+}
+
+/// Takes each changed live-shipped volume's record before a checkpoint, as a delta publication takes it: a checkpoint is
+/// this shard's recovery journal restarting, which says nothing about what a live log needs, and it is due when the
+/// deltas reach the size of the shard's metadata, while a whole record carries every byte of the volume's content. Mapped
+/// to whole records, one write in three copied the volume (68 of 201 records, 2026-11-05, `live_fleet`). An unchanged
+/// live volume ships nothing. A record that cannot be taken is `None`: the volume ships whole.
+fn capture_live_changes(
+  state: &mut ShardState,
+  handles: &[Handle<VolumeSlot>],
+) -> Result<(), slates_vfs::VfsError> {
+  for handle in handles {
+    let slot = state.volumes.get_mut(*handle)?;
+    let id = slot.id;
+    let live = state
+      .db
+      .partition()
+      .volume(id)
+      .is_some_and(|volume| volume.policy.live_shipped);
+    if !live || being_destroyed(&slot.volume) || slot.volume.is_clean(&state.store) {
+      continue;
+    }
+    let mut record = Vec::new();
+    let encoded = slot.volume.encode_publication(
+      &state.store,
+      slot.host.as_mut().map(|host| host as &mut dyn HostFs),
+      &mut record,
+    );
+    state
+      .live
+      .captured
+      .push((id, encoded.ok().map(|()| record)));
+  }
+  Ok(())
 }
 
 /// A delta of what changed since the last publication, appended to the shard's delta log (A-68): each changed

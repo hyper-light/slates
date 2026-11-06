@@ -8451,6 +8451,28 @@ period. The old code on a second machine (kiln-a094a12d, x86-64, load 13–17, 0
 of the run at load 8 was under 1 ms. The goal's 50 µs is not met: the added median is the cross-shard dispatch round
 measured above. Owed: that round's hops measured apart, and the p999 under 1 ms at load 30.
 
+**What a checkpoint shipped (A-200, AC-8.9; 2026-11-05).** The same command, release binaries built from main
+(00e5269c, arm A) and from this branch (arm B), run alternately A, B, four rounds, in one capped unit on adacachy at load
+21–23. The owner's counters per 2,050 writes, then microseconds (p50 / p99 / p999 / max):
+
+| round | arm | whole records | credit refusals | sends with no session | plain | live | added at p50 |
+|---|---|---|---|---|---|---|---|
+| 1 | A | (not counted on main) | 431 | 612 | 17.4 / 55.9 / 96.9 / 702.7 | 109.2 / 419.2 / 1,090.5 / 1,263.9 | 91.9 |
+| 1 | B | 1 | 0 | 6 | 10.8 / 17.0 / 35.5 / 1,075.8 | 105.9 / 240.4 / 678.4 / 848.0 | 95.1 |
+| 2 | A | (not counted on main) | 437 | 433 | 14.4 / 84.6 / 363.1 / 563.6 | 133.8 / 600.8 / 1,123.4 / 2,519.8 | 119.4 |
+| 2 | B | 1 | 0 | 4 | 11.5 / 22.2 / 39.4 / 144.7 | 113.3 / 323.1 / 672.8 / 876.0 | 101.8 |
+| 3 | A | (not counted on main) | 419 | 623 | 16.2 / 52.9 / 72.5 / 74.2 | 109.9 / 230.9 / 898.3 / 1,105.8 | 93.7 |
+| 3 | B | 1 | 0 | 3 | 13.9 / 32.2 / 465.7 / 998.0 | 147.7 / 1,391.7 / 3,931.0 / 4,357.0 | 133.8 |
+| 4 | A | (not counted on main) | 439 | 567 | 13.5 / 59.5 / 87.0 / 322.1 | 104.1 / 231.6 / 656.9 / 1,061.9 | 90.7 |
+| 4 | B | 1 | 0 | 7 | 11.2 / 19.5 / 64.6 / 203.1 | 108.6 / 267.2 / 779.6 / 910.4 | 97.5 |
+
+Main appended 2,305–2,395 records for 2,050 writes, the extra ones whole copies made after a credit refusal; the branch
+appends one per write and one whole record, the log's first. **Reading.** Dead even on latency: the added median is
+90.7–119.4 µs on main and 95.1–133.8 µs on the branch, and a dead-even A/B lands no latency claim. What changed is what
+ships: about 420 copies of the volume per 2,050 writes on main against one, which on this one-file volume cost little
+and on a large volume would copy all of it each time. Round 3's slow tail on the branch came with its plain writes
+slowed as well (p999 465.7 µs).
+
 
 ## What a WinFsp mount and unmount wait for the Windows anchor (A-213; 2026-11-05)
 
