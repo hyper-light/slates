@@ -131,6 +131,9 @@ const PURGE_ECHOES: &str = "winfsp.purge_echoes";
 const RESTORED_READS: &str = "winfsp.restored_reads";
 /// Format: kernel requests settled from the retained receive journal before taking a new batch (A-198).
 const CAPTURED_SETTLED: &str = "winfsp.captured_requests_settled";
+/// Format: captured requests recovery answered with a refusal from the file system: a replayed Cleanup or Close whose
+/// open could not be ended. One whose open the dead daemon had already ended is answered done and not counted.
+const CAPTURED_REFUSED: &str = "winfsp.captured_requests_refused";
 /// Format: release attempts the anchor refused or did not answer, each repeated: the non-vacuity counter of the unmount
 /// oracle. A healthy anchor keeps it at zero.
 const HOLD_RELEASE_REFUSED: &str = "winfsp.hold_release_refused";
@@ -408,7 +411,7 @@ async fn await_mounted(
         ));
       }
       // No command (a round or a purge) is sent before the mount is up, so none can come back.
-      Some(Outcome::Notified(..) | Outcome::Purged(_) | Outcome::Recovered(_)) | None => {
+      Some(Outcome::Notified(..) | Outcome::Purged(_) | Outcome::Recovered { .. }) | None => {
         futures::idle().await
       }
     }
@@ -884,7 +887,10 @@ async fn reap(mut thread: MountThread, attachment: u64, released: bool) {
         return;
       }
       Some(
-        Outcome::Mounted(_) | Outcome::Notified(..) | Outcome::Purged(_) | Outcome::Recovered(_),
+        Outcome::Mounted(_)
+        | Outcome::Notified(..)
+        | Outcome::Purged(_)
+        | Outcome::Recovered { .. },
       ) => {}
       Some(Outcome::Failed(error)) => {
         slates_machine::log_line!("slates-server: ending WinFsp receive worker: {error}")
@@ -1112,7 +1118,10 @@ fn take_outcomes(s: &mut ShardState, mount: &mut WinFspMount) -> Result<bool, ()
         record_purges(s, &mut mount.retries, &purged);
       }
       Outcome::Mounted(_) => {}
-      Outcome::Recovered(count) => s.count(CAPTURED_SETTLED, count),
+      Outcome::Recovered { settled, refused } => {
+        s.count(CAPTURED_SETTLED, settled);
+        s.count(CAPTURED_REFUSED, refused);
+      }
       Outcome::Failed(error) => {
         slates_machine::log_line!("slates-server: WinFsp receive worker failed: {error}");
         mount.ending = true;
