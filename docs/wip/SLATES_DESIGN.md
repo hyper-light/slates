@@ -5621,6 +5621,11 @@ attachment flush barriers, hashing and puts have separately measured costs. An a
 without a client barrier covers only server-visible writes (§4.6); the volume reports `last_placed_snapshot_age` and `mirror_age`
 so an agent that needs durability can `await placed(scope)`.
 
+> **Status (2026-11-05, A-222: another host's write attachment).** A client on another node attaches a volume in the
+> record form, through the fleet's forward, and writes it through the file verbs; the owner records it under the
+> client's host and client, ends it at a detach by volume, the client node's reap or the host's retirement, and a
+> silent holder's lease at its term. Ownership migration and the snapshot's remote attach below stay owed.
+
 **Remote attach.** An agent on node B attaches a snapshot of a volume owned by A: B routes the id
 to A (or A's successor), reads the head record from A under its lease, fetches the manifest by
 identity from a recorded holder (metadata only), creates a local read-only attachment record,
@@ -13077,6 +13082,60 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Arm64 Windows proven** since (2026-10-27): the direct-map client tests, 20 of 20, on CI's `windows-11-arm` (run
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
+
+### A-222 — Another host's attachment is served by the owner, under a consumer that names the origin (accepted and built 2026-11-05)
+
+- **What it answers.** §4.10 and D-16 say "a write-intent attachment that stays on another host migrates [ownership]
+  there", so such an attachment exists, served by the owner, before any migration. None did: a client on node B naming
+  a volume node A owns was refused `NotFound` at `attach` (`Attach` was not a forwardable verb), so a client binary on
+  another machine could push to a green but never write a volume. Found by the fs-server lab of 2026-11-04; red test
+  `a_client_node_attaches_a_server_volume_for_writing_and_writes_through_it` (`crates/cli/tests/fs_server.rs`,
+  refused `NotFound` for 40 s on main bbfdbddb).
+- **Decided.**
+  1. `Attach` in the record form (`AttachRequest::Root`) is forwarded to the volume's owner as a volume-scoped write
+     is (`RequestBody::forwards_as_write`), under a completion record keyed by the origin's request id. Every other
+     form hands the client something of the owner's host (a mount, a device, a stream, a container bind) and is
+     refused by its kind, on the client's node before anything is sent and on the owner for any forward:
+     `AttachmentUnsupported { transport, reason: OwnedByAnotherHost }`.
+  2. The owner records the attachment under `Consumer::Remote { host, client }`: `host` is the forwarding peer's
+     authenticated member id (`serve_forward`'s `origin`, set as the request's origin), never a claim of the
+     request's; `client` the origin's client id. The write lease is taken on the owner as for a local writer (D-16).
+  3. The file verbs forward as they did; the owner serves a request only through an attachment of the requester's
+     own host (`remote_attach::may_use`): another host's attachment from that host, any other from this node. A
+     forward naming another host's attachment, or one of the owner's own, is refused `Forbidden`.
+  4. A detach of another host's attachment names its volume (`DetachOf { volume, attachment }`, `slates detach ID
+     --volume V`) and routes by it: an attachment id names its owner partition, not its host, so it cannot route
+     across hosts by itself. The owner checks the volume, the principal and the host.
+  5. Without a detach: the client's node remembers, per client, the volumes it attached on other hosts (bounded by the
+     client's ring slots, `remote_attach::bound`; past it `RemoteAttachmentsFull`), and its reap of a dead client
+     sends each owner `RemoteReap { volume, client }`, which ends that host's client's attachments there (the host
+     again the authenticated peer's, so a node reaps only its own clients). A host that leaves the configuration has
+     every remote attachment it held ended at each install that no longer lists it (`remote_attach::end_departed`).
+  6. **The bound on a silent holder is its write lease's term**, `failover_slo_ns` (derived in `take_write_lease`; 10
+     s by default): a reap, like a local one, ends the record and leaves the lease to its term (D-16 "Lease holder
+     crash: writes refused until the lease expires"); the owner's lease sweep releases it within one liveness budget
+     after.
+  7. R8: at one node nothing is forwarded and no attachment is `Remote`; `may_use` reads the same rule for a local
+     requester (its host is this node), so no branch serves the laptop differently.
+- **Measured** (adacachy, Linux x86_64, 2026-11-05; `SLATES_TEST_CLI=1 cargo +1.98.1 test -p slates-cli --test
+  fs_server`, two or three `slates daemon --fleet` processes on loopback): a client node attaches, writes two files the
+  owner reads, detaches by volume, and a write after it is refused; after `kill -9` of a holder process on the client
+  node, the owner ended its attachment in 1.72–1.78 s and its lease 10.0–10.1 s after the kill (bound 13 s: the term
+  plus two liveness budgets and the sweep); with the client node's daemon killed, the three-node fleet retired it and
+  the owner ended the attachment in 1.66 s (bound 40 s). Red checks, one each: without `end_departed` the retired
+  host's attachment stood 40 s; without the reap the killed holder's stood 13 s; with `may_use` always true the client
+  node overwrote the server's file through the server's own attachment.
+- **Not in this change.** Ownership migration to a writer that stays (the PNUTS rule) and the read-only remote attach of
+  a snapshot (§4.10 "Remote attach", A-112) stay owed. A CLI `attach` and its later `write` are separate processes,
+  so the attaching client is reaped within two liveness budgets of its exit, remote or local alike; an agent holds one
+  client for its session (the SDK), as the holder test does.
+- **Rejected: forwarded attaches under the shared forwarded pseudo-client.** No reap ever ends its attachments, so every
+  remote client's death would keep an attachment, and its lease, until the volume's destroy.
+- **Rejected: telling every peer of every dead client.** A round trip per peer for each exiting CLI process; the
+  bounded per-client set sends one per volume the client actually attached.
+- **Rejected: migrating ownership on attach.** §4.10 migrates only a writer that stays; migrating on each attach would
+  bounce ownership between agents on different hosts.
+Applied in the same change to: §4.10 (status), GAPS (top blockquote).
 
 ### A-216 — An acknowledgement is answered once the client's own shard has released its records (accepted 2026-11-05)
 Applied in the same change to: §4.9 (its status), `crates/server/src/verbs.rs` (`scatter_acknowledge`,

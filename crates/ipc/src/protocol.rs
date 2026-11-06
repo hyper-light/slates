@@ -754,6 +754,23 @@ pub enum RequestBody {
     /// Whether it is live-shipped from now on.
     live_shipped: bool,
   },
+  /// Detach an attachment of `volume` (§4.10, A-222): `Detach` routed by the volume, so an attachment another host's
+  /// owner holds is ended there (an attachment id names its owner partition, not its host). Appended.
+  DetachOf {
+    /// The volume the attachment is of.
+    volume: VolumeId,
+    /// The attachment.
+    attachment: u64,
+  },
+  /// End every attachment the sending host's dead `client` holds on `volume` (§4.10, A-222): sent by a node's reap of
+  /// a dead client to the owner of each volume that client attached from it. The owner trusts only the authenticated
+  /// peer as the host, so a node ends only its own clients' attachments. Never sent by a client. Appended.
+  RemoteReap {
+    /// The volume the dead client attached.
+    volume: VolumeId,
+    /// The dead client's id on the sending host.
+    client: u32,
+  },
 }
 
 /// Format: the name of the image file in an image volume's root (§4.6, A-160): what a VMM is pointed at.
@@ -1351,7 +1368,10 @@ impl RequestBody {
       | RequestBody::Enroll { .. }
       | RequestBody::Attest { .. }
       | RequestBody::Revoke { .. } => None,
-      RequestBody::Share { volume, .. } | RequestBody::LiveShip { volume, .. } => Some(*volume),
+      RequestBody::Share { volume, .. }
+      | RequestBody::LiveShip { volume, .. }
+      | RequestBody::DetachOf { volume, .. }
+      | RequestBody::RemoteReap { volume, .. } => Some(*volume),
     }
   }
 
@@ -1409,7 +1429,18 @@ impl RequestBody {
   /// record (§4.8 "Lookup"): a volume-scoped mutation ([`Self::volume`] names the volume, [`Self::mutates_shard_image`]
   /// changes it).
   pub fn forwards_as_write(&self) -> bool {
-    self.volume().is_some() && self.mutates_shard_image()
+    self.volume().is_some()
+      && (self.mutates_shard_image()
+        // An attachment in the record form, and its detach by volume, are recorded on the volume's owner whatever
+        // host the client is on (§4.10, A-222). Every other form hands the client something of the owner's host (a
+        // mount, a device, a stream), so it is not forwarded and is refused from another host by its kind.
+        || matches!(
+          self,
+          RequestBody::Attach {
+            form: AttachRequest::Root,
+            ..
+          } | RequestBody::DetachOf { .. }
+        ))
   }
 
   /// Whether a node may forward this verb to another node, so its reply can take a location round and a forward
@@ -2145,6 +2176,9 @@ pub enum UnsupportedReason {
   /// WinFsp's user-mode library (`winfsp-x64.dll`) could not be loaded: WinFsp is not installed on this host. slates
   /// installs nothing (R10); WinFsp's own installer is the one privileged piece (§4.6). Appended.
   WinFspNotInstalled,
+  /// The volume's owner is another host, and this form hands the client something of the owner's host (a mount, a
+  /// device, a stream, a container bind); only the record form is served across hosts (§4.10, A-222). Appended.
+  OwnedByAnotherHost,
 }
 
 /// One transport's report (§4.6 A-9: "supported transport, target-path constraints, read/write policy,
@@ -2870,6 +2904,13 @@ pub enum Refusal {
   MapsHeld {
     /// The writable maps held under the attachment.
     maps: u64,
+  },
+  /// A client already holds as many attachments of other hosts' volumes as its node keeps for it (§4.10, A-222):
+  /// the node remembers each so its reap can end them at their owners, and that memory is bounded. Nothing was
+  /// attached. Appended.
+  RemoteAttachmentsFull {
+    /// The bound.
+    bound: u64,
   },
 }
 

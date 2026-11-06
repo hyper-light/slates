@@ -4511,6 +4511,7 @@ async fn control_loop(
                 owner_route: None,
                 read_ahead: None,
                 read_ahead_pending: 0,
+                remote_volumes: Vec::new(),
               }) {
                 Ok(_) => admission.seat(),
                 Err(e) => {
