@@ -3826,7 +3826,7 @@ or executable regression was performed by this docs change.
 | GAP-A9-7 | BUG-12 acceptance-epoch fix and BUG-13 reachability correction landed separately in `d9cb6e5`; complete adoption-value/extension checks, message faults, read authority and real configuration core remain unestablished. | §4.8: accepted/proposed/promise separation, exact historical prefix, distinct quorums, safe leases and bounded epochs; configuration only on cold changes. | AC-8.18/T-8.16; AC-8.20/T-8.18; Phase 8. Model refinement/revalidation also owed, not run. |
 | GAP-A9-8 | Identity-only replication, mirror lag in records, no byte-complete holder admission, repair or cross-region service. | §4.10/§4.16: verified placed reference graph, real holder capacity, atomic generations, recomputation and time lag. | AC-8.19/T-8.17; original fleet gates; Phase 8. |
 | GAP-A9-9 | Enrollment and the grant issuer are built to the A-8 specification for one host: consumers are trusted enrollments under an account with scoped rights, channels bind by a delivered capability (never by uid or channel class), rights are checked before any lookup or effect, and grant authority is a verified capability. The harness delivery channel is built (2026-09-14): the capability travels on an inherited descriptor — a close-on-exec pipe whose read end one child inherits (cleared in the forked child on Unix; a `CreateProcessW` handle list on Windows), named by `SLATES_CONSUMER_FD`, taken once and refused typed when absent, not inherited, the wrong kind, the wrong length, corrupt or consumed — the client binds at connect and again by itself after a daemon restart, and `slates run` is the harness verb (with `enroll`/`revoke`/`share`). Still open: the cross-host consumer scope on the transport, MCP roots against the access list, and the Linux human surface (the anchor's segment is a descriptor only its children hold). | §4.13: trusted consumer enrollment, scoped rights before effects, protected grant issuer and manifest-bound approval; private content sharing scopes. | AC-2.13/T-2.15; AC-5.10/T-5.12; Phases 2/5. |
-| GAP-A9-10 | No MCP/SDKs; CLI ids/manual root setup, partial help/output and no grant issuance; schema parity and actual path readiness incomplete. | §4.12: one operation descriptor; scoped names, consistent JSON/help/errors/cursors; discoverable native/guest flows and exact capability status. | AC-5.9–5.11/T-5.11–5.13; Phase 5. |
+| GAP-A9-10 | Reconciled 2026-11-06 (Step 15): MCP (30d34e2d, e82ce2e4), both SDKs (d44e2962, cbb9562d), grant issuance (596bfb04) and the merge and guest flows (93176ff7, ff9964df) are built. Still open: one operation descriptor generating the wire, SDK, MCP and CLI surfaces (MCP schemas are hand-written, `crates/mcp/src/lib.rs` `tool_list`), so schema parity is kept by hand; actual path readiness. | §4.12: one operation descriptor; scoped names, consistent JSON/help/errors/cursors; discoverable native/guest flows and exact capability status. | AC-5.9–5.11/T-5.11–5.13; Phase 5. |
 | GAP-A9-11 | Separate frame classes do not bound CPU, device, arena or full-object transfer costs; resumable helper is not bounded end-to-end ingest. | §4.2/§4.9: all-resource QoS, bounded quanta/credits, verified named and unknown-length transfer, cancellation and release. | AC-0.10/T-0.10; AC-7.7/T-7.8; Phases 0/7/8. |
 | GAP-A9-12 | Closed registry, distinct identities with type-enforced causation, and typed loss/absence markers built and proven by use single-node (`e18619a`); open: cross-node trace propagation and the fleet/archive emitters (§4.8/§4.10 integration). (Was: signal names/absence and request-vs-trace causation not enforced end to end; nine spans were called seven.) | §4.14: closed registry, absence/freshness semantics, distinct identities and telemetry loss markers. | AC-0.11/T-0.11; Phase 0 foundation with surface/fleet integration. |
 | GAP-A9-13 | **Built single-node (2026-09-14, `docs/wip/clean-digest.md`):** verified current digest only (`Overlay::digest`, the `Digest` verb on the wire/CLI/MCP); invalidated before any mutation (`copy_up`, `base_forget`, listing refresh); bounded cache discovery (`Store.digests`, `digest_capacity`, typed counted `DigestCacheFull`); watcher hints backed by revalidation, overflow drops all. Owed: cooperative slicing of the hash, sealed-content digests, SDK exposure. (Was: clean-file digest export and bounded cache discovery not implemented; stale source knowledge must not imply clean content.) | §4.15: verified current digest only; invalidate before mutation; watcher hints backed by revalidation. | AC-1.17/T-1.21; Phase 1 core and bridge integration. |
@@ -4258,12 +4258,12 @@ a caught-up member's fetch with no bytes. The on-time fold skipped such a reply,
 - each latest-state refusal is counted by its reason (`lease.refused.superseded`,
   `lease.refused.unconfirmed`).
 
-**Open — CI run 36603261909's two failures are owner-lease refusals.** One is the NFS takeover test's
+**Closed by 16c847b4 (the owner lease keyed to the owner's own authority standing) (reconciled 2026-11-06, Step 15) — CI run 36603261909's two failures were owner-lease refusals.** One is the NFS takeover test's
 `NFS3ERR_JUKEBOX`, the other the CLI mount's `LeaseUnconfirmed { version: 3 }`. The lease and every record key
 on the one regional version, which each `Settle` and `Confirm` now advances. That churn is the hypothesis, and
 it is unproven until the refusal's reason is counted.
 
-**Open — the location test's `HomedElsewhere` (CI on `84cc9c1`) recurred locally, once in a suite run.**
+**Closed by 16c847b4 (test `a_node_whose_placement_lags_its_council_still_claims_what_it_owns`) (reconciled 2026-11-06, Step 15) — the location test's `HomedElsewhere` (CI on `84cc9c1`) recurred locally, once in a suite run.**
 - At the asking node the round met the successor's session out, asked it once it returned, and found no
   owner.
 - At the successor, one `fleet.owner_location.foreign_view` was counted.
@@ -6575,7 +6575,7 @@ An 8 MiB file was written on `a1` and read back byte-identical there (sha256 `5b
   - The fix is upstream in `../hyper-raft`. The reproducer is ignored until then.
   - `slates status` now shows each detector pair's suspicions and condemnations beside their theoretical
     allowance (`fleet_detector`).
-- **Open: cross-region reads still refused.** After the lease fix, region 1's reads answered `HomedElsewhere`:
+- **Closed by 4d3dc536 and the false-death fixes recorded below (reads correct, false deaths gone) (reconciled 2026-11-06, Step 15): cross-region reads still refused.** After the lease fix, region 1's reads answered `HomedElsewhere`:
   - three location rounds, all `unavailable`, one counting `no_session`;
   - in the run before, the same reads went `direct`.
 
@@ -6587,7 +6587,7 @@ An 8 MiB file was written on `a1` and read back byte-identical there (sha256 `5b
   volume.
 - **Mirroring in part (later the same day):** content shipping, `await placed(mirror)` and `mirror_age` are built
   (`docs/wip/mirroring.md` M1–M3). The mirrored head record and promotion adoption are still owed (M4).
-- **Open, and the core of condition 10: cross-region mirroring was not built.** §4.10 "Mirroring across regions"
+- **Closed by d789fb4e (M2/M3: home-placed snapshots shipped to the owner's neighbours) and 2a56388f (a promoted region serves) (reconciled 2026-11-06, Step 15) — the core of condition 10: cross-region mirroring was not built.** §4.10 "Mirroring across regions"
   ships every committed record and its content to the owner's neighbourhood in the mirror region, acknowledged at
   `f + 1` there, with `mirror_age` exposed. In the code:
   - `Placement::mirror_acked` is only ever `None`;
@@ -6714,12 +6714,12 @@ to 24.1 s, inside its 8–32 s noise band. The grid's share rose 1.6 % and its p
 
 On the two-network Docker topology (100 ms ± 40 ms, 3 % loss; `reads.sh`, three rounds, three readers in region 1):
 - Reads took 54.2–126.7 s; 8 of 9 were byte-identical. The median was about 120 s, against about 135 s before.
-- **Open: one read refused** after 54.2 s (`b0`, round 3). The counters name a forward that went out and was never
+- **Closed by 416f43ed (test `a_read_whose_owner_answered_past_the_takeover_bound_is_retried_by_the_client`) and 355a87fb (reconciled 2026-11-06, Step 15): one read refused** after 54.2 s (`b0`, round 3). The counters name a forward that went out and was never
   answered within its budget (`fleet.owner_location.forward_unanswered` 1). The client got `HomedElsewhere`, which by
   design (§4.8 "Lookup") it retries. Owed: a client-side retry of a refused read in `slates read` and the SDKs, under
   the same exactly-once rules as writes, or a measured case for retrying at the origin.
 
-**Open: `a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_live_peer` failed in 2 of the last 3
+**Closed by 5bf9e5e6 (a sealed head ships only once it carries every live key entry) and 47b190a6 (a forward re-locates within its budget) (reconciled 2026-11-06, Step 15): `a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_live_peer` failed in 2 of the last 3
 full fleet suites** with "retry not served: HomedElsewhere". It passes alone (4 of 4), at 6 concurrent copies (18 of
 18) and at 12 (36 of 36, load 6.7), so it needs the suite's state, not load (`CONDITIONS.md`, `019a149d`). The
 foreign daemon's counters after the last retry show a third location round that found no claim (`unavailable` 1,
@@ -6754,7 +6754,7 @@ and says which of its two write pairs failed.
   open until its refusal kind is read: 6 sequential and 4 concurrent full suites since its counter landed did not
   reproduce it.
 
-**Open (2026-10-07): `an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losing_both_paths_retires_it`
+**Closed by bc11feba, bee1bb41 and 3cf3265e (0 failures in 84 runs, then 36 of 36, recorded below) (reconciled 2026-11-06, Step 15). Was open (2026-10-07): `an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losing_both_paths_retires_it`
 fails under extreme load, on either detector snapshot.**
 - It first failed in a pair of concurrent full fleet suites run right after the hyper-swim re-vendor (`40c502fe`).
 - Alone, at 8 concurrent copies: 21 of 24 passed. Every failure was the hold: A retired B within 100 of its periods
@@ -7308,7 +7308,7 @@ file, snapshots it, and times the snapshot's placement at home and then in the m
   (`conflicting_position`). The shipment named the content holders known when built, and was rebuilt each period, so
   a holder whose first acknowledgement came back too late refused every later shipment. A mirror job now keeps its
   first shipment and resends it unchanged (`SealJob::shipment`).
-- **Open:**
+- **Closed by aefcc6da (a home placement recorded again keeps the snapshot's mirror placement) and 962d4a9e (a delivered pair key recorded apart) (reconciled 2026-11-06, Step 15). Was open:**
   1. Conflicts still occur, by head record (1–2 snapshots in 5 in some runs, 143–342 refusals). They coincide with
      mirror jobs being started again (`fleet.mirror.job_started` 6–10 for 5 snapshots); a restarted job builds a new
      shipment. The shipment must stay fixed per (object, sequence) across a job's restart, or a late acknowledgement
@@ -7337,7 +7337,7 @@ file, snapshots it, and times the snapshot's placement at home and then in the m
   twice with different holder sets. The per-(object, sequence) freeze, re-measured on that evidence, still conflicted
   (415/408 in one run of three) and is rejected again (`mirror-map2.patch`). A likely source not yet shown: the frozen
   entry dropped at the mirror placement's record, followed by a restarted job for the same snapshot.
-- **Open, sharpened:** the conflicting head value at one position has a source not yet found, and runs that ship
+- **Closed by aefcc6da (reconciled 2026-11-06, Step 15). Was open, sharpened:** the conflicting head value at one position had a source not yet found, and runs that ship
   nothing need the content-round counters beside `job_started` to place the stall. The next step is a log of each
   shipment's head bytes (hash) per (object, sequence) on the owner, to name which field differs.
 - New counters: `fleet.mirror.no_neighbourhood`, `job_started`, `content_rounds`, `acks`, `round_failed`,
@@ -8071,7 +8071,7 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
 - **Not won everywhere** (`BENCHMARKS.md`): with every CPU and a VM contended by other sessions' containers, four
   streams were 2.1–2.8× slower at 8,000 and 16,000 files, because more syncs in flight merge into fewer commits when
   commits are slow.
-- **Open, measured next:** sync threads kept for the landing rather than started per barrier. That would let every
+- **Measured and rejected (below: 17 µs a spawn, about 8 ms of a 1.8 s landing; not built) (reconciled 2026-11-06, Step 15). Was open, measured next:** sync threads kept for the landing rather than started per barrier. That would let every
   file's sync be in flight without the CPU burst.
 - **Linux lane** (bounded container, non-root): workspace clippy clean, run with 1.98.0's clippy and rustfmt installed
   from checksum-verified tarballs, since the Docker VM has had no network since Docker Desktop restarted. `slates-land`
