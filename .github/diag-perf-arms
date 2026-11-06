@@ -1,0 +1,3 @@
+base --client-spin-ns default
+fix --client-spin-ns default
+fix --client-spin-ns default --sched-slice-ns 100000
