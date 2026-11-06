@@ -1588,7 +1588,10 @@ metadata provisioning path, not arbitrary host pathname resolution. A scratch vo
   client of its own (the verb wakes the owner's serve rounds; the reaper's cadence retries a refused
   record) — release quota, tombstone; the base directory is untouched. In a fleet the tombstone is the
   volume's final register value, shipped to every candidate holder and retired once all hold it (§4.10
-  status, AUD-29-43); a takeover adopts it and never re-materializes the volume. A volume being destroyed is left
+  status, AUD-29-43); a takeover adopts it and never re-materializes the volume. The destroy is answered only once
+  its tombstone is placed at `f + 1` (at once on a laptop): answered before, an owner lost at once let a takeover serve
+  the volume again (2026-11-06, `docs/bugs/2026-11-06-a-destroy-was-answered-before-its-tombstone-was-placed.md`). A
+  volume being destroyed is left
   out of the shard's recovery image (its record says Destroying; recovery completes it). Before 2026-09-29
   a destroy forwarded to a shard without a client was never stepped
   (`docs/bugs/2026-09-29-a-destroy-on-a-shard-without-a-client-never-completed.md`).
@@ -5786,6 +5789,19 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > candidate's). Before, the successor counted itself only when it held a copy (a takeover could wait for its quorum for
 > good), and a remote candidate's empty report raised no fence, which the nemesis model shows breaks StaleNeverCommits
 > (10 seeds; bug record `docs/bugs/2026-11-05-a-live-takeover-counted-no-empty-report-and-fenced-no-empty-copy.md`).
+>
+> **Chaos from outside the processes (2026-11-06).** `crates/cli/tests/live_chaos.rs` streams writes through the Rust
+> client while it partitions or kills processes. It ends every flow with Agreement, NoLoss, StaleNeverCommits and
+> Convergence, checked from every node's `status`; each live line now carries its head's epoch and chain identity and
+> its fence.
+> - **The early destroy (fixed).** A destroy was answered before its tombstone was placed, and an owner lost at once let
+>   a takeover serve the volume again. A destroy now answers once its tombstone is region-placed, and never waits on
+>   the live log.
+> - **A write never answered under a partitioned candidate (fixed).** A dispatch on the control shard was dropped at
+>   its deadline and stranded its sessions. A same-shard `xshard::task_within` now runs to its end, as a cross-shard one
+>   does.
+> - **An install never finishing inside an entry's budget (open).** The whole volume, sent to a candidate behind the
+>   retained tail, is resent without end (GAPS "Chaos from outside the processes").
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the

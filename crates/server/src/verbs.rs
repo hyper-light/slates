@@ -2179,12 +2179,9 @@ fn run_recorded(
   let mut deferred = std::mem::take(&mut state.acceptance_deferred);
   // A verb on a live-shipped volume answers once its publication is durable on `f` candidates (A-200): like a deferred
   // acceptance, its effects commit now and its completion and reply follow (`crate::live_ship::resolve`).
-  let live_target = live_volume
-    .filter(|_| label == 1 && !deferred && !matches!(reply, ReplyBody::Refused { .. }))
-    .and_then(|volume| {
-      crate::live_ship::durable_target(state, volume).map(|target| (volume, target))
-    });
-  deferred |= live_target.is_some();
+  let (live_target, destroy_target) =
+    replicated_waits(state, live_volume.filter(|_| !deferred), label, &reply);
+  deferred |= live_target.is_some() || destroy_target.is_some();
   let reply = if deferred {
     reply
   } else {
@@ -2219,6 +2216,11 @@ fn run_recorded(
   {
     return crate::live_ship::defer(state, live_target, (origin, id), route, reply);
   }
+  if let Some(destroy_target) = destroy_target
+    && !matches!(reply, ReplyBody::Refused { .. })
+  {
+    return crate::live_ship::defer_destroy(state, destroy_target, (origin, id), route, reply);
+  }
   if deferred && !matches!(reply, ReplyBody::Refused { .. }) {
     return None;
   }
@@ -2235,6 +2237,36 @@ fn run_recorded(
       Some(reply)
     }
   }
+}
+
+/// A volume and the position (a live log's) or sequence (a tombstone's) a verb's reply waits for.
+type ReplicatedWait = (DbVolumeId, u64);
+
+/// What a verb that just committed on `volume` must wait for before it answers, beyond its own partition: a mutation of
+/// a live-shipped volume, its log durable where its publication put it (A-200; `live_ship::durable_target`); a destroy,
+/// its tombstone placed at `f + 1` (`live_ship::tombstone_target`). A destroy never waits on the live log: it publishes
+/// no content to make durable, and its teardown refuses whatever waits on the log `NotFound`, which had told a client
+/// its successful destroy had not happened; and answered before its tombstone was placed, an owner lost at once left a
+/// takeover that served the volume again (2026-11-06, `crates/cli/tests/live_chaos.rs`).
+fn replicated_waits(
+  state: &ShardState,
+  volume: Option<DbVolumeId>,
+  label: u32,
+  reply: &ReplyBody,
+) -> (Option<ReplicatedWait>, Option<ReplicatedWait>) {
+  let Some(volume) = volume else {
+    return (None, None);
+  };
+  if matches!(reply, ReplyBody::Destroyed) {
+    let destroy =
+      crate::live_ship::tombstone_target(state, volume).map(|sequence| (volume, sequence));
+    return (None, destroy);
+  }
+  if label != 1 || matches!(reply, ReplyBody::Refused { .. }) {
+    return (None, None);
+  }
+  let live = crate::live_ship::durable_target(state, volume).map(|target| (volume, target));
+  (live, None)
 }
 
 /// The owner's side of a forwarded verb: its own completion window first (a retry of a

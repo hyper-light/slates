@@ -563,6 +563,47 @@
 > own report only when it holds a copy, while a remote candidate that holds nothing answers `None` and counts, so a
 > successor holding nothing never counts itself and `f + 1` is out of reach once the owner is gone. Owner: raft,
 > before any other live-shipping work.
+>
+> **Chaos from outside the processes (raft-chaos, 2026-11-06): two defects fixed, a third open.**
+> The harness is `crates/cli/tests/live_chaos.rs` (`SLATES_TEST_CLI=1`): three fleet daemons, a Rust client streaming
+> 4 KiB writes, every node's live lines sampled throughout (status now prints each log's head epoch, chain identity and
+> fence), and each flow ending with the register invariants checked from outside the processes:
+> - Agreement: one identity at every epoch and position any copy reported;
+> - NoLoss: every acknowledged write served byte for byte, nothing torn;
+> - StaleNeverCommits: writes through a superseded owner refused, survivors fenced at the takeover's epoch;
+> - Convergence: every candidate at the owner's head, durable, nothing owed.
+>
+> - **Fixed: a destroy was answered before its tombstone was placed** (record
+>   `docs/bugs/2026-11-06-a-destroy-was-answered-before-its-tombstone-was-placed.md`).
+>   - With both candidates stopped, a live volume's destroy was answered done; the owner was SIGKILLed, and a survivor
+>     listed the volume and served its file again. This is a safety defect.
+>   - With a write waiting, the destroy was told `NotFound` by its own teardown, though it happened.
+>
+>   Every fleet destroy now answers once its tombstone is region-placed (`live_ship::defer_destroy`), and never waits
+>   on the live log, so the teardown's `forget` never sees it. Results, live and plain, after the fix: an unheard
+>   destroy is never answered done (its client is told the daemon is gone), and a heard one is answered done and stays
+>   destroyed across the owner's loss.
+> - **Fixed: a write never answered under a partitioned candidate** (record
+>   `docs/bugs/2026-11-06-a-call-to-its-own-shard-dropped-its-future-and-a-live-owner-lost-its-sessions.md`).
+>   `xshard::task_within` to its own shard dropped its future at the deadline, so a live dispatch on the control shard
+>   was dropped mid-exchange. Its borrowed sessions stayed `lent=true` for good (`no_session` 129), and the owner sent to
+>   no candidate again. Candidates partitioned in turn (SIGSTOP 2 s each,
+>   `candidates_partitioned_in_turn_mid_stream_lose_nothing`) failed 3 of 5 runs before: two writes were never
+>   answered, one for over 20 minutes. After the fix, 6 of 7 runs pass and none hangs. Red-checked by
+>   `xshard::tests::a_call_to_its_own_shard_runs_its_future_to_the_end_past_the_deadline`.
+> - **Open: an install never finishes inside the liveness budget** (record
+>   `docs/bugs/2026-11-06-an-install-never-finished-inside-the-liveness-budget.md`). A candidate left behind the retained
+>   tail is sent the whole volume (0.5-1.5 MB) under the 1 s budget an entry gets. In one run 1,391 installs (2.06 GB)
+>   went out, both candidates held the owner's head, and no write became durable. Edits in progress (raft-chaos, with
+>   live-durability building on them in the dispatch round): a size-derived exchange budget, replies folded as they
+>   come, one task a holder, and a byte-bounded retained tail. With them, 3 of 8 runs still failed: of 425 installs
+>   logged in one, about 400 found no session, as the holder's tasks raced for its one session.
+> - **The anchored flows** (a candidate's daemon SIGKILLed and succeeded, a candidate's node replaced) are counted apart
+>   from the invariant results until A-228 lands: at load 60–80 the anchor kills live daemons whose heartbeat lapses.
+>
+> Touched: `crates/server/src/{live_ship,verbs,fleet}.rs` (the destroy's wait), the status line (`crates/ipc`
+> `LiveReport`, `crates/cli` status), the harness, the KIND leg (`xtask/src/kind_live.rs`,
+> `crates/cli/examples/pod_live_probe.rs`).
 
 > **VFS plan step 14, Shards' WHP window's three edge cases (2026-11-05): done, patches with the owner's folder.** Six
 > real-guest tests and one fix for Shards' owner, in `docs/wip/shards-patches/` (never pushed to Shards; README there), and
