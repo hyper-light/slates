@@ -233,9 +233,6 @@ pub struct ShardState {
   /// The content arena's allocation count when the reserve's refill last found nothing to fault (A-214): until the
   /// arena allocates again, or the burst measure moves, an idle moment's refill has nothing to do.
   pub(crate) refill_settled: Option<u64>,
-  /// The journal generation whose dead recovery memory an idle shard last gave back (A-117,
-  /// `daemon::return_dead_recovery`): a later publication moves the generation and re-arms the return.
-  pub(crate) recovery_returned_at: Option<u64>,
   /// The half-open byte range `[start, end)` of `content` this shard publishes into and recovers
   /// from; `0..0` when there is no content object.
   pub content_range: (usize, usize),

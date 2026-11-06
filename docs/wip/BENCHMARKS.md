@@ -8329,6 +8329,43 @@ stops at 20 s:
 One request is one forwarded round trip: `accept_one` costs a ping. The p99 is the link's: accept 138 to 158 ms,
 accept_one 70 to 132 ms.
 
+**The macOS paced tail was the recovery give-back (A-226, 2026-11-06, adas-macbook-pro-2).** Paced (`--pause-ns 2000000`,
+so each edit meets parked shards), a macOS edit and merge had a p99 of 5.7 to 21 ms, which a split of each call by the
+doorbell thread's stamps put between the doorbell's wake and the shard's read of the slot (17 to 31 ms in the p99
+samples). It was neither a missed nor a held wake. A temporary diagnostic stamped the
+doorbell's kick on each parked shard and logged, from the shard's own clock, every park whose kick-to-return passed
+1 ms. It also logged every poll over 1 ms with the thread's CPU across it and the polled future's type. One paced run
+(`--pause-ns 2000000 --files 10 --form accept`, 3 × 1,000 calls) had 12 late parks, 1.1 to 15 ms, each in a wait the
+kernel never slept (asked timeout 0): the host descheduled the thread. It had 57 long polls, 46 of them the reap loop
+at 18 to 42 ms with the thread on the CPU throughout (wall 42,068 µs, CPU 42,055 µs). Narrowed section by section,
+they were the idle give-back of the recovery memory no restart reads (A-117). At every publication it marked the whole
+stale slot and the whole log past the tail reusable, 18,325,143,552 bytes, 18 to 21 ms a call. A-226 gives back only
+what was written since the last give-back (`docs/bugs/2026-11-06-an-idle-shards-recovery-give-back-walked-18-gb-at-every-publication.md`).
+
+The same run, interleaved, 2026-11-06 05:16 to 06:05 UTC, adas-macbook-pro-2 at load 50 to 95. A = agents/perf-2
+`83803328`, B = A-226, each with the per-poll CPU log in a second build; paced (`--pause-ns 2000000`) and unpaced; 10,
+1,000 files; accept and conflict; 10 of 12 runs finished before the time limit. Reap-loop polls of 5 ms CPU or more
+in one paced run: A 46 (up to 48.5 ms), B 6, all at boot, a shard's first two give-backs, 12.1 to 42.7 ms. p99 in ms
+(accept f10, conflict f10, accept f1000, conflict f1000):
+
+| run | load | A | B |
+|---|---|---|---|
+| round 1, paced | 52–84 | 233.8, 33.7, 148.9, 39.2 | 21.7, 6.8, 29.2, 26.5 |
+| round 1, unpaced | 54–84 | 3.34, 1.87, 3.46, 3.99 | 0.77, 0.43, 2.16, 0.51 |
+| round 2, paced | 52–82 | 23.7, 20.7, 34.6, 12.3 | 7.1, 18.6, 93.8, 53.8 |
+| round 2, unpaced | 53–59 | 0.64, 1.37, 3.49, 1.44 | 1.62, 6.84, 2.88, 1.64 |
+| round 3, paced | 95 | 360.6, 178.8, 307.0, 142.3 | (stopped by the time limit) |
+| round 3, unpaced | 65–78 | 6.33, 0.94, 20.9, 32.3 | (not run) |
+
+At 3 to 5 runnable threads a core, both arms' tails are the host's: in B's run, every poll over 1 ms besides those 6
+had under 1 ms of CPU. So the table is informational; the CPU count is the measurement. Still owed: the boot's two
+whole give-backs a shard, to be sliced; the latency again on a quiet Mac.
+
+On CI (diag-perf-5, run 42173825162, 2026-11-06 06:25 to 06:56 UTC, base `83803328` against A-226 `cd582843`, interleaved
+× 3, 10 and 1,000 files): Windows x86_64's paced accept p99 went from 1.21 to 1.40 ms to 0.42 to 0.76 ms, and both
+builds keep a paced p999 and max of 20 to 34 ms there, a tail of its own. Windows arm64, and Linux under the controlled
+load and quiet, were even: Linux's give-back is a hole punch, and its loaded tail is the scheduler's.
+
 ## The client's edit and merge latency, and a merge that grows with its green (RQ-4, §4.16; 2026-11-05)
 
 The per-platform client record (`platforms.md`) had a provisioning histogram and no number for the two verbs an agent
