@@ -70,8 +70,8 @@
 >     separate form.
 >   - If no one form passes both runners, the per-machine form question goes to Ada with that table.
 
-> **A-214, A-217 and A-207's port reverted from main (2026-11-05, by the supervisor). A-217 and A-207 are re-landed
-> (2026-11-06, `agents/reland-a207-1`); A-214's re-landing is owed.** Main CI 42119714654 on b502cf96 failed six jobs,
+> **A-214, A-217 and A-207's port reverted from main (2026-11-05, by the supervisor); all three are re-landed (A-214 in
+> `2f70a86b`; A-217 and A-207 from `agents/reland-a207-1`, 2026-11-06).** Main CI 42119714654 on b502cf96 failed six jobs,
 > all from two pairs of landed changes, each green on its own branch:
 > - **A-217 against A-201's checkout (fixed).** A-217 records a green's origin as a reference to its base snapshot,
 >   and `checkout` (`crates/server/src/checkout.rs`) compared the recorded origin's bytes with a fresh
@@ -84,11 +84,11 @@
 >   - Windows, the same run (windows-latest): the native lint wall over ci.yml's crate list and `slates-cli`, and
 >     merge_load 4. Also `cargo xwin clippy` clean from macOS.
 >   - The load test's macOS runs (BENCHMARKS): 0 oracle failures in every run but one. That one is the next entry's.
-> - **A-214 against A-205's give-back (owed).** The reserve keeps a write burst's worth of freed content pages
->   pre-faulted, so `a_deleted_files_memory_leaves_the_working_set_and_recreating_it_reads_every_byte` failed on
->   windows-latest and windows-11-arm; and A-214's own `arena::tests::an_idle_purge_keeps_the_reserve_and_gives_back_the_rest` fails
->   under Miri. Owed: nfs-write re-lands A-214 reconciled with A-205's give-back (a reserve the give-back test accounts
->   for, or one that decays), green under Miri and on the Windows give-back test.
+> - **A-214 against A-205's give-back (re-landed in `2f70a86b`; the large-file NFS write entry has its evidence).** The
+>   reserve kept a write burst's worth of freed content pages pre-faulted, so
+>   `a_deleted_files_memory_leaves_the_working_set_and_recreating_it_reads_every_byte` failed on windows-latest and
+>   windows-11-arm, and A-214's own `arena::tests::an_idle_purge_keeps_the_reserve_and_gives_back_the_rest` failed
+>   under Miri.
 
 > **A daemon's restart can exceed the anchor's fixed recovery budget (found 2026-11-06 re-landing A-207 and A-217;
 > open, to be assigned).** A starting daemon that has not beaten 1 s after its spawn is killed ("the daemon never beat
