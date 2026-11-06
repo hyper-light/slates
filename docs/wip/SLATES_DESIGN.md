@@ -1577,7 +1577,16 @@ metadata provisioning path, not arbitrary host pathname resolution. A scratch vo
   change" step; slates never merges.
 - pin(volume, paths?) → Pinned: read the named subtrees (default: the whole base) into the store
   and witness them, so the view of those entries is stable regardless of later disk changes;
-  cost proportional to what is pinned and reported in the reply; never implicit.
+  cost proportional to what is pinned and reported in the reply; never implicit. Run a slice at a time on the
+  volume's owner shard, its reply deferred until the walk ends (§4.3). Its copy is the volume's content, charged to
+  the volume's quota and refused `NoSpace` past it.
+
+  > **Status (2026-11-06, sliced).** The pin was one synchronous call on the owner shard: Linux's `Documentation/`
+  > (11,608 files) held it for one poll of 9,194 ms on a Mac, past the anchor's liveness budget, and the client gave
+  > up at its 1 s reply deadline. It is now a walk (`PinWalk`, one file or one listing a unit, no handle held between
+  > units) stepped in a task of the owner shard. Its completion and reply commit together after the shard is
+  > published. A retry joins the walk (`a_pin_of_a_large_base_never_holds_its_shard`;
+  > `docs/bugs/2026-11-06-a-pin-held-its-shard-for-the-whole-tree.md`).
 - materialize(snapshot, target, filter?, grant?) → LandingRequest | LandingReport: the landing
   of §4.15. Without a grant the reply is `GrantRequired{request_id, manifest_hash, summary}` and
   the request waits (or returns at once if the caller asked not to wait); a human issues the

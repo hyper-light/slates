@@ -18,6 +18,15 @@
 >   borrowers abandoned the session's newest exchange on a failure, which on a shared session can be a forward's
 >   (`Endpoint::abandon_begun_since`).
 >
+> - **A pin held its shard for the whole tree.** `Documentation/` (11,608 files) took one poll of 9,194 ms on a Mac,
+>   past the anchor's 1,000 ms liveness budget, and every verb on the shard waited. The pin is now a walk stepped a
+>   slice at a time in a task of the owner shard, its reply deferred, as a checkout's is. Red: no probe was answered
+>   inside the pin, and the one waiting was refused `Stalled` at 1 s. Green: 238 probes inside an 8.49 s pin, the
+>   longest 318 ms (`a_pin_of_a_large_base_never_holds_its_shard`). The pin's own memory is linear, 1.4 to 3.5 KB of
+>   heap a file on Linux and macOS. The quiet Linux CI runner's daemon peaked at 552 MB pinning `Documentation/`, and
+>   the growth came after the pin. A pin past its volume's quota is refused `NoSpace`
+>   (`docs/bugs/2026-11-06-a-pin-held-its-shard-for-the-whole-tree.md`).
+>
 > The topology launcher is `crates/cli/tests/load_scale.rs`. It runs one primary and two replica server nodes in
 > region 0 at `f = 1`, and client nodes in region 1, so the client nodes are never the green's holders. One harness
 > drives every client node (`--instance a,b,…`), so one oracle judges every submit. It is portable (`ps`, `pgrep`),
@@ -229,7 +238,8 @@
 > - **A volume promised the whole version slab is refused at recovery** (bug record of 2026-11-05): a recovered
 >   snapshot rebuilds its directories privately, one retained version slot each the live volume did not hold (465,831
 >   committed slots before a restart, 465,832 after). Fix owed in `crates/vfs/src/recover.rs`.
-> - **Pinning a tree of many files grows memory far faster than its files, in one unsliced verb**: `kernel/` (754
+> - **Pinning a tree of many files grows memory far faster than its files, in one unsliced verb** (the slicing fixed
+>   2026-11-06 by agents/loadtest-scale, and the memory not reproduced: see that entry above): `kernel/` (754
 >   files) 86,848 KiB, `fs/` (2,365) about 226,000 KiB in 3 of 3 runs, `Documentation/` (11,608, 59 MB) past 12 GB and
 >   `arch/` (18,944, 127 MB) past 9.9 GB inside the pin, which also outlasts the client's 1 s reply deadline; the whole
 >   kernel is killed at a 24 GB cap in its pin. Not root-caused; samples show `Overlay::read_whole` → `copy_up`.

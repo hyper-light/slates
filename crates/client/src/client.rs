@@ -105,6 +105,9 @@ pub fn defers_reply(body: &RequestBody) -> bool {
         // A green's checkout writes its base volume in slices on the owner shard, as long as the difference takes
         // (A-201).
         | RequestBody::Checkout { .. }
+        // A pin reads the subtrees it names into the store in slices on the owner shard, as long as the tree takes
+        // (§4.4, §4.3).
+        | RequestBody::Pin { .. }
         // A direct map's copy is filled in slices on the owner shard, as long as the file takes (A-171).
         | RequestBody::MapRead { .. }
         // A writable map's copy is filled the same way, and its stores are compared back into the file in slices at

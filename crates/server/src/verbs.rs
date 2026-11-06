@@ -8682,6 +8682,12 @@ fn rewitness(
   }
 }
 
+/// `Pin` (§4.4): checks the overlay and the caller's write right at once, then reads the named subtrees (the whole
+/// base when none are named) into the store in a task of the volume's owner shard, a slice of the shard's step quantum
+/// at a time (§4.3 "Bounded work everywhere"), and defers the reply to it, as a green's checkout does. It was one
+/// synchronous call: the kernel's `Documentation/` (11,608 files) held its shard for one poll of 9,194 ms, past the
+/// anchor's 1,000 ms liveness budget, and every verb on the shard waited for the whole pin
+/// (`a_pin_of_a_large_base_never_holds_its_shard`). A retry while it runs joins it.
 fn pin(
   state: &mut ShardState,
   principal: &Principal,
@@ -8692,18 +8698,79 @@ fn pin(
     Ok(h) => h,
     Err(r) => return *r,
   };
-  let Ok(slot) = state.volumes.get_mut(handle) else {
-    return refused(Refusal::NotFound);
+  let Some(request) = state.current_request else {
+    return refused(Refusal::Unsupported {
+      feature: "a pin outside a recorded request".to_owned(),
+    });
   };
-  let Some(host) = slot.host.as_mut() else {
-    return refused(Refusal::NotFound);
+  let job = PinJob {
+    request,
+    handle,
+    volume: to_db_volume(volume),
+    walk: slates_vfs::base::PinWalk::new(paths),
   };
-  match slot.volume.with_host(host).pin(&mut state.store, paths) {
-    Ok(entries) => ReplyBody::Pinned {
-      entries: u64::try_from(entries).unwrap_or(u64::MAX),
-    },
-    Err(e) => refused(refusal_of_vfs(&e)),
+  crate::image::defer(state, run_pin(job))
+}
+
+/// A pin between its slices.
+struct PinJob {
+  request: (u64, RequestId),
+  handle: Handle<crate::state::VolumeSlot>,
+  volume: DbVolumeId,
+  walk: slates_vfs::base::PinWalk,
+}
+
+impl PinJob {
+  /// One unit of the walk on the overlay's slot; `Some(pinned)` once it is whole. A volume destroyed meanwhile is a
+  /// stale handle, refused `NotFound`.
+  fn step(&mut self, state: &mut ShardState) -> Result<Option<usize>, Refusal> {
+    let Ok(slot) = state.volumes.get_mut(self.handle) else {
+      return Err(Refusal::NotFound);
+    };
+    let Some(host) = slot.host.as_mut() else {
+      return Err(Refusal::NotFound);
+    };
+    slot
+      .volume
+      .with_host(host)
+      .pin_unit(&mut state.store, &mut self.walk)
+      .map_err(|e| refusal_of_vfs(&e))
   }
+
+  /// Publishes the volume so its pinned state precedes the completion (a client told it is pinned never meets a
+  /// restart that lost the pin); the reply.
+  fn finish(&self, state: &mut ShardState, pinned: usize) -> Result<ReplyBody, Refusal> {
+    match publish_shard(state) {
+      Ok(published) if published.captured(self.volume) => Ok(ReplyBody::Pinned {
+        entries: u64::try_from(pinned).unwrap_or(u64::MAX),
+      }),
+      Ok(_) => Err(refusal_of_vfs(&slates_vfs::VfsError::RecoveryIncomplete)),
+      Err(error) => Err(refusal_of_vfs(&error)),
+    }
+  }
+}
+
+/// Walks the pin a slice at a time, then commits the completion and delivers the reply. With the shard's state
+/// unreachable (its shutdown) no completion is recorded, so the client's retry pins again on the shard that succeeds
+/// it, from the volume as it stands (a pin is idempotent: what is pinned stays pinned).
+async fn run_pin(mut job: PinJob) {
+  let outcome = loop {
+    match crate::image::with(|s| crate::image::sliced(s, |s| job.step(s))) {
+      Ok(Some(pinned)) => break Ok(pinned),
+      Ok(None) => slates_rt::futures::yield_now().await,
+      Err(refusal) => break Err(refusal),
+    }
+  };
+  let request = job.request;
+  let _ = crate::state::with_state(|s| {
+    let (reply, route) = crate::image::complete(s, request, |s| {
+      match outcome.and_then(|pinned| job.finish(s, pinned)) {
+        Ok(reply) => reply,
+        Err(refusal) => refused(refusal),
+      }
+    });
+    crate::image::deliver(s, reply, route);
+  });
 }
 
 /// Serves every ready request of every client, retries deferred replies, steps destroys and
