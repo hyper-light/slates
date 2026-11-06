@@ -1983,10 +1983,9 @@ impl Mounted {
     let piece = purge_piece();
     let mut purged = Purged::default();
     for purge in purges {
-      let Some(client) = self.purge_client.ready()? else {
-        purged.unavailable = purged.unavailable.saturating_add(1);
-        continue;
-      };
+      // DIAG red-check: the in-process open put back.
+      let client = std::process::id();
+      let _ = &self.purge_client;
       self
         .purge_intents
         .publish(Some(crate::purge_intents::Intent {
@@ -1994,7 +1993,7 @@ impl Mounted {
           client,
         }))?;
       let path = format!("\\\\?\\{}{}", self.mount_point, purge.path);
-      let outcome = self.purge_client.purge(&path, purge, piece);
+      let outcome = crate::purge_client::in_process(self.purge_marker, &path, purge, piece);
       self.purge_intents.publish(None)?;
       purged.outcomes.push((purge.clone(), outcome));
     }

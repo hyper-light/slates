@@ -25,6 +25,9 @@
 //! ready byte once its token is made. Each request is the purge's range, piece size and full drive path; each answer is
 //! one outcome byte. The pipe's end at the parent closing (the daemon gone) ends the child.
 
+// DIAG red-check: the client is bypassed, so its code is unused here.
+#![allow(dead_code)]
+
 use std::ffi::{OsStr, OsString};
 use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::OnceLock;
@@ -510,6 +513,17 @@ fn os_error(call: &'static str) -> WinFspError {
     call,
     code: std::io::Error::last_os_error().raw_os_error(),
   }
+}
+
+/// DIAG red-check only: the purge made on the calling (daemon) thread, as before the move.
+pub(crate) fn in_process(marker: Marker, path: &str, purge: &Purge, piece: u32) -> PurgeOutcome {
+  let Ok(token) = PurgeToken::with_marker(marker) else {
+    return PurgeOutcome::Refused;
+  };
+  let mut buffers = Buffers::new();
+  token
+    .during(|| Ok(purge_one(path, purge, piece, &mut buffers)))
+    .unwrap_or(PurgeOutcome::Refused)
 }
 
 #[cfg(test)]
