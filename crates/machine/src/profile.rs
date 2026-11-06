@@ -387,7 +387,17 @@ pub struct DerivedConstants {
   /// message per syscall for as long as the consumer's wake takes at its p99, so a producer spins on a full
   /// ring in fewer than one wake in a hundred.
   pub ring_entries: Derived<u64>,
+  /// The scheduling slice a shard thread asks for (§4.3, A-224): a woken shard needs the CPU for its wake at the p99
+  /// and one cooperative quantum (the expected wake) to serve what woke it, within the slices the kernel takes.
+  pub shard_slice_ns: Derived<u64>,
 }
+
+/// Format: the shortest slice Linux takes from `sched_setattr(2)`'s `sched_runtime` for a fair thread, 0.1 ms: the
+/// kernel clamps the request to `[NSEC_PER_MSEC / 10, NSEC_PER_MSEC * 100]` (`kernel/sched/syscalls.c`,
+/// `__setscheduler_params`, since 6.12).
+pub const KERNEL_MIN_SLICE_NS: u64 = 100_000;
+/// Format: the longest slice Linux takes for a fair thread, 100 ms (the same clamp).
+pub const KERNEL_MAX_SLICE_NS: u64 = 100_000_000;
 
 impl DerivedConstants {
   fn from_profile(p: &MachineProfile) -> DerivedConstants {
@@ -446,6 +456,18 @@ impl DerivedConstants {
         "Little's law at the overflow target: one message per syscall.median for a wake at its p99, rounded up to a power of two",
         ["wake.p99_ns", "syscall.median"]
       ),
+      shard_slice_ns: derived!(
+        wake_p99
+          .saturating_add(wake_mean)
+          .clamp(KERNEL_MIN_SLICE_NS, KERNEL_MAX_SLICE_NS),
+        "wake.p99 + wake.mean (one wake and one quantum), within the kernel's 0.1 to 100 ms",
+        [
+          "wake.p99_ns",
+          "wake.mean_ns",
+          "KERNEL_MIN_SLICE_NS",
+          "KERNEL_MAX_SLICE_NS"
+        ]
+      ),
     }
   }
 
@@ -467,6 +489,7 @@ impl DerivedConstants {
       line("copy_versus_remap_bytes", &self.copy_versus_remap_bytes),
       line("discard_from_bytes", &self.discard_from_bytes),
       line("ring_entries", &self.ring_entries),
+      line("shard_slice_ns", &self.shard_slice_ns),
     ]
   }
 }

@@ -209,7 +209,10 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 53
+slates-machine = 55
+# 2026-11-06 (+2, A-224, Linux only): `probes::sched_getattr` and `probes::sched_setattr`, each one raw syscall
+#   (`SYS_sched_getattr`, `SYS_sched_setattr`) into a `#[repr(C)] struct sched_attr`: a shard thread asks the fair
+#   scheduler for its slice. Neither rustix 1.1.4 nor libc has a wrapper for either call.
 # 2026-11-04 (+2, A-205, compiled only for Windows): `Facts::resident_now` reads the working set: the zeroed record and
 #   `K32GetProcessMemoryInfo`, which has no safe wrapper.
 #   Raised 19 → 22 on 2026-09-30 for AUD-29-09 (a shared object hands out no reference to its bytes):

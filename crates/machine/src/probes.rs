@@ -568,6 +568,27 @@ pub fn pin_current_thread(core: u32) -> Pinning {
   platform::pin_current(core)
 }
 
+/// What the scheduler holds for the calling thread's slice after [`request_slice`] (§4.3, A-224).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slice {
+  /// The kernel holds the slice asked for, nanoseconds (Linux 6.12+, after its clamp to 0.1 to 100 ms).
+  Held(u64),
+  /// The kernel took the request but holds another slice, nanoseconds (an older kernel that ignores a `SCHED_OTHER`
+  /// thread's `sched_runtime`, so its slice reads back zero).
+  Ignored(u64),
+  /// The kernel refused the request (its errno), or the thread is not under the fair class and is left as it is.
+  Refused(Option<i32>),
+  /// This OS has no such request (macOS, Windows).
+  Unsupported,
+}
+
+/// Asks the scheduler for a slice of `slice_ns` for the calling thread, keeping its policy and nice, and reads back
+/// what it holds (§4.3, A-224): on Linux `sched_setattr(2)`'s `sched_runtime` for a `SCHED_OTHER` thread, which needs
+/// no privilege while the nice is kept. Other OSes ask nothing ([`Slice::Unsupported`]).
+pub fn request_slice(slice_ns: u64) -> Slice {
+  platform::request_slice(slice_ns)
+}
+
 /// The calling thread's CPU affinity, kept so a probe that pins the thread can put it back: a process
 /// spawned afterwards inherits the calling thread's mask (the anchor measures, then spawns the daemon;
 /// docs/bugs/2026-09-14-core-matrix-leaves-the-anchor-pinned-to-one-core.md).
@@ -788,6 +809,87 @@ mod platform {
     Pinning::Refused
   }
 
+  /// Linux's `struct sched_attr` (`include/uapi/linux/sched/types.h`), as `sched_getattr(2)` and `sched_setattr(2)`
+  /// take it.
+  #[cfg(target_os = "linux")]
+  #[repr(C)]
+  #[derive(Clone, Copy, Default)]
+  struct SchedAttr {
+    size: u32,
+    policy: u32,
+    flags: u64,
+    nice: i32,
+    priority: u32,
+    runtime: u64,
+    deadline: u64,
+    period: u64,
+    util_min: u32,
+    util_max: u32,
+  }
+
+  /// Format: `SCHED_OTHER`, the fair class's policy (`include/uapi/linux/sched.h`).
+  #[cfg(target_os = "linux")]
+  const SCHED_OTHER: u32 = 0;
+
+  /// The calling thread's scheduling attributes, or the errno.
+  #[cfg(target_os = "linux")]
+  fn sched_getattr() -> Result<SchedAttr, Option<i32>> {
+    let mut attr = SchedAttr::default();
+    let size = u32::try_from(std::mem::size_of::<SchedAttr>()).map_err(|_| None)?;
+    // SAFETY: pid 0 is the calling thread; the kernel writes at most `size` bytes into `attr`, which is a
+    // `#[repr(C)]` `struct sched_attr` of exactly that size, and reads nothing from it.
+    let rc = unsafe { libc::syscall(libc::SYS_sched_getattr, 0, &raw mut attr, size, 0) };
+    if rc == 0 {
+      Ok(attr)
+    } else {
+      Err(std::io::Error::last_os_error().raw_os_error())
+    }
+  }
+
+  /// Sets the calling thread's scheduling attributes, or the errno.
+  #[cfg(target_os = "linux")]
+  fn sched_setattr(attr: &SchedAttr) -> Result<(), Option<i32>> {
+    // SAFETY: pid 0 is the calling thread; the kernel reads `attr.size` bytes from `attr`, a `#[repr(C)]` `struct
+    // sched_attr` whose `size` field names its own size, and writes nothing.
+    let rc = unsafe { libc::syscall(libc::SYS_sched_setattr, 0, std::ptr::from_ref(attr), 0) };
+    if rc == 0 {
+      Ok(())
+    } else {
+      Err(std::io::Error::last_os_error().raw_os_error())
+    }
+  }
+
+  #[cfg(target_os = "linux")]
+  pub(super) fn request_slice(slice_ns: u64) -> super::Slice {
+    let current = match sched_getattr() {
+      Ok(attr) => attr,
+      Err(code) => return super::Slice::Refused(code),
+    };
+    // Another class (batch, idle, real time) is the operator's choice, and is left alone.
+    if current.policy != SCHED_OTHER {
+      return super::Slice::Refused(None);
+    }
+    let size = u32::try_from(std::mem::size_of::<SchedAttr>()).unwrap_or(current.size);
+    let asked = SchedAttr {
+      size,
+      runtime: slice_ns,
+      ..current
+    };
+    if let Err(code) = sched_setattr(&asked) {
+      return super::Slice::Refused(code);
+    }
+    match sched_getattr() {
+      Ok(held) if held.runtime == slice_ns => super::Slice::Held(held.runtime),
+      Ok(held) => super::Slice::Ignored(held.runtime),
+      Err(code) => super::Slice::Refused(code),
+    }
+  }
+
+  #[cfg(not(target_os = "linux"))]
+  pub(super) fn request_slice(_slice_ns: u64) -> super::Slice {
+    super::Slice::Unsupported
+  }
+
   /// Nothing pins here, so nothing is put back.
   #[cfg(not(any(target_os = "linux", target_os = "macos")))]
   pub(super) struct Affinity;
@@ -932,6 +1034,11 @@ mod platform {
   fn set_thread_affinity(mask: usize) -> usize {
     // SAFETY: the calling thread's pseudo-handle and a mask within the process's.
     unsafe { SetThreadAffinityMask(GetCurrentThread(), mask) }
+  }
+
+  /// Windows has no per-thread slice request (A-224).
+  pub(super) fn request_slice(_slice_ns: u64) -> super::Slice {
+    super::Slice::Unsupported
   }
 
   pub(super) fn pin_current(core: u32) -> Pinning {

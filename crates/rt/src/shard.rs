@@ -149,6 +149,9 @@ pub struct Counters {
   /// scheduler puts it: a fault on Linux and Windows, where the placement names only cores the process
   /// owns (`slates_machine::placement`); on macOS the affinity hint Apple silicon refuses by design.
   pub pin_refused: u64,
+  /// 1 when the scheduler did not hold the slice the shard asked for (A-224): an older kernel, a refusal, or a thread
+  /// outside the fair class. The shard runs with the default slice.
+  pub slice_refused: u64,
   /// Readiness completions that found no registration waiting on their descriptor, because its future was
   /// dropped before the descriptor fired (A-149). Such a completion wakes no one.
   pub interests_unclaimed: u64,
@@ -624,6 +627,11 @@ impl ShardContext {
     self
       .with_inner(|inner| inner.arena.generation_high())
       .unwrap_or(0)
+  }
+
+  /// Records that the scheduler did not hold the slice this shard asked for ([`Counters::slice_refused`]).
+  pub fn note_slice_refused(&self) {
+    self.with_inner(|inner| inner.counters.slice_refused = 1);
   }
 
   /// Records that the OS refused the core this shard's placement fixed it to ([`Counters::pin_refused`]).

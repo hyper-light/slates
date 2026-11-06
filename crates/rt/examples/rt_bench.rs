@@ -63,6 +63,7 @@ fn config(shards: u16) -> RuntimeConfig {
     page_bytes: 16384,
     spin_ns: 0,
     wake_tracking: None,
+    slice_ns: None,
   }
 }
 

@@ -25,6 +25,7 @@ fn config() -> RuntimeConfig {
     page_bytes: 4096,
     spin_ns: 0,
     wake_tracking: None,
+    slice_ns: None,
   }
 }
 

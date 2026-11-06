@@ -1457,6 +1457,13 @@ from the facts. A refused pin is counted per shard and logged once where the OS 
 cpuset with no quota between them still share its cores, which the facts cannot show: give each daemon its
 own machine, cpuset or quota.
 
+**Slice (A-224).** Each shard thread asks the fair scheduler for a slice of `shard_slice_ns` as it starts: one wake
+at its p99 and one cooperative quantum (`wake.p99 + wake.mean`), within the 0.1 to 100 ms Linux takes. A shorter
+slice gives a woken shard an earlier EEVDF deadline, so under load it runs before threads that never sleep
+(`sched_setattr(2)`'s `sched_runtime`, Linux 6.12+). The request keeps the thread's policy and nice, so it needs no
+privilege. A kernel that refuses it or ignores it is logged once in the boot profile and counted per shard
+(`slice_refused`), and nothing else changes; macOS and Windows ask nothing.
+
 > **Status (2026-09-29, A-41: shards are fixed only to cores the process owns).** The facts listed a Linux
 > process's cores as `0..available_parallelism()`, a count a CPU quota lowers and that names no core. Every
 > daemon under the KIND lane's two-CPU quota pinned its one shard to CPU 1: eight shards on one of 18
@@ -13333,6 +13340,42 @@ the server takes it as the work's delta over its new base (`WorkFiles::from_chan
   rebase's changes over it equals the twin's head after the accept, every change differing from the head (red with
   the changes under `d` dropped: the first case failed); a one-file edit of a thousand-file green rebases to that file
   alone. The server's library, daemon and client suites pass.
+
+### A-224 — A shard thread asks the scheduler for a slice as long as one wake and one quantum (accepted 2026-11-06, the supervisor's decision (a))
+Applied in the same change to: §4.3 (Placement), `crates/machine/src/probes.rs` (`request_slice`, `Slice`),
+`crates/machine/src/profile.rs` (`DerivedConstants::shard_slice_ns`, `KERNEL_MIN_SLICE_NS`, `KERNEL_MAX_SLICE_NS`),
+`crates/rt/src/runtime.rs` (`RuntimeConfig::slice_ns`, `run_worker`, `log_slice_outcome`), `crates/rt/src/shard.rs`
+(`Counters::slice_refused`), `unsafe-budget.toml` (slates-machine +2), the tests
+`a_shard_slice_is_held_without_privilege_and_changes_nothing_else` (`crates/machine/tests/slice.rs`), the
+harness (its `--sched-slice-ns` is gone), BENCHMARKS, GAPS.
+
+Status: built 2026-11-06 (Linux; macOS and Windows have no such request, and ask nothing).
+- Why: under the controlled load (two spinners a core on two CPUs, a sibling fsync writer, 256 MB), a woken shard
+  waited for the fair scheduler's default slice behind threads that never sleep. The edit-and-merge p99 was 6 to 15 ms
+  (x86_64) and 20 to 35 ms (arm64). A 100 µs slice asked for every slates thread cut it 3 to 4 times, to 1.9 to 4.0 and
+  2.2 to 10 ms, every round (BENCHMARKS, diag-perf-5). EEVDF (Linux 6.6+) gives a task that asks a shorter slice an
+  earlier virtual deadline, so a woken shard runs sooner; since Linux 6.12 a `SCHED_OTHER` thread asks through
+  `sched_setattr(2)`'s `sched_runtime` (B: kernel commit 857b158dc5e8, "sched/eevdf: Use sched_attr::sched_runtime to
+  set request/slice suggestion"), which the kernel clamps to 0.1 to 100 ms.
+- The rule: each shard thread, as it starts, reads its own scheduling attributes, keeps its policy and nice, and asks
+  for `shard_slice_ns`. Then it reads the attributes back. Derived: a woken shard needs the CPU for its wake (`wake.p99`)
+  and one cooperative quantum (`task_step_budget_ns`, the expected wake) to serve what woke it, so the slice is
+  `wake.p99 + wake.mean`, at least the kernel's smallest slice and at most its largest. On every machine measured so far
+  the kernel's floor, 100 µs, binds.
+- No privilege: a `SCHED_OTHER` thread that keeps its nice asks nothing of `CAP_SYS_NICE` (R10). The proof is a test
+  run as an unprivileged user, in a capped `systemd-run --user` unit (CapEff 0), that the kernel holds the slice and
+  the thread's policy and nice are unchanged.
+- An older kernel, or another OS: the request is refused, or ignored (the slice read back is not the one asked for).
+  Either is logged once in the boot profile ("the kernel holds no custom slice: shards run with the default slice") and
+  counted on each shard (`slice_refused`). Nothing else changes. It is the OS's answer, not a second path.
+- What it does not change: the client's threads, which are the caller's; the shards' placement and pinning; every
+  other derived constant.
+- Proven (2026-11-06): `a_shard_slice_is_held_without_privilege_and_changes_nothing_else` ran as uid 1000 in a capped
+  `systemd-run --user` unit (CapEff 0000000000000000, `Nice=19`) on kiln-a094a12d, Linux 6.19.10. Result: `Held(100000)`,
+  policy and nice (0, 19) before and after. On macOS it answers `Unsupported`. No kernel older than 6.12 was at hand;
+  that branch is the test's assertion on such a kernel.
+- Measured: the harness-only arm of diag-perf-5 (BENCHMARKS). The product's own A/B, base `20c74c56` against this
+  change under the controlled load, and its idle wakeups and CPU at rest, are diag-perf-6's, owed.
 
 ### A-225 — Edit and submit in one request (accepted 2026-11-06, the supervisor's decision (b))
 Applied in the same change to: §4.16 ("Edit and submit in one request"), `crates/ipc/src/protocol.rs`

@@ -71,6 +71,10 @@ pub struct RuntimeConfig {
   /// `None` is a hand-written configuration with no measured prior to track (a test harness's fixed
   /// quanta, an internal helper runtime), which keeps its fixed values.
   pub wake_tracking: Option<WakeTracking>,
+  /// The scheduling slice each shard thread asks for as it starts (§4.3, A-224: the profile's `shard_slice_ns`, one
+  /// wake and one quantum); `None` asks nothing, for a hand-written configuration with no measured wake (a test
+  /// harness, an internal helper runtime), as `wake_tracking` does.
+  pub slice_ns: Option<u64>,
 }
 
 /// What a shard needs to refine its wake estimate after boot (§4.1: the boot probe's mean converges
@@ -130,6 +134,7 @@ impl RuntimeConfig {
         shift: profile.wake.estimate_shift(),
         idle_ratio: 1,
       }),
+      slice_ns: Some(d.shard_slice_ns.get()),
     };
     config.batch = config.calibrate_batch(latency_budget_ns).get();
     config
@@ -200,6 +205,31 @@ fn log_pin_refused(shard: u16, core: u32) {
       "slates-rt: shard {shard} could not be fixed to CPU {core} (the OS refused); it runs where the \
        scheduler places it (first occurrence; each shard counts its own)"
     );
+  }
+}
+
+/// Logs, once a process, what the scheduler holds for the shards' slice (A-224): held, or why not, in which case the
+/// shards run with the default slice and nothing else changes. Each shard counts its own refusal
+/// ([`crate::shard::Counters::slice_refused`]).
+fn log_slice_outcome(asked: u64, held: slates_machine::probes::Slice) {
+  use slates_machine::probes::Slice;
+  static LOGGED: AtomicBool = AtomicBool::new(false);
+  if LOGGED.swap(true, Ordering::AcqRel) {
+    return;
+  }
+  match held {
+    Slice::Held(ns) => slates_machine::log_line!(
+      "slates-rt: shard slice: asked {asked} ns (shard_slice_ns), the kernel holds {ns} ns"
+    ),
+    Slice::Ignored(ns) => slates_machine::log_line!(
+      "slates-rt: shard slice: asked {asked} ns, the kernel holds {ns} ns (no custom slice before Linux 6.12): \
+       shards run with the default slice"
+    ),
+    Slice::Refused(code) => slates_machine::log_line!(
+      "slates-rt: shard slice: asked {asked} ns, refused (errno {code:?}, or not the fair class): shards run with \
+       the default slice"
+    ),
+    Slice::Unsupported => {}
   }
 }
 
@@ -356,6 +386,11 @@ fn run_worker(
 ) -> Result<Counters, RtError> {
   let id = seed.id;
   let pinned = core.map(|core| (core, slates_machine::probes::pin_current_thread(core)));
+  // The slice is asked for on the shard's own thread, before it serves anything (A-224).
+  let slice = seed
+    .config
+    .slice_ns
+    .map(|asked| (asked, slates_machine::probes::request_slice(asked)));
   let ctx = match ShardContext::build(seed) {
     Ok(ctx) => ctx,
     Err(error) => {
@@ -370,6 +405,12 @@ fn run_worker(
   if let Some((core, Pinning::Refused)) = pinned {
     ctx.note_pin_refused();
     log_pin_refused(ctx.id, core);
+  }
+  if let Some((asked, held)) = slice {
+    if !matches!(held, slates_machine::probes::Slice::Held(_)) {
+      ctx.note_slice_refused();
+    }
+    log_slice_outcome(asked, held);
   }
   ctx.run();
   let counters = ctx.counters();
