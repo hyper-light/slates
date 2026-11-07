@@ -99,7 +99,10 @@ fn a_creation_takes_the_creators_umask_and_ids_and_the_setgid_parents_group() {
     .attach(
       VOLUME,
       View::Current,
-      Principal::Uid { uid: ENROLLED },
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: ENROLLED,
+      },
       Rights {
         read: true,
         write: true,
@@ -196,7 +199,10 @@ fn fuse_create_and_mkdir_refuse_dot_names() {
     .attach(
       VOLUME,
       View::Current,
-      Principal::Uid { uid: ENROLLED },
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: ENROLLED,
+      },
       Rights {
         read: true,
         write: true,
@@ -267,7 +273,10 @@ fn fuse_create_family_refuses_a_path_or_absolute_name() {
     .attach(
       VOLUME,
       View::Current,
-      Principal::Uid { uid: ENROLLED },
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: ENROLLED,
+      },
       Rights {
         read: true,
         write: true,
@@ -335,7 +344,10 @@ fn a_huge_symlink_target_is_handled_without_a_panic() {
     .attach(
       VOLUME,
       View::Current,
-      Principal::Uid { uid: ENROLLED },
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: ENROLLED,
+      },
       Rights {
         read: true,
         write: true,
@@ -385,7 +397,10 @@ fn fuse_mknod_refuses_a_character_or_block_device() {
     .attach(
       VOLUME,
       View::Current,
-      Principal::Uid { uid: ENROLLED },
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: ENROLLED,
+      },
       Rights {
         read: true,
         write: true,
@@ -458,7 +473,10 @@ fn a_fuse_getattr_with_a_forged_node_id_is_refused_without_a_panic() {
     .attach(
       VOLUME,
       View::Current,
-      Principal::Uid { uid: ENROLLED },
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: ENROLLED,
+      },
       Rights {
         read: true,
         write: true,
@@ -510,7 +528,10 @@ fn a_truncated_fuse_body_is_a_typed_error_not_a_panic() {
     .attach(
       VOLUME,
       View::Current,
-      Principal::Uid { uid: ENROLLED },
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: ENROLLED,
+      },
       Rights {
         read: true,
         write: true,

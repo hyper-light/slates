@@ -4346,6 +4346,8 @@ fn a_client_reads_a_cross_region_volume_by_forwarding_to_its_owner() {
   // A client on node b (region 1) reads the volume's Status. b forwards the read to a and relays the reply.
   // Polled: it turns from a transient refusal (the root configuration not yet formed on b, so the lookup guard
   // does not fire and b routes locally, or the b→a session not yet up) into the served Status.
+  // Another node's account reaches this volume only through a share naming it (A-237).
+  share_with_node(&mut client_a, id, &daemons[1], ALL_RIGHTS);
   let mut client_b = Client::connect(&instances[1].clone());
   let (served, last) = poll_status_served(&daemons, &mut client_b, id, COUNCIL_RETIRE_DEADLINE);
 
@@ -4410,6 +4412,9 @@ fn a_client_of_another_node_in_the_owners_region_reads_and_writes_its_volume_thr
       panic!("write attach on node a: {other:?}");
     }
   };
+  // Another node's account reaches this volume only through a share naming it (A-237).
+  share_with_node(&mut client_a, id, &daemons[1], ALL_RIGHTS);
+  share_with_node(&mut client_a, id, &daemons[2], ALL_RIGHTS);
   let mut client_b = Client::connect(&instances[1].clone());
   let mut client_c = Client::connect(&instances[2].clone());
   let (status_served, status_last) =
@@ -4804,6 +4809,8 @@ fn a_cross_region_read_is_served_from_read_ahead_windows_and_byte_identical() {
   }) else {
     panic!("attach");
   };
+  // Another node's account reaches this volume only through a share naming it (A-237).
+  share_with_node(&mut raw, volume, &daemons[1], ALL_RIGHTS);
   let mut writer = slates_client::Client::connect(&instances[0], deadlines).unwrap();
   let file: Vec<u8> = (0..4u32 << 20)
     .map(|index| (index.wrapping_mul(2_654_435_761) >> 24) as u8)
@@ -4854,6 +4861,64 @@ fn a_cross_region_read_is_served_from_read_ahead_windows_and_byte_identical() {
     "the read crossed to the owner once per doubling batch: {forwards} forwards for {pages} pages"
   );
 }
+
+/// This process's account as a daemon records its channel (A-237): the uid on Unix; on Windows 0, since the rendezvous
+/// authenticates by the bootstrap object's mode and reads no SID.
+fn this_account() -> u32 {
+  #[cfg(unix)]
+  {
+    rustix::process::getuid().as_raw()
+  }
+  #[cfg(not(unix))]
+  {
+    0
+  }
+}
+
+/// Shares `volume` through `owner`, a client of the volume's owning node, with this test's account on `node`, named by
+/// `node`'s anchor (A-237: a uid means something only on its host, so a client of another node reaches a volume only
+/// through a share naming that node's account), and expects it `Shared`.
+fn share_with_node(
+  owner: &mut Client,
+  volume: VolumeId,
+  node: &Daemon,
+  rights: slates_ipc::protocol::Rights,
+) {
+  let reply = owner.call(&RequestBody::Share {
+    volume,
+    principal: slates_ipc::protocol::Principal::Uid {
+      host: node.anchor().unwrap(),
+      uid: this_account(),
+    },
+    rights,
+  });
+  assert!(
+    matches!(reply, ReplyBody::Shared),
+    "the volume was shared with node {}'s account: {reply:?}",
+    node.instance()
+  );
+}
+
+/// Shares `volume`, owned on `daemons[owner_index]`, with this test's account on every other node, through a client of
+/// the owner's node (A-237).
+fn share_with_every_other_node(daemons: &[Daemon], owner_index: usize, volume: VolumeId) {
+  let mut sharer = Client::connect(daemons[owner_index].instance());
+  for node in daemons
+    .iter()
+    .enumerate()
+    .filter(|(index, _)| *index != owner_index)
+    .map(|(_, node)| node)
+  {
+    share_with_node(&mut sharer, volume, node, ALL_RIGHTS);
+  }
+}
+
+/// Shape: every right, as an owner shares its volume with its own account on another node.
+const ALL_RIGHTS: slates_ipc::protocol::Rights = slates_ipc::protocol::Rights {
+  read: true,
+  write: true,
+  admin: true,
+};
 
 /// Polls a `Status` of `volume` through `client` until it is served or `within` passes: whether it was, and the
 /// last reply, so a wait that fails names what the node answered.
@@ -4909,6 +4974,8 @@ fn a_lone_owner_in_its_region_serves_its_latest_state_past_the_startup_allowance
   let ReplyBody::Created { id } = client_a.call(&scratch("lone-owner")) else {
     panic!("create on node a")
   };
+  // Another node's account reaches this volume only through a share naming it (A-237).
+  share_with_node(&mut client_a, id, &daemons[1], ALL_RIGHTS);
   let mut client_b = Client::connect(daemons[1].instance());
   let (routed, first) = poll_status_served(&daemons, &mut client_b, id, COUNCIL_RETIRE_DEADLINE);
   let sustained = routed.then(|| status_served_throughout(&mut client_a, &mut client_b, id));
@@ -5008,6 +5075,8 @@ fn a_forward_waits_for_the_owners_session_while_it_is_out() {
   let ReplyBody::Created { id } = client_a.call(&scratch("session-out")) else {
     panic!("create on node a")
   };
+  // Another node's account reaches this volume only through a share naming it (A-237).
+  share_with_node(&mut client_a, id, &daemons[1], ALL_RIGHTS);
   let mut client_b = Client::connect(daemons[1].instance());
   let (routed, last) = poll_status_served(&daemons, &mut client_b, id, COUNCIL_RETIRE_DEADLINE);
   let held = routed.then(|| daemons[1].hold_record_session(hosts[0], SESSION_HOLD_NS));
@@ -5362,6 +5431,9 @@ fn a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_liv
     .collect();
   let (id, successor, unrelated) =
     place_copyset_routing_case(&daemons, owner_index, owner, &neighborhood, &survivors);
+  // The owner's account reaches its volume from every other node only through a share naming that node's account
+  // (A-237): the foreign client's, and the successor's after the takeover.
+  share_with_every_other_node(&daemons, owner_index, id);
   trace::record(format_args!(
     "owner-lookup selected owner={owner:?}, successor={successor:?}, unrelated={unrelated:?}, object={:?}",
     ObjectId(id.bytes)
@@ -5893,6 +5965,9 @@ fn a_client_writes_a_cross_region_volume_by_forwarding_to_its_owner() {
       panic!("create on node a did not return an id: {other:?}");
     }
   };
+
+  // Node b's account reaches a's volume only through a share naming it (A-237).
+  share_with_node(&mut client_a, id, &daemons[1], ALL_RIGHTS);
 
   // A client on node b (region 1). Wait until a cross-region *read* is served — that proves the root
   // configuration has formed on b (the lookup guard fires) and the b→a session is up — so the write below is
@@ -8988,6 +9063,14 @@ fn a_destroyed_volume_is_retired_on_its_holders_and_no_takeover_brings_it_back()
       panic!("setup: {why}");
     }
   };
+  // Both volumes are shared with the survivors' accounts before the destroy (A-237): a survivor that would serve the
+  // destroyed volume is refused by its retirement alone, never by a missing share, so the check stays non-vacuous.
+  let mut sharer = Client::connect(&instance_a);
+  for volume in [gone, kept] {
+    for node in &daemons[1..] {
+      share_with_node(&mut sharer, volume, node, ALL_RIGHTS);
+    }
+  }
   let released = destroy_and_await_release(&instance_a, &daemons, gone);
 
   let owner = daemons.remove(0);
@@ -12113,7 +12196,10 @@ fn an_isolated_owner_holds_its_guests_requests_rather_than_serve_them() {
   let guest = start_guest(
     &daemons[0],
     held,
-    slates_db::catalog::Principal::Uid { uid: my_uid() },
+    slates_db::catalog::Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: my_uid(),
+    },
     slates_server::virtiofs::GuestView::default(),
     move |kick_write, call_read| {
       Box::pin(async move {
@@ -13273,6 +13359,8 @@ fn a_grant_made_after_the_last_seal_survives_a_takeover() {
     .map(|daemon| daemon.member_identity().unwrap())
     .collect();
   assert_fleet_forms(&daemons, &hosts, &names);
+  // The grant names its account by node a's anchor, whose account it is (A-237).
+  let anchor_a = daemons[0].anchor().unwrap();
 
   let id = match seal_hello_on_owner(&instance_a, &daemons, "granted") {
     Ok(id) => id,
@@ -13292,7 +13380,10 @@ fn a_grant_made_after_the_last_seal_survives_a_takeover() {
   };
   let shared = client.call(&RequestBody::Share {
     volume: id,
-    principal: slates_ipc::protocol::Principal::Uid { uid: GRANTED_UID },
+    principal: slates_ipc::protocol::Principal::Uid {
+      host: anchor_a,
+      uid: GRANTED_UID,
+    },
     rights: grant,
   });
   assert!(matches!(shared, ReplyBody::Shared), "{shared:?}");
@@ -13332,7 +13423,10 @@ fn a_grant_made_after_the_last_seal_survives_a_takeover() {
   assert_eq!(
     access,
     vec![slates_db::catalog::AccessEntry {
-      principal: slates_db::catalog::Principal::Uid { uid: GRANTED_UID },
+      principal: slates_db::catalog::Principal::Uid {
+        host: slates_db::HostId(anchor_a),
+        uid: GRANTED_UID,
+      },
       rights: slates_db::catalog::Rights {
         read: true,
         write: false,
@@ -14233,6 +14327,8 @@ fn a_forwarded_read_whose_owner_shard_is_starved_is_served_past_a_wall_window() 
       },
     )
     .expect("a volume node a's second shard owns");
+  // Another node's account reaches this volume only through a share naming it (A-237).
+  share_with_node(&mut client_a, id, &daemons[1], ALL_RIGHTS);
   let mut client_b = Client::connect(&instances[1].clone());
   let ready = poll_until(
     &daemons.iter().collect::<Vec<_>>(),
@@ -14300,5 +14396,94 @@ fn a_forwarded_read_whose_owner_shard_is_starved_is_served_past_a_wall_window() 
   assert!(
     served,
     "a starved owner shard's forwarded read was lost after {took:?}: {reply:?}"
+  );
+}
+
+/// A-237 (§4.13 "Principals": "between hosts, authenticated transport also binds the delegated consumer scope"). Do:
+/// three daemons, each its own region, all run by this one test process, so the same uid; create a volume on node a
+/// as that uid; from a client of node b, the same uid on another host, read its `Status`, polled until the read is
+/// served or refused for its rights (a forming configuration's refusals are transient). Expect: refused `NotShared`,
+/// naming node b's account by node b's anchor, the share that would let it in — a uid means something only on its
+/// host, and nothing shared the volume with node b's account. Before A-237 the forwarded principal was compared with no
+/// host, so the read was served: one uid on two hosts, usually two people, was one principal.
+#[test]
+fn a_forwarded_read_by_the_same_uid_on_another_host_is_forbidden_without_a_share() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let regions: std::collections::BTreeMap<HostId, RegionId> = [
+    (hosts[0], RegionId(0)),
+    (hosts[1], RegionId(1)),
+    (hosts[2], RegionId(2)),
+  ]
+  .into_iter()
+  .collect();
+  let daemons = start_mesh_with_regions(nodes, &hosts, &certs, &serve, 1, &regions);
+  let instances: Vec<String> = daemons
+    .iter()
+    .map(|daemon| daemon.instance().to_owned())
+    .collect();
+  let members: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &members, &names);
+  let mut client_a = Client::connect(&instances[0].clone());
+  let ReplyBody::Created { id } = client_a.call(&scratch("host-scoped")) else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("the volume was created on node a");
+  };
+  let anchor_b = daemons[1].anchor().unwrap();
+  let mut client_b = Client::connect(&instances[1].clone());
+  let mut last = None;
+  let settled = poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    COUNCIL_RETIRE_DEADLINE,
+    || {
+      let reply = client_b.call(&RequestBody::Status { volume: id });
+      let settled = matches!(
+        reply,
+        ReplyBody::Status { .. }
+          | ReplyBody::Refused {
+            refusal: Refusal::Forbidden { .. } | Refusal::NotShared { .. }
+          }
+      );
+      last = Some(reply);
+      Ok(settled)
+    },
+  );
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    settled,
+    "the forwarded read settled, served or refused for its rights (last: {last:?})"
+  );
+  let refused_by_name = matches!(
+    &last,
+    Some(ReplyBody::Refused {
+      refusal: Refusal::NotShared {
+        principal: slates_ipc::protocol::Principal::Uid { host, .. },
+        ..
+      }
+    }) if *host == anchor_b
+  );
+  assert!(
+    refused_by_name,
+    "node b's account, the same uid on another host, was refused naming (node b's anchor, its uid), the share that \
+     would let it in; got {}",
+    match &last {
+      Some(ReplyBody::Status { .. }) =>
+        "the volume's status: it read a volume nothing shared with it".to_owned(),
+      other => format!("{other:?}"),
+    }
   );
 }

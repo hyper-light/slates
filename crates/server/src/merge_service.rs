@@ -1724,7 +1724,17 @@ pub(crate) fn enqueue_record(
         record.owner.clone(),
       )
     })
-    .unwrap_or_else(|| (String::new(), false, Principal::Uid { uid: 0 }));
+    // No record: an owner no real principal is (host 0 is no node's anchor, every anchor being a hash).
+    .unwrap_or_else(|| {
+      (
+        String::new(),
+        false,
+        Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 0,
+        },
+      )
+    });
   let local_hold = Placement {
     acked: vec![local],
     mirror_acked: None,
@@ -2807,7 +2817,10 @@ mod tests {
         evidence: Vec::new(),
         name: String::new(),
         require_evidence: false,
-        owner: Principal::Uid { uid: 0 },
+        owner: Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 0,
+        },
       },
       inputs: Placement {
         candidates: candidates.clone(),
@@ -2856,7 +2869,10 @@ mod tests {
               evidence: Vec::new(),
               name: String::new(),
               require_evidence: false,
-              owner: Principal::Uid { uid: 0 },
+              owner: Principal::Uid {
+                host: slates_db::HostId(0),
+                uid: 0,
+              },
             },
             inputs: Placement {
               candidates: candidates.clone(),
@@ -2940,7 +2956,10 @@ mod tests {
       evidence: vec![[1u8; 32]],
       name: "green".to_owned(),
       require_evidence: true,
-      owner: Principal::Uid { uid: 1000 },
+      owner: Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1000,
+      },
     }
   }
 
@@ -2959,7 +2978,10 @@ mod tests {
       evidence: Vec::new(),
       name: String::new(),
       require_evidence: false,
-      owner: Principal::Uid { uid: 0 },
+      owner: Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 0,
+      },
     };
     assert_eq!(
       MergeRecordValue::from_record_bytes(&origin_only.to_record_bytes()),

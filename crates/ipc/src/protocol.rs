@@ -58,18 +58,23 @@ pub struct Filter {
   pub exclude: Vec<String>,
 }
 
-/// A principal on the wire (§4.13), as a `share` names one: the host account, or an enrolled consumer
-/// under one. The daemon maps it to the catalog's principal (`verbs::to_db_principal`); a certificate
-/// or SID principal is never named by a client, so neither is on the wire.
+/// A principal on the wire (§4.13), as a `share` names one: a host's account, or an enrolled consumer under one. A host
+/// account means something only on its host (A-237), so each names its host by that host's certificate anchor, as
+/// `slates status` shows it (`DaemonReport::anchor`). The daemon maps it to the catalog's principal
+/// (`verbs::to_db_principal`); a certificate or SID principal is never named by a client, so neither is on the wire.
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub enum Principal {
-  /// A Unix user.
+  /// A Unix user of a host.
   Uid {
+    /// The host whose user it is: its certificate anchor.
+    host: u64,
     /// The uid.
     uid: u32,
   },
-  /// An enrolled consumer under a host account.
+  /// An enrolled consumer under a host's account.
   Consumer {
+    /// The host whose account the consumer was enrolled under: its certificate anchor.
+    host: u64,
     /// The account.
     account: u32,
     /// The consumer id.
@@ -1616,6 +1621,9 @@ pub struct DaemonReport {
   pub log_lines_refused: u64,
   /// Log lines the anchor could not write over its life, as it last wrote the count to the segment (A-213). Appended.
   pub anchor_log_lines_refused: u64,
+  /// This node's certificate anchor (A-237): the host a principal of this node names, as a share to one of its
+  /// accounts must name it. Stable across the node's restarts. Appended.
+  pub anchor: u64,
 }
 
 /// The node's sealing at rest (A-92): how its root came (`unavailable`, `minted`, `minted-daemon-only` or
@@ -2951,6 +2959,15 @@ pub enum Refusal {
   TableAtCapacity {
     /// The table.
     table: String,
+  },
+  /// A request forwarded from another host for a volume nothing has shared with that host's account (A-237: a uid
+  /// means something only on its host). `principal` is the account as the owner judged it, its host included: the
+  /// share that would let it through names exactly this (`slates share ID uid:N@ANCHOR`).
+  NotShared {
+    /// The verb.
+    verb: String,
+    /// The requester, by its host's certificate anchor and its account.
+    principal: Principal,
   },
 }
 

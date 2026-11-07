@@ -830,7 +830,10 @@ mod tests {
       let made = crate::verbs::dispatch(
         state,
         0,
-        &slates_db::catalog::Principal::Uid { uid: 501 },
+        &slates_db::catalog::Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 501,
+        },
         slates_ipc::protocol::RequestBody::Create {
           name: "keepers".to_owned(),
           size: slates_ipc::protocol::SizeClass::Bounded { limit: 4 << 20 },

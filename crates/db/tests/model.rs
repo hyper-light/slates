@@ -280,7 +280,10 @@ fn vid(n: u64) -> VolumeId {
 }
 
 fn principal(n: u32) -> Principal {
-  Principal::Uid { uid: 1000 + n }
+  Principal::Uid {
+    host: slates_db::HostId(0),
+    uid: 1000 + n,
+  }
 }
 
 fn volume(n: u64, name: &str) -> VolumeRecord {
@@ -1677,7 +1680,8 @@ fn a_tenants_key_is_erased_with_its_last_volume_on_the_partition() {
   let mut segment = segment("slates-db-tenant-erase", LOG_BYTES);
   let mut db = open(&mut segment);
   let (first, other) = (principal(0), principal(1));
-  let (first_account, other_account) = (1000u64, 1001u64);
+  // Each tenant is its owner's, as sealing names it (A-237: a host account's tenant includes its host).
+  let (first_account, other_account) = (first.tenant(), other.tenant());
   for (n, owner) in [(1, &first), (2, &first), (3, &other)] {
     let record = VolumeRecord {
       owner: owner.clone(),

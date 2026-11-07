@@ -122,7 +122,10 @@ fn takeover_round(kernel_bumps_epoch: bool) -> Delivered {
     .attach(
       volume_id,
       View::Current,
-      Principal::Uid { uid: 0 },
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 0,
+      },
       Rights {
         read: true,
         write: true,
