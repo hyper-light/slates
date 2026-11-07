@@ -5171,7 +5171,7 @@ integration still require the A-9 tests.
 > until the ledger-prefix transfer ships the history, so its owner stays unsettled (safe: the joint writes go
 > on).
 
-> **Status (2026-11-06; amendment number owed by the supervisor;
+> **Status (2026-11-06, A-234, reviewed by raft-chaos;
 > `docs/bugs/2026-11-06-a-submit-in-a-three-process-fleet-is-never-answered.md`).** Two corrections, both found where a
 > green was made on a bootstrapper before its council grew:
 > - **A cohort smaller than the quorum.** A bootstrap settles the first node's neighbourhood as itself alone, so while
@@ -14596,7 +14596,7 @@ and settle, `DaemonEnd::reply`'s stamp and confirmation) and `crates/ipc/tests/r
 `docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`. A client and a daemon of
 different layout versions refuse each other by name; no consensus rule or capability changes.
 
-### A-(number owed by the supervisor) — A joint write's sub-quorum cohort needs every member, and pending merge records follow the current placement (accepted 2026-11-06)
+### A-234 — A joint write's sub-quorum cohort needs every member, and pending merge records follow the current placement (accepted 2026-11-06)
 
 A bootstrap installs a one-candidate placement on the bootstrapping node and settles its neighbourhood as itself, so
 a green made there before the council grows was enqueued under that placement and then, re-placed, met a joint

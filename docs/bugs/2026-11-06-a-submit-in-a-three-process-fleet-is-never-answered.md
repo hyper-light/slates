@@ -60,7 +60,7 @@ and at each record ship, in the in-process and the CLI tests, showed:
   consistent with this, and its doc now says why.
 - The three tests above. `start_mesh_with` is split so that `start_mesh_unsettled` stops after the bootstrap. The CLI
   test's failure prints every node's merge, content and seal counters.
-- §4.8 "Neighbourhood changes" status and the amendment. GAPS.
+- §4.8 "Neighbourhood changes" status and A-234. GAPS.
 
 ## Checks
 
