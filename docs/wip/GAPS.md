@@ -64,6 +64,20 @@
 > no catalog candidate receives that record only when the configuration names it again, by then a counted member of the
 > next transition. A safe release needs a holder-set generation the entries and replies carry. raft-chaos's five-node
 > flow notes the copies dropped holders keep, and asserts their release once that lands.
+>
+> **Fixed (live-fixes b5601dea, found by live-durability, 2026-11-07): a holder set was moved to one of `f` or fewer,
+> and writes waited on its lone member.** With `W` allowing `n = f`, a candidate found dead moved the holders `{X,Y}` to
+> `{Y}` at `f = 1`; once X resumed, the move back kept each write on `{Y}` until it was recorded, and Y stopped inside
+> that window held every write for a partition's length (the rolling partition flow at 8b0f0341,
+> diag-live-durability-35: a 2.2–3.1 s write in 4 of 6 runs on each arch, 1 of 6 before the floor; on the Mac, the
+> stalled runs were exactly those with two transitions). Such a set is no longer moved to: no takeover counts `f + 1`
+> reports from it. With the fix, 1 of 12 CI runs (diag-live-durability-36) and 0 of 6 Mac runs had a write over 1 s; the
+> Mac runs counted no transition.
+> **Open (owner live-fixes): a resumed candidate refuses entries while its own view still places the volume elsewhere.**
+> That one CI run (arm, 2.34 s) is another shape: the resumed X refused 2,086 entries `not_a_candidate` while the other
+> was stopped, so no holder answered (pre-merge's one 2.6 s stall counted no refusal; its shape is unknown). The holder
+> set already names X, and the owner's fence decides who may ship. Wanted: a holder in the owner's named set does not
+> refuse on its own placement view, or the shipper does not count on a holder until that holder's view places it again.
 
 > **Fixed (live-fixes, 2026-11-07): a live shipper made before its candidates were known shipped to nobody** (A-200's
 > amendment of that date). A shipper kept the holders of its first publication, so a live volume made on a fleet's
