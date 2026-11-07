@@ -1,0 +1,48 @@
+before: tested 499c3300421cb71815f607b9a3c241edb3442fb4 on x86_64, 4 cpus, load 0.42 0.16 0.06
+build exit 0
+killed daemon 5942, anchor not held: restarted at once
+bench exit 1
+level	300	wall_ns	3604887585	workers	1
+harness	300	starved	0	rebase_conflicts	427	max_sweep_ns	3430620	max_drain_gap_ns	80683885	reconnects	10	resent	238	max_outage_ns	80380987	backpressure	52	retried	0	unconfirmed	0
+oracle_failure	300	version 443 (base 378) was accepted over conflicts {("crash_core_test.c", 0, 64)}
+oracle_failure	300	version 445 (base 392) was accepted over conflicts {("up.c", 384, 64)}
+oracle_failure	300	version 446 (base 393) was accepted over conflicts {("irq/resend.c", 0, 64)}
+oracle_failure	300	version 447 (base 394) was accepted over conflicts {("livepatch/Kconfig", 256, 64)}
+oracle_failure	300	version 450 (base 395) was accepted over conflicts {("debug/debug_core.c", 0, 64)}
+oracle_failure	300	version 451 (base 395) was accepted over conflicts {("irq/cpuhotplug.c", 256, 64)}
+oracle_failure	300	version 453 (base 375) was accepted over conflicts {("time/hrtimer.c", 128, 64)}
+oracle_failure	300	version 455 (base 392) was accepted over conflicts {("bpf/preload/iterators/iterators.bpf.c", 128, 64)}
+oracle_failure	300	version 456 (base 376) was accepted over conflicts {("sched/isolation.c", 256, 64)}
+oracle_failure	300	version 457 (base 441) was accepted over conflicts {("trace/rv/monitors/scpd/scpd.c", 256, 64)}
+oracle_failure	300	version 458 (base 421) was accepted over conflicts {("trace/trace_nop.c", 256, 64)}
+oracle_failure	300	version 462 (base 444) was accepted over conflicts {("bpf/bpf_lru_list.h", 128, 64), ("bpf/offload.c", 128, 64)}
+oracle_failure	300	version 474 (base 418) was accepted over conflicts {("bpf/cnum_defs.h", 128, 64), ("trace/rv/monitors/deadline/deadline.h", 384, 64)}
+oracle_failure	300	conflict (agent 300000287, base 416) reported {("time/timer_migration.c", 0, 64)}; no head in 470..=499 expects that; at 499 expected {("locking/lock_events.c", 256, 64), ("time/timer_migration.c", 0, 64)}; unexpected: []
+oracle_failure	300	version 479 (base 418) was accepted over conflicts {("trace/trace_printk.c", 256, 64)}
+oracle_failure	300	version 480 (base 418) was accepted over conflicts {("trace/trace_events_filter.c", 256, 64)}
+oracle_failure	300	version 547 (base 380) was accepted over conflicts {("sched/isolation.c", 256, 64)}
+oracle_failure	300	version 548 (base 380) was accepted over conflicts {("trace/rv/monitors/sts/sts_kunit.h", 384, 64)}
+oracle_failure	300	version 549 (base 395) was accepted over conflicts {("trace/ring_buffer.c", 0, 64)}
+oracle_failure	300	version 550 (base 395) was accepted over conflicts {("sched/build_utility.c", 0, 64), ("smpboot.h", 384, 64)}
+oracle	300	accepted	900	conflicts	727	unknown	0	files_checked	654	oracle_failures	208
+oracle_failure	300	client 300000002's own file holds "300000002:0\n300000002:1\n", its accepted rounds [0, 1, 2] append "300000002:0\n300000002:1\n300000002:2\n"
+oracle_failure	300	client 300000003's own file holds "300000003:1\n300000003:2\n", its accepted rounds [0, 1, 2] append "300000003:0\n300000003:1\n300000003:2\n"
+oracle_failure	300	client 300000005's own file holds "300000005:0\n300000005:2\n", its accepted rounds [0, 1, 2] append "300000005:0\n300000005:1\n300000005:2\n"
+oracle_failure	300	client 300000006's own file holds "300000006:1\n300000006:2\n", its accepted rounds [0, 1, 2] append "300000006:0\n300000006:1\n300000006:2\n"
+oracle_failure	300	client 300000007's own file holds "300000007:0\n300000007:1\n", its accepted rounds [0, 1, 2] append "300000007:0\n300000007:1\n300000007:2\n"
+oracle_failure	300	client 300000010's own file holds "300000010:1\n300000010:2\n", its accepted rounds [0, 1, 2] append "300000010:0\n300000010:1\n300000010:2\n"
+oracle_failure	300	client 300000011's own file holds "300000011:1\n300000011:2\n", its accepted rounds [0, 1, 2] append "300000011:0\n300000011:1\n300000011:2\n"
+oracle_failure	300	client 300000012's own file holds "300000012:0\n300000012:2\n", its accepted rounds [0, 1, 2] append "300000012:0\n300000012:1\n300000012:2\n"
+oracle_failure	300	client 300000013's own file holds "300000013:1\n300000013:2\n", its accepted rounds [0, 1, 2] append "300000013:0\n300000013:1\n300000013:2\n"
+oracle_failure	300	client 300000014's own file holds "300000014:0\n300000014:1\n", its accepted rounds [0, 1, 2] append "300000014:0\n300000014:1\n300000014:2\n"
+oracle_failure	300	client 300000017's own file holds "300000017:1\n300000017:2\n", its accepted rounds [0, 1, 2] append "300000017:0\n300000017:1\n300000017:2\n"
+oracle_failure	300	client 300000019's own file holds "300000019:1\n300000019:2\n", its accepted rounds [0, 1, 2] append "300000019:0\n300000019:1\n300000019:2\n"
+oracle_failure	300	client 300000021's own file holds "300000021:1\n300000021:2\n", its accepted rounds [0, 1, 2] append "300000021:0\n300000021:1\n300000021:2\n"
+oracle_failure	300	client 300000022's own file holds "300000022:0\n300000022:2\n", its accepted rounds [0, 1, 2] append "300000022:0\n300000022:1\n300000022:2\n"
+oracle_failure	300	client 300000023's own file holds "300000023:0\n300000023:1\n", its accepted rounds [0, 1, 2] append "300000023:0\n300000023:1\n300000023:2\n"
+oracle_failure	300	client 300000024's own file holds "300000024:1\n300000024:2\n", its accepted rounds [0, 1, 2] append "300000024:0\n300000024:1\n300000024:2\n"
+oracle_failure	300	client 300000025's own file holds "300000025:1\n300000025:2\n", its accepted rounds [0, 1, 2] append "300000025:0\n300000025:1\n300000025:2\n"
+slates anchor: instance chaos-2552 up; daemon pid 5942; 1 shards
+slates anchor: daemon exited (None); restarted (1 in the window)
+slates-server: shard 0: recovered 1 volumes from their images (0 refused), 239 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone 
+slates anchor: stopped (daemon exit Some(0))
