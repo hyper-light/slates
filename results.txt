@@ -1,0 +1,55 @@
+runner ubuntu-24.04-arm, 4 CPUs, Sat Nov  7 13:58:04 UTC 2026, commit 29760a79
+== cargo test --locked -q -p slates-wire
+test result: ok. 32 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.69s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-db
+test result: ok. 63 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.29s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.12s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.56s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.81s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.10s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-anchor -- --test-threads=1
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 18 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out; finished in 1.15s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-server --lib
+test result: ok. 202 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 1.26s
+== exit 0
+== cargo test --locked -q -p slates-server --test consumers
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+== exit 0
+== cargo test --locked -q -p slates-server --test daemon
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.58s
+== exit 0
+== cargo test --locked -q -p slates-server --test virtiofs
+test result: ok. 28 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.03s
+== exit 0
+== cargo test --locked -q -p slates-cli --bins
+test result: ok. 50 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.35s
+== exit 0
+== cargo test --locked -q -p slates-server --test fleet
+a_grant_made_after_the_last_seal_survives_a_takeover --- FAILED
+a_taken_over_green_serves_every_version_and_accepts_new_work_on_the_successor --- FAILED
+an_isolated_owner_holds_its_guests_requests_rather_than_serve_them --- FAILED
+an_isolated_owner_refuses_latest_state_reads_while_the_successor_advances_the_green --- FAILED
+thread 'a_grant_made_after_the_last_seal_survives_a_takeover' (10266) panicked at crates/server/tests/fleet.rs:13182:3:
+thread 'a_taken_over_green_serves_every_version_and_accepts_new_work_on_the_successor' (10556) panicked at crates/server/tests/fleet.rs:11773:3:
+thread 'an_isolated_owner_holds_its_guests_requests_rather_than_serve_them' (10635) panicked at crates/server/tests/fleet.rs:12017:3:
+thread 'an_isolated_owner_refuses_latest_state_reads_while_the_successor_advances_the_green' (10648) panicked at crates/server/tests/fleet.rs:11902:3:
+    a_grant_made_after_the_last_seal_survives_a_takeover
+    a_taken_over_green_serves_every_version_and_accepts_new_work_on_the_successor
+    an_isolated_owner_holds_its_guests_requests_rather_than_serve_them
+    an_isolated_owner_refuses_latest_state_reads_while_the_successor_advances_the_green
+test result: FAILED. 89 passed; 4 failed; 3 ignored; 0 measured; 0 filtered out; finished in 341.88s
+== exit 101
