@@ -1,0 +1,7 @@
+user runnervmm7ud1\runneradmin
+user sid S-1-5-21-3289802278-1561746829-1498425070-500
+token default owner BUILTIN\Administrators
+elevated True
+workspace owner BUILTIN\Administrators
+crates\server owner BUILTIN\Administrators
+a directory this step makes, owner BUILTIN\Administrators
