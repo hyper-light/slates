@@ -43,3 +43,15 @@ live keyed: ZZ live-keyed-b-46146 counters {"appended": 6, "awaited": 5, "durabl
 live keyed: ZZ live-keyed-c-46146 counters {"held": 11, "hold_refused": 7, "hold_refused.no_catalog": 7}
 live keyed: the writes returned while the candidate was stopped: false; served whole by live-keyed-c-46146 after 2.649388333s
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 10.79s
+=== keyed-5 exit 0 load { 16.81 6.80 4.83 }
+live keyed: created 1884e3c20f2c2d2a0000000000000014 after 497.311833ms
+live keyed: created 1884e3c20f2c2d2a0001000000000004 after 509.97075ms
+live keyed: created 1884e3c20f2c2d2a0000000000000017 after 521.86325ms
+live keyed: 1884e3c20f2c2d2a0000000000000017's successor is the stopped node, after 521.952667ms
+live keyed: live-shipped and writing, after 522.04825ms
+live keyed: ZZ owner counters before the kill {"appended": 6, "awaited": 5, "durable": 6, "held_back.keys": 9, "held_back.placement": 1, "held_back.whole": 1, "holders_recorded": 1, "no_session": 16, "resolved": 5, "unanswered": 9, "whole": 2}
+live keyed: ZZ live-keyed-a-46644 counters {"hold_refused": 29, "hold_refused.no_catalog": 16, "hold_refused.not_a_member": 13}
+live keyed: ZZ live-keyed-b-46644 counters {"held": 8}
+live keyed: ZZ live-keyed-c-46644 counters {"appended": 6, "awaited": 5, "durable": 6, "held_back.keys": 9, "held_back.placement": 1, "held_back.whole": 1, "holders_recorded": 1, "no_session": 18, "resolved": 5, "unanswered": 9, "whole": 2}
+live keyed: the writes returned while the candidate was stopped: false; served whole by live-keyed-a-46644 after 2.326803292s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 7.32s
