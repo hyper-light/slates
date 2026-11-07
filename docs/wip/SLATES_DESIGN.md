@@ -5501,7 +5501,8 @@ window is the mirror lag at that moment, zero for every operation that awaited t
 > boot from the replay throughput recovery measured. A daemon booted fresh replayed nothing, took one byte a
 > microsecond, and re-encoded its whole partition every 1 MB of log for its whole life: at 10,000 works the green's
 > owner shard spent about 1,800 of 2,241 samples doing it. At every snapshot the cadence is now re-derived as
-> `max(budget × the apply throughput measured since the last snapshot, the snapshot's size)` (`SnapshotPolicy::at_snapshot`),
+> `max(budget × the replay throughput measured since the last snapshot, the snapshot's size)` (`SnapshotPolicy::at_snapshot`),
+> the throughput timed on each commit's append and apply, the work a replay repeats per record,
 > so snapshot work stays within about twice the log it absorbs, whatever the partition's size, and `slates status`
 > shows each shard's snapshots, their bytes and longest duration, the log appended, the cadence and the measured rate.
 > Recovery's bound changes with it (the paragraph below). The snapshot still runs whole on the committing shard's
@@ -5517,7 +5518,8 @@ RAM-fault case; that node holds nothing for others until re-replication fills it
 metadata takeover uses a configuration decision and phase-one exchange. A read may additionally
 need content fetch and a confirmed lease; measure that complete recovery boundary. A partition's own part is decoding
 its last snapshot and replaying the log after it, and the log between snapshots is at most
-`max(recovery budget × measured apply throughput, the last snapshot's size)` (A-243). So local recovery holds the
+`max(recovery budget × measured replay throughput, the last snapshot's size)` (A-243), the throughput timed on each
+commit's append and apply. So local recovery holds the
 budget while a partition's snapshot decodes within it, and is bounded by about twice its own snapshot's cost once the
 partition outgrows it.
 
@@ -7997,8 +7999,8 @@ SDKs.
    daemon (start, restart on exit, hand back held fds later in Phase 3/4).
 2. Partition data model and indexes; the op log in the segment; replay on start; snapshots of
    partition state into the segment on a cadence derived from measured replay throughput and the
-   recovery budget (since A-243 re-derived at every snapshot from the measured apply throughput, and never shorter
-   than the snapshot's own size).
+   recovery budget (since A-243 re-derived at every snapshot from the replay throughput each commit's append and
+   apply measure, and never shorter than the snapshot's own size).
 3. Rendezvous per OS; ring regions; wake words; the completion fd; peer authentication.
 4. The lifecycle verbs of Part 4.4 through the server, with completion records (exactly-once),
    leases with epochs, attachments (client form only), quotas fed by the real pressure sources.
@@ -14251,25 +14253,31 @@ green's base, the other half of the load test's first finding, is A-202's.
 - **Cost (measured on the branch it comes from):** every edit now appends to the partition log, so the partition's
   snapshots come at the rate edits arrive.
 
-### A-243 — A partition's snapshot cadence is re-derived at every snapshot, from the measured apply throughput and the snapshot's own size (accepted and built 2026-11-07, the 10,000-client rung's snapshot wall; raft agreed)
+### A-243 — A partition's snapshot cadence is re-derived at every snapshot, from the measured replay throughput and the snapshot's own size (accepted and built 2026-11-07, the 10,000-client rung's snapshot wall; raft agreed)
 
 Applied in the same change to:
 - §4.8: its status and the Recovery paragraph's bound.
 - Phase 2 task 2's cadence.
 - GAPS: the load-test blockquote.
-- `crates/db/src/replay.rs`: `SnapshotPolicy::at_snapshot`, `DbStats`, `Db::stats`, the timed apply, `set_policy`
-  pinning.
+- `crates/db/src/replay.rs`: `SnapshotPolicy::at_snapshot`, `DbStats`, `Db::stats`, the timed append and apply,
+  `set_policy` pinning, `set_recovery_budget`.
 - `crates/ipc` (`ShardReport::snapshots`, `DbSnapshotReport`), `crates/server` (`shard_report`) and `crates/cli`
   (`slates status`).
-- The test `crates/db/tests/snapshot_cadence.rs`.
+- The tests in `crates/db/tests/snapshot_cadence.rs`.
 - **What was there.**
   - `bytes_between_snapshots = budget × replay throughput`, measured once at boot.
   - A fresh boot replayed nothing, took 1 B/µs, and kept a 1 MB cadence for life.
   - Each snapshot re-encodes the whole partition, so snapshot work was partition size / 1 MB per byte of log.
 - **The rule.**
-  - At every snapshot, `bytes_between_snapshots = max(budget × apply throughput, snapshot size)`.
-  - The apply throughput is measured live: the partition's apply, timed around each commit's apply (the work replay
-    repeats), over the log bytes since the last snapshot; the boot replay's rate stands until one is measured.
+  - At every snapshot, `bytes_between_snapshots = max(budget × replay throughput, snapshot size)`.
+  - The replay throughput is measured live: the log bytes since the last snapshot over the time each commit spent on
+    the record's append (encode, checksum, copy into the ring) and its apply. That is the work a replay repeats per
+    record, the append mirroring the replay's read, checksum and decode. The boot replay's rate stands until one is
+    measured.
+  - Timing the apply alone overstated the replay's speed by the decode's share, so a recovery's tail could run past
+    the budget by it (raft's review). A fresh partition's longest tail, the one the cadence allows, is recovered and
+    timed against the budget (`a_fresh_partitions_longest_tail_replays_within_its_recovery_budget`).
+  - The budget is the operator's input (`Db::set_recovery_budget`, GAPS §5), one second by default.
   - The second term is the doubling rule, so snapshot work stays within about twice the log written.
   - The decision is the commit's, never the apply's: replay sees no clock.
   - A cadence a caller sets is pinned.

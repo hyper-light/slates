@@ -27,7 +27,7 @@ use slates_db::catalog::{
   Rights, Role, SizeClass, SnapshotId, SnapshotRecord, VolumeId, VolumeRecord, VolumeState,
 };
 use slates_db::partition::PartitionCaps;
-use slates_db::replay::{SnapshotPolicy, recover};
+use slates_db::replay::{SnapshotPolicy, Tail, recover, snapshot_due};
 use slates_db::{Db, DbError, Op};
 use slates_machine::facts::Identity;
 use slates_wire::request::Seen;
@@ -969,6 +969,88 @@ fn note_applied(op: &Op, ids: &mut Ids) {
   }
 }
 
+/// When a generated history's database snapshots: a pinned byte cadence, or the measured trigger (A-243) with a
+/// recovery budget, whose snapshot points follow the clock and so differ between two runs of one history.
+#[derive(Clone, Copy, Debug)]
+enum Cadence {
+  Pinned(u64),
+  Measured(u64),
+}
+
+/// Sets `cadence` on a database just opened or recovered.
+fn hold_to(db: &mut Db, cadence: Cadence) {
+  match cadence {
+    Cadence::Pinned(bytes) => db.set_policy(SnapshotPolicy {
+      bytes_between_snapshots: bytes,
+    }),
+    Cadence::Measured(budget_ns) => db.set_recovery_budget(budget_ns),
+  }
+}
+
+/// Runs a generated history under `cadence`, crashing where it says: after every crash, and at the end, the recovered
+/// partition equals the live one whole; refused operations were never recorded.
+fn every_recovery_equals_the_live_partition_under(
+  steps: &[Step],
+  cadence: Cadence,
+) -> Result<(), TestCaseError> {
+  let mut seg = segment("slates-db-model", LOG_BYTES);
+  let mut db = open(&mut seg);
+  hold_to(&mut db, cadence);
+  let mut ids = Ids::default();
+  let mut now_ns = 0u64;
+  let mut applied = 0usize;
+  for s in steps {
+    now_ns += 100;
+    if matches!(s, Step::Crash) {
+      let live = db.partition().to_snapshot(0);
+      let seq = db.next_seq();
+      drop(db);
+      let (recovered, stats) = recover(&mut seg, 0, caps(), now_ns).unwrap();
+      prop_assert_eq!(
+        recovered.partition().to_snapshot(0),
+        live,
+        "recovery differs from the live partition"
+      );
+      prop_assert_eq!(recovered.next_seq(), seq);
+      prop_assert!(!stats.torn, "a clean crash has no torn tail");
+      db = recovered;
+      hold_to(&mut db, cadence);
+      continue;
+    }
+    let Some(op) = op_for(s, &mut ids, now_ns) else {
+      continue;
+    };
+    match db.mutate(&mut seg, &op, now_ns) {
+      Ok(_) => {
+        note_applied(&op, &mut ids);
+        applied += 1;
+      }
+      Err(
+        DbError::NotFound
+        | DbError::AlreadyExists { .. }
+        | DbError::LeaseHeld { .. }
+        | DbError::StaleLease { .. }
+        | DbError::StaleCompletion { .. }
+        | DbError::Capacity { .. }
+        | DbError::CheckpointOutOfRange { .. },
+      ) => {}
+      Err(other) => prop_assert!(false, "unexpected refusal {other:?}"),
+    }
+    for expired in db.partition_mut().expired_leases(now_ns) {
+      db.mutate(&mut seg, &Op::LeaseReleased { volume: expired }, now_ns)
+        .unwrap();
+    }
+  }
+  let live = db.partition().to_snapshot(0);
+  let seq = db.next_seq();
+  drop(db);
+  let (recovered, _) = recover(&mut seg, 0, caps(), now_ns).unwrap();
+  prop_assert_eq!(recovered.partition().to_snapshot(0), live);
+  prop_assert_eq!(recovered.next_seq(), seq);
+  prop_assert!(usize::try_from(seq).unwrap() >= applied);
+  Ok(())
+}
+
 proptest! {
   #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(60), ..ProptestConfig::default() }))]
 
@@ -977,46 +1059,15 @@ proptest! {
   /// recorded; the snapshot cadence and the log trim never lose a record.
   #[test]
   fn every_recovery_equals_the_live_partition(steps in proptest::collection::vec(step(), 1..250), snapshot_every in 1u64..20_000) {
-    let mut seg = segment("slates-db-model", LOG_BYTES);
-    let mut db = open(&mut seg);
-    db.set_policy(SnapshotPolicy { bytes_between_snapshots: snapshot_every });
-    let mut ids = Ids::default();
-    let mut now_ns = 0u64;
-    let mut applied = 0usize;
-    for s in &steps {
-      now_ns += 100;
-      if matches!(s, Step::Crash) {
-        let live = db.partition().to_snapshot(0);
-        let seq = db.next_seq();
-        drop(db);
-        let (recovered, stats) = recover(&mut seg, 0, caps(), now_ns).unwrap();
-        prop_assert_eq!(recovered.partition().to_snapshot(0), live, "recovery differs from the live partition");
-        prop_assert_eq!(recovered.next_seq(), seq);
-        prop_assert!(!stats.torn, "a clean crash has no torn tail");
-        db = recovered;
-        db.set_policy(SnapshotPolicy { bytes_between_snapshots: snapshot_every });
-        continue;
-      }
-      let Some(op) = op_for(s, &mut ids, now_ns) else { continue };
-      match db.mutate(&mut seg, &op, now_ns) {
-        Ok(_) => {
-          note_applied(&op, &mut ids);
-          applied += 1;
-        }
-        Err(DbError::NotFound | DbError::AlreadyExists { .. } | DbError::LeaseHeld { .. } | DbError::StaleLease { .. } | DbError::StaleCompletion { .. } | DbError::Capacity { .. } | DbError::CheckpointOutOfRange { .. }) => {}
-        Err(other) => prop_assert!(false, "unexpected refusal {other:?}"),
-      }
-      for expired in db.partition_mut().expired_leases(now_ns) {
-        db.mutate(&mut seg, &Op::LeaseReleased { volume: expired }, now_ns).unwrap();
-      }
-    }
-    let live = db.partition().to_snapshot(0);
-    let seq = db.next_seq();
-    drop(db);
-    let (recovered, _) = recover(&mut seg, 0, caps(), now_ns).unwrap();
-    prop_assert_eq!(recovered.partition().to_snapshot(0), live);
-    prop_assert_eq!(recovered.next_seq(), seq);
-    prop_assert!(usize::try_from(seq).unwrap() >= applied);
+    every_recovery_equals_the_live_partition_under(&steps, Cadence::Pinned(snapshot_every))?;
+  }
+
+  /// AC-2.3, A-243 (raft): the same under the measured trigger, a recovery budget of 0 to 200 µs, so snapshots fall
+  /// where the clock puts them (with a budget of 0, at every snapshot's size of log). Expect: every recovery equals the
+  /// live partition whole, wherever the snapshots fell.
+  #[test]
+  fn every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots(steps in proptest::collection::vec(step(), 1..250), budget_ns in 0u64..200_000) {
+    every_recovery_equals_the_live_partition_under(&steps, Cadence::Measured(budget_ns))?;
   }
 }
 
@@ -1558,18 +1609,25 @@ fn a_full_log_snapshots_and_retries() {
   assert_eq!(recovered.partition().to_snapshot(0), live);
 }
 
-/// The snapshot policy derives from the recovery budget and the measured replay throughput.
+/// A-243: the measured trigger needs both the budget's replay work and a snapshot's size of log. Work alone would
+/// re-encode a large partition for every budget's worth of small records, past the doubling bound; bytes alone is the
+/// extrapolation that let a tail of small records run past the budget.
 #[test]
-fn the_snapshot_policy_derives_from_the_budget_and_the_measured_replay() {
-  let p = SnapshotPolicy::derive(1_000_000_000, 700);
-  assert_eq!(p.value.bytes_between_snapshots, 700_000_000);
-  assert_eq!(
-    SnapshotPolicy::derive(1_000_000_000, 0)
-      .value
-      .bytes_between_snapshots,
-    1_000_000
+fn a_snapshot_is_due_only_once_the_tail_took_the_budget_and_reached_the_floor() {
+  let tail = |bytes, replay_ns| Tail { bytes, replay_ns };
+  assert!(snapshot_due(tail(4_096, 1_000), 4_096, 1_000));
+  assert!(
+    !snapshot_due(tail(4_095, 1_000_000), 4_096, 1_000),
+    "work without the floor's bytes"
   );
-  assert!(p.anchors.contains(&"replay_bytes_per_us"));
+  assert!(
+    !snapshot_due(tail(1 << 30, 999), 4_096, 1_000),
+    "bytes without the budget's work"
+  );
+  assert!(
+    snapshot_due(tail(0, 0), 0, 0),
+    "a zero budget and floor snapshot at every commit"
+  );
 }
 
 /// Shape: the snapshot interval of the rewind test — small, so the history crosses hundreds of snapshots.
