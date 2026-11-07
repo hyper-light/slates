@@ -1,0 +1,26 @@
+=== suite-1 exit 0 load { 84.17 49.81 26.53 }
+test a_destroyed_live_volumes_copies_are_let_go_by_its_candidates ... slates daemon: fleet node `a` of `slates-fleet`: member 11566138989710857146 with 2 peer(s) at f = 1
+test a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates ... slates daemon: fleet node `c` of `slates-fleet`: member 16617143219406881149 with 2 peer(s) at f = 1
+test a_live_volume_made_while_its_successor_was_stopped_is_served_by_it ... slates daemon: fleet node `a` of `slates-fleet`: member 5357178533513439421 with 2 peer(s) at f = 1
+live keyed: created b1528a664875247a000000000000000e after 159.739458ms
+live keyed: b1528a664875247a000000000000000e's successor is the stopped node, after 159.91ms
+live keyed: live-shipped and writing, after 160.029541ms
+live keyed: ZZ owner counters before the kill {"appended": 6, "awaited": 5, "durable": 6, "held_back.keys": 8, "held_back.placement": 1, "held_back.whole": 1, "holders_recorded": 1, "no_session": 14, "resolved": 5, "unanswered": 8, "whole": 2}
+live keyed: ZZ live-keyed-a-15409 counters {"held": 8}
+live keyed: ZZ live-keyed-b-15409 counters {"appended": 6, "awaited": 5, "durable": 6, "held_back.keys": 8, "held_back.placement": 1, "held_back.whole": 1, "holders_recorded": 1, "no_session": 14, "resolved": 5, "unanswered": 8, "whole": 2}
+live keyed: ZZ live-keyed-c-15409 counters {"hold_refused": 29, "hold_refused.no_catalog": 29}
+live keyed: the writes returned while the candidate was stopped: false; served whole by live-keyed-c-15409 after 2.383944083s
+test a_live_volumes_acknowledged_writes_survive_its_owners_death ... slates daemon: fleet node `c` of `slates-fleet`: member 14124382976884483953 with 2 peer(s) at f = 1
+test a_live_volumes_writes_ship_their_changes_not_the_volume ... slates daemon: fleet node `c` of `slates-fleet`: member 16505581730107829723 with 2 peer(s) at f = 1
+test a_long_writer_keeps_the_candidates_copies_within_their_bound ... slates daemon: fleet node `c` of `slates-fleet`: member 786151485484190246 with 2 peer(s) at f = 1
+test a_paused_candidate_neither_stops_writes_nor_stays_behind ... slates daemon: fleet node `a` of `slates-fleet`: member 3292962796830009348 with 2 peer(s) at f = 1
+test a_stable_nfs_write_to_a_live_volume_is_answered_once_a_candidate_holds_it ... slates daemon: fleet node `b` of `slates-fleet`: member 2370317548629261365 with 2 peer(s) at f = 1
+test a_successor_that_holds_no_copy_still_takes_a_live_volume_over ... slates daemon: fleet node `c` of `slates-fleet`: member 17848947452736956405 with 2 peer(s) at f = 1
+test a_superseded_owner_resumed_after_its_takeover_is_fenced ... slates daemon: fleet node `b` of `slates-fleet`: member 7095715137752146722 with 2 peer(s) at f = 1
+test a_writer_on_a_macos_mount_waits_for_stopped_candidates_rather_than_fail ... slates daemon: fleet node `a` of `slates-fleet`: member 4482027346041914208 with 2 peer(s) at f = 1
+test an_owner_killed_while_its_fleet_still_forms_is_taken_over ... slates daemon: fleet node `a` of `slates-fleet`: member 6095541279332968445 with 2 peer(s) at f = 1
+test clients_cut_off_mid_write_leave_the_live_log_whole ... slates daemon: fleet node `b` of `slates-fleet`: member 13288940166311376202 with 2 peer(s) at f = 1
+test measure_what_live_shipping_adds_to_a_stable_nfs_write ... skipping the live-shipping measurement: set SLATES_TEST_CLI=1 and SLATES_TEST_MEASURE=1 (release)
+test three_daemon_processes_ship_a_live_volumes_writes_to_both_candidates ... slates daemon: fleet node `a` of `slates-fleet`: member 13209260767792323684 with 2 peer(s) at f = 1
+test writes_stay_durable_through_injected_candidate_stalls ... slates daemon: fleet node `a` of `slates-fleet`: member 10832629248449468163 with 2 peer(s) at f = 1
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 232.23s
