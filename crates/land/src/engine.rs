@@ -580,7 +580,9 @@ struct WriteContext<'x, H: LandFs> {
 /// The write phase's state across the entries it writes, kept between slices: the class being written, the file being
 /// copied, and the batch staged for its barrier (A-130).
 struct WriteProgress {
-  /// When the write phase began: the landing's elapsed clock for its grant and lease checks.
+  /// The instant the landing's request clock was read (`LandingRun::began`): its elapsed clock for the grant and lease
+  /// fences and the entries' spans, so the time the plan, the sweep and the validation took counts. It was the write
+  /// phase's own start until 2026-11-08, and a landing paused before its writes wrote past its lease's term.
   started: Instant,
   /// The class of the entry last begun (§4.15 step 5): a batch takes its barrier before an entry of another class.
   class: Option<u8>,
@@ -600,9 +602,9 @@ struct WriteProgress {
 }
 
 impl WriteProgress {
-  fn start() -> Self {
+  fn start(began: Instant) -> Self {
     Self {
-      started: Instant::now(),
+      started: began,
       class: None,
       entry_start_ns: 0,
       copy: None,
@@ -2889,6 +2891,9 @@ pub fn begin_landing<'h, H: LandFs>(
   audit: &mut Audit,
   request: &LandingRequest,
 ) -> Result<LandingRun<'h, H>, (HostSlot<'h, H>, LandingRefusal)> {
+  // The instant `request.now_ns` stands for: its caller read the clock as it called this, and every fence counts the
+  // run's time from here, the plan's included.
+  let began = Instant::now();
   // Plan.
   let planned = match host.get() {
     Some(lent) => plan(vol, store, lent, &request.filter, request.source),
@@ -2957,6 +2962,7 @@ pub fn begin_landing<'h, H: LandFs>(
     manifest,
     grant,
     lease,
+    began,
   )
 }
 
@@ -3195,6 +3201,9 @@ pub struct LandingRun<'h, H: LandFs> {
   last_unit_ns: u64,
   /// How long the last [`LandingRun::step`] ran, in nanoseconds, to the end of its last unit.
   last_step_ns: u64,
+  /// The instant the run's request clock (`request.now_ns`) stands for: taken as [`begin_landing`] starts, which its
+  /// caller calls as it reads the clock. The fences count the run's time from here.
+  began: Instant,
 }
 
 impl<'h, H: LandFs> LandingRun<'h, H> {
@@ -3206,6 +3215,7 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
     manifest: Manifest,
     grant: GrantRecord,
     lease: LandingLease,
+    began: Instant,
   ) -> Result<Self, (HostSlot<'h, H>, LandingRefusal)> {
     let caps = match host.get().map(|host| host.capabilities(target.dir)) {
       Some(Ok(caps)) => caps,
@@ -3227,6 +3237,7 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
       swept: 0,
       last_unit_ns: 0,
       last_step_ns: 0,
+      began,
     })
   }
 
@@ -3479,6 +3490,7 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
       swept,
       last_unit_ns: _,
       last_step_ns: _,
+      began,
     } = self;
     let Some(host) = host.get() else {
       return Some(Err(LandingRefusal::HostAway));
@@ -3531,7 +3543,7 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
           } else {
             next_phase = Some(Phase::Write {
               next: 0,
-              progress: WriteProgress::start(),
+              progress: WriteProgress::start(*began),
             });
           }
         }
