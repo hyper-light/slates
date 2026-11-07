@@ -1537,6 +1537,19 @@ fn keep(held: &mut Held, payload: &[u8], bound: usize) -> Result<(), LiveError> 
 /// Counter: a takeover of a live volume that could not rebuild it from the adopted log (its first entry not whole, an
 /// entry that would not open or apply, or content missing for an extent): the volume is not served from it.
 const LIVE_TAKEOVER_REFUSED: &str = "fleet.live.takeover_refused";
+/// Counter: a takeover refused because the lineage key the log's whole entry carries could not be adopted.
+const REFUSED_LINEAGE: &str = "fleet.live.takeover_refused.lineage";
+/// Counter: a takeover refused because an entry's payload would not open (its seal, or its bytes).
+const REFUSED_OPEN: &str = "fleet.live.takeover_refused.open";
+/// Counter: a takeover refused because an opened entry's record would not decode.
+const REFUSED_RECORD: &str = "fleet.live.takeover_refused.record";
+/// Counter: a takeover refused because a delta would not apply to the image before it.
+const REFUSED_APPLY: &str = "fleet.live.takeover_refused.apply";
+/// Counter: a takeover refused because the log's first entry is not a whole record (or there is none).
+const REFUSED_NOT_WHOLE_FIRST: &str = "fleet.live.takeover_refused.not_whole_first";
+/// Counter: a takeover refused because the rebuilt image could not be laid out as an archive (no root, a cycle,
+/// content missing for an extent).
+const REFUSED_LAYOUT: &str = "fleet.live.takeover_refused.layout";
 /// Counter: a taken-over live volume rebuilt from the adopted log.
 const LIVE_TAKEN_OVER: &str = "fleet.live.taken_over";
 
@@ -1654,7 +1667,12 @@ pub(crate) fn archive_from_live(
   let rebuilt = rebuild(state, id, owner, fetched);
   match &rebuilt {
     Ok(_) => state.count(LIVE_TAKEN_OVER, 1),
-    Err(_) => state.count(LIVE_TAKEOVER_REFUSED, 1),
+    Err(why) => {
+      // In total and by why (`fleet.live.takeover_refused.*`), as a holder's refusals are counted: one counter for nine
+      // refusals hid which step a 1,000-write log failed at on KIND (runs 42178128960, 42318867890: 1,512 refusals).
+      state.count(LIVE_TAKEOVER_REFUSED, 1);
+      state.count(why, 1);
+    }
   }
   rebuilt
 }
@@ -1667,33 +1685,32 @@ fn rebuild(
 ) -> Result<slates_archive::Archive, &'static str> {
   if let Some(lineage) = fetched.lineage.clone() {
     crate::seal_keys::adopt_lineage(state, id, owner, lineage, fetched.naming.as_ref())
-      .map_err(|_| LIVE_TAKEOVER_REFUSED)?;
+      .map_err(|_| REFUSED_LINEAGE)?;
   }
   let mut publications = Vec::new();
   for payload in &fetched.payloads {
-    publications.push(open_payload(state, id, owner, payload).ok_or(LIVE_TAKEOVER_REFUSED)?);
+    publications.push(open_payload(state, id, owner, payload).ok_or(REFUSED_OPEN)?);
   }
   let mut image = None;
   let mut runs: BTreeMap<(u64, u64), Vec<u8>> = BTreeMap::new();
   for publication in publications {
-    let record = <VolumeRecord as Wire>::decode(&mut &publication.record[..])
-      .map_err(|_| LIVE_TAKEOVER_REFUSED)?;
+    let record =
+      <VolumeRecord as Wire>::decode(&mut &publication.record[..]).map_err(|_| REFUSED_RECORD)?;
     match (record, image.as_mut()) {
       (VolumeRecord::Full { image: whole }, _) => {
         image = Some(whole);
         runs.clear();
       }
       (VolumeRecord::Delta { delta }, Some(image)) => {
-        slates_vfs::recover::VolumeImage::apply(image, &delta)
-          .map_err(|_| LIVE_TAKEOVER_REFUSED)?;
+        slates_vfs::recover::VolumeImage::apply(image, &delta).map_err(|_| REFUSED_APPLY)?;
       }
-      (VolumeRecord::Delta { .. }, None) => return Err(LIVE_TAKEOVER_REFUSED),
+      (VolumeRecord::Delta { .. }, None) => return Err(REFUSED_NOT_WHOLE_FIRST),
     }
     for run in publication.runs {
       runs.insert((run.inode, run.offset), run.bytes);
     }
   }
-  let image = image.ok_or(LIVE_TAKEOVER_REFUSED)?;
+  let image = image.ok_or(REFUSED_NOT_WHOLE_FIRST)?;
   archive_of(&image, &runs, ObjectId(id.bytes).local(), state.config.page)
 }
 
@@ -1739,7 +1756,7 @@ fn archive_of(
   let inodes: BTreeMap<u64, &InodeImage> =
     image.inodes.iter().map(|inode| (inode.no, inode)).collect();
   let mut chunks = Vec::new();
-  let root = inodes.get(&image.root_no).ok_or(LIVE_TAKEOVER_REFUSED)?;
+  let root = inodes.get(&image.root_no).ok_or(REFUSED_LAYOUT)?;
   let root_meta = meta_of(root);
   let mut visiting = Vec::new();
   let manifest = node_of(root, &inodes, runs, &mut chunks, &mut visiting)?;
@@ -1775,7 +1792,7 @@ fn node_of(
   match &inode.body {
     BodyImage::Directory { entries, .. } => {
       if visiting.contains(&inode.no) {
-        return Err(LIVE_TAKEOVER_REFUSED);
+        return Err(REFUSED_LAYOUT);
       }
       visiting.push(inode.no);
       let mut children = Vec::new();
@@ -1807,9 +1824,9 @@ fn node_of(
         .map(|extent| (extent.offset, extent.len))
         .chain(open.iter().map(|open| (open.offset, open.len)));
       for (offset, len) in spans {
-        let bytes = runs.get(&(inode.no, offset)).ok_or(LIVE_TAKEOVER_REFUSED)?;
+        let bytes = runs.get(&(inode.no, offset)).ok_or(REFUSED_LAYOUT)?;
         if u64::try_from(bytes.len()).ok() != Some(len) {
-          return Err(LIVE_TAKEOVER_REFUSED);
+          return Err(REFUSED_LAYOUT);
         }
         let chunk = slates_archive::Archive::raw_chunk(bytes.clone());
         laid.push(slates_archive::Extent {
