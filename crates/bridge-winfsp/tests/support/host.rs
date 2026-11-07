@@ -986,11 +986,12 @@ fn journals_holding_a_batch(ledger: &OwnedHandle) -> u64 {
     {
       holding |= 1 << SAVED_OPEN_BIT;
     }
+    let mut scratch = crate::inflight::Scratch::new().unwrap();
     if crate::inflight::capture::Capture::new(&mut captured)
       .unwrap()
-      .resume()
+      .resume(&mut scratch)
       .unwrap()
-      .is_some_and(|batch| !batch.hints().is_empty())
+      .is_some_and(|batch| !batch.hints().unwrap().is_empty())
     {
       holding |= 1 << worker;
     }

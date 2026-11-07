@@ -708,15 +708,16 @@ fn recover(
 ) -> Result<Option<Settled>, WinFspError> {
   let mut journals = Vec::with_capacity(inflight::capture::MAX_WORKERS);
   let mut any = false;
+  let mut scratch = inflight::Scratch::new().map_err(WinFspError::Capture)?;
   for worker in 0..inflight::capture::MAX_WORKERS {
     match view
       .capture(worker)?
-      .resume()
+      .resume(&mut scratch)
       .map_err(WinFspError::Capture)?
     {
       Some(batch) => {
         any = true;
-        journals.push((batch.stamp(), batch.hints()));
+        journals.push((batch.stamp(), batch.hints().map_err(WinFspError::Capture)?));
       }
       None => journals.push((None, Vec::new())),
     }
@@ -729,7 +730,7 @@ fn recover(
   for (worker, passed) in passed.iter().enumerate() {
     if let Some(mut batch) = view
       .capture(worker)?
-      .resume()
+      .resume(&mut scratch)
       .map_err(WinFspError::Capture)?
     {
       let settled = settle(file_system, &mut batch, passed, shard, owned)?;
@@ -760,6 +761,8 @@ fn serve_loop(
   let control = unsafe { (*file_system).volume_handle };
   // What this worker's last batch in each buffer filled; its first receive into each clears all of it.
   let mut fill = inflight::capture::Fill::new();
+  // This worker's index of its batch's frames, reserved once, so taking a batch allocates nothing (audit step 7).
+  let mut scratch = inflight::Scratch::new().map_err(WinFspError::Capture)?;
   let mut next = Next::Receive;
   loop {
     let batch = match next {
@@ -777,12 +780,12 @@ fn serve_loop(
           return Ok(());
         }
         receiving
-          .received(reported, &mut fill, performance_counter()?)
+          .received(reported, &mut fill, performance_counter()?, &mut scratch)
           .map_err(WinFspError::Capture)?
       }
       Next::Take(reported) => view
         .capture(worker)?
-        .handed_off(reported, &mut fill, performance_counter()?)
+        .handed_off(reported, &mut fill, performance_counter()?, &mut scratch)
         .map_err(WinFspError::Capture)?,
     };
     let Some(following) = serve_batch(file_system, control, batch, shard, owned, &mut fill)? else {

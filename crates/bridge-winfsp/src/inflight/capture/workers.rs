@@ -357,6 +357,7 @@ mod oracle {
     gate: &Turnstile,
     order: Order,
   ) -> Result<(), Crashed> {
+    let mut scratch = crate::inflight::Scratch::new().unwrap();
     let mut fill = Fill::new();
     let mut next = Next::Receive;
     loop {
@@ -377,13 +378,15 @@ mod oracle {
           };
           gate.pass(worker)?;
           let stamp = stamp(world);
-          receiving.received(reported, &mut fill, stamp).unwrap()
+          receiving
+            .received(reported, &mut fill, stamp, &mut scratch)
+            .unwrap()
         }
         Next::Take(reported) => {
           let stamp = stamp(world);
           Capture::new(memory)
             .unwrap()
-            .handed_off(reported, &mut fill, stamp)
+            .handed_off(reported, &mut fill, stamp, &mut scratch)
             .unwrap()
         }
       };
@@ -446,6 +449,7 @@ mod oracle {
     world: &Mutex<World>,
     gate: &Turnstile,
   ) -> Result<(), Crashed> {
+    let mut scratch = crate::inflight::Scratch::new().unwrap();
     let mut retained = Vec::new();
     let mut journals = Vec::new();
     for memory in memories.iter() {
@@ -453,12 +457,16 @@ mod oracle {
       if let Some(open) = Capture::new(&mut copy).unwrap().retained_open().unwrap() {
         retained.push(open);
       }
-      match Capture::new(&mut copy).unwrap().resume().unwrap() {
+      match Capture::new(&mut copy)
+        .unwrap()
+        .resume(&mut scratch)
+        .unwrap()
+      {
         Some(batch) => {
-          if batch.stamp().is_none() && !batch.hints().is_empty() {
+          if batch.stamp().is_none() && !batch.hints().unwrap().is_empty() {
             world.lock().unwrap().unstamped += 1;
           }
-          journals.push((batch.stamp(), batch.hints()));
+          journals.push((batch.stamp(), batch.hints().unwrap()));
         }
         None => journals.push((None, Vec::new())),
       }
@@ -480,7 +488,7 @@ mod oracle {
         Capture::new(memory).unwrap().landing().unwrap(),
         Landing::HandingOffUndelivered
       );
-      let Some(mut batch) = Capture::new(memory).unwrap().resume().unwrap() else {
+      let Some(mut batch) = Capture::new(memory).unwrap().resume(&mut scratch).unwrap() else {
         continue;
       };
       while let Some(request) = batch.next_request().unwrap() {

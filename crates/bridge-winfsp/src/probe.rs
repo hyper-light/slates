@@ -322,6 +322,8 @@ fn serve_waiting(
   let control = control as HANDLE;
   // What this worker's last batch in each buffer filled; its first receive into each clears all of it.
   let mut fill = capture::Fill::new();
+  // This worker's index of its batch's frames, reserved once (audit step 7).
+  let mut scratch = crate::inflight::Scratch::new().map_err(WinFspError::Capture)?;
   // Each open's context, as a mount's ledger tokens are: small, distinct, never zero.
   let mut context = 0u64;
   // The transfer of the batch the last combined call delivered, to be taken next.
@@ -341,6 +343,7 @@ fn serve_waiting(
             reported,
             &mut fill,
             crate::dispatcher::performance_counter()?,
+            &mut scratch,
           )
           .map_err(WinFspError::Capture)?
       }
@@ -350,7 +353,7 @@ fn serve_waiting(
         }
         let stamp = crate::dispatcher::performance_counter()?;
         capture::Capture::new(&mut *journal)
-          .and_then(|capture| capture.handed_off(reported, &mut fill, stamp))
+          .and_then(|capture| capture.handed_off(reported, &mut fill, stamp, &mut scratch))
           .map_err(WinFspError::Capture)?
       }
     };

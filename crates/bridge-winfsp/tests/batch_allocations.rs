@@ -12,7 +12,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 use slates_bridge_winfsp::inflight::capture::{BYTES, Capture, Fill};
-use slates_bridge_winfsp::inflight::{CLOSE_KIND, REQUEST_BASE};
+use slates_bridge_winfsp::inflight::{CLOSE_KIND, REQUEST_BASE, Scratch};
 
 struct Counting;
 
@@ -53,12 +53,14 @@ fn close_frame(into: &mut [u8], hint: u64) {
 }
 
 /// One worker round over the journal: receive one Close into the buffer the next receive fills, take it, save its
-/// response, and acknowledge it, which ends the batch.
-fn round(region: &mut [u8], fill: &mut Fill, hint: u64) {
+/// response, and acknowledge it, which ends the batch. `scratch` is the worker's index, kept across its batches.
+fn round(region: &mut [u8], fill: &mut Fill, scratch: &mut Scratch, hint: u64) {
   let capture = Capture::new(region).unwrap();
   let mut receiving = capture.begin(fill).unwrap();
   close_frame(&mut receiving.buffer_mut()[..REQUEST_BASE], hint);
-  let mut batch = receiving.received(REQUEST_BASE, fill, hint).unwrap();
+  let mut batch = receiving
+    .received(REQUEST_BASE, fill, hint, scratch)
+    .unwrap();
   let request = batch.next_request().unwrap().unwrap();
   let response = request.cancelled_response().unwrap();
   batch.record_response(&request, &response).unwrap();
@@ -71,10 +73,11 @@ fn round(region: &mut [u8], fill: &mut Fill, hint: u64) {
 fn a_received_batch_is_served_without_a_system_allocation() {
   let mut region = vec![0u8; BYTES];
   let mut fill = Fill::new();
-  round(&mut region, &mut fill, 1);
+  let mut scratch = Scratch::new().unwrap();
+  round(&mut region, &mut fill, &mut scratch, 1);
   let before = CALLS.get();
   for hint in 2..=101 {
-    round(&mut region, &mut fill, hint);
+    round(&mut region, &mut fill, &mut scratch, hint);
   }
   let calls = CALLS.get() - before;
   assert_eq!(calls, 0, "100 batches made {calls} system allocations");
