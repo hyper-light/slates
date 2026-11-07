@@ -8,3 +8,9 @@ mounts 0
 mounts 0
 === deploy 5 exit 0 load { 47.10 36.31 20.30 }
 mounts 0
+=== rejoin 1 exit 101 load { 53.70 39.75 22.48 }
+rejoins: successor daemon 17346 answered after 88.248458ms
+slates-cluster: fleet: HostId(2256394931768034795) holds HostId(17391054620531056849) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+thread 'a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet' (33742) panicked at crates/cli/tests/live_chaos.rs:2455:7:
+the fleet re-formed after the successor: [Some(("2256394931768034795", 3, 0)), Some(("12256985233666603424", 2, 1)), Some(("17391054620531056849", 2, 1))]
+mounts 0
