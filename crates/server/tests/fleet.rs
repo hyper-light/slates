@@ -9945,9 +9945,11 @@ fn green_and_work_on(instance: &str) -> (VolumeId, VolumeId) {
 /// §4.9 "Exactly-once", §4.16 "Commit" (AUD-11), found by fixtures' 1,000-client `f = 1` rung on 2026-11-06 (447
 /// submits answered `DuplicateRequest`): in a two-node `f = 1` fleet whose holder B withholds every merge record, a
 /// client on B submits a work whose green A owns. The forwarded submit runs on A, and its acceptance waits for the
-/// commit past the owner's liveness budget, so B's client is answered `Overloaded`, the refusal retryable under the
-/// same id. Do: the client acknowledges everything it may; the holder's fault is lifted and the version commits; the
-/// client sends the submit again under its id (`begin_again`). Expect: the first answer `Overloaded`; the resend
+/// commit past the owner's liveness budget, so B's client is answered with a refusal retryable under the same id:
+/// `Overloaded` when A's deferred answer reaches B (this Mac), `OwnerUnreachable` when B's forward gives up on A first
+/// (CI's Linux runners, run 42348339167). Do: the client acknowledges everything it may; the holder's fault is lifted
+/// and the version commits; the client sends the submit again under its id (`begin_again`). Expect: the first answer
+/// one of those two; the resend
 /// answered `Submitted { version: Some(1) }` from the completion the commit recorded. Before: the acknowledgement
 /// covered the refused id, so A pruned it and refused the resend `DuplicateRequest`.
 #[test]
@@ -10041,8 +10043,11 @@ fn assert_resent_under_its_id(run: &ForwardedResend) {
     "the run's steps: {failed:?} did not hold"
   );
   assert!(
-    matches!(&run.first, Some(Err(refusal)) if refusal.starts_with("Overloaded")),
-    "the forwarded submit's acceptance outlived the owner's budget: {:?}",
+    matches!(
+      &run.first,
+      Some(Err(refusal)) if refusal.starts_with("Overloaded") || refusal.starts_with("OwnerUnreachable")
+    ),
+    "the forwarded submit's acceptance outlived a budget, answered retryable under its id: {:?}",
     run.first
   );
   assert!(
