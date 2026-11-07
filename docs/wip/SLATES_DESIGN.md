@@ -14258,8 +14258,20 @@ Status: built 2026-11-06.
   limit): paced p99 before 12.3 to 39.2 ms at load 52 to 82 (149 and 234 ms in round 1, 142 to 361 ms at load 95),
   after 6.8 to 29.2 ms (54 and 94 ms in one run); unpaced p99 before 0.64 to 32 ms, after 0.43 to 6.8 ms. That load
   dominates both arms' tails, so the latency rows are informational and the CPU count is the measurement.
-- Owed: a boot's two whole give-backs a shard (memories this journal did not write) still hold the shard 12 to 43 ms
-  each. They should be given back in slices under the step quantum, from a measured discard rate (GAPS).
+- Sliced (2026-11-06, the supervisor's item 3): a give-back no longer takes a region whole in one step. Each idle step
+  gives back one slice from the top of each region down, and the journal records it (`Journal::given_back_from`).
+  The slice is what the OS gave back in one step quantum the previous step, measured by each step for the next
+  (`give_back_slice`, `learn_give_back_rate`; a page the first time). `purge_if_idle` yields between slices while any
+  is left. So a boot's give-back of memories the journal did not write (18 GB a shard on adas-macbook-pro-2, 12 to 43
+  ms in one poll before) holds the shard one quantum a step. The oracle gives back generated shares from the top
+  (`JournalStep::GiveBack { quarters }`). The test of the shard held is
+  `a_boot_give_back_holds_its_shard_no_longer_than_its_noise_floor`: a probe's longest wait through the boot's
+  give-back against its own quiet floor, skipping loudly on a host too loaded to judge.
+- The sibling of the same shape, sliced the same day: the Linux FUSE write log (A-63) gave back its whole record
+  area once per emptying (`WriteLog::purge`), whatever its records had reached. It now gives back only as far as
+  records reached since its last give-back (the whole area once, for a log opened over a predecessor's object), a slice
+  a call from the same measured slice. Failing first: `a_purge_gives_back_only_what_the_log_wrote_since_its_last`
+  (12,288 bytes, the 16 KiB log's whole area, after one 15-byte record; Linux 6.19.10).
 
 ### A-214 — An idle shard keeps its last write burst's worth of free content pages pre-faulted (accepted 2026-11-05, VFS plan step 11; amends A-105)
 

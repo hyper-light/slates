@@ -914,12 +914,11 @@
 > behind. It now gives back only what was written since its last give-back. In one paced run, reap polls of 5 ms CPU
 > or more went from 46 to 6. Failing first: `a_give_back_returns_only_recovery_memory_written_since_the_last` (91.6 GB
 > given back after a one-file delta, against 0). Oracle: `a_give_back_names_every_dead_written_byte_and_stops_at_the_last`.
-> **Open:** the 6 left are each shard's first two give-backs after a boot, over memories the journal did not write
-> (12 to 43 ms each), owed slices under the step quantum (built on agents/perf-2, to land after this). On CI
-> (diag-perf-5, run 42173825162) A-226 is even on Linux and halves Windows x86_64's paced accept p99 (1.21 to 1.40 ms
-> became 0.42 to 0.76 ms). Also open: the latency A/B on a quiet Mac (this one ran at load 50 to 95), and the sibling of
-> the same shape, the Linux FUSE write log's purge (`crates/server/src/write_log.rs`, its whole capacity once per
-> emptying).
+> The 6 left were each shard's first two give-backs after a boot, over memories the journal did not write (12 to 43 ms
+> each). **Sliced 2026-11-07:** a give-back takes one measured slice a step from the top down. So does its sibling,
+> the Linux FUSE write log's purge, which gave back its whole area per emptying (red first: 12,288 bytes for one
+> 15-byte record). On CI (diag-perf-5, run 42173825162) A-226 is even on Linux and halves Windows x86_64's paced accept
+> p99 (1.21 to 1.40 ms became 0.42 to 0.76 ms). **Open:** the latency A/B on a quiet Mac.
 >
 >
 
