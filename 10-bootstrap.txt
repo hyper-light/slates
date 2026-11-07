@@ -54,3 +54,6 @@ test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 === boot-1 exit 0 load { 15.16 14.15 11.59 }
 test a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates ... slates daemon: fleet node `a` of `slates-fleet`: member 14584345337675801646slates daemon: fleet node `b` of `slates-fleet`: member 12026455468667511999 with 2 peer(s) at f = 1
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 4.40s
+=== boot-2 exit 0 load { 15.47 14.23 11.63 }
+test a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates ... slates daemon: fleet node `c` of `slates-fleet`: member 6750457516513120871 with 2 peer(s) at f = 1
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 5.16s
