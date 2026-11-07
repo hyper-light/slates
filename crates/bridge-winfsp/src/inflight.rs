@@ -243,43 +243,107 @@ impl Request<'_> {
   }
 }
 
-/// Checks the complete bounded batch before returning any frame. A zeroed tail ends the batch; a malformed tail or
-/// repeated hint refuses it whole. The live receive owner must settle these frames before receiving any fresh one.
-pub fn requests(bytes: &[u8]) -> Result<Vec<Request<'_>>, Refusal> {
+/// Shape: the most frames one batch can hold, each at least a request's fixed part.
+const FRAMES_MAX: usize = BATCH_BYTES / REQUEST_BASE;
+
+/// Where one request sits in its batch's bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Frame {
+  at: usize,
+  length: usize,
+}
+
+impl Frame {
+  /// The checked request this frame names in `bytes`, the batch it was indexed from.
+  pub(crate) fn request<'b>(self, bytes: &'b [u8]) -> Result<Request<'b>, Refusal> {
+    let tail = bytes.get(self.at..).ok_or(Refusal::Length)?;
+    checked_request(tail, self.length).map(|(request, _)| request)
+  }
+
+  /// The request's hint, read without checking the rest again.
+  pub(crate) fn hint(self, bytes: &[u8]) -> Result<u64, Refusal> {
+    read_u64(bytes.get(self.at..).ok_or(Refusal::Length)?, HINT_AT)
+  }
+
+  /// The request's kind, read without checking the rest again.
+  pub(crate) fn kind(self, bytes: &[u8]) -> Result<u32, Refusal> {
+    read_u32(bytes.get(self.at..).ok_or(Refusal::Length)?, KIND_AT)
+  }
+}
+
+/// A receive owner's room for one batch's index: where each request sits, and their hints for the duplicate check. It is
+/// reserved for the most frames a batch can hold when the owner starts and kept across its batches, so taking a batch
+/// allocates nothing (audit step 7: each batch had made two allocations and a sort, 100 batches 200 calls,
+/// `tests/batch_allocations.rs`).
+#[derive(Debug)]
+pub struct Scratch {
+  pub(crate) frames: std::collections::VecDeque<Frame>,
+  hints: Vec<u64>,
+}
+
+impl Scratch {
+  /// Room for the largest batch, reserved once; refused `NoMemory` when the process has none.
+  pub fn new() -> Result<Self, Refusal> {
+    let mut frames = std::collections::VecDeque::new();
+    frames
+      .try_reserve_exact(FRAMES_MAX)
+      .map_err(|_| Refusal::NoMemory)?;
+    let mut hints = Vec::new();
+    hints
+      .try_reserve_exact(FRAMES_MAX)
+      .map_err(|_| Refusal::NoMemory)?;
+    Ok(Self { frames, hints })
+  }
+}
+
+/// Checks the complete bounded batch before any frame is taken, and indexes its frames into `scratch` in driver order. A
+/// zeroed tail ends the batch; a malformed tail or repeated hint refuses it whole. The live receive owner must settle
+/// these frames before receiving any fresh one.
+pub fn index(bytes: &[u8], scratch: &mut Scratch) -> Result<(), Refusal> {
+  scratch.frames.clear();
+  scratch.hints.clear();
   if bytes.len() > BATCH_BYTES || !bytes.len().is_multiple_of(ALIGNMENT) {
     return Err(Refusal::Length);
   }
-  let bound = bytes.len() / REQUEST_BASE;
-  let mut requests = Vec::new();
-  let mut hints = Vec::new();
-  requests
-    .try_reserve_exact(bound)
-    .map_err(|_| Refusal::NoMemory)?;
-  hints
-    .try_reserve_exact(bound)
-    .map_err(|_| Refusal::NoMemory)?;
   let mut at = 0usize;
   while at < bytes.len() {
     let tail = bytes.get(at..).ok_or(Refusal::Length)?;
     let length = usize::from(read_u16(tail, SIZE_AT)?);
     if length == 0 {
       if tail.iter().any(|byte| *byte != 0) {
+        scratch.frames.clear();
         return Err(Refusal::Tail);
       }
       break;
     }
-    let (request, stride) = checked_request(tail, length)?;
-    hints.push(request.hint);
-    requests.push(request);
+    let (request, stride) = match checked_request(tail, length) {
+      Ok(checked) => checked,
+      Err(refusal) => {
+        scratch.frames.clear();
+        return Err(refusal);
+      }
+    };
+    // Within the bound reserved for: a frame is at least REQUEST_BASE bytes of a batch of at most BATCH_BYTES.
+    if scratch.frames.len() >= FRAMES_MAX {
+      scratch.frames.clear();
+      return Err(Refusal::Length);
+    }
+    scratch.hints.push(request.hint);
+    scratch.frames.push_back(Frame { at, length });
     at = at.checked_add(stride).ok_or(Refusal::Length)?;
   }
-  // A kernel batch cannot contain one processing IRP twice. Sort a bounded index rather than changing request
-  // order: cleanup and close effects must still settle in the order the driver supplied them.
-  hints.sort_unstable();
-  if hints.windows(2).any(|pair| pair.first() == pair.last()) {
+  // A kernel batch cannot contain one processing IRP twice. Sort the hints' own buffer rather than the frames: cleanup
+  // and close effects must still settle in the order the driver supplied them.
+  scratch.hints.sort_unstable();
+  if scratch
+    .hints
+    .windows(2)
+    .any(|pair| pair.first() == pair.last())
+  {
+    scratch.frames.clear();
     return Err(Refusal::Hint);
   }
-  Ok(requests)
+  Ok(())
 }
 
 fn checked_request(tail: &[u8], length: usize) -> Result<(Request<'_>, usize), Refusal> {
@@ -434,6 +498,17 @@ mod tests {
     }
   }
   use super::*;
+
+  /// A batch's checked requests in driver order, through the index a receive owner takes.
+  fn requests(bytes: &[u8]) -> Result<Vec<Request<'_>>, Refusal> {
+    let mut scratch = Scratch::new()?;
+    index(bytes, &mut scratch)?;
+    scratch
+      .frames
+      .iter()
+      .map(|frame| frame.request(bytes))
+      .collect()
+  }
   use std::collections::BTreeMap;
 
   fn captured_reads(hints: &[u64]) -> Vec<u8> {

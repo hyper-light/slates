@@ -585,7 +585,13 @@ fn receive_loop(
   let mut owned = Owned::new(private);
   let file_system = file_system as *mut FileSystem;
   let mut view = CaptureView::new(section, bound)?;
-  if let Some(mut batch) = view.capture()?.resume().map_err(WinFspError::Capture)? {
+  // This worker's index of its batch's frames, reserved once, so taking a batch allocates nothing (audit step 7).
+  let mut scratch = inflight::Scratch::new().map_err(WinFspError::Capture)?;
+  if let Some(mut batch) = view
+    .capture()?
+    .resume(&mut scratch)
+    .map_err(WinFspError::Capture)?
+  {
     let settled = settle(
       file_system,
       &mut batch,
@@ -629,7 +635,9 @@ fn receive_loop(
       return Ok(());
     }
     used = Some(inflight::capture::filled(reported).map_err(WinFspError::Capture)?);
-    let mut batch = receiving.received(reported).map_err(WinFspError::Capture)?;
+    let mut batch = receiving
+      .received(reported, &mut scratch)
+      .map_err(WinFspError::Capture)?;
     settle(
       file_system,
       &mut batch,
