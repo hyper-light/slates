@@ -1,11 +1,14 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
-> **The anchor killed every start a busy machine starved (found 2026-11-06, the start judgment fixed 2026-11-07; recovery
-> in one poll, open).** A start not beaten within the fixed recovery budget (a wall second) was killed, and every restart
-> started over. Now a start is judged in its own CPU time by the watchdog's rule: killed only when it makes no progress for
-> a window or runs a window of CPU without beating. Measured on this Mac under 144 spinners: 153 of 153 starts killed
-> before, each having used 16-18 ms of CPU. `a_starved_start_that_makes_progress_is_not_killed` was red on main and
-> passes. Open:
+> **The anchor killed every start a busy machine starved (found 2026-11-06, closed 2026-11-07; recovery in one poll and
+> the client's deadlines stay open, below).** A start not beaten within the fixed recovery budget (a wall second) was
+> killed, and every restart started over. Now a start is judged in its own CPU time by the watchdog's rule: killed only
+> when it makes no progress for a window or runs a window of CPU without beating. Measured on this Mac under 144
+> spinners: 153 of 153 starts killed before, each having used 16-18 ms of CPU. `a_starved_start_that_makes_progress_is_not_killed`
+> was red on main and passes. At the extremes (`agents/liveness-restart` @ 469b92e5): 0 progressing starts killed in 15
+> runs of clients' recipe at 183-292 runnable processes and in loadtest-scale's memrung beside the same spinners; stuck
+> starts killed at 1,001-1,294 ms on this Mac, both Linux and both Windows CI runners; the restart, handoff and start
+> suites green on all four. Open:
 > - a shard's recovery is one poll, which past a window of CPU stops the watchdog's beat;
 > - the client's reconnect budget (recovery + liveness, 2 s) can still be outlasted by a starved restart (owner clients);
 > - `Facts::query()` gathers every fact to read the identity (676 ms p50 under that load);
@@ -340,7 +343,10 @@
 >   follows the same constant.
 > - **2026-11-07, the start judgment closed** (the entry "The anchor killed every start a busy machine starved"): a
 >   start is judged in its own CPU time, not by the fixed second. Recovery in one poll and the client's reconnect
->   budget stay open here.
+>   budget stay open here. Seen since by loadtest-scale (memrung on a24e8e40, run A): after a restart, shard 0 recovered
+>   one volume image and 1,001 merge volumes in 1,498,306 µs, past the 1 s window, and the start was waited for, not
+>   killed (`~/.cache/slates-agents-scratch/loadtest-scale/mem-liveness/live-k32-r3-n1000/anchor.err`). Slicing the
+>   recovery is liveness's next goal.
 
 > **A private purge's intent can wait up to the 1 s transaction timeout (found 2026-11-05, audit step 7; open).**
 > WinFsp's transact never goes pending: the control dispatch calls `FspVolumeTransact` inline (v2.1 `src/sys/fsctl.c:95-99`),

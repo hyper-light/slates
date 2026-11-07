@@ -606,6 +606,17 @@ the measured wake cost before parking (the 2-competitive rule). The mount is nev
 > a daemon), or refused `ENOENT`, which ended the anchor and its instance. Record:
 > `docs/bugs/2026-10-22-an-anchor-restarted-its-daemon-by-a-path-an-upgrade-can-replace.md`.
 
+> **A busy machine starves boot steps 1 and 2; it no longer ends them (2026-11-07).** Both steps were bounded by a
+> wall where only progress tells a starved step from a stuck one.
+> - **Step 1:** the profile's wake probe refused once its 250 ms wall passed short of its sample floor, and the anchor
+>   with it, 19 times in 20 under 144 nice-19 spinners on 18 CPUs. It now runs on while each round's waiter runs at
+>   all, within 7.75 s more (§4.1 status).
+> - **Step 2:** the anchor killed a daemon that had not beaten one wall second after its spawn; 153 of 153 starts under
+>   the same load. It now judges a start in the daemon's own CPU time, read from the OS (§4.14 status).
+>
+> Records: `docs/bugs/2026-11-07-a-busy-machine-refused-the-anchors-boot-at-the-wake-probe.md`,
+> `docs/bugs/2026-11-07-the-anchor-killed-every-start-a-busy-machine-starved.md`.
+
 1. The anchor process starts (or is already running), maps or creates the shared segment, and
    loads or rebuilds the machine profile.
 2. The daemon starts, attaches the segment, and either replays the op logs into fresh in-memory
@@ -6732,8 +6743,12 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > `crates/cli/src/anchor.rs`): killed once it makes no CPU progress for a window or runs a window of CPU without beating,
 > waited for while it progresses. Before, a start not beaten within the fixed recovery budget, a wall second, was killed;
 > under 144 spinners on 18 CPUs the anchor killed 153 starts of 153 after each had used 16-18 ms of CPU
-> (`docs/bugs/2026-11-07-the-anchor-killed-every-start-a-busy-machine-starved.md`). A shard's recovery still runs as
-> one poll, which the watchdog counts as spinning past a window of CPU: GAPS holds it open.
+> (`docs/bugs/2026-11-07-the-anchor-killed-every-start-a-busy-machine-starved.md`). On Linux the clock is the process's
+> CPU-time clock: `/proc/<pid>/schedstat`, read first, is the main thread's alone
+> (`docs/bugs/2026-11-07-the-linux-process-clock-read-the-main-thread-alone.md`). At the extremes, 0 progressing starts
+> were killed at 183-292 runnable processes, and a stuck start was killed at 1,001-1,294 ms on macOS, Linux and Windows.
+> A shard's recovery still runs as one poll, which the watchdog counts as spinning past a window of CPU: GAPS holds it
+> open.
 
 > **Telemetry oracle correction (2026-09-20, AC-0.11).** A drain request itself emits spans.
 > The daemon integration oracle now derives convergence from the reply quota minus the
