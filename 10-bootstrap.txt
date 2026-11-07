@@ -9,3 +9,13 @@ shard 0 refused fleet.plane.peer_reconnected: 4
 thread 'a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet' (42327) panicked at crates/cli/tests/live_chaos.rs:2593:7:
 the fleet re-formed after the successor: [Some(("6815637750919949134", 2, 1)), Some(("10776561280911943196", 1, 0)), Some(("4577389318175879068", 2, 1))]
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 16 filtered out; finished in 47.39s
+=== rejoin-2 exit 101 load { 14.57 16.27 12.84 }
+rejoins: successor daemon 20679 answered after 43.429125ms
+rejoins --- chaos-rejoins-a-20568
+shard 0 refused fleet.plane.peer_reconnected: 3
+rejoins --- chaos-rejoins-b-20568
+rejoins --- chaos-rejoins-c-20568
+shard 0 refused fleet.plane.peer_reconnected: 4
+thread 'a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet' (45927) panicked at crates/cli/tests/live_chaos.rs:2593:7:
+the fleet re-formed after the successor: [Some(("18242922742630982891", 2, 1)), Some(("8752907406739791513", 1, 0)), Some(("1797756239563472038", 2, 1))]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 16 filtered out; finished in 46.89s
