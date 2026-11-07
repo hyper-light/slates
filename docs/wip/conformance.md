@@ -1,5 +1,17 @@
 # Transport conformance evidence (AC-9.7 / T-9.1; GAP-A9-15)
 
+> **A failed fsx run keeps its failure (2026-11-07).** fsx prints its failure (`READ BAD DATA: …` and an offset
+> table) and then replays up to a thousand operations, so a record's "fsx output tail", the first 512 characters of the
+> output's last 12 lines, held replay lines only (CI run 42395077767, `native-macos-nfs`). The note now keeps fsx's
+> report, the output before its log dump, and the dump's last lines, the failing operation last, each in half of the
+> bound. The run's `-P` files go beside the record, in `<records>/<transport>.fsx-logs/`, so the `conformance-records`
+> artifact carries them. Each is bounded to the file length plus 128 bytes an operation (1,542,144 bytes at the recorded
+> bounds), and a file past that keeps its end. The container lane's stay in the container's `/tmp`. Held by
+> `an_fsx_failure_keeps_its_report_and_its_last_operation` (`crates/conformance/src/exerciser.rs`, a real fsx failure as
+> its fixture) and by `a_forced_fsx_failure_keeps_its_failure_line_and_its_logs_beside_the_record`
+> (`xtask/src/conformance/suites.rs`, which the CI conformance lane runs with `SLATES_TEST_FSX=1`: the pinned fsx with
+> its file overwritten in place).
+
 > **Live-shipped volumes do not yet conform as plain ones do (2026-11-06, A-200; OPEN, owner raft).** `--live-ship`
 > runs a suite over a volume live-shipped on an `f = 1` fleet: three anchors from one manifest, the volume created and
 > mounted on node a, `slates live-ship ID`. A run fails unless the owner's log is durable at its head and both

@@ -1276,6 +1276,13 @@ jobs:
       # below; the rest of the scratch (a cargo target, fsstress's tree) stays on the runner.
       # The cache restores the last run's `target/`, scratch included: every suite's own directory is
       # emptied before it runs (`Scratch::fresh`), and only the tool builds are reused.
+      # A failed fsx run's record must hold fsx's own failure line and keep its -P files beside the record (CI run
+      # 42395077767 kept replay lines only, and its .fsxlog stayed in the scratch): the pinned fsx is run with its file
+      # overwritten in place, and the harness's note and kept logs are checked.
+      - name: A forced fsx failure keeps its failure line and its logs with the record
+        env:
+          SLATES_TEST_FSX: "1"
+        run: cargo test -p xtask --bin xtask a_forced_fsx_failure_keeps_its_failure_line_and_its_logs_beside_the_record -- --nocapture
       - name: Plan, then run every suite this runner can (each verdict gates the step; records kept)
         run: cargo xtask conformance all --records target/conformance-records --scratch target/conformance-scratch --keep
       - name: Upload the records
