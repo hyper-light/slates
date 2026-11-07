@@ -1,0 +1,23 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 14:14:38 UTC 2026, tree F a610ccf74364f80fc2dd1e99351e863b8bc8c62a
+live laggard: {"appended": 181, "durable": 181, "install_image": 1, "resolved": 181, "whole": 1}; then Some(("180", "180", "false")) [Some(("180", "none", "false")), Some(("180", "none", "false"))]
+== run 1 a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log exit 0 load 1.62 1.84 0.90
+live laggard: {"appended": 181, "durable": 181, "install_image": 1, "no_session": 1, "resolved": 181, "whole": 1}; then Some(("180", "180", "false")) [Some(("180", "none", "false")), Some(("180", "none", "false"))]
+== run 2 a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log exit 0 load 1.62 1.84 0.90
+live laggard: {"appended": 181, "durable": 181, "install_image": 2, "no_session": 1, "resolved": 181, "whole": 1}; then Some(("180", "180", "false")) [Some(("180", "none", "false")), Some(("180", "none", "false"))]
+== run 3 a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log exit 0 load 1.65 1.84 0.90
+live laggard: {"appended": 181, "durable": 181, "install_image": 2, "no_session": 1, "resolved": 181, "whole": 1}; then Some(("180", "180", "false")) [Some(("180", "none", "false")), Some(("180", "none", "false"))]
+== run 4 a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log exit 0 load 1.65 1.84 0.90
+live laggard: {"appended": 181, "durable": 181, "install_image": 1, "no_session": 1, "resolved": 181, "whole": 1}; then Some(("180", "180", "false")) [Some(("180", "none", "false")), Some(("180", "none", "false"))]
+== run 5 a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log exit 0 load 1.65 1.84 0.90
+live laggard: {"appended": 181, "durable": 181, "install_image": 1, "no_session": 1, "resolved": 181, "whole": 1}; then Some(("180", "180", "false")) [Some(("180", "none", "false")), Some(("180", "none", "false"))]
+== run 6 a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log exit 0 load 1.76 1.86 0.91
+live laggard: {"appended": 181, "durable": 181, "install_image": 1, "resolved": 181, "whole": 1}; then Some(("180", "180", "false")) [Some(("180", "none", "false")), Some(("180", "none", "false"))]
+== run 7 a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log exit 0 load 1.76 1.86 0.91
+live laggard: {"appended": 181, "durable": 181, "install_image": 1, "no_session": 1, "resolved": 181, "whole": 1}; then Some(("180", "180", "false")) [Some(("180", "none", "false")), Some(("180", "none", "false"))]
+== run 8 a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log exit 0 load 1.62 1.83 0.91
+live laggard: {"appended": 181, "durable": 181, "install_image": 1, "no_session": 1, "resolved": 181, "whole": 1}; then Some(("180", "180", "false")) [Some(("180", "none", "false")), Some(("180", "none", "false"))]
+== run 9 a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log exit 0 load 1.62 1.83 0.91
+live laggard: {"appended": 181, "durable": 181, "install_image": 2, "no_session": 1, "resolved": 181, "whole": 1}; then Some(("180", "180", "false")) [Some(("180", "none", "false")), Some(("180", "none", "false"))]
+== run 10 a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log exit 0 load 1.62 1.83 0.91
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 26.74s
+== live_fleet quiet exit 0
