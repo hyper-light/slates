@@ -244,7 +244,9 @@ mod tests {
   /// §2.6, the anchor's start judgment: a daemon's work runs on its shard and watchdog threads while its main thread
   /// may wait on them, and its progress is the whole process's. Do: start a child of this binary whose main thread
   /// waits while another thread spins ([`spinner_off_the_main_thread`]), let it settle a span, and read its clock a span
-  /// apart. Expect its progress to rise. On Linux the clock was `/proc/<pid>/schedstat`, which is the main thread's
+  /// apart. Expect its progress to rise and its time not to go back (Windows charges time a 15.6 ms tick at a time, and
+  /// beside eight spinners on four CPUs a span can pass without one; its progress, the cycles, is exact). On Linux the
+  /// clock was `/proc/<pid>/schedstat`, which is the main thread's
   /// alone (`task->se.sum_exec_runtime`), so a start whose main thread waited a window on its shards' recovery read as
   /// making no progress.
   #[test]
@@ -272,7 +274,7 @@ mod tests {
     let _ = child.kill();
     let _ = child.wait();
     assert!(
-      matches!((before, after), (Some(b), Some(a)) if a.progress > b.progress && a.spent_ns > b.spent_ns),
+      matches!((before, after), (Some(b), Some(a)) if a.progress > b.progress && a.spent_ns >= b.spent_ns),
       "{before:?} → {after:?}"
     );
   }

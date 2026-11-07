@@ -580,7 +580,7 @@ fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
     }
   }));
   await_stable_daemon(&instance, true);
-  let frozen = daemon_pid(&instance).expect("the daemon answers");
+  let frozen = await_daemon(&instance, None, &[]);
   // A kill of the starting daemon (the start's own recovery, `await_stable_daemon`) is not this one.
   while killed.try_recv().is_ok() {}
   assert!(
@@ -686,7 +686,7 @@ fn a_starved_start_that_makes_progress_is_not_killed() {
   let (lines, forwarding) = forward_lines(stderr);
   anchor.drain = Some(forwarding);
   await_stable_daemon(&instance, true);
-  let killed = daemon_pid(&instance).expect("the daemon answers");
+  let killed = await_daemon(&instance, None, &[]);
   let successor = successor_of(&anchor, killed);
   let pid = Pid::from_raw(i32::try_from(successor).unwrap()).unwrap();
   let runs = STARVED_PERIOD / STARVED_RUNS_ONE_IN;
@@ -856,7 +856,7 @@ fn a_daemon_killed_after_its_anchors_executable_is_replaced_restarts_from_the_an
   anchor.drain = Some(forwarding);
   await_stable_daemon(&instance, true);
   link_and_later_replace(&link, Some(REPLACEMENT_SCRIPT));
-  let killed = daemon_pid(&instance).expect("the daemon answers");
+  let killed = await_daemon(&instance, None, &[]);
   assert!(
     Command::new("kill")
       .args(["-9", &killed.to_string()])
