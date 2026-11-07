@@ -136,3 +136,5 @@ live bootstrap --- the owner's volume stat
 journal_grown_bytes: 0 (growth refused 0)
 thread 'a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates' (44174) panicked at crates/cli/tests/live_fleet.rs:1932:3:
 the bootstrap node's live writes became durable and both candidates hold them: Some(("1", "1", "false")) [Some(("1", "none", "false")), Some(("1", "none", "false"))] [("live-bootstrap-a-19489", {"held": 2, "hold_refused": 6, "hold_refused.not_a_member": 6}), ("live-bootstrap-b-19489", {"appended": 2
+=== bootstrap off 3 exit 0 load { 48.60 33.60 21.01 }
+live bootstrap: written=true caught_up=true shipping=Some(("5", "5", "false")) held=[Some(("5", "none", "false")), Some(("5", "none", "false"))] [("live-bootstrap-a-20809", {"held": 10, "hold_refused": 9, "hold_refused.no_catalog": 2, "hold_refused.not_a_member": 7}), ("live-bootstrap-b-20809", {"ap
