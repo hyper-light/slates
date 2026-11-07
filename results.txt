@@ -1,0 +1,65 @@
+bb010365fcfc8c0a800186df1e5cd46f95ad6950 Windows X64; token default owner BUILTIN\Administrators
+=== clippy: exit 0
+=== land: exit 0
+1 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.12s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.41s
+1 test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+1 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+1 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+1 test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+2 test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+1 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+=== base: exit 0
+1 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.00s
+=== os-again-1: exit 0
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.18s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.36s
+1 test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+1 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+=== os-again-2: exit 0
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.13s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.41s
+1 test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+1 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+=== os-again-3: exit 0
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.13s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.34s
+1 test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+1 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+=== server-lib: exit 0
+1 test result: ok. 195 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 5.85s
+> D:\a\slates\slates\diag-logs\server-lib.log:388:slates-server: partition 0: volume 4487961b123b7a4e0000000000000002 was not imaged, skipped: EIO (first on this shard; later ones are counted as publish.volume_skipped)
+  D:\a\slates\slates\diag-logs\server-lib.log:389:ok
+  D:\a\slates\slates\diag-logs\server-lib.log:390:test verbs::tests::a_taken_over_archive_lands_at_its_offsets_and_an_oversized_one_is_refused ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+=== server-verb: exit 101
+1 error: 1 target failed:
+1 error: test failed, to rerun pass `-p slates-server --test snapshot_landing`
+1 test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+1 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 23.15s
+> D:\a\slates\slates\diag-logs\server-verb.log:22:slates-server: partition 0: volume 7d64b059af547e2d0000000000000002 was not imaged, skipped: EIO (first on this shard; later ones are counted as publish.volume_skipped)
+  D:\a\slates\slates\diag-logs\server-verb.log:23:ok
+  D:\a\slates\slates\diag-logs\server-verb.log:24:test an_async_patient_landing_outlasting_the_reply_deadline_is_waited_for ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+> D:\a\slates\slates\diag-logs\server-verb.log:26:slates-server: partition 0: volume 0c7f75c4ecb5ad360000000000000018 was not imaged, skipped: EIO (first on this shard; later ones are counted as publish.volume_skipped)
+  D:\a\slates\slates\diag-logs\server-verb.log:27:slates daemon: the control loop ended; the watchdog withholds the beat so the anchor restarts the daemon
+  D:\a\slates\slates\diag-logs\server-verb.log:28:ok
+> D:\a\slates\slates\diag-logs\server-verb.log:57:---- a_landing_of_a_partly_edited_large_base_file_keeps_the_disk_bytes_it_did_not_edit stdout ----
+  D:\a\slates\slates\diag-logs\server-verb.log:58:
+> D:\a\slates\slates\diag-logs\server-verb.log:59:thread 'a_landing_of_a_partly_edited_large_base_file_keeps_the_disk_bytes_it_did_not_edit' (9132) panicked at crates\server\tests\common\target.rs:23:60:
+  D:\a\slates\slates\diag-logs\server-verb.log:60:called `Result::unwrap()` on an `Err` value: Os { code: 123, kind: InvalidFilename, message: "The filename, directory name, or volume label syntax is incorrect." }
+  D:\a\slates\slates\diag-logs\server-verb.log:61:note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+> D:\a\slates\slates\diag-logs\server-verb.log:63:---- a_landing_of_an_overlay_into_its_base_serves_both_files_afterwards stdout ----
+  D:\a\slates\slates\diag-logs\server-verb.log:64:
+> D:\a\slates\slates\diag-logs\server-verb.log:65:thread 'a_landing_of_an_overlay_into_its_base_serves_both_files_afterwards' (9016) panicked at crates\server\tests\common\target.rs:23:60:
+  D:\a\slates\slates\diag-logs\server-verb.log:66:called `Result::unwrap()` on an `Err` value: Os { code: 123, kind: InvalidFilename, message: "The filename, directory name, or volume label syntax is incorrect." }
+  D:\a\slates\slates\diag-logs\server-verb.log:67:
+=== client-presentation: exit 0
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.23s
+=== client-shards: exit 0
+1 test result: ok. 13 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 3.73s
+=== end
