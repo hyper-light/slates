@@ -8476,6 +8476,28 @@ period. The old code on a second machine (kiln-a094a12d, x86-64, load 13–17, 0
 of the run at load 8 was under 1 ms. The goal's 50 µs is not met: the added median is the cross-shard dispatch round
 measured above. Owed: that round's hops measured apart, and the p999 under 1 ms at load 30.
 
+**What a checkpoint shipped (A-200, AC-8.9; 2026-11-05).** The same command, release binaries built from main
+(00e5269c, arm A) and from this branch (arm B), run alternately A, B, four rounds, in one capped unit on adacachy at load
+21–23. The owner's counters per 2,050 writes, then microseconds (p50 / p99 / p999 / max):
+
+| round | arm | whole records | credit refusals | sends with no session | plain | live | added at p50 |
+|---|---|---|---|---|---|---|---|
+| 1 | A | (not counted on main) | 431 | 612 | 17.4 / 55.9 / 96.9 / 702.7 | 109.2 / 419.2 / 1,090.5 / 1,263.9 | 91.9 |
+| 1 | B | 1 | 0 | 6 | 10.8 / 17.0 / 35.5 / 1,075.8 | 105.9 / 240.4 / 678.4 / 848.0 | 95.1 |
+| 2 | A | (not counted on main) | 437 | 433 | 14.4 / 84.6 / 363.1 / 563.6 | 133.8 / 600.8 / 1,123.4 / 2,519.8 | 119.4 |
+| 2 | B | 1 | 0 | 4 | 11.5 / 22.2 / 39.4 / 144.7 | 113.3 / 323.1 / 672.8 / 876.0 | 101.8 |
+| 3 | A | (not counted on main) | 419 | 623 | 16.2 / 52.9 / 72.5 / 74.2 | 109.9 / 230.9 / 898.3 / 1,105.8 | 93.7 |
+| 3 | B | 1 | 0 | 3 | 13.9 / 32.2 / 465.7 / 998.0 | 147.7 / 1,391.7 / 3,931.0 / 4,357.0 | 133.8 |
+| 4 | A | (not counted on main) | 439 | 567 | 13.5 / 59.5 / 87.0 / 322.1 | 104.1 / 231.6 / 656.9 / 1,061.9 | 90.7 |
+| 4 | B | 1 | 0 | 7 | 11.2 / 19.5 / 64.6 / 203.1 | 108.6 / 267.2 / 779.6 / 910.4 | 97.5 |
+
+Main appended 2,305–2,395 records for 2,050 writes, the extra ones whole copies made after a credit refusal; the branch
+appends one per write and one whole record, the log's first. **Reading.** Dead even on latency: the added median is
+90.7–119.4 µs on main and 95.1–133.8 µs on the branch, and a dead-even A/B lands no latency claim. What changed is what
+ships: about 420 copies of the volume per 2,050 writes on main against one, which on this one-file volume cost little
+and on a large volume would copy all of it each time. Round 3's slow tail on the branch came with its plain writes
+slowed as well (p999 465.7 µs).
+
 
 ### Measured and rejected: queueing the deltas the credit turns away (A-200; 2026-11-06)
 
@@ -9771,6 +9793,59 @@ for p in $(pgrep -f "instance $instance"); do kill -9 $p 2>/dev/null; done
 sleep 0.5; echo "left: $(pgrep -f "instance $instance" | tr '\n' ' ')" >> $dir/chaos-$tag.pids
 ```
 
+### The many-client load test after the re-landing of A-207 and A-217, macOS (2026-11-06)
+
+`agents/reland-a207-1` at `827092dd` (A-217, the checkout by identity, A-207 over A-202's delta rebase), release.
+Apple M5 Max, 18 cores, macOS 26.4.1, 5 shards (the harness's own daemon) or `--shards 4` (chaos under the anchor);
+load 31 to 53 from other agents' builds and runs; 2026-11-06 06:44 to 06:52 UTC. The tree is the kernel's `kernel/`
+(754 files, 16,321,721 bytes). main's harness cannot run on macOS: `tree_bytes` calls `du -sb`, and BSD `du` has no
+`-b`. So the harness binary was built with loadtest-scale's `tree_bytes` (`-sAk` x 1024 on macOS, on
+`agents/loadtest-scale-1`). That hunk was applied for the build and then removed, and is not in the branch. Two
+readings of main's harness (loadtest-scale):
+- Its oracle replays a whole copy of every touched file per version. That takes seconds at 10 and 100 clients and
+  does not scale to 1,000; the per-slot oracle is `c35c532f` on `agents/loadtest-scale-1`.
+- A refusal row is the harness's own error string, not a typed refusal.
+
+`load_bench --tree kernel --clients 10,100 --hot-files 80`, three runs, all shown. Nanoseconds, p50:
+
+| Clients | Edit, runs 1 / 2 / 3 | Accepted submit, runs 1 / 2 / 3 | CreateWork, runs 1 / 2 / 3 | Oracle |
+|---|---|---|---|---|
+| 10 | 87,291 / 299,917 / 212,833 | 246,250 / 539,083 / 300,125 | 113,729,958 / 881,042 / 4,975,834 | 30 accepted, 5 conflicts, 0 failures each |
+| 100 | 28,640,208 / 28,857,875 / 25,886,958 | 38,721,417 / 61,656,459 / 38,997,667 | 54,042,000 / 1,719,875 / 1,027,083 | 300 accepted, 199 to 229 conflicts, 0 failures each |
+
+Every client's own file held its accepted rounds once each in all six levels.
+
+Chaos: the procedure above, 10 clients x 200 rounds and 100 x 20, the daemon SIGKILLed 0.5, 1.5, 2.5, 3.5 and 5 s
+into the run phase. No mount was live, so no kill landed under a kernel NFS mount.
+- **Nine of the ten runs:** 2,000 accepted, 0 oracle and 0 own-file failures, harness exit 0.
+  - Reconnected and resent: 10, 10, 10, 10 and 8 of 10 (the rest had finished), and 100 of 100 in each 100-client run.
+  - Longest outage: 7,105,042 to 150,410,292 ns at 10 clients and 65,804,250 to 357,513,750 ns at 100.
+- **One run failed: 100 clients, killed at 3.5 s.** The anchor killed three successors in a row ("the daemon never
+  beat inside the recovery budget"), and the fourth recovered. In each, shard 0's recovery (one green, at least 322
+  versions, 100 work logs) held its first beat. The one that finished logged shard 0 initialized in 936,422 µs. By then
+  every client had passed its reconnect budget (recovery plus liveness, 2 s) and was refused "the daemon did not come
+  back within the reconnect budget": 0 reconnects.
+  - The oracle then found 4 file failures and 1 own-file failure, all of one kind. Client `100000003`'s file holds its
+    round 6, but the harness never saw round 6 accepted: the daemon accepted the submit and the client gave up before
+    it could resend.
+  - So nothing acknowledged was lost. The run fails on the restart's time, not its content (GAPS, "A daemon's restart
+    can exceed the anchor's fixed recovery budget").
+- **The 10-client run killed at 0.5 s passed, after the anchor killed 7 successors** (never beat) and 1 running
+  daemon (heartbeat lapsed).
+
+Shard 0's recovery time in the other eight runs, the successor that served: 245,701 to 548,338 µs with 101 merge
+volumes, 269,660 to 366,273 µs with 9 to 11.
+
+**main on the same machine, interleaved, two configurations each (2026-11-06, `00e5269c` built with the same
+`tree_bytes`; four runs, then stopped):** main's harness aborted in setup in both of its runs. Each time
+`pin(overlay)` over the tree was refused `Stalled` after the client's 1 s reply deadline, and the anchor had already
+killed a starting daemon (never beat) and lapsed running ones (2 and 1). The branch's two runs aborted too: in one the
+anchor killed 5 starting daemons, some before they logged "serving"; in the other it lapsed 5. So at this load the
+anchor's fixed 1 s budgets kill daemons on main too, before any recovery. The comparison of restart cost did not
+complete.
+A pin over about 1 s answering `Stalled` is main's client behaviour. loadtest-scale is making Pin a deferred reply
+sliced on its owner shard, to land on `agents/loadtest-scale-1` as its own commit (not yet committed on 2026-11-06).
+
 ### What a successful open costs under each serving pattern: arm64's remainder is the DLL's second waiting thread (2026-11-05)
 
 **The question (the supervisor's).** Does completing our open cost the kernel more than the DLL's, or is the time on the
@@ -9837,6 +9912,23 @@ could not see this.
 A second receiver cannot simply be added: two journals need the multi-worker crash proof (GAPS), which is not built. A
 second worker would also make x86_64 slower unless it ran on arm64 alone, and a mode chosen per architecture would need
 a derivation the rules accept.
+
+### The load test over the network: a client node and a server node (2026-11-05)
+
+`SLATES_LOADTEST_TREE=<linux-v7.4-rc1>/kernel SLATES_LOADTEST_BENCH=<release load_bench> SLATES_LOADTEST_CLIENTS=<n>
+SLATES_LOADTEST_ARGS="--hot-files <0.8 n> --reply-patience 60" cargo test --release -p slates-cli --test load_fleet --
+--nocapture`: two `slates anchor --fleet` nodes from one manifest (f = 0, loopback), the green on the server node, the
+harness at the client node; same machine as above, load 22 to 45, one run each. Nanoseconds, p50:
+
+| Clients | CreateWork | Edit | Submit (accepted) | Accepted / conflicts | Server RSS before → peak (KiB) | Client node RSS before → peak (KiB) | Refused |
+|---|---|---|---|---|---|---|---|
+| 100 | 509,673,093 | 96,438 | 277,486 | 300 / 20 | 102,124 → 244,528 | not recorded | none |
+| 300 | 1,709,859,756 | 69,688 | 185,272 | 900 / 45 | 121,096 → 484,900 | 30,180 → 59,828 | none |
+| 1,000 | 4,296,230,485 | 89,061 | 212,021 | 1,376 / 156 | 121,540 → 785,832 | 30,008 → 93,732 | 536 CreateWork, 7 Edit `OwnerUnreachable` |
+
+The oracle and every own file: 0 failures at each rung. A forwarded verb waits for the client node's one session to
+its server (GAPS), so the creates queue. With the server daemon SIGKILLed 1 s (100 clients) and 3 s (300) into the rung
+and restarted by its anchor, the client node's forwards stayed refused `OwnerUnreachable` (GAPS).
 
 ## Raising the shard threads' priority, and where the receiver stands against the DLL (A-212; 2026-11-05)
 
@@ -10559,3 +10651,34 @@ after every thread has exited. On both runners of both runs:
 - the CLI mount suites then sat 75-90 minutes with no output until the cancel at 01:40 UTC;
 - no killed daemon was seen to exit, so the 5-minute bound itself is not observed here.
 So A-219's runtime (`e070f31e`, and `5b5f7ba1` over the combined call) stays off main.
+
+### The load test's quiet arm: 1,000 and 3,000 clients on one node (2026-11-06, agents/loadtest-scale)
+
+`rung.sh <label> <bound> --tree <linux-v7.4-rc1>/kernel --clients <n> --hot-files <0.8 n> --per-connection 32 --rounds 3
+--reply-patience 60`, against a single-node `slates anchor --quick`. Mac Studio (adas-mac-studio.local-2, 32 CPUs, Apple
+silicon), release binaries of agents/loadtest-scale-1 at 6f7c5306, load 5.0 to 9.1, one run each. Linux v7.4-rc1
+(6628e7d4) `kernel/`, 754 files. Milliseconds:
+
+| Clients | Connections | Kind | p50 | p99 | p999 | max |
+|---|---|---|---|---|---|---|
+| 1,000 | 32 | CreateWork | 34.7 | 66.2 | 66.3 | 66.3 |
+| 1,000 | 32 | Edit | 62.3 | 160.8 | 201.5 | 242.0 |
+| 1,000 | 32 | SubmitAccepted | 66.0 | 204.8 | 229.4 | 242.0 |
+| 1,000 | 32 | SubmitConflict | 72.7 | 226.5 | 233.1 | 242.0 |
+| 1,000 | 32 | Rebase | 67.4 | 157.6 | 196.2 | 196.7 |
+| 3,000 | 94 | CreateWork | 400.0 | 423.2 | 424.2 | 424.5 |
+| 3,000 | 94 | Edit | 197.4 | 447.2 | 543.5 | 544.8 |
+| 3,000 | 94 | SubmitAccepted | 203.0 | 478.2 | 543.3 | 543.8 |
+| 3,000 | 94 | SubmitConflict | 205.7 | 428.5 | 543.3 | 544.6 |
+| 3,000 | 94 | Rebase | 210.3 | 478.5 | 543.9 | 544.8 |
+
+- **Correctness:** the oracle and every own file had 0 failures in both runs.
+- **Resolution:** the longest gap between two drains of a ring was 0.70 ms (1,000) and 3.12 ms (3,000).
+- **Throughput:** 95,867 operations in 10.7 s at 1,000 clients, about 8,960 a second, about 112 µs an operation. Every
+  operation of a green's works is served by the green's shard, since `CreateWork` places each work on the green's
+  partition. The harness keeps one request in flight per client, so a latency is about clients × service time
+  (Little's law): 1,000 × 112 µs ≈ 112 ms, and 3,000 triples it.
+- **Daemon peak RSS:** 14.3 GB (1,000) and 14.9 GB (3,000).
+- **The 3,000 rung's refusals:** 2,405 submits were refused `BudgetExceeded`, at the green's retention cap. A version
+  keeps the whole previous bytes of every file it overwrote, and the history folds only down to the oldest base a
+  live work holds. 3,766 versions were accepted.

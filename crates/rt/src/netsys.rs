@@ -558,9 +558,9 @@ mod imp {
   use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
   use windows_sys::Win32::Networking::WinSock::{
     AF_INET, FIONBIO, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IP_DONTFRAGMENT, IPPROTO_IP, IPPROTO_TCP,
-    IPPROTO_UDP, MSG_PEEK, SD_BOTH, SD_SEND, SIO_TCP_INFO, SIO_UDP_CONNRESET, SO_ERROR,
-    SO_EXCLUSIVEADDRUSE, SO_RCVBUF, SO_RCVLOWAT, SO_SNDBUF, SO_TYPE, SOCK_DGRAM, SOCK_STREAM,
-    SOCKADDR, SOCKADDR_IN, SOCKET, SOCKET_ERROR, SOL_SOCKET, TCP_INFO_v0, TCP_NODELAY,
+    IPPROTO_UDP, MSG_PEEK, SD_BOTH, SD_SEND, SIO_TCP_INFO, SIO_UDP_CONNRESET, SIO_UDP_NETRESET,
+    SO_ERROR, SO_EXCLUSIVEADDRUSE, SO_RCVBUF, SO_RCVLOWAT, SO_SNDBUF, SO_TYPE, SOCK_DGRAM,
+    SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKET, SOCKET_ERROR, SOL_SOCKET, TCP_INFO_v0, TCP_NODELAY,
     TCPSTATE_ESTABLISHED, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED, WSABUF, WSADATA,
     WSAEINTR, WSAEINVAL, WSAENOBUFS, WSAESHUTDOWN, WSAEWOULDBLOCK, WSAGetLastError, WSAIoctl,
     WSASend, WSASocketW, WSAStartup, accept as ws_accept, bind as ws_bind, closesocket,
@@ -643,8 +643,47 @@ mod imp {
   pub(crate) fn dgram_socket() -> Result<Socket, RtError> {
     let socket = exclusive_socket(SOCK_DGRAM, IPPROTO_UDP, "WSASocketW(DGRAM)")?;
     set_dont_fragment(&socket)?;
-    keep_receiving_after_unreachable(&socket)?;
+    ignore_earlier_datagrams_errors(&socket)?;
     Ok(socket)
+  }
+
+  /// Turns off Windows' report of an earlier datagram's ICMP error on a datagram socket's next receive
+  /// (`SIO_UDP_CONNRESET`, port unreachable, and `SIO_UDP_NETRESET`, time to live expired; each takes a `BOOL`, and
+  /// `FALSE` turns the report off: Microsoft Learn, "Winsock IOCTLs"). With either on, one send to a peer that has
+  /// gone (a fleet node restarting, a probe of a closed port) fails the socket's next `recvfrom` with WSAECONNRESET or
+  /// WSAENETRESET, which names no error of the datagram being received. Linux and macOS report no ICMP error to an
+  /// unconnected socket, and the fleet's sockets are all unconnected, so this makes Windows behave as they do. Until
+  /// 2026-11-06 both were on: conformance run 42150662467's three-node fleet never formed on windows-latest, its
+  /// handshakes' `recvfrom` failing 10054.
+  fn ignore_earlier_datagrams_errors(socket: &Socket) -> Result<(), RtError> {
+    /// Format: the Win32 `BOOL` that turns a report off.
+    const OFF: u32 = 0;
+    for (code, call) in [
+      (SIO_UDP_CONNRESET, "WSAIoctl(SIO_UDP_CONNRESET)"),
+      (SIO_UDP_NETRESET, "WSAIoctl(SIO_UDP_NETRESET)"),
+    ] {
+      let off = OFF;
+      let mut returned = 0u32;
+      // SAFETY: the input is a live `BOOL` passed with its own length and no output is asked; with no OVERLAPPED
+      // the call is done with both before it returns.
+      let rc = unsafe {
+        WSAIoctl(
+          socket.socket,
+          code,
+          (&raw const off).cast(),
+          u32::try_from(size_of::<u32>()).unwrap_or(0),
+          std::ptr::null_mut(),
+          0,
+          &raw mut returned,
+          std::ptr::null_mut(),
+          None,
+        )
+      };
+      if rc == SOCKET_ERROR {
+        return Err(last(call));
+      }
+    }
+    Ok(())
   }
 
   /// Creates a non-blocking INET socket of `kind` over `protocol` that no child process inherits
@@ -693,36 +732,6 @@ mod imp {
 
   /// Sets the don't-fragment bit on every datagram the socket sends (`IP_DONTFRAGMENT`; RFC 8899 §3 — see
   /// the Unix arms), so a path-MTU probe that is too large is dropped rather than fragmented.
-  /// Turns `SIO_UDP_CONNRESET` off, so the ICMP port-unreachable an earlier `sendto` drew is not reported as
-  /// `WSAECONNRESET` on the socket's next `recvfrom` (Microsoft KB263823, "WSAECONNRESET on UDP sockets"): an unconnected
-  /// datagram socket serves many peers, and one that has not started yet must not end the receive loop serving the rest.
-  /// Unix reports nothing on an unconnected socket, so every platform now receives alike. Without it a three-node fleet
-  /// on CI's `windows-latest` lost a serve socket's receive loop to its first probe of a peer still starting, and never
-  /// formed (3 of 4 starts, 2026-11-06).
-  fn keep_receiving_after_unreachable(socket: &Socket) -> Result<(), RtError> {
-    let off: u32 = 0;
-    let mut returned: u32 = 0;
-    // SAFETY: `SIO_UDP_CONNRESET` takes a BOOL in and returns nothing; the in pointer and length name one live local,
-    // the out buffer is the documented null with length 0, and no overlapped or completion routine is passed.
-    let outcome = unsafe {
-      WSAIoctl(
-        socket.socket,
-        SIO_UDP_CONNRESET,
-        (&raw const off).cast::<std::ffi::c_void>(),
-        u32::try_from(std::mem::size_of::<u32>()).unwrap_or(u32::MAX),
-        std::ptr::null_mut(),
-        0,
-        &mut returned,
-        std::ptr::null_mut(),
-        None,
-      )
-    };
-    if outcome == SOCKET_ERROR {
-      return Err(last("WSAIoctl(SIO_UDP_CONNRESET)"));
-    }
-    Ok(())
-  }
-
   fn set_dont_fragment(socket: &Socket) -> Result<(), RtError> {
     let on: i32 = 1;
     let len = i32::try_from(std::mem::size_of::<i32>()).unwrap_or(i32::MAX);
@@ -820,7 +829,7 @@ mod imp {
     not_inherited(&socket)?;
     set_nonblocking(&socket)?;
     set_dont_fragment(&socket)?;
-    keep_receiving_after_unreachable(&socket)?;
+    ignore_earlier_datagrams_errors(&socket)?;
     Ok(socket)
   }
 

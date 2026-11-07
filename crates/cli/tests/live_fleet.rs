@@ -1116,10 +1116,123 @@ fn a_superseded_owner_resumed_after_its_takeover_is_fenced() {
   );
 }
 
+/// A-200, AC-8.9: a live log ships a write's change, not the volume. Do make `WRITES` stable NFS writes, one at a time,
+/// to a live-shipped volume. Expect one whole record, the log's first: a whole record copies every byte of the volume.
+/// Until 2026-11-05 every local checkpoint shipped one, and a shard checkpoints once its deltas reach the size of its
+/// metadata, so one write in four copied the volume's content (532 whole records in 2,050 writes, and the ones behind
+/// them refused for credit, 431).
+#[test]
+fn a_live_volumes_writes_ship_their_changes_not_the_volume() {
+  /// Shape: enough writes for the shard's journal to checkpoint many times over.
+  const WRITES: u32 = 200;
+  /// Shape: each write's bytes, a page.
+  const WRITE_BYTES: usize = 4096;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping change-only flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-changes");
+  let owner = &fleet.instances[(fleet.bootstrap + 1) % fleet.instances.len()];
+  let (mut live, file, _) = stable_session(owner, "changes", true);
+  let data = vec![0x5a_u8; WRITE_BYTES];
+  for write in 0..WRITES {
+    nfs::write(&mut live, &file, &data, 100 + write);
+  }
+  let counters = live_counters(owner);
+  drop(live);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!("live changes: {WRITES} writes: {counters:?}");
+  let of = |name: &str| counters.get(name).copied().unwrap_or(0);
+  assert!(
+    of("appended") >= u64::from(WRITES),
+    "every write reached the log: {counters:?}"
+  );
+  assert_eq!(
+    of("whole"),
+    1,
+    "only the log's first record is whole: {counters:?}"
+  );
+  assert_eq!(
+    of("refused"),
+    0,
+    "a sequential writer stays within its credit: {counters:?}"
+  );
+}
+
+/// A-200, AC-8.9: a candidate's copy of a live log stays within its bound however long the writer runs. Do make stable
+/// NFS writes to a live volume bounded at 1 MiB until the changes shipped are three times its size. Expect every write
+/// answered, no candidate refusing an entry for its bound, and whole records shipped as the changes grow: a candidate
+/// keeps a whole record and the changes after it, at most twice the volume's size, so the owner ships a whole record
+/// once the changes since the last reach the volume's size. Found 2026-11-06: with whole records only at the log's
+/// start, the candidates' copies grew to the bound and both refused every entry after it, so no write was durable.
+#[test]
+fn a_long_writer_keeps_the_candidates_copies_within_their_bound() {
+  /// Shape: each write's bytes, a page.
+  const WRITE_BYTES: usize = 4096;
+  /// Shape: the volume's bound, and three times its size in writes of a page.
+  const VOLUME: &str = "1MiB";
+  /// Shape: see [`VOLUME`].
+  const WRITES: u32 = 3 * 256;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping bound flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-bound");
+  let owner = fleet.instances[(fleet.bootstrap + 1) % fleet.instances.len()].clone();
+  let (mut live, file, _) = stable_session_of(&owner, "bounded", true, VOLUME);
+  let data = vec![0x5a_u8; WRITE_BYTES];
+  let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    for write in 0..WRITES {
+      nfs::write(&mut live, &file, &data, 100 + write);
+    }
+  }))
+  .is_ok();
+  let counters: Vec<_> = fleet
+    .instances
+    .iter()
+    .map(|instance| (instance.clone(), live_counters(instance)))
+    .collect();
+  drop(live);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!("live bound: {WRITES} writes, all answered {written}: {counters:?}");
+  let sum = |name: &str| -> u64 {
+    counters
+      .iter()
+      .map(|(_, counts)| counts.get(name).copied().unwrap_or(0))
+      .sum()
+  };
+  assert!(written, "every write was answered: {counters:?}");
+  assert_eq!(
+    sum("hold_refused.malformed"),
+    0,
+    "no candidate refused an entry for its bound: {counters:?}"
+  );
+  assert!(
+    sum("whole") >= 2,
+    "whole records shipped as the changes grew: {counters:?}"
+  );
+}
+
 /// A stable-write NFS session to a fresh volume's export on `owner`: the stream, the file, and the volume's id.
 fn stable_session(owner: &str, name: &str, live: bool) -> (std::net::TcpStream, Vec<u8>, String) {
+  stable_session_of(owner, name, live, "64MiB")
+}
+
+/// [`stable_session`] for a volume bounded at `size`.
+fn stable_session_of(
+  owner: &str,
+  name: &str,
+  live: bool,
+  size: &str,
+) -> (std::net::TcpStream, Vec<u8>, String) {
   let id = value_of(
-    &run_ready(owner, &["volume", "create", name, "--bounded", "64MiB"]),
+    &run_ready(owner, &["volume", "create", name, "--bounded", size]),
     "id",
   );
   if live {
@@ -2253,57 +2366,4 @@ fn a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it() {
     "the device's hold answered the stopped FSYNC: {held_alone:?}"
   );
   assert_eq!(resumed.0, 0, "once the candidates are back, FSYNC succeeds");
-}
-
-/// A-200: a journal checkpoint is no reason for a live volume's log to take a whole record, since its candidates already
-/// hold everything before the change. Do: make 1,500 stable 4 KiB NFS writes to one file of a live volume, enough for the
-/// shard's journal to checkpoint several times (about every 500 entries on CI's runner). Expect the live log to have
-/// taken a whole record only for its first and for what it owed itself (a publication the credit turned away, a laggard
-/// behind its retained tail), never for a checkpoint (`fleet.live.whole_appended`), and to be durable through the last
-/// write.
-/// Before 2026-11-07 each checkpoint shipped the volume's whole image to every holder while a write waited: the quiet
-/// fleet's slow writes came every ~500 entries at 47, 82, 98 and 160 ms, growing with the volume (diag-live-durability-6).
-#[test]
-fn a_journal_checkpoint_ships_a_live_volumes_change_not_its_whole_image() {
-  /// Shape: stable writes, enough to cross several journal checkpoints.
-  const WRITES: u32 = 1_500;
-  if std::env::var_os("SLATES_TEST_CLI").is_none() {
-    eprintln!(
-      "skipping the live-shipping checkpoint flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
-    );
-    return;
-  }
-  let fleet = start_fleet("live-checkpoint");
-  let owner = &fleet.instances[(fleet.bootstrap + 1) % fleet.instances.len()];
-  let (mut stream, file, id) = stable_session(owner, "checkpointed", true);
-  let data = vec![0x5a_u8; 4096];
-  for xid in 10..10 + WRITES {
-    nfs::write(&mut stream, &file, &data, xid);
-  }
-  let whole = counter(owner, "fleet.live.whole_appended");
-  let appended = counter(owner, "fleet.live.appended");
-  // The log's own reasons to take a whole record: a publication it could not append (the credit full, a read refused),
-  // and a laggard behind its retained tail. Neither is a checkpoint.
-  let owed = counter(owner, "fleet.live.refused") + counter(owner, "fleet.live.install_sent");
-  let line = live_line(owner, "shipping", &id);
-  drop(stream);
-  drop(fleet.daemons);
-  drop(fleet.scratch);
-  eprintln!(
-    "live checkpoint: {appended} entries appended, {whole} whole, {owed} owed by the log itself; live log {line:?}"
-  );
-  assert!(
-    appended >= u64::from(WRITES),
-    "every stable write was shipped: {appended}"
-  );
-  assert!(
-    whole <= 1 + owed,
-    "no whole record but the log's first and those it owed itself ({owed}); a checkpoint ships the change: {whole}"
-  );
-  assert!(
-    line.as_ref().is_some_and(|(_, durable, _)| durable
-      .parse::<u64>()
-      .is_ok_and(|durable| durable + 1 >= u64::from(WRITES))),
-    "the log is durable at least through the last write: {line:?}"
-  );
 }

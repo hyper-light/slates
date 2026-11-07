@@ -6,8 +6,9 @@
 //! conflict, an equal one is accepted by identity, and nothing is inferred (D-26, D-27).
 //!
 //! **What is checked first.** The green is readable by the caller, the volume and snapshot named are the green's base
-//! (the snapshot's origin, captured as `green --base` captures it, encodes byte for byte to the green's recorded
-//! origin: an equal path is not evidence of an equal source, §4.10), and the volume is still exactly that snapshot's
+//! (the snapshot's origin, captured as `green --base` captures it, has the identity the green recorded: its held
+//! reference's since A-217, or the BLAKE3 of the bytes a taken-over green still records; an equal path is not evidence
+//! of an equal source, §4.10), and the volume is still exactly that snapshot's
 //! state ([`slates_vfs::volume::Volume::unchanged_since`]), so nothing the volume gained since is overwritten by the
 //! head. A green whose difference from its origin includes a symbolic link, a hard link, an extended attribute or a
 //! FIFO/socket is refused `Unsupported` naming the path: those dimensions are owed.
@@ -290,14 +291,17 @@ pub(crate) fn checkout_verb(
   if !rights_of(&base_record, principal).write {
     return forbidden("checkout");
   }
-  let Some(recorded) = state
-    .db
-    .partition()
-    .green_origin(record.id)
-    .map(<[u8]>::to_vec)
-  else {
-    // A scratch green has no base to write into: it is created over none.
-    return refused(Refusal::ConsistentBaseUnavailable);
+  // The origin's identity as the green recorded it: a based green holds a reference to its base snapshot with the
+  // identity (A-217); a green taken over by another host still records the origin's bytes. A scratch green has neither
+  // and no base to write into.
+  let partition = state.db.partition();
+  let recorded = match (
+    partition.green_origin_ref(record.id),
+    partition.green_origin(record.id),
+  ) {
+    (Some(held), _) => held.identity,
+    (None, Some(bytes)) => *blake3::hash(bytes).as_bytes(),
+    (None, None) => return refused(Refusal::ConsistentBaseUnavailable),
   };
   let unchanged = match state.volumes.get(handle) {
     Ok(slot) => slot.volume.unchanged_since(core_snapshot(base.snapshot)),
@@ -318,7 +322,7 @@ pub(crate) fn checkout_verb(
     Ok(origin) => origin,
     Err(refusal) => return refused(refusal),
   };
-  if origin.encode() != recorded {
+  if crate::merge_service::origin_identity(&origin) != recorded {
     return refused(Refusal::ConsistentBaseUnavailable);
   }
   let Some(engine) = state.greens.get(&record.id) else {

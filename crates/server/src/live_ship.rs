@@ -63,9 +63,8 @@ const RETAIN: usize = 4;
 /// Counter: a live volume's publication that could not be shipped as an entry, because its content could not be read,
 /// sealed or appended; its next publication ships the whole volume.
 const LIVE_REFUSED: &str = "fleet.live.refused";
-/// Counter: whole records appended to a live volume's log on this owner shard (a checkpoint of the log: the first, and
-/// each one a gap or a laggard behind the retained tail made owed).
-const LIVE_WHOLE_APPENDED: &str = "fleet.live.whole_appended";
+/// Counter: whole records appended to a live log, each a copy of the volume's content.
+const LIVE_WHOLE: &str = "fleet.live.whole";
 /// Counter: entries appended to a live volume's log on this owner shard.
 const LIVE_APPENDED: &str = "fleet.live.appended";
 /// Counter: entries a holder refused to keep (over its bound, unauthorized, malformed).
@@ -163,6 +162,9 @@ pub(crate) struct LiveVolume {
   /// The holders known to hold a version of the volume's catalog, which a holder's bound is derived from
   /// ([`hold_bound`]): every holder any of the catalog's placements named, kept. Bounded by the candidates.
   catalogued: Vec<HostId>,
+  /// The bytes a candidate keeps of this log: the last whole entry and every entry since ([`keep`]). Once it reaches
+  /// the volume's size the next publication ships whole, which clears them ([`kept_reaches_size`]).
+  kept: usize,
 }
 
 /// What a candidate keeps of one live volume.
@@ -750,22 +752,10 @@ fn answer(state: &mut ShardState, entry: Awaiting, reply: slates_ipc::protocol::
   }
 }
 
-/// Notes each live-shipped volume of a committed checkpoint and what its log is shipped for it ([`ship_captured`]): the
-/// volume's delta since its last publication (`None` only where that could not be encoded, and then its whole image).
-/// A journal checkpoint is no reason for the live log to take one: its holders hold everything before the delta. Until
-/// 2026-11-07 every checkpoint shipped each live volume's whole image to every holder while a write waited on it,
-/// costing more as the volume grew: on CI's quiet x86_64 runner the slow writes of the quiet-fleet flow came every ~500
-/// entries at 47, 82, 98 and 160 ms (diag-live-durability-6). The log still takes a whole record when it needs one (a
-/// gap, a laggard behind its retained tail).
-pub(crate) fn note_checkpoint(
-  state: &mut ShardState,
-  volumes: Vec<(slates_db::catalog::VolumeId, Option<Vec<u8>>)>,
-) {
-  for (id, record) in volumes {
-    if is_live(state, id) {
-      state.live.captured.push((id, record));
-    }
-  }
+/// Keeps, of the live records taken for a committed checkpoint (`verbs::capture_live_changes`), those of the volumes it
+/// carried: a volume it left out stays dirty and publishes again, record and all.
+pub(crate) fn note_checkpoint(state: &mut ShardState, volumes: &[slates_db::catalog::VolumeId]) {
+  state.live.captured.retain(|(id, _)| volumes.contains(id));
 }
 
 /// Ships what the publication that just committed recorded of each live-shipped volume ([`published`]).
@@ -824,6 +814,7 @@ pub(crate) fn published(
     placed.max(configuration.host_epoch)
   });
   let quorum = configuration.quorum;
+  let reaches_size = kept_reaches_size(state, id);
   let live = state
     .live
     .shipping
@@ -841,19 +832,20 @@ pub(crate) fn published(
       fenced: None,
       lanes: BTreeMap::new(),
       catalogued: Vec::new(),
+      kept: 0,
     });
-  let whole = live.owes_whole || record.is_none();
+  let whole = live.owes_whole || record.is_none() || reaches_size;
   let built = if whole {
     whole_record(state, id)
   } else {
     record.map(<[u8]>::to_vec)
   };
   let Some(record) = built else {
-    refuse(state, id);
+    refuse(state, id, "fleet.live.refused.no_record");
     return;
   };
   let Some(payload) = payload(state, id, whole, record) else {
-    refuse(state, id);
+    refuse(state, id, "fleet.live.refused.no_payload");
     return;
   };
   let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
@@ -868,6 +860,11 @@ pub(crate) fn published(
   match appended {
     Ok(entry) => {
       live.owes_whole = false;
+      live.kept = if whole {
+        payload.len()
+      } else {
+        live.kept.saturating_add(payload.len())
+      };
       if whole {
         let head = entry.head();
         live.shipper.mark_checkpoint(head);
@@ -879,19 +876,38 @@ pub(crate) fn published(
       }
       state.count(LIVE_APPENDED, 1);
       if whole {
-        state.count(LIVE_WHOLE_APPENDED, 1);
+        state.count(LIVE_WHOLE, 1);
       }
       resolve(state, id.bytes);
       let sends = pending_sends(state, id.bytes);
       dispatch(state, sends);
     }
-    Err(_) => refuse(state, id),
+    Err(_) => refuse(state, id, "fleet.live.refused.no_credit"),
   }
 }
 
+/// Whether what a candidate keeps of `id`'s log has reached the volume's size, so its next publication ships whole: a
+/// candidate keeps a whole entry and the entries since, within twice the volume's size ([`hold_bound`]), and a whole
+/// entry clears them. Shipped at the volume's size, the entry that crosses it still fits under the bound whatever it
+/// is, since no publication is larger than the volume. Never the case for a volume this shard does not know.
+fn kept_reaches_size(state: &ShardState, id: slates_db::catalog::VolumeId) -> bool {
+  let Some(kept) = state.live.shipping.get(&id.bytes).map(|live| live.kept) else {
+    return false;
+  };
+  let Some(volume) = state.db.partition().volume(id) else {
+    return false;
+  };
+  let size = match volume.policy.size {
+    slates_db::catalog::SizeClass::Bounded { limit } => limit,
+    slates_db::catalog::SizeClass::Dynamic { max } => max,
+  };
+  u64::try_from(kept).unwrap_or(u64::MAX) >= size
+}
+
 /// A publication that could not become an entry: counted, and the volume owes a whole record next.
-fn refuse(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
+fn refuse(state: &mut ShardState, id: slates_db::catalog::VolumeId, why: &'static str) {
   state.count(LIVE_REFUSED, 1);
+  state.count(why, 1);
   if let Some(live) = state.live.shipping.get_mut(&id.bytes) {
     live.owes_whole = true;
   }
