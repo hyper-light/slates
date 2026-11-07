@@ -3696,7 +3696,9 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
         candidates.push(host);
       }
     }
-    match crate::live_ship::fetch(object, placed.epoch, candidates, holders).await {
+    // RED-CHECK (diag only): phase one counts f + 1 from the current placement again, not the recorded holders.
+    let _recorded = holders;
+    match crate::live_ship::fetch(object, placed.epoch, candidates.clone(), candidates).await {
       Ok(fetched) => fetched,
       Err(waits) => {
         count_refusal(waits);
