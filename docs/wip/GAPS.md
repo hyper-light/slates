@@ -7,7 +7,11 @@
 > asked each volume's status and stopped at the first refusal, so one such volume blocked every drive; it now asks every
 > volume, names a refused one on standard error by kind, and releases the drive any volume reports. macOS and Linux
 > unmount is the OS's own and asks no volume; no other client loop asks a status per volume. Proven: the status test red
-> on macOS and Linux with the fix removed (and on macOS before it) and green on both, CI runs RUNS_PENDING. Open:
+> on macOS before the fix and with it removed, green after; on Linux green (diag-slabs-24, run 42319805779: the named
+> tests 6, the CLI flow 86) and red with it removed (diag-slabs-26, run 42319805390: "refused: NotFound"). On Windows,
+> on both runners, the unmount test green (diag-slabs-24, run 42319805783: the WinFsp suite 16), red with the old loop
+> (diag-slabs-25, run 42319805958: the drive was found first and the unrecovered volume never named), and red with the
+> status fix removed (diag-slabs-26, run 42319805581: "refused: NotFound"). Open:
 > - **Destroying such a volume.** `destroy` goes through the same lookup, so it is refused `NotRecovered` (before, `NotFound`)
 >   and the catalog record stays: a destroy must be able to remove a record with no live slot.
 
