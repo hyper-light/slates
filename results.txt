@@ -1,0 +1,7 @@
+tested 888e3ae300339543ebbb748cf23100d6e9b20c62 variant after on aarch64, 4 cpus
+client-post-state exit 0 68s
+  client-post-state: warning: aws-lc-sys@0.45.0: Target platform: 'aarch64-unknown-linux-gnu'
+  client-post-state: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+clippy exit 0 59s
+  clippy: warning: aws-lc-sys@0.45.0: Target platform: 'aarch64-unknown-linux-gnu'
+fmt exit 0 4s
