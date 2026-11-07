@@ -9,7 +9,11 @@
 > - a shard's recovery is one poll, which past a window of CPU stops the watchdog's beat;
 > - the client's reconnect budget (recovery + liveness, 2 s) can still be outlasted by a starved restart (owner clients);
 > - `Facts::query()` gathers every fact to read the identity (676 ms p50 under that load);
-> - the anchor's own profile was refused under the same load (`measurement timeout: wake`).
+> - the anchor's own profile was refused under the same load (`measurement timeout: wake`). Closed the same day: the
+>   wake probe now runs past its wall while each round's waiter runs at all, rounds doubling from one window to 4 s (7.75 s
+>   in all), and refuses after a round whose waiter never ran
+>   (`docs/bugs/2026-11-07-a-busy-machine-refused-the-anchors-boot-at-the-wake-probe.md`). That closes the standing
+>   limitation of 2026-10-18's "busy-machine discipline" (1): "a machine too busy for the floor in 250 ms still refuses".
 > The bug record of 2026-11-07 has the per-phase table.
 > **A Windows UDP socket died on an earlier send's ICMP error (found 2026-11-06, fixed 2026-11-06).** With Windows'
 > default `SIO_UDP_CONNRESET`, a port-unreachable for a datagram sent earlier failed the socket's next `recvfrom` with
@@ -10165,7 +10169,8 @@ caller's budget at face value. Canonical: `crates/machine/src/wake.rs` — a rou
 short of the sample floor, bounded by `PROBE_WALL_BUDGET`. The caller's budget then sets the *per-round* size,
 which is why handing it 250 ms instead of 5 ms still matters (rounds fifty times larger from the first), and
 why it does **not** buy more wall time. A machine too busy for the floor in 250 ms still refuses; that ceiling
-is the standing limitation.
+is the standing limitation. *(Closed 2026-11-07: past the wall the probe runs on while each round's waiter runs
+at all, within 31 more windows; see the top entry.)*
 
 **2. "This operation was fast."** A tight bound — one the same order as scheduling noise — must say whether
 the code did its job, not whether the machine was fast while it did. Attribute with `getrusage`'s involuntary
