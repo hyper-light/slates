@@ -1,0 +1,11 @@
+tested 95f6990d2f86863ac5cbd2d1177b78b44ce89a88 variant before-read on x86_64, 4 cpus
+  reverted:  crates/server/src/merge_service.rs | 2 +-
+  reverted:  1 file changed, 1 insertion(+), 1 deletion(-)
+recovered exit 101 85s
+  recovered: warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+  recovered: slates-server: shard 0: recovered 0 volumes from their images (0 refused), 2 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  recovered: thread 'a_green_recovered_after_its_chain_was_checkpointed_is_the_green_it_was' (5759) panicked at crates/server/tests/green_checkpoint.rs:173:3:
+  recovered: a version below the checkpoint is unknown, never answered as if the file were absent: Err(Refused(NotFound))
+  recovered: test a_green_recovered_after_its_chain_was_checkpointed_is_the_green_it_was ... FAILED
+  recovered: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.52s
+  recovered: error: test failed, to rerun pass `-p slates-server --test green_checkpoint`
