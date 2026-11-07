@@ -7286,6 +7286,10 @@ stays in the overlay.
 > - **The source.** An unnamed landing lands an implicit snapshot of the head, taken when it begins.
 > - **One at a time.** One granted landing per volume runs at a time.
 > - **Large files.** A large file is copied one content window per unit, so no unit grows with a file.
+> - **The plan.** A landing's beginning, the diverged walk, the plan and a presentation's preliminary verdicts, runs a
+>   unit at a time like its writes: a presentation's reply is deferred to it, on an implicit snapshot of the head, and
+>   a granted landing plans inside its task with its lease kept alive. Until 2026-11-08 it was one poll
+>   (`docs/bugs/2026-11-08-a-landings-plan-held-its-shard.md`).
 > - **The fences' clock.** Every entry is fenced against its lease and grant on the landing's clock, which counts from
 >   the instant its request's clock was read: the plan, the sweep and the validation count. Until 2026-11-08 it
 >   counted from the first write, so a landing paused before it wrote past its term
