@@ -427,17 +427,20 @@ impl Fleet {
       .iter()
       .map(|node| format!("chaos-{tag}-{node}-{pid}"))
       .collect();
+    // One node at a time, each answering before the next starts: a daemon's boot measures the machine
+    // (`MachineProfile::measure_patiently`, about 13 s for a lone debug daemon on a loaded Mac, 2026-11-07), and three
+    // measuring at once disturb each other past the start wait, so every flow failed at start (live-durability, at load
+    // 12 with no other fleet running).
     let processes = FLEET_NODES
       .iter()
       .zip(&instances)
       .zip(&blocks)
       .map(|((node, instance), held)| {
-        Some(start_node(instance, &manifest, node, held, supervision))
+        let process = start_node(instance, &manifest, node, held, supervision);
+        wait_answers(instance);
+        Some(process)
       })
       .collect();
-    for instance in &instances {
-      wait_answers(instance);
-    }
     let hosts = wait_formed(&instances);
     let bootstrap = (0..hosts.len())
       .min_by_key(|index| hosts[*index].parse::<u64>().unwrap())
@@ -559,10 +562,26 @@ fn volume_id_of(hex: &str) -> VolumeId {
   VolumeId { bytes }
 }
 
+/// Shape: the room each streamed file takes beyond its bytes (its inode and directory entry), as a multiple: room
+/// twice over.
+const FILE_ROOM: usize = 2;
+
+/// Derived: a flow's volume holds every file a stream can write, `STREAM_FILES` × `WRITE_BYTES` × [`FILE_ROOM`], in
+/// MiB, so no flow is ever refused for space before it is stopped. A fixed 64 MiB held 16,384 writes, and a 10 s
+/// release stream with the live checkpoint fix wrote 16,404 and failed on its last 20 (live-durability, CI
+/// diag-live-durability-7, 2026-11-07). It is a quota, not memory: the daemons hold only what was written.
+fn volume_bound_mib() -> usize {
+  STREAM_FILES
+    .saturating_mul(WRITE_BYTES)
+    .saturating_mul(FILE_ROOM)
+    .div_ceil(1 << 20)
+}
+
 /// Creates a volume on `owner` (live-shipped when `live`): its id.
 fn create_volume(owner: &str, name: &str, live: bool) -> String {
+  let bound = format!("{}MiB", volume_bound_mib());
   let id = value_of(
-    &run_ready(owner, &["volume", "create", name, "--bounded", "64MiB"]),
+    &run_ready(owner, &["volume", "create", name, "--bounded", &bound]),
     "id",
   );
   if live {
@@ -1056,7 +1075,9 @@ fn stream_through<F: FnOnce(&Instant)>(
       "a write on {owner} was never answered (the fleet's state is printed above): {:?}",
       outcomes.last()
     );
-    (outcomes, sampler.join().unwrap())
+    let samples = sampler.join().unwrap();
+    print_slow_windows(instances, &outcomes, &samples);
+    (outcomes, samples)
   })
 }
 
@@ -1082,6 +1103,59 @@ fn after_writes(owner: &str, volume: &str, count: u64) {
       );
     }
     pause();
+  }
+}
+
+/// Format: the opt-in that prints the samples around each slow write ([`print_slow_windows`]).
+const PRINT_SLOW: &str = "SLATES_CHAOS_PRINT_SLOW";
+/// Shape: how far before a slow write's send its window of samples begins: enough to show the copies' state as it was
+/// sent.
+const SLOW_WINDOW_BEFORE: Duration = Duration::from_millis(500);
+/// Shape: how far past a slow write's answer its window of samples ends.
+const SLOW_WINDOW_AFTER: Duration = Duration::from_millis(200);
+
+/// With [`PRINT_SLOW`] set, prints for every write that took a liveness budget or more the samples from
+/// [`SLOW_WINDOW_BEFORE`] before its send to [`SLOW_WINDOW_AFTER`] after its answer, in time order: when, which node,
+/// and its live line. That separates a reply not folded (the healthy holder's head moved, the owner's durable did not)
+/// from a durable position computed from the stopped holder (live-durability, 2026-11-07).
+fn print_slow_windows(instances: &[String], outcomes: &[Outcome], samples: &[Sample]) {
+  if std::env::var_os(PRINT_SLOW).is_none() {
+    return;
+  }
+  let bound = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
+  for outcome in outcomes.iter().filter(|outcome| outcome.took >= bound) {
+    let from = outcome.sent.saturating_sub(SLOW_WINDOW_BEFORE);
+    let to = outcome.sent + outcome.took + SLOW_WINDOW_AFTER;
+    let mut window: Vec<&Sample> = samples
+      .iter()
+      .filter(|sample| sample.at >= from && sample.at <= to)
+      .collect();
+    window.sort_by_key(|sample| sample.at);
+    eprintln!(
+      "chaos slow write {} sent {:?} took {:?} refused {:?}: {} samples",
+      chaos_path(outcome.file),
+      outcome.sent,
+      outcome.took,
+      outcome.refused,
+      window.len()
+    );
+    for sample in window {
+      eprintln!(
+        "  {:>10.3?} {} {} head={:?} durable={:?} owed={} epoch={:?} fence={}",
+        sample.at,
+        instances.get(sample.node).map_or("?", String::as_str),
+        if sample.state.holding {
+          "held"
+        } else {
+          "shipping"
+        },
+        sample.state.head,
+        sample.state.durable,
+        sample.state.owed,
+        sample.state.epoch,
+        sample.state.fence
+      );
+    }
   }
 }
 
@@ -1285,6 +1359,15 @@ fn judge_healed(
   verdict.note(format!("{} samples, {heads} heads seen", samples.len()));
   verdict.check("Agreement", disagreements);
   verdict.check("NoLoss", no_loss(owner, volume, outcomes));
+  // Each node's refusals of the owner's messages by why, passing or not: a candidate refusing every entry for want of
+  // the volume's catalog (`no_catalog`) was much of an install storm that a passing flow hid (live-durability,
+  // 2026-11-06).
+  for instance in std::iter::once(owner).chain(candidates.iter().map(String::as_str)) {
+    verdict.note(format!(
+      "{instance} refused the owner: {:?}",
+      counters(instance, "fleet.live.hold_refused.")
+    ));
+  }
 }
 
 /// Shape: the bound a healed candidate catches up within, from its resume to holding the owner's head at that moment:
@@ -1927,7 +2010,7 @@ fn a_destroy_then_the_owners_loss(live: bool, unheard: bool) {
       "after the unanswered destroy: {outcome}; {views:?}"
     ));
     verdict.check(
-      "an unanswered destroy settles: destroyed everywhere, or served whole",
+      "an unanswered destroy settles: destroyed everywhere (NotFound or OwnerUnreachable, never Overloaded), or served whole",
       if settled.is_some() {
         Vec::new()
       } else {
@@ -2457,7 +2540,8 @@ fn clients_cut_off_mid_merge_leave_the_green_whole_across_a_takeover() {
   verdict.judge();
 }
 
-/// How a volume whose destroy was never answered done settled: destroyed on every survivor, or served whole by one.
+/// How a volume whose destroy was never answered done settled: destroyed on every survivor (none lists it, each read
+/// refused `NotFound` or `OwnerUnreachable`), or served whole by one.
 enum Settled {
   Destroyed,
   Served(String),
@@ -2474,8 +2558,14 @@ fn wait_settled_after_destroy(
   let deadline = Instant::now() + FLEET_WAIT;
   loop {
     let views = survivor_views(survivors, volume);
+    // Destroyed: nobody lists it, nobody serves it, and every answer is NotFound or OwnerUnreachable (a destroyed
+    // volume of a departed creator: once its tombstone retires no member remembers it and its id routes to the gone
+    // creator; answering NotFound there is an open design item, GAPS). Never a stuck Overloaded, the successor that
+    // kept its routing to a retired volume (2026-11-06).
     let destroyed = views.iter().all(|view| {
-      !view.listed && matches!(&view.read, Some(Err(error)) if error.contains("NotFound"))
+      !view.listed
+        && matches!(&view.read, Some(Err(error))
+          if error.contains("NotFound") || error.contains("OwnerUnreachable"))
     });
     if destroyed {
       return (Some(Settled::Destroyed), views);
@@ -2493,4 +2583,66 @@ fn wait_settled_after_destroy(
     }
     pause();
   }
+}
+
+/// A-200 takeover of a live volume with a long log: do stream `LONG_LOG` writes to a live volume (the log goes past
+/// whole records and their deltas), let both candidates hold it, then kill the owner's node. Expect a survivor to take
+/// the volume over from its live log and serve every acknowledged write. On KIND (runs 42178128960 and 42318867890,
+/// 1,000 writes) both survivors held the log at its head while the successor refused to rebuild it 1,512 times
+/// (`fleet.live.takeover_refused`), and the volume was never served.
+#[test]
+fn a_long_live_log_is_taken_over_whole() {
+  /// Shape: the writes before the owner's loss: the KIND leg's unshaped count.
+  const LONG_LOG: usize = 1000;
+  if !gated("long-log") {
+    return;
+  }
+  let mut fleet = Fleet::start("long-log", Supervision::Bare);
+  let owner_index = fleet.owner_index();
+  let owner = fleet.instances[owner_index].clone();
+  let candidates = candidates_of(&fleet, owner_index);
+  let volume = create_volume(&owner, "long-log", true);
+  let mut verdict = Verdict::new("a long live log taken over");
+  // Streamed in steps the stall guard watches (40 durable writes within the fleet wait each), so a write the daemon
+  // never answers fails the flow with the fleet printed, where one long stream ran into the test's own timeout.
+  let (outcomes, samples) = stream_through(&fleet.instances, &owner, &volume, 0..LONG_LOG, |_| {
+    while live_states(&owner, &volume)
+      .unwrap_or_default()
+      .into_iter()
+      .find(|state| !state.holding)
+      .and_then(|state| state.durable)
+      .is_none_or(|durable| durable < u64::try_from(LONG_LOG).unwrap())
+    {
+      after_writes(&owner, &volume, BETWEEN_EVENTS);
+    }
+  });
+  verdict.note(latency_line(&outcomes));
+  let (heads, disagreements) = agreement(&samples);
+  verdict.note(format!("{} samples, {heads} heads seen", samples.len()));
+  verdict.check("Agreement", disagreements);
+  let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+  let (caught_up, last) = converged(&owner, &refs, &volume);
+  verdict.check(
+    "Convergence",
+    if caught_up { Vec::new() } else { vec![last] },
+  );
+  fleet.kill_node(owner_index);
+  match wait_serving(&refs, &volume, &outcomes) {
+    Some((successor, took)) => {
+      verdict.note(format!("taken over by {successor} after {took:?}"));
+      verdict.check("NoLoss (successor)", no_loss(successor, &volume, &outcomes));
+    }
+    None => verdict.check(
+      "NoLoss (successor)",
+      vec![format!(
+        "no survivor served the volume within the fleet wait: {:?}",
+        refs
+          .iter()
+          .map(|survivor| (*survivor, counters(survivor, "fleet.live.")))
+          .collect::<Vec<_>>()
+      )],
+    ),
+  }
+  drop(fleet);
+  verdict.judge();
 }
