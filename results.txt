@@ -1,0 +1,15 @@
+runner windows-latest, Sat Nov  7 03:44:05 UTC 2026, tree 5574c3dc5cd03dc42fd8ad46c5718b208311e6da
+live winfsp flush: healthy Ok(()); candidates suspended Err(Os { code: 1117, kind: Uncategorized, message: "The request could not be performed because of an I/O device error." }) after 1.0008294s; resumed Ok(()); owner's live counters {"fleet.live.appended": 6, "fleet.live.durable": 6, "fleet.live.link_lost": 2, "fleet.live.no_session": 47, "fleet.live.refused": 4, "fleet.live.unanswered": 42, "winfsp.live_flush_held": 2, "winfsp.live_flush_refused": 1}
+test a_winfsp_flush_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.05s
+== flush 1 exit 0
+live winfsp flush: healthy Ok(()); candidates suspended Err(Os { code: 1117, kind: Uncategorized, message: "The request could not be performed because of an I/O device error." }) after 1.0134753s; resumed Ok(()); owner's live counters {"fleet.live.appended": 6, "fleet.live.durable": 3, "fleet.live.link_lost": 2, "fleet.live.no_session": 51, "fleet.live.refused": 4, "fleet.live.unanswered": 41, "winfsp.live_flush_held": 2, "winfsp.live_flush_refused": 1}
+test a_winfsp_flush_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.18s
+== flush 2 exit 0
+live winfsp flush: healthy Ok(()); candidates suspended Err(Os { code: 1117, kind: Uncategorized, message: "The request could not be performed because of an I/O device error." }) after 1.0008387s; resumed Ok(()); owner's live counters {"fleet.live.appended": 6, "fleet.live.durable": 6, "fleet.live.link_lost": 1, "fleet.live.no_session": 41, "fleet.live.refused": 4, "fleet.live.unanswered": 21, "winfsp.live_flush_held": 2, "winfsp.live_flush_refused": 1}
+test a_winfsp_flush_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.30s
+== flush 3 exit 0
+test result: ok. 13 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 152.23s
+== winfsp suite exit 0
