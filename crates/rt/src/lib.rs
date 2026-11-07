@@ -77,7 +77,7 @@ pub mod kqueue;
 pub use driver::{Driver, DriverKind};
 pub use error::RtError;
 pub use registry::SlotHolder;
-pub use runtime::{Runtime, RuntimeConfig, WakeTracking};
+pub use runtime::{Runtime, RuntimeConfig, ShardCapacity, WakeTracking};
 pub use shard::{ShardId, TaskId};
 pub use sim::SimRuntime;
 pub use task::Outcome;
