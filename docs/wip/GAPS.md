@@ -13734,6 +13734,26 @@ Mac, binaries built on `d61c3be2`):
   `a_mount_survives_connections_broken_and_tampered_mid_call_under_load` never lowers its stop flags, so its breakers
   and spinners run on and the scope never ends. One run hung for 36 minutes at load ~100 until stopped by hand.
 
+### 2026-11-07: a daemon killed inside its profile's republication refused every successor — fixed
+
+`slates_run_spawns_the_command_as_an_ephemeral_consumer` (`crates/cli/tests/cli.rs`) failed 1 of 10 runs alone under two
+spinners a core (an 18-core Mac): "the daemon never served: slates anchor: the daemon is in a crash loop (last exit
+Some(4))". Its anchor killed two starting daemons in a row at its recovery budget (the open entry "A daemon's restart
+can exceed the anchor's fixed recovery budget"), and the third exited 4: "profile: a payload publication is
+unfinished". Every daemon republishes the anchor's profile into the segment at its start (`Daemon::start`), under the
+payload's seqlock; killed inside it, it left the generation odd, and `read_published` refused each successor
+`PublicationInProgress`. Only the anchor's first publication wrote the region again, so the crash loop had no end.
+
+The supervisor now keeps the profile the anchor published and publishes it again before every start
+(`Supervisor::start`, `crates/anchor/src/supervise.rs`), when no daemon runs. Red first:
+`a_daemon_killed_mid_publication_leaves_its_successor_the_anchors_profile` (`crates/anchor/tests/anchor.rs`) supervises
+a child whose first start leaves the generation odd and exits; its successor exited 4 (3 of 3 on adacachy) and now
+reads the profile whole, 10 of 10 under two spinners a core. The CLI test again, 10 runs on the Mac under two spinners
+a core with the fix: no unfinished publication and no crash loop; 9 passed and 1 hit the runs' 300 s bound. The
+first-beat kill itself stays with that open entry, and the Mac's runs add to it: every run had starting daemons
+killed (1 to 236), and in the bounded run none of the 236 printed its first configuration line, so they were killed
+before any shard started or recovered anything.
+
 ### 2026-10-22: two pressure tests failed on a busy machine, not on the property — fixed
 
 `a_stale_handle_never_reads_a_reused_inode_under_churn` and
