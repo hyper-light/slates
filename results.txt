@@ -1,0 +1,61 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 01:54:08 UTC 2026, commit 87708c1f
+== ack_release_main busy round 1 at 01:54:08
+status on a starved shard answered in 569.002231ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.16s
+== ack_release busy round 1 at 01:54:11
+status on a starved shard answered in 556.009246ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.55s
+== ack_release_main busy round 2 at 01:54:14
+status on a starved shard answered in 534.018588ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.06s
+== ack_release busy round 2 at 01:54:18
+status on a starved shard answered in 541.797766ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.74s
+== ack_release_main busy round 3 at 01:54:21
+status on a starved shard answered in 568.001278ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.26s
+== ack_release busy round 3 at 01:54:25
+status on a starved shard answered in 543.008803ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.74s
+== ack_release_main busy round 4 at 01:54:28
+status on a starved shard answered in 565.028751ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.88s
+== ack_release busy round 4 at 01:54:31
+status on a starved shard answered in 566.012482ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.82s
+== ack_release_main busy round 5 at 01:54:34
+status on a starved shard answered in 547.02289ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.90s
+== ack_release busy round 5 at 01:54:38
+status on a starved shard answered in 533.957044ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.87s
+== ack_release_main busy round 6 at 01:54:41
+status on a starved shard answered in 576.006163ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.51s
+== ack_release busy round 6 at 01:54:45
+status on a starved shard answered in 529.971374ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.95s
+== ack_release_main busy round 7 at 01:54:49
+status on a starved shard answered in 530.022692ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.13s
+== ack_release busy round 7 at 01:54:52
+status on a starved shard answered in 539.734685ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.70s
+== ack_release_main busy round 8 at 01:54:55
+status on a starved shard answered in 570.027926ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.95s
+== ack_release busy round 8 at 01:54:58
+status on a starved shard answered in 559.637477ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.66s
+== ack_release_main busy round 9 at 01:55:01
+status on a starved shard answered in 540.025082ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.47s
+== ack_release busy round 9 at 01:55:05
+status on a starved shard answered in 544.83967ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.92s
+== ack_release_main busy round 10 at 01:55:08
+status on a starved shard answered in 536.00272ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.15s
+== ack_release busy round 10 at 01:55:12
+status on a starved shard answered in 554.975529ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.72s
