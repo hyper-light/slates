@@ -1,0 +1,71 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 02:21:49 UTC 2026, commit 858246b4
+== cli_main busy round 1 at 02:21:49
+slates anchor: the daemon's heartbeat lapsed (1001 ms old, past 1001 ms: the 1000 ms window plus this anchor's lateness p99 of 1 ms over 6 waits); killing it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 2.32s
+== cli busy round 1 at 02:21:52
+slates anchor: the daemon's heartbeat lapsed (1003 ms old, past 1002 ms: the 1000 ms window plus this anchor's lateness p99 of 2 ms over 6 waits); killing it
+frozen daemon: replaced after 1.14105147s; the anchor's beat was 1.003s old against its 1.002s bound
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 2.19s
+== cli_main busy round 2 at 02:21:55
+slates anchor: the daemon's heartbeat lapsed (1000 ms old, past 1000 ms: the 1000 ms window plus this anchor's lateness p99 of 0 ms over 6 waits); killing it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 2.17s
+== cli busy round 2 at 02:21:57
+slates anchor: the daemon's heartbeat lapsed (1002 ms old, past 1002 ms: the 1000 ms window plus this anchor's lateness p99 of 2 ms over 6 waits); killing it
+frozen daemon: replaced after 1.095163759s; the anchor's beat was 1.002s old against its 1.002s bound
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 2.06s
+== cli_main busy round 3 at 02:22:00
+slates anchor: the daemon's heartbeat lapsed (1003 ms old, past 1002 ms: the 1000 ms window plus this anchor's lateness p99 of 2 ms over 6 waits); killing it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 2.15s
+== cli busy round 3 at 02:22:02
+slates anchor: the daemon's heartbeat lapsed (1002 ms old, past 1001 ms: the 1000 ms window plus this anchor's lateness p99 of 1 ms over 6 waits); killing it
+frozen daemon: replaced after 1.056828583s; the anchor's beat was 1.002s old against its 1.001s bound
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 2.17s
+== cli_main busy round 4 at 02:22:05
+slates anchor: the daemon's heartbeat lapsed (1002 ms old, past 1002 ms: the 1000 ms window plus this anchor's lateness p99 of 2 ms over 6 waits); killing it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 2.22s
+== cli busy round 4 at 02:22:08
+slates anchor: the daemon's heartbeat lapsed (1000 ms old, past 1000 ms: the 1000 ms window plus this anchor's lateness p99 of 0 ms over 6 waits); killing it
+frozen daemon: replaced after 1.013084247s; the anchor's beat was 1s old against its 1s bound
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 2.10s
+== cli_main busy round 5 at 02:22:10
+slates anchor: the daemon's heartbeat lapsed (1000 ms old, past 1000 ms: the 1000 ms window plus this anchor's lateness p99 of 0 ms over 6 waits); killing it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 2.25s
+== cli busy round 5 at 02:22:13
+slates anchor: the daemon's heartbeat lapsed (1001 ms old, past 1000 ms: the 1000 ms window plus this anchor's lateness p99 of 0 ms over 6 waits); killing it
+frozen daemon: replaced after 1.040137608s; the anchor's beat was 1.001s old against its 1s bound
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 2.23s
+== cli_main busy round 6 at 02:22:15
+slates anchor: the daemon's heartbeat lapsed (1001 ms old, past 1001 ms: the 1000 ms window plus this anchor's lateness p99 of 1 ms over 6 waits); killing it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 2.24s
+== cli busy round 6 at 02:22:18
+slates anchor: the daemon's heartbeat lapsed (1000 ms old, past 1000 ms: the 1000 ms window plus this anchor's lateness p99 of 0 ms over 6 waits); killing it
+frozen daemon: replaced after 1.11946959s; the anchor's beat was 1s old against its 1s bound
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 2.28s
+== cli_main busy round 7 at 02:22:20
+slates anchor: the daemon's heartbeat lapsed (1003 ms old, past 1001 ms: the 1000 ms window plus this anchor's lateness p99 of 1 ms over 6 waits); killing it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 2.22s
+== cli busy round 7 at 02:22:23
+slates anchor: the daemon's heartbeat lapsed (1000 ms old, past 1000 ms: the 1000 ms window plus this anchor's lateness p99 of 0 ms over 6 waits); killing it
+frozen daemon: replaced after 1.114027173s; the anchor's beat was 1s old against its 1s bound
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 2.21s
+== cli_main busy round 8 at 02:22:26
+slates anchor: the daemon's heartbeat lapsed (1002 ms old, past 1002 ms: the 1000 ms window plus this anchor's lateness p99 of 2 ms over 6 waits); killing it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 2.37s
+== cli busy round 8 at 02:22:28
+slates anchor: the daemon's heartbeat lapsed (1002 ms old, past 1001 ms: the 1000 ms window plus this anchor's lateness p99 of 1 ms over 7 waits); killing it
+frozen daemon: replaced after 1.09909463s; the anchor's beat was 1.002s old against its 1.001s bound
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 2.22s
+== cli_main busy round 9 at 02:22:31
+slates anchor: the daemon's heartbeat lapsed (1003 ms old, past 1001 ms: the 1000 ms window plus this anchor's lateness p99 of 1 ms over 6 waits); killing it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 2.08s
+== cli busy round 9 at 02:22:34
+slates anchor: the daemon's heartbeat lapsed (1003 ms old, past 1002 ms: the 1000 ms window plus this anchor's lateness p99 of 2 ms over 6 waits); killing it
+frozen daemon: replaced after 1.06804753s; the anchor's beat was 1.003s old against its 1.002s bound
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 2.22s
+== cli_main busy round 10 at 02:22:36
+slates anchor: the daemon's heartbeat lapsed (1001 ms old, past 1001 ms: the 1000 ms window plus this anchor's lateness p99 of 1 ms over 6 waits); killing it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 2.20s
+== cli busy round 10 at 02:22:39
+slates anchor: the daemon's heartbeat lapsed (1000 ms old, past 1000 ms: the 1000 ms window plus this anchor's lateness p99 of 0 ms over 6 waits); killing it
+frozen daemon: replaced after 1.040097351s; the anchor's beat was 1s old against its 1s bound
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 2.16s
