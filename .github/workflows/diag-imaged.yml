@@ -1,0 +1,33 @@
+name: DIAG does a volume go unimaged during a landing on Unix too (not for main)
+
+on:
+  push:
+    branches: ['diag-winfsp-bench-land-[0-9]*']
+
+permissions:
+  contents: write
+
+jobs:
+  imaged:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: The test, uncaptured
+        shell: bash
+        run: |
+          set +e
+          cargo test -p slates-server --locked --test landing_fairness an_async_patient -- --test-threads=1 --nocapture > f.log 2>&1
+          code=$?
+          { echo "${{ matrix.runner }} exit $code; lines naming it: $(grep -ac 'was not imaged' f.log)"; grep -a -B2 -A1 'was not imaged' f.log | cut -c1-260 | head -20; grep -a '^test result' f.log | cut -c1-100; } > results.txt
+          git config user.name diag; git config user.email diag@invalid
+          tree=$(printf '100644 blob %s\tresults.txt\n' "$(git hash-object -w results.txt)" | git mktree)
+          commit=$(git commit-tree "$tree" -m imaged)
+          git push -f origin "$commit:refs/heads/diag-winfsp-bench-land-results-imaged-${{ matrix.runner }}"
