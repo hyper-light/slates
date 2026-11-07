@@ -1,0 +1,60 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 07:08:27 UTC 2026, arm B a1c9e44b3aaeb64571a57838db360bd2091a9adc
+== quiet round 1 arm a at 07:08:27, load 1.81 2.64 1.56
+live laggard: {"appended": 183, "durable": 182, "install_bytes": 15285, "install_sent": 3, "no_session": 1, "resolved": 181, "whole": 3}; then Some(("182", "182", "false")) [Some(("182", "none", "false")), Some(("182", "none", "false"))]
+thread 'a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log' (10290) panicked at crates/cli/tests/live_fleet.rs:1222:3:
+test a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 1.28s
+  8392 writes, 8392 acknowledged: p50 590 us, p99 7786 us, p999 22962 us, max 582701 us; 5 over 50ms (sent+took): 0.00s+124ms 3.27s+60ms 4.32s+54ms 6.39s+55ms 6.45s+583ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 12.42s
+  8107 writes, 8107 acknowledged: p50 343 us, p99 652 us, p999 71544 us, max 957366 us; 10 over 50ms (sent+took): 0.00s+138ms 0.17s+174ms 2.25s+72ms 2.36s+206ms 2.56s+120ms 3.33s+51ms 3.74s+494ms 4.24s+930ms 5.17s+957ms 6.13s+272ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 9.08s
+== quiet round 1 arm a exit 101
+== quiet round 1 arm b at 07:08:50, load 2.39 2.73 1.61
+live laggard: {"appended": 181, "durable": 181, "install_bytes": 5095, "install_image": 1, "install_sent": 1, "no_session": 1, "resolved": 181, "whole": 1}; then Some(("180", "180", "false")) [Some(("180", "none", "false")), Some(("180", "none", "false"))]
+test a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 2.31s
+  12070 writes, 12070 acknowledged: p50 513 us, p99 5150 us, p999 30252 us, max 192204 us; 5 over 50ms (sent+took): 0.00s+192ms 2.09s+63ms 3.18s+50ms 5.23s+56ms 7.34s+52ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 11.72s
+  each healed candidate caught up within the bound: 1 violations
+  9252 writes, 9252 acknowledged: p50 342 us, p99 5619 us, p999 39524 us, max 532850 us; 7 over 50ms (sent+took): 0.00s+119ms 2.12s+94ms 2.21s+73ms 2.33s+174ms 3.23s+103ms 3.76s+533ms 7.49s+242ms
+thread 'candidates_partitioned_in_turn_mid_stream_lose_nothing' (13131) panicked at crates/cli/tests/live_chaos.rs:990:5:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 11.46s
+== quiet round 1 arm b exit 101
+== quiet round 2 arm b at 07:09:16, load 2.63 2.77 1.66
+live laggard: {"appended": 181, "durable": 181, "install_bytes": 10190, "install_image": 2, "install_sent": 2, "no_session": 1, "resolved": 181, "whole": 1}; then Some(("180", "180", "false")) [Some(("180", "none", "false")), Some(("180", "none", "false"))]
+test a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 1.26s
+  7952 writes, 7952 acknowledged: p50 609 us, p99 6715 us, p999 22349 us, max 144049 us; 2 over 50ms (sent+took): 0.00s+144ms 2.04s+77ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 11.57s
+  5092 writes, 5092 acknowledged: p50 426 us, p99 3606 us, p999 138078 us, max 247653 us; 14 over 50ms (sent+took): 0.00s+136ms 1.20s+51ms 2.04s+63ms 2.10s+199ms 3.42s+160ms 3.58s+95ms 3.68s+93ms 3.77s+138ms 3.91s+94ms 4.00s+140ms 4.14s+95ms 4.24s+93ms 4.33s+146ms 4.47s+248ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 6.51s
+== quiet round 2 arm b exit 0
+== quiet round 2 arm a at 07:09:36, load 3.00 2.85 1.71
+live laggard: {"appended": 182, "durable": 182, "install_bytes": 5095, "install_sent": 1, "no_session": 1, "resolved": 181, "whole": 2}; then Some(("181", "181", "false")) [Some(("181", "none", "false")), Some(("181", "none", "false"))]
+thread 'a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log' (15261) panicked at crates/cli/tests/live_fleet.rs:1222:3:
+test a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 1.52s
+  10756 writes, 10756 acknowledged: p50 556 us, p99 3494 us, p999 29035 us, max 756898 us; 4 over 50ms (sent+took): 0.00s+141ms 2.17s+56ms 3.18s+56ms 8.40s+757ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 13.05s
+  4819 writes, 4819 acknowledged: p50 490 us, p99 10191 us, p999 59884 us, max 236192 us; 5 over 50ms (sent+took): 0.01s+126ms 0.62s+60ms 2.32s+94ms 2.43s+154ms 3.67s+236ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 7.49s
+== quiet round 2 arm a exit 101
+== quiet round 3 arm a at 07:09:58, load 3.06 2.87 1.75
+live laggard: {"appended": 182, "durable": 182, "install_bytes": 5095, "install_sent": 1, "no_session": 1, "resolved": 181, "whole": 2}; then Some(("181", "181", "false")) [Some(("181", "none", "false")), Some(("181", "none", "false"))]
+thread 'a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log' (16842) panicked at crates/cli/tests/live_fleet.rs:1222:3:
+test a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 1.34s
+  12039 writes, 12039 acknowledged: p50 559 us, p99 3538 us, p999 18542 us, max 266278 us; 3 over 50ms (sent+took): 0.00s+123ms 3.07s+68ms 3.15s+266ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 11.75s
+  5108 writes, 5108 acknowledged: p50 440 us, p99 4243 us, p999 124324 us, max 251719 us; 14 over 50ms (sent+took): 0.00s+161ms 1.22s+135ms 2.16s+77ms 2.50s+124ms 3.66s+252ms 3.97s+57ms 4.03s+139ms 4.16s+94ms 4.26s+93ms 4.35s+92ms 4.44s+93ms 4.54s+100ms 4.64s+227ms 4.86s+115ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 7.55s
+== quiet round 3 arm a exit 101
+== quiet round 3 arm b at 07:10:19, load 3.17 2.92 1.79
+live laggard: {"appended": 181, "durable": 181, "install_bytes": 5095, "install_image": 1, "install_sent": 1, "no_session": 1, "resolved": 181, "whole": 1}; then Some(("180", "180", "false")) [Some(("180", "none", "false")), Some(("180", "none", "false"))]
+test a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 1.20s
+  16444 writes, 16444 acknowledged: p50 460 us, p99 2874 us, p999 12681 us, max 130362 us; 4 over 50ms (sent+took): 0.00s+130ms 5.07s+51ms 6.14s+50ms 8.18s+96ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 12.04s
+  2985 writes, 2985 acknowledged: p50 954 us, p99 14725 us, p999 53797 us, max 119782 us; 3 over 50ms (sent+took): 0.00s+120ms 2.10s+54ms 5.16s+59ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 7.06s
+== quiet round 3 arm b exit 0
