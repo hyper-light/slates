@@ -1,0 +1,297 @@
+runner ubuntu-latest, 4 CPUs, 1cf2eba diag: liveness-13 on 52c91447: the anchor suite x3, held_rendezvous x3 o, Sat Nov  7 08:25:02 UTC 2026
+== spinners: 8
+test profile::tests::a_profile_whose_wake_was_not_measured_is_refused ... ok
+test process_clock::tests::a_process_that_runs_shows_its_cpu_rise ... ok
+test process_clock::tests::a_stopped_process_comes_to_rest ... ok
+test wake::tests::a_probe_whose_waiter_runs_measures_past_the_wall_and_one_whose_waiter_never_runs_refuses ... ok
+test wake::tests::a_round_past_the_wall_gets_a_window_and_doubles_to_the_longest_round ... ok
+test wake::tests::a_probe_that_measured_no_wake_refuses_rather_than_report_a_mean ... ok
+test wake::tests::rounds_in_two_modes_disagree_and_rounds_of_one_do_not ... ok
+test wake::tests::the_estimate_window_follows_the_probes_spread ... ok
+test wake::tests::the_online_estimate_tracks_the_mean_without_rounding_drift ... ok
+test wake::tests::the_pairs_follow_the_runtimes_shard_placement ... ok
+test wake::tests::a_budget_too_short_for_its_rounds_extends_to_the_full_probe_budget ... ok
+test wake::tests::a_wake_is_a_confirmed_sleepers_wake_on_the_production_placement ... ok
+test profile::tests::a_refused_wake_re_measure_keeps_the_measured_wake ... ok
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 49 filtered out; finished in 0.40s
+== machine exit 0 in 1 s, load 3.34
+test handles::tests::a_changed_message_is_refused_before_a_handle_is_selected ... ok
+test handles::tests::a_hold_encodes_to_its_golden_bytes ... ok
+test handles::tests::a_hold_outside_the_shapes_is_refused_at_encoding ... ok
+test handles::tests::a_refusal_is_logged_once_and_the_lines_stay_bounded ... ok
+test handles::tests::every_message_round_trips ... ok
+test handles::tests::hostile_environments_are_refused ... ok
+test handles::tests::hostile_messages_are_refused ... ok
+test handles::tests::one_inherited_handle_cannot_have_two_owners ... ok
+test handles::tests::the_environment_round_trips ... ok
+test held::tests::a_connection_hold_and_its_release_cross_the_channel_in_order ... ok
+test held::tests::a_copy_hold_and_its_release_cross_the_channel ... ok
+test held::tests::a_hold_a_session_and_a_release_cross_the_channel_whole_and_in_order ... ok
+test held::tests::a_message_with_the_wrong_descriptors_or_session_is_refused ... ok
+test held::tests::an_unknown_kind_or_an_oversized_session_is_refused ... ok
+test held::tests::held_connections_keep_their_own_bound ... ok
+test held::tests::held_copies_keep_their_own_bound ... ok
+test held::tests::held_devices_keep_their_bound_and_ignore_what_they_do_not_hold ... ok
+test held::tests::malformed_connection_handoffs_are_refused ... ok
+test held::tests::malformed_copy_handoffs_are_refused ... ok
+test held::tests::malformed_environment_handoffs_are_refused ... ok
+test held::tests::the_connections_handoff_round_trips ... ok
+test held::tests::the_copies_handoff_round_trips ... ok
+test held::tests::the_environment_handoff_round_trips ... ok
+test layout::tests::every_region_is_found_at_its_place_in_the_layout_and_no_other ... ok
+test layout::tests::regions_are_page_aligned_and_disjoint_and_the_geometry_round_trips ... ok
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test a_crash_loop_is_restarted_after_a_doubling_backoff_never_given_up ... 
+test a_crashing_daemon_is_restarted_until_the_derived_bound_and_the_segment_says_so ... 
+test a_daemon_that_never_acknowledges_a_stop_is_killed_after_the_liveness_budget ... 
+test a_daemon_whose_heartbeat_lapses_while_stopping_is_killed_before_its_declared_deadline ... 
+test a_delayed_child_and_its_restart_beat_in_the_anchors_clock_domain ... 
+test a_device_a_daemon_sent_is_held_across_its_restart_and_handed_to_its_successor ... 
+test a_graceful_stop_waits_for_the_daemon_to_drain_and_exit_without_a_kill ... 
+test a_pool_extent_is_claimed_by_one_partition_and_released_only_by_it ... ok
+test a_published_sealing_root_is_adopted_by_a_later_attachment ... ok
+test a_segment_is_created_attached_and_read_through_the_seqlock ... ok
+test a_segment_with_process_relative_deadlines_is_refused_before_recovery ... ok
+test deaf_stopping_child ... ignored, a stopping child; run by a_daemon_that_never_acknowledges_... with --ignored
+test device_child ... ignored, the device-handoff child; run by the parent with --ignored
+test device_garbler ... ignored, the garbling daemon of the device-refusal fixture; run by the anchor role with --ignored
+test device_refusals_anchor ... ignored, the anchor of the device-refusal fixture; run by the parent with --ignored
+test every_bad_device_message_is_counted_and_the_log_says_each_kind_once ... ok
+test graceful_stopping_child ... ignored, a stopping child; run by a_graceful_stop_... with --ignored
+test host_clock_heartbeat_child ... ignored, heartbeat child; invoked by the supervision history
+test nfs_listener_child ... ignored, the NFS-listener-inheritance child; run by the parent with --ignored
+test oversize_payloads_foreign_identities_and_wrong_lengths_are_refused ... ok
+test racing_claimants_take_each_pool_extent_exactly_once_and_the_claims_outlive_the_mapping ... ok
+test supervised_child ... ignored, the supervised child; run by a_crashing_daemon_... with --ignored
+test the_content_object_survives_a_daemon_restart_through_the_handoff ... ok
+test the_restart_policy_derives_from_the_recovery_budget ... ok
+test the_supervised_child_inherits_the_held_nfs_listener ... 
+test wedged_stopping_child ... ignored, a stopping child; run by a_daemon_whose_heartbeat_lapses_... with --ignored
+test result: ok. 17 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out; finished in 0.95s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== anchor run 1 exit 0 in 1 s, load 3.34
+test handles::tests::a_changed_message_is_refused_before_a_handle_is_selected ... ok
+test handles::tests::a_hold_encodes_to_its_golden_bytes ... ok
+test handles::tests::a_hold_outside_the_shapes_is_refused_at_encoding ... ok
+test handles::tests::a_refusal_is_logged_once_and_the_lines_stay_bounded ... ok
+test handles::tests::every_message_round_trips ... ok
+test handles::tests::hostile_environments_are_refused ... ok
+test handles::tests::hostile_messages_are_refused ... ok
+test handles::tests::one_inherited_handle_cannot_have_two_owners ... ok
+test handles::tests::the_environment_round_trips ... ok
+test held::tests::a_connection_hold_and_its_release_cross_the_channel_in_order ... ok
+test held::tests::a_copy_hold_and_its_release_cross_the_channel ... ok
+test held::tests::a_hold_a_session_and_a_release_cross_the_channel_whole_and_in_order ... ok
+test held::tests::a_message_with_the_wrong_descriptors_or_session_is_refused ... ok
+test held::tests::an_unknown_kind_or_an_oversized_session_is_refused ... ok
+test held::tests::held_connections_keep_their_own_bound ... ok
+test held::tests::held_copies_keep_their_own_bound ... ok
+test held::tests::held_devices_keep_their_bound_and_ignore_what_they_do_not_hold ... ok
+test held::tests::malformed_connection_handoffs_are_refused ... ok
+test held::tests::malformed_copy_handoffs_are_refused ... ok
+test held::tests::malformed_environment_handoffs_are_refused ... ok
+test held::tests::the_connections_handoff_round_trips ... ok
+test held::tests::the_copies_handoff_round_trips ... ok
+test held::tests::the_environment_handoff_round_trips ... ok
+test layout::tests::every_region_is_found_at_its_place_in_the_layout_and_no_other ... ok
+test layout::tests::regions_are_page_aligned_and_disjoint_and_the_geometry_round_trips ... ok
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test a_crash_loop_is_restarted_after_a_doubling_backoff_never_given_up ... 
+test a_crashing_daemon_is_restarted_until_the_derived_bound_and_the_segment_says_so ... 
+test a_daemon_that_never_acknowledges_a_stop_is_killed_after_the_liveness_budget ... 
+test a_daemon_whose_heartbeat_lapses_while_stopping_is_killed_before_its_declared_deadline ... 
+test a_delayed_child_and_its_restart_beat_in_the_anchors_clock_domain ... 
+test a_device_a_daemon_sent_is_held_across_its_restart_and_handed_to_its_successor ... 
+test a_graceful_stop_waits_for_the_daemon_to_drain_and_exit_without_a_kill ... 
+test a_pool_extent_is_claimed_by_one_partition_and_released_only_by_it ... ok
+test a_published_sealing_root_is_adopted_by_a_later_attachment ... ok
+test a_segment_is_created_attached_and_read_through_the_seqlock ... ok
+test a_segment_with_process_relative_deadlines_is_refused_before_recovery ... ok
+test deaf_stopping_child ... ignored, a stopping child; run by a_daemon_that_never_acknowledges_... with --ignored
+test device_child ... ignored, the device-handoff child; run by the parent with --ignored
+test device_garbler ... ignored, the garbling daemon of the device-refusal fixture; run by the anchor role with --ignored
+test device_refusals_anchor ... ignored, the anchor of the device-refusal fixture; run by the parent with --ignored
+test every_bad_device_message_is_counted_and_the_log_says_each_kind_once ... ok
+test graceful_stopping_child ... ignored, a stopping child; run by a_graceful_stop_... with --ignored
+test host_clock_heartbeat_child ... ignored, heartbeat child; invoked by the supervision history
+test nfs_listener_child ... ignored, the NFS-listener-inheritance child; run by the parent with --ignored
+test oversize_payloads_foreign_identities_and_wrong_lengths_are_refused ... ok
+test racing_claimants_take_each_pool_extent_exactly_once_and_the_claims_outlive_the_mapping ... ok
+test supervised_child ... ignored, the supervised child; run by a_crashing_daemon_... with --ignored
+test the_content_object_survives_a_daemon_restart_through_the_handoff ... ok
+test the_restart_policy_derives_from_the_recovery_budget ... ok
+test the_supervised_child_inherits_the_held_nfs_listener ... 
+test wedged_stopping_child ... ignored, a stopping child; run by a_daemon_whose_heartbeat_lapses_... with --ignored
+test result: ok. 17 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out; finished in 0.96s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== anchor run 2 exit 0 in 1 s, load 3.34
+test handles::tests::a_changed_message_is_refused_before_a_handle_is_selected ... ok
+test handles::tests::a_hold_encodes_to_its_golden_bytes ... ok
+test handles::tests::a_hold_outside_the_shapes_is_refused_at_encoding ... ok
+test handles::tests::a_refusal_is_logged_once_and_the_lines_stay_bounded ... ok
+test handles::tests::every_message_round_trips ... ok
+test handles::tests::hostile_environments_are_refused ... ok
+test handles::tests::hostile_messages_are_refused ... ok
+test handles::tests::one_inherited_handle_cannot_have_two_owners ... ok
+test handles::tests::the_environment_round_trips ... ok
+test held::tests::a_connection_hold_and_its_release_cross_the_channel_in_order ... ok
+test held::tests::a_copy_hold_and_its_release_cross_the_channel ... ok
+test held::tests::a_hold_a_session_and_a_release_cross_the_channel_whole_and_in_order ... ok
+test held::tests::a_message_with_the_wrong_descriptors_or_session_is_refused ... ok
+test held::tests::an_unknown_kind_or_an_oversized_session_is_refused ... ok
+test held::tests::held_connections_keep_their_own_bound ... ok
+test held::tests::held_copies_keep_their_own_bound ... ok
+test held::tests::held_devices_keep_their_bound_and_ignore_what_they_do_not_hold ... ok
+test held::tests::malformed_connection_handoffs_are_refused ... ok
+test held::tests::malformed_copy_handoffs_are_refused ... ok
+test held::tests::malformed_environment_handoffs_are_refused ... ok
+test held::tests::the_connections_handoff_round_trips ... ok
+test held::tests::the_copies_handoff_round_trips ... ok
+test held::tests::the_environment_handoff_round_trips ... ok
+test layout::tests::every_region_is_found_at_its_place_in_the_layout_and_no_other ... ok
+test layout::tests::regions_are_page_aligned_and_disjoint_and_the_geometry_round_trips ... ok
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test a_crash_loop_is_restarted_after_a_doubling_backoff_never_given_up ... 
+test a_crashing_daemon_is_restarted_until_the_derived_bound_and_the_segment_says_so ... 
+test a_daemon_that_never_acknowledges_a_stop_is_killed_after_the_liveness_budget ... 
+test a_daemon_whose_heartbeat_lapses_while_stopping_is_killed_before_its_declared_deadline ... 
+test a_delayed_child_and_its_restart_beat_in_the_anchors_clock_domain ... 
+test a_device_a_daemon_sent_is_held_across_its_restart_and_handed_to_its_successor ... 
+test a_graceful_stop_waits_for_the_daemon_to_drain_and_exit_without_a_kill ... 
+test a_pool_extent_is_claimed_by_one_partition_and_released_only_by_it ... ok
+test a_published_sealing_root_is_adopted_by_a_later_attachment ... ok
+test a_segment_is_created_attached_and_read_through_the_seqlock ... ok
+test a_segment_with_process_relative_deadlines_is_refused_before_recovery ... ok
+test deaf_stopping_child ... ignored, a stopping child; run by a_daemon_that_never_acknowledges_... with --ignored
+test device_child ... ignored, the device-handoff child; run by the parent with --ignored
+test device_garbler ... ignored, the garbling daemon of the device-refusal fixture; run by the anchor role with --ignored
+test device_refusals_anchor ... ignored, the anchor of the device-refusal fixture; run by the parent with --ignored
+test every_bad_device_message_is_counted_and_the_log_says_each_kind_once ... ok
+test graceful_stopping_child ... ignored, a stopping child; run by a_graceful_stop_... with --ignored
+test host_clock_heartbeat_child ... ignored, heartbeat child; invoked by the supervision history
+test nfs_listener_child ... ignored, the NFS-listener-inheritance child; run by the parent with --ignored
+test oversize_payloads_foreign_identities_and_wrong_lengths_are_refused ... ok
+test racing_claimants_take_each_pool_extent_exactly_once_and_the_claims_outlive_the_mapping ... ok
+test supervised_child ... ignored, the supervised child; run by a_crashing_daemon_... with --ignored
+test the_content_object_survives_a_daemon_restart_through_the_handoff ... ok
+test the_restart_policy_derives_from_the_recovery_budget ... ok
+test the_supervised_child_inherits_the_held_nfs_listener ... 
+test wedged_stopping_child ... ignored, a stopping child; run by a_daemon_whose_heartbeat_lapses_... with --ignored
+test result: ok. 17 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out; finished in 0.96s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== anchor run 3 exit 0 in 1 s, load 3.34
+test a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon ... held rendezvous: 6 connects at a kill, all answered by the next daemon, longest 93.898846ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.11s
+== held_rendezvous exit 0 in 4 s, load 4.03
+test a_daemon_killed_after_its_anchors_executable_is_replaced_restarts_from_the_anchors_own_image ... slates anchor: instance cli-replaced-exe-6503 up; daemon pid 6517; 2 shards
+slates anchor: daemon exited (None); restarted as pid 6545 (1 in the window)
+test a_fleet_node_under_its_anchor_keeps_its_serve_ports_across_a_daemon_restart ... slates anchor: instance cli-fleet-anchor-6503 up; daemon pid 6579; 2 shards
+slates anchor: daemon exited (None); restarted as pid 6586 (1 in the window)
+test a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted ... slates anchor: instance cli-frozen-6503 up; daemon pid 6604; 2 shards
+slates anchor: the daemon's heartbeat lapsed (1003 ms old, past 1000 ms: the 1000 ms window plus this anchor's lateness p99 of 0 ms over 6 waits); killing it
+slates anchor: daemon exited (None); restarted as pid 6632 (1 in the window)
+frozen daemon: replaced after 994.399602ms; the anchor's beat was 1.003s old against its 1s bound
+test a_fuse_mount_whose_daemon_was_killed_is_ended_by_the_restarted_daemon ... SKIP: this kernel resends FUSE requests (Linux 6.9+), so the mount survives the kill (A-61)
+test a_locked_volume_locks_only_its_own_content_across_a_restart_or_is_refused_with_nothing_locked ... slates anchor: instance cli-locked-6503 up; daemon pid 6652; 2 shards
+slates anchor: daemon exited (None); restarted as pid 6691 (1 in the window)
+test a_real_anchors_hold_refusals_show_in_slates_status ... 
+test a_starved_start_that_makes_progress_is_not_killed ... slates anchor: instance cli-starved-6503 up; daemon pid 6728; 2 shards
+slates anchor: daemon exited (None); restarted as pid 6756 (1 in the window)
+test a_store_made_after_a_refetch_lands_through_a_mount_taken_over_by_a_restarted_daemon ... slates anchor: instance cli-maptakeover-6503 up; daemon pid 6778; 2 shards
+slates anchor: daemon exited (None); restarted as pid 6810 (1 in the window)
+test a_stuck_start_is_killed_and_restarted ... slates anchor: instance cli-stuck-start-6503 up; daemon pid 6836; 2 shards
+slates anchor: daemon exited (None); restarted as pid 6864 (1 in the window)
+slates anchor: the starting daemon (pid 6864) made no progress for 1002 ms (the 1000 ms liveness window); killing it
+slates anchor: daemon exited (None); restarted as pid 6868 (1 in the window)
+test an_anchor_whose_log_reader_went_away_keeps_supervising ... slates anchor: instance cli-closed-log-6503 up; daemon pid 6885; 2 shards
+test an_anchored_node_serves_its_export_over_rpc_with_tls_across_a_daemon_restart ... slates anchor: instance cli-fleet-export-6503 up; daemon pid 6940; 2 shards
+slates anchor: daemon exited (None); restarted as pid 6947 (1 in the window)
+test recovery_approval_is_bound_to_the_reviewed_plan_and_anchor_issuer ... skipping named anchor issuer surface on Linux: exercised by the provisioned recovery key test
+test the_anchor_and_its_daemon_exclude_themselves_from_core_dumps ... slates anchor: instance cli-dumps-6503 up; daemon pid 6969; 2 shards
+test the_anchor_supervises_a_daemon_the_verbs_answer_and_the_daemon_leaves_with_the_anchor ... slates anchor: instance cli-6503 up; daemon pid 7006; 2 shards
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 69 filtered out; finished in 17.44s
+== cli restart exit 0 in 18 s, load 5.81
+test a_daemon_killed_after_its_anchors_executable_is_replaced_restarts_from_the_anchors_own_image ... slates anchor: instance cli-replaced-exe-7074 up; daemon pid 7088; 2 shards
+slates anchor: daemon exited (None); restarted as pid 7116 (1 in the window)
+test a_fleet_node_under_its_anchor_keeps_its_serve_ports_across_a_daemon_restart ... slates anchor: instance cli-fleet-anchor-7074 up; daemon pid 7148; 2 shards
+slates anchor: daemon exited (None); restarted as pid 7155 (1 in the window)
+test a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted ... slates anchor: instance cli-frozen-7074 up; daemon pid 7173; 2 shards
+slates anchor: the daemon's heartbeat lapsed (1002 ms old, past 1001 ms: the 1000 ms window plus this anchor's lateness p99 of 1 ms over 6 waits); killing it
+slates anchor: daemon exited (None); restarted as pid 7201 (1 in the window)
+frozen daemon: replaced after 1.093821232s; the anchor's beat was 1.002s old against its 1.001s bound
+test a_fuse_mount_whose_daemon_was_killed_is_ended_by_the_restarted_daemon ... SKIP: this kernel resends FUSE requests (Linux 6.9+), so the mount survives the kill (A-61)
+test a_locked_volume_locks_only_its_own_content_across_a_restart_or_is_refused_with_nothing_locked ... slates anchor: instance cli-locked-7074 up; daemon pid 7221; 2 shards
+slates anchor: daemon exited (None); restarted as pid 7261 (1 in the window)
+test a_restored_mounts_counted_files_are_tracked_from_its_start_past_the_journals_reach ... slates anchor: instance cli-restoredstart-7074 up; daemon pid 7282; 2 shards
+slates anchor: daemon exited (None); restarted as pid 7317 (1 in the window)
+test a_starved_start_that_makes_progress_is_not_killed ... slates anchor: instance cli-starved-7074 up; daemon pid 7440; 2 shards
+slates anchor: daemon exited (None); restarted as pid 7468 (1 in the window)
+test a_store_made_after_a_refetch_lands_through_a_mount_taken_over_by_a_restarted_daemon ... slates anchor: instance cli-maptakeover-7074 up; daemon pid 7492; 2 shards
+slates anchor: daemon exited (None); restarted as pid 7524 (1 in the window)
+test a_stuck_start_is_killed_and_restarted ... slates anchor: instance cli-stuck-start-7074 up; daemon pid 7550; 2 shards
+slates anchor: daemon exited (None); restarted as pid 7578 (1 in the window)
+slates anchor: the starting daemon (pid 7578) made no progress for 1005 ms (the 1000 ms liveness window); killing it
+slates anchor: daemon exited (None); restarted as pid 7582 (1 in the window)
+test an_anchored_node_serves_its_export_over_rpc_with_tls_across_a_daemon_restart ... slates anchor: instance cli-fleet-export-7074 up; daemon pid 7611; 2 shards
+slates anchor: daemon exited (None); restarted as pid 7618 (1 in the window)
+test every_fuse_mount_is_a_journal_reader_from_its_start_to_its_end ... slates anchor: instance cli-fuse-readers-7074 up; daemon pid 7641; 2 shards
+slates anchor: daemon exited (None); restarted as pid 7682 (1 in the window)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 72 filtered out; finished in 18.44s
+== start judgment run 1 exit 0 in 18 s, load 6.82
+test a_daemon_killed_after_its_anchors_executable_is_replaced_restarts_from_the_anchors_own_image ... slates anchor: instance cli-replaced-exe-7714 up; daemon pid 7728; 2 shards
+slates anchor: daemon exited (None); restarted as pid 7757 (1 in the window)
+test a_fleet_node_under_its_anchor_keeps_its_serve_ports_across_a_daemon_restart ... slates anchor: instance cli-fleet-anchor-7714 up; daemon pid 7790; 2 shards
+slates anchor: daemon exited (None); restarted as pid 7796 (1 in the window)
+test a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted ... slates anchor: instance cli-frozen-7714 up; daemon pid 7814; 2 shards
+slates anchor: the daemon's heartbeat lapsed (1000 ms old, past 1000 ms: the 1000 ms window plus this anchor's lateness p99 of 0 ms over 6 waits); killing it
+slates anchor: daemon exited (None); restarted as pid 7843 (1 in the window)
+frozen daemon: replaced after 981.707888ms; the anchor's beat was 1s old against its 1s bound
+test a_fuse_mount_whose_daemon_was_killed_is_ended_by_the_restarted_daemon ... SKIP: this kernel resends FUSE requests (Linux 6.9+), so the mount survives the kill (A-61)
+test a_locked_volume_locks_only_its_own_content_across_a_restart_or_is_refused_with_nothing_locked ... slates anchor: instance cli-locked-7714 up; daemon pid 7863; 2 shards
+slates anchor: daemon exited (None); restarted as pid 7902 (1 in the window)
+test a_restored_mounts_counted_files_are_tracked_from_its_start_past_the_journals_reach ... slates anchor: instance cli-restoredstart-7714 up; daemon pid 7923; 2 shards
+slates anchor: daemon exited (None); restarted as pid 7962 (1 in the window)
+test a_starved_start_that_makes_progress_is_not_killed ... slates anchor: instance cli-starved-7714 up; daemon pid 8084; 2 shards
+slates anchor: daemon exited (None); restarted as pid 8112 (1 in the window)
+test a_store_made_after_a_refetch_lands_through_a_mount_taken_over_by_a_restarted_daemon ... slates anchor: instance cli-maptakeover-7714 up; daemon pid 8148; 2 shards
+slates anchor: daemon exited (None); restarted as pid 8180 (1 in the window)
+test a_stuck_start_is_killed_and_restarted ... slates anchor: instance cli-stuck-start-7714 up; daemon pid 8206; 2 shards
+slates anchor: daemon exited (None); restarted as pid 8234 (1 in the window)
+slates anchor: the starting daemon (pid 8234) made no progress for 1004 ms (the 1000 ms liveness window); killing it
+slates anchor: daemon exited (None); restarted as pid 8238 (1 in the window)
+test an_anchored_node_serves_its_export_over_rpc_with_tls_across_a_daemon_restart ... slates anchor: instance cli-fleet-export-7714 up; daemon pid 8272; 2 shards
+slates anchor: daemon exited (None); restarted as pid 8279 (1 in the window)
+test every_fuse_mount_is_a_journal_reader_from_its_start_to_its_end ... slates anchor: instance cli-fuse-readers-7714 up; daemon pid 8303; 2 shards
+slates anchor: daemon exited (None); restarted as pid 8349 (1 in the window)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 72 filtered out; finished in 18.42s
+== start judgment run 2 exit 0 in 19 s, load 7.49
+test a_daemon_killed_after_its_anchors_executable_is_replaced_restarts_from_the_anchors_own_image ... slates anchor: instance cli-replaced-exe-8381 up; daemon pid 8395; 2 shards
+slates anchor: daemon exited (None); restarted as pid 8423 (1 in the window)
+test a_fleet_node_under_its_anchor_keeps_its_serve_ports_across_a_daemon_restart ... slates anchor: instance cli-fleet-anchor-8381 up; daemon pid 8457; 2 shards
+slates anchor: daemon exited (None); restarted as pid 8464 (1 in the window)
+test a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted ... slates anchor: instance cli-frozen-8381 up; daemon pid 8482; 2 shards
+slates anchor: the daemon's heartbeat lapsed (1000 ms old, past 1000 ms: the 1000 ms window plus this anchor's lateness p99 of 0 ms over 6 waits); killing it
+slates anchor: daemon exited (None); restarted as pid 8510 (1 in the window)
+frozen daemon: replaced after 985.149008ms; the anchor's beat was 1s old against its 1s bound
+test a_fuse_mount_whose_daemon_was_killed_is_ended_by_the_restarted_daemon ... SKIP: this kernel resends FUSE requests (Linux 6.9+), so the mount survives the kill (A-61)
+test a_locked_volume_locks_only_its_own_content_across_a_restart_or_is_refused_with_nothing_locked ... slates anchor: instance cli-locked-8381 up; daemon pid 8530; 2 shards
+slates anchor: daemon exited (None); restarted as pid 8569 (1 in the window)
+test a_restored_mounts_counted_files_are_tracked_from_its_start_past_the_journals_reach ... slates anchor: instance cli-restoredstart-8381 up; daemon pid 8590; 2 shards
+slates anchor: daemon exited (None); restarted as pid 8624 (1 in the window)
+test a_starved_start_that_makes_progress_is_not_killed ... slates anchor: instance cli-starved-8381 up; daemon pid 8746; 2 shards
+slates anchor: daemon exited (None); restarted as pid 8774 (1 in the window)
+test a_store_made_after_a_refetch_lands_through_a_mount_taken_over_by_a_restarted_daemon ... slates anchor: instance cli-maptakeover-8381 up; daemon pid 8796; 2 shards
+slates anchor: daemon exited (None); restarted as pid 8828 (1 in the window)
+test a_stuck_start_is_killed_and_restarted ... slates anchor: instance cli-stuck-start-8381 up; daemon pid 8855; 2 shards
+slates anchor: daemon exited (None); restarted as pid 8883 (1 in the window)
+slates anchor: the starting daemon (pid 8883) made no progress for 1003 ms (the 1000 ms liveness window); killing it
+slates anchor: daemon exited (None); restarted as pid 8886 (1 in the window)
+test an_anchored_node_serves_its_export_over_rpc_with_tls_across_a_daemon_restart ... slates anchor: instance cli-fleet-export-8381 up; daemon pid 8918; 2 shards
+slates anchor: daemon exited (None); restarted as pid 8925 (1 in the window)
+test every_fuse_mount_is_a_journal_reader_from_its_start_to_its_end ... slates anchor: instance cli-fuse-readers-8381 up; daemon pid 8948; 2 shards
+slates anchor: daemon exited (None); restarted as pid 8989 (1 in the window)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 72 filtered out; finished in 18.09s
+== start judgment run 3 exit 0 in 18 s, load 8.24
