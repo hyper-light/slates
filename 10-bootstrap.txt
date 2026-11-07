@@ -1,0 +1,4 @@
+=== rejoin-1 exit 0 load { 17.23 12.48 5.84 }
+rejoins: successor daemon 12616 answered after 55.798333ms
+rejoins: the fleet re-formed after 407.824208ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 16 filtered out; finished in 5.70s
