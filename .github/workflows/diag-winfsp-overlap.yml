@@ -1,0 +1,123 @@
+name: DIAG the purge intent's red check -- the idle-purge test at its own commit and at the fix, and the live suites at the fix (not for main)
+
+# GAPS, "A private purge's intent waited up to the 1 s transaction timeout" (agents/winfsp-overlap-17 on main ecb86b4f).
+# - red: purges_the_kernel_refuses_on_an_idle_drive_do_not_wait_out_the_transaction_timeout at c81bd21f, the test alone:
+#   it must fail, the round taking at least the idle receive's 1 s transaction timeout.
+# - fix: at 74527f64 the same test must pass, and the bridge's and the CLI's live WinFsp suites with it, since a
+#   cancelled receive now reads as an empty one.
+# Derived: each step times out at three times diag-20's whole live step on the slower runner (4 min 52 s on
+# windows-latest, run 42130583401): 14.6 minutes, so 15.
+
+on:
+  push:
+    branches: ['diag-winfsp-overlap-[0-9]*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  RED_COMMIT: c81bd21fe0640ebce595b0d1e0ef5afdd8f5d2bd
+  FIX_COMMIT: 74527f6439b8f6afc5616ba8761496a1d73d9280
+  WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+  WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+
+jobs:
+  purge:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, windows-11-arm]
+        commit: [red, fix]
+        include:
+          - runner: windows-latest
+            msvc: x64
+          - runner: windows-11-arm
+            msvc: arm64
+    name: purge intent at ${{ matrix.commit }} on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.commit == 'red' && env.RED_COMMIT || env.FIX_COMMIT }}
+      - name: The results publisher
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/publish.sh" <<'EOF'
+          #!/bin/bash
+          # One commit per call on the results branch; a failed publish is reported and does not end the job.
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          cd "$GITHUB_WORKSPACE" || exit 0
+          touch ab.txt live.txt clippy.txt mount.txt
+          ab=$(git hash-object -w ab.txt) || exit 0
+          live=$(git hash-object -w live.txt) || exit 0
+          lint=$(git hash-object -w clippy.txt) || exit 0
+          mount=$(git hash-object -w mount.txt) || exit 0
+          tree=$(printf '100644 blob %s\tab.txt\n100644 blob %s\tclippy.txt\n100644 blob %s\tlive.txt\n100644 blob %s\tmount.txt\n' "$ab" "$lint" "$live" "$mount" | git mktree) || exit 0
+          parent=$(cat "$RUNNER_TEMP/results-parent" 2>/dev/null || true)
+          commit=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "results of run $GITHUB_RUN_ID") || exit 0
+          if git push origin "$commit:refs/heads/$RESULTS_BRANCH"; then
+            echo "$commit" > "$RUNNER_TEMP/results-parent"
+          else
+            echo "::warning::could not publish the results"
+          fi
+          EOF
+          chmod +x "$RUNNER_TEMP/publish.sh"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64)
+        if: matrix.msvc == 'x64'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64)
+        if: matrix.msvc == 'arm64'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install WinFsp, pinned
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi
+          $found = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
+          $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: The purge intent's tests
+        timeout-minutes: 15
+        shell: bash
+        env:
+          RESULTS_BRANCH: diag-winfsp-overlap-results-${{ github.run_id }}-purge-${{ matrix.commit }}-${{ matrix.runner }}
+        run: |
+          set +e
+          {
+            echo "# the purge intent at $(git rev-parse HEAD) (${{ matrix.commit }})"
+            if [ "${{ matrix.commit }}" = red ]; then
+              WINFSP_TEST_MOUNT=1 cargo test --locked -p slates-bridge-winfsp --lib -- --test-threads=1 --nocapture \
+                purges_the_kernel_refuses_on_an_idle_drive_do_not_wait_out_the_transaction_timeout
+              echo "## purge test, red, exit $?"
+            else
+              WINFSP_TEST_MOUNT=1 cargo test --locked -p slates-bridge-winfsp --lib -- --test-threads=1 --nocapture
+              echo "## bridge, fix, exit $?"
+              "$RUNNER_TEMP/publish.sh"
+              SLATES_TEST_CLI=1 WINFSP_TEST_MOUNT=1 cargo test --locked -p slates-cli --test winfsp -- --test-threads=1 --nocapture
+              echo "## cli, fix, exit $?"
+            fi
+          } 2>&1 | tee live.txt
+          "$RUNNER_TEMP/publish.sh"
+          if [ "${{ matrix.commit }}" = red ]; then
+            grep -q 'waiting out the idle receive' live.txt && grep -q '^## purge test, red, exit 101$' live.txt
+          else
+            grep -q 'WINFSP IDLE PURGE: 4 purges' live.txt && grep -c '^## .*, fix, exit 0$' live.txt | grep -qx 2
+          fi
