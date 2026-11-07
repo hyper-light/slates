@@ -96,6 +96,17 @@ struct Holder {
   alive: bool,
 }
 
+/// Whose reports phase one counts toward `f + 1` (A-240).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Counting {
+  /// The design: every reachable candidate is asked and fenced, and only reports from the holder set the superseded
+  /// shipper committed count.
+  Holders,
+  /// A mutation, the daemon before A-240: the first `f + 1` reachable candidates of the current configuration count,
+  /// whoever they are.
+  AnyCandidate,
+}
+
 /// What phase one does with a candidate that holds no copy of the log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EmptyReport {
@@ -163,6 +174,13 @@ struct Run {
   /// Phase one's reports counted from candidates that held no copy.
   empty_reports: u64,
   rule: EmptyReport,
+  /// Whose reports phase one counts ([`Counting`]).
+  counting: Counting,
+  /// Whether a fresh member may join the candidates when an owner is lost, as a replaced pod does under a fresh identity
+  /// (KIND runs 42326682216, 42331191530): it never held the log, and the shipper's holders never name it.
+  newcomers: bool,
+  /// The members that joined so.
+  joined: u64,
   /// Whether the history is printed as it happens ([`Run::traced`]): what each step did that bears on the invariants.
   traced: bool,
 }
@@ -219,8 +237,23 @@ impl Run {
       stale_refusals: 0,
       empty_reports: 0,
       rule,
+      counting: Counting::Holders,
+      newcomers: false,
+      joined: 0,
       traced: false,
     }
+  }
+
+  /// This run with phase one counting by `counting`.
+  fn counting(mut self, counting: Counting) -> Run {
+    self.counting = counting;
+    self
+  }
+
+  /// This run with fresh members joining the candidates at an owner's loss ([`Run::newcomers`]).
+  fn with_newcomers(mut self) -> Run {
+    self.newcomers = true;
+    self
   }
 
   /// This run with its history kept, for a failing seed's record.
@@ -437,10 +470,58 @@ impl Run {
     }
   }
 
+  /// The lost owner's replacement joins under a fresh identity, before phase one (half the time, when the run has
+  /// newcomers): a candidate of the configuration now, holding nothing of the log.
+  fn maybe_join_fresh_member(&mut self, old_host: HostId) {
+    if !self.newcomers || !self.rng.chance(500) {
+      return;
+    }
+    let fresh = HostId(self.hosts.iter().map(|host| host.0).max().unwrap_or(0) + 1);
+    self.hosts.push(fresh);
+    self.holders.insert(
+      fresh,
+      Holder {
+        replica: None,
+        configured: old_host,
+        state: Vec::new(),
+        alive: true,
+      },
+    );
+    self.joined += 1;
+    self.note(|| format!("host {} joins as a fresh member", fresh.0));
+  }
+
+  /// Phase one's hosts under the run's counting rule: those asked, and those whose reports count toward `f + 1`; `None`
+  /// when too few of them are reachable. Under A-240 every reachable candidate is asked and `f + 1` of the superseded
+  /// shipper's committed holders must answer; the mutation asks the first `f + 1` reachable candidates and counts them.
+  fn phase_one_hosts(
+    &self,
+    old: usize,
+    reachable: &[HostId],
+  ) -> Option<(Vec<HostId>, Vec<HostId>)> {
+    let needed = usize::try_from(self.f + 1).unwrap();
+    match self.counting {
+      Counting::Holders => {
+        // The holder set the superseded shipper committed (A-240): what phase one counts.
+        let committed: Vec<HostId> = self.owners[old].shipper.holders().to_vec();
+        let answering = reachable
+          .iter()
+          .filter(|host| committed.contains(host))
+          .count();
+        (answering >= needed).then(|| (reachable.to_vec(), committed))
+      }
+      Counting::AnyCandidate => {
+        let asked: Vec<HostId> = reachable.iter().copied().take(needed).collect();
+        (asked.len() >= needed).then(|| (asked.clone(), asked))
+      }
+    }
+  }
+
   /// Loses the current owner and takes it over: phase one over `f + 1` reachable live candidates under a new epoch.
   fn take_over(&mut self) {
     let old = self.current;
     let old_host = self.owners[old].host;
+    self.maybe_join_fresh_member(old_host);
     let candidates: Vec<HostId> = self
       .hosts
       .iter()
@@ -457,14 +538,13 @@ impl Run {
         !self.cut.contains(&(successor, *host)) && !self.cut.contains(&(*host, successor))
       })
       .collect();
-    let needed = usize::try_from(self.f + 1).unwrap();
-    if reachable.len() < needed {
+    let Some((asked, counted)) = self.phase_one_hosts(old, &reachable) else {
       return;
-    }
+    };
     self.epoch += 1;
     let epoch = HostEpoch(self.epoch);
     let mut reports = Vec::new();
-    for host in reachable.iter().take(needed) {
+    for host in &asked {
       let holder = self.holders.get_mut(host).unwrap();
       let report = match (&mut holder.replica, self.rule) {
         (Some(replica), _) => replica.prepare(epoch).unwrap(),
@@ -491,6 +571,7 @@ impl Run {
     });
     let adopted = adopt(
       &reports,
+      &counted,
       Quorum {
         f: u32::try_from(self.f).unwrap(),
       },
@@ -513,7 +594,7 @@ impl Run {
     // Phase one's participants learn the successor at once; the other holders learn it later from the configuration
     // (`learn`), and until then only their fence, if a takeover raised it, stands between them and the superseded
     // owner.
-    for host in reachable.iter().take(needed) {
+    for host in &asked {
       if let Some(replica) = &mut self.holders.get_mut(host).unwrap().replica {
         replica.reassign(successor);
       }
@@ -670,12 +751,16 @@ impl Run {
     }
   }
 
+  /// Convergence over the log's holders: every live member of the current shipper's holder set holds the owner's state.
+  /// A member outside it (one that joined while this owner shipped) is no holder of this log; it becomes one under the
+  /// next shipper that names it (A-240).
   fn converged(&self) -> bool {
     let owner = &self.owners[self.current];
+    let holders = owner.shipper.holders();
     self
       .holders
       .iter()
-      .filter(|(host, holder)| holder.alive && **host != owner.host)
+      .filter(|(host, holder)| holder.alive && **host != owner.host && holders.contains(host))
       .all(|(_, holder)| {
         holder.state == owner.state
           && holder.replica.as_ref().and_then(Replica::head) == owner.shipper.head()
@@ -1029,5 +1114,104 @@ fn a_laggard_is_sent_its_entries_while_they_cost_no_more_than_an_install() {
     shipper.pending(hosts[2]),
     Next::Install,
     "past the budget and the count, the laggard is installed"
+  );
+}
+
+/// A-200 phase one with the membership changing: do run the nemesis with the lost owner's replacement joining the
+/// candidates under a fresh identity before phase one (it never held the log; the shipper's holders never name it), at
+/// `f = 1` and `f = 2`. Expect every history to hold Agreement, NoLoss, StaleNeverCommits and Convergence: phase one's
+/// `f + 1` reports must meet the holders the writes were durable on, so a newcomer's empty report cannot stand in for
+/// one of them. Found on KIND (runs 42326682216 and 42331191530): a takeover completed with the successor's report and
+/// the replacement pod's, while the other holder of the log was never asked and kept its fence at the old epoch.
+#[test]
+fn phase_one_meets_the_logs_holders_when_a_fresh_member_has_joined() {
+  let mut broken = Vec::new();
+  let mut joined = 0;
+  for f in [1, 2] {
+    for seed in 0..SEEDS {
+      let outcome = std::panic::catch_unwind(|| {
+        let mut run = Run::new(f, seed, EmptyReport::FenceAndCount).with_newcomers();
+        for _ in 0..STEPS {
+          run.step();
+        }
+        run.settle();
+        run.joined
+      });
+      match outcome {
+        Ok(count) => joined += count,
+        Err(panic) => {
+          let message = panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+            .unwrap_or_default();
+          broken.push((f, seed, message));
+        }
+      }
+    }
+  }
+  eprintln!(
+    "fresh members at owner loss: {joined} joined in the passing seeds; {} broken seeds; first {:?}",
+    broken.len(),
+    broken.first()
+  );
+  if let Some((f, seed, _)) = broken.first().cloned() {
+    eprintln!("history of f={f} seed {seed}:");
+    let _ = std::panic::catch_unwind(|| {
+      let mut run = Run::new(f, seed, EmptyReport::FenceAndCount)
+        .with_newcomers()
+        .traced();
+      for _ in 0..STEPS {
+        run.step();
+      }
+      run.settle();
+    });
+  }
+  assert!(
+    broken.is_empty(),
+    "phase one with fresh members: {broken:?}"
+  );
+}
+
+/// A-240's mutation, kept as a test: do run the nemesis with fresh members joining at an owner's loss and phase one
+/// counting the first `f + 1` reachable candidates of the current configuration, whoever they are (the daemon before
+/// A-240). Expect a history to break NoLoss, StaleNeverCommits or Agreement in some seed: a newcomer's empty report
+/// stands in for a holder that was never asked.
+#[test]
+fn counting_any_candidate_lets_a_fresh_member_stand_in_for_a_holder() {
+  let mut broken = Vec::new();
+  for f in [1, 2] {
+    for seed in 0..SEEDS {
+      let outcome = std::panic::catch_unwind(|| {
+        let mut run = Run::new(f, seed, EmptyReport::FenceAndCount)
+          .counting(Counting::AnyCandidate)
+          .with_newcomers();
+        for _ in 0..STEPS {
+          run.step();
+        }
+        run.settle();
+      });
+      if let Err(panic) = outcome {
+        let message = panic
+          .downcast_ref::<String>()
+          .cloned()
+          .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+          .unwrap_or_default();
+        broken.push((f, seed, message));
+      }
+    }
+  }
+  eprintln!(
+    "counting any candidate with fresh members: {} broken seeds; first {:?}",
+    broken.len(),
+    broken.first()
+  );
+  assert!(
+    broken.iter().any(|(_, _, message)| {
+      message.contains("NoLoss")
+        || message.contains("StaleNeverCommits")
+        || message.contains("Agreement")
+    }),
+    "a fresh member's report stood in for a holder: {broken:?}"
   );
 }

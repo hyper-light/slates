@@ -214,6 +214,20 @@ pub struct PolicyRecord {
   /// barrier is answered only once the owner and `f` of them hold it. False at creation; set by `LiveShip`.
   /// Appended.
   pub live_shipped: bool,
+  /// The holder set the volume's live shipper ships to, under its epoch (A-240): committed at `f + 1` through the
+  /// catalog register before the shipper's first entry, so a takeover counts phase one's reports from exactly the hosts
+  /// a durable entry is held by. `None` until a shipper commits one. Appended.
+  pub live_holders: Option<LiveHolders>,
+}
+
+/// A live shipper's holder set and the epoch it ships under (A-240): the `2f` candidates it ships to, as their host
+/// ids, fixed for the shipper's life.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct LiveHolders {
+  /// The shipper's epoch.
+  pub epoch: u64,
+  /// The hosts it ships to.
+  pub holders: Vec<u64>,
 }
 
 /// What the volume sits on (§4.15).

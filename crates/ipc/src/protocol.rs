@@ -1090,6 +1090,9 @@ pub struct GroupReport {
   pub voters: u64,
   /// Whether a joint change of the voter set is in flight (Raft §6).
   pub joint: bool,
+  /// The member ids of the voters in force (both sets while a joint change is in flight), ascending: which members a
+  /// loss costs the group a vote. Appended (2026-11-07).
+  pub voter_ids: Vec<u64>,
 }
 
 /// One shard's part of the daemon's status.

@@ -47,6 +47,10 @@ const SHARDS: &str = "2";
 const FLEET_NAME: &str = "slates-fleet";
 /// Shape: the nodes, in manifest order.
 const FLEET_NODES: [&str; 3] = ["a", "b", "c"];
+/// Shape: a fleet wide enough that its council keeps a majority (3 of 5) with the owner lost and one of a volume's two
+/// holders partitioned, so a takeover runs while a holder of the log cannot answer, and the successor's placement
+/// holds members that are not holders.
+const WIDE_NODES: [&str; 5] = ["a", "b", "c", "d", "e"];
 /// Shape: the fleet's fault tolerance: three nodes at `f = 1`.
 const FLEET_F: usize = 1;
 /// Shape: the ports a node serves on (`slates_server::deploy`): its base and the next.
@@ -148,8 +152,8 @@ fn mint_identity(dir: &str, node: &str) {
 }
 
 #[allow(clippy::disallowed_methods)]
-fn write_manifest(dir: &str, bases: &[u16]) -> String {
-  let nodes: Vec<serde_json::Value> = FLEET_NODES
+fn write_manifest(dir: &str, names: &[&str], bases: &[u16]) -> String {
+  let nodes: Vec<serde_json::Value> = names
     .iter()
     .zip(bases)
     .map(|(node, base)| {
@@ -190,12 +194,12 @@ fn free_port_block(from: u16, count: u16) -> HeldBlock {
   panic!("no block of {count} free loopback UDP ports found from {from}");
 }
 
-fn port_blocks() -> Vec<HeldBlock> {
+fn port_blocks(nodes: usize) -> Vec<HeldBlock> {
   // Offset from `live_fleet.rs`'s start (which multiplies the pid by 7), so the two suites run side by side.
   let offset = (std::process::id().wrapping_mul(13)) % u32::from(PORT_SPAN);
   let mut from = u16::try_from(u32::from(PORT_FLOOR) + offset).unwrap();
   let mut blocks = Vec::new();
-  for _ in FLEET_NODES {
+  for _ in 0..nodes {
     let held = free_port_block(from, PORTS_PER_NODE);
     from = held.base.checked_add(PORTS_PER_NODE).unwrap_or(PORT_FLOOR);
     blocks.push(held);
@@ -281,8 +285,8 @@ fn fleet_view(instance: &str) -> Option<(String, usize, u32)> {
   ))
 }
 
-/// Waits until every node holds all three members alive with both peers probed; returns their member ids.
-fn wait_formed(instances: &[String]) -> Vec<String> {
+/// Waits until every node holds all `members` members alive with every peer probed; returns their member ids.
+fn wait_formed(instances: &[String], members: usize) -> Vec<String> {
   let deadline = Instant::now() + FLEET_WAIT;
   loop {
     let views: Vec<_> = instances
@@ -292,7 +296,9 @@ fn wait_formed(instances: &[String]) -> Vec<String> {
     if views.iter().all(|view| {
       view
         .as_ref()
-        .is_some_and(|(_, members, probed)| *members == FLEET_NODES.len() && *probed == 2)
+        .is_some_and(|(_, held, probed)| {
+          *held == members && usize::try_from(*probed).ok() == members.checked_sub(1)
+        })
     }) {
       return views.into_iter().map(|view| view.unwrap().0).collect();
     }
@@ -301,9 +307,9 @@ fn wait_formed(instances: &[String]) -> Vec<String> {
   }
 }
 
-/// Waits until the fleet is whole on every node: all three members voting, all three in the committed configuration,
-/// and a record session to each peer (`live_fleet.rs`'s `wait_settled`, which says why).
-fn wait_settled(instances: &[String]) {
+/// Waits until the fleet is whole on every node: all `members` members voting, all in the committed configuration, and
+/// a record session to each peer (`live_fleet.rs`'s `wait_settled`, which says why).
+fn wait_settled(instances: &[String], members: usize) {
   let deadline = Instant::now() + FLEET_WAIT;
   loop {
     let views: Vec<(String, String, usize)> = instances
@@ -329,11 +335,24 @@ fn wait_settled(instances: &[String]) {
         )
       })
       .collect();
-    let whole = views.iter().all(|(voters, members, sessions)| {
-      voters.trim() == FLEET_NODES.len().to_string()
-        && members.trim() == FLEET_NODES.len().to_string()
-        && *sessions == FLEET_NODES.len() - 1
-    });
+    // The council seats `2f + 1` voters whatever the membership (`slates_cluster::config_group::council_voters`).
+    let expected = members.min(2 * FLEET_F + 1);
+    // Every member holds the whole configuration, and every seat is filled as its voters see it. In a fleet no wider
+    // than the council every member votes and holds a record session to each peer. A wider fleet's members without a
+    // seat report a council of one (they are not in it), and a member need not hold a session to every peer (5-node
+    // runs of 2026-11-07 settled with 2 to 4); there, the flow's first durable writes show the owner reaches its holders.
+    let configured_everywhere = views
+      .iter()
+      .all(|(_, configured, _)| configured.trim() == members.to_string());
+    let seated = views
+      .iter()
+      .filter(|(voters, _, _)| voters.trim() == expected.to_string())
+      .count();
+    let meshed = members > expected
+      || views
+        .iter()
+        .all(|(_, _, sessions)| Some(*sessions) == members.checked_sub(1));
+    let whole = configured_everywhere && seated >= expected && meshed;
     if whole {
       return;
     }
@@ -410,20 +429,27 @@ struct Fleet {
   instances: Vec<String>,
   supervision: Supervision,
   bootstrap: usize,
+  /// The manifest's node names, one per node index.
+  nodes: &'static [&'static str],
 }
 
 impl Fleet {
   /// Starts three nodes from one manifest, waits until they form, and bootstraps the root once.
   fn start(tag: &str, supervision: Supervision) -> Fleet {
+    Fleet::start_with(tag, supervision, &FLEET_NODES)
+  }
+
+  /// Starts the nodes `nodes` names from one manifest, waits until they form, and bootstraps the root once.
+  fn start_with(tag: &str, supervision: Supervision, nodes: &'static [&'static str]) -> Fleet {
     let pid = std::process::id();
     let scratch = scratch_dir(tag);
-    for node in FLEET_NODES {
+    for node in nodes {
       mint_identity(&scratch.path, node);
     }
-    let blocks = port_blocks();
+    let blocks = port_blocks(nodes.len());
     let bases: Vec<u16> = blocks.iter().map(|held| held.base).collect();
-    let manifest = write_manifest(&scratch.path, &bases);
-    let instances: Vec<String> = FLEET_NODES
+    let manifest = write_manifest(&scratch.path, nodes, &bases);
+    let instances: Vec<String> = nodes
       .iter()
       .map(|node| format!("chaos-{tag}-{node}-{pid}"))
       .collect();
@@ -431,7 +457,7 @@ impl Fleet {
     // (`MachineProfile::measure_patiently`, about 13 s for a lone debug daemon on a loaded Mac, 2026-11-07), and three
     // measuring at once disturb each other past the start wait, so every flow failed at start (live-durability, at load
     // 12 with no other fleet running).
-    let processes = FLEET_NODES
+    let processes = nodes
       .iter()
       .zip(&instances)
       .zip(&blocks)
@@ -441,13 +467,13 @@ impl Fleet {
         Some(process)
       })
       .collect();
-    let hosts = wait_formed(&instances);
+    let hosts = wait_formed(&instances, nodes.len());
     let bootstrap = (0..hosts.len())
       .min_by_key(|index| hosts[*index].parse::<u64>().unwrap())
       .unwrap();
     let (code, _, error) = run(&instances[bootstrap], &["bootstrap", "root"]);
     assert_eq!(code, 0, "one bootstrap of the fresh fleet: {error}");
-    wait_settled(&instances);
+    wait_settled(&instances, nodes.len());
     eprintln!("chaos: fleet {tag} ({supervision:?}) formed and settled: hosts {hosts:?}");
     DIAGNOSED.with(|diagnosed| *diagnosed.borrow_mut() = instances.clone());
     Fleet {
@@ -458,6 +484,7 @@ impl Fleet {
       instances,
       supervision,
       bootstrap,
+      nodes,
     }
   }
 
@@ -521,22 +548,22 @@ impl Fleet {
     self.processes[index] = Some(start_node(
       &self.instances[index],
       &self.manifest,
-      FLEET_NODES[index],
+      self.nodes[index],
       &self.blocks[index],
       self.supervision,
     ));
     wait_answers(&self.instances[index]);
   }
 
-  /// Waits until every live node holds exactly three members, each probed by the others: a succeeded or replaced
-  /// node rejoined under its new identity and the old one retired.
+  /// Waits until every live node holds exactly the manifest's members, each probed by the others: a succeeded or
+  /// replaced node rejoined under its new identity and the old one retired.
   fn wait_rejoined(&self) {
     let live: Vec<String> = (0..self.instances.len())
       .filter(|index| self.processes[*index].is_some())
       .map(|index| self.instances[index].clone())
       .collect();
-    wait_formed(&live);
-    wait_settled(&live);
+    wait_formed(&live, self.nodes.len());
+    wait_settled(&live, self.nodes.len());
   }
 }
 
@@ -2719,6 +2746,198 @@ fn a_live_entry_past_one_chunk_is_taken_over_whole() {
       )]
     },
   );
+  drop(fleet);
+  verdict.judge();
+}
+
+/// The nodes of `fleet` holding a council seat, by index, as the bootstrap node's status names them.
+fn council_voters_by_index(fleet: &Fleet) -> Vec<usize> {
+  let (_, out, _) = run(&fleet.instances[fleet.bootstrap], &["status"]);
+  let seated: Vec<String> = value_of(&out, "fleet_council_voter_ids")
+    .split_whitespace()
+    .map(str::to_owned)
+    .collect();
+  (0..fleet.instances.len())
+    .filter(|index| {
+      fleet_view(&fleet.instances[*index]).is_some_and(|(host, _, _)| seated.contains(&host))
+    })
+    .collect()
+}
+
+/// The nodes of `fleet` holding a copy of `volume`'s log as candidates, by index.
+fn holders_of(fleet: &Fleet, volume: &str) -> Vec<usize> {
+  (0..fleet.instances.len())
+    .filter(|index| {
+      live_states(&fleet.instances[*index], volume)
+        .unwrap_or_default()
+        .iter()
+        .any(|state| state.holding)
+    })
+    .collect()
+}
+
+/// A-240, phase one with a member that is not a holder: on a five-node fleet (f = 1, so a volume has two holders beside
+/// its owner, and the council seats three voters), do stream writes to a live volume owned by a member without a seat,
+/// replace a node that holds none of the log (a fresh member identity joins), partition one holder (SIGSTOP) while the
+/// writes go on through the other, stop the stream, then partition that other holder, crash the owner and resume the
+/// stale holder. The partitioned holder is one that leaves the council two of its three votes, so the takeover can run. Expect no survivor ever to serve the volume without every
+/// acknowledged write (NoLoss), and a phase one that waits for the holder of the log (`takeover_waits_quorum`) rather
+/// than counting the replacement or another member in its place; once the partitioned holder is resumed, a survivor
+/// may serve it whole. Before A-240 phase one counted `f + 1` among the current placement, so the stale holder and a
+/// member that never held the log made a quorum (the model's 10 of 400 seeds; on KIND a holder kept its fence at the
+/// old epoch after a takeover, 2026-11-06).
+#[test]
+fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
+  if !gated("fresh-member") {
+    return;
+  }
+  let mut fleet = Fleet::start_with("fresh-member", Supervision::Bare, &WIDE_NODES);
+  let instances = fleet.instances.clone();
+  // The owner holds no council seat, so its loss costs the council no vote and the takeover can run with a holder
+  // partitioned too (the council seats three of the five).
+  let seated = council_voters_by_index(&fleet);
+  let owner_index = (0..instances.len())
+    .filter(|index| !seated.contains(index))
+    .min_by_key(|index| *index == fleet.bootstrap)
+    .expect("a five-member fleet seats three voters, so two members hold no seat");
+  let owner = instances[owner_index].clone();
+  let volume = create_volume(&owner, "fresh-member", true);
+  let mut verdict = Verdict::new("a member that never held the log at a takeover");
+  verdict.note(format!(
+    "owner {owner}; council seats at {:?}",
+    seated
+      .iter()
+      .map(|index| instances[*index].as_str())
+      .collect::<Vec<_>>()
+  ));
+  let mut holders = Vec::new();
+  let mut roles = None;
+  let fleet_cell = std::cell::RefCell::new(&mut fleet);
+  let (outcomes, _samples) = stream_through(&instances, &owner, &volume, 0..STREAM_FILES, |began| {
+    after_writes(&owner, &volume, BETWEEN_EVENTS);
+    holders = holders_of(&fleet_cell.borrow(), &volume);
+    assert_eq!(
+      holders.len(),
+      2,
+      "the volume has two holders beside its owner: {holders:?}"
+    );
+    // A member that holds none of the log is replaced: its successor joins under a fresh identity. One without a seat
+    // first, so the council's seats stay where they were.
+    let seated = council_voters_by_index(&fleet_cell.borrow());
+    let replaced = fleet_cell
+      .borrow()
+      .others(owner_index)
+      .into_iter()
+      .filter(|index| !holders.contains(index))
+      .min_by_key(|index| seated.contains(index))
+      .unwrap();
+    fleet_cell.borrow_mut().kill_node(replaced);
+    fleet_cell.borrow_mut().replace_node(replaced);
+    fleet_cell.borrow().wait_rejoined();
+    verdict.note(format!(
+      "{} replaced by a fresh member, rejoined at {:?}",
+      instances[replaced],
+      began.elapsed()
+    ));
+    // The holder partitioned at the owner's loss: one whose seat, with the owner's, leaves the council two of its three
+    // votes. The other holder falls behind first.
+    let seated = council_voters_by_index(&fleet_cell.borrow());
+    let owner_seated = seated.contains(&owner_index);
+    let current = holders
+      .iter()
+      .copied()
+      .find(|holder| !(owner_seated && seated.contains(holder)))
+      .expect("a holder whose partition with the owner's loss leaves the council a majority");
+    let stale = holders
+      .iter()
+      .copied()
+      .find(|holder| *holder != current)
+      .unwrap();
+    roles = Some((current, stale));
+    after_writes(&owner, &volume, BETWEEN_EVENTS);
+    fleet_cell.borrow().stop(stale);
+    verdict.note(format!(
+      "{} stopped at {:?}",
+      instances[stale],
+      began.elapsed()
+    ));
+    after_writes(&owner, &volume, BETWEEN_EVENTS);
+  });
+  let (current, stale) = roles.expect("the flow chose its holders' roles");
+  // The writes since the stale holder stopped are durable on the owner and `current` alone. Once the stream has
+  // stopped (every write answered), `current` is partitioned and the owner crashed, and only then is the stale holder
+  // resumed, so nothing reaches it and it stays behind.
+  fleet.stop(current);
+  fleet.kill_node(owner_index);
+  fleet.resume(stale);
+  verdict.note(format!(
+    "{} stopped, owner {owner} crashed and {} resumed stale",
+    instances[current], instances[stale]
+  ));
+  let acknowledged = outcomes
+    .iter()
+    .filter(|outcome| outcome.refused.is_none())
+    .count();
+  verdict.note(format!(
+    "{acknowledged} writes acknowledged; holders {} (partitioned) and {} (stale)",
+    instances[current], instances[stale]
+  ));
+  let survivors: Vec<&str> = (0..instances.len())
+    .filter(|index| *index != owner_index && *index != current)
+    .map(|index| instances[index].as_str())
+    .collect();
+  // A survivor that takes the volume over in the window must serve every acknowledged write; with the fix none can
+  // until the partitioned holder answers.
+  match wait_taken_over(&survivors, &volume) {
+    Some((successor, took)) => {
+      verdict.note(format!(
+        "{successor} took the volume over after {took:?} without the partitioned holder"
+      ));
+      verdict.check(
+        "NoLoss (a takeover without the log's holder)",
+        no_loss(successor, &volume, &outcomes),
+      );
+    }
+    None => verdict.note(format!(
+      "no survivor took the volume over within {FLEET_WAIT:?} without the log's holder"
+    )),
+  }
+  let waited: u64 = survivors
+    .iter()
+    .map(|survivor| counter(survivor, "fleet.live.takeover_waits_quorum"))
+    .sum();
+  verdict.note(format!(
+    "phase one waited for the holders {waited} times across the survivors"
+  ));
+  verdict.check(
+    "phase one ran and waited for the log's holders",
+    if waited > 0 {
+      Vec::new()
+    } else {
+      vec!["no survivor's phase one waited for the holders".to_owned()]
+    },
+  );
+  // Liveness, noted: the partitioned holder answers again, and a takeover may now count it.
+  fleet.resume(current);
+  let mut everyone = survivors.clone();
+  everyone.push(instances[current].as_str());
+  match wait_serving(&everyone, &volume, &outcomes) {
+    Some((successor, took)) => {
+      verdict.note(format!(
+        "after the holder resumed, {successor} served the volume after {took:?}"
+      ));
+      verdict.check("NoLoss (successor)", no_loss(successor, &volume, &outcomes));
+      let epoch = takeover_epoch(successor, &volume);
+      verdict.check(
+        "StaleNeverCommits (fences)",
+        fenced_at_or_above(&everyone, &volume, epoch),
+      );
+    }
+    None => verdict.note(
+      "after the holder resumed, no node served the volume within the fleet wait (the holder may have been retired)"
+        .to_owned(),
+    ),
+  }
   drop(fleet);
   verdict.judge();
 }
