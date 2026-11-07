@@ -1,0 +1,68 @@
+name: DIAG loadtest-scale chaos -- one daemon restart during a 300-client rung, with A-207 (reland-a207) and without it (not for main)
+
+# Two jobs on one runner kind: `after` builds this commit's tree (agents/loadtest-scale-1 merged with
+# agents/reland-a207-1, GAPS.md left conflicted, docs only); `before` builds agents/loadtest-scale-1 alone. Each runs
+# the same chaos rung: a single-node anchored daemon, the release harness at 300 clients (32 a connection, 3 rounds,
+# kernel/ of v7.4-rc1), the daemon SIGKILLed 1.5 s into the level its anchor restarting it at once, so the clients reconnect within their budget and resend. Results
+# are published as one commit on diag-loadtest-scale-chaos-results-<run>-<job>, read with git.
+
+on:
+  push:
+    branches: ['diag-loadtest-scale-chaos-[0-9]*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  chaos:
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [after, before]
+    name: chaos ${{ matrix.arm }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      RESULTS_BRANCH: diag-loadtest-scale-chaos-results-${{ github.run_id }}-${{ matrix.arm }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          ref: ${{ matrix.arm == 'before' && 'agents/loadtest-scale-1' || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: rung
+        shell: bash
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "false"
+        run: |
+          set -u +e +o pipefail
+          out="$RUNNER_TEMP/results.txt"; : > "$out"
+          echo "${{ matrix.arm }}: tested $(git rev-parse HEAD) on $(uname -m), $(nproc) cpus, load $(cut -d' ' -f1-3 /proc/loadavg)" >> "$out"
+          K="$RUNNER_TEMP/linux"; git clone -q --depth 1 --branch v7.4-rc1 https://github.com/torvalds/linux.git "$K"
+          cargo build --release -p slates-client --example load_bench -p slates-cli --bin slates > "$RUNNER_TEMP/build.log" 2>&1; echo "build exit $?" >> "$out"
+          SL=target/release/slates; LB=target/release/examples/load_bench; I=chaos-$$
+          ulimit -n 65536
+          $SL --instance $I anchor --quick > /dev/null 2> "$RUNNER_TEMP/anchor.err" & AP=$!
+          for i in $(seq 1 300); do $SL --instance $I volume list > /dev/null 2>&1 && break; sleep 0.1; done
+          $SL --instance $I bootstrap root > /dev/null 2>&1
+          timeout 1800 $LB --instance $I --tree "$K/kernel" --clients 300 --hot-files 240 --per-connection 32 --rounds 3 --reply-patience 60 > "$RUNNER_TEMP/bench.log" 2>&1 & BP=$!
+          until grep -q "^level.*connect_all_ns" "$RUNNER_TEMP/bench.log" 2>/dev/null || ! kill -0 $BP 2>/dev/null; do sleep 0.1; done
+          sleep 1.5
+          DP=$(pgrep -P $AP | head -1); kill -STOP $AP; kill -9 $DP; echo "killed daemon $DP, anchor not held: restarted at once" >> "$out"
+          kill -CONT $AP
+          wait $BP; echo "bench exit $?" >> "$out"
+          kill $AP 2> /dev/null; wait $AP 2> /dev/null
+          grep -E "^level.*wall|^oracle|^harness|^refusal" "$RUNNER_TEMP/bench.log" | cut -c1-300 | head -40 >> "$out"
+          grep -E "anchor:|recovered" "$RUNNER_TEMP/anchor.err" | cut -c1-300 | head -12 >> "$out"
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          blob=$(git hash-object -w "$out")
+          tree=$(printf '100644 blob %s\tresults.txt\n' "$blob" | git mktree)
+          commit=$(git commit-tree "$tree" -m "chaos results of run $GITHUB_RUN_ID, ${{ matrix.arm }}")
+          git push origin "$commit:refs/heads/$RESULTS_BRANCH" || echo "::warning::could not publish the results"

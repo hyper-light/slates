@@ -4043,6 +4043,31 @@ write, MiB/s at 1, 4 and 16 workers:
   1,284–1,479 / 1,291–1,435. They overlap.
 - The tick-only first build was dead even on the same harness (run 42058939194: 531–556 against 534–551 MiB/s).
 
+**Re-landed after the revert (2026-11-05).** Main reverted A-214 (CI 42119714654: A-205's give-back on both Windows
+lanes, and the arena test under Miri). The re-landing (`c9b971aa`) ends a busy period on a free as well as an
+allocation, so a delete takes its reserve with it:
+- `a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it` (Linux): before the write the content object held
+  12,288 bytes, with the file and its reserve 33,759,232, and after the delete 204,800 (16,793,600 before the fix);
+- A-205's give-back (diagnostics run 42129821506), deleted bytes that left the working set: windows-latest 92% in
+  1.61 s and 104%; windows-11-arm 110% in 1.13 s and 205% in 1.05 s (the reserve's pages go back with the files);
+- the incumbent harness on the M5 Max, main `f5396e3b` (A) against `c9b971aa` (B), six rounds each A then B,
+  2026-11-05 23:37–23:41Z, load 12–44 from other sessions, MiB/s at 1, 4 and 16 workers:
+
+  | round | A | B |
+  |---|---|---|
+  | 1 | 934.9 / 745.4 / 973.3 | 983.9 / 970.9 / 1,221.8 |
+  | 2 | 962.6 / 868.7 / 1,016.3 | 934.7 / 951.6 / 1,211.5 |
+  | 3 | 931.6 / 787.4 / 954.2 | 944.2 / 963.0 / 1,238.3 |
+  | 4 | 818.4 / 767.6 / 905.3 | 826.1 / 981.5 / 988.5 |
+  | 5 | 918.3 / 715.3 / 1,021.9 | 933.3 / 899.9 / 1,183.9 |
+  | 6 | 1,002.8 / 796.3 / 925.4 | 945.8 / 895.6 / 1,278.1 |
+
+  Best of eighteen: B 1,278.1, A 1,021.9; step 11 asks 967. Beyond the spread at 4 workers (B's lowest 895.6 against
+  A's highest 868.7); at 16 workers B led every round but one round's 988.5 sits under A's 1,021.9; at 1 worker the arms
+  overlap. Write p99 at 16 workers, µs (create / overwrite / append): A 2,621–4,590 / 1,394–2,989 / 1,238–3,415; B
+  2,831–3,962 / 1,731–3,359 / 1,647–3,607, overlapping at this load. nfsd wrote 1,428–1,817 MiB/s. The volume's shard
+  counted 358,875,136 bytes pre-faulted in every B run.
+
 **The resident cost per shard.** An idle shard holds at most its last burst's net growth of free pages, and never more
 than its memory share (`reserve_per_shard`: 1,073,741,824 bytes on the Mac's daemon, logged at boot). A shard whose
 last busy period grew nothing holds none: a written and deleted file nets zero, and A-105's give-back test passes
@@ -9724,6 +9749,59 @@ kill $anchor 2>/dev/null; sleep 1; kill -9 $anchor 2>/dev/null
 for p in $(pgrep -f "instance $instance"); do kill -9 $p 2>/dev/null; done
 sleep 0.5; echo "left: $(pgrep -f "instance $instance" | tr '\n' ' ')" >> $dir/chaos-$tag.pids
 ```
+
+### The many-client load test after the re-landing of A-207 and A-217, macOS (2026-11-06)
+
+`agents/reland-a207-1` at `827092dd` (A-217, the checkout by identity, A-207 over A-202's delta rebase), release.
+Apple M5 Max, 18 cores, macOS 26.4.1, 5 shards (the harness's own daemon) or `--shards 4` (chaos under the anchor);
+load 31 to 53 from other agents' builds and runs; 2026-11-06 06:44 to 06:52 UTC. The tree is the kernel's `kernel/`
+(754 files, 16,321,721 bytes). main's harness cannot run on macOS: `tree_bytes` calls `du -sb`, and BSD `du` has no
+`-b`. So the harness binary was built with loadtest-scale's `tree_bytes` (`-sAk` x 1024 on macOS, on
+`agents/loadtest-scale-1`). That hunk was applied for the build and then removed, and is not in the branch. Two
+readings of main's harness (loadtest-scale):
+- Its oracle replays a whole copy of every touched file per version. That takes seconds at 10 and 100 clients and
+  does not scale to 1,000; the per-slot oracle is `c35c532f` on `agents/loadtest-scale-1`.
+- A refusal row is the harness's own error string, not a typed refusal.
+
+`load_bench --tree kernel --clients 10,100 --hot-files 80`, three runs, all shown. Nanoseconds, p50:
+
+| Clients | Edit, runs 1 / 2 / 3 | Accepted submit, runs 1 / 2 / 3 | CreateWork, runs 1 / 2 / 3 | Oracle |
+|---|---|---|---|---|
+| 10 | 87,291 / 299,917 / 212,833 | 246,250 / 539,083 / 300,125 | 113,729,958 / 881,042 / 4,975,834 | 30 accepted, 5 conflicts, 0 failures each |
+| 100 | 28,640,208 / 28,857,875 / 25,886,958 | 38,721,417 / 61,656,459 / 38,997,667 | 54,042,000 / 1,719,875 / 1,027,083 | 300 accepted, 199 to 229 conflicts, 0 failures each |
+
+Every client's own file held its accepted rounds once each in all six levels.
+
+Chaos: the procedure above, 10 clients x 200 rounds and 100 x 20, the daemon SIGKILLed 0.5, 1.5, 2.5, 3.5 and 5 s
+into the run phase. No mount was live, so no kill landed under a kernel NFS mount.
+- **Nine of the ten runs:** 2,000 accepted, 0 oracle and 0 own-file failures, harness exit 0.
+  - Reconnected and resent: 10, 10, 10, 10 and 8 of 10 (the rest had finished), and 100 of 100 in each 100-client run.
+  - Longest outage: 7,105,042 to 150,410,292 ns at 10 clients and 65,804,250 to 357,513,750 ns at 100.
+- **One run failed: 100 clients, killed at 3.5 s.** The anchor killed three successors in a row ("the daemon never
+  beat inside the recovery budget"), and the fourth recovered. In each, shard 0's recovery (one green, at least 322
+  versions, 100 work logs) held its first beat. The one that finished logged shard 0 initialized in 936,422 µs. By then
+  every client had passed its reconnect budget (recovery plus liveness, 2 s) and was refused "the daemon did not come
+  back within the reconnect budget": 0 reconnects.
+  - The oracle then found 4 file failures and 1 own-file failure, all of one kind. Client `100000003`'s file holds its
+    round 6, but the harness never saw round 6 accepted: the daemon accepted the submit and the client gave up before
+    it could resend.
+  - So nothing acknowledged was lost. The run fails on the restart's time, not its content (GAPS, "A daemon's restart
+    can exceed the anchor's fixed recovery budget").
+- **The 10-client run killed at 0.5 s passed, after the anchor killed 7 successors** (never beat) and 1 running
+  daemon (heartbeat lapsed).
+
+Shard 0's recovery time in the other eight runs, the successor that served: 245,701 to 548,338 µs with 101 merge
+volumes, 269,660 to 366,273 µs with 9 to 11.
+
+**main on the same machine, interleaved, two configurations each (2026-11-06, `00e5269c` built with the same
+`tree_bytes`; four runs, then stopped):** main's harness aborted in setup in both of its runs. Each time
+`pin(overlay)` over the tree was refused `Stalled` after the client's 1 s reply deadline, and the anchor had already
+killed a starting daemon (never beat) and lapsed running ones (2 and 1). The branch's two runs aborted too: in one the
+anchor killed 5 starting daemons, some before they logged "serving"; in the other it lapsed 5. So at this load the
+anchor's fixed 1 s budgets kill daemons on main too, before any recovery. The comparison of restart cost did not
+complete.
+A pin over about 1 s answering `Stalled` is main's client behaviour. loadtest-scale is making Pin a deferred reply
+sliced on its owner shard, to land on `agents/loadtest-scale-1` as its own commit (not yet committed on 2026-11-06).
 
 ### What a successful open costs under each serving pattern: arm64's remainder is the DLL's second waiting thread (2026-11-05)
 
