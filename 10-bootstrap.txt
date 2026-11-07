@@ -1,0 +1,70 @@
+=== bootstrap on 1 exit 101 load { 28.78 17.70 13.05 }
+live bootstrap: written=false caught_up=true shipping=Some(("0", "0", "false")) held=[Some(("0", "none", "false")), Some(("0", "none", "false"))] [("live-bootstrap-a-22871", {"held": 1, "hold_refused": 3, "hold_refused.not_a_member": 3}), ("live-bootstrap-b-22871", {"held": 1, "hold_refused": 3, "ho
+live bootstrap --- live-bootstrap-a-22871
+fleet_host: 6467803199955757136
+fleet_host_epoch: 1
+fleet_members: 2613095384040169765 3660746566364524368 6467803199955757136
+fleet_replaced: 0
+fleet_configuration_version: 4
+fleet_configuration_members: 3
+fleet_council_leads: false
+fleet_council_voters: 3
+fleet_council_joint: false
+fleet_root_joint: false
+fleet_session 2613095384040169765: lent=false cwnd=18360 srtt_ns=698830 pto_ns=1912610 spurious_losses=0 persistent_collapses=0 consumed=4665 mtu=9209
+fleet_session 3660746566364524368: lent=false cwnd=18360 srtt_ns=893861 pto_ns=3155561 spurious_losses=0 persistent_collapses=0 consumed=4649 mtu=9209
+shard 0: clients=1 volumes=0 served=9 replayed=0 replay_ns=96167 torn=false mapped=0 locked=0 reserve=0 committed=0 retained=0 replicated=0 retained_versions=0 metadata=795177722 committed_metadata=0 tasks_refused=0 landings_awaiting=0/2248 landings_in_flight=0 target_leases=0
+shard 0 refused fleet.learner.fetch_paced: 22
+shard 0 refused fleet.learner.fetches: 8
+shard 0 live held 2443946831ed61250000000000000012 head=0 durable=none owed=false epoch=1 identity=388a15d53a988751b38f6d574a848221796062a763f543da672748f278b742a7 fence=1
+shard 0 span consensus.step: absent/unknown (never; producer configuration group expected here)
+shard 1: clients=2 volumes=0 served=10 replayed=0 replay_ns=55583 torn=false mapped=0 locked=0 reserve=0 committed=0 retained=0 replicated=0 retained_versions=0 metadata=795177722 committed_metadata=0 tasks_refused=0 landings_awaiting=0/2248 landings_in_flight=0 target_leases=0
+shard 1 span consensus.step: absent/unknown (never; producer configuration group expected here)
+live bootstrap --- live-bootstrap-b-22871
+fleet_host: 3660746566364524368
+fleet_host_epoch: 1
+fleet_members: 2613095384040169765 3660746566364524368 6467803199955757136
+fleet_replaced: 0
+fleet_configuration_version: 4
+fleet_configuration_members: 3
+fleet_council_leads: false
+fleet_council_voters: 3
+fleet_council_joint: false
+fleet_root_joint: false
+fleet_session 2613095384040169765: lent=false cwnd=18360 srtt_ns=627136 pto_ns=1627136 spurious_losses=0 persistent_collapses=0 consumed=4612 mtu=9209
+fleet_session 6467803199955757136: lent=false cwnd=18360 srtt_ns=688512 pto_ns=2129332 spurious_losses=0 persistent_collapses=0 consumed=3474 mtu=9209
+shard 0: clients=1 volumes=0 served=9 replayed=0 replay_ns=4684916 torn=false mapped=0 locked=0 reserve=0 committed=0 retained=0 replicated=0 retained_versions=0 metadata=795177722 committed_metadata=0 tasks_refused=0 landings_awaiting=0/2248 landings_in_flight=0 target_leases=0
+shard 0 refused fleet.learner.fetch_paced: 22
+shard 0 refused fleet.learner.fetches: 8
+shard 0 refused fleet.live.hold_refused.no_catalog: 1
+shard 0 live held 2443946831ed61250000000000000012 head=0 durable=none owed=false epoch=1 identity=388a15d53a988751b38f6d574a848221796062a763f543da672748f278b742a7 fence=1
+shard 0 span consensus.step: absent/unknown (never; producer configuration group expected here)
+shard 1: clients=2 volumes=0 served=10 replayed=0 replay_ns=4677125 torn=false mapped=0 locked=0 reserve=0 committed=0 retained=0 replicated=0 retained_versions=0 metadata=795177722 committed_metadata=0 tasks_refused=0 landings_awaiting=0/2248 landings_in_flight=0 target_leases=0
+shard 1 span consensus.step: absent/unknown (never; producer configuration group expected here)
+live bootstrap --- live-bootstrap-c-22871
+fleet_host: 2613095384040169765
+fleet_host_epoch: 1
+fleet_members: 2613095384040169765 3660746566364524368 6467803199955757136
+fleet_replaced: 4
+fleet_configuration_version: 4
+fleet_configuration_members: 3
+fleet_council_leads: true
+fleet_council_voters: 3
+fleet_council_joint: false
+fleet_root_joint: false
+fleet_session 3660746566364524368: lent=false cwnd=18360 srtt_ns=891255 pto_ns=2617819 spurious_losses=0 persistent_collapses=0 consumed=41499 mtu=9209
+fleet_session 6467803199955757136: lent=false cwnd=18360 srtt_ns=783666 pto_ns=2366238 spurious_losses=0 persistent_collapses=0 consumed=41397 mtu=9209
+shard 0: clients=2 volumes=1 served=12 replayed=0 replay_ns=39959 torn=false mapped=1073741824 locked=0 reserve=1073741824 committed=8388608 retained=0 replicated=0 retained_versions=0 metadata=795177722 committed_metadata=35408 tasks_refused=0 landings_awaiting=0/2248 landings_in_flight=0 target_le
+shard 0 refused fleet.learner.fetch_paced: 16
+shard 0 refused fleet.learner.fetches: 8
+shard 0 refused fleet.live.held_back.placement: 2
+shard 0 refused fleet.ship.catalog.short: 4
+shard 0 refused fleet.ship.head.short: 1
+shard 0 live shipping 2443946831ed61250000000000000012 head=0 durable=0 owed=false epoch=1 identity=388a15d53a988751b38f6d574a848221796062a763f543da672748f278b742a7 fence=1
+shard 0 span consensus.step: absent/unknown (never; producer configuration group expected here)
+shard 1: clients=2 volumes=0 served=11 replayed=0 replay_ns=28042 torn=false mapped=0 locked=0 reserve=0 committed=0 retained=0 replicated=0 retained_versions=0 metadata=795177722 committed_metadata=0 tasks_refused=0 landings_awaiting=0/2248 landings_in_flight=0 target_leases=0
+shard 1 span consensus.step: absent/unknown (never; producer configuration group expected here)
+live bootstrap --- the owner's volume stat
+journal_grown_bytes: 0 (growth refused 0)
+thread 'a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates' (52367) panicked at crates/cli/tests/live_fleet.rs:1932:3:
+the bootstrap node's live writes became durable and both candidates hold them: Some(("0", "0", "false")) [Some(("0", "none", "false")), Some(("0", "none", "false"))] [("live-bootstrap-a-22871", {"held": 1, "hold_refused": 3, "hold_refused.not_a_member": 3}), ("live-bootstrap-b-22871", {"held": 1, "h
