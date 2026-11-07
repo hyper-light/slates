@@ -1,0 +1,63 @@
+name: diag-liveness-stuck
+
+# Diagnostics only, never on main. diag-liveness-15: a_stuck_start_is_killed_and_restarted failed once of three on
+# ubuntu-latest beside two spinners a CPU, at StartProgress's "no progress for the start wait"; the message was not
+# kept. The test ten times beside two spinners a CPU on both Linux runners, its message and the anchor's lines kept.
+on:
+  push:
+    branches: ["diag-liveness-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  linux:
+    name: stuck start x10 (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo test --locked -p slates-cli --test cli --no-run
+      - name: The stuck start ten times beside two spinners a CPU
+        env:
+          SLATES_TEST_CLI: "1"
+        run: |
+          R=../results.txt
+          echo "runner ${{ matrix.os }}, $(nproc) CPUs, $(git log --oneline -1 | cut -c1-80), $(date -u)" > $R
+          pids=""
+          for i in $(seq 1 $(( $(nproc) * 2 ))); do nice -n 19 bash -c 'while :; do :; done' & pids="$pids $!"; done
+          trap 'for p in $pids; do kill $p 2>/dev/null; done' EXIT
+          for run in $(seq 1 10); do
+            status=0
+            cargo test --locked -p slates-cli --test cli -- --exact --nocapture a_stuck_start_is_killed_and_restarted > ../s.log 2>&1 || status=$?
+            if [ $status != 0 ]; then
+              grep -E 'slates anchor|panicked|waited for|serving on|initialized in|test result' -A1 ../s.log | cut -c1-400 | tee -a $R
+            else
+              grep -E 'made no progress' ../s.log | cut -c1-200 | tee -a $R
+            fi
+            echo "== run $run exit $status, load $(cut -d' ' -f1 /proc/loadavg)" | tee -a $R
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/liveness-16-${{ matrix.os }}"
+          git config user.name "diag-liveness"
+          git config user.email "diag-liveness@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-liveness-16 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
