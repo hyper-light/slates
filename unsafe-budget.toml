@@ -52,6 +52,11 @@
 #   with it, since a mapping is its bytes whoever made it (`region.rs` `lock_bytes_whole`/`lock_bytes_range`):
 #   the whole-map lock on fault and its macOS arm (2) and the range lock with `MADV_DONTDUMP` (2), less the two
 #   that took a memmap2 map and are now thin callers (−2): +2. 37 → 45.
+#   Crash-dump exclusion on Windows (`dump_exclusion.rs`, 2026-11-06, A-231): `GetModuleHandleW` of kernel32 (1),
+#   `GetProcAddress` of `WerRegisterExcludedMemoryBlock` and `WerUnregisterExcludedMemoryBlock` (2), their transmute
+#   to `werapi.h`'s signatures (1) and the two function-pointer types that name them `unsafe extern "system"` (2), the
+#   register and the unregister calls (2). Resolved at run time, not imported, so a Windows without them still loads
+#   the binary; no safe wrapper exists. 63 → 71.
 # slates-rt (48): rustix marks kevent unsafe because the kernel fills the buffer (3); io-uring
 #   marks push unsafe for buffer lifetimes (2); the RawWaker vtable is unsafe by signature (5);
 #   the IOCP calls are Win32 (6); the UDP readiness registration (§4.10a, added 2026-09-07): the
@@ -239,7 +244,7 @@ slates-machine = 53
 # has no Darwin advice, so they are `libc::madvise`); and the test-only footprint reader `test_serial::footprint`
 # (`proc_pid_rusage` into a buffer of its struct's size and the `assume_init` after it succeeded, 2), with which the
 # give-back's tests observe what macOS counts.
-slates-mem = 63
+slates-mem = 71
 # 2026-11-04 (+2, A-205, Windows gives freed pages back, compiled only for Windows): `DiscardVirtualMemory` over a
 #   region's block (`region.rs`, `os::discard_slice`) and over a sparse object's committed run (`shared.rs`,
 #   `Inner::discard`). The call has no safe wrapper.

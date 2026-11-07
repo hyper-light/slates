@@ -67,11 +67,15 @@ impl RootState {
 /// full `cargo test --workspace` and passed alone, and every other two-shard test in the binary had been running
 /// with sealing unavailable whenever the order fell that way.
 pub fn reserve(slots: usize) -> bool {
-  match hyper_seal::lock_keys(slots) {
+  let reserved = match hyper_seal::lock_keys(slots) {
     Ok(()) => true,
     Err(hyper_seal::SealError::AlreadyLocked { slots: held }) => held >= slots,
     Err(_) => false,
+  };
+  if reserved {
+    exclude_key_region();
   }
+  reserved
 }
 
 /// Locks the key region for `slots` keys and the anchor's page, then finds or makes the node's root in `segment` (the
@@ -81,7 +85,7 @@ pub fn init(segment: &mut AnchorSegment, slots: usize) -> RootState {
   // daemon's tests) is answered by the region already made: enough for its keys, or `AlreadyLocked` with the count it
   // holds — never a smaller region taken as enough.
   match hyper_seal::lock_keys(slots) {
-    Ok(()) => {}
+    Ok(()) => exclude_key_region(),
     Err(hyper_seal::SealError::AlreadyLocked { slots: held }) => {
       slates_machine::log_line!(
         "slates-server: sealing unavailable: this process's key region holds {held} keys, fewer than the {slots} \
@@ -118,6 +122,21 @@ pub fn init(segment: &mut AnchorSegment, slots: usize) -> RootState {
     );
     RootState::Unavailable
   }
+}
+
+/// The key region's exclusion from Windows' crash dumps (A-231), made once a process and kept for its life, as the
+/// region is: hyper-seal keeps the region out of Linux's dumps itself (`MADV_DONTDUMP`) and has no Windows arm, so the
+/// daemon registers it with its other private mappings (`slates_mem::dump_exclusion`). A refusal is counted there and
+/// reported as `dumps_unexcluded`.
+static KEY_REGION_EXCLUDED: std::sync::OnceLock<slates_mem::dump_exclusion::DumpExclusion> =
+  std::sync::OnceLock::new();
+
+/// Keeps the process's key region out of crash dumps, once (the static's doc).
+fn exclude_key_region() {
+  KEY_REGION_EXCLUDED.get_or_init(|| match hyper_seal::key_region() {
+    Some((base, len)) => slates_mem::dump_exclusion::DumpExclusion::exclude(base, len),
+    None => slates_mem::dump_exclusion::DumpExclusion::default(),
+  });
 }
 
 /// A shard's own copy of the node's root, read from its attachment of the anchor's segment into the locked region:

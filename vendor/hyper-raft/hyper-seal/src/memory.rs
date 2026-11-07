@@ -104,6 +104,19 @@ pub fn keys_held() -> Option<(usize, usize)> {
     region().map(|r| (r.slots, r.held.load(Ordering::Acquire)))
 }
 
+/// The key region's first byte and its length, once made: for a consumer that names the region to its OS where this
+/// crate cannot. On Windows a crash dump is kept from the region only by registering it with Windows Error Reporting
+/// (`WerRegisterExcludedMemoryBlock`), which a consumer does with its other private mappings (slates A-231); Linux's
+/// `MADV_DONTDUMP` is set here. Reading or writing through the pointer is never sound: every slot has its owner.
+pub fn key_region() -> Option<(*const u8, usize)> {
+    region().map(|r| {
+        (
+            std::ptr::with_exposed_provenance(r.base),
+            r.slots.saturating_mul(SLOT),
+        )
+    })
+}
+
 /// Allocates `len` bytes aligned to `page`, zeroed, locked, and out of core dumps where the OS
 /// offers it. The allocation is never freed: the region lives as long as the process.
 fn allocate(len: usize, page: usize) -> Result<usize, SealError> {
