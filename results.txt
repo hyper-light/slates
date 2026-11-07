@@ -1,0 +1,24 @@
+runner ubuntu-24.04-arm, 4 CPUs, de8fac4 diag: liveness-20, the recovery-slicing red tests on d9fac9b5, both Linu, Sat Nov  7 13:54:24 UTC 2026
+slates daemon: shard 1 is spinning: 1001 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+slates-server: shard 1 is still starting; the control loop waits a further window
+--
+thread 'a_shard_start_running_windows_of_cpu_keeps_the_daemons_beat' (5540) panicked at crates/server/tests/recovery.rs:2716:3:
+the beat went 2.004600917s without advancing while a shard's start ran on the CPU, past the 1s window plus a 100ms beat: the watchdog withheld it
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 48 filtered out; finished in 4.37s
+
+== a_shard_start_running_windows_of_cpu_keeps_the_daemons_beat exit 101
+thread 'a_large_merge_state_is_recovered_whole_and_in_slices' (5564) panicked at crates/server/tests/recovery.rs:2823:3:
+the recovery of 200 versions and 100 open works ran in one slice (recovery.slices = 0)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 48 filtered out; finished in 1.57s
+
+== a_large_merge_state_is_recovered_whole_and_in_slices exit 101
+slates daemon: shard 1 is spinning: 1005 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+slates-server: shard 1 initialized in 2001638 µs
+--
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 48 filtered out; finished in 2.36s
+
+== a_daemon_stopped_while_its_boot_waits_on_a_shard_stops exit 0
