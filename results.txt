@@ -1,0 +1,132 @@
+runner macos-latest, 5 CPUs, Sat Nov  7 02:21:39 UTC 2026, commit 858246b4
+== cli_main busy round 1 at 02:21:39
+slates anchor: the daemon's heartbeat lapsed (1003 ms old, past 1001 ms: the 1000 ms window plus this anchor's lateness p99 of 1 ms over 6 waits); killing it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 2.97s
+== cli busy round 1 at 02:21:42
+slates anchor: the daemon's heartbeat lapsed (1002 ms old, past 1001 ms: the 1000 ms window plus this anchor's lateness p99 of 1 ms over 6 waits); killing it
+frozen daemon: replaced after 1.003884666s; the anchor's beat was 1.002s old against its 1.001s bound
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 2.68s
+== cli_main busy round 2 at 02:21:45
+slates anchor: the daemon's heartbeat lapsed (1004 ms old, past 1001 ms: the 1000 ms window plus this anchor's lateness p99 of 1 ms over 6 waits); killing it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 2.84s
+== cli busy round 2 at 02:21:48
+slates anchor: the daemon's heartbeat lapsed (1003 ms old, past 1001 ms: the 1000 ms window plus this anchor's lateness p99 of 1 ms over 6 waits); killing it
+frozen daemon: replaced after 998.69975ms; the anchor's beat was 1.003s old against its 1.001s bound
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 2.72s
+== cli_main busy round 3 at 02:21:51
+slates anchor: the daemon's heartbeat lapsed (1003 ms old, past 1001 ms: the 1000 ms window plus this anchor's lateness p99 of 1 ms over 6 waits); killing it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 2.64s
+== cli busy round 3 at 02:21:53
+slates anchor: the daemon's heartbeat lapsed (1003 ms old, past 1001 ms: the 1000 ms window plus this anchor's lateness p99 of 1 ms over 6 waits); killing it
+frozen daemon: replaced after 1.004980667s; the anchor's beat was 1.003s old against its 1.001s bound
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 2.80s
+== cli_main busy round 4 at 02:21:56
+slates anchor: the daemon's heartbeat lapsed (1003 ms old, past 1001 ms: the 1000 ms window plus this anchor's lateness p99 of 1 ms over 6 waits); killing it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 2.53s
+== cli busy round 4 at 02:21:59
+slates anchor: the daemon's heartbeat lapsed (1003 ms old, past 1001 ms: the 1000 ms window plus this anchor's lateness p99 of 1 ms over 6 waits); killing it
+frozen daemon: replaced after 986.194416ms; the anchor's beat was 1.003s old against its 1.001s bound
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 2.70s
+== cli_main busy round 5 at 02:22:02
+slates anchor: the daemon's heartbeat lapsed (1002 ms old, past 1001 ms: the 1000 ms window plus this anchor's lateness p99 of 1 ms over 6 waits); killing it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 2.49s
+== cli busy round 5 at 02:22:04
+slates anchor: the daemon's heartbeat lapsed (1003 ms old, past 1001 ms: the 1000 ms window plus this anchor's lateness p99 of 1 ms over 6 waits); killing it
+frozen daemon: replaced after 955.987792ms; the anchor's beat was 1.003s old against its 1.001s bound
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 2.72s
+== cli_main busy round 6 at 02:22:07
+slates anchor: the daemon's heartbeat lapsed (1002 ms old, past 1001 ms: the 1000 ms window plus this anchor's lateness p99 of 1 ms over 6 waits); killing it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 2.65s
+== cli busy round 6 at 02:22:10
+slates anchor: the daemon's heartbeat lapsed (1004 ms old, past 1002 ms: the 1000 ms window plus this anchor's lateness p99 of 2 ms over 6 waits); killing it
+frozen daemon: replaced after 942.508709ms; the anchor's beat was 1.004s old against its 1.002s bound
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 2.64s
+== cli_main busy round 7 at 02:22:13
+slates anchor: the daemon's heartbeat lapsed (1003 ms old, past 1002 ms: the 1000 ms window plus this anchor's lateness p99 of 2 ms over 6 waits); killing it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 2.65s
+== cli busy round 7 at 02:22:16
+slates anchor: the daemon's heartbeat lapsed (1004 ms old, past 1002 ms: the 1000 ms window plus this anchor's lateness p99 of 2 ms over 6 waits); killing it
+frozen daemon: replaced after 993.47975ms; the anchor's beat was 1.004s old against its 1.002s bound
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 2.75s
+== cli_main busy round 8 at 02:22:18
+slates anchor: the daemon's heartbeat lapsed (1004 ms old, past 1002 ms: the 1000 ms window plus this anchor's lateness p99 of 2 ms over 6 waits); killing it
+not killed before its heartbeat lapsed: replaced after 862.716833ms
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 37 filtered out; finished in 2.74s
+== cli busy round 8 at 02:22:21
+slates anchor: the daemon's heartbeat lapsed (1003 ms old, past 1002 ms: the 1000 ms window plus this anchor's lateness p99 of 2 ms over 6 waits); killing it
+frozen daemon: replaced after 1.007377167s; the anchor's beat was 1.003s old against its 1.002s bound
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 2.85s
+== cli_main busy round 9 at 02:22:24
+slates anchor: the daemon's heartbeat lapsed (1003 ms old, past 1001 ms: the 1000 ms window plus this anchor's lateness p99 of 1 ms over 6 waits); killing it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 2.66s
+== cli busy round 9 at 02:22:27
+slates anchor: the daemon's heartbeat lapsed (1005 ms old, past 1001 ms: the 1000 ms window plus this anchor's lateness p99 of 1 ms over 6 waits); killing it
+frozen daemon: replaced after 1.004770833s; the anchor's beat was 1.005s old against its 1.001s bound
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 2.74s
+== cli_main busy round 10 at 02:22:30
+slates anchor: the daemon's heartbeat lapsed (1002 ms old, past 1001 ms: the 1000 ms window plus this anchor's lateness p99 of 1 ms over 6 waits); killing it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 2.81s
+== cli busy round 10 at 02:22:33
+slates anchor: the daemon's heartbeat lapsed (1005 ms old, past 1003 ms: the 1000 ms window plus this anchor's lateness p99 of 3 ms over 6 waits); killing it
+frozen daemon: replaced after 960.338333ms; the anchor's beat was 1.005s old against its 1.003s bound
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 2.86s
+== ack_release_main busy round 1 at 02:22:36
+status on a starved shard answered in 535.027667ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.17s
+== ack_release busy round 1 at 02:23:24
+status on a starved shard answered in 545.701917ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.22s
+== ack_release_main busy round 2 at 02:23:28
+status on a starved shard answered in 537.220792ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.20s
+== ack_release busy round 2 at 02:23:31
+status on a starved shard answered in 543.4645ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.28s
+== ack_release_main busy round 3 at 02:23:33
+status on a starved shard answered in 531.13825ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.06s
+== ack_release busy round 3 at 02:23:37
+status on a starved shard answered in 529.195125ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.10s
+== ack_release_main busy round 4 at 02:23:39
+status on a starved shard answered in 543.964291ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.10s
+== ack_release busy round 4 at 02:23:42
+status on a starved shard answered in 529.667209ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.06s
+== ack_release_main busy round 5 at 02:23:44
+status on a starved shard answered in 531.51ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.05s
+== ack_release busy round 5 at 02:23:47
+status on a starved shard answered in 563.592292ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.24s
+== ack_release_main busy round 6 at 02:23:50
+status on a starved shard answered in 533.241625ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.03s
+== ack_release busy round 6 at 02:23:53
+status on a starved shard answered in 532.708542ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.12s
+== ack_release_main busy round 7 at 02:23:55
+status on a starved shard answered in 544.099917ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.06s
+== ack_release busy round 7 at 02:23:58
+status on a starved shard answered in 551.142833ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.15s
+== ack_release_main busy round 8 at 02:24:01
+status on a starved shard answered in 547.887042ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.17s
+== ack_release busy round 8 at 02:24:04
+status on a starved shard answered in 528.434959ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.17s
+== ack_release_main busy round 9 at 02:24:06
+status on a starved shard answered in 545.790167ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.12s
+== ack_release busy round 9 at 02:24:10
+status on a starved shard answered in 527.189708ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.26s
+== ack_release_main busy round 10 at 02:24:12
+status on a starved shard answered in 549.18075ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.09s
+== ack_release busy round 10 at 02:24:15
+.status on a starved shard answered in 545.802584ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.33s
