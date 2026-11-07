@@ -906,6 +906,13 @@
 > failure detector held no entry for it (the owner was already stopped when it came back, so it never heard from it and
 > never suspected it); the other survivor had dropped the owner. The reproduction is
 > `a_candidates_restored_copy_serves_its_owners_takeover` (`crates/cli/tests/live_fleet.rs`, ignored until fixed).
+> Root cause (read from the code, 2026-11-07): a node joins a member to its failure detector only once a session keyed
+> it (`member_task::join_addressable` reads `plane.keyed`), and its detector ignores gossip about members it has not
+> joined (AUD-15: no authenticated peer can name arbitrary targets). A member already down when the node restarts is
+> never keyed, so never joined, and the survivors' gossip of its death is dropped. Proposed fix, not yet built: also
+> join every member the committed configuration names whose address resolves, keyed or not. The configuration
+> authorizes them, so AUD-15's bound holds. The peers' death gossip then reaches the restarted node, while its own
+> unsendable probes stay no misses (the KIND rule in `MemberPlane::join`).
 > Owner: raft. Also open there: the holder's live copies ride its recovery image, rebuilt whole at each acknowledgement
 > (`live_ship::acknowledged`), which costs about 100 µs a live write now and grows with what a candidate keeps.
 >
