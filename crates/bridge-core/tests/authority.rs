@@ -12,7 +12,10 @@ use slates_db::catalog::{Principal, VolumeId};
 fn a_context_is_built_from_the_record_and_a_revoked_attachment_is_refused() {
   let mut attachments = Attachments::new();
   let volume = VolumeId { bytes: [1; 16] };
-  let subject = Principal::Uid { uid: 501 };
+  let subject = Principal::Uid {
+    host: slates_db::HostId(0),
+    uid: 501,
+  };
   let id = attachments
     .attach(
       volume,
@@ -63,7 +66,10 @@ fn a_takeover_fences_attachments_under_the_old_epoch() {
     .attach(
       VolumeId { bytes: [2; 16] },
       View::Current,
-      Principal::Uid { uid: 0 },
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 0,
+      },
       Rights {
         read: true,
         write: false,

@@ -5,11 +5,12 @@
 
 /// Format: the segment's magic, `SLAN` in little-endian ASCII.
 pub const MAGIC: u32 = 0x4E41_4C53;
-/// Format: the layout version; changed for header, region or timestamp semantics. Version 3 uses
-/// one host-wide monotonic origin for supervision and retained deadlines; version 2 reset clocks
-/// per instance and cannot be recovered safely by a version-3 daemon. Version 4 (A-98) appends the
-/// content pool's owner words, so a version-3 segment is refused rather than read without them.
-pub const LAYOUT_VERSION: u32 = 4;
+/// Format: the layout version, changed for header, region, timestamp or record semantics: 3 a host-wide monotonic
+/// origin, 4 the content pool's owner words (A-98), 5 every principal recorded with the host whose account it is
+/// (A-237). An older segment is refused, never read under semantics it was not written with.
+pub const LAYOUT_VERSION: u32 = 5;
+/// Format: the layout before A-237's host-scoped principals, refused with what to do about it.
+pub const LAYOUT_BEFORE_HOST_SCOPED_PRINCIPALS: u32 = 4;
 /// Format: one content-pool extent's owner word (A-98): 0 while the extent is free, else its owning partition plus
 /// one, so partition 0 is distinct from "free".
 pub const POOL_WORD_BYTES: usize = 8;

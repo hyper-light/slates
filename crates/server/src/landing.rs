@@ -2365,7 +2365,7 @@ fn to_wire_volume(id: DbVolumeId) -> VolumeId {
 
 fn session_of(principal: &Principal) -> u64 {
   match principal {
-    Principal::Uid { uid } => u64::from(*uid),
+    Principal::Uid { uid, .. } => u64::from(*uid),
     // A consumer's session is its own, not its account's: two consumers under one uid never share a
     // session-scoped grant (§4.13 "distinct consumers sharing a uid cannot use each other's grant rights").
     Principal::Consumer { consumer, .. } => *consumer,

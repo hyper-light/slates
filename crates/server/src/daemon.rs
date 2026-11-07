@@ -539,6 +539,12 @@ fn boot_durability(
 }
 
 impl Daemon {
+  /// This node's certificate anchor (A-237): the host its accounts' principals name, stable across its restarts, as
+  /// `slates status` prints it. A share from another node names this node's accounts by it.
+  pub fn anchor(&self) -> Result<u64, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| s.origin_anchor.0)
+  }
+
   /// This start's fresh member identity. The instance name and certificate anchor remain stable. An
   /// observation the daemon could not make is its typed refusal ([`Self::observation`]).
   pub fn member_identity(&self) -> Result<slates_db::HostId, ObserveError> {
@@ -2849,6 +2855,16 @@ fn registered_chokepoints() -> ChokepointRegistry {
   registry
 }
 
+/// This node's certificate anchor (§4.8, A-237): the fleet's pinned certificate's when it has a fleet, else the machine
+/// identity's host id. Stable across the node's restarts. It keys completion origins, and it is the host a principal of
+/// this node names, so the rendezvous and the shard state take it from here alone.
+pub(crate) fn local_anchor(config: &DaemonConfig, identity: &Identity) -> slates_db::HostId {
+  config.fleet.as_ref().map_or_else(
+    || slates_db::HostId(host_id_of(identity)),
+    |m| m.origin_anchor,
+  )
+}
+
 /// The node's host id: the first eight bytes of the machine identity's hash. Public so a fleet operator or
 /// a multi-node test computes a node's host id from its machine identity the same way the daemon does — the
 /// id a peer names in its fleet configuration (§4.8).
@@ -3212,10 +3228,7 @@ fn init_shard(
   // The stable anchor keys TLS authentication and completion origins (§4.8). A random
   // per-start nonce derives the member id used for voting and ownership. The anchor's
   // supervision counter cannot supply freshness after whole-pod RAM loss (AUD-07).
-  let origin_anchor = config.fleet.as_ref().map_or_else(
-    || slates_db::HostId(host_id_of(identity)),
-    |m| m.origin_anchor,
-  );
+  let origin_anchor = local_anchor(config, identity);
   let issuer_secret = segment.issuer_secret()?;
   // The node's sealing root (A-92), read from this shard's own attachment into a key of its own in the locked region.
   let seal_root = crate::seal_keys::shard_root(&segment, sealing);
@@ -4441,6 +4454,8 @@ async fn control_loop(
   };
   // This loop runs on the control shard, the first of `shards`; its doorbell flag is that shard's.
   let control = shards.first().map_or(0, |shard| shard.0);
+  // The host every accepted client's account belongs to (A-237).
+  let anchor = local_anchor(&config, &identity);
   if listener.raw_fd().is_none()
     && let Some(task) = futures::current_task()
   {
@@ -4550,7 +4565,10 @@ async fn control_loop(
     {
       for a in round.accepted {
         let shard = ShardId(a.region.shard());
-        let principal = Principal::Uid { uid: a.uid };
+        let principal = Principal::Uid {
+          host: anchor,
+          uid: a.uid,
+        };
         let client_id = a.client_id;
         let mut admission = Admission {
           client_id,
@@ -5650,7 +5668,10 @@ mod tests {
         evidence: Vec::new(),
         name: String::new(),
         require_evidence: false,
-        owner: slates_db::catalog::Principal::Uid { uid: 0 },
+        owner: slates_db::catalog::Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 0,
+        },
       };
       let record = Record {
         owner,
@@ -6076,7 +6097,10 @@ mod tests {
         evidence: Vec::new(),
         name: String::new(),
         require_evidence: false,
-        owner: slates_db::catalog::Principal::Uid { uid: 0 },
+        owner: slates_db::catalog::Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 0,
+        },
       };
       let record = Record {
         owner,
