@@ -1373,6 +1373,49 @@ impl PendingGreen {
     self.records.insert(version, record);
   }
 
+  /// Re-derives every pending position's placement from `placement`, the owner's current placement of the green: a
+  /// position keeps the acknowledgements it gathered (each a durable hold) and is owed to the candidates that still
+  /// lack it. A position is enqueued under the configuration the owner holds then, which can be the one-candidate
+  /// placement a bootstrap installs before its council grows (§4.8); at `f = 1` that placement can never commit, so
+  /// a position kept to it never placed and no submit to the green was answered (the bug record of 2026-11-06). Head
+  /// records are placed by the current configuration each period (`fleet::owed_record`); merge records now are too.
+  fn retarget(&mut self, placement: &Placement) {
+    let mut changed = false;
+    for pending in self.records.values_mut() {
+      if pending.record.candidates != placement.candidates
+        || pending.record.joint != placement.joint
+      {
+        pending.record = Placement {
+          acked: std::mem::take(&mut pending.record.acked),
+          mirror_acked: pending.record.mirror_acked.take(),
+          ..placement.clone()
+        };
+        changed = true;
+      }
+      if pending.inputs.candidates != placement.candidates
+        || pending.inputs.joint != placement.joint
+      {
+        pending.inputs = Placement {
+          acked: std::mem::take(&mut pending.inputs.acked),
+          mirror_acked: pending.inputs.mirror_acked.take(),
+          ..placement.clone()
+        };
+        changed = true;
+      }
+    }
+    if !changed {
+      return;
+    }
+    self.owed.clear();
+    for (version, pending) in &self.records {
+      for host in &pending.record.candidates {
+        if !pending.record.acked.contains(host) {
+          self.owed.entry(*host).or_default().insert(*version);
+        }
+      }
+    }
+  }
+
   /// One first missing position per remote holder, grouped into the record dispatches that may
   /// share a quorum. A holder cannot skip its own prefix to follow a faster holder.
   fn next(&self, local: HostId) -> BTreeMap<u64, Vec<HostId>> {
@@ -1705,9 +1748,11 @@ pub(crate) fn next_merge_work(state: &mut ShardState, local: HostId) -> Vec<Merg
   let mut work = Vec::new();
   let objects: Vec<ObjectId> = state.merge.pending.keys().copied().collect();
   for object in objects {
-    let Some(pending_green) = state.merge.pending.get(&object) else {
+    let placement = config.place(object);
+    let Some(pending_green) = state.merge.pending.get_mut(&object) else {
       continue;
     };
+    pending_green.retarget(&placement);
     let selected = pending_green.next(local);
     for (version, targets) in selected {
       let Some(pending) = state

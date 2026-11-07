@@ -5171,6 +5171,21 @@ integration still require the A-9 tests.
 > until the ledger-prefix transfer ships the history, so its owner stays unsettled (safe: the joint writes go
 > on).
 
+> **Status (2026-11-06; amendment number owed by the supervisor;
+> `docs/bugs/2026-11-06-a-submit-in-a-three-process-fleet-is-never-answered.md`).** Two corrections, both found where a
+> green was made on a bootstrapper before its council grew:
+> - **A cohort smaller than the quorum.** A bootstrap settles the first node's neighbourhood as itself alone, so while
+>   it grows to the region a record's placement is joint with that one-member cohort. At `f = 1` a cohort of one can
+>   never give `f + 1`, so no such record committed, and the change waiting for the owner's greens never settled. A
+>   joint write now needs, of each cohort, `f + 1` or every member when it has fewer (`Quorum::committed_within`). A
+>   cohort of `f + 1` or more is judged as before. A takeover's phase one through a sub-quorum cohort already needs one
+>   promise (`Quorum::recovery`), which meets a commit every member holds.
+> - **Merge records are re-placed like heads.** A pending merge record kept the placement it was enqueued under; it
+>   now follows the owner's current placement each period (`PendingGreen::retarget`), keeping its acknowledgements.
+> Regressions: `a_submit_made_while_the_council_forms_is_answered_once_its_record_commits`,
+> `a_submit_in_a_three_process_fleet_is_answered_once_its_record_commits` (CLI), and
+> `a_joint_placement_with_a_cohort_smaller_than_the_quorum_needs_every_member_of_it`.
+
 **Leases and reads.** Epoch fencing alone does not authorize linearizable owner-local reads.
 Use the explicit lease safety obligations above: only an owner with a currently confirmed,
 conservatively bounded lease may serve the latest head locally. Expiry/uncertainty stops those
@@ -14580,6 +14595,24 @@ Applied in the same change to: §4.7 (data model, wake strategy, status); `slate
 and settle, `DaemonEnd::reply`'s stamp and confirmation) and `crates/ipc/tests/rings.rs`; GAPS. Evidence:
 `docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`. A client and a daemon of
 different layout versions refuse each other by name; no consensus rule or capability changes.
+
+### A-(number owed by the supervisor) — A joint write's sub-quorum cohort needs every member, and pending merge records follow the current placement (accepted 2026-11-06)
+
+A bootstrap installs a one-candidate placement on the bootstrapping node and settles its neighbourhood as itself, so
+a green made there before the council grows was enqueued under that placement and then, re-placed, met a joint
+placement whose settled cohort has one member. Joint writes required `f + 1` of each cohort, which a cohort of one
+can never give at `f = 1`; nothing committed and the neighbourhood change never settled. Replace the rule: each
+cohort of a joint write commits at `f + 1` of it, or at every member when it has fewer (`Quorum::committed_within`),
+and pending merge records are re-placed from the owner's current configuration each period, as head records are.
+Safety: a takeover's phase one needs `max(cohort − f, 1)` promises of a cohort (`Quorum::recovery`), and a commit in a
+sub-quorum cohort is held by all of it, so one promise meets it; every reader of a placement judges through
+`Placement::placed_with`. Rejected: refusing writes until the council has formed, which leaves the deadlock for any
+object placed before then and fixes neither half. Reviewed by raft-chaos (2026-11-06).
+
+Applied in the same change to: §4.8 (Neighbourhood changes, status); `slates-db` (`Quorum::committed_within`,
+`Placement::placed_with`, `Quorum::recovery`'s doc); `slates-server` (`merge_service::PendingGreen::retarget`); the
+fleet and CLI tests; GAPS. Evidence: `docs/bugs/2026-11-06-a-submit-in-a-three-process-fleet-is-never-answered.md`. No
+wire, layout or capability change.
 
 ### A-197 — pmem over a handed copy: a socket route for every pmem VMM (accepted and built on Linux x86_64 2026-11-01, Step 6 of the VFS and DAX plan; Firecracker on arm64 owed)
 Applied in the same change to: A-186 (the copy's length), GAPS, `crates/ipc` (`protocol.rs`: `MapWrite`'s `granule`;

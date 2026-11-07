@@ -3752,7 +3752,7 @@ fn a_submit_in_a_three_process_fleet_is_answered_once_its_record_commits() {
   });
   assert_eq!(code, 0, "the submit was accepted: {err}");
   assert_eq!(
-    value_of(&out, "version"),
+    value_of(&out, "accepted"),
     "1",
     "accepted as version 1: {out}"
   );

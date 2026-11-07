@@ -150,15 +150,15 @@
 > the demultiplexer, an endpoint's handshake and a DNS lookup each failing before its change; see the bug record of
 > 2026-11-07. Owed: the membership plane's change has no test of its own.
 
-> **A submit in a three-process fleet at `f = 1` is never answered (found 2026-11-06 by goal 4's Linux rungs; open).**
-> In a fleet deployed as separate processes from one manifest, a green's merge record never commits at the quorum, so
-> no submit is answered (§4.16 "Commit", AUD-11). That held at 1, 30, 300 and 1,000 clients, and for a CLI `submit` on
-> the owner itself. The same rule passes in every in-process shape tried. Failing test:
-> `a_submit_in_a_three_process_fleet_is_answered_once_its_record_commits` (`crates/cli/tests/cli.rs`), 4 of 4 runs.
-> Two stalled shapes: inputs put every period and refused `fleet.content.unauthorized` by the holders, or never put
-> at all. The load harness also gives up on the retryable `Overloaded`/`OwnerUnreachable`, which turned these into
-> false oracle failures (loadtest-scale's to fix). Owner: the merge record plane and content authority, through the
-> supervisor. Record: `docs/bugs/2026-11-06-a-submit-in-a-three-process-fleet-is-never-answered.md`.
+> **A submit in a three-process fleet at `f = 1` was never answered: fixed (2026-11-06, §4.8 joint writes, §4.16
+> Commit; amendment number owed by the supervisor).** A green made on the bootstrapper while its council formed had
+> its merge records enqueued under the bootstrap's one-candidate placement, and pending records were never
+> re-placed; once they were, the joint placement joined the bootstrap's one-member settled cohort, which can never
+> give `f + 1`. Pending merge records now follow the current configuration each period, as heads do
+> (`PendingGreen::retarget`), and a joint cohort smaller than the quorum needs every member
+> (`Quorum::committed_within`). In-process red test: 0 of 8 answered before, 5 of 5 after (1.2 s); three-process CLI
+> test: 0 of 5 before, 3 of 3 after (2.3 to 3.0 s). Record:
+> `docs/bugs/2026-11-06-a-submit-in-a-three-process-fleet-is-never-answered.md`.
 
 > **The anchor kills live daemons on a busy machine (found 2026-11-06, audit step 7; fixed by A-228, Windows CI owed).** Under the
 > A/B bar's load, two spinners a logical CPU (8 on CI's 4-CPU Windows runners), the anchor killed daemons that were
