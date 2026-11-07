@@ -873,3 +873,5 @@ slates-server: shard 2 initialized in 2500 µs
 slates-server: shard 0 initialized in 3073 µs
 slates-winfsp: reply spin window = 11600 ns: the median one-way channel wake of 15 (the 2-competitive spin)
 ## run 5 of 5 done, 2026-11-07T20:21:44Z
+To https://github.com/hyper-light/slates
+   ebb0d6e..dc970fd  dc970fd4adcf576a8f4fdfa674b845c8818fb482 -> diag-winfsp-overlap-results-42405814913-candelete-ab
