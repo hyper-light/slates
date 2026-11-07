@@ -1016,13 +1016,12 @@ fn assert_retry_semantics(green: &mut Green, first: &Outcome) {
   );
 }
 
-/// §4.2 all-cost admission, §4.16 "delta retention before folding" (AUD-16): small edits to a large
-/// file retain a full copy of the file per edit — **measured** here: after `SMALL_EDITS` four-byte
-/// overwrites of a 64 KiB file the content history holds one 64 KiB copy per superseded version, the
-/// engine's running total equals the recount, and every version still reconstructs. Folding the
-/// histories to the head releases every copy no reader can name (the running total and the recount
-/// agree at zero), keeps the current file exactly, and keeps a version at or above the floor
-/// reconstructible; folding to a lower floor keeps the one copy in effect there.
+/// §4.2 all-cost admission, §4.16 "delta retention before folding" (AUD-16) and "Splice" (W2): small edits to a large
+/// file retain what they changed, not the file. After `SMALL_EDITS` four-byte overwrites of a 64 KiB file the content
+/// history holds less than one copy of it (it held one whole copy per edit, eight here, before 2026-11-07), the
+/// engine's running total equals the recount, and every version still reconstructs. Folding to a reader's version
+/// stops there, balanced, keeping every version at or above it; folding to the head releases everything no reader can
+/// name, keeping the current file exactly.
 #[test]
 fn small_edits_to_a_large_file_are_charged_as_retained_history_and_fold_below_the_floor() {
   let mut green = Green::new();
@@ -1034,36 +1033,26 @@ fn small_edits_to_a_large_file_are_charged_as_retained_history_and_fold_below_th
     "the current file is content, not history"
   );
   apply_small_edits(&mut green);
-  assert_amplified(&green);
+  assert_shared(&green);
   let head = green.head();
   assert_fold_bounded_by_the_reachable_floor(&mut green, head);
   assert_fold_to_head(&mut green, head);
 }
 
-/// Folding is budget-driven and floor-bounded: under an ample budget nothing folds (an earlier
-/// version can still be re-pinned); under a budget of five copies with a live reader at version 3 the
-/// oldest copies go one version at a time until the floor binds — six copies remain, balanced, and
-/// versions at or above 3 still reconstruct.
+/// Folding is floor-bounded: with a live reader at version 3 and no budget at all, the fold stops at 3, balanced, and
+/// versions at or above 3 still reconstruct while the head is untouched.
 fn assert_fold_bounded_by_the_reachable_floor(green: &mut Green, head: u64) {
-  let copies = usize::try_from(SMALL_EDITS).unwrap();
+  let before = green.retained_bytes().history;
+  let released = green.fold_history_to_budget(3, 0);
   assert_eq!(
-    (
-      green.fold_history_to_budget(3, copies * LARGE_FILE_BYTES),
-      green.folded_below()
-    ),
-    (0, 0),
-    "an ample budget folds nothing: every version stays reconstructible"
+    green.folded_below(),
+    3,
+    "the reader's version bounds the fold"
   );
-  let released = green.fold_history_to_budget(3, (copies - 3) * LARGE_FILE_BYTES);
   assert_eq!(
-    (
-      released,
-      green.folded_below(),
-      green.retained_bytes().history
-    ),
-    (2 * LARGE_FILE_BYTES, 3, (copies - 2) * LARGE_FILE_BYTES),
-    "the two copies below the reader's version were released, then the floor bound the fold above \
-     the budget"
+    green.retained_bytes().history,
+    before - released,
+    "what the fold released left the running total"
   );
   assert_eq!(
     green.retained_bytes().history,
@@ -1091,45 +1080,59 @@ fn apply_small_edits(green: &mut Green) {
   }
 }
 
-/// The measured amplification: one full copy of the superseded file per small edit, the running
-/// total equal to the recount, the current file held once, and an early version reconstructing.
-fn assert_amplified(green: &Green) {
+/// What the edits retained: less than one copy of the file for all of them together (one whole copy per edit before
+/// W2), the running total equal to the recount, the current file held once, and every version reconstructing.
+fn assert_shared(green: &Green) {
   let retained = green.retained_bytes();
-  assert_eq!(
-    (retained.history, retained.content),
-    (
-      usize::try_from(SMALL_EDITS).unwrap() * LARGE_FILE_BYTES,
-      LARGE_FILE_BYTES
-    ),
-    "each small edit retained a full copy of the superseded file (the measured amplification); the \
-     current file once"
+  assert!(
+    retained.history < LARGE_FILE_BYTES,
+    "{} small edits retained {} bytes, a copy of the file is {LARGE_FILE_BYTES}",
+    SMALL_EDITS,
+    retained.history
   );
+  assert_eq!(retained.content, LARGE_FILE_BYTES, "the current file once");
   assert_eq!(
     retained.history,
     green.history_bytes_recounted(),
     "the running total is what the histories hold"
   );
-  let at_two = green.content_at("big", 2).expect("version 2 reconstructs");
-  assert_eq!(
-    &at_two[..8],
-    b"EDIT....",
-    "version 2 holds the first edit only"
-  );
+  for version in 1..=green.head() {
+    let bytes = green
+      .content_at("big", version)
+      .expect("every version reconstructs");
+    let edits = usize::try_from(version - 1).unwrap();
+    for edit in 0..usize::try_from(SMALL_EDITS).unwrap() {
+      let at = edit * 8;
+      let expected: &[u8] = if edit < edits { b"EDIT" } else { b"...." };
+      assert_eq!(
+        &bytes[at..at + 4],
+        expected,
+        "version {version}, edit {edit}"
+      );
+    }
+  }
 }
 
-/// With no reader below the head and no budget at all, folding releases every retained copy, keeps
-/// the current file exactly, and is idempotent.
+/// With no reader below the head and no budget at all, folding releases every earlier version, keeps the current file
+/// exactly, and is idempotent; what stays retained is only the overwritten bytes inside the chunk the current file
+/// shares (W2).
 fn assert_fold_to_head(green: &mut Green, head: u64) {
   let released = green.fold_history_to_budget(head, 0);
   assert!(released > 0, "something was left to release");
+  let retained = green.retained_bytes().history;
   assert_eq!(
     (
-      green.retained_bytes().history,
       green.history_bytes_recounted(),
       green.content("big").map(|bytes| bytes.len())
     ),
-    (0, 0, Some(LARGE_FILE_BYTES)),
-    "nothing is retained beyond the current file, which is untouched"
+    (retained, Some(LARGE_FILE_BYTES)),
+    "balanced, and the current file is untouched"
+  );
+  // What stays is the bytes the edits overwrote, held inside the chunk the current file still shares (W2): a chunk
+  // lives while any piece names it.
+  assert!(
+    retained <= usize::try_from(SMALL_EDITS).unwrap() * 4,
+    "nothing is retained but the overwritten bytes of a shared chunk: {retained}"
   );
   assert_eq!(green.fold_history_to_budget(head, 0), 0, "idempotent");
 }
