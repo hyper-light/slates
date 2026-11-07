@@ -228,10 +228,17 @@
 > **The loaded Linux tail is the scheduler's slice; a 100 µs slice cuts it 3 to 4 times (diag-perf-5, run
 > 42173825162).** Under the controlled load, accept p99 was 1.9 to 4.0 ms (x86_64) and 2.2 to 10 ms (arm64) with
 > slates' threads asking EEVDF for a 100 µs slice, against 6.1 to 15 ms and 20 to 35 ms without, in the same build.
-> The loaded p50 rose (19 to 21 µs became 81 to 393 µs, x86_64). The slice is harness-only until A-224 builds it into
-> the runtime. Owed there: a slice derived from the measured wake and service times; the proof that it needs no
-> privilege; the older kernel's refusal logged once; and the idle wakeup and CPU cost at rest. Also owed: a Windows x86_64
-> paced p999 of 20 to 34 ms in both builds, not yet traced.
+> The loaded p50 rose (19 to 21 µs became 81 to 393 µs, x86_64). **Built as A-224 (2026-11-06):** each shard thread
+> asks for `shard_slice_ns` (`wake.p99 + wake.mean`, within the kernel's 0.1 to 100 ms), held with no privilege (CapEff
+> 0, Linux 6.19.10). The product A/B (diag-perf-6, run 42188445711): arm64 loaded accept p99 13 to 25 ms became 6.7 to
+> 9.0 ms, and the max 20 to 35 ms became 9 to 12 ms. On x86_64 the p99 overlaps (3.4 to 8.9 against 5.1 to 7.2 ms) and
+> the max fell from 8 to 16 to 8 to 10 ms. At rest the two are identical. **Open:**
+> - the loaded p50 on arm64 (some rounds 3.8 to 4.0 ms against 17 to 210 µs);
+> - x86_64's remaining tail: the harness arm that also sliced the client's thread reached 1.9 to 4.0 ms there, but a
+>   client's threads are its caller's;
+> - a run on a kernel older than 6.12;
+> - Miri and loom over the runtime change, which are CI's, and run when it lands;
+> - a Windows x86_64 paced p999 of 20 to 34 ms in both builds, not yet traced.
 >
 
 > **Windows conformance runs, and the arm64 Linux suites (2026-11-05, A-209; VFS plan step 10).** WinFsp's own two

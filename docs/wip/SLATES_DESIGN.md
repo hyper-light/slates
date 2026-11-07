@@ -13374,8 +13374,16 @@ Status: built 2026-11-06 (Linux; macOS and Windows have no such request, and ask
   `systemd-run --user` unit (CapEff 0000000000000000, `Nice=19`) on kiln-a094a12d, Linux 6.19.10. Result: `Held(100000)`,
   policy and nice (0, 19) before and after. On macOS it answers `Unsupported`. No kernel older than 6.12 was at hand;
   that branch is the test's assertion on such a kernel.
-- Measured: the harness-only arm of diag-perf-5 (BENCHMARKS). The product's own A/B, base `20c74c56` against this
-  change under the controlled load, and its idle wakeups and CPU at rest, are diag-perf-6's, owed.
+- Measured (diag-perf-6, run 42188445711, CI's Linux 7.0.0-1017-azure runners, BENCHMARKS): base `20c74c56` against
+  this change, under the controlled load, interleaved × 3. The kernel held 100 µs on both runners.
+  - arm64: accept p99 13.0 to 25.2 ms became 6.7 to 9.0 ms, and the max 19.5 to 35.0 became 9.0 to 11.9 ms.
+  - x86_64: accept p99 3.4 to 8.9 ms became 5.1 to 7.2 ms, overlapping, and the max 8.1 to 16.0 became 8.1 to 9.7 ms.
+  - At rest, each build's idle daemon over a minute was identical: 657 voluntary switches and 4 CPU ticks (x86_64),
+    777 to 779 and 4 to 5 (arm64).
+  - Quiet, paced and unpaced, even.
+  - The cost is the loaded p50: some arm64 rounds 3.8 to 4.0 ms, against 17 to 210 µs.
+  - The harness-only arm of diag-perf-5 sliced the client's thread too and cut x86_64's p99 to 1.9 to 4.0 ms. A
+    client's threads are its caller's, so the runtime does not slice them, and that part of the gain is not taken.
 
 ### A-225 — Edit and submit in one request (accepted 2026-11-06, the supervisor's decision (b))
 Applied in the same change to: §4.16 ("Edit and submit in one request"), `crates/ipc/src/protocol.rs`

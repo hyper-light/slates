@@ -8380,6 +8380,30 @@ two accept forms in the other order). 3 runs × up to 1,000 samples; a run stops
 One request is one forwarded round trip: `accept_one` costs a ping. The p99 is the link's: accept 138 to 158 ms,
 accept_one 70 to 132 ms.
 
+**The runtime's slice, the product A/B (A-224; diag-perf-6, run 42188445711, 2026-11-06 08:37 to 09:12 UTC).** base =
+`20c74c56`, fix = `7c04f873`, in the same workflow as diag-perf-5 (`.github/workflows/diag-perf.yml` on branch
+`diag-perf-6`), interleaved × 3 under the controlled load, then quiet, paced and unpaced. The fix's shards ask for
+`shard_slice_ns` themselves; nothing in the harness asks. The boot log on both runners: `slates-rt: shard slice: asked
+100000 ns (shard_slice_ns), the kernel holds 100000 ns`. Loaded p99 per round, in ms (rounds 1, 2, 3):
+
+| Runner, form | base p99 | fix p99 | base max | fix max |
+|---|---|---|---|---|
+| ubuntu-latest, accept 10 files | 7.99, 3.41, 7.05 | 5.05, 7.22, 5.48 | 8.06–12.99 | 8.21–8.81 |
+| ubuntu-latest, conflict 10 files | 6.00, 6.03, 6.00 | 4.93, 4.71, 5.39 | 8.90–11.82 | 6.96–10.12 |
+| ubuntu-latest, accept 1,000 files | 8.88, 6.03, 6.81 | 6.00, 5.66, 7.18 | 12.06–15.99 | 8.09–9.70 |
+| ubuntu-24.04-arm, accept 10 files | 25.2, 13.0, 24.0 | 9.00, 9.00, 7.19 | 19.53–34.99 | 9.00–11.85 |
+| ubuntu-24.04-arm, conflict 10 files | 23.0, 8.95, 26.0 | 1.77, 9.00, 9.00 | 19.00–35.00 | 7.80–11.92 |
+| ubuntu-24.04-arm, accept 1,000 files | 20.89, 15.99, 25.96 | 8.09, 9.00, 6.67 | 26.99–34.99 | 10.17–11.04 |
+
+- Quiet, paced and unpaced: even, every form, on both runners (accept p99 0.03 to 0.10 ms in either build).
+- At rest, each build's `slates daemon --quick` idle for 60 s, interleaved × 2 (`/proc/PID/task/*`): x86_64 657, 657,
+  658, 657 voluntary switches, 0 to 1 involuntary, 4 CPU ticks each (CLK_TCK 100); arm64 777, 777, 777, 779 switches,
+  4 to 5 ticks. The slice costs nothing at rest.
+- The loaded p50 is the cost on arm64: some fix rounds 3.8 to 4.0 ms (accept), against 17 to 210 µs for base. On x86_64
+  it was 19 to 20 µs, against 16 to 18 µs (one conflict round 2.0 ms).
+- Against diag-perf-5's harness arm (x86_64 p99 1.9 to 4.0 ms): that arm sliced the in-process client's thread too.
+  The product slices only its shards, since a client's threads are its caller's, so x86_64 keeps only part of the gain.
+
 **Across two machines (item 2, 2026-11-06 03:14 to 03:21 UTC).** A two-node fleet from one manifest (`f = 0`): the server
 node on adas-macbook-pro-2 (192.168.1.71, Wi-Fi, load 15 to 24) and the client node on kiln-a094a12d (Fedora, x86_64,
 32 cores, 192.168.1.72, Wi-Fi, load 6 to 42), each `slates daemon --quick --shards 2 --fleet fleet.json --node N`, release
