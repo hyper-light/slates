@@ -31,6 +31,9 @@ const CREDIT_WAIT: Duration = Duration::from_secs(5);
 /// Shape: how long the other shard is held: one liveness budget. A reply that waited for it took at least that; one
 /// that did not comes in microseconds.
 const HOLD: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);
+/// Shape: how often a hold that lasts until the client's answer looks whether it may end: a hundredth of the hold the
+/// other tests use, so it ends promptly once the answer is in.
+const HOLD_POLL: Duration = Duration::from_millis(10);
 /// Shape: the names tried while looking for one the other shard owns; with two shards a run that finds none in this
 /// many is a fault of the hash, not luck.
 const NAME_TRIES: usize = 64;
@@ -190,6 +193,44 @@ fn hold(
     std::thread::yield_now();
   }
   waiter
+}
+
+/// Holds the shard at `partition` until the test lowers `holding` (or the client's reply deadline passes): its thread
+/// runs nothing else meanwhile. Returns once the hold has begun, with the thread that waits for it to end. A scatter's
+/// part must be refused while its shard is held, and the part's wait for room ends by the scatter's own shard's clock,
+/// which on a busy machine runs late against any fixed hold: the scheduled CI run 42206043007 on ubuntu x86_64 tried
+/// the part once more after a one-second hold had ended, the drained channel took it, and the listing was answered in
+/// full. So the hold ends only once the client has its answer.
+///
+/// The hold's flags are its own: the scatter tests run in parallel, and with one flag shared among them the first test
+/// to be answered ended the others' holds (ten of ten rounds failed on CI's loaded Linux runners, diag `ack-1`). Returns
+/// the flag that ends the hold when lowered.
+fn hold_until_answered(
+  daemon: &Daemon,
+  partition: usize,
+) -> (std::thread::JoinHandle<()>, &'static AtomicBool) {
+  let held = &*Box::leak(Box::new(AtomicBool::new(false)));
+  let holding = &*Box::leak(Box::new(AtomicBool::new(true)));
+  let shard = daemon.shards()[partition];
+  let observation = daemon
+    .observation(Some(shard), OBSERVE_BUDGET_NS, move |_: &mut ShardState| {
+      held.store(true, Ordering::Release);
+      let started = Instant::now();
+      while holding.load(Ordering::Acquire)
+        && started.elapsed() < Duration::from_nanos(DEADLINE_NS)
+      {
+        let (_hold, rx) = std::sync::mpsc::channel::<()>();
+        let _ = rx.recv_timeout(HOLD_POLL);
+      }
+    })
+    .unwrap();
+  let waiter = std::thread::spawn(move || observation.wait().unwrap());
+  let started = Instant::now();
+  while !held.load(Ordering::Acquire) {
+    assert!(started.elapsed() < CREDIT_WAIT, "the hold began");
+    std::thread::yield_now();
+  }
+  (waiter, holding)
 }
 
 /// A-216, §4.9. Do: on a two-shard daemon, create a volume the other shard owns (its completion is recorded there),
@@ -430,15 +471,15 @@ fn scattered_with_the_other_shard_full(
   name: &str,
   body: &RequestBody,
 ) -> (usize, ReplyBody, Duration) {
-  static HELD: AtomicBool = AtomicBool::new(false);
   let (daemon, instance) = daemon(name);
   let mut client = Client::connect(&instance);
   let other = 1 - serving(&daemon, client.client);
-  let holding = hold(&daemon, other, HOLD, &HELD);
+  let (holding, hold_on) = hold_until_answered(&daemon, other);
   let flooded = daemon.flood_control_channel_of(other).unwrap();
   let started = Instant::now();
   let (_, reply) = client.call(body);
   let took = started.elapsed();
+  hold_on.store(false, Ordering::Release);
   holding.join().unwrap();
   let shard = usize::from(daemon.shards()[other].0);
   daemon.stop();
@@ -446,8 +487,9 @@ fn scattered_with_the_other_shard_full(
   (shard, reply, took)
 }
 
-/// The answer a scatter must give when a part cannot be sent to `shard`: the typed refusal, decided inside the hold — had
-/// the part waited past it, the drained channel would have taken it and the scatter would have answered in full. The
+/// The answer a scatter must give when a part cannot be sent to `shard`: the typed refusal. The other shard is held until
+/// the answer is in ([`hold_until_answered`]), so a part that waited however long on a busy shard still met a full
+/// channel; before, a fixed hold could end first, and the drained channel took the part. The
 /// part waits for room for half the liveness budget first, so the answer comes after that, and within the client's reply
 /// deadline. The answer's delivery is not held to the hold: on a busy shard it takes longer, and only the decision's
 /// moment is the design's (2026-11-06).
@@ -508,13 +550,12 @@ const STARVED_FOR: Duration = Duration::from_millis(20);
 /// the hold, as it did once at load 62–68 on macOS (2026-11-06).
 #[test]
 fn a_status_on_a_starved_shard_is_refused_overloaded_on_time() {
-  static HELD: AtomicBool = AtomicBool::new(false);
   static STARVING: AtomicBool = AtomicBool::new(false);
   let (daemon, instance) = daemon("status-starved");
   let mut client = Client::connect(&instance);
   let mine = serving(&daemon, client.client);
   let other = 1 - mine;
-  let holding = hold(&daemon, other, HOLD, &HELD);
+  let (holding, hold_on) = hold_until_answered(&daemon, other);
   let flooded = daemon.flood_control_channel_of(other).unwrap();
   STARVING.store(true, Ordering::Release);
   let caller = std::thread::spawn(move || {
@@ -544,6 +585,7 @@ fn a_status_on_a_starved_shard_is_refused_overloaded_on_time() {
     let _ = starved.wait();
   }
   let (reply, took) = caller.join().unwrap();
+  hold_on.store(false, Ordering::Release);
   holding.join().unwrap();
   let shard = usize::from(daemon.shards()[other].0);
   daemon.stop();

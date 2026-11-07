@@ -1,0 +1,70 @@
+name: diag-clients
+
+# Diagnostics only, never on main (the ack_release scatter tests' fixed hold, main CI run 42206043007): on CI's two
+# Linux runners, under the A/B bar's load (two spinning shell loops a logical CPU), ten interleaved rounds of main's
+# crates/server/tests/ack_release.rs (carried here as ack_release_main.rs) and of the fixed one, run as CI runs them
+# (the default test threads). Each job pushes its result lines to diag-results/clients-ack-2-<os> with the Actions
+# token, read by git fetch at no API quota.
+on:
+  push:
+    branches: ["diag-clients-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ack-release:
+    name: ack_release under load on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the tests
+        run: cargo test --locked -p slates-server --test ack_release --test ack_release_main --no-run
+      - name: Main's and the fixed ack_release, interleaved, under the bar's load
+        run: |
+          set +e
+          R=../results.txt
+          cpus=$(nproc)
+          echo "runner ${{ matrix.os }}, $cpus CPUs, $(date -u), commit $(git rev-parse --short HEAD)" > $R
+          pids=""
+          for i in $(seq 1 $((cpus * 2))); do ( while :; do :; done ) & pids="$pids $!"; done
+          for round in $(seq 1 10); do
+            for t in ack_release_main ack_release; do
+              echo "== $t busy round $round at $(date -u +%H:%M:%S)" | tee -a $R
+              cargo test --locked -q -p slates-server --test $t -- --nocapture 2>&1 | grep -E 'answered in|panicked|Listed|Refused|test result|^    [a-z_:]+$' | tee -a $R
+            done
+          done
+          for p in $pids; do kill "$p" 2>/dev/null || true; done
+          wait 2>/dev/null || true
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/clients-ack-2-${{ matrix.os }}"
+          git config user.name "diag-clients"
+          git config user.email "diag-clients@users.noreply.github.com"
+          git stash -q || true
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-clients ack-2 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
