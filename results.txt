@@ -12,3 +12,4 @@ run 3 exit 0 9s load=2.14 0.96 0.36
     slates daemon: the control shard's beat task ran 612 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 60 steps and 181 polls (181 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 1; 5 tasks live; its longest poll is 263 ms and its timer overrun 0 ms
     green over 4000 files of 16384 bytes: 6.425017381s, reply GreenCreated { id: VolumeId { bytes: [209, 148, 161, 64, 42, 96, 23, 119, 0, 0, 0, 0, 0, 0, 35, 86] } }; 3413 probes inside it — p50 898.603µs, p99 3.018263ms, longest of all 517.195096ms; before it the longest 749.924µs
     test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.23s
+DONE
