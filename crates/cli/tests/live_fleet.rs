@@ -799,6 +799,118 @@ fn a_paused_candidate_neither_stops_writes_nor_stays_behind() {
   );
 }
 
+/// A-200 with each candidate stopped in turn: do stop one candidate's process, write files, resume it and wait for it
+/// to catch up, then the same with the other. Expect no write to wait as long as the liveness budget, since the other
+/// candidate answers throughout, and each resumed candidate to catch up to the owner's head. Before the holders were
+/// shipped to at once, a write's messages went to them one after another, so with the holder asked first stopped every
+/// write waited a liveness budget for it before the healthy one was asked (2026-11-06, `live_chaos`: p50 1.01 s, p99
+/// 5.5 s). And an exchange still in flight when its dispatch ended was dropped with its holder's session in it, so a
+/// resumed candidate was never sent to again (KIND, raft-chaos run 42178128960: both of an owner's sessions
+/// `lent=true` with its log stuck).
+#[test]
+fn each_candidate_stopped_in_turn_holds_no_write_and_catches_up() {
+  /// Shape: writes made while each candidate is stopped.
+  const WRITES_PER_STOP: usize = 4;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping stop-in-turn flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-turns");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = &fleet.instances[owner_index];
+  let others: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| *instance != owner)
+    .collect();
+  let id = create_live_volume(owner, "turns");
+  write_files(owner, &id, 0..1);
+  let liveness = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
+  let mut waited = Vec::new();
+  let mut behind = Vec::new();
+  let mut next = 1;
+  for step in 1..fleet.instances.len() {
+    let stopped = (owner_index + step) % fleet.instances.len();
+    signal(&fleet.daemons[stopped], rustix::process::Signal::STOP);
+    let latencies = write_files(owner, &id, next..next + WRITES_PER_STOP);
+    next += WRITES_PER_STOP;
+    signal(&fleet.daemons[stopped], rustix::process::Signal::CONT);
+    let (caught_up, shipping, held) = wait_caught_up(owner, &others, &id);
+    eprintln!(
+      "live turns: {} stopped: writes {latencies:?}; then {shipping:?} {held:?}",
+      fleet.instances[stopped]
+    );
+    waited.extend(
+      latencies
+        .into_iter()
+        .filter(|took| *took >= liveness)
+        .map(|took| (fleet.instances[stopped].clone(), took)),
+    );
+    if !caught_up {
+      behind.push((fleet.instances[stopped].clone(), shipping, held));
+    }
+  }
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  assert!(
+    waited.is_empty(),
+    "no write waits for the stopped candidate: {waited:?}"
+  );
+  assert!(
+    behind.is_empty(),
+    "each resumed candidate catches up: {behind:?}"
+  );
+}
+
+/// A-200: a new live volume's log is shipped only to candidates that hold its catalog. Do make a volume live-shipped and
+/// write files to it at once. Expect neither candidate to refuse an entry for not holding the volume's catalog
+/// (`fleet.live.hold_refused.no_catalog`): a candidate derives what it keeps from the catalog, which the record plane
+/// places within a record period, so an entry sent before that is refused, and with it the session it rode. Found
+/// 2026-11-06 in `live_chaos`: 116 and 119 such refusals on the two candidates of one run, and the installs they drew
+/// held a session against the record plane's own re-ship of the catalog.
+#[test]
+fn a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping catalog flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-catalog");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = &fleet.instances[owner_index];
+  let others: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| *instance != owner)
+    .collect();
+  let id = create_live_volume(owner, "catalogued");
+  write_files(owner, &id, 0..FILES);
+  let (caught_up, shipping, held) = wait_caught_up(owner, &others, &id);
+  let refused: Vec<(String, u64)> = others
+    .iter()
+    .map(|other| {
+      (
+        (*other).clone(),
+        counter(other, "fleet.live.hold_refused.no_catalog"),
+      )
+    })
+    .collect();
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!("live catalog: refusals {refused:?}; then {shipping:?} {held:?}");
+  assert!(
+    caught_up,
+    "both candidates hold the owner's head: {shipping:?} {held:?}"
+  );
+  assert!(
+    refused.iter().all(|(_, count)| *count == 0),
+    "no entry sent to a candidate without the volume's catalog: {refused:?}"
+  );
+}
+
 /// A-200 under injected latency: do stop each candidate's process for `STALL` of every `2 × STALL`, out of phase, so for
 /// part of each period both are stopped, while writing `WRITES_UNDER_STALLS` files. Expect every write answered and durable
 /// (some waiting out a stall: both candidates stopped means no durability until one resumes), none refused, and both
