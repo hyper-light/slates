@@ -44,3 +44,15 @@ live keyed: ZZ live-keyed-b-24642 counters {"held": 9}
 live keyed: ZZ live-keyed-c-24642 counters {"appended": 6, "awaited": 5, "durable": 6, "held_back.keys": 4, "held_back.placement": 1, "held_back.whole": 1, "holders_recorded": 1, "no_session": 10, "resolved": 5, "unanswered": 4, "whole": 2}
 live keyed: the writes returned while the candidate was stopped: false; served whole by live-keyed-a-24642 after 2.5978975s
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 8.91s
+=== keyed-2 exit 0 load { 68.31 50.21 27.75 }
+test a_live_volume_made_while_its_successor_was_stopped_is_served_by_it ... slates daemon: fleet node `a` of `slates-fleet`: member 10359645243065632233 with 2 peer(s) at f = 1
+live keyed: created 3df103e7dad97455000000000000001a after 879.308458ms
+live keyed: created 3df103e7dad974550001000000000006 after 887.816375ms
+live keyed: 3df103e7dad974550001000000000006's successor is the stopped node, after 887.890208ms
+live keyed: live-shipped and writing, after 887.959541ms
+live keyed: ZZ owner counters before the kill {"appended": 6, "awaited": 5, "durable": 6, "held_back.keys": 9, "held_back.placement": 1, "held_back.whole": 1, "holders_recorded": 1, "no_session": 16, "resolved": 5, "unanswered": 9, "whole": 2}
+live keyed: ZZ live-keyed-a-25063 counters {"appended": 6, "awaited": 5, "durable": 6, "held_back.keys": 9, "held_back.placement": 1, "held_back.whole": 1, "holders_recorded": 1, "no_session": 16, "resolved": 5, "unanswered": 9, "whole": 2}
+live keyed: ZZ live-keyed-b-25063 counters {"held": 10}
+live keyed: ZZ live-keyed-c-25063 counters {"held": 9}
+live keyed: the writes returned while the candidate was stopped: false; served whole by live-keyed-b-25063 after 2.722500459s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 8.22s
