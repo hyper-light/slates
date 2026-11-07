@@ -1,0 +1,7 @@
+=== learner-1 exit 101 load { 66.50 65.44 39.67 }
+thread 'a_learner_learns_configurations_that_leave_the_membership_alone' (28027) panicked at crates/server/tests/fleet.rs:6116:3:
+every member's council reached the newest configuration (installed, council) per member: [Ok((8, 8)), Ok((8, 8)), Ok((7, 7)), Ok((8, 8)), Ok((8, 8))]; voters Ok(Some([HostId(104699469104436874), HostId(7348883709076653863), HostId(13163012736959007843)]))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 95 filtered out; finished in 417.26s
+
