@@ -14176,6 +14176,15 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   hand-off test passes in each of 6 (no later child inherits the end, against an inheritable copy's contrast), and the
   client Shards suite 11 of 11 in each of 3, with the hostile holder test. All are red-checked. **Owed:** arm64 Windows
   runs `stream_spawn` but not the CLI test (its lane builds no `slates-cli`).
+- **Landing on Windows built (A-185, 2026-10-26):** `slates-land` has a Windows write seam
+  (`crates/land/src/os_windows.rs`), handle-relative over NTFS, and the server lands on Windows. Proven on jupiter: the
+  land suite whole (the kill test on NTFS, the escape oracle with junction and hard-link swaps, the removal oracle with
+  real outsider saves), red-checked three ways. Found and fixed on the way: Windows base modes were raw attributes
+  (`docs/bugs/2026-10-26-windows-base-file-modes-were-raw-attributes.md`), and NTFS tunneling gives a renamed file the
+  creation time of the name's last holder (the engine's move check sets the birth time aside). **Owed:** a symbolic
+  link in a landing on Windows (refused `EPERM`: no unprivileged, handle-relative way to make one); a reflink
+  (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS); arm64 Windows. CI's x86_64 Windows lane runs the land suite whole and
+  lints it.
 - **Windows' DAX window built (G-shards-windows step 5, A-180, 2026-10-26):** a descriptor ask on a Windows stream
   names the asking process and its stream handle there. The daemon checks the handle is this stream's own object, by
   `CompareObjectHandles` against a known holder, never by a name query, which hung past 3 s on a synchronous pipe with

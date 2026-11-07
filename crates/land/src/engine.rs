@@ -773,14 +773,7 @@ impl<H: LandFs> Landing<'_, H> {
     witness: &Witness,
   ) -> Result<Option<bool>, HostError> {
     match self.host.entry_fingerprint(dir, aside) {
-      Ok(moved) => Ok(Some(
-        Fingerprint {
-          ctime_ns: witness.fingerprint.ctime_ns,
-          uid: witness.fingerprint.uid,
-          gid: witness.fingerprint.gid,
-          ..moved
-        } == witness.fingerprint,
-      )),
+      Ok(moved) => Ok(Some(same_object_after_a_move(&witness.fingerprint, &moved))),
       Err(HostError::NotFound) => Ok(None),
       Err(e) => Err(e),
     }
@@ -928,14 +921,7 @@ impl<H: LandFs> Landing<'_, H> {
     let restored = self
       .restored
       .get(&entry.path)
-      .filter(|after| {
-        Fingerprint {
-          ctime_ns: witness.fingerprint.ctime_ns,
-          uid: witness.fingerprint.uid,
-          gid: witness.fingerprint.gid,
-          ..**after
-        } == witness.fingerprint
-      })
+      .filter(|after| same_object_after_a_move(&witness.fingerprint, after))
       .copied();
     Some(match restored {
       Some(after) => Witness {
@@ -1897,14 +1883,7 @@ impl<H: LandFs> Landing<'_, H> {
   /// or racy witness additionally requires the witnessed bytes and a stable read (§4.15).
   fn displaced_matches(&mut self, file: HostFile, witness: &Witness) -> Result<bool, HostError> {
     let before = self.host.fstat(file)?;
-    // A metadata-only change (the ctime, and the owner a `chown` moves with it) is not drift of the bytes.
-    let preserved = Fingerprint {
-      ctime_ns: witness.fingerprint.ctime_ns,
-      uid: witness.fingerprint.uid,
-      gid: witness.fingerprint.gid,
-      ..before
-    };
-    if preserved != witness.fingerprint {
+    if !same_object_after_a_move(&witness.fingerprint, &before) {
       return Ok(false);
     }
     if before == witness.fingerprint && !witness.racy {
@@ -3990,4 +3969,21 @@ fn advances(outcome: Option<&Outcome>) -> bool {
         | Outcome::Skipped(SkipReason::AlreadyThere | SkipReason::Drift)
     )
   )
+}
+
+/// Whether `after` is the witnessed object `witness` after a move: every field equal but those a move or a
+/// metadata-only change may set without touching the bytes — the ctime, the owner a `chown` moves with it, and the
+/// birth time. NTFS gives a file renamed onto a name another file left moments before that file's creation time
+/// ("tunneling"), and the landing's fallback does exactly that (the old file onto the hidden name the temporary just
+/// left): measured on jupiter (Windows 10.0.26200, 2026-10-26), every replacement was undone `TargetInUse` with the
+/// birth time the only other difference. The device, the file index, the size, the mtime and the mode still name the
+/// object; a changed ctime or a racy witness still asks for the bytes.
+fn same_object_after_a_move(witness: &Fingerprint, after: &Fingerprint) -> bool {
+  Fingerprint {
+    ctime_ns: witness.ctime_ns,
+    uid: witness.uid,
+    gid: witness.gid,
+    birth_ns: witness.birth_ns,
+    ..*after
+  } == *witness
 }

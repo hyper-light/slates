@@ -1190,6 +1190,148 @@ mod delivered {
       drop((section, guest, client, daemon, host));
     }
 
+    /// Shape: a grant's term in the landing test, a minute, far past the test.
+    const GRANT_TERM_NS: u64 = 60_000_000_000;
+    /// Shape: what the other attachment writes over the base file before its volume is landed.
+    const LANDED: &[u8] = b"written through another slates attachment and landed onto the disk";
+
+    /// An overlay volume named `name` over `host`'s directory.
+    fn overlay(client: &mut Client, name: &str, host: &HostDir) -> VolumeId {
+      client
+        .create(&CreateSpec {
+          name: name.to_owned(),
+          size: SizeClass::Bounded { limit: QUOTA },
+          names: NamePolicy::Exact,
+          require_locked: false,
+          base: Some(host.0.to_string_lossy().into_owned()),
+        })
+        .unwrap()
+    }
+
+    /// Lands `volume`'s head onto `target` under a grant the human surface's proof approves (§4.15, R10: the
+    /// daemon's issuer secret, which only a caller that maps the anchor segment holds).
+    fn land_with_a_grant(daemon: &Daemon, client: &mut Client, volume: VolumeId, target: &str) {
+      let presented = client
+        .land(volume, None, target, slates_client::Filter::default(), None)
+        .unwrap();
+      let slates_client::Landing::GrantRequired {
+        landing, manifest, ..
+      } = presented
+      else {
+        panic!("the landing was not presented: {presented:?}");
+      };
+      let secret = daemon.segment().issuer_secret().unwrap();
+      let proof = slates_server::landing::grant_proof(
+        &secret,
+        landing,
+        &manifest,
+        slates_client::GrantScope::Once,
+        GRANT_TERM_NS,
+      );
+      let grant = client
+        .grant(
+          landing,
+          manifest,
+          slates_client::GrantScope::Once,
+          GRANT_TERM_NS,
+          proof,
+        )
+        .unwrap();
+      let landed = client
+        .land(
+          volume,
+          None,
+          target,
+          slates_client::Filter::default(),
+          Some(grant),
+        )
+        .unwrap();
+      assert!(
+        matches!(landed, slates_client::Landing::Landed(_)),
+        "{landed:?}"
+      );
+    }
+
+    /// Format: Linux `ESTALE`, what a node answers once its name holds another file (A-151).
+    const ESTALE: i32 = 116;
+
+    /// The section a descriptor ask for `node` hands this process, read-only, mapped.
+    fn map_section(guest: &mut Guest, node: u64) -> (OwnedHandle, Mapped) {
+      let value = guest
+        .descriptor(node, false, std::process::id(), guest.stream_value())
+        .unwrap();
+      // SAFETY: the value the daemon duplicated into this process, taken as this test's own.
+      let section = unsafe {
+        OwnedHandle::from_raw_handle(std::ptr::with_exposed_provenance_mut(
+          usize::try_from(value).unwrap(),
+        ))
+      };
+      let map = Mapped::map(&section, FILE_MAP_READ).unwrap();
+      (section, map)
+    }
+
+    /// T-shards-windows-5.7, beneath an overlay. Do: map a read-only section of an untouched base file of overlay
+    /// A; write the file through another slates attachment, of overlay B over the same directory, and land B onto
+    /// the directory under a grant; the guest of A asks for the old node's attributes, looks the name up again and
+    /// maps it afresh. Expect the landing to write the disk; the old node to answer `ESTALE` and its section to keep
+    /// the replaced file's bytes, as a map of a replaced file does on any filesystem (a landing never writes a file in
+    /// place, R1: it places a new one); and the name, looked up again, to be a new node whose section holds the landed
+    /// bytes and zeros past them. So a slates write made through another attachment reaches the guest once it next
+    /// looks the file up.
+    #[test]
+    fn a_write_through_another_attachment_landed_on_the_disk_reaches_a_fresh_map() {
+      let (daemon, mut client) = start("dax-land");
+      let file = pattern();
+      let host = HostDir::holding("based.bin", &file);
+      let mapped = overlay(&mut client, "dax-mapped", &host);
+      let mut guest = Guest::over(client.attach_shards(mapped, Intent::Read, None).unwrap());
+      let node = guest.lookup(ROOT, "based.bin").unwrap();
+      let (old_section, old_map) = map_section(&mut guest, node);
+      assert_eq!(old_map.read(0, FILE_BYTES), file);
+
+      let writer = overlay(&mut client, "dax-writer", &host);
+      let other = client
+        .attach(writer, None, Intent::Write)
+        .unwrap()
+        .attachment;
+      client
+        .fs_write((writer, other), "/based.bin", LANDED, 0o644)
+        .unwrap();
+      client.detach(other).unwrap();
+      land_with_a_grant(&daemon, &mut client, writer, &host.0.to_string_lossy());
+      #[allow(clippy::disallowed_methods)]
+      let on_disk = std::fs::read(host.0.join("based.bin")).unwrap();
+      assert_eq!(on_disk, LANDED, "the landing wrote the disk");
+
+      assert_eq!(
+        guest.getattr(node),
+        ESTALE,
+        "the old node's name holds another file"
+      );
+      assert_eq!(
+        old_map.read(0, FILE_BYTES),
+        file,
+        "the old section keeps the replaced file's bytes"
+      );
+      let fresh = guest.lookup(ROOT, "based.bin").unwrap();
+      assert_ne!(fresh, node, "the name, looked up again, is a new node");
+      let (new_section, new_map) = map_section(&mut guest, fresh);
+      assert_eq!(
+        new_map.read(0, LANDED.len()),
+        LANDED,
+        "the fresh section holds the landed bytes"
+      );
+      assert!(
+        new_map
+          .read(LANDED.len(), FILE_BYTES - LANDED.len())
+          .iter()
+          .all(|&b| b == 0),
+        "and zeros past them"
+      );
+      drop((old_map, new_map));
+      drop((old_section, new_section, guest, client, daemon, host));
+    }
+
     /// A file of [`FILE_BYTES`] whose every byte names its offset, so a byte out of place shows.
     fn pattern() -> Vec<u8> {
       (0..FILE_BYTES)

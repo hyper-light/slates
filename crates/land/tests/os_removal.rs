@@ -12,9 +12,9 @@
 
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-#![cfg(unix)]
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -87,7 +87,56 @@ struct Interfering {
   /// Whether the engine may see the exchange.
   exchange: bool,
   /// A descriptor on every outsider file, held for the history, so its inode number names it alone.
-  pins: Vec<std::os::fd::OwnedFd>,
+  pins: Vec<Pin>,
+}
+
+/// What holds an object so its number names it alone: a descriptor (Unix), a handle (Windows).
+#[cfg(unix)]
+type Pin = std::os::fd::OwnedFd;
+/// What holds an object so its number names it alone: a descriptor (Unix), a handle (Windows).
+#[cfg(windows)]
+type Pin = std::fs::File;
+
+/// Format: `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT`: a directory or a link, opened as itself.
+#[cfg(windows)]
+const ITSELF: u32 = 0x0200_0000 | 0x0020_0000;
+
+/// A handle on the object at `path` itself (never through a link), no access but its attributes, sharing read, write
+/// and delete, so a landing's renames and removals of it go on as they would without it (Windows; NTFS hands out
+/// fresh file indexes, but the hold keeps the oracle's rule one rule on every host).
+#[cfg(windows)]
+#[allow(clippy::disallowed_methods)]
+fn pin(path: &Path) -> Pin {
+  use std::os::windows::fs::OpenOptionsExt;
+  std::fs::OpenOptions::new()
+    .access_mode(0)
+    .custom_flags(ITSELF)
+    .open(path)
+    .unwrap()
+}
+
+/// The number that names the object at `path` itself: its inode (Unix).
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)]
+fn object_number(path: &Path) -> u64 {
+  std::fs::symlink_metadata(path).unwrap().ino()
+}
+
+/// The number that names the object at `path` itself: its file index, read through a handle of it (Windows; the
+/// standard library's `file_index` is unstable).
+#[cfg(windows)]
+fn object_number(path: &Path) -> u64 {
+  use std::os::windows::io::AsRawHandle;
+  use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+  };
+  let held = pin(path);
+  // SAFETY: an all-zero `BY_HANDLE_FILE_INFORMATION` is a valid value (integers and `FILETIME`s) for the call to fill.
+  let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+  // SAFETY: a handle this test just opened and a writable record of the type the call fills.
+  let read = unsafe { GetFileInformationByHandle(held.as_raw_handle().cast(), &mut info) };
+  assert_ne!(read, 0);
+  (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow)
 }
 
 /// Format: `O_SYMLINK` from macOS `<sys/fcntl.h>`: open a symlink itself rather than its target (rustix
@@ -100,7 +149,8 @@ const O_SYMLINK: u32 = 0x0020_0000;
 /// freed number at once (a removed witnessed object's number came back as the outsider's later file, and
 /// the oracle read the removal as not done); tmpfs and APFS hand out fresh numbers, which hid this. A held
 /// descriptor changes nothing a landing observes: unlink, rename and rmdir succeed on an open object.
-fn pin(path: &Path) -> std::os::fd::OwnedFd {
+#[cfg(unix)]
+fn pin(path: &Path) -> Pin {
   #[cfg(target_os = "linux")]
   let flags = rustix::fs::OFlags::PATH | rustix::fs::OFlags::NOFOLLOW;
   #[cfg(target_vendor = "apple")]
@@ -143,17 +193,15 @@ impl Interfering {
   fn outsider_save(&mut self, bytes: &[u8]) -> Fired {
     let temp = self.outsider_dir.join(format!("save-{}", self.fired.len()));
     std::fs::write(&temp, bytes).unwrap();
-    let created = std::fs::symlink_metadata(&temp).unwrap().ino();
+    let created = object_number(&temp);
     self.pins.push(pin(&temp));
     let before = std::fs::symlink_metadata(&self.path).ok();
+    let displaced = before.as_ref().map(|_| object_number(&self.path));
     if before.as_ref().is_some_and(std::fs::Metadata::is_dir) {
       std::fs::remove_dir_all(&self.path).unwrap();
     }
     std::fs::rename(&temp, &self.path).unwrap();
-    Fired {
-      created,
-      displaced: before.map(|m| m.ino()),
-    }
+    Fired { created, displaced }
   }
 }
 
@@ -322,7 +370,12 @@ fn seed(removal: Removal, target: &Path) {
         .set_modified(aged)
         .unwrap();
     }
+    #[cfg(unix)]
     Removal::Symlink => std::os::unix::fs::symlink("somewhere", &doomed).unwrap(),
+    #[cfg(windows)]
+    Removal::Symlink => {
+      panic!("no symbolic link without a privilege on Windows; filtered out")
+    }
     Removal::Directory | Removal::Clear { .. } | Removal::Rename | Removal::RenameOnto => {
       std::fs::create_dir(&doomed).unwrap();
       std::fs::write(doomed.join("inner"), b"base inner").unwrap();
@@ -344,7 +397,7 @@ fn inodes(target: &Path) -> BTreeMap<u64, String> {
       if meta.is_dir() {
         stack.push((entry.path(), path.clone()));
       }
-      out.insert(meta.ino(), path);
+      out.insert(object_number(&entry.path()), path);
     }
   }
   out
@@ -381,9 +434,7 @@ fn run(ram: &Path, label: &str, removal: Removal, edits: &[(u64, &[u8])]) -> Run
   let ws = Workspace::new(ram, label);
   let target_path = ws.target();
   seed(removal, &target_path);
-  let witnessed = std::fs::symlink_metadata(target_path.join("doomed"))
-    .unwrap()
-    .ino();
+  let witnessed = object_number(&target_path.join("doomed"));
   let _witnessed_pin = pin(&target_path.join("doomed"));
   let (inner, target) = OsLand::open_target(&target_path).unwrap();
   let mut host = Interfering {
@@ -475,7 +526,11 @@ fn run(ram: &Path, label: &str, removal: Removal, edits: &[(u64, &[u8])]) -> Run
 #[test]
 fn a_real_outsider_save_at_any_seam_call_survives_every_removal() {
   let ram = build_output();
-  for (kind, removal) in REMOVALS.into_iter().enumerate() {
+  // Windows makes no symbolic link without a privilege outsiders and slates lack, so that kind runs on Unix.
+  let removals = REMOVALS
+    .into_iter()
+    .filter(|removal| cfg!(unix) || !matches!(removal, Removal::Symlink));
+  for (kind, removal) in removals.enumerate() {
     let reference = run(&ram, &format!("{kind}-ref"), removal, &[]);
     assert_reference(removal, &reference.seen());
     let (mut stale, mut written, mut pairs) = (0u64, 0u64, 0u64);
