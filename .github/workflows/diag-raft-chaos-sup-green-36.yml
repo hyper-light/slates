@@ -1,0 +1,52 @@
+name: DIAG raft-chaos superseded owner (not for main)
+
+# Diagnostics branch of the raft-chaos agent; never merged. live_fleet's a_superseded_owner_resumed_after_its_takeover_is_fenced,
+# two runs, release, each bounded at 15 minutes (a hang shows as exit 124). Results to diag-results/diag-raft-chaos-sup-green-36 by git push.
+
+on:
+  push:
+    branches: [diag-raft-chaos-sup-green-36]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  SLATES_TEST_CLI: "1"
+
+jobs:
+  superseded:
+    name: superseded owner x2
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked -p slates-cli --bin slates --test live_fleet
+      - name: The flow
+        run: |
+          R=../results.txt
+          echo "head $(git rev-parse HEAD), $(date -u)" > $R
+          for run in 1 2; do
+            status=0
+            timeout 900 cargo test --release --locked -p slates-cli --test live_fleet -- --nocapture --test-threads=1 --exact a_superseded_owner_resumed_after_its_takeover_is_fenced > ../run.log 2>&1 || status=$?
+            grep -E 'live fence|panicked|test result|FAILED' ../run.log | cut -c1-600 | tail -40 >> $R
+            echo "== run $run exit $status" | tee -a $R
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          git config user.name "diag-raft-chaos"
+          git config user.email "diag-raft-chaos@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-raft-chaos-sup-green-36 results"
+          git push -q origin "HEAD:refs/heads/diag-results/diag-raft-chaos-sup-green-36"
