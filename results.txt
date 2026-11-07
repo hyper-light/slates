@@ -1,0 +1,8 @@
+tested 3ac85f45207de5742f74438ed840c92d04144c09 variant after on aarch64, 4 cpus
+unstarted exit 0 86s
+unstarted-again exit 0 1s
+held exit 0 93s
+fleet-forward exit 0 145s
+server-lib exit 0 29s
+server exit 0 26s
+clippy exit 0 63s
