@@ -166,6 +166,16 @@ pub enum Outcome {
     /// The conflicting windows.
     windows: Vec<ConflictWindow>,
   },
+  /// The increment's base is below the version the green's chain was checkpointed at
+  /// ([`Green::checkpoint`]): the deltas it would be mapped through are folded away, so it is never judged. No live
+  /// reader is below that version (the service checkpoints at the reachable floor), so a caller meets this only with a
+  /// base no longer anyone's; the service answers it `UnknownBase`.
+  BaseUnavailable {
+    /// The increment's base.
+    base: u64,
+    /// The oldest base the green still judges.
+    floor: u64,
+  },
 }
 
 /// The result of a rebase (§4.16 "Rebase, the only corrective path"). The green is never changed by
@@ -191,6 +201,13 @@ pub enum Rebased {
   Conflict {
     /// The conflicting windows.
     windows: Vec<ConflictWindow>,
+  },
+  /// The work's base is below the version the green's chain was checkpointed at ([`Outcome::BaseUnavailable`]).
+  BaseUnavailable {
+    /// The work's base.
+    base: u64,
+    /// The oldest base the green still maps.
+    floor: u64,
   },
 }
 
@@ -320,7 +337,11 @@ pub struct Green {
   symlink_history: ValueHistory<String>,
   hardlink_history: ValueHistory<String>,
   xattr_history: XattrHistory,
+  /// The deltas of the versions after `deltas_from`, in order: `deltas[i]` is version `deltas_from + i + 1`'s.
   deltas: Vec<BTreeMap<String, Vec<Op>>>,
+  /// The version the green was restored at from a checkpoint ([`Green::restore`]), 0 for a green built from its origin:
+  /// the deltas up to it are folded into the checkpoint, so a base below it is not mapped.
+  deltas_from: u64,
   last_changed: BTreeMap<String, u64>,
   mode_changed: BTreeMap<String, u64>,
   symlink_changed: BTreeMap<String, u64>,
@@ -388,6 +409,25 @@ pub struct RetainedBytes {
   pub history: usize,
   /// The rejected-result cache's bytes.
   pub rejected: usize,
+}
+
+/// Every key of `history` whose value in effect at `at` was set after the origin (version 0): the key, that version and
+/// that value (`None`: removed), for a checkpoint at `at`.
+fn changed_at<K: Clone, V: Clone>(
+  history: &BTreeMap<K, Vec<(u64, Option<V>)>>,
+  at: u64,
+) -> Vec<crate::checkpoint::Changed<K, V>> {
+  history
+    .iter()
+    .filter_map(|(key, entries)| {
+      let (version, value) = entries.iter().rev().find(|(v, _)| *v <= at)?;
+      (*version > 0).then(|| crate::checkpoint::Changed {
+        key: key.clone(),
+        at: *version,
+        value: value.clone(),
+      })
+    })
+    .collect()
 }
 
 /// Folds one `(version, value)` history below `floor`: drops every entry recorded before `floor`
@@ -711,9 +751,193 @@ impl Green {
     green
   }
 
-  /// The head version (the number of committed deltas).
+  /// The green's checkpoint at version `at` (§4.16; [`crate::checkpoint`]): every key whose value in effect at `at` was
+  /// set after the origin, with that version and value, and every increment accepted at or before `at`. `None` when
+  /// `at` is past the head or below the folded floor (its values are no longer reconstructible). With the origin it
+  /// restores ([`Green::restore`]) a green that answers as this one does for every version from `at` on.
+  pub fn checkpoint(&self, at: u64) -> Option<crate::checkpoint::Checkpoint> {
+    if at > self.head() || at < self.folded_below || at < self.deltas_from {
+      return None;
+    }
+    let mut checkpoint = crate::checkpoint::Checkpoint {
+      version: at,
+      accepted: self
+        .accepted
+        .iter()
+        .filter(|(_, version)| **version <= at)
+        .map(|(id, version)| (*id, *version))
+        .collect(),
+      files: changed_at(&self.content_history, at),
+      dirs: self
+        .dir_history
+        .iter()
+        .filter_map(|(path, history)| {
+          let (version, present) = history.iter().rev().find(|(v, _)| *v <= at)?;
+          (*version > 0).then(|| crate::checkpoint::Changed {
+            key: path.clone(),
+            at: *version,
+            value: present.then_some(()),
+          })
+        })
+        .collect(),
+      modes: changed_at(&self.mode_history, at),
+      symlinks: changed_at(&self.symlink_history, at),
+      hardlinks: changed_at(&self.hardlink_history, at),
+      specials: changed_at(&self.special_history, at),
+      xattrs: changed_at(&self.xattr_history, at),
+    };
+    checkpoint.canonicalize();
+    Some(checkpoint)
+  }
+
+  /// A green restored from its `origin` and a `checkpoint` of it (§4.16, §4.8 recovery): the origin's state with every
+  /// key the checkpoint names set to its value there (its history one entry, its last change the checkpoint's), the
+  /// accepted identities restored, and the head at the checkpoint's version with no delta before it, so every later
+  /// increment replays onto it as onto the green the checkpoint was taken from, and a base below it is refused
+  /// ([`Outcome::BaseUnavailable`]). Deterministic: the same origin and checkpoint restore the same green.
+  pub fn restore(
+    origin: &crate::origin::Origin,
+    checkpoint: &crate::checkpoint::Checkpoint,
+  ) -> Green {
+    let mut green = Green::with_origin(origin);
+    for changed in &checkpoint.files {
+      green.restore_file(changed);
+    }
+    for changed in &checkpoint.dirs {
+      green.restore_dir(changed);
+    }
+    for changed in &checkpoint.modes {
+      green.restore_mode(changed);
+    }
+    for changed in &checkpoint.symlinks {
+      green.restore_link(IDENTITY_TAG_SYMLINK, changed);
+    }
+    for changed in &checkpoint.hardlinks {
+      green.restore_link(IDENTITY_TAG_HARDLINK, changed);
+    }
+    for changed in &checkpoint.specials {
+      green.restore_special(changed);
+    }
+    for changed in &checkpoint.xattrs {
+      green.restore_xattr(changed);
+    }
+    green.accepted = checkpoint.accepted.iter().copied().collect();
+    green.deltas_from = checkpoint.version;
+    green.folded_below = checkpoint.version;
+    green.identity_version = checkpoint.version;
+    green.history_bytes = green.history_bytes_recounted();
+    green
+  }
+
+  fn restore_file(&mut self, changed: &crate::checkpoint::Changed<String, Vec<u8>>) {
+    if let Some(old) = self.content.remove(&changed.key) {
+      self.identity.remove(&file_entry(&changed.key, &old));
+    }
+    if let Some(bytes) = &changed.value {
+      self.identity.add(&file_entry(&changed.key, bytes));
+      self.content.insert(changed.key.clone(), bytes.clone());
+    }
+    self.last_changed.insert(changed.key.clone(), changed.at);
+    self.content_history.insert(
+      changed.key.clone(),
+      vec![(changed.at, changed.value.clone())],
+    );
+  }
+
+  fn restore_dir(&mut self, changed: &crate::checkpoint::Changed<String, ()>) {
+    if self.dirs.remove(&changed.key) {
+      self.identity.remove(&dir_entry(&changed.key));
+    }
+    if changed.value.is_some() {
+      self.identity.add(&dir_entry(&changed.key));
+      self.dirs.insert(changed.key.clone());
+    }
+    self.dir_history.insert(
+      changed.key.clone(),
+      vec![(changed.at, changed.value.is_some())],
+    );
+  }
+
+  fn restore_mode(&mut self, changed: &crate::checkpoint::Changed<String, u32>) {
+    if let Some(old) = self.modes.remove(&changed.key) {
+      self.identity.remove(&mode_entry(&changed.key, old));
+    }
+    if let Some(mode) = changed.value {
+      self.identity.add(&mode_entry(&changed.key, mode));
+      self.modes.insert(changed.key.clone(), mode);
+    }
+    self.mode_changed.insert(changed.key.clone(), changed.at);
+    self
+      .mode_history
+      .insert(changed.key.clone(), vec![(changed.at, changed.value)]);
+  }
+
+  fn restore_link(&mut self, tag: &[u8], changed: &crate::checkpoint::Changed<String, String>) {
+    let (map, changed_map, history) = if tag == IDENTITY_TAG_SYMLINK {
+      (
+        &mut self.symlinks,
+        &mut self.symlink_changed,
+        &mut self.symlink_history,
+      )
+    } else {
+      (
+        &mut self.hardlinks,
+        &mut self.hardlink_changed,
+        &mut self.hardlink_history,
+      )
+    };
+    if let Some(old) = map.remove(&changed.key) {
+      self.identity.remove(&link_entry(tag, &changed.key, &old));
+    }
+    if let Some(target) = &changed.value {
+      self.identity.add(&link_entry(tag, &changed.key, target));
+      map.insert(changed.key.clone(), target.clone());
+    }
+    changed_map.insert(changed.key.clone(), changed.at);
+    history.insert(
+      changed.key.clone(),
+      vec![(changed.at, changed.value.clone())],
+    );
+  }
+
+  fn restore_special(&mut self, changed: &crate::checkpoint::Changed<String, SpecialNode>) {
+    if let Some(old) = self.specials.remove(&changed.key) {
+      self.identity.remove(&special_entry(&changed.key, &old));
+    }
+    if let Some(node) = changed.value {
+      self.identity.add(&special_entry(&changed.key, &node));
+      self.specials.insert(changed.key.clone(), node);
+    }
+    self.special_changed.insert(changed.key.clone(), changed.at);
+    self
+      .special_history
+      .insert(changed.key.clone(), vec![(changed.at, changed.value)]);
+  }
+
+  fn restore_xattr(&mut self, changed: &crate::checkpoint::Changed<(String, String), Vec<u8>>) {
+    let (path, name) = &changed.key;
+    if let Some(old) = self.xattrs.remove(&changed.key) {
+      self.identity.remove(&xattr_entry(path, name, &old));
+    }
+    if let Some(value) = &changed.value {
+      self.identity.add(&xattr_entry(path, name, value));
+      self.xattrs.insert(changed.key.clone(), value.clone());
+    }
+    self.xattr_changed.insert(changed.key.clone(), changed.at);
+    self.xattr_history.insert(
+      changed.key.clone(),
+      vec![(changed.at, changed.value.clone())],
+    );
+  }
+
+  /// The head version: the checkpoint's version, if restored from one, plus the deltas committed since.
   pub fn head(&self) -> u64 {
-    self.deltas.len() as u64
+    self.deltas_from.saturating_add(self.deltas.len() as u64)
+  }
+
+  /// The oldest base the green still judges and maps: the version it was restored at from a checkpoint, else 0.
+  pub fn mappable_from(&self) -> u64 {
+    self.deltas_from
   }
 
   /// The identity of the green's state at the head (§4.16 "the manifest identity": what a holder
@@ -1241,11 +1465,12 @@ impl Green {
 
   /// The ops each intervening delta in `(base, head]` applied to `path`.
   fn intervening(&self, path: &str, base: u64) -> Vec<&[Op]> {
-    let base = usize::try_from(base).unwrap_or(usize::MAX);
+    // `submit` and `rebase` refuse a base below `deltas_from`, so the skip is the base's own place in the deltas.
+    let skip = usize::try_from(base.saturating_sub(self.deltas_from)).unwrap_or(usize::MAX);
     self
       .deltas
       .iter()
-      .skip(base)
+      .skip(skip)
       .filter_map(|delta| delta.get(path).map(Vec::as_slice))
       .collect()
   }
@@ -2124,6 +2349,12 @@ impl Green {
         windows: windows.clone(),
       };
     }
+    if inc.base < self.deltas_from {
+      return Outcome::BaseUnavailable {
+        base: inc.base,
+        floor: self.deltas_from,
+      };
+    }
     let resolved = Green::resolve(inc);
     match self.decide(inc, &resolved) {
       Ok(effects) => {
@@ -2379,6 +2610,12 @@ impl Green {
   /// A conflict returns the windows and changes nothing; the agent resolves each window and rebases
   /// again. The green — content, deltas and counters — is left exactly as it was.
   pub fn rebase(&mut self, inc: &Increment) -> Rebased {
+    if inc.base < self.deltas_from {
+      return Rebased::BaseUnavailable {
+        base: inc.base,
+        floor: self.deltas_from,
+      };
+    }
     let to = self.head();
     let resolved = Green::resolve(inc);
     // The verdict shares `submit`'s decision but must not perturb the green; the only field `decide`
