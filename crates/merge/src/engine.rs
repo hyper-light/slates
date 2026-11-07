@@ -290,6 +290,116 @@ fn xattr_entry(path: &str, name: &str, value: &[u8]) -> crate::identity::Entry {
 /// padding. Anchor: the actual `SpecialNode` layout on the target, measured by `size_of`.
 const SPECIAL_NODE_BYTES: usize = size_of::<SpecialNode>();
 
+/// A green being seeded from its origin a share at a time (§4.16 "the origin version from a snapshot"; §4.3 "Bounded
+/// work everywhere"): the origin's entries are moved into the engine — each one's identity added, its value and its
+/// version-0 history set — until a share's bytes are in, so a kernel-sized origin (97,229 files) seeds over many of a
+/// shard's steps instead of one poll. The order entries go in does not reach the result: the identity is a set hash
+/// and every table is keyed. [`Green::with_origin`] is the load run to its end.
+#[derive(Debug)]
+pub struct OriginLoad {
+  green: Green,
+  origin: crate::origin::Origin,
+}
+
+impl OriginLoad {
+  /// A load of `origin`, canonicalized in place unless it already is (later declarations of a repeated key win, as
+  /// [`crate::origin::Origin::canonicalize`] keeps them); a walk of a snapshot gives a canonical one.
+  pub fn new(mut origin: crate::origin::Origin) -> OriginLoad {
+    if !origin.is_canonical() {
+      origin.canonicalize();
+    }
+    OriginLoad {
+      green: Green::default(),
+      origin,
+    }
+  }
+
+  /// Moves entries in until at least `budget_bytes` of their values and paths have gone in, or the origin is empty (an
+  /// entry is the unit, so a share overruns by at most one file); the seeded green once the last is in.
+  pub fn step(&mut self, budget_bytes: usize) -> Option<Green> {
+    let mut moved = 0usize;
+    while moved < budget_bytes {
+      match self.move_one() {
+        Some(bytes) => moved = moved.saturating_add(bytes),
+        None => return Some(std::mem::take(&mut self.green)),
+      }
+    }
+    None
+  }
+
+  /// Moves one entry of the origin into the green, the files first; the bytes it moved, `None` once the origin is
+  /// empty.
+  fn move_one(&mut self) -> Option<usize> {
+    let green = &mut self.green;
+    let origin = &mut self.origin;
+    if let Some((path, bytes)) = origin.files.pop() {
+      let moved = path.len().saturating_add(bytes.len());
+      green.identity.add(&file_entry(&path, &bytes));
+      green.content.insert(path.clone(), bytes.clone());
+      green.last_changed.insert(path.clone(), 0);
+      green.content_history.insert(path, vec![(0, Some(bytes))]);
+      return Some(moved);
+    }
+    if let Some((path, node)) = origin.specials.pop() {
+      let moved = path.len();
+      green.identity.add(&special_entry(&path, &node));
+      green.specials.insert(path.clone(), node);
+      green.special_changed.insert(path.clone(), 0);
+      green.special_history.insert(path, vec![(0, Some(node))]);
+      return Some(moved);
+    }
+    if let Some(path) = origin.dirs.pop() {
+      let moved = path.len();
+      if green.dirs.insert(path.clone()) {
+        green.identity.add(&dir_entry(&path));
+      }
+      green.dir_history.insert(path, vec![(0, true)]);
+      return Some(moved);
+    }
+    if let Some((path, mode)) = origin.modes.pop() {
+      let moved = path.len();
+      green.identity.add(&mode_entry(&path, mode));
+      green.modes.insert(path.clone(), mode);
+      green.mode_changed.insert(path.clone(), 0);
+      green.mode_history.insert(path, vec![(0, Some(mode))]);
+      return Some(moved);
+    }
+    if let Some((path, target)) = origin.symlinks.pop() {
+      let moved = path.len().saturating_add(target.len());
+      green
+        .identity
+        .add(&link_entry(IDENTITY_TAG_SYMLINK, &path, &target));
+      green.symlinks.insert(path.clone(), target.clone());
+      green.symlink_changed.insert(path.clone(), 0);
+      green.symlink_history.insert(path, vec![(0, Some(target))]);
+      return Some(moved);
+    }
+    if let Some((path, target)) = origin.hardlinks.pop() {
+      let moved = path.len().saturating_add(target.len());
+      green
+        .identity
+        .add(&link_entry(IDENTITY_TAG_HARDLINK, &path, &target));
+      green.hardlinks.insert(path.clone(), target.clone());
+      green.hardlink_changed.insert(path.clone(), 0);
+      green.hardlink_history.insert(path, vec![(0, Some(target))]);
+      return Some(moved);
+    }
+    if let Some((path, name, value)) = origin.xattrs.pop() {
+      let moved = path
+        .len()
+        .saturating_add(name.len())
+        .saturating_add(value.len());
+      green.identity.add(&xattr_entry(&path, &name, &value));
+      let key = (path, name);
+      green.xattrs.insert(key.clone(), value.clone());
+      green.xattr_changed.insert(key.clone(), 0);
+      green.xattr_history.insert(key, vec![(0, Some(value))]);
+      return Some(moved);
+    }
+    None
+  }
+}
+
 /// A green volume's merge state. Each dimension is a current value plus the version it last changed
 /// at (the base-comparison index), and a per-path/key *history* of `(version, value)` entries so any
 /// base version can be reconstructed for a lagging work (the design's chain shares these histories
@@ -657,58 +767,15 @@ impl Green {
   /// the fast path (last changed at 0 ≤ base 0), and `base_at(0)` reconstructs it. The head stays
   /// 0: the origin is not a delta. Deterministic: the same origin seeds the same state, which is what
   /// lets a holder recompute version 0 from the placed origin bytes.
-  pub fn with_origin(origin: &crate::origin::Origin) -> Green {
-    let mut green = Green::default();
-    let mut canonical = origin.clone();
-    canonical.canonicalize();
-    for (path, node) in canonical.specials {
-      green.identity.add(&special_entry(&path, &node));
-      green.specials.insert(path.clone(), node);
-      green.special_changed.insert(path.clone(), 0);
-      green.special_history.insert(path, vec![(0, Some(node))]);
-    }
-    for (path, bytes) in canonical.files {
-      green.identity.add(&file_entry(&path, &bytes));
-      green.content.insert(path.clone(), bytes.clone());
-      green.last_changed.insert(path.clone(), 0);
-      green.content_history.insert(path, vec![(0, Some(bytes))]);
-    }
-    for path in canonical.dirs {
-      if green.dirs.insert(path.clone()) {
-        green.identity.add(&dir_entry(&path));
+  /// Takes the origin by value and moves its entries in, so seeding costs no copy of the origin (it cloned the whole
+  /// origin to canonicalize it before 2026-11-07); [`OriginLoad`] is the same seeding in shares.
+  pub fn with_origin(origin: crate::origin::Origin) -> Green {
+    let mut load = OriginLoad::new(origin);
+    loop {
+      if let Some(green) = load.step(usize::MAX) {
+        return green;
       }
-      green.dir_history.insert(path, vec![(0, true)]);
     }
-    for (path, mode) in canonical.modes {
-      green.identity.add(&mode_entry(&path, mode));
-      green.modes.insert(path.clone(), mode);
-      green.mode_changed.insert(path.clone(), 0);
-      green.mode_history.insert(path, vec![(0, Some(mode))]);
-    }
-    for (path, target) in canonical.symlinks {
-      green
-        .identity
-        .add(&link_entry(IDENTITY_TAG_SYMLINK, &path, &target));
-      green.symlinks.insert(path.clone(), target.clone());
-      green.symlink_changed.insert(path.clone(), 0);
-      green.symlink_history.insert(path, vec![(0, Some(target))]);
-    }
-    for (path, target) in canonical.hardlinks {
-      green
-        .identity
-        .add(&link_entry(IDENTITY_TAG_HARDLINK, &path, &target));
-      green.hardlinks.insert(path.clone(), target.clone());
-      green.hardlink_changed.insert(path.clone(), 0);
-      green.hardlink_history.insert(path, vec![(0, Some(target))]);
-    }
-    for (path, name, value) in canonical.xattrs {
-      green.identity.add(&xattr_entry(&path, &name, &value));
-      let key = (path, name);
-      green.xattrs.insert(key.clone(), value.clone());
-      green.xattr_changed.insert(key.clone(), 0);
-      green.xattr_history.insert(key, vec![(0, Some(value))]);
-    }
-    green
   }
 
   /// The head version (the number of committed deltas).

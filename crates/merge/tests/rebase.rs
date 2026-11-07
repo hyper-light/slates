@@ -28,8 +28,8 @@ fn head_files(green: &Green) -> BTreeMap<String, Vec<u8>> {
 /// Two greens built alike: the same origin, the same increments, in order.
 fn twins(origin: &[common::generated::Raw], history: &[common::generated::Raw]) -> (Green, Green) {
   let mut built = [
-    Green::with_origin(&origin_of(origin)),
-    Green::with_origin(&origin_of(origin)),
+    Green::with_origin(origin_of(origin)),
+    Green::with_origin(origin_of(origin)),
   ];
   for green in &mut built {
     for (index, step) in history.iter().enumerate() {
@@ -92,7 +92,7 @@ fn a_rebase_of_one_files_edit_holds_one_file_of_a_thousand() {
       .collect(),
     ..Origin::default()
   };
-  let mut green = Green::with_origin(&origin);
+  let mut green = Green::with_origin(origin.clone());
   assert!(matches!(
     green.submit(&Build::new().overwrite("f0001", 0, b"head").at(1, 0)),
     Outcome::Accepted { version: 1 }
