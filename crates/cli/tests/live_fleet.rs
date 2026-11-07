@@ -800,11 +800,12 @@ fn a_paused_candidate_neither_stops_writes_nor_stays_behind() {
 }
 
 /// A-200 with each candidate stopped in turn: do stop one candidate's process, write files, resume it and wait for it
-/// to catch up, then the same with the other. Expect no write to wait as long as the liveness budget, since the other
-/// candidate answers throughout, and each resumed candidate to catch up to the owner's head. Before the holders were
-/// shipped to at once, a write's messages went to them one after another, so with the holder asked first stopped every
-/// write waited a liveness budget for it before the healthy one was asked (2026-11-06, `live_chaos`: p50 1.01 s, p99
-/// 5.5 s). And an exchange still in flight when its dispatch ended was dropped with its holder's session in it, so a
+/// to catch up, then the same with the other. Expect no write to wait on the stopped candidate ([`STOPPED_WAIT`]), since
+/// the other answers throughout, and each resumed candidate to catch up to the owner's head. Before the holders were
+/// shipped to at once, a dispatch folded a write's answers only once every holder's exchange had ended, so the first
+/// write after each stop waited for the stopped holder's exchange to give up: 489–783 ms in 20 of 20 stops on main
+/// (CI, both Linux arches, release, `diag-live-durability-20`), against 3–5 ms for every write after it; under the
+/// rolling partition, writes at p50 1.01 s and p99 5.5 s (2026-11-06, `live_chaos`). And an exchange still in flight when its dispatch ended was dropped with its holder's session in it, so a
 /// resumed candidate was never sent to again (KIND, raft-chaos run 42178128960: both of an owner's sessions
 /// `lent=true` with its log stuck).
 #[test]
@@ -827,7 +828,7 @@ fn each_candidate_stopped_in_turn_holds_no_write_and_catches_up() {
     .collect();
   let id = create_live_volume(owner, "turns");
   write_files(owner, &id, 0..1);
-  let liveness = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
+  let liveness = Duration::from_nanos(STOPPED_WAIT);
   let mut waited = Vec::new();
   let mut behind = Vec::new();
   let mut next = 1;
@@ -863,6 +864,12 @@ fn each_candidate_stopped_in_turn_holds_no_write_and_catches_up() {
     "each resumed candidate catches up: {behind:?}"
   );
 }
+
+/// Shape: how long a write may take while a candidate is stopped before it counts as having waited on that candidate: a
+/// quarter of the liveness budget. A write that waits for the stopped holder's exchange to give up takes most of the
+/// budget (489–783 ms measured, [`each_candidate_stopped_in_turn_holds_no_write_and_catches_up`]); one that does not
+/// takes the other holder's round trip (3–5 ms). The bound sits between, far from both.
+const STOPPED_WAIT: u64 = slates_server::daemon::LIVENESS_BUDGET_NS / 4;
 
 /// A-200: a new live volume's log is shipped only to candidates that hold its catalog. Do make a volume live-shipped and
 /// write files to it at once. Expect neither candidate to refuse an entry for not holding the volume's catalog
