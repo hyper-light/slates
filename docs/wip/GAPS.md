@@ -1,5 +1,13 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Fixed (live-fixes, 2026-11-06): main's macOS fleet-deploy test refused the successor's mount `OwnedByAnotherHost`
+> under load (scheduled run 42206043007).** A-222's early refusal reads the routing of the shard serving the client; a
+> takeover recorded the new owner on the control shard alone. Counted on CI under two spinners a CPU: 5 of 9 runs
+> refused on the successor's shard 1 (`attach.foreign_refused.owner_unknown`) while its shard 0 had adopted the volume.
+> An adoption's owner now reaches every shard (`takeover::track_owner_on_every_shard`); 10 of 10 green under the same
+> load. The test now also requires the other survivor to refuse the mount by kind. Bug record
+> `docs/bugs/2026-11-06-a-successor-refused-its-own-volumes-mount-on-a-shard-that-never-learned-the-takeover.md`.
+
 > **A forming fleet lost its takeovers (live-fixes, 2026-11-05, A-200 and §4.8; three fixed, for raft).** raft's soak
 > found that a fleet acting before it settled could leave a killed owner's volume unserved; the tests were made to wait
 > (d91464cf) and the product stayed unfixed. Bootstrapping three real processes and acting at once found three defects,

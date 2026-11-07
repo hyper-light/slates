@@ -148,6 +148,27 @@ impl HostTakeover {
   }
 }
 
+/// Records `owner` as `object`'s owner in this shard's routing and in every other shard's (§4.8 "Lookup"). A takeover
+/// runs on the control shard, and every shard decides from its own routing whether a volume is this node's: a client
+/// whose request was served on another shard was refused its own node's adopted volume `OwnedByAnotherHost`, the
+/// shard's routing still naming the dead creator (main's macOS fleet-deploy test, run 42206043007; counted
+/// `attach.foreign_refused.*`). A shard the message does not reach (its admission bound) is counted
+/// (`xshard.run_refused`) and learns the owner as before, from a lookup.
+pub(crate) fn track_owner_on_every_shard(state: &mut ShardState, object: ObjectId, owner: HostId) {
+  state.fleet.track_object_owner(object, owner);
+  let origin = state.shard;
+  for shard in state
+    .shards
+    .iter()
+    .copied()
+    .filter(|shard| *shard != origin)
+  {
+    crate::xshard::run_on_counted(origin, shard, move |s| {
+      s.fleet.track_object_owner(object, owner);
+    });
+  }
+}
+
 /// Brings every object this holder holds to the owner the committed configuration names for it (§4.8), run on
 /// the control shard at each install, before the held acceptors' authority is reconciled to their owners:
 ///
@@ -174,7 +195,7 @@ pub(crate) fn resolve_held_objects(state: &mut ShardState, local: HostId) {
         departed,
         successor,
       } => {
-        state.fleet.track_object_owner(object, successor);
+        track_owner_on_every_shard(state, object, successor);
         let since_version = regional
           .retired
           .get(&departed)
@@ -894,7 +915,7 @@ fn record_adoption(
   placement: Placement,
   local: HostId,
 ) {
-  state.fleet.track_object_owner(object, local);
+  track_owner_on_every_shard(state, object, local);
   state.placed_heads.insert(
     object,
     PlacedHead {

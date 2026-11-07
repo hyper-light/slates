@@ -13236,6 +13236,13 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   another machine could push to a green but never write a volume. Found by the fs-server lab of 2026-11-04; red test
   `a_client_node_attaches_a_server_volume_for_writing_and_writes_through_it` (`crates/cli/tests/fs_server.rs`,
   refused `NotFound` for 40 s on main bbfdbddb).
+- **Status (2026-11-06): every shard knows a taken-over volume's owner.** The early refusal of a foreign form runs on
+  the shard serving the client and reads that shard's routing, while a takeover recorded the new owner on the control
+  shard alone, so a successor refused its own volume's mount `OwnedByAnotherHost` from its other shard (5 of 9 runs
+  under load on macOS CI, `attach.foreign_refused.owner_unknown`). An adoption's owner is now sent to every shard
+  (`takeover::track_owner_on_every_shard`), and the fleet-deploy test asserts both answers: the successor mounts, the
+  other survivor refuses by kind (10 of 10 under load; bug record
+  `docs/bugs/2026-11-06-a-successor-refused-its-own-volumes-mount-on-a-shard-that-never-learned-the-takeover.md`).
 - **Decided.**
   1. `Attach` in the record form (`AttachRequest::Root`) is forwarded to the volume's owner as a volume-scoped write
      is (`RequestBody::forwards_as_write`), under a completion record keyed by the origin's request id. Every other
