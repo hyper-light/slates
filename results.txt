@@ -1,0 +1,44 @@
+tested 9d9ca24e0019355dafb75588910c9793a3b75d6e variant after on x86_64, 4 cpus
+held exit 101 125s
+  held:   Downloaded ring v0.17.14
+  held: warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+  held: slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, extensions 10 × 100000000 ns; no path measured yet
+  held: slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, extensions 10 × 100000000 ns; no path measured yet
+  held: thread 'a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound' (5453) panicked at crates/server/tests/fleet.rs:10154:3:
+  held: assertion `left == right` failed: every edit past the bound served while the submit was held (4 resends)
+  held:   left: (63, Some("Refused(AcknowledgementOwed { retained: 64, bound: 64 })"))
+  held:  right: (128, None)
+  held: test a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound ... FAILED
+  held:     a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound
+  held: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 96 filtered out; finished in 52.51s
+  held: error: test failed, to rerun pass `-p slates-server --test fleet`
+held-again exit 101 53s
+  held-again: warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+  held-again: slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, extensions 10 × 100000000 ns; no path measured yet
+  held-again: slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, extensions 10 × 100000000 ns; no path measured yet
+  held-again: thread 'a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound' (5485) panicked at crates/server/tests/fleet.rs:10154:3:
+  held-again: assertion `left == right` failed: every edit past the bound served while the submit was held (4 resends)
+  held-again:   left: (63, Some("Refused(AcknowledgementOwed { retained: 64, bound: 64 })"))
+  held-again:  right: (128, None)
+  held-again: test a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound ... FAILED
+  held-again:     a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound
+  held-again: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 96 filtered out; finished in 52.53s
+  held-again: error: test failed, to rerun pass `-p slates-server --test fleet`
+held-third exit 101 53s
+  held-third: warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+  held-third: slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, extensions 10 × 100000000 ns; no path measured yet
+  held-third: slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, extensions 10 × 100000000 ns; no path measured yet
+  held-third: thread 'a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound' (5515) panicked at crates/server/tests/fleet.rs:10154:3:
+  held-third: assertion `left == right` failed: every edit past the bound served while the submit was held (4 resends)
+  held-third:   left: (63, Some("Refused(AcknowledgementOwed { retained: 64, bound: 64 })"))
+  held-third:  right: (128, None)
+  held-third: test a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound ... FAILED
+  held-third:     a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound
+  held-third: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 96 filtered out; finished in 52.48s
+  held-third: error: test failed, to rerun pass `-p slates-server --test fleet`
+resend exit 0 12s
+  resend: warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+  resend: slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, extensions 10 × 100000000 ns; no path measured yet
+  resend: slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, extensions 10 × 100000000 ns; no path measured yet
+  resend: test a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id ... ok
+  resend: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 96 filtered out; finished in 12.39s
