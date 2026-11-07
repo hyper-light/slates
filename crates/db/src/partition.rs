@@ -128,6 +128,40 @@ pub struct PartitionSnapshot {
   pub nfs_calls: Vec<NfsCallRecord>,
   /// The NFSv4 purges this partition's shard owes its owners, not yet acknowledged by all (2026-10-10; appended).
   pub nfs_purges: Vec<NfsPurgeRecord>,
+  /// Each work volume's log since its last restatement (§4.16, D-18; 2026-11-04; appended).
+  pub work_logs: Vec<WorkLog>,
+  /// Each green's origin held as a reference to its base snapshot (A-217; 2026-11-05; appended).
+  pub green_origin_refs: Vec<GreenOriginRef>,
+}
+
+/// A green's origin as a reference (A-217): the base volume and snapshot it was walked from, and the BLAKE3 of the
+/// origin's canonical encoding, which a recovery's walk of the same snapshot must reproduce.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OriginRef {
+  /// The base volume.
+  pub volume: VolumeId,
+  /// The snapshot of it.
+  pub snapshot: SnapshotId,
+  /// The origin's identity.
+  pub identity: [u8; 32],
+}
+
+/// One green's origin reference, as a snapshot carries it.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GreenOriginRef {
+  /// The green.
+  pub green: VolumeId,
+  /// Its origin.
+  pub origin: OriginRef,
+}
+
+/// One work volume's log: what recovery replays onto the work, in order.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct WorkLog {
+  /// The work volume.
+  pub work: VolumeId,
+  /// The encoded entries, oldest first: at most one restatement, first, then edits and declarations.
+  pub entries: Vec<Vec<u8>>,
 }
 
 /// The partition.
@@ -161,8 +195,16 @@ pub struct Partition {
   /// chain on recovery. Counted in `green_chain_bytes` against the same cap.
   green_origins: BTreeMap<VolumeId, Vec<u8>>,
   /// The total bytes held across all green chains, so a new increment can be refused at the cap
-  /// before it is appended (bounded growth; checkpointing to fold old chain entries is owed).
+  /// before it is appended (bounded growth; checkpointing to fold old chain entries is owed). The work logs count
+  /// here too: one merge byte budget per partition.
   green_chain_bytes: usize,
+  /// Each work volume's log since its last restatement (§4.16, D-18): what recovery replays onto the work so an
+  /// acknowledged edit survives a daemon restart. Counted in `green_chain_bytes` against the same cap; a work's
+  /// restatement (an accepted submit, a rebase) replaces its log, and its destroy reclaims it.
+  work_logs: BTreeMap<VolumeId, Vec<Vec<u8>>>,
+  /// Each green's origin held as a reference to its base snapshot (A-217): a few dozen bytes a green, whatever its
+  /// tree, where `green_origins` held the whole tree's bytes. Removed with the green.
+  green_origin_refs: BTreeMap<VolumeId, OriginRef>,
   /// The NFSv4 file state and clients (§4.6 A-37), each bounded before any operation is issued: the
   /// owner's file state bounds its opens and locks, the listener's session table its clients, and a
   /// replay reproduces only what they admitted.
@@ -238,6 +280,8 @@ impl Partition {
       green_chains: BTreeMap::new(),
       green_origins: BTreeMap::new(),
       green_chain_bytes: 0,
+      work_logs: BTreeMap::new(),
+      green_origin_refs: BTreeMap::new(),
       tombstones: BTreeMap::new(),
     }
   }
@@ -875,6 +919,30 @@ impl Partition {
         }
         Ok(())
       }
+      Op::WorkLogged { work, entry } => {
+        self.volume(*work).ok_or(DbError::NotFound)?;
+        self.merge_bytes_fit(0, entry.len())
+      }
+      Op::GreenOriginHeld { green, origin } => {
+        self.volume(*green).ok_or(DbError::NotFound)?;
+        self
+          .snapshot(origin.volume, origin.snapshot)
+          .ok_or(DbError::NotFound)?;
+        // Version 0, recorded once and only before any increment, whatever form the origin takes.
+        if self.green_origins.contains_key(green)
+          || self.green_origin_refs.contains_key(green)
+          || !self.green_chain(*green).is_empty()
+        {
+          return Err(DbError::AlreadyExists {
+            existing: green.bytes,
+          });
+        }
+        Ok(())
+      }
+      Op::WorkRestated { work, entry } => {
+        self.volume(*work).ok_or(DbError::NotFound)?;
+        self.merge_bytes_fit(self.work_log_bytes(*work), entry.len())
+      }
       Op::GreenOriginated { green, origin } => {
         self.volume(*green).ok_or(DbError::NotFound)?;
         // An origin is version 0: recorded once, and only before any increment — a chain that has
@@ -1236,7 +1304,64 @@ impl Partition {
         self.green_origins.insert(*green, origin.clone());
         Ok(())
       }
+      Op::GreenOriginHeld { green, origin } => {
+        self.green_origin_refs.insert(*green, *origin);
+        Ok(())
+      }
+      Op::WorkLogged { work, entry } => {
+        self.green_chain_bytes = self.green_chain_bytes.saturating_add(entry.len());
+        self.work_logs.entry(*work).or_default().push(entry.clone());
+        Ok(())
+      }
+      Op::WorkRestated { work, entry } => {
+        let released = self.work_log_bytes(*work);
+        self.green_chain_bytes = self
+          .green_chain_bytes
+          .saturating_sub(released)
+          .saturating_add(entry.len());
+        self.work_logs.insert(*work, vec![entry.clone()]);
+        Ok(())
+      }
     }
+  }
+
+  /// The bytes a work's log holds now.
+  fn work_log_bytes(&self, work: VolumeId) -> usize {
+    self
+      .work_logs
+      .get(&work)
+      .map_or(0, |log| log.iter().map(Vec::len).sum())
+  }
+
+  /// Whether replacing `released` bytes of the merge budget with `added` keeps it within the partition's cap: the
+  /// typed refusal at the bound otherwise (bounded growth, CLAUDE.md banned item 8).
+  fn merge_bytes_fit(&self, released: usize, added: usize) -> Result<(), DbError> {
+    if self
+      .green_chain_bytes
+      .saturating_sub(released)
+      .saturating_add(added)
+      > self.caps.green_chain_bytes
+    {
+      return Err(DbError::Capacity {
+        table: "green_chains",
+      });
+    }
+    Ok(())
+  }
+
+  /// A green's origin reference (A-217), if its origin is held as one.
+  pub fn green_origin_ref(&self, green: VolumeId) -> Option<&OriginRef> {
+    self.green_origin_refs.get(&green)
+  }
+
+  /// Every green origin reference, by green (A-217): what recovery counts as pins, and what a volume's destroy checks.
+  pub fn green_origin_refs(&self) -> impl Iterator<Item = (&VolumeId, &OriginRef)> {
+    self.green_origin_refs.iter()
+  }
+
+  /// A work volume's log since its last restatement, oldest first (§4.16, D-18): what recovery replays onto it.
+  pub fn work_log(&self, work: VolumeId) -> &[Vec<u8>] {
+    self.work_logs.get(&work).map_or(&[], Vec::as_slice)
   }
 
   fn insert_volume(&mut self, record: VolumeRecord) -> Result<(), DbError> {
@@ -1292,6 +1417,12 @@ impl Partition {
     }
     if let Some(origin) = self.green_origins.remove(&id) {
       self.green_chain_bytes = self.green_chain_bytes.saturating_sub(origin.len());
+    }
+    self.green_origin_refs.remove(&id);
+    // A destroyed work's log can never be replayed either.
+    let log = self.work_log_bytes(id);
+    if self.work_logs.remove(&id).is_some() {
+      self.green_chain_bytes = self.green_chain_bytes.saturating_sub(log);
     }
     Ok(())
   }
@@ -1403,6 +1534,22 @@ impl Partition {
       nfs_sessions: self.nfs_sessions.values().cloned().collect(),
       nfs_calls: self.nfs_calls.values().cloned().collect(),
       nfs_purges: self.nfs_purges.iter().copied().collect(),
+      green_origin_refs: self
+        .green_origin_refs
+        .iter()
+        .map(|(green, origin)| GreenOriginRef {
+          green: *green,
+          origin: *origin,
+        })
+        .collect(),
+      work_logs: self
+        .work_logs
+        .iter()
+        .map(|(work, entries)| WorkLog {
+          work: *work,
+          entries: entries.clone(),
+        })
+        .collect(),
       nfs_instance: self.nfs_instance,
       tombstones: self.tombstones().collect(),
       green_chains: {
@@ -1509,12 +1656,27 @@ impl Partition {
       p.landings.insert(l.id, l.clone());
     }
     p.audit = snapshot.audit.clone();
-    for chain in &snapshot.green_chains {
-      p.restore_green_chain(chain);
-    }
+    p.restore_merge(snapshot);
     p.restore_nfs(snapshot);
     p.restore_consumers_and_tombstones(snapshot);
     Ok(p)
+  }
+
+  /// Restores the merge plane a snapshot carries (§4.16): every green's chain and origin, every held origin reference
+  /// (A-217) and every work's log (A-207), each charged to the merge byte budget as when it was recorded.
+  fn restore_merge(&mut self, snapshot: &PartitionSnapshot) {
+    for chain in &snapshot.green_chains {
+      self.restore_green_chain(chain);
+    }
+    for held in &snapshot.green_origin_refs {
+      self.green_origin_refs.insert(held.green, held.origin);
+    }
+    for log in &snapshot.work_logs {
+      self.green_chain_bytes = self
+        .green_chain_bytes
+        .saturating_add(log.entries.iter().map(Vec::len).sum());
+      self.work_logs.insert(log.work, log.entries.clone());
+    }
   }
 
   /// Restores one green's chain and origin from a snapshot, charging both to the chain budget; a
