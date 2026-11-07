@@ -37,6 +37,10 @@ pub struct ClientSlot {
   pub last_seen_ns: u64,
   /// Dead ring admission is closed while its attachments are retired on all owner shards (§4.7).
   pub(crate) retiring: bool,
+  /// Set once the client has proven its id with its session key (`crate::session_key`), checked before its first
+  /// request is served. A slot never proven is ended without retiring its id's attachments (`reap::end_unproven`):
+  /// they belong to the id's owner, whom a stranger naming the id is not.
+  pub(crate) proven: bool,
   /// The control channel, where the platform has one (Linux: the socket whose close is how
   /// the daemon learns of a dead client, and whose peer end closing tells the client the
   /// daemon died; held for the client's life).
@@ -495,6 +499,9 @@ pub struct ShardState {
   /// (`landing::grant_proof`). Every shard reads the same secret, so a grant verifies on whichever shard
   /// serves the client; it is never sent on any channel.
   pub issuer_secret: [u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  /// The node's client session secret (`crate::session_key`), read from the anchor's supervision block at shard init:
+  /// what a client's session key is derived from and checked against on the shard that serves it. Never sent.
+  pub session_secret: [u8; slates_anchor::layout::SESSION_SECRET_BYTES],
   /// This shard's copy of the node's sealing root (A-92), in hyper-seal's locked region; `None` while sealing is
   /// unavailable. Tenant keys on this partition are wrapped under it.
   pub seal_root: Option<hyper_seal::keys::WrappingKey>,
@@ -505,8 +512,9 @@ pub struct ShardState {
   /// unavailable.
   pub seal_recipient: Option<hyper_seal::recipient::Recipient>,
   /// The candidate nodes, by stable anchor, this shard's pair key was delivered to in this daemon's life (A-92 piece 4b),
-  /// bounded by the fleet's peer capacity.
-  pub pairs_delivered: std::collections::BTreeSet<u64>,
+  /// each with the member id it was delivered to, so a node back at its anchor with fresh RAM (a new member id) is
+  /// delivered it again; bounded by the fleet's peer capacity.
+  pub pairs_delivered: std::collections::BTreeMap<u64, slates_db::HostId>,
   /// The stable anchor of each neighbour, by member id, as this owner shard's pair delivery last resolved them (A-92
   /// piece 4c): a head naming sealed content ships only once it carries a key entry for every remote candidate's
   /// anchor. Refreshed each record period, so a member that restarts under a new id with the same anchor resolves;
@@ -658,10 +666,18 @@ pub struct ShardState {
   /// This start's random nonce, announced with its derived member id on SWIM contact (§4.8).
   /// It survives a warm restart with the complete retained Raft state; whole-anchor loss changes it.
   pub member_boot_nonce: u64,
+  /// A word fresh at every start of this daemon process (keyed from the issuer secret minted at each start), announced
+  /// with this node's identity so a peer tells a restarted process from a redial of this one (`member_task::Announcement`).
+  pub member_process_nonce: u64,
   /// One authenticated identity per rostered certificate anchor, bounded by the roster.
   /// A different nonce retires the previous id; nonces cannot establish numeric age order.
   /// Only the control shard updates it. Empty before contact, and on a laptop.
   pub learned_members: BTreeMap<slates_db::HostId, LearnedMember>,
+  /// Members this node holds dead that have since announced themselves over an authenticated record session, by the
+  /// incarnation they died at: their process is alive (an anchor's warm restart keeps the member id), so contact with
+  /// them is kept until they refute the death (`fleet::direct_contact`'s `Returned`). Only the control shard updates it;
+  /// bounded by the fleet's peer capacity.
+  pub returned_members: BTreeMap<slates_db::HostId, u64>,
   /// Reverse index of the current authenticated identities, bounded by learned_members.
   /// Relayed alive gossip may refute a failure, but cannot revive a superseded RAM identity.
   pub authenticated_members: std::collections::BTreeSet<slates_db::HostId>,

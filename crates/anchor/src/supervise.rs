@@ -23,6 +23,7 @@ mod windows;
 use slates_machine::{Derived, derived};
 
 use crate::error::AnchorError;
+use crate::layout::RegionKind;
 use crate::segment::AnchorSegment;
 
 /// Format: the environment variable carrying the anchor's process id to the daemon, so the
@@ -130,6 +131,10 @@ pub enum Stopping {
 /// The supervisor.
 pub struct Supervisor {
   segment: AnchorSegment,
+  /// The profile the anchor published before supervision began, published again before every start: a daemon
+  /// republishes the profile at its start, and one killed inside that left it unfinished, which refused every daemon
+  /// after it (`PublicationInProgress`; a crash loop under two spinners a core, an 18-core Mac, 2026-11-07).
+  profile: Option<Vec<u8>>,
   /// The path this process was started from: every daemon's `argv[0]`, so `ps` and `pgrep -f` show it as before, and
   /// where there is no link to the running image, the file each start is checked against (A-145).
   program: String,
@@ -233,8 +238,10 @@ impl Supervisor {
       .to_string_lossy()
       .into_owned();
     let image = own_image::identity(&program)?;
+    let profile = segment.read_published(RegionKind::Profile)?;
     Ok(Supervisor {
       segment,
+      profile,
       program,
       image,
       args: args.to_vec(),
@@ -592,6 +599,11 @@ impl Supervisor {
     #[cfg(unix)]
     env.extend(self.device_env());
     env.extend(self.environment.iter().cloned());
+    // The daemon before this one may have died inside its republication of the profile; the anchor's is whole again
+    // before the next reads it. No daemon runs now, so nothing else writes it.
+    if let Some(profile) = &self.profile {
+      self.segment.publish(RegionKind::Profile, profile)?;
+    }
     let child = self.spawn_child(env)?;
     let restart = self.segment.supervision()?.generation() > 0;
     self

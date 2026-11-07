@@ -104,6 +104,12 @@ pub struct LandingState {
   pub slices_past_budget: u64,
   /// The budget the last slice was given, in nanoseconds (half the shard's step quantum then).
   pub slice_budget_ns: u64,
+  /// The longest a granted landing on this shard went between two looks at its lease, in nanoseconds: from the
+  /// take to the first look, then from look to look (`keep_lease_alive`). The keepalive renews once less than half
+  /// the term is left (`RENEW_AT_REMAINING_PERMILLE`), so a gap past half the term lapses the lease and the entries
+  /// after it are skipped `LeaseEnded`, as a holder paused past its term must be (AUD-29-03). The measure a term is
+  /// judged against: a busy machine's gaps, not a guess.
+  pub longest_lease_gap_ns: u64,
 }
 
 /// What a shard's granted-landing slices measured (AUD-29-25), for a run to publish.
@@ -123,6 +129,8 @@ pub struct SliceSummary {
   pub past_budget: u64,
   /// The budget the last slice was given.
   pub budget_ns: u64,
+  /// The longest gap between two of a landing's looks at its lease ([`LandingState::longest_lease_gap_ns`]).
+  pub longest_lease_gap_ns: u64,
 }
 
 impl LandingState {
@@ -142,6 +150,7 @@ impl LandingState {
       max_ns: self.slice_times.max(),
       past_budget: self.slices_past_budget,
       budget_ns: self.slice_budget_ns,
+      longest_lease_gap_ns: self.longest_lease_gap_ns,
     }
   }
 }
@@ -188,6 +197,7 @@ impl Default for LandingState {
       slice_times: crate::histogram::DurationHistogram::default(),
       slices_past_budget: 0,
       slice_budget_ns: 0,
+      longest_lease_gap_ns: 0,
     }
   }
 }
@@ -257,7 +267,8 @@ pub fn land_verb(
 /// Takes the landing lease on the target whose canonical key is `key`, on this shard — the control shard,
 /// the one owner of the host's target leases (§4.15 "Ownership facts", step 4; AUD-29-03) — for the landing
 /// attempt `holder`, for `term_ns`, as a durable record. Refused `LandingLeaseHeld`, naming the holder,
-/// while any attempt's lease on that target is unexpired. Refused `LandingLeaseLost`, taking nothing, once
+/// while another attempt's lease on that target is unexpired; the holder's own take renews it (the keepalive,
+/// AUD-29-25). Refused `LandingLeaseLost`, taking nothing, once
 /// the caller's `deadline_ns` has passed: the caller no longer waits for the answer, and a lease it never
 /// learned of would hold the target for a term. The generation is the take's log sequence on this
 /// partition, so it only grows, across releases and restarts: a release or a fence naming an older one
@@ -835,6 +846,8 @@ struct GrantedRun {
   /// An unnamed landing's snapshot of the head, taken when it began and destroyed when it ends: what lands is
   /// the head as it was then, while writers go on between slices (§4.15; A-48/49 land a snapshot exactly).
   implicit: Option<slates_vfs::ids::SnapshotId>,
+  /// When the landing last looked at its lease, on the shard's clock: at first when the lease was taken.
+  lease_seen_ns: u64,
 }
 
 /// A granted landing that ended before running: what its reply needs.
@@ -1018,9 +1031,15 @@ const RENEW_AT_REMAINING_PERMILLE: u64 = 500;
 async fn keep_lease_alive(granted: &mut GrantedRun, ask: LeaseAsk, key: &str) {
   let expires_ns = granted.run.lease().expires_ns;
   let margin = ask.term.saturating_mul(RENEW_AT_REMAINING_PERMILLE) / PERMILLE;
-  let Some(now) = crate::state::with_state(|s| s.clock.monotonic_ns()) else {
+  let seen = granted.lease_seen_ns;
+  let Some(now) = crate::state::with_state(|s| {
+    let now = s.clock.monotonic_ns();
+    s.landing.longest_lease_gap_ns = s.landing.longest_lease_gap_ns.max(now.saturating_sub(seen));
+    now
+  }) else {
     return;
   };
+  granted.lease_seen_ns = now;
   if now.saturating_add(margin) < expires_ns {
     return;
   }
@@ -1289,6 +1308,9 @@ fn begin_granted(
         spans: SpanObserver::with_capacity(telemetry_capacity),
         away: None,
         implicit,
+        lease_seen_ns: lease
+          .expires_ns
+          .saturating_sub(state.config.failover_slo_ns),
       };
       if was_overlay {
         lend_back(slot, &mut granted);
@@ -2550,22 +2572,20 @@ mod tests {
   }
 
   /// §4.15 step 4 (AUD-29-03): the control shard's target lease has one holder until it is released or its
-  /// term ends. Do: attempt A takes a target; attempts B and A again take it; B releases it; A releases it
-  /// and C takes it. Expect: B's take and A's second take are refused `LandingLeaseHeld` naming A — an attempt
-  /// id is not a renewal; another target is its own lease; B's release frees nothing; after A's release C
-  /// holds it under a greater generation; the status report counts each record and none once released.
+  /// term ends. Do: attempt A takes a target; attempt B takes it; B releases it; A releases it and C takes it.
+  /// Expect: B's take is refused `LandingLeaseHeld` naming A; another target is its own lease; B's release frees
+  /// nothing; after A's release C holds it under a greater generation; the status report counts each record and
+  /// none once released. (A's own second take renews it: `a_holder_renews_its_own_live_lease_and_no_other_holder_can`.)
   #[test]
   fn a_target_lease_has_one_holder_until_its_release_or_its_term() {
     crate::daemon::audit_on_shard(|state| {
       let deadline = far(state);
       let a = take_target_lease(state, target(2), 10, LONG_TERM_NS, deadline).unwrap();
-      for holder in [11, 10] {
-        assert_eq!(
-          take_target_lease(state, target(2), holder, LONG_TERM_NS, deadline),
-          Err(Refusal::LandingLeaseHeld { holder: 10 }),
-          "attempt {holder}"
-        );
-      }
+      assert_eq!(
+        take_target_lease(state, target(2), 11, LONG_TERM_NS, deadline),
+        Err(Refusal::LandingLeaseHeld { holder: 10 }),
+        "another attempt"
+      );
       take_target_lease(state, target(3), 11, LONG_TERM_NS, deadline).unwrap();
       assert_eq!(crate::verbs::shard_report(state).target_leases, 2);
       release_target_lease(state, &target(2), 11).unwrap();
@@ -2604,6 +2624,30 @@ mod tests {
     });
   }
 
+  /// §4.15 "The lease keepalive" (AUD-29-25): a running landing renews its target lease between slices by taking it
+  /// again as its own holder once half its term has passed, while the lease still holds. Do: take a target for one
+  /// attempt; take it again for the same attempt before its term ends; then take it for another attempt. Expect: the
+  /// second take renews it (a later generation, ending no sooner) and the third is refused naming the holder. Before
+  /// 2026-11-07 the second was refused `LandingLeaseHeld` naming its own holder, so a renewal only ever succeeded once
+  /// the lease had already lapsed, and the entries a landing reached in between were skipped `LeaseEnded`
+  /// (`crates/server/tests/landing_fairness.rs` under two spinners a logical CPU).
+  #[test]
+  fn a_holder_renews_its_own_live_lease_and_no_other_holder_can() {
+    crate::daemon::audit_on_shard(|state| {
+      let deadline = far(state);
+      let first = take_target_lease(state, target(3), 20, LONG_TERM_NS, deadline).unwrap();
+      let renewed = take_target_lease(state, target(3), 20, LONG_TERM_NS, deadline)
+        .expect("the holder renews its own lease while it holds");
+      assert_eq!(renewed.holder, 20);
+      assert!(renewed.generation > first.generation);
+      assert!(renewed.expires_ns >= first.expires_ns);
+      assert_eq!(
+        take_target_lease(state, target(3), 21, LONG_TERM_NS, deadline),
+        Err(Refusal::LandingLeaseHeld { holder: 20 })
+      );
+    });
+  }
+
   /// §4.15 step 4 (AUD-29-03): a take that reaches the control shard after its caller stopped waiting takes
   /// nothing, so no lease is held for an attempt that never learns of it. Do: take with a deadline already
   /// passed, then take for another attempt. Expect: the first is refused `LandingLeaseLost` and the second
@@ -2628,12 +2672,51 @@ mod tests {
   /// status report counts five, then one.
   #[test]
   fn a_take_releases_the_leases_whose_terms_have_ended() {
-    crate::daemon::audit_on_shard(|state| {
+    takes_release_the_leases_whose_terms_have_ended(false);
+  }
+
+  /// The same history on a machine slow enough that the short leases' takes outlast their term (GAPS, "a lease test
+  /// assumes five takes finish inside a 20 ms term": CI run 40077995650 counted 4 where 5 were due). Do: stall past
+  /// the term before the last short take. Expect: the history still holds, since the count before the pause is judged
+  /// by the time the takes measured, and the final take still leaves its own lease alone.
+  #[test]
+  fn a_take_releases_the_leases_whose_terms_have_ended_when_the_takes_outlast_the_term() {
+    takes_release_the_leases_whose_terms_have_ended(true);
+  }
+
+  /// Takes `TARGETS` short leases (stalling past the term before the last when `stalled`), counts them, pauses past
+  /// the term, and takes one long lease, which must release every short one.
+  ///
+  /// The count before the pause is judged by the takes' own clock, not the test's speed: a take releases each lease
+  /// whose term ended at or before its reading, and a short take's reading is its lease's expiry less the term. So
+  /// the leases held after the last short take are exactly those expiring after its reading: all of them on a machine
+  /// that took them inside a term, fewer on one that did not (a stalled history must show fewer, or it stalled
+  /// nothing).
+  // A history's helper: a refused take is a failed test, as in the `#[test]` bodies.
+  #[allow(clippy::unwrap_used)]
+  fn takes_release_the_leases_whose_terms_have_ended(stalled: bool) {
+    crate::daemon::audit_on_shard(move |state| {
       let deadline = far(state);
+      let mut taken = Vec::new();
       for inode in 0..TARGETS {
-        take_target_lease(state, target(inode), inode, SHORT_TERM_NS, deadline).unwrap();
+        if stalled && inode + 1 == TARGETS {
+          pause_past_a_short_term();
+        }
+        taken
+          .push(take_target_lease(state, target(inode), inode, SHORT_TERM_NS, deadline).unwrap());
       }
-      assert_eq!(crate::verbs::shard_report(state).target_leases, TARGETS);
+      let last_reading = taken
+        .last()
+        .map_or(0, |lease| lease.expires_ns.saturating_sub(SHORT_TERM_NS));
+      let held = taken
+        .iter()
+        .filter(|lease| lease.expires_ns > last_reading)
+        .count();
+      let held = u64::try_from(held).unwrap();
+      if stalled {
+        assert!(held < TARGETS, "the stall outlasted no term: {held} held");
+      }
+      assert_eq!(crate::verbs::shard_report(state).target_leases, held);
       pause_past_a_short_term();
       take_target_lease(state, target(TARGETS), TARGETS, LONG_TERM_NS, deadline).unwrap();
       assert_eq!(crate::verbs::shard_report(state).target_leases, 1);

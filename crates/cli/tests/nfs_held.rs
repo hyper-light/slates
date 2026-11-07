@@ -301,6 +301,8 @@ fn an_nfs_connection_outlives_its_daemons_kill_and_every_request_is_answered() {
 /// One NFS connection to a fresh volume's export, its file, and the model of what was written to it.
 struct HeldSession {
   stream: TcpStream,
+  /// The export's path and port, for a second connection to it.
+  export: (String, u16),
   root: Vec<u8>,
   file: Vec<u8>,
   model: Vec<u8>,
@@ -323,12 +325,14 @@ impl HeldSession {
     let (code, out, err) = run(instance, &["export", &id, "--json"]);
     assert_eq!(code, 0, "export: {err}");
     let (path, port) = (json_field(&out, "path"), json_field(&out, "port"));
-    let mut stream = TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap())).unwrap();
+    let port = port.parse::<u16>().unwrap();
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream.set_read_timeout(Some(START_WAIT)).unwrap();
     let root = nfs::mount(&mut stream, &path, 1);
     let file = nfs::create(&mut stream, &root, "burst", 2);
     HeldSession {
       stream,
+      export: (path, port),
       root,
       file,
       model: Vec::new(),
@@ -854,4 +858,164 @@ fn held_counter(instance: &str, counter: &str) -> u64 {
         .ok()
     })
     .sum()
+}
+
+/// Shape: the page the write-back history works on: one client page.
+const PAGE: usize = 4096;
+/// Shape: the bytes the other path changes at the page's start.
+const OTHER_PATH: std::ops::Range<usize> = 0..100;
+/// Shape: the byte the stale write-back's program store lands on, outside the other path's change.
+const STALE_STORE: usize = 2000;
+/// Shape: the byte the fresh write-back's program store lands on.
+const FRESH_STORE: usize = 3000;
+/// Format: NFS3ERR_IO (RFC 1813), what a refused write-back is answered (A-192).
+const NFS3ERR_IO: u32 = 5;
+/// Shape: the steps of the history, so a crash point lands before each one and after the last.
+const HISTORY_STEPS: usize = 5;
+
+/// One run of the write-back history (A-231) on a fresh anchor, its daemon killed after `crash_after` steps (0: before
+/// the first). Returns the stale write-back's status, the file after the history, and whether the daemon that judged the
+/// stale write-back had taken back a held connection's states (counted `nfs.writeback_states_restored`).
+fn write_back_history(crash_after: usize) -> (u32, Vec<u8>, u64) {
+  let instance = format!("nfs-carry-{}-{crash_after}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let mut owner = HeldSession::open(&instance);
+  // The other path: a second connection the anchor holds, writing with the file's handle.
+  let (path, port) = owner.export.clone();
+  let mut other = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  other.set_read_timeout(Some(START_WAIT)).unwrap();
+  let _ = nfs::mount(&mut other, &path, 1);
+  let original = vec![0x11u8; PAGE];
+  assert_eq!(
+    nfs::status(&call_once(
+      &mut owner.stream,
+      WRITE,
+      &write_args(&owner.file, 0, &original),
+      50
+    )),
+    0,
+    "the file's first page"
+  );
+  let mut pid = daemon_pid(&instance).expect("a daemon answers");
+  let mut xid = 200u32;
+  let mut stale_status = u32::MAX;
+  let mut restored = 0u64;
+  let mut fetched = Vec::new();
+  for step in 0..=HISTORY_STEPS {
+    if step == crash_after {
+      let killed = Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .unwrap();
+      assert!(killed.success(), "kill the daemon");
+      pid = await_new_daemon(&instance, pid, crash_after);
+    }
+    match step {
+      // The owner's client fetches the page.
+      0 => {
+        fetched = read_whole(&mut owner.stream, &owner.file, PAGE, xid);
+        xid += 1;
+      }
+      // Another path changes the page's first bytes.
+      1 => {
+        let changed = vec![0xBBu8; OTHER_PATH.len()];
+        let results = call_once(
+          &mut other,
+          WRITE,
+          &write_args(&owner.file, 0, &changed),
+          xid,
+        );
+        assert_eq!(nfs::status(&results), 0, "the other path's write");
+        xid += 1;
+      }
+      // The owner's client writes its dirty page back whole: the page as fetched, one byte stored by its program.
+      2 => {
+        restored = held_counter(&instance, "nfs.writeback_states_restored");
+        let mut page = fetched.clone();
+        page[STALE_STORE] = 0xCC;
+        let results = call_once(
+          &mut owner.stream,
+          WRITE,
+          &write_args(&owner.file, 0, &page),
+          xid,
+        );
+        stale_status = nfs::status(&results);
+        xid += 1;
+      }
+      // The client fetches again, then writes back a page that holds the other path's change.
+      3 => {
+        fetched = read_whole(&mut owner.stream, &owner.file, PAGE, xid);
+        xid += 1;
+      }
+      4 => {
+        let mut page = fetched.clone();
+        page[FRESH_STORE] = 0xDD;
+        let results = call_once(
+          &mut owner.stream,
+          WRITE,
+          &write_args(&owner.file, 0, &page),
+          xid,
+        );
+        assert_eq!(
+          nfs::status(&results),
+          0,
+          "a fresh write-back is applied (crash after {crash_after})"
+        );
+        xid += 1;
+      }
+      _ => {}
+    }
+  }
+  let file = read_whole(&mut owner.stream, &owner.file, PAGE, xid);
+  (stale_status, file, restored)
+}
+
+/// A-231 (A-192's byte states across a takeover). Do: for each point of a write-back history — a held connection's
+/// client fetches a page, another path changes its first bytes, the client writes its page back from before that change,
+/// fetches again and writes back a fresh page — kill the daemon there, on a fresh anchor each time, and let its successor
+/// serve the rest on the same connections. Expect, at every crash point: the stale write-back refused `NFS3ERR_IO`, the
+/// other path's bytes kept, the stale page's store never applied, and the fresh write-back applied; and a successor
+/// that took back carried states at least once.
+#[test]
+fn a_stale_write_back_is_refused_at_every_crash_point_of_its_history() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the write-back history: set SLATES_TEST_CLI=1 to run it (an anchor and its daemons)"
+    );
+    return;
+  }
+  if cfg!(target_os = "linux") {
+    eprintln!(
+      "skipping the write-back history: Linux does not hold NFS connections yet (A-113, GAPS)"
+    );
+    return;
+  }
+  let mut restored_somewhere = 0u64;
+  for crash_after in 0..=HISTORY_STEPS {
+    let (stale, file, restored) = write_back_history(crash_after);
+    eprintln!(
+      "crash after {crash_after} steps: stale write-back status {stale}, states restored {restored}"
+    );
+    restored_somewhere += restored;
+    assert_eq!(
+      stale, NFS3ERR_IO,
+      "the stale write-back was refused (crash after {crash_after} steps)"
+    );
+    assert!(
+      file[OTHER_PATH].iter().all(|&byte| byte == 0xBB),
+      "the other path's bytes were kept (crash after {crash_after} steps)"
+    );
+    assert_eq!(
+      file[STALE_STORE], 0x11,
+      "the stale page's store was never applied (crash after {crash_after})"
+    );
+    assert_eq!(
+      file[FRESH_STORE], 0xDD,
+      "the fresh write-back was applied (crash after {crash_after})"
+    );
+  }
+  assert!(
+    restored_somewhere > 0,
+    "a successor took back carried states"
+  );
 }

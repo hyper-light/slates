@@ -8,6 +8,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 /// Shape: how long the daemon may take to come up.
@@ -49,24 +50,41 @@ fn pause() {
   std::thread::sleep(POLL);
 }
 
-/// The anchor, killed and reaped on drop, so a failed assertion leaves no daemon behind.
-struct Anchor(Child);
+/// Format: the start of the line a daemon prints once it serves (`crates/cli/src/daemon.rs`); the instance follows.
+const SERVING_LINE: &str = "slates daemon: instance ";
+
+/// The anchor, killed and reaped on drop, so a failed assertion leaves no daemon behind; each of its daemons' serving
+/// lines arrives on `served` with the moment it was read.
+struct Anchor {
+  child: Child,
+  served: Receiver<Instant>,
+}
 
 impl Drop for Anchor {
   fn drop(&mut self) {
-    let _ = self.0.kill();
-    let _ = self.0.wait();
+    let _ = self.child.kill();
+    let _ = self.child.wait();
   }
 }
 
 fn start_anchor(instance: &str) -> Anchor {
-  let child = slates()
+  let mut child = slates()
     .args(["--instance", instance, "anchor", "--quick", "--shards", "2"])
     .stdout(Stdio::null())
-    .stderr(Stdio::null())
+    .stderr(Stdio::piped())
     .spawn()
     .unwrap();
-  let anchor = Anchor(child);
+  let stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+  let serving = format!("{SERVING_LINE}{instance} serving on ");
+  let (send, served) = std::sync::mpsc::channel();
+  std::thread::spawn(move || {
+    for line in std::io::BufRead::lines(stderr).map_while(Result::ok) {
+      if line.starts_with(&serving) && send.send(Instant::now()).is_err() {
+        break;
+      }
+    }
+  });
+  let anchor = Anchor { child, served };
   let started = Instant::now();
   let mut streak = 0;
   while streak < STABLE_STREAK {
@@ -79,6 +97,36 @@ fn start_anchor(instance: &str) -> Anchor {
     pause();
   }
   anchor
+}
+
+/// Ends process `pid` at once, as `kill -9` does: `SIGKILL` on Unix, `TerminateProcess` on Windows (where there is no
+/// `kill` to run; until 2026-11-07 this test was run on Unix only for that reason).
+#[cfg(unix)]
+fn kill_hard(pid: u32) {
+  let status = Command::new("kill")
+    .args(["-9", &pid.to_string()])
+    .status()
+    .unwrap();
+  assert!(status.success(), "kill the daemon");
+}
+
+/// See the Unix form.
+#[cfg(windows)]
+fn kill_hard(pid: u32) {
+  use windows_sys::Win32::Foundation::CloseHandle;
+  use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+  // SAFETY: the pid came from the daemon's own status; only the right to end it is asked, with no inheritance.
+  let process = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+  assert!(
+    !process.is_null(),
+    "OpenProcess({pid}): {}",
+    std::io::Error::last_os_error()
+  );
+  // SAFETY: the live handle just opened, used once and closed here.
+  let ended = unsafe { TerminateProcess(process, 1) };
+  // SAFETY: the same handle, closed once.
+  unsafe { CloseHandle(process) };
+  assert_ne!(ended, 0, "kill the daemon");
 }
 
 /// The daemon's pid, from `status --json`, or `None` while no daemon answers.
@@ -96,9 +144,15 @@ fn daemon_pid(instance: &str) -> Option<u32> {
     .ok()
 }
 
-/// A-114, T-2.16. Do: under `slates anchor`, six times `kill -9` the daemon and at once run `slates status --json`.
-/// Expect: every one exits 0, answered by a daemon other than the one killed, inside the claim wait (before A-114
-/// each waited the whole claim wait and exited 3).
+/// A-114, T-2.16. Do: under `slates anchor`, six times end the daemon at once (`kill -9`, `TerminateProcess`) and at
+/// once run `slates status --json`. Expect: every one exits 0, answered by a daemon other than the one killed, within a
+/// claim wait of that daemon's serving (before A-114 each waited the whole claim wait and exited 3).
+///
+/// The bound is counted from the successor's serving line, not from the kill: a client of a live anchor waits out the
+/// restart, however long the machine makes it. Counted from the kill, beside two spinners a CPU on windows-latest
+/// (diag-liveness-14) the first round was answered by the next daemon in 1.05-1.28 s, five runs in five, against a
+/// 1 s claim wait, while quiet it was 43-47 ms. A client that ran out a claim wait and retried would still be caught:
+/// it is answered more than a claim wait after the successor serves.
 #[test]
 fn a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon() {
   if std::env::var_os("SLATES_TEST_CLI").is_none() {
@@ -108,15 +162,12 @@ fn a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon() {
     return;
   }
   let instance = format!("held-rdv-{}", std::process::id());
-  let _anchor = start_anchor(&instance);
+  let anchor = start_anchor(&instance);
   let mut longest = Duration::ZERO;
   for round in 0..KILLS {
     let killed = daemon_pid(&instance).expect("a daemon answers");
-    let status = Command::new("kill")
-      .args(["-9", &killed.to_string()])
-      .status()
-      .unwrap();
-    assert!(status.success(), "kill the daemon");
+    while anchor.served.try_recv().is_ok() {}
+    kill_hard(killed);
     let started = Instant::now();
     let (code, out, err) = run(&instance, &["status", "--json"]);
     let took = started.elapsed();
@@ -140,9 +191,14 @@ fn a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon() {
       answered_by, killed,
       "round {round}: the next daemon answered"
     );
+    let served_after = anchor
+      .served
+      .recv_timeout(START_WAIT)
+      .expect("the next daemon said it serves")
+      .saturating_duration_since(started);
     assert!(
-      took < CLAIM_WAIT,
-      "round {round}: answered in {took:?}, inside the claim wait"
+      took < served_after + CLAIM_WAIT,
+      "round {round}: answered in {took:?}, the next daemon serving after {served_after:?}: within a claim wait of it"
     );
     #[allow(clippy::disallowed_methods)] // the test keeps its kills inside the restart policy
     std::thread::sleep(BETWEEN_KILLS);

@@ -299,14 +299,16 @@ fn wait_formed(instances: &[String]) -> Vec<String> {
 }
 
 /// Waits until the bootstrapped fleet is whole on every node: all three members voting in the council, all three in the
-/// committed configuration, and a record session to each peer. A test that kills or stops a node before then can take
+/// committed configuration, a record session to each peer, and a pair key from each shard of each peer (A-92 piece 4b;
+/// `fleet.seal.pair_served`): a live log is durable only once its whole entry carries a key for every candidate
+/// (`live_ship::covers_candidates`), so a candidate stopped before its pairs came holds every live write back. A test that kills or stops a node before then can take
 /// the council below its quorum (the third member is promoted to voter about 1.5 s after the bootstrap when quiet, later
 /// under load) or find no session to a candidate: under load at 36–46 a killed owner left a council of two voters that
 /// never elected again, and an owner found no session to its only reachable candidate (2026-11-05, `live_fleet`).
 fn wait_settled(instances: &[String]) {
   let deadline = Instant::now() + FLEET_WAIT;
   loop {
-    let views: Vec<(String, String, usize)> = instances
+    let views: Vec<(String, String, usize, u64)> = instances
       .iter()
       .map(|instance| {
         let (_, out, _) = run(instance, &["status"]);
@@ -314,24 +316,33 @@ fn wait_settled(instances: &[String]) {
           .lines()
           .filter(|line| line.starts_with("fleet_session "))
           .count();
+        let pairs: u64 = out
+          .lines()
+          .filter_map(|line| line.split_once(" refused fleet.seal.pair_served: "))
+          .filter_map(|(_, count)| count.trim().parse::<u64>().ok())
+          .sum();
         (
           value_of(&out, "fleet_council_voters"),
           value_of(&out, "fleet_configuration_members"),
           sessions,
+          pairs,
         )
       })
       .collect();
-    let whole = views.iter().all(|(voters, members, sessions)| {
+    let pairs_wanted =
+      u64::try_from((FLEET_NODES.len() - 1) * SHARDS.parse::<usize>().unwrap()).unwrap();
+    let whole = views.iter().all(|(voters, members, sessions, pairs)| {
       voters.trim() == FLEET_NODES.len().to_string()
         && members.trim() == FLEET_NODES.len().to_string()
         && *sessions == FLEET_NODES.len() - 1
+        && *pairs >= pairs_wanted
     });
     if whole {
       return;
     }
     assert!(
       Instant::now() < deadline,
-      "the fleet settled (council voters, configuration members, record sessions): {views:?}"
+      "the fleet settled (council voters, configuration members, record sessions, pairs served): {views:?}"
     );
     pause();
   }
@@ -393,6 +404,8 @@ struct Fleet {
   daemons: Vec<FleetProcess>,
   instances: Vec<String>,
   bootstrap: usize,
+  /// Each node's member id, in the order of `instances`.
+  hosts: Vec<String>,
 }
 
 /// Starts three daemon processes from one manifest, waits until they form, and bootstraps the root once.
@@ -403,6 +416,19 @@ fn start_fleet(tag: &str) -> Fleet {
 /// [`start_fleet`] with each node run as `verb`: `daemon` alone, or `anchor`, which owns the segment and supervises
 /// the daemon as its child, so a daemon killed as a crash kills it is replaced with its memory kept (a warm restart).
 fn start_fleet_as(tag: &str, verb: &str) -> Fleet {
+  let fleet = start_fleet_bootstrapped_as(tag, verb);
+  wait_settled(&fleet.instances);
+  fleet
+}
+
+/// Starts three daemon processes from one manifest, waits until they form, and bootstraps the root once; returns as
+/// soon as the bootstrap does, with the fleet still forming.
+fn start_fleet_bootstrapped(tag: &str) -> Fleet {
+  start_fleet_bootstrapped_as(tag, "daemon")
+}
+
+/// [`start_fleet_bootstrapped`] with each node run as `verb` ([`start_fleet_as`]).
+fn start_fleet_bootstrapped_as(tag: &str, verb: &str) -> Fleet {
   let pid = std::process::id();
   let scratch = scratch_dir(tag);
   for node in FLEET_NODES {
@@ -430,12 +456,12 @@ fn start_fleet_as(tag: &str, verb: &str) -> Fleet {
     .unwrap();
   let (code, _, error) = run(&instances[bootstrap], &["bootstrap", "root"]);
   assert_eq!(code, 0, "one bootstrap of the fresh fleet: {error}");
-  wait_settled(&instances);
   Fleet {
     scratch,
     daemons,
     instances,
     bootstrap,
+    hosts,
   }
 }
 
@@ -1449,6 +1475,24 @@ fn a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it() {
     resumed.is_ok(),
     "once the candidates are back, fsync succeeds: {resumed:?}"
   );
+}
+
+/// The survivor among `hosts` (each member id with its instance) that takes `volume` over, as [`successor_of`] ranks it.
+fn successor_among(hosts: &[(slates_db::register::HostId, String)], volume: &str) -> String {
+  let mut bytes = [0u8; 16];
+  for (byte, pair) in bytes.iter_mut().zip(volume.as_bytes().chunks(2)) {
+    *byte = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
+  }
+  let mut sorted = hosts.to_vec();
+  sorted.sort_by_key(|(host, _)| host.0);
+  let ids: Vec<slates_db::register::HostId> = sorted.iter().map(|(host, _)| *host).collect();
+  let first =
+    slates_db::register::rendezvous_first(&ids, slates_db::register::ObjectId(bytes)).unwrap();
+  sorted
+    .into_iter()
+    .find(|(host, _)| *host == first)
+    .map(|(_, instance)| instance)
+    .unwrap()
 }
 
 /// The survivor that takes `volume` over when `owner` dies, as the configuration ranks it: the rendezvous winner for the
@@ -2659,4 +2703,370 @@ fn a_fleet_is_one_membership_again_after_its_owners_warm_restart() {
     "every node lists every member within {bound:?} of the owner's warm restart: {:?}",
     whole.1
   );
+}
+
+/// This node's council voters, as `status` reports them (`None` while it does not answer).
+fn council_voters(instance: &str) -> Option<usize> {
+  let (code, out, _) = run(instance, &["status"]);
+  (code == 0).then(|| value_of(&out, "fleet_council_voters").trim().parse().ok())?
+}
+
+/// The records `instance` holds for others, as `status` reports them (`fleet_held_records`; 0 while it does not answer).
+fn held_records(instance: &str) -> u64 {
+  let (code, out, _) = run(instance, &["status"]);
+  if code != 0 {
+    return 0;
+  }
+  value_of(&out, "fleet_held_records")
+    .trim()
+    .parse()
+    .unwrap_or(0)
+}
+
+/// §4.8 while a fleet is still forming: do bootstrap a fresh three-node fleet and, at once, stop the node that is
+/// neither the bootstrap nor the owner (SIGSTOP), create a volume on the owner and wait until the bootstrap node holds
+/// its catalog and head, then kill the owner (SIGKILL) and resume the stopped node. Expect a survivor to take the volume
+/// over and serve it. Found 2026-11-05 by raft's soak under load: the council grew a voter at a time, so with its third
+/// member slow to catch up it sat at two voters, the bootstrap node and the owner; two voters can lose neither, and the
+/// owner's death left both survivors at term 1, no election and no takeover, every read refused `OwnerUnreachable`
+/// (red here: two voters at the kill, 40 s with no leader). The council now grows only by steps that raise the
+/// failures it tolerates (`slates_cluster::config_group::widening`), so it stays at the bootstrap node alone until
+/// both others vote.
+#[test]
+fn an_owner_killed_while_its_fleet_still_forms_is_taken_over() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the forming-fleet takeover flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let mut fleet = start_fleet_bootstrapped("forming");
+  let count = fleet.instances.len();
+  let owner_index = (fleet.bootstrap + 1) % count;
+  let third_index = (fleet.bootstrap + 2) % count;
+  signal(&fleet.daemons[third_index], rustix::process::Signal::STOP);
+  let owner = fleet.instances[owner_index].clone();
+  let bootstrap = fleet.instances[fleet.bootstrap].clone();
+  let id = value_of(
+    &run_ready(
+      &owner,
+      &["volume", "create", "forming", "--bounded", "8MiB"],
+    ),
+    "id",
+  );
+  // The catalog and the head, placed on the owner and the bootstrap node (`f + 1`): a takeover can find the volume.
+  let deadline = Instant::now() + FLEET_WAIT;
+  while held_records(&bootstrap) < 2 {
+    assert!(
+      Instant::now() < deadline,
+      "the bootstrap node holds the volume's catalog and head"
+    );
+    pause();
+  }
+  let voters_at_kill = council_voters(&bootstrap);
+  let third = fleet.daemons.remove(third_index);
+  drop(fleet.daemons.remove(if owner_index > third_index {
+    owner_index - 1
+  } else {
+    owner_index
+  }));
+  signal(&third, rustix::process::Signal::CONT);
+  fleet.daemons.push(third);
+  let survivors: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| **instance != owner)
+    .collect();
+  eprintln!(
+    "forming: the bootstrap node's council held {voters_at_kill:?} voters when the owner was killed"
+  );
+  let (successor, took) = wait_served_whole(&survivors, &id, 0);
+  eprintln!("forming: served by {successor} after {took:?}");
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+}
+
+/// Shape: volumes a test may create to find one whose successor is a chosen node: each is that node's with
+/// probability one half among two survivors, so twenty all miss once in about a million runs.
+const SUCCESSOR_TRIES: usize = 20;
+/// Shape: how long the test keeps the candidate stopped once the writes are under way: several record periods.
+const STOPPED_HOLD: Duration = Duration::from_millis(500);
+
+/// A-200 with A-92 piece 4c: do bootstrap a fresh fleet and, at once, stop one candidate (SIGSTOP), before the owner's
+/// shards have delivered their pair keys to it; create volumes on the owner until one's successor is the stopped node,
+/// turn it live-shipped, write to it, resume the candidate, then kill the owner once the writes return. Expect the
+/// writes to return, and the successor to serve every one. Found 2026-11-05: the log's whole entry was sealed while the
+/// candidate was stopped, so it carried no copy of the lineage key for it (no pair had been delivered); the owner never
+/// sealed another, and the successor refused the rebuild 145 times without serving the volume. A write is now durable
+/// only once the log's last whole entry covers every candidate, and the owner checkpoints again once the pairs it
+/// lacked are delivered (`live_ship::covers_candidates`). In a settled fleet every pair is delivered before any volume
+/// is made, so only a forming fleet shows it.
+#[test]
+fn a_live_volume_made_while_its_successor_was_stopped_is_served_by_it() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping key flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let mut fleet = start_fleet_bootstrapped("live-keyed");
+  let count = fleet.instances.len();
+  let owner_index = (fleet.bootstrap + 1) % count;
+  let stopped_index = (fleet.bootstrap + 2) % count;
+  signal(&fleet.daemons[stopped_index], rustix::process::Signal::STOP);
+  let owner = fleet.instances[owner_index].clone();
+  let stopped = fleet.instances[stopped_index].clone();
+  let hosts: Vec<(slates_db::register::HostId, String)> = fleet
+    .hosts
+    .iter()
+    .zip(&fleet.instances)
+    .filter(|(_, instance)| **instance != owner)
+    .map(|(host, instance)| {
+      (
+        slates_db::register::HostId(host.parse().unwrap()),
+        instance.clone(),
+      )
+    })
+    .collect();
+  let began = Instant::now();
+  let id = (0..SUCCESSOR_TRIES)
+    .map(|attempt| {
+      let id = value_of(
+        &run_ready(
+          &owner,
+          &[
+            "volume",
+            "create",
+            &format!("keyed-{attempt}"),
+            "--bounded",
+            "8MiB",
+          ],
+        ),
+        "id",
+      );
+      eprintln!("live keyed: created {id} after {:?}", began.elapsed());
+      id
+    })
+    .find(|id| successor_among(&hosts, id) == stopped)
+    .expect("a volume whose successor is the stopped node");
+  eprintln!(
+    "live keyed: {id}'s successor is the stopped node, after {:?}",
+    began.elapsed()
+  );
+  // `live-ship` is answered once its own publication is durable, which waits for the stopped candidate too, so it runs
+  // beside the writes, off this thread.
+  let (sender, receiver) = std::sync::mpsc::channel();
+  {
+    let (owner, id) = (owner.clone(), id.clone());
+    std::thread::spawn(move || {
+      let (code, _, err) = run(&owner, &["live-ship", &id]);
+      assert_eq!(code, 0, "live-ship: {err}");
+      sender.send(write_files(&owner, &id, 0..FILES)).unwrap();
+    });
+  }
+  eprintln!(
+    "live keyed: live-shipped and writing, after {:?}",
+    began.elapsed()
+  );
+  let returned_while_stopped = receiver.recv_timeout(STOPPED_HOLD).is_ok();
+  signal(&fleet.daemons[stopped_index], rustix::process::Signal::CONT);
+  if !returned_while_stopped {
+    receiver
+      .recv_timeout(FLEET_WAIT)
+      .expect("the writes return once the candidate is back");
+  }
+  drop(fleet.daemons.remove(owner_index));
+  let survivors: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| **instance != owner)
+    .collect();
+  let (successor, took) = wait_served_whole(&survivors, &id, FILES);
+  eprintln!(
+    "live keyed: the writes returned while the candidate was stopped: {returned_while_stopped}; served whole by \
+     {successor} after {took:?}"
+  );
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+}
+
+/// Shape: how long the test keeps both candidates stopped while a change waits on the macOS mount: past the give-up a
+/// soft mount imposed, measured at 57.1 s on 2026-11-05 (conformance's `a_live_shipped_volume_makes_a_writer_wait_…`,
+/// both candidates stopped), with a margin of a few of the client's own retry waits.
+#[cfg(target_os = "macos")]
+const PAST_SOFT_GIVE_UP: Duration = Duration::from_secs(75);
+
+/// A kernel mount made by `slates mount`, unmounted when dropped, by force if the plain unmount is refused. Declared
+/// after the fleet it mounts, so it drops first: no daemon is stopped under it.
+#[cfg(target_os = "macos")]
+struct KernelMount {
+  path: String,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for KernelMount {
+  fn drop(&mut self) {
+    let plain = Command::new("umount").arg(&self.path).output();
+    if !plain.is_ok_and(|out| out.status.success()) {
+      let _ = Command::new("umount").args(["-f", &self.path]).output();
+    }
+  }
+}
+
+/// A-200 through the macOS kernel's own NFS client (§4.6): do mount a live-shipped volume with `slates mount`, open a
+/// file there, stop both candidates (SIGSTOP), ask the file for a new size, and resume the candidates once the
+/// soft mount's measured give-up has passed. Expect the size change to wait for the candidates and then succeed: A-200
+/// "holders that do not answer make the writer wait: backpressure, never a false success". Found 2026-11-05 by the
+/// conformance agent: the macOS mount was `soft,intr`, so the kernel itself ended the waiting call `ETIMEDOUT` after
+/// 57.1 s whatever the daemon answered (a held reply or `NFS3ERR_JUKEBOX`). The mount is now `hard,intr`
+/// (`slates_bridge_nfs::client::MountArgs`): the kernel waits as long as the daemon asks, and a signal still interrupts
+/// the caller. Only the candidates stop; the daemon serving the mount never does.
+#[cfg(target_os = "macos")]
+#[test]
+#[allow(clippy::disallowed_methods)] // a program's calls on the slates mount, the point of the test
+fn a_writer_on_a_macos_mount_waits_for_stopped_candidates_rather_than_fail() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping kernel-mount flow: set SLATES_TEST_CLI=1 to run it (three daemons, a kernel mount)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-mounted");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let id = write_live_volume(&owner, 1);
+  let path = format!("{}/mnt", fleet.scratch.path);
+  assert!(
+    Command::new("mkdir")
+      .args(["-p", &path])
+      .output()
+      .unwrap()
+      .status
+      .success()
+  );
+  let (code, _, err) = run(&owner, &["mount", &id, &path]);
+  assert_eq!(code, 0, "slates mount: {err}");
+  let mount = KernelMount { path: path.clone() };
+  #[allow(clippy::disallowed_methods)]
+  // a program's call on the slates mount, the point of the test
+  let handle = std::fs::OpenOptions::new()
+    .read(true)
+    .write(true)
+    .create(true)
+    .truncate(true)
+    .open(format!("{path}/sized.bin"))
+    .unwrap();
+  let candidates: Vec<usize> = (0..fleet.instances.len())
+    .filter(|index| *index != owner_index)
+    .collect();
+  for index in &candidates {
+    signal(&fleet.daemons[*index], rustix::process::Signal::STOP);
+  }
+  let began = Instant::now();
+  let (changed, answered) = std::thread::scope(|scope| {
+    let change = scope.spawn(|| (handle.set_len(4096), began.elapsed()));
+    while !change.is_finished() && began.elapsed() < PAST_SOFT_GIVE_UP {
+      pause();
+    }
+    for index in &candidates {
+      signal(&fleet.daemons[*index], rustix::process::Signal::CONT);
+    }
+    change.join().unwrap()
+  });
+  eprintln!("live mounted: the size change answered after {answered:?}: {changed:?}");
+  drop(handle);
+  drop(mount);
+  assert!(
+    changed.is_ok(),
+    "a writer waiting for stopped candidates failed after {answered:?}: {changed:?}"
+  );
+  assert!(
+    answered >= PAST_SOFT_GIVE_UP,
+    "the change waited for the candidates rather than answering while both were stopped: {answered:?}"
+  );
+}
+
+/// A-200 on the node that bootstrapped the fleet: do bootstrap a fresh fleet and, at once, make a live-shipped volume on
+/// the bootstrap node and write to it. Expect each write to return durable and both candidates to hold the owner's head.
+/// Found 2026-11-07 by the Linux conformance pair (diag run 42325923902, native-linux-fuse fsx over a live volume on node
+/// a, which had bootstrapped): the owner's log stood at head=2 durable=none owed=true for the whole run with 49
+/// publications refused for credit, and both candidates' `fleet.live` counters were empty: nothing was ever sent to them.
+/// The owner's shipper had taken its holders from the configuration at the volume's first publication, when the
+/// bootstrap node's configuration named only itself, and kept that empty set for good.
+#[test]
+fn a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the bootstrap-node live flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet_bootstrapped("live-bootstrap");
+  let owner = fleet.instances[fleet.bootstrap].clone();
+  let others: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| **instance != owner)
+    .collect();
+  let (sender, receiver) = std::sync::mpsc::channel();
+  {
+    let owner = owner.clone();
+    std::thread::spawn(move || {
+      let id = create_live_volume(&owner, "bootstrapped");
+      sender.send(id.clone()).unwrap();
+      write_files(&owner, &id, 0..FILES);
+      sender.send(id).unwrap();
+    });
+  }
+  let id = receiver
+    .recv_timeout(FLEET_WAIT)
+    .expect("the live volume was made");
+  let written = receiver.recv_timeout(FLEET_WAIT).is_ok();
+  let (caught_up, shipping, held) = wait_caught_up(&owner, &others, &id);
+  let counters: Vec<_> = fleet
+    .instances
+    .iter()
+    .map(|instance| (instance.clone(), live_counters(instance)))
+    .collect();
+  eprintln!(
+    "live bootstrap: written={written} caught_up={caught_up} shipping={shipping:?} held={held:?} {counters:?}"
+  );
+  if !(written && caught_up) {
+    for instance in &fleet.instances {
+      let (_, out, _) = run(instance, &["status"]);
+      let lines: Vec<&str> = out
+        .lines()
+        .filter(|line| {
+          line.starts_with("fleet_host")
+            || line.starts_with("fleet_configuration_version")
+            || line.starts_with("fleet_configuration_members")
+            || line.starts_with("fleet_council_voters")
+            || line.starts_with("fleet_council_leads")
+            || line.starts_with("fleet_members")
+            || line.starts_with("fleet_session ")
+            || line.contains("learner")
+            || line.contains("consensus")
+            || line.contains("join")
+            || line.contains("fleet.record")
+            || line.contains("fleet.accept")
+            || line.contains("head")
+            || line.contains("catalog")
+            || line.contains("place")
+            || line.contains("commit")
+            || line.contains(" live ")
+        })
+        .filter(|line| !line.contains("catalog.volumes"))
+        .collect();
+      eprintln!("live bootstrap --- {instance}\n{}", lines.join("\n"));
+    }
+    let (_, stat, stat_err) = run(&owner, &["volume", "stat", &id]);
+    eprintln!("live bootstrap --- the owner's volume stat\n{stat}{stat_err}");
+  }
+  assert!(
+    written && caught_up,
+    "the bootstrap node's live writes became durable and both candidates hold them: {shipping:?} {held:?} \
+     {counters:?}"
+  );
+  drop(fleet.daemons);
+  drop(fleet.scratch);
 }

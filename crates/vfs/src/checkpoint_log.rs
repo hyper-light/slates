@@ -25,8 +25,8 @@ use slates_wire::crc32c::{crc32c, crc32c_append};
 use crate::delta::VolumeRecord;
 use crate::error::VfsError;
 use crate::recover::{
-  CommittedSlot, HELD_CALL_KEY_BYTES, HeldCall, HeldNfsReply, HeldReply, ImageRead, ImageWrite,
-  ShardImage, StreamedImage,
+  CommittedSlot, HELD_CALL_KEY_BYTES, HeldCall, HeldNfsReply, HeldNfsStates, HeldReply, ImageRead,
+  ImageWrite, ShardImage, StreamedImage,
 };
 
 /// Format: a delta's magic, checked before anything else on decode.
@@ -35,7 +35,7 @@ const DELTA_MAGIC: u32 = u32::from_le_bytes(*b"SLD1");
 /// 2026-10-09) a file changed only by writes to its chunked body is carried as its written windows
 /// (`delta::InodePatch`), not its whole image; 3 (A-127, 2026-10-09) the call records changed and purged since the
 /// last publication; 4 (A-128, 2026-10-09) the held NFSv3 replies, whole, when they changed.
-const DELTA_VERSION: u16 = 4;
+const DELTA_VERSION: u16 = 5;
 /// Format: a log frame's header — a little-endian payload length then a CRC-32C of the payload.
 const LOG_HEADER: usize = 2 * size_of::<u32>();
 /// Format: a log frame's payload prefix — its generation and its base checkpoint's generation.
@@ -72,6 +72,8 @@ pub struct ShardDelta {
   pub calls_removed: Vec<[u8; HELD_CALL_KEY_BYTES]>,
   /// The held NFSv3 replies now, when they changed (A-128).
   pub nfs_replies: Option<Vec<HeldNfsReply>>,
+  /// The held connections' byte states now, when they changed (A-231).
+  pub nfs_states: Option<Vec<HeldNfsStates>>,
 }
 
 impl ShardDelta {
@@ -88,8 +90,8 @@ impl ShardDelta {
 
   /// Ends a streamed shard delta: the volume count patched in at `at`, then the volumes gone (sorted here), the held
   /// replicas' image, the replies, the call records changed and purged (each sorted here), and the held NFSv3 replies
-  /// when they changed, as `ShardDelta::new(volumes, removed, held, replies).with_calls(calls, calls_removed)
-  /// .with_nfs_replies(nfs_replies).encode` writes them.
+  /// and the held connections' byte states when they changed, as `ShardDelta::new(volumes, removed, held, replies)
+  /// .with_calls(calls, calls_removed).with_nfs_replies(nfs_replies).with_nfs_states(nfs_states).encode` writes them.
   #[allow(clippy::too_many_arguments)] // one delta's whole tail, each part written in the format's order
   pub fn encode_finish(
     out: &mut Vec<u8>,
@@ -99,7 +101,7 @@ impl ShardDelta {
     held: Option<&[u8]>,
     replies: Option<&[HeldReply]>,
     (calls, calls_removed): (&mut [HeldCall], &mut [[u8; HELD_CALL_KEY_BYTES]]),
-    nfs_replies: Option<&mut [HeldNfsReply]>,
+    (nfs_replies, nfs_states): (Option<&mut [HeldNfsReply]>, Option<&mut [HeldNfsStates]>),
   ) -> Result<(), VfsError> {
     if !slates_wire::codec::patch_len(out, at, volumes) {
       return Err(VfsError::RecoveryIncomplete);
@@ -141,6 +143,17 @@ impl ShardDelta {
         }
       }
     }
+    match nfs_states {
+      None => out.push(slates_wire::codec::OPTION_NONE),
+      Some(nfs_states) => {
+        nfs_states.sort_unstable_by_key(|states| (states.connection, states.volume));
+        out.push(slates_wire::codec::OPTION_SOME);
+        slates_wire::codec::encode_len(nfs_states.len(), out);
+        for states in nfs_states.iter() {
+          states.encode(out);
+        }
+      }
+    }
     Ok(())
   }
 
@@ -163,6 +176,7 @@ impl ShardDelta {
       calls: Vec::new(),
       calls_removed: Vec::new(),
       nfs_replies: None,
+      nfs_states: None,
     }
   }
 
@@ -187,6 +201,17 @@ impl ShardDelta {
     nfs_replies.sort_unstable_by_key(|reply| (reply.connection, reply.xid));
     ShardDelta {
       nfs_replies: Some(nfs_replies),
+      ..self
+    }
+  }
+}
+
+impl ShardDelta {
+  /// This delta carrying the held connections' byte states now (A-231), sorted by (connection, volume).
+  pub fn with_nfs_states(self, mut nfs_states: Vec<HeldNfsStates>) -> ShardDelta {
+    nfs_states.sort_unstable_by_key(|states| (states.connection, states.volume));
+    ShardDelta {
+      nfs_states: Some(nfs_states),
       ..self
     }
   }
@@ -251,6 +276,9 @@ impl ShardImage {
       .retain(|held| delta.calls_removed.binary_search(&held.key).is_err());
     if let Some(nfs_replies) = &delta.nfs_replies {
       self.nfs_replies.clone_from(nfs_replies);
+    }
+    if let Some(nfs_states) = &delta.nfs_states {
+      self.nfs_states.clone_from(nfs_states);
     }
     Ok(())
   }

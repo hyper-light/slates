@@ -42,7 +42,7 @@ use std::fmt;
 use slates_bridge_core::{Bridge, OpContext};
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
 use slates_bridge_fuse::bridge::{
-  EIO, dispatch, needs_barrier, reclaim_unreported, reply_error, success_reply_bytes, takes_reply,
+  EIO, needs_barrier, reclaim_unreported, reply_error, success_reply_bytes, takes_reply,
 };
 use slates_bridge_fuse::init::{InitNegotiation, MAX_WRITE, negotiate};
 use slates_bridge_fuse::reply::ReplyHeader;
@@ -352,14 +352,14 @@ pub struct ToldSettled {
 
 /// What `serve_dax` did with a FUSE_SETUPMAPPING / FUSE_REMOVEMAPPING (§4.6): not a DAX verb (dispatch answers),
 /// a reply already in the out buffer, or — for a SETUPMAPPING — the window asked for, which the device holds the chain
-/// for while the window's backing is filled and its pieces mapped (`crate::backed`).
+/// for while the window's backing is filled and its pieces mapped (`crate::backed`). Unix only, as `serve_dax` is.
+#[cfg(unix)]
 enum DaxServed {
   /// Not a DAX verb, or no window offered: the FUSE codec's dispatch answers.
   NotHandled,
   /// This many reply bytes are in the out buffer; scatter and publish as usual.
   Replied(usize),
   /// A SETUPMAPPING was taken: its chain is held for the fill and the placer's map.
-  #[cfg(unix)]
   MapHeld {
     /// The request's `unique`, which its reply carries.
     unique: u64,
@@ -557,6 +557,9 @@ pub struct Device {
   queues: Vec<Virtqueue>,
   request: Vec<u8>,
   reply: Vec<u8>,
+  /// The dirty-page write-back rule for this guest (§4.6 "Cache posture"): its stale cache write-backs are refused,
+  /// never applied over another path's newer write (`slates_bridge_fuse::guest_writeback`).
+  writeback: slates_bridge_fuse::guest_writeback::GuestWriteback,
   negotiated: Option<InitNegotiation>,
   fault: Option<DeviceError>,
   awaiting: Option<AwaitingBarrier>,
@@ -601,6 +604,7 @@ impl Device {
       queues: Vec::new(),
       request: Vec::new(),
       reply: Vec::new(),
+      writeback: slates_bridge_fuse::guest_writeback::GuestWriteback::new(),
       negotiated: None,
       fault: None,
       awaiting: None,
@@ -1388,9 +1392,7 @@ impl Device {
     // A request whose success reply cannot fit the room the guest posted is not dispatched (AUD-29-85): its
     // effect — a created file, an open handle, a reference, changed bytes — would happen and its reply, naming
     // what it granted, would be lost. It is answered `EIO` below, with no effect.
-    let room_short = header
-      .as_ref()
-      .and_then(|h| Opcode::from_wire(h.opcode))
+    let room_short = opcode
       .and_then(success_reply_bytes)
       .is_some_and(|need| reply_room < need);
     let mut written = if room_short {
@@ -1408,7 +1410,9 @@ impl Device {
           &mut self.backed,
           &mut self.reply,
         ) {
-          DaxServed::NotHandled => dispatch(&self.request, bridge, cx, &mut self.reply),
+          DaxServed::NotHandled => self
+            .writeback
+            .serve(&self.request, bridge, cx, &mut self.reply),
           DaxServed::Replied(n) => n,
           // A SETUPMAPPING was taken: hold the chain while its window's backing is filled and its pieces mapped. No
           // reply is scattered now; the turn (and the message placer's acks) answer the guest.
@@ -1434,7 +1438,9 @@ impl Device {
       }
       #[cfg(not(unix))]
       {
-        dispatch(&self.request, bridge, cx, &mut self.reply)
+        self
+          .writeback
+          .serve(&self.request, bridge, cx, &mut self.reply)
       }
     };
     // A write-back the volume refused before this request is answered where its asker reads an answer, so a guest's

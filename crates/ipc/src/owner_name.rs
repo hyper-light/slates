@@ -71,6 +71,49 @@ pub(crate) struct OwnerName {
   port: MachPort,
 }
 
+impl OwnerName {
+  /// The token's port, whose receive right this process holds: what a client's message to the name reaches
+  /// (`crate::mach_claim`, GAP-A9-9).
+  pub(crate) fn port(&self) -> MachPort {
+    self.port
+  }
+}
+
+/// A send right this process was given by a look-up, given back when dropped.
+pub(crate) struct SendRight {
+  port: MachPort,
+}
+
+impl SendRight {
+  /// The right's name in this task's space.
+  pub(crate) fn port(&self) -> MachPort {
+    self.port
+  }
+}
+
+impl Drop for SendRight {
+  fn drop(&mut self) {
+    deallocate_send(self.port);
+  }
+}
+
+/// A send right to the live holder of the token `name`, found at the top of this process's bootstrap chain as
+/// [`claim`] registers it: `Ok(None)` when no live process holds it. Only the process that registered the name holds
+/// its receive right, and launchd refuses the name to any other while that one lives, so a message sent on this right
+/// reaches the token's holder and no one else.
+pub(crate) fn look_up(name: &str) -> Result<Option<SendRight>, IpcError> {
+  let name = token_name(name)?;
+  let top = top_namespace()?;
+  let mut found: MachPort = PORT_NULL;
+  // SAFETY: `top.port` is a send right to a bootstrap namespace this process holds for the call; `name` is a live
+  // zero-terminated string shorter than `NAME_BYTES`; `found` is a live out-parameter, written only on success.
+  let looked = unsafe { bootstrap_look_up(top.port, name.as_ptr(), &mut found) };
+  if looked != KERN_SUCCESS || found == PORT_NULL {
+    return Ok(None);
+  }
+  Ok(Some(SendRight { port: found }))
+}
+
 impl Drop for OwnerName {
   fn drop(&mut self) {
     destroy(self.port, true);

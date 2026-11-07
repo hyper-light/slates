@@ -1090,6 +1090,9 @@ pub struct GroupReport {
   pub voters: u64,
   /// Whether a joint change of the voter set is in flight (Raft §6).
   pub joint: bool,
+  /// The member ids of the voters in force (both sets while a joint change is in flight), ascending: which members a
+  /// loss costs the group a vote. Appended (2026-11-07).
+  pub voter_ids: Vec<u64>,
 }
 
 /// One shard's part of the daemon's status.
@@ -1241,6 +1244,17 @@ pub struct LiveReport {
   /// On a candidate, the fence its copy has promised: no message made under a lower epoch is served. On the owner, the
   /// epoch it ships under. Appended.
   pub fence: u64,
+  /// On the owner, the member ids of the holders its durability counts (during a transition, the set it is moving
+  /// from), ascending; empty on a candidate. Appended (2026-11-07).
+  pub holders: Vec<u64>,
+  /// On the owner, the member ids of the set a holder transition is moving to, ascending; empty when none is in
+  /// flight, and on a candidate. Appended (2026-11-07).
+  pub moving_to: Vec<u64>,
+  /// On the owner, the member ids of the holder set its volume's catalog records (A-240: what a takeover's phase one
+  /// counts), ascending; it can name a transition's target before the shipper activates it. On a candidate, the same
+  /// when the volume is served here (a successor before its first publication); otherwise empty, as when nothing is
+  /// recorded. Appended (2026-11-07).
+  pub recorded: Vec<u64>,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.
@@ -2324,6 +2338,10 @@ pub enum AttachRequest {
     /// The drive letter and its colon (`S:`).
     mount_point: String,
   },
+  /// A CLI attachment (§4.7, A-230): the record form, made by a process that exits for later processes to name. It
+  /// outlives its client for a term, the failover SLO as the write lease's, renewed by every verb that names it, and
+  /// ends at the term's lapse; a verb naming it after is refused `AttachmentExpired`. Appended.
+  Termed,
 }
 
 impl AttachRequest {
@@ -2928,6 +2946,25 @@ pub enum Refusal {
     path: String,
     /// What the daemon was asked to use it as.
     used_as: OwnMountUse,
+  },
+  /// A verb named a CLI attachment whose term lapsed (§4.7, A-230): it ended then, its write lease with it, and is
+  /// named here rather than as unknown, so a user who paused past the term learns why. Attach again. Appended.
+  AttachmentExpired {
+    /// The attachment.
+    attachment: u64,
+  },
+  /// A client named an id its session key does not prove (§4.9; `slates_server::session_key`): the seat and the
+  /// completion records under that id belong to the client it was issued to, so nothing is served on this channel,
+  /// which the daemon then ends. A client resumes only the session it was handed (`Session`, with its key). Appended.
+  SessionUnproven,
+  /// A durable table of the partition the verb records into is at its derived capacity (§4.8; CLAUDE.md banned item
+  /// 8): `green_chains`, the merge byte budget a partition's green chains, origins, checkpoints and work logs share,
+  /// when what live readers still hold below their greens' checkpoints fills it. Nothing was recorded. Until 2026-11-06
+  /// (A-238) it reached the client as `BadRequest { reason: "<table> at capacity" }`, as if the request were
+  /// malformed. Appended.
+  TableAtCapacity {
+    /// The table.
+    table: String,
   },
 }
 

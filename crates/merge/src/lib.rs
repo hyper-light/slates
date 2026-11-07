@@ -31,8 +31,10 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
+pub mod checkpoint;
 pub mod derive;
 pub mod engine;
+mod history;
 mod identity;
 pub mod increment;
 pub mod map;

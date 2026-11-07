@@ -3489,3 +3489,259 @@ mod backed {
     }
   }
 }
+
+/// Shape: the guest's page in the stale write-back test.
+const GUEST_PAGE: usize = 4096;
+
+/// A guest's context and another attachment's over the same volume, from one registry, so the volume tells their
+/// changes apart.
+fn guest_and_other_path() -> (OpContext, OpContext) {
+  use slates_bridge_core::{Attachments, Rights, View};
+  use slates_db::catalog::Principal;
+  let mut attachments = Attachments::new();
+  let mut attach = || {
+    attachments
+      .attach(
+        vid(),
+        View::Current,
+        Principal::Uid { uid: 0 },
+        Rights {
+          read: true,
+          write: true,
+        },
+      )
+      .unwrap()
+  };
+  let (guest, other) = (attach(), attach());
+  (
+    attachments.context(guest).unwrap(),
+    attachments.context(other).unwrap(),
+  )
+}
+
+/// `fuse_write_in` carrying `FUSE_WRITE_CACHE`: the guest kernel writing a cached page back, then the data.
+fn cache_write_body(fh: u64, offset: u64, data: &[u8]) -> Vec<u8> {
+  let mut b = write_body(fh, offset, data);
+  b[20..24].copy_from_slice(&slates_bridge_fuse::abi::WRITE_CACHE.to_le_bytes());
+  b
+}
+
+/// GAPS "the direct virtio-fs route shares serve_write, and a guest's page cache gets no invalidation, so its stale
+/// write-backs are not judged" (§4.6 cache posture; the FUSE host mount's rule is A-139/140, NFS's A-192). Do: a guest
+/// creates a file and writes a page of `A`, then reads the page back, as its page cache holds it; another attachment
+/// replaces the page with `C`; the guest then writes its cached page back (`FUSE_WRITE_CACHE`) with one store, `Z`, in
+/// its first byte, as a page dirtied through a shared map and laundered at its revalidation is. Expect: every byte the
+/// guest did not store keeps the other path's `C`. Before, the device applied the stale page whole and the other path's
+/// write was reverted to `A`.
+#[test]
+fn a_guests_stale_cache_write_back_never_reverts_another_paths_write() {
+  let (mut device, mut driver) = device_and_driver();
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+  let (cx, other) = guest_and_other_path();
+  let init = exchange_once(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    &message(Opcode::Init.to_wire(), 1, 0, &init_body(0)),
+  );
+  assert_eq!(reply_error(&init), 0);
+  let created = exchange_once(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    &message(Opcode::Create.to_wire(), 2, ROOT, &create_body("mapped")),
+  );
+  assert_eq!(reply_error(&created), 0);
+  let ino = u64_at(&created, OUT_HEADER_LEN);
+  let fh = u64_at(&created, OUT_HEADER_LEN + EntryOut::LEN);
+  let written = exchange_once(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    &message(
+      Opcode::Write.to_wire(),
+      3,
+      ino,
+      &write_body(fh, 0, &[b'A'; GUEST_PAGE]),
+    ),
+  );
+  assert_eq!(reply_error(&written), 0);
+  let fetched = exchange_once(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    &message(
+      Opcode::Read.to_wire(),
+      4,
+      ino,
+      &read_body(fh, 0, u32::try_from(GUEST_PAGE).unwrap()),
+    ),
+  );
+  assert_eq!(&fetched[OUT_HEADER_LEN..], &[b'A'; GUEST_PAGE][..]);
+  let object = ObjectId {
+    inode: ino,
+    generation: 0,
+  };
+  bridge
+    .write(object, &other, 0, &[b'C'; GUEST_PAGE])
+    .unwrap();
+  let mut stale = vec![b'A'; GUEST_PAGE];
+  stale[0] = b'Z';
+  let answered = exchange_once(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    &message(
+      Opcode::Write.to_wire(),
+      5,
+      ino,
+      &cache_write_body(fh, 0, &stale),
+    ),
+  );
+  let mut now = Vec::new();
+  bridge
+    .read(
+      object,
+      &other,
+      0,
+      u32::try_from(GUEST_PAGE).unwrap(),
+      &mut now,
+    )
+    .unwrap();
+  let reverted = now.iter().skip(1).filter(|byte| **byte != b'C').count();
+  assert_eq!(
+    reverted,
+    0,
+    "{reverted} of the other path's {} bytes were reverted by the guest's stale page",
+    GUEST_PAGE - 1
+  );
+  // The rule (A-192's): the stale page is refused whole, `EIO`, which the guest reports at its next fsync or msync.
+  assert_eq!(
+    reply_error(&answered),
+    -EIO,
+    "the stale write-back is refused"
+  );
+  assert_eq!(now[0], b'C', "nothing of a refused write-back is applied");
+}
+
+/// The rule's controls (§4.6 "Cache posture"). Do: the guest writes a page and reads it back; it then writes its cached
+/// page back with one store, no other path having touched the file; another path then replaces the page, the guest reads
+/// it again, and writes it back once more with a store. Expect: both write-backs applied whole, since neither held a
+/// byte another path changed after the guest fetched it: the rule refuses only what is stale.
+#[test]
+fn a_guests_cache_write_back_of_a_fresh_page_is_applied() {
+  let (mut device, mut driver) = device_and_driver();
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+  let (cx, other) = guest_and_other_path();
+  let mut unique = 0u64;
+  let mut ask = |device: &mut Device,
+                 driver: &mut SimDriver,
+                 bridge: &mut VolumeBridge<'_>,
+                 opcode: Opcode,
+                 node: u64,
+                 body: &[u8]| {
+    unique += 1;
+    exchange_once(
+      device,
+      driver,
+      bridge,
+      &cx,
+      &message(opcode.to_wire(), unique, node, body),
+    )
+  };
+  let page = u32::try_from(GUEST_PAGE).unwrap();
+  assert_eq!(
+    reply_error(&ask(
+      &mut device,
+      &mut driver,
+      &mut bridge,
+      Opcode::Init,
+      0,
+      &init_body(0)
+    )),
+    0
+  );
+  let created = ask(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    Opcode::Create,
+    ROOT,
+    &create_body("fresh"),
+  );
+  let ino = u64_at(&created, OUT_HEADER_LEN);
+  let fh = u64_at(&created, OUT_HEADER_LEN + EntryOut::LEN);
+  ask(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    Opcode::Write,
+    ino,
+    &write_body(fh, 0, &[b'A'; GUEST_PAGE]),
+  );
+  ask(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    Opcode::Read,
+    ino,
+    &read_body(fh, 0, page),
+  );
+  let mut stored = vec![b'A'; GUEST_PAGE];
+  stored[0] = b'Z';
+  let applied = ask(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    Opcode::Write,
+    ino,
+    &cache_write_body(fh, 0, &stored),
+  );
+  assert_eq!(
+    reply_error(&applied),
+    0,
+    "a write-back of a page no one else touched is applied"
+  );
+  let object = ObjectId {
+    inode: ino,
+    generation: 0,
+  };
+  bridge
+    .write(object, &other, 0, &[b'C'; GUEST_PAGE])
+    .unwrap();
+  ask(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    Opcode::Read,
+    ino,
+    &read_body(fh, 0, page),
+  );
+  let mut refetched = vec![b'C'; GUEST_PAGE];
+  refetched[1] = b'Y';
+  let applied = ask(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    Opcode::Write,
+    ino,
+    &cache_write_body(fh, 0, &refetched),
+  );
+  assert_eq!(
+    reply_error(&applied),
+    0,
+    "a write-back made after a refetch is applied"
+  );
+  let mut now = Vec::new();
+  bridge.read(object, &other, 0, page, &mut now).unwrap();
+  assert_eq!(now, refetched, "the volume holds the guest's newer page");
+}

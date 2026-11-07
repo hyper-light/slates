@@ -11,7 +11,7 @@
 //! a misplaced op, a wrong length, a wrong source, or a wrong create/unlink/rename diverges.
 
 // Test code may panic (CLAUDE.md §2 item 6 applies to shipped code).
-#![allow(clippy::indexing_slicing)]
+#![allow(clippy::indexing_slicing, clippy::unwrap_used)]
 use std::collections::{BTreeMap, BTreeSet};
 
 use slates_merge::increment::{Base, DeriveError, VolumeOp, compose_volume};
@@ -208,22 +208,70 @@ fn ops_for(doc: &OpsDoc, index: u16) -> Vec<Op> {
     .collect()
 }
 
-/// The post-state: the emitting files' final content in path-table order (the deriver's region
-/// layout — created, renamed, or content-changed files, sorted by final path; net-unchanged files
-/// are not in the document, so not in the post-state).
-fn post_state_of(doc: &OpsDoc, model: &Model) -> Vec<u8> {
+/// The post-state the document's runs name, built from the model (W2): for each content op that adds bytes, the
+/// bytes at its run's offset in the model's final file, which a walk of the path's ops finds as `apply` does (base
+/// runs copied, added runs placed), laid at the op's `src`. Independent of the deriver's layout and of its plan, so
+/// it holds both: a run's `src` must name a place no other run takes, and its bytes must be the file's at the place
+/// the walk puts it.
+fn post_state_of(base: &[(String, u64)], doc: &OpsDoc, model: &Model) -> Vec<u8> {
   let mut post_state = Vec::new();
   for (path_index, name) in doc.paths.paths().iter().enumerate() {
     let index = u16::try_from(path_index).unwrap_or(u16::MAX);
-    let emits = doc
-      .ops
+    let ops = ops_for(doc, index);
+    let (Some(final_bytes), Some(base_len)) =
+      (model.get(name), base_len_for(base, doc, &ops, name))
+    else {
+      continue;
+    };
+    let (mut pos, mut out) = (0u64, 0u64);
+    for op in ops
       .iter()
-      .any(|op| op.path == index && op.kind != OpKind::Unlink);
-    if let Some(content) = model.get(name).filter(|_| emits) {
-      post_state.extend_from_slice(content);
+      .filter(|op| !matches!(op.kind, OpKind::Create | OpKind::Rename))
+    {
+      if op.at > pos {
+        out += op.at.min(base_len).saturating_sub(pos.min(base_len));
+        pos = op.at;
+      }
+      let adds = matches!(op.kind, OpKind::Overwrite | OpKind::Insert | OpKind::Extend);
+      if adds {
+        let (src, at, len) = (
+          usize::try_from(op.src).unwrap(),
+          usize::try_from(out).unwrap(),
+          usize::try_from(op.len).unwrap(),
+        );
+        if post_state.len() < src + len {
+          post_state.resize(src + len, 0);
+        }
+        post_state[src..src + len].copy_from_slice(&final_bytes[at..at + len]);
+        out += op.len;
+      }
+      match op.kind {
+        OpKind::Delete | OpKind::Overwrite => pos += op.len,
+        OpKind::Truncate => pos = base_len,
+        _ => {}
+      }
     }
   }
   post_state
+}
+
+/// The length of the base content `name`'s ops apply to: its rename source's, nothing for a created file, else its
+/// own; `None` for a path with no content (no ops, or removed).
+fn base_len_for(base: &[(String, u64)], doc: &OpsDoc, ops: &[Op], name: &str) -> Option<u64> {
+  if ops.is_empty() || ops.iter().any(|op| op.kind == OpKind::Unlink) {
+    return None;
+  }
+  if let Some(op) = ops.iter().find(|op| op.kind == OpKind::Rename) {
+    let source = doc
+      .paths
+      .path(u16::try_from(op.src).unwrap_or(u16::MAX))
+      .unwrap_or("");
+    return Some(base_of(base, source).len() as u64);
+  }
+  if ops.iter().any(|op| op.kind == OpKind::Create) {
+    return Some(0);
+  }
+  Some(base_of(base, name).len() as u64)
 }
 
 /// Reconstructs the content the document declares for the path at `index`, or `None` when the path
@@ -266,7 +314,7 @@ fn reconstruct_path(
 /// Reconstructs the whole filesystem from the base and the ops document, and asserts it equals
 /// the model.
 fn check(base: &[(String, u64)], doc: &OpsDoc, model: &Model) {
-  let post_state = post_state_of(doc, model);
+  let post_state = post_state_of(base, doc, model);
 
   // The base paths renamed away (present as some rename's source): excluded from the result.
   let mut renamed_away: BTreeSet<String> = BTreeSet::new();
