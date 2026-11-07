@@ -1,0 +1,52 @@
+kind live: unshaped: installed and rolled out in 8.9 s
+kind live: unshaped: live-write: count=1000 acknowledged=1000 refused=0 p50_us=588 p99_us=1737 p999_us=5075 max_us=5857 first_refusal=""
+kind live: wan: installed and rolled out in 7.9 s
+kind live: wan: live-write: count=300 acknowledged=300 refused=0 p50_us=155666 p99_us=400077 p999_us=439912 max_us=439912 first_refusal=""
+kind live: wan-loss: installed and rolled out in 9.9 s
+kind live: wan-loss: live-write: count=300 acknowledged=300 refused=0 p50_us=157352 p99_us=409412 p999_us=420664 max_us=420664 first_refusal=""
+kind live: slates-0:
+  fleet_session 12146152503332985058: lent=true cwnd=5252 srtt_ns=200857943 pto_ns=411927439 spurious_losses=0 persistent_collapses=0 consumed=30217 mtu=1466
+  fleet_session 12815885137077105941: lent=false cwnd=11708 srtt_ns=76580712 pto_ns=136574712 spurious_losses=0 persistent_collapses=0 consumed=2369 mtu=1466
+  shard 0 refused fleet.live.held: 359
+  shard 0 refused fleet.live.taken_over: 1
+  shard 0 refused fleet.takeover.adopted: 2
+  shard 0 live held 9ac1419a23db177d000000000000000c head=358 durable=none owed=false epoch=1 identity=677488cde51452bd2036c2cfe2cf485c3ac0de06c7765c7102a0db14cbc04dac fence=2
+kind live: slates-1:
+  fleet_session 10140439019488500614: lent=false cwnd=11469 srtt_ns=221940879 pto_ns=669158075 spurious_losses=0 persistent_collapses=0 consumed=1850 mtu=1466
+  fleet_session 12815885137077105941: lent=true cwnd=11710 srtt_ns=71123434 pto_ns=162827762 spurious_losses=1 persistent_collapses=0 consumed=996 mtu=1466
+  shard 0 refused fleet.live.held: 356
+  shard 0 live held 9ac1419a23db177d000000000000000c head=358 durable=none owed=false epoch=1 identity=677488cde51452bd2036c2cfe2cf485c3ac0de06c7765c7102a0db14cbc04dac fence=1
+kind live: wan-loss: the successor was slates-0
+kind live: wan-loss: kind live: wan-loss: StaleNeverCommits: slates-1's copy is fenced at 1 below the takeover's epoch 2
+kind live: ceiling: installed and rolled out in 7.8 s
+kind live: slates-0:
+  fleet_session 6165294230759262749: lent=true cwnd=11710 srtt_ns=700251841 pto_ns=701251841 spurious_losses=0 persistent_collapses=0 consumed=66853 mtu=1466
+  fleet_session 13528371143540299350: lent=true cwnd=11710 srtt_ns=350312090 pto_ns=351312090 spurious_losses=0 persistent_collapses=0 consumed=78003 mtu=1466
+  shard 0 refused fleet.live.held: 248
+  shard 0 live held bbbe6de0f05d5656000000000000000d head=6 durable=none owed=false epoch=1 identity=2583e1764e5bcd621a52cdec71803a7da40016749b42335a29eaa6593e36b21b fence=1
+kind live: slates-1:
+  fleet_session 1227358496938205713: lent=true cwnd=11710 srtt_ns=700398554 pto_ns=780366798 spurious_losses=0 persistent_collapses=0 consumed=4180 mtu=1466
+  fleet_session 13528371143540299350: lent=false cwnd=11710 srtt_ns=350216094 pto_ns=351216094 spurious_losses=0 persistent_collapses=0 consumed=8230 mtu=1466
+  shard 0 refused fleet.live.held: 76
+  shard 0 live held bbbe6de0f05d5656000000000000000d head=8 durable=none owed=false epoch=1 identity=d218ec15f1370adca7b293bf46ff511ee1e0b6a66598098a3f455d92b10865d8 fence=1
+kind live: slates-2:
+  fleet_session 1227358496938205713: lent=true cwnd=0 srtt_ns=0 pto_ns=0 spurious_losses=0 persistent_collapses=0 consumed=0 mtu=0
+  shard 0 refused fleet.live.appended: 9
+  shard 0 refused fleet.live.awaited: 5
+  shard 0 refused fleet.live.durable: 6
+  shard 0 refused fleet.live.link_lost: 483
+  shard 0 refused fleet.live.no_session: 6156
+  shard 0 refused fleet.live.refused: 3
+  shard 0 refused fleet.live.refused.no_credit: 3
+  shard 0 refused fleet.live.resolved: 4
+  shard 0 refused fleet.live.unanswered: 6307
+  shard 0 refused fleet.live.whole: 3
+  shard 0 live shipping bbbe6de0f05d5656000000000000000d head=8 durable=5 owed=true epoch=1 identity=d218ec15f1370adca7b293bf46ff511ee1e0b6a66598098a3f455d92b10865d8 fence=1
+kind live: ceiling: kind live: the probe live-writer did not finish within 600s
+kind live:   unshaped: count=1000 acknowledged=1000 refused=0 p50_us=588 p99_us=1737 p999_us=5075 max_us=5857 first_refusal=""; converged at head Some(1001) epoch Some(1); 1 heads seen, one identity each; owner read back whole=1000 missing=0 torn=0; taken over by slates-1 after 4.1 s, epoch 2, read back whole=1000 missing=0 torn=0
+kind live:   wan: count=300 acknowledged=300 refused=0 p50_us=155666 p99_us=400077 p999_us=439912 max_us=439912 first_refusal=""; converged at head Some(355) epoch Some(1); 1 heads seen, one identity each; owner read back whole=300 missing=0 torn=0; taken over by slates-0 after 10.2 s, epoch 2, read back whole=300 missing=0 torn=0
+kind live:   wan-loss: FAILED: kind live: wan-loss: StaleNeverCommits: slates-1's copy is fenced at 1 below the takeover's epoch 2
+kind live:   ceiling: FAILED: kind live: the probe live-writer did not finish within 600s
+kind live: kind live: wan-loss: StaleNeverCommits: slates-1's copy is fenced at 1 below the takeover's epoch 2
+xtask: kind live: wan-loss: StaleNeverCommits: slates-1's copy is fenced at 1 below the takeover's epoch 2
+exit 1
