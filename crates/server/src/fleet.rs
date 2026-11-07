@@ -5559,6 +5559,21 @@ async fn drive_council_election(
 /// to admit a newcomer, retire a departed member, or take over a failed owner's objects (the quiescent
 /// successor's only cue, as it receives no records for the dead owner's objects). Equal in steady state, so a
 /// converged learner fetches nothing. Compared as sets; both include this node.
+/// Whether a member of this node's region has announced, on its probes, a configuration newer than the one this node's
+/// council holds (`AnswersGiven::announced_versions`): evidence that the council committed a change this learner has not
+/// fetched. A change that leaves the membership alone (a voter change, an owner's settlement) shows no divergence in
+/// the learner's own view, so before this a learner held version 12 while its region stood at 17, and reported its
+/// settlement 359 times for a generation the council had moved past (CI diag-live-fixes-21). Another region's members
+/// announce their own council's versions, another counter, so only this region's count.
+fn region_announces_newer_configuration(state: &ShardState) -> bool {
+  let own = state.council.configuration().version;
+  state
+    .answers_given
+    .announced_versions
+    .iter()
+    .any(|(peer, announced)| *announced > own && same_region(state, *peer))
+}
+
 fn membership_diverges_from_config(state: &ShardState) -> bool {
   let alive: std::collections::BTreeSet<HostId> =
     state.fleet.membership().alive().into_iter().collect();
@@ -5768,7 +5783,7 @@ async fn drive_config_council(
         due
       } else {
         s.council_learner_pace.reset();
-        membership_diverges_from_config(s)
+        membership_diverges_from_config(s) || region_announces_newer_configuration(s)
       }
     })
     .unwrap_or(false);
