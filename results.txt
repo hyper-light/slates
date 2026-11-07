@@ -1,0 +1,48 @@
+runner ubuntu-24.04-arm, 4 CPUs, Sat Nov  7 00:34:01 UTC 2026, commit 1ac4d968
+== fix quiet round 1 at 00:34:01
+a bootstrap with its control shard starved: Ok(Acknowledged) after 1.505714163s
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.001819598s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.89s
+== fix quiet round 2 at 00:34:06
+a bootstrap with its control shard starved: Ok(Acknowledged) after 1.505147019s
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.000495475s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.89s
+== fix quiet round 3 at 00:34:11
+a bootstrap with its control shard starved: Ok(Acknowledged) after 1.503844635s
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.000603077s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.89s
+== fix busy (two spinners a CPU) round 1 at 00:34:16
+a bootstrap with its control shard starved: Ok(Acknowledged) after 1.507029094s
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.012731659s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.71s
+== fix busy (two spinners a CPU) round 2 at 00:34:22
+a bootstrap with its control shard starved: Ok(Acknowledged) after 1.512017036s
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.008022293s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.59s
+== fix busy (two spinners a CPU) round 3 at 00:34:28
+a bootstrap with its control shard starved: Ok(Acknowledged) after 1.508772619s
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.00701493s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.37s
+== cargo test --locked -q -p slates-server --lib
+test result: ok. 198 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 1.20s
+== exit 0
+== cargo test --locked -q -p slates-server --test observe
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.15s
+== exit 0
+== cargo test --locked -q -p slates-server --test recovery
+test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 35.77s
+== exit 0
+== cargo test --locked -q -p slates-server --test liveness -- --test-threads=1
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.99s
+== exit 0
+== main's server sources (d61c3be2), the test unchanged: the starved case must fail
+== main quiet round 1 at 00:35:38
+a bootstrap with its control shard starved: Err(Refused(Overloaded { shard: 0 })) after 1.000692619s
+thread 'a_bootstrap_whose_control_shard_is_starved_is_acknowledged_past_a_wall_window' (7037) panicked at crates/server/tests/cross_shard_wait.rs:206:3:
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.000498824s
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.89s
+== main quiet round 2 at 00:36:10
+a bootstrap with its control shard starved: Err(Refused(Overloaded { shard: 0 })) after 1.000677346s
+thread 'a_bootstrap_whose_control_shard_is_starved_is_acknowledged_past_a_wall_window' (7066) panicked at crates/server/tests/cross_shard_wait.rs:206:3:
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.000387316s
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.89s
