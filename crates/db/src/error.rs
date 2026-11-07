@@ -57,6 +57,16 @@ pub enum DbError {
     /// The partition's current instance.
     current: u32,
   },
+  /// A green's checkpoint (W3; §4.16) at a version it cannot stand for: not past the checkpoint the green holds, or
+  /// past the green's head (its checkpoint's version and the increments held after it). Never entered in the log.
+  CheckpointOutOfRange {
+    /// The version the checkpoint named.
+    version: u64,
+    /// The version of the checkpoint the green holds (0: none).
+    held: u64,
+    /// The green's head.
+    head: u64,
+  },
   /// A sealing key record of other than hyper-seal's fixed length (A-92): never entered in the log.
   SealKeyMalformed {
     /// The record's length.
@@ -100,6 +110,14 @@ impl fmt::Display for DbError {
       Self::NfsInstanceRegressed { current } => {
         write!(f, "NFSv4 instance must advance past {current}")
       }
+      Self::CheckpointOutOfRange {
+        version,
+        held,
+        head,
+      } => write!(
+        f,
+        "a green checkpoint at version {version}, outside ({held}, {head}]"
+      ),
       Self::SealKeyMalformed { len } => write!(f, "a sealing key record of {len} bytes"),
       Self::Unpublished { seq, cause } => {
         write!(

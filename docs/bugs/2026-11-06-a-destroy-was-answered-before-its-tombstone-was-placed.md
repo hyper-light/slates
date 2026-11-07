@@ -79,3 +79,40 @@ so the red is on the answer. The resurrection itself was seen once, at 06:06.
 Not yet proven: whether a takeover serves the acknowledged writes of a live volume whose destroy was never answered.
 The flow now checks NoLoss there (8 s after the loss neither survivor served it: one `NotFound`, one `Overloaded`); its
 result is owed.
+
+## Second half: an unanswered destroy never settled (found and fixed 2026-11-06/07)
+
+**Found** by the same flows once their check asked the right question. A destroy that was never answered may still take
+effect: its records sit unread in the stopped candidates' sockets and are applied once they resume. So the check
+became "the volume settles, on every survivor, into destroyed or served whole". It never settled, 6 of 6 runs (3 live,
+3 plain, macOS arm64, debug, 2026-11-06 07:15-07:35 UTC).
+- One survivor answered `NotFound`: it held the tombstone, retired.
+- The successor answered every verb `Overloaded` for the whole 40 s wait (`fleet.owner_location.owned_unmaterialized`
+  36-190).
+
+**Root cause**, from temporary log lines (since removed):
+1. The successor adopts the tombstone (seq 1) and the catalog in its takeover. `takeover::record_adoption` tracks it
+   as the owner of both.
+2. It ships the retirement, and the other survivor accepts it (seq 2).
+3. On the successor, `fleet::retire_shard_tombstones` forgot its acceptor's registers but not that routing. So
+   `verbs::owned_unmaterialized` answered `Overloaded`, an owned volume not yet materialized, for good.
+
+A first attempt, queueing `pending_tombstones` in `tombstone::on_held`, changed nothing (6 of 6 still unsettled): the
+successor never receives the tombstone after adopting a head; it adopts the tombstone itself.
+
+**Fix.** `fleet::retire_shard_tombstones` forgets the routing of the retired volume and its catalog
+(`fleet.forget_object`, `departed_owners`), as a holder does in `tombstone::on_held`. The settled answer for a retired
+destroyed volume of a departed creator is then `OwnerUnreachable` on every survivor: no member remembers it, and its id
+routes to the gone creator. Nobody lists or serves it. Answering `NotFound` there is an open design item (GAPS): it
+needs the creator's takeover known complete fleet-wide, since another member may still be mid-adoption of the id.
+
+**Tests.** `a_live_volumes_unheard_destroy_then_its_owners_loss` and `a_plain_volumes_unheard_destroy_then_its_owners_loss`
+require "destroyed everywhere (`NotFound` or `OwnerUnreachable`, never `Overloaded`), or served whole".
+- Red before the fix: 6 of 6, as above.
+- Green after (macOS arm64, debug, 2026-11-07 ~02:00-02:45 UTC): 3 of 3 runs, 6 of 6 flows, "destroyed on every
+  survivor".
+- Red-check with the fix reversed: see below.
+- Red-check (2026-11-07 ~02:50 UTC, the routing fix reversed, 1 run): the live flow is unsettled again. Its successor
+  answers `Overloaded` (`owned_unmaterialized` 44) and the other survivor `NotFound`. The plain flow settled in that run
+  (both survivors `OwnerUnreachable`, no successor having kept the routing), so the red shows in 1 of 2 flows. The fix
+  re-applied passes both.

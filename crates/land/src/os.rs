@@ -64,6 +64,9 @@ pub enum TargetRefusal {
   EscapesTarget,
   /// The target is owned by another user.
   TargetNotOwned,
+  /// A component lies on a mount this daemon serves (§4.6: no daemon thread opens a path on a volume the daemon
+  /// serves; A-227): refused before it was entered, so the landing wrote nothing and waits on nothing of its own.
+  OwnMount,
   /// The host refused.
   Unavailable(HostError),
 }
@@ -132,6 +135,17 @@ fn target_component_refusal(
   TargetRefusal::Unavailable(refusal(error))
 }
 
+/// Refuses a target component on one of this daemon's own mounts before the walk enters it (A-227): on Linux the
+/// component is opened `O_PATH` and its mount compared; on macOS the kernel's path of `dir` with the component is
+/// compared with the kernel's mount point of each mount this daemon serves (`slates_base::own_mounts`).
+fn check_crossing(dir: BorrowedFd<'_>, name: &str) -> Result<(), TargetRefusal> {
+  slates_base::own_mounts::check_child(dir, std::ffi::OsStr::new(name)).map_err(|error| match error
+  {
+    HostError::OwnMount(_) => TargetRefusal::OwnMount,
+    other => TargetRefusal::Unavailable(other),
+  })
+}
+
 /// Walks an absolute target path from `/` one component at a time (no `..`, no symlink: containment), checks
 /// the target is owned by this process's user, and returns its descriptor and the key it lands under.
 fn walk_target(path: &Path) -> Result<(OwnedFd, String), TargetRefusal> {
@@ -148,6 +162,7 @@ fn walk_target(path: &Path) -> Result<(OwnedFd, String), TargetRefusal> {
       Component::CurDir => continue,
       _ => return Err(TargetRefusal::EscapesTarget),
     };
+    check_crossing(current.as_fd(), name)?;
     let next = rustix::fs::openat(&current, name, dir_flags(), Mode::empty())
       .map_err(|error| target_component_refusal(current.as_fd(), name, error))?;
     key.push('/');

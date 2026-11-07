@@ -178,6 +178,28 @@ jobs:
           SLATES_TEST_CLI: "1"
         run: |
           cargo test -p slates-cli --test cli --test fs_server -- --test-threads=1 --nocapture
+      # `slates exec`'s FUSE flow (§4.6 "The launcher") on a host whose AppArmor does not confine unprivileged user
+      # namespaces. GitHub's Ubuntu runner does (kernel.apparmor_restrict_unprivileged_userns=1), so every step above,
+      # on the default policy, proves the launcher's refusal that names the sysctl
+      # (`the_launcher_binds_a_volume_or_names_the_host_setting_that_forbids_it`). This step lifts the restriction for
+      # itself alone: test setup on the runner, not a privilege the product needs, modelling hosts without the
+      # restriction (Fedora's and Debian's defaults), so the bind is proven too. It puts the restriction back whatever the
+      # tests answer. The supervisor's decision, 2026-11-06 (GAPS 8a-launcher-ci).
+      - name: The slates exec FUSE flow, user namespaces unconfined (Linux)
+        if: runner.os == 'Linux'
+        env:
+          SLATES_TEST_CLI: "1"
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          status=0
+          cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture --exact \
+            the_launcher_refuses_a_path_it_would_have_to_create_and_leaves_the_host_untouched \
+            the_launcher_binds_a_volume_or_names_the_host_setting_that_forbids_it > exec.log 2>&1 || status=$?
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
+          cat exec.log
+          if grep -q "SKIP" exec.log; then echo "the exec flow skipped where it must run"; exit 1; fi
+          grep -q "test result: ok. 2 passed" exec.log
+          exit "$status"
       # The FSKit shim's Swift wire codec must agree with the Rust codec byte for byte (it shares the
       # golden vector). Compile and run its cross-check on the macOS runner, where swiftc lives.
       # ShimWire.swift is a pure library of the codec types; ShimWireMain.swift is the @main driver,
@@ -448,8 +470,11 @@ jobs:
       # until then. **`slates-cluster` joined on 2026-11-05**: it was built here only as the daemon's dependency, so its
       # tests and examples, which asked `rustix::param` for the page size (configured out on Windows), never compiled for
       # Windows; they ask `slates_machine::facts::Facts::page_bytes` now (`cargo xwin clippy` red before, clean after).
+      # **`slates-bridge-virtiofs` joined on 2026-11-07**: the daemon builds it, but only listed crates are
+      # linted, and its Unix-only DAX reply type and an `opcode` only Unix read failed `-D warnings` for Windows unseen
+      # (found by `cargo xwin clippy` from a Mac).
       - name: Clippy the Windows-buildable crates (native Windows)
-        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp -p slates-cluster --all-targets -- -D warnings
+        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-bridge-virtiofs -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp -p slates-cluster --all-targets -- -D warnings
       # The shipped Windows binary, linted without `--all-targets` and as a step of its own so its exit code
       # is checked on its own (the Windows shell is `pwsh`, where a native command failing mid-script does not
       # end the script — only the last line decides the step, which would mask this).
@@ -468,6 +493,8 @@ jobs:
         run: cargo clippy -p slates-cli --test winfsp --test winfsp_semantics -- -D warnings
       - name: Clippy the Shards hand-off CLI test (native Windows)
         run: cargo clippy -p slates-cli --test shards -- -D warnings
+      - name: Clippy the start-judgment CLI test (native Windows)
+        run: cargo clippy -p slates-cli --test start_judgment --test held_rendezvous -- -D warnings
       # The other half of the documentation gate in `gates`. That one runs on ubuntu and macos, so it checks
       # every reference those two hosts can resolve — and a reference resolves or not *per platform*, because
       # an item behind `#[cfg(windows)]` exists for no other. Of the errors that gate found, five were visible
@@ -676,6 +703,23 @@ jobs:
         env:
           SLATES_TEST_CLI: "1"
         run: cargo test -p slates-cli --test shards -- --nocapture
+      # The anchor's start judgment (§2.6 boot step 1; docs/bugs/2026-11-07-the-anchor-killed-every-start-a-busy-machine-
+      # starved.md): a successor suspended all but a sixty-fourth of every heartbeat is waited for, not killed; one
+      # suspended for good is killed and replaced. Gated by `SLATES_TEST_CLI=1`.
+      - name: The anchor's start judgment through the CLI (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        env:
+          SLATES_TEST_CLI: "1"
+        run: cargo test -p slates-cli --test start_judgment -- --test-threads=1 --nocapture
+      # A-114: a client connecting as its daemon dies is answered by the next one (the anchor holds the rendezvous).
+      # Gated by `SLATES_TEST_CLI=1`.
+      - name: The held rendezvous through the CLI (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        env:
+          SLATES_TEST_CLI: "1"
+        run: cargo test -p slates-cli --test held_rendezvous -- --test-threads=1 --nocapture
       # A-209: Win32 semantics through the drive that winfstest found broken (a move not asked to replace, a directory
       # holding a file, SetFileTime's times, an open that truncates), then WinFsp's own two suites over the drive through
       # the harness: the fsx port and winfstest, each built from billziss-gh/secfs.test@6ac65cd with MSVC; winfstest is
@@ -885,7 +929,7 @@ jobs:
           -p slates-bridge-winfsp -p slates-mcp -p slates-cluster --all-targets -- -D warnings
       - name: Clippy the shipped binary and its Shards and WinFsp tests natively on arm64 Windows
         if: ${{ !cancelled() }}
-        run: cargo clippy -p slates-cli --bin slates --test shards --test winfsp --test winfsp_semantics -- -D warnings
+        run: cargo clippy -p slates-cli --bin slates --test shards --test start_judgment --test held_rendezvous --test winfsp --test winfsp_semantics -- -D warnings
       # The daemon on a weak memory model: an in-process daemon found through the rendezvous, its verbs over the rings,
       # the async driver; one test at a time, as on x86_64 (each daemon is sized from the whole machine).
       - name: Test the client binary and the async driver, one test at a time (native arm64 Windows)
@@ -937,6 +981,23 @@ jobs:
         env:
           SLATES_TEST_CLI: "1"
         run: cargo test -p slates-cli --test shards -- --nocapture
+      # The anchor's start judgment (§2.6 boot step 1; docs/bugs/2026-11-07-the-anchor-killed-every-start-a-busy-machine-
+      # starved.md): a successor suspended all but a sixty-fourth of every heartbeat is waited for, not killed; one
+      # suspended for good is killed and replaced. Gated by `SLATES_TEST_CLI=1`.
+      - name: The anchor's start judgment through the CLI (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        env:
+          SLATES_TEST_CLI: "1"
+        run: cargo test -p slates-cli --test start_judgment -- --test-threads=1 --nocapture
+      # A-114: a client connecting as its daemon dies is answered by the next one (the anchor holds the rendezvous).
+      # Gated by `SLATES_TEST_CLI=1`.
+      - name: The held rendezvous through the CLI (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        env:
+          SLATES_TEST_CLI: "1"
+        run: cargo test -p slates-cli --test held_rendezvous -- --test-threads=1 --nocapture
       # The WinFsp mount on arm64 (the DAX matrix's bare-metal Windows arm64 mount-route cell, docs/wip/virtiofs.md §8):
       # WinFsp's package carries its arm64 driver and library (`winfsp-a64.sys`, `winfsp-a64.dll`, which the bridge
       # loads by name on this target), and the same tests as the x86_64 lanes run: a cached read follows another path's
@@ -1164,7 +1225,7 @@ jobs:
           if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
           "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Clippy the Windows-buildable crates
-        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp -p slates-cluster --all-targets -- -D warnings
+        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-bridge-virtiofs -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp -p slates-cluster --all-targets -- -D warnings
       # The shipped Windows binary, linted without `--all-targets` and as a step of its own so its exit code
       # is checked on its own (the Windows shell is `pwsh`, where a native command failing mid-script does not
       # end the script — only the last line decides the step, which would mask this).
@@ -1262,6 +1323,23 @@ jobs:
         env:
           SLATES_TEST_CLI: "1"
         run: cargo test -p slates-cli --test shards -- --nocapture
+      # The anchor's start judgment (§2.6 boot step 1; docs/bugs/2026-11-07-the-anchor-killed-every-start-a-busy-machine-
+      # starved.md): a successor suspended all but a sixty-fourth of every heartbeat is waited for, not killed; one
+      # suspended for good is killed and replaced. Gated by `SLATES_TEST_CLI=1`.
+      - name: The anchor's start judgment through the CLI (Windows, every push to main)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        env:
+          SLATES_TEST_CLI: "1"
+        run: cargo test -p slates-cli --test start_judgment -- --test-threads=1 --nocapture
+      # A-114: a client connecting as its daemon dies is answered by the next one (the anchor holds the rendezvous).
+      # Gated by `SLATES_TEST_CLI=1`.
+      - name: The held rendezvous through the CLI (Windows, every push to main)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        env:
+          SLATES_TEST_CLI: "1"
+        run: cargo test -p slates-cli --test held_rendezvous -- --test-threads=1 --nocapture
 
   # Part 6 "Conformance" and "Real workloads", example 8 "Hermeticity"; AC-9.7/T-9.1 (GAP-A9-15): the
   # suites the design names — pjdfstest, fsx, fsstress — plus the workload suite and the filesystem-write

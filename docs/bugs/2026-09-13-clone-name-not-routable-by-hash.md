@@ -1,7 +1,9 @@
 # A clone's name does not route to the partition that holds it
 
-Date: 2026-09-13. Status: open (found by the recovery oracle's clone read; outside the recovery
-path, reported for a separate fix). Design: §4.8 "Lookup" (ids route to owners, no global index,
+Date: 2026-09-13. Status: **fixed 2026-11-06 by A-236** (the supervisor chose the alias: option 3, below). The
+name's partition holds an alias pointing at the clone, made by a reservation protocol and reconciled at recovery
+(`crates/db/src/alias.rs`). Originally: open (found by the recovery oracle's clone read; outside the recovery path,
+reported for a separate fix). Design: §4.8 "Lookup" (ids route to owners, no global index,
 D-14), §4.6 "Chosen path".
 
 ## Description
@@ -40,3 +42,22 @@ root `READDIR` gather but cannot be entered. Duplicate names across partitions a
 The recovery oracle sidesteps it by choosing a clone name that hashes to the origin's partition
 (`clone_name_on_origin_partition`), so it reads the snapshot's content through the route that
 exists and stays honest about why.
+
+## Fix (2026-11-06, A-236)
+
+The supervisor chose a third shape: the name's partition holds an **alias** pointing at the clone, which stays beside
+its origin.
+- A lookup by name still routes by hash, and the name's partition says where the name is served (`nfs::routed`).
+- A second create of the name meets the alias and is refused `AlreadyExists`.
+- The two-partition create is a reservation protocol: reserve the alias, make the clone, confirm the alias. A refused
+  clone releases its reservation, and a destroy releases the alias.
+- A recovery reconciles every alias with the clone it names before any client is admitted, so after a crash at any
+  step the name belongs to no one or resolves to its clone.
+
+Evidence:
+- `crates/db/tests/alias.rs` crashes at every step.
+- `a_clone_named_on_another_partition_is_reached_by_name_and_held_once` (`crates/server/tests/recovery.rs`) runs two
+  shards and one, restart included. It was red at main and red with the alias routing disabled.
+
+Siblings left as they were and reported: `ImageBuild` and `ImageMerge` name a volume on the origin's partition with
+the same local-only check.

@@ -31,7 +31,7 @@ use slates_anchor::{AnchorSegment, RegionKind};
 use slates_client::{
   Client, ClientError, CreateSpec, Deadlines, NamePolicy, SizeClass, SnapshotId, VolumeId,
 };
-use slates_ipc::protocol::{Filter, ReplyBody, RequestBody};
+use slates_ipc::protocol::{Filter, Refusal, ReplyBody, RequestBody};
 use slates_machine::MachineProfile;
 use slates_server::{BootFault, BootFaultKind, Daemon, DaemonConfig};
 use slates_wire::request::RequestId;
@@ -402,6 +402,117 @@ fn acknowledged_content_and_its_snapshot_survive_a_daemon_restart_byte_for_byte(
   );
   second.stop();
   drop(anchor);
+}
+
+/// A clone name that routes, by name, to a partition other than its origin `origin_name`'s, on a daemon of
+/// `partitions` (A-236): the case a clone's alias exists for. With one partition every name routes to the origin's,
+/// so the stem is taken as it is: the same history, the degenerate case (R8).
+fn clone_name_elsewhere(origin_name: &str, stem: &str, partitions: u16) -> String {
+  let partitions = usize::from(partitions);
+  let origin = slates_server::verbs::owner_of_name(origin_name, partitions);
+  (0..64)
+    .map(|suffix| format!("{stem}-{suffix}"))
+    .find(|candidate| {
+      partitions == 1 || slates_server::verbs::owner_of_name(candidate, partitions) != origin
+    })
+    .unwrap_or_else(|| stem.to_owned())
+}
+
+/// What one run of [`a_clone_named_on_another_partition_is_reached_by_name_and_held_once`] saw, compared between one
+/// partition and two.
+#[derive(Debug, PartialEq, Eq)]
+struct CloneNameSeen {
+  read: Vec<u8>,
+  second_create_refused: bool,
+  read_after_restart: Vec<u8>,
+  second_create_refused_after_restart: bool,
+  created_after_destroy: bool,
+}
+
+/// One run of the clone-name history on a daemon of `shards` shards (see the test).
+fn clone_name_history(shards: u16) -> CloneNameSeen {
+  let profile = common::machine_profile();
+  let instance = format!("srv-clone-name-{shards}-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(shards));
+  let anchor = held_anchor(&format!("clone-name-{shards}"), &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let origin = client.create(&scratch("clone-origin")).unwrap();
+  {
+    let mut stream = nfs_stream(&first);
+    let root = mount(&mut stream, &capability_path(&first, "clone-origin"), 1);
+    let file = create(&mut stream, &root, "f", 2);
+    write(&mut stream, &file, BEFORE, 3);
+  }
+  let snapshot = client.snapshot(origin).unwrap();
+  let name = clone_name_elsewhere("clone-origin", "the-clone", shards);
+  let clone = client.clone_snapshot(origin, snapshot, &name).unwrap();
+  let read = read_file(&first, &name, "f");
+  let second_create_refused = matches!(
+    client.create(&scratch(&name)),
+    Err(ClientError::Refused(Refusal::AlreadyExists { .. }))
+  );
+  first.stop();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let read_after_restart = read_file(&second, &name, "f");
+  let second_create_refused_after_restart = matches!(
+    client.create(&scratch(&name)),
+    Err(ClientError::Refused(Refusal::AlreadyExists { .. }))
+  );
+  client.destroy(clone).unwrap();
+  let started = Instant::now();
+  let created_after_destroy = loop {
+    match client.create(&scratch(&name)) {
+      Ok(_) => break true,
+      Err(ClientError::Refused(Refusal::AlreadyExists { .. }))
+        if started.elapsed() < START_WAIT =>
+      {
+        #[allow(clippy::disallowed_methods)] // a test waiting out the destroy's slices
+        std::thread::sleep(Duration::from_millis(10));
+      }
+      Err(_) => break false,
+    }
+  };
+  second.stop();
+  drop(anchor);
+  CloneNameSeen {
+    read,
+    second_create_refused,
+    read_after_restart,
+    second_create_refused_after_restart,
+    created_after_destroy,
+  }
+}
+
+/// A-236 (§4.8 "Lookup"; `docs/bugs/2026-09-13-clone-name-not-routable-by-hash.md`), with its N=1 differential (R8).
+/// Do: on a daemon of two shards, clone a snapshot under a name that routes to the other partition; read the clone's
+/// file through an NFS mount by that name; create a volume of the name; restart the daemon over the same anchor RAM and
+/// do both again; destroy the clone and create the name once more. Then the same history on one shard. Expect: the
+/// clone read by name, every second create refused `AlreadyExists`, both after the restart too, the name free once the
+/// clone is destroyed, and the one-shard daemon seeing exactly the same. Before A-236 the clone answered `NOENT` by
+/// name on two shards and a second volume of its name was created.
+#[test]
+fn a_clone_named_on_another_partition_is_reached_by_name_and_held_once() {
+  let fleet_like = clone_name_history(TEST_SHARDS);
+  assert_eq!(fleet_like.read, BEFORE, "the clone is read by its name");
+  assert!(
+    fleet_like.second_create_refused,
+    "a second volume of the clone's name is refused"
+  );
+  assert_eq!(fleet_like.read_after_restart, BEFORE, "and after a restart");
+  assert!(
+    fleet_like.second_create_refused_after_restart,
+    "and after a restart"
+  );
+  assert!(
+    fleet_like.created_after_destroy,
+    "the name is free once the clone is destroyed"
+  );
+  let laptop = clone_name_history(1);
+  assert_eq!(laptop, fleet_like, "one partition sees what two do (R8)");
 }
 
 /// A one-file archive of `bytes` as one raw chunk, with the format's own header bounds — the replica the
@@ -2901,9 +3012,10 @@ fn a_sealed_files_block_is_trimmed_to_its_pages_and_survives_a_restart() {
 
 /// A-214 (VFS plan step 11). Do: on a one-shard daemon over a held anchor, write a file of many chunks (the shard's
 /// write burst), publish, and leave the shard idle for two reap ticks (`content.ticks.idle`), by which its idle work, the
-/// reserve's refill, has finished, or until the bound passes; then write a second file of the same size, watching the content object's allocated bytes across that
-/// write. Expect the second burst to land on pages already resident: the object grows by less than a quarter of the
-/// file during the write, and the idle pre-fault is counted (`content.prefaulted_bytes`). Before A-214 the idle purge
+/// reserve's refill, has finished, or until the bound passes; then write a second file of the same size, watching the
+/// content object's allocated bytes across each write. Expect the second burst to land on pages already resident: the
+/// object grows by less than half of what the first burst, on fresh pages, grew it, and the idle pre-fault is counted
+/// (`content.prefaulted_bytes`). Before A-214 the idle purge
 /// left no free page resident, so the second file's every page was allocated, and faulted fresh, during its write: the
 /// object grew by the whole file (one `shmem_fault` a page, the 41.5% of a large NFS write's samples that CI run
 /// 41986870989 measured). The object's allocation is the content's own measure; the process's minor faults also
@@ -2939,9 +3051,14 @@ fn a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted() {
     .attach(volume, None, slates_ipc::protocol::Intent::Write)
     .unwrap()
     .attachment;
+  let content = format!("slates-con-{tag}");
+  let at_start = allocated_in_content(&content);
   client
     .fs_write((volume, attachment), "first", &body, 0o644)
     .unwrap();
+  // The first burst lands on pages nobody faulted yet, in whatever units the kernel allocates them (2 MiB huge pages where
+  // it grants `MADV_HUGEPAGE`, else single pages): the measure the second burst is held to.
+  let first_grew = allocated_in_content(&content).saturating_sub(at_start);
   daemon.publish_every_shard().unwrap();
   let prefaulted = || {
     daemon
@@ -2952,7 +3069,6 @@ fn a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted() {
       .unwrap_or(0)
   };
   let file = u64::try_from(body.len()).unwrap();
-  let content = format!("slates-con-{tag}");
   // The refill is the shard's idle work, so once the shard has been idle a whole reap tick it has finished: wait for two
   // idle ticks after the first write (`content.ticks.idle`), or the bound.
   let idle_ticks = || {
@@ -2975,7 +3091,8 @@ fn a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted() {
     .unwrap();
   let grew = allocated_in_content(&content).saturating_sub(before);
   eprintln!(
-    "a burst after idle: the content object grew {grew} bytes during a {}-byte write, {} bytes pre-faulted at idle",
+    "a burst after idle: the content object grew {grew} bytes during a {}-byte write (the first burst grew it \
+     {first_grew}), {} bytes pre-faulted at idle",
     body.len(),
     prefaulted()
   );
@@ -2985,9 +3102,14 @@ fn a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted() {
   daemon.stop();
   drop(anchor);
   assert!(read_back == body, "the second file reads back as written");
+  // Held to the first burst, not to the file: what the second write needs beyond the reserve (its metadata, the image)
+  // is allocated in the kernel's units, whole 2 MiB huge pages when it grants them, which a quarter of a 16 MiB file
+  // could not hold under parallel tests (4,194,304 bytes against the bound's 4,194,300, adacachy, 2026-11-06). Every
+  // page fresh, the second write grows the object as much as the first did; on resident pages it grows a fraction.
   assert!(
-    grew * 4 < file,
-    "the burst after idle landed on resident pages: the content object grew {grew} bytes during a {file}-byte write"
+    grew * 2 < first_grew,
+    "the burst after idle landed on resident pages: the content object grew {grew} bytes during a {file}-byte write, \
+     where the first burst, on fresh pages, grew it {first_grew}"
   );
   assert!(
     reserved >= file / 2,
@@ -4192,7 +4314,9 @@ fn a_greens_base_snapshot_is_held_and_its_origin_recovered_from_it() {
 }
 
 /// A bounded overlay over `dir`, pinned and snapshotted, a green over the snapshot, and one accepted increment that
-/// replaces `g` with `G`. Returns the overlay, the snapshot and the green.
+/// replaces `g` with `G`. A second work stays at version 0, holding the reachable floor there, so version 0 stays
+/// readable across a restart: a version below the floor is folded into the green's checkpoint and refused
+/// `UnknownBase` after it (A-238). Returns the overlay, the snapshot and the green.
 fn green_over_a_held_base(client: &mut Client, dir: &str) -> (VolumeId, SnapshotId, VolumeId) {
   let overlay = client
     .create(&CreateSpec {
@@ -4218,6 +4342,7 @@ fn green_over_a_held_base(client: &mut Client, dir: &str) -> (VolumeId, Snapshot
     )
     .unwrap();
   let (work, _) = client.create_work(green, "origin-ref-work").unwrap();
+  client.create_work(green, "origin-ref-floor").unwrap();
   let len = u64::try_from(AFTER.len()).unwrap();
   client.edit(work, "g", 0, len, b"G").unwrap();
   assert_eq!(

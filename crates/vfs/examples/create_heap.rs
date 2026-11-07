@@ -280,7 +280,7 @@ fn main() {
           None,
           None,
           (&mut [], &mut []),
-          None,
+          (None, None),
         )
         .unwrap();
         !whole && journal.append_encoded(&mut log, &scratch).is_ok()
@@ -295,7 +295,12 @@ fn main() {
         ShardImage::encode_finish(
           stream.buf(),
           &[],
-          (&mut Vec::new(), &mut Vec::new(), &mut Vec::new()),
+          (
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+          ),
         );
         journal.finish_checkpoint(stream).unwrap();
       });

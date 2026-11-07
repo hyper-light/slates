@@ -49,6 +49,8 @@ pub mod handle_route;
 /// registration made once per owner's life; no message crosses it, so D-10's refusal of Mach messages as the request
 /// transport does not reach it.
 #[cfg(target_os = "macos")]
+mod mach_claim;
+#[cfg(target_os = "macos")]
 mod owner_name;
 pub mod park;
 /// A Unix socket peer's credentials on Linux, read soundly (`SO_PEERCRED`; a peer whose process the reader cannot see

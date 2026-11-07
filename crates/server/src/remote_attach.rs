@@ -24,7 +24,8 @@ use crate::state::ShardState;
 /// The transport a form asks for, for its refusal by kind.
 fn transport_of(form: &AttachRequest) -> AttachTransport {
   match form {
-    AttachRequest::Root => AttachTransport::Root,
+    // A CLI attachment is a root attachment with a term (A-230).
+    AttachRequest::Root | AttachRequest::Termed => AttachTransport::Root,
     AttachRequest::HostMount
     | AttachRequest::ScopedHostMount { .. }
     | AttachRequest::BoundHostMount { .. } => AttachTransport::NfsLoopback,
@@ -88,9 +89,10 @@ pub(crate) fn consumer(
   state: &ShardState,
   form: &AttachRequest,
   client_id: u32,
+  expires_ns: u64,
 ) -> Result<Consumer, Refusal> {
   if client_id != crate::verbs::FORWARDED_CLIENT {
-    return crate::verbs::consumer_of(form, client_id);
+    return crate::verbs::consumer_of(form, client_id, expires_ns);
   }
   if let Some(refusal) = foreign_form(form) {
     return Err(refusal);
@@ -104,7 +106,8 @@ pub(crate) fn consumer(
 
 /// A forwarded verb that is neither a forwardable read nor write, on the owner: a peer's reap of its dead client
 /// (`RemoteReap`), which ends that client's attachments under the peer's authenticated id and keeps no completion
-/// record (it is idempotent); any other is refused `Unsupported`.
+/// record (it is idempotent); any other is refused `Unsupported`. The owner shard is waited for in its own time
+/// (`xshard::call_in_shard_time`, R3 class A, as the forwarded reads and writes are).
 pub(crate) async fn serve_unforwardable(
   control: u16,
   shard: u16,
@@ -117,7 +120,7 @@ pub(crate) async fn serve_unforwardable(
     });
   };
   let volume = crate::verbs::to_db_volume(volume);
-  let ended = crate::xshard::call_within(
+  let ended = crate::xshard::call_in_shard_time(
     control,
     shard,
     move |state| reap(state, host, volume, client),
@@ -141,6 +144,7 @@ pub(crate) fn may_use(state: &ShardState, record: &AttachmentRecord) -> bool {
   match record.consumer {
     Consumer::Remote { host, .. } => !local && host == requester,
     Consumer::Sdk { .. }
+    | Consumer::Termed { .. }
     | Consumer::Bridge
     | Consumer::Launcher
     | Consumer::Mount { .. }

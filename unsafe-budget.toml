@@ -115,14 +115,18 @@
 #   seam unchanged in number. 84 → 96.
 # slates-wire (4): the CRC32C hardware intrinsics behind runtime feature detection.
 # slates-wire-derive (0).
-# slates-base (10): rustix marks kevent unsafe because the kernel fills the output list; one
+# slates-base (11): rustix marks kevent unsafe because the kernel fills the output list; one
 #   registration and one drain of the macOS/BSD directory watcher (2); the Windows fingerprint
 #   through the stable Win32 file-information calls (2), since the standard library's handle
 #   metadata is unstable on 1.98 (its two zeroed records are now built as literals); and the
 #   Windows contained opens (AUD-29-62, 2026-10-01: 6) — `NtCreateFile` relative to a retained
 #   directory handle, which no safe wrapper offers; adopting the handle it returns; the
 #   attribute-and-tag query on the opened object; the directory enumeration of a retained handle;
-#   `FSCTL_GET_REPARSE_POINT` on a link's own handle; and the NT status's Win32 translation.
+#   `FSCTL_GET_REPARSE_POINT` on a link's own handle; and the NT status's Win32 translation. Since
+#   2026-11-06 (A-227: 11) also `QueryDosDeviceW` in `windows.rs`'s `drive_is_own`, which names a base path's
+#   drive by the object manager, never the volume, so a base on this daemon's own WinFsp drive is refused
+#   before any request reaches it; no safe wrapper offers the call. The reparse read is shared with the
+#   root path's walk (`reparse_target`), so it is still one site.
 # slates-vfs (0): the volume core is safe Rust over the arenas and slabs of slates-mem; the block
 #   layout is read and written through byte slices, never a cast.
 # slates-anchor (6): the segment is byte slices and the atomic views of slates-mem; the Windows
@@ -209,7 +213,14 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 53
+slates-machine = 63
+# 2026-11-07 (+2, compiled only for Linux): the process clock reads the whole process's CPU-time clock,
+#   `clock_getcpuclockid` and `clock_gettime`; `/proc/<pid>/schedstat`, which it read before, is the main thread's alone.
+#   Neither call has a safe wrapper in rustix.
+# 2026-11-07 (+8, the anchor's start judgment): another process's CPU clock (`process_clock.rs`): on macOS the zeroed
+#   `proc_taskinfo`, `proc_pidinfo(PROC_PIDTASKINFO)` and `mach_timebase_info` (declared here, as `facts.rs` declares
+#   `mach_host_self`); on Windows `OpenProcess` with the limited query right, `GetProcessTimes`, `QueryProcessCycleTime`
+#   and the handle's `CloseHandle`. None has a safe wrapper.
 # 2026-11-04 (+2, A-205, compiled only for Windows): `Facts::resident_now` reads the working set: the zeroed record and
 #   `K32GetProcessMemoryInfo`, which has no safe wrapper.
 #   Raised 19 → 22 on 2026-09-30 for AUD-29-09 (a shared object hands out no reference to its bytes):
@@ -315,7 +326,7 @@ slates-rt = 96
 # 2026-11-06 (+1, compiled only for Windows): a datagram socket's `WSAIoctl` turning off `SIO_UDP_CONNRESET` and
 #   `SIO_UDP_NETRESET` (`netsys::ignore_earlier_datagrams_errors`), which has no safe wrapper; without it one send to a
 #   closed port failed the socket's next `recvfrom` 10054 and ended a fleet node's receive loop (run 42150662467).
-slates-base = 10
+slates-base = 11
 slates-vfs = 0
 slates-land = 4
 # 2026-11-02, A-198: retire the six supervisor job/assignment sites in favor of IPC's existing creation-time job
@@ -333,7 +344,16 @@ slates-db = 0
 # 2026-11-02 (+3, A-198 Step 9.4): the holder's process descriptor is converted from SDDL, applied before acquiring
 # held objects, and freed with LocalFree (`process_access.rs`). CreateProcessW borrows that same descriptor at birth;
 # these Win32 security calls have no safe wrapper and add no file or privilege requirement.
-slates-ipc = 113
+slates-ipc = 139
+# 2026-11-06 (+26, GAP-A9-9, `mach_claim.rs` and one in `owner_name.rs`, compiled only for macOS): a client's region is
+#   handed over as a Mach fileport, never by a name a same-uid stranger could open. The Mach message calls the SDK
+#   wraps nothing for: `mach_msg` for the owner thread's receive, each answer (a refusal, a delivery), the client's fetch
+#   send and receive, the daemon's keep, and the owner's own control; `mach_msg_destroy` for each message refused or
+#   not expected, so no right a stranger sent is kept; `fileport_makeport`/`fileport_makefd` on each side;
+#   `audit_token_to_pid` for the sender of each message; `proc_pidinfo` for a keep's sender's parent;
+#   `mach_port_allocate`/`mach_port_mod_refs`/`mach_port_deallocate` for the client's reply port and the fileports;
+#   `OwnedFd::from_raw_fd` for a descriptor a fileport made; the byte view of the receive buffer the trailer is read
+#   from; `bootstrap_look_up` for the token's send right (`owner_name::look_up`); and the tests' plants.
 # 2026-11-01 (+1, Step 6.1 of the VFS and DAX plan, `stream.rs` `spawn_bound` compiled only for Linux): `slates pmem`
 #   must stay its VMM's parent to hold the VMM's map and compare it back, so it spawns rather than replacing itself as
 #   `exec_with` does. `pre_exec` (unsafe by signature) whose closure sets the parent-death signal (`prctl`, through

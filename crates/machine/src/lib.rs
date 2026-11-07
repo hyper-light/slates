@@ -50,6 +50,7 @@ pub mod facts;
 pub mod log;
 pub mod placement;
 pub mod probes;
+pub mod process_clock;
 pub mod profile;
 pub mod segment;
 pub mod stats;

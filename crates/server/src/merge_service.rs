@@ -89,6 +89,12 @@ pub struct MergeShardState {
   /// The waiting requests by completion key (origin, client, sequence), so a retry of one joins its
   /// entry instead of running the verb again.
   pub awaiting_by_request: BTreeMap<(u64, u32, u32), (ObjectId, u64)>,
+  /// On the control shard: whether some owner shard has merge work the record plane can do now (a version
+  /// enqueued, an input or a record newly acknowledged), so the coordinator runs the merge plane at once rather
+  /// than at its next period (`nudge_record_plane`, `nudged`).
+  pub nudged: bool,
+  /// On the control shard: the coordinator's waker while it waits for its next period, woken by a nudge.
+  pub nudge_waker: Option<std::task::Waker>,
 }
 
 /// A green attachment's pin: the green and the version its view is fixed at.
@@ -129,6 +135,105 @@ pub(crate) fn reachable_floor(state: &ShardState, green: DbVolumeId) -> u64 {
   work_bases.chain(pins).min().unwrap_or(head).min(head)
 }
 
+/// The version a green's durable chain may be checkpointed at (W3; §4.16): the reachable floor, kept below the
+/// oldest version whose merge record still waits for its placement, since that record's inputs are read from the
+/// chain entry (`inputs_of`) until it is placed. At `f = 0` nothing waits and it is the reachable floor.
+pub(crate) fn checkpoint_floor(state: &ShardState, green: DbVolumeId) -> u64 {
+  let floor = reachable_floor(state, green);
+  state
+    .merge
+    .pending
+    .get(&ObjectId(green.bytes))
+    .and_then(PendingGreen::oldest)
+    .map_or(floor, |oldest| floor.min(oldest.saturating_sub(1)))
+}
+
+/// Checkpoints `green`'s durable chain at its checkpoint floor when the increments that would fold are at least the
+/// checkpoint it holds (W3; §4.16 "Deltas older than the derived retention fold into checkpoint deltas"): the
+/// partition then holds the green's state at the floor in place of every increment up to it, and recovery restores
+/// the green from it and replays only the increments after it (`verbs::replay_green`).
+///
+/// The rule is the doubling one: a checkpoint is taken once the bytes it would fold reach the size of the one it
+/// replaces, so the work of taking checkpoints is at most the bytes appended to the chain, and the chain's own bytes
+/// past the checkpoint stay under the checkpoint's size plus what live readers still hold below. Until 2026-11-06
+/// nothing was ever folded: a green whose readers all kept up was refused `green_chains at capacity` once its
+/// history passed the partition's cap (`crates/server/tests/green_checkpoint.rs`, version 31 under 256 KiB), and
+/// every snapshot re-encoded the whole chain.
+///
+/// Never refuses the verb that called it: a checkpoint the engine cannot take at the floor (its histories already
+/// folded past it) or the partition refuses is counted and skipped, and the chain stays whole and correct.
+pub(crate) fn checkpoint_green(state: &mut ShardState, green: DbVolumeId) {
+  checkpoint_green_when(state, green, Doubling::Wait);
+}
+
+/// Whether [`checkpoint_green_when`] waits for the increments to fold to reach the held checkpoint's size.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Doubling {
+  /// Wait for them: the amortized rule, after an accept.
+  Wait,
+  /// Take it at once: the chain is at its cap, and no accept can come to take it otherwise.
+  Now,
+}
+
+/// [`checkpoint_green`], with the doubling rule waived when `doubling` is [`Doubling::Now`]: what a submit refused at
+/// the chain's cap does first (`verbs::submit`, A-238), since the floor may have risen since the last accept (a work
+/// destroyed, rebased or reset), and a chain at its cap refuses every submit whose accept would take it.
+pub(crate) fn checkpoint_green_when(state: &mut ShardState, green: DbVolumeId, doubling: Doubling) {
+  let floor = checkpoint_floor(state, green);
+  let partition = state.db.partition();
+  let (held, held_bytes) = partition
+    .green_checkpoint(green)
+    .map_or((0, 0), |(version, bytes)| (version, bytes.len()));
+  let Some(folds) = floor
+    .checked_sub(held)
+    .filter(|folds| *folds > 0)
+    .and_then(|folds| usize::try_from(folds).ok())
+  else {
+    return;
+  };
+  let folded: usize = partition
+    .green_chain(green)
+    .iter()
+    .take(folds)
+    .map(Vec::len)
+    .sum();
+  if doubling == Doubling::Wait && folded < held_bytes {
+    return;
+  }
+  let Some(checkpoint) = state
+    .greens
+    .get(&green)
+    .and_then(|engine| engine.checkpoint(floor))
+  else {
+    state.count(CHECKPOINT_UNAVAILABLE, 1);
+    return;
+  };
+  let op = Op::GreenCheckpointed {
+    green,
+    version: floor,
+    checkpoint: checkpoint.encode(),
+  };
+  let now = state.clock.monotonic_ns();
+  let recorded = state
+    .db
+    .partition()
+    .check(&op, now)
+    .and_then(|()| state.db.mutate(&mut state.segment, &op, now).map(|_| ()));
+  match recorded {
+    Ok(()) => state.count(CHECKPOINT_TAKEN, 1),
+    Err(_) => state.count(CHECKPOINT_REFUSED, 1),
+  }
+}
+
+/// Counter: a green's chain checkpointed (W3), the non-vacuity count of [`checkpoint_green`].
+pub(crate) const CHECKPOINT_TAKEN: &str = "merge.checkpoint.taken";
+/// Counter: a checkpoint the engine could not take at the floor (its histories folded past it); the chain stays
+/// whole.
+pub(crate) const CHECKPOINT_UNAVAILABLE: &str = "merge.checkpoint.unavailable";
+/// Counter: a checkpoint the partition refused (its record did not fit the log or the budget); the chain stays
+/// whole.
+pub(crate) const CHECKPOINT_REFUSED: &str = "merge.checkpoint.refused";
+
 /// A work's base (`crate::work_files`): its green on this shard, when it still exists, at the work's base version.
 pub(crate) fn work_base<'a>(
   state: &'a ShardState,
@@ -158,14 +263,26 @@ pub(crate) fn unreadable_base(work: &crate::state::WorkState) -> Refusal {
 /// construction. `Err(available)` when the budget cannot cover a charge — nothing is then changed
 /// but the fold, which only releases.
 pub(crate) fn settle_green_retention(state: &mut ShardState, green: DbVolumeId) -> Result<(), u64> {
+  settle_green_retention_leaving(state, green, 0)
+}
+
+/// [`settle_green_retention`], folding until the green's retention leaves `room` bytes under its cap: what a submit
+/// is about to secure (`secure_green_retention`). Folding only to the cap left none, so a green whose readers all
+/// kept up was refused `BudgetExceeded { available: 0 }` once its history filled the cap, though everything below
+/// the head was foldable (version 34 of `crates/server/tests/green_checkpoint.rs` under a 256 KiB cap, 2026-11-06).
+pub(crate) fn settle_green_retention_leaving(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  room: usize,
+) -> Result<(), u64> {
   let floor = reachable_floor(state, green);
   let budget = rejected_cache_budget(state);
   let Some(engine) = state.greens.get_mut(&green) else {
     return Ok(());
   };
   // Oldest-first, only as far as the retention budget needs (the same derived cap the rejected
-  // cache is bounded by: one merge byte bound per green), never past a live reader's version.
-  engine.fold_history_to_budget(floor, budget);
+  // cache is bounded by: one merge byte bound per green) with `room` to spare, never past a live reader's version.
+  engine.fold_history_to_budget(floor, budget.saturating_sub(room));
   let wanted = u64::try_from(engine.retention_charge()).unwrap_or(u64::MAX);
   let charged = state.green_retention.get(&green).copied().unwrap_or(0);
   if wanted > charged {
@@ -613,10 +730,11 @@ pub(crate) fn attach_green(
   if !rights_of(record, principal).read {
     return forbidden("attach");
   }
-  let consumer = match crate::verbs::consumer_of(form, client_id) {
-    Ok(consumer) => consumer,
-    Err(refusal) => return refused(refusal),
-  };
+  let consumer =
+    match crate::verbs::consumer_of(form, client_id, crate::verbs::termed_expiry(state)) {
+      Ok(consumer) => consumer,
+      Err(refusal) => return refused(refusal),
+    };
   let Some(engine) = state.greens.get(&record.id) else {
     return refused(Refusal::NotFound);
   };
@@ -693,6 +811,10 @@ pub(crate) fn advance(
   attachment: u64,
   version: Option<u64>,
 ) -> ReplyBody {
+  // A CLI attachment is renewed by the verb, or refused once its term lapsed (A-230).
+  if let Err(refusal) = crate::verbs::use_attachment(state, attachment) {
+    return refused(refusal);
+  }
   let Some(record) = state.db.partition().attachment(attachment).cloned() else {
     return refused(Refusal::NotFound);
   };
@@ -836,8 +958,12 @@ pub(crate) fn read_window(
     Role::Green { .. } => read_green_range(state, record.id, key, at, (offset, want)),
     Role::Work { .. } => match at {
       ReadAt::Head => match state.works.get(&record.id) {
-        Some(w) => match w.files.get(work_base(state, w), key) {
-          Ok(Some(bytes)) => page_of(bytes, (offset, want), w.revision),
+        Some(w) => match w.files.page(work_base(state, w), key, (offset, want)) {
+          Ok(Some((bytes, total))) => ReplyBody::ReadPage {
+            bytes,
+            total,
+            stamp: w.revision,
+          },
           Ok(None) => refused(Refusal::NotFound),
           Err(_) => refused(unreadable_base(w)),
         },
@@ -856,18 +982,6 @@ pub(crate) fn read_window(
   }
 }
 
-/// The page of `bytes` from `offset`, at most `want` long, stamped `stamp`.
-fn page_of(bytes: &[u8], (offset, want): (u64, u64), stamp: u64) -> ReplyBody {
-  let total = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-  let start = usize::try_from(offset.min(total)).unwrap_or(bytes.len());
-  let end = usize::try_from(offset.saturating_add(want).min(total)).unwrap_or(bytes.len());
-  ReplyBody::ReadPage {
-    bytes: bytes.get(start..end).unwrap_or_default().to_vec(),
-    total,
-    stamp,
-  }
-}
-
 /// A green's file page at a view; the resolved version is its stamp.
 fn read_green_range(
   state: &ShardState,
@@ -883,14 +997,18 @@ fn read_green_range(
     Ok(version) => version,
     Err(refusal) => return refused(refusal),
   };
-  match engine.content_ref_at(path, version) {
-    Some(bytes) => page_of(bytes, range, version),
+  match engine.content_page_at(path, version, range) {
+    Some((bytes, total)) => ReplyBody::ReadPage {
+      bytes,
+      total,
+      stamp: version,
+    },
     None => refused(Refusal::NotFound),
   }
 }
 
-/// The version a read of a green at `at` serves: the head, a named version no later than it, or an attachment's
-/// pinned version; the refusal otherwise.
+/// The version a read of a green at `at` serves: the head, a named version no later than it and no earlier than the
+/// engine's fold, or an attachment's pinned version; the refusal otherwise.
 pub(crate) fn green_version(
   state: &ShardState,
   engine: &slates_merge::engine::Green,
@@ -910,7 +1028,10 @@ pub(crate) fn green_version(
       None => return Err(Refusal::NotFound),
     },
   };
-  if version > engine.head() {
+  // A version past the head does not exist yet, and one below the fold no longer can be read: its histories were
+  // folded to the value in effect at the floor (and a recovered green starts at its checkpoint, W3), so it would be
+  // answered as the floor's state or a file missing (`NotFound` for a file that was there). Unknown either way.
+  if version > engine.head() || version < engine.folded_below() {
     return Err(Refusal::UnknownBase {
       green: wire_id(green),
       version,
@@ -1102,6 +1223,8 @@ pub(crate) fn destroy_merge_volume(
       return Some(refused(refusal_of_db(&e)));
     }
   }
+  // A volume whose name hashes elsewhere gives its alias back there (A-236).
+  crate::verbs::release_name_alias(state, id, &record.name);
   crate::verbs::retire_local_tombstones(state);
   // A retired work may have held the oldest reachable version of its green: fold and credit. A
   // destroyed green credits everything it charged as retention.
@@ -1151,9 +1274,9 @@ pub(crate) fn status_merge_volume(
       (
         work
           .files
-          .files(work_base(state, work))
+          .sizes(work_base(state, work))
           .iter()
-          .map(|(_, bytes)| bytes.len() as u64)
+          .map(|(_, len)| *len)
           .sum(),
         work.base_version,
       )
@@ -1206,7 +1329,7 @@ pub(crate) fn status_merge_volume(
 // `crate::fleet::run_record_period`) works each holder's first missing version per green per period, in two steps that never reorder: while the version's inputs — the
 // increment's ops document and post-state (or the origin) as one archive — are not placed at `f + 1`
 // candidates they are put through the same content exchange the seals use (§4.10, verified on
-// arrival, hedged to every candidate at once: the inputs are small); only then does the record ship,
+// arrival, hedged at once to every candidate whose next record it is: the inputs are small); only then does the record ship,
 // and only to a candidate that already acknowledged the version before it, so every holder sees the
 // chain in order. A record that waits on its inputs is counted (`merge.inputs_unplaced`), the
 // non-vacuity counter for placed-before-reference. The pending state is bounded by the chain: the
@@ -1342,6 +1465,8 @@ pub enum GreenFence {
   /// The origin is held as a reference to a base snapshot (A-217) that recovery did not bring back: the base volume
   /// or its snapshot is not on this shard.
   OriginUnavailable,
+  /// The green's checkpoint (W3) does not decode, or names another version than the partition holds it at.
+  CheckpointCorrupt,
   /// The retention the rebuilt histories hold could not be charged: `short` bytes past the budget.
   Retention {
     /// The bytes the budget could not cover.
@@ -1359,6 +1484,11 @@ pub struct PendingGreen {
 }
 
 impl PendingGreen {
+  /// The oldest version whose record is not yet placed, if any: its inputs are read from the chain until it is.
+  fn oldest(&self) -> Option<u64> {
+    self.records.keys().next().copied()
+  }
+
   /// Registers one new position and the holders still owed it. Re-enqueuing a position preserves
   /// its acknowledgements; a pending position's identity never changes (§4.8 Continuity).
   fn insert(&mut self, version: u64, record: PendingMergeRecord) {
@@ -1371,6 +1501,49 @@ impl PendingGreen {
       }
     }
     self.records.insert(version, record);
+  }
+
+  /// Re-derives every pending position's placement from `placement`, the owner's current placement of the green: a
+  /// position keeps the acknowledgements it gathered (each a durable hold) and is owed to the candidates that still
+  /// lack it. A position is enqueued under the configuration the owner holds then, which can be the one-candidate
+  /// placement a bootstrap installs before its council grows (§4.8); at `f = 1` that placement can never commit, so
+  /// a position kept to it never placed and no submit to the green was answered (the bug record of 2026-11-06). Head
+  /// records are placed by the current configuration each period (`fleet::owed_record`); merge records now are too.
+  fn retarget(&mut self, placement: &Placement) {
+    let mut changed = false;
+    for pending in self.records.values_mut() {
+      if pending.record.candidates != placement.candidates
+        || pending.record.joint != placement.joint
+      {
+        pending.record = Placement {
+          acked: std::mem::take(&mut pending.record.acked),
+          mirror_acked: pending.record.mirror_acked.take(),
+          ..placement.clone()
+        };
+        changed = true;
+      }
+      if pending.inputs.candidates != placement.candidates
+        || pending.inputs.joint != placement.joint
+      {
+        pending.inputs = Placement {
+          acked: std::mem::take(&mut pending.inputs.acked),
+          mirror_acked: pending.inputs.mirror_acked.take(),
+          ..placement.clone()
+        };
+        changed = true;
+      }
+    }
+    if !changed {
+      return;
+    }
+    self.owed.clear();
+    for (version, pending) in &self.records {
+      for host in &pending.record.candidates {
+        if !pending.record.acked.contains(host) {
+          self.owed.entry(*host).or_default().insert(*version);
+        }
+      }
+    }
   }
 
   /// One first missing position per remote holder, grouped into the record dispatches that may
@@ -1494,7 +1667,14 @@ fn inputs_of(state: &ShardState, green: DbVolumeId, version: u64) -> Option<Vec<
     }
     return state.db.partition().green_origin(green).map(<[u8]>::to_vec);
   }
-  let index = usize::try_from(version.checked_sub(1)?).ok()?;
+  // The chain holds the versions after its checkpoint (W3); a version folded into it has no inputs of its own any
+  // more, and `checkpoint_floor` keeps every version whose record waits for them above it.
+  let held = state
+    .db
+    .partition()
+    .green_checkpoint(green)
+    .map_or(0, |(held, _)| held);
+  let index = usize::try_from(version.checked_sub(held)?.checked_sub(1)?).ok()?;
   state.db.partition().green_chain(green).get(index).cloned()
 }
 
@@ -1594,6 +1774,47 @@ pub(crate) fn enqueue_record(
       },
     },
   );
+  nudge_record_plane(state);
+}
+
+/// Tells the record plane that this owner shard has merge work it can do now (§4.16 "Commit"): a version to
+/// place, or one whose inputs or predecessor were just acknowledged. The coordinator runs the merge plane at once
+/// rather than waiting out its period, so a submit's answer waits for the exchange, not for the coordinator
+/// (before, every answer at `f > 0` waited out at least one period and usually two, 208 ms at the least: the bug
+/// record of 2026-11-06, a submit at `f = 1` waited for the coordinator's period). Only an event that makes new
+/// work nudges, so a holder that never answers costs no pass beyond the period's own.
+pub(crate) fn nudge_record_plane(state: &mut ShardState) {
+  let control = state.shards.first().copied().unwrap_or(state.shard);
+  if control == state.shard {
+    nudge(state);
+  } else {
+    crate::xshard::run_on_counted(state.shard, control, nudge);
+  }
+}
+
+/// Marks the control shard's record plane nudged and wakes the coordinator if it is waiting.
+fn nudge(state: &mut ShardState) {
+  state.merge.nudged = true;
+  if let Some(waker) = state.merge.nudge_waker.take() {
+    waker.wake();
+  }
+}
+
+/// Ready once the record plane has been nudged since it last ran (on the control shard, by the coordinator); the
+/// nudge is consumed.
+pub(crate) async fn nudged() {
+  std::future::poll_fn(|cx| {
+    crate::state::with_state(|s| {
+      if std::mem::take(&mut s.merge.nudged) {
+        std::task::Poll::Ready(())
+      } else {
+        s.merge.nudge_waker = Some(cx.waker().clone());
+        std::task::Poll::Pending
+      }
+    })
+    .unwrap_or(std::task::Poll::Pending)
+  })
+  .await;
 }
 
 /// `await placed(green, region)` (§4.4, §4.16): whether every committed version's merge record
@@ -1670,6 +1891,8 @@ pub(crate) enum MergeWork {
     archive: Archive,
     /// Every candidate.
     candidates: Vec<HostId>,
+    /// The candidates whose next record is this version: the only ones put to.
+    to: Vec<HostId>,
     /// The candidates that already hold the inputs.
     acked: Vec<HostId>,
     /// The quorum.
@@ -1705,9 +1928,11 @@ pub(crate) fn next_merge_work(state: &mut ShardState, local: HostId) -> Vec<Merg
   let mut work = Vec::new();
   let objects: Vec<ObjectId> = state.merge.pending.keys().copied().collect();
   for object in objects {
-    let Some(pending_green) = state.merge.pending.get(&object) else {
+    let placement = config.place(object);
+    let Some(pending_green) = state.merge.pending.get_mut(&object) else {
       continue;
     };
+    pending_green.retarget(&placement);
     let selected = pending_green.next(local);
     for (version, targets) in selected {
       let Some(pending) = state
@@ -1732,6 +1957,7 @@ pub(crate) fn next_merge_work(state: &mut ShardState, local: HostId) -> Vec<Merg
           version,
           archive: MergeShardState::inputs_archive(&bytes, 0, page),
           candidates: pending.inputs.candidates.clone(),
+          to: targets.clone(),
           acked: pending.inputs.acked.clone(),
           quorum: config.quorum,
         });
@@ -1807,11 +2033,12 @@ pub(crate) async fn run_merge_period(
         version,
         archive,
         candidates,
+        to,
         acked,
         quorum,
       } => {
         put_inputs(
-          origin, shard, local, object, version, archive, candidates, acked, quorum, budget,
+          origin, shard, local, object, version, archive, candidates, to, acked, quorum, budget,
         )
         .await
       }
@@ -1846,9 +2073,13 @@ pub(crate) async fn run_merge_period(
   }
 }
 
-/// Puts a version's inputs to every candidate that does not hold them (the inputs are small, so
-/// every remaining candidate at once), folding the acknowledgements into the pending record on the
-/// owner shard. A late acknowledgement is dropped; the next period's offer round finds the holder
+/// Puts a version's inputs to every candidate whose next record is this version and that does not hold
+/// them (`to`; the inputs are small, so all of them at once), folding the acknowledgements into the
+/// pending record on the owner shard. Never to a candidate still owed an earlier version: a holder keeps
+/// only its newest placement ahead of its accepted records (`crate::content_retention`), so a later
+/// version's inputs released the inputs its next record needed, and that record was refused
+/// `merge.inputs_unheld` until a period re-put them (53 and 71 refusals in two runs of twenty submits on an
+/// idle three-node fleet at `f = 1`, 2026-11-06). A late acknowledgement is dropped; the next period's offer round finds the holder
 /// holding the content and re-acknowledges it at no cost.
 #[allow(clippy::too_many_arguments)]
 async fn put_inputs(
@@ -1859,12 +2090,13 @@ async fn put_inputs(
   version: u64,
   archive: Archive,
   candidates: Vec<HostId>,
+  to: Vec<HostId>,
   acked: Vec<HostId>,
   quorum: Quorum,
   budget: CommitBudget,
 ) -> Option<Dispatch> {
   let holders = take_sessions("fleet.lent_to.put_inputs", |host| {
-    host != local && candidates.contains(&host) && !acked.contains(&host)
+    host != local && to.contains(&host) && !acked.contains(&host)
   });
   if holders.is_empty() {
     return None;
@@ -1900,10 +2132,16 @@ async fn put_inputs(
       .get_mut(&object)
       .and_then(|pending_green| pending_green.records.get_mut(&version))
     {
+      let mut acknowledged = false;
       for host in placement.acked {
         if !pending.inputs.acked.contains(&host) {
           pending.inputs.acked.push(host);
+          acknowledged = true;
         }
+      }
+      // The record may ship now that its inputs placed further.
+      if acknowledged {
+        nudge_record_plane(s);
       }
     }
   });
@@ -2011,9 +2249,11 @@ fn record_merge_acks(
   let Some(pending) = pending_green.records.get_mut(&version) else {
     return;
   };
+  let mut acknowledged = false;
   for host in placement.acked {
     if pending.record.candidates.contains(&host) && !pending.record.acked.contains(&host) {
       pending.record.acked.push(host);
+      acknowledged = true;
       if let Some(versions) = pending_green.owed.get_mut(&host) {
         versions.remove(&version);
         if versions.is_empty() {
@@ -2045,6 +2285,10 @@ fn record_merge_acks(
     if pending_green.records.is_empty() {
       state.merge.pending.remove(&object);
     }
+  }
+  // A holder that acknowledged this version may take the next one now.
+  if acknowledged && state.merge.pending.contains_key(&object) {
+    nudge_record_plane(state);
   }
   // The version is committed at the quorum: every submit whose acceptance waited on it is answered
   // now — its completion recorded, its reply delivered (§4.16 "Commit"; AUD-11).

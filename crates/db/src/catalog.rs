@@ -398,6 +398,13 @@ pub enum Consumer {
     /// The client's id on that host.
     client: u32,
   },
+  /// A CLI attachment (§4.7, A-230): one a process makes and exits, for later processes to name, so it outlives the
+  /// client that made it. It holds a term, the failover SLO as the write lease's does, renewed by every verb that names
+  /// it, and ends at the term's lapse: an abandoned one releases its volume's write lease within one term. Appended.
+  Termed {
+    /// When its term lapses, on the shard's monotonic clock.
+    expires_ns: u64,
+  },
 }
 
 /// The form of an attachment. Append-only.
@@ -930,6 +937,22 @@ pub struct NfsPurgeRecord {
   pub clientid: u64,
   /// Format: the destroyed session's id (16 bytes), or `None` for the dropped client's whole state.
   pub session: Option<[u8; 16]>,
+}
+
+/// A volume name held at its name's partition for a volume another partition holds (§4.8 "Lookup", A-236): a clone
+/// lives beside its origin, for copy-on-write, while its name hashes elsewhere. The name's partition is where the name
+/// is looked up and where its uniqueness is decided, so it holds this alias, which points at the clone. An alias is
+/// reserved before the clone is made and confirmed after: a reserved one holds the name (a create of it is refused) but
+/// resolves nothing until confirmed, and a daemon's recovery confirms or releases every reserved one by asking the
+/// clone's partition whether the clone exists under this name.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct NameAliasRecord {
+  /// The name.
+  pub name: String,
+  /// The volume it names, on the partition its id encodes.
+  pub volume: VolumeId,
+  /// Whether the clone was made and the alias confirmed; until then the alias holds the name and resolves nothing.
+  pub confirmed: bool,
 }
 
 /// Format: the bytes of hyper-seal's wrapped key record (version, parent id, parent generation, AES-256-KW of the key;

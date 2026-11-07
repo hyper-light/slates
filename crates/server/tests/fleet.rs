@@ -2844,6 +2844,28 @@ fn start_mesh_with(
     slates_db::register::RegionId,
   >,
 ) -> Vec<Daemon> {
+  let daemons = start_mesh_unsettled(nodes, hosts, certs, serve, f, shards, regions, mirrors);
+  settle_initial_consensus(&daemons, hosts, regions, Quorum { f });
+  daemons
+}
+
+/// [`start_mesh_with`] up to and including the explicit bootstrap, without waiting for the initial membership to
+/// commit: what an operator's deployment does (bootstrap, then use), so a test can act while the groups are still
+/// forming.
+#[allow(clippy::too_many_arguments)]
+fn start_mesh_unsettled(
+  nodes: Vec<(MachineProfile, HostId, Identity)>,
+  hosts: &[HostId],
+  certs: &[rustls::pki_types::CertificateDer<'static>],
+  serve: &[(u16, u16)],
+  f: u32,
+  shards: u16,
+  regions: &std::collections::BTreeMap<HostId, slates_db::register::RegionId>,
+  mirrors: &std::collections::BTreeMap<
+    slates_db::register::RegionId,
+    slates_db::register::RegionId,
+  >,
+) -> Vec<Daemon> {
   let pid = std::process::id();
   let n = hosts.len();
   // Each node's stable anchor (the machine-identity hash its member ids derive from, task #22), so every
@@ -2900,7 +2922,6 @@ fn start_mesh_with(
     })
     .collect();
   bootstrap_mesh(&daemons, hosts, regions);
-  settle_initial_consensus(&daemons, hosts, regions, Quorum { f });
   daemons
 }
 
@@ -9898,6 +9919,170 @@ fn submit_one_version(client: &mut Client) -> (VolumeId, VolumeId) {
   (green, work)
 }
 
+/// Shape: how long the forwarded submit's client waits for any one answer: past the owner's liveness budget, after
+/// which a deferred acceptance is answered `Overloaded`, with the record plane's placement on top.
+const FORWARDED_ANSWER_WAIT: Duration = PLACEMENT_DEADLINE;
+
+/// Polls `client` for `word`'s reply within [`FORWARDED_ANSWER_WAIT`]: the reply or the refusal, `None` if neither
+/// came.
+fn answer_within(
+  client: &mut slates_client::Client,
+  word: u64,
+) -> Option<Result<ReplyBody, String>> {
+  let began = Instant::now();
+  while began.elapsed() < FORWARDED_ANSWER_WAIT {
+    match client.poll_reply_word(word) {
+      Ok(Some(reply)) => return Some(Ok(reply)),
+      Ok(None) => std::thread::yield_now(),
+      Err(slates_client::ClientError::Refused(refusal)) => {
+        return Some(Err(format!("{refusal:?}")));
+      }
+      Err(e) => return Some(Err(format!("{e}"))),
+    }
+  }
+  None
+}
+
+/// A green and a work over it, created through `instance`'s node, which owns them.
+fn green_and_work_on(instance: &str) -> (VolumeId, VolumeId) {
+  let mut owner_client = Client::connect(instance);
+  let ReplyBody::GreenCreated { id: green } = owner_client.call(&RequestBody::CreateGreen {
+    name: "forwarded-green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("create green");
+  };
+  let ReplyBody::WorkCreated { id: work, .. } = owner_client.call(&RequestBody::CreateWork {
+    green,
+    name: "forwarded-work".to_owned(),
+  }) else {
+    panic!("create work");
+  };
+  (green, work)
+}
+
+/// §4.9 "Exactly-once", §4.16 "Commit" (AUD-11), found by fixtures' 1,000-client `f = 1` rung on 2026-11-06 (447
+/// submits answered `DuplicateRequest`): in a two-node `f = 1` fleet whose holder B withholds every merge record, a
+/// client on B submits a work whose green A owns. The forwarded submit runs on A, and its acceptance waits for the
+/// commit past the owner's liveness budget, so B's client is answered with a refusal retryable under the same id:
+/// `Overloaded` when A's deferred answer reaches B (this Mac), `OwnerUnreachable` when B's forward gives up on A first
+/// (CI's Linux runners, run 42348339167). Do: the client acknowledges everything it may; the holder's fault is lifted
+/// and the version commits; the client sends the submit again under its id (`begin_again`). Expect: the first answer
+/// one of those two; the resend
+/// answered `Submitted { version: Some(1) }` from the completion the commit recorded. Before: the acknowledgement
+/// covered the refused id, so A pruned it and refused the resend `DuplicateRequest`.
+#[test]
+fn a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let (green, work) = green_and_work_on(&instance_a);
+  let withheld = daemon_b.inject_merge_fault(slates_server::merge_service::MergeFault {
+    refuse_content_puts: false,
+    corrupt_next_inputs: false,
+    refuse_records: true,
+  });
+  let mut client = common::client::connect(daemon_b.instance());
+  let edited = client.edit(work, "f", 0, 0, b"hello");
+  let submit = RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  };
+  let word = client.begin(&submit).map(|id| id.word());
+  let first = word
+    .as_ref()
+    .ok()
+    .and_then(|word| answer_within(&mut client, *word));
+  let acknowledged = client.acknowledge_all();
+  let lifted = daemon_b.inject_merge_fault(slates_server::merge_service::MergeFault::default());
+  let both = [&daemon_a, &daemon_b];
+  let committed = poll_until(&both, PLACEMENT_DEADLINE, || {
+    daemon_a.merge_record_placed(green, 1)
+  });
+  let answer = word
+    .as_ref()
+    .ok()
+    .and_then(|word| resent_answer(&mut client, *word, &submit));
+  drop(client);
+  daemon_a.stop();
+  daemon_b.stop();
+  assert_resent_under_its_id(&ForwardedResend {
+    faulted: withheld.is_ok() && lifted.is_ok(),
+    edited: edited.is_ok(),
+    sent: word.is_ok(),
+    first,
+    acknowledged: acknowledged.is_ok(),
+    committed,
+    answer,
+  });
+}
+
+/// What the forwarded resend run observed, for [`assert_resent_under_its_id`].
+struct ForwardedResend {
+  faulted: bool,
+  edited: bool,
+  sent: bool,
+  first: Option<Result<ReplyBody, String>>,
+  acknowledged: bool,
+  committed: bool,
+  answer: Option<Result<ReplyBody, String>>,
+}
+
+/// Sends `submit` again under `word` and waits for its answer; `None` if it could not be sent or none came.
+fn resent_answer(
+  client: &mut slates_client::Client,
+  word: u64,
+  submit: &RequestBody,
+) -> Option<Result<ReplyBody, String>> {
+  match client.begin_again(word, submit) {
+    Ok(true) => answer_within(client, word),
+    _ => None,
+  }
+}
+
+/// The forwarded resend's assertions: refused `Overloaded` first, then, after the acknowledgement and the commit,
+/// answered with version 1 under its own id.
+fn assert_resent_under_its_id(run: &ForwardedResend) {
+  let setup = [
+    ("the holder's fault installs and lifts", run.faulted),
+    ("the forwarded edit is served", run.edited),
+    ("the submit is sent", run.sent),
+    ("the client acknowledges", run.acknowledged),
+    (
+      "the version commits once the holder takes its record",
+      run.committed,
+    ),
+  ];
+  let failed: Vec<&str> = setup
+    .iter()
+    .filter(|(_, held)| !held)
+    .map(|(what, _)| *what)
+    .collect();
+  assert!(
+    failed.is_empty(),
+    "the run's steps: {failed:?} did not hold"
+  );
+  assert!(
+    matches!(
+      &run.first,
+      Some(Err(refusal)) if refusal.starts_with("Overloaded") || refusal.starts_with("OwnerUnreachable")
+    ),
+    "the forwarded submit's acceptance outlived a budget, answered retryable under its id: {:?}",
+    run.first
+  );
+  assert!(
+    matches!(
+      run.answer,
+      Some(Ok(ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }))
+    ),
+    "the resend under its id meets the committed result: {:?}",
+    run.answer
+  );
+}
+
 /// AC-8.19/T-8.17 and §4.16 "Commit" ("committed at f+1 acknowledgements … issued only when every
 /// identity the version references is placed"; §4.10 placed-before-committed): in a two-node `f = 1`
 /// fleet the holder B is made to **refuse every content put** (an injected placement refusal). A green's
@@ -11069,6 +11254,350 @@ fn a_submit_is_answered_only_once_its_record_commits_at_the_quorum() {
   daemon_a.stop();
   daemon_b.stop();
   assert_commit_gate(&gate);
+}
+
+/// §4.16 "Commit" (AUD-11) with D-7's one owning shard per volume (found 2026-11-06 by the Linux load rungs: in a
+/// three-server fleet of seven-shard daemons at `f = 1`, no submit to a green was ever answered; the green's owner
+/// counted `merge.acceptance_deferred` 30 and `merge.inputs_unplaced` 591 in 60 s, and `merge.acceptance_resolved`
+/// never). Do: in a two-node `f = 1` fleet of two-shard daemons, a green whose name routes to the shard that is not the
+/// control shard, a work over it with one edit, and a submit. Expect the submit accepted as version 1, the version's
+/// record placed at the quorum and the acceptance resolved, as on the control shard
+/// ([`a_submit_is_answered_only_once_its_record_commits_at_the_quorum`] runs there).
+#[test]
+fn a_submit_to_a_green_on_a_non_control_shard_is_answered_once_its_record_commits() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
+  let a = node("a", pa_probe, pa_record);
+  let b = node("b", pb_probe, pb_record);
+  let pid = std::process::id();
+  let instance_a = format!("fleet-{}-{pid}", a.host.0);
+  let peer_of_a = Peer {
+    anchor: b.origin_anchor,
+    host: b.host,
+    address: b.address,
+    record_address: b.record_address,
+    certificate: b.identity.certificate(),
+  };
+  let peer_of_b = Peer {
+    anchor: a.origin_anchor,
+    host: a.host,
+    address: a.address,
+    record_address: a.record_address,
+    certificate: a.identity.certificate(),
+  };
+  let daemon_a = start_sharded(a, peer_of_a, TWO_SHARDS);
+  let daemon_b = start_sharded(b, peer_of_b, TWO_SHARDS);
+  assert!(
+    form_and_settle(&[&daemon_a, &daemon_b]),
+    "the fleet's groups formed before the test acts"
+  );
+  let mut client = Client::connect(&instance_a);
+  let name = name_on_partition("green", OTHER_PARTITION, usize::from(TWO_SHARDS));
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name,
+    require_evidence: false,
+    base: None,
+  }) else {
+    daemon_a.stop();
+    daemon_b.stop();
+    panic!("create green");
+  };
+  let on_other_shard = slates_server::verbs::owner_of(green) == OTHER_PARTITION;
+  let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
+    green,
+    name: "work".to_owned(),
+  }) else {
+    daemon_a.stop();
+    daemon_b.stop();
+    panic!("create work");
+  };
+  let edited = client.call(&RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  let submitted = client.call(&RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  });
+  let placed = daemon_a.merge_record_placed(green, 1);
+  let counters = daemon_a.fleet_refusals().map(|counters| {
+    counters
+      .into_iter()
+      .filter(|(name, _)| name.starts_with("merge."))
+      .collect::<Vec<_>>()
+  });
+  daemon_a.stop();
+  daemon_b.stop();
+  assert!(
+    on_other_shard,
+    "the green is on the shard that is not the control shard"
+  );
+  assert!(
+    matches!(edited, ReplyBody::Edited),
+    "the edit was declared: {edited:?}"
+  );
+  assert_eq!(
+    submitted,
+    ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    },
+    "the submit is accepted once its record commits; the record placed {placed:?}; the owner's merge counters \
+     {counters:?}"
+  );
+}
+
+/// §4.16 "Commit" (AUD-11) under a forming configuration (the bug record of 2026-11-06: in a deployed three-server
+/// fleet no submit was ever answered). The bootstrap gives the bootstrapping node a one-voter council and installs its
+/// one-candidate placement at once, so a green made and submitted to there before the council grows enqueued its merge
+/// records with the owner alone as candidate; the placement at `f = 1` needs two, and nothing re-targeted the pending
+/// records when the council's later configurations were installed. Do: start three nodes at `f = 1`, bootstrap without
+/// waiting for the initial membership, and on the bootstrapper create a green, a work over it with one edit, and submit.
+/// Expect the submit answered, accepted as version 1, within the fixture's wait: the pending records follow the
+/// configuration the owner holds now, as head records do.
+#[test]
+fn a_submit_made_while_the_council_forms_is_answered_once_its_record_commits() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<_> = names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<_> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<_> = nodes
+    .iter()
+    .map(|(_, _, identity)| identity.certificate())
+    .collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let no_regions = std::collections::BTreeMap::new();
+  let daemons = start_mesh_unsettled(
+    nodes,
+    &hosts,
+    &certs,
+    &serve,
+    1,
+    1,
+    &no_regions,
+    &std::collections::BTreeMap::new(),
+  );
+  let mut client = Client::connect(daemons[0].instance());
+  // Only the readiness refusal is retried: the bootstrapper serves writes once its root and council exist.
+  let mut created = ReplyBody::Refused {
+    refusal: Refusal::ConsensusNotInitialized,
+  };
+  let made = audit_wait(|| {
+    created = client.call(&RequestBody::CreateGreen {
+      name: "green".to_owned(),
+      require_evidence: false,
+      base: None,
+    });
+    Ok(!matches!(
+      created,
+      ReplyBody::Refused {
+        refusal: Refusal::ConsensusNotInitialized
+      }
+    ))
+  });
+  let ReplyBody::GreenCreated { id: green } = created else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("the green was created ({made}): {created:?}");
+  };
+  let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
+    green,
+    name: "work".to_owned(),
+  }) else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("create work");
+  };
+  let edited = client.call(&RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  // The fixture's whole formation wait: a commit that is going to place has long placed by then.
+  let submitted = client
+    .try_call(
+      &RequestBody::Submit {
+        work,
+        evidence: Vec::new(),
+      },
+      u64::try_from(formation_deadline().as_nanos()).unwrap_or(u64::MAX),
+    )
+    .ok();
+  let answered = submitted.is_some();
+  let placed = daemons[0].merge_record_placed(green, 1);
+  let awaiting = daemons[0].merge_awaiting(green);
+  // Each node's merge, content and record counters, so a submit still waiting names what holds it.
+  let counters: Vec<_> = daemons
+    .iter()
+    .map(|daemon| {
+      daemon.fleet_refusals().map(|counters| {
+        counters
+          .into_iter()
+          .filter(|(name, _)| {
+            [
+              "merge.",
+              "fleet.content",
+              "content.refused",
+              "fleet.record",
+              "fleet.seal",
+            ]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+          })
+          .collect::<Vec<_>>()
+      })
+    })
+    .collect();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(matches!(edited, ReplyBody::Edited), "the edit: {edited:?}");
+  assert!(
+    answered,
+    "the submit was answered once its record committed; the record placed {placed:?}, submits awaiting {awaiting:?}; \
+     each node's counters {counters:?}"
+  );
+  assert_eq!(
+    submitted,
+    Some(ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    }),
+    "accepted as version 1"
+  );
+}
+
+/// §4.16 "Commit" (AUD-11) at the speed of the exchange, not the coordinator's period (goal 4's Linux rungs,
+/// 2026-11-06: at 1,000 clients against three servers at `f = 1` every accepted submit was answered `Overloaded`, its
+/// version committed, and one submit at a time took 159 to 670 ms on an idle fleet). A version's inputs were put at one
+/// coordinator period and its record shipped at the next, so every answer waited out at least one period. Do: on a
+/// settled three-node fleet at `f = 1`, submit twenty works over one green one after another, timing each submit. Expect
+/// every submit accepted, each as the next version, and the median answered within one coordinator period
+/// ([`HEARTBEAT_NS`]): an accepted version wakes the record plane, which ships it as soon as its inputs place.
+#[test]
+fn a_submit_at_f1_is_answered_without_waiting_for_the_coordinators_period() {
+  /// Shape: submits timed, one after another; enough for the median to be one submit's answer, not a lucky one.
+  const SUBMITS: u64 = 20;
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<_> = names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<_> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<_> = nodes
+    .iter()
+    .map(|(_, _, identity)| identity.certificate())
+    .collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 1);
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("create green");
+  };
+  let answers = timed_submits(&mut client, green, SUBMITS);
+  let counters = merge_and_content_counters(&daemons);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  for (index, edited, submitted, _) in &answers {
+    assert!(
+      matches!(edited, ReplyBody::Edited),
+      "edit {index} was declared: {edited:?}"
+    );
+    assert_eq!(
+      *submitted,
+      ReplyBody::Submitted {
+        version: Some(index + 1),
+        conflicts: Vec::new(),
+      },
+      "submit {index} is accepted as the next version"
+    );
+  }
+  let mut waits: Vec<Duration> = answers.iter().map(|(_, _, _, waited)| *waited).collect();
+  waits.sort();
+  let median = waits.get(waits.len() / 2).copied().unwrap_or(Duration::MAX);
+  eprintln!(
+    "submit answers at f = 1: median {median:?}, every answer {waits:?}; counters {counters:?}"
+  );
+  let unheld: u64 = counters
+    .iter()
+    .flatten()
+    .filter(|(name, _)| name == "merge.inputs_unheld")
+    .map(|(_, count)| count)
+    .sum();
+  assert_eq!(
+    unheld, 0,
+    "no holder refused a record for want of inputs it was counted holding: {counters:?}"
+  );
+  assert!(
+    median < Duration::from_nanos(HEARTBEAT_NS),
+    "the median submit is answered within one coordinator period ({} ms): median {median:?}, every answer {waits:?}",
+    HEARTBEAT_NS / 1_000_000
+  );
+}
+
+/// `count` works over `green`, each with one edit declared and then submitted, one after another: each work's index,
+/// its edit's reply, its submit's reply and how long the submit took to answer.
+fn timed_submits(
+  client: &mut Client,
+  green: VolumeId,
+  count: u64,
+) -> Vec<(u64, ReplyBody, ReplyBody, Duration)> {
+  let mut answers = Vec::new();
+  for index in 0..count {
+    let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
+      green,
+      name: format!("work-{index}"),
+    }) else {
+      panic!("create work {index}");
+    };
+    let edited = client.call(&RequestBody::Edit {
+      work,
+      path: format!("file-{index}"),
+      at: 0,
+      delete_len: 0,
+      bytes: b"hello".to_vec(),
+    });
+    let started = Instant::now();
+    let submitted = client.call(&RequestBody::Submit {
+      work,
+      evidence: Vec::new(),
+    });
+    answers.push((index, edited, submitted, started.elapsed()));
+  }
+  answers
+}
+
+/// Each node's merge and content-exchange counters. A holder refuses a record for want of inputs it was counted
+/// holding only if a later version's put made it let them go.
+fn merge_and_content_counters(daemons: &[Daemon]) -> Vec<Vec<(String, u64)>> {
+  daemons
+    .iter()
+    .map(|daemon| {
+      daemon
+        .fleet_refusals()
+        .map(|counters| {
+          counters
+            .into_iter()
+            .filter(|(name, _)| name.starts_with("merge.") || name.starts_with("fleet.content."))
+            .map(|(name, count)| (name.to_owned(), count))
+            .collect()
+        })
+        .unwrap_or_default()
+    })
+    .collect()
 }
 
 /// A green, a work over it with one edit declared, and the submit request that would advance it.
@@ -13551,5 +14080,139 @@ fn a_settled_fleet_admits_a_create_on_every_node() {
       .iter()
       .all(|reply| matches!(reply, ReplyBody::Created { .. })),
     "every node of the settled fleet admits a create: {replies:?}"
+  );
+}
+
+/// Shape: how long the owner's shard is kept in one starved poll: a window and a half, so an answer behind it comes past
+/// a wall window.
+const STARVED_OWNER: Duration = Duration::from_millis(1_500);
+/// Shape: the starved poll's time on the CPU and off it in each turn: a fifth of the time on it, as a thread kept off
+/// its core by spinners runs.
+const STARVED_BURST: Duration = Duration::from_millis(10);
+const STARVED_OFF: Duration = Duration::from_millis(40);
+/// Shape: the volumes created on node a while looking for one its second shard owns; with two shards a run that finds
+/// none in this many is a fault of the placement, not luck.
+const OWNER_TRIES: usize = 48;
+
+/// R3 class A, the forwarded verbs (`verbs.rs` `serve_forward`: the forwarded read's call from the control shard to the
+/// volume's owner shard), A-65, §4.3, §4.8. Do: three daemons of two shards, each its own region; create a volume node
+/// a's second shard owns; from a client on node b, read its `Status` until the forward path is up, then read it again
+/// while node a's second shard runs one starved poll for a window and a half (on the CPU a fifth of the time). Expect:
+/// the read is served, after more than a wall window. On main node a's control shard gave up on its owner shard at the
+/// wall second and answered `NotFound`: a live volume reported missing across the fleet.
+#[test]
+fn a_forwarded_read_whose_owner_shard_is_starved_is_served_past_a_wall_window() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let regions: std::collections::BTreeMap<HostId, RegionId> = [
+    (hosts[0], RegionId(0)),
+    (hosts[1], RegionId(1)),
+    (hosts[2], RegionId(2)),
+  ]
+  .into_iter()
+  .collect();
+  let daemons = start_mesh_with(
+    nodes,
+    &hosts,
+    &certs,
+    &serve,
+    1,
+    2,
+    &regions,
+    &std::collections::BTreeMap::new(),
+  );
+  let instances: Vec<String> = daemons
+    .iter()
+    .map(|daemon| daemon.instance().to_owned())
+    .collect();
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  let mut client_a = Client::connect(&instances[0].clone());
+  let id = (0..OWNER_TRIES)
+    .find_map(
+      |attempt| match client_a.call(&scratch(&format!("starved-owner-{attempt}"))) {
+        ReplyBody::Created { id } if slates_server::verbs::owner_of(id) == 1 => Some(id),
+        _ => None,
+      },
+    )
+    .expect("a volume node a's second shard owns");
+  let mut client_b = Client::connect(&instances[1].clone());
+  let ready = poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    COUNCIL_RETIRE_DEADLINE,
+    || {
+      Ok(matches!(
+        client_b.call(&RequestBody::Status { volume: id }),
+        ReplyBody::Status { .. }
+      ))
+    },
+  );
+  assert!(ready, "b's cross-region forward path to region 0 came up");
+
+  let begun = &*Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false)));
+  let owner_shard = daemons[0].shards()[1];
+  let starver = daemons[0]
+    .observation(
+      Some(owner_shard),
+      10 * LIVENESS_BUDGET_NS,
+      move |_: &mut slates_server::state::ShardState| {
+        begun.store(true, std::sync::atomic::Ordering::Release);
+        let started = Instant::now();
+        while started.elapsed() < STARVED_OWNER {
+          let burst = Instant::now();
+          while burst.elapsed() < STARVED_BURST {
+            std::hint::spin_loop();
+          }
+          let (_hold, rx) = std::sync::mpsc::channel::<()>();
+          let _ = rx.recv_timeout(STARVED_OFF);
+        }
+      },
+    )
+    .unwrap();
+  let starving = std::thread::spawn(move || {
+    let _ = starver.wait();
+  });
+  let began = Instant::now();
+  while !begun.load(std::sync::atomic::Ordering::Acquire) {
+    assert!(
+      began.elapsed() < COUNCIL_RETIRE_DEADLINE,
+      "the starved poll began"
+    );
+    std::thread::yield_now();
+  }
+  let started = Instant::now();
+  let reply = client_b.try_call(&RequestBody::Status { volume: id }, 10 * LIVENESS_BUDGET_NS);
+  let took = started.elapsed();
+  starving.join().unwrap();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  let served = matches!(reply, Ok(ReplyBody::Status { .. }));
+  println!(
+    "a forwarded read with its owner shard starved: {} after {took:?}",
+    if served {
+      "served".to_owned()
+    } else {
+      format!("{reply:?}")
+    }
+  );
+  assert!(
+    took > Duration::from_nanos(LIVENESS_BUDGET_NS),
+    "the answer came past a wall window ({took:?}), so the test is not vacuous"
+  );
+  assert!(
+    served,
+    "a starved owner shard's forwarded read was lost after {took:?}: {reply:?}"
   );
 }

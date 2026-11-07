@@ -38,6 +38,8 @@ const COULD_NOT_RUN: u8 = 2;
 const VOLUME_HEX_DIGITS: usize = 32;
 /// Format: a written file's mode.
 const FILE_MODE: u32 = 0o644;
+/// Shape: the writes between progress lines.
+const PROGRESS_EVERY: usize = 50;
 
 fn main() -> ExitCode {
   let args: Vec<String> = std::env::args().skip(1).collect();
@@ -144,6 +146,13 @@ fn write(plan: Plan) -> Result<String, String> {
   let mut refused = 0usize;
   let mut first_refusal = None;
   for file in 0..plan.count {
+    if file % PROGRESS_EVERY == 0 {
+      // A line as it goes, so a stream that stops is seen where it stopped (the lane prints a stalled probe's log).
+      println!(
+        "live-progress: sent={file} acknowledged={} refused={refused}",
+        times.len()
+      );
+    }
     let bytes = body(file, plan.bytes);
     let began = Instant::now();
     match client.fs_write((plan.volume, attachment), &path(file), &bytes, FILE_MODE) {
