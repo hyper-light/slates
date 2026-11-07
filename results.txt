@@ -1,0 +1,4 @@
+tested 9c1d8b27a51d6e33f0342054a0a5f7b4db7c6bcf variant after on x86_64, 4 cpus
+client exit 0 113s
+harness exit 0 172s
+clippy exit 0 58s
