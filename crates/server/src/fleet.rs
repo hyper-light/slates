@@ -1731,6 +1731,11 @@ pub(crate) fn content_authorized(
 
 /// [`content_authorized`], with the counter naming why not: `peer` is not a member, the object's acting owner is
 /// unknown here, `peer` is not it, or (placing) this node is not among its candidates.
+/// Counter and reason: a placement refused because this node is not among the object's candidates in its own
+/// configuration, the sender being the acting owner ([`content_authority`]); a live holder the volume's record names
+/// admits the entry anyway (`live_ship::admitted`).
+pub(crate) const CONTENT_NOT_A_CANDIDATE: &str = "content.refused.not_a_candidate";
+
 pub(crate) fn content_authority(
   regional: &slates_db::register::RegionalConfiguration,
   records: &std::collections::BTreeMap<ObjectId, slates_db::register::Acceptor>,
@@ -1762,7 +1767,7 @@ pub(crate) fn content_authority(
       Err("content.refused.not_the_acting_owner")
     }
     slates_cluster::content::ContentAccess::Place if !candidates.contains(&local) => {
-      Err("content.refused.not_a_candidate")
+      Err(CONTENT_NOT_A_CANDIDATE)
     }
     slates_cluster::content::ContentAccess::Place => Ok(()),
     slates_cluster::content::ContentAccess::Read => {

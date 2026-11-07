@@ -6833,7 +6833,10 @@ it uses content addressing. The RAM-only trust boundary and any allowed sharing 
 > - **Bound to the object.** Every offer, put and fetch names its object (`Fetch` gained it). The holder
 >   decides authority from the committed configuration and its own records before any lookup or allocation.
 >   - A placement needs the object's acting owner (its owner, or a departed owner's takeover successor) and
->     must land on that owner's candidates.
+>     must land on that owner's candidates. A live log's entry (A-200) also lands on a holder the volume's
+>     newest catalog record names among its live holders (A-240), though the holder's own configuration does
+>     not place it yet: phase one counts the recorded holders, and a holder whose view lagged refused every
+>     entry while the other was stopped (2026-11-07, `live_ship::live_admission`).
 >   - A read needs the acting owner, one of its candidates, or a holder of its recovery cohort.
 > - **Scoped answers.** Answers come only from what the holder holds for that object: another object's
 >   chunks count as missing, cannot be leaned on by a put, and are never fetched. A refused request draws the
