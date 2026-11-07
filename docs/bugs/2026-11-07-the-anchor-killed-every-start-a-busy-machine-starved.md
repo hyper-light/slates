@@ -79,6 +79,26 @@ On CI (diag-liveness-10, two spinners a CPU on four runners), the stuck start wa
 Linux runners, 1,007-1,070 ms on windows-latest and 1,002-1,009 ms on windows-11-arm, three runs each, and the
 starved start was never killed (`start_judgment.rs` on Windows, `cli.rs` on Linux).
 
+### After the suites' own fixes (11ac10b0)
+
+The same recipe on this Mac, 183-292 runnable processes:
+
+| test, runs | passed | starts of a progressing daemon killed | stuck start killed after |
+|---|---|---|---|
+| `a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted` ×5 (28b0ddf2) | 5 | 0 | |
+| `a_starved_start_that_makes_progress_is_not_killed` ×5 (28b0ddf2) | 5 | 0 | |
+| `a_stuck_start_is_killed_and_restarted` ×5 | 5 | 0 | 1,016-1,294 ms |
+
+loadtest-scale's memrung (its `memrung-liveness.sh`, on a release build of 1c9e6969) beside the same spinners, three
+rounds of 1,000, 300 and 1,000 clients at 32 a connection, 183-248 runnable processes: 0 start kills, 0 heartbeat
+lapses, 0 restarts, 0 measurement timeouts; shards initialized in 3-1,500 ms. The 300-client round finished (0 starved,
+0 reconnects). The 1,000-client rounds hit the harness's own 900 s bound before finishing; pinning the tree alone took
+164 s at this load. loadtest-scale's own run on a24e8e40, without the spinners: 0 start kills in three rounds.
+
+CI, diag-liveness-19 on 11ac10b0, beside two spinners a CPU, on ubuntu-latest, ubuntu-24.04-arm, windows-latest and
+windows-11-arm: the anchor suite ×3, the held-rendezvous handoff (×3 on Windows), the start judgment ×3 and the
+process clock, all green; stuck starts killed at 1,001-1,008 ms on Linux and 1,005-1,135 ms on Windows.
+
 ## Left open
 
 - **Recovery in one poll.** Since A-228 the watchdog starts before the shards' recovery ends, so a start beats during a
