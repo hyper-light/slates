@@ -11611,7 +11611,7 @@ one windows-11-arm VM (4 logical CPUs, WinFsp 2.1.25156), quiet and loaded (two 
   (3.5 ms against 0.9), so those are its two worse cells. Run 42354811410's `alloc` arm, the same build, had one such
   open. Unexplained, and only in the combined form, which does not ship. Main's form shows no such shift.
 
-### The CanDelete lever measured: a file's CanDelete answered from its context (`agents/winfsp-overlap-18`)
+### The CanDelete lever: measured and rejected (a file's CanDelete answered from its context, `agents/winfsp-overlap-18`)
 
 **The lever.** CanDelete's shard check is kept (above), but only a directory's emptiness needs the volume. A file may
 always be marked. `agents/winfsp-overlap-18` (`10e7c2f8` on main `a2cf9af7`) carries the open's kind in its ledger
@@ -11641,6 +11641,11 @@ minus main, p50:
 
 The trip it removes was 2.6 µs at the p50 (run 42185624364), and the unlink moved −0.8 µs quiet and −3.1 loaded,
 about what that predicts. Both are inside an unlink's run-to-run spread of 221–297 µs.
+
+**Rejected (the supervisor's decision, 2026-11-07).** The request-level saving is real: 11,001 CanDelete shard trips a
+run become 1, each 2.6 µs at the p50. At the bench the A/B is dead even, and a dead-even change does not land, least of
+all one that costs a ledger format (version 4 → 5, versioned contexts). `agents/winfsp-overlap-18` stays off main; a
+file's CanDelete still asks the shard, and its check stays as kept above.
 
 ### Every remaining per-request cost, with its number
 
@@ -11683,9 +11688,9 @@ dash in a table: not broken out on that runner.
   allocations.
 - **The allocation fix, five runs on one VM:** in main's form it slows nothing (unlink −1.8 µs quiet, −2.6 loaded,
   within each run) and is beyond the spread faster on a loaded stat (−2.9 µs, 5 runs of 5).
-- **Kept, CanDelete's check:** the baseline skips it and lets a non-empty directory's removal report success. A file's
-  check answered from its ledger context (`agents/winfsp-overlap-18`) removes 11,001 shard trips a run and measured dead
-  even (unlink −0.8 µs quiet, −3.1 loaded).
+- **Kept, CanDelete's check:** the baseline skips it and lets a non-empty directory's removal report success. Answering a
+  file's check from its ledger context (`agents/winfsp-overlap-18`) removes 11,001 shard trips a run but measured dead
+  even at the bench (unlink −0.8 µs quiet, −3.1 loaded), so it is rejected and every CanDelete still asks the shard.
 - **Kept, crash safety's price:** on arm64, quiet, about 18 µs a stat and 30 to 35 µs a rename or an unlink against the
   DLL dispatcher. The journal holds 3 to 4.5 µs a request, the ledger and A-198's barriers about 5 µs a stat, direct
   output 0.5 µs a call, and a kernel share of 3 to 5 µs a request inside the transaction call. R4 keeps it: the
