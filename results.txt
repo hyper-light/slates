@@ -1,0 +1,103 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 10:21:46 UTC 2026, commit 430e4693
+== quiet 1
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1001 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 323µs in, and the beat stopped 1.000029229s after it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.29s
+== quiet 2
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1001 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 374µs in, and the beat stopped 1.010630438s after it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.29s
+== quiet 3
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1001 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 361µs in, and the beat stopped 1.010071478s after it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.29s
+== quiet 4
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1001 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 325µs in, and the beat stopped 1.000911201s after it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.29s
+== quiet 5
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1001 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 355µs in, and the beat stopped 1.000998886s after it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.29s
+== quiet 6
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1001 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 367µs in, and the beat stopped 1.000946808s after it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.29s
+== quiet 7
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1001 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 399µs in, and the beat stopped 1.009625208s after it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.29s
+== quiet 8
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1001 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 343µs in, and the beat stopped 1.001648086s after it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.29s
+== quiet 9
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1001 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 347µs in, and the beat stopped 1.001783341s after it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.29s
+== quiet 10
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1001 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 330µs in, and the beat stopped 1.000782047s after it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.29s
+== busy 1
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1000 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 4.632ms in, and the beat stopped 998.256806ms after it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.83s
+== busy 2
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1006 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 768µs in, and the beat stopped 997.546433ms after it
+slates daemon: the control loop ended; the watchdog withholds the beat so the anchor restarts the daemon
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.87s
+== busy 3
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1006 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 18.764ms in, and the beat stopped 990.747787ms after it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.78s
+== busy 4
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1003 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 2.576ms in, and the beat stopped 999.033578ms after it
+slates daemon: the control loop ended; the watchdog withholds the beat so the anchor restarts the daemon
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.80s
+== busy 5
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1005 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 2.803ms in, and the beat stopped 1.006906817s after it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.87s
+== busy 6
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1005 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 17.01ms in, and the beat stopped 991.552113ms after it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.98s
+== busy 7
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1003 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 772µs in, and the beat stopped 1.005063285s after it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.89s
+== busy 8
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1005 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 5.814ms in, and the beat stopped 1.004311241s after it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.80s
+== busy 9
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1002 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 246µs in, and the beat stopped 1.008918826s after it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.74s
+== busy 10
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1002 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 17.582ms in, and the beat stopped 991.112741ms after it
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.96s
