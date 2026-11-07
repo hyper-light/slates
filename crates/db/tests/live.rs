@@ -1739,6 +1739,43 @@ fn a_write_is_durable_only_where_every_takeover_quorum_meets_it() {
   assert_eq!(shipper.durable(), Some(0), "f = 2: f of three holders is");
 }
 
+/// A-200: a holder set of `f` or fewer members is never moved to, since no takeover can count `f + 1` reports from it.
+/// Do begin transitions from two holders at `f = 1` and from four at `f = 2` to sets of every size. Expect sets of `f` or
+/// fewer refused (no transition begun, the holders kept and still making `W` alone) and larger ones begun. Found by
+/// live-durability's rolling partition flow at 8b0f0341: a candidate found dead left one other, the log moved to it,
+/// and writes stalled for a partition's length when that one stopped before the move back was recorded (4 of 6 runs on
+/// each arch).
+#[test]
+fn a_holder_set_of_f_or_fewer_is_never_moved_to() {
+  let owner = HostId(1);
+  let others: Vec<HostId> = (2..=6).map(HostId).collect();
+  for (f, current) in [(1u32, 2usize), (2, 4)] {
+    let tolerated = usize::try_from(f).unwrap();
+    for size in 1..=others.len() {
+      let mut shipper = Shipper::new(
+        (owner, OBJECT, HostEpoch(1)),
+        Quorum { f },
+        &others[..current],
+        None,
+        (4, 8),
+      );
+      let target: Vec<HostId> = others[others.len() - size..].to_vec();
+      assert_eq!(
+        shipper.begin_transition(&target),
+        size > tolerated && target != others[..current],
+        "f = {f}: a move from {current} holders to {size}"
+      );
+      if size <= tolerated {
+        assert_eq!(
+          (shipper.transition(), shipper.holders()),
+          (None, &others[..current]),
+          "f = {f}: the holders are kept"
+        );
+      }
+    }
+  }
+}
+
 /// R8: at `f = 0` there are no holders and every entry is durable at its append, by the same code.
 #[test]
 fn the_laptop_is_durable_at_its_own_append() {
