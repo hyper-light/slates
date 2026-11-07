@@ -1,0 +1,51 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 10:58:52 UTC 2026, tree R 7ae9bc0a1d404a79bf6c6f2b3f3a0362e9d87345
+== run 1 at 10:58:52, load 1.79 1.96 0.93
+live turns: live-turns-b-6257 stopped: writes [583.151019ms, 4.092748ms, 3.743938ms, 3.845196ms]
+live turns: live-turns-c-6257 stopped: writes [953.901372ms, 3.801999ms, 3.711497ms, 3.952997ms]
+no write waits for the stopped candidate: [("live-turns-b-6257", 583.151019ms), ("live-turns-c-6257", 953.901372ms)]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 3.35s
+== run 1 each_candidate_stopped_in_turn_holds_no_write_and_catches_up exit 101
+live catalog: refusals [("live-catalog-a-6508", 1), ("live-catalog-b-6508", 1)]
+no entry sent to a candidate without the volume's catalog: [("live-catalog-a-6508", 1), ("live-catalog-b-6508", 1)]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 2.13s
+== run 1 a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog exit 101
+== run 2 at 10:58:58, load 1.89 1.97 0.95
+live turns: live-turns-c-6777 stopped: writes [592.56244ms, 3.995367ms, 3.827083ms, 4.511539ms]
+live turns: live-turns-a-6777 stopped: writes [591.842839ms, 3.79485ms, 3.777648ms, 4.00916ms]
+no write waits for the stopped candidate: [("live-turns-c-6777", 592.56244ms), ("live-turns-a-6777", 591.842839ms)]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 2.71s
+== run 2 each_candidate_stopped_in_turn_holds_no_write_and_catches_up exit 101
+live catalog: refusals [("live-catalog-b-7019", 1), ("live-catalog-c-7019", 1)]
+no entry sent to a candidate without the volume's catalog: [("live-catalog-b-7019", 1), ("live-catalog-c-7019", 1)]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 1.13s
+== run 2 a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog exit 101
+== run 3 at 10:59:02, load 1.82 1.96 0.95
+live turns: live-turns-c-7181 stopped: writes [591.807039ms, 4.439315ms, 4.223292ms, 4.318463ms]
+live turns: live-turns-a-7181 stopped: writes [762.614842ms, 3.840896ms, 3.746731ms, 3.823395ms]
+no write waits for the stopped candidate: [("live-turns-c-7181", 591.807039ms), ("live-turns-a-7181", 762.614842ms)]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 2.93s
+== run 3 each_candidate_stopped_in_turn_holds_no_write_and_catches_up exit 101
+live catalog: refusals [("live-catalog-a-7399", 1), ("live-catalog-c-7399", 1)]
+no entry sent to a candidate without the volume's catalog: [("live-catalog-a-7399", 1), ("live-catalog-c-7399", 1)]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 1.23s
+== run 3 a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog exit 101
+== run 4 at 10:59:06, load 1.91 1.98 0.96
+live turns: live-turns-c-7577 stopped: writes [701.157845ms, 4.369995ms, 4.073773ms, 4.120319ms]
+live turns: live-turns-a-7577 stopped: writes [489.40032ms, 4.274959ms, 4.139556ms, 4.255351ms]
+no write waits for the stopped candidate: [("live-turns-c-7577", 701.157845ms), ("live-turns-a-7577", 489.40032ms)]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 3.62s
+== run 4 each_candidate_stopped_in_turn_holds_no_write_and_catches_up exit 101
+live catalog: refusals [("live-catalog-a-7895", 1), ("live-catalog-b-7895", 1)]
+no entry sent to a candidate without the volume's catalog: [("live-catalog-a-7895", 1), ("live-catalog-b-7895", 1)]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 2.15s
+== run 4 a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog exit 101
+== run 5 at 10:59:12, load 1.76 1.94 0.95
+live turns: live-turns-a-8175 stopped: writes [693.205022ms, 4.011816ms, 3.864662ms, 3.827493ms]
+live turns: live-turns-b-8175 stopped: writes [463.687778ms, 4.358197ms, 4.270499ms, 4.300213ms]
+no write waits for the stopped candidate: [("live-turns-a-8175", 693.205022ms), ("live-turns-b-8175", 463.687778ms)]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 2.84s
+== run 5 each_candidate_stopped_in_turn_holds_no_write_and_catches_up exit 101
+live catalog: refusals [("live-catalog-a-8405", 1), ("live-catalog-b-8405", 1)]
+no entry sent to a candidate without the volume's catalog: [("live-catalog-a-8405", 1), ("live-catalog-b-8405", 1)]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 1.33s
+== run 5 a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog exit 101
