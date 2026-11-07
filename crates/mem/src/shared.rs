@@ -1455,6 +1455,8 @@ mod platform {
     view: usize,
     len: usize,
     name: String,
+    /// The view's exclusion from crash dumps (A-231): every view of an object may hold tenant content or keys.
+    excluded: crate::dump_exclusion::DumpExclusion,
   }
 
   impl Inner {
@@ -1469,6 +1471,8 @@ mod platform {
 
   impl Drop for Inner {
     fn drop(&mut self) {
+      // Unregistered before the unmap, so no view another thread maps at this address meanwhile loses its own.
+      self.excluded.release();
       // SAFETY: the view and handle were created or opened by this module and are ours.
       unsafe {
         UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
@@ -1536,6 +1540,7 @@ mod platform {
       handle: handle.into_raw_handle().expose_provenance(),
       view: view.expose_provenance(),
       len,
+      excluded: crate::dump_exclusion::DumpExclusion::exclude(view.cast::<u8>().cast_const(), len),
       name: String::new(),
     })
   }
@@ -1591,6 +1596,7 @@ mod platform {
       handle: handle.expose_provenance(),
       view: view.expose_provenance(),
       len,
+      excluded: crate::dump_exclusion::DumpExclusion::exclude(view.cast::<u8>().cast_const(), len),
       name: name.unwrap_or_default().to_owned(),
     })
   }
@@ -1635,6 +1641,7 @@ mod platform {
       handle: handle.expose_provenance(),
       view: view.expose_provenance(),
       len,
+      excluded: crate::dump_exclusion::DumpExclusion::exclude(view.cast::<u8>().cast_const(), len),
       name: name.clone(),
     })
   }
