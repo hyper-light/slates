@@ -1521,3 +1521,5 @@ slates-winfsp: reply spin window = 7000 ns: the median one-way channel wake of 1
 slates-winfsp: reply spin window = 5100 ns: the median one-way channel wake of 15 (the 2-competitive spin)
 slates-winfsp: receive worker 1 serves, after the probe
 ## run 5 of 5 done, 2026-11-07T02:28:17Z
+To https://github.com/hyper-light/slates
+   2ba4a04..01d6181  01d6181a4b1dd13c1779066f6161ca80097041c3 -> diag-winfsp-overlap-results-42319726082-windows-11-arm
