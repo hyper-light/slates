@@ -123,3 +123,16 @@ fleet_host: 9128716752172554650
 fleet_peers_probed: 0
 fleet_host: 572960214355688649
 fleet_peers_probed: 1
+=== epochs 3 exit 101 load { 12.39 16.42 13.92 }
+rejoins: successor daemon 31774 answered after 41.414875ms
+slates-cluster: fleet: HostId(7204932818663239685) holds HostId(3978505701725150257) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+thread 'a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet' (64095) panicked at crates/cli/tests/live_chaos.rs:2451:7:
+the fleet re-formed after the successor: [Some(("3978505701725150257", 2, 1)), Some(("7204932818663239685", 3, 0)), Some(("2383309524487753384", 2, 1))]
+fleet_host: 3978505701725150257
+fleet_peers_probed: 1
+shard 0 refused fleet.link.invalid.believed_dead: 1
+fleet_host: 7204932818663239685
+fleet_peers_probed: 0
+fleet_host: 2383309524487753384
+fleet_peers_probed: 1
+shard 0 refused fleet.link.invalid.believed_dead: 1
