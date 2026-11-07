@@ -27,6 +27,7 @@ mod bench;
 mod container;
 mod fetch;
 mod hermeticity;
+mod live_fleet;
 mod mount;
 mod slates;
 mod suites;
@@ -72,6 +73,8 @@ pub(crate) struct Options {
   scratch: Option<PathBuf>,
   /// Keep the scratch directory.
   keep: bool,
+  /// Run each suite over a live-shipped volume on an `f = 1` fleet (A-200; `live_fleet.rs`), not one daemon's.
+  live_ship: bool,
   /// `run`: the suite.
   suite: Option<Suite>,
   /// `run`: only this one of the host's transports (every one when absent).
@@ -80,6 +83,9 @@ pub(crate) struct Options {
   write: bool,
   /// `tally`: the kept `pjdfstest-output` directory to re-read.
   outputs: Option<PathBuf>,
+  /// `compare`: the plain run's directory and the live-shipped run's, each holding the `records` and `scratch` its
+  /// harness wrote (`--records DIR/records --scratch DIR/scratch --keep`).
+  compared: Option<(PathBuf, PathBuf)>,
   /// `tally`: who ran the outputs (`root` or `unprivileged`); this process's own identity when
   /// absent.
   privilege: Option<Privilege>,
@@ -133,7 +139,10 @@ fn number<T: std::str::FromStr>(args: &[String], flag: &str, default: T) -> Resu
 /// Parses the arguments after `conformance`.
 pub(crate) fn parse(root: &Path, args: &[String]) -> Result<Options, Failure> {
   let command = args.first().cloned().ok_or_else(|| {
-    Failure("conformance: a subcommand is needed: plan, run, all, matrix, tally, bench".to_owned())
+    Failure(
+      "conformance: a subcommand is needed: plan, run, all, matrix, tally, compare, bench"
+        .to_owned(),
+    )
   })?;
   let privilege = match value_after(args, "--privilege") {
     Some("root") => Some(Privilege::Root),
@@ -171,9 +180,13 @@ pub(crate) fn parse(root: &Path, args: &[String]) -> Result<Options, Failure> {
       .map_or_else(|| root.join("docs/wip/conformance/records"), PathBuf::from),
     scratch: value_after(args, "--scratch").map(PathBuf::from),
     keep: args.iter().any(|a| a == "--keep"),
+    live_ship: args.iter().any(|a| a == "--live-ship"),
     suite,
     write: args.iter().any(|a| a == "--write"),
     outputs: value_after(args, "--outputs").map(PathBuf::from),
+    compared: value_after(args, "--plain")
+      .zip(value_after(args, "--live"))
+      .map(|(plain, live)| (PathBuf::from(plain), PathBuf::from(live))),
     privilege,
     rounds: number(args, "--rounds", bench::DEFAULT_ROUNDS)?,
     bounds: Bounds {
@@ -200,10 +213,131 @@ pub(crate) fn run(root: &Path, options: &Options) -> Result<(), Failure> {
     "all" => all(root, options),
     "matrix" => render_matrix(root, options),
     "tally" => tally(root, options),
+    "compare" => compare(options),
     "bench" => bench::run_bench(root, options, host_os()?),
     other => Err(Failure(format!(
-      "conformance: unknown subcommand `{other}`; plan, run, all, matrix, tally, bench"
+      "conformance: unknown subcommand `{other}`; plan, run, all, matrix, tally, compare, bench"
     ))),
+  }
+}
+
+/// The kept TAP outputs under a run's scratch, by transport and suite: pjdfstest's (`<a__b.t>.txt`) and winfstest's
+/// (`t_base_00.t.out`), each parsed as its judgement parses it.
+fn kept_cases(
+  scratch: &Path,
+) -> Result<std::collections::BTreeMap<String, Vec<slates_conformance::tap::TapCase>>, Failure> {
+  let runner = suites::this_user();
+  let mut kept = std::collections::BTreeMap::new();
+  let Ok(transports) = std::fs::read_dir(scratch) else {
+    return Ok(kept);
+  };
+  for transport in transports.filter_map(Result::ok) {
+    for (suite, extension) in [("pjdfstest-output", "txt"), ("winfstest-output", "out")] {
+      let dir = transport.path().join(suite);
+      let Ok(files) = std::fs::read_dir(&dir) else {
+        continue;
+      };
+      let mut cases = Vec::new();
+      for file in files.filter_map(Result::ok).map(|entry| entry.path()) {
+        if file.extension().is_none_or(|x| x != extension) {
+          continue;
+        }
+        let name = file
+          .file_name()
+          .and_then(|n| n.to_str())
+          .unwrap_or_default();
+        let relative = if extension == "txt" {
+          name.trim_end_matches(".txt").replace("__", "/")
+        } else {
+          name.trim_end_matches(".out").replacen('_', "/", 2)
+        };
+        let output = std::fs::read_to_string(&file)
+          .map_err(|e| Failure(format!("{}: {e}", file.display())))?;
+        cases.extend(slates_conformance::tap::parse_file(&relative, &output, &runner).cases);
+      }
+      kept.insert(
+        format!("{} {suite}", transport.file_name().to_string_lossy()),
+        cases,
+      );
+    }
+  }
+  Ok(kept)
+}
+
+/// The outcome of every record in a directory, by file name: what two runs' records must agree on.
+fn outcomes(
+  records: &Path,
+) -> Result<std::collections::BTreeMap<String, serde_json::Value>, Failure> {
+  let mut out = std::collections::BTreeMap::new();
+  for record in load_records(records)? {
+    let outcome = serde_json::to_value(&record.outcome).map_err(|e| Failure(e.to_string()))?;
+    out.insert(record.file_name(), outcome);
+  }
+  Ok(out)
+}
+
+/// `compare --plain DIR --live DIR`: the plain run and the live-shipped one, compared (A-200): every kept pjdfstest and
+/// winfstest case by its verdict's kind, and every record's outcome (fsx's and fsstress's verdicts, the suites' counts).
+/// Exits non-zero on any difference, naming each.
+fn compare(options: &Options) -> Result<(), Failure> {
+  let (plain, live) = options
+    .compared
+    .as_ref()
+    .ok_or_else(|| Failure("conformance compare: --plain DIR --live DIR are needed".to_owned()))?;
+  let mut differences = Vec::new();
+  let (plain_cases, live_cases) = (
+    kept_cases(&plain.join("scratch"))?,
+    kept_cases(&live.join("scratch"))?,
+  );
+  let mut suites: Vec<&String> = plain_cases.keys().chain(live_cases.keys()).collect();
+  suites.sort_unstable();
+  suites.dedup();
+  for suite in suites {
+    let (a, b) = (
+      plain_cases
+        .get(suite)
+        .map(Vec::as_slice)
+        .unwrap_or_default(),
+      live_cases.get(suite).map(Vec::as_slice).unwrap_or_default(),
+    );
+    let found = slates_conformance::differential::compare(a, b);
+    println!(
+      "compare: {suite}: {} cases plain, {} live, {} differing",
+      a.len(),
+      b.len(),
+      found.len()
+    );
+    differences.extend(found.into_iter().map(|d| format!("{suite} {d}")));
+  }
+  let (plain_records, live_records) = (
+    outcomes(&plain.join("records"))?,
+    outcomes(&live.join("records"))?,
+  );
+  let mut names: Vec<&String> = plain_records.keys().chain(live_records.keys()).collect();
+  names.sort_unstable();
+  names.dedup();
+  for name in names {
+    let (a, b) = (plain_records.get(name), live_records.get(name));
+    let same = a == b;
+    println!(
+      "compare: record {name}: {}",
+      if same { "the same outcome" } else { "DIFFERS" }
+    );
+    if !same {
+      differences.push(format!("record {name}: plain {a:?}, live {b:?}"));
+    }
+  }
+  if differences.is_empty() {
+    println!("compare: the live-shipped run conforms exactly as the plain one does");
+    Ok(())
+  } else {
+    for difference in &differences {
+      println!("compare: DIFFERENCE {difference}");
+    }
+    Err(Failure(format!(
+      "{} differences between the plain and the live-shipped run",
+      differences.len()
+    )))
   }
 }
 

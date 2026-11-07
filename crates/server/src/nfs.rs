@@ -1312,7 +1312,9 @@ fn record_and_publish(
 /// Serves one call on the volume's `owner` shard over the bridge queue: spawns the serve on the owner
 /// (the same cross-shard spawn the client forward uses, §4.3), which spawns a task back on `origin`
 /// that hands the reply to this awaiting task. Returns a system error if the owner shard is gone. The
-/// mounting user's `subject` rides to the owner, so the request runs as the same user there (§4.13).
+/// mounting user's `subject` rides to the owner, so the request runs as the same user there (§4.13). The reply is
+/// waited for in the owner's own time (`xshard::task_in_shard_time`, R3 class A): a starved owner's reply is heard, a
+/// wedged one's given up after a window with no progress.
 #[allow(clippy::too_many_arguments)] // one RPC call's whole identity: where, who, its xid, program, procedure, args, port
 async fn serve_remote(
   owner: u16,
@@ -1326,7 +1328,7 @@ async fn serve_remote(
 ) -> (AcceptStatus, Vec<u8>) {
   // A task on the owner, not a closure, so the reply can wait there for the volume's FUSE mounts to be told of the
   // call's change (AC-3.3) without holding the owner's turn.
-  crate::xshard::task_within(
+  crate::xshard::task_in_shard_time(
     origin,
     owner,
     move || async move {
@@ -1401,8 +1403,9 @@ impl VolumeSet for GatheredVolumeSet {
   }
 }
 
-/// Gathers every owner's entries under one liveness budget (§4.8 lookup). Any failed admission,
-/// missing reply or timeout refuses the entire listing. Calls own their registrations, so early return
+/// Gathers every owner's entries, each waited for in its owner's own time up to the liveness budget of its CPU
+/// (`xshard::within_shard_time`, R3 class A; before, one wall second for them all, and a listing failed while a starved
+/// shard was still answering). Any failed admission, missing reply or owner given up refuses the entire listing. Calls own their registrations, so early return
 /// or cancellation also releases the gathers still in flight (AUD-04/AUD-17).
 async fn gather_all_entries(
   capability: Option<MountCapability>,
@@ -1416,7 +1419,6 @@ async fn gather_entries(
   shards: &[u16],
   capability: Option<MountCapability>,
 ) -> Option<Vec<(String, VolumeId)>> {
-  let deadline = futures::now_ns().saturating_add(crate::daemon::LIVENESS_BUDGET_NS);
   let calls = shards
     .iter()
     .map(|shard| {
@@ -1429,9 +1431,9 @@ async fn gather_entries(
     .collect::<Result<Vec<_>, _>>()
     .ok()?;
   let mut all = Vec::new();
+  // The calls run on their shards meanwhile, so the gather waits about as long as its slowest owner.
   for call in calls {
-    let remaining = deadline.saturating_sub(futures::now_ns());
-    all.extend(crate::xshard::within(call, remaining).await?);
+    all.extend(crate::xshard::within_shard_time(call, crate::daemon::LIVENESS_BUDGET_NS).await?);
   }
   Some(all)
 }
@@ -1926,7 +1928,8 @@ fn with_v4_sessions<R>(
 }
 
 /// Sends `work` to shard `to` and awaits its outcome in a detached task of this shard, counting `lost` when it could
-/// not be delivered or did not answer within the liveness budget (never a silent drop, banned item 9).
+/// not be delivered or did not answer while `to` was working, up to the liveness budget of its CPU
+/// (`xshard::within_shard_time`, R3 class A), never a silent drop (banned item 9).
 fn send_note(
   this: u16,
   to: u16,
@@ -1938,7 +1941,7 @@ fn send_note(
     return;
   };
   match futures::spawn(async move {
-    if crate::xshard::within(call, crate::daemon::LIVENESS_BUDGET_NS)
+    if crate::xshard::within_shard_time(call, crate::daemon::LIVENESS_BUDGET_NS)
       .await
       .is_none()
     {
@@ -2023,7 +2026,7 @@ impl compound::Backend for PurgeBackend {
       }) else {
         return status_word(Nfsstat4::Delay);
       };
-      crate::xshard::within(call, crate::daemon::LIVENESS_BUDGET_NS)
+      crate::xshard::within_shard_time(call, crate::daemon::LIVENESS_BUDGET_NS)
         .await
         .unwrap_or_else(|| status_word(Nfsstat4::Delay))
     }
@@ -2181,7 +2184,7 @@ impl compound::Backend for RoutedBackend {
       }) else {
         return status_word(Nfsstat4::Delay);
       };
-      crate::xshard::within(call, crate::daemon::LIVENESS_BUDGET_NS)
+      crate::xshard::within_shard_time(call, crate::daemon::LIVENESS_BUDGET_NS)
         .await
         .unwrap_or_else(|| status_word(Nfsstat4::Delay))
     }

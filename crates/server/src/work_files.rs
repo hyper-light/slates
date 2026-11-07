@@ -225,10 +225,18 @@ impl WorkFiles {
     Ok(())
   }
 
-  /// A work's delta as a clean rebase leaves it (`Rebased::changed`): per path its bytes where they differ from the
-  /// new base, `None` where it removes the base's file.
+  /// A work's delta as a clean rebase leaves it (`Rebased::changed`), or as a restatement in its log replays it
+  /// (A-207): per path its bytes where they differ from the base, `None` where it removes the base's file.
   pub fn from_changed(changed: BTreeMap<String, Option<Vec<u8>>>) -> WorkFiles {
     WorkFiles { changed }
+  }
+
+  /// What the work holds of its own, in path order (A-207: what a restatement in its log carries).
+  pub fn changed_entries(&self) -> impl Iterator<Item = (&str, Option<&[u8]>)> {
+    self
+      .changed
+      .iter()
+      .map(|(path, entry)| (path.as_str(), entry.as_deref()))
   }
 
   /// Forgets every change: the work now equals its (new) base.

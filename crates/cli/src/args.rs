@@ -38,7 +38,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   volume placed ID [--snapshot N] [--mirror] [--json]   await a durability scope
   attach ID [--read | --write] [--snapshot N]
             [--oci-source HOST_PATH --oci-destination CONTAINER_PATH] [--json]
-  detach ATTACHMENT [--json]
+  detach ATTACHMENT [--volume ID] [--json]   (--volume: an attachment another host's owner holds)
   bootstrap (root | region) [--json]             explicitly create a new consensus group
   recovery-plan (root | region) [--join-group HASH] [--json]
   recover (root | region) --confirm PLAN --fenced --accept-loss [--join-group HASH] [--json]
@@ -403,6 +403,9 @@ pub(crate) enum Verb {
   Detach {
     /// The attachment.
     attachment: u64,
+    /// `--volume ID`: the attachment's volume, which routes the detach to its owner when that is another host
+    /// (A-222).
+    volume: Option<slates_client::VolumeId>,
   },
   /// Read a base entry.
   ReadBase {
@@ -1579,14 +1582,18 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
     }
     ["attach"] => Err(ParseError::Missing("volume ID")),
     ["detach", attachment] => {
-      taken.only(&NONE)?;
+      taken.only(&Spec {
+        values: &["--volume"],
+        switches: &[],
+      })?;
       let attachment = attachment
         .parse::<u64>()
         .map_err(|e| ParseError::BadValue {
           what: "ATTACHMENT",
           reason: e.to_string(),
         })?;
-      Ok(client(&taken, Verb::Detach { attachment }))
+      let volume = taken.value("--volume").map(volume).transpose()?;
+      Ok(client(&taken, Verb::Detach { attachment, volume }))
     }
     ["detach"] => Err(ParseError::Missing("ATTACHMENT")),
     ["status", id] => {

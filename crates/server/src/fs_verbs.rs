@@ -121,6 +121,8 @@ pub(crate) fn with_writer<T>(
     || catalog.principal != *principal
     || !catalog.rights.write
     || catalog.snapshot.is_some()
+    // Another host's attachment serves only that host's forwards, and this node's only this node (A-222).
+    || !crate::remote_attach::may_use(state, &catalog)
   {
     return Err(Refusal::Forbidden {
       verb: verb.to_owned(),

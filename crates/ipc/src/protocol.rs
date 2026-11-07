@@ -754,6 +754,23 @@ pub enum RequestBody {
     /// Whether it is live-shipped from now on.
     live_shipped: bool,
   },
+  /// Detach an attachment of `volume` (§4.10, A-222): `Detach` routed by the volume, so an attachment another host's
+  /// owner holds is ended there (an attachment id names its owner partition, not its host). Appended.
+  DetachOf {
+    /// The volume the attachment is of.
+    volume: VolumeId,
+    /// The attachment.
+    attachment: u64,
+  },
+  /// End every attachment the sending host's dead `client` holds on `volume` (§4.10, A-222): sent by a node's reap of
+  /// a dead client to the owner of each volume that client attached from it. The owner trusts only the authenticated
+  /// peer as the host, so a node ends only its own clients' attachments. Never sent by a client. Appended.
+  RemoteReap {
+    /// The volume the dead client attached.
+    volume: VolumeId,
+    /// The dead client's id on the sending host.
+    client: u32,
+  },
 }
 
 /// Format: the name of the image file in an image volume's root (§4.6, A-160): what a VMM is pointed at.
@@ -1216,6 +1233,14 @@ pub struct LiveReport {
   /// On the owner: publications are owed to the log (a burst outran the credit, or one could not be shipped), so its
   /// head is behind the volume until the whole record it owes is appended.
   pub owed: bool,
+  /// The head's epoch: the owner's epoch that made the entry at the head (`None`: nothing yet). Appended.
+  pub head_epoch: Option<u64>,
+  /// The head's chain identity: the BLAKE3 of the entry at the head, which binds every entry before it (`None`: nothing
+  /// yet). Two copies at one epoch and position hold the same log exactly when these agree (Agreement). Appended.
+  pub head_identity: Option<[u8; 32]>,
+  /// On a candidate, the fence its copy has promised: no message made under a lower epoch is served. On the owner, the
+  /// epoch it ships under. Appended.
+  pub fence: u64,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.
@@ -1351,7 +1376,10 @@ impl RequestBody {
       | RequestBody::Enroll { .. }
       | RequestBody::Attest { .. }
       | RequestBody::Revoke { .. } => None,
-      RequestBody::Share { volume, .. } | RequestBody::LiveShip { volume, .. } => Some(*volume),
+      RequestBody::Share { volume, .. }
+      | RequestBody::LiveShip { volume, .. }
+      | RequestBody::DetachOf { volume, .. }
+      | RequestBody::RemoteReap { volume, .. } => Some(*volume),
     }
   }
 
@@ -1409,7 +1437,18 @@ impl RequestBody {
   /// record (§4.8 "Lookup"): a volume-scoped mutation ([`Self::volume`] names the volume, [`Self::mutates_shard_image`]
   /// changes it).
   pub fn forwards_as_write(&self) -> bool {
-    self.volume().is_some() && self.mutates_shard_image()
+    self.volume().is_some()
+      && (self.mutates_shard_image()
+        // An attachment in the record form, and its detach by volume, are recorded on the volume's owner whatever
+        // host the client is on (§4.10, A-222). Every other form hands the client something of the owner's host (a
+        // mount, a device, a stream), so it is not forwarded and is refused from another host by its kind.
+        || matches!(
+          self,
+          RequestBody::Attach {
+            form: AttachRequest::Root,
+            ..
+          } | RequestBody::DetachOf { .. }
+        ))
   }
 
   /// Whether a node may forward this verb to another node, so its reply can take a location round and a forward
@@ -2145,6 +2184,9 @@ pub enum UnsupportedReason {
   /// WinFsp's user-mode library (`winfsp-x64.dll`) could not be loaded: WinFsp is not installed on this host. slates
   /// installs nothing (R10); WinFsp's own installer is the one privileged piece (§4.6). Appended.
   WinFspNotInstalled,
+  /// The volume's owner is another host, and this form hands the client something of the owner's host (a mount, a
+  /// device, a stream, a container bind); only the record form is served across hosts (§4.10, A-222). Appended.
+  OwnedByAnotherHost,
 }
 
 /// One transport's report (§4.6 A-9: "supported transport, target-path constraints, read/write policy,
@@ -2875,6 +2917,13 @@ pub enum Refusal {
     /// The writable maps held under the attachment.
     maps: u64,
   },
+  /// A client already holds as many attachments of other hosts' volumes as its node keeps for it (§4.10, A-222):
+  /// the node remembers each so its reap can end them at their owners, and that memory is bounded. Nothing was
+  /// attached. Appended.
+  RemoteAttachmentsFull {
+    /// The bound.
+    bound: u64,
+  },
   /// A verb named a CLI attachment whose term lapsed (§4.7, A-230): it ended then, its write lease with it, and is
   /// named here rather than as unknown, so a user who paused past the term learns why. Attach again. Appended.
   AttachmentExpired {
@@ -3439,6 +3488,50 @@ pub fn pack<M: Wire>(
   })
 }
 
+/// The framed body a bulk slot's `payload` names in `region`'s bulk area, copied out; a reference of the wrong size or
+/// outside the area is a typed refusal.
+fn bulk_body(region: &ClientRegion, payload: &[u8]) -> Result<Vec<u8>, IpcError> {
+  if payload.len() != BULK_REF_BYTES {
+    return Err(IpcError::BadSlot {
+      reason: "bulk reference of the wrong size",
+    });
+  }
+  let (offset, len) = payload
+    .split_at_checked(size_of::<u64>())
+    .unwrap_or_default();
+  let word = |bytes: &[u8]| {
+    usize::try_from(u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]))).unwrap_or(usize::MAX)
+  };
+  let (offset, len) = (word(offset), word(len));
+  if offset
+    .checked_add(len)
+    .is_none_or(|end| end > region.bulk_len())
+  {
+    return Err(IpcError::BadSlot {
+      reason: "bulk reference outside the area",
+    });
+  }
+  let mut body = vec![0u8; len];
+  region.read_bulk(offset, &mut body)?;
+  Ok(body)
+}
+
+/// A slot taken from a ring, its body owned: a bulk slot's body copied out of the bulk area and carried inline, as
+/// [`unpack`] reads an inline one, so the ring may release the slot (and with it the chunk) at once. Any other slot is
+/// returned as it is. Called by each end's take before it releases the slot (`Ring::peek`, `Ring::release`): the chunk
+/// is the next message's at that ring position, which the producer writes as soon as the slot is released, and a body
+/// read after that was the next message's (`a_request_taken_from_the_ring_keeps_its_bulk_body_when_the_client_sends_on`).
+pub fn owned(region: &ClientRegion, slot: Slot) -> Result<Slot, IpcError> {
+  if slot.kind != SlotKind::Bulk {
+    return Ok(slot);
+  }
+  Ok(Slot {
+    kind: SlotKind::Inline,
+    request: slot.request,
+    payload: bulk_body(region, &slot.payload)?,
+  })
+}
+
 /// Decodes the message a slot carries, inline or from the bulk chunk it names; a reference
 /// outside the bulk area is a typed refusal.
 pub fn unpack<M: Wire>(
@@ -3448,32 +3541,7 @@ pub fn unpack<M: Wire>(
 ) -> Result<M, IpcError> {
   match kind {
     SlotKind::Inline => unframe(payload),
-    SlotKind::Bulk => {
-      if payload.len() != BULK_REF_BYTES {
-        return Err(IpcError::BadSlot {
-          reason: "bulk reference of the wrong size",
-        });
-      }
-      let (offset, len) = payload
-        .split_at_checked(size_of::<u64>())
-        .unwrap_or_default();
-      let word = |bytes: &[u8]| {
-        usize::try_from(u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8])))
-          .unwrap_or(usize::MAX)
-      };
-      let (offset, len) = (word(offset), word(len));
-      if offset
-        .checked_add(len)
-        .is_none_or(|end| end > region.bulk_len())
-      {
-        return Err(IpcError::BadSlot {
-          reason: "bulk reference outside the area",
-        });
-      }
-      let mut body = vec![0u8; len];
-      region.read_bulk(offset, &mut body)?;
-      unframe(&body)
-    }
+    SlotKind::Bulk => unframe(&bulk_body(region, payload)?),
     SlotKind::Cancel | SlotKind::Heartbeat => Err(IpcError::BadSlot {
       reason: "not a message",
     }),

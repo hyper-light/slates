@@ -481,6 +481,7 @@ pub async fn request_within(
   deadline_ns: u64,
 ) -> (TimedReply, Endpoint) {
   let sent_ns = now_ns();
+  let before = endpoint.last_exchange();
   // A delivered reply is preferred over the deadline when both are ready; a deadline that cannot be armed
   // (off a shard) fails the exchange like a transport error, never as a timeout (AUD-29-39).
   let reply =
@@ -494,9 +495,7 @@ pub async fn request_within(
     // half-sent frames do not ride the next flush on this reused session and reach the peer folded into an
     // unrelated request (`docs/bugs/2026-09-10-abandoned-request-retransmit-lockstep.md`); the peer is told
     // to stop its reply (`StopSending`), and any late copy of it is dropped by the closed stream's tombstone.
-    if let Some(abandoned) = endpoint.last_exchange() {
-      endpoint.abandon(abandoned);
-    }
+    endpoint.abandon_begun_since(before);
   }
   // The round trip is measured only for an exchange the peer answered (Karn's rule): a reply that came
   // back is a sample of the path, however empty; a deadline or a transport error is not.

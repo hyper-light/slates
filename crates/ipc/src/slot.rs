@@ -342,12 +342,32 @@ impl Ring {
   /// when nothing is there. A hostile kind or length is a typed refusal and the slot is
   /// released anyway (a bad message never wedges the ring).
   pub fn pop(&self, object: &SharedObject, index: u64) -> Result<Option<Slot>, IpcError> {
+    let Some(peeked) = self.peek(object, index)? else {
+      return Ok(None);
+    };
+    self.release(object, index)?;
+    peeked.map(Some)
+  }
+
+  /// The consumer reads the slot at `index` without releasing it: `None` when nothing is there, else the slot or the
+  /// typed refusal of a hostile one. The producer cannot reuse the slot, or the bulk chunk its position names, until
+  /// [`Ring::release`]: a consumer copies a bulk body out first, since a released slot's chunk is the next message's at
+  /// that position (`protocol::chunk`), which a producer sending on writes at once.
+  pub fn peek(
+    &self,
+    object: &SharedObject,
+    index: u64,
+  ) -> Result<Option<Result<Slot, IpcError>>, IpcError> {
     if !self.can_pop(object, index)? {
       return Ok(None);
     }
     let mut body = [0u8; BODY_BYTES];
     object.read_span(self.ids(object)?.body, self.position(index), &mut body)?;
-    let decoded = decode_body(&body);
+    Ok(Some(decode_body(&body)))
+  }
+
+  /// Releases the slot at `index`, which [`Ring::peek`] read, back to the producer.
+  pub fn release(&self, object: &SharedObject, index: u64) -> Result<(), IpcError> {
     self.seq(object, index)?.store(
       index.wrapping_add(u64::try_from(self.slots).unwrap_or(0)),
       Ordering::Release,
@@ -355,7 +375,7 @@ impl Ring {
     self
       .head_hint(object)?
       .store(index.wrapping_add(1), Ordering::Release);
-    decoded.map(Some)
+    Ok(())
   }
 
   /// Messages the producer has published that the consumer has not taken, by the hints.

@@ -388,6 +388,16 @@ pub enum Consumer {
   /// the record's principal names. It ends with the device: the guest's hangup, a revocation, a detach, the
   /// volume's destroy, and the daemon's process (recovery ends it, as it ends a FUSE mount). Appended.
   Guest,
+  /// A client of another host, its attachment recorded on this owner (§4.10, A-222): `host` is the forwarding peer's
+  /// authenticated member id, never a claim of the request's. It ends with a detach routed by its volume, its host's
+  /// reap of `client` (`RemoteReap`), the host's retirement, and the volume's destroy; a silent holder's write lease
+  /// ends at its term (D-16). Appended.
+  Remote {
+    /// The member id of the client's host.
+    host: u64,
+    /// The client's id on that host.
+    client: u32,
+  },
   /// A CLI attachment (§4.7, A-230): one a process makes and exits, for later processes to name, so it outlives the
   /// client that made it. It holds a term, the failover SLO as the write lease's does, renewed by every verb that names
   /// it, and ends at the term's lapse: an abandoned one releases its volume's write lease within one term. Appended.
