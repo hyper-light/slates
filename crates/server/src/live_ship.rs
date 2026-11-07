@@ -3092,7 +3092,10 @@ mod tests {
         name: "v".to_owned(),
         size: slates_db::catalog::SizeClass::Bounded { limit: 1 << 20 },
         names: slates_db::catalog::NamePolicy::Exact,
-        owner: slates_db::catalog::Principal::Uid { uid: 501 },
+        owner: slates_db::catalog::Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 501,
+        },
         require_locked: false,
         access: Vec::new(),
         live_shipped: true,

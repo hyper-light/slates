@@ -11936,6 +11936,91 @@ mod tests {
   };
   use slates_db::register::RootConfiguration;
 
+  /// A volume owned by `owner`, sharing it with each of `access`.
+  fn volume_owned_by(
+    owner: Principal,
+    access: Vec<slates_db::catalog::AccessEntry>,
+  ) -> slates_db::catalog::VolumeRecord {
+    use slates_db::catalog::{
+      BaseRecord, NamePolicy, PolicyRecord, Role, SizeClass, SnapshotId, VolumeRecord, VolumeState,
+    };
+    VolumeRecord {
+      id: slates_db::catalog::VolumeId { bytes: [7; 16] },
+      name: "owned".to_owned(),
+      owner_shard: 0,
+      policy: PolicyRecord {
+        size: SizeClass::Dynamic { max: 0 },
+        names: NamePolicy::Exact,
+        require_locked: false,
+        role: Role::Plain,
+        live_shipped: false,
+        live_holders: None,
+      },
+      base: BaseRecord::Scratch,
+      head: SnapshotId::default(),
+      epoch: 0,
+      referenced_bytes: 0,
+      unique_bytes: 0,
+      state: VolumeState::Live,
+      lease: None,
+      owner,
+      access,
+      created_ns: 0,
+      catalog_version: 0,
+    }
+  }
+
+  /// A-237 (§4.13): Windows→Unix-root by rule. Every Windows channel is recorded as uid 0, Unix root's number. Do:
+  /// judge a volume owned by root on host A for root on A, for uid 0 forwarded from host B (a Windows user there, or
+  /// B's root) as `serve_forward` rescopes it by B's session, and for that principal again once A shares the volume
+  /// read-only with (B, uid 0). Expect: A's root owns it; B's uid 0 has no right at all; the share grants B's uid 0
+  /// read alone.
+  #[test]
+  fn uid_zero_on_another_host_is_not_this_hosts_root() {
+    use slates_db::catalog::{AccessEntry, Rights};
+    let host_a = slates_db::HostId(0xA);
+    let host_b = slates_db::HostId(0xB);
+    let root_on_a = Principal::Uid {
+      host: host_a,
+      uid: 0,
+    };
+    // The origin's request names its own host; the session's anchor replaces it (`Principal::rehosted`).
+    let zero_from_b = Principal::Uid {
+      host: host_a,
+      uid: 0,
+    }
+    .rehosted(host_b);
+    let read_only = Rights {
+      read: true,
+      write: false,
+      admin: false,
+    };
+    let all = Rights {
+      read: true,
+      write: true,
+      admin: true,
+    };
+    let unshared = volume_owned_by(root_on_a.clone(), Vec::new());
+    let shared = volume_owned_by(
+      root_on_a.clone(),
+      vec![AccessEntry {
+        principal: Principal::Uid {
+          host: host_b,
+          uid: 0,
+        },
+        rights: read_only,
+      }],
+    );
+    assert_eq!(
+      (
+        super::rights_of(&unshared, &root_on_a),
+        super::rights_of(&unshared, &zero_from_b),
+        super::rights_of(&shared, &zero_from_b),
+      ),
+      (all, Rights::default(), read_only)
+    );
+  }
+
   /// A page reply of `len` bytes of `fill`, at `stamp`, of a file `total` long.
   fn page(fill: u8, len: usize, (stamp, total): (u64, u64)) -> ReplyBody {
     ReplyBody::ReadPage {
@@ -12653,7 +12738,10 @@ mod tests {
     name: &str,
     hold_floor: bool,
   ) -> super::DbVolumeId {
-    let owner = Principal::Uid { uid: 1234 };
+    let owner = Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 1234,
+    };
     let super::ReplyBody::GreenCreated { id } = super::dispatch(
       state,
       1,
