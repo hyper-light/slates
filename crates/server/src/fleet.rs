@@ -6584,7 +6584,62 @@ async fn run_record_plane(local: HostId) {
     // the share once done (§4.8 "Promotion and takeover"; the takeover module). The holds and the rounds are
     // this node's (they arrive over this shard's sessions), so this runs here.
     adopt_and_serve(origin, local, budget, &mut in_flight).await;
-    crate::daemon::pace(HEARTBEAT_NS).await;
+    pace_running_merges(
+      origin,
+      &shards,
+      local,
+      budget,
+      &mut owner_acceptor,
+      &mut in_flight,
+    )
+    .await;
+  }
+}
+
+/// Waits out the coordinator's period ([`HEARTBEAT_NS`]), running the merge record plane at once each time an owner
+/// shard nudges it (§4.16 "Commit"; `merge_service::nudge_record_plane`): a version enqueued, or an input or record of
+/// one newly acknowledged. A submit at `f > 0` is answered when its record commits, so its answer waits for the
+/// exchange rather than the period; the council, the root, the seals and the heads keep the period. The merge plane
+/// runs here, on the coordinator, because the owner's acceptor and the holders' sessions are the coordinator's.
+/// Before, each version's inputs were put at one period and its record shipped at the next: one submit at a time on an
+/// idle three-node fleet at `f = 1` took 208 to 647 ms (2026-11-06, the bug record of that day, "a submit at f = 1
+/// waited for the coordinator's period").
+async fn pace_running_merges(
+  origin: u16,
+  shards: &[u16],
+  local: HostId,
+  budget: CommitBudget,
+  owner_acceptor: &mut Acceptor,
+  in_flight: &mut Vec<Dispatch>,
+) {
+  let period_ends = slates_rt::futures::now_ns().saturating_add(HEARTBEAT_NS);
+  loop {
+    let remaining = period_ends.saturating_sub(slates_rt::futures::now_ns());
+    if remaining == 0 {
+      return;
+    }
+    match slates_rt::futures::within(remaining, crate::merge_service::nudged()).await {
+      Ok(Some(())) => {
+        in_flight.retain_mut(|dispatch| !dispatch.settle());
+        for shard in shards.iter().copied() {
+          crate::merge_service::run_merge_period(
+            origin,
+            shard,
+            local,
+            budget,
+            owner_acceptor,
+            in_flight,
+          )
+          .await;
+        }
+      }
+      Ok(None) => return,
+      // The timer refused: the period's own pace counts and reports it, and the loop stops there as before.
+      Err(_) => {
+        crate::daemon::pace(remaining).await;
+        return;
+      }
+    }
   }
 }
 

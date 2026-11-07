@@ -11311,6 +11311,132 @@ fn a_submit_made_while_the_council_forms_is_answered_once_its_record_commits() {
   );
 }
 
+/// §4.16 "Commit" (AUD-11) at the speed of the exchange, not the coordinator's period (goal 4's Linux rungs,
+/// 2026-11-06: at 1,000 clients against three servers at `f = 1` every accepted submit was answered `Overloaded`, its
+/// version committed, and one submit at a time took 159 to 670 ms on an idle fleet). A version's inputs were put at one
+/// coordinator period and its record shipped at the next, so every answer waited out at least one period. Do: on a
+/// settled three-node fleet at `f = 1`, submit twenty works over one green one after another, timing each submit. Expect
+/// every submit accepted, each as the next version, and the median answered within one coordinator period
+/// ([`HEARTBEAT_NS`]): an accepted version wakes the record plane, which ships it as soon as its inputs place.
+#[test]
+fn a_submit_at_f1_is_answered_without_waiting_for_the_coordinators_period() {
+  /// Shape: submits timed, one after another; enough for the median to be one submit's answer, not a lucky one.
+  const SUBMITS: u64 = 20;
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<_> = names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<_> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<_> = nodes
+    .iter()
+    .map(|(_, _, identity)| identity.certificate())
+    .collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 1);
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("create green");
+  };
+  let answers = timed_submits(&mut client, green, SUBMITS);
+  let counters = merge_and_content_counters(&daemons);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  for (index, edited, submitted, _) in &answers {
+    assert!(
+      matches!(edited, ReplyBody::Edited),
+      "edit {index} was declared: {edited:?}"
+    );
+    assert_eq!(
+      *submitted,
+      ReplyBody::Submitted {
+        version: Some(index + 1),
+        conflicts: Vec::new(),
+      },
+      "submit {index} is accepted as the next version"
+    );
+  }
+  let mut waits: Vec<Duration> = answers.iter().map(|(_, _, _, waited)| *waited).collect();
+  waits.sort();
+  let median = waits.get(waits.len() / 2).copied().unwrap_or(Duration::MAX);
+  eprintln!(
+    "submit answers at f = 1: median {median:?}, every answer {waits:?}; counters {counters:?}"
+  );
+  let unheld: u64 = counters
+    .iter()
+    .flatten()
+    .filter(|(name, _)| name == "merge.inputs_unheld")
+    .map(|(_, count)| count)
+    .sum();
+  assert_eq!(
+    unheld, 0,
+    "no holder refused a record for want of inputs it was counted holding: {counters:?}"
+  );
+  assert!(
+    median < Duration::from_nanos(HEARTBEAT_NS),
+    "the median submit is answered within one coordinator period ({} ms): median {median:?}, every answer {waits:?}",
+    HEARTBEAT_NS / 1_000_000
+  );
+}
+
+/// `count` works over `green`, each with one edit declared and then submitted, one after another: each work's index,
+/// its edit's reply, its submit's reply and how long the submit took to answer.
+fn timed_submits(
+  client: &mut Client,
+  green: VolumeId,
+  count: u64,
+) -> Vec<(u64, ReplyBody, ReplyBody, Duration)> {
+  let mut answers = Vec::new();
+  for index in 0..count {
+    let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
+      green,
+      name: format!("work-{index}"),
+    }) else {
+      panic!("create work {index}");
+    };
+    let edited = client.call(&RequestBody::Edit {
+      work,
+      path: format!("file-{index}"),
+      at: 0,
+      delete_len: 0,
+      bytes: b"hello".to_vec(),
+    });
+    let started = Instant::now();
+    let submitted = client.call(&RequestBody::Submit {
+      work,
+      evidence: Vec::new(),
+    });
+    answers.push((index, edited, submitted, started.elapsed()));
+  }
+  answers
+}
+
+/// Each node's merge and content-exchange counters. A holder refuses a record for want of inputs it was counted
+/// holding only if a later version's put made it let them go.
+fn merge_and_content_counters(daemons: &[Daemon]) -> Vec<Vec<(String, u64)>> {
+  daemons
+    .iter()
+    .map(|daemon| {
+      daemon
+        .fleet_refusals()
+        .map(|counters| {
+          counters
+            .into_iter()
+            .filter(|(name, _)| name.starts_with("merge.") || name.starts_with("fleet.content."))
+            .map(|(name, count)| (name.to_owned(), count))
+            .collect()
+        })
+        .unwrap_or_default()
+    })
+    .collect()
+}
+
 /// A green, a work over it with one edit declared, and the submit request that would advance it.
 fn edited_work_to_submit(client: &mut Client) -> (VolumeId, RequestBody) {
   let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
