@@ -1438,36 +1438,6 @@ fn exchange_budget(
   )
 }
 
-/// The budget one message to one holder gets: the liveness budget a reply gets, plus the time its bytes take at the
-/// session's window-limited rate. Derived: `bytes × smoothed RTT / congestion window` (one window a round trip, the
-/// slowest a sender in congestion avoidance moves), so an install of the whole volume is given its transfer and an
-/// entry, a few kilobytes, about nothing more. Under the liveness budget alone an install of 1.5 MB never finished
-/// over a session a partition had left at an initial window and a 100–240 ms smoothed RTT: each was cut off, its link
-/// dropped and dialed afresh, at an initial window again, and the whole volume sent again, 1,391 times (2.06 GB) while
-/// both candidates already held the owner's head, and no write became durable (2026-11-06, `live_chaos.rs`).
-fn exchange_budget(
-  bytes: usize,
-  sessions: &[(HostId, slates_transport::endpoint::Endpoint)],
-) -> slates_cluster::CommitBudget {
-  let live = crate::fleet::live_budget();
-  let transfer_ns = sessions.first().map_or(0, |(_, endpoint)| {
-    // Before any sample the smoothed RTT reads zero; the probe timeout, twice the initial RTT then, stands in.
-    let round_trip = match endpoint.smoothed_rtt() {
-      0 => endpoint.pto(),
-      measured => measured,
-    };
-    u64::try_from(bytes)
-      .unwrap_or(u64::MAX)
-      .saturating_mul(round_trip)
-      .checked_div(endpoint.congestion_window().max(1))
-      .unwrap_or(0)
-  });
-  slates_cluster::CommitBudget::hard(
-    live.deadline_ns.saturating_add(transfer_ns),
-    live.poll_interval_ns,
-  )
-}
-
 /// Borrows `holder`'s record session, waiting for it while another dispatch has it out, one timer tick at a time,
 /// within `deadline_ns`: empty when it never came back (counted, and the period re-ships). Dropped at the first miss, a
 /// write's message waited for whichever later dispatch carried it, at worst the next record period: two in three sends of
