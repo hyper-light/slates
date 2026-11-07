@@ -60,13 +60,12 @@ fn daemon(name: &str) -> (Daemon, String) {
   (daemon, instance)
 }
 
-/// The shard that serves `client_id`, asked of each shard.
+/// The shard that serves `client_id`, asked of each shard until one has taken the client: a client's connect returns
+/// before its shard has moved the ring end in, which on a busy machine is a while (CI's busy round, 2026-11-07).
 fn serving(daemon: &Daemon, client_id: u32) -> ShardId {
-  daemon
-    .shards()
-    .iter()
-    .copied()
-    .find(|shard| {
+  let started = Instant::now();
+  loop {
+    let found = daemon.shards().iter().copied().find(|shard| {
       daemon
         .observation(
           Some(*shard),
@@ -81,8 +80,16 @@ fn serving(daemon: &Daemon, client_id: u32) -> ShardId {
         .unwrap()
         .wait()
         .unwrap()
-    })
-    .expect("a shard serves the client")
+    });
+    if let Some(shard) = found {
+      return shard;
+    }
+    assert!(
+      started.elapsed() < WINDOW * 20,
+      "a shard took client {client_id}"
+    );
+    std::thread::yield_now();
+  }
 }
 
 /// A client of `instance` whose reply deadline is [`REPLY_WAIT_NS`], retrying the rendezvous while the daemon starts.
@@ -375,5 +382,176 @@ fn an_attest_whose_record_shard_is_starved_is_attested_past_a_wall_window() {
   );
   drop(workload);
   drop(owner);
+  daemon.stop();
+}
+
+/// Format: `NFS4ERR_DELAY` and `NFS4ERR_BAD_STATEID` (RFC 7863 `nfsstat4`).
+#[cfg(unix)]
+const NFS4ERR_DELAY: u32 = 10008;
+#[cfg(unix)]
+const NFS4ERR_BAD_STATEID: u32 = 10025;
+/// Format: the bytes of a state id's counter, before its owner's partition (`slates_bridge_nfs::v4::files::owner_of`).
+#[cfg(unix)]
+const STATEID_COUNTER_BYTES: usize = 6;
+/// Format: the daemon's counter of NFSv4 state calls sent to another shard.
+#[cfg(unix)]
+const STATE_FORWARDED: &str = "nfs4.state.forwarded";
+
+/// FREE_STATEID of a state id no owner minted, naming partition `owner` (RFC 8881 §18.38): the owner's answer, or the
+/// first failing status, and how long it took.
+#[cfg(unix)]
+fn free_stateid(
+  session: &mut common::nfs4::Session,
+  capability: &str,
+  owner: u16,
+) -> (Result<Vec<u8>, u32>, Duration) {
+  let mut other = [0u8; 12];
+  other[STATEID_COUNTER_BYTES..STATEID_COUNTER_BYTES + 2].copy_from_slice(&owner.to_be_bytes());
+  let started = Instant::now();
+  let answer = session.at(capability, &[], |args| {
+    args.u32(slates_bridge_nfs::v4::compound::op::FREE_STATEID);
+    args.u32(0);
+    args.fixed(&other);
+  });
+  (answer, started.elapsed())
+}
+
+/// The daemon's count of NFSv4 state calls sent to another shard.
+#[cfg(unix)]
+fn forwarded(daemon: &Daemon) -> u64 {
+  daemon
+    .refusals_on_every_shard()
+    .unwrap()
+    .get(STATE_FORWARDED)
+    .copied()
+    .unwrap_or(0)
+}
+
+/// R3 class A, the NFS bridge (`nfs.rs`: the v4 front end's `call_owner`, and `send_note`), A-65, §4.3, §4.6. Unix: the
+/// test's NFSv4 client is. Do: over an NFSv4.1 session, free a state id naming the partition of the shard that does
+/// not serve the compound (learned from the forwarded-call counter), while that shard runs one starved poll for a
+/// window and a half. Expect: the owner's own answer, `NFS4ERR_BAD_STATEID` (no owner minted it), after more than a
+/// wall window. On main the call gave up at the wall second and the client was told `NFS4ERR_DELAY`, the owner's answer
+/// lost.
+#[cfg(unix)]
+#[test]
+fn an_nfs_state_call_to_a_starved_owner_hears_its_answer_past_a_wall_window() {
+  static BEGUN: AtomicBool = AtomicBool::new(false);
+  let (daemon, instance) = daemon("nfs-starved");
+  daemon.bootstrap(true).unwrap();
+  let mut client = connect(&instance);
+  client.create(&common::client::scratch("state")).unwrap();
+  let capability = daemon.mount_capability("state").unwrap().unwrap();
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut session = common::nfs4::Session::open(port, b"xwait-nfs");
+  // The partition whose state call is forwarded: the other shard than the one serving this session's compounds.
+  let before = forwarded(&daemon);
+  let (probe, _) = free_stateid(&mut session, &capability, 1);
+  assert_eq!(
+    probe.map(|_| ()),
+    Err(NFS4ERR_BAD_STATEID),
+    "the probe was answered"
+  );
+  let owner: u16 = if forwarded(&daemon) > before { 1 } else { 0 };
+  let before = forwarded(&daemon);
+  let holding = hold(
+    &daemon,
+    daemon.shards()[usize::from(owner)],
+    Held::Starved,
+    &BEGUN,
+  );
+  let (answer, took) = free_stateid(&mut session, &capability, owner);
+  holding.join().unwrap();
+  let answer = answer.map(|_| ());
+  println!("an NFS state call to a starved owner: {answer:?} after {took:?}");
+  assert!(
+    forwarded(&daemon) > before,
+    "the call went to the other shard, so the test is not vacuous"
+  );
+  assert!(
+    took > WINDOW,
+    "the answer came past a wall window ({took:?}), so the test is not vacuous"
+  );
+  assert_ne!(
+    answer,
+    Err(NFS4ERR_DELAY),
+    "a starved owner's answer was lost after {took:?}"
+  );
+  assert_eq!(
+    answer,
+    Err(NFS4ERR_BAD_STATEID),
+    "the owner's own answer came back"
+  );
+  drop(session);
+  drop(client);
+  daemon.stop();
+}
+
+/// Format: NFSv3 `READDIRPLUS` (RFC 1813) and the RPC accept status `SUCCESS` (RFC 5531 §9).
+const NFSPROC3_READDIRPLUS: u32 = 17;
+const RPC_SUCCESS: u32 = 0;
+/// Shape: the listing's `dircount` and `maxcount`: a page, far more than one volume's entry needs.
+const LISTING_DIRCOUNT: u32 = 512;
+const LISTING_MAXCOUNT: u32 = 8192;
+/// Shape: the volumes created while looking for one the control shard owns; with two shards a run that finds none in
+/// this many is a fault of the placement, not luck.
+const VOLUME_TRIES: usize = 48;
+
+/// R3 class A, the NFS bridge (`nfs.rs` `gather_entries`, the host root's listing gathered from every shard), A-65,
+/// §4.3, §4.6. Do: create a volume the control shard owns, mount the host root scoped to its capability over NFSv3 (the
+/// connection stays on the control shard, where it was accepted), and list the root while the other shard runs one
+/// starved poll for a window and a half. Expect: the listing succeeds, naming the volume, after more than a wall
+/// window. On main the gather gave up on the starved shard at the wall second and the listing failed.
+#[test]
+fn a_host_root_listing_with_a_starved_shard_lists_past_a_wall_window() {
+  static BEGUN: AtomicBool = AtomicBool::new(false);
+  let (daemon, instance) = daemon("nfs-listing");
+  daemon.bootstrap(true).unwrap();
+  let mut client = connect(&instance);
+  let name = (0..VOLUME_TRIES)
+    .map(|attempt| format!("listed-{attempt}"))
+    .find(|name| {
+      let id = client.create(&common::client::scratch(name)).unwrap();
+      slates_server::verbs::owner_of(id) == 0
+    })
+    .expect("a volume the control shard owns");
+  let path = daemon.mount_capability(&name).unwrap().unwrap();
+  let (_, capability) = path.rsplit_once('@').expect("a capability path");
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = common::nfs::mount(&mut stream, &format!("/@{capability}"), 1);
+  let holding = hold(&daemon, daemon.shards()[1], Held::Starved, &BEGUN);
+  let mut args = Vec::new();
+  common::nfs::opaque(&root, &mut args);
+  args.extend_from_slice(&0u64.to_be_bytes()); // cookie
+  args.extend_from_slice(&[0u8; 8]); // cookieverf
+  args.extend_from_slice(&LISTING_DIRCOUNT.to_be_bytes());
+  args.extend_from_slice(&LISTING_MAXCOUNT.to_be_bytes());
+  let started = Instant::now();
+  let accepted = common::nfs::call_accept_status(
+    &mut stream,
+    common::nfs::NFS_PROGRAM,
+    NFSPROC3_READDIRPLUS,
+    &args,
+    2,
+  );
+  let took = started.elapsed();
+  holding.join().unwrap();
+  println!("a host root listing with a starved shard: accept status {accepted} after {took:?}");
+  assert!(
+    took > WINDOW,
+    "the answer came past a wall window ({took:?}), so the test is not vacuous"
+  );
+  assert_eq!(
+    accepted, RPC_SUCCESS,
+    "a starved shard's part of the listing was lost after {took:?} (accept status {accepted})"
+  );
+  assert_eq!(
+    common::nfs::readdirplus(&mut stream, &root, 3),
+    vec![name],
+    "the listing names the volume"
+  );
+  drop(stream);
+  drop(client);
   daemon.stop();
 }

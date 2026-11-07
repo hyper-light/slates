@@ -45,7 +45,17 @@ machine scheduled the target thread, not whether the target was working.
     unconverted code a revoke with the other shard starved was refused `NotFound` after 1.003 s and an attestation
     with its record's shard starved after 1.075 s; with the change they answered `Revoked` after 1.57–1.71 s and
     `Attested` after 1.61–1.80 s over three runs, and a revoke with the other shard wedged is still refused after
-    1.01–1.09 s.
+    1.01–1.09 s. CI diag run of `diag-clients-r3a-2` (2026-11-07 UTC): revoke green on the four Linux and Windows
+    runners and attest on both Linux runners (it is Unix-only), quiet and busy, 1.50–1.59 s; red on each over main's
+    sources (1.000–1.012 s). One busy round on ubuntu x86_64 failed in the test's own helper: it asked which shard
+    served a client its connect had just returned, before the shard had taken the client's ring. The helper now asks
+    again until a shard has, within twenty windows.
+  - **The NFS bridge** (`nfs.rs`: `serve_remote`, a call served on its volume's shard; `gather_entries`, the host
+    root's listing from every shard, which had one wall second for them all; `send_note`; and the v4 front end's and
+    its v3 backend's `call_owner`, a state call at the state id's owner). Measured (same host, load 52–66): over the
+    unconverted code a host-root listing with the other shard starved was refused `SYSTEM_ERR` after 1.262 s, and an
+    NFSv4 `FREE_STATEID` at a starved owner was answered `NFS4ERR_DELAY` after 1.296 s; with the change the listing
+    succeeded after 1.59–1.80 s and the owner's own `NFS4ERR_BAD_STATEID` came back after 1.52–1.58 s, over three runs.
 
 ## Tests
 
@@ -55,6 +65,10 @@ machine scheduled the target thread, not whether the target was working.
 - `a_revoke_with_a_starved_shard_is_revoked_past_a_wall_window`, `an_attest_whose_record_shard_is_starved_is_attested_past_a_wall_window`
   (Unix: an attestation binds only a uid principal): red on main, green with the fix.
 - `a_revoke_with_a_wedged_shard_is_refused_after_a_window`: the guard, green on both.
+- `a_host_root_listing_with_a_starved_shard_lists_past_a_wall_window` (NFSv3, every platform) and
+  `an_nfs_state_call_to_a_starved_owner_hears_its_answer_past_a_wall_window` (NFSv4, Unix: the test's v4 client is):
+  red on main, green with the fix. The v4 test learns which shard serves its compounds from the daemon's
+  `nfs4.state.forwarded` count, and asserts the count moved, so its call did cross shards.
 
 All use a client whose reply deadline is ten windows, so they measure the daemon's wait and not the client's. The
 client's own deadline is the liveness window too; deriving that window is A-232 (classes C and D).
@@ -62,10 +76,10 @@ client's own deadline is the liveness window too; deriving that window is A-232 
 ## Siblings
 
 Still waiting on the wall second, each its own commit: the forwarded verbs (`verbs.rs` `serve_forward`,
-`await_deferred_completion`), the NFS bridge's calls (`nfs.rs`), the
-direct map's delivery (`direct_map.rs`) and a peer's remote reap (`remote_attach.rs` `serve_unforwardable`). The
-delegation's recall (`delegation.rs`, `callback::call_on_slot`) also waits a liveness budget, but on the NFS client
-across the network, not on a shard: that is class B (the transport's round-trip estimate).
+`await_deferred_completion`), the direct map's delivery (`direct_map.rs`) and a peer's remote reap (`remote_attach.rs`
+`serve_unforwardable`). The delegation's recall and the back channel's probe (`delegation.rs`, `nfs.rs`
+`probe_back_channel`, both through `callback::call_on_slot`) also wait a liveness budget, but on the NFS client across
+the network, not on a shard: that is class B (the transport's round-trip estimate).
 
 Found on the way, not changed here:
 
