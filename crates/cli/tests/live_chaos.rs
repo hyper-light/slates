@@ -1285,6 +1285,15 @@ fn judge_healed(
   verdict.note(format!("{} samples, {heads} heads seen", samples.len()));
   verdict.check("Agreement", disagreements);
   verdict.check("NoLoss", no_loss(owner, volume, outcomes));
+  // Each node's refusals of the owner's messages by why, passing or not: a candidate refusing every entry for want of
+  // the volume's catalog (`no_catalog`) was much of an install storm that a passing flow hid (live-durability,
+  // 2026-11-06).
+  for instance in std::iter::once(owner).chain(candidates.iter().map(String::as_str)) {
+    verdict.note(format!(
+      "{instance} refused the owner: {:?}",
+      counters(instance, "fleet.live.hold_refused.")
+    ));
+  }
 }
 
 /// A-200 with candidates partitioned in turn mid-stream: do stream writes to a live volume and stop each candidate's
