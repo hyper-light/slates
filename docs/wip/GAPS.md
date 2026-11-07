@@ -88,6 +88,12 @@
 >   - a stated offered load per client for the 1 ms bound. At zero think time, 100k clients at 1 ms is 10⁸
 >     operations a second.
 >
+>   The 10,000-client rung (same Studio, load 9.8 to 10.9, 313 connections) did not finish within its 30-minute bound.
+>   After 1,775 s about 2,170 of 10,000 clients were done and about 11,600 submits counted, with daemon RSS 17.6 GB.
+>   At the 1,000-client rate the rung's roughly 950k operations take under two minutes, so a submit costs far more at
+>   this scale; the green's history and the rebases are the suspects, not yet measured. Its percentiles are lost: the
+>   harness prints them at the level's end, and the bound killed it. The Studio's runner then went offline.
+>
 > The topology launcher is `crates/cli/tests/load_scale.rs`. It runs one primary and two replica server nodes in
 > region 0 at `f = 1`, and client nodes in region 1, so the client nodes are never the green's holders. One harness
 > drives every client node (`--instance a,b,…`), so one oracle judges every submit. It is portable (`ps`, `pgrep`),
