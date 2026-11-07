@@ -5868,7 +5868,27 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   stopped a `COMMIT` answers `NFS4ERR_DELAY` after 1.0008–1.0024 s (3 of 3); red-checked with the wait removed, it
 >   and a `FILE_SYNC` write answered `NFS4_OK` in 285 and 349 µs. Once the candidates' confirmations lapse, the
 >   owner's lease fence (AUD-29-83) answers every call `NFS4ERR_DELAY` at once until a heartbeat after they resume.
-> Owed in this sweep: virtio-fs and vhost-user `FSYNC`, WinFsp's flush.
+> - *A virtio-fs or vhost-user guest's `FSYNC`* (`slates_bridge_virtiofs`'s device holds it, the guest's later chains
+>   served meanwhile; `BridgeAccess::durable_owed`/`durability`/`durable`): through `slates vhost-user` with a stand-in
+>   VMM on CI's Linux runners, answered `0` in 368–679 µs with both candidates stopped (red, x86_64 and arm64); now `EIO`
+>   after 1.0006–1.0017 s, 8 of 8 on each lane, and once in 3 more on x86_64 answered `0` after 1.000358 s, unexplained
+>   (that run printed no log line; the flow now prints the log and the hold's counters at that point and requires the
+>   hold's refusal). The device's own tests hold both legs on every Unix host: never durable, `EIO` at the bound with a
+>   later read published first; durable, `0` at once.
+> - *A WinFsp flush* (`FlushFileBuffers` of a handle, held on the mount, `STATUS_UNEXPECTED_IO_ERROR` past the budget),
+>   and a *volume* flush, which answered success on WinFsp's thread with no publication at all, now publishes and waits
+>   the same way. Three anchored fleet nodes on CI's `windows-latest` (`crates/cli/tests/live_winfsp.rs`): red, the
+>   flush succeeded in 995 µs with both candidates suspended; fixed, error 1117 after 1.0010–1.0283 s (3 of 3), success
+>   after the resume. Forming that fleet found a Windows defect in the runtime: a UDP socket reported a
+>   port-unreachable an earlier send drew as `WSAECONNRESET` on its next `recvfrom`, which ended a fleet serve socket's
+>   receive loop at its first probe of a peer still starting (3 of 4 starts never formed). Datagram sockets are now
+>   made with `SIO_UDP_CONNRESET` off (`crates/rt/src/netsys.rs`, red then green on the runner).
+> - *Landings* need no wait: a landing claims what it wrote to disk, which holds it; a takeover that loses the volume's
+>   undurable tail serves the disk's bytes through the base, and a later landing that would revert the disk is refused
+>   by the witness check.
+> Open, found on the way: on Windows, a candidate's anchor kills a daemon suspended past the liveness budget and starts
+> a successor under a fresh identity, after which the owner's mount stayed fenced and the fleet did not re-form within
+> 40 minutes (CI, 1 run); the flow now suspends each anchor with its daemon.
 
 > **Phase one with a candidate that holds no copy (2026-11-05).** Every candidate's report counts toward `f + 1`, an empty
 > one too, and every reporter raises its fence to the takeover's epoch, an empty one too: a candidate with no copy makes

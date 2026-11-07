@@ -584,8 +584,11 @@
 > answered at durability since 2026-11-05 (`EIO` past the liveness budget; §4.10 status "FUSE `fsync` at durability"). So are a Shards
 > stream's `FSYNC` (`EIO` after 1.001–1.003 s with both candidates stopped, where it answered `0` in 337 µs), a writable
 > map's `MapSync` and a checkout into a live base (each answered with nothing durable before; now they wait as a verb
-> does); NFSv4 shares the v3 wait (§4.10 status "Every other durability claim"). Open in that sweep: virtio-fs and
-> vhost-user `FSYNC`, WinFsp's flush.
+> does); NFSv4 shares the v3 wait; a virtio-fs or vhost-user `FSYNC` (`EIO` after 1.0006–1.0017 s, where it
+> answered `0` in under 1 ms) and a WinFsp flush (error after 1.001–1.028 s, where it succeeded in 995 µs; a volume
+> flush now publishes at all) wait too (§4.10 status "Every other durability claim"). Open: one x86_64 virtio-fs run of
+> 19 answered `0` after the budget, unexplained; a Windows fleet did not re-form after an anchor succeeded a suspended
+> candidate.
 > Measured in the daemon (release, BENCHMARKS "What live shipping adds to a stable NFS write"): a live 4 KiB `FILE_SYNC`
 > write costs 90–114 µs more than a plain one at the median, p99 217–398 µs, p999 0.44–1.27 ms, worst 0.47–1.87 ms at
 > load 8–30 (2026-11-05). The rare 100 ms tail is explained and removed (two waits for the record period; and a
