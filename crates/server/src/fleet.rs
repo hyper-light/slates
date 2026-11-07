@@ -7024,7 +7024,13 @@ async fn ship_head(
   let holders = take_sessions("fleet.lent_to.ship_head", |host| {
     head.shape.candidates.contains(&host) && !head.acked.contains(&host)
   });
+  let catalog = head.object.is_catalog();
   if holders.is_empty() {
+    count_refusal(if catalog {
+      SHIP_CATALOG_NO_SESSION
+    } else {
+      SHIP_HEAD_NO_SESSION
+    });
     return None; // No live session to a candidate that still needs the head; retry next period.
   }
   let taken: Vec<HostId> = holders.iter().map(|(host, _)| *host).collect();
@@ -7050,6 +7056,7 @@ async fn ship_head(
       }
     });
   }
+  count_refusal(ship_outcome_counter(catalog, &committed.outcome, head.quorum));
   let dispatch = Dispatch::new(
     taken,
     &committed.reusable,
@@ -7073,6 +7080,46 @@ async fn ship_head(
   });
   Some(dispatch)
 }
+
+/// The counter naming one head or catalog commit's outcome: placed at `f + 1`, acknowledged short of it, uncertain, or
+/// refused before anything was dispatched.
+fn ship_outcome_counter(
+  catalog: bool,
+  outcome: &Result<Placement, ClusterError>,
+  quorum: Quorum,
+) -> &'static str {
+  match (catalog, outcome) {
+    (true, Ok(placement)) if placement.placed(quorum) => SHIP_CATALOG_PLACED,
+    (false, Ok(placement)) if placement.placed(quorum) => SHIP_HEAD_PLACED,
+    (true, Ok(_) | Err(ClusterError::NotPlaced { .. })) => SHIP_CATALOG_SHORT,
+    (false, Ok(_) | Err(ClusterError::NotPlaced { .. })) => SHIP_HEAD_SHORT,
+    (true, Err(ClusterError::Uncertain { .. })) => SHIP_CATALOG_UNCERTAIN,
+    (false, Err(ClusterError::Uncertain { .. })) => SHIP_HEAD_UNCERTAIN,
+    (true, Err(_)) => SHIP_CATALOG_FAILED,
+    (false, Err(_)) => SHIP_HEAD_FAILED,
+  }
+}
+
+/// Counter: a volume's head (or tombstone) committed at `f + 1` by one ship.
+const SHIP_HEAD_PLACED: &str = "fleet.ship.head.placed";
+/// Counter: a head ship acknowledged by fewer than `f + 1` candidates.
+const SHIP_HEAD_SHORT: &str = "fleet.ship.head.short";
+/// Counter: a head ship whose outcome is uncertain (the dispatch's budget ran out).
+const SHIP_HEAD_UNCERTAIN: &str = "fleet.ship.head.uncertain";
+/// Counter: a head ship refused by the runtime before anything was dispatched.
+const SHIP_HEAD_FAILED: &str = "fleet.ship.head.failed";
+/// Counter: a head owed to candidates none of which had a session to ride.
+const SHIP_HEAD_NO_SESSION: &str = "fleet.ship.head.no_session";
+/// Counter: a volume's catalog record committed at `f + 1` by one ship.
+const SHIP_CATALOG_PLACED: &str = "fleet.ship.catalog.placed";
+/// Counter: a catalog ship acknowledged by fewer than `f + 1` candidates.
+const SHIP_CATALOG_SHORT: &str = "fleet.ship.catalog.short";
+/// Counter: a catalog ship whose outcome is uncertain.
+const SHIP_CATALOG_UNCERTAIN: &str = "fleet.ship.catalog.uncertain";
+/// Counter: a catalog ship refused by the runtime before anything was dispatched.
+const SHIP_CATALOG_FAILED: &str = "fleet.ship.catalog.failed";
+/// Counter: a catalog owed to candidates none of which had a session to ride.
+const SHIP_CATALOG_NO_SESSION: &str = "fleet.ship.catalog.no_session";
 
 /// Merges an acknowledging set into the object's recorded placement at `sequence` — never overwriting it
 /// within a sequence: the union of every round's acknowledgements is the true region placement, since each
