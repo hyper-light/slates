@@ -38,3 +38,7 @@ shard 0 refused fleet.plane.peer_reconnected: 3
 thread 'a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet' (53947) panicked at crates/cli/tests/live_chaos.rs:2593:7:
 the fleet re-formed after the successor: [Some(("8037076695113518549", 3, 2)), Some(("12736259248236858666", 3, 1)), Some(("3057700664692240063", 3, 2))]
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 16 filtered out; finished in 51.94s
+=== rejoin-6 exit 0 load { 14.25 15.98 13.36 }
+rejoins: successor daemon 29570 answered after 55.84875ms
+rejoins: the fleet re-formed after 1.514887958s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 16 filtered out; finished in 47.92s
