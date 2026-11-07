@@ -1,0 +1,5 @@
+tree cc86b4e748b59eb4dfc6a79b9caaf2686fbb966c 2026-11-07T19:19:54Z
+3
+ProductName:		macOS
+ProductVersion:		26.7.2
+BuildVersion:		25G332

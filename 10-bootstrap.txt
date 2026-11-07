@@ -1,0 +1,11 @@
+=== rejoin-1 exit 101 load { 16.75 16.67 12.78 }
+rejoins: successor daemon 18673 answered after 40.113333ms
+rejoins --- chaos-rejoins-a-18448
+shard 0 refused fleet.plane.peer_reconnected: 3
+shard 0 refused fleet.plane.peer_redialed: 1
+rejoins --- chaos-rejoins-b-18448
+rejoins --- chaos-rejoins-c-18448
+shard 0 refused fleet.plane.peer_reconnected: 4
+thread 'a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet' (42327) panicked at crates/cli/tests/live_chaos.rs:2593:7:
+the fleet re-formed after the successor: [Some(("6815637750919949134", 2, 1)), Some(("10776561280911943196", 1, 0)), Some(("4577389318175879068", 2, 1))]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 16 filtered out; finished in 47.39s
