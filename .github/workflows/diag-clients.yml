@@ -1,0 +1,74 @@
+name: diag-clients
+
+# Diagnostics only, never on main (A-228's wedged-shard test flakes 2 of 5 on adacachy): main's liveness test
+# a_wedged_shard_stops_the_beat ten times quiet and ten times beside two spinning shell loops a CPU on CI's Linux
+# runners, its printout and panic kept. Results go to diag-results/clients-wedged-1-<os>, read by git fetch.
+on:
+  push:
+    branches: ["diag-clients-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cross-shard-wait:
+    name: R3 class A on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Build the tests
+        run: cargo test --locked -p slates-server --test liveness --no-run
+      - name: The wedged-shard test, quiet and busy
+        run: |
+          set +e
+          R=../results.txt
+          cpus=$(nproc)
+          echo "runner ${{ matrix.os }}, $cpus CPUs, $(date -u), commit $(git rev-parse --short HEAD)" > $R
+          T="cargo test --locked -q -p slates-server --test liveness -- --exact a_wedged_shard_stops_the_beat --nocapture --test-threads=1"
+          for round in $(seq 1 10); do
+            echo "== quiet $round" | tee -a $R
+            $T 2>&1 | grep -E 'wedged shard|panicked|beat|block|test result' | tee -a $R
+          done
+          pids=""
+          for i in $(seq 1 $((cpus * 2))); do ( while :; do :; done ) & pids="$pids $!"; done
+          for round in $(seq 1 10); do
+            echo "== busy $round" | tee -a $R
+            $T 2>&1 | grep -E 'wedged shard|panicked|beat|block|test result' | tee -a $R
+          done
+          for p in $pids; do kill "$p" 2>/dev/null || true; done
+          wait 2>/dev/null || true
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/clients-wedged-1-${{ matrix.os }}"
+          git config user.name "diag-clients"
+          git config user.email "diag-clients@users.noreply.github.com"
+          git stash -q || true
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-clients wedged-1 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
