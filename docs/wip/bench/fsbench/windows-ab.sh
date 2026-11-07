@@ -78,7 +78,7 @@ free_drive() {
 # command substitution holds its output open), and answers once its daemon does; the pid goes in ANCHORS.
 start_anchor() {
   local index=$1 instance=$2 binary=${BINARIES[$1]}
-  "$binary" --instance "$instance" anchor 2> "$W/$instance.err" &
+  "$binary" --instance "$instance" anchor ${SHARDS:+--shards "$SHARDS"} 2> "$W/$instance.err" &
   ANCHORS[$index]=$!
   for _ in $(seq 1 600); do
     if "$binary" --instance "$instance" volume list > /dev/null 2>&1; then
@@ -134,7 +134,7 @@ for run in $(seq 1 "$RUNS"); do
   # kill a daemon that missed its heartbeat, and a failed run is a result to record, not a reason to lose the rest.
   outcome=done
   "$BENCH" "${arms[@]}" --spinners-per-cpu "$SPINNERS_PER_CPU" \
-    ${FILES:+--files "$FILES"} ${ROUNDS:+--rounds "$ROUNDS"} || outcome=FAILED
+    ${FILES:+--files "$FILES"} ${ROUNDS:+--rounds "$ROUNDS"} ${PASS:+--pass "$PASS"} || outcome=FAILED
   # After the teardown, so a daemon's last words are in it.
   teardown
   for instance in ${INSTANCES[@]+"${INSTANCES[@]}"}; do
