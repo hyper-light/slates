@@ -105,6 +105,70 @@ mod sched {
   }
 }
 
+/// The slice sweep (the supervisor's decision of 2026-11-06 on A-224): the slices a shard may ask for, each derived
+/// from this machine, so the sweep searches the frontier rather than trying one point. Asking nothing; the kernel's
+/// smallest slice; the shard's step budget doubled from one quantum up to the kernel's default slice; the default
+/// itself; and A-224's `shard_slice_ns` (`wake.p99 + wake.mean`). Each is clamped to what the kernel takes, and a value
+/// two candidates share is listed once.
+mod slice_sweep {
+  use slates_machine::MachineProfile;
+  use slates_machine::profile::{KERNEL_MAX_SLICE_NS, KERNEL_MIN_SLICE_NS};
+
+  /// Format: the kernel's base slice before scaling, 0.75 ms (`sysctl_sched_base_slice`, `kernel/sched/fair.c`).
+  const KERNEL_BASE_SLICE_NS: u64 = 750_000;
+  /// Format: the most CPUs the default slice scales by (`get_update_sysctl_factor`'s cap, `kernel/sched/fair.c`).
+  const KERNEL_SCALING_CPUS: u64 = 8;
+
+  /// The CPUs online, as the kernel counts them when it scales its default slice (not the affinity mask).
+  #[cfg(unix)]
+  fn online_cpus() -> u64 {
+    // SAFETY: `sysconf` reads a system value and takes no memory.
+    let online = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+    u64::try_from(online).unwrap_or(1).max(1)
+  }
+
+  /// No fair-scheduler slice off Unix: one CPU for the arithmetic, and the shards ask nothing there anyway.
+  #[cfg(not(unix))]
+  fn online_cpus() -> u64 {
+    1
+  }
+
+  /// The kernel's default slice here: the base times `1 + log2(online CPUs, at most eight)`
+  /// (`SCHED_TUNABLESCALING_LOG`, the default scaling).
+  pub(crate) fn kernel_default_ns() -> u64 {
+    let cpus = online_cpus().min(KERNEL_SCALING_CPUS);
+    KERNEL_BASE_SLICE_NS.saturating_mul(1 + u64::from(cpus.ilog2()))
+  }
+
+  /// The candidates, in the order `--shard-slice K` indexes them.
+  pub(crate) fn candidates(profile: &MachineProfile) -> Vec<(String, Option<u64>)> {
+    let d = profile.derived();
+    let clamp = |ns: u64| ns.clamp(KERNEL_MIN_SLICE_NS, KERNEL_MAX_SLICE_NS);
+    let default = kernel_default_ns();
+    let budget = d.task_step_budget_ns.get().max(1);
+    let mut list: Vec<(String, Option<u64>)> = vec![
+      ("none (the kernel's default)".to_owned(), None),
+      ("kernel minimum".to_owned(), Some(KERNEL_MIN_SLICE_NS)),
+    ];
+    let mut multiple = 1u64;
+    while budget.saturating_mul(multiple) < default {
+      list.push((
+        format!("step budget {budget} ns x {multiple}"),
+        Some(clamp(budget.saturating_mul(multiple))),
+      ));
+      multiple = multiple.saturating_mul(2);
+    }
+    list.push(("kernel default, asked".to_owned(), Some(clamp(default))));
+    list.push((
+      "A-224 shard_slice_ns (wake.p99 + wake.mean)".to_owned(),
+      Some(d.shard_slice_ns.get()),
+    ));
+    let mut seen = std::collections::BTreeSet::new();
+    list.retain(|(_, slice)| seen.insert(*slice));
+    list
+  }
+}
+
 /// The pause before each sample (`--pause-ns N`, set once, in `main`): past the shards' idle window, so each sample
 /// meets parked shards and pays the doorbell and the wake, as an agent's edits do between its thinking.
 static PAUSE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
@@ -1032,6 +1096,11 @@ struct Selection {
   attached_shards: u16,
   /// Whether slates' threads take the interactive QoS class (`--qos-interactive`, macOS).
   qos_interactive: bool,
+  /// The in-process daemon's shard slice for a sweep arm (`--shard-slice-ns N`, one of [`slice_sweep::candidates`]
+  /// listed once for the whole sweep; `0` asks nothing); the derived one (`shard_slice_ns`) when not given.
+  shard_slice: Option<u64>,
+  /// Print the slice candidates and stop (`--slice-candidates`), for a sweep to know its arms.
+  list_slices: bool,
 }
 
 impl Selection {
@@ -1052,6 +1121,8 @@ impl Selection {
       seed_green: None,
       attached_shards: 0,
       qos_interactive: false,
+      shard_slice: None,
+      list_slices: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -1059,6 +1130,15 @@ impl Selection {
         "--quiet-only" => selection.loaded = false,
         "--loaded-only" => selection.quiet = false,
         "--qos-interactive" => selection.qos_interactive = true,
+        "--slice-candidates" => selection.list_slices = true,
+        "--shard-slice-ns" => {
+          selection.shard_slice = Some(
+            args
+              .next()
+              .and_then(|n| n.parse().ok())
+              .expect("--shard-slice-ns takes nanoseconds (0: ask nothing)"),
+          );
+        }
         "--pause-ns" => {
           let ns: u64 = args
             .next()
@@ -1159,6 +1239,13 @@ fn main() {
   })
   .expect("the machine profile measures");
   let mut selection = Selection::parse();
+  if selection.list_slices {
+    // One line a candidate, `slice\t<ns, 0 for none>\t<name>`, for a sweep's arms.
+    for (name, slice) in slice_sweep::candidates(&profile) {
+      println!("slice\t{}\t{name}", slice.unwrap_or(0));
+    }
+    return;
+  }
   // The QoS experiment, set before any daemon thread exists so they all inherit it.
   if selection.qos_interactive {
     sched::set_qos(true);
@@ -1170,7 +1257,11 @@ fn main() {
     Some(instance) => (instance, selection.attached_shards, None),
     None => {
       let instance = format!("edit-merge-bench-{}", std::process::id());
-      let config = DaemonConfig::derive(&profile, &instance, None);
+      let mut config = DaemonConfig::derive(&profile, &instance, None);
+      if let Some(slice) = selection.shard_slice {
+        config.runtime.slice_ns = (slice > 0).then_some(slice);
+        println!("sched: the shards ask for {:?} ns", config.runtime.slice_ns);
+      }
       let shards = config.runtime.shards;
       let daemon = Daemon::start(
         &profile,
