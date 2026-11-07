@@ -5911,9 +5911,9 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   flush succeeded in 995 µs with both candidates suspended; fixed, error 1117 after 1.0010–1.0283 s (3 of 3), success
 >   after the resume. Forming that fleet found a Windows defect in the runtime: a UDP socket reported a
 >   port-unreachable an earlier send drew as `WSAECONNRESET` on its next `recvfrom`, which ended a fleet serve socket's
->   receive loop at its first probe of a peer still starting (3 of 4 starts never formed). The fix that lands is
->   liveness's (d8a8d859: every Windows datagram socket, an adopted one too, made with `SIO_UDP_CONNRESET` and
->   `SIO_UDP_NETRESET` off); the WinFsp flow needs it to form its fleet.
+>   receive loop at its first probe of a peer still starting (3 of 4 starts never formed). The fix that landed is
+>   liveness's (00c4add1, first pushed as d8a8d859: every Windows datagram socket, an adopted one too, made with
+>   `SIO_UDP_CONNRESET` and `SIO_UDP_NETRESET` off); the WinFsp flow needs it to form its fleet.
 > - *Landings* need no wait: a landing claims what it wrote to disk, which holds it; a takeover that loses the volume's
 >   undurable tail serves the disk's bytes through the base, and a later landing that would revert the disk is refused
 >   by the witness check.
