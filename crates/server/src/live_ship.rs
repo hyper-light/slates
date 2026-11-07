@@ -65,6 +65,9 @@ const RETAIN: usize = 4;
 const LIVE_REFUSED: &str = "fleet.live.refused";
 /// Counter: whole records appended to a live log, each a copy of the volume's content.
 const LIVE_WHOLE: &str = "fleet.live.whole";
+/// Counter: install images made from a publication's state (or a clean volume's, on the record period) for a holder
+/// behind the retained tail, beside the log rather than on it ([`refresh_image`]).
+const LIVE_IMAGE: &str = "fleet.live.install_image";
 /// Counter: entries appended to a live volume's log on this owner shard.
 const LIVE_APPENDED: &str = "fleet.live.appended";
 /// Counter: entries a holder refused to keep (over its bound, unauthorized, malformed).
@@ -156,7 +159,12 @@ pub(crate) struct LiveVolume {
   shipper: Shipper,
   /// Its next publication must ship the whole volume (a delta would not apply to what the holders hold).
   owes_whole: bool,
-  /// The last whole entry's payload, and its head: what an install sends.
+  /// A holder behind the retained tail already holds the last whole state ([`pending_sends`]), so an install needs a
+  /// newer one: made from the next publication's state, at that publication's head, beside the log ([`refresh_image`]).
+  /// Unlike `owes_whole`, no write waits on it: the log itself is whole, only that holder is behind.
+  owes_image: bool,
+  /// The last whole state's payload and its head: the last whole entry, or an image a publication's state made at its
+  /// own head ([`refresh_image`]). What an install sends.
   whole: Option<(Head, Vec<u8>)>,
   /// The later epoch a holder answered with: this owner was superseded (a takeover placed the volume elsewhere), ships
   /// no more of it, and refuses every write waiting on it or made after (`Refusal::StaleEpoch`). Kept, not dropped with
@@ -835,6 +843,7 @@ pub(crate) fn published(
         (CREDIT, RETAIN),
       ),
       owes_whole: true,
+      owes_image: false,
       whole: None,
       fenced: None,
       kept: 0,
@@ -872,6 +881,7 @@ pub(crate) fn published(
       } else {
         live.kept.saturating_add(payload.len())
       };
+      let image_owed = live.owes_image && !whole;
       if whole {
         let head = entry.head();
         live.shipper.mark_checkpoint(head);
@@ -879,10 +889,15 @@ pub(crate) fn published(
         // instead: shipping it the entries it lacks never costs more than installing it (`Shipper::retain_up_to`).
         live.shipper.retain_up_to(payload.len());
         live.whole = Some((head, payload));
+        live.owes_image = false;
       }
       state.count(LIVE_APPENDED, 1);
       if whole {
         state.count(LIVE_WHOLE, 1);
+      }
+      if image_owed {
+        // The volume's state now is this publication's, so its image is exactly the head just appended.
+        refresh_image(state, id);
       }
       resolve(state, id.bytes);
       let sends = pending_sends(state, id.bytes);
@@ -908,6 +923,55 @@ fn kept_reaches_size(state: &ShardState, id: slates_db::catalog::VolumeId) -> bo
     slates_db::catalog::SizeClass::Dynamic { max } => max,
   };
   u64::try_from(kept).unwrap_or(u64::MAX) >= size
+}
+
+/// Makes the install image a holder behind the retained tail is owed ([`LiveVolume::owes_image`]): the volume's whole
+/// state, sealed as a whole payload, at the shipper's head, which it must equal, so this runs only where the volume's
+/// state is its head's: right after a publication is appended ([`published`]), or on the record period for a volume with
+/// nothing unpublished ([`period`]). The log is untouched: a holder on the chain goes on taking the changes, and only the
+/// holder behind is installed. Until 2026-11-07 such a holder set `owes_whole`, so the next write's record carried the
+/// whole volume to every holder and every write behind it waited for the up-to-date candidate to take it: 20–45 MB a
+/// time, 100–600 ms each, and writes of 1.2–1.9 s (CI, `diag-live-durability-14`). The retained tail's byte bound
+/// follows the image (`Shipper::retain_up_to`), so a laggard is sent the entries it lacks while they cost less than
+/// installing the volume as it is now, not as it was at its last whole record. A volume whose image cannot be made
+/// stays owing it, and the next publication or period tries again.
+fn refresh_image(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
+  // A volume owing a whole record lost a change from its log (a refused publication): its state is past its head, so
+  // an image now would not be the head's. The whole record that follows is the newer state an install sends.
+  if state
+    .live
+    .shipping
+    .get(&id.bytes)
+    .is_none_or(|live| live.owes_whole)
+  {
+    return;
+  }
+  let Some(record) = whole_record(state, id) else {
+    return;
+  };
+  let Some(image) = payload(state, id, true, record) else {
+    return;
+  };
+  let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
+    return;
+  };
+  let Some(head) = live.shipper.head() else {
+    return;
+  };
+  live.shipper.mark_checkpoint(head);
+  live.shipper.retain_up_to(image.len());
+  live.whole = Some((head, image));
+  live.owes_image = false;
+  state.count(LIVE_IMAGE, 1);
+}
+
+/// Whether `id`'s volume has nothing unpublished: its state is the one its live log's head records.
+fn published_whole(state: &ShardState, id: slates_db::catalog::VolumeId) -> bool {
+  state
+    .by_id
+    .get(&id)
+    .and_then(|handle| state.volumes.get(*handle).ok())
+    .is_some_and(|slot| slot.volume.is_clean(&state.store))
 }
 
 /// A publication that could not become an entry: counted, and the volume owes a whole record next.
@@ -1091,7 +1155,7 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
     }
   }
   if stale_checkpoint {
-    live.owes_whole = true;
+    live.owes_image = true;
   }
   sends
 }
@@ -1478,6 +1542,15 @@ fn fold_into(state: &mut ShardState, replies: Vec<(ObjectId, HostId, Vec<u8>)>) 
   dispatch(state, sends);
 }
 
+/// Whether `volume` owes an install image ([`LiveVolume::owes_image`]).
+fn owes_image(state: &ShardState, volume: [u8; 16]) -> bool {
+  state
+    .live
+    .shipping
+    .get(&volume)
+    .is_some_and(|live| live.owes_image)
+}
+
 /// Whether `volume` owes a whole record and its credit allows one now (a checkpoint may go one past it,
 /// `Shipper::append_checkpoint`).
 fn owes_whole_within_credit(state: &ShardState, volume: [u8; 16]) -> bool {
@@ -1500,8 +1573,12 @@ pub(crate) async fn period(origin: u16, shard: u16) {
       // A volume that owes a whole record ships one once its credit allows: a burst that outran the credit left its
       // last writes unshipped until another write came, and none might (three of five writes, `live_fleet`).
       for volume in &volumes {
+        let id = slates_db::catalog::VolumeId { bytes: *volume };
         if owes_whole_within_credit(s, *volume) {
-          published(s, slates_db::catalog::VolumeId { bytes: *volume }, None);
+          published(s, id, None);
+        } else if owes_image(s, *volume) && published_whole(s, id) {
+          // No publication is coming to make the image a holder behind the tail waits for (the writer is idle).
+          refresh_image(s, id);
         }
       }
       let mut sends = Vec::new();

@@ -5859,7 +5859,9 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   same way; `Shipper` now remembers holders owed an install, the model passes again (f=1: 309 installs, f=2: 455).
 >   And an install at a checkpoint a holder already holds is refreshed by a new whole record, which may go one entry
 >   past the credit (`Shipper::append_checkpoint`): with both candidates behind, waiting for credit no laggard could
->   free deadlocked the stall flow.
+>   free deadlocked the stall flow. (Since 2026-11-07 the refresh is an image beside the log while the log itself is
+>   whole; the whole record past the credit remains for a log that lost a change, as with both candidates behind. See
+>   "An install image beside the log" below.)
 > - *Clients cut off mid-write*: ten writers SIGKILLed right after starting, between finished writes: the log whole on
 >   every candidate, every deferred reply resolved (awaited 10, resolved 10).
 > - *A live volume destroyed*: its candidates let their copy of its log go once the tombstone reaches them
@@ -6004,6 +6006,33 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > partition: 3 of 10 runs stalled without it at load 118, 0 of 10 with it at load 41–58. Those loads differ, so this
 > is not an A/B. The first write's ~99 ms in some runs is a lane waiting one record period for its holder's session,
 > lent to the record plane (`ship_head`); open.
+>
+> **An install image beside the log (2026-11-07).** A holder that falls behind the retained tail is installed with the
+> owner's last whole state. If it already holds that state, a newer one is needed. Until now that set `owes_whole`, so
+> the next write's record carried the whole volume as an entry to every holder. The up-to-date candidate had to take it
+> before any later write was durable, and `durable_target` made every waiting write wait for that record.
+>
+> The trigger was common because the retained tail's byte bound was the last whole record's size, fixed while the
+> volume grew. In the chaos flows (CI, `diag-live-durability-14`, release, both Linux arches) every run made such
+> records:
+> - 20–45 MB each, each exchange 100–600 ms;
+> - the lanes they held turned later writes away for credit, which owed further whole records;
+> - writes of 1.2–1.9 s followed.
+>
+> Now the stale checkpoint sets `owes_image` instead (`LiveVolume::owes_image`), and the log is untouched:
+> - the next publication appends its change as usual, and the volume's whole state, which is that publication's
+>   state, becomes the install at the head just appended (`live_ship::refresh_image`);
+> - on the record period a volume with nothing unpublished makes it the same way, so an idle writer leaves no holder
+>   waiting;
+> - the retained tail's bound follows the image, so a laggard is sent entries while they cost less than installing the
+>   volume as it is now;
+> - nothing waits on `owes_image`; only the lagging holder is installed;
+> - a log that lost a change (`owes_whole`) still takes a whole record, and an image is never made then, since the
+>   volume's state is past its head.
+>
+> Held by `a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log` (one candidate stopped
+> for the middle third of 180 sequential stable writes: one whole record, at least one install, and the candidate caught
+> up).
 >
 > **Chaos from outside the processes (2026-11-06).** `crates/cli/tests/live_chaos.rs` streams writes through the Rust
 > client while it partitions or kills processes. It ends every flow with Agreement, NoLoss, StaleNeverCommits and

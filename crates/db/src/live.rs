@@ -880,8 +880,9 @@ impl Shipper {
     }
   }
 
-  /// Records `head` as the last whole state shipped: the entry at it carries the owner's whole state, which an install
-  /// sends to a holder off the chain or behind the retained tail. Ignored unless it is the owner's head now.
+  /// Records `head` as the last whole state made: the owner's whole state as of the entry at it (that entry itself when
+  /// it is whole, or an image of the state it left, made beside the log), which an install sends to a holder off the
+  /// chain or behind the retained tail. Ignored unless it is the owner's head now.
   pub fn mark_checkpoint(&mut self, head: Head) {
     if Some(head) == self.head {
       self.checkpoint = Some(head);
@@ -960,10 +961,9 @@ impl Shipper {
 
   /// Keeps entries for laggards up to `bytes` of payload as well as the `retain` entries: whichever keeps more.
   /// Derived (by the caller): `bytes` is the size of the whole state an install would send, the owner's last whole
-  /// record; then a laggard is sent the entries it lacks for as long as they cost no more than an install. Kept to a
-  /// count alone, an owner writing faster than an install's round trip left a holder it had just installed behind the
-  /// tail again, and installed it again without end (2026-11-06, `crates/cli/tests/live_chaos.rs`: 803 installs, 571
-  /// MB, in one run).
+  /// record; then a laggard is sent the entries it lacks for as long as they cost no more than an install. Kept to a count alone, an owner writing faster than an install's
+  /// round trip left a holder it had just installed behind the tail again, and installed it again without end
+  /// (2026-11-06, `crates/cli/tests/live_chaos.rs`: 803 installs, 571 MB, in one run).
   pub fn retain_up_to(&mut self, bytes: usize) {
     self.retain_bytes = bytes;
     self.trim();
