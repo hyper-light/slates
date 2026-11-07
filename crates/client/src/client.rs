@@ -98,7 +98,9 @@ pub fn defers_reply(body: &RequestBody) -> bool {
   body.may_be_forwarded()
     || matches!(
       body,
-      RequestBody::Land { grant: Some(_), .. }
+      // A landing is planned in slices on the owner shard, as long as its tree takes, and a granted one runs in them
+      // (AUD-29-25; a presentation since 2026-11-08).
+      RequestBody::Land { .. }
         // An image's build and merge run in slices on the owner shard, as long as the image takes (A-160).
         | RequestBody::ImageBuild { .. }
         | RequestBody::ImageMerge { .. }
