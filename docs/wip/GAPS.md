@@ -9,6 +9,13 @@
 >   records, so a resend after a restart was answered `DuplicateRequest` for an applied create. The watermark now
 >   stops below the first request with no reply (`an_acknowledgement_never_covers_a_request_still_awaited`;
 >   `docs/bugs/2026-11-06-an-acknowledgement-covered-requests-still-awaited.md`).
+> - **A ring slot's bulk body was overwritten before it was read.** The ring's credit covered the 64-byte slot, not the
+>   bulk chunk it names, which every message at that ring position shares. So a body was overwritten in two ways: by
+>   a consumer that released the slot before reading the body, and by a producer that packed before it knew the ring
+>   had room. A request then ran another request's body under its own id (red: request 0 decoded as request 8), or
+>   failed `BadRequest { "body does not decode" }`. That happened 1 to 3 times in every 300-client run at 32 clients a
+>   connection, and in none of 3 after the fix
+>   (`docs/bugs/2026-11-06-a-ring-slots-bulk-body-was-overwritten-before-it-was-read.md`).
 > - **Forwards to one owner went one at a time** (the network load test's fault one, below). The origin borrowed
 >   the session to the owner for each forward's round trip, and the owner served one request of a session at a
 >   time. Now they share the session through a per-peer lane, and the owner runs each forwarded verb on its own
@@ -39,6 +46,18 @@
 >   stayed at 509 to 717 ms. Then the process peaked at 24.07 GB and was gone at 652 s before its oracle: no panic,
 >   with heartbeats 2.5 to 4.2 s late and unattributed (memory pressure is the inference, not proven). Owed:
 >   `CreateGreen` sliced, and its origin held by reference (A-217), before the rungs use the whole kernel.
+>
+> - **On a busy machine the anchor kills a live daemon, and then its successor, and the clients give up** (open; the
+>   anchor's half is the top entry's, unassigned). Mac, single-node anchored daemon, load 60 to 89, 300 to 1,000
+>   clients:
+>   - The anchor killed a live daemon whose heartbeat lapsed. The successor "never beat inside the recovery budget",
+>     recovering 300 to 1,000 works and their green's versions, and was killed again: twice, and four times in another
+>     run.
+>   - The clients' reconnect budget ran out first (0 reconnects, 172 and 439 clients gave up), and the restart reset
+>     the works (A-207's port is reverted on main).
+>   - The harness's oracle then failed 30 checks: versions it never saw accepted, and heads it could not replay. Those
+>     are submits whose outcome their clients never learned, and the oracle treats them as never accepted. It owes a
+>     sound treatment: read which versions the green took and fit the unknown submits to them.
 >
 > The topology launcher is `crates/cli/tests/load_scale.rs`. It runs one primary and two replica server nodes in
 > region 0 at `f = 1`, and client nodes in region 1, so the client nodes are never the green's holders. One harness

@@ -16,11 +16,11 @@ use slates_db::catalog::{
 use slates_db::register::{HostId, ObjectId, RegionId, RootConfiguration};
 use slates_db::{DbError, Partition};
 use slates_ipc::protocol::{
-  AttachRequest, AttachTransport, DaemonReport, Direction, Established, FleetReport,
-  FreshnessBasis, GroupReport, HealthSignal, Intent, NamePolicy, PlacedState, ReadAt,
-  ReadWritePolicy, Refusal, RefusalCount, ReplyBody, RequestBody, Scope, ShardReport, Signal,
-  SizeClass, SnapshotId, StatusReport, UnsupportedReason, VolumeId, VolumeSummary, WorkOp,
-  decode_body, encode_body, pack, unpack,
+  AttachRequest, AttachTransport, DaemonReport, Established, FleetReport, FreshnessBasis,
+  GroupReport, HealthSignal, Intent, NamePolicy, PlacedState, ReadAt, ReadWritePolicy, Refusal,
+  RefusalCount, ReplyBody, RequestBody, Scope, ShardReport, Signal, SizeClass, SnapshotId,
+  StatusReport, UnsupportedReason, VolumeId, VolumeSummary, WorkOp, decode_body, encode_body,
+  unpack,
 };
 use slates_ipc::slot::SlotKind;
 use slates_ipc::{IpcError, Request};
@@ -8985,37 +8985,22 @@ fn send_reply(
       })
       .unwrap_or_else(refused);
   }
-  let index = client.end.next_reply_index();
-  let slot = match pack(
-    client.end.region_mut(),
-    Direction::Reply,
-    index,
-    request,
-    reply,
-  ) {
-    Ok(s) => s,
+  // Room first, then the body (`DaemonEnd::reply_message`): a reply packed before a full ring refused it was written
+  // over the bulk body of the oldest reply the client had not taken.
+  match client.end.reply_message(request, reply) {
+    Ok(()) => true,
+    Err(IpcError::RingFull) => false,
     Err(_) => {
       let fallback = ReplyBody::Refused {
         refusal: Refusal::BadRequest {
           reason: "reply too large for the bulk area".to_owned(),
         },
       };
-      match pack(
-        client.end.region_mut(),
-        Direction::Reply,
-        index,
-        request,
-        &fallback,
-      ) {
-        Ok(s) => s,
-        Err(_) => return true,
-      }
+      !matches!(
+        client.end.reply_message(request, &fallback),
+        Err(IpcError::RingFull)
+      )
     }
-  };
-  match client.end.reply(&slot) {
-    Ok(()) => true,
-    Err(IpcError::RingFull) => false,
-    Err(_) => true,
   }
 }
 

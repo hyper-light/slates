@@ -3429,6 +3429,50 @@ pub fn pack<M: Wire>(
   })
 }
 
+/// The framed body a bulk slot's `payload` names in `region`'s bulk area, copied out; a reference of the wrong size or
+/// outside the area is a typed refusal.
+fn bulk_body(region: &ClientRegion, payload: &[u8]) -> Result<Vec<u8>, IpcError> {
+  if payload.len() != BULK_REF_BYTES {
+    return Err(IpcError::BadSlot {
+      reason: "bulk reference of the wrong size",
+    });
+  }
+  let (offset, len) = payload
+    .split_at_checked(size_of::<u64>())
+    .unwrap_or_default();
+  let word = |bytes: &[u8]| {
+    usize::try_from(u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]))).unwrap_or(usize::MAX)
+  };
+  let (offset, len) = (word(offset), word(len));
+  if offset
+    .checked_add(len)
+    .is_none_or(|end| end > region.bulk_len())
+  {
+    return Err(IpcError::BadSlot {
+      reason: "bulk reference outside the area",
+    });
+  }
+  let mut body = vec![0u8; len];
+  region.read_bulk(offset, &mut body)?;
+  Ok(body)
+}
+
+/// A slot taken from a ring, its body owned: a bulk slot's body copied out of the bulk area and carried inline, as
+/// [`unpack`] reads an inline one, so the ring may release the slot (and with it the chunk) at once. Any other slot is
+/// returned as it is. Called by each end's take before it releases the slot (`Ring::peek`, `Ring::release`): the chunk
+/// is the next message's at that ring position, which the producer writes as soon as the slot is released, and a body
+/// read after that was the next message's (`a_request_taken_from_the_ring_keeps_its_bulk_body_when_the_client_sends_on`).
+pub fn owned(region: &ClientRegion, slot: Slot) -> Result<Slot, IpcError> {
+  if slot.kind != SlotKind::Bulk {
+    return Ok(slot);
+  }
+  Ok(Slot {
+    kind: SlotKind::Inline,
+    request: slot.request,
+    payload: bulk_body(region, &slot.payload)?,
+  })
+}
+
 /// Decodes the message a slot carries, inline or from the bulk chunk it names; a reference
 /// outside the bulk area is a typed refusal.
 pub fn unpack<M: Wire>(
@@ -3438,32 +3482,7 @@ pub fn unpack<M: Wire>(
 ) -> Result<M, IpcError> {
   match kind {
     SlotKind::Inline => unframe(payload),
-    SlotKind::Bulk => {
-      if payload.len() != BULK_REF_BYTES {
-        return Err(IpcError::BadSlot {
-          reason: "bulk reference of the wrong size",
-        });
-      }
-      let (offset, len) = payload
-        .split_at_checked(size_of::<u64>())
-        .unwrap_or_default();
-      let word = |bytes: &[u8]| {
-        usize::try_from(u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8])))
-          .unwrap_or(usize::MAX)
-      };
-      let (offset, len) = (word(offset), word(len));
-      if offset
-        .checked_add(len)
-        .is_none_or(|end| end > region.bulk_len())
-      {
-        return Err(IpcError::BadSlot {
-          reason: "bulk reference outside the area",
-        });
-      }
-      let mut body = vec![0u8; len];
-      region.read_bulk(offset, &mut body)?;
-      unframe(&body)
-    }
+    SlotKind::Bulk => unframe(&bulk_body(region, payload)?),
     SlotKind::Cancel | SlotKind::Heartbeat => Err(IpcError::BadSlot {
       reason: "not a message",
     }),

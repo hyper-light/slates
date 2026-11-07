@@ -8,11 +8,11 @@ use std::time::Instant;
 
 use slates_ipc::delivery::{Capability, Delivered, DeliveryFault, attest_proof};
 use slates_ipc::protocol::{
-  AttachRequest, AttachmentCapability, AuditEntry, CheckoutReport, DaemonReport, Direction,
-  Established, Filter, GrantScope, GrantSummary, GreenBase, ImageMergeReport, Intent,
-  LandingOutcome, LandingSummary, MergeWindow, NamePolicy, Principal, ReadAt, ReplyBody,
-  RequestBody, Rights, Scope, SizeClass, SnapshotCoverage, SnapshotId, StatusReport,
-  TelemetryReport, VolumeId, VolumeSummary, WorkOp, pack, unpack,
+  AttachRequest, AttachmentCapability, AuditEntry, CheckoutReport, DaemonReport, Established,
+  Filter, GrantScope, GrantSummary, GreenBase, ImageMergeReport, Intent, LandingOutcome,
+  LandingSummary, MergeWindow, NamePolicy, Principal, ReadAt, ReplyBody, RequestBody, Rights,
+  Scope, SizeClass, SnapshotCoverage, SnapshotId, StatusReport, TelemetryReport, VolumeId,
+  VolumeSummary, WorkOp, unpack,
 };
 #[cfg(unix)]
 use slates_ipc::rendezvous::ControlDelivery;
@@ -2792,15 +2792,7 @@ impl Client {
   /// found gone instead and the client reconnected (the caller binds and sends again).
   /// One attempt to put `body` under `id` on the command ring: `Ok(false)` when it has no slot.
   fn try_send(&mut self, id: RequestId, body: &RequestBody) -> Result<bool, ClientError> {
-    let index = self.end.next_request_index();
-    let slot = pack(
-      self.end.region_mut(),
-      Direction::Request,
-      index,
-      id.word(),
-      body,
-    )?;
-    match self.end.send(&slot) {
+    match self.end.send_message(id.word(), body) {
       Ok(()) => Ok(true),
       Err(IpcError::RingFull) => Ok(false),
       Err(e) => Err(ClientError::Ipc(e)),
@@ -2810,15 +2802,7 @@ impl Client {
   fn send(&mut self, id: RequestId, body: &RequestBody) -> Result<bool, ClientError> {
     let started = Instant::now();
     loop {
-      let index = self.end.next_request_index();
-      let slot = pack(
-        self.end.region_mut(),
-        Direction::Request,
-        index,
-        id.word(),
-        body,
-      )?;
-      match self.end.send(&slot) {
+      match self.end.send_message(id.word(), body) {
         Ok(()) => return Ok(true),
         Err(IpcError::RingFull) => {
           if elapsed_ns(started) < self.deadlines.reply_ns {
