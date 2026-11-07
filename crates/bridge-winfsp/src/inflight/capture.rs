@@ -5,8 +5,7 @@
 //! first, so a second crash cannot lose an already-issued open by overwriting its only complete response.
 
 use super::{
-  BATCH_BYTES, RESPONSE_BASE, RESPONSE_MAX, Refusal, Request, Scratch, index, put, read_u32,
-  read_u64,
+  BATCH_BYTES, RESPONSE_BASE, RESPONSE_MAX, Refusal, Request, Scratch, index, read_u32, read_u64,
 };
 use slates_wire::crc32c::crc32c;
 
@@ -71,20 +70,16 @@ impl<'a> Capture<'a> {
     if self.phase.first() != Some(&0) {
       return Err(Refusal::Unsettled);
     }
-    match used {
-      Some(filled) => self
-        .request
-        .get_mut(..filled)
-        .ok_or(Refusal::Length)?
-        .fill(0),
-      None => self.request.fill(0),
-    }
-    self
-      .saved
-      .get_mut(..SAVED_HEADER)
-      .ok_or(Refusal::Length)?
-      .fill(0);
-    *self.phase.first_mut().ok_or(Refusal::Length)? = RECEIVING;
+    let cleared = match used {
+      Some(filled) => self.request.get_mut(..filled).ok_or(Refusal::Length)?,
+      None => &mut *self.request,
+    };
+    cleared.fill(0);
+    stored(cleared);
+    let header = self.saved.get_mut(..SAVED_HEADER).ok_or(Refusal::Length)?;
+    header.fill(0);
+    stored(header);
+    set(self.phase.first_mut().ok_or(Refusal::Length)?, RECEIVING);
     Ok(Receiving { capture: self })
   }
 
@@ -172,7 +167,7 @@ impl<'a> Batch<'a> {
       None => None,
     };
     if pending.frames.is_empty() {
-      *capture.phase.first_mut().ok_or(Refusal::Length)? = 0;
+      set(capture.phase.first_mut().ok_or(Refusal::Length)?, 0);
     }
     Ok(Self {
       phase: capture.phase,
@@ -228,24 +223,17 @@ impl<'a> Batch<'a> {
         Err(Refusal::ResponseChanged)
       };
     }
-    *self.saved.first_mut().ok_or(Refusal::Length)? = 0;
-    let end = SAVED_HEADER
-      .checked_add(response.len())
-      .ok_or(Refusal::Length)?;
-    self
-      .saved
-      .get_mut(SAVED_HEADER..end)
-      .ok_or(Refusal::Length)?
-      .copy_from_slice(response);
-    put(
+    set(self.saved.first_mut().ok_or(Refusal::Length)?, 0);
+    store(self.saved, SAVED_HEADER, response)?;
+    store(
       self.saved,
       LENGTH_AT,
       &u32::try_from(response.len())
         .map_err(|_| Refusal::Length)?
         .to_le_bytes(),
     )?;
-    put(self.saved, CRC_AT, &crc32c(response).to_le_bytes())?;
-    *self.saved.first_mut().ok_or(Refusal::Length)? = PUBLISHED;
+    store(self.saved, CRC_AT, &crc32c(response).to_le_bytes())?;
+    set(self.saved.first_mut().ok_or(Refusal::Length)?, PUBLISHED);
     Ok(())
   }
 
@@ -261,11 +249,37 @@ impl<'a> Batch<'a> {
     }
     self.current = None;
     if self.pending.frames.is_empty() {
-      *self.phase.first_mut().ok_or(Refusal::Length)? = 0;
+      set(self.phase.first_mut().ok_or(Refusal::Length)?, 0);
     }
     Ok(())
   }
 }
+
+/// Copies `from` into the journal at `at`.
+fn store(bytes: &mut [u8], at: usize, from: &[u8]) -> Result<(), Refusal> {
+  let end = at.checked_add(from.len()).ok_or(Refusal::Length)?;
+  let target = bytes.get_mut(at..end).ok_or(Refusal::Length)?;
+  target.copy_from_slice(from);
+  stored(target);
+  Ok(())
+}
+
+/// Writes one journal byte: a phase or a saved response's state, which a single store cannot tear.
+fn set(byte: &mut u8, value: u8) {
+  *byte = value;
+  stored(std::slice::from_ref(byte));
+}
+
+/// Tells the crash oracle of each store to the journal, in order (`super::oracle`), so it can crash the protocol after
+/// any one of them. Test builds only.
+#[cfg(test)]
+fn stored(bytes: &[u8]) {
+  super::oracle::journal_stored(bytes);
+}
+
+/// Stores are not observed outside the crash oracle.
+#[cfg(not(test))]
+fn stored(_bytes: &[u8]) {}
 
 fn saved_response(bytes: &[u8]) -> Result<Option<&[u8]>, Refusal> {
   match bytes.first() {
