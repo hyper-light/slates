@@ -70,7 +70,13 @@ fn rw(_consumer: &Principal) -> slates_bridge_core::Rights {
 
 /// A seam whose guest driver has published `count` GETATTR-of-root requests.
 fn seam_with_requests(count: u64) -> SimVmm {
-  let mut seam = SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 501 }));
+  let mut seam = SimVmm::new(
+    &QUEUE_SIZES,
+    Ok(Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 501,
+    }),
+  );
   for unique in 1..=count {
     seam.guest_mut().submit(
       usize::from(FIRST_REQUEST_QUEUE),
@@ -93,7 +99,13 @@ fn config() -> DeviceConfig {
 #[test]
 fn admission_authenticates_the_consumer_before_any_queue_memory_or_tag() {
   let mut registry = Attachments::new();
-  let seam = SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 501 }));
+  let seam = SimVmm::new(
+    &QUEUE_SIZES,
+    Ok(Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 501,
+    }),
+  );
   let admitted = admit(
     request(GuestTransport::InProcess),
     seam,
@@ -116,7 +128,10 @@ fn admission_authenticates_the_consumer_before_any_queue_memory_or_tag() {
   assert_eq!(admitted.seam().published().unwrap().tag.as_str(), "slates");
   assert_eq!(
     admitted.context(&registry).unwrap().subject,
-    Principal::Uid { uid: 501 }
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 501
+    }
   );
 
   let seam = SimVmm::new(&QUEUE_SIZES, Err(SeamError::ConsumerUnverified));
@@ -158,7 +173,13 @@ fn an_unsupported_form_is_refused_typed_before_the_seam_is_touched() {
   };
   let refused = admit(
     dax,
-    SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 0 })),
+    SimVmm::new(
+      &QUEUE_SIZES,
+      Ok(Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 0,
+      }),
+    ),
     config(),
     roomy(),
     rw,
@@ -181,7 +202,13 @@ fn an_unsupported_form_is_refused_typed_before_the_seam_is_touched() {
   assert!(matches!(
     admit(
       notify,
-      SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 0 })),
+      SimVmm::new(
+        &QUEUE_SIZES,
+        Ok(Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 0
+        })
+      ),
       config(),
       roomy(),
       rw,
@@ -200,7 +227,13 @@ fn an_unsupported_form_is_refused_typed_before_the_seam_is_touched() {
   let inherited = request(GuestTransport::InheritedDescriptor);
   let admitted = admit(
     inherited,
-    SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 0 })),
+    SimVmm::new(
+      &QUEUE_SIZES,
+      Ok(Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 0,
+      }),
+    ),
     config(),
     roomy(),
     rw,
@@ -273,7 +306,13 @@ fn requests_are_charged_against_the_credits_and_released_on_completion() {
 #[test]
 fn a_pass_notifies_a_queue_only_for_the_replies_it_published() {
   let mut registry = Attachments::new();
-  let seam = SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 501 }));
+  let seam = SimVmm::new(
+    &QUEUE_SIZES,
+    Ok(Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 501,
+    }),
+  );
   let mut admitted = admit(
     request(GuestTransport::InProcess),
     seam,
@@ -472,7 +511,13 @@ fn a_chain_beyond_the_byte_credit_is_refused_before_access_and_faults_the_device
 #[test]
 fn revocation_refuses_before_access_and_the_terminal_step_reclaims() {
   let mut registry = Attachments::new();
-  let seam = SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 501 }));
+  let seam = SimVmm::new(
+    &QUEUE_SIZES,
+    Ok(Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 501,
+    }),
+  );
   let mut admitted = admit(
     request(GuestTransport::InProcess),
     seam,
@@ -652,7 +697,13 @@ fn assert_reclaimed(
 #[test]
 fn the_capability_report_is_truthful() {
   let mut registry = Attachments::new();
-  let seam = SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 0 }));
+  let seam = SimVmm::new(
+    &QUEUE_SIZES,
+    Ok(Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    }),
+  );
   let admitted = admit(
     request(GuestTransport::InProcess),
     seam,
@@ -720,7 +771,14 @@ fn a_refused_admission_leaves_no_attachment_behind() {
     (SeamCall::Memory, SeamError::MemoryUnavailable),
     (SeamCall::Publish, SeamError::PublishRefused),
   ] {
-    let seam = SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 501 })).failing(step);
+    let seam = SimVmm::new(
+      &QUEUE_SIZES,
+      Ok(Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 501,
+      }),
+    )
+    .failing(step);
     let refused = admit(
       request(GuestTransport::InProcess),
       seam,
@@ -740,7 +798,13 @@ fn a_refused_admission_leaves_no_attachment_behind() {
   }
   let admitted = admit(
     request(GuestTransport::InProcess),
-    SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 501 })),
+    SimVmm::new(
+      &QUEUE_SIZES,
+      Ok(Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 501,
+      }),
+    ),
     config(),
     roomy(),
     rw,
@@ -754,7 +818,13 @@ fn a_refused_admission_leaves_no_attachment_behind() {
 fn admitted_in(registry: &mut Attachments) -> AdmittedDevice<SimVmm> {
   admit(
     request(GuestTransport::InProcess),
-    SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 501 })),
+    SimVmm::new(
+      &QUEUE_SIZES,
+      Ok(Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 501,
+      }),
+    ),
     config(),
     roomy(),
     rw,
@@ -871,8 +941,14 @@ fn an_admitted_devices_window_maps_the_files_backing_through_the_loops_entry_poi
   // number is reserved (A-150), so the guest's replies need no barrier for it.
   vol.mark_published(&store);
   let mut registry = Attachments::new();
-  let seam =
-    SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 0 })).with_dax_window("admit-backed", range);
+  let seam = SimVmm::new(
+    &QUEUE_SIZES,
+    Ok(Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    }),
+  )
+  .with_dax_window("admit-backed", range);
   let mut admitted = admit(
     request(GuestTransport::InProcess),
     seam,

@@ -107,10 +107,16 @@ mod tests {
       name: "catalogued".to_owned(),
       size: SizeClass::Bounded { limit: 1 << 20 },
       names: NamePolicy::Exact,
-      owner: Principal::Uid { uid: 501 },
+      owner: Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 501,
+      },
       require_locked: true,
       access: vec![AccessEntry {
-        principal: Principal::Uid { uid: 502 },
+        principal: Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 502,
+        },
         rights: Rights {
           read: true,
           write: false,

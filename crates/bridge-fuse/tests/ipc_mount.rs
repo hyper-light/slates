@@ -162,6 +162,7 @@ fn serve(
       id,
       View::Current,
       Principal::Uid {
+        host: slates_db::HostId(0),
         uid: rustix::process::getuid().as_raw(),
       },
       Rights {

@@ -679,6 +679,34 @@ fn a_segment_with_process_relative_deadlines_is_refused_before_recovery() {
   );
 }
 
+/// A-237 (§4.13): a segment written before principals carried their host names its owners, access lists and consumers
+/// as bare accounts, which a daemon of today would take for its own host's. Do: write layout 4 into a segment's header
+/// and attach it. Expect: refused typed at start, saying what to do (start afresh and re-enroll), never read. Before
+/// A-237 layout 4 was the current one, and the attach succeeded.
+#[test]
+fn a_segment_from_before_host_scoped_principals_is_refused_at_start_saying_to_re_enroll() {
+  use slates_anchor::layout::{AT_VERSION, LAYOUT_BEFORE_HOST_SCOPED_PRINCIPALS};
+  let name = format!("slates-anchor-unscoped-{}", std::process::id());
+  let segment = AnchorSegment::create(&name, &identity(), geometry()).unwrap();
+  let (handoff, len) = handoff_of(&segment);
+  let header = slates_mem::Words::new().with(slates_mem::WordRun::one(
+    slates_anchor::layout::AT_GENERATION,
+    slates_mem::Width::U64,
+  ));
+  let mut mapping = slates_mem::SparseObject::open(&handoff, len, header).unwrap();
+  mapping
+    .write(
+      AT_VERSION,
+      &LAYOUT_BEFORE_HOST_SCOPED_PRINCIPALS.to_le_bytes(),
+    )
+    .unwrap();
+  let result = AnchorSegment::attach(&handoff, len, &identity());
+  assert!(
+    matches!(&result, Err(AnchorError::Layout { reason }) if reason.contains("re-enroll")),
+    "a segment of unscoped principals is refused at start, saying to re-enroll: {result:?}"
+  );
+}
+
 /// Shape: how long the graceful stopping child keeps beating after it acknowledges a stop before it exits —
 /// its "drain", long enough that an anchor which did not wait for it would be seen not to.
 const DRAIN_MS: u64 = 100;
