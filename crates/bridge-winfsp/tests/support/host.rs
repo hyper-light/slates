@@ -758,6 +758,66 @@ fn count_recovery(role: &str, request: &Request, mount: &mut MountThread, counte
   eprintln!("WINFSP INFLIGHT: successor counted {count} settled captured requests");
 }
 
+/// A-212, audit step 7's profile (2026-11-06). Do: rename a file whose one open Windows holds, through the receiver's
+/// durable name update, against a shard that counts its turns. Expect: the open's name is the new one, in the ledger
+/// and in the names Windows' notifications use, after one turn. The update spent a second turn only to learn that no
+/// open was left beneath the old name: 2.27 turns a rename on arm64 in diagnostics run 42178889880, 4.7 µs each.
+#[test]
+fn a_rename_with_one_open_name_takes_one_shard_turn() {
+  let (send, receive) = sync_channel::<Request>(REQUEST_BOUND);
+  let shard = std::thread::spawn(move || {
+    let mut store = fixed_store();
+    let (mut volume, cx) = fixed_volume(&mut store);
+    let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut volume, &mut store);
+    let root = ObjectId::new(bridge.root(&cx).unwrap(), 0);
+    let file = bridge.lookup(root, &cx, "file").unwrap();
+    let object = ObjectId::new(file.ino, file.generation);
+    let fh = bridge.open(object, &cx, 0).unwrap();
+    let memory =
+      SparseObject::unnamed(crate::opens::bytes(2).unwrap(), slates_mem::Words::new()).unwrap();
+    let mut ledger = Ledger::create(memory, 2).unwrap();
+    let context = ledger
+      .opened(
+        Open {
+          object,
+          fh,
+          purge: false,
+        },
+        "\\file",
+      )
+      .unwrap();
+    let mut names = OpenNames::new();
+    names.opened(context, file.ino, "\\file");
+    let mut turns = 0u32;
+    while let Ok(request) = receive.recv() {
+      turns += 1;
+      assert!(
+        request
+          .serve(&mut bridge, &cx, &mut names, &mut ledger)
+          .send()
+      );
+    }
+    (
+      turns,
+      ledger.name(context).unwrap(),
+      names.first_beneath("\\renamed"),
+      names.first_beneath("\\file"),
+      context,
+      file.ino,
+    )
+  });
+  crate::host::rename_open_names(&send, Waker::noop(), "\\file", "\\renamed", 2).unwrap();
+  drop(send);
+  let (turns, ledgered, renamed, left, context, inode) = shard.join().unwrap();
+  assert_eq!(ledgered, "\\renamed");
+  assert_eq!(renamed, Some((context, inode)));
+  assert_eq!(left, None);
+  assert_eq!(
+    turns, 1,
+    "a rename with one open name took {turns} shard turns"
+  );
+}
+
 /// A-198. Do: replay an open's delete cleanup after its first cleanup unlinked the name and an SDK created a new file
 /// there. Expect: the replacement still has its name and bytes; cleanup belongs to the old file's identity.
 #[test]
