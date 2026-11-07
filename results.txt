@@ -1,0 +1,794 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 23:13:57 UTC 2026, head f2f4e40ad02fd6aa59b8dcbbc47c9a018c9eaa6a
+== run 1 at 23:13:57, load 1.51 2.21 1.17
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (6361) panicked at crates/cli/tests/live_chaos.rs:326:7:
+the fleet formed, or kept changing, within each fleet wait: [Some(("15820648756197945668", 5, 4)), Some(("2916391276795815313", 5, 4)), Some(("13418403313753412057", 5, 4)), Some(("7707937369847094701", 5, 4)), Some(("11452840434543742186", 5, 4))]
+--- chaos-fresh-member-a-6360 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 15820648756197945668
+  fleet_host_epoch: 1
+  fleet_members: 2916391276795815313 7707937369847094701 11452840434543742186 13418403313753412057 15820648756197945668
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 2916391276795815313: lent=false cwnd=130934 srtt_ns=198190 pto_ns=1198190 spurious_losses=0 persistent_collapses=0 consumed=3525 mtu=65496
+  fleet_session 7707937369847094701: lent=false cwnd=130934 srtt_ns=233989 pto_ns=1233989 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 11452840434543742186: lent=false cwnd=130934 srtt_ns=137339 pto_ns=1137339 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 13418403313753412057: lent=false cwnd=130934 srtt_ns=439387 pto_ns=2329279 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-b-6360 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 2916391276795815313
+  fleet_host_epoch: 1
+  fleet_members: 2916391276795815313 7707937369847094701 11452840434543742186 13418403313753412057 15820648756197945668
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 7707937369847094701: lent=false cwnd=130934 srtt_ns=350418 pto_ns=2315266 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 11452840434543742186: lent=false cwnd=130934 srtt_ns=172473 pto_ns=1172473 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 13418403313753412057: lent=false cwnd=130934 srtt_ns=409813 pto_ns=2287941 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 15820648756197945668: lent=false cwnd=130934 srtt_ns=377782 pto_ns=1897894 spurious_losses=0 persistent_collapses=0 consumed=3525 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-c-6360 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 13418403313753412057
+  fleet_host_epoch: 1
+  fleet_members: 2916391276795815313 7707937369847094701 11452840434543742186 13418403313753412057 15820648756197945668
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 2916391276795815313: lent=false cwnd=130934 srtt_ns=583312 pto_ns=3695128 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 7707937369847094701: lent=false cwnd=130934 srtt_ns=459025 pto_ns=2525001 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 11452840434543742186: lent=false cwnd=130934 srtt_ns=310003 pto_ns=1409343 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 15820648756197945668: lent=false cwnd=130934 srtt_ns=464953 pto_ns=2368257 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-d-6360 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 7707937369847094701
+  fleet_host_epoch: 1
+  fleet_members: 2916391276795815313 7707937369847094701 11452840434543742186 13418403313753412057 15820648756197945668
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 2916391276795815313: lent=false cwnd=130934 srtt_ns=359630 pto_ns=1574366 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 11452840434543742186: lent=false cwnd=130934 srtt_ns=257162 pto_ns=1257162 spurious_losses=0 persistent_collapses=0 consumed=2650 mtu=65496
+  fleet_session 13418403313753412057: lent=false cwnd=130934 srtt_ns=292294 pto_ns=1292294 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 15820648756197945668: lent=false cwnd=130934 srtt_ns=487318 pto_ns=3227258 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-e-6360 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 11452840434543742186
+  fleet_host_epoch: 1
+  fleet_members: 2916391276795815313 7707937369847094701 11452840434543742186 13418403313753412057 15820648756197945668
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 2916391276795815313: lent=false cwnd=130934 srtt_ns=717953 pto_ns=3990865 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 7707937369847094701: lent=false cwnd=130934 srtt_ns=742020 pto_ns=3929128 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 13418403313753412057: lent=false cwnd=130934 srtt_ns=571312 pto_ns=3571704 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 15820648756197945668: lent=false cwnd=130934 srtt_ns=402038 pto_ns=2423754 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+--
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 41.56s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 1 exit 101
+== run 2 at 23:14:39, load 2.29 2.32 1.25
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (11368) panicked at crates/cli/tests/live_chaos.rs:326:7:
+the fleet formed, or kept changing, within each fleet wait: [Some(("8538644604809011676", 5, 4)), Some(("5329144730862581449", 5, 4)), Some(("12774686822293287546", 5, 4)), Some(("11773649397597807794", 5, 4)), Some(("5563909301991648749", 5, 4))]
+--- chaos-fresh-member-a-11367 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 8538644604809011676
+  fleet_host_epoch: 1
+  fleet_members: 5329144730862581449 5563909301991648749 8538644604809011676 11773649397597807794 12774686822293287546
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 5329144730862581449: lent=false cwnd=130934 srtt_ns=288877 pto_ns=1288877 spurious_losses=0 persistent_collapses=0 consumed=3528 mtu=65496
+  fleet_session 5563909301991648749: lent=false cwnd=130934 srtt_ns=285736 pto_ns=1460600 spurious_losses=0 persistent_collapses=0 consumed=2662 mtu=65496
+  fleet_session 11773649397597807794: lent=false cwnd=130934 srtt_ns=473608 pto_ns=2336152 spurious_losses=0 persistent_collapses=0 consumed=2662 mtu=65496
+  fleet_session 12774686822293287546: lent=false cwnd=130934 srtt_ns=349278 pto_ns=2047246 spurious_losses=0 persistent_collapses=0 consumed=2662 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-b-11367 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 5329144730862581449
+  fleet_host_epoch: 1
+  fleet_members: 5329144730862581449 5563909301991648749 8538644604809011676 11773649397597807794 12774686822293287546
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 5563909301991648749: lent=false cwnd=130934 srtt_ns=774281 pto_ns=4132185 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  fleet_session 8538644604809011676: lent=false cwnd=130934 srtt_ns=302895 pto_ns=1302895 spurious_losses=0 persistent_collapses=0 consumed=3526 mtu=65496
+  fleet_session 11773649397597807794: lent=false cwnd=130934 srtt_ns=467378 pto_ns=2628126 spurious_losses=0 persistent_collapses=0 consumed=2662 mtu=65496
+  fleet_session 12774686822293287546: lent=false cwnd=130934 srtt_ns=247630 pto_ns=1247630 spurious_losses=0 persistent_collapses=0 consumed=2662 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-c-11367 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 12774686822293287546
+  fleet_host_epoch: 1
+  fleet_members: 5329144730862581449 5563909301991648749 8538644604809011676 11773649397597807794 12774686822293287546
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 5329144730862581449: lent=false cwnd=130934 srtt_ns=199232 pto_ns=1199232 spurious_losses=0 persistent_collapses=0 consumed=2662 mtu=65496
+  fleet_session 5563909301991648749: lent=false cwnd=130934 srtt_ns=418630 pto_ns=2200070 spurious_losses=0 persistent_collapses=0 consumed=2662 mtu=65496
+  fleet_session 8538644604809011676: lent=false cwnd=130934 srtt_ns=197396 pto_ns=1197396 spurious_losses=0 persistent_collapses=0 consumed=2662 mtu=65496
+  fleet_session 11773649397597807794: lent=false cwnd=130934 srtt_ns=248435 pto_ns=1248435 spurious_losses=0 persistent_collapses=0 consumed=2662 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-d-11367 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 11773649397597807794
+  fleet_host_epoch: 1
+  fleet_members: 5329144730862581449 5563909301991648749 8538644604809011676 11773649397597807794 12774686822293287546
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 5329144730862581449: lent=false cwnd=130934 srtt_ns=780521 pto_ns=5526089 spurious_losses=0 persistent_collapses=0 consumed=2662 mtu=65496
+  fleet_session 5563909301991648749: lent=false cwnd=130934 srtt_ns=847052 pto_ns=5653932 spurious_losses=0 persistent_collapses=0 consumed=2662 mtu=65496
+  fleet_session 8538644604809011676: lent=false cwnd=130934 srtt_ns=520137 pto_ns=2639521 spurious_losses=0 persistent_collapses=0 consumed=2662 mtu=65496
+  fleet_session 12774686822293287546: lent=false cwnd=130934 srtt_ns=287392 pto_ns=1287392 spurious_losses=0 persistent_collapses=0 consumed=2662 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-e-11367 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 5563909301991648749
+  fleet_host_epoch: 1
+  fleet_members: 5329144730862581449 5563909301991648749 8538644604809011676 11773649397597807794 12774686822293287546
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 5329144730862581449: lent=false cwnd=130934 srtt_ns=386180 pto_ns=1845300 spurious_losses=0 persistent_collapses=0 consumed=2662 mtu=65496
+  fleet_session 8538644604809011676: lent=false cwnd=130934 srtt_ns=315674 pto_ns=1315674 spurious_losses=0 persistent_collapses=0 consumed=2662 mtu=65496
+  fleet_session 11773649397597807794: lent=false cwnd=130934 srtt_ns=697858 pto_ns=4455726 spurious_losses=0 persistent_collapses=0 consumed=2662 mtu=65496
+  fleet_session 12774686822293287546: lent=false cwnd=130934 srtt_ns=676550 pto_ns=3494050 spurious_losses=0 persistent_collapses=0 consumed=2662 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+--
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 41.55s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 2 exit 101
+== run 3 at 23:15:20, load 2.43 2.34 1.30
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (16125) panicked at crates/cli/tests/live_chaos.rs:326:7:
+the fleet formed, or kept changing, within each fleet wait: [Some(("15318365451458177889", 5, 4)), Some(("11576955000568427023", 5, 4)), Some(("15803617997347435234", 5, 4)), Some(("1551738655898364491", 5, 4)), Some(("4606226975267459432", 5, 4))]
+--- chaos-fresh-member-a-16124 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 15318365451458177889
+  fleet_host_epoch: 1
+  fleet_members: 1551738655898364491 4606226975267459432 11576955000568427023 15318365451458177889 15803617997347435234
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 1551738655898364491: lent=false cwnd=130934 srtt_ns=413103 pto_ns=1413103 spurious_losses=0 persistent_collapses=0 consumed=2663 mtu=65496
+  fleet_session 4606226975267459432: lent=false cwnd=130934 srtt_ns=525101 pto_ns=1889017 spurious_losses=0 persistent_collapses=0 consumed=2663 mtu=65496
+  fleet_session 11576955000568427023: lent=false cwnd=130934 srtt_ns=464767 pto_ns=2094395 spurious_losses=0 persistent_collapses=0 consumed=3530 mtu=65496
+  fleet_session 15803617997347435234: lent=false cwnd=130934 srtt_ns=310949 pto_ns=1565557 spurious_losses=0 persistent_collapses=0 consumed=2663 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-b-16124 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 11576955000568427023
+  fleet_host_epoch: 1
+  fleet_members: 1551738655898364491 4606226975267459432 11576955000568427023 15318365451458177889 15803617997347435234
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 1551738655898364491: lent=false cwnd=130934 srtt_ns=645366 pto_ns=3949146 spurious_losses=0 persistent_collapses=0 consumed=2653 mtu=65496
+  fleet_session 4606226975267459432: lent=false cwnd=130934 srtt_ns=323537 pto_ns=1396261 spurious_losses=0 persistent_collapses=0 consumed=2653 mtu=65496
+  fleet_session 15318365451458177889: lent=false cwnd=130934 srtt_ns=788770 pto_ns=4069334 spurious_losses=0 persistent_collapses=0 consumed=3519 mtu=65496
+  fleet_session 15803617997347435234: lent=false cwnd=130934 srtt_ns=780279 pto_ns=5798375 spurious_losses=0 persistent_collapses=0 consumed=2653 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-c-16124 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 15803617997347435234
+  fleet_host_epoch: 1
+  fleet_members: 1551738655898364491 4606226975267459432 11576955000568427023 15318365451458177889 15803617997347435234
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 1551738655898364491: lent=false cwnd=130934 srtt_ns=331519 pto_ns=1698631 spurious_losses=0 persistent_collapses=0 consumed=2653 mtu=65496
+  fleet_session 4606226975267459432: lent=false cwnd=130934 srtt_ns=395398 pto_ns=1914802 spurious_losses=0 persistent_collapses=0 consumed=2653 mtu=65496
+  fleet_session 11576955000568427023: lent=false cwnd=130934 srtt_ns=356082 pto_ns=1832758 spurious_losses=0 persistent_collapses=0 consumed=2653 mtu=65496
+  fleet_session 15318365451458177889: lent=false cwnd=130934 srtt_ns=512401 pto_ns=2095649 spurious_losses=0 persistent_collapses=0 consumed=2663 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-d-16124 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 1551738655898364491
+  fleet_host_epoch: 1
+  fleet_members: 1551738655898364491 4606226975267459432 11576955000568427023 15318365451458177889 15803617997347435234
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 4606226975267459432: lent=false cwnd=130934 srtt_ns=925481 pto_ns=5701445 spurious_losses=0 persistent_collapses=0 consumed=2653 mtu=65496
+  fleet_session 11576955000568427023: lent=false cwnd=130934 srtt_ns=717753 pto_ns=4977329 spurious_losses=0 persistent_collapses=0 consumed=2653 mtu=65496
+  fleet_session 15318365451458177889: lent=false cwnd=130934 srtt_ns=502267 pto_ns=1697811 spurious_losses=0 persistent_collapses=0 consumed=2653 mtu=65496
+  fleet_session 15803617997347435234: lent=false cwnd=130934 srtt_ns=239829 pto_ns=1239829 spurious_losses=0 persistent_collapses=0 consumed=2653 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-e-16124 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 4606226975267459432
+  fleet_host_epoch: 1
+  fleet_members: 1551738655898364491 4606226975267459432 11576955000568427023 15318365451458177889 15803617997347435234
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 1551738655898364491: lent=false cwnd=130934 srtt_ns=413862 pto_ns=1879070 spurious_losses=0 persistent_collapses=0 consumed=2653 mtu=65496
+  fleet_session 11576955000568427023: lent=false cwnd=130934 srtt_ns=1171430 pto_ns=9237842 spurious_losses=0 persistent_collapses=0 consumed=2653 mtu=65496
+  fleet_session 15318365451458177889: lent=false cwnd=130934 srtt_ns=347322 pto_ns=1347322 spurious_losses=0 persistent_collapses=0 consumed=2653 mtu=65496
+  fleet_session 15803617997347435234: lent=false cwnd=130934 srtt_ns=739555 pto_ns=4707563 spurious_losses=0 persistent_collapses=0 consumed=2653 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+--
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 41.36s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 3 exit 101
+== run 4 at 23:16:02, load 3.23 2.55 1.42
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (20600) panicked at crates/cli/tests/live_chaos.rs:326:7:
+the fleet formed, or kept changing, within each fleet wait: [Some(("15921211341959565048", 5, 4)), Some(("7749900072381344130", 5, 4)), Some(("17199188118223971759", 5, 4)), Some(("9455919137516894442", 5, 4)), Some(("13653536578955071438", 5, 4))]
+--- chaos-fresh-member-a-20599 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 15921211341959565048
+  fleet_host_epoch: 1
+  fleet_members: 7749900072381344130 9455919137516894442 13653536578955071438 15921211341959565048 17199188118223971759
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 7749900072381344130: lent=false cwnd=130934 srtt_ns=258466 pto_ns=1258466 spurious_losses=0 persistent_collapses=0 consumed=3515 mtu=65496
+  fleet_session 9455919137516894442: lent=false cwnd=130934 srtt_ns=301415 pto_ns=1621079 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 13653536578955071438: lent=false cwnd=130934 srtt_ns=480618 pto_ns=2884438 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 17199188118223971759: lent=false cwnd=130934 srtt_ns=473839 pto_ns=2738963 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-b-20599 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 7749900072381344130
+  fleet_host_epoch: 1
+  fleet_members: 7749900072381344130 9455919137516894442 13653536578955071438 15921211341959565048 17199188118223971759
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 9455919137516894442: lent=false cwnd=130934 srtt_ns=387040 pto_ns=1984956 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 13653536578955071438: lent=false cwnd=130934 srtt_ns=451235 pto_ns=2432419 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 15921211341959565048: lent=false cwnd=130934 srtt_ns=342681 pto_ns=1615449 spurious_losses=0 persistent_collapses=0 consumed=3525 mtu=65496
+  fleet_session 17199188118223971759: lent=false cwnd=130934 srtt_ns=469090 pto_ns=2735338 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-c-20599 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 17199188118223971759
+  fleet_host_epoch: 1
+  fleet_members: 7749900072381344130 9455919137516894442 13653536578955071438 15921211341959565048 17199188118223971759
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 7749900072381344130: lent=false cwnd=130934 srtt_ns=425645 pto_ns=2608821 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 9455919137516894442: lent=false cwnd=130934 srtt_ns=509003 pto_ns=3179439 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 13653536578955071438: lent=false cwnd=130934 srtt_ns=173940 pto_ns=1173940 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 15921211341959565048: lent=false cwnd=130934 srtt_ns=396558 pto_ns=2406326 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-d-20599 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 9455919137516894442
+  fleet_host_epoch: 1
+  fleet_members: 7749900072381344130 9455919137516894442 13653536578955071438 15921211341959565048 17199188118223971759
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 7749900072381344130: lent=false cwnd=130934 srtt_ns=245964 pto_ns=1245964 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 13653536578955071438: lent=false cwnd=130934 srtt_ns=297251 pto_ns=1297251 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 15921211341959565048: lent=false cwnd=130934 srtt_ns=367366 pto_ns=2136366 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 17199188118223971759: lent=false cwnd=130934 srtt_ns=317333 pto_ns=1611773 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  shard 0 refused fleet.link.stale_return: 1
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-e-20599 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 13653536578955071438
+  fleet_host_epoch: 1
+  fleet_members: 7749900072381344130 9455919137516894442 13653536578955071438 15921211341959565048 17199188118223971759
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 7749900072381344130: lent=false cwnd=130934 srtt_ns=674808 pto_ns=3907016 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 9455919137516894442: lent=false cwnd=130934 srtt_ns=305286 pto_ns=1305286 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 15921211341959565048: lent=false cwnd=130934 srtt_ns=367174 pto_ns=2137286 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  fleet_session 17199188118223971759: lent=false cwnd=130934 srtt_ns=316881 pto_ns=1709633 spurious_losses=0 persistent_collapses=0 consumed=2660 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+--
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 41.55s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 4 exit 101
+== run 5 at 23:16:43, load 3.80 2.78 1.55
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (25716) panicked at crates/cli/tests/live_chaos.rs:326:7:
+the fleet formed, or kept changing, within each fleet wait: [Some(("10991651663467818672", 5, 4)), Some(("12374096977738211808", 5, 4)), Some(("9570205303165811740", 5, 4)), Some(("13450526802230422779", 5, 4)), Some(("943353293558176914", 5, 4))]
+--- chaos-fresh-member-a-25715 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 10991651663467818672
+  fleet_host_epoch: 1
+  fleet_members: 943353293558176914 9570205303165811740 10991651663467818672 12374096977738211808 13450526802230422779
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 943353293558176914: lent=false cwnd=130934 srtt_ns=616651 pto_ns=2442735 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  fleet_session 9570205303165811740: lent=false cwnd=130934 srtt_ns=586701 pto_ns=3219237 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  fleet_session 12374096977738211808: lent=false cwnd=130934 srtt_ns=611979 pto_ns=3212179 spurious_losses=0 persistent_collapses=0 consumed=3518 mtu=65496
+  fleet_session 13450526802230422779: lent=false cwnd=130934 srtt_ns=629065 pto_ns=2057865 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-b-25715 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 12374096977738211808
+  fleet_host_epoch: 1
+  fleet_members: 943353293558176914 9570205303165811740 10991651663467818672 12374096977738211808 13450526802230422779
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 943353293558176914: lent=false cwnd=130934 srtt_ns=468825 pto_ns=1993197 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  fleet_session 9570205303165811740: lent=false cwnd=130934 srtt_ns=381296 pto_ns=1498384 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  fleet_session 10991651663467818672: lent=false cwnd=130934 srtt_ns=532784 pto_ns=1599484 spurious_losses=0 persistent_collapses=0 consumed=3518 mtu=65496
+  fleet_session 13450526802230422779: lent=false cwnd=130934 srtt_ns=490173 pto_ns=1745305 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-c-25715 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 9570205303165811740
+  fleet_host_epoch: 1
+  fleet_members: 943353293558176914 9570205303165811740 10991651663467818672 12374096977738211808 13450526802230422779
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 943353293558176914: lent=false cwnd=130934 srtt_ns=954055 pto_ns=6224895 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  fleet_session 10991651663467818672: lent=false cwnd=130934 srtt_ns=680046 pto_ns=3042650 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  fleet_session 12374096977738211808: lent=false cwnd=130934 srtt_ns=679134 pto_ns=4836758 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  fleet_session 13450526802230422779: lent=false cwnd=130934 srtt_ns=742527 pto_ns=4865043 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-d-25715 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 13450526802230422779
+  fleet_host_epoch: 1
+  fleet_members: 943353293558176914 9570205303165811740 10991651663467818672 12374096977738211808 13450526802230422779
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 943353293558176914: lent=false cwnd=130934 srtt_ns=348603 pto_ns=1742663 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  fleet_session 9570205303165811740: lent=false cwnd=130934 srtt_ns=722820 pto_ns=4273416 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  fleet_session 10991651663467818672: lent=false cwnd=130934 srtt_ns=725625 pto_ns=2687673 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  fleet_session 12374096977738211808: lent=false cwnd=130934 srtt_ns=636248 pto_ns=3876516 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-e-25715 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 943353293558176914
+  fleet_host_epoch: 1
+  fleet_members: 943353293558176914 9570205303165811740 10991651663467818672 12374096977738211808 13450526802230422779
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 9570205303165811740: lent=false cwnd=130934 srtt_ns=755923 pto_ns=4784791 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  fleet_session 10991651663467818672: lent=false cwnd=130934 srtt_ns=806545 pto_ns=3589997 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  fleet_session 12374096977738211808: lent=false cwnd=130934 srtt_ns=408451 pto_ns=2014619 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  fleet_session 13450526802230422779: lent=false cwnd=130934 srtt_ns=1049188 pto_ns=6682332 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+--
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 40.78s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 5 exit 101
+== run 6 at 23:17:24, load 3.53 2.81 1.61
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (30561) panicked at crates/cli/tests/live_chaos.rs:326:7:
+the fleet formed, or kept changing, within each fleet wait: [Some(("7800913251778631947", 5, 4)), Some(("16276903692955010019", 5, 4)), Some(("8556960824132000599", 5, 4)), Some(("1790607683656812280", 5, 4)), Some(("5480767627390044579", 5, 4))]
+--- chaos-fresh-member-a-30560 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 7800913251778631947
+  fleet_host_epoch: 1
+  fleet_members: 1790607683656812280 5480767627390044579 7800913251778631947 8556960824132000599 16276903692955010019
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 1790607683656812280: lent=false cwnd=130934 srtt_ns=329331 pto_ns=1527983 spurious_losses=0 persistent_collapses=0 consumed=2665 mtu=65496
+  fleet_session 5480767627390044579: lent=false cwnd=130934 srtt_ns=619284 pto_ns=3296008 spurious_losses=0 persistent_collapses=0 consumed=2665 mtu=65496
+  fleet_session 8556960824132000599: lent=false cwnd=130934 srtt_ns=678457 pto_ns=3898313 spurious_losses=0 persistent_collapses=0 consumed=2665 mtu=65496
+  fleet_session 16276903692955010019: lent=false cwnd=130934 srtt_ns=300453 pto_ns=1300453 spurious_losses=0 persistent_collapses=0 consumed=3530 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-b-30560 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 16276903692955010019
+  fleet_host_epoch: 1
+  fleet_members: 1790607683656812280 5480767627390044579 7800913251778631947 8556960824132000599 16276903692955010019
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 1790607683656812280: lent=false cwnd=130934 srtt_ns=418335 pto_ns=2320303 spurious_losses=0 persistent_collapses=0 consumed=2655 mtu=65496
+  fleet_session 5480767627390044579: lent=false cwnd=130934 srtt_ns=757352 pto_ns=4482696 spurious_losses=0 persistent_collapses=0 consumed=2655 mtu=65496
+  fleet_session 7800913251778631947: lent=false cwnd=130934 srtt_ns=321946 pto_ns=1321946 spurious_losses=0 persistent_collapses=0 consumed=3522 mtu=65496
+  fleet_session 8556960824132000599: lent=false cwnd=130934 srtt_ns=309604 pto_ns=1799844 spurious_losses=0 persistent_collapses=0 consumed=2665 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-c-30560 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 8556960824132000599
+  fleet_host_epoch: 1
+  fleet_members: 1790607683656812280 5480767627390044579 7800913251778631947 8556960824132000599 16276903692955010019
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 1790607683656812280: lent=false cwnd=130934 srtt_ns=260133 pto_ns=1260133 spurious_losses=0 persistent_collapses=0 consumed=2665 mtu=65496
+  fleet_session 5480767627390044579: lent=false cwnd=130934 srtt_ns=145636 pto_ns=1145636 spurious_losses=0 persistent_collapses=0 consumed=2655 mtu=65496
+  fleet_session 7800913251778631947: lent=false cwnd=130934 srtt_ns=339474 pto_ns=1339474 spurious_losses=0 persistent_collapses=0 consumed=2665 mtu=65496
+  fleet_session 16276903692955010019: lent=false cwnd=130934 srtt_ns=143381 pto_ns=1143381 spurious_losses=0 persistent_collapses=0 consumed=2665 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-d-30560 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 1790607683656812280
+  fleet_host_epoch: 1
+  fleet_members: 1790607683656812280 5480767627390044579 7800913251778631947 8556960824132000599 16276903692955010019
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 5480767627390044579: lent=false cwnd=130934 srtt_ns=569828 pto_ns=3404748 spurious_losses=0 persistent_collapses=0 consumed=2655 mtu=65496
+  fleet_session 7800913251778631947: lent=false cwnd=130934 srtt_ns=618163 pto_ns=2733791 spurious_losses=0 persistent_collapses=0 consumed=2665 mtu=65496
+  fleet_session 8556960824132000599: lent=false cwnd=130934 srtt_ns=612442 pto_ns=3049646 spurious_losses=0 persistent_collapses=0 consumed=2665 mtu=65496
+  fleet_session 16276903692955010019: lent=false cwnd=130934 srtt_ns=279098 pto_ns=1625522 spurious_losses=0 persistent_collapses=0 consumed=2665 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-e-30560 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 5480767627390044579
+  fleet_host_epoch: 1
+  fleet_members: 1790607683656812280 5480767627390044579 7800913251778631947 8556960824132000599 16276903692955010019
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 1790607683656812280: lent=false cwnd=130934 srtt_ns=460514 pto_ns=3004998 spurious_losses=0 persistent_collapses=0 consumed=2655 mtu=65496
+  fleet_session 7800913251778631947: lent=false cwnd=130934 srtt_ns=309967 pto_ns=1309967 spurious_losses=0 persistent_collapses=0 consumed=2655 mtu=65496
+  fleet_session 8556960824132000599: lent=false cwnd=130934 srtt_ns=743711 pto_ns=5030263 spurious_losses=0 persistent_collapses=0 consumed=2655 mtu=65496
+  fleet_session 16276903692955010019: lent=false cwnd=130934 srtt_ns=705825 pto_ns=5220725 spurious_losses=0 persistent_collapses=0 consumed=2655 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+--
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 41.43s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 6 exit 101
+== run 7 at 23:18:06, load 3.57 2.92 1.70
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (35725) panicked at crates/cli/tests/live_chaos.rs:326:7:
+the fleet formed, or kept changing, within each fleet wait: [Some(("15458952060695230817", 5, 4)), Some(("8675035940783537853", 5, 4)), Some(("9151924277316086857", 5, 4)), Some(("706145146400937865", 5, 4)), Some(("223230949771933275", 5, 4))]
+--- chaos-fresh-member-a-35724 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 15458952060695230817
+  fleet_host_epoch: 1
+  fleet_members: 223230949771933275 706145146400937865 8675035940783537853 9151924277316086857 15458952060695230817
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 223230949771933275: lent=false cwnd=130934 srtt_ns=734656 pto_ns=3110128 spurious_losses=0 persistent_collapses=0 consumed=2664 mtu=65496
+  fleet_session 706145146400937865: lent=false cwnd=130934 srtt_ns=706722 pto_ns=3577938 spurious_losses=0 persistent_collapses=0 consumed=2664 mtu=65496
+  fleet_session 8675035940783537853: lent=false cwnd=130934 srtt_ns=485989 pto_ns=1821609 spurious_losses=0 persistent_collapses=0 consumed=3529 mtu=65496
+  fleet_session 9151924277316086857: lent=false cwnd=130934 srtt_ns=578635 pto_ns=2086039 spurious_losses=0 persistent_collapses=0 consumed=2664 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-b-35724 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 8675035940783537853
+  fleet_host_epoch: 1
+  fleet_members: 223230949771933275 706145146400937865 8675035940783537853 9151924277316086857 15458952060695230817
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 223230949771933275: lent=false cwnd=130934 srtt_ns=669793 pto_ns=4621317 spurious_losses=0 persistent_collapses=0 consumed=2644 mtu=65496
+  fleet_session 706145146400937865: lent=false cwnd=130934 srtt_ns=611275 pto_ns=4484543 spurious_losses=0 persistent_collapses=0 consumed=2664 mtu=65496
+  fleet_session 9151924277316086857: lent=false cwnd=130934 srtt_ns=1181024 pto_ns=5779388 spurious_losses=0 persistent_collapses=0 consumed=2664 mtu=65496
+  fleet_session 15458952060695230817: lent=false cwnd=130934 srtt_ns=745668 pto_ns=4041772 spurious_losses=0 persistent_collapses=0 consumed=3529 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-c-35724 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 9151924277316086857
+  fleet_host_epoch: 1
+  fleet_members: 223230949771933275 706145146400937865 8675035940783537853 9151924277316086857 15458952060695230817
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 223230949771933275: lent=false cwnd=130934 srtt_ns=595526 pto_ns=3161622 spurious_losses=0 persistent_collapses=0 consumed=2654 mtu=65496
+  fleet_session 706145146400937865: lent=false cwnd=130934 srtt_ns=315461 pto_ns=1812413 spurious_losses=0 persistent_collapses=0 consumed=2664 mtu=65496
+  fleet_session 8675035940783537853: lent=false cwnd=130934 srtt_ns=833505 pto_ns=5116013 spurious_losses=0 persistent_collapses=0 consumed=2664 mtu=65496
+  fleet_session 15458952060695230817: lent=false cwnd=130934 srtt_ns=450127 pto_ns=1450127 spurious_losses=0 persistent_collapses=0 consumed=2664 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-d-35724 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 706145146400937865
+  fleet_host_epoch: 1
+  fleet_members: 223230949771933275 706145146400937865 8675035940783537853 9151924277316086857 15458952060695230817
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 223230949771933275: lent=false cwnd=130934 srtt_ns=677462 pto_ns=3758110 spurious_losses=0 persistent_collapses=0 consumed=2654 mtu=65496
+  fleet_session 8675035940783537853: lent=false cwnd=130934 srtt_ns=678047 pto_ns=4492731 spurious_losses=0 persistent_collapses=0 consumed=2664 mtu=65496
+  fleet_session 9151924277316086857: lent=false cwnd=130934 srtt_ns=1348983 pto_ns=8204495 spurious_losses=0 persistent_collapses=0 consumed=2664 mtu=65496
+  fleet_session 15458952060695230817: lent=false cwnd=130934 srtt_ns=834800 pto_ns=4395708 spurious_losses=0 persistent_collapses=0 consumed=2664 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-e-35724 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 223230949771933275
+  fleet_host_epoch: 1
+  fleet_members: 223230949771933275 706145146400937865 8675035940783537853 9151924277316086857 15458952060695230817
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 706145146400937865: lent=false cwnd=130934 srtt_ns=621892 pto_ns=3842340 spurious_losses=0 persistent_collapses=0 consumed=2654 mtu=65496
+  fleet_session 8675035940783537853: lent=false cwnd=130934 srtt_ns=483386 pto_ns=2782410 spurious_losses=0 persistent_collapses=0 consumed=2654 mtu=65496
+  fleet_session 9151924277316086857: lent=false cwnd=130934 srtt_ns=709768 pto_ns=4517476 spurious_losses=0 persistent_collapses=0 consumed=2654 mtu=65496
+  fleet_session 15458952060695230817: lent=false cwnd=130934 srtt_ns=554866 pto_ns=2557514 spurious_losses=0 persistent_collapses=0 consumed=2654 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+--
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 41.53s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 7 exit 101
+== run 8 at 23:18:48, load 3.87 3.10 1.82
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (40102) panicked at crates/cli/tests/live_chaos.rs:326:7:
+the fleet formed, or kept changing, within each fleet wait: [Some(("15102570428485339108", 5, 4)), Some(("10872335472289269267", 5, 4)), Some(("860836737547432694", 5, 4)), Some(("17560616266095439052", 5, 4)), Some(("4486955019536695507", 5, 4))]
+--- chaos-fresh-member-a-40101 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 15102570428485339108
+  fleet_host_epoch: 1
+  fleet_members: 860836737547432694 4486955019536695507 10872335472289269267 15102570428485339108 17560616266095439052
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 860836737547432694: lent=false cwnd=130934 srtt_ns=515072 pto_ns=1627884 spurious_losses=0 persistent_collapses=0 consumed=2662 mtu=65496
+  fleet_session 4486955019536695507: lent=false cwnd=130934 srtt_ns=812814 pto_ns=3793362 spurious_losses=0 persistent_collapses=0 consumed=2662 mtu=65496
+  fleet_session 10872335472289269267: lent=false cwnd=130934 srtt_ns=425817 pto_ns=1980457 spurious_losses=0 persistent_collapses=0 consumed=3527 mtu=65496
+  fleet_session 17560616266095439052: lent=false cwnd=130934 srtt_ns=604454 pto_ns=2795410 spurious_losses=0 persistent_collapses=0 consumed=2662 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-b-40101 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 10872335472289269267
+  fleet_host_epoch: 1
+  fleet_members: 860836737547432694 4486955019536695507 10872335472289269267 15102570428485339108 17560616266095439052
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 860836737547432694: lent=false cwnd=130934 srtt_ns=283920 pto_ns=1516292 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  fleet_session 4486955019536695507: lent=false cwnd=130934 srtt_ns=537176 pto_ns=3432744 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  fleet_session 15102570428485339108: lent=false cwnd=130934 srtt_ns=293108 pto_ns=1293108 spurious_losses=0 persistent_collapses=0 consumed=3518 mtu=65496
+  fleet_session 17560616266095439052: lent=false cwnd=130934 srtt_ns=284912 pto_ns=1588212 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-c-40101 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 860836737547432694
+  fleet_host_epoch: 1
+  fleet_members: 860836737547432694 4486955019536695507 10872335472289269267 15102570428485339108 17560616266095439052
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 4486955019536695507: lent=false cwnd=130934 srtt_ns=451427 pto_ns=2906247 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  fleet_session 10872335472289269267: lent=false cwnd=130934 srtt_ns=278155 pto_ns=1504507 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  fleet_session 15102570428485339108: lent=false cwnd=130934 srtt_ns=421981 pto_ns=1421981 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  fleet_session 17560616266095439052: lent=false cwnd=130934 srtt_ns=306278 pto_ns=1709426 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-d-40101 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 17560616266095439052
+  fleet_host_epoch: 1
+  fleet_members: 860836737547432694 4486955019536695507 10872335472289269267 15102570428485339108 17560616266095439052
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 860836737547432694: lent=false cwnd=130934 srtt_ns=179018 pto_ns=1179018 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  fleet_session 4486955019536695507: lent=false cwnd=130934 srtt_ns=620542 pto_ns=4633134 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  fleet_session 10872335472289269267: lent=false cwnd=130934 srtt_ns=353053 pto_ns=1992813 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  fleet_session 15102570428485339108: lent=false cwnd=130934 srtt_ns=320624 pto_ns=1320624 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+--- chaos-fresh-member-e-40101 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 4486955019536695507
+  fleet_host_epoch: 1
+  fleet_members: 860836737547432694 4486955019536695507 10872335472289269267 15102570428485339108 17560616266095439052
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 860836737547432694: lent=false cwnd=130934 srtt_ns=327983 pto_ns=1465527 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  fleet_session 10872335472289269267: lent=false cwnd=130934 srtt_ns=743812 pto_ns=4930680 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  fleet_session 15102570428485339108: lent=false cwnd=130934 srtt_ns=312146 pto_ns=1312146 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  fleet_session 17560616266095439052: lent=false cwnd=130934 srtt_ns=493910 pto_ns=2974914 spurious_losses=0 persistent_collapses=0 consumed=2652 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+--
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 41.33s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 8 exit 101
