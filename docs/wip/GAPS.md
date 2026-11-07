@@ -1,5 +1,14 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A purge that stopped between calls lost the blocks freed behind it (found 2026-11-07, main CI 42184319025; fixed
+> 2026-11-07).** A-205's give-back test failed on Windows: the daemon counted 118,337,536 of 134,217,728 deleted bytes
+> given back. A per-tick log named the cause. A-214's reserve kept a walk of the idle purge under way, and a delete
+> released its blocks behind the walk's cursor. The walk's end reset the resident count to what it had kept, so the
+> count later saturated at zero mid-walk. The purge then returned at its first line forever, leaving those pages
+> resident and uncounted. Now a walk ends at what the regions' sets record, and the purge's "nothing to do" asks the
+> sets. Main failed 6 of 10 Windows runs of the test; the fix passed 10 of 10 (`diag-liveness-4`, `-6`). The bug record
+> of 2026-11-07 has the log.
+
 > **The anchor kills live daemons on a busy machine (found 2026-11-06, audit step 7; fixed by A-228, Windows CI owed).** Under the
 > A/B bar's load, two spinners a logical CPU (8 on CI's 4-CPU Windows runners), the anchor killed daemons that were
 > alive and serving because their heartbeat lapsed its 1,000 ms liveness budget. A busy machine is the normal case
