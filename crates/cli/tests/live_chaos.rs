@@ -28,6 +28,10 @@
 )]
 #![cfg(unix)]
 
+#[path = "../../server/tests/common/nfs.rs"]
+#[allow(dead_code)]
+mod nfs;
+
 use std::collections::BTreeMap;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,6 +51,10 @@ const SHARDS: &str = "2";
 const FLEET_NAME: &str = "slates-fleet";
 /// Shape: the nodes, in manifest order.
 const FLEET_NODES: [&str; 3] = ["a", "b", "c"];
+/// Shape: a fleet wide enough that its council keeps a majority (3 of 5) with the owner lost and one of a volume's two
+/// holders partitioned, so a takeover runs while a holder of the log cannot answer, and the successor's placement
+/// holds members that are not holders.
+const WIDE_NODES: [&str; 5] = ["a", "b", "c", "d", "e"];
 /// Shape: the fleet's fault tolerance: three nodes at `f = 1`.
 const FLEET_F: usize = 1;
 /// Shape: the ports a node serves on (`slates_server::deploy`): its base and the next.
@@ -148,8 +156,8 @@ fn mint_identity(dir: &str, node: &str) {
 }
 
 #[allow(clippy::disallowed_methods)]
-fn write_manifest(dir: &str, bases: &[u16]) -> String {
-  let nodes: Vec<serde_json::Value> = FLEET_NODES
+fn write_manifest(dir: &str, names: &[&str], bases: &[u16]) -> String {
+  let nodes: Vec<serde_json::Value> = names
     .iter()
     .zip(bases)
     .map(|(node, base)| {
@@ -190,12 +198,12 @@ fn free_port_block(from: u16, count: u16) -> HeldBlock {
   panic!("no block of {count} free loopback UDP ports found from {from}");
 }
 
-fn port_blocks() -> Vec<HeldBlock> {
+fn port_blocks(nodes: usize) -> Vec<HeldBlock> {
   // Offset from `live_fleet.rs`'s start (which multiplies the pid by 7), so the two suites run side by side.
   let offset = (std::process::id().wrapping_mul(13)) % u32::from(PORT_SPAN);
   let mut from = u16::try_from(u32::from(PORT_FLOOR) + offset).unwrap();
   let mut blocks = Vec::new();
-  for _ in FLEET_NODES {
+  for _ in 0..nodes {
     let held = free_port_block(from, PORTS_PER_NODE);
     from = held.base.checked_add(PORTS_PER_NODE).unwrap_or(PORT_FLOOR);
     blocks.push(held);
@@ -281,30 +289,104 @@ fn fleet_view(instance: &str) -> Option<(String, usize, u32)> {
   ))
 }
 
-/// Waits until every node holds all three members alive with both peers probed; returns their member ids.
-fn wait_formed(instances: &[String]) -> Vec<String> {
-  let deadline = Instant::now() + FLEET_WAIT;
+/// Waits until every node holds all `members` members alive with every peer probed; returns their member ids.
+fn wait_formed(instances: &[String], members: usize) -> Vec<String> {
+  let mut window = FrozenWindow::new();
   loop {
     let views: Vec<_> = instances
       .iter()
       .map(|instance| fleet_view(instance))
       .collect();
     if views.iter().all(|view| {
-      view
-        .as_ref()
-        .is_some_and(|(_, members, probed)| *members == FLEET_NODES.len() && *probed == 2)
+      view.as_ref().is_some_and(|(_, held, probed)| {
+        *held == members && usize::try_from(*probed).ok() == members.checked_sub(1)
+      })
     }) {
       return views.into_iter().map(|view| view.unwrap().0).collect();
     }
-    assert!(Instant::now() < deadline, "the fleet formed: {views:?}");
+    if !window.moving(&format!("{views:?}")) {
+      // What the probe and record planes did, for a pair that never probed each other (diag-31 run 7; live-fixes).
+      panic!(
+        "the fleet formed, or kept changing, within each fleet wait: {views:?}\n{}",
+        diagnosis(instances, "")
+      );
+    }
     pause();
   }
 }
 
-/// Waits until the fleet is whole on every node: all three members voting, all three in the committed configuration,
-/// and a record session to each peer (`live_fleet.rs`'s `wait_settled`, which says why).
-fn wait_settled(instances: &[String]) {
-  let deadline = Instant::now() + FLEET_WAIT;
+/// Waits until every node in `instances` has settled at its own neighbourhood generation (the fleet's objects re-placed
+/// onto the neighbourhood after a membership change), judged by progress ([`FrozenWindow`]).
+fn wait_neighbourhood_settled(instances: &[String]) {
+  let mut window = FrozenWindow::new();
+  loop {
+    let views: Vec<(Option<u64>, Option<u64>)> = instances
+      .iter()
+      .map(|instance| {
+        let (_, out, _) = run(instance, &["status"]);
+        let read = |key: &str| {
+          out
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}: ")))
+            .and_then(|value| value.trim().parse::<u64>().ok())
+        };
+        (
+          read("fleet_settled_generation"),
+          read("fleet_neighbourhood_generation"),
+        )
+      })
+      .collect();
+    // Each node settled at its own neighbourhood generation. The generations are each node's own count and differ
+    // between nodes in a settled fleet (3, 8 and 11 side by side in diag-31), so they are not compared across nodes; a
+    // node retired while away is kept out by the stale holder's short stop instead.
+    if views
+      .iter()
+      .all(|(settled, neighbourhood)| settled.is_some() && settled == neighbourhood)
+    {
+      return;
+    }
+    if !window.moving(&format!("{views:?}")) {
+      // What the stuck node reported and shipped toward its new cohort (live-fixes, 2026-11-07).
+      panic!(
+        "every neighbourhood settled, or kept changing, within each fleet wait: {views:?}\n{}",
+        diagnosis(instances, "")
+      );
+    }
+    pause();
+  }
+}
+
+/// A wait judged by progress, not a fixed span: it goes on while what it watches keeps changing, and gives up only after
+/// a whole fleet wait in which nothing changed. A five-member fleet forming on a loaded CI runner took longer than one
+/// fleet wait while it was still forming (diag-28 runs 1 and 2, 2026-11-07; live-fixes measured 37-108 s for the server
+/// fleet suite and judges those waits the same way, `poll_until`).
+struct FrozenWindow {
+  last: Option<String>,
+  since: Instant,
+}
+
+impl FrozenWindow {
+  fn new() -> FrozenWindow {
+    FrozenWindow {
+      last: None,
+      since: Instant::now(),
+    }
+  }
+
+  /// Whether the wait may go on after seeing `now`: it changed, or it has been the same for less than a fleet wait.
+  fn moving(&mut self, now: &str) -> bool {
+    if self.last.as_deref() != Some(now) {
+      self.last = Some(now.to_owned());
+      self.since = Instant::now();
+    }
+    self.since.elapsed() < FLEET_WAIT
+  }
+}
+
+/// Waits until the fleet is whole on every node: all `members` members voting, all in the committed configuration, and
+/// a record session to each peer (`live_fleet.rs`'s `wait_settled`, which says why).
+fn wait_settled(instances: &[String], members: usize) {
+  let mut window = FrozenWindow::new();
   loop {
     let views: Vec<(String, String, usize)> = instances
       .iter()
@@ -329,17 +411,31 @@ fn wait_settled(instances: &[String]) {
         )
       })
       .collect();
-    let whole = views.iter().all(|(voters, members, sessions)| {
-      voters.trim() == FLEET_NODES.len().to_string()
-        && members.trim() == FLEET_NODES.len().to_string()
-        && *sessions == FLEET_NODES.len() - 1
-    });
+    // The council seats `2f + 1` voters whatever the membership (`slates_cluster::config_group::council_voters`).
+    let expected = members.min(2 * FLEET_F + 1);
+    // Every member holds the whole configuration, and every seat is filled as its voters see it. In a fleet no wider
+    // than the council every member votes and holds a record session to each peer. A wider fleet's members without a
+    // seat report a council of one (they are not in it), and a member need not hold a session to every peer (5-node
+    // runs of 2026-11-07 settled with 2 to 4); there, the flow's first durable writes show the owner reaches its holders.
+    let configured_everywhere = views
+      .iter()
+      .all(|(_, configured, _)| configured.trim() == members.to_string());
+    let seated = views
+      .iter()
+      .filter(|(voters, _, _)| voters.trim() == expected.to_string())
+      .count();
+    let meshed = members > expected
+      || views
+        .iter()
+        .all(|(_, _, sessions)| Some(*sessions) == members.checked_sub(1));
+    let whole = configured_everywhere && seated >= expected && meshed;
     if whole {
       return;
     }
     assert!(
-      Instant::now() < deadline,
-      "the fleet settled (council voters, configuration members, record sessions): {views:?}"
+      window.moving(&format!("{views:?}")),
+      "the fleet settled, or kept changing, within each fleet wait (council voters, configuration members, record \
+       sessions): {views:?}"
     );
     pause();
   }
@@ -410,20 +506,27 @@ struct Fleet {
   instances: Vec<String>,
   supervision: Supervision,
   bootstrap: usize,
+  /// The manifest's node names, one per node index.
+  nodes: &'static [&'static str],
 }
 
 impl Fleet {
   /// Starts three nodes from one manifest, waits until they form, and bootstraps the root once.
   fn start(tag: &str, supervision: Supervision) -> Fleet {
+    Fleet::start_with(tag, supervision, &FLEET_NODES)
+  }
+
+  /// Starts the nodes `nodes` names from one manifest, waits until they form, and bootstraps the root once.
+  fn start_with(tag: &str, supervision: Supervision, nodes: &'static [&'static str]) -> Fleet {
     let pid = std::process::id();
     let scratch = scratch_dir(tag);
-    for node in FLEET_NODES {
+    for node in nodes {
       mint_identity(&scratch.path, node);
     }
-    let blocks = port_blocks();
+    let blocks = port_blocks(nodes.len());
     let bases: Vec<u16> = blocks.iter().map(|held| held.base).collect();
-    let manifest = write_manifest(&scratch.path, &bases);
-    let instances: Vec<String> = FLEET_NODES
+    let manifest = write_manifest(&scratch.path, nodes, &bases);
+    let instances: Vec<String> = nodes
       .iter()
       .map(|node| format!("chaos-{tag}-{node}-{pid}"))
       .collect();
@@ -431,7 +534,7 @@ impl Fleet {
     // (`MachineProfile::measure_patiently`, about 13 s for a lone debug daemon on a loaded Mac, 2026-11-07), and three
     // measuring at once disturb each other past the start wait, so every flow failed at start (live-durability, at load
     // 12 with no other fleet running).
-    let processes = FLEET_NODES
+    let processes = nodes
       .iter()
       .zip(&instances)
       .zip(&blocks)
@@ -441,13 +544,13 @@ impl Fleet {
         Some(process)
       })
       .collect();
-    let hosts = wait_formed(&instances);
+    let hosts = wait_formed(&instances, nodes.len());
     let bootstrap = (0..hosts.len())
       .min_by_key(|index| hosts[*index].parse::<u64>().unwrap())
       .unwrap();
     let (code, _, error) = run(&instances[bootstrap], &["bootstrap", "root"]);
     assert_eq!(code, 0, "one bootstrap of the fresh fleet: {error}");
-    wait_settled(&instances);
+    wait_settled(&instances, nodes.len());
     eprintln!("chaos: fleet {tag} ({supervision:?}) formed and settled: hosts {hosts:?}");
     DIAGNOSED.with(|diagnosed| *diagnosed.borrow_mut() = instances.clone());
     Fleet {
@@ -458,6 +561,7 @@ impl Fleet {
       instances,
       supervision,
       bootstrap,
+      nodes,
     }
   }
 
@@ -521,22 +625,22 @@ impl Fleet {
     self.processes[index] = Some(start_node(
       &self.instances[index],
       &self.manifest,
-      FLEET_NODES[index],
+      self.nodes[index],
       &self.blocks[index],
       self.supervision,
     ));
     wait_answers(&self.instances[index]);
   }
 
-  /// Waits until every live node holds exactly three members, each probed by the others: a succeeded or replaced
-  /// node rejoined under its new identity and the old one retired.
+  /// Waits until every live node holds exactly the manifest's members, each probed by the others: a succeeded or
+  /// replaced node rejoined under its new identity and the old one retired.
   fn wait_rejoined(&self) {
     let live: Vec<String> = (0..self.instances.len())
       .filter(|index| self.processes[*index].is_some())
       .map(|index| self.instances[index].clone())
       .collect();
-    wait_formed(&live);
-    wait_settled(&live);
+    wait_formed(&live, self.nodes.len());
+    wait_settled(&live, self.nodes.len());
   }
 }
 
@@ -752,6 +856,12 @@ struct LiveState {
   epoch: Option<u64>,
   identity: Option<String>,
   fence: u64,
+  /// On the owner, the member ids of the holders its durability counts; empty on a candidate.
+  holders: Vec<String>,
+  /// On the owner, the member ids of the set a holder transition is moving to; empty when none is in flight.
+  moving_to: Vec<String>,
+  /// On the owner, the member ids of the holder set its volume's catalog records (what a takeover counts).
+  recorded: Vec<String>,
 }
 
 fn field<'a>(fields: &'a str, key: &str) -> Option<&'a str> {
@@ -788,10 +898,21 @@ fn live_states(instance: &str, volume: &str) -> Option<Vec<LiveState>> {
             .filter(|identity| *identity != "none")
             .map(str::to_owned),
           fence: number(field(fields, "fence=")).unwrap_or(0),
+          holders: id_list(field(fields, "holders=")),
+          moving_to: id_list(field(fields, "moving_to=")),
+          recorded: id_list(field(fields, "recorded=")),
         })
       })
       .collect(),
   )
+}
+
+/// A status line's comma-joined member ids (`none`, or a line from before the field: empty).
+fn id_list(text: Option<&str>) -> Vec<String> {
+  text
+    .filter(|text| *text != "none")
+    .map(|text| text.split(',').map(str::to_owned).collect())
+    .unwrap_or_default()
 }
 
 /// One sample: when, which node, and what it reported.
@@ -811,25 +932,44 @@ struct Sampler<'a> {
 }
 
 impl Sampler<'_> {
+  /// Samples every node until `stop`, each node on its own thread, then once more; the samples in time order. One thread
+  /// a node, because a `status` call to a stopped (SIGSTOPped) node does not return until it resumes: one round over
+  /// every node left a hole in every node's samples for as long as one was stopped (about 1.5 s of every 2 s partition
+  /// in `candidates_partitioned_in_turn_mid_stream_lose_nothing`, live-durability, 2026-11-07).
   fn run(&self, stop: &AtomicBool) -> Vec<Sample> {
-    let mut samples = Vec::new();
-    while !stop.load(Ordering::Acquire) {
-      samples.extend(self.once());
-      pause();
-    }
-    samples.extend(self.once());
+    let mut samples: Vec<Sample> = std::thread::scope(|scope| {
+      let threads: Vec<_> = self
+        .instances
+        .iter()
+        .enumerate()
+        .map(|(node, instance)| {
+          scope.spawn(move || {
+            let mut samples = Vec::new();
+            while !stop.load(Ordering::Acquire) {
+              samples.extend(self.once(node, instance));
+              pause();
+            }
+            samples.extend(self.once(node, instance));
+            samples
+          })
+        })
+        .collect();
+      threads
+        .into_iter()
+        .flat_map(|thread| thread.join().unwrap())
+        .collect()
+    });
+    samples.sort_by_key(|sample| sample.at);
     samples
   }
 
-  fn once(&self) -> Vec<Sample> {
-    let mut samples = Vec::new();
-    for (node, instance) in self.instances.iter().enumerate() {
-      let at = self.began.elapsed();
-      for state in live_states(instance, self.volume).unwrap_or_default() {
-        samples.push(Sample { at, node, state });
-      }
-    }
-    samples
+  fn once(&self, node: usize, instance: &str) -> Vec<Sample> {
+    let at = self.began.elapsed();
+    live_states(instance, self.volume)
+      .unwrap_or_default()
+      .into_iter()
+      .map(|state| Sample { at, node, state })
+      .collect()
   }
 }
 
@@ -1169,8 +1309,31 @@ fn diagnosis(instances: &[String], volume: &str) -> String {
         .lines()
         .filter(|line| {
           line.starts_with("fleet_session ")
+            || line.starts_with("fleet_members")
             || line.contains(" live ")
             || line.contains("fleet.live.")
+            || line.contains("fleet.takeover")
+            || line.contains("fleet.materialize")
+            || line.contains("fleet.seal.")
+            || line.contains("fleet.plane.")
+            || line.contains("fleet.report.")
+            || line.contains("fleet.ship.")
+            || line.starts_with("fleet_record_link")
+            || line.contains("fleet.link.")
+            || line.contains("fleet.accept.")
+            || line.starts_with("fleet_formed_probe_peers")
+            || line.starts_with("fleet_contacts")
+            || line.contains("fleet.promotion")
+            || line.contains("fleet.record")
+            || line.contains("fleet.owner_location")
+            || line.starts_with("fleet_retirement")
+            || line.starts_with("fleet_settled_generation")
+            || line.starts_with("fleet_neighbourhood_generation")
+            || line.starts_with("fleet_takeovers_pending")
+            || line.starts_with("fleet_held_records")
+            || line.starts_with("fleet_configuration_version")
+            || line.contains("anchor")
+            || line.starts_with("fleet_host")
             || line.contains("lent_to")
         })
         .collect();
@@ -2489,6 +2652,68 @@ fn clients_cut_off_mid_merge_leave_the_green_whole_across_a_takeover() {
   verdict.judge();
 }
 
+/// §4.8 "Membership" with an anchored daemon succeeded (raft-chaos report 8): do start an anchored three-node fleet, let
+/// it settle, then SIGKILL one candidate's daemon so that its anchor starts a successor under a fresh member identity.
+/// Expect the fleet to re-form within the fleet wait: every node holding three members alive with both peers probed, the
+/// successor voting and in the committed configuration, with a record session to each peer. Reported 2026-11-06: the
+/// successor answered in 0.3-0.9 s but held three members with no peer probed for the whole wait, while each other node
+/// held two members and one peer.
+#[test]
+fn a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet() {
+  if !gated("succeeded-rejoins") {
+    return;
+  }
+  let fleet = Fleet::start("rejoins", Supervision::Anchored);
+  let owner_index = fleet.owner_index();
+  let killed_index = fleet.others(owner_index)[0];
+  let began = Instant::now();
+  let successor = fleet.kill_daemon_and_await_successor(killed_index);
+  eprintln!(
+    "rejoins: successor daemon {successor} answered after {:?}",
+    began.elapsed()
+  );
+  let deadline = Instant::now() + FLEET_WAIT;
+  loop {
+    let views: Vec<_> = fleet
+      .instances
+      .iter()
+      .map(|instance| fleet_view(instance))
+      .collect();
+    let formed = views.iter().all(|view| {
+      view
+        .as_ref()
+        .is_some_and(|(_, members, probed)| *members == FLEET_NODES.len() && *probed == 2)
+    });
+    if formed {
+      break;
+    }
+    if Instant::now() >= deadline {
+      for instance in &fleet.instances {
+        let (_, out, _) = run(instance, &["status"]);
+        let lines: Vec<&str> = out
+          .lines()
+          .filter(|line| {
+            line.starts_with("fleet_")
+              || line.contains(" refused fleet.")
+              || line.contains(" refused member")
+              || line.contains(" refused probe")
+          })
+          .filter(|line| {
+            !line.contains("_base_periods")
+              && !line.contains("_rtt_")
+              && !line.contains("_priority")
+          })
+          .collect();
+        eprintln!("rejoins --- {instance}\n{}", lines.join("\n"));
+      }
+      panic!("the fleet re-formed after the successor: {views:?}");
+    }
+    pause();
+  }
+  fleet.wait_rejoined();
+  eprintln!("rejoins: the fleet re-formed after {:?}", began.elapsed());
+}
+
 /// How a volume whose destroy was never answered done settled: destroyed on every survivor (none lists it, each read
 /// refused `NotFound` or `OwnerUnreachable`), or served whole by one.
 enum Settled {
@@ -2554,15 +2779,23 @@ fn a_long_live_log_is_taken_over_whole() {
   let mut verdict = Verdict::new("a long live log taken over");
   // Streamed in steps the stall guard watches (40 durable writes within the fleet wait each), so a write the daemon
   // never answers fails the flow with the fleet printed, where one long stream ran into the test's own timeout.
+  // Each step asks for no more than the positions left before `LONG_LOG`: every write adds at least one, so the step can
+  // always be met. A fixed 40 asked near the end for positions a stream of `LONG_LOG` writes never makes (from 983, 40
+  // more, where the log ends near 1,002), and the flow failed there on every tree (raft, 2026-11-07; CI diag-34).
+  let target = u64::try_from(LONG_LOG).unwrap();
   let (outcomes, samples) = stream_through(&fleet.instances, &owner, &volume, 0..LONG_LOG, |_| {
-    while live_states(&owner, &volume)
-      .unwrap_or_default()
-      .into_iter()
-      .find(|state| !state.holding)
-      .and_then(|state| state.durable)
-      .is_none_or(|durable| durable < u64::try_from(LONG_LOG).unwrap())
-    {
-      after_writes(&owner, &volume, BETWEEN_EVENTS);
+    loop {
+      let durable = live_states(&owner, &volume)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|state| !state.holding)
+        .and_then(|state| state.durable)
+        .unwrap_or(0);
+      let left = target.saturating_sub(durable);
+      if left == 0 {
+        break;
+      }
+      after_writes(&owner, &volume, left.min(BETWEEN_EVENTS));
     }
   });
   verdict.note(latency_line(&outcomes));
@@ -2668,6 +2901,600 @@ fn a_live_entry_past_one_chunk_is_taken_over_whole() {
       )]
     },
   );
+  drop(fleet);
+  verdict.judge();
+}
+
+/// The nodes of `fleet` holding a council seat, by index, as the bootstrap node's status names them.
+fn council_voters_by_index(fleet: &Fleet) -> Vec<usize> {
+  let (_, out, _) = run(&fleet.instances[fleet.bootstrap], &["status"]);
+  let seated: Vec<String> = value_of(&out, "fleet_council_voter_ids")
+    .split_whitespace()
+    .map(str::to_owned)
+    .collect();
+  (0..fleet.instances.len())
+    .filter(|index| {
+      fleet_view(&fleet.instances[*index]).is_some_and(|(host, _, _)| seated.contains(&host))
+    })
+    .collect()
+}
+
+/// The nodes of `fleet` holding a copy of `volume`'s log as candidates, by index.
+fn holders_of(fleet: &Fleet, volume: &str) -> Vec<usize> {
+  (0..fleet.instances.len())
+    .filter(|index| {
+      live_states(&fleet.instances[*index], volume)
+        .unwrap_or_default()
+        .iter()
+        .any(|state| state.holding)
+    })
+    .collect()
+}
+
+/// A-240, phase one with a member that is not a holder: on a five-node fleet (f = 1, so a volume has two holders beside
+/// its owner, and the council seats three voters), do stream writes to a live volume owned by a member without a seat,
+/// replace a node that holds none of the log (a fresh member identity joins), and stop one holder (SIGSTOP) while the
+/// writes go on through the other, so it falls behind. Then stop the stream, crash the owner and resume the stale
+/// holder. Both holders answer the registers' takeover (the head and catalog promotion needs `f + 1` of the volume's
+/// original candidates); the moment a survivor has adopted them, the holder with the log is stopped for
+/// [`HOLDER_PAUSE`], past one phase-one exchange, so the live log's phase one meets the stale holder and members that
+/// never held the log. Expect no survivor ever to serve the volume without every acknowledged write (NoLoss), and, when
+/// phase one ran inside the pause, that it waited for the holder (`takeover_waits_quorum`) rather than counting another
+/// member in its place; once the holder resumes, a survivor serves the volume whole. This is KIND's shape: the holder's
+/// reply over a shaped path missed the 1 s exchange, and the successor counted itself and the replacement pod (runs
+/// 42326682216, 42331191530, 42341005472: a holder left at fence 1 after a takeover at epoch 2).
+#[test]
+fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
+  /// Shape: how long the holder with the log is stopped once the registers are adopted: past one phase-one exchange
+  /// (the liveness budget, 1 s) and the record period after it.
+  const HOLDER_PAUSE: Duration = Duration::from_secs(3);
+  if !gated("fresh-member") {
+    return;
+  }
+  let mut fleet = Fleet::start_with("fresh-member", Supervision::Bare, &WIDE_NODES);
+  let instances = fleet.instances.clone();
+  // The owner holds no council seat, so its loss costs the council no vote and the takeover can run with a holder
+  // stopped too (the council seats three of the five).
+  let seated = council_voters_by_index(&fleet);
+  let owner_index = (0..instances.len())
+    .filter(|index| !seated.contains(index))
+    .min_by_key(|index| *index == fleet.bootstrap)
+    .expect("a five-member fleet seats three voters, so two members hold no seat");
+  let owner = instances[owner_index].clone();
+  let volume = create_volume(&owner, "fresh-member", true);
+  let mut verdict = Verdict::new("a member that never held the log at a takeover");
+  verdict.note(format!(
+    "owner {owner}; council seats at {:?}",
+    seated
+      .iter()
+      .map(|index| instances[*index].as_str())
+      .collect::<Vec<_>>()
+  ));
+  let mut roles = None;
+  let fleet_cell = std::cell::RefCell::new(&mut fleet);
+  let (outcomes, _samples) =
+    stream_through(&instances, &owner, &volume, 0..STREAM_FILES, |began| {
+      after_writes(&owner, &volume, BETWEEN_EVENTS);
+      let holders = wait_holders(&fleet_cell.borrow(), &volume, 2);
+      // A member that holds none of the log is replaced: its successor joins under a fresh identity. One without a seat
+      // first, so the council's seats stay where they were.
+      let seated = council_voters_by_index(&fleet_cell.borrow());
+      let replaced = fleet_cell
+        .borrow()
+        .others(owner_index)
+        .into_iter()
+        .filter(|index| !holders.contains(index))
+        .min_by_key(|index| seated.contains(index))
+        .unwrap();
+      fleet_cell.borrow_mut().kill_node(replaced);
+      fleet_cell.borrow_mut().replace_node(replaced);
+      fleet_cell.borrow().wait_rejoined();
+      verdict.note(format!(
+        "{} replaced by a fresh member, rejoined at {:?}",
+        instances[replaced],
+        began.elapsed()
+      ));
+      // The replacement may move the volume's placement, and the shipper then moves its holders by a transition: the
+      // roles are the holders its durability counts once no transition is in flight.
+      let holders = settled_holders(&fleet_cell.borrow(), owner_index, &volume);
+      verdict.note(format!(
+        "the owner's holders once settled: {:?}",
+        holders
+          .iter()
+          .map(|index| instances[*index].as_str())
+          .collect::<Vec<_>>()
+      ));
+      // The replacement is within the tolerance only once every node's neighbourhood has settled onto it: before then a
+      // volume's records may still sit on the replaced member's old identity, and the owner's loss is a second
+      // failure at f = 1, which the register takeover rightly calls lost (diag-28 run 8; live-fixes, 2026-11-07).
+      wait_neighbourhood_settled(&instances);
+      // The holder stopped at the takeover: one whose seat, with the owner's, leaves the council two of its three votes.
+      let seated = council_voters_by_index(&fleet_cell.borrow());
+      let owner_seated = seated.contains(&owner_index);
+      let current = holders
+        .iter()
+        .copied()
+        .find(|holder| !(owner_seated && seated.contains(holder)))
+        .expect("a holder whose stop with the owner's loss leaves the council a majority");
+      let stale = holders
+        .iter()
+        .copied()
+        .find(|holder| *holder != current)
+        .unwrap();
+      roles = Some((current, stale));
+      after_writes(&owner, &volume, BETWEEN_EVENTS);
+      fleet_cell.borrow().stop(stale);
+      verdict.note(format!(
+        "{} stopped at {:?}",
+        instances[stale],
+        began.elapsed()
+      ));
+      // One write durable without it makes it stale. More only lengthens its stop, and a stop past the failure detector
+      // retires it: with the owner's crash that is two failures at f = 1, which the register takeover rightly calls lost
+      // (diag-30 run 4, diag-28 run 8: the stale holder's configuration frozen at version 8 while the others moved on).
+      after_writes(&owner, &volume, 1);
+    });
+  let (current, stale) = roles.expect("the flow chose its holders' roles");
+  let survivors: Vec<&str> = (0..instances.len())
+    .filter(|index| *index != owner_index)
+    .map(|index| instances[index].as_str())
+    .collect();
+  let adopted_before: u64 = survivors
+    .iter()
+    .map(|survivor| counter(survivor, "fleet.takeover.adopted"))
+    .sum();
+  // The writes since the stale holder stopped are durable on the owner and `current` alone. Once the stream has stopped
+  // (every write answered), the owner is crashed and the stale holder resumed: nothing reaches it any more.
+  fleet.kill_node(owner_index);
+  fleet.resume(stale);
+  let acknowledged = outcomes
+    .iter()
+    .filter(|outcome| outcome.refused.is_none())
+    .count();
+  verdict.note(format!(
+    "{acknowledged} writes acknowledged; owner crashed; holders {} (with the log) and {} (stale)",
+    instances[current], instances[stale]
+  ));
+  // The moment a survivor has adopted the registers, the holder with the log is stopped, so the live log's phase one
+  // runs without it.
+  let deadline = Instant::now() + FLEET_WAIT;
+  let adopted_by = loop {
+    if let Some(survivor) = survivors.iter().find(|survivor| {
+      counter(survivor, "fleet.takeover.adopted") > 0
+        && survivors
+          .iter()
+          .map(|survivor| counter(survivor, "fleet.takeover.adopted"))
+          .sum::<u64>()
+          > adopted_before
+    }) {
+      break Some(*survivor);
+    }
+    if Instant::now() >= deadline {
+      break None;
+    }
+    pause();
+  };
+  let Some(adopted_by) = adopted_by else {
+    let live: Vec<String> = survivors
+      .iter()
+      .map(|survivor| (*survivor).to_owned())
+      .collect();
+    verdict.note(format!(
+      "no survivor adopted the registers; the survivors:\n{}",
+      diagnosis(&live, &volume)
+    ));
+    verdict.check(
+      "the registers' takeover",
+      vec!["no survivor adopted the volume's registers within the fleet wait".to_owned()],
+    );
+    drop(fleet);
+    return verdict.judge();
+  };
+  let decisive = adopted_by != instances[current].as_str();
+  if decisive {
+    fleet.stop(current);
+  }
+  let stopped_at = Instant::now();
+  verdict.note(format!(
+    "{adopted_by} adopted the registers; {}",
+    if decisive {
+      format!("{} stopped for {HOLDER_PAUSE:?}", instances[current])
+    } else {
+      "it holds the log itself, so this run cannot show the defect".to_owned()
+    }
+  ));
+  let others: Vec<&str> = survivors
+    .iter()
+    .copied()
+    .filter(|survivor| *survivor != instances[current].as_str())
+    .collect();
+  let mut served_without = None;
+  while decisive && stopped_at.elapsed() < HOLDER_PAUSE {
+    if let Some(successor) = others.iter().find(|survivor| {
+      counter(survivor, "fleet.live.taken_over") > 0 || serving_epoch(survivor, &volume) > 0
+    }) {
+      served_without = Some(*successor);
+      break;
+    }
+    pause();
+  }
+  let waited: u64 = others
+    .iter()
+    .map(|survivor| counter(survivor, "fleet.live.takeover_waits_quorum"))
+    .sum();
+  if let Some(successor) = served_without {
+    verdict.note(format!(
+      "{successor} took the volume over while the holder of the log was stopped"
+    ));
+    verdict.check(
+      "NoLoss (a takeover without the log's holder)",
+      no_loss(successor, &volume, &outcomes),
+    );
+  }
+  verdict.note(format!(
+    "decisive {decisive}; phase one waited for the holders {waited} times while the holder was stopped"
+  ));
+  if decisive {
+    fleet.resume(current);
+  }
+  judge_served(&mut verdict, &survivors, &volume, &outcomes);
+  drop(fleet);
+  verdict.judge();
+}
+
+/// The end of the fresh-member flow: a survivor serves `volume` with every acknowledged write, and every holder the
+/// takeover counted is fenced at its epoch. Those are read from the successor: the holder set its catalog records (the
+/// set its phase one counted, which a transition may have recorded before the old owner activated it) and its own
+/// holders. A copy left on any other survivor, a member a transition dropped, is counted by no one and is noted.
+fn judge_served(verdict: &mut Verdict, survivors: &[&str], volume: &str, outcomes: &[Outcome]) {
+  match wait_serving(survivors, volume, outcomes) {
+    Some((successor, took)) => {
+      verdict.note(format!("{successor} served the volume after {took:?}"));
+      verdict.check("NoLoss (successor)", no_loss(successor, volume, outcomes));
+      let epoch = takeover_epoch(successor, volume);
+      let hosts: BTreeMap<String, &str> = survivors
+        .iter()
+        .filter_map(|survivor| fleet_view(survivor).map(|(host, _, _)| (host, *survivor)))
+        .collect();
+      let named: Vec<String> = live_states(successor, volume)
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|state| state.recorded.into_iter().chain(state.holders))
+        .collect();
+      let counted: Vec<&str> = hosts
+        .iter()
+        .filter(|(host, survivor)| named.contains(host) && **survivor != successor)
+        .map(|(_, survivor)| *survivor)
+        .collect();
+      verdict.note(format!(
+        "the successor's recorded and active holders among the survivors: {counted:?}"
+      ));
+      let unfenced = fenced_at_or_above(&counted, volume, epoch);
+      if !unfenced.is_empty() {
+        let mut shown: Vec<String> = vec![successor.to_owned()];
+        shown.extend(counted.iter().map(|survivor| (*survivor).to_owned()));
+        verdict.note(format!(
+          "a counted holder unfenced; the successor and the counted holders:\n{}",
+          diagnosis(&shown, volume)
+        ));
+      }
+      verdict.check("StaleNeverCommits (the counted holders' fences)", unfenced);
+      let others: Vec<&str> = survivors
+        .iter()
+        .copied()
+        .filter(|survivor| !counted.contains(survivor) && *survivor != successor)
+        .collect();
+      let unfenced_others = fenced_at_or_above(&others, volume, epoch);
+      if !unfenced_others.is_empty() {
+        verdict.note(format!(
+          "copies on members no longer holders, at the takeover: {unfenced_others:?}"
+        ));
+      }
+      // A member a transition dropped is counted by no one, so its copy is memory held for nothing. Letting it go safely
+      // needs a holder-set generation on the wire (an open design item, live-fixes, 2026-11-07: a plain release could
+      // drop the copy of a host re-included meanwhile), so a copy still held at the end of the fleet wait is noted.
+      let kept = copies_kept(&others, volume);
+      if !kept.is_empty() {
+        verdict.note(format!("copies dropped holders still keep: {kept:?}"));
+      }
+    }
+    None => {
+      let live: Vec<String> = survivors
+        .iter()
+        .map(|survivor| (*survivor).to_owned())
+        .collect();
+      verdict.note(format!(
+        "no survivor served the volume; the survivors:\n{}",
+        diagnosis(&live, volume)
+      ));
+      verdict.check(
+        "a takeover once the holder answers",
+        vec!["no survivor served the volume within the fleet wait".to_owned()],
+      );
+    }
+  }
+}
+
+/// The members of `instances` that still hold a copy of `volume`'s log at the end of the fleet wait: none once each has let
+/// its copy go.
+fn copies_kept(instances: &[&str], volume: &str) -> Vec<String> {
+  let deadline = Instant::now() + FLEET_WAIT;
+  loop {
+    let kept: Vec<String> = instances
+      .iter()
+      .filter(|instance| {
+        live_states(instance, volume)
+          .unwrap_or_default()
+          .iter()
+          .any(|state| state.holding)
+      })
+      .map(|instance| format!("{instance} keeps its copy"))
+      .collect();
+    if kept.is_empty() || Instant::now() >= deadline {
+      return kept;
+    }
+    pause();
+  }
+}
+
+/// The nodes holding `volume`'s log whose acknowledgements the owner at `owner_index` counts, once it reports two and no
+/// holder transition in flight and each holds the owner's durable position, within the fleet wait.
+fn settled_holders(fleet: &Fleet, owner_index: usize, volume: &str) -> Vec<usize> {
+  let deadline = Instant::now() + FLEET_WAIT;
+  loop {
+    let owner = live_states(&fleet.instances[owner_index], volume)
+      .unwrap_or_default()
+      .into_iter()
+      .find(|state| !state.holding);
+    let hosts: BTreeMap<String, usize> = (0..fleet.instances.len())
+      .filter_map(|index| fleet_view(&fleet.instances[index]).map(|(host, _, _)| (host, index)))
+      .collect();
+    if let Some(owner) = &owner
+      && owner.moving_to.is_empty()
+      && owner.holders.len() == 2
+    {
+      let indexes: Vec<usize> = owner
+        .holders
+        .iter()
+        .filter_map(|host| hosts.get(host).copied())
+        .collect();
+      let caught_up = indexes.len() == 2
+        && indexes.iter().all(|index| {
+          live_states(&fleet.instances[*index], volume)
+            .unwrap_or_default()
+            .iter()
+            .any(|state| state.holding && owner.durable.is_some() && state.head >= owner.durable)
+        });
+      if caught_up {
+        return indexes;
+      }
+    }
+    assert!(
+      Instant::now() < deadline,
+      "the owner's holders settled within the fleet wait: {owner:?}"
+    );
+    pause();
+  }
+}
+
+/// The nodes of `fleet` holding a copy of `volume`'s log, once at least `count` do, within the fleet wait.
+fn wait_holders(fleet: &Fleet, volume: &str, count: usize) -> Vec<usize> {
+  let deadline = Instant::now() + FLEET_WAIT;
+  loop {
+    let holders = holders_of(fleet, volume);
+    if holders.len() >= count {
+      return holders;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "{count} nodes hold the volume's log within the fleet wait: {holders:?}"
+    );
+    pause();
+  }
+}
+
+/// How a flow's write is made durable before its answer (A-200's barrier), one per path a client has to a live volume.
+#[derive(Clone, Copy, Debug)]
+enum Barrier {
+  /// The in-process client's `fs_write`, answered once the volume's log is durable.
+  ClientWrite,
+  /// A stable (`FILE_SYNC`) NFS write over the owner's export, from a userspace NFS client (never a kernel mount).
+  NfsFileSync,
+}
+
+/// The value of `key` in a `--json` line, unquoted.
+fn json_field(text: &str, key: &str) -> String {
+  let needle = format!("\"{key}\":");
+  let after = text
+    .split(&needle)
+    .nth(1)
+    .unwrap_or_else(|| panic!("{key} in {text}"))
+    .trim_start();
+  match after.strip_prefix('"') {
+    Some(quoted) => quoted.split('"').next().unwrap().to_owned(),
+    None => after.split([',', '}']).next().unwrap().trim().to_owned(),
+  }
+}
+
+/// Writes `name` with `body` to `volume` on `owner` through `barrier`, returning once the write is answered: the moment
+/// the caller may kill the owner. Panics when the write is refused (the flow's precondition is a healthy fleet).
+fn write_through(owner: &str, volume: &str, barrier: Barrier, name: &str, body: &[u8]) {
+  match barrier {
+    Barrier::ClientWrite => {
+      let stream = Stream {
+        instance: owner,
+        volume: volume_id_of(volume),
+        began: Instant::now(),
+      };
+      let (mut client, attachment) = stream.attach().expect("attached for writing");
+      client
+        .fs_write((volume_id_of(volume), attachment), name, body, FILE_MODE)
+        .expect("the probe write is answered");
+    }
+    Barrier::NfsFileSync => {
+      let (code, out, err) = run(owner, &["export", volume, "--json"]);
+      assert_eq!(code, 0, "export: {err}");
+      let (path, port) = (json_field(&out, "path"), json_field(&out, "port"));
+      let mut stream =
+        std::net::TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap())).unwrap();
+      stream.set_read_timeout(Some(FLEET_WAIT)).unwrap();
+      stream.set_nodelay(true).unwrap();
+      let root = nfs::mount(&mut stream, &path, 1);
+      let file = nfs::create(&mut stream, &root, name, 2);
+      nfs::write(&mut stream, &file, body, 3);
+    }
+  }
+}
+
+/// Waits until one of `survivors` serves `name` of `volume` as `body`, byte for byte; which, and after how long. `None`
+/// at the fleet wait.
+fn wait_reads<'a>(
+  survivors: &[&'a str],
+  volume: &str,
+  name: &str,
+  body: &[u8],
+) -> Option<(&'a str, Duration)> {
+  let began = Instant::now();
+  while began.elapsed() < FLEET_WAIT {
+    for survivor in survivors {
+      if let Ok(mut client) = Client::connect(survivor, deadlines())
+        && client
+          .read(volume_id_of(volume), &format!("/{name}"), ReadAt::Head)
+          .is_ok_and(|bytes| bytes == body)
+      {
+        return Some((survivor, began.elapsed()));
+      }
+    }
+    pause();
+  }
+  None
+}
+
+/// Runs `writes` on a thread of its own and waits for it within the fleet wait. `Err` with every node's state when it is
+/// not done by then (the writes are left to fail once the fleet's daemons are killed). A write held without an answer
+/// would otherwise hang the flow until its test's own timeout, with nothing printed: the kill-at-acknowledgement flow did,
+/// on every iteration whose owner was a freshly joined member (CI diag-17, 2026-11-07).
+fn answered_within(
+  instances: &[String],
+  volume: &str,
+  writes: impl FnOnce() + Send,
+) -> Result<(), String> {
+  std::thread::scope(|scope| {
+    let writer = scope.spawn(writes);
+    let began = Instant::now();
+    while !writer.is_finished() {
+      if began.elapsed() > FLEET_WAIT {
+        let state = diagnosis(instances, volume);
+        for instance in instances {
+          if let Some(pid) = daemon_pid(instance) {
+            send_signal(pid, rustix::process::Signal::KILL);
+          }
+        }
+        // The writer's client is told its daemon is gone and the thread ends (a panicked thread left unjoined would
+        // make the scope panic over this answer).
+        let _ = writer.join();
+        return Err(state);
+      }
+      pause();
+    }
+    writer.join().map_err(|_| "the writes panicked".to_owned())
+  })
+}
+
+/// A-200 NoLoss at the acknowledgement itself (live-durability's proposal, 2026-11-07): do, `ITERATIONS` times on one
+/// fleet, make a live volume on the owner, write `BEFORE` files, then write a probe file through a barrier (alternately
+/// the client's `fs_write` and a userspace NFS `FILE_SYNC` write) and SIGKILL the owner the instant the probe's answer
+/// returns; then replace the dead node with a fresh member, which owns the next iteration's volume. Expect a survivor to
+/// serve the probe and every file before it, byte for byte, each time: a write's answer means it is durable on `f + 1`
+/// hosts, so no window between the answer and the owner's death may lose it.
+#[test]
+fn a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor() {
+  /// Shape: the iterations, alternating the barrier.
+  const ITERATIONS: usize = 6;
+  /// Shape: the files written before the probe, so the log has entries past its first whole record.
+  const BEFORE: usize = 8;
+  if !gated("kill-at-ack") {
+    return;
+  }
+  let mut fleet = Fleet::start("kill-at-ack", Supervision::Bare);
+  let mut verdict = Verdict::new("a write answered the instant before its owner dies");
+  let owner_index = fleet.owner_index();
+  for iteration in 0..ITERATIONS {
+    let barrier = if iteration % 2 == 0 {
+      Barrier::ClientWrite
+    } else {
+      Barrier::NfsFileSync
+    };
+    let owner = fleet.instances[owner_index].clone();
+    let volume = create_volume(&owner, &format!("kill-at-ack-{iteration}"), true);
+    let files: Vec<(String, Vec<u8>)> = (0..=BEFORE)
+      .map(|file| {
+        let name = format!("ack-{iteration}-{file}");
+        let body = chaos_body(iteration * (BEFORE + 1) + file);
+        (name, body)
+      })
+      .collect();
+    let (probe, before) = files.split_last().unwrap();
+    let answered = answered_within(&fleet.instances, &volume, || {
+      for (name, body) in before {
+        write_through(&owner, &volume, Barrier::ClientWrite, name, body);
+      }
+      write_through(&owner, &volume, barrier, &probe.0, &probe.1);
+    });
+    if let Err(state) = answered {
+      verdict.check(
+        &format!("every write answered, iteration {iteration} ({barrier:?})"),
+        vec![format!(
+          "a write on {owner} was not answered within the fleet wait:\n{state}"
+        )],
+      );
+      break;
+    }
+    // The instant the probe's answer is back, the owner is gone.
+    fleet.kill_node(owner_index);
+    let survivors: Vec<String> = fleet
+      .others(owner_index)
+      .into_iter()
+      .map(|index| fleet.instances[index].clone())
+      .collect();
+    let refs: Vec<&str> = survivors.iter().map(String::as_str).collect();
+    match wait_reads(&refs, &volume, &probe.0, &probe.1) {
+      Some((successor, took)) => {
+        let lost: Vec<String> = before
+          .iter()
+          .filter(|(name, body)| {
+            Client::connect(successor, deadlines())
+              .ok()
+              .and_then(|mut client| {
+                client
+                  .read(volume_id_of(&volume), &format!("/{name}"), ReadAt::Head)
+                  .ok()
+              })
+              .is_none_or(|bytes| bytes != *body)
+          })
+          .map(|(name, _)| name.clone())
+          .collect();
+        verdict.note(format!(
+          "iteration {iteration} ({barrier:?}): {successor} served the probe {took:?} after the owner's death"
+        ));
+        verdict.check(
+          &format!("NoLoss, iteration {iteration} (earlier files)"),
+          lost,
+        );
+      }
+      None => verdict.check(
+        &format!("NoLoss, iteration {iteration} ({barrier:?})"),
+        vec![format!(
+          "no survivor served {} within the fleet wait:\n{}",
+          probe.0,
+          diagnosis(&survivors, &volume)
+        )],
+      ),
+    }
+    // The dead node's replacement, a fresh member at the same index, owns the next iteration's volume.
+    fleet.replace_node(owner_index);
+    fleet.wait_rejoined();
+  }
   drop(fleet);
   verdict.judge();
 }

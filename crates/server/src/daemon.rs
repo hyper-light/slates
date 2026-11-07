@@ -2100,10 +2100,9 @@ impl Daemon {
     object: slates_db::register::ObjectId,
   ) -> Result<bool, ObserveError> {
     self.observe(self.shard_of_object(object), move |s| {
-      let quorum = s.fleet.configuration().quorum;
       s.placed_heads
         .get(&object)
-        .is_some_and(|head| head.placement.placed(quorum))
+        .is_some_and(|head| head.placed_under(s.fleet.configuration(), object))
     })
   }
 
@@ -3360,7 +3359,7 @@ fn init_shard(
     seal_root,
     seal_state: sealing,
     seal_recipient: None,
-    pairs_delivered: std::collections::BTreeSet::new(),
+    pairs_delivered: std::collections::BTreeMap::new(),
     member_anchors: std::collections::BTreeMap::new(),
     peer_recipients: std::collections::BTreeMap::new(),
     content,
@@ -3483,7 +3482,9 @@ fn init_shard(
     forward_lanes: crate::forward_lane::ForwardLanes::default(),
     staging: crate::staging::Staging::default(),
     member_boot_nonce: incarnation,
+    member_process_nonce: keyed_word(&issuer_secret, b"slates/member-process/v1"),
     learned_members: std::collections::BTreeMap::new(),
+    returned_members: std::collections::BTreeMap::new(),
     authenticated_members: std::collections::BTreeSet::new(),
     council_death_watch: std::collections::BTreeMap::new(),
     discovery: None,
