@@ -56,6 +56,7 @@ pub mod dns;
 pub mod doorbell;
 pub mod error;
 pub mod fleet;
+mod forward_lane;
 mod fs_verbs;
 #[cfg(target_os = "linux")]
 mod fuse;
@@ -99,6 +100,7 @@ mod owner_location;
 mod staging;
 mod work_charge;
 pub mod work_files;
+mod work_log;
 // The container bind form of `attach` (§4.6 A-9): the host mount verified through the kernel's mount
 // table and the runtime-specification entry; paired per platform inside, so it compiles everywhere.
 pub mod oci;
