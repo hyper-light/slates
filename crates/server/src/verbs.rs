@@ -5522,12 +5522,12 @@ fn edit(
   // The journal operations this edit records, built before anything changes so its charge is exact, by the one
   // builder the work log's replay uses too (`crate::work_log`, A-207).
   let inserted = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-  let ops = crate::work_log::edit_ops(path, old, (at, delete_len, inserted));
+  let ops = crate::work_log::edit_ops(path, old.as_deref(), (at, delete_len, inserted));
   // The work is charged for what the edit adds before it changes anything (`crate::work_charge`): the file it now
   // holds (copied from the base when it had not changed it), less what the splice deletes, and the journal's ops.
-  let (spliced, removed) = w
-    .files
-    .splice_delta(path, old, (at, delete_len, bytes.len()));
+  let (spliced, removed) =
+    w.files
+      .splice_delta(path, old.as_deref(), (at, delete_len, bytes.len()));
   let added = crate::work_charge::journal_footprint(&ops).saturating_add(spliced);
   let entry = crate::work_log::WorkLogEntry::Edit {
     path: path.to_owned(),
@@ -5731,14 +5731,21 @@ fn declared_xattr<'a>(journal: &'a [VolumeOp], path: &str, name: &str) -> Option
   })
 }
 
-/// Assembles an increment's post-state from a work's content and journal (§4.16): the seal lays each
-/// file's final content out by region and then the extended-attribute values, and each content or
-/// `SetXattr` op names a slice of that region. A content op copies `[op.at, op.at + op.len)` of its
-/// file; a `SetXattr` op copies the attribute's whole value — both into `[op.src, op.src + op.len)`.
+/// Assembles an increment's post-state from a work's content and journal (§4.16): the deriver lays the runs its
+/// content ops add out compactly, then the extended-attribute values and the special nodes, and each such op names
+/// its slice (`slates_merge::increment::compose_volume_planned`). A content op copies `len` bytes of its file from
+/// where the work's file holds them, the plan's offset for its `src`; a `SetXattr` op copies the attribute's whole
+/// value — both into `[op.src, op.src + op.len)`. Until 2026-11-07 a content op's bytes were read at `op.at`, its
+/// offset in base coordinates, so a run after an earlier length change in the same file was read from the wrong
+/// place: a delete of a file's first two bytes then an overwrite of its last two merged two zeros into the green
+/// (`crates/server/tests/green_post_state.rs`).
 /// The xattr value round-trips through the post-state, which is how the green stores it and how the
 /// identity check compares two agents' values, so it must be laid in, not left zero.
 fn assemble_post_state(
-  doc: &slates_merge::ops_doc::OpsDoc,
+  (doc, plan): (
+    &slates_merge::ops_doc::OpsDoc,
+    &slates_merge::increment::PostStatePlan,
+  ),
   (files, base): (&crate::work_files::WorkFiles, crate::work_files::Base<'_>),
   journal: &[VolumeOp],
 ) -> Vec<u8> {
@@ -5762,13 +5769,18 @@ fn assemble_post_state(
       continue;
     };
     let encoded_node;
+    let file_bytes;
     // The bytes this op contributes, and the offset into them: a file's slice, or an xattr's value.
     let (source, source_at): (&[u8], u64) = if is_file_content(op.kind) {
       // The submit read the base already (`build_increment` refuses a work whose green is gone).
       let Some(file) = files.get(base, path).ok().flatten() else {
         continue;
       };
-      (file, op.at)
+      let Some(at) = plan.get(&op.src) else {
+        continue;
+      };
+      file_bytes = file;
+      (&file_bytes, *at)
     } else if op.kind == OpKind::Mknod {
       let Some(node) = journal.iter().rev().find_map(|entry| match entry {
         VolumeOp::Mknod {
@@ -5843,8 +5855,8 @@ fn build_increment(
   // Only the base entries the journal names (`Green::base_for`): the deriver reads nothing else, and the
   // whole base cloned every path's name on every submit.
   let base = engine.base_for(base_version, &w.journal);
-  let doc = match slates_merge::increment::compose_volume(&base, &w.journal) {
-    Ok(doc) => doc,
+  let (doc, plan) = match slates_merge::increment::compose_volume_planned(&base, &w.journal) {
+    Ok(planned) => planned,
     Err(e) => {
       return Err(Refusal::BadRequest {
         reason: format!("increment does not compose: {e:?}"),
@@ -5852,7 +5864,7 @@ fn build_increment(
     }
   };
   let post_state = assemble_post_state(
-    &doc,
+    (&doc, &plan),
     (
       &w.files,
       crate::work_files::Base {

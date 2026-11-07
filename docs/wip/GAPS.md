@@ -44,6 +44,14 @@
 >   the growth came after the pin. A pin past its volume's quota is refused `NoSpace`
 >   (`docs/bugs/2026-11-06-a-pin-held-its-shard-for-the-whole-tree.md`).
 >
+> - **A run after a length change in its file merged zeros** (found 2026-11-07 proving W2, since 34548a59, the
+>   submit flow's first version). The seal read each added run at its op's base-coordinate offset rather than where
+>   the work's file holds it, so a work that deleted a file's first two bytes and then overwrote its last two merged
+>   `cd\0\0` where it held `cdXY`. Every increment also carried each edited file's whole region, zero-filled (a
+>   64-byte edit at 640 KiB carried 640 KiB). The deriver now lays the runs out compactly with a plan of where each
+>   is read, and the seal reads it there (`green_post_state.rs`: red on CI run 42365926059;
+>   `docs/bugs/2026-11-07-a-run-after-a-length-change-merged-zeros.md`).
+>
 > - **A resend under its own id was already acknowledged** (found by fixtures' `f = 1` 1,000-client rung on
 >   12596890, 2026-11-06).
 >   - The defect: a forwarded submit whose acceptance outlived the owner's budget is answered `Overloaded`, retryable
@@ -119,7 +127,10 @@
 >   file it overwrote, and the history folds only down to the oldest base a live work holds. Walls owed for the
 >   10k–100k rungs (the green chain's checkpointing above is closed on the owner):
 >   - a green's works served off its owner's shard, with only the verdict serialized;
->   - history that keeps what a version overwrote, not whole files;
+>   - ~~history that keeps what a version overwrote, not whole files~~ **closed (AMENDMENT-W2, 2026-11-07)**: the
+>     history is copy-on-write (`crates/merge/src/history.rs`). A version costs the bytes it wrote and its piece
+>     lists. Behind a held floor, 64 versions of 64-byte overwrites of a 1 MiB file under a 16 MiB cap: 16 of 64
+>     accepted before, 64 after (`green_retention.rs`, CI runs 42358895080 and 42367326179);
 >   - a stated offered load per client for the 1 ms bound. At zero think time, 100k clients at 1 ms is 10⁸
 >     operations a second.
 >
@@ -128,6 +139,18 @@
 >   At the 1,000-client rate the rung's roughly 950k operations take under two minutes, so a submit costs far more at
 >   this scale; the green's history and the rebases are the suspects, not yet measured. Its percentiles are lost: the
 >   harness prints them at the level's end, and the bound killed it. The Studio's runner then went offline.
+>
+>   **Rerun on A-238 (2026-11-07, same Studio, load 1.5 to 7.5): it is a stall, not throughput.**
+>   - It did not finish in 1,800 s. The daemon used 5 min 22 s of CPU in the 30 minutes, and its RSS sat flat at
+>     19.7 GB from the first minutes.
+>   - 535 requests sent in the run's first second were still unanswered at 1,795 s (Edit, ReadHead, Rebase). The
+>     harness's workers froze (worker 0 at 1,130 of 1,264 clients done from 1,600 s on).
+>   - The daemon logged "the control shard's beat task ran 918331 ms after its last turn … in the gap the shard ran 2
+>     steps and 1 polls": a shard asleep for 15 minutes with requests waiting, a lost wakeup by the look of it. A-228's
+>     watchdog does not flag a parked shard.
+>   - At 3,000 clients, W3 and main measure the same (three runs each, wall 72 to 105 s, `SubmitAccepted` p50 0.58
+>     to 0.92 s). The 2,410 to 2,456 `BudgetExceeded` per run were W2's.
+>   - Owed: the stall's diagnosis (which shard, which ring, which wake), raised to the supervisor.
 >
 > The topology launcher is `crates/cli/tests/load_scale.rs`. It runs one primary and two replica server nodes in
 > region 0 at `f = 1`, and client nodes in region 1, so the client nodes are never the green's holders. One harness

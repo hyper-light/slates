@@ -180,7 +180,10 @@ mod tests {
         inserted,
       } => {
         let path = PATHS[*path];
-        let old = files.get(base, path).unwrap().map(<[u8]>::to_vec);
+        let old = files
+          .get(base, path)
+          .unwrap()
+          .map(std::borrow::Cow::into_owned);
         let ops = edit_ops(path, old.as_deref(), (*at, *delete_len, *inserted));
         let (spliced, removed) =
           files.splice_delta(path, old.as_deref(), (*at, *delete_len, *inserted));
@@ -264,7 +267,8 @@ mod tests {
           .collect();
         prop_assert_eq!(&seen, &model, "after {:?}", step);
         for path in PATHS {
-          prop_assert_eq!(files.get(base, path).unwrap(), model.get(path).map(Vec::as_slice));
+          let seen = files.get(base, path).unwrap();
+          prop_assert_eq!(seen.as_deref(), model.get(path).map(Vec::as_slice));
         }
       }
     }
