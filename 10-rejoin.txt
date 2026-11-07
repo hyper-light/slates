@@ -106,3 +106,8 @@ shard 0 refused fleet.link.invalid.believed_dead: 1
 shard 0 refused fleet.plane.epoch_refused: 405
 shard 0 refused fleet.plane.epoch_refused.install: 405
 shard 0 refused fleet.plane.member_returned: 393
+=== epochs 1 exit 0 load { 16.19 17.95 14.09 }
+rejoins: successor daemon 29313 answered after 61.771166ms
+slates-cluster: fleet: HostId(11611027092026229569) holds HostId(746412848131670763) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+rejoins: the fleet re-formed after 1.720162083s
+slates daemon: the anchor is gone; leaving
