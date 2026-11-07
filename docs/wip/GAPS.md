@@ -782,7 +782,18 @@
 > load 8–30 (2026-11-05). The rare 100 ms tail is explained and removed (two waits for the record period; and a
 > superseded owner that held a write unanswered is now refused, and a destroyed volume's shipper is let go: §4.10
 > status "The tail and three more defects"). Open: the added median is the cross-shard dispatch round (50 µs not met);
-> p999 under 1 ms at load 30. Open: one exchange per message to every holder starved the second holder (never
+> p999 under 1 ms at load 30. Measured 2026-11-07 (live-durability, CI, release):
+> - a quiet live 4 KiB stable write adds 142–148 µs on x86_64 and 345–364 µs on arm64 at the median, with one lane per
+>   holder (main: 222–230 and 536–553 µs, interleaved);
+> - its hops: to the control shard 27–35 µs, the exchange's spawn 12–19 µs, the transport request round trip 135–236 µs
+>   (the holder's own serve 6–11 µs, the session's packet RTT 55–104 µs), back to the collector 8–14 µs, to the owner
+>   shard 5–14 µs;
+> - letting a request's acknowledgement ride its reply was measured and rejected (BENCHMARKS), and the rest of the round
+>   trip is unexplained.
+>
+> Fixed the same day: a holder behind the retained tail no longer puts a whole copy of the volume on the log ahead of
+> every later write; it is installed from an image made beside the log (§4.10 status "An install image beside the
+> log"). Open: one exchange per message to every holder starved the second holder (never
 > accepted an entry, in six of nine process flows) and was rejected; why is not pinned down. Open, toward a filesystem
 > server replicated per write in under 1 ms: AC-8.9's credit backpressure (since 2026-11-05 a local checkpoint ships a
 > live volume's changes, not a whole copy: 1 whole record in 2,051 where main made about 420; the credit itself is

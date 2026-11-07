@@ -1,0 +1,84 @@
+name: diag-live-durability
+
+# Diagnostics only, never on main (A-200, item 2). Interleaved A/B: arm A 2c89eb1f (the failing test: a candidate behind
+# the retained tail draws a whole record onto the log), arm B the same plus the fix (an install image beside the log).
+# Each round, each arm: the new live_fleet test, the quiet-fleet flow and the rolling partition flow, release, three
+# rounds, arms alternating, both Linux arches. Results to diag-results/live-durability-16-<os> by git push.
+on:
+  push:
+    branches: ["diag-live-durability-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  SLATES_TEST_CLI: "1"
+  SLATES_TEST_MEASURE: "1"
+  ARM_A_SHA: 2c89eb1f
+
+jobs:
+  ab:
+    name: A-200 install image A/B (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build both arms
+        run: |
+          git worktree add ../arm-a "$ARM_A_SHA"
+          ( cd ../arm-a && CARGO_TARGET_DIR=../target-a cargo build --release --locked -p slates-cli --bin slates --test live_fleet --test live_chaos )
+          cargo build --release --locked -p slates-cli --bin slates --test live_fleet --test live_chaos
+      - name: The bench, quiet and busy, three rounds each, the arms alternating
+        run: |
+          R=../results.txt
+          cpus=$(nproc)
+          echo "runner ${{ matrix.os }}, $cpus CPUs, $(date -u), arm B $(git rev-parse HEAD)" > $R
+          for round in 1 2 3; do
+            if [ $((round % 2)) = 1 ]; then order="a b"; else order="b a"; fi
+            for cond in quiet; do
+              for arm in $order; do
+                pids=""
+                if [ $cond = busy ]; then
+                  for i in $(seq 1 $((cpus * 2))); do ( while :; do :; done ) & pids="$pids $!"; done
+                fi
+                echo "== $cond round $round arm $arm at $(date -u +%H:%M:%S), load $(cut -d' ' -f1-3 /proc/loadavg)" | tee -a $R
+                status=0
+                if [ $arm = a ]; then
+                  ( cd ../arm-a && CARGO_TARGET_DIR=../target-a timeout 900 cargo test --release --locked -p slates-cli --test live_fleet -- --nocapture --exact a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log) > ../run.log 2>&1 || status=$?
+                  ( cd ../arm-a && CARGO_TARGET_DIR=../target-a timeout 900 cargo test --release --locked -p slates-cli --test live_chaos -- --nocapture --test-threads=1 --exact writes_stream_on_a_quiet_fleet) >> ../run.log 2>&1 || status=$?
+                  ( cd ../arm-a && CARGO_TARGET_DIR=../target-a timeout 900 cargo test --release --locked -p slates-cli --test live_chaos -- --nocapture --test-threads=1 --exact candidates_partitioned_in_turn_mid_stream_lose_nothing) >> ../run.log 2>&1 || status=$?
+                else
+                  timeout 900 cargo test --release --locked -p slates-cli --test live_fleet -- --nocapture --exact a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log > ../run.log 2>&1 || status=$?
+                  timeout 900 cargo test --release --locked -p slates-cli --test live_chaos -- --nocapture --test-threads=1 --exact writes_stream_on_a_quiet_fleet >> ../run.log 2>&1 || status=$?
+                  timeout 900 cargo test --release --locked -p slates-cli --test live_chaos -- --nocapture --test-threads=1 --exact candidates_partitioned_in_turn_mid_stream_lose_nothing >> ../run.log 2>&1 || status=$?
+                fi
+                for p in $pids; do kill "$p" 2>/dev/null || true; done
+                wait 2>/dev/null || true
+                grep -E '^live laggard|^  [0-9]+ writes|slow write|violations|panicked at|test result|^test .* (ok|FAILED)' ../run.log | cut -c1-600 | tee -a $R
+                echo "== $cond round $round arm $arm exit $status" | tee -a $R
+              done
+            done
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/live-durability-16-${{ matrix.os }}"
+          git config user.name "diag-live-durability"
+          git config user.email "diag-live-durability@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-live-durability-16 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"

@@ -880,8 +880,9 @@ impl Shipper {
     }
   }
 
-  /// Records `head` as the last whole state shipped: the entry at it carries the owner's whole state, which an install
-  /// sends to a holder off the chain or behind the retained tail. Ignored unless it is the owner's head now.
+  /// Records `head` as the last whole state made: the owner's whole state as of the entry at it (that entry itself when
+  /// it is whole, or an image of the state it left, made beside the log), which an install sends to a holder off the
+  /// chain or behind the retained tail. Ignored unless it is the owner's head now.
   pub fn mark_checkpoint(&mut self, head: Head) {
     if Some(head) == self.head {
       self.checkpoint = Some(head);
