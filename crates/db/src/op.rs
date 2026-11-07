@@ -392,6 +392,14 @@ pub enum Op {
     /// The encoded restatement.
     entry: Vec<u8>,
   },
+  /// A live-shipped volume's shipper committed its holder set (A-240): carried by the catalog register to `f + 1`
+  /// before the shipper's first entry. Appended (2026-11-06).
+  LiveHoldersCommitted {
+    /// The volume.
+    id: VolumeId,
+    /// The shipper's epoch and holders.
+    holders: crate::catalog::LiveHolders,
+  },
 }
 
 impl Op {
@@ -455,6 +463,7 @@ impl Op {
       Op::NfsPurgeOwed { .. } => "nfs_purge_owed",
       Op::NfsPurgeSettled { .. } => "nfs_purge_settled",
       Op::LiveShippingChanged { .. } => "live_shipping_changed",
+      Op::LiveHoldersCommitted { .. } => "live_holders_committed",
     }
   }
 }

@@ -3238,6 +3238,7 @@ pub(crate) fn is_control_shard(state: &ShardState) -> bool {
 fn council_report(state: &ShardState) -> GroupReport {
   group_report(
     state.council.is_leader(),
+    state.council.voters(),
     state.council_timing,
     state.council.election_view(),
     state
@@ -3250,6 +3251,7 @@ fn council_report(state: &ShardState) -> GroupReport {
 fn root_report(state: &ShardState) -> GroupReport {
   group_report(
     state.root.is_leader(),
+    state.root.voters(),
     state.root_timing,
     state.root.election_view(),
     state
@@ -3260,9 +3262,10 @@ fn root_report(state: &ShardState) -> GroupReport {
 
 /// A consensus group's status line: whether this node leads it, the election timing it derived, and its
 /// election state — term, priority, lease and campaigns — with its `rank` among the voters it holds alive, as
-/// its drive ranks it.
+/// its drive ranks it, and the ids of the voters in force.
 fn group_report(
   leads: bool,
+  voters: Vec<slates_db::HostId>,
   timing: slates_cluster::timing::ElectionTiming,
   view: slates_cluster::raft::ElectionView,
   rank: usize,
@@ -3289,6 +3292,12 @@ fn group_report(
     refused_log: view.pre_votes.refused_log,
     voters: view.seated,
     joint: view.joint,
+    voter_ids: {
+      let mut ids: Vec<u64> = voters.iter().map(|host| host.0).collect();
+      ids.sort_unstable();
+      ids.dedup();
+      ids
+    },
   }
 }
 
@@ -4554,6 +4563,7 @@ fn create(
       require_locked,
       role: Role::Plain,
       live_shipped: false,
+      live_holders: None,
     },
     base: match base {
       None => BaseRecord::Scratch,
@@ -5179,6 +5189,7 @@ fn create_green(
         head_version: 0,
       },
       live_shipped: false,
+      live_holders: None,
     },
     base: BaseRecord::Scratch,
     head: DbSnapshotId::default(),
@@ -5342,6 +5353,7 @@ fn create_work(
         stream: false,
       },
       live_shipped: false,
+      live_holders: None,
     },
     base: BaseRecord::Scratch,
     head: DbSnapshotId::default(),
@@ -8059,25 +8071,19 @@ fn placement_of(state: &ShardState, volume: DbVolumeId) -> PlacementState {
   }
 }
 
-/// The region placement of `object`'s head at `sequence` as the fleet has **actually committed** it (§4.8
-/// "the acknowledging set is recorded in the object's head record"): the acknowledging candidates the
-/// control-shard record plane recorded when it replicated that head to its holders
-/// (`ShardState::placed_heads`), or — before any holder has acknowledged, for an older or newer sequence,
-/// or on a laptop where no fleet loop runs — the owner's local placement the configuration computes
-/// (`Configuration::place`: the owner alone, which is placed at `f = 0` and not yet at `f > 0`). One code
-/// path serves both (R8): the laptop is the empty-map degenerate. Reading the computed placement alone
-/// reported a fleet's head *never* region-placed, however many holders held it.
-fn committed_placement(
-  state: &ShardState,
-  object: ObjectId,
-  sequence: u64,
-) -> slates_db::register::Placement {
+/// Whether `object`'s head at `sequence` is region-placed as the fleet has **actually committed** it (§4.8 "the
+/// acknowledging set is recorded in the object's head record"): the acknowledgements the control-shard record plane
+/// recorded when it replicated that head (`ShardState::placed_heads`), judged under the configuration's placement now
+/// (`head::PlacedHead::placed_under`); at `f = 0` placed on the local append (R8: the laptop is the empty-map
+/// degenerate). Reading the computed placement alone reported a fleet's head *never* region-placed, however many
+/// holders held it; reading the recorded round's own cohorts kept a head unplaced once its neighbourhood settled.
+fn committed_placed(state: &ShardState, object: ObjectId, sequence: u64) -> bool {
   state
     .placed_heads
     .get(&object)
     .filter(|head| head.sequence == sequence)
-    .map(|head| head.placement.clone())
-    .unwrap_or_else(|| state.fleet.configuration().place(object))
+    .is_some_and(|head| head.placed_under(state.fleet.configuration(), object))
+    || state.fleet.configuration().quorum.f == 0
 }
 
 /// A volume's head placement for a status reply (§4.8, D-18): whether the head is placed in
@@ -8092,8 +8098,7 @@ pub(crate) fn placed_state(state: &ShardState, record: &VolumeRecord) -> PlacedS
     // 128-bit id (its high half names the creator host); the old code truncated it to that high half
     // alone, so every volume of one creator collided to one placement object — fixed by ObjectId.
     let object = ObjectId(record.id.bytes);
-    let config = state.fleet.configuration();
-    config.region_placed(&committed_placement(state, object, CREATION_HEAD_SEQUENCE))
+    committed_placed(state, object, CREATION_HEAD_SEQUENCE)
   } else {
     match state.db.partition().snapshot(record.id, record.head) {
       Some(snapshot) => matches!(snapshot.placed, PlacementState::Placed { .. }),
@@ -8166,7 +8171,7 @@ fn await_placed(
     None => Some(record.head),
   };
   let region = match target {
-    None => config.region_placed(&committed_placement(state, object, CREATION_HEAD_SEQUENCE)),
+    None => committed_placed(state, object, CREATION_HEAD_SEQUENCE),
     Some(target) => match state.db.partition().snapshot(record.id, target) {
       Some(snapshot) => matches!(snapshot.placed, PlacementState::Placed { .. }),
       None => return refused(Refusal::NotFound),
@@ -8249,6 +8254,7 @@ pub(crate) fn materialize_taken_over_green(
           head_version: recovery.head,
         },
         live_shipped: false,
+        live_holders: None,
       },
       base: BaseRecord::Scratch,
       head: DbSnapshotId::default(),
@@ -8518,6 +8524,9 @@ pub(crate) fn materialize_taken_over(
       role: Role::Plain,
       // A live-shipped volume stays live-shipped under its successor (A-200): its catalog carries the flag.
       live_shipped: catalog.live_shipped,
+      // The holder set the dead owner's shipper recorded (A-240), kept until this node's own shipper records its own:
+      // a catalog shipped meanwhile still names the holders that hold the log.
+      live_holders: catalog.live_holders.clone(),
     },
     // Placed content is always whole in RAM (an overlay's base-backed bodies are never sealed), so the
     // successor serves it with no base beneath.
@@ -12066,6 +12075,7 @@ mod tests {
       require_locked: false,
       access: Vec::new(),
       live_shipped: false,
+      live_holders: None,
     }
   }
 

@@ -571,6 +571,7 @@ impl BuildJob {
         require_locked: self.record.policy.require_locked,
         role: Role::Plain,
         live_shipped: false,
+        live_holders: None,
       },
       base: BaseRecord::Image {
         volume: self.source,

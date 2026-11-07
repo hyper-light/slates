@@ -1,5 +1,97 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Fixed (live-fixes, 2026-11-07): a node back at its anchor with fresh RAM had every pair key refused (A-92 piece 4b).**
+> A receiver kept one pair key per sender anchor and shard and refused any other, so a node replaced at its anchor (its
+> keys gone) was refused for good (789 of 793, raft-chaos's kill-at-ack, CI diag-raft-chaos-three-25): its sealed live
+> entries never covered its candidates and its writes waited for ever (`held_back.keys` 394). And an owner shard marked
+> a pair delivered by anchor, so it never delivered to the new incarnation, which could not open its heads as a
+> successor. Now the newer key replaces the recorded one, the old kept as retired while anything held is sealed under
+> it, and an owner shard delivers again to a new member id. Test:
+> `a_node_replaced_with_fresh_ram_at_its_anchor_exchanges_pair_keys_with_its_survivors` (red on each half alone).
+> Open: no process test yet takes over an old incarnation's volume after its replacement's key arrived (the retired
+> key's path). Bug record `docs/bugs/2026-11-07-a-node-back-at-its-anchor-with-fresh-ram-had-every-pair-key-refused.md`.
+
+> **Fixed (live-fixes, 2026-11-07): a live write counted durable on too few holders when the owner fell outside its own
+> volume's placement.** The shipper counted a position durable at the `f`-th highest holder, right for `2f` holders but
+> not for `2f + 1` (every other candidate a holder): at f = 1 a write on one of three was "durable", and a successor
+> counted the other two (raft-chaos, CI diag-20 run 7: a holder left at fence 1, NoLoss held only because it was the
+> stale one). Now `n − f` of `n` holders (never durable at `n <= f`, from which no phase one counts `f + 1`).
+> `a_write_is_durable_only_where_every_takeover_quorum_meets_it` was red on the old count; the model, now also naming
+> `2f + 1` and short sets, passes 20 of 20.
+>
+> **Open (live-fixes): an ex-holder keeps its live copy until the volume's tombstone.** A holder the joint transition
+> drops keeps its copy at an old fence (memory, not safety: no phase one counts it, and with `n − f` no owner commits
+> through it alone). A let-go on the newer holder record (2ba5572d) was reverted (eab618f2): a holder dropped while it was
+> no catalog candidate receives that record only when the configuration names it again, by then a counted member of the
+> next transition. A safe release needs a holder-set generation the entries and replies carry. raft-chaos's five-node
+> flow notes the copies dropped holders keep, and asserts their release once that lands.
+
+> **Fixed (live-fixes, 2026-11-07): a live shipper made before its candidates were known shipped to nobody** (A-200's
+> amendment of that date). A shipper kept the holders of its first publication, so a live volume made on a fleet's
+> bootstrap node stood at `durable=none` for good (the Linux conformance pair, diag run 42325923902). Its holders now
+> follow the candidates by a joint transition (ship to both sets, count durability over each, switch once the new set
+> holds every durable write and the record names it). The first fix, replacing the holders outright, was unsafe
+> (raft-chaos); the model shows it (the record-at-once mutation breaks NoLoss) and 0 of 400 seeds broken under the
+> joint rule. The target is recorded in the volume's catalog (A-240, merged
+> from raft-chaos) once it holds every durable write under a key it can open, and activated once that record is placed.
+> **Open, raft-chaos's:** a successor's recorded set must be the set its takeover counted, then its own transition.
+> Bug record `docs/bugs/2026-11-07-a-live-shipper-made-before-its-candidates-were-known-shipped-to-nobody.md`.
+
+> **Fixed (live-fixes, 2026-11-06 and 07): a daemon restarted under its anchor never rejoined its fleet (raft-chaos
+> report 8).** The successor keeps the member id; the other nodes hold that id dead. Its restarted plane epochs were
+> refused as not newer (`fleet.plane.epoch_refused.install`), and a canonical dialer holding it dead never dialed it again
+> (`fleet.link.invalid.believed_dead`), so it could never refute the death. The acceptor now takes a restarted sequence
+> (`fleet.plane.epoch_restarted`), and contact is kept with a dead member that announced itself since
+> (`DirectContact::Returned`, `fleet.plane.member_returned`). Under load on macOS CI: 0 of 6 re-formed before, 5 of 6
+> after (0.10 to 1.68 s). The sixth, a successor up before the others suspected it, is fixed too (2026-11-07): a
+> canonical dialer drops its session to a member that announced itself on a new one and dials afresh
+> (`fleet.plane.peer_reconnected`): 3 of 6 re-formed with that rule off, 6 of 6 with it on (0.47 to 0.66 s, load 30 to 74). Bug record `docs/bugs/2026-11-06-a-daemon-restarted-under-its-anchor-never-rejoined-its-fleet.md`;
+> test `a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet`.
+
+> **Fixed (live-fixes, 2026-11-06): main's macOS fleet-deploy test refused the successor's mount `OwnedByAnotherHost`
+> under load (scheduled run 42206043007).** A-222's early refusal reads the routing of the shard serving the client; a
+> takeover recorded the new owner on the control shard alone. Counted on CI under two spinners a CPU: 5 of 9 runs
+> refused on the successor's shard 1 (`attach.foreign_refused.owner_unknown`) while its shard 0 had adopted the volume.
+> An adoption's owner now reaches every shard (`takeover::track_owner_on_every_shard`); 10 of 10 green under the same
+> load. The test now also requires the other survivor to refuse the mount by kind. Bug record
+> `docs/bugs/2026-11-06-a-successor-refused-its-own-volumes-mount-on-a-shard-that-never-learned-the-takeover.md`.
+
+> **A forming fleet lost its takeovers (live-fixes, 2026-11-05, A-200 and §4.8; three fixed, for raft).** raft's soak
+> found that a fleet acting before it settled could leave a killed owner's volume unserved; the tests were made to wait
+> (d91464cf) and the product stayed unfixed. Bootstrapping three real processes and acting at once found three defects,
+> each fixed with a failing test first (bug record `docs/bugs/2026-11-05-a-forming-fleet-lost-its-takeovers.md`):
+> - **Fixed: the council sat at two voters**, which can lose neither, so an owner killed then left both survivors at
+>   term 1 with no takeover. The council now grows only by steps that raise the failures it tolerates, unless the step
+>   seats every member, and a member that cannot catch up is passed over for a free seat
+>   (`slates_cluster::config_group::widening`, `RegionalCouncil::passed_over`). The first form of the rule failed 7 of
+>   89 fleet-suite tests that the base passed; corrected, those seven pass 7 of 7 (59 s against the base's 57 s). `an_owner_killed_while_its_fleet_still_forms_is_taken_over` was red 1 of
+>   1 (two voters at the kill, no leader for 40 s) and is green in every run that started (macOS, load 45 to 96).
+> - **Fixed: a live log sealed before a candidate's pair carried no key for it**, and that candidate as successor
+>   refused the rebuild without end. A live write is now durable only once the log's last whole entry covers every
+>   candidate, and the owner checkpoints again once the missing pairs are delivered (`live_ship::covers_candidates`).
+>   `a_live_volume_made_while_its_successor_was_stopped_is_served_by_it` was red 3 of 3 with the check forced off and is
+>   green 12 of 12. A candidate stopped before its pairs came now holds live writes back until it returns or is retired,
+>   as it already held a sealed head back.
+> - **Fixed: a takeover dropped `ConfigurationStale`**, so a learner successor one version behind never fetched and
+>   never served (`takeover::ask_pages`, `takeover::adopt`; counted `fleet.takeover.stale_configuration`). Red 1 of 8
+>   with the edits off, green 8 of 8.
+> - The live fleet suite's settled wait now also waits for every node's pair keys (`fleet.seal.pair_served`).
+> - **Fixed (2026-11-06, A-229, Ada's choice): a writer on a macOS mount failed rather than waited.** The mount was
+>   `soft,intr`, and macOS ends any soft call after about a minute: with both candidates stopped a size change failed
+>   `ETIMEDOUT` after 57.2 s. The mount is `hard,intr`: the same call waited through the stop and succeeded (90.6 s and
+>   102.4 s; `a_writer_on_a_macos_mount_waits_for_stopped_candidates_rather_than_fail`, red then green on this Mac at
+>   load 15 to 104).
+> - **Open: a killed owner was never condemned** in one forming-fleet run: both survivors' detectors held it with one
+>   suspicion and no condemnation for 40 s (`configured=false`, `CorrelationUnmeasured`). About 1 run in 20.
+> - **Open: a live dispatch's replies are dropped with its whole task** (`live_ship::send_from_control` returns its
+>   replies only at the end, bounded by twice one session wait, while each message to a holder whose session is out on
+>   loan waits a whole session wait). Seen once: the owner at `durable=0` while the other candidate held every entry
+>   (`fleet.live.held` 237; owner `fleet.live.no_session` 447). A per-holder rewrite was reverted: no test could show it
+>   red, so the mechanism is not confirmed.
+> - **Not reproduced: raft's other two formation findings** (an owner with no session to its only reachable candidate
+>   for 249 tries; a candidate refusing `no_catalog` for good). Eight full live fleet suites with the settled wait
+>   removed, with these fixes: no such stall; each first `no_catalog` refusal was followed by holding.
+
 > **A path on a volume this daemon serves is refused before any open (A-227, 2026-11-06): built on Linux, Windows and
 > macOS.** A base directory and every lookup below it, a landing's target and a FUSE mount point are refused typed
 > (`HostError::OwnMount`, `TargetRefusal::OwnMount`, the wire's `Refusal::OwnMount`) when they lie on a mount this
@@ -921,7 +1013,7 @@
 > successor holding nothing never counts itself and `f + 1` is out of reach once the owner is gone. Owner: raft,
 > before any other live-shipping work.
 >
-> **Chaos from outside the processes (raft-chaos, 2026-11-06): two defects fixed, a third open.**
+> **Chaos from outside the processes (raft-chaos, 2026-11-06): defects fixed and open, below.**
 > The harness is `crates/cli/tests/live_chaos.rs` (`SLATES_TEST_CLI=1`): three fleet daemons, a Rust client streaming
 > 4 KiB writes, every node's live lines sampled throughout (status now prints each log's head epoch, chain identity and
 > fence), and each flow ending with the register invariants checked from outside the processes:
@@ -950,6 +1042,10 @@
 >   `xshard::tests::a_call_to_its_own_shard_runs_its_future_to_the_end_past_the_deadline`.
 > - **Open (live-durability): an install never finishes inside the liveness budget, and a dispatch strands its
 >   sessions** (record `docs/bugs/2026-11-06-an-install-never-finished-inside-the-liveness-budget.md`).
+>   - The size-derived budget is `live_ship::exchange_budget` (`bytes × smoothed RTT / congestion window` plus the
+>     liveness budget), on raft-chaos's branch with A-240, where phase one's log fetch uses it. live-durability's
+>     lanes take it after A-240 lands. Until then an install over a slow path is cut at the liveness budget, on main
+>     and on live-durability's landable branch alike (agreed 2026-11-07).
 >   - A candidate left behind the retained tail is sent the whole volume (0.5-1.5 MB) under the 1 s budget an entry
 >     gets. In one run 1,391 installs (2.06 GB) went out, both candidates held the owner's head, and no write became
 >     durable.
@@ -980,8 +1076,47 @@
 >   - A candidate's node replaced by a fresh anchor was promoted to voter after 41 s in one run, and never in the other.
 >   These are counted apart from the invariant results.
 >
+> - **Fixed (A-240): a live takeover counted members that never held the log** (record
+>   `docs/bugs/2026-11-06-a-live-takeover-counted-members-that-never-held-the-log.md`).
+>   - Phase one took `f + 1` reports from the current placement. A member placed after the writes (a replacement pod
+>     on KIND) stood in for a holder that could not answer, so a stale head could be adopted. KIND runs 42326682216
+>     and 42331191530 saw a holder at fence 1 after a takeover at epoch 2. The model broke 10 of 400 seeds.
+>   - Each shipper now records its epoch and holders in the volume's catalog and ships only once that catalog is
+>     placed at `f + 1`. Phase one counts `f + 1` among those holders alone, and waits typed when too few answer.
+>   - The model passes 0 broken of 400 seeds. The process flow is
+>     `a_member_that_never_held_the_log_never_stands_in_for_its_holder` (five nodes).
+>   - KIND run 42365340676 passed all four profiles end to end with A-240 and the two-step fetch: every write
+    acknowledged, every volume taken over whole at epoch 2 (unshaped 2.5 s, wan and wan-loss 16.9 s, ceiling 57.2 s).
+  - Process red-check, CI, 13 runs a side: the mutation (counting the current placement) left a holder at fence 1 in 4.
+    A-240 left none, and lost no write.
+  - **The stack's evidence (CI, 2026-11-07, three-way tree with live-durability's lanes, diag-24).** KIND passed all
+    four profiles end to end, every volume taken over whole at epoch 2: unshaped 1,000 writes, p99 1.2 ms, 2.5 s;
+    wan 300, p99 423 ms, 17.7 s; wan-loss 300, p99 407 ms, 18.8 s; ceiling 50, p50 1.55 s, 52.6 s. The five-node flow
+    passed 7 of 8 with no fence or NoLoss violation, judged on the successor's recorded holders; in its decisive run
+    phase one waited 28 times for the stopped holder, then took the volume over whole. The eighth was the open register
+    stall (`fleet.takeover.lost`, live-fixes).
+  - Open (live-fixes): a node replaced at the same machine anchor (same certificate) never answers a live write. Its
+    neighbours keep the old node's pair key and refuse the new one (`fleet.seal.pair_refused` 789 of 793 served, the
+    owner `pair_undelivered` 1,580), so the whole entry never carries their keys (`held_back.keys` 394). Before the
+    answering gate such writes were answered and could not be served at a takeover (`takeover_refused.open`).
+  - **Fixed (2026-11-07): a holder set of 2f+1 under an f-count.** Once the shipper follows the placement, a set can
+    have 2f+1 members (the placement moved off the owner: CI diag-20 run 7 recorded e, c, b at f = 1). The shipper
+    counted a write durable at f of a set while phase one counts f+1, and 1 + 2 = |H|: the successor counted itself and
+    c, and holder b was never fenced. A write is now durable once n − f of a set's n holders hold it, never for n ≤ f
+    (live-fixes, 6dd512b4; `a_write_is_durable_only_where_every_takeover_quorum_meets_it`, red on the old count).
+  - Open (memory, not safety): a holder a transition dropped keeps its copy, since it is no longer a catalog candidate
+    and never sees the record that omits it. A plain release (on that record, or from the owner) can drop the copy of a
+    host re-included meanwhile, whose replies the shipper may already count, so it needs a holder-set generation in
+    entries and replies (live-fixes; 2ba5572d reverted in eab618f2). Phase one never counts such a copy, and with the
+    n − f count no owner commits through it alone.
+  - Open: the holder set changing under a live log (joint transition and activation, with live-fixes and raft); a
+    successor outside the holders cannot open the log (`takeover_refused.open`); and a refused rebuild refetched the
+    log every period, fixed 2026-11-07 (`live_ship::owes_refetch`: no refetch at a head whose bytes were refused; bug
+    record `docs/bugs/2026-11-07-a-refused-live-takeover-refetched-its-log-every-period.md`).
+>
 > Touched: `crates/server/src/{live_ship,verbs,fleet}.rs` (the destroy's wait; the successor's routing at a
-> tombstone's retirement), the status line (`crates/ipc`
+> tombstone's retirement; A-240's holder record and phase-one count), `crates/db/src/{live,catalog,op,partition}.rs`
+> (A-240), the status line (`crates/ipc`
 > `LiveReport`, `crates/cli` status), the harness, the KIND leg (`xtask/src/kind_live.rs`,
 > `crates/cli/examples/pod_live_probe.rs`).
 
