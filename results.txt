@@ -1,0 +1,12 @@
+tested ed848a8cfaad9df9707b43f8594d027f2541766b variant before-forced on x86_64, 4 cpus
+  reverted:  crates/server/src/verbs.rs | 3 ---
+  reverted:  1 file changed, 3 deletions(-)
+capacity exit 101 67s
+  capacity: warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+  capacity:     |                 -------- variant in this enum
+  capacity: thread 'a_chain_held_by_a_reader_is_refused_typed_at_its_cap_and_folds_once_released' (5477) panicked at crates/server/tests/green_checkpoint.rs:333:3:
+  capacity: once the floor is released the refused version is accepted next: Err(Refused(TableAtCapacity { table: "green_chains" }))
+  capacity: test a_chain_held_by_a_reader_is_refused_typed_at_its_cap_and_folds_once_released ... FAILED
+  capacity:     a_chain_held_by_a_reader_is_refused_typed_at_its_cap_and_folds_once_released
+  capacity: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.28s
+  capacity: error: test failed, to rerun pass `-p slates-server --test green_checkpoint`
