@@ -121,3 +121,26 @@ shard 1 refused attach.foreign_refused.owner_unknown: 1
 0
 === run 9 exit 0 load { 14.07 10.84 9.03 }
 0
+=== run 10 exit 101 load { 12.26 10.96 9.19 }
+thread 'three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owners_death' (106522) panicked at crates/cli/tests/cli.rs:989:5:
+slates mount failed: slates: refused: AttachmentUnsupported { transport: NfsLoopback, reason: OwnedByAnotherHost }
+
+--- cli-fleet-b-50079 status:
+fleet_host: 17267155984088284669
+fleet_configuration_members: 2
+fleet_council_leads: false
+shard 0 refused fleet.takeover.adopted: 2
+shard 1 refused attach.foreign_refused.owner_unknown: 1
+--- cli-fleet-a-50079 status at the refusal:
+--- cli-fleet-b-50079 status at the refusal:
+fleet_host: 17267155984088284669
+fleet_configuration_members: 2
+fleet_council_leads: false
+shard 0 refused fleet.takeover.adopted: 2
+shard 1 refused attach.foreign_refused.owner_unknown: 1
+--- cli-fleet-c-50079 status at the refusal:
+fleet_host: 8031418036111546663
+fleet_configuration_members: 2
+fleet_council_leads: true
+--- the council did not widen to every node within 40s after the refusal
+0
