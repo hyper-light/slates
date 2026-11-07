@@ -63,15 +63,34 @@ fn elsewhere(state: &ShardState, volume: slates_ipc::protocol::VolumeId) -> bool
 /// The refusal, on the client's node, of an attach in a form other than the record form of another host's volume:
 /// by its kind, before anything is sent (A-222). `None` for every other request.
 pub(crate) fn foreign_attach(
-  state: &ShardState,
+  state: &mut ShardState,
   body: &slates_ipc::protocol::RequestBody,
 ) -> Option<Refusal> {
   let slates_ipc::protocol::RequestBody::Attach { volume, form, .. } = body else {
     return None;
   };
   let refusal = foreign_form(form)?;
-  elsewhere(state, *volume).then_some(refusal)
+  if !elsewhere(state, *volume) {
+    return None;
+  }
+  // Counted by what this shard's routing said, so a refusal of a volume this node owns names its cause.
+  let object = slates_db::register::ObjectId(volume.bytes);
+  state.count(
+    if state.fleet.object_owner(object).is_some() {
+      FOREIGN_REFUSED_OWNER_ELSEWHERE
+    } else {
+      FOREIGN_REFUSED_OWNER_UNKNOWN
+    },
+    1,
+  );
+  Some(refusal)
 }
+
+/// Counter: an attach refused by its kind because this shard's routing names another host as the volume's owner.
+const FOREIGN_REFUSED_OWNER_ELSEWHERE: &str = "attach.foreign_refused.owner_elsewhere";
+/// Counter: an attach refused by its kind because this shard's routing names no owner for a volume another host
+/// created.
+const FOREIGN_REFUSED_OWNER_UNKNOWN: &str = "attach.foreign_refused.owner_unknown";
 
 /// The host a request being served came from: the forwarding peer for a verb forwarded from another node, this node
 /// for a local client's.

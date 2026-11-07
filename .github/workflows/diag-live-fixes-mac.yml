@@ -1,0 +1,78 @@
+# Diagnostics for the live-fixes agent (not for main): main's macOS fleet-deploy test refused its successor's mount
+# OwnedByAnotherHost under load (scheduled run 42206043007). Ten runs of that test under two spinners a logical CPU, with
+# the attach refusal counted per shard by what its routing said. Results go to diag-live-fixes-results-<run>-macos.
+name: diag-live-fixes-mac
+
+on:
+  push:
+    branches: ['diag-live-fixes-[0-9]*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  deploy:
+    name: the fleet-deploy test ten times under load on macos-latest
+    runs-on: macos-latest
+    timeout-minutes: 180
+    env:
+      RESULTS_BRANCH: diag-live-fixes-results-${{ github.run_id }}-macos
+    steps:
+      - uses: actions/checkout@v4
+      - name: The results publisher
+        run: |
+          cat > "$RUNNER_TEMP/publish.sh" <<'EOF'
+          #!/bin/bash
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          cd "$GITHUB_WORKSPACE" || exit 0
+          entries=""
+          for f in results/*; do
+            [ -f "$f" ] || continue
+            blob=$(git hash-object -w "$f") || exit 0
+            entries="$entries$(printf '100644 blob %s\t%s' "$blob" "$(basename "$f")")"$'\n'
+          done
+          tree=$(printf '%s' "$entries" | git mktree) || exit 0
+          parent=$(cat "$RUNNER_TEMP/results-parent" 2>/dev/null || true)
+          commit=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "results of run $GITHUB_RUN_ID") || exit 0
+          if git push origin "$commit:refs/heads/$RESULTS_BRANCH"; then
+            echo "$commit" > "$RUNNER_TEMP/results-parent"
+          else
+            echo "::warning::could not publish the results"
+          fi
+          EOF
+          chmod +x "$RUNNER_TEMP/publish.sh"
+          mkdir -p results
+          { echo "tree $(git rev-parse HEAD) $(date -u +%FT%TZ)"; sysctl -n hw.logicalcpu; sw_vers; } > results/00-image.txt
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build -p slates-cli --tests --bins
+      - name: Ten runs under two spinners a logical CPU
+        run: |
+          T=three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owners_death
+          spinners=$(( $(sysctl -n hw.logicalcpu) * 2 ))
+          for i in $(seq 1 $spinners); do (while :; do :; done) & echo $! >> "$RUNNER_TEMP/spinners"; done
+          sleep 10
+          for n in $(seq 1 10); do
+            log="$RUNNER_TEMP/run-$n.log"
+            SLATES_TEST_CLI=1 timeout 600 cargo test -p slates-cli --test cli $T -- --nocapture > "$log" 2>&1
+            code=$?
+            {
+              echo "=== run $n exit $code load $(sysctl -n vm.loadavg)"
+              grep -E 'panicked at' -A2 "$log" | head -6
+              grep -E 'attach\.foreign_refused|fleet\.takeover\.adopted|fleet_host:|^--- |volume stat exit|fleet_configuration_members|fleet_council_leads' "$log" | head -60
+            } >> results/10-deploy.txt
+            if [ $code -ne 0 ]; then grep -vE '^slates-cluster: fleet: HostId' "$log" | tail -400 > results/run-$n-tail.txt; fi
+            mount | grep -c slates >> results/10-deploy.txt || true
+            bash "$RUNNER_TEMP/publish.sh"
+          done
+          kill $(cat "$RUNNER_TEMP/spinners") 2>/dev/null || true
+      - name: Publish whatever was measured
+        if: always()
+        run: if [ -f "$RUNNER_TEMP/publish.sh" ]; then bash "$RUNNER_TEMP/publish.sh"; fi
