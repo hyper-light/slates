@@ -1056,7 +1056,9 @@ fn stream_through<F: FnOnce(&Instant)>(
       "a write on {owner} was never answered (the fleet's state is printed above): {:?}",
       outcomes.last()
     );
-    (outcomes, sampler.join().unwrap())
+    let samples = sampler.join().unwrap();
+    print_slow_windows(instances, &outcomes, &samples);
+    (outcomes, samples)
   })
 }
 
@@ -1082,6 +1084,59 @@ fn after_writes(owner: &str, volume: &str, count: u64) {
       );
     }
     pause();
+  }
+}
+
+/// Format: the opt-in that prints the samples around each slow write ([`print_slow_windows`]).
+const PRINT_SLOW: &str = "SLATES_CHAOS_PRINT_SLOW";
+/// Shape: how far before a slow write's send its window of samples begins: enough to show the copies' state as it was
+/// sent.
+const SLOW_WINDOW_BEFORE: Duration = Duration::from_millis(500);
+/// Shape: how far past a slow write's answer its window of samples ends.
+const SLOW_WINDOW_AFTER: Duration = Duration::from_millis(200);
+
+/// With [`PRINT_SLOW`] set, prints for every write that took a liveness budget or more the samples from
+/// [`SLOW_WINDOW_BEFORE`] before its send to [`SLOW_WINDOW_AFTER`] after its answer, in time order: when, which node,
+/// and its live line. That separates a reply not folded (the healthy holder's head moved, the owner's durable did not)
+/// from a durable position computed from the stopped holder (live-durability, 2026-11-07).
+fn print_slow_windows(instances: &[String], outcomes: &[Outcome], samples: &[Sample]) {
+  if std::env::var_os(PRINT_SLOW).is_none() {
+    return;
+  }
+  let bound = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
+  for outcome in outcomes.iter().filter(|outcome| outcome.took >= bound) {
+    let from = outcome.sent.saturating_sub(SLOW_WINDOW_BEFORE);
+    let to = outcome.sent + outcome.took + SLOW_WINDOW_AFTER;
+    let mut window: Vec<&Sample> = samples
+      .iter()
+      .filter(|sample| sample.at >= from && sample.at <= to)
+      .collect();
+    window.sort_by_key(|sample| sample.at);
+    eprintln!(
+      "chaos slow write {} sent {:?} took {:?} refused {:?}: {} samples",
+      chaos_path(outcome.file),
+      outcome.sent,
+      outcome.took,
+      outcome.refused,
+      window.len()
+    );
+    for sample in window {
+      eprintln!(
+        "  {:>10.3?} {} {} head={:?} durable={:?} owed={} epoch={:?} fence={}",
+        sample.at,
+        instances.get(sample.node).map_or("?", String::as_str),
+        if sample.state.holding {
+          "held"
+        } else {
+          "shipping"
+        },
+        sample.state.head,
+        sample.state.durable,
+        sample.state.owed,
+        sample.state.epoch,
+        sample.state.fence
+      );
+    }
   }
 }
 
