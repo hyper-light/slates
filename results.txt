@@ -1,0 +1,79 @@
+1e634a556ef62049cca25efcbea4d0e79d06d877 Windows X64
+=== clippy: exit 0
+=== land: exit 0
+      1 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.88s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.26s
+      1 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+      1 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+      1 test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.73s
+      2 test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+      1 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+      1 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+=== base: exit 0
+      1 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.00s
+=== os-again-1: exit 0
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.89s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.24s
+      1 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+=== os-again-2: exit 0
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.90s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.10s
+      1 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+=== os-again-3: exit 0
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.88s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.15s
+      1 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+=== server-lib: exit 101
+      1 error: test failed, to rerun pass `-p slates-server --lib`
+      1 test result: FAILED. 193 passed; 2 failed; 2 ignored; 0 measured; 0 filtered out; finished in 4.62s
+---- verbs::tests::a_landing_of_a_named_snapshot_presents_that_snapshot_whatever_the_head_became stdout ----
+
+thread 'slates-shard-0' (1364) panicked at crates\server\src\verbs.rs:11809:18:
+not presented: Refused { refusal: TargetUnavailable { reason: "the target is owned by another user" } }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'verbs::tests::a_landing_of_a_named_snapshot_presents_that_snapshot_whatever_the_head_became' (2744) panicked at crates\server\src\daemon.rs:5124:12:
+the audit history completed: Terminated { stage: Execution, attempts: 1 }
+
+---- verbs::tests::a_presentation_past_the_bound_is_refused_and_changes_nothing stdout ----
+
+thread 'slates-shard-0' (3872) panicked at crates\server\src\verbs.rs:11702:9:
+Refused { refusal: TargetUnavailable { reason: "the target is owned by another user" } }
+
+thread 'verbs::tests::a_presentation_past_the_bound_is_refused_and_changes_nothing' (8296) panicked at crates\server\src\daemon.rs:5124:12:
+the audit history completed: Terminated { stage: Execution, attempts: 1 }
+
+
+=== server-verb: exit 101
+      1 error: test failed, to rerun pass `-p slates-server --test lease`
+      1 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+      1 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 23.43s
+---- one_target_has_one_landing_lease_whichever_shard_and_spelling_lands_it stdout ----
+lease: SKIP the alias half — this host has no unprivileged second spelling of \\?\D:\a\slates\slates\target\tmp\slates-3312-0; both landings use one spelling (the cross-shard half still runs)
+
+thread 'one_target_has_one_landing_lease_whichever_shard_and_spelling_lands_it' (8136) panicked at crates\server\tests\lease.rs:245:49:
+called `Result::unwrap()` on an `Err` value: Os { code: 123, kind: InvalidFilename, message: "The filename, directory name, or volume label syntax is incorrect." }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+=== client-presentation: exit 101
+      1 error: test failed, to rerun pass `-p slates-client --test presentation`
+      1 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+thread 'a_killed_clients_presented_landing_is_abandoned_with_it' (7288) panicked at crates\client\tests\presentation.rs:60:6:
+called `Result::unwrap()` on an `Err` value: Refused(TargetUnavailable { reason: "the target is owned by another user" })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+--
+---- a_killed_clients_presented_landing_is_abandoned_with_it stdout ----
+
+thread 'a_killed_clients_presented_landing_is_abandoned_with_it' (9104) panicked at crates\client\tests\presentation.rs:112:6:
+the presenter printed its landing
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+=== client-shards: exit 0
+      1 test result: ok. 13 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 3.24s
+=== end
