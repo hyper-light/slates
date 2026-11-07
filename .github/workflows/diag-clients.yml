@@ -1,0 +1,64 @@
+name: diag-clients
+
+# Diagnostics only, never on main (A-237's premise): main 4326a9d8 plus crates/server/tests/consumers.rs alone, on CI's
+# Linux and Windows runners: does a consumer enrolled under the channel's own host account attest on Windows today?
+# Each job pushes its result lines to diag-results/clients-consumers-1-<os> with the Actions token, read by git fetch.
+on:
+  push:
+    branches: ["diag-clients-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cross-shard-wait:
+    name: R3 class A on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Build the tests
+        run: cargo test --locked -p slates-server --test consumers --no-run
+      - name: The consumers test, three times
+        run: |
+          set +e
+          R=../results.txt
+          echo "runner ${{ matrix.os }}, $(date -u), commit $(git rev-parse --short HEAD)" > $R
+          for round in 1 2 3; do
+            echo "== round $round" | tee -a $R
+            cargo test --locked -q -p slates-server --test consumers -- --nocapture 2>&1 | grep -E 'panicked|cannot be enrolled|test result|assertion|left|right|Refused|Err' | tee -a $R
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/clients-consumers-1-${{ matrix.os }}"
+          git config user.name "diag-clients"
+          git config user.email "diag-clients@users.noreply.github.com"
+          git stash -q || true
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-clients consumers-1 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
