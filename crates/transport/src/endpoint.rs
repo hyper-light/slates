@@ -1375,6 +1375,7 @@ impl Endpoint {
         });
       }
       self.send(&datagram)?;
+      PROBE_SENT.with(|sent| sent.set(sent.get().saturating_add(1)));
     }
     // A spent packet-number space ends the session here, typed: nothing more can be sent under these keys.
     if self.conn.packet_numbers_exhausted() {
@@ -1663,6 +1664,7 @@ impl Endpoint {
         return Ok(reply);
       }
       self.flush()?;
+      PROBE_TURNS.with(|turns| turns.set(turns.get().saturating_add(1)));
       self.receive_or_probe().await?;
     }
   }
@@ -2522,4 +2524,19 @@ mod tests {
       Err(EndpointError::Header)
     ));
   }
+}
+
+std::thread_local! {
+  /// TEMPORARY (item 2 hops): receive waits inside `request` on this thread.
+  static PROBE_TURNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+  /// TEMPORARY: datagrams `flush` sent on this thread.
+  static PROBE_SENT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// TEMPORARY (item 2 hops): this thread's (receive waits in `request`, datagrams sent) since the last call.
+pub fn probe_take() -> (u64, u64) {
+  (
+    PROBE_TURNS.with(|t| t.replace(0)),
+    PROBE_SENT.with(|t| t.replace(0)),
+  )
 }

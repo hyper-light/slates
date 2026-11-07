@@ -782,7 +782,7 @@ struct Send {
 }
 
 // TEMPORARY (item 2 hop measurement): counters `live.hop.<hop>.<bucket>`, `.sum_ns`, `.n`.
-const HOP_NAMES: [[&str; 12]; 9] = [
+const HOP_NAMES: [[&str; 12]; 13] = [
   [
     "live.hop.to_control.lt0008us",
     "live.hop.to_control.lt0016us",
@@ -908,6 +908,62 @@ const HOP_NAMES: [[&str; 12]; 9] = [
     "live.hop.serve.ge2048us",
     "live.hop.serve.sum_ns",
     "live.hop.serve.n",
+  ],
+  [
+    "live.hop.srtt.lt0008us",
+    "live.hop.srtt.lt0016us",
+    "live.hop.srtt.lt0032us",
+    "live.hop.srtt.lt0064us",
+    "live.hop.srtt.lt0128us",
+    "live.hop.srtt.lt0256us",
+    "live.hop.srtt.lt0512us",
+    "live.hop.srtt.lt1024us",
+    "live.hop.srtt.lt2048us",
+    "live.hop.srtt.ge2048us",
+    "live.hop.srtt.sum_ns",
+    "live.hop.srtt.n",
+  ],
+  [
+    "live.hop.cwnd_pkts_k.lt0008us",
+    "live.hop.cwnd_pkts_k.lt0016us",
+    "live.hop.cwnd_pkts_k.lt0032us",
+    "live.hop.cwnd_pkts_k.lt0064us",
+    "live.hop.cwnd_pkts_k.lt0128us",
+    "live.hop.cwnd_pkts_k.lt0256us",
+    "live.hop.cwnd_pkts_k.lt0512us",
+    "live.hop.cwnd_pkts_k.lt1024us",
+    "live.hop.cwnd_pkts_k.lt2048us",
+    "live.hop.cwnd_pkts_k.ge2048us",
+    "live.hop.cwnd_pkts_k.sum_ns",
+    "live.hop.cwnd_pkts_k.n",
+  ],
+  [
+    "live.hop.turns_k.lt0008us",
+    "live.hop.turns_k.lt0016us",
+    "live.hop.turns_k.lt0032us",
+    "live.hop.turns_k.lt0064us",
+    "live.hop.turns_k.lt0128us",
+    "live.hop.turns_k.lt0256us",
+    "live.hop.turns_k.lt0512us",
+    "live.hop.turns_k.lt1024us",
+    "live.hop.turns_k.lt2048us",
+    "live.hop.turns_k.ge2048us",
+    "live.hop.turns_k.sum_ns",
+    "live.hop.turns_k.n",
+  ],
+  [
+    "live.hop.sent_k.lt0008us",
+    "live.hop.sent_k.lt0016us",
+    "live.hop.sent_k.lt0032us",
+    "live.hop.sent_k.lt0064us",
+    "live.hop.sent_k.lt0128us",
+    "live.hop.sent_k.lt0256us",
+    "live.hop.sent_k.lt0512us",
+    "live.hop.sent_k.lt1024us",
+    "live.hop.sent_k.lt2048us",
+    "live.hop.sent_k.ge2048us",
+    "live.hop.sent_k.sum_ns",
+    "live.hop.sent_k.n",
   ],
 ];
 
@@ -1445,6 +1501,11 @@ async fn ship_lane(
     let t_borrowed = slates_machine::clock::monotonic_ns();
     // Each message under its own budget: the liveness budget plus its transfer on the session it rides, so an install
     // of the whole volume is not given up the moment an entry would be (`exchange_budget`).
+    let probe_conn = sessions.first().map(|(_, endpoint)| {
+      let mtu = endpoint.path_mtu().unwrap_or(1200).max(1) as u64;
+      (endpoint.smoothed_rtt(), endpoint.congestion_window() / mtu)
+    });
+    let _ = slates_transport::endpoint::probe_take();
     let exchange = exchange_budget(send.bytes.len(), &sessions);
     let exchanged =
       slates_cluster::live::exchange((send.stream, &send.bytes), sessions, exchange, |_, _| true)
@@ -1456,6 +1517,14 @@ async fn ship_lane(
       hop(s, 0, t_lane.saturating_sub(made_ns));
       hop(s, 1, t_borrowed.saturating_sub(t_lane));
       hop(s, 2, t_exchanged.saturating_sub(t_borrowed));
+      let (turns, sent) = slates_transport::endpoint::probe_take();
+      if let Some((srtt, cwnd_pkts)) = probe_conn {
+        hop(s, 9, srtt);
+        // Counts recorded in thousands of "ns" so the µs buckets read as plain numbers (lt0008 = under 8).
+        hop(s, 10, cwnd_pkts.saturating_mul(1_000));
+        hop(s, 11, turns.saturating_mul(1_000));
+        hop(s, 12, sent.saturating_mul(1_000));
+      }
       for [spawn, rtt, back] in &exchanged.timings {
         hop(s, 5, *spawn);
         hop(s, 6, *rtt);
