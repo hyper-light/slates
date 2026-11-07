@@ -1,0 +1,11 @@
+tested ed848a8cfaad9df9707b43f8594d027f2541766b variant before-typed on x86_64, 4 cpus
+  reverted:  crates/server/src/error.rs | 4 +---
+  reverted:  1 file changed, 1 insertion(+), 3 deletions(-)
+capacity exit 101 84s
+  capacity: warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+  capacity: thread 'a_chain_held_by_a_reader_is_refused_typed_at_its_cap_and_folds_once_released' (5878) panicked at crates/server/tests/green_checkpoint.rs:321:3:
+  capacity: the chain held at its floor is refused typed at its cap (head 282): Some(Err(Refused(BadRequest { reason: "green_chains at capacity" })))
+  capacity: test a_chain_held_by_a_reader_is_refused_typed_at_its_cap_and_folds_once_released ... FAILED
+  capacity:     a_chain_held_by_a_reader_is_refused_typed_at_its_cap_and_folds_once_released
+  capacity: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.34s
+  capacity: error: test failed, to rerun pass `-p slates-server --test green_checkpoint`
