@@ -1,0 +1,181 @@
+tested f7b79d92b83b9da6d845e12f6fb694bdcb4de982 variant after on aarch64, 4 cpus
+mix exit 0 17s
+  mix: check 1: a tail of 4684 bytes replayed in 2498149 ns at the median
+  mix: check 2: a tail of 7060 bytes replayed in 2624322 ns at the median; the commits measured 864027 ns
+  mix: check 3: a tail of 10444 bytes replayed in 2855738 ns at the median; the commits measured 1262935 ns
+  mix: check 4: a tail of 15052 bytes replayed in 3179581 ns at the median; the commits measured 1805481 ns
+  mix: check 5: a tail of 21028 bytes replayed in 3611651 ns at the median; the commits measured 2515769 ns
+  mix: check 6: a tail of 28372 bytes replayed in 4119652 ns at the median; the commits measured 3387920 ns
+  mix: check 7: a tail of 37012 bytes replayed in 4728897 ns at the median; the commits measured 4435131 ns
+  mix: check 8: a tail of 46804 bytes replayed in 5403432 ns at the median; the commits measured 5594731 ns
+  mix: check 9: a tail of 57676 bytes replayed in 6184010 ns at the median; the commits measured 6886511 ns
+  mix: check 10: a tail of 69340 bytes replayed in 7050760 ns at the median; the commits measured 8261797 ns
+  mix: check 11: a tail of 81652 bytes replayed in 7948990 ns at the median; the commits measured 9725126 ns
+  mix: budget 10000000 ns: the small records' tail checked (bytes, median ns): [(4684, 2498149), (7060, 2624322), (10444, 2855738), (15052, 3179581), (21028, 3611651), (28372, 4119652), (37012, 4728897), (46804, 5403432), (57676, 6184010), (69340, 7050760), (81652, 7948990)]; snapshot after 83952 bytes of them
+  mix: test a_tail_whose_records_change_size_still_replays_within_its_recovery_budget ... ok
+  mix: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.25s
+mix-again exit 0 0s
+  mix-again: check 1: a tail of 4684 bytes replayed in 1431417 ns at the median
+  mix-again: check 2: a tail of 8788 bytes replayed in 1697226 ns at the median; the commits measured 1059535 ns
+  mix-again: check 3: a tail of 15268 bytes replayed in 2152690 ns at the median; the commits measured 1827896 ns
+  mix-again: check 4: a tail of 24196 bytes replayed in 2775903 ns at the median; the commits measured 2881332 ns
+  mix-again: check 5: a tail of 35140 bytes replayed in 3567482 ns at the median; the commits measured 4174368 ns
+  mix-again: check 6: a tail of 47452 bytes replayed in 4416926 ns at the median; the commits measured 5628759 ns
+  mix-again: check 7: a tail of 60916 bytes replayed in 5410585 ns at the median; the commits measured 7217884 ns
+  mix-again: check 8: a tail of 75028 bytes replayed in 6418843 ns at the median; the commits measured 8892723 ns
+  mix-again: budget 10000000 ns: the small records' tail checked (bytes, median ns): [(4684, 1431417), (8788, 1697226), (15268, 2152690), (24196, 2775903), (35140, 3567482), (47452, 4416926), (60916, 5410585), (75028, 6418843)]; snapshot after 84312 bytes of them
+  mix-again: test a_tail_whose_records_change_size_still_replays_within_its_recovery_budget ... ok
+  mix-again: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.18s
+mix-third exit 0 0s
+  mix-third: check 1: a tail of 4608 bytes replayed in 1421305 ns at the median
+  mix-third: check 2: a tail of 8712 bytes replayed in 1689826 ns at the median; the commits measured 1081287 ns
+  mix-third: check 3: a tail of 15192 bytes replayed in 2167002 ns at the median; the commits measured 1848186 ns
+  mix-third: check 4: a tail of 23976 bytes replayed in 2761990 ns at the median; the commits measured 2888669 ns
+  mix-third: check 5: a tail of 34848 bytes replayed in 3539201 ns at the median; the commits measured 4169153 ns
+  mix-third: check 6: a tail of 47160 bytes replayed in 4446584 ns at the median; the commits measured 5623289 ns
+  mix-third: check 7: a tail of 60480 bytes replayed in 5328797 ns at the median; the commits measured 7198775 ns
+  mix-third: check 8: a tail of 74736 bytes replayed in 6404802 ns at the median; the commits measured 8878966 ns
+  mix-third: budget 10000000 ns: the small records' tail checked (bytes, median ns): [(4608, 1421305), (8712, 1689826), (15192, 2167002), (23976, 2761990), (34848, 3539201), (47160, 4446584), (60480, 5328797), (74736, 6404802)]; snapshot after 84240 bytes of them
+  mix-third: test a_tail_whose_records_change_size_still_replays_within_its_recovery_budget ... ok
+  mix-third: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.18s
+budget exit 0 1s
+  budget: budget 10000000 ns: tail 85104 bytes, 9991654 ns of replay work as the commits measured it (8 bytes/us), floor 226 bytes; replayed 85104 bytes; recoveries [6316839, 6152169, 6145554, 6148193, 6122992] ns, median 6148193 ns (13 bytes/us), 614 per mille of the budget
+  budget: test a_fresh_partitions_longest_tail_replays_within_its_recovery_budget ... ok
+  budget: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.11s
+budget-again exit 0 0s
+  budget-again: budget 10000000 ns: tail 84888 bytes, 9985417 ns of replay work as the commits measured it (8 bytes/us), floor 226 bytes; replayed 84888 bytes; recoveries [6307822, 6166266, 6145241, 6140337, 6152649] ns, median 6152649 ns (13 bytes/us), 615 per mille of the budget
+  budget-again: test a_fresh_partitions_longest_tail_replays_within_its_recovery_budget ... ok
+  budget-again: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.11s
+budget-third exit 0 0s
+  budget-third: budget 10000000 ns: tail 84960 bytes, 9983945 ns of replay work as the commits measured it (8 bytes/us), floor 226 bytes; replayed 84960 bytes; recoveries [6327816, 6190843, 6141681, 6140473, 6124921] ns, median 6141681 ns (13 bytes/us), 614 per mille of the budget
+  budget-third: test a_fresh_partitions_longest_tail_replays_within_its_recovery_budget ... ok
+  budget-third: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.11s
+cadence exit 0 4s
+  cadence: ring 67108864: partition 8388983 bytes; 16777224 bytes of log in 233017 records; snapshots wrote 8388983 bytes; tail Tail { bytes: 8432568, replay_ns: 988630672 }, floor 8388983 bytes, longest snapshot 139285309 ns
+  cadence: ring 8388608: partition 8388983 bytes; 16777224 bytes of log in 233017 records; snapshots wrote 16777966 bytes; tail Tail { bytes: 262440, replay_ns: 30794759 }, floor 8388983 bytes, longest snapshot 140125714 ns
+  cadence: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 3.64s
+model exit 0 6s
+  model: test a_snapshot_is_due_only_once_the_tail_took_the_budget_and_reached_the_floor ... ok
+  model: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 4.16s
+db exit 0 31s
+  db: test ledger::tests::a_takeover_above_the_last_epoch_is_refused ... ok
+  db: test mirror::tests::an_older_record_and_a_rewrite_are_refused_and_a_retry_changes_nothing ... ok
+  db: test register::tests::a_configuration_reports_its_copyset_count_and_checks_the_loss_bound ... ok
+  db: test register::tests::a_hostile_takeover_page_is_refused ... ok
+  db: test register::tests::a_recovery_quorum_meets_every_commit_its_cohort_could_make_and_no_smaller_one_does ... ok
+  db: test register::tests::a_stale_configuration_version_is_refused_with_the_current_one ... ok
+  db: test register::tests::a_stale_epoch_is_refused_at_every_f ... ok
+  db: test result: ok. 63 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.01s
+  db: test a_ledger_promise_with_a_mismatched_log_length_is_refused ... ok
+  db: test a_truncated_ledger_promise_is_refused ... ok
+  db: test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.04s
+  db: test a_refused_entry_is_never_counted_as_held ... ok
+  db: test hostile_fetched_replies_are_refused ... ok
+  db: test hostile_fetches_are_refused ... ok
+  db: test hostile_replies_are_refused ... ok
+  db: test hostile_bytes_are_refused_not_trusted ... ok
+  db: test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.55s
+  db: test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  db: test a_snapshot_is_due_only_once_the_tail_took_the_budget_and_reached_the_floor ... ok
+  db: test hostile_records_are_refused_without_a_panic ... ok
+  db: test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.33s
+  db: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.11s
+  db: test a_publication_refused_before_the_append_rolls_the_transaction_back_and_a_retry_re_executes ... ok
+  db: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  db: test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+  db: test a_fresh_partitions_longest_tail_replays_within_its_recovery_budget ... ok
+  db: test a_tail_whose_records_change_size_still_replays_within_its_recovery_budget ... ok
+  db: test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.64s
+  db: test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+server-tests exit 0 119s
+  server-tests:   Downloaded ring v0.17.14
+  server-tests: warning: aws-lc-sys@0.45.0: Target platform: 'aarch64-unknown-linux-gnu'
+  server-tests: test catalog::tests::truncated_padded_and_foreign_class_values_are_refused ... ok
+  server-tests: test checkout::tests::a_symlink_difference_is_refused_by_path ... ok
+  server-tests: slates-server: client 41's seat was refused by its shard; its id is given back (first occurrence; later ones are counted)
+  server-tests: test daemon::tests::an_empty_fetch_reply_is_neither_adopted_nor_a_refused_join ... ok
+  server-tests: test deploy::tests::a_bad_address_is_refused ... ok
+  server-tests: test deploy::tests::a_bad_manifest_is_refused_by_name ... ok
+  server-tests: test deploy::tests::an_unusable_identity_is_refused_at_plan_time ... ok
+  server-tests: test direct_map::tests::a_copy_past_a_clients_share_is_refused_with_the_counts ... ok
+  server-tests: test dns::tests::a_bad_name_is_refused_by_reason ... ok
+  server-tests: test dns::tests::a_hostile_name_or_length_is_refused ... ok
+  server-tests: test dns::tests::a_refused_receive_does_not_end_a_lookup ... ok
+  server-tests: slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)test dns::tests::a_reply_for_another_query_is_refused ... 
+  server-tests: test dns::tests::a_truncated_reply_is_refused ... ok
+  server-tests: test fleet::discovery_wait_tests::a_settled_roster_backs_its_discovery_checks_off_to_the_horizon_and_a_change_resets_them ... ok
+  server-tests: test daemon::tests::refused_merge_authority_leaves_the_replica_unchanged ... ok
+  server-tests: test discovery::tests::refused_revalidation_keeps_the_complete_roster_for_the_next_restart ... ok
+  server-tests: test head::tests::truncated_and_padded_values_are_refused ... ok
+  server-tests: test lease::tests::every_promotion_quorum_meets_the_lease_confirmations_and_no_fewer_suffice ... ok
+  server-tests: test member_task::tests::an_announcement_round_trips_and_a_wrong_length_is_refused ... ok
+  server-tests: test merge_service::tests::a_truncated_or_padded_merge_record_value_is_refused ... ok
+  server-tests: slates-server: consensus retention refused; control shard stopped: consensus publication of 13955 bytes exceeds its 12272-byte budget
+  server-tests: test status_pages::tests::refused_capture_leaves_credit_available ... ok
+  server-tests: test tombstone::tests::truncated_padded_non_canonical_and_foreign_class_values_are_refused ... ok
+  server-tests: test verbs::tests::a_presentation_past_the_bound_is_refused_and_changes_nothing ... ok
+  server-tests: test verbs::tests::a_recovered_volume_over_its_acknowledged_size_is_refused_without_leaking_its_records ... ok
+  server-tests: test verbs::tests::a_taken_over_archive_lands_at_its_offsets_and_an_oversized_one_is_refused ... ok
+  server-tests: test work_log::tests::a_truncated_or_overlong_entry_is_refused ... ok
+  server-tests: test result: ok. 203 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 1.25s
+  server-tests: test a_connect_past_the_client_bound_is_refused_typed_at_the_rendezvous ... ok
+  server-tests: test a_client_that_never_acknowledges_is_refused_at_its_bound_and_served_once_it_acknowledges ... ok
+  server-tests: slates-server: any verb budget refuse-all (first occurrence): requested=0 config[reserve_per_shard=2785987242 shards=2 max_inodes=1209195 max_chunks=680172 metadata_class=2785987242] bytes[capacity=2147483648 committed=0 retained=0 headroom=2621440 replicated=0] versions[capacity=1209195 committed=0 retained=0 headroom=1] held[stages=0 charged=0]
+  server-tests: test a_works_edits_are_charged_and_refused_typed_when_the_budget_cannot_hold_them ... ok
+  server-tests: slates-server: a client's claim was refused: send refused (code Some(32)) (first occurrence; later ones are counted)
+  server-tests: test a_write_the_declared_durability_cannot_cover_is_refused_typed ... ok
+  server-tests: test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.57s
+  server-tests: test a_chain_held_by_a_reader_is_refused_typed_at_its_cap_and_folds_once_released ... ok
+  server-tests: slates-server: shard 0: recovered 0 volumes from their images (0 refused), 2 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.17s
+  server-tests: slates-server: shard 6: recovered 2 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: shard 3: recovered 2 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 2 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 1 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: shard 2: recovered 2 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: shard 6: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 1 destroys in flight, corrected 1 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: shard 1: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: shard 1: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: client 1's seat was refused by its shard; its id is given back (first occurrence; later ones are counted)
+  server-tests: slates-server: shard 4: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: shard 4: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: shard 4: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: shard 0: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: shard 0: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: shard 4: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: shard 6: recovered 1 volumes from their images (0 refused), 3 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 1 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: shard 4: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: shard 4: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: bytes budget refuse-all (first occurrence): requested=33816576 config[reserve_per_shard=8454144 shards=2 max_inodes=1209195 max_chunks=680172 metadata_class=2785987242] bytes[capacity=0 committed=0 retained=0 headroom=2621440 replicated=0] versions[capacity=1209195 committed=0 retained=0 headroom=1] held[stages=0 charged=0]
+  server-tests: slates-server: shard 4: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 1 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: shard 7: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: shard 7: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: shard 4: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: test a_refused_admission_leaves_the_pool_to_the_other_shards ... ok
+  server-tests: slates-server: shard 4: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: shard 6: recovered 2 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: shard 0: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 1 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: shard 4: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: test a_shard_is_refused_while_another_holds_the_pool_and_admitted_once_it_returns ... ok
+  server-tests: slates-server: shard 4: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: shard 2: recovered 2 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: client identity recovery refused on shard 6
+  server-tests: slates-server: the boot is refused; the heartbeat stops so the anchor restarts this daemon
+  server-tests: slates-server: shard 4: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: shard 6: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: shard 4: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: shard 5: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 1 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: shard 0: recovered 0 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: shard 0: recovered 0 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  server-tests: slates-server: client identity recovery refused on shard 6
+  server-tests: slates-server: the boot is refused; the heartbeat stops so the anchor restarts this daemon
+  server-tests: slates-server: shard 0: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 1 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+cli-status exit 0 45s
+  cli-status: warning: aws-lc-sys@0.45.0: Target platform: 'aarch64-unknown-linux-gnu'
+  cli-status: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 85 filtered out; finished in 0.00s
+bench-builds exit 0 0s
+clippy exit 101 43s
+  clippy: error: `unwrap` used in a function that returns a `Result`
+  clippy: error: `unwrap` used in a function that returns a `Result`
+  clippy: error: `unwrap` used in a function that returns a `Result`
+  clippy: error: `unwrap` used in a function that returns a `Result`
+  clippy: error: could not compile `slates-db` (test "model") due to 4 previous errors
+  clippy: warning: aws-lc-sys@0.45.0: Target platform: 'aarch64-unknown-linux-gnu'
