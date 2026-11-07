@@ -2,8 +2,8 @@
 
 > **CI coverage on every platform (2026-11-06, VFS plan Step 15).** `docs/wip/ci-matrix.md` lists every test target of
 > the workspace (301: lib, bin and tests) against the lanes that run it.
-> - **Now run on both Windows lanes:** `slates-server`'s unit tests (two landing tests failed there until winfsp-bench's
->   fix) and `crates/server/tests/fleet.rs`, which was `cfg(unix)` as a whole. Only its virtio-fs guest test stays
+> - **Now run on both Windows lanes:** `slates-server`'s unit tests (two landing tests fail there until the Windows landing
+>   writer lands, winfsp-bench's port of `agents/windows-land-wip`; the step lands with it) and `crates/server/tests/fleet.rs`, which was `cfg(unix)` as a whole. Only its virtio-fs guest test stays
 >   Unix-only. Both run one test at a time.
 > - **Built for Windows by no lane:** the `slates` binary's unit tests and `slates-bridge-fuse`'s `abi` test did not
 >   compile there (fixed). Three `slates-cli` benchmark examples still do not compile (`nfs_writeback_ab`,

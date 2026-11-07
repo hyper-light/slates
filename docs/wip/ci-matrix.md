@@ -34,7 +34,8 @@ drift (CLAUDE.md §4, doc-truth tests).
 | Windows arm64 | 39 | 1 | 0 | 207 | 54 |
 
 With this change the Windows lanes run `slates-server`'s unit tests and `crates/server/tests/fleet.rs` (before: 38 and
-37 targets).
+37 targets). The unit-test step lands with the Windows landing writer: two landing tests fail on Windows until it does,
+since `landing.rs`'s Windows arm refuses `Unsupported { feature: "landing" }`.
 
 ## What compiling the whole workspace for Windows found
 
