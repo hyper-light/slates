@@ -1,0 +1,602 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 02:41:00 UTC 2026, arm B 30b8aa22845698a7641623a77f1daa58106072e3
+== quiet round 1 arm a at 02:41:00, load 1.95 2.37 1.26
+measure: the owner's live counters {"appended": 2551, "durable": 2551, "install_bytes": 5091, "install_sent": 1, "resolved": 2051}
+hop borrow.lt0008us 4718
+hop borrow.lt0016us 4
+hop borrow.n 4722
+hop borrow.sum_ns 3168553
+hop exchange.lt0128us 1231
+hop exchange.lt0256us 3463
+hop exchange.lt0512us 25
+hop exchange.lt1024us 3
+hop exchange.n 4722
+hop exchange.sum_ns 692133783
+hop round.lt0256us 4293
+hop round.lt0512us 426
+hop round.lt1024us 3
+hop round.n 4722
+hop round.sum_ns 904363719
+hop to_control.lt0016us 22
+hop to_control.lt0032us 3822
+hop to_control.lt0064us 858
+hop to_control.lt0128us 16
+hop to_control.lt0256us 3
+hop to_control.lt0512us 1
+hop to_control.n 4722
+hop to_control.sum_ns 137186675
+hop to_owner.lt0008us 3117
+hop to_owner.lt0016us 893
+hop to_owner.lt0032us 313
+hop to_owner.lt0064us 179
+hop to_owner.lt0128us 217
+hop to_owner.lt0256us 3
+hop to_owner.n 4722
+hop to_owner.sum_ns 63295975
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 1.95 2.37 1.26 3/268 10203
+  plain p50 65.9 p99 125.2 p999 149.1 max 158.8 us
+  live  p50 257.9 p99 376.8 p999 498.9 max 975.1 us
+  added at p50 192.0 us; live log at the end Some(("2550", "2550", "false")); late 0; (no_session, unanswered, link_lost) (0, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 2.60s
+== quiet round 1 arm a exit 0
+== quiet round 1 arm b at 02:41:03, load 1.95 2.37 1.26
+measure: the owner's live counters {"appended": 2537, "durable": 2537, "install_bytes": 56001, "install_sent": 11, "no_session": 1, "refused": 30, "resolved": 2051}
+hop borrow.ge2048us 1
+hop borrow.lt0008us 4558
+hop borrow.lt0016us 7
+hop borrow.lt0032us 2
+hop borrow.n 4568
+hop borrow.sum_ns 103578637
+hop exchange.ge2048us 2
+hop exchange.lt0128us 3638
+hop exchange.lt0256us 863
+hop exchange.lt0512us 34
+hop exchange.lt1024us 14
+hop exchange.lt2048us 17
+hop exchange.n 4568
+hop exchange.sum_ns 582852557
+hop round.ge2048us 5
+hop round.lt0128us 546
+hop round.lt0256us 3332
+hop round.lt0512us 633
+hop round.lt1024us 26
+hop round.lt2048us 26
+hop round.n 4568
+hop round.sum_ns 982750507
+hop to_control.ge2048us 2
+hop to_control.lt0016us 420
+hop to_control.lt0032us 3499
+hop to_control.lt0064us 326
+hop to_control.lt0128us 256
+hop to_control.lt0256us 32
+hop to_control.lt0512us 25
+hop to_control.lt1024us 3
+hop to_control.lt2048us 5
+hop to_control.n 4568
+hop to_control.sum_ns 137408429
+hop to_owner.lt0008us 2525
+hop to_owner.lt0016us 505
+hop to_owner.lt0032us 262
+hop to_owner.lt0064us 177
+hop to_owner.lt0128us 1068
+hop to_owner.lt0256us 23
+hop to_owner.lt0512us 5
+hop to_owner.lt1024us 3
+hop to_owner.n 4568
+hop to_owner.sum_ns 148316410
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 1.88 2.35 1.26 3/268 10381
+  plain p50 58.2 p99 1213.9 p999 1471.7 max 1802.9 us
+  live  p50 238.9 p99 586.4 p999 1309.2 max 1499.9 us
+  added at p50 180.6 us; live log at the end Some(("2536", "2536", "false")); late 0; (no_session, unanswered, link_lost) (1, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 1.90s
+== quiet round 1 arm b exit 0
+== busy round 1 arm a at 02:41:05, load 1.88 2.35 1.26
+measure: the owner's live counters {"appended": 2395, "durable": 2393, "install_bytes": 56001, "install_sent": 11, "no_session": 2, "refused": 237, "resolved": 2051}
+hop borrow.lt0008us 4754
+hop borrow.lt0016us 1
+hop borrow.lt1024us 2
+hop borrow.n 4757
+hop borrow.sum_ns 5866058
+hop exchange.ge2048us 1929
+hop exchange.lt0128us 93
+hop exchange.lt0256us 349
+hop exchange.lt0512us 415
+hop exchange.lt1024us 854
+hop exchange.lt2048us 1117
+hop exchange.n 4757
+hop exchange.sum_ns 9370863334
+hop round.ge2048us 2689
+hop round.lt0128us 4
+hop round.lt0256us 153
+hop round.lt0512us 181
+hop round.lt1024us 599
+hop round.lt2048us 1131
+hop round.n 4757
+hop round.sum_ns 14580815518
+hop to_control.ge2048us 470
+hop to_control.lt0008us 1
+hop to_control.lt0016us 559
+hop to_control.lt0032us 2261
+hop to_control.lt0064us 677
+hop to_control.lt0128us 143
+hop to_control.lt0256us 35
+hop to_control.lt0512us 35
+hop to_control.lt1024us 361
+hop to_control.lt2048us 215
+hop to_control.n 4757
+hop to_control.sum_ns 2494724388
+hop to_owner.ge2048us 453
+hop to_owner.lt0008us 235
+hop to_owner.lt0016us 1415
+hop to_owner.lt0032us 891
+hop to_owner.lt0064us 515
+hop to_owner.lt0128us 378
+hop to_owner.lt0256us 110
+hop to_owner.lt0512us 31
+hop to_owner.lt1024us 354
+hop to_owner.lt2048us 375
+hop to_owner.n 4757
+hop to_owner.sum_ns 2692391120
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 3.59 2.70 1.39 13/277 10524
+  plain p50 91.5 p99 4925.8 p999 7063.5 max 9000.8 us
+  live  p50 3001.1 p99 12228.9 p999 17149.5 max 18007.6 us
+  added at p50 2909.6 us; live log at the end Some(("2394", "2394", "false")); late 0; (no_session, unanswered, link_lost) (2, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 11.84s
+== busy round 1 arm a exit 0
+== busy round 1 arm b at 02:41:17, load 3.59 2.70 1.39
+measure: the owner's live counters {"appended": 2303, "durable": 2291, "install_bytes": 916380, "install_sent": 180, "no_session": 25, "refused": 297, "resolved": 2051}
+hop borrow.ge2048us 14
+hop borrow.lt0008us 3836
+hop borrow.lt0016us 1
+hop borrow.lt0064us 1
+hop borrow.lt0256us 1
+hop borrow.lt0512us 3
+hop borrow.lt1024us 3
+hop borrow.lt2048us 4
+hop borrow.n 3863
+hop borrow.sum_ns 265635135
+hop exchange.ge2048us 1603
+hop exchange.lt0064us 21
+hop exchange.lt0128us 1635
+hop exchange.lt0256us 306
+hop exchange.lt0512us 16
+hop exchange.lt1024us 36
+hop exchange.lt2048us 246
+hop exchange.n 3863
+hop exchange.sum_ns 23341226274
+hop round.ge2048us 2650
+hop round.lt0128us 917
+hop round.lt0256us 157
+hop round.lt0512us 49
+hop round.lt1024us 32
+hop round.lt2048us 58
+hop round.n 3863
+hop round.sum_ns 45593048932
+hop to_control.ge2048us 1814
+hop to_control.lt0008us 757
+hop to_control.lt0016us 640
+hop to_control.lt0032us 186
+hop to_control.lt0064us 77
+hop to_control.lt0128us 65
+hop to_control.lt0256us 40
+hop to_control.lt0512us 6
+hop to_control.lt1024us 119
+hop to_control.lt2048us 159
+hop to_control.n 3863
+hop to_control.sum_ns 13819185550
+hop to_owner.ge2048us 1564
+hop to_owner.lt0008us 1527
+hop to_owner.lt0016us 56
+hop to_owner.lt0032us 22
+hop to_owner.lt0064us 41
+hop to_owner.lt0128us 78
+hop to_owner.lt0256us 28
+hop to_owner.lt0512us 7
+hop to_owner.lt1024us 230
+hop to_owner.lt2048us 310
+hop to_owner.n 3863
+hop to_owner.sum_ns 8144746546
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 7.94 3.85 1.81 14/274 10646
+  plain p50 56.8 p99 11999.7 p999 12003.9 max 14289.3 us
+  live  p50 9000.5 p99 38954.3 p999 48003.6 max 56078.1 us
+  added at p50 8943.7 us; live log at the end Some(("2302", "2302", "false")); late 0; (no_session, unanswered, link_lost) (25, 0, 0); live writes over 50 ms 1
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 26.35s
+== busy round 1 arm b exit 0
+== quiet round 2 arm b at 02:41:44, load 7.94 3.85 1.81
+measure: the owner's live counters {"appended": 2551, "durable": 2550, "install_bytes": 25455, "install_sent": 5, "no_session": 1, "refused": 2, "resolved": 2051}
+hop borrow.ge2048us 1
+hop borrow.lt0008us 4645
+hop borrow.lt0016us 2
+hop borrow.n 4648
+hop borrow.sum_ns 104331224
+hop exchange.ge2048us 1
+hop exchange.lt0128us 4194
+hop exchange.lt0256us 440
+hop exchange.lt0512us 8
+hop exchange.lt1024us 2
+hop exchange.lt2048us 3
+hop exchange.n 4648
+hop exchange.sum_ns 474427693
+hop round.ge2048us 2
+hop round.lt0128us 3424
+hop round.lt0256us 1040
+hop round.lt0512us 172
+hop round.lt1024us 6
+hop round.lt2048us 4
+hop round.n 4648
+hop round.sum_ns 694179607
+hop to_control.lt0008us 83
+hop to_control.lt0016us 3756
+hop to_control.lt0032us 728
+hop to_control.lt0064us 56
+hop to_control.lt0128us 13
+hop to_control.lt0256us 10
+hop to_control.lt0512us 1
+hop to_control.lt1024us 1
+hop to_control.n 4648
+hop to_control.sum_ns 66799248
+hop to_owner.lt0008us 3098
+hop to_owner.lt0016us 1090
+hop to_owner.lt0032us 230
+hop to_owner.lt0064us 197
+hop to_owner.lt0128us 30
+hop to_owner.lt0256us 1
+hop to_owner.lt1024us 2
+hop to_owner.n 4648
+hop to_owner.sum_ns 40900480
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 7.94 3.85 1.81 3/269 10896
+  plain p50 51.5 p99 1105.0 p999 1359.8 max 2069.4 us
+  live  p50 194.2 p99 306.1 p999 1107.5 max 1347.1 us
+  added at p50 142.7 us; live log at the end Some(("2550", "2550", "false")); late 0; (no_session, unanswered, link_lost) (1, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 2.59s
+== quiet round 2 arm b exit 0
+== quiet round 2 arm a at 02:41:46, load 7.94 3.85 1.81
+measure: the owner's live counters {"appended": 2551, "durable": 2551, "install_bytes": 5091, "install_sent": 1, "no_session": 2, "resolved": 2051}
+hop borrow.ge2048us 1
+hop borrow.lt0008us 4744
+hop borrow.lt0016us 1
+hop borrow.lt0128us 1
+hop borrow.n 4747
+hop borrow.sum_ns 104154142
+hop exchange.lt0128us 516
+hop exchange.lt0256us 4217
+hop exchange.lt0512us 14
+hop exchange.n 4747
+hop exchange.sum_ns 740578944
+hop round.ge2048us 1
+hop round.lt0256us 4152
+hop round.lt0512us 593
+hop round.lt1024us 1
+hop round.n 4747
+hop round.sum_ns 1103633924
+hop to_control.lt0016us 32
+hop to_control.lt0032us 980
+hop to_control.lt0064us 3681
+hop to_control.lt0128us 50
+hop to_control.lt0256us 3
+hop to_control.lt0512us 1
+hop to_control.n 4747
+hop to_control.sum_ns 168981576
+hop to_owner.lt0008us 2894
+hop to_owner.lt0016us 986
+hop to_owner.lt0032us 283
+hop to_owner.lt0064us 158
+hop to_owner.lt0128us 426
+hop to_owner.n 4747
+hop to_owner.sum_ns 80220258
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 7.31 3.78 1.80 3/269 11167
+  plain p50 65.3 p99 124.5 p999 155.7 max 275.0 us
+  live  p50 285.5 p99 372.9 p999 497.2 max 559.6 us
+  added at p50 220.2 us; live log at the end Some(("2550", "2550", "false")); late 0; (no_session, unanswered, link_lost) (2, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 2.75s
+== quiet round 2 arm a exit 0
+== busy round 2 arm b at 02:41:49, load 7.31 3.78 1.80
+measure: the owner's live counters {"appended": 2325, "durable": 2316, "install_bytes": 1048746, "install_sent": 206, "no_session": 11, "refused": 285, "resolved": 2051}
+hop borrow.ge2048us 9
+hop borrow.lt0008us 3781
+hop borrow.lt0512us 1
+hop borrow.lt2048us 1
+hop borrow.n 3792
+hop borrow.sum_ns 63718615
+hop exchange.ge2048us 1786
+hop exchange.lt0064us 16
+hop exchange.lt0128us 1545
+hop exchange.lt0256us 189
+hop exchange.lt0512us 8
+hop exchange.lt1024us 22
+hop exchange.lt2048us 226
+hop exchange.n 3792
+hop exchange.sum_ns 22624965858
+hop round.ge2048us 2594
+hop round.lt0128us 949
+hop round.lt0256us 158
+hop round.lt0512us 19
+hop round.lt1024us 17
+hop round.lt2048us 55
+hop round.n 3792
+hop round.sum_ns 42264758206
+hop to_control.ge2048us 1411
+hop to_control.lt0008us 799
+hop to_control.lt0016us 728
+hop to_control.lt0032us 253
+hop to_control.lt0064us 86
+hop to_control.lt0128us 63
+hop to_control.lt0256us 33
+hop to_control.lt0512us 3
+hop to_control.lt1024us 204
+hop to_control.lt2048us 212
+hop to_control.n 3792
+hop to_control.sum_ns 11538454034
+hop to_owner.ge2048us 1499
+hop to_owner.lt0008us 1467
+hop to_owner.lt0016us 20
+hop to_owner.lt0032us 18
+hop to_owner.lt0064us 42
+hop to_owner.lt0128us 78
+hop to_owner.lt0256us 11
+hop to_owner.lt0512us 3
+hop to_owner.lt1024us 304
+hop to_owner.lt2048us 350
+hop to_owner.n 3792
+hop to_owner.sum_ns 8019166319
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 10.08 4.72 2.16 13/276 11297
+  plain p50 61.5 p99 11998.3 p999 12004.0 max 15003.9 us
+  live  p50 8993.6 p99 36001.9 p999 47113.3 max 106887.4 us
+  added at p50 8932.1 us; live log at the end Some(("2324", "2324", "false")); late 0; (no_session, unanswered, link_lost) (11, 0, 0); live writes over 50 ms 1
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 24.51s
+== busy round 2 arm b exit 0
+== busy round 2 arm a at 02:42:14, load 10.08 4.72 2.16
+measure: the owner's live counters {"appended": 2416, "durable": 2412, "install_bytes": 56001, "install_sent": 11, "no_session": 9, "refused": 191, "resolved": 2051}
+hop borrow.ge2048us 2
+hop borrow.lt0008us 4793
+hop borrow.lt0256us 1
+hop borrow.lt0512us 1
+hop borrow.lt1024us 2
+hop borrow.lt2048us 3
+hop borrow.n 4802
+hop borrow.sum_ns 16632410
+hop exchange.ge2048us 1905
+hop exchange.lt0128us 65
+hop exchange.lt0256us 375
+hop exchange.lt0512us 487
+hop exchange.lt1024us 980
+hop exchange.lt2048us 990
+hop exchange.n 4802
+hop exchange.sum_ns 9286091304
+hop round.ge2048us 2657
+hop round.lt0128us 2
+hop round.lt0256us 134
+hop round.lt0512us 257
+hop round.lt1024us 518
+hop round.lt2048us 1234
+hop round.n 4802
+hop round.sum_ns 14878989284
+hop to_control.ge2048us 471
+hop to_control.lt0016us 240
+hop to_control.lt0032us 2644
+hop to_control.lt0064us 579
+hop to_control.lt0128us 182
+hop to_control.lt0256us 29
+hop to_control.lt0512us 46
+hop to_control.lt1024us 425
+hop to_control.lt2048us 186
+hop to_control.n 4802
+hop to_control.sum_ns 2398725860
+hop to_owner.ge2048us 591
+hop to_owner.lt0008us 176
+hop to_owner.lt0016us 1305
+hop to_owner.lt0032us 830
+hop to_owner.lt0064us 642
+hop to_owner.lt0128us 231
+hop to_owner.lt0256us 103
+hop to_owner.lt0512us 42
+hop to_owner.lt1024us 471
+hop to_owner.lt2048us 411
+hop to_owner.n 4802
+hop to_owner.sum_ns 3162629799
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 10.52 4.99 2.28 14/276 11425
+  plain p50 117.2 p99 6000.8 p999 9000.4 max 9997.2 us
+  live  p50 3272.5 p99 15034.7 p999 18995.1 max 23993.6 us
+  added at p50 3155.3 us; live log at the end Some(("2415", "2415", "false")); late 0; (no_session, unanswered, link_lost) (9, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 12.19s
+== busy round 2 arm a exit 0
+== quiet round 3 arm a at 02:42:27, load 10.52 4.99 2.28
+measure: the owner's live counters {"appended": 2551, "durable": 2551, "install_bytes": 5091, "install_sent": 1, "no_session": 2, "resolved": 2051}
+hop borrow.ge2048us 1
+hop borrow.lt0008us 4717
+hop borrow.lt0016us 5
+hop borrow.lt0256us 1
+hop borrow.n 4724
+hop borrow.sum_ns 103242176
+hop exchange.lt0128us 888
+hop exchange.lt0256us 3804
+hop exchange.lt0512us 32
+hop exchange.n 4724
+hop exchange.sum_ns 719146268
+hop round.ge2048us 1
+hop round.lt0128us 1
+hop round.lt0256us 4177
+hop round.lt0512us 543
+hop round.lt1024us 2
+hop round.n 4724
+hop round.sum_ns 1039212154
+hop to_control.lt0008us 1
+hop to_control.lt0016us 42
+hop to_control.lt0032us 2914
+hop to_control.lt0064us 1723
+hop to_control.lt0128us 40
+hop to_control.lt0256us 3
+hop to_control.lt0512us 1
+hop to_control.n 4724
+hop to_control.sum_ns 149113338
+hop to_owner.lt0008us 3592
+hop to_owner.lt0016us 383
+hop to_owner.lt0032us 261
+hop to_owner.lt0064us 181
+hop to_owner.lt0128us 306
+hop to_owner.lt0256us 1
+hop to_owner.n 4724
+hop to_owner.sum_ns 58222558
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 9.68 4.91 2.27 3/268 11691
+  plain p50 64.6 p99 124.9 p999 145.3 max 170.2 us
+  live  p50 259.7 p99 346.9 p999 411.3 max 449.9 us
+  added at p50 195.0 us; live log at the end Some(("2550", "2550", "false")); late 0; (no_session, unanswered, link_lost) (2, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 2.80s
+== quiet round 3 arm a exit 0
+== quiet round 3 arm b at 02:42:30, load 9.68 4.91 2.27
+measure: the owner's live counters {"appended": 2545, "durable": 2545, "install_bytes": 15273, "install_sent": 3, "no_session": 2, "refused": 10, "resolved": 2051}
+hop borrow.ge2048us 1
+hop borrow.lt0008us 4603
+hop borrow.lt0016us 2
+hop borrow.lt0064us 1
+hop borrow.n 4607
+hop borrow.sum_ns 103322450
+hop exchange.lt0128us 3742
+hop exchange.lt0256us 829
+hop exchange.lt0512us 20
+hop exchange.lt1024us 7
+hop exchange.lt2048us 9
+hop exchange.n 4607
+hop exchange.sum_ns 567692005
+hop round.ge2048us 3
+hop round.lt0128us 728
+hop round.lt0256us 3652
+hop round.lt0512us 204
+hop round.lt1024us 10
+hop round.lt2048us 10
+hop round.n 4607
+hop round.sum_ns 841769041
+hop to_control.lt0008us 3
+hop to_control.lt0016us 578
+hop to_control.lt0032us 3603
+hop to_control.lt0064us 381
+hop to_control.lt0128us 24
+hop to_control.lt0256us 12
+hop to_control.lt0512us 3
+hop to_control.lt2048us 3
+hop to_control.n 4607
+hop to_control.sum_ns 107560961
+hop to_owner.lt0008us 3345
+hop to_owner.lt0016us 578
+hop to_owner.lt0032us 360
+hop to_owner.lt0064us 188
+hop to_owner.lt0128us 135
+hop to_owner.lt0256us 1
+hop to_owner.n 4607
+hop to_owner.sum_ns 55607973
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 9.68 4.91 2.27 3/270 11880
+  plain p50 55.7 p99 1098.3 p999 1629.9 max 1763.8 us
+  live  p50 238.4 p99 902.5 p999 1880.6 max 1989.9 us
+  added at p50 182.7 us; live log at the end Some(("2544", "2544", "false")); late 0; (no_session, unanswered, link_lost) (2, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 2.02s
+== quiet round 3 arm b exit 0
+== busy round 3 arm a at 02:42:32, load 9.68 4.91 2.27
+measure: the owner's live counters {"appended": 2450, "durable": 2447, "install_bytes": 280005, "install_sent": 55, "no_session": 10, "refused": 189, "resolved": 2051}
+hop borrow.ge2048us 2
+hop borrow.lt0008us 4642
+hop borrow.lt0016us 1
+hop borrow.lt0256us 5
+hop borrow.lt0512us 2
+hop borrow.lt2048us 1
+hop borrow.n 4653
+hop borrow.sum_ns 115184605
+hop exchange.ge2048us 792
+hop exchange.lt0128us 51
+hop exchange.lt0256us 856
+hop exchange.lt0512us 1952
+hop exchange.lt1024us 560
+hop exchange.lt2048us 442
+hop exchange.n 4653
+hop exchange.sum_ns 4788010922
+hop round.ge2048us 2266
+hop round.lt0256us 142
+hop round.lt0512us 872
+hop round.lt1024us 562
+hop round.lt2048us 811
+hop round.n 4653
+hop round.sum_ns 12708869811
+hop to_control.ge2048us 953
+hop to_control.lt0016us 138
+hop to_control.lt0032us 1895
+hop to_control.lt0064us 451
+hop to_control.lt0128us 191
+hop to_control.lt0256us 84
+hop to_control.lt0512us 116
+hop to_control.lt1024us 335
+hop to_control.lt2048us 490
+hop to_control.n 4653
+hop to_control.sum_ns 4205405148
+hop to_owner.ge2048us 993
+hop to_owner.lt0008us 72
+hop to_owner.lt0016us 1230
+hop to_owner.lt0032us 374
+hop to_owner.lt0064us 460
+hop to_owner.lt0128us 566
+hop to_owner.lt0256us 268
+hop to_owner.lt0512us 150
+hop to_owner.lt1024us 227
+hop to_owner.lt2048us 313
+hop to_owner.n 4653
+hop to_owner.sum_ns 3582527065
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 10.63 5.27 2.42 13/277 12031
+  plain p50 81.0 p99 4667.8 p999 6263.6 max 6545.3 us
+  live  p50 2069.0 p99 10999.1 p999 14999.3 max 16038.3 us
+  added at p50 1988.0 us; live log at the end Some(("2449", "2449", "false")); late 0; (no_session, unanswered, link_lost) (10, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 10.01s
+== busy round 3 arm a exit 0
+== busy round 3 arm b at 02:42:42, load 10.63 5.27 2.42
+measure: the owner's live counters {"appended": 2278, "durable": 2269, "install_bytes": 855288, "install_sent": 168, "no_session": 11, "refused": 333, "resolved": 2051}
+hop borrow.ge2048us 7
+hop borrow.lt0008us 3740
+hop borrow.lt0016us 1
+hop borrow.lt0512us 1
+hop borrow.lt1024us 1
+hop borrow.lt2048us 2
+hop borrow.n 3752
+hop borrow.sum_ns 71840485
+hop exchange.ge2048us 1559
+hop exchange.lt0064us 24
+hop exchange.lt0128us 1660
+hop exchange.lt0256us 260
+hop exchange.lt0512us 16
+hop exchange.lt1024us 26
+hop exchange.lt2048us 207
+hop exchange.n 3752
+hop exchange.sum_ns 21785206327
+hop round.ge2048us 2493
+hop round.lt0128us 965
+hop round.lt0256us 166
+hop round.lt0512us 56
+hop round.lt1024us 22
+hop round.lt2048us 50
+hop round.n 3752
+hop round.sum_ns 42761916240
+hop to_control.ge2048us 1670
+hop to_control.lt0008us 875
+hop to_control.lt0016us 557
+hop to_control.lt0032us 134
+hop to_control.lt0064us 79
+hop to_control.lt0128us 77
+hop to_control.lt0256us 33
+hop to_control.lt0512us 6
+hop to_control.lt1024us 117
+hop to_control.lt2048us 204
+hop to_control.n 3752
+hop to_control.sum_ns 13189192959
+hop to_owner.ge2048us 1520
+hop to_owner.lt0008us 1480
+hop to_owner.lt0016us 31
+hop to_owner.lt0032us 19
+hop to_owner.lt0064us 42
+hop to_owner.lt0128us 104
+hop to_owner.lt0256us 36
+hop to_owner.lt0512us 1
+hop to_owner.lt1024us 263
+hop to_owner.lt2048us 256
+hop to_owner.n 3752
+hop to_owner.sum_ns 7700203860
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 11.99 6.02 2.74 14/274 12186
+  plain p50 54.9 p99 9008.2 p999 12016.1 max 14985.4 us
+  live  p50 8948.4 p99 37997.4 p999 47004.1 max 48000.4 us
+  added at p50 8893.5 us; live log at the end Some(("2277", "2277", "false")); late 0; (no_session, unanswered, link_lost) (11, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 24.82s
+== busy round 3 arm b exit 0
