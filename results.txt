@@ -1,0 +1,21 @@
+runner ubuntu-24.04-arm, 4 CPUs, 683b53f diag: liveness-16 on b5603105: the stuck start x10 beside two spinners a, Sat Nov  7 09:33:27 UTC 2026
+slates anchor: the starting daemon (pid 5358) made no progress for 1004 ms (the 1000 ms liveness window); killing it
+== run 1 exit 0, load 2.17
+slates anchor: the starting daemon (pid 5421) made no progress for 1005 ms (the 1000 ms liveness window); killing it
+== run 2 exit 0, load 2.63
+slates anchor: the starting daemon (pid 5484) made no progress for 1001 ms (the 1000 ms liveness window); killing it
+== run 3 exit 0, load 2.63
+slates anchor: the starting daemon (pid 5548) made no progress for 1002 ms (the 1000 ms liveness window); killing it
+== run 4 exit 0, load 3.30
+slates anchor: the starting daemon (pid 5611) made no progress for 1001 ms (the 1000 ms liveness window); killing it
+== run 5 exit 0, load 3.30
+slates anchor: the starting daemon (pid 5673) made no progress for 1003 ms (the 1000 ms liveness window); killing it
+== run 6 exit 0, load 3.30
+slates anchor: the starting daemon (pid 5736) made no progress for 1003 ms (the 1000 ms liveness window); killing it
+== run 7 exit 0, load 4.00
+slates anchor: the starting daemon (pid 5799) made no progress for 1002 ms (the 1000 ms liveness window); killing it
+== run 8 exit 0, load 4.00
+slates anchor: the starting daemon (pid 5863) made no progress for 1002 ms (the 1000 ms liveness window); killing it
+== run 9 exit 0, load 4.32
+slates anchor: the starting daemon (pid 5925) made no progress for 1001 ms (the 1000 ms liveness window); killing it
+== run 10 exit 0, load 4.32
