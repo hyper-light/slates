@@ -77,5 +77,10 @@ slates-conformance = { workspace = true }
 proptest = { workspace = true }
 slates-test-seeds = { workspace = true }
 
+# The crash-dump test (`tests/dump_exclusion.rs`, A-239): the crashing child reads and clears the error mode it inherited
+# (`GetErrorMode`, `SetErrorMode`), since a mode with `SEM_NOGPFAULTERRORBOX` keeps Windows Error Reporting from its crash.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Diagnostics_Debug", "Win32_System_ErrorReporting", "Win32_System_Kernel"] }
+
 [lints]
 workspace = true

@@ -51,6 +51,10 @@ impl Backing {
 /// A mapped region.
 #[derive(Debug)]
 pub struct Region {
+  /// A private mapping's exclusion from Windows' crash dumps (A-239), declared before `backing` so it is dropped, and
+  /// unregistered, before the mapping is unmapped. Empty over a shared object, whose view carries its own
+  /// ([`crate::shared`]), and on Unix, where the process is excluded whole.
+  _excluded: crate::dump_exclusion::DumpExclusion,
   backing: Backing,
   page: usize,
   locked: bool,
@@ -78,6 +82,7 @@ impl Region {
       advise_huge(&map);
     }
     Ok(Region {
+      _excluded: crate::dump_exclusion::DumpExclusion::exclude(map.as_ptr(), map.len()),
       backing: Backing::Anon(map),
       page,
       locked: false,
@@ -103,6 +108,7 @@ impl Region {
     let page = page.max(1);
     let len = object.bytes().len();
     Region {
+      _excluded: crate::dump_exclusion::DumpExclusion::default(),
       backing: Backing::Shared(object),
       page,
       locked: false,

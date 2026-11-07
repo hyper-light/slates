@@ -20,7 +20,8 @@
 //! formulas live next to their values as `Derived` (§4.2, "Derived constants").
 //!
 //! Modules: [`handle`], [`segmented`], [`slab`], [`buddy`], [`region`], [`lock`], [`prefault`],
-//! [`arena`], [`ring`], [`mpsc`], [`budget`], [`error`], [`shared`], and [`dax_object`] (the memory a VMM
+//! [`arena`], [`ring`], [`mpsc`], [`budget`], [`error`], [`shared`], [`dump_exclusion`] (each private mapping kept out
+//! of Windows' crash dumps, A-239), and [`dax_object`] (the memory a VMM
 //! maps one file's DAX ranges from, §4.6); under `--cfg loom`, `loom_bounds` holds the exploration bounds
 //! every loom model in the workspace checks through (AC-0.7).
 
@@ -35,6 +36,7 @@ pub mod arena;
 pub mod buddy;
 pub mod budget;
 pub mod dax_object;
+pub mod dump_exclusion;
 pub mod error;
 pub mod handle;
 pub mod lock;
