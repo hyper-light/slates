@@ -1,0 +1,61 @@
+name: DIAG reland-a207 W4 -- a green over a large base and its shard, red first (not for main)
+
+# crates/server/tests/green_fairness.rs on this diag commit's parent, three runs on each runner, no added load: the
+# walk held in one poll is the defect, and a quiet runner shows it. Each run's lines go to
+# diag-reland-a207-w4-results-<run>-<runner> as one commit after every run.
+
+on:
+  push:
+    branches: ['diag-reland-a207-w4-[0-9]*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  green:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    name: green_fairness on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      RESULTS_BRANCH: diag-reland-a207-w4-results-${{ github.run_id }}-${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: runs
+        shell: bash
+        run: |
+          set -u +e +o pipefail
+          out="$RUNNER_TEMP/results.txt"; : > "$out"
+          echo "tested $(git rev-parse HEAD^) on $(uname -m), $(nproc) cpus" >> "$out"
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          publish() {
+            blob=$(git hash-object -w "$out") || return 0
+            tree=$(printf '100644 blob %s\tresults.txt\n' "$blob" | git mktree) || return 0
+            parent=$(cat "$RUNNER_TEMP/results-parent" 2>/dev/null || true)
+            commit=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "results of run $GITHUB_RUN_ID on ${{ matrix.runner }}") || return 0
+            git push -q origin "$commit:refs/heads/$RESULTS_BRANCH" && echo "$commit" > "$RUNNER_TEMP/results-parent"
+          }
+          cargo test -p slates-server --test green_fairness --no-run > "$RUNNER_TEMP/build.log" 2>&1; echo "build exit $?" >> "$out"
+          grep -E '^error' -A6 "$RUNNER_TEMP/build.log" | head -30 >> "$out"; publish
+          for n in 1 2 3; do
+            log="$RUNNER_TEMP/run-$n.log"; start=$(date +%s)
+            timeout 900 cargo test -p slates-server --test green_fairness -- --nocapture > "$log" 2>&1; code=$?
+            echo "run $n exit $code $(( $(date +%s) - start ))s load=$(cut -d' ' -f1-3 /proc/loadavg)" >> "$out"
+            grep -E 'green over|panicked|assert|left|right|Stalled|longest poll is|test result' "$log" | head -12 | cut -c1-500 | sed 's/^/    /' >> "$out"
+            publish
+          done
+          echo DONE >> "$out"; publish
+          cat "$out"
