@@ -1,0 +1,64 @@
+name: DIAG bug-sweep 15, fsx over native-macos-nfs before, at and after the stack (not for main)
+
+# A diagnostics branch, never merged: main CI 42395077767 failed fsx seed 1 over the macOS NFS mount once the bug-sweep
+# stack landed (e86fb417). Here 7ce90ebb (main before the stack), e86fb417 (main) and the fix (this commit) run the same
+# fsx, interleaved on one runner, and every run's .fsxlog/.fsxgood, record and anchor log is uploaded.
+
+on:
+  push:
+    branches: [diag-bug-sweep-15]
+
+jobs:
+  fsx:
+    runs-on: macos-latest
+    timeout-minutes: 150
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-shared
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 7ce90ebbed9ec0da1c01803e5d91485c92d23340
+          path: base
+      - uses: actions/checkout@v4
+        with:
+          ref: e86fb417771c1a1a5f54ef025c970e9739323902
+          path: main
+      - uses: actions/checkout@v4
+        with:
+          path: fix
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: Suite tools (macOS)
+        run: brew install ripgrep fswatch
+      - name: Build each tree's harness and binary
+        run: |
+          for tree in base main fix; do
+            (cd "$tree" && cargo build -q -p slates-cli && cargo build -q -p xtask) || echo "BUILD $tree FAILED"
+          done
+      - name: fsx, interleaved
+        run: |
+          for round in 1 2; do
+            for tree in base main fix; do
+              echo "=== fsx $tree round $round $(date -u +%H:%M:%S) load $(sysctl -n vm.loadavg)"
+              if (cd "$tree" && cargo xtask conformance run --suite fsx --records "../out/records-$tree-$round" --scratch "../out/scratch-$tree-$round" --keep); then
+                echo "=== fsx $tree round $round PASSED"
+              else
+                echo "=== fsx $tree round $round FAILED"
+              fi
+            done
+          done
+      - name: What each run kept
+        if: ${{ !cancelled() }}
+        run: |
+          find out -name '*.fsxlog' -o -name '*.fsxgood' -o -name '*.json' | sort | head -60
+          for log in $(find out -name '*.fsxlog' | sort); do echo "== $log"; tail -25 "$log"; done
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: diag-fsx-macos
+          path: |
+            out/**/fsx-logs/**
+            out/records-*/**
+            out/scratch-*/*/*.log
