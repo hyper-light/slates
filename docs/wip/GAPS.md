@@ -1057,6 +1057,11 @@
     acknowledged, every volume taken over whole at epoch 2 (unshaped 2.5 s, wan and wan-loss 16.9 s, ceiling 57.2 s).
   - Process red-check, CI, 13 runs a side: the mutation (counting the current placement) left a holder at fence 1 in 4.
     A-240 left none, and lost no write.
+  - **Open, safety (found 2026-11-07, CI diag-20 run 7): a holder set of 2f+1 under an f-count.** Once the shipper
+    follows the placement, a set can have 2f+1 members (the placement moved off the owner: the recorded set was e, c, b
+    at f = 1). The shipper counts a write durable at f of a set, and phase one counts f+1. 1 + 2 = 3 = |H|, so they need
+    not meet: the successor counted itself and c, and b was never fenced. Fix proposed: durability counts |H| − f of
+    each set. The Shipper's count is live-fixes'; the model must name 2f+1 sets too. The stack is held from landing.
   - Open: the holder set changing under a live log (joint transition and activation, with live-fixes and raft); a
     successor outside the holders cannot open the log (`takeover_refused.open`); and a refused rebuild refetched the
     log every period, fixed 2026-11-07 (`live_ship::owes_refetch`: no refetch at a head whose bytes were refused; bug
