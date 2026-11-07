@@ -2630,7 +2630,7 @@ fn a_shard_stuck_in_its_start_stops_the_heartbeat_so_the_anchor_restarts_the_dae
 /// Shape: how long the beat-watching boot test holds a shard's start on the CPU: three liveness windows. Unsliced, the
 /// watchdog finds the shard spinning after one window of CPU and withholds the beat until the start ends, a gap of about
 /// two windows; with two windows held the gap would sit at about one, on the bound itself.
-const BUSY_START_NS: u64 = 3 * slates_server::daemon::LIVENESS_BUDGET_NS;
+const BUSY_START_NS: u64 = 2 * slates_server::daemon::LIVENESS_BUDGET_NS;
 
 /// Shape: the longest the beat-watching boot test waits for the busy start to end: the start's CPU time at a sixty-fourth of
 /// a CPU, the slowest share the CLI suite holds a start to (`STARVED_RUNS_ONE_IN` there). On a busy Mac the start's three

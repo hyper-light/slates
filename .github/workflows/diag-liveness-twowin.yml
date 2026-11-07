@@ -1,0 +1,59 @@
+name: diag-liveness-twowin
+
+# Diagnostics only, never on main (recovery-slicing plan, step 2): test (a) in its specified form, the Busy fault for two
+# liveness windows of the shard's CPU, on agents/liveness-slice2's red commit with only that constant changed; five runs
+# quiet and five beside two spinners a CPU, on both Linux runners. Results go to diag-results/liveness-21-<os>.
+on:
+  push:
+    branches: ["diag-liveness-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  linux:
+    name: two windows (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo test --locked -p slates-server --test recovery --no-run
+      - name: Test (a) at two windows, quiet then beside two spinners a CPU
+        run: |
+          R=../results.txt
+          echo "runner ${{ matrix.os }}, $(nproc) CPUs, $(git log --oneline -1 | cut -c1-80), $(grep -n '^const BUSY_START_NS' crates/server/tests/recovery.rs), $(date -u)" > $R
+          one() {
+            status=0
+            cargo test --locked -p slates-server --test recovery -- --exact --nocapture --test-threads=1 a_shard_start_running_windows_of_cpu_keeps_the_daemons_beat > ../t.log 2>&1 || status=$?
+            grep -E 'spinning|the beat went' ../t.log | cut -c1-200 | tee -a $R || true
+            echo "== $1 exit $status" | tee -a $R
+          }
+          for run in 1 2 3 4 5; do one "quiet run $run"; done
+          pids=""
+          for i in $(seq 1 $(( $(nproc) * 2 ))); do nice -n 19 bash -c 'while :; do :; done' & pids="$pids $!"; done
+          trap 'for p in $pids; do kill $p 2>/dev/null; done' EXIT
+          for run in 1 2 3 4 5; do one "loaded run $run, load $(cut -d' ' -f1 /proc/loadavg)"; done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/liveness-21-${{ matrix.os }}"
+          git config user.name "diag-liveness"
+          git config user.email "diag-liveness@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-liveness-21 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
