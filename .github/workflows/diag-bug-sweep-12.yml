@@ -1,0 +1,69 @@
+name: DIAG bug-sweep 12, crash-dump exclusion on Windows (not for main)
+
+# A diagnostics branch, never merged: A-239 (GAPS 8a-win-dumps), the fix.
+
+on:
+  push:
+    branches: [diag-bug-sweep-12]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Build the test
+        run: cargo test -p slates-server --test dump_exclusion --no-run
+      - name: A default crash report (no LocalDumps yet)
+        if: ${{ !cancelled() }}
+        env:
+          SLATES_WER_SCAN_DEFAULT_REPORT: "1"
+        run: cargo test -p slates-server --test dump_exclusion -- --exact a_default_crash_report_carries_no_content_region_shared_view_or_key_slot --nocapture
+      - name: Turn WER reporting on, and say why it was off
+        if: ${{ !cancelled() }}
+        run: |
+          foreach ($key in 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting', 'HKCU:\SOFTWARE\Microsoft\Windows\Windows Error Reporting', 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Error Reporting', 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\Windows Error Reporting', 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\Consent', 'HKLM:\SOFTWARE\Policies\Microsoft\PCHealth\ErrorReporting') {
+            "== $key"; Get-ItemProperty $key -ErrorAction SilentlyContinue | Format-List
+          }
+          (Get-CimInstance Win32_OperatingSystem).Caption
+          foreach ($root in 'HKLM:', 'HKCU:') {
+            $key = "$root\SOFTWARE\Microsoft\Windows\Windows Error Reporting"
+            New-Item -Force -Path $key -ErrorAction SilentlyContinue | Out-Null
+            New-ItemProperty -Force -Path $key -Name Disabled -PropertyType DWord -Value 0 | Out-Null
+            New-ItemProperty -Force -Path $key -Name DontSendAdditionalData -PropertyType DWord -Value 0 | Out-Null
+          }
+          Set-Service WerSvc -StartupType Manual
+          Start-Service WerSvc
+          Get-Service WerSvc | Format-List Name,Status
+      - name: WER's report heap dump
+        if: ${{ !cancelled() }}
+        run: cargo test -p slates-server --test dump_exclusion -- --exact a_wer_reports_heap_dump_carries_no_content_region_shared_view_or_key_slot --nocapture
+      - name: Have WER write full crash dumps (LocalDumps)
+        if: ${{ !cancelled() }}
+        run: |
+          $dumps = Join-Path $env:RUNNER_TEMP 'wer-dumps'
+          New-Item -ItemType Directory -Force -Path $dumps | Out-Null
+          $key = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps'
+          New-Item -Force -Path $key | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpFolder -PropertyType ExpandString -Value $dumps | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpType -PropertyType DWord -Value 2 | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpCount -PropertyType DWord -Value 10 | Out-Null
+          "SLATES_WER_DUMP_DIR=$dumps" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: An administrator's LocalDumps full dump
+        if: ${{ !cancelled() }}
+        run: cargo test -p slates-server --test dump_exclusion -- --exact an_administrators_local_full_dump_carries_every_mapping --nocapture
+      - name: What WER kept
+        if: ${{ !cancelled() }}
+        run: |
+          foreach ($dir in 'C:\ProgramData\Microsoft\Windows\WER\ReportQueue', 'C:\ProgramData\Microsoft\Windows\WER\ReportArchive', "$env:LOCALAPPDATA\Microsoft\Windows\WER\ReportQueue", "$env:LOCALAPPDATA\Microsoft\Windows\WER\ReportArchive") {
+            "== $dir"; Get-ChildItem -Force -Recurse $dir -ErrorAction SilentlyContinue | Select-Object -First 30 | Format-Table FullName,Length
+          }
