@@ -1,0 +1,101 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 12:31:59 UTC 2026, commit c1921079
+== cargo test --locked -q -p slates-wire
+test result: ok. 32 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.85s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-db
+test result: ok. 62 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.24s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.85s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.51s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.77s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.40s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-anchor -- --test-threads=1
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 18 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out; finished in 1.15s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-server --lib
+test result: ok. 200 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 1.33s
+== exit 0
+== cargo test --locked -q -p slates-server --test consumers
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+== exit 0
+== cargo test --locked -q -p slates-server --test daemon
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.48s
+== exit 0
+== cargo test --locked -q -p slates-server --test virtiofs
+test result: ok. 28 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.90s
+== exit 0
+== cargo test --locked -q -p slates-cli --bins
+test result: ok. 49 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.49s
+== exit 0
+== cargo test --locked -q -p slates-server --test fleet
+a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_live_peer --- FAILED
+a_forward_answered_within_its_bounds_is_never_reported_stalled --- FAILED
+a_grant_made_after_the_last_seal_survives_a_takeover --- FAILED
+a_lapsed_lease_refuses_only_what_the_node_holds_and_authorizes --- FAILED
+a_location_round_asks_a_peer_whose_session_was_out_once_it_returns --- FAILED
+a_pressure_hold_does_not_keep_a_successor_from_serving_a_taken_over_volume --- FAILED
+a_read_whose_owner_answered_past_the_takeover_bound_is_retried_by_the_client --- FAILED
+a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget --- FAILED
+a_restarted_peer_is_learned_on_contact_under_its_fresh_identity --- FAILED
+a_sealed_head_waits_for_every_candidates_key_entry_so_any_successor_can_open_it --- FAILED
+a_taken_over_green_serves_every_version_and_accepts_new_work_on_the_successor --- FAILED
+a_takeover_completes_when_one_survivor_never_received_the_head --- FAILED
+a_takeover_successor_serves_a_volume_on_a_non_control_shard --- FAILED
+a_takeover_successor_serves_the_dead_owners_content_over_nfs --- FAILED
+a_volume_awaited_in_the_mirror_is_served_there_after_its_home_region_is_lost_and_promoted --- FAILED
+an_isolated_owner_holds_its_guests_requests_rather_than_serve_them --- FAILED
+an_isolated_owner_refuses_latest_state_reads_while_the_successor_advances_the_green --- FAILED
+an_unanswered_forward_is_sent_again_within_the_takeover_bound --- FAILED
+forwards_to_one_owner_never_wait_behind_each_other --- FAILED
+thread 'a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_live_peer' (10906) panicked at crates/server/tests/fleet.rs:5834:3:
+thread 'a_forward_answered_within_its_bounds_is_never_reported_stalled' (10998) panicked at crates/server/tests/fleet.rs:5834:3:
+thread 'a_grant_made_after_the_last_seal_survives_a_takeover' (11048) panicked at crates/server/tests/fleet.rs:12795:3:
+thread 'a_lapsed_lease_refuses_only_what_the_node_holds_and_authorizes' (11201) panicked at crates/server/tests/fleet.rs:11830:3:
+thread 'a_location_round_asks_a_peer_whose_session_was_out_once_it_returns' (11215) panicked at crates/server/tests/fleet.rs:5834:3:
+thread 'a_pressure_hold_does_not_keep_a_successor_from_serving_a_taken_over_volume' (11287) panicked at crates/server/tests/fleet.rs:12408:3:
+thread 'a_read_whose_owner_answered_past_the_takeover_bound_is_retried_by_the_client' (11301) panicked at crates/server/tests/fleet.rs:13461:3:
+thread 'a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget' (11316) panicked at crates/server/tests/fleet.rs:12659:3:
+thread 'a_restarted_peer_is_learned_on_contact_under_its_fresh_identity' (11359) panicked at crates/server/tests/fleet.rs:2119:3:
+thread 'a_sealed_head_waits_for_every_candidates_key_entry_so_any_successor_can_open_it' (11436) panicked at crates/server/tests/fleet.rs:5834:3:
+thread 'a_sealed_head_waits_for_every_candidates_key_entry_so_any_successor_can_open_it' (11436) panicked at crates/server/tests/fleet.rs:12491:3:
+thread 'a_taken_over_green_serves_every_version_and_accepts_new_work_on_the_successor' (11503) panicked at crates/server/tests/fleet.rs:11394:3:
+thread 'a_takeover_completes_when_one_survivor_never_received_the_head' (11511) panicked at crates/server/tests/fleet.rs:8280:3:
+thread 'a_takeover_successor_serves_a_volume_on_a_non_control_shard' (11518) panicked at crates/server/tests/fleet.rs:9847:3:
+thread 'a_takeover_successor_serves_the_dead_owners_content_over_nfs' (11523) panicked at crates/server/tests/fleet.rs:8845:3:
+thread 'a_volume_awaited_in_the_mirror_is_served_there_after_its_home_region_is_lost_and_promoted' (11541) panicked at crates/server/tests/fleet.rs:4693:3:
+thread 'an_isolated_owner_holds_its_guests_requests_rather_than_serve_them' (11736) panicked at crates/server/tests/fleet.rs:11638:3:
+thread 'an_isolated_owner_refuses_latest_state_reads_while_the_successor_advances_the_green' (11750) panicked at crates/server/tests/fleet.rs:11523:3:
+thread 'an_unanswered_forward_is_sent_again_within_the_takeover_bound' (11781) panicked at crates/server/tests/fleet.rs:13385:3:
+thread 'forwards_to_one_owner_never_wait_behind_each_other' (11811) panicked at crates/server/tests/fleet.rs:5200:5:
+    a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_live_peer
+    a_forward_answered_within_its_bounds_is_never_reported_stalled
+    a_grant_made_after_the_last_seal_survives_a_takeover
+    a_lapsed_lease_refuses_only_what_the_node_holds_and_authorizes
+    a_location_round_asks_a_peer_whose_session_was_out_once_it_returns
+    a_pressure_hold_does_not_keep_a_successor_from_serving_a_taken_over_volume
+    a_read_whose_owner_answered_past_the_takeover_bound_is_retried_by_the_client
+    a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget
+    a_restarted_peer_is_learned_on_contact_under_its_fresh_identity
+    a_sealed_head_waits_for_every_candidates_key_entry_so_any_successor_can_open_it
+    a_taken_over_green_serves_every_version_and_accepts_new_work_on_the_successor
+    a_takeover_completes_when_one_survivor_never_received_the_head
+    a_takeover_successor_serves_a_volume_on_a_non_control_shard
+    a_takeover_successor_serves_the_dead_owners_content_over_nfs
+    a_volume_awaited_in_the_mirror_is_served_there_after_its_home_region_is_lost_and_promoted
+    an_isolated_owner_holds_its_guests_requests_rather_than_serve_them
+    an_isolated_owner_refuses_latest_state_reads_while_the_successor_advances_the_green
+    an_unanswered_forward_is_sent_again_within_the_takeover_bound
+    forwards_to_one_owner_never_wait_behind_each_other
+test result: FAILED. 71 passed; 19 failed; 3 ignored; 0 measured; 0 filtered out; finished in 3980.65s
+== exit 101
