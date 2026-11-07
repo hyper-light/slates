@@ -76,6 +76,18 @@
 >     each snapshot re-encoding it, and the cap refusing submits well before. Green chain checkpointing is the 100k
 >     rung's wall (owner to be decided).
 >
+> - **The quiet arm's first rungs: correct, and far from 1 ms** (Mac Studio, load 5 to 9, one node; BENCHMARKS, "The
+>   load test's quiet arm"). At 1,000 clients p50 is 35 to 73 ms and p99 158 to 227 ms; at 3,000, p50 197 to 219 ms.
+>   The oracle had 0 failures. Every operation of a green's works is served on the green's one shard (about 112 µs
+>   an operation, 8,960 a second), so a closed-loop client's latency is clients × service time. At 3,000 clients the
+>   green's retention cap refused 2,405 submits `BudgetExceeded`: a version keeps the whole previous bytes of every
+>   file it overwrote, and the history folds only down to the oldest base a live work holds. Walls owed for the
+>   10k–100k rungs, besides the green chain's checkpointing above:
+>   - a green's works served off its owner's shard, with only the verdict serialized;
+>   - history that keeps what a version overwrote, not whole files;
+>   - a stated offered load per client for the 1 ms bound. At zero think time, 100k clients at 1 ms is 10⁸
+>     operations a second.
+>
 > The topology launcher is `crates/cli/tests/load_scale.rs`. It runs one primary and two replica server nodes in
 > region 0 at `f = 1`, and client nodes in region 1, so the client nodes are never the green's holders. One harness
 > drives every client node (`--instance a,b,…`), so one oracle judges every submit. It is portable (`ps`, `pgrep`),

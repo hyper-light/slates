@@ -10530,3 +10530,34 @@ after every thread has exited. On both runners of both runs:
 - the CLI mount suites then sat 75-90 minutes with no output until the cancel at 01:40 UTC;
 - no killed daemon was seen to exit, so the 5-minute bound itself is not observed here.
 So A-219's runtime (`e070f31e`, and `5b5f7ba1` over the combined call) stays off main.
+
+### The load test's quiet arm: 1,000 and 3,000 clients on one node (2026-11-06, agents/loadtest-scale)
+
+`rung.sh <label> <bound> --tree <linux-v7.4-rc1>/kernel --clients <n> --hot-files <0.8 n> --per-connection 32 --rounds 3
+--reply-patience 60`, against a single-node `slates anchor --quick`. Mac Studio (adas-mac-studio.local-2, 32 CPUs, Apple
+silicon), release binaries of agents/loadtest-scale-1 at 6f7c5306, load 5.0 to 9.1, one run each. Linux v7.4-rc1
+(6628e7d4) `kernel/`, 754 files. Milliseconds:
+
+| Clients | Connections | Kind | p50 | p99 | p999 | max |
+|---|---|---|---|---|---|---|
+| 1,000 | 32 | CreateWork | 34.7 | 66.2 | 66.3 | 66.3 |
+| 1,000 | 32 | Edit | 62.3 | 160.8 | 201.5 | 242.0 |
+| 1,000 | 32 | SubmitAccepted | 66.0 | 204.8 | 229.4 | 242.0 |
+| 1,000 | 32 | SubmitConflict | 72.7 | 226.5 | 233.1 | 242.0 |
+| 1,000 | 32 | Rebase | 67.4 | 157.6 | 196.2 | 196.7 |
+| 3,000 | 94 | CreateWork | 400.0 | 423.2 | 424.2 | 424.5 |
+| 3,000 | 94 | Edit | 197.4 | 447.2 | 543.5 | 544.8 |
+| 3,000 | 94 | SubmitAccepted | 203.0 | 478.2 | 543.3 | 543.8 |
+| 3,000 | 94 | SubmitConflict | 205.7 | 428.5 | 543.3 | 544.6 |
+| 3,000 | 94 | Rebase | 210.3 | 478.5 | 543.9 | 544.8 |
+
+- **Correctness:** the oracle and every own file had 0 failures in both runs.
+- **Resolution:** the longest gap between two drains of a ring was 0.70 ms (1,000) and 3.12 ms (3,000).
+- **Throughput:** 95,867 operations in 10.7 s at 1,000 clients, about 8,960 a second, about 112 µs an operation. Every
+  operation of a green's works is served by the green's shard, since `CreateWork` places each work on the green's
+  partition. The harness keeps one request in flight per client, so a latency is about clients × service time
+  (Little's law): 1,000 × 112 µs ≈ 112 ms, and 3,000 triples it.
+- **Daemon peak RSS:** 14.3 GB (1,000) and 14.9 GB (3,000).
+- **The 3,000 rung's refusals:** 2,405 submits were refused `BudgetExceeded`, at the green's retention cap. A version
+  keeps the whole previous bytes of every file it overwrote, and the history folds only down to the oldest base a
+  live work holds. 3,766 versions were accepted.
