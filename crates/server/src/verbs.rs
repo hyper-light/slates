@@ -4015,10 +4015,12 @@ fn revoke_on_channel(
 }
 
 /// The revocation's two bounded steps: the durable record on `owner`, then the mark on every shard.
-/// Returns the reply to deliver. Each call is bounded by the liveness budget; one that does not answer
-/// refuses `NotFound` (the record, if written, stands for the retry).
+/// Returns the reply to deliver. Each call is waited for in its target's own time, up to the liveness budget of its CPU
+/// (`xshard::call_in_shard_time`); one whose target made no progress for a window, or ran the budget without answering,
+/// refuses `NotFound` (the record, if written, stands for the retry). R3 class A: before, a shard given a fifth of a
+/// core for 1.5 s was refused at the wall second.
 async fn revoke_everywhere(origin: u16, owner: u16, shards: &[u16], consumer: u64) -> ReplyBody {
-  let recorded = crate::xshard::call_within(
+  let recorded = crate::xshard::call_in_shard_time(
     origin,
     owner,
     move |s| {
@@ -4037,7 +4039,7 @@ async fn revoke_everywhere(origin: u16, owner: u16, shards: &[u16], consumer: u6
     Some(Ok(())) => {}
   }
   for shard in shards.iter().copied() {
-    let marked = crate::xshard::call_within(
+    let marked = crate::xshard::call_in_shard_time(
       origin,
       shard,
       move |s| mark_revoked(s, consumer),
@@ -4241,7 +4243,8 @@ fn attest_on_channel(
     return Served::Reply(refused(Refusal::NotFound));
   };
   let task = slates_rt::futures::spawn(async move {
-    let facts: Option<ConsumerFacts> = crate::xshard::call_within(
+    // Waited for in the record's shard's own time (R3 class A): a starved shard's record is read, not taken for absent.
+    let facts: Option<ConsumerFacts> = crate::xshard::call_in_shard_time(
       origin,
       owner,
       move |s| {
