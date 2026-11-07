@@ -173,8 +173,15 @@
 >   - Open: an `Overloaded` raised inside a verb is recorded as its completion, so a resend under its id meets it for
 >     good.
 >
-> - **The whole kernel as the workload: the pin holds, creating the green does not** (open; reported to fixtures, A-217's
->   re-lander, 2026-11-06). In-process daemon on the Mac (loaded arm, load 30 to 47), Linux v7.4-rc1 whole (97,229
+> - **The whole kernel as the workload: the pin holds; creating the green held its shard until 2026-11-07** (the
+>   `CreateGreen` half fixed on `agents/reland-a207-3`). It is now walked, hashed and seeded in slices with its reply
+>   deferred, the identity hashed with no buffer, and `with_origin` takes the origin by value.
+>   - `green_fairness.rs`, 1,000 files of 16 KiB: main held its shard for one poll of 134 ms (x86_64) and 960 ms
+>     (arm64) with 0 probes answered; sliced, 259 to 1,456 probes inside, the longest 13.6 ms.
+>   - Peak RSS over the whole kernel 9.42 to 8.02 GB, `fs/` 361 to 283 MB (BENCHMARKS, "CreateGreen sliced").
+>   - Still open: the engine's second lifetime copy (loadtest-scale, after W2), and recovery's walk in `init_shard`.
+>
+>   The 2026-11-06 record, as it was found (reported to fixtures, A-217's re-lander): In-process daemon on the Mac (loaded arm, load 30 to 47), Linux v7.4-rc1 whole (97,229
 >   files on APFS, 1.67 GB), the sliced pin:
 >   - pin 64.4 s, RSS 42 MB to 3.4 GB (the content, granule-rounded);
 >   - snapshot 0.71 s;
