@@ -1,0 +1,54 @@
+tested 2bdaa7c03f6bc5f9ff018a377cb6b550c2f7aa51 variant after on x86_64, 4 cpus
+admitted exit 101 110s
+  admitted: b: clients_per_shard 2583 slots 32 shards 2 tasks_per_shard 10344 lane bound 165312; 647 clients x 32 forwards
+  admitted: 20660 of 20704 answered: 20556 served, 0 Overloaded; control tasks refused 0
+  admitted: thread 'a_silent_owner_leaves_no_forward_the_lane_admitted_unrun' (5483) panicked at crates/server/tests/fleet.rs:5271:3:
+  admitted: assertion `left == right` failed: every read is answered; b's hop counters summed over its shards: {"fleet.forward.batch_done": 20704, "fleet.forward.batch_given_up": 94, "fleet.forward.begun": 20793, "fleet.forward.client.control_started": 20705, "fleet.forward.client.delivered_home": 20705, "fleet.forward.client.resolved": 20705, "fleet.forward.client.to_control": 20705, "fleet.forward.retried": 93, "fleet.forward.taken_for_another": 20688, "fleet.owner_location.direct": 20705, "fleet.owner_location.forward_unanswered": 94, "fleet.owner_location.route_dropped.refused": 104}
+  admitted:   left: 20660
+  admitted:  right: 20704
+  admitted: test a_silent_owner_leaves_no_forward_the_lane_admitted_unrun ... FAILED
+  admitted: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 99 filtered out; finished in 48.98s
+  admitted: error: test failed, to rerun pass `-p slates-server --test fleet`
+admitted-again exit 101 44s
+  admitted-again: b: clients_per_shard 2583 slots 32 shards 2 tasks_per_shard 10344 lane bound 165312; 647 clients x 32 forwards
+  admitted-again: 20656 of 20704 answered: 15175 served, 0 Overloaded; control tasks refused 0
+  admitted-again: thread 'a_silent_owner_leaves_no_forward_the_lane_admitted_unrun' (5522) panicked at crates/server/tests/fleet.rs:5271:3:
+  admitted-again: assertion `left == right` failed: every read is answered; b's hop counters summed over its shards: {"fleet.forward.batch_done": 15327, "fleet.forward.batch_given_up": 5453, "fleet.forward.begun": 15538, "fleet.forward.client.control_started": 20705, "fleet.forward.client.delivered_home": 20705, "fleet.forward.client.resolved": 20705, "fleet.forward.client.to_control": 20705, "fleet.forward.no_session": 1, "fleet.forward.retried": 75, "fleet.forward.session_never_returned": 5240, "fleet.forward.taken_for_another": 15311, "fleet.owner_location.direct": 20705, "fleet.owner_location.forward_unanswered": 213, "fleet.owner_location.forward_unsent": 5240, "fleet.owner_location.route_dropped.refused": 5481}
+  admitted-again:   left: 20656
+  admitted-again:  right: 20704
+  admitted-again: test a_silent_owner_leaves_no_forward_the_lane_admitted_unrun ... FAILED
+  admitted-again: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 99 filtered out; finished in 43.54s
+  admitted-again: error: test failed, to rerun pass `-p slates-server --test fleet`
+silent exit 0 3s
+silent-again exit 0 4s
+unstarted exit 0 5s
+fleet-forward exit 101 193s
+  fleet-forward: test a_forward_answered_within_its_bounds_is_never_reported_stalled ... ok
+  fleet-forward: test a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id ... ok
+  fleet-forward: test a_silent_owner_leaves_no_forward_the_lane_admitted_unrun ... FAILED
+  fleet-forward: test an_unanswered_forward_is_sent_again_within_the_takeover_bound ... ok
+  fleet-forward: ---- a_silent_owner_leaves_no_forward_the_lane_admitted_unrun stdout ----
+  fleet-forward: b: clients_per_shard 2583 slots 32 shards 2 tasks_per_shard 10344 lane bound 165312; 647 clients x 32 forwards
+  fleet-forward: 20674 of 20704 answered: 17711 served, 0 Overloaded; control tasks refused 0
+  fleet-forward: thread 'a_silent_owner_leaves_no_forward_the_lane_admitted_unrun' (5778) panicked at crates/server/tests/fleet.rs:5271:3:
+  fleet-forward: assertion `left == right` failed: every read is answered; b's hop counters summed over its shards: {"fleet.forward.batch_done": 17844, "fleet.forward.batch_given_up": 2968, "fleet.forward.begun": 18141, "fleet.forward.client.control_started": 20705, "fleet.forward.client.delivered_home": 20705, "fleet.forward.client.resolved": 20705, "fleet.forward.client.to_control": 20705, "fleet.forward.no_session": 1, "fleet.forward.retried": 107, "fleet.forward.session_never_returned": 2661, "fleet.forward.taken_for_another": 17830, "fleet.owner_location.direct": 20705, "fleet.owner_location.forward_unanswered": 307, "fleet.owner_location.forward_unsent": 2661, "fleet.owner_location.route_dropped.refused": 2963}
+  fleet-forward:   left: 20674
+  fleet-forward:  right: 20704
+  fleet-forward: test result: FAILED. 17 passed; 1 failed; 0 ignored; 0 measured; 82 filtered out; finished in 193.36s
+  fleet-forward: error: test failed, to rerun pass `-p slates-server --test fleet`
+  fleet-forward: error: 1 target failed:
+rt exit 0 12s
+server-lib exit 0 17s
+server exit 0 57s
+  server: test a_compound_retried_across_a_daemon_restart_is_answered_never_run_again ... ok
+  server: test an_open_and_a_close_retried_across_a_daemon_restart_are_answered_never_run_again ... ok
+  server: test a_guests_write_over_a_shards_stream_is_answered_once_every_fuse_mount_of_its_volume_was_told ... ok
+client exit 0 50s
+  client: test a_connect_is_answered_within_a_tenth_of_the_claim_wait ... ok
+harness exit 0 162s
+clippy exit 101 48s
+  clippy: error: the function has a cognitive complexity of (11/10)
+  clippy:     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#cognitive_complexity
+  clippy:     = note: requested on the command line with `-D clippy::cognitive-complexity`
+  clippy: error: could not compile `slates-server` (lib) due to 1 previous error
+  clippy: error: could not compile `slates-server` (lib test) due to 1 previous error
