@@ -1,0 +1,162 @@
+name: diag-liveness-restart
+
+# Diagnostics only, never on main (the anchor restart loop, step 4: extremes). On four runners, beside two nice-19
+# spinners a logical CPU: the wake probe and the process clock (slates-machine), the anchor crate's suites, the
+# rendezvous handoff (held_rendezvous, now on Windows too), and the anchor's start judgment three times (cli.rs' starved/stuck/frozen and
+# restart tests on Linux; start_judgment.rs on Windows). Results go to diag-results/liveness-19-<os>.
+on:
+  push:
+    branches: ["diag-liveness-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  windows:
+    name: restart and handoff (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build
+        run: |
+          cargo test --locked -p slates-machine --lib --no-run
+          cargo test --locked -p slates-anchor --no-run
+          cargo test --locked -p slates-cli --test start_judgment --test held_rendezvous --no-run
+      - name: Clippy the new Windows test and the binary
+        run: |
+          status=0
+          cargo clippy --locked -p slates-cli --bin slates --test start_judgment --test held_rendezvous -- -D warnings > ../clippy.log 2>&1 || status=$?
+          echo "runner ${{ matrix.os }}, $NUMBER_OF_PROCESSORS CPUs, $(git log --oneline -1 | cut -c1-80), $(date -u)" > ../results.txt
+          grep -E '^(warning|error)' ../clippy.log | head -20 >> ../results.txt || true
+          echo "== clippy exit $status" >> ../results.txt
+      - name: The suites beside two spinners a CPU
+        env:
+          SLATES_TEST_CLI: "1"
+        run: |
+          R=../results.txt
+          pids=""
+          for i in $(seq 1 $((NUMBER_OF_PROCESSORS * 2))); do (while :; do :; done) & pids="$pids $!"; done
+          trap 'for p in $pids; do kill $p 2>/dev/null; done' EXIT
+          echo "== spinners: $(echo $pids | wc -w)" | tee -a $R
+          suite() {
+            name="$1"; shift
+            status=0
+            started=$(date +%s)
+            "$@" > ../suite.log 2>&1 || status=$?
+            grep -E '^test |panicked|test result|slates anchor: (the starting daemon|daemon exited|the daemon.s heartbeat)|measurement timeout|replaced after' ../suite.log | cut -c1-300 | tee -a $R || true
+            echo "== $name exit $status in $(( $(date +%s) - started )) s" | tee -a $R
+          }
+          suite machine cargo test --locked -p slates-machine --lib -- process_clock wake
+          for run in 1 2 3; do
+            suite "anchor run $run" cargo test --locked -p slates-anchor -- --test-threads=1
+          done
+          for run in 1 2 3; do
+            suite "held_rendezvous run $run" cargo test --locked -p slates-cli --test held_rendezvous -- --test-threads=1 --nocapture
+          done
+          for run in 1 2 3; do
+            suite "start_judgment run $run" cargo test --locked -p slates-cli --test start_judgment -- --test-threads=1 --nocapture
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/liveness-19-${{ matrix.os }}"
+          git config user.name "diag-liveness"
+          git config user.email "diag-liveness@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-liveness-19 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
+
+  linux:
+    name: restart and handoff (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Grant user_allow_other
+        run: grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+      - name: Build
+        run: |
+          cargo test --locked -p slates-machine --lib --no-run
+          cargo test --locked -p slates-anchor --no-run
+          cargo test --locked -p slates-cli --test cli --test held_rendezvous --no-run
+      - name: The suites beside two spinners a CPU
+        env:
+          SLATES_TEST_CLI: "1"
+        run: |
+          R=../results.txt
+          echo "runner ${{ matrix.os }}, $(nproc) CPUs, $(git log --oneline -1 | cut -c1-80), $(date -u)" > $R
+          pids=""
+          for i in $(seq 1 $(( $(nproc) * 2 ))); do nice -n 19 bash -c 'while :; do :; done' & pids="$pids $!"; done
+          trap 'for p in $pids; do kill $p 2>/dev/null; done' EXIT
+          echo "== spinners: $(echo $pids | wc -w)" | tee -a $R
+          suite() {
+            name="$1"; shift
+            status=0
+            started=$(date +%s)
+            "$@" > ../suite.log 2>&1 || status=$?
+            grep -E '^test |panicked|test result|slates anchor: (the starting daemon|daemon exited|the daemon.s heartbeat)|measurement timeout|replaced after' ../suite.log | cut -c1-300 | tee -a $R || true
+            echo "== $name exit $status in $(( $(date +%s) - started )) s, load $(cut -d' ' -f1 /proc/loadavg)" | tee -a $R
+          }
+          suite machine cargo test --locked -p slates-machine --lib -- process_clock wake
+          for run in 1 2 3; do
+            suite "anchor run $run" cargo test --locked -p slates-anchor -- --test-threads=1
+          done
+          suite held_rendezvous cargo test --locked -p slates-cli --test held_rendezvous -- --test-threads=1 --nocapture
+          suite "cli restart" cargo test --locked -p slates-cli --test cli -- --test-threads=1 --nocapture restart frozen anchor supervises killed
+          for run in 1 2 3; do
+            suite "start judgment run $run" cargo test --locked -p slates-cli --test cli -- --test-threads=1 --nocapture start
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/liveness-19-${{ matrix.os }}"
+          git config user.name "diag-liveness"
+          git config user.email "diag-liveness@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-liveness-19 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
