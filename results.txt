@@ -1,0 +1,11 @@
+tested 3ac85f45207de5742f74438ed840c92d04144c09 variant after on aarch64, 4 cpus
+unstarted exit 101 86s
+  unstarted: thread 'a_forward_refused_at_admission_answers_its_client' (5450) panicked at crates/server/tests/fleet.rs:5182:3:
+  unstarted: test a_forward_refused_at_admission_answers_its_client ... FAILED
+  unstarted: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 97 filtered out; finished in 2.62s
+  unstarted: error: test failed, to rerun pass `-p slates-server --test fleet`
+unstarted-again exit 101 3s
+  unstarted-again: thread 'a_forward_refused_at_admission_answers_its_client' (5478) panicked at crates/server/tests/fleet.rs:5182:3:
+  unstarted-again: test a_forward_refused_at_admission_answers_its_client ... FAILED
+  unstarted-again: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 97 filtered out; finished in 2.62s
+  unstarted-again: error: test failed, to rerun pass `-p slates-server --test fleet`
