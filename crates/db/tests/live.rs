@@ -765,8 +765,8 @@ impl Run {
     (counted >= needed).then_some((asked, recorded))
   }
 
-  /// The configuration names a new candidate set for the volume: `2f` hosts other than the owner, drawn at random (any
-  /// overlap with the old set, none included), or now and then none at all.
+  /// The configuration names a new candidate set for the volume: hosts other than the owner, drawn at random (any
+  /// overlap with the old set, none included): `2f` mostly, now and then none, `2f + 1` or `1..=f`.
   fn reconfigure(&mut self) {
     let owner = self.owners[self.current].host;
     let mut others: Vec<HostId> = self
@@ -775,12 +775,19 @@ impl Run {
       .copied()
       .filter(|host| *host != owner)
       .collect();
+    // The set's size: none now and then; `2f + 1` now and then (the owner outside its own volume's placement, so every
+    // other candidate a holder: raft-chaos, CI diag-20 run 7); `1..=f` now and then (too few for phase one); `2f`
+    // otherwise.
+    let size = match self.rng.below(10) {
+      0 => 0,
+      1 => 2 * self.f + 1,
+      2 => 1 + u64::try_from(self.rng.below(usize::try_from(self.f).unwrap())).unwrap(),
+      _ => 2 * self.f,
+    };
     let mut next = Vec::new();
-    if !self.rng.chance(100) {
-      while u64::try_from(next.len()).unwrap() < 2 * self.f && !others.is_empty() {
-        let at = self.rng.below(others.len());
-        next.push(others.swap_remove(at));
-      }
+    while u64::try_from(next.len()).unwrap() < size && !others.is_empty() {
+      let at = self.rng.below(others.len());
+      next.push(others.swap_remove(at));
     }
     next.sort_unstable();
     let named = format!("{next:?}");
@@ -1482,6 +1489,48 @@ fn a_shipper_that_keeps_its_first_holders_never_reaches_new_candidates() {
       .iter()
       .any(|(_, _, message)| message.contains("Convergence") || message.contains("NoLoss")),
     "fixed holders: {broken:?}"
+  );
+}
+
+/// A-200's intersection over a holder set of any size: a write is durable only once every `f + 1` reports a takeover can
+/// count from the set meet a holder of it, so on `n` holders it needs `n − f` of them (`f` of `2f`, `f + 1` of
+/// `2f + 1`), and on fewer than `f + 1` it is never durable, since no takeover can count `f + 1` there. Do ship one
+/// entry at `f = 1` to three holders (the owner outside its own volume's placement, so every other candidate holds),
+/// acknowledged by one. Expect it not durable, and a takeover counting the other two adopting no head; durable once a
+/// second holds it. Then the same with two holders and one acknowledgement: durable. With one holder: never durable.
+/// Found by raft-chaos on CI (diag-20 run 7): with three recorded holders the owner counted a write durable on one,
+/// and a successor counted the other two and never asked it.
+#[test]
+fn a_write_is_durable_only_where_every_takeover_quorum_meets_it() {
+  let owner = HostId(1);
+  let quorum = Quorum { f: 1 };
+  let ship = |holders: &[HostId]| {
+    let mut shipper = Shipper::new((owner, OBJECT, HostEpoch(1)), quorum, holders, None, (4, 8));
+    let entry = shipper.append(vec![1]).unwrap();
+    (shipper, held_after(owner, &[entry]))
+  };
+  let three = [HostId(2), HostId(3), HostId(4)];
+  let (mut shipper, held) = ship(&three);
+  shipper.on_reply(three[0], Ok(held));
+  assert_eq!(
+    (
+      shipper.durable(),
+      adopt(&[(three[1], None), (three[2], None)], &three, quorum)
+    ),
+    (None, None),
+    "held by one of three: a takeover counting the other two adopts nothing, so it is not durable"
+  );
+  shipper.on_reply(three[1], Ok(held));
+  assert_eq!(shipper.durable(), Some(0), "held by two of three");
+  let (mut shipper, held) = ship(&three[..2]);
+  shipper.on_reply(three[0], Ok(held));
+  assert_eq!(shipper.durable(), Some(0), "held by one of two (f of 2f)");
+  let (mut shipper, held) = ship(&three[..1]);
+  shipper.on_reply(three[0], Ok(held));
+  assert_eq!(
+    shipper.durable(),
+    None,
+    "one holder: no takeover can count f + 1, never durable"
   );
 }
 

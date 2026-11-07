@@ -1,5 +1,20 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Fixed (live-fixes, 2026-11-07): a live write counted durable on too few holders when the owner fell outside its own
+> volume's placement.** The shipper counted a position durable at the `f`-th highest holder, right for `2f` holders but
+> not for `2f + 1` (every other candidate a holder): at f = 1 a write on one of three was "durable", and a successor
+> counted the other two (raft-chaos, CI diag-20 run 7: a holder left at fence 1, NoLoss held only because it was the
+> stale one). Now `n − f` of `n` holders (never durable at `n <= f`, from which no phase one counts `f + 1`).
+> `a_write_is_durable_only_where_every_takeover_quorum_meets_it` was red on the old count; the model, now also naming
+> `2f + 1` and short sets, passes 20 of 20.
+>
+> **Open (live-fixes): an ex-holder keeps its live copy until the volume's tombstone.** A holder the joint transition
+> drops keeps its copy at an old fence (memory, not safety: no phase one counts it, and with `n − f` no owner commits
+> through it alone). A let-go on the newer holder record (2ba5572d) was reverted (eab618f2): a holder dropped while it was
+> no catalog candidate receives that record only when the configuration names it again, by then a counted member of the
+> next transition. A safe release needs a holder-set generation the entries and replies carry. raft-chaos's five-node
+> flow asserts the release and stays red until then.
+
 > **Fixed (live-fixes, 2026-11-07): a live shipper made before its candidates were known shipped to nobody** (A-200's
 > amendment of that date). A shipper kept the holders of its first publication, so a live volume made on a fleet's
 > bootstrap node stood at `durable=none` for good (the Linux conformance pair, diag run 42325923902). Its holders now
