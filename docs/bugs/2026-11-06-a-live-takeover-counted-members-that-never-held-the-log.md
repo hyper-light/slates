@@ -44,6 +44,20 @@ identity at each position), so the loss showed only as missing writes and as the
   (`verbs::materialize_taken_over`). A catalog it ships before its own shipper records still names the hosts that hold
   the log.
 
+## A second defect the fix exposed: phase one fetched every holder's whole log in one 1 s exchange
+
+With the old counting, a successor never needed a remote holder's answer (it counted itself and the replacement). Once
+it did, KIND's shaped legs never finished a takeover: run 42357611870 (2026-11-07, live-durability 480a620a with A-240)
+acknowledged every write in all four profiles and took the unshaped volume over whole, but under `wan`, `wan-loss`
+and `ceiling` no survivor took over within 120 s. The successor counted `fleet.live.takeover_waits_quorum` 621 times;
+the other holder had answered once (`fleet.live.fetched` 1), and the successor's sessions were left lent. Each holder's
+reply carried its whole log under the 1 s liveness budget (`fleet::live_budget`), which a shaped path (80–290 ms
+smoothed RTT, 5–10 KB windows) cannot carry; the late reply went to the dispatch's straggler queue and was lost.
+
+Phase one now asks for heads only (`slates_db::live::Report`; `live_ship::serve_report` answers the head and the bytes
+kept), and the adopted holder alone is fetched (`live_ship::fetch_log`) under `exchange_budget(bytes)`, as a dispatch
+sizes an install. Hostile-input tests: `hostile_reports_are_refused`, `hostile_report_answers_are_refused`.
+
 ## Tests
 
 - Model: `phase_one_meets_the_logs_holders_when_a_fresh_member_has_joined` in `crates/db/tests/live.rs`. The lost

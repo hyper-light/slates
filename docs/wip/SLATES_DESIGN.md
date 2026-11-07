@@ -14078,6 +14078,12 @@ through it; their status notes follow each built slice.
     served from its placed seal.
   - A successor keeps the recorded holders in its own record until its shipper records its own, so a catalog it ships
     meanwhile still names the hosts that hold the log.
+  - Phase one asks for heads only (`slates_db::live::Report`): each holder raises its fence and reports its head and
+    the bytes it keeps, a few bytes each, within the liveness budget. Only the adopted holder's log is then fetched
+    (`live_ship::fetch_log`), under a budget its reported bytes derive (`bytes × smoothed RTT / congestion window`
+    plus the liveness budget). Asking every holder for its whole log in one exchange held to 1 s, no takeover
+    finished over KIND's shaped paths once A-240 needed a remote holder's answer (run 42357611870: `wan`, `wan-loss`
+    and `ceiling`, 621 waits for the quorum, the successor's sessions left lent).
 - **Rejected.**
   - Asking the old placement alone: a takeover's placement retention (§4.8, 2026-09-17) covers registers, but a
     shipper's holders are fixed when it starts, and only a record says which they were.

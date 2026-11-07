@@ -1438,6 +1438,36 @@ fn exchange_budget(
   )
 }
 
+/// The budget one message to one holder gets: the liveness budget a reply gets, plus the time its bytes take at the
+/// session's window-limited rate. Derived: `bytes × smoothed RTT / congestion window` (one window a round trip, the
+/// slowest a sender in congestion avoidance moves), so an install of the whole volume is given its transfer and an
+/// entry, a few kilobytes, about nothing more. Under the liveness budget alone an install of 1.5 MB never finished
+/// over a session a partition had left at an initial window and a 100–240 ms smoothed RTT: each was cut off, its link
+/// dropped and dialed afresh, at an initial window again, and the whole volume sent again, 1,391 times (2.06 GB) while
+/// both candidates already held the owner's head, and no write became durable (2026-11-06, `live_chaos.rs`).
+fn exchange_budget(
+  bytes: usize,
+  sessions: &[(HostId, slates_transport::endpoint::Endpoint)],
+) -> slates_cluster::CommitBudget {
+  let live = crate::fleet::live_budget();
+  let transfer_ns = sessions.first().map_or(0, |(_, endpoint)| {
+    // Before any sample the smoothed RTT reads zero; the probe timeout, twice the initial RTT then, stands in.
+    let round_trip = match endpoint.smoothed_rtt() {
+      0 => endpoint.pto(),
+      measured => measured,
+    };
+    u64::try_from(bytes)
+      .unwrap_or(u64::MAX)
+      .saturating_mul(round_trip)
+      .checked_div(endpoint.congestion_window().max(1))
+      .unwrap_or(0)
+  });
+  slates_cluster::CommitBudget::hard(
+    live.deadline_ns.saturating_add(transfer_ns),
+    live.poll_interval_ns,
+  )
+}
+
 /// Borrows `holder`'s record session, waiting for it while another dispatch has it out, one timer tick at a time,
 /// within `deadline_ns`: empty when it never came back (counted, and the period re-ships). Dropped at the first miss, a
 /// write's message waited for whichever later dispatch carried it, at worst the next record period: two in three sends of
@@ -1896,6 +1926,47 @@ pub(crate) fn serve_fetch(
   }
 }
 
+/// A candidate's answer to phase one's report (A-200, A-240): authorized as a fetch is, the fence raised to the
+/// successor's epoch, and the head and the bytes kept, never the entries (the adopted holder alone is fetched).
+pub(crate) fn serve_report(
+  state: &mut ShardState,
+  local: HostId,
+  peer: HostId,
+  request: &[u8],
+) -> Vec<u8> {
+  let Ok(report) = slates_db::live::Report::decode(request) else {
+    count_refused(state, REFUSED_MALFORMED);
+    return slates_db::live::encode_reported(&Err(LiveError::Malformed), 0);
+  };
+  let regional = state.council.configuration();
+  let reading = slates_cluster::content::ContentAccess::Read;
+  if !crate::fleet::content_authorized(
+    regional,
+    &state.holder_records,
+    local,
+    peer,
+    reading,
+    report.object,
+  ) {
+    count_refused(state, "fleet.live.hold_refused.fetch_unauthorized");
+    return slates_db::live::encode_reported(&Err(LiveError::Unauthorized), 0);
+  }
+  match fenced_copy(state, peer, report.object, report.epoch) {
+    Ok(held) => {
+      held.replica.reassign(peer);
+      let head = held.replica.head();
+      let kept = u64::try_from(held.bytes).unwrap_or(u64::MAX);
+      state.count(LIVE_REPORTED, 1);
+      slates_db::live::encode_reported(&Ok(head), kept)
+    }
+    Err(refusal) => slates_db::live::encode_reported(&Err(refusal), 0),
+  }
+}
+
+/// Counter: phase-one reports this candidate answered (A-240).
+/// Format: a counter name in the daemon's status report.
+const LIVE_REPORTED: &str = "fleet.live.reported";
+
 /// This candidate's copy of `object` with its fence raised to a takeover's `epoch` (phase one): the copy it holds, or
 /// an empty one made now for `successor`. An empty report counts toward phase one's `f + 1` (any `f + 1` of the `2f`
 /// other candidates include one of the `f` that hold every durable entry), so it must leave the same fence a full one
@@ -1925,7 +1996,9 @@ pub(crate) fn serve_state(
   peer: HostId,
   request: &[u8],
 ) -> Vec<u8> {
-  if slates_db::live::is_fetch(request) {
+  if slates_db::live::is_report(request) {
+    serve_report(state, local, peer, request)
+  } else if slates_db::live::is_fetch(request) {
     serve_fetch(state, local, peer, request)
   } else {
     serve_install(state, local, peer, request)
@@ -1980,8 +2053,9 @@ pub(crate) struct Fetched {
 }
 
 /// Phase one for a live volume (A-200), on the control shard: raises this node's own copy's fence to `epoch`, asks every
-/// other candidate in `candidates` to do the same over its session, and adopts the greatest head among the answers
-/// (`slates_db::live::adopt`). The `f + 1` it needs are counted among `holders` alone, the hosts the shipper being
+/// other candidate in `candidates` to do the same and report its head and kept bytes (`slates_db::live::Report`), adopts
+/// the greatest head among the answers (`slates_db::live::adopt`), and then fetches the adopted holder's log alone
+/// ([`fetch_log`]). The `f + 1` it needs are counted among `holders` alone, the hosts the shipper being
 /// taken over recorded in the volume's catalog before it shipped (A-240): a host outside them (a member that joined
 /// since) holds none of the log, and counted in a holder's place it let a head the log had passed be adopted. A host
 /// asked that is not a holder still reports, and its head is adopted when it is the greatest. `Ok(None)` when no
@@ -2001,20 +2075,18 @@ pub(crate) async fn fetch(
     .flatten()
     .ok_or("fleet.live.takeover_waits_catalog")?;
   let mut reports: Vec<(HostId, Option<Head>)> = Vec::new();
-  let mut kept: BTreeMap<HostId, Vec<Vec<u8>>> = BTreeMap::new();
+  let mut kept: BTreeMap<HostId, u64> = BTreeMap::new();
   // The successor's own report, as any candidate's: an empty one counts too, fenced ([`fenced_copy`]). Counted only
   // when it held a copy, a successor holding nothing could not reach `f + 1` once the owner was gone and waited for
   // its quorum without end (370 and 371 waits under load, 2026-11-05; `a_successor_that_holds_no_copy_…`).
-  if let Some(Some(own)) = state::with_state(|s| {
+  let own = state::with_state(|s| {
     let held = fenced_copy(s, local, object, epoch).ok()?;
     held.replica.reassign(local);
-    Some((
-      held.replica.head(),
-      held.entries.iter().cloned().collect::<Vec<_>>(),
-    ))
-  }) {
-    reports.push((local, own.0));
-    kept.insert(local, own.1);
+    Some(held.replica.head())
+  })
+  .flatten();
+  if let Some(head) = own {
+    reports.push((local, head));
   }
   let mut others: Vec<HostId> = candidates
     .into_iter()
@@ -2025,9 +2097,11 @@ pub(crate) async fn fetch(
       others.push(*holder);
     }
   }
+  // Phase one proper: every other candidate and recorded holder reports its head and the bytes it keeps, a few bytes
+  // each, within the liveness budget whatever the path.
   let sessions =
     crate::fleet::take_sessions("fleet.lent_to.live_takeover", |host| others.contains(&host));
-  let request = slates_db::live::Fetch { object, epoch }.encode();
+  let request = slates_db::live::Report { object, epoch }.encode();
   let exchanged = slates_cluster::live::exchange(
     (slates_cluster::live::LIVE_STATE_STREAM, &request),
     sessions,
@@ -2042,9 +2116,9 @@ pub(crate) async fn fetch(
     exchanged.stragglers,
   );
   for (host, bytes) in exchanged.replies {
-    if let Ok((head, payloads)) = slates_db::live::decode_fetched(&bytes, cap) {
+    if let Ok((Ok(head), bytes)) = slates_db::live::decode_reported(&bytes) {
       reports.push((host, head));
-      kept.insert(host, payloads);
+      kept.insert(host, bytes);
     }
   }
   let needed = usize::try_from(quorum.f)
@@ -2058,10 +2132,22 @@ pub(crate) async fn fetch(
   if counted < needed {
     return Err("fleet.live.takeover_waits_quorum");
   }
-  let Some((holder, _)) = slates_db::live::adopt(&reports, &holders, quorum) else {
+  let Some((holder, head)) = slates_db::live::adopt(&reports, &holders, quorum) else {
     return Ok(None);
   };
-  let payloads = kept.remove(&holder).unwrap_or_default();
+  let payloads = if holder == local {
+    state::with_state(|s| {
+      s.live
+        .held
+        .get(&object)
+        .map(|held| held.entries.iter().cloned().collect::<Vec<_>>())
+    })
+    .flatten()
+    .unwrap_or_default()
+  } else {
+    let bytes = kept.get(&holder).copied().unwrap_or(0);
+    fetch_log(object, epoch, (holder, head), bytes, cap).await?
+  };
   let sealing = payloads
     .first()
     .and_then(|first| sealed_body(first))
@@ -2075,6 +2161,48 @@ pub(crate) async fn fetch(
     lineage,
     naming,
   }))
+}
+
+/// The second step of a live takeover (A-240): the log of the one holder phase one adopted, `bytes` long as it
+/// reported, fetched under a budget those bytes derive ([`exchange_budget`]), so a log of any size is given its transfer
+/// over the path to that holder. The holder is fenced at `epoch` already, so its head cannot have moved; one that
+/// answers another head (a later takeover fenced it higher) or nothing is waited for, and phase one runs again.
+async fn fetch_log(
+  object: ObjectId,
+  epoch: slates_db::register::HostEpoch,
+  (holder, head): (HostId, Head),
+  bytes: u64,
+  cap: usize,
+) -> Result<Vec<Vec<u8>>, &'static str> {
+  let session =
+    crate::fleet::take_sessions("fleet.lent_to.live_takeover", |host| host == holder);
+  if session.is_empty() {
+    return Err("fleet.live.takeover_waits_log_session");
+  }
+  let budget = exchange_budget(usize::try_from(bytes).unwrap_or(usize::MAX), &session);
+  let request = slates_db::live::Fetch { object, epoch }.encode();
+  let exchanged = slates_cluster::live::exchange(
+    (slates_cluster::live::LIVE_STATE_STREAM, &request),
+    session,
+    budget,
+    |_, _| false,
+  )
+  .await;
+  crate::fleet::return_sessions(exchanged.reusable);
+  settle_stragglers(
+    state::with_state(|s| s.shard).unwrap_or_default(),
+    object,
+    exchanged.stragglers,
+  );
+  let fetched = exchanged
+    .replies
+    .into_iter()
+    .find(|(host, _)| *host == holder)
+    .ok_or("fleet.live.takeover_waits_log")?;
+  match slates_db::live::decode_fetched(&fetched.1, cap) {
+    Ok((Some(fetched_head), payloads)) if fetched_head == head => Ok(payloads),
+    _ => Err("fleet.live.takeover_waits_log"),
+  }
 }
 
 /// A payload's sealed body, when it is sealed.

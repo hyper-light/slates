@@ -1059,6 +1059,65 @@ fn hostile_fetches_are_refused() {
   assert_eq!(Fetch::decode(&install_tag), Err(LiveError::Malformed));
 }
 
+/// A-240 hostile input on phase one's report: a report round-trips and is told from a fetch and an install; every
+/// truncation, a fetch's tag where a report is read, and trailing bytes are refused, never a panic.
+#[test]
+fn hostile_reports_are_refused() {
+  use slates_db::live::{Report, is_fetch, is_report, object_of_state};
+  let report = Report {
+    object: OBJECT,
+    epoch: HostEpoch(4),
+  };
+  let bytes = report.encode();
+  assert!(is_report(&bytes) && !is_fetch(&bytes));
+  assert_eq!(object_of_state(&bytes), Some(OBJECT));
+  assert_eq!(Report::decode(&bytes), Ok(report));
+  for length in 0..bytes.len() {
+    assert_eq!(Report::decode(&bytes[..length]), Err(LiveError::Malformed));
+  }
+  let mut longer = bytes.clone();
+  longer.push(0);
+  assert_eq!(Report::decode(&longer), Err(LiveError::Malformed));
+  let mut fetch_tag = bytes.clone();
+  fetch_tag[0] = 2;
+  assert_eq!(Report::decode(&fetch_tag), Err(LiveError::Malformed));
+}
+
+/// A-240 hostile input on a report's answer: it round-trips with a head, with nothing held and with a fence refusal,
+/// and every cut short of the kept bytes is refused, never a panic; no longer cut reads as the head.
+#[test]
+fn hostile_report_answers_are_refused() {
+  use slates_db::live::{decode_reported, encode_reported};
+  let head = Head {
+    epoch: HostEpoch(2),
+    position: 9,
+    identity: [5; 32],
+  };
+  for (reply, kept) in [
+    (Ok(Some(head)), 4096u64),
+    (Ok(None), 0),
+    (
+      Err(LiveError::StaleEpoch {
+        current: HostEpoch(6),
+      }),
+      0,
+    ),
+  ] {
+    let answer = encode_reported(&reply, kept);
+    assert_eq!(decode_reported(&answer), Ok((reply, kept)));
+  }
+  let answer = encode_reported(&Ok(Some(head)), 4096);
+  for length in 0..8 {
+    assert_eq!(decode_reported(&answer[..length]), Err(LiveError::Malformed));
+  }
+  for length in 8..answer.len() {
+    assert!(
+      decode_reported(&answer[..length]).is_ok_and(|(reply, _)| reply != Ok(Some(head))),
+      "a cut answer never reads as the head"
+    );
+  }
+}
+
 /// Hostile input on a fetched reply: it round-trips; a payload over the cap is refused, and no cut of it decodes whole.
 #[test]
 fn hostile_fetched_replies_are_refused() {
