@@ -1,0 +1,21 @@
+runner macos-latest, 3 CPUs, Sat Nov  7 11:43:17 UTC 2026
+== run 1 arm a exit 127 load { 18.99 19.60 13.40 }
+== run 1 arm b exit 127 load { 18.99 19.60 13.40 }
+== run 2 arm a exit 127 load { 18.99 19.60 13.40 }
+== run 2 arm b exit 127 load { 18.99 19.60 13.40 }
+== run 3 arm a exit 127 load { 18.99 19.60 13.40 }
+== run 3 arm b exit 127 load { 18.99 19.60 13.40 }
+== run 4 arm a exit 127 load { 18.99 19.60 13.40 }
+== run 4 arm b exit 127 load { 18.99 19.60 13.40 }
+== run 5 arm a exit 127 load { 18.99 19.60 13.40 }
+== run 5 arm b exit 127 load { 18.99 19.60 13.40 }
+== run 6 arm a exit 127 load { 18.99 19.60 13.40 }
+== run 6 arm b exit 127 load { 18.99 19.60 13.40 }
+== run 7 arm a exit 127 load { 18.99 19.60 13.40 }
+== run 7 arm b exit 127 load { 18.99 19.60 13.40 }
+== run 8 arm a exit 127 load { 18.99 19.60 13.40 }
+== run 8 arm b exit 127 load { 18.99 19.60 13.40 }
+== run 9 arm a exit 127 load { 18.99 19.60 13.40 }
+== run 9 arm b exit 127 load { 18.99 19.60 13.40 }
+== run 10 arm a exit 127 load { 18.99 19.60 13.40 }
+== run 10 arm b exit 127 load { 18.99 19.60 13.40 }
