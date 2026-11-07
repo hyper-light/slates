@@ -1,0 +1,70 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 15:09:17 UTC 2026, head f24f124767a69bcf0b38d14c43a1d48a1c337582
+== run 1 at 15:09:17, load 1.80 1.78 0.82
+chaos: fleet kill-at-ack (Bare) formed and settled: hosts ["1553058021368144829", "18384739423737616405", "13948066818253817746"]
+chaos a write answered the instant before its owner dies: iteration 0 (ClientWrite): chaos-kill-at-ack-a-6170 served the probe 1.961858029s after the owner's death
+chaos a write answered the instant before its owner dies: iteration 1 (NfsFileSync): chaos-kill-at-ack-a-6170 served the probe 2.187974314s after the owner's death
+chaos a write answered the instant before its owner dies: iteration 2 (ClientWrite): chaos-kill-at-ack-c-6170 served the probe 2.251558548s after the owner's death
+chaos a write answered the instant before its owner dies: iteration 3 (NfsFileSync): chaos-kill-at-ack-a-6170 served the probe 1.799220875s after the owner's death
+chaos a write answered the instant before its owner dies: iteration 4 (ClientWrite): chaos-kill-at-ack-c-6170 served the probe 2.036485041s after the owner's death
+chaos a write answered the instant before its owner dies: iteration 5 (NfsFileSync): chaos-kill-at-ack-a-6170 served the probe 2.091571514s after the owner's death
+chaos a write answered the instant before its owner dies:
+  iteration 0 (ClientWrite): chaos-kill-at-ack-a-6170 served the probe 1.961858029s after the owner's death
+  NoLoss, iteration 0 (earlier files): held
+  iteration 1 (NfsFileSync): chaos-kill-at-ack-a-6170 served the probe 2.187974314s after the owner's death
+  NoLoss, iteration 1 (earlier files): held
+  iteration 2 (ClientWrite): chaos-kill-at-ack-c-6170 served the probe 2.251558548s after the owner's death
+  NoLoss, iteration 2 (earlier files): held
+  iteration 3 (NfsFileSync): chaos-kill-at-ack-a-6170 served the probe 1.799220875s after the owner's death
+  NoLoss, iteration 3 (earlier files): held
+  iteration 4 (ClientWrite): chaos-kill-at-ack-c-6170 served the probe 2.036485041s after the owner's death
+  NoLoss, iteration 4 (earlier files): held
+  iteration 5 (NfsFileSync): chaos-kill-at-ack-a-6170 served the probe 2.091571514s after the owner's death
+  NoLoss, iteration 5 (earlier files): held
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 20.14s
+== run 1 exit 0
+== run 2 at 15:09:37, load 1.98 1.83 0.85
+chaos: fleet kill-at-ack (Bare) formed and settled: hosts ["9476604004055716210", "17046862514545403463", "8393708122519431189"]
+chaos a write answered the instant before its owner dies: iteration 0 (ClientWrite): chaos-kill-at-ack-b-7073 served the probe 2.008893008s after the owner's death
+chaos a write answered the instant before its owner dies: iteration 1 (NfsFileSync): chaos-kill-at-ack-b-7073 served the probe 2.123185488s after the owner's death
+chaos a write answered the instant before its owner dies: iteration 2 (ClientWrite): chaos-kill-at-ack-c-7073 served the probe 2.076224276s after the owner's death
+chaos a write answered the instant before its owner dies: iteration 3 (NfsFileSync): chaos-kill-at-ack-b-7073 served the probe 2.002603333s after the owner's death
+chaos a write answered the instant before its owner dies: iteration 4 (ClientWrite): chaos-kill-at-ack-c-7073 served the probe 2.06920481s after the owner's death
+chaos a write answered the instant before its owner dies: iteration 5 (NfsFileSync): chaos-kill-at-ack-b-7073 served the probe 2.003597553s after the owner's death
+chaos a write answered the instant before its owner dies:
+  iteration 0 (ClientWrite): chaos-kill-at-ack-b-7073 served the probe 2.008893008s after the owner's death
+  NoLoss, iteration 0 (earlier files): held
+  iteration 1 (NfsFileSync): chaos-kill-at-ack-b-7073 served the probe 2.123185488s after the owner's death
+  NoLoss, iteration 1 (earlier files): held
+  iteration 2 (ClientWrite): chaos-kill-at-ack-c-7073 served the probe 2.076224276s after the owner's death
+  NoLoss, iteration 2 (earlier files): held
+  iteration 3 (NfsFileSync): chaos-kill-at-ack-b-7073 served the probe 2.002603333s after the owner's death
+  NoLoss, iteration 3 (earlier files): held
+  iteration 4 (ClientWrite): chaos-kill-at-ack-c-7073 served the probe 2.06920481s after the owner's death
+  NoLoss, iteration 4 (earlier files): held
+  iteration 5 (NfsFileSync): chaos-kill-at-ack-b-7073 served the probe 2.003597553s after the owner's death
+  NoLoss, iteration 5 (earlier files): held
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 20.96s
+== run 2 exit 0
+== run 3 at 15:09:58, load 1.70 1.79 0.87
+chaos: fleet kill-at-ack (Bare) formed and settled: hosts ["13731382486257631046", "14785917741330662728", "10861552856781145712"]
+chaos a write answered the instant before its owner dies: iteration 0 (ClientWrite): chaos-kill-at-ack-b-8037 served the probe 2.011609987s after the owner's death
+chaos a write answered the instant before its owner dies: iteration 1 (NfsFileSync): chaos-kill-at-ack-b-8037 served the probe 2.00918979s after the owner's death
+chaos a write answered the instant before its owner dies: iteration 2 (ClientWrite): chaos-kill-at-ack-b-8037 served the probe 2.143657732s after the owner's death
+chaos a write answered the instant before its owner dies: iteration 3 (NfsFileSync): chaos-kill-at-ack-b-8037 served the probe 1.999134225s after the owner's death
+chaos a write answered the instant before its owner dies: iteration 4 (ClientWrite): chaos-kill-at-ack-b-8037 served the probe 2.010174764s after the owner's death
+chaos a write answered the instant before its owner dies: iteration 5 (NfsFileSync): chaos-kill-at-ack-b-8037 served the probe 1.994774821s after the owner's death
+chaos a write answered the instant before its owner dies:
+  iteration 0 (ClientWrite): chaos-kill-at-ack-b-8037 served the probe 2.011609987s after the owner's death
+  NoLoss, iteration 0 (earlier files): held
+  iteration 1 (NfsFileSync): chaos-kill-at-ack-b-8037 served the probe 2.00918979s after the owner's death
+  NoLoss, iteration 1 (earlier files): held
+  iteration 2 (ClientWrite): chaos-kill-at-ack-b-8037 served the probe 2.143657732s after the owner's death
+  NoLoss, iteration 2 (earlier files): held
+  iteration 3 (NfsFileSync): chaos-kill-at-ack-b-8037 served the probe 1.999134225s after the owner's death
+  NoLoss, iteration 3 (earlier files): held
+  iteration 4 (ClientWrite): chaos-kill-at-ack-b-8037 served the probe 2.010174764s after the owner's death
+  NoLoss, iteration 4 (earlier files): held
+  iteration 5 (NfsFileSync): chaos-kill-at-ack-b-8037 served the probe 1.994774821s after the owner's death
+  NoLoss, iteration 5 (earlier files): held
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 20.02s
+== run 3 exit 0
