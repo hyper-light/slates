@@ -939,7 +939,7 @@ pub struct BootFault {
 /// How a shard's start misbehaves under a [`BootFault`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BootFaultKind {
-  /// The start runs on the CPU for the whole time, as a long recovery does.
+  /// The start runs on the CPU until it has run the whole time of its own CPU, as a long recovery does.
   Busy,
   /// The start sleeps for the whole time, using no CPU, as a stuck shard does.
   Stuck,
