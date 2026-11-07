@@ -1,0 +1,82 @@
+leg fetch-arm, ubuntu-24.04-arm, 4 CPUs, Sat Nov  7 19:44:53 UTC 2026, tree f8fe1de27f53776762078cda3bd09b8b09fc1fe3
+== release build exit 0
+  chaos-rolling-a-6205 partitioned from 144.681782ms to 2.144777976s
+  chaos-rolling-c-6205 partitioned from 2.203358602s to 4.203451204s
+  4816 writes, 4816 acknowledged: p50 442 us, p99 6064 us, p999 41348 us, max 392932 us; 4 over 50ms (sent+took): 0.00s+112ms 2.20s+393ms 3.37s+56ms 3.43s+61ms
+  converged: true: owner Some(LiveState { holding: false, head: Some(4820), durable: Some(4820), owed: false, epoch: Some(1), identity: Some("f074f52156b46eccf14e75c056bf82d29255f575ece60008e13cfb8869bc15ac"), fence: 1, holders: ["5895743115686137415", "7483764726374826051"], moving_to: [], recorded: ["5895743115686137415", "7483764726374826051"] }); candidates [Some(LiveState { holding: true, head: Some(4820), durable: None, owed: false, epoch: Some(1), identity: Some("f074f52156b46eccf14e75c056bf82d29255f575ece60008e13cfb8869bc15ac"), fence: 1, holders: [], moving_to: [], recorded: [] }), Some(LiveState { holding: true, head: Some(4820), durable: None, owed: false, epoch: Some(1), identity: Some("f074f52156b46eccf14e75c056bf82d29255f575ece60008e13cfb8869bc15ac"), fence: 1, holders: [], moving_to: [], recorded: [] })]
+  chaos-rolling-b-6205 refused the owner: {}
+  chaos-rolling-a-6205 refused the owner: {}
+  chaos-rolling-c-6205 refused the owner: {}
+== partition 1 exit 0
+  chaos-rolling-a-6956 partitioned from 177.355839ms to 2.177517605s
+  chaos-rolling-b-6956 partitioned from 2.207455589s to 4.207538609s
+  5783 writes, 5783 acknowledged: p50 399 us, p99 3826 us, p999 8223 us, max 417483 us; 3 over 50ms (sent+took): 0.00s+140ms 0.18s+174ms 2.21s+417ms
+  converged: true: owner Some(LiveState { holding: false, head: Some(5786), durable: Some(5786), owed: false, epoch: Some(1), identity: Some("ad83b0e7375bae88fdf833bde9b1f0c27dcd9098e3925a223b216fdf225faea4"), fence: 1, holders: ["5674280415769612566", "15742839278201597545"], moving_to: [], recorded: ["5674280415769612566", "15742839278201597545"] }); candidates [Some(LiveState { holding: true, head: Some(5786), durable: None, owed: false, epoch: Some(1), identity: Some("ad83b0e7375bae88fdf833bde9b1f0c27dcd9098e3925a223b216fdf225faea4"), fence: 1, holders: [], moving_to: [], recorded: [] }), Some(LiveState { holding: true, head: Some(5786), durable: None, owed: false, epoch: Some(1), identity: Some("ad83b0e7375bae88fdf833bde9b1f0c27dcd9098e3925a223b216fdf225faea4"), fence: 1, holders: [], moving_to: [], recorded: [] })]
+  chaos-rolling-c-6956 refused the owner: {}
+  chaos-rolling-a-6956 refused the owner: {}
+  chaos-rolling-b-6956 refused the owner: {}
+== partition 2 exit 0
+  chaos-rolling-a-7659 partitioned from 254.871788ms to 2.255197936s
+  chaos-rolling-c-7659 partitioned from 2.336344697s to 4.336438254s
+  1838 writes, 1838 acknowledged: p50 827 us, p99 6199 us, p999 121134 us, max 2322423 us; 2 over 50ms (sent+took): 0.00s+121ms 2.33s+2322ms
+  converged: true: owner Some(LiveState { holding: false, head: Some(1842), durable: Some(1842), owed: false, epoch: Some(1), identity: Some("9d6b92518f16161cfed72f8228704a7bc63cf3b5220af29ae1cdb5625c40e584"), fence: 1, holders: ["5087502746570694731", "9035043211363386602"], moving_to: [], recorded: ["5087502746570694731", "9035043211363386602"] }); candidates [Some(LiveState { holding: true, head: Some(1842), durable: None, owed: false, epoch: Some(1), identity: Some("9d6b92518f16161cfed72f8228704a7bc63cf3b5220af29ae1cdb5625c40e584"), fence: 1, holders: [], moving_to: [], recorded: [] }), Some(LiveState { holding: true, head: Some(1842), durable: None, owed: false, epoch: Some(1), identity: Some("9d6b92518f16161cfed72f8228704a7bc63cf3b5220af29ae1cdb5625c40e584"), fence: 1, holders: [], moving_to: [], recorded: [] })]
+  chaos-rolling-b-7659 refused the owner: {}
+  chaos-rolling-a-7659 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 376}
+  chaos-rolling-c-7659 refused the owner: {}
+== partition 3 exit 0
+  chaos-rolling-a-8635 partitioned from 170.549424ms to 2.170634339s
+  chaos-rolling-b-8635 partitioned from 2.23531312s to 4.235394963s
+  4210 writes, 4210 acknowledged: p50 499 us, p99 6856 us, p999 36696 us, max 327551 us; 4 over 50ms (sent+took): 0.00s+132ms 0.17s+172ms 2.24s+328ms 4.43s+111ms
+  converged: true: owner Some(LiveState { holding: false, head: Some(4213), durable: Some(4213), owed: false, epoch: Some(1), identity: Some("bf551eee378b0ac1201ebf9ffa604abefadaf536bc49957e5b0161240e71d315"), fence: 1, holders: ["1838487342512725589", "4817022924802924511"], moving_to: [], recorded: ["1838487342512725589", "4817022924802924511"] }); candidates [Some(LiveState { holding: true, head: Some(4213), durable: None, owed: false, epoch: Some(1), identity: Some("bf551eee378b0ac1201ebf9ffa604abefadaf536bc49957e5b0161240e71d315"), fence: 1, holders: [], moving_to: [], recorded: [] }), Some(LiveState { holding: true, head: Some(4213), durable: None, owed: false, epoch: Some(1), identity: Some("bf551eee378b0ac1201ebf9ffa604abefadaf536bc49957e5b0161240e71d315"), fence: 1, holders: [], moving_to: [], recorded: [] })]
+  chaos-rolling-c-8635 refused the owner: {}
+  chaos-rolling-a-8635 refused the owner: {}
+  chaos-rolling-b-8635 refused the owner: {}
+== partition 4 exit 0
+  chaos-rolling-a-9232 partitioned from 174.493813ms to 2.17460854s
+  chaos-rolling-b-9232 partitioned from 2.472730069s to 4.472813099s
+  4671 writes, 4671 acknowledged: p50 460 us, p99 4660 us, p999 45881 us, max 122409 us; 4 over 50ms (sent+took): 0.00s+122ms 2.26s+82ms 2.34s+59ms 3.48s+86ms
+  converged: true: owner Some(LiveState { holding: false, head: Some(4674), durable: Some(4674), owed: false, epoch: Some(1), identity: Some("e2b4b159fffaf40864a9f777002b5cf648fca0b4b7e078ce07470098e92dc517"), fence: 1, holders: ["3416711754271566684", "8981814164181147891"], moving_to: [], recorded: ["3416711754271566684", "8981814164181147891"] }); candidates [Some(LiveState { holding: true, head: Some(4674), durable: None, owed: false, epoch: Some(1), identity: Some("e2b4b159fffaf40864a9f777002b5cf648fca0b4b7e078ce07470098e92dc517"), fence: 1, holders: [], moving_to: [], recorded: [] }), Some(LiveState { holding: true, head: Some(4674), durable: None, owed: false, epoch: Some(1), identity: Some("e2b4b159fffaf40864a9f777002b5cf648fca0b4b7e078ce07470098e92dc517"), fence: 1, holders: [], moving_to: [], recorded: [] })]
+  chaos-rolling-c-9232 refused the owner: {}
+  chaos-rolling-a-9232 refused the owner: {}
+  chaos-rolling-b-9232 refused the owner: {}
+== partition 5 exit 0
+  chaos-rolling-b-9960 partitioned from 235.069742ms to 2.235156225s
+  chaos-rolling-c-9960 partitioned from 2.291474614s to 4.293295946s
+  3420 writes, 3420 acknowledged: p50 678 us, p99 5080 us, p999 71421 us, max 409613 us; 4 over 50ms (sent+took): 0.00s+187ms 0.23s+163ms 2.29s+410ms 4.46s+71ms
+  converged: true: owner Some(LiveState { holding: false, head: Some(3423), durable: Some(3423), owed: false, epoch: Some(1), identity: Some("19ddeb602081c8f87c19d7d5e83d7776815e6ae043f151a816c702e5a6c6881f"), fence: 1, holders: ["8120102385233295817", "14088638785696685120"], moving_to: [], recorded: ["8120102385233295817", "14088638785696685120"] }); candidates [Some(LiveState { holding: true, head: Some(3423), durable: None, owed: false, epoch: Some(1), identity: Some("19ddeb602081c8f87c19d7d5e83d7776815e6ae043f151a816c702e5a6c6881f"), fence: 1, holders: [], moving_to: [], recorded: [] }), Some(LiveState { holding: true, head: Some(3423), durable: None, owed: false, epoch: Some(1), identity: Some("19ddeb602081c8f87c19d7d5e83d7776815e6ae043f151a816c702e5a6c6881f"), fence: 1, holders: [], moving_to: [], recorded: [] })]
+  chaos-rolling-a-9960 refused the owner: {}
+  chaos-rolling-b-9960 refused the owner: {}
+  chaos-rolling-c-9960 refused the owner: {}
+== partition 6 exit 0
+  chaos-rolling-b-10653 partitioned from 234.455203ms to 2.23455948s
+  chaos-rolling-c-10653 partitioned from 2.339971279s to 4.340101934s
+  4228 writes, 4228 acknowledged: p50 543 us, p99 6422 us, p999 59431 us, max 258498 us; 6 over 50ms (sent+took): 0.00s+188ms 2.19s+56ms 2.25s+59ms 2.34s+258ms 4.33s+71ms 4.67s+115ms
+  converged: true: owner Some(LiveState { holding: false, head: Some(4231), durable: Some(4231), owed: false, epoch: Some(1), identity: Some("17e284fcfa6b75b3109db8c2aa1ac335948a310099e1097a0cfee96bf8648071"), fence: 1, holders: ["2206139374247078972", "5962931435223084397"], moving_to: [], recorded: ["2206139374247078972", "5962931435223084397"] }); candidates [Some(LiveState { holding: true, head: Some(4231), durable: None, owed: false, epoch: Some(1), identity: Some("17e284fcfa6b75b3109db8c2aa1ac335948a310099e1097a0cfee96bf8648071"), fence: 1, holders: [], moving_to: [], recorded: [] }), Some(LiveState { holding: true, head: Some(4231), durable: None, owed: false, epoch: Some(1), identity: Some("17e284fcfa6b75b3109db8c2aa1ac335948a310099e1097a0cfee96bf8648071"), fence: 1, holders: [], moving_to: [], recorded: [] })]
+  chaos-rolling-a-10653 refused the owner: {}
+  chaos-rolling-b-10653 refused the owner: {}
+  chaos-rolling-c-10653 refused the owner: {}
+== partition 7 exit 0
+  chaos-rolling-a-11369 partitioned from 186.685976ms to 2.186765674s
+  chaos-rolling-c-11369 partitioned from 2.51624476s to 4.516338372s
+  2237 writes, 2237 acknowledged: p50 672 us, p99 8058 us, p999 69963 us, max 2429580 us; 4 over 50ms (sent+took): 0.00s+115ms 2.26s+64ms 2.39s+70ms 2.52s+2430ms
+  converged: true: owner Some(LiveState { holding: false, head: Some(2240), durable: Some(2240), owed: false, epoch: Some(1), identity: Some("9de8caf7bebe71a51d87c88efa1e099e4c17853325a4ab2bb06e8476bf0d2866"), fence: 1, holders: ["2318943035444513507", "13628617029904252588"], moving_to: [], recorded: ["2318943035444513507", "13628617029904252588"] }); candidates [Some(LiveState { holding: true, head: Some(2240), durable: None, owed: false, epoch: Some(1), identity: Some("9de8caf7bebe71a51d87c88efa1e099e4c17853325a4ab2bb06e8476bf0d2866"), fence: 1, holders: [], moving_to: [], recorded: [] }), Some(LiveState { holding: true, head: Some(2240), durable: None, owed: false, epoch: Some(1), identity: Some("9de8caf7bebe71a51d87c88efa1e099e4c17853325a4ab2bb06e8476bf0d2866"), fence: 1, holders: [], moving_to: [], recorded: [] })]
+  chaos-rolling-b-11369 refused the owner: {}
+  chaos-rolling-a-11369 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 73}
+  chaos-rolling-c-11369 refused the owner: {}
+== partition 8 exit 0
+  chaos-rolling-a-12157 partitioned from 325.94282ms to 2.326356934s
+  chaos-rolling-b-12157 partitioned from 2.611730694s to 4.611808761s
+  1977 writes, 1977 acknowledged: p50 1471 us, p99 12059 us, p999 58444 us, max 134952 us; 2 over 50ms (sent+took): 0.00s+135ms 2.33s+58ms
+  converged: true: owner Some(LiveState { holding: false, head: Some(1980), durable: Some(1980), owed: false, epoch: Some(1), identity: Some("54610a24d13a36d0b4e18704b258caccdf0366527933036ee08f8ceac4b45a68"), fence: 1, holders: ["2240022102342677252", "9032625674463559621"], moving_to: [], recorded: ["2240022102342677252", "9032625674463559621"] }); candidates [Some(LiveState { holding: true, head: Some(1980), durable: None, owed: false, epoch: Some(1), identity: Some("54610a24d13a36d0b4e18704b258caccdf0366527933036ee08f8ceac4b45a68"), fence: 1, holders: [], moving_to: [], recorded: [] }), Some(LiveState { holding: true, head: Some(1980), durable: None, owed: false, epoch: Some(1), identity: Some("54610a24d13a36d0b4e18704b258caccdf0366527933036ee08f8ceac4b45a68"), fence: 1, holders: [], moving_to: [], recorded: [] })]
+  chaos-rolling-c-12157 refused the owner: {}
+  chaos-rolling-a-12157 refused the owner: {}
+  chaos-rolling-b-12157 refused the owner: {}
+== partition 9 exit 0
+  chaos-rolling-a-12884 partitioned from 178.829688ms to 2.179136404s
+  chaos-rolling-c-12884 partitioned from 2.260388124s to 4.262303026s
+  3523 writes, 3523 acknowledged: p50 604 us, p99 4696 us, p999 33390 us, max 365208 us; 2 over 50ms (sent+took): 0.00s+111ms 2.26s+365ms
+  converged: true: owner Some(LiveState { holding: false, head: Some(3526), durable: Some(3526), owed: false, epoch: Some(1), identity: Some("3618ff63375a5c5fac96ef41bf6b506d698610ba90dd8794a8e816fd03ad9c52"), fence: 1, holders: ["8361018848530326251", "9298944779270525155"], moving_to: [], recorded: ["8361018848530326251", "9298944779270525155"] }); candidates [Some(LiveState { holding: true, head: Some(3526), durable: None, owed: false, epoch: Some(1), identity: Some("3618ff63375a5c5fac96ef41bf6b506d698610ba90dd8794a8e816fd03ad9c52"), fence: 1, holders: [], moving_to: [], recorded: [] }), Some(LiveState { holding: true, head: Some(3526), durable: None, owed: false, epoch: Some(1), identity: Some("3618ff63375a5c5fac96ef41bf6b506d698610ba90dd8794a8e816fd03ad9c52"), fence: 1, holders: [], moving_to: [], recorded: [] })]
+  chaos-rolling-b-12884 refused the owner: {}
+  chaos-rolling-a-12884 refused the owner: {}
+  chaos-rolling-c-12884 refused the owner: {}
+== partition 10 exit 0
