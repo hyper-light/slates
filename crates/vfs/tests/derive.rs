@@ -479,3 +479,57 @@ fn a_renamed_directorys_old_name_recreated_with_a_new_entry_reads_right() {
     ],
   );
 }
+
+/// Format: the records the short journal of
+/// `a_derivation_over_a_journal_that_dropped_part_of_the_work_is_refused` keeps, fewer than the files its work creates.
+const SHORT_JOURNAL_RECORDS: usize = 4;
+/// Format: the files that test's work creates, four times what its short journal keeps.
+const WORK_FILES: usize = 4 * SHORT_JOURNAL_RECORDS;
+
+/// §4.16 (the ops document is derived from the journal since the base) and GAPS "the deriver reads the journal with no
+/// completeness check" (2026-10-23): a derivation over a journal whose retention dropped records after the base snapshot
+/// describes part of the work as all of it. Do: snapshot a volume whose journal keeps `SHORT_JOURNAL_RECORDS` records,
+/// then create `WORK_FILES` files, so the oldest of the work's records leave. Expect: the derivation refused
+/// [`VfsError::JournalIncomplete`], never a document naming only the files whose records survived; and the same work
+/// under a journal that keeps it all derives a document naming every file (the control).
+#[test]
+fn a_derivation_over_a_journal_that_dropped_part_of_the_work_is_refused() {
+  use slates_vfs::VfsError;
+  use slates_vfs::clock::StepClock;
+  use slates_vfs::volume::VolumeConfig;
+  let derive_after_work = |journal_bytes: usize| {
+    let mut store = store();
+    let mut vol = Volume::create(
+      &mut store,
+      VolumeConfig {
+        prefix: 7,
+        names: NameEquivalence::Exact,
+        quota: Quota::Bounded { limit: 1 << 30 },
+        journal_bytes,
+        clock: Box::new(StepClock::new(0, 1_000)),
+      },
+    )
+    .unwrap();
+    let base = vol.snapshot(&mut store).unwrap();
+    let root = vol.root();
+    for file in 0..WORK_FILES {
+      vol
+        .create_file(&mut store, root, &format!("f{file}"), 0o644)
+        .unwrap();
+    }
+    vol.derive(&store, base)
+  };
+  let record = std::mem::size_of::<slates_vfs::journal::OpRecord>();
+  let whole = derive_after_work(1 << 20).unwrap();
+  assert_eq!(
+    whole.files.len(),
+    WORK_FILES,
+    "the control names every file"
+  );
+  let short = derive_after_work(SHORT_JOURNAL_RECORDS * record);
+  assert!(
+    matches!(short, Err(VfsError::JournalIncomplete { .. })),
+    "a journal that dropped part of the work derived {:?}",
+    short.map(|doc| doc.files.len())
+  );
+}
