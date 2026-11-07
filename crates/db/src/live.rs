@@ -726,6 +726,33 @@ impl Shipper {
     &self.holders
   }
 
+  /// Ships to `holders` from now on (the volume's other candidates as the configuration now names them; the owner is
+  /// left out). A holder kept keeps what it reported; a new one is owed everything (entries, or an install once the
+  /// retained tail no longer reaches back); a holder no longer named is forgotten. The durable position never falls.
+  /// Whether the set changed. A shipper made before the owner's configuration named the volume's candidates (a volume
+  /// made on a fleet's bootstrap node, which names only itself until the others are admitted) shipped to nobody for
+  /// good: no entry was ever durable, and every later publication was refused for credit.
+  pub fn set_holders(&mut self, holders: &[HostId]) -> bool {
+    let mut named: Vec<HostId> = holders
+      .iter()
+      .copied()
+      .filter(|holder| *holder != self.owner)
+      .collect();
+    named.sort_unstable();
+    named.dedup();
+    let mut current = self.holders.clone();
+    current.sort_unstable();
+    if named == current {
+      return false;
+    }
+    self.held.retain(|holder, _| named.contains(holder));
+    self.owed_install.retain(|holder| named.contains(holder));
+    self.holders = named;
+    self.trim();
+    self.durable = self.recompute_durable();
+    true
+  }
+
   /// The entries appended here that are not yet durable.
   pub fn in_flight(&self) -> u64 {
     let Some(head) = self.head else {
