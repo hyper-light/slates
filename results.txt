@@ -6,3 +6,6 @@ run 1 exit 0 4s load=2.31 0.91 0.34
 run 2 exit 0 4s load=2.20 0.91 0.34
     presentation of 1000 files of 16384 bytes: 667.302058ms, 1000 entries; 489 probes inside it — p50 696.98µs, p99 1.351219ms, longest of all 18.221216ms; before it the longest 680.837µs
     test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.64s
+run 3 exit 0 4s load=2.11 0.91 0.35
+    presentation of 1000 files of 16384 bytes: 670.440713ms, 1000 entries; 481 probes inside it — p50 714.827µs, p99 1.460884ms, longest of all 18.276598ms; before it the longest 681.974µs
+    test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.76s
