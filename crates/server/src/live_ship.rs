@@ -158,6 +158,9 @@ pub(crate) struct LiveVolume {
   /// The holders a lane is shipping to now, each with when it began ([`dispatch`]): at most one lane a holder, so the
   /// messages a holder lacks queue here, not as tasks waiting for its one session.
   lanes: BTreeMap<HostId, u64>,
+  /// The holders known to hold a version of the volume's catalog, which a holder's bound is derived from
+  /// ([`hold_bound`]): every holder any of the catalog's placements named, kept. Bounded by the candidates.
+  catalogued: Vec<HostId>,
 }
 
 /// What a candidate keeps of one live volume.
@@ -793,6 +796,7 @@ pub(crate) fn published(
       fenced: None,
       kept: 0,
       lanes: BTreeMap::new(),
+      catalogued: Vec::new(),
     });
   let whole = live.owes_whole || record.is_none() || reaches_size;
   let built = if whole {
@@ -975,17 +979,36 @@ fn content_runs(
 /// record (its next publication or the period appends one, and the install is made from that).
 fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
   let object = ObjectId(volume);
-  let catalogued = catalogued_holders(state, object);
+  let placed = catalogued_holders(state, object);
+  let (now, expiry) = (slates_rt::futures::now_ns(), lane_expiry_ns());
   let Some(live) = state.live.shipping.get_mut(&volume) else {
     return Vec::new();
   };
+  // Kept, not replaced: a round that placed the catalog at `f + 1` while a candidate was away names only the others,
+  // and the candidate, which holds an earlier version, was shipped nothing more (a healed candidate left at 228 against
+  // the owner's 554 for good, `live_chaos`, 2026-11-06).
+  for holder in placed {
+    if !live.catalogued.contains(&holder) {
+      live.catalogued.push(holder);
+    }
+  }
+  let catalogued = live.catalogued.clone();
+  // A holder a lane is shipping to is sent its messages when the lane ends ([`lane_ended`]): nothing is built for it
+  // now, an install least of all (a clone of the whole volume each: 1,631 built in one run, 2.3 GB copied on the owner
+  // shard, for lanes that sent none of them).
+  let busy: Vec<HostId> = live
+    .lanes
+    .iter()
+    .filter(|(_, began)| now.saturating_sub(**began) < expiry)
+    .map(|(holder, _)| *holder)
+    .collect();
   let mut sends = Vec::new();
   let mut stale_checkpoint = false;
   for holder in live.shipper.holders() {
     // A holder that has not acknowledged the volume's catalog refuses the log (its bound is the catalog's size,
     // `hold_bound`): the record plane places the catalog there first, re-shipped each period, and the next dispatch after
     // that ships it the log.
-    if !catalogued.contains(holder) {
+    if !catalogued.contains(holder) || busy.contains(holder) {
       continue;
     }
     match live.shipper.pending(*holder) {
@@ -1035,8 +1058,8 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
   sends
 }
 
-/// The candidates that have acknowledged `object`'s catalog record: the holders that take its live log ([`hold_bound`]
-/// is derived from the catalog). Shipped to every candidate before, a candidate the record plane had not yet placed the
+/// The candidates the latest placement of `object`'s catalog record names: holders that take its live log ([`hold_bound`]
+/// is derived from the catalog), folded into the volume's `catalogued` by [`pending_sends`]. Shipped to every candidate before, a candidate the record plane had not yet placed the
 /// catalog on refused each entry and each install (`fleet.live.hold_refused.no_catalog`, 116 and 119 refusals on the two
 /// candidates of one run), and its installs, the whole volume each, held its one session against the record plane's
 /// re-ship of the very catalog it lacked: one candidate held the log alone, and partitioning it stalled every write
