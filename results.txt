@@ -1,0 +1,25 @@
+tested e2882c6c83b0c6855a3735801829b78cc3cc348c variant after on aarch64, 4 cpus
+held exit 101 170s
+  held: thread 'a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound' (5576) panicked at crates/server/tests/fleet.rs:10195:3:
+  held: the forward hops balance: started 0, resolved 0, batches done 130, given up 90; all Ok({"content.prefaulted_bytes": 65536, "content.purged_bytes": 12536926208, "content.ticks.busy": 1, "content.ticks.idle": 91, "fleet.content.answered": 2, "fleet.discovery.pages": 7, "fleet.forward.batch_done": 130, "fleet.forward.batch_given_up": 90, "fleet.forward.begun": 220, "fleet.forward.retried": 81, "fleet.learner.fetch_paced": 8, "fleet.learner.fetches": 2, "fleet.owner_location.direct": 139, "fleet.owner_location.forward_unanswered": 90, "fleet.owner_location.route_dropped.query_changed": 8, "fleet.owner_location.route_dropped.refused": 9, "fleet.plane.announce_lends": 2, "fleet.plane.announcements_sent": 2, "fleet.seal.pair_served": 1, "merge.record_withheld": 882, "recovery.returned_bytes": 11143938048})
+  held: test a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound ... FAILED
+  held: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 96 filtered out; finished in 92.84s
+  held: error: test failed, to rerun pass `-p slates-server --test fleet`
+held-again exit 101 92s
+  held-again: thread 'a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound' (5610) panicked at crates/server/tests/fleet.rs:10195:3:
+  held-again: the forward hops balance: started 0, resolved 0, batches done 130, given up 90; all Ok({"content.prefaulted_bytes": 65536, "content.purged_bytes": 12536926208, "content.ticks.busy": 1, "content.ticks.idle": 91, "fleet.content.answered": 2, "fleet.discovery.pages": 7, "fleet.forward.batch_done": 130, "fleet.forward.batch_given_up": 90, "fleet.forward.begun": 220, "fleet.forward.retried": 81, "fleet.learner.fetch_paced": 8, "fleet.learner.fetches": 2, "fleet.owner_location.direct": 139, "fleet.owner_location.forward_unanswered": 90, "fleet.owner_location.route_dropped.query_changed": 8, "fleet.owner_location.route_dropped.refused": 9, "fleet.plane.announce_lends": 2, "fleet.plane.announcements_sent": 2, "fleet.seal.pair_served": 1, "merge.record_withheld": 882, "recovery.returned_bytes": 11143938048})
+  held-again: test a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound ... FAILED
+  held-again: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 96 filtered out; finished in 92.81s
+  held-again: error: test failed, to rerun pass `-p slates-server --test fleet`
+lane exit 0 2s
+  lane: the forward of a read on a free shard took 1.602944ms while another forward to its owner waited out a 500ms hold; b's fleet counters Ok({"content.purged_bytes": 696492032, "content.ticks.idle": 1, "fleet.discovery.pages": 13, "fleet.fan.sent": 3, "fleet.fan.unchanged": 12, "fleet.forward.batch_done": 4, "fleet.forward.begun": 4, "fleet.forward.taken_for_another": 1, "fleet.learner.fetch_paced": 8, "fleet.learner.fetches": 2, "fleet.owner_location.direct": 4, "fleet.plane.announce_lends": 4, "fleet.plane.announcements_sent": 4})
+fleet-forward exit 101 134s
+  fleet-forward: test a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound ... FAILED
+  fleet-forward: ---- a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound stdout ----
+  fleet-forward: thread 'a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound' (5677) panicked at crates/server/tests/fleet.rs:10195:3:
+  fleet-forward: the forward hops balance: started 0, resolved 0, batches done 130, given up 90; all Ok({"content.prefaulted_bytes": 65536, "content.purged_bytes": 12536926208, "content.ticks.busy": 1, "content.ticks.idle": 91, "fleet.content.answered": 2, "fleet.discovery.pages": 7, "fleet.forward.batch_done": 130, "fleet.forward.batch_given_up": 90, "fleet.forward.begun": 220, "fleet.forward.retried": 81, "fleet.learner.fetch_paced": 8, "fleet.learner.fetches": 2, "fleet.owner_location.direct": 139, "fleet.owner_location.forward_unanswered": 90, "fleet.owner_location.route_dropped.query_changed": 8, "fleet.owner_location.route_dropped.refused": 9, "fleet.plane.announce_lends": 2, "fleet.plane.announcements_sent": 2, "fleet.seal.pair_served": 1, "merge.record_withheld": 882, "recovery.returned_bytes": 11143938048})
+  fleet-forward: test result: FAILED. 10 passed; 1 failed; 0 ignored; 0 measured; 86 filtered out; finished in 133.07s
+  fleet-forward: error: test failed, to rerun pass `-p slates-server --test fleet`
+  fleet-forward: error: 1 target failed:
+server-lib exit 0 26s
+clippy exit 0 60s
