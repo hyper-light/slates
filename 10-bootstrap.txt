@@ -18,3 +18,13 @@ live keyed: ZZ live-keyed-b-45159 counters {"held": 15}
 live keyed: ZZ live-keyed-c-45159 counters {"held": 15}
 live keyed: the writes returned while the candidate was stopped: false; served whole by live-keyed-b-45159 after 2.233367333s
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 11.09s
+=== keyed-3 exit 0 load { 13.94 5.58 4.36 }
+live keyed: created 715915b3686ddf460000000000000012 after 553.0595ms
+live keyed: 715915b3686ddf460000000000000012's successor is the stopped node, after 553.213166ms
+live keyed: live-shipped and writing, after 553.373708ms
+live keyed: ZZ owner counters before the kill {"appended": 6, "awaited": 5, "durable": 6, "held_back.keys": 7, "held_back.placement": 1, "held_back.whole": 1, "holders_recorded": 1, "no_session": 15, "resolved": 5, "unanswered": 7, "whole": 2}
+live keyed: ZZ live-keyed-a-45657 counters {"hold_refused": 31, "hold_refused.not_a_member": 31}
+live keyed: ZZ live-keyed-b-45657 counters {"held": 9}
+live keyed: ZZ live-keyed-c-45657 counters {"appended": 6, "awaited": 5, "durable": 6, "held_back.keys": 7, "held_back.placement": 1, "held_back.whole": 1, "holders_recorded": 1, "no_session": 15, "resolved": 5, "unanswered": 7, "whole": 2}
+live keyed: the writes returned while the candidate was stopped: false; served whole by live-keyed-a-45657 after 4.151247334s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 12.43s
