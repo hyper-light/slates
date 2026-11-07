@@ -1,0 +1,16 @@
+tested ed848a8cfaad9df9707b43f8594d027f2541766b variant after on aarch64, 4 cpus
+green-checkpoint exit 0 76s
+  green-checkpoint: warning: aws-lc-sys@0.45.0: Target platform: 'aarch64-unknown-linux-gnu'
+  green-checkpoint: test a_chain_held_by_a_reader_is_refused_typed_at_its_cap_and_folds_once_released ... ok
+  green-checkpoint: slates-server: shard 0: recovered 0 volumes from their images (0 refused), 2 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  green-checkpoint: partition snapshot: 15431 bytes at version 40, 21831 at 200 (bound on growth 39168)
+  green-checkpoint: test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.80s
+fleet exit 101 24s
+  fleet: warning: aws-lc-sys@0.45.0: Target platform: 'aarch64-unknown-linux-gnu'
+  fleet: thread 'a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id' (5494) panicked at crates/server/tests/fleet.rs:10043:3:
+  fleet: the forwarded submit's acceptance outlived the owner's budget: Some(Err("OwnerUnreachable { region: 0 }"))
+  fleet: test a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id ... FAILED
+  fleet:     a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id
+  fleet: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 91 filtered out; finished in 12.72s
+  fleet: error: test failed, to rerun pass `-p slates-server --test fleet`
+  fleet: error: 1 target failed:
