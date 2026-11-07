@@ -385,6 +385,9 @@ pub struct Green {
   /// — a work's base, a pinned attachment — can still name.
   folded_below: u64,
   fast_path_hits: u64,
+  /// The deltas the verdict's position mapping consulted (`intervening`): the non-vacuity count that it reads only the
+  /// deltas that changed a path, never every delta since a base. A cell, as the deltas it counts are borrowed.
+  deltas_visited: std::cell::Cell<u64>,
 }
 
 /// The bytes a retained conflict window costs the rejected-result cache: its path, its range and
@@ -1252,6 +1255,12 @@ impl Green {
     self.fast_path_hits
   }
 
+  /// The deltas the verdict's position mapping has consulted ([`Green::fast_path_hits`]'s companion): one per delta
+  /// that changed a path an increment touches since its base.
+  pub fn deltas_visited(&self) -> u64 {
+    self.deltas_visited.get()
+  }
+
   /// The green's state at an older `version` as a deriver [`Base`](crate::increment::Base), for a
   /// work whose base lagged behind an intervening submit. Files come from the content history (exact,
   /// renames and deletes included); directories and modes are replayed from the deltas up to the
@@ -1636,16 +1645,56 @@ impl Green {
       .saturating_add(self.special_history_bytes)
   }
 
-  /// The ops each intervening delta in `(base, head]` applied to `path`.
+  /// The ops each intervening delta in `(base, head]` applied to `path`, oldest first: read at the versions `path`'s
+  /// content history names after `base`, the only deltas that hold ops for it (a delta records a path's ops exactly
+  /// when the commit set its content, which pushes its history entry), so the walk costs the path's own changes since
+  /// the base. Walking every delta since the base cost the versions since it, whatever they changed: at 10,000 clients
+  /// over one green, whose works lag by thousands of versions, that walk on the green's owner shard was the rung's wall
+  /// (2026-11-07). A base below the fold, whose history entries may be gone, walks every delta as before.
   fn intervening(&self, path: &str, base: u64) -> Vec<&[Op]> {
+    if base < self.folded_below {
+      return self.intervening_walk(path, base);
+    }
+    let Some(history) = self.content_history.get(path) else {
+      return Vec::new();
+    };
+    let after = history.partition_point(|(version, _)| *version <= base);
+    let ops: Vec<&[Op]> = history
+      .get(after..)
+      .unwrap_or_default()
+      .iter()
+      .filter_map(|(version, _)| {
+        let index = version.checked_sub(self.deltas_from)?.checked_sub(1)?;
+        self
+          .deltas
+          .get(usize::try_from(index).ok()?)?
+          .get(path)
+          .map(Vec::as_slice)
+      })
+      .collect();
+    self.count_visited(history.len().saturating_sub(after));
+    ops
+  }
+
+  /// [`Green::intervening`] by walking every delta in `(base, head]`: for a base below the fold.
+  fn intervening_walk(&self, path: &str, base: u64) -> Vec<&[Op]> {
     // `submit` and `rebase` refuse a base below `deltas_from`, so the skip is the base's own place in the deltas.
     let skip = usize::try_from(base.saturating_sub(self.deltas_from)).unwrap_or(usize::MAX);
+    self.count_visited(self.deltas.len().saturating_sub(skip));
     self
       .deltas
       .iter()
       .skip(skip)
       .filter_map(|delta| delta.get(path).map(Vec::as_slice))
       .collect()
+  }
+
+  /// Adds `deltas` to the verdict's visited count.
+  fn count_visited(&self, deltas: usize) {
+    let deltas = u64::try_from(deltas).unwrap_or(u64::MAX);
+    self
+      .deltas_visited
+      .set(self.deltas_visited.get().saturating_add(deltas));
   }
 
   /// A whole-path namespace conflict window.
