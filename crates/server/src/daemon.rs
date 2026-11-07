@@ -4302,8 +4302,19 @@ async fn serve_loop() {
       // Announce idle, fence, re-check (the doorbell protocol, `verbs::announce_idle`): a request found
       // pending is served now; one published later is rung, and the ring wakes this poller.
       let serve_instead = state::with_state(verbs::announce_idle).unwrap_or(false);
+      // A forward its owner's full control channel refused is kept for the next round (§4.3, "backpressure, never a
+      // drop"), but no ring or kick says the channel has room: the owner drains it without a word to the shards that
+      // wait. So while one is kept the loop idles at most the idle window, then serves a round that sends it again.
+      // Idling until a ring woke it, a shard whose clients all waited on kept forwards slept until some other
+      // request came: at 10,000 clients over one green, requests waited 10 to 42 s with the daemon idle
+      // (`crates/server/tests/forward_retry.rs`).
+      let kept = state::with_state(|s| !s.pending_forwards.is_empty()).unwrap_or(false);
       if !serve_instead {
-        futures::idle().await;
+        if kept {
+          let _ = futures::within(idle_window_ns.max(1), futures::idle()).await;
+        } else {
+          futures::idle().await;
+        }
       }
       state::with_state(verbs::announce_polling);
     }
