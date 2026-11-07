@@ -1,0 +1,5 @@
+tested fix b7c13d8ecb38c3fdd493f87704dab107cd89b0d8 on x86_64, 4 cpus
+build exit 0 bin target/debug/deps/landing_fairness-175a150e2b2585fb
+loaded run 1 a_landing_longer_than_its_lease_term_renews_it_and_lands_everything exit 0 253s late_beats=0 longest_poll_ms=0 load=10.19 6.32 2.76
+    calibration: 500 files in 562.83772ms, twice that in 1.287027257s (1.448379ms per file at the margin)
+    landing of 1381 files: 1.394442054s under a 1000000000 ns term, 2 renewals, longest lease gap 70779255 ns: 1381 written, done
