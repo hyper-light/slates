@@ -70,7 +70,10 @@ suite holds a start to (1/64). The frozen and stuck tests no longer bound the su
 frozen test checks the kill came within a window of the lapse, and the stuck test reads the anchor's start-kill line
 and checks "no progress for N ms" lies in [window, 2 × window). `held_rendezvous.rs`, the rendezvous handoff, ran on
 Unix only because it killed with `kill`; it now ends the daemon with `TerminateProcess` on Windows and runs in all three
-Windows CI lanes.
+Windows CI lanes. Its answer bound now counts from the successor's serving line, not from the kill: beside two spinners
+a CPU on windows-latest the first round was answered by the next daemon, exit 0, in 1.05-1.28 s against a 1 s claim
+wait, five runs in five, and in 43-47 ms quiet (diag-liveness-14). A client that ran out a claim wait and retried is
+still caught, since it is answered more than a claim wait after the successor serves.
 
 On CI (diag-liveness-10, two spinners a CPU on four runners), the stuck start was killed at 1,001-1,007 ms on both
 Linux runners, 1,007-1,070 ms on windows-latest and 1,002-1,009 ms on windows-11-arm, three runs each, and the
