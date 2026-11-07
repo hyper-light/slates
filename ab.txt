@@ -873,3 +873,5 @@ slates-winfsp: reply spin window = 186900 ns: the median one-way channel wake of
 slates-winfsp: reply spin window = 13400 ns: the median one-way channel wake of 15 (the 2-competitive spin)
 slates-winfsp: a receive worker had ended before worker 0 released it
 ## run 5 of 5 done, 2026-11-07T09:06:46Z
+To https://github.com/hyper-light/slates
+   58248f2..80aa9bb  80aa9bb03a081bbdfa3201a9984707f6005bd70a -> diag-winfsp-overlap-results-42354811410-form-arm
