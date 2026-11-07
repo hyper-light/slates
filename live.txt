@@ -1,0 +1,112 @@
+# the CanDelete lever at b21fec116a3f51dfea02b888f00e8bb338519d59 (red)
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded cfg-if v1.0.4
+  Downloaded cpufeatures v0.3.1
+  Downloaded constant_time_eq v0.4.2
+  Downloaded arrayvec v0.7.8
+  Downloaded lz4_flex v0.11.6
+  Downloaded cc v1.4.5
+  Downloaded jobserver v0.1.35
+  Downloaded find-msvc-tools v0.1.12
+  Downloaded getrandom v0.4.3
+  Downloaded itoa v1.0.18
+  Downloaded unicode-ident v1.0.24
+  Downloaded serde v1.0.229
+  Downloaded tinyvec_macros v0.1.1
+  Downloaded memmap2 v0.9.11
+  Downloaded proc-macro2 v1.0.107
+  Downloaded syn v2.0.119
+  Downloaded shlex v2.0.1
+  Downloaded unicode-normalization v0.1.25
+  Downloaded serde_derive v1.0.229
+  Downloaded tinyvec v1.13.2
+  Downloaded zmij v1.0.23
+  Downloaded zstd v0.13.3
+  Downloaded serde_core v1.0.229
+  Downloaded blake3 v1.8.7
+  Downloaded zstd-sys v2.1.0+zstd.1.5.7
+  Downloaded serde_json v1.0.151
+  Downloaded zstd-safe v7.3.0
+  Downloaded memchr v2.8.3
+  Downloaded syn v3.0.5
+  Downloaded pkg-config v0.3.34
+  Downloaded quote v1.0.47
+  Downloaded windows-sys v0.60.2
+  Downloaded windows-targets v0.53.5
+  Downloaded windows_x86_64_msvc v0.53.1
+  Downloaded twox-hash v2.1.4
+   Compiling getrandom v0.4.3
+   Compiling cfg-if v1.0.4
+   Compiling find-msvc-tools v0.1.12
+   Compiling shlex v2.0.1
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling windows_x86_64_msvc v0.53.1
+   Compiling serde_core v1.0.229
+   Compiling zmij v1.0.23
+   Compiling jobserver v0.1.35
+   Compiling cc v1.4.5
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling syn v3.0.5
+   Compiling constant_time_eq v0.4.2
+   Compiling arrayvec v0.7.8
+   Compiling cpufeatures v0.3.1
+   Compiling windows-targets v0.53.5
+   Compiling memchr v2.8.3
+   Compiling blake3 v1.8.7
+   Compiling itoa v1.0.18
+   Compiling windows-sys v0.60.2
+   Compiling serde_derive v1.0.229
+   Compiling pkg-config v0.3.34
+   Compiling memmap2 v0.9.11
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+   Compiling syn v2.0.119
+   Compiling zstd-safe v7.3.0
+   Compiling twox-hash v2.1.4
+   Compiling tinyvec_macros v0.1.1
+   Compiling tinyvec v1.13.2
+   Compiling lz4_flex v0.11.6
+   Compiling unicode-normalization v0.1.25
+   Compiling slates-image v0.1.0 (D:\a\slates\slates\crates\image)
+   Compiling slates-wire-derive v0.1.0 (D:\a\slates\slates\crates\wire-derive)
+   Compiling slates-machine v0.1.0 (D:\a\slates\slates\crates\machine)
+   Compiling slates-mem v0.1.0 (D:\a\slates\slates\crates\mem)
+   Compiling slates-wire v0.1.0 (D:\a\slates\slates\crates\wire)
+   Compiling slates-ipc v0.1.0 (D:\a\slates\slates\crates\ipc)
+   Compiling zstd v0.13.3
+   Compiling slates-archive v0.1.0 (D:\a\slates\slates\crates\archive)
+   Compiling slates-rt v0.1.0 (D:\a\slates\slates\crates\rt)
+   Compiling slates-vfs v0.1.0 (D:\a\slates\slates\crates\vfs)
+   Compiling slates-anchor v0.1.0 (D:\a\slates\slates\crates\anchor)
+   Compiling slates-db v0.1.0 (D:\a\slates\slates\crates\db)
+   Compiling slates-bridge-core v0.1.0 (D:\a\slates\slates\crates\bridge-core)
+   Compiling slates-bridge-winfsp v0.1.0 (D:\a\slates\slates\crates\bridge-winfsp)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 55.68s
+     Running unittests src\lib.rs (target\debug\deps\slates_bridge_winfsp-68e58da83a217bfc.exe)
+
+running 1 test
+test host::tests::a_files_can_delete_makes_no_shard_trip_and_a_directorys_does ... slates-winfsp: reply spin window = 16700 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+
+running 1 test
+WINFSP CAN DELETE: the client removed the file and the empty directory
+WINFSP CAN DELETE: 2 CanDelete requests reached the shard
+
+thread 'host::tests::a_files_can_delete_makes_no_shard_trip_and_a_directorys_does' (4292) panicked at crates\bridge-winfsp\src\..\tests\support\host.rs:870:3:
+assertion `left == right` failed: only the directory's CanDelete may ask the shard; 2 did
+  left: 2
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    host::tests::a_files_can_delete_makes_no_shard_trip_and_a_directorys_does
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 84 filtered out; finished in 1.06s
+
+error: test failed, to rerun pass `-p slates-bridge-winfsp --lib`
+## candelete test, red, exit 101
