@@ -289,7 +289,23 @@ fn fleet_view(instance: &str) -> Option<(String, usize, u32)> {
   ))
 }
 
-/// Waits until every node holds all `members` members alive with every peer probed; returns their member ids.
+/// Whether `instance`'s probe mesh is up as its daemon judges it: every peer it keeps direct contact with is probed
+/// (`fleet_peers_unmeshed` zero), and it keeps contact with at least one. Not "every member less one probed": two
+/// members that neither hold for each other nor vote keep no direct contact (§4.8), so a five-node fleet's two
+/// non-voters probe each other only in formation's first window (raft-chaos's flow took that for a stall, CI
+/// diag-live-fixes-30 runs 5 and 6).
+fn meshed(instance: &str) -> bool {
+  let (code, out, _) = run(instance, &["status"]);
+  code == 0
+    && value_of(&out, "fleet_peers_unmeshed").trim() == "0"
+    && value_of(&out, "fleet_peers_in_contact")
+      .trim()
+      .parse::<u32>()
+      .is_ok_and(|contact| contact > 0)
+}
+
+/// Waits until every node holds all `members` members alive with its probe mesh up ([`meshed`]); returns their member
+/// ids.
 fn wait_formed(instances: &[String], members: usize) -> Vec<String> {
   let mut window = FrozenWindow::new();
   loop {
@@ -298,10 +314,11 @@ fn wait_formed(instances: &[String], members: usize) -> Vec<String> {
       .map(|instance| fleet_view(instance))
       .collect();
     if views.iter().all(|view| {
-      view.as_ref().is_some_and(|(_, held, probed)| {
-        *held == members && usize::try_from(*probed).ok() == members.checked_sub(1)
-      })
-    }) {
+      view
+        .as_ref()
+        .is_some_and(|(_, held, _)| *held == members)
+    }) && instances.iter().all(|instance| meshed(instance))
+    {
       return views.into_iter().map(|view| view.unwrap().0).collect();
     }
     if !window.moving(&format!("{views:?}")) {
