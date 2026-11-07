@@ -1,0 +1,28 @@
+runner ubuntu-24.04-arm, 4 CPUs, Sat Nov  7 16:07:46 UTC 2026, tree 4299a0e192799a59c411de8e113edad8634752d0
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 39.11s
+== db live exit 0
+  3607 writes, 3607 acknowledged: p50 432 us, p99 3229 us, p999 48017 us, max 3101128 us; 3 over 50ms (sent+took): 0.00s+114ms 0.15s+164ms 2.23s+3101ms
+  chaos-rolling-b-7082 refused the owner: {}
+  chaos-rolling-a-7082 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 405}
+  chaos-rolling-c-7082 refused the owner: {}
+== partition 1 exit 0
+  6117 writes, 6117 acknowledged: p50 356 us, p99 6671 us, p999 27032 us, max 678193 us; 6 over 50ms (sent+took): 0.00s+125ms 2.13s+73ms 2.20s+53ms 2.29s+410ms 3.23s+57ms 4.12s+678ms
+  chaos-rolling-b-8925 refused the owner: {}
+  chaos-rolling-a-8925 refused the owner: {}
+  chaos-rolling-c-8925 refused the owner: {}
+== partition 2 exit 0
+  2425 writes, 2425 acknowledged: p50 722 us, p99 5081 us, p999 157498 us, max 3026286 us; 4 over 50ms (sent+took): 0.01s+206ms 0.26s+157ms 2.21s+54ms 2.35s+3026ms
+  chaos-rolling-b-9547 refused the owner: {}
+  chaos-rolling-a-9547 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 284}
+  chaos-rolling-c-9547 refused the owner: {}
+== partition 3 exit 0
+  1886 writes, 1886 acknowledged: p50 1054 us, p99 4599 us, p999 148039 us, max 2635222 us; 2 over 50ms (sent+took): 0.00s+148ms 2.29s+2635ms
+  chaos-rolling-c-10782 refused the owner: {}
+  chaos-rolling-a-10782 refused the owner: {}
+  chaos-rolling-b-10782 refused the owner: {}
+== partition 4 exit 0
+  4255 writes, 4255 acknowledged: p50 362 us, p99 2902 us, p999 23555 us, max 3010668 us; 4 over 50ms (sent+took): 0.00s+147ms 0.18s+176ms 2.06s+54ms 2.21s+3011ms
+  chaos-rolling-b-11476 refused the owner: {}
+  chaos-rolling-a-11476 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 94}
+  chaos-rolling-c-11476 refused the owner: {}
+== partition 5 exit 0
