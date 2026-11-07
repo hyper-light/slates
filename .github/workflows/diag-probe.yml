@@ -1,0 +1,59 @@
+name: DIAG who owns what, and the structural check's words (not for main)
+
+on:
+  push:
+    branches: ['diag-winfsp-bench-land-[0-9]*']
+
+permissions:
+  contents: write
+
+jobs:
+  owners:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Owners and the token
+        shell: pwsh
+        run: |
+          $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $elevated = ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          $policy = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name nodefaultadminowner -ErrorAction SilentlyContinue).nodefaultadminowner
+          $probe = Join-Path $env:GITHUB_WORKSPACE 'target\tmp\probe'
+          New-Item -ItemType Directory -Force $probe | Out-Null
+          $lines = @(
+            "user $($id.Name) $($id.User.Value)",
+            "token default owner $($id.Owner.Value) $($id.Owner.Translate([Security.Principal.NTAccount]))",
+            "elevated $elevated; nodefaultadminowner $policy",
+            "workspace parent owner $((Get-Acl (Split-Path $env:GITHUB_WORKSPACE)).Owner)",
+            "workspace owner $((Get-Acl $env:GITHUB_WORKSPACE).Owner)",
+            "crates\server owner $((Get-Acl (Join-Path $env:GITHUB_WORKSPACE 'crates\server')).Owner)",
+            "a directory this step makes: owner $((Get-Acl $probe).Owner)"
+          )
+          $lines | Out-File results.txt -Encoding utf8
+          git config user.name diag; git config user.email diag@invalid
+          $blob = git hash-object -w results.txt
+          $tree = "100644 blob $blob`tresults.txt`n" | git mktree
+          $commit = git commit-tree $tree -m probe
+          git push -f origin "${commit}:refs/heads/diag-winfsp-bench-land-results-probe-${{ matrix.runner }}"
+  xtask:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: The structural check, its last words published
+        shell: bash
+        run: |
+          set +e
+          cargo xtask check > xtask.log 2>&1
+          code=$?
+          { echo "xtask exit $code"; grep -av 'Compiling\|Downloaded\|Downloading' xtask.log | tail -60 | cut -c1-300; } > results.txt
+          git config user.name diag; git config user.email diag@invalid
+          tree=$(printf '100644 blob %s\tresults.txt\n' "$(git hash-object -w results.txt)" | git mktree)
+          commit=$(git commit-tree "$tree" -m probe)
+          git push -f origin "$commit:refs/heads/diag-winfsp-bench-land-results-probe-xtask"
