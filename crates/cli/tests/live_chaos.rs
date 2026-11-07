@@ -304,10 +304,13 @@ fn wait_formed(instances: &[String], members: usize) -> Vec<String> {
     }) {
       return views.into_iter().map(|view| view.unwrap().0).collect();
     }
-    assert!(
-      window.moving(&format!("{views:?}")),
-      "the fleet formed, or kept changing, within each fleet wait: {views:?}"
-    );
+    if !window.moving(&format!("{views:?}")) {
+      // What the probe and record planes did, for a pair that never probed each other (diag-31 run 7; live-fixes).
+      panic!(
+        "the fleet formed, or kept changing, within each fleet wait: {views:?}\n{}",
+        diagnosis(instances, "")
+      );
+    }
     pause();
   }
 }
@@ -1309,6 +1312,11 @@ fn diagnosis(instances: &[String], volume: &str) -> String {
             || line.contains("fleet.takeover")
             || line.contains("fleet.materialize")
             || line.contains("fleet.seal.")
+            || line.contains("fleet.plane.")
+            || line.contains("fleet.link.")
+            || line.contains("fleet.accept.")
+            || line.starts_with("fleet_formed_probe_peers")
+            || line.starts_with("fleet_contacts")
             || line.contains("fleet.promotion")
             || line.contains("fleet.record")
             || line.contains("fleet.owner_location")
