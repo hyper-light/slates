@@ -562,10 +562,26 @@ fn volume_id_of(hex: &str) -> VolumeId {
   VolumeId { bytes }
 }
 
+/// Shape: the room each streamed file takes beyond its bytes (its inode and directory entry), as a multiple: room
+/// twice over.
+const FILE_ROOM: usize = 2;
+
+/// Derived: a flow's volume holds every file a stream can write, `STREAM_FILES` × `WRITE_BYTES` × [`FILE_ROOM`], in
+/// MiB, so no flow is ever refused for space before it is stopped. A fixed 64 MiB held 16,384 writes, and a 10 s
+/// release stream with the live checkpoint fix wrote 16,404 and failed on its last 20 (live-durability, CI
+/// diag-live-durability-7, 2026-11-07). It is a quota, not memory: the daemons hold only what was written.
+fn volume_bound_mib() -> usize {
+  STREAM_FILES
+    .saturating_mul(WRITE_BYTES)
+    .saturating_mul(FILE_ROOM)
+    .div_ceil(1 << 20)
+}
+
 /// Creates a volume on `owner` (live-shipped when `live`): its id.
 fn create_volume(owner: &str, name: &str, live: bool) -> String {
+  let bound = format!("{}MiB", volume_bound_mib());
   let id = value_of(
-    &run_ready(owner, &["volume", "create", name, "--bounded", "64MiB"]),
+    &run_ready(owner, &["volume", "create", name, "--bounded", &bound]),
     "id",
   );
   if live {
@@ -2536,14 +2552,23 @@ fn a_long_live_log_is_taken_over_whole() {
   let candidates = candidates_of(&fleet, owner_index);
   let volume = create_volume(&owner, "long-log", true);
   let mut verdict = Verdict::new("a long live log taken over");
-  let never = AtomicBool::new(false);
-  let outcomes = Stream {
-    instance: &owner,
-    volume: volume_id_of(&volume),
-    began: Instant::now(),
-  }
-  .run(0..LONG_LOG, &never);
+  // Streamed in steps the stall guard watches (40 durable writes within the fleet wait each), so a write the daemon
+  // never answers fails the flow with the fleet printed, where one long stream ran into the test's own timeout.
+  let (outcomes, samples) = stream_through(&fleet.instances, &owner, &volume, 0..LONG_LOG, |_| {
+    while live_states(&owner, &volume)
+      .unwrap_or_default()
+      .into_iter()
+      .find(|state| !state.holding)
+      .and_then(|state| state.durable)
+      .is_none_or(|durable| durable < u64::try_from(LONG_LOG).unwrap())
+    {
+      after_writes(&owner, &volume, BETWEEN_EVENTS);
+    }
+  });
   verdict.note(latency_line(&outcomes));
+  let (heads, disagreements) = agreement(&samples);
+  verdict.note(format!("{} samples, {heads} heads seen", samples.len()));
+  verdict.check("Agreement", disagreements);
   let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
   let (caught_up, last) = converged(&owner, &refs, &volume);
   verdict.check(
