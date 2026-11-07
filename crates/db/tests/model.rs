@@ -330,7 +330,7 @@ enum Step {
   Attach(usize, u32),
   Detach(usize),
   Complete(u32, u32),
-  Acknowledge(u32, u32),
+  Acknowledge(u32, u32, Vec<u32>),
   Grant(usize),
   GrantState(usize, u8),
   LandingLease(u32, u64),
@@ -389,7 +389,7 @@ fn step() -> impl Strategy<Value = Step> {
     1 => (0..8usize, 0..3u32).prop_map(|(v, c)| Step::Attach(v, c)),
     1 => (0..8usize).prop_map(Step::Detach),
     2 => (0..3u32, 0..16u32).prop_map(|(c, s)| Step::Complete(c, s)),
-    1 => (0..3u32, 0..16u32).prop_map(|(c, s)| Step::Acknowledge(c, s)),
+    1 => (0..3u32, 0..16u32, proptest::collection::vec(0..16u32, 0..4)).prop_map(|(c, s, owed)| Step::Acknowledge(c, s, owed)),
     1 => (0..8usize).prop_map(Step::Grant),
     1 => (0..8usize, 0..4u8).prop_map(|(g, s)| Step::GrantState(g, s)),
     1 => (0..2u32, 1..100u64).prop_map(|(h, t)| Step::LandingLease(h, t)),
@@ -622,10 +622,11 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
         result: vec![u8::try_from(*s).unwrap_or(0); 3],
       },
     },
-    Step::Acknowledge(c, s) => Op::CompletionsAcknowledged {
+    Step::Acknowledge(c, s, owed) => Op::CompletionsAcknowledged {
       origin: 0,
       client: *c,
       up_to: *s,
+      owed: owed.clone(),
     },
     step @ (Step::Grant(..)
     | Step::GrantState(..)
@@ -1359,6 +1360,7 @@ fn completions_are_exactly_once_across_recovery() {
       origin: 0,
       client: 7,
       up_to: 3,
+      owed: Vec::new(),
     },
     0,
   )
@@ -1408,6 +1410,7 @@ fn completions_from_distinct_origins_do_not_collide() {
       origin: 1,
       client: 7,
       up_to: 3,
+      owed: Vec::new(),
     },
     0,
   )

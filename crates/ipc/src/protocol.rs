@@ -288,10 +288,13 @@ pub enum RequestBody {
   },
   /// List the caller's volumes.
   List,
-  /// Acknowledge completions up to a sequence (releases their records).
+  /// Acknowledge completions up to a sequence except the ids still owed (releases the others' records, §4.9).
   Acknowledge {
-    /// Every sequence up to and including this one.
+    /// Every sequence up to and including this one, except `owed`.
     up_to: u32,
+    /// The ids at or below `up_to` the client still owes (awaited, or held for a resend under the same id), whose
+    /// records stay: at most the ring's slots and the client's hold.
+    owed: Vec<u32>,
   },
   /// The base entry as the disk holds it now (§4.4 `read_base`).
   ReadBase {

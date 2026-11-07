@@ -58,10 +58,12 @@ pub struct ClientCompletions {
   pub origin: u64,
   /// The client.
   pub client: u32,
-  /// Every sequence up to and including this one is acknowledged.
+  /// Every sequence up to and including this one is acknowledged, except `owed`.
   pub acknowledged_up_to: Option<u32>,
   /// The retained completions.
   pub records: Vec<CompletionRecord>,
+  /// The ids at or below `acknowledged_up_to` the client still owes, kept open (§4.9).
+  pub owed: Vec<u32>,
 }
 
 /// One green volume's merge chain as a snapshot carries it: the green, its origin when it was
@@ -597,6 +599,15 @@ impl Partition {
       .completions
       .get(&(origin, client))
       .map_or(0, ClientWindow::retained)
+  }
+
+  /// The ids at or below a client's watermark it still owes (its window's open ids), in order: what an origin relays
+  /// beside the watermark with a forwarded write, so the owner keeps them open too (§4.9).
+  pub fn owed_completions(&self, origin: u64, client: u32) -> Vec<u32> {
+    self
+      .completions
+      .get(&(origin, client))
+      .map_or_else(Vec::new, |w| w.owed().collect())
   }
 
   /// The highest sequence a client has acknowledged (its completion window's watermark), or `None` if it has
@@ -1334,12 +1345,13 @@ impl Partition {
         origin,
         client,
         up_to,
+        owed,
       } => {
         self
           .completions
           .entry((*origin, *client))
           .or_default()
-          .acknowledge(*up_to);
+          .acknowledge(*up_to, owed);
         Ok(())
       }
       Op::GrantIssued { record } => {
@@ -1626,6 +1638,7 @@ impl Partition {
           origin: *origin,
           client: *client,
           acknowledged_up_to: w.acknowledged_up_to(),
+          owed: w.owed().collect(),
           records: w
             .retained_entries()
             .map(|(sequence, result)| CompletionRecord {
@@ -1744,7 +1757,7 @@ impl Partition {
         w.record(r.sequence, r.result.clone());
       }
       if let Some(up_to) = c.acknowledged_up_to {
-        w.acknowledge(up_to);
+        w.acknowledge(up_to, &c.owed);
       }
     }
   }
