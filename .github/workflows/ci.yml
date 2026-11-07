@@ -621,16 +621,6 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-server --test give_back -- --nocapture
-      # The daemon's own unit tests, which no Windows lane ran until 2026-11-06 (the matrix in docs/wip/ci-matrix.md). Two
-      # landing tests failed on both runners because Windows had no landing writer (`landing.rs`'s cfg(not(unix)) arm
-      # refuses Unsupported { feature: "landing" }); this step lands with the Windows writer, those two its failing
-      # tests. One test at a time: each test daemon sizes itself from the whole machine, and Windows charges commit when
-      # memory is made, so at 4 threads the suite met the commit limit and at 32 it aborted (the oversubscription GAPS
-      # records for the client binary).
-      - name: Test the daemon's unit tests, one test at a time (native Windows)
-        if: ${{ !cancelled() }}
-        timeout-minutes: 15
-        run: cargo test -p slates-server --lib -- --test-threads=1
       # The fleet over real loopback UDP sessions with mutual TLS (crates/server/tests/fleet.rs): formation, detection,
       # replication, takeover and serving the dead owner's bytes over the successor's NFS port. It was cfg(unix) as a
       # whole until 2026-11-06; only the virtio-fs guest test stays Unix-only. It needs the Windows datagram socket's
@@ -945,16 +935,6 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-server --test give_back -- --nocapture
-      # The daemon's own unit tests, which no Windows lane ran until 2026-11-06 (the matrix in docs/wip/ci-matrix.md). Two
-      # landing tests failed on both runners because Windows had no landing writer (`landing.rs`'s cfg(not(unix)) arm
-      # refuses Unsupported { feature: "landing" }); this step lands with the Windows writer, those two its failing
-      # tests. One test at a time: each test daemon sizes itself from the whole machine, and Windows charges commit when
-      # memory is made, so at 4 threads the suite met the commit limit and at 32 it aborted (the oversubscription GAPS
-      # records for the client binary).
-      - name: Test the daemon's unit tests, one test at a time (native Windows)
-        if: ${{ !cancelled() }}
-        timeout-minutes: 15
-        run: cargo test -p slates-server --lib -- --test-threads=1
       # The fleet over real loopback UDP sessions with mutual TLS (crates/server/tests/fleet.rs): formation, detection,
       # replication, takeover and serving the dead owner's bytes over the successor's NFS port. It was cfg(unix) as a
       # whole until 2026-11-06; only the virtio-fs guest test stays Unix-only. It needs the Windows datagram socket's

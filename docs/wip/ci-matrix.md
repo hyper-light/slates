@@ -2,7 +2,7 @@
 
 Every test target in the workspace (each `lib`, `bin` and `tests/*.rs` target `cargo metadata` lists), and which lane of
 `.github/workflows/ci.yml` runs it on which platform. Made 2026-11-06 for VFS plan Step 15 ("CI green on every
-platform"), from the tree at `agents/release-wincov` (main d61c3be2 + this change). The table is a snapshot: it is not yet
+platform"), from the tree at `agents/release-wincov` (main a2cf9af7 + this change). The table is a snapshot: it is not yet
 checked by a test, so it can drift; the follow-up proposed below is a `cargo xtask` check that regenerates it and fails on
 drift (CLAUDE.md §4, doc-truth tests).
 
@@ -23,19 +23,20 @@ drift (CLAUDE.md §4, doc-truth tests).
   to main and on the nightly, not on pull requests.
 - `#[ignore]`d tests run only where a step names them with `--ignored` (the model and explorer searches in `gates`).
 
-## Totals (301 targets)
+## Totals (319 targets)
 
 | lane | all | part | skips | — (no lane) | n/b |
 |---|---|---|---|---|---|
-| ubuntu x64 | 283 | 0 | 5 | 0 | 13 |
-| ubuntu arm64 | 1 | 4 | 0 | 283 | 13 |
-| macOS arm64 | 267 | 0 | 5 | 0 | 29 |
-| Windows x64 | 40 | 1 | 0 | 206 | 54 |
-| Windows arm64 | 39 | 1 | 0 | 207 | 54 |
+| ubuntu x64 | 299 | 0 | 5 | 0 | 15 |
+| ubuntu arm64 | 1 | 4 | 0 | 299 | 15 |
+| macOS arm64 | 282 | 0 | 5 | 0 | 32 |
+| Windows x64 | 40 | 1 | 0 | 217 | 61 |
+| Windows arm64 | 41 | 1 | 0 | 216 | 61 |
 
-With this change the Windows lanes run `slates-server`'s unit tests and `crates/server/tests/fleet.rs` (before: 38 and
-37 targets). The unit-test step lands with the Windows landing writer: two landing tests fail on Windows until it does,
-since `landing.rs`'s Windows arm refuses `Unsupported { feature: "landing" }`.
+With this change both Windows lanes run `crates/server/tests/fleet.rs` (85 passed, 3 ignored on the runners:
+diagnostics run 42340483175). `slates-server`'s unit tests join them with the Windows landing writer: two landing tests
+fail on Windows until it lands, since `landing.rs`'s Windows arm refuses `Unsupported { feature: "landing" }`, so that
+step lands with the writer (`agents/release-wincov-lib`).
 
 ## What compiling the whole workspace for Windows found
 
@@ -60,9 +61,9 @@ since `landing.rs`'s Windows arm refuses `Unsupported { feature: "landing" }`.
    - `live_chaos` (13 flows; it runs many fleets in one process): the nightly only (`github.event_name == 'schedule'`),
      on ubuntu, after raising the descriptor soft limit to the hard one (`ulimit -n "$(ulimit -Hn)"`): a systemd unit's
      1,024 failed it.
-2. **ubuntu arm64 runs 5 of 288 targets that build there:** one `cargo test --workspace` step in `linux-arm64`, with the
+2. **ubuntu arm64 runs 5 of 304 targets that build there:** one `cargo test --workspace` step in `linux-arm64`, with the
    `gates` Test step's environment. The runner exists and already builds the workspace for its named tests.
-3. **Windows runs about 40 of 247 targets that build there.** The pure crates (`slates-vfs`, `-merge`, `-db`, `-cluster`,
+3. **Windows runs 41 (x86_64) and 42 (arm64) of the 258 targets that build there.** The pure crates (`slates-vfs`, `-merge`, `-db`, `-cluster`,
    `-archive`, `-image`, `-transport`, `-wire`, `-machine`, `-land`'s oracles) need nothing Windows lacks: one step in
    `windows-nightly` and `windows-arm64`, `cargo test --workspace --lib --bins --tests --exclude slates-cli -- --test-threads=1`
    (one thread, as every daemon suite on Windows), after one jupiter run of it to find what fails first. Daemon-spawning
@@ -74,7 +75,7 @@ since `landing.rs`'s Windows arm refuses `Unsupported { feature: "landing" }`.
 
 | crate | target | builds where | tests (ignored, env-gated) | ubuntu x64 | ubuntu arm64 | macOS arm64 | Windows x64 | Windows arm64 |
 |---|---|---|---|---|---|---|---|---|
-| slates-anchor | test `anchor` | — | 26 (9, 0) | all | — | all | all | all |
+| slates-anchor | test `anchor` | — | 28 (10, 0) | all | — | all | all | all |
 | slates-anchor | test `handles_windows` | windows | 17 (9, 0) | n/b | n/b | n/b | all | all |
 | slates-anchor | lib | — | 0 (0, 0) | all | — | all | all | all |
 | slates-archive | test `archive` | — | 20 (0, 0) | all | — | all | — | — |
@@ -137,37 +138,43 @@ since `landing.rs`'s Windows arm refuses `Unsupported { feature: "landing" }`.
 | slates-bridge-oci | lib | — | 0 (0, 0) | all | — | all | — | — |
 | slates-bridge-oci | test `verify` | — | 11 (0, 0) | all | — | all | — | — |
 | slates-bridge-virtiofs | test `admission` | — | 11 (0, 0) | all | — | all | — | — |
-| slates-bridge-virtiofs | test `device` | — | 33 (0, 0) | all | — | all | — | — |
-| slates-bridge-virtiofs | test `serve` | unix | 10 (0, 0) | all | — | all | n/b | n/b |
+| slates-bridge-virtiofs | test `device` | — | 35 (0, 0) | all | — | all | — | — |
+| slates-bridge-virtiofs | test `serve` | unix | 12 (0, 0) | all | — | all | n/b | n/b |
 | slates-bridge-virtiofs | lib | — | 0 (0, 0) | all | — | all | — | — |
 | slates-bridge-virtiofs | test `virtqueue` | — | 14 (0, 0) | all | — | all | — | — |
+| slates-bridge-winfsp | test `batch_allocations` | — | 1 (0, 0) | all | — | all | — | — |
 | slates-bridge-winfsp | lib | — | 6 (0, 0) | all | — | all | all | all |
-| slates-cli | test `cli` | unix | 83 (1, 67) | all | part | all | n/b | n/b |
+| slates-cli | test `cli` | unix | 93 (1, 76) | all | part | all | n/b | n/b |
 | slates-cli | test `fs_server` | unix | 6 (0, 5) | all | — | all | n/b | n/b |
 | slates-cli | test `guest_dax` | target_os = "linux" | 3 (0, 0) | all | — | n/b | n/b | n/b |
 | slates-cli | test `guest_image` | target_os = "linux" | 7 (0, 0) | all | — | n/b | n/b | n/b |
 | slates-cli | test `guest_vhost` | target_os = "linux" | 8 (0, 0) | all | — | n/b | n/b | n/b |
-| slates-cli | test `held_rendezvous` | — | 1 (0, 1) | skips | — | skips | — | — |
-| slates-cli | test `live_chaos` | unix | 13 (0, 13) | skips | — | skips | n/b | n/b |
-| slates-cli | test `live_fleet` | unix | 11 (0, 11) | skips | — | skips | n/b | n/b |
+| slates-cli | test `held_rendezvous` | — | 1 (0, 1) | skips | — | skips | all | all |
+| slates-cli | test `live_chaos` | unix | 15 (0, 15) | skips | — | skips | n/b | n/b |
+| slates-cli | test `live_fleet` | unix | 18 (0, 18) | skips | — | skips | n/b | n/b |
+| slates-cli | test `live_winfsp` | windows | 1 (0, 1) | n/b | n/b | n/b | — | — |
+| slates-cli | test `load_fleet` | target_os = "linux" | 1 (0, 0) | all | — | n/b | n/b | n/b |
+| slates-cli | test `load_scale` | unix | 1 (0, 0) | all | — | all | n/b | n/b |
 | slates-cli | test `merge_kill` | unix | 1 (0, 1) | skips | — | skips | n/b | n/b |
-| slates-cli | test `nfs_held` | unix | 3 (0, 3) | skips | — | skips | n/b | n/b |
+| slates-cli | test `nfs_held` | unix | 4 (0, 4) | skips | — | skips | n/b | n/b |
 | slates-cli | test `nfs_v4_restart` | target_os = "linux" | 1 (0, 0) | all | — | n/b | n/b | n/b |
 | slates-cli | test `pmem` | target_os = "linux" | 6 (0, 0) | all | — | n/b | n/b | n/b |
 | slates-cli | test `shards` | windows | 1 (0, 1) | n/b | n/b | n/b | all | all |
 | slates-cli | bin `slates` | — | 0 (0, 0) | all | — | all | — | — |
+| slates-cli | test `start_judgment` | windows | 2 (0, 2) | n/b | n/b | n/b | all | all |
 | slates-cli | test `vm_harness` | target_os = "linux" | 2 (1, 0) | all | — | n/b | n/b | n/b |
-| slates-cli | test `winfsp` | windows | 14 (1, 13) | n/b | n/b | n/b | all | all |
+| slates-cli | test `winfsp` | windows | 16 (1, 15) | n/b | n/b | n/b | all | all |
 | slates-cli | test `winfsp_semantics` | windows | 7 (0, 7) | n/b | n/b | n/b | all | all |
-| slates-client | test `acknowledge` | — | 1 (0, 0) | all | — | all | — | — |
+| slates-client | test `acknowledge` | — | 2 (0, 0) | all | — | all | — | — |
 | slates-client | test `async_core` | unix | 2 (0, 0) | all | — | all | n/b | n/b |
 | slates-client | test `cipher_keys` | — | 1 (0, 0) | all | — | all | — | — |
-| slates-client | test `client` | — | 35 (0, 0) | all | part | all | all | all |
+| slates-client | test `client` | — | 38 (0, 0) | all | part | all | all | all |
 | slates-client | test `consumer` | unix | 5 (2, 0) | all | — | all | n/b | n/b |
 | slates-client | test `driver` | — | 2 (0, 0) | all | — | all | all | all |
 | slates-client | test `image` | — | 3 (0, 0) | all | — | all | — | — |
 | slates-client | test `merge_chaos` | — | 1 (0, 0) | all | — | all | — | — |
 | slates-client | test `merge_identity` | — | 1 (0, 0) | all | — | all | — | — |
+| slates-client | test `merge_post_state` | — | 2 (0, 0) | all | — | all | — | — |
 | slates-client | test `netns` | target_os = "linux" | 1 (0, 0) | all | part | n/b | n/b | n/b |
 | slates-client | test `presentation` | — | 1 (0, 0) | all | — | all | — | — |
 | slates-client | test `reap` | — | 1 (0, 0) | all | — | all | — | — |
@@ -201,10 +208,11 @@ since `landing.rs`'s Windows arm refuses `Unsupported { feature: "landing" }`.
 | slates-cluster | test `wan_election` | — | 4 (1, 0) | all | — | all | — | — |
 | slates-conformance | test `matrix` | — | 5 (1, 0) | all | — | all | — | — |
 | slates-conformance | lib | — | 0 (0, 0) | all | — | all | — | — |
+| slates-db | test `alias` | — | 5 (0, 0) | all | — | all | — | — |
 | slates-db | test `ledger` | — | 16 (0, 0) | all | — | all | — | — |
 | slates-db | test `live` | — | 10 (0, 0) | all | — | all | — | — |
 | slates-db | test `mirror` | — | 6 (0, 0) | all | — | all | — | — |
-| slates-db | test `model` | — | 14 (0, 0) | all | — | all | — | — |
+| slates-db | test `model` | — | 15 (0, 0) | all | — | all | — | — |
 | slates-db | test `promote_oracle` | — | 2 (0, 0) | all | — | all | — | — |
 | slates-db | test `publication` | — | 2 (0, 0) | all | — | all | — | — |
 | slates-db | test `reconfig` | — | 7 (0, 0) | all | — | all | — | — |
@@ -220,7 +228,7 @@ since `landing.rs`'s Windows arm refuses `Unsupported { feature: "landing" }`.
 | slates-image | test `steps` | — | 6 (0, 0) | all | — | all | — | — |
 | slates-ipc | test `delivery` | — | 5 (2, 0) | all | — | all | all | all |
 | slates-ipc | test `rendezvous` | — | 22 (0, 0) | all | part | all | all | all |
-| slates-ipc | test `rings` | — | 10 (0, 0) | all | — | all | all | all |
+| slates-ipc | test `rings` | — | 13 (0, 0) | all | — | all | all | all |
 | slates-ipc | lib | — | 0 (0, 0) | all | — | all | — | — |
 | slates-ipc | test `status` | — | 3 (0, 0) | all | — | all | — | — |
 | slates-ipc | test `stream_exec` | unix | 1 (0, 0) | all | — | all | n/b | n/b |
@@ -253,8 +261,9 @@ since `landing.rs`'s Windows arm refuses `Unsupported { feature: "landing" }`.
 | slates-mem | test `shared_region` | — | 6 (0, 0) | all | — | all | all | all |
 | slates-mem | lib | — | 0 (0, 0) | all | — | all | all | all |
 | slates-merge | test `base_for` | — | 2 (0, 0) | all | — | all | — | — |
+| slates-merge | test `checkpoint` | — | 3 (0, 0) | all | — | all | — | — |
 | slates-merge | test `derive` | — | 9 (0, 0) | all | — | all | — | — |
-| slates-merge | test `engine` | — | 45 (0, 0) | all | — | all | — | — |
+| slates-merge | test `engine` | — | 46 (0, 0) | all | — | all | — | — |
 | slates-merge | test `identity` | — | 3 (0, 0) | all | — | all | — | — |
 | slates-merge | test `increment` | — | 42 (0, 0) | all | — | all | — | — |
 | slates-merge | test `map` | — | 10 (0, 0) | all | — | all | — | — |
@@ -289,33 +298,41 @@ since `landing.rs`'s Windows arm refuses `Unsupported { feature: "landing" }`.
 | slates-rt | test `tcp` | — | 11 (0, 0) | all | — | all | all | all |
 | slates-rt | test `timer_allocations` | — | 2 (0, 0) | all | — | all | — | — |
 | slates-rt | test `timers` | — | 6 (0, 0) | all | — | all | — | — |
-| slates-rt | test `udp` | — | 13 (0, 0) | all | — | all | all | all |
+| slates-rt | test `udp` | — | 15 (0, 0) | all | — | all | all | all |
 | slates-rt | test `wake_estimate` | — | 4 (0, 0) | all | — | all | — | — |
 | slates-seal | lib | — | 8 (0, 0) | all | — | all | — | — |
 | slates-server | test `ack_release` | unix | 6 (0, 0) | all | — | all | n/b | n/b |
 | slates-server | test `attach_forms` | unix | 9 (0, 0) | all | — | all | n/b | n/b |
+| slates-server | test `attachment_term` | — | 1 (0, 0) | all | — | all | — | — |
 | slates-server | test `checkout` | unix | 3 (0, 0) | all | — | all | n/b | n/b |
+| slates-server | test `consumers` | — | 1 (0, 0) | all | — | all | — | — |
+| slates-server | test `cross_shard_wait` | — | 7 (0, 0) | all | — | all | — | — |
 | slates-server | test `daemon` | unix | 25 (0, 0) | all | — | all | n/b | n/b |
-| slates-server | test `fleet` | — | 90 (5, 0) | all | — | all | all | all |
+| slates-server | test `fleet` | — | 96 (5, 0) | all | — | all | all | all |
+| slates-server | test `forward_retry` | unix | 1 (0, 0) | all | — | all | n/b | n/b |
 | slates-server | test `fuse_idle` | target_os = "linux" | 1 (0, 0) | all | — | n/b | n/b | n/b |
 | slates-server | test `fuse_mount` | target_os = "linux" | 3 (0, 0) | all | — | n/b | n/b | n/b |
 | slates-server | test `fuse_told` | target_os = "linux" | 3 (0, 0) | all | — | n/b | n/b | n/b |
 | slates-server | test `give_back` | windows | 1 (0, 0) | n/b | n/b | n/b | all | all |
+| slates-server | test `green_checkpoint` | unix | 4 (0, 0) | all | — | all | n/b | n/b |
+| slates-server | test `green_post_state` | unix | 1 (0, 0) | all | — | all | n/b | n/b |
+| slates-server | test `green_retention` | unix | 1 (0, 0) | all | — | all | n/b | n/b |
 | slates-server | test `landing_fairness` | unix | 3 (0, 0) | all | — | all | n/b | n/b |
 | slates-server | test `lease` | unix | 1 (0, 0) | all | — | all | n/b | n/b |
 | slates-server | test `live_ship` | unix | 1 (0, 0) | all | — | all | n/b | n/b |
-| slates-server | test `liveness` | — | 5 (0, 0) | all | — | all | — | — |
-| slates-server | test `merge_load` | — | 4 (0, 0) | all | — | all | — | — |
-| slates-server | test `nfs_hostile` | — | 18 (0, 0) | all | — | all | all | all |
+| slates-server | test `liveness` | — | 7 (1, 0) | all | — | all | — | — |
+| slates-server | test `merge_load` | — | 5 (0, 0) | all | — | all | — | — |
+| slates-server | test `nfs_hostile` | — | 19 (0, 0) | all | — | all | all | all |
 | slates-server | test `nfs_mount` | unix | 40 (0, 0) | all | — | all | n/b | n/b |
 | slates-server | test `nfs_tls` | — | 8 (0, 0) | all | — | all | all | all |
 | slates-server | test `nfs_v4_kernel` | unix | 1 (0, 0) | all | — | all | n/b | n/b |
 | slates-server | test `nfs_writeback` | — | 7 (0, 0) | all | — | all | all | all |
 | slates-server | test `observe` | — | 8 (0, 0) | all | — | all | all | — |
-| slates-server | test `recovery` | unix | 45 (0, 0) | all | — | all | n/b | n/b |
+| slates-server | test `pin_fairness` | unix | 1 (0, 0) | all | — | all | n/b | n/b |
+| slates-server | test `recovery` | unix | 48 (0, 0) | all | — | all | n/b | n/b |
 | slates-server | test `seal` | — | 2 (0, 0) | all | — | all | — | — |
 | slates-server | test `shards` | unix | 28 (1, 0) | all | — | all | n/b | n/b |
-| slates-server | lib | — | 0 (0, 0) | all | — | all | all | all |
+| slates-server | lib | — | 0 (0, 0) | all | — | all | — | — |
 | slates-server | test `snapshot_landing` | unix | 3 (0, 0) | all | — | all | n/b | n/b |
 | slates-server | test `virtiofs` | unix | 30 (1, 0) | all | — | all | n/b | n/b |
 | slates-test-seeds | lib | — | 4 (0, 0) | all | — | all | — | — |
@@ -324,6 +341,7 @@ since `landing.rs`'s Windows arm refuses `Unsupported { feature: "landing" }`.
 | slates-transport | test `exchanges` | — | 5 (0, 0) | all | — | all | — | — |
 | slates-transport | test `handshake_levels` | — | 4 (0, 0) | all | — | all | — | — |
 | slates-transport | test `key_update` | — | 1 (0, 0) | all | — | all | — | — |
+| slates-transport | test `receive_refusal` | — | 3 (0, 0) | all | — | all | — | — |
 | slates-transport | test `session` | — | 17 (0, 0) | all | — | all | — | — |
 | slates-transport | lib | — | 0 (0, 0) | all | — | all | — | — |
 | slates-vfs | test `allocate` | — | 5 (0, 0) | all | — | all | — | — |
@@ -338,7 +356,7 @@ since `landing.rs`'s Windows arm refuses `Unsupported { feature: "landing" }`.
 | slates-vfs | test `clones` | — | 1 (0, 0) | all | — | all | — | — |
 | slates-vfs | test `content_in_place` | — | 18 (0, 0) | all | — | all | — | — |
 | slates-vfs | test `counter_reserve` | — | 3 (0, 0) | all | — | all | — | — |
-| slates-vfs | test `coverage` | — | 3 (0, 0) | all | — | all | — | — |
+| slates-vfs | test `coverage` | — | 5 (0, 0) | all | — | all | — | — |
 | slates-vfs | test `delta_cost` | — | 5 (0, 0) | all | — | all | — | — |
 | slates-vfs | test `derive` | — | 8 (0, 0) | all | — | all | — | — |
 | slates-vfs | test `differential` | unix | 3 (0, 0) | all | — | all | n/b | n/b |
@@ -347,6 +365,7 @@ since `landing.rs`'s Windows arm refuses `Unsupported { feature: "landing" }`.
 | slates-vfs | test `entitlement` | — | 3 (0, 0) | all | — | all | — | — |
 | slates-vfs | test `image` | — | 6 (0, 0) | all | — | all | — | — |
 | slates-vfs | test `image_cost` | — | 1 (0, 0) | all | — | all | — | — |
+| slates-vfs | test `journal_cost` | — | 1 (0, 0) | all | — | all | — | — |
 | slates-vfs | test `lifetime` | — | 14 (0, 0) | all | — | all | — | — |
 | slates-vfs | test `metadata` | — | 1 (0, 0) | all | — | all | — | — |
 | slates-vfs | test `model` | — | 13 (1, 0) | all | — | all | — | — |

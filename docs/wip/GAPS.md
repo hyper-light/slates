@@ -1,10 +1,10 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
 > **CI coverage on every platform (2026-11-06, VFS plan Step 15).** `docs/wip/ci-matrix.md` lists every test target of
-> the workspace (301: lib, bin and tests) against the lanes that run it.
-> - **Now run on both Windows lanes:** `slates-server`'s unit tests (two landing tests fail there until the Windows landing
->   writer lands, winfsp-bench's port of `agents/windows-land-wip`; the step lands with it) and `crates/server/tests/fleet.rs`, which was `cfg(unix)` as a whole. Only its virtio-fs guest test stays
->   Unix-only. Both run one test at a time. On CI's Windows runners (4 logical CPUs, 16 GB each; diagnostics run
+> the workspace (319: lib, bin and tests) against the lanes that run it.
+> - **Now run on both Windows lanes:** `crates/server/tests/fleet.rs`, which was `cfg(unix)` as a whole. Only its
+>   virtio-fs guest test stays Unix-only, and it runs one test at a time. `slates-server`'s unit tests join it with the
+>   Windows landing writer (two landing tests fail there until it lands; the step is `agents/release-wincov-lib`). On CI's Windows runners (4 logical CPUs, 16 GB each; diagnostics run
 >   42340483175, 2026-11-07), the fleet suite passed whole on both architectures: 85 passed, 3 ignored, in 418 s
 >   (x86_64) and 365 s (arm64). This was with liveness's UDP-reset fix merged in.
 > - **Open: six fleet tests fail on jupiter** (Windows x86_64, 32 logical CPUs, 128 GB, other projects running,
@@ -33,8 +33,8 @@
 >   - `live_fleet`: no lane sets `SLATES_TEST_CLI` for it; a Linux step in `gates` on main and the nightly.
 >   - `live_chaos`: the nightly on ubuntu, after `ulimit -n "$(ulimit -Hn)"` (a systemd unit's 1,024 descriptors failed
 >     it).
->   - ubuntu arm64: 283 of 288 targets; one `cargo test --workspace` step in `linux-arm64`.
->   - Windows x64 and arm64: 206 and 207 of 247 targets (the pure crates among them); one `cargo test --workspace --lib
+>   - ubuntu arm64: 299 of 304 targets; one `cargo test --workspace` step in `linux-arm64`.
+>   - Windows x64 and arm64: 217 and 216 of 258 targets (the pure crates among them); one `cargo test --workspace --lib
 >     --bins --tests --exclude slates-cli -- --test-threads=1` step in `windows-nightly` and `windows-arm64`, after a jupiter
 >     run of it.
 > - **Owed:** the table as a `cargo xtask` doc-truth check, so a target no lane runs fails CI.
