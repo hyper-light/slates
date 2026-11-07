@@ -1210,6 +1210,16 @@ fn dispatch(state: &mut ShardState, sends: Vec<Send>) {
       let Some(live) = state.live.shipping.get_mut(&send.object.0) else {
         return false;
       };
+      if let Some(began) = live.lanes.get(&send.holder)
+        && now.saturating_sub(*began) >= expiry
+        && !opened.contains(&(send.object, send.holder))
+      {
+        slates_machine::log_line!(
+          "LANEPROBE lane EXPIRED holder={:?} age_ms={}",
+          send.holder,
+          now.saturating_sub(*began) / 1_000_000
+        );
+      }
       let busy = live
         .lanes
         .get(&send.holder)
@@ -1278,10 +1288,18 @@ fn lane_ended(state: &mut ShardState, holder: HostId, objects: Vec<ObjectId>, an
 async fn send_from_control(origin: u16, control: u16, sends: Vec<Send>) {
   let budget = crate::fleet::live_budget();
   let deadline = budget.max_deadline_ns().saturating_mul(2);
-  let _ = crate::xshard::task_within(
+  let dispatched = slates_rt::futures::now_ns();
+  let outcome = crate::xshard::task_within(
     origin,
     control,
     move || async move {
+      let queued = slates_rt::futures::now_ns().saturating_sub(dispatched);
+      if queued >= 50_000_000 {
+        slates_machine::log_line!(
+          "LANEPROBE dispatch started late queued_ms={}",
+          queued / 1_000_000
+        );
+      }
       drain_stragglers();
       let mut lanes: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>> = Vec::new();
       for (holder, sends) in by_holder(sends) {
@@ -1292,6 +1310,9 @@ async fn send_from_control(origin: u16, control: u16, sends: Vec<Send>) {
     deadline,
   )
   .await;
+  if outcome.is_none() {
+    slates_machine::log_line!("LANEPROBE dispatch refused or timed out");
+  }
 }
 
 /// `sends` grouped by holder, each holder's in the order they were made (the order its session carries them).
@@ -1339,9 +1360,23 @@ async fn ship_to_holder(
   let answered = ship_lane(origin, holder, sends, budget).await;
   // After the lane's own folds, so the owner sends what the holder lacks given its last answer.
   let control = state::with_state(|s| s.shard).unwrap_or(origin);
-  crate::xshard::run_on_counted(control, origin, move |s| {
+  let began = slates_rt::futures::now_ns();
+  if crate::xshard::run_on(control, origin, move |s| {
+    let waited = slates_rt::futures::now_ns().saturating_sub(began);
+    if waited >= 50_000_000 {
+      slates_machine::log_line!(
+        "LANEPROBE lane_ended late holder={holder:?} waited_ms={}",
+        waited / 1_000_000
+      );
+    }
     lane_ended(s, holder, objects, answered);
-  });
+  })
+  .is_err()
+  {
+    slates_machine::log_line!(
+      "LANEPROBE lane_ended REFUSED holder={holder:?} control={control} origin={origin}"
+    );
+  }
 }
 
 /// The messages of one lane in turn ([`ship_to_holder`]): whether the holder answered every one it was sent.
@@ -1351,8 +1386,13 @@ async fn ship_lane(
   sends: Vec<Send>,
   budget: slates_cluster::CommitBudget,
 ) -> bool {
+  let lane_began = slates_rt::futures::now_ns();
+  let lane_sends = sends.len();
   for send in sends {
+    let t0 = slates_rt::futures::now_ns();
     let sessions = borrow_session(holder, budget.max_deadline_ns()).await;
+    let t1 = slates_rt::futures::now_ns();
+    let had_session = !sessions.is_empty();
     // Each message under its own budget: the liveness budget plus its transfer on the session it rides, so an install
     // of the whole volume is not given up the moment an entry would be (`exchange_budget`).
     let exchange = exchange_budget(send.bytes.len(), &sessions);
@@ -1360,6 +1400,7 @@ async fn ship_lane(
       slates_cluster::live::exchange((send.stream, &send.bytes), sessions, exchange, |_, _| true)
         .await;
     let answered = !exchanged.replies.is_empty();
+    let t2 = slates_rt::futures::now_ns();
     if !answered {
       let _ = state::with_state(|s| {
         s.count(LIVE_UNANSWERED, 1);
@@ -1377,10 +1418,25 @@ async fn ship_lane(
       .collect();
     if !replies.is_empty() {
       let control = state::with_state(|s| s.shard).unwrap_or(origin);
-      crate::xshard::run_on_counted(control, origin, move |s| fold_into(s, replies));
+      if crate::xshard::run_on(control, origin, move |s| fold_into(s, replies)).is_err() {
+        slates_machine::log_line!("LANEPROBE fold REFUSED holder={holder:?}");
+      }
     }
     // After the answers are on their way to the owner, so durability waits for no straggler.
     finish_stragglers(origin, send.object, exchanged.stragglers).await;
+    let t3 = slates_rt::futures::now_ns();
+    if t3.saturating_sub(t0) >= 100_000_000 {
+      slates_machine::log_line!(
+        "LANEPROBE step t={}ms holder={holder:?} stream={} bytes={} session={had_session} borrow_ms={} exchange_ms={} stragglers_ms={} answered={answered} lane_age_ms={} lane_sends={lane_sends}",
+        t3 / 1_000_000 % 100_000,
+        send.stream,
+        send.bytes.len(),
+        t1.saturating_sub(t0) / 1_000_000,
+        t2.saturating_sub(t1) / 1_000_000,
+        t3.saturating_sub(t2) / 1_000_000,
+        t3.saturating_sub(lane_began) / 1_000_000
+      );
+    }
     if !answered {
       return false;
     }
