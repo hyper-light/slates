@@ -6,3 +6,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 16 filtered out; fin
 rejoins: successor daemon 12817 answered after 42.773083ms
 rejoins: the fleet re-formed after 1.469812542s
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 16 filtered out; finished in 6.32s
+=== rejoin-3 exit 0 load { 18.49 12.98 6.13 }
+rejoins: successor daemon 13220 answered after 41.621667ms
+rejoins: the fleet re-formed after 329.999792ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 16 filtered out; finished in 5.22s
