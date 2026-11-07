@@ -191,6 +191,11 @@ pub(crate) struct LiveVolume {
   /// A transition target the catalog has been asked to record, and the catalog version that records it: the shipper
   /// activates it once that version is placed ([`follow_candidates`]).
   recording: Option<(u64, Vec<HostId>)>,
+  /// Whether this shipper's record has been placed once, so it may ship ([`holders_placed`]): A-240 needs the record
+  /// placed before the first entry only. Once open the gate stays open, or a shipper whose own placement view goes stale
+  /// (an owner resumed after its takeover) stops shipping, never meets a holder's fence, and answers nothing and refuses
+  /// nothing.
+  shipping_open: bool,
 }
 
 /// What a candidate keeps of one live volume.
@@ -876,6 +881,7 @@ pub(crate) fn published(
       kept: 0,
       recorded: None,
       recording: None,
+      shipping_open: false,
     });
   follow_candidates(state, id.bytes);
   let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
@@ -1278,20 +1284,32 @@ const LIVE_HOLDERS_UNRECORDED: &str = "fleet.live.holders_unrecorded";
 const LIVE_HOLDERS_RECORDED: &str = "fleet.live.holders_recorded";
 
 /// Whether `volume`'s shipper may ship (A-240): its epoch and holders are recorded in the volume's catalog and that
-/// catalog version is placed at `f + 1`, as a head is (at `f = 0` the owner's own commit places it, [`head_placed`]).
+/// catalog version has been placed at `f + 1` once, as a head is (at `f = 0` the owner's own commit places it, [`head_placed`]).
 /// Records them first when this shipper has not yet. A takeover's phase one counts its `f + 1` reports among the
 /// holders the adopted catalog names; a shipper that shipped before its holders were placed could leave the log on
 /// hosts no successor counts. In the model a fresh member counted in a holder's place let a stale head commit (10 of
 /// 400 seeds, `crates/db/tests/live.rs`), and on KIND a holder kept fence 1 after a takeover at epoch 2 (runs
 /// 42326682216, `wan-loss` and `ceiling`, and 42331191530, `ceiling`).
 fn holders_placed(state: &mut ShardState, volume: [u8; 16]) -> bool {
-  let Some(recorded) = state.live.shipping.get(&volume).map(|live| live.recorded) else {
+  let Some((recorded, open)) = state
+    .live
+    .shipping
+    .get(&volume)
+    .map(|live| (live.recorded, live.shipping_open))
+  else {
     return false;
   };
+  if open {
+    return true;
+  }
   let Some(recorded) = recorded.or_else(|| record_holders(state, volume)) else {
     return false;
   };
-  catalog_placed_at(state, volume, recorded)
+  let placed = catalog_placed_at(state, volume, recorded);
+  if placed && let Some(live) = state.live.shipping.get_mut(&volume) {
+    live.shipping_open = true;
+  }
+  placed
 }
 
 /// Records `volume`'s shipper's epoch and holders in its catalog (`Op::LiveHoldersCommitted`, A-240) and returns the
