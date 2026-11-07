@@ -1,0 +1,57 @@
+name: diag-live-durability
+
+# Diagnostics only, never on main (A-200, item 2): raft-chaos's quiet-fleet flow (no chaos) three times in debug, with
+# temporary logs of each live write's deferral (its target, the log's head and durable position, whether the head is
+# placed, the lanes) and its answer, to find what a quiet write waits hundreds of milliseconds for. Results to
+# diag-results/live-durability-6-<os> by git push.
+on:
+  push:
+    branches: ["diag-live-durability-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  SLATES_TEST_CLI: "1"
+
+jobs:
+  linux:
+    name: A-200 quiet fleet waits (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked -p slates-cli --bin slates --test live_chaos
+      - name: The quiet flow, three runs
+        run: |
+          R=../results.txt
+          echo "runner ${{ matrix.os }}, $(nproc) CPUs, $(date -u), tree $(git rev-parse HEAD)" > $R
+          for n in 1 2 3; do
+            status=0
+            timeout 900 cargo test --locked -p slates-cli --test live_chaos -- --nocapture --test-threads=1 writes_stream_on_a_quiet_fleet > ../run.log 2>&1 || status=$?
+            echo "== run $n exit $status, load $(cut -d' ' -f1-3 /proc/loadavg)" | tee -a $R
+            grep -E '^  [0-9]+ writes|panicked at|test result' ../run.log | sort -u | cut -c1-600 | tee -a $R
+            grep -E "TEMP [0-9]+ (defer|answer|resolve|borrow)" ../run.log | cut -c1-300 >> $R
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/live-durability-6-${{ matrix.os }}"
+          git config user.name "diag-live-durability"
+          git config user.email "diag-live-durability@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-live-durability-6 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
