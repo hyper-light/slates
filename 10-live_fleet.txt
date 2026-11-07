@@ -1,0 +1,47 @@
+test a_destroyed_live_volumes_copies_are_let_go_by_its_candidates ... ok
+live fsync: healthy Ok(()); candidates stopped Err(Os { code: 5, kind: Uncategorized, message: "Input/output error" }) after 1.078556671s; resumed Ok(()); owner's live counters {"appended": 4, "durable": 4, "link_lost": 1, "no_session": 23, "unanswered": 13, "whole": 2}
+test a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+live keyed: created c49d851b2eaed84f0000000000000019 after 258.997555ms
+live keyed: c49d851b2eaed84f0000000000000019's successor is the stopped node, after 259.052046ms
+live keyed: live-shipped and writing, after 259.144328ms
+live keyed: the writes returned while the candidate was stopped: false; served whole by live-keyed-b-17819 after 13.222418075s
+test a_live_volume_made_while_its_successor_was_stopped_is_served_by_it ... ok
+live takeover: served whole by live-takeover-c-17819 after 2.200490273s; taken_over=1 fetched=1; [("live-takeover-a-17819", {"fetched": 1, "held": 6, "hold_refused": 1, "hold_refused.no_catalog": 1}), ("live-takeover-c-17819", {"held": 6, "hold_refused": 1, "hold_refused.no_catalog": 1, "taken_over": 1})]
+test a_live_volumes_acknowledged_writes_survive_its_owners_death ... ok
+live changes: 200 writes: {"appended": 201, "durable": 201, "no_session": 7, "resolved": 201, "whole": 1}
+test a_live_volumes_writes_ship_their_changes_not_the_volume ... ok
+live bound: 768 writes, all answered true: [("live-bound-a-17819", {"held": 791, "hold_refused": 1, "hold_refused.no_catalog": 1}), ("live-bound-b-17819", {"appended": 769, "durable": 769, "no_session": 24, "resolved": 769, "whole": 4}), ("live-bound-c-17819", {"held": 791, "hold_refused": 1, "hold_refused.no_catalog": 1})]
+test a_long_writer_keeps_the_candidates_copies_within_their_bound ... ok
+live pause: writes while paused [572.267354ms, 11.923522ms, 11.491763ms, 12.030708ms]; at return Some(("4", "4", "false")); then Some(("4", "4", "false")) [Some(("4", "none", "false")), Some(("4", "none", "false"))]
+test a_paused_candidate_neither_stops_writes_nor_stays_behind ... ok
+live nfs: after each write [Some(("1", "1", "false")), Some(("2", "2", "false")), Some(("3", "3", "false")), Some(("4", "4", "false")), Some(("5", "5", "false"))] late=0
+test a_stable_nfs_write_to_a_live_volume_is_answered_once_a_candidate_holds_it ... ok
+live empty successor live-empty-a-17819: served by Some("live-empty-a-17819"); [("live-empty-a-17819", {"hold_refused": 1, "hold_refused.no_catalog": 1, "taken_over": 1}), ("live-empty-b-17819", {"fetched": 1, "held": 9})]
+test a_successor_that_holds_no_copy_still_takes_a_live_volume_over ... ok
+live fence: the old owner's live counters {"appended": 4, "awaited": 4, "durable": 3, "fenced": 1, "resolved": 4, "whole": 1}, its log Some(("3", "2", "false"))
+live fence: taken over by live-fence-c-17819 after 2.163676957s; stale write outcome Some(Some(1)); successor read of /stale: 1 ""
+test a_superseded_owner_resumed_after_its_takeover_is_fenced ... ok
+forming: the bootstrap node's council held Some(1) voters when the owner was killed
+live bootstrap: written=false caught_up=true shipping=Some(("1", "1", "false")) held=[Some(("1", "none", "false")), Some(("1", "none", "false"))] [("live-bootstrap-a-17819", {"appended": 2, "awaited": 1, "durable": 2, "holders_changed": 1, "no_session": 1, "whole": 2}), ("live-bootstrap-b-17819", {"held": 2, "hold_refused": 8, "hold_refused.not_a_member": 8}), ("live-bootstrap-c-17819", {"held": 2, "hold_refused": 12, "hold_refused.not_a_member": 12})]
+thread 'a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates' (18021) panicked at crates/cli/tests/live_fleet.rs:1901:3:
+test a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates ... FAILED
+forming: served by forming-b-17819 after 1.833069939s
+test an_owner_killed_while_its_fleet_still_forms_is_taken_over ... ok
+test measure_what_live_shipping_adds_to_a_stable_nfs_write ... ok
+live cut: Some(("9", "9", "false")) [Some(("9", "none", "false")), Some(("9", "none", "false"))] awaited=10 resolved=10 unrecorded=0
+test clients_cut_off_mid_write_leave_the_live_log_whole ... ok
+thread '<unnamed>' (18153) panicked at crates/cli/tests/live_fleet.rs:764:7:
+live fleet: shipping(head, durable, owed)=Some(("4", "4", "false")) held=[Some(("4", "none", "false")), Some(("4", "none", "false"))] appended=5 refused=0 hold_refused=[1, 1]
+test three_daemon_processes_ship_a_live_volumes_writes_to_both_candidates ... ok
+live stall: 30 writes, client-seen latency p50 55.324958ms p90 57.681092ms max 58.369105ms; at return Some(("30", "30", "false")); then Some(("30", "30", "false")) [Some(("30", "none", "false")), Some(("30", "none", "false"))]; over_bound=0
+test writes_stay_durable_through_injected_candidate_stalls ... ok
+test result: FAILED. 15 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 50.24s
+thread 'a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates' (18021) panicked at crates/cli/tests/live_fleet.rs:1901:3:
+the bootstrap node's live writes became durable and both candidates hold them: Some(("1", "1", "false")) [Some(("1", "none", "false")), Some(("1", "none", "false"))] [("live-bootstrap-a-17819", {"appended": 2, "awaited": 1, "durable": 2, "holders_changed": 1, "no_session": 1, "whole": 2}), ("live-bootstrap-b-17819", {"held": 2, "hold_refused": 8, "hold_refused.not_a_member": 8}), ("live-bootstrap-c-17819", {"held": 2, "hold_refused": 12, "hold_refused.not_a_member": 12})]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates ... FAILED
+--
+thread '<unnamed>' (18153) panicked at crates/cli/tests/live_fleet.rs:764:7:
+assertion `left == right` failed: write /file-0: slates: no daemon at instance live-bootstrap-a-17819: daemon gone for 2000000000 ns (is `slates anchor` running?)
+
+  left: 3
