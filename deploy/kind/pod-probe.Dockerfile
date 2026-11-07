@@ -4,6 +4,8 @@
 #   file through kubelet's NFS mount and waits for another path's change: the mount route.
 # - `slates-pod-direct-probe` (`crates/cli/examples/pod_direct_probe.rs`; `cargo xtask kind direct`) maps a file by the
 #   direct map from a container of the daemon's pod and says whether the map is zero-copy: the socket route.
+# - `slates-pod-live-probe` (`crates/cli/examples/pod_live_probe.rs`; `cargo xtask kind live`) streams timed writes to a
+#   live-shipped volume from a container of its owner's pod, and reads them back after a takeover.
 #
 # Built from the repository root like the slates image (`Dockerfile`), with the same toolchain and the same cache
 # mounts, so the lane's second build reuses the first's dependencies. The runtime base is the slates image's, for the
@@ -19,10 +21,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/work/target,sharing=locked \
     RUSTUP_TOOLCHAIN=1.98.1 cargo build --release --locked -p slates-guest-probe --bin slates-pod-probe \
     && RUSTUP_TOOLCHAIN=1.98.1 cargo build --release --locked -p slates-cli --example pod_direct_probe \
+    && RUSTUP_TOOLCHAIN=1.98.1 cargo build --release --locked -p slates-cli --example pod_live_probe \
     && cp target/release/slates-pod-probe /slates-pod-probe \
-    && cp target/release/examples/pod_direct_probe /slates-pod-direct-probe
+    && cp target/release/examples/pod_direct_probe /slates-pod-direct-probe \
+    && cp target/release/examples/pod_live_probe /slates-pod-live-probe
 
 FROM gcr.io/distroless/cc-debian13:nonroot
 COPY --from=build /slates-pod-probe /slates-pod-probe
 COPY --from=build /slates-pod-direct-probe /slates-pod-direct-probe
+COPY --from=build /slates-pod-live-probe /slates-pod-live-probe
 ENTRYPOINT ["/slates-pod-probe"]

@@ -104,6 +104,12 @@ fn read_all(client: &mut Client, volume: VolumeId, round: u8) {
 /// in each round the working set falls by at least 90% of the bytes deleted, within the bound, with the daemon's own
 /// count of pages given back reaching the same share (`content.purged_bytes`); and every byte of every recreated
 /// file reads back as written, with the working set back up by at least half of them, so the reused pages count again.
+///
+/// A-214's reserve (the free pages an idle shard keeps pre-faulted for its last write burst) is accounted for by its
+/// own rule: the delete's busy period takes what it freed off the burst, so after a round's delete the reserve is empty
+/// and the 90% holds for every deleted byte. This test failed on both Windows lanes when the burst ignored frees (main CI
+/// 42119714654); `a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it` in `recovery.rs` holds the same
+/// rule on Linux.
 #[test]
 fn a_deleted_files_memory_leaves_the_working_set_and_recreating_it_reads_every_byte() {
   let profile = common::machine_profile();

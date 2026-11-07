@@ -55,6 +55,9 @@ pub struct ClientSlot {
   /// to its window when a batch is delivered, and credited with the client when it goes — so a batch whose reply
   /// was never carried home (`crate::xshard::send_back`) holds its charge no longer than its client.
   pub(crate) read_ahead_pending: u64,
+  /// The volumes of other hosts this client asked for an attachment of in the record form (A-222), so its reap ends
+  /// them at their owners (`crate::remote_attach::reap_at_owners`). Bounded by `crate::remote_attach::bound`.
+  pub(crate) remote_volumes: Vec<slates_ipc::protocol::VolumeId>,
 }
 
 impl std::fmt::Debug for ClientSlot {
@@ -217,6 +220,15 @@ pub struct ShardState {
   /// The content arena's allocation count at the last reap tick: unchanged at the next means the shard allocated
   /// nothing in between, so its free blocks can go back to the OS (A-105, `daemon::purge_if_idle`).
   pub(crate) purge_seen_allocations: u64,
+  /// The content arena's allocation count and allocated bytes at the last idle reap tick (A-214), `None` before the
+  /// first: a later idle tick with another count ends a busy period, whose net growth is the allocated bytes' rise.
+  pub(crate) burst_seen: Option<(u64, usize)>,
+  /// The net growth of the content arena's allocated bytes over its last busy period (A-214): the write burst an idle
+  /// shard keeps free pages pre-faulted for (`daemon::purge_if_idle`).
+  pub(crate) last_burst: usize,
+  /// The content arena's allocation count when the reserve's refill last found nothing to fault (A-214): until the
+  /// arena allocates again, or the burst measure moves, an idle moment's refill has nothing to do.
+  pub(crate) refill_settled: Option<u64>,
   /// The journal generation whose dead recovery memory an idle shard last gave back (A-117,
   /// `daemon::return_dead_recovery`): a later publication moves the generation and re-arms the return.
   pub(crate) recovery_returned_at: Option<u64>,
@@ -644,6 +656,8 @@ pub struct ShardState {
   pub nfs_service: crate::nfs::ServiceTimes,
   /// The NFSv4.1 back channels of the connections this shard serves (`crate::callback`).
   pub(crate) callbacks: crate::callback::Callbacks,
+  /// The forwards to each peer, multiplexed over its record session (`crate::forward_lane`; the control shard's).
+  pub(crate) forward_lanes: crate::forward_lane::ForwardLanes,
   /// The staging buffers of edits too large for one request, for the works this shard owns (`crate::staging`).
   pub(crate) staging: crate::staging::Staging,
   /// This start's random nonce, announced with its derived member id on SWIM contact (§4.8).

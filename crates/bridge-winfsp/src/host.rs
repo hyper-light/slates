@@ -323,8 +323,12 @@ impl<T> Op<T> {
 
 /// The shard's reply to an [`Op`].
 enum Reply {
-  /// The last context visited by a cooperative name update, or None when all live contexts were visited.
-  RenamedName(Option<u64>),
+  /// A cooperative name update's turn: the context it renamed (None when no open was beneath the old name), and whether
+  /// any open is still beneath it, so the receiver asks for no turn only to learn that none is left.
+  RenamedName {
+    renamed: Option<u64>,
+    more: bool,
+  },
   Volume {
     total: u64,
     free: u64,
@@ -360,6 +364,9 @@ pub struct Request {
   op: Op<u64>,
   reply: SyncSender<Reply>,
   hint: u64,
+  /// Whether recovery is replaying this request from a dead daemon's journal (`crate::dispatcher`), so a Close the
+  /// dead daemon already applied may be found done.
+  replayed: bool,
 }
 
 impl Request {
@@ -413,6 +420,10 @@ impl Request {
       Op::Release { object } => Some(*object),
       _ => None,
     };
+    // A replayed Release (a Close) ends an open the dead daemon may already have ended: it served the Close, retired
+    // the open, and died before acknowledging it. Its open being gone is then the Close done, not a refusal. A Cleanup
+    // retires nothing, so a replayed Cleanup's stale context stays a refusal.
+    let ends_open = closed.is_some();
     let refused = admission_refusal(&self.op, names, ledger);
     let bound = bind(self.op, ledger);
     let barrier = bound.as_ref().is_ok_and(|op| {
@@ -425,6 +436,12 @@ impl Request {
       (Ok(_op), Some(refusal)) => Reply::Err(ntstatus(&refusal).as_i32()),
       (Ok(op), None) => {
         run(bridge, cx, op).unwrap_or_else(|error| Reply::Err(ntstatus(&error).as_i32()))
+      }
+      (Err(crate::opens::Refusal::Stale), _) if self.replayed && ends_open => {
+        slates_machine::log_line!(
+          "slates-winfsp: a replayed close found its open already ended: answered done"
+        );
+        Reply::Ok
       }
       (Err(error), _) => {
         slates_machine::log_line!("slates-winfsp: context refused: {error}");
@@ -460,7 +477,10 @@ fn rename_one_name(
   to: &str,
 ) -> Reply {
   let Some((context, inode)) = names.first_beneath(from) else {
-    return Reply::RenamedName(None);
+    return Reply::RenamedName {
+      renamed: None,
+      more: false,
+    };
   };
   let result = ledger
     .rename_name(context, from, to)
@@ -468,7 +488,10 @@ fn rename_one_name(
   match result {
     Ok(name) => {
       names.opened(context, inode, &name);
-      Reply::RenamedName(Some(context))
+      Reply::RenamedName {
+        renamed: Some(context),
+        more: names.first_beneath(from).is_some(),
+      }
     }
     Err(error) => {
       slates_machine::log_line!("slates-winfsp: durable kernel rename refused: {error}");
@@ -1092,6 +1115,7 @@ fn call_on(requests: &SyncSender<Request>, wake: &Waker, op: Op<u64>) -> Reply {
       op,
       reply,
       hint: crate::dispatcher::current_hint(),
+      replayed: crate::dispatcher::replaying(),
     })
     .is_err()
   {
@@ -1139,8 +1163,11 @@ pub(crate) fn rename_open_names(
         to: to.to_owned(),
       },
     ) {
-      Reply::RenamedName(None) => return Ok(()),
-      Reply::RenamedName(Some(context)) if previous != Some(context) => previous = Some(context),
+      Reply::RenamedName { more: false, .. } => return Ok(()),
+      Reply::RenamedName {
+        renamed: Some(context),
+        more: true,
+      } if previous != Some(context) => previous = Some(context),
       Reply::Err(status) => {
         return Err(WinFspError::Api {
           call: "record kernel rename",
@@ -2099,8 +2126,15 @@ pub enum Outcome {
   Purged(Purged),
   /// The receive worker ended before the mount was intentionally stopped.
   Failed(WinFspError),
-  /// The receive journal was settled before any fresh receive. The owner counts it; the taken-read oracle requires it.
-  Recovered(u64),
+  /// The receive journal was settled before any fresh receive: how many captured requests were answered, and how many
+  /// of those were a replayed Cleanup or Close the file system refused. The owner counts both; the taken-request
+  /// oracles require the first and the replayed-Close oracle requires the second to be zero.
+  Recovered {
+    /// Captured requests answered.
+    settled: u64,
+    /// Of those, the replayed Cleanups and Closes the file system refused.
+    refused: u64,
+  },
   /// The file system is unmounted and deleted; the thread is ending.
   Stopped,
 }

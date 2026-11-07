@@ -407,7 +407,12 @@ so it runs on Docker Desktop too.
 - **Limit:** a pod in a network namespace of its own cannot reach the daemon's abstract socket at all; that needs a
   rendezvous it can reach (GAPS, the DAX matrix's entry).
 
-## The one gap left — a whole-pod restart does not rejoin (open; not the cause first recorded)
+## A whole-pod restart did not rejoin (closed; the history is kept below)
+
+> **Reconciled 2026-11-06 (VFS plan Step 15).** Closed: the replacement rejoins at its new IP (the header above, verified
+> 2026-09-15; 8a3bc497, the membership plane re-resolves a moved peer and judges only an addressable one; GAPS, CI job
+> 105312670637, rejoin in 2.2 s). The section below is the record of how it was diagnosed. Still owed: the in-pod
+> mount's read-back after a takeover (the last paragraph).
 
 When the owner's pod is deleted, the StatefulSet recreates it under the same name at a new IP. The
 replacement boots at incarnation 0 with the same manifest seed member id its predecessor held (a pod

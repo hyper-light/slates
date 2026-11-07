@@ -256,8 +256,11 @@ pub struct Admitted<T> {
 /// the budget, which an uncontended shard does at the wall clock's pace. A reading at or below the mark (a thread id the
 /// OS reused once the shard's thread had ended, which reads lower) ends it too. Under Miri, which has no thread
 /// clock, the wall budget stands alone.
+///
+/// A cross-shard call's wait judged in its target's own time uses the same rule (`crate::xshard::within_shard_time`,
+/// the R3 debt's class A).
 #[derive(Clone, Copy, Debug)]
-struct ShardTime {
+pub(crate) struct ShardTime {
   holder: SlotHolder,
   budget_ns: u64,
   /// The CPU time the shard had run when the observation began.
@@ -267,7 +270,7 @@ struct ShardTime {
 }
 
 impl ShardTime {
-  fn new(holder: SlotHolder, budget_ns: u64) -> Self {
+  pub(crate) fn new(holder: SlotHolder, budget_ns: u64) -> Self {
     let began = slates_rt::registry::shard_cpu(holder);
     ShardTime {
       holder,
@@ -280,6 +283,13 @@ impl ShardTime {
   /// The next wall deadline when the shard worked through the window just ended within its budget; `None` ends the
   /// observation.
   fn extend(&mut self) -> Option<Instant> {
+    Instant::now().checked_add(Duration::from_nanos(self.next_window_ns()?))
+  }
+
+  /// The next window's wall length when the shard worked through the window just ended within its budget: the budget
+  /// it has not yet run. `None` ends the wait: the shard made no progress in the window, it has run its budget, or its
+  /// clock cannot be read.
+  pub(crate) fn next_window_ns(&mut self) -> Option<u64> {
     let now = slates_rt::registry::shard_cpu(self.holder)?;
     let unspent = self
       .budget_ns
@@ -291,7 +301,7 @@ impl ShardTime {
     self.mark = Some(now.progress);
     // The budget the shard has not yet run, as wall time: an uncontended shard runs at the wall clock's pace and has
     // next to none left; a starved one has most of it.
-    Instant::now().checked_add(Duration::from_nanos(unspent))
+    Some(unspent)
   }
 }
 

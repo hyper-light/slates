@@ -991,6 +991,45 @@ impl Volume {
   }
 }
 
+/// A pin in progress (§4.4 `pin`; [`Overlay::pin_unit`]): the directories still to list, by absolute path, and the
+/// files listed and not yet pinned, by inode number, so a walk stepped a slice at a time holds no handle between its
+/// slices. Its size is the walk's frontier: the subdirectories of the directories listed so far and the files of the
+/// last listing, never the tree.
+#[derive(Debug, Default)]
+pub struct PinWalk {
+  dirs: Vec<String>,
+  files: Vec<InodeNo>,
+  pinned: usize,
+}
+
+impl PinWalk {
+  /// A walk of the named subtrees, or of the whole base when none are named.
+  pub fn new(paths: Option<&[String]>) -> PinWalk {
+    let mut dirs: Vec<String> = paths.map_or_else(|| vec!["/".to_owned()], <[String]>::to_vec);
+    // Popped from the end: reversed, so the named subtrees are walked in the order named.
+    dirs.reverse();
+    PinWalk {
+      dirs,
+      files: Vec::new(),
+      pinned: 0,
+    }
+  }
+
+  /// The files pinned so far.
+  pub fn pinned(&self) -> usize {
+    self.pinned
+  }
+}
+
+/// The absolute path of `name` in the directory at `parent`.
+fn child_path(parent: &str, name: &str) -> String {
+  if parent.ends_with('/') {
+    format!("{parent}{name}")
+  } else {
+    format!("{parent}/{name}")
+  }
+}
+
 /// A volume borrowed together with its host: the base-aware verbs.
 pub struct Overlay<'a> {
   vol: &'a mut Volume,
@@ -3639,47 +3678,57 @@ impl Overlay<'_> {
   }
 
   /// `pin`: read the named subtrees (the whole base when none are named) into the store and
-  /// witness them; cost proportional to what is pinned, reported as the entry count.
+  /// witness them; cost proportional to what is pinned, reported as the entry count. The whole walk at once, by
+  /// [`Overlay::pin_unit`] to its end; a daemon steps the same walk a slice at a time instead (§4.3).
   pub fn pin(&mut self, store: &mut Store, paths: Option<&[String]>) -> Result<usize, VfsError> {
-    let roots: Vec<String> = paths.map_or_else(|| vec!["/".to_owned()], <[String]>::to_vec);
-    let mut pinned = 0usize;
-    for path in roots {
-      let located = self.resolve(store, &path)?;
-      let mut stack = vec![located];
-      while let Some(l) = stack.pop() {
-        match l.child {
-          Child::Dir(h) => {
-            let rows: Vec<(Kind, InodeNo, String)> = self
-              .readdir(store, h)?
-              .iter()
-              .map(|r| (r.kind, r.inode, r.name.to_owned()))
-              .collect();
-            let h = self.vol.head_dir(store, h)?;
-            for (kind, no, name) in rows {
-              let child = match kind {
-                Kind::Dir => match self.vol.lookup(store, h, &name)?.child {
-                  Child::Dir(d) => Child::Dir(d),
-                  other => other,
-                },
-                Kind::File => Child::File(no),
-                Kind::Symlink => Child::Symlink(no),
-                Kind::Fifo => Child::Fifo(no),
-                Kind::Socket => Child::Socket(no),
-              };
-              stack.push(Located { child, inode: no });
-            }
-          }
-          Child::File(no) => {
-            self.copy_up(store, no, CopyUp::Content)?;
-            let size = self.vol.inode(store, no)?.attrs.size;
-            self.pin_windows(store, no, 0, size)?;
-            pinned = pinned.saturating_add(1);
-          }
-          Child::Symlink(_) | Child::Fifo(_) | Child::Socket(_) | Child::Whiteout => {}
-        }
+    let mut walk = PinWalk::new(paths);
+    loop {
+      if let Some(pinned) = self.pin_unit(store, &mut walk)? {
+        return Ok(pinned);
       }
     }
-    Ok(pinned)
+  }
+
+  /// One unit of a pin's walk: a file of a listed directory pinned (copied up whole and witnessed), else the next
+  /// directory listed (its files queued, its subdirectories queued by path). `Some(pinned)` once nothing is left. A
+  /// unit's work is one file or one listing, never a subtree, so a caller bounding its slices against the clock
+  /// overruns by one unit at most. The walk holds no handle between units: a directory is resolved again by its path
+  /// when its turn comes, so one copied on write by another verb between two slices is read as it now stands, and a
+  /// file by its inode number.
+  pub fn pin_unit(
+    &mut self,
+    store: &mut Store,
+    walk: &mut PinWalk,
+  ) -> Result<Option<usize>, VfsError> {
+    if let Some(no) = walk.files.pop() {
+      self.copy_up(store, no, CopyUp::Content)?;
+      let size = self.vol.inode(store, no)?.attrs.size;
+      self.pin_windows(store, no, 0, size)?;
+      walk.pinned = walk.pinned.saturating_add(1);
+      return Ok(None);
+    }
+    let Some(path) = walk.dirs.pop() else {
+      return Ok(Some(walk.pinned));
+    };
+    match self.resolve(store, &path)?.child {
+      Child::Dir(handle) => {
+        let rows: Vec<(Kind, InodeNo, String)> = self
+          .readdir(store, handle)?
+          .iter()
+          .map(|row| (row.kind, row.inode, row.name.to_owned()))
+          .collect();
+        for (kind, no, name) in rows {
+          match kind {
+            Kind::Dir => walk.dirs.push(child_path(&path, &name)),
+            Kind::File => walk.files.push(no),
+            Kind::Symlink | Kind::Fifo | Kind::Socket => {}
+          }
+        }
+      }
+      Child::File(no) => walk.files.push(no),
+      Child::Symlink(_) | Child::Fifo(_) | Child::Socket(_) | Child::Whiteout => {}
+    }
+    Ok(None)
   }
 
   // ------------------------------------------------- metadata copy-ups and by-inode verbs

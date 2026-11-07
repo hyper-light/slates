@@ -356,6 +356,8 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   if !verdict.ok {
     notes.push(format!("fsx output tail: {}", verdict.detail));
   }
+  let (alive, live_note) = leg.session.alive_and_shipped();
+  notes.extend(live_note);
   notes.extend(leg.session.size_note.clone());
   let command = leg.recorded(&command)?;
   drop(leg);
@@ -376,7 +378,7 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     ),
     expected_failure_list: None,
     notes,
-    ok: verdict.ok,
+    ok: verdict.ok && alive,
   })
 }
 
@@ -399,7 +401,7 @@ pub(crate) fn run_fsstress(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let (success, output, command) =
     run_in_container(&mounting_user()?, &leg.binding, &sources, &script)?;
   let verdict = judge_fsstress(success, &output);
-  let alive = leg.session.daemon_alive();
+  let (alive, live_note) = leg.session.alive_and_shipped();
   let ok = verdict.ok && alive;
   let mut notes = leg.notes(format!(
     "fsstress: {} ({}), sha256 {}, compiled inside the container `cc {}` over the harness's Linux shim config.h",
@@ -420,6 +422,7 @@ pub(crate) fn run_fsstress(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       leg.session.anchor_log_tail()
     ));
   }
+  notes.extend(live_note);
   notes.extend(leg.session.size_note.clone());
   let command = leg.recorded(&command)?;
   drop(leg);
@@ -741,7 +744,7 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     .iter()
     .map(|(path, text)| slates_conformance::tap::parse_file(path, text, &runner))
     .collect();
-  let alive = leg.session.daemon_alive();
+  let (alive, live_note) = leg.session.alive_and_shipped();
   let mut notes = leg.notes(format!(
     "pjdfstest: {} at {}, compiled inside the container with config.h answered by its own compiler from the \
      harness's {} probes",
@@ -755,6 +758,7 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       leg.session.anchor_log_tail()
     ));
   }
+  notes.extend(live_note);
   notes.extend(leg.session.size_note.clone());
   let command = leg.recorded(&command)?;
   let files = outputs.len();
