@@ -23,3 +23,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 16 filtered out;
 rejoins: successor daemon 23068 answered after 46.2905ms
 rejoins: the fleet re-formed after 1.374709333s
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 16 filtered out; finished in 9.77s
+=== rejoin-4 exit 0 load { 14.88 16.27 13.08 }
+rejoins: successor daemon 25084 answered after 63.865583ms
+rejoins: the fleet re-formed after 4.613576458s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 16 filtered out; finished in 45.98s
