@@ -1213,24 +1213,38 @@ fn covers_candidates(state: &ShardState, volume: [u8; 16]) -> bool {
   let Some(live) = state.live.shipping.get(&volume) else {
     return true;
   };
-  let image_covers = live
-    .image_anchors
-    .as_ref()
-    .is_none_or(|anchors| anchors_cover(state, volume, anchors));
-  let Some(anchors) = &live.whole_anchors else {
-    return live.whole_entry.is_some() && image_covers;
-  };
-  anchors_cover(state, volume, anchors) && image_covers
+  let wanted: Vec<Option<u64>> = remote_candidates(state, volume)
+    .map(|candidate| state.member_anchors.get(&candidate).copied())
+    .collect();
+  log_covers(
+    &wanted,
+    live.whole_entry.is_some(),
+    live.whole_anchors.as_deref(),
+    live.image_anchors.as_deref(),
+  )
 }
 
-/// Whether `anchors` hold a key for every remote candidate of `volume`.
-fn anchors_cover(state: &ShardState, volume: [u8; 16], anchors: &[u64]) -> bool {
-  remote_candidates(state, volume).all(|candidate| {
-    state
-      .member_anchors
-      .get(&candidate)
-      .is_some_and(|anchor| anchors.contains(anchor))
-  })
+/// Whether a successor among the candidates could open the log, given each remote candidate's anchor (`wanted`; `None`
+/// for one this shard knows none for): the last whole entry's anchors must hold a key for every one, and so must the
+/// install image's when there is one, since a holder installed from it keeps it as its log's first payload. With no
+/// anchors recorded (a log shipped in the clear), a whole entry is enough. Before, only the entry was judged, and a pair
+/// retired between the entry and an image could leave the image short of a key the entry's check passed.
+fn log_covers(
+  wanted: &[Option<u64>],
+  has_whole_entry: bool,
+  whole: Option<&[u64]>,
+  image: Option<&[u64]>,
+) -> bool {
+  let covers = |anchors: &[u64]| {
+    wanted
+      .iter()
+      .all(|anchor| anchor.is_some_and(|anchor| anchors.contains(&anchor)))
+  };
+  let image_covers = image.is_none_or(covers);
+  match whole {
+    None => has_whole_entry && image_covers,
+    Some(anchors) => covers(anchors) && image_covers,
+  }
 }
 
 /// `volume`'s candidates other than this node that are still in its neighbourhood.
@@ -2941,6 +2955,33 @@ fn meta_of(inode: &InodeImage) -> slates_archive::NodeMeta {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A-240 with an install image beside the log: do ask whether the log covers candidates a and b when the last whole
+  /// entry's anchors hold both keys and the install image's hold only a's. Expect not: a holder installed from the image
+  /// keeps it as its log's first payload, and a successor adopting that holder could not open it for want of b's key. An
+  /// image holding both keys covers, and so does the entry with no image. Before, only the entry was judged, and the same
+  /// inputs answered that the log was covered (raft-chaos's review of the merged stack, 2026-11-07).
+  #[test]
+  fn an_install_image_short_of_a_candidates_key_does_not_cover_the_log() {
+    let (a, b) = (11_u64, 22_u64);
+    let wanted = [Some(a), Some(b)];
+    assert!(
+      log_covers(&wanted, true, Some(&[a, b]), None),
+      "the whole entry alone covers both"
+    );
+    assert!(
+      !log_covers(&wanted, true, Some(&[a, b]), Some(&[a])),
+      "an image short of b's key does not cover the log"
+    );
+    assert!(
+      log_covers(&wanted, true, Some(&[a, b]), Some(&[a, b])),
+      "an image with both keys covers"
+    );
+    assert!(
+      log_covers(&wanted, true, None, None),
+      "a log shipped in the clear needs no key"
+    );
+  }
 
   /// A refused live takeover (A-200, A-240): do ask whether a successor fetches the adopted holder's log again, after
   /// each kind of rebuild refusal, at the head it was refused at and at a later one. Expect a refusal the log's bytes
