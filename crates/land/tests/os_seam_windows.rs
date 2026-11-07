@@ -17,7 +17,7 @@
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use slates_land::os::OsLand;
+use slates_land::os::{OsLand, TargetRefusal};
 use slates_vfs::host::{HostDir, HostError, LandFs};
 
 /// Format: `EEXIST`, as the seam reports a name that exists.
@@ -104,6 +104,31 @@ fn assert_name_exists<T: std::fmt::Debug>(result: Result<T, HostError>) {
   assert!(
     matches!(result, Err(HostError::Unavailable(ERRNO_EXIST))),
     "{result:?}"
+  );
+}
+
+/// §4.15 step 4: a target is the writer's when it bears the owner this process's own creations get, as Unix's check is
+/// `st_uid == geteuid`. Do: make a directory in this process and open it as a target. Expect: it opens, whatever the
+/// token: an elevated token's default owner is `BUILTIN\Administrators`, not its user (CI's runners, an elevated shell;
+/// measured 2026-11-06), and until then the writer refused every directory such a process made. Git Bash hides this: it
+/// sets its token's default owner to the user, so run this from PowerShell to see it red.
+#[test]
+fn a_directory_this_process_makes_is_a_target_it_owns() {
+  let space = Workspace::new("own");
+  let opened = OsLand::open_target(&space.target());
+  assert!(opened.is_ok(), "{:?}", opened.err());
+}
+
+/// §4.15 step 4: a target another user owns is refused. Do: open the system's own directory, which `TrustedInstaller`
+/// owns on every Windows, as a target. Expect: `TargetNotOwned`, before anything could be written.
+#[test]
+fn a_target_another_user_owns_is_refused() {
+  let system = PathBuf::from(std::env::var("SystemRoot").unwrap()).join("System32");
+  let opened = OsLand::open_target(&system);
+  assert!(
+    matches!(opened, Err(TargetRefusal::TargetNotOwned)),
+    "{:?}",
+    opened.err()
   );
 }
 
