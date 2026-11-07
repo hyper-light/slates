@@ -778,6 +778,156 @@ struct Send {
   holder: HostId,
   stream: u64,
   bytes: Vec<u8>,
+  made_ns: u64, // TEMPORARY hop measurement
+}
+
+// TEMPORARY (item 2 hop measurement): counters `live.hop.<hop>.<bucket>`, `.sum_ns`, `.n`.
+const HOP_NAMES: [[&str; 12]; 9] = [
+  [
+    "live.hop.to_control.lt0008us",
+    "live.hop.to_control.lt0016us",
+    "live.hop.to_control.lt0032us",
+    "live.hop.to_control.lt0064us",
+    "live.hop.to_control.lt0128us",
+    "live.hop.to_control.lt0256us",
+    "live.hop.to_control.lt0512us",
+    "live.hop.to_control.lt1024us",
+    "live.hop.to_control.lt2048us",
+    "live.hop.to_control.ge2048us",
+    "live.hop.to_control.sum_ns",
+    "live.hop.to_control.n",
+  ],
+  [
+    "live.hop.borrow.lt0008us",
+    "live.hop.borrow.lt0016us",
+    "live.hop.borrow.lt0032us",
+    "live.hop.borrow.lt0064us",
+    "live.hop.borrow.lt0128us",
+    "live.hop.borrow.lt0256us",
+    "live.hop.borrow.lt0512us",
+    "live.hop.borrow.lt1024us",
+    "live.hop.borrow.lt2048us",
+    "live.hop.borrow.ge2048us",
+    "live.hop.borrow.sum_ns",
+    "live.hop.borrow.n",
+  ],
+  [
+    "live.hop.exchange.lt0008us",
+    "live.hop.exchange.lt0016us",
+    "live.hop.exchange.lt0032us",
+    "live.hop.exchange.lt0064us",
+    "live.hop.exchange.lt0128us",
+    "live.hop.exchange.lt0256us",
+    "live.hop.exchange.lt0512us",
+    "live.hop.exchange.lt1024us",
+    "live.hop.exchange.lt2048us",
+    "live.hop.exchange.ge2048us",
+    "live.hop.exchange.sum_ns",
+    "live.hop.exchange.n",
+  ],
+  [
+    "live.hop.to_owner.lt0008us",
+    "live.hop.to_owner.lt0016us",
+    "live.hop.to_owner.lt0032us",
+    "live.hop.to_owner.lt0064us",
+    "live.hop.to_owner.lt0128us",
+    "live.hop.to_owner.lt0256us",
+    "live.hop.to_owner.lt0512us",
+    "live.hop.to_owner.lt1024us",
+    "live.hop.to_owner.lt2048us",
+    "live.hop.to_owner.ge2048us",
+    "live.hop.to_owner.sum_ns",
+    "live.hop.to_owner.n",
+  ],
+  [
+    "live.hop.round.lt0008us",
+    "live.hop.round.lt0016us",
+    "live.hop.round.lt0032us",
+    "live.hop.round.lt0064us",
+    "live.hop.round.lt0128us",
+    "live.hop.round.lt0256us",
+    "live.hop.round.lt0512us",
+    "live.hop.round.lt1024us",
+    "live.hop.round.lt2048us",
+    "live.hop.round.ge2048us",
+    "live.hop.round.sum_ns",
+    "live.hop.round.n",
+  ],
+  [
+    "live.hop.spawn.lt0008us",
+    "live.hop.spawn.lt0016us",
+    "live.hop.spawn.lt0032us",
+    "live.hop.spawn.lt0064us",
+    "live.hop.spawn.lt0128us",
+    "live.hop.spawn.lt0256us",
+    "live.hop.spawn.lt0512us",
+    "live.hop.spawn.lt1024us",
+    "live.hop.spawn.lt2048us",
+    "live.hop.spawn.ge2048us",
+    "live.hop.spawn.sum_ns",
+    "live.hop.spawn.n",
+  ],
+  [
+    "live.hop.rtt.lt0008us",
+    "live.hop.rtt.lt0016us",
+    "live.hop.rtt.lt0032us",
+    "live.hop.rtt.lt0064us",
+    "live.hop.rtt.lt0128us",
+    "live.hop.rtt.lt0256us",
+    "live.hop.rtt.lt0512us",
+    "live.hop.rtt.lt1024us",
+    "live.hop.rtt.lt2048us",
+    "live.hop.rtt.ge2048us",
+    "live.hop.rtt.sum_ns",
+    "live.hop.rtt.n",
+  ],
+  [
+    "live.hop.back.lt0008us",
+    "live.hop.back.lt0016us",
+    "live.hop.back.lt0032us",
+    "live.hop.back.lt0064us",
+    "live.hop.back.lt0128us",
+    "live.hop.back.lt0256us",
+    "live.hop.back.lt0512us",
+    "live.hop.back.lt1024us",
+    "live.hop.back.lt2048us",
+    "live.hop.back.ge2048us",
+    "live.hop.back.sum_ns",
+    "live.hop.back.n",
+  ],
+  [
+    "live.hop.serve.lt0008us",
+    "live.hop.serve.lt0016us",
+    "live.hop.serve.lt0032us",
+    "live.hop.serve.lt0064us",
+    "live.hop.serve.lt0128us",
+    "live.hop.serve.lt0256us",
+    "live.hop.serve.lt0512us",
+    "live.hop.serve.lt1024us",
+    "live.hop.serve.lt2048us",
+    "live.hop.serve.ge2048us",
+    "live.hop.serve.sum_ns",
+    "live.hop.serve.n",
+  ],
+];
+
+/// TEMPORARY: records `ns` for hop `hop` on this shard's counters.
+pub(crate) fn hop(state: &mut ShardState, hop: usize, ns: u64) {
+  let Some(names) = HOP_NAMES.get(hop) else {
+    return;
+  };
+  let micros = ns / 1_000;
+  let bounds: [u64; 9] = [8, 16, 32, 64, 128, 256, 512, 1024, 2048];
+  let bucket = bounds.iter().position(|bound| micros < *bound).unwrap_or(9);
+  if let Some(name) = names.get(bucket) {
+    state.count(name, 1);
+  }
+  if let Some(name) = names.get(10) {
+    state.count(name, ns);
+  }
+  if let Some(name) = names.get(11) {
+    state.count(name, 1);
+  }
 }
 
 /// Whether the volume with `id` is live-shipped, by its policy on this partition.
@@ -1059,6 +1209,7 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
             holder: *holder,
             stream: slates_cluster::live::LIVE_ENTRY_STREAM,
             bytes: entry.encode(),
+            made_ns: slates_machine::clock::monotonic_ns(),
           });
         }
       }
@@ -1089,6 +1240,7 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
           holder: *holder,
           stream: slates_cluster::live::LIVE_STATE_STREAM,
           bytes,
+          made_ns: slates_machine::clock::monotonic_ns(),
         });
       }
       Next::Nothing | Next::Fenced(_) => {}
@@ -1288,7 +1440,9 @@ async fn ship_lane(
   budget: slates_cluster::CommitBudget,
 ) -> bool {
   for send in sends {
+    let t_lane = slates_machine::clock::monotonic_ns();
     let sessions = borrow_session(holder, budget.max_deadline_ns()).await;
+    let t_borrowed = slates_machine::clock::monotonic_ns();
     // Each message under its own budget: the liveness budget plus its transfer on the session it rides, so an install
     // of the whole volume is not given up the moment an entry would be (`exchange_budget`).
     let exchange = exchange_budget(send.bytes.len(), &sessions);
@@ -1296,6 +1450,18 @@ async fn ship_lane(
       slates_cluster::live::exchange((send.stream, &send.bytes), sessions, exchange, |_, _| true)
         .await;
     let answered = !exchanged.replies.is_empty();
+    let t_exchanged = slates_machine::clock::monotonic_ns();
+    let made_ns = send.made_ns;
+    let _ = state::with_state(|s| {
+      hop(s, 0, t_lane.saturating_sub(made_ns));
+      hop(s, 1, t_borrowed.saturating_sub(t_lane));
+      hop(s, 2, t_exchanged.saturating_sub(t_borrowed));
+      for [spawn, rtt, back] in &exchanged.timings {
+        hop(s, 5, *spawn);
+        hop(s, 6, *rtt);
+        hop(s, 7, *back);
+      }
+    });
     if !answered {
       let _ = state::with_state(|s| {
         s.count(LIVE_UNANSWERED, 1);
@@ -1313,7 +1479,16 @@ async fn ship_lane(
       .collect();
     if !replies.is_empty() {
       let control = state::with_state(|s| s.shard).unwrap_or(origin);
-      crate::xshard::run_on_counted(control, origin, move |s| fold_into(s, replies));
+      crate::xshard::run_on_counted(control, origin, move |s| {
+        let now = slates_machine::clock::monotonic_ns();
+        hop(s, 3, now.saturating_sub(t_exchanged));
+        fold_into(s, replies);
+        hop(
+          s,
+          4,
+          slates_machine::clock::monotonic_ns().saturating_sub(made_ns),
+        );
+      });
     }
     // After the answers are on their way to the owner, so durability waits for no straggler.
     finish_stragglers(origin, send.object, exchanged.stragglers).await;

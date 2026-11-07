@@ -341,6 +341,10 @@ pub struct TimedReply {
   pub bytes: Vec<u8>,
   /// The exchange's round trip in nanoseconds when the peer answered inside the deadline.
   pub round_trip_ns: Option<u64>,
+  /// TEMPORARY (item 2 hops): when the request began and when the reply was in hand, monotonic ns.
+  pub began_ns: u64,
+  /// TEMPORARY: see `began_ns`.
+  pub done_ns: u64,
 }
 
 /// What a dispatch task reports back to the owner's collection loop: a holder's timed reply (empty bytes
@@ -504,6 +508,8 @@ pub async fn request_within(
     TimedReply {
       bytes: reply.unwrap_or_default(),
       round_trip_ns,
+      began_ns: sent_ns,
+      done_ns: now_ns(),
     },
     endpoint,
   )

@@ -1325,6 +1325,24 @@ fn measure_what_live_shipping_adds_to_a_stable_nfs_write() {
     "measure: the owner's live counters {:?}",
     live_counters(owner)
   );
+  // TEMPORARY (item 2): the dispatch round's hops on every node, summed over its shards.
+  for instance in &fleet.instances {
+    let (_, status, _) = run(instance, &["status"]);
+    let mut hops = std::collections::BTreeMap::<String, u64>::new();
+    for (kind, count) in status
+      .lines()
+      .filter_map(|line| line.split_once(" refused live.hop.").map(|(_, rest)| rest))
+      .filter_map(|rest| rest.split_once(": "))
+    {
+      *hops.entry(kind.to_owned()).or_default() += count.trim().parse::<u64>().unwrap_or(0);
+    }
+    for (kind, count) in &hops {
+      eprintln!(
+        "hop {} {kind} {count}",
+        if instance == owner { "owner" } else { "holder" }
+      );
+    }
+  }
   let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
   drop((plain, live));
   drop(fleet.daemons);

@@ -1424,7 +1424,14 @@ async fn serve_peer_records(
               .learned_members
               .get(&peer_anchor)
               .map_or(seed, |learned| learned.host);
-            crate::live_ship::serve_entry(s, local, peer_host, &request)
+            let began = slates_machine::clock::monotonic_ns();
+            let reply = crate::live_ship::serve_entry(s, local, peer_host, &request);
+            crate::live_ship::hop(
+              s,
+              8,
+              slates_machine::clock::monotonic_ns().saturating_sub(began),
+            );
+            reply
           })
           .unwrap_or_default(),
           slates_cluster::live::LIVE_STATE_STREAM => state::with_state(|s| {
