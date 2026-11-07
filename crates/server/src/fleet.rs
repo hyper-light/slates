@@ -1707,6 +1707,10 @@ fn after_held_record(state: &mut ShardState, record: &Record) {
     // A newer head or ledger position may supersede content held for the object (AUD-29-43).
     crate::content_retention::retain_object(state, record.object);
   }
+  if record.object.is_catalog() {
+    // A live volume's holder record may name this node a holder of its log, or no longer (A-240).
+    crate::live_ship::on_catalog_accepted(state, record.object, record.sequence, &record.value);
+  }
 }
 
 /// Validates a record against both the transport principal and installed authority before any effect
