@@ -5923,8 +5923,12 @@ fn submit(
   let secured = u64::try_from(engine.history_reservation(&inc)).unwrap_or(u64::MAX);
   // An accepted work is reset to its green at the new version, where it holds nothing of its own
   // (`crate::work_files`): the reset only releases charge, so nothing is secured for it here.
-  // Make room first: fold whatever the retention budget allows (never a live reader's version).
-  if let Err(available) = crate::merge_service::settle_green_retention(state, green_id) {
+  // Make room first: fold whatever the retention budget allows, leaving room for what is secured (never a live
+  // reader's version).
+  let room = usize::try_from(secured).unwrap_or(usize::MAX);
+  if let Err(available) =
+    crate::merge_service::settle_green_retention_leaving(state, green_id, room)
+  {
     return refused(Refusal::BudgetExceeded { available });
   }
   if let Err(available) = crate::merge_service::secure_green_retention(state, green_id, secured) {
@@ -5963,9 +5967,8 @@ fn submit(
       // The pre-check passed and the shard is single-threaded, so this append fits the budget; a
       // segment-full failure refuses like any other verb. A resubmit the engine answered from its
       // idempotent accept names a version the chain already holds: nothing is appended twice.
-      let chain_len =
-        u64::try_from(state.db.partition().green_chain(green_id).len()).unwrap_or(u64::MAX);
-      if chain_len < version
+      // The durable head is the checkpoint's version and the increments after it (W3).
+      if state.db.partition().green_head(green_id) < version
         && let Err(e) = state.db.mutate(&mut state.segment, &record, now)
       {
         return refused(refusal_of_db(&e));
@@ -5992,6 +5995,8 @@ fn submit(
       // to it and true the retention charge up to what the commit retained (the secured surplus credited).
       // A settle after an accept only credits: nothing was retained beyond what was secured.
       let _ = crate::merge_service::settle_green_retention(state, green_id);
+      // And the durable chain may be folded to it (W3): a checkpoint at the floor replaces the increments below.
+      crate::merge_service::checkpoint_green(state, green_id);
       // The acceptance is published only once the version's merge record is **committed at the
       // quorum** (§4.16 "Commit": "committed at f+1 acknowledgements … issued only when every identity
       // the version references is placed"; AUD-11). At `f = 0` the append was the commit and the reply
@@ -6014,6 +6019,15 @@ fn submit(
         version: None,
         conflicts: merge_windows(&windows),
       }
+    }
+    // A base below the green's checkpoint (W3) is no live reader's, so it is unknown: never judged, and nothing
+    // retained, so the bytes secured are credited back.
+    slates_merge::engine::Outcome::BaseUnavailable { base, .. } => {
+      let _ = crate::merge_service::settle_green_retention(state, green_id);
+      refused(Refusal::UnknownBase {
+        green: to_wire_volume(green_id),
+        version: base,
+      })
     }
   }
 }
@@ -6116,6 +6130,11 @@ fn rebase(state: &mut ShardState, principal: &Principal, work: VolumeId) -> Repl
       version: None,
       conflicts: merge_windows(&windows),
     },
+    // A base below the green's checkpoint (W3): unknown, as the submit answers it.
+    slates_merge::engine::Rebased::BaseUnavailable { base, .. } => refused(Refusal::UnknownBase {
+      green: to_wire_volume(green_id),
+      version: base,
+    }),
   }
 }
 
@@ -8197,7 +8216,8 @@ pub(crate) fn materialize_taken_over_green(
   ));
   // The chain, durably, in order — each entry guarded before it is applied.
   let now = state.clock.monotonic_ns();
-  let already = state.db.partition().green_chain(id).len();
+  // What this node holds durably already: its checkpoint's version and the increments after it (W3).
+  let already = usize::try_from(state.db.partition().green_head(id)).unwrap_or(usize::MAX);
   if already == 0
     && state.db.partition().green_origin(id).is_none()
     && let Some(origin) = &recovery.origin
@@ -9654,22 +9674,33 @@ fn replay_green(
   id: DbVolumeId,
 ) -> Result<slates_merge::engine::Green, crate::merge_service::GreenFence> {
   use crate::merge_service::GreenFence;
+  let origin = recovered_origin(state, id)?;
   let partition = state.db.partition();
-  let mut green = match (partition.green_origin_ref(id), partition.green_origin(id)) {
-    // A held origin (A-217) is walked again from its base snapshot, rebuilt before any green, and must give the
-    // origin the green was created from.
-    (Some(held), _) => match crate::merge_service::walk_held_origin(state, held) {
-      Ok(origin) => slates_merge::engine::Green::with_origin(&origin),
-      Err(Refusal::ContentUnavailable) => return Err(GreenFence::OriginCorrupt),
-      Err(_) => return Err(GreenFence::OriginUnavailable),
-    },
-    (None, Some(bytes)) => slates_merge::origin::Origin::decode(bytes)
-      .map(|origin| slates_merge::engine::Green::with_origin(&origin))
-      .map_err(|_| GreenFence::OriginCorrupt)?,
-    (None, None) => slates_merge::engine::Green::new(),
+  // A checkpointed green (W3) is restored at its checkpoint, and only the increments after it are replayed.
+  let (mut green, held) = match partition.green_checkpoint(id) {
+    Some((held, bytes)) => {
+      let checkpoint = slates_merge::checkpoint::Checkpoint::decode(bytes)
+        .ok()
+        .filter(|checkpoint| checkpoint.version == held)
+        .ok_or(GreenFence::CheckpointCorrupt)?;
+      let origin = origin.unwrap_or_default();
+      (
+        slates_merge::engine::Green::restore(&origin, &checkpoint),
+        held,
+      )
+    }
+    None => (
+      origin.map_or_else(slates_merge::engine::Green::new, |origin| {
+        slates_merge::engine::Green::with_origin(&origin)
+      }),
+      0,
+    ),
   };
-  for (index, bytes) in state.db.partition().green_chain(id).iter().enumerate() {
-    let version = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+  for (index, bytes) in partition.green_chain(id).iter().enumerate() {
+    let version = u64::try_from(index)
+      .unwrap_or(u64::MAX)
+      .saturating_add(held)
+      .saturating_add(1);
     let increment = slates_merge::engine::Increment::decode(bytes)
       .map_err(|_| GreenFence::EntryCorrupt { version })?;
     match green.submit(&increment) {
@@ -9677,13 +9708,36 @@ fn replay_green(
       slates_merge::engine::Outcome::Accepted { version: accepted } => {
         return Err(GreenFence::WrongVersion { version, accepted });
       }
-      slates_merge::engine::Outcome::Conflict { .. } => {
+      slates_merge::engine::Outcome::Conflict { .. }
+      | slates_merge::engine::Outcome::BaseUnavailable { .. } => {
         return Err(GreenFence::NotAccepted { version });
       }
     }
   }
   green.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
   Ok(green)
+}
+
+/// Green `id`'s origin as recovery finds it (§4.16): a held origin (A-217) walked again from its base snapshot,
+/// rebuilt before any green, which must give the origin the green was created from; the origin's bytes; or `None`
+/// for a green that started from scratch. A fence when it cannot be had.
+fn recovered_origin(
+  state: &ShardState,
+  id: DbVolumeId,
+) -> Result<Option<slates_merge::origin::Origin>, crate::merge_service::GreenFence> {
+  use crate::merge_service::GreenFence;
+  let partition = state.db.partition();
+  match (partition.green_origin_ref(id), partition.green_origin(id)) {
+    (Some(held), _) => match crate::merge_service::walk_held_origin(state, held) {
+      Ok(origin) => Ok(Some(origin)),
+      Err(Refusal::ContentUnavailable) => Err(GreenFence::OriginCorrupt),
+      Err(_) => Err(GreenFence::OriginUnavailable),
+    },
+    (None, Some(bytes)) => slates_merge::origin::Origin::decode(bytes)
+      .map(Some)
+      .map_err(|_| GreenFence::OriginCorrupt),
+    (None, None) => Ok(None),
+  }
 }
 
 /// Fences green `record` (AUD-29-18): no engine and no retention stay installed, every verb naming it is
@@ -11850,6 +11904,19 @@ mod tests {
       ) else {
         panic!("create work")
       };
+      // A second work held at version 0 keeps the reachable floor there, so the version stays a chain entry rather
+      // than folding into a checkpoint (W3): the replay of an entry is what this test holds.
+      let super::ReplyBody::WorkCreated { .. } = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::CreateWork {
+          green: id,
+          name: "floor-holder".to_owned(),
+        },
+      ) else {
+        panic!("create the floor's holder")
+      };
       let edited = super::dispatch(
         state,
         1,
@@ -11936,6 +12003,138 @@ mod tests {
       assert_eq!(
         state.fenced_greens.get(&other),
         Some(&crate::merge_service::GreenFence::OriginCorrupt)
+      );
+    });
+  }
+
+  /// Test support: creates a green named `name` with a work, and — when `hold_floor` — a second work left at version
+  /// 0, which keeps the reachable floor there so nothing is checkpointed; then edits `/f` in the first work and submits
+  /// it, expecting version 1. Returns the green.
+  fn green_at_version_one(
+    state: &mut crate::state::ShardState,
+    name: &str,
+    hold_floor: bool,
+  ) -> super::DbVolumeId {
+    let owner = Principal::Uid { uid: 1234 };
+    let super::ReplyBody::GreenCreated { id } = super::dispatch(
+      state,
+      1,
+      &owner,
+      super::RequestBody::CreateGreen {
+        name: name.to_owned(),
+        require_evidence: false,
+        base: None,
+      },
+    ) else {
+      panic!("create green")
+    };
+    let works: &[&str] = if hold_floor {
+      &["work", "floor"]
+    } else {
+      &["work"]
+    };
+    let mut created = Vec::new();
+    for work in works {
+      let super::ReplyBody::WorkCreated { id: work, .. } = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::CreateWork {
+          green: id,
+          name: format!("{name}-{work}"),
+        },
+      ) else {
+        panic!("create work")
+      };
+      created.push(work);
+    }
+    let work = created[0];
+    let edited = super::dispatch(
+      state,
+      1,
+      &owner,
+      super::RequestBody::Edit {
+        work,
+        path: "/f".to_owned(),
+        at: 0,
+        delete_len: 0,
+        bytes: b"hello".to_vec(),
+      },
+    );
+    assert!(matches!(edited, super::ReplyBody::Edited), "{edited:?}");
+    let submitted = super::dispatch(
+      state,
+      1,
+      &owner,
+      super::RequestBody::Submit {
+        work,
+        evidence: Vec::new(),
+      },
+    );
+    assert!(
+      matches!(
+        submitted,
+        super::ReplyBody::Submitted {
+          version: Some(1),
+          ..
+        }
+      ),
+      "{submitted:?}"
+    );
+    super::to_db_volume(id)
+  }
+
+  /// W3, AUD-29-18: do: submit one version of a green whose only work is reset to it (so the service checkpoints
+  /// it) and rebuild the green; then, on a second green whose floor a work holds at version 0, record a checkpoint at
+  /// version 1 whose bytes do not decode, and rebuild it. Expect: the first green's chain is empty, its checkpoint at
+  /// version 1, and the rebuild restores the acknowledged head exactly (version 1, the same identity); the second is
+  /// fenced `CheckpointCorrupt` rather than served from bytes the replay cannot read.
+  #[test]
+  fn a_green_replays_from_its_checkpoint_and_a_corrupt_one_is_fenced() {
+    crate::daemon::audit_on_shard(|state| {
+      let green = green_at_version_one(state, "checkpointed", false);
+      assert_eq!(
+        state
+          .db
+          .partition()
+          .green_checkpoint(green)
+          .map(|(held, _)| held),
+        Some(1)
+      );
+      assert!(state.db.partition().green_chain(green).is_empty());
+      let before = state
+        .greens
+        .get_mut(&green)
+        .map(|g| (g.head(), g.head_identity()));
+      let record = state.db.partition().volume(green).cloned().unwrap();
+      super::rebuild_green(state, &record);
+      assert_eq!(
+        state
+          .greens
+          .get_mut(&green)
+          .map(|g| (g.head(), g.head_identity())),
+        before,
+        "the replay from the checkpoint reproduces the acknowledged head exactly"
+      );
+
+      let held = green_at_version_one(state, "corrupted", true);
+      assert_eq!(
+        state.db.partition().green_checkpoint(held),
+        None,
+        "the floor held at 0 folds nothing"
+      );
+      let corrupt = super::Op::GreenCheckpointed {
+        green: held,
+        version: 1,
+        checkpoint: vec![0xff; 16],
+      };
+      state.db.mutate(&mut state.segment, &corrupt, 0).unwrap();
+      let record = state.db.partition().volume(held).cloned().unwrap();
+      super::rebuild_green(state, &record);
+      assert!(!state.greens.contains_key(&held));
+      assert_eq!(
+        state.fenced_greens.get(&held),
+        Some(&crate::merge_service::GreenFence::CheckpointCorrupt)
       );
     });
   }

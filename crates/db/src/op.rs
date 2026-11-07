@@ -392,6 +392,18 @@ pub enum Op {
     /// The encoded restatement.
     entry: Vec<u8>,
   },
+  /// A green's checkpoint (W3; §4.16 "Deltas older than the derived retention fold into checkpoint deltas"): the
+  /// green's state at `version` beyond its origin, encoded (`slates_merge::checkpoint`), held in place of every
+  /// increment up to `version`, which applying it drops. Refused at or below the checkpoint held and past the head.
+  /// Appended (2026-11-06).
+  GreenCheckpointed {
+    /// The green volume.
+    green: VolumeId,
+    /// The version the checkpoint is the green's state at.
+    version: u64,
+    /// The encoded checkpoint.
+    checkpoint: Vec<u8>,
+  },
 }
 
 impl Op {
@@ -402,6 +414,7 @@ impl Op {
       Op::WorkLogged { .. } => "work_logged",
       Op::GreenOriginHeld { .. } => "green_origin_held",
       Op::WorkRestated { .. } => "work_restated",
+      Op::GreenCheckpointed { .. } => "green_checkpointed",
       Op::VolumeStateChanged { .. } => "volume_state_changed",
       Op::VolumeResized { .. } => "volume_resized",
       Op::VolumeAccounted { .. } => "volume_accounted",

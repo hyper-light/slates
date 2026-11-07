@@ -129,6 +129,89 @@ pub(crate) fn reachable_floor(state: &ShardState, green: DbVolumeId) -> u64 {
   work_bases.chain(pins).min().unwrap_or(head).min(head)
 }
 
+/// The version a green's durable chain may be checkpointed at (W3; §4.16): the reachable floor, kept below the
+/// oldest version whose merge record still waits for its placement, since that record's inputs are read from the
+/// chain entry (`inputs_of`) until it is placed. At `f = 0` nothing waits and it is the reachable floor.
+pub(crate) fn checkpoint_floor(state: &ShardState, green: DbVolumeId) -> u64 {
+  let floor = reachable_floor(state, green);
+  state
+    .merge
+    .pending
+    .get(&ObjectId(green.bytes))
+    .and_then(PendingGreen::oldest)
+    .map_or(floor, |oldest| floor.min(oldest.saturating_sub(1)))
+}
+
+/// Checkpoints `green`'s durable chain at its checkpoint floor when the increments that would fold are at least the
+/// checkpoint it holds (W3; §4.16 "Deltas older than the derived retention fold into checkpoint deltas"): the
+/// partition then holds the green's state at the floor in place of every increment up to it, and recovery restores
+/// the green from it and replays only the increments after it (`verbs::replay_green`).
+///
+/// The rule is the doubling one: a checkpoint is taken once the bytes it would fold reach the size of the one it
+/// replaces, so the work of taking checkpoints is at most the bytes appended to the chain, and the chain's own bytes
+/// past the checkpoint stay under the checkpoint's size plus what live readers still hold below. Until 2026-11-06
+/// nothing was ever folded: a green whose readers all kept up was refused `green_chains at capacity` once its
+/// history passed the partition's cap (`crates/server/tests/green_checkpoint.rs`, version 31 under 256 KiB), and
+/// every snapshot re-encoded the whole chain.
+///
+/// Never refuses the verb that called it: a checkpoint the engine cannot take at the floor (its histories already
+/// folded past it) or the partition refuses is counted and skipped, and the chain stays whole and correct.
+pub(crate) fn checkpoint_green(state: &mut ShardState, green: DbVolumeId) {
+  let floor = checkpoint_floor(state, green);
+  let partition = state.db.partition();
+  let (held, held_bytes) = partition
+    .green_checkpoint(green)
+    .map_or((0, 0), |(version, bytes)| (version, bytes.len()));
+  let Some(folds) = floor
+    .checked_sub(held)
+    .filter(|folds| *folds > 0)
+    .and_then(|folds| usize::try_from(folds).ok())
+  else {
+    return;
+  };
+  let folded: usize = partition
+    .green_chain(green)
+    .iter()
+    .take(folds)
+    .map(Vec::len)
+    .sum();
+  if folded < held_bytes {
+    return;
+  }
+  let Some(checkpoint) = state
+    .greens
+    .get(&green)
+    .and_then(|engine| engine.checkpoint(floor))
+  else {
+    state.count(CHECKPOINT_UNAVAILABLE, 1);
+    return;
+  };
+  let op = Op::GreenCheckpointed {
+    green,
+    version: floor,
+    checkpoint: checkpoint.encode(),
+  };
+  let now = state.clock.monotonic_ns();
+  let recorded = state
+    .db
+    .partition()
+    .check(&op, now)
+    .and_then(|()| state.db.mutate(&mut state.segment, &op, now).map(|_| ()));
+  match recorded {
+    Ok(()) => state.count(CHECKPOINT_TAKEN, 1),
+    Err(_) => state.count(CHECKPOINT_REFUSED, 1),
+  }
+}
+
+/// Counter: a green's chain checkpointed (W3), the non-vacuity count of [`checkpoint_green`].
+pub(crate) const CHECKPOINT_TAKEN: &str = "merge.checkpoint.taken";
+/// Counter: a checkpoint the engine could not take at the floor (its histories folded past it); the chain stays
+/// whole.
+pub(crate) const CHECKPOINT_UNAVAILABLE: &str = "merge.checkpoint.unavailable";
+/// Counter: a checkpoint the partition refused (its record did not fit the log or the budget); the chain stays
+/// whole.
+pub(crate) const CHECKPOINT_REFUSED: &str = "merge.checkpoint.refused";
+
 /// A work's base (`crate::work_files`): its green on this shard, when it still exists, at the work's base version.
 pub(crate) fn work_base<'a>(
   state: &'a ShardState,
@@ -158,14 +241,26 @@ pub(crate) fn unreadable_base(work: &crate::state::WorkState) -> Refusal {
 /// construction. `Err(available)` when the budget cannot cover a charge — nothing is then changed
 /// but the fold, which only releases.
 pub(crate) fn settle_green_retention(state: &mut ShardState, green: DbVolumeId) -> Result<(), u64> {
+  settle_green_retention_leaving(state, green, 0)
+}
+
+/// [`settle_green_retention`], folding until the green's retention leaves `room` bytes under its cap: what a submit
+/// is about to secure (`secure_green_retention`). Folding only to the cap left none, so a green whose readers all
+/// kept up was refused `BudgetExceeded { available: 0 }` once its history filled the cap, though everything below
+/// the head was foldable (version 34 of `crates/server/tests/green_checkpoint.rs` under a 256 KiB cap, 2026-11-06).
+pub(crate) fn settle_green_retention_leaving(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  room: usize,
+) -> Result<(), u64> {
   let floor = reachable_floor(state, green);
   let budget = rejected_cache_budget(state);
   let Some(engine) = state.greens.get_mut(&green) else {
     return Ok(());
   };
   // Oldest-first, only as far as the retention budget needs (the same derived cap the rejected
-  // cache is bounded by: one merge byte bound per green), never past a live reader's version.
-  engine.fold_history_to_budget(floor, budget);
+  // cache is bounded by: one merge byte bound per green) with `room` to spare, never past a live reader's version.
+  engine.fold_history_to_budget(floor, budget.saturating_sub(room));
   let wanted = u64::try_from(engine.retention_charge()).unwrap_or(u64::MAX);
   let charged = state.green_retention.get(&green).copied().unwrap_or(0);
   if wanted > charged {
@@ -1342,6 +1437,8 @@ pub enum GreenFence {
   /// The origin is held as a reference to a base snapshot (A-217) that recovery did not bring back: the base volume
   /// or its snapshot is not on this shard.
   OriginUnavailable,
+  /// The green's checkpoint (W3) does not decode, or names another version than the partition holds it at.
+  CheckpointCorrupt,
   /// The retention the rebuilt histories hold could not be charged: `short` bytes past the budget.
   Retention {
     /// The bytes the budget could not cover.
@@ -1359,6 +1456,11 @@ pub struct PendingGreen {
 }
 
 impl PendingGreen {
+  /// The oldest version whose record is not yet placed, if any: its inputs are read from the chain until it is.
+  fn oldest(&self) -> Option<u64> {
+    self.records.keys().next().copied()
+  }
+
   /// Registers one new position and the holders still owed it. Re-enqueuing a position preserves
   /// its acknowledgements; a pending position's identity never changes (§4.8 Continuity).
   fn insert(&mut self, version: u64, record: PendingMergeRecord) {
@@ -1494,7 +1596,14 @@ fn inputs_of(state: &ShardState, green: DbVolumeId, version: u64) -> Option<Vec<
     }
     return state.db.partition().green_origin(green).map(<[u8]>::to_vec);
   }
-  let index = usize::try_from(version.checked_sub(1)?).ok()?;
+  // The chain holds the versions after its checkpoint (W3); a version folded into it has no inputs of its own any
+  // more, and `checkpoint_floor` keeps every version whose record waits for them above it.
+  let held = state
+    .db
+    .partition()
+    .green_checkpoint(green)
+    .map_or(0, |(held, _)| held);
+  let index = usize::try_from(version.checked_sub(held)?.checked_sub(1)?).ok()?;
   state.db.partition().green_chain(green).get(index).cloned()
 }
 

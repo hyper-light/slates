@@ -73,8 +73,20 @@
 >     `Capacity { table: "green_chains" }` at the cap) "until checkpointing folds old chain entries (owed)". So each
 >     version costs its increment for good, and each snapshot taken when the log fills re-encodes the whole chain.
 >   - **What it means at 100k** (extrapolation): 3 rounds × 100k clients is 300k increments, about 48 GB of chain,
->     each snapshot re-encoding it, and the cap refusing submits well before. Green chain checkpointing is the 100k
->     rung's wall (owner to be decided).
+>     each snapshot re-encoding it, and the cap refusing submits well before.
+>   - **Closed for the owner's partition (AMENDMENT-TBD, 2026-11-06,
+>     `docs/bugs/2026-11-06-a-greens-chain-kept-every-version-it-ever-took.md`).** A green's chain is checkpointed at
+>     its reachable floor once the increments to fold reach the checkpoint's size. Recovery restores from the
+>     checkpoint and replays only the tail. The settle before a submit folds until its claim fits.
+>     - Under a 256 KiB cap, 200 versions of 8 KiB from a work that keeps up are all accepted. Before, the chain cap
+>       refused at version 31, and then the retention fold at version 34.
+>     - The partition's snapshot grows by at most 39,168 bytes from version 40 to 200; before, it grew 1,329,920
+>       (`crates/server/tests/green_checkpoint.rs`).
+>   - **Still owed:**
+>     - At `f > 0` the holders' replicas and holder records still grow a version at a time.
+>     - A takeover adopts the whole chain into the successor's partition.
+>     - A checkpoint keeps 40 bytes for every accepted identity.
+>     - The checkpoint walk is not sliced.
 >
 > - **The quiet arm's first rungs: correct, and far from 1 ms** (Mac Studio, load 5 to 9, one node; BENCHMARKS, "The
 >   load test's quiet arm"). At 1,000 clients p50 is 35 to 73 ms and p99 158 to 227 ms; at 3,000, p50 197 to 219 ms.
@@ -82,7 +94,7 @@
 >   an operation, 8,960 a second), so a closed-loop client's latency is clients × service time. At 3,000 clients the
 >   green's retention cap refused 2,405 submits `BudgetExceeded`: a version keeps the whole previous bytes of every
 >   file it overwrote, and the history folds only down to the oldest base a live work holds. Walls owed for the
->   10k–100k rungs, besides the green chain's checkpointing above:
+>   10k–100k rungs (the green chain's checkpointing above is closed on the owner):
 >   - a green's works served off its owner's shard, with only the verdict serialized;
 >   - history that keeps what a version overwrote, not whole files;
 >   - a stated offered load per client for the 1 ms bound. At zero think time, 100k clients at 1 ms is 10⁸
