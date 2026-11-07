@@ -10661,3 +10661,44 @@ silicon), release binaries of agents/loadtest-scale-1 at 6f7c5306, load 5.0 to 9
 - **The 3,000 rung's refusals:** 2,405 submits were refused `BudgetExceeded`, at the green's retention cap. A version
   keeps the whole previous bytes of every file it overwrote, and the history folds only down to the oldest base a
   live work holds. 3,766 versions were accepted.
+
+## CreateGreen sliced: its shard and peak RSS over `fs/` and the whole kernel (2026-11-07)
+
+`agents/reland-a207-3` (`CreateGreen { base }` walked, hashed and seeded in slices with its reply deferred; the
+identity hashed with no buffer; `with_origin` by value; canonicalizing without cloning keys) against its base, main
+`4326a9d8`.
+
+**The shard** (`crates/server/tests/green_fairness.rs`: 1,000 files of 16 KiB, one shard, a second client probing it;
+CI, quiet 4-vCPU runners, 3 runs each):
+
+| Runner | main `4326a9d8` + the test (diag run 42371545928) | sliced (diag run 42371546045) |
+|---|---|---|
+| ubuntu-latest | one poll of 134.0 / 134.5 / 134.5 ms, 0 probes inside | 155 / 149 / 166 ms, 306 / 259 / 288 probes inside, longest 13.5 / 13.6 / 13.4 ms |
+| ubuntu-24.04-arm | one poll of 961 / 960 / 962 ms, 0 probes inside | 1.71 / 1.74 / 1.76 s, 1,193 / 1,404 / 1,456 probes inside, longest 7.6 / 10.0 / 9.8 ms |
+
+At 4,000 files (diag runs 42365451658, 42367880917) main held the shard 549 to 556 ms on x86_64 and about 3.8 s on
+arm64. The first sliced build left one unit of about 255 ms on arm64, which turned out to be the key cloning in
+canonicalize.
+
+**Memory and time** (`load_bench --tree <linux-v7.4-rc1>/<tree> --clients 1`, release, in-process daemon, under
+`/usr/bin/time -l`; Apple M5 Max, 18 cores, 128 GiB, macOS 26.4.1; interleaved; 2026-11-07 12:00-15:00 UTC; main
+`load_bench` MD5 `951c8406…`, the branch's `6b000576…`, each built in its own target dir; other agents' load as shown):
+
+| Tree | Build | Peak RSS (bytes), runs 1 / 2 / 3 | CreateGreen (ns), runs 1 / 2 / 3 | Load at each run's end |
+|---|---|---|---|---|
+| `fs/` (2,365 files, 51 MB) | main | 360,808,448 / 423,182,336 / 512,589,824 | 1,163,369,916 / 666,684,709 / 681,655,833 | 57 / 49 / 48 |
+| `fs/` | sliced | 282,722,304 / 304,676,864 / 292,438,016 | 2,296,340,458 / 1,466,747,791 / 1,619,755,917 | 53 / 51 / 46 |
+| whole (97,229 files, 1.68 GB) | main | 9,622,224,896 / 9,418,211,328 | 48,226,987,000 / 89,095,751,125 | 11 / 12 |
+| whole | sliced | 8,017,805,312 / 8,017,379,328 | 82,290,335,459 / 269,366,051,209 | 84 / 91 |
+
+- **Peak RSS:** best of runs, `fs/` 360.8 to 282.7 MB (22% less); the whole kernel 9.42 to 8.02 GB (15% less, about
+  0.84 of the tree's bytes). That is the two transient copies gone: `encode()`'s clone and buffer, made only to hash,
+  and `with_origin`'s clone.
+- **What is left:** the store's pinned copy (the pin alone took the whole kernel's RSS to 3.4 GB, GAPS), the origin
+  the walk reads out, and the engine's two lifetime copies (head content and version 0's history). The second engine
+  copy is loadtest-scale's to share after W2.
+- **The time is the slicing's price, not comparable here.** The sliced green yields after every slice of its step
+  quantum, so its creation is longer and grows with the shard's load. Its whole-kernel runs ran at load 84 to 91
+  against main's 11 to 12. On the quiet CI runners above, the sliced walk took 1.1 to 1.9 times main's one poll. Main's
+  number is a poll that held the shard throughout.
+- Every run's harness ended with 0 oracle failures.
