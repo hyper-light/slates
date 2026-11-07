@@ -5653,8 +5653,9 @@ sender refuses with `StaleEpoch{current}`. Refreshes consume the operation's bou
 budget; the latter refusal ends the sender's authority.
 
 **Exactly-once.** `(client id, sequence)` request ids; completion records kept until acknowledged
-(the client acknowledges by advancing its sequence window); retries return the original result;
-provisioning is therefore safe to retry after any failure.
+(the client acknowledges by advancing its sequence window, naming the ids at or below it that it
+still owes); retries return the original result; provisioning is therefore safe to retry after any
+failure.
 
 > **Status (2026-10-07, the bound built).** The bound this section requires ("exhaustion refuses admission") was not
 > built: a client's records grew until it acknowledged, and a client that never did grew them without end. Each
@@ -5685,6 +5686,23 @@ provisioning is therefore safe to retry after any failure.
 > it is resent or released (`release_retryable`), within the reconnect budget, so a caller that never resends cannot
 > pin it (`a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id`;
 > `docs/bugs/2026-11-06-a-resend-under-its-id-was-already-acknowledged.md`).
+
+> **Status (2026-11-07, an acknowledgement names the ids still owed).** A watermark is contiguous, so one held or
+> slow request kept every later completion of its client: the owner pruned none of them, and past `2 × slots` refused
+> the client's next requests `AcknowledgementOwed`. At `f = 1`, where nearly every slow submit is held, that was the
+> steady state: 906,317 refused against 59,646 served on the owner shard of fixtures' 1,000-client rung, 2.46 million
+> at the quiet arm's 10,000. An `Acknowledge { up_to, owed }` now covers every id the client issued and names the
+> ones at or below it still owed (awaited, held for a resend, `Unpublished`): at most the ring's slots and the hold's
+> cap. Every partition releases the rest and keeps the owed ones open, answerable and recordable. An acknowledgement
+> closes only what it speaks for: an open id at or below its `up_to` that it does not name is closed, one above its
+> `up_to` is left open, and a closed id is never opened again, so an acknowledgement that arrives late, by a scatter
+> or a relay, can close only ids it covers and reopen none, and a released id is never executed twice. One naming an
+> owed id above its `up_to`, or more than `2 × slots` of them, is refused whole (`BadRequest`, `ack.malformed`), never
+> cut, since a cut would release ids still owed (raft). The origin relays the owed ids beside the watermark
+> with a forwarded write, so the owner keeps a held submit's record too (`slates_wire::request::ClientWindow`,
+> `Op::CompletionsAcknowledged`, `ClientCompletions::owed`, `ForwardedRequest::ack_owed`, `slates_client`
+> `acknowledgement`; `a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound`;
+> `docs/bugs/2026-11-07-a-held-request-kept-every-later-completion-of-its-client.md`).
 
 > **Status (2026-11-05, A-216: an acknowledgement is answered once its own shard has released).** An `Acknowledge
 > { up_to }` releases the client's records at or below `up_to` on every partition that may hold them. Its reply now

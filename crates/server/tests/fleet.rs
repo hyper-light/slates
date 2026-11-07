@@ -6830,7 +6830,13 @@ impl Client {
     let up_to = self.sequence;
     self.sequence += 1;
     if matches!(
-      self.send_at(self.sequence, &RequestBody::Acknowledge { up_to }),
+      self.send_at(
+        self.sequence,
+        &RequestBody::Acknowledge {
+          up_to,
+          owed: Vec::new(),
+        }
+      ),
       ReplyBody::Acknowledged
     ) {
       self.acknowledged = up_to;
@@ -10082,6 +10088,145 @@ fn assert_resent_under_its_id(run: &ForwardedResend) {
     "the resend under its id meets the committed result: {:?}",
     run.answer
   );
+}
+
+/// Shape: the edits the held-submit test makes past its client's completion bound, in rings: four rings is twice the
+/// bound (`completion_bound` = two rings), so a client whose records cannot be pruned is refused well before the end.
+const RINGS_OF_EDITS_PAST_A_HELD_SUBMIT: usize = 4;
+
+/// §4.9 "Exactly-once" (RIFL's acknowledgements), found by fixtures' `f = 1` rungs on 7bc80672 (owner shard 1 refused
+/// 906,317 requests `AcknowledgementOwed` against 59,646 served at 1,000 clients): in a two-node `f = 1` fleet whose
+/// holder B withholds every merge record, a client on B submits a work whose green A owns, and is answered retryable
+/// under its id. The client holds that id for its resend, so its acknowledgement watermark stops below it, and A can
+/// prune none of the client's later completions. Do: the same client makes four rings of edits to another work on A,
+/// resending the held submit under its id every half ring, as the load harness does; then the holder's fault is lifted,
+/// the version commits, and the submit is sent once more under its id. Expect: every edit served, none refused
+/// `AcknowledgementOwed`; the last resend answered `Submitted { version: Some(1) }` from the completion the commit
+/// recorded. Before: refused `AcknowledgementOwed` once the client's records on A reached twice its ring's slots.
+#[test]
+fn a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let (green, work) = green_and_work_on(&instance_a);
+  let other = another_work_on(&instance_a, green);
+  let withheld = daemon_b.inject_merge_fault(slates_server::merge_service::MergeFault {
+    refuse_content_puts: false,
+    corrupt_next_inputs: false,
+    refuse_records: true,
+  });
+  let mut client = common::client::connect(daemon_b.instance());
+  let edited = client.edit(work, "f", 0, 0, b"hello");
+  let submit = RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  };
+  let word = client.begin(&submit).map(|id| id.word());
+  let first = word
+    .as_ref()
+    .ok()
+    .and_then(|word| answer_within(&mut client, *word));
+  let slots = client.ring_slots();
+  let edits = edits_while_held(
+    &mut client,
+    other,
+    slots,
+    word.as_ref().ok().copied(),
+    &submit,
+  );
+  let lifted = daemon_b.inject_merge_fault(slates_server::merge_service::MergeFault::default());
+  let both = [&daemon_a, &daemon_b];
+  let committed = poll_until(&both, PLACEMENT_DEADLINE, || {
+    daemon_a.merge_record_placed(green, 1)
+  });
+  let answer = word
+    .as_ref()
+    .ok()
+    .and_then(|word| resent_answer(&mut client, *word, &submit));
+  drop(client);
+  daemon_a.stop();
+  daemon_b.stop();
+  assert!(
+    withheld.is_ok() && lifted.is_ok() && edited.is_ok() && word.is_ok() && committed,
+    "the run's steps: fault {withheld:?}/{lifted:?}, edit {edited:?}, sent {}, committed {committed}",
+    word.is_ok()
+  );
+  assert!(
+    matches!(
+      &first,
+      Some(Err(refusal)) if refusal.starts_with("Overloaded") || refusal.starts_with("OwnerUnreachable")
+    ),
+    "the forwarded submit's acceptance outlived a budget, answered retryable under its id: {first:?}"
+  );
+  assert_eq!(
+    (edits.served, edits.refused.as_deref()),
+    (RINGS_OF_EDITS_PAST_A_HELD_SUBMIT * slots, None),
+    "every edit past the bound served while the submit was held ({} resends)",
+    edits.resends
+  );
+  assert!(
+    matches!(
+      answer,
+      Some(Ok(ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }))
+    ),
+    "the resend under its id still meets the committed result: {answer:?}"
+  );
+}
+
+/// What the edits made while a submit was held came to: served, the first refusal (which ends them), and the submit's
+/// resends under its id.
+struct EditsWhileHeld {
+  served: usize,
+  refused: Option<String>,
+  resends: usize,
+}
+
+/// Makes `RINGS_OF_EDITS_PAST_A_HELD_SUBMIT` rings of edits to `work`, resending `submit` under `word` and taking its
+/// answer every half ring, so the client keeps holding the id as the load harness does (each retryable answer renews
+/// the hold). Stops at the first refused edit.
+fn edits_while_held(
+  client: &mut slates_client::Client,
+  work: VolumeId,
+  slots: usize,
+  word: Option<u64>,
+  submit: &RequestBody,
+) -> EditsWhileHeld {
+  let mut run = EditsWhileHeld {
+    served: 0,
+    refused: None,
+    resends: 0,
+  };
+  let every = (slots / 2).max(1);
+  for n in 0..RINGS_OF_EDITS_PAST_A_HELD_SUBMIT * slots {
+    if n % every == 0
+      && let Some(word) = word
+      && resent_answer(client, word, submit).is_some()
+    {
+      run.resends += 1;
+    }
+    match client.edit(work, "g", 0, 0, b"x") {
+      Ok(()) => run.served += 1,
+      Err(e) => {
+        run.refused = Some(format!("{e:?}"));
+        break;
+      }
+    }
+  }
+  run
+}
+
+/// Another work over `green`, created through `instance`'s node, which owns it.
+fn another_work_on(instance: &str, green: VolumeId) -> VolumeId {
+  let mut owner_client = Client::connect(instance);
+  let ReplyBody::WorkCreated { id: work, .. } = owner_client.call(&RequestBody::CreateWork {
+    green,
+    name: "another-work".to_owned(),
+  }) else {
+    panic!("create another work");
+  };
+  work
 }
 
 /// AC-8.19/T-8.17 and §4.16 "Commit" ("committed at f+1 acknowledgements … issued only when every

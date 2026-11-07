@@ -520,6 +520,7 @@ async fn promote_region_here_or_forward(region: u64, principal: Principal) -> Re
         // no-op), so it needs no completion record — the request id and watermark are unused for it.
         request: 0,
         ack_up_to: None,
+        ack_owed: Vec::new(),
       });
       match crate::fleet::forward_over_leader_session(
         leader,
@@ -558,6 +559,9 @@ pub(crate) struct ForwardedRequest {
   /// completions the way a local client's are pruned by its acknowledgements (§4.9 RIFL; banned item 8).
   /// `None` before the client has acknowledged anything.
   pub ack_up_to: Option<u32>,
+  /// The ids at or below `ack_up_to` the client still owes (its origin window's open ids), relayed so the owner keeps
+  /// them open too: a forwarded submit held for its resend must still meet its record (§4.9).
+  pub ack_owed: Vec<u32>,
 }
 
 /// The volume whose **latest state** a verb serves, so it requires a confirmed owner lease (§4.8 "Leases
@@ -842,6 +846,7 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     body,
     request,
     ack_up_to,
+    ack_owed,
   }) = decode_body::<ForwardedRequest>(bytes)
   else {
     return Vec::new();
@@ -906,7 +911,7 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
       shard,
       move |s| {
         if let Some(up_to) = ack_up_to {
-          prune_forwarded(s, origin_host, id.client, up_to);
+          prune_forwarded(s, origin_host, id.client, up_to, &ack_owed);
         }
         // The fleet envelope carries no trace context yet: the verb's span declares its cause missing.
         let reply = run_forwarded(s, origin_host, id, 0, &principal, body, None);
@@ -988,18 +993,29 @@ async fn await_deferred_completion(
 }
 
 /// Prunes a forwarded client's completions on this (owner) node up to the acknowledgement watermark the
-/// origin relayed, the same way a local client's are pruned by its acknowledgements — so forwarded
-/// completions do not grow unbounded (§4.9 RIFL; banned item 8). A no-op when the watermark has not advanced,
-/// so a stream of forwarded writes at a steady watermark writes no acknowledgement records.
-fn prune_forwarded(state: &mut ShardState, origin: u64, client: u32, up_to: u32) {
-  let advances = state
-    .db
-    .partition()
+/// origin relayed, except the ids it still owes, the same way a local client's are pruned by its acknowledgements — so
+/// forwarded completions do not grow unbounded (§4.9 RIFL; banned item 8). A no-op when the acknowledgement would
+/// release nothing new (the watermark has not advanced and every id still open is still owed), so a stream of
+/// forwarded writes at a steady watermark writes no acknowledgement records.
+fn prune_forwarded(state: &mut ShardState, origin: u64, client: u32, up_to: u32, owed: &[u32]) {
+  let partition = state.db.partition();
+  let advances = partition
     .acknowledged_up_to(origin, client)
-    .is_none_or(|current| up_to > current);
+    .is_none_or(|current| up_to > current)
+    || partition
+      .owed_completions(origin, client)
+      .iter()
+      .any(|open| *open <= up_to && !owed.contains(open));
   if !advances {
     return;
   }
+  let owed = match acknowledgement_owing(state, up_to, owed) {
+    Ok(owed) => owed,
+    Err(_) => {
+      state.count(ACK_MALFORMED, 1);
+      return;
+    }
+  };
   let now = state.clock.monotonic_ns();
   // Retried by the next advance; a refusal is counted, never silent.
   let recorded = state.db.mutate(
@@ -1008,10 +1024,45 @@ fn prune_forwarded(state: &mut ShardState, origin: u64, client: u32, up_to: u32)
       origin,
       client,
       up_to,
+      owed,
     },
     now,
   );
   count_secondary(state, recorded);
+}
+
+/// Format: the count of acknowledgements refused as malformed, a local client's (answered `BadRequest`) or one an
+/// origin relayed with a forwarded write (dropped): an owed id above its own watermark, or more owed ids than the
+/// client's completion bound. Nothing of one is released. Shown in `slates status`.
+pub(crate) const ACK_MALFORMED: &str = "ack.malformed";
+
+/// The owed ids of an acknowledgement, in order, or the refusal of a malformed one (§4.9): an owed id above its own
+/// watermark, or more than the client's completion bound of them. A conforming client owes at most its ring's slots and
+/// its hold, so only a hostile list exceeds the bound. It is refused whole, never cut: cutting would release ids the
+/// client still owes, and their resends would then be refused `DuplicateRequest` (raft).
+fn acknowledgement_owing(
+  state: &ShardState,
+  up_to: u32,
+  owed: &[u32],
+) -> Result<Vec<u32>, Refusal> {
+  let mut named: Vec<u32> = owed.to_vec();
+  named.sort_unstable();
+  named.dedup();
+  if named.last().is_some_and(|highest| *highest > up_to) {
+    return Err(Refusal::BadRequest {
+      reason: format!("an acknowledgement up to {up_to} names an owed id above it"),
+    });
+  }
+  let bound = completion_bound(state);
+  if u64::try_from(named.len()).unwrap_or(u64::MAX) > bound {
+    return Err(Refusal::BadRequest {
+      reason: format!(
+        "an acknowledgement names {} owed ids, past the client's completion bound of {bound}",
+        named.len()
+      ),
+    });
+  }
+  Ok(named)
 }
 
 /// Counts a secondary record the database refused (`DB_SECONDARY_REFUSED`): one a verb writes beside its own effect
@@ -1437,15 +1488,16 @@ pub(crate) fn forwarded_request(
   principal: Principal,
   body: RequestBody,
 ) -> Vec<u8> {
-  let ack_up_to = state
-    .db
-    .partition()
-    .acknowledged_up_to(state.origin_anchor.0, RequestId::from_word(request).client);
+  let client = RequestId::from_word(request).client;
+  let partition = state.db.partition();
+  let ack_up_to = partition.acknowledged_up_to(state.origin_anchor.0, client);
+  let ack_owed = partition.owed_completions(state.origin_anchor.0, client);
   encode_body(&ForwardedRequest {
     principal,
     body,
     request,
     ack_up_to,
+    ack_owed,
   })
 }
 
@@ -1991,8 +2043,14 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
       principal.clone(),
     );
   }
-  if let RequestBody::Acknowledge { up_to } = body {
-    return scatter_acknowledge(state, client.index(), request.request, client_id, up_to);
+  if let RequestBody::Acknowledge { up_to, owed } = body {
+    return scatter_acknowledge(
+      state,
+      client.index(),
+      request.request,
+      client_id,
+      (up_to, owed),
+    );
   }
   // An attach of another host's volume is remembered with its client here, on the client's own shard, before it is
   // sent anywhere, so the client's reap reaches the owner (A-222).
@@ -2956,7 +3014,7 @@ fn scatter_acknowledge(
   _client_index: u32,
   request: u64,
   client_id: u32,
-  up_to: u32,
+  (up_to, owed): (u32, Vec<u32>),
 ) -> Served {
   let others: Vec<u16> = state
     .shards
@@ -2964,7 +3022,7 @@ fn scatter_acknowledge(
     .copied()
     .filter(|s| *s != state.shard)
     .collect();
-  let mine = acknowledge(state, client_id, up_to);
+  let mine = acknowledge(state, client_id, up_to, &owed);
   // A refusal here is the reply, and nothing was released: the next acknowledgement asks again.
   if others.is_empty() || matches!(mine, ReplyBody::Refused { .. }) {
     return Served::Reply(mine);
@@ -2977,9 +3035,10 @@ fn scatter_acknowledge(
   state.ack_scatters.insert(request, others.len());
   let origin = state.shard;
   for shard in others {
+    let owed = owed.clone();
     let task = SpawnRequest::new(
       Box::pin(async move {
-        let part = crate::state::with_state(|s| acknowledge(s, client_id, up_to))
+        let part = crate::state::with_state(|s| acknowledge(s, client_id, up_to, &owed))
           .unwrap_or_else(|| refused(Refusal::NotFound));
         let back = SpawnRequest::new(
           Box::pin(async move {
@@ -3938,7 +3997,7 @@ fn dispatch_inner(
     ),
     RequestBody::Grants => crate::landing::grants_verb(state, principal),
     RequestBody::Audit { since } => crate::landing::audit_verb(state, since),
-    RequestBody::Acknowledge { up_to } => acknowledge(state, client_id, up_to),
+    RequestBody::Acknowledge { up_to, owed } => acknowledge(state, client_id, up_to, &owed),
     RequestBody::ReadBase { volume, path } => read_base(state, principal, volume, &path),
     RequestBody::Digest { volume, path } => digest(state, principal, volume, &path),
     RequestBody::Rewitness { volume, paths } => {
@@ -8875,7 +8934,7 @@ fn list(state: &mut ShardState, principal: &Principal) -> ReplyBody {
   ReplyBody::Listed { volumes }
 }
 
-fn acknowledge(state: &mut ShardState, client_id: u32, up_to: u32) -> ReplyBody {
+fn acknowledge(state: &mut ShardState, client_id: u32, up_to: u32, owed: &[u32]) -> ReplyBody {
   let now = state.clock.monotonic_ns();
   // A local client acknowledges its own completions, keyed under this node's **stable cert-anchor** — the
   // same key `serve` records and looks them up under (task #22 two-id model), never the ephemeral member
@@ -8885,12 +8944,20 @@ fn acknowledge(state: &mut ShardState, client_id: u32, up_to: u32) -> ReplyBody 
   // times in two days — also `…-acknowledge-keyed-on-ephemeral-member-id.md`,
   // `2026-09-14-ack-keyed-under-ephemeral-member-id.md` and `2026-09-14-ack-keyed-on-ephemeral-member-id.md`).
   let origin = state.origin_anchor.0;
+  let owed = match acknowledgement_owing(state, up_to, owed) {
+    Ok(owed) => owed,
+    Err(refusal) => {
+      state.count(ACK_MALFORMED, 1);
+      return refused(refusal);
+    }
+  };
   match state.db.mutate(
     &mut state.segment,
     &Op::CompletionsAcknowledged {
       origin,
       client: client_id,
       up_to,
+      owed,
     },
     now,
   ) {

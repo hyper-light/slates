@@ -133,8 +133,11 @@ pub enum Op {
     origin: u64,
     /// The client.
     client: u32,
-    /// Every sequence up to and including this one.
+    /// Every sequence up to and including this one, except `owed`.
     up_to: u32,
+    /// The ids at or below `up_to` the client still owes (awaited, or held for a resend under the same id): kept open
+    /// rather than released (§4.9). An open id this does not name is closed; a closed one is never reopened.
+    owed: Vec<u32>,
   },
   /// A grant was issued.
   GrantIssued {
