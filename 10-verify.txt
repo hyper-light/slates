@@ -26,3 +26,9 @@ slates-cluster: fleet: HostId(13630349979494854068) holds HostId(148276788386039
 thread 'a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet' (39095) panicked at crates/cli/tests/live_chaos.rs:2455:7:
 the fleet re-formed after the successor: [Some(("13630349979494854068", 3, 0)), Some(("14827678838603966350", 2, 1)), Some(("18231464956103320414", 2, 1))]
 mounts 0
+=== rejoin 4 exit 0 load { 49.33 42.68 25.57 }
+rejoins: successor daemon 22008 answered after 53.373125ms
+slates-cluster: fleet: HostId(1572904175628385007) holds HostId(7818089309423443574) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+rejoins: the fleet re-formed after 2.253332s
+slates daemon: the anchor is gone; leaving
+mounts 0
