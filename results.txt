@@ -1,2 +1,6 @@
 tested ef588f4c02268c3bf64c7af92c6ba1c0a88f46ca on aarch64, 4 cpus
 build exit 0
+run 1 exit 0 9s load=2.38 0.92 0.34
+    slates daemon: the control shard's beat task ran 553 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 36 steps and 109 polls (109 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 252 ms and its timer overrun 0 ms
+    green over 4000 files of 16384 bytes: 6.477019138s, reply GreenCreated { id: VolumeId { bytes: [183, 142, 127, 155, 127, 145, 30, 31, 0, 0, 0, 0, 0, 0, 35, 7] } }; 3383 probes inside it — p50 875.114µs, p99 3.053422ms, longest of all 254.311586ms; before it the longest 802.407µs
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.29s
