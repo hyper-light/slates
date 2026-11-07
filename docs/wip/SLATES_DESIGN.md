@@ -2613,8 +2613,10 @@ client takes the refusal without telling the program (`msync` returns 0), so a p
 through the socket route (A-186).
 > Status (2026-10-31): built and measured, Ada's A/B against applying the write-back (A-192). Through Apple's client the
 > other path's write is kept 9 of 9 (arm A lost it 9 of 9); the adversarial suite passes 6 of 6 (arm A 2 of 6). It costs
-> nothing measurable quiet, and 2–3 % a write-back while another connection writes (`docs/wip/BENCHMARKS.md`). A
-> restart starts the states empty (GAPS).
+> nothing measurable quiet, and 2–3 % a write-back while another connection writes (`docs/wip/BENCHMARKS.md`).
+> Status (2026-11-07, A-231): a takeover no longer starts a held connection's states empty. Each publication carries
+> the held connections' states; a successor takes them back, and judges every file made before the takeover as possibly
+> cached by a connection the anchor handed it, so a change since makes those bytes stale.
 
 **NFS versions (direction, 2026-09-26).** One NFS server speaks several versions over the shared
 bridge core: v3 as today, and v4.1 and v4.2 (RFC 8881, RFC 7862, RFC 8276, and pNFS flexfiles
@@ -13367,6 +13369,42 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
+### A-231 — A held NFS connection's byte states cross a takeover, and what the successor cannot know is judged stale (accepted 2026-11-07, the supervisor's decision)
+Applied in the same change to: §4.6 "NFS v3" (its status), A-192 (its restart line), GAPS, `crates/vfs`
+(`recover.rs`: `HeldNfsStates`, `CarriedFile`, `CarriedRange`, `CarriedByte`, `ShardImage::nfs_states`, image version
+22; `checkpoint_log.rs`: `ShardDelta::nfs_states`, delta version 5; `volume.rs`: `Volume::issued_below`),
+`crates/bridge-fuse` (`coherence.rs`: `PageStates::carried`, `restored`, `opened_unknown`), `crates/server`
+(`nfs_writeback.rs`: the held and inherited connections, `carry`, `restore`, the takeover bound; `nfs.rs`: a connection
+the anchor handed back is marked inherited; `verbs.rs`: both publication paths carry the states, recovery restores them
+last), `crates/cli/tests/nfs_held.rs` (the history test).
+- **What was wrong.** A-192 keeps, per connection, what its client's cache of each file is as of, and refuses a
+  write-back of stale bytes. A held connection (A-113) outlives its daemon, but its states did not: a successor started
+  them empty and judged every file untracked as never fetched, so a stale write-back of a page fetched before the
+  takeover was applied over another path's newer change.
+- **The rule.**
+  - Each publication carries the held connections' states, every tracker consumed through its journal's head first, each
+    range's journal point dropped (a successor's journal begins again): never fetched, fresh, stale or unknown.
+  - A successor takes them back once the volumes are rebuilt, every byte placed before its own journal's first record,
+    so every change since the publication that touched a byte, replayed or newer, marks it stale.
+  - What the successor cannot know is judged stale too. A READ after the last publication was not carried, and a held
+    connection may have touched nothing before it. So a connection the anchor handed back treats every file made before
+    the takeover (an inode below the volume's counter at recovery, A-150) as possibly cached: a change since the takeover
+    makes those bytes stale. A file it first tracks after its tracker consumed changes is taken from the journal's
+    changes to it since the successor's first record, or as unknown once the journal no longer reaches back, and a
+    write-back over unknown bytes is refused until a fetch makes them fresh. Files made after the takeover are judged as
+    A-192 judges them.
+- **What it costs.** A program store into bytes another path changed after the takeover, made through a page the client
+  fetched after the last publication, is refused with the rest of its write-back, and Apple's client drops it silently.
+  Each delta carries the held connections' states whole: a READ changes them without a publication of its own.
+- **Evidence.** `a_stale_write_back_is_refused_at_every_crash_point_of_its_history` (`crates/cli/tests/nfs_held.rs`,
+  macOS, `SLATES_TEST_CLI=1`): a held connection fetches a page, another path changes its first bytes, the connection
+  writes its page back from before the change, fetches again and writes back a fresh page; the daemon killed before each
+  step and after the last, on a fresh anchor each time. At all six crash points the stale write-back was refused
+  `NFS3ERR_IO`, the other path's bytes kept and the fresh write-back applied, and the successors took back carried
+  states. Red-checked: with nothing taken back, the crash after the fetch let the stale write-back apply (`0`, not `NFS3ERR_IO`). The carried states' round trip is unit-tested (`carried_states_come_back_before_the_successors_records`),
+  and both encodings of the image and the delta are compared with the field (`crates/vfs/tests`).
+- **Format.** Image version 22, delta version 5: earlier images and logs are refused by version, as before.
+
 ### A-SEAT — A client proves its id with a session key, and a request names its own client (accepted 2026-11-07, the supervisor's order)
 Applied in the same change to: §4.9 (its status), GAPS (GAP-A9-9's entry), the bug record of 2026-11-07,
 `crates/anchor` (`layout::SUP_SESSION_PRESENT`, `SUP_SESSION_SECRET`, `SESSION_SECRET_BYTES`, appended;
@@ -15390,7 +15428,7 @@ decided); in a third, `.github/workflows/ci.yml` (the three Windows NFS steps ru
   a program's stores in a refused page go without a word. When they came before the other path's write, that is the
   order of events; when they came after, through a page the client had not refetched, they were the newer write and
   are lost, the case only a byte-level merge could keep. A program that needs both kept maps through the socket route
-  (A-186). A daemon restart starts the states empty, so a page fetched before it is not judged.
+  (A-186). A daemon restart started the states empty, so a page fetched before it was not judged; A-231 carries them.
 - **Found and fixed on the way**, each failing a test first, each recorded in `docs/bugs/`:
   - The byte states panicked on an empty range, which an NFS WRITE of no bytes reached and no FUSE kernel sends: a
     release daemon would have aborted on it.

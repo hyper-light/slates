@@ -13561,7 +13561,8 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
         program's stores in a refused page go without a word. Where they came after the other path's write, through a
         page the client had not refetched, they were the newer write and are lost; only a byte-level merge, which is
         banned, could keep both. The socket route's writable map (A-186) keeps both.
-      - A daemon restart starts the states empty: a page fetched before it is not judged.
+      - A daemon restart started the states empty, so a page fetched before it was not judged. Fixed 2026-11-07 by
+        A-231: a publication carries the held connections' states, and a successor judges what it cannot know as stale.
       - Main's, seen in both arms on fedora-2 at load 24–63 under `CPUWeight=1`: `nfs_hostile`'s broken-connections test
         answers an honest client's forwarded call `SYSTEM_ERR` once in about five runs (arm A 1 of 5, arm B 1 of 5
         interleaved; 0 of 8 each in a later series at load 72–139). The call is forwarded under the liveness budget, 1 s,

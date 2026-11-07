@@ -9727,6 +9727,8 @@ pub struct Rebuilt {
   pub blocks_swept: usize,
   /// Host mounts of snapshots whose read-only views were rebuilt (AUD-29-76).
   pub snapshot_views: usize,
+  /// Held NFSv3 connections' byte states taken back (A-231), one per connection and volume.
+  pub nfs_states_restored: usize,
   /// Merge volumes rebuilt (§4.16): greens with their persisted chain replayed, works with their log replayed over
   /// their green (A-207: their acknowledged edits survive).
   pub merge_volumes: usize,
@@ -9772,6 +9774,7 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
     replies,
     calls,
     nfs_replies,
+    nfs_states,
   } = recover_images(state);
   restore_nfs_answers(state, calls, nfs_replies);
   // The barrier replies the dead daemon published and never delivered, for the mounts the anchor held (A-61).
@@ -9899,6 +9902,9 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
   rebuilt.pins_reconciled = reconcile_clone_pins(state);
   // The recorded snapshot mounts' views, once the volumes and their pins are back (AUD-29-76).
   rebuilt.snapshot_views = crate::snapshot_view::rebuild(state);
+  // The held connections' byte states, once the volumes are back and every write since the publication replayed onto
+  // them (A-231): each change the successor's journal holds is one the states have not seen.
+  rebuilt.nfs_states_restored = crate::nfs_writeback::restore(state, nfs_states);
   rebuilt
 }
 
@@ -10331,6 +10337,7 @@ fn recover_images(state: &mut ShardState) -> RecoveredImages {
         replies: shard.replies,
         calls: shard.calls,
         nfs_replies: shard.nfs_replies,
+        nfs_states: shard.nfs_states,
       }
     }
     Ok((None, _)) => RecoveredImages::default(),
@@ -10353,6 +10360,7 @@ struct RecoveredImages {
   replies: Vec<slates_vfs::recover::HeldReply>,
   calls: Vec<slates_vfs::recover::HeldCall>,
   nfs_replies: Vec<slates_vfs::recover::HeldNfsReply>,
+  nfs_states: Vec<slates_vfs::recover::HeldNfsStates>,
 }
 
 /// What a shard publish committed (§4.8): the volumes the new image carries, and the ones it could
@@ -10588,6 +10596,8 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   let mut replies = pending_replies(state);
   let mut calls = call_records_checkpoint(state);
   let mut nfs_replies = held_nfs_replies(state);
+  // The held connections' byte states (A-231), each tracker consumed through now first.
+  let mut nfs_states = crate::nfs_writeback::carry(state);
   // A volume that cannot be captured restarts the checkpoint without it: the image's bytes before it may already be
   // in the slot, and the slot commits only when its header is written last, so the abandoned stream commits nothing.
   // Each restart leaves out one more volume, so there are at most as many restarts as volumes.
@@ -10598,7 +10608,7 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
       &handles,
       &skipped,
       &held,
-      (&mut replies, &mut calls, &mut nfs_replies),
+      (&mut replies, &mut calls, &mut nfs_replies, &mut nfs_states),
     ) {
       Ok(Streamed::Uncaptured(id, e)) => skipped.push((id, e)),
       Ok(Streamed::Committed(published)) => break Ok(published),
@@ -10664,10 +10674,11 @@ fn stream_checkpoint(
   handles: &[Handle<VolumeSlot>],
   skipped: &[(DbVolumeId, slates_vfs::VfsError)],
   held: &[u8],
-  (replies, calls, nfs_replies): (
+  (replies, calls, nfs_replies, nfs_states): (
     &mut Vec<slates_vfs::recover::HeldReply>,
     &mut Vec<slates_vfs::recover::HeldCall>,
     &mut Vec<slates_vfs::recover::HeldNfsReply>,
+    &mut Vec<slates_vfs::recover::HeldNfsStates>,
   ),
 ) -> Result<Streamed, slates_vfs::VfsError> {
   let left_out = |slot: &VolumeSlot| {
@@ -10720,7 +10731,11 @@ fn stream_checkpoint(
     }
     published.volumes.push(id);
   }
-  ShardImage::encode_finish(stream.buf(), held, (replies, calls, nfs_replies));
+  ShardImage::encode_finish(
+    stream.buf(),
+    held,
+    (replies, calls, nfs_replies, nfs_states),
+  );
   match state.journal.finish_checkpoint(stream) {
     Ok(frame_bytes) => published.frame_bytes = frame_bytes,
     Err(e) => return Ok(Streamed::Refused(e)),
@@ -10854,6 +10869,9 @@ fn publish_delta_into(
   let held_changed = held != state.published_held;
   let (mut calls, mut calls_removed) = call_records_delta(state);
   let mut nfs_replies = held_nfs_replies_changed(state).then(|| held_nfs_replies(state));
+  // The held connections' byte states (A-231), whole in every delta: a READ changes them without a publication of its
+  // own, so a delta carries them as of its own moment.
+  let mut nfs_states = crate::nfs_writeback::carry(state);
   slates_vfs::checkpoint_log::ShardDelta::encode_finish(
     encoded,
     count_at,
@@ -10862,7 +10880,7 @@ fn publish_delta_into(
     held_changed.then_some(&held[..]),
     Some(&pending_replies(state)),
     (&mut calls, &mut calls_removed),
-    nfs_replies.as_deref_mut(),
+    (nfs_replies.as_deref_mut(), Some(&mut nfs_states[..])),
   )?;
   let (start, end) = state.delta_range;
   let Some(object) = state.content.as_mut() else {

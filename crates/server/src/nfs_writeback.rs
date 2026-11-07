@@ -33,8 +33,15 @@
 //! 0 in every measured case. So the program's stores in a refused page are gone without a word. When they came before
 //! the other path's write, that is the order of events (the later write wins); when they came after, through a page
 //! the client had not refetched, they were the newer write and are lost — the case only a byte-level merge could keep,
-//! which is banned. A program that needs both kept maps through the socket route (A-186). And a daemon restart starts
-//! the states empty, so a page fetched before it is not judged.
+//! which is banned. A program that needs both kept maps through the socket route (A-186).
+//!
+//! **Across a takeover (A-231).** A connection the anchor holds outlives its daemon, so its states must too. Each
+//! publication carries the held connections' states ([`carry`]), every tracker consumed first; a successor takes them
+//! back once its volumes are rebuilt ([`restore`]), each byte placed before its own journal's first record, so every
+//! change since the publication marks the bytes it touched stale. What it cannot know is judged stale too: a connection
+//! the anchor handed back treats every file made before the takeover as possibly cached, so a change since makes those
+//! bytes stale, and a file it first tracks late is taken from the journal, or as unknown once the journal no longer
+//! reaches back.
 //!
 //! **Keeping the states current.** One tracker per volume with connections tracking its files: a journal reader (A-157),
 //! so a record waits for it, and a task parked on the volume's change generation that consumes each change into every
@@ -76,6 +83,10 @@ const KEEPER_REFUSED: &str = "nfs.writeback_keeper_refused";
 /// ended rather than take it: a tracker closed before its task first ran, and a new one opened.
 const STALE_KEEPERS: &str = "nfs.writeback_keepers_stale";
 
+/// Format: held connections' byte states taken back from the last publication after a takeover (A-231): the carry's
+/// non-vacuity count.
+const RESTORED: &str = "nfs.writeback_states_restored";
+
 /// Format: the point of a byte the client never fetched: no record can follow it, so no change makes the byte stale.
 const ABSENT: u64 = u64::MAX;
 
@@ -91,6 +102,15 @@ pub(crate) struct WritebackStates {
   trackers: BTreeMap<VolumeId, Tracker>,
   /// The identity the next tracker made takes.
   next_tracker: u64,
+  /// The connections the anchor holds among those tracked (A-231): only their states outlive the daemon, carried in each
+  /// publication. Bounded by the anchor's hold bound; a connection leaves it when it ends.
+  held: std::collections::BTreeSet<u64>,
+  /// The connections this daemon's anchor handed it at its start, held for a daemon before it (A-231): their clients may
+  /// hold pages fetched before the takeover. Bounded as [`WritebackStates::held`].
+  inherited: std::collections::BTreeSet<u64>,
+  /// Each volume of this shard's first inode number not issued at the takeover (A-231): a file below it may be cached
+  /// by an inherited connection's client. Bounded by the shard's volumes; set once, at recovery.
+  takeover_below: BTreeMap<VolumeId, u64>,
 }
 
 /// One volume's tracker: how far its journal is consumed, its change generation as of then, and each connection's
@@ -116,6 +136,14 @@ struct Connection {
   states: PageStates,
   own: OwnRecords,
   charged: u64,
+  /// Taken back after a takeover (A-231): the first inode number its volume had not issued then. What the connection
+  /// fetched after the last publication was not carried, so a file below it, which may have been cached before the
+  /// takeover, is taken as fetched before the successor's first record; a file at or past it was made since.
+  restored_below: Option<u64>,
+  /// First tracked here after its tracker had consumed changes made since the takeover (A-231): a file made before the
+  /// takeover is taken back from the journal's changes to it since the successor's first record, or as unknown once the
+  /// journal no longer reaches back.
+  late: bool,
 }
 
 /// A WRITE's verdict.
@@ -142,6 +170,7 @@ pub(crate) fn judge(
     return Verdict::Apply;
   }
   consume(s, volume);
+  let history = prepare(s, connection, (volume, ino));
   let range = at..at.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
   let stale = {
     let ShardState {
@@ -153,10 +182,7 @@ pub(crate) fn judge(
       return Verdict::Apply;
     };
     let conn = tracker.connections.entry(connection).or_default();
-    if !conn.states.tracks(ino) {
-      make_room(&mut store.metadata, conn, 1);
-      conn.states.opened(ino, ABSENT);
-    }
+    open_untracked(&mut store.metadata, conn, ino, &history);
     let lost = conn.states.take_lost_for_room();
     let stale = conn.states.stale_after(ino, range, ABSENT, &[]);
     (stale, lost)
@@ -235,6 +261,7 @@ pub(crate) fn fetched(
   let Some(head) = head_of(s, volume) else {
     return;
   };
+  let history = prepare(s, connection, (volume, ino));
   let lost = {
     let ShardState {
       nfs_writeback,
@@ -250,13 +277,112 @@ pub(crate) fn fetched(
       conn,
       MOST_ADDED_BY_AN_UPDATE.saturating_add(1),
     );
-    if !conn.states.tracks(ino) {
-      conn.states.opened(ino, ABSENT);
-    }
+    open_untracked(&mut store.metadata, conn, ino, &history);
     conn.states.fetched(ino, range, head);
     conn.states.take_lost_for_room()
   };
   s.count(LOST_FOR_ROOM, lost);
+}
+
+/// What an untracked file is to a connection it is first named on (A-192, A-231):
+/// - never fetched (`ABSENT`), so a write it makes without reading is a write: a connection not inherited, or a file
+///   made since the takeover;
+/// - for an inherited connection and a file made before the takeover, fetched before the successor's first record:
+///   with no change since, when its tracker consumed every change since the takeover into it (not [`Connection::late`]);
+///   else with the journal's changes to it since then (`history`), or every byte unknown once the journal no longer
+///   reaches back.
+fn open_untracked(
+  ledger: &mut slates_mem::budget::MetadataBudget,
+  conn: &mut Connection,
+  ino: u64,
+  history: &Option<Option<Changes>>,
+) {
+  if conn.states.tracks(ino) {
+    return;
+  }
+  if !conn.restored_below.is_some_and(|below| ino < below) {
+    make_room(ledger, conn, 1);
+    conn.states.opened(ino, ABSENT);
+    return;
+  }
+  match (conn.late, history) {
+    (true, Some(Some(changes))) => {
+      make_room(
+        ledger,
+        conn,
+        changes
+          .len()
+          .saturating_mul(MOST_ADDED_BY_AN_UPDATE)
+          .saturating_add(1),
+      );
+      conn.states.adopted(ino, 0, Some(changes));
+    }
+    (true, _) => {
+      make_room(ledger, conn, 1);
+      conn.states.opened_unknown(ino, 0);
+    }
+    (false, _) => {
+      make_room(ledger, conn, 1);
+      conn.states.opened(ino, 0);
+    }
+  }
+}
+
+/// A file's changes in a journal, each with its sequence and whether it is the connection's own.
+type Changes = Vec<(std::ops::Range<u64>, u64, bool)>;
+
+/// The changes to `ino` the successor's journal holds since its first record, each told the connection's own by `own`;
+/// `None` when the journal no longer reaches its first record (A-231).
+fn history(log: &slates_vfs::journal::OpLog, ino: u64, own: &OwnRecords) -> Option<Changes> {
+  if log.oldest_seq() > 1 {
+    return None;
+  }
+  Some(
+    log
+      .since(0)
+      .filter_map(slates_bridge_core::changed::data_change)
+      .filter(|change| change.ino == ino)
+      .map(|change| (change.range, change.seq, own.took(change.seq)))
+      .collect(),
+  )
+}
+
+/// Prepares connection `connection`'s entry in `volume`'s tracker for a call naming `ino`: an inherited connection first
+/// tracked here learns the takeover's bound and that it came late, and the journal's history of `ino` is read when that
+/// connection will need it ([`open_untracked`]). `Some(history)` only then.
+fn prepare(
+  s: &mut ShardState,
+  connection: u64,
+  (volume, ino): (VolumeId, u64),
+) -> Option<Option<Changes>> {
+  let inherited = s.nfs_writeback.inherited.contains(&connection);
+  let below = s.nfs_writeback.takeover_below.get(&volume).copied();
+  let tracker = s.nfs_writeback.trackers.get_mut(&volume)?;
+  let cursor = tracker.cursor;
+  let conn = tracker.connections.entry(connection).or_default();
+  if inherited && conn.restored_below.is_none() {
+    conn.restored_below = below;
+    conn.late = cursor > 0;
+  }
+  if !conn.late || conn.states.tracks(ino) || !conn.restored_below.is_some_and(|below| ino < below)
+  {
+    return None;
+  }
+  let own = std::mem::take(&mut conn.own);
+  let changes = s
+    .by_id
+    .get(&volume)
+    .and_then(|&handle| s.volumes.get(handle).ok())
+    .and_then(|slot| history(slot.volume.op_log(), ino, &own));
+  if let Some(conn) = s
+    .nfs_writeback
+    .trackers
+    .get_mut(&volume)
+    .and_then(|tracker| tracker.connections.get_mut(&connection))
+  {
+    conn.own = own;
+  }
+  Some(changes)
 }
 
 /// The journal's head of `volume` now, when it lives on this shard.
@@ -345,9 +471,116 @@ impl Drop for Footprint {
   }
 }
 
+/// What connection `connection` is: one the anchor holds (A-128), whose states are carried in each publication, and one
+/// it handed this daemon at its start, whose client may hold pages fetched before the takeover (A-231).
+pub(crate) fn note_connection(s: &mut ShardState, connection: u64, held: bool, inherited: bool) {
+  if held {
+    s.nfs_writeback.held.insert(connection);
+  }
+  if inherited {
+    s.nfs_writeback.inherited.insert(connection);
+  }
+}
+
+/// The held connections' byte states, for a publication (A-231): each tracker consumed through its journal's head first,
+/// so the states carried are as of this moment and nothing the publication carries is left unconsumed.
+pub(crate) fn carry(s: &mut ShardState) -> Vec<slates_vfs::recover::HeldNfsStates> {
+  if s.nfs_writeback.held.is_empty() {
+    return Vec::new();
+  }
+  let volumes: Vec<VolumeId> = s.nfs_writeback.trackers.keys().copied().collect();
+  for volume in &volumes {
+    consume(s, *volume);
+  }
+  let held = &s.nfs_writeback.held;
+  s.nfs_writeback
+    .trackers
+    .iter()
+    .flat_map(|(volume, tracker)| {
+      tracker
+        .connections
+        .iter()
+        .filter(|(connection, _)| held.contains(connection))
+        .map(
+          move |(&connection, conn)| slates_vfs::recover::HeldNfsStates {
+            connection,
+            volume: volume.bytes,
+            files: conn.states.carried(ABSENT),
+          },
+        )
+    })
+    .collect()
+}
+
+/// Takes back the held connections' byte states the last publication carried (A-231), once the volumes are rebuilt:
+/// each fetched byte placed before every record the successor's journal holds, so a change made after that publication
+/// (replayed, or made since) marks the bytes it touched stale when consumed, here at once while the journal still holds
+/// it. A journal that no longer reaches its first record loses every file, whose writes are then refused. The states
+/// taken back.
+pub(crate) fn restore(
+  s: &mut ShardState,
+  carried: Vec<slates_vfs::recover::HeldNfsStates>,
+) -> usize {
+  // Every volume's takeover bound, for the connections the anchor handed back that carried nothing for it.
+  let bounds: Vec<(VolumeId, u64)> = s
+    .by_id
+    .iter()
+    .filter_map(|(&volume, &handle)| {
+      s.volumes
+        .get(handle)
+        .ok()
+        .map(|slot| (volume, slot.volume.issued_below().0))
+    })
+    .collect();
+  s.nfs_writeback.takeover_below.extend(bounds);
+  let mut restored = 0usize;
+  let mut volumes = Vec::new();
+  for states in carried {
+    let volume = VolumeId {
+      bytes: states.volume,
+    };
+    if !tracking(s, volume) {
+      continue;
+    }
+    let Some(issued_below) = s.nfs_writeback.takeover_below.get(&volume).copied() else {
+      continue;
+    };
+    let ShardState {
+      nfs_writeback,
+      store,
+      ..
+    } = &mut *s;
+    let Some(tracker) = nfs_writeback.trackers.get_mut(&volume) else {
+      continue;
+    };
+    // Before every record the successor's journal holds: its replayed writes come after the publication.
+    tracker.cursor = 0;
+    let conn = tracker.connections.entry(states.connection).or_default();
+    let ranges: usize = states.files.iter().map(|file| file.ranges.len()).sum();
+    make_room(&mut store.metadata, conn, ranges);
+    // Every byte as fetched before the successor's first record, the never-fetched ones too: what the connection
+    // fetched after the last publication was not carried, so a byte carried as never fetched may have been since.
+    conn.states.restored(&states.files, 0, 0);
+    conn.restored_below = Some(issued_below);
+    nfs_writeback.held.insert(states.connection);
+    nfs_writeback.inherited.insert(states.connection);
+    volumes.push(volume);
+    restored = restored.saturating_add(1);
+  }
+  for volume in volumes {
+    consume(s, volume);
+  }
+  if restored > 0 {
+    s.count(RESTORED, u64::try_from(restored).unwrap_or(u64::MAX));
+  }
+  restored
+}
+
 /// Connection `connection` ended: its states go from every tracker of this shard, their ledger bytes returned, and a
 /// tracker left with no connection closes.
 fn ended(s: &mut ShardState, connection: u64) {
+  s.nfs_writeback.held.remove(&connection);
+  s.nfs_writeback.inherited.remove(&connection);
   let mut emptied = Vec::new();
   let mut credit = 0u64;
   for (volume, tracker) in &mut s.nfs_writeback.trackers {
@@ -465,6 +698,14 @@ fn consume(s: &mut ShardState, volume: VolumeId) {
     for conn in tracker.connections.values_mut() {
       for change in &changes {
         make_room(&mut store.metadata, conn, MOST_ADDED_BY_AN_UPDATE);
+        // A connection taken back after a takeover tracks a file made before it from its first change since: the
+        // client may hold pages of it fetched before the takeover, which the change makes stale (A-231).
+        if conn.restored_below.is_some_and(|below| change.ino < below)
+          && !conn.states.tracks(change.ino)
+        {
+          let past = conn.late.then(|| history(log, change.ino, &conn.own));
+          open_untracked(&mut store.metadata, conn, change.ino, &past);
+        }
         let own = conn.own.took(change.seq);
         conn
           .states
