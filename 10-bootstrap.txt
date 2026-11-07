@@ -134,3 +134,71 @@ live bootstrap --- the owner's volume stat
 journal_grown_bytes: 0 (growth refused 0)
 thread 'a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates' (35958) panicked at crates/cli/tests/live_fleet.rs:1932:3:
 the bootstrap node's live writes became durable and both candidates hold them: Some(("1", "1", "false")) [Some(("1", "none", "false")), Some(("1", "none", "false"))] [("live-bootstrap-a-16454", {"held": 2, "hold_refused": 6, "hold_refused.no_catalog": 2, "hold_refused.not_a_member": 4}), ("live-boot
+=== bootstrap on 3 exit 101 load { 61.58 44.36 26.11 }
+live bootstrap: written=false caught_up=true shipping=Some(("1", "1", "false")) held=[Some(("1", "none", "false")), Some(("1", "none", "false"))] [("live-bootstrap-a-17852", {"appended": 2, "awaited": 1, "durable": 2, "held_back.placement": 3, "holders_changed": 1, "no_session": 2, "whole": 2}), ("l
+live bootstrap --- live-bootstrap-a-17852
+fleet_host: 892716005316518267
+fleet_host_epoch: 1
+fleet_members: 892716005316518267 5075659726385654175 16233050656892037009
+fleet_replaced: 2
+fleet_configuration_version: 4
+fleet_configuration_members: 3
+fleet_council_leads: true
+fleet_council_voters: 3
+fleet_council_joint: false
+fleet_root_joint: false
+fleet_session 5075659726385654175: lent=false cwnd=18360 srtt_ns=974300 pto_ns=4149220 spurious_losses=0 persistent_collapses=0 consumed=42262 mtu=9209
+fleet_session 16233050656892037009: lent=false cwnd=18360 srtt_ns=885888 pto_ns=3790576 spurious_losses=0 persistent_collapses=0 consumed=42436 mtu=9209
+shard 0: clients=2 volumes=1 served=12 replayed=0 replay_ns=3591250 torn=false mapped=1073741824 locked=0 reserve=1073741824 committed=8388608 retained=0 replicated=0 retained_versions=0 metadata=795177722 committed_metadata=35408 tasks_refused=0 landings_awaiting=0/2248 landings_in_flight=0 target_
+shard 0 refused fleet.learner.fetch_paced: 18
+shard 0 refused fleet.learner.fetches: 4
+shard 0 refused fleet.live.held_back.placement: 3
+shard 0 live shipping 0c63907a1e32617b0000000000000012 head=1 durable=1 owed=false epoch=1 identity=b21ad12843e67d035f92e938a904d04ac692f7c1d7133801e638847db71f70f8 fence=1
+shard 0 span consensus.step: absent/unknown (never; producer configuration group expected here)
+shard 1: clients=2 volumes=0 served=11 replayed=0 replay_ns=3374250 torn=false mapped=0 locked=0 reserve=0 committed=0 retained=0 replicated=0 retained_versions=0 metadata=795177722 committed_metadata=0 tasks_refused=0 landings_awaiting=0/2248 landings_in_flight=0 target_leases=0
+shard 1 span consensus.step: absent/unknown (never; producer configuration group expected here)
+live bootstrap --- live-bootstrap-b-17852
+fleet_host: 16233050656892037009
+fleet_host_epoch: 1
+fleet_members: 892716005316518267 5075659726385654175 16233050656892037009
+fleet_replaced: 0
+fleet_configuration_version: 4
+fleet_configuration_members: 3
+fleet_council_leads: false
+fleet_council_voters: 3
+fleet_council_joint: false
+fleet_root_joint: false
+fleet_session 892716005316518267: lent=false cwnd=18360 srtt_ns=475538 pto_ns=1475538 spurious_losses=0 persistent_collapses=0 consumed=4675 mtu=9209
+fleet_session 5075659726385654175: lent=false cwnd=18360 srtt_ns=661971 pto_ns=2778863 spurious_losses=0 persistent_collapses=0 consumed=4605 mtu=9209
+shard 0: clients=1 volumes=0 served=9 replayed=0 replay_ns=3641541 torn=false mapped=0 locked=0 reserve=0 committed=0 retained=0 replicated=0 retained_versions=0 metadata=795177722 committed_metadata=0 tasks_refused=0 landings_awaiting=0/2248 landings_in_flight=0 target_leases=0
+shard 0 refused fleet.learner.fetch_paced: 22
+shard 0 refused fleet.learner.fetches: 8
+shard 0 live held 0c63907a1e32617b0000000000000012 head=1 durable=none owed=false epoch=1 identity=b21ad12843e67d035f92e938a904d04ac692f7c1d7133801e638847db71f70f8 fence=1
+shard 0 span consensus.step: absent/unknown (never; producer configuration group expected here)
+shard 1: clients=2 volumes=0 served=10 replayed=0 replay_ns=3823500 torn=false mapped=0 locked=0 reserve=0 committed=0 retained=0 replicated=0 retained_versions=0 metadata=795177722 committed_metadata=0 tasks_refused=0 landings_awaiting=0/2248 landings_in_flight=0 target_leases=0
+shard 1 span consensus.step: absent/unknown (never; producer configuration group expected here)
+live bootstrap --- live-bootstrap-c-17852
+fleet_host: 5075659726385654175
+fleet_host_epoch: 1
+fleet_members: 892716005316518267 5075659726385654175 16233050656892037009
+fleet_replaced: 0
+fleet_configuration_version: 4
+fleet_configuration_members: 3
+fleet_council_leads: false
+fleet_council_voters: 3
+fleet_council_joint: false
+fleet_root_joint: false
+fleet_session 892716005316518267: lent=false cwnd=18360 srtt_ns=588022 pto_ns=2522670 spurious_losses=0 persistent_collapses=0 consumed=4622 mtu=9209
+fleet_session 16233050656892037009: lent=false cwnd=18360 srtt_ns=493319 pto_ns=1522551 spurious_losses=0 persistent_collapses=0 consumed=3464 mtu=9209
+shard 0: clients=1 volumes=0 served=9 replayed=0 replay_ns=44375 torn=false mapped=0 locked=0 reserve=0 committed=0 retained=0 replicated=0 retained_versions=0 metadata=795177722 committed_metadata=0 tasks_refused=0 landings_awaiting=0/2248 landings_in_flight=0 target_leases=0
+shard 0 refused fleet.learner.fetch_paced: 22
+shard 0 refused fleet.learner.fetches: 8
+shard 0 refused fleet.live.hold_refused.no_catalog: 4
+shard 0 live held 0c63907a1e32617b0000000000000012 head=1 durable=none owed=false epoch=1 identity=b21ad12843e67d035f92e938a904d04ac692f7c1d7133801e638847db71f70f8 fence=1
+shard 0 span consensus.step: absent/unknown (never; producer configuration group expected here)
+shard 1: clients=2 volumes=0 served=10 replayed=0 replay_ns=22541 torn=false mapped=0 locked=0 reserve=0 committed=0 retained=0 replicated=0 retained_versions=0 metadata=795177722 committed_metadata=0 tasks_refused=0 landings_awaiting=0/2248 landings_in_flight=0 target_leases=0
+shard 1 span consensus.step: absent/unknown (never; producer configuration group expected here)
+live bootstrap --- the owner's volume stat
+journal_grown_bytes: 0 (growth refused 0)
+thread 'a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates' (39198) panicked at crates/cli/tests/live_fleet.rs:1932:3:
+the bootstrap node's live writes became durable and both candidates hold them: Some(("1", "1", "false")) [Some(("1", "none", "false")), Some(("1", "none", "false"))] [("live-bootstrap-a-17852", {"appended": 2, "awaited": 1, "durable": 2, "held_back.placement": 3, "holders_changed": 1, "no_session": 
