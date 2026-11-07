@@ -50,3 +50,13 @@ test measure_what_live_shipping_adds_to_a_stable_nfs_write ... skipping the live
 test three_daemon_processes_ship_a_live_volumes_writes_to_both_candidates ... slates daemon: fleet node `b` of `slates-fleet`: member 5411538477124408875 with 2 peer(s) at f = 1
 test writes_stay_durable_through_injected_candidate_stalls ... slates daemon: fleet node `a` of `slates-fleet`: member 11014476305666346393 with 2 peer(s) at f = 1
 test result: FAILED. 15 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 269.14s
+=== boot-1 exit 101 load { 9.01 10.26 11.80 }
+test a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates ... slates daemon: fleet node `a` of `slates-fleet`: member 9264973192659309374 with 2 peer(s) at f = 1
+live bootstrap: written=false caught_up=false shipping=Some(("1", "none", "false")) held=[None, None] [("live-bootstrap-a-40501", {}), ("live-bootstrap-b-40501", {}), ("live-bootstrap-c-40501", {"appended": 2, "awaited": 1, "holders_recorded": 2, "holders_transition": 1, "whole": 2})]
+live bootstrap --- live-bootstrap-a-40501
+live bootstrap --- live-bootstrap-b-40501
+live bootstrap --- live-bootstrap-c-40501
+live bootstrap --- the owner's volume stat
+thread 'a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates' (85214) panicked at crates/cli/tests/live_fleet.rs:1932:3:
+the bootstrap node's live writes became durable and both candidates hold them: Some(("1", "none", "false")) [None, None] [("live-bootstrap-a-40501", {}), ("live-bootstrap-b-40501", {}), ("live-bootstrap-c-40501", {"appended": 2, "awaited": 1, "holders_recorded": 2, "holders_transition": 1, "whole": 
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 82.79s
