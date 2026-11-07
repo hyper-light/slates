@@ -1,0 +1,6 @@
+tested 7bc80672155023953cba3266448d8ef9a146ab0f variant after on x86_64, 4 cpus
+cadence exit 101 26s
+  cadence: thread 'a_partitions_snapshots_cost_what_its_log_absorbs_not_its_size_per_megabyte' (3474) panicked at crates/db/tests/snapshot_cadence.rs:150:3:
+  cadence: test a_partitions_snapshots_cost_what_its_log_absorbs_not_its_size_per_megabyte ... FAILED
+  cadence: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.12s
+  cadence: error: test failed, to rerun pass `-p slates-db --test snapshot_cadence`
