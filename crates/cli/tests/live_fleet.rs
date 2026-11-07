@@ -871,6 +871,76 @@ fn each_candidate_stopped_in_turn_holds_no_write_and_catches_up() {
 /// takes the other holder's round trip (3–5 ms). The bound sits between, far from both.
 const STOPPED_WAIT: u64 = slates_server::daemon::LIVENESS_BUDGET_NS / 4;
 
+/// A-200 with both candidates stopped: do stop both candidates' processes, make a write so the owner has entries to
+/// ship (it waits, since no candidate can hold it), keep them stopped for three liveness budgets, then resume them.
+/// Expect the owner's sends that went unanswered to stay within what a holder's lane can end unanswered: once per record
+/// period and once per publication, for each holder. Found 2026-11-07 (CI macos-latest, `diag-live-durability-23`):
+/// a lane ending unanswered sent what every other holder lacked; with both links dropped, each holder's lane ended at
+/// once and sent the other's, and the two went back and forth at the shards' speed (1,658 unanswered sends in one stop,
+/// against 5-13 otherwise).
+#[test]
+fn both_candidates_stopped_draw_no_storm_of_sends() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping both-stopped flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-storm");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let others: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| **instance != owner)
+    .collect();
+  let id = create_live_volume(&owner, "storm");
+  write_files(&owner, &id, 0..1);
+  let before = counter(&owner, "fleet.live.unanswered");
+  let stopped: Vec<usize> = (1..fleet.instances.len())
+    .map(|step| (owner_index + step) % fleet.instances.len())
+    .collect();
+  for index in &stopped {
+    signal(&fleet.daemons[*index], rustix::process::Signal::STOP);
+  }
+  // The write waits for durability no candidate can give; its answer, whatever it is, is not what this judges.
+  let writer = {
+    let (owner, id) = (owner.clone(), id.clone());
+    std::thread::spawn(move || {
+      let attachment = value_of(&run_ready(&owner, &["attach", &id, "--write"]), "attachment");
+      let _ = run_with_stdin(
+        &owner,
+        &["write", &id, &attachment, "/while-stopped"],
+        live_body(1).as_bytes(),
+      );
+    })
+  };
+  let stop = Duration::from_nanos(3 * slates_server::daemon::LIVENESS_BUDGET_NS);
+  std::thread::sleep(stop);
+  let during = counter(&owner, "fleet.live.unanswered").saturating_sub(before);
+  for index in &stopped {
+    signal(&fleet.daemons[*index], rustix::process::Signal::CONT);
+  }
+  let _ = writer.join();
+  let (caught_up, shipping, held) = wait_caught_up(&owner, &others, &id);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  // Derived: each holder's lane ends unanswered at most once per record period (the period re-sends what it lacks) and
+  // once per publication (the write and its attach), plus the lane in flight when the stop began.
+  let periods = u64::try_from(stop.as_nanos() / u128::from(slates_server::daemon::HEARTBEAT_NS)).unwrap_or(u64::MAX);
+  let publications = 2;
+  let bound = u64::try_from(others.len()).unwrap_or(u64::MAX) * (periods + publications + 1);
+  eprintln!("live storm: unanswered sends while both stopped {during} (bound {bound}); then {shipping:?} {held:?}");
+  assert!(
+    during <= bound,
+    "unanswered sends while both candidates were stopped: {during}, over {bound}"
+  );
+  assert!(
+    caught_up,
+    "both candidates caught up once resumed: {shipping:?} {held:?}"
+  );
+}
+
 /// A-200: a new live volume's log is shipped only to candidates that hold its catalog. Do make a volume live-shipped and
 /// write files to it at once. Expect neither candidate to refuse an entry for not holding the volume's catalog
 /// (`fleet.live.hold_refused.no_catalog`): a candidate derives what it keeps from the catalog, which the record plane
