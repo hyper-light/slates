@@ -1,0 +1,1211 @@
+runner ubuntu-24.04-arm, 4 CPUs, Sat Nov  7 06:08:15 UTC 2026, arm B 2f72b6ec6aea1650af00686c5c924bd53eebe7be
+== quiet round 1 arm a at 06:08:15, load 1.79 2.28 1.25
+measure: the owner's live counters {"appended": 2051, "durable": 2051, "install_bytes": 6015, "install_sent": 2, "resolved": 2051, "whole": 2}
+hop holder serve.lt0008us 290
+hop holder serve.lt0016us 1568
+hop holder serve.lt0032us 191
+hop holder serve.lt0064us 2
+hop holder serve.n 2051
+hop holder serve.sum_ns 21093519
+hop owner back.lt0008us 2458
+hop owner back.lt0016us 739
+hop owner back.lt0032us 468
+hop owner back.lt0064us 204
+hop owner back.lt0128us 1
+hop owner back.n 3870
+hop owner back.sum_ns 43805535
+hop owner borrow.lt0008us 3869
+hop owner borrow.lt0016us 1
+hop owner borrow.n 3870
+hop owner borrow.sum_ns 2930343
+hop owner cwnd_pkts_k.lt0008us 3870
+hop owner cwnd_pkts_k.n 3870
+hop owner cwnd_pkts_k.sum_ns 3870000
+hop owner exchange.lt0128us 2
+hop owner exchange.lt0256us 3385
+hop owner exchange.lt0512us 478
+hop owner exchange.lt1024us 5
+hop owner exchange.n 3870
+hop owner exchange.sum_ns 898619932
+hop owner round.lt0256us 1095
+hop owner round.lt0512us 2770
+hop owner round.lt1024us 5
+hop owner round.n 3870
+hop owner round.sum_ns 1065932980
+hop owner rtt.lt0128us 2
+hop owner rtt.lt0256us 3714
+hop owner rtt.lt0512us 149
+hop owner rtt.lt1024us 5
+hop owner rtt.n 3870
+hop owner rtt.sum_ns 779148260
+hop owner sent_k.lt0008us 3869
+hop owner sent_k.lt0016us 1
+hop owner sent_k.n 3870
+hop owner sent_k.sum_ns 11595000
+hop owner spawn.lt0008us 2060
+hop owner spawn.lt0016us 10
+hop owner spawn.lt0032us 630
+hop owner spawn.lt0064us 1170
+hop owner spawn.n 3870
+hop owner spawn.sum_ns 68566388
+hop owner srtt.lt0064us 165
+hop owner srtt.lt0128us 3680
+hop owner srtt.lt0256us 21
+hop owner srtt.lt0512us 3
+hop owner srtt.lt1024us 1
+hop owner srtt.n 3870
+hop owner srtt.sum_ns 301324138
+hop owner to_control.lt0016us 38
+hop owner to_control.lt0032us 3027
+hop owner to_control.lt0064us 787
+hop owner to_control.lt0128us 14
+hop owner to_control.lt0256us 4
+hop owner to_control.n 3870
+hop owner to_control.sum_ns 116908818
+hop owner to_owner.lt0008us 2634
+hop owner to_owner.lt0016us 527
+hop owner to_owner.lt0032us 374
+hop owner to_owner.lt0064us 332
+hop owner to_owner.lt0128us 3
+hop owner to_owner.n 3870
+hop owner to_owner.sum_ns 42253484
+hop owner turns_k.lt0008us 3870
+hop owner turns_k.n 3870
+hop owner turns_k.sum_ns 11580000
+hop holder serve.lt0008us 45
+hop holder serve.lt0016us 1566
+hop holder serve.lt0032us 206
+hop holder serve.n 1817
+hop holder serve.sum_ns 19565665
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 1.73 2.25 1.25 4/270 10079
+  plain p50 40.8 p99 61.2 p999 101.5 max 117.0 us
+  live  p50 374.0 p99 483.2 p999 619.7 max 880.2 us
+  added at p50 333.3 us; live log at the end Some(("2050", "2050", "false")); late 0; (no_session, unanswered, link_lost) (0, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 2.89s
+  17333 writes, 17333 acknowledged: p50 424 us, p99 3082 us, p999 10053 us, max 176734 us; 5 over 50ms (sent+took): 0.00s+177ms 2.27s+51ms 2.33s+53ms 4.38s+65ms 5.47s+53ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 13.11s
+== quiet round 1 arm a exit 0
+== quiet round 1 arm b at 06:08:31, load 2.00 2.30 1.27
+measure: the owner's live counters {"appended": 2052, "durable": 2052, "install_bytes": 6015, "install_sent": 2, "no_session": 1, "resolved": 2051, "whole": 2}
+hop holder serve.lt0008us 147
+hop holder serve.lt0016us 1656
+hop holder serve.lt0032us 17
+hop holder serve.n 1820
+hop holder serve.sum_ns 16882889
+hop holder serve.lt0008us 82
+hop holder serve.lt0016us 1938
+hop holder serve.lt0032us 28
+hop holder serve.lt0064us 2
+hop holder serve.lt0128us 2
+hop holder serve.n 2052
+hop holder serve.sum_ns 20962028
+hop owner back.lt0008us 2229
+hop owner back.lt0016us 1281
+hop owner back.lt0032us 302
+hop owner back.lt0064us 60
+hop owner back.lt0128us 2
+hop owner back.n 3874
+hop owner back.sum_ns 37796753
+hop owner borrow.lt0008us 3872
+hop owner borrow.lt0016us 1
+hop owner borrow.lt0064us 1
+hop owner borrow.n 3874
+hop owner borrow.sum_ns 3063838
+hop owner cwnd_pkts_k.lt0008us 3874
+hop owner cwnd_pkts_k.n 3874
+hop owner cwnd_pkts_k.sum_ns 3874000
+hop owner exchange.lt0256us 1972
+hop owner exchange.lt0512us 1898
+hop owner exchange.lt1024us 4
+hop owner exchange.n 3874
+hop owner exchange.sum_ns 989488929
+hop owner round.lt0256us 524
+hop owner round.lt0512us 3337
+hop owner round.lt1024us 13
+hop owner round.n 3874
+hop owner round.sum_ns 1153524873
+hop owner rtt.lt0128us 1
+hop owner rtt.lt0256us 3345
+hop owner rtt.lt0512us 525
+hop owner rtt.lt1024us 3
+hop owner rtt.n 3874
+hop owner rtt.sum_ns 874209811
+hop owner sent_k.lt0008us 3874
+hop owner sent_k.n 3874
+hop owner sent_k.sum_ns 11602000
+hop owner spawn.lt0008us 2059
+hop owner spawn.lt0016us 12
+hop owner spawn.lt0032us 321
+hop owner spawn.lt0064us 1476
+hop owner spawn.lt0128us 4
+hop owner spawn.lt0256us 2
+hop owner spawn.n 3874
+hop owner spawn.sum_ns 70678783
+hop owner srtt.lt0128us 3723
+hop owner srtt.lt0256us 145
+hop owner srtt.lt0512us 5
+hop owner srtt.lt1024us 1
+hop owner srtt.n 3874
+hop owner srtt.sum_ns 384950580
+hop owner to_control.lt0016us 117
+hop owner to_control.lt0032us 2880
+hop owner to_control.lt0064us 855
+hop owner to_control.lt0128us 17
+hop owner to_control.lt0256us 5
+hop owner to_control.n 3874
+hop owner to_control.sum_ns 117902469
+hop owner to_owner.lt0008us 3179
+hop owner to_owner.lt0016us 192
+hop owner to_owner.lt0032us 220
+hop owner to_owner.lt0064us 257
+hop owner to_owner.lt0128us 26
+hop owner to_owner.n 3874
+hop owner to_owner.sum_ns 37127442
+hop owner turns_k.lt0008us 3874
+hop owner turns_k.n 3874
+hop owner turns_k.sum_ns 7722000
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 1.84 2.26 1.27 5/270 11438
+  plain p50 41.2 p99 60.8 p999 78.9 max 122.5 us
+  live  p50 389.2 p99 509.1 p999 610.2 max 719.8 us
+  added at p50 348.0 us; live log at the end Some(("2051", "2051", "false")); late 0; (no_session, unanswered, link_lost) (1, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 2.20s
+  6537 writes, 6537 acknowledged: p50 741 us, p99 7186 us, p999 23369 us, max 191808 us; 3 over 50ms (sent+took): 0.00s+192ms 1.59s+105ms 2.09s+61ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 11.91s
+== quiet round 1 arm b exit 0
+== busy round 1 arm a at 06:08:45, load 2.25 2.33 1.30
+measure: the owner's live counters {"appended": 2054, "durable": 2054, "install_bytes": 20380, "install_sent": 4, "no_session": 6, "resolved": 2051, "whole": 5}
+hop owner back.lt0008us 2599
+hop owner back.lt0016us 556
+hop owner back.lt0032us 788
+hop owner back.lt0064us 99
+hop owner back.lt0128us 13
+hop owner back.lt0256us 13
+hop owner back.n 4068
+hop owner back.sum_ns 41792386
+hop owner borrow.ge2048us 1
+hop owner borrow.lt0008us 4060
+hop owner borrow.lt0016us 2
+hop owner borrow.lt0512us 1
+hop owner borrow.lt1024us 1
+hop owner borrow.lt2048us 3
+hop owner borrow.n 4068
+hop owner borrow.sum_ns 117213011
+hop owner cwnd_pkts_k.lt0008us 4068
+hop owner cwnd_pkts_k.n 4068
+hop owner cwnd_pkts_k.sum_ns 4068000
+hop owner exchange.ge2048us 2103
+hop owner exchange.lt0128us 1
+hop owner exchange.lt0256us 187
+hop owner exchange.lt0512us 374
+hop owner exchange.lt1024us 533
+hop owner exchange.lt2048us 870
+hop owner exchange.n 4068
+hop owner exchange.sum_ns 9399790126
+hop owner round.ge2048us 2679
+hop owner round.lt0256us 23
+hop owner round.lt0512us 144
+hop owner round.lt1024us 397
+hop owner round.lt2048us 825
+hop owner round.n 4068
+hop owner round.sum_ns 14836712851
+hop owner rtt.ge2048us 2081
+hop owner rtt.lt0128us 3
+hop owner rtt.lt0256us 239
+hop owner rtt.lt0512us 325
+hop owner rtt.lt1024us 580
+hop owner rtt.lt2048us 840
+hop owner rtt.n 4068
+hop owner rtt.sum_ns 9296076103
+hop owner sent_k.lt0008us 4059
+hop owner sent_k.lt0016us 9
+hop owner sent_k.n 4068
+hop owner sent_k.sum_ns 11450000
+hop owner spawn.lt0008us 2923
+hop owner spawn.lt0016us 3
+hop owner spawn.lt0032us 95
+hop owner spawn.lt0064us 1031
+hop owner spawn.lt0256us 14
+hop owner spawn.lt0512us 2
+hop owner spawn.n 4068
+hop owner spawn.sum_ns 54690291
+hop owner srtt.ge2048us 39
+hop owner srtt.lt0128us 70
+hop owner srtt.lt0256us 219
+hop owner srtt.lt0512us 74
+hop owner srtt.lt1024us 1205
+hop owner srtt.lt2048us 2461
+hop owner srtt.n 4068
+hop owner srtt.sum_ns 4477780540
+hop owner to_control.ge2048us 523
+hop owner to_control.lt0008us 23
+hop owner to_control.lt0016us 288
+hop owner to_control.lt0032us 2190
+hop owner to_control.lt0064us 166
+hop owner to_control.lt0128us 402
+hop owner to_control.lt0256us 12
+hop owner to_control.lt0512us 29
+hop owner to_control.lt1024us 285
+hop owner to_control.lt2048us 150
+hop owner to_control.n 4068
+hop owner to_control.sum_ns 2284303616
+hop owner to_owner.ge2048us 484
+hop owner to_owner.lt0008us 55
+hop owner to_owner.lt0016us 821
+hop owner to_owner.lt0032us 1133
+hop owner to_owner.lt0064us 489
+hop owner to_owner.lt0128us 186
+hop owner to_owner.lt0256us 171
+hop owner to_owner.lt0512us 6
+hop owner to_owner.lt1024us 332
+hop owner to_owner.lt2048us 391
+hop owner to_owner.n 4068
+hop owner to_owner.sum_ns 3016719963
+hop owner turns_k.lt0008us 4068
+hop owner turns_k.n 4068
+hop owner turns_k.sum_ns 11364000
+hop holder serve.lt0008us 523
+hop holder serve.lt0016us 1491
+hop holder serve.lt0032us 4
+hop holder serve.lt0064us 1
+hop holder serve.lt0128us 1
+hop holder serve.lt0512us 1
+hop holder serve.n 2021
+hop holder serve.sum_ns 18615373
+hop holder serve.lt0008us 581
+hop holder serve.lt0016us 1453
+hop holder serve.lt0032us 9
+hop holder serve.n 2043
+hop holder serve.sum_ns 18290525
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 4.91 2.92 1.51 15/279 12543
+  plain p50 74.4 p99 8002.0 p999 9001.6 max 10997.3 us
+  live  p50 3997.5 p99 15000.6 p999 18000.6 max 18019.3 us
+  added at p50 3923.1 us; live log at the end Some(("2053", "2053", "false")); late 0; (no_session, unanswered, link_lost) (6, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 14.20s
+  297 writes, 297 acknowledged: p50 38996 us, p99 97009 us, p999 116878 us, max 116878 us; 88 over 50ms (sent+took): 0.02s+117ms 0.32s+59ms 0.44s+60ms 0.70s+102ms 0.96s+54ms 1.13s+54ms 1.20s+50ms 1.42s+62ms 1.55s+60ms 2.88s+88ms 2.96s+72ms 3.13s+97ms 3.39s+74ms 3.46s+74ms 3.54s+58ms 3.79s+56ms 4.40s+56ms 4.69s+52ms 4.77s+56ms 4.83s+61ms 5.03s+67ms 5.12s+65ms 5.18s+73ms 5.49s+59ms 5.64s+92ms 5.95s+57ms 6.14s+53ms 6.30s+51ms 6.50s+56ms 6.92s+58ms 6.98s+58ms 7.11s+63ms 7.17s+55ms 7.27s+53ms 7.32s+65ms 7.39s+61ms 7.48s+78ms 7.56s+76ms 7.64s+64ms 7.70s+51ms 7.80s+89ms 7.92s+71ms 7.99s+69ms 8.06s+54
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 15.60s
+== busy round 1 arm a exit 0
+== busy round 1 arm b at 06:09:16, load 7.88 3.68 1.78
+measure: the owner's live counters {"appended": 2055, "durable": 2055, "install_bytes": 20380, "install_sent": 4, "no_session": 4, "resolved": 2051, "whole": 5}
+hop holder serve.lt0008us 580
+hop holder serve.lt0016us 1454
+hop holder serve.lt0032us 11
+hop holder serve.n 2045
+hop holder serve.sum_ns 18184417
+hop holder serve.lt0008us 415
+hop holder serve.lt0016us 1622
+hop holder serve.lt0032us 6
+hop holder serve.lt0064us 1
+hop holder serve.n 2044
+hop holder serve.sum_ns 18515522
+hop owner back.lt0008us 2444
+hop owner back.lt0016us 630
+hop owner back.lt0032us 792
+hop owner back.lt0064us 88
+hop owner back.lt0128us 37
+hop owner back.lt0256us 93
+hop owner back.lt0512us 5
+hop owner back.lt2048us 4
+hop owner back.n 4093
+hop owner back.sum_ns 67273987
+hop owner borrow.lt0008us 4088
+hop owner borrow.lt0256us 1
+hop owner borrow.lt0512us 1
+hop owner borrow.lt1024us 1
+hop owner borrow.lt2048us 2
+hop owner borrow.n 4093
+hop owner borrow.sum_ns 7209986
+hop owner cwnd_pkts_k.lt0008us 4093
+hop owner cwnd_pkts_k.n 4093
+hop owner cwnd_pkts_k.sum_ns 4093000
+hop owner exchange.ge2048us 1330
+hop owner exchange.lt0128us 1
+hop owner exchange.lt0256us 190
+hop owner exchange.lt0512us 1530
+hop owner exchange.lt1024us 293
+hop owner exchange.lt2048us 749
+hop owner exchange.n 4093
+hop owner exchange.sum_ns 6713432903
+hop owner round.ge2048us 2617
+hop owner round.lt0256us 10
+hop owner round.lt0512us 425
+hop owner round.lt1024us 217
+hop owner round.lt2048us 824
+hop owner round.n 4093
+hop owner round.sum_ns 14037243035
+hop owner rtt.ge2048us 1298
+hop owner rtt.lt0128us 2
+hop owner rtt.lt0256us 443
+hop owner rtt.lt0512us 1318
+hop owner rtt.lt1024us 353
+hop owner rtt.lt2048us 679
+hop owner rtt.n 4093
+hop owner rtt.sum_ns 6543744976
+hop owner sent_k.lt0008us 4093
+hop owner sent_k.n 4093
+hop owner sent_k.sum_ns 11761000
+hop owner spawn.ge2048us 1
+hop owner spawn.lt0008us 2581
+hop owner spawn.lt0016us 7
+hop owner spawn.lt0032us 151
+hop owner spawn.lt0064us 1235
+hop owner spawn.lt0128us 1
+hop owner spawn.lt0256us 112
+hop owner spawn.lt0512us 1
+hop owner spawn.lt2048us 4
+hop owner spawn.n 4093
+hop owner spawn.sum_ns 94782270
+hop owner srtt.ge2048us 24
+hop owner srtt.lt0128us 280
+hop owner srtt.lt0256us 1173
+hop owner srtt.lt0512us 206
+hop owner srtt.lt1024us 672
+hop owner srtt.lt2048us 1738
+hop owner srtt.n 4093
+hop owner srtt.sum_ns 3225544880
+hop owner to_control.ge2048us 808
+hop owner to_control.lt0008us 7
+hop owner to_control.lt0016us 189
+hop owner to_control.lt0032us 1797
+hop owner to_control.lt0064us 144
+hop owner to_control.lt0128us 237
+hop owner to_control.lt0256us 13
+hop owner to_control.lt0512us 35
+hop owner to_control.lt1024us 396
+hop owner to_control.lt2048us 467
+hop owner to_control.n 4093
+hop owner to_control.sum_ns 3880672577
+hop owner to_owner.ge2048us 829
+hop owner to_owner.lt0008us 46
+hop owner to_owner.lt0016us 514
+hop owner to_owner.lt0032us 959
+hop owner to_owner.lt0064us 508
+hop owner to_owner.lt0128us 522
+hop owner to_owner.lt0256us 102
+hop owner to_owner.lt0512us 24
+hop owner to_owner.lt1024us 321
+hop owner to_owner.lt2048us 268
+hop owner to_owner.n 4093
+hop owner to_owner.sum_ns 3420652426
+hop owner turns_k.lt0008us 4093
+hop owner turns_k.n 4093
+hop owner turns_k.sum_ns 7636000
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 9.52 4.25 2.00 14/279 13092
+  plain p50 999.4 p99 8001.7 p999 9996.7 max 9998.8 us
+  live  p50 3999.1 p99 13082.0 p999 18001.1 max 19001.9 us
+  added at p50 2999.6 us; live log at the end Some(("2054", "2054", "false")); late 0; (no_session, unanswered, link_lost) (4, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 14.04s
+  389 writes, 389 acknowledged: p50 25953 us, p99 75294 us, p999 174804 us, max 174804 us; 35 over 50ms (sent+took): 0.02s+175ms 0.24s+51ms 0.55s+51ms 0.60s+51ms 2.09s+51ms 2.21s+62ms 2.94s+62ms 3.04s+77ms 4.09s+67ms 4.81s+55ms 4.98s+62ms 6.96s+51ms 7.34s+53ms 8.64s+54ms 8.81s+54ms 9.80s+51ms 9.90s+57ms 9.95s+51ms 10.08s+53ms 10.14s+77ms 10.21s+59ms 10.27s+59ms 10.33s+75ms 10.41s+63ms 10.47s+70ms 10.54s+54ms 10.59s+71ms 10.71s+62ms 10.77s+51ms 10.82s+74ms 10.90s+54ms 10.95s+68ms 11.02s+60ms 11.12s+58ms 11.22s+60ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 14.92s
+== busy round 1 arm b exit 0
+== quiet round 2 arm b at 06:09:45, load 11.11 4.86 2.24
+measure: the owner's live counters {"appended": 2051, "durable": 2051, "install_bytes": 5095, "install_sent": 1, "no_session": 2, "resolved": 2051, "whole": 2}
+hop holder serve.lt0008us 10
+hop holder serve.lt0016us 1786
+hop holder serve.lt0032us 50
+hop holder serve.lt0128us 5
+hop holder serve.n 1851
+hop holder serve.sum_ns 19780238
+hop owner back.lt0008us 1758
+hop owner back.lt0016us 1772
+hop owner back.lt0032us 183
+hop owner back.lt0064us 189
+hop owner back.lt0128us 1
+hop owner back.n 3903
+hop owner back.sum_ns 41215746
+hop owner borrow.ge2048us 1
+hop owner borrow.lt0008us 3900
+hop owner borrow.lt0016us 1
+hop owner borrow.lt0128us 1
+hop owner borrow.n 3903
+hop owner borrow.sum_ns 102952143
+hop owner cwnd_pkts_k.lt0008us 3903
+hop owner cwnd_pkts_k.n 3903
+hop owner cwnd_pkts_k.sum_ns 3903000
+hop owner exchange.lt0128us 1
+hop owner exchange.lt0256us 1941
+hop owner exchange.lt0512us 1957
+hop owner exchange.lt1024us 4
+hop owner exchange.n 3903
+hop owner exchange.sum_ns 1000713308
+hop owner round.ge2048us 1
+hop owner round.lt0256us 332
+hop owner round.lt0512us 3560
+hop owner round.lt1024us 10
+hop owner round.n 3903
+hop owner round.sum_ns 1286963375
+hop owner rtt.lt0128us 2
+hop owner rtt.lt0256us 3376
+hop owner rtt.lt0512us 522
+hop owner rtt.lt1024us 3
+hop owner rtt.n 3903
+hop owner rtt.sum_ns 877252072
+hop owner sent_k.lt0008us 3903
+hop owner sent_k.n 3903
+hop owner sent_k.sum_ns 11695000
+hop owner spawn.lt0008us 2065
+hop owner spawn.lt0016us 6
+hop owner spawn.lt0032us 51
+hop owner spawn.lt0064us 1776
+hop owner spawn.lt0128us 5
+hop owner spawn.n 3903
+hop owner spawn.sum_ns 75188174
+hop owner srtt.lt0128us 3681
+hop owner srtt.lt0256us 221
+hop owner srtt.lt0512us 1
+hop owner srtt.n 3903
+hop owner srtt.sum_ns 381582844
+hop owner to_control.lt0016us 76
+hop owner to_control.lt0032us 972
+hop owner to_control.lt0064us 2833
+hop owner to_control.lt0128us 19
+hop owner to_control.lt0512us 3
+hop owner to_control.n 3903
+hop owner to_control.sum_ns 133316202
+hop owner to_owner.lt0008us 2726
+hop owner to_owner.lt0016us 688
+hop owner to_owner.lt0032us 221
+hop owner to_owner.lt0064us 207
+hop owner to_owner.lt0128us 60
+hop owner to_owner.lt0256us 1
+hop owner to_owner.n 3903
+hop owner to_owner.sum_ns 43871673
+hop owner turns_k.lt0008us 3903
+hop owner turns_k.n 3903
+hop owner turns_k.sum_ns 7783000
+hop holder serve.lt0008us 101
+hop holder serve.lt0016us 1925
+hop holder serve.lt0032us 21
+hop holder serve.lt0064us 1
+hop holder serve.lt0128us 2
+hop holder serve.lt0256us 1
+hop holder serve.n 2051
+hop holder serve.sum_ns 19670321
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 10.22 4.77 2.22 3/273 13753
+  plain p50 47.3 p99 68.5 p999 84.5 max 92.8 us
+  live  p50 399.7 p99 493.7 p999 687.9 max 985.5 us
+  added at p50 352.4 us; live log at the end Some(("2050", "2050", "false")); late 0; (no_session, unanswered, link_lost) (2, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 3.03s
+  8199 writes, 8199 acknowledged: p50 782 us, p99 5772 us, p999 23609 us, max 117571 us; 1 over 50ms (sent+took): 0.00s+118ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 12.31s
+== quiet round 2 arm b exit 0
+== quiet round 2 arm a at 06:10:01, load 9.58 4.82 2.26
+measure: the owner's live counters {"appended": 2051, "durable": 2051, "install_bytes": 6015, "install_sent": 2, "resolved": 2051, "whole": 2}
+hop holder serve.lt0008us 456
+hop holder serve.lt0016us 1571
+hop holder serve.lt0032us 21
+hop holder serve.lt0064us 3
+hop holder serve.n 2051
+hop holder serve.sum_ns 18835708
+hop holder serve.lt0008us 148
+hop holder serve.lt0016us 1598
+hop holder serve.lt0032us 75
+hop holder serve.n 1821
+hop holder serve.sum_ns 18414005
+hop owner back.lt0008us 1836
+hop owner back.lt0016us 1239
+hop owner back.lt0032us 274
+hop owner back.lt0064us 514
+hop owner back.lt0128us 9
+hop owner back.lt0256us 2
+hop owner back.n 3874
+hop owner back.sum_ns 50909613
+hop owner borrow.lt0008us 3874
+hop owner borrow.n 3874
+hop owner borrow.sum_ns 2976211
+hop owner cwnd_pkts_k.lt0008us 3874
+hop owner cwnd_pkts_k.n 3874
+hop owner cwnd_pkts_k.sum_ns 3874000
+hop owner exchange.lt0128us 2
+hop owner exchange.lt0256us 2923
+hop owner exchange.lt0512us 949
+hop owner exchange.n 3874
+hop owner exchange.sum_ns 931833181
+hop owner round.lt0256us 715
+hop owner round.lt0512us 3159
+hop owner round.n 3874
+hop owner round.sum_ns 1107345097
+hop owner rtt.lt0128us 2
+hop owner rtt.lt0256us 3592
+hop owner rtt.lt0512us 280
+hop owner rtt.n 3874
+hop owner rtt.sum_ns 799992953
+hop owner sent_k.lt0008us 3874
+hop owner sent_k.n 3874
+hop owner sent_k.sum_ns 11624000
+hop owner spawn.lt0008us 2047
+hop owner spawn.lt0016us 8
+hop owner spawn.lt0032us 56
+hop owner spawn.lt0064us 1760
+hop owner spawn.lt0128us 3
+hop owner spawn.n 3874
+hop owner spawn.sum_ns 73770145
+hop owner srtt.lt0128us 3863
+hop owner srtt.lt0256us 11
+hop owner srtt.n 3874
+hop owner srtt.sum_ns 309999527
+hop owner to_control.lt0016us 23
+hop owner to_control.lt0032us 2476
+hop owner to_control.lt0064us 1350
+hop owner to_control.lt0128us 25
+hop owner to_control.n 3874
+hop owner to_control.sum_ns 121480573
+hop owner to_owner.lt0008us 2634
+hop owner to_owner.lt0016us 438
+hop owner to_owner.lt0032us 233
+hop owner to_owner.lt0064us 563
+hop owner to_owner.lt0128us 6
+hop owner to_owner.n 3874
+hop owner to_owner.sum_ns 45342738
+hop owner turns_k.lt0008us 3874
+hop owner turns_k.n 3874
+hop owner turns_k.sum_ns 11612000
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 8.81 4.74 2.25 4/272 15064
+  plain p50 42.3 p99 63.3 p999 81.5 max 110.5 us
+  live  p50 386.4 p99 515.4 p999 609.2 max 630.6 us
+  added at p50 344.1 us; live log at the end Some(("2050", "2050", "false")); late 0; (no_session, unanswered, link_lost) (0, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 2.89s
+  17548 writes, 17548 acknowledged: p50 424 us, p99 3101 us, p999 13374 us, max 136631 us; 3 over 50ms (sent+took): 0.00s+137ms 2.15s+83ms 4.24s+52ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 11.77s
+== quiet round 2 arm a exit 0
+== busy round 2 arm b at 06:10:16, load 7.99 4.69 2.27
+measure: the owner's live counters {"appended": 2058, "durable": 2058, "install_bytes": 30570, "install_sent": 6, "no_session": 7, "resolved": 2051, "whole": 7}
+hop holder serve.lt0008us 390
+hop holder serve.lt0016us 1652
+hop holder serve.lt0032us 14
+hop holder serve.lt0064us 1
+hop holder serve.lt0512us 1
+hop holder serve.n 2058
+hop holder serve.sum_ns 20188901
+hop owner back.lt0008us 2761
+hop owner back.lt0016us 472
+hop owner back.lt0032us 688
+hop owner back.lt0064us 115
+hop owner back.lt0128us 21
+hop owner back.lt0256us 31
+hop owner back.lt2048us 2
+hop owner back.n 4090
+hop owner back.sum_ns 47150744
+hop owner borrow.lt0008us 4083
+hop owner borrow.lt0128us 1
+hop owner borrow.lt0512us 1
+hop owner borrow.lt1024us 1
+hop owner borrow.lt2048us 4
+hop owner borrow.n 4090
+hop owner borrow.sum_ns 9163311
+hop owner cwnd_pkts_k.lt0008us 4090
+hop owner cwnd_pkts_k.n 4090
+hop owner cwnd_pkts_k.sum_ns 4090000
+hop owner exchange.ge2048us 1901
+hop owner exchange.lt0128us 1
+hop owner exchange.lt0256us 288
+hop owner exchange.lt0512us 681
+hop owner exchange.lt1024us 344
+hop owner exchange.lt2048us 875
+hop owner exchange.n 4090
+hop owner exchange.sum_ns 8776062287
+hop owner round.ge2048us 2870
+hop owner round.lt0256us 33
+hop owner round.lt0512us 191
+hop owner round.lt1024us 276
+hop owner round.lt2048us 720
+hop owner round.n 4090
+hop owner round.sum_ns 17107262116
+hop owner rtt.ge2048us 1849
+hop owner rtt.lt0128us 3
+hop owner rtt.lt0256us 390
+hop owner rtt.lt0512us 587
+hop owner rtt.lt1024us 429
+hop owner rtt.lt2048us 832
+hop owner rtt.n 4090
+hop owner rtt.sum_ns 8638252286
+hop owner sent_k.lt0008us 4089
+hop owner sent_k.lt0016us 1
+hop owner sent_k.n 4090
+hop owner sent_k.sum_ns 11735000
+hop owner spawn.lt0008us 2587
+hop owner spawn.lt0016us 3
+hop owner spawn.lt0032us 132
+hop owner spawn.lt0064us 1321
+hop owner spawn.lt0128us 1
+hop owner spawn.lt0256us 40
+hop owner spawn.lt0512us 1
+hop owner spawn.lt1024us 1
+hop owner spawn.lt2048us 4
+hop owner spawn.n 4090
+hop owner spawn.sum_ns 83004488
+hop owner srtt.ge2048us 80
+hop owner srtt.lt0128us 227
+hop owner srtt.lt0256us 470
+hop owner srtt.lt0512us 132
+hop owner srtt.lt1024us 824
+hop owner srtt.lt2048us 2357
+hop owner srtt.n 4090
+hop owner srtt.sum_ns 4264622827
+hop owner to_control.ge2048us 608
+hop owner to_control.lt0008us 7
+hop owner to_control.lt0016us 175
+hop owner to_control.lt0032us 1927
+hop owner to_control.lt0064us 174
+hop owner to_control.lt0128us 337
+hop owner to_control.lt0256us 27
+hop owner to_control.lt0512us 42
+hop owner to_control.lt1024us 534
+hop owner to_control.lt2048us 259
+hop owner to_control.n 4090
+hop owner to_control.sum_ns 3195702848
+hop owner to_owner.ge2048us 1046
+hop owner to_owner.lt0008us 129
+hop owner to_owner.lt0016us 637
+hop owner to_owner.lt0032us 767
+hop owner to_owner.lt0064us 444
+hop owner to_owner.lt0128us 173
+hop owner to_owner.lt0256us 110
+hop owner to_owner.lt0512us 7
+hop owner to_owner.lt1024us 363
+hop owner to_owner.lt2048us 414
+hop owner to_owner.n 4090
+hop owner to_owner.sum_ns 5110992390
+hop owner turns_k.lt0008us 4090
+hop owner turns_k.n 4090
+hop owner turns_k.sum_ns 7602000
+hop holder serve.lt0008us 382
+hop holder serve.lt0016us 1638
+hop holder serve.lt0032us 6
+hop holder serve.n 2026
+hop holder serve.sum_ns 19429602
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 9.74 5.31 2.52 17/280 16271
+  plain p50 1002.0 p99 8997.6 p999 9001.1 max 10998.1 us
+  live  p50 5000.2 p99 15000.8 p999 18002.2 max 83003.4 us
+  added at p50 3998.2 us; live log at the end Some(("2057", "2057", "false")); late 0; (no_session, unanswered, link_lost) (7, 0, 0); live writes over 50 ms 1
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 18.55s
+  262 writes, 262 acknowledged: p50 42994 us, p99 82750 us, p999 200682 us, max 200682 us; 106 over 50ms (sent+took): 0.02s+201ms 0.26s+51ms 0.42s+66ms 0.56s+57ms 0.62s+69ms 0.73s+58ms 0.95s+67ms 1.49s+68ms 1.62s+51ms 1.67s+59ms 1.72s+72ms 1.83s+81ms 1.95s+78ms 2.07s+75ms 2.15s+62ms 2.21s+83ms 2.29s+69ms 2.36s+61ms 2.54s+58ms 2.67s+64ms 2.77s+50ms 2.86s+56ms 2.94s+73ms 3.05s+55ms 3.25s+50ms 3.53s+63ms 3.62s+72ms 4.24s+63ms 4.41s+66ms 4.48s+60ms 4.70s+61ms 4.88s+50ms 5.08s+56ms 5.19s+53ms 5.33s+64ms 5.43s+63ms 5.50s+55ms 5.55s+55ms 5.61s+66ms 5.67s+53ms 5.73s+77ms 5.84s+57ms 5.90s+57ms 5.96s+61
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 18.05s
+== busy round 2 arm b exit 0
+== busy round 2 arm a at 06:10:53, load 11.77 6.07 2.83
+measure: the owner's live counters {"appended": 2055, "durable": 2055, "install_bytes": 20380, "install_sent": 4, "no_session": 3, "resolved": 2051, "whole": 5}
+hop holder serve.lt0008us 591
+hop holder serve.lt0016us 1439
+hop holder serve.lt0032us 8
+hop holder serve.lt0064us 1
+hop holder serve.n 2039
+hop holder serve.sum_ns 19095079
+hop holder serve.lt0008us 380
+hop holder serve.lt0016us 1664
+hop holder serve.lt0032us 3
+hop holder serve.lt0128us 1
+hop holder serve.n 2048
+hop holder serve.sum_ns 20140797
+hop owner back.ge2048us 2
+hop owner back.lt0008us 2184
+hop owner back.lt0016us 714
+hop owner back.lt0032us 918
+hop owner back.lt0064us 197
+hop owner back.lt0128us 14
+hop owner back.lt0256us 58
+hop owner back.lt0512us 2
+hop owner back.lt1024us 1
+hop owner back.lt2048us 1
+hop owner back.n 4091
+hop owner back.sum_ns 71374319
+hop owner borrow.lt0008us 4088
+hop owner borrow.lt0512us 1
+hop owner borrow.lt1024us 1
+hop owner borrow.lt2048us 1
+hop owner borrow.n 4091
+hop owner borrow.sum_ns 6068491
+hop owner cwnd_pkts_k.lt0008us 4091
+hop owner cwnd_pkts_k.n 4091
+hop owner cwnd_pkts_k.sum_ns 4091000
+hop owner exchange.ge2048us 2332
+hop owner exchange.lt0256us 147
+hop owner exchange.lt0512us 695
+hop owner exchange.lt1024us 214
+hop owner exchange.lt2048us 703
+hop owner exchange.n 4091
+hop owner exchange.sum_ns 9984950236
+hop owner round.ge2048us 3004
+hop owner round.lt0256us 12
+hop owner round.lt0512us 216
+hop owner round.lt1024us 184
+hop owner round.lt2048us 675
+hop owner round.n 4091
+hop owner round.sum_ns 16726207899
+hop owner rtt.ge2048us 2289
+hop owner rtt.lt0128us 1
+hop owner rtt.lt0256us 303
+hop owner rtt.lt0512us 564
+hop owner rtt.lt1024us 268
+hop owner rtt.lt2048us 666
+hop owner rtt.n 4091
+hop owner rtt.sum_ns 9814311553
+hop owner sent_k.lt0008us 4073
+hop owner sent_k.lt0016us 18
+hop owner sent_k.n 4091
+hop owner sent_k.sum_ns 11960000
+hop owner spawn.ge2048us 1
+hop owner spawn.lt0008us 2459
+hop owner spawn.lt0016us 9
+hop owner spawn.lt0032us 125
+hop owner spawn.lt0064us 1420
+hop owner spawn.lt0128us 6
+hop owner spawn.lt0256us 66
+hop owner spawn.lt0512us 1
+hop owner spawn.lt1024us 3
+hop owner spawn.lt2048us 1
+hop owner spawn.n 4091
+hop owner spawn.sum_ns 92237320
+hop owner srtt.ge2048us 66
+hop owner srtt.lt0128us 44
+hop owner srtt.lt0256us 504
+hop owner srtt.lt0512us 118
+hop owner srtt.lt1024us 742
+hop owner srtt.lt2048us 2617
+hop owner srtt.n 4091
+hop owner srtt.sum_ns 4721369428
+hop owner to_control.ge2048us 504
+hop owner to_control.lt0008us 9
+hop owner to_control.lt0016us 147
+hop owner to_control.lt0032us 1886
+hop owner to_control.lt0064us 176
+hop owner to_control.lt0128us 235
+hop owner to_control.lt0256us 27
+hop owner to_control.lt0512us 12
+hop owner to_control.lt1024us 843
+hop owner to_control.lt2048us 252
+hop owner to_control.n 4091
+hop owner to_control.sum_ns 2961609120
+hop owner to_owner.ge2048us 732
+hop owner to_owner.lt0008us 155
+hop owner to_owner.lt0016us 500
+hop owner to_owner.lt0032us 907
+hop owner to_owner.lt0064us 578
+hop owner to_owner.lt0128us 177
+hop owner to_owner.lt0256us 82
+hop owner to_owner.lt0512us 35
+hop owner to_owner.lt1024us 526
+hop owner to_owner.lt2048us 399
+hop owner to_owner.n 4091
+hop owner to_owner.sum_ns 3758034606
+hop owner turns_k.lt0008us 4090
+hop owner turns_k.lt0016us 1
+hop owner turns_k.n 4091
+hop owner turns_k.sum_ns 11831000
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 12.04 6.41 3.00 14/275 16784
+  plain p50 998.7 p99 8253.3 p999 9997.3 max 10001.7 us
+  live  p50 5001.4 p99 15000.5 p999 17656.2 max 22381.0 us
+  added at p50 4002.7 us; live log at the end Some(("2054", "2054", "false")); late 0; (no_session, unanswered, link_lost) (3, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 17.64s
+  170 writes, 170 acknowledged: p50 74992 us, p99 126456 us, p999 186737 us, max 186737 us; 154 over 50ms (sent+took): 0.03s+187ms 0.22s+81ms 0.30s+117ms 0.42s+126ms 0.58s+112ms 0.69s+103ms 0.84s+106ms 0.94s+106ms 1.05s+76ms 1.12s+54ms 1.21s+72ms 1.28s+81ms 1.37s+65ms 1.43s+82ms 1.51s+73ms 1.63s+68ms 1.69s+51ms 1.75s+75ms 1.82s+90ms 1.91s+73ms 1.98s+85ms 2.07s+104ms 2.17s+97ms 2.27s+69ms 2.34s+77ms 2.42s+90ms 2.51s+109ms 2.61s+85ms 2.70s+87ms 2.79s+72ms 2.86s+71ms 2.93s+78ms 3.01s+91ms 3.10s+64ms 3.16s+75ms 3.24s+62ms 3.30s+73ms 3.37s+63ms 3.44s+82ms 3.52s+75ms 3.59s+52ms 3.64s+72ms 3.72s+51ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 17.88s
+== busy round 2 arm a exit 0
+== quiet round 3 arm a at 06:11:29, load 13.75 7.16 3.32
+measure: the owner's live counters {"appended": 2052, "durable": 2052, "install_bytes": 5095, "install_sent": 1, "no_session": 1, "resolved": 2051, "whole": 2}
+hop owner back.lt0008us 2214
+hop owner back.lt0016us 1022
+hop owner back.lt0032us 461
+hop owner back.lt0064us 180
+hop owner back.lt0128us 4
+hop owner back.n 3881
+hop owner back.sum_ns 43521401
+hop owner borrow.ge2048us 1
+hop owner borrow.lt0008us 3876
+hop owner borrow.lt0016us 4
+hop owner borrow.n 3881
+hop owner borrow.sum_ns 103009716
+hop owner cwnd_pkts_k.lt0008us 3881
+hop owner cwnd_pkts_k.n 3881
+hop owner cwnd_pkts_k.sum_ns 3881000
+hop owner exchange.lt0128us 1
+hop owner exchange.lt0256us 2799
+hop owner exchange.lt0512us 1074
+hop owner exchange.lt1024us 7
+hop owner exchange.n 3881
+hop owner exchange.sum_ns 952055364
+hop owner round.ge2048us 1
+hop owner round.lt0256us 462
+hop owner round.lt0512us 3399
+hop owner round.lt1024us 19
+hop owner round.n 3881
+hop owner round.sum_ns 1247837592
+hop owner rtt.lt0128us 2
+hop owner rtt.lt0256us 3586
+hop owner rtt.lt0512us 289
+hop owner rtt.lt1024us 4
+hop owner rtt.n 3881
+hop owner rtt.sum_ns 830557596
+hop owner sent_k.lt0008us 3877
+hop owner sent_k.lt0016us 4
+hop owner sent_k.n 3881
+hop owner sent_k.sum_ns 11626000
+hop owner spawn.lt0008us 2066
+hop owner spawn.lt0016us 6
+hop owner spawn.lt0032us 381
+hop owner spawn.lt0064us 1425
+hop owner spawn.lt0128us 2
+hop owner spawn.lt0256us 1
+hop owner spawn.n 3881
+hop owner spawn.sum_ns 71106797
+hop owner srtt.lt0128us 3839
+hop owner srtt.lt0256us 41
+hop owner srtt.lt0512us 1
+hop owner srtt.n 3881
+hop owner srtt.sum_ns 323085804
+hop owner to_control.lt0016us 10
+hop owner to_control.lt0032us 1006
+hop owner to_control.lt0064us 2838
+hop owner to_control.lt0128us 24
+hop owner to_control.lt0256us 2
+hop owner to_control.lt0512us 1
+hop owner to_control.n 3881
+hop owner to_control.sum_ns 134873966
+hop owner to_owner.lt0008us 2125
+hop owner to_owner.lt0016us 752
+hop owner to_owner.lt0032us 623
+hop owner to_owner.lt0064us 372
+hop owner to_owner.lt0128us 8
+hop owner to_owner.lt0256us 1
+hop owner to_owner.n 3881
+hop owner to_owner.sum_ns 52004002
+hop owner turns_k.lt0008us 3881
+hop owner turns_k.n 3881
+hop owner turns_k.sum_ns 11609000
+hop holder serve.lt0008us 125
+hop holder serve.lt0016us 1908
+hop holder serve.lt0032us 18
+hop holder serve.lt0128us 1
+hop holder serve.n 2052
+hop holder serve.sum_ns 19035069
+hop holder serve.lt0008us 40
+hop holder serve.lt0016us 1760
+hop holder serve.lt0032us 27
+hop holder serve.lt0064us 1
+hop holder serve.n 1828
+hop holder serve.sum_ns 18356337
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 13.75 7.16 3.32 3/269 17394
+  plain p50 44.5 p99 63.7 p999 85.5 max 89.9 us
+  live  p50 398.8 p99 526.8 p999 772.1 max 1097.7 us
+  added at p50 354.3 us; live log at the end Some(("2051", "2051", "false")); late 0; (no_session, unanswered, link_lost) (1, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 2.12s
+  7430 writes, 7430 acknowledged: p50 780 us, p99 6110 us, p999 18459 us, max 173023 us; 4 over 50ms (sent+took): 0.00s+173ms 2.07s+76ms 3.11s+54ms 7.19s+52ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 11.62s
+== quiet round 3 arm a exit 0
+== quiet round 3 arm b at 06:11:43, load 11.78 7.04 3.34
+measure: the owner's live counters {"appended": 2051, "durable": 2051, "install_bytes": 5095, "install_sent": 1, "no_session": 1, "resolved": 2051, "whole": 2}
+hop owner back.lt0008us 2276
+hop owner back.lt0016us 1095
+hop owner back.lt0032us 482
+hop owner back.lt0064us 38
+hop owner back.n 3891
+hop owner back.sum_ns 41240208
+hop owner borrow.ge2048us 1
+hop owner borrow.lt0008us 3887
+hop owner borrow.lt0016us 3
+hop owner borrow.n 3891
+hop owner borrow.sum_ns 102978116
+hop owner cwnd_pkts_k.lt0008us 3891
+hop owner cwnd_pkts_k.n 3891
+hop owner cwnd_pkts_k.sum_ns 3891000
+hop owner exchange.lt0128us 2
+hop owner exchange.lt0256us 1600
+hop owner exchange.lt0512us 2288
+hop owner exchange.lt1024us 1
+hop owner exchange.n 3891
+hop owner exchange.sum_ns 1037756317
+hop owner round.ge2048us 1
+hop owner round.lt0256us 238
+hop owner round.lt0512us 3647
+hop owner round.lt1024us 5
+hop owner round.n 3891
+hop owner round.sum_ns 1339653751
+hop owner rtt.lt0128us 2
+hop owner rtt.lt0256us 3051
+hop owner rtt.lt0512us 837
+hop owner rtt.lt1024us 1
+hop owner rtt.n 3891
+hop owner rtt.sum_ns 916784121
+hop owner sent_k.lt0008us 3891
+hop owner sent_k.n 3891
+hop owner sent_k.sum_ns 11655000
+hop owner spawn.lt0008us 2064
+hop owner spawn.lt0016us 6
+hop owner spawn.lt0032us 125
+hop owner spawn.lt0064us 1692
+hop owner spawn.lt0128us 4
+hop owner spawn.n 3891
+hop owner spawn.sum_ns 72833859
+hop owner srtt.lt0128us 3319
+hop owner srtt.lt0256us 571
+hop owner srtt.lt0512us 1
+hop owner srtt.n 3891
+hop owner srtt.sum_ns 406440642
+hop owner to_control.lt0016us 292
+hop owner to_control.lt0032us 1039
+hop owner to_control.lt0064us 2548
+hop owner to_control.lt0128us 12
+hop owner to_control.n 3891
+hop owner to_control.sum_ns 126097673
+hop owner to_owner.lt0008us 2351
+hop owner to_owner.lt0016us 593
+hop owner to_owner.lt0032us 296
+hop owner to_owner.lt0064us 427
+hop owner to_owner.lt0128us 223
+hop owner to_owner.lt0256us 1
+hop owner to_owner.n 3891
+hop owner to_owner.sum_ns 65506037
+hop owner turns_k.lt0008us 3891
+hop owner turns_k.n 3891
+hop owner turns_k.sum_ns 7757000
+hop holder serve.lt0008us 74
+hop holder serve.lt0016us 1722
+hop holder serve.lt0032us 39
+hop holder serve.lt0064us 1
+hop holder serve.lt0128us 3
+hop holder serve.n 1839
+hop holder serve.sum_ns 18078031
+hop holder serve.lt0008us 85
+hop holder serve.lt0016us 1888
+hop holder serve.lt0032us 73
+hop holder serve.lt0064us 2
+hop holder serve.lt0128us 3
+hop holder serve.n 2051
+hop holder serve.sum_ns 21820523
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 11.78 7.04 3.34 3/270 18626
+  plain p50 43.6 p99 63.8 p999 82.1 max 86.1 us
+  live  p50 411.8 p99 480.9 p999 554.3 max 574.5 us
+  added at p50 368.2 us; live log at the end Some(("2050", "2050", "false")); late 0; (no_session, unanswered, link_lost) (1, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 3.06s
+  4200 writes, 4200 acknowledged: p50 1335 us, p99 11862 us, p999 21553 us, max 135035 us; 3 over 50ms (sent+took): 0.00s+135ms 2.22s+58ms 3.25s+62ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 12.51s
+== quiet round 3 arm b exit 0
+== busy round 3 arm a at 06:11:59, load 10.39 6.96 3.37
+measure: the owner's live counters {"appended": 2053, "durable": 2053, "install_bytes": 10190, "install_sent": 2, "no_session": 9, "resolved": 2051, "whole": 3}
+hop holder serve.lt0008us 849
+hop holder serve.lt0016us 1176
+hop holder serve.lt0032us 10
+hop holder serve.n 2035
+hop holder serve.sum_ns 17442856
+hop holder serve.lt0008us 464
+hop holder serve.lt0016us 1575
+hop holder serve.lt0032us 13
+hop holder serve.lt0256us 1
+hop holder serve.n 2053
+hop holder serve.sum_ns 18175929
+hop owner back.ge2048us 25
+hop owner back.lt0008us 2028
+hop owner back.lt0016us 844
+hop owner back.lt0032us 801
+hop owner back.lt0064us 71
+hop owner back.lt0128us 53
+hop owner back.lt0256us 260
+hop owner back.lt0512us 3
+hop owner back.lt2048us 5
+hop owner back.n 4090
+hop owner back.sum_ns 165208618
+hop owner borrow.lt0008us 4081
+hop owner borrow.lt0512us 6
+hop owner borrow.lt1024us 1
+hop owner borrow.lt2048us 2
+hop owner borrow.n 4090
+hop owner borrow.sum_ns 8427029
+hop owner cwnd_pkts_k.lt0008us 4090
+hop owner cwnd_pkts_k.n 4090
+hop owner cwnd_pkts_k.sum_ns 4090000
+hop owner exchange.ge2048us 828
+hop owner exchange.lt0128us 1
+hop owner exchange.lt0256us 159
+hop owner exchange.lt0512us 2541
+hop owner exchange.lt1024us 236
+hop owner exchange.lt2048us 325
+hop owner exchange.n 4090
+hop owner exchange.sum_ns 4508211193
+hop owner round.ge2048us 2289
+hop owner round.lt0256us 11
+hop owner round.lt0512us 1078
+hop owner round.lt1024us 213
+hop owner round.lt2048us 499
+hop owner round.n 4090
+hop owner round.sum_ns 11275035582
+hop owner rtt.ge2048us 776
+hop owner rtt.lt0128us 1
+hop owner rtt.lt0256us 776
+hop owner rtt.lt0512us 2009
+hop owner rtt.lt1024us 223
+hop owner rtt.lt2048us 305
+hop owner rtt.n 4090
+hop owner rtt.sum_ns 4156818108
+hop owner sent_k.lt0008us 4083
+hop owner sent_k.lt0016us 7
+hop owner sent_k.n 4090
+hop owner sent_k.sum_ns 11856000
+hop owner spawn.ge2048us 20
+hop owner spawn.lt0008us 2498
+hop owner spawn.lt0016us 12
+hop owner spawn.lt0032us 737
+hop owner spawn.lt0064us 501
+hop owner spawn.lt0128us 8
+hop owner spawn.lt0256us 297
+hop owner spawn.lt0512us 6
+hop owner spawn.lt1024us 2
+hop owner spawn.lt2048us 9
+hop owner spawn.n 4090
+hop owner spawn.sum_ns 179925168
+hop owner srtt.ge2048us 7
+hop owner srtt.lt0128us 1225
+hop owner srtt.lt0256us 1416
+hop owner srtt.lt0512us 178
+hop owner srtt.lt1024us 389
+hop owner srtt.lt2048us 875
+hop owner srtt.n 4090
+hop owner srtt.sum_ns 1945348627
+hop owner to_control.ge2048us 1022
+hop owner to_control.lt0008us 7
+hop owner to_control.lt0016us 105
+hop owner to_control.lt0032us 1940
+hop owner to_control.lt0064us 122
+hop owner to_control.lt0128us 162
+hop owner to_control.lt0256us 22
+hop owner to_control.lt0512us 38
+hop owner to_control.lt1024us 246
+hop owner to_control.lt2048us 426
+hop owner to_control.n 4090
+hop owner to_control.sum_ns 3851539831
+hop owner to_owner.ge2048us 770
+hop owner to_owner.lt0008us 32
+hop owner to_owner.lt0016us 466
+hop owner to_owner.lt0032us 876
+hop owner to_owner.lt0064us 813
+hop owner to_owner.lt0128us 537
+hop owner to_owner.lt0256us 198
+hop owner to_owner.lt0512us 25
+hop owner to_owner.lt1024us 168
+hop owner to_owner.lt2048us 205
+hop owner to_owner.n 4090
+hop owner to_owner.sum_ns 2892447277
+hop owner turns_k.lt0008us 4090
+hop owner turns_k.n 4090
+hop owner turns_k.sum_ns 11817000
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 10.88 7.18 3.48 16/275 19752
+  plain p50 62.8 p99 4860.6 p999 8999.1 max 9000.3 us
+  live  p50 2619.2 p99 11952.5 p999 18014.1 max 68202.2 us
+  added at p50 2556.4 us; live log at the end Some(("2052", "2052", "false")); late 0; (no_session, unanswered, link_lost) (9, 0, 0); live writes over 50 ms 1
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 8.97s
+  423 writes, 423 acknowledged: p50 24992 us, p99 79007 us, p999 279992 us, max 279992 us; 37 over 50ms (sent+took): 0.02s+280ms 0.30s+82ms 0.38s+66ms 0.53s+59ms 0.94s+54ms 1.49s+60ms 1.73s+64ms 1.79s+64ms 1.89s+71ms 1.98s+121ms 2.29s+59ms 2.59s+55ms 3.17s+59ms 3.26s+55ms 3.52s+51ms 3.69s+53ms 4.03s+63ms 4.27s+73ms 4.34s+80ms 4.42s+58ms 4.78s+52ms 4.83s+52ms 4.88s+52ms 5.32s+79ms 7.07s+53ms 7.37s+51ms 7.63s+59ms 8.11s+53ms 8.32s+51ms 8.84s+53ms 9.56s+50ms 10.05s+54ms 10.44s+66ms 10.68s+58ms 11.11s+53ms 11.16s+55ms 11.40s+66ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 16.38s
+== busy round 3 arm a exit 0
+== busy round 3 arm b at 06:12:25, load 12.18 7.64 3.69
+measure: the owner's live counters {"appended": 2057, "durable": 2057, "install_bytes": 30570, "install_sent": 6, "no_session": 12, "resolved": 2051, "whole": 7}
+hop holder serve.lt0008us 216
+hop holder serve.lt0016us 1829
+hop holder serve.lt0032us 9
+hop holder serve.lt0064us 2
+hop holder serve.lt0256us 1
+hop holder serve.n 2057
+hop holder serve.sum_ns 20092518
+hop owner back.ge2048us 3
+hop owner back.lt0008us 2202
+hop owner back.lt0016us 748
+hop owner back.lt0032us 874
+hop owner back.lt0064us 91
+hop owner back.lt0128us 49
+hop owner back.lt0256us 117
+hop owner back.lt0512us 2
+hop owner back.lt2048us 2
+hop owner back.n 4088
+hop owner back.sum_ns 76881034
+hop owner borrow.ge2048us 1
+hop owner borrow.lt0008us 4074
+hop owner borrow.lt0016us 2
+hop owner borrow.lt0512us 5
+hop owner borrow.lt1024us 1
+hop owner borrow.lt2048us 5
+hop owner borrow.n 4088
+hop owner borrow.sum_ns 15020066
+hop owner cwnd_pkts_k.lt0008us 4088
+hop owner cwnd_pkts_k.n 4088
+hop owner cwnd_pkts_k.sum_ns 4088000
+hop owner exchange.ge2048us 1363
+hop owner exchange.lt0128us 4
+hop owner exchange.lt0256us 206
+hop owner exchange.lt0512us 1785
+hop owner exchange.lt1024us 208
+hop owner exchange.lt2048us 522
+hop owner exchange.n 4088
+hop owner exchange.sum_ns 6658225098
+hop owner round.ge2048us 2934
+hop owner round.lt0256us 22
+hop owner round.lt0512us 480
+hop owner round.lt1024us 172
+hop owner round.lt2048us 480
+hop owner round.n 4088
+hop owner round.sum_ns 18419698057
+hop owner rtt.ge2048us 1330
+hop owner rtt.lt0128us 4
+hop owner rtt.lt0256us 503
+hop owner rtt.lt0512us 1529
+hop owner rtt.lt1024us 214
+hop owner rtt.lt2048us 508
+hop owner rtt.n 4088
+hop owner rtt.sum_ns 6456869629
+hop owner sent_k.lt0008us 4085
+hop owner sent_k.lt0016us 3
+hop owner sent_k.n 4088
+hop owner sent_k.sum_ns 11830000
+hop owner spawn.ge2048us 8
+hop owner spawn.lt0008us 2546
+hop owner spawn.lt0016us 7
+hop owner spawn.lt0032us 280
+hop owner spawn.lt0064us 1095
+hop owner spawn.lt0128us 7
+hop owner spawn.lt0256us 135
+hop owner spawn.lt0512us 8
+hop owner spawn.lt2048us 2
+hop owner spawn.n 4088
+hop owner spawn.sum_ns 116798591
+hop owner srtt.ge2048us 88
+hop owner srtt.lt0128us 516
+hop owner srtt.lt0256us 1302
+hop owner srtt.lt0512us 163
+hop owner srtt.lt1024us 363
+hop owner srtt.lt2048us 1656
+hop owner srtt.n 4088
+hop owner srtt.sum_ns 3195620842
+hop owner to_control.ge2048us 1061
+hop owner to_control.lt0008us 14
+hop owner to_control.lt0016us 151
+hop owner to_control.lt0032us 1632
+hop owner to_control.lt0064us 171
+hop owner to_control.lt0128us 197
+hop owner to_control.lt0256us 26
+hop owner to_control.lt0512us 36
+hop owner to_control.lt1024us 370
+hop owner to_control.lt2048us 430
+hop owner to_control.n 4088
+hop owner to_control.sum_ns 4838860448
+hop owner to_owner.ge2048us 1519
+hop owner to_owner.lt0008us 102
+hop owner to_owner.lt0016us 411
+hop owner to_owner.lt0032us 663
+hop owner to_owner.lt0064us 393
+hop owner to_owner.lt0128us 248
+hop owner to_owner.lt0256us 79
+hop owner to_owner.lt0512us 14
+hop owner to_owner.lt1024us 298
+hop owner to_owner.lt2048us 361
+hop owner to_owner.n 4088
+hop owner to_owner.sum_ns 6893500306
+hop owner turns_k.lt0008us 4088
+hop owner turns_k.n 4088
+hop owner turns_k.sum_ns 7696000
+hop holder serve.lt0008us 335
+hop holder serve.lt0016us 1675
+hop holder serve.lt0032us 15
+hop holder serve.n 2025
+hop holder serve.sum_ns 18900110
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 12.63 7.97 3.86 14/275 20329
+  plain p50 70.9 p99 7998.6 p999 9001.7 max 10999.5 us
+  live  p50 4998.8 p99 17999.3 p999 19008.4 max 58201.2 us
+  added at p50 4927.9 us; live log at the end Some(("2056", "2056", "false")); late 0; (no_session, unanswered, link_lost) (12, 0, 0); live writes over 50 ms 1
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 16.78s
+  269 writes, 269 acknowledged: p50 36999 us, p99 90083 us, p999 259829 us, max 259829 us; 96 over 50ms (sent+took): 0.01s+260ms 0.42s+51ms 0.83s+51ms 1.06s+52ms 2.17s+53ms 2.82s+52ms 2.87s+50ms 3.00s+61ms 3.20s+64ms 3.34s+56ms 3.44s+63ms 3.50s+64ms 3.68s+54ms 3.73s+60ms 3.86s+59ms 3.96s+70ms 4.12s+53ms 4.17s+74ms 4.29s+67ms 4.39s+62ms 4.46s+67ms 4.52s+64ms 4.64s+71ms 4.71s+74ms 4.78s+82ms 4.86s+85ms 4.95s+65ms 5.06s+83ms 5.21s+64ms 5.32s+61ms 5.64s+52ms 5.91s+54ms 6.06s+57ms 6.32s+63ms 6.42s+55ms 7.11s+75ms 7.22s+63ms 7.29s+60ms 7.35s+66ms 7.41s+61ms 7.47s+65ms 7.56s+63ms 7.62s+70ms 7.69s+75m
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 14.84s
+== busy round 3 arm b exit 0
