@@ -1232,8 +1232,9 @@ pub struct DbSnapshotReport {
   pub log_bytes_appended: u64,
   /// The cadence now: log bytes between snapshots.
   pub bytes_between: u64,
-  /// The partition's apply throughput measured since the last snapshot, bytes a microsecond (zero until measured).
-  pub apply_bytes_per_us: u64,
+  /// The partition's replay throughput its commits measured since the last snapshot (each record's append and apply),
+  /// bytes a microsecond (zero until measured).
+  pub replay_bytes_per_us: u64,
 }
 
 /// One live-shipped volume's log as a shard sees it (A-200): as its owner (`holding` false: the head it appended and
