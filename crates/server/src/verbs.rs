@@ -8269,8 +8269,9 @@ const CREATION_HEAD_SEQUENCE: u64 = 0;
 /// `AlreadyExists` (names are per host, §4.4); a malformed archive is a `BadRequest` naming the reader's
 /// refusal. Any refusal leaves nothing behind (the credits go back, the partial volume is discarded).
 /// Materializes a taken-over **green** on the shard its id routes to (§4.16 owner-loss recovery;
-/// AUD-14): records its catalog entry under the adopted record's name, evidence policy and owner
-/// (guard-then-apply, refused typed when the name is taken or the chain budget cannot hold it),
+/// AUD-14): records its catalog entry under the adopted record's name, evidence policy and owner, with the
+/// access list of its adopted catalog register at that register's sequence (A-237) (guard-then-apply,
+/// refused typed when the name is taken or the chain budget cannot hold it),
 /// re-records its origin and every increment of the recovered chain durably — so a restart of this
 /// node rebuilds the same green — replays them into a fresh engine (`rebuild_green`: the same
 /// derivation a restart runs, with the rejected-cache budget and retention settled), and verifies the
@@ -8316,9 +8317,9 @@ pub(crate) fn materialize_taken_over_green(
       state: VolumeState::Live,
       lease: None,
       owner: recovery.owner.clone(),
-      access: Vec::new(),
+      access: recovery.access.clone(),
       created_ns: state.clock.monotonic_ns(),
-      catalog_version: 0,
+      catalog_version: recovery.catalog_sequence,
     };
     let now = state.clock.monotonic_ns();
     if let Err(e) = state

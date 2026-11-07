@@ -38,7 +38,8 @@
 use std::collections::BTreeMap;
 
 use slates_db::catalog::{
-  AttachForm, AttachmentRecord, Principal, Role, VolumeId as DbVolumeId, VolumeRecord, VolumeState,
+  AccessEntry, AttachForm, AttachmentRecord, Principal, Role, VolumeId as DbVolumeId, VolumeRecord,
+  VolumeState,
 };
 use slates_db::op::Op;
 use slates_ipc::protocol::{GreenBase, Intent, ReadAt, Refusal, ReplyBody, SnapshotId, VolumeId};
@@ -1807,6 +1808,11 @@ pub(crate) fn next_merge_work(state: &mut ShardState, local: HostId) -> Vec<Merg
   let mut work = Vec::new();
   let objects: Vec<ObjectId> = state.merge.pending.keys().copied().collect();
   for object in objects {
+    // The green's catalog register first (A-237): a successor that adopted a merge record and no catalog could
+    // not say who may use the green, so no record ships before the catalog's current version is committed.
+    if !crate::fleet::green_catalog_committed(state, DbVolumeId { bytes: object.0 }, local) {
+      continue;
+    }
     let placement = config.place(object);
     let Some(pending_green) = state.merge.pending.get_mut(&object) else {
       continue;
@@ -2492,8 +2498,10 @@ fn recompute(
 }
 
 /// What a successor rebuilds a taken-over green from (AUD-14): the catalog facts the adopted record
-/// carries, the origin bytes for version 0 (none for a scratch green), the increments' bytes in
-/// version order, the adopted head and its identity — every input this node itself holds.
+/// carries, the access list of the green's adopted catalog register and that register's sequence (A-237: a
+/// share made on the departed owner must still admit its subject here), the origin bytes for version 0 (none
+/// for a scratch green), the increments' bytes in version order, the adopted head and its identity — every
+/// input this node itself holds.
 #[derive(Clone, Debug)]
 pub(crate) struct GreenRecovery {
   /// The green's mount name.
@@ -2502,6 +2510,10 @@ pub(crate) struct GreenRecovery {
   pub require_evidence: bool,
   /// The owning principal.
   pub owner: Principal,
+  /// The access list of the green's adopted catalog register.
+  pub access: Vec<AccessEntry>,
+  /// The adopted catalog register's sequence, which the rebuilt record's catalog version continues from.
+  pub catalog_sequence: u64,
   /// The origin's bytes (version 0), or none for a scratch green.
   pub origin: Option<Vec<u8>>,
   /// The increments' bytes, version 1 first.
@@ -2522,6 +2534,7 @@ pub(crate) fn recover_green_inputs(
   state: &mut ShardState,
   object: ObjectId,
   adopted: &MergeRecordValue,
+  (catalog_sequence, catalog): (u64, &crate::catalog::CatalogValue),
 ) -> Option<GreenRecovery> {
   let mut values: BTreeMap<u64, MergeRecordValue> = state
     .holder_records
@@ -2555,6 +2568,8 @@ pub(crate) fn recover_green_inputs(
     name: adopted.name.clone(),
     require_evidence: adopted.require_evidence,
     owner: adopted.owner.clone(),
+    access: catalog.access.clone(),
+    catalog_sequence,
     origin,
     chain,
     head: adopted.version,

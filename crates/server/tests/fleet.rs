@@ -11785,6 +11785,102 @@ fn a_taken_over_green_serves_every_version_and_accepts_new_work_on_the_successor
   );
 }
 
+/// A-237 (§4.13, §4.16 owner-loss recovery): a share of a green made after its last version survives the owner's
+/// death. Do X (advance a green three versions on A, then share it read-only with node a's account 7777, kill A),
+/// expect Y (the green's catalog register carrying the share reaches both survivors, and the successor rebuilds the
+/// green with the share in its access list). Before 2026-11-07 a green shipped no catalog register: the successor
+/// rebuilt it with an empty access list, which uid equality hid until principals carried their host (A-237), and
+/// the successor then refused its own fleet's shares `Forbidden`.
+#[test]
+fn a_share_of_a_green_made_after_its_last_version_survives_a_takeover() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let anchor_a = daemons[0].anchor().unwrap();
+
+  let mut client = Client::connect(daemons[0].instance());
+  let (green, work) = green_with_work(&mut client, "shared-green", &daemons);
+  commit_three_versions(&mut client, work);
+  let object = ObjectId(green.bytes);
+  let shared = client.call(&RequestBody::Share {
+    volume: green,
+    principal: slates_ipc::protocol::Principal::Uid {
+      host: anchor_a,
+      uid: GRANTED_UID,
+    },
+    rights: slates_ipc::protocol::Rights {
+      read: true,
+      write: false,
+      admin: false,
+    },
+  });
+  let granted = slates_db::catalog::AccessEntry {
+    principal: slates_db::catalog::Principal::Uid {
+      host: slates_db::HostId(anchor_a),
+      uid: GRANTED_UID,
+    },
+    rights: slates_db::catalog::Rights {
+      read: true,
+      write: false,
+      admin: false,
+    },
+  };
+  let replicated = poll_until(&daemons.iter().collect::<Vec<_>>(), SERVE_DEADLINE, || {
+    Ok(daemons[1..].iter().all(|daemon| {
+      daemon
+        .fleet_holder_head(object.catalog())
+        .ok()
+        .flatten()
+        .is_some_and(|(_, value)| {
+          slates_server::catalog::CatalogValue::from_record_bytes(&value)
+            .is_some_and(|catalog| catalog.access.contains(&granted))
+        })
+    }))
+  });
+
+  daemons.remove(0).stop();
+  let successor_host =
+    rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over the green");
+  let successor_index = usize::from(successor_host != hosts[1]);
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let materialized = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    daemons[successor_index].merge_record_placed(green, 3)
+  });
+  let access = daemons[successor_index].volume_access(object);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(matches!(shared, ReplyBody::Shared), "{shared:?}");
+  assert!(
+    replicated,
+    "the green's catalog register carrying the share reached both survivors"
+  );
+  assert!(
+    materialized,
+    "the successor materialized the taken-over green at version 3"
+  );
+  let access = access
+    .ok()
+    .flatten()
+    .expect("the successor records the green");
+  assert!(
+    access.contains(&granted),
+    "the share keeps its access on the successor: {access:?}"
+  );
+}
+
 /// AC (§4.8 "Leases and reads"; AUD-08): in a three-node `f = 1` fleet a green advances three versions on
 /// its owner, then the owner is **isolated** on the probe plane (both directions) — it is not stopped, its
 /// client connection stays open. Its owner lease lapses by the host clock (measured across a scheduling
@@ -11949,8 +12045,9 @@ fn an_isolated_owner_holds_its_guests_requests_rather_than_serve_them() {
   let guest = start_guest(
     &daemons[0],
     held,
+    // The guest is a local account of node a, where the volume is owned (A-237).
     slates_db::catalog::Principal::Uid {
-      host: slates_db::HostId(0),
+      host: slates_db::HostId(daemons[0].anchor().unwrap()),
       uid: my_uid(),
     },
     slates_server::virtiofs::GuestView::default(),
@@ -13146,7 +13243,20 @@ fn a_grant_made_after_the_last_seal_survives_a_takeover() {
     rights: grant,
   });
   assert!(matches!(shared, ReplyBody::Shared), "{shared:?}");
-  // The catalog register's newest record reaches both survivors before A dies.
+  // The volume was shared with the fleet's accounts at creation (A-237), so the grant is one entry among those.
+  let granted = slates_db::catalog::AccessEntry {
+    principal: slates_db::catalog::Principal::Uid {
+      host: slates_db::HostId(anchor_a),
+      uid: GRANTED_UID,
+    },
+    rights: slates_db::catalog::Rights {
+      read: true,
+      write: false,
+      admin: false,
+    },
+  };
+  // The catalog register's record carrying the grant reaches both survivors before A dies. The creation's shares
+  // make the register's access list non-empty before the grant, so the wait names the grant itself.
   let replicated = poll_until(&daemons.iter().collect::<Vec<_>>(), SERVE_DEADLINE, || {
     Ok(daemons[1..].iter().all(|daemon| {
       daemon
@@ -13155,7 +13265,7 @@ fn a_grant_made_after_the_last_seal_survives_a_takeover() {
         .flatten()
         .is_some_and(|(_, value)| {
           slates_server::catalog::CatalogValue::from_record_bytes(&value)
-            .is_some_and(|catalog| !catalog.access.is_empty())
+            .is_some_and(|catalog| catalog.access.contains(&granted))
         })
     }))
   });
@@ -13179,20 +13289,9 @@ fn a_grant_made_after_the_last_seal_survives_a_takeover() {
   );
   assert!(served, "the successor serves the taken-over volume");
   let access = access.expect("the successor records the volume");
-  assert_eq!(
-    access,
-    vec![slates_db::catalog::AccessEntry {
-      principal: slates_db::catalog::Principal::Uid {
-        host: slates_db::HostId(anchor_a),
-        uid: GRANTED_UID,
-      },
-      rights: slates_db::catalog::Rights {
-        read: true,
-        write: false,
-        admin: false,
-      },
-    }],
-    "the consumer keeps its access on the successor"
+  assert!(
+    access.contains(&granted),
+    "the consumer keeps its access on the successor: {access:?}"
   );
 }
 
