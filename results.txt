@@ -1,0 +1,6 @@
+macos-latest exit 0; lines naming it: 1
+slates-server: shard 0 initialized in 11810 µs
+calibration: 500 files in 300.528209ms, twice that in 522.251834ms (443.447µs per file at the margin); 4511 files to last 2s
+slates-server: partition 0: volume 3807a406a506c8ba0000000000000017 was not imaged, skipped: EIO (first on this shard; later ones are counted as publish.volume_skipped)
+4511 files; reply deadline 1s; plain call ended at 6.294952167s: Ok(Some(Landed(LandingOutcome { landing: 4, state: "done", written: 4511, skipped: 0, conflicts: 0, failed: 0, bytes_written: 39489, held: 0, durability: LandingDurability { data_synced: true, di
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 17.34s
