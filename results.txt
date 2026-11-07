@@ -1,0 +1,10 @@
+tested 26c0eff4fb3e8e5431234110f74cca0afb980edd variant before-kept on aarch64, 4 cpus
+  reverted:  crates/server/src/daemon.rs | 7 ++-----
+  reverted:  1 file changed, 2 insertions(+), 5 deletions(-)
+forward-retry exit 101 80s
+  forward-retry: warning: aws-lc-sys@0.45.0: Target platform: 'aarch64-unknown-linux-gnu'
+  forward-retry: thread 'a_forward_kept_for_a_full_channel_is_sent_once_the_channel_has_room' (5385) panicked at crates/server/tests/forward_retry.rs:149:3:
+  forward-retry: the kept forward was answered within 1s of the hold's end (waited 1.000000661s): None
+  forward-retry: test a_forward_kept_for_a_full_channel_is_sent_once_the_channel_has_room ... FAILED
+  forward-retry: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.36s
+  forward-retry: error: test failed, to rerun pass `-p slates-server --test forward_retry`
