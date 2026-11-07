@@ -2401,8 +2401,14 @@ impl Daemon {
   pub fn give_back_recovery_on_every_shard(&self) -> Result<u64, ObserveError> {
     let mut returned = 0u64;
     for shard in self.shards.iter().copied() {
-      let bytes = self.observe(Some(shard), return_dead_recovery)?;
-      returned = returned.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+      // Slice after slice, as the idle tick takes them (one quantum a step), until nothing is left.
+      loop {
+        let (bytes, more) = self.observe(Some(shard), return_dead_recovery)?;
+        returned = returned.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+        if !more {
+          break;
+        }
+      }
     }
     Ok(returned)
   }
@@ -3258,6 +3264,7 @@ fn init_shard(
     peer_recipients: std::collections::BTreeMap::new(),
     content,
     purge_seen_allocations: 0,
+    give_back_slice_bytes: 0,
     content_range,
     delta_range: delta_range(config, partition, content_range),
     journal: slates_vfs::checkpoint_log::Journal::default(),
@@ -3679,17 +3686,48 @@ async fn seal_idle_content() {
 
 /// The idle shard's emptied FUSE write log, its pages given back (`crate::write_log::WriteLog::purge`).
 #[cfg(target_os = "linux")]
-fn purge_write_log(s: &mut ShardState) -> usize {
-  match (s.content.as_mut(), s.write_log.as_mut()) {
-    (Some(object), Some(log)) => log.purge(object),
-    _ => 0,
-  }
+fn purge_write_log(s: &mut ShardState) -> (usize, bool) {
+  let slice = give_back_slice(s);
+  let started = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
+  let purged = match (s.content.as_mut(), s.write_log.as_mut()) {
+    (Some(object), Some(log)) => log.purge(object, slice),
+    _ => crate::write_log::Purged::default(),
+  };
+  learn_give_back_rate(s, purged.walked, started);
+  (purged.bytes, purged.more)
 }
 
 /// No write log off Linux (A-63 logs the FUSE mount's writes).
 #[cfg(not(target_os = "linux"))]
-fn purge_write_log(_s: &mut ShardState) -> usize {
-  0
+fn purge_write_log(_s: &mut ShardState) -> (usize, bool) {
+  (0, false)
+}
+
+/// The bytes one give-back step may walk (A-226): what the OS gave back in one step quantum the last time
+/// (`give_back_slice_bytes`), at least a page, so a step holds the shard about one quantum whatever the memory.
+fn give_back_slice(s: &ShardState) -> usize {
+  let page = usize::try_from(s.config.geometry.page).unwrap_or(1).max(1);
+  s.give_back_slice_bytes.max(page)
+}
+
+/// Learns the next give-back slice from this step's: `walked` bytes since `started` (the shard clock), scaled to one
+/// step quantum. A step that walked nothing teaches nothing.
+fn learn_give_back_rate(s: &mut ShardState, walked: usize, started: u64) {
+  if walked == 0 {
+    return;
+  }
+  let quantum = futures::step_budget_ns()
+    .unwrap_or(s.config.runtime.step_budget_ns)
+    .max(1);
+  let took = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock)
+    .saturating_sub(started)
+    .max(1);
+  let per_quantum = u128::try_from(walked)
+    .unwrap_or(u128::MAX)
+    .saturating_mul(u128::from(quantum))
+    .checked_div(u128::from(took))
+    .unwrap_or(0);
+  s.give_back_slice_bytes = usize::try_from(per_quantum).unwrap_or(usize::MAX);
 }
 
 /// Counter: content bytes an idle shard gave back to the OS (A-105).
@@ -3698,41 +3736,57 @@ pub const CONTENT_PURGED: &str = "content.purged_bytes";
 /// Counter: recovery memory an idle shard gave back because no restart reads it (A-117).
 pub const RECOVERY_RETURNED: &str = "recovery.returned_bytes";
 
-/// Gives back an idle shard's recovery memory that no restart reads (A-117): the checkpoint slot older than the
-/// committed one, and its delta log past the tail, each only as far as it was written since its last give-back
-/// (`Journal::dead_ranges`, A-226), so a give-back costs what the publications since wrote. A busy shard never runs
-/// this, so its next checkpoint and deltas write into resident pages; an idle one stops holding up to two dead images.
-/// A range the object refuses stays owed and is asked for at the next give-back. The bytes given back.
-fn return_dead_recovery(s: &mut ShardState) -> usize {
+/// Gives back one slice of an idle shard's recovery memory that no restart reads (A-117): the checkpoint slot older than
+/// the committed one, and its delta log past the tail, each only as far as it was written since its last give-back
+/// (`Journal::dead_ranges`, A-226), taken from the top of each down so the journal can record a slice at a time. A
+/// slice is the bytes the OS gave back in one step quantum the last time, measured here (`give_back_slice`), so a
+/// give-back of memory a predecessor may have written (18 GB a shard on a 128 GiB Mac) holds the shard one quantum a
+/// step, not 18 to 21 ms. A busy shard never runs this. A range the object refuses stays owed and is asked for at the
+/// next give-back. The bytes given back, and whether any is left.
+fn return_dead_recovery(s: &mut ShardState) -> (usize, bool) {
   let (slots_start, slots_end) = s.content_range;
   let (log_start, log_end) = s.delta_range;
   let Some(dead) = s.journal.dead_ranges(
     slots_end.saturating_sub(slots_start),
     log_end.saturating_sub(log_start),
   ) else {
-    return 0;
+    return (0, false);
   };
+  let slice = give_back_slice(s);
+  let started = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
   let Some(object) = s.content.as_mut() else {
-    return 0;
+    return (0, false);
   };
-  let mut give_back = |base: usize, (offset, len): (usize, usize)| -> Option<usize> {
-    if len == 0 {
-      return Some(0);
+  let mut left = slice;
+  // The top `left` bytes of `(offset, len)` within the region at `base`: given back, the offset they start at (what
+  // the journal records), and the bytes the object took. `None` when the object refused.
+  let mut give_back = |base: usize, (offset, len): (usize, usize)| -> Option<(usize, usize)> {
+    let piece = len.min(left);
+    let from = offset.saturating_add(len).saturating_sub(piece);
+    if piece == 0 {
+      return Some((from, 0));
     }
-    object.discard(base.checked_add(offset)?, len).ok()
+    let bytes = object.discard(base.checked_add(from)?, piece).ok()?;
+    left = left.saturating_sub(piece);
+    Some((from, bytes))
   };
   let stale_slot = give_back(slots_start, dead.stale_slot);
   let log_past_tail = give_back(log_start, dead.log_past_tail);
-  s.journal
-    .given_back(stale_slot.is_some(), log_past_tail.is_some());
+  s.journal.given_back_from(
+    stale_slot.map(|(from, _)| from.saturating_sub(dead.stale_slot.0)),
+    log_past_tail.map(|(from, _)| from),
+  );
+  learn_give_back_rate(s, slice.saturating_sub(left), started);
   let returned = stale_slot
-    .unwrap_or(0)
-    .saturating_add(log_past_tail.unwrap_or(0));
+    .map_or(0, |(_, bytes)| bytes)
+    .saturating_add(log_past_tail.map_or(0, |(_, bytes)| bytes));
   s.count(
     RECOVERY_RETURNED,
     u64::try_from(returned).unwrap_or(u64::MAX),
   );
-  returned
+  let more = stale_slot.is_some_and(|(from, _)| from > dead.stale_slot.0)
+    || log_past_tail.is_some_and(|(from, _)| from > dead.log_past_tail.0);
+  (returned, more)
 }
 
 /// Gives an idle shard's resident free content, and its emptied write log's pages, back to the OS (A-105): when the
@@ -3756,14 +3810,16 @@ async fn purge_if_idle() {
         .unwrap_or(0)
         .max(1);
       let purged = s.store.content.arena_mut().purge(slice_blocks);
-      let log = if purged.more {
-        0
+      let (log, recovery_left) = if purged.more {
+        (0, false)
       } else {
-        purge_write_log(s).saturating_add(return_dead_recovery(s))
+        let (recovery, recovery_left) = return_dead_recovery(s);
+        let (log, log_left) = purge_write_log(s);
+        (log.saturating_add(recovery), recovery_left || log_left)
       };
       let bytes = purged.bytes.saturating_add(log);
       s.count(CONTENT_PURGED, u64::try_from(bytes).unwrap_or(u64::MAX));
-      Some(purged.more)
+      Some(purged.more || recovery_left)
     })
     .flatten();
     if step != Some(true) {

@@ -2856,6 +2856,107 @@ fn a_give_back_returns_only_recovery_memory_written_since_the_last() {
   drop(anchor);
 }
 
+/// A-226, a give-back holds its shard no longer than a slice: do start a one-shard daemon over a fresh anchor (its
+/// journal has seen none of its recovery memory written, so its first idle ticks give back both checkpoint slots and
+/// the whole log, 18 GB a shard on a 128 GiB Mac) and probe the shard with a volume's status through those ticks; then
+/// probe it for as long again with nothing left to give back, the test's own noise floor. Expect the recovery give-back
+/// counted in the first window (the non-vacuity count) and nothing more given back in the second, and the first window's
+/// longest probe no more than `FLOOR_MULTIPLE` times the second's. A closed-loop probe meets one stall as one sample,
+/// so the longest probe is the judge and the p99 and p999 are printed beside it. A host too loaded to judge by (its
+/// quiet probe past `JUDGED_FLOOR`) skips loudly. Before the give-back was sliced, one step marked
+/// 18,325,143,552 bytes reusable in 18 to 21 ms (macOS) while every probe that reached the shard waited.
+#[test]
+fn a_boot_give_back_holds_its_shard_no_longer_than_its_noise_floor() {
+  /// Shape: a probe window, in reap ticks (`LIVENESS_BUDGET_NS` each): the first tick after the volume's create sees
+  /// allocations, the second finds the shard idle and gives back, and two more cover the give-back's slices.
+  const WINDOW_TICKS: u64 = 4;
+  /// Shape: how many times the quiet window's longest probe the give-back window's may be: past that, a probe waited
+  /// on the shard's own work, not on the noise both windows share (18–21 ms against about 1 ms before A-226's slices).
+  const FLOOR_MULTIPLE: u32 = 4;
+  /// Shape: the longest quiet probe this test can judge by: a host whose own noise holds a probe longer than a
+  /// give-back step costs (18–21 ms on macOS) cannot tell the two, so the test says so and judges nothing (a loaded
+  /// development machine: 160–350 ms at load 89–114 on 18 cores, 2026-11-06).
+  const JUDGED_FLOOR: Duration = Duration::from_millis(5);
+  let profile = common::machine_profile();
+  let instance = format!("srv-recovery-slices-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let anchor = held_anchor("recovery-slices", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let volume = client.create(&scratch("probed")).unwrap();
+  let window =
+    Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS.saturating_mul(WINDOW_TICKS));
+  let returned = |daemon: &Daemon| {
+    daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get(slates_server::daemon::RECOVERY_RETURNED)
+      .copied()
+      .unwrap_or(0)
+  };
+  let giving_back = longest_probe(&mut client, volume, window);
+  let after_give_back = returned(&daemon);
+  let quiet = longest_probe(&mut client, volume, window);
+  let after_quiet = returned(&daemon);
+  println!(
+    "longest probe: {giving_back:?} while giving back {after_give_back} bytes, {quiet:?} with nothing to give back"
+  );
+  if cfg!(any(target_os = "linux", target_os = "macos")) {
+    assert!(
+      after_give_back > 0,
+      "the boot give-back ran in the first window"
+    );
+    assert_eq!(
+      after_quiet, after_give_back,
+      "nothing was left to give back in the second"
+    );
+  }
+  if quiet > JUDGED_FLOOR {
+    println!(
+      "SKIPPED (loudly): this host's own noise held a quiet probe {quiet:?}, past the {JUDGED_FLOOR:?} the test can \
+       judge a give-back step by"
+    );
+  } else {
+    assert!(
+      giving_back <= quiet.saturating_mul(FLOOR_MULTIPLE),
+      "a probe waited {giving_back:?} on the give-back, against {quiet:?} with nothing to give back"
+    );
+  }
+  daemon.stop();
+  drop(anchor);
+}
+
+/// The longest of the status probes of `volume` made back to back for `window`, with their p50, p99 and p999 printed.
+fn longest_probe(client: &mut Client, volume: VolumeId, window: Duration) -> Duration {
+  let started = Instant::now();
+  let mut longest = Duration::ZERO;
+  let mut waits = Vec::new();
+  while started.elapsed() < window {
+    let sent = Instant::now();
+    client.status(volume).unwrap();
+    longest = longest.max(sent.elapsed());
+    waits.push(sent.elapsed());
+  }
+  waits.sort();
+  let at = |permille: usize| {
+    waits
+      .get(waits.len().saturating_mul(permille) / 1000)
+      .copied()
+      .unwrap_or_default()
+  };
+  println!(
+    "{} probes: p50 {:?}, p99 {:?}, p999 {:?}, max {longest:?}",
+    waits.len(),
+    at(500),
+    at(990),
+    at(999)
+  );
+  longest
+}
+
 /// The recovery bytes `daemon` counts given back once its shard goes idle, above `before`, waiting up to the bound.
 fn returned_after_idle(daemon: &Daemon, before: u64) -> u64 {
   let returned = || {

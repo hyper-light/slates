@@ -217,6 +217,10 @@ pub struct ShardState {
   /// The content arena's allocation count at the last reap tick: unchanged at the next means the shard allocated
   /// nothing in between, so its free blocks can go back to the OS (A-105, `daemon::purge_if_idle`).
   pub(crate) purge_seen_allocations: u64,
+  /// The bytes one idle give-back step walks (A-226), the recovery memory's and the write log's alike: what the OS gave
+  /// back in one step quantum the last time, measured by each step for the next (`daemon::learn_give_back_rate`); zero
+  /// until the first, which takes a page.
+  pub(crate) give_back_slice_bytes: usize,
   /// The half-open byte range `[start, end)` of `content` this shard publishes into and recovers
   /// from; `0..0` when there is no content object.
   pub content_range: (usize, usize),

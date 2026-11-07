@@ -210,11 +210,13 @@
 > behind. It now gives back only what was written since its last give-back. In one paced run, reap polls of 5 ms CPU
 > or more went from 46 to 6. Failing first: `a_give_back_returns_only_recovery_memory_written_since_the_last` (91.6 GB
 > given back after a one-file delta, against 0). Oracle: `a_give_back_names_every_dead_written_byte_and_stops_at_the_last`.
-> **Open:** the 6 left are each shard's first two give-backs after a boot, over memories the journal did not write
-> (12 to 43 ms each). They are owed slices under the step quantum, from a measured discard rate. Also open: the
-> latency A/B on a quiet Mac (this one ran at load 50 to 95), Linux and Windows (diag-perf-5), and the sibling of the
-> same shape, the Linux FUSE write log's purge (`crates/server/src/write_log.rs`, its whole capacity once per
-> emptying; its cost is not measured).
+> The 6 left were each shard's first two give-backs after a boot, over memories the journal did not write (12 to 43 ms
+> each). **Sliced 2026-11-06:** a give-back takes one measured slice a step from the top down. So does its sibling,
+> the Linux FUSE write log's purge, which gave back its whole area per emptying (red first: 12,288 bytes for one
+> 15-byte record). **Open:**
+> - the red-and-green of the shard-held probe (`a_boot_give_back_holds_its_shard_no_longer_than_its_noise_floor`) on
+>   a quiet host: every development machine was at load 47 to 226 on 2026-11-06, so it skipped loudly there;
+> - the latency A/B on a quiet Mac.
 >
 > **Merge: edit and submit in one request (A-225, 2026-11-06, agents/perf-2).** `Client::edit_and_submit`
 > (`RequestBody::EditSubmit`) is `edit` and then `submit` in one durable step under one completion record. Across the

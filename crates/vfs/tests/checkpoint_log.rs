@@ -462,7 +462,9 @@ enum JournalStep {
   /// One file created and its delta appended (a checkpoint instead when the log is full).
   ChangeAndAppend,
   /// The dead ranges given back.
-  GiveBack,
+  /// The dead ranges given back from the top down, `quarters` quarters of each (one to four), as a give-back taken a
+  /// slice at a time leaves them.
+  GiveBack { quarters: usize },
   /// The journal dropped and recovered from its memories, as a restarted daemon's is.
   Restart,
 }
@@ -536,10 +538,10 @@ proptest::proptest! {
   fn a_give_back_names_every_dead_written_byte_and_stops_at_the_last(
     steps in proptest::collection::vec(
       // Weights 1 : 4 : 2 : 1 over eight draws (no `prop_oneof!`, which boxes its arms in an `Arc`).
-      proptest::strategy::Strategy::prop_map(0u8..8, |draw| match draw {
+      proptest::strategy::Strategy::prop_map((0u8..8, 1usize..=4), |(draw, quarters)| match draw {
         0 => JournalStep::Checkpoint,
         1..=4 => JournalStep::ChangeAndAppend,
-        5 | 6 => JournalStep::GiveBack,
+        5 | 6 => JournalStep::GiveBack { quarters },
         _ => JournalStep::Restart,
       }),
       1..40,
@@ -575,14 +577,24 @@ proptest::proptest! {
             Err(other) => panic!("append refused: {other:?}"),
           }
         }
-        JournalStep::GiveBack => {
+        JournalStep::GiveBack { quarters } => {
           if let Some(dead) = journal.dead_ranges(ORACLE_MEMORY, ORACLE_MEMORY) {
-            checkpoints.give_back(dead.stale_slot);
-            log.give_back(dead.log_past_tail);
-            journal.given_back(true, true);
-            let stale = slates_vfs::recover::committed_slot(&checkpoints).unwrap().stale_slot(ORACLE_MEMORY);
-            unknown.slots.remove(&stale.0);
-            unknown.log = false;
+            // The top `quarters` quarters of each range, as one slice of a sliced give-back takes them.
+            let top = |(offset, len): (usize, usize)| {
+              let piece = len * quarters / 4;
+              (offset + len - piece, piece)
+            };
+            let (stale_at, stale_piece) = top(dead.stale_slot);
+            let (log_at, log_piece) = top(dead.log_past_tail);
+            checkpoints.give_back((stale_at, stale_piece));
+            log.give_back((log_at, log_piece));
+            journal.given_back_from(Some(stale_at - dead.stale_slot.0), Some(log_at));
+            // A region the journal had not seen written is known once it has been given back whole.
+            if quarters == 4 {
+              let stale = slates_vfs::recover::committed_slot(&checkpoints).unwrap().stale_slot(ORACLE_MEMORY);
+              unknown.slots.remove(&stale.0);
+              unknown.log = false;
+            }
           }
         }
         JournalStep::Restart => {
