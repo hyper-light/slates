@@ -875,6 +875,9 @@ pub(crate) fn published(
       if whole {
         let head = entry.head();
         live.shipper.mark_checkpoint(head);
+        // Derived: the retained tail's byte bound is this whole record's size, the install a laggard would be sent
+        // instead: shipping it the entries it lacks never costs more than installing it (`Shipper::retain_up_to`).
+        live.shipper.retain_up_to(payload.len());
         live.whole = Some((head, payload));
       }
       state.count(LIVE_APPENDED, 1);
