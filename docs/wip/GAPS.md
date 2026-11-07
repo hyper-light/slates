@@ -663,17 +663,40 @@
 >   `candidates_partitioned_in_turn_mid_stream_lose_nothing`) failed 3 of 5 runs before: two writes were never
 >   answered, one for over 20 minutes. After the fix, 6 of 7 runs pass and none hangs. Red-checked by
 >   `xshard::tests::a_call_to_its_own_shard_runs_its_future_to_the_end_past_the_deadline`.
-> - **Open: an install never finishes inside the liveness budget** (record
->   `docs/bugs/2026-11-06-an-install-never-finished-inside-the-liveness-budget.md`). A candidate left behind the retained
->   tail is sent the whole volume (0.5-1.5 MB) under the 1 s budget an entry gets. In one run 1,391 installs (2.06 GB)
->   went out, both candidates held the owner's head, and no write became durable. Edits in progress (raft-chaos, with
->   live-durability building on them in the dispatch round): a size-derived exchange budget, replies folded as they
->   come, one task a holder, and a byte-bounded retained tail. With them, 3 of 8 runs still failed: of 425 installs
->   logged in one, about 400 found no session, as the holder's tasks raced for its one session.
-> - **The anchored flows** (a candidate's daemon SIGKILLed and succeeded, a candidate's node replaced) are counted apart
->   from the invariant results until A-228 lands: at load 60–80 the anchor kills live daemons whose heartbeat lapses.
+> - **Open (live-durability): an install never finishes inside the liveness budget, and a dispatch strands its
+>   sessions** (record `docs/bugs/2026-11-06-an-install-never-finished-inside-the-liveness-budget.md`).
+>   - A candidate left behind the retained tail is sent the whole volume (0.5-1.5 MB) under the 1 s budget an entry
+>     gets. In one run 1,391 installs (2.06 GB) went out, both candidates held the owner's head, and no write became
+>     durable.
+>   - raft-chaos's edits (a size-derived exchange budget, replies folded as they come, a byte-bounded retained tail)
+>     are merged into live-durability's dispatch round. It adds one lane per (volume, holder), ships only to candidates
+>     holding the catalog, and waits for each exchange's stragglers before a lane ends. A straggler cancelled with its
+>     lane had taken its session with it, which is the KIND `wan` stall: both owner sessions `lent=true`, `no_session`
+>     24-40 k, runs 42178128960 and 42318867890.
+> - **Fixed: an unanswered destroy never settled.** Both candidates stopped, the destroy unanswered (correct), the owner
+>   killed. The destroy's records still reach the candidates once they resume, so it takes effect. But the successor,
+>   which adopted the tombstone in its takeover and retired it, kept its routing to the volume and answered every verb
+>   `Overloaded` for good (`fleet.owner_location.owned_unmaterialized`), while the other survivor answered `NotFound`.
+>   That happened in 6 of 6 runs, live and plain, macOS, 2026-11-06. `fleet::retire_shard_tombstones` now forgets the
+>   successor's routing at retirement, as a holder does in `tombstone::on_held`. The settled answer for a retired
+>   destroyed volume of a departed creator is `OwnerUnreachable`: no member remembers it and its id routes to the gone
+>   creator. Nobody lists or serves it. Flow: `a_{live,plain}_volumes_unheard_destroy_then_its_owners_loss`.
+> - **Open design item, not built: `NotFound` for a retired destroyed volume of a departed creator.** Today such a
+>   volume answers `OwnerUnreachable` (retryable, and true while a takeover could still be pending), because an owner
+>   location round never reports an unavailable view as `NotFound` (`owner_location::LocationError`). `NotFound` would
+>   be correct once no member can still adopt the id. A node's own view cannot show that: "this node has no unfinished
+>   takeover of the creator" is local, and another member may still be mid-adoption of that id, declining for now. So
+>   the rule needs the creator's takeover known complete fleet-wide, for example committed in the configuration group,
+>   before any member answers `NotFound` for the creator's ids.
+> - **Open (live-fixes): the anchored flows fail in fleet membership** on main 76e5b502 with A-228 (macOS, debug, load
+>   45-59, 2 runs each).
+>   - A candidate's daemon SIGKILLed under its anchor is succeeded in under 1 s but never readmitted within 40 s: the
+>     successor holds 3 members with 0 peers probed, while the others hold 2.
+>   - A candidate's node replaced by a fresh anchor was promoted to voter after 41 s in one run, and never in the other.
+>   These are counted apart from the invariant results.
 >
-> Touched: `crates/server/src/{live_ship,verbs,fleet}.rs` (the destroy's wait), the status line (`crates/ipc`
+> Touched: `crates/server/src/{live_ship,verbs,fleet}.rs` (the destroy's wait; the successor's routing at a
+> tombstone's retirement), the status line (`crates/ipc`
 > `LiveReport`, `crates/cli` status), the harness, the KIND leg (`xtask/src/kind_live.rs`,
 > `crates/cli/examples/pod_live_probe.rs`).
 
