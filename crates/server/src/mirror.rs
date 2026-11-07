@@ -878,7 +878,7 @@ fn seed_assigned(state: &mut ShardState, local: HostId) -> Vec<ObjectId> {
       // Built: this node now owns it and claims it to lookups; never before, or a lookup routed here would find no
       // volume yet.
       if !state.pending_materializations.contains_key(&object) {
-        state.fleet.track_object_owner(object, local);
+        crate::takeover::track_owner_on_every_shard(state, object, local);
         reports.push(object);
       }
       continue;

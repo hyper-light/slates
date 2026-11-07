@@ -3774,6 +3774,29 @@ fn wait_successor(instances: &[String], id: &str) -> String {
   }
 }
 
+/// A-222 and §4.8: a kernel mount of a volume asked of a node that does not own it is refused by its kind
+/// (`AttachmentUnsupported { NfsLoopback, OwnedByAnotherHost }`), never served from a copy that node holds: the mount
+/// would hand the client something of this host's for another host's volume. Where `mount_nfs` exists; elsewhere it
+/// skips loudly.
+fn mount_refused_by_kind(instance: &str, id: &str, mountable: bool) {
+  if !mountable {
+    eprintln!("mount_nfs is not on this host: skipping the bystander's refused mount");
+    return;
+  }
+  let mount_point = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let (code, _, err) = run(instance, &["mount", id, &mount_point.path]);
+  assert!(
+    code != 0 && err.contains("AttachmentUnsupported") && err.contains("OwnedByAnotherHost"),
+    "a node that does not own the volume refuses its mount by kind: exit {code}: {err}"
+  );
+  assert!(
+    !is_mounted(&mount_point.path),
+    "nothing was mounted at the refused path"
+  );
+}
+
 /// The payload written on the dead owner reads back through a real kernel mount of the successor's
 /// volume — where `mount_nfs` exists; elsewhere the read-back skips loudly.
 fn read_on_successor(instance: &str, id: &str, mountable: bool) {
@@ -3808,7 +3831,9 @@ fn read_on_successor(instance: &str, id: &str, mountable: bool) {
 /// is retired by both survivors (their `status` drops it), and the survivor rendezvous ranks first takes
 /// the volume over and serves it under its id — the file written on the dead owner reading back through a
 /// real kernel mount of the successor where `mount_nfs` exists (elsewhere that step skips loudly; the
-/// deployment proof stands). Gated like the other process flows (`SLATES_TEST_CLI=1`): three daemons with
+/// deployment proof stands), while the other survivor refuses a mount of it by kind (`OwnedByAnotherHost`). Under load
+/// on macOS CI (run 42206043007) the successor itself refused its mount so: the takeover had recorded the new owner on
+/// the control shard alone, and the shard serving the client still named the dead creator. Gated like the other process flows (`SLATES_TEST_CLI=1`): three daemons with
 /// spinning shards need the machine to themselves.
 #[test]
 fn three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owners_death() {
@@ -3883,6 +3908,11 @@ fn three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owner
   assert_retired(&wait_fleet_views(&survivors, 2, 1), &owner_host);
   let successor = wait_successor(&survivors, &id);
   read_on_successor(&successor, &id, mountable);
+  let bystander = survivors
+    .iter()
+    .find(|instance| **instance != successor)
+    .unwrap();
+  mount_refused_by_kind(bystander, &id, mountable);
 
   drop(daemons);
   drop(scratch);
