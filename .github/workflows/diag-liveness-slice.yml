@@ -1,0 +1,53 @@
+name: diag-liveness-slice-red
+
+# Diagnostics only, never on main (recovery-slicing plan, step 2): the failing tests on agents/liveness-slice's red commit,
+# on both Linux runners, each failure's message kept. Results go to diag-results/liveness-20-<os>.
+on:
+  push:
+    branches: ["diag-liveness-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  linux:
+    name: slicing red (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo test --locked -p slates-server --test recovery --no-run
+      - name: The red tests
+        run: |
+          R=../results.txt
+          echo "runner ${{ matrix.os }}, $(nproc) CPUs, $(git log --oneline -1 | cut -c1-80), $(date -u)" > $R
+          for t in a_shard_start_running_windows_of_cpu_keeps_the_daemons_beat a_large_merge_state_is_recovered_whole_and_in_slices a_daemon_stopped_while_its_boot_waits_on_a_shard_stops; do
+            status=0
+            cargo test --locked -p slates-server --test recovery -- --exact --nocapture --test-threads=1 $t > ../t.log 2>&1 || status=$?
+            grep -E 'panicked|the beat went|ran in one slice|the daemon stopped|spinning|test result' -A1 ../t.log | cut -c1-300 | tee -a $R || true
+            echo "== $t exit $status" | tee -a $R
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/liveness-20-${{ matrix.os }}"
+          git config user.name "diag-liveness"
+          git config user.email "diag-liveness@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-liveness-20 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
