@@ -35,14 +35,16 @@ const NO_CORE_BYTES: u64 = 0;
 ///
 /// `RLIMIT_CORE = 0` has no unprivileged equivalent on Windows. A crash dump is written by Windows Error
 /// Reporting, and turning that off for a process is a registry setting an administrator makes, which R10
-/// refuses to require; `WerRegisterExcludedMemoryBlock` excludes named regions rather than the process, and
-/// the daemon's content arena is not a fixed set of regions it could name up front. So on Windows this
-/// hardening is **absent**: a crash can write the daemon's RAM, tenant content included, to a dump file.
+/// refuses to require. What an ordinary process can do is name regions WER leaves out
+/// (`WerRegisterExcludedMemoryBlock`), so each mapping that holds private bytes registers itself when it is mapped
+/// (A-239, `slates_mem::dump_exclusion`): the content regions, every view of a shared memory object (the anchor
+/// segment, the content object, the copies) and the daemon's key region. Nothing is left to do here at start.
 ///
-/// It returns `Ok` rather than refusing because refusing would stop the daemon starting on Windows at all,
-/// which is a bigger hole than the one it would be guarding. Recorded for Ada in `docs/wip/GAPS.md`
-/// (`8a-win-dumps`) rather than left as an implication of a `cfg`. Found 2026-10-20, when `slates-cli` was
-/// compiled for Windows for the first time.
+/// What stays in a dump (the residual, GAPS `8a-win-dumps`): stacks and the heap, which can hold fragments of content
+/// or keys in flight (a request's buffer, an inline file in a tree node, aws-lc's key schedules), and any mapping WER
+/// refused (its 512-block limit, or a Windows without the call), counted and reported by `slates status` as
+/// `dumps_unexcluded`. It returns `Ok` rather than refusing on that residual, since refusing would stop the daemon
+/// starting on Windows at all.
 #[cfg(not(unix))]
 pub(crate) fn exclude_from_dumps() -> Result<(), Failure> {
   Ok(())
