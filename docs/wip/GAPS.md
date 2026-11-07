@@ -81,12 +81,20 @@
 > acting owner's entries though its configuration lags (`live_ship::live_admission`, red with the exception removed).
 > The A/B, rolling partition x10 per leg per arch (diag-live-durability-39): without, `not_a_candidate` in 4 of 20 runs,
 > a write over 1 s in 4, Convergence failed in 1; with, none of the three in 20.
-> **Open (unassigned; shape unknown): a write held about 2.3 s when the second candidate stops within a quarter second
-> of the first's resume.** With the fix above, 1 of 40 rolling partition runs (diag-live-durability-40 and -41: x86,
-> sent at 2.48 s as c stopped, b resumed at 2.23 s, answered 0.31 s after c resumed, no refusal anywhere). The resumed
-> holder was not yet counting: its catch-up (an install, after 2 s away) or the owner's redial of its session. A passing
-> run prints no counters, so which is not known (the diag runs' stuck-write watcher, diag-live-durability-38, dumps only
-> from 3 s). Before the merge 1 of 6 runs had one too (2.6 s, no refusal).
+> **Open (live-durability, 2026-11-07; shape unknown): a write held about 2.3 s when the second candidate stops within a
+> quarter second of the first's resume.** With the fix above, 1 of 40 rolling partition runs (diag-live-durability-40
+> and -41: x86, sent at 2.48 s as c stopped, b resumed at 2.23 s, answered 0.31 s after c resumed, no refusal anywhere).
+> The resumed holder was not yet counting: its catch-up (an install, after 2 s away) or the owner's redial of its
+> session. A passing run prints no counters, so which is not known (the diag runs' stuck-write watcher,
+> diag-live-durability-38, dumps only from 3 s). Before the merge 1 of 6 runs had one too (2.6 s, no refusal).
+> **Open (raft-chaos, 2026-11-07; cause unknown): a live takeover over KIND's lossy WAN path never finished.** At
+> e140ca3a, 1 of 4 runs of the KIND lane's live takeover under 80 ms ± 20 ms with 1 % loss (raft-chaos's diag-41, the
+> tip plus a counter only) found no survivor serving the volume within `TAKEOVER_WAIT` (120 s, `xtask/src/kind.rs`);
+> the other 3 took it over in 17–21 s. Nothing was lost: all 300 writes read back, and both survivors hold one head.
+> The candidate received only its own report and retried phase one 425 times, while its session to the other holder
+> stayed lent out throughout; phase one losing its own session was ruled out. Main's rate is not measured (its one
+> sample, run 42403976587, passed). Owed before any fix: each session's lends and returns counted and dumped at the
+> missed budget, and an interleaved A/B of the lane against main.
 
 > **Fixed (live-fixes, 2026-11-07): a live shipper made before its candidates were known shipped to nobody** (A-200's
 > amendment of that date). A shipper kept the holders of its first publication, so a live volume made on a fleet's
