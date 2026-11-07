@@ -271,7 +271,7 @@ pub(crate) enum Durability {
 /// Whether `volume`'s log is durable at `target` on this (its owner) shard; when it is not yet and `waker` is given,
 /// parks it on the volume. Shared by every transport that holds a reply for durability: an NFS stable write or `COMMIT`
 /// and a Shards stream's `FSYNC` ([`wait_durable`]), a FUSE `fsync` (`crate::fuse`) and a virtio-fs `FSYNC`
-/// (`crate::virtiofs`, [`DurableWait`]).
+/// (`crate::virtiofs`, `DurableWait`, Unix only).
 pub(crate) fn durability(
   state: &mut ShardState,
   volume: slates_db::catalog::VolumeId,
