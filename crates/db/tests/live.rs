@@ -694,9 +694,9 @@ impl Run {
     let mut holders: Vec<HostId> = match self.following {
       None => self.holders.keys().copied().collect(),
       Some(Following::Joint) => self.owners[old].recorded.clone(),
-      Some(
-        Following::RecordAtOnce | Following::Fixed | Following::SuccessorFromConfiguration,
-      ) => self.configuration.clone(),
+      Some(Following::RecordAtOnce | Following::Fixed | Following::SuccessorFromConfiguration) => {
+        self.configuration.clone()
+      }
     };
     holders.retain(|host| *host != successor && *host != old_host);
     // The old owner was a candidate; it is gone, but stays in the holder list as a dead candidate it ships to.
@@ -818,9 +818,7 @@ impl Run {
   fn follow(&mut self) {
     if matches!(
       self.following,
-      Some(
-        Following::Joint | Following::RecordAtOnce | Following::SuccessorFromConfiguration
-      )
+      Some(Following::Joint | Following::RecordAtOnce | Following::SuccessorFromConfiguration)
     ) {
       let named = self.configuration.clone();
       let owner = &mut self.owners[self.current];
