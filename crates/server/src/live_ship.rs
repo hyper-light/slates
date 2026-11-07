@@ -159,6 +159,12 @@ pub(crate) struct LiveVolume {
   /// The bytes a candidate keeps of this log: the last whole entry and every entry since ([`keep`]). Once it reaches
   /// the volume's size the next publication ships whole, which clears them ([`kept_reaches_size`]).
   kept: usize,
+  /// The holders a lane is shipping to now, each with when it began ([`dispatch`]): at most one lane a holder, so the
+  /// messages a holder lacks queue here, not as tasks waiting for its one session.
+  lanes: BTreeMap<HostId, u64>,
+  /// The holders known to hold a version of the volume's catalog, which a holder's bound is derived from
+  /// ([`hold_bound`]): every holder any of the catalog's placements named, kept. Bounded by the candidates.
+  catalogued: Vec<HostId>,
 }
 
 /// What a candidate keeps of one live volume.
@@ -825,6 +831,8 @@ pub(crate) fn published(
       whole: None,
       fenced: None,
       kept: 0,
+      lanes: BTreeMap::new(),
+      catalogued: Vec::new(),
     });
   let whole = live.owes_whole || record.is_none() || reaches_size;
   let built = if whole {
@@ -1006,13 +1014,39 @@ fn content_runs(
 /// owed at a checkpoint the holder already holds cannot move it, so instead the volume is marked to owe a fresh whole
 /// record (its next publication or the period appends one, and the install is made from that).
 fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
+  let object = ObjectId(volume);
+  let placed = catalogued_holders(state, object);
+  let (now, expiry) = (slates_rt::futures::now_ns(), lane_expiry_ns());
   let Some(live) = state.live.shipping.get_mut(&volume) else {
     return Vec::new();
   };
-  let object = ObjectId(volume);
+  // Kept, not replaced: a round that placed the catalog at `f + 1` while a candidate was away names only the others,
+  // and the candidate, which holds an earlier version, was shipped nothing more (a healed candidate left at 228 against
+  // the owner's 554 for good, `live_chaos`, 2026-11-06).
+  for holder in placed {
+    if !live.catalogued.contains(&holder) {
+      live.catalogued.push(holder);
+    }
+  }
+  let catalogued = live.catalogued.clone();
+  // A holder a lane is shipping to is sent its messages when the lane ends ([`lane_ended`]): nothing is built for it
+  // now, an install least of all (a clone of the whole volume each: 1,631 built in one run, 2.3 GB copied on the owner
+  // shard, for lanes that sent none of them).
+  let busy: Vec<HostId> = live
+    .lanes
+    .iter()
+    .filter(|(_, began)| now.saturating_sub(**began) < expiry)
+    .map(|(holder, _)| *holder)
+    .collect();
   let mut sends = Vec::new();
   let mut stale_checkpoint = false;
   for holder in live.shipper.holders() {
+    // A holder that has not acknowledged the volume's catalog refuses the log (its bound is the catalog's size,
+    // `hold_bound`): the record plane places the catalog there first, re-shipped each period, and the next dispatch after
+    // that ships it the log.
+    if !catalogued.contains(holder) || busy.contains(holder) {
+      continue;
+    }
     match live.shipper.pending(*holder) {
       Next::Entries(entries) => {
         for entry in entries {
@@ -1060,10 +1094,56 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
   sends
 }
 
+/// The candidates the latest placement of `object`'s catalog record names: holders that take its live log ([`hold_bound`]
+/// is derived from the catalog), folded into the volume's `catalogued` by [`pending_sends`]. Shipped to every candidate before, a candidate the record plane had not yet placed the
+/// catalog on refused each entry and each install (`fleet.live.hold_refused.no_catalog`, 116 and 119 refusals on the two
+/// candidates of one run), and its installs, the whole volume each, held its one session against the record plane's
+/// re-ship of the very catalog it lacked: one candidate held the log alone, and partitioning it stalled every write
+/// (`live_chaos`'s rolling partition, 2026-11-06: 1,785 installs, 2.3 GB, in one run).
+fn catalogued_holders(state: &ShardState, object: ObjectId) -> Vec<HostId> {
+  state
+    .placed_heads
+    .get(&object.catalog())
+    .map(|placed| placed.placement.acked.clone())
+    .unwrap_or_default()
+}
+
 /// Ships `sends` from the control shard and folds the replies on this (the owner) shard, in a task of this shard: the
-/// barrier that called it does not wait (A-200's next slice makes it). The task is bounded by the dispatch's budget and
-/// detached, so nothing joins it and its slot is reaped when it ends.
-fn dispatch(state: &ShardState, sends: Vec<Send>) {
+/// barrier that called it does not wait for it (the barrier's reply waits on [`durability`] instead). The task is
+/// bounded by the dispatch's budget and detached, so nothing joins it and its slot is reaped when it ends.
+///
+/// One lane a holder (A-200): a message for a holder a lane is already shipping to is not sent now. The lane, when it
+/// ends, sends what the holder lacks then ([`lane_ended`]), so a holder's messages queue in its shipper, never as tasks
+/// waiting for its one record session. Before 2026-11-06 every publication, every folded answer and every record period
+/// sent each holder its own lane: under `live_chaos`'s rolling partition at load 45 a lane waited 100–1,000 ms for its
+/// holder's session against 1–5 ms for its exchange (one borrow waited 1,208 timer ticks, all of them behind other live
+/// lanes), writes took a second with both holders up, and a healed holder fell further behind. A lane whose task ended
+/// without reporting (its shard's shutdown) is passed over once the dispatch's deadline has gone by.
+fn dispatch(state: &mut ShardState, sends: Vec<Send>) {
+  let now = slates_rt::futures::now_ns();
+  let expiry = lane_expiry_ns();
+  let mut opened: Vec<(ObjectId, HostId)> = Vec::new();
+  let sends: Vec<Send> = sends
+    .into_iter()
+    .filter(|send| {
+      let Some(live) = state.live.shipping.get_mut(&send.object.0) else {
+        return false;
+      };
+      let busy = live
+        .lanes
+        .get(&send.holder)
+        .is_some_and(|began| now.saturating_sub(*began) < expiry)
+        && !opened.contains(&(send.object, send.holder));
+      if busy {
+        return false;
+      }
+      live.lanes.insert(send.holder, now);
+      if !opened.contains(&(send.object, send.holder)) {
+        opened.push((send.object, send.holder));
+      }
+      true
+    })
+    .collect();
   if sends.is_empty() {
     return;
   }
@@ -1071,54 +1151,152 @@ fn dispatch(state: &ShardState, sends: Vec<Send>) {
     state.shard,
     state.shards.first().copied().unwrap_or(state.shard),
   );
-  let spawned = slates_rt::futures::spawn(async move {
-    let replies = send_from_control(origin, control, sends).await;
-    let _ = state::with_state(|s| fold_into(s, replies));
-  });
+  let spawned = slates_rt::futures::spawn(send_from_control(origin, control, sends));
   if let Ok(task) = spawned {
     let _ = slates_rt::futures::detach(task);
   }
 }
 
-/// Sends each message over the control shard's session to its holder and brings back every reply that came in the
-/// dispatch's budget; the stragglers' replies follow through [`fold_into`] when they come.
-async fn send_from_control(
-  origin: u16,
-  control: u16,
-  sends: Vec<Send>,
-) -> Vec<(ObjectId, HostId, Vec<u8>)> {
+/// Derived: how long a lane is taken to be shipping before it is passed over: the dispatch's own deadline (twice the
+/// live exchange's longest budget, [`send_from_control`]), past which its task cannot still be running.
+fn lane_expiry_ns() -> u64 {
+  crate::fleet::live_budget()
+    .max_deadline_ns()
+    .saturating_mul(2)
+}
+
+/// A lane to `holder` has ended for `objects`: each volume's lane is closed, and what any holder of those volumes lacks
+/// now is sent ([`dispatch`]), the ended holder's at once when it `answered`. A holder that did not answer is left to
+/// the next publication or the record period: sent again at once, a holder with no link (dropped to be dialed afresh)
+/// would end each new lane at once and loop between the shards at their speed.
+fn lane_ended(state: &mut ShardState, holder: HostId, objects: Vec<ObjectId>, answered: bool) {
+  let mut sends = Vec::new();
+  for object in objects {
+    let Some(live) = state.live.shipping.get_mut(&object.0) else {
+      continue;
+    };
+    live.lanes.remove(&holder);
+    if live.fenced.is_none() {
+      sends.extend(
+        pending_sends(state, object.0)
+          .into_iter()
+          .filter(|send| answered || send.holder != holder),
+      );
+    }
+  }
+  dispatch(state, sends);
+}
+
+/// Sends each message over the control shard's session to its holder, the holders at once: one lane per holder, its
+/// messages in order on its session, every lane polled together, and each lane's replies handed to the owner shard
+/// (`origin`) the moment its exchange ends. So a write is durable as soon as the fastest `f` holders answer, and a
+/// holder that does not answer delays no other: before 2026-11-06 the holders were asked in turn, each within up to a
+/// liveness budget for its session and again for its reply, and with one candidate stopped a write waited for it before
+/// the healthy one was asked (`live_chaos`'s rolling partition: writes at 1.0–6.6 s, at or past the budget, in 3 of 3
+/// runs). The stragglers' replies follow through [`fold_into`] when they come.
+async fn send_from_control(origin: u16, control: u16, sends: Vec<Send>) {
   let budget = crate::fleet::live_budget();
   let deadline = budget.max_deadline_ns().saturating_mul(2);
-  crate::xshard::task_within(
+  let _ = crate::xshard::task_within(
     origin,
     control,
     move || async move {
       drain_stragglers();
-      let mut replies = Vec::new();
-      for send in sends {
-        let sessions = borrow_session(send.holder, budget.max_deadline_ns()).await;
-        let exchanged =
-          slates_cluster::live::exchange((send.stream, &send.bytes), sessions, budget, |_, _| true)
-            .await;
-        if exchanged.replies.is_empty() {
-          let _ = state::with_state(|s| s.count(LIVE_UNANSWERED, 1));
-        }
-        lose_links(&exchanged.unanswered);
-        crate::fleet::return_sessions(exchanged.reusable);
-        replies.extend(
-          exchanged
-            .replies
-            .into_iter()
-            .map(|(host, bytes)| (send.object, host, bytes)),
-        );
-        settle_stragglers(origin, send.object, exchanged.stragglers);
+      let mut lanes: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>> = Vec::new();
+      for (holder, sends) in by_holder(sends) {
+        lanes.push(Box::pin(ship_to_holder(origin, holder, sends, budget)));
       }
-      replies
+      every(lanes).await;
     },
     deadline,
   )
-  .await
-  .unwrap_or_default()
+  .await;
+}
+
+/// `sends` grouped by holder, each holder's in the order they were made (the order its session carries them).
+fn by_holder(sends: Vec<Send>) -> Vec<(HostId, Vec<Send>)> {
+  let mut lanes: Vec<(HostId, Vec<Send>)> = Vec::new();
+  for send in sends {
+    match lanes.iter_mut().find(|(holder, _)| *holder == send.holder) {
+      Some((_, lane)) => lane.push(send),
+      None => lanes.push((send.holder, vec![send])),
+    }
+  }
+  lanes
+}
+
+/// Runs every future in `lanes` to its end, polling them together on this task: the lanes of one dispatch, one a holder.
+/// Each finishes within its exchanges' budget, so this does too.
+async fn every(mut lanes: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>>) {
+  std::future::poll_fn(|cx| {
+    lanes.retain_mut(|lane| lane.as_mut().poll(cx).is_pending());
+    if lanes.is_empty() {
+      std::task::Poll::Ready(())
+    } else {
+      std::task::Poll::Pending
+    }
+  })
+  .await;
+}
+
+/// One holder's lane of a dispatch, on the control shard: each message over the holder's session in turn, each answer
+/// folded on the owner shard as it comes. A message the holder did not answer ends the lane: the rest would each wait
+/// out the same budget, and the link it rode is dropped to be dialed afresh ([`lose_links`]), after which the next
+/// dispatch or the record period sends what the holder lacks.
+async fn ship_to_holder(
+  origin: u16,
+  holder: HostId,
+  sends: Vec<Send>,
+  budget: slates_cluster::CommitBudget,
+) {
+  let mut objects: Vec<ObjectId> = Vec::new();
+  for send in &sends {
+    if !objects.contains(&send.object) {
+      objects.push(send.object);
+    }
+  }
+  let answered = ship_lane(origin, holder, sends, budget).await;
+  // After the lane's own folds, so the owner sends what the holder lacks given its last answer.
+  let control = state::with_state(|s| s.shard).unwrap_or(origin);
+  crate::xshard::run_on_counted(control, origin, move |s| {
+    lane_ended(s, holder, objects, answered);
+  });
+}
+
+/// The messages of one lane in turn ([`ship_to_holder`]): whether the holder answered every one it was sent.
+async fn ship_lane(
+  origin: u16,
+  holder: HostId,
+  sends: Vec<Send>,
+  budget: slates_cluster::CommitBudget,
+) -> bool {
+  for send in sends {
+    let sessions = borrow_session(holder, budget.max_deadline_ns()).await;
+    let exchanged =
+      slates_cluster::live::exchange((send.stream, &send.bytes), sessions, budget, |_, _| true)
+        .await;
+    let answered = !exchanged.replies.is_empty();
+    if !answered {
+      let _ = state::with_state(|s| s.count(LIVE_UNANSWERED, 1));
+    }
+    lose_links(&exchanged.unanswered);
+    crate::fleet::return_sessions(exchanged.reusable);
+    let replies: Vec<(ObjectId, HostId, Vec<u8>)> = exchanged
+      .replies
+      .into_iter()
+      .map(|(host, bytes)| (send.object, host, bytes))
+      .collect();
+    if !replies.is_empty() {
+      let control = state::with_state(|s| s.shard).unwrap_or(origin);
+      crate::xshard::run_on_counted(control, origin, move |s| fold_into(s, replies));
+    }
+    // After the answers are on their way to the owner, so durability waits for no straggler.
+    finish_stragglers(origin, send.object, exchanged.stragglers).await;
+    if !answered {
+      return false;
+    }
+  }
+  true
 }
 
 /// Borrows `holder`'s record session, waiting for it while another dispatch has it out, one timer tick at a time,
@@ -1172,29 +1350,63 @@ pub(crate) fn drain_stragglers() {
   };
   let mut kept = Vec::new();
   for (origin, object, mut stragglers) in queued {
-    let (late, done) = stragglers.recover_replies();
-    let mut replies = Vec::new();
-    let mut sessions = Vec::new();
-    let mut lost = Vec::new();
-    for (host, reply, endpoint) in late {
-      if reply.round_trip_ns.is_none() {
-        lost.push(host);
-        continue;
-      }
-      replies.push((object, host, reply.bytes));
-      sessions.push((host, endpoint));
-    }
-    lose_links(&lost);
-    crate::fleet::return_sessions(sessions);
-    if !replies.is_empty() {
-      let control = state::with_state(|s| s.shard).unwrap_or(origin);
-      crate::xshard::run_on_counted(control, origin, move |s| fold_into(s, replies));
-    }
-    if !done {
+    if !recover_stragglers(origin, object, &mut stragglers) {
       kept.push((origin, object, stragglers));
     }
   }
   let _ = state::with_state(|s| s.live.stragglers.extend(kept));
+}
+
+/// Takes what `stragglers` have returned: each answered holder's session back to the pool and its reply to the volume's
+/// owner shard (`origin`), each unanswered holder's link dropped to be dialed afresh. Whether every straggler has
+/// returned. On the control shard.
+fn recover_stragglers(
+  origin: u16,
+  object: ObjectId,
+  stragglers: &mut slates_cluster::Stragglers,
+) -> bool {
+  let (late, done) = stragglers.recover_replies();
+  let mut replies = Vec::new();
+  let mut sessions = Vec::new();
+  let mut lost = Vec::new();
+  for (host, reply, endpoint) in late {
+    if reply.round_trip_ns.is_none() {
+      lost.push(host);
+      continue;
+    }
+    replies.push((object, host, reply.bytes));
+    sessions.push((host, endpoint));
+  }
+  lose_links(&lost);
+  crate::fleet::return_sessions(sessions);
+  if !replies.is_empty() {
+    let control = state::with_state(|s| s.shard).unwrap_or(origin);
+    crate::xshard::run_on_counted(control, origin, move |s| fold_into(s, replies));
+  }
+  done
+}
+
+/// Waits, on the lane's own task, for an exchange's stragglers to report, and recovers them ([`recover_stragglers`]).
+/// An exchange's requests are children of the task that made it (`slates_cluster::live::exchange`), and a task's end
+/// cancels its children: a request still in flight when its lane's task ended was dropped with its holder's session in
+/// it, never reported, and its slot stayed lent for good, so the owner shipped that holder nothing again (both of an
+/// owner's sessions `lent=true` with its log stuck two short of its head: `live_chaos` at load 118, 3 of 10 runs stalled
+/// without this and 0 of 10 with it at load 41-58; and the KIND leg's 80 ms WAN in 50-100 writes, raft-chaos run
+/// 42178128960, 2026-11-06). Each request is bounded by the exchange's own deadline, so this waits at most the gap
+/// between the exchange giving up and its requests doing so: a timer tick or two. A shard that can no longer time the
+/// wait leaves them to the drain ([`drain_stragglers`]).
+async fn finish_stragglers(
+  origin: u16,
+  object: ObjectId,
+  mut stragglers: slates_cluster::Stragglers,
+) {
+  while !recover_stragglers(origin, object, &mut stragglers) {
+    // Shape: one tick of the shard's timer wheel, the finest park there is (`sleep` rounds up to it).
+    if slates_rt::futures::sleep(1).await.is_err() {
+      settle_stragglers(origin, object, stragglers);
+      return;
+    }
+  }
 }
 
 /// Drops the record links of holders that answered nothing (on the control shard, where the links live): their link
