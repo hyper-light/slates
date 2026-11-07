@@ -831,7 +831,7 @@ impl Shipper {
   }
 
   /// Begins moving to `next` (the volume's other candidates as the configuration now names them; the owner is left
-  /// out), a change of holder set in the manner of Vertical Paxos (Lamport, Malkhi and Zhou, PODC 2009): until the
+  /// out; refused for a set of `f` or fewer, from which no takeover counts `f + 1`), a change of holder set in the manner of Vertical Paxos (Lamport, Malkhi and Zhou, PODC 2009): until the
   /// record names `next` ([`Shipper::activate`]), the shipper ships to both sets and counts a position durable only once
   /// `f` of each hold it, so a takeover counting either set meets every durable entry. A member of `next` is owed
   /// everything it lacks (entries, or an install once the retained tail no longer reaches back). Whether the target
@@ -843,6 +843,15 @@ impl Shipper {
   /// common members at `f = 1` broke NoLoss in the model (`tests/live.rs`, 2026-11-07).
   pub fn begin_transition(&mut self, next: &[HostId]) -> bool {
     let named = self.named(next);
+    // A set of `f` or fewer members is never moved to: no takeover can count `f + 1` reports from it, so a log recorded
+    // on it could not be taken over, and while the record named it every write waited on its few members. The current
+    // holders keep making `W` with the members still alive. Moving to such a set (a candidate found dead leaves one
+    // other at `f = 1`) stalled writes for a partition's length when the lone member stopped before the move back was
+    // recorded (live-durability's rolling partition flow, 4 of 6 runs on each arch at 8b0f0341).
+    let tolerated = usize::try_from(self.quorum.f).unwrap_or(usize::MAX);
+    if tolerated > 0 && named.len() <= tolerated {
+      return false;
+    }
     if self.transition.as_deref() == Some(named.as_slice())
       || (self.transition.is_some() && self.transferred())
     {
