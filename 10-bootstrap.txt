@@ -3,3 +3,8 @@ live bootstrap: written=false caught_up=false shipping=Some(("1", "none", "false
 
 thread 'a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates' (65024) panicked at crates/cli/tests/live_fleet.rs:1901:3:
 the bootstrap node's live writes became durable and both candidates hold them: Some(("1", "none", "false")) [None, None] [("live-bootstrap-a-28540", {}), ("live-bootstrap-b-28540", {"appended": 2, "awaited": 1, "whole": 2}), ("live-bootstrap-c-28540", {})]
+=== bootstrap off 2 exit 101 load { 11.52 8.84 9.35 }
+live bootstrap: written=false caught_up=true shipping=Some(("0", "0", "false")) held=[Some(("0", "none", "false")), Some(("0", "none", "false"))] [("live-bootstrap-a-31428", {"held": 1, "hold_refused": 4, "hold_refused.no_catalog": 1, "hold_refused.not_a_member": 3}), ("live-bootstrap-b-31428", {"held": 1, "hold_refused": 4, "hold_refused.no_catalog": 1, "hold_refused.not_a_member": 3}), ("live-bootstrap-c-31428", {"appended": 1, "awaited": 1, "durable": 1, "whole": 1})]
+
+thread 'a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates' (70318) panicked at crates/cli/tests/live_fleet.rs:1901:3:
+the bootstrap node's live writes became durable and both candidates hold them: Some(("0", "0", "false")) [Some(("0", "none", "false")), Some(("0", "none", "false"))] [("live-bootstrap-a-31428", {"held": 1, "hold_refused": 4, "hold_refused.no_catalog": 1, "hold_refused.not_a_member": 3}), ("live-bootstrap-b-31428", {"held": 1, "hold_refused": 4, "hold_refused.no_catalog": 1, "hold_refused.not_a_member": 3}), ("live-bootstrap-c-31428", {"appended": 1, "awaited": 1, "durable": 1, "whole": 1})]
