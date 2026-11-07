@@ -136,15 +136,31 @@ pub fn defers_reply(body: &RequestBody) -> bool {
 /// ids already issued still reach their completion records.
 pub const LAST_SEQUENCE: u32 = u32::MAX - 1;
 
-/// What a client keeps to resume: its id and the next sequence it would use. A process that
-/// restarts with this retries what it had in flight and meets the completion record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a client keeps to resume: its id, the next sequence it would use, and the session key that proves the id is
+/// its own. A process that restarts with this retries what it had in flight and meets the completion record; one that
+/// names an id without its key is refused `SessionUnproven` (§4.9, `slates_server::session_key`). The key is a secret:
+/// keep a session where the process's other secrets are kept, never in a log (its `Debug` leaves the key out).
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Session {
   /// The client id the daemon bound to this principal.
   pub client_id: u32,
   /// The next sequence.
   pub next_sequence: u32,
+  /// The session key the daemon issued with the id.
+  pub key: [u8; SESSION_KEY_BYTES],
 }
+
+impl std::fmt::Debug for Session {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("Session")
+      .field("client_id", &self.client_id)
+      .field("next_sequence", &self.next_sequence)
+      .finish_non_exhaustive()
+  }
+}
+
+/// Format: a session key's width (`slates_ipc::region::SESSION_KEY_BYTES`).
+pub const SESSION_KEY_BYTES: usize = slates_ipc::region::SESSION_KEY_BYTES;
 
 /// What `attach_shards` returns (§4.6, the Shards route; A-161): the attachment, and the stream end to hand a Shards
 /// VMM, which reaches that attachment and nothing else.
@@ -257,6 +273,9 @@ pub struct Client {
   instance: String,
   end: ClientEnd,
   client_id: u32,
+  /// The session key that proves `client_id` is this client's (`Session::key`), written into every region it is
+  /// handed again under the id, before the first request there.
+  session_key: [u8; SESSION_KEY_BYTES],
   /// The last sequence used.
   sequence: u32,
   deadlines: Deadlines,
@@ -949,7 +968,7 @@ impl Connecting {
       Ok(None) => Ok(None),
       Ok(Some(connected)) => {
         self.claim = None;
-        let mut client = Client::over(&self.instance, connected, 0, self.deadlines);
+        let mut client = Client::over(&self.instance, connected, 0, self.deadlines, None)?;
         // Bound on the first send, without waiting (`bind_without_waiting`).
         client.consumer = self.delivered.take();
         Ok(Some(client))
@@ -1000,7 +1019,7 @@ impl Client {
     let delivered = delivered_capability()?;
     install_seal();
     let connected = connect_as(instance, 0, deadlines.reconnect_ns)?;
-    let mut client = Client::over(instance, connected, 0, deadlines);
+    let mut client = Client::over(instance, connected, 0, deadlines, None)?;
     client.bind_delivered(delivered)?;
     Ok(client)
   }
@@ -1042,21 +1061,38 @@ impl Client {
       connected,
       session.next_sequence.saturating_sub(1),
       deadlines,
-    );
+      Some(session.key),
+    )?;
     client.bind_delivered(delivered)?;
     Ok(client)
   }
 
-  /// A client over a fresh rendezvous, its sequence at `sequence` (the last used).
-  fn over(instance: &str, connected: Connected, sequence: u32, deadlines: Deadlines) -> Client {
+  /// A client over a fresh rendezvous, its sequence at `sequence` (the last used). `key` is the session key of an id
+  /// being resumed, written into the region to prove it; `None` for an id issued fresh, whose key the daemon wrote
+  /// there.
+  fn over(
+    instance: &str,
+    mut connected: Connected,
+    sequence: u32,
+    deadlines: Deadlines,
+    key: Option<[u8; SESSION_KEY_BYTES]>,
+  ) -> Result<Client, ClientError> {
     let client_id = connected.region.client_id();
+    let session_key = match key {
+      Some(key) => {
+        connected.region.set_session_key(&key)?;
+        key
+      }
+      None => connected.region.session_key()?,
+    };
     let end = ClientEnd::connected(connected);
     let ack_every = ack_every_of(&end);
     let unpublished_cap = end.region().cmd().slots().max(1);
-    Client {
+    Ok(Client {
       instance: instance.to_owned(),
       end,
       client_id,
+      session_key,
       sequence,
       deadlines,
       reconnects: 0,
@@ -1078,7 +1114,7 @@ impl Client {
       bound: false,
       rebinds: 0,
       reconnecting: None,
-    }
+    })
   }
 
   /// Binds the channel to the delivered consumer, when there is one.
@@ -1130,6 +1166,7 @@ impl Client {
       client_id: self.client_id,
       // At most `LAST_SEQUENCE + 1 = u32::MAX`, the exhausted marker: exact, never a wrap.
       next_sequence: self.sequence.saturating_add(1),
+      key: self.session_key,
     }
   }
 
@@ -2005,11 +2042,12 @@ impl Client {
     }
     match polled {
       Ok(None) => Ok(false),
-      Ok(Some(connected)) => {
+      Ok(Some(mut connected)) => {
         let assigned = connected.region.client_id();
         if assigned != self.client_id {
           return Err(ClientError::SessionTaken { assigned });
         }
+        connected.region.set_session_key(&self.session_key)?;
         self.end = ClientEnd::connected(connected);
         self.reconnects = self.reconnects.saturating_add(1);
         self.bound = false;
@@ -2879,11 +2917,12 @@ impl Client {
     let mut pause_ns = self.end.wake_estimate_ns().max(1);
     loop {
       match connect_as(&self.instance, self.client_id, self.deadlines.reconnect_ns) {
-        Ok(connected) => {
+        Ok(mut connected) => {
           let assigned = connected.region.client_id();
           if assigned != self.client_id {
             return Err(ClientError::SessionTaken { assigned });
           }
+          connected.region.set_session_key(&self.session_key)?;
           self.end = ClientEnd::connected(connected);
           self.reconnects = self.reconnects.saturating_add(1);
           self.bound = false;

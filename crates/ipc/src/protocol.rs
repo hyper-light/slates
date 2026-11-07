@@ -2930,6 +2930,10 @@ pub enum Refusal {
     /// The attachment.
     attachment: u64,
   },
+  /// A client named an id its session key does not prove (§4.9; `slates_server::session_key`): the seat and the
+  /// completion records under that id belong to the client it was issued to, so nothing is served on this channel,
+  /// which the daemon then ends. A client resumes only the session it was handed (`Session`, with its key). Appended.
+  SessionUnproven,
 }
 
 /// The writes a snapshot is known to include (§4.6 "Writeback and snapshot barrier"): every write the

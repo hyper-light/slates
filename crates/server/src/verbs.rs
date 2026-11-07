@@ -3448,6 +3448,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
   match r {
     Refusal::NotFound => "not_found",
     Refusal::AttachmentExpired { .. } => "attachment_expired",
+    Refusal::SessionUnproven => "session_unproven",
     Refusal::AlreadyExists { .. } => "already_exists",
     Refusal::StaleLease { .. } => "stale_lease",
     Refusal::LeaseHeld { .. } => "lease_held",
@@ -9368,6 +9369,92 @@ fn retry_deferred(state: &mut ShardState) -> bool {
   any
 }
 
+/// Whether a request passes the gates before it is served, neither of which records a completion:
+/// - a request names its client in its id, and a completion is keyed by that id (§4.9): one naming another client than
+///   this slot's would run under that client's id and record its reply there, where that client's own request of the
+///   same id would meet it, so it is refused before any effect (`refuse_foreign_request`);
+/// - a client serves nothing until it has proven its id (`crate::session_key`): a stranger that names a dead client's
+///   id is refused `SessionUnproven`, and its slot is ended without retiring anything of the id's.
+fn gate(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, request: u64) -> bool {
+  if refuse_foreign_request(state, handle, request) {
+    return false;
+  }
+  if session_proven(state, handle) {
+    return true;
+  }
+  let mut reply = refused(Refusal::SessionUnproven);
+  // Not recorded: the id's completion records are its owner's. A refusal the full ring cannot take is lost with the
+  // slot, which ends next either way.
+  let _answered = send_reply(state, index, request, &mut reply);
+  crate::reap::end_unproven(state, handle);
+  false
+}
+
+/// Refuses, `BadRequest`, a request whose id names another client than the slot's (`serve_client`): answered on this
+/// slot's ring under the id it carried, so its sender learns why, and recorded nowhere. `true` when refused. Counted.
+fn refuse_foreign_request(
+  state: &mut ShardState,
+  handle: Handle<ClientSlot>,
+  request: u64,
+) -> bool {
+  let Ok(client) = state.clients.get_mut(handle) else {
+    return false;
+  };
+  if client.client_id == RequestId::from_word(request).client {
+    return false;
+  }
+  let refusal = refused(Refusal::BadRequest {
+    reason: "a request names another client's id".to_owned(),
+  });
+  // A full ring loses the refusal; the request is refused either way, and the sender's wait ends at its deadline.
+  let _answered = client.end.reply_message(request, &refusal);
+  state.count("client.foreign_request", 1);
+  true
+}
+
+/// Whether the client in `handle` has proven its id: once, the first time it is asked, by the session key its region
+/// holds (`crate::session_key::proves`); every later call reads the slot's flag. A refusal is counted.
+fn session_proven(state: &mut ShardState, handle: Handle<ClientSlot>) -> bool {
+  let secret = state.session_secret;
+  let Ok(client) = state.clients.get_mut(handle) else {
+    return false;
+  };
+  if client.proven {
+    return true;
+  }
+  let proven = client
+    .end
+    .region()
+    .session_key()
+    .is_ok_and(|key| crate::session_key::proves(&secret, client.client_id, &key));
+  client.proven = proven;
+  if !proven {
+    state.count("client.session_unproven", 1);
+  }
+  proven
+}
+
+/// What a taken slot asks before it is served: the client is seen; a cancel clears its status pages; a heartbeat or a
+/// cancel is done with; any other request is served if it passes the gates (`gate`).
+fn to_serve(
+  state: &mut ShardState,
+  index: u32,
+  handle: Handle<ClientSlot>,
+  request: &Request,
+  now: u64,
+) -> bool {
+  if let Ok(client) = state.clients.get_mut(handle) {
+    client.last_seen_ns = now;
+    if request.kind == SlotKind::Cancel {
+      client.status_pages.clear(&mut state.store.metadata);
+    }
+  }
+  if matches!(request.kind, SlotKind::Heartbeat | SlotKind::Cancel) {
+    return false;
+  }
+  gate(state, index, handle, request.request)
+}
+
 /// Up to a batch of one client's requests.
 fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, now: u64) -> bool {
   let mut any = false;
@@ -9386,15 +9473,8 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
       }
     };
     any = true;
-    if let Ok(c) = state.clients.get_mut(handle) {
-      c.last_seen_ns = now;
-    }
-    if request.kind == SlotKind::Cancel
-      && let Ok(client) = state.clients.get_mut(handle)
-    {
-      client.status_pages.clear(&mut state.store.metadata);
-    }
-    if matches!(request.kind, SlotKind::Heartbeat | SlotKind::Cancel) {
+    // A slot the gate ended is gone, and the next take finds it so.
+    if !to_serve(state, index, handle, &request, now) {
       continue;
     }
     // The `ring.request` span (§4.14) opens the request's trace as a root at the slot read: the client

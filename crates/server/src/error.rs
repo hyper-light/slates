@@ -42,6 +42,10 @@ pub enum ServerError {
   /// refused. Fail-closed — a daemon with no issuer authority would make every landing un-grantable while
   /// looking healthy — so the daemon does not start; the provider's reason is carried.
   IssuerSecret(String),
+  /// The client session secret could not be minted at the first start under an anchor (`session_key`): the crypto
+  /// provider's secure random refused. Fail-closed: a daemon with no secret could not tell a client resuming its
+  /// session from a stranger naming its id, so it does not start; the provider's reason is carried.
+  SessionSecret(String),
 }
 
 impl fmt::Display for ServerError {
@@ -62,6 +66,9 @@ impl fmt::Display for ServerError {
       ),
       Self::IssuerSecret(reason) => {
         write!(f, "the grant-issuer secret could not be minted: {reason}")
+      }
+      Self::SessionSecret(reason) => {
+        write!(f, "the client session secret could not be minted: {reason}")
       }
     }
   }

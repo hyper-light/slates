@@ -188,6 +188,22 @@ impl SharedObject {
     Ok(())
   }
 
+  /// Copies the `into.len()` racy bytes at `offset` out, byte by byte through `AtomicU8`: for bytes the other side
+  /// may write meanwhile. Refused unless the span lies wholly inside one declared racy span.
+  pub fn read_racy(&self, offset: usize, into: &mut [u8]) -> Result<(), MemError> {
+    check_racy(&self.words, offset, into.len(), self.len)?;
+    racy_out(&self.inner, offset, into);
+    Ok(())
+  }
+
+  /// Copies `from` in at `offset` byte by byte through `AtomicU8`: for bytes the other side may read meanwhile.
+  /// Refused unless the span lies wholly inside one declared racy span.
+  pub fn write_racy(&mut self, offset: usize, from: &[u8]) -> Result<(), MemError> {
+    check_racy(&self.words, offset, from.len(), self.len)?;
+    racy_in(&self.inner, offset, from);
+    Ok(())
+  }
+
   /// The declared 64-bit word at `offset`, as an atomic.
   pub fn atomic_u64(&self, offset: usize) -> Result<&AtomicU64, MemError> {
     check_word(&self.words, offset, Width::U64)?;

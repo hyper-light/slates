@@ -32,10 +32,11 @@
 >   stranger can scribble to refuse claims. That is a denial of service, never a ring.
 > - **Windows**, the same shape by name (`Local\` sections with the default DACL); the fix is a section DACL and handle
 >   duplication, as `delivery.rs` already does.
-> - **Found on the way, every platform: a wanted client id is granted to whoever asks while it is not live.** In
->   `Listener::accept_pending`, `wanted != 0 && !in_use(wanted)` assigns it. Ids are small integers, so a same-uid
->   process that reconnects with a dead client's id in a restart's window takes that client's seat and its retained
->   completion records. Not yet fixed or measured; reported to the supervisor.
+> - **Found on the way, every platform: a wanted client id was granted to whoever asked while it was not live.** Fixed
+>   2026-11-07 by A-SEAT, with a sibling found on the way: any client could run a request under another client's id and
+>   plant its reply there, where that client's own request of the id later met it. A client now proves its id with a
+>   session key only it holds, and a request naming another client is refused
+>   (`docs/bugs/2026-11-07-a-stranger-took-a-dead-clients-seat-and-planted-its-replies.md`).
 
 > **A Windows UDP socket died on an earlier send's ICMP error (found 2026-11-06, fixed 2026-11-06).** With Windows'
 > default `SIO_UDP_CONNRESET`, a port-unreachable for a datagram sent earlier failed the socket's next `recvfrom` with

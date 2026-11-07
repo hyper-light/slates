@@ -678,6 +678,9 @@ impl Daemon {
       .map_err(|e| ServerError::IssuerSecret(e.to_string()))?;
     segment.publish_issuer_secret(&issuer_secret)?;
     let region_names = region_name_key(&issuer_secret);
+    // The client session secret (`crate::session_key`): adopted from the daemon before this one under the anchor, or
+    // made and published by the first, so a client's session key still opens its session after a restart.
+    crate::session_key::adopt_or_mint(&mut segment)?;
     // The node's sealing root (A-92): adopted from the previous daemon under this anchor, or made and published into
     // the anchor's locked page; sealing reports itself unavailable, never unlocked, where the OS refuses the lock.
     let sealing = crate::seal_keys::init(&mut segment, config.seal_key_slots);
@@ -3272,6 +3275,9 @@ fn init_shard(
   // before the segment moves into the state; every shard reads the same value, so a `Grant` verifies on
   // whichever shard serves the client.
   let issuer_secret = segment.issuer_secret()?;
+  // The client session secret (`crate::session_key`), published before any shard starts: a client's key is checked
+  // on the shard that serves it.
+  let session_secret = crate::session_key::secret_of(&segment)?;
   // The attachment counter starts past every attachment recovered with the partition — a host mount's
   // survives a restart (AUD-01) — so a fresh mint never meets a kept record's id.
   let next_attachment = verbs::next_attachment_counter(db.partition());
@@ -3281,6 +3287,7 @@ fn init_shard(
     config: config.clone(),
     segment,
     issuer_secret,
+    session_secret,
     seal_root,
     seal_state: sealing,
     seal_recipient: None,
@@ -4422,7 +4429,9 @@ async fn retained_client_ids(origin: u16, shard: u16) -> Option<u32> {
 
 /// Persist admission before its region can reach the client. A refused publication or exhausted
 /// id space refuses the handoff; no new caller can inherit a retained completion identity (§4.9).
-fn reserve_client_identity(client: u32, instance: &str) -> Result<(), slates_ipc::IpcError> {
+/// `true` for an id issued here for the first time, `false` for one issued before (a resumed session, whose
+/// client must prove its key before it is served: `crate::session_key`).
+fn reserve_client_identity(client: u32, instance: &str) -> Result<bool, slates_ipc::IpcError> {
   let unavailable = |why| slates_ipc::IpcError::DaemonUnavailable {
     endpoint: instance.to_owned(),
     why,
@@ -4437,7 +4446,7 @@ fn reserve_client_identity(client: u32, instance: &str) -> Result<(), slates_ipc
         .partition()
         .client_id_high_water(state.origin_anchor.0)
     {
-      return Ok(());
+      return Ok(false);
     }
     let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
     state
@@ -4447,10 +4456,10 @@ fn reserve_client_identity(client: u32, instance: &str) -> Result<(), slates_ipc
         &slates_db::Op::ClientIdReserved { client },
         now,
       )
-      .map(|_| ())
+      .map(|_| true)
   });
   match reserved {
-    Some(Ok(())) => Ok(()),
+    Some(Ok(fresh)) => Ok(fresh),
     _ => Err(unavailable("client identity reservation was not published")),
   }
 }
@@ -4528,7 +4537,7 @@ async fn control_loop(
           CLIENTS_REFUSED.fetch_add(1, Ordering::AcqRel);
           return Err(slates_ipc::IpcError::TooManyClients { limit: bound });
         }
-        reserve_client_identity(client_id, &config.instance)?;
+        let fresh = reserve_client_identity(client_id, &config.instance)?;
         // The id is reserved in the live set **here**, at admission, not once the accept round returns:
         // an accept round serves every pending connection before it returns, so a burst of connects
         // inside one round was admitted against a live set that did not yet count the earlier ones —
@@ -4547,7 +4556,20 @@ async fn control_loop(
         state::with_handed(|h| h.insert(client_id));
         let name = format!("slates-cr-{region_names:016x}-{regions_made:08x}");
         regions_made = regions_made.wrapping_add(1);
-        let region = match ClientRegion::create(&name, client_id, shard.0, config.region) {
+        let region = ClientRegion::create(&name, client_id, shard.0, config.region).and_then(|mut region| {
+          // An id issued fresh gets its session key in its region, which only its client is handed; an id issued
+          // before is resumed, and its client must write its own key there (`crate::session_key`).
+          if fresh {
+            let key = state::with_state(|state| crate::session_key::key_of(&state.session_secret, client_id))
+              .ok_or(slates_ipc::IpcError::DaemonUnavailable {
+                endpoint: config.instance.clone(),
+                why: "the client's session key has no shard state to be derived on",
+              })?;
+            region.set_session_key(&key)?;
+          }
+          Ok(region)
+        });
+        let region = match region {
           Ok(region) => region,
           Err(e) => {
             state::with_handed(|h| h.remove(&client_id));
@@ -4624,6 +4646,7 @@ async fn control_loop(
                 pid,
                 last_seen_ns,
                 retiring: false,
+                proven: false,
                 control,
                 revoked: false,
                 owner_route: None,

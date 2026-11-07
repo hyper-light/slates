@@ -107,6 +107,8 @@ pub mod oci;
 pub mod peer;
 mod reap;
 pub mod seal_keys;
+// A client's session key (GAP-A9-9's threat model): what a client resuming under its id proves before its seat is served.
+pub mod session_key;
 mod snapshot_view;
 // The Shards fs transport (§4.6, the Shards route; A-161): a volume served to a Shards microVM over an anonymous
 // stream, on the volume's owning shard: a socket pair on Unix, a duplex named pipe on Windows served by the runtime's

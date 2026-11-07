@@ -5600,6 +5600,21 @@ window is the process-restart window (zero, thanks to the anchor). Same code, ze
 
 ### 4.9 Wire protocol (D-15)
 
+> **Status (2026-11-07, A-SEAT: a client proves its id).** A client's id names its seat: its retained completion records,
+> its attachments, every verb after. The rendezvous carries only the id a client wants, which a stranger can name, and
+> a request carries its id in its slot word. So now:
+> - **A session key per id** (`slates_server::session_key`): keyed BLAKE3 over the id under the node's session secret,
+>   which the first daemon under an anchor makes and publishes in the supervision block, and every later one adopts.
+>   The key travels only in the client's own region (its header's bytes 64 to 96, region layout 4): written by the
+>   daemon for an id it issues fresh, and by a client resuming an id before its first request. `Session` carries it.
+> - **Checked once a slot**, in constant time, before its first request. A slot that does not prove its id is refused
+>   `SessionUnproven` with nothing recorded, and ended without retiring anything of the id's; the id is given back.
+> - **A request names its own client.** One whose id names another client than its slot's is refused `BadRequest`
+>   before any effect, recorded nowhere.
+> Proven by `a_stranger_with_a_dead_clients_id_gets_neither_its_seat_nor_its_records` and
+> `a_client_cannot_send_a_request_under_another_clients_id` (`crates/client/tests/client.rs`), each red before and
+> red-checked (`docs/bugs/2026-11-07-a-stranger-took-a-dead-clients-seat-and-planted-its-replies.md`).
+
 > **Status (2026-09-30, AUD-29-21).** A client's request sequence never wraps.
 > - **Range and marker.** Sequences run from 1 to `LAST_SEQUENCE = u32::MAX − 1`, and `u32::MAX` is kept
 >   as the session's exhausted marker, so a resume from it issues nothing.
@@ -13282,6 +13297,33 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Arm64 Windows proven** since (2026-10-27): the direct-map client tests, 20 of 20, on CI's `windows-11-arm` (run
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
+
+### A-SEAT — A client proves its id with a session key, and a request names its own client (accepted 2026-11-07, the supervisor's order)
+Applied in the same change to: §4.9 (its status), GAPS (GAP-A9-9's entry), the bug record of 2026-11-07,
+`crates/anchor` (`layout::SUP_SESSION_PRESENT`, `SUP_SESSION_SECRET`, `SESSION_SECRET_BYTES`, appended;
+`AnchorSegment::publish_session_secret`, `session_secret`), `crates/ipc` (`region.rs`: the session key at header byte
+64, layout version 4; `Refusal::SessionUnproven`, appended), `crates/mem` (`SharedObject::read_racy`, `write_racy`),
+`crates/server` (`session_key.rs`, new; `daemon.rs`: the secret adopted or made at start, the key written for an id
+issued fresh; `state.rs`: `ClientSlot::proven`, `ShardState::session_secret`; `verbs.rs`: `session_proven`,
+`refuse_foreign_request`; `reap.rs`: `end_unproven`), `crates/client` (`Session::key`, `SESSION_KEY_BYTES`; every
+resume and reconnect writes the key; tests).
+- **What was wrong.** `Listener::accept_pending` granted a wanted id to whoever named it while no live client held it,
+  so a same-uid stranger resuming under a dead client's id after a restart was served that client's seat and read its
+  completion records. And `serve` took a request's client from its slot word without comparing it with the slot's, so
+  any client could run a request under another's id and record its reply there; the daemon dropped the reply on its
+  way back, but that client's own request of the id then met the planted record and never ran.
+- **The rule.** A client proves its id with a session key only it and the daemon hold, before its slot serves anything;
+  a request naming another client than its slot's is refused before any effect. Neither refusal records a completion.
+- **Why a derived key, not a stored one.** A key per id derived under one secret needs no table that grows with every
+  id a node ever issues, survives a daemon restart with the secret, and is checked on whichever shard serves the
+  client. The issuer secret could not serve: it is made afresh at every start, and resumption crosses starts.
+- **Evidence.** `a_stranger_with_a_dead_clients_id_gets_neither_its_seat_nor_its_records`: red before ("the stranger
+  took client 1's seat; its retry of the victim's create answered Ok(Created …)"), green after, and red again with the
+  proof check forced true. `a_client_cannot_send_a_request_under_another_clients_id`: red before (the victim's create
+  of `victims-next` answered the planted volume's id; listed `["forged-victims", "planted"]`), green after.
+- **Residual.** A stranger that claims a dead id and sends nothing holds the slot until the reaper finds its process
+  gone, delaying the owner's resume, reading and changing nothing. On macOS the anchor segment, and the secret in it,
+  opens by name to a same-uid process: the exposure with Ada.
 
 ### A-230 — A CLI attachment holds a term, renewed by each verb that names it (accepted 2026-11-06, the supervisor's decision: option 2)
 Applied in the same change to: §4.7 (a dead client's attachments: the CLI's are excepted), `docs/cli.md`, GAPS,
