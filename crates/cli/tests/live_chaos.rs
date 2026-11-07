@@ -1239,6 +1239,9 @@ fn diagnosis(instances: &[String], volume: &str) -> String {
             || line.contains("fleet.live.")
             || line.contains("fleet.takeover")
             || line.contains("fleet.materialize")
+            || line.contains("fleet.seal.")
+            || line.contains("anchor")
+            || line.starts_with("fleet_host")
             || line.contains("lent_to")
         })
         .collect();
