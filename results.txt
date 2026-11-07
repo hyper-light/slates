@@ -1,0 +1,5 @@
+tested 6192f1f5ce7eb1f7b523f66a073db423ca2dd801 on windows
+clippy exit 0 108s
+clippy-cli exit 0 19s
+server-merge_load exit 0 134s
+  server-merge_load: test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s
