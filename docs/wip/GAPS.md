@@ -14,6 +14,13 @@
 >   in all), and refuses after a round whose waiter never ran
 >   (`docs/bugs/2026-11-07-a-busy-machine-refused-the-anchors-boot-at-the-wake-probe.md`). That closes the standing
 >   limitation of 2026-10-18's "busy-machine discipline" (1): "a machine too busy for the floor in 250 ms still refuses".
+> - Also closed the same day: the Linux process clock read `/proc/<pid>/schedstat`, the main thread's alone, so a start
+>   whose main thread waited on its shards read as stuck; it now reads the process's CPU-time clock
+>   (`docs/bugs/2026-11-07-the-linux-process-clock-read-the-main-thread-alone.md`). And the test suites that measured
+>   the machine at this load were fixed: the crash-loop test's wall clock, the CLI suite's daemon waits and the
+>   held-rendezvous answer bound (`docs/bugs/2026-11-07-the-crash-loop-test-timed-its-children-on-the-wall.md` and the
+>   start judgment's bug). Still the client's (clients, A-232): its wall-second reply deadline stalls a verb against a
+>   live, starved daemon ("no reply within 1000000000 ns" for `bootstrap root`, 5 of 15 runs at 8 spinners a CPU).
 > The bug record of 2026-11-07 has the per-phase table.
 > **A Windows UDP socket died on an earlier send's ICMP error (found 2026-11-06, fixed 2026-11-06).** With Windows'
 > default `SIO_UDP_CONNRESET`, a port-unreachable for a datagram sent earlier failed the socket's next `recvfrom` with

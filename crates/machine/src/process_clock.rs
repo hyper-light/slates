@@ -246,9 +246,8 @@ mod tests {
   /// waits while another thread spins ([`spinner_off_the_main_thread`]), let it settle a span, and read its clock a span
   /// apart. Expect its progress to rise and its time not to go back (Windows charges time a 15.6 ms tick at a time, and
   /// beside eight spinners on four CPUs a span can pass without one; its progress, the cycles, is exact). On Linux the
-  /// clock was `/proc/<pid>/schedstat`, which is the main thread's
-  /// alone (`task->se.sum_exec_runtime`), so a start whose main thread waited a window on its shards' recovery read as
-  /// making no progress.
+  /// clock was `/proc/<pid>/schedstat`, which is the main thread's alone (`task->se.sum_exec_runtime`), so a start
+  /// whose main thread waited a window on its shards' recovery read as making no progress.
   #[test]
   #[allow(clippy::disallowed_methods)] // the spans the child is watched across
   fn a_process_whose_work_runs_off_its_main_thread_shows_its_cpu_rise() {
