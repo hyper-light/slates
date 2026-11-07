@@ -724,9 +724,37 @@ fn a_live_volumes_acknowledged_writes_survive_its_owners_death() {
 // clients cut off mid-write. SIGSTOP is the unprivileged partition: a stopped process answers nothing, its sockets keep
 // their ports, and SIGCONT returns it with every timer late, as a healed partition or a long scheduling stall does.
 
-/// Sends `signal` to a fleet daemon's process.
+/// Sends `signal` to a fleet daemon's process; a stop is waited for until the kernel shows the process stopped
+/// ([`wait_stopped`]).
 fn signal(process: &FleetProcess, signal: rustix::process::Signal) {
   rustix::process::kill_process(rustix::process::Pid::from_child(&process.child), signal).unwrap();
+  if signal == rustix::process::Signal::STOP {
+    wait_stopped(process.child.id());
+  }
+}
+
+/// Waits, within the fleet wait, until `pid` is shown stopped (`ps`'s state `T`). `kill` returns as soon as a stop is
+/// sent, and the process runs on until it is delivered: under load a "stopped" candidate went on to acknowledge the
+/// entry written next, so a FUSE `fsync` made after both candidates were stopped answered success in 0.28–3 ms with a
+/// candidate truly holding it (3 of 40 loaded runs, CI x86_64, `diag-live-durability-26`), and the flow read it as a
+/// false claim of durability.
+fn wait_stopped(pid: u32) {
+  let deadline = Instant::now() + FLEET_WAIT;
+  loop {
+    let state = Command::new("ps")
+      .args(["-o", "stat=", "-p", &pid.to_string()])
+      .output()
+      .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+      .unwrap_or_default();
+    if state.starts_with('T') {
+      return;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "process {pid} shown stopped within the fleet wait: state {state:?}"
+    );
+    pause();
+  }
 }
 
 /// Creates a live-shipped volume on `owner`: its id.
