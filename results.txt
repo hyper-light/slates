@@ -1,0 +1,25 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 19:06:07 UTC 2026, head 55dc69f063643374fadfb7a5fcd4d045d7a35bec
+== run 1 at 19:06:07, load 1.50 1.84 0.92
+live fence: the old owner's live counters {"appended": 3, "awaited": 3, "durable": 3, "fenced": 1, "held_back.placement": 1, "holders_recorded": 1, "no_session": 2, "resolved": 3, "unanswered": 1, "whole": 1}, its log Some(("2", "2", "false"))
+live fence: taken over by live-fence-a-6421 after 2.03091536s; stale write outcome Some(Some(1)); successor read of /stale: 1 ""
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 4.43s
+
+== run 1 exit 0
+== run 2 at 19:06:12, load 1.38 1.81 0.91
+live fence: the old owner's live counters {"appended": 3, "awaited": 3, "durable": 3, "fenced": 1, "held_back.placement": 1, "holders_recorded": 1, "no_session": 2, "resolved": 3, "unanswered": 1, "whole": 1}, its log Some(("2", "2", "false"))
+live fence: taken over by live-fence-a-6850 after 2.097071049s; stale write outcome Some(Some(1)); successor read of /stale: 1 ""
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 4.48s
+
+== run 2 exit 0
+== run 3 at 19:06:16, load 1.27 1.78 0.91
+live fence: the old owner's live counters {"appended": 3, "awaited": 3, "durable": 3, "fenced": 1, "held_back.placement": 1, "holders_recorded": 1, "no_session": 2, "resolved": 3, "unanswered": 1, "whole": 1}, its log Some(("2", "2", "false"))
+live fence: taken over by live-fence-c-7304 after 1.736936735s; stale write outcome Some(Some(1)); successor read of /stale: 1 ""
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 3.17s
+
+== run 3 exit 0
