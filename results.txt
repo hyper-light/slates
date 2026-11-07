@@ -1,0 +1,35 @@
+runner windows-latest, 4 CPUs, Sat Nov  7 03:43:37 UTC 2026, commit fccf3609
+== fix quiet round 1 at 03:43:37
+a map whose client's shard was starved at its hand-off: direct true, answered after 1.5693069s (1.5680709s after the starve began; the fill caught under way at map 1)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 1.88s
+== fix quiet round 2 at 03:43:39
+a map whose client's shard was starved at its hand-off: direct true, answered after 1.5175442s (1.5163315s after the starve began; the fill caught under way at map 1)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 1.81s
+== fix quiet round 3 at 03:43:41
+a map whose client's shard was starved at its hand-off: direct true, answered after 1.5682527s (1.5671149s after the starve began; the fill caught under way at map 1)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 1.86s
+== fix busy (two spinners a CPU) round 1 at 03:43:45
+a map whose client's shard was starved at its hand-off: direct true, answered after 2.2721424s (1.6178796s after the starve began; the fill caught under way at map 1)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 12.75s
+== fix busy (two spinners a CPU) round 2 at 03:44:02
+a map whose client's shard was starved at its hand-off: direct true, answered after 1.990879s (1.8202442s after the starve began; the fill caught under way at map 1)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 11.64s
+== fix busy (two spinners a CPU) round 3 at 03:44:18
+a map whose client's shard was starved at its hand-off: direct true, answered after 1.9493723s (1.7153271s after the starve began; the fill caught under way at map 1)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 15.66s
+== cargo clippy --locked -p slates-client --test client -- -D warnings
+== exit 0
+== cargo test --locked -q -p slates-client --test client -- --test-threads=1
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.04s
+== exit 0
+== main's server sources (d61c3be2), the test unchanged: every starved case must fail
+== main quiet round 1 at 03:45:48
+a map whose client's shard was starved at its hand-off: direct false, answered after 1.5499944s (1.5484467s after the starve began; the fill caught under way at map 1)
+thread 'a_map_whose_clients_shard_is_starved_at_its_hand_off_is_direct_past_a_wall_window' (8256) panicked at crates\client\tests\client.rs:1762:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 32 filtered out; finished in 1.84s
+[1m[91merror[0m: test failed, to rerun pass `-p slates-client --test client`
+== main quiet round 2 at 03:46:29
+a map whose client's shard was starved at its hand-off: direct false, answered after 1.5269629s (1.5255646s after the starve began; the fill caught under way at map 1)
+thread 'a_map_whose_clients_shard_is_starved_at_its_hand_off_is_direct_past_a_wall_window' (8876) panicked at crates\client\tests\client.rs:1762:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 32 filtered out; finished in 1.85s
+[1m[91merror[0m: test failed, to rerun pass `-p slates-client --test client`
