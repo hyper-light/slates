@@ -81,6 +81,36 @@ fn start_anchor(instance: &str) -> Anchor {
   anchor
 }
 
+/// Ends process `pid` at once, as `kill -9` does: `SIGKILL` on Unix, `TerminateProcess` on Windows (where there is no
+/// `kill` to run; until 2026-11-07 this test was run on Unix only for that reason).
+#[cfg(unix)]
+fn kill_hard(pid: u32) {
+  let status = Command::new("kill")
+    .args(["-9", &pid.to_string()])
+    .status()
+    .unwrap();
+  assert!(status.success(), "kill the daemon");
+}
+
+/// See the Unix form.
+#[cfg(windows)]
+fn kill_hard(pid: u32) {
+  use windows_sys::Win32::Foundation::CloseHandle;
+  use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+  // SAFETY: the pid came from the daemon's own status; only the right to end it is asked, with no inheritance.
+  let process = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+  assert!(
+    !process.is_null(),
+    "OpenProcess({pid}): {}",
+    std::io::Error::last_os_error()
+  );
+  // SAFETY: the live handle just opened, used once and closed here.
+  let ended = unsafe { TerminateProcess(process, 1) };
+  // SAFETY: the same handle, closed once.
+  unsafe { CloseHandle(process) };
+  assert_ne!(ended, 0, "kill the daemon");
+}
+
 /// The daemon's pid, from `status --json`, or `None` while no daemon answers.
 fn daemon_pid(instance: &str) -> Option<u32> {
   let (code, out, _) = run(instance, &["status", "--json"]);
@@ -96,9 +126,9 @@ fn daemon_pid(instance: &str) -> Option<u32> {
     .ok()
 }
 
-/// A-114, T-2.16. Do: under `slates anchor`, six times `kill -9` the daemon and at once run `slates status --json`.
-/// Expect: every one exits 0, answered by a daemon other than the one killed, inside the claim wait (before A-114
-/// each waited the whole claim wait and exited 3).
+/// A-114, T-2.16. Do: under `slates anchor`, six times end the daemon at once (`kill -9`, `TerminateProcess`) and at
+/// once run `slates status --json`. Expect: every one exits 0, answered by a daemon other than the one killed, inside
+/// the claim wait (before A-114 each waited the whole claim wait and exited 3).
 #[test]
 fn a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon() {
   if std::env::var_os("SLATES_TEST_CLI").is_none() {
@@ -112,11 +142,7 @@ fn a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon() {
   let mut longest = Duration::ZERO;
   for round in 0..KILLS {
     let killed = daemon_pid(&instance).expect("a daemon answers");
-    let status = Command::new("kill")
-      .args(["-9", &killed.to_string()])
-      .status()
-      .unwrap();
-    assert!(status.success(), "kill the daemon");
+    kill_hard(killed);
     let started = Instant::now();
     let (code, out, err) = run(&instance, &["status", "--json"]);
     let took = started.elapsed();
