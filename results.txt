@@ -1,0 +1,142 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 20:03:20 UTC 2026, tree 691f8c494b0ce138b161ede92ca51f3df7b915bc
+== release build exit 0
+  chaos-rolling-a-6372 partitioned from 175.045585ms to 2.175139924s
+  chaos-rolling-b-6372 partitioned from 2.356262809s to 4.356411799s
+  4627 writes, 4627 acknowledged: p50 439 us, p99 4548 us, p999 67347 us, max 161393 us; 5 over 50ms (sent+took): 0.00s+142ms 2.17s+67ms 2.36s+148ms 4.28s+69ms 4.54s+161ms
+  chaos-rolling-c-6372 refused the owner: {}
+  chaos-rolling-a-6372 refused the owner: {}
+  chaos-rolling-b-6372 refused the owner: {}
+== partition 1 exit 0
+  chaos-rolling-a-6967 partitioned from 210.434657ms to 2.210600307s
+  chaos-rolling-b-6967 partitioned from 2.266457093s to 4.269049711s
+  4214 writes, 4214 acknowledged: p50 553 us, p99 5163 us, p999 43307 us, max 401601 us; 4 over 50ms (sent+took): 0.00s+164ms 2.06s+67ms 2.26s+402ms 4.53s+173ms
+  chaos-rolling-c-6967 refused the owner: {}
+  chaos-rolling-a-6967 refused the owner: {}
+  chaos-rolling-b-6967 refused the owner: {}
+== partition 2 exit 0
+  chaos-rolling-b-7552 partitioned from 198.485985ms to 2.198602198s
+  chaos-rolling-c-7552 partitioned from 2.440226631s to 4.44034474s
+  3872 writes, 3872 acknowledged: p50 556 us, p99 6135 us, p999 46910 us, max 212301 us; 3 over 50ms (sent+took): 0.00s+153ms 2.15s+212ms 4.23s+124ms
+  chaos-rolling-a-7552 refused the owner: {}
+  chaos-rolling-b-7552 refused the owner: {}
+  chaos-rolling-c-7552 refused the owner: {}
+== partition 3 exit 0
+  chaos-rolling-a-8229 partitioned from 253.369259ms to 2.256109587s
+  chaos-rolling-c-8229 partitioned from 2.415936883s to 4.416115454s
+  2455 writes, 2455 acknowledged: p50 557 us, p99 5347 us, p999 201369 us, max 1760923 us; 4 over 50ms (sent+took): 0.00s+201ms 2.20s+51ms 2.41s+206ms 2.90s+1761ms
+  chaos-rolling-b-8229 refused the owner: {}
+  chaos-rolling-a-8229 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 2264}
+  chaos-rolling-c-8229 refused the owner: {}
+== partition 4 exit 0
+  chaos-rolling-a-9130 partitioned from 197.867107ms to 2.197967717s
+  chaos-rolling-c-9130 partitioned from 2.2662665s to 4.266392688s
+  2816 writes, 2816 acknowledged: p50 531 us, p99 3823 us, p999 130042 us, max 2460841 us; 3 over 50ms (sent+took): 0.00s+130ms 0.20s+143ms 2.26s+2461ms
+  chaos-rolling-b-9130 refused the owner: {}
+  chaos-rolling-a-9130 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 2242}
+  chaos-rolling-c-9130 refused the owner: {}
+== partition 5 exit 0
+  chaos-rolling-a-10270 partitioned from 177.077102ms to 2.177218371s
+  chaos-rolling-b-10270 partitioned from 2.24206029s to 4.242151179s
+  4155 writes, 4155 acknowledged: p50 514 us, p99 6529 us, p999 86992 us, max 346349 us; 5 over 50ms (sent+took): 0.01s+124ms 0.18s+158ms 2.24s+346ms 4.15s+87ms 4.48s+170ms
+  chaos-rolling-c-10270 refused the owner: {}
+  chaos-rolling-a-10270 refused the owner: {}
+  chaos-rolling-b-10270 refused the owner: {}
+== partition 6 exit 0
+  chaos-rolling-b-10850 partitioned from 222.468345ms to 2.222624156s
+  chaos-rolling-c-10850 partitioned from 2.305641299s to 4.305772102s
+  3791 writes, 3791 acknowledged: p50 648 us, p99 5748 us, p999 78148 us, max 230770 us; 4 over 50ms (sent+took): 0.00s+174ms 0.22s+160ms 2.08s+78ms 2.31s+231ms
+  chaos-rolling-a-10850 refused the owner: {}
+  chaos-rolling-b-10850 refused the owner: {}
+  chaos-rolling-c-10850 refused the owner: {}
+== partition 7 exit 0
+  chaos-rolling-a-11415 partitioned from 281.92966ms to 2.282103828s
+  chaos-rolling-b-11415 partitioned from 2.371502348s to 4.371597655s
+  2992 writes, 2992 acknowledged: p50 873 us, p99 5261 us, p999 43961 us, max 249018 us; 2 over 50ms (sent+took): 0.00s+204ms 2.37s+249ms
+  chaos-rolling-c-11415 refused the owner: {}
+  chaos-rolling-a-11415 refused the owner: {}
+  chaos-rolling-b-11415 refused the owner: {}
+== partition 8 exit 0
+  chaos-rolling-a-11978 partitioned from 179.257213ms to 2.179354883s
+  chaos-rolling-c-11978 partitioned from 2.399417452s to 4.401513375s
+  4272 writes, 4272 acknowledged: p50 513 us, p99 4461 us, p999 63663 us, max 282604 us; 7 over 50ms (sent+took): 0.00s+136ms 2.16s+78ms 2.24s+64ms 2.40s+165ms 4.25s+54ms 4.31s+51ms 4.62s+283ms
+  chaos-rolling-b-11978 refused the owner: {}
+  chaos-rolling-a-11978 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 2308}
+  chaos-rolling-c-11978 refused the owner: {}
+== partition 9 exit 0
+  chaos-rolling-a-12692 partitioned from 202.389605ms to 2.203880864s
+  chaos-rolling-b-12692 partitioned from 2.43345029s to 4.433632168s
+  4636 writes, 4636 acknowledged: p50 518 us, p99 7203 us, p999 53191 us, max 152430 us; 6 over 50ms (sent+took): 0.00s+146ms 0.20s+152ms 2.24s+51ms 2.34s+90ms 3.43s+109ms 4.37s+53ms
+  chaos-rolling-c-12692 refused the owner: {}
+  chaos-rolling-a-12692 refused the owner: {}
+  chaos-rolling-b-12692 refused the owner: {}
+== partition 10 exit 0
+  chaos-rolling-a-13358 partitioned from 183.246953ms to 2.183349591s
+  chaos-rolling-c-13358 partitioned from 2.445754136s to 4.445867164s
+  3161 writes, 3161 acknowledged: p50 514 us, p99 4134 us, p999 93687 us, max 2392973 us; 5 over 50ms (sent+took): 0.00s+115ms 0.18s+146ms 2.22s+61ms 2.33s+94ms 2.45s+2393ms
+  chaos-rolling-b-13358 refused the owner: {}
+  chaos-rolling-a-13358 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 76}
+  chaos-rolling-c-13358 refused the owner: {}
+== partition 11 exit 0
+  chaos-rolling-b-14092 partitioned from 187.538737ms to 2.187662724s
+  chaos-rolling-c-14092 partitioned from 2.456533057s to 4.456628701s
+  6222 writes, 6222 acknowledged: p50 447 us, p99 10341 us, p999 54348 us, max 162980 us; 7 over 50ms (sent+took): 0.00s+154ms 2.16s+98ms 2.30s+117ms 2.46s+62ms 3.25s+59ms 4.10s+163ms 4.57s+54ms
+  chaos-rolling-a-14092 refused the owner: {}
+  chaos-rolling-b-14092 refused the owner: {}
+  chaos-rolling-c-14092 refused the owner: {}
+== partition 12 exit 0
+  chaos-rolling-a-14783 partitioned from 204.416813ms to 2.204512213s
+  chaos-rolling-b-14783 partitioned from 2.543287216s to 4.543405094s
+  3535 writes, 3535 acknowledged: p50 554 us, p99 7659 us, p999 57066 us, max 243386 us; 5 over 50ms (sent+took): 0.00s+153ms 2.16s+56ms 2.22s+243ms 3.54s+69ms 4.27s+57ms
+  chaos-rolling-c-14783 refused the owner: {}
+  chaos-rolling-a-14783 refused the owner: {}
+  chaos-rolling-b-14783 refused the owner: {}
+== partition 13 exit 0
+  chaos-rolling-a-15364 partitioned from 169.070564ms to 2.169162764s
+  chaos-rolling-b-15364 partitioned from 2.272807613s to 4.273063831s
+  4078 writes, 4078 acknowledged: p50 611 us, p99 4218 us, p999 48522 us, max 309218 us; 4 over 50ms (sent+took): 0.00s+140ms 0.17s+180ms 2.16s+62ms 2.27s+309ms
+  chaos-rolling-c-15364 refused the owner: {}
+  chaos-rolling-a-15364 refused the owner: {}
+  chaos-rolling-b-15364 refused the owner: {}
+== partition 14 exit 0
+  chaos-rolling-b-15948 partitioned from 208.415997ms to 2.208842295s
+  chaos-rolling-c-15948 partitioned from 2.367474811s to 4.367578958s
+  3870 writes, 3870 acknowledged: p50 524 us, p99 5658 us, p999 40530 us, max 153301 us; 2 over 50ms (sent+took): 0.00s+153ms 2.37s+107ms
+  chaos-rolling-a-15948 refused the owner: {}
+  chaos-rolling-b-15948 refused the owner: {}
+  chaos-rolling-c-15948 refused the owner: {}
+== partition 15 exit 0
+  chaos-rolling-a-16509 partitioned from 181.19858ms to 2.181290513s
+  chaos-rolling-b-16509 partitioned from 2.303195176s to 4.303303049s
+  5347 writes, 5347 acknowledged: p50 436 us, p99 6883 us, p999 52860 us, max 312879 us; 6 over 50ms (sent+took): 0.00s+131ms 0.18s+161ms 2.14s+58ms 2.30s+313ms 3.21s+53ms 4.29s+76ms
+  chaos-rolling-c-16509 refused the owner: {}
+  chaos-rolling-a-16509 refused the owner: {}
+  chaos-rolling-b-16509 refused the owner: {}
+== partition 16 exit 0
+  chaos-rolling-a-17097 partitioned from 305.975234ms to 2.306101357s
+  chaos-rolling-c-17097 partitioned from 2.417658897s to 4.41778994s
+  2689 writes, 2689 acknowledged: p50 1056 us, p99 6596 us, p999 84962 us, max 302722 us; 4 over 50ms (sent+took): 0.01s+202ms 2.20s+54ms 2.42s+303ms 4.62s+85ms
+  chaos-rolling-b-17097 refused the owner: {}
+  chaos-rolling-a-17097 refused the owner: {}
+  chaos-rolling-c-17097 refused the owner: {}
+== partition 17 exit 0
+  chaos-rolling-a-17758 partitioned from 178.15469ms to 2.178369097s
+  chaos-rolling-c-17758 partitioned from 2.304291234s to 4.304384016s
+  3806 writes, 3806 acknowledged: p50 520 us, p99 5909 us, p999 58876 us, max 259207 us; 4 over 50ms (sent+took): 0.00s+127ms 2.30s+259ms 4.43s+59ms 4.58s+90ms
+  chaos-rolling-b-17758 refused the owner: {}
+  chaos-rolling-a-17758 refused the owner: {}
+  chaos-rolling-c-17758 refused the owner: {}
+== partition 18 exit 0
+  chaos-rolling-a-18417 partitioned from 176.210912ms to 2.17632273s
+  chaos-rolling-c-18417 partitioned from 2.216263128s to 4.216387559s
+  3836 writes, 3836 acknowledged: p50 519 us, p99 16997 us, p999 105727 us, max 361765 us; 6 over 50ms (sent+took): 0.00s+122ms 0.18s+155ms 2.04s+53ms 2.22s+362ms 4.30s+77ms 4.47s+106ms
+  chaos-rolling-b-18417 refused the owner: {}
+  chaos-rolling-a-18417 refused the owner: {}
+  chaos-rolling-c-18417 refused the owner: {}
+== partition 19 exit 0
+  chaos-rolling-a-18973 partitioned from 171.768706ms to 2.171886489s
+  chaos-rolling-b-18973 partitioned from 2.275263129s to 4.275404054s
+  3091 writes, 3091 acknowledged: p50 797 us, p99 5632 us, p999 31122 us, max 299006 us; 2 over 50ms (sent+took): 0.00s+115ms 2.27s+299ms
+  chaos-rolling-c-18973 refused the owner: {}
+  chaos-rolling-a-18973 refused the owner: {}
+  chaos-rolling-b-18973 refused the owner: {}
+== partition 20 exit 0
