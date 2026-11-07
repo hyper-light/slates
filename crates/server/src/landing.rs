@@ -37,7 +37,7 @@ use slates_land::engine::{AuditKind, AuditRecord};
 #[cfg(unix)]
 use slates_land::engine::{
   Degradation, Durability, HostSlot, LandingRefusal, LandingReport, LandingRequest, LandingRun,
-  Observer, begin_landing, land, settle_grant,
+  Observer, begin_landing, settle_grant,
 };
 use slates_land::grant::{
   GrantBinding, GrantRecord as LandGrantRecord, GrantScope as LandScope,
@@ -522,8 +522,8 @@ fn land_verb_unix(
     grant,
   };
   match grant {
-    // A presentation writes nothing and takes no lease: it is answered now.
-    None => run_landing(state, prepared, None),
+    // A presentation writes nothing and takes no lease; it is planned in slices and answered when planned.
+    None => defer_presentation(state, prepared),
     // A granted landing runs as an owned task under its target's lease (AUD-29-03).
     Some(_) => defer_granted_landing(state, prepared),
   }
@@ -545,35 +545,43 @@ struct Prepared {
   grant: Option<u64>,
 }
 
-/// Runs the engine for `prepared` under `lease` (none for a presentation) and turns its outcome into the
-/// reply: the finished landing's records, the presentation, or the typed refusal. The landing's id and clock
-/// are read here, as it runs — for a granted landing after its wait for the lease, so a presentation another
-/// landing consumed meanwhile is not landed twice under one id.
+/// A presentation (§4.15 steps 1–3; AUD-29-07): the landing planned and its entries checked against the target without
+/// a write, answered `GrantRequired` with what a human grants. Planned in a task of the volume's owner shard a unit at a
+/// time (`slates_land::engine::Beginning` through `image::sliced`, §4.3 "Bounded work everywhere"), its reply deferred
+/// to it, as a pin's and a green's creation are; an unnamed landing plans an implicit snapshot of the head, so writes
+/// between its slices cannot tear its manifest, and the snapshot is dropped when it is answered. It was one call: 1,000
+/// files of 16 KiB held the shard for one poll of 6.77 s on a Mac, 6.20 s of it the plan, and every verb on the shard
+/// waited for it (`crates/server/tests/presentation_fairness.rs`).
 #[cfg(unix)]
-fn run_landing(
-  state: &mut ShardState,
-  prepared: Prepared,
-  lease: Option<&LandingLease>,
-) -> ReplyBody {
-  // The id names its owner partition (`verbs::landing_id`), so the `Grant` that later covers it routes
-  // to this shard, where the presented record waits. A granted landing lands under the id of the
-  // presentation its grant was issued from, so its finish consumes that presentation and a resume under the
-  // same grant keeps the id its hidden siblings carry (AUD-29-07; before 2026-09-29 every call took a fresh
-  // id, the presentation was never consumed, and a resume could not find its crashed attempt's siblings).
-  let presented = prepared.grant.and_then(|g| presentation_for(state, g));
-  let landing_id = presented
-    .unwrap_or_else(|| crate::verbs::landing_id(state.partition, state.landing.next_landing));
-  let slot = match state.volumes.get_mut(prepared.handle) {
-    Ok(s) => s,
-    Err(_) => return refused(Refusal::NotFound),
+fn defer_presentation(state: &mut ShardState, prepared: Prepared) -> ReplyBody {
+  let Some(request_id) = state.current_request else {
+    return refused(Refusal::Unsupported {
+      feature: "a presentation outside a recorded request".to_owned(),
+    });
+  };
+  // The id names its owner partition (`verbs::landing_id`), so the `Grant` that later covers it routes to this shard,
+  // where the presented record waits.
+  let landing_id = crate::verbs::landing_id(state.partition, state.landing.next_landing);
+  let Ok(slot) = state.volumes.get_mut(prepared.handle) else {
+    return refused(Refusal::NotFound);
+  };
+  let (source, implicit) = match prepared.source {
+    Source::Head => match slot.volume.snapshot(&mut state.store) {
+      Ok(id) => (Source::Snapshot(id), Some(id)),
+      Err(e) => {
+        state.count(LANDING_SNAPSHOT_REFUSED, 1);
+        return refused(refusal_of_vfs(&e));
+      }
+    },
+    named => (named, None),
   };
   let was_overlay = slot.volume.is_overlay();
-  // One host per volume: an overlay's base names its directories by the handles of the host its slot holds,
-  // so the writer is built inside that host — taken now, as the landing runs (a granted landing's wait for
-  // its lease left it serving), with the target walked again under the same containment — and given back
-  // after. A writer over its own host would read the base through handles that name other directories there.
-  let (mut os, land_target) = if was_overlay {
+  // One host per volume: an overlay's base names its directories by the handles of the host its slot holds, so the
+  // writer is built inside that host, with the target walked again under the same containment, and the host goes back
+  // to the slot between units.
+  let (os, land_target) = if was_overlay {
     let Some(host) = slot.host.take() else {
+      drop_implicit(slot, &mut state.store, implicit, &mut state.refusals);
       return refused(Refusal::BaseUnavailable {
         path: prepared.target.clone(),
         errno: 0,
@@ -583,19 +591,13 @@ fn run_landing(
       Ok(pair) => pair,
       Err((host, refusal)) => {
         slot.host = Some(host);
+        drop_implicit(slot, &mut state.store, implicit, &mut state.refusals);
         return refused(target_refusal(&refusal, &prepared.target));
       }
     }
   } else {
     (prepared.os, prepared.land_target)
   };
-  // Observe each entry to emit a `land.entry` span (§4.14), into a bounded buffer so a large landing
-  // does not grow it without bound (ban 8). It records only timings; the spans are built and drained
-  // into the shard's telemetry sink after the landing, once the borrows above are released.
-  let telemetry_capacity = usize::try_from(state.config.region.slots)
-    .unwrap_or(1)
-    .max(1);
-  let mut spans = SpanObserver::with_capacity(telemetry_capacity);
   let request = LandingRequest {
     landing_id,
     // The grant binds the caller by its exact principal (its key), never by the session number several
@@ -603,60 +605,183 @@ fn run_landing(
     consumer: prepared.principal.key().into_boxed_slice(),
     volume: prepared.volume.bytes,
     snapshot: prepared.snapshot.value,
-    source: prepared.source,
-    grant: prepared.grant.map(GrantId),
+    source,
+    grant: None,
     filter: prepared.filter.clone(),
-    // Read as the landing begins: its fences count its time from `begin_landing`'s start, so nothing between the read
-    // and the run (the target's opening) may lie outside that count.
+    // Read as the beginning starts: its clock counts from `Beginning::new`.
     now_ns: state.clock.monotonic_ns(),
     media_durability: false,
     large_class_bytes: state.config.large_class_bytes,
   };
-  let outcome = land(
-    &mut os,
-    &land_target,
-    &mut slot.volume,
-    &mut state.store,
-    &mut state.landing.grants,
-    lease,
-    &mut state.landing.audit,
-    &request,
-    &mut spans,
-  );
-  drain_land_spans(state, spans);
-  // The volume keeps the writer's host when it has a base: an overlay's own, given back; or — a scratch volume
-  // the landing made an overlay over its target (§4.15 step 9) — the host whose handle now names its base
-  // root. An overlay's walked target is closed first (its base root is its own handle), so a landing adds no
-  // handle to the host it returns to. Until 2026-09-30 a landed scratch volume was served hostless: a landed
-  // file, now a base entry, could not be read (found when the bridge began refusing hostless verbs on an
-  // overlay, AUD-29-16).
-  let mut rebased = false;
-  if let Ok(slot) = state.volumes.get_mut(prepared.handle)
-    && slot.volume.is_overlay()
-  {
-    rebased = !was_overlay;
-    let mut host = os.into_host();
-    if was_overlay {
-      host.close_dir(land_target.dir);
+  let beginning = match slates_land::engine::Beginning::new(&slot.volume, &land_target, &request) {
+    Ok(beginning) => beginning,
+    Err(refusal) => {
+      give_host_back(slot, HostSlot::Owned(os), was_overlay, land_target.dir);
+      drop_implicit(slot, &mut state.store, implicit, &mut state.refusals);
+      let ids = LandingIds {
+        landing_id,
+        fresh: true,
+        volume: prepared.volume,
+        snapshot: prepared.snapshot,
+        target: &prepared.target,
+        rebased: false,
+      };
+      let presenter = Presenter {
+        client: prepared.client,
+        principal: &prepared.principal,
+      };
+      return not_landed(state, presenter, &ids, refusal);
     }
+  };
+  let writer = if was_overlay {
+    let (host, away) = os.lend();
     slot.host = Some(host);
-  }
-  let ids = LandingIds {
+    Writer::Lent(away)
+  } else {
+    Writer::Own(os)
+  };
+  let job = PresentJob {
+    request_id,
+    handle: prepared.handle,
     landing_id,
-    fresh: presented.is_none(),
     volume: prepared.volume,
     snapshot: prepared.snapshot,
-    target: &prepared.target,
-    rebased,
-  };
-  let presenter = Presenter {
+    target: prepared.target,
+    principal: prepared.principal,
     client: prepared.client,
-    principal: &prepared.principal,
+    target_dir: land_target.dir,
+    implicit,
+    writer,
+    beginning,
   };
-  match outcome {
-    Ok(report) => finish(state, &prepared.principal, &ids, &report, prepared.grant),
-    Err(refusal) => not_landed(state, presenter, &ids, refusal),
+  crate::image::defer(state, run_presentation(job))
+}
+
+/// A presentation's writer between its units: its own (a scratch volume's), or, an overlay's, lent back to the
+/// volume's slot with what the writer keeps of its own.
+#[cfg(unix)]
+enum Writer {
+  Own(OsLand),
+  Lent(slates_land::os::Away),
+  /// Taken for a unit.
+  Out,
+}
+
+/// A presentation between its units ([`defer_presentation`]).
+#[cfg(unix)]
+struct PresentJob {
+  request_id: (u64, slates_wire::request::RequestId),
+  handle: slates_mem::Handle<crate::state::VolumeSlot>,
+  landing_id: u64,
+  volume: DbVolumeId,
+  snapshot: DbSnapshotId,
+  target: String,
+  principal: Principal,
+  client: u32,
+  target_dir: slates_vfs::host::HostDir,
+  implicit: Option<slates_vfs::ids::SnapshotId>,
+  writer: Writer,
+  beginning: slates_land::engine::Beginning,
+}
+
+#[cfg(unix)]
+impl PresentJob {
+  /// One unit of the beginning, the writer taken for it and given back after; its end once it has one: the plan, or
+  /// the landing refusal that ended it (a volume destroyed meanwhile, an overlay whose host is away, the volume's or
+  /// the target's own).
+  fn step(
+    &mut self,
+    state: &mut ShardState,
+  ) -> Option<Result<slates_land::engine::Planned, LandingRefusal>> {
+    let Ok(slot) = state.volumes.get_mut(self.handle) else {
+      return Some(Err(LandingRefusal::Volume(
+        slates_vfs::error::VfsError::StaleHandle,
+      )));
+    };
+    let mut os = match std::mem::replace(&mut self.writer, Writer::Out) {
+      Writer::Own(os) => os,
+      Writer::Lent(away) => match slot.host.take() {
+        Some(host) => OsLand::resume(host, away),
+        None => {
+          self.writer = Writer::Lent(away);
+          return Some(Err(LandingRefusal::HostAway));
+        }
+      },
+      Writer::Out => return Some(Err(LandingRefusal::HostAway)),
+    };
+    let stepped = self.beginning.unit(
+      &mut os,
+      &mut slot.volume,
+      &mut state.store,
+      &mut state.landing.grants,
+      &mut state.landing.audit,
+    );
+    self.writer = if slot.volume.is_overlay() {
+      let (host, away) = os.lend();
+      slot.host = Some(host);
+      Writer::Lent(away)
+    } else {
+      Writer::Own(os)
+    };
+    stepped.transpose()
   }
+
+  /// After the last unit, whatever its end: the overlay's walked target closed in the host its slot keeps (a scratch
+  /// volume's own writer closes with it), and the implicit snapshot dropped.
+  fn settle(&mut self, state: &mut ShardState) {
+    let Ok(slot) = state.volumes.get_mut(self.handle) else {
+      return;
+    };
+    if let (Writer::Lent(_), Some(host)) = (&self.writer, slot.host.as_mut()) {
+      host.close_dir(self.target_dir);
+    }
+    self.writer = Writer::Out;
+    drop_implicit(slot, &mut state.store, self.implicit, &mut state.refusals);
+  }
+}
+
+/// Plans the presentation a slice at a time, then records it with the request's completion as one atom and delivers
+/// the reply. With the shard's state unreachable (its shutdown) no completion is recorded, so the client's retry
+/// presents again on the shard that succeeds it.
+#[cfg(unix)]
+async fn run_presentation(mut job: PresentJob) {
+  let ended = loop {
+    match crate::image::with(|s| crate::image::sliced(s, |s| Ok(job.step(s)))) {
+      Ok(Some(ended)) => break Some(ended),
+      Ok(None) => slates_rt::futures::yield_now().await,
+      Err(_) => break None,
+    }
+  };
+  let request = job.request_id;
+  let _ = crate::state::with_state(|s| {
+    job.settle(s);
+    let (reply, route) = crate::image::complete(s, request, |s| {
+      let ids = LandingIds {
+        landing_id: job.landing_id,
+        fresh: true,
+        volume: job.volume,
+        snapshot: job.snapshot,
+        target: &job.target,
+        rebased: false,
+      };
+      let presenter = Presenter {
+        client: job.client,
+        principal: &job.principal,
+      };
+      match ended {
+        Some(Ok(slates_land::engine::Planned::Presented(plan))) => {
+          present(s, presenter, &ids, &plan)
+        }
+        // A presentation carries no grant, so the engine never finds one: a defect, refused typed.
+        Some(Ok(slates_land::engine::Planned::Granted(_))) => refused(Refusal::Unsupported {
+          feature: "a granted plan in a presentation".to_owned(),
+        }),
+        Some(Err(refusal)) => not_landed(s, presenter, &ids, refusal),
+        None => refused(Refusal::NotFound),
+      }
+    });
+    crate::image::deliver(s, reply, route);
+  });
 }
 
 /// The reply to a landing the engine did not land: its presentation when it needs a grant, else the typed
