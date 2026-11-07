@@ -1442,7 +1442,11 @@ fn settle_held(s: &mut ShardState, mount: &mut WinFspMount) -> Option<u64> {
 /// its log is durable on `f` candidates too (A-200; AC-8.3): held on the mount and sent by [`settle_held`], so a
 /// `FlushFileBuffers` never claims what no candidate holds. Past the mount's bound it is answered
 /// `STATUS_UNEXPECTED_IO_ERROR`, counted.
-fn answer(s: &mut ShardState, mount: &mut WinFspMount, mut served: slates_bridge_winfsp::host::Served) {
+fn answer(
+  s: &mut ShardState,
+  mount: &mut WinFspMount,
+  mut served: slates_bridge_winfsp::host::Served,
+) {
   if served.is_restored_read() {
     s.count(RESTORED_READS, 1);
   }

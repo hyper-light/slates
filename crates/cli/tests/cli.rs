@@ -11320,44 +11320,6 @@ fn a_command_whose_output_reader_went_away_fails_without_a_panic() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const OWN_MOUNT_ANSWER: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Shape: the cadence of [`run_within`]'s polls of its child.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-const RUN_POLL: std::time::Duration = std::time::Duration::from_millis(20);
-
-/// Runs a client verb as [`run`] does, but gives up after `limit`: `None` (the client killed and reaped) when it had not
-/// answered by then, for a verb that would wait on a daemon blocked on itself.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn run_within(
-  instance: &str,
-  args: &[&str],
-  limit: std::time::Duration,
-) -> Option<(i32, String, String)> {
-  let mut child = slates()
-    .arg("--instance")
-    .arg(instance)
-    .args(args)
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
-    .unwrap();
-  let started = std::time::Instant::now();
-  while child.try_wait().unwrap().is_none() {
-    if started.elapsed() > limit {
-      child.kill().unwrap();
-      child.wait().unwrap();
-      return None;
-    }
-    #[allow(clippy::disallowed_methods)]
-    std::thread::sleep(RUN_POLL);
-  }
-  let output = child.wait_with_output().unwrap();
-  Some((
-    output.status.code().unwrap_or(-1),
-    String::from_utf8_lossy(&output.stdout).into_owned(),
-    String::from_utf8_lossy(&output.stderr).into_owned(),
-  ))
-}
-
 /// Whether this host runs the own-mount tests (A-227): a real kernel mount the daemon serves, FUSE on Linux and the
 /// loopback NFS mount on macOS; skipped loudly otherwise.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
