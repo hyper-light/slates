@@ -4200,6 +4200,8 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
     resolver,
   } = dial;
   let mut peer_host = seed;
+  // Whether this link is idling because the peer is out of direct contact, so the idle is counted once on entering it.
+  let mut idling = false;
   // When the next discovery page is due, and the wait after it (see `next_discovery_wait`).
   let mut discovery_due: u64 = 0;
   let mut discovery_wait: u64 = HEARTBEAT_NS;
@@ -4216,8 +4218,7 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
     // incarnation is dead by definition — drop it, and from here keep the link under the id the peer now
     // writes as (dialed again once the council admits it, as any newly admitted member is).
     peer_host = refresh_record_identity(anchor, peer_host, &mut client, &mut discovery_cursor);
-    let retired = state::with_state(|s| !keeps_direct_contact_with(s, peer_host));
-    if retired == Some(true) {
+    if out_of_contact(peer_host, &mut idling) {
       // The peer is retired. Drop its record session and **idle** — this task does not end, so if the peer
       // rejoins (its probe reaches this node's serve side, which re-admits it — [`serve_peer_probes`]) this
       // loop sees it back in the neighbourhood and re-establishes. A believed-dead peer is never dialed
@@ -4256,6 +4257,23 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
     crate::daemon::pace(HEARTBEAT_NS).await;
   }
 }
+
+/// Whether `peer` is out of this node's direct contact, so its record link idles; entering the idle is counted
+/// ([`LINK_OUT_OF_CONTACT`]), so a pair with no record session tells by design from a link that failed.
+fn out_of_contact(peer: HostId, idling: &mut bool) -> bool {
+  let out = state::with_state(|s| !keeps_direct_contact_with(s, peer)) == Some(true);
+  if out && !*idling {
+    count_refusal(LINK_OUT_OF_CONTACT);
+  }
+  *idling = out;
+  out
+}
+
+/// Counter: a record link that went idle because its peer is out of this node's direct contact (`keeps_direct_contact_with`:
+/// neither holds for the other, and neither votes nor is staged), counted on entering the idle. Two such members form
+/// no record session and no probe session by design (raft-chaos's five-node flow took such a pair for a stall: the two
+/// non-voters held 3 of 4 peers probed for a whole fleet wait, CI diag-live-fixes-30).
+const LINK_OUT_OF_CONTACT: &str = "fleet.link.out_of_contact";
 
 /// Counter: a discovery page sent over a record link (a settled roster's pages back off to one per horizon a peer).
 /// Format: a counter name in the daemon's status report.
