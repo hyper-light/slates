@@ -2238,34 +2238,41 @@ fn admitted(
   let object = object.ok_or(REFUSED_MALFORMED)?;
   let regional = state.council.configuration();
   let placing = slates_cluster::content::ContentAccess::Place;
-  match crate::fleet::content_authority(
+  let authority = crate::fleet::content_authority(
     regional,
     &state.holder_records,
     local,
     peer,
     placing,
     object,
-  ) {
-    Ok(()) => {}
-    // The acting owner ships to a holder the volume's record names, though this node's own configuration has not
-    // placed it there (yet): its view lags the owner's, or the owner keeps a holder its configuration dropped, since a
-    // log never moves to a set of `f` or fewer (`Shipper::begin_transition`). Phase one counts the recorded holders, so
-    // a copy kept here counts; refused, every write waited for the other holder alone (live-durability's rolling
-    // partition flow: 2,086 refusals in one run while that holder was stopped, a write held 2.34 s).
-    Err("content.refused.not_a_candidate") if recorded_holder(state, local, object) => {}
-    Err(why) => return Err(not_owner_counter(why)),
-  }
-  hold_bound(state, object).ok_or(REFUSED_NO_CATALOG)
-}
-
-/// Whether the newest catalog record of `object` this node holds names it among the live log's holders (A-240's record).
-fn recorded_holder(state: &ShardState, local: HostId, object: ObjectId) -> bool {
+  );
   let catalog = object.catalog();
-  state
+  let recorded = state
     .holder_records
     .get(&catalog)
     .and_then(|acceptor| acceptor.highest(catalog))
-    .and_then(|(_, bytes)| crate::catalog::CatalogValue::from_record_bytes(bytes))
+    .is_some_and(|(_, bytes)| names_holder(bytes, local));
+  live_admission(authority, recorded).map_err(not_owner_counter)?;
+  hold_bound(state, object).ok_or(REFUSED_NO_CATALOG)
+}
+
+/// A live holder's admission of its acting owner's entry: the placement authority's answer, except that a node the
+/// volume's newest catalog record names among the log's holders (`recorded`) takes the entry though its own
+/// configuration has not placed it (`fleet::CONTENT_NOT_A_CANDIDATE`). Its view lags the owner's, or the owner keeps a
+/// holder its configuration dropped, since a log never moves to a set of `f` or fewer (`Shipper::begin_transition`);
+/// phase one counts the recorded holders, so the copy counts. Refused, every write waited for the other holder alone
+/// (live-durability's rolling partition flow: 2,086 refusals in one run while that holder was stopped, a write held
+/// 2.34 s). Every other refusal stands: the sender is not a member, or not the acting owner.
+fn live_admission(authority: Result<(), &'static str>, recorded: bool) -> Result<(), &'static str> {
+  match authority {
+    Err(crate::fleet::CONTENT_NOT_A_CANDIDATE) if recorded => Ok(()),
+    other => other,
+  }
+}
+
+/// Whether a catalog record's value names `local` among the live log's holders (A-240's record).
+fn names_holder(value: &[u8], local: HostId) -> bool {
+  crate::catalog::CatalogValue::from_record_bytes(value)
     .and_then(|value| value.live_holders)
     .is_some_and(|recorded| recorded.holders.contains(&local.0))
 }
@@ -2276,7 +2283,7 @@ fn not_owner_counter(why: &'static str) -> &'static str {
     "content.refused.not_a_member" => "fleet.live.hold_refused.not_a_member",
     "content.refused.no_acting_owner" => "fleet.live.hold_refused.no_acting_owner",
     "content.refused.not_the_acting_owner" => "fleet.live.hold_refused.not_the_acting_owner",
-    "content.refused.not_a_candidate" => "fleet.live.hold_refused.not_a_candidate",
+    crate::fleet::CONTENT_NOT_A_CANDIDATE => "fleet.live.hold_refused.not_a_candidate",
     _ => "fleet.live.hold_refused.not_owner",
   }
 }
@@ -3045,6 +3052,58 @@ mod tests {
       owes_refetch(None, refused_at),
       "nothing refused yet: fetched"
     );
+  }
+
+  /// A-200 with A-240's record: a live holder takes its acting owner's entry when the volume's record names it, though
+  /// its own configuration does not place it; any other refusal stands. Do judge every authority answer with the record
+  /// naming this node and without. Expect: placed, admitted either way; not a candidate, admitted only when named;
+  /// not a member, not the acting owner and no acting owner, refused either way.
+  #[test]
+  fn a_recorded_holder_takes_its_owners_entry_though_its_configuration_lags() {
+    for recorded in [false, true] {
+      assert_eq!(live_admission(Ok(()), recorded), Ok(()));
+      for refusal in [
+        "content.refused.not_a_member",
+        "content.refused.not_the_acting_owner",
+        "content.refused.no_acting_owner",
+      ] {
+        assert_eq!(live_admission(Err(refusal), recorded), Err(refusal));
+      }
+    }
+    assert_eq!(
+      live_admission(Err(crate::fleet::CONTENT_NOT_A_CANDIDATE), true),
+      Ok(()),
+      "named by the record: taken"
+    );
+    assert_eq!(
+      live_admission(Err(crate::fleet::CONTENT_NOT_A_CANDIDATE), false),
+      Err(crate::fleet::CONTENT_NOT_A_CANDIDATE),
+      "not named: refused"
+    );
+  }
+
+  /// A-240's record read for a holder: do encode catalog values naming holders and not, and one without a record.
+  /// Expect only the value naming this node to name it, and bytes of another register class to name nobody.
+  #[test]
+  fn a_catalog_record_names_its_live_holders() {
+    let local = HostId(7);
+    let value = |holders: Option<Vec<u64>>| {
+      crate::catalog::CatalogValue {
+        name: "v".to_owned(),
+        size: slates_db::catalog::SizeClass::Bounded { limit: 1 << 20 },
+        names: slates_db::catalog::NamePolicy::Exact,
+        owner: slates_db::catalog::Principal::Uid { uid: 501 },
+        require_locked: false,
+        access: Vec::new(),
+        live_shipped: true,
+        live_holders: holders.map(|holders| slates_db::catalog::LiveHolders { epoch: 1, holders }),
+      }
+      .to_record_bytes()
+    };
+    assert!(names_holder(&value(Some(vec![3, 7])), local));
+    assert!(!names_holder(&value(Some(vec![3, 9])), local));
+    assert!(!names_holder(&value(None), local));
+    assert!(!names_holder(&[0xff, 1, 2], local));
   }
 
   /// Format: the key generation the tests' keys carry.
