@@ -13617,6 +13617,16 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   hand-off test passes in each of 6 (no later child inherits the end, against an inheritable copy's contrast), and the
   client Shards suite 11 of 11 in each of 3, with the hostile holder test. All are red-checked. **Owed:** arm64 Windows
   runs `stream_spawn` but not the CLI test (its lane builds no `slates-cli`).
+- **Owed, owner winfsp-bench, after the Windows writer: a machine-sized daemon's timer wheel commits its whole bound on
+  Windows.** `slates_rt::timer::Wheel::new` reserves its slab at once, up to 1,746,925,056 bytes a partition on jupiter
+  (123.6 GB of RAM). Linux and macOS charge those pages only when touched; Windows charges commit when the block is made,
+  empty or not. So `cargo test -p slates-server --lib` aborts at 32 threads (4 of 4 runs, `memory allocation of 1746925056
+  bytes failed`), and at 4 threads 4 to 10 of 186 tests fail on `VirtualAlloc(MEM_COMMIT)` code 1455 (7 of 7 runs); at 1
+  thread none fail (2026-11-06). Those binaries run one test at a time on Windows CI meanwhile. The fix: reserve the
+  wheel's address space and commit it as the wheel fills, or bound the wheel by what a partition can arm; and size each
+  daemon of a many-daemon test from its share of the machine. Found while tracing it: on Windows such a refused map
+  answers `BudgetExceeded { available: 44252790784 }` for a 1 MiB volume, since `Store::admittable` counts the pool's free
+  extents and `ContentPool::hand_out` discards the OS's error. The first measurement is the client binary's, above.
 - **Landing on Windows built (A-185, 2026-10-26):** `slates-land` has a Windows write seam
   (`crates/land/src/os_windows.rs`), handle-relative over NTFS, and the server lands on Windows. Proven on jupiter: the
   land suite whole (the kill test on NTFS, the escape oracle with junction and hard-link swaps, the removal oracle with
