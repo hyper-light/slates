@@ -13710,6 +13710,30 @@ because sixteen daemons share the test process, and was the second partition.
   working; one asleep (state `S`) using no CPU may be stuck. The current check cannot tell these apart. A refusal costs
   the start: in production the anchor restarts the daemon, with crash-loop backoff if it repeats (A-119).
 
+### 2026-11-07: two nfs_hostile siblings under load — a MOUNT answered SYSTEM_ERR (already fixed) and a stop announced as a restart — fixed
+
+Seen running `crates/server/tests/nfs_hostile.rs` with its tests in parallel under two spinners a core (an 18-core
+Mac, binaries built on `d61c3be2`):
+- **A MOUNT answered `SYSTEM_ERR` (accept status 5).** Every one of 8 in 2 of 4 runs came from `serve_remote`
+  (`crates/server/src/nfs.rs`), for MOUNT `MNT`: the connection's shard routes the call to the volume's owner, and
+  `xshard::task_within` gave the owner one second of wall time. The owner was starved, not stopped. Main had already
+  fixed it in `6b9de4a1` (`xshard::within_shard_time`: a target is waited for while it makes CPU progress, A-65's
+  rule). `a_mount_routed_to_a_starved_owner_is_answered_and_to_a_wedged_one_refused` holds it for NFS: with the owner
+  in one poll on the CPU a fifth of the time for two windows, the MOUNT was refused after 1.00 s on `d61c3be2` 3 of 3
+  times (adacachy) and is accepted on main once the poll ends; a wedged owner, a poll asleep for three windows, is
+  still refused `SYSTEM_ERR` after one window. Under two spinners a core on adacachy: 10 of 10.
+- **"The control loop ended; the watchdog withholds the beat so the anchor restarts the daemon"** was a daemon's own
+  stop. `Daemon::stop_parts` shuts the runtime down, which ends the control loop, and stops the watchdog last; a beat
+  inside a slow shutdown took the loop's end for a crash. The line came 8 times in one run of the binary, each just
+  before a test passed (in 14 of 41 saved run logs). No daemon stopped serving. The watchdog is now told a stop is
+  under way first (`Watchdog::stopping`) and says nothing of a restart then; it still withholds the beat once the loop
+  ends. `a_stopped_daemon_does_not_say_its_control_loop_ended` (`crates/server/tests/liveness.rs`) stops a daemon
+  while a poll holds a shard for three beats, in a child process whose standard error it reads: 3 of 3 said it before
+  the fix, 10 of 10 under two spinners a core did not after (adacachy).
+- Found with them, not fixed here: when an honest client's thread panics,
+  `a_mount_survives_connections_broken_and_tampered_mid_call_under_load` never lowers its stop flags, so its breakers
+  and spinners run on and the scope never ends. One run hung for 36 minutes at load ~100 until stopped by hand.
+
 ### 2026-10-22: two pressure tests failed on a busy machine, not on the property — fixed
 
 `a_stale_handle_never_reads_a_reused_inode_under_churn` and

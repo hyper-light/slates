@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use slates_ipc::protocol::{NamePolicy, SizeClass};
+use slates_server::daemon::{LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS};
+use slates_server::state::ShardState;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
@@ -96,6 +98,62 @@ fn two_shard_daemon_with(name: &str, adjust: impl FnOnce(&mut DaemonConfig)) -> 
   .unwrap();
   daemon.bootstrap(true).unwrap();
   (daemon, instance)
+}
+
+/// Shape: the liveness window by which the daemon judges a shard (its anchor's budget).
+const WINDOW: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);
+/// Shape: a starved poll's CPU burst and its time off the CPU, a fifth of the time on it, as a thread kept off its core
+/// by spinners runs a little at a time (as `tests/liveness.rs`).
+const STARVED_BURST: Duration = Duration::from_millis(10);
+const STARVED_OFF: Duration = Duration::from_millis(40);
+
+/// Holds `daemon`'s shard at `partition` in one poll for `span`, on the CPU in bursts when `starved` (a fifth of the
+/// time, as a starved thread runs) and asleep throughout when not (as a wedged one is). Returns once the poll has
+/// begun, with the thread that waits for it to end.
+fn hold_shard(
+  daemon: &Daemon,
+  partition: usize,
+  span: Duration,
+  starved: bool,
+) -> std::thread::JoinHandle<()> {
+  let began: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+  let observation = daemon
+    .observation(
+      Some(*daemon.shards().get(partition).unwrap()),
+      OBSERVE_BUDGET_NS,
+      move |_: &mut ShardState| {
+        began.store(true, Ordering::Release);
+        let started = Instant::now();
+        while started.elapsed() < span {
+          let burst = Instant::now();
+          while starved && burst.elapsed() < STARVED_BURST {
+            std::hint::spin_loop();
+          }
+          let (_hold, rx) = std::sync::mpsc::channel::<()>();
+          let _ = rx.recv_timeout(if starved { STARVED_OFF } else { span });
+        }
+      },
+    )
+    .unwrap();
+  let waiter = std::thread::spawn(move || {
+    let _ = observation.wait();
+  });
+  let started = Instant::now();
+  while !began.load(Ordering::Acquire) {
+    assert!(started.elapsed() < SETTLE, "the hold began");
+    std::thread::yield_now();
+  }
+  waiter
+}
+
+/// MOUNT MNT `export` over a fresh connection: the RPC accept status and how long the answer took.
+fn timed_mount(port: u16, export: &str) -> (u32, Duration) {
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let mut args = Vec::new();
+  opaque(export.as_bytes(), &mut args);
+  let started = Instant::now();
+  let accepted = call_accept_status(&mut stream, MOUNT_PROGRAM, 1, &args, 1);
+  (accepted, started.elapsed())
 }
 
 /// A record-marked NFSv3 call with no credential, as the test helpers build it.
@@ -1652,5 +1710,37 @@ fn a_write_at_a_colossal_offset_is_refused_and_the_daemon_survives() {
   );
 
   drop(s);
+  drop(daemon);
+}
+
+/// §4.3, §4.14 (A-65, A-228). Do: on a two-shard daemon with a volume the second shard owns, hold that shard in one
+/// poll for two liveness windows, on the CPU a fifth of the time as a starved shard runs, and meanwhile MOUNT the volume
+/// over a connection the control shard serves, which routes the MNT to the owner; then hold it in a poll that sleeps two
+/// windows, as a wedged shard does, and MOUNT again. Expect: the first MOUNT accepted once the starved owner serves it,
+/// and the second answered `SYSTEM_ERR` before the wedged hold ends. A starved owner is alive by the rule the watchdog
+/// and observations judge a shard by, its own CPU time, and is waited for; a wedged one is not. Before `6b9de4a1` the
+/// control shard gave the owner one second of wall time, so a starved owner's MOUNT was answered `SYSTEM_ERR` (accept
+/// status 5): 8 honest MOUNTs in 2 of 4 runs of this binary under two spinners a core (an 18-core Mac, 2026-11-07), and
+/// this test's first MOUNT 3 of 3 times on `d61c3be2`, after 1.00 s (adacachy).
+#[test]
+fn a_mount_routed_to_a_starved_owner_is_answered_and_to_a_wedged_one_refused() {
+  let (daemon, instance) = two_shard_daemon("starved-owner");
+  let name = provision_remote_volume(&instance);
+  let export = daemon.mount_capability(&name).unwrap().unwrap();
+  let port = daemon.nfs_port().unwrap();
+  let starved = hold_shard(&daemon, 1, WINDOW * 2, true);
+  let (accepted, took) = timed_mount(port, &export);
+  starved.join().unwrap();
+  assert_eq!(
+    accepted, 0,
+    "a MOUNT routed to a starved owner was accepted (status {accepted} after {took:?}, against a {WINDOW:?} window)"
+  );
+  let wedged = hold_shard(&daemon, 1, WINDOW * 3, false);
+  let (accepted, took) = timed_mount(port, &export);
+  assert!(
+    accepted == 5 && took < WINDOW * 3,
+    "a MOUNT routed to a wedged owner was refused SYSTEM_ERR before the hold ended (status {accepted} after {took:?})"
+  );
+  wedged.join().unwrap();
   drop(daemon);
 }

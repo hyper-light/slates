@@ -2787,6 +2787,11 @@ impl Daemon {
     if let Some(mut doorbell) = self.doorbell.take() {
       doorbell.stop();
     }
+    // The shutdown ends the control loop before the watchdog stops: told first, it does not take that end for one the
+    // anchor should restart (A-228).
+    if let Some(watchdog) = self.watchdog.as_ref() {
+      watchdog.stopping();
+    }
     if let Some(runtime) = self.runtime.take()
       && let Err(error) = runtime.shutdown()
     {
