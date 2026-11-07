@@ -46,7 +46,7 @@ exist.
   retention and verification it always had), then the record is accepted. The holder counts `merge.inputs_carried`.
 - Unit tests: when a record carries its inputs, the shipment round trip, and hostile shipments (truncated, a count of
   `u32::MAX`, a frame length past the bytes, bytes left over).
-- §4.16 status, the amendment, GAPS.
+- §4.16 status, A-244, GAPS.
 
 ## Verification
 

@@ -57,7 +57,7 @@ did: the restarted owner shipped nothing, and its counters were empty. After, it
   - A re-enqueued record is placed from the configuration the owner holds when it ships (`PendingGreen::retarget`).
     A holder that already holds a version acknowledges it again at no cost (`accept_merge_record`'s already-applied
     branch).
-- The test above. §4.16 status, the amendment, GAPS.
+- The test above. §4.16 status, A-246, GAPS.
 
 ## Verification
 
