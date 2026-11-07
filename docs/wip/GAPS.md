@@ -1,5 +1,16 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Fixed (live-fixes, 2026-11-07): a node back at its anchor with fresh RAM had every pair key refused (A-92 piece 4b).**
+> A receiver kept one pair key per sender anchor and shard and refused any other, so a node replaced at its anchor (its
+> keys gone) was refused for good (789 of 793, raft-chaos's kill-at-ack, CI diag-raft-chaos-three-25): its sealed live
+> entries never covered its candidates and its writes waited for ever (`held_back.keys` 394). And an owner shard marked
+> a pair delivered by anchor, so it never delivered to the new incarnation, which could not open its heads as a
+> successor. Now the newer key replaces the recorded one, the old kept as retired while anything held is sealed under
+> it, and an owner shard delivers again to a new member id. Test:
+> `a_node_replaced_with_fresh_ram_at_its_anchor_exchanges_pair_keys_with_its_survivors` (red on each half alone).
+> Open: no process test yet takes over an old incarnation's volume after its replacement's key arrived (the retired
+> key's path). Bug record `docs/bugs/2026-11-07-a-node-back-at-its-anchor-with-fresh-ram-had-every-pair-key-refused.md`.
+
 > **Fixed (live-fixes, 2026-11-07): a live write counted durable on too few holders when the owner fell outside its own
 > volume's placement.** The shipper counted a position durable at the `f`-th highest holder, right for `2f` holders but
 > not for `2f + 1` (every other candidate a holder): at f = 1 a write on one of three was "durable", and a successor
@@ -13,7 +24,7 @@
 > through it alone). A let-go on the newer holder record (2ba5572d) was reverted (eab618f2): a holder dropped while it was
 > no catalog candidate receives that record only when the configuration names it again, by then a counted member of the
 > next transition. A safe release needs a holder-set generation the entries and replies carry. raft-chaos's five-node
-> flow asserts the release and stays red until then.
+> flow notes the copies dropped holders keep, and asserts their release once that lands.
 
 > **Fixed (live-fixes, 2026-11-07): a live shipper made before its candidates were known shipped to nobody** (A-200's
 > amendment of that date). A shipper kept the holders of its first publication, so a live volume made on a fleet's
@@ -1072,6 +1083,16 @@
     acknowledged, every volume taken over whole at epoch 2 (unshaped 2.5 s, wan and wan-loss 16.9 s, ceiling 57.2 s).
   - Process red-check, CI, 13 runs a side: the mutation (counting the current placement) left a holder at fence 1 in 4.
     A-240 left none, and lost no write.
+  - **The stack's evidence (CI, 2026-11-07, three-way tree with live-durability's lanes, diag-24).** KIND passed all
+    four profiles end to end, every volume taken over whole at epoch 2: unshaped 1,000 writes, p99 1.2 ms, 2.5 s;
+    wan 300, p99 423 ms, 17.7 s; wan-loss 300, p99 407 ms, 18.8 s; ceiling 50, p50 1.55 s, 52.6 s. The five-node flow
+    passed 7 of 8 with no fence or NoLoss violation, judged on the successor's recorded holders; in its decisive run
+    phase one waited 28 times for the stopped holder, then took the volume over whole. The eighth was the open register
+    stall (`fleet.takeover.lost`, live-fixes).
+  - Open (live-fixes): a node replaced at the same machine anchor (same certificate) never answers a live write. Its
+    neighbours keep the old node's pair key and refuse the new one (`fleet.seal.pair_refused` 789 of 793 served, the
+    owner `pair_undelivered` 1,580), so the whole entry never carries their keys (`held_back.keys` 394). Before the
+    answering gate such writes were answered and could not be served at a takeover (`takeover_refused.open`).
   - **Fixed (2026-11-07): a holder set of 2f+1 under an f-count.** Once the shipper follows the placement, a set can
     have 2f+1 members (the placement moved off the owner: CI diag-20 run 7 recorded e, c, b at f = 1). The shipper
     counted a write durable at f of a set while phase one counts f+1, and 1 + 2 = |H|: the successor counted itself and
