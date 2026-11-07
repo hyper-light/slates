@@ -11,3 +11,6 @@ loaded run 2 a_landing_longer_than_its_lease_term_renews_it_and_lands_everything
     landing of 3507 files: 1.963031359s under a 1000000000 ns term, 1 renewals: 3507 written, done
 loaded run 2 an_async_patient_landing_outlasting_the_reply_deadline_is_waited_for exit 124 900s late_beats=0 longest_poll_ms=0 load=11.01 11.00 10.10
     calibration: 500 files in 266.759152ms, twice that in 412.981305ms (292.444µs per file at the margin); 6839 files to last 2s
+loaded run 3 a_landing_longer_than_its_lease_term_renews_it_and_lands_everything exit 0 405s late_beats=0 longest_poll_ms=0 load=10.14 10.50 10.19
+    calibration: 500 files in 341.985726ms, twice that in 652.564015ms (621.156µs per file at the margin); 3220 files to last 2s
+    landing of 3220 files: 2.159680606s under a 1000000000 ns term, 2 renewals: 3220 written, done
