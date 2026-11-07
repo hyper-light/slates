@@ -1,0 +1,12 @@
+=== off 1 exit 101 load { 30.62 24.34 13.84 }
+rejoins: successor daemon 14586 answered after 46.870792ms
+slates-cluster: fleet: HostId(6470196106963798563) holds HostId(3320162837250422269) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+thread 'a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet' (31081) panicked at crates/cli/tests/live_chaos.rs:2455:7:
+the fleet re-formed after the successor: [Some(("3320162837250422269", 2, 1)), Some(("6470196106963798563", 3, 0)), Some(("2737771555087033969", 2, 1))]
+fleet_host: 3320162837250422269
+fleet_peers_probed: 1
+shard 0 refused fleet.link.invalid.believed_dead: 1
+fleet_host: 6470196106963798563
+fleet_peers_probed: 0
+fleet_host: 2737771555087033969
+fleet_peers_probed: 1
