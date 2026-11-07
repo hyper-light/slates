@@ -467,9 +467,11 @@ jobs:
       # arms and its `huge_page_bytes` probe that answers `None` off Linux. Cross-linted clean against
       # `x86_64-pc-windows-gnu` before being added here. **`slates-mcp` joined on 2026-10-26** with its HTTP edge on Windows
       # (A-183); its test runs here once landing does, since `slates.land.materialize` answers `Unsupported` on Windows
-      # until then.
+      # until then. **`slates-bridge-virtiofs` joined on 2026-11-07**: the daemon builds it, but only listed crates are
+      # linted, and its Unix-only DAX reply type and an `opcode` only Unix read failed `-D warnings` for Windows unseen
+      # (found by `cargo xwin clippy` from a Mac).
       - name: Clippy the Windows-buildable crates (native Windows)
-        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp --all-targets -- -D warnings
+        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-bridge-virtiofs -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp --all-targets -- -D warnings
       # The shipped Windows binary, linted without `--all-targets` and as a step of its own so its exit code
       # is checked on its own (the Windows shell is `pwsh`, where a native command failing mid-script does not
       # end the script — only the last line decides the step, which would mask this).
@@ -1132,7 +1134,7 @@ jobs:
           if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
           "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Clippy the Windows-buildable crates
-        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp --all-targets -- -D warnings
+        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-bridge-virtiofs -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp --all-targets -- -D warnings
       # The shipped Windows binary, linted without `--all-targets` and as a step of its own so its exit code
       # is checked on its own (the Windows shell is `pwsh`, where a native command failing mid-script does not
       # end the script — only the last line decides the step, which would mask this).

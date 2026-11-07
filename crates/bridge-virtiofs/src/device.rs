@@ -300,14 +300,14 @@ pub struct ToldSettled {
 
 /// What `serve_dax` did with a FUSE_SETUPMAPPING / FUSE_REMOVEMAPPING (§4.6): not a DAX verb (dispatch answers),
 /// a reply already in the out buffer, or — for a SETUPMAPPING — the window asked for, which the device holds the chain
-/// for while the window's backing is filled and its pieces mapped (`crate::backed`).
+/// for while the window's backing is filled and its pieces mapped (`crate::backed`). Unix only, as `serve_dax` is.
+#[cfg(unix)]
 enum DaxServed {
   /// Not a DAX verb, or no window offered: the FUSE codec's dispatch answers.
   NotHandled,
   /// This many reply bytes are in the out buffer; scatter and publish as usual.
   Replied(usize),
   /// A SETUPMAPPING was taken: its chain is held for the fill and the placer's map.
-  #[cfg(unix)]
   MapHeld {
     /// The request's `unique`, which its reply carries.
     unique: u64,
@@ -1317,9 +1317,7 @@ impl Device {
     // A request whose success reply cannot fit the room the guest posted is not dispatched (AUD-29-85): its
     // effect — a created file, an open handle, a reference, changed bytes — would happen and its reply, naming
     // what it granted, would be lost. It is answered `EIO` below, with no effect.
-    let room_short = header
-      .as_ref()
-      .and_then(|h| Opcode::from_wire(h.opcode))
+    let room_short = opcode
       .and_then(success_reply_bytes)
       .is_some_and(|need| reply_room < need);
     let mut written = if room_short {
