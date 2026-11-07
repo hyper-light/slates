@@ -54,3 +54,5 @@ mounts 0
 mounts 0
 === mirror 5 exit 0 load { 44.68 42.91 27.98 }
 mounts 0
+=== mirror 6 exit 0 load { 44.86 42.98 28.09 }
+mounts 0
