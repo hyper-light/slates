@@ -1,0 +1,7 @@
+344d2bcd red-mapping on windows-latest: exit 0
+> D:\a\slates\slates\own.log:174:test a_base_on_the_daemons_own_drive_is_refused_before_any_open ... slates anchor: instance wfownbase3832 up; daemon pid 6560; 1 shards
+  D:\a\slates\slates\own.log:175:slates anchor: issuer surface: export SLATES_ANCHOR=slates-seg-wfownbase3832 SLATES_ANCHOR_LEN=18605608960 SLATES_ANCHOR_CONTENT=slates-con-wfownbase3832 SLATES_ANCHOR_CONTENT_LEN=24330436608
+> D:\a\slates\slates\own.log:218:test a_landing_target_on_the_daemons_own_drive_is_refused_before_any_open ... slates anchor: instance wfownland3832 up; daemon pid 7692; 1 shards
+  D:\a\slates\slates\own.log:219:slates anchor: issuer surface: export SLATES_ANCHOR=slates-seg-wfownland3832 SLATES_ANCHOR_LEN=18605608960 SLATES_ANCHOR_CONTENT=slates-con-wfownland3832 SLATES_ANCHOR_CONTENT_LEN=24330436608
+> D:\a\slates\slates\own.log:263:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 1.37s
+  D:\a\slates\slates\own.log:264:
