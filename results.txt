@@ -9,3 +9,4 @@ run 2 exit 0 3s load=2.23 0.92 0.37
 run 3 exit 0 3s load=2.05 0.90 0.37
     green over 1000 files of 16384 bytes: 1.76103894s, reply GreenCreated { id: VolumeId { bytes: [195, 170, 5, 236, 117, 223, 190, 5, 0, 0, 0, 0, 0, 0, 15, 119] } }; 1456 probes inside it — p50 770.874µs, p99 3.994308ms, longest of all 9.805979ms; before it the longest 548.722µs
     test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.75s
+DONE
