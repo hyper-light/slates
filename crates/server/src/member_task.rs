@@ -174,6 +174,10 @@ pub(crate) struct PlaneState {
   /// session's exporter secret, which differs per connection): a member announcing on another session reconnected, its
   /// process perhaps restarted under the same id ([`note_reconnected`]). Bounded by the fleet's peer capacity.
   pub announced_from: BTreeMap<HostId, [u8; RECONNECT_FINGERPRINT_BYTES]>,
+  /// Members that reconnected, whose pair this node (their canonical dialer) announces again on the session it holds
+  /// ([`note_reconnected`]): answered, the pair is keyed afresh; unanswered, that session led to a process that is gone
+  /// and is dropped so the link dials anew. Bounded by the fleet's peer capacity, as `announced_from` is.
+  pub reannouncing: std::collections::BTreeSet<HostId>,
 }
 
 /// Format: the bytes of a session's exporter secret kept to tell one connection from the next: enough that two
@@ -297,12 +301,14 @@ fn note_returned(state: &mut ShardState, member: HostId) {
 }
 
 /// Notes that `member` (of `anchor`) announced itself on `secret`'s session. Announced before on another session, it
-/// reconnected, and where this node is the pair's canonical dialer (the lower anchor) the session this node dialed may
-/// lead to a process that is gone: it is dropped, so the link dials afresh and announces the pair's next epoch on a
-/// session the member's process holds. Kept, a member restarted under the same id within the moment it took the others
-/// to suspect it announced itself while still held alive, the canonical dialer went on announcing to nobody, the pair
-/// stayed unkeyed, and the member was then condemned with no way to refute it (5 of 6 anchored rejoins under load on
-/// macOS CI, diag run 42342444105, successor up in 50 to 90 ms; `fleet.plane.peer_reconnected`).
+/// reconnected: a redial of a live process, or a process restarted under the same id within the moment it took the
+/// others to suspect it (5 of 6 anchored rejoins under load on macOS CI, diag run 42342444105, successor up in 50 to
+/// 90 ms). Where this node is the pair's canonical dialer (the lower anchor) it announces the pair's next epoch again
+/// on the session it holds ([`announce_on`]): a live process answers and the pair is keyed afresh; a session to a
+/// process that is gone goes unanswered and only then is dropped, so the link dials the new one. Dropping the session
+/// at every reconnect (f31f6b21) tore down a live pair's keyed session each time its member's record link redialed
+/// under load: a five-node fleet's node held 3 of 4 peers probed for a whole fleet wait with
+/// `fleet.plane.peer_reconnected` 5 (raft-chaos, CI diag-raft-chaos-final-37).
 fn note_reconnected(
   state: &mut ShardState,
   anchor: HostId,
@@ -321,16 +327,18 @@ fn note_reconnected(
   let previous = state.plane.announced_from.insert(member, fingerprint);
   let reconnected = previous.is_some_and(|previous| previous != fingerprint);
   if reconnected && anchor > state.origin_anchor {
-    state.record_sessions.remove(&member);
     state.plane.announced_on.remove(&member);
-    crate::fleet::wake_link_waiter_of(state, member);
+    state.plane.reannouncing.insert(member);
     crate::fleet::count_refusal_in(state, PEER_RECONNECTED);
   }
 }
 
-/// Counter: a member that announced itself on a new session, whose session this node dialed as the pair's canonical
-/// dialer was dropped to be dialed afresh.
+/// Counter: a member that announced itself on a new session, whose pair this node (its canonical dialer) announces again.
 const PEER_RECONNECTED: &str = "fleet.plane.peer_reconnected";
+
+/// Counter: a reconnected member's session this node held went unanswered at its re-announcement and was dropped to be
+/// dialed afresh.
+const PEER_REDIALED: &str = "fleet.plane.peer_redialed";
 
 /// Counter: an announcement from a member this node held dead, whose contact is kept so it can refute the death.
 const MEMBER_RETURNED: &str = "fleet.plane.member_returned";
@@ -439,6 +447,15 @@ async fn announce_on(member: HostId, endpoint: &mut Endpoint, canonical: bool) {
     _ => {
       endpoint.abandon_begun_since(before);
       crate::fleet::count_refusal(EPOCH_UNANSWERED);
+      // A re-announcement after the member reconnected that goes unanswered: the session leads to a process that is
+      // gone, so it is dropped and the link dials the member's new one ([`note_reconnected`]).
+      let _ = state::with_state(|state| {
+        if state.plane.reannouncing.remove(&member) {
+          state.record_sessions.remove(&member);
+          crate::fleet::wake_link_waiter_of(state, member);
+          crate::fleet::count_refusal_in(state, PEER_REDIALED);
+        }
+      });
       return;
     }
   };
@@ -454,6 +471,7 @@ async fn announce_on(member: HostId, endpoint: &mut Endpoint, canonical: bool) {
       return;
     }
     state.plane.announced_on.insert(member, connection);
+    state.plane.reannouncing.remove(&member);
     if epoch == IDENTITY_ONLY {
       return;
     }
