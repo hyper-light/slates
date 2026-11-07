@@ -5522,12 +5522,12 @@ fn edit(
   // The journal operations this edit records, built before anything changes so its charge is exact, by the one
   // builder the work log's replay uses too (`crate::work_log`, A-207).
   let inserted = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-  let ops = crate::work_log::edit_ops(path, old, (at, delete_len, inserted));
+  let ops = crate::work_log::edit_ops(path, old.as_deref(), (at, delete_len, inserted));
   // The work is charged for what the edit adds before it changes anything (`crate::work_charge`): the file it now
   // holds (copied from the base when it had not changed it), less what the splice deletes, and the journal's ops.
-  let (spliced, removed) = w
-    .files
-    .splice_delta(path, old, (at, delete_len, bytes.len()));
+  let (spliced, removed) =
+    w.files
+      .splice_delta(path, old.as_deref(), (at, delete_len, bytes.len()));
   let added = crate::work_charge::journal_footprint(&ops).saturating_add(spliced);
   let entry = crate::work_log::WorkLogEntry::Edit {
     path: path.to_owned(),
@@ -5762,13 +5762,15 @@ fn assemble_post_state(
       continue;
     };
     let encoded_node;
+    let file_bytes;
     // The bytes this op contributes, and the offset into them: a file's slice, or an xattr's value.
     let (source, source_at): (&[u8], u64) = if is_file_content(op.kind) {
       // The submit read the base already (`build_increment` refuses a work whose green is gone).
       let Some(file) = files.get(base, path).ok().flatten() else {
         continue;
       };
-      (file, op.at)
+      file_bytes = file;
+      (&file_bytes, op.at)
     } else if op.kind == OpKind::Mknod {
       let Some(node) = journal.iter().rev().find_map(|entry| match entry {
         VolumeOp::Mknod {

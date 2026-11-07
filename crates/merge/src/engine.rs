@@ -37,6 +37,7 @@
 
 use crate::special::SpecialNode;
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops_doc::{Op, OpKind, OpsDoc};
@@ -214,7 +215,7 @@ pub enum Rebased {
 /// A per-path content history: for each path, the versions at which its bytes changed and the bytes
 /// then (`None` when removed), so any base version's content can be reconstructed for the identity
 /// check. The design's chain shares these copy-on-write; here they are full copies (owed).
-type ContentHistory = BTreeMap<String, Vec<(u64, Option<Vec<u8>>)>>;
+type ContentHistory = BTreeMap<String, Vec<(u64, Option<crate::history::Value>)>>;
 
 /// A per-path value history for a namespace dimension: the value at each version the path changed,
 /// `None` marking a removal (mode, symlink target, hard-link target). Reconstructs a base version.
@@ -309,9 +310,9 @@ const SPECIAL_NODE_BYTES: usize = size_of::<SpecialNode>();
 
 /// A green volume's merge state. Each dimension is a current value plus the version it last changed
 /// at (the base-comparison index), and a per-path/key *history* of `(version, value)` entries so any
-/// base version can be reconstructed for a lagging work (the design's chain shares these histories
-/// copy-on-write; here they are full copies, the measured optimization owed). The content dimension's
-/// history holds the bytes; the namespace dimensions' histories hold presence or the value.
+/// base version can be reconstructed for a lagging work. The content dimension's history is copy-on-write
+/// (`crate::history`, W2): each version of a file is pieces of shared immutable chunks, so a version costs the bytes it
+/// added, not the file; the namespace dimensions' histories hold presence or the value.
 #[derive(Debug, Default)]
 pub struct Green {
   /// The set hash of every entry at `identity_version` (`crate::identity`, A-202): brought to the head only when
@@ -324,6 +325,12 @@ pub struct Green {
   identity_dirty: BTreeSet<IdentityKey>,
   content: BTreeMap<String, Vec<u8>>,
   content_history: ContentHistory,
+  /// The chunks the content history's values share (`crate::history`).
+  chunks: crate::history::Chunks,
+  /// The bytes every content history value's piece list costs, a running total.
+  history_lists: usize,
+  /// The bytes of every path's latest content value (the current files, as the history holds them), a running total:
+  /// what [`Green::history_bytes`] leaves out, as the current values were always left out.
   specials: BTreeMap<String, SpecialNode>,
   special_history: ValueHistory<SpecialNode>,
   special_changed: BTreeMap<String, u64>,
@@ -368,10 +375,10 @@ pub struct Green {
   /// Rejected results evicted or never retained for want of budget — the non-vacuity counter the
   /// bound's regression asserts.
   rejected_evicted: u64,
-  /// The bytes the content and IPC histories retain beyond the current values — every earlier value of every
-  /// path still held for reconstruction (`content_at`, `base_at`) — kept as a running total so the
-  /// service can charge it as retention without walking the histories.
-  history_bytes: usize,
+  history_current: usize,
+  /// The bytes the IPC (special node) history retains beyond the current values, a running total: with the content
+  /// history's chunks and lists less its current values, [`Green::history_bytes`].
+  special_history_bytes: usize,
   /// The version below which the histories have been **folded** (`fold_history_before`): values
   /// recorded before it survive only as the one entry in effect at it, so a version below the floor
   /// is no longer reconstructible. The service keeps the floor at the oldest version any live reader
@@ -432,9 +439,9 @@ fn changed_at<K: Clone, V: Clone>(
 
 /// Folds one `(version, value)` history below `floor`: drops every entry recorded before `floor`
 /// except the last of them (the value in effect at `floor`), so lookups at or above the floor are
-/// unchanged. `cost` prices an entry's value; the sum over the dropped entries is returned (the
-/// bytes released). Entries are in version order, as the histories keep them.
-fn fold_entries<T>(history: &mut Vec<(u64, T)>, floor: u64, cost: impl Fn(&T) -> usize) -> usize {
+/// unchanged. The dropped entries are returned, for the caller to release what they held. Entries are in version
+/// order, as the histories keep them.
+fn fold_entries<T>(history: &mut Vec<(u64, T)>, floor: u64) -> Vec<(u64, T)> {
   let below = history
     .iter()
     .take_while(|(version, _)| *version < floor)
@@ -450,16 +457,10 @@ fn fold_entries<T>(history: &mut Vec<(u64, T)>, floor: u64, cost: impl Fn(&T) ->
     below.saturating_sub(1)
   };
   if drop == 0 {
-    return 0;
+    return Vec::new();
   }
   let drop = drop.min(history.len());
-  let dropped: usize = history
-    .iter()
-    .take(drop)
-    .map(|(_, value)| cost(value))
-    .sum();
-  history.drain(..drop);
-  dropped
+  history.drain(..drop).collect()
 }
 
 /// The value of a `(version, Option<value>)` history at `version`: the last entry recorded at or
@@ -575,6 +576,12 @@ fn apply(base: &[u8], ops: &[Op], post_state: &[u8]) -> Vec<u8> {
     );
   }
   out
+}
+
+/// [`apply`], for the history's oracle (`crate::history`'s tests).
+#[cfg(test)]
+pub(crate) fn apply_for_tests(base: &[u8], ops: &[Op], post_state: &[u8]) -> Vec<u8> {
+  apply(base, ops, post_state)
 }
 
 /// Appends `len` bytes at `src` of `from` to `out`, clamped to `from`'s bounds.
@@ -711,7 +718,8 @@ impl Green {
       green.identity.add(&file_entry(&path, &bytes));
       green.content.insert(path.clone(), bytes.clone());
       green.last_changed.insert(path.clone(), 0);
-      green.content_history.insert(path, vec![(0, Some(bytes))]);
+      let value = crate::history::Value::whole(&mut green.chunks, &bytes);
+      green.push_content(path, 0, Some(value));
     }
     for path in canonical.dirs {
       if green.dirs.insert(path.clone()) {
@@ -767,7 +775,7 @@ impl Green {
         .filter(|(_, version)| **version <= at)
         .map(|(id, version)| (*id, *version))
         .collect(),
-      files: changed_at(&self.content_history, at),
+      files: self.changed_content_at(at),
       dirs: self
         .dir_history
         .iter()
@@ -825,7 +833,7 @@ impl Green {
     green.deltas_from = checkpoint.version;
     green.folded_below = checkpoint.version;
     green.identity_version = checkpoint.version;
-    green.history_bytes = green.history_bytes_recounted();
+    green.special_history_bytes = green.special_history_recounted();
     green
   }
 
@@ -838,10 +846,12 @@ impl Green {
       self.content.insert(changed.key.clone(), bytes.clone());
     }
     self.last_changed.insert(changed.key.clone(), changed.at);
-    self.content_history.insert(
-      changed.key.clone(),
-      vec![(changed.at, changed.value.clone())],
-    );
+    self.clear_content_history(&changed.key);
+    let value = changed
+      .value
+      .as_ref()
+      .map(|bytes| crate::history::Value::whole(&mut self.chunks, bytes));
+    self.push_content(changed.key.clone(), changed.at, value);
   }
 
   fn restore_dir(&mut self, changed: &crate::checkpoint::Changed<String, ()>) {
@@ -989,7 +999,7 @@ impl Green {
       IdentityKey::File(path) => (
         self
           .content_ref_at(path, since)
-          .map(|bytes| file_entry(path, bytes)),
+          .map(|bytes| file_entry(path, &bytes)),
         self.content.get(path).map(|bytes| file_entry(path, bytes)),
       ),
       IdentityKey::Special(path) => (
@@ -1254,8 +1264,8 @@ impl Green {
       .keys()
       .filter_map(|path| {
         self
-          .content_at(path, version)
-          .map(|bytes| (path.clone(), bytes.len() as u64))
+          .content_len_at(path, version)
+          .map(|len| (path.clone(), len as u64))
       })
       .collect();
     let dirs = self
@@ -1380,8 +1390,8 @@ impl Green {
   /// Every dimension's entry at `path` at the earlier `version` but hard links, from the histories, added to `base`
   /// ([`Green::base_for`]).
   fn entries_at(&self, path: &str, version: u64, base: &mut crate::increment::Base) {
-    if let Some(bytes) = self.content_ref_at(path, version) {
-      base.files.push((path.to_owned(), bytes.len() as u64));
+    if let Some(len) = self.content_len_at(path, version) {
+      base.files.push((path.to_owned(), len as u64));
     }
     if let Some(node) = self
       .special_history
@@ -1422,24 +1432,22 @@ impl Green {
     }
   }
 
-  /// A file's bytes at `version`, reconstructed from its history — the latest recorded value at or
-  /// before `version`, or `None` when the file was absent then. What a version-pinned attachment
-  /// reads (§4.16 "Attachments and versions": a reader's view moves only by `advance`).
+  /// A file's bytes at `version`, reconstructed from its history — the value in effect at `version`, or `None` when
+  /// the file was absent then. What a version-pinned attachment reads (§4.16 "Attachments and versions": a reader's
+  /// view moves only by `advance`).
   pub fn content_at(&self, path: &str, version: u64) -> Option<Vec<u8>> {
-    self.content_history.get(path).and_then(|history| {
-      history
-        .iter()
-        .rev()
-        .find(|(recorded, _)| *recorded <= version)
-        .and_then(|(_, bytes)| bytes.clone())
-    })
+    self.content_ref_at(path, version).map(Cow::into_owned)
   }
 
-  /// Every file at `version` with its bytes, borrowed, in path order: the head's files, or each path's history
-  /// at an earlier version. What a work based at `version` lists (its untouched files are the green's there).
-  pub fn files_at(&self, version: u64) -> Vec<(&str, &[u8])> {
+  /// Every file at `version` with its bytes in path order: the head's files, or each path's value at an earlier
+  /// version. What a work based at `version` lists (its untouched files are the green's there). Borrowed where a
+  /// file is unchanged since `version`, copied out of the history where it changed after ([`Green::content_ref_at`]).
+  pub fn files_at(&self, version: u64) -> Vec<(&str, Cow<'_, [u8]>)> {
     if version >= self.head() {
-      return self.files().collect();
+      return self
+        .files()
+        .map(|(path, bytes)| (path, Cow::Borrowed(bytes)))
+        .collect();
     }
     self
       .content_history
@@ -1452,15 +1460,174 @@ impl Green {
       .collect()
   }
 
-  /// A file's bytes at `version`, borrowed ([`Green::content_at`] without the copy): what a paged read slices.
-  pub fn content_ref_at(&self, path: &str, version: u64) -> Option<&[u8]> {
-    self.content_history.get(path).and_then(|history| {
-      history
-        .iter()
-        .rev()
-        .find(|(recorded, _)| *recorded <= version)
-        .and_then(|(_, bytes)| bytes.as_deref())
-    })
+  /// A file's bytes at `version` ([`Green::content_at`] without the copy where it can): borrowed from the head when
+  /// the file is unchanged since `version` (its value then is the current one), copied out of the history's chunks
+  /// when it changed after (W2: the history holds what each version changed, not a whole copy of the file to lend).
+  pub fn content_ref_at(&self, path: &str, version: u64) -> Option<Cow<'_, [u8]>> {
+    let history = self.content_history.get(path)?;
+    let index = history
+      .iter()
+      .rposition(|(recorded, _)| *recorded <= version)?;
+    let value = history.get(index)?.1.as_ref()?;
+    if index.saturating_add(1) == history.len() {
+      return self
+        .content
+        .get(path)
+        .map(|bytes| Cow::Borrowed(bytes.as_slice()));
+    }
+    Some(Cow::Owned(value.materialize(&self.chunks)))
+  }
+
+  /// A page of a file at `version`: its bytes in `[offset, offset + want)` (clamped to its length) and its length, or
+  /// `None` when it was absent then. Sliced from the head when the file is unchanged since `version`, and copied out of
+  /// only the history's pieces that hold the page when it changed after: a paged read never copies the whole file.
+  pub fn content_page_at(
+    &self,
+    path: &str,
+    version: u64,
+    (offset, want): (u64, u64),
+  ) -> Option<(Vec<u8>, u64)> {
+    let history = self.content_history.get(path)?;
+    let index = history
+      .iter()
+      .rposition(|(recorded, _)| *recorded <= version)?;
+    let value = history.get(index)?.1.as_ref()?;
+    let total = value.len();
+    let start = usize::try_from(offset).unwrap_or(usize::MAX).min(total);
+    let end = usize::try_from(offset.saturating_add(want))
+      .unwrap_or(usize::MAX)
+      .min(total);
+    let page = if index.saturating_add(1) == history.len() {
+      self
+        .content
+        .get(path)
+        .and_then(|bytes| bytes.get(start..end))
+        .unwrap_or_default()
+        .to_vec()
+    } else {
+      value.read(&self.chunks, start, end)
+    };
+    Some((page, u64::try_from(total).unwrap_or(u64::MAX)))
+  }
+
+  /// Every file at `version` with its length, in path order: [`Green::files_at`] without the bytes.
+  pub fn file_lens_at(&self, version: u64) -> Vec<(&str, usize)> {
+    if version >= self.head() {
+      return self
+        .files()
+        .map(|(path, bytes)| (path, bytes.len()))
+        .collect();
+    }
+    self
+      .content_history
+      .keys()
+      .filter_map(|path| {
+        self
+          .content_len_at(path, version)
+          .map(|len| (path.as_str(), len))
+      })
+      .collect()
+  }
+
+  /// A file's length at `version`, or `None` when it was absent then: read off the history, never copied.
+  pub fn content_len_at(&self, path: &str, version: u64) -> Option<usize> {
+    self
+      .content_history
+      .get(path)?
+      .iter()
+      .rev()
+      .find(|(recorded, _)| *recorded <= version)
+      .and_then(|(_, value)| value.as_ref().map(crate::history::Value::len))
+  }
+
+  /// Every file whose value in effect at `at` was set after the origin, with that version and its bytes: the
+  /// checkpoint's files ([`Green::checkpoint`]).
+  fn changed_content_at(&self, at: u64) -> Vec<crate::checkpoint::Changed<String, Vec<u8>>> {
+    self
+      .content_history
+      .iter()
+      .filter_map(|(path, entries)| {
+        let (version, value) = entries.iter().rev().find(|(v, _)| *v <= at)?;
+        (*version > 0).then(|| crate::checkpoint::Changed {
+          key: path.clone(),
+          at: *version,
+          value: value.as_ref().map(|value| value.materialize(&self.chunks)),
+        })
+      })
+      .collect()
+  }
+
+  /// Records `value` as `path`'s content at `version`, the running totals with it: the new latest value replaces the
+  /// previous one among the current values, and its list joins the history's.
+  fn push_content(&mut self, path: String, version: u64, value: Option<crate::history::Value>) {
+    let previous = self
+      .content_history
+      .get(&path)
+      .and_then(|history| history.last())
+      .and_then(|(_, value)| value.as_ref())
+      .map_or(0, crate::history::Value::len);
+    self.history_current = self.history_current.saturating_sub(previous);
+    if let Some(value) = &value {
+      self.history_lists = self.history_lists.saturating_add(value.list_bytes());
+      self.history_current = self.history_current.saturating_add(value.len());
+    }
+    self
+      .content_history
+      .entry(path)
+      .or_default()
+      .push((version, value));
+  }
+
+  /// The value `bytes` that `ops` make of `path`'s latest content (`crate::history::Value::spliced`), or `bytes`
+  /// whole for a path with none.
+  fn content_value(&mut self, path: &str, ops: &[Op], bytes: &[u8]) -> crate::history::Value {
+    let Green {
+      content_history,
+      chunks,
+      ..
+    } = self;
+    match content_history
+      .get(path)
+      .and_then(|history| history.last())
+      .and_then(|(_, value)| value.as_ref())
+    {
+      Some(latest) => latest.spliced(chunks, ops, bytes),
+      None => crate::history::Value::whole(chunks, bytes),
+    }
+  }
+
+  /// Drops `path`'s content history, its chunks released and the running totals with it.
+  fn clear_content_history(&mut self, path: &str) {
+    let Some(history) = self.content_history.remove(path) else {
+      return;
+    };
+    if let Some((_, Some(latest))) = history.last() {
+      self.history_current = self.history_current.saturating_sub(latest.len());
+    }
+    for (_, value) in history {
+      self.release_content(value);
+    }
+  }
+
+  /// Releases one content history value: its list leaves the running total and its chunks their references.
+  fn release_content(&mut self, value: Option<crate::history::Value>) {
+    if let Some(value) = value {
+      self.history_lists = self.history_lists.saturating_sub(value.list_bytes());
+      value.release(&mut self.chunks);
+    }
+  }
+
+  /// The bytes the content and IPC histories retain beyond the current values — every earlier value still held for
+  /// reconstruction (`content_at`, `base_at`) — read off running totals so the service charges retention without
+  /// walking the histories: the content history's chunks and piece lists, less the current values they also hold,
+  /// and the IPC history's earlier nodes.
+  fn history_bytes(&self) -> usize {
+    self
+      .chunks
+      .bytes()
+      .saturating_add(self.history_lists)
+      .saturating_sub(self.history_current)
+      .saturating_add(self.special_history_bytes)
   }
 
   /// The ops each intervening delta in `(base, head]` applied to `path`.
@@ -2029,8 +2196,8 @@ impl Green {
           0
         } else {
           self
-            .content_ref_at(edited, inc.base)
-            .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+            .content_len_at(edited, inc.base)
+            .map_or(0, |len| u64::try_from(len).unwrap_or(u64::MAX))
         };
         !fits_base(ops, base_len, post_len)
       })
@@ -2157,7 +2324,9 @@ impl Green {
   /// Keep the superseded IPC value for pinned readers before setting the new value.
   fn commit_special(&mut self, path: String, node: SpecialNode, version: u64) {
     if self.specials.insert(path.clone(), node).is_some() {
-      self.history_bytes = self.history_bytes.saturating_add(SPECIAL_NODE_BYTES);
+      self.special_history_bytes = self
+        .special_history_bytes
+        .saturating_add(SPECIAL_NODE_BYTES);
     }
     self.special_changed.insert(path.clone(), version);
     self
@@ -2171,7 +2340,9 @@ impl Green {
   fn remove_special(&mut self, path: String, version: u64) {
     // The inode's own key is marked by its effect; its mode and attributes go with it and are marked here.
     if self.specials.remove(&path).is_some() {
-      self.history_bytes = self.history_bytes.saturating_add(SPECIAL_NODE_BYTES);
+      self.special_history_bytes = self
+        .special_history_bytes
+        .saturating_add(SPECIAL_NODE_BYTES);
     }
     self.special_changed.insert(path.clone(), version);
     if self.modes.remove(&path).is_some() {
@@ -2307,29 +2478,20 @@ impl Green {
       }
     }
     for path in removed_content {
-      // A removed file's last value stays in the history for reconstruction: retained, and charged.
-      if let Some(previous) = self.content.remove(&path) {
-        self.history_bytes = self.history_bytes.saturating_add(previous.len());
-      }
+      // A removed file's last value stays in the history for reconstruction: no longer a current value, so retained
+      // and charged (`history_bytes`).
+      self.content.remove(&path);
       self.last_changed.insert(path.clone(), version);
-      self
-        .content_history
-        .entry(path)
-        .or_default()
-        .push((version, None));
+      self.push_content(path, version, None);
     }
     for (path, bytes, ops) in set_content {
-      // The value this one supersedes becomes retained history: charged to the running total the
-      // service accounts for as retention (the current value is charged as content).
-      if let Some(previous) = self.content.insert(path.clone(), bytes.clone()) {
-        self.history_bytes = self.history_bytes.saturating_add(previous.len());
-      }
+      // The value this one supersedes stays in the history, sharing every run the new one kept (W2): what the
+      // history gains is the bytes the new value added, its piece list, and whatever the old one held that the new
+      // one does not, the retention charged to the running totals.
+      let value = self.content_value(&path, &ops, &bytes);
+      self.content.insert(path.clone(), bytes);
       self.last_changed.insert(path.clone(), version);
-      self
-        .content_history
-        .entry(path.clone())
-        .or_default()
-        .push((version, Some(bytes)));
+      self.push_content(path.clone(), version, Some(value));
       delta.insert(path, ops);
     }
     self.deltas.push(delta);
@@ -2436,35 +2598,61 @@ impl Green {
     )
   }
 
-  /// The maximum old values this increment can retain. Admission charges the superseded values,
-  /// not the incoming payload: an unlink has no payload, and a one-byte overwrite can retain an
-  /// entire old file. Each path is counted once; rename sources and destinations both count.
+  /// The most this increment can add to the retained history ([`Green::retention_charge`]), charged before the
+  /// verdict (A-16): what the history would gain if every op were applied. Per path (W2: the history shares what a
+  /// version kept, `crate::history`):
+  /// - a content edit gains the bytes it adds, the bytes it deletes or truncates away (they leave the current value
+  ///   but stay in the history), and its piece list; or, when the list would outweigh the value and it is stored
+  ///   whole, the old value;
+  /// - a path replaced whole (created over, renamed onto, removed, or renamed away) keeps its old value, and one
+  ///   given new content (created or renamed onto) a piece for it;
+  /// - an IPC node replaced or removed keeps the node.
+  ///
+  /// A post-state shorter than its ops declare is stored whole after the verdict (`crate::history::Value::spliced`);
+  /// the settle after it charges what that costs.
   pub fn history_reservation(&self, inc: &Increment) -> usize {
     if self.accepted.contains_key(&inc.id) {
       return 0;
     }
-    let mut paths = BTreeSet::new();
+    let mut edits: BTreeMap<&str, Vec<&Op>> = BTreeMap::new();
+    let mut replaced: BTreeSet<&str> = BTreeSet::new();
+    let mut filled: BTreeSet<&str> = BTreeSet::new();
     for op in &inc.doc.ops {
-      if (is_content(op.kind)
-        || matches!(
-          op.kind,
-          OpKind::Create | OpKind::Unlink | OpKind::Rename | OpKind::Mknod
-        ))
-        && let Some(path) = inc.doc.paths.path(op.path)
-      {
-        paths.insert(path);
+      let Some(path) = inc.doc.paths.path(op.path) else {
+        continue;
+      };
+      if is_content(op.kind) {
+        edits.entry(path).or_default().push(op);
+      } else if matches!(
+        op.kind,
+        OpKind::Create | OpKind::Unlink | OpKind::Rename | OpKind::Mknod
+      ) {
+        replaced.insert(path);
+        if matches!(op.kind, OpKind::Create | OpKind::Rename) {
+          filled.insert(path);
+        }
       }
       if op.kind == OpKind::Rename
-        && let Some(path) = u16::try_from(op.src)
+        && let Some(source) = u16::try_from(op.src)
           .ok()
           .and_then(|index| inc.doc.paths.path(index))
       {
-        paths.insert(path);
+        replaced.insert(source);
       }
     }
-    paths.into_iter().fold(0usize, |total, path| {
+    let content: usize = edits
+      .iter()
+      .filter(|(path, _)| !replaced.contains(*path))
+      .map(|(path, ops)| self.edit_reservation(path, ops))
+      .sum();
+    replaced.into_iter().fold(content, |total, path| {
       total
         .saturating_add(self.content.get(path).map_or(0, Vec::len))
+        .saturating_add(if filled.contains(path) {
+          crate::history::PIECE_BYTES
+        } else {
+          0
+        })
         .saturating_add(if self.specials.contains_key(path) {
           SPECIAL_NODE_BYTES
         } else {
@@ -2473,11 +2661,59 @@ impl Green {
     })
   }
 
+  /// [`Green::history_reservation`] for one path's content ops. The history gains the new value's chunk and list,
+  /// less what the current value grew by: overwritten bytes, deleted and truncated bytes, and the list, inserts and
+  /// extensions costing their pieces alone (their bytes are current). Stored whole, it gains the old value and a piece.
+  fn edit_reservation(&self, path: &str, ops: &[&Op]) -> usize {
+    let old = self.content.get(path).map_or(0, Vec::len);
+    let old_len = u64::try_from(old).unwrap_or(u64::MAX);
+    let (overwritten, removed, inserted) =
+      ops
+        .iter()
+        .fold((0u64, 0u64, 0u64), |(over, removed, ins), op| {
+          match op.kind {
+            OpKind::Overwrite => (over.saturating_add(op.len), removed, ins),
+            OpKind::Insert | OpKind::Extend => (over, removed, ins.saturating_add(op.len)),
+            OpKind::Delete => (over, removed.saturating_add(op.len), ins),
+            OpKind::Truncate => (
+              over,
+              removed.saturating_add(old_len.saturating_sub(op.at)),
+              ins,
+            ),
+            _ => (over, removed, ins),
+          }
+        });
+    let to_usize = |bytes: u64| usize::try_from(bytes).unwrap_or(usize::MAX);
+    let pieces = self
+      .content_history
+      .get(path)
+      .and_then(|history| history.last())
+      .and_then(|(_, value)| value.as_ref())
+      .map_or(0, crate::history::Value::pieces);
+    // The new list: the old pieces, each op splitting one and adding one, merged runs aside.
+    let list = pieces
+      .saturating_add(ops.len().saturating_mul(2))
+      .saturating_add(1)
+      .saturating_mul(crate::history::PIECE_BYTES);
+    let spliced = to_usize(overwritten)
+      .saturating_add(to_usize(removed))
+      .saturating_add(list);
+    let whole = old.saturating_add(crate::history::PIECE_BYTES);
+    let next = old
+      .saturating_sub(to_usize(removed))
+      .saturating_add(to_usize(inserted));
+    if list > next {
+      whole.max(spliced)
+    } else {
+      spliced
+    }
+  }
+
   /// What the green charges as retention (AUD-16): the content and IPC histories' bytes and the
   /// rejected-result cache's, both running totals, so the settle after every submit costs nothing that
   /// follows the green's size. [`Green::retained_bytes`] also sums the current files, a report's figure.
   pub fn retention_charge(&self) -> usize {
-    self.history_bytes.saturating_add(self.rejected_bytes)
+    self.history_bytes().saturating_add(self.rejected_bytes)
   }
 
   /// What the green holds in memory beyond its durable chain ([`RetainedBytes`]): the history and
@@ -2490,16 +2726,39 @@ impl Green {
         .map(Vec::len)
         .sum::<usize>()
         .saturating_add(self.specials.len().saturating_mul(SPECIAL_NODE_BYTES)),
-      history: self.history_bytes,
+      history: self.history_bytes(),
       rejected: self.rejected_bytes,
     }
   }
 
   /// The content and IPC histories' retained bytes **recounted** from the histories themselves — the oracle
-  /// the running total is checked against (balanced accounting): every earlier value of every path,
-  /// the current value excluded.
+  /// the running totals are checked against (balanced accounting): the distinct chunks the content values name and
+  /// their piece lists, less the current values, and every earlier IPC node.
   pub fn history_bytes_recounted(&self) -> usize {
-    let special_bytes: usize = self
+    let values = || {
+      self
+        .content_history
+        .values()
+        .flat_map(|history| history.iter().filter_map(|(_, value)| value.as_ref()))
+    };
+    let current: usize = self
+      .content_history
+      .values()
+      .filter_map(|history| history.last())
+      .filter_map(|(_, value)| value.as_ref())
+      .map(crate::history::Value::len)
+      .sum();
+    self
+      .chunks
+      .referenced_bytes(values())
+      .saturating_add(values().map(crate::history::Value::list_bytes).sum())
+      .saturating_sub(current)
+      .saturating_add(self.special_history_recounted())
+  }
+
+  /// The IPC history's earlier nodes, recounted: every node but each path's latest.
+  fn special_history_recounted(&self) -> usize {
+    self
       .special_history
       .values()
       .map(|history| {
@@ -2511,21 +2770,7 @@ impl Green {
           .count()
           .saturating_mul(SPECIAL_NODE_BYTES)
       })
-      .sum();
-    special_bytes.saturating_add(
-      self
-        .content_history
-        .values()
-        .map(|history| {
-          history
-            .iter()
-            .rev()
-            .skip(1)
-            .map(|(_, bytes)| bytes.as_ref().map_or(0, Vec::len))
-            .sum::<usize>()
-        })
-        .sum::<usize>(),
-    )
+      .sum()
   }
 
   /// The version below which the histories are folded.
@@ -2543,7 +2788,7 @@ impl Green {
   /// Returns the bytes released. A reachable floor at or below the current one is a no-op.
   pub fn fold_history_to_budget(&mut self, reachable_floor: u64, budget: usize) -> usize {
     let mut released = 0usize;
-    while self.history_bytes > budget && self.folded_below < reachable_floor {
+    while self.history_bytes() > budget && self.folded_below < reachable_floor {
       let next = self.folded_below.saturating_add(1);
       released = released.saturating_add(self.fold_history_before(next));
     }
@@ -2568,38 +2813,53 @@ impl Green {
       self.fold_identity();
     }
     self.folded_below = floor;
-    let mut released = 0usize;
-    for history in self.content_history.values_mut() {
-      released = released.saturating_add(fold_entries(history, floor, |bytes| {
-        bytes.as_ref().map_or(0, Vec::len)
-      }));
-    }
-    for history in self.special_history.values_mut() {
-      released = released.saturating_add(fold_entries(history, floor, |node| {
-        if node.is_some() {
-          SPECIAL_NODE_BYTES
-        } else {
-          0
-        }
-      }));
-    }
+    let before = self.history_bytes();
+    self.fold_content_before(floor);
+    self.fold_specials_before(floor);
     for history in self.mode_history.values_mut() {
-      fold_entries(history, floor, |_| 0);
+      fold_entries(history, floor);
     }
     for history in self.symlink_history.values_mut() {
-      fold_entries(history, floor, |_| 0);
+      fold_entries(history, floor);
     }
     for history in self.hardlink_history.values_mut() {
-      fold_entries(history, floor, |_| 0);
+      fold_entries(history, floor);
     }
     for history in self.xattr_history.values_mut() {
-      fold_entries(history, floor, |_| 0);
+      fold_entries(history, floor);
     }
     for history in self.dir_history.values_mut() {
-      fold_entries(history, floor, |_| 0);
+      fold_entries(history, floor);
     }
-    self.history_bytes = self.history_bytes.saturating_sub(released);
-    released
+    before.saturating_sub(self.history_bytes())
+  }
+
+  /// Folds the content history below `floor`: the latest value is never folded, so the current values stand, and each
+  /// dropped value releases its chunks.
+  fn fold_content_before(&mut self, floor: u64) {
+    let mut dropped = Vec::new();
+    for history in self.content_history.values_mut() {
+      dropped.extend(fold_entries(history, floor));
+    }
+    for (_, value) in dropped {
+      self.release_content(value);
+    }
+  }
+
+  /// Folds the IPC history below `floor`, its earlier nodes leaving the running total.
+  fn fold_specials_before(&mut self, floor: u64) {
+    let mut specials = 0usize;
+    for history in self.special_history.values_mut() {
+      specials = specials.saturating_add(
+        fold_entries(history, floor)
+          .iter()
+          .filter(|(_, node)| node.is_some())
+          .count(),
+      );
+    }
+    self.special_history_bytes = self
+      .special_history_bytes
+      .saturating_sub(specials.saturating_mul(SPECIAL_NODE_BYTES));
   }
 
   /// Rebases a work's increment onto the green's head (§4.16 "Rebase, the only corrective path"):

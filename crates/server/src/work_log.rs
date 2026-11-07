@@ -374,7 +374,7 @@ pub(crate) fn replay(
         bytes,
       } => {
         let base = Base { green, version };
-        let old = files.get(base, &path)?.map(<[u8]>::to_vec);
+        let old = files.get(base, &path)?.map(std::borrow::Cow::into_owned);
         let inserted = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         let ops = edit_ops(&path, old.as_deref(), (at, delete_len, inserted));
         apply_edit(
