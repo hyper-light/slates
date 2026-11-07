@@ -1,0 +1,246 @@
+name: DIAG the CanDelete lever -- its red check and the live suites on both runners, and the unlink A/B on arm64 (not for main)
+
+# Audit plan step 7, reopened (2026-11-07): an open's ledger context carries its kind, so a file's CanDelete makes no
+# shard trip (agents/winfsp-overlap-18 on main a2cf9af7).
+# - purge (the job's key, kept from its template): a_files_can_delete_makes_no_shard_trip_and_a_directorys_does at
+#   b21fec11, the test alone (red: 2 CanDelete requests reach the shard), and at 10e7c2f8, the fix (1), with the bridge's
+#   and the CLI's live WinFsp suites, on both runners.
+# - ab: main (a2cf9af7) against the fix (10e7c2f8), interleaved on one windows-11-arm VM, quiet and loaded, five runs.
+# Derived: each live step times out at three times diag-20's whole live step on the slower runner (4 min 52 s on
+# windows-latest, run 42130583401): 14.6 minutes, so 15.
+
+on:
+  push:
+    branches: ['diag-winfsp-overlap-[0-9]*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  MAIN_HEAD: a2cf9af737e85df69884869d8bbf1ebdd0d32cd0
+  FIX_HEAD: 10e7c2f8581009c4fd5c468c6accf4738cb8affd
+  RED_COMMIT: b21fec116a3f51dfea02b888f00e8bb338519d59
+  FIX_COMMIT: 10e7c2f8581009c4fd5c468c6accf4738cb8affd
+  WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+  WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+
+jobs:
+  purge:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, windows-11-arm]
+        commit: [red, fix]
+        include:
+          - runner: windows-latest
+            msvc: x64
+          - runner: windows-11-arm
+            msvc: arm64
+    name: CanDelete at ${{ matrix.commit }} on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.commit == 'red' && env.RED_COMMIT || env.FIX_COMMIT }}
+      - name: The results publisher
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/publish.sh" <<'EOF'
+          #!/bin/bash
+          # One commit per call on the results branch; a failed publish is reported and does not end the job.
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          cd "$GITHUB_WORKSPACE" || exit 0
+          touch ab.txt live.txt clippy.txt mount.txt
+          ab=$(git hash-object -w ab.txt) || exit 0
+          live=$(git hash-object -w live.txt) || exit 0
+          lint=$(git hash-object -w clippy.txt) || exit 0
+          mount=$(git hash-object -w mount.txt) || exit 0
+          tree=$(printf '100644 blob %s\tab.txt\n100644 blob %s\tclippy.txt\n100644 blob %s\tlive.txt\n100644 blob %s\tmount.txt\n' "$ab" "$lint" "$live" "$mount" | git mktree) || exit 0
+          parent=$(cat "$RUNNER_TEMP/results-parent" 2>/dev/null || true)
+          commit=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "results of run $GITHUB_RUN_ID") || exit 0
+          if git push origin "$commit:refs/heads/$RESULTS_BRANCH"; then
+            echo "$commit" > "$RUNNER_TEMP/results-parent"
+          else
+            echo "::warning::could not publish the results"
+          fi
+          EOF
+          chmod +x "$RUNNER_TEMP/publish.sh"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64)
+        if: matrix.msvc == 'x64'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64)
+        if: matrix.msvc == 'arm64'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install WinFsp, pinned
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi
+          $found = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
+          $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: The CanDelete tests
+        timeout-minutes: 15
+        shell: bash
+        env:
+          RESULTS_BRANCH: diag-winfsp-overlap-results-${{ github.run_id }}-candelete-${{ matrix.commit }}-${{ matrix.runner }}
+        run: |
+          set +e
+          {
+            echo "# the CanDelete lever at $(git rev-parse HEAD) (${{ matrix.commit }})"
+            if [ "${{ matrix.commit }}" = red ]; then
+              WINFSP_TEST_MOUNT=1 cargo test --locked -p slates-bridge-winfsp --lib -- --test-threads=1 --nocapture \
+                a_files_can_delete_makes_no_shard_trip_and_a_directorys_does
+              echo "## candelete test, red, exit $?"
+            else
+              WINFSP_TEST_MOUNT=1 cargo test --locked -p slates-bridge-winfsp --lib -- --test-threads=1 --nocapture
+              echo "## bridge, fix, exit $?"
+              "$RUNNER_TEMP/publish.sh"
+              SLATES_TEST_CLI=1 WINFSP_TEST_MOUNT=1 cargo test --locked -p slates-cli --test winfsp -- --test-threads=1 --nocapture
+              echo "## cli, fix, exit $?"
+            fi
+          } 2>&1 | tee live.txt
+          "$RUNNER_TEMP/publish.sh"
+          if [ "${{ matrix.commit }}" = red ]; then
+            grep -q 'WINFSP CAN DELETE: 2 CanDelete requests reached the shard' live.txt && grep -q '^## candelete test, red, exit 101$' live.txt
+          else
+            grep -q 'WINFSP CAN DELETE: 1 CanDelete requests reached the shard' live.txt && grep -c '^## .*, fix, exit 0$' live.txt | grep -qx 2
+          fi
+  ab:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: candelete-ab
+            runner: windows-11-arm
+            msvc: arm64
+            arms: "main:MAIN_HEAD: candelete:FIX_HEAD:"
+            pass: ""
+    name: ${{ matrix.lane }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 355
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: The results publisher
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/publish.sh" <<'EOF'
+          #!/bin/bash
+          # One commit per call on the results branch; a failed publish is reported and does not end the job.
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          cd "$GITHUB_WORKSPACE" || exit 0
+          touch ab.txt live.txt clippy.txt mount.txt
+          ab=$(git hash-object -w ab.txt) || exit 0
+          live=$(git hash-object -w live.txt) || exit 0
+          lint=$(git hash-object -w clippy.txt) || exit 0
+          mount=$(git hash-object -w mount.txt) || exit 0
+          tree=$(printf '100644 blob %s\tab.txt\n100644 blob %s\tclippy.txt\n100644 blob %s\tlive.txt\n100644 blob %s\tmount.txt\n' "$ab" "$lint" "$live" "$mount" | git mktree) || exit 0
+          parent=$(cat "$RUNNER_TEMP/results-parent" 2>/dev/null || true)
+          commit=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "results of run $GITHUB_RUN_ID") || exit 0
+          if git push origin "$commit:refs/heads/$RESULTS_BRANCH"; then
+            echo "$commit" > "$RUNNER_TEMP/results-parent"
+          else
+            echo "::warning::could not publish the results"
+          fi
+          EOF
+          chmod +x "$RUNNER_TEMP/publish.sh"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64)
+        if: matrix.msvc == 'x64'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64)
+        if: matrix.msvc == 'arm64'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install WinFsp, pinned
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi
+          $found = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
+          $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "image $env:ImageOS $env:ImageVersion; $env:NUMBER_OF_PROCESSORS CPUs; $env:PROCESSOR_ARCHITECTURE $env:PROCESSOR_IDENTIFIER; WinFsp 2.1.25156" | Out-File -FilePath image.txt -Encoding utf8
+      - name: Build every arm
+        shell: bash
+        env:
+          ARM_LIST: ${{ matrix.arms }}
+        run: |
+          cargo build --release --locked -p slates-cli --example mount_bench
+          mkdir -p ab-bin
+          cp target/release/examples/mount_bench.exe ab-bin/mount_bench.exe
+          for arm in $ARM_LIST; do
+            name=${arm%%:*} rest=${arm#*:} ref=${rest%%:*} workers=${rest#*:}
+            mkdir -p "ab-bin/$name"
+            case "$ref" in
+              HEAD) dir=. ;;
+              *) commit=${!ref}
+                 git fetch --depth=1 origin "$commit"
+                 git worktree add --detach "$RUNNER_TEMP/$name" "$commit"
+                 dir="$RUNNER_TEMP/$name" ;;
+            esac
+            (cd "$dir" && env CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-$name" \
+              ${workers:+SLATES_DIAG_RECEIVE_WORKERS=$workers} cargo build --release --locked -p slates-cli --bin slates)
+            cp "target-$name/release/slates.exe" "ab-bin/$name/slates.exe"
+          done
+      - name: The interleaved mount benchmark
+        shell: bash
+        env:
+          RESULTS_BRANCH: diag-winfsp-overlap-results-${{ github.run_id }}-${{ matrix.lane }}
+          ARM_LIST: ${{ matrix.arms }}
+          PASS: ${{ matrix.pass }}
+        run: |
+          {
+            echo "# lane ${{ matrix.lane }}: arms $ARM_LIST; MAIN_HEAD $MAIN_HEAD; FIX_HEAD $FIX_HEAD; $(date -u +%FT%TZ)"
+            tr -d '\r\000' < image.txt | sed 's/^\xef\xbb\xbf//'
+            cmd //c ver | tr -d '\r' | grep -v '^$'
+            arms=""
+            for arm in $ARM_LIST; do name=${arm%%:*}; arms="$arms $name=ab-bin/$name/slates.exe"; done
+            ARMS="$arms" BENCH=ab-bin/mount_bench.exe RUNS=5 SPINNERS_PER_CPU=2 PASS="$PASS" AFTER_RUN="$RUNNER_TEMP/publish.sh" \
+              bash docs/wip/bench/fsbench/windows-ab.sh
+          } 2>&1 | tee ab.txt
+      - name: Publish whatever was measured
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/publish.sh" ]; then bash "$RUNNER_TEMP/publish.sh"; fi
+        env:
+          RESULTS_BRANCH: diag-winfsp-overlap-results-${{ github.run_id }}-${{ matrix.lane }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ab-${{ matrix.lane }}
+          path: |
+            ab.txt
