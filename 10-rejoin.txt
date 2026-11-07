@@ -1,0 +1,18 @@
+=== neither 1 exit 101 load { 19.10 18.49 12.80 }
+rejoins: successor daemon 17568 answered after 50.010167ms
+slates-cluster: fleet: HostId(5764446504621981004) holds HostId(11751491938677962516) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+thread 'a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet' (39858) panicked at crates/cli/tests/live_chaos.rs:2451:7:
+the fleet re-formed after the successor: [Some(("5764446504621981004", 2, 0)), Some(("10224096637450880995", 2, 1)), Some(("11751491938677962516", 2, 1))]
+fleet_host: 5764446504621981004
+fleet_peers_probed: 0
+shard 0 refused fleet.plane.epoch_refused: 406
+shard 0 refused fleet.plane.epoch_refused.answer: 406
+fleet_host: 10224096637450880995
+fleet_peers_probed: 1
+shard 0 refused fleet.link.invalid.believed_dead: 1
+shard 0 refused fleet.plane.epoch_refused: 406
+shard 0 refused fleet.plane.epoch_refused.install: 406
+shard 0 refused fleet.plane.member_returned: 393
+fleet_host: 11751491938677962516
+fleet_peers_probed: 1
+shard 0 refused fleet.link.invalid.believed_dead: 1
