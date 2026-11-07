@@ -1,0 +1,106 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 13:26:08 UTC 2026, tree F 3cef4bdafc676788c0554943e68626e08ddb269c
+live storm: unanswered sends while both stopped 18 (bound 66)
+== run 1 both_candidates_stopped_draw_no_storm_of_sends exit 0
+live turns: live-turns-b-6806 stopped: writes [4.639708ms, 4.486942ms, 4.457003ms, 4.439793ms]
+live turns: live-turns-c-6806 stopped: writes [4.40253ms, 4.36342ms, 4.395259ms, 4.342761ms]
+== run 1 each_candidate_stopped_in_turn_holds_no_write_and_catches_up exit 0
+live catalog: refusals [("live-catalog-a-7077", 0), ("live-catalog-b-7077", 0)]
+== run 1 a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog exit 0
+live storm: unanswered sends while both stopped 17 (bound 66)
+== run 2 both_candidates_stopped_draw_no_storm_of_sends exit 0
+live turns: live-turns-a-7612 stopped: writes [98.593066ms, 4.071462ms, 3.837233ms, 3.898828ms]
+live turns: live-turns-b-7612 stopped: writes [4.0386ms, 4.037659ms, 3.860126ms, 4.2834ms]
+== run 2 each_candidate_stopped_in_turn_holds_no_write_and_catches_up exit 0
+live catalog: refusals [("live-catalog-a-7781", 0), ("live-catalog-c-7781", 0)]
+== run 2 a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog exit 0
+live storm: unanswered sends while both stopped 40 (bound 66)
+== run 3 both_candidates_stopped_draw_no_storm_of_sends exit 0
+live turns: live-turns-c-8310 stopped: writes [4.928831ms, 4.926121ms, 4.787095ms, 4.687609ms]
+live turns: live-turns-a-8310 stopped: writes [4.376574ms, 9.617662ms, 3.877507ms, 3.925287ms]
+== run 3 each_candidate_stopped_in_turn_holds_no_write_and_catches_up exit 0
+live catalog: refusals [("live-catalog-a-8489", 0), ("live-catalog-b-8489", 0)]
+== run 3 a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog exit 0
+live storm: unanswered sends while both stopped 18 (bound 66)
+== run 4 both_candidates_stopped_draw_no_storm_of_sends exit 0
+live turns: live-turns-a-9000 stopped: writes [4.124494ms, 3.983636ms, 3.883179ms, 3.912003ms]
+live turns: live-turns-b-9000 stopped: writes [4.003575ms, 3.94821ms, 3.903447ms, 3.970914ms]
+== run 4 each_candidate_stopped_in_turn_holds_no_write_and_catches_up exit 0
+live catalog: refusals [("live-catalog-a-9285", 0), ("live-catalog-b-9285", 0)]
+== run 4 a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog exit 0
+live storm: unanswered sends while both stopped 17 (bound 66)
+== run 5 both_candidates_stopped_draw_no_storm_of_sends exit 0
+live turns: live-turns-b-9723 stopped: writes [4.717845ms, 4.682682ms, 4.722664ms, 4.74133ms]
+live turns: live-turns-c-9723 stopped: writes [3.962507ms, 10.444874ms, 3.945625ms, 3.850968ms]
+== run 5 each_candidate_stopped_in_turn_holds_no_write_and_catches_up exit 0
+live catalog: refusals [("live-catalog-a-9903", 0), ("live-catalog-c-9903", 0)]
+== run 5 a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog exit 0
+== live_fleet quiet at 13:26:52, load 0.94 1.81 0.97
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 26.02s
+== live_fleet quiet exit 0
+== live_fleet loaded at 13:27:18, load 1.11 1.78 0.98
+test a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... FAILED
+test a_live_volumes_writes_ship_their_changes_not_the_volume ... FAILED
+thread 'a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it' (14357) panicked at crates/cli/tests/live_fleet.rs:1611:3:
+thread 'a_live_volumes_writes_ship_their_changes_not_the_volume' (14528) panicked at crates/cli/tests/live_fleet.rs:1350:3:
+test result: FAILED. 19 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 44.56s
+== live_fleet loaded exit 101
+== partition quiet 1 at 13:28:03, load 9.91 4.04 1.79
+  5164 writes, 5164 acknowledged: p50 352 us, p99 3025 us, p999 42850 us, max 320491 us; 5 over 50ms (sent+took): 0.00s+128ms 0.72s+97ms 2.13s+63ms 2.20s+51ms 2.32s+320ms
+  chaos-rolling-b-16712 refused the owner: {}
+  chaos-rolling-a-16712 refused the owner: {}
+  chaos-rolling-c-16712 refused the owner: {}
+== partition quiet 1 exit 0
+== partition quiet 2 at 13:28:10, load 9.75 4.11 1.82
+  6003 writes, 6003 acknowledged: p50 391 us, p99 5890 us, p999 15569 us, max 571098 us; 4 over 50ms (sent+took): 0.00s+123ms 0.17s+167ms 2.20s+571ms 3.29s+71ms
+  chaos-rolling-c-16962 refused the owner: {}
+  chaos-rolling-a-16962 refused the owner: {}
+  chaos-rolling-b-16962 refused the owner: {}
+== partition quiet 2 exit 0
+== partition quiet 3 at 13:28:17, load 8.50 4.02 1.82
+  5820 writes, 5820 acknowledged: p50 404 us, p99 5240 us, p999 56296 us, max 710188 us; 6 over 50ms (sent+took): 0.00s+129ms 0.17s+166ms 2.27s+398ms 4.24s+56ms 4.30s+710ms 5.02s+243ms
+  chaos-rolling-c-17298 refused the owner: {}
+  chaos-rolling-a-17298 refused the owner: {}
+  chaos-rolling-b-17298 refused the owner: {}
+== partition quiet 3 exit 0
+== partition quiet 4 at 13:28:24, load 8.13 4.02 1.83
+  6364 writes, 6364 acknowledged: p50 371 us, p99 6293 us, p999 49416 us, max 628291 us; 6 over 50ms (sent+took): 0.00s+188ms 2.27s+628ms 3.27s+75ms 3.39s+51ms 3.45s+68ms 3.51s+144ms
+  chaos-rolling-a-17549 refused the owner: {}
+  chaos-rolling-b-17549 refused the owner: {}
+  chaos-rolling-c-17549 refused the owner: {}
+== partition quiet 4 exit 0
+== partition quiet 5 at 13:28:32, load 7.72 4.01 1.83
+  4268 writes, 4268 acknowledged: p50 569 us, p99 2912 us, p999 44073 us, max 203355 us; 4 over 50ms (sent+took): 0.00s+163ms 0.71s+81ms 2.16s+52ms 2.33s+203ms
+  chaos-rolling-a-17881 refused the owner: {}
+  chaos-rolling-b-17881 refused the owner: {}
+  chaos-rolling-c-17881 refused the owner: {}
+== partition quiet 5 exit 0
+== partition loaded 1 at 13:28:39, load 6.76 3.92 1.83
+  1044 writes, 1044 acknowledged: p50 3354 us, p99 60090 us, p999 246674 us, max 368880 us; 19 over 50ms (sent+took): 0.01s+247ms 0.26s+60ms 0.37s+62ms 0.93s+57ms 0.99s+54ms 1.09s+53ms 1.14s+68ms 1.21s+51ms 1.51s+52ms 1.66s+64ms 2.89s+126ms 4.14s+65ms 4.20s+136ms 4.67s+53ms 5.88s+199ms 7.00s+53ms 7.
+  chaos-rolling-b-18233 refused the owner: {}
+  chaos-rolling-a-18233 refused the owner: {}
+  chaos-rolling-c-18233 refused the owner: {}
+== partition loaded 1 exit 0
+== partition loaded 2 at 13:28:56, load 8.56 4.47 2.04
+  326 writes, 326 acknowledged: p50 25998 us, p99 100621 us, p999 328986 us, max 328986 us; 82 over 50ms (sent+took): 0.03s+329ms 0.40s+67ms 0.47s+79ms 0.55s+90ms 0.64s+66ms 0.71s+97ms 0.80s+75ms 0.88s+70ms 0.95s+67ms 1.01s+59ms 1.12s+84ms 1.21s+95ms 1.30s+68ms 1.37s+80ms 1.45s+76ms 1.52s+101ms 1.63
+  chaos-rolling-b-18545 refused the owner: {}
+  chaos-rolling-a-18545 refused the owner: {}
+  chaos-rolling-c-18545 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 118}
+== partition loaded 2 exit 0
+== partition loaded 3 at 13:29:15, load 9.96 5.05 2.29
+  548 writes, 548 acknowledged: p50 8996 us, p99 79729 us, p999 197990 us, max 197990 us; 19 over 50ms (sent+took): 0.02s+108ms 0.67s+51ms 3.30s+58ms 3.41s+68ms 3.48s+97ms 3.61s+56ms 3.66s+52ms 3.72s+54ms 3.87s+85ms 4.17s+62ms 4.39s+54ms 5.43s+80ms 6.59s+56ms 6.64s+56ms 6.87s+198ms 7.07s+71ms 7.22s+
+  chaos-rolling-b-19022 refused the owner: {}
+  chaos-rolling-a-19022 refused the owner: {}
+  chaos-rolling-c-19022 refused the owner: {}
+== partition loaded 3 exit 0
+== partition loaded 4 at 13:29:29, load 11.35 5.60 2.51
+  286 writes, 286 acknowledged: p50 32997 us, p99 112298 us, p999 217416 us, max 217416 us; 81 over 50ms (sent+took): 0.01s+217ms 0.23s+79ms 0.31s+73ms 0.38s+86ms 0.46s+68ms 0.53s+112ms 0.64s+90ms 0.73s+71ms 0.81s+64ms 0.87s+68ms 0.94s+66ms 1.00s+95ms 1.10s+73ms 1.17s+61ms 1.23s+83ms 1.32s+83ms 1.40
+  chaos-rolling-b-19308 refused the owner: {}
+  chaos-rolling-a-19308 refused the owner: {}
+  chaos-rolling-c-19308 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 452}
+== partition loaded 4 exit 0
+== partition loaded 5 at 13:30:12, load 13.76 7.07 3.16
+  592 writes, 592 acknowledged: p50 7998 us, p99 77002 us, p999 170396 us, max 170396 us; 20 over 50ms (sent+took): 0.02s+170ms 0.19s+60ms 0.29s+57ms 0.35s+62ms 0.53s+54ms 0.64s+57ms 0.69s+60ms 0.80s+70ms 0.94s+63ms 1.00s+59ms 1.08s+65ms 1.15s+70ms 1.25s+59ms 1.55s+59ms 2.79s+84ms 4.03s+77ms 4.11s+8
+  chaos-rolling-c-20219 refused the owner: {}
+  chaos-rolling-a-20219 refused the owner: {}
+  chaos-rolling-b-20219 refused the owner: {}
+== partition loaded 5 exit 0
