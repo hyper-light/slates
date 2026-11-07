@@ -163,7 +163,7 @@
 >   owed, so one submit held for its resend kept all its client's later records, and past `2 × slots` the owner
 >   refused the client's next requests `AcknowledgementOwed`: 906,317 against 59,646 served on fixtures' 1k owner
 >   shard, 2.46 million at the 10k. An acknowledgement now names the ids still owed and every partition releases the
->   rest; an owed id closes once and never reopens (§4.9's status; red on both Linux runners, run 42396554623: refused
+>   rest; an owed id closes once and never reopens (A-245, §4.9's status; red on both Linux runners, run 42396554623: refused
 >   at the 64th edit past a held submit; `docs/bugs/2026-11-07-a-held-request-kept-every-later-completion-of-its-client.md`).
 >
 > - **A kept forward waited for another request** (found 2026-11-07, the 10k stall). A forward refused by its owner

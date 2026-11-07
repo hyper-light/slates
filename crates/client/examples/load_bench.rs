@@ -1585,8 +1585,8 @@ fn versions_patiently(client: &mut Client, green: VolumeId) -> u64 {
   patiently(client, "versions", |client| client.versions(green))
 }
 
-/// An oracle call tried again while its answer is only late or refused for now: a stall past one reply deadline (the
-/// daemon draining after every client is done), `LeaseUnconfirmed` (an owner confirming its lease after a node's
+/// An oracle or setup call tried again while its answer is only late or refused for now: a stall past one reply
+/// deadline (the daemon draining after every client is done), its daemon gone for longer than one reconnect budget, `LeaseUnconfirmed` (an owner confirming its lease after a node's
 /// kill: fixtures' 1,000-client replica-kill rung aborted the harness on one, 2026-11-07), `Overloaded` or
 /// `OwnerUnreachable`. Paced by the client's own retry pause and bounded by `reply_patience` reconnect budgets, past
 /// which the harness stops with the last answer named.
@@ -1608,6 +1608,9 @@ fn patiently<T>(
       Ok(answer) => return answer,
       Err(
         ClientError::Stalled { .. }
+        // A kill rung's restarted node may take longer than one reconnect budget to come back; each call reconnects
+        // again (fixtures' 1,000-client primary kill: `versions` met `DaemonGone` 7.52 s in, 2026-11-07).
+        | ClientError::DaemonGone { .. }
         | ClientError::Refused(
           Refusal::LeaseUnconfirmed { .. }
           | Refusal::Overloaded { .. }

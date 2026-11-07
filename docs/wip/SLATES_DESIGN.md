@@ -5742,7 +5742,7 @@ failure.
 > pin it (`a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id`;
 > `docs/bugs/2026-11-06-a-resend-under-its-id-was-already-acknowledged.md`).
 
-> **Status (2026-11-07, an acknowledgement names the ids still owed).** A watermark is contiguous, so one held or
+> **Status (2026-11-07, A-245: an acknowledgement names the ids still owed).** A watermark is contiguous, so one held or
 > slow request kept every later completion of its client: the owner pruned none of them, and past `2 × slots` refused
 > the client's next requests `AcknowledgementOwed`. At `f = 1`, where nearly every slow submit is held, that was the
 > steady state: 906,317 refused against 59,646 served on the owner shard of fixtures' 1,000-client rung, 2.46 million
@@ -14516,6 +14516,45 @@ green's base, the other half of the load test's first finding, is A-202's.
 - **Unchanged:** a work's state is owner-local and lost with its host (D-18's host boundary), not placed at f + 1.
 - **Cost (measured on the branch it comes from):** every edit now appends to the partition log, so the partition's
   snapshots come at the rate edits arrive.
+
+### A-245 — An acknowledgement names the ids its client still owes, and every partition releases the rest (accepted and built 2026-11-07, fixtures' f = 1 rungs and the 10,000-client rung's backpressure; raft agreed)
+
+Applied in the same change to:
+- §4.9: "Exactly-once" (the acknowledgement names its owed ids) and its status of 2026-11-07.
+- GAPS: the load-test blockquote.
+- `crates/wire/src/request.rs`: `ClientWindow` keeps an open set; `acknowledge(up_to, owed)` and its rule.
+- `crates/db`: `Op::CompletionsAcknowledged` and the snapshot's `ClientCompletions` carry `owed`;
+  `owed_completions`.
+- `crates/ipc`: `RequestBody::Acknowledge { up_to, owed }`.
+- `crates/server`: `acknowledgement_owing` (a malformed acknowledgement refused whole, `ack.malformed`);
+  `ForwardedRequest::ack_owed` and `prune_forwarded`.
+- `crates/client`: `Client::acknowledgement` names the awaited, held and `Unpublished` ids.
+- The tests: `a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound` (`fleet.rs`),
+  `no_owed_id_is_released_whatever_order_its_acknowledgements_arrive_in` and the generated histories (`model.rs`),
+  the window's unit tests, and `an_unpublished_verb_stays_retryable_across_the_clients_acknowledgement` (`recovery.rs`)
+  restated for the rule.
+- **What was there.** One watermark (RIFL's, Lee et al., SOSP 2015), stopping below the lowest id still owed. A
+  watermark is contiguous, so one held or slow request kept every later completion of its client, and past
+  `2 × slots` the owner refused the client's next requests `AcknowledgementOwed`. At `f = 1`, where nearly every slow
+  submit is held for its resend, that was the steady state.
+- **The rule.**
+  - `up_to` covers every id issued; `owed` names those at or below it still owed (awaited, held within the reconnect
+    budget, `Unpublished`), at most the ring's slots and the hold's cap.
+  - An acknowledgement closes only what it speaks for (raft's rule): an open id at or below its `up_to` it does not
+    name is closed, an open id above its `up_to` is left open, a named id above the old watermark is opened, and a
+    closed id is never opened again. So a late, duplicated or reordered acknowledgement (a scatter, a relay) closes
+    only ids it covers and reopens none, and a released id is never executed twice. The watermark never moves back.
+  - One naming an owed id above its own `up_to`, or more owed ids than the completion bound, is refused whole
+    (`BadRequest`), never cut, since a cut releases ids still owed. The window ignores one whole if it were ever
+    logged, so replay stays a pure function of the log.
+  - The op changes in place: replay refuses an entry whose schema hash differs (`record.rs`), so an old log is refused,
+    never misread, as an appended op would be (raft).
+  - The origin relays its owed ids with a forwarded write, so the owner keeps a held submit's record too.
+- **Measured.** The bug record (`docs/bugs/2026-11-07-a-held-request-kept-every-later-completion-of-its-client.md`):
+  - the owner's `acknowledgement_owed` was 906,317 against 59,646 served at fixtures' 1k `f = 1`, and 513k at its 3k;
+  - after the change, 15 at the 3k, with oracle 0;
+  - the held-submit test was red 6/6 and is green.
+- **Owed.** The sync `call` path holds only `Unpublished` ids. A relayed acknowledgement rides only a forwarded write.
 
 ### A-243 — A partition snapshots once its log's measured replay work reaches the recovery budget and the log reaches the last snapshot's size (accepted and built 2026-11-07, the 10,000-client rung's snapshot wall; raft agreed)
 

@@ -1,4 +1,4 @@
-# A held request kept every later completion of its client (2026-11-07, §4.9 "Exactly-once")
+# A held request kept every later completion of its client (2026-11-07, §4.9 "Exactly-once", A-245)
 
 Found by agents/fixtures on its `f = 1` rungs of 7bc80672 merged with main 7ce90ebb, with perf reading the counters,
 and seen first as the backpressure column of agents/loadtest-scale's quiet-arm 10,000-client rung. Introduced as a
