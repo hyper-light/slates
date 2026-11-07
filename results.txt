@@ -1,0 +1,13 @@
+tree S 200958233e1b861f376004f9956b30771b8f3b21, Sat Nov  7 17:53:59 UTC 2026
+== run 1 exit 0
+live fence: the old owner's live counters {"appended": 3, "awaited": 3, "durable": 3, "fenced": 1, "no_session": 1, "resolved": 3, "unanswered": 1, "whole": 1}, its log Some(("2", "2", "false"))
+live fence: taken over by live-fence-a-6408 after 1.72757528s; stale write outcome Some(Some(1)); successor read of /stale: 1 ""
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 3.95s
+== run 2 exit 0
+live fence: the old owner's live counters {"appended": 3, "awaited": 3, "durable": 3, "fenced": 1, "no_session": 1, "resolved": 3, "unanswered": 1, "whole": 1}, its log Some(("2", "2", "false"))
+live fence: taken over by live-fence-c-6800 after 4.742581506s; stale write outcome Some(Some(1)); successor read of /stale: 1 ""
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 6.12s
+== run 3 exit 0
+live fence: the old owner's live counters {"appended": 3, "awaited": 3, "durable": 3, "fenced": 1, "no_session": 1, "resolved": 3, "unanswered": 1, "whole": 1}, its log Some(("2", "2", "false"))
+live fence: taken over by live-fence-b-7393 after 1.819483379s; stale write outcome Some(Some(1)); successor read of /stale: 1 ""
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 2.99s
