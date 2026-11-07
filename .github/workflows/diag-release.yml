@@ -1,0 +1,68 @@
+# DIAG, not for main: the Windows fleet suite and the daemon's unit tests on CI's Windows runners, over
+# release-wincov + liveness-udpreset + winfsp-bench-server-lib (the steps release-wincov adds to ci.yml).
+name: DIAG Windows fleet (not for main)
+
+on:
+  push:
+    branches: ["diag-release-*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fleet:
+    name: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest, nasm: true }
+          - { runner: windows-11-arm, clang_cl: true }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - name: Install NASM
+        if: ${{ matrix.nasm }}
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl for the C the daemon links (arm64)
+        if: ${{ matrix.clang_cl }}
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Machine
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_ComputerSystem | Select-Object NumberOfLogicalProcessors, TotalPhysicalMemory
+          Get-CimInstance Win32_OperatingSystem | Select-Object TotalVirtualMemorySize, FreeVirtualMemory
+      - name: The daemon's unit tests, one test at a time
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: cargo test -p slates-server --lib -- --test-threads=1
+      - name: The fleet suite, one test at a time
+        if: ${{ !cancelled() }}
+        timeout-minutes: 150
+        env:
+          SLATES_FLEET_TRACE: "1"
+          SLATES_TEST_HEDGE_STARVATION_SECS: "20"
+          SLATES_TEST_RESTART_SLOWDOWN: "10"
+          SLATES_TEST_FLEET_DEADLINE_SECS: "120"
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p slates-server --test fleet -- --test-threads=1 2>&1 | tee fleet.log | grep -E '^test |test result|panicked|left:|right:|memory allocation' || true
+          echo "DIAG: per-test outcomes"; grep -E ' \.\.\. (ok|FAILED|ignored)' fleet.log | sed 's/^test //' | sort | uniq -c | sort -rn | head -5
+          grep -E 'panicked at' -A3 fleet.log | head -60
+          tail -3 fleet.log
