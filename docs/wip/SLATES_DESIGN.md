@@ -5713,6 +5713,14 @@ provisioning is therefore safe to retry after any failure.
 > awaited therefore meets `AcknowledgementOwed` at the `2 × slots` bound, as backpressure until that request answers
 > (`slates_client` `ack_watermark`; `an_acknowledgement_never_covers_a_request_still_awaited`;
 > `docs/bugs/2026-11-06-an-acknowledgement-covered-requests-still-awaited.md`).
+>
+> The same day it was extended to the refusals retryable under the same id. A forwarded submit whose acceptance
+> outlived the owner's budget is answered `Overloaded`: the verb ran, and its completion is recorded at the commit.
+> The next acknowledgement covered it, so its resend was refused `DuplicateRequest` (447 in fixtures' `f = 1`
+> 1,000-client rung). An async caller's `Overloaded` or `OwnerUnreachable` id now holds the watermark below it until
+> it is resent or released (`release_retryable`), within the reconnect budget, so a caller that never resends cannot
+> pin it (`a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id`;
+> `docs/bugs/2026-11-06-a-resend-under-its-id-was-already-acknowledged.md`).
 
 > **Status (2026-11-05, A-216: an acknowledgement is answered once its own shard has released).** An `Acknowledge
 > { up_to }` releases the client's records at or below `up_to` on every partition that may hold them. Its reply now
@@ -7518,6 +7526,30 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > identity is a set hash over the green's entries, brought up to date when read, so a record at `f > 0` costs what its
 > version changed. Since part 3 (2026-11-06) a clean rebase returns only what the work changed over the head.
 
+> **Status (2026-11-07, A-242: the history is copy-on-write, and an increment carries what it adds).**
+> - **The history.** The engine kept a whole copy of a file per version that changed it, and charged the whole
+>   previous file to each submit. A version now holds pieces of shared chunks (`crates/merge/src/history.rs`): the
+>   bytes it added and its piece list. That is the "Splice" below, done in the engine's history.
+> - **The increment.** Its post-state laid out each edited file's whole final content, zero-filled but for the runs,
+>   and the seal read each run at its op's base-coordinate offset. A run after an earlier length change in the same
+>   file therefore merged zeros into the green. The post-state now holds only the runs, each read from where the
+>   work's file holds it (`increment::compose_volume_planned`).
+> - Measured on CI: behind a held floor, 64 versions of 64-byte overwrites of a 1 MiB file under a 16 MiB budget,
+>   16 of 64 accepted before and 64 after. The corruption's test: the green's head was `cd\0\0`, now `cdXY`.
+>   (`docs/bugs/2026-11-07-a-greens-history-kept-a-copy-of-every-file-per-version.md`,
+>   `docs/bugs/2026-11-07-a-run-after-a-length-change-merged-zeros.md`.)
+
+> **Status (2026-11-06, A-238: a green's chain is checkpointed at its reachable floor).** The partition kept
+> every accepted increment for good, and the "fold into checkpoint deltas" below had no durable form.
+> - Now, after each accept, the owner checkpoints the chain at the floor. The floor is the oldest version a live work
+>   or pin names, kept below any merge record still waiting for placement. The owner checkpoints once the increments
+>   to fold reach the size of the checkpoint they replace (`Op::GreenCheckpointed`, `slates_merge::checkpoint`).
+> - Recovery restores the green from its origin and the checkpoint and replays only the increments after it.
+> - A base below the checkpoint is no reader's and is answered `UnknownBase`. It is not mapped through deltas that
+>   are gone, so "every base back to green's origin" now holds back to the checkpoint.
+> - Under a 256 KiB cap, a green whose work kept up took 200 versions where it was refused at 31.
+>   (`docs/bugs/2026-11-06-a-greens-chain-kept-every-version-it-ever-took.md`.)
+
 > **Status (2026-11-04, A-201: a green's head lands through a checkout).** `checkout GREEN VOLUME ATTACHMENT
 > --snapshot N` writes the green's head into the volume it was created from (the server's overlay of the directory
 > it lands into), checked to be that base and unchanged since, and `land` lands the volume under a grant; a green
@@ -7587,7 +7619,9 @@ that lie strictly after p by d; ranges that overlap an intervening effect range 
 the verdict; a rename in an intervening delta remaps the increment's paths beneath it. Maps
 compose: `map(a..c) = map(b..c) ∘ map(a..b)`. Deltas older than the derived retention fold into
 checkpoint deltas by the same composition, which is exact, so every base back to green's origin
-maps at O(log) checkpoint lookups plus the raw deltas after the last checkpoint.
+maps at O(log) checkpoint lookups plus the raw deltas after the last checkpoint. (Since A-238 the durable
+checkpoint is the green's state at its reachable floor, and a base below it is refused `UnknownBase`: no live reader
+names one.)
 
 **The verdict, two pure passes.** Inputs: the mapped increment, the effect ranges of the
 intervening deltas, and the referenced immutable content. Pass one: a sweep line over the
@@ -14444,6 +14478,99 @@ green's base, the other half of the load test's first finding, is A-202's.
 - **Unchanged:** a work's state is owner-local and lost with its host (D-18's host boundary), not placed at f + 1.
 - **Cost (measured on the branch it comes from):** every edit now appends to the partition log, so the partition's
   snapshots come at the rate edits arrive.
+
+### A-242 — A green's content history is copy-on-write, and an increment's post-state holds only the runs it adds (accepted and built 2026-11-07, W2 of the load test's walls)
+
+Applied in the same change to:
+- §4.16: its status.
+- GAPS: the load-test blockquote.
+- `crates/merge`:
+  - `history.rs` (new): `Chunks`, `Value`, `Value::spliced`, `Value::read`.
+  - `engine.rs`: `content_history`, the running totals and `history_bytes()`, `history_reservation` and
+    `edit_reservation`, `content_ref_at`/`files_at` as `Cow`, and the new `content_len_at`, `file_lens_at` and
+    `content_page_at`.
+  - `increment.rs`: `compose_volume_planned`, `PostStatePlan`, and the compact layout in `seal`/`push_content`.
+- `crates/server`:
+  - `verbs.rs`: `assemble_post_state` reads each run where the plan says.
+  - `work_files.rs`: `Cow`, `page`, `sizes`.
+  - `merge_service.rs` and `listing.rs`: paged reads and sizes.
+- The tests: `crates/server/tests/green_retention.rs`, `crates/server/tests/green_post_state.rs`, the history's
+  proptest oracle, and the increment oracle's post-state built independently of the plan. The engine's and the
+  daemon's amplification tests now assert the bound.
+- **What was there.**
+  - The history kept each version of a file as a whole copy, and admission charged the whole previous file per
+    submit: a one-byte overwrite of a large file retained the file.
+  - The post-state laid out each edited file's whole final content as a zero-filled region.
+  - The seal read each run at its op's base-coordinate offset, which merged zeros for a run after an earlier length
+    change in the same file. That has been so since 34548a59.
+- **The rule.**
+  - A history value is pieces over refcounted immutable chunks: no shared-ownership pointer, freed with the last
+    piece.
+  - A version is spliced from the one before by `apply`'s walk, sharing every kept run and copying only the added
+    bytes. It is checked against its bytes and stored whole when the check fails or its list would outweigh it.
+  - Retention is chunks and lists less the current values' bytes and lists: what the history holds beyond the
+    current files, as before.
+  - Admission charges an edit's overwritten, deleted and truncated bytes and the old list, or the old value when
+    stored whole, and a replaced path's old value.
+  - The head stays contiguous. A read below the head is borrowed when the file is unchanged since, copied out of the
+    pieces when not, and a page copies only the page.
+  - An increment's post-state is the runs its ops add, laid out compactly. The deriver plans each run's offset in the
+    work's file, and the seal reads it there.
+- **Measured.** The bug records and BENCHMARKS.
+- **Owed.**
+  - A rename copies its source's bytes into one chunk rather than sharing its pieces.
+  - A base-seeded green's origin is held as chunks beside the head copy (W4, reland-a207's).
+  - Greens merged before the fix may hold zeros a run after a length change put there.
+
+### A-238 — A green's durable chain is checkpointed at its reachable floor, and a base below the checkpoint is unknown (accepted and built 2026-11-06, W3 of the load test's walls)
+
+Applied in the same change to:
+- §4.16: its status and "Position mapping".
+- GAPS: the load-test blockquote, "Memory per client, attributed".
+- `crates/merge`: `checkpoint.rs`, `Green::checkpoint`, `Green::restore`, `Outcome::BaseUnavailable`,
+  `Rebased::BaseUnavailable`.
+- `crates/db`: `Op::GreenCheckpointed`, `GreenCheckpoint`, `PartitionSnapshot::green_checkpoints`,
+  `DbError::CheckpointOutOfRange`, `Partition::green_checkpoint` and `green_head`.
+- `crates/server`, in `merge_service.rs`: `checkpoint_floor`, `checkpoint_green`, `checkpoint_green_when`,
+  `settle_green_retention_leaving`, `inputs_of`, `green_version`, `GreenFence::CheckpointCorrupt`; in `error.rs`:
+  `refusal_of_db`.
+- `crates/ipc`: `Refusal::TableAtCapacity`.
+- `crates/server`, in `verbs.rs`: `replay_green`, `recovered_origin`, `submit`, `rebase`, the takeover's chain
+  adoption.
+- `crates/server`, in `daemon.rs`: `merge_chain_identities`, `partition_snapshot_bytes`.
+- The tests: `crates/merge/tests/checkpoint.rs`, `crates/db/tests/model.rs`,
+  `crates/server/tests/green_checkpoint.rs`, and the server's unit tests.
+- **What was there.** Every accepted increment stayed in the partition's `green_chains`, refused at the cap "until
+  checkpointing folds old chain entries (owed)". Each version cost its increment for good. Each snapshot re-encoded the
+  whole chain. Recovery replayed every version. A green whose readers all kept up was refused at the cap: version 31
+  under 256 KiB.
+- **The rule.**
+  - A checkpoint at `F` holds, for each key whose value at `F` was set after version 0, that version and value. It
+    also holds the identities of the increments accepted up to `F`.
+  - The partition holds it in place of the increments up to `F`. The owner takes one after an accept, at the
+    reachable floor kept below any merge record waiting for placement. It takes it only once the increments to fold
+    reach the size of the checkpoint they replace, so checkpointing costs at most the bytes appended.
+  - A version not past the held checkpoint, or past the head, is refused `CheckpointOutOfRange`. A checkpoint no
+    larger than what it releases is admitted at any fill.
+  - Recovery restores the green from the origin and the checkpoint, and fences one that does not decode
+    (`CheckpointCorrupt`).
+  - A submit or rebase based below `F` answers `UnknownBase`. No live reader names such a base, since `F` is never
+    above one.
+  - So does a read at a named version below the engine's fold: below the checkpoint after a restart, and below the
+    in-memory fold before it. It had been answered as the floor's state or `NotFound`.
+  - The settle before a submit folds until the submit's claim fits. Folding to the cap alone had refused version 34
+    `BudgetExceeded { available: 0 }`.
+  - A submit refused at the chain's cap checkpoints at the floor first, the doubling rule waived: the floor may have
+    risen since the last accept. What is still full is refused `TableAtCapacity { table }`, appended to `Refusal`;
+    it had reached the client as `BadRequest`.
+- **Measured** (the bug record):
+  - Under a 256 KiB cap, 200 of 200 versions are accepted, where the cap refused at version 31.
+  - Recovered at head 200, and version 201 is accepted.
+  - From version 40 to 200 the partition's snapshot grows at most 39,168 bytes, against 1,329,920 before.
+- **Owed.**
+  - At `f > 0` the holders' replicas and records grow per version, and a takeover adopts the whole chain.
+  - The 40 bytes a checkpoint keeps for each accepted identity.
+  - The checkpoint walk is not sliced.
 
 ### A-217 — A green's origin is a reference to the base snapshot it holds, not a copy of the tree in the partition (accepted 2026-11-05, the supervisor's decision (a))
 

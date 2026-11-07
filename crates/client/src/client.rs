@@ -302,6 +302,17 @@ pub struct Client {
   unpublished_cap: usize,
   /// Unpublished ids forgotten at the bound.
   unpublished_forgotten: u64,
+  /// The sequences an async caller was answered `Overloaded` or `OwnerUnreachable`, the refusals retryable under the
+  /// same id, with when (§4.9, §4.16 "Commit"): a forwarded submit whose acceptance outlived the owner's budget ran,
+  /// and its completion is recorded once the version commits, so its resend must meet that record. The watermark stops
+  /// below the lowest held within the reconnect budget, the window in which a resend under the id is made, renewed by
+  /// each refusal; past it the id is released, so a caller that never resends cannot hold its watermark (and with it
+  /// the daemon's completion records, refused `AcknowledgementOwed` past their bound) for good. Before 2026-11-06 the
+  /// next acknowledgement covered the refused id and its resend was refused `DuplicateRequest` (447 submits of
+  /// fixtures' 1,000-client `f = 1` rung). Bounded by `unpublished_cap`, the oldest forgotten and counted.
+  retry_held: std::collections::BTreeMap<u32, Instant>,
+  /// Ids released from `retry_held` at its bound or released by their caller unanswered.
+  retry_released: u64,
   /// Replies drained from the completion ring while looking for another request's reply, held by
   /// their request-id word until their own [`Client::poll_reply`] takes them. The async path drains
   /// the ring on a completion-fd signal and matches by id, so replies that arrive out of order (a
@@ -1102,6 +1113,8 @@ impl Client {
       unpublished: std::collections::BTreeSet::new(),
       unpublished_cap,
       unpublished_forgotten: 0,
+      retry_held: std::collections::BTreeMap::new(),
+      retry_released: 0,
       pending: Vec::new(),
       awaited: std::collections::BTreeMap::new(),
       edit_chains: std::collections::BTreeMap::new(),
@@ -1746,14 +1759,46 @@ impl Client {
       .filter(|word| !self.pending.iter().any(|(held, _)| held == *word))
       .map(|word| RequestId::from_word(*word).sequence)
       .min();
-    first_incomplete.map_or(received, |lowest| received.min(lowest.saturating_sub(1)))
+    let first_held = self
+      .retry_held
+      .iter()
+      .filter(|(_, refused)| elapsed_ns(**refused) < self.deadlines.reconnect_ns)
+      .map(|(sequence, _)| *sequence)
+      .next();
+    [first_incomplete, first_held]
+      .into_iter()
+      .flatten()
+      .fold(received, |watermark, lowest| {
+        watermark.min(lowest.saturating_sub(1))
+      })
   }
 
   /// Notes what `word`'s reply means for the retryable set: an `Unpublished` refusal keeps the id
   /// retryable (bounded, the oldest forgotten and counted past the ring's slots); any other answer
-  /// to a retried id releases it.
-  fn note_reply(&mut self, word: u64, body: &ReplyBody) {
+  /// to a retried id releases it. On the async path (`by_word`: a caller holding the id's word, which
+  /// [`Self::begin_again`] resends) an `Overloaded` or `OwnerUnreachable` refusal is held as well, within the
+  /// reconnect budget (`retry_held`).
+  fn note_reply(&mut self, word: u64, body: &ReplyBody, by_word: bool) {
     let sequence = RequestId::from_word(word).sequence;
+    let held_for_retry = by_word
+      && matches!(
+        body,
+        ReplyBody::Refused {
+          refusal: slates_ipc::protocol::Refusal::Overloaded { .. }
+            | slates_ipc::protocol::Refusal::OwnerUnreachable { .. }
+        }
+      );
+    if held_for_retry {
+      if self.retry_held.len() >= self.unpublished_cap
+        && !self.retry_held.contains_key(&sequence)
+        && self.retry_held.pop_first().is_some()
+      {
+        self.retry_released = self.retry_released.saturating_add(1);
+      }
+      self.retry_held.insert(sequence, Instant::now());
+    } else {
+      self.retry_held.remove(&sequence);
+    }
     if matches!(
       body,
       ReplyBody::Refused {
@@ -1777,6 +1822,21 @@ impl Client {
     self.unpublished_forgotten
   }
 
+  /// Releases `word`, an id the caller was answered with a refusal retryable under it and will not send again: the
+  /// acknowledgement watermark no longer stops below it, so the daemon may release its completion records past it.
+  pub fn release_retryable(&mut self, word: u64) {
+    let sequence = RequestId::from_word(word).sequence;
+    if self.retry_held.remove(&sequence).is_some() {
+      self.retry_released = self.retry_released.saturating_add(1);
+    }
+    self.unpublished.remove(&sequence);
+  }
+
+  /// Ids released from the hold for a resend under their own id unanswered: at its bound or by their caller.
+  pub fn retry_released(&self) -> u64 {
+    self.retry_released
+  }
+
   /// One request under the next sequence, without the automatic acknowledgement.
   fn call_plain(&mut self, body: &RequestBody) -> Result<ReplyBody, ClientError> {
     let id = self.fresh_id()?;
@@ -1796,7 +1856,7 @@ impl Client {
     loop {
       self.rebind_if_needed()?;
       if let Some(reply) = self.round_trip(id, body)? {
-        self.note_reply(id.word(), &reply);
+        self.note_reply(id.word(), &reply, false);
         return resolved(reply);
       }
     }
@@ -1928,8 +1988,10 @@ impl Client {
   }
 
   /// Sends `body` again under `word`, an id the caller already used and was answered with a refusal the protocol
-  /// marks retryable under the same id (`Overloaded`, `OwnerUnreachable`, `Unpublished`, `ContentUnavailable`): the
-  /// daemon answers from the verb's completion record once it is durable, or runs it if it never ran. The word is
+  /// marks retryable under the same id (`Overloaded`, `OwnerUnreachable`, `Unpublished`): the daemon answers from the
+  /// verb's completion record once it is durable, or runs it if it never ran. The acknowledgement watermark stops
+  /// below such an id from its refusal until this resend (within the reconnect budget for the first two;
+  /// [`Self::release_retryable`] releases one the caller gives up). The word is
   /// awaited again, so its reply is taken as a [`Self::begin`]'s is, within the same in-flight bound. `Ok(false)` when
   /// the ring has no slot (nothing was sent).
   pub fn begin_again(&mut self, word: u64, body: &RequestBody) -> Result<bool, ClientError> {
@@ -2135,14 +2197,14 @@ impl Client {
     if let Some(pos) = self.pending.iter().position(|(held, _)| *held == word) {
       let (_, body) = self.pending.remove(pos);
       self.awaited.remove(&word);
-      self.note_reply(word, &body);
+      self.note_reply(word, &body, true);
       return resolved(body).map(Some);
     }
     while let Some(reply) = self.end.try_take()? {
       let body: ReplyBody = unpack(self.end.region(), reply.kind, &reply.payload)?;
       if reply.request == word {
         self.awaited.remove(&word);
-        self.note_reply(word, &body);
+        self.note_reply(word, &body, true);
         return resolved(body).map(Some);
       }
       self.buffer(reply.request, body);
@@ -2188,7 +2250,7 @@ impl Client {
     // A chain step's reply is its chain's: filed under the public word the caller awaits.
     if let Some(public) = self.chain_steps.remove(&id_word) {
       self.awaited.remove(&id_word);
-      self.note_reply(id_word, &body);
+      self.note_reply(id_word, &body, false);
       if !self.pending.iter().any(|(held, _)| *held == public) {
         self.pending.push((public, body));
       }
@@ -2209,6 +2271,9 @@ impl Client {
     }
     if self.awaited.contains_key(&id_word) && !self.pending.iter().any(|(held, _)| *held == id_word)
     {
+      // Held as soon as it is drained: a reply in `pending` counts as received, so an acknowledgement sent before
+      // its caller takes it must already stop below a refusal it will resend.
+      self.note_reply(id_word, &body, true);
       self.pending.push((id_word, body));
     } else {
       self.unawaited_dropped = self.unawaited_dropped.saturating_add(1);

@@ -2943,6 +2943,15 @@ pub enum Refusal {
   /// completion records under that id belong to the client it was issued to, so nothing is served on this channel,
   /// which the daemon then ends. A client resumes only the session it was handed (`Session`, with its key). Appended.
   SessionUnproven,
+  /// A durable table of the partition the verb records into is at its derived capacity (§4.8; CLAUDE.md banned item
+  /// 8): `green_chains`, the merge byte budget a partition's green chains, origins, checkpoints and work logs share,
+  /// when what live readers still hold below their greens' checkpoints fills it. Nothing was recorded. Until 2026-11-06
+  /// (A-238) it reached the client as `BadRequest { reason: "<table> at capacity" }`, as if the request were
+  /// malformed. Appended.
+  TableAtCapacity {
+    /// The table.
+    table: String,
+  },
 }
 
 /// What a path refused [`Refusal::OwnMount`] was given as (A-227). Append-only.

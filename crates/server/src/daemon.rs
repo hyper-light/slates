@@ -2288,7 +2288,7 @@ impl Daemon {
   }
 
   /// The chain of `green` as the shard that serves it holds it: each version's increment identity in
-  /// order (§4.16; AUD-14) — what a test compares between the departed owner and its successor to prove
+  /// order (§4.16; AUD-14), those folded into its checkpoint (W3) as the checkpoint keeps them — what a test compares between the departed owner and its successor to prove
   /// the full ledger prefix and the original results were preserved through the takeover. Empty for a
   /// green this daemon does not serve; the typed refusal when the shard could not be observed.
   pub fn merge_chain_identities(
@@ -2298,22 +2298,55 @@ impl Daemon {
     let object = slates_db::register::ObjectId(green.bytes);
     let volume = slates_db::catalog::VolumeId { bytes: green.bytes };
     self.observe(self.shard_of_object(object), move |s| {
-      s.db
-        .partition()
-        .green_chain(volume)
-        .iter()
-        .enumerate()
-        .filter_map(|(index, bytes)| {
+      // The versions up to the green's checkpoint (W3) are named by the identities it keeps with them; the chain
+      // holds the versions after it.
+      let partition = s.db.partition();
+      let (held, mut identities) =
+        partition
+          .green_checkpoint(volume)
+          .map_or((0, Vec::new()), |(held, bytes)| {
+            let accepted = slates_merge::checkpoint::Checkpoint::decode(bytes)
+              .map(|checkpoint| checkpoint.accepted)
+              .unwrap_or_default();
+            (
+              held,
+              accepted
+                .into_iter()
+                .map(|(id, version)| (version, id))
+                .collect(),
+            )
+          });
+      identities.sort_unstable();
+      identities.extend(partition.green_chain(volume).iter().enumerate().filter_map(
+        |(index, bytes)| {
           slates_merge::engine::Increment::decode(bytes)
             .ok()
             .map(|increment| {
               (
-                u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1),
+                u64::try_from(index)
+                  .unwrap_or(u64::MAX)
+                  .saturating_add(held)
+                  .saturating_add(1),
                 increment.id,
               )
             })
-        })
-        .collect()
+        },
+      ));
+      identities
+    })
+  }
+
+  /// The bytes the snapshot of `green`'s partition encodes to now (§4.8): what every snapshot taken when its log
+  /// fills writes, and what recovery reads first. A test reads it to hold the partition to what its volumes are rather
+  /// than what they have been (W3: a green's chain checkpointed at its reachable floor). Encodes the partition on the
+  /// green's owner shard; the typed refusal when it could not be observed.
+  pub fn partition_snapshot_bytes(
+    &self,
+    green: slates_ipc::protocol::VolumeId,
+  ) -> Result<usize, ObserveError> {
+    let object = slates_db::register::ObjectId(green.bytes);
+    self.observe(self.shard_of_object(object), move |s| {
+      slates_wire::Wire::to_bytes(&s.db.partition().to_snapshot(0)).len()
     })
   }
 
@@ -4346,8 +4379,19 @@ async fn serve_loop() {
       // Announce idle, fence, re-check (the doorbell protocol, `verbs::announce_idle`): a request found
       // pending is served now; one published later is rung, and the ring wakes this poller.
       let serve_instead = state::with_state(verbs::announce_idle).unwrap_or(false);
+      // A forward its owner's full control channel refused is kept for the next round (§4.3, "backpressure, never a
+      // drop"), but no ring or kick says the channel has room: the owner drains it without a word to the shards that
+      // wait. So while one is kept the loop idles at most the idle window, then serves a round that sends it again.
+      // Idling until a ring woke it, a shard whose clients all waited on kept forwards slept until some other
+      // request came: at 10,000 clients over one green, requests waited 10 to 42 s with the daemon idle
+      // (`crates/server/tests/forward_retry.rs`).
+      let kept = state::with_state(|s| !s.pending_forwards.is_empty()).unwrap_or(false);
       if !serve_instead {
-        futures::idle().await;
+        if kept {
+          let _ = futures::within(idle_window_ns.max(1), futures::idle()).await;
+        } else {
+          futures::idle().await;
+        }
       }
       state::with_state(verbs::announce_polling);
     }

@@ -189,18 +189,18 @@ fn dedup_by_key<T, K: Ord>(table: &mut Vec<T>, key: impl Fn(&T) -> K) {
   table.reverse();
 }
 
-fn put_count(out: &mut Vec<u8>, count: usize) {
+pub(crate) fn put_count(out: &mut Vec<u8>, count: usize) {
   out.extend_from_slice(&u32::try_from(count).unwrap_or(u32::MAX).to_le_bytes());
 }
 
-fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+pub(crate) fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
   put_count(out, bytes.len());
   out.extend_from_slice(bytes);
 }
 
 /// A table's declared count, refused before any allocation when the bytes that remain could not
 /// hold that many entries at the smallest entry size.
-fn take_count(reader: &mut Reader<'_>) -> Result<usize, DocDecodeError> {
+pub(crate) fn take_count(reader: &mut Reader<'_>) -> Result<usize, DocDecodeError> {
   let count = reader.u32()? as usize;
   if count > reader.remaining() / ENTRY_MIN_BYTES {
     return Err(DocDecodeError::Truncated);
@@ -208,12 +208,12 @@ fn take_count(reader: &mut Reader<'_>) -> Result<usize, DocDecodeError> {
   Ok(count)
 }
 
-fn reader_bytes<'a>(reader: &mut Reader<'a>) -> Result<&'a [u8], DocDecodeError> {
+pub(crate) fn reader_bytes<'a>(reader: &mut Reader<'a>) -> Result<&'a [u8], DocDecodeError> {
   let len = reader.u32()? as usize;
   reader.bytes(len)
 }
 
-fn take_str(reader: &mut Reader<'_>) -> Result<String, DocDecodeError> {
+pub(crate) fn take_str(reader: &mut Reader<'_>) -> Result<String, DocDecodeError> {
   let raw = reader_bytes(reader)?;
   std::str::from_utf8(raw)
     .map(str::to_owned)

@@ -167,8 +167,9 @@ pub fn refusal_of_db(e: &DbError) -> Refusal {
     DbError::StaleLease { current } => Refusal::StaleLease { current: *current },
     DbError::LeaseHeld { epoch } => Refusal::LeaseHeld { epoch: *epoch },
     DbError::StaleCompletion { .. } => Refusal::DuplicateRequest,
-    DbError::Capacity { table } => Refusal::BadRequest {
-      reason: format!("{table} at capacity"),
+    // Typed (A-238): a full table is the partition's bound, not a malformed request.
+    DbError::Capacity { table } => Refusal::TableAtCapacity {
+      table: (*table).to_owned(),
     },
     // Nothing of the verb is durable — the transaction was rolled back (`Unpublished`), or a record
     // could not be appended for want of log space a snapshot did not release (`LogFull` reaching

@@ -4314,7 +4314,9 @@ fn a_greens_base_snapshot_is_held_and_its_origin_recovered_from_it() {
 }
 
 /// A bounded overlay over `dir`, pinned and snapshotted, a green over the snapshot, and one accepted increment that
-/// replaces `g` with `G`. Returns the overlay, the snapshot and the green.
+/// replaces `g` with `G`. A second work stays at version 0, holding the reachable floor there, so version 0 stays
+/// readable across a restart: a version below the floor is folded into the green's checkpoint and refused
+/// `UnknownBase` after it (A-238). Returns the overlay, the snapshot and the green.
 fn green_over_a_held_base(client: &mut Client, dir: &str) -> (VolumeId, SnapshotId, VolumeId) {
   let overlay = client
     .create(&CreateSpec {
@@ -4340,6 +4342,7 @@ fn green_over_a_held_base(client: &mut Client, dir: &str) -> (VolumeId, Snapshot
     )
     .unwrap();
   let (work, _) = client.create_work(green, "origin-ref-work").unwrap();
+  client.create_work(green, "origin-ref-floor").unwrap();
   let len = u64::try_from(AFTER.len()).unwrap();
   client.edit(work, "g", 0, len, b"G").unwrap();
   assert_eq!(
