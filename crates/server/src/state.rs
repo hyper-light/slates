@@ -384,6 +384,12 @@ pub struct ShardState {
   pub landing: crate::landing::LandingState,
   /// The image builds and merges running on this shard (§4.6, A-160).
   pub(crate) image: crate::image::ImageState,
+  /// The anchors of the fleet's members as the control shard last looked (A-222): a host that leaves them has its
+  /// clients' attachments ended on every shard (`crate::remote_attach::sweep_departed`). Bounded by the fleet's members.
+  pub(crate) configured_members: Vec<u64>,
+  /// Anchors that departed and whose attachments some shard has not yet ended, owed to the next look (A-222). Bounded
+  /// by the fleet's members.
+  pub(crate) departed_owed: Vec<u64>,
   /// The same-kernel direct maps being filled on this shard (§4.6, A-171).
   pub(crate) direct_map: crate::direct_map::DirectMapState,
   /// The store.

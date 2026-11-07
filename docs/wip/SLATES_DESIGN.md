@@ -13815,7 +13815,13 @@ name unlinked; `completion.rs`: the bridge's mappings by duplicate), `crates/mem
      client's ring slots, `remote_attach::bound`; past it `RemoteAttachmentsFull`), and its reap of a dead client
      sends each owner `RemoteReap { volume, client }`, which ends that host's client's attachments there (the host
      again the authenticated peer's, so a node reaps only its own clients). A host that leaves the configuration has
-     every remote attachment it held ended at each install that no longer lists it (`remote_attach::end_departed`).
+     every remote attachment it held ended: each liveness budget the control shard maps the configuration's members
+     to their certificate anchors (the id a forward authenticates, which `Remote` records; a member id is fresh per
+     incarnation), names each anchor among them at the last look and absent now, and has every shard end that
+     anchor's attachments (`remote_attach::sweep_departed`), owed again until every shard answered. **Corrected
+     2026-11-07:** the first form ended them at two of the nine paths that install a configuration, compared member
+     ids with anchors, and ended a not-yet-configured host's attachment mid-formation; main CI 42335884062 held a
+     retired host's attachment for 40 s (`docs/bugs/2026-11-07-a-retired-hosts-remote-attachment-was-never-ended.md`).
   6. **The bound on a silent holder is its write lease's term**, `failover_slo_ns` (derived in `take_write_lease`; 10
      s by default): a reap, like a local one, ends the record and leaves the lease to its term (D-16 "Lease holder
      crash: writes refused until the lease expires"); the owner's lease sweep releases it within one liveness budget
