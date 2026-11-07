@@ -7306,7 +7306,12 @@ pub(crate) fn take_sessions(
 ) -> Vec<(HostId, Endpoint)> {
   state::with_state(|s| {
     let mut taken = Vec::new();
+    let mut held_from_phase_one: Vec<&'static str> = Vec::new();
     for (host, link) in s.record_sessions.iter_mut() {
+      // DIAG (never for main): a session phase one wants but finds out is counted under its holder's own tag.
+      if lent_to == "fleet.lent_to.live_takeover" && wanted(*host) && link.endpoint.is_none() {
+        held_from_phase_one.push(link.lent_to.unwrap_or("fleet.lent_to.none"));
+      }
       if wanted(*host)
         && let Some(mut endpoint) = link.endpoint.take()
       {
@@ -7315,6 +7320,9 @@ pub(crate) fn take_sessions(
         link.lent_to = Some(lent_to);
         taken.push((*host, endpoint));
       }
+    }
+    for holder in held_from_phase_one {
+      s.count(holder, 1);
     }
     taken
   })
