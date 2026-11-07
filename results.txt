@@ -1,0 +1,15 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 15:52:38 UTC 2026, tree 043d5231677d76310ef48c65151701b89470e057
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.76s
+== cluster live run 1 exit 0
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.76s
+== cluster live run 2 exit 0
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.77s
+== cluster live run 3 exit 0
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.76s
+== cluster live run 4 exit 0
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.77s
+== cluster live run 5 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+== server live_ship exit 0
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.56s
+== live_fleet exit 0
