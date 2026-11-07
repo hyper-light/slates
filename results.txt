@@ -1,0 +1,10 @@
+tested 888e3ae300339543ebbb748cf23100d6e9b20c62 variant after on x86_64, 4 cpus
+post-state exit 101 61s
+  post-state: warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+  post-state: thread 'a_run_after_a_length_change_in_its_file_merges_its_own_bytes' (5722) panicked at crates/server/tests/green_post_state.rs:65:3:
+  post-state: assertion `left == right` failed: the green's head is the work's file
+  post-state:   left: [99, 100, 0, 0]
+  post-state:  right: [99, 100, 88, 89]
+  post-state: test a_run_after_a_length_change_in_its_file_merges_its_own_bytes ... FAILED
+  post-state: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+  post-state: error: test failed, to rerun pass `-p slates-server --test green_post_state`
