@@ -738,14 +738,13 @@ fn a_stuck_start_is_killed_and_restarted() {
   await_stable_daemon(&instance, true);
   // Awaited, not asked once: a status that lands in the anchor's one startup restart is refused (seen once at load 29).
   let killed = await_daemon(&instance, None, &[]);
-  let stuck = successor_of(&anchor, killed);
-  assert!(
-    Command::new("kill")
-      .args(["-STOP", &stuck.to_string()])
-      .status()
-      .unwrap()
-      .success()
-  );
+  // The successor is stopped as soon as the anchor names it, by signals sent from here, not by spawned `pgrep` and
+  // `kill` processes: at 240 runnable processes those were slow enough that a successor beat first, once in fifteen
+  // runs, and was then rightly killed at its heartbeat's lapse, not as a start (2026-11-07).
+  let pid = |raw: u32| rustix::process::Pid::from_raw(i32::try_from(raw).unwrap()).unwrap();
+  rustix::process::kill_process(pid(killed), rustix::process::Signal::KILL).unwrap();
+  let stuck = restarted_pid(&lines);
+  rustix::process::kill_process(pid(stuck), rustix::process::Signal::STOP).unwrap();
   let answered = await_daemon(&instance, Some(stuck), &[]);
   let stuck_alive = Command::new("kill")
     .args(["-0", &stuck.to_string()])
@@ -769,6 +768,26 @@ fn a_stuck_start_is_killed_and_restarted() {
     still_for.is_some_and(|still| still >= window && still < window * 2),
     "killed as a start within a window of its last progress: {kill_line:?}"
   );
+}
+
+/// Format: the anchor's restart line names the daemon it started after this (`crates/cli/src/anchor.rs`).
+const RESTARTED_AS: &str = "restarted as pid ";
+
+/// The pid the anchor's next restart line names, from its forwarded lines, within [`START_CEILING`].
+#[cfg(unix)]
+fn restarted_pid(lines: &std::sync::mpsc::Receiver<String>) -> u32 {
+  loop {
+    let line = lines
+      .recv_timeout(START_CEILING)
+      .expect("the anchor said it restarted the daemon");
+    if let Some(after) = line.split(RESTARTED_AS).nth(1) {
+      return after
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|pid| pid.parse().ok())
+        .unwrap_or_else(|| panic!("no pid in the restart line {line:?}"));
+    }
+  }
 }
 
 /// Format: the anchor's words for a start that made no progress (`crates/cli/src/anchor.rs`, `start_stuck`), before
