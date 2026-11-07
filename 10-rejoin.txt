@@ -190,3 +190,8 @@ fleet_peers_probed: 1
 fleet_host: 17315358111262760816
 fleet_peers_probed: 1
 shard 0 refused fleet.link.invalid.believed_dead: 1
+=== both 6 exit 0 load { 12.38 14.87 13.64 }
+rejoins: successor daemon 39514 answered after 41.4815ms
+slates-cluster: fleet: HostId(403861865057424147) holds HostId(255996629624285842) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+rejoins: the fleet re-formed after 1.6829285s
+test a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet ... ok
