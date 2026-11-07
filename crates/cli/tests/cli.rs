@@ -35,7 +35,7 @@ const POLL_MS: u64 = 20;
 /// Shape: shards for the test daemon.
 const SHARDS: &str = "2";
 /// Shape: shards for a direct-map test's daemon ([`start_one_shard_anchor`]).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const ONE_SHARD: &str = "1";
 /// Shape: exit code 3 — the daemon was unavailable (the client never reached it).
 const EXIT_UNAVAILABLE: i32 = 3;
@@ -157,7 +157,7 @@ fn start_anchor_with_environment(
 /// handed to a client of any shard since A-188 (`crates/client/tests/client.rs`,
 /// `a_client_of_another_shard_maps_a_file_read_and_write`); before it, which shard a container's client landed on, its
 /// id's residue, decided whether it was handed one.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn start_one_shard_anchor(instance: &str) -> AnchorProcess {
   start_anchor_of(instance, &[], ONE_SHARD)
 }
@@ -566,8 +566,15 @@ fn strict_volume_or_typed_refusal(instance: &str) -> Option<String> {
 /// §4.14 `daemon.alive` (2026-10-10, when the anchor began waiting for the lapse instead of looking every beat): a daemon
 /// that stops beating is killed at its heartbeat lapse and restarted. Do: start an anchor, freeze its daemon
 /// (`SIGSTOP`: alive and silent), and wait for another daemon to answer. Expect the frozen one gone, killed once, and the
-/// new one answering no sooner than the liveness budget less one heartbeat after the freeze (the lapse runs from the last
-/// beat, which may precede the freeze by a beat) and within the suite's start wait after that.
+/// anchor's own kill line to say the beat it judged was at least its lapse bound old (the liveness window plus the
+/// anchor's lateness p99), never less than the window; and the new daemon answering within the suite's start wait past
+/// that bound.
+///
+/// The lower bound is the anchor's own predicate, read from its kill line, because the test cannot see how old the last
+/// beat was when it stopped the daemon. Since A-228 the beat is the watchdog's, and on a loaded machine a beat can come
+/// late (0.26 s measured on a starved shard), so the lapse can end sooner after the stop than a window less one beat.
+/// Main CI run 42184319025 (macOS, 2026-11-07) replaced the daemon 869.8 ms after the stop, with the anchor right, and
+/// failed the old bound of the window less a beat (900 ms).
 ///
 /// Since A-228 the beat is the daemon's watchdog thread's, and a frozen process stops every thread at once, the watchdog
 /// with them, so nothing in the daemon can say it is only starved. A stopped process is indistinguishable from a hung one,
@@ -582,8 +589,21 @@ fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
     return;
   }
   let instance = format!("cli-frozen-{}", std::process::id());
-  let anchor = start_anchor(&instance);
+  let (mut anchor, mut stderr) = spawn_anchor(&instance, &[]);
+  await_serving(&mut stderr, &instance, false);
+  let (kills, killed) = std::sync::mpsc::channel::<String>();
+  anchor.drain = Some(std::thread::spawn(move || {
+    for line in std::io::BufRead::lines(stderr).map_while(Result::ok) {
+      eprintln!("{line}");
+      if line.contains(LAPSE_KILL_LINE) {
+        let _ = kills.send(line);
+      }
+    }
+  }));
+  await_stable_daemon(&instance, true);
   let frozen = daemon_pid(&instance).expect("the daemon answers");
+  // A kill of the starting daemon (the start's own recovery, `await_stable_daemon`) is not this one.
+  while killed.try_recv().is_ok() {}
   assert!(
     Command::new("kill")
       .args(["-STOP", &frozen.to_string()])
@@ -599,19 +619,52 @@ fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
     .status()
     .unwrap()
     .success();
+  let line = killed
+    .recv_timeout(START_WAIT)
+    .expect("the anchor said why it killed the daemon");
   drop(anchor);
-  let budget = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
-  let beat = Duration::from_nanos(slates_server::daemon::HEARTBEAT_NS);
+  let (age, bound, window) = lapse_of(&line);
+  println!(
+    "frozen daemon: replaced after {replaced_after:?}; the anchor's beat was {age:?} old against its {bound:?} bound"
+  );
   assert_ne!(successor, frozen);
   assert!(!frozen_alive, "the frozen daemon was killed");
-  assert!(
-    replaced_after >= budget.saturating_sub(beat),
-    "not killed before its heartbeat lapsed: replaced after {replaced_after:?}"
+  assert_eq!(
+    window,
+    Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS),
+    "the anchor's window is the liveness budget"
   );
   assert!(
-    replaced_after <= budget + START_WAIT,
-    "killed at the lapse and replaced: after {replaced_after:?}"
+    age >= bound && age >= window,
+    "not killed before its heartbeat lapsed: the beat was {age:?} old against a {bound:?} bound ({line})"
   );
+  assert!(
+    replaced_after <= bound + START_WAIT,
+    "killed at the lapse and replaced: after {replaced_after:?}, against a {bound:?} bound"
+  );
+}
+
+/// Format: the words of the anchor's kill line for a lapsed beat (`crates/cli/src/anchor.rs`).
+const LAPSE_KILL_LINE: &str = "the daemon's heartbeat lapsed (";
+
+/// The beat's age, the lapse bound and the window the anchor's kill line names, in that order: "(N ms old, past B ms: the
+/// W ms window …".
+fn lapse_of(line: &str) -> (Duration, Duration, Duration) {
+  let (_, rest) = line.split_once(LAPSE_KILL_LINE).expect("a kill line");
+  let numbers: Vec<u64> = rest
+    .split(|c: char| !c.is_ascii_digit())
+    .filter(|word| !word.is_empty())
+    .take(3)
+    .map(|word| word.parse().unwrap())
+    .collect();
+  let [age, bound, window] = numbers[..] else {
+    panic!("the kill line names the age, the bound and the window: {line}");
+  };
+  (
+    Duration::from_millis(age),
+    Duration::from_millis(bound),
+    Duration::from_millis(window),
+  )
 }
 
 /// Kills the daemon (`SIGKILL`) and waits for the anchor's restarted one to answer.
@@ -3535,6 +3588,174 @@ fn three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owner
 
   drop(daemons);
   drop(scratch);
+}
+
+/// Each fleet node's merge, content and seal counters and its fleet view from `status --json`: what an unanswered submit
+/// in a fleet is waiting on (`a_submit_in_a_three_process_fleet_is_answered_once_its_record_commits`).
+fn commit_counters(instances: &[String]) -> Vec<String> {
+  instances
+    .iter()
+    .map(|instance| {
+      let (_, out, _) = run(instance, &["status", "--json"]);
+      let status: serde_json::Value = serde_json::from_str(&out).unwrap_or_default();
+      let named: Vec<String> = status["shards"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .flat_map(|(shard, report)| {
+          report["refusals"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(move |refusal| {
+              let kind = refusal["kind"].as_str()?;
+              ["merge.", "fleet.content", "fleet.seal", "content.sealed"]
+                .iter()
+                .any(|prefix| kind.starts_with(prefix))
+                .then(|| format!("{shard}:{kind}={}", refusal["count"]))
+            })
+        })
+        .collect();
+      let fleet: Vec<String> = status["fleet"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(_, value)| !value.is_object())
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+      let council = &status["fleet"]["council"];
+      format!("{instance} {named:?} fleet {fleet:?} council {council}")
+    })
+    .collect()
+}
+
+/// Three daemon processes from one manifest at `f = 1`, formed and bootstrapped as the deployment flow is: the scratch,
+/// the processes, their instances and the index of the node the root was bootstrapped on.
+fn bootstrapped_fleet(prefix: &str) -> (ScratchDir, Vec<FleetProcess>, Vec<String>, usize) {
+  let pid = std::process::id();
+  let scratch = scratch_dir();
+  for node in FLEET_NODES {
+    mint_identity(&scratch.path, node);
+  }
+  let blocks = port_blocks();
+  let bases: Vec<u16> = blocks.iter().map(|held| held.base).collect();
+  let manifest = write_manifest(&scratch.path, &bases);
+  let instances: Vec<String> = FLEET_NODES
+    .iter()
+    .map(|node| format!("{prefix}-{node}-{pid}"))
+    .collect();
+  let daemons: Vec<FleetProcess> = FLEET_NODES
+    .iter()
+    .zip(&instances)
+    .zip(&blocks)
+    .map(|((node, instance), held)| start_fleet_daemon(instance, &manifest, node, held))
+    .collect();
+  for instance in &instances {
+    wait_answers(instance);
+  }
+  let views = wait_fleet_views(
+    &instances,
+    FLEET_NODES.len(),
+    u32::try_from(FLEET_NODES.len() - 1).unwrap(),
+  );
+  assert_formed(&views);
+  let bootstrap = views
+    .iter()
+    .enumerate()
+    .min_by_key(|(_, view)| view.as_ref().unwrap().host.parse::<u64>().unwrap())
+    .map(|(index, _)| index)
+    .unwrap();
+  let (code, _, error) = run(&instances[bootstrap], &["bootstrap", "root"]);
+  assert_eq!(
+    code, 0,
+    "one explicit bootstrap of the fresh fleet: {error}"
+  );
+  (scratch, daemons, instances, bootstrap)
+}
+
+/// A green on `owner`, made once its groups have formed: until then a green is refused `ConsensusNotInitialized`, typed,
+/// before any effect, so only that refusal is retried, within the fleet wait.
+fn green_once_groups_form(owner: &str) -> String {
+  let deadline = Instant::now() + FLEET_WAIT;
+  loop {
+    let (code, out, err) = run(owner, &["green", "g"]);
+    if code == 0 {
+      break value_of(&out, "id");
+    }
+    assert!(
+      err.contains("ConsensusNotInitialized") && Instant::now() < deadline,
+      "create the green: {err}"
+    );
+    pause();
+  }
+}
+
+/// Runs `slates --instance INSTANCE ARGS…` with a deadline: `None` when it has not exited by then (it is killed and reaped,
+/// so a hung verb fails its test rather than the test hanging).
+fn run_within(instance: &str, args: &[&str], within: Duration) -> Option<(i32, String, String)> {
+  let mut child = slates()
+    .arg("--instance")
+    .arg(instance)
+    .args(args)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let deadline = Instant::now() + within;
+  while child.try_wait().unwrap().is_none() {
+    if Instant::now() >= deadline {
+      let _ = child.kill();
+      let _ = child.wait();
+      return None;
+    }
+    pause();
+  }
+  let out = child.wait_with_output().unwrap();
+  Some((
+    out.status.code().unwrap_or(-1),
+    String::from_utf8_lossy(&out.stdout).into_owned(),
+    String::from_utf8_lossy(&out.stderr).into_owned(),
+  ))
+}
+
+/// §4.16 "Commit" (AUD-11) across processes (found 2026-11-06 by the Linux load rungs on loadtest-scale's
+/// `load_scale.rs`: in a three-server fleet at `f = 1`, a submit to a green was never answered, with one client or
+/// three hundred, and even a CLI `submit` on the owner itself had not returned after 600 s; the owner counted
+/// `merge.inputs_unplaced` every period and `merge.acceptance_resolved` never). The same rule passes in-process with
+/// two or three nodes, one, two or seven shards, local or forwarded. Do: three daemon processes from one manifest at
+/// `f = 1`, formed and bootstrapped as the deployment flow is; on one node a green, a work over it and one edit; then
+/// `submit`. Expect it answered, accepted as version 1, within the fleet wait.
+#[test]
+fn a_submit_in_a_three_process_fleet_is_answered_once_its_record_commits() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the fleet submit: set SLATES_TEST_CLI=1 to run it (three daemons; needs the machine to itself)"
+    );
+    return;
+  }
+  let (scratch, daemons, instances, bootstrap) = bootstrapped_fleet("cli-commit");
+  let owner = &instances[bootstrap];
+  let green = green_once_groups_form(owner);
+  let (code, out, err) = run(owner, &["work", &green, "w"]);
+  assert_eq!(code, 0, "create the work: {err}");
+  let work = value_of(&out, "id");
+  let (code, _, err) = run(owner, &["edit", &work, "f", "0", "0", "hello"]);
+  assert_eq!(code, 0, "declare the edit: {err}");
+  let submitted = run_within(owner, &["submit", &work], FLEET_WAIT);
+  // Each node's merge, content and seal counters as the wait ends, so an unanswered submit names where it waits.
+  let counters = commit_counters(&instances);
+  drop(daemons);
+  drop(scratch);
+  let (code, out, err) = submitted.unwrap_or_else(|| {
+    panic!("the submit was answered within the fleet wait; each node's counters {counters:?}")
+  });
+  assert_eq!(code, 0, "the submit was accepted: {err}");
+  assert_eq!(
+    value_of(&out, "accepted"),
+    "1",
+    "accepted as version 1: {out}"
+  );
 }
 
 // --- T-4.13: the OCI namespace handoff (§4.6 A-9; AC-4.11; RQ-20). ---
@@ -11092,4 +11313,361 @@ fn a_command_whose_output_reader_went_away_fails_without_a_panic() {
     stderr.contains("could not be written"),
     "the failure says why: {stderr}"
   );
+}
+
+/// Shape: how long a refusal of a path on the daemon's own mount may take to come back (A-227): the verb's own work and
+/// one round trip, far under a client's stall deadline, so a daemon waiting on its own mount fails here, not later.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const OWN_MOUNT_ANSWER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether this host runs the own-mount tests (A-227): a real kernel mount the daemon serves, FUSE on Linux and the
+/// loopback NFS mount on macOS; skipped loudly otherwise.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn own_mount_tests_run() -> bool {
+  #[cfg(target_os = "linux")]
+  {
+    linux_fuse_mount_runs()
+  }
+  #[cfg(target_os = "macos")]
+  {
+    if std::env::var_os("SLATES_TEST_CLI").is_none() {
+      eprintln!(
+        "skipping the own-mount flow: set SLATES_TEST_CLI=1 to run it (a real kernel mount)"
+      );
+      return false;
+    }
+    mount_nfs_available()
+  }
+}
+
+/// Mounts volume `id` at `path` the host's way, checked: FUSE on Linux, the loopback NFS mount on macOS.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn own_mount_and_check(instance: &str, id: &str, path: &str) {
+  #[cfg(target_os = "linux")]
+  fuse_mount_and_check(instance, id, path);
+  #[cfg(target_os = "macos")]
+  mount_and_check(instance, id, path);
+}
+
+/// A-227, the base plane (§4.6: no daemon thread opens a path on a volume the daemon serves). Do: on a one-shard daemon,
+/// mount a volume (FUSE on Linux, NFS on macOS), make a directory in it, and create a second volume with that directory
+/// as its base. Expect: the create refused at once (exit 1, `OwnMount`), nothing created, and the daemon still
+/// answering. Before A-227 the shard opened the base through its own mount and waited on the request only it could
+/// answer.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_base_on_one_of_the_daemons_own_mounts_is_refused_before_any_open() {
+  if !own_mount_tests_run() {
+    return;
+  }
+  let instance = format!("cli-ownbase-{}", std::process::id());
+  let _anchor = start_one_shard_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "outer", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  own_mount_and_check(&instance, &id, &mount.path);
+  let base = format!("{}/project", mount.path);
+  shell(&format!("mkdir {base}"));
+  let created = [
+    "volume",
+    "create",
+    "inner",
+    "--bounded",
+    "8MiB",
+    "--base",
+    &base,
+  ];
+  let Some((code, _, err)) = run_within(&instance, &created, OWN_MOUNT_ANSWER) else {
+    panic!(
+      "the daemon did not answer a base on its own mount within {OWN_MOUNT_ANSWER:?}: it opened the base through \
+       its own mount and waits on itself"
+    );
+  };
+  assert_eq!(
+    code, 1,
+    "a base on the daemon's own mount is refused: {err}"
+  );
+  assert!(
+    err.contains("OwnMount"),
+    "refused as the daemon's own mount: {err}"
+  );
+  let (code, out, err) = run(&instance, &["volume", "list"]);
+  assert_eq!(code, 0, "the daemon still answers: {err}");
+  assert!(!out.contains("inner"), "nothing was created: {out}");
+}
+
+/// A-227, a landing's target (§4.6: no daemon thread opens a path on a volume the daemon serves). Do: on a one-shard
+/// daemon, mount a volume (FUSE on Linux, NFS on macOS), make a directory in it, and present a landing of a second
+/// volume into that directory. Expect: refused at once (exit 1, `OwnMount`), the directory untouched, and the daemon
+/// still answering. Before A-227 the shard walked the target through its own mount and waited on itself.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_landing_target_on_one_of_the_daemons_own_mounts_is_refused_before_any_open() {
+  if !own_mount_tests_run() {
+    return;
+  }
+  let instance = format!("cli-ownland-{}", std::process::id());
+  let _anchor = start_one_shard_anchor(&instance);
+  let created = |name: &str| {
+    let (code, out, err) = run(&instance, &["volume", "create", name, "--bounded", "8MiB"]);
+    assert_eq!(code, 0, "{err}");
+    value_of(&out, "id")
+  };
+  let mounted = created("mounted");
+  let landed = created("landed");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  own_mount_and_check(&instance, &mounted, &mount.path);
+  let target = format!("{}/target", mount.path);
+  shell(&format!("mkdir {target}"));
+  let landing = ["land", &landed, &target, "--json"];
+  let Some((code, out, err)) = run_within(&instance, &landing, OWN_MOUNT_ANSWER) else {
+    panic!(
+      "the daemon did not answer a landing target on its own mount within {OWN_MOUNT_ANSWER:?}: it walked the \
+       target through its own mount and waits on itself"
+    );
+  };
+  assert_eq!(
+    code, 1,
+    "a landing target on the daemon's own mount is refused: {err} {out}"
+  );
+  assert!(
+    err.contains("OwnMount"),
+    "refused as the daemon's own mount: {err}"
+  );
+  assert_eq!(
+    std::fs::read_dir(&target).unwrap().count(),
+    0,
+    "the target is untouched"
+  );
+  let (code, _, err) = run(&instance, &["volume", "list"]);
+  assert_eq!(code, 0, "the daemon still answers: {err}");
+}
+
+/// A-227, a FUSE mount point (§4.6: no daemon thread opens a path on a volume the daemon serves). Do: on a one-shard
+/// daemon, mount a volume through FUSE, make a directory in it, and mount a second volume at that directory. Expect:
+/// refused at once (exit 1, `OwnMount`), nothing mounted there, and the daemon still answering. Before A-227 the
+/// shard's mount-point check stat'ed the directory through its own mount and waited on itself.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_fuse_mount_point_on_one_of_the_daemons_own_mounts_is_refused_before_any_open() {
+  if !linux_fuse_mount_runs() {
+    return;
+  }
+  let instance = format!("cli-ownpoint-{}", std::process::id());
+  let _anchor = start_one_shard_anchor(&instance);
+  let created = |name: &str| {
+    let (code, out, err) = run(&instance, &["volume", "create", name, "--bounded", "8MiB"]);
+    assert_eq!(code, 0, "{err}");
+    value_of(&out, "id")
+  };
+  let outer = created("outer");
+  let inner = created("inner");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &outer, &mount.path);
+  let point = format!("{}/nested", mount.path);
+  shell(&format!("mkdir {point}"));
+  let nested = ["mount", &inner, &point];
+  let Some((code, out, err)) = run_within(&instance, &nested, OWN_MOUNT_ANSWER) else {
+    panic!(
+      "the daemon did not answer a mount point on its own mount within {OWN_MOUNT_ANSWER:?}: it stat'ed the point \
+       through its own mount and waits on itself"
+    );
+  };
+  assert_eq!(
+    code, 1,
+    "a mount point on the daemon's own mount is refused: {err} {out}"
+  );
+  assert!(
+    err.contains("OwnMount"),
+    "refused as the daemon's own mount: {err}"
+  );
+  assert!(mountinfo_at(&point).is_none(), "nothing is mounted there");
+  let (code, _, err) = run(&instance, &["volume", "list"]);
+  assert_eq!(code, 0, "the daemon still answers: {err}");
+}
+
+/// Format: the signal that ends the instance's daemon with its kernel mounts kept for a successor. macOS: `SIGTERM`, an
+/// orderly stop (the daemon drains and exits; the anchor holds the NFS mount's connections, A-113), since no daemon is
+/// killed under a macOS kernel mount. Linux: `SIGKILL`, since a daemon stopped in order ends its FUSE connections (its
+/// mounts then answer `ENOTCONN`) and the anchor holds a FUSE device only across a daemon that did not end it (A-61).
+#[cfg(target_os = "macos")]
+const KEEPING_SIGNAL: &str = "-TERM";
+#[cfg(target_os = "linux")]
+const KEEPING_SIGNAL: &str = "-KILL";
+
+/// Ends the instance's daemon with its kernel mounts kept ([`KEEPING_SIGNAL`]), returning its pid; the anchor starts a
+/// successor.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn end_keeping_mounts(instance: &str) -> u32 {
+  let ended = daemon_pid(instance).expect("the daemon answers");
+  assert!(
+    Command::new("kill")
+      .args([KEEPING_SIGNAL, &ended.to_string()])
+      .status()
+      .unwrap()
+      .success(),
+    "{KEEPING_SIGNAL} sent"
+  );
+  ended
+}
+
+/// [`end_keeping_mounts`], then the anchor's successor's pid once it answers.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn restart_keeping_mounts(instance: &str) -> u32 {
+  let ended = end_keeping_mounts(instance);
+  await_daemon(instance, Some(ended), &[])
+}
+
+/// A-227, a restart (§4.6: no daemon thread opens a path on a volume the daemon serves, its predecessor's mounts
+/// included). Do: on a one-shard daemon, mount a volume (FUSE on Linux, NFS on macOS) and make a directory in it; end
+/// the daemon with the mount kept ([`KEEPING_SIGNAL`]: an orderly stop on macOS) and wait for the anchor's successor;
+/// then create a second volume with that directory as its base. Expect: refused at once as the daemon's own mount (exit 1, `OwnMount`): the successor
+/// learned the mount it kept from its catalog before it served. Then the mount still serves, and the daemon answers.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_base_on_a_mount_the_daemon_kept_across_a_restart_is_refused_by_kind() {
+  if !own_mount_tests_run() {
+    return;
+  }
+  let instance = format!("cli-ownkept-{}", std::process::id());
+  let _anchor = start_one_shard_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "kept", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  own_mount_and_check(&instance, &id, &mount.path);
+  let base = format!("{}/project", mount.path);
+  shell(&format!("mkdir {base}"));
+  restart_keeping_mounts(&instance);
+  let created = [
+    "volume",
+    "create",
+    "inner",
+    "--bounded",
+    "8MiB",
+    "--base",
+    &base,
+  ];
+  let Some((code, _, err)) = run_within(&instance, &created, OWN_MOUNT_ANSWER) else {
+    panic!(
+      "the successor did not answer a base on the mount it kept within {OWN_MOUNT_ANSWER:?}: it opened the base \
+       through its own mount and waits on itself"
+    );
+  };
+  assert_eq!(code, 1, "a base on the kept mount is refused: {err}");
+  assert!(
+    err.contains("OwnMount"),
+    "refused as the daemon's own mount: {err}"
+  );
+  assert_eq!(
+    shell(&format!("ls {}", mount.path)).trim(),
+    "project",
+    "the kept mount still serves"
+  );
+  let (code, out, err) = run(&instance, &["volume", "list"]);
+  assert_eq!(code, 0, "the daemon still answers: {err}");
+  assert!(!out.contains("inner"), "nothing was created: {out}");
+}
+
+/// Shape: how long a successor may take to answer after a restart whose recovery meets a kept mount (A-227): its start
+/// and one refusal, the same bound as one answer.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const KEPT_RECOVERY_ANSWER: Duration = OWN_MOUNT_ANSWER;
+
+/// A-227, recovery's reacquire (§4.6, §4.8): a base that a mount of the daemon's own came to cover is never entered when
+/// a successor reacquires it. Do: on a one-shard daemon, create a volume over an empty directory `D/project`, then mount
+/// a second volume over `D` (FUSE on Linux, NFS on macOS) and make `project` in it, so `D/project` is now the mount's;
+/// end the daemon with the mount kept ([`KEEPING_SIGNAL`]). Expect: the successor answers within the bound, the first volume is
+/// not rebuilt and its log names the daemon's own mount, and the mount still serves. Before, the successor's one shard
+/// opened the base through the mount it had yet to serve again and waited on itself.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_base_a_kept_mount_covers_is_not_reacquired_through_it() {
+  if !own_mount_tests_run() {
+    return;
+  }
+  let instance = format!("cli-ownreacq-{}", std::process::id());
+  let (mut anchor, mut stderr) =
+    spawn_anchor_from(env!("CARGO_BIN_EXE_slates"), &instance, &[], ONE_SHARD);
+  await_serving(&mut stderr, &instance, false);
+  let (lines, forwarding) = forward_lines(stderr);
+  anchor.drain = Some(forwarding);
+  await_stable_daemon(&instance, true);
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let base = format!("{}/project", mount.path);
+  shell(&format!("mkdir {base}"));
+  let (code, _, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "covered",
+      "--bounded",
+      "8MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "cover", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let cover = value_of(&out, "id");
+  own_mount_and_check(&instance, &cover, &mount.path);
+  shell(&format!("mkdir {base}"));
+  let stopped = end_keeping_mounts(&instance);
+  let started = Instant::now();
+  let mut log = Vec::new();
+  let refused = loop {
+    while let Ok(line) = lines.try_recv() {
+      log.push(line);
+    }
+    if let Some(line) = log
+      .iter()
+      .find(|line| line.contains("volume covered not rebuilt"))
+    {
+      break line.clone();
+    }
+    assert!(
+      started.elapsed() < START_WAIT + KEPT_RECOVERY_ANSWER,
+      "the successor never finished reacquiring the covered base: it opened it through the mount it kept and waits \
+       on itself"
+    );
+    pause();
+  };
+  assert!(
+    refused.contains("on a mount this daemon serves"),
+    "the covered base is refused as the daemon's own mount: {refused}"
+  );
+  let successor = await_daemon(&instance, Some(stopped), &[]);
+  assert_ne!(successor, stopped);
+  assert_eq!(
+    shell(&format!("ls {}", mount.path)).trim(),
+    "project",
+    "the kept mount still serves"
+  );
+  // The covered directory beneath the mount point, removed once the mount is gone, then the point itself.
+  let point = mount.path.clone();
+  drop(mount);
+  let _ = Command::new("rmdir").arg(&base).output();
+  let _ = Command::new("rmdir").arg(&point).output();
 }

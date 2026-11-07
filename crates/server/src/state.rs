@@ -410,6 +410,16 @@ pub struct ShardState {
   /// by the partition's attachment cap: one entry per live FUSE attachment at most.
   #[cfg(target_os = "linux")]
   pub(crate) fuse_mounts: crate::fuse::FuseMounts,
+  /// The FUSE mounts a predecessor kept that this shard's catalog names, recorded as this daemon's own as the shard
+  /// starts, before any base or landing is served (A-227); each is taken by its mount's adoption (`crate::fuse`), and
+  /// what no adoption takes is let go once adoption ends. Bounded by the partition's attachment cap.
+  #[cfg(target_os = "linux")]
+  pub(crate) learned_fuse: BTreeMap<u64, crate::fuse::OwnMountRecord>,
+  /// The macOS NFS mounts this shard's attachments are bound to, recorded as this daemon's own (A-227,
+  /// `crate::own_nfs`): bound by the CLI or learned at the shard's start, each let go with its attachment. Bounded by
+  /// the partition's attachment cap.
+  #[cfg(target_os = "macos")]
+  pub(crate) own_nfs_mounts: BTreeMap<u64, crate::own_nfs::OwnNfsMount>,
   /// The Windows WinFsp mounts this shard serves, by attachment (§4.6 "Windows"; `crate::winfsp`). Bounded by the
   /// partition's attachment cap: one entry per live WinFsp attachment at most.
   #[cfg(windows)]
@@ -641,6 +651,8 @@ pub struct ShardState {
   pub nfs_service: crate::nfs::ServiceTimes,
   /// The NFSv4.1 back channels of the connections this shard serves (`crate::callback`).
   pub(crate) callbacks: crate::callback::Callbacks,
+  /// The forwards to each peer, multiplexed over its record session (`crate::forward_lane`; the control shard's).
+  pub(crate) forward_lanes: crate::forward_lane::ForwardLanes,
   /// The staging buffers of edits too large for one request, for the works this shard owns (`crate::staging`).
   pub(crate) staging: crate::staging::Staging,
   /// This start's random nonce, announced with its derived member id on SWIM contact (§4.8).

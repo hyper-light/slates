@@ -673,3 +673,104 @@ fn a_send_under_local_pressure_waits_for_writability_and_sends_once() {
     "the datagram arrived exactly once"
   );
 }
+
+/// Shape: how long the unreachable-port test waits for the live peer's datagram on loopback, where it takes
+/// microseconds: long enough for a loaded runner, short enough to fail a lost datagram promptly.
+const LIVE_WAIT: Duration = Duration::from_secs(5);
+
+/// Sends to a port nothing listens on from `receiver`, then has a live peer send to `receiver`, and reads until the
+/// peer's datagram comes: every read must be a datagram or nothing waiting, never an error.
+fn receive_after_an_unreachable_send(receiver: &UdpSocket) -> Result<Vec<u8>, String> {
+  let closed = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+  let closed_port = closed.local_addr().unwrap().port();
+  drop(closed);
+  receiver
+    .send_to(
+      b"to nobody",
+      SocketAddrV4::new(Ipv4Addr::LOCALHOST, closed_port),
+    )
+    .map_err(|e| format!("the send to the closed port was refused: {e}"))?;
+  let peer = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+  let to = receiver.local_addr().unwrap();
+  peer.send_to(b"live", to).unwrap();
+  let started = std::time::Instant::now();
+  let mut buf = [0u8; 64];
+  while started.elapsed() < LIVE_WAIT {
+    match receiver.try_recv_from(&mut buf) {
+      Ok(Some((n, _))) => return Ok(buf[..n].to_vec()),
+      Ok(None) => std::thread::yield_now(),
+      Err(e) => {
+        return Err(format!("a read after the unreachable send failed: {e}"));
+      }
+    }
+  }
+  Err(format!(
+    "the live peer's datagram did not come within {LIVE_WAIT:?}"
+  ))
+}
+
+/// §4.10a, the fleet's handshakes (conformance run 42150662467, windows-latest: a three-node fleet never formed in
+/// 40 s, its nodes probing one or two peers after a handshake's `recvfrom` failed with WSAECONNRESET, 10054). Do send
+/// from a socket to a closed port, then send to that socket from a live peer, and read. Expect the peer's datagram
+/// whole and no read refused, for a socket the runtime bound and one it adopted. On Windows the ICMP port-unreachable
+/// the closed port answers surfaces as WSAECONNRESET on the socket's next `recvfrom` unless `SIO_UDP_CONNRESET` is off
+/// (Microsoft Learn, "WSAIoctl", `SIO_UDP_CONNRESET`); Linux and macOS report no ICMP error to an unconnected socket.
+#[test]
+fn a_socket_that_sent_to_a_closed_port_still_receives_from_a_live_peer() {
+  let bound = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+  assert_eq!(
+    receive_after_an_unreachable_send(&bound).as_deref(),
+    Ok(&b"live"[..]),
+    "a bound socket"
+  );
+  let held = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+  let adopted = UdpSocket::adopt(held.into()).unwrap();
+  assert_eq!(
+    receive_after_an_unreachable_send(&adopted).as_deref(),
+    Ok(&b"live"[..]),
+    "an adopted socket"
+  );
+}
+
+/// §4.10a, the receive loops' rule (2026-11-07). Do: make a datagram socket unreadable for good under the runtime —
+/// on Unix replace its descriptor with a pipe's, so it is no socket; on Windows shut it down for receiving — and read
+/// it. Expect a refusal that names the socket gone (`RtError::receive_refusal`), the one kind a receive loop ends on.
+#[test]
+fn a_receive_on_a_socket_that_is_gone_names_it_gone() {
+  let held = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+  #[cfg(unix)]
+  let socket = {
+    use std::os::fd::AsRawFd;
+    let fd = held.as_raw_fd();
+    let socket = UdpSocket::adopt(held.into()).unwrap();
+    let mut ends = [0i32; 2];
+    // SAFETY: `ends` is this frame's own pair of ints, written by the call.
+    assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+    // SAFETY: `fd` is the adopted socket's descriptor, open for the socket's life; replacing it with the pipe's read
+    // end is the test's point, and the adopted socket closes the pipe end it then holds when it drops.
+    assert_eq!(unsafe { libc::dup2(ends[0], fd) }, fd);
+    // SAFETY: the pipe's two original ends, this test's own, closed once.
+    unsafe {
+      libc::close(ends[0]);
+      libc::close(ends[1]);
+    }
+    socket
+  };
+  #[cfg(windows)]
+  let socket = {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{SD_RECEIVE, shutdown};
+    let raw = usize::try_from(held.as_raw_socket()).unwrap();
+    // SAFETY: the held socket's own handle, live for the call.
+    let shut = unsafe { shutdown(raw, SD_RECEIVE) };
+    assert_eq!(shut, 0);
+    UdpSocket::adopt(held.into()).unwrap()
+  };
+  let mut buf = [0u8; 16];
+  let refusal = socket.try_recv_from(&mut buf).unwrap_err();
+  assert_eq!(
+    refusal.receive_refusal(),
+    slates_rt::error::ReceiveRefusal::SocketGone,
+    "{refusal}"
+  );
+}

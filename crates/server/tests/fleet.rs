@@ -2845,6 +2845,28 @@ fn start_mesh_with(
     slates_db::register::RegionId,
   >,
 ) -> Vec<Daemon> {
+  let daemons = start_mesh_unsettled(nodes, hosts, certs, serve, f, shards, regions, mirrors);
+  settle_initial_consensus(&daemons, hosts, regions, Quorum { f });
+  daemons
+}
+
+/// [`start_mesh_with`] up to and including the explicit bootstrap, without waiting for the initial membership to
+/// commit: what an operator's deployment does (bootstrap, then use), so a test can act while the groups are still
+/// forming.
+#[allow(clippy::too_many_arguments)]
+fn start_mesh_unsettled(
+  nodes: Vec<(MachineProfile, HostId, Identity)>,
+  hosts: &[HostId],
+  certs: &[rustls::pki_types::CertificateDer<'static>],
+  serve: &[(u16, u16)],
+  f: u32,
+  shards: u16,
+  regions: &std::collections::BTreeMap<HostId, slates_db::register::RegionId>,
+  mirrors: &std::collections::BTreeMap<
+    slates_db::register::RegionId,
+    slates_db::register::RegionId,
+  >,
+) -> Vec<Daemon> {
   let pid = std::process::id();
   let n = hosts.len();
   // Each node's stable anchor (the machine-identity hash its member ids derive from, task #22), so every
@@ -2901,7 +2923,6 @@ fn start_mesh_with(
     })
     .collect();
   bootstrap_mesh(&daemons, hosts, regions);
-  settle_initial_consensus(&daemons, hosts, regions, Quorum { f });
   daemons
 }
 
@@ -5027,6 +5048,139 @@ fn a_forward_waits_for_the_owners_session_while_it_is_out() {
     counters.get("fleet.forward.session_never_returned"),
     None,
     "no forward outlived its deadline: {counters:?}"
+  );
+}
+
+/// Shape: how long [`forwards_to_one_owner_never_wait_behind_each_other`] holds the owner's non-control shard: half
+/// a liveness budget, so the forward of a read there waits that long inside its own one-budget bound, and a forward
+/// that waited behind it is told from one that did not by hundreds of milliseconds.
+const OWNER_SHARD_HOLD: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS / 2);
+/// Shape: how long after the slow forward is sent the fast one goes: a tenth of the hold, so the slow one has
+/// reached the owner and is waiting on its held shard.
+const SLOW_FORWARD_LEAD: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS / 20);
+/// Shape: the volumes made while looking for one a given shard of two owns; a run that finds none in this many is a
+/// fault of the placement, not luck.
+const PLACEMENT_TRIES: usize = 64;
+/// Raised by the owner's held shard when its hold begins.
+static OWNER_SHARD_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A volume created through `client` that the daemon's shard at `partition` owns.
+fn volume_owned_by(client: &mut Client, partition: usize, tag: &str) -> VolumeId {
+  for attempt in 0..PLACEMENT_TRIES {
+    let ReplyBody::Created { id } = client.call(&scratch(&format!("{tag}-{attempt}"))) else {
+      panic!("create {tag}-{attempt}")
+    };
+    if usize::from(slates_server::verbs::owner_of(id)) == partition {
+      return id;
+    }
+  }
+  panic!("no volume of {PLACEMENT_TRIES} landed on partition {partition}");
+}
+
+/// The network load test's fault one (GAPS, "The many-client load test over the network": a forwarded `CreateWork`
+/// p50 1.71 s at 300 clients and 4.30 s at 1,000, against 45 µs on the owner's own node). §4.8 "Lookup", §4.10. Do:
+/// three nodes, each its own region, two shards each. On a, create two volumes, `slow` owned by a's non-control
+/// shard and `fast` by its control shard. Through two clients of b read each once, so b routes both to a. Then hold
+/// a's non-control shard for half a liveness budget. Inside the hold, read `slow` through the first client of b; a
+/// tenth of the hold later, read `fast` through the second. Expect: both are served, and `fast` answers in under a
+/// quarter of the hold, since nothing it needs is held. Forwards to one owner share the origin's one session to
+/// it, and a forward that borrowed that session for its whole round trip, while the owner served one forward at a
+/// time a session, made every forward behind it wait for it.
+#[test]
+fn forwards_to_one_owner_never_wait_behind_each_other() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let regions: std::collections::BTreeMap<HostId, RegionId> = hosts
+    .iter()
+    .enumerate()
+    .map(|(index, host)| (*host, RegionId(u64::try_from(index).unwrap())))
+    .collect();
+  let daemons = start_mesh_with(
+    nodes,
+    &hosts,
+    &certs,
+    &serve,
+    1,
+    2,
+    &regions,
+    &std::collections::BTreeMap::new(),
+  );
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut client_a = Client::connect(daemons[0].instance());
+  let slow = volume_owned_by(&mut client_a, 1, "slow");
+  let fast = volume_owned_by(&mut client_a, 0, "fast");
+  let mut slow_client = Client::connect(daemons[1].instance());
+  let mut fast_client = Client::connect(daemons[1].instance());
+  let (slow_routed, slow_last) =
+    poll_status_served(&daemons, &mut slow_client, slow, COUNCIL_RETIRE_DEADLINE);
+  let (fast_routed, fast_last) =
+    poll_status_served(&daemons, &mut fast_client, fast, COUNCIL_RETIRE_DEADLINE);
+  let measured = (slow_routed && fast_routed).then(|| {
+    OWNER_SHARD_HELD.store(false, std::sync::atomic::Ordering::Release);
+    let hold = daemons[0]
+      .observation(
+        Some(daemons[0].shards()[1]),
+        slates_server::daemon::OBSERVE_BUDGET_NS,
+        |_: &mut slates_server::state::ShardState| {
+          OWNER_SHARD_HELD.store(true, std::sync::atomic::Ordering::Release);
+          // The held shard's thread runs nothing else for the hold: the read of `slow` waits there.
+          #[allow(clippy::disallowed_methods)]
+          std::thread::sleep(OWNER_SHARD_HOLD);
+        },
+      )
+      .unwrap();
+    let holder = std::thread::spawn(move || hold.wait());
+    let began = Instant::now();
+    while !OWNER_SHARD_HELD.load(std::sync::atomic::Ordering::Acquire) {
+      assert!(began.elapsed() < OWNER_SHARD_HOLD, "the hold began");
+      std::thread::yield_now();
+    }
+    let slow_read = std::thread::spawn(move || {
+      let reply = slow_client.call(&RequestBody::Status { volume: slow });
+      (reply, slow_client)
+    });
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(SLOW_FORWARD_LEAD);
+    let sent = Instant::now();
+    let fast_reply = fast_client.call(&RequestBody::Status { volume: fast });
+    let fast_took = sent.elapsed();
+    let (slow_reply, _) = slow_read.join().unwrap();
+    holder.join().unwrap().unwrap();
+    (fast_reply, fast_took, slow_reply)
+  });
+  let counters = daemons[1].fleet_refusals();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  let (fast_reply, fast_took, slow_reply) = measured.unwrap_or_else(|| {
+    panic!("b routed both reads to a before the hold (last replies: {slow_last:?}, {fast_last:?})")
+  });
+  eprintln!(
+    "the forward of a read on a free shard took {fast_took:?} while another forward to its owner waited out a \
+     {OWNER_SHARD_HOLD:?} hold; b's fleet counters {counters:?}"
+  );
+  assert!(
+    matches!(slow_reply, ReplyBody::Status { .. }),
+    "the read on the held shard is served once the hold ends: {slow_reply:?}"
+  );
+  assert!(
+    matches!(fast_reply, ReplyBody::Status { .. }),
+    "the read on the free shard is served: {fast_reply:?}"
+  );
+  assert!(
+    fast_took < OWNER_SHARD_HOLD / 4,
+    "the forward of a read on a free shard took {fast_took:?}, waiting behind another forward to the same owner \
+     ({OWNER_SHARD_HOLD:?} hold)"
   );
 }
 
@@ -10939,6 +11093,350 @@ fn a_submit_is_answered_only_once_its_record_commits_at_the_quorum() {
   assert_commit_gate(&gate);
 }
 
+/// §4.16 "Commit" (AUD-11) with D-7's one owning shard per volume (found 2026-11-06 by the Linux load rungs: in a
+/// three-server fleet of seven-shard daemons at `f = 1`, no submit to a green was ever answered; the green's owner
+/// counted `merge.acceptance_deferred` 30 and `merge.inputs_unplaced` 591 in 60 s, and `merge.acceptance_resolved`
+/// never). Do: in a two-node `f = 1` fleet of two-shard daemons, a green whose name routes to the shard that is not the
+/// control shard, a work over it with one edit, and a submit. Expect the submit accepted as version 1, the version's
+/// record placed at the quorum and the acceptance resolved, as on the control shard
+/// ([`a_submit_is_answered_only_once_its_record_commits_at_the_quorum`] runs there).
+#[test]
+fn a_submit_to_a_green_on_a_non_control_shard_is_answered_once_its_record_commits() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
+  let a = node("a", pa_probe, pa_record);
+  let b = node("b", pb_probe, pb_record);
+  let pid = std::process::id();
+  let instance_a = format!("fleet-{}-{pid}", a.host.0);
+  let peer_of_a = Peer {
+    anchor: b.origin_anchor,
+    host: b.host,
+    address: b.address,
+    record_address: b.record_address,
+    certificate: b.identity.certificate(),
+  };
+  let peer_of_b = Peer {
+    anchor: a.origin_anchor,
+    host: a.host,
+    address: a.address,
+    record_address: a.record_address,
+    certificate: a.identity.certificate(),
+  };
+  let daemon_a = start_sharded(a, peer_of_a, TWO_SHARDS);
+  let daemon_b = start_sharded(b, peer_of_b, TWO_SHARDS);
+  assert!(
+    form_and_settle(&[&daemon_a, &daemon_b]),
+    "the fleet's groups formed before the test acts"
+  );
+  let mut client = Client::connect(&instance_a);
+  let name = name_on_partition("green", OTHER_PARTITION, usize::from(TWO_SHARDS));
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name,
+    require_evidence: false,
+    base: None,
+  }) else {
+    daemon_a.stop();
+    daemon_b.stop();
+    panic!("create green");
+  };
+  let on_other_shard = slates_server::verbs::owner_of(green) == OTHER_PARTITION;
+  let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
+    green,
+    name: "work".to_owned(),
+  }) else {
+    daemon_a.stop();
+    daemon_b.stop();
+    panic!("create work");
+  };
+  let edited = client.call(&RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  let submitted = client.call(&RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  });
+  let placed = daemon_a.merge_record_placed(green, 1);
+  let counters = daemon_a.fleet_refusals().map(|counters| {
+    counters
+      .into_iter()
+      .filter(|(name, _)| name.starts_with("merge."))
+      .collect::<Vec<_>>()
+  });
+  daemon_a.stop();
+  daemon_b.stop();
+  assert!(
+    on_other_shard,
+    "the green is on the shard that is not the control shard"
+  );
+  assert!(
+    matches!(edited, ReplyBody::Edited),
+    "the edit was declared: {edited:?}"
+  );
+  assert_eq!(
+    submitted,
+    ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    },
+    "the submit is accepted once its record commits; the record placed {placed:?}; the owner's merge counters \
+     {counters:?}"
+  );
+}
+
+/// §4.16 "Commit" (AUD-11) under a forming configuration (the bug record of 2026-11-06: in a deployed three-server
+/// fleet no submit was ever answered). The bootstrap gives the bootstrapping node a one-voter council and installs its
+/// one-candidate placement at once, so a green made and submitted to there before the council grows enqueued its merge
+/// records with the owner alone as candidate; the placement at `f = 1` needs two, and nothing re-targeted the pending
+/// records when the council's later configurations were installed. Do: start three nodes at `f = 1`, bootstrap without
+/// waiting for the initial membership, and on the bootstrapper create a green, a work over it with one edit, and submit.
+/// Expect the submit answered, accepted as version 1, within the fixture's wait: the pending records follow the
+/// configuration the owner holds now, as head records do.
+#[test]
+fn a_submit_made_while_the_council_forms_is_answered_once_its_record_commits() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<_> = names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<_> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<_> = nodes
+    .iter()
+    .map(|(_, _, identity)| identity.certificate())
+    .collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let no_regions = std::collections::BTreeMap::new();
+  let daemons = start_mesh_unsettled(
+    nodes,
+    &hosts,
+    &certs,
+    &serve,
+    1,
+    1,
+    &no_regions,
+    &std::collections::BTreeMap::new(),
+  );
+  let mut client = Client::connect(daemons[0].instance());
+  // Only the readiness refusal is retried: the bootstrapper serves writes once its root and council exist.
+  let mut created = ReplyBody::Refused {
+    refusal: Refusal::ConsensusNotInitialized,
+  };
+  let made = audit_wait(|| {
+    created = client.call(&RequestBody::CreateGreen {
+      name: "green".to_owned(),
+      require_evidence: false,
+      base: None,
+    });
+    Ok(!matches!(
+      created,
+      ReplyBody::Refused {
+        refusal: Refusal::ConsensusNotInitialized
+      }
+    ))
+  });
+  let ReplyBody::GreenCreated { id: green } = created else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("the green was created ({made}): {created:?}");
+  };
+  let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
+    green,
+    name: "work".to_owned(),
+  }) else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("create work");
+  };
+  let edited = client.call(&RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  // The fixture's whole formation wait: a commit that is going to place has long placed by then.
+  let submitted = client
+    .try_call(
+      &RequestBody::Submit {
+        work,
+        evidence: Vec::new(),
+      },
+      u64::try_from(formation_deadline().as_nanos()).unwrap_or(u64::MAX),
+    )
+    .ok();
+  let answered = submitted.is_some();
+  let placed = daemons[0].merge_record_placed(green, 1);
+  let awaiting = daemons[0].merge_awaiting(green);
+  // Each node's merge, content and record counters, so a submit still waiting names what holds it.
+  let counters: Vec<_> = daemons
+    .iter()
+    .map(|daemon| {
+      daemon.fleet_refusals().map(|counters| {
+        counters
+          .into_iter()
+          .filter(|(name, _)| {
+            [
+              "merge.",
+              "fleet.content",
+              "content.refused",
+              "fleet.record",
+              "fleet.seal",
+            ]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+          })
+          .collect::<Vec<_>>()
+      })
+    })
+    .collect();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(matches!(edited, ReplyBody::Edited), "the edit: {edited:?}");
+  assert!(
+    answered,
+    "the submit was answered once its record committed; the record placed {placed:?}, submits awaiting {awaiting:?}; \
+     each node's counters {counters:?}"
+  );
+  assert_eq!(
+    submitted,
+    Some(ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    }),
+    "accepted as version 1"
+  );
+}
+
+/// §4.16 "Commit" (AUD-11) at the speed of the exchange, not the coordinator's period (goal 4's Linux rungs,
+/// 2026-11-06: at 1,000 clients against three servers at `f = 1` every accepted submit was answered `Overloaded`, its
+/// version committed, and one submit at a time took 159 to 670 ms on an idle fleet). A version's inputs were put at one
+/// coordinator period and its record shipped at the next, so every answer waited out at least one period. Do: on a
+/// settled three-node fleet at `f = 1`, submit twenty works over one green one after another, timing each submit. Expect
+/// every submit accepted, each as the next version, and the median answered within one coordinator period
+/// ([`HEARTBEAT_NS`]): an accepted version wakes the record plane, which ships it as soon as its inputs place.
+#[test]
+fn a_submit_at_f1_is_answered_without_waiting_for_the_coordinators_period() {
+  /// Shape: submits timed, one after another; enough for the median to be one submit's answer, not a lucky one.
+  const SUBMITS: u64 = 20;
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<_> = names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<_> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<_> = nodes
+    .iter()
+    .map(|(_, _, identity)| identity.certificate())
+    .collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 1);
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("create green");
+  };
+  let answers = timed_submits(&mut client, green, SUBMITS);
+  let counters = merge_and_content_counters(&daemons);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  for (index, edited, submitted, _) in &answers {
+    assert!(
+      matches!(edited, ReplyBody::Edited),
+      "edit {index} was declared: {edited:?}"
+    );
+    assert_eq!(
+      *submitted,
+      ReplyBody::Submitted {
+        version: Some(index + 1),
+        conflicts: Vec::new(),
+      },
+      "submit {index} is accepted as the next version"
+    );
+  }
+  let mut waits: Vec<Duration> = answers.iter().map(|(_, _, _, waited)| *waited).collect();
+  waits.sort();
+  let median = waits.get(waits.len() / 2).copied().unwrap_or(Duration::MAX);
+  eprintln!(
+    "submit answers at f = 1: median {median:?}, every answer {waits:?}; counters {counters:?}"
+  );
+  let unheld: u64 = counters
+    .iter()
+    .flatten()
+    .filter(|(name, _)| name == "merge.inputs_unheld")
+    .map(|(_, count)| count)
+    .sum();
+  assert_eq!(
+    unheld, 0,
+    "no holder refused a record for want of inputs it was counted holding: {counters:?}"
+  );
+  assert!(
+    median < Duration::from_nanos(HEARTBEAT_NS),
+    "the median submit is answered within one coordinator period ({} ms): median {median:?}, every answer {waits:?}",
+    HEARTBEAT_NS / 1_000_000
+  );
+}
+
+/// `count` works over `green`, each with one edit declared and then submitted, one after another: each work's index,
+/// its edit's reply, its submit's reply and how long the submit took to answer.
+fn timed_submits(
+  client: &mut Client,
+  green: VolumeId,
+  count: u64,
+) -> Vec<(u64, ReplyBody, ReplyBody, Duration)> {
+  let mut answers = Vec::new();
+  for index in 0..count {
+    let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
+      green,
+      name: format!("work-{index}"),
+    }) else {
+      panic!("create work {index}");
+    };
+    let edited = client.call(&RequestBody::Edit {
+      work,
+      path: format!("file-{index}"),
+      at: 0,
+      delete_len: 0,
+      bytes: b"hello".to_vec(),
+    });
+    let started = Instant::now();
+    let submitted = client.call(&RequestBody::Submit {
+      work,
+      evidence: Vec::new(),
+    });
+    answers.push((index, edited, submitted, started.elapsed()));
+  }
+  answers
+}
+
+/// Each node's merge and content-exchange counters. A holder refuses a record for want of inputs it was counted
+/// holding only if a later version's put made it let them go.
+fn merge_and_content_counters(daemons: &[Daemon]) -> Vec<Vec<(String, u64)>> {
+  daemons
+    .iter()
+    .map(|daemon| {
+      daemon
+        .fleet_refusals()
+        .map(|counters| {
+          counters
+            .into_iter()
+            .filter(|(name, _)| name.starts_with("merge.") || name.starts_with("fleet.content."))
+            .map(|(name, count)| (name.to_owned(), count))
+            .collect()
+        })
+        .unwrap_or_default()
+    })
+    .collect()
+}
+
 /// A green, a work over it with one edit declared, and the submit request that would advance it.
 fn edited_work_to_submit(client: &mut Client) -> (VolumeId, RequestBody) {
   let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
@@ -13416,5 +13914,139 @@ fn a_settled_fleet_admits_a_create_on_every_node() {
       .iter()
       .all(|reply| matches!(reply, ReplyBody::Created { .. })),
     "every node of the settled fleet admits a create: {replies:?}"
+  );
+}
+
+/// Shape: how long the owner's shard is kept in one starved poll: a window and a half, so an answer behind it comes past
+/// a wall window.
+const STARVED_OWNER: Duration = Duration::from_millis(1_500);
+/// Shape: the starved poll's time on the CPU and off it in each turn: a fifth of the time on it, as a thread kept off
+/// its core by spinners runs.
+const STARVED_BURST: Duration = Duration::from_millis(10);
+const STARVED_OFF: Duration = Duration::from_millis(40);
+/// Shape: the volumes created on node a while looking for one its second shard owns; with two shards a run that finds
+/// none in this many is a fault of the placement, not luck.
+const OWNER_TRIES: usize = 48;
+
+/// R3 class A, the forwarded verbs (`verbs.rs` `serve_forward`: the forwarded read's call from the control shard to the
+/// volume's owner shard), A-65, §4.3, §4.8. Do: three daemons of two shards, each its own region; create a volume node
+/// a's second shard owns; from a client on node b, read its `Status` until the forward path is up, then read it again
+/// while node a's second shard runs one starved poll for a window and a half (on the CPU a fifth of the time). Expect:
+/// the read is served, after more than a wall window. On main node a's control shard gave up on its owner shard at the
+/// wall second and answered `NotFound`: a live volume reported missing across the fleet.
+#[test]
+fn a_forwarded_read_whose_owner_shard_is_starved_is_served_past_a_wall_window() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let regions: std::collections::BTreeMap<HostId, RegionId> = [
+    (hosts[0], RegionId(0)),
+    (hosts[1], RegionId(1)),
+    (hosts[2], RegionId(2)),
+  ]
+  .into_iter()
+  .collect();
+  let daemons = start_mesh_with(
+    nodes,
+    &hosts,
+    &certs,
+    &serve,
+    1,
+    2,
+    &regions,
+    &std::collections::BTreeMap::new(),
+  );
+  let instances: Vec<String> = daemons
+    .iter()
+    .map(|daemon| daemon.instance().to_owned())
+    .collect();
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  let mut client_a = Client::connect(&instances[0].clone());
+  let id = (0..OWNER_TRIES)
+    .find_map(
+      |attempt| match client_a.call(&scratch(&format!("starved-owner-{attempt}"))) {
+        ReplyBody::Created { id } if slates_server::verbs::owner_of(id) == 1 => Some(id),
+        _ => None,
+      },
+    )
+    .expect("a volume node a's second shard owns");
+  let mut client_b = Client::connect(&instances[1].clone());
+  let ready = poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    COUNCIL_RETIRE_DEADLINE,
+    || {
+      Ok(matches!(
+        client_b.call(&RequestBody::Status { volume: id }),
+        ReplyBody::Status { .. }
+      ))
+    },
+  );
+  assert!(ready, "b's cross-region forward path to region 0 came up");
+
+  let begun = &*Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false)));
+  let owner_shard = daemons[0].shards()[1];
+  let starver = daemons[0]
+    .observation(
+      Some(owner_shard),
+      10 * LIVENESS_BUDGET_NS,
+      move |_: &mut slates_server::state::ShardState| {
+        begun.store(true, std::sync::atomic::Ordering::Release);
+        let started = Instant::now();
+        while started.elapsed() < STARVED_OWNER {
+          let burst = Instant::now();
+          while burst.elapsed() < STARVED_BURST {
+            std::hint::spin_loop();
+          }
+          let (_hold, rx) = std::sync::mpsc::channel::<()>();
+          let _ = rx.recv_timeout(STARVED_OFF);
+        }
+      },
+    )
+    .unwrap();
+  let starving = std::thread::spawn(move || {
+    let _ = starver.wait();
+  });
+  let began = Instant::now();
+  while !begun.load(std::sync::atomic::Ordering::Acquire) {
+    assert!(
+      began.elapsed() < COUNCIL_RETIRE_DEADLINE,
+      "the starved poll began"
+    );
+    std::thread::yield_now();
+  }
+  let started = Instant::now();
+  let reply = client_b.try_call(&RequestBody::Status { volume: id }, 10 * LIVENESS_BUDGET_NS);
+  let took = started.elapsed();
+  starving.join().unwrap();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  let served = matches!(reply, Ok(ReplyBody::Status { .. }));
+  println!(
+    "a forwarded read with its owner shard starved: {} after {took:?}",
+    if served {
+      "served".to_owned()
+    } else {
+      format!("{reply:?}")
+    }
+  );
+  assert!(
+    took > Duration::from_nanos(LIVENESS_BUDGET_NS),
+    "the answer came past a wall window ({took:?}), so the test is not vacuous"
+  );
+  assert!(
+    served,
+    "a starved owner shard's forwarded read was lost after {took:?}: {reply:?}"
   );
 }

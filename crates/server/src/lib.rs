@@ -56,11 +56,15 @@ pub mod dns;
 pub mod doorbell;
 pub mod error;
 pub mod fleet;
+mod forward_lane;
 mod fs_verbs;
 #[cfg(target_os = "linux")]
 mod fuse;
 #[cfg(target_os = "linux")]
 mod fuse_hold;
+// The macOS NFS mounts this daemon serves, recorded as its own (A-227).
+#[cfg(target_os = "macos")]
+mod own_nfs;
 // A writable direct map's copy that outlives its daemon: held by the anchor, taken back by the successor (A-197).
 mod checkout;
 pub mod head;
@@ -99,6 +103,7 @@ mod owner_location;
 mod staging;
 mod work_charge;
 pub mod work_files;
+mod work_log;
 // The container bind form of `attach` (§4.6 A-9): the host mount verified through the kernel's mount
 // table and the runtime-specification entry; paired per platform inside, so it compiles everywhere.
 pub mod oci;

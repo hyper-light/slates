@@ -269,3 +269,92 @@ fn reads_after_resets(client: &mut Client, works: &[VolumeId], file_len: usize) 
     "the first work stays at its own version, 2"
   );
 }
+
+/// A-207, §4.16 and D-18 ("Local acknowledgement promises daemon-restart survival only when bytes … and completion records are
+/// recoverable from anchor-owned RAM"; BUG-11 closed that for a plain volume's content; found 2026-11-04 by the load
+/// test's chaos plan). Do: a green holding `f`; work A overwrites a slot and is accepted (its log restated at version
+/// 2), then overwrites another slot (logged); work B overwrites A's first slot, conflicts, writes version 2's bytes
+/// over the window and rebases (restated at 2, its journal restated), then overwrites its own slot; stop the daemon and
+/// start another over the same anchor segment. Expect each work's bytes after the restart as acknowledged before it,
+/// and A then B submitted and accepted at 3 and 4 with exactly those bytes. Before: a work was rebuilt as a fresh clone
+/// of the green's head, so A and B read back the green's bytes and would have been accepted without their edits.
+#[cfg(unix)]
+#[test]
+fn acknowledged_work_edits_survive_a_daemon_restart() {
+  let profile = common::machine_profile();
+  let instance = format!("merge-load-restart-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let anchor = common::anchor::held_anchor("merge-load-restart", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), common::anchor::source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = common::client::connect(&instance);
+  let green = green_with_file(&mut client);
+  let (a, b) = edits_before_a_restart(&mut client, green);
+  let before = (
+    client.read(a, "f", ReadAt::Head).unwrap(),
+    client.read(b, "f", ReadAt::Head).unwrap(),
+  );
+  first.stop();
+  let second = Daemon::start(&profile, config, common::anchor::source_of(&anchor)).unwrap();
+  let after = (
+    client.read(a, "f", ReadAt::Head).unwrap(),
+    client.read(b, "f", ReadAt::Head).unwrap(),
+  );
+  assert_eq!(
+    after.0, before.0,
+    "work A's bytes after the restart are what it acknowledged before it"
+  );
+  assert_eq!(after.1, before.1, "and work B's, rebased, too");
+  assert_eq!(
+    client.submit(a).unwrap(),
+    Submitted::Accepted(3),
+    "A's base survived: no conflict with its own version"
+  );
+  assert_eq!(
+    client.submit(b).unwrap(),
+    Submitted::Accepted(4),
+    "B's rebase survived: disjoint from A's"
+  );
+  let merged = client
+    .read(green, "f", ReadAt::Version { version: 4 })
+    .unwrap();
+  for (at, fill) in [(0, b'a'), (SLOT_AT, b'A'), (SLOT_AT + 4 * SLOT_LEN, b'b')] {
+    let start = usize::try_from(at).unwrap();
+    let end = start + usize::try_from(SLOT_LEN).unwrap();
+    assert_eq!(
+      &merged[start..end],
+      &slot(fill)[..],
+      "version 4 holds the slot at {at}"
+    );
+  }
+  drop(client);
+  second.stop();
+  drop(anchor);
+}
+
+/// The acknowledged state `acknowledged_work_edits_survive_a_daemon_restart` restarts over: work A accepted at 2 and
+/// then edited again; work B conflicted, resolved by rebasing onto 2, and edited again. Returns `(A, B)`. Built where
+/// its one caller is.
+#[cfg(unix)]
+fn edits_before_a_restart(client: &mut Client, green: VolumeId) -> (VolumeId, VolumeId) {
+  let (a, _) = client.create_work(green, "a").unwrap();
+  let (b, _) = client.create_work(green, "b").unwrap();
+  client.edit(a, "f", SLOT_AT, SLOT_LEN, &slot(b'A')).unwrap();
+  client.edit(b, "f", SLOT_AT, SLOT_LEN, &slot(b'B')).unwrap();
+  assert_eq!(client.submit(a).unwrap(), Submitted::Accepted(2));
+  client.edit(a, "f", 0, SLOT_LEN, &slot(b'a')).unwrap();
+  assert!(matches!(client.submit(b).unwrap(), Submitted::Conflict(_)));
+  let theirs = client
+    .read(green, "f", ReadAt::Version { version: 2 })
+    .unwrap();
+  let start = usize::try_from(SLOT_AT).unwrap();
+  let window = &theirs[start..start + usize::try_from(SLOT_LEN).unwrap()];
+  client.edit(b, "f", SLOT_AT, SLOT_LEN, window).unwrap();
+  assert_eq!(client.rebase(b).unwrap(), Rebased::Rebased(2));
+  client
+    .edit(b, "f", SLOT_AT + 4 * SLOT_LEN, SLOT_LEN, &slot(b'b'))
+    .unwrap();
+  (a, b)
+}

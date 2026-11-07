@@ -1,5 +1,175 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A path on a volume this daemon serves is refused before any open (A-227, 2026-11-06): built on Linux, Windows and
+> macOS.** A base directory and every lookup below it, a landing's target and a FUSE mount point are refused typed
+> (`HostError::OwnMount`, `TargetRefusal::OwnMount`, the wire's `Refusal::OwnMount`) when they lie on a mount this
+> daemon serves, its predecessor's kept mounts included. Linux compares each component's mount id (procfs) with a
+> lock-free bounded set of this daemon's own mount ids; a FUSE mount's source is `slates:<tag>`, a per-start random
+> value. Windows names a path's drive by `QueryDosDeviceW` against this daemon's WinFsp volumes. macOS records each NFS
+> mount at bind by the kernel's filesystem id and compares the kernel's path of each crossing. A successor learns its
+> kept mounts before any base is reacquired. Proven: Linux red on main (run 42161480656), green (run 42161730984; a
+> checked base open costs 1.25 µs more, BENCHMARKS); Windows red on main, green and red-checked (diag-slabs-8/9/10, runs
+> 42163139473, 42163139554, 42163139568); macOS 4 tests green, and red with the successor's learning removed; the kept
+> mounts on Linux green (run 42170240376) and red in the old order (run 42170240677), on Windows green with the whole
+> WinFsp suite, 15 on each runner (run 42171800738), and red in the old order (run 42170240630) (A-227).
+> Open:
+> - **The macOS check's cost** with a mount recorded (one `F_GETPATH` a directory crossing) did not resolve from the
+>   noise at load 51 to 54 on 18 cores (BENCHMARKS, "The own-mount check on macOS"): a quiet re-measure is owed. With no
+>   mount recorded the check is one atomic load.
+> - **Windows `slates unmount` stops at the first volume whose status refuses** (`crates/cli/src/verbs.rs`
+>   `unmount_verb`): a volume recovery refused (`NotFound`) keeps every drive from being unmounted by its letter until
+>   it is destroyed. Found by A-227's reacquire test, which detaches by the attachment's id instead; not fixed here.
+
+> **A purge that stopped between calls lost the blocks freed behind it (found 2026-11-07, main CI 42184319025; fixed
+> 2026-11-07).** A-205's give-back test failed on Windows: the daemon counted 118,337,536 of 134,217,728 deleted bytes
+> given back. A per-tick log named the cause. A-214's reserve kept a walk of the idle purge under way, and a delete
+> released its blocks behind the walk's cursor. The walk's end reset the resident count to what it had kept, so the
+> count later saturated at zero mid-walk. The purge then returned at its first line forever, leaving those pages
+> resident and uncounted. Now a walk ends at what the regions' sets record, and the purge's "nothing to do" asks the
+> sets. Main failed 6 of 10 Windows runs of the test; the fix passed 10 of 10 (`diag-liveness-4`, `-6`). The bug record
+> of 2026-11-07 has the log.
+
+> **A Windows UDP socket died on an earlier send's ICMP error (found 2026-11-06, fixed 2026-11-06).** With Windows'
+> default `SIO_UDP_CONNRESET`, a port-unreachable for a datagram sent earlier failed the socket's next `recvfrom` with
+> WSAECONNRESET. A fleet node's demultiplexer ends on a receive refusal, so its socket stopped receiving, and
+> conformance's three-node fleet never formed (run 42150662467). Every datagram socket the Windows seam makes or
+> adopts now turns both ICMP reports off (`netsys::ignore_earlier_datagrams_errors`). On both CI Windows runners the
+> failing test failed on main (10054) and passes with the fix (`diag-liveness-3`). Conformance's live fleet failed 4 of
+> 4 runs without the fix and passed 4 of 4 with it. Owed: a fleet test on Windows in a lane on main, since `fleet.rs`
+> is Unix-only (owner release, 2026-11-07); `slates-cluster`'s tests build on Windows since conformance's a0015062
+> landed as 12e57aa8 (the bug record of 2026-11-06).
+
+> **The many-client load test from 10,000 to 100,000 clients (loadtest-scale; 2026-11-06): in progress.** The
+> harness (`crates/client/examples/load_bench.rs`) multiplexes logical clients over connections
+> (`--per-connection k`). Each logical client keeps its own work volume, rounds, merges and conflicts, and has one
+> request in flight. A sweep drains every connection's ring before it moves any client on, so a latency is stamped
+> when its reply arrives, not when the harness reaches the client. Fixed, failing test first:
+> - **An acknowledgement covered requests still awaited.** A client with several in flight released their completion
+>   records, so a resend after a restart was answered `DuplicateRequest` for an applied create. The watermark now
+>   stops below the first request with no reply (`an_acknowledgement_never_covers_a_request_still_awaited`;
+>   `docs/bugs/2026-11-06-an-acknowledgement-covered-requests-still-awaited.md`).
+> - **A ring slot's bulk body was overwritten before it was read.** The ring's credit covered the 64-byte slot, not the
+>   bulk chunk it names, which every message at that ring position shares. So a body was overwritten in two ways: by
+>   a consumer that released the slot before reading the body, and by a producer that packed before it knew the ring
+>   had room. A request then ran another request's body under its own id (red: request 0 decoded as request 8), or
+>   failed `BadRequest { "body does not decode" }`. That happened 1 to 3 times in every 300-client run at 32 clients a
+>   connection, and in none of 3 after the fix
+>   (`docs/bugs/2026-11-06-a-ring-slots-bulk-body-was-overwritten-before-it-was-read.md`).
+> - **Forwards to one owner went one at a time** (the network load test's fault one, below). The origin borrowed
+>   the session to the owner for each forward's round trip, and the owner served one request of a session at a
+>   time. Now they share the session through a per-peer lane, and the owner runs each forwarded verb on its own
+>   task. A forward to a free shard, behind one waiting on a held shard: 471.8 ms before, 1.77 to 2.41 ms after
+>   (`forwards_to_one_owner_never_wait_behind_each_other`;
+>   `docs/bugs/2026-11-06-forwards-to-one-owner-went-one-at-a-time.md`). A sibling is fixed with it: three
+>   borrowers abandoned the session's newest exchange on a failure, which on a shared session can be a forward's
+>   (`Endpoint::abandon_begun_since`).
+>
+> - **A pin held its shard for the whole tree.** `Documentation/` (11,608 files) took one poll of 9,194 ms on a Mac,
+>   past the anchor's 1,000 ms liveness budget, and every verb on the shard waited. The pin is now a walk stepped a
+>   slice at a time in a task of the owner shard, its reply deferred, as a checkout's is. Red: no probe was answered
+>   inside the pin, and the one waiting was refused `Stalled` at 1 s. Green: 238 probes inside an 8.49 s pin, the
+>   longest 318 ms (`a_pin_of_a_large_base_never_holds_its_shard`). The pin's own memory is linear, 1.4 to 3.5 KB of
+>   heap a file on Linux and macOS. The quiet Linux CI runner's daemon peaked at 552 MB pinning `Documentation/`, and
+>   the growth came after the pin. A pin past its volume's quota is refused `NoSpace`
+>   (`docs/bugs/2026-11-06-a-pin-held-its-shard-for-the-whole-tree.md`).
+>
+> - **The whole kernel as the workload: the pin holds, creating the green does not** (open; reported to fixtures, A-217's
+>   re-lander, 2026-11-06). In-process daemon on the Mac (loaded arm, load 30 to 47), Linux v7.4-rc1 whole (97,229
+>   files on APFS, 1.67 GB), the sliced pin:
+>   - pin 64.4 s, RSS 42 MB to 3.4 GB (the content, granule-rounded);
+>   - snapshot 0.71 s;
+>   - `CreateGreen` 69.05 s as one shard poll of 69,028 ms, RSS 3.4 to 17.8 GB, holding 10 GB after: the origin
+>     `seed_origin` copies whole (`walk_origin`), unsliced.
+>
+>   A 10-client rung then ran (1.93 s; Edit p50 91 µs, p99 1.20 s; SubmitAccepted p99 645 ms) while the shard's polls
+>   stayed at 509 to 717 ms. Then the process peaked at 24.07 GB and was gone at 652 s before its oracle: no panic,
+>   with heartbeats 2.5 to 4.2 s late and unattributed (memory pressure is the inference, not proven). Owed:
+>   `CreateGreen` sliced, and its origin held by reference (A-217), before the rungs use the whole kernel.
+>
+> - **On a busy machine the anchor kills a live daemon, and then its successor, and the clients give up** (open; the
+>   anchor's half is the top entry's, unassigned). Mac, single-node anchored daemon, load 60 to 89, 300 to 1,000
+>   clients:
+>   - The anchor killed a live daemon whose heartbeat lapsed. The successor "never beat inside the recovery budget",
+>     recovering 300 to 1,000 works and their green's versions, and was killed again: twice, and four times in another
+>     run.
+>   - The clients' reconnect budget ran out first (0 reconnects, 172 and 439 clients gave up), and the restart reset
+>     the works (A-207's port is reverted on main).
+>   - The harness's oracle then failed 30 checks: versions it never saw accepted, and heads it could not replay. Those
+>     are submits whose outcome their clients never learned, and the oracle treats them as never accepted. It owes a
+>     sound treatment: read which versions the green took and fit the unknown submits to them.
+>
+> - **Memory per client, attributed** (2026-11-06). Mac, in-process daemon over `kernel/`, 300 clients at 32 a
+>   connection, works kept (`--keep-works`). Memory is not load-sensitive.
+>   - **Per same-machine connection, about 8.4 MB of daemon RSS.** At 1,000 clients, 1,000 connections peaked at
+>     12.5 GB and 32 at 4.4 GB. Multiplexing 32 a connection makes it about 0.26 MB a logical client, and over the
+>     network the server pays none of it.
+>   - **Per accepted version, about 0.16 MB of live heap**, but RSS grew about 3.4 MB a version (one round, 300
+>     versions: 1.15 GB; three, 900 versions: 3.20 GB). `vmmap` puts the difference in freed large blocks still
+>     resident ("MALLOC_LARGE (empty)", 597 MB to 2.5 GB). A counting allocator found 464 allocations of 1 MiB or more,
+>     9.4 GB in one level, from `Partition::to_snapshot` ← `Db::snapshot` ← `Db::commit`, with buffers growing to
+>     134 MB.
+>   - **The cause.** The partition keeps every accepted increment in `green_chains` (bounded, refused
+>     `Capacity { table: "green_chains" }` at the cap) "until checkpointing folds old chain entries (owed)". So each
+>     version costs its increment for good, and each snapshot taken when the log fills re-encodes the whole chain.
+>   - **What it means at 100k** (extrapolation): 3 rounds × 100k clients is 300k increments, about 48 GB of chain,
+>     each snapshot re-encoding it, and the cap refusing submits well before. Green chain checkpointing is the 100k
+>     rung's wall (owner to be decided).
+>
+> - **The quiet arm's first rungs: correct, and far from 1 ms** (Mac Studio, load 5 to 9, one node; BENCHMARKS, "The
+>   load test's quiet arm"). At 1,000 clients p50 is 35 to 73 ms and p99 158 to 227 ms; at 3,000, p50 197 to 219 ms.
+>   The oracle had 0 failures. Every operation of a green's works is served on the green's one shard (about 112 µs
+>   an operation, 8,960 a second), so a closed-loop client's latency is clients × service time. At 3,000 clients the
+>   green's retention cap refused 2,405 submits `BudgetExceeded`: a version keeps the whole previous bytes of every
+>   file it overwrote, and the history folds only down to the oldest base a live work holds. Walls owed for the
+>   10k–100k rungs, besides the green chain's checkpointing above:
+>   - a green's works served off its owner's shard, with only the verdict serialized;
+>   - history that keeps what a version overwrote, not whole files;
+>   - a stated offered load per client for the 1 ms bound. At zero think time, 100k clients at 1 ms is 10⁸
+>     operations a second.
+>
+> The topology launcher is `crates/cli/tests/load_scale.rs`. It runs one primary and two replica server nodes in
+> region 0 at `f = 1`, and client nodes in region 1, so the client nodes are never the green's holders. One harness
+> drives every client node (`--instance a,b,…`), so one oracle judges every submit. It is portable (`ps`, `pgrep`),
+> so it runs on macOS. Not yet through a rung: with a debug daemon on the loaded Mac, `base pin` of `kernel/`
+> outlasts the CLI's 1 s reply deadline, and the green is then refused `ConsistentBaseUnavailable`. In release the
+> pin takes 278 to 637 ms for 754 files. That is the open "pinning a tree of many files" item (loadtest's, above),
+> and it is the wall for the whole kernel as the workload.
+>
+> Sanity rungs, Mac, in-process daemon, loaded arm (load 46 to 62 on 18 CPUs, the fleet suite running): 10 and 100
+> clients over `kernel/`, at one and ten logical clients a connection, oracle and own files 0 failures, no
+> backpressure, no starved clients. The latencies measure the box, not slates: the worker threads were descheduled
+> for up to 147 ms between drains of one ring (`max_drain_gap_ns`), so the quiet arm is on the Studio. A
+> `rebase_conflicts` of exactly 100 at 100 clients, in both forms, was coincidence: a third run counted 99. Every named
+> window is one of the client's own hot slots, rewritten by another client between its resolution read and its
+> rebase, so the head really moved (the harness names the first five a worker meets).
+
+> **One refused receive ended a fleet node's transport (found 2026-11-06 as the UDP reset's sibling, fixed
+> 2026-11-07).** `Demux::run` read every refused receive as the socket's end, so an earlier send's report stopped a
+> node's serve socket for the daemon's life. Now every receive loop in `rt`, `transport` and `server` ends only on the
+> socket gone (`RtError::receive_refusal`), and counts the rest by kind in status. Tests on the simulated fabric hold
+> the demultiplexer, an endpoint's handshake and a DNS lookup each failing before its change; see the bug record of
+> 2026-11-07. Owed: the membership plane's change has no test of its own.
+
+> **A submit at `f = 1` waited for the coordinator's period: fixed (2026-11-06, §4.16 Commit;
+> A-235).** The merge record plane ran once per 100 ms coordinator period, putting a version's inputs at one
+> period and shipping its record at the next. One submit at a time on an idle three-node fleet took 208 to 647 ms, and at
+> 1,000 clients on Linux every accepted submit was answered `Overloaded`. Now an enqueued version, or a newly
+> acknowledged input or record, wakes the coordinator, which runs the merge plane at once (`nudge_record_plane`,
+> `pace_running_merges`). A version's inputs go only to the holders whose next record it is, since a lagging holder let
+> go of the inputs it needed next (`merge.inputs_unheld` 53 and 71 in two runs). Median now 2.7 to 4.4 ms (debug build,
+> 5 of 5). Still owed: more than one version a holder per pass, so a hot green's versions still commit one round trip
+> apart. Record: `docs/bugs/2026-11-06-a-submit-at-f1-waited-for-the-coordinators-period.md`.
+
+> **A submit in a three-process fleet at `f = 1` was never answered: fixed (2026-11-06, §4.8 joint writes, §4.16
+> Commit; A-234, `Quorum::committed_within` reviewed by raft-chaos).** A green made on the bootstrapper while its council formed had
+> its merge records enqueued under the bootstrap's one-candidate placement, and pending records were never
+> re-placed; once they were, the joint placement joined the bootstrap's one-member settled cohort, which can never
+> give `f + 1`. Pending merge records now follow the current configuration each period, as heads do
+> (`PendingGreen::retarget`), and a joint cohort smaller than the quorum needs every member
+> (`Quorum::committed_within`). In-process red test: 0 of 8 answered before, 5 of 5 after (1.2 s); three-process CLI
+> test: 0 of 5 before, 3 of 3 after (2.3 to 3.0 s). Record:
+> `docs/bugs/2026-11-06-a-submit-in-a-three-process-fleet-is-never-answered.md`.
+
 > **The anchor kills live daemons on a busy machine (found 2026-11-06, audit step 7; fixed by A-228, Windows CI owed).** Under the
 > A/B bar's load, two spinners a logical CPU (8 on CI's 4-CPU Windows runners), the anchor killed daemons that were
 > alive and serving because their heartbeat lapsed its 1,000 ms liveness budget. A busy machine is the normal case
@@ -37,10 +207,56 @@
 >   1,044 ms bound: the window plus a 44 ms lateness p99). Owed: the Windows runners under the bar's load (diag branch),
 >   then macOS and Linux beside them. Record: `docs/bugs/2026-11-06-the-anchor-killed-live-daemons-on-a-busy-machine.md`.
 >
+> **A principal is compared across hosts with no host (security, open, 2026-11-07; owner: clients; fix: A-237).** A
+> verb forwarded to a volume's owner on another node carries the requester's principal "as the origin node authenticated
+> it" (`crates/server/src/verbs.rs` `ForwardedRequest`). The owner dispatches a read under it, and runs a write under
+> it, as is (`serve_forward`); the origin's host keys only the completion record. `rights_of` then grants a principal
+> equal to a volume's owner or access entry, and a host account carries no host (`slates_db::catalog::Principal::Uid {
+> uid }`). Three collisions follow:
+> - every Windows channel is `Uid { uid: 0 }` (the bootstrap object's mode is the authentication: only the daemon's
+>   user opens it, and `slates_ipc::rendezvous`'s `current_uid` is 0 on Windows), so any two Windows users on different
+>   nodes are one principal across a forward;
+> - a Windows user is Unix root's principal: a forward from any Windows node meets a root-run daemon's volumes as their
+>   owner, and the other way round;
+> - one uid on two Unix hosts, usually two people, is one principal across a forward.
+>
+> What does not cross hosts: grants and landings (issued on the local control channel), remote attachments
+> (`Consumer::Remote { host, client }`) and enrolled consumers (found by id on their record's partition). Decided
+> (supervisor, 2026-11-07): every principal that crosses hosts is scoped by its origin host's authenticated identity,
+> owner and access entries record (host, account), and `rights_of` compares the scoped principal (A-237). A fleet account
+> mapping, one person's accounts on several hosts as one principal, is a separate open design item for Ada; until it
+> exists, cross-host access needs an access entry naming (host, account). Found while checking a wrong premise: a
+> Windows consumer does attest (`crates/server/tests/consumers.rs`, green on main on ubuntu x86_64 and arm64, Windows
+> x86_64 and arm64 and macOS, diag `consumers-1`). What remains of that is naming: on Windows the host account is
+> recorded as uid 0, Unix root's number, and §4.13 says the rendezvous authenticates "uid/SID" while the code
+> authenticates by the object's ACL and never reads a SID (held; the supervisor decides after A-237).
+>
+> **A fleet account mapping (open design item for Ada, 2026-11-07).** After A-237 a local account means something only
+> on its host, so one person's accounts on several hosts are several principals: a volume shared across the fleet needs
+> an access entry for each (host, account). Whether the fleet should map accounts to one fleet principal, and who may
+> assert such a mapping (it is an authority over every node's volumes), is undecided.
+
 > **`LIVENESS_BUDGET_NS` is still a fixed second (R3 debt, 2026-11-06; follow-on, not A-228).** It is A-228's window and
 > the reply-deadline unit of about 60 files (the client's and the server's deadlines, observations, the scatter's room
 > wait). A-228 judges the window in each shard's own CPU time, which keeps a starved daemon alive, but the window's length
 > is still the `Shape:` constant "a second", not measured.
+>
+> - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for
+>   another shard's answer gave up at the wall second while the target was alive and starved, and the work went on to
+>   take effect with the client refused. `xshard::within_shard_time` (`call_in_shard_time`, `task_in_shard_time`)
+>   waits by A-65's rule instead, one commit per call family, each failing first
+>   (`crates/server/tests/cross_shard_wait.rs`). Done: the consensus verbs (a bootstrap with the control shard on the
+>   CPU a fifth of the time, refused `Overloaded` after 1.003 s on main, acknowledged after 1.52–1.68 s; a wedged control
+>   shard still refused after 1.000–1.004 s; the same on CI's four Linux and Windows runners, quiet and busy); the consumer
+>   verbs (a revoke and an attestation with a starved shard refused `NotFound` after 1.003 s and 1.075 s, now answered
+>   after 1.57–1.80 s); the NFS bridge (a host-root listing refused `SYSTEM_ERR` after 1.262 s and a v4 state call told
+>   `NFS4ERR_DELAY` after 1.296 s with a starved shard; now listed after 1.59–1.80 s and answered by the owner after
+>   1.52–1.58 s); the forwarded verbs and a peer's remote reap (a peer's read of a volume whose owner shard was starved
+>   answered `NotFound` after 1.302 s, now served after 1.70–2.11 s); the direct map's hand-off on Linux and Windows (a
+>   client whose shard was starved at its hand-off read by copy, now mapped directly). Class A is done; classes B (the
+>   transport's round-trip estimate) and C+D (A-232, the window itself) are open. Found on
+>   the way: a Windows channel (a `Sid`) can never attest a consumer (`verify_attestation` takes a uid only), and two
+>   server unit tests of landing fail on Windows, where CI does not run them. Record: `docs/bugs/2026-11-06-a-cross-shard-wait-lost-a-starved-shards-answer.md`.
 
 > **A-190's purge client leaves the daemon's process (2026-11-06, fixed); the sweep for the rest (open).** No daemon
 > thread opens a path on a volume the daemon serves (§4.6). The coherent purge's opens, writes and reads now run in a
@@ -51,6 +267,7 @@
 > after the anchor let the volume go (run 42155020781), and nor did the fix with the in-process open put back (run
 > 42155197023). The sweep found three more places a daemon thread opens a host path it does not check against its own mounts.
 > Each is open, and each is a hang or a stranded exit only when that path lies on a volume this daemon serves:
+> - **Built on Linux, Windows and macOS by A-227 (the entry above).**
 > - **A base directory** (`OsHost::open_root`, `crates/server/src/verbs.rs` `open_base` and the recovery's reacquire):
 >   a volume over a base on a slates drive or mount this daemon serves is read by its shard threads through that mount,
 >   for every lookup and read of the base.
@@ -126,21 +343,68 @@
 >     (0 differing), but shipping failed: candidate b held no live log, the owner counted `no_session` 7,663,
 >     `unanswered` 5,596 and `refused` 138, and only candidate c held entries (4,741).
 
-> **A-214, A-217 and A-207's port reverted from main (2026-11-05, by the supervisor); their re-landing is owed.** Main CI
-> 42119714654 on b502cf96 failed six jobs, all from this pairing of landed changes, each green on its own branch:
-> - **A-217 against A-201's checkout.** A-217 records a green's origin as a reference to its base snapshot, and
->   `checkout` (`crates/server/src/checkout.rs`) compares the recorded origin's bytes with a fresh `seed_origin`'s
->   encoding, so every checkout was refused `ConsistentBaseUnavailable`: `crates/server/tests/checkout.rs`, 3 of 3 on
->   Linux and macOS. A-207's port (`661b41b2`) and the load record (`21240d01`) use A-217's ops, so they go with it.
-> - **A-214 against A-205's give-back.** The reserve keeps a write burst's worth of freed content pages pre-faulted,
->   so `a_deleted_files_memory_leaves_the_working_set_and_recreating_it_reads_every_byte` failed on windows-latest and
->   windows-11-arm; and A-214's own `arena::tests::an_idle_purge_keeps_the_reserve_and_gives_back_the_rest` fails
+> **The many-client load test over the network (loadtest; 2026-11-05).** The harness
+> (`crates/client/examples/load_bench.rs`, `--green` to drive a green on another node) and its launcher
+> (`crates/cli/tests/load_fleet.rs`, gated on `SLATES_LOADTEST_TREE` and `SLATES_LOADTEST_BENCH`).
+> - **Over the network (2026-11-05, `crates/cli/tests/load_fleet.rs`: a server node and a client node under anchors,
+>   f = 0, loopback; the harness at the client node against the server's green over `kernel/`):** 100, 300 and 1,000
+>   clients, the oracle and every own file 0 failures. The server pays about 1.2 to 1.4 MB a client at peak (121,096 to
+>   484,900 KiB at 300), the client node about 64 to 100 KB a local client (30,180 to 59,828 KiB at 300). Three faults:
+>   - **Forwards to one owner go one at a time** (fixed 2026-11-06 by agents/loadtest-scale, above). `forward_batch_over_leader_session` (`crates/server/src/fleet.rs`)
+>     takes the peer's one session for a forward's whole round trip, so a client node's verbs to its server serialize:
+>     a forwarded `CreateWork` p50 1.71 s at 300 clients and 4.30 s at 1,000 (45 µs on the owner's own node).
+>   - **A forward queued past the failover bound is refused `OwnerUnreachable`** though the owner is alive and served
+>     everything else: 536 `CreateWork` and 7 edits at 1,000 clients. Typed, but the wrong cause.
+>   - **After the server's daemon is killed and its anchor restarts it, the client node's forwards stay refused
+>     `OwnerUnreachable`**: at 300 clients 207 `CreateWork`, 41 edits, 7 submits, 2 destroys; at 100 clients the
+>     harness's final read 20 s after the kill. The server recovered its green (`1 merge volumes`; whether the
+>     forwarded works existed at the kill is not yet settled).
+>   The 1,000-client "hang" seen in 3 of 10 runs (minutes with both daemons idle) was the harness's own oracle, which
+>   replayed a whole copy of every touched file for every version (1,600 × 677 at 1,000 clients); it now keeps each
+>   slot's writes and judges by lookup, and two runs finish in 19 to 20 s with 0 failures (red-checked: blinded, it
+>   flags 13 of 13 conflicts). Owners of the three faults: the fleet forward and session code (raft, fs-server).
+> - **Memory per same-machine connection is a client node's, about 64 to 100 KB a local client** (the 20 to 29 MB
+>   measured before was the daemon and the harness in one process, both touching every ring); a client node derives
+>   about 7,900 seats here, so the 10k-100k rungs need several client nodes, and fault one above caps each.
+
+> **A-214, A-217 and A-207's port reverted from main (2026-11-05, by the supervisor); all three are re-landed (A-214 in
+> `2f70a86b`; A-217 and A-207 from `agents/reland-a207-1`, 2026-11-06).** Main CI 42119714654 on b502cf96 failed six jobs,
+> all from two pairs of landed changes, each green on its own branch:
+> - **A-217 against A-201's checkout (fixed).** A-217 records a green's origin as a reference to its base snapshot,
+>   and `checkout` (`crates/server/src/checkout.rs`) compared the recorded origin's bytes with a fresh
+>   `seed_origin`'s encoding. So every checkout was refused `ConsistentBaseUnavailable`:
+>   `crates/server/tests/checkout.rs`, 3 of 3 on Linux and macOS. The checkout now compares origin identities
+>   (fs-server's `ab9e706c`, `docs/bugs/2026-11-05-a-held-origin-refused-every-checkout.md`). Re-landed with it are
+>   A-217, A-207 over A-202's delta rebase, and `edits_before_a_restart` built only where its caller is.
+>   - Linux, diag run 42173694626 (ubuntu-latest and ubuntu-24.04-arm): fmt, clippy, doc, `xtask check`, server lib
+>     195, checkout 3, merge_load 5, recovery 45, daemon 24, and `cargo test --workspace`, all passing.
+>   - Windows, the same run (windows-latest): the native lint wall over ci.yml's crate list and `slates-cli`, and
+>     merge_load 4. Also `cargo xwin clippy` clean from macOS.
+>   - The load test's macOS runs (BENCHMARKS): 0 oracle failures in every run but one. That one is the next entry's.
+> - **A-214 against A-205's give-back (re-landed in `2f70a86b`; the large-file NFS write entry has its evidence).** The
+>   reserve kept a write burst's worth of freed content pages pre-faulted, so
+>   `a_deleted_files_memory_leaves_the_working_set_and_recreating_it_reads_every_byte` failed on windows-latest and
+>   windows-11-arm, and A-214's own `arena::tests::an_idle_purge_keeps_the_reserve_and_gives_back_the_rest` failed
 >   under Miri.
-> The reverted tree passes the checkout, mem, rt, merge, recovery and daemon suites on macOS. Owed: nfs-write re-lands
-> A-214 reconciled with A-205's give-back (a reserve the give-back test accounts for, or one that decays) and green
-> under Miri; loadtest re-lands A-217 and A-207 with checkout comparing the base by what A-217 records. Both must run
-> `crates/server/tests/checkout.rs`, the Windows give-back test and Miri before they are handed over. A-204, the
-> harness (`93483514`), the merge windows fix (`d0389720`) and winfsp-overlap-3 stay on main.
+
+> **A daemon's restart can exceed the anchor's fixed recovery budget (found 2026-11-06 re-landing A-207 and A-217;
+> open, owner liveness with clients, A-228's family, assigned 2026-11-07).** A starting daemon that has not beaten 1 s after its spawn is killed ("the daemon never beat
+> inside the recovery budget"). The budget is `slates_db::replay::RECOVERY_BUDGET_NS`, a `Shape:` constant: RAMCloud's
+> target, not derived from the machine. The heartbeat is a task on the control shard, and recovery runs in that
+> shard's `init_shard` before any beat. So the whole start, including recovery, must fit in 1 s.
+> - **Seen** (macOS, Apple M5 Max, load 31 to 53; BENCHMARKS, the macOS re-land record):
+>   - Shard 0's recovery of one green over the kernel's `kernel/` and its works took 245,701 to 936,422 µs.
+>   - In 1 chaos run of 10, the anchor killed three successors in a row, and all 100 clients passed their reconnect
+>     budget (2 s). Another run saw 7 successors killed and passed.
+>   - main `00e5269c` at the same load had starting daemons killed before any green existed, beside the lapses the
+>     entry "The anchor kills live daemons on a busy machine" records.
+> - **What recovery does there:** the green's chain replayed version by version over its origin. Since A-217 the
+>   origin is walked again from the held snapshot (a `CreateGreen`'s walk; 158 to 466 ms for the trees measured). Since
+>   A-207 each work's log is replayed. None of it is sliced, so a large green holds the first beat for all of it. The
+>   cost per part is not yet measured.
+> - **The same class as the liveness entry above:** a fixed second, a shard task as the beat, and a busy machine as
+>   the normal case. A busy machine must not kill a daemon that is making progress, and a client's reconnect budget
+>   follows the same constant.
 
 > **A private purge's intent can wait up to the 1 s transaction timeout (found 2026-11-05, audit step 7; open).**
 > WinFsp's transact never goes pending: the control dispatch calls `FspVolumeTransact` inline (v2.1 `src/sys/fsctl.c:95-99`),
@@ -233,10 +497,15 @@
 > (it was the first); a pinned large-class file reads across its extents (no green could start from the kernel tree);
 > A-217, a green's origin is a reference to the base snapshot it holds (peak RSS over `fs/` 549,520 to 225,776 KiB,
 > `CreateGreen` 415 to 158 ms, best of three; `a_greens_base_snapshot_is_held_and_its_origin_recovered_from_it`). Open:
+> - **Fixed (A-207): a work's acknowledged edits were lost at a daemon restart.** A work's changes are logged in the
+>   partition and replayed at recovery (`acknowledged_work_edits_survive_a_daemon_restart`, red on main). Chaos on the
+>   branch it comes from: twenty daemon kills under the anchor at 10 and 100 clients, every client reconnected and
+>   resent its request in flight under its own id, the oracle and each client's own file 0 failures in every run.
 > - **A volume promised the whole version slab is refused at recovery** (bug record of 2026-11-05): a recovered
 >   snapshot rebuilds its directories privately, one retained version slot each the live volume did not hold (465,831
 >   committed slots before a restart, 465,832 after). Fix owed in `crates/vfs/src/recover.rs`.
-> - **Pinning a tree of many files grows memory far faster than its files, in one unsliced verb**: `kernel/` (754
+> - **Pinning a tree of many files grows memory far faster than its files, in one unsliced verb** (the slicing fixed
+>   2026-11-06 by agents/loadtest-scale, and the memory not reproduced: see that entry above): `kernel/` (754
 >   files) 86,848 KiB, `fs/` (2,365) about 226,000 KiB in 3 of 3 runs, `Documentation/` (11,608, 59 MB) past 12 GB and
 >   `arch/` (18,944, 127 MB) past 9.9 GB inside the pin, which also outlasts the client's 1 s reply deadline; the whole
 >   kernel is killed at a 24 GB cap in its pin. Not root-caused; samples show `Overlay::read_whole` → `copy_up`.
@@ -588,7 +857,15 @@
 > write acknowledged; writers killed mid-write leave the log whole and no reply held; a destroyed volume's copies are
 > let go (three defects found and fixed on the way: §4.10 status "Chaos, continued"). Open: hard links and extended
 > attributes in the rebuilt volume; a candidate's copy across its own daemon's restart. FUSE `fsync` on a live volume is
-> answered at durability since 2026-11-05 (`EIO` past the liveness budget; §4.10 status "FUSE `fsync` at durability").
+> answered at durability since 2026-11-05 (`EIO` past the liveness budget; §4.10 status "FUSE `fsync` at durability"). So are a Shards
+> stream's `FSYNC` (`EIO` after 1.001–1.003 s with both candidates stopped, where it answered `0` in 337 µs), a writable
+> map's `MapSync` and a checkout into a live base (each answered with nothing durable before; now they wait as a verb
+> does); NFSv4 shares the v3 wait; a virtio-fs or vhost-user `FSYNC` (`EIO` after 1.0006–1.0017 s, where it
+> answered `0` in under 1 ms) and a WinFsp flush (error after 1.001–1.028 s, where it succeeded in 995 µs; a volume
+> flush now publishes at all) wait too (§4.10 status "Every other durability claim"). Open (live-durability): one x86_64
+> virtio-fs run of 19 answered a stopped `FSYNC` `0` after 1.000358 s, unexplained; that run printed no log line, and
+> the 16 runs since, which print the owner's log and the hold's counters at that point, never repeated it. Open
+> (live-fixes): a Windows fleet did not re-form after an anchor succeeded a suspended candidate under a fresh identity.
 > Measured in the daemon (release, BENCHMARKS "What live shipping adds to a stable NFS write"): a live 4 KiB `FILE_SYNC`
 > write costs 90–114 µs more than a plain one at the median, p99 217–398 µs, p999 0.44–1.27 ms, worst 0.47–1.87 ms at
 > load 8–30 (2026-11-05). The rare 100 ms tail is explained and removed (two waits for the record period; and a
@@ -674,17 +951,40 @@
 >   `candidates_partitioned_in_turn_mid_stream_lose_nothing`) failed 3 of 5 runs before: two writes were never
 >   answered, one for over 20 minutes. After the fix, 6 of 7 runs pass and none hangs. Red-checked by
 >   `xshard::tests::a_call_to_its_own_shard_runs_its_future_to_the_end_past_the_deadline`.
-> - **Open: an install never finishes inside the liveness budget** (record
->   `docs/bugs/2026-11-06-an-install-never-finished-inside-the-liveness-budget.md`). A candidate left behind the retained
->   tail is sent the whole volume (0.5-1.5 MB) under the 1 s budget an entry gets. In one run 1,391 installs (2.06 GB)
->   went out, both candidates held the owner's head, and no write became durable. Edits in progress (raft-chaos, with
->   live-durability building on them in the dispatch round): a size-derived exchange budget, replies folded as they
->   come, one task a holder, and a byte-bounded retained tail. With them, 3 of 8 runs still failed: of 425 installs
->   logged in one, about 400 found no session, as the holder's tasks raced for its one session.
-> - **The anchored flows** (a candidate's daemon SIGKILLed and succeeded, a candidate's node replaced) are counted apart
->   from the invariant results until A-228 lands: at load 60–80 the anchor kills live daemons whose heartbeat lapses.
+> - **Open (live-durability): an install never finishes inside the liveness budget, and a dispatch strands its
+>   sessions** (record `docs/bugs/2026-11-06-an-install-never-finished-inside-the-liveness-budget.md`).
+>   - A candidate left behind the retained tail is sent the whole volume (0.5-1.5 MB) under the 1 s budget an entry
+>     gets. In one run 1,391 installs (2.06 GB) went out, both candidates held the owner's head, and no write became
+>     durable.
+>   - raft-chaos's edits (a size-derived exchange budget, replies folded as they come, a byte-bounded retained tail)
+>     are merged into live-durability's dispatch round. It adds one lane per (volume, holder), ships only to candidates
+>     holding the catalog, and waits for each exchange's stragglers before a lane ends. A straggler cancelled with its
+>     lane had taken its session with it, which is the KIND `wan` stall: both owner sessions `lent=true`, `no_session`
+>     24-40 k, runs 42178128960 and 42318867890.
+> - **Fixed: an unanswered destroy never settled.** Both candidates stopped, the destroy unanswered (correct), the owner
+>   killed. The destroy's records still reach the candidates once they resume, so it takes effect. But the successor,
+>   which adopted the tombstone in its takeover and retired it, kept its routing to the volume and answered every verb
+>   `Overloaded` for good (`fleet.owner_location.owned_unmaterialized`), while the other survivor answered `NotFound`.
+>   That happened in 6 of 6 runs, live and plain, macOS, 2026-11-06. `fleet::retire_shard_tombstones` now forgets the
+>   successor's routing at retirement, as a holder does in `tombstone::on_held`. The settled answer for a retired
+>   destroyed volume of a departed creator is `OwnerUnreachable`: no member remembers it and its id routes to the gone
+>   creator. Nobody lists or serves it. Flow: `a_{live,plain}_volumes_unheard_destroy_then_its_owners_loss`.
+> - **Open design item, not built: `NotFound` for a retired destroyed volume of a departed creator.** Today such a
+>   volume answers `OwnerUnreachable` (retryable, and true while a takeover could still be pending), because an owner
+>   location round never reports an unavailable view as `NotFound` (`owner_location::LocationError`). `NotFound` would
+>   be correct once no member can still adopt the id. A node's own view cannot show that: "this node has no unfinished
+>   takeover of the creator" is local, and another member may still be mid-adoption of that id, declining for now. So
+>   the rule needs the creator's takeover known complete fleet-wide, for example committed in the configuration group,
+>   before any member answers `NotFound` for the creator's ids.
+> - **Open (live-fixes): the anchored flows fail in fleet membership** on main 76e5b502 with A-228 (macOS, debug, load
+>   45-59, 2 runs each).
+>   - A candidate's daemon SIGKILLed under its anchor is succeeded in under 1 s but never readmitted within 40 s: the
+>     successor holds 3 members with 0 peers probed, while the others hold 2.
+>   - A candidate's node replaced by a fresh anchor was promoted to voter after 41 s in one run, and never in the other.
+>   These are counted apart from the invariant results.
 >
-> Touched: `crates/server/src/{live_ship,verbs,fleet}.rs` (the destroy's wait), the status line (`crates/ipc`
+> Touched: `crates/server/src/{live_ship,verbs,fleet}.rs` (the destroy's wait; the successor's routing at a
+> tombstone's retirement), the status line (`crates/ipc`
 > `LiveReport`, `crates/cli` status), the harness, the KIND leg (`xtask/src/kind_live.rs`,
 > `crates/cli/examples/pod_live_probe.rs`).
 
@@ -721,7 +1021,9 @@
 > written), presented 1 create and 3 replaces (manifest `06ca7f70…`), the human's `slates grant` at the Mac's anchor
 > issued grant 1, and the landing ended `done`: 4 written, 74 bytes, data and 2 directories synced; the Mac's disk
 > held every merged byte. Two Mac Studios had frozen the server earlier the same day (the kiln runner's headroom
-> guard, the anchor in state `T`); the MacBook did not. Open, found on the way:
+> guard, the anchor in state `T`); the MacBook did not. On main b502cf96 A-217's held origin made every checkout of a
+> based green refuse `ConsistentBaseUnavailable` (3 of 3 checkout tests red on main); fixed by comparing identities
+> (`docs/bugs/2026-11-05-a-held-origin-refused-every-checkout.md`). Open, found on the way:
 > - **The daemon cannot clone an overlay volume.** `admit_clone` gives every clone no host, so `volume clone` of an
 >   overlay is refused `ContentUnavailable` (pinned or not; fleet and standalone), though the volume core can.
 > - **No grant can be issued on Linux from the CLI.** The anchor's issuer segment is a descriptor only its children
@@ -779,6 +1081,17 @@
 >   answers. Raising shard threads above normal priority removed it (run 42059294312), on arms sharing a machine, so the gain is
 >   not yet measured, and it is a whole-daemon change. Also: under two spinners a core on a 4-vCPU x86_64 VM the anchor killed both
 >   daemons for a late heartbeat in run 3 of all three jobs that reached it.
+> - **The reply spin window can be set by a noisy start (A-212's spin; OPEN, a measurement defect, owner winfsp-overlap,
+>   2026-11-06).** Each receive worker times 15 one-way wakes through a bounded channel once as it starts and spins for
+>   their median before it parks for a reply (`crates/bridge-winfsp/src/reply.rs`, `SAMPLES`). The median was meant to keep
+>   one scheduling delay from setting the window, but a start where most samples are delayed sets it too. On CI's arm64
+>   runner, quiet, one daemon's two workers measured 143.9 µs and 108.1 µs (diagnostics run 42178889880, run 3), where the
+>   other runs' workers measured 4.1–11.5 µs. Such a worker spins up to 144 µs on each slow reply, taking a core from the
+>   shards of a 4-vCPU machine. That run's stat p50 (143.0 µs) was no worse than the others' (141.3–151.7 µs), so this is not
+>   the receiver's gap against the DLL, but the window has no bound and no check that its samples agree. Owed: a window the
+>   measurement cannot set beyond what a wake on the machine costs (a bound derived from the profile's wake, or samples
+>   retaken until their spread is within the probe's own precision, as `wake.mean_ns` is), with a test that a delayed start
+>   cannot set it.
 > - **Two failures recorded open below**: the wake-learning case under load (fixed 2026-11-04, A-199) and the fleet
 >   routing Create reply (fixed 2026-11-04 in its fixture; its second, rarer failure fixed 2026-11-05).
 >
@@ -13553,6 +13866,31 @@ The property under test never failed. `hold_until_enough_attacks` now keeps the 
 On the same two cores the fixed tests passed 6 of 6, against 1 of 3 failing before. The stale-handle attack ran past the
 window to reach the floor where it had to: 1,010–1,373 attempts in five runs and 2,708 in one. Each run took
 2.4–3.1 s, against 2.4–2.6 s before. Both properties held in every run: no leak, and no stale read resolved.
+
+### 2026-11-06: the progress rule failed while the server was starved, not stopped — fixed
+
+The stale-handle test failed its progress assertion on `windows-latest` with its binary's tests run in parallel (CI runs
+them one at a time). Reproduced on an 18-core Mac under two spinners a core: alone, 1 of 8 runs at 99 attempts, and 2 of
+10 instrumented runs with 0 attempts counted when the hold gave up, at 2,136 and 2,089 ms. In both, 14 and 15 of the 18
+attackers' first reads then hit their 2 s timeout. The daemon was alive, but its one shard was starved: its beat task ran
+3,332 ms after its last turn. The hold's own 20 ms polls overslept 2,013 of the 2,136 ms, so the machine was running no
+thread on time. The window, 2 s of wall time, was as long as the attackers' read timeout, and an attempt counted only
+when its reply or its timeout came, so slow first replies read as "stopped".
+
+`hold_until_enough_attacks` now charges each poll only the 20 ms it asked to sleep, so a busy machine stretches the
+window and a quiet one keeps it. It counts only answered reads: a stretched window outlasts the read timeout, so counted
+timeouts would keep a server that never answers looking busy. Under the same load the stale-handle test passed 10 of 10,
+with 1,019–1,379 answered in 28–51 s. Pointed at a listener that accepts and never answers, it still fails (0 answered,
+180 unanswered, 21.7 s). The cross-tenant test shares the rule and passed 10 of 10 under the same load (1,070–2,048
+answered).
+On `windows-latest` with the binary's tests in parallel (diagnostics run 42334762487), the fixed rule passed 10 of 10
+whole runs (stale-handle 1,010–1,344 answered, cross-tenant 1,054–2,950); the old rule failed the binary in its fourth
+run, the failing test not captured.
+
+Siblings seen running the whole binary in parallel under that load, not fixed here: three tests' `provision` calls
+refused `Stalled { after_ns: 1000000000 }` (`nfs_hostile.rs:71`); `common/nfs.rs:76` got RPC accept status 5
+(`SYSTEM_ERR`) in the broken-connections test; and a daemon logged "the control loop ended; the watchdog withholds the
+beat" after its control shard's beat ran 989 ms late.
 
 ### 2026-10-22: a daemon serving two FUSE mounts of a volume spun a core after one write — fixed (A-149)
 

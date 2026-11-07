@@ -145,7 +145,8 @@ impl OpenNames {
   /// One open at or beneath `from`, for the receiver's cooperative durable rename: its context and inode. The owner
   /// changes one name per request, after which that open is no longer beneath `from`, so the next request finds the
   /// next; a repeat after a crash finds what is left. Opens under other names are never visited: a rename of one file
-  /// takes one shard turn and one more to learn it is done, however many opens the mount holds (A-212).
+  /// takes one shard turn, however many opens the mount holds: the turn that renames the last open says so (A-212;
+  /// the turn that only learned none was left cost 4.7 µs a rename on arm64, run 42178889880).
   pub fn first_beneath(&self, from: &str) -> Option<(u64, u64)> {
     let exact = self
       .by_name

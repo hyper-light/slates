@@ -15,6 +15,11 @@ slates-vfs = { workspace = true }
 rustix = { workspace = true }
 libc = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# The kernel's mount table without contacting any filesystem (`getfsstat(MNT_NOWAIT)`), by which a mount this daemon
+# serves is named (A-227, `own_mounts`).
+slates-bridge-oci = { workspace = true }
+
 [dev-dependencies]
 slates-mem = { workspace = true }
 # The differential's other leg for the clean-file digest (§4.15): the standard library's bytes hashed here.
