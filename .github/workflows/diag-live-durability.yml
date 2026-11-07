@@ -1,0 +1,69 @@
+name: diag-live-durability
+
+# Diagnostics only, never on main (A-200, item 2): diag-25's two loaded live_fleet failures on the landing branch (F)
+# against main with its tests (R): a FUSE fsync with both candidates stopped, and the whole-record count, ten runs each
+# with two spinning shell loops per CPU, each run's line kept. Release, both Linux arches. Results to
+# diag-results/live-durability-26-<tree>-<os> by git push.
+on:
+  push:
+    branches: ["diag-live-durability-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  SLATES_TEST_CLI: "1"
+
+jobs:
+  landing:
+    name: landing (${{ matrix.tree.name }}, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+        tree:
+          - { name: R, sha: 86012d108a1e329ff31e4ed52f85135e2e766f54 }
+          - { name: F, sha: 3cef4bdafc676788c0554943e68626e08ddb269c }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the tree
+        run: |
+          git worktree add ../tree "${{ matrix.tree.sha }}"
+          cd ../tree && cargo build --release --locked -p slates-cli --bin slates --test live_fleet
+      - name: The two loaded failures, ten runs each, loaded
+        run: |
+          R=../results.txt
+          cpus=$(nproc)
+          echo "runner ${{ matrix.os }}, $cpus CPUs, $(date -u), tree ${{ matrix.tree.name }} ${{ matrix.tree.sha }}" > $R
+          cd ../tree
+          pids=""; for i in $(seq 1 $((cpus * 2))); do ( while :; do :; done ) & pids="$pids $!"; done
+          for run in $(seq 1 10); do
+            for t in a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it a_live_volumes_writes_ship_their_changes_not_the_volume; do
+              status=0
+              timeout 600 cargo test --release --locked -p slates-cli --test live_fleet -- --nocapture --test-threads=1 --exact $t > ../run.log 2>&1 || status=$?
+              grep -E '^live fsync|^live changes|panicked at|fails EIO|only the log' ../run.log | cut -c1-700 >> ../results.txt
+              echo "== run $run $t exit $status load $(cut -d' ' -f1-3 /proc/loadavg)" >> ../results.txt
+            done
+          done
+          for p in $pids; do kill "$p" 2>/dev/null || true; done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/live-durability-26-${{ matrix.tree.name }}-${{ matrix.os }}"
+          git config user.name "diag-live-durability"
+          git config user.email "diag-live-durability@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-live-durability-26 results, ${{ matrix.tree.name }}, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
