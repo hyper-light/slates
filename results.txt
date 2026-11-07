@@ -1,0 +1,115 @@
+leg tip-x86, ubuntu-latest, 4 CPUs, Sat Nov  7 20:05:25 UTC 2026, tree 691f8c494b0ce138b161ede92ca51f3df7b915bc
+== release build exit 0
+  chaos-rolling-b-6079 partitioned from 207.11695ms to 2.207510456s
+  chaos-rolling-c-6079 partitioned from 2.386951544s to 4.389238545s
+  7490 writes, 7490 acknowledged: p50 189 us, p99 4200 us, p999 15019 us, max 176863 us; 3 over 50ms (sent+took): 0.00s+177ms 2.22s+84ms 2.39s+151ms
+  chaos-rolling-a-6079 refused the owner: {}
+  chaos-rolling-b-6079 refused the owner: {}
+  chaos-rolling-c-6079 refused the owner: {}
+== partition 1 exit 0
+  chaos-rolling-a-6784 partitioned from 184.422379ms to 2.184505611s
+  chaos-rolling-b-6784 partitioned from 2.665277201s to 4.665396397s
+  7677 writes, 7677 acknowledged: p50 214 us, p99 9991 us, p999 30694 us, max 146483 us; 5 over 50ms (sent+took): 0.00s+146ms 1.18s+55ms 2.36s+134ms 2.54s+84ms 3.67s+76ms
+  chaos-rolling-c-6784 refused the owner: {}
+  chaos-rolling-a-6784 refused the owner: {}
+  chaos-rolling-b-6784 refused the owner: {}
+== partition 2 exit 0
+  chaos-rolling-a-7560 partitioned from 162.598117ms to 2.162676563s
+  chaos-rolling-c-7560 partitioned from 2.244145171s to 4.244231048s
+  3225 writes, 3225 acknowledged: p50 731 us, p99 4613 us, p999 30275 us, max 384884 us; 3 over 50ms (sent+took): 0.00s+131ms 0.16s+185ms 2.25s+385ms
+  chaos-rolling-b-7560 refused the owner: {}
+  chaos-rolling-a-7560 refused the owner: {}
+  chaos-rolling-c-7560 refused the owner: {}
+== partition 3 exit 0
+  chaos-rolling-a-8139 partitioned from 184.967874ms to 2.185257722s
+  chaos-rolling-b-8139 partitioned from 2.444900609s to 4.444983554s
+  4143 writes, 4143 acknowledged: p50 522 us, p99 7593 us, p999 39576 us, max 131715 us; 4 over 50ms (sent+took): 0.00s+132ms 2.24s+75ms 3.44s+53ms 4.30s+54ms
+  chaos-rolling-c-8139 refused the owner: {}
+  chaos-rolling-a-8139 refused the owner: {}
+  chaos-rolling-b-8139 refused the owner: {}
+== partition 4 exit 0
+  chaos-rolling-b-9329 partitioned from 181.658325ms to 2.182345709s
+  chaos-rolling-c-9329 partitioned from 2.408800308s to 4.408889348s
+  5935 writes, 5935 acknowledged: p50 256 us, p99 7317 us, p999 34559 us, max 166851 us; 3 over 50ms (sent+took): 0.00s+167ms 2.22s+71ms 2.41s+119ms
+  chaos-rolling-a-9329 refused the owner: {}
+  chaos-rolling-b-9329 refused the owner: {}
+  chaos-rolling-c-9329 refused the owner: {}
+== partition 5 exit 0
+  chaos-rolling-a-10027 partitioned from 159.688777ms to 2.159800296s
+  chaos-rolling-c-10027 partitioned from 2.197930264s to 4.19802241s
+  6096 writes, 6096 acknowledged: p50 225 us, p99 2222 us, p999 5829 us, max 2395554 us; 4 over 50ms (sent+took): 0.00s+131ms 0.16s+179ms 2.20s+2396ms 4.63s+81ms
+  chaos-rolling-b-10027 refused the owner: {}
+  chaos-rolling-a-10027 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 287}
+  chaos-rolling-c-10027 refused the owner: {}
+== partition 6 exit 0
+  chaos-rolling-b-11499 partitioned from 203.178243ms to 2.203266958s
+  chaos-rolling-c-11499 partitioned from 2.286191987s to 4.289203855s
+  4420 writes, 4420 acknowledged: p50 446 us, p99 5570 us, p999 25511 us, max 299841 us; 3 over 50ms (sent+took): 0.00s+162ms 1.97s+59ms 2.29s+300ms
+  chaos-rolling-a-11499 refused the owner: {}
+  chaos-rolling-b-11499 refused the owner: {}
+  chaos-rolling-c-11499 refused the owner: {}
+== partition 7 exit 0
+  chaos-rolling-a-12097 partitioned from 273.710021ms to 2.273793948s
+  chaos-rolling-c-12097 partitioned from 2.326182276s to 4.326266194s
+  4108 writes, 4108 acknowledged: p50 293 us, p99 4205 us, p999 47826 us, max 1368218 us; 4 over 50ms (sent+took): 0.00s+193ms 0.27s+128ms 2.33s+1368ms 3.96s+773ms
+  Convergence: 1 violations
+  chaos-rolling-b-12097 refused the owner: {}
+  chaos-rolling-a-12097 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 195928}
+  chaos-rolling-c-12097 refused the owner: {}
+thread 'candidates_partitioned_in_turn_mid_stream_lose_nothing' (12098) panicked at crates/cli/tests/live_chaos.rs:1135:5:
+-- tail
+    chaos-rolling-b-12097: {"fleet.live.appended": 4114, "fleet.live.awaited": 4108, "fleet.live.durable": 4113, "fleet.live.held_back.placement": 1, "fleet.live.holders_recorded": 1, "fleet.live.install_image": 2, "fleet.live.link_lost": 1, "fleet.live.no_session": 4170, "fleet.live.resolved": 4108, "fleet.live.unanswered": 4154, "fleet.live.whole": 1}
+    chaos-rolling-a-12097: {"fleet.live.held": 165, "fleet.live.hold_refused": 195392, "fleet.live.hold_refused.not_a_candidate": 195392}
+    chaos-rolling-c-12097: {"fleet.live.held": 4050}
+chaos candidates partitioned in turn mid-stream: 398 samples, 188 heads seen
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-12097 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-12097 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 195928}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-12097 refused the owner: {}
+chaos candidates partitioned in turn mid-stream:
+  chaos-rolling-a-12097 partitioned from 273.710021ms to 2.273793948s
+  chaos-rolling-c-12097 partitioned from 2.326182276s to 4.326266194s
+  every write acknowledged: held
+  4108 writes, 4108 acknowledged: p50 293 us, p99 4205 us, p999 47826 us, max 1368218 us; 4 over 50ms (sent+took): 0.00s+193ms 0.27s+128ms 2.33s+1368ms 3.96s+773ms
+  converged: false: owner Some(LiveState { holding: false, head: Some(4113), durable: Some(4113), owed: false, epoch: Some(1), identity: Some("b922b35e92078619f264dc6709a11d622a0d3b6b3d115a1cdfc408e6601dbc03"), fence: 1, holders: ["6861907338030700971", "14058012757634065811"], moving_to: [], recorded: ["6861907338030700971", "14058012757634065811"] }); candidates [Some(LiveState { holding: true, head: Some(4069), durable: None, owed: false, epoch: Some(1), identity: Some("4ae4d1300316eb521bbd0bd3077adfe9293e622bdbcaf709352cd59f84326fc8"), fence: 1, holders: [], moving_to: [], recorded: [] }),
+    chaos-rolling-b-12097: {"fleet.live.appended": 4114, "fleet.live.awaited": 4108, "fleet.live.durable": 4113, "fleet.live.held_back.placement": 1, "fleet.live.holders_recorded": 1, "fleet.live.install_image": 2, "fleet.live.link_lost": 1, "fleet.live.no_session": 4170, "fleet.live.resolved": 4108, "fleet.live.unanswered": 4154, "fleet.live.whole": 1}
+    chaos-rolling-a-12097: {"fleet.live.held": 165, "fleet.live.hold_refused": 195392, "fleet.live.hold_refused.not_a_candidate": 195392}
+    chaos-rolling-c-12097: {"fleet.live.held": 4050}
+  Convergence: 1 violations
+  398 samples, 188 heads seen
+  Agreement: held
+  NoLoss: held
+  chaos-rolling-b-12097 refused the owner: {}
+  chaos-rolling-a-12097 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 195928}
+  chaos-rolling-c-12097 refused the owner: {}
+
+thread 'candidates_partitioned_in_turn_mid_stream_lose_nothing' (12098) panicked at crates/cli/tests/live_chaos.rs:1135:5:
+chaos candidates partitioned in turn mid-stream: Convergence: owner Some(LiveState { holding: false, head: Some(4113), durable: Some(4113), owed: false, epoch: Some(1), identity: Some("b922b35e92078619f264dc6709a11d622a0d3b6b3d115a1cdfc408e6601dbc03"), fence: 1, holders: ["6861907338030700971", "14058012757634065811"], moving_to: [], recorded: ["6861907338030700971", "14058012757634065811"] }); candidates [Some(LiveState { holding: true, head: Some(4069), durable: None, owed: false, epoch: Some(1), identity: Some("4ae4d1300316eb521bbd0bd3077adfe9293e622bdbcaf709352cd59f84326fc8"), fence: 1, ho
+    chaos-rolling-b-12097: {"fleet.live.appended": 4114, "fleet.live.awaited": 4108, "fleet.live.durable": 4113, "fleet.live.held_back.placement": 1, "fleet.live.holders_recorded": 1, "fleet.live.install_image": 2, "fleet.live.link_lost": 1, "fleet.live.no_session": 4170, "fleet.live.resolved": 4108, "fleet.live.unanswered": 4154, "fleet.live.whole": 1}
+    chaos-rolling-a-12097: {"fleet.live.held": 165, "fleet.live.hold_refused": 195392, "fleet.live.hold_refused.not_a_candidate": 195392}
+    chaos-rolling-c-12097: {"fleet.live.held": 4050}
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    candidates_partitioned_in_turn_mid_stream_lose_nothing
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 46.33s
+
+error: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== partition 8 exit 101
+  chaos-rolling-a-16109 partitioned from 143.897832ms to 2.143985238s
+  chaos-rolling-c-16109 partitioned from 2.363375616s to 4.363466126s
+  3181 writes, 3181 acknowledged: p50 219 us, p99 5305 us, p999 50303 us, max 2230743 us; 4 over 50ms (sent+took): 0.00s+119ms 2.16s+57ms 2.21s+50ms 2.36s+2231ms
+  chaos-rolling-b-16109 refused the owner: {}
+  chaos-rolling-a-16109 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 482}
+  chaos-rolling-c-16109 refused the owner: {}
+== partition 9 exit 0
+  chaos-rolling-a-17087 partitioned from 154.605245ms to 2.154962965s
+  chaos-rolling-b-17087 partitioned from 2.302977623s to 4.304125826s
+  5994 writes, 5994 acknowledged: p50 237 us, p99 4618 us, p999 30179 us, max 123737 us; 4 over 50ms (sent+took): 0.00s+117ms 2.30s+124ms 4.40s+77ms 4.51s+98ms
+  chaos-rolling-c-17087 refused the owner: {}
+  chaos-rolling-a-17087 refused the owner: {}
+  chaos-rolling-b-17087 refused the owner: {}
+== partition 10 exit 0
