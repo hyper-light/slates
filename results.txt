@@ -1,0 +1,134 @@
+tested 28acf5766becb9d5d2d1fdfa53cbd2508464003c on x86_64, 4 cpus, load 0.29 0.06 0.02
+fmt exit 0 4s
+clippy exit 0 61s
+xtask exit 0 36s
+forward-1 exit 0 54s
+  forward-1: the forward of a read on a free shard took 1.509286ms while another forward to its owner waited out a 500ms hold; b's fleet counters Ok({"content.purged_bytes": 698343424, "fleet.discovery.pages": 11, "fleet.fan.sent": 3, "fleet.fan.unchanged": 9, "fleet.forward.begun": 4, "fleet.forward.taken_for_another": 1, "fleet.learner.fetch_paced": 2, "fleet.learner.fetches": 1, "fleet.owner_location.direct": 4, "fleet.plane.announce_lends": 4, "fleet.plane.announcements_sent": 4})
+  forward-1: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 90 filtered out; finished in 1.29s
+forward-2 exit 0 2s
+  forward-2: the forward of a read on a free shard took 1.542826ms while another forward to its owner waited out a 500ms hold; b's fleet counters Ok({"content.purged_bytes": 698343424, "fleet.discovery.pages": 13, "fleet.fan.sent": 3, "fleet.fan.unchanged": 13, "fleet.forward.begun": 4, "fleet.forward.taken_for_another": 1, "fleet.learner.fetch_paced": 8, "fleet.learner.fetches": 2, "fleet.owner_location.direct": 4, "fleet.plane.announce_lends": 4, "fleet.plane.announcements_sent": 4})
+  forward-2: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 90 filtered out; finished in 1.72s
+forward-3 exit 0 2s
+  forward-3: the forward of a read on a free shard took 1.450677ms while another forward to its owner waited out a 500ms hold; b's fleet counters Ok({"content.purged_bytes": 698343424, "fleet.discovery.pages": 13, "fleet.fan.sent": 3, "fleet.fan.unchanged": 12, "fleet.forward.begun": 4, "fleet.forward.taken_for_another": 1, "fleet.learner.fetch_paced": 8, "fleet.learner.fetches": 2, "fleet.owner_location.direct": 4, "fleet.plane.announce_lends": 4, "fleet.plane.announcements_sent": 4})
+  forward-3: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 90 filtered out; finished in 1.62s
+pin-1 exit 0 1s
+  pin-1: pin of 1000 files: 356.481616ms, reply Pinned { entries: 1000 }; 181 probes inside it — p50 810.507µs, p99 5.362772ms, longest of all 5.415903ms; before it the longest 1.343095ms
+  pin-1: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.59s
+pin-2 exit 0 1s
+  pin-2: pin of 1000 files: 414.309849ms, reply Pinned { entries: 1000 }; 206 probes inside it — p50 1.050351ms, p99 5.674955ms, longest of all 7.036467ms; before it the longest 433.226µs
+  pin-2: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s
+pin-3 exit 0 1s
+  pin-3: pin of 1000 files: 387.492343ms, reply Pinned { entries: 1000 }; 189 probes inside it — p50 862.507µs, p99 6.145107ms, longest of all 6.235534ms; before it the longest 1.429475ms
+  pin-3: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+ipc exit 0 6s
+  ipc: test result: ok. 29 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.00s
+  ipc: test result: ok. 2 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  ipc: test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+  ipc: test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+  ipc: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+  ipc: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  ipc: test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  ipc: test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+vfs exit 0 65s
+  vfs: test result: ok. 54 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 7.08s
+  vfs: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+  vfs: test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.17s
+  vfs: test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+  vfs: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.68s
+  vfs: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  vfs: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  vfs: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.53s
+  vfs: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+  vfs: test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+  vfs: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+  vfs: test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s
+  vfs: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.93s
+  vfs: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+  vfs: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+  vfs: test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
+  vfs: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
+  vfs: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  vfs: test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.33s
+  vfs: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+  vfs: test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+  vfs: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.92s
+  vfs: test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  vfs: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  vfs: test result: ok. 12 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.47s
+  vfs: test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.85s
+  vfs: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  vfs: test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.52s
+  vfs: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+  vfs: test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+  vfs: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  vfs: test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+  vfs: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  vfs: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  vfs: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.31s
+  vfs: test result: ok. 10 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 7.44s
+  vfs: test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  vfs: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.56s
+  vfs: test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.99s
+  vfs: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+  vfs: test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+  vfs: test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+server-tests exit 0 8s
+  server-tests: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.19s
+  server-tests: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.24s
+  server-tests: test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.30s
+fleet exit 0 326s
+  fleet: test result: ok. 88 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 325.93s
+client exit 0 48s
+  client: test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  client: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.14s
+  client: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+  client: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s
+  client: test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.19s
+  client: test result: ok. 3 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 2.14s
+  client: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.20s
+  client: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s
+  client: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+  client: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+  client: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  client: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.13s
+  client: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.16s
+  client: test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.26s
+  client: test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+  client: test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+transport-cluster exit 0 119s
+  transport-cluster: test result: ok. 213 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.17s
+  transport-cluster: test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+  transport-cluster: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+  transport-cluster: test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+  transport-cluster: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  transport-cluster: test result: ok. 1 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 29.91s
+  transport-cluster: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+  transport-cluster: test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.46s
+  transport-cluster: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+  transport-cluster: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+  transport-cluster: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+  transport-cluster: test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+  transport-cluster: test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.44s
+  transport-cluster: test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.97s
+  transport-cluster: test result: ok. 1 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.72s
+  transport-cluster: test result: ok. 1 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 41.30s
+  transport-cluster: test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.13s
+  transport-cluster: test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 3.73s
+  transport-cluster: test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  transport-cluster: test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  transport-cluster: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+  transport-cluster: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+  transport-cluster: test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+  transport-cluster: test result: ok. 3 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 1.08s
+  transport-cluster: test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.79s
+  transport-cluster: test result: ok. 132 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.79s
+  transport-cluster: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+  transport-cluster: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  transport-cluster: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.17s
+  transport-cluster: test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+  transport-cluster: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+  transport-cluster: test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+  transport-cluster: test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  transport-cluster: test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+server-lib exit 0 18s
+  server-lib: test result: ok. 193 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.63s
