@@ -662,6 +662,20 @@ fn keep_works() -> bool {
   std::env::args().any(|a| a == "--keep-works")
 }
 
+/// Format: nanoseconds a microsecond.
+const NS_PER_US: u64 = 1_000;
+
+/// The pause each client takes after a reply before its next request (`--think-us <µs>`, default none: a closed loop
+/// with no think time, every client always waiting on a request). An agent between its requests thinks, reads its
+/// tree or runs a build: the offered load the latency bound is stated for. A latency never includes the pause.
+fn think_ns() -> u64 {
+  arg("--think-us").map_or(0, |us| {
+    us.parse::<u64>()
+      .expect("--think-us µs")
+      .saturating_mul(NS_PER_US)
+  })
+}
+
 /// How many logical clients share one connection (`--per-connection <k>`, default one): each keeps its own work
 /// volume, rounds, merges and conflicts and one request in flight, so a connection carries up to `k` at once, within
 /// the client's own in-flight bound (its ring's slots), which refuses a `k` past it at the first send.
@@ -726,8 +740,11 @@ impl Connection {
 struct Worker {
   conns: Vec<Connection>,
   agents: Vec<Agent>,
-  /// Clients with nothing in flight and a step to send, in the order they became ready.
-  ready: std::collections::VecDeque<usize>,
+  /// Clients with nothing in flight and a step to send, by when each may send: its last reply plus the think time
+  /// (`--think-us`), earliest first.
+  ready: std::collections::BinaryHeap<std::cmp::Reverse<(u64, usize)>>,
+  /// The pause a client takes after each reply before its next request (`--think-us`), nanoseconds.
+  think_ns: u64,
   tally: Tally,
   epoch: Instant,
 }
@@ -770,16 +787,21 @@ impl Worker {
   /// Sends for every ready client, in order, until one cannot go (each connection's ring and bound are its own, so
   /// a client that cannot go is kept and the rest are tried).
   fn send_ready(&mut self) {
-    let mut kept = std::collections::VecDeque::new();
-    while let Some(a) = self.ready.pop_front() {
+    let now = ns_since(self.epoch);
+    let mut kept = Vec::new();
+    while let Some(std::cmp::Reverse((due, a))) = self.ready.peek().copied() {
+      if due > now {
+        break;
+      }
+      self.ready.pop();
       if self.agents[a].step == Step::Done || self.agents[a].inflight.is_some() {
         continue;
       }
       if !self.send(a) {
-        kept.push_back(a);
+        kept.push(std::cmp::Reverse((now, a)));
       }
     }
-    self.ready = kept;
+    self.ready.extend(kept);
   }
 
   /// Drains connection `c`'s ring, stamping each reply's arrival, and moves each reply's client on.
@@ -818,7 +840,9 @@ impl Worker {
       };
       agent.advance(reply, (sent_ns, now, kind), &mut self.tally);
       if agent.step != Step::Done {
-        self.ready.push_back(a);
+        self
+          .ready
+          .push(std::cmp::Reverse((now.saturating_add(self.think_ns), a)));
       }
     }
     // The daemon keeps every reply's completion record until the client acknowledges it, and refuses a client that
@@ -973,7 +997,9 @@ impl Worker {
 /// sends its next request at once, then sends for clients still waiting for room. Every `PROGRESS_EVERY` it prints how
 /// many of its clients are done and the submits it has seen.
 fn drive(conns: Vec<Connection>, agents: Vec<Agent>, epoch: Instant, worker: usize) -> Tally {
-  let ready = (0..agents.len()).collect();
+  let ready = (0..agents.len())
+    .map(|a| std::cmp::Reverse((0, a)))
+    .collect();
   let check_every = conns.first().map_or(1, |conn| {
     (conn.client.deadlines().reply_ns / OVERDUE_CHECKS_PER_DEADLINE).max(1)
   });
@@ -981,6 +1007,7 @@ fn drive(conns: Vec<Connection>, agents: Vec<Agent>, epoch: Instant, worker: usi
     conns,
     agents,
     ready,
+    think_ns: think_ns(),
     tally: Tally::default(),
     epoch,
   };
