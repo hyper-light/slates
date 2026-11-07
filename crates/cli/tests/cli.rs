@@ -267,8 +267,7 @@ fn await_stable_daemon(instance: &str, bootstrap: bool) {
     };
     if streak >= STABLE_STREAK {
       if bootstrap {
-        let (code, _, error) = run(instance, &["bootstrap", "root"]);
-        assert_eq!(code, 0, "explicit first-time bootstrap: {error}");
+        bootstrap_through_stalls(instance, &mut progress);
       }
       return;
     }
@@ -3210,6 +3209,36 @@ fn await_daemon(instance: &str, replaced: Option<u32>, held: &[u16]) -> u32 {
       return pid;
     }
     progress.check(instance, "a daemon other than the one replaced answered");
+    pause();
+  }
+}
+
+/// Format: the client's words when a live daemon has not answered inside its reply deadline (`ClientError::Stalled`,
+/// `crates/client/src/error.rs`).
+const STALLED_WORDS: &str = "no reply within";
+
+/// Bootstraps the consensus group, waiting out a reply that stalls while the daemon progresses ([`StartProgress`]). At 8
+/// spinners a CPU (2026-11-07) `bootstrap root` was refused "no reply within 1000000000 ns" in five of fifteen runs: the
+/// client's reply deadline is a wall second against a daemon that was alive and starved (the client's deadlines are
+/// clients' A-232). A stalled bootstrap may still land, so after a stall the group being already initialized is the
+/// bootstrap done; any other refusal fails the test.
+fn bootstrap_through_stalls(instance: &str, progress: &mut StartProgress) {
+  let mut stalled = false;
+  loop {
+    let (code, _, error) = run(instance, &["bootstrap", "root"]);
+    if code == 0 {
+      return;
+    }
+    let squashed = error.to_ascii_lowercase().replace('_', "");
+    if stalled && squashed.contains("consensusalreadyinitialized") {
+      return;
+    }
+    assert!(
+      error.contains(STALLED_WORDS),
+      "explicit first-time bootstrap: {error}"
+    );
+    stalled = true;
+    progress.check(instance, "the bootstrap's reply");
     pause();
   }
 }
