@@ -14096,9 +14096,21 @@ status, GAPS.
   `docs/bugs/2026-11-06-a-live-takeover-counted-members-that-never-held-the-log.md`.
 - **The rule.**
   - Each shipper, a successor's too, records its epoch and holder set in the volume's catalog register before its
-    first entry (`Op::LiveHoldersCommitted`, `PolicyRecord::live_holders`).
-  - It ships nothing until that catalog version is placed at `f + 1`, as a head's catalog is. At `f = 0` the owner's
-    commit places it, with the same code (R8).
+    first entry (`Op::LiveHoldersCommitted`, `PolicyRecord::live_holders`). It ships nothing until that catalog version
+    is placed at `f + 1`, as a head's catalog is. At `f = 0` the owner's commit places it, with the same code (R8).
+  - A new shipper's first set is the one the volume's catalog records, less this node, when it records one. For a
+    successor that is the set its takeover counted (the dead owner's record); for an owner restarted at its epoch, its
+    own. Only a volume with no record starts from the configuration's candidates. Re-recording that set under the new
+    epoch names hosts that already hold the log.
+  - **The set changes by a joint transition, recorded only after the transfer (Vertical Paxos activation, amended
+    2026-11-07).** When the configuration names H′ ≠ H, the shipper ships to H ∪ H′ and counts a write durable only
+    once `f` of each hold it (`Shipper::begin_transition`; live-fixes). H′ is recorded only once it holds every durable
+    entry and the last whole entry, itself durable, carries a key for every candidate (`live_ship::target_recordable`).
+    The shipper drops H once that record is placed (`Shipper::activate`). Recording H′ first, as A-240 first said, let
+    a successor that died before its install was durable leave the next phase one counting a set that held none of the
+    log. The model breaks NoLoss with the record made at once (`recording_a_new_holder_set_before_it_holds_the_log_…`).
+  - A write is answered only once a successor could open the log at it (`live_ship::answerable`): the last whole entry
+    carries a key for every candidate and is itself durable.
   - Phase one counts `f + 1` reports only among the holders the adopted catalog records. Every member asked still
     reports, and the greatest head among all reports is adopted.
   - When too few recorded holders answer, phase one waits (`fleet.live.takeover_waits_quorum`). It never falls back to

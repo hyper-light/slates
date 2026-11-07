@@ -771,12 +771,34 @@ pub(crate) fn published(
   let object = ObjectId(id.bytes);
   let configuration = state.fleet.configuration();
   let local = configuration.owner;
-  let holders: Vec<HostId> = configuration
-    .place(object)
-    .candidates
-    .into_iter()
-    .filter(|host| *host != local)
-    .collect();
+  // A new shipper starts from the holder set the volume's catalog records, less this node, when it records one: a
+  // successor's is the set its takeover counted (the dead owner's record, kept by `verbs::materialize_taken_over`), and
+  // an owner restarted at its epoch finds its own. Those hosts hold the log; the configuration's candidates may be a set
+  // the old owner was still moving to, holding none of it, and recorded at once they would leave the next takeover
+  // counting them. The shipper moves to the configuration by a transition of its own ([`follow_candidates`]). With no
+  // record, nothing was ever shipped, and it starts from the configuration.
+  let recorded: Option<Vec<HostId>> = state
+    .db
+    .partition()
+    .volume(id)
+    .and_then(|volume| volume.policy.live_holders.as_ref())
+    .map(|recorded| {
+      recorded
+        .holders
+        .iter()
+        .copied()
+        .map(HostId)
+        .filter(|host| *host != local)
+        .collect()
+    });
+  let holders: Vec<HostId> = recorded.unwrap_or_else(|| {
+    configuration
+      .place(object)
+      .candidates
+      .into_iter()
+      .filter(|host| *host != local)
+      .collect()
+  });
   // The volume's epoch is its head's: a successor ships under the epoch its takeover placed the head at, which is above
   // the dead owner's, whatever its own host's epoch (heads use the same rule, `fleet::owed_record`).
   let placed = state.placed_heads.get(&object).map(|placed| placed.epoch);
