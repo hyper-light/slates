@@ -2627,6 +2627,206 @@ fn a_shard_stuck_in_its_start_stops_the_heartbeat_so_the_anchor_restarts_the_dae
   drop(anchor);
 }
 
+/// Shape: how long the beat-watching boot test holds a shard's start on the CPU: three liveness windows. Unsliced, the
+/// watchdog finds the shard spinning after one window of CPU and withholds the beat until the start ends, a gap of about
+/// two windows; with two windows held the gap would sit at about one, on the bound itself.
+const BUSY_START_NS: u64 = 3 * slates_server::daemon::LIVENESS_BUDGET_NS;
+
+/// Shape: the longest the beat-watching boot test waits for the busy start to end: the start's CPU time at a sixty-fourth of
+/// a CPU, the slowest share the CLI suite holds a start to (`STARVED_RUNS_ONE_IN` there). On a busy Mac the start's three
+/// windows of CPU took 21 s of wall time.
+const BUSY_START_CEILING: Duration = Duration::from_nanos(64 * BUSY_START_NS);
+
+/// The largest gap between successive beats of the anchor's heartbeat word (a beat still missing at the end counts as a
+/// gap), from the first beat seen until `done` says the busy start ended, and a liveness window past it; the test plays
+/// the anchor, reading the word every beat. Ends the test at [`BUSY_START_CEILING`].
+#[allow(clippy::disallowed_methods)] // the test plays the anchor, which watches the heartbeat from its own thread
+fn largest_beat_gap(anchor: &Anchor, done: &std::sync::mpsc::Receiver<()>) -> Duration {
+  let read = || anchor.segment.supervision().unwrap().heartbeat_ns();
+  let every = Duration::from_nanos(slates_server::daemon::HEARTBEAT_NS);
+  let after = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
+  let started = Instant::now();
+  let mut ended: Option<Instant> = None;
+  let mut last = read();
+  let mut last_seen = started.elapsed();
+  let mut largest = Duration::ZERO;
+  while ended.is_none_or(|at| at.elapsed() < after) {
+    assert!(
+      started.elapsed() < BUSY_START_CEILING,
+      "the busy start ended within {BUSY_START_CEILING:?}"
+    );
+    std::thread::sleep(every);
+    if ended.is_none() && done.try_recv().is_ok() {
+      ended = Some(Instant::now());
+    }
+    let now = read();
+    if now != last {
+      if last != 0 {
+        largest = largest.max(Duration::from_nanos(now.saturating_sub(last)));
+      }
+      last = now;
+      last_seen = started.elapsed();
+    }
+  }
+  if last != 0 {
+    largest = largest.max(started.elapsed().saturating_sub(last_seen));
+  }
+  largest
+}
+
+/// Boot, §4.14 `daemon.alive` (the recovery-slicing plan): a shard's start that runs three liveness windows on the CPU,
+/// as a large recovery does, keeps the daemon's beat: its work yields between slices, so the watchdog sees the shard
+/// step. Do: start a daemon whose second shard runs the Busy boot fault for [`BUSY_START_NS`] of its own CPU, and watch
+/// the anchor's heartbeat word every beat until a window past the start's end (an observation of that shard answered). Expect: the beat never older than one window plus a
+/// beat. Unsliced, the start is one poll, the watchdog finds the shard spinning after a window of CPU and withholds the
+/// beat until the start ends, and the anchor kills the daemon, whose successor repeats the same start.
+#[test]
+fn a_shard_start_running_windows_of_cpu_keeps_the_daemons_beat() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-busy-beat-{}", std::process::id());
+  let config =
+    DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS)).with_boot_fault(BootFault {
+      partition: 1,
+      kind: BootFaultKind::Busy,
+      for_ns: BUSY_START_NS,
+    });
+  let anchor = held_anchor("busy-beat", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let window = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
+  let beat = Duration::from_nanos(slates_server::daemon::HEARTBEAT_NS);
+  // An observation of the busy shard is answered once its start's poll ends: the watch runs until then. Its budget is
+  // the shard's own CPU time, past the start's.
+  let busy = daemon.shards()[1];
+  let observation = daemon
+    .observation(
+      Some(busy),
+      4 * BUSY_START_NS,
+      |_: &mut slates_server::state::ShardState| (),
+    )
+    .unwrap();
+  let (said, done) = std::sync::mpsc::channel();
+  let waiter = std::thread::spawn(move || {
+    let _ = observation.wait();
+    let _ = said.send(());
+  });
+  let gap = largest_beat_gap(&anchor, &done);
+  let _ = waiter.join();
+  daemon.stop();
+  drop(anchor);
+  assert!(
+    gap <= window + beat,
+    "the beat went {gap:?} without advancing while a shard's start ran on the CPU, past the {window:?} window plus a \
+     {beat:?} beat: the watchdog withheld it"
+  );
+}
+
+/// Shape: the accepted versions and the open works the sliced-recovery test leaves behind: enough that the recovery
+/// spans many slices (step 1 of the recovery-slicing plan measured 300 entries and 101 merge volumes at about 80 ms of
+/// CPU on this Mac, against slices of microseconds to a few milliseconds), and few enough for the suite.
+const SLICED_VERSIONS: u64 = 200;
+/// Shape: see [`SLICED_VERSIONS`].
+const SLICED_OPEN_WORKS: u64 = 100;
+
+/// Format: the status count of the slices a shard's recovery ran in.
+const RECOVERY_SLICES: &str = "recovery.slices";
+
+/// The largest single shard's status count `kind` (a count every shard keeps of its own).
+fn max_counter(client: &mut Client, kind: &str) -> u64 {
+  client
+    .daemon_status()
+    .unwrap()
+    .shards
+    .iter()
+    .map(|shard| {
+      shard
+        .refusals
+        .iter()
+        .filter(|refusal| refusal.kind == kind)
+        .map(|refusal| refusal.count)
+        .sum::<u64>()
+    })
+    .max()
+    .unwrap_or(0)
+}
+
+/// §2.6 boot step 2, §4.16 (the recovery-slicing plan): a daemon restarted over a green with a long chain and many open
+/// works recovers it in slices, and recovers all of it. Do: a green, [`SLICED_VERSIONS`] versions accepted from works
+/// each adding a file, and [`SLICED_OPEN_WORKS`] works each with an unsubmitted edit; restart the daemon over the same
+/// segment. Expect: the green at its head, every version's file at its version, every open work's edit read back, and
+/// the shard's recovery having run in more than one slice ([`RECOVERY_SLICES`]). Unsliced, it runs in one poll.
+#[test]
+fn a_large_merge_state_is_recovered_whole_and_in_slices() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-sliced-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let anchor = held_anchor("sliced", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let green = client.create_green("sliced-green", false).unwrap();
+  let version_file = |version: u64| format!("v{version}");
+  let version_bytes = |version: u64| format!("accepted as version {version}\n").into_bytes();
+  for version in 1..=SLICED_VERSIONS {
+    let (work, _) = client
+      .create_work(green, &format!("sliced-v{version}"))
+      .unwrap();
+    client
+      .edit(work, &version_file(version), 0, 0, &version_bytes(version))
+      .unwrap();
+    assert_eq!(
+      client.submit(work).unwrap(),
+      slates_client::Submitted::Accepted(version)
+    );
+  }
+  let open_bytes = |index: u64| format!("open work {index}'s edit\n").into_bytes();
+  let mut open = Vec::new();
+  for index in 0..SLICED_OPEN_WORKS {
+    let (work, _) = client
+      .create_work(green, &format!("sliced-open-{index}"))
+      .unwrap();
+    client
+      .edit(work, &format!("w{index}"), 0, 0, &open_bytes(index))
+      .unwrap();
+    open.push(work);
+  }
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  assert_eq!(
+    client.versions(green).unwrap(),
+    SLICED_VERSIONS,
+    "the green recovered at its head"
+  );
+  for version in 1..=SLICED_VERSIONS {
+    let at = slates_client::ReadAt::Version { version };
+    assert_eq!(
+      client.read(green, &version_file(version), at).unwrap(),
+      version_bytes(version),
+      "version {version}'s file"
+    );
+  }
+  for (index, work) in (0..).zip(&open) {
+    assert_eq!(
+      client
+        .read(*work, &format!("w{index}"), slates_client::ReadAt::Head)
+        .unwrap(),
+      open_bytes(index),
+      "open work {index}'s edit"
+    );
+  }
+  let slices = max_counter(&mut client, RECOVERY_SLICES);
+  drop(client);
+  second.stop();
+  drop(anchor);
+  assert!(
+    slices > 1,
+    "the recovery of {SLICED_VERSIONS} versions and {SLICED_OPEN_WORKS} open works ran in one slice ({RECOVERY_SLICES} \
+     = {slices})"
+  );
+}
+
 /// Boot (A-100): do start a daemon whose second shard spends two liveness windows on the CPU in its start, and stop the
 /// daemon at once, while its control loop still waits on that shard; expect the stop to finish within the client's
 /// start wait. (The heartbeat kept joinable until the boot was accepted hung `Daemon::stop` in
