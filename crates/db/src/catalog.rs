@@ -20,16 +20,25 @@ pub struct SnapshotId {
   pub value: u64,
 }
 
-/// A principal, established at rendezvous (§4.13).
+/// A principal, established at rendezvous (§4.13). A host account means something only on its host (A-237): a uid, a
+/// SID and a consumer enrolled under an account each carry the host whose account it is, by that host's certificate
+/// anchor (`slates_server::deploy`'s blake3 of the node certificate, stable across the host's restarts, never the
+/// per-boot member id). So one uid on two hosts is two principals, a forwarded request is scoped by the authenticated
+/// session's anchor ([`Principal::rehosted`]), and an owner or access entry names (host, account). A certificate names
+/// itself on every host.
 #[derive(Wire, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Principal {
-  /// A Unix user.
+  /// A Unix user of a host.
   Uid {
+    /// The host whose user it is, by its certificate anchor.
+    host: crate::HostId,
     /// The uid.
     uid: u32,
   },
-  /// A Windows SID.
+  /// A Windows SID of a host.
   Sid {
+    /// The host whose account it is, by its certificate anchor.
+    host: crate::HostId,
     /// The SID text.
     sid: String,
   },
@@ -41,9 +50,10 @@ pub enum Principal {
   /// An **enrolled consumer** under a host account (§4.13 "Principals": "a trusted enrollment
   /// establishes `ConsumerId` and scoped rights for a workload under that account"): the workload
   /// bound its channel at rendezvous with the capability its enrollment minted, so two agents sharing a
-  /// uid are two principals here, each with only the rights an access list names for it. Appended for
-  /// append-only wire evolution.
+  /// uid are two principals here, each with only the rights an access list names for it.
   Consumer {
+    /// The host whose account the consumer was enrolled under, by its certificate anchor.
+    host: crate::HostId,
     /// The host account (uid) the consumer was enrolled under.
     account: u32,
     /// The consumer's id, minted at enrollment.
@@ -51,8 +61,8 @@ pub enum Principal {
   },
 }
 
-/// Format: the bit that marks a tenant id hashed from a principal with no numeric account (a SID, a certificate), so it
-/// never names the same tenant as a uid.
+/// Format: the bit that marks a tenant id hashed from a principal. Since A-237 every tenant is hashed (a host account
+/// with its host), and the bit stays so no hashed tenant is ever a bare uid.
 const HASHED_TENANT: u64 = 1 << 63;
 
 impl Principal {
@@ -60,22 +70,59 @@ impl Principal {
   /// account; a SID or a certificate by a namespaced hash of its identity, marked with the top bit so it never names the
   /// same tenant as a uid. Here, beside the records, so a volume's destroy can tell when its tenant has no volume left.
   pub fn tenant(&self) -> u64 {
-    let hashed = |kind: &[u8], identity: &[u8]| {
+    let hashed = |kind: &[u8], identity: &[&[u8]]| {
       let mut hasher = blake3::Hasher::new();
-      hasher.update(b"slates tenant v1");
+      hasher.update(b"slates tenant v2");
       hasher.update(kind);
-      hasher.update(identity);
+      for part in identity {
+        hasher.update(part);
+      }
       let mut word = [0u8; size_of::<u64>()];
       if let Some(head) = hasher.finalize().as_bytes().get(..size_of::<u64>()) {
         word.copy_from_slice(head);
       }
       u64::from_le_bytes(word) | HASHED_TENANT
     };
+    // A host account seals under its host as well (A-237): one uid on two hosts is two tenants.
     match self {
-      Principal::Uid { uid } => u64::from(*uid),
-      Principal::Consumer { account, .. } => u64::from(*account),
-      Principal::Sid { sid } => hashed(b"sid", sid.as_bytes()),
-      Principal::Certificate { hash } => hashed(b"certificate", hash),
+      Principal::Uid { host, uid } => hashed(b"uid", &[&host.0.to_le_bytes(), &uid.to_le_bytes()]),
+      Principal::Consumer { host, account, .. } => {
+        hashed(b"uid", &[&host.0.to_le_bytes(), &account.to_le_bytes()])
+      }
+      Principal::Sid { host, sid } => hashed(b"sid", &[&host.0.to_le_bytes(), sid.as_bytes()]),
+      Principal::Certificate { hash } => hashed(b"certificate", &[hash]),
+    }
+  }
+
+  /// The host whose account this principal is (A-237); `None` for a certificate, which names itself on every host.
+  pub fn host(&self) -> Option<crate::HostId> {
+    match self {
+      Principal::Uid { host, .. } | Principal::Sid { host, .. } | Principal::Consumer { host, .. } => {
+        Some(*host)
+      }
+      Principal::Certificate { .. } => None,
+    }
+  }
+
+  /// This principal as the host `host` authenticated it (A-237): a host account's host replaced by `host`, a
+  /// certificate as it is. The owner of a forwarded request scopes its principal by the session's authenticated
+  /// anchor this way, never by the host the origin's request names.
+  #[must_use]
+  pub fn rehosted(&self, host: crate::HostId) -> Principal {
+    match self {
+      Principal::Uid { uid, .. } => Principal::Uid { host, uid: *uid },
+      Principal::Sid { sid, .. } => Principal::Sid {
+        host,
+        sid: sid.clone(),
+      },
+      Principal::Consumer {
+        account, consumer, ..
+      } => Principal::Consumer {
+        host,
+        account: *account,
+        consumer: *consumer,
+      },
+      Principal::Certificate { hash } => Principal::Certificate { hash: *hash },
     }
   }
 
@@ -91,20 +138,27 @@ impl Principal {
     const KIND_CONSUMER: u8 = 4;
     let mut out = Vec::new();
     match self {
-      Principal::Uid { uid } => {
+      Principal::Uid { host, uid } => {
         out.push(KIND_UID);
+        out.extend_from_slice(&host.0.to_le_bytes());
         out.extend_from_slice(&uid.to_le_bytes());
       }
-      Principal::Sid { sid } => {
+      Principal::Sid { host, sid } => {
         out.push(KIND_SID);
+        out.extend_from_slice(&host.0.to_le_bytes());
         out.extend_from_slice(sid.as_bytes());
       }
       Principal::Certificate { hash } => {
         out.push(KIND_CERTIFICATE);
         out.extend_from_slice(hash);
       }
-      Principal::Consumer { account, consumer } => {
+      Principal::Consumer {
+        host,
+        account,
+        consumer,
+      } => {
         out.push(KIND_CONSUMER);
+        out.extend_from_slice(&host.0.to_le_bytes());
         out.extend_from_slice(&account.to_le_bytes());
         out.extend_from_slice(&consumer.to_le_bytes());
       }

@@ -73,7 +73,7 @@ fn rw_cx() -> OpContext {
     .attach(
       VolumeId { bytes: [0; 16] },
       View::Current,
-      Principal::Uid { uid: 0 },
+      Principal::Uid { host: slates_db::HostId(0), uid: 0 },
       Rights {
         read: true,
         write: true,
@@ -467,7 +467,7 @@ fn each_current_round_records_what_waited_for_it_and_a_pinned_round_records_noth
     .attach(
       VolumeId { bytes: [0; 16] },
       View::Version(1),
-      Principal::Uid { uid: 0 },
+      Principal::Uid { host: slates_db::HostId(0), uid: 0 },
       Rights {
         read: true,
         write: false,
@@ -509,7 +509,7 @@ fn a_current_round_moves_its_readers_point_and_a_pinned_round_moves_none() {
       .attach(
         VolumeId { bytes: [0; 16] },
         view,
-        Principal::Uid { uid: 0 },
+        Principal::Uid { host: slates_db::HostId(0), uid: 0 },
         Rights { read: true, write },
       )
       .unwrap();

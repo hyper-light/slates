@@ -91,7 +91,7 @@ fn cx_as(uid: u32) -> OpContext {
     .attach(
       VOLUME,
       View::Current,
-      Principal::Uid { uid },
+      Principal::Uid { host: slates_db::HostId(0), uid },
       Rights {
         read: true,
         write: true,
@@ -105,7 +105,7 @@ fn export<'a>(bridge: &'a mut VolumeBridge<'_>, uid: u32) -> Export<'a> {
   Export::new(
     bridge,
     VOLUME,
-    Principal::Uid { uid },
+    Principal::Uid { host: slates_db::HostId(0), uid },
     Rights {
       read: true,
       write: true,

@@ -280,7 +280,7 @@ fn vid(n: u64) -> VolumeId {
 }
 
 fn principal(n: u32) -> Principal {
-  Principal::Uid { uid: 1000 + n }
+  Principal::Uid { host: slates_db::HostId(0), uid: 1000 + n }
 }
 
 fn volume(n: u64, name: &str) -> VolumeRecord {

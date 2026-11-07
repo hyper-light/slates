@@ -72,7 +72,7 @@ fn write_cx() -> OpContext {
     .attach(
       VOL_ID,
       View::Current,
-      Principal::Uid { uid: 0 },
+      Principal::Uid { host: slates_db::HostId(0), uid: 0 },
       Rights {
         read: true,
         write: true,
@@ -156,7 +156,7 @@ fn a_client_mounts_and_reads_a_file_over_a_real_socket() {
     let mut export = Export::new(
       &mut bridge,
       VOL_ID,
-      Principal::Uid { uid: 0 },
+      Principal::Uid { host: slates_db::HostId(0), uid: 0 },
       Rights {
         read: true,
         write: true,

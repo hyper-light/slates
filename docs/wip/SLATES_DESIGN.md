@@ -6459,6 +6459,13 @@ also binds the delegated consumer scope. Rights are checked before resource admi
 namespace lookup that reveals protected content, queue creation or any VFS/device effect.
 Replay/session resumption preserves that binding; it cannot change the authenticated consumer.
 
+> **Status (2026-11-07, A-237): a host account carries its host.** Every principal names the host whose account it is
+> by that host's certificate anchor, a forwarded request is rescoped by its TLS session's anchor, and owner and access
+> entries record (host, account), so a uid is never taken for another host's. A client of another node is refused
+> `NotShared` naming the (anchor, account) a share would name. On Windows the account is still recorded as uid 0 (the
+> rendezvous authenticates by the bootstrap object's mode and reads no SID), now host-qualified; naming it by its SID is
+> held.
+
 This requires a harness boundary when untrusted processes share an OS account. Slates cannot
 prevent an unsandboxed same-uid process from reading other process memory or writing host files
 through unrelated syscalls. It supplies scoped VFS access and grant checks; the harness owns
@@ -13350,6 +13357,38 @@ GAPS, BENCHMARKS ("The spin policy, measured and rejected").
 - **What stays.** Main's macOS spin: a nap of about 15 µs at each driver harvest, busy steps included, which is what
   keeps its tails under load. The decision rests on Ada's rule that p99 under load is the target. The true spin's change
   is kept on record, not landed (`agents/clients-spin`, a75f9213).
+
+### A-237 — A host account means something only on its host: every principal that crosses hosts is scoped by its origin's certificate anchor (accepted and built 2026-11-07)
+Applied in the same change to: §4.13 (its status on principals), `slates_db::catalog::Principal` (a host on `Uid`,
+`Sid` and `Consumer`; the tenant and the index key over it; `rehosted`), `slates_ipc::protocol` (the wire `Principal`'s
+host, `DaemonReport::anchor`, `Refusal::NotShared`), `slates_wire::header::MAJOR` (2), `slates_anchor::layout`
+(`LAYOUT_VERSION` 5, a typed refusal of layout 4), `crates/server/src/verbs.rs` (`serve_forward` rescopes the forwarded
+principal by the session's anchor; `not_shared_with`; `to_db_principal`, `to_wire_principal`), `crates/server/src/daemon.rs`
+(`local_anchor`, the rendezvous's principal, `Daemon::anchor`), `crates/server/src/nfs.rs` (an NFS caller's host),
+`crates/bridge-virtiofs/src/vhost_user.rs` (`adopt` takes the host), the CLI (`slates status` prints `anchor:`; `slates
+share` takes `@ANCHOR`), GAPS, `docs/bugs/2026-11-07-a-principal-was-compared-across-hosts-with-no-host.md`, and the
+tests named below.
+- **Why.** A verb forwarded to a volume's owner on another node carried the requester's principal "as the origin node
+  authenticated it", and the owner judged it by `rights_of`'s bare equality: a principal is equal to an owner or an
+  access entry, and a uid carried no host. So one uid on two hosts was one principal; every Windows channel is
+  recorded as uid 0 (the bootstrap object's mode is the authentication), so any two Windows users on different nodes
+  were one principal, and a Windows user was Unix root's principal. Found 2026-11-07 while checking a wrong premise
+  (that a Windows consumer could never attest; it can, `crates/server/tests/consumers.rs`).
+- **The rule.** A local account is meaningful only on its host. A uid, a SID and a consumer each carry the host whose
+  account it is, by that host's certificate anchor: the fleet's pinned certificate's, else the machine identity's
+  (`daemon::local_anchor`), stable across the host's restarts and never the per-boot member id, which would orphan every
+  user's volumes at a restart. A local request is the local anchor's; a forwarded request is rescoped by the anchor of
+  the TLS session it arrived on (`Principal::rehosted`), never by a host the origin's request names. Owner and access
+  entries record (host, account), and `rights_of`'s equality compares them whole. A certificate names itself on every
+  host. This is §4.13's "between hosts, authenticated transport also binds the delegated consumer scope".
+- **What a user meets.** A client of node B reaching a volume owned on node A is refused `NotShared { verb, principal }`,
+  naming (B's anchor, its account): the share that lets it in. `slates status` prints each node's `anchor:`, and `slates
+  share ID uid:N@ANCHOR` (or `consumer:ACCOUNT/ID@ANCHOR`) names another node's account. One person's accounts on
+  several hosts as one principal, a fleet account mapping, is not part of this: an open design item for Ada (GAPS).
+- **Format.** The wire principal and the catalog's records change shape, so the wire major is 2 (a major-1 peer is
+  refused before its body is read) and the segment layout is 5 (a layout-4 segment is refused at start, saying to start
+  afresh and re-enroll and re-share). Pre-release; no shim. Neither SDK encodes a principal or `Enroll`.
+- **Tests:** RESULTS-A237.
 
 ### A-228 — A daemon's liveness is judged in its shards' own CPU time, by an owned watchdog thread (accepted and built 2026-11-06)
 Applied in the same change to: §4.14 (its status on `daemon.alive`), `crates/server/src/watchdog.rs` (new),

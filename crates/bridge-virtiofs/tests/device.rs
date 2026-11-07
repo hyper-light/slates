@@ -2637,7 +2637,7 @@ mod backed {
       .attach(
         vid(),
         slates_bridge_core::View::Current,
-        slates_db::catalog::Principal::Uid { uid: 0 },
+        slates_db::catalog::Principal::Uid { host: slates_db::HostId(0), uid: 0 },
         slates_bridge_core::Rights {
           read: true,
           write: false,

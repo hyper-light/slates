@@ -499,7 +499,8 @@ async fn serve_vhost_user_device(
 ) {
   use slates_bridge_virtiofs::vhost_user::VhostUserSeam;
   let config = DeviceConfig::new(tag);
-  let mut seam = match VhostUserSeam::adopt(socket, &config) {
+  let host = crate::state::with_state(|s| s.origin_anchor).unwrap_or(slates_db::HostId(0));
+  let mut seam = match VhostUserSeam::adopt(socket, &config, host) {
     Ok(seam) => seam,
     Err(refused) => {
       (harness.on_end)(GuestDeviceOutcome::HandshakeRefused(Some(refused)));

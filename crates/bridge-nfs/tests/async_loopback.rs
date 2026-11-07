@@ -97,7 +97,7 @@ fn write_cx() -> OpContext {
     .attach(
       VOL_ID,
       View::Current,
-      Principal::Uid { uid: 0 },
+      Principal::Uid { host: slates_db::HostId(0), uid: 0 },
       Rights {
         read: true,
         write: true,
@@ -187,7 +187,7 @@ fn a_client_mounts_and_reads_a_file_over_the_async_server() {
       let mut export = Export::new(
         &mut bridge,
         VOL_ID,
-        Principal::Uid { uid: 0 },
+        Principal::Uid { host: slates_db::HostId(0), uid: 0 },
         Rights {
           read: true,
           write: true,
@@ -286,7 +286,7 @@ fn queued_calls_yield_between_replies() {
   let mut export = Export::new(
     &mut bridge,
     VOL_ID,
-    Principal::Uid { uid: 0 },
+    Principal::Uid { host: slates_db::HostId(0), uid: 0 },
     Rights {
       read: true,
       write: true,

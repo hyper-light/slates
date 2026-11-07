@@ -22,7 +22,7 @@ fn a_mounted_fixture_reports_its_provisioning_owner() {
     .attach(
       id,
       View::Current,
-      Principal::Uid { uid },
+      Principal::Uid { host: slates_db::HostId(0), uid },
       Rights {
         read: true,
         write: true,

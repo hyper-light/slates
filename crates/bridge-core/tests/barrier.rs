@@ -77,7 +77,7 @@ fn rw() -> Rights {
 
 fn attach(registry: &mut Attachments, volume: VolumeId) -> AttachmentId {
   registry
-    .attach(volume, View::Current, Principal::Uid { uid: 0 }, rw())
+    .attach(volume, View::Current, Principal::Uid { host: slates_db::HostId(0), uid: 0 }, rw())
     .unwrap()
 }
 

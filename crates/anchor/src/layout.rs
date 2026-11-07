@@ -8,8 +8,12 @@ pub const MAGIC: u32 = 0x4E41_4C53;
 /// Format: the layout version; changed for header, region or timestamp semantics. Version 3 uses
 /// one host-wide monotonic origin for supervision and retained deadlines; version 2 reset clocks
 /// per instance and cannot be recovered safely by a version-3 daemon. Version 4 (A-98) appends the
-/// content pool's owner words, so a version-3 segment is refused rather than read without them.
-pub const LAYOUT_VERSION: u32 = 4;
+/// content pool's owner words, so a version-3 segment is refused rather than read without them. Version 5 (A-237)
+/// records every principal with the host whose account it is, so a version-4 segment's owners, access lists and
+/// consumers, which name accounts with no host, are refused at start rather than taken for this host's.
+pub const LAYOUT_VERSION: u32 = 5;
+/// Format: the layout before A-237's host-scoped principals, refused with what to do about it.
+pub const LAYOUT_BEFORE_HOST_SCOPED_PRINCIPALS: u32 = 4;
 /// Format: one content-pool extent's owner word (A-98): 0 while the extent is free, else its owning partition plus
 /// one, so partition 0 is distinct from "free".
 pub const POOL_WORD_BYTES: usize = 8;

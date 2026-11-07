@@ -200,7 +200,7 @@ impl std::fmt::Debug for PipeVmm {
 
 impl VmmSeam for PipeVmm {
   fn consumer(&mut self) -> Result<Principal, SeamError> {
-    Ok(Principal::Uid { uid: 501 })
+    Ok(Principal::Uid { host: slates_db::HostId(0), uid: 501 })
   }
   fn memory(&mut self) -> Result<&mut dyn GuestMemory, SeamError> {
     Ok(&mut self.memory)
@@ -669,7 +669,7 @@ fn a_seam_without_a_doorbell_ends_the_loop_at_once() {
   let shard = rt.shard_ids()[0];
   let (end_tx, end_rx) = channel::<ServeEnd>();
   rt.spawn_on(shard, async move {
-    let seam = SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 0 }));
+    let seam = SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { host: slates_db::HostId(0), uid: 0 }));
     let mut owned = OwnedVolume::fresh();
     let admitted = admit(
       request(),

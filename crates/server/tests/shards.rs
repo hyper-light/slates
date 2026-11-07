@@ -205,7 +205,7 @@ fn attach(
   daemon
     .attach_shards_stream(
       ShardsAsk {
-        principal: Principal::Uid { uid: my_uid() },
+        principal: Principal::Uid { host: slates_db::HostId(0), uid: my_uid() },
         volume,
         subtree: subtree.map(str::to_owned),
         intent,

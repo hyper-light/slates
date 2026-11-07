@@ -1,0 +1,69 @@
+name: diag-clients
+
+# Diagnostics only, never on main (A-237, host-scoped principals): on CI's Linux runners the whole fleet suite (every
+# cross-node test now shares its volume with the reading node's account by its anchor) and the suites A-237 touches; on
+# the Windows runners the suites that build there. Results go to diag-results/clients-host-1-<os>, read by git fetch.
+on:
+  push:
+    branches: ["diag-clients-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cross-shard-wait:
+    name: R3 class A on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Build the tests
+        run: cargo test --locked -p slates-server -p slates-anchor -p slates-wire -p slates-db --no-run
+      - name: The A-237 suites
+        run: |
+          set +e
+          R=../results.txt
+          echo "runner ${{ matrix.os }}, $(nproc 2>/dev/null || echo $NUMBER_OF_PROCESSORS) CPUs, $(date -u), commit $(git rev-parse --short HEAD)" > $R
+          cmds=("cargo test --locked -q -p slates-wire" "cargo test --locked -q -p slates-db" "cargo test --locked -q -p slates-anchor -- --test-threads=1" "cargo test --locked -q -p slates-server --lib" "cargo test --locked -q -p slates-server --test consumers")
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            cmds+=("cargo test --locked -q -p slates-server --test daemon" "cargo test --locked -q -p slates-server --test virtiofs" "cargo test --locked -q -p slates-cli --bins" "cargo test --locked -q -p slates-server --test fleet")
+          fi
+          for cmd in "${cmds[@]}"; do
+            echo "== $cmd" | tee -a $R
+            $cmd 2>&1 | grep -E 'test result|FAILED|panicked|^    [a-z_:]+$|^error' | tee -a $R
+            echo "== exit ${PIPESTATUS[0]}" | tee -a $R
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/clients-host-1-${{ matrix.os }}"
+          git config user.name "diag-clients"
+          git config user.email "diag-clients@users.noreply.github.com"
+          git stash -q || true
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-clients host-1 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"

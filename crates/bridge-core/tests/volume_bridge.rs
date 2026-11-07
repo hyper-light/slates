@@ -30,7 +30,7 @@ fn context(view: View, rights: Rights) -> OpContext {
     .attach(
       VolumeId { bytes: [0; 16] },
       view,
-      Principal::Uid { uid: 0 },
+      Principal::Uid { host: slates_db::HostId(0), uid: 0 },
       rights,
     )
     .unwrap();
@@ -56,7 +56,7 @@ fn rw_cx_as(uid: u32) -> OpContext {
     .attach(
       VolumeId { bytes: [0; 16] },
       View::Current,
-      Principal::Uid { uid },
+      Principal::Uid { host: slates_db::HostId(0), uid },
       Rights {
         read: true,
         write: true,
@@ -78,7 +78,7 @@ fn two_rw_contexts() -> (OpContext, OpContext) {
     .attach(
       VolumeId { bytes: [0; 16] },
       View::Current,
-      Principal::Uid { uid: 0 },
+      Principal::Uid { host: slates_db::HostId(0), uid: 0 },
       rights,
     )
     .unwrap();
@@ -86,7 +86,7 @@ fn two_rw_contexts() -> (OpContext, OpContext) {
     .attach(
       VolumeId { bytes: [0; 16] },
       View::Current,
-      Principal::Uid { uid: 0 },
+      Principal::Uid { host: slates_db::HostId(0), uid: 0 },
       rights,
     )
     .unwrap();
