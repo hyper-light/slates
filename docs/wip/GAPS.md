@@ -1,7 +1,7 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
 > **A submit in a three-process fleet at `f = 1` was never answered: fixed (2026-11-06, §4.8 joint writes, §4.16
-> Commit; amendment number owed by the supervisor).** A green made on the bootstrapper while its council formed had
+> Commit; A-234, `Quorum::committed_within` reviewed by raft-chaos).** A green made on the bootstrapper while its council formed had
 > its merge records enqueued under the bootstrap's one-candidate placement, and pending records were never
 > re-placed; once they were, the joint placement joined the bootstrap's one-member settled cohort, which can never
 > give `f + 1`. Pending merge records now follow the current configuration each period, as heads do
