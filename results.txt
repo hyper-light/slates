@@ -1,0 +1,21 @@
+tested f7b79d92b83b9da6d845e12f6fb694bdcb4de982 variant before-rate on aarch64, 4 cpus
+  reverted:  crates/db/src/replay.rs | 4 +---
+  reverted:  1 file changed, 1 insertion(+), 3 deletions(-)
+budget exit 101 23s
+  budget: budget 10000000 ns: cadence 2720000 bytes, 272 bytes/us as the commits measured it; tail 2719872 bytes, replayed 2719872 bytes in 196768297 ns at best of 5 (13 bytes/us), 19676 per mille of the budget
+  budget: thread 'a_fresh_partitions_longest_tail_replays_within_its_recovery_budget' (3328) panicked at crates/db/tests/snapshot_cadence.rs:285:3:
+  budget: test a_fresh_partitions_longest_tail_replays_within_its_recovery_budget ... FAILED
+  budget: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 2.82s
+  budget: error: test failed, to rerun pass `-p slates-db --test snapshot_cadence`
+budget-again exit 101 3s
+  budget-again: budget 10000000 ns: cadence 2730000 bytes, 273 bytes/us as the commits measured it; tail 2729880 bytes, replayed 2729880 bytes in 197351773 ns at best of 5 (13 bytes/us), 19735 per mille of the budget
+  budget-again: thread 'a_fresh_partitions_longest_tail_replays_within_its_recovery_budget' (3342) panicked at crates/db/tests/snapshot_cadence.rs:285:3:
+  budget-again: test a_fresh_partitions_longest_tail_replays_within_its_recovery_budget ... FAILED
+  budget-again: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 2.83s
+  budget-again: error: test failed, to rerun pass `-p slates-db --test snapshot_cadence`
+budget-third exit 101 3s
+  budget-third: budget 10000000 ns: cadence 2760000 bytes, 276 bytes/us as the commits measured it; tail 2759904 bytes, replayed 2759904 bytes in 199547825 ns at best of 5 (13 bytes/us), 19954 per mille of the budget
+  budget-third: thread 'a_fresh_partitions_longest_tail_replays_within_its_recovery_budget' (3356) panicked at crates/db/tests/snapshot_cadence.rs:285:3:
+  budget-third: test a_fresh_partitions_longest_tail_replays_within_its_recovery_budget ... FAILED
+  budget-third: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 2.86s
+  budget-third: error: test failed, to rerun pass `-p slates-db --test snapshot_cadence`
