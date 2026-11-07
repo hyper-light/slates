@@ -1,0 +1,13 @@
+kind live: unshaped: installed and rolled out in 7.6 s
+kind live: unshaped: live-write: count=1000 acknowledged=1000 refused=0 p50_us=401 p99_us=1543 p999_us=23982 max_us=106910 first_refusal=""
+kind live: wan: installed and rolled out in 7.6 s
+kind live: wan: live-write: count=300 acknowledged=300 refused=0 p50_us=155834 p99_us=422395 p999_us=607201 max_us=607201 first_refusal=""
+kind live: wan-loss: installed and rolled out in 8.7 s
+kind live: wan-loss: live-write: count=300 acknowledged=300 refused=0 p50_us=155224 p99_us=465716 p999_us=599292 max_us=599292 first_refusal=""
+kind live: ceiling: installed and rolled out in 7.7 s
+kind live: ceiling: live-write: count=50 acknowledged=50 refused=0 p50_us=1559704 p99_us=5513962 p999_us=5513962 max_us=5513962 first_refusal=""
+kind live:   unshaped: count=1000 acknowledged=1000 refused=0 p50_us=401 p99_us=1543 p999_us=23982 max_us=106910 first_refusal=""; converged at head Some(1001) epoch Some(1); 1 heads seen, one identity each; owner read back whole=1000 missing=0 torn=0; taken over by slates-1 after 2.7 s, epoch 2, read back whole=1000 missing=0 torn=0
+kind live:   wan: count=300 acknowledged=300 refused=0 p50_us=155834 p99_us=422395 p999_us=607201 max_us=607201 first_refusal=""; converged at head Some(359) epoch Some(1); 1 heads seen, one identity each; owner read back whole=300 missing=0 torn=0; taken over by slates-0 after 19.2 s, epoch 2, read back whole=300 missing=0 torn=0
+kind live:   wan-loss: count=300 acknowledged=300 refused=0 p50_us=155224 p99_us=465716 p999_us=599292 max_us=599292 first_refusal=""; converged at head Some(359) epoch Some(1); 1 heads seen, one identity each; owner read back whole=300 missing=0 torn=0; taken over by slates-0 after 20.3 s, epoch 2, read back whole=300 missing=0 torn=0
+kind live:   ceiling: count=50 acknowledged=50 refused=0 p50_us=1559704 p99_us=5513962 p999_us=5513962 max_us=5513962 first_refusal=""; converged at head Some(105) epoch Some(1); 2 heads seen, one identity each; owner read back whole=50 missing=0 torn=0; taken over by slates-0 after 68.9 s, epoch 2, read back whole=50 missing=0 torn=0
+exit 0
