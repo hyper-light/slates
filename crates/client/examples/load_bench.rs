@@ -175,6 +175,8 @@ struct Agent {
 /// What a worker brings back.
 #[derive(Default)]
 struct Tally {
+  /// Replies taken: a worker's sign of motion, for its stall dump.
+  answered: u64,
   latencies: BTreeMap<Kind, Vec<u64>>,
   submits: Vec<SubmitEvent>,
   refusals: BTreeMap<String, u64>,
@@ -731,6 +733,11 @@ const REBASE_CONFLICTS_NAMED: u64 = 5;
 const PROGRESS_NAMED: usize = 4;
 /// Shape: how often a worker prints its progress, so a long or stuck level shows where it is.
 const PROGRESS_EVERY: Duration = Duration::from_secs(5);
+/// Shape: how long a worker goes with no reply before it dumps where every connection's replies stand
+/// ([`Worker::stall_dump`]), once per stall. Twelve progress reports: a stall, not a slow commit.
+const STALL_DUMP_AFTER: Duration = Duration::from_secs(60);
+/// Shape: the stuck requests a stall dump names per connection.
+const STALL_NAMED: usize = 4;
 /// Shape: how many times per reply deadline a worker looks for overdue requests: often enough that a lost reply is
 /// named within a few percent of the deadline past it, rarely enough that the scan costs nothing next to the sweeps.
 const OVERDUE_CHECKS_PER_DEADLINE: u64 = 16;
@@ -893,6 +900,7 @@ impl Worker {
         }
       };
       answered = true;
+      self.tally.answered += 1;
       let agent = &mut self.agents[a];
       let Some((_, sent_ns, kind)) = agent.inflight.take() else {
         continue;
@@ -1054,6 +1062,47 @@ impl Worker {
     }
   }
 
+  /// Where every connection with a request in flight stands, printed once per stall, so a stalled level names its hop
+  /// without a debugger (fixtures' f = 1 stalls of 2026-11-07, where ptrace was not allowed): `ring_unread` or `held`
+  /// above zero is a reply that came and was not collected (the harness's side); both zero with requests awaited is a
+  /// reply that never came (the daemon's side, placed by its `fleet.forward.*` hop counters).
+  fn stall_dump(&self, worker: usize, quiet: Duration) {
+    let now = ns_since(self.epoch);
+    for (c, conn) in self.conns.iter().enumerate() {
+      if conn.inflight.is_empty() {
+        continue;
+      }
+      let (unread, held, awaited) = conn.client.reply_state();
+      let named: Vec<String> = conn
+        .inflight
+        .iter()
+        .take(STALL_NAMED)
+        .map(|(word, a)| {
+          let agent = &self.agents[*a];
+          let age = agent
+            .inflight
+            .map_or(0, |(_, sent, _)| now.saturating_sub(sent) / 1_000_000);
+          let kind = agent.inflight.map(|(_, _, kind)| kind);
+          format!(
+            "{word:#x}:{kind:?}:{age}ms:defers={}",
+            conn.client.defers(*word)
+          )
+        })
+        .collect();
+      println!(
+        "stall\t{worker}\tquiet_ms\t{}\tconn\t{c}\tinflight\t{}\toutstanding\t{}\tawaited\t{awaited}\tring_unread\t{unread:?}\theld\t{held}\tunawaited_dropped\t{}\treconnecting\t{}\tresend\t{}\tdaemon_gone\t{}\tstuck\t{}",
+        quiet.as_millis(),
+        conn.inflight.len(),
+        conn.client.outstanding().len(),
+        conn.client.unawaited_dropped(),
+        conn.reconnecting.is_some(),
+        conn.resend.len(),
+        conn.client.daemon_gone(),
+        named.join(",")
+      );
+    }
+  }
+
   fn progress(&self, worker: usize) {
     let done = self
       .agents
@@ -1108,6 +1157,10 @@ fn drive(conns: Vec<Connection>, agents: Vec<Agent>, epoch: Instant, worker: usi
   };
   let mut reported = Instant::now();
   let mut checked = ns_since(epoch);
+  // The last time any reply moved a client on, and whether this stall was dumped.
+  let mut moved = Instant::now();
+  let mut answers = 0u64;
+  let mut dumped = false;
   while state.agents.iter().any(|agent| agent.step != Step::Done) {
     let sweep = Instant::now();
     for c in 0..state.conns.len() {
@@ -1129,6 +1182,15 @@ fn drive(conns: Vec<Connection>, agents: Vec<Agent>, epoch: Instant, worker: usi
     if reported.elapsed() >= PROGRESS_EVERY {
       reported = Instant::now();
       state.progress(worker);
+    }
+    let answered = state.tally.answered;
+    if answered != answers {
+      answers = answered;
+      moved = Instant::now();
+      dumped = false;
+    } else if !dumped && moved.elapsed() >= STALL_DUMP_AFTER {
+      dumped = true;
+      state.stall_dump(worker, moved.elapsed());
     }
   }
   state.tally

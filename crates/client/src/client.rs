@@ -2185,6 +2185,20 @@ impl Client {
       .collect()
   }
 
+  /// Where this client's replies stand, for a caller diagnosing a stall: the replies the daemon published on the
+  /// completion ring that this client has not taken (`None` when the ring cannot be read), the replies taken and
+  /// held for a caller that has not asked for them, and the requests awaited. A stalled request whose reply is in
+  /// either of the first two was answered and not collected; one in neither was never answered.
+  pub fn reply_state(&self) -> (Option<u64>, usize, usize) {
+    let unread = self
+      .end
+      .region()
+      .cpl()
+      .depth(self.end.region().object())
+      .ok();
+    (unread, self.pending.len(), self.awaited.len())
+  }
+
   /// Replies dropped on arrival because nothing awaited them (a protocol-only acknowledgement's, or an
   /// abandoned operation's) — the counter a test reads to see the drop path ran.
   pub fn unawaited_dropped(&self) -> u64 {
