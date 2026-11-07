@@ -379,7 +379,11 @@ fn home_redirect(
 }
 
 /// Route bootstrap to the sole shard that drives consensus. The bounded call owns its reply
-/// registration through cancellation; an unavailable shard cannot produce a successful bootstrap.
+/// registration through cancellation; an unavailable shard cannot produce a successful bootstrap. Each call (the
+/// operation on the control shard, then its publication on every other) is waited for in its target's own time
+/// (`xshard::call_in_shard_time`): a starved shard's answer is heard, and a wedged one is refused `Overloaded` after a
+/// window with no progress (R3 class A; before, a control shard given a fifth of a core for 1.5 s was refused at the
+/// wall second while the bootstrap went on).
 fn consensus_on_control(
   state: &ShardState,
   client_index: u32,
@@ -391,7 +395,7 @@ fn consensus_on_control(
   };
   let origin = state.shard;
   let task = slates_rt::futures::spawn(async move {
-    let outcome = crate::xshard::call_within(
+    let outcome = crate::xshard::call_in_shard_time(
       origin,
       control,
       move |state| {
@@ -414,7 +418,7 @@ fn consensus_on_control(
         let mut reply = reply;
         for shard in shards.into_iter().filter(|shard| *shard != control) {
           let publication = publication.clone();
-          if crate::xshard::call_within(
+          if crate::xshard::call_in_shard_time(
             origin,
             shard,
             move |state| publication.apply(state),
