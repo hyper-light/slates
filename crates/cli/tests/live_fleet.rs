@@ -1742,6 +1742,10 @@ fn a_live_volume_made_while_its_successor_was_stopped_is_served_by_it() {
       .recv_timeout(FLEET_WAIT)
       .expect("the writes return once the candidate is back");
   }
+  eprintln!("live keyed: ZZ owner counters before the kill {:?}", live_counters(&owner));
+  for instance in &fleet.instances {
+    eprintln!("live keyed: ZZ {instance} counters {:?}", live_counters(instance));
+  }
   drop(fleet.daemons.remove(owner_index));
   let survivors: Vec<&String> = fleet
     .instances

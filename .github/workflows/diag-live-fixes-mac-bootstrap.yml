@@ -1,0 +1,79 @@
+# Diagnostics for the live-fixes agent (not for main): the merged tree (A-240 with the joint holder transition), the
+# whole live_fleet suite twice and the bootstrap-node live flow three times, under two spinners a CPU.
+name: diag-live-fixes-mac-bootstrap
+
+on:
+  push:
+    branches: ['diag-live-fixes-[0-9]*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  deploy:
+    name: live_fleet on the merged tree with the catalog gate fixed, on macos-latest
+    runs-on: macos-latest
+    timeout-minutes: 300
+    env:
+      RESULTS_BRANCH: diag-live-fixes-results-${{ github.run_id }}-macos-bootstrap
+    steps:
+      - uses: actions/checkout@v4
+      - name: The results publisher
+        run: |
+          cat > "$RUNNER_TEMP/publish.sh" <<'EOF'
+          #!/bin/bash
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          cd "$GITHUB_WORKSPACE" || exit 0
+          entries=""
+          for f in results/*; do
+            [ -f "$f" ] || continue
+            blob=$(git hash-object -w "$f") || exit 0
+            entries="$entries$(printf '100644 blob %s\t%s' "$blob" "$(basename "$f")")"$'\n'
+          done
+          tree=$(printf '%s' "$entries" | git mktree) || exit 0
+          parent=$(cat "$RUNNER_TEMP/results-parent" 2>/dev/null || true)
+          commit=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "results of run $GITHUB_RUN_ID") || exit 0
+          if git push origin "$commit:refs/heads/$RESULTS_BRANCH"; then
+            echo "$commit" > "$RUNNER_TEMP/results-parent"
+          else
+            echo "::warning::could not publish the results"
+          fi
+          EOF
+          chmod +x "$RUNNER_TEMP/publish.sh"
+          mkdir -p results
+          { echo "tree $(git rev-parse HEAD) $(date -u +%FT%TZ)"; sysctl -n hw.logicalcpu; sw_vers; } > results/00-image.txt
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build -p slates-cli --tests --bins
+      - name: live_fleet twice and the bootstrap flow three times, under two spinners a logical CPU
+        run: |
+          set +e
+          export SLATES_TEST_CLI=1
+          T=a_live_volume_made_while_its_successor_was_stopped_is_served_by_it
+          spinners=$(( $(sysctl -n hw.logicalcpu) * 2 ))
+          for i in $(seq 1 $spinners); do (while :; do :; done) & echo $! >> "$RUNNER_TEMP/spinners"; done
+          sleep 10
+          for arm in suite-1 boot-1 boot-2 boot-3 keyed-1 keyed-2 keyed-3; do
+            case $arm in suite-*) filter="";; boot-*) filter=a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates;; *) filter=$T;; esac
+            log="$RUNNER_TEMP/$arm.log"
+            perl -e 'alarm shift; exec @ARGV' 2400 cargo test -p slates-cli --test live_fleet $filter -- --nocapture --test-threads 1 > "$log" 2>&1
+            code=$?
+            {
+              echo "=== $arm exit $code load $(sysctl -n vm.loadavg)"
+              grep -E '^test |test result|panicked at|^live keyed' "$log" | cut -c1-1500 | head -80
+            } >> results/10-bootstrap.txt
+            if [ $code -ne 0 ]; then grep -vE '^slates-cluster: fleet: HostId' "$log" | grep -E 'live keyed|live bootstrap|panicked|^---|refused fleet\.(live|takeover|ship)|^shard [0-9]+ (live|fleet)|file-|^placed:' > "results/run-$arm-tail.txt"; fi
+            pkill -f live-bootstrap- || true
+            bash "$RUNNER_TEMP/publish.sh"
+          done
+          kill $(cat "$RUNNER_TEMP/spinners") 2>/dev/null || true
+      - name: Publish whatever was measured
+        if: always()
+        run: if [ -f "$RUNNER_TEMP/publish.sh" ]; then bash "$RUNNER_TEMP/publish.sh"; fi
