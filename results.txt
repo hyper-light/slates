@@ -1,0 +1,36 @@
+runner windows-latest, 4 CPUs, 62ad93f diag: liveness-9, the give-back fix on main 4326a9d8: A-205's give-back , Sat Nov  7 03:56:39 UTC 2026
+== run 1 at 03:56:39
+round 1: working set 167075840 -> 27262976 in 1.092614s, 139812864 of 134217728 deleted bytes left it (104%); the daemon counted 142733312 given back
+round 1: recreated, every byte read back, working set 27262976 -> 199643136
+round 2: working set 199643136 -> 63807488 in 1.2241555s, 135835648 of 134217728 deleted bytes left it (101%); the daemon counted 145645568 given back
+round 2: recreated, every byte read back, working set 63807488 -> 221495296
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 23.19s
+== run 1 exit 0
+== run 2 at 03:57:03
+round 1: working set 167616512 -> 27750400 in 1.1005772s, 139866112 of 134217728 deleted bytes left it (104%); the daemon counted 141721600 given back
+round 1: recreated, every byte read back, working set 27750400 -> 213929984
+round 2: working set 214708224 -> 27664384 in 1.1049123s, 187043840 of 134217728 deleted bytes left it (139%); the daemon counted 188293120 given back
+round 2: recreated, every byte read back, working set 27664384 -> 225005568
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 22.75s
+== run 2 exit 0
+== run 3 at 03:57:26
+round 1: working set 167608320 -> 27226112 in 1.3379567s, 140382208 of 134217728 deleted bytes left it (104%); the daemon counted 142176256 given back
+round 1: recreated, every byte read back, working set 27226112 -> 231747584
+round 2: working set 232480768 -> 76754944 in 1.301073s, 155725824 of 134217728 deleted bytes left it (116%); the daemon counted 165244928 given back
+round 2: recreated, every byte read back, working set 76754944 -> 234450944
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 24.58s
+== run 3 exit 0
+== run 4 at 03:57:51
+round 1: working set 168579072 -> 26894336 in 1.2302538s, 141684736 of 134217728 deleted bytes left it (105%); the daemon counted 143675392 given back
+round 1: recreated, every byte read back, working set 26894336 -> 219062272
+round 2: working set 219795456 -> 27029504 in 1.1086458s, 192765952 of 134217728 deleted bytes left it (143%); the daemon counted 193990656 given back
+round 2: recreated, every byte read back, working set 27029504 -> 226516992
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 23.62s
+== run 4 exit 0
+== run 5 at 03:58:15
+round 1: working set 166973440 -> 27115520 in 1.0954565s, 139857920 of 134217728 deleted bytes left it (104%); the daemon counted 141692928 given back
+round 1: recreated, every byte read back, working set 27115520 -> 210964480
+round 2: working set 211755008 -> 27115520 in 1.0995391s, 184639488 of 134217728 deleted bytes left it (137%); the daemon counted 185831424 given back
+round 2: recreated, every byte read back, working set 27115520 -> 225955840
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 22.92s
+== run 5 exit 0
