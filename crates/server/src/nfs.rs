@@ -333,7 +333,9 @@ fn with_export<R>(
     .attachment(capability.0)
     .map(|record| (record.form.scope(), record.form.bound_uid()));
   let (scope, bound_uid) = form.unwrap_or((None, None));
-  let stranger = bound_uid.is_some_and(|bound| subject != Principal::Uid { uid: bound });
+  // An NFS subject is this node's own (`Requester::of`), so the uid alone tells the bound user.
+  let stranger =
+    bound_uid.is_some_and(|bound| !matches!(&subject, Principal::Uid { uid, .. } if *uid == bound));
   let ShardState {
     store,
     volumes,
@@ -631,6 +633,12 @@ struct Requester {
   inherited: bool,
 }
 
+/// This node's certificate anchor, the host an NFS caller's account belongs to (A-237); host 0, no node's anchor, off a
+/// shard, where no call is served.
+fn local_host() -> slates_db::HostId {
+  state::with_state(|s| s.origin_anchor).unwrap_or(slates_db::HostId(0))
+}
+
 impl Requester {
   /// The mounting user a call runs as, from its `AUTH_SYS` credential (uid and groups, §4.13, set by
   /// the kernel on a loopback mount — so a real `mount_nfs` runs as the mounting user and stamps the
@@ -639,7 +647,10 @@ impl Requester {
   fn of(body: &[u8]) -> Requester {
     match auth_sys_identity(body) {
       Some(identity) => Requester {
-        subject: Principal::Uid { uid: identity.uid },
+        subject: Principal::Uid {
+          host: local_host(),
+          uid: identity.uid,
+        },
         groups: Some(identity.groups),
         capability: None,
         dialect: Dialect::LOOPBACK_NFS3,
@@ -658,7 +669,10 @@ impl Requester {
   /// credential would not.
   fn root() -> Requester {
     Requester {
-      subject: Principal::Uid { uid: 0 },
+      subject: Principal::Uid {
+        host: local_host(),
+        uid: 0,
+      },
       groups: None,
       capability: None,
       dialect: Dialect::LOOPBACK_NFS3,
@@ -2218,7 +2232,7 @@ impl compound::Backend for RoutedBackend {
     // A subject that is not a Unix user is no uid, and never root's: the bridge's convention for one
     // (`access::INVALID_UID`, which owns nothing). Every NFS requester is a uid today (`Requester::of`).
     match self.requester.subject {
-      Principal::Uid { uid } => uid,
+      Principal::Uid { uid, .. } => uid,
       _ => slates_bridge_nfs::access::INVALID_UID,
     }
   }

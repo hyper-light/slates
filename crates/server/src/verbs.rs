@@ -57,14 +57,43 @@ pub(crate) fn to_wire_volume(id: DbVolumeId) -> VolumeId {
   VolumeId { bytes: id.bytes }
 }
 
-/// A wire principal (as `share` names one) as the catalog's.
+/// A wire principal (as `share` names one) as the catalog's, with the host it names (A-237).
 fn to_db_principal(principal: &slates_ipc::protocol::Principal) -> Principal {
   match principal {
-    slates_ipc::protocol::Principal::Uid { uid } => Principal::Uid { uid: *uid },
-    slates_ipc::protocol::Principal::Consumer { account, consumer } => Principal::Consumer {
+    slates_ipc::protocol::Principal::Uid { host, uid } => Principal::Uid {
+      host: slates_db::HostId(*host),
+      uid: *uid,
+    },
+    slates_ipc::protocol::Principal::Consumer {
+      host,
+      account,
+      consumer,
+    } => Principal::Consumer {
+      host: slates_db::HostId(*host),
       account: *account,
       consumer: *consumer,
     },
+  }
+}
+
+/// A catalog principal as the wire names it (A-237), host included; `None` for one a client never names (a SID, a
+/// certificate).
+fn to_wire_principal(principal: &Principal) -> Option<slates_ipc::protocol::Principal> {
+  match principal {
+    Principal::Uid { host, uid } => Some(slates_ipc::protocol::Principal::Uid {
+      host: host.0,
+      uid: *uid,
+    }),
+    Principal::Consumer {
+      host,
+      account,
+      consumer,
+    } => Some(slates_ipc::protocol::Principal::Consumer {
+      host: host.0,
+      account: *account,
+      consumer: *consumer,
+    }),
+    Principal::Sid { .. } | Principal::Certificate { .. } => None,
   }
 }
 
@@ -846,6 +875,10 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
   else {
     return Vec::new();
   };
+  // The requester is an account of the node this session authenticated, whatever host its request names (A-237): a
+  // uid means something only on its host, so the owner judges it as (origin, account) and never by the origin's word.
+  let principal = principal.rehosted(origin);
+  let requester = principal.clone();
   if let RequestBody::PromoteRegion { region } = body {
     return encode_body(
       &crate::state::with_state(|s| propose_region_promotion(s, region))
@@ -939,7 +972,25 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     // A peer's reap of its dead client (A-222) is the one verb served here that is neither; any other is refused.
     Some(crate::remote_attach::serve_unforwardable(control, shard, origin_host, body).await)
   };
-  encode_body(&reply.unwrap_or_else(|| refused(Refusal::NotFound)))
+  encode_body(&not_shared_with(
+    reply.unwrap_or_else(|| refused(Refusal::NotFound)),
+    &requester,
+  ))
+}
+
+/// A forwarded request's `Forbidden` as the refusal that names its fix (A-237): the requester is another host's
+/// account, which only a share naming (its host, its account) lets in, so the client is told exactly that principal.
+/// Every other reply, and a requester with no wire form (a certificate), as it is.
+fn not_shared_with(reply: ReplyBody, requester: &Principal) -> ReplyBody {
+  match (reply, to_wire_principal(requester)) {
+    (
+      ReplyBody::Refused {
+        refusal: Refusal::Forbidden { verb },
+      },
+      Some(principal),
+    ) => refused(Refusal::NotShared { verb, principal }),
+    (reply, _) => reply,
+  }
 }
 
 /// A cross-node forwarded verb whose acceptance was deferred to a fleet commit (AUD-11): polls the
@@ -3428,6 +3479,7 @@ fn daemon_report(state: &mut ShardState, shards: Vec<ShardReport>) -> ReplyBody 
       log_lines_refused: slates_machine::log::log_lines_refused(),
       anchor_log_lines_refused,
       dumps_local_full: crate::local_dumps::full(),
+      anchor: state.origin_anchor.0,
     }),
   }
 }
@@ -3508,6 +3560,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::RemoteAttachmentsFull { .. } => "remote_attachments_full",
     Refusal::OwnMount { .. } => "own_mount",
     Refusal::TableAtCapacity { .. } => "table_at_capacity",
+    Refusal::NotShared { .. } => "not_shared",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",
@@ -4223,7 +4276,7 @@ pub fn verify_attestation(
   if revoked {
     return Err(Refusal::ConsumerRevoked);
   }
-  let same_account = matches!(channel_principal, Principal::Uid { uid } if *uid == account);
+  let same_account = matches!(channel_principal, Principal::Uid { uid, .. } if *uid == account);
   let expected = crate::landing::attest_proof(&secret, client_id);
   if !same_account || !crate::landing::constant_time_eq(&expected, proof) {
     return Err(Refusal::ConsumerNotEnrolled);
@@ -4296,7 +4349,12 @@ fn attest_on_channel(
               .find(|(h, _)| h.index() == client_index)
               .map(|(h, _)| h);
             if let Some(slot) = handle.and_then(|h| s.clients.get_mut(h).ok()) {
-              slot.principal = Principal::Consumer { account, consumer };
+              // The consumer of this host's account: the slot and its channel are this node's (A-237).
+              slot.principal = Principal::Consumer {
+                host: s.origin_anchor,
+                account,
+                consumer,
+              };
             }
           })
           .is_ok();
@@ -9883,7 +9941,11 @@ pub fn wire_id(id: DbVolumeId) -> VolumeId {
 /// The rights the owner holds, for the status of access lists (§4.13).
 pub fn owner_rights() -> AccessEntry {
   AccessEntry {
-    principal: Principal::Uid { uid: 0 },
+    // A placeholder for the owner: host 0 is no node's anchor.
+    principal: Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     rights: Rights {
       read: true,
       write: true,
@@ -11842,7 +11904,7 @@ fn stamp_root_owner(
   volume: &mut Volume,
   principal: &Principal,
 ) -> Result<(), slates_vfs::error::VfsError> {
-  let Principal::Uid { uid } = principal else {
+  let Principal::Uid { uid, .. } = principal else {
     return Ok(());
   };
   let root = volume.root_inode(store)?;
@@ -11977,7 +12039,10 @@ mod tests {
   fn a_shard_short_of_room_only_by_deferred_frees_publishes_to_release_them() {
     crate::daemon::audit_on_shard_configured(
       |state| {
-        let principal = Principal::Uid { uid: 1234 };
+        let principal = Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 1234,
+        };
         let chunk = state.store.content.chunk_bytes();
         // The shard claims its arena lazily (A-98); one claim takes its own slice, a single extent at this
         // power-of-two reserve, and the volume below fits in it, so nothing else is claimed.
@@ -12052,7 +12117,10 @@ mod tests {
     for volumes in [512usize, 1024, 2048, 4096, 8192] {
       let (hosted, published, best_ns) = crate::daemon::audit_on_shard_configured(
         move |state| {
-          let principal = Principal::Uid { uid: 1234 };
+          let principal = Principal::Uid {
+            host: slates_db::HostId(0),
+            uid: 1234,
+          };
           for n in 0..volumes {
             let reply = super::dispatch(
               state,
@@ -12120,7 +12188,10 @@ mod tests {
   #[test]
   fn bounded_volumes_that_fill_a_shards_bytes_fit_its_version_slab() {
     crate::daemon::audit_on_shard(|state| {
-      let principal = Principal::Uid { uid: 1234 };
+      let principal = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
       let page = u64::try_from(state.store.content.granule()).unwrap();
       let share = state.store.admittable() / 4 / page * page;
       for n in 0..4 {
@@ -12156,7 +12227,10 @@ mod tests {
   #[test]
   fn a_publish_leaves_out_a_volume_being_destroyed() {
     crate::daemon::audit_on_shard(|state| {
-      let principal = Principal::Uid { uid: 1234 };
+      let principal = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
       let reply = super::dispatch(
         state,
         1,
@@ -12203,7 +12277,10 @@ mod tests {
   #[test]
   fn a_streamed_checkpoint_restarts_without_a_volume_it_cannot_capture() {
     crate::daemon::audit_on_shard(|state| {
-      let principal = Principal::Uid { uid: 1234 };
+      let principal = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
       let base = concat!(env!("CARGO_MANIFEST_DIR"), "/src").to_owned();
       let (plain, plain_handle) = dynamic_volume(state, &principal, "streamed-plain", None);
       let (overlay, overlay_handle) =
@@ -12326,7 +12403,10 @@ mod tests {
   #[test]
   fn a_laptop_destroy_retires_its_tombstone_with_the_destroy() {
     crate::daemon::audit_on_shard(|state| {
-      let principal = Principal::Uid { uid: 1234 };
+      let principal = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
       let id = created(state, &principal, "tombstoned");
       let reply = super::dispatch(
         state,
@@ -12378,7 +12458,10 @@ mod tests {
   #[test]
   fn a_green_whose_recovered_chain_is_corrupt_is_fenced_not_served_shorter() {
     crate::daemon::audit_on_shard(|state| {
-      let owner = Principal::Uid { uid: 1234 };
+      let owner = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
       let reply = super::dispatch(
         state,
         1,
@@ -12432,7 +12515,10 @@ mod tests {
   #[test]
   fn a_healthy_green_replays_exactly_and_a_duplicate_or_corrupt_origin_is_fenced() {
     crate::daemon::audit_on_shard(|state| {
-      let owner = Principal::Uid { uid: 1234 };
+      let owner = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
       let super::ReplyBody::GreenCreated { id } = super::dispatch(
         state,
         1,
@@ -12698,7 +12784,10 @@ mod tests {
       name: name.to_owned(),
       size: slates_db::catalog::SizeClass::Bounded { limit },
       names: slates_db::catalog::NamePolicy::Exact,
-      owner: Principal::Uid { uid: 501 },
+      owner: Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 501,
+      },
       require_locked: false,
       access: Vec::new(),
       live_shipped: false,
@@ -12748,7 +12837,10 @@ mod tests {
         )
       };
       let grant = slates_db::catalog::AccessEntry {
-        principal: Principal::Uid { uid: 777 },
+        principal: Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 777,
+        },
         rights: slates_db::catalog::Rights {
           read: true,
           write: true,
@@ -12946,7 +13038,10 @@ mod tests {
       let reply = super::dispatch(
         state,
         1,
-        &Principal::Uid { uid: 1234 },
+        &Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 1234,
+        },
         super::RequestBody::Create {
           name: "ipc-restore".to_owned(),
           size: super::SizeClass::Bounded { limit: 1 << 20 },
@@ -13056,7 +13151,10 @@ mod tests {
     let reply = super::dispatch(
       state,
       1,
-      &Principal::Uid { uid: 1234 },
+      &Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      },
       super::RequestBody::Create {
         name: name.to_owned(),
         size: super::SizeClass::Bounded { limit: 1 << 20 },
@@ -13307,7 +13405,10 @@ mod tests {
       let reply = super::dispatch(
         state,
         1,
-        &Principal::Uid { uid: 1234 },
+        &Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 1234,
+        },
         super::RequestBody::Create {
           name: "owned".to_owned(),
           size: super::SizeClass::Bounded { limit: 1 << 20 },
@@ -13342,7 +13443,10 @@ mod tests {
       let reply = super::dispatch(
         state,
         1,
-        &Principal::Uid { uid: 0 },
+        &Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 0,
+        },
         super::RequestBody::Create {
           name: "recovery-proof".to_owned(),
           size,
@@ -13384,7 +13488,10 @@ mod tests {
       let reply = super::dispatch(
         state,
         1,
-        &Principal::Uid { uid: 0 },
+        &Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 0,
+        },
         super::RequestBody::Create {
           name: "over-policy".to_owned(),
           size,
@@ -13443,10 +13550,29 @@ mod tests {
           require_locked: false,
           base: None,
         };
-        let first =
-          super::run_recorded(state, 1, id, 1, &Principal::Uid { uid: 0 }, request.clone());
-        let retry =
-          super::run_forwarded(state, 1, id, 1, &Principal::Uid { uid: 0 }, request, None);
+        let first = super::run_recorded(
+          state,
+          1,
+          id,
+          1,
+          &Principal::Uid {
+            host: slates_db::HostId(0),
+            uid: 0,
+          },
+          request.clone(),
+        );
+        let retry = super::run_forwarded(
+          state,
+          1,
+          id,
+          1,
+          &Principal::Uid {
+            host: slates_db::HostId(0),
+            uid: 0,
+          },
+          request,
+          None,
+        );
         (first, retry)
       });
       assert!(
@@ -13532,7 +13658,10 @@ mod tests {
     const CLIENT: u32 = 7;
     const OTHER_CLIENT: u32 = 8;
     let secret = [0x5Au8; 32];
-    let channel = Principal::Uid { uid: ACCOUNT };
+    let channel = Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: ACCOUNT,
+    };
     let proof = crate::landing::attest_proof(&secret, CLIENT);
 
     assert_eq!(

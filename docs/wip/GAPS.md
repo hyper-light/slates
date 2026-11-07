@@ -471,7 +471,10 @@
 >   1,044 ms bound: the window plus a 44 ms lateness p99). Owed: the Windows runners under the bar's load (diag branch),
 >   then macOS and Linux beside them. Record: `docs/bugs/2026-11-06-the-anchor-killed-live-daemons-on-a-busy-machine.md`.
 >
-> **A principal is compared across hosts with no host (security, open, 2026-11-07; owner: clients; fix: A-237).** A
+> **A principal is compared across hosts with no host (security, fixed 2026-11-07 by A-237; owner: clients).** Fixed:
+> every principal carries its host's certificate anchor, a forwarded principal is rescoped by its session's anchor, and
+> a refused forward is `NotShared` naming the share that would let it in (record:
+> `docs/bugs/2026-11-07-a-principal-was-compared-across-hosts-with-no-host.md`). What it was: A
 > verb forwarded to a volume's owner on another node carries the requester's principal "as the origin node authenticated
 > it" (`crates/server/src/verbs.rs` `ForwardedRequest`). The owner dispatches a read under it, and runs a write under
 > it, as is (`serve_forward`); the origin's host keys only the completion record. `rights_of` then grants a principal

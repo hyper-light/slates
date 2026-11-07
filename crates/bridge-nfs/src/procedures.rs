@@ -492,7 +492,7 @@ impl<'b> Export<'b> {
     // The caller's uid is the enrolled subject's; a subject that is not a Unix user owns nothing and
     // is judged by the other class of every object.
     let caller_uid = match &subject {
-      Principal::Uid { uid } => *uid,
+      Principal::Uid { uid, .. } => *uid,
       _ => access::INVALID_UID,
     };
     let mut owned = Attachments::new();
@@ -525,7 +525,7 @@ impl<'b> Export<'b> {
     attachment: AttachmentId,
   ) -> Export<'b> {
     let caller_uid = match &subject {
-      Principal::Uid { uid } => *uid,
+      Principal::Uid { uid, .. } => *uid,
       _ => access::INVALID_UID,
     };
     let fsid = first_word(&volume.bytes);

@@ -205,7 +205,11 @@ fn attach(
   daemon
     .attach_shards_stream(
       ShardsAsk {
-        principal: Principal::Uid { uid: my_uid() },
+        // This node's account (A-237): the volume's owner, as the rendezvous recorded it, named by this node's anchor.
+        principal: Principal::Uid {
+          host: slates_db::HostId(daemon.anchor().expect("the daemon reports its anchor")),
+          uid: my_uid(),
+        },
         volume,
         subtree: subtree.map(str::to_owned),
         intent,
