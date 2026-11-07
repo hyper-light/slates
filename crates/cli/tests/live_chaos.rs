@@ -291,7 +291,7 @@ fn fleet_view(instance: &str) -> Option<(String, usize, u32)> {
 
 /// Waits until every node holds all `members` members alive with every peer probed; returns their member ids.
 fn wait_formed(instances: &[String], members: usize) -> Vec<String> {
-  let deadline = Instant::now() + FLEET_WAIT;
+  let mut window = FrozenWindow::new();
   loop {
     let views: Vec<_> = instances
       .iter()
@@ -304,15 +304,82 @@ fn wait_formed(instances: &[String], members: usize) -> Vec<String> {
     }) {
       return views.into_iter().map(|view| view.unwrap().0).collect();
     }
-    assert!(Instant::now() < deadline, "the fleet formed: {views:?}");
+    assert!(
+      window.moving(&format!("{views:?}")),
+      "the fleet formed, or kept changing, within each fleet wait: {views:?}"
+    );
     pause();
+  }
+}
+
+/// Waits until every node in `instances` reports its settled generation equal to its neighbourhood generation (the
+/// fleet's objects re-placed onto the neighbourhood after a membership change), judged by progress ([`FrozenWindow`]).
+fn wait_neighbourhood_settled(instances: &[String]) {
+  let mut window = FrozenWindow::new();
+  loop {
+    let views: Vec<(String, String)> = instances
+      .iter()
+      .map(|instance| {
+        let (_, out, _) = run(instance, &["status"]);
+        let read = |key: &str| {
+          out
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}: ")))
+            .unwrap_or("?")
+            .trim()
+            .to_owned()
+        };
+        (
+          read("fleet_settled_generation"),
+          read("fleet_neighbourhood_generation"),
+        )
+      })
+      .collect();
+    if views
+      .iter()
+      .all(|(settled, neighbourhood)| settled != "?" && settled == neighbourhood)
+    {
+      return;
+    }
+    assert!(
+      window.moving(&format!("{views:?}")),
+      "every neighbourhood settled, or kept changing, within each fleet wait: {views:?}"
+    );
+    pause();
+  }
+}
+
+/// A wait judged by progress, not a fixed span: it goes on while what it watches keeps changing, and gives up only after
+/// a whole fleet wait in which nothing changed. A five-member fleet forming on a loaded CI runner took longer than one
+/// fleet wait while it was still forming (diag-28 runs 1 and 2, 2026-11-07; live-fixes measured 37-108 s for the server
+/// fleet suite and judges those waits the same way, `poll_until`).
+struct FrozenWindow {
+  last: Option<String>,
+  since: Instant,
+}
+
+impl FrozenWindow {
+  fn new() -> FrozenWindow {
+    FrozenWindow {
+      last: None,
+      since: Instant::now(),
+    }
+  }
+
+  /// Whether the wait may go on after seeing `now`: it changed, or it has been the same for less than a fleet wait.
+  fn moving(&mut self, now: &str) -> bool {
+    if self.last.as_deref() != Some(now) {
+      self.last = Some(now.to_owned());
+      self.since = Instant::now();
+    }
+    self.since.elapsed() < FLEET_WAIT
   }
 }
 
 /// Waits until the fleet is whole on every node: all `members` members voting, all in the committed configuration, and
 /// a record session to each peer (`live_fleet.rs`'s `wait_settled`, which says why).
 fn wait_settled(instances: &[String], members: usize) {
-  let deadline = Instant::now() + FLEET_WAIT;
+  let mut window = FrozenWindow::new();
   loop {
     let views: Vec<(String, String, usize)> = instances
       .iter()
@@ -359,8 +426,9 @@ fn wait_settled(instances: &[String], members: usize) {
       return;
     }
     assert!(
-      Instant::now() < deadline,
-      "the fleet settled (council voters, configuration members, record sessions): {views:?}"
+      window.moving(&format!("{views:?}")),
+      "the fleet settled, or kept changing, within each fleet wait (council voters, configuration members, record \
+       sessions): {views:?}"
     );
     pause();
   }
@@ -2913,6 +2981,10 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
           .map(|index| instances[*index].as_str())
           .collect::<Vec<_>>()
       ));
+      // The replacement is within the tolerance only once every node's neighbourhood has settled onto it: before then a
+      // volume's records may still sit on the replaced member's old identity, and the owner's loss is a second
+      // failure at f = 1, which the register takeover rightly calls lost (diag-28 run 8; live-fixes, 2026-11-07).
+      wait_neighbourhood_settled(&instances);
       // The holder stopped at the takeover: one whose seat, with the owner's, leaves the council two of its three votes.
       let seated = council_voters_by_index(&fleet_cell.borrow());
       let owner_seated = seated.contains(&owner_index);

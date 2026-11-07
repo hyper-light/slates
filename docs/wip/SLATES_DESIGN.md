@@ -14265,9 +14265,9 @@ status, GAPS.
     log. The model breaks NoLoss with the record made at once (`recording_a_new_holder_set_before_it_holds_the_log_…`).
   - A write is answered only once the set its durability counts is recorded at `f + 1`, and a successor could open the
     log at it (`live_ship::answerable`: the last whole entry carries a key for every candidate and is itself durable).
-    A write is durable once `n − f` of each set's `n` holders hold it (live-fixes, 2026-11-07), so `f + 1` reports from
-    the set always meet it: `f` alone was right only for a set of `2f`, and a set of `2f + 1` (the placement moved off
-    the owner) left a holder unfenced (CI diag-20 run 7).
+    A write is durable once `max(n − f, f)` of each set's `n` holders hold it, so `f + 1` reports from the set always
+    meet it and `f` failures never lose it: `f` alone was right only for a set of `2f`, and a set of `2f + 1` (the
+    placement moved off the owner) left a holder unfenced (CI diag-20 run 7).
   - **The invariant** (raft's review, 2026-11-07): every write ever answered was answered while the recorded holder
     set held it, so the recorded set always holds everything answered, and phase one may count only it. It rests on
     these conditions, each held by the code:
@@ -14277,8 +14277,10 @@ status, GAPS.
     2. H is dropped only once H′'s record is placed at `f + 1`; phase one reads the catalog at quorum (the register
        takeover's adopted catalog), so it meets a placed record and never acts on a dropped H.
     3. Phase one fences every reporter and counts only the recorded set.
-    4. "Durable on a set" counts its members other than the owner, at `n − f` of `n`; a set of `f` or fewer is never
-       durable, so its transition waits rather than weakening `f`.
+    4. "Durable on a set" counts its members other than the owner, at `W = max(n − f, f)` of `n`, and never while
+       `n < f` (the write waits, counted). `W ≥ f` keeps `f + 1` copies with the owner, so any `f` failures leave one;
+       `W + f + 1 > n` meets phase one. Plain `n − f` is short at `f ≥ 2` for `f < n < 2f` (`f = 2, n = 3` gives one
+       holder), which `f = 1` cannot show (raft's review, 2026-11-07; the count is live-fixes').
     5. One transition at a time: once a target is transferred its record may be in flight, and a further change waits
        for the activation (`Shipper::begin_transition`); before that, the newest target replaces the pending one.
     6. A takeover is the same steps from the counted set (H_old → H′): the successor answers nothing until its own
