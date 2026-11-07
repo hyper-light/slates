@@ -1,0 +1,348 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 17:25:58 UTC 2026, head 6bb80b80f9d8a5562945cdb9b64d10bd678e0c47
+== run 1 at 17:25:58, load 1.71 1.90 0.92
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["1109215992080062742", "10737419630112804249", "11196709604639226806", "5721120537957767352", "3453898500232525413"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-b-6319; council seats at ["chaos-fresh-member-a-6319", "chaos-fresh-member-d-6319", "chaos-fresh-member-e-6319"]
+slates daemon: fleet node `c` of `slates-fleet`: member 16701018949719172854 with 4 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a member that never held the log at a takeover: chaos-fresh-member-c-6319 replaced by a fresh member, rejoined at 2.016577642s
+chaos a member that never held the log at a takeover: the owner's holders once settled: ["chaos-fresh-member-a-6319", "chaos-fresh-member-e-6319"]
+
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (6320) panicked at crates/cli/tests/live_chaos.rs:348:5:
+every neighbourhood settled, or kept changing, within each fleet wait: [(Some(8), Some(8)), (Some(3), Some(3)), (Some(8), Some(12)), (Some(8), Some(8)), (Some(8), Some(8))]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+--
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 43.96s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 1 exit 101
+== run 2 at 17:26:42, load 7.70 3.48 1.50
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["4462719508237497282", "13591530071601088083", "6404162957338362575", "10764369502321296346", "9964691534379551771"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-b-13502; council seats at ["chaos-fresh-member-a-13502", "chaos-fresh-member-c-13502", "chaos-fresh-member-e-13502"]
+slates daemon: fleet node `a` of `slates-fleet`: member 13228190296382447659 with 4 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a member that never held the log at a takeover: chaos-fresh-member-a-13502 replaced by a fresh member, rejoined at 1.713901763s
+chaos a member that never held the log at a takeover: the owner's holders once settled: ["chaos-fresh-member-c-13502", "chaos-fresh-member-d-13502"]
+chaos a member that never held the log at a takeover: chaos-fresh-member-d-13502 stopped at 2.128200633s
+chaos a member that never held the log at a takeover: 527 writes acknowledged; owner crashed; holders chaos-fresh-member-c-13502 (with the log) and chaos-fresh-member-d-13502 (stale)
+slates-cluster: fleet: HostId(9964691534379551771) holds HostId(10764369502321296346) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:620:8
+slates-cluster: fleet: HostId(6404162957338362575) holds HostId(10764369502321296346) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:620:8
+--
+chaos a member that never held the log at a takeover: chaos-fresh-member-c-13502 adopted the registers; it holds the log itself, so this run cannot show the defect
+chaos a member that never held the log at a takeover: decisive false; phase one waited for the holders 0 times while the holder was stopped
+chaos a member that never held the log at a takeover: chaos-fresh-member-c-13502 served the volume after 15.83957ms
+chaos a member that never held the log at a takeover: the successor's recorded and active holders among the survivors: ["chaos-fresh-member-a-13502"]
+chaos a member that never held the log at a takeover: copies on members no longer holders, at the takeover: ["chaos-fresh-member-d-13502 holds a copy fenced below 2: LiveState { holding: true, head: Some(521), durable: None, owed: false, epoch: Some(1), identity: Some(\"0f261b90fd82163c43e5c5b0ccbdf2d9b135b36b8b05b4f2735fe30e0cc880b0\"), fence: 1, holders: [], moving_to: [], recorded: [] }"]
+slates-server: fleet: no reply from 127.0.0.1:45533 through 2 handshake budgets; dialing afresh from a new port
+chaos a member that never held the log at a takeover: copies dropped holders still keep: ["chaos-fresh-member-d-13502 keeps its copy", "chaos-fresh-member-e-13502 keeps its copy"]
+chaos a member that never held the log at a takeover:
+  owner chaos-fresh-member-b-13502; council seats at ["chaos-fresh-member-a-13502", "chaos-fresh-member-c-13502", "chaos-fresh-member-e-13502"]
+  chaos-fresh-member-a-13502 replaced by a fresh member, rejoined at 1.713901763s
+  the owner's holders once settled: ["chaos-fresh-member-c-13502", "chaos-fresh-member-d-13502"]
+  chaos-fresh-member-d-13502 stopped at 2.128200633s
+  527 writes acknowledged; owner crashed; holders chaos-fresh-member-c-13502 (with the log) and chaos-fresh-member-d-13502 (stale)
+  chaos-fresh-member-c-13502 adopted the registers; it holds the log itself, so this run cannot show the defect
+  decisive false; phase one waited for the holders 0 times while the holder was stopped
+  chaos-fresh-member-c-13502 served the volume after 15.83957ms
+  NoLoss (successor): held
+  the successor's recorded and active holders among the survivors: ["chaos-fresh-member-a-13502"]
+  StaleNeverCommits (the counted holders' fences): held
+  copies on members no longer holders, at the takeover: ["chaos-fresh-member-d-13502 holds a copy fenced below 2: LiveState { holding: true, head: Some(521), durable: None, owed: false, epoch: Some(1), identity: Some(\"0f261b90fd82163c43e5c5b0ccbdf2d9b135b36b8b05b4f2735fe30e0cc880b0\"), fence: 1, holders: [], moving_to: [], recorded: [] }"]
+  copies dropped holders still keep: ["chaos-fresh-member-d-13502 keeps its copy", "chaos-fresh-member-e-13502 keeps its copy"]
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 56.87s
+
+== run 2 exit 0
+== run 3 at 17:27:39, load 4.07 3.18 1.51
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["18146971619075061278", "1859113236228204358", "191334955617802339", "12411550308410616072", "10964947155312480927"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-a-18329; council seats at ["chaos-fresh-member-b-18329", "chaos-fresh-member-c-18329", "chaos-fresh-member-e-18329"]
+slates daemon: fleet node `d` of `slates-fleet`: member 1620708192977222252 with 4 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (18330) panicked at crates/cli/tests/live_chaos.rs:309:7:
+the fleet formed, or kept changing, within each fleet wait: [Some(("18146971619075061278", 5, 3)), Some(("1859113236228204358", 5, 4)), Some(("191334955617802339", 5, 4)), Some(("5292727694933316930", 5, 3)), Some(("10964947155312480927", 5, 4))]
+--- chaos-fresh-member-a-18329 (status exit 0; live Some([LiveState { holding: false, head: Some(1454), durable: Some(1454), owed: false, epoch: Some(1), identity: Some("0bcde7b99f692773a349be292301c022bb5352351206fad0127cc9bc09ef09e7"), fence: 1, holders: ["191334955617802339", "1859113236228204358"], moving_to: [], recorded: ["191334955617802339", "1859113236228204358"] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 18146971619075061278
+  fleet_host_epoch: 1
+  fleet_members: 191334955617802339 1859113236228204358 5292727694933316930 10964947155312480927 18146971619075061278
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 13
+  fleet_settled_generation: 4
+  fleet_neighbourhood_generation: 4
+  fleet_retirement: host=12411550308410616072 version=12 survivors=[1859113236228204358 18146971619075061278] confirmed=[] unconfirmed=[]
+  fleet_session 191334955617802339: lent=false cwnd=130934 srtt_ns=1996517 pto_ns=10455717 spurious_losses=0 persistent_collapses=0 consumed=83794 mtu=65496
+  fleet_session 1859113236228204358: lent=false cwnd=130934 srtt_ns=1438995 pto_ns=7439883 spurious_losses=0 persistent_collapses=0 consumed=75827 mtu=65496
+  shard 0 refused fleet.live.appended: 1455
+  shard 0 refused fleet.live.awaited: 1421
+  shard 0 refused fleet.live.durable: 1455
+  shard 0 refused fleet.live.held_back.placement: 1
+  shard 0 refused fleet.live.holders_recorded: 1
+  shard 0 refused fleet.live.install_image: 1
+  shard 0 refused fleet.live.no_session: 74
+  shard 0 refused fleet.live.resolved: 1421
+  shard 0 refused fleet.live.whole: 1
+  shard 0 refused fleet.plane.announce_lends: 9
+  shard 0 refused fleet.plane.announcements_sent: 9
+  shard 0 refused fleet.plane.peer_reconnected: 5
+  shard 0 refused fleet.seal.pair_served: 6
+  shard 0 live shipping fbd6fe8a7010761e0000000000000069 head=1454 durable=1454 owed=false epoch=1 identity=0bcde7b99f692773a349be292301c022bb5352351206fad0127cc9bc09ef09e7 fence=1 holders=191334955617802339,1859113236228204358 moving_to=none recorded=191334955617802339,1859113236228204358
+--- chaos-fresh-member-b-18329 (status exit 0; live Some([LiveState { holding: true, head: Some(1455), durable: None, owed: false, epoch: Some(1), identity: Some("95b739ab0587376b930ce705eb404a23d04d77f2985c336a5028bc641f26a1b2"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 1859113236228204358
+  fleet_host_epoch: 1
+  fleet_members: 191334955617802339 1859113236228204358 5292727694933316930 10964947155312480927 18146971619075061278
+  fleet_held_records: 2
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 15
+  fleet_settled_generation: 9
+  fleet_neighbourhood_generation: 9
+  fleet_session 191334955617802339: lent=false cwnd=130934 srtt_ns=2396289 pto_ns=8105265 spurious_losses=0 persistent_collapses=0 consumed=7311 mtu=65496
+  fleet_session 5292727694933316930: lent=false cwnd=130934 srtt_ns=3442244 pto_ns=13665052 spurious_losses=0 persistent_collapses=0 consumed=4329 mtu=65496
+  fleet_session 10964947155312480927: lent=false cwnd=130934 srtt_ns=5196584 pto_ns=19237924 spurious_losses=0 persistent_collapses=0 consumed=2659 mtu=65496
+  fleet_session 18146971619075061278: lent=false cwnd=130934 srtt_ns=4000083 pto_ns=14361211 spurious_losses=0 persistent_collapses=0 consumed=7328 mtu=65496
+  shard 0 refused fleet.live.held: 1456
+  shard 0 refused fleet.plane.announce_lends: 14
+  shard 0 refused fleet.plane.announcements_sent: 14
+  shard 0 refused fleet.plane.peer_reconnected: 6
+  shard 0 refused fleet.seal.pair_recipient_unknown: 4
+  shard 0 refused fleet.seal.pair_served: 8
+  shard 0 live held fbd6fe8a7010761e0000000000000069 head=1455 durable=none owed=false epoch=1 identity=95b739ab0587376b930ce705eb404a23d04d77f2985c336a5028bc641f26a1b2 fence=1 holders=none moving_to=none recorded=none
+--- chaos-fresh-member-c-18329 (status exit 0; live Some([LiveState { holding: true, head: Some(1456), durable: None, owed: false, epoch: Some(1), identity: Some("fc9fb41c12237bcc5d89d28ace9c9f890000412436981e431963b08f9f4a0455"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 191334955617802339
+  fleet_host_epoch: 1
+  fleet_members: 191334955617802339 1859113236228204358 5292727694933316930 10964947155312480927 18146971619075061278
+  fleet_held_records: 2
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 15
+  fleet_settled_generation: 4
+  fleet_neighbourhood_generation: 4
+  fleet_session 1859113236228204358: lent=false cwnd=130934 srtt_ns=4266137 pto_ns=10745009 spurious_losses=0 persistent_collapses=0 consumed=40253 mtu=65496
+  fleet_session 5292727694933316930: lent=false cwnd=130934 srtt_ns=2788836 pto_ns=9405672 spurious_losses=0 persistent_collapses=0 consumed=2645 mtu=65496
+  fleet_session 10964947155312480927: lent=false cwnd=130934 srtt_ns=3472364 pto_ns=12664272 spurious_losses=0 persistent_collapses=0 consumed=38365 mtu=65496
+  fleet_session 18146971619075061278: lent=false cwnd=130934 srtt_ns=3619219 pto_ns=16149671 spurious_losses=0 persistent_collapses=0 consumed=4359 mtu=65496
+  shard 0 refused fleet.live.held: 1427
+  shard 0 refused fleet.plane.announce_lends: 9
+  shard 0 refused fleet.plane.announcements_sent: 9
+  shard 0 refused fleet.seal.pair_served: 6
+  shard 0 live held fbd6fe8a7010761e0000000000000069 head=1456 durable=none owed=false epoch=1 identity=fc9fb41c12237bcc5d89d28ace9c9f890000412436981e431963b08f9f4a0455 fence=1 holders=none moving_to=none recorded=none
+--- chaos-fresh-member-d-18329 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 5292727694933316930
+  fleet_host_epoch: 1
+  fleet_members: 191334955617802339 1859113236228204358 5292727694933316930 10964947155312480927 18146971619075061278
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 12
+  fleet_settled_generation: 9
+  fleet_neighbourhood_generation: 12
+  fleet_retirement: host=12411550308410616072 version=12 survivors=[1859113236228204358 18146971619075061278] confirmed=[] unconfirmed=[]
+  fleet_session 191334955617802339: lent=false cwnd=130934 srtt_ns=2935003 pto_ns=14819979 spurious_losses=0 persistent_collapses=0 consumed=7427 mtu=65496
+  fleet_session 1859113236228204358: lent=false cwnd=130934 srtt_ns=1970835 pto_ns=9573999 spurious_losses=0 persistent_collapses=0 consumed=8022 mtu=65496
+  fleet_session 10964947155312480927: lent=false cwnd=130934 srtt_ns=3584864 pto_ns=16908812 spurious_losses=0 persistent_collapses=0 consumed=8029 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 8
+  shard 0 refused fleet.plane.announcements_sent: 8
+  shard 0 refused fleet.seal.pair_refused: 625
+  shard 0 refused fleet.seal.pair_served: 627
+--- chaos-fresh-member-e-18329 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 10964947155312480927
+  fleet_host_epoch: 1
+  fleet_members: 191334955617802339 1859113236228204358 5292727694933316930 10964947155312480927 18146971619075061278
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 15
+  fleet_settled_generation: 9
+  fleet_neighbourhood_generation: 9
+  fleet_session 191334955617802339: lent=false cwnd=130934 srtt_ns=2979859 pto_ns=8463843 spurious_losses=0 persistent_collapses=0 consumed=7394 mtu=65496
+  fleet_session 1859113236228204358: lent=false cwnd=130934 srtt_ns=3714034 pto_ns=12697190 spurious_losses=0 persistent_collapses=0 consumed=2658 mtu=65496
+  fleet_session 5292727694933316930: lent=false cwnd=130934 srtt_ns=3793372 pto_ns=16706500 spurious_losses=0 persistent_collapses=0 consumed=2615 mtu=65496
+  fleet_session 18146971619075061278: lent=false cwnd=130934 srtt_ns=3594718 pto_ns=16465302 spurious_losses=0 persistent_collapses=0 consumed=2655 mtu=65496
+  shard 0 refused fleet.plane.address_unresolved: 5
+  shard 0 refused fleet.plane.announce_lends: 14
+  shard 0 refused fleet.plane.announcements_sent: 14
+  shard 0 refused fleet.plane.peer_reconnected: 3
+  shard 0 refused fleet.seal.pair_no_session: 9
+  shard 0 refused fleet.seal.pair_served: 2
+  shard 0 refused fleet.seal.pair_unanswered: 626
+  shard 0 refused fleet.seal.pair_undelivered: 635
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+--
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 44.40s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 3 exit 101
+== run 4 at 17:28:24, load 8.82 4.51 2.04
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["4288533613985104873", "1526026790458627040", "13143960233917490391", "14408381973310447390", "4649060388572575854"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-c-25167; council seats at ["chaos-fresh-member-a-25167", "chaos-fresh-member-b-25167", "chaos-fresh-member-e-25167"]
+slates daemon: fleet node `d` of `slates-fleet`: member 5623968967471510459 with 4 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a member that never held the log at a takeover: chaos-fresh-member-d-25167 replaced by a fresh member, rejoined at 1.849967088s
+chaos a member that never held the log at a takeover: the owner's holders once settled: ["chaos-fresh-member-a-25167", "chaos-fresh-member-d-25167"]
+chaos a member that never held the log at a takeover: chaos-fresh-member-d-25167 stopped at 2.286692268s
+chaos a member that never held the log at a takeover: 526 writes acknowledged; owner crashed; holders chaos-fresh-member-a-25167 (with the log) and chaos-fresh-member-d-25167 (stale)
+slates-cluster: fleet: HostId(4288533613985104873) holds HostId(12777384847187580953) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:620:8
+slates-cluster: fleet: HostId(4288533613985104873) holds HostId(12777384847187580953) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:720:9
+--
+chaos a member that never held the log at a takeover: chaos-fresh-member-a-25167 adopted the registers; it holds the log itself, so this run cannot show the defect
+chaos a member that never held the log at a takeover: decisive false; phase one waited for the holders 0 times while the holder was stopped
+chaos a member that never held the log at a takeover: chaos-fresh-member-a-25167 served the volume after 8.144924ms
+chaos a member that never held the log at a takeover: the successor's recorded and active holders among the survivors: ["chaos-fresh-member-d-25167", "chaos-fresh-member-b-25167", "chaos-fresh-member-e-25167"]
+chaos a member that never held the log at a takeover:
+  owner chaos-fresh-member-c-25167; council seats at ["chaos-fresh-member-a-25167", "chaos-fresh-member-b-25167", "chaos-fresh-member-e-25167"]
+  chaos-fresh-member-d-25167 replaced by a fresh member, rejoined at 1.849967088s
+  the owner's holders once settled: ["chaos-fresh-member-a-25167", "chaos-fresh-member-d-25167"]
+  chaos-fresh-member-d-25167 stopped at 2.286692268s
+  526 writes acknowledged; owner crashed; holders chaos-fresh-member-a-25167 (with the log) and chaos-fresh-member-d-25167 (stale)
+  chaos-fresh-member-a-25167 adopted the registers; it holds the log itself, so this run cannot show the defect
+  decisive false; phase one waited for the holders 0 times while the holder was stopped
+  chaos-fresh-member-a-25167 served the volume after 8.144924ms
+  NoLoss (successor): held
+  the successor's recorded and active holders among the survivors: ["chaos-fresh-member-d-25167", "chaos-fresh-member-b-25167", "chaos-fresh-member-e-25167"]
+  StaleNeverCommits (the counted holders' fences): held
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 10.88s
+
+== run 4 exit 0
+== run 5 at 17:28:35, load 7.91 4.46 2.05
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["16455404920650401687", "4136008204690572938", "6911915037678317620", "14906032855170810919", "15828867172146498025"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-a-26231; council seats at ["chaos-fresh-member-b-26231", "chaos-fresh-member-c-26231", "chaos-fresh-member-d-26231"]
+slates daemon: fleet node `e` of `slates-fleet`: member 9199118946787520349 with 4 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a member that never held the log at a takeover: chaos-fresh-member-e-26231 replaced by a fresh member, rejoined at 2.840658941s
+chaos a member that never held the log at a takeover: the owner's holders once settled: ["chaos-fresh-member-b-26231", "chaos-fresh-member-c-26231"]
+
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (26232) panicked at crates/cli/tests/live_chaos.rs:348:5:
+every neighbourhood settled, or kept changing, within each fleet wait: [(Some(4), Some(4)), (Some(10), Some(10)), (Some(10), Some(10)), (Some(10), Some(10)), (Some(9), Some(10))]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+--
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 45.40s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 5 exit 101
+== run 6 at 17:29:20, load 11.13 5.72 2.59
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["1820631995533795252", "8178108494748224959", "863389585005624760", "7752181339413654105", "4302554228891857072"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-b-32787; council seats at ["chaos-fresh-member-a-32787", "chaos-fresh-member-c-32787", "chaos-fresh-member-e-32787"]
+slates daemon: fleet node `d` of `slates-fleet`: member 17823257398224256554 with 4 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a member that never held the log at a takeover: chaos-fresh-member-d-32787 replaced by a fresh member, rejoined at 2.266863639s
+chaos a member that never held the log at a takeover: the owner's holders once settled: ["chaos-fresh-member-a-32787", "chaos-fresh-member-e-32787"]
+chaos a member that never held the log at a takeover: chaos-fresh-member-e-32787 stopped at 3.03282021s
+chaos a member that never held the log at a takeover: 402 writes acknowledged; owner crashed; holders chaos-fresh-member-a-32787 (with the log) and chaos-fresh-member-e-32787 (stale)
+slates-cluster: fleet: HostId(17057665670434993289) holds HostId(4302554228891857072) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:620:8
+slates-cluster: fleet: HostId(17057665670434993289) holds HostId(4302554228891857072) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:720:9
+--
+chaos a member that never held the log at a takeover: chaos-fresh-member-a-32787 adopted the registers; it holds the log itself, so this run cannot show the defect
+chaos a member that never held the log at a takeover: decisive false; phase one waited for the holders 0 times while the holder was stopped
+chaos a member that never held the log at a takeover: chaos-fresh-member-a-32787 served the volume after 9.795255ms
+chaos a member that never held the log at a takeover: the successor's recorded and active holders among the survivors: ["chaos-fresh-member-d-32787"]
+chaos a member that never held the log at a takeover: copies dropped holders still keep: ["chaos-fresh-member-c-32787 keeps its copy", "chaos-fresh-member-e-32787 keeps its copy"]
+chaos a member that never held the log at a takeover:
+  owner chaos-fresh-member-b-32787; council seats at ["chaos-fresh-member-a-32787", "chaos-fresh-member-c-32787", "chaos-fresh-member-e-32787"]
+  chaos-fresh-member-d-32787 replaced by a fresh member, rejoined at 2.266863639s
+  the owner's holders once settled: ["chaos-fresh-member-a-32787", "chaos-fresh-member-e-32787"]
+  chaos-fresh-member-e-32787 stopped at 3.03282021s
+  402 writes acknowledged; owner crashed; holders chaos-fresh-member-a-32787 (with the log) and chaos-fresh-member-e-32787 (stale)
+  chaos-fresh-member-a-32787 adopted the registers; it holds the log itself, so this run cannot show the defect
+  decisive false; phase one waited for the holders 0 times while the holder was stopped
+  chaos-fresh-member-a-32787 served the volume after 9.795255ms
+  NoLoss (successor): held
+  the successor's recorded and active holders among the survivors: ["chaos-fresh-member-d-32787"]
+  StaleNeverCommits (the counted holders' fences): held
+  copies dropped holders still keep: ["chaos-fresh-member-c-32787 keeps its copy", "chaos-fresh-member-e-32787 keeps its copy"]
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 61.71s
+
+== run 6 exit 0
+== run 7 at 17:30:22, load 4.50 4.86 2.50
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["15040155949414144722", "4564771393093227981", "3268454506620298486", "11182399834620114518", "3531594242134457432"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-a-37746; council seats at ["chaos-fresh-member-b-37746", "chaos-fresh-member-c-37746", "chaos-fresh-member-e-37746"]
+slates daemon: fleet node `d` of `slates-fleet`: member 16313429566600467207 with 4 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a member that never held the log at a takeover: chaos-fresh-member-d-37746 replaced by a fresh member, rejoined at 2.095581356s
+chaos a member that never held the log at a takeover: the owner's holders once settled: ["chaos-fresh-member-e-37746", "chaos-fresh-member-b-37746"]
+chaos a member that never held the log at a takeover: chaos-fresh-member-b-37746 stopped at 2.606045523s
+chaos a member that never held the log at a takeover: 426 writes acknowledged; owner crashed; holders chaos-fresh-member-e-37746 (with the log) and chaos-fresh-member-b-37746 (stale)
+slates-cluster: fleet: HostId(3268454506620298486) holds HostId(4564771393093227981) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:620:8
+slates-cluster: fleet: HostId(3268454506620298486) holds HostId(4564771393093227981) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:720:9
+--
+chaos a member that never held the log at a takeover: chaos-fresh-member-d-37746 adopted the registers; chaos-fresh-member-e-37746 stopped for 3s
+chaos a member that never held the log at a takeover: chaos-fresh-member-d-37746 took the volume over while the holder of the log was stopped
+chaos a member that never held the log at a takeover: decisive true; phase one waited for the holders 0 times while the holder was stopped
+chaos a member that never held the log at a takeover: chaos-fresh-member-d-37746 served the volume after 29.03439ms
+chaos a member that never held the log at a takeover: the successor's recorded and active holders among the survivors: ["chaos-fresh-member-e-37746"]
+chaos a member that never held the log at a takeover: copies on members no longer holders, at the takeover: ["chaos-fresh-member-b-37746 holds a copy fenced below 2: LiveState { holding: true, head: Some(422), durable: None, owed: false, epoch: Some(1), identity: Some(\"f3805a0c8bba0facdfc2cc078c6cd5ba4a73592cf8c74d5a5c5eeb6a09a30afc\"), fence: 1, holders: [], moving_to: [], recorded: [] }"]
+chaos a member that never held the log at a takeover: copies dropped holders still keep: ["chaos-fresh-member-b-37746 keeps its copy", "chaos-fresh-member-c-37746 keeps its copy"]
+chaos a member that never held the log at a takeover:
+  owner chaos-fresh-member-a-37746; council seats at ["chaos-fresh-member-b-37746", "chaos-fresh-member-c-37746", "chaos-fresh-member-e-37746"]
+  chaos-fresh-member-d-37746 replaced by a fresh member, rejoined at 2.095581356s
+  the owner's holders once settled: ["chaos-fresh-member-e-37746", "chaos-fresh-member-b-37746"]
+  chaos-fresh-member-b-37746 stopped at 2.606045523s
+  426 writes acknowledged; owner crashed; holders chaos-fresh-member-e-37746 (with the log) and chaos-fresh-member-b-37746 (stale)
+  chaos-fresh-member-d-37746 adopted the registers; chaos-fresh-member-e-37746 stopped for 3s
+  chaos-fresh-member-d-37746 took the volume over while the holder of the log was stopped
+  NoLoss (a takeover without the log's holder): held
+  decisive true; phase one waited for the holders 0 times while the holder was stopped
+  chaos-fresh-member-d-37746 served the volume after 29.03439ms
+  NoLoss (successor): held
+  the successor's recorded and active holders among the survivors: ["chaos-fresh-member-e-37746"]
+  StaleNeverCommits (the counted holders' fences): held
+  copies on members no longer holders, at the takeover: ["chaos-fresh-member-b-37746 holds a copy fenced below 2: LiveState { holding: true, head: Some(422), durable: None, owed: false, epoch: Some(1), identity: Some(\"f3805a0c8bba0facdfc2cc078c6cd5ba4a73592cf8c74d5a5c5eeb6a09a30afc\"), fence: 1, holders: [], moving_to: [], recorded: [] }"]
+  copies dropped holders still keep: ["chaos-fresh-member-b-37746 keeps its copy", "chaos-fresh-member-c-37746 keeps its copy"]
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 51.13s
+
+== run 7 exit 0
+== run 8 at 17:31:13, load 3.48 4.56 2.53
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["557406457815935008", "8144266596447051240", "10196812744192981234", "17755133246363888637", "410908094051957928"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-c-41833; council seats at ["chaos-fresh-member-a-41833", "chaos-fresh-member-b-41833", "chaos-fresh-member-e-41833"]
+slates daemon: fleet node `a` of `slates-fleet`: member 14471056985744565597 with 4 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a member that never held the log at a takeover: chaos-fresh-member-a-41833 replaced by a fresh member, rejoined at 2.14392402s
+chaos a member that never held the log at a takeover: the owner's holders once settled: ["chaos-fresh-member-b-41833", "chaos-fresh-member-a-41833"]
+
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (41834) panicked at crates/cli/tests/live_chaos.rs:348:5:
+every neighbourhood settled, or kept changing, within each fleet wait: [(Some(9), Some(9)), (Some(13), Some(13)), (Some(9), Some(9)), (Some(9), Some(13)), (Some(13), Some(13))]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+--
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 43.78s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 8 exit 101
