@@ -25,3 +25,14 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 16 filtered out; fin
 rejoins: successor daemon 21071 answered after 44.2595ms
 rejoins: the fleet re-formed after 296.1275ms
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 16 filtered out; finished in 7.82s
+=== rejoin-6 exit 101 load { 48.45 34.07 22.19 }
+rejoins: successor daemon 21419 answered after 40.495667ms
+rejoins --- chaos-rejoins-a-21141
+rejoins --- chaos-rejoins-b-21141
+shard 0 refused fleet.plane.peer_reconnected: 4
+rejoins --- chaos-rejoins-c-21141
+shard 0 refused fleet.plane.peer_reconnected: 3
+shard 0 refused fleet.plane.peer_redialed: 1
+thread 'a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet' (46328) panicked at crates/cli/tests/live_chaos.rs:2593:7:
+the fleet re-formed after the successor: [Some(("5270634831052638534", 1, 0)), Some(("3569034536716120792", 2, 1)), Some(("6295549811278917293", 2, 1))]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 16 filtered out; finished in 46.74s
