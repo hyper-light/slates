@@ -131,3 +131,5 @@ journal_grown_bytes: 0 (growth refused 0)
 thread 'a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates' (48140) panicked at crates/cli/tests/live_fleet.rs:1932:3:
 === bootstrap on 1 exit 0 load { 53.47 41.02 25.66 }
 live bootstrap: written=true caught_up=true shipping=Some(("5", "5", "false")) held=[Some(("5", "none", "false")), Some(("5", "none", "false"))] [("live-bootstrap-a-25257", {"held": 11, "hold_refused": 1, "hold_refused.no_catalog": 1}), ("live-bootstrap-b-25257", {"held": 5, "hold_refused": 34, "hol
+=== bootstrap on 2 exit 0 load { 54.29 41.60 26.04 }
+live bootstrap: written=true caught_up=true shipping=Some(("5", "5", "false")) held=[Some(("5", "none", "false")), Some(("5", "none", "false"))] [("live-bootstrap-a-25677", {"held": 10, "hold_refused": 10, "hold_refused.no_catalog": 2, "hold_refused.not_a_member": 8}), ("live-bootstrap-b-25677", {"h
