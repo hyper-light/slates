@@ -10028,6 +10028,7 @@ fn stream_checkpoint(
   };
   ShardImage::encode_start(stream.buf(), count);
   let mut published = Published::default();
+  let mut live = Vec::new();
   for handle in handles {
     let slot = state.volumes.get_mut(*handle)?;
     if being_destroyed(&slot.volume) {
@@ -10038,6 +10039,23 @@ fn stream_checkpoint(
       continue;
     }
     let id = slot.id;
+    // A live-shipped volume's log is shipped its change since its last publication, not this checkpoint's whole image
+    // (A-200, `crate::live_ship::note_checkpoint`); an unchanged one, nothing.
+    if state
+      .db
+      .partition()
+      .volume(id)
+      .is_some_and(|volume| volume.policy.live_shipped)
+      && !slot.volume.is_clean(&state.store)
+    {
+      let mut record = Vec::new();
+      let encoded = slot.volume.encode_publication(
+        &state.store,
+        slot.host.as_mut().map(|host| host as &mut dyn HostFs),
+        &mut record,
+      );
+      live.push((id, encoded.is_ok().then_some(record)));
+    }
     stream.buf().extend_from_slice(&id.bytes);
     if let Err(e) = slot.volume.encode_image_into(
       &state.store,
@@ -10056,8 +10074,8 @@ fn stream_checkpoint(
     Ok(frame_bytes) => published.frame_bytes = frame_bytes,
     Err(e) => return Ok(Streamed::Refused(e)),
   }
-  // A checkpoint ships each live-shipped volume's whole image once it commits (A-200, `crate::live_ship`).
-  crate::live_ship::note_checkpoint(state, &published.volumes);
+  // A checkpoint ships each changed live-shipped volume's delta once it commits (A-200, `crate::live_ship`).
+  crate::live_ship::note_checkpoint(state, live);
   Ok(Streamed::Committed(published))
 }
 

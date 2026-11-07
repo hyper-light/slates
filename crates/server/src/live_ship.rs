@@ -63,6 +63,9 @@ const RETAIN: usize = 4;
 /// Counter: a live volume's publication that could not be shipped as an entry, because its content could not be read,
 /// sealed or appended; its next publication ships the whole volume.
 const LIVE_REFUSED: &str = "fleet.live.refused";
+/// Counter: whole records appended to a live volume's log on this owner shard (a checkpoint of the log: the first, and
+/// each one a gap or a laggard behind the retained tail made owed).
+const LIVE_WHOLE_APPENDED: &str = "fleet.live.whole_appended";
 /// Counter: entries appended to a live volume's log on this owner shard.
 const LIVE_APPENDED: &str = "fleet.live.appended";
 /// Counter: entries a holder refused to keep (over its bound, unauthorized, malformed).
@@ -747,11 +750,20 @@ fn answer(state: &mut ShardState, entry: Awaiting, reply: slates_ipc::protocol::
   }
 }
 
-/// Notes each live-shipped volume of a committed checkpoint, whose whole image ships ([`ship_captured`]).
-pub(crate) fn note_checkpoint(state: &mut ShardState, volumes: &[slates_db::catalog::VolumeId]) {
-  for id in volumes {
-    if is_live(state, *id) {
-      state.live.captured.push((*id, None));
+/// Notes each live-shipped volume of a committed checkpoint and what its log is shipped for it ([`ship_captured`]): the
+/// volume's delta since its last publication (`None` only where that could not be encoded, and then its whole image).
+/// A journal checkpoint is no reason for the live log to take one: its holders hold everything before the delta. Until
+/// 2026-11-07 every checkpoint shipped each live volume's whole image to every holder while a write waited on it,
+/// costing more as the volume grew: on CI's quiet x86_64 runner the slow writes of the quiet-fleet flow came every ~500
+/// entries at 47, 82, 98 and 160 ms (diag-live-durability-6). The log still takes a whole record when it needs one (a
+/// gap, a laggard behind its retained tail).
+pub(crate) fn note_checkpoint(
+  state: &mut ShardState,
+  volumes: Vec<(slates_db::catalog::VolumeId, Option<Vec<u8>>)>,
+) {
+  for (id, record) in volumes {
+    if is_live(state, id) {
+      state.live.captured.push((id, record));
     }
   }
 }
@@ -866,6 +878,9 @@ pub(crate) fn published(
         live.whole = Some((head, payload));
       }
       state.count(LIVE_APPENDED, 1);
+      if whole {
+        state.count(LIVE_WHOLE_APPENDED, 1);
+      }
       resolve(state, id.bytes);
       let sends = pending_sends(state, id.bytes);
       dispatch(state, sends);
