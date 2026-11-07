@@ -1,0 +1,14 @@
+tested e3d01d21255bde00659a03ab2716d25e117ff9b1 on x86_64, 4 cpus
+green-checkpoint exit 101 53s
+  green-checkpoint: thread 'a_green_recovered_after_its_chain_was_checkpointed_is_the_green_it_was' (5434) panicked at crates/server/tests/green_checkpoint.rs:132:3:
+  green-checkpoint: assertion `left == right` failed: every version accepted before the restart (head 30)
+  green-checkpoint:   left: Some("submit 31: refused: BadRequest { reason: \"green_chains at capacity\" }")
+  green-checkpoint:  right: None
+  green-checkpoint: thread 'a_green_whose_readers_keep_up_holds_versions_past_its_chain_cap' (5435) panicked at crates/server/tests/green_checkpoint.rs:101:3:
+  green-checkpoint: assertion `left == right` failed: every version accepted (head reached 30 of 200)
+  green-checkpoint:   left: Some("submit 31: refused: BadRequest { reason: \"green_chains at capacity\" }")
+  green-checkpoint:  right: None
+  green-checkpoint: test a_green_whose_readers_keep_up_holds_versions_past_its_chain_cap ... FAILED
+  green-checkpoint: test a_green_recovered_after_its_chain_was_checkpointed_is_the_green_it_was ... FAILED
+  green-checkpoint: test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+  green-checkpoint: error: test failed, to rerun pass `-p slates-server --test green_checkpoint`
