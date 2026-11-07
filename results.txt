@@ -1,0 +1,121 @@
+runner ubuntu-24.04-arm, 4 CPUs, Sat Nov  7 05:01:53 UTC 2026, arm B 7b986d8bf6b9afb21a21004208d63df3b338571d
+== quiet round 1 arm a at 05:01:53, load 1.85 2.36 1.32
+measure: the owner's live counters {"appended": 2051, "durable": 2051, "no_session": 16, "resolved": 2051, "whole": 1}
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 1.85 2.36 1.32 3/267 9890
+  plain p50 37.7 p99 57.4 p999 82.7 max 102.2 us
+  live  p50 590.7 p99 781.6 p999 1073.2 max 1746.6 us
+  added at p50 553.0 us; live log at the end Some(("2050", "2050", "false")); late 0; (no_session, unanswered, link_lost) (16, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 2.52s
+  8197 writes, 8197 acknowledged: p50 638 us, p99 5214 us, p999 94878 us, max 583346 us; 11 over 50ms (sent+took): 0.00s+169ms 0.17s+103ms 2.30s+70ms 2.40s+95ms 2.50s+157ms 7.47s+56ms 7.54s+583ms 8.12s+416ms 8.54s+542ms 9.08s+353ms 9.43s+217ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 12.79s
+== quiet round 1 arm a exit 0
+== quiet round 1 arm b at 05:02:09, load 1.75 2.31 1.32
+measure: the owner's live counters {"appended": 2052, "durable": 2052, "install_bytes": 5095, "install_sent": 1, "no_session": 3, "resolved": 2051, "whole": 2}
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 1.75 2.31 1.32 3/267 11212
+  plain p50 41.4 p99 66.4 p999 96.6 max 101.9 us
+  live  p50 404.9 p99 570.1 p999 661.7 max 755.6 us
+  added at p50 363.5 us; live log at the end Some(("2051", "2051", "false")); late 0; (no_session, unanswered, link_lost) (3, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 2.95s
+  9691 writes, 9691 acknowledged: p50 543 us, p99 5980 us, p999 27774 us, max 167862 us; 2 over 50ms (sent+took): 0.00s+168ms 3.02s+63ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 11.66s
+== quiet round 1 arm b exit 0
+== busy round 1 arm a at 05:02:24, load 2.44 2.43 1.38
+measure: the owner's live counters {"appended": 2051, "durable": 2051, "no_session": 45, "resolved": 2051, "whole": 1}
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 4.79 2.95 1.56 14/275 12296
+  plain p50 999.8 p99 6998.3 p999 9001.7 max 10997.7 us
+  live  p50 5995.4 p99 16998.6 p999 20000.2 max 23000.4 us
+  added at p50 4995.7 us; live log at the end Some(("2050", "2050", "false")); late 0; (no_session, unanswered, link_lost) (45, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 16.56s
+  175 writes, 175 acknowledged: p50 80948 us, p99 191253 us, p999 257008 us, max 257008 us; 147 over 50ms (sent+took): 0.02s+179ms 0.25s+97ms 0.37s+64ms 0.44s+71ms 0.51s+89ms 0.60s+103ms 0.70s+139ms 0.84s+93ms 0.93s+117ms 1.05s+127ms 1.17s+126ms 1.30s+142ms 1.44s+145ms 1.59s+180ms 1.77s+133ms 1.90s+177ms 2.08s+151ms 2.23s+118ms 2.35s+257ms 2.60s+122ms 2.73s+122ms 2.85s+119ms 2.97s+126ms 3.09s+152ms 3.25s+121ms 3.37s+103ms 3.47s+129ms 3.60s+191ms 3.79s+111ms 3.90s+175ms 4.08s+82ms 4.16s+67ms 4.22s+72ms 4.30s+63ms 4.36s+83ms 4.44s+82ms 4.52s+55ms 4.58s+72ms 4.65s+85ms 4.74s+75ms 4.86s+70ms 4.93s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 17.56s
+== busy round 1 arm a exit 0
+== busy round 1 arm b at 05:02:58, load 8.53 3.92 1.92
+measure: the owner's live counters {"appended": 2060, "durable": 2060, "install_bytes": 50950, "install_sent": 10, "no_session": 5, "resolved": 2051, "whole": 11}
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 9.15 4.21 2.03 14/274 12872
+  plain p50 996.3 p99 4996.0 p999 6005.9 max 6999.2 us
+  live  p50 2000.5 p99 11000.8 p999 22001.0 max 51252.8 us
+  added at p50 1004.1 us; live log at the end Some(("2059", "2059", "false")); late 0; (no_session, unanswered, link_lost) (5, 0, 0); live writes over 50 ms 1
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 10.40s
+  205 writes, 205 acknowledged: p50 61993 us, p99 117529 us, p999 272990 us, max 272990 us; 148 over 50ms (sent+took): 0.02s+273ms 0.29s+58ms 0.35s+94ms 0.44s+71ms 0.51s+79ms 0.59s+79ms 0.67s+91ms 0.76s+96ms 0.86s+78ms 0.99s+78ms 1.06s+76ms 1.19s+57ms 1.24s+52ms 1.33s+120ms 1.45s+82ms 1.82s+60ms 1.89s+55ms 1.94s+82ms 2.02s+69ms 2.09s+75ms 2.17s+64ms 2.23s+72ms 2.30s+66ms 2.37s+85ms 2.45s+72ms 2.52s+118ms 2.64s+84ms 2.72s+79ms 2.80s+99ms 2.90s+94ms 3.00s+75ms 3.07s+110ms 3.18s+105ms 3.29s+94ms 3.38s+95ms 3.48s+72ms 3.55s+99ms 3.65s+94ms 3.74s+71ms 3.81s+74ms 3.89s+67ms 3.95s+81ms 4.03s+85ms 4.1
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 16.82s
+== busy round 1 arm b exit 0
+== quiet round 2 arm b at 05:03:26, load 10.83 4.82 2.26
+measure: the owner's live counters {"appended": 2053, "durable": 2053, "install_bytes": 10190, "install_sent": 2, "no_session": 2, "resolved": 2051, "whole": 3}
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 10.04 4.76 2.26 4/265 13493
+  plain p50 37.4 p99 57.9 p999 116.1 max 128.2 us
+  live  p50 382.3 p99 524.2 p999 612.4 max 936.5 us
+  added at p50 344.9 us; live log at the end Some(("2052", "2052", "false")); late 0; (no_session, unanswered, link_lost) (2, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 2.07s
+  14866 writes, 14866 acknowledged: p50 481 us, p99 3348 us, p999 27159 us, max 113438 us; 2 over 50ms (sent+took): 0.00s+113ms 2.21s+52ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 12.50s
+== quiet round 2 arm b exit 0
+== quiet round 2 arm a at 05:03:41, load 9.42 4.80 2.30
+measure: the owner's live counters {"appended": 2051, "durable": 2051, "no_session": 14, "resolved": 2051, "whole": 1}
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 8.66 4.72 2.29 3/261 14865
+  plain p50 37.2 p99 59.6 p999 89.2 max 113.4 us
+  live  p50 580.6 p99 783.8 p999 1226.6 max 1594.1 us
+  added at p50 543.4 us; live log at the end Some(("2050", "2050", "false")); late 0; (no_session, unanswered, link_lost) (14, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 3.50s
+  4557 writes, 4557 acknowledged: p50 686 us, p99 6931 us, p999 325730 us, max 568988 us; 26 over 50ms (sent+took): 0.00s+152ms 2.19s+69ms 3.19s+56ms 3.25s+59ms 3.31s+243ms 3.60s+53ms 4.25s+68ms 5.32s+304ms 5.62s+129ms 5.75s+306ms 6.06s+319ms 6.38s+77ms 6.45s+206ms 6.66s+396ms 7.06s+249ms 7.31s+569ms 7.88s+67ms 7.94s+131ms 8.07s+149ms 8.22s+326ms 8.55s+412ms 8.96s+138ms 9.10s+122ms 9.22s+186ms 9.41s+562ms 9.97s+267ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 11.48s
+== quiet round 2 arm a exit 0
+== busy round 2 arm b at 05:03:56, load 7.72 4.64 2.29
+measure: the owner's live counters {"appended": 2051, "durable": 2051, "no_session": 8, "resolved": 2051, "whole": 1}
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 8.82 4.98 2.42 16/270 15887
+  plain p50 62.2 p99 4351.6 p999 5137.1 max 6000.9 us
+  live  p50 3896.5 p99 9407.3 p999 13073.8 max 14962.2 us
+  added at p50 3834.3 us; live log at the end Some(("2050", "2050", "false")); late 0; (no_session, unanswered, link_lost) (8, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 9.87s
+  238 writes, 238 acknowledged: p50 52001 us, p99 127999 us, p999 386084 us, max 386084 us; 125 over 50ms (sent+took): 0.02s+386ms 0.41s+102ms 0.51s+80ms 0.59s+89ms 0.68s+88ms 0.77s+76ms 0.84s+74ms 0.92s+98ms 1.02s+59ms 1.20s+64ms 1.27s+52ms 1.36s+76ms 1.44s+73ms 1.51s+58ms 1.57s+55ms 1.64s+93ms 1.78s+59ms 1.84s+64ms 2.05s+90ms 2.19s+60ms 2.25s+104ms 2.35s+92ms 2.45s+96ms 2.54s+125ms 2.67s+114ms 2.78s+130ms 2.91s+100ms 3.01s+78ms 3.09s+96ms 3.18s+86ms 3.27s+69ms 3.34s+95ms 3.43s+90ms 3.52s+78ms 3.60s+78ms 3.81s+52ms 3.87s+64ms 4.02s+56ms 4.07s+61ms 4.13s+65ms 4.20s+55ms 4.33s+94ms 4.43s+60ms 4
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 18.21s
+== busy round 2 arm b exit 0
+== busy round 2 arm a at 05:04:25, load 10.87 5.70 2.71
+measure: the owner's live counters {"appended": 2051, "durable": 2051, "no_session": 36, "resolved": 2051, "whole": 1}
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 11.37 6.06 2.88 14/274 16422
+  plain p50 71.9 p99 5001.8 p999 7001.1 max 9002.5 us
+  live  p50 4997.5 p99 12998.7 p999 17999.1 max 20104.0 us
+  added at p50 4925.6 us; live log at the end Some(("2050", "2050", "false")); late 0; (no_session, unanswered, link_lost) (36, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 12.77s
+  172 writes, 172 acknowledged: p50 74995 us, p99 251039 us, p999 253824 us, max 253824 us; 148 over 50ms (sent+took): 0.02s+251ms 0.27s+124ms 0.39s+83ms 0.47s+81ms 0.55s+75ms 0.63s+61ms 0.69s+119ms 0.81s+75ms 0.88s+98ms 1.03s+75ms 1.11s+101ms 1.21s+84ms 1.29s+107ms 1.40s+91ms 1.49s+129ms 1.62s+79ms 1.70s+67ms 1.77s+86ms 1.85s+92ms 1.94s+111ms 2.05s+104ms 2.16s+84ms 2.24s+89ms 2.33s+94ms 2.43s+54ms 2.48s+81ms 2.56s+66ms 2.63s+85ms 2.76s+60ms 2.82s+58ms 2.87s+112ms 2.99s+59ms 3.05s+104ms 3.15s+102ms 3.30s+56ms 3.45s+77ms 3.52s+66ms 3.59s+69ms 3.66s+86ms 3.74s+97ms 3.84s+118ms 3.96s+75ms 4.03s+1
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 17.15s
+== busy round 2 arm a exit 0
+== quiet round 3 arm a at 05:04:56, load 12.48 6.56 3.10
+measure: the owner's live counters {"appended": 2051, "durable": 2051, "no_session": 12, "resolved": 2051, "whole": 1}
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 11.72 6.50 3.10 3/265 16985
+  plain p50 39.0 p99 67.8 p999 97.9 max 129.4 us
+  live  p50 575.1 p99 764.8 p999 1314.6 max 3286.6 us
+  added at p50 536.1 us; live log at the end Some(("2050", "2050", "false")); late 0; (no_session, unanswered, link_lost) (12, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 2.48s
+  7872 writes, 7872 acknowledged: p50 764 us, p99 4972 us, p999 52616 us, max 569282 us; 8 over 50ms (sent+took): 0.00s+170ms 2.40s+84ms 3.43s+53ms 5.45s+79ms 7.52s+569ms 8.09s+95ms 8.19s+90ms 8.28s+60ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 12.52s
+== quiet round 3 arm a exit 0
+== quiet round 3 arm b at 05:05:11, load 10.62 6.44 3.11
+measure: the owner's live counters {"appended": 2052, "durable": 2052, "install_bytes": 5095, "install_sent": 1, "no_session": 4, "resolved": 2051, "whole": 2}
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 9.77 6.33 3.09 3/265 18216
+  plain p50 38.6 p99 67.6 p999 126.9 max 538.8 us
+  live  p50 401.0 p99 607.3 p999 773.2 max 1210.5 us
+  added at p50 362.4 us; live log at the end Some(("2051", "2051", "false")); late 0; (no_session, unanswered, link_lost) (4, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 2.13s
+  15227 writes, 15227 acknowledged: p50 457 us, p99 3346 us, p999 9463 us, max 141554 us; 7 over 50ms (sent+took): 0.00s+142ms 2.14s+55ms 4.25s+95ms 5.29s+51ms 6.33s+53ms 7.38s+53ms 9.47s+94ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 11.67s
+== quiet round 3 arm b exit 0
+== busy round 3 arm a at 05:05:25, load 9.11 6.30 3.12
+measure: the owner's live counters {"appended": 2051, "durable": 2051, "no_session": 55, "resolved": 2051, "whole": 1}
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 10.15 6.72 3.33 16/270 19362
+  plain p50 1000.7 p99 8997.0 p999 9999.7 max 10006.3 us
+  live  p50 5001.6 p99 15334.5 p999 20934.7 max 25002.0 us
+  added at p50 4000.9 us; live log at the end Some(("2050", "2050", "false")); late 0; (no_session, unanswered, link_lost) (55, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 17.89s
+  179 writes, 179 acknowledged: p50 71992 us, p99 188169 us, p999 235979 us, max 235979 us; 147 over 50ms (sent+took): 0.03s+236ms 0.26s+83ms 0.35s+123ms 0.47s+111ms 0.58s+106ms 0.69s+148ms 0.83s+124ms 0.96s+105ms 1.06s+109ms 1.17s+121ms 1.29s+95ms 1.39s+86ms 1.47s+79ms 1.55s+63ms 1.62s+75ms 1.69s+98ms 1.79s+67ms 1.85s+100ms 1.95s+150ms 2.10s+105ms 2.21s+120ms 2.33s+108ms 2.44s+97ms 2.53s+109ms 2.64s+63ms 2.71s+130ms 2.89s+84ms 2.97s+76ms 3.05s+104ms 3.15s+150ms 3.30s+116ms 3.42s+78ms 3.50s+81ms 3.58s+58ms 3.63s+55ms 3.69s+53ms 3.74s+61ms 3.82s+99ms 3.92s+52ms 3.97s+52ms 4.02s+72ms 4.09s+77ms 
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 15.77s
+== busy round 3 arm a exit 0
+== busy round 3 arm b at 05:06:00, load 11.76 7.24 3.55
+measure: the owner's live counters {"appended": 2051, "durable": 2051, "no_session": 9, "resolved": 2051, "whole": 1}
+measure: 2000 writes each of 4096 B FILE_SYNC, 5 interleaved rounds; load 12.10 7.46 3.66 13/270 19914
+  plain p50 66.1 p99 7007.6 p999 9003.5 max 10000.1 us
+  live  p50 4351.8 p99 10370.7 p999 12006.7 max 17591.2 us
+  added at p50 4285.7 us; live log at the end Some(("2050", "2050", "false")); late 0; (no_session, unanswered, link_lost) (9, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 11.33s
+  171 writes, 171 acknowledged: p50 77890 us, p99 139248 us, p999 234887 us, max 234887 us; 162 over 50ms (sent+took): 0.03s+235ms 0.27s+85ms 0.35s+77ms 0.43s+105ms 0.54s+76ms 0.61s+85ms 0.70s+71ms 0.77s+84ms 0.85s+78ms 0.93s+123ms 1.05s+73ms 1.13s+98ms 1.22s+64ms 1.29s+110ms 1.40s+74ms 1.47s+74ms 1.55s+51ms 1.60s+82ms 1.68s+119ms 1.80s+125ms 1.92s+99ms 2.02s+122ms 2.14s+139ms 2.28s+114ms 2.40s+88ms 2.48s+94ms 2.58s+115ms 2.69s+86ms 2.78s+104ms 2.88s+90ms 2.97s+106ms 3.08s+99ms 3.18s+53ms 3.23s+88ms 3.32s+83ms 3.40s+79ms 3.48s+59ms 3.54s+100ms 3.64s+81ms 3.72s+77ms 3.80s+75ms 3.87s+106ms 3.98s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 18.00s
+== busy round 3 arm b exit 0
