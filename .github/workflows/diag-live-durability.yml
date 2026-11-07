@@ -1,9 +1,9 @@
 name: diag-live-durability
 
-# Diagnostics only, never on main (A-200, item 2): diag-10's TEMPORARY lane probe again, busy skips counted not listed (LANEPROBE log lines: a lane step past 100 ms
+# Diagnostics only, never on main (A-200, item 2): the lane probe plus why each whole record ships (owes_whole, no record, kept at the size), every refusal with its reason and the lanes' ages, and every stale checkpoint; busy skips counted not listed (LANEPROBE log lines: a lane step past 100 ms
 # with its borrow, exchange and straggler times; a holder skipped as busy past 250 ms; a lane ending past 100 ms; the
 # borrower holding a session a lane missed). The rolling partition flow ten times and the quiet-fleet flow five times,
-# release, both Linux arches. Results to diag-results/live-durability-12-<os> by git push.
+# release, both Linux arches. Results to diag-results/live-durability-14-<os> by git push.
 on:
   push:
     branches: ["diag-live-durability-*"]
@@ -41,7 +41,7 @@ jobs:
         run: |
           R=../results.txt
           echo "runner ${{ matrix.os }}, $(nproc) CPUs, $(date -u), head $(git rev-parse HEAD)" > $R
-          for run in $(seq 1 10); do
+          for run in $(seq 1 5); do
             echo "== run $run at $(date -u +%H:%M:%S), load $(cut -d' ' -f1-3 /proc/loadavg)" | tee -a $R
             status=0
             timeout 900 cargo test --release --locked -p slates-cli --test live_chaos -- --nocapture --test-threads=1 --exact candidates_partitioned_in_turn_mid_stream_lose_nothing > ../run.log 2>&1 || status=$?
@@ -58,12 +58,12 @@ jobs:
       - name: Publish the results to a branch
         if: always()
         run: |
-          branch="diag-results/live-durability-12-${{ matrix.os }}"
+          branch="diag-results/live-durability-14-${{ matrix.os }}"
           git config user.name "diag-live-durability"
           git config user.email "diag-live-durability@users.noreply.github.com"
           git checkout --orphan results-only
           git rm -rq --cached . || true
           cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
           git add results.txt
-          git commit -qm "diag-live-durability-12 results, ${{ matrix.os }}"
+          git commit -qm "diag-live-durability-14 results, ${{ matrix.os }}"
           git push -q origin "HEAD:refs/heads/$branch"

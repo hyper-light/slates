@@ -842,6 +842,16 @@ pub(crate) fn published(
       kept: 0,
     });
   let whole = live.owes_whole || record.is_none() || reaches_size;
+  if whole {
+    // TEMPORARY (item 2 whole-record probe): why this publication ships whole.
+    slates_machine::log_line!(
+      "LANEPROBE whole owes_whole={} no_record={} reaches_size={} in_flight={}",
+      live.owes_whole,
+      record.is_none(),
+      reaches_size,
+      live.shipper.in_flight()
+    );
+  }
   let built = if whole {
     whole_record(state, id)
   } else {
@@ -913,6 +923,21 @@ fn kept_reaches_size(state: &ShardState, id: slates_db::catalog::VolumeId) -> bo
 
 /// A publication that could not become an entry: counted, and the volume owes a whole record next.
 fn refuse(state: &mut ShardState, id: slates_db::catalog::VolumeId, why: &'static str) {
+  // TEMPORARY (item 2 whole-record probe).
+  let lanes: Vec<(HostId, u64)> = state
+    .live
+    .shipping
+    .get(&id.bytes)
+    .map(|live| {
+      let now = slates_rt::futures::now_ns();
+      live
+        .lanes
+        .iter()
+        .map(|(holder, began)| (*holder, now.saturating_sub(*began) / 1_000_000))
+        .collect()
+    })
+    .unwrap_or_default();
+  slates_machine::log_line!("LANEPROBE refuse why={why} lanes_ms={lanes:?}");
   state.count(LIVE_REFUSED, 1);
   state.count(why, 1);
   if let Some(live) = state.live.shipping.get_mut(&id.bytes) {
@@ -1106,6 +1131,8 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
     }
   }
   if stale_checkpoint {
+    // TEMPORARY (item 2 whole-record probe).
+    slates_machine::log_line!("LANEPROBE stale_checkpoint");
     live.owes_whole = true;
   }
   for bytes in state_counts {
