@@ -1,0 +1,36 @@
+runner ubuntu-24.04-arm, 4 CPUs, Sat Nov  7 14:13:26 UTC 2026, tree R d1e3424f9dce868dc5c75f85725e342c66dc05ce
+live laggard: {"appended": 183, "durable": 183, "no_session": 266, "resolved": 181, "unanswered": 262, "whole": 3}; then Some(("182", "182", "false")) [Some(("182", "none", "false")), Some(("182", "none", "false"))]
+thread 'a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log' (6173) panicked at crates/cli/tests/live_fleet.rs:1444:3:
+== run 1 a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log exit 101 load 1.67 1.61 0.74
+live laggard: {"appended": 184, "durable": 183, "no_session": 265, "resolved": 181, "unanswered": 261, "whole": 4}; then Some(("183", "183", "false")) [Some(("183", "none", "false")), Some(("183", "none", "false"))]
+thread 'a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log' (6453) panicked at crates/cli/tests/live_fleet.rs:1444:3:
+== run 2 a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log exit 101 load 1.67 1.61 0.74
+live laggard: {"appended": 183, "durable": 183, "no_session": 273, "resolved": 181, "unanswered": 259, "whole": 3}; then Some(("182", "182", "false")) [Some(("182", "none", "false")), Some(("182", "none", "false"))]
+thread 'a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log' (6626) panicked at crates/cli/tests/live_fleet.rs:1444:3:
+== run 3 a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log exit 101 load 1.70 1.62 0.74
+live laggard: {"appended": 183, "durable": 183, "no_session": 266, "resolved": 181, "unanswered": 261, "whole": 3}; then Some(("182", "182", "false")) [Some(("182", "none", "false")), Some(("182", "none", "false"))]
+thread 'a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log' (6881) panicked at crates/cli/tests/live_fleet.rs:1444:3:
+== run 4 a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log exit 101 load 1.70 1.62 0.74
+live laggard: {"appended": 183, "durable": 183, "no_session": 262, "resolved": 181, "unanswered": 258, "whole": 3}; then Some(("182", "182", "false")) [Some(("182", "none", "false")), Some(("182", "none", "false"))]
+thread 'a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log' (7158) panicked at crates/cli/tests/live_fleet.rs:1444:3:
+== run 5 a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log exit 101 load 1.64 1.61 0.74
+live laggard: {"appended": 183, "durable": 183, "no_session": 264, "resolved": 181, "unanswered": 260, "whole": 3}; then Some(("182", "182", "false")) [Some(("182", "none", "false")), Some(("182", "none", "false"))]
+thread 'a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log' (7357) panicked at crates/cli/tests/live_fleet.rs:1444:3:
+== run 6 a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log exit 101 load 1.64 1.61 0.74
+live laggard: {"appended": 183, "durable": 183, "no_session": 264, "resolved": 181, "unanswered": 259, "whole": 3}; then Some(("182", "182", "false")) [Some(("182", "none", "false")), Some(("182", "none", "false"))]
+thread 'a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log' (7550) panicked at crates/cli/tests/live_fleet.rs:1444:3:
+== run 7 a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log exit 101 load 1.51 1.58 0.74
+live laggard: {"appended": 183, "durable": 183, "no_session": 262, "resolved": 181, "unanswered": 259, "whole": 3}; then Some(("182", "182", "false")) [Some(("182", "none", "false")), Some(("182", "none", "false"))]
+thread 'a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log' (7751) panicked at crates/cli/tests/live_fleet.rs:1444:3:
+== run 8 a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log exit 101 load 1.51 1.58 0.74
+live laggard: {"appended": 184, "durable": 183, "no_session": 265, "resolved": 181, "unanswered": 260, "whole": 4}; then Some(("183", "183", "false")) [Some(("183", "none", "false")), Some(("183", "none", "false"))]
+thread 'a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log' (8023) panicked at crates/cli/tests/live_fleet.rs:1444:3:
+== run 9 a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log exit 101 load 1.87 1.65 0.77
+live laggard: {"appended": 183, "durable": 183, "no_session": 262, "resolved": 181, "unanswered": 258, "whole": 3}; then Some(("182", "182", "false")) [Some(("182", "none", "false")), Some(("182", "none", "false"))]
+thread 'a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log' (8308) panicked at crates/cli/tests/live_fleet.rs:1444:3:
+== run 10 a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log exit 101 load 1.72 1.63 0.76
+test a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log ... FAILED
+test a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog ... FAILED
+test each_candidate_stopped_in_turn_holds_no_write_and_catches_up ... FAILED
+test result: FAILED. 19 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 30.08s
+== live_fleet quiet exit 101
