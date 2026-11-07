@@ -581,6 +581,7 @@ fn diagnose_pod(lane: &Lane, each: &str) {
             || line.contains("fleet.materialize")
             || line.contains("fleet.owner_location")
             || line.contains("fleet.lent_to.")
+            || line.contains("diag.")
             || line.starts_with("fleet_session ")
             || line.starts_with("fleet_host")
             || line.starts_with("fleet_members")

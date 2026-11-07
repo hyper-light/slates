@@ -7324,9 +7324,138 @@ pub(crate) fn take_sessions(
     for holder in held_from_phase_one {
       s.count(holder, 1);
     }
+    s.count(
+      diag_lend_names(Some(lent_to)).0,
+      u64::try_from(taken.len()).unwrap_or(u64::MAX),
+    );
     taken
   })
   .unwrap_or_default()
+}
+
+/// DIAG (never for main): the lend, return and stale-return counter names of a borrow tag, so a session lent and never
+/// returned shows as lends above returns plus stale returns under the lane that took it.
+fn diag_lend_names(tag: Option<&'static str>) -> (&'static str, &'static str, &'static str) {
+  match tag.unwrap_or("") {
+    "fleet.lent_to.adopt" => ("diag.lend.adopt", "diag.returned.adopt", "diag.stale.adopt"),
+    "fleet.lent_to.announce_epochs" => (
+      "diag.lend.announce_epochs",
+      "diag.returned.announce_epochs",
+      "diag.stale.announce_epochs",
+    ),
+    "fleet.lent_to.ask_pages" => (
+      "diag.lend.ask_pages",
+      "diag.returned.ask_pages",
+      "diag.stale.ask_pages",
+    ),
+    "fleet.lent_to.deliver_pairs" => (
+      "diag.lend.deliver_pairs",
+      "diag.returned.deliver_pairs",
+      "diag.stale.deliver_pairs",
+    ),
+    "fleet.lent_to.drive_council_replication" => (
+      "diag.lend.drive_council_replication",
+      "diag.returned.drive_council_replication",
+      "diag.stale.drive_council_replication",
+    ),
+    "fleet.lent_to.drive_learner_fetch" => (
+      "diag.lend.drive_learner_fetch",
+      "diag.returned.drive_learner_fetch",
+      "diag.stale.drive_learner_fetch",
+    ),
+    "fleet.lent_to.drive_promotion" => (
+      "diag.lend.drive_promotion",
+      "diag.returned.drive_promotion",
+      "diag.stale.drive_promotion",
+    ),
+    "fleet.lent_to.drive_root_learner_fetch" => (
+      "diag.lend.drive_root_learner_fetch",
+      "diag.returned.drive_root_learner_fetch",
+      "diag.stale.drive_root_learner_fetch",
+    ),
+    "fleet.lent_to.drive_root_replication" => (
+      "diag.lend.drive_root_replication",
+      "diag.returned.drive_root_replication",
+      "diag.stale.drive_root_replication",
+    ),
+    "fleet.lent_to.drive_transfer_invitation" => (
+      "diag.lend.drive_transfer_invitation",
+      "diag.returned.drive_transfer_invitation",
+      "diag.stale.drive_transfer_invitation",
+    ),
+    "fleet.lent_to.fetch_into_hold" => (
+      "diag.lend.fetch_into_hold",
+      "diag.returned.fetch_into_hold",
+      "diag.stale.fetch_into_hold",
+    ),
+    "fleet.lent_to.forward_lane" => (
+      "diag.lend.forward_lane",
+      "diag.returned.forward_lane",
+      "diag.stale.forward_lane",
+    ),
+    "fleet.lent_to.hold_record_session" => (
+      "diag.lend.hold_record_session",
+      "diag.returned.hold_record_session",
+      "diag.stale.hold_record_session",
+    ),
+    "fleet.lent_to.link" => ("diag.lend.link", "diag.returned.link", "diag.stale.link"),
+    "fleet.lent_to.live_ship" => (
+      "diag.lend.live_ship",
+      "diag.returned.live_ship",
+      "diag.stale.live_ship",
+    ),
+    "fleet.lent_to.live_takeover" => (
+      "diag.lend.live_takeover",
+      "diag.returned.live_takeover",
+      "diag.stale.live_takeover",
+    ),
+    "fleet.lent_to.locate" => (
+      "diag.lend.locate",
+      "diag.returned.locate",
+      "diag.stale.locate",
+    ),
+    "fleet.lent_to.mirror_ship" => (
+      "diag.lend.mirror_ship",
+      "diag.returned.mirror_ship",
+      "diag.stale.mirror_ship",
+    ),
+    "fleet.lent_to.put_inputs" => (
+      "diag.lend.put_inputs",
+      "diag.returned.put_inputs",
+      "diag.stale.put_inputs",
+    ),
+    "fleet.lent_to.put_seal_content" => (
+      "diag.lend.put_seal_content",
+      "diag.returned.put_seal_content",
+      "diag.stale.put_seal_content",
+    ),
+    "fleet.lent_to.request_peer" => (
+      "diag.lend.request_peer",
+      "diag.returned.request_peer",
+      "diag.stale.request_peer",
+    ),
+    "fleet.lent_to.send_council_report" => (
+      "diag.lend.send_council_report",
+      "diag.returned.send_council_report",
+      "diag.stale.send_council_report",
+    ),
+    "fleet.lent_to.ship_head" => (
+      "diag.lend.ship_head",
+      "diag.returned.ship_head",
+      "diag.stale.ship_head",
+    ),
+    "fleet.lent_to.ship_record" => (
+      "diag.lend.ship_record",
+      "diag.returned.ship_record",
+      "diag.stale.ship_record",
+    ),
+    "fleet.lent_to.take_campaign_sessions" => (
+      "diag.lend.take_campaign_sessions",
+      "diag.returned.take_campaign_sessions",
+      "diag.stale.take_campaign_sessions",
+    ),
+    _ => ("diag.lend.other", "diag.returned.other", "diag.stale.other"),
+  }
 }
 
 /// Returns borrowed sessions to the shard state after a dispatch. A slot is refilled only by the session
@@ -7339,14 +7468,19 @@ pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
   state::with_state(|s| {
     for (host, mut endpoint) in sessions {
       let returned = endpoint.connection_id().ok();
+      let tag = s.record_sessions.get(&host).and_then(|link| link.lent_to);
       match s.record_sessions.get_mut(&host) {
         Some(link) if link.endpoint.is_none() && link.borrowed == returned => {
           link.last_seen = Some(crate::state::RecordLink::seen(host, &endpoint));
           link.endpoint = Some(endpoint);
           link.borrowed = None;
           link.lent_to = None;
+          s.count(diag_lend_names(tag).1, 1);
         }
-        _ => s.count(LINK_STALE_RETURN, 1),
+        _ => {
+          s.count(LINK_STALE_RETURN, 1);
+          s.count(diag_lend_names(tag).2, 1);
+        }
       }
     }
   });
