@@ -1,0 +1,63 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 13:36:14 UTC 2026, tree F 3cef4bdafc676788c0554943e68626e08ddb269c
+live fsync: healthy Ok(()); candidates stopped Err(Os { code: 5, kind: Uncategorized, message: "Input/output error" }) after 1.00068739s; resumed Ok(()); owner's live counters {"appended": 4, "durable": 4, "no_session": 1, "unanswered": 1, "whole": 1}
+== run 1 a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it exit 0 load 2.45 1.94 0.87
+live changes: 200 writes: {"appended": 201, "durable": 201, "no_session": 1, "resolved": 201, "whole": 3}
+thread 'a_live_volumes_writes_ship_their_changes_not_the_volume' (6228) panicked at crates/cli/tests/live_fleet.rs:1350:3:
+assertion `left == right` failed: only the log's first record is whole: {"appended": 201, "durable": 201, "no_session": 1, "resolved": 201, "whole": 3}
+== run 1 a_live_volumes_writes_ship_their_changes_not_the_volume exit 101 load 2.45 1.94 0.87
+live fsync: healthy Ok(()); candidates stopped Err(Os { code: 5, kind: Uncategorized, message: "Input/output error" }) after 1.001556491s; resumed Ok(()); owner's live counters {"appended": 4, "durable": 4, "no_session": 2, "unanswered": 2, "whole": 1}
+== run 2 a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it exit 0 load 3.70 2.21 0.97
+live changes: 200 writes: {"appended": 202, "durable": 202, "no_session": 1, "resolved": 201, "whole": 3}
+thread 'a_live_volumes_writes_ship_their_changes_not_the_volume' (6454) panicked at crates/cli/tests/live_fleet.rs:1350:3:
+assertion `left == right` failed: only the log's first record is whole: {"appended": 202, "durable": 202, "no_session": 1, "resolved": 201, "whole": 3}
+== run 2 a_live_volumes_writes_ship_their_changes_not_the_volume exit 101 load 4.76 2.46 1.05
+live fsync: healthy Ok(()); candidates stopped Err(Os { code: 5, kind: Uncategorized, message: "Input/output error" }) after 1.001004094s; resumed Ok(()); owner's live counters {"appended": 4, "durable": 4, "link_lost": 1, "no_session": 5, "unanswered": 6, "whole": 1}
+== run 3 a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it exit 0 load 5.26 2.60 1.11
+live changes: 200 writes: {"appended": 207, "durable": 207, "no_session": 1, "resolved": 201, "whole": 11}
+thread 'a_live_volumes_writes_ship_their_changes_not_the_volume' (6720) panicked at crates/cli/tests/live_fleet.rs:1350:3:
+assertion `left == right` failed: only the log's first record is whole: {"appended": 207, "durable": 207, "no_session": 1, "resolved": 201, "whole": 11}
+== run 3 a_live_volumes_writes_ship_their_changes_not_the_volume exit 101 load 5.26 2.60 1.11
+live fsync: healthy Ok(()); candidates stopped Ok(()) after 1.99698ms; resumed Ok(()); owner's live counters {"appended": 4, "durable": 4, "whole": 1}
+thread 'a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it' (6839) panicked at crates/cli/tests/live_fleet.rs:1611:3:
+assertion `left == right` failed: an fsync no candidate can hold fails EIO, not success: Ok(())
+== run 4 a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it exit 101 load 5.72 2.74 1.16
+live changes: 200 writes: {"appended": 202, "durable": 202, "resolved": 201, "whole": 2}
+thread 'a_live_volumes_writes_ship_their_changes_not_the_volume' (6944) panicked at crates/cli/tests/live_fleet.rs:1350:3:
+assertion `left == right` failed: only the log's first record is whole: {"appended": 202, "durable": 202, "resolved": 201, "whole": 2}
+== run 4 a_live_volumes_writes_ship_their_changes_not_the_volume exit 101 load 6.14 2.87 1.21
+live fsync: healthy Ok(()); candidates stopped Err(Os { code: 5, kind: Uncategorized, message: "Input/output error" }) after 1.000617253s; resumed Ok(()); owner's live counters {"appended": 4, "durable": 4, "no_session": 2, "unanswered": 1, "whole": 1}
+== run 5 a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it exit 0 load 6.14 2.87 1.21
+live changes: 200 writes: {"appended": 204, "durable": 204, "no_session": 1, "resolved": 201, "whole": 5}
+thread 'a_live_volumes_writes_ship_their_changes_not_the_volume' (7159) panicked at crates/cli/tests/live_fleet.rs:1350:3:
+assertion `left == right` failed: only the log's first record is whole: {"appended": 204, "durable": 204, "no_session": 1, "resolved": 201, "whole": 5}
+== run 5 a_live_volumes_writes_ship_their_changes_not_the_volume exit 101 load 7.01 3.11 1.30
+live fsync: healthy Ok(()); candidates stopped Err(Os { code: 5, kind: Uncategorized, message: "Input/output error" }) after 1.003346124s; resumed Ok(()); owner's live counters {"appended": 4, "durable": 4, "link_lost": 1, "no_session": 4, "unanswered": 5, "whole": 1}
+== run 6 a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it exit 0 load 7.01 3.11 1.30
+live changes: 200 writes: {"appended": 209, "durable": 209, "resolved": 201, "whole": 14}
+thread 'a_live_volumes_writes_ship_their_changes_not_the_volume' (7358) panicked at crates/cli/tests/live_fleet.rs:1350:3:
+assertion `left == right` failed: only the log's first record is whole: {"appended": 209, "durable": 209, "resolved": 201, "whole": 14}
+== run 6 a_live_volumes_writes_ship_their_changes_not_the_volume exit 101 load 7.33 3.24 1.35
+live fsync: healthy Ok(()); candidates stopped Err(Os { code: 5, kind: Uncategorized, message: "Input/output error" }) after 1.005008419s; resumed Ok(()); owner's live counters {"appended": 4, "durable": 4, "link_lost": 1, "no_session": 7, "unanswered": 7, "whole": 1}
+== run 7 a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it exit 0 load 7.87 3.42 1.42
+live changes: 200 writes: {"appended": 201, "durable": 201, "no_session": 1, "resolved": 201, "whole": 1}
+== run 7 a_live_volumes_writes_ship_their_changes_not_the_volume exit 0 load 7.87 3.42 1.42
+live fsync: healthy Ok(()); candidates stopped Ok(()) after 2.998638ms; resumed Ok(()); owner's live counters {"appended": 4, "durable": 4, "whole": 1}
+thread 'a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it' (7711) panicked at crates/cli/tests/live_fleet.rs:1611:3:
+assertion `left == right` failed: an fsync no candidate can hold fails EIO, not success: Ok(())
+== run 8 a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it exit 101 load 8.20 3.56 1.48
+live changes: 200 writes: {"appended": 202, "durable": 202, "no_session": 1, "resolved": 201, "whole": 2}
+thread 'a_live_volumes_writes_ship_their_changes_not_the_volume' (7841) panicked at crates/cli/tests/live_fleet.rs:1350:3:
+assertion `left == right` failed: only the log's first record is whole: {"appended": 202, "durable": 202, "no_session": 1, "resolved": 201, "whole": 2}
+== run 8 a_live_volumes_writes_ship_their_changes_not_the_volume exit 101 load 8.82 3.77 1.55
+live fsync: healthy Ok(()); candidates stopped Err(Os { code: 5, kind: Uncategorized, message: "Input/output error" }) after 1.00096969s; resumed Ok(()); owner's live counters {"appended": 4, "durable": 4, "link_lost": 1, "no_session": 5, "unanswered": 5, "whole": 1}
+== run 9 a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it exit 0 load 8.92 3.87 1.60
+live changes: 200 writes: {"appended": 201, "durable": 201, "no_session": 1, "resolved": 201, "whole": 2}
+thread 'a_live_volumes_writes_ship_their_changes_not_the_volume' (8073) panicked at crates/cli/tests/live_fleet.rs:1350:3:
+assertion `left == right` failed: only the log's first record is whole: {"appended": 201, "durable": 201, "no_session": 1, "resolved": 201, "whole": 2}
+== run 9 a_live_volumes_writes_ship_their_changes_not_the_volume exit 101 load 8.92 3.87 1.60
+live fsync: healthy Ok(()); candidates stopped Err(Os { code: 5, kind: Uncategorized, message: "Input/output error" }) after 1.002005876s; resumed Ok(()); owner's live counters {"appended": 4, "durable": 4, "link_lost": 1, "no_session": 5, "unanswered": 5, "whole": 1}
+== run 10 a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it exit 0 load 9.72 4.12 1.69
+live changes: 200 writes: {"appended": 202, "durable": 202, "no_session": 1, "resolved": 201, "whole": 2}
+thread 'a_live_volumes_writes_ship_their_changes_not_the_volume' (8301) panicked at crates/cli/tests/live_fleet.rs:1350:3:
+assertion `left == right` failed: only the log's first record is whole: {"appended": 202, "durable": 202, "no_session": 1, "resolved": 201, "whole": 2}
+== run 10 a_live_volumes_writes_ship_their_changes_not_the_volume exit 101 load 10.39 4.35 1.78
