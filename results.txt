@@ -1,0 +1,10 @@
+tested 888e3ae300339543ebbb748cf23100d6e9b20c62 variant after on x86_64, 4 cpus
+retention exit 101 61s
+  retention: warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+  retention: thread 'a_green_behind_a_held_floor_retains_what_its_versions_changed_not_the_file' (5458) panicked at crates/server/tests/green_retention.rs:122:3:
+  retention: assertion `left == right` failed: every edit accepted (16 of 64)
+  retention:   left: Some("submit 16: Err(Refused(BudgetExceeded { available: 0 }))")
+  retention:  right: None
+  retention: test a_green_behind_a_held_floor_retains_what_its_versions_changed_not_the_file ... FAILED
+  retention: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+  retention: error: test failed, to rerun pass `-p slates-server --test green_retention`
