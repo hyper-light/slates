@@ -895,8 +895,9 @@
   - Process red-check, CI, 13 runs a side: the mutation (counting the current placement) left a holder at fence 1 in 4.
     A-240 left none, and lost no write.
   - Open: the holder set changing under a live log (joint transition and activation, with live-fixes and raft); a
-    successor outside the holders cannot open the log (`takeover_refused.open`); and a refused rebuild refetches the
-    log every period (backoff owed, raft-chaos).
+    successor outside the holders cannot open the log (`takeover_refused.open`); and a refused rebuild refetched the
+    log every period, fixed 2026-11-07 (`live_ship::owes_refetch`: no refetch at a head whose bytes were refused; bug
+    record `docs/bugs/2026-11-07-a-refused-live-takeover-refetched-its-log-every-period.md`).
 >
 > Touched: `crates/server/src/{live_ship,verbs,fleet}.rs` (the destroy's wait; the successor's routing at a
 > tombstone's retirement; A-240's holder record and phase-one count), `crates/db/src/{live,catalog,op,partition}.rs`

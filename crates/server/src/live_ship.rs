@@ -209,6 +209,10 @@ pub(crate) struct LiveState {
   /// the volume, holding those holders' sessions until they return ([`drain_stragglers`]). Bounded by the sessions: each
   /// holds at least one.
   stragglers: Vec<(u16, ObjectId, slates_cluster::Stragglers)>,
+  /// The head each taken-over live volume's rebuild was last refused at, and why ([`owes_refetch`]), on the control
+  /// shard: its log is not fetched again until phase one adopts another head. One entry a pending materialization, removed
+  /// when it is served.
+  pub(crate) refused_rebuilds: BTreeMap<ObjectId, (Head, &'static str)>,
 }
 
 /// Notes, after a transport's barrier published `volume`, the position its reply must wait for ([`wait_durable`]).
@@ -1743,6 +1747,8 @@ const LIVE_TAKEN_OVER: &str = "fleet.live.taken_over";
 /// What a takeover fetched of a live volume: the adopted head's payloads (a whole one first), and the
 /// successor's copy of the lineage key the first carries (A-92 piece 4c), unwrapped on this control shard.
 pub(crate) struct Fetched {
+  /// The head adopted, which the payloads end at.
+  pub(crate) head: Head,
   pub(crate) payloads: Vec<Vec<u8>>,
   pub(crate) lineage: Option<([u8; 16], Vec<u8>)>,
   pub(crate) naming: Option<crate::head::HeadNaming>,
@@ -1831,6 +1837,10 @@ pub(crate) async fn fetch(
   let Some((holder, head)) = slates_db::live::adopt(&reports, &holders, quorum) else {
     return Ok(None);
   };
+  let refused = state::with_state(|s| s.live.refused_rebuilds.get(&object).copied()).flatten();
+  if !owes_refetch(refused.as_ref(), head) {
+    return Err(LIVE_TAKEOVER_WAITS_NEW_HEAD);
+  }
   let payloads = if holder == local {
     state::with_state(|s| {
       s.live
@@ -1853,11 +1863,56 @@ pub(crate) async fn fetch(
   });
   let naming = sealing.and_then(|sealing| sealing.naming);
   Ok(Some(Fetched {
+    head,
     payloads,
     lineage,
     naming,
   }))
 }
+
+/// Counter: a taken-over live volume's log was not fetched again, its rebuild having been refused at the head phase
+/// one adopted now ([`owes_refetch`]).
+/// Format: a counter name in the daemon's status report.
+const LIVE_TAKEOVER_WAITS_NEW_HEAD: &str = "fleet.live.takeover_waits_new_head";
+
+/// Whether a successor fetches the adopted holder's log for a rebuild, given the head and kind its last rebuild was
+/// refused at (`None`: none was). A refusal the log's bytes decide is final for that head (its first payload's
+/// sealing, its records and its deltas are fixed by the chain identity), so the log is fetched again only once phase
+/// one adopts another head. The lineage refusal is this node's own key record (`seal_keys::adopt_lineage`), which may
+/// succeed next time, so it is retried. Every refusal refetched the whole log each record period before: 389 fetches
+/// of one holder for a successor that could never open the log (CI, diag-14 run 3, 2026-11-07).
+fn owes_refetch(refused: Option<&(Head, &'static str)>, adopted: Head) -> bool {
+  match refused {
+    None => true,
+    Some((_, kind)) if *kind == REFUSED_LINEAGE => true,
+    Some((head, _)) => *head != adopted,
+  }
+}
+
+/// Records on the control shard that `object`'s rebuild from the log at `head` was refused for `why`, so its log is not
+/// fetched again at that head ([`owes_refetch`]); forgets it once the volume is served (`why` is `None`).
+pub(crate) fn note_rebuild(object: ObjectId, head: Head, why: Option<&'static str>) {
+  let _ = state::with_state(|s| match why {
+    // Only a refusal of the log itself: one from the volume's restore says nothing about the log's bytes.
+    Some(why) if REBUILD_REFUSALS.contains(&why) => {
+      s.live.refused_rebuilds.insert(object, (head, why));
+    }
+    Some(_) => {}
+    None => {
+      s.live.refused_rebuilds.remove(&object);
+    }
+  });
+}
+
+/// The refusals of a rebuild from a live log ([`rebuild`]), each its counter's name.
+const REBUILD_REFUSALS: [&str; 6] = [
+  REFUSED_LINEAGE,
+  REFUSED_OPEN,
+  REFUSED_RECORD,
+  REFUSED_APPLY,
+  REFUSED_NOT_WHOLE_FIRST,
+  REFUSED_LAYOUT,
+];
 
 /// The second step of a live takeover (A-240): the log of the one holder phase one adopted, `bytes` long as it
 /// reported, fetched under a budget those bytes derive ([`exchange_budget`]), so a log of any size is given its transfer
@@ -2194,6 +2249,47 @@ fn meta_of(inode: &InodeImage) -> slates_archive::NodeMeta {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A refused live takeover (A-200, A-240): do ask whether a successor fetches the adopted holder's log again, after
+  /// each kind of rebuild refusal, at the head it was refused at and at a later one. Expect a refusal the log's bytes
+  /// decide (open, record, apply, not whole first, layout) to stop the refetch until phase one adopts another head, and
+  /// the lineage refusal (this node's own key record) to retry. Before, every refusal refetched the whole log every
+  /// record period: one holder answered 389 fetches for a successor that could never open the log (CI, diag-14 run 3,
+  /// 2026-11-07), and earlier runs moved 4.2 GB that way.
+  #[test]
+  fn a_rebuild_refused_at_a_head_is_not_fetched_again_until_the_head_moves() {
+    let refused_at = Head {
+      epoch: slates_db::register::HostEpoch(1),
+      position: 184,
+      identity: [7; 32],
+    };
+    let later = Head {
+      position: 185,
+      identity: [8; 32],
+      ..refused_at
+    };
+    for kind in [
+      REFUSED_OPEN,
+      REFUSED_RECORD,
+      REFUSED_APPLY,
+      REFUSED_NOT_WHOLE_FIRST,
+      REFUSED_LAYOUT,
+    ] {
+      assert!(
+        !owes_refetch(Some(&(refused_at, kind)), refused_at),
+        "{kind} at the same head is refused again by the same bytes"
+      );
+      assert!(
+        owes_refetch(Some(&(refused_at, kind)), later),
+        "{kind} at another head is fetched"
+      );
+    }
+    assert!(
+      owes_refetch(Some(&(refused_at, REFUSED_LINEAGE)), refused_at),
+      "a lineage refusal is this node's own record, retried"
+    );
+    assert!(owes_refetch(None, refused_at), "nothing refused yet: fetched");
+  }
 
   /// Format: the key generation the tests' keys carry.
   const GENERATION: u32 = 1;
