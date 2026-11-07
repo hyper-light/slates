@@ -1,0 +1,21 @@
+xtask exit 1
+info: syncing channel updates for 1.98.1-x86_64-unknown-linux-gnu
+info: latest update on 2026-09-03 for version 1.98.1 (48a229cea 2026-09-01)
+info: downloading 2 components
+[1m[92m    Updating[0m crates.io index
+[1m[33mwarning[0m: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+[1m[33mwarning[0m: aws-lc-sys@0.45.0: Value: 1 is true.
+[1m[33mwarning[0m: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+[1m[33mwarning[0m: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+[1m[33mwarning[0m: aws-lc-sys@0.45.0: Building with: CC
+[1m[33mwarning[0m: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+[1m[33mwarning[0m: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+[1m[33mwarning[0m: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-1cc42298ea61bcf9/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+[1m[33mwarning[0m: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-1cc42298ea61bcf9/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+[1m[33mwarning[0m: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-1cc42298ea61bcf9/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+[1m[33mwarning[0m: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-1cc42298ea61bcf9/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+[1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 49.47s
+[1m[92m     Running[0m `target/debug/xtask check`
+structural: ok (33 shipped crates)
+literals: /home/runner/work/slates/slates/crates/land/src/os_windows.rs:459: `64` in `let mut buffer = [0u64; 64];`
+xtask: 1 numeric literal(s) without a derivation (R3); mark them with `derived!`, or a `Derived:`, `Measured:`, `Format:` or `Shape:` doc line
