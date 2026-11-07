@@ -1,0 +1,33 @@
+runner ubuntu-24.04-arm, 4 CPUs, Sat Nov  7 06:50:43 UTC 2026, commit 03aec3e4
+== fix quiet round 1 at 06:50:43
+a forwarded read with its owner shard starved: served after 1.503558047s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 91 filtered out; finished in 2.61s
+== fix quiet round 2 at 06:50:45
+a forwarded read with its owner shard starved: served after 1.501583746s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 91 filtered out; finished in 2.62s
+== fix quiet round 3 at 06:50:48
+a forwarded read with its owner shard starved: served after 1.504095176s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 91 filtered out; finished in 2.62s
+== fix busy (two spinners a CPU) round 1 at 06:50:51
+a forwarded read with its owner shard starved: served after 1.542334024s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 91 filtered out; finished in 5.02s
+== fix busy (two spinners a CPU) round 2 at 06:50:56
+a forwarded read with its owner shard starved: served after 1.513077213s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 91 filtered out; finished in 3.77s
+== fix busy (two spinners a CPU) round 3 at 06:51:00
+a forwarded read with its owner shard starved: served after 1.504882059s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 91 filtered out; finished in 3.89s
+== cargo test --locked -q -p slates-server --test fleet
+test result: ok. 89 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 323.88s
+== exit 0
+== cargo test --locked -q -p slates-server --test cross_shard_wait
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.89s
+== exit 0
+== main's server sources (4326a9d8), the test unchanged: every starved case must fail
+== main quiet round 1 at 06:56:35
+a forwarded read with its owner shard starved: Ok(Refused { refusal: NotFound }) after 1.001863561s
+thread 'a_forwarded_read_whose_owner_shard_is_starved_is_served_past_a_wall_window' (7009) panicked at crates/server/tests/fleet.rs:13683:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 91 filtered out; finished in 2.94s
+== main quiet round 2 at 06:57:09
+a forwarded read with its owner shard starved: served after 1.503281696s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 91 filtered out; finished in 2.60s
