@@ -1,0 +1,41 @@
+runner ubuntu-24.04-arm, 4 CPUs, Sat Nov  7 10:58:11 UTC 2026, tree F 5d712407867c71b8ab599ddaf4ef7bc55b8cd78e
+== run 1 at 10:58:11, load 1.61 1.53 0.74
+live turns: live-turns-c-6144 stopped: writes [3.774602ms, 3.54537ms, 3.679878ms, 3.531882ms]
+live turns: live-turns-a-6144 stopped: writes [3.723009ms, 3.59466ms, 3.729096ms, 3.641413ms]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 2.22s
+== run 1 each_candidate_stopped_in_turn_holds_no_write_and_catches_up exit 0
+live catalog: refusals [("live-catalog-a-6444", 0), ("live-catalog-c-6444", 0)]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 1.41s
+== run 1 a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog exit 0
+== run 2 at 10:58:15, load 1.56 1.52 0.74
+live turns: live-turns-b-6637 stopped: writes [3.913226ms, 3.80811ms, 3.888089ms, 3.781077ms]
+live turns: live-turns-c-6637 stopped: writes [3.853936ms, 3.732364ms, 3.581758ms, 3.609688ms]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 2.12s
+== run 2 each_candidate_stopped_in_turn_holds_no_write_and_catches_up exit 0
+live catalog: refusals [("live-catalog-a-6927", 0), ("live-catalog-b-6927", 0)]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 1.33s
+== run 2 a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog exit 0
+== run 3 at 10:58:18, load 1.56 1.52 0.74
+live turns: live-turns-b-7104 stopped: writes [98.482709ms, 3.850727ms, 3.510836ms, 3.404032ms]
+live turns: live-turns-c-7104 stopped: writes [3.85508ms, 3.809454ms, 3.699106ms, 3.577367ms]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 1.35s
+== run 3 each_candidate_stopped_in_turn_holds_no_write_and_catches_up exit 0
+live catalog: refusals [("live-catalog-a-7293", 0), ("live-catalog-c-7293", 0)]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 1.41s
+== run 3 a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog exit 0
+== run 4 at 10:58:21, load 1.76 1.56 0.75
+live turns: live-turns-b-7492 stopped: writes [3.535493ms, 3.390431ms, 3.323526ms, 3.384264ms]
+live turns: live-turns-c-7492 stopped: writes [3.804038ms, 3.678001ms, 3.530012ms, 3.896049ms]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 2.13s
+== run 4 each_candidate_stopped_in_turn_holds_no_write_and_catches_up exit 0
+live catalog: refusals [("live-catalog-a-7755", 0), ("live-catalog-c-7755", 0)]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 1.23s
+== run 4 a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog exit 0
+== run 5 at 10:58:25, load 1.69 1.55 0.76
+live turns: live-turns-b-7935 stopped: writes [3.65332ms, 3.544773ms, 3.655585ms, 3.557821ms]
+live turns: live-turns-c-7935 stopped: writes [3.874784ms, 3.760036ms, 3.612688ms, 3.924338ms]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 2.15s
+== run 5 each_candidate_stopped_in_turn_holds_no_write_and_catches_up exit 0
+live catalog: refusals [("live-catalog-b-8202", 0), ("live-catalog-c-8202", 0)]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 2.12s
+== run 5 a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog exit 0
