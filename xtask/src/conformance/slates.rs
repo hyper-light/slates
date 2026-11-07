@@ -571,8 +571,26 @@ impl Mount {
 impl Drop for Mount {
   fn drop(&mut self) {
     match self.method {
+      // A plain unmount first; a mount still busy (a file left open on it, a holder that outlived its test) is forced,
+      // since the anchor that serves it is about to go and a mount whose server is gone must not be left behind (a hard
+      // mount would hang whatever touched it next). As `crates/cli/tests/cli.rs` `MountPoint` does.
       MountMethod::Slates => {
-        let _ = Command::new("umount").arg(&self.path).output();
+        let unmounted = |force: bool| {
+          let mut command = Command::new("umount");
+          if force {
+            command.arg("-f");
+          }
+          command
+            .arg(&self.path)
+            .output()
+            .is_ok_and(|output| output.status.success())
+        };
+        if !unmounted(false) && !unmounted(true) {
+          eprintln!(
+            "conformance: {} could not be unmounted, plainly or forced",
+            self.path.display()
+          );
+        }
       }
       MountMethod::LinuxRoot => {
         let _ = Command::new("sudo")
@@ -1033,6 +1051,50 @@ impl Session {
 #[cfg(test)]
 mod tests {
   use super::{admitted_size, available_of_refusal};
+
+  /// The harness's own teardown (asked by live-fixes, 2026-11-06). Do: open a session over a real `slates mount`, open a
+  /// file on its mount and keep it open, then drop the session. Expect: the mount is gone from the mount table, since a
+  /// mount left behind once its anchor has gone is a mount with no server (a hard mount would hang its next caller). On
+  /// 2026-11-05 a plain `umount` refused busy left three such mounts on this Mac. macOS (the `slates mount` method);
+  /// skips loudly without `SLATES_TEST_BINARY`.
+  #[cfg(target_os = "macos")]
+  #[test]
+  #[allow(clippy::unwrap_used, clippy::disallowed_methods)] // a program's open file on the slates mount
+  fn a_session_dropped_with_a_file_open_on_its_mount_leaves_no_mount() {
+    let Some(path) = std::env::var_os("SLATES_TEST_BINARY") else {
+      eprintln!("SKIP: set SLATES_TEST_BINARY to a built slates CLI to mount a volume");
+      return;
+    };
+    let root = crate::workspace_root().unwrap();
+    let options = crate::conformance::parse(&root, &["run".to_owned()]).unwrap();
+    let os = crate::conformance::host_os().unwrap();
+    let transport = crate::conformance::native_transport(os);
+    let run = crate::conformance::Run {
+      root: &root,
+      options: &options,
+      os,
+      transport,
+      root_available: false,
+      scratch: crate::conformance::Scratch::open(&options, transport).unwrap(),
+    };
+    let session = super::Session::open_with(
+      &run,
+      super::SlatesBinary::at(std::path::PathBuf::from(path)),
+      ("unmount", crate::conformance::VOLUME_SIZE, false),
+      None,
+    )
+    .unwrap();
+    let point = session.mount.path().to_path_buf();
+    let held = std::fs::File::create(session.workdir("held").unwrap().join("open.txt")).unwrap();
+    drop(session);
+    let still = super::is_mounted(&point);
+    drop(held);
+    assert!(
+      !still,
+      "{} was left mounted with a file open on it",
+      point.display()
+    );
+  }
 
   /// CI run 36565560556 (`docs/bugs/2026-09-29-a-suites-departing-daemon-wrote-into-the-next-suites-trace.md`):
   /// stopping an anchor leaves no daemon of its instance running, so no process of one suite outlives it into

@@ -457,6 +457,8 @@ mod tests {
     eprintln!(
       "the size change answered after {answered:?} ({changed:?}); the owner's late stable replies: {late}"
     );
+    // The file closes before the session's unmount, so the mount is not busy when its server goes.
+    drop(handle);
     drop(session);
     assert!(
       changed.is_ok(),
