@@ -1,2 +1,6 @@
 tested acd722aa6d17c963f0b900c843942d2398d1515d on x86_64, 4 cpus
 build exit 0
+run 1 exit 101 2s load=2.58 1.00 0.37
+    presentation of 1000 files of 16384 bytes: 28.549563ms, 1000 entries; 0 probes inside it — p50 0ns, p99 0ns, longest of all 28.373433ms; before it the longest 597.127µs
+    thread 'presenting_a_large_landing_never_holds_its_shard' (5727) panicked at crates/server/tests/presentation_fairness.rs:226:3:
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.32s
