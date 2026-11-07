@@ -154,6 +154,10 @@ pub(crate) struct LiveVolume {
   owes_whole: bool,
   /// The last whole entry's payload, and its head: what an install sends.
   whole: Option<(Head, Vec<u8>)>,
+  /// The anchors whose copy of the volume's lineage key the last whole entry carries (`None`: its body is in the
+  /// clear, which any successor opens): a successor opens the log only through its own key entry there, so the log
+  /// is durable only once that entry covers every remote candidate ([`covers_candidates`]).
+  whole_anchors: Option<Vec<u64>>,
   /// The later epoch a holder answered with: this owner was superseded (a takeover placed the volume elsewhere), ships
   /// no more of it, and refuses every write waiting on it or made after (`Refusal::StaleEpoch`). Kept, not dropped with
   /// the shipper: dropped, the writes waiting on it were never answered (the resumed old owner held one for the fence
@@ -166,6 +170,9 @@ pub(crate) struct LiveVolume {
   /// until the record is made. Nothing ships before that version is placed at `f + 1`, so a takeover's phase one always
   /// knows which hosts hold the log and counts its quorum among them alone.
   recorded: Option<u64>,
+  /// A transition target the catalog has been asked to record, and the catalog version that records it: the shipper
+  /// activates it once that version is placed ([`follow_candidates`]).
+  recording: Option<(u64, Vec<HostId>)>,
 }
 
 /// What a candidate keeps of one live volume.
@@ -287,11 +294,7 @@ pub(crate) fn durability(
   }
   let durable = head_placed(state, volume.bytes)
     && state.live.shipping.get(&volume.bytes).is_none_or(|live| {
-      !live.owes_whole
-        && live
-          .shipper
-          .durable()
-          .is_some_and(|durable| durable >= target)
+      !live.owes_whole && answerable(state, volume.bytes).is_some_and(|durable| durable >= target)
     });
   if durable {
     return Durability::Durable;
@@ -354,7 +357,7 @@ fn head_placed(state: &ShardState, volume: [u8; 16]) -> bool {
     || state
       .placed_heads
       .get(&ObjectId(volume))
-      .is_some_and(|head| configuration.region_placed(&head.placement))
+      .is_some_and(|head| head.placed_under(configuration, ObjectId(volume)))
 }
 
 /// A verb's reply held until its volume's log is durable where its publication put it.
@@ -418,8 +421,7 @@ pub(crate) fn durable_target(
   } else {
     head?
   };
-  let durable = live.shipper.durable();
-  if !live.owes_whole && durable.is_some_and(|durable| durable >= target) {
+  if !live.owes_whole && answerable(state, volume.bytes).is_some_and(|durable| durable >= target) {
     return None;
   }
   Some(target)
@@ -519,15 +521,8 @@ pub(crate) fn join(
 /// submit is (`merge_service::resolve_accepted`).
 pub(crate) fn resolve(state: &mut ShardState, volume: [u8; 16]) {
   wake_parked(state, volume);
-  if !head_placed(state, volume) {
-    return;
-  }
-  let Some(durable) = state
-    .live
-    .shipping
-    .get(&volume)
-    .and_then(|live| live.shipper.durable())
-  else {
+  let Some(durable) = answerable(state, volume) else {
+    count_held_back(state, volume);
     return;
   };
   let keys: Vec<([u8; 16], u64)> = state
@@ -580,7 +575,9 @@ fn tombstone_placed(state: &ShardState, volume: [u8; 16], sequence: u64) -> bool
     || state
       .placed_heads
       .get(&ObjectId(volume))
-      .is_some_and(|head| head.sequence >= sequence && configuration.region_placed(&head.placement))
+      .is_some_and(|head| {
+        head.sequence >= sequence && head.placed_under(configuration, ObjectId(volume))
+      })
 }
 
 /// Holds a destroy's reply until its volume's tombstone is placed at `f + 1` ([`tombstone_target`]): its effects are
@@ -788,7 +785,7 @@ pub(crate) fn published(
   });
   let quorum = configuration.quorum;
   let reaches_size = kept_reaches_size(state, id);
-  let live = state
+  state
     .live
     .shipping
     .entry(id.bytes)
@@ -802,10 +799,16 @@ pub(crate) fn published(
       ),
       owes_whole: true,
       whole: None,
+      whole_anchors: None,
       fenced: None,
       kept: 0,
       recorded: None,
+      recording: None,
     });
+  follow_candidates(state, id.bytes);
+  let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
+    return;
+  };
   let whole = live.owes_whole || record.is_none() || reaches_size;
   let built = if whole {
     whole_record(state, id)
@@ -816,7 +819,7 @@ pub(crate) fn published(
     refuse(state, id, "fleet.live.refused.no_record");
     return;
   };
-  let Some(payload) = payload(state, id, whole, record) else {
+  let Some((payload, anchors)) = payload(state, id, whole, record) else {
     refuse(state, id, "fleet.live.refused.no_payload");
     return;
   };
@@ -841,6 +844,7 @@ pub(crate) fn published(
         let head = entry.head();
         live.shipper.mark_checkpoint(head);
         live.whole = Some((head, payload));
+        live.whole_anchors = anchors;
       }
       state.count(LIVE_APPENDED, 1);
       if whole {
@@ -872,6 +876,99 @@ fn kept_reaches_size(state: &ShardState, id: slates_db::catalog::VolumeId) -> bo
   u64::try_from(kept).unwrap_or(u64::MAX) >= size
 }
 
+/// Moves `volume`'s log to its other candidates as this shard's configuration names them now, by a joint transition
+/// (`Shipper::begin_transition`, counted `fleet.live.holders_transition`): the shipper ships to the old and the new set
+/// and counts a write durable only once `f` of each hold it, and the new set becomes the holders once it holds every
+/// durable entry (`Shipper::activate`, counted `fleet.live.holders_activated`). The configuration grows while a fleet
+/// forms (a bootstrap node names only itself until the others are admitted) and moves at a takeover or a neighbourhood
+/// change; a shipper that kept the holders of its first publication shipped to nobody when that set was empty (the
+/// Linux conformance pair, diag run 42325923902: head=2 durable=none for a whole fsx run, nothing sent to either
+/// candidate), and one that replaced them outright could leave a takeover counting a set that held none of the durable
+/// writes (the model, `slates_db`'s `tests/live.rs`).
+///
+/// The record the activation waits on is A-240's: once [`target_recordable`] holds, the target is committed to the
+/// volume's catalog as its holder set (`Op::LiveHoldersCommitted`), and the shipper activates it once that catalog
+/// version is placed at `f + 1`, so a takeover's phase one never counts a set the shipper does not count durability
+/// over.
+fn follow_candidates(state: &mut ShardState, volume: [u8; 16]) {
+  let configuration = state.fleet.configuration();
+  let local = configuration.owner;
+  let candidates: Vec<HostId> = configuration
+    .place(ObjectId(volume))
+    .candidates
+    .into_iter()
+    .filter(|host| *host != local)
+    .collect();
+  let Some(live) = state.live.shipping.get_mut(&volume) else {
+    return;
+  };
+  let began = live.shipper.begin_transition(&candidates);
+  if began {
+    state.count(LIVE_HOLDERS_TRANSITION, 1);
+  }
+  if !target_recordable(state, volume) {
+    return;
+  }
+  let Some(live) = state.live.shipping.get(&volume) else {
+    return;
+  };
+  let Some(target) = live.shipper.transition().map(<[HostId]>::to_vec) else {
+    return;
+  };
+  match live.recording.clone() {
+    Some((version, named)) if named == target => {
+      if !catalog_placed_at(state, volume, version) {
+        return;
+      }
+      let activated = state.live.shipping.get_mut(&volume).is_some_and(|live| {
+        let activated = live.shipper.activate(&named);
+        if activated {
+          live.recorded = Some(version);
+          live.recording = None;
+        }
+        activated
+      });
+      if activated {
+        state.count(LIVE_HOLDERS_ACTIVATED, 1);
+      }
+    }
+    // The target is kept from here until it is activated (`Shipper::begin_transition`), so a record made for it stays
+    // the one to wait on; a refused record is made again at the next period.
+    _ => {
+      if let Some(version) = commit_holders(state, volume, &target)
+        && let Some(live) = state.live.shipping.get_mut(&volume)
+      {
+        live.recording = Some((version, target));
+      }
+    }
+  }
+}
+
+/// Whether the record may name `volume`'s transition target: the target holds every durable write
+/// (`Shipper::transferred`), and, once anything is durable, the last whole entry carries a key for every candidate
+/// ([`covers_candidates`]) and is itself durable, so `f` of the target hold a whole entry they can open. A target that
+/// held the log under a key it lacked could not serve it: raft-chaos saw a successor outside the shipper's holders
+/// refuse every rebuild for want of the lineage key (`fleet.live.takeover_refused.open` 814, CI diag-raft-chaos-kind-14,
+/// 2026-11-07). The period checkpoints the log again once this shard has delivered the missing pairs ([`period`]).
+fn target_recordable(state: &ShardState, volume: [u8; 16]) -> bool {
+  let Some(live) = state.live.shipping.get(&volume) else {
+    return false;
+  };
+  if !live.shipper.transferred() {
+    return false;
+  }
+  let Some(durable) = live.shipper.durable() else {
+    return true;
+  };
+  let whole = live.whole.as_ref().map(|(head, _)| head.position);
+  covers_candidates(state, volume) && whole.is_some_and(|whole| whole <= durable)
+}
+
+/// Counter: a live volume began moving its holders to a changed set of candidates.
+const LIVE_HOLDERS_TRANSITION: &str = "fleet.live.holders_transition";
+/// Counter: a live volume's new holder set held every durable entry and became its holders.
+const LIVE_HOLDERS_ACTIVATED: &str = "fleet.live.holders_activated";
+
 /// A publication that could not become an entry: counted, and the volume owes a whole record next.
 fn refuse(state: &mut ShardState, id: slates_db::catalog::VolumeId, why: &'static str) {
   state.count(LIVE_REFUSED, 1);
@@ -895,20 +992,21 @@ fn whole_record(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> Opt
 }
 
 /// The entry payload of `record`: its kind and body byte, then the body (the record and its content runs), sealed
-/// under the volume's lineage key where this node seals.
+/// under the volume's lineage key where this node seals; and, for a sealed whole entry, the anchors its copies of the
+/// lineage key are wrapped for (`None` for a clear body).
 fn payload(
   state: &mut ShardState,
   id: slates_db::catalog::VolumeId,
   whole: bool,
   record: Vec<u8>,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, Option<Vec<u64>>)> {
   let runs = content_runs(state, id, &record)?;
   let body = LivePublication { record, runs }.to_bytes();
   let kind = if whole { KIND_WHOLE } else { KIND_DELTA };
   if state.seal_root.is_none() {
     let mut payload = vec![kind, BODY_CLEAR];
     payload.extend_from_slice(&body);
-    return Some(payload);
+    return Some((payload, None));
   }
   let account = crate::seal_keys::tenant_of(&state.db.partition().volume(id)?.owner);
   let lineage = crate::seal_keys::lineage(state, id, account).ok()?;
@@ -921,10 +1019,100 @@ fn payload(
   } else {
     None
   };
+  let anchors = sealing.as_ref().map_or_else(Vec::new, |sealing| {
+    sealing.keys.iter().map(|key| key.anchor).collect()
+  });
   let mut payload = vec![kind, BODY_SEALED];
   payload.extend_from_slice(&SealedBody { sealing, pieces }.to_bytes());
-  Some(payload)
+  Some((payload, Some(anchors)))
 }
+
+/// Whether a successor among `volume`'s remote candidates (those still in the neighbourhood) can open its log: its
+/// last whole entry is in the clear, or carries a copy of the lineage key for each one's anchor (A-92 piece 4c), as a
+/// sealed head must before it ships (`fleet::sealing_covers`). Every candidate at once, since any may succeed. A whole
+/// entry sealed before a candidate's pair was delivered (the candidate stopped as the volume was made) carried none for
+/// it, and that candidate, the successor, refused the rebuild 145 times and never served the volume (2026-11-05;
+/// `a_live_volume_made_while_its_successor_was_stopped_is_served_by_it` in `crates/cli/tests/live_fleet.rs`).
+fn covers_candidates(state: &ShardState, volume: [u8; 16]) -> bool {
+  let Some(live) = state.live.shipping.get(&volume) else {
+    return true;
+  };
+  let Some(anchors) = &live.whole_anchors else {
+    return live.whole.is_some();
+  };
+  remote_candidates(state, volume).all(|candidate| {
+    state
+      .member_anchors
+      .get(&candidate)
+      .is_some_and(|anchor| anchors.contains(anchor))
+  })
+}
+
+/// `volume`'s candidates other than this node that are still in its neighbourhood.
+fn remote_candidates(state: &ShardState, volume: [u8; 16]) -> impl Iterator<Item = HostId> + '_ {
+  let configuration = state.fleet.configuration();
+  let local = configuration.owner;
+  configuration
+    .place(ObjectId(volume))
+    .candidates
+    .into_iter()
+    .filter(move |candidate| *candidate != local && configuration.neighbourhood.contains(candidate))
+}
+
+/// Whether a whole entry made now would cover every remote candidate that the last one does not: this shard has
+/// delivered its pair to each one's anchor (`seal_keys::head_sealing` wraps the key for exactly those). The period
+/// then owes one ([`period`]), so the log is checkpointed again once the pairs are there.
+fn coverable_now(state: &ShardState, volume: [u8; 16]) -> bool {
+  remote_candidates(state, volume).all(|candidate| {
+    state
+      .member_anchors
+      .get(&candidate)
+      .is_some_and(|anchor| state.pairs_delivered.contains(anchor))
+  })
+}
+
+/// The position up to which `volume`'s log is durable for its writers here: the shipper's durable position, once the
+/// fleet knows the volume ([`head_placed`]) and a successor could open the log at it ([`covers_candidates`]: the last
+/// whole entry covers every candidate, and is itself durable). `None` until then.
+fn answerable(state: &ShardState, volume: [u8; 16]) -> Option<u64> {
+  let live = state.live.shipping.get(&volume)?;
+  let durable = live.shipper.durable()?;
+  if !head_placed(state, volume) || !covers_candidates(state, volume) {
+    return None;
+  }
+  let whole = live.whole.as_ref().map(|(head, _)| head.position)?;
+  (durable >= whole).then_some(durable)
+}
+
+/// Counts why `volume`'s log, durable on its holders, does not yet answer its writers ([`answerable`]): the fleet does not
+/// know the volume yet (`placement`), its last whole entry does not carry every candidate's key (`keys`), or that entry
+/// is not itself durable yet (`whole`). Nothing is counted while the shipper holds nothing durable.
+fn count_held_back(state: &mut ShardState, volume: [u8; 16]) {
+  let Some(live) = state.live.shipping.get(&volume) else {
+    return;
+  };
+  let Some(durable) = live.shipper.durable() else {
+    return;
+  };
+  let whole = live.whole.as_ref().map(|(head, _)| head.position);
+  let why = if !head_placed(state, volume) {
+    LIVE_HELD_BACK_PLACEMENT
+  } else if !covers_candidates(state, volume) {
+    LIVE_HELD_BACK_KEYS
+  } else if whole.is_none_or(|whole| durable < whole) {
+    LIVE_HELD_BACK_WHOLE
+  } else {
+    return;
+  };
+  state.count(why, 1);
+}
+
+/// Counter: a durable live log whose writers wait because the fleet does not know the volume yet (its head unplaced).
+const LIVE_HELD_BACK_PLACEMENT: &str = "fleet.live.held_back.placement";
+/// Counter: a durable live log whose writers wait because its last whole entry lacks a candidate's key.
+const LIVE_HELD_BACK_KEYS: &str = "fleet.live.held_back.keys";
+/// Counter: a durable live log whose writers wait because its last whole entry is not durable yet.
+const LIVE_HELD_BACK_WHOLE: &str = "fleet.live.held_back.whole";
 
 /// The content of every extent `record`'s inode images name, read through the volume (sealed chunks open into the
 /// buffer, A-99). `None` when a read is refused: the entry would be missing bytes, so it is not made.
@@ -989,38 +1177,40 @@ const LIVE_HOLDERS_RECORDED: &str = "fleet.live.holders_recorded";
 /// 400 seeds, `crates/db/tests/live.rs`), and on KIND a holder kept fence 1 after a takeover at epoch 2 (runs
 /// 42326682216, `wan-loss` and `ceiling`, and 42331191530, `ceiling`).
 fn holders_placed(state: &mut ShardState, volume: [u8; 16]) -> bool {
-  let Some(recorded) = state
-    .live
-    .shipping
-    .get(&volume)
-    .map(|live| live.recorded)
-  else {
+  let Some(recorded) = state.live.shipping.get(&volume).map(|live| live.recorded) else {
     return false;
   };
   let Some(recorded) = recorded.or_else(|| record_holders(state, volume)) else {
     return false;
   };
-  let configuration = state.fleet.configuration();
-  configuration.quorum.f == 0
-    || state
-      .placed_heads
-      .get(&ObjectId(volume).catalog())
-      .is_some_and(|head| {
-        head.sequence >= recorded && configuration.region_placed(&head.placement)
-      })
+  catalog_placed_at(state, volume, recorded)
 }
 
 /// Records `volume`'s shipper's epoch and holders in its catalog (`Op::LiveHoldersCommitted`, A-240) and returns the
 /// catalog version that holds them; the record plane ships it as any catalog change (`fleet::unplaced_heads`). `None`
 /// when the database refused the record, counted; the next send tries again.
 fn record_holders(state: &mut ShardState, volume: [u8; 16]) -> Option<u64> {
+  let holders = state
+    .live
+    .shipping
+    .get(&volume)
+    .map(|live| live.shipper.holders().to_vec())?;
+  let version = commit_holders(state, volume, &holders)?;
+  if let Some(live) = state.live.shipping.get_mut(&volume) {
+    live.recorded = Some(version);
+  }
+  Some(version)
+}
+
+/// Commits `holders` as `volume`'s shipper's holder set under its epoch (`Op::LiveHoldersCommitted`, A-240) and returns
+/// the catalog version that holds them; `None` when the database refused the record, counted.
+fn commit_holders(state: &mut ShardState, volume: [u8; 16], holders: &[HostId]) -> Option<u64> {
   let id = slates_db::catalog::VolumeId { bytes: volume };
-  let holders = state.live.shipping.get(&volume).map(|live| {
-    slates_db::catalog::LiveHolders {
-      epoch: live.shipper.epoch().0,
-      holders: live.shipper.holders().iter().map(|host| host.0).collect(),
-    }
-  })?;
+  let epoch = state.live.shipping.get(&volume)?.shipper.epoch().0;
+  let holders = slates_db::catalog::LiveHolders {
+    epoch,
+    holders: holders.iter().map(|host| host.0).collect(),
+  };
   let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
   let op = slates_db::op::Op::LiveHoldersCommitted { id, holders };
   if state.db.mutate(&mut state.segment, &op, now).is_err() {
@@ -1029,10 +1219,18 @@ fn record_holders(state: &mut ShardState, volume: [u8; 16]) -> Option<u64> {
   }
   let version = state.db.partition().volume(id)?.catalog_version;
   state.count(LIVE_HOLDERS_RECORDED, 1);
-  if let Some(live) = state.live.shipping.get_mut(&volume) {
-    live.recorded = Some(version);
-  }
   Some(version)
+}
+
+/// Whether `volume`'s catalog is placed at `f + 1` at `version` or later (at `f = 0`, always: the owner's commit places
+/// it, R8).
+fn catalog_placed_at(state: &ShardState, volume: [u8; 16], version: u64) -> bool {
+  let configuration = state.fleet.configuration();
+  configuration.quorum.f == 0
+    || state
+      .placed_heads
+      .get(&ObjectId(volume).catalog())
+      .is_some_and(|head| head.sequence >= version && configuration.region_placed(&head.placement))
 }
 
 /// A catalog register's placement moved (`fleet::record_acks_in`): when it is a live volume's and now places that
@@ -1063,7 +1261,8 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
   let object = ObjectId(volume);
   let mut sends = Vec::new();
   let mut stale_checkpoint = false;
-  for holder in live.shipper.holders() {
+  let targets: Vec<HostId> = live.shipper.targets().collect();
+  for holder in &targets {
     match live.shipper.pending(*holder) {
       Next::Entries(entries) => {
         for entry in entries {
@@ -1363,6 +1562,18 @@ pub(crate) async fn period(origin: u16, shard: u16) {
       // A volume that owes a whole record ships one once its credit allows: a burst that outran the credit left its
       // last writes unshipped until another write came, and none might (three of five writes, `live_fleet`).
       for volume in &volumes {
+        follow_candidates(s, *volume);
+        // A writer may wait on a condition that changes with no acknowledgement to fold (the head placed once its
+        // neighbourhood settles, a pair delivered): answered here at the latest.
+        resolve(s, *volume);
+        // A log whose last whole entry no successor among the candidates could open is checkpointed again once this
+        // shard has delivered the pairs that would let it ([`covers_candidates`]).
+        if !covers_candidates(s, *volume)
+          && coverable_now(s, *volume)
+          && let Some(live) = s.live.shipping.get_mut(volume)
+        {
+          live.owes_whole = true;
+        }
         if owes_whole_within_credit(s, *volume) {
           published(s, slates_db::catalog::VolumeId { bytes: *volume }, None);
         }
@@ -1925,8 +2136,7 @@ async fn fetch_log(
   bytes: u64,
   cap: usize,
 ) -> Result<Vec<Vec<u8>>, &'static str> {
-  let session =
-    crate::fleet::take_sessions("fleet.lent_to.live_takeover", |host| host == holder);
+  let session = crate::fleet::take_sessions("fleet.lent_to.live_takeover", |host| host == holder);
   if session.is_empty() {
     return Err("fleet.live.takeover_waits_log_session");
   }

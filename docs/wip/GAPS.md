@@ -1,5 +1,70 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Fixed (live-fixes, 2026-11-07): a live shipper made before its candidates were known shipped to nobody** (A-200's
+> amendment of that date). A shipper kept the holders of its first publication, so a live volume made on a fleet's
+> bootstrap node stood at `durable=none` for good (the Linux conformance pair, diag run 42325923902). Its holders now
+> follow the candidates by a joint transition (ship to both sets, count durability over each, switch once the new set
+> holds every durable write and the record names it). The first fix, replacing the holders outright, was unsafe
+> (raft-chaos); the model shows it (the record-at-once mutation breaks NoLoss) and 0 of 400 seeds broken under the
+> joint rule. The target is recorded in the volume's catalog (A-240, merged
+> from raft-chaos) once it holds every durable write under a key it can open, and activated once that record is placed.
+> **Open, raft-chaos's:** a successor's recorded set must be the set its takeover counted, then its own transition.
+> Bug record `docs/bugs/2026-11-07-a-live-shipper-made-before-its-candidates-were-known-shipped-to-nobody.md`.
+
+> **Fixed (live-fixes, 2026-11-06 and 07): a daemon restarted under its anchor never rejoined its fleet (raft-chaos
+> report 8).** The successor keeps the member id; the other nodes hold that id dead. Its restarted plane epochs were
+> refused as not newer (`fleet.plane.epoch_refused.install`), and a canonical dialer holding it dead never dialed it again
+> (`fleet.link.invalid.believed_dead`), so it could never refute the death. The acceptor now takes a restarted sequence
+> (`fleet.plane.epoch_restarted`), and contact is kept with a dead member that announced itself since
+> (`DirectContact::Returned`, `fleet.plane.member_returned`). Under load on macOS CI: 0 of 6 re-formed before, 5 of 6
+> after (0.10 to 1.68 s). The sixth, a successor up before the others suspected it, is fixed too (2026-11-07): a
+> canonical dialer drops its session to a member that announced itself on a new one and dials afresh
+> (`fleet.plane.peer_reconnected`): 3 of 6 re-formed with that rule off, 6 of 6 with it on (0.47 to 0.66 s, load 30 to 74). Bug record `docs/bugs/2026-11-06-a-daemon-restarted-under-its-anchor-never-rejoined-its-fleet.md`;
+> test `a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet`.
+
+> **Fixed (live-fixes, 2026-11-06): main's macOS fleet-deploy test refused the successor's mount `OwnedByAnotherHost`
+> under load (scheduled run 42206043007).** A-222's early refusal reads the routing of the shard serving the client; a
+> takeover recorded the new owner on the control shard alone. Counted on CI under two spinners a CPU: 5 of 9 runs
+> refused on the successor's shard 1 (`attach.foreign_refused.owner_unknown`) while its shard 0 had adopted the volume.
+> An adoption's owner now reaches every shard (`takeover::track_owner_on_every_shard`); 10 of 10 green under the same
+> load. The test now also requires the other survivor to refuse the mount by kind. Bug record
+> `docs/bugs/2026-11-06-a-successor-refused-its-own-volumes-mount-on-a-shard-that-never-learned-the-takeover.md`.
+
+> **A forming fleet lost its takeovers (live-fixes, 2026-11-05, A-200 and §4.8; three fixed, for raft).** raft's soak
+> found that a fleet acting before it settled could leave a killed owner's volume unserved; the tests were made to wait
+> (d91464cf) and the product stayed unfixed. Bootstrapping three real processes and acting at once found three defects,
+> each fixed with a failing test first (bug record `docs/bugs/2026-11-05-a-forming-fleet-lost-its-takeovers.md`):
+> - **Fixed: the council sat at two voters**, which can lose neither, so an owner killed then left both survivors at
+>   term 1 with no takeover. The council now grows only by steps that raise the failures it tolerates, unless the step
+>   seats every member, and a member that cannot catch up is passed over for a free seat
+>   (`slates_cluster::config_group::widening`, `RegionalCouncil::passed_over`). The first form of the rule failed 7 of
+>   89 fleet-suite tests that the base passed; corrected, those seven pass 7 of 7 (59 s against the base's 57 s). `an_owner_killed_while_its_fleet_still_forms_is_taken_over` was red 1 of
+>   1 (two voters at the kill, no leader for 40 s) and is green in every run that started (macOS, load 45 to 96).
+> - **Fixed: a live log sealed before a candidate's pair carried no key for it**, and that candidate as successor
+>   refused the rebuild without end. A live write is now durable only once the log's last whole entry covers every
+>   candidate, and the owner checkpoints again once the missing pairs are delivered (`live_ship::covers_candidates`).
+>   `a_live_volume_made_while_its_successor_was_stopped_is_served_by_it` was red 3 of 3 with the check forced off and is
+>   green 12 of 12. A candidate stopped before its pairs came now holds live writes back until it returns or is retired,
+>   as it already held a sealed head back.
+> - **Fixed: a takeover dropped `ConfigurationStale`**, so a learner successor one version behind never fetched and
+>   never served (`takeover::ask_pages`, `takeover::adopt`; counted `fleet.takeover.stale_configuration`). Red 1 of 8
+>   with the edits off, green 8 of 8.
+> - The live fleet suite's settled wait now also waits for every node's pair keys (`fleet.seal.pair_served`).
+> - **Fixed (2026-11-06, A-229, Ada's choice): a writer on a macOS mount failed rather than waited.** The mount was
+>   `soft,intr`, and macOS ends any soft call after about a minute: with both candidates stopped a size change failed
+>   `ETIMEDOUT` after 57.2 s. The mount is `hard,intr`: the same call waited through the stop and succeeded (90.6 s and
+>   102.4 s; `a_writer_on_a_macos_mount_waits_for_stopped_candidates_rather_than_fail`, red then green on this Mac at
+>   load 15 to 104).
+> - **Open: a killed owner was never condemned** in one forming-fleet run: both survivors' detectors held it with one
+>   suspicion and no condemnation for 40 s (`configured=false`, `CorrelationUnmeasured`). About 1 run in 20.
+> - **Open: a live dispatch's replies are dropped with its whole task** (`live_ship::send_from_control` returns its
+>   replies only at the end, bounded by twice one session wait, while each message to a holder whose session is out on
+>   loan waits a whole session wait). Seen once: the owner at `durable=0` while the other candidate held every entry
+>   (`fleet.live.held` 237; owner `fleet.live.no_session` 447). A per-holder rewrite was reverted: no test could show it
+>   red, so the mechanism is not confirmed.
+> - **Not reproduced: raft's other two formation findings** (an owner with no session to its only reachable candidate
+>   for 249 tries; a candidate refusing `no_catalog` for good). Eight full live fleet suites with the settled wait
+>   removed, with these fixes: no such stall; each first `no_catalog` refusal was followed by holding.
 > **A Windows UDP socket died on an earlier send's ICMP error (found 2026-11-06, fixed 2026-11-06).** With Windows'
 > default `SIO_UDP_CONNRESET`, a port-unreachable for a datagram sent earlier failed the socket's next `recvfrom` with
 > WSAECONNRESET. A fleet node's demultiplexer ends on a receive refusal, so its socket stopped receiving, and

@@ -652,6 +652,11 @@ pub struct ShardState {
   /// A different nonce retires the previous id; nonces cannot establish numeric age order.
   /// Only the control shard updates it. Empty before contact, and on a laptop.
   pub learned_members: BTreeMap<slates_db::HostId, LearnedMember>,
+  /// Members this node holds dead that have since announced themselves over an authenticated record session, by the
+  /// incarnation they died at: their process is alive (an anchor's warm restart keeps the member id), so contact with
+  /// them is kept until they refute the death (`fleet::direct_contact`'s `Returned`). Only the control shard updates it;
+  /// bounded by the fleet's peer capacity.
+  pub returned_members: BTreeMap<slates_db::HostId, u64>,
   /// Reverse index of the current authenticated identities, bounded by learned_members.
   /// Relayed alive gossip may refute a failure, but cannot revive a superseded RAM identity.
   pub authenticated_members: std::collections::BTreeSet<slates_db::HostId>,
