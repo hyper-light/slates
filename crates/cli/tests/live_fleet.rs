@@ -1387,6 +1387,75 @@ fn a_live_volumes_writes_ship_their_changes_not_the_volume() {
   );
 }
 
+/// A-200: a candidate that falls behind the owner's retained entries is installed, and the log stays a chain of changes.
+/// Do make stable NFS writes to a live volume from one sequential writer (so the credit never refuses a write), stop one
+/// candidate's process for the middle third of them, then resume it. Expect the paused candidate to catch up to the
+/// owner's head, at least one install sent (it fell behind the retained tail), and the log's first record still the only
+/// whole one. Found 2026-11-07 (CI, `diag-live-durability-14`): a laggard that already held the last whole record set
+/// `owes_whole`, so the next write's record carried the whole volume (20–45 MB in the chaos flows) to every holder. The
+/// up-to-date candidate had to take it before any later write was durable: 100–600 ms a time, and 1.2–1.9 s writes.
+#[test]
+fn a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log() {
+  /// Shape: writes before, during and after the pause, each enough to outrun the retained tail.
+  const WRITES_PER_THIRD: u32 = 60;
+  /// Shape: each write's bytes, a page.
+  const WRITE_BYTES: usize = 4096;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping laggard-install flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-laggard");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = &fleet.instances[owner_index];
+  let paused_index = (owner_index + 1) % fleet.instances.len();
+  let others: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| *instance != owner)
+    .collect();
+  let (mut live, file, id) = stable_session(owner, "laggard", true);
+  let data = vec![0x5a_u8; WRITE_BYTES];
+  let mut xid = 100;
+  let mut write_third = |live: &mut std::net::TcpStream| {
+    for _ in 0..WRITES_PER_THIRD {
+      xid += 1;
+      nfs::write(live, &file, &data, xid);
+    }
+  };
+  write_third(&mut live);
+  signal(&fleet.daemons[paused_index], rustix::process::Signal::STOP);
+  write_third(&mut live);
+  signal(&fleet.daemons[paused_index], rustix::process::Signal::CONT);
+  write_third(&mut live);
+  let (caught_up, shipping, held) = wait_caught_up(owner, &others, &id);
+  let counters = live_counters(owner);
+  drop(live);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!("live laggard: {counters:?}; then {shipping:?} {held:?}");
+  let of = |name: &str| counters.get(name).copied().unwrap_or(0);
+  assert!(
+    caught_up,
+    "the paused candidate caught up: {shipping:?} {held:?}"
+  );
+  assert!(
+    of("install_sent") >= 1,
+    "the paused candidate fell behind the retained tail and was installed: {counters:?}"
+  );
+  assert_eq!(
+    of("whole"),
+    1,
+    "only the log's first record is whole: {counters:?}"
+  );
+  assert_eq!(
+    of("refused"),
+    0,
+    "a sequential writer stays within its credit: {counters:?}"
+  );
+}
+
 /// A-200, AC-8.9: a candidate's copy of a live log stays within its bound however long the writer runs. Do make stable
 /// NFS writes to a live volume bounded at 1 MiB until the changes shipped are three times its size. Expect every write
 /// answered, no candidate refusing an entry for its bound, and whole records shipped as the changes grow: a candidate
