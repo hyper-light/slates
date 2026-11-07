@@ -65,7 +65,7 @@ impl GuestWriteback {
     request: &[u8],
     bridge: &mut dyn Bridge,
     cx: &OpContext,
-    reply: &mut Vec<u8>,
+    reply: &mut [u8],
   ) -> usize {
     let before = bridge.seen(cx).journal_seq;
     let started_at = *self.fed_through.get_or_insert(before);
@@ -129,7 +129,7 @@ impl GuestWriteback {
     head: u64,
     bridge: &mut dyn Bridge,
     cx: &OpContext,
-    reply: &mut Vec<u8>,
+    reply: &mut [u8],
   ) -> usize {
     let stale = Request::parse(request)
       .ok()
