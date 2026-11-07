@@ -1,6 +1,6 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
-> **A clone's name is held at its name's partition (2026-11-06, A-229, bug-sweep; the supervisor's option 3).** A clone
+> **A clone's name is held at its name's partition (2026-11-06, A-236, bug-sweep; the supervisor's option 3).** A clone
 > whose name hashed to another partition than its origin's was unreachable by name over the mount transport, and its
 > name could be created twice (bug record of 2026-09-13).
 > - Now the name's partition holds an alias pointing at the clone. It is made by a reservation protocol (reserve, make
@@ -12,7 +12,7 @@
 >   name check, the same bug class. Also, an alias step the name's shard did not take (`names.alias_step_untaken`)
 >   leaves a reserved alias that resolves nothing until the next recovery.
 
-> **GAP-A9-9 on macOS, the ring half: a client's region crosses as a Mach fileport, never by name (2026-11-06, A-220,
+> **GAP-A9-9 on macOS, the ring half: a client's region crosses as a Mach fileport, never by name (2026-11-06, A-233,
 > bug-sweep; the rest open).** A same-uid stranger could open any client's ring by the name the claim slot published
 > (measured 2026-10-18). Now:
 > - The daemon unlinks a region's name before it answers, and the region reaches its claimant only as a fileport through
@@ -9078,7 +9078,7 @@ advertisement-gated and **not** harness-only — every Linux `MapRead` served by
 
 ### 2026-10-18: GAP-A9-9 measured — on macOS a same-uid stranger opens any client's ring, by name
 
-> **2026-11-06: the ring half fixed by A-220** (the entry at the top of this file); the segment, the bootstrap object
+> **2026-11-06: the ring half fixed by A-233** (the entry at the top of this file); the segment, the bootstrap object
 > and Windows stay open there.
 
 The ledger has carried "same-uid isolation (GAP-A9-9) owed" since §4.7 was written. This is the first

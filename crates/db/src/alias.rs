@@ -1,4 +1,4 @@
-//! A clone's name held at the name's partition (§4.8 "Lookup", A-229): the pure decisions of the protocol that makes
+//! A clone's name held at the name's partition (§4.8 "Lookup", A-236): the pure decisions of the protocol that makes
 //! it, and of the recovery that reconciles it.
 //!
 //! **What it answers.** A name routes by its hash to one partition, where it is looked up and where its uniqueness is

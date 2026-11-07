@@ -363,18 +363,18 @@ pub enum Op {
     /// Whether it is live-shipped now.
     live_shipped: bool,
   },
-  /// A name was reserved at its name's partition for a clone another partition is about to make (A-229): the name is
+  /// A name was reserved at its name's partition for a clone another partition is about to make (A-236): the name is
   /// held from here, and resolves nothing until confirmed. Appended.
   NameAliasReserved {
     /// The alias, unconfirmed.
     record: NameAliasRecord,
   },
-  /// A reserved name's clone was made: the alias resolves from here (A-229). Appended.
+  /// A reserved name's clone was made: the alias resolves from here (A-236). Appended.
   NameAliasConfirmed {
     /// The name.
     name: String,
   },
-  /// A name's alias was released: its clone was destroyed, never made, or no longer holds the name (A-229). Appended.
+  /// A name's alias was released: its clone was destroyed, never made, or no longer holds the name (A-236). Appended.
   NameAliasReleased {
     /// The name.
     name: String,

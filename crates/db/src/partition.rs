@@ -128,7 +128,7 @@ pub struct PartitionSnapshot {
   pub nfs_calls: Vec<NfsCallRecord>,
   /// The NFSv4 purges this partition's shard owes its owners, not yet acknowledged by all (2026-10-10; appended).
   pub nfs_purges: Vec<NfsPurgeRecord>,
-  /// The names this partition holds for volumes other partitions hold, by name (A-229; appended).
+  /// The names this partition holds for volumes other partitions hold, by name (A-236; appended).
   pub name_aliases: Vec<NameAliasRecord>,
   /// The CLI attachments whose term lapsed, oldest first (A-230; appended).
   pub expired_attachments: Vec<u64>,
@@ -182,7 +182,7 @@ pub struct Partition {
   /// The purges this shard owes its owners (2026-10-10): one per client dropped or session destroyed here and not yet
   /// acknowledged by every owner, bounded by the drops a round could not settle.
   nfs_purges: BTreeSet<NfsPurgeRecord>,
-  /// The names this partition holds for volumes other partitions hold (A-229): at most one a name, and at most
+  /// The names this partition holds for volumes other partitions hold (A-236): at most one a name, and at most
   /// `caps.volumes` of them, since each stands for a volume another partition holds under the same cap.
   name_aliases: BTreeMap<String, NameAliasRecord>,
   /// The CLI attachments whose term lapsed, oldest first (A-230), so a later use is refused as expired rather than as
@@ -318,12 +318,12 @@ impl Partition {
     self.expired_attachments.contains(&id)
   }
 
-  /// The alias this partition holds for `name`, if any (A-229): a name another partition's volume holds.
+  /// The alias this partition holds for `name`, if any (A-236): a name another partition's volume holds.
   pub fn name_alias(&self, name: &str) -> Option<&NameAliasRecord> {
     self.name_aliases.get(name)
   }
 
-  /// Every alias this partition holds, by name (A-229): what a recovery reconciles.
+  /// Every alias this partition holds, by name (A-236): what a recovery reconciles.
   pub fn name_aliases(&self) -> impl Iterator<Item = &NameAliasRecord> {
     self.name_aliases.values()
   }
@@ -681,7 +681,7 @@ impl Partition {
 
   // ------------------------------------------------------------------ the guard
 
-  /// [`Partition::check`] for a name alias (A-229) and a CLI attachment's term (A-230).
+  /// [`Partition::check`] for a name alias (A-236) and a CLI attachment's term (A-230).
   fn check_alias_or_term(&self, op: &Op) -> Result<(), DbError> {
     match op {
       // A name is held once on its partition: by a volume there, or by one alias for another partition's volume.
@@ -730,7 +730,7 @@ impl Partition {
             existing: existing.id.bytes,
           });
         }
-        // A name this partition holds for another partition's volume is that volume's (A-229), confirmed or not.
+        // A name this partition holds for another partition's volume is that volume's (A-236), confirmed or not.
         if let Some(alias) = self.name_alias(&record.name) {
           return Err(DbError::AlreadyExists {
             existing: alias.volume.bytes,
@@ -1545,7 +1545,7 @@ impl Partition {
     self.expired_attachments = snapshot.expired_attachments.iter().copied().collect();
   }
 
-  /// Restores the name aliases a snapshot carries (A-229).
+  /// Restores the name aliases a snapshot carries (A-236).
   fn restore_name_aliases(&mut self, snapshot: &PartitionSnapshot) {
     for record in &snapshot.name_aliases {
       self

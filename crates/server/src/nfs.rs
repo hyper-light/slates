@@ -705,7 +705,7 @@ fn route(program: u32, procedure: u32, args: &[u8]) -> Option<u16> {
 }
 
 /// [`route`], with a call that names a volume by its mount name (a root `LOOKUP`, a `MNT`, a `UMNT`) asked of the
-/// name's partition first (A-229): that partition holds the name, as a volume of its own or as an alias of a clone
+/// name's partition first (A-236): that partition holds the name, as a volume of its own or as an alias of a clone
 /// another partition holds beside its origin, and says which partition serves it.
 async fn routed(this: u16, program: u32, procedure: u32, args: &[u8]) -> Option<u16> {
   let Some(name) = root_mount_name(program, procedure, args) else {
@@ -742,7 +742,7 @@ async fn routed(this: u16, program: u32, procedure: u32, args: &[u8]) -> Option<
   .flatten()
 }
 
-/// The partition that serves the volume `name` names, as its name's partition (this one) holds it (A-229): this one
+/// The partition that serves the volume `name` names, as its name's partition (this one) holds it (A-236): this one
 /// when it holds a volume of that name or nothing for it (a lookup then misses here), the clone's when a confirmed
 /// alias names one. A reserved alias resolves nothing until confirmed, so a lookup of it misses here, by kind.
 fn served_partition(s: &mut ShardState, name: &str) -> u16 {

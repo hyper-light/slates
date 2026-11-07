@@ -1,4 +1,4 @@
-//! A-229's protocol under a crash at every step (§4.8 "Lookup"; the pattern of `model.rs`: the database dropped and
+//! A-236's protocol under a crash at every step (§4.8 "Lookup"; the pattern of `model.rs`: the database dropped and
 //! recovered from a real anchor segment). A clone whose name hashes to another partition is made in
 //! `slates_db::alias::CLONE_STEPS` order across two partitions: the alias reserved at the name's partition, the clone
 //! made at its origin's, the alias confirmed. It is destroyed in `DESTROY_STEPS` order. After a crash between any two
@@ -212,7 +212,7 @@ fn assert_consistent(pair: &Pair, id: VolumeId, after: &str) {
   }
 }
 
-/// A-229. Do: for each point from before the first step to after the last, run the clone's steps up to it, crash
+/// A-236. Do: for each point from before the first step to after the last, run the clone's steps up to it, crash
 /// (both partitions dropped and recovered from the segment), check the unreconciled name, reconcile, and check again.
 /// Expect: before the reconcile a reserved alias holds the name and resolves nothing; after it, the name belongs to no
 /// one or resolves to the clone, at every crash point.
@@ -252,7 +252,7 @@ fn a_clones_name_is_consistent_after_a_crash_at_every_step() {
   }
 }
 
-/// A-229. Do: make the clone in full, then for each point of its destroy's steps, crash there, recover, reconcile.
+/// A-236. Do: make the clone in full, then for each point of its destroy's steps, crash there, recover, reconcile.
 /// Expect: the name resolves to the clone until the clone is destroyed, and to no one from then on, at every crash
 /// point; and a create of the name is allowed once no one holds it.
 #[test]
@@ -281,7 +281,7 @@ fn a_destroyed_clones_name_is_consistent_after_a_crash_at_every_step() {
   }
 }
 
-/// A-229 (a clone that cannot be made). Do: reserve the alias, then release it as a refused clone does, crash, and
+/// A-236 (a clone that cannot be made). Do: reserve the alias, then release it as a refused clone does, crash, and
 /// recover. Expect: the name belongs to no one, and a create of it is allowed.
 #[test]
 fn a_clone_that_could_not_be_made_gives_its_name_back() {
@@ -296,7 +296,7 @@ fn a_clone_that_could_not_be_made_gives_its_name_back() {
   assert!(!held(&pair), "the name is free again");
 }
 
-/// A-229 (uniqueness at the name's partition). Do: hold the name as a volume of the name's partition, then reserve an
+/// A-236 (uniqueness at the name's partition). Do: hold the name as a volume of the name's partition, then reserve an
 /// alias for it; and the other way round. Expect: each second holder refused `AlreadyExists`, whichever came first.
 #[test]
 fn a_name_is_held_once_by_a_volume_or_an_alias() {
@@ -346,7 +346,7 @@ fn a_name_is_held_once_by_a_volume_or_an_alias() {
   ));
 }
 
-/// A-229 (the snapshot's appended field). Do: hold a confirmed and a reserved alias, take the partition's snapshot,
+/// A-236 (the snapshot's appended field). Do: hold a confirmed and a reserved alias, take the partition's snapshot,
 /// encode and decode it, and rebuild a partition from it. Expect: both aliases back as they were, the reserved one still
 /// resolving nothing and still holding its name.
 #[test]

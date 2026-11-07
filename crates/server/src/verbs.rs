@@ -5999,7 +5999,7 @@ fn clone(
     return refused(Refusal::AlreadyExists { existing });
   }
   // A name that hashes to another partition is held there by an alias of the clone, which lives here beside its origin
-  // for copy-on-write (A-229, §4.8 "Lookup"): the clone is made across the two partitions by the alias protocol.
+  // for copy-on-write (A-236, §4.8 "Lookup"): the clone is made across the two partitions by the alias protocol.
   let name_partition = owner_of_name(name, state.shards.len());
   if name_partition != state.partition {
     return clone_named_elsewhere(state, principal, (volume, snapshot, name), name_partition);
@@ -6024,7 +6024,7 @@ fn clone(
 }
 
 /// The volume holding `name` on this partition: one of its own volumes, or one another partition holds under an alias
-/// here (A-229), confirmed or reserved.
+/// here (A-236), confirmed or reserved.
 fn name_held(state: &ShardState, name: &str) -> Option<VolumeId> {
   let partition = state.db.partition();
   partition
@@ -6037,7 +6037,7 @@ fn name_held(state: &ShardState, name: &str) -> Option<VolumeId> {
     })
 }
 
-/// Records one step of a name alias on this, the name's, partition (A-229): its own durable record.
+/// Records one step of a name alias on this, the name's, partition (A-236): its own durable record.
 pub(crate) fn alias_step(state: &mut ShardState, op: &Op) -> Result<(), Refusal> {
   let now = state.clock.monotonic_ns();
   state
@@ -6047,11 +6047,11 @@ pub(crate) fn alias_step(state: &mut ShardState, op: &Op) -> Result<(), Refusal>
     .map_err(|e| refusal_of_db(&e))
 }
 
-/// Format: the status counter of alias steps whose name's shard did not take them (A-229): a reserved alias left for
+/// Format: the status counter of alias steps whose name's shard did not take them (A-236): a reserved alias left for
 /// the next recovery to confirm or release, so the name resolves nothing until then.
 const ALIAS_STEP_UNTAKEN: &str = "names.alias_step_untaken";
 
-/// Makes a clone whose name hashes to `name_partition`, another partition (A-229, `slates_db::alias::CLONE_STEPS`):
+/// Makes a clone whose name hashes to `name_partition`, another partition (A-236, `slates_db::alias::CLONE_STEPS`):
 /// the alias reserved at the name's partition, the clone made here beside its origin with its completion record, and
 /// the alias confirmed (or released, when the clone could not be made) before the reply. The reply is deferred to a
 /// task of this shard, so a retry meanwhile joins it.
@@ -6169,7 +6169,7 @@ fn clone_as(
   }
 }
 
-/// Releases the alias the name's partition holds for `id`, a volume of this partition destroyed under `name` (A-229,
+/// Releases the alias the name's partition holds for `id`, a volume of this partition destroyed under `name` (A-236,
 /// `slates_db::alias::DESTROY_STEPS`). Nothing when the name hashes here, which holds no alias for it. The release is a
 /// message to the name's shard, which takes it only while its alias still names `id`; one not taken (refused,
 /// counted) is the next recovery's to release.
@@ -6377,7 +6377,7 @@ pub(crate) fn publish_clone(
   )
 }
 
-/// [`publish_clone`] under an id chosen before (A-229: the id the name's alias already names).
+/// [`publish_clone`] under an id chosen before (A-236: the id the name's alias already names).
 #[allow(clippy::too_many_arguments)] // publish_clone's arguments and the id it would choose
 pub(crate) fn publish_clone_as(
   state: &mut ShardState,
@@ -7934,7 +7934,7 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
         continue;
       }
       any = true;
-      // A clone whose name hashes elsewhere gives its alias back there (A-229).
+      // A clone whose name hashes elsewhere gives its alias back there (A-236).
       if let Some(name) = name {
         release_name_alias(state, id, &name);
       }
@@ -9614,7 +9614,7 @@ fn complete_recovered_destroys(state: &mut ShardState) -> usize {
       .is_ok()
     {
       completed = completed.saturating_add(1);
-      // A clone whose name hashes elsewhere gives its alias back there (A-229).
+      // A clone whose name hashes elsewhere gives its alias back there (A-236).
       if let Some(name) = name {
         release_name_alias(state, id, &name);
       }

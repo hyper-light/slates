@@ -5212,7 +5212,7 @@ context. A name is not a host pathname or a bearer capability. Fleet-wide enumer
 owners, each answer linearizable at its owner and the whole labelled with the configuration
 version.
 
-> **Status (2026-11-06, A-229: a clone's name at its name's partition).** Within a daemon a name routes by its hash to
+> **Status (2026-11-06, A-236: a clone's name at its name's partition).** Within a daemon a name routes by its hash to
 > one partition (`owner_of_name`), where it is looked up and where its uniqueness is decided. A clone lives beside its
 > origin, for copy-on-write, so when its name hashes elsewhere, the name's partition holds an alias pointing at the
 > clone (`slates_db::catalog::NameAliasRecord`). A lookup by name still routes by hash, and the name's partition says
@@ -13136,7 +13136,9 @@ the reaper's loop; the verbs that name an attachment), `crates/cli` (`slates att
     end, it is refused `AttachmentExpired` by a write and by a detach after a lapse, and its write lease is free.
   - Red-checked: with the renewal off, the second write is refused; with the expired ids ignored, `NotFound`.
 
-### A-229 — A clone's name is held at its name's partition by an alias, made by a reservation protocol (accepted 2026-11-06, the supervisor's decision: option 3)
+### A-236 — A clone's name is held at its name's partition by an alias, made by a reservation protocol (accepted 2026-11-06, the supervisor's decision: option 3)
+Renumbered 2026-11-07 from A-229 (the supervisor's allocation: A-229 was taken elsewhere). The commit that made it,
+c69f0d92, carries the old number in its message; history is not rewritten.
 Applied in the same change to: §4.8 "Lookup" (its status), GAPS, the bug record of 2026-09-13
 (`clone-name-not-routable-by-hash`), `crates/db` (`alias.rs`, new; `catalog::NameAliasRecord`; three appended ops,
 `NameAliasReserved`, `NameAliasConfirmed`, `NameAliasReleased`; the partition's alias table, its guards, its snapshot
@@ -13175,7 +13177,9 @@ recovery's reconcile, and `mount_capability` follows the alias; `image.rs`: `pub
   are left as they were: `ImageBuild` and `ImageMerge` make a named volume on the origin's partition with the same
   local-only name check, and a fleet takeover that moves a clone off its host is outside this daemon's partitions.
 
-### A-220 — macOS hands a client its region as a Mach fileport, never by a name a stranger could open (accepted 2026-11-06, GAP-A9-9's ring half)
+### A-233 — macOS hands a client its region as a Mach fileport, never by a name a stranger could open (accepted 2026-11-06, GAP-A9-9's ring half)
+Renumbered 2026-11-07 from A-220 (the supervisor's allocation: A-220 was taken elsewhere). The commit that made it,
+d0087a8b, carries the old number in its message; history is not rewritten.
 Applied in the same change to: §4.7 (the macOS rendezvous), GAPS (GAP-A9-9), `crates/ipc` (`mach_claim.rs`, new;
 `owner_name.rs`: the token's port and its look-up; `rendezvous.rs`: the macOS `Owner` serves the token, the answer names
 nothing, the claimant fetches its region; `region.rs`: a region from a descriptor, a second mapping by a duplicate, its

@@ -1,6 +1,6 @@
 # A clone's name does not route to the partition that holds it
 
-Date: 2026-09-13. Status: **fixed 2026-11-06 by A-229** (the supervisor chose the alias: option 3, below). The
+Date: 2026-09-13. Status: **fixed 2026-11-06 by A-236** (the supervisor chose the alias: option 3, below). The
 name's partition holds an alias pointing at the clone, made by a reservation protocol and reconciled at recovery
 (`crates/db/src/alias.rs`). Originally: open (found by the recovery oracle's clone read; outside the recovery path,
 reported for a separate fix). Design: §4.8 "Lookup" (ids route to owners, no global index,
@@ -43,7 +43,7 @@ The recovery oracle sidesteps it by choosing a clone name that hashes to the ori
 (`clone_name_on_origin_partition`), so it reads the snapshot's content through the route that
 exists and stays honest about why.
 
-## Fix (2026-11-06, A-229)
+## Fix (2026-11-06, A-236)
 
 The supervisor chose a third shape: the name's partition holds an **alias** pointing at the clone, which stays beside
 its origin.

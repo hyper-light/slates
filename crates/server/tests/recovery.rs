@@ -405,7 +405,7 @@ fn acknowledged_content_and_its_snapshot_survive_a_daemon_restart_byte_for_byte(
 }
 
 /// A clone name that routes, by name, to a partition other than its origin `origin_name`'s, on a daemon of
-/// `partitions` (A-229): the case a clone's alias exists for. With one partition every name routes to the origin's,
+/// `partitions` (A-236): the case a clone's alias exists for. With one partition every name routes to the origin's,
 /// so the stem is taken as it is: the same history, the degenerate case (R8).
 fn clone_name_elsewhere(origin_name: &str, stem: &str, partitions: u16) -> String {
   let partitions = usize::from(partitions);
@@ -487,12 +487,12 @@ fn clone_name_history(shards: u16) -> CloneNameSeen {
   }
 }
 
-/// A-229 (§4.8 "Lookup"; `docs/bugs/2026-09-13-clone-name-not-routable-by-hash.md`), with its N=1 differential (R8).
+/// A-236 (§4.8 "Lookup"; `docs/bugs/2026-09-13-clone-name-not-routable-by-hash.md`), with its N=1 differential (R8).
 /// Do: on a daemon of two shards, clone a snapshot under a name that routes to the other partition; read the clone's
 /// file through an NFS mount by that name; create a volume of the name; restart the daemon over the same anchor RAM and
 /// do both again; destroy the clone and create the name once more. Then the same history on one shard. Expect: the
 /// clone read by name, every second create refused `AlreadyExists`, both after the restart too, the name free once the
-/// clone is destroyed, and the one-shard daemon seeing exactly the same. Before A-229 the clone answered `NOENT` by
+/// clone is destroyed, and the one-shard daemon seeing exactly the same. Before A-236 the clone answered `NOENT` by
 /// name on two shards and a second volume of its name was created.
 #[test]
 fn a_clone_named_on_another_partition_is_reached_by_name_and_held_once() {

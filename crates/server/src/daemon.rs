@@ -2608,7 +2608,7 @@ impl Daemon {
   /// not a wire surface); the typed refusal when the name's owner shard could not be observed, `Ok(None)`
   /// when no volume has that name there or the secure random could not mint a token.
   pub fn mount_capability(&self, name: &str) -> Result<Option<String>, ObserveError> {
-    // The name's partition says where its volume is served: its own, or a clone's beside its origin (A-229).
+    // The name's partition says where its volume is served: its own, or a clone's beside its origin (A-236).
     let partition = verbs::owner_of_name(name, self.shards.len());
     let asked = name.to_owned();
     let partition = self.observe(self.shards.get(usize::from(partition)).copied(), move |s| {
@@ -4136,7 +4136,7 @@ async fn restore_client_ids(listener: &mut Listener, origin: u16, shards: &[Shar
   true
 }
 
-/// A recovery's reconciliation of every name alias (A-229, `slates_db::alias::reconcile`): each shard's aliases asked
+/// A recovery's reconciliation of every name alias (A-236, `slates_db::alias::reconcile`): each shard's aliases asked
 /// for, the volume each names asked of its partition, and the alias confirmed when that volume holds the name, released
 /// when it does not. Run before any client is admitted, when no clone is between its steps. An alias whose question is
 /// unanswered is left as it is, for the next start: a reserved one resolves nothing meanwhile. The aliases reconciled.
@@ -4320,7 +4320,7 @@ async fn control_loop(
     return;
   }
   // Every shard has recovered and no client is admitted yet, so no clone is between its steps: the names' aliases are
-  // reconciled with the clones they name (A-229).
+  // reconciled with the clones they name (A-236).
   let reconciled = reconcile_name_aliases(control, &shards).await;
   if reconciled > 0 {
     slates_machine::log_line!(

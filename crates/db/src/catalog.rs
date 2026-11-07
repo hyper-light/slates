@@ -929,7 +929,7 @@ pub struct NfsPurgeRecord {
   pub session: Option<[u8; 16]>,
 }
 
-/// A volume name held at its name's partition for a volume another partition holds (§4.8 "Lookup", A-229): a clone
+/// A volume name held at its name's partition for a volume another partition holds (§4.8 "Lookup", A-236): a clone
 /// lives beside its origin, for copy-on-write, while its name hashes elsewhere. The name's partition is where the name
 /// is looked up and where its uniqueness is decided, so it holds this alias, which points at the clone. An alias is
 /// reserved before the clone is made and confirmed after: a reserved one holds the name (a create of it is refused) but
