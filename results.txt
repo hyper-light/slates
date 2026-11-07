@@ -1,0 +1,65 @@
+runner windows-latest, 4 CPUs, Sat Nov  7 01:08:32 UTC 2026, commit ba334406
+== fix quiet round 1 at 01:08:33
+a bootstrap with its control shard starved: Ok(Acknowledged) after 1.5050764s
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.0152828s
+a revoke with a starved shard: Ok(Revoked) after 1.5112072s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.38s
+== fix quiet round 2 at 01:08:42
+a bootstrap with its control shard starved: Ok(Acknowledged) after 1.5411199s
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.0155507s
+a revoke with a starved shard: Ok(Revoked) after 1.5035392s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.40s
+== fix quiet round 3 at 01:08:52
+a bootstrap with its control shard starved: Ok(Acknowledged) after 1.5054827s
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.005059s
+a revoke with a starved shard: Ok(Revoked) after 1.5358744s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.40s
+== fix busy (two spinners a CPU) round 1 at 01:09:04
+a bootstrap with its control shard starved: Ok(Acknowledged) after 1.6209199s
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.0820774s
+a revoke with a starved shard: Ok(Revoked) after 1.5334318s
+a revoke with a wedged shard: Err(Refused(NotFound)) after 1.0755941s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.77s
+== fix busy (two spinners a CPU) round 2 at 01:09:26
+a bootstrap with its control shard starved: Ok(Acknowledged) after 1.6119074s
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.1014811s
+a revoke with a starved shard: Ok(Revoked) after 1.5805566s
+a revoke with a wedged shard: Err(Refused(NotFound)) after 1.0793173s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.80s
+== fix busy (two spinners a CPU) round 3 at 01:09:48
+a bootstrap with its control shard starved: Ok(Acknowledged) after 1.5769857s
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.0778422s
+a revoke with a starved shard: Ok(Revoked) after 1.5100135s
+a revoke with a wedged shard: Err(Refused(NotFound)) after 1.1033576s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.25s
+== cargo clippy --locked -p slates-server --test cross_shard_wait -- -D warnings
+== exit 0
+== cargo test --locked -q -p slates-server --test observe
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.15s
+== exit 0
+== cargo test --locked -q -p slates-server --test recovery
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-server --test liveness -- --test-threads=1
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.08s
+== exit 0
+== main's server sources (d61c3be2), the test unchanged: every starved case must fail
+== main quiet round 1 at 01:11:36
+a bootstrap with its control shard starved: Err(Refused(Overloaded { shard: 0 })) after 1.0073031s
+thread 'a_bootstrap_whose_control_shard_is_starved_is_acknowledged_past_a_wall_window' (6724) panicked at crates\server\tests\cross_shard_wait.rs:206:3:
+a starved control shard's bootstrap was lost after 1.0073031s: Err(Refused(Overloaded { shard: 0 }))
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.0140367s
+a revoke with a starved shard: Err(Refused(NotFound)) after 1.0039794s
+thread 'a_revoke_with_a_starved_shard_is_revoked_past_a_wall_window' (5548) panicked at crates\server\tests\cross_shard_wait.rs:313:3:
+a starved shard's revocation was lost after 1.0039794s: Err(Refused(NotFound))
+a revoke with a wedged shard: Err(Refused(NotFound)) after 1.0059692s
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.43s
+== main quiet round 2 at 01:12:24
+a bootstrap with its control shard starved: Err(Refused(Overloaded { shard: 0 })) after 1.004602s
+thread 'a_bootstrap_whose_control_shard_is_starved_is_acknowledged_past_a_wall_window' (4336) panicked at crates\server\tests\cross_shard_wait.rs:206:3:
+a starved control shard's bootstrap was lost after 1.004602s: Err(Refused(Overloaded { shard: 0 }))
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.0152757s
+a revoke with a starved shard: Err(Refused(NotFound)) after 1.0108708s
+thread 'a_revoke_with_a_starved_shard_is_revoked_past_a_wall_window' (5104) panicked at crates\server\tests\cross_shard_wait.rs:313:3:
+a starved shard's revocation was lost after 1.0108708s: Err(Refused(NotFound))
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.48s
