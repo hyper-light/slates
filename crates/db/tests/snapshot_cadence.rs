@@ -34,6 +34,20 @@ const INCREMENT_BYTES: usize = 256 << 10;
 const INCREMENTS: usize = 32;
 /// Shape: the log the test appends after the partition is built, in small records that do not grow it.
 const TAIL_BYTES: u64 = 16 << 20;
+/// Shape: a recovery budget small enough that the log its cadence allows fits a test's ring: 10 ms, a hundredth of the
+/// daemon's, so at up to 12,800 bytes a microsecond of measured replay throughput the cadence stays inside
+/// `BUDGET_LOG_BYTES` and only the cadence decides when a snapshot comes.
+const SMALL_BUDGET_NS: u64 = 10_000_000;
+/// Shape: the log ring for the budget test, room for a cadence of `SMALL_BUDGET_NS` at up to 12,800 bytes a
+/// microsecond.
+const BUDGET_LOG_BYTES: u64 = 128 << 20;
+/// Shape: snapshots taken before the measured tail, so the cadence has been re-derived from a full window of commits
+/// (the first window follows the boot rate, one byte a microsecond on a fresh segment).
+const SETTLING_SNAPSHOTS: u64 = 4;
+/// Shape: recoveries of the same tail, the median judged: recovery writes nothing to a tail that verifies, so each
+/// replays the same bytes. The budget is a bound a recovery meets on the machine as it is, so the median, not the
+/// fastest, is held to it (raft); all of them are printed.
+const RECOVERIES: usize = 5;
 
 fn identity() -> Identity {
   Identity {
@@ -154,12 +168,12 @@ fn absorb(log_bytes: u64) -> Absorbed {
   };
   println!(
     "ring {log_bytes}: partition {} bytes; {} bytes of log in {n} records; snapshots wrote {} bytes; cadence {} \
-     bytes, apply {} bytes/us, longest snapshot {} ns",
+     bytes, replay {} bytes/us, longest snapshot {} ns",
     absorbed.partition,
     absorbed.appended,
     absorbed.written,
     after.bytes_between_snapshots,
-    after.apply_bytes_per_us,
+    after.replay_bytes_per_us,
     after.snapshot_ns_max
   );
   absorbed
@@ -194,4 +208,91 @@ fn a_partitions_snapshots_cost_what_its_log_absorbs_not_its_size_per_megabyte() 
 #[test]
 fn a_ring_about_the_partitions_size_keeps_the_same_bound() {
   assert_bounded(&absorb(NARROW_LOG_BYTES));
+}
+
+/// Appends one small record that changes `id`'s accounting and does not grow the partition; returns the log bytes it
+/// took.
+fn account(db: &mut slates_db::replay::Db, seg: &mut AnchorSegment, id: VolumeId, n: u64) -> u64 {
+  let before = db.stats().log_bytes_appended;
+  let accounted = Op::VolumeAccounted {
+    id,
+    referenced_bytes: n,
+    unique_bytes: n,
+  };
+  db.mutate(seg, &accounted, 0).unwrap();
+  db.stats().log_bytes_appended - before
+}
+
+/// A-243, §4.8 (raft's check of the bound). Do: on a fresh segment with a 10 ms recovery budget, append small records
+/// until the cadence has been re-derived from the commits' measured throughput, then stop one record short of the next
+/// snapshot and recover from the segment five times, timed. Expect: the median replay of that tail, the longest one
+/// the cadence allows, fits the budget. A rate timed on the apply alone left out the replay's read, checksum and
+/// decode, so its cadence allowed a tail the replay could not finish in the budget.
+#[test]
+fn a_fresh_partitions_longest_tail_replays_within_its_recovery_budget() {
+  let mut seg = segment(BUDGET_LOG_BYTES);
+  let mut db = recover(&mut seg, 0, caps(), 0).unwrap().0;
+  db.set_recovery_budget(SMALL_BUDGET_NS);
+  let record = green();
+  let id = record.id;
+  db.mutate(&mut seg, &Op::VolumeCreated { record }, 0)
+    .unwrap();
+  let mut n = 0u64;
+  while db.stats().snapshots < SETTLING_SNAPSHOTS {
+    n += 1;
+    account(&mut db, &mut seg, id, n);
+  }
+  let settled = db.stats();
+  assert!(
+    settled.bytes_between_snapshots < BUDGET_LOG_BYTES / 2,
+    "the cadence {} bytes leaves the ring {} bytes room for the tail; the ring would force a snapshot first",
+    settled.bytes_between_snapshots,
+    BUDGET_LOG_BYTES
+  );
+  let mut last = 0u64;
+  while db.stats().log_bytes_appended - settled.log_bytes_appended + 2 * last
+    < settled.bytes_between_snapshots
+  {
+    n += 1;
+    last = account(&mut db, &mut seg, id, n);
+  }
+  assert_eq!(
+    db.stats().snapshots,
+    settled.snapshots,
+    "the tail stopped short of the next snapshot"
+  );
+  let tail = db.stats().log_bytes_appended - settled.log_bytes_appended;
+  drop(db);
+  let mut replay_ns = Vec::with_capacity(RECOVERIES);
+  let mut replayed = 0u64;
+  for _ in 0..RECOVERIES {
+    let recovered = recover(&mut seg, 0, caps(), 0).unwrap().1;
+    assert!(!recovered.torn, "the tail verifies");
+    replayed = recovered.replayed_bytes;
+    replay_ns.push(recovered.replay_ns);
+  }
+  let in_order = {
+    let mut sorted = replay_ns.clone();
+    sorted.sort_unstable();
+    sorted
+  };
+  let median = in_order.get(RECOVERIES / 2).copied().unwrap();
+  println!(
+    "budget {SMALL_BUDGET_NS} ns: cadence {} bytes, {} bytes/us as the commits measured it; tail {tail} bytes, \
+     replayed {replayed} bytes; recoveries {replay_ns:?} ns, median {median} ns ({} bytes/us), {} per mille of the \
+     budget",
+    settled.bytes_between_snapshots,
+    settled.bytes_between_snapshots * 1_000 / SMALL_BUDGET_NS,
+    replayed * 1_000 / median.max(1),
+    median * 1_000 / SMALL_BUDGET_NS
+  );
+  assert!(
+    replayed >= tail,
+    "the recovery replayed the tail: {replayed} of {tail} bytes"
+  );
+  assert!(
+    median <= SMALL_BUDGET_NS,
+    "the longest tail the cadence allows ({replayed} bytes) took {median} ns at the median to replay, past the \
+     {SMALL_BUDGET_NS} ns budget"
+  );
 }

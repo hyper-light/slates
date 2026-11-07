@@ -39,10 +39,14 @@ The cadence was derived from a throughput measured only at boot, and a boot that
 ## Fix
 
 - At every snapshot, the cadence is re-derived (`SnapshotPolicy::at_snapshot`) as
-  `max(budget × the apply throughput measured since the last snapshot, the snapshot's size)`.
-  - The apply throughput is timed around the partition's apply in every commit: the work a replay repeats, measured
-    at no extra pass (raft's choice over the encode or a decode).
+  `max(budget × the replay throughput measured since the last snapshot, the snapshot's size)`.
+  - The replay throughput is timed on each commit's append (encode, checksum, copy into the ring) and apply: the work
+    a replay repeats per record, the append mirroring its read, checksum and decode, measured at no extra pass.
+  - The first version timed the apply alone. raft's review found that it overstated the replay's speed by the
+    decode's share, so a recovery's tail could run past the budget by that share; the append joined it (raft's
+    option (a), right for a fresh daemon with no boot measurement).
   - The boot replay's rate stands until one is measured.
+  - The budget is the operator's input (`Db::set_recovery_budget`, GAPS §5), one second by default.
 - The second term is the doubling rule: a snapshot comes only once the log has absorbed what it costs, so snapshot
   work stays within about twice the log written.
 - The decision is the commit's, never the apply's.
