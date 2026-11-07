@@ -1,0 +1,31 @@
+test a_destroyed_live_volumes_copies_are_let_go_by_its_candidates ... ok
+live keyed: created c74a006a28cc84d40000000000000028 after 688.686984ms
+live keyed: created c74a006a28cc84d40001000000000004 after 694.202983ms
+live keyed: c74a006a28cc84d40001000000000004's successor is the stopped node, after 694.249673ms
+live keyed: live-shipped and writing, after 694.334752ms
+live fsync: healthy Ok(()); candidates stopped Err(Os { code: 5, kind: Uncategorized, message: "Input/output error" }) after 1.083786072s; resumed Ok(()); owner's live counters {"appended": 4, "durable": 4, "link_lost": 1, "no_session": 18, "unanswered": 9}
+test a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+live keyed: the writes returned while the candidate was stopped: false; served whole by live-keyed-c-6698 after 1.785976664s
+test a_live_volume_made_while_its_successor_was_stopped_is_served_by_it ... ok
+live takeover: served whole by live-takeover-a-6698 after 2.166326788s; taken_over=1 fetched=1; [("live-takeover-a-6698", {"held": 6, "hold_refused": 1, "hold_refused.no_catalog": 1, "taken_over": 1}), ("live-takeover-c-6698", {"fetched": 1, "held": 6, "hold_refused": 1, "hold_refused.no_catalog": 1})]
+test a_live_volumes_acknowledged_writes_survive_its_owners_death ... ok
+live pause: writes while paused [441.21133ms, 15.29275ms, 13.961679ms, 19.658901ms]; at return Some(("4", "4", "false")); then Some(("4", "4", "false")) [Some(("4", "none", "false")), Some(("4", "none", "false"))]
+test a_paused_candidate_neither_stops_writes_nor_stays_behind ... ok
+live nfs: after each write [Some(("1", "1", "false")), Some(("2", "2", "false")), Some(("3", "3", "false")), Some(("4", "4", "false")), Some(("5", "5", "false"))] late=0
+test a_stable_nfs_write_to_a_live_volume_is_answered_once_a_candidate_holds_it ... ok
+live fence: the old owner's live counters {"appended": 4, "awaited": 4, "durable": 3, "fenced": 1, "no_session": 1, "resolved": 4}, its log Some(("3", "2", "false"))
+live fence: taken over by live-fence-a-6698 after 1.872738268s; stale write outcome Some(Some(1)); successor read of /stale: 1 ""
+test a_superseded_owner_resumed_after_its_takeover_is_fenced ... ok
+live empty successor live-empty-a-6698: served by Some("live-empty-a-6698"); [("live-empty-a-6698", {"hold_refused": 1, "hold_refused.no_catalog": 1, "taken_over": 1}), ("live-empty-b-6698", {"fetched": 1, "held": 10, "hold_refused": 1, "hold_refused.no_catalog": 1})]
+test a_successor_that_holds_no_copy_still_takes_a_live_volume_over ... ok
+forming: the bootstrap node's council held Some(1) voters when the owner was killed
+live cut: Some(("9", "9", "false")) [Some(("9", "none", "false")), Some(("9", "none", "false"))] awaited=10 resolved=10 unrecorded=0
+test clients_cut_off_mid_write_leave_the_live_log_whole ... ok
+test measure_what_live_shipping_adds_to_a_stable_nfs_write ... ok
+live fleet: shipping(head, durable, owed)=Some(("4", "4", "false")) held=[Some(("4", "none", "false")), Some(("4", "none", "false"))] appended=5 refused=0 hold_refused=[1, 1]
+test three_daemon_processes_ship_a_live_volumes_writes_to_both_candidates ... ok
+forming: served by forming-a-6698 after 3.487637978s
+test an_owner_killed_while_its_fleet_still_forms_is_taken_over ... ok
+live stall: 30 writes, client-seen latency p50 43.536649ms p90 47.833417ms max 56.049686ms; at return Some(("30", "30", "false")); then Some(("30", "30", "false")) [Some(("30", "none", "false")), Some(("30", "none", "false"))]; over_bound=0
+test writes_stay_durable_through_injected_candidate_stalls ... ok
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.60s
