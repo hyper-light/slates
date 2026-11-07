@@ -65,6 +65,16 @@ machine scheduled the target thread, not whether the target was working.
     volume whose owner shard on node a was starved was answered `NotFound` after 1.302 s; with the change it was served
     after 1.70–2.11 s. The remote reap's arm is converted by the same rule, but has no test of its own: it is reached only
     by a peer reaping a dead client's remote attachment.
+  - **The direct map's hand-off** (`direct_map.rs` `hand_off`: on Linux the copy's shard asks the client's shard to send
+    the copy's descriptor, on Windows to name the client's process; macOS offers the copy on the copy's own shard, so
+    nothing crosses). Measured (`crates/client/tests/client.rs`, CI diag `diag-clients-r3a-5`, 2026-11-07 UTC): with the
+    fill held between two slices and the client's shard starved for 1.5 s (on the CPU a fifth of the time), main's
+    hand-off gave up and the client read by copy (`direct false`, answered 1.51–1.56 s after the starve began) on ubuntu
+    x86_64 and arm64 and Windows x86_64 and arm64; with the change the map was direct. On busy Windows runners that run's test lost its
+    own race (the 16-slice fill ended before the observation's turn, 4 of 6 busy rounds); the file is now 64 slices and
+    a missed map is let go and made again. `diag-clients-r3a-6`: 6 of 6 rounds green on each of the four runners, quiet
+    and with two spinners a CPU (direct, answered 1.50–3.09 s after the starve began, the fill caught at the first
+    map every time), and 2 of 2 red on each over main's sources (`direct false`, 1.53–1.56 s).
 
 ## Tests
 
@@ -84,7 +94,7 @@ client's own deadline is the liveness window too; deriving that window is A-232 
 
 ## Siblings
 
-Still waiting on the wall second: the direct map's delivery (`direct_map.rs`). A remote reap's own driver
+No class-A site is left waiting on the wall second. A remote reap's own driver
 (`remote_attach.rs`, its task on the control shard) waits the reap's deadline, not the liveness budget, and is not class
 A. The delegation's recall and the back channel's probe (`delegation.rs`, `nfs.rs`
 `probe_back_channel`, both through `callback::call_on_slot`) also wait a liveness budget, but on the NFS client across

@@ -167,7 +167,9 @@
 >   after 1.57–1.80 s); the NFS bridge (a host-root listing refused `SYSTEM_ERR` after 1.262 s and a v4 state call told
 >   `NFS4ERR_DELAY` after 1.296 s with a starved shard; now listed after 1.59–1.80 s and answered by the owner after
 >   1.52–1.58 s); the forwarded verbs and a peer's remote reap (a peer's read of a volume whose owner shard was starved
->   answered `NotFound` after 1.302 s, now served after 1.70–2.11 s). Open: the direct map's delivery. Found on
+>   answered `NotFound` after 1.302 s, now served after 1.70–2.11 s); the direct map's hand-off on Linux and Windows (a
+>   client whose shard was starved at its hand-off read by copy, now mapped directly). Class A is done; classes B (the
+>   transport's round-trip estimate) and C+D (A-232, the window itself) are open. Found on
 >   the way: a Windows channel (a `Sid`) can never attest a consumer (`verify_attestation` takes a uid only), and two
 >   server unit tests of landing fail on Windows, where CI does not run them. Record: `docs/bugs/2026-11-06-a-cross-shard-wait-lost-a-starved-shards-answer.md`.
 
