@@ -228,25 +228,24 @@ pub fn wake(budget: Duration, placement: &Placement) -> Result<WakeLatency, Mach
   let mut asleep_confirmed = true;
   let mut rounds = 0u32;
   let began = Instant::now();
-  // A zero budget doubles to zero: no round could measure, so the wall extension is not given to it.
-  let short_of_floor = |kept: &[u64], rounds: u32| {
-    kept.len() < MIN_SAMPLES
-      && (rounds < WAKE_ROUNDS.saturating_mul(2)
-        || (!budget.is_zero() && began.elapsed() < PROBE_WALL_BUDGET))
-  };
-  while rounds < WAKE_ROUNDS || short_of_floor(&kept, rounds) {
-    if rounds >= WAKE_ROUNDS {
-      round_budget = round_budget.saturating_mul(2);
-    }
-    if rounds >= WAKE_ROUNDS.saturating_mul(2) {
-      round_budget = round_budget.min(PROBE_WALL_BUDGET.saturating_sub(began.elapsed()));
-    }
+  let mut last_answered = false;
+  while extends(
+    budget,
+    &Standing {
+      kept: kept.len(),
+      rounds,
+      waited: began.elapsed(),
+      last_answered,
+    },
+  ) {
+    round_budget = next_round_budget(round_budget, rounds, began.elapsed());
     let pair = usize::try_from(rounds)
       .ok()
       .and_then(|round| pairs.get(round.checked_rem(pairs.len())?))
       .copied();
     rounds = rounds.saturating_add(1);
     let outcome = wake_round(pair, round_budget, &mut rng);
+    last_answered = !outcome.samples.is_empty() || outcome.same_cpu > 0;
     placement = weaker(placement, outcome.placement);
     same_cpu_samples = same_cpu_samples.saturating_add(outcome.same_cpu);
     asleep_confirmed &= outcome.asleep_confirmed;
@@ -278,6 +277,42 @@ pub fn wake(budget: Duration, placement: &Placement) -> Result<WakeLatency, Mach
     },
     &mut rng,
   ))
+}
+
+/// Where the probe stands after the rounds so far: what [`extends`] decides on.
+struct Standing {
+  /// The samples kept across the rounds.
+  kept: usize,
+  /// The rounds run.
+  rounds: u32,
+  /// The wall time since the probe began.
+  waited: Duration,
+  /// Whether the last round got any wake answered (kept, or dropped as a one-CPU wake).
+  last_answered: bool,
+}
+
+/// Whether the probe runs another round: the [`WAKE_ROUNDS`] planned ones always; then, while short of the sample
+/// floor, [`WAKE_ROUNDS`] more doubling ones, and more still until the full probe budget ([`PROBE_WALL_BUDGET`]) is
+/// spent. A zero budget doubles to zero: no round could measure, so the wall extension is not given to it.
+fn extends(budget: Duration, standing: &Standing) -> bool {
+  standing.rounds < WAKE_ROUNDS
+    || (standing.kept < MIN_SAMPLES
+      && (standing.rounds < WAKE_ROUNDS.saturating_mul(2)
+        || (!budget.is_zero() && standing.waited < PROBE_WALL_BUDGET)))
+}
+
+/// The budget of the round after `rounds` rounds, the last of which had `last`: the planned rounds share the budget,
+/// the extension rounds double it, and a round past the doubling ones is capped at what is left of the full probe
+/// budget.
+fn next_round_budget(last: Duration, rounds: u32, waited: Duration) -> Duration {
+  let mut next = last;
+  if rounds >= WAKE_ROUNDS {
+    next = next.saturating_mul(2);
+  }
+  if rounds >= WAKE_ROUNDS.saturating_mul(2) {
+    next = next.min(PROBE_WALL_BUDGET.saturating_sub(waited));
+  }
+  next
 }
 
 /// What the rounds found beside their samples.
@@ -872,6 +907,56 @@ mod tests {
     );
     let after = std::thread::available_parallelism().map_or(1, |n| n.get());
     assert_eq!(after, before);
+  }
+
+  /// The standing of a probe past its doubling rounds and the full probe budget, still short of the sample floor.
+  fn starved(last_answered: bool) -> Standing {
+    Standing {
+      kept: MIN_SAMPLES.saturating_sub(1),
+      rounds: WAKE_ROUNDS.saturating_mul(3),
+      waited: PROBE_WALL_BUDGET.saturating_mul(2),
+      last_answered,
+    }
+  }
+
+  /// §4.1 refusals, judged by progress, not a wall (A-228's rule, the anchor's start judgment): a starved probe is
+  /// one whose wakes come slowly, a stuck one gets none. Measured on this Mac under 144 nice-19 spinners on 18 CPUs
+  /// (2026-11-07): a wake took 68 ms at the median and 205 ms at p99, so the sample floor needs over a second, and
+  /// `slates profile --quick` was refused 19 times in 20 with the anchor's boot behind it. Do: decide on a probe past
+  /// the full probe budget still short of the floor, whose last round got a wake answered, and one whose last round
+  /// got none. Expect: the first runs another round, the second refuses; at the floor, or with a zero budget past its
+  /// doubling rounds, none runs; inside the full budget one runs answered or not.
+  #[test]
+  fn a_probe_whose_wakes_keep_coming_measures_past_the_wall_and_one_whose_wakes_stop_refuses() {
+    let budget = Duration::from_millis(5);
+    assert!(extends(budget, &starved(true)));
+    assert!(!extends(budget, &starved(false)));
+    let at_floor = Standing {
+      kept: MIN_SAMPLES,
+      ..starved(true)
+    };
+    assert!(!extends(budget, &at_floor));
+    assert!(!extends(Duration::ZERO, &starved(true)));
+    let inside_the_budget = Standing {
+      waited: PROBE_WALL_BUDGET.saturating_sub(Duration::from_millis(1)),
+      ..starved(false)
+    };
+    assert!(extends(budget, &inside_the_budget));
+  }
+
+  /// The other half of the rule: a round past the full probe budget gets a whole window to answer a wake in, never
+  /// the nothing left of a spent wall, and never more than one window. Do: ask the budget of a round past the doubling
+  /// rounds and the wall, after a round of half a window and after one of a whole window. Expect: one window each.
+  #[test]
+  fn a_round_past_the_wall_gets_one_window() {
+    let rounds = WAKE_ROUNDS.saturating_mul(3);
+    let waited = PROBE_WALL_BUDGET.saturating_mul(2);
+    let half = PROBE_WALL_BUDGET.checked_div(2).unwrap();
+    assert_eq!(next_round_budget(half, rounds, waited), PROBE_WALL_BUDGET);
+    assert_eq!(
+      next_round_budget(PROBE_WALL_BUDGET, rounds, waited),
+      PROBE_WALL_BUDGET
+    );
   }
 
   /// Shape: a wake budget too short for its rounds to confirm a sleeper: 10 µs, so 2 µs shares and at most 124 µs
