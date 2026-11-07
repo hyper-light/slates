@@ -1,0 +1,68 @@
+name: diag-liveness-nfs
+
+# Diagnostics only, never on main (the give-back fix against A-214's write throughput): `nfs_large_write` from main
+# (MAIN_SHA) and from the fix (FIX_SHA), built on the runner and run interleaved, three rounds each, on macOS and
+# Linux. Results go to diag-results/liveness-7-<os>.
+on:
+  push:
+    branches: ["diag-liveness-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  MAIN_SHA: d61c3be2
+  FIX_SHA: 0e4f5046
+
+jobs:
+  ab:
+    name: nfs write A/B (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build both arms
+        run: |
+          mkdir -p ../arms
+          for arm in main fix; do
+            case $arm in main) sha=$MAIN_SHA;; fix) sha=$FIX_SHA;; esac
+            git worktree add "../src-$arm" "$sha"
+            ( cd "../src-$arm" && CARGO_TARGET_DIR="../target-$arm" cargo build --release --locked -p slates-cli --example nfs_large_write )
+            cp "../target-$arm/release/examples/nfs_large_write" "../arms/nfs-$arm"
+          done
+      - name: Three rounds a arm, interleaved
+        run: |
+          R=../results.txt
+          echo "runner ${{ matrix.os }}, $(getconf _NPROCESSORS_ONLN) CPUs, $(date -u)" > $R
+          for round in 1 2 3; do
+            for arm in main fix; do
+              echo "== $arm round $round at $(date -u +%H:%M:%S); $(uptime)" | tee -a $R
+              status=0
+              ../arms/nfs-$arm > ../run.log 2>&1 || status=$?
+              grep -E '^nfs_' ../run.log | tee -a $R || true
+              echo "== $arm round $round exit $status" | tee -a $R
+            done
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/liveness-7-${{ matrix.os }}"
+          git config user.name "diag-liveness"
+          git config user.email "diag-liveness@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-liveness-7 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
