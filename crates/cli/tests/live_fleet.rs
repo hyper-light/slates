@@ -907,7 +907,10 @@ fn both_candidates_stopped_draw_no_storm_of_sends() {
   let writer = {
     let (owner, id) = (owner.clone(), id.clone());
     std::thread::spawn(move || {
-      let attachment = value_of(&run_ready(&owner, &["attach", &id, "--write"]), "attachment");
+      let attachment = value_of(
+        &run_ready(&owner, &["attach", &id, "--write"]),
+        "attachment",
+      );
       let _ = run_with_stdin(
         &owner,
         &["write", &id, &attachment, "/while-stopped"],
@@ -916,6 +919,8 @@ fn both_candidates_stopped_draw_no_storm_of_sends() {
     })
   };
   let stop = Duration::from_nanos(3 * slates_server::daemon::LIVENESS_BUDGET_NS);
+  // The test holds the stop for its length; shipped code parks on its driver (D-9).
+  #[allow(clippy::disallowed_methods)]
   std::thread::sleep(stop);
   let during = counter(&owner, "fleet.live.unanswered").saturating_sub(before);
   for index in &stopped {
@@ -927,10 +932,13 @@ fn both_candidates_stopped_draw_no_storm_of_sends() {
   drop(fleet.scratch);
   // Derived: each holder's lane ends unanswered at most once per record period (the period re-sends what it lacks) and
   // once per publication (the write and its attach), plus the lane in flight when the stop began.
-  let periods = u64::try_from(stop.as_nanos() / u128::from(slates_server::daemon::HEARTBEAT_NS)).unwrap_or(u64::MAX);
+  let periods = u64::try_from(stop.as_nanos() / u128::from(slates_server::daemon::HEARTBEAT_NS))
+    .unwrap_or(u64::MAX);
   let publications = 2;
   let bound = u64::try_from(others.len()).unwrap_or(u64::MAX) * (periods + publications + 1);
-  eprintln!("live storm: unanswered sends while both stopped {during} (bound {bound}); then {shipping:?} {held:?}");
+  eprintln!(
+    "live storm: unanswered sends while both stopped {during} (bound {bound}); then {shipping:?} {held:?}"
+  );
   assert!(
     during <= bound,
     "unanswered sends while both candidates were stopped: {during}, over {bound}"
