@@ -56,6 +56,15 @@ machine scheduled the target thread, not whether the target was working.
     unconverted code a host-root listing with the other shard starved was refused `SYSTEM_ERR` after 1.262 s, and an
     NFSv4 `FREE_STATEID` at a starved owner was answered `NFS4ERR_DELAY` after 1.296 s; with the change the listing
     succeeded after 1.59–1.80 s and the owner's own `NFS4ERR_BAD_STATEID` came back after 1.52–1.58 s, over three runs.
+    CI diag run of `diag-clients-r3a-3` (2026-11-07 UTC): every test of the file green in every round on the four Linux
+    and Windows runners, quiet and busy (the v4 test on Linux only), and every starved case red over main's sources.
+  - **The forwarded verbs** (`verbs.rs` `serve_forward`: a peer's forwarded read and write, the wait for the write's
+    told mounts, and `await_deferred_completion`'s reads of the completion record; and `remote_attach.rs`
+    `serve_unforwardable`, a peer's remote reap, the same path's third arm). Measured (`crates/server/tests/fleet.rs`,
+    three daemons of two shards, each its own region, same host): over the unconverted code a client on node b reading a
+    volume whose owner shard on node a was starved was answered `NotFound` after 1.302 s; with the change it was served
+    after 1.70–2.11 s. The remote reap's arm is converted by the same rule, but has no test of its own: it is reached only
+    by a peer reaping a dead client's remote attachment.
 
 ## Tests
 
@@ -75,9 +84,9 @@ client's own deadline is the liveness window too; deriving that window is A-232 
 
 ## Siblings
 
-Still waiting on the wall second, each its own commit: the forwarded verbs (`verbs.rs` `serve_forward`,
-`await_deferred_completion`), the direct map's delivery (`direct_map.rs`) and a peer's remote reap (`remote_attach.rs`
-`serve_unforwardable`). The delegation's recall and the back channel's probe (`delegation.rs`, `nfs.rs`
+Still waiting on the wall second: the direct map's delivery (`direct_map.rs`). A remote reap's own driver
+(`remote_attach.rs`, its task on the control shard) waits the reap's deadline, not the liveness budget, and is not class
+A. The delegation's recall and the back channel's probe (`delegation.rs`, `nfs.rs`
 `probe_back_channel`, both through `callback::call_on_slot`) also wait a liveness budget, but on the NFS client across
 the network, not on a shard: that is class B (the transport's round-trip estimate).
 
