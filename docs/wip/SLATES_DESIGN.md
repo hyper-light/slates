@@ -7334,6 +7334,17 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > work reads one position per holder rather than rescanning the retained chain. Transfer to a new
 > candidate set and full green takeover remain owed (AUD-14).
 
+> **Status (2026-11-06, A-235: the record plane runs when there is merge work).**
+> The merge record plane ran once per coordinator period (100 ms), putting a version's inputs at one period and its
+> record at the next, so every answer at `f > 0` waited at least one period, and usually two. One submit at a time on an
+> idle three-node fleet at `f = 1` took 208 to 647 ms, and at 1,000 clients every accepted submit was answered
+> `Overloaded` (`docs/bugs/2026-11-06-a-submit-at-f1-waited-for-the-coordinators-period.md`). Now an enqueued version, an
+> input newly placed, or a record newly acknowledged with versions still pending nudges the coordinator. It runs the
+> merge plane at once, between its periods, and the council, root, seals and heads keep the period. A version's inputs
+> are put only to the holders whose next record it is: a holder keeps only its newest placement ahead of its records, so
+> a later version's inputs had released a lagging holder's next. Median answer now 2.7 to 4.4 ms on the debug build.
+> Still owed: pipelining, more than one version to a holder per pass.
+
 > **Status (2026-11-04, A-202: a submit's cost follows what it changed).** A work holds only the files it changed
 > since its base and reads the rest from the green's history there; an accept moves its base and clears that, in
 > O(1). The deriver composes over the base restricted to the journal's paths, and the merge record's identities are
@@ -14419,6 +14430,24 @@ Applied in the same change to: §4.7 (data model, wake strategy, status); `slate
 and settle, `DaemonEnd::reply`'s stamp and confirmation) and `crates/ipc/tests/rings.rs`; GAPS. Evidence:
 `docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`. A client and a daemon of
 different layout versions refuse each other by name; no consensus rule or capability changes.
+
+### A-235 — The merge record plane runs when there is merge work, and a version's inputs go only to holders whose next record it is (accepted 2026-11-06)
+
+§4.16 "Commit" ran the record plane only on the coordinator's period, so a submit at `f > 0`, answered once its record
+commits, waited one to two periods (208 to 647 ms at `f = 1`), against goal 4's 1 ms. Replace that: an owner shard
+nudges the coordinator when it has merge work it can do now, which is a version enqueued, a version's inputs newly
+acknowledged, or a record newly acknowledged with versions still pending. The coordinator runs the merge plane at once
+between its periods, and everything else keeps the period. Only events that make new work nudge, so an unanswering
+holder adds no passes. Put a version's inputs only to the candidates whose first missing record is that version. Hedging
+them to every candidate gave a lagging holder two placements ahead of its records, and content retention keeps only the
+newest of those, so it let go of the one its next record needed. Rejected: a separate shipping task per version as live
+shipping uses (A-200). The owner's acceptor and the holders' sessions belong to the coordinator, and a second
+dispatcher would contend for both. Also rejected: a shorter period, which charges every node the council's and the
+heads' work more often to buy what an event gives for free.
+
+Applied in the same change to: §4.16 (Commit status); `slates-server` (`merge_service::nudge_record_plane`, `nudged`,
+`MergeShardState::nudged`, `put_inputs`'s recipients, `fleet::pace_running_merges`); the fleet test; GAPS. Evidence:
+`docs/bugs/2026-11-06-a-submit-at-f1-waited-for-the-coordinators-period.md`. No wire, layout or capability change.
 
 ### A-234 — A joint write's sub-quorum cohort needs every member, and pending merge records follow the current placement (accepted 2026-11-06)
 

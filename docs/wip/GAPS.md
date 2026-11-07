@@ -1,5 +1,15 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A submit at `f = 1` waited for the coordinator's period: fixed (2026-11-06, §4.16 Commit;
+> A-235).** The merge record plane ran once per 100 ms coordinator period, putting a version's inputs at one
+> period and shipping its record at the next. One submit at a time on an idle three-node fleet took 208 to 647 ms, and at
+> 1,000 clients on Linux every accepted submit was answered `Overloaded`. Now an enqueued version, or a newly
+> acknowledged input or record, wakes the coordinator, which runs the merge plane at once (`nudge_record_plane`,
+> `pace_running_merges`). A version's inputs go only to the holders whose next record it is, since a lagging holder let
+> go of the inputs it needed next (`merge.inputs_unheld` 53 and 71 in two runs). Median now 2.7 to 4.4 ms (debug build,
+> 5 of 5). Still owed: more than one version a holder per pass, so a hot green's versions still commit one round trip
+> apart. Record: `docs/bugs/2026-11-06-a-submit-at-f1-waited-for-the-coordinators-period.md`.
+
 > **A submit in a three-process fleet at `f = 1` was never answered: fixed (2026-11-06, §4.8 joint writes, §4.16
 > Commit; A-234, `Quorum::committed_within` reviewed by raft-chaos).** A green made on the bootstrapper while its council formed had
 > its merge records enqueued under the bootstrap's one-candidate placement, and pending records were never
