@@ -339,7 +339,7 @@ fn head_placed(state: &ShardState, volume: [u8; 16]) -> bool {
     || state
       .placed_heads
       .get(&ObjectId(volume))
-      .is_some_and(|head| configuration.region_placed(&head.placement))
+      .is_some_and(|head| head.placed_under(configuration, ObjectId(volume)))
 }
 
 /// A verb's reply held until its volume's log is durable where its publication put it.
@@ -504,6 +504,7 @@ pub(crate) fn join(
 pub(crate) fn resolve(state: &mut ShardState, volume: [u8; 16]) {
   wake_parked(state, volume);
   let Some(durable) = answerable(state, volume) else {
+    count_held_back(state, volume);
     return;
   };
   let keys: Vec<([u8; 16], u64)> = state
@@ -556,7 +557,9 @@ fn tombstone_placed(state: &ShardState, volume: [u8; 16], sequence: u64) -> bool
     || state
       .placed_heads
       .get(&ObjectId(volume))
-      .is_some_and(|head| head.sequence >= sequence && configuration.region_placed(&head.placement))
+      .is_some_and(|head| {
+        head.sequence >= sequence && head.placed_under(configuration, ObjectId(volume))
+      })
 }
 
 /// Holds a destroy's reply until its volume's tombstone is placed at `f + 1` ([`tombstone_target`]): its effects are
@@ -764,7 +767,7 @@ pub(crate) fn published(
   });
   let quorum = configuration.quorum;
   let reaches_size = kept_reaches_size(state, id);
-  let live = state
+  state
     .live
     .shipping
     .entry(id.bytes)
@@ -782,6 +785,10 @@ pub(crate) fn published(
       fenced: None,
       kept: 0,
     });
+  follow_candidates(state, id.bytes);
+  let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
+    return;
+  };
   let whole = live.owes_whole || record.is_none() || reaches_size;
   let built = if whole {
     whole_record(state, id)
@@ -848,6 +855,73 @@ fn kept_reaches_size(state: &ShardState, id: slates_db::catalog::VolumeId) -> bo
   };
   u64::try_from(kept).unwrap_or(u64::MAX) >= size
 }
+
+/// Moves `volume`'s log to its other candidates as this shard's configuration names them now, by a joint transition
+/// (`Shipper::begin_transition`, counted `fleet.live.holders_transition`): the shipper ships to the old and the new set
+/// and counts a write durable only once `f` of each hold it, and the new set becomes the holders once it holds every
+/// durable entry (`Shipper::activate`, counted `fleet.live.holders_activated`). The configuration grows while a fleet
+/// forms (a bootstrap node names only itself until the others are admitted) and moves at a takeover or a neighbourhood
+/// change; a shipper that kept the holders of its first publication shipped to nobody when that set was empty (the
+/// Linux conformance pair, diag run 42325923902: head=2 durable=none for a whole fsx run, nothing sent to either
+/// candidate), and one that replaced them outright could leave a takeover counting a set that held none of the durable
+/// writes (the model, `slates_db`'s `tests/live.rs`).
+///
+/// The record the activation waits on is the configuration: a takeover counts the candidates it names. A-240 makes it
+/// the holder set the shipper itself records in the volume's catalog; with that record, `activate` is called with the
+/// set the placed record names, once [`target_recordable`] has said the target may be recorded.
+fn follow_candidates(state: &mut ShardState, volume: [u8; 16]) {
+  let configuration = state.fleet.configuration();
+  let local = configuration.owner;
+  let candidates: Vec<HostId> = configuration
+    .place(ObjectId(volume))
+    .candidates
+    .into_iter()
+    .filter(|host| *host != local)
+    .collect();
+  let Some(live) = state.live.shipping.get_mut(&volume) else {
+    return;
+  };
+  let began = live.shipper.begin_transition(&candidates);
+  if began {
+    state.count(LIVE_HOLDERS_TRANSITION, 1);
+  }
+  if !target_recordable(state, volume) {
+    return;
+  }
+  let activated = state
+    .live
+    .shipping
+    .get_mut(&volume)
+    .is_some_and(|live| live.shipper.activate(&candidates));
+  if activated {
+    state.count(LIVE_HOLDERS_ACTIVATED, 1);
+  }
+}
+
+/// Whether the record may name `volume`'s transition target: the target holds every durable write
+/// (`Shipper::transferred`), and, once anything is durable, the last whole entry carries a key for every candidate
+/// ([`covers_candidates`]) and is itself durable, so `f` of the target hold a whole entry they can open. A target that
+/// held the log under a key it lacked could not serve it: raft-chaos saw a successor outside the shipper's holders
+/// refuse every rebuild for want of the lineage key (`fleet.live.takeover_refused.open` 814, CI diag-raft-chaos-kind-14,
+/// 2026-11-07). The period checkpoints the log again once this shard has delivered the missing pairs ([`period`]).
+fn target_recordable(state: &ShardState, volume: [u8; 16]) -> bool {
+  let Some(live) = state.live.shipping.get(&volume) else {
+    return false;
+  };
+  if !live.shipper.transferred() {
+    return false;
+  }
+  let Some(durable) = live.shipper.durable() else {
+    return true;
+  };
+  let whole = live.whole.as_ref().map(|(head, _)| head.position);
+  covers_candidates(state, volume) && whole.is_some_and(|whole| whole <= durable)
+}
+
+/// Counter: a live volume began moving its holders to a changed set of candidates.
+const LIVE_HOLDERS_TRANSITION: &str = "fleet.live.holders_transition";
+/// Counter: a live volume's new holder set held every durable entry and became its holders.
+const LIVE_HOLDERS_ACTIVATED: &str = "fleet.live.holders_activated";
 
 /// A publication that could not become an entry: counted, and the volume owes a whole record next.
 fn refuse(state: &mut ShardState, id: slates_db::catalog::VolumeId, why: &'static str) {
@@ -972,6 +1046,36 @@ fn answerable(state: &ShardState, volume: [u8; 16]) -> Option<u64> {
   (durable >= whole).then_some(durable)
 }
 
+/// Counts why `volume`'s log, durable on its holders, does not yet answer its writers ([`answerable`]): the fleet does not
+/// know the volume yet (`placement`), its last whole entry does not carry every candidate's key (`keys`), or that entry
+/// is not itself durable yet (`whole`). Nothing is counted while the shipper holds nothing durable.
+fn count_held_back(state: &mut ShardState, volume: [u8; 16]) {
+  let Some(live) = state.live.shipping.get(&volume) else {
+    return;
+  };
+  let Some(durable) = live.shipper.durable() else {
+    return;
+  };
+  let whole = live.whole.as_ref().map(|(head, _)| head.position);
+  let why = if !head_placed(state, volume) {
+    LIVE_HELD_BACK_PLACEMENT
+  } else if !covers_candidates(state, volume) {
+    LIVE_HELD_BACK_KEYS
+  } else if whole.is_none_or(|whole| durable < whole) {
+    LIVE_HELD_BACK_WHOLE
+  } else {
+    return;
+  };
+  state.count(why, 1);
+}
+
+/// Counter: a durable live log whose writers wait because the fleet does not know the volume yet (its head unplaced).
+const LIVE_HELD_BACK_PLACEMENT: &str = "fleet.live.held_back.placement";
+/// Counter: a durable live log whose writers wait because its last whole entry lacks a candidate's key.
+const LIVE_HELD_BACK_KEYS: &str = "fleet.live.held_back.keys";
+/// Counter: a durable live log whose writers wait because its last whole entry is not durable yet.
+const LIVE_HELD_BACK_WHOLE: &str = "fleet.live.held_back.whole";
+
 /// The content of every extent `record`'s inode images name, read through the volume (sealed chunks open into the
 /// buffer, A-99). `None` when a read is refused: the entry would be missing bytes, so it is not made.
 fn content_runs(
@@ -1030,7 +1134,8 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
   let object = ObjectId(volume);
   let mut sends = Vec::new();
   let mut stale_checkpoint = false;
-  for holder in live.shipper.holders() {
+  let targets: Vec<HostId> = live.shipper.targets().collect();
+  for holder in &targets {
     match live.shipper.pending(*holder) {
       Next::Entries(entries) => {
         for entry in entries {
@@ -1300,6 +1405,10 @@ pub(crate) async fn period(origin: u16, shard: u16) {
       // A volume that owes a whole record ships one once its credit allows: a burst that outran the credit left its
       // last writes unshipped until another write came, and none might (three of five writes, `live_fleet`).
       for volume in &volumes {
+        follow_candidates(s, *volume);
+        // A writer may wait on a condition that changes with no acknowledgement to fold (the head placed once its
+        // neighbourhood settles, a pair delivered): answered here at the latest.
+        resolve(s, *volume);
         // A log whose last whole entry no successor among the candidates could open is checkpointed again once this
         // shard has delivered the pairs that would let it ([`covers_candidates`]).
         if !covers_candidates(s, *volume)

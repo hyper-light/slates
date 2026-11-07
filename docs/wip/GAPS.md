@@ -1,5 +1,15 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Fixed (live-fixes, 2026-11-07): a live shipper made before its candidates were known shipped to nobody** (A-200's
+> amendment of that date). A shipper kept the holders of its first publication, so a live volume made on a fleet's
+> bootstrap node stood at `durable=none` for good (the Linux conformance pair, diag run 42325923902). Its holders now
+> follow the candidates by a joint transition (ship to both sets, count durability over each, switch once the new set
+> holds every durable write and the record names it). The first fix, replacing the holders outright, was unsafe
+> (raft-chaos); the model shows it (the record-at-once mutation breaks NoLoss) and 0 of 400 seeds broken under the
+> joint rule. **For raft-chaos:** the record that names each target is A-240's; until it lands the daemon activates
+> against the configuration's candidates. A successor must record the set its takeover counted, not its configuration's
+> candidates when they differ. Bug record `docs/bugs/2026-11-07-a-live-shipper-made-before-its-candidates-were-known-shipped-to-nobody.md`.
+
 > **Fixed (live-fixes, 2026-11-06 and 07): a daemon restarted under its anchor never rejoined its fleet (raft-chaos
 > report 8).** The successor keeps the member id; the other nodes hold that id dead. Its restarted plane epochs were
 > refused as not newer (`fleet.plane.epoch_refused.install`), and a canonical dialer holding it dead never dialed it again

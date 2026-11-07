@@ -5774,6 +5774,13 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > unauthorized before checking its fence, so that owner never learned it was fenced and shipped on. The fence is now
 > checked first.
 >
+> **Holders follow the candidates (2026-11-07, A-200's amendment of that date).** The shipper's holder set changes by a
+> joint transition (`Shipper::begin_transition`, `transferred`, `activate`); the daemon begins one whenever the
+> configuration names other candidates for the volume (`fleet.live.holders_transition`) and switches once the new set
+> holds every durable write (`fleet.live.holders_activated`). The model runs the same nemesis over `4f + 1` hosts with
+> the configuration naming random candidate sets: 0 of 400 seeds broken, 3,622 activations, 599 of them keeping fewer
+> than `f` of the old holders.
+>
 > **On the transport (2026-11-04).** `crates/cluster/src/live.rs`: `ship` sends an entry or install to each holder
 > over its warm session (kinds 22 and 23) and folds the replies until the write is durable, through the
 > wake-on-reply collector; `serve_entry` and `serve_install` are the holder's answer. Measured over real loopback
@@ -14041,6 +14048,30 @@ Then the real transport, measured; then the daemon and real processes under chao
 
 **Applied in the same change to:** this log only. §4.10's "Live shipping" paragraph, AC-8.3 and AC-8.9 are read
 through it; their status notes follow each built slice.
+
+**Amended 2026-11-07 (live-fixes): a log's holders follow its candidates by a joint transition.** A shipper kept the
+holders its configuration named at its first publication. A volume made on a fleet's bootstrap node therefore shipped
+to nobody for good (its configuration named only itself), and a neighbourhood change or a takeover left a log shipping
+to hosts that were no longer its candidates. Replacing the holders outright is unsafe: a new set that shares fewer than
+`f` members with the old holds none of the durable writes, so a takeover counting it adopts a head without them. The
+holder set now changes as Vertical Paxos changes a configuration (Lamport, Malkhi and Zhou, PODC 2009):
+
+- `Shipper::begin_transition(next)` ships to the holders and to `next`, and counts a position durable only once `f` of
+  each set hold it, so whichever set the record names when a takeover reads it, `f + 1` of its reports meet every
+  durable write.
+- `Shipper::transferred` holds once `f` of `next` hold the durable position and the head the shipper started from (a
+  successor's start holds writes made durable under the owner it took over, which its own count has not seen).
+- The record may name `next` only then, and `Shipper::activate(recorded)` switches once it does. A transferred target is
+  kept against a later change until activated, since its record may be in flight.
+- A successor's holders are the set its takeover counted, less itself, with the lost owner; it moves to its
+  configuration's candidates by a transition of its own.
+
+The record is A-240's (raft-chaos: the shipper records its holders in the volume's catalog and phase one counts them).
+Until it lands the daemon activates against the configuration's candidates, which phase one counts today. Model:
+`crates/db/tests/live.rs` with `Following` (400 seeds, 0 broken under the rule; the record-at-once and fixed-holder
+mutations broken). Bug record `docs/bugs/2026-11-07-a-live-shipper-made-before-its-candidates-were-known-shipped-to-nobody.md`.
+**Applied in the same change to:** `crates/db/src/live.rs`, `crates/server/src/live_ship.rs`, §4.10's live-shipping
+status, GAPS.
 
 ### A-212 — What a live WinFsp receive reads and clears, and what a rename visits (2026-11-05)
 

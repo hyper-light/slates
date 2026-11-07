@@ -83,6 +83,9 @@ struct Owner {
   superseded: Option<(Option<Head>, Vec<u64>)>,
   /// Set once a holder's reply told it a later fence: it stops.
   fenced: bool,
+  /// The holder set the volume's record names for this owner's log (with `following`): its shipper's holders at its
+  /// making, then each transition target the record names. Phase one counts it under `Following::Joint`.
+  recorded: Vec<HostId>,
 }
 
 struct Holder {
@@ -94,6 +97,22 @@ struct Holder {
   configured: HostId,
   state: Vec<u64>,
   alive: bool,
+}
+
+/// How an owner's shipper follows the configuration when it names new candidates for the volume, and which holder set
+/// phase one counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Following {
+  /// The design (Vertical Paxos): the shipper begins a transition to the candidates named, ships to both sets and counts
+  /// durability over each; the record names the new set only once it holds every durable entry, and phase one counts the
+  /// set the record names.
+  Joint,
+  /// A mutation: the record names the new candidates at once, as replacing the shipper's holders outright did, so phase
+  /// one counts a set that may hold none of the durable entries.
+  RecordAtOnce,
+  /// A mutation, the daemon before 2026-11-07: the shipper keeps the holders it was made with, and phase one counts the
+  /// configuration's candidates.
+  Fixed,
 }
 
 /// What phase one does with a candidate that holds no copy of the log.
@@ -163,6 +182,16 @@ struct Run {
   /// Phase one's reports counted from candidates that held no copy.
   empty_reports: u64,
   rule: EmptyReport,
+  /// How the shipper follows the configuration's candidates (`None`: the configuration never changes them).
+  following: Option<Following>,
+  /// The current owner's other candidates as the configuration names them now (with `following` only).
+  configuration: Vec<HostId>,
+  /// The times the configuration named a new candidate set.
+  reconfigurations: u64,
+  /// The times the record named a transition's target and the shipper activated it.
+  activations: u64,
+  /// Of those, the ones whose target kept fewer than `f` of the holders it replaced.
+  activations_past_the_overlap: u64,
   /// Whether the history is printed as it happens ([`Run::traced`]): what each step did that bears on the invariants.
   traced: bool,
 }
@@ -206,6 +235,7 @@ impl Run {
         state: Vec::new(),
         superseded: None,
         fenced: false,
+        recorded: Vec::new(),
       }],
       current: 0,
       network: Vec::new(),
@@ -219,8 +249,50 @@ impl Run {
       stale_refusals: 0,
       empty_reports: 0,
       rule,
+      following: None,
+      configuration: Vec::new(),
+      reconfigurations: 0,
+      activations: 0,
+      activations_past_the_overlap: 0,
       traced: false,
     }
+  }
+
+  /// This run with the configuration naming new candidates as it goes (`following` says how the shipper follows), over
+  /// `4f + 1` hosts so a new set can share fewer than `f` members with the old. Half the runs start as a volume made on
+  /// a fleet's bootstrap node: its configuration names no other candidate, and its shipper has no holders.
+  fn following(mut self, following: Following) -> Run {
+    let owner = self.owners[0].host;
+    let first = u64::try_from(self.hosts.len()).unwrap() + 1;
+    for host in (first..=4 * self.f + 1).map(HostId) {
+      self.hosts.push(host);
+      self.holders.insert(
+        host,
+        Holder {
+          replica: None,
+          configured: owner,
+          state: Vec::new(),
+          alive: true,
+        },
+      );
+    }
+    self.following = Some(following);
+    self.configuration = if self.rng.chance(500) {
+      Vec::new()
+    } else {
+      self.owners[0].shipper.holders().to_vec()
+    };
+    self.owners[0].shipper = Shipper::new(
+      (owner, OBJECT, HostEpoch(1)),
+      Quorum {
+        f: u32::try_from(self.f).unwrap(),
+      },
+      &self.configuration,
+      None,
+      (8, 16),
+    );
+    self.owners[0].recorded.clone_from(&self.configuration);
+    self
   }
 
   /// This run with its history kept, for a failing seed's record.
@@ -280,7 +352,7 @@ impl Run {
           "an owner's state is one value per position"
         );
         let from = owner.host;
-        let holders = owner.shipper.holders().to_vec();
+        let holders: Vec<HostId> = owner.shipper.targets().collect();
         let epoch = owner.shipper.epoch().0;
         self.note(|| {
           format!(
@@ -303,7 +375,10 @@ impl Run {
     if self.owners[index].fenced {
       return;
     }
-    let holders = self.owners[index].shipper.holders().to_vec();
+    if index == self.current {
+      self.follow();
+    }
+    let holders: Vec<HostId> = self.owners[index].shipper.targets().collect();
     for holder in holders {
       let next = self.owners[index].shipper.pending(holder);
       self.send_next(index, holder, next);
@@ -445,7 +520,11 @@ impl Run {
       .hosts
       .iter()
       .copied()
-      .filter(|host| *host != old_host && self.holders.get(host).is_some_and(|holder| holder.alive))
+      .filter(|host| {
+        *host != old_host
+          && self.holders.get(host).is_some_and(|holder| holder.alive)
+          && (self.following.is_none() || self.configuration.contains(host))
+      })
       .collect();
     let Some(successor) = candidates.get(self.rng.below(candidates.len())).copied() else {
       return;
@@ -457,14 +536,13 @@ impl Run {
         !self.cut.contains(&(successor, *host)) && !self.cut.contains(&(*host, successor))
       })
       .collect();
-    let needed = usize::try_from(self.f + 1).unwrap();
-    if reachable.len() < needed {
+    let Some(asked) = self.phase_one_asked(old, successor, &reachable) else {
       return;
-    }
+    };
     self.epoch += 1;
     let epoch = HostEpoch(self.epoch);
     let mut reports = Vec::new();
-    for host in reachable.iter().take(needed) {
+    for host in &asked {
       let holder = self.holders.get_mut(host).unwrap();
       let report = match (&mut holder.replica, self.rule) {
         (Some(replica), _) => replica.prepare(epoch).unwrap(),
@@ -513,17 +591,32 @@ impl Run {
     // Phase one's participants learn the successor at once; the other holders learn it later from the configuration
     // (`learn`), and until then only their fence, if a takeover raised it, stands between them and the superseded
     // owner.
-    for host in reachable.iter().take(needed) {
+    for host in &asked {
       if let Some(replica) = &mut self.holders.get_mut(host).unwrap().replica {
         replica.reassign(successor);
       }
     }
     // The successor serves from the adopted state; it holds it (as a holder, it fetched it from the adopted replica).
     let successor_holder = self.holders.remove(&successor).unwrap();
-    let mut holders: Vec<HostId> = self.holders.keys().copied().collect();
-    holders.retain(|host| *host != successor);
+    // With `following`, the successor's holders are the set the takeover counted, less itself: what the durable
+    // writes are held by. The configuration's candidates may be a set the old owner was still moving to, which holds
+    // none of them; the successor moves to it by a transition of its own.
+    let mut holders: Vec<HostId> = match self.following {
+      None => self.holders.keys().copied().collect(),
+      Some(Following::Joint) => self.owners[old].recorded.clone(),
+      Some(Following::RecordAtOnce | Following::Fixed) => self.configuration.clone(),
+    };
+    holders.retain(|host| *host != successor && *host != old_host);
     // The old owner was a candidate; it is gone, but stays in the holder list as a dead candidate it ships to.
     holders.push(old_host);
+    if self.following.is_some() {
+      // The successor's configuration names the same candidates less itself, with the lost owner until it is retired.
+      self
+        .configuration
+        .retain(|host| *host != successor && *host != old_host);
+      self.configuration.push(old_host);
+      self.configuration.sort_unstable();
+    }
     self.holders.insert(
       old_host,
       Holder {
@@ -549,9 +642,135 @@ impl Run {
       state,
       superseded: None,
       fenced: false,
+      recorded: holders,
     });
     self.current = self.owners.len() - 1;
     self.takeovers += 1;
+  }
+
+  /// Phase one's asked hosts: without `following`, the first `f + 1` reachable candidates, all counted. With it, every
+  /// reachable live host the configuration or the record names, of which `f + 1` must be in the holder set the record
+  /// names for the owner being taken over ([`Following`]); `None` when too few are.
+  fn phase_one_asked(
+    &self,
+    old: usize,
+    successor: HostId,
+    reachable: &[HostId],
+  ) -> Option<Vec<HostId>> {
+    let needed = usize::try_from(self.f + 1).unwrap();
+    let Some(following) = self.following else {
+      return (reachable.len() >= needed).then(|| reachable.iter().copied().take(needed).collect());
+    };
+    let recorded: Vec<HostId> = match following {
+      Following::Joint => self.owners[old].recorded.clone(),
+      Following::RecordAtOnce | Following::Fixed => self.configuration.clone(),
+    };
+    let old_host = self.owners[old].host;
+    let asked: Vec<HostId> = self
+      .hosts
+      .iter()
+      .copied()
+      .filter(|host| {
+        *host != old_host
+          && (recorded.contains(host) || self.configuration.contains(host))
+          && self.holders.get(host).is_some_and(|holder| holder.alive)
+          && !self.cut.contains(&(successor, *host))
+          && !self.cut.contains(&(*host, successor))
+      })
+      .collect();
+    let counted = asked.iter().filter(|host| recorded.contains(host)).count();
+    (counted >= needed).then_some(asked)
+  }
+
+  /// The configuration names a new candidate set for the volume: `2f` hosts other than the owner, drawn at random (any
+  /// overlap with the old set, none included), or now and then none at all.
+  fn reconfigure(&mut self) {
+    let owner = self.owners[self.current].host;
+    let mut others: Vec<HostId> = self
+      .hosts
+      .iter()
+      .copied()
+      .filter(|host| *host != owner)
+      .collect();
+    let mut next = Vec::new();
+    if !self.rng.chance(100) {
+      while u64::try_from(next.len()).unwrap() < 2 * self.f && !others.is_empty() {
+        let at = self.rng.below(others.len());
+        next.push(others.swap_remove(at));
+      }
+    }
+    next.sort_unstable();
+    let named = format!("{next:?}");
+    self.note(|| format!("the configuration names candidates {named}"));
+    self.configuration = next;
+    self.reconfigurations += 1;
+    self.follow();
+  }
+
+  /// The current owner's shipper follows the configuration's candidates (`Following::Fixed` never does).
+  fn follow(&mut self) {
+    if matches!(
+      self.following,
+      Some(Following::Joint | Following::RecordAtOnce)
+    ) {
+      let named = self.configuration.clone();
+      let owner = &mut self.owners[self.current];
+      owner.shipper.begin_transition(&named);
+      if self.following == Some(Following::RecordAtOnce) {
+        owner.recorded = named;
+      }
+    }
+  }
+
+  /// The record names the current shipper's transition target once it holds every durable entry
+  /// ([`Shipper::transferred`]). From then on phase one counts the target; the shipper activates it later
+  /// ([`Run::activate`]), when it learns the record is placed.
+  fn record(&mut self) {
+    if self.following != Some(Following::Joint) {
+      return;
+    }
+    let owner = &mut self.owners[self.current];
+    if !owner.shipper.transferred() {
+      return;
+    }
+    let Some(next) = owner.shipper.transition().map(<[HostId]>::to_vec) else {
+      return;
+    };
+    if owner.recorded != next {
+      owner.recorded.clone_from(&next);
+      let named = format!("{next:?}");
+      self.note(|| format!("the record names holders {named}"));
+    }
+  }
+
+  /// The current shipper learns the record names its transition's target, and activates it.
+  fn activate(&mut self) {
+    if !matches!(
+      self.following,
+      Some(Following::Joint | Following::RecordAtOnce)
+    ) {
+      return;
+    }
+    let f = self.f;
+    let owner = &mut self.owners[self.current];
+    let recorded = owner.recorded.clone();
+    if owner.shipper.transition() != Some(recorded.as_slice()) {
+      return;
+    }
+    let kept = owner
+      .shipper
+      .holders()
+      .iter()
+      .filter(|host| recorded.contains(host))
+      .count();
+    if owner.shipper.activate(&recorded) {
+      self.activations += 1;
+      if u64::try_from(kept).unwrap() < f {
+        self.activations_past_the_overlap += 1;
+      }
+      let named = format!("{recorded:?}");
+      self.note(|| format!("the shipper activates holders {named}"));
+    }
   }
 
   /// A holder learns the current configuration: the current owner and its epoch.
@@ -575,6 +794,15 @@ impl Run {
     if let Some(host) = live.get(self.rng.below(live.len())) {
       self.holders.get_mut(host).unwrap().alive = false;
       self.lost += 1;
+    }
+  }
+
+  /// Cuts a random pair of hosts apart, or heals it if it was cut.
+  fn toggle_cut(&mut self) {
+    let a = self.hosts[self.rng.below(self.hosts.len())];
+    let b = self.hosts[self.rng.below(self.hosts.len())];
+    if a != b && !self.cut.remove(&(a, b)) {
+      self.cut.insert((a, b));
     }
   }
 
@@ -602,13 +830,7 @@ impl Run {
         }
       }
       79..=83 => self.tick(self.current),
-      84..=86 => {
-        let a = self.hosts[self.rng.below(self.hosts.len())];
-        let b = self.hosts[self.rng.below(self.hosts.len())];
-        if a != b && !self.cut.remove(&(a, b)) {
-          self.cut.insert((a, b));
-        }
-      }
+      84..=86 => self.toggle_cut(),
       87..=89 => {
         // A superseded owner keeps writing and re-shipping.
         let stale: Vec<usize> = (0..self.owners.len())
@@ -625,6 +847,9 @@ impl Run {
       90..=91 if self.lost < self.f => self.take_over(),
       93..=95 => self.learn(),
       92 if self.lost < self.f => self.crash_holder(),
+      96 if self.following.is_some() => self.reconfigure(),
+      97 => self.record(),
+      98 => self.activate(),
       _ => {}
     }
   }
@@ -633,9 +858,17 @@ impl Run {
   fn settle(&mut self) {
     self.cut.clear();
     self.everyone_learns();
-    // Messages of superseded owners are still delivered: they must change nothing.
-    for _ in 0..10_000 {
+    while self.following.is_some() && u64::try_from(self.configuration.len()).unwrap() < 2 * self.f
+    {
+      self.reconfigure();
+    }
+    // Messages of superseded owners are still delivered: they must change nothing. The budget covers the backlog in
+    // flight at the heal on top of the steps to converge: a run whose candidates changed often heals with thousands of
+    // re-sends in flight (6,160 in one f = 2 run), which a bare 10,000 never drained.
+    for _ in 0..self.network.len() + 10_000 {
       if self.network.is_empty() {
+        self.record();
+        self.activate();
         self.tick(self.current);
         if self.network.is_empty() {
           break;
@@ -643,9 +876,16 @@ impl Run {
       }
       let at = self.rng.below(self.network.len());
       self.deliver(at);
+      // The daemon's period records and follows whatever the network holds.
+      self.record();
+      self.activate();
+      self.follow();
       if self.converged() {
         break;
       }
+    }
+    if !self.converged() {
+      self.note(|| self.convergence_state());
     }
     assert!(
       self.converged(),
@@ -661,6 +901,46 @@ impl Run {
     }
   }
 
+  /// The current owner's shipper and every candidate's copy, for a history that did not converge.
+  fn convergence_state(&self) -> String {
+    let owner = &self.owners[self.current];
+    let shipper = &owner.shipper;
+    let mut out = format!(
+      "unconverged: {} messages in flight; owner host {} head {:?} durable {:?} holders {:?} transition {:?} transferred {} \
+       configuration {:?}",
+      self.network.len(),
+      owner.host.0,
+      shipper.head().map(|head| (head.epoch.0, head.position)),
+      shipper.durable(),
+      shipper.holders(),
+      shipper.transition(),
+      shipper.transferred(),
+      self.configuration
+    );
+    for (host, holder) in &self.holders {
+      out.push_str(&format!(
+        "\n    host {} alive {} configured {} copy {:?} fence {:?} held_by {:?} pending {:?}",
+        host.0,
+        holder.alive,
+        holder.configured.0,
+        holder
+          .replica
+          .as_ref()
+          .and_then(Replica::head)
+          .map(|head| (head.epoch.0, head.position)),
+        holder.replica.as_ref().map(|replica| replica.fence().0),
+        shipper
+          .held_by(*host)
+          .map(|head| (head.epoch.0, head.position)),
+        match shipper.pending(*host) {
+          Next::Entries(entries) => format!("{} entries", entries.len()),
+          other => format!("{other:?}"),
+        }
+      ));
+    }
+    out
+  }
+
   /// Every holder learns the current configuration, as the configuration group's commit reaches each in the end.
   fn everyone_learns(&mut self) {
     let owner = self.owners[self.current].host;
@@ -670,16 +950,29 @@ impl Run {
     }
   }
 
+  /// Every live holder holds the owner's state. With `following`, the holders are the configuration's live candidates,
+  /// the record names them, and the owner knows each holds its head, so every write is durable.
   fn converged(&self) -> bool {
     let owner = &self.owners[self.current];
-    self
+    let following = self.following.is_some();
+    let holders_converged = self
       .holders
       .iter()
-      .filter(|(host, holder)| holder.alive && **host != owner.host)
-      .all(|(_, holder)| {
+      .filter(|(host, holder)| {
+        holder.alive && **host != owner.host && (!following || self.configuration.contains(host))
+      })
+      .all(|(host, holder)| {
         holder.state == owner.state
           && holder.replica.as_ref().and_then(Replica::head) == owner.shipper.head()
-      })
+          && (!following || owner.shipper.held_by(*host) == owner.shipper.head())
+      });
+    holders_converged
+      && (!following
+        || ({
+          let mut holders = owner.shipper.holders().to_vec();
+          holders.sort_unstable();
+          holders == self.configuration
+        } && owner.shipper.durable() == owner.shipper.head().map(|head| head.position)))
   }
 }
 
@@ -843,6 +1136,260 @@ fn a_refused_entry_is_never_counted_as_held() {
     shipper.durable(),
     Some(1),
     "the other holder's acknowledgement does"
+  );
+}
+
+/// A-200: a shipper made before its candidates were known ships to them once they are named. Do make the owner's
+/// shipper with no holders (a volume made on a fleet's bootstrap node, whose configuration named only itself), append two
+/// entries, then begin a transition to the two candidates. Expect nothing durable before or during it (no holder is
+/// recorded yet), each candidate owed every entry, the target transferred at once (nothing is durable), and the log
+/// durable once the record names the candidates and one of them holds the entries. Found by the Linux conformance pair
+/// (diag run 42325923902): such a log stood at head=2 durable=none for a whole fsx run.
+#[test]
+fn a_shipper_made_before_its_candidates_were_known_ships_to_them_once_named() {
+  let hosts = [HostId(1), HostId(2), HostId(3)];
+  let mut shipper = Shipper::new(
+    (hosts[0], OBJECT, HostEpoch(1)),
+    Quorum { f: 1 },
+    &hosts[..1],
+    None,
+    (4, 8),
+  );
+  let first = shipper.append(vec![1]).unwrap();
+  let second = shipper.append(vec![2]).unwrap();
+  assert_eq!(
+    (shipper.durable(), shipper.pending(hosts[1])),
+    (None, Next::Nothing),
+    "no holder, nothing durable, nothing owed"
+  );
+  assert_eq!(
+    (
+      shipper.begin_transition(&hosts),
+      shipper.begin_transition(&hosts)
+    ),
+    (true, false),
+    "the candidates are named; naming them again changes nothing"
+  );
+  let everything = Next::Entries(vec![first.clone(), second.clone()]);
+  assert_eq!(
+    (shipper.pending(hosts[1]), shipper.pending(hosts[2])),
+    (everything.clone(), everything),
+    "a newly named holder is owed every entry"
+  );
+  shipper.on_reply(hosts[1], Ok(held_after(hosts[0], &[first, second])));
+  assert_eq!(
+    (shipper.durable(), shipper.transferred()),
+    (None, true),
+    "nothing is durable before the record names the candidates, since the empty recorded set holds nothing; so \
+     nothing needs transferring"
+  );
+  assert!(shipper.activate(&hosts[1..]), "the record names them");
+  assert_eq!(
+    (shipper.holders(), shipper.transition(), shipper.durable()),
+    (&hosts[1..], None, Some(1)),
+    "durable once the recorded holder holds them"
+  );
+}
+
+/// The head a fresh holder of `owner`'s log holds after accepting `entries` in order.
+fn held_after(owner: HostId, entries: &[Entry]) -> Option<Head> {
+  let mut replica = Replica::new(owner, OBJECT);
+  let mut held = None;
+  for entry in entries {
+    held = replica.accept(entry).unwrap();
+  }
+  held
+}
+
+/// A-200, Vertical Paxos: a change of holder set to one that shares no member with the old counts durability over
+/// both until the record names the new one. Do ship two entries durable on holders `{2, 3}`, begin a transition to
+/// `{4, 5}`, and ship a third. Expect the third not durable while only an old holder holds it, the target not
+/// transferred while no new holder holds the first two, the record's naming refused until one does, the target kept
+/// against a later change once transferred, and every durable position held by `f` of whichever set the record names.
+#[test]
+fn a_new_holder_set_counts_only_once_it_holds_every_durable_entry() {
+  let hosts = [HostId(1), HostId(2), HostId(3), HostId(4), HostId(5)];
+  let mut shipper = Shipper::new(
+    (hosts[0], OBJECT, HostEpoch(1)),
+    Quorum { f: 1 },
+    &hosts[..3],
+    None,
+    (8, 8),
+  );
+  let entries = [
+    shipper.append(vec![1]).unwrap(),
+    shipper.append(vec![2]).unwrap(),
+  ];
+  shipper.on_reply(hosts[1], Ok(held_after(hosts[0], &entries)));
+  assert_eq!(
+    (shipper.durable(), shipper.begin_transition(&hosts[3..])),
+    (Some(1), true)
+  );
+  assert_eq!(
+    shipper.targets().collect::<Vec<_>>(),
+    vec![hosts[1], hosts[2], hosts[3], hosts[4]],
+    "it ships to both sets"
+  );
+  assert_eq!(
+    (shipper.transferred(), shipper.activate(&hosts[3..])),
+    (false, false),
+    "no new holder holds the durable entries, so the record may not name the new set"
+  );
+  let third = shipper.append(vec![3]).unwrap();
+  let all = [entries[0].clone(), entries[1].clone(), third];
+  shipper.on_reply(hosts[1], Ok(held_after(hosts[0], &all)));
+  assert_eq!(
+    (shipper.durable(), shipper.pending(hosts[3])),
+    (Some(1), Next::Entries(all.to_vec())),
+    "the third waits for the new set as well, and a new holder is owed every retained entry"
+  );
+  shipper.on_reply(hosts[3], Ok(held_after(hosts[0], &all[..2])));
+  assert_eq!(
+    (
+      shipper.transferred(),
+      shipper.begin_transition(&hosts[1..3])
+    ),
+    (true, false),
+    "a new holder holds the durable entries; a transferred target is kept, since its record may be in flight"
+  );
+  shipper.on_reply(hosts[3], Ok(held_after(hosts[0], &all)));
+  assert_eq!(
+    (
+      shipper.durable(),
+      shipper.activate(&hosts[1..3]),
+      shipper.activate(&hosts[3..])
+    ),
+    (Some(2), false, true),
+    "held by f of each set; only the target is activated"
+  );
+  assert_eq!(
+    (
+      shipper.holders(),
+      shipper.durable(),
+      shipper.pending(hosts[1])
+    ),
+    (&hosts[3..], Some(2), Next::Nothing),
+    "the durable position never falls, and a holder no longer named is shipped nothing"
+  );
+}
+
+/// What a nemesis run under [`Following`] counted: reconfigurations, activations, activations past the overlap,
+/// takeovers, durable positions.
+type FollowingCounts = (u64, u64, u64, u64, u64);
+
+/// A broken seed: its `f`, its seed, and the failed check's message.
+type BrokenSeed = (u64, u64, String);
+
+/// Runs the nemesis with the configuration naming new candidates under `following`, at `f = 1` and `f = 2` over every
+/// seed: the broken seeds with their messages, and the totals (reconfigurations, activations, activations past the
+/// overlap, takeovers, durable positions) of the passing ones.
+fn run_following(following: Following) -> (Vec<BrokenSeed>, FollowingCounts) {
+  let mut broken = Vec::new();
+  let mut totals = (0, 0, 0, 0, 0);
+  for f in [1, 2] {
+    for seed in 0..SEEDS {
+      let outcome = std::panic::catch_unwind(|| {
+        let mut run = Run::new(f, seed, EmptyReport::FenceAndCount).following(following);
+        for _ in 0..STEPS {
+          run.step();
+        }
+        run.settle();
+        (
+          run.reconfigurations,
+          run.activations,
+          run.activations_past_the_overlap,
+          run.takeovers,
+          u64::try_from(run.durable.len()).unwrap(),
+        )
+      });
+      match outcome {
+        Ok(counts) => {
+          totals.0 += counts.0;
+          totals.1 += counts.1;
+          totals.2 += counts.2;
+          totals.3 += counts.3;
+          totals.4 += counts.4;
+        }
+        Err(panic) => {
+          let message = panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+            .unwrap_or_default();
+          broken.push((f, seed, message));
+        }
+      }
+    }
+  }
+  eprintln!(
+    "{following:?}: {} broken seeds, first {:?}; passing seeds: {} reconfigurations, {} activations ({} keeping fewer \
+     than f holders), {} takeovers, {} durable positions",
+    broken.len(),
+    broken.first(),
+    totals.0,
+    totals.1,
+    totals.2,
+    totals.3,
+    totals.4
+  );
+  if let Some((f, seed, _)) = broken.first().cloned() {
+    eprintln!("history of f={f} seed {seed}:");
+    let _ = std::panic::catch_unwind(|| {
+      let mut run = Run::new(f, seed, EmptyReport::FenceAndCount)
+        .following(following)
+        .traced();
+      for _ in 0..STEPS {
+        run.step();
+      }
+      run.settle();
+    });
+  }
+  (broken, totals)
+}
+
+/// A-200 with the candidates changing: do run the nemesis while the configuration names new candidate sets for the
+/// volume (any overlap with the old, none included, and now and then none; half the runs start with no candidate, as a
+/// volume made on a fleet's bootstrap node), the shipper following by a joint transition the record names once the new
+/// set holds every durable entry, at `f = 1` and `f = 2`. Expect every history to hold Agreement, NoLoss,
+/// StaleNeverCommits and Convergence over the configuration's candidates with every write durable; and, so the run is
+/// not vacuous, sets activated that kept fewer than `f` of the old holders, takeovers, and durable writes.
+#[test]
+fn a_live_logs_holders_follow_its_candidates_through_a_joint_transition() {
+  let (broken, (reconfigurations, activations, past_the_overlap, takeovers, durable)) =
+    run_following(Following::Joint);
+  assert!(broken.is_empty(), "joint transition: {broken:?}");
+  assert!(
+    reconfigurations > 0 && activations > 0 && past_the_overlap > 0 && takeovers > 0 && durable > 0
+  );
+}
+
+/// The mutation of the replace rule, kept as a test: do run the same nemesis with the record naming each new candidate
+/// set at once, before it holds the durable entries. Expect a history to break NoLoss, StaleNeverCommits or Agreement:
+/// a takeover counts a set that never held what was durable.
+#[test]
+fn recording_a_new_holder_set_before_it_holds_the_log_loses_durable_writes() {
+  let (broken, _) = run_following(Following::RecordAtOnce);
+  assert!(
+    broken.iter().any(|(_, _, message)| {
+      message.contains("NoLoss")
+        || message.contains("StaleNeverCommits")
+        || message.contains("Agreement")
+    }),
+    "recorded at once: {broken:?}"
+  );
+}
+
+/// The daemon before 2026-11-07, kept as a test: do run the same nemesis with the shipper keeping the holders it was
+/// made with. Expect a history to fail: the configuration's new candidates never receive the log (Convergence), or a
+/// takeover counting them adopts a head without the durable writes (NoLoss).
+#[test]
+fn a_shipper_that_keeps_its_first_holders_never_reaches_new_candidates() {
+  let (broken, _) = run_following(Following::Fixed);
+  assert!(
+    broken
+      .iter()
+      .any(|(_, _, message)| message.contains("Convergence") || message.contains("NoLoss")),
+    "fixed holders: {broken:?}"
   );
 }
 
