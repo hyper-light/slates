@@ -1177,6 +1177,12 @@ impl Client {
     self.end.park_ratio()
   }
 
+  /// The client's ring slots: the requests it may hold in flight, and half the completion records the daemon keeps
+  /// for it unacknowledged (§4.9; the server's `completion_bound` is twice this).
+  pub fn ring_slots(&self) -> usize {
+    self.end.region().cmd().slots()
+  }
+
   /// Parks a wake ended with no reply waiting, so the client parked again.
   pub fn unanswered_wakes(&self) -> u64 {
     self.end.unanswered_wakes()
