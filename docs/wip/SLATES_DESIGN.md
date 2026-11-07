@@ -6028,6 +6028,46 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > it still fits, since no publication is larger than the volume. After: 768 writes answered, 4 whole records, no
 > refusal for the bound.
 >
+> **One lane a holder, only to holders of the catalog, and no session left with a cancelled request (2026-11-07).**
+> The dispatch round (`live_ship::dispatch`, `send_from_control`) now ships the way the record plane's sessions allow.
+> - *One lane a holder, the holders at once.* A dispatch sent a write's messages to the holders one after another, and
+>   folded their answers only once every holder's exchange had ended, so with one candidate stopped every write it
+>   carried waited for that candidate's exchange to give up. Now each holder has one lane, a dispatch's lanes run
+>   together on the control shard, each lane's answers are folded on the owner as its exchange ends, and a holder whose
+>   lane is shipping is sent nothing new until the lane ends (`lane_ended`), then what it lacks: only that holder's, and
+>   only when it answered. Sending every holder's let two holders with no link (both stopped) end each other's lanes
+>   at the shards' speed, 565,202 unanswered sends in one stop (`both_candidates_stopped_draw_no_storm_of_sends`).
+> - *Only to holders of the catalog.* A candidate derives what it keeps of a live log from the volume's catalog, which
+>   the record plane places within a record period; an entry sent before was refused
+>   (`fleet.live.hold_refused.no_catalog`), and installs drawn by it held the candidate's one session against the record
+>   plane's re-ship of that catalog. The owner now ships to the candidates any placement of the catalog named
+>   (`catalogued_holders`), kept as a union so a candidate away during one round is not dropped for good, and builds
+>   nothing for a holder whose lane is busy (an install clones the whole volume).
+> - *No session left with a cancelled request.* An exchange's requests are children of the task that made it, and a
+>   task's end cancels its children: a request still in flight when its lane ended was dropped with the holder's
+>   session in it, and the slot stayed lent for good, so the owner never shipped that holder again. A lane now waits for
+>   its exchange's stragglers to report before it ends (`finish_stragglers`).
+> Held by two failing tests in `crates/cli/tests/live_fleet.rs`, run on four trees (CI, release, both Linux arches, 5
+> runs each, `diag-live-durability-21`):
+> | tree | `each_candidate_stopped_in_turn_holds_no_write_and_catches_up` | `a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog` |
+> |---|---|---|
+> | main | 0 of 10 (the first write after each stop 406–1,064 ms) | 1 of 10 |
+> | one lane a holder | 10 of 10 (2.8–99.5 ms) | 1 of 10 |
+> | and only to catalog holders | 10 of 10 | 10 of 10 |
+> | and the stragglers' wait | 10 of 10 | 10 of 10 |
+> And `both_candidates_stopped_draw_no_storm_of_sends`: main 10 of 10 (30–58 unanswered sends while both are stopped),
+> the lanes without the rule above 8 of 10 (565,202 and 555,320 in the two failures), the whole series 10 of 10 (17–42,
+> bound 66; `diag-live-durability-24`).
+> On KIND (raft-chaos, release, real pods), main stalled with both of the owner's sessions `lent=true` (run
+> 42318867890: `wan` at durable 123 of 126, `wan-loss` 199 of 202, `ceiling` 0 of 3). The lanes with the catalogued
+> holders alone acknowledged every write in every profile (run 42357764313: `wan` p99 979 ms, max 1.59 s), and so did
+> the lanes with the stragglers' wait (run 42326682216: `wan` p99 1.36 s). So KIND does not separate the stragglers'
+> wait's own effect, and it has no local failing test: the stranding needs a request still in flight as its lane ends.
+> What argues for it is the mechanism (a cancelled child drops the session it holds) and `live_chaos`'s rolling
+> partition: 3 of 10 runs stalled without it at load 118, 0 of 10 with it at load 41–58. Those loads differ, so this
+> is not an A/B. The first write's ~99 ms in some runs is a lane waiting one record period for its holder's session,
+> lent to the record plane (`ship_head`); open.
+>
 > **Chaos from outside the processes (2026-11-06).** `crates/cli/tests/live_chaos.rs` streams writes through the Rust
 > client while it partitions or kills processes. It ends every flow with Agreement, NoLoss, StaleNeverCommits and
 > Convergence, checked from every node's `status`; each live line now carries its head's epoch and chain identity and
