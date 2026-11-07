@@ -313,17 +313,19 @@ fn wait_formed(instances: &[String], members: usize) -> Vec<String> {
       .iter()
       .map(|instance| fleet_view(instance))
       .collect();
+    let meshes: Vec<bool> = instances.iter().map(|instance| meshed(instance)).collect();
     if views
       .iter()
       .all(|view| view.as_ref().is_some_and(|(_, held, _)| *held == members))
-      && instances.iter().all(|instance| meshed(instance))
+      && meshes.iter().all(|meshed| *meshed)
     {
       return views.into_iter().map(|view| view.unwrap().0).collect();
     }
-    if !window.moving(&format!("{views:?}")) {
-      // What the probe and record planes did, for a pair that never probed each other (diag-31 run 7; live-fixes).
+    // Progress counts a node's mesh coming up as well as its members and probes changing.
+    if !window.moving(&format!("{views:?} {meshes:?}")) {
+      // What the probe and record planes did, for a node whose in-contact peers never all probed it.
       panic!(
-        "the fleet formed, or kept changing, within each fleet wait: {views:?}\n{}",
+        "the fleet formed, or kept changing, within each fleet wait: {views:?} meshed {meshes:?}\n{}",
         diagnosis(instances, "")
       );
     }
@@ -648,8 +650,8 @@ impl Fleet {
     wait_answers(&self.instances[index]);
   }
 
-  /// Waits until every live node holds exactly the manifest's members, each probed by the others: a succeeded or
-  /// replaced node rejoined under its new identity and the old one retired.
+  /// Waits until every live node holds exactly the manifest's members with its probe mesh up ([`meshed`]): a succeeded
+  /// or replaced node rejoined under its new identity and the old one retired.
   fn wait_rejoined(&self) {
     let live: Vec<String> = (0..self.instances.len())
       .filter(|index| self.processes[*index].is_some())
