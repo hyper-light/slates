@@ -566,8 +566,15 @@ fn strict_volume_or_typed_refusal(instance: &str) -> Option<String> {
 /// §4.14 `daemon.alive` (2026-10-10, when the anchor began waiting for the lapse instead of looking every beat): a daemon
 /// that stops beating is killed at its heartbeat lapse and restarted. Do: start an anchor, freeze its daemon
 /// (`SIGSTOP`: alive and silent), and wait for another daemon to answer. Expect the frozen one gone, killed once, and the
-/// new one answering no sooner than the liveness budget less one heartbeat after the freeze (the lapse runs from the last
-/// beat, which may precede the freeze by a beat) and within the suite's start wait after that.
+/// anchor's own kill line to say the beat it judged was at least its lapse bound old (the liveness window plus the
+/// anchor's lateness p99), never less than the window; and the new daemon answering within the suite's start wait past
+/// that bound.
+///
+/// The lower bound is the anchor's own predicate, read from its kill line, because the test cannot see how old the last
+/// beat was when it stopped the daemon. Since A-228 the beat is the watchdog's, and on a loaded machine a beat can come
+/// late (0.26 s measured on a starved shard), so the lapse can end sooner after the stop than a window less one beat.
+/// Main CI run 42184319025 (macOS, 2026-11-07) replaced the daemon 869.8 ms after the stop, with the anchor right, and
+/// failed the old bound of the window less a beat (900 ms).
 ///
 /// Since A-228 the beat is the daemon's watchdog thread's, and a frozen process stops every thread at once, the watchdog
 /// with them, so nothing in the daemon can say it is only starved. A stopped process is indistinguishable from a hung one,
@@ -582,8 +589,21 @@ fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
     return;
   }
   let instance = format!("cli-frozen-{}", std::process::id());
-  let anchor = start_anchor(&instance);
+  let (mut anchor, mut stderr) = spawn_anchor(&instance, &[]);
+  await_serving(&mut stderr, &instance, false);
+  let (kills, killed) = std::sync::mpsc::channel::<String>();
+  anchor.drain = Some(std::thread::spawn(move || {
+    for line in std::io::BufRead::lines(stderr).map_while(Result::ok) {
+      eprintln!("{line}");
+      if line.contains(LAPSE_KILL_LINE) {
+        let _ = kills.send(line);
+      }
+    }
+  }));
+  await_stable_daemon(&instance, true);
   let frozen = daemon_pid(&instance).expect("the daemon answers");
+  // A kill of the starting daemon (the start's own recovery, `await_stable_daemon`) is not this one.
+  while killed.try_recv().is_ok() {}
   assert!(
     Command::new("kill")
       .args(["-STOP", &frozen.to_string()])
@@ -599,19 +619,52 @@ fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
     .status()
     .unwrap()
     .success();
+  let line = killed
+    .recv_timeout(START_WAIT)
+    .expect("the anchor said why it killed the daemon");
   drop(anchor);
-  let budget = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
-  let beat = Duration::from_nanos(slates_server::daemon::HEARTBEAT_NS);
+  let (age, bound, window) = lapse_of(&line);
+  println!(
+    "frozen daemon: replaced after {replaced_after:?}; the anchor's beat was {age:?} old against its {bound:?} bound"
+  );
   assert_ne!(successor, frozen);
   assert!(!frozen_alive, "the frozen daemon was killed");
-  assert!(
-    replaced_after >= budget.saturating_sub(beat),
-    "not killed before its heartbeat lapsed: replaced after {replaced_after:?}"
+  assert_eq!(
+    window,
+    Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS),
+    "the anchor's window is the liveness budget"
   );
   assert!(
-    replaced_after <= budget + START_WAIT,
-    "killed at the lapse and replaced: after {replaced_after:?}"
+    age >= bound && age >= window,
+    "not killed before its heartbeat lapsed: the beat was {age:?} old against a {bound:?} bound ({line})"
   );
+  assert!(
+    replaced_after <= bound + START_WAIT,
+    "killed at the lapse and replaced: after {replaced_after:?}, against a {bound:?} bound"
+  );
+}
+
+/// Format: the words of the anchor's kill line for a lapsed beat (`crates/cli/src/anchor.rs`).
+const LAPSE_KILL_LINE: &str = "the daemon's heartbeat lapsed (";
+
+/// The beat's age, the lapse bound and the window the anchor's kill line names, in that order: "(N ms old, past B ms: the
+/// W ms window …".
+fn lapse_of(line: &str) -> (Duration, Duration, Duration) {
+  let (_, rest) = line.split_once(LAPSE_KILL_LINE).expect("a kill line");
+  let numbers: Vec<u64> = rest
+    .split(|c: char| !c.is_ascii_digit())
+    .filter(|word| !word.is_empty())
+    .take(3)
+    .map(|word| word.parse().unwrap())
+    .collect();
+  let [age, bound, window] = numbers[..] else {
+    panic!("the kill line names the age, the bound and the window: {line}");
+  };
+  (
+    Duration::from_millis(age),
+    Duration::from_millis(bound),
+    Duration::from_millis(window),
+  )
 }
 
 /// Shape: how long the starved-start test starves its successor: three of the anchor's start budgets

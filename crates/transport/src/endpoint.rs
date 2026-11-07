@@ -1672,6 +1672,18 @@ impl Endpoint {
     self.exchanges.keys().next_back().copied()
   }
 
+  /// Abandons the newest open exchange if it was begun after `before` (what [`last_exchange`](Endpoint::last_exchange)
+  /// said just before the caller's own `request`): the caller's own exchange, cut off by its deadline. Nothing when
+  /// its `begin` was refused, so another caller's exchange on a shared session (a forward left open between turns,
+  /// `slates_server`'s forward lane) is never abandoned in its place.
+  pub fn abandon_begun_since(&mut self, before: Option<u64>) {
+    if let Some(newest) = self.last_exchange()
+      && before.is_none_or(|before| newest > before)
+    {
+      self.abandon(newest);
+    }
+  }
+
   /// Abandons every open exchange (a caller dropping a session's pending work).
   pub fn abandon_all(&mut self) {
     let ids: Vec<u64> = self.exchanges.keys().copied().collect();

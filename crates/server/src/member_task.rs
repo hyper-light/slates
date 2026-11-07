@@ -325,6 +325,7 @@ async fn announce_on(member: HostId, endpoint: &mut Endpoint, canonical: bool) {
   };
   crate::fleet::count_refusal(EPOCH_SENT);
   let budget = crate::fleet::record_exchange_budget_ns();
+  let before = endpoint.last_exchange();
   let answered = futures::within(
     budget,
     endpoint.request(PLANE_EPOCH_STREAM, Priority::Control, &request.encode()),
@@ -333,9 +334,7 @@ async fn announce_on(member: HostId, endpoint: &mut Endpoint, canonical: bool) {
   let reply = match answered {
     Ok(Some(Ok(reply))) => reply,
     _ => {
-      if let Some(abandoned) = endpoint.last_exchange() {
-        endpoint.abandon(abandoned);
-      }
+      endpoint.abandon_begun_since(before);
       crate::fleet::count_refusal(EPOCH_UNANSWERED);
       return;
     }
