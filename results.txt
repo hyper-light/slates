@@ -1,0 +1,10 @@
+tested 95f6990d2f86863ac5cbd2d1177b78b44ce89a88 variant before-retry on x86_64, 4 cpus
+  reverted:  crates/client/src/client.rs | 2 +-
+  reverted:  1 file changed, 1 insertion(+), 1 deletion(-)
+resend exit 101 107s
+  resend: warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+  resend: thread 'a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id' (5763) panicked at crates/server/tests/fleet.rs:10043:3:
+  resend: test a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id ... FAILED
+  resend:     a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id
+  resend: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 91 filtered out; finished in 12.64s
+  resend: error: test failed, to rerun pass `-p slates-server --test fleet`
