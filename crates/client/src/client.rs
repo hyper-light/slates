@@ -108,6 +108,9 @@ pub fn defers_reply(body: &RequestBody) -> bool {
         // A pin reads the subtrees it names into the store in slices on the owner shard, as long as the tree takes
         // (§4.4, §4.3).
         | RequestBody::Pin { .. }
+        // A green over a base walks the base snapshot into its origin in slices on the owner shard, as long as the
+        // tree takes (§4.16 "Green creation"); a scratch green is answered at once.
+        | RequestBody::CreateGreen { base: Some(_), .. }
         // A direct map's copy is filled in slices on the owner shard, as long as the file takes (A-171).
         | RequestBody::MapRead { .. }
         // A writable map's copy is filled the same way, and its stores are compared back into the file in slices at

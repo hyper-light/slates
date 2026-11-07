@@ -248,7 +248,7 @@ mod tests {
         model.insert(PATHS[*path].to_owned(), vec![b'b'; *len]);
       }
       origin.files = model.iter().map(|(path, bytes)| (path.clone(), bytes.clone())).collect();
-      let green = Green::with_origin(&origin);
+      let green = Green::with_origin(origin.clone());
       let base = Base { green: Some(&green), version: 0 };
       let mut files = WorkFiles::default();
       let mut journal: Vec<VolumeOp> = Vec::new();

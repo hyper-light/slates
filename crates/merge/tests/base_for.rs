@@ -33,7 +33,7 @@ proptest! {
     history in proptest::collection::vec(raw(), 0..16),
     journals in proptest::collection::vec(proptest::collection::vec(raw(), 1..8), 1..8),
   ) {
-    let mut green = Green::with_origin(&origin_of(&origin));
+    let mut green = Green::with_origin(origin_of(&origin));
     for (index, step) in history.iter().enumerate() {
       let id = u8::try_from(index).unwrap_or(u8::MAX);
       // A conflicting step is not committed; the head moves only on an accept.
@@ -69,7 +69,7 @@ fn the_restricted_base_holds_only_what_the_journal_names() {
     files: (0..64).map(|n| (format!("f{n:02}"), vec![7; 8])).collect(),
     ..Origin::default()
   };
-  let green = Green::with_origin(&origin);
+  let green = Green::with_origin(origin.clone());
   let journal = vec![VolumeOp::Overwrite {
     path: "f07".to_owned(),
     at: 0,
