@@ -1,0 +1,54 @@
+tree M 0ad0ba6bfbd83261f50b4630026449749b3041af, Sat Nov  7 17:54:31 UTC 2026
+== run 1 exit 124
+
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: instance live-fence-c-6141 serving on 2 shards alone
+slates-server: shard 1 initialized in 439 µs
+slates-server: shard 0 initialized in 609 µs
+slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, ex
+slates-cluster: fleet: HostId(14240530362811780008) holds HostId(10082066588014863024) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(10082066588014863024) holds HostId(14240530362811780008) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(12278796029213876218) holds HostId(10082066588014863024) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(10082066588014863024) holds HostId(12278796029213876218) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(14240530362811780008) holds HostId(10082066588014863024) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:720:9
+slates-cluster: fleet: HostId(10082066588014863024) holds HostId(14240530362811780008) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:720:9
+slates-cluster: fleet: HostId(12278796029213876218) holds HostId(14240530362811780008) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(14240530362811780008) holds HostId(12278796029213876218) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(14240530362811780008) holds HostId(12278796029213876218) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:720:9
+slates-cluster: fleet: HostId(10082066588014863024) holds HostId(12278796029213876218) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:720:9
+slates-cluster: fleet: HostId(12278796029213876218) holds HostId(10082066588014863024) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:720:9
+slates-cluster: fleet: HostId(12278796029213876218) holds HostId(14240530362811780008) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:720:9
+test a_superseded_owner_resumed_after_its_takeover_is_fenced has been running for over 60 seconds
+slates-cluster: fleet: HostId(14240530362811780008) holds HostId(12278796029213876218) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:620:8
+slates-cluster: fleet: HostId(14240530362811780008) holds HostId(12278796029213876218) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> slates daemon: the control shard's beat task ran MemberState598671 {  ms after its last turn (a near miss against a liveness1000:  ms window; the anch
+564 timers, waited 15 times, spawned 33 tasks and finished 32; 14 tasks live; its longest poll is 2 ms and its timer overrun 0 ms
+slates-cluster: fleet: HostId(10082066588014863024) holds HostId(12278796029213876218) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:620:8
+slates-cluster: fleet: HostId(10082066588014863024) holds HostId(12278796029213876218) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:720:9
+slates daemon: stop requested; drained: DrainReport { council: NotLeading, root: NotLeading, took: 476.24µs }
+== run 2 exit 124
+== run 3 exit 124
+slates daemon: instance live-fence-c-7017 serving on 2 shards alone
+slates-server: shard 1 initialized in 504 µs
+slates-server: shard 0 initialized in 477 µs
+slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, ex
+slates-cluster: fleet: HostId(13066966024769481251) holds HostId(14836378964559826250) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(14836378964559826250) holds HostId(13066966024769481251) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(15677906528546473733) holds HostId(14836378964559826250) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(14836378964559826250) holds HostId(15677906528546473733) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(15677906528546473733) holds HostId(13066966024769481251) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(13066966024769481251) holds HostId(15677906528546473733) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(13066966024769481251) holds HostId(14836378964559826250) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:720:9
+slates-cluster: fleet: HostId(14836378964559826250) holds HostId(13066966024769481251) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:720:9
+slates-cluster: fleet: HostId(15677906528546473733) holds HostId(13066966024769481251) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:720:9
+slates-cluster: fleet: HostId(15677906528546473733) holds HostId(14836378964559826250) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:720:9
+slates-cluster: fleet: HostId(13066966024769481251) holds HostId(15677906528546473733) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:720:9
+slates-cluster: fleet: HostId(14836378964559826250) holds HostId(15677906528546473733) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:720:9
+test a_superseded_owner_resumed_after_its_takeover_is_fenced has been running for over 60 seconds
+slates-cluster: fleet: HostId(13066966024769481251) holds HostId(15677906528546473733) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:620:8
+slates-cluster: fleet: HostId(13066966024769481251) holds HostId(15677906528546473733) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:720:9
+slates daemon: the control shard's beat task ran 598575 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 2594 steps and 2824 polls (46 long in a task, 1 blocked in the kernel, 0 preempted by the host, 9 unattributed), fi
+slates-cluster: fleet: HostId(14836378964559826250) holds HostId(15677906528546473733) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:620:8
+slates-cluster: fleet: HostId(14836378964559826250) holds HostId(15677906528546473733) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:720:9
+slates daemon: stop requested; drained: DrainReport { council: NotLeading, root: NotLeading, took: 522.845µs }
+aemon: stop requested; drained: DrainReport { council: NotLeading, root: NotLeading, took: 107.866µs }
+slates daemon: stop requested; drained: DrainReport { council: StillLeading, root: NoTarget, took: 2.104604269s }
