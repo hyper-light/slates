@@ -59,6 +59,23 @@
 >     are submits whose outcome their clients never learned, and the oracle treats them as never accepted. It owes a
 >     sound treatment: read which versions the green took and fit the unknown submits to them.
 >
+> - **Memory per client, attributed** (2026-11-06). Mac, in-process daemon over `kernel/`, 300 clients at 32 a
+>   connection, works kept (`--keep-works`). Memory is not load-sensitive.
+>   - **Per same-machine connection, about 8.4 MB of daemon RSS.** At 1,000 clients, 1,000 connections peaked at
+>     12.5 GB and 32 at 4.4 GB. Multiplexing 32 a connection makes it about 0.26 MB a logical client, and over the
+>     network the server pays none of it.
+>   - **Per accepted version, about 0.16 MB of live heap**, but RSS grew about 3.4 MB a version (one round, 300
+>     versions: 1.15 GB; three, 900 versions: 3.20 GB). `vmmap` puts the difference in freed large blocks still
+>     resident ("MALLOC_LARGE (empty)", 597 MB to 2.5 GB). A counting allocator found 464 allocations of 1 MiB or more,
+>     9.4 GB in one level, from `Partition::to_snapshot` ← `Db::snapshot` ← `Db::commit`, with buffers growing to
+>     134 MB.
+>   - **The cause.** The partition keeps every accepted increment in `green_chains` (bounded, refused
+>     `Capacity { table: "green_chains" }` at the cap) "until checkpointing folds old chain entries (owed)". So each
+>     version costs its increment for good, and each snapshot taken when the log fills re-encodes the whole chain.
+>   - **What it means at 100k** (extrapolation): 3 rounds × 100k clients is 300k increments, about 48 GB of chain,
+>     each snapshot re-encoding it, and the cap refusing submits well before. Green chain checkpointing is the 100k
+>     rung's wall (owner to be decided).
+>
 > The topology launcher is `crates/cli/tests/load_scale.rs`. It runs one primary and two replica server nodes in
 > region 0 at `f = 1`, and client nodes in region 1, so the client nodes are never the green's holders. One harness
 > drives every client node (`--instance a,b,…`), so one oracle judges every submit. It is portable (`ps`, `pgrep`),
