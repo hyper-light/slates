@@ -1902,6 +1902,8 @@ pub(crate) fn reports(state: &ShardState) -> Vec<slates_ipc::protocol::LiveRepor
         head_epoch: live.shipper.head().map(|head| head.epoch.0),
         head_identity: live.shipper.head().map(|head| head.identity),
         fence: live.shipper.epoch().0,
+        holders: sorted_ids(live.shipper.holders()),
+        moving_to: live.shipper.transition().map(sorted_ids).unwrap_or_default(),
       });
   let held = state
     .live
@@ -1916,8 +1918,17 @@ pub(crate) fn reports(state: &ShardState) -> Vec<slates_ipc::protocol::LiveRepor
       head_epoch: held.replica.head().map(|head| head.epoch.0),
       head_identity: held.replica.head().map(|head| head.identity),
       fence: held.replica.fence().0,
+      holders: Vec::new(),
+      moving_to: Vec::new(),
     });
   shipping.chain(held).collect()
+}
+
+/// `hosts`' member ids, ascending.
+fn sorted_ids(hosts: &[HostId]) -> Vec<u64> {
+  let mut ids: Vec<u64> = hosts.iter().map(|host| host.0).collect();
+  ids.sort_unstable();
+  ids
 }
 
 /// The bound on what a candidate keeps of one volume: its whole record and the deltas after it are each at most the

@@ -2631,7 +2631,7 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
     ));
     for live in &shard.live {
       out.push_str(&format!(
-        "shard {} live {} {} head={} durable={} owed={} epoch={} identity={} fence={}\n",
+        "shard {} live {} {} head={} durable={} owed={} epoch={} identity={} fence={} holders={} moving_to={}\n",
         shard.partition,
         if live.holding { "held" } else { "shipping" },
         volume_id_text(live.volume),
@@ -2640,7 +2640,9 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
         live.owed,
         option_text(live.head_epoch),
         option_text(live.head_identity.as_ref().map(hex32)),
-        live.fence
+        live.fence,
+        id_list_text(&live.holders),
+        id_list_text(&live.moving_to)
       ));
     }
     if let Some(batch) = telemetry
@@ -2651,6 +2653,18 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
     }
   }
   out
+}
+
+/// Member ids joined by commas, or `none` for an empty list.
+fn id_list_text(ids: &[u64]) -> String {
+  if ids.is_empty() {
+    return "none".to_owned();
+  }
+  ids
+    .iter()
+    .map(u64::to_string)
+    .collect::<Vec<String>>()
+    .join(",")
 }
 
 /// `slates profile`: the machine profile, as its derived constants or as JSON.

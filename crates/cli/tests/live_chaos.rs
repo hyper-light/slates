@@ -781,6 +781,10 @@ struct LiveState {
   epoch: Option<u64>,
   identity: Option<String>,
   fence: u64,
+  /// On the owner, the member ids of the holders its durability counts; empty on a candidate.
+  holders: Vec<String>,
+  /// On the owner, the member ids of the set a holder transition is moving to; empty when none is in flight.
+  moving_to: Vec<String>,
 }
 
 fn field<'a>(fields: &'a str, key: &str) -> Option<&'a str> {
@@ -817,10 +821,20 @@ fn live_states(instance: &str, volume: &str) -> Option<Vec<LiveState>> {
             .filter(|identity| *identity != "none")
             .map(str::to_owned),
           fence: number(field(fields, "fence=")).unwrap_or(0),
+          holders: id_list(field(fields, "holders=")),
+          moving_to: id_list(field(fields, "moving_to=")),
         })
       })
       .collect(),
   )
+}
+
+/// A status line's comma-joined member ids (`none`, or a line from before the field: empty).
+fn id_list(text: Option<&str>) -> Vec<String> {
+  text
+    .filter(|text| *text != "none")
+    .map(|text| text.split(',').map(str::to_owned).collect())
+    .unwrap_or_default()
 }
 
 /// One sample: when, which node, and what it reported.
@@ -2925,6 +2939,16 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
         instances[replaced],
         began.elapsed()
       ));
+      // The replacement may move the volume's placement, and the shipper then moves its holders by a transition: the
+      // roles are the holders its durability counts once no transition is in flight.
+      let holders = settled_holders(&fleet_cell.borrow(), owner_index, &volume);
+      verdict.note(format!(
+        "the owner's holders once settled: {:?}",
+        holders
+          .iter()
+          .map(|index| instances[*index].as_str())
+          .collect::<Vec<_>>()
+      ));
       // The holder stopped at the takeover: one whose seat, with the owner's, leaves the council two of its three votes.
       let seated = council_voters_by_index(&fleet_cell.borrow());
       let owner_seated = seated.contains(&owner_index);
@@ -3051,15 +3075,48 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
   if decisive {
     fleet.resume(current);
   }
-  match wait_serving(&survivors, &volume, &outcomes) {
+  judge_served(
+    &mut verdict,
+    &survivors,
+    &volume,
+    &outcomes,
+    [instances[current].as_str(), instances[stale].as_str()],
+  );
+  drop(fleet);
+  verdict.judge();
+}
+
+/// The end of the fresh-member flow: a survivor serves `volume` with every acknowledged write, the holders the takeover
+/// counted (`counted`) are fenced at its epoch, and a copy left on a member that is no longer a holder is noted.
+fn judge_served(
+  verdict: &mut Verdict,
+  survivors: &[&str],
+  volume: &str,
+  outcomes: &[Outcome],
+  counted: [&str; 2],
+) {
+  match wait_serving(survivors, volume, outcomes) {
     Some((successor, took)) => {
       verdict.note(format!("{successor} served the volume after {took:?}"));
-      verdict.check("NoLoss (successor)", no_loss(successor, &volume, &outcomes));
-      let epoch = takeover_epoch(successor, &volume);
+      verdict.check("NoLoss (successor)", no_loss(successor, volume, outcomes));
+      let epoch = takeover_epoch(successor, volume);
+      // The holders the takeover counts are fenced; a copy left on a member the shipper's transition dropped is counted
+      // by no one, and is noted.
       verdict.check(
-        "StaleNeverCommits (fences)",
-        fenced_at_or_above(&survivors, &volume, epoch),
+        "StaleNeverCommits (the counted holders' fences)",
+        fenced_at_or_above(&counted, volume, epoch),
       );
+      let others: Vec<&str> = survivors
+        .iter()
+        .copied()
+        .filter(|survivor| !counted.contains(survivor))
+        .collect();
+      let left = fenced_at_or_above(&others, volume, epoch);
+      if !left.is_empty() {
+        verdict.note(format!(
+          "copies left on members no longer holders: {left:?}"
+        ));
+      }
     }
     None => {
       let live: Vec<String> = survivors
@@ -3068,7 +3125,7 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
         .collect();
       verdict.note(format!(
         "no survivor served the volume; the survivors:\n{}",
-        diagnosis(&live, &volume)
+        diagnosis(&live, volume)
       ));
       verdict.check(
         "a takeover once the holder answers",
@@ -3076,8 +3133,46 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
       );
     }
   }
-  drop(fleet);
-  verdict.judge();
+}
+
+/// The nodes holding `volume`'s log whose acknowledgements the owner at `owner_index` counts, once it reports two and no
+/// holder transition in flight and each holds the owner's durable position, within the fleet wait.
+fn settled_holders(fleet: &Fleet, owner_index: usize, volume: &str) -> Vec<usize> {
+  let deadline = Instant::now() + FLEET_WAIT;
+  loop {
+    let owner = live_states(&fleet.instances[owner_index], volume)
+      .unwrap_or_default()
+      .into_iter()
+      .find(|state| !state.holding);
+    let hosts: BTreeMap<String, usize> = (0..fleet.instances.len())
+      .filter_map(|index| fleet_view(&fleet.instances[index]).map(|(host, _, _)| (host, index)))
+      .collect();
+    if let Some(owner) = &owner
+      && owner.moving_to.is_empty()
+      && owner.holders.len() == 2
+    {
+      let indexes: Vec<usize> = owner
+        .holders
+        .iter()
+        .filter_map(|host| hosts.get(host).copied())
+        .collect();
+      let caught_up = indexes.len() == 2
+        && indexes.iter().all(|index| {
+          live_states(&fleet.instances[*index], volume)
+            .unwrap_or_default()
+            .iter()
+            .any(|state| state.holding && owner.durable.is_some() && state.head >= owner.durable)
+        });
+      if caught_up {
+        return indexes;
+      }
+    }
+    assert!(
+      Instant::now() < deadline,
+      "the owner's holders settled within the fleet wait: {owner:?}"
+    );
+    pause();
+  }
 }
 
 /// The nodes of `fleet` holding a copy of `volume`'s log, once at least `count` do, within the fleet wait.
@@ -3238,7 +3333,10 @@ fn a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor
         verdict.note(format!(
           "iteration {iteration} ({barrier:?}): {successor} served the probe {took:?} after the owner's death"
         ));
-        verdict.check(&format!("NoLoss, iteration {iteration} (earlier files)"), lost);
+        verdict.check(
+          &format!("NoLoss, iteration {iteration} (earlier files)"),
+          lost,
+        );
       }
       None => verdict.check(
         &format!("NoLoss, iteration {iteration} ({barrier:?})"),
