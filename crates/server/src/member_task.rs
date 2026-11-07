@@ -472,6 +472,8 @@ async fn announce_on(member: HostId, endpoint: &mut Endpoint, canonical: bool) {
     }
     state.plane.announced_on.insert(member, connection);
     state.plane.reannouncing.remove(&member);
+    // An answer is the member's own: one this node holds dead is alive, and keeps its contact to refute the death.
+    note_returned(state, answer.member);
     if epoch == IDENTITY_ONLY {
       return;
     }
@@ -606,6 +608,19 @@ fn changed_members(state: &mut ShardState) -> Vec<(HostId, MemberState)> {
       && let Some(anchor) = anchor_of(state, *member)
     {
       forget_address(state, anchor);
+    }
+    // A member condemned while this node holds a record session to it: the death is put to that session by announcing
+    // on it again ([`announce_on`]). Answered, the member is alive (a process restarted under its id faster than the
+    // others suspected it), so contact with it is kept until its probes refute the death; unanswered, the session is
+    // dropped. Without it, a successor that announced itself while still held alive was condemned afterwards with
+    // nothing new to announce, and was never re-admitted (3 of 6 anchored rejoins under load on macOS CI, diag run
+    // 42405661792).
+    if belief.liveness == slates_cluster::membership::Liveness::Dead
+      && state.record_sessions.contains_key(member)
+      && state.plane.reannouncing.len() < state.config.fleet_peer_capacity
+    {
+      state.plane.announced_on.remove(member);
+      state.plane.reannouncing.insert(*member);
     }
   }
   changed
