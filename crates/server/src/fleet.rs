@@ -1874,21 +1874,8 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
       }
       continue;
     }
-    // The catalog register first (AUD-29-17): what a successor serves the volume as, shipped at every
-    // catalog change. The head waits until the catalog's current version is committed, so an adopted head
-    // always meets an adopted catalog as new as the head's own volume.
-    let catalog = object.catalog();
-    let catalog_owed = owed_record(
-      state,
-      config,
-      (catalog, record.catalog_version),
-      crate::catalog::CatalogValue::of(record).to_record_bytes(),
-      local,
-    );
-    let catalog_committed = state.placed_heads.get(&catalog).is_some_and(|head| {
-      head.sequence == record.catalog_version && head.placed_under(config, catalog)
-    });
-    let catalog_ready = catalog_owed.is_none() || catalog_committed;
+    // The catalog register first (AUD-29-17): the head waits until the catalog's current version is committed.
+    let (catalog_owed, catalog_ready) = owed_catalog(state, config, record, local);
     heads.extend(catalog_owed);
     if !catalog_ready {
       continue;
@@ -1907,10 +1894,55 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
       local,
     ));
   }
+  // A green's catalog register too (AUD-29-17): its access list is what a successor admits by, and the merge plane
+  // ships no record of the green before the register's current version is committed (`green_catalog_committed`).
+  for id in state.greens.keys() {
+    if let Some(record) = state.db.partition().volume(*id) {
+      heads.extend(owed_catalog(state, config, record, local).0);
+    }
+  }
   for tombstone in state.db.partition().tombstones() {
     heads.extend(owed_tombstone(state, config, tombstone, local));
   }
   heads
+}
+
+/// The catalog register of `record` (AUD-29-17) as this owner still owes it to some remote candidate, and whether
+/// its current version is ready to be built on: owed to nobody, or committed at the quorum. The register is what a
+/// successor serves the volume or green as — its owner, policy and access list — shipped at every catalog change,
+/// and a record that names the object's later state (a volume's head, a green's merge record) waits until it is
+/// ready, so an adopted record always meets an adopted catalog as new as its own object.
+fn owed_catalog(
+  state: &ShardState,
+  config: &slates_db::register::Configuration,
+  record: &VolumeRecord,
+  local: HostId,
+) -> (Option<Head>, bool) {
+  let catalog = ObjectId(record.id.bytes).catalog();
+  let owed = owed_record(
+    state,
+    config,
+    (catalog, record.catalog_version),
+    crate::catalog::CatalogValue::of(record).to_record_bytes(),
+    local,
+  );
+  let committed = state.placed_heads.get(&catalog).is_some_and(|head| {
+    head.sequence == record.catalog_version && head.placed_under(config, catalog)
+  });
+  let ready = owed.is_none() || committed;
+  (owed, ready)
+}
+
+/// Whether the green `id`'s catalog register is ready for its merge records to ship (AUD-29-17; see [`owed_catalog`]):
+/// a successor materializes a green only with its adopted catalog, so a merge record that could be adopted without
+/// one would leave the green unserved. A green with no record here owes no catalog: a destroyed green's tombstone
+/// stands for both registers (AUD-29-43). Read on the green's owner shard.
+pub(crate) fn green_catalog_committed(state: &ShardState, id: DbVolumeId, local: HostId) -> bool {
+  state
+    .db
+    .partition()
+    .volume(id)
+    .is_none_or(|record| owed_catalog(state, state.fleet.configuration(), record, local).1)
 }
 
 /// The stage of a destroyed volume's tombstone this owner still owes some candidate (AUD-29-43; see
@@ -3508,9 +3540,23 @@ async fn materialize_pending_greens(origin: u16) {
   })
   .unwrap_or_default();
   for (object, adopted) in pending {
-    let recovery =
-      state::with_state(|s| crate::merge_service::recover_green_inputs(s, object, &adopted))
-        .flatten();
+    // The green's catalog register, adopted in the same round as its merge record (the owner ships no merge
+    // record before its current catalog is committed): the green's access list. Until it and its
+    // placement are adopted the materialization waits, as a volume's does (AUD-29-17).
+    let catalog = state::with_state(|s| {
+      let catalog = s.pending_catalogs.get(&object).cloned();
+      let placed = s.placed_heads.get(&object.catalog()).cloned();
+      catalog.zip(placed)
+    })
+    .flatten();
+    let Some(((catalog_sequence, catalog), catalog_placed)) = catalog else {
+      count_refusal(GREEN_TAKEOVER_WAITS_CATALOG);
+      continue;
+    };
+    let recovery = state::with_state(|s| {
+      crate::merge_service::recover_green_inputs(s, object, &adopted, (catalog_sequence, &catalog))
+    })
+    .flatten();
     let Some(recovery) = recovery else {
       count_refusal(GREEN_TAKEOVER_INCOMPLETE);
       continue;
@@ -3537,6 +3583,7 @@ async fn materialize_pending_greens(origin: u16) {
             .is_ok();
         if served {
           s.placed_heads.insert(object, placed);
+          s.placed_heads.insert(object.catalog(), catalog_placed);
         }
         served
       },
@@ -3546,6 +3593,7 @@ async fn materialize_pending_greens(origin: u16) {
     state::with_state(|s| {
       if served == Some(true) {
         s.pending_green_materializations.remove(&object);
+        s.pending_catalogs.remove(&object);
       } else {
         s.count(GREEN_TAKEOVER_REFUSED, 1);
       }
@@ -3612,6 +3660,10 @@ const MATERIALIZE_WAITS_CATALOG_PLACEMENT: &str = "fleet.materialize.waits.catal
 /// Format: a counter name in the daemon's status report.
 const MATERIALIZE_WAITS_SHARD: &str = "fleet.materialize.waits.shard";
 
+/// A taken-over green whose catalog register (its access list) or that register's placement was not yet
+/// adopted this period; it stays pending and is retried.
+/// Format: a counter name in the daemon's status report.
+const GREEN_TAKEOVER_WAITS_CATALOG: &str = "merge.takeover_waits_catalog";
 /// A taken-over green whose chain could not be gathered this period (an input not held, or the adopted
 /// version beyond this node's accepted prefix); it stays pending and is retried.
 const GREEN_TAKEOVER_INCOMPLETE: &str = "merge.takeover_incomplete";
