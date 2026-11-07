@@ -14161,6 +14161,10 @@ holder set now changes as Vertical Paxos changes a configuration (Lamport, Malkh
   kept against a later change until activated, since its record may be in flight.
 - A successor's holders are the set its takeover counted, less itself, with the lost owner; it moves to its
   configuration's candidates by a transition of its own.
+- Over a holder set of `n`, a write is durable once `W = max(n − f, f)` of them hold it (never on fewer than `f`): every
+  `f + 1` reports meet it (`W + f + 1 > n`) and the owner and `W` holders survive `f` failures. The `f`-th highest
+  holder, right for `2f`, counted one of three when the owner fell outside its own placement (raft-chaos, CI); `n − f`
+  alone counted the owner and one holder at `f = 2` with three (raft's review).
 
 The record is A-240's (raft-chaos: the shipper records its holders in the volume's catalog and phase one counts them).
 `live_ship::follow_candidates` commits the target as the holder set once `target_recordable` holds (transferred, and the
