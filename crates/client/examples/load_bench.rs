@@ -512,6 +512,10 @@ impl Agent {
       tally.backpressure += 1;
       return;
     }
+    // A request the daemon could not read is named in full: its reason says which part of the slot was wrong.
+    if matches!(refusal, Refusal::BadRequest { .. }) {
+      return self.give_up(tally, &format!("{kind:?}: {refusal:?}"));
+    }
     let name = format!("{kind:?}: {refusal:?}");
     let short = name
       .split([' ', '{', '('])
