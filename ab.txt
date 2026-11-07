@@ -1,0 +1,1250 @@
+# profile pair arm-product, run 3: dll 40ee5a651924733575619efea7a2fc1886d97b38 (71cf09ac with the profile); shards , comb 11fb9ee3d750f643d403306ef6d72d121ce842c8; quiet only; 2026-11-07T19:39:12Z
+image win11-vs2026-arm64 20261101.203.1; 4 CPUs; ARM64 ARMv8 (64-bit) Family 8 Model D49 Revision   0, MICROSOFT CORPORATION; WinFsp 2.1.25156
+Microsoft Windows [Version 10.0.26200.9725]
+# dll's measured profile:
+{
+  "version": 3,
+  "facts": {
+    "identity": {
+      "cpu": "windows processor architecture 12 level 3401 revision 0",
+      "os": "windows 0x23f00206",
+      "arch": "aarch64",
+      "cores": 4,
+      "memory": 17169387520,
+      "page": 4096
+    },
+    "page": {
+      "base": 4096,
+      "huge": [
+        2097152
+      ],
+      "transparent_huge": false,
+      "allocation_granularity": 65536
+    },
+    "cache_line": 64,
+    "cores": [
+      {
+        "id": 0,
+        "class": "Unknown",
+        "level": 0,
+        "numa": 0,
+        "l2_bytes": 1048576
+      },
+      {
+        "id": 1,
+        "class": "Unknown",
+        "level": 0,
+        "numa": 0,
+        "l2_bytes": 1048576
+      },
+      {
+        "id": 2,
+        "class": "Unknown",
+        "level": 0,
+        "numa": 0,
+        "l2_bytes": 1048576
+      },
+      {
+        "id": 3,
+        "class": "Unknown",
+        "level": 0,
+        "numa": 0,
+        "l2_bytes": 1048576
+      }
+    ],
+    "cpu_budget": null,
+    "memory": {
+      "total": 17169387520,
+      "available": 13894615040,
+      "address_bits": 64,
+      "limit": null
+    },
+    "power": "Mains",
+    "notes": [
+      "core classes are not queried on Windows in this phase; recorded unknown"
+    ]
+  },
+  "timer_overhead_ns": 34,
+  "syscall": {
+    "interval": {
+      "median": 206,
+      "lower": 206,
+      "upper": 209
+    },
+    "p99_ns": 218,
+    "min_ns": 203,
+    "samples": 16,
+    "batch": 32,
+    "quick": false
+  },
+  "faults": {
+    "base_ns": 378,
+    "base_region": {
+      "interval": {
+        "median": 101400,
+        "lower": 98600,
+        "upper": 106100
+      },
+      "p99_ns": 117500,
+      "min_ns": 96600,
+      "samples": 16,
+      "batch": 1,
+      "quick": false
+    },
+    "map_unmap_region": {
+      "interval": {
+        "median": 4600,
+        "lower": 4400,
+        "upper": 4800
+      },
+      "p99_ns": 5400,
+      "min_ns": 4200,
+      "samples": 16,
+      "batch": 1,
+      "quick": false
+    },
+    "populated_ns": null,
+    "huge_ns": null,
+    "pages_per_region": 256
+  },
+  "wake": {
+    "mean_ns": 1098,
+    "mean_lower_ns": 968,
+    "mean_upper_ns": 1236,
+    "p50_ns": 500,
+    "p99_ns": 9700,
+    "sd_ns": 2070,
+    "samples": 877,
+    "same_cpu_samples": 0,
+    "rounds": 5,
+    "rounds_agree": false,
+    "placement": "Pinned",
+    "asleep_confirmed": false,
+    "quick": true
+  },
+  "core_rtt": [],
+  "pinning": "Refused",
+  "memcpy": [
+    {
+      "bytes": 64,
+      "bytes_per_second": 32000000000,
+      "per_copy": {
+        "interval": {
+          "median": 2,
+          "lower": 2,
+          "upper": 2
+        },
+        "p99_ns": 2,
+        "min_ns": 2,
+        "samples": 16,
+        "batch": 2048,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 128,
+      "bytes_per_second": 64000000000,
+      "per_copy": {
+        "interval": {
+          "median": 2,
+          "lower": 2,
+          "upper": 2
+        },
+        "p99_ns": 2,
+        "min_ns": 2,
+        "samples": 16,
+        "batch": 1024,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 256,
+      "bytes_per_second": 85333333333,
+      "per_copy": {
+        "interval": {
+          "median": 3,
+          "lower": 3,
+          "upper": 3
+        },
+        "p99_ns": 3,
+        "min_ns": 3,
+        "samples": 16,
+        "batch": 1024,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 512,
+      "bytes_per_second": 85333333333,
+      "per_copy": {
+        "interval": {
+          "median": 6,
+          "lower": 6,
+          "upper": 6
+        },
+        "p99_ns": 7,
+        "min_ns": 6,
+        "samples": 16,
+        "batch": 512,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 1024,
+      "bytes_per_second": 78769230769,
+      "per_copy": {
+        "interval": {
+          "median": 13,
+          "lower": 13,
+          "upper": 13
+        },
+        "p99_ns": 13,
+        "min_ns": 12,
+        "samples": 16,
+        "batch": 256,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 2048,
+      "bytes_per_second": 78769230769,
+      "per_copy": {
+        "interval": {
+          "median": 26,
+          "lower": 26,
+          "upper": 26
+        },
+        "p99_ns": 27,
+        "min_ns": 25,
+        "samples": 16,
+        "batch": 128,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 4096,
+      "bytes_per_second": 80313725490,
+      "per_copy": {
+        "interval": {
+          "median": 51,
+          "lower": 50,
+          "upper": 53
+        },
+        "p99_ns": 53,
+        "min_ns": 50,
+        "samples": 16,
+        "batch": 64,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 8192,
+      "bytes_per_second": 81920000000,
+      "per_copy": {
+        "interval": {
+          "median": 100,
+          "lower": 100,
+          "upper": 103
+        },
+        "p99_ns": 106,
+        "min_ns": 96,
+        "samples": 16,
+        "batch": 32,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 16384,
+      "bytes_per_second": 87614973262,
+      "per_copy": {
+        "interval": {
+          "median": 187,
+          "lower": 187,
+          "upper": 193
+        },
+        "p99_ns": 431,
+        "min_ns": 187,
+        "samples": 16,
+        "batch": 16,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 32768,
+      "bytes_per_second": 90519337016,
+      "per_copy": {
+        "interval": {
+          "median": 362,
+          "lower": 362,
+          "upper": 375
+        },
+        "p99_ns": 387,
+        "min_ns": 350,
+        "samples": 16,
+        "batch": 8,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 65536,
+      "bytes_per_second": 87381333333,
+      "per_copy": {
+        "interval": {
+          "median": 750,
+          "lower": 725,
+          "upper": 750
+        },
+        "p99_ns": 775,
+        "min_ns": 725,
+        "samples": 16,
+        "batch": 4,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 131072,
+      "bytes_per_second": 62415238095,
+      "per_copy": {
+        "interval": {
+          "median": 2100,
+          "lower": 2100,
+          "upper": 2150
+        },
+        "p99_ns": 2400,
+        "min_ns": 2100,
+        "samples": 16,
+        "batch": 2,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 262144,
+      "bytes_per_second": 58254222222,
+      "per_copy": {
+        "interval": {
+          "median": 4500,
+          "lower": 4400,
+          "upper": 4500
+        },
+        "p99_ns": 5000,
+        "min_ns": 4300,
+        "samples": 16,
+        "batch": 1,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 524288,
+      "bytes_per_second": 47233153153,
+      "per_copy": {
+        "interval": {
+          "median": 11100,
+          "lower": 11000,
+          "upper": 11400
+        },
+        "p99_ns": 13100,
+        "min_ns": 10800,
+        "samples": 16,
+        "batch": 1,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 1048576,
+      "bytes_per_second": 38836148148,
+      "per_copy": {
+        "interval": {
+          "median": 27000,
+          "lower": 25200,
+          "upper": 185200
+        },
+        "p99_ns": 32700,
+        "min_ns": 25200,
+        "samples": 5,
+        "batch": 1,
+        "quick": true
+      }
+    },
+    {
+      "bytes": 2097152,
+      "bytes_per_second": 5270550389,
+      "per_copy": {
+        "interval": {
+          "median": 397900,
+          "lower": 397900,
+          "upper": 397900
+        },
+        "p99_ns": 397900,
+        "min_ns": 397900,
+        "samples": 1,
+        "batch": 1,
+        "quick": true
+      }
+    },
+    {
+      "bytes": 4194304,
+      "bytes_per_second": 4901032951,
+      "per_copy": {
+        "interval": {
+          "median": 855800,
+          "lower": 855800,
+          "upper": 855800
+        },
+        "p99_ns": 855800,
+        "min_ns": 855800,
+        "samples": 1,
+        "batch": 1,
+        "quick": true
+      }
+    },
+    {
+      "bytes": 8388608,
+      "bytes_per_second": 5002151460,
+      "per_copy": {
+        "interval": {
+          "median": 1677000,
+          "lower": 1677000,
+          "upper": 1677000
+        },
+        "p99_ns": 1677000,
+        "min_ns": 1677000,
+        "samples": 1,
+        "batch": 1,
+        "quick": true
+      }
+    }
+  ],
+  "hash": {
+    "bytes": 4194304,
+    "blake3_bytes_per_second": 1455193421,
+    "per_buffer": {
+      "interval": {
+        "median": 2882300,
+        "lower": 2882300,
+        "upper": 2965700
+      },
+      "p99_ns": 2882300,
+      "min_ns": 2882300,
+      "samples": 2,
+      "batch": 1,
+      "quick": true
+    }
+  },
+  "codecs": [],
+  "lock": {
+    "bytes": 1413120,
+    "source": "process maximum working set",
+    "confirmed": true
+  },
+  "quick": true,
+  "elapsed_ns": 40139500
+}
+
+# main's measured profile:
+{
+  "version": 4,
+  "facts": {
+    "identity": {
+      "cpu": "windows processor architecture 12 level 3401 revision 0",
+      "os": "windows 0x23f00206",
+      "arch": "aarch64",
+      "cores": 4,
+      "memory": 17169387520,
+      "page": 4096
+    },
+    "page": {
+      "base": 4096,
+      "huge": [
+        2097152
+      ],
+      "transparent_huge": false,
+      "allocation_granularity": 65536
+    },
+    "cache_line": 64,
+    "cores": [
+      {
+        "id": 0,
+        "class": "Unknown",
+        "level": 0,
+        "numa": 0,
+        "l2_bytes": 1048576,
+        "physical": 0
+      },
+      {
+        "id": 1,
+        "class": "Unknown",
+        "level": 0,
+        "numa": 0,
+        "l2_bytes": 1048576,
+        "physical": 1
+      },
+      {
+        "id": 2,
+        "class": "Unknown",
+        "level": 0,
+        "numa": 0,
+        "l2_bytes": 1048576,
+        "physical": 2
+      },
+      {
+        "id": 3,
+        "class": "Unknown",
+        "level": 0,
+        "numa": 0,
+        "l2_bytes": 1048576,
+        "physical": 3
+      }
+    ],
+    "cpu_budget": null,
+    "memory": {
+      "total": 17169387520,
+      "available": 13895049216,
+      "address_bits": 64,
+      "limit": null
+    },
+    "power": "Mains",
+    "notes": [
+      "core classes are not queried on Windows in this phase; recorded unknown"
+    ]
+  },
+  "timer_overhead_ns": 34,
+  "syscall": {
+    "interval": {
+      "median": 209,
+      "lower": 209,
+      "upper": 209
+    },
+    "p99_ns": 237,
+    "min_ns": 206,
+    "samples": 16,
+    "batch": 32,
+    "quick": false
+  },
+  "faults": {
+    "base_ns": 401,
+    "base_region": {
+      "interval": {
+        "median": 104700,
+        "lower": 103600,
+        "upper": 109500
+      },
+      "p99_ns": 116800,
+      "min_ns": 100500,
+      "samples": 16,
+      "batch": 1,
+      "quick": false
+    },
+    "map_unmap_region": {
+      "interval": {
+        "median": 1800,
+        "lower": 1750,
+        "upper": 1850
+      },
+      "p99_ns": 3500,
+      "min_ns": 1700,
+      "samples": 16,
+      "batch": 2,
+      "quick": false
+    },
+    "populated_ns": null,
+    "huge_ns": null,
+    "pages_per_region": 256
+  },
+  "wake": {
+    "mean_ns": 1137,
+    "mean_lower_ns": 992,
+    "mean_upper_ns": 1290,
+    "p50_ns": 500,
+    "p99_ns": 9600,
+    "sd_ns": 2119,
+    "samples": 721,
+    "same_cpu_samples": 0,
+    "rounds": 5,
+    "rounds_agree": true,
+    "placement": "Pinned",
+    "asleep_confirmed": false,
+    "quick": true
+  },
+  "core_rtt": [],
+  "pinning": "Refused",
+  "memcpy": [
+    {
+      "bytes": 64,
+      "bytes_per_second": 64000000000,
+      "per_copy": {
+        "interval": {
+          "median": 1,
+          "lower": 1,
+          "upper": 2
+        },
+        "p99_ns": 2,
+        "min_ns": 1,
+        "samples": 17,
+        "batch": 2048,
+        "quick": true
+      }
+    },
+    {
+      "bytes": 128,
+      "bytes_per_second": 64000000000,
+      "per_copy": {
+        "interval": {
+          "median": 2,
+          "lower": 2,
+          "upper": 2
+        },
+        "p99_ns": 2,
+        "min_ns": 2,
+        "samples": 16,
+        "batch": 1024,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 256,
+      "bytes_per_second": 85333333333,
+      "per_copy": {
+        "interval": {
+          "median": 3,
+          "lower": 3,
+          "upper": 3
+        },
+        "p99_ns": 3,
+        "min_ns": 3,
+        "samples": 16,
+        "batch": 1024,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 512,
+      "bytes_per_second": 85333333333,
+      "per_copy": {
+        "interval": {
+          "median": 6,
+          "lower": 6,
+          "upper": 6
+        },
+        "p99_ns": 6,
+        "min_ns": 6,
+        "samples": 16,
+        "batch": 512,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 1024,
+      "bytes_per_second": 78769230769,
+      "per_copy": {
+        "interval": {
+          "median": 13,
+          "lower": 13,
+          "upper": 13
+        },
+        "p99_ns": 13,
+        "min_ns": 13,
+        "samples": 16,
+        "batch": 256,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 2048,
+      "bytes_per_second": 81920000000,
+      "per_copy": {
+        "interval": {
+          "median": 25,
+          "lower": 25,
+          "upper": 25
+        },
+        "p99_ns": 26,
+        "min_ns": 24,
+        "samples": 16,
+        "batch": 128,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 4096,
+      "bytes_per_second": 85333333333,
+      "per_copy": {
+        "interval": {
+          "median": 48,
+          "lower": 48,
+          "upper": 48
+        },
+        "p99_ns": 48,
+        "min_ns": 46,
+        "samples": 16,
+        "batch": 64,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 8192,
+      "bytes_per_second": 88086021505,
+      "per_copy": {
+        "interval": {
+          "median": 93,
+          "lower": 93,
+          "upper": 96
+        },
+        "p99_ns": 96,
+        "min_ns": 93,
+        "samples": 16,
+        "batch": 32,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 16384,
+      "bytes_per_second": 87614973262,
+      "per_copy": {
+        "interval": {
+          "median": 187,
+          "lower": 181,
+          "upper": 187
+        },
+        "p99_ns": 187,
+        "min_ns": 181,
+        "samples": 16,
+        "batch": 16,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 32768,
+      "bytes_per_second": 87381333333,
+      "per_copy": {
+        "interval": {
+          "median": 375,
+          "lower": 375,
+          "upper": 375
+        },
+        "p99_ns": 387,
+        "min_ns": 362,
+        "samples": 16,
+        "batch": 8,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 65536,
+      "bytes_per_second": 87381333333,
+      "per_copy": {
+        "interval": {
+          "median": 750,
+          "lower": 725,
+          "upper": 750
+        },
+        "p99_ns": 775,
+        "min_ns": 725,
+        "samples": 16,
+        "batch": 4,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 131072,
+      "bytes_per_second": 62415238095,
+      "per_copy": {
+        "interval": {
+          "median": 2100,
+          "lower": 2100,
+          "upper": 2150
+        },
+        "p99_ns": 2400,
+        "min_ns": 2100,
+        "samples": 16,
+        "batch": 2,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 262144,
+      "bytes_per_second": 54613333333,
+      "per_copy": {
+        "interval": {
+          "median": 4800,
+          "lower": 4700,
+          "upper": 4800
+        },
+        "p99_ns": 5400,
+        "min_ns": 4600,
+        "samples": 16,
+        "batch": 1,
+        "quick": false
+      }
+    },
+    {
+      "bytes": 524288,
+      "bytes_per_second": 44431186440,
+      "per_copy": {
+        "interval": {
+          "median": 11800,
+          "lower": 11700,
+          "upper": 12200
+        },
+        "p99_ns": 13900,
+        "min_ns": 11500,
+        "samples": 14,
+        "batch": 1,
+        "quick": true
+      }
+    },
+    {
+      "bytes": 1048576,
+      "bytes_per_second": 32263876923,
+      "per_copy": {
+        "interval": {
+          "median": 32500,
+          "lower": 27700,
+          "upper": 233000
+        },
+        "p99_ns": 32500,
+        "min_ns": 27700,
+        "samples": 3,
+        "batch": 1,
+        "quick": true
+      }
+    },
+    {
+      "bytes": 2097152,
+      "bytes_per_second": 5299853424,
+      "per_copy": {
+        "interval": {
+          "median": 395700,
+          "lower": 395700,
+          "upper": 395700
+        },
+        "p99_ns": 395700,
+        "min_ns": 395700,
+        "samples": 1,
+        "batch": 1,
+        "quick": true
+      }
+    },
+    {
+      "bytes": 4194304,
+      "bytes_per_second": 5400159649,
+      "per_copy": {
+        "interval": {
+          "median": 776700,
+          "lower": 776700,
+          "upper": 776700
+        },
+        "p99_ns": 776700,
+        "min_ns": 776700,
+        "samples": 1,
+        "batch": 1,
+        "quick": true
+      }
+    },
+    {
+      "bytes": 8388608,
+      "bytes_per_second": 5064667028,
+      "per_copy": {
+        "interval": {
+          "median": 1656300,
+          "lower": 1656300,
+          "upper": 1656300
+        },
+        "p99_ns": 1656300,
+        "min_ns": 1656300,
+        "samples": 1,
+        "batch": 1,
+        "quick": true
+      }
+    }
+  ],
+  "hash": {
+    "bytes": 4194304,
+    "blake3_bytes_per_second": 1445065977,
+    "per_buffer": {
+      "interval": {
+        "median": 2902500,
+        "lower": 2902500,
+        "upper": 2981200
+      },
+      "p99_ns": 2902500,
+      "min_ns": 2902500,
+      "samples": 2,
+      "batch": 1,
+      "quick": true
+    }
+  },
+  "codecs": [],
+  "lock": {
+    "bytes": 1413120,
+    "source": "process maximum working set",
+    "confirmed": true
+  },
+  "quick": true,
+  "elapsed_ns": 38415900
+}
+
+# shards: '' (empty: each build's own derivation)
+## run 1 of 1, 2026-11-07T19:39:13Z
+# dll started first: dll=S: main=T:
+# host: windows 0x23f00206 on windows processor architecture 12 level 3401 revision 0 (aarch64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 1048576 B, cache line 64 B
+# workload: 10 rounds of 1000 files of 4096 B per arm and pass, arms interleaved, first arm rotating
+# arm dll: S:/d
+# arm main: T:/d
+# warm-up: one untimed round per arm (1000 files each)
+# pass quiet: spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 25.2 µs, p99 43.2 µs, p999 488.1 µs, max 3950.2 µs over 29160 probes; 153.7 s
+fsbench	quiet	dll	create	10000	197300	399900	3511100	19814700
+fsbench	quiet	dll	write	10000	95000	218600	3218600	17919200
+fsbench	quiet	dll	fsync	10000	113600	167000	368100	17788900
+fsbench	quiet	dll	close	10000	4062400	6652900	17636900	19524900
+fsbench	quiet	dll	stat	10000	125400	201200	323800	11957000
+fsbench	quiet	dll	open	10000	3833400	5375400	7133800	12819900
+fsbench	quiet	dll	read	10000	43900	71000	130800	4279600
+fsbench	quiet	dll	rename	10000	411700	824900	3541100	21466400
+fsbench	quiet	dll	unlink	10000	262500	496200	1030000	20868900
+fsbench	quiet	main	create	10000	217500	340500	1578500	17206900
+fsbench	quiet	main	write	10000	98200	254500	901900	30408600
+fsbench	quiet	main	fsync	10000	122400	216500	928100	6034700
+fsbench	quiet	main	close	10000	4222100	5934700	10537800	31651200
+fsbench	quiet	main	stat	10000	158900	279600	735600	3848500
+fsbench	quiet	main	open	10000	3876700	5515000	26799300	370652600
+fsbench	quiet	main	read	10000	43500	67800	151700	5657100
+fsbench	quiet	main	rename	10000	480600	1203900	2147900	12960100
+fsbench	quiet	main	unlink	10000	297200	511400	1060300	125740600
+
+**quiet** (spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 25.2 µs, p99 43.2 µs, p999 488.1 µs, max 3950.2 µs over 29160 probes; 153.7 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | dll | main |
+|---|---|---|
+| create | 197.3 · 399.9 · 3511.1 · 19814.7 | 217.5 · 340.5 · 1578.5 · 17206.9 |
+| write | 95.0 · 218.6 · 3218.6 · 17919.2 | 98.2 · 254.5 · 901.9 · 30408.6 |
+| fsync | 113.6 · 167.0 · 368.1 · 17788.9 | 122.4 · 216.5 · 928.1 · 6034.7 |
+| close | 4062.4 · 6652.9 · 17636.9 · 19524.9 | 4222.1 · 5934.7 · 10537.8 · 31651.2 |
+| stat | 125.4 · 201.2 · 323.8 · 11957.0 | 158.9 · 279.6 · 735.6 · 3848.5 |
+| open | 3833.4 · 5375.4 · 7133.8 · 12819.9 | 3876.7 · 5515.0 · 26799.3 · 370652.6 |
+| read | 43.9 · 71.0 · 130.8 · 4279.6 | 43.5 · 67.8 · 151.7 · 5657.1 |
+| rename | 411.7 · 824.9 · 3541.1 · 21466.4 | 480.6 · 1203.9 · 2147.9 · 12960.1 |
+| unlink | 262.5 · 496.2 · 1030.0 · 20868.9 | 297.2 · 511.4 · 1060.3 · 125740.6 |
+
+unmounted: S:
+unmounted: T:
+# fsb-1542-1-dll's error output, 138 lines:
+slates anchor: instance fsb-1542-1-dll up; daemon pid 1396; 3 shards
+slates anchor: issuer surface: export SLATES_ANCHOR=slates-seg-fsb-1542-1-dll SLATES_ANCHOR_LEN=10969415680 SLATES_ANCHOR_CONTENT=slates-con-fsb-1542-1-dll SLATES_ANCHOR_CONTENT_LEN=24323555328
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 17169387520: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 1907709724: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 1413120: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 476927431: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 1568840: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 840: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 476927431: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 953854862: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 612: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 29475080815: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 12379: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: codec = lz4 true, zstd levels [1, 3, 9, 19], byte worth 33 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 384: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 827999: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 245333: metadata_class / (Slot<DirNode> + Slot<DirBlock>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 465749: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 1907709724: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 77624: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 20: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 1764: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 465749: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5292: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 3533: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 84000: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_listing_entries = 0: none: a Windows guest's stream ends with its daemon, so no number it holds outlives a restart (anchors [])
+slates daemon: inode_reserve = 18876: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 1754: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 238463715: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2483997: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2483997: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates-server: shard 1 initialized in 2512 µs
+slates daemon: instance fsb-1542-1-dll serving on 3 shards under the anchor
+slates-server: shard 2 initialized in 2841 µs
+slates-server: shard 0 initialized in 3211 µs
+phases	VolumeInfo	round	11004	4500	5200	17500	5115
+phases_hist	VolumeInfo	round	3700:7 3800:47 3900:213 4000:528 4100:867 4200:1142 4300:1325 4400:1338 4500:1158 4600:897 4700:723 4800:528 4900:412 5000:352 5100:284 5200:224 5300:183 5400:119 5500:80 5600:68 5700:47 5800:34 5900:35 6000:18 6100:21 6200:16 6300:10 6400:6 6500:9 6600:5 6700:1 6800:3 6900:2 7000:2 7100:2 7200:1 7300:2 7400:2 7500:1 7700:1 7800:1 8000:1 8100:1 8200:2 8500:1 8600:2 8700:3 8900:1 9100:1 9200:1 9300:1 9700:2 9900:1 11100:1 11200:1 11300:1 12200:1 12300:2 12400:2 12500:1 12600:2 12700:2 12800:4 12900:1 13000:4 13100:2 13200:1 13300:2 13400:1 13500:3 13700:2 13900:2 14000:2 14100:1 14200:1 14300:2 14400:3 14500:1 14600:2 14700:2 14800:4 14900:5 15000:6 15100:5 15200:7 15300:1 15400:5 15500:2 15600:9 15700:4 15800:3 15900:5 16000:2 16100:1 16200:6 16300:5 16400:4 16500:3 16600:7 16700:4 16800:2 16900:1 17000:2 17100:7 17200:4 17300:4 17400:3 17500:5 17600:1 17700:7 17800:4 17900:4 18000:1 18100:1 18200:2 18500:1 18700:2 19000:2 19300:2 19600:1 21000:11 22000:6 23000:5 24000:7 25000:4 26000:7 27000:2 28000:2 29000:2 30000:4 31000:1 32000:3 33000:1 34000:3 36000:1 38000:1 40000:1 42000:1 43000:1 46000:1 47000:1 50000:1 51000:1 52000:1 55000:1 57000:1 60000:2 61000:1 62000:1 80000:1 84000:1 111000:1 144000:1 925000:1 2175000:1
+phases	VolumeInfo	hop_in	11004	1800	2200	4700	2143
+phases	VolumeInfo	serve	11004	1300	1400	2100	1248
+phases	VolumeInfo	to_answer	11004	1100	1200	10800	1205
+phases_hist	VolumeInfo	to_answer	800:9 900:737 1000:3956 1100:4506 1200:1359 1300:120 1400:5 1500:2 1600:1 1700:1 1800:7 1900:4 2000:5 2100:4 2200:3 2300:3 2600:1 2800:1 3000:1 3100:3 3200:3 3300:1 3400:1 3600:1 4100:1 4500:2 4600:1 4700:1 4900:1 5000:1 5200:2 5300:1 5900:1 6100:1 6300:2 6400:4 6500:2 6600:1 6700:1 6800:3 6900:4 7000:2 7100:7 7200:4 7300:2 7500:2 7700:2 7800:1 8000:3 8100:2 8200:4 8400:2 8500:1 8600:2 8700:5 8800:6 8900:1 9000:6 9100:1 9200:4 9400:2 9500:5 9600:2 9700:4 9800:7 9900:4 10000:4 10100:4 10200:5 10300:5 10400:7 10500:4 10600:6 10700:5 10800:11 10900:7 11000:6 11100:4 11200:6 11300:3 11400:6 11500:3 11600:6 11700:3 11800:2 11900:2 12100:2 12200:2 12400:1 12500:3 12700:2 12800:3 12900:1 13100:1 13200:2 13300:2 13400:4 13500:1 13600:2 13800:1 13900:2 14000:1 14100:2 14300:1 14500:4 14800:1 14900:1 15200:1 15300:1 15600:2 15700:1 16600:2 17000:2 17500:1 17600:1 18400:1 18600:2 18800:1 21000:2 22000:1 24000:1 26000:1 28000:1 30000:1
+phases	Resolve	round	88014	5800	38000	56000	16212
+phases_hist	Resolve	round	2800:2 2900:5 3000:7 3100:7 3200:5 3300:4 3400:52 3500:248 3600:750 3700:1743 3800:2724 3900:3373 4000:3730 4100:3922 4200:3483 4300:3067 4400:2497 4500:2265 4600:2092 4700:2041 4800:1890 4900:1798 5000:1458 5100:1273 5200:1028 5300:866 5400:811 5500:763 5600:837 5700:819 5800:935 5900:938 6000:891 6100:908 6200:892 6300:791 6400:660 6500:533 6600:465 6700:466 6800:380 6900:366 7000:335 7100:299 7200:302 7300:304 7400:267 7500:285 7600:280 7700:233 7800:235 7900:249 8000:229 8100:191 8200:188 8300:155 8400:161 8500:144 8600:134 8700:120 8800:107 8900:125 9000:116 9100:125 9200:119 9300:147 9400:134 9500:140 9600:143 9700:178 9800:182 9900:181 10000:199 10100:190 10200:201 10300:203 10400:203 10500:207 10600:224 10700:235 10800:245 10900:241 11000:246 11100:229 11200:255 11300:263 11400:228 11500:204 11600:211 11700:181 11800:181 11900:161 12000:160 12100:119 12200:118 12300:104 12400:98 12500:118 12600:87 12700:97 12800:71 12900:68 13000:81 13100:99 13200:91 13300:89 13400:84 13500:86 13600:95 13700:85 13800:88 13900:85 14000:86 14100:88 14200:88 14300:86 14400:95 14500:86 14600:90 14700:70 14800:99 14900:98 15000:107 15100:104 15200:100 15300:106 15400:122 15500:126 15600:99 15700:135 15800:122 15900:112 16000:129 16100:127 16200:145 16300:128 16400:145 16500:143 16600:134 16700:131 16800:145 16900:145 17000:134 17100:108 17200:113 17300:122 17400:128 17500:101 17600:129 17700:97 17800:116 17900:84 18000:76 18100:98 18200:86 18300:97 18400:89 18500:83 18600:77 18700:75 18800:84 18900:90 19000:79 19100:75 19200:74 19300:81 19400:69 19500:71 19600:82 19700:77 19800:76 19900:87 20000:73 21000:907 22000:893 23000:710 24000:770 25000:789 26000:689 27000:564 28000:355 29000:289 30000:230 31000:210 32000:282 33000:327 34000:368 35000:424 36000:577 37000:690 38000:784 39000:844 40000:872 41000:828 42000:707 43000:650 44000:582 45000:493 46000:419 47000:329 48000:296 49000:226 50000:202 51000:185 52000:171 53000:116 54000:116 55000:117 56000:79 57000:73 58000:56 59000:44 60000:39 61000:28 62000:30 63000:26 64000:24 65000:23 66000:31 67000:13 68000:15 69000:22 70000:12 71000:13 72000:20 73000:17 74000:11 75000:11 76000:13 77000:10 78000:5 79000:9 80000:7 81000:13 82000:9 83000:5 84000:5 85000:5 86000:6 87000:3 88000:4 89000:5 90000:6 91000:7 93000:3 94000:1 95000:3 96000:10 97000:6 98000:3 99000:6 100000:6 101000:2 102000:4 103000:2 104000:2 105000:1 106000:5 109000:3 110000:4 111000:2 112000:2 113000:3 114000:1 115000:1 117000:4 118000:2 119000:1 120000:1 121000:1 122000:1 125000:1 126000:3 129000:2 131000:2 133000:1 136000:2 137000:1 138000:1 139000:1 142000:1 143000:2 147000:1 149000:1 151000:1 153000:2 154000:1 155000:2 156000:1 157000:1 158000:1 162000:1 164000:1 165000:1 167000:1 168000:2 178000:1 180000:1 185000:3 200000:1 225000:4 250000:3 275000:4 300000:7 325000:1 350000:4 425000:1 450000:1 475000:2 500000:3 525000:1 575000:2 600000:2 625000:2 650000:9 675000:13 700000:11 725000:10 750000:12 775000:1 800000:1 825000:2 900000:2 925000:1 950000:1 975000:1 1000000:1 1525000:1 1600000:1 1700000:1 1750000:1 1875000:1 1975000:1 2075000:1 2100000:1 2225000:1 2250000:1 2300000:1 2325000:1 2600000:1 2675000:1 2800000:1 2900000:1 2975000:1 3300000:1 3525000:1 3775000:1 3850000:1 3875000:1 3975000:1 4325000:1 4450000:1 18446744073709551615:12
+phases	Resolve	hop_in	88014	2300	17800	32000	8755
+phases	Resolve	serve	88014	1600	3500	5400	1878
+phases	Resolve	to_answer	88014	1100	15200	19900	4929
+phases_hist	Resolve	to_answer	800:72 900:3594 1000:19786 1100:21690 1200:6024 1300:851 1400:175 1500:171 1600:243 1700:299 1800:445 1900:564 2000:586 2100:520 2200:383 2300:232 2400:100 2500:49 2600:35 2700:19 2800:28 2900:55 3000:68 3100:80 3200:131 3300:119 3400:100 3500:79 3600:56 3700:34 3800:33 3900:63 4000:65 4100:117 4200:191 4300:263 4400:336 4500:365 4600:395 4700:473 4800:489 4900:433 5000:407 5100:353 5200:336 5300:264 5400:218 5500:160 5600:145 5700:122 5800:118 5900:116 6000:116 6100:122 6200:113 6300:138 6400:141 6500:96 6600:124 6700:85 6800:106 6900:81 7000:112 7100:73 7200:99 7300:107 7400:116 7500:115 7600:117 7700:91 7800:127 7900:111 8000:110 8100:119 8200:111 8300:128 8400:127 8500:127 8600:132 8700:122 8800:127 8900:121 9000:93 9100:95 9200:94 9300:114 9400:88 9500:119 9600:112 9700:108 9800:122 9900:130 10000:137 10100:171 10200:165 10300:193 10400:226 10500:231 10600:237 10700:237 10800:251 10900:256 11000:297 11100:276 11200:260 11300:299 11400:315 11500:264 11600:253 11700:280 11800:239 11900:279 12000:288 12100:237 12200:251 12300:257 12400:196 12500:229 12600:208 12700:181 12800:204 12900:219 13000:203 13100:229 13200:217 13300:206 13400:225 13500:231 13600:236 13700:233 13800:240 13900:271 14000:255 14100:240 14200:244 14300:274 14400:254 14500:251 14600:247 14700:246 14800:236 14900:249 15000:250 15100:272 15200:256 15300:283 15400:235 15500:270 15600:256 15700:277 15800:254 15900:282 16000:256 16100:246 16200:281 16300:257 16400:219 16500:257 16600:221 16700:224 16800:193 16900:239 17000:202 17100:200 17200:208 17300:185 17400:169 17500:177 17600:173 17700:156 17800:155 17900:160 18000:141 18100:137 18200:146 18300:131 18400:128 18500:120 18600:116 18700:110 18800:96 18900:107 19000:74 19100:86 19200:68 19300:72 19400:60 19500:56 19600:60 19700:69 19800:51 19900:43 20000:55 21000:287 22000:163 23000:121 24000:60 25000:50 26000:36 27000:29 28000:10 29000:7 30000:6 31000:8 32000:5 33000:3 34000:3 35000:2 36000:3 38000:2 39000:1 40000:1 42000:1 44000:2 45000:2 46000:1 47000:1 48000:1 50000:1 51000:1 52000:1 58000:1 86000:1 132000:1 145000:1 182000:1
+phases	Open	round	55005	8800	18100	28000	10212
+phases_hist	Open	round	2800:1 2900:2 3000:3 3100:8 3200:8 3300:10 3400:3 3500:9 3600:18 3700:85 3800:292 3900:734 4000:1065 4100:1421 4200:1670 4300:2223 4400:2581 4500:2116 4600:967 4700:423 4800:284 4900:341 5000:396 5100:507 5200:504 5300:528 5400:669 5500:910 5600:1027 5700:937 5800:801 5900:521 6000:309 6100:226 6200:157 6300:154 6400:100 6500:104 6600:121 6700:139 6800:134 6900:151 7000:140 7100:140 7200:125 7300:123 7400:101 7500:84 7600:85 7700:109 7800:122 7900:154 8000:170 8100:234 8200:281 8300:401 8400:447 8500:512 8600:604 8700:613 8800:593 8900:626 9000:548 9100:511 9200:439 9300:387 9400:364 9500:323 9600:299 9700:336 9800:272 9900:264 10000:231 10100:259 10200:253 10300:265 10400:241 10500:259 10600:225 10700:220 10800:223 10900:215 11000:176 11100:179 11200:169 11300:153 11400:134 11500:135 11600:128 11700:112 11800:122 11900:108 12000:133 12100:111 12200:111 12300:125 12400:101 12500:106 12600:122 12700:124 12800:109 12900:110 13000:155 13100:131 13200:145 13300:158 13400:160 13500:202 13600:189 13700:212 13800:238 13900:252 14000:264 14100:277 14200:277 14300:287 14400:344 14500:335 14600:344 14700:338 14800:364 14900:333 15000:353 15100:335 15200:373 15300:331 15400:319 15500:304 15600:283 15700:264 15800:311 15900:267 16000:265 16100:228 16200:246 16300:251 16400:226 16500:217 16600:219 16700:228 16800:222 16900:190 17000:224 17100:199 17200:203 17300:174 17400:207 17500:190 17600:180 17700:167 17800:171 17900:165 18000:128 18100:137 18200:134 18300:136 18400:147 18500:120 18600:120 18700:116 18800:119 18900:96 19000:98 19100:88 19200:99 19300:84 19400:81 19500:92 19600:89 19700:74 19800:74 19900:76 20000:92 21000:754 22000:682 23000:466 24000:369 25000:300 26000:181 27000:105 28000:71 29000:48 30000:38 31000:22 32000:36 33000:29 34000:31 35000:24 36000:34 37000:30 38000:25 39000:31 40000:19 41000:21 42000:17 43000:14 44000:12 45000:13 46000:11 47000:12 48000:8 49000:2 50000:2 51000:2 52000:3 53000:2 54000:4 56000:1 58000:1 59000:1 60000:2 62000:3 63000:2 64000:1 65000:1 66000:2 70000:1 72000:1 76000:1 79000:2 83000:2 84000:1 87000:1 90000:2 94000:1 96000:1 97000:1 100000:2 101000:1 106000:2 113000:1 114000:1 125000:1 140000:1 225000:3 275000:1 300000:1 325000:1 525000:2
+phases	Open	hop_in	55005	1900	3100	5900	2069
+phases	Open	serve	55005	2100	4000	6900	2358
+phases	Open	to_answer	55005	4600	11700	17500	5270
+phases_hist	Open	to_answer	700:5 800:88 900:1672 1000:7047 1100:6058 1200:982 1300:105 1400:175 1500:385 1600:507 1700:646 1800:1103 1900:1403 2000:1281 2100:809 2200:357 2300:152 2400:56 2500:37 2600:67 2700:135 2800:209 2900:213 3000:252 3100:203 3200:171 3300:91 3400:72 3500:54 3600:42 3700:45 3800:57 3900:123 4000:174 4100:274 4200:357 4300:498 4400:567 4500:695 4600:745 4700:785 4800:774 4900:732 5000:640 5100:542 5200:503 5300:513 5400:428 5500:403 5600:420 5700:368 5800:418 5900:427 6000:415 6100:452 6200:448 6300:464 6400:397 6500:359 6600:315 6700:312 6800:226 6900:186 7000:162 7100:126 7200:116 7300:116 7400:97 7500:117 7600:141 7700:168 7800:135 7900:165 8000:187 8100:222 8200:238 8300:228 8400:238 8500:230 8600:230 8700:224 8800:237 8900:208 9000:236 9100:230 9200:187 9300:212 9400:221 9500:212 9600:220 9700:228 9800:235 9900:219 10000:227 10100:248 10200:240 10300:305 10400:270 10500:316 10600:297 10700:333 10800:351 10900:365 11000:340 11100:319 11200:317 11300:326 11400:307 11500:317 11600:239 11700:268 11800:229 11900:210 12000:199 12100:194 12200:161 12300:185 12400:160 12500:157 12600:139 12700:143 12800:128 12900:140 13000:108 13100:107 13200:119 13300:99 13400:104 13500:98 13600:99 13700:102 13800:80 13900:76 14000:77 14100:70 14200:75 14300:66 14400:67 14500:64 14600:60 14700:59 14800:62 14900:57 15000:58 15100:60 15200:46 15300:67 15400:51 15500:45 15600:47 15700:54 15800:64 15900:46 16000:55 16100:54 16200:40 16300:38 16400:38 16500:36 16600:40 16700:33 16800:44 16900:47 17000:32 17100:42 17200:26 17300:40 17400:40 17500:28 17600:34 17700:23 17800:30 17900:22 18000:30 18100:25 18200:15 18300:19 18400:20 18500:19 18600:13 18700:8 18800:11 18900:14 19000:11 19100:10 19200:7 19300:16 19400:10 19500:8 19600:3 19700:9 19800:7 19900:11 20000:4 21000:49 22000:22 23000:15 24000:11 25000:13 26000:2 27000:3 28000:4 29000:3 30000:4 31000:1 32000:1 33000:1 34000:2 40000:1 41000:2 43000:1 45000:1 48000:1 49000:1 54000:1 55000:1 63000:1 70000:1 76000:1 78000:1 83000:1 97000:1 110000:2 116000:1 117000:1 225000:2
+phases	Create	round	11001	31000	38000	59000	32844
+phases_hist	Create	round	16600:1 17700:1 17900:1 18600:2 18800:1 19000:1 19300:1 19500:1 19600:1 21000:3 22000:8 23000:28 24000:89 25000:199 26000:339 27000:484 28000:706 29000:1046 30000:1440 31000:1600 32000:1316 33000:862 34000:622 35000:468 36000:324 37000:250 38000:169 39000:138 40000:71 41000:61 42000:67 43000:58 44000:53 45000:44 46000:48 47000:36 48000:40 49000:32 50000:37 51000:38 52000:40 53000:26 54000:33 55000:28 56000:28 57000:18 58000:23 59000:19 60000:4 61000:10 62000:9 63000:5 64000:6 65000:5 66000:6 67000:4 68000:3 69000:6 70000:4 71000:1 72000:3 73000:1 75000:1 76000:3 77000:1 80000:2 81000:1 82000:1 83000:3 86000:1 91000:1 94000:1 105000:1 119000:1 132000:1 134000:1 139000:1 250000:1 275000:2 300000:2 325000:1 350000:2 400000:1 525000:1 575000:1 2000000:1 3700000:1
+phases	Create	hop_in	11001	2100	3100	7800	2735
+phases	Create	serve	11001	9600	14300	32000	10997
+phases	Create	to_answer	11001	14000	16700	21000	13773
+phases_hist	Create	to_answer	1700:3 1800:1 2000:1 2100:2 2200:1 2400:2 2700:2 2900:1 3500:1 3700:1 4000:1 4100:1 4200:2 4300:1 4400:1 4600:2 4700:1 4800:2 4900:1 5100:1 5200:3 5400:2 5500:3 5700:2 5800:2 5900:1 6100:1 6200:2 6400:3 6500:2 6800:2 6900:1 7100:2 7200:3 7400:1 7700:1 8100:1 8500:1 8700:1 8800:2 8900:2 9000:3 9100:10 9200:9 9300:16 9400:8 9500:20 9600:24 9700:29 9800:50 9900:43 10000:57 10100:85 10200:96 10300:94 10400:117 10500:132 10600:135 10700:132 10800:170 10900:155 11000:163 11100:211 11200:159 11300:151 11400:143 11500:125 11600:145 11700:110 11800:126 11900:102 12000:106 12100:131 12200:108 12300:96 12400:88 12500:97 12600:104 12700:80 12800:113 12900:125 13000:112 13100:119 13200:125 13300:135 13400:144 13500:145 13600:144 13700:156 13800:144 13900:165 14000:187 14100:161 14200:186 14300:201 14400:202 14500:205 14600:233 14700:210 14800:236 14900:226 15000:203 15100:210 15200:196 15300:202 15400:177 15500:190 15600:200 15700:165 15800:138 15900:143 16000:125 16100:108 16200:98 16300:96 16400:68 16500:77 16600:96 16700:70 16800:68 16900:59 17000:54 17100:41 17200:51 17300:43 17400:30 17500:42 17600:38 17700:47 17800:33 17900:27 18000:20 18100:34 18200:22 18300:25 18400:21 18500:24 18600:13 18700:19 18800:19 18900:14 19000:9 19100:15 19200:12 19300:16 19400:10 19500:17 19600:10 19700:8 19800:11 19900:12 20000:10 21000:87 22000:53 23000:30 24000:12 25000:3 30000:2 32000:1 35000:1 38000:1 40000:2 42000:1 46000:1 58000:1
+phases	Read	round	10011	42000	54000	67000	43736
+phases_hist	Read	round	15700:1 16500:1 17200:1 17900:1 18500:1 18700:1 19800:1 21000:3 22000:1 23000:2 24000:1 25000:2 26000:19 27000:51 28000:91 29000:147 30000:206 31000:216 32000:309 33000:335 34000:316 35000:245 36000:260 37000:338 38000:443 39000:563 40000:602 41000:478 42000:404 43000:387 44000:379 45000:358 46000:325 47000:318 48000:325 49000:356 50000:404 51000:411 52000:383 53000:300 54000:239 55000:181 56000:142 57000:103 58000:61 59000:43 60000:31 61000:29 62000:26 63000:26 64000:11 65000:15 66000:17 67000:17 68000:11 69000:6 70000:5 71000:6 72000:4 73000:2 74000:2 75000:1 76000:2 77000:1 78000:2 79000:1 80000:2 82000:1 83000:1 85000:2 89000:1 90000:1 93000:1 95000:1 103000:1 112000:1 115000:1 118000:1 123000:1 124000:1 154000:1 155000:1 161000:1 188000:1 193000:1 200000:1 225000:2 250000:1 300000:3 375000:4 400000:1 475000:1 525000:1 600000:1 625000:2 775000:1 1075000:1 1550000:1 1825000:1
+phases	Read	hop_in	10011	16700	24000	38000	18678
+phases	Read	serve	10011	5100	6500	10300	5128
+phases	Read	to_answer	10011	21000	25000	27000	18710
+phases_hist	Read	to_answer	1100:1 1400:1 3000:1 3500:2 3600:1 3900:1 4200:2 4900:1 5100:1 5300:1 5400:1 6100:1 6300:1 6400:1 6600:2 6700:1 7000:1 7400:1 7600:1 7900:1 8000:1 8100:1 8600:1 8800:1 9100:2 9200:3 9500:2 9600:1 9800:1 9900:2 10000:2 10100:6 10200:4 10300:11 10400:10 10500:15 10600:22 10700:19 10800:19 10900:23 11000:37 11100:32 11200:25 11300:39 11400:35 11500:55 11600:57 11700:72 11800:59 11900:66 12000:63 12100:53 12200:73 12300:69 12400:77 12500:81 12600:57 12700:80 12800:67 12900:75 13000:72 13100:89 13200:97 13300:84 13400:87 13500:69 13600:92 13700:88 13800:79 13900:116 14000:102 14100:98 14200:117 14300:106 14400:91 14500:97 14600:104 14700:85 14800:93 14900:86 15000:94 15100:66 15200:79 15300:85 15400:67 15500:73 15600:79 15700:67 15800:75 15900:58 16000:47 16100:49 16200:58 16300:58 16400:56 16500:40 16600:31 16700:39 16800:36 16900:26 17000:27 17100:38 17200:20 17300:32 17400:31 17500:24 17600:23 17700:18 17800:17 17900:12 18000:21 18100:24 18200:10 18300:12 18400:17 18500:11 18600:14 18700:15 18800:7 18900:14 19000:8 19100:15 19200:12 19300:13 19400:16 19500:13 19600:12 19700:12 19800:15 19900:13 20000:15 21000:337 22000:803 23000:1360 24000:1411 25000:802 26000:238 27000:63 28000:33 29000:16 30000:16 31000:8 32000:9 33000:2 34000:1 35000:1 36000:1 39000:1 47000:1 85000:1
+phases	Write	round	11000	22000	31000	52000	32366
+phases_hist	Write	round	7600:1 8100:1 8400:1 8900:1 9000:1 9300:1 9500:2 9800:1 9900:1 10800:1 11000:1 11300:1 12200:2 12300:2 12400:6 12500:1 12600:2 12800:2 12900:2 13000:5 13100:5 13200:1 13300:1 13400:5 13500:8 13600:6 13700:6 13800:4 13900:12 14000:5 14100:13 14200:11 14300:14 14400:16 14500:11 14600:14 14700:22 14800:7 14900:14 15000:8 15100:12 15200:18 15300:15 15400:16 15500:19 15600:24 15700:22 15800:23 15900:14 16000:18 16100:20 16200:16 16300:17 16400:25 16500:23 16600:30 16700:28 16800:21 16900:21 17000:37 17100:37 17200:35 17300:40 17400:36 17500:49 17600:38 17700:53 17800:69 17900:66 18000:66 18100:57 18200:92 18300:91 18400:77 18500:96 18600:107 18700:103 18800:109 18900:128 19000:128 19100:135 19200:84 19300:130 19400:99 19500:121 19600:122 19700:110 19800:121 19900:108 20000:96 21000:1067 22000:1249 23000:1244 24000:990 25000:655 26000:432 27000:282 28000:210 29000:189 30000:185 31000:159 32000:160 33000:119 34000:92 35000:75 36000:58 37000:43 38000:39 39000:28 40000:38 41000:42 42000:25 43000:39 44000:37 45000:28 46000:23 47000:24 48000:27 49000:31 50000:23 51000:21 52000:21 53000:16 54000:14 55000:8 56000:9 57000:8 58000:6 59000:6 60000:4 61000:2 62000:3 64000:1 65000:1 67000:1 69000:2 76000:1 80000:1 85000:2 86000:1 87000:1 91000:1 92000:2 100000:1 102000:1 103000:1 109000:1 112000:1 116000:1 300000:1 675000:1 3175000:1 18446744073709551615:6
+phases	Write	hop_in	11000	3900	6200	27000	13739
+phases	Write	serve	11000	5400	8000	16600	5981
+phases	Write	to_answer	11000	11500	14700	19900	11730
+phases_hist	Write	to_answer	1100:4 1200:2 1300:1 1500:1 1700:2 1800:2 1900:3 2000:1 2100:1 2200:3 2900:3 3000:1 3100:1 3200:2 3300:1 3400:2 3500:3 3700:1 3800:1 3900:2 4100:2 4300:4 4400:1 4600:5 4700:6 4800:8 4900:7 5000:6 5100:2 5200:7 5300:7 5400:7 5500:5 5600:3 5700:1 5800:2 5900:3 6000:5 6100:3 6200:4 6300:3 6400:8 6500:9 6600:18 6700:13 6800:17 6900:27 7000:19 7100:17 7200:29 7300:26 7400:22 7500:20 7600:32 7700:25 7800:19 7900:24 8000:25 8100:35 8200:30 8300:29 8400:23 8500:23 8600:24 8700:31 8800:26 8900:31 9000:34 9100:23 9200:50 9300:37 9400:41 9500:56 9600:66 9700:73 9800:84 9900:111 10000:151 10100:166 10200:180 10300:211 10400:213 10500:301 10600:298 10700:316 10800:330 10900:286 11000:300 11100:322 11200:305 11300:291 11400:311 11500:306 11600:315 11700:318 11800:299 11900:280 12000:256 12100:244 12200:221 12300:205 12400:192 12500:187 12600:151 12700:122 12800:95 12900:101 13000:113 13100:71 13200:100 13300:78 13400:84 13500:71 13600:83 13700:91 13800:90 13900:72 14000:64 14100:77 14200:61 14300:64 14400:60 14500:61 14600:64 14700:55 14800:46 14900:54 15000:42 15100:43 15200:46 15300:46 15400:28 15500:35 15600:28 15700:34 15800:32 15900:34 16000:40 16100:31 16200:23 16300:23 16400:33 16500:21 16600:28 16700:19 16800:19 16900:11 17000:12 17100:8 17200:17 17300:11 17400:10 17500:9 17600:9 17700:12 17800:8 17900:9 18000:15 18100:7 18200:7 18300:7 18400:8 18500:9 18600:7 18700:2 18800:5 18900:6 19000:6 19100:4 19200:5 19300:12 19400:8 19500:6 19600:5 19700:8 19800:4 19900:3 20000:3 21000:35 22000:28 23000:13 24000:7 25000:7 26000:4 27000:2 29000:4 31000:1 32000:1 36000:1 49000:1 55000:1
+phases	Info	round	22001	3800	5300	24000	4607
+phases_hist	Info	round	1900:1 2000:1 2100:6 2200:8 2300:15 2400:13 2500:10 2600:13 2700:9 2800:11 2900:17 3000:57 3100:199 3200:468 3300:913 3400:1491 3500:1991 3600:2197 3700:2264 3800:1953 3900:1550 4000:1222 4100:972 4200:711 4300:596 4400:543 4500:432 4600:358 4700:354 4800:325 4900:268 5000:246 5100:234 5200:226 5300:206 5400:171 5500:171 5600:119 5700:108 5800:82 5900:74 6000:72 6100:38 6200:36 6300:26 6400:33 6500:28 6600:23 6700:20 6800:13 6900:12 7000:17 7100:12 7200:10 7300:6 7400:10 7500:7 7600:12 7700:8 7800:6 7900:6 8000:5 8100:2 8200:3 8300:4 8400:5 8500:5 8600:7 8700:1 8800:3 8900:4 9000:5 9100:5 9200:4 9300:7 9400:5 9500:2 9600:5 9700:3 9800:2 9900:3 10000:4 10100:3 10200:10 10300:9 10400:5 10500:7 10600:1 10700:8 10800:2 10900:9 11000:6 11100:5 11200:1 11300:4 11400:3 11500:4 11600:3 11700:6 11800:8 11900:3 12000:3 12100:6 12200:6 12300:6 12400:4 12500:9 12600:6 12700:3 12800:9 12900:5 13000:8 13100:7 13200:5 13300:8 13400:6 13500:4 13600:8 13700:5 13800:10 13900:4 14000:2 14100:6 14200:4 14300:9 14400:9 14500:6 14600:6 14700:12 14800:6 14900:7 15000:6 15100:7 15200:3 15300:9 15400:8 15500:6 15600:7 15700:2 15800:6 15900:4 16000:7 16100:1 16200:6 16300:7 16400:5 16500:8 16600:9 16700:6 16800:5 16900:8 17000:8 17100:2 17200:10 17300:3 17400:2 17500:8 17600:4 17700:11 17800:6 17900:2 18000:4 18100:3 18200:2 18300:3 18400:8 18500:3 18600:5 18700:3 18800:9 18900:3 19000:9 19100:8 19200:1 19300:2 19400:1 19500:5 19600:5 19700:2 19800:9 19900:6 20000:6 21000:51 22000:34 23000:37 24000:39 25000:35 26000:19 27000:28 28000:17 29000:13 30000:9 31000:13 32000:9 33000:5 34000:6 35000:2 36000:4 37000:1 38000:7 39000:3 40000:3 41000:3 42000:1 43000:1 44000:2 45000:2 47000:1 48000:1 54000:2 55000:1 71000:1 92000:1 97000:1 108000:1 127000:1 151000:1 180000:1 250000:1 625000:1
+phases	Info	hop_in	22001	2000	2800	10500	2277
+phases	Info	serve	22001	400	500	700	304
+phases	Info	to_answer	22001	1100	1300	12200	1391
+phases_hist	Info	to_answer	800:19 900:615 1000:4717 1100:8859 1200:5178 1300:1291 1400:175 1500:40 1600:31 1700:27 1800:30 1900:23 2000:21 2100:12 2200:19 2300:6 2400:2 2500:4 2600:5 2700:2 2800:1 2900:3 3000:3 3100:1 3200:5 3300:3 3400:9 3500:2 3600:6 3700:4 3800:4 3900:8 4000:7 4100:3 4200:2 4300:1 4400:5 4500:5 4600:3 4700:3 4800:1 4900:2 5000:6 5100:3 5200:3 5300:5 5400:5 5500:7 5600:4 5700:3 5800:9 5900:10 6000:9 6100:10 6200:8 6300:6 6400:7 6500:9 6600:8 6700:6 6800:8 6900:6 7000:9 7100:9 7200:14 7300:10 7400:10 7500:7 7600:10 7700:7 7800:9 7900:7 8000:15 8100:9 8200:11 8300:6 8400:10 8500:7 8600:7 8700:9 8800:7 8900:10 9000:4 9100:10 9200:10 9300:7 9400:12 9500:7 9600:11 9700:9 9800:11 9900:12 10000:12 10100:9 10200:10 10300:8 10400:12 10500:11 10600:8 10700:8 10800:9 10900:10 11000:15 11100:6 11200:13 11300:19 11400:4 11500:9 11600:8 11700:8 11800:11 11900:8 12000:8 12100:9 12200:7 12300:8 12400:7 12500:3 12600:6 12700:7 12800:2 12900:4 13000:5 13100:5 13200:10 13300:3 13400:10 13500:9 13600:6 13700:5 13800:3 13900:3 14000:3 14100:2 14200:3 14400:6 14500:3 14600:2 14700:4 14800:4 14900:3 15000:6 15100:3 15200:2 15300:1 15400:4 15500:4 15600:2 15700:1 15800:1 15900:1 16000:2 16100:2 16200:4 16300:4 16400:2 16500:1 16600:2 16700:2 16900:1 17100:1 17400:1 17500:2 17600:1 17700:2 17800:2 17900:1 18000:1 18200:1 18300:1 18400:1 18600:1 18700:1 18900:1 19300:1 19400:1 19500:1 19600:1 20000:2 21000:1 22000:1 23000:3 24000:3 25000:1 26000:3 27000:3 28000:1 29000:1 30000:1 35000:1 38000:1
+phases	SetSize	round	11000	32000	48000	146000	50795
+phases_hist	SetSize	round	6000:2 6100:2 6200:1 6300:2 6400:3 6500:6 6600:6 6700:3 6800:14 6900:8 7000:6 7100:7 7200:8 7300:6 7400:4 7500:6 7600:6 7700:7 7800:6 7900:5 8000:6 8100:8 8200:1 8300:9 8400:6 8500:7 8600:6 8700:7 8800:10 8900:8 9000:12 9100:11 9200:7 9300:8 9400:10 9500:17 9600:14 9700:15 9800:10 9900:8 10000:4 10100:9 10200:4 10300:7 10400:1 10500:4 10600:5 10700:1 11100:3 11200:3 11300:1 11400:6 11500:1 11700:2 11800:2 11900:1 12100:5 12200:3 12300:3 12400:2 12500:2 12600:4 12700:1 12800:6 12900:6 13000:9 13100:3 13200:6 13300:8 13400:8 13500:10 13600:15 13700:12 13800:16 13900:12 14000:15 14100:16 14200:12 14300:11 14400:18 14500:11 14600:16 14700:15 14800:23 14900:14 15000:21 15100:14 15200:18 15300:20 15400:10 15500:15 15600:15 15700:19 15800:15 15900:9 16000:9 16100:20 16200:19 16300:8 16400:19 16500:12 16600:15 16700:19 16800:16 16900:15 17000:15 17100:12 17200:21 17300:13 17400:17 17500:15 17600:22 17700:11 17800:26 17900:17 18000:14 18100:16 18200:14 18300:15 18400:17 18500:12 18600:12 18700:15 18800:19 18900:16 19000:16 19100:12 19200:16 19300:16 19400:17 19500:23 19600:15 19700:13 19800:19 19900:15 20000:16 21000:215 22000:336 23000:582 24000:613 25000:455 26000:289 27000:211 28000:206 29000:242 30000:343 31000:409 32000:412 33000:430 34000:430 35000:401 36000:425 37000:402 38000:409 39000:342 40000:306 41000:243 42000:206 43000:168 44000:122 45000:93 46000:78 47000:71 48000:76 49000:67 50000:38 51000:35 52000:26 53000:28 54000:28 55000:21 56000:17 57000:18 58000:20 59000:16 60000:16 61000:15 62000:5 63000:12 64000:12 65000:13 66000:8 67000:14 68000:10 69000:11 70000:10 71000:6 72000:10 73000:15 74000:13 75000:5 76000:16 77000:7 78000:11 79000:8 80000:14 81000:10 82000:8 83000:9 84000:8 85000:7 86000:17 87000:8 88000:14 89000:6 90000:16 91000:12 92000:2 93000:9 94000:11 95000:9 96000:9 97000:5 98000:2 99000:4 100000:8 101000:4 102000:3 103000:4 104000:2 105000:2 106000:3 107000:1 108000:5 109000:3 110000:1 111000:1 112000:1 113000:2 114000:2 115000:2 116000:1 117000:3 119000:2 120000:3 121000:5 122000:5 123000:6 124000:5 125000:7 126000:9 127000:5 128000:11 129000:7 130000:4 131000:9 132000:6 133000:10 134000:17 135000:12 136000:4 137000:6 138000:10 139000:6 140000:7 141000:8 142000:6 143000:3 144000:4 145000:6 146000:5 147000:3 148000:5 149000:2 150000:3 151000:3 152000:3 153000:2 154000:2 155000:1 156000:1 157000:2 158000:1 159000:1 160000:2 163000:2 164000:1 166000:3 173000:1 174000:1 181000:1 185000:2 189000:2 192000:1 225000:1 250000:7 275000:8 300000:5 325000:3 350000:6 375000:1 400000:4 425000:1 500000:1 525000:1 550000:2 575000:1 600000:2 625000:1 650000:1 675000:2 725000:1 925000:1 975000:1 1000000:1 1100000:1 1225000:2 18446744073709551615:10
+phases	SetSize	hop_in	11000	10700	25000	114000	30435
+phases	SetSize	serve	11000	1800	2300	3400	1842
+phases	SetSize	to_answer	11000	13700	17100	21000	13122
+phases_hist	SetSize	to_answer	900:7 1000:23 1100:49 1200:36 1300:18 1400:7 1500:1 1600:3 1700:2 1800:7 1900:13 2000:10 2100:9 2200:11 2300:7 2400:3 2500:3 2600:6 2700:4 2800:8 2900:6 3000:7 3100:24 3200:29 3300:35 3400:26 3500:28 3600:15 3700:9 3800:10 3900:7 4000:5 4100:12 4200:5 4300:8 4400:4 4500:10 4600:5 4700:11 4800:11 4900:17 5000:9 5100:16 5200:13 5300:17 5400:12 5500:8 5600:14 5700:17 5800:15 5900:14 6000:6 6100:12 6200:18 6300:9 6400:12 6500:12 6600:22 6700:23 6800:24 6900:30 7000:21 7100:17 7200:20 7300:13 7400:22 7500:22 7600:32 7700:29 7800:21 7900:23 8000:24 8100:22 8200:24 8300:24 8400:21 8500:25 8600:23 8700:28 8800:24 8900:28 9000:22 9100:32 9200:29 9300:35 9400:46 9500:26 9600:36 9700:44 9800:30 9900:43 10000:45 10100:41 10200:46 10300:37 10400:47 10500:58 10600:59 10700:71 10800:65 10900:83 11000:78 11100:82 11200:119 11300:106 11400:99 11500:124 11600:112 11700:128 11800:128 11900:135 12000:124 12100:135 12200:140 12300:129 12400:112 12500:130 12600:126 12700:124 12800:150 12900:138 13000:133 13100:113 13200:118 13300:124 13400:111 13500:111 13600:113 13700:112 13800:109 13900:125 14000:134 14100:116 14200:115 14300:128 14400:131 14500:148 14600:123 14700:153 14800:166 14900:162 15000:163 15100:196 15200:157 15300:196 15400:182 15500:159 15600:167 15700:148 15800:170 15900:131 16000:141 16100:143 16200:124 16300:106 16400:92 16500:102 16600:91 16700:72 16800:61 16900:65 17000:71 17100:58 17200:59 17300:51 17400:44 17500:46 17600:52 17700:43 17800:40 17900:43 18000:43 18100:43 18200:40 18300:30 18400:31 18500:30 18600:28 18700:20 18800:21 18900:25 19000:19 19100:26 19200:16 19300:21 19400:22 19500:17 19600:14 19700:16 19800:23 19900:15 20000:11 21000:75 22000:51 23000:17 24000:15 25000:4 27000:4 28000:4 29000:3 30000:1 31000:1 46000:2 57000:1 114000:1 135000:1
+phases	Rename	round	11000	35000	42000	56000	36652
+phases_hist	Rename	round	19500:1 21000:1 22000:2 23000:1 24000:2 25000:42 26000:93 27000:123 28000:215 29000:363 30000:459 31000:549 32000:756 33000:921 34000:1177 35000:1274 36000:1046 37000:835 38000:638 39000:476 40000:412 41000:327 42000:295 43000:222 44000:164 45000:115 46000:91 47000:66 48000:61 49000:35 50000:30 51000:23 52000:21 53000:16 54000:12 55000:15 56000:11 57000:12 58000:8 59000:7 60000:4 61000:2 62000:2 63000:2 64000:2 65000:2 66000:3 67000:4 68000:1 70000:1 71000:2 73000:1 74000:1 79000:2 80000:2 81000:3 82000:1 86000:2 92000:1 95000:1 101000:2 117000:1 136000:1 149000:1 163000:1 184000:1 197000:1 225000:3 250000:2 400000:4 425000:8 450000:5 475000:1 500000:3 525000:3 550000:1 575000:1 600000:2 625000:2 975000:1
+phases	Rename	hop_in	11000	1700	2000	2700	1694
+phases	Rename	serve	11000	11600	16400	23000	12343
+phases	Rename	to_answer	11000	15500	18100	23000	15071
+phases_hist	Rename	to_answer	900:1 1600:1 1800:1 2100:2 2200:2 3400:1 3600:1 3800:1 3900:1 4000:1 4200:1 4300:2 4400:1 4500:1 4600:1 4700:1 4800:1 5200:1 5300:2 5500:1 5700:1 5900:2 6100:1 6300:1 6800:2 6900:2 7000:1 7100:4 7200:1 7300:1 7400:1 7600:2 7900:1 8300:1 8500:1 8700:1 8800:2 8900:5 9000:3 9100:2 9200:5 9300:8 9400:4 9500:10 9600:9 9700:10 9800:24 9900:21 10000:24 10100:38 10200:42 10300:65 10400:92 10500:94 10600:112 10700:128 10800:150 10900:136 11000:133 11100:134 11200:113 11300:95 11400:77 11500:64 11600:51 11700:50 11800:49 11900:45 12000:45 12100:59 12200:60 12300:47 12400:52 12500:52 12600:39 12700:38 12800:50 12900:53 13000:53 13100:49 13200:56 13300:39 13400:52 13500:79 13600:89 13700:79 13800:94 13900:87 14000:137 14100:118 14200:134 14300:108 14400:137 14500:124 14600:143 14700:167 14800:161 14900:154 15000:158 15100:178 15200:206 15300:206 15400:227 15500:246 15600:237 15700:253 15800:255 15900:251 16000:266 16100:255 16200:232 16300:244 16400:210 16500:205 16600:195 16700:174 16800:173 16900:168 17000:157 17100:140 17200:110 17300:112 17400:99 17500:103 17600:96 17700:102 17800:80 17900:71 18000:56 18100:70 18200:56 18300:74 18400:48 18500:44 18600:34 18700:37 18800:42 18900:39 19000:33 19100:30 19200:28 19300:27 19400:38 19500:28 19600:22 19700:18 19800:18 19900:18 20000:24 21000:207 22000:89 23000:33 24000:19 25000:12 26000:9 27000:11 28000:5 29000:7 30000:3 31000:2 33000:1 34000:1 35000:1 37000:1 39000:1 40000:1 44000:2 51000:1 60000:1 65000:1 77000:1 130000:1
+phases	Flush	round	11000	15700	21000	37000	16787
+phases_hist	Flush	round	4700:1 5700:1 6100:1 6200:1 6400:2 6600:3 6700:2 6800:2 6900:3 7000:1 7100:1 7200:4 7300:9 7400:7 7500:9 7600:5 7700:9 7800:12 7900:11 8000:9 8100:7 8200:4 8300:10 8400:10 8500:7 8600:5 8700:1 8800:4 8900:5 9000:14 9100:6 9200:3 9300:6 9400:6 9500:7 9600:8 9700:5 9800:6 9900:7 10000:7 10100:4 10200:11 10300:18 10400:25 10500:33 10600:44 10700:51 10800:64 10900:82 11000:88 11100:82 11200:76 11300:78 11400:61 11500:61 11600:51 11700:42 11800:39 11900:42 12000:25 12100:41 12200:37 12300:29 12400:45 12500:34 12600:31 12700:23 12800:29 12900:30 13000:22 13100:26 13200:32 13300:36 13400:28 13500:33 13600:44 13700:54 13800:64 13900:90 14000:125 14100:152 14200:158 14300:214 14400:199 14500:211 14600:177 14700:228 14800:198 14900:225 15000:207 15100:213 15200:213 15300:234 15400:231 15500:205 15600:249 15700:236 15800:218 15900:190 16000:165 16100:162 16200:165 16300:140 16400:149 16500:126 16600:125 16700:139 16800:100 16900:108 17000:104 17100:102 17200:100 17300:117 17400:91 17500:95 17600:110 17700:110 17800:87 17900:75 18000:106 18100:72 18200:79 18300:73 18400:79 18500:76 18600:67 18700:49 18800:64 18900:61 19000:54 19100:51 19200:51 19300:50 19400:61 19500:57 19600:59 19700:47 19800:51 19900:61 20000:56 21000:424 22000:192 23000:137 24000:112 25000:68 26000:69 27000:36 28000:29 29000:24 30000:18 31000:18 32000:16 33000:10 34000:13 35000:10 36000:7 37000:7 38000:9 39000:6 40000:6 41000:10 42000:6 43000:3 44000:6 45000:3 46000:2 47000:4 48000:2 49000:1 51000:1 52000:1 57000:2 61000:1 62000:1 65000:1 66000:1 67000:1 76000:1 77000:2 79000:2 81000:2 82000:3 83000:2 84000:1 91000:1 92000:1 93000:2 95000:1 119000:1 121000:1 143000:1 151000:1 182000:1 188000:2 196000:1 197000:1 225000:3 250000:4 275000:1 300000:1 325000:1 400000:1 425000:1 550000:1
+phases	Flush	hop_in	11000	2200	3100	9700	2453
+phases	Flush	serve	11000	300	400	500	196
+phases	Flush	to_answer	11000	9200	12200	16700	9257
+phases_hist	Flush	to_answer	800:1 900:3 1000:13 1100:23 1200:24 1300:8 1400:4 1500:4 1600:9 1700:6 1800:13 1900:26 2000:12 2100:23 2200:4 2300:4 2400:2 2500:4 2600:1 2800:2 2900:8 3000:15 3100:11 3200:6 3300:10 3400:5 3500:6 3600:6 3700:2 3800:5 3900:11 4000:7 4100:13 4200:9 4300:9 4400:15 4500:12 4600:14 4700:17 4800:14 4900:18 5000:8 5100:6 5200:12 5300:14 5400:15 5500:20 5600:26 5700:40 5800:66 5900:90 6000:105 6100:116 6200:113 6300:135 6400:124 6500:113 6600:88 6700:53 6800:55 6900:52 7000:37 7100:35 7200:20 7300:19 7400:19 7500:31 7600:28 7700:50 7800:55 7900:77 8000:107 8100:146 8200:154 8300:186 8400:233 8500:282 8600:318 8700:355 8800:378 8900:429 9000:437 9100:393 9200:358 9300:334 9400:314 9500:250 9600:210 9700:197 9800:160 9900:150 10000:139 10100:116 10200:126 10300:113 10400:116 10500:131 10600:118 10700:121 10800:113 10900:122 11000:123 11100:126 11200:106 11300:118 11400:89 11500:112 11600:104 11700:104 11800:88 11900:79 12000:97 12100:80 12200:71 12300:69 12400:69 12500:68 12600:58 12700:53 12800:41 12900:62 13000:43 13100:43 13200:33 13300:46 13400:34 13500:26 13600:23 13700:22 13800:23 13900:12 14000:15 14100:17 14200:15 14300:18 14400:17 14500:14 14600:10 14700:10 14800:9 14900:9 15000:14 15100:6 15200:7 15300:7 15400:7 15500:6 15600:6 15700:3 15800:5 15900:5 16000:5 16100:4 16200:3 16300:8 16400:4 16500:5 16600:5 16700:7 16800:3 16900:3 17000:5 17100:1 17200:3 17300:7 17500:2 17600:2 17700:3 17800:5 17900:3 18000:2 18100:1 18200:1 18300:3 18400:5 18500:2 18700:5 18800:2 18900:3 19000:3 19100:1 19200:1 19300:1 19400:1 19500:1 19600:1 19700:1 19900:1 21000:10 22000:10 23000:4 24000:3 25000:4 26000:3 27000:1 28000:1 31000:1 41000:1
+phases	Cleanup	round	22001	32000	63000	850000	107199
+phases_hist	Cleanup	round	11800:1 12100:1 12500:3 12600:2 12900:1 13000:1 13100:4 13200:8 13300:6 13400:4 13500:12 13600:6 13700:2 13800:7 13900:10 14000:9 14100:8 14200:8 14300:8 14400:8 14500:13 14600:9 14700:10 14800:14 14900:17 15000:11 15100:12 15200:9 15300:12 15400:10 15500:7 15600:10 15700:11 15800:12 15900:9 16000:9 16100:10 16200:13 16300:10 16400:17 16500:10 16600:12 16700:15 16800:12 16900:12 17000:5 17100:15 17200:2 17300:10 17400:19 17500:14 17600:19 17700:19 17800:18 17900:22 18000:15 18100:25 18200:19 18300:27 18400:19 18500:28 18600:30 18700:23 18800:18 18900:28 19000:28 19100:31 19200:33 19300:35 19400:29 19500:29 19600:36 19700:28 19800:61 19900:52 20000:38 21000:491 22000:649 23000:777 24000:882 25000:1004 26000:1046 27000:947 28000:838 29000:792 30000:865 31000:874 32000:1009 33000:950 34000:978 35000:935 36000:776 37000:685 38000:625 39000:549 40000:509 41000:385 42000:277 43000:188 44000:150 45000:119 46000:116 47000:113 48000:119 49000:91 50000:105 51000:93 52000:78 53000:74 54000:62 55000:74 56000:67 57000:69 58000:62 59000:57 60000:54 61000:43 62000:37 63000:41 64000:52 65000:35 66000:38 67000:40 68000:30 69000:26 70000:35 71000:20 72000:27 73000:18 74000:15 75000:25 76000:11 77000:17 78000:12 79000:22 80000:13 81000:14 82000:17 83000:11 84000:9 85000:4 86000:6 87000:8 88000:12 89000:14 90000:6 91000:2 92000:2 93000:6 94000:6 95000:6 96000:3 97000:4 98000:6 99000:3 100000:4 101000:2 102000:4 103000:6 104000:3 105000:4 106000:2 107000:4 108000:4 109000:3 110000:3 111000:2 112000:4 115000:3 116000:2 117000:1 118000:2 119000:2 120000:1 121000:2 122000:2 123000:1 124000:3 125000:2 128000:1 129000:2 130000:1 133000:1 134000:1 137000:2 138000:2 140000:3 142000:3 143000:2 144000:2 146000:3 147000:1 149000:1 150000:1 153000:1 155000:2 157000:2 159000:2 160000:1 162000:1 164000:3 165000:1 166000:1 167000:1 168000:2 169000:1 170000:1 172000:3 175000:1 176000:2 177000:1 179000:2 180000:1 182000:1 183000:1 184000:2 186000:1 187000:2 188000:1 189000:2 190000:1 191000:6 192000:2 195000:1 197000:1 198000:1 199000:1 225000:13 250000:9 275000:7 300000:6 325000:40 350000:170 375000:221 400000:81 425000:20 450000:8 475000:10 500000:3 525000:9 550000:2 575000:6 600000:2 675000:2 700000:11 725000:50 750000:122 775000:139 800000:146 825000:107 850000:86 875000:40 900000:28 925000:11 950000:4 975000:2 1000000:5 1025000:6 1050000:6 1075000:3 1100000:2 1125000:1 1150000:3 1175000:1 1275000:1 1325000:1 1375000:1 1425000:1 1500000:1 1575000:1 1625000:1 2150000:1 2375000:1 2700000:1 2975000:1 3100000:1 3175000:1 3375000:2 3450000:1 3475000:1 3775000:1 4125000:1 4975000:1 18446744073709551615:55
+phases	Cleanup	hop_in	22001	13000	29000	825000	83367
+phases	Cleanup	serve	22001	3000	6200	12100	3095
+phases	Cleanup	to_answer	22001	13300	19600	27000	13437
+phases_hist	Cleanup	to_answer	900:1 1300:1 1500:4 1600:9 1700:32 1800:31 1900:47 2000:45 2100:59 2200:39 2300:49 2400:27 2500:29 2600:25 2700:21 2800:29 2900:54 3000:41 3100:51 3200:70 3300:66 3400:59 3500:45 3600:55 3700:52 3800:47 3900:42 4000:33 4100:41 4200:37 4300:39 4400:33 4500:27 4600:35 4700:35 4800:32 4900:23 5000:36 5100:41 5200:28 5300:33 5400:28 5500:31 5600:38 5700:34 5800:48 5900:38 6000:32 6100:34 6200:41 6300:44 6400:41 6500:25 6600:41 6700:42 6800:27 6900:34 7000:37 7100:55 7200:57 7300:33 7400:39 7500:31 7600:40 7700:39 7800:37 7900:36 8000:42 8100:54 8200:46 8300:37 8400:39 8500:39 8600:40 8700:54 8800:58 8900:62 9000:53 9100:54 9200:63 9300:66 9400:97 9500:78 9600:119 9700:125 9800:154 9900:156 10000:194 10100:202 10200:214 10300:244 10400:258 10500:232 10600:240 10700:258 10800:221 10900:200 11000:235 11100:217 11200:228 11300:194 11400:195 11500:192 11600:193 11700:236 11800:231 11900:222 12000:221 12100:226 12200:201 12300:214 12400:207 12500:211 12600:207 12700:211 12800:178 12900:203 13000:184 13100:184 13200:180 13300:192 13400:175 13500:175 13600:140 13700:137 13800:156 13900:154 14000:173 14100:174 14200:172 14300:194 14400:170 14500:199 14600:193 14700:242 14800:207 14900:192 15000:223 15100:217 15200:187 15300:243 15400:228 15500:209 15600:236 15700:224 15800:184 15900:195 16000:198 16100:171 16200:200 16300:153 16400:133 16500:160 16600:133 16700:138 16800:134 16900:109 17000:133 17100:120 17200:87 17300:98 17400:89 17500:101 17600:105 17700:87 17800:97 17900:83 18000:85 18100:69 18200:87 18300:83 18400:71 18500:68 18600:59 18700:66 18800:72 18900:54 19000:67 19100:59 19200:55 19300:66 19400:52 19500:65 19600:54 19700:53 19800:40 19900:49 20000:38 21000:393 22000:313 23000:290 24000:254 25000:247 26000:159 27000:150 28000:74 29000:43 30000:29 31000:16 32000:9 33000:3 34000:5 35000:2 37000:3 38000:4 40000:2 41000:1 45000:1 46000:1 49000:2 50000:2 52000:1 53000:1 54000:2 55000:1 57000:1 59000:1 62000:2 84000:1 125000:1 173000:1
+phases	Release	round	66006	5000	36000	126000	17459
+phases_hist	Release	round	2100:7 2200:3 2300:8 2400:11 2500:7 2600:4 2700:9 2800:34 2900:189 3000:513 3100:968 3200:1463 3300:1847 3400:2205 3500:2349 3600:2694 3700:2579 3800:2395 3900:2343 4000:2152 4100:1880 4200:1648 4300:1350 4400:1096 4500:942 4600:876 4700:869 4800:983 4900:1007 5000:1000 5100:941 5200:931 5300:882 5400:730 5500:659 5600:514 5700:421 5800:337 5900:323 6000:249 6100:212 6200:213 6300:203 6400:166 6500:134 6600:137 6700:122 6800:111 6900:109 7000:96 7100:73 7200:75 7300:54 7400:53 7500:52 7600:41 7700:29 7800:35 7900:31 8000:32 8100:35 8200:38 8300:30 8400:36 8500:31 8600:34 8700:54 8800:40 8900:32 9000:51 9100:33 9200:40 9300:50 9400:56 9500:75 9600:64 9700:73 9800:67 9900:69 10000:61 10100:60 10200:71 10300:52 10400:58 10500:62 10600:51 10700:44 10800:38 10900:39 11000:41 11100:39 11200:52 11300:62 11400:61 11500:54 11600:36 11700:57 11800:56 11900:61 12000:56 12100:59 12200:70 12300:54 12400:62 12500:59 12600:59 12700:58 12800:53 12900:54 13000:61 13100:63 13200:73 13300:66 13400:58 13500:85 13600:85 13700:97 13800:92 13900:101 14000:93 14100:111 14200:143 14300:150 14400:139 14500:143 14600:131 14700:128 14800:120 14900:134 15000:118 15100:118 15200:124 15300:103 15400:109 15500:110 15600:92 15700:91 15800:69 15900:85 16000:88 16100:97 16200:69 16300:79 16400:58 16500:64 16600:58 16700:53 16800:56 16900:66 17000:54 17100:73 17200:60 17300:55 17400:69 17500:65 17600:57 17700:67 17800:54 17900:65 18000:55 18100:52 18200:63 18300:52 18400:78 18500:70 18600:68 18700:66 18800:68 18900:60 19000:81 19100:86 19200:87 19300:71 19400:84 19500:75 19600:77 19700:76 19800:74 19900:90 20000:91 21000:967 22000:953 23000:924 24000:847 25000:636 26000:470 27000:414 28000:421 29000:429 30000:511 31000:596 32000:643 33000:621 34000:559 35000:508 36000:420 37000:389 38000:390 39000:315 40000:289 41000:279 42000:223 43000:220 44000:223 45000:204 46000:199 47000:166 48000:170 49000:177 50000:154 51000:159 52000:147 53000:143 54000:120 55000:101 56000:95 57000:79 58000:60 59000:62 60000:61 61000:43 62000:29 63000:55 64000:27 65000:43 66000:38 67000:34 68000:30 69000:33 70000:20 71000:18 72000:20 73000:19 74000:25 75000:29 76000:15 77000:18 78000:13 79000:15 80000:20 81000:18 82000:14 83000:18 84000:17 85000:9 86000:15 87000:14 88000:10 89000:8 90000:9 91000:7 92000:6 93000:5 94000:8 95000:6 96000:10 97000:9 98000:10 99000:9 100000:8 101000:12 102000:9 103000:6 104000:9 105000:9 106000:13 107000:11 108000:15 109000:11 110000:10 111000:15 112000:16 113000:9 114000:18 115000:18 116000:15 117000:27 118000:12 119000:22 120000:21 121000:12 122000:17 123000:21 124000:27 125000:16 126000:29 127000:18 128000:20 129000:18 130000:34 131000:17 132000:22 133000:16 134000:15 135000:18 136000:20 137000:17 138000:16 139000:8 140000:9 141000:17 142000:9 143000:7 144000:9 145000:12 146000:9 147000:10 148000:11 149000:9 150000:10 151000:7 152000:6 153000:9 154000:8 155000:2 156000:3 157000:2 158000:5 159000:4 160000:6 161000:1 162000:4 163000:7 164000:5 165000:2 166000:1 167000:4 168000:2 169000:4 170000:1 171000:1 172000:1 174000:1 175000:3 176000:6 177000:2 178000:1 179000:1 181000:2 182000:3 183000:1 184000:1 185000:1 186000:1 187000:1 189000:1 190000:2 192000:1 193000:1 194000:2 196000:1 197000:2 198000:1 225000:14 250000:6 275000:6 300000:6 325000:4 350000:11 375000:4 400000:2 425000:4 450000:5 475000:3 500000:2 525000:3 550000:4 575000:1 625000:2 650000:1 675000:7 700000:4 725000:1 750000:2 775000:1 800000:2 825000:2 850000:2 875000:1 900000:3 925000:5 950000:2 975000:1 1000000:3 1025000:2 1050000:1 1075000:3 1100000:1 1125000:1 1150000:2 1175000:1 1200000:1 1225000:1 1250000:1 1275000:2 1300000:1 1350000:3 1375000:1 1400000:1 1425000:1 1450000:2 1475000:2 1500000:1 1525000:1 1575000:1 1625000:1 1675000:1 1725000:1 1800000:3 1900000:1 2250000:1 2550000:1 2800000:1 2825000:1 2850000:1 2875000:1 2975000:1 3175000:1 3200000:1 3325000:1 3475000:1 3725000:1 3825000:1 4300000:1 4575000:1 18446744073709551615:5
+phases	Release	hop_in	66006	2300	19300	105000	11049
+phases	Release	serve	66006	900	2600	5200	1244
+phases	Release	to_answer	66006	1100	12700	18400	4399
+phases_hist	Release	to_answer	800:76 900:3859 1000:17001 1100:15766 1200:3960 1300:423 1400:111 1500:70 1600:35 1700:44 1800:47 1900:69 2000:56 2100:46 2200:42 2300:82 2400:88 2500:138 2600:144 2700:177 2800:230 2900:228 3000:194 3100:192 3200:167 3300:153 3400:132 3500:129 3600:121 3700:88 3800:86 3900:58 4000:93 4100:85 4200:78 4300:74 4400:84 4500:75 4600:98 4700:74 4800:94 4900:111 5000:134 5100:112 5200:143 5300:141 5400:169 5500:143 5600:148 5700:150 5800:133 5900:126 6000:126 6100:109 6200:108 6300:121 6400:144 6500:128 6600:111 6700:130 6800:151 6900:126 7000:117 7100:118 7200:138 7300:126 7400:134 7500:148 7600:129 7700:122 7800:118 7900:118 8000:120 8100:120 8200:112 8300:103 8400:118 8500:137 8600:111 8700:137 8800:114 8900:136 9000:126 9100:152 9200:160 9300:171 9400:188 9500:220 9600:217 9700:211 9800:206 9900:249 10000:236 10100:212 10200:264 10300:244 10400:257 10500:264 10600:253 10700:254 10800:267 10900:302 11000:279 11100:243 11200:292 11300:255 11400:290 11500:288 11600:312 11700:289 11800:304 11900:294 12000:277 12100:294 12200:259 12300:310 12400:257 12500:274 12600:284 12700:243 12800:251 12900:252 13000:201 13100:186 13200:227 13300:169 13400:179 13500:159 13600:179 13700:150 13800:148 13900:151 14000:160 14100:136 14200:154 14300:138 14400:130 14500:134 14600:136 14700:124 14800:115 14900:124 15000:112 15100:141 15200:115 15300:114 15400:109 15500:102 15600:99 15700:84 15800:114 15900:79 16000:72 16100:80 16200:65 16300:69 16400:63 16500:67 16600:53 16700:55 16800:62 16900:52 17000:46 17100:48 17200:48 17300:43 17400:48 17500:41 17600:44 17700:34 17800:27 17900:43 18000:32 18100:24 18200:24 18300:27 18400:27 18500:25 18600:28 18700:22 18800:24 18900:14 19000:19 19100:19 19200:14 19300:17 19400:11 19500:14 19600:5 19700:11 19800:9 19900:8 20000:19 21000:102 22000:51 23000:57 24000:21 25000:32 26000:23 27000:14 28000:11 29000:7 30000:6 31000:9 32000:7 33000:4 34000:2 35000:1 36000:1 37000:1 38000:3 39000:3 41000:1 42000:2 43000:1 46000:1 49000:1 50000:3 51000:1 52000:1 53000:3 66000:1 97000:1 99000:1 108000:1 127000:2 132000:1 800000:1
+phases	cb_get_volume_info	interface	11004	5200	6000	18600	5883
+phases	cb_get_volume_info	between	11004	31000	42000	55000	32048
+phases	cb_get_security_by_name	interface	88014	8300	42000	62000	18709
+phases	cb_get_security_by_name	between	88012	56000	162000	775000	1570283
+phases	cb_create	interface	11001	33000	41000	62000	35072
+phases	cb_create	between	11001	14400	21000	32000	15433
+phases	cb_open	interface	55005	10400	22000	33000	12146
+phases	cb_open	between	55005	500	8800	12500	1989
+phases	cb_cleanup	interface	66006	500	40000	775000	36818
+phases	cb_cleanup	between	66006	77000	4050000	18446744073709551615	1316149
+phases	cb_close	interface	66006	6200	37000	127000	18549
+phases	cb_close	between	66006	26000	44000	115000	366802
+phases	cb_read	interface	10011	46000	57000	71000	47174
+phases	cb_read	between	10011	575000	650000	850000	575376
+phases	cb_write	interface	11000	25000	35000	56000	35226
+phases	cb_write	between	11000	67000	83000	108000	5986228
+phases	cb_flush	interface	11000	22000	28000	49000	22799
+phases	cb_flush	between	11000	26000	33000	41000	948510
+phases	cb_get_file_info	interface	11001	5000	7500	28000	6188
+phases	cb_get_file_info	between	11001	70000	92000	121000	72417
+phases	cb_set_file_size	interface	11000	34000	50000	148000	52635
+phases	cb_set_file_size	between	11000	101000	123000	161000	191071
+phases	cb_can_delete	interface	11001	300	300	500	161
+phases	cb_can_delete	between	11001	200	400	600	158
+phases	cb_rename	interface	11000	37000	44000	59000	38253
+phases	cb_rename	between	11000	400	500	900	314
+# fsb-1542-1-main's error output, 180 lines:
+slates anchor: instance fsb-1542-1-main up; daemon pid 648; 3 shards
+slates anchor: issuer surface: export SLATES_ANCHOR=slates-seg-fsb-1542-1-main SLATES_ANCHOR_LEN=10969415680 SLATES_ANCHOR_CONTENT=slates-con-fsb-1542-1-main SLATES_ANCHOR_CONTENT_LEN=24323555328
+slates anchor: a daemon's beat is lapsed once older than the 1000 ms liveness window plus this anchor's own measured lateness p99, over its last 100 timed waits
+slates anchor: a starting daemon is killed once it makes no CPU progress for the 1000 ms liveness window, or runs that much CPU without its first beat, in its own CPU time (read from the OS)
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 17169387520: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 1907709724: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 1413120: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 476927431: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 1568840: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 912: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 476927431: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 953854862: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 661: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 28416693766: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 12958: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: page_fault_ns = 418: the profile's measured base-page fault cost (at least one) (anchors ["faults.base_ns"])
+slates daemon: prefault_reserve_bytes = min(the shard's last write burst, reserve_per_shard = 1907709724, the arena's free bytes): the free content pages an idle shard keeps pre-faulted; the burst is measured at each idle tick (anchors ["reserve_per_shard", "content.allocated_bytes"])
+slates daemon: codec = lz4 true, zstd levels [1, 3, 9, 19], byte worth 35 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 384: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 827999: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 624659: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 465749: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 1907709724: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 77624: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 19: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 1764: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 465749: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5292: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 3533: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 91200: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_listing_entries = 0: none: a Windows guest's stream ends with its daemon, so no number it holds outlives a restart (anchors [])
+slates daemon: inode_reserve = 18876: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 1754: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 238463715: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2483997: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2483997: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates-server: shard 1 initialized in 1804 µs
+slates-server: shard 2 initialized in 1793 µs
+slates-server: shard 0 initialized in 1875 µs
+slates daemon: instance fsb-1542-1-main serving on 3 shards under the anchor
+slates-winfsp: reply spin window = 5700 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+phases	irp1	decode	66013	200	300	400	106
+phases	irp1	operation	66013	20000	91000	123000	52895
+phases	irp1	callback	66013	19400	90000	122000	52329
+phases	irp1	record	66013	400	800	1100	343
+phases	irp1	confirm_finish	66005	3700	5200	81000	8777
+phases	irp1	send_alone	66013	14600	24000	30000	16181
+phases	irp1	service	132021	12400	73000	116000	32151
+phases	irp1	acknowledge	66013	200	300	500	120
+phases	irp3	decode	66005	200	300	400	128
+phases	irp3	operation	66005	1400	45000	375000	22269
+phases	irp3	callback	66005	800	43000	375000	21561
+phases	irp3	record	66005	400	900	1500	424
+phases	irp3	send_alone	66005	12500	24000	33000	14192
+phases	irp3	service	132000	1800	30000	73000	12619
+phases	irp3	acknowledge	66005	200	400	600	163
+phases	irp4	decode	66005	200	300	400	84
+phases	irp4	operation	66005	8000	44000	146000	29225
+phases	irp4	callback	66005	7600	43000	145000	28823
+phases	irp4	record	66005	300	700	1000	265
+phases	irp4	send_alone	66005	3500	6200	9400	3672
+phases	irp4	service	109768	5700	39000	139000	18542
+phases	irp4	acknowledge	66005	200	300	400	95
+phases	irp5	decode	8540	200	300	400	120
+phases	irp5	operation	8540	37000	44000	75000	71242
+phases	irp5	callback	8540	36000	44000	74000	70814
+phases	irp5	record	8540	300	400	1000	253
+phases	irp5	send_alone	8540	9600	11600	19000	11339
+phases	irp5	service	17075	14500	42000	62000	36730
+phases	irp5	acknowledge	8540	200	300	300	126
+phases	irp6	decode	11000	200	300	400	121
+phases	irp6	operation	11000	23000	35000	63000	24452
+phases	irp6	callback	11000	22000	34000	62000	23728
+phases	irp6	record	11000	500	800	1100	409
+phases	irp6	send_alone	11000	10200	13400	19500	10740
+phases	irp6	service	22000	4300	30000	55000	13648
+phases	irp6	acknowledge	11000	200	300	400	126
+phases	irp8	decode	33001	200	300	400	134
+phases	irp8	operation	33001	29000	43000	105000	27512
+phases	irp8	callback	33001	28000	42000	104000	26779
+phases	irp8	record	33001	500	800	1100	446
+phases	irp8	send_alone	33001	13300	17800	25000	13929
+phases	irp8	service	66000	5800	53000	79000	17406
+phases	irp8	acknowledge	33001	200	300	600	142
+phases	irp11	decode	11000	200	300	400	104
+phases	irp11	operation	11000	11300	16800	57000	14506
+phases	irp11	callback	11000	10800	15700	57000	13956
+phases	irp11	record	11000	400	700	1000	324
+phases	irp11	send_alone	11000	10100	13100	17100	10447
+phases	irp11	service	22000	7000	15800	42000	8474
+phases	irp11	acknowledge	11000	200	300	300	105
+phases	irp12	decode	11003	200	300	400	109
+phases	irp12	operation	11003	6400	7200	15800	7071
+phases	irp12	callback	11003	5900	6700	15100	6613
+phases	irp12	record	11003	400	600	800	366
+phases	irp12	send_alone	11003	9100	9700	12200	9022
+phases	irp12	service	22004	5600	8400	12200	4705
+phases	irp12	acknowledge	11003	200	300	300	105
+phases	irp31	capture	253102	400	700	900	319
+phases	irp31	send_alone	1	10900	10900	10900	10800
+phases	irp31	service	2801	700	900	5500	777
+phases	irp31	begin	253103	200	200	300	78
+phases	RenameName	round	14829	7300	8800	26000	7214
+phases_hist	RenameName	round	3600:2 3700:14 3800:39 3900:113 4000:229 4100:412 4200:530 4300:547 4400:474 4500:333 4600:232 4700:185 4800:128 4900:115 5000:73 5100:52 5200:54 5300:35 5400:32 5500:27 5600:26 5700:35 5800:36 5900:57 6000:81 6100:122 6200:205 6300:267 6400:319 6500:362 6600:301 6700:239 6800:301 6900:488 7000:444 7100:294 7200:167 7300:203 7400:350 7500:425 7600:607 7700:524 7800:494 7900:445 8000:405 8100:380 8200:393 8300:432 8400:365 8500:319 8600:282 8700:237 8800:196 8900:160 9000:136 9100:135 9200:90 9300:90 9400:77 9500:60 9600:70 9700:46 9800:51 9900:26 10000:33 10100:37 10200:30 10300:15 10400:6 10500:7 10600:7 10700:7 10800:3 10900:3 11000:4 11100:2 11200:3 11300:2 11400:2 11700:1 12100:1 12200:2 12600:2 12700:1 12800:1 12900:1 13000:2 13400:2 13800:1 14000:1 14100:1 14900:1 15400:2 15500:4 15600:1 15700:1 15800:1 15900:1 16000:4 16100:1 16200:3 16300:1 16400:3 16600:1 16900:2 17000:1 17200:3 17500:1 17700:2 17800:1 17900:1 18000:1 18200:1 18300:1 18400:2 18500:1 18600:5 18700:2 18800:2 18900:1 19000:2 19100:1 19200:1 19300:5 19600:3 19700:3 19800:2 19900:1 20000:1 21000:15 22000:8 23000:9 24000:6 25000:13 26000:21 27000:17 28000:18 29000:20 30000:9 31000:11 32000:8 33000:9 34000:9 35000:4 36000:6 37000:4 38000:3 39000:3 40000:2 41000:1 43000:1 44000:2 45000:1 47000:1 49000:2 52000:2 54000:1 56000:1 61000:1 77000:1 130000:1 156000:1 225000:1 275000:1 550000:1
+phases	RenameName	hop_in	14829	1900	2300	6400	1843
+phases	RenameName	serve	14829	4300	5300	7100	4110
+phases	RenameName	to_answer	14829	800	1200	10000	906
+phases_hist	RenameName	to_answer	400:55 500:2520 600:3413 700:1010 800:579 900:563 1000:1767 1100:2861 1200:1303 1300:282 1400:61 1500:46 1600:18 1700:16 1800:16 1900:11 2000:5 2100:3 2200:4 2300:2 2400:6 2500:4 2600:5 2700:5 2800:3 2900:1 3100:2 3200:3 3300:1 3400:4 3500:1 3700:3 3800:1 4100:2 4200:2 4300:1 5000:1 5100:1 5300:1 5400:2 5500:1 5600:1 5900:4 6000:5 6100:2 6200:2 6300:1 6400:3 6500:3 6600:3 6700:1 6900:2 7000:3 7100:1 7200:2 7300:2 7500:4 7600:2 7700:2 7900:2 8000:1 8100:1 8200:4 8300:3 8400:4 8500:3 8600:2 8700:2 8800:2 8900:3 9000:4 9100:2 9200:4 9300:1 9400:2 9500:1 9600:2 9700:4 9800:2 9900:3 10000:5 10100:6 10200:4 10300:4 10400:3 10500:4 10600:6 10700:1 10800:6 10900:3 11000:6 11100:9 11200:4 11300:3 11400:3 11500:4 11600:1 11700:6 11800:3 11900:5 12000:2 12100:2 12200:3 12300:2 12400:3 12500:3 12600:2 12700:2 12900:3 13000:2 13100:5 13200:2 13500:2 13700:1 14100:2 14200:2 14400:1 14500:2 14600:2 14900:1 15000:1 15100:1 15400:1 15500:1 15800:1 16000:1 16600:2 17000:1 17200:1 19200:1 19300:1 19900:2 22000:3 23000:1 30000:1
+phases	Confirm	round	66005	3100	4400	80000	8139
+phases_hist	Confirm	round	2200:3 2300:20 2400:324 2500:1383 2600:3372 2700:5471 2800:6945 2900:7505 3000:7004 3100:5806 3200:4190 3300:3137 3400:2585 3500:2267 3600:2005 3700:1762 3800:1448 3900:1139 4000:992 4100:714 4200:523 4300:490 4400:449 4500:421 4600:392 4700:419 4800:356 4900:377 5000:306 5100:304 5200:220 5300:183 5400:142 5500:110 5600:89 5700:86 5800:74 5900:74 6000:68 6100:67 6200:50 6300:49 6400:45 6500:38 6600:40 6700:23 6800:24 6900:22 7000:17 7100:13 7200:17 7300:9 7400:11 7500:11 7600:6 7700:8 7800:5 7900:7 8000:7 8100:7 8200:8 8300:4 8400:17 8500:10 8600:8 8700:5 8800:4 8900:3 9000:7 9100:7 9200:5 9300:4 9400:5 9500:2 9600:7 9700:5 9800:6 9900:5 10000:8 10100:3 10200:3 10300:4 10400:3 10500:7 10600:3 10700:3 10800:3 10900:1 11000:5 11200:1 11300:2 11400:1 11500:1 11700:1 11800:1 12000:1 12100:1 12200:2 12500:1 12800:1 12900:1 13000:2 13100:1 13200:1 13500:1 13700:2 14000:1 14200:1 14500:1 14700:1 15000:1 15100:1 15200:1 15400:1 15500:1 15900:2 16000:1 16100:3 16200:1 16300:1 16400:2 16500:1 16600:2 16700:1 16800:2 16900:1 17100:1 17200:1 17300:2 17400:2 17600:1 17700:2 17800:1 17900:1 18000:4 18100:2 18200:4 18300:4 18400:2 18500:2 18600:2 18700:1 18800:2 18900:1 19000:1 19100:3 19200:1 19300:2 19400:6 19500:2 19600:5 19700:6 19800:4 19900:3 20000:7 21000:32 22000:27 23000:26 24000:20 25000:34 26000:24 27000:19 28000:37 29000:23 30000:27 31000:27 32000:14 33000:19 34000:18 35000:12 36000:19 37000:23 38000:36 39000:29 40000:24 41000:23 42000:36 43000:43 44000:43 45000:58 46000:43 47000:40 48000:36 49000:23 50000:25 51000:13 52000:20 53000:14 54000:10 55000:10 56000:11 57000:12 58000:17 59000:14 60000:16 61000:22 62000:25 63000:22 64000:16 65000:26 66000:25 67000:27 68000:19 69000:31 70000:14 71000:18 72000:24 73000:19 74000:37 75000:23 76000:23 77000:24 78000:20 79000:14 80000:23 81000:16 82000:17 83000:14 84000:14 85000:14 86000:17 87000:20 88000:11 89000:15 90000:16 91000:17 92000:23 93000:21 94000:16 95000:15 96000:13 97000:17 98000:19 99000:18 100000:13 101000:17 102000:13 103000:12 104000:11 105000:5 106000:9 107000:8 108000:7 109000:6 110000:5 111000:4 113000:2 114000:4 115000:3 116000:3 117000:1 118000:2 120000:3 121000:1 123000:3 124000:1 126000:1 128000:1 129000:2 130000:1 132000:2 133000:2 134000:2 135000:2 136000:2 137000:1 139000:2 141000:4 142000:3 143000:2 144000:1 145000:4 146000:5 147000:2 148000:7 149000:3 150000:2 151000:5 152000:5 153000:3 154000:6 155000:1 156000:5 157000:1 158000:2 159000:2 160000:2 161000:1 162000:4 163000:6 164000:1 165000:5 166000:1 167000:4 168000:2 169000:1 170000:1 172000:1 173000:1 175000:4 177000:1 186000:1 188000:1 189000:2 190000:1 191000:1 192000:2 195000:1 197000:1 199000:1 200000:1 225000:11 250000:6 275000:7 300000:3 325000:1 350000:4 375000:1 400000:2 475000:1 500000:2 525000:1 550000:1 575000:2 600000:4 625000:2 650000:2 675000:1 750000:1 775000:2 825000:2 850000:1 925000:1 950000:2 1350000:1 1425000:1 1500000:1 1625000:1 2425000:1 2675000:1 3400000:1 3500000:1 3650000:1 18446744073709551615:5
+phases	Confirm	hop_in	66005	2000	2700	66000	6476
+phases	Confirm	serve	66005	300	400	600	231
+phases	Confirm	to_answer	66005	600	700	13600	876
+phases_hist	Confirm	to_answer	400:493 500:21401 600:35757 700:5736 800:203 900:27 1000:35 1100:69 1200:47 1300:23 1400:12 1500:10 1600:8 1700:7 1800:6 1900:7 2000:6 2100:8 2200:7 2300:5 2400:2 2500:2 2600:2 2700:3 2800:2 2900:4 3000:5 3100:2 3200:4 3300:5 3400:6 3500:11 3600:7 3700:7 3800:9 3900:3 4000:8 4100:3 4200:11 4300:11 4400:13 4500:9 4600:17 4700:11 4800:11 4900:20 5000:20 5100:17 5200:12 5300:17 5400:21 5500:17 5600:14 5700:13 5800:3 5900:14 6000:7 6100:8 6200:6 6300:5 6400:2 6500:3 6600:9 6700:7 6800:3 6900:5 7100:6 7200:6 7300:3 7500:4 7600:5 7700:5 7800:4 7900:10 8000:5 8100:12 8200:10 8300:8 8400:9 8500:6 8600:11 8700:5 8800:10 8900:4 9000:6 9100:9 9200:7 9300:11 9400:6 9500:4 9600:5 9700:4 9800:8 9900:10 10000:3 10100:11 10200:11 10300:12 10400:11 10500:24 10600:14 10700:13 10800:12 10900:19 11000:20 11100:22 11200:25 11300:16 11400:34 11500:25 11600:18 11700:27 11800:15 11900:27 12000:24 12100:22 12200:30 12300:34 12400:30 12500:36 12600:37 12700:26 12800:31 12900:35 13000:43 13100:32 13200:29 13300:27 13400:35 13500:46 13600:33 13700:22 13800:37 13900:31 14000:17 14100:29 14200:20 14300:29 14400:21 14500:26 14600:24 14700:23 14800:22 14900:14 15000:12 15100:14 15200:17 15300:10 15400:13 15500:10 15600:7 15700:14 15800:11 15900:4 16000:8 16100:7 16200:9 16300:6 16400:6 16500:1 16600:6 16700:9 16800:6 16900:7 17000:4 17100:3 17200:3 17300:7 17400:1 17500:2 17600:4 17700:2 17800:5 17900:2 18000:4 18100:1 18200:4 18300:4 18400:1 18500:2 18600:1 18700:3 18900:2 19000:1 19100:4 19200:2 19300:2 19400:2 19600:1 19800:3 19900:2 21000:17 22000:9 23000:5 24000:5 25000:4 26000:3 27000:4 28000:2 29000:2 30000:4 31000:3 34000:1 35000:1 41000:1 46000:2 55000:2 56000:1 57000:1 60000:1 61000:1 63000:1 65000:1 67000:1 70000:1 72000:1 77000:1 81000:1 86000:1 116000:1 131000:1 300000:1 1300000:1
+phases	VolumeInfo	round	11003	4700	5400	12400	5372
+phases_hist	VolumeInfo	round	3600:5 3700:9 3800:13 3900:21 4000:57 4100:135 4200:377 4300:632 4400:922 4500:1275 4600:1437 4700:1396 4800:1170 4900:881 5000:594 5100:401 5200:277 5300:173 5400:138 5500:130 5600:104 5700:117 5800:100 5900:84 6000:62 6100:73 6200:41 6300:41 6400:30 6500:26 6600:19 6700:14 6800:10 6900:3 7000:6 7100:13 7200:5 7300:2 7400:5 7500:5 7600:3 7700:2 7800:3 7900:3 8000:5 8100:5 8200:2 8300:3 8400:5 8500:2 8600:5 8700:3 8900:3 9000:1 9100:3 9300:2 9400:2 9600:3 9700:2 9800:2 9900:2 10000:3 10100:4 10200:3 10300:4 10500:1 10700:2 10800:2 11000:1 11100:1 11500:1 12000:3 12100:2 12300:1 12400:1 13300:1 13600:1 14000:1 15900:1 17000:1 17200:1 17900:2 18900:1 19100:1 19800:1 21000:2 23000:7 24000:4 25000:3 26000:2 27000:5 28000:4 29000:2 30000:7 31000:7 32000:11 33000:6 34000:4 35000:5 36000:3 37000:5 38000:2 42000:1 44000:1 49000:1 52000:1 54000:2 59000:1 60000:3 76000:1 94000:1 108000:1 141000:1 142000:1 250000:1 275000:1 500000:1 1575000:1 1625000:1
+phases	VolumeInfo	hop_in	11003	2200	2500	8100	2668
+phases	VolumeInfo	serve	11003	1300	1400	2300	1258
+phases	VolumeInfo	to_answer	11003	600	700	1600	602
+phases_hist	VolumeInfo	to_answer	400:8 500:2504 600:6703 700:1513 800:95 900:9 1000:7 1100:15 1200:24 1300:5 1400:7 1500:1 1600:3 1700:4 1800:1 1900:1 2000:1 2100:2 2200:2 2700:1 2800:1 3100:1 3900:2 4000:1 4100:1 4200:1 4600:1 4900:1 5800:1 6100:1 7100:1 7200:1 7400:1 7800:1 9000:1 9800:1 10000:1 10100:1 10200:1 10700:2 10800:1 10900:2 11000:1 11100:1 11200:2 11300:2 11400:1 11600:2 11700:2 11800:1 11900:3 12000:4 12100:2 12200:2 12300:2 12400:1 12600:2 12700:3 12800:1 13000:4 13100:1 13200:1 13300:1 13500:1 13700:2 14100:1 14400:2 14500:2 14600:2 14700:1 14800:2 14900:1 15000:1 15100:2 15300:2 15600:2 15700:1 15900:2 16600:1 16900:1 17200:1 21000:1 22000:1 24000:1 25000:1 26000:1 36000:1
+phases	Resolve	round	88013	4900	37000	56000	20300
+phases_hist	Resolve	round	2300:3 2400:10 2500:19 2600:23 2700:37 2800:60 2900:50 3000:49 3100:77 3200:198 3300:610 3400:1025 3500:1565 3600:2044 3700:2698 3800:3271 3900:3708 4000:3886 4100:3937 4200:3863 4300:3542 4400:2992 4500:2773 4600:2458 4700:2228 4800:2275 4900:2148 5000:2187 5100:2073 5200:1844 5300:1703 5400:1600 5500:1616 5600:1488 5700:1450 5800:1367 5900:1291 6000:1143 6100:1102 6200:914 6300:857 6400:721 6500:688 6600:670 6700:493 6800:478 6900:435 7000:456 7100:453 7200:448 7300:375 7400:402 7500:358 7600:363 7700:306 7800:290 7900:260 8000:228 8100:221 8200:202 8300:156 8400:160 8500:135 8600:132 8700:114 8800:109 8900:93 9000:78 9100:68 9200:85 9300:85 9400:68 9500:64 9600:74 9700:62 9800:37 9900:45 10000:44 10100:45 10200:49 10300:48 10400:32 10500:18 10600:32 10700:31 10800:21 10900:31 11000:24 11100:16 11200:15 11300:11 11400:15 11500:10 11600:12 11700:13 11800:7 11900:10 12000:9 12100:7 12200:6 12300:5 12400:4 12500:5 12600:3 12700:6 12900:3 13000:6 13100:3 13200:2 13300:1 13400:2 13600:3 13700:1 13800:2 13900:1 14000:2 14100:2 14200:3 14300:1 14400:3 14500:4 14600:3 14700:1 14800:1 14900:1 15000:6 15100:4 15200:2 15300:2 15400:1 15500:3 15600:5 15800:2 15900:5 16000:1 16100:2 16200:3 16300:1 16400:2 16500:2 16600:2 16700:3 16800:3 16900:3 17000:4 17100:1 17200:1 17300:2 17400:5 17500:1 17600:1 17800:2 17900:3 18000:4 18100:1 18200:2 18300:1 18400:5 18500:3 18700:3 18800:4 18900:2 19000:2 19100:6 19200:4 19300:6 19400:7 19500:1 19600:3 19700:2 19800:5 19900:4 20000:5 21000:46 22000:47 23000:66 24000:58 25000:62 26000:76 27000:81 28000:104 29000:172 30000:193 31000:224 32000:276 33000:283 34000:362 35000:303 36000:296 37000:280 38000:254 39000:277 40000:271 41000:380 42000:458 43000:527 44000:595 45000:646 46000:731 47000:649 48000:591 49000:524 50000:425 51000:364 52000:336 53000:304 54000:253 55000:192 56000:153 57000:117 58000:92 59000:66 60000:39 61000:33 62000:28 63000:20 64000:12 65000:10 66000:7 67000:8 68000:8 69000:3 70000:6 71000:6 72000:8 73000:7 74000:7 75000:5 76000:1 77000:4 78000:3 79000:3 80000:6 81000:5 82000:1 83000:13 84000:7 85000:5 86000:1 87000:1 88000:4 89000:3 90000:2 91000:3 92000:3 93000:3 94000:3 95000:5 96000:1 97000:3 98000:7 99000:4 100000:1 101000:2 102000:3 103000:4 104000:2 105000:3 106000:1 107000:2 108000:3 109000:3 110000:1 111000:2 112000:2 113000:2 114000:2 116000:1 117000:2 118000:1 119000:2 120000:2 121000:4 122000:2 123000:2 125000:2 126000:1 127000:2 128000:1 130000:2 131000:1 133000:1 136000:2 138000:3 147000:2 149000:2 153000:2 155000:1 156000:1 159000:1 160000:1 164000:1 165000:2 166000:2 168000:1 171000:1 176000:1 178000:2 179000:2 186000:1 189000:1 194000:1 198000:1 225000:6 250000:5 275000:11 300000:10 325000:2 350000:2 375000:1 400000:5 450000:3 475000:3 500000:2 525000:5 550000:4 575000:1 600000:5 625000:2 650000:6 675000:8 700000:5 725000:3 750000:4 775000:1 800000:1 825000:1 850000:1 925000:2 950000:2 975000:2 1000000:1 1025000:2 1050000:2 1125000:2 1150000:1 1250000:1 1300000:1 1325000:2 1350000:1 1400000:1 1425000:1 1450000:1 1475000:1 1575000:3 1625000:1 1675000:1 1725000:1 1875000:1 1900000:2 1950000:1 1975000:1 2000000:1 2025000:1 2075000:1 2100000:1 2400000:1 2450000:2 2500000:1 2525000:1 2700000:1 2725000:1 2800000:1 2825000:1 2950000:2 2975000:1 3075000:1 3100000:1 3125000:1 3175000:1 3500000:1 3725000:1 4000000:1 4075000:1 4350000:1 18446744073709551615:23
+phases	Resolve	hop_in	88013	2300	19500	32000	15244
+phases	Resolve	serve	88013	1700	3600	5400	1968
+phases	Resolve	to_answer	88013	600	12900	18900	2442
+phases_hist	Resolve	to_answer	400:481 500:20876 600:40450 700:11272 800:1277 900:235 1000:179 1100:406 1200:387 1300:288 1400:144 1500:77 1600:39 1700:32 1800:22 1900:15 2000:15 2100:18 2200:7 2300:12 2400:6 2500:5 2600:5 2700:9 2800:8 2900:7 3000:8 3100:10 3200:6 3300:6 3400:8 3500:7 3600:8 3700:4 3800:18 3900:13 4000:6 4100:10 4200:10 4300:4 4400:12 4500:4 4600:5 4700:7 4800:3 4900:3 5000:5 5100:4 5200:3 5300:3 5400:3 5500:5 5600:3 5700:8 5800:4 5900:4 6000:7 6100:3 6200:3 6300:4 6400:11 6500:6 6600:8 6700:3 6800:9 6900:8 7000:4 7100:9 7200:6 7300:12 7400:10 7500:9 7600:11 7700:21 7800:11 7900:10 8000:12 8100:14 8200:21 8300:22 8400:25 8500:16 8600:15 8700:18 8800:14 8900:15 9000:14 9100:9 9200:20 9300:19 9400:17 9500:10 9600:21 9700:19 9800:21 9900:20 10000:23 10100:34 10200:35 10300:45 10400:45 10500:76 10600:82 10700:93 10800:92 10900:111 11000:113 11100:108 11200:115 11300:105 11400:119 11500:95 11600:77 11700:80 11800:69 11900:69 12000:86 12100:58 12200:67 12300:59 12400:63 12500:78 12600:67 12700:71 12800:58 12900:51 13000:76 13100:71 13200:79 13300:85 13400:91 13500:76 13600:105 13700:100 13800:93 13900:97 14000:102 14100:100 14200:106 14300:103 14400:111 14500:101 14600:141 14700:126 14800:118 14900:110 15000:146 15100:132 15200:148 15300:144 15400:132 15500:156 15600:153 15700:149 15800:145 15900:168 16000:148 16100:194 16200:181 16300:166 16400:163 16500:174 16600:159 16700:184 16800:170 16900:183 17000:173 17100:165 17200:179 17300:176 17400:167 17500:159 17600:145 17700:167 17800:161 17900:146 18000:157 18100:138 18200:121 18300:122 18400:118 18500:121 18600:94 18700:97 18800:83 18900:79 19000:74 19100:74 19200:65 19300:59 19400:49 19500:39 19600:43 19700:39 19800:31 19900:18 20000:19 21000:126 22000:60 23000:45 24000:33 25000:17 26000:17 27000:5 28000:3 29000:3 30000:3 31000:4 32000:1 34000:1 41000:1 42000:1 61000:1 62000:1 71000:1 72000:1 73000:1 89000:1 107000:1 120000:1 121000:1 125000:1 133000:1 250000:1
+phases	Open	round	55004	6300	25000	40000	12293
+phases_hist	Open	round	3600:1 3700:40 3800:167 3900:336 4000:450 4100:538 4200:632 4300:656 4400:589 4500:569 4600:674 4700:980 4800:1333 4900:1553 5000:1737 5100:1715 5200:1599 5300:1383 5400:1348 5500:1254 5600:1202 5700:1245 5800:1292 5900:1355 6000:1377 6100:1577 6200:1619 6300:1538 6400:1472 6500:1198 6600:582 6700:227 6800:366 6900:603 7000:893 7100:964 7200:824 7300:684 7400:588 7500:593 7600:625 7700:546 7800:600 7900:608 8000:496 8100:405 8200:405 8300:363 8400:311 8500:289 8600:257 8700:231 8800:234 8900:197 9000:192 9100:162 9200:154 9300:150 9400:124 9500:128 9600:95 9700:87 9800:89 9900:80 10000:81 10100:80 10200:70 10300:63 10400:43 10500:44 10600:44 10700:31 10800:30 10900:22 11000:25 11100:17 11200:21 11300:23 11400:15 11500:11 11600:16 11700:19 11800:14 11900:12 12000:8 12100:12 12200:11 12300:10 12400:10 12500:10 12600:6 12700:13 12800:9 12900:13 13000:9 13100:15 13200:13 13300:8 13400:15 13500:14 13600:11 13700:11 13800:7 13900:6 14000:5 14100:9 14200:9 14300:6 14400:2 14500:3 14600:3 14700:4 14800:3 14900:7 15000:3 15100:3 15200:4 15300:3 15400:6 15500:5 15600:4 15700:2 15800:6 15900:6 16000:9 16100:10 16200:7 16300:11 16400:6 16500:7 16600:4 16700:10 16800:13 16900:11 17000:10 17100:10 17200:9 17300:11 17400:8 17500:8 17600:5 17700:9 17800:9 17900:11 18000:9 18100:12 18200:12 18300:16 18400:23 18500:21 18600:14 18700:25 18800:23 18900:23 19000:25 19100:25 19200:23 19300:29 19400:16 19500:29 19600:22 19700:19 19800:19 19900:18 20000:18 21000:308 22000:603 23000:693 24000:838 25000:987 26000:1084 27000:1063 28000:874 29000:593 30000:385 31000:233 32000:157 33000:125 34000:81 35000:68 36000:57 37000:40 38000:51 39000:24 40000:42 41000:30 42000:56 43000:29 44000:30 45000:34 46000:26 47000:22 48000:19 49000:25 50000:12 51000:20 52000:20 53000:14 54000:10 55000:9 56000:8 57000:5 58000:6 59000:2 60000:3 61000:2 62000:3 63000:1 64000:1 66000:1 67000:2 68000:1 69000:4 70000:2 71000:1 72000:1 74000:1 76000:3 77000:2 78000:1 79000:2 80000:2 81000:2 82000:1 84000:2 89000:1 95000:1 99000:1 100000:2 102000:1 104000:1 108000:1 109000:1 111000:1 113000:1 115000:1 119000:1 120000:1 122000:1 128000:1 138000:1 139000:1 144000:1 148000:1 149000:2 152000:2 154000:2 155000:1 162000:1 163000:1 170000:1 172000:1 177000:1 181000:1 184000:1 187000:1 200000:1 225000:12 250000:7 275000:8 300000:3 325000:1 350000:2 375000:1 400000:4 425000:9 450000:4 475000:3 500000:6 525000:1 550000:3 575000:3 600000:2 625000:1 750000:1 900000:1 1000000:1 1025000:1 1575000:1 3625000:1 18446744073709551615:6
+phases	Open	hop_in	55004	1800	2900	4800	3914
+phases	Open	serve	55004	2800	5800	10300	3223
+phases	Open	to_answer	55004	600	10200	13200	2349
+phases_hist	Open	to_answer	400:272 500:11628 600:18533 700:3413 800:899 900:991 1000:2545 1100:3489 1200:2117 1300:723 1400:252 1500:117 1600:59 1700:60 1800:54 1900:39 2000:37 2100:25 2200:19 2300:10 2400:14 2500:16 2600:18 2700:31 2800:30 2900:22 3000:42 3100:34 3200:17 3300:22 3400:19 3500:8 3600:10 3700:6 3800:6 3900:16 4000:7 4100:6 4200:6 4300:6 4400:6 4500:5 4600:3 4800:1 4900:5 5000:2 5100:5 5200:2 5300:3 5400:2 5500:4 5600:10 5700:10 5800:24 5900:33 6000:31 6100:25 6200:43 6300:48 6400:38 6500:29 6600:23 6700:18 6800:21 6900:17 7000:19 7100:17 7200:13 7300:30 7400:37 7500:53 7600:70 7700:78 7800:112 7900:142 8000:120 8100:128 8200:118 8300:97 8400:131 8500:99 8600:109 8700:87 8800:84 8900:81 9000:93 9100:65 9200:58 9300:64 9400:62 9500:92 9600:89 9700:128 9800:157 9900:205 10000:228 10100:295 10200:365 10300:392 10400:394 10500:444 10600:383 10700:343 10800:352 10900:304 11000:278 11100:266 11200:223 11300:213 11400:177 11500:145 11600:126 11700:106 11800:101 11900:78 12000:81 12100:82 12200:58 12300:63 12400:42 12500:42 12600:36 12700:37 12800:34 12900:29 13000:25 13100:24 13200:30 13300:17 13400:9 13500:22 13600:17 13700:14 13800:12 13900:16 14000:7 14100:24 14200:13 14300:13 14400:8 14500:11 14600:13 14700:7 14800:11 14900:11 15000:18 15100:8 15200:6 15300:9 15400:9 15500:11 15600:12 15700:2 15800:6 15900:6 16000:10 16100:5 16200:9 16300:5 16400:7 16500:6 16600:3 16700:5 16800:6 16900:8 17000:4 17100:4 17200:3 17300:1 17400:6 17600:8 17700:1 17800:3 17900:2 18000:2 18100:5 18200:3 18300:5 18400:5 18500:2 18600:3 18700:6 18800:6 18900:5 19000:3 19100:3 19200:4 19300:5 19400:5 19500:4 19600:4 19700:4 19800:5 20000:2 21000:13 22000:9 23000:10 24000:6 25000:1 29000:1 31000:3 32000:1 33000:1 34000:1 35000:1 43000:1 49000:1 61000:1 89000:1 110000:1 112000:1 187000:1 3600000:1
+phases	Create	round	11001	33000	44000	64000	35576
+phases_hist	Create	round	15900:1 16500:1 21000:3 22000:5 23000:14 24000:24 25000:78 26000:243 27000:524 28000:1018 29000:1016 30000:924 31000:737 32000:640 33000:590 34000:653 35000:648 36000:606 37000:534 38000:388 39000:314 40000:280 41000:227 42000:174 43000:143 44000:128 45000:108 46000:88 47000:89 48000:81 49000:79 50000:69 51000:54 52000:55 53000:54 54000:60 55000:35 56000:39 57000:48 58000:21 59000:24 60000:17 61000:13 62000:19 63000:11 64000:15 65000:7 66000:11 67000:8 68000:4 69000:10 70000:4 71000:3 72000:4 73000:1 74000:4 75000:2 76000:1 77000:2 78000:1 80000:2 83000:2 84000:1 86000:2 87000:1 88000:1 89000:1 91000:2 93000:1 99000:3 100000:2 103000:1 104000:1 107000:1 108000:1 110000:1 111000:1 112000:1 121000:2 122000:1 126000:2 135000:2 137000:1 139000:1 140000:1 144000:1 161000:1 176000:1 177000:1 178000:1 350000:1 500000:1 825000:2 1050000:1 2650000:1 18446744073709551615:1
+phases	Create	hop_in	11001	2100	3200	13900	3615
+phases	Create	serve	11001	11900	21000	36000	13714
+phases	Create	to_answer	11001	11500	16100	19800	12356
+phases_hist	Create	to_answer	1000:1 1600:1 1800:3 1900:4 2000:6 2100:3 2200:1 2300:4 2400:2 2500:1 2600:2 2700:2 2800:3 3200:1 3300:1 3400:1 3500:1 3600:2 3700:2 3800:3 3900:2 4000:2 4100:1 4300:4 4400:2 4500:2 4600:4 4700:4 4800:1 5000:2 5200:4 5300:4 5500:2 5600:1 5700:1 5800:1 5900:1 6100:2 6200:1 6600:2 6700:2 7000:1 7200:2 7300:2 7400:2 7500:1 7700:2 7800:1 7900:2 8000:1 8100:4 8300:1 8400:1 8600:3 8700:2 8800:1 8900:1 9000:1 9100:3 9200:2 9300:1 9400:8 9500:5 9600:8 9700:25 9800:39 9900:48 10000:76 10100:118 10200:172 10300:255 10400:288 10500:351 10600:390 10700:447 10800:472 10900:488 11000:520 11100:495 11200:406 11300:405 11400:348 11500:336 11600:264 11700:239 11800:190 11900:173 12000:159 12100:120 12200:117 12300:100 12400:100 12500:80 12600:75 12700:78 12800:86 12900:73 13000:84 13100:80 13200:67 13300:77 13400:70 13500:65 13600:78 13700:59 13800:96 13900:60 14000:68 14100:60 14200:86 14300:75 14400:66 14500:70 14600:57 14700:70 14800:75 14900:62 15000:83 15100:77 15200:79 15300:63 15400:67 15500:62 15600:76 15700:61 15800:74 15900:54 16000:59 16100:55 16200:63 16300:46 16400:52 16500:43 16600:40 16700:42 16800:45 16900:41 17000:41 17100:32 17200:33 17300:37 17400:29 17500:44 17600:27 17700:37 17800:28 17900:24 18000:38 18100:22 18200:18 18300:15 18400:20 18500:21 18600:21 18700:12 18800:18 18900:12 19000:12 19100:18 19200:9 19300:13 19400:11 19500:8 19600:3 19700:3 19800:9 19900:7 20000:6 21000:41 22000:12 23000:8 24000:6 25000:1 26000:5 27000:1 28000:2 29000:1 30000:1 31000:2 34000:1 41000:1 43000:1 45000:1 48000:1 63000:1 64000:1 107000:1 109000:1
+phases	Read	round	8540	34000	42000	69000	68799
+phases_hist	Read	round	6500:1 9000:1 10000:1 10500:1 11000:2 11300:1 11800:1 17300:1 17500:1 19000:1 19500:1 19700:1 22000:3 23000:3 24000:16 25000:30 26000:38 27000:46 28000:91 29000:141 30000:301 31000:560 32000:946 33000:1134 34000:1088 35000:910 36000:696 37000:514 38000:399 39000:312 40000:241 41000:201 42000:138 43000:97 44000:67 45000:57 46000:48 47000:51 48000:37 49000:49 50000:32 51000:22 52000:33 53000:27 54000:17 55000:17 56000:13 57000:11 58000:11 59000:6 60000:6 61000:7 62000:6 63000:5 64000:5 65000:1 66000:2 67000:2 68000:2 69000:3 70000:1 71000:2 72000:1 73000:3 74000:2 76000:1 78000:1 79000:4 80000:1 81000:1 82000:2 87000:1 88000:1 89000:3 90000:2 91000:1 93000:1 98000:1 99000:1 100000:1 104000:1 107000:1 108000:2 118000:1 119000:1 124000:1 131000:1 149000:1 150000:1 152000:2 154000:1 183000:1 184000:1 189000:1 195000:1 198000:1 225000:2 250000:1 275000:2 300000:1 325000:1 350000:2 425000:1 450000:1 500000:2 525000:2 550000:2 675000:1 700000:1 1000000:1 1075000:2 1325000:1 1500000:2 1600000:1 1775000:1 2825000:1 3400000:1 3425000:1 18446744073709551615:6
+phases	Read	hop_in	8540	16600	22000	39000	51064
+phases	Read	serve	8540	5200	6900	18500	5306
+phases	Read	to_answer	8540	11500	12700	23000	11683
+phases_hist	Read	to_answer	600:1 1100:2 1200:3 1300:3 1400:4 2000:1 2100:1 3100:2 3200:1 3800:1 4200:2 4400:1 4700:1 4800:1 4900:1 5000:1 5100:1 5200:2 5300:1 5400:1 5600:1 5700:1 5900:2 6000:1 6200:1 6300:1 6500:4 6600:1 6700:3 6800:1 6900:2 7000:1 7100:3 7300:1 7400:2 7600:5 7700:3 7800:6 7900:5 8000:7 8100:12 8200:6 8300:11 8400:11 8500:8 8600:1 8700:7 8800:9 8900:4 9000:7 9100:9 9200:6 9300:5 9400:5 9500:4 9600:7 9700:8 9800:9 9900:15 10000:25 10100:42 10200:53 10300:97 10400:118 10500:152 10600:194 10700:253 10800:346 10900:369 11000:399 11100:426 11200:507 11300:475 11400:499 11500:465 11600:439 11700:423 11800:396 11900:335 12000:314 12100:256 12200:239 12300:178 12400:177 12500:130 12600:105 12700:84 12800:76 12900:51 13000:47 13100:41 13200:34 13300:28 13400:29 13500:18 13600:17 13700:18 13800:13 13900:9 14000:11 14100:14 14200:9 14300:16 14400:13 14500:8 14600:15 14700:7 14800:6 14900:11 15000:6 15100:9 15200:4 15300:5 15400:4 15500:9 15600:4 15700:2 15800:9 15900:4 16000:5 16100:5 16200:2 16300:4 16400:4 16500:1 16600:4 16700:1 16800:2 16900:2 17000:3 17100:6 17200:1 17300:2 17400:3 17500:1 17600:2 17700:4 17800:3 17900:1 18000:3 18100:1 18200:4 18300:2 18400:4 18500:3 18600:1 18700:2 18800:1 18900:2 19000:2 19100:4 19200:4 19300:3 19500:5 19600:1 19700:3 19800:2 19900:4 20000:2 21000:21 22000:40 23000:33 24000:36 25000:16 26000:6 27000:5 31000:1 34000:1 36000:1 54000:1 115000:1
+phases	Write	round	11000	18900	29000	56000	20226
+phases_hist	Write	round	6500:2 6600:2 6700:1 6900:1 7000:1 7100:4 7200:6 7300:5 7400:13 7500:11 7600:10 7700:8 7800:9 7900:13 8000:11 8100:21 8200:25 8300:34 8400:29 8500:40 8600:33 8700:36 8800:42 8900:47 9000:58 9100:56 9200:83 9300:84 9400:79 9500:105 9600:106 9700:114 9800:131 9900:149 10000:148 10100:162 10200:155 10300:159 10400:162 10500:213 10600:174 10700:168 10800:165 10900:160 11000:129 11100:114 11200:100 11300:119 11400:82 11500:95 11600:74 11700:83 11800:76 11900:83 12000:60 12100:66 12200:65 12300:56 12400:58 12500:41 12600:52 12700:36 12800:38 12900:43 13000:21 13100:28 13200:24 13300:27 13400:20 13500:15 13600:15 13700:14 13800:11 13900:21 14000:13 14100:14 14200:7 14300:11 14400:12 14500:10 14600:6 14700:6 14800:7 14900:2 15000:11 15100:6 15200:6 15300:9 15400:10 15500:14 15600:12 15700:4 15800:6 15900:6 16000:11 16100:8 16200:14 16300:12 16400:10 16500:13 16600:26 16700:20 16800:11 16900:12 17000:11 17100:13 17200:12 17300:15 17400:24 17500:12 17600:22 17700:18 17800:24 17900:25 18000:23 18100:32 18200:27 18300:30 18400:37 18500:28 18600:34 18700:43 18800:34 18900:27 19000:40 19100:49 19200:42 19300:45 19400:46 19500:45 19600:51 19700:45 19800:51 19900:81 20000:81 21000:875 22000:716 23000:621 24000:472 25000:400 26000:338 27000:198 28000:138 29000:71 30000:88 31000:61 32000:54 33000:51 34000:57 35000:52 36000:57 37000:61 38000:56 39000:66 40000:54 41000:48 42000:46 43000:30 44000:34 45000:27 46000:38 47000:23 48000:25 49000:14 50000:9 51000:4 52000:6 53000:6 54000:7 55000:8 56000:5 57000:2 58000:3 59000:4 60000:1 61000:2 62000:3 63000:2 64000:4 65000:2 66000:3 67000:1 68000:1 69000:1 70000:2 71000:2 72000:2 73000:1 74000:2 75000:2 76000:3 77000:3 78000:3 79000:1 80000:1 81000:4 82000:1 83000:4 84000:1 86000:3 87000:3 88000:1 90000:1 91000:2 99000:1 101000:2 106000:1 108000:2 113000:1 120000:1 127000:1 128000:1 136000:1 139000:1 167000:1 168000:1 170000:1 173000:1 179000:1 181000:1 195000:1 225000:1 250000:1 275000:1 300000:1 400000:2 425000:1 450000:1 475000:1 675000:1 700000:1 800000:1 825000:1 1275000:1 1325000:1 2800000:1 4225000:1
+phases	Write	hop_in	11000	4300	6200	32000	6387
+phases	Write	serve	11000	5700	7400	12500	6376
+phases	Write	to_answer	11000	7300	13000	18000	6501
+phases_hist	Write	to_answer	400:1 500:20 600:46 700:43 800:45 900:53 1000:202 1100:832 1200:1479 1300:1156 1400:495 1500:149 1600:43 1700:26 1800:12 1900:10 2000:11 2100:17 2200:14 2300:18 2400:26 2500:14 2600:15 2700:9 2800:14 2900:9 3000:7 3100:12 3200:7 3300:9 3400:7 3500:13 3600:16 3700:8 3800:16 3900:18 4000:14 4100:19 4200:17 4300:13 4400:5 4500:7 4600:2 4700:5 4800:6 4900:2 5000:2 5100:1 5200:2 5300:1 5400:1 5600:1 5800:8 5900:3 6000:6 6100:8 6200:10 6300:17 6400:25 6500:36 6600:37 6700:49 6800:45 6900:54 7000:75 7100:61 7200:53 7300:55 7400:45 7500:43 7600:31 7700:28 7800:24 7900:36 8000:32 8100:33 8200:35 8300:35 8400:50 8500:57 8600:61 8700:59 8800:87 8900:88 9000:94 9100:111 9200:143 9300:155 9400:150 9500:160 9600:148 9700:115 9800:129 9900:125 10000:90 10100:93 10200:99 10300:84 10400:77 10500:74 10600:72 10700:84 10800:80 10900:87 11000:80 11100:86 11200:102 11300:103 11400:95 11500:100 11600:86 11700:83 11800:94 11900:76 12000:79 12100:74 12200:55 12300:56 12400:54 12500:55 12600:47 12700:54 12800:43 12900:51 13000:34 13100:52 13200:48 13300:40 13400:33 13500:38 13600:37 13700:24 13800:31 13900:19 14000:20 14100:24 14200:26 14300:19 14400:17 14500:20 14600:19 14700:19 14800:14 14900:14 15000:16 15100:15 15200:21 15300:14 15400:22 15500:16 15600:13 15700:19 15800:13 15900:12 16000:17 16100:16 16200:25 16300:17 16400:23 16500:19 16600:20 16700:13 16800:17 16900:11 17000:15 17100:9 17200:13 17300:10 17400:9 17500:9 17600:9 17700:10 17800:8 17900:6 18000:6 18100:3 18200:2 18300:4 18400:4 18500:5 18600:5 18700:3 18800:1 18900:5 19100:4 19200:3 19300:3 19400:5 19500:3 19600:2 19700:4 19800:1 19900:4 20000:1 21000:16 22000:8 23000:5 24000:4 25000:5 26000:1 27000:3 28000:1 31000:1 40000:1 42000:1 74000:1 115000:1
+phases	Info	round	11001	4400	5400	22000	6804
+phases_hist	Info	round	2700:1 2800:7 2900:17 3000:41 3100:46 3200:83 3300:95 3400:161 3500:213 3600:277 3700:370 3800:473 3900:584 4000:617 4100:684 4200:700 4300:656 4400:663 4500:629 4600:621 4700:535 4800:496 4900:471 5000:426 5100:398 5200:329 5300:279 5400:220 5500:178 5600:147 5700:96 5800:70 5900:58 6000:34 6100:33 6200:26 6300:16 6400:13 6500:14 6600:6 6700:4 6800:6 6900:5 7000:4 7100:2 7200:3 7300:2 7400:1 7500:4 7600:1 7700:3 7800:1 7900:3 8000:1 8400:4 8600:2 8700:1 8900:1 9000:2 9300:1 9500:1 9600:2 9700:1 9900:1 10000:3 10100:2 10200:1 10300:3 10400:3 10500:1 10600:3 10700:1 11100:3 11200:3 11300:1 11500:3 11600:1 11700:4 11800:1 12100:1 12300:2 12600:1 12900:1 16500:1 17200:1 18000:1 18100:1 19000:1 19300:1 20000:1 21000:6 22000:4 23000:6 24000:5 25000:6 26000:10 27000:11 28000:11 29000:14 30000:9 31000:5 32000:4 33000:1 34000:3 35000:2 36000:2 37000:2 40000:2 46000:1 47000:1 49000:1 58000:1 59000:1 64000:1 67000:2 73000:1 138000:1 153000:1 176000:1 1450000:1 18446744073709551615:1
+phases	Info	hop_in	11001	2500	3000	11600	4700
+phases	Info	serve	11001	400	500	800	356
+phases	Info	to_answer	11001	600	700	5100	645
+phases_hist	Info	to_answer	400:18 500:1823 600:5886 700:2697 800:366 900:35 1000:4 1100:23 1200:9 1300:6 1400:3 1500:2 1600:3 1700:1 1900:1 2400:2 2500:1 3200:2 3600:2 3900:1 4500:2 4600:1 4900:1 5000:1 5100:1 5500:1 5600:1 6000:1 6300:1 6400:1 6700:1 7000:1 7100:1 7300:1 9400:1 9600:1 9800:2 9900:4 10100:1 10200:1 10300:1 10400:3 10500:7 10600:6 10700:5 10800:3 10900:3 11000:3 11100:1 11200:6 11300:3 11400:3 11600:2 11700:1 11800:1 11900:2 12000:1 12100:1 12300:2 12400:1 12500:1 12700:2 12800:3 12900:3 13000:1 13100:1 13200:1 13300:2 13900:1 14000:1 14200:1 14700:1 14800:1 14900:1 15000:1 15300:1 15700:1 15800:1 16100:1 16300:1 16600:1 17000:1 17400:1 18600:1 19200:1 19400:1 19700:1 22000:1 32000:1 111000:1
+phases	SetSize	round	11000	26000	41000	139000	28615
+phases_hist	SetSize	round	5400:6 5500:4 5600:3 5700:5 5800:12 5900:11 6000:20 6100:25 6200:29 6300:18 6400:25 6500:39 6600:47 6700:51 6800:62 6900:59 7000:30 7100:44 7200:56 7300:44 7400:44 7500:41 7600:47 7700:29 7800:31 7900:28 8000:38 8100:22 8200:18 8300:25 8400:26 8500:21 8600:21 8700:17 8800:22 8900:16 9000:13 9100:14 9200:12 9300:9 9400:6 9500:10 9600:15 9700:8 9800:10 9900:20 10000:13 10100:17 10200:24 10300:27 10400:20 10500:27 10600:43 10700:57 10800:66 10900:82 11000:88 11100:77 11200:108 11300:110 11400:99 11500:113 11600:97 11700:90 11800:102 11900:87 12000:101 12100:90 12200:74 12300:91 12400:73 12500:61 12600:64 12700:65 12800:52 12900:58 13000:54 13100:49 13200:38 13300:29 13400:37 13500:38 13600:31 13700:31 13800:29 13900:20 14000:16 14100:21 14200:20 14300:14 14400:13 14500:20 14600:16 14700:17 14800:18 14900:18 15000:19 15100:18 15200:14 15300:14 15400:12 15500:14 15600:13 15700:8 15800:7 15900:2 16000:7 16100:5 16200:6 16300:8 16400:3 16500:9 16600:3 16700:5 16800:5 16900:4 17000:6 17100:4 17200:6 17300:8 17400:12 17500:4 17600:3 17700:2 17800:8 17900:6 18000:8 18100:6 18200:5 18300:6 18400:6 18500:5 18600:7 18700:5 18800:5 18900:7 19000:10 19100:13 19200:7 19300:12 19400:6 19500:14 19600:11 19700:10 19800:21 19900:18 20000:21 21000:253 22000:246 23000:160 24000:165 25000:245 26000:430 27000:429 28000:361 29000:359 30000:362 31000:331 32000:327 33000:363 34000:356 35000:274 36000:239 37000:229 38000:190 39000:154 40000:126 41000:105 42000:74 43000:71 44000:58 45000:48 46000:38 47000:47 48000:24 49000:18 50000:24 51000:17 52000:23 53000:15 54000:15 55000:21 56000:16 57000:14 58000:17 59000:24 60000:12 61000:10 62000:15 63000:15 64000:18 65000:9 66000:6 67000:15 68000:10 69000:3 70000:9 71000:13 72000:8 73000:6 74000:4 75000:6 76000:6 77000:7 78000:3 79000:2 80000:5 81000:5 82000:5 83000:1 84000:6 85000:2 86000:2 87000:4 88000:5 89000:2 91000:3 92000:1 93000:4 94000:1 95000:1 96000:2 97000:2 98000:3 99000:1 100000:1 101000:1 103000:5 104000:2 105000:4 107000:2 108000:1 109000:1 110000:3 111000:3 112000:3 113000:6 114000:6 115000:7 116000:9 117000:4 118000:6 119000:6 120000:14 121000:7 122000:9 123000:11 124000:8 125000:8 126000:5 127000:6 128000:6 129000:4 130000:5 131000:7 132000:3 133000:6 134000:5 135000:8 136000:3 137000:3 138000:4 139000:2 140000:2 141000:3 142000:1 143000:2 144000:1 145000:2 146000:3 147000:4 148000:4 149000:1 150000:1 152000:2 153000:1 154000:1 155000:1 158000:1 160000:1 163000:1 164000:1 167000:1 168000:1 169000:1 171000:1 172000:1 174000:1 178000:1 179000:2 180000:3 184000:1 185000:1 186000:1 190000:1 193000:2 196000:1 197000:1 199000:1 200000:1 225000:5 250000:5 275000:15 300000:7 325000:5 350000:2 375000:3 400000:1 425000:1 475000:1 500000:1 525000:2 575000:1 725000:1 800000:1 950000:1 1000000:1 1250000:1 2625000:1
+phases	SetSize	hop_in	11000	7100	18900	102000	12436
+phases	SetSize	serve	11000	2100	2700	3800	2138
+phases	SetSize	to_answer	11000	10300	14900	19800	8101
+phases_hist	SetSize	to_answer	400:1 500:181 600:519 700:255 800:52 900:15 1000:43 1100:288 1200:668 1300:775 1400:515 1500:211 1600:64 1700:24 1800:13 1900:16 2000:14 2100:23 2200:25 2300:13 2400:21 2500:12 2600:10 2700:10 2800:19 2900:15 3000:26 3100:18 3200:26 3300:22 3400:20 3500:21 3600:20 3700:22 3800:25 3900:34 4000:36 4100:23 4200:19 4300:31 4400:25 4500:19 4600:10 4700:18 4800:10 4900:11 5000:9 5100:9 5200:7 5300:5 5400:9 5500:7 5600:6 5700:5 5800:7 5900:10 6000:5 6100:6 6200:9 6300:2 6400:6 6500:6 6600:9 6700:10 6800:13 6900:6 7000:7 7100:9 7200:10 7300:12 7400:17 7500:9 7600:22 7700:28 7800:32 7900:27 8000:23 8100:25 8200:27 8300:34 8400:36 8500:28 8600:34 8700:45 8800:31 8900:39 9000:43 9100:31 9200:47 9300:44 9400:36 9500:40 9600:49 9700:55 9800:52 9900:44 10000:47 10100:34 10200:51 10300:56 10400:60 10500:55 10600:56 10700:67 10800:73 10900:77 11000:90 11100:95 11200:129 11300:118 11400:127 11500:127 11600:153 11700:136 11800:153 11900:176 12000:163 12100:147 12200:170 12300:153 12400:175 12500:160 12600:158 12700:147 12800:147 12900:130 13000:126 13100:114 13200:82 13300:67 13400:68 13500:64 13600:53 13700:50 13800:41 13900:50 14000:54 14100:45 14200:33 14300:54 14400:58 14500:38 14600:44 14700:38 14800:55 14900:48 15000:56 15100:65 15200:57 15300:52 15400:57 15500:40 15600:41 15700:54 15800:37 15900:42 16000:34 16100:35 16200:29 16300:26 16400:26 16500:15 16600:15 16700:20 16800:18 16900:21 17000:15 17100:17 17200:11 17300:13 17400:9 17500:9 17600:8 17700:11 17800:17 17900:7 18000:8 18100:8 18200:7 18300:4 18400:9 18500:8 18600:6 18700:3 18800:8 18900:4 19000:4 19100:4 19200:1 19300:2 19400:5 19500:8 19600:5 19700:3 19800:5 19900:5 20000:2 21000:22 22000:23 23000:17 24000:8 25000:9 26000:4 27000:2 28000:2 29000:1 30000:1 32000:1 34000:1 35000:1 38000:1 40000:1 45000:3 55000:1 61000:1 66000:1 68000:1 81000:1
+phases	Rename	round	11000	28000	33000	44000	28681
+phases_hist	Rename	round	14000:1 14200:1 15400:2 16400:1 16800:1 16900:1 17800:1 18300:1 18500:1 18600:2 18700:1 18800:2 18900:3 19100:3 19300:1 19400:1 19500:1 19600:1 19700:1 19900:1 20000:1 21000:3 22000:6 23000:14 24000:316 25000:1446 26000:1763 27000:1675 28000:1016 29000:535 30000:802 31000:1218 32000:749 33000:414 34000:272 35000:167 36000:135 37000:104 38000:69 39000:50 40000:33 41000:30 42000:25 43000:16 44000:11 45000:7 46000:10 47000:5 48000:6 49000:9 50000:8 51000:7 52000:7 53000:2 54000:3 55000:3 56000:2 57000:1 58000:1 59000:3 60000:2 61000:3 62000:2 63000:1 64000:1 65000:1 68000:1 69000:2 71000:2 74000:1 79000:1 80000:1 101000:1 107000:1 225000:1 400000:1 425000:1 450000:1 475000:2 525000:1 550000:1 650000:1
+phases	Rename	hop_in	11000	1800	2100	2700	1815
+phases	Rename	serve	11000	9800	12400	19200	10346
+phases	Rename	to_answer	11000	11300	15100	17000	11868
+phases_hist	Rename	to_answer	1000:1 1400:4 1600:1 1800:2 1900:1 2100:2 2200:2 2300:1 2400:1 3000:2 3100:1 3200:1 3300:2 3400:1 3700:2 3900:3 4000:2 4100:5 4300:4 4400:3 4500:2 4600:3 4700:4 4800:1 4900:1 5000:3 5100:2 5200:2 5300:1 5400:2 5500:3 5600:1 5800:2 5900:2 6100:3 6400:1 6500:3 6700:1 6800:3 6900:1 7000:2 7100:4 7200:5 7300:3 7400:1 7500:4 7600:2 7700:8 7800:2 7900:3 8000:2 8100:4 8200:1 8300:4 8400:3 8500:1 8600:1 8700:7 8800:10 8900:9 9000:13 9100:24 9200:46 9300:71 9400:92 9500:127 9600:162 9700:177 9800:194 9900:182 10000:207 10100:249 10200:238 10300:255 10400:256 10500:278 10600:298 10700:302 10800:344 10900:372 11000:381 11100:395 11200:379 11300:379 11400:313 11500:305 11600:252 11700:231 11800:173 11900:139 12000:122 12100:126 12200:89 12300:74 12400:79 12500:99 12600:81 12700:55 12800:67 12900:74 13000:77 13100:76 13200:75 13300:95 13400:92 13500:85 13600:103 13700:87 13800:93 13900:93 14000:101 14100:67 14200:77 14300:97 14400:72 14500:90 14600:107 14700:109 14800:107 14900:122 15000:137 15100:119 15200:95 15300:87 15400:106 15500:85 15600:76 15700:67 15800:59 15900:57 16000:66 16100:59 16200:40 16300:29 16400:31 16500:26 16600:14 16700:17 16800:18 16900:16 17000:13 17100:8 17200:12 17300:3 17400:4 17500:3 17600:5 17700:4 17800:3 17900:2 18000:3 18100:6 18300:1 18500:3 18800:1 18900:3 19000:2 19500:2 19600:1 20000:1 21000:3 22000:10 23000:7 24000:2 25000:1 26000:3 27000:1 28000:1 29000:1 33000:1 39000:1 40000:1 64000:1
+phases	CanDelete	round	1	24000	24000	24000	23600
+phases_hist	CanDelete	round	24000:1
+phases	CanDelete	hop_in	1	1900	1900	1900	1800
+phases	CanDelete	serve	1	9200	9200	9200	9100
+phases	CanDelete	to_answer	1	11100	11100	11100	11000
+phases_hist	CanDelete	to_answer	11100:1
+phases	Flush	round	11000	8900	12800	55000	11978
+## run 1 of 1 done, 2026-11-07T19:42:08Z
