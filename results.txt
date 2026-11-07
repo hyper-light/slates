@@ -9,3 +9,8 @@ run 2 exit 101 6s load=2.21 0.87 0.32
     green over 4000 files of 16384 bytes: 3.833859888s, reply GreenCreated { id: VolumeId { bytes: [192, 6, 92, 182, 181, 64, 245, 72, 0, 0, 0, 0, 0, 0, 0, 173] } }; 0 probes inside it — p50 0ns, p99 0ns, longest of all 3.834133076s; before it the longest 677.584µs
     thread 'creating_a_green_over_a_large_base_never_holds_its_shard' (5499) panicked at crates/server/tests/green_fairness.rs:253:3:
     test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.57s
+run 3 exit 101 7s load=2.10 0.89 0.33
+    slates daemon: the control shard's beat task ran 3910 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 109 steps and 222 polls (221 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 1 timers, waited 0 times, spawned 1 tasks and finished 1; 5 tasks live; its longest poll is 3839 ms and its timer overrun 0 ms
+    green over 4000 files of 16384 bytes: 3.839748546s, reply GreenCreated { id: VolumeId { bytes: [4, 247, 180, 190, 178, 23, 45, 54, 0, 0, 0, 0, 0, 0, 0, 173] } }; 0 probes inside it — p50 0ns, p99 0ns, longest of all 3.839975905s; before it the longest 717.284µs
+    thread 'creating_a_green_over_a_large_base_never_holds_its_shard' (5539) panicked at crates/server/tests/green_fairness.rs:253:3:
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.60s
