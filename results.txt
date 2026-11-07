@@ -4,3 +4,8 @@ run 1 exit 101 6s load=2.24 0.83 0.30
     thread 'creating_a_green_over_a_large_base_never_holds_its_shard' (5457) panicked at crates/server/tests/green_fairness.rs:108:10:
     called `Result::unwrap()` on an `Err` value: Stalled { after_ns: 1000000000 }
     test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.58s
+run 2 exit 101 6s load=2.21 0.87 0.32
+    slates daemon: the control shard's beat task ran 3902 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 112 steps and 228 polls (224 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 1 timers, waited 0 times, spawned 1 tasks and finished 1; 5 tasks live; its longest poll is 3833 ms and its timer overrun 0 ms
+    green over 4000 files of 16384 bytes: 3.833859888s, reply GreenCreated { id: VolumeId { bytes: [192, 6, 92, 182, 181, 64, 245, 72, 0, 0, 0, 0, 0, 0, 0, 173] } }; 0 probes inside it — p50 0ns, p99 0ns, longest of all 3.834133076s; before it the longest 677.584µs
+    thread 'creating_a_green_over_a_large_base_never_holds_its_shard' (5499) panicked at crates/server/tests/green_fairness.rs:253:3:
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.57s
