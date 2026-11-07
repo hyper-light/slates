@@ -180,7 +180,8 @@ impl UdpSocket {
   /// Receives one datagram, awaiting readability through the driver when none is ready. Returns the
   /// byte count and the sender's address. The loop of [`UdpSocket::readable`] and
   /// [`UdpSocket::try_recv_from`] — a caller whose buffer must not be held across the await (one buffer
-  /// shared by a shard's readers) drives those two itself.
+  /// shared by a shard's readers) drives those two itself. A refused receive is handed to the caller, which reads on
+  /// past every kind but [`crate::error::ReceiveRefusal::SocketGone`] (§4.10a).
   pub async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddrV4), RtError> {
     loop {
       if let Some(received) = self.try_recv_from(buf)? {
@@ -203,7 +204,9 @@ impl UdpSocket {
 
   /// Takes one waiting datagram into `buf` without blocking: the byte count and the sender, or `None`
   /// when nothing is waiting. A datagram longer than `buf` is truncated to it (size `buf` to the largest
-  /// datagram the caller reads).
+  /// datagram the caller reads). A refused receive is handed to the caller as it is; a loop over this ends
+  /// only on [`crate::error::ReceiveRefusal::SocketGone`] and reads past every other kind
+  /// ([`RtError::receive_refusal`]; §4.10a).
   pub fn try_recv_from(&self, buf: &mut [u8]) -> Result<Option<(usize, SocketAddrV4)>, RtError> {
     match &self.inner {
       Inner::Real { socket } => loop {
@@ -213,13 +216,18 @@ impl UdpSocket {
           Io::Interrupted => {}
         }
       },
-      Inner::Sim { port } => Ok(crate::sim::sim_udp_recv(*port).map(|(bytes, from)| {
-        let n = bytes.len().min(buf.len());
-        if let (Some(into), Some(from_bytes)) = (buf.get_mut(..n), bytes.get(..n)) {
-          into.copy_from_slice(from_bytes);
+      Inner::Sim { port } => {
+        if let Some(refusal) = crate::sim::sim_udp_take_refusal(*port) {
+          return Err(refusal);
         }
-        (n, SocketAddrV4::new(Ipv4Addr::LOCALHOST, from))
-      })),
+        Ok(crate::sim::sim_udp_recv(*port).map(|(bytes, from)| {
+          let n = bytes.len().min(buf.len());
+          if let (Some(into), Some(from_bytes)) = (buf.get_mut(..n), bytes.get(..n)) {
+            into.copy_from_slice(from_bytes);
+          }
+          (n, SocketAddrV4::new(Ipv4Addr::LOCALHOST, from))
+        }))
+      }
     }
   }
 }

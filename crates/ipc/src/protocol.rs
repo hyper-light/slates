@@ -2923,6 +2923,26 @@ pub enum Refusal {
     /// The bound.
     bound: u64,
   },
+  /// A host path the daemon was given lies on a mount it serves itself (§4.6: no daemon thread opens a path on a volume
+  /// the daemon serves; A-227): opening it would send the daemon a request only it can answer. Nothing was opened.
+  /// Appended.
+  OwnMount {
+    /// The path as given.
+    path: String,
+    /// What the daemon was asked to use it as.
+    used_as: OwnMountUse,
+  },
+}
+
+/// What a path refused [`Refusal::OwnMount`] was given as (A-227). Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnMountUse {
+  /// A volume's base directory, or an entry below it.
+  Base,
+  /// A granted landing's target.
+  LandingTarget,
+  /// A FUSE mount point.
+  MountPoint,
 }
 
 /// The writes a snapshot is known to include (§4.6 "Writeback and snapshot barrier"): every write the

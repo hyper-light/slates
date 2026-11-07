@@ -329,6 +329,14 @@ hecate `WIRE_SECURITY.md` to slates's D-15 (TLS 1.3, not Noise). **Ratify before
 > exporter, carried in every short header, and a demultiplexer over one socket, `demux.rs`);
 > multi-stream multiplexing remains.
 
+> **Status (2026-11-07, receive refusals).** Every receive loop of the planes reads past a refused receive
+> unless it names the socket gone (`RtError::receive_refusal`: `EBADF`, `ENOTSOCK`, `WSAENOTSOCK`, `WSAESHUTDOWN`, or
+> the runtime's own refusal), counting it by kind: the demultiplexer (`DemuxCounters::receive_refused_*`, in status as
+> `fleet.serve.receive_refused.*`), an endpoint's own link (`Endpoint::receive_refusals`), the membership plane
+> (`fleet.plane.receive_refused.*`) and the DNS query. Before, one earlier send's report (Windows' WSAECONNRESET,
+> Linux's ECONNREFUSED, udp(7)) ended the serve socket's loop for the daemon's life
+> (`docs/bugs/2026-11-07-one-refused-receive-ended-a-fleet-nodes-transport.md`).
+
 slates's session plane carries every **reliable** class (version chains, merge records, content
 transfer, cross-region). It is an owned RFC 9000/9002-shaped dialect — adapting hecate-quic's
 ordered streams and flow-control law — reconciled to slates:
