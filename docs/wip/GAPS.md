@@ -155,6 +155,15 @@
 > the reply-deadline unit of about 60 files (the client's and the server's deadlines, observations, the scatter's room
 > wait). A-228 judges the window in each shard's own CPU time, which keeps a starved daemon alive, but the window's length
 > is still the `Shape:` constant "a second", not measured.
+>
+> - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for
+>   another shard's answer gave up at the wall second while the target was alive and starved, and the work went on to
+>   take effect with the client refused. `xshard::within_shard_time` (`call_in_shard_time`, `task_in_shard_time`)
+>   waits by A-65's rule instead, one commit per call family, each failing first
+>   (`crates/server/tests/cross_shard_wait.rs`). Done: the consensus verbs (a bootstrap with the control shard on the
+>   CPU a fifth of the time, refused `Overloaded` after 1.003 s on main, acknowledged after 1.52–1.68 s; a wedged control
+>   shard still refused after 1.000–1.004 s). Open: the forwarded verbs, the consumer verbs, the NFS bridge, the direct
+>   map's delivery, the remote reap. Record: `docs/bugs/2026-11-06-a-cross-shard-wait-lost-a-starved-shards-answer.md`.
 
 > **A-190's purge client leaves the daemon's process (2026-11-06, fixed); the sweep for the rest (open).** No daemon
 > thread opens a path on a volume the daemon serves (§4.6). The coherent purge's opens, writes and reads now run in a
