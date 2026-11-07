@@ -34,9 +34,9 @@ drift (CLAUDE.md §4, doc-truth tests).
 | Windows arm64 | 41 | 1 | 0 | 216 | 61 |
 
 With this change both Windows lanes run `crates/server/tests/fleet.rs` (85 passed, 3 ignored on the runners:
-diagnostics run 42340483175). `slates-server`'s unit tests join them with the Windows landing writer: two landing tests
-fail on Windows until it lands, since `landing.rs`'s Windows arm refuses `Unsupported { feature: "landing" }`, so that
-step lands with the writer (`agents/release-wincov-lib`).
+diagnostics run 42340483175). `slates-server`'s unit tests run there too, one test at a time, landed with the Windows landing
+writer (its failing tests were two landing tests that `landing.rs`'s Windows arm refused, `Unsupported { feature: "landing" }`).
+The table below predates that step: its `slates-server` lib row reads `—` on Windows.
 
 ## What compiling the whole workspace for Windows found
 

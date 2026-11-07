@@ -3,8 +3,8 @@
 > **CI coverage on every platform (2026-11-06, VFS plan Step 15).** `docs/wip/ci-matrix.md` lists every test target of
 > the workspace (319: lib, bin and tests) against the lanes that run it.
 > - **Now run on both Windows lanes:** `crates/server/tests/fleet.rs`, which was `cfg(unix)` as a whole. Only its
->   virtio-fs guest test stays Unix-only, and it runs one test at a time. `slates-server`'s unit tests join it with the
->   Windows landing writer (two landing tests fail there until it lands; the step is `agents/release-wincov-lib`). On CI's Windows runners (4 logical CPUs, 16 GB each; diagnostics run
+>   virtio-fs guest test stays Unix-only, and it runs one test at a time. `slates-server`'s unit tests run there too, one test at
+>   a time, landed with the Windows landing writer (whose failing tests are the two landing tests the writer makes pass). On CI's Windows runners (4 logical CPUs, 16 GB each; diagnostics run
 >   42340483175, 2026-11-07), the fleet suite passed whole on both architectures: 85 passed, 3 ignored, in 418 s
 >   (x86_64) and 365 s (arm64). This was with liveness's UDP-reset fix merged in.
 > - **Open: six fleet tests fail on jupiter** (Windows x86_64, 32 logical CPUs, 128 GB, other projects running,
