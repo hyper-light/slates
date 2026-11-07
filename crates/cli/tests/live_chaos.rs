@@ -838,25 +838,44 @@ struct Sampler<'a> {
 }
 
 impl Sampler<'_> {
+  /// Samples every node until `stop`, each node on its own thread, then once more; the samples in time order. One thread
+  /// a node, because a `status` call to a stopped (SIGSTOPped) node does not return until it resumes: one round over
+  /// every node left a hole in every node's samples for as long as one was stopped (about 1.5 s of every 2 s partition
+  /// in `candidates_partitioned_in_turn_mid_stream_lose_nothing`, live-durability, 2026-11-07).
   fn run(&self, stop: &AtomicBool) -> Vec<Sample> {
-    let mut samples = Vec::new();
-    while !stop.load(Ordering::Acquire) {
-      samples.extend(self.once());
-      pause();
-    }
-    samples.extend(self.once());
+    let mut samples: Vec<Sample> = std::thread::scope(|scope| {
+      let threads: Vec<_> = self
+        .instances
+        .iter()
+        .enumerate()
+        .map(|(node, instance)| {
+          scope.spawn(move || {
+            let mut samples = Vec::new();
+            while !stop.load(Ordering::Acquire) {
+              samples.extend(self.once(node, instance));
+              pause();
+            }
+            samples.extend(self.once(node, instance));
+            samples
+          })
+        })
+        .collect();
+      threads
+        .into_iter()
+        .flat_map(|thread| thread.join().unwrap())
+        .collect()
+    });
+    samples.sort_by_key(|sample| sample.at);
     samples
   }
 
-  fn once(&self) -> Vec<Sample> {
-    let mut samples = Vec::new();
-    for (node, instance) in self.instances.iter().enumerate() {
-      let at = self.began.elapsed();
-      for state in live_states(instance, self.volume).unwrap_or_default() {
-        samples.push(Sample { at, node, state });
-      }
-    }
-    samples
+  fn once(&self, node: usize, instance: &str) -> Vec<Sample> {
+    let at = self.began.elapsed();
+    live_states(instance, self.volume)
+      .unwrap_or_default()
+      .into_iter()
+      .map(|state| Sample { at, node, state })
+      .collect()
   }
 }
 

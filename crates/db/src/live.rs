@@ -60,6 +60,8 @@ const INSTALL_PREFIX_BYTES: usize =
 const TAG_INSTALL: u8 = 1;
 /// Format: a whole-state message's first byte: a takeover's fetch (successor to holder).
 const TAG_FETCH: u8 = 2;
+/// Format: a whole-state message's first byte: phase one's report (successor to holder; A-240).
+const TAG_REPORT: u8 = 3;
 /// Format: a reply's first byte: a head held, a holder with nothing, or a fence refusal.
 const REPLY_HEAD: u8 = 1;
 /// Format: see [`REPLY_HEAD`].
@@ -290,9 +292,14 @@ pub fn object_of_state(bytes: &[u8]) -> Option<ObjectId> {
       reader.word().ok()?;
       reader.object().ok()
     }
-    TAG_FETCH => reader.object().ok(),
+    TAG_FETCH | TAG_REPORT => reader.object().ok(),
     _ => None,
   }
+}
+
+/// Whether a whole-state message is a [`Report`] (phase one's question, A-240).
+pub fn is_report(bytes: &[u8]) -> bool {
+  bytes.first() == Some(&TAG_REPORT)
 }
 
 /// Whether a whole-state message is a [`Fetch`] (otherwise an [`Install`], or malformed).
@@ -336,6 +343,62 @@ impl Fetch {
       Err(LiveError::Malformed)
     }
   }
+}
+
+/// Phase one's question for a live volume (A-200, A-240): the successor asks a holder to raise its fence to `epoch` and
+/// report its head and how many bytes it keeps, nothing more. Every answer is a few bytes, so phase one runs within the
+/// liveness budget over any path; the log itself is fetched afterwards from the one holder adopted ([`Fetch`]), under a
+/// budget its reported bytes derive. Asked in one exchange, every holder's whole log missed a 1 s budget over KIND's
+/// shaped paths, and no takeover finished (run 42357611870, `wan`, `wan-loss` and `ceiling`, 2026-11-07).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Report {
+  /// The volume.
+  pub object: ObjectId,
+  /// The epoch the successor ships under.
+  pub epoch: HostEpoch,
+}
+
+impl Report {
+  /// The canonical bytes: its tag, the object, the epoch.
+  pub fn encode(&self) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(TAG_REPORT);
+    out.extend_from_slice(&self.object.0);
+    out.extend_from_slice(&self.epoch.0.to_le_bytes());
+    out
+  }
+
+  /// Parses bytes that crossed the network.
+  pub fn decode(bytes: &[u8]) -> Result<Report, LiveError> {
+    let mut reader = Reader { bytes };
+    if reader.byte()? != TAG_REPORT {
+      return Err(LiveError::Malformed);
+    }
+    let report = Report {
+      object: reader.object()?,
+      epoch: HostEpoch(reader.word()?),
+    };
+    if reader.bytes.is_empty() {
+      Ok(report)
+    } else {
+      Err(LiveError::Malformed)
+    }
+  }
+}
+
+/// A holder's answer to a [`Report`]: the bytes it keeps of the log, then its reply (the head, or the fence refusing a
+/// stale successor).
+pub fn encode_reported(reply: &Result<Option<Head>, LiveError>, kept: u64) -> Vec<u8> {
+  let mut out = kept.to_le_bytes().to_vec();
+  out.extend_from_slice(&encode_reply(reply));
+  out
+}
+
+/// Parses a holder's answer to a [`Report`]: its reply and the bytes it keeps.
+pub fn decode_reported(bytes: &[u8]) -> Result<(Result<Option<Head>, LiveError>, u64), LiveError> {
+  let mut reader = Reader { bytes };
+  let kept = reader.word()?;
+  Ok((decode_reply(reader.bytes), kept))
 }
 
 /// A holder's answer to a [`Fetch`]: its reply (the head, or the fence refusing a stale successor) and the payloads it
