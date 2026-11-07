@@ -1,0 +1,85 @@
+name: diag-perf
+
+# The shard slice sweep (A-224; the supervisor's decision of 2026-11-06): the edit-and-merge harness
+# (`crates/client/examples/edit_merge_bench.rs`) with the in-process daemon's shards asking each slice the harness
+# derives from this runner (`--slice-candidates`: nothing, the kernel's minimum, the step budget doubled up to the
+# kernel's default, the default, A-224's `shard_slice_ns`). Listed once a runner, so every arm keeps one value across
+# its rounds. Under the controlled load the supervisor set (two spinning threads a core, two CPUs, 256 MB, a sibling
+# writer that fsyncs), then quiet (paced and unpaced), every arm interleaved, three rounds. A diagnostics lane run only
+# from `diag-perf-*` branches (never main).
+
+on:
+  push:
+    branches: ["diag-perf-*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  slice-sweep:
+    name: slice sweep (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the harness
+        run: |
+          cargo build --release -p slates-client --example edit_merge_bench
+          mkdir -p "$RUNNER_TEMP/bin"
+          cp target/release/examples/edit_merge_bench "$RUNNER_TEMP/bin/edit_merge_bench"
+      - name: The constraint and the candidates
+        run: |
+          nproc; free -m | head -2; uname -a
+          if systemd-run --user --scope -p MemoryMax=256M -p AllowedCPUs=0-1 true 2>/dev/null; then
+            echo "constraint: systemd-run --user --scope, AllowedCPUs=0-1, MemoryMax=256M" | tee "$RUNNER_TEMP/constraint"
+          else
+            echo "constraint: taskset -c 0,1 only (no user systemd manager; memory not capped)" | tee "$RUNNER_TEMP/constraint"
+          fi
+          "$RUNNER_TEMP/bin/edit_merge_bench" --slice-candidates </dev/null | grep '^slice' | tee "$RUNNER_TEMP/candidates"
+          cut -f2 "$RUNNER_TEMP/candidates" > "$RUNNER_TEMP/slices"
+      - name: Every candidate under the controlled load, interleaved
+        run: |
+          cat > "$RUNNER_TEMP/loaded.sh" <<'EOS'
+          #!/bin/bash
+          # The sibling writer: 16 MiB written and fsynced, again and again, beside the harness in the same cgroup.
+          ( while true; do dd if=/dev/zero of="$RUNNER_TEMP/fsync.bin" bs=1M count=16 conv=fsync status=none; done ) &
+          writer=$!
+          "$RUNNER_TEMP/bin/edit_merge_bench" --loaded-only --spinners-per-core 2 --client-spin-ns default \
+            --shard-slice-ns "$1" --files 10 --form accept --form conflict
+          status=$?
+          kill $writer; wait $writer 2>/dev/null
+          exit $status
+          EOS
+          chmod +x "$RUNNER_TEMP/loaded.sh"
+          export RUNNER_TEMP
+          for round in 1 2 3; do
+            while read -r slice; do
+              echo "== round $round slice [$slice] $(date -u +%FT%TZ) $(uptime) $(cat "$RUNNER_TEMP/constraint")"
+              if grep -q systemd-run "$RUNNER_TEMP/constraint"; then
+                timeout 900 systemd-run --user --scope -q -p MemoryMax=256M -p AllowedCPUs=0-1 \
+                  -E RUNNER_TEMP="$RUNNER_TEMP" "$RUNNER_TEMP/loaded.sh" "$slice" </dev/null 2>&1 | grep -E 'goal|WRONG|loaded:|refused|sched:|shard slice'
+              else
+                timeout 900 taskset -c 0,1 "$RUNNER_TEMP/loaded.sh" "$slice" </dev/null 2>&1 | grep -E 'goal|WRONG|loaded:|refused|sched:|shard slice'
+              fi
+            done < "$RUNNER_TEMP/slices"
+          done
+      - name: Every candidate quiet, paced and unpaced, interleaved
+        run: |
+          for round in 1 2 3; do
+            while read -r slice; do
+              for pace in 2000000 0; do
+                flag=""; [ "$pace" != 0 ] && flag="--pause-ns $pace"
+                echo "== quiet round $round slice [$slice] pause $pace $(date -u +%FT%TZ) $(uptime)"
+                "$RUNNER_TEMP/bin/edit_merge_bench" --quiet-only --client-spin-ns default --shard-slice-ns "$slice" $flag \
+                  --files 10 --form accept --form conflict </dev/null 2>&1 | grep -E 'goal|WRONG|sched:|shard slice'
+              done
+            done < "$RUNNER_TEMP/slices"
+          done
