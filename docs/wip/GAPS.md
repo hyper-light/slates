@@ -18,7 +18,11 @@
 > stale one). Now `W = max(n − f, f)` of `n` holders (raft's review: `n − f` alone answered a write on the owner and one
 > holder at `f = 2` with three holders, two copies that two failures lose), never durable on fewer than `f`.
 > `a_write_is_durable_only_where_every_takeover_quorum_meets_it` was red on both earlier counts; the model, naming
-> `2f + 1` and `1..2f − 1` sets and taking owners over inside each transition window, passes.
+> `2f + 1` and `1..2f − 1` sets and taking owners over inside each transition window, passes. The interim count of
+> 6dd512b4 ("never durable at `n <= f`") also had a liveness hole the floor closes: a three-node fleet's successor ships
+> to one holder (`n = f = 1`), so none of its writes became durable, and `a_superseded_owner_resumed_after_its_takeover_is_fenced`
+> hung 3 of 3 on a tree carrying it (live-durability's bisect, CI diag-live-durability-33); with `W = f = 1` there it passes
+> in 3.6 to 4.5 s (raft-chaos, CI diag-raft-chaos-sup-red-35 and -green-36).
 >
 > **Open (live-fixes): an ex-holder keeps its live copy until the volume's tombstone.** A holder the joint transition
 > drops keeps its copy at an old fence (memory, not safety: no phase one counts it, and with `n − f` no owner commits
