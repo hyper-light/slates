@@ -846,6 +846,58 @@ fn a_refused_entry_is_never_counted_as_held() {
   );
 }
 
+/// A-200: a shipper made before its candidates were known ships to them once they are named. Do make the owner's
+/// shipper with no holders (a volume made on a fleet's bootstrap node, whose configuration named only itself), append two
+/// entries, then name the two candidates. Expect nothing durable before, each candidate owed every entry after, and the
+/// log durable once one candidate holds them; naming the same set again changes nothing. Found by the Linux conformance
+/// pair (diag run 42325923902): such a log stood at head=2 durable=none for a whole fsx run.
+#[test]
+fn a_shipper_made_before_its_candidates_were_known_ships_to_them_once_named() {
+  let hosts = [HostId(1), HostId(2), HostId(3)];
+  let mut shipper = Shipper::new(
+    (hosts[0], OBJECT, HostEpoch(1)),
+    Quorum { f: 1 },
+    &hosts[..1],
+    None,
+    (4, 8),
+  );
+  let first = shipper.append(vec![1]).unwrap();
+  let second = shipper.append(vec![2]).unwrap();
+  assert_eq!(shipper.durable(), None, "no holder, nothing durable");
+  assert_eq!(
+    shipper.pending(hosts[1]),
+    Next::Nothing,
+    "no holder named yet"
+  );
+  assert!(shipper.set_holders(&hosts), "the candidates are named");
+  assert!(
+    !shipper.set_holders(&hosts),
+    "naming them again changes nothing"
+  );
+  for holder in &hosts[1..] {
+    assert_eq!(
+      shipper.pending(*holder),
+      Next::Entries(vec![first.clone(), second.clone()]),
+      "a newly named holder is owed every entry"
+    );
+  }
+  let mut replica = Replica::new(hosts[0], OBJECT);
+  replica.accept(&first).unwrap();
+  let held = replica.accept(&second).unwrap();
+  shipper.on_reply(hosts[1], Ok(held));
+  assert_eq!(
+    shipper.durable(),
+    Some(1),
+    "durable once a named holder holds them"
+  );
+  assert!(shipper.set_holders(&hosts[..2]), "one candidate leaves");
+  assert_eq!(
+    shipper.durable(),
+    Some(1),
+    "the durable position never falls"
+  );
+}
+
 /// R8: at `f = 0` there are no holders and every entry is durable at its append, by the same code.
 #[test]
 fn the_laptop_is_durable_at_its_own_append() {

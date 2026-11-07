@@ -8019,25 +8019,19 @@ fn placement_of(state: &ShardState, volume: DbVolumeId) -> PlacementState {
   }
 }
 
-/// The region placement of `object`'s head at `sequence` as the fleet has **actually committed** it (§4.8
-/// "the acknowledging set is recorded in the object's head record"): the acknowledging candidates the
-/// control-shard record plane recorded when it replicated that head to its holders
-/// (`ShardState::placed_heads`), or — before any holder has acknowledged, for an older or newer sequence,
-/// or on a laptop where no fleet loop runs — the owner's local placement the configuration computes
-/// (`Configuration::place`: the owner alone, which is placed at `f = 0` and not yet at `f > 0`). One code
-/// path serves both (R8): the laptop is the empty-map degenerate. Reading the computed placement alone
-/// reported a fleet's head *never* region-placed, however many holders held it.
-fn committed_placement(
-  state: &ShardState,
-  object: ObjectId,
-  sequence: u64,
-) -> slates_db::register::Placement {
+/// Whether `object`'s head at `sequence` is region-placed as the fleet has **actually committed** it (§4.8 "the
+/// acknowledging set is recorded in the object's head record"): the acknowledgements the control-shard record plane
+/// recorded when it replicated that head (`ShardState::placed_heads`), judged under the configuration's placement now
+/// (`head::PlacedHead::placed_under`); at `f = 0` placed on the local append (R8: the laptop is the empty-map
+/// degenerate). Reading the computed placement alone reported a fleet's head *never* region-placed, however many
+/// holders held it; reading the recorded round's own cohorts kept a head unplaced once its neighbourhood settled.
+fn committed_placed(state: &ShardState, object: ObjectId, sequence: u64) -> bool {
   state
     .placed_heads
     .get(&object)
     .filter(|head| head.sequence == sequence)
-    .map(|head| head.placement.clone())
-    .unwrap_or_else(|| state.fleet.configuration().place(object))
+    .is_some_and(|head| head.placed_under(state.fleet.configuration(), object))
+    || state.fleet.configuration().quorum.f == 0
 }
 
 /// A volume's head placement for a status reply (§4.8, D-18): whether the head is placed in
@@ -8052,8 +8046,7 @@ pub(crate) fn placed_state(state: &ShardState, record: &VolumeRecord) -> PlacedS
     // 128-bit id (its high half names the creator host); the old code truncated it to that high half
     // alone, so every volume of one creator collided to one placement object — fixed by ObjectId.
     let object = ObjectId(record.id.bytes);
-    let config = state.fleet.configuration();
-    config.region_placed(&committed_placement(state, object, CREATION_HEAD_SEQUENCE))
+    committed_placed(state, object, CREATION_HEAD_SEQUENCE)
   } else {
     match state.db.partition().snapshot(record.id, record.head) {
       Some(snapshot) => matches!(snapshot.placed, PlacementState::Placed { .. }),
@@ -8126,7 +8119,7 @@ fn await_placed(
     None => Some(record.head),
   };
   let region = match target {
-    None => config.region_placed(&committed_placement(state, object, CREATION_HEAD_SEQUENCE)),
+    None => committed_placed(state, object, CREATION_HEAD_SEQUENCE),
     Some(target) => match state.db.partition().snapshot(record.id, target) {
       Some(snapshot) => matches!(snapshot.placed, PlacementState::Placed { .. }),
       None => return refused(Refusal::NotFound),

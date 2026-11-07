@@ -2073,10 +2073,9 @@ impl Daemon {
     object: slates_db::register::ObjectId,
   ) -> Result<bool, ObserveError> {
     self.observe(self.shard_of_object(object), move |s| {
-      let quorum = s.fleet.configuration().quorum;
       s.placed_heads
         .get(&object)
-        .is_some_and(|head| head.placement.placed(quorum))
+        .is_some_and(|head| head.placed_under(s.fleet.configuration(), object))
     })
   }
 

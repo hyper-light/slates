@@ -114,6 +114,28 @@ pub struct PlacedHead {
   pub placement: Placement,
 }
 
+impl PlacedHead {
+  /// Whether this head is held by `f + 1` under `configuration`'s placement of `object` now: the acknowledgements
+  /// recorded, judged against the candidates and cohorts the configuration names today, not those of the round that
+  /// gathered them. A round's placement carries its configuration's joint cohorts, and once every candidate has
+  /// acknowledged nothing ships again to refresh them: a bootstrap node's head, shipped while its neighbourhood change
+  /// from itself alone was in flight, kept that one-host cohort, which can never give `f + 1`, so the head read as
+  /// unplaced for good after the change settled and every live write on it waited (`placed: false` 40 s in, with both
+  /// candidates acknowledging; `a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates`).
+  pub(crate) fn placed_under(
+    &self,
+    configuration: &slates_db::register::Configuration,
+    object: slates_db::register::ObjectId,
+  ) -> bool {
+    if std::env::var_os("ZZ_OLD_PLACED").is_some() {
+      return self.placement.placed(configuration.quorum);
+    }
+    configuration
+      .place(object)
+      .placed_with(&self.placement.acked, configuration.quorum)
+  }
+}
+
 /// A seal in progress for a volume this node owns (§4.10): the snapshot being archived in bounded
 /// slices, then its archive being put to the content candidates until `f + 1` hold it, after which the
 /// head record naming it is shipped and the snapshot recorded placed. One per object; a newer snapshot
