@@ -13736,6 +13736,10 @@ tests named below.
   naming (B's anchor, its account): the share that lets it in. `slates status` prints each node's `anchor:`, and `slates
   share ID uid:N@ANCHOR` (or `consumer:ACCOUNT/ID@ANCHOR`) names another node's account. One person's accounts on
   several hosts as one principal, a fleet account mapping, is not part of this: an open design item for Ada (GAPS).
+- **A taken-over green kept no shares.** Found by this change's tests: a green shipped no catalog register, so its
+  successor rebuilt it with an empty access list, which uid equality had hidden. Fixed in its own change just before
+  this one (AUD-29-17's catalog register for greens; `docs/bugs/2026-11-07-a-taken-over-green-lost-its-access-list.md`),
+  so it could land first. Here its test names node a's account by its anchor.
 - **Format.** The wire principal and the catalog's records change shape, so the wire major is 2 (a major-1 peer is
   refused before its body is read) and the segment layout is 5 (a layout-4 segment is refused at start, saying to start
   afresh and re-enroll and re-share). Pre-release; no shim. Neither SDK encodes a principal or `Enroll`.

@@ -343,7 +343,9 @@
 > **A principal is compared across hosts with no host (security, fixed 2026-11-07 by A-237; owner: clients).** Fixed:
 > every principal carries its host's certificate anchor, a forwarded principal is rescoped by its session's anchor, and
 > a refused forward is `NotShared` naming the share that would let it in (record:
-> `docs/bugs/2026-11-07-a-principal-was-compared-across-hosts-with-no-host.md`). What it was: A
+> `docs/bugs/2026-11-07-a-principal-was-compared-across-hosts-with-no-host.md`). Found with it, and fixed in its own change first: a
+> taken-over green kept no shares, since a green shipped no catalog register
+> (`docs/bugs/2026-11-07-a-taken-over-green-lost-its-access-list.md`). What it was: A
 > verb forwarded to a volume's owner on another node carries the requester's principal "as the origin node authenticated
 > it" (`crates/server/src/verbs.rs` `ForwardedRequest`). The owner dispatches a read under it, and runs a write under
 > it, as is (`serve_forward`); the origin's host keys only the completion record. `rights_of` then grants a principal
