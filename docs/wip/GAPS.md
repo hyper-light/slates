@@ -13748,6 +13748,28 @@ On the same two cores the fixed tests passed 6 of 6, against 1 of 3 failing befo
 window to reach the floor where it had to: 1,010–1,373 attempts in five runs and 2,708 in one. Each run took
 2.4–3.1 s, against 2.4–2.6 s before. Both properties held in every run: no leak, and no stale read resolved.
 
+### 2026-11-06: the progress rule failed while the server was starved, not stopped — fixed
+
+The stale-handle test failed its progress assertion on `windows-latest` with its binary's tests run in parallel (CI runs
+them one at a time). Reproduced on an 18-core Mac under two spinners a core: alone, 1 of 8 runs at 99 attempts, and 2 of
+10 instrumented runs with 0 attempts counted when the hold gave up, at 2,136 and 2,089 ms. In both, 14 and 15 of the 18
+attackers' first reads then hit their 2 s timeout. The daemon was alive, but its one shard was starved: its beat task ran
+3,332 ms after its last turn. The hold's own 20 ms polls overslept 2,013 of the 2,136 ms, so the machine was running no
+thread on time. The window, 2 s of wall time, was as long as the attackers' read timeout, and an attempt counted only
+when its reply or its timeout came, so slow first replies read as "stopped".
+
+`hold_until_enough_attacks` now charges each poll only the 20 ms it asked to sleep, so a busy machine stretches the
+window and a quiet one keeps it. It counts only answered reads: a stretched window outlasts the read timeout, so counted
+timeouts would keep a server that never answers looking busy. Under the same load the stale-handle test passed 10 of 10,
+with 1,019–1,379 answered in 28–51 s. Pointed at a listener that accepts and never answers, it still fails (0 answered,
+180 unanswered, 21.7 s). The cross-tenant test shares the rule and passed 10 of 10 under the same load (1,070–2,048
+answered).
+
+Siblings seen running the whole binary in parallel under that load, not fixed here: three tests' `provision` calls
+refused `Stalled { after_ns: 1000000000 }` (`nfs_hostile.rs:71`); `common/nfs.rs:76` got RPC accept status 5
+(`SYSTEM_ERR`) in the broken-connections test; and a daemon logged "the control loop ended; the watchdog withholds the
+beat" after its control shard's beat ran 989 ms late.
+
 ### 2026-10-22: a daemon serving two FUSE mounts of a volume spun a core after one write — fixed (A-149)
 
 Found on the box while measuring the truncate-under-DAX hang: the daemon used 129 to 200 clock ticks per 2 s when it
