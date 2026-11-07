@@ -2238,16 +2238,36 @@ fn admitted(
   let object = object.ok_or(REFUSED_MALFORMED)?;
   let regional = state.council.configuration();
   let placing = slates_cluster::content::ContentAccess::Place;
-  crate::fleet::content_authority(
+  match crate::fleet::content_authority(
     regional,
     &state.holder_records,
     local,
     peer,
     placing,
     object,
-  )
-  .map_err(not_owner_counter)?;
+  ) {
+    Ok(()) => {}
+    // The acting owner ships to a holder the volume's record names, though this node's own configuration has not
+    // placed it there (yet): its view lags the owner's, or the owner keeps a holder its configuration dropped, since a
+    // log never moves to a set of `f` or fewer (`Shipper::begin_transition`). Phase one counts the recorded holders, so
+    // a copy kept here counts; refused, every write waited for the other holder alone (live-durability's rolling
+    // partition flow: 2,086 refusals in one run while that holder was stopped, a write held 2.34 s).
+    Err("content.refused.not_a_candidate") if recorded_holder(state, local, object) => {}
+    Err(why) => return Err(not_owner_counter(why)),
+  }
   hold_bound(state, object).ok_or(REFUSED_NO_CATALOG)
+}
+
+/// Whether the newest catalog record of `object` this node holds names it among the live log's holders (A-240's record).
+fn recorded_holder(state: &ShardState, local: HostId, object: ObjectId) -> bool {
+  let catalog = object.catalog();
+  state
+    .holder_records
+    .get(&catalog)
+    .and_then(|acceptor| acceptor.highest(catalog))
+    .and_then(|(_, bytes)| crate::catalog::CatalogValue::from_record_bytes(bytes))
+    .and_then(|value| value.live_holders)
+    .is_some_and(|recorded| recorded.holders.contains(&local.0))
 }
 
 /// The holder's counter for a placement the configuration does not authorize, by `fleet::content_authority`'s reason.
