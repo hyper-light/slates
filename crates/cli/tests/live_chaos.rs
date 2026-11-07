@@ -304,16 +304,19 @@ fn wait_formed(instances: &[String], members: usize) -> Vec<String> {
     }) {
       return views.into_iter().map(|view| view.unwrap().0).collect();
     }
-    assert!(
-      window.moving(&format!("{views:?}")),
-      "the fleet formed, or kept changing, within each fleet wait: {views:?}"
-    );
+    if !window.moving(&format!("{views:?}")) {
+      // What the probe and record planes did, for a pair that never probed each other (diag-31 run 7; live-fixes).
+      panic!(
+        "the fleet formed, or kept changing, within each fleet wait: {views:?}\n{}",
+        diagnosis(instances, "")
+      );
+    }
     pause();
   }
 }
 
-/// Waits until every node in `instances` stands at the same neighbourhood generation and has settled at it (the fleet's
-/// objects re-placed onto the neighbourhood after a membership change), judged by progress ([`FrozenWindow`]).
+/// Waits until every node in `instances` has settled at its own neighbourhood generation (the fleet's objects re-placed
+/// onto the neighbourhood after a membership change), judged by progress ([`FrozenWindow`]).
 fn wait_neighbourhood_settled(instances: &[String]) {
   let mut window = FrozenWindow::new();
   loop {
@@ -333,16 +336,13 @@ fn wait_neighbourhood_settled(instances: &[String]) {
         )
       })
       .collect();
-    // Every node at the same, newest generation, each settled at it: a node whose view froze (retired while away)
-    // settles at its own old generation, which proves nothing about the others (diag-30 run 4: one at 4 = 4 while the
-    // rest stood at 24).
-    let newest = views
+    // Each node settled at its own neighbourhood generation. The generations are each node's own count and differ
+    // between nodes in a settled fleet (3, 8 and 11 side by side in diag-31), so they are not compared across nodes; a
+    // node retired while away is kept out by the stale holder's short stop instead.
+    if views
       .iter()
-      .filter_map(|(_, neighbourhood)| *neighbourhood)
-      .max();
-    if views.iter().all(|(settled, neighbourhood)| {
-      settled.is_some() && settled == neighbourhood && *neighbourhood == newest
-    }) {
+      .all(|(settled, neighbourhood)| settled.is_some() && settled == neighbourhood)
+    {
       return;
     }
     assert!(
@@ -1312,6 +1312,11 @@ fn diagnosis(instances: &[String], volume: &str) -> String {
             || line.contains("fleet.takeover")
             || line.contains("fleet.materialize")
             || line.contains("fleet.seal.")
+            || line.contains("fleet.plane.")
+            || line.contains("fleet.link.")
+            || line.contains("fleet.accept.")
+            || line.starts_with("fleet_formed_probe_peers")
+            || line.starts_with("fleet_contacts")
             || line.contains("fleet.promotion")
             || line.contains("fleet.record")
             || line.contains("fleet.owner_location")
