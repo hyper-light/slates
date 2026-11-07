@@ -237,17 +237,28 @@ fn a_partitions_snapshot_holds_what_its_green_is_not_what_it_has_been() {
   );
 }
 
-/// Submits versions from `work`, each creating a new file of [`EDIT_BYTES`], until one is refused or [`VERSIONS`] are
-/// accepted: the head reached and the refused submit's answer, if any.
+/// Shape: the cap of the held-chain test: small, so a chain of mode changes, each increment a few hundred bytes, meets
+/// it within a few hundred versions.
+const HELD_CAP_BYTES: usize = 32 << 10;
+/// Shape: the most versions the held-chain test submits: several times what [`HELD_CAP_BYTES`] holds of them.
+const HELD_VERSIONS: u64 = 4_000;
+/// Format: the two modes the held-chain test alternates between.
+const MODES: [u32; 2] = [0o600, 0o644];
+
+/// Submits versions from `work`, each changing one file's mode, until one is refused or [`HELD_VERSIONS`] are
+/// accepted: the head reached and the refused submit's answer, if any. A mode change adds an increment to the chain
+/// but neither grows the green's state nor retains history in memory, so the chain's cap is the one met.
 fn fill_until_refused(
   client: &mut Client,
   work: VolumeId,
 ) -> (u64, Option<Result<Submitted, slates_client::ClientError>>) {
   let mut head = 0;
-  for n in 1..=VERSIONS {
-    client
-      .edit(work, &format!("file-{n}"), 0, 0, &bytes_of(n))
-      .unwrap();
+  for (_, mode) in (1..=HELD_VERSIONS).zip(MODES.iter().cycle()) {
+    let op = slates_client::WorkOp::SetMode {
+      path: "file".to_owned(),
+      mode: *mode,
+    };
+    client.declare(work, op).unwrap();
     match client.submit(work) {
       Ok(Submitted::Accepted(version)) => head = version,
       other => return (head, Some(other)),
@@ -256,20 +267,26 @@ fn fill_until_refused(
   (head, None)
 }
 
-/// W3 (A-238), §4.8. Do: on a one-shard daemon whose green-chain cap is 256 KiB, make a green, a work, and a second
-/// work left at version 0, which holds the reachable floor there; submit versions from the first work, each creating a
-/// new file of 8 KiB, until one is refused; then destroy the second work and submit the refused version again.
-/// Expect: the refusal is `TableAtCapacity { table: "green_chains" }`, typed (it reached the client as `BadRequest
-/// { reason: "green_chains at capacity" }`), after about 32 versions; and once the floor is released the same submit
-/// is accepted as the next version: the submit checkpoints at the risen floor before it refuses, since no accept could
-/// come to take the checkpoint otherwise.
-#[test]
-fn a_chain_held_by_a_reader_is_refused_typed_at_its_cap_and_folds_once_released() {
+/// A green with one file, `file`, created at version 1 by the work returned with it.
+fn green_with_one_file(client: &mut Client) -> (VolumeId, VolumeId) {
+  let green = client.create_green("chain-green", false).unwrap();
+  let (work, _) = client.create_work(green, "chain-work").unwrap();
+  client.edit(work, "file", 0, 0, b"f").unwrap();
+  assert!(
+    matches!(client.submit(work), Ok(Submitted::Accepted(1))),
+    "the file is created"
+  );
+  (green, work)
+}
+
+/// A one-shard daemon whose green-chain cap is [`HELD_CAP_BYTES`], bootstrapped.
+fn held_cap_daemon(instance: &str) -> Daemon {
   let profile = common::machine_profile();
-  let instance = format!("srv-chain-held-{}", std::process::id());
+  let mut config = DaemonConfig::derive(&profile, instance, Some(TEST_SHARDS));
+  config.caps.green_chain_bytes = HELD_CAP_BYTES;
   let daemon = Daemon::start(
     &profile,
-    config(&profile, &instance),
+    config,
     slates_server::SegmentSource::Create {
       name: format!("slates-seg-chain-held-{}", std::process::id()),
     },
@@ -278,9 +295,23 @@ fn a_chain_held_by_a_reader_is_refused_typed_at_its_cap_and_folds_once_released(
   daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
+  daemon
+}
+
+/// W3 (A-238), §4.8. Do: on a one-shard daemon whose green-chain cap is 32 KiB, make a green and a work, create one
+/// file, then make a second work, left at version 1, which holds the reachable floor there; submit versions from the
+/// first work, each changing the file's mode, until one is refused; then destroy the second work and submit the
+/// refused version again. Expect: the refusal is `TableAtCapacity { table: "green_chains" }`, typed (it reached the
+/// client as `BadRequest { reason: "green_chains at capacity" }`); and once the floor is released the same submit is
+/// accepted as the next version: the submit checkpoints at the risen floor before it refuses, since no accept could
+/// come to take the checkpoint otherwise. Mode changes keep the green's own state and its history in memory small, so
+/// only the chain fills.
+#[test]
+fn a_chain_held_by_a_reader_is_refused_typed_at_its_cap_and_folds_once_released() {
+  let instance = format!("srv-chain-held-{}", std::process::id());
+  let daemon = held_cap_daemon(&instance);
   let mut client = connect(&instance);
-  let green = client.create_green("chain-green", false).unwrap();
-  let (work, _) = client.create_work(green, "chain-work").unwrap();
+  let (green, work) = green_with_one_file(&mut client);
   let (holder, _) = client.create_work(green, "floor-holder").unwrap();
   let (head, refused) = fill_until_refused(&mut client, work);
   let released = client.destroy(holder);
@@ -295,7 +326,6 @@ fn a_chain_held_by_a_reader_is_refused_typed_at_its_cap_and_folds_once_released(
     ),
     "the chain held at its floor is refused typed at its cap (head {head}): {refused:?}"
   );
-  assert!(head < VERSIONS, "the cap was met before the last version");
   assert!(
     released.is_ok(),
     "the floor's work is destroyed: {released:?}"
