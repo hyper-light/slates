@@ -213,13 +213,18 @@ impl UdpSocket {
           Io::Interrupted => {}
         }
       },
-      Inner::Sim { port } => Ok(crate::sim::sim_udp_recv(*port).map(|(bytes, from)| {
-        let n = bytes.len().min(buf.len());
-        if let (Some(into), Some(from_bytes)) = (buf.get_mut(..n), bytes.get(..n)) {
-          into.copy_from_slice(from_bytes);
+      Inner::Sim { port } => {
+        if let Some(refusal) = crate::sim::sim_udp_take_refusal(*port) {
+          return Err(refusal);
         }
-        (n, SocketAddrV4::new(Ipv4Addr::LOCALHOST, from))
-      })),
+        Ok(crate::sim::sim_udp_recv(*port).map(|(bytes, from)| {
+          let n = bytes.len().min(buf.len());
+          if let (Some(into), Some(from_bytes)) = (buf.get_mut(..n), bytes.get(..n)) {
+            into.copy_from_slice(from_bytes);
+          }
+          (n, SocketAddrV4::new(Ipv4Addr::LOCALHOST, from))
+        }))
+      }
     }
   }
 }
