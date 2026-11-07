@@ -48,8 +48,11 @@
 >   waits by A-65's rule instead, one commit per call family, each failing first
 >   (`crates/server/tests/cross_shard_wait.rs`). Done: the consensus verbs (a bootstrap with the control shard on the
 >   CPU a fifth of the time, refused `Overloaded` after 1.003 s on main, acknowledged after 1.52–1.68 s; a wedged control
->   shard still refused after 1.000–1.004 s). Open: the forwarded verbs, the consumer verbs, the NFS bridge, the direct
->   map's delivery, the remote reap. Record: `docs/bugs/2026-11-06-a-cross-shard-wait-lost-a-starved-shards-answer.md`.
+>   shard still refused after 1.000–1.004 s; the same on CI's four Linux and Windows runners, quiet and busy); the consumer
+>   verbs (a revoke and an attestation with a starved shard refused `NotFound` after 1.003 s and 1.075 s, now answered
+>   after 1.57–1.80 s). Open: the forwarded verbs, the NFS bridge, the direct map's delivery, the remote reap. Found on
+>   the way: a Windows channel (a `Sid`) can never attest a consumer (`verify_attestation` takes a uid only), and two
+>   server unit tests of landing fail on Windows, where CI does not run them. Record: `docs/bugs/2026-11-06-a-cross-shard-wait-lost-a-starved-shards-answer.md`.
 
 > **A-190's purge client leaves the daemon's process (2026-11-06, fixed); the sweep for the rest (open).** No daemon
 > thread opens a path on a volume the daemon serves (§4.6). The coherent purge's opens, writes and reads now run in a

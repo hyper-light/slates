@@ -236,3 +236,144 @@ fn a_bootstrap_whose_control_shard_is_wedged_is_refused_after_a_window() {
   drop(client);
   daemon.stop();
 }
+
+/// Shape: the account the revoke tests enroll their consumer under: any one, since enrollment and revocation are
+/// decided by the issuer's proof, not by the caller's own account.
+const ACCOUNT: u32 = 1;
+
+/// Bootstraps the daemon (a fresh one records nothing before, AC-8.1) and enrolls a consumer from `client` under the
+/// daemon's issuer secret: its id, its capability and the secret. Done before any hold.
+fn enrolled(daemon: &Daemon, client: &mut Client, account: u32) -> (u64, [u8; 32], [u8; 32]) {
+  let member = daemon.member_identity().unwrap().0;
+  let (booted, _) = bootstrap(member, client);
+  assert!(
+    matches!(booted, Ok(ReplyBody::Acknowledged)),
+    "the daemon was bootstrapped: {booted:?}"
+  );
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let proof = slates_server::landing::enroll_proof(&secret, account);
+  let enrolled = client.call(&RequestBody::Enroll { account, proof });
+  let Ok(ReplyBody::Enrolled {
+    consumer,
+    secret: capability,
+  }) = enrolled
+  else {
+    panic!("the consumer was enrolled: {enrolled:?}");
+  };
+  (consumer, capability, secret)
+}
+
+/// The shard that holds `consumer`'s record.
+#[cfg(unix)]
+fn owner_of(daemon: &Daemon, consumer: u64) -> ShardId {
+  daemon.shards()[usize::from(slates_server::verbs::owner_of_consumer(consumer))]
+}
+
+/// The other shard of the two.
+fn other_than(daemon: &Daemon, shard: ShardId) -> ShardId {
+  *daemon
+    .shards()
+    .iter()
+    .find(|other| **other != shard)
+    .unwrap()
+}
+
+/// Revokes `consumer` from `client` with the issuer's proof: the reply and how long it took.
+fn revoke(
+  client: &mut Client,
+  secret: &[u8; 32],
+  consumer: u64,
+) -> (Result<ReplyBody, ClientError>, Duration) {
+  let proof = slates_server::landing::revoke_proof(secret, consumer);
+  let started = Instant::now();
+  let reply = client.call(&RequestBody::Revoke { consumer, proof });
+  (reply, started.elapsed())
+}
+
+/// R3 class A, the consumer verbs (`verbs.rs` `revoke_everywhere`), A-65, §4.3, §4.13. Do: enroll a consumer, then,
+/// from a client served on one shard, revoke it while the other shard runs one starved poll for a window and a half.
+/// The revocation calls the consumer's own shard to record it and then every shard to mark it, so one of its calls
+/// waits on the starved shard whichever holds the record. Expect: the consumer is revoked, after more than a wall
+/// window. On main that call gave up at the wall second and the human was refused `NotFound` while the record stood.
+#[test]
+fn a_revoke_with_a_starved_shard_is_revoked_past_a_wall_window() {
+  static BEGUN: AtomicBool = AtomicBool::new(false);
+  let (daemon, instance) = daemon("revoke-starved");
+  let mut client = connect(&instance);
+  let (consumer, _, secret) = enrolled(&daemon, &mut client, ACCOUNT);
+  let starved = other_than(&daemon, serving(&daemon, client.client_id()));
+  let holding = hold(&daemon, starved, Held::Starved, &BEGUN);
+  let (reply, took) = revoke(&mut client, &secret, consumer);
+  holding.join().unwrap();
+  println!("a revoke with a starved shard: {reply:?} after {took:?}");
+  assert!(
+    took > WINDOW,
+    "the answer came past a wall window ({took:?}), so the test is not vacuous"
+  );
+  assert!(
+    matches!(reply, Ok(ReplyBody::Revoked)),
+    "a starved shard's revocation was lost after {took:?}: {reply:?}"
+  );
+  drop(client);
+  daemon.stop();
+}
+
+/// R3 class A, the consumer verbs, A-65, §4.3. Do: as the starved revoke, with the other shard's poll off the CPU
+/// throughout (wedged). Expect: refused `NotFound` after a window and before the wedge ends.
+#[test]
+fn a_revoke_with_a_wedged_shard_is_refused_after_a_window() {
+  static BEGUN: AtomicBool = AtomicBool::new(false);
+  let (daemon, instance) = daemon("revoke-wedged");
+  let mut client = connect(&instance);
+  let (consumer, _, secret) = enrolled(&daemon, &mut client, ACCOUNT);
+  let wedged = other_than(&daemon, serving(&daemon, client.client_id()));
+  let holding = hold(&daemon, wedged, Held::Wedged, &BEGUN);
+  let (reply, took) = revoke(&mut client, &secret, consumer);
+  holding.join().unwrap();
+  println!("a revoke with a wedged shard: {reply:?} after {took:?}");
+  assert!(
+    matches!(reply, Err(ClientError::Refused(Refusal::NotFound))),
+    "a wedged shard refused the revocation NotFound, got {reply:?}"
+  );
+  assert!(
+    took >= WINDOW && took < WEDGED_FOR,
+    "the wedged shard was given up after a window and before the wedge ended, not after {took:?}"
+  );
+  drop(client);
+  daemon.stop();
+}
+
+/// R3 class A, the consumer verbs (`verbs.rs` attest), A-65, §4.3, §4.13. Unix: an attestation binds a channel whose
+/// principal is the consumer's account's uid (`verify_attestation`). Do: enroll a consumer under this process's uid, then, from a client
+/// served on the shard that does not hold its record, attest as it while the record's shard runs one starved poll for
+/// a window and a half. Expect: the channel is attested, after more than a wall window. On main the call for the
+/// consumer's record gave up at the wall second and the workload was refused `NotFound`, as if never enrolled.
+#[cfg(unix)]
+#[test]
+fn an_attest_whose_record_shard_is_starved_is_attested_past_a_wall_window() {
+  static BEGUN: AtomicBool = AtomicBool::new(false);
+  let (daemon, instance) = daemon("attest-starved");
+  let mut owner = connect(&instance);
+  let uid = rustix::process::getuid().as_raw();
+  let (consumer, capability, _) = enrolled(&daemon, &mut owner, uid);
+  let record = owner_of(&daemon, consumer);
+  let (mut workload, _others) = client_on(&daemon, &instance, other_than(&daemon, record));
+  let proof = slates_server::landing::attest_proof(&capability, workload.client_id());
+  let holding = hold(&daemon, record, Held::Starved, &BEGUN);
+  let started = Instant::now();
+  let reply = workload.call(&RequestBody::Attest { consumer, proof });
+  let took = started.elapsed();
+  holding.join().unwrap();
+  println!("an attest with its record's shard starved: {reply:?} after {took:?}");
+  assert!(
+    took > WINDOW,
+    "the answer came past a wall window ({took:?}), so the test is not vacuous"
+  );
+  assert!(
+    matches!(reply, Ok(ReplyBody::Attested)),
+    "a starved shard's attestation was lost after {took:?}: {reply:?}"
+  );
+  drop(workload);
+  drop(owner);
+  daemon.stop();
+}
