@@ -449,7 +449,7 @@ jobs:
       # tests and examples, which asked `rustix::param` for the page size (configured out on Windows), never compiled for
       # Windows; they ask `slates_machine::facts::Facts::page_bytes` now (`cargo xwin clippy` red before, clean after).
       - name: Clippy the Windows-buildable crates (native Windows)
-        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp -p slates-cluster --all-targets -- -D warnings
+        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp -p slates-cluster -p slates-land --all-targets -- -D warnings
       # The shipped Windows binary, linted without `--all-targets` and as a step of its own so its exit code
       # is checked on its own (the Windows shell is `pwsh`, where a native command failing mid-script does not
       # end the script — only the last line decides the step, which would mask this).
@@ -485,7 +485,7 @@ jobs:
       - name: Documentation (every reference names something Windows can see)
         env:
           RUSTDOCFLAGS: -D warnings -A rustdoc::private_intra_doc_links
-        run: cargo doc -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-anchor -p slates-cli -p slates-mcp --no-deps --document-private-items
+        run: cargo doc -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-anchor -p slates-cli -p slates-mcp -p slates-land --no-deps --document-private-items
       # Run the tests whose Win32 cfg branches only a native Windows runner can exercise: the shared
       # memory (`CreateFileMappingW`); the cross-process wake (the named auto-reset Event — §4.7's
       # `WaitOnAddress`-is-process-local case, so the park/late-reply wake in `rings` goes through the
@@ -544,6 +544,24 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-base
+      # Landing on Windows (§4.15, A-185): the writer over NTFS handles, the oracle, a real kill mid-landing on NTFS
+      # (T-1.15), an outsider's junction and hard-link swaps before every seam call, and real outsider saves during
+      # every kind of removal; the symbolic-link cases are Unix's (Windows makes none without a privilege).
+      - name: Test landing on Windows (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p slates-land --release
+      # The verb that writes: landing through a daemon, then a presentation that dies with its client. One test at a
+      # time, as the client binary is: each daemon is sized from the whole machine, and Windows charges commit when
+      # memory is made.
+      - name: Test the landing verb through a daemon, one test at a time (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p slates-server --test lease --test snapshot_landing --test landing_fairness -- --test-threads=1
+      - name: Test a presentation abandoned with its client (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-client --test presentation -- --test-threads=1
       - name: Test the AFD readiness over loopback UDP (native Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 15
@@ -856,7 +874,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: >-
           cargo clippy -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-anchor
-          -p slates-bridge-winfsp -p slates-mcp -p slates-cluster --all-targets -- -D warnings
+          -p slates-bridge-winfsp -p slates-mcp -p slates-cluster -p slates-land --all-targets -- -D warnings
       - name: Clippy the shipped binary and its Shards and WinFsp tests natively on arm64 Windows
         if: ${{ !cancelled() }}
         run: cargo clippy -p slates-cli --bin slates --test shards --test winfsp --test winfsp_semantics -- -D warnings
@@ -870,6 +888,19 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 20
         run: cargo test -p slates-client --test shards -- --test-threads=1
+      # Landing on arm64 (A-185): as on x86_64, the writer over real NTFS handles, then the verb through a daemon.
+      - name: Test landing (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p slates-land --release
+      - name: Test the landing verb through a daemon, one test at a time (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p slates-server --test lease --test snapshot_landing --test landing_fairness -- --test-threads=1
+      - name: Test a presentation abandoned with its client (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-client --test presentation -- --test-threads=1
       # A-205: as on x86_64, the pages of a deleted file leave the working set.
       - name: Test a deleted file's memory going back to the OS (native arm64 Windows)
         if: ${{ !cancelled() }}
@@ -1112,7 +1143,7 @@ jobs:
           if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
           "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Clippy the Windows-buildable crates
-        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp -p slates-cluster --all-targets -- -D warnings
+        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp -p slates-cluster -p slates-land --all-targets -- -D warnings
       # The shipped Windows binary, linted without `--all-targets` and as a step of its own so its exit code
       # is checked on its own (the Windows shell is `pwsh`, where a native command failing mid-script does not
       # end the script — only the last line decides the step, which would mask this).
