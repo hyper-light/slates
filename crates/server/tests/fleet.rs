@@ -5077,6 +5077,137 @@ fn volume_owned_by(client: &mut Client, partition: usize, tag: &str) -> VolumeId
   panic!("no volume of {PLACEMENT_TRIES} landed on partition {partition}");
 }
 
+/// Shape: how long [`a_silent_forward_gives_up_while_its_session_carries_others`] holds the owner's shard: three
+/// liveness budgets, past a forward's stall budget (one budget plus the path's tail, near zero here).
+const SILENT_OWNER_HOLD: Duration = Duration::from_nanos(3 * LIVENESS_BUDGET_NS);
+/// Shape: how long the other client keeps the session busy inside that hold: all of it but half a budget, so the
+/// counters are read while the silent forward's owner is still held.
+const BUSY_SESSION_FOR: Duration = Duration::from_nanos(5 * LIVENESS_BUDGET_NS / 2);
+/// The owner's shard is held ([`a_silent_forward_gives_up_while_its_session_carries_others`]).
+static SILENT_OWNER_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// §4.8 "Lookup", the forward lane's stall budget, found by fixtures' 1,000-client primary-kill rung (2026-11-07): 298
+/// forwards an owner never answered stayed open in the lane for good, neither done nor given up, because the session
+/// kept carrying other replies, and progress was any byte the session consumed. Do: three nodes, each its own region;
+/// on a, a volume `silent` on its non-control shard and `busy` on its control shard; route b's two clients to them.
+/// Hold a's non-control shard for three liveness budgets; inside it, read `silent` through the first client and read
+/// `busy` over and over through the second, so b's session to a keeps carrying replies. Expect: before the hold ends,
+/// b's lane has given up at least one forwarder (`fleet.forward.batch_given_up`), so the read on the held shard is
+/// sent again and, after the hold, served. Before: none given up while the session was busy.
+#[test]
+fn a_silent_forward_gives_up_while_its_session_carries_others() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let regions: std::collections::BTreeMap<HostId, RegionId> = hosts
+    .iter()
+    .enumerate()
+    .map(|(index, host)| (*host, RegionId(u64::try_from(index).unwrap())))
+    .collect();
+  let daemons = start_mesh_with(
+    nodes,
+    &hosts,
+    &certs,
+    &serve,
+    1,
+    2,
+    &regions,
+    &std::collections::BTreeMap::new(),
+  );
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut client_a = Client::connect(daemons[0].instance());
+  let silent = volume_owned_by(&mut client_a, 1, "silent");
+  let busy = volume_owned_by(&mut client_a, 0, "busy");
+  let mut silent_client = Client::connect(daemons[1].instance());
+  let mut busy_client = Client::connect(daemons[1].instance());
+  let (silent_routed, silent_last) = poll_status_served(
+    &daemons,
+    &mut silent_client,
+    silent,
+    COUNCIL_RETIRE_DEADLINE,
+  );
+  let (busy_routed, busy_last) =
+    poll_status_served(&daemons, &mut busy_client, busy, COUNCIL_RETIRE_DEADLINE);
+  let measured = (silent_routed && busy_routed).then(|| {
+    SILENT_OWNER_HELD.store(false, std::sync::atomic::Ordering::Release);
+    let hold = daemons[0]
+      .observation(
+        Some(daemons[0].shards()[1]),
+        slates_server::daemon::OBSERVE_BUDGET_NS,
+        |_: &mut slates_server::state::ShardState| {
+          SILENT_OWNER_HELD.store(true, std::sync::atomic::Ordering::Release);
+          // The held shard's thread runs nothing else for the hold: the read of `silent` waits there.
+          #[allow(clippy::disallowed_methods)]
+          std::thread::sleep(SILENT_OWNER_HOLD);
+        },
+      )
+      .unwrap();
+    let holder = std::thread::spawn(move || hold.wait());
+    let began = Instant::now();
+    while !SILENT_OWNER_HELD.load(std::sync::atomic::Ordering::Acquire) {
+      assert!(began.elapsed() < SILENT_OWNER_HOLD, "the hold began");
+      std::thread::yield_now();
+    }
+    let silent_read = std::thread::spawn(move || {
+      let reply = silent_client.call(&RequestBody::Status { volume: silent });
+      (reply, silent_client)
+    });
+    let busy_began = Instant::now();
+    let mut busy_served = 0u64;
+    while busy_began.elapsed() < BUSY_SESSION_FOR {
+      if matches!(
+        busy_client.call(&RequestBody::Status { volume: busy }),
+        ReplyBody::Status { .. }
+      ) {
+        busy_served += 1;
+      }
+    }
+    let during = daemons[1].fleet_refusals();
+    let (silent_reply, _) = silent_read.join().unwrap();
+    holder.join().unwrap().unwrap();
+    (busy_served, during, silent_reply)
+  });
+  for daemon in daemons {
+    daemon.stop();
+  }
+  let (busy_served, during, silent_reply) = measured.unwrap_or_else(|| {
+    panic!(
+      "b routed both reads to a before the hold (last replies: {silent_last:?}, {busy_last:?})"
+    )
+  });
+  let given_up = during
+    .as_ref()
+    .map(|map| {
+      map
+        .get("fleet.forward.batch_given_up")
+        .copied()
+        .unwrap_or(0)
+    })
+    .unwrap_or(0);
+  assert!(
+    busy_served > 0,
+    "the session carried other replies through the hold"
+  );
+  assert!(
+    given_up >= 1,
+    "a forward its owner never answered was given up at its stall budget while the session carried {busy_served} \
+     other replies: batch_given_up {given_up}; b's counters {during:?}"
+  );
+  assert!(
+    matches!(silent_reply, ReplyBody::Status { .. }),
+    "the silent read, sent again, is served once the hold ends: {silent_reply:?}"
+  );
+}
+
 /// Shape: how long [`fill_task_arena`] may take to fill a shard's arena, and each filler's admission wait.
 const FILL_DEADLINE: Duration = Duration::from_secs(30);
 /// Shape: how long a forward refused at admission may take to be answered: a liveness budget is far more than
