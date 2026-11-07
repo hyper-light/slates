@@ -1,0 +1,7 @@
+38b71fab green on windows-latest: exit 0
+> D:\a\slates\slates\own.log:174:test a_base_on_the_daemons_own_drive_is_refused_before_any_open ... slates anchor: instance wfownbase7852 up; daemon pid 920; 1 shards
+  D:\a\slates\slates\own.log:175:slates anchor: issuer surface: export SLATES_ANCHOR=slates-seg-wfownbase7852 SLATES_ANCHOR_LEN=18605608960 SLATES_ANCHOR_CONTENT=slates-con-wfownbase7852 SLATES_ANCHOR_CONTENT_LEN=24330436608
+> D:\a\slates\slates\own.log:218:test a_landing_target_on_the_daemons_own_drive_is_refused_before_any_open ... slates anchor: instance wfownland7852 up; daemon pid 8072; 1 shards
+  D:\a\slates\slates\own.log:219:slates anchor: issuer surface: export SLATES_ANCHOR=slates-seg-wfownland7852 SLATES_ANCHOR_LEN=18605608960 SLATES_ANCHOR_CONTENT=slates-con-wfownland7852 SLATES_ANCHOR_CONTENT_LEN=24330436608
+> D:\a\slates\slates\own.log:263:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 1.19s
+  D:\a\slates\slates\own.log:264:
