@@ -1156,12 +1156,18 @@ fn coverable_now(state: &ShardState, volume: [u8; 16]) -> bool {
 }
 
 /// The position up to which `volume`'s log is durable for its writers here: the shipper's durable position, once the
-/// fleet knows the volume ([`head_placed`]) and a successor could open the log at it ([`covers_candidates`]: the last
-/// whole entry covers every candidate, and is itself durable). `None` until then.
+/// fleet knows the volume ([`head_placed`]), the holder set its durability counts is recorded in the catalog at
+/// `f + 1` ([`active_set_recorded`], A-240), and a successor could open the log at it ([`covers_candidates`]: the last
+/// whole entry covers every candidate, and is itself durable). `None` until then. The record gate also holds by
+/// construction (nothing ships before it, `pending_sends`); it is stated here, where a write is answered, so a later
+/// change that ships first cannot answer under an unrecorded set unnoticed (raft's review, 2026-11-07).
 fn answerable(state: &ShardState, volume: [u8; 16]) -> Option<u64> {
   let live = state.live.shipping.get(&volume)?;
   let durable = live.shipper.durable()?;
-  if !head_placed(state, volume) || !covers_candidates(state, volume) {
+  if !head_placed(state, volume)
+    || !active_set_recorded(state, volume)
+    || !covers_candidates(state, volume)
+  {
     return None;
   }
   let whole = live.whole.as_ref().map(|(head, _)| head.position)?;
@@ -1181,6 +1187,8 @@ fn count_held_back(state: &mut ShardState, volume: [u8; 16]) {
   let whole = live.whole.as_ref().map(|(head, _)| head.position);
   let why = if !head_placed(state, volume) {
     LIVE_HELD_BACK_PLACEMENT
+  } else if !active_set_recorded(state, volume) {
+    LIVE_HELD_BACK_HOLDERS
   } else if !covers_candidates(state, volume) {
     LIVE_HELD_BACK_KEYS
   } else if whole.is_none_or(|whole| durable < whole) {
@@ -1193,6 +1201,21 @@ fn count_held_back(state: &mut ShardState, volume: [u8; 16]) {
 
 /// Counter: a durable live log whose writers wait because the fleet does not know the volume yet (its head unplaced).
 const LIVE_HELD_BACK_PLACEMENT: &str = "fleet.live.held_back.placement";
+/// Counter: a durable live log whose writers wait because the holder set its durability counts is not yet recorded in
+/// the volume's catalog at `f + 1` (A-240).
+const LIVE_HELD_BACK_HOLDERS: &str = "fleet.live.held_back.holders";
+
+/// Whether the holder set `volume`'s shipper counts durability over is recorded in its catalog and that version is placed
+/// at `f + 1` (A-240; at `f = 0` the owner's commit places it, [`catalog_placed_at`]).
+fn active_set_recorded(state: &ShardState, volume: [u8; 16]) -> bool {
+  state
+    .live
+    .shipping
+    .get(&volume)
+    .and_then(|live| live.recorded)
+    .is_some_and(|version| catalog_placed_at(state, volume, version))
+}
+
 /// Counter: a durable live log whose writers wait because its last whole entry lacks a candidate's key.
 const LIVE_HELD_BACK_KEYS: &str = "fleet.live.held_back.keys";
 /// Counter: a durable live log whose writers wait because its last whole entry is not durable yet.
