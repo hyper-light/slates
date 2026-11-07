@@ -289,19 +289,27 @@ fn fleet_view(instance: &str) -> Option<(String, usize, u32)> {
   ))
 }
 
-/// Whether `instance`'s probe mesh is up as its daemon judges it: every peer it keeps direct contact with is probed
-/// (`fleet_peers_unmeshed` zero), and it keeps contact with at least one. Not "every member less one probed": two
+/// Whether a node's probe mesh ([`mesh_of`]) is up as its daemon judges it: every peer it keeps direct contact with is
+/// probed (`fleet_peers_unmeshed` zero), and it keeps contact with at least one. Not "every member less one probed": two
 /// members that neither hold for each other nor vote keep no direct contact (§4.8), so a five-node fleet's two
 /// non-voters probe each other only in formation's first window (raft-chaos's flow took that for a stall, CI
 /// diag-live-fixes-30 runs 5 and 6).
-fn meshed(instance: &str) -> bool {
+fn meshed(mesh: Option<(u32, u32)>) -> bool {
+  mesh.is_some_and(|(in_contact, unmeshed)| in_contact > 0 && unmeshed == 0)
+}
+
+/// `instance`'s probe mesh from `status`: the peers it keeps direct contact with (`fleet_peers_in_contact`) and how
+/// many of them have no formed probe session (`fleet_peers_unmeshed`); `None` when `status` does not answer.
+fn mesh_of(instance: &str) -> Option<(u32, u32)> {
   let (code, out, _) = run(instance, &["status"]);
-  code == 0
-    && value_of(&out, "fleet_peers_unmeshed").trim() == "0"
-    && value_of(&out, "fleet_peers_in_contact")
-      .trim()
-      .parse::<u32>()
-      .is_ok_and(|contact| contact > 0)
+  if code != 0 {
+    return None;
+  }
+  let count = |key: &str| value_of(&out, key).trim().parse::<u32>().ok();
+  Some((
+    count("fleet_peers_in_contact")?,
+    count("fleet_peers_unmeshed")?,
+  ))
 }
 
 /// Waits until every node holds all `members` members alive with its probe mesh up ([`meshed`]); returns their member
@@ -313,11 +321,13 @@ fn wait_formed(instances: &[String], members: usize) -> Vec<String> {
       .iter()
       .map(|instance| fleet_view(instance))
       .collect();
-    let meshes: Vec<bool> = instances.iter().map(|instance| meshed(instance)).collect();
+    // Each node's (in contact, unmeshed), as `status` prints them.
+    let meshes: Vec<Option<(u32, u32)>> =
+      instances.iter().map(|instance| mesh_of(instance)).collect();
     if views
       .iter()
       .all(|view| view.as_ref().is_some_and(|(_, held, _)| *held == members))
-      && meshes.iter().all(|meshed| *meshed)
+      && meshes.iter().all(|mesh| meshed(*mesh))
     {
       return views.into_iter().map(|view| view.unwrap().0).collect();
     }
@@ -325,7 +335,7 @@ fn wait_formed(instances: &[String], members: usize) -> Vec<String> {
     if !window.moving(&format!("{views:?} {meshes:?}")) {
       // What the probe and record planes did, for a node whose in-contact peers never all probed it.
       panic!(
-        "the fleet formed, or kept changing, within each fleet wait: {views:?} meshed {meshes:?}\n{}",
+        "the fleet formed, or kept changing, within each fleet wait: {views:?} (in contact, unmeshed) {meshes:?}\n{}",
         diagnosis(instances, "")
       );
     }
@@ -1352,6 +1362,7 @@ fn diagnosis(instances: &[String], volume: &str) -> String {
             || line.starts_with("fleet_configuration_version")
             || line.contains("anchor")
             || line.starts_with("fleet_host")
+            || line.starts_with("fleet_peers_")
             || line.contains("lent_to")
         })
         .collect();
