@@ -28,6 +28,10 @@
 )]
 #![cfg(unix)]
 
+#[path = "../../server/tests/common/nfs.rs"]
+#[allow(dead_code)]
+mod nfs;
+
 use std::collections::BTreeMap;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2972,4 +2976,165 @@ fn wait_holders(fleet: &Fleet, volume: &str, count: usize) -> Vec<usize> {
     );
     pause();
   }
+}
+
+/// How a flow's write is made durable before its answer (A-200's barrier), one per path a client has to a live volume.
+#[derive(Clone, Copy, Debug)]
+enum Barrier {
+  /// The in-process client's `fs_write`, answered once the volume's log is durable.
+  ClientWrite,
+  /// A stable (`FILE_SYNC`) NFS write over the owner's export, from a userspace NFS client (never a kernel mount).
+  NfsFileSync,
+}
+
+/// The value of `key` in a `--json` line, unquoted.
+fn json_field(text: &str, key: &str) -> String {
+  let needle = format!("\"{key}\":");
+  let after = text
+    .split(&needle)
+    .nth(1)
+    .unwrap_or_else(|| panic!("{key} in {text}"))
+    .trim_start();
+  match after.strip_prefix('"') {
+    Some(quoted) => quoted.split('"').next().unwrap().to_owned(),
+    None => after.split([',', '}']).next().unwrap().trim().to_owned(),
+  }
+}
+
+/// Writes `name` with `body` to `volume` on `owner` through `barrier`, returning once the write is answered: the moment
+/// the caller may kill the owner. Panics when the write is refused (the flow's precondition is a healthy fleet).
+fn write_through(owner: &str, volume: &str, barrier: Barrier, name: &str, body: &[u8]) {
+  match barrier {
+    Barrier::ClientWrite => {
+      let stream = Stream {
+        instance: owner,
+        volume: volume_id_of(volume),
+        began: Instant::now(),
+      };
+      let (mut client, attachment) = stream.attach().expect("attached for writing");
+      client
+        .fs_write((volume_id_of(volume), attachment), name, body, FILE_MODE)
+        .expect("the probe write is answered");
+    }
+    Barrier::NfsFileSync => {
+      let (code, out, err) = run(owner, &["export", volume, "--json"]);
+      assert_eq!(code, 0, "export: {err}");
+      let (path, port) = (json_field(&out, "path"), json_field(&out, "port"));
+      let mut stream =
+        std::net::TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap())).unwrap();
+      stream.set_read_timeout(Some(FLEET_WAIT)).unwrap();
+      stream.set_nodelay(true).unwrap();
+      let root = nfs::mount(&mut stream, &path, 1);
+      let file = nfs::create(&mut stream, &root, name, 2);
+      nfs::write(&mut stream, &file, body, 3);
+    }
+  }
+}
+
+/// Waits until one of `survivors` serves `name` of `volume` as `body`, byte for byte; which, and after how long. `None`
+/// at the fleet wait.
+fn wait_reads<'a>(
+  survivors: &[&'a str],
+  volume: &str,
+  name: &str,
+  body: &[u8],
+) -> Option<(&'a str, Duration)> {
+  let began = Instant::now();
+  while began.elapsed() < FLEET_WAIT {
+    for survivor in survivors {
+      if let Ok(mut client) = Client::connect(survivor, deadlines())
+        && client
+          .read(volume_id_of(volume), &format!("/{name}"), ReadAt::Head)
+          .is_ok_and(|bytes| bytes == body)
+      {
+        return Some((survivor, began.elapsed()));
+      }
+    }
+    pause();
+  }
+  None
+}
+
+/// A-200 NoLoss at the acknowledgement itself (live-durability's proposal, 2026-11-07): do, `ITERATIONS` times on one
+/// fleet, make a live volume on the owner, write `BEFORE` files, then write a probe file through a barrier (alternately
+/// the client's `fs_write` and a userspace NFS `FILE_SYNC` write) and SIGKILL the owner the instant the probe's answer
+/// returns; then replace the dead node with a fresh member, which owns the next iteration's volume. Expect a survivor to
+/// serve the probe and every file before it, byte for byte, each time: a write's answer means it is durable on `f + 1`
+/// hosts, so no window between the answer and the owner's death may lose it.
+#[test]
+fn a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor() {
+  /// Shape: the iterations, alternating the barrier.
+  const ITERATIONS: usize = 6;
+  /// Shape: the files written before the probe, so the log has entries past its first whole record.
+  const BEFORE: usize = 8;
+  if !gated("kill-at-ack") {
+    return;
+  }
+  let mut fleet = Fleet::start("kill-at-ack", Supervision::Bare);
+  let mut verdict = Verdict::new("a write answered the instant before its owner dies");
+  let owner_index = fleet.owner_index();
+  for iteration in 0..ITERATIONS {
+    let barrier = if iteration % 2 == 0 {
+      Barrier::ClientWrite
+    } else {
+      Barrier::NfsFileSync
+    };
+    let owner = fleet.instances[owner_index].clone();
+    let volume = create_volume(&owner, &format!("kill-at-ack-{iteration}"), true);
+    let files: Vec<(String, Vec<u8>)> = (0..=BEFORE)
+      .map(|file| {
+        let name = format!("ack-{iteration}-{file}");
+        let body = chaos_body(iteration * (BEFORE + 1) + file);
+        (name, body)
+      })
+      .collect();
+    let (probe, before) = files.split_last().unwrap();
+    for (name, body) in before {
+      write_through(&owner, &volume, Barrier::ClientWrite, name, body);
+    }
+    write_through(&owner, &volume, barrier, &probe.0, &probe.1);
+    // The instant the probe's answer is back, the owner is gone.
+    fleet.kill_node(owner_index);
+    let survivors: Vec<String> = fleet
+      .others(owner_index)
+      .into_iter()
+      .map(|index| fleet.instances[index].clone())
+      .collect();
+    let refs: Vec<&str> = survivors.iter().map(String::as_str).collect();
+    match wait_reads(&refs, &volume, &probe.0, &probe.1) {
+      Some((successor, took)) => {
+        let lost: Vec<String> = before
+          .iter()
+          .filter(|(name, body)| {
+            Client::connect(successor, deadlines())
+              .ok()
+              .and_then(|mut client| {
+                client
+                  .read(volume_id_of(&volume), &format!("/{name}"), ReadAt::Head)
+                  .ok()
+              })
+              .is_none_or(|bytes| bytes != *body)
+          })
+          .map(|(name, _)| name.clone())
+          .collect();
+        verdict.note(format!(
+          "iteration {iteration} ({barrier:?}): {successor} served the probe {took:?} after the owner's death"
+        ));
+        verdict.check(&format!("NoLoss, iteration {iteration} (earlier files)"), lost);
+      }
+      None => verdict.check(
+        &format!("NoLoss, iteration {iteration} ({barrier:?})"),
+        vec![format!(
+          "no survivor served {} within the fleet wait:\n{}",
+          probe.0,
+          diagnosis(&survivors, &volume)
+        )],
+      ),
+    }
+    // The dead node's replacement, a fresh member at the same index, owns the next iteration's volume.
+    fleet.replace_node(owner_index);
+    fleet.wait_rejoined();
+  }
+  drop(fleet);
+  verdict.judge();
 }
