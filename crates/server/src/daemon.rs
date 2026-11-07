@@ -744,6 +744,8 @@ impl Daemon {
       let learning = (!held.is_empty()).then(|| gate.learning());
       #[cfg(target_os = "macos")]
       let learning = Some(gate.learning());
+      #[cfg(windows)]
+      let learning = ();
       runtime.spawn_on(*shard, async move {
         #[cfg(unix)]
         gate.enter();
@@ -760,15 +762,13 @@ impl Daemon {
           &config,
           &env,
           &identity,
-          (partition, sealing),
+          (partition, sealing, learning),
           &all,
           retained,
           #[cfg(target_os = "linux")]
           (held, copies),
           #[cfg(windows)]
           windows_holds,
-          #[cfg(unix)]
-          learning,
         );
         let took_us = started.elapsed().as_micros();
         match outcome {
@@ -3110,13 +3110,20 @@ fn operation_headroom(
   )
 }
 
+/// A shard's learning of the mounts it keeps (A-227, `slates_base::own_mounts::Learning`), let go once they are
+/// recorded; none on Windows, which learns its held volumes before any shard starts.
+#[cfg(unix)]
+type ShardLearning = Option<slates_base::own_mounts::Learning>;
+#[cfg(windows)]
+type ShardLearning = ();
+
 /// Runs on the shard: attaches the segment, recovers the partition, builds the store and
 /// installs the state, then spawns the server loop as a poller.
 fn init_shard(
   config: &DaemonConfig,
   env: &[(String, String)],
   identity: &Identity,
-  (partition, sealing): (u16, crate::seal_keys::RootState),
+  (partition, sealing, learning): (u16, crate::seal_keys::RootState, ShardLearning),
   config_shards: &[u16],
   retained: Option<crate::retention::Retained>,
   #[cfg(target_os = "linux")] (inherited_fuse, inherited_copies): (
@@ -3127,7 +3134,6 @@ fn init_shard(
     Vec<crate::winfsp::InheritedMount>,
     Option<std::os::windows::io::OwnedHandle>,
   ),
-  #[cfg(unix)] learning: Option<slates_base::own_mounts::Learning>,
 ) -> Result<(), ServerError> {
   let (handoff, len) = handoff_of(env)?;
   let mut segment = AnchorSegment::attach(&handoff, len, identity)?;
@@ -3469,6 +3475,9 @@ fn init_shard(
   crate::own_nfs::learn(&mut state).map_err(ServerError::Refused)?;
   #[cfg(unix)]
   drop(learning);
+  // Windows learned its held volumes before any shard started; it carries no learning to let go.
+  #[cfg(windows)]
+  let () = learning;
   // The landing counter starts past every landing recovered with the partition (its records are
   // durable and the guard refuses a duplicate id), as the attachment counter does.
   state.landing.next_landing = verbs::next_landing_counter(state.db.partition());
