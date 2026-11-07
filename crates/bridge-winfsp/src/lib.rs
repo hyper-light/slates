@@ -48,6 +48,9 @@ pub mod host;
 // (§4.6 "Windows"). Pure, so it is tested on every host.
 #[cfg(windows)]
 mod dispatcher;
+// DIAG ONLY: where a request's time goes, per phase.
+#[cfg(windows)]
+mod phases;
 // Which WinFsp DLL this host may drive: its version, against the one its layout was written from. Pure, so it is tested
 // on every host.
 pub mod dll_version;
