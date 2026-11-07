@@ -10143,8 +10143,10 @@ fn a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound(
     .ok()
     .and_then(|word| resent_answer(&mut client, *word, &submit));
   drop(client);
+  let hops = daemon_b.fleet_refusals();
   daemon_a.stop();
   daemon_b.stop();
+  assert_forward_hops_balance(&hops);
   assert!(
     withheld.is_ok() && lifted.is_ok() && edited.is_ok() && word.is_ok() && committed,
     "the run's steps: fault {withheld:?}/{lifted:?}, edit {edited:?}, sent {}, committed {committed}",
@@ -10172,6 +10174,28 @@ fn a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound(
       }))
     ),
     "the resend under its id still meets the committed result: {answer:?}"
+  );
+}
+
+/// B's control shard counted every hop of its clients' forwards, and they balance: each forward's control-shard task
+/// that started was resolved, each lane forwarder ended answered (none given up), and the counts moved (the
+/// non-vacuity of the hop counters a stalled rung is read by, 2026-11-07).
+fn assert_forward_hops_balance(
+  hops: &Result<std::collections::BTreeMap<&'static str, u64>, ObserveError>,
+) {
+  let count = |name: &str| {
+    hops
+      .as_ref()
+      .map(|map| map.get(name).copied().unwrap_or(0))
+      .unwrap_or(0)
+  };
+  let started = count("fleet.forward.local.control_started");
+  let resolved = count("fleet.forward.local.resolved");
+  let done = count("fleet.forward.batch_done");
+  assert!(
+    started > 0 && started == resolved && done >= resolved,
+    "the forward hops balance: started {started}, resolved {resolved}, batches done {done}, given up {}; all {hops:?}",
+    count("fleet.forward.batch_given_up")
   );
 }
 
