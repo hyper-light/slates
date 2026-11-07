@@ -17,7 +17,10 @@
 //!   (default 1), `SLATES_LOADTEST_ARGS` (further harness arguments), `SLATES_LOADTEST_KILL_MS` and
 //!   `SLATES_LOADTEST_KILL_NODE` (kill that server node's daemon, `0` the primary, this long into each rung).
 //!
-//! Each rung adds a `node` line per node to the harness's own lines.
+//! Each rung adds a `node` line per node to the harness's own lines. On Linux, raise the open-file limit for the run
+//! (`LimitNOFILE` of its unit, or `ulimit -n`): a client node holds descriptors for every connection, and at the
+//! default a 1,000-client rung failed at once with "the handoff carried the wrong number of descriptors" (fixtures on
+//! adacachy, 2026-11-06).
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
   clippy::unwrap_used,

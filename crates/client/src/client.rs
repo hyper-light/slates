@@ -1890,6 +1890,25 @@ impl Client {
     Ok(id)
   }
 
+  /// Sends `body` again under `word`, an id the caller already used and was answered with a refusal the protocol
+  /// marks retryable under the same id (`Overloaded`, `OwnerUnreachable`, `Unpublished`, `ContentUnavailable`): the
+  /// daemon answers from the verb's completion record once it is durable, or runs it if it never ran. The word is
+  /// awaited again, so its reply is taken as a [`Self::begin`]'s is, within the same in-flight bound. `Ok(false)` when
+  /// the ring has no slot (nothing was sent).
+  pub fn begin_again(&mut self, word: u64, body: &RequestBody) -> Result<bool, ClientError> {
+    if self.awaited.len() >= self.awaited_cap {
+      return Err(ClientError::TooManyOutstanding {
+        limit: self.awaited_cap,
+      });
+    }
+    self.bind_without_waiting()?;
+    if !self.try_send(RequestId::from_word(word), body)? {
+      return Ok(false);
+    }
+    self.awaited.insert(word, body.clone());
+    Ok(true)
+  }
+
   /// Sends `body` under the next sequence, owned by no caller: a protocol-only request whose reply is
   /// dropped on arrival (the periodic acknowledgement).
   fn begin_unawaited(&mut self, body: &RequestBody) -> Result<RequestId, ClientError> {

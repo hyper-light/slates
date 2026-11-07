@@ -161,6 +161,11 @@ struct Agent {
   resolutions: usize,
   /// The request in flight: its word, its send instant and its kind.
   inflight: Option<(u64, u64, Kind)>,
+  /// A request the daemon refused retryable under its own id (`Overloaded`, `OwnerUnreachable`, `Unpublished`,
+  /// `ContentUnavailable`), to send again under that word: its word, its first send's instant and its kind. The verb may
+  /// have run (a forwarded submit waiting on the fleet commit is answered `Overloaded` while its acceptance commits),
+  /// and only the same id meets its completion record.
+  retry: Option<(u64, u64, Kind)>,
 }
 
 /// What a worker brings back.
@@ -177,6 +182,8 @@ struct Tally {
   reconnects: u64,
   resent: u64,
   max_outage_ns: u64,
+  /// Requests the daemon refused retryable under their own id and the client sent again under it.
+  retried: u64,
   /// Requests the daemon refused `AcknowledgementOwed` and the client sent again: the multiplexed connection's
   /// backpressure while an older request of the connection is still awaited (its acknowledgement cannot pass it).
   backpressure: u64,
@@ -665,6 +672,25 @@ fn keep_works() -> bool {
 /// Format: nanoseconds a microsecond.
 const NS_PER_US: u64 = 1_000;
 
+/// Whether `refusal` is one the protocol marks retryable under the request's own id: the verb was not run, or ran and
+/// its completion record answers the same id once it is durable (§4.8, §4.9).
+fn retryable_under_its_id(refusal: &Refusal) -> bool {
+  matches!(
+    refusal,
+    Refusal::Overloaded { .. }
+      | Refusal::OwnerUnreachable { .. }
+      | Refusal::Unpublished { .. }
+      | Refusal::ContentUnavailable
+  )
+}
+
+/// Connection `c`'s reconnect budget: how long a retryable refusal is retried before the outcome is left unknown.
+fn conn_reconnect_ns(conns: &[Connection], c: usize) -> u64 {
+  conns
+    .get(c)
+    .map_or(0, |conn| conn.client.deadlines().reconnect_ns)
+}
+
 /// The pause each client takes after a reply before its next request (`--think-us <µs>`, default none: a closed loop
 /// with no think time, every client always waiting on a request). An agent between its requests thinks, reads its
 /// tree or runs a build: the offered load the latency bound is stated for. A latency never includes the pause.
@@ -761,6 +787,27 @@ impl Worker {
     if conn.reconnecting.is_some() {
       return false;
     }
+    if let Some((word, first_sent_ns, retried_kind)) = agent.retry {
+      return match conn.client.begin_again(word, &body) {
+        Ok(true) => {
+          agent.retry = None;
+          agent.inflight = Some((word, first_sent_ns, retried_kind));
+          conn.inflight.insert(word, a);
+          self.tally.retried += 1;
+          true
+        }
+        Ok(false) | Err(ClientError::TooManyOutstanding { .. } | ClientError::Rebinding) => false,
+        Err(_) if conn.client.daemon_gone() => {
+          conn.lost(self.epoch);
+          false
+        }
+        Err(e) => {
+          agent.inflight = agent.retry.take();
+          agent.give_up(&mut self.tally, &format!("retry {kind:?}: {e}"));
+          true
+        }
+      };
+    }
     match conn.client.begin(&body) {
       Ok(id) => {
         agent.inflight = Some((id.word(), ns_since(self.epoch), kind));
@@ -838,6 +885,24 @@ impl Worker {
       let Some((_, sent_ns, kind)) = agent.inflight.take() else {
         continue;
       };
+      if let ReplyBody::Refused { refusal } = &reply
+        && retryable_under_its_id(refusal)
+      {
+        // Bounded: past the client's reconnect budget times the patience, the outcome is left unknown for the oracle.
+        let waited = now.saturating_sub(sent_ns);
+        let budget = conn_reconnect_ns(&self.conns, agent.conn).saturating_mul(reply_patience());
+        if waited > budget {
+          agent.inflight = Some((word, sent_ns, kind));
+          agent.give_up(
+            &mut self.tally,
+            &format!("{kind:?}: still refused retryable after {waited} ns"),
+          );
+          continue;
+        }
+        agent.retry = Some((word, sent_ns, kind));
+        self.ready.push(std::cmp::Reverse((now, a)));
+        continue;
+      }
       agent.advance(reply, (sent_ns, now, kind), &mut self.tally);
       if agent.step != Step::Done {
         self
@@ -1137,7 +1202,7 @@ fn report(n: usize, tally: &mut Tally) {
     println!("refusal\t{n}\t{count}\t{why}");
   }
   println!(
-    "harness\t{n}\tstarved\t{}\trebase_conflicts\t{}\tmax_sweep_ns\t{}\tmax_drain_gap_ns\t{}\treconnects\t{}\tresent\t{}\tmax_outage_ns\t{}\tbackpressure\t{}",
+    "harness\t{n}\tstarved\t{}\trebase_conflicts\t{}\tmax_sweep_ns\t{}\tmax_drain_gap_ns\t{}\treconnects\t{}\tresent\t{}\tmax_outage_ns\t{}\tbackpressure\t{}\tretried\t{}",
     tally.starved,
     tally.rebase_conflicts,
     tally.max_sweep_ns,
@@ -1145,7 +1210,8 @@ fn report(n: usize, tally: &mut Tally) {
     tally.reconnects,
     tally.resent,
     tally.max_outage_ns,
-    tally.backpressure
+    tally.backpressure,
+    tally.retried
   );
 }
 
@@ -1458,9 +1524,29 @@ fn spread(
       own_len: 0,
       resolutions: 0,
       inflight: None,
+      retry: None,
     });
   }
   groups
+}
+
+/// The files long enough to hold a client's slots, or `None` (said, as a failure) when the green holds none: a green
+/// over a scratch volume or a tree of tiny files gives the clients nothing to edit, never an index out of an empty list.
+fn eligible_files(files: &[(String, u64)], n: usize) -> Option<Vec<(String, u64)>> {
+  let eligible: Vec<(String, u64)> = files
+    .iter()
+    .filter(|(_, len)| *len >= SLOTS_PER_FILE * SLOT_STRIDE)
+    .cloned()
+    .collect();
+  if eligible.is_empty() {
+    println!(
+      "oracle_failure\t{n}\tthe green holds no file of {} bytes or more to edit (of {} files)",
+      SLOTS_PER_FILE * SLOT_STRIDE,
+      files.len()
+    );
+    return None;
+  }
+  Some(eligible)
 }
 
 /// One load level: `n` clients over the green, `workers` threads sweeping them. Returns the oracle's failures.
@@ -1471,11 +1557,9 @@ fn level(
   (n, rounds, hot_files): (usize, usize, usize),
   workers: usize,
 ) -> u64 {
-  let eligible: Vec<(String, u64)> = files
-    .iter()
-    .filter(|(_, len)| *len >= SLOTS_PER_FILE * SLOT_STRIDE)
-    .cloned()
-    .collect();
+  let Some(eligible) = eligible_files(files, n) else {
+    return 1;
+  };
   let mut rng = Rng(SEED ^ n as u64);
   let hot: Vec<usize> = (0..hot_files)
     .map(|_| usize::try_from(rng.below(eligible.len() as u64)).unwrap())
@@ -1557,6 +1641,7 @@ fn level(
     total.resent += tally.resent;
     total.max_outage_ns = total.max_outage_ns.max(tally.max_outage_ns);
     total.backpressure += tally.backpressure;
+    total.retried += tally.retried;
     total.max_drain_gap_ns = total.max_drain_gap_ns.max(tally.max_drain_gap_ns);
   }
   println!(
