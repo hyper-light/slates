@@ -734,10 +734,26 @@ pub(crate) fn ready_objects(
     let mut promised_everywhere = true;
     for cohort in regional.recovery_cohorts(departed, *object) {
       let needed = regional.quorum.recovery(cohort.len());
+      let whole_cohort = cohort.clone();
       let members: Vec<HostId> = cohort
         .into_iter()
         .filter(|host| regional.members.contains(host))
         .collect();
+      if members.len() < needed && std::env::var_os("SLATES_DIAG_TAKEOVER_LOST").is_some() {
+        // DIAG ONLY (raft-chaos for live-fixes, never for main): the cohort a lost object was judged by.
+        eprintln!(
+          "chaos-diag lost: object={:02x?} departed={} local={} owners={:?} cohort={:?} members_in_cohort={:?} needed={} retired={:?} members={:?}",
+          &object.0[..6],
+          departed.0,
+          local.0,
+          regional.recovery_owners(departed).iter().map(|host| host.0).collect::<Vec<_>>(),
+          whole_cohort.iter().map(|host| host.0).collect::<Vec<_>>(),
+          members.iter().map(|host| host.0).collect::<Vec<_>>(),
+          needed,
+          regional.retired.keys().map(|host| host.0).collect::<Vec<_>>(),
+          regional.members.iter().map(|host| host.0).collect::<Vec<_>>()
+        );
+      }
       if members.len() < needed {
         lost.push(*object);
         promised_everywhere = false;
