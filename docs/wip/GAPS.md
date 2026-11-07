@@ -1032,6 +1032,17 @@
 >   answers. Raising shard threads above normal priority removed it (run 42059294312), on arms sharing a machine, so the gain is
 >   not yet measured, and it is a whole-daemon change. Also: under two spinners a core on a 4-vCPU x86_64 VM the anchor killed both
 >   daemons for a late heartbeat in run 3 of all three jobs that reached it.
+> - **The reply spin window can be set by a noisy start (A-212's spin; OPEN, a measurement defect, owner winfsp-overlap,
+>   2026-11-06).** Each receive worker times 15 one-way wakes through a bounded channel once as it starts and spins for
+>   their median before it parks for a reply (`crates/bridge-winfsp/src/reply.rs`, `SAMPLES`). The median was meant to keep
+>   one scheduling delay from setting the window, but a start where most samples are delayed sets it too. On CI's arm64
+>   runner, quiet, one daemon's two workers measured 143.9 µs and 108.1 µs (diagnostics run 42178889880, run 3), where the
+>   other runs' workers measured 4.1–11.5 µs. Such a worker spins up to 144 µs on each slow reply, taking a core from the
+>   shards of a 4-vCPU machine. That run's stat p50 (143.0 µs) was no worse than the others' (141.3–151.7 µs), so this is not
+>   the receiver's gap against the DLL, but the window has no bound and no check that its samples agree. Owed: a window the
+>   measurement cannot set beyond what a wake on the machine costs (a bound derived from the profile's wake, or samples
+>   retaken until their spread is within the probe's own precision, as `wake.mean_ns` is), with a test that a delayed start
+>   cannot set it.
 > - **Two failures recorded open below**: the wake-learning case under load (fixed 2026-11-04, A-199) and the fleet
 >   routing Create reply (fixed 2026-11-04 in its fixture; its second, rarer failure fixed 2026-11-05).
 >
