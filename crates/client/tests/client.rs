@@ -2548,7 +2548,9 @@ fn host_dir_with_file() -> HostDir {
 }
 
 /// A green over a complete immutable base: an overlay over the host directory, pinned whole and
-/// snapshotted, then the green created over that snapshot and advanced once (`f.txt` prefixed).
+/// snapshotted, then the green created over that snapshot and advanced once (`f.txt` prefixed). A second work stays
+/// at version 0, so the reachable floor does too and version 0 stays readable across the restart: a version below
+/// the floor is folded into the green's checkpoint (W3) and refused `UnknownBase` after it.
 fn seed_green_over_base(client: &mut Client, dir: &str) -> slates_client::VolumeId {
   let overlay = client
     .create(&CreateSpec {
@@ -2577,6 +2579,8 @@ fn seed_green_over_base(client: &mut Client, dir: &str) -> slates_client::Volume
     .unwrap();
   let (work, base) = client.create_work(green, "w0").unwrap();
   assert_eq!(base, 0);
+  let (_, floor) = client.create_work(green, "floor").unwrap();
+  assert_eq!(floor, 0, "the floor's work stays at version 0");
   client.edit(work, "f.txt", 0, 0, b"agent: ").unwrap();
   assert!(matches!(
     client.submit(work).unwrap(),

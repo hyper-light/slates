@@ -1,7 +1,7 @@
 # A green's chain kept every version it ever took (2026-11-06, §4.16 "Deltas older than the derived retention fold into checkpoint deltas", §4.8 recovery, CLAUDE.md banned item 8)
 
 Found by agents/loadtest-scale attributing the load test's memory per version (GAPS, "Memory per client,
-attributed"). W3 of the load test's walls, assigned by the supervisor on 2026-11-06. Amendment: AMENDMENT-TBD.
+attributed"). W3 of the load test's walls, assigned by the supervisor on 2026-11-06. Amendment: A-238.
 
 ## Description
 
@@ -81,6 +81,29 @@ it was settling for.
 - **The fold.** `settle_green_retention_leaving` folds until the claim about to be secured fits, never past a live
   reader's version.
 
+## A read below the fold, fixed with it
+
+A read of a green at a named version was refused only past the head. Below the engine's fold, its histories keep
+only the value in effect at the floor, so an earlier version was answered as the floor's state or as a file missing.
+After a restart from a checkpoint, `f.txt` at version 0 of a base-seeded green read `NotFound` though the origin held
+it (`a_base_seeded_greens_origin_survives_a_daemon_restart`, failing on this Mac). In the checkpoint recovery test,
+version 1 read `NotFound` (red).
+- The fix: `merge_service::green_version` refuses a version below `Green::folded_below` `UnknownBase`, as it does one
+  past the head.
+- The base-seeded test now keeps a second work at version 0, which holds the floor there: its subject is the origin's
+  durability.
+
+## A full chain, typed, and folded once its floor is released (fixed with it, at the supervisor's request)
+
+- The db's `Capacity` refusal reached the client as `BadRequest { reason: "green_chains at capacity" }`, as if the
+  request were malformed. It is now `Refusal::TableAtCapacity { table }`, appended.
+- A chain held at its floor by a reader fills to its cap and is refused. When the reader goes (a work destroyed or
+  rebased), nothing folded the chain: the checkpoint was taken only after an accept, and the full chain refused every
+  submit. A submit refused at the cap now checkpoints at the floor first, the doubling rule waived, and checks again.
+- `a_chain_held_by_a_reader_is_refused_typed_at_its_cap_and_folds_once_released` holds both: refused typed after
+  about 32 versions with a work held at version 0, then accepted once that work is destroyed. Its red and green
+  runs are CI's (diag-loadtest-scale-w3-3).
+
 ## Impact
 
 Before the fix, a green's durable cost and its snapshot grew with every version it took, and its submits were refused
@@ -100,5 +123,4 @@ holds a green's changed state once plus a short tail. The one per-version cost l
 - The checkpoint walk is one synchronous call on the green's shard, O(the keys changed since the origin), not sliced.
 - A checkpoint larger than the log ring is refused and counted (`merge.checkpoint.refused`), and the chain stays
   whole. The cap then refuses as before.
-- Errors: the db's `Capacity` refusal reaches the client as `BadRequest { reason: "green_chains at capacity" }`, not
-  a typed capacity refusal.
+

@@ -109,9 +109,10 @@ fn a_green_whose_readers_keep_up_holds_versions_past_its_chain_cap() {
 }
 
 /// W3, §4.8 recovery. Do: the same 200 versions under a played anchor, then stop the daemon and start a second over the
-/// same anchor; read the green, and submit one more version from a new work. Expect: the recovered green's head is
-/// version 200 with its bytes, every version from the reachable floor on still reads as written, and version 201 is
-/// accepted. Recovery rebuilds the green from what the partition holds, so a checkpoint must carry everything a later
+/// same anchor; read the green, read version 1, and submit one more version from a new work. Expect: the recovered
+/// green's head is version 200 with its bytes, every version from the reachable floor on still reads as written,
+/// version 1 (folded into the checkpoint) is refused `UnknownBase` rather than read as an absent file (it read
+/// `NotFound`), and version 201 is accepted. Recovery rebuilds the green from what the partition holds, so a checkpoint must carry everything a later
 /// verdict needs, and an increment folded into it is never needed again.
 #[test]
 fn a_green_recovered_after_its_chain_was_checkpointed_is_the_green_it_was() {
@@ -147,6 +148,7 @@ fn a_green_recovered_after_its_chain_was_checkpointed_is_the_green_it_was() {
   let at_head = client
     .read(green, "file", ReadAt::Version { version: VERSIONS })
     .unwrap();
+  let below = client.read(green, "file", ReadAt::Version { version: 1 });
   let (next, _) = client.create_work(green, "after-restart").unwrap();
   client
     .edit(next, "file", 0, EDIT_BYTES as u64, &bytes_of(VERSIONS + 1))
@@ -167,6 +169,15 @@ fn a_green_recovered_after_its_chain_was_checkpointed_is_the_green_it_was() {
     at_head,
     bytes_of(VERSIONS),
     "the head version reads by number"
+  );
+  assert!(
+    matches!(
+      below,
+      Err(slates_client::ClientError::Refused(
+        slates_client::Refusal::UnknownBase { version: 1, .. }
+      ))
+    ),
+    "a version below the checkpoint is unknown, never answered as if the file were absent: {below:?}"
   );
   assert!(
     matches!(submitted, Ok(Submitted::Accepted(v)) if v == VERSIONS + 1),
@@ -223,5 +234,74 @@ fn a_partitions_snapshot_holds_what_its_green_is_not_what_it_has_been() {
     after.saturating_sub(before) <= bound,
     "the snapshot grew {} bytes over {added} versions ({before} to {after}), past {bound}",
     after.saturating_sub(before)
+  );
+}
+
+/// Submits versions from `work`, each creating a new file of [`EDIT_BYTES`], until one is refused or [`VERSIONS`] are
+/// accepted: the head reached and the refused submit's answer, if any.
+fn fill_until_refused(
+  client: &mut Client,
+  work: VolumeId,
+) -> (u64, Option<Result<Submitted, slates_client::ClientError>>) {
+  let mut head = 0;
+  for n in 1..=VERSIONS {
+    client
+      .edit(work, &format!("file-{n}"), 0, 0, &bytes_of(n))
+      .unwrap();
+    match client.submit(work) {
+      Ok(Submitted::Accepted(version)) => head = version,
+      other => return (head, Some(other)),
+    }
+  }
+  (head, None)
+}
+
+/// W3 (A-238), §4.8. Do: on a one-shard daemon whose green-chain cap is 256 KiB, make a green, a work, and a second
+/// work left at version 0, which holds the reachable floor there; submit versions from the first work, each creating a
+/// new file of 8 KiB, until one is refused; then destroy the second work and submit the refused version again.
+/// Expect: the refusal is `TableAtCapacity { table: "green_chains" }`, typed (it reached the client as `BadRequest
+/// { reason: "green_chains at capacity" }`), after about 32 versions; and once the floor is released the same submit
+/// is accepted as the next version: the submit checkpoints at the risen floor before it refuses, since no accept could
+/// come to take the checkpoint otherwise.
+#[test]
+fn a_chain_held_by_a_reader_is_refused_typed_at_its_cap_and_folds_once_released() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-chain-held-{}", std::process::id());
+  let daemon = Daemon::start(
+    &profile,
+    config(&profile, &instance),
+    slates_server::SegmentSource::Create {
+      name: format!("slates-seg-chain-held-{}", std::process::id()),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let green = client.create_green("chain-green", false).unwrap();
+  let (work, _) = client.create_work(green, "chain-work").unwrap();
+  let (holder, _) = client.create_work(green, "floor-holder").unwrap();
+  let (head, refused) = fill_until_refused(&mut client, work);
+  let released = client.destroy(holder);
+  let after = client.submit(work);
+  drop(client);
+  daemon.stop();
+  assert!(
+    matches!(
+      &refused,
+      Some(Err(slates_client::ClientError::Refused(slates_client::Refusal::TableAtCapacity { table })))
+        if table == "green_chains"
+    ),
+    "the chain held at its floor is refused typed at its cap (head {head}): {refused:?}"
+  );
+  assert!(head < VERSIONS, "the cap was met before the last version");
+  assert!(
+    released.is_ok(),
+    "the floor's work is destroyed: {released:?}"
+  );
+  assert!(
+    matches!(after, Ok(Submitted::Accepted(version)) if version == head + 1),
+    "once the floor is released the refused version is accepted next: {after:?}"
   );
 }

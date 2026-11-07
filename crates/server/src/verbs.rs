@@ -3444,6 +3444,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::HolderPending => "holder_pending",
     Refusal::MapsHeld { .. } => "maps_held",
     Refusal::RemoteAttachmentsFull { .. } => "remote_attachments_full",
+    Refusal::TableAtCapacity { .. } => "table_at_capacity",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",
@@ -5906,8 +5907,8 @@ fn submit(
     increment: inc.encode(),
   };
   let now = state.clock.monotonic_ns();
-  if let Err(e) = state.db.partition().check(&record, now) {
-    return refused(refusal_of_db(&e));
+  if let Err(refusal) = chain_admits(state, green_id, &record, now) {
+    return refused(refusal);
   }
   // So is the work's restatement an acceptance records with it (A-207): guard-then-apply, the whole submit is refused
   // before the verdict rather than after the chain moved.
@@ -6030,6 +6031,26 @@ fn submit(
       })
     }
   }
+}
+
+/// Whether green `green`'s chain can hold `record`, an increment about to be judged: checked guard-then-apply. A chain
+/// at its cap is checkpointed at its floor first, the doubling rule waived (A-238): the floor may have risen since the
+/// last accept (a work destroyed or rebased), and a full chain refuses every submit whose accept would take the
+/// checkpoint, so without it the green stayed full for good. What is still full is refused `TableAtCapacity`.
+fn chain_admits(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  record: &Op,
+  now: u64,
+) -> Result<(), Refusal> {
+  if let Err(slates_db::DbError::Capacity { .. }) = state.db.partition().check(record, now) {
+    crate::merge_service::checkpoint_green_when(state, green, crate::merge_service::Doubling::Now);
+  }
+  state
+    .db
+    .partition()
+    .check(record, now)
+    .map_err(|e| refusal_of_db(&e))
 }
 
 /// An accepted work now equals its green at `version` (§4.16 "Submission"): its journal is consumed (the increment

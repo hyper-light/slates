@@ -157,6 +157,22 @@ pub(crate) fn checkpoint_floor(state: &ShardState, green: DbVolumeId) -> u64 {
 /// Never refuses the verb that called it: a checkpoint the engine cannot take at the floor (its histories already
 /// folded past it) or the partition refuses is counted and skipped, and the chain stays whole and correct.
 pub(crate) fn checkpoint_green(state: &mut ShardState, green: DbVolumeId) {
+  checkpoint_green_when(state, green, Doubling::Wait);
+}
+
+/// Whether [`checkpoint_green_when`] waits for the increments to fold to reach the held checkpoint's size.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Doubling {
+  /// Wait for them: the amortized rule, after an accept.
+  Wait,
+  /// Take it at once: the chain is at its cap, and no accept can come to take it otherwise.
+  Now,
+}
+
+/// [`checkpoint_green`], with the doubling rule waived when `doubling` is [`Doubling::Now`]: what a submit refused at
+/// the chain's cap does first (`verbs::submit`, A-238), since the floor may have risen since the last accept (a work
+/// destroyed, rebased or reset), and a chain at its cap refuses every submit whose accept would take it.
+pub(crate) fn checkpoint_green_when(state: &mut ShardState, green: DbVolumeId, doubling: Doubling) {
   let floor = checkpoint_floor(state, green);
   let partition = state.db.partition();
   let (held, held_bytes) = partition
@@ -175,7 +191,7 @@ pub(crate) fn checkpoint_green(state: &mut ShardState, green: DbVolumeId) {
     .take(folds)
     .map(Vec::len)
     .sum();
-  if folded < held_bytes {
+  if doubling == Doubling::Wait && folded < held_bytes {
     return;
   }
   let Some(checkpoint) = state
@@ -984,8 +1000,8 @@ fn read_green_range(
   }
 }
 
-/// The version a read of a green at `at` serves: the head, a named version no later than it, or an attachment's
-/// pinned version; the refusal otherwise.
+/// The version a read of a green at `at` serves: the head, a named version no later than it and no earlier than the
+/// engine's fold, or an attachment's pinned version; the refusal otherwise.
 pub(crate) fn green_version(
   state: &ShardState,
   engine: &slates_merge::engine::Green,
@@ -1005,7 +1021,10 @@ pub(crate) fn green_version(
       None => return Err(Refusal::NotFound),
     },
   };
-  if version > engine.head() {
+  // A version past the head does not exist yet, and one below the fold no longer can be read: its histories were
+  // folded to the value in effect at the floor (and a recovered green starts at its checkpoint, W3), so it would be
+  // answered as the floor's state or a file missing (`NotFound` for a file that was there). Unknown either way.
+  if version > engine.head() || version < engine.folded_below() {
     return Err(Refusal::UnknownBase {
       green: wire_id(green),
       version,

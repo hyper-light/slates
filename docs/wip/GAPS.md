@@ -87,7 +87,7 @@
 >     version costs its increment for good, and each snapshot taken when the log fills re-encodes the whole chain.
 >   - **What it means at 100k** (extrapolation): 3 rounds × 100k clients is 300k increments, about 48 GB of chain,
 >     each snapshot re-encoding it, and the cap refusing submits well before.
->   - **Closed for the owner's partition (AMENDMENT-TBD, 2026-11-06,
+>   - **Closed for the owner's partition (A-238, 2026-11-06,
 >     `docs/bugs/2026-11-06-a-greens-chain-kept-every-version-it-ever-took.md`).** A green's chain is checkpointed at
 >     its reachable floor once the increments to fold reach the checkpoint's size. Recovery restores from the
 >     checkpoint and replays only the tail. The settle before a submit folds until its claim fits.

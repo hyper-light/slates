@@ -9913,7 +9913,7 @@ fn answer_within(
   while began.elapsed() < FORWARDED_ANSWER_WAIT {
     match client.poll_reply_word(word) {
       Ok(Some(reply)) => return Some(Ok(reply)),
-      Ok(None) => std::thread::sleep(Duration::from_nanos(HEARTBEAT_NS)),
+      Ok(None) => std::thread::yield_now(),
       Err(slates_client::ClientError::Refused(refusal)) => {
         return Some(Err(format!("{refusal:?}")));
       }
@@ -9921,6 +9921,25 @@ fn answer_within(
     }
   }
   None
+}
+
+/// A green and a work over it, created through `instance`'s node, which owns them.
+fn green_and_work_on(instance: &str) -> (VolumeId, VolumeId) {
+  let mut owner_client = Client::connect(instance);
+  let ReplyBody::GreenCreated { id: green } = owner_client.call(&RequestBody::CreateGreen {
+    name: "forwarded-green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("create green");
+  };
+  let ReplyBody::WorkCreated { id: work, .. } = owner_client.call(&RequestBody::CreateWork {
+    green,
+    name: "forwarded-work".to_owned(),
+  }) else {
+    panic!("create work");
+  };
+  (green, work)
 }
 
 /// §4.9 "Exactly-once", §4.16 "Commit" (AUD-11), found by fixtures' 1,000-client `f = 1` rung on 2026-11-06 (447
@@ -9935,20 +9954,7 @@ fn answer_within(
 fn a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id() {
   let _serial = serialize_fleet_tests();
   let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
-  let mut owner_client = Client::connect(&instance_a);
-  let ReplyBody::GreenCreated { id: green } = owner_client.call(&RequestBody::CreateGreen {
-    name: "forwarded-green".to_owned(),
-    require_evidence: false,
-    base: None,
-  }) else {
-    panic!("create green");
-  };
-  let ReplyBody::WorkCreated { id: work, .. } = owner_client.call(&RequestBody::CreateWork {
-    green,
-    name: "forwarded-work".to_owned(),
-  }) else {
-    panic!("create work");
-  };
+  let (green, work) = green_and_work_on(&instance_a);
   let withheld = daemon_b.inject_merge_fault(slates_server::merge_service::MergeFault {
     refuse_content_puts: false,
     corrupt_next_inputs: false,
@@ -9971,44 +9977,84 @@ fn a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_
   let committed = poll_until(&both, PLACEMENT_DEADLINE, || {
     daemon_a.merge_record_placed(green, 1)
   });
-  let resent = word
+  let answer = word
     .as_ref()
     .ok()
-    .map(|word| client.begin_again(*word, &submit).map(|sent| (*word, sent)));
-  let answer = match resent {
-    Some(Ok((word, true))) => answer_within(&mut client, word),
-    _ => None,
-  };
+    .and_then(|word| resent_answer(&mut client, *word, &submit));
   drop(client);
   daemon_a.stop();
   daemon_b.stop();
-  assert!(
-    withheld.is_ok() && lifted.is_ok(),
-    "the holder's fault installs and lifts"
-  );
-  assert!(edited.is_ok(), "the forwarded edit is served: {edited:?}");
-  assert!(word.is_ok(), "the submit is sent: {word:?}");
-  assert!(
-    matches!(&first, Some(Err(refusal)) if refusal.starts_with("Overloaded")),
-    "the forwarded submit's acceptance outlived the owner's budget: {first:?}"
-  );
-  assert!(
-    acknowledged.is_ok(),
-    "the client acknowledges: {acknowledged:?}"
-  );
-  assert!(
+  assert_resent_under_its_id(&ForwardedResend {
+    faulted: withheld.is_ok() && lifted.is_ok(),
+    edited: edited.is_ok(),
+    sent: word.is_ok(),
+    first,
+    acknowledged: acknowledged.is_ok(),
     committed,
-    "the version commits once the holder takes its record"
+    answer,
+  });
+}
+
+/// What the forwarded resend run observed, for [`assert_resent_under_its_id`].
+struct ForwardedResend {
+  faulted: bool,
+  edited: bool,
+  sent: bool,
+  first: Option<Result<ReplyBody, String>>,
+  acknowledged: bool,
+  committed: bool,
+  answer: Option<Result<ReplyBody, String>>,
+}
+
+/// Sends `submit` again under `word` and waits for its answer; `None` if it could not be sent or none came.
+fn resent_answer(
+  client: &mut slates_client::Client,
+  word: u64,
+  submit: &RequestBody,
+) -> Option<Result<ReplyBody, String>> {
+  match client.begin_again(word, submit) {
+    Ok(true) => answer_within(client, word),
+    _ => None,
+  }
+}
+
+/// The forwarded resend's assertions: refused `Overloaded` first, then, after the acknowledgement and the commit,
+/// answered with version 1 under its own id.
+fn assert_resent_under_its_id(run: &ForwardedResend) {
+  let setup = [
+    ("the holder's fault installs and lifts", run.faulted),
+    ("the forwarded edit is served", run.edited),
+    ("the submit is sent", run.sent),
+    ("the client acknowledges", run.acknowledged),
+    (
+      "the version commits once the holder takes its record",
+      run.committed,
+    ),
+  ];
+  let failed: Vec<&str> = setup
+    .iter()
+    .filter(|(_, held)| !held)
+    .map(|(what, _)| *what)
+    .collect();
+  assert!(
+    failed.is_empty(),
+    "the run's steps: {failed:?} did not hold"
+  );
+  assert!(
+    matches!(&run.first, Some(Err(refusal)) if refusal.starts_with("Overloaded")),
+    "the forwarded submit's acceptance outlived the owner's budget: {:?}",
+    run.first
   );
   assert!(
     matches!(
-      answer,
+      run.answer,
       Some(Ok(ReplyBody::Submitted {
         version: Some(1),
         ..
       }))
     ),
-    "the resend under its id meets the committed result: {answer:?}"
+    "the resend under its id meets the committed result: {:?}",
+    run.answer
   );
 }
 

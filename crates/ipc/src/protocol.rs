@@ -2912,6 +2912,15 @@ pub enum Refusal {
     /// The bound.
     bound: u64,
   },
+  /// A durable table of the partition the verb records into is at its derived capacity (§4.8; CLAUDE.md banned item
+  /// 8): `green_chains`, the merge byte budget a partition's green chains, origins, checkpoints and work logs share,
+  /// when what live readers still hold below their greens' checkpoints fills it. Nothing was recorded. Until 2026-11-06
+  /// (A-238) it reached the client as `BadRequest { reason: "<table> at capacity" }`, as if the request were
+  /// malformed. Appended.
+  TableAtCapacity {
+    /// The table.
+    table: String,
+  },
 }
 
 /// The writes a snapshot is known to include (§4.6 "Writeback and snapshot barrier"): every write the

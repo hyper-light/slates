@@ -7337,7 +7337,7 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > identity is a set hash over the green's entries, brought up to date when read, so a record at `f > 0` costs what its
 > version changed. Since part 3 (2026-11-06) a clean rebase returns only what the work changed over the head.
 
-> **Status (2026-11-06, AMENDMENT-TBD: a green's chain is checkpointed at its reachable floor).** The partition kept
+> **Status (2026-11-06, A-238: a green's chain is checkpointed at its reachable floor).** The partition kept
 > every accepted increment for good, and the "fold into checkpoint deltas" below had no durable form.
 > - Now, after each accept, the owner checkpoints the chain at the floor. The floor is the oldest version a live work
 >   or pin names, kept below any merge record still waiting for placement. The owner checkpoints once the increments
@@ -7417,7 +7417,7 @@ that lie strictly after p by d; ranges that overlap an intervening effect range 
 the verdict; a rename in an intervening delta remaps the increment's paths beneath it. Maps
 compose: `map(a..c) = map(b..c) ∘ map(a..b)`. Deltas older than the derived retention fold into
 checkpoint deltas by the same composition, which is exact, so every base back to green's origin
-maps at O(log) checkpoint lookups plus the raw deltas after the last checkpoint. (Since AMENDMENT-TBD the durable
+maps at O(log) checkpoint lookups plus the raw deltas after the last checkpoint. (Since A-238 the durable
 checkpoint is the green's state at its reachable floor, and a base below it is refused `UnknownBase`: no live reader
 names one.)
 
@@ -14072,7 +14072,7 @@ green's base, the other half of the load test's first finding, is A-202's.
 - **Cost (measured on the branch it comes from):** every edit now appends to the partition log, so the partition's
   snapshots come at the rate edits arrive.
 
-### AMENDMENT-TBD — A green's durable chain is checkpointed at its reachable floor, and a base below the checkpoint is unknown (accepted and built 2026-11-06, W3 of the load test's walls)
+### A-238 — A green's durable chain is checkpointed at its reachable floor, and a base below the checkpoint is unknown (accepted and built 2026-11-06, W3 of the load test's walls)
 
 Applied in the same change to:
 - §4.16: its status and "Position mapping".
@@ -14081,8 +14081,10 @@ Applied in the same change to:
   `Rebased::BaseUnavailable`.
 - `crates/db`: `Op::GreenCheckpointed`, `GreenCheckpoint`, `PartitionSnapshot::green_checkpoints`,
   `DbError::CheckpointOutOfRange`, `Partition::green_checkpoint` and `green_head`.
-- `crates/server`, in `merge_service.rs`: `checkpoint_floor`, `checkpoint_green`, `settle_green_retention_leaving`,
-  `inputs_of`, `GreenFence::CheckpointCorrupt`.
+- `crates/server`, in `merge_service.rs`: `checkpoint_floor`, `checkpoint_green`, `checkpoint_green_when`,
+  `settle_green_retention_leaving`, `inputs_of`, `green_version`, `GreenFence::CheckpointCorrupt`; in `error.rs`:
+  `refusal_of_db`.
+- `crates/ipc`: `Refusal::TableAtCapacity`.
 - `crates/server`, in `verbs.rs`: `replay_green`, `recovered_origin`, `submit`, `rebase`, the takeover's chain
   adoption.
 - `crates/server`, in `daemon.rs`: `merge_chain_identities`, `partition_snapshot_bytes`.
@@ -14104,8 +14106,13 @@ Applied in the same change to:
     (`CheckpointCorrupt`).
   - A submit or rebase based below `F` answers `UnknownBase`. No live reader names such a base, since `F` is never
     above one.
+  - So does a read at a named version below the engine's fold: below the checkpoint after a restart, and below the
+    in-memory fold before it. It had been answered as the floor's state or `NotFound`.
   - The settle before a submit folds until the submit's claim fits. Folding to the cap alone had refused version 34
     `BudgetExceeded { available: 0 }`.
+  - A submit refused at the chain's cap checkpoints at the floor first, the doubling rule waived: the floor may have
+    risen since the last accept. What is still full is refused `TableAtCapacity { table }`, appended to `Refusal`;
+    it had reached the client as `BadRequest`.
 - **Measured** (the bug record):
   - Under a 256 KiB cap, 200 of 200 versions are accepted, where the cap refused at version 31.
   - Recovered at head 200, and version 201 is accepted.
