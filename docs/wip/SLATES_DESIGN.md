@@ -129,7 +129,9 @@ Four separate claims follow from it, each needing its own evidence:
    hold a byte, or refuse to start — core size limit 0 soft and hard (every Unix) and an empty
    core filter (Linux), observed from outside the real processes (AUD-29-41 in part, 2026-10-01). Not claimed
    yet: pageout — only a strict create locks the content arena; metadata, rings, logs, completion records,
-   codec and transport buffers are pageable; and Windows dump exclusion (WER) is not set (AUD-29-41).
+   codec and transport buffers are pageable; and Windows has no unprivileged dump exclusion (AUD-29-41): under WER's
+   defaults a crash kept nothing locally, and an administrator's `LocalDumps` full dump keeps everything, which the
+   daemon detects and reports as `dumps_local_full` (A-239).
 3. *No private byte is disclosed across consumers or hosts.* A grant binds its consumer (AUD-29-01); owed:
    per-consumer authority for fleet content (AUD-29-45).
 4. *Ownership is bounded through cancellation, restart and destroy.* Partly evidenced by §4.2's admission;
@@ -13596,6 +13598,33 @@ last), `crates/cli/tests/nfs_held.rs` (the history test).
   states. Red-checked: with nothing taken back, the crash after the fetch let the stale write-back apply (`0`, not `NFS3ERR_IO`). The carried states' round trip is unit-tested (`carried_states_come_back_before_the_successors_records`),
   and both encodings of the image and the delta are compared with the field (`crates/vfs/tests`).
 - **Format.** Image version 22, delta version 5: earlier images and logs are refused by version, as before.
+
+### A-239 — On Windows the daemon reports an administrator's full crash dumps; it registers no region exclusion (accepted 2026-11-07, the supervisor's decision: option b)
+Applied in the same change to: §1's RAM-only guarantee 2, GAPS (`8a-win-dumps`), `crates/server` (`local_dumps.rs`,
+new; the daemon's start reads it; `verbs.rs`: the status field; `tests/dump_exclusion.rs`, new), `crates/ipc`
+(`DaemonReport::dumps_local_full`, appended), `crates/cli` (`dumps.rs`: the Windows arm's doc; the status line),
+`crates/mcp` (the status field), `.github/workflows/ci.yml` (the default crash and `LocalDumps` on the Windows job).
+- **What was asked.** GAPS `8a-win-dumps`: Windows has no unprivileged way to keep a process out of a crash dump. The
+  supervisor's first call was to exclude the private mappings with `WerRegisterExcludedMemoryBlock` as each is mapped,
+  and prove it with a dump of a crashed child.
+- **What was measured** (windows-latest, Windows Server 2025 Datacenter, build 26100; a child that writes a known
+  pattern into a content region, a shared object's view, a key slot and, as a control, the heap):
+  - An administrator's `LocalDumps` full dump ignored the registration: every registered region's pattern was in it,
+    once each, beside the heap's (runs 42355310061 and 42362092866; 17 to 18 MB dumps), though every registration
+    returned `S_OK`.
+  - Under WER's defaults a crash kept no file in the machine's or the user's report queue or archive within 60 s (run
+    42362092866).
+  - WER's own report, the one dump the call is documented to govern ("excluded from the WER error report"), could not be
+    produced: `WerReportSubmit` answered `WerDisabled` with `Disabled` 0, WerSvc running and no policy (run 42364879358).
+  - CI's runner hands its steps error mode `0x8003` (`SEM_NOGPFAULTERRORBOX` in it), so WER sees no crash there unless the
+    child clears it; its job refuses a breakaway.
+- **The decision (b).** No registration: its one measurement shows no effect, and R4 accepts complexity only on evidence
+  (the patch is kept in scratch for a Windows client that can measure WER's own report). The daemon reads the
+  `LocalDumps` setting, unprivileged, logs it once and reports `dumps_local_full`; it serves either way (R10).
+- **Evidence.** `local_dumps_settings_are_judged_as_wer_applies_them` (the setting's rules, every host);
+  `a_default_crash_report_carries_no_content_region_shared_view_or_key_slot` and
+  `an_administrators_local_full_dump_carries_every_mapping` (Windows CI, before and after the job sets `LocalDumps`; the
+  second also asserts the daemon's detection reads it), each holding the residual as measured.
 
 ### A-241 — A client proves its id with a session key, and a request names its own client (accepted 2026-11-07, the supervisor's order)
 Applied in the same change to: §4.9 (its status), GAPS (GAP-A9-9's entry), the bug record of 2026-11-07,

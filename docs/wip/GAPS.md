@@ -2937,7 +2937,22 @@ restores no-opinion over vendor and stages zero files.
 
 **Proven** on run 39528936826: `aarch64 windows (native, by test)` success, against failure on the parent commit's run 39527867650. Native Windows cannot be executed from this machine, so CI was the arbiter.
 
-### 8a-win-dumps. Windows has no unprivileged core-dump exclusion, and the CLI now says so (2026-10-20, OPEN — needs Ada)
+### 8a-win-dumps. Windows has no unprivileged core-dump exclusion, and the daemon says when a full dump is set (2026-10-20; decided 2026-11-07, A-239)
+
+> **2026-11-07, A-239 (the supervisor's decision: option b).** Region exclusion was built, measured and set aside;
+> the daemon reports an administrator's full dumps instead. Measured on windows-latest (build 26100):
+> - An administrator's `LocalDumps` full dump ignores `WerRegisterExcludedMemoryBlock`: every registered region's
+>   pattern was in it, beside the heap's (runs 42355310061, 42362092866).
+> - WER's defaults keep nothing locally: no file in either report queue or archive within 60 s (run 42362092866).
+> - WER's own report, the dump the call governs, could not be produced: `WerReportSubmit` answered `WerDisabled` with
+>   `Disabled` 0, WerSvc running and no policy (run 42364879358). Open: measure it on a Windows client; the
+>   registration patch is kept in scratch for that.
+> - CI's runner hands its steps error mode `0x8003` (`SEM_NOGPFAULTERRORBOX`), so WER sees no crash there unless a
+>   process clears it.
+>
+> The daemon reads the `LocalDumps` setting unprivileged, logs it once and reports `dumps_local_full` in `slates status`;
+> it serves either way (R10). Residual, stated: with that setting a crash dump holds every byte the daemon serves.
+
 
 Compiling `slates-cli` for Windows for the first time turned up three Unix-only sites in the shipped
 binary, and one of them is a security property rather than a portability detail. `dumps::exclude_from_dumps`

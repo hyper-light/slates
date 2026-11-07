@@ -690,6 +690,8 @@ impl Daemon {
     // The client session secret (`crate::session_key`): adopted from the daemon before this one under the anchor, or
     // made and published by the first, so a client's session key still opens its session after a restart.
     crate::session_key::adopt_or_mint(&mut segment)?;
+    // A full crash dump an administrator's setting would write of this daemon (A-239): read and logged once at start.
+    let _ = crate::local_dumps::full();
     // The node's sealing root (A-92): adopted from the previous daemon under this anchor, or made and published into
     // the anchor's locked page; sealing reports itself unavailable, never unlocked, where the OS refuses the lock.
     let sealing = crate::seal_keys::init(&mut segment, config.seal_key_slots);
