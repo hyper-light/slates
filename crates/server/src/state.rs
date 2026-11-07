@@ -1167,8 +1167,11 @@ pub fn ring_ready_in(s: &ShardState) -> bool {
   }) || !s.deferred.is_empty()
 }
 
+/// Counter: a reply [`deliver`] dropped because its client's slot was gone, retiring or reused by another client.
+pub(crate) const REPLY_UNDELIVERABLE: &str = "reply.undeliverable";
+
 /// A reply that came back from another shard (or a scatter's part): queued for the client's
-/// ring and the server task woken.
+/// ring and the server task woken; dropped and counted ([`REPLY_UNDELIVERABLE`]) when its client is gone.
 pub fn deliver(client_index: u32, request: u64, reply: ReplyBody, recorded: bool) {
   let server = with_state(|s| {
     // The origin's `ring.request` span (§4.14), opened at the slot read and kept while the request was
@@ -1186,6 +1189,9 @@ pub fn deliver(client_index: u32, request: u64, reply: ReplyBody, recorded: bool
       !client.retiring
         && client.client_id == slates_wire::request::RequestId::from_word(request).client
     }) {
+      // Its client is gone or its slot reused: nobody can take the reply. Counted, since a client still waiting would
+      // otherwise wait with nothing to show where its reply went.
+      s.count(REPLY_UNDELIVERABLE, 1);
       return None;
     }
     s.deferred.push(Deferred {

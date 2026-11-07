@@ -51,6 +51,12 @@ const BEGUN: &str = "fleet.forward.begun";
 /// The status count of a waiting forwarder woken by the driver with its reply taken: a reply begun on the session
 /// and taken by another forwarder's turn (the count that shows forwards sharing the session rather than taking turns).
 const TAKEN_FOR_ANOTHER: &str = "fleet.forward.taken_for_another";
+/// The status count of a forwarder whose forwards were all answered (or answered unanswered by a replaced session):
+/// with [`BATCH_GIVEN_UP`], every forwarder that ended, so the forwarders still waiting are the ones begun and not
+/// counted here.
+const BATCH_DONE: &str = "fleet.forward.batch_done";
+/// The status count of a forwarder that gave up its batch at its stall budget, or because its session failed.
+const BATCH_GIVEN_UP: &str = "fleet.forward.batch_given_up";
 
 /// Where one forward is.
 enum Stage {
@@ -273,6 +279,7 @@ pub(crate) async fn forward_batch(
     let look = look(peer, &held.tickets)?;
     let (drive, progress_ns) = match look {
       Look::Done(replies) => {
+        state::with_state(|s| s.count(BATCH_DONE, 1));
         let last_ns = futures::now_ns();
         let bytes: usize = replies.iter().flatten().map(Vec::len).sum();
         let (first_ns, first_len) = first_reply.unwrap_or((last_ns, bytes));
@@ -326,6 +333,7 @@ pub(crate) async fn forward_batch(
 /// The batch's replies so far, its budget spent: `None` when none of it was ever begun (the session never came),
 /// else the replies with `None` for those not answered.
 fn given_up(peer: HostId, held: &Held, begun: bool) -> Option<BatchReplies> {
+  state::with_state(|s| s.count(BATCH_GIVEN_UP, 1));
   let replies: Vec<Option<Vec<u8>>> = state::with_state(|s| {
     let lane = s.forward_lanes.lanes.get(&peer);
     held

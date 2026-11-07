@@ -2615,6 +2615,7 @@ async fn forward_for_local_client(
   let deliver_home = move |reply: ReplyBody| {
     SpawnRequest::new(
       Box::pin(async move {
+        crate::state::with_state_counted(|s| s.count(FORWARD_LOCAL_DELIVERED_HOME, 1));
         crate::state::deliver(client_index, request, reply, true);
       }),
       None,
@@ -2623,13 +2624,25 @@ async fn forward_for_local_client(
   let sent = control.is_some_and(|control| {
     let task = SpawnRequest::new(
       Box::pin(async move {
+        crate::state::with_state_counted(|s| s.count(FORWARD_LOCAL_CONTROL_STARTED, 1));
         let (replies, _) = resolve_and_forward(volume, region, None, vec![request_bytes]).await;
+        crate::state::with_state_counted(|s| s.count(FORWARD_LOCAL_RESOLVED, 1));
         let reply = replies.first;
         crate::xshard::send_back(origin, deliver_home(reply)).await;
       }),
       None,
     );
     slates_rt::registry::send_control(control, Control::Spawn(Box::new(task))).is_ok()
+  });
+  crate::state::with_state_counted(|s| {
+    s.count(
+      if sent {
+        FORWARD_LOCAL_TO_CONTROL
+      } else {
+        FORWARD_LOCAL_CONTROL_REFUSED
+      },
+      1,
+    );
   });
   if !sent {
     crate::xshard::send_back(
@@ -2639,6 +2652,20 @@ async fn forward_for_local_client(
     .await;
   }
 }
+
+/// Counter: a local client's verb for a volume another host owns, handed from the volume's shard here to the control
+/// shard to be forwarded (`forward_for_local_client`). With the counters after it, each hop of the forward is counted,
+/// so a reply lost in a stall is placed by the first count that falls behind the one before it (fixtures' f = 1 r3k
+/// stall, 2026-11-07: requests in flight for 2,670 s with every daemon idle and nothing deferred or dropped).
+const FORWARD_LOCAL_TO_CONTROL: &str = "fleet.forward.local.to_control";
+/// Counter: such a verb the control shard's channel refused; it is answered `HomedElsewhere`.
+const FORWARD_LOCAL_CONTROL_REFUSED: &str = "fleet.forward.local.control_refused";
+/// Counter: the control shard's task for such a verb started.
+const FORWARD_LOCAL_CONTROL_STARTED: &str = "fleet.forward.local.control_started";
+/// Counter: its owner's reply (or the refusal standing for one) was resolved on the control shard.
+const FORWARD_LOCAL_RESOLVED: &str = "fleet.forward.local.resolved";
+/// Counter: its reply reached the client's shard, to be written into the client's ring.
+const FORWARD_LOCAL_DELIVERED_HOME: &str = "fleet.forward.local.delivered_home";
 
 /// Retries the forwards a full control channel refused; whether any went out.
 fn retry_forwards(state: &mut ShardState) -> bool {
