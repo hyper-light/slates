@@ -319,7 +319,6 @@ fn sim_rows() {
   row("land.replan_after_landing_nothing_diverged", second, true);
 }
 
-#[cfg(unix)]
 mod os_rows {
   use super::*;
   use slates_land::os::OsLand;
@@ -335,14 +334,23 @@ mod os_rows {
     }
   }
 
-  /// `cp -r` of the same delta (the edited files, written to a sibling tree) as the comparison.
+  /// `cp -r` of the same delta (the edited files, written to a sibling tree) as the comparison; on Windows the
+  /// system's own recursive copy, `xcopy /E /I /Q /Y` (A-185).
   #[allow(clippy::disallowed_methods)]
   fn cp_r_delta(src: &Path, dst: &Path) -> std::time::Duration {
     let started = Instant::now();
+    #[cfg(unix)]
     let status = Command::new("cp")
       .arg("-r")
       .arg(src)
       .arg(dst)
+      .status()
+      .unwrap();
+    #[cfg(windows)]
+    let status = Command::new("xcopy")
+      .arg(src)
+      .arg(dst)
+      .args(["/E", "/I", "/Q", "/Y"])
       .status()
       .unwrap();
     assert!(status.success());
@@ -476,15 +484,12 @@ fn main() {
     .ok()
     .and_then(|exe| exe.parent().map(PathBuf::from));
   match beside {
-    #[cfg(unix)]
     Some(build_output) => {
       os_rows::flat(&build_output);
       if !flat_only {
         os_rows::run(&build_output);
       }
     }
-    #[cfg(not(unix))]
-    Some(_) => println!("land bench: the OS rows run on Unix only"),
     None => println!("land bench: OS rows skipped — the binary's directory is unknown"),
   }
 }

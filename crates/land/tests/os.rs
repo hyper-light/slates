@@ -15,7 +15,6 @@
   clippy::panic,
   clippy::indexing_slicing
 )]
-#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -26,13 +25,17 @@ use slates_land::os::{OsLand, TargetRefusal};
 use slates_vfs::base::BaseConfig;
 use slates_vfs::host::{HostError, HostFs, LandFs};
 use slates_vfs::volume::{Store, Volume};
+#[cfg(unix)]
 use slates_vfs::xattr::XattrSet;
 
 mod common;
 use common::{
-  LARGE, Session, Setup, config, mkdir, mkdir_with_mode, read_through, rename, request, rm_r,
-  scratch, store, symlink, unlink, write_file,
+  LARGE, Session, Setup, config, mkdir, read_through, rename, request, rm_r, scratch, store,
+  unlink, write_file,
 };
+// The pieces only the Unix tests use (a symlink, a directory's recorded mode).
+#[cfg(unix)]
+use common::{mkdir_with_mode, symlink};
 
 /// Format: the environment variable that turns this binary into the kill test's child.
 const CHILD_DIR: &str = "SLATES_LAND_CHILD_DIR";
@@ -133,6 +136,8 @@ fn edit_example(vol: &mut Volume, host: &mut OsLand, store: &mut Store) {
   unlink(vol, host, store, "/src/gone.rs");
   mkdir(vol, host, store, "/out");
   write_file(vol, host, store, "/out/inner", b"inner");
+  // Windows makes no symbolic link without a privilege slates never asks for (R10; `os_windows.rs`).
+  #[cfg(unix)]
   symlink(vol, host, store, "/link", "src/lib.rs");
   rename(vol, host, store, "/moved", "/moved2");
   rm_r(vol, host, store, "/tree");
@@ -147,9 +152,12 @@ fn assert_example_on_disk(root: &Path) {
   assert_eq!(read(&root.join("moved2/m")).unwrap(), b"m");
   assert!(!root.join("moved").exists());
   assert!(!root.join("tree").exists());
-  #[allow(clippy::disallowed_methods)]
-  let link = std::fs::read_link(root.join("link")).unwrap();
-  assert_eq!(link, Path::new("src/lib.rs"));
+  #[cfg(unix)]
+  {
+    #[allow(clippy::disallowed_methods)]
+    let link = std::fs::read_link(root.join("link")).unwrap();
+    assert_eq!(link, Path::new("src/lib.rs"));
+  }
   assert!(
     !names_in(root).iter().any(|n| n.starts_with(".slates-")),
     "{:?}",
@@ -200,14 +208,35 @@ fn the_worked_example_lands_on_a_real_directory() {
   );
 }
 
-/// Containment: a symlink component and `..` are refused before the lease; a relative path too.
+/// A name at `alias` that redirects to the directory `real`, as an outsider makes one without privilege: a symbolic
+/// link on Unix, a junction on Windows (`mklink /J`, whose arguments take backslashes).
+fn redirect(real: &Path, alias: &Path) {
+  #[cfg(unix)]
+  {
+    #[allow(clippy::disallowed_methods)]
+    std::os::unix::fs::symlink(real, alias).unwrap();
+  }
+  #[cfg(windows)]
+  {
+    let backslashed = |path: &Path| path.to_string_lossy().replace('/', "\\");
+    let made = Command::new("cmd")
+      .args(["/C", "mklink", "/J"])
+      .arg(backslashed(alias))
+      .arg(backslashed(real))
+      .output()
+      .unwrap();
+    assert!(made.status.success(), "mklink /J: {made:?}");
+  }
+}
+
+/// Containment: a symlink (Unix) or junction (Windows) component and `..` are refused before the lease; a relative
+/// path too.
 #[test]
 fn a_target_path_that_escapes_is_refused() {
   let ram = build_output();
   let ws = Workspace::new(&ram, "escape");
   seed_dir(&ws.path.join("real"));
-  #[allow(clippy::disallowed_methods)]
-  std::os::unix::fs::symlink(ws.path.join("real"), ws.path.join("alias")).unwrap();
+  redirect(&ws.path.join("real"), &ws.path.join("alias"));
   assert_eq!(
     OsLand::open_target(&ws.path.join("alias"))
       .err()
@@ -313,6 +342,7 @@ fn a_landing_component_never_steps_out_of_the_target() {
 /// `"through/evil"`). Proven on a real directory with a symlink aimed at the parent that holds the secret:
 /// the walk step (open as a directory) and the leaf step (open as a file) both refuse, so a sibling entry
 /// keyed through it can never be created outside, and the secret keeps its bytes (R1, §4.15 containment).
+#[cfg(unix)]
 #[test]
 fn a_landing_never_walks_a_manifest_path_through_a_symlink() {
   let ram = build_output();
@@ -395,6 +425,7 @@ fn a_scratch_volume_into_an_empty_real_directory_preserves_the_target() {
 /// each directory on the disk has exactly its recorded mode. Before 2026-10-01 the landed directory was made
 /// with `mkdirat(mode)` and nothing after it, so the process umask cleared bits the volume held: 0775 landed
 /// 0755 (found by the Linux container lane's hermeticity run, whose harness made its directories under umask 002).
+#[cfg(unix)]
 #[test]
 fn a_landed_directory_keeps_its_mode_whatever_the_umask() {
   // The conventional umask, so the test means the same on every host; the landing must not depend on it.
@@ -442,6 +473,7 @@ fn a_landed_directory_keeps_its_mode_whatever_the_umask() {
 /// `04755`, land it, and read the disk file. Expect: owned by the process's euid, never the recorded uid; the
 /// setuid bit present. A regression against a future `fchown` added to `land` for "ownership fidelity", which
 /// would turn a recorded uid-0 setuid file into a setuid-root binary on disk.
+#[cfg(unix)]
 #[test]
 fn a_landed_setuid_file_is_owned_by_the_daemon_never_the_recorded_root() {
   use std::os::unix::fs::MetadataExt;
@@ -524,6 +556,7 @@ fn a_landed_setuid_file_is_owned_by_the_daemon_never_the_recorded_root() {
 /// cousins. Do: write a file, set `security.capability` on it in the volume (asserting the volume holds it), land
 /// it, read the disk file back. Expect: the file's bytes land (non-vacuity: the landing ran to completion), and
 /// `security.capability` is absent on disk (reading it fails: no such attribute).
+#[cfg(unix)]
 #[test]
 fn a_landing_never_materializes_a_security_capability_xattr() {
   let ram = build_output();
