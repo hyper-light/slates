@@ -1,13 +1,14 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
-> **Fixed in part (live-fixes, 2026-11-06): a daemon restarted under its anchor never rejoined its fleet (raft-chaos
+> **Fixed (live-fixes, 2026-11-06 and 07): a daemon restarted under its anchor never rejoined its fleet (raft-chaos
 > report 8).** The successor keeps the member id; the other nodes hold that id dead. Its restarted plane epochs were
 > refused as not newer (`fleet.plane.epoch_refused.install`), and a canonical dialer holding it dead never dialed it again
 > (`fleet.link.invalid.believed_dead`), so it could never refute the death. The acceptor now takes a restarted sequence
 > (`fleet.plane.epoch_restarted`), and contact is kept with a dead member that announced itself since
 > (`DirectContact::Returned`, `fleet.plane.member_returned`). Under load on macOS CI: 0 of 6 re-formed before, 5 of 6
-> after (0.10 to 1.68 s). **Open:** the sixth: the node holding it dead received no announcement from it in 40 s, cause
-> not yet counted. Bug record `docs/bugs/2026-11-06-a-daemon-restarted-under-its-anchor-never-rejoined-its-fleet.md`;
+> after (0.10 to 1.68 s). The sixth, a successor up before the others suspected it, is fixed too (2026-11-07): a
+> canonical dialer drops its session to a member that announced itself on a new one and dials afresh
+> (`fleet.plane.peer_reconnected`): 3 of 6 re-formed with that rule off, 6 of 6 with it on (0.47 to 0.66 s, load 30 to 74). Bug record `docs/bugs/2026-11-06-a-daemon-restarted-under-its-anchor-never-rejoined-its-fleet.md`;
 > test `a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet`.
 
 > **Fixed (live-fixes, 2026-11-06): main's macOS fleet-deploy test refused the successor's mount `OwnedByAnotherHost`

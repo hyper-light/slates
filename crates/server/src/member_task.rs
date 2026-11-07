@@ -164,7 +164,15 @@ pub(crate) struct PlaneState {
   /// Members keyed by an installed epoch, and whether each has been joined to the detector: a member joins once it is
   /// also addressable (`MemberPlane::join`).
   pub keyed: BTreeMap<HostId, bool>,
+  /// Per member, a fingerprint of the session it last announced itself on to this node (the first bytes of that
+  /// session's exporter secret, which differs per connection): a member announcing on another session reconnected, its
+  /// process perhaps restarted under the same id ([`note_reconnected`]). Bounded by the fleet's peer capacity.
+  pub announced_from: BTreeMap<HostId, [u8; RECONNECT_FINGERPRINT_BYTES]>,
 }
+
+/// Format: the bytes of a session's exporter secret kept to tell one connection from the next: enough that two
+/// connections' secrets, uniformly random, coincide with probability 2^-128.
+pub(crate) const RECONNECT_FINGERPRINT_BYTES: usize = 16;
 
 impl std::fmt::Debug for PlaneState {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -218,6 +226,7 @@ pub(crate) fn accept_announcement(
     return refuse(state, EPOCH_REFUSED_FORGED);
   }
   note_returned(state, announced.member);
+  note_reconnected(state, anchor, announced.member, secret);
   let answer = Announcement {
     epoch: announced.epoch,
     member: state.fleet.host(),
@@ -280,6 +289,42 @@ fn note_returned(state: &mut ShardState, member: HostId) {
     crate::fleet::count_refusal_in(state, MEMBER_RETURNED);
   }
 }
+
+/// Notes that `member` (of `anchor`) announced itself on `secret`'s session. Announced before on another session, it
+/// reconnected, and where this node is the pair's canonical dialer (the lower anchor) the session this node dialed may
+/// lead to a process that is gone: it is dropped, so the link dials afresh and announces the pair's next epoch on a
+/// session the member's process holds. Kept, a member restarted under the same id within the moment it took the others
+/// to suspect it announced itself while still held alive, the canonical dialer went on announcing to nobody, the pair
+/// stayed unkeyed, and the member was then condemned with no way to refute it (5 of 6 anchored rejoins under load on
+/// macOS CI, diag run 42342444105, successor up in 50 to 90 ms; `fleet.plane.peer_reconnected`).
+fn note_reconnected(
+  state: &mut ShardState,
+  anchor: HostId,
+  member: HostId,
+  secret: &[u8; hyper_datagram::SECRET_BYTES],
+) {
+  let mut fingerprint = [0u8; RECONNECT_FINGERPRINT_BYTES];
+  for (kept, byte) in fingerprint.iter_mut().zip(secret.iter()) {
+    *kept = *byte;
+  }
+  if !state.plane.announced_from.contains_key(&member)
+    && state.plane.announced_from.len() >= state.config.fleet_peer_capacity
+  {
+    return;
+  }
+  let previous = state.plane.announced_from.insert(member, fingerprint);
+  let reconnected = previous.is_some_and(|previous| previous != fingerprint);
+  if reconnected && anchor > state.origin_anchor {
+    state.record_sessions.remove(&member);
+    state.plane.announced_on.remove(&member);
+    crate::fleet::wake_link_waiter_of(state, member);
+    crate::fleet::count_refusal_in(state, PEER_RECONNECTED);
+  }
+}
+
+/// Counter: a member that announced itself on a new session, whose session this node dialed as the pair's canonical
+/// dialer was dropped to be dialed afresh.
+const PEER_RECONNECTED: &str = "fleet.plane.peer_reconnected";
 
 /// Counter: an announcement from a member this node held dead, whose contact is kept so it can refute the death.
 const MEMBER_RETURNED: &str = "fleet.plane.member_returned";

@@ -59,8 +59,16 @@ probes, no council seat, no holder role, for as long as the processes ran.
   - the restarted epoch sequence alone: 3 of 6 (the three failures show only `believed_dead`);
   - both: 5 of 6, re-formed 0.10 to 1.68 s after the successor answered.
 
-## Open
+## The sixth case: a restart quicker than the suspicion (2026-11-07)
 
-One run of six with both edits still failed: the node holding the successor dead counted no `member_returned`, so no
-announcement from the successor reached it within the 40 s wait. The counters do not say why; the next diagnostic run
-keeps each failure's whole log.
+After main 4326a9d8 was merged the successor came up in 50 to 90 ms, and the anchored rejoin failed 5 of 6 under load
+(diag run 42342444105): the node holding the successor dead counted no `member_returned`, because the successor had
+announced itself while still held alive, before the others condemned it. The pair's canonical dialer still held the
+session it had dialed to the dead process and never announced to the new one, so the pair stayed unkeyed and the death
+came after. Now an acceptor remembers a fingerprint of the session each member last announced itself on
+(`PlaneState::announced_from`, the first 16 bytes of the session's exporter secret); a member announcing on another
+session reconnected, and where this node is the pair's canonical dialer it drops its dialed session to that member so
+the link dials afresh and keys the pair (`member_task::note_reconnected`, `fleet.plane.peer_reconnected`). One build,
+the rule switched off and on by a diagnostic-only variable, six runs each under two spinners a CPU on macos-latest
+(diag run 42345923153, load 30 to 74 on 3 CPUs): off 3 of 6 re-formed, on 6 of 6, re-formed 0.47 to 0.66 s after the
+successor answered.
