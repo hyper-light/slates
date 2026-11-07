@@ -13503,6 +13503,14 @@ recovery's reconcile, and `mount_capability` follows the alias; `image.rs`: `pub
 - **What it does not change.** Lookups by id, and a create whose name hashes to its own partition. The siblings found
   are left as they were: `ImageBuild` and `ImageMerge` make a named volume on the origin's partition with the same
   local-only name check, and a fleet takeover that moves a clone off its host is outside this daemon's partitions.
+- **2026-11-07: the image verbs on the same protocol** (the supervisor's order). `ImageBuild` and `ImageMerge` make
+  their volume beside its source for copy-on-write, as a clone is made, and now hold a name that hashes elsewhere the
+  same way (`crates/server/src/image.rs`: `name_alias`, `reserve`, `settle`): the volume's id minted first, the alias
+  reserved at the name's partition before the build or merge starts, confirmed or released before the reply; the name
+  checked against the name's partition's aliases as well as its volumes. Destroy's release and recovery's reconcile were
+  already the protocol's for any volume. `an_image_and_its_merge_named_on_another_partition_are_held_once`
+  (`crates/server/tests/recovery.rs`) was red (the merge was not served under its name), is green on two shards and on
+  one (R8) across a restart, and is red again with the alias turned off.
 
 ### A-233 — macOS hands a client its region as a Mach fileport, never by a name a stranger could open (accepted 2026-11-06, GAP-A9-9's ring half)
 Renumbered 2026-11-07 from A-220 (the supervisor's allocation: A-220 was taken elsewhere). The commit that made it,

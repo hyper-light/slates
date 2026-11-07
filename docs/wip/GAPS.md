@@ -8,8 +8,8 @@
 >   are admitted.
 > - `crates/db/tests/alias.rs` crashes at every step. `a_clone_named_on_another_partition_is_reached_by_name_and_held_once`
 >   runs two shards and its one-shard differential, restart included; it was red at main and red with the routing off.
-> - **Siblings open:** `ImageBuild` and `ImageMerge` make a named volume on the origin's partition with a local-only
->   name check, the same bug class. Also, an alias step the name's shard did not take (`names.alias_step_untaken`)
+> - **Siblings:** `ImageBuild` and `ImageMerge` made a named volume on the origin's partition with a local-only name
+>   check, the same bug class; fixed 2026-11-07 on the same protocol (A-236's note). Still open: an alias step the name's shard did not take (`names.alias_step_untaken`)
 >   leaves a reserved alias that resolves nothing until the next recovery.
 
 > **GAP-A9-9 on macOS, the ring half: a client's region crosses as a Mach fileport, never by name (2026-11-06, A-233,
