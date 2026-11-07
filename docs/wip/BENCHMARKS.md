@@ -8520,6 +8520,41 @@ in order, up to the last whole record's size, and appended them as the credit fr
 
 Dead even (3 of 5 against 2 of 5, medians and tails overlapping), so it does not land; the patch is kept off the tree.
 
+### Measured and rejected: a request's acknowledgement riding its synchronous reply (A-200; 2026-11-07)
+
+**Where a live entry's round trip goes.** A probe kept off the tree timed each hop of a quiet 4 KiB stable write's
+dispatch round:
+- **Command and machine:** `measure_what_live_shipping_adds_to_a_stable_nfs_write`, release, CI's `ubuntu-latest`
+  and `ubuntu-24.04-arm` runners (4 CPUs each).
+- **Transport request round trip:** 135–158 µs on x86_64 and 201–236 µs on arm64.
+- **Of that, the holder's own serve:** 6–11 µs.
+- **The session's smoothed packet RTT:** 55–67 µs on x86_64 and 78–104 µs on arm64.
+- **Receive waits:** the owner took 3 receive waits per request, because the holder acknowledges a request in its own
+  datagram, sent by `Endpoint::next_request`'s flush before the request is returned, and then sends the reply.
+
+**The experiment.** `next_request` returned a ready request before flushing, so the acknowledgement rode the reply; and
+`serve_once_async` flushed before awaiting its handler, so a slow handler's request was still acknowledged at once.
+
+**A/B.** Interleaved against the probe alone (`6afaea45`), three quiet and three busy rounds per arch, arms alternating
+(`diag-live-durability-13`, 2026-11-07). Added at the median, quiet, A then B:
+
+| | A (probe) | B (piggyback) |
+|---|---|---|
+| x86_64 | 247.4 / 256.0 / 259.7 µs | 251.3 / 267.7 / 231.6 µs |
+| arm64 | 333.3 / 344.1 / 354.3 µs | 348.0 / 352.4 / 368.2 µs |
+| request round trip, x86_64 | 135 / 148 / 158 µs | 141 / 153 / 137 µs |
+| request round trip, arm64 | 201 / 207 / 214 µs | 226 / 225 / 236 µs |
+
+**Result.** The owner's receive waits fell from 3.0 to 2.0 per request, but the round trip did not move, so the separate
+acknowledgement was not where the time went. Busy rounds overlapped too: x86_64 2,950 / 3,191 / 2,010 µs against
+2,951 / 1,999 / 2,409 µs.
+
+**Why it does not land.** Dead even on x86_64, slightly worse on arm64. It also breaks the transport's contract that
+taking a request acknowledges it: `a_peer_that_dies_mid_exchange_is_bounded_by_the_deadline_and_leaves_no_exchange_behind`
+failed because a peer that took the request and died had never acknowledged it, so the client's reset stayed owed
+forever. The patch is kept off the tree. The ~80 µs between the packet RTT and the request round trip is still
+unexplained: either the holder's turnaround outside its handler, or the wakes.
+
 ## What a WinFsp mount and unmount wait for the Windows anchor (A-213; 2026-11-05)
 
 Each WinFsp mount sends the anchor a hold and each unmount a release, and waits for the answer (A-198, A-206). The
