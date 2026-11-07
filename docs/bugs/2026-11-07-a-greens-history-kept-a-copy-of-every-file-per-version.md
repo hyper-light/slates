@@ -2,7 +2,7 @@
 
 Found by agents/loadtest-scale attributing the load test's memory per version (GAPS, "Memory per client,
 attributed") and its `BudgetExceeded` refusals. W2 of the load test's walls, assigned by the supervisor on
-2026-11-06. Amendment: AMENDMENT-W2.
+2026-11-06. Amendment: A-242.
 
 ## Description
 

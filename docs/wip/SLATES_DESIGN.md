@@ -7454,7 +7454,7 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > identity is a set hash over the green's entries, brought up to date when read, so a record at `f > 0` costs what its
 > version changed. Since part 3 (2026-11-06) a clean rebase returns only what the work changed over the head.
 
-> **Status (2026-11-07, AMENDMENT-W2: the history is copy-on-write, and an increment carries what it adds).**
+> **Status (2026-11-07, A-242: the history is copy-on-write, and an increment carries what it adds).**
 > - **The history.** The engine kept a whole copy of a file per version that changed it, and charged the whole
 >   previous file to each submit. A version now holds pieces of shared chunks (`crates/merge/src/history.rs`): the
 >   bytes it added and its piece list. That is the "Splice" below, done in the engine's history.
@@ -14236,7 +14236,7 @@ green's base, the other half of the load test's first finding, is A-202's.
 - **Cost (measured on the branch it comes from):** every edit now appends to the partition log, so the partition's
   snapshots come at the rate edits arrive.
 
-### AMENDMENT-W2 — A green's content history is copy-on-write, and an increment's post-state holds only the runs it adds (accepted and built 2026-11-07, W2 of the load test's walls)
+### A-242 — A green's content history is copy-on-write, and an increment's post-state holds only the runs it adds (accepted and built 2026-11-07, W2 of the load test's walls)
 
 Applied in the same change to:
 - §4.16: its status.

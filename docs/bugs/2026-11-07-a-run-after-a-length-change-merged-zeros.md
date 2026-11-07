@@ -1,7 +1,7 @@
 # A run after a length change in its file merged zeros, and every increment carried its files' whole regions (2026-11-07, §4.16 "Submission", "the sealed post-state")
 
 Found by agents/loadtest-scale while proving W2. The green-retention test was refused `TableAtCapacity` at 44 of 64
-versions of 64-byte edits, which the edits' size could not explain. Amendment: AMENDMENT-W2 (with the history's
+versions of 64-byte edits, which the edits' size could not explain. Amendment: A-242 (with the history's
 copy-on-write).
 
 ## Description

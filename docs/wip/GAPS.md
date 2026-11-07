@@ -171,7 +171,7 @@
 >   file it overwrote, and the history folds only down to the oldest base a live work holds. Walls owed for the
 >   10k–100k rungs (the green chain's checkpointing above is closed on the owner):
 >   - a green's works served off its owner's shard, with only the verdict serialized;
->   - ~~history that keeps what a version overwrote, not whole files~~ **closed (AMENDMENT-W2, 2026-11-07)**: the
+>   - ~~history that keeps what a version overwrote, not whole files~~ **closed (A-242, 2026-11-07)**: the
 >     history is copy-on-write (`crates/merge/src/history.rs`). A version costs the bytes it wrote and its piece
 >     lists. Behind a held floor, 64 versions of 64-byte overwrites of a 1 MiB file under a 16 MiB cap: 16 of 64
 >     accepted before, 64 after (`green_retention.rs`, CI runs 42358895080 and 42367326179);
