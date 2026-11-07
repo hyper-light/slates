@@ -1230,3 +1230,84 @@ fn every_bad_device_message_is_counted_and_the_log_says_each_kind_once() {
     "one line per kind: {stderr}"
   );
 }
+
+/// Format: the role of [`tearing_child`]: set, the child is it.
+const CHILD_TEAR: &str = "SLATES_ANCHOR_TEST_TEAR";
+/// Format: the exit of a [`tearing_child`] that left the profile's publication unfinished, as a daemon the anchor
+/// killed inside its `publish` leaves it.
+const TORE: i32 = 21;
+/// Format: the exit of one that read the anchor's profile whole.
+const READ_WHOLE: i32 = 0;
+/// Format: the exit of one refused the profile, the daemon's own exit for a refused start.
+const REFUSED: i32 = 4;
+/// Format: the profile the test's anchor publishes.
+const PROFILE: &[u8] = b"{\"the anchor's profile\":1}";
+
+/// The child [`a_daemon_killed_mid_publication_leaves_its_successor_the_anchors_profile`] supervises. Its first start
+/// does what a daemon's `publish` does first, making the profile's generation odd, and exits there, as a daemon the
+/// anchor kills inside it does; a later start reads the profile as a daemon does at its start.
+#[test]
+#[ignore = "the tearing child; run by a_daemon_killed_mid_publication_leaves_its_successor_the_anchors_profile"]
+fn tearing_child() {
+  if std::env::var_os(CHILD_TEAR).is_none() {
+    return;
+  }
+  let segment = AnchorSegment::attach_from_env(&identity()).unwrap();
+  if segment.supervision().unwrap().restarts() == 0 {
+    segment
+      .payload_generation(RegionKind::Profile)
+      .unwrap()
+      .fetch_or(1, Ordering::AcqRel);
+    std::process::exit(TORE);
+  }
+  match segment.read_published(RegionKind::Profile) {
+    Ok(Some(profile)) if profile == PROFILE => std::process::exit(READ_WHOLE),
+    _ => std::process::exit(REFUSED),
+  }
+}
+
+/// §4.14, A-119. Do: publish a profile as `slates anchor` does, and supervise a child whose first start leaves the
+/// profile's publication unfinished and exits, as a daemon killed inside its own republication of the profile does.
+/// Expect its successor to read the anchor's profile whole. Before, the successor was refused it
+/// (`PublicationInProgress`, "a payload publication is unfinished") and exited 4, and so did every daemon after it:
+/// only the anchor's first publication ever wrote the region again. Under two spinners a core the anchor killed two
+/// starting daemons in a row at its recovery budget, and the third exited 4 into a crash loop that failed
+/// `slates_run_spawns_the_command_as_an_ephemeral_consumer` (1 of 10 runs, an 18-core Mac, 2026-11-07).
+#[test]
+fn a_daemon_killed_mid_publication_leaves_its_successor_the_anchors_profile() {
+  let mut segment = AnchorSegment::create(
+    &unique_name("slates-anchor-test-tear"),
+    &identity(),
+    geometry(),
+  )
+  .unwrap();
+  segment.publish(RegionKind::Profile, PROFILE).unwrap();
+  let args = ["--ignored", "--exact", "tearing_child", "--nocapture"].map(str::to_owned);
+  // Shape: a window long enough to hold every restart of this test.
+  let policy = RestartPolicy {
+    window_ns: 60_000_000_000,
+    max_restarts: 3,
+  };
+  let mut supervisor = Supervisor::new(segment, &args, policy).unwrap();
+  supervisor.hold_environment(CHILD_TEAR, "1".to_owned());
+  let clock = Instant::now();
+  supervisor.start(now_ns(clock)).unwrap();
+  let mut exits = Vec::new();
+  while exits.len() < 2 && clock.elapsed() < Duration::from_millis(CHILD_WAIT_MS) {
+    match supervisor.step(now_ns(clock)).unwrap() {
+      Step::Restarted { exit_code, .. } => exits.push(exit_code),
+      Step::Running => {
+        // The test harness paces the poll; shipped code parks on its driver (D-9).
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(Duration::from_micros(POLL_US));
+      }
+      other => panic!("the supervisor stepped to {other:?}"),
+    }
+  }
+  assert_eq!(
+    exits,
+    vec![Some(TORE), Some(READ_WHOLE)],
+    "the child after the one that left the publication unfinished read the anchor's profile whole (exit {READ_WHOLE}, \
+     not {REFUSED})"
+  );
+}
