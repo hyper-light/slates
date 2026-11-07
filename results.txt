@@ -1,0 +1,9 @@
+09b2d4c8 red on windows-11-arm: exit 0
+> C:\a\slates\slates\own.log:3077:error[E0599]: no variant, associated function, or constant named `OwnMount` found for enum `TargetRefusal` in the current scope
+  C:\a\slates\slates\own.log:3078:    --> crates\server\src\landing.rs:2309:39
+> C:\a\slates\slates\own.log:3080:2309 |   if matches!(refusal, TargetRefusal::OwnMount) {
+  C:\a\slates\slates\own.log:3081:     |                                       ^^^^^^^^ variant, associated function, or constant not found in `TargetRefusal`
+> C:\a\slates\slates\own.log:3083:error[E0599]: no variant, associated function, or constant named `OwnMount` found for enum `TargetRefusal` in the current scope
+  C:\a\slates\slates\own.log:3084:    --> crates\server\src\landing.rs:2320:22
+> C:\a\slates\slates\own.log:3086:2320 |       TargetRefusal::OwnMount => "a component lies on a mount this daemon serves".to_owned(),
+  C:\a\slates\slates\own.log:3087:     |                      ^^^^^^^^ variant, associated function, or constant not found in `TargetRefusal`
