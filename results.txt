@@ -1,0 +1,31 @@
+runner windows-11-arm, 4 CPUs, e8b7fd1 diag: liveness-14 on 52c91447: held_rendezvous x5 quiet and x5 beside tw, Sat Nov  7 09:01:29 UTC 2026
+test a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon ... held rendezvous: 6 connects at a kill, all answered by the next daemon, longest 50.9225ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.98s
+== quiet run 1 exit 0
+test a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon ... held rendezvous: 6 connects at a kill, all answered by the next daemon, longest 100.8893ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.06s
+== quiet run 2 exit 0
+test a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon ... held rendezvous: 6 connects at a kill, all answered by the next daemon, longest 48.4723ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.97s
+== quiet run 3 exit 0
+test a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon ... held rendezvous: 6 connects at a kill, all answered by the next daemon, longest 48.4141ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.95s
+== quiet run 4 exit 0
+test a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon ... held rendezvous: 6 connects at a kill, all answered by the next daemon, longest 48.1258ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.96s
+== quiet run 5 exit 0
+test a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon ... held rendezvous: 6 connects at a kill, all answered by the next daemon, longest 603.2698ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.93s
+== loaded run 1 exit 0
+test a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon ... held rendezvous: 6 connects at a kill, all answered by the next daemon, longest 632.6317ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.79s
+== loaded run 2 exit 0
+test a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon ... held rendezvous: 6 connects at a kill, all answered by the next daemon, longest 625.2384ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.84s
+== loaded run 3 exit 0
+test a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon ... held rendezvous: 6 connects at a kill, all answered by the next daemon, longest 660.398ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.21s
+== loaded run 4 exit 0
+test a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon ... held rendezvous: 6 connects at a kill, all answered by the next daemon, longest 629.5848ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.38s
+== loaded run 5 exit 0
