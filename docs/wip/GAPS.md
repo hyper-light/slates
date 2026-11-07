@@ -1,5 +1,20 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Fixed (live-fixes, 2026-11-07): a live write counted durable on too few holders when the owner fell outside its own
+> volume's placement.** The shipper counted a position durable at the `f`-th highest holder, right for `2f` holders but
+> not for `2f + 1` (every other candidate a holder): at f = 1 a write on one of three was "durable", and a successor
+> counted the other two (raft-chaos, CI diag-20 run 7: a holder left at fence 1, NoLoss held only because it was the
+> stale one). Now `n − f` of `n` holders (never durable at `n <= f`, from which no phase one counts `f + 1`).
+> `a_write_is_durable_only_where_every_takeover_quorum_meets_it` was red on the old count; the model, now also naming
+> `2f + 1` and short sets, passes 20 of 20.
+>
+> **Open (live-fixes): an ex-holder keeps its live copy until the volume's tombstone.** A holder the joint transition
+> drops keeps its copy at an old fence (memory, not safety: no phase one counts it, and with `n − f` no owner commits
+> through it alone). A let-go on the newer holder record (2ba5572d) was reverted (eab618f2): a holder dropped while it was
+> no catalog candidate receives that record only when the configuration names it again, by then a counted member of the
+> next transition. A safe release needs a holder-set generation the entries and replies carry. raft-chaos's five-node
+> flow asserts the release and stays red until then.
+
 > **Fixed (live-fixes, 2026-11-07): a live shipper made before its candidates were known shipped to nobody** (A-200's
 > amendment of that date). A shipper kept the holders of its first publication, so a live volume made on a fleet's
 > bootstrap node stood at `durable=none` for good (the Linux conformance pair, diag run 42325923902). Its holders now
@@ -1057,6 +1072,16 @@
     acknowledged, every volume taken over whole at epoch 2 (unshaped 2.5 s, wan and wan-loss 16.9 s, ceiling 57.2 s).
   - Process red-check, CI, 13 runs a side: the mutation (counting the current placement) left a holder at fence 1 in 4.
     A-240 left none, and lost no write.
+  - **Fixed (2026-11-07): a holder set of 2f+1 under an f-count.** Once the shipper follows the placement, a set can
+    have 2f+1 members (the placement moved off the owner: CI diag-20 run 7 recorded e, c, b at f = 1). The shipper
+    counted a write durable at f of a set while phase one counts f+1, and 1 + 2 = |H|: the successor counted itself and
+    c, and holder b was never fenced. A write is now durable once n − f of a set's n holders hold it, never for n ≤ f
+    (live-fixes, 6dd512b4; `a_write_is_durable_only_where_every_takeover_quorum_meets_it`, red on the old count).
+  - Open (memory, not safety): a holder a transition dropped keeps its copy, since it is no longer a catalog candidate
+    and never sees the record that omits it. A plain release (on that record, or from the owner) can drop the copy of a
+    host re-included meanwhile, whose replies the shipper may already count, so it needs a holder-set generation in
+    entries and replies (live-fixes; 2ba5572d reverted in eab618f2). Phase one never counts such a copy, and with the
+    n − f count no owner commits through it alone.
   - Open: the holder set changing under a live log (joint transition and activation, with live-fixes and raft); a
     successor outside the holders cannot open the log (`takeover_refused.open`); and a refused rebuild refetched the
     log every period, fixed 2026-11-07 (`live_ship::owes_refetch`: no refetch at a head whose bytes were refused; bug

@@ -1,6 +1,7 @@
 //! Live shipping's log (§4.10 "Live shipping", A-200; §4.8 the register rules it rides): the owner of a
 //! `live-shipped` volume ships each of its publications to the volume's other candidates as a fenced, hash-chained log,
-//! and a publication is durable once the owner and `f` holders hold it. This module is the protocol alone — sans-io,
+//! and a publication is durable once the owner and enough holders hold it that every `f + 1` of them a takeover can count
+//! meets one (`f` of the usual `2f`; `n − f` of `n`). This module is the protocol alone — sans-io,
 //! deterministic, no clock — so the same code is the laptop (`f = 0`: no holders, every entry durable at once) and the
 //! fleet (R8), and the simulation in `crates/db/tests/live.rs` drives it under a nemesis.
 //!
@@ -742,7 +743,7 @@ pub struct Shipper {
   retained: VecDeque<Entry>,
   /// What each holder holds on this chain, as last reported.
   held: BTreeMap<HostId, Head>,
-  /// The highest position held by the owner and `f` holders.
+  /// The highest position held by the owner and enough holders that every `f + 1` a takeover counts meet it.
   durable: Option<u64>,
   /// The head of the last whole state the owner shipped ([`Shipper::mark_checkpoint`]): on the chain, and what an
   /// install names, so a holder installed there is credited even once the retained tail no longer reaches it.
@@ -806,8 +807,8 @@ impl Shipper {
     self.epoch
   }
 
-  /// The highest position the owner and `f` holders hold (`None`: none yet). A barrier covering an entry at or below
-  /// it may answer (A-200).
+  /// The highest position the owner and enough holders hold that every `f + 1` of them a takeover can count meets it
+  /// (`n − f` of `n` holders; `None`: none yet). A barrier covering an entry at or below it may answer (A-200).
   pub fn durable(&self) -> Option<u64> {
     self.durable
   }
@@ -1165,10 +1166,10 @@ impl Shipper {
     self.trim();
   }
 
-  /// The highest position the owner and `f` holders hold: the `f`-th highest holder position, capped at the owner's
-  /// head; during a transition, the lower of that over the holders and over the target, so a takeover counting either
-  /// meets it. At `f = 0` the owner's head. It never falls: an older answer arriving late, or a set with fewer than `f`
-  /// members holding anything, leaves it where it was.
+  /// The highest position the owner and enough holders hold, capped at the owner's head: over the holders, every `f + 1`
+  /// of them a takeover can count meet it ([`Shipper::reached_by`]); during a transition, the lower of that over the
+  /// holders and over the target, so a takeover counting either meets it. At `f = 0` the owner's head. It never falls:
+  /// an older answer arriving late, or a set where too few hold anything, leaves it where it was.
   fn recompute_durable(&self) -> Option<u64> {
     let own = self.head?.position;
     if self.quorum.f == 0 {
@@ -1187,13 +1188,21 @@ impl Shipper {
     }
   }
 
-  /// The `f`-th highest position the members of `set` hold (`None`: fewer than `f` hold anything; at `f = 0`, the
-  /// owner's head).
+  /// The highest position held by enough members of `set` that every `f + 1` of them a takeover's phase one can count
+  /// meets one holding it: the `(n − f)`-th highest held position over its `n` members (`f` of `2f`; `f + 1` of
+  /// `2f + 1`, a set without the owner, whose placement moved off it). `None` when fewer hold anything, and always for a
+  /// set of `f` or fewer members, from which no phase one can count `f + 1`. At `f = 0`, the owner's head. Counting the
+  /// `f`-th highest whatever the set's size let a write held by one of three holders count as durable, and a successor
+  /// counted the other two (raft-chaos, CI diag-20 run 7).
   fn reached_by(&self, set: &[HostId]) -> Option<u64> {
-    let needed = usize::try_from(self.quorum.f).ok()?;
-    let Some(rank) = needed.checked_sub(1) else {
+    let tolerated = usize::try_from(self.quorum.f).ok()?;
+    if tolerated == 0 {
       return self.head.map(|head| head.position);
-    };
+    }
+    if set.len() <= tolerated {
+      return None;
+    }
+    let rank = set.len().checked_sub(tolerated)?.checked_sub(1)?;
     let mut positions: Vec<u64> = set
       .iter()
       .filter_map(|holder| self.held.get(holder).map(|head| head.position))
