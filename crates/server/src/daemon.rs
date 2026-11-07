@@ -3482,6 +3482,7 @@ fn init_shard(
     forward_lanes: crate::forward_lane::ForwardLanes::default(),
     staging: crate::staging::Staging::default(),
     member_boot_nonce: incarnation,
+    member_process_nonce: keyed_word(&issuer_secret, b"slates/member-process/v1"),
     learned_members: std::collections::BTreeMap::new(),
     returned_members: std::collections::BTreeMap::new(),
     authenticated_members: std::collections::BTreeSet::new(),
