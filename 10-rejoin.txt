@@ -59,3 +59,8 @@ rejoins: successor daemon 21290 answered after 59.172ms
 slates-cluster: fleet: HostId(7985263575981156459) holds HostId(16409024208515174930) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
 rejoins: the fleet re-formed after 472.720583ms
 slates daemon: the anchor is gone; leaving
+=== on 3 exit 0 load { 69.32 39.01 21.01 }
+rejoins: successor daemon 21477 answered after 43.387709ms
+slates-cluster: fleet: HostId(17794672266272843438) holds HostId(13484493008185611463) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+rejoins: the fleet re-formed after 624.49325ms
+slates daemon: the anchor is gone; leaving
