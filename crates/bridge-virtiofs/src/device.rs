@@ -42,7 +42,7 @@ use std::fmt;
 use slates_bridge_core::{Bridge, OpContext};
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
 use slates_bridge_fuse::bridge::{
-  EIO, dispatch, needs_barrier, reclaim_unreported, reply_error, success_reply_bytes, takes_reply,
+  EIO, needs_barrier, reclaim_unreported, reply_error, success_reply_bytes, takes_reply,
 };
 use slates_bridge_fuse::init::{InitNegotiation, MAX_WRITE, negotiate};
 use slates_bridge_fuse::reply::ReplyHeader;
@@ -505,6 +505,9 @@ pub struct Device {
   queues: Vec<Virtqueue>,
   request: Vec<u8>,
   reply: Vec<u8>,
+  /// The dirty-page write-back rule for this guest (§4.6 "Cache posture"): its stale cache write-backs are refused,
+  /// never applied over another path's newer write (`slates_bridge_fuse::guest_writeback`).
+  writeback: slates_bridge_fuse::guest_writeback::GuestWriteback,
   negotiated: Option<InitNegotiation>,
   fault: Option<DeviceError>,
   awaiting: Option<AwaitingBarrier>,
@@ -546,6 +549,7 @@ impl Device {
       queues: Vec::new(),
       request: Vec::new(),
       reply: Vec::new(),
+      writeback: slates_bridge_fuse::guest_writeback::GuestWriteback::new(),
       negotiated: None,
       fault: None,
       awaiting: None,
@@ -1333,7 +1337,9 @@ impl Device {
           &mut self.backed,
           &mut self.reply,
         ) {
-          DaxServed::NotHandled => dispatch(&self.request, bridge, cx, &mut self.reply),
+          DaxServed::NotHandled => self
+            .writeback
+            .serve(&self.request, bridge, cx, &mut self.reply),
           DaxServed::Replied(n) => n,
           // A SETUPMAPPING was taken: hold the chain while its window's backing is filled and its pieces mapped. No
           // reply is scattered now; the turn (and the message placer's acks) answer the guest.
@@ -1359,7 +1365,9 @@ impl Device {
       }
       #[cfg(not(unix))]
       {
-        dispatch(&self.request, bridge, cx, &mut self.reply)
+        self
+          .writeback
+          .serve(&self.request, bridge, cx, &mut self.reply)
       }
     };
     // A write-back the volume refused before this request is answered where its asker reads an answer, so a guest's
