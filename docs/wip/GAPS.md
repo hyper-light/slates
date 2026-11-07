@@ -855,6 +855,10 @@
 >   `xshard::tests::a_call_to_its_own_shard_runs_its_future_to_the_end_past_the_deadline`.
 > - **Open (live-durability): an install never finishes inside the liveness budget, and a dispatch strands its
 >   sessions** (record `docs/bugs/2026-11-06-an-install-never-finished-inside-the-liveness-budget.md`).
+>   - The size-derived budget is `live_ship::exchange_budget` (`bytes × smoothed RTT / congestion window` plus the
+>     liveness budget), on raft-chaos's branch with A-240, where phase one's log fetch uses it. live-durability's
+>     lanes take it after A-240 lands. Until then an install over a slow path is cut at the liveness budget, on main
+>     and on live-durability's landable branch alike (agreed 2026-11-07).
 >   - A candidate left behind the retained tail is sent the whole volume (0.5-1.5 MB) under the 1 s budget an entry
 >     gets. In one run 1,391 installs (2.06 GB) went out, both candidates held the owner's head, and no write became
 >     durable.

@@ -1215,8 +1215,11 @@ fn diagnosis(instances: &[String], volume: &str) -> String {
         .lines()
         .filter(|line| {
           line.starts_with("fleet_session ")
+            || line.starts_with("fleet_members")
             || line.contains(" live ")
             || line.contains("fleet.live.")
+            || line.contains("fleet.takeover")
+            || line.contains("fleet.materialize")
             || line.contains("lent_to")
         })
         .collect();
@@ -2921,6 +2924,11 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
     pause();
   };
   let Some(adopted_by) = adopted_by else {
+    let live: Vec<String> = survivors.iter().map(|survivor| (*survivor).to_owned()).collect();
+    verdict.note(format!(
+      "no survivor adopted the registers; the survivors:\n{}",
+      diagnosis(&live, &volume)
+    ));
     verdict.check(
       "the registers' takeover",
       vec!["no survivor adopted the volume's registers within the fleet wait".to_owned()],
@@ -2985,10 +2993,17 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
         fenced_at_or_above(&survivors, &volume, epoch),
       );
     }
-    None => verdict.check(
-      "a takeover once the holder answers",
-      vec!["no survivor served the volume within the fleet wait".to_owned()],
-    ),
+    None => {
+      let live: Vec<String> = survivors.iter().map(|survivor| (*survivor).to_owned()).collect();
+      verdict.note(format!(
+        "no survivor served the volume; the survivors:\n{}",
+        diagnosis(&live, &volume)
+      ));
+      verdict.check(
+        "a takeover once the holder answers",
+        vec!["no survivor served the volume within the fleet wait".to_owned()],
+      );
+    }
   }
   drop(fleet);
   verdict.judge();
