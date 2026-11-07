@@ -1,0 +1,55 @@
+test a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet ... slates anchor: instance chaos-rejoins-a-25248 up; daemon pid 25535; 2 shards
+slates daemon: fleet_sessions_per_plane = 843: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 123833: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 34797073: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 2253: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: instance chaos-rejoins-a-25248 serving on 2 shards under the anchor
+slates anchor: instance chaos-rejoins-b-25248 up; daemon pid 25563; 2 shards
+slates daemon: fleet_sessions_per_plane = 843: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 123833: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 34797073: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 2253: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: instance chaos-rejoins-b-25248 serving on 2 shards under the anchor
+slates anchor: instance chaos-rejoins-c-25248 up; daemon pid 25597; 2 shards
+slates daemon: fleet_sessions_per_plane = 843: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 123833: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 34797073: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 2253: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: instance chaos-rejoins-c-25248 serving on 2 shards under the anchor
+chaos: fleet rejoins (Anchored) formed and settled: hosts ["8037076695113518549", "12736259248236858666", "3057700664692240063"]
+slates daemon: fleet_sessions_per_plane = 843: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 123833: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 34797073: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 2253: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: instance chaos-rejoins-b-25248 serving on 2 shards under the anchor
+rejoins: successor daemon 25656 answered after 108.863583ms
+rejoins --- chaos-rejoins-a-25248
+fleet_members: 3057700664692240063 8037076695113518549 12736259248236858666
+fleet_peers_probed: 2
+fleet_sessions_refused: 0
+fleet_session 3057700664692240063: lent=false cwnd=18360 srtt_ns=807963 pto_ns=2821123 spurious_losses=0 persistent_collapses=0 consumed=4711 mtu=9209
+fleet_session 12736259248236858666: lent=false cwnd=18360 srtt_ns=753106 pto_ns=2430858 spurious_losses=0 persistent_collapses=0 consumed=1761 mtu=9209
+shard 0 refused fleet.plane.announce_lends: 6
+shard 0 refused fleet.plane.announcements_sent: 6
+shard 0 refused fleet.plane.epoch_unanswered: 1
+shard 0 refused fleet.plane.peer_reconnected: 4
+shard 0 refused fleet.plane.peer_redialed: 1
+rejoins --- chaos-rejoins-b-25248
+fleet_members: 3057700664692240063 8037076695113518549 12736259248236858666
+fleet_peers_probed: 1
+fleet_sessions_refused: 0
+fleet_session 3057700664692240063: lent=false cwnd=18360 srtt_ns=658026 pto_ns=1709442 spurious_losses=0 persistent_collapses=0 consumed=4913 mtu=9209
+fleet_session 8037076695113518549: lent=false cwnd=18360 srtt_ns=630941 pto_ns=1630941 spurious_losses=0 persistent_collapses=0 consumed=4913 mtu=9209
+shard 0 refused fleet.plane.announce_lends: 4
+shard 0 refused fleet.plane.announcements_sent: 4
+rejoins --- chaos-rejoins-c-25248
+fleet_members: 3057700664692240063 8037076695113518549 12736259248236858666
+fleet_peers_probed: 2
+fleet_sessions_refused: 0
+fleet_session 8037076695113518549: lent=false cwnd=18360 srtt_ns=735758 pto_ns=2778406 spurious_losses=0 persistent_collapses=0 consumed=34515 mtu=9209
+fleet_session 12736259248236858666: lent=true cwnd=18360 srtt_ns=684481 pto_ns=2125973 spurious_losses=0 persistent_collapses=0 consumed=3473 mtu=9209
+shard 0 refused fleet.plane.announce_lends: 5
+shard 0 refused fleet.plane.announcements_sent: 5
+shard 0 refused fleet.plane.peer_reconnected: 3
+thread 'a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet' (53947) panicked at crates/cli/tests/live_chaos.rs:2593:7:
+    a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet
