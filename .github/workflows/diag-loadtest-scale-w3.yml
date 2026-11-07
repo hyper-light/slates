@@ -1,0 +1,81 @@
+name: DIAG loadtest-scale W3 (A-238) and the retry hold -- the forwarded resend after and with its hold reverted, on both Linux runners (not for main)
+
+# This commit's parent on ubuntu-latest and ubuntu-24.04-arm (after), and four variants of it on ubuntu-latest, each
+# with one fix reverted in place before the build (before-*), running the test that holds it. Results are published as
+# one commit per job on diag-loadtest-scale-w3-results-<run>-<job>, read with git.
+
+on:
+  push:
+    branches: ['diag-loadtest-scale-w3-[0-9]*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  w3:
+    name: ${{ matrix.variant }} on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { variant: after, os: ubuntu-latest }
+          - { variant: after, os: ubuntu-24.04-arm }
+          - { variant: before-retry, os: ubuntu-latest }
+          - { variant: before-retry, os: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      RESULTS_BRANCH: diag-loadtest-scale-w3-results-${{ github.run_id }}-${{ matrix.variant }}-${{ matrix.os }}
+      VARIANT: ${{ matrix.variant }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.variant }}
+      - name: suites
+        shell: bash
+        run: |
+          set -u +e +o pipefail
+          out="$RUNNER_TEMP/results.txt"; : > "$out"
+          step() { name=$1; shift; start=$(date +%s); "$@" > "$RUNNER_TEMP/$name.log" 2>&1; code=$?
+            echo "$name exit $code $(( $(date +%s) - start ))s" >> "$out"
+            grep -E '^test result|FAILED|panicked|^error|left:|right:|assertion|refused|head reached|partition snapshot|meets|unknown|released|did not hold|outlived|once the floor|---- ' "$RUNNER_TEMP/$name.log" | head -80 | sed "s/^/  $name: /" >> "$out"; }
+          echo "tested $(git rev-parse HEAD^) variant $VARIANT on $(uname -m), $(nproc) cpus" >> "$out"
+          revert() { perl -0pi -e "$2" "$1"; if git diff --quiet -- "$1"; then echo "REVERT DID NOT APPLY to $1" >> "$out"; else git diff --stat -- "$1" | sed 's/^/  reverted: /' >> "$out"; fi; }
+          case "$VARIANT" in
+            after)
+              step fleet cargo test -p slates-server --test fleet --no-fail-fast -- a_forwarded_submit_refused_overloaded --nocapture
+              ;;
+            before-typed)
+              revert crates/server/src/error.rs 's/DbError::Capacity \{ table \} => Refusal::TableAtCapacity \{\s*table: \(\*table\)\.to_owned\(\),\s*\},/DbError::Capacity { table } => Refusal::BadRequest { reason: format!("{table} at capacity") },/s'
+              step capacity cargo test -p slates-server --test green_checkpoint -- a_chain_held_by_a_reader --nocapture
+              ;;
+            before-forced)
+              revert crates/server/src/verbs.rs 's/  if let Err\(slates_db::DbError::Capacity \{ \.\. \}\) = state\.db\.partition\(\)\.check\(record, now\) \{.*?\n  \}\n//s'
+              step capacity cargo test -p slates-server --test green_checkpoint -- a_chain_held_by_a_reader --nocapture
+              ;;
+            before-read)
+              revert crates/server/src/merge_service.rs 's/if version > engine\.head\(\) \|\| version < engine\.folded_below\(\) \{/if version > engine.head() {/'
+              step recovered cargo test -p slates-server --test green_checkpoint -- a_green_recovered_after --nocapture
+              ;;
+            before-retry)
+              revert crates/client/src/client.rs 's/let held_for_retry = by_word\n/let held_for_retry = false \&\& by_word\n/'
+              step resend cargo test -p slates-server --test fleet -- a_forwarded_submit_refused_overloaded --nocapture
+              ;;
+          esac
+          git checkout -- . 2>/dev/null
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          blob=$(git hash-object -w "$out")
+          tree=$(printf '100644 blob %s\tresults.txt\n' "$blob" | git mktree)
+          commit=$(git commit-tree "$tree" -m "w3 results of run $GITHUB_RUN_ID, $VARIANT on ${{ matrix.os }}")
+          git push origin "$commit:refs/heads/$RESULTS_BRANCH" || echo "::warning::could not publish the results"
