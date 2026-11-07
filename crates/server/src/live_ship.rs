@@ -124,13 +124,20 @@ struct LivePublication {
   runs: Vec<LiveRun>,
 }
 
-/// A sealed body: the sealed chunk's keyed name and bytes (`slates_cluster::sealed`), and on a whole entry the volume's
-/// lineage key wrapped for each neighbour (the `sealing` a head carries, A-92 piece 4c), so a successor can open the log
-/// whether or not the volume ever sealed a snapshot.
+/// A sealed body: its pieces, each a sealed chunk's keyed name and bytes (`slates_cluster::sealed`), and on a whole entry
+/// the volume's lineage key wrapped for each neighbour (the `sealing` a head carries, A-92 piece 4c), so a successor can
+/// open the log whether or not the volume ever sealed a snapshot.
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 struct SealedBody {
   /// The lineage key for successors, on a whole entry.
   sealing: Option<crate::head::HeadSealing>,
+  /// The body's pieces in order ([`seal_body`]).
+  pieces: Vec<SealedPiece>,
+}
+
+/// One piece of a sealed body: a sealed chunk of at most an archive chunk's bytes.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+struct SealedPiece {
   /// The keyed name.
   name: Vec<u8>,
   /// The sealed bytes.
@@ -866,9 +873,8 @@ fn payload(
   let account = crate::seal_keys::tenant_of(&state.db.partition().volume(id)?.owner);
   let lineage = crate::seal_keys::lineage(state, id, account).ok()?;
   let namer = crate::seal_keys::namer(state, id, account).ok()?;
-  let chunk = slates_archive::Archive::raw_chunk(body);
   let segment = u32::try_from(state.config.page).ok()?;
-  let sealed = slates_cluster::sealed::seal_chunk(&lineage, &namer, &chunk, segment).ok()?;
+  let pieces = seal_body(&lineage, &namer, body, segment)?;
   let sealing = if whole {
     let owner = state.db.partition().volume(id)?.owner.clone();
     crate::seal_keys::head_sealing(state, id, &owner)
@@ -876,14 +882,7 @@ fn payload(
     None
   };
   let mut payload = vec![kind, BODY_SEALED];
-  payload.extend_from_slice(
-    &SealedBody {
-      sealing,
-      name: sealed.name.to_vec(),
-      bytes: sealed.bytes,
-    }
-    .to_bytes(),
-  );
+  payload.extend_from_slice(&SealedBody { sealing, pieces }.to_bytes());
   Some(payload)
 }
 
@@ -1714,6 +1713,56 @@ fn rebuild(
   archive_of(&image, &runs, ObjectId(id.bytes).local(), state.config.page)
 }
 
+/// A publication's body sealed under the volume's lineage key, in pieces of at most an archive chunk's bytes
+/// (`slates_archive::format::MAX_CHUNK_BYTES`, 1 MiB), since no chunk opens past it (`Archive::content`). Sealed as one
+/// chunk, a body past it sealed and shipped but never opened: a whole record carries the volume's content, so a live
+/// volume holding more than 1 MiB could not be taken over (KIND runs 42326682216 and 42331191530: every refusal
+/// `fleet.live.takeover_refused.open`, a 1,000-write volume never served).
+fn seal_body(
+  lineage: &hyper_seal::keys::WrappingKey,
+  namer: &hyper_seal::name::Namer,
+  body: Vec<u8>,
+  segment: u32,
+) -> Option<Vec<SealedPiece>> {
+  let cap = usize::try_from(slates_archive::format::MAX_CHUNK_BYTES).ok()?;
+  body
+    .chunks(cap.max(1))
+    .map(|piece| {
+      let chunk = slates_archive::Archive::raw_chunk(piece.to_vec());
+      let sealed = slates_cluster::sealed::seal_chunk(lineage, namer, &chunk, segment).ok()?;
+      Some(SealedPiece {
+        name: sealed.name.to_vec(),
+        bytes: sealed.bytes,
+      })
+    })
+    .collect()
+}
+
+/// A body [`seal_body`] sealed, opened piece by piece and joined: the publication's bytes. `None` when any piece will
+/// not open, or there are none.
+fn open_body(
+  lineage: &hyper_seal::keys::WrappingKey,
+  namer: &hyper_seal::name::Namer,
+  pieces: Vec<SealedPiece>,
+) -> Option<Vec<u8>> {
+  if pieces.is_empty() {
+    return None;
+  }
+  let mut body = Vec::new();
+  for piece in pieces {
+    let chunk = slates_cluster::sealed::SealedChunk {
+      name: piece.name.as_slice().try_into().ok()?,
+      bytes: piece.bytes,
+    };
+    body.extend_from_slice(
+      &slates_cluster::sealed::open_chunk(lineage, namer, &chunk)
+        .ok()?
+        .payload,
+    );
+  }
+  Some(body)
+}
+
 /// One payload's body, opened under the volume's lineage key when sealed.
 fn open_payload(
   state: &mut ShardState,
@@ -1727,13 +1776,7 @@ fn open_payload(
     let account = crate::seal_keys::tenant_of(owner);
     let lineage = crate::seal_keys::lineage(state, id, account).ok()?;
     let namer = crate::seal_keys::namer(state, id, account).ok()?;
-    let chunk = slates_cluster::sealed::SealedChunk {
-      name: sealed.name.as_slice().try_into().ok()?,
-      bytes: sealed.bytes,
-    };
-    slates_cluster::sealed::open_chunk(&lineage, &namer, &chunk)
-      .ok()?
-      .payload
+    open_body(&lineage, &namer, sealed.pieces)?
   } else {
     body.to_vec()
   };
@@ -1888,5 +1931,40 @@ fn meta_of(inode: &InodeImage) -> slates_archive::NodeMeta {
     uid: attrs.uid,
     gid: attrs.gid,
     xattrs: Vec::new(),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Format: the key generation the tests' keys carry.
+  const GENERATION: u32 = 1;
+  /// Shape: keys the tests may hold at once in the process's locked region (as `crates/cluster/tests/sealed.rs`).
+  const KEYS: usize = 256;
+
+  /// A-200 takeover of a live volume holding more than one chunk's worth: do seal publication bodies of sizes up to
+  /// and past an archive chunk's cap (`slates_archive::format::MAX_CHUNK_BYTES`, 1 MiB) and open each under the same
+  /// keys. Expect every body back byte for byte. A whole record carries the volume's content, so on KIND a 1,000-write
+  /// volume's could not be opened by its successor: every refusal was `fleet.live.takeover_refused.open` (runs
+  /// 42326682216, 42331191530), and the volume was never served.
+  #[test]
+  fn a_body_past_one_chunk_opens_as_it_was_sealed() {
+    // The process's locked key region may already be set by another test; that is the same region.
+    let _ = hyper_seal::lock_keys(KEYS);
+    let tenant = hyper_seal::keys::WrappingKey::generate(GENERATION).unwrap();
+    let (naming, _) = tenant.make_child().unwrap();
+    let namer = hyper_seal::name::Namer::new(&naming).unwrap();
+    let lineage = hyper_seal::keys::WrappingKey::generate(GENERATION).unwrap();
+    let cap = usize::try_from(slates_archive::format::MAX_CHUNK_BYTES).unwrap();
+    for len in [1, cap - 1, cap, cap + 1, 3 * cap + 17] {
+      let body: Vec<u8> = (0..len).map(|at| u8::try_from(at % 251).unwrap()).collect();
+      let pieces = seal_body(&lineage, &namer, body.clone(), 16_384).unwrap();
+      assert_eq!(
+        open_body(&lineage, &namer, pieces).as_ref(),
+        Some(&body),
+        "a body of {len} bytes opens as it was sealed"
+      );
+    }
   }
 }
