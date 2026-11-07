@@ -1,0 +1,93 @@
+name: DIAG the Windows landing writer on every runner (not for main)
+
+on:
+  push:
+    branches: ['diag-winfsp-bench-land-[0-9]*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  land:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest, kind: x64 }
+          - { runner: windows-11-arm, kind: arm64 }
+          - { runner: ubuntu-latest, kind: unix }
+          - { runner: macos-latest, kind: unix }
+    name: land on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64)
+        if: matrix.kind == 'x64'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64)
+        if: matrix.kind == 'arm64'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Run the legs, one at a time
+        shell: bash
+        env:
+          RESULTS_BRANCH: diag-winfsp-bench-land-results-${{ github.run_id }}-${{ matrix.runner }}
+        run: |
+          publish() {
+            git config user.name diag; git config user.email diag@invalid
+            tree=$(printf '100644 blob %s\tresults.txt\n' "$(git hash-object -w results.txt)" | git mktree)
+            commit=$(git commit-tree "$tree" -m "results of run $GITHUB_RUN_ID") || return 0
+            git push -f origin "$commit:refs/heads/$RESULTS_BRANCH" || echo "::warning::could not publish"
+          }
+          mkdir -p diag-logs
+          echo "$(git rev-parse HEAD) $RUNNER_OS $RUNNER_ARCH" > results.txt
+          leg() {
+            name=$1; shift
+            log="diag-logs/$name.log"
+            "$@" > "$log" 2>&1
+            code=$?
+            {
+              echo "=== $name: exit $code"
+              grep -aE '^(test result|error)' "$log" | cut -c1-200 | sort | uniq -c | head -30
+              grep -aE -A3 ' panicked at |^---- ' "$log" | cut -c1-400 | head -80
+            } >> results.txt
+            publish
+          }
+          leg clippy cargo clippy -p slates-land -p slates-base -p slates-server --all-targets --locked -- -D warnings
+          leg land cargo test -p slates-land --release --locked
+          leg base cargo test -p slates-base --locked
+          for run in 1 2 3; do
+            leg "os-again-$run" cargo test -p slates-land --release --locked --test os --test os_escape --test os_removal
+          done
+          leg server-lib cargo test -p slates-server --lib --locked -- --test-threads=1
+          leg server-verb cargo test -p slates-server --locked --test lease --test snapshot_landing --test landing_fairness -- --test-threads=1
+          leg client-presentation cargo test -p slates-client --locked --test presentation -- --test-threads=1
+          leg client-shards cargo test -p slates-client --locked --test shards -- --test-threads=1
+          if [ "$RUNNER_OS" = Linux ]; then
+            leg fmt cargo fmt --all --check
+            leg xtask cargo xtask check
+          fi
+          echo "=== end" >> results.txt
+          publish
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: land-${{ matrix.runner }}
+          path: diag-logs
