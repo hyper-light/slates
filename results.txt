@@ -1,0 +1,52 @@
+runner windows-latest, 4 CPUs, a2a9824 diag: liveness-11, the anchor crate A/B main 4326a9d8 vs 2810a612 x5 on , Sat Nov  7 07:50:22 UTC 2026
+== spinners: 8
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.02s
+FAILED
+thread 'a_crash_loop_is_restarted_after_a_doubling_backoff_never_given_up' (8104) panicked at crates\anchor\tests\anchor.rs:484:3:
+test result: FAILED. 13 passed; 1 failed; 5 ignored; 0 measured; 0 filtered out; finished in 12.35s
+== main run 1 exit 101
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.04s
+FAILED
+thread 'a_crash_loop_is_restarted_after_a_doubling_backoff_never_given_up' (2764) panicked at crates\anchor\tests\anchor.rs:484:3:
+test result: FAILED. 13 passed; 1 failed; 5 ignored; 0 measured; 0 filtered out; finished in 12.49s
+== branch run 1 exit 101
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.02s
+FAILED
+thread 'a_crash_loop_is_restarted_after_a_doubling_backoff_never_given_up' (8628) panicked at crates\anchor\tests\anchor.rs:484:3:
+test result: FAILED. 13 passed; 1 failed; 5 ignored; 0 measured; 0 filtered out; finished in 12.34s
+== main run 2 exit 101
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.07s
+FAILED
+thread 'a_crash_loop_is_restarted_after_a_doubling_backoff_never_given_up' (8720) panicked at crates\anchor\tests\anchor.rs:484:3:
+test result: FAILED. 13 passed; 1 failed; 5 ignored; 0 measured; 0 filtered out; finished in 12.31s
+== branch run 2 exit 101
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.26s
+FAILED
+thread 'a_crash_loop_is_restarted_after_a_doubling_backoff_never_given_up' (1204) panicked at crates\anchor\tests\anchor.rs:484:3:
+test result: FAILED. 13 passed; 1 failed; 5 ignored; 0 measured; 0 filtered out; finished in 13.05s
+== main run 3 exit 101
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.79s
+FAILED
+thread 'a_crash_loop_is_restarted_after_a_doubling_backoff_never_given_up' (1172) panicked at crates\anchor\tests\anchor.rs:484:3:
+test result: FAILED. 13 passed; 1 failed; 5 ignored; 0 measured; 0 filtered out; finished in 12.72s
+== branch run 3 exit 101
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.04s
+FAILED
+thread 'a_crash_loop_is_restarted_after_a_doubling_backoff_never_given_up' (504) panicked at crates\anchor\tests\anchor.rs:484:3:
+test result: FAILED. 13 passed; 1 failed; 5 ignored; 0 measured; 0 filtered out; finished in 12.45s
+== main run 4 exit 101
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.03s
+FAILED
+thread 'a_crash_loop_is_restarted_after_a_doubling_backoff_never_given_up' (6488) panicked at crates\anchor\tests\anchor.rs:484:3:
+test result: FAILED. 13 passed; 1 failed; 5 ignored; 0 measured; 0 filtered out; finished in 12.34s
+== branch run 4 exit 101
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.05s
+FAILED
+thread 'a_crash_loop_is_restarted_after_a_doubling_backoff_never_given_up' (5172) panicked at crates\anchor\tests\anchor.rs:484:3:
+test result: FAILED. 13 passed; 1 failed; 5 ignored; 0 measured; 0 filtered out; finished in 12.26s
+== main run 5 exit 101
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.00s
+FAILED
+thread 'a_crash_loop_is_restarted_after_a_doubling_backoff_never_given_up' (8972) panicked at crates\anchor\tests\anchor.rs:484:3:
+test result: FAILED. 13 passed; 1 failed; 5 ignored; 0 measured; 0 filtered out; finished in 12.34s
+== branch run 5 exit 101
