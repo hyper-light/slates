@@ -890,7 +890,13 @@
 >     placed at `f + 1`. Phase one counts `f + 1` among those holders alone, and waits typed when too few answer.
 >   - The model passes 0 broken of 400 seeds. The process flow is
 >     `a_member_that_never_held_the_log_never_stands_in_for_its_holder` (five nodes).
->   - Owed: the KIND `ceiling` leg re-run on the fix.
+>   - KIND run 42365340676 passed all four profiles end to end with A-240 and the two-step fetch: every write
+    acknowledged, every volume taken over whole at epoch 2 (unshaped 2.5 s, wan and wan-loss 16.9 s, ceiling 57.2 s).
+  - Process red-check, CI, 13 runs a side: the mutation (counting the current placement) left a holder at fence 1 in 4.
+    A-240 left none, and lost no write.
+  - Open: the holder set changing under a live log (joint transition and activation, with live-fixes and raft); a
+    successor outside the holders cannot open the log (`takeover_refused.open`); and a refused rebuild refetches the
+    log every period (backoff owed, raft-chaos).
 >
 > Touched: `crates/server/src/{live_ship,verbs,fleet}.rs` (the destroy's wait; the successor's routing at a
 > tombstone's retirement; A-240's holder record and phase-one count), `crates/db/src/{live,catalog,op,partition}.rs`
