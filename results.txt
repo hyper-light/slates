@@ -1,0 +1,307 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 10:12:46 UTC 2026, arm B d722740bd57df8d1b61d58375c7f0e9b86f6f7a5
+== quiet round 1 arm a at 10:12:46, load 1.74 2.56 1.51
+  plain p50 62.0 p99 107.2 p999 126.2 max 142.0 us
+  live  p50 414.6 p99 519.5 p999 629.0 max 851.1 us
+  added at p50 352.6 us; live log at the end Some(("2050", "2050", "false")); late 0; (no_session, unanswered, link_lost) (1, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 3.09s
+chaos writes on a quiet fleet: chaos-quiet-a-10510 refused the owner: {}
+chaos writes on a quiet fleet: chaos-quiet-b-10510 refused the owner: {}
+chaos writes on a quiet fleet: chaos-quiet-c-10510 refused the owner: {}
+  13232 writes, 13232 acknowledged: p50 566 us, p99 3503 us, p999 19594 us, max 165624 us; 3 over 50ms (sent+took): 0.00s+166ms 2.25s+78ms 3.22s+75ms
+  chaos-quiet-a-10510 refused the owner: {}
+  chaos-quiet-b-10510 refused the owner: {}
+  chaos-quiet-c-10510 refused the owner: {}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 12.67s
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-11565 partitioned from 228.684926ms to 2.228970478s, caught up after Some(378.810267ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-11565 partitioned from 2.671684913s to 4.671804532s, caught up after Some(440.350619ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-11565 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-11565 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-11565 refused the owner: {}
+  chaos-rolling-b-11565 partitioned from 228.684926ms to 2.228970478s, caught up after Some(378.810267ms)
+  chaos-rolling-c-11565 partitioned from 2.671684913s to 4.671804532s, caught up after Some(440.350619ms)
+  4925 writes, 4925 acknowledged: p50 428 us, p99 3284 us, p999 115533 us, max 186970 us; 12 over 50ms (sent+took): 0.00s+172ms 2.50s+59ms 3.67s+116ms 3.79s+60ms 3.89s+72ms 4.21s+50ms 4.26s+160ms 4.42s+149ms 4.57s+89ms 4.66s+75ms 4.73s+187ms 4.92s+57ms
+  chaos-rolling-a-11565 refused the owner: {}
+  chaos-rolling-b-11565 refused the owner: {}
+  chaos-rolling-c-11565 refused the owner: {}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 6.46s
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-11850 partitioned from 193.658948ms to 2.193870275s, caught up after Some(270.76464ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-11850 partitioned from 2.530956473s to 4.531088317s, caught up after Some(336.294064ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-11850 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-11850 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-11850 refused the owner: {}
+  chaos-rolling-a-11850 partitioned from 193.658948ms to 2.193870275s, caught up after Some(270.76464ms)
+  chaos-rolling-b-11850 partitioned from 2.530956473s to 4.531088317s, caught up after Some(336.294064ms)
+  4588 writes, 4588 acknowledged: p50 465 us, p99 3760 us, p999 87416 us, max 207650 us; 16 over 50ms (sent+took): 0.00s+139ms 2.14s+53ms 2.20s+208ms 3.53s+95ms 3.63s+86ms 3.71s+83ms 3.79s+86ms 3.88s+83ms 3.96s+82ms 4.05s+83ms 4.13s+83ms 4.21s+83ms 4.30s+84ms 4.38s+87ms 4.47s+192ms 4.66s+59ms
+  chaos-rolling-c-11850 refused the owner: {}
+  chaos-rolling-a-11850 refused the owner: {}
+  chaos-rolling-b-11850 refused the owner: {}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 6.37s
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-12117 partitioned from 171.27826ms to 2.171384086s, caught up after Some(384.327076ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-12117 partitioned from 2.612598279s to 4.61271721s, caught up after Some(533.183943ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-12117 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-12117 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-12117 refused the owner: {}
+  chaos-rolling-a-12117 partitioned from 171.27826ms to 2.171384086s, caught up after Some(384.327076ms)
+  chaos-rolling-b-12117 partitioned from 2.612598279s to 4.61271721s, caught up after Some(533.183943ms)
+  7753 writes, 7753 acknowledged: p50 372 us, p99 1527 us, p999 160110 us, max 270222 us; 13 over 50ms (sent+took): 0.00s+134ms 0.17s+173ms 2.15s+87ms 2.35s+132ms 3.21s+62ms 3.61s+270ms 3.88s+160ms 4.04s+161ms 4.20s+162ms 4.37s+162ms 4.53s+164ms 4.69s+170ms 4.86s+96ms
+  chaos-rolling-c-12117 refused the owner: {}
+  chaos-rolling-a-12117 refused the owner: {}
+  chaos-rolling-b-12117 refused the owner: {}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 6.73s
+== quiet round 1 arm a exit 0
+== quiet round 1 arm b at 10:13:22, load 2.38 2.65 1.58
+  plain p50 76.1 p99 113.8 p999 144.0 max 196.6 us
+  live  p50 394.2 p99 527.7 p999 644.6 max 816.8 us
+  added at p50 318.0 us; live log at the end Some(("2050", "2050", "false")); late 0; (no_session, unanswered, link_lost) (0, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 2.98s
+chaos writes on a quiet fleet: chaos-quiet-a-12644 refused the owner: {}
+chaos writes on a quiet fleet: chaos-quiet-b-12644 refused the owner: {"fleet.live.hold_refused.behind": 557}
+chaos writes on a quiet fleet: chaos-quiet-c-12644 refused the owner: {"fleet.live.hold_refused.behind": 1}
+  11361 writes, 11361 acknowledged: p50 510 us, p99 3990 us, p999 49410 us, max 280072 us; 11 over 50ms (sent+took): 0.00s+162ms 1.96s+70ms 3.00s+50ms 4.08s+54ms 5.19s+280ms 5.61s+211ms 6.00s+213ms 6.41s+219ms 6.84s+227ms 7.57s+233ms 8.28s+271ms
+  chaos-quiet-a-12644 refused the owner: {}
+  chaos-quiet-b-12644 refused the owner: {"fleet.live.hold_refused.behind": 557}
+  chaos-quiet-c-12644 refused the owner: {"fleet.live.hold_refused.behind": 1}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 12.35s
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-13463 partitioned from 193.24236ms to 2.193369581s, caught up after Some(318.369863ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-13463 partitioned from 2.543106341s to 4.543222137s, caught up after Some(411.953281ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-13463 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-13463 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-13463 refused the owner: {"fleet.live.hold_refused.behind": 123}
+  chaos-rolling-a-13463 partitioned from 193.24236ms to 2.193369581s, caught up after Some(318.369863ms)
+  chaos-rolling-b-13463 partitioned from 2.543106341s to 4.543222137s, caught up after Some(411.953281ms)
+  5909 writes, 5909 acknowledged: p50 321 us, p99 2979 us, p999 95471 us, max 187417 us; 18 over 50ms (sent+took): 0.00s+152ms 2.22s+60ms 3.54s+181ms 3.72s+65ms 3.79s+66ms 3.86s+95ms 3.95s+65ms 4.02s+64ms 4.08s+63ms 4.14s+65ms 4.21s+65ms 4.27s+64ms 4.34s+64ms 4.40s+64ms 4.47s+99ms 4.61s+124ms 4.74s+52ms 4.95s+187ms
+  chaos-rolling-c-13463 refused the owner: {}
+  chaos-rolling-a-13463 refused the owner: {}
+  chaos-rolling-b-13463 refused the owner: {"fleet.live.hold_refused.behind": 123}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 7.13s
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-13762 partitioned from 170.755767ms to 2.17087189s, caught up after Some(499.57116ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-13762 partitioned from 2.914689997s to 4.914800692s, caught up after Some(661.925593ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-13762 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-13762 refused the owner: {"fleet.live.hold_refused.behind": 82}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-13762 refused the owner: {"fleet.live.hold_refused.behind": 289}
+  chaos-rolling-b-13762 partitioned from 170.755767ms to 2.17087189s, caught up after Some(499.57116ms)
+  chaos-rolling-c-13762 partitioned from 2.914689997s to 4.914800692s, caught up after Some(661.925593ms)
+  9597 writes, 9597 acknowledged: p50 314 us, p99 1191 us, p999 57172 us, max 459079 us; 10 over 50ms (sent+took): 0.00s+146ms 2.18s+132ms 2.34s+187ms 2.68s+181ms 2.91s+57ms 3.91s+459ms 4.37s+274ms 4.65s+412ms 5.06s+282ms 5.60s+302ms
+  chaos-rolling-a-13762 refused the owner: {}
+  chaos-rolling-b-13762 refused the owner: {"fleet.live.hold_refused.behind": 82}
+  chaos-rolling-c-13762 refused the owner: {"fleet.live.hold_refused.behind": 289}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 9.62s
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-14189 partitioned from 143.439956ms to 2.143563641s, caught up after Some(539.163129ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-14189 partitioned from 2.715960617s to 4.716071659s, caught up after Some(247.734299ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-14189 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-14189 refused the owner: {"fleet.live.hold_refused.behind": 150, "fleet.live.hold_refused.not_a_candidate": 13}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-14189 refused the owner: {}
+  chaos-rolling-a-14189 partitioned from 143.439956ms to 2.143563641s, caught up after Some(539.163129ms)
+  chaos-rolling-c-14189 partitioned from 2.715960617s to 4.716071659s, caught up after Some(247.734299ms)
+  no write waited for the stopped candidate: 1 violations
+  3670 writes, 3670 acknowledged: p50 333 us, p99 6819 us, p999 72282 us, max 2221600 us; 7 over 50ms (sent+took): 0.00s+122ms 1.14s+72ms 2.06s+60ms 2.12s+57ms 2.50s+86ms 2.58s+54ms 2.74s+2222ms
+  chaos-rolling-b-14189 refused the owner: {}
+  chaos-rolling-a-14189 refused the owner: {"fleet.live.hold_refused.behind": 150, "fleet.live.hold_refused.not_a_candidate": 13}
+  chaos-rolling-c-14189 refused the owner: {}
+thread 'candidates_partitioned_in_turn_mid_stream_lose_nothing' (14190) panicked at crates/cli/tests/live_chaos.rs:990:5:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 7.27s
+== quiet round 1 arm b exit 101
+== quiet round 2 arm b at 10:14:02, load 2.49 2.65 1.63
+  plain p50 55.1 p99 106.0 p999 121.4 max 138.2 us
+  live  p50 400.1 p99 551.0 p999 673.8 max 698.6 us
+  added at p50 345.0 us; live log at the end Some(("2050", "2050", "false")); late 0; (no_session, unanswered, link_lost) (2, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 2.16s
+chaos writes on a quiet fleet: chaos-quiet-a-14744 refused the owner: {}
+chaos writes on a quiet fleet: chaos-quiet-b-14744 refused the owner: {"fleet.live.hold_refused.behind": 248}
+chaos writes on a quiet fleet: chaos-quiet-c-14744 refused the owner: {"fleet.live.hold_refused.behind": 1}
+  11590 writes, 11590 acknowledged: p50 522 us, p99 3482 us, p999 27356 us, max 408213 us; 7 over 50ms (sent+took): 0.00s+170ms 2.28s+80ms 2.38s+75ms 6.47s+295ms 6.98s+332ms 7.52s+312ms 9.52s+408ms
+  chaos-quiet-a-14744 refused the owner: {}
+  chaos-quiet-b-14744 refused the owner: {"fleet.live.hold_refused.behind": 248}
+  chaos-quiet-c-14744 refused the owner: {"fleet.live.hold_refused.behind": 1}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 12.51s
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-15692 partitioned from 197.8827ms to 2.198014801s, caught up after Some(324.99818ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-15692 partitioned from 2.577677578s to 4.577900238s, caught up after Some(450.887889ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-15692 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-15692 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-15692 refused the owner: {"fleet.live.hold_refused.behind": 97}
+  chaos-rolling-a-15692 partitioned from 197.8827ms to 2.198014801s, caught up after Some(324.99818ms)
+  chaos-rolling-b-15692 partitioned from 2.577677578s to 4.577900238s, caught up after Some(450.887889ms)
+  4452 writes, 4452 acknowledged: p50 371 us, p99 8927 us, p999 52047 us, max 142231 us; 5 over 50ms (sent+took): 0.00s+142ms 2.22s+52ms 2.41s+59ms 4.25s+131ms 4.88s+53ms
+  chaos-rolling-c-15692 refused the owner: {}
+  chaos-rolling-a-15692 refused the owner: {}
+  chaos-rolling-b-15692 refused the owner: {"fleet.live.hold_refused.behind": 97}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 6.52s
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-15986 partitioned from 145.885326ms to 2.14601237s, caught up after Some(328.943208ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-15986 partitioned from 2.512080547s to 4.512184589s, caught up after Some(262.50282ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-15986 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-15986 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 11}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-15986 refused the owner: {}
+  chaos-rolling-a-15986 partitioned from 145.885326ms to 2.14601237s, caught up after Some(328.943208ms)
+  chaos-rolling-c-15986 partitioned from 2.512080547s to 4.512184589s, caught up after Some(262.50282ms)
+  no write waited for the stopped candidate: 1 violations
+  2707 writes, 2707 acknowledged: p50 453 us, p99 5139 us, p999 81520 us, max 2258142 us; 5 over 50ms (sent+took): 0.00s+103ms 1.15s+56ms 2.09s+52ms 2.15s+82ms 2.51s+2258ms
+  chaos-rolling-b-15986 refused the owner: {}
+  chaos-rolling-a-15986 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 11}
+  chaos-rolling-c-15986 refused the owner: {}
+thread 'candidates_partitioned_in_turn_mid_stream_lose_nothing' (15987) panicked at crates/cli/tests/live_chaos.rs:990:5:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 7.99s
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-16417 partitioned from 172.237514ms to 2.172378287s, caught up after Some(407.958956ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-16417 partitioned from 2.620525285s to 4.620694411s, caught up after Some(780.294989ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-16417 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-16417 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-16417 refused the owner: {"fleet.live.hold_refused.behind": 172}
+  chaos-rolling-a-16417 partitioned from 172.237514ms to 2.172378287s, caught up after Some(407.958956ms)
+  chaos-rolling-b-16417 partitioned from 2.620525285s to 4.620694411s, caught up after Some(780.294989ms)
+  7754 writes, 7754 acknowledged: p50 390 us, p99 3984 us, p999 65271 us, max 204197 us; 9 over 50ms (sent+took): 0.00s+123ms 0.17s+160ms 2.25s+92ms 2.35s+137ms 3.31s+86ms 3.62s+89ms 4.46s+65ms 4.75s+55ms 5.00s+204ms
+  chaos-rolling-c-16417 refused the owner: {}
+  chaos-rolling-a-16417 refused the owner: {}
+  chaos-rolling-b-16417 refused the owner: {"fleet.live.hold_refused.behind": 172}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 7.74s
+== quiet round 2 arm b exit 101
+== quiet round 2 arm a at 10:14:40, load 2.02 2.53 1.63
+  plain p50 45.8 p99 86.4 p999 105.6 max 109.4 us
+  live  p50 430.6 p99 527.9 p999 670.1 max 906.3 us
+  added at p50 384.8 us; live log at the end Some(("2050", "2050", "false")); late 0; (no_session, unanswered, link_lost) (1, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 2.20s
+chaos writes on a quiet fleet: chaos-quiet-b-16982 refused the owner: {}
+chaos writes on a quiet fleet: chaos-quiet-a-16982 refused the owner: {}
+chaos writes on a quiet fleet: chaos-quiet-c-16982 refused the owner: {}
+  16445 writes, 16445 acknowledged: p50 452 us, p99 3069 us, p999 9567 us, max 113732 us; 5 over 50ms (sent+took): 0.00s+114ms 1.22s+51ms 2.22s+56ms 6.38s+93ms 7.43s+79ms
+  chaos-quiet-b-16982 refused the owner: {}
+  chaos-quiet-a-16982 refused the owner: {}
+  chaos-quiet-c-16982 refused the owner: {}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 12.73s
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-18115 partitioned from 153.248353ms to 2.153371979s, caught up after Some(1.056328621s)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-18115 partitioned from 3.339838301s to 5.339963239s, caught up after Some(3.936281736s)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-18115 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-18115 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 8}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-18115 refused the owner: {}
+  chaos-rolling-a-18115 partitioned from 153.248353ms to 2.153371979s, caught up after Some(1.056328621s)
+  chaos-rolling-c-18115 partitioned from 3.339838301s to 5.339963239s, caught up after Some(3.936281736s)
+  each healed candidate caught up within the bound: 1 violations
+  8352 writes, 8352 acknowledged: p50 398 us, p99 7293 us, p999 29949 us, max 405808 us; 7 over 50ms (sent+took): 0.00s+106ms 0.15s+161ms 2.02s+80ms 2.31s+138ms 3.07s+73ms 3.14s+77ms 3.34s+406ms
+  chaos-rolling-b-18115 refused the owner: {}
+  chaos-rolling-a-18115 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 8}
+  chaos-rolling-c-18115 refused the owner: {}
+thread 'candidates_partitioned_in_turn_mid_stream_lose_nothing' (18116) panicked at crates/cli/tests/live_chaos.rs:990:5:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 12.12s
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-18956 partitioned from 166.723198ms to 2.166836526s, caught up after Some(329.676418ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-18956 partitioned from 2.531711693s to 4.531841793s, caught up after Some(560.367685ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-18956 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-18956 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-18956 refused the owner: {}
+  chaos-rolling-a-18956 partitioned from 166.723198ms to 2.166836526s, caught up after Some(329.676418ms)
+  chaos-rolling-b-18956 partitioned from 2.531711693s to 4.531841793s, caught up after Some(560.367685ms)
+  5309 writes, 5309 acknowledged: p50 378 us, p99 12930 us, p999 64815 us, max 123113 us; 6 over 50ms (sent+took): 0.00s+123ms 3.53s+85ms 4.43s+91ms 4.53s+78ms 4.60s+78ms 4.73s+65ms
+  chaos-rolling-c-18956 refused the owner: {}
+  chaos-rolling-a-18956 refused the owner: {}
+  chaos-rolling-b-18956 refused the owner: {}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 7.52s
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-19336 partitioned from 195.146681ms to 2.195252561s, caught up after Some(406.021215ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-19336 partitioned from 2.64128168s to 4.641381776s, caught up after Some(674.081213ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-19336 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-19336 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-19336 refused the owner: {}
+  chaos-rolling-a-19336 partitioned from 195.146681ms to 2.195252561s, caught up after Some(406.021215ms)
+  chaos-rolling-b-19336 partitioned from 2.64128168s to 4.641381776s, caught up after Some(674.081213ms)
+  8065 writes, 8065 acknowledged: p50 355 us, p99 1511 us, p999 68855 us, max 523572 us; 10 over 50ms (sent+took): 0.00s+160ms 0.19s+175ms 2.06s+56ms 2.38s+135ms 3.13s+69ms 3.64s+524ms 4.17s+232ms 4.40s+233ms 4.63s+294ms 4.92s+188ms
+  chaos-rolling-c-19336 refused the owner: {}
+  chaos-rolling-a-19336 refused the owner: {}
+  chaos-rolling-b-19336 refused the owner: {}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 7.10s
+== quiet round 2 arm a exit 101
+== quiet round 3 arm a at 10:15:22, load 2.44 2.56 1.68
+  plain p50 74.0 p99 114.0 p999 121.1 max 127.2 us
+  live  p50 416.4 p99 538.2 p999 623.2 max 656.1 us
+  added at p50 342.3 us; live log at the end Some(("2050", "2050", "false")); late 0; (no_session, unanswered, link_lost) (1, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 3.04s
+chaos writes on a quiet fleet: chaos-quiet-a-19890 refused the owner: {}
+chaos writes on a quiet fleet: chaos-quiet-b-19890 refused the owner: {}
+chaos writes on a quiet fleet: chaos-quiet-c-19890 refused the owner: {}
+  11881 writes, 11881 acknowledged: p50 527 us, p99 4423 us, p999 21390 us, max 235912 us; 4 over 50ms (sent+took): 0.00s+159ms 2.18s+105ms 4.30s+52ms 5.37s+236ms
+  chaos-quiet-a-19890 refused the owner: {}
+  chaos-quiet-b-19890 refused the owner: {}
+  chaos-quiet-c-19890 refused the owner: {}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 12.93s
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-20975 partitioned from 236.338117ms to 2.23644187s, caught up after Some(200.055447ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-20975 partitioned from 2.46869306s to 4.468820017s, caught up after Some(410.904618ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-20975 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-20975 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-20975 refused the owner: {}
+  chaos-rolling-b-20975 partitioned from 236.338117ms to 2.23644187s, caught up after Some(200.055447ms)
+  chaos-rolling-c-20975 partitioned from 2.46869306s to 4.468820017s, caught up after Some(410.904618ms)
+  5509 writes, 5509 acknowledged: p50 352 us, p99 12375 us, p999 39928 us, max 190208 us; 5 over 50ms (sent+took): 0.00s+190ms 2.13s+116ms 2.25s+170ms 3.47s+88ms 4.24s+57ms
+  chaos-rolling-a-20975 refused the owner: {}
+  chaos-rolling-b-20975 refused the owner: {}
+  chaos-rolling-c-20975 refused the owner: {}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 6.14s
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-21252 partitioned from 172.341298ms to 2.172535176s, caught up after Some(305.140934ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-21252 partitioned from 2.536752124s to 4.536872446s, caught up after Some(482.668228ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-21252 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-21252 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-21252 refused the owner: {}
+  chaos-rolling-a-21252 partitioned from 172.341298ms to 2.172535176s, caught up after Some(305.140934ms)
+  chaos-rolling-b-21252 partitioned from 2.536752124s to 4.536872446s, caught up after Some(482.668228ms)
+  5132 writes, 5132 acknowledged: p50 412 us, p99 11833 us, p999 48808 us, max 121444 us; 4 over 50ms (sent+took): 0.01s+121ms 2.37s+66ms 3.54s+76ms 4.24s+78ms
+  chaos-rolling-c-21252 refused the owner: {}
+  chaos-rolling-a-21252 refused the owner: {}
+  chaos-rolling-b-21252 refused the owner: {}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 6.38s
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-21542 partitioned from 172.603814ms to 2.172776861s, caught up after Some(387.837442ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-21542 partitioned from 2.600793848s to 4.600953286s, caught up after Some(476.368196ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-21542 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-21542 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-21542 refused the owner: {}
+  chaos-rolling-a-21542 partitioned from 172.603814ms to 2.172776861s, caught up after Some(387.837442ms)
+  chaos-rolling-c-21542 partitioned from 2.600793848s to 4.600953286s, caught up after Some(476.368196ms)
+  7344 writes, 7344 acknowledged: p50 401 us, p99 12367 us, p999 57229 us, max 159420 us; 8 over 50ms (sent+took): 0.00s+119ms 0.17s+159ms 2.13s+79ms 2.33s+139ms 3.18s+57ms 3.60s+150ms 4.32s+65ms 4.38s+59ms
+  chaos-rolling-b-21542 refused the owner: {}
+  chaos-rolling-a-21542 refused the owner: {}
+  chaos-rolling-c-21542 refused the owner: {}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 6.74s
+== quiet round 3 arm a exit 0
+== quiet round 3 arm b at 10:15:58, load 2.75 2.64 1.74
+  plain p50 44.3 p99 90.9 p999 109.2 max 115.7 us
+  live  p50 392.9 p99 474.4 p999 603.7 max 729.2 us
+  added at p50 348.6 us; live log at the end Some(("2050", "2050", "false")); late 0; (no_session, unanswered, link_lost) (2, 0, 0); live writes over 50 ms 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 2.02s
+chaos writes on a quiet fleet: chaos-quiet-c-21979 refused the owner: {}
+chaos writes on a quiet fleet: chaos-quiet-a-21979 refused the owner: {"fleet.live.hold_refused.behind": 1}
+chaos writes on a quiet fleet: chaos-quiet-b-21979 refused the owner: {}
+  3083 writes, 3083 acknowledged: p50 2918 us, p99 11324 us, p999 22718 us, max 150098 us; 1 over 50ms (sent+took): 0.00s+150ms
+  chaos-quiet-c-21979 refused the owner: {}
+  chaos-quiet-a-21979 refused the owner: {"fleet.live.hold_refused.behind": 1}
+  chaos-quiet-b-21979 refused the owner: {}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 11.56s
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-22778 partitioned from 240.749953ms to 2.240877203s, caught up after Some(902.634048ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-22778 partitioned from 3.459915336s to 5.460046548s, caught up after Some(650.911239ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-22778 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-22778 refused the owner: {"fleet.live.hold_refused.behind": 213, "fleet.live.hold_refused.not_a_candidate": 4}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-22778 refused the owner: {}
+  chaos-rolling-a-22778 partitioned from 240.749953ms to 2.240877203s, caught up after Some(902.634048ms)
+  chaos-rolling-c-22778 partitioned from 3.459915336s to 5.460046548s, caught up after Some(650.911239ms)
+  7510 writes, 7510 acknowledged: p50 380 us, p99 7162 us, p999 91424 us, max 269138 us; 10 over 50ms (sent+took): 0.00s+200ms 0.24s+269ms 2.20s+69ms 2.40s+117ms 3.14s+143ms 3.30s+70ms 3.46s+179ms 5.38s+114ms 5.49s+91ms 5.71s+210ms
+  chaos-rolling-b-22778 refused the owner: {}
+  chaos-rolling-a-22778 refused the owner: {"fleet.live.hold_refused.behind": 213, "fleet.live.hold_refused.not_a_candidate": 4}
+  chaos-rolling-c-22778 refused the owner: {}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 8.78s
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-23222 partitioned from 169.141853ms to 2.169236342s, caught up after Some(336.017368ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-23222 partitioned from 2.65983176s to 4.659933125s, caught up after Some(580.398923ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-23222 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-23222 refused the owner: {"fleet.live.hold_refused.behind": 48}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-23222 refused the owner: {"fleet.live.hold_refused.behind": 131}
+  chaos-rolling-b-23222 partitioned from 169.141853ms to 2.169236342s, caught up after Some(336.017368ms)
+  chaos-rolling-c-23222 partitioned from 2.65983176s to 4.659933125s, caught up after Some(580.398923ms)
+  7155 writes, 7155 acknowledged: p50 396 us, p99 2492 us, p999 128041 us, max 321732 us; 11 over 50ms (sent+took): 0.01s+130ms 0.17s+273ms 2.30s+111ms 2.50s+103ms 3.66s+194ms 3.85s+319ms 4.17s+215ms 4.39s+322ms 4.71s+222ms 4.93s+114ms 5.25s+128ms
+  chaos-rolling-a-23222 refused the owner: {}
+  chaos-rolling-b-23222 refused the owner: {"fleet.live.hold_refused.behind": 48}
+  chaos-rolling-c-23222 refused the owner: {"fleet.live.hold_refused.behind": 131}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 7.00s
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-23494 partitioned from 173.118434ms to 2.173224547s, caught up after Some(286.04103ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-23494 partitioned from 2.490606387s to 4.490737043s, caught up after Some(497.909194ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-23494 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-23494 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-23494 refused the owner: {"fleet.live.hold_refused.behind": 133}
+  chaos-rolling-a-23494 partitioned from 173.118434ms to 2.173224547s, caught up after Some(286.04103ms)
+  chaos-rolling-c-23494 partitioned from 2.490606387s to 4.490737043s, caught up after Some(497.909194ms)
+  6111 writes, 6111 acknowledged: p50 308 us, p99 3751 us, p999 90175 us, max 249628 us; 18 over 50ms (sent+took): 0.00s+125ms 0.81s+53ms 2.16s+86ms 3.49s+250ms 3.74s+88ms 3.83s+97ms 3.93s+86ms 4.01s+86ms 4.10s+87ms 4.19s+86ms 4.27s+87ms 4.36s+88ms 4.45s+90ms 4.54s+95ms 4.63s+97ms 4.73s+57ms 4.82s+70ms 5.02s+138ms
+  chaos-rolling-b-23494 refused the owner: {}
+  chaos-rolling-a-23494 refused the owner: {}
+  chaos-rolling-c-23494 refused the owner: {"fleet.live.hold_refused.behind": 133}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 7.48s
+== quiet round 3 arm b exit 0
