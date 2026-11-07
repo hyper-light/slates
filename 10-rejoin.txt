@@ -88,3 +88,21 @@ shard 0 refused fleet.link.invalid.believed_dead: 1
 shard 0 refused fleet.plane.epoch_refused: 400
 shard 0 refused fleet.plane.epoch_refused.install: 400
 shard 0 refused fleet.plane.member_returned: 389
+=== neither 6 exit 101 load { 13.89 17.59 13.92 }
+rejoins: successor daemon 27274 answered after 44.581291ms
+slates-cluster: fleet: HostId(7843479586594375776) holds HostId(110849498650701778) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+thread 'a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet' (56278) panicked at crates/cli/tests/live_chaos.rs:2451:7:
+the fleet re-formed after the successor: [Some(("7843479586594375776", 2, 0)), Some(("110849498650701778", 2, 1)), Some(("4964676946303165841", 2, 1))]
+fleet_host: 7843479586594375776
+fleet_peers_probed: 0
+shard 0 refused fleet.plane.epoch_refused: 405
+shard 0 refused fleet.plane.epoch_refused.answer: 405
+fleet_host: 110849498650701778
+fleet_peers_probed: 1
+shard 0 refused fleet.link.invalid.believed_dead: 1
+fleet_host: 4964676946303165841
+fleet_peers_probed: 1
+shard 0 refused fleet.link.invalid.believed_dead: 1
+shard 0 refused fleet.plane.epoch_refused: 405
+shard 0 refused fleet.plane.epoch_refused.install: 405
+shard 0 refused fleet.plane.member_returned: 393
