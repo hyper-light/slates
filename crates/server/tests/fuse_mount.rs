@@ -181,7 +181,16 @@ fn mount_work_and_detach(
   assert_eq!(attached.path.as_deref(), Some(point.path.as_str()));
   let (fstype, source) = mounted_at(&point.path).expect("the kernel lists the mount");
   assert_eq!(fstype, "fuse.slates");
-  assert_eq!(source, format!("slates:{:016x}", attached.attachment));
+  // The source is this daemon's tag, a random value made at its start (A-227), and never the attachment's id: the mount
+  // table is world-readable, so it says only whose mount this is.
+  assert_eq!(
+    Some(source.as_str()),
+    slates_base::own_mounts::fsname().as_deref()
+  );
+  assert!(
+    !source.contains(&format!("{:x}", attached.attachment)),
+    "the mount table names no attachment: {source}"
+  );
   work_through_the_kernel(&point.path);
   assert_eq!(client.status(volume).unwrap().attachments, 1);
   let removed = remove_a_full_directory(&point.path);
