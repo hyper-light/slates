@@ -13407,6 +13407,10 @@ last), `crates/cli/tests/nfs_held.rs` (the history test).
   and both encodings of the image and the delta are compared with the field (`crates/vfs/tests`).
 - **Format.** Image version 22, delta version 5: earlier images and logs are refused by version, as before.
 
+- **2026-11-07, a regression fixed** (`docs/bugs/2026-11-07-a-held-connections-own-write-back-was-refused-as-stale.md`):
+  the carry consumed the live trackers inside a call, before the call's own records were noted, so a held connection's
+  own write went stale and its next write-back was refused (main CI 42395077767, fsx over the macOS mount). The carry
+  now reads a copy and leaves the live states alone.
 ### A-239 — On Windows the daemon reports an administrator's full crash dumps; it registers no region exclusion (accepted 2026-11-07, the supervisor's decision: option b)
 Applied in the same change to: §1's RAM-only guarantee 2, GAPS (`8a-win-dumps`), `crates/server` (`local_dumps.rs`,
 new; the daemon's start reads it; `verbs.rs`: the status field; `tests/dump_exclusion.rs`, new), `crates/ipc`
