@@ -10,9 +10,11 @@ use slates_wire::crc32c::crc32c;
 
 mod names;
 
-/// Format: identifies version 4 of the Windows ledger: open records, two checked kernel-name versions per slot, their
-/// long-name tails, then the retained receive journal. The unnamed sparse section commits touched ranges only.
-const MAGIC: &[u8; 4] = b"WFO4";
+/// Format: identifies version 5 of the Windows ledger: open records, two checked kernel-name versions per slot, their
+/// long-name tails, then the retained receive journal. The unnamed sparse section commits touched ranges only. Version 5
+/// records each open's kind (`DIRECTORY`) and issues contexts that carry it (`CONTEXT_FORMAT`); a successor refuses a
+/// version 4 ledger, whose contexts carry no kind, rather than restore them.
+const MAGIC: &[u8; 4] = b"WFO5";
 /// Format: the immutable header carries the first epoch, the slot count, and a CRC32C after the magic.
 const HEADER: usize = MAGIC.len() + size_of::<u64>() + size_of::<u32>() + size_of::<u32>();
 /// Format: generation, live/purge flags, daemon epoch, inode, inode generation, bridge handle and request hint,
@@ -25,6 +27,14 @@ const CONFIRMED_AT: usize = FRAME - size_of::<u8>();
 const LIVE: u8 = 1;
 /// Format: see [`LIVE`]. A purge's writes must never be applied, including after takeover.
 const PURGE: u8 = 2;
+/// Format: bit two marks a live open of a directory; it never stands without [`LIVE`].
+const DIRECTORY: u8 = 4;
+/// Format: a context's low word is its slot's index plus one, under two flag bits: this one marks the context format
+/// that carries the open's kind, so a context issued before it is refused [`Refusal::Format`] rather than misread.
+const CONTEXT_FORMAT: u32 = 1 << 30;
+/// Format: the low word's top bit marks a context whose open is a directory, so a file's `CanDelete` is answered without
+/// the shard (audit step 7).
+const CONTEXT_DIRECTORY: u32 = 1 << 31;
 /// Format: the packed bridge handle with slot index `u32::MAX`, beyond the bounded `MAX_OPEN_HANDLES` store.
 /// Unlike zero (its first live slot), this word cannot address a successor's handle. Releasing it settles a restored
 /// reference by file identity through `VolumeBridge::release` (A-148, A-152).
@@ -41,6 +51,8 @@ pub enum Refusal {
   Stale,
   /// A generation or daemon epoch cannot advance without reuse.
   Exhausted,
+  /// A kernel context in a format this ledger does not issue: one from before contexts carried their open's kind.
+  Format,
   /// The memory backing refused a checked copy.
   Memory(MemError),
 }
@@ -101,6 +113,8 @@ pub struct Open {
   pub fh: u64,
   /// This open belongs to a coherent purge, whose write is only an echo.
   pub purge: bool,
+  /// The open is of a directory. Its context carries this, so a file's `CanDelete` needs no shard (audit step 7).
+  pub directory: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -231,7 +245,10 @@ impl<M: Memory> Ledger<M> {
         if pending.is_some() {
           return Err(Refusal::Corrupt);
         }
-        pending = Some((token(index, slot.generation)?, slot.hint));
+        pending = Some((
+          token(index, slot.generation, slot_directory(&slot))?,
+          slot.hint,
+        ));
       }
       slots.push(slot);
     }
@@ -285,7 +302,7 @@ impl<M: Memory> Ledger<M> {
     self.memory.write(offset(index)?, &encode(slot)?)?;
     *self.slots.get_mut(index).ok_or(Refusal::Bound)? = slot;
     self.free.pop();
-    let context = token(index, generation)?;
+    let context = token(index, generation, open.directory)?;
     if !confirmed {
       self.pending = Some((context, hint));
     }
@@ -362,6 +379,10 @@ impl<M: Memory> Ledger<M> {
       return Err(Refusal::Stale);
     }
     let mut open = slot.open.ok_or(Refusal::Stale)?;
+    // A context whose kind disagrees with its record was not issued for it.
+    if context_is_directory(context)? != open.directory {
+      return Err(Refusal::Stale);
+    }
     if slot.epoch != self.epoch {
       open.fh = RESTORED_HANDLE;
     }
@@ -394,7 +415,7 @@ impl<M: Memory> Ledger<M> {
   /// Live contexts, including those issued before the takeover, for rebuilding the mount's coherence names.
   pub fn live(&self) -> impl Iterator<Item = (u64, Open)> + '_ {
     self.slots.iter().enumerate().filter_map(|(index, slot)| {
-      let context = token(index, slot.generation).ok()?;
+      let context = token(index, slot.generation, slot_directory(slot)).ok()?;
       self.get(context).ok().map(|open| (context, open))
     })
   }
@@ -415,19 +436,40 @@ impl<M: Memory> Ledger<M> {
   }
 }
 
-fn token(index: usize, generation: u32) -> Result<u64, Refusal> {
+/// Whether a slot's live open is a directory; a closed slot's is not.
+fn slot_directory(slot: &Slot) -> bool {
+  slot.open.is_some_and(|open| open.directory)
+}
+
+fn token(index: usize, generation: u32, directory: bool) -> Result<u64, Refusal> {
   let slot = u32::try_from(index)
     .ok()
     .and_then(|index| index.checked_add(1))
+    .filter(|slot| slot & (CONTEXT_FORMAT | CONTEXT_DIRECTORY) == 0)
     .ok_or(Refusal::Bound)?;
   if generation == 0 {
     return Err(Refusal::Stale);
   }
-  Ok((u64::from(generation) << u32::BITS) | u64::from(slot))
+  let kind = if directory { CONTEXT_DIRECTORY } else { 0 };
+  Ok((u64::from(generation) << u32::BITS) | u64::from(slot | CONTEXT_FORMAT | kind))
+}
+
+/// Whether a kernel context names a directory's open, read from the context alone, on any thread: a context's kind is
+/// fixed when it is issued and never changes (audit step 7). A context in an older format is refused typed.
+pub fn context_is_directory(context: u64) -> Result<bool, Refusal> {
+  let word = u32::try_from(context & u64::from(u32::MAX)).map_err(|_| Refusal::Stale)?;
+  if word & CONTEXT_FORMAT == 0 {
+    return Err(Refusal::Format);
+  }
+  Ok(word & CONTEXT_DIRECTORY != 0)
 }
 
 fn unpack(context: u64) -> Result<(usize, u32), Refusal> {
-  let slot = u32::try_from(context & u64::from(u32::MAX)).map_err(|_| Refusal::Stale)?;
+  let word = u32::try_from(context & u64::from(u32::MAX)).map_err(|_| Refusal::Stale)?;
+  if word & CONTEXT_FORMAT == 0 {
+    return Err(Refusal::Format);
+  }
+  let slot = word & !(CONTEXT_FORMAT | CONTEXT_DIRECTORY);
   let index = slot
     .checked_sub(1)
     .and_then(|slot| usize::try_from(slot).ok())
@@ -466,9 +508,10 @@ fn encode(slot: Slot) -> Result<[u8; FRAME], Refusal> {
     object: ObjectId::new(0, 0),
     fh: 0,
     purge: false,
+    directory: false,
   });
   encoded.push(if slot.open.is_some() {
-    LIVE | if open.purge { PURGE } else { 0 }
+    LIVE | if open.purge { PURGE } else { 0 } | if open.directory { DIRECTORY } else { 0 }
   } else {
     0
   });
@@ -506,7 +549,10 @@ fn decode(frame: &[u8; FRAME]) -> Result<Slot, Refusal> {
   let generation = read_u32(frame, 0)?;
   let flags_at = size_of::<u32>();
   let flags = *frame.get(flags_at).ok_or(Refusal::Corrupt)?;
-  if generation == 0 || flags & !(LIVE | PURGE) != 0 || flags == PURGE {
+  if generation == 0
+    || flags & !(LIVE | PURGE | DIRECTORY) != 0
+    || (flags != 0 && flags & LIVE == 0)
+  {
     return Err(Refusal::Corrupt);
   }
   let mut at = flags_at.saturating_add(1);
@@ -537,6 +583,7 @@ fn decode(frame: &[u8; FRAME]) -> Result<Slot, Refusal> {
       object: ObjectId::new(inode, object_generation),
       fh,
       purge: flags & PURGE != 0,
+      directory: flags & DIRECTORY != 0,
     }),
     quarantined: false,
     hint,
@@ -610,7 +657,64 @@ mod tests {
       object: ObjectId::new(inode, 7),
       fh: 42,
       purge: false,
+      directory: false,
     }
+  }
+
+  fn directory(inode: u64) -> Open {
+    Open {
+      directory: true,
+      ..file(inode)
+    }
+  }
+
+  /// Audit step 7, the CanDelete lever. Do: open a file and a directory, then let a successor recover the ledger. Expect:
+  /// each context says its open's kind before and after the takeover, the successor issues the same two contexts with
+  /// the same kinds, and each resolves to its open.
+  #[test]
+  fn a_contexts_kind_survives_the_takeover_for_a_file_and_a_directory() {
+    let mut first = Ledger::create(Ram(vec![0; bytes(2).unwrap()]), 2).unwrap();
+    let file_context = first.opened(file(5), "\\f").unwrap();
+    let directory_context = first.opened(directory(6), "\\d").unwrap();
+    assert_eq!(context_is_directory(file_context), Ok(false));
+    assert_eq!(context_is_directory(directory_context), Ok(true));
+    let next = Ledger::recover(first.into_memory(), 2).unwrap();
+    let mut live: Vec<(u64, bool)> = next
+      .live()
+      .map(|(context, open)| (context, open.directory))
+      .collect();
+    live.sort_unstable();
+    let mut expected = vec![(file_context, false), (directory_context, true)];
+    expected.sort_unstable();
+    assert_eq!(live, expected);
+    assert!(!next.get(file_context).unwrap().directory);
+    assert!(next.get(directory_context).unwrap().directory);
+  }
+
+  /// Audit step 7. Do: present a context issued in the format before contexts carried their kind (no format bit), and
+  /// one whose kind bit disagrees with its record. Expect: the first refused `Format`, never misread as some slot; the
+  /// second `Stale`.
+  #[test]
+  fn an_old_format_context_is_refused_typed_and_a_wrong_kind_is_stale() {
+    let mut ledger = Ledger::create(Ram(vec![0; bytes(1).unwrap()]), 1).unwrap();
+    let context = ledger.opened(file(5), "\\f").unwrap();
+    let old = context & !u64::from(CONTEXT_FORMAT | CONTEXT_DIRECTORY);
+    assert_eq!(context_is_directory(old), Err(Refusal::Format));
+    assert_eq!(ledger.get(old), Err(Refusal::Format));
+    let wrong_kind = context | u64::from(CONTEXT_DIRECTORY);
+    assert_eq!(ledger.get(wrong_kind), Err(Refusal::Stale));
+    assert!(ledger.get(context).is_ok());
+  }
+
+  /// Audit step 7. Do: recover a ledger whose header names version 4, whose contexts carry no kind. Expect: refused
+  /// `Corrupt` before any context is restored.
+  #[test]
+  fn a_version_4_ledger_is_refused_at_recovery() {
+    let mut ledger = Ledger::create(Ram(vec![0; bytes(1).unwrap()]), 1).unwrap();
+    ledger.opened(file(5), "\\f").unwrap();
+    let mut memory = ledger.into_memory();
+    memory.0[..MAGIC.len()].copy_from_slice(b"WFO4");
+    assert!(matches!(Ledger::recover(memory, 1), Err(Refusal::Corrupt)));
   }
 
   /// The paged pool charged to this process (`PROCESS_MEMORY_COUNTERS.QuotaPagedPoolUsage`), where a section's bookkeeping

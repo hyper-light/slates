@@ -683,6 +683,7 @@ fn a_rename_with_one_open_name_takes_one_shard_turn() {
           object,
           fh,
           purge: false,
+          directory: false,
         },
         "\\file",
       )
@@ -739,6 +740,7 @@ fn a_replayed_cleanup_cannot_unlink_the_file_that_replaced_its_open() {
         object,
         fh,
         purge: false,
+        directory: false,
       },
       "\\file",
     )

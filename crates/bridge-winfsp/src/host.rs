@@ -539,7 +539,17 @@ fn record_open_reply(
     return reply;
   };
   let (object, fh, info) = (*object, *fh, *info);
-  match ledger.opened_for(Open { object, fh, purge }, &path, hint) {
+  let directory = info.file_attributes & crate::FILE_ATTRIBUTE_DIRECTORY != 0;
+  match ledger.opened_for(
+    Open {
+      object,
+      fh,
+      purge,
+      directory,
+    },
+    &path,
+    hint,
+  ) {
     Ok(context) => {
       names.opened(context, object.inode, &path);
       Reply::Opened { context, info }
@@ -1646,7 +1656,15 @@ extern "C" fn set_file_size(
 
 extern "C" fn can_delete(fs: *mut FileSystem, context: Pvoid, _file_name: Pwstr) -> Ntstatus {
   // The delete itself happens in Cleanup, which answers the kernel nothing, so the refusal a program must see (a
-  // directory with a child, `ERROR_DIR_NOT_EMPTY`) is decided here, before Windows marks the object for deletion.
+  // directory with a child, `ERROR_DIR_NOT_EMPTY`) is decided here, before Windows marks the object for deletion. Only a
+  // directory's emptiness needs the volume: a file's context says it is a file, so it is answered here, with no shard
+  // trip (audit step 7). A context the ledger cannot read goes to the shard, which refuses it typed.
+  if matches!(
+    crate::opens::context_is_directory(context_key(context)),
+    Ok(false)
+  ) {
+    return STATUS_SUCCESS.as_i32();
+  }
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   match handler.call(Op::CanDelete {
