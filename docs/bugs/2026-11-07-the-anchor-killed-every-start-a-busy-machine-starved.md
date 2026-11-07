@@ -49,6 +49,25 @@ the two apart. A running daemon was already judged by progress, in each shard's 
   start-kill line. To name the successor without `pgrep -P`, the anchor's restart line now says "restarted as pid N",
   and its start-kill line says "the starting daemon (pid N)". Both CI Windows lanes run them.
 
+## Measured at the extremes (2026-11-07)
+
+On this Mac under clients' recipe (`frozen-load.sh`, eight nice-19 spinners a CPU, 144 on 18, with other agents' work
+alongside: 240 runnable processes), debug build of 2810a612:
+
+| test, runs | starts | starts of a progressing daemon killed | test result |
+|---|---|---|---|
+| `a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted` ×5 | 5 first, 3 successors | **0** | 1 passed; 4 failed on the harness's fixed waits |
+| `a_starved_start_that_makes_progress_is_not_killed` ×5 | 5 first, 4 starved successors | **0** | 3 passed; 2 failed on the harness's fixed waits |
+| `a_stuck_start_is_killed_and_restarted` ×3 | 3 first, 1 stuck | 0; the stuck one killed: "made no progress for 1104 ms (the 1000 ms liveness window)" | 3 failed on the harness's fixed waits |
+
+Before the fix, clients counted 104 kills in one frozen run at load 150-233. The failures above are the tests' own
+fixed waits, not the anchor: `await_daemon`'s 20 s `START_WAIT` for a successor that at about 1.5% of a CPU serves
+just after it (`cli.rs:3212`), and `await_stable_daemon`'s attempt streak (`cli.rs:291`). Told clients, 2026-11-07.
+
+On CI (diag-liveness-10, two spinners a CPU on four runners), the stuck start was killed at 1,001-1,007 ms on both
+Linux runners, 1,007-1,070 ms on windows-latest and 1,002-1,009 ms on windows-11-arm, three runs each, and the
+starved start was never killed (`start_judgment.rs` on Windows, `cli.rs` on Linux).
+
 ## Left open
 
 - **Recovery in one poll.** Since A-228 the watchdog starts before the shards' recovery ends, so a start beats during a
