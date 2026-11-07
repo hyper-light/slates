@@ -183,6 +183,8 @@
 #   and the daemon adopting a fleet node's inherited serve sockets (`fleet.rs` `adopt_inherited`,
 #   added 2026-09-28 with the anchor-held fleet ports, §4.8): the same `OwnedFd::from_raw_fd` on each
 #   number in `SLATES_ANCHOR_FLEET_SERVE`, one site called per plane (1, Unix only).
+#   The daemon reading Windows Error Reporting's `LocalDumps` setting (`local_dumps.rs`, 2026-11-07, A-239): one
+#   `RegGetValueW` of a DWORD into a local, unprivileged (1, Windows only). 7 → 8.
 # slates-db (0): records, indexes and the log are safe Rust over the segment's byte slices.
 # slates-merge (0): the verdict is a pure sweep over ranges and a memcmp; safe Rust throughout.
 # slates-client (0): the rings and the rendezvous are slates-ipc's. Raised 0 → 3 on 2026-10-15 for the
@@ -395,7 +397,7 @@ slates-ipc = 139
 #   range) the layout keeps: the daemon's copies reach only the write log and image slots.
 # 2026-11-02 (+1, A-198 Step 9.3): `anchor_hold_windows::adopted` takes unique ownership of an explicitly inherited
 # handle after the bounded handoff parser checked nonzero values and aliasing; its inheritance flag is cleared in IPC.
-slates-server = 7
+slates-server = 8
 slates-client = 0
 slates-cli = 7
 # 2026-11-01 (+2, Step 6.1 of the VFS and DAX plan, `signal.rs` `relay` compiled only for Linux): `slates pmem` waits on
