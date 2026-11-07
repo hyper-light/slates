@@ -1219,14 +1219,18 @@ fn commit_holders(state: &mut ShardState, volume: [u8; 16], holders: &[HostId]) 
 }
 
 /// Whether `volume`'s catalog is placed at `f + 1` at `version` or later (at `f = 0`, always: the owner's commit places
-/// it, R8).
+/// it, R8), its acknowledgements judged under the configuration now (`PlacedHead::placed_under`). Judged under the
+/// round's own joint cohorts, a bootstrap node's catalog kept its one-host cohort and never read placed, so the shipper
+/// shipped nothing (the bootstrap-node live flow after A-240's merge: both candidates holding nothing, macOS CI
+/// diag-live-fixes-17).
 fn catalog_placed_at(state: &ShardState, volume: [u8; 16], version: u64) -> bool {
   let configuration = state.fleet.configuration();
+  let catalog = ObjectId(volume).catalog();
   configuration.quorum.f == 0
     || state
       .placed_heads
-      .get(&ObjectId(volume).catalog())
-      .is_some_and(|head| head.sequence >= version && configuration.region_placed(&head.placement))
+      .get(&catalog)
+      .is_some_and(|head| head.sequence >= version && head.placed_under(configuration, catalog))
 }
 
 /// A catalog register's placement moved (`fleet::record_acks_in`): when it is a live volume's and now places that
