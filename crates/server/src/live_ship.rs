@@ -1284,7 +1284,6 @@ async fn ship_lane(
     }
     lose_links(&exchanged.unanswered);
     crate::fleet::return_sessions(exchanged.reusable);
-    settle_stragglers(origin, send.object, exchanged.stragglers);
     let replies: Vec<(ObjectId, HostId, Vec<u8>)> = exchanged
       .replies
       .into_iter()
@@ -1294,6 +1293,8 @@ async fn ship_lane(
       let control = state::with_state(|s| s.shard).unwrap_or(origin);
       crate::xshard::run_on_counted(control, origin, move |s| fold_into(s, replies));
     }
+    // After the answers are on their way to the owner, so durability waits for no straggler.
+    finish_stragglers(origin, send.object, exchanged.stragglers).await;
     if !answered {
       return false;
     }
@@ -1352,29 +1353,63 @@ pub(crate) fn drain_stragglers() {
   };
   let mut kept = Vec::new();
   for (origin, object, mut stragglers) in queued {
-    let (late, done) = stragglers.recover_replies();
-    let mut replies = Vec::new();
-    let mut sessions = Vec::new();
-    let mut lost = Vec::new();
-    for (host, reply, endpoint) in late {
-      if reply.round_trip_ns.is_none() {
-        lost.push(host);
-        continue;
-      }
-      replies.push((object, host, reply.bytes));
-      sessions.push((host, endpoint));
-    }
-    lose_links(&lost);
-    crate::fleet::return_sessions(sessions);
-    if !replies.is_empty() {
-      let control = state::with_state(|s| s.shard).unwrap_or(origin);
-      crate::xshard::run_on_counted(control, origin, move |s| fold_into(s, replies));
-    }
-    if !done {
+    if !recover_stragglers(origin, object, &mut stragglers) {
       kept.push((origin, object, stragglers));
     }
   }
   let _ = state::with_state(|s| s.live.stragglers.extend(kept));
+}
+
+/// Takes what `stragglers` have returned: each answered holder's session back to the pool and its reply to the volume's
+/// owner shard (`origin`), each unanswered holder's link dropped to be dialed afresh. Whether every straggler has
+/// returned. On the control shard.
+fn recover_stragglers(
+  origin: u16,
+  object: ObjectId,
+  stragglers: &mut slates_cluster::Stragglers,
+) -> bool {
+  let (late, done) = stragglers.recover_replies();
+  let mut replies = Vec::new();
+  let mut sessions = Vec::new();
+  let mut lost = Vec::new();
+  for (host, reply, endpoint) in late {
+    if reply.round_trip_ns.is_none() {
+      lost.push(host);
+      continue;
+    }
+    replies.push((object, host, reply.bytes));
+    sessions.push((host, endpoint));
+  }
+  lose_links(&lost);
+  crate::fleet::return_sessions(sessions);
+  if !replies.is_empty() {
+    let control = state::with_state(|s| s.shard).unwrap_or(origin);
+    crate::xshard::run_on_counted(control, origin, move |s| fold_into(s, replies));
+  }
+  done
+}
+
+/// Waits, on the lane's own task, for an exchange's stragglers to report, and recovers them ([`recover_stragglers`]).
+/// An exchange's requests are children of the task that made it (`slates_cluster::live::exchange`), and a task's end
+/// cancels its children: a request still in flight when its lane's task ended was dropped with its holder's session in
+/// it, never reported, and its slot stayed lent for good, so the owner shipped that holder nothing again (both of an
+/// owner's sessions `lent=true` with its log stuck two short of its head: `live_chaos` at load 118, 3 of 10 runs stalled
+/// without this and 0 of 10 with it at load 41-58; and the KIND leg's 80 ms WAN in 50-100 writes, raft-chaos run
+/// 42178128960, 2026-11-06). Each request is bounded by the exchange's own deadline, so this waits at most the gap
+/// between the exchange giving up and its requests doing so: a timer tick or two. A shard that can no longer time the
+/// wait leaves them to the drain ([`drain_stragglers`]).
+async fn finish_stragglers(
+  origin: u16,
+  object: ObjectId,
+  mut stragglers: slates_cluster::Stragglers,
+) {
+  while !recover_stragglers(origin, object, &mut stragglers) {
+    // Shape: one tick of the shard's timer wheel, the finest park there is (`sleep` rounds up to it).
+    if slates_rt::futures::sleep(1).await.is_err() {
+      settle_stragglers(origin, object, stragglers);
+      return;
+    }
+  }
 }
 
 /// Drops the record links of holders that answered nothing (on the control shard, where the links live): their link
