@@ -1,0 +1,62 @@
+name: diag-live-durability
+
+# Diagnostics only, never on main (A-200, item 2): the merged stack (straggler-2 @ 55db932b: the landing series with raft-chaos-1
+# merged): the cluster live tests three times, slates-db's live model, the server live_ship suite, the whole live_fleet
+# suite, and the rolling partition five times. Release for live_fleet, debug for the rest. Both Linux arches. Results to
+# diag-results/live-durability-30-<os> by git push.
+on:
+  push:
+    branches: ["diag-live-durability-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  SLATES_TEST_CLI: "1"
+
+jobs:
+  check:
+    name: stack (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: The runs
+        run: |
+          R=../results.txt
+          echo "runner ${{ matrix.os }}, $(nproc) CPUs, $(date -u), tree $(git rev-parse HEAD)" > $R
+          for run in $(seq 1 3); do
+            status=0
+            timeout 900 cargo test --locked -p slates-cluster --test live > ../run.log 2>&1 || status=$?
+            grep -E 'test result|panicked|left|right' ../run.log | head -5 >> $R
+            echo "== cluster live run $run exit $status" >> $R
+          done
+          status=0
+          timeout 1800 cargo test --locked -p slates-server --test live_ship > ../run.log 2>&1 || status=$?
+          grep -E '^test .* FAILED|test result' ../run.log >> $R
+          echo "== server live_ship exit $status" >> $R
+          status=0
+          timeout 2400 cargo test --release --locked -p slates-cli --test live_fleet -- --test-threads=2 > ../run.log 2>&1 || status=$?
+          grep -E '^test .* FAILED|test result' ../run.log >> $R
+          echo "== live_fleet exit $status" >> $R
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/live-durability-30-${{ matrix.os }}"
+          git config user.name "diag-live-durability"
+          git config user.email "diag-live-durability@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-live-durability-30 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
