@@ -13759,14 +13759,15 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   answers `BudgetExceeded { available: 44252790784 }` for a 1 MiB volume, since `Store::admittable` counts the pool's free
   extents and `ContentPool::hand_out` discards the OS's error. The first measurement is the client binary's, above.
 - **Landing on Windows built (A-185, 2026-10-26):** `slates-land` has a Windows write seam
-  (`crates/land/src/os_windows.rs`), handle-relative over NTFS, and the server lands on Windows. Proven on jupiter: the
-  land suite whole (the kill test on NTFS, the escape oracle with junction and hard-link swaps, the removal oracle with
-  real outsider saves), red-checked three ways. Found and fixed on the way: Windows base modes were raw attributes
-  (`docs/bugs/2026-10-26-windows-base-file-modes-were-raw-attributes.md`), and NTFS tunneling gives a renamed file the
-  creation time of the name's last holder (the engine's move check sets the birth time aside). **Owed:** a symbolic
-  link in a landing on Windows (refused `EPERM`: no unprivileged, handle-relative way to make one); a reflink
-  (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS); arm64 Windows. CI's x86_64 Windows lane runs the land suite whole and
-  lints it.
+  (`crates/land/src/os_windows.rs`), handle-relative over NTFS, and the server lands on Windows. Proven on both CI
+  Windows runners, x86_64 and arm64, from pwsh (2026-11-06): the land suite whole (the kill test on NTFS, the escape
+  oracle with junction and hard-link swaps, the removal oracle with real outsider saves, each verb on a name that
+  exists), the server's landing suites and its lib tests one test at a time. Found and fixed on the way: Windows base
+  modes were raw attributes (`docs/bugs/2026-10-26-windows-base-file-modes-were-raw-attributes.md`); NTFS tunneling
+  gives a renamed file the creation time of the name's last holder (the move check sets the birth time aside on Windows);
+  an elevated token owned nothing it made (`docs/bugs/2026-11-06-an-elevated-token-owned-nothing-it-made.md`). **Owed:**
+  a symbolic link in a landing on Windows (refused `EPERM`: no unprivileged, handle-relative way to make one); a reflink
+  (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS). A flush reaching the device is held by no test, as on Unix.
 - **Windows' DAX window built (G-shards-windows step 5, A-180, 2026-10-26):** a descriptor ask on a Windows stream
   names the asking process and its stream handle there. The daemon checks the handle is this stream's own object, by
   `CompareObjectHandles` against a known holder, never by a name query, which hung past 3 s on a synchronous pipe with
