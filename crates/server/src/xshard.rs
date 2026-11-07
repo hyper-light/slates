@@ -729,3 +729,108 @@ mod tests {
     }
   }
 }
+
+/// A guard moved into a task that owes a client its reply: dropped before the task's first poll, it answers the client
+/// with `reply` instead (§4.9: a forwarded verb is waited for while the daemon lives, so a task lost before it ran left
+/// its client waiting for ever). A shard refuses a spawn whose arena is full at admission, and then drops the task's
+/// future unrun with only its own `tasks_refused` count to show for it; `registry::send_control` reports only that the
+/// channel took the message. Found by fixtures' 1,000-client replica-kill rung (2026-11-07): the client node's control
+/// shard counted `tasks_refused` 117, and 87 forwards handed to it never started, their clients stalled for good
+/// (`fleet.forward.client.to_control` 85,750 against `control_started` 85,663, every later hop balanced).
+///
+/// `at` is the shard the task runs on and `home` the client's shard. Dropped on `at` unstarted, it delivers `reply`
+/// at once when `at` is `home`, else sends it home on a task carrying its own guard, so a reply refused at the client's
+/// shard is delivered there directly. Dropped anywhere else, its sender's refused send answers the client already, and
+/// it does nothing. `reply` is one the client may retry under its own id (`Overloaded`): the verb never ran here.
+pub(crate) struct AnswerUnstarted {
+  home: u16,
+  at: u16,
+  client_index: u32,
+  request: u64,
+  reply: Option<slates_ipc::protocol::ReplyBody>,
+}
+
+impl AnswerUnstarted {
+  /// A guard for a task on shard `at` owing client `client_index`'s `request` on shard `home`.
+  pub(crate) fn new(
+    home: u16,
+    at: u16,
+    client_index: u32,
+    request: u64,
+    reply: slates_ipc::protocol::ReplyBody,
+  ) -> Self {
+    Self {
+      home,
+      at,
+      client_index,
+      request,
+      reply: Some(reply),
+    }
+  }
+
+  /// The task started, and answers its client itself.
+  pub(crate) fn started(&mut self) {
+    self.reply = None;
+  }
+}
+
+impl Drop for AnswerUnstarted {
+  fn drop(&mut self) {
+    // A send its sender saw refused: the sender answers the client on its own refusal path.
+    if DISCARDING_UNSENT.with(Cell::get) {
+      return;
+    }
+    let Some(reply) = self.reply.take() else {
+      return;
+    };
+    if state::with_state(|s| s.shard) != Some(self.at) {
+      return;
+    }
+    state::with_state_counted(|s| s.count(UNSTARTED_ANSWERED, 1));
+    let (home, client_index, request) = (self.home, self.client_index, self.request);
+    if home == self.at {
+      // The completion is the executing owner's, or nobody's: the refusal is never recorded here.
+      state::deliver(client_index, request, reply, true);
+      return;
+    }
+    let mut guard = AnswerUnstarted::new(home, home, client_index, request, reply.clone());
+    let back = SpawnRequest::new(
+      Box::pin(async move {
+        guard.started();
+        state::deliver(client_index, request, reply, true);
+      }),
+      None,
+    );
+    if registry::send_control(home, Control::Spawn(Box::new(back))).is_err() {
+      state::with_state_counted(|s| s.count(UNSTARTED_UNANSWERED, 1));
+    }
+  }
+}
+
+thread_local! {
+  /// Set while [`send_owing`] drops a task its target's channel refused, so the task's [`AnswerUnstarted`] stands
+  /// down: the sender answers that client itself (a client on the control shard forwarding through it would otherwise
+  /// be answered twice).
+  static DISCARDING_UNSENT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Sends `task`, which carries an [`AnswerUnstarted`], to `target`'s control channel: the channel's refusal is returned
+/// for the sender to answer its client, and the task is dropped without its guard answering too. Once accepted, a task
+/// dropped unrun (refused at admission) is answered by its guard.
+pub(crate) fn send_owing(target: u16, task: SpawnRequest) -> Result<(), RtError> {
+  match registry::send_control_or_return(target, Control::Spawn(Box::new(task))) {
+    Ok(()) => Ok(()),
+    Err(refused) => {
+      DISCARDING_UNSENT.with(|discarding| discarding.set(true));
+      drop(refused.message);
+      DISCARDING_UNSENT.with(|discarding| discarding.set(false));
+      Err(refused.error)
+    }
+  }
+}
+
+/// Counter: a task owing a client its reply that was dropped before it ran (its spawn refused at admission, its shard
+/// shutting down), its client answered instead ([`AnswerUnstarted`]).
+pub(crate) const UNSTARTED_ANSWERED: &str = "xshard.unstarted_answered";
+/// Counter: such a task whose answer could not be sent home either (the client's shard's channel refused it).
+pub(crate) const UNSTARTED_UNANSWERED: &str = "xshard.unstarted_unanswered";

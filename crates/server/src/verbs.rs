@@ -463,8 +463,16 @@ fn promote_region_on_root(
     return Served::Reply(refused(Refusal::NotFound));
   };
   let origin = state.shard;
+  let mut unstarted = crate::xshard::AnswerUnstarted::new(
+    origin,
+    control,
+    client_index,
+    request,
+    refused(Refusal::Overloaded { shard: control }),
+  );
   let task = SpawnRequest::new(
     Box::pin(async move {
+      unstarted.started();
       let reply = promote_region_here_or_forward(region, principal).await;
       if origin == control {
         crate::state::deliver(client_index, request, reply, false);
@@ -480,7 +488,7 @@ fn promote_region_on_root(
     }),
     None,
   );
-  if slates_rt::registry::send_control(control, Control::Spawn(Box::new(task))).is_err() {
+  if crate::xshard::send_owing(control, task).is_err() {
     return Served::Reply(refused(Refusal::NotFound));
   }
   Served::Forwarded
@@ -1126,8 +1134,16 @@ fn forward_to_owner(
     .into_iter()
     .map(|body| forwarded_request(state, request, principal.clone(), body))
     .collect();
+  let mut unstarted = crate::xshard::AnswerUnstarted::new(
+    origin,
+    control,
+    client.index(),
+    request,
+    refused(Refusal::Overloaded { shard: control }),
+  );
   let task = SpawnRequest::new(
     Box::pin(async move {
+      unstarted.started();
       crate::state::with_state_counted(|s| s.count(FORWARD_CLIENT_CONTROL_STARTED, 1));
       let (replies, route) = resolve_and_forward(volume, region, cached, requests).await;
       crate::state::with_state_counted(|s| s.count(FORWARD_CLIENT_RESOLVED, 1));
@@ -1135,7 +1151,7 @@ fn forward_to_owner(
     }),
     None,
   );
-  if slates_rt::registry::send_control(control, Control::Spawn(Box::new(task))).is_err() {
+  if crate::xshard::send_owing(control, task).is_err() {
     state.count(FORWARD_CLIENT_CONTROL_REFUSED, 1);
     if let Ok(slot) = state.clients.get_mut(client) {
       slot.read_ahead_pending = slot.read_ahead_pending.saturating_sub(charged);
@@ -2550,8 +2566,16 @@ fn send_forward(
 ) -> Result<(), slates_rt::RtError> {
   let principal = principal.clone();
   let body = body.clone();
+  let mut unstarted = crate::xshard::AnswerUnstarted::new(
+    origin,
+    owner,
+    client_index,
+    request,
+    refused(Refusal::Overloaded { shard: owner }),
+  );
   let task = SpawnRequest::new(
     Box::pin(async move {
+      unstarted.started();
       let id = RequestId::from_word(request);
       let mut elsewhere = None;
       let mut carried = None;
@@ -2616,7 +2640,7 @@ fn send_forward(
     }),
     None,
   );
-  slates_rt::registry::send_control(owner, Control::Spawn(Box::new(task)))
+  crate::xshard::send_owing(owner, task)
 }
 
 /// Sends a local client's verb, run on its volume's owner shard here, to the volume's owner host over the fleet,
@@ -2641,8 +2665,16 @@ async fn forward_for_local_client(
     )
   };
   let sent = control.is_some_and(|control| {
+    let mut unstarted = crate::xshard::AnswerUnstarted::new(
+      origin,
+      control,
+      client_index,
+      request,
+      refused(Refusal::Overloaded { shard: control }),
+    );
     let task = SpawnRequest::new(
       Box::pin(async move {
+        unstarted.started();
         crate::state::with_state_counted(|s| s.count(FORWARD_LOCAL_CONTROL_STARTED, 1));
         let (replies, _) = resolve_and_forward(volume, region, None, vec![request_bytes]).await;
         crate::state::with_state_counted(|s| s.count(FORWARD_LOCAL_RESOLVED, 1));
@@ -2651,7 +2683,7 @@ async fn forward_for_local_client(
       }),
       None,
     );
-    slates_rt::registry::send_control(control, Control::Spawn(Box::new(task))).is_ok()
+    crate::xshard::send_owing(control, task).is_ok()
   });
   crate::state::with_state_counted(|s| {
     s.count(
