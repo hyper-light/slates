@@ -1,0 +1,104 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 11:07:07 UTC 2026, head 64e13ec16b3995d02ecac9ad96f4fc12e9bcc7ab
+== run 1 at 11:07:07, load 1.66 1.95 0.94
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["9858914261629094955", "2739854878033453578", "14719060530046304105", "6183940071927565244", "14603630521368836860"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-c-6352; council seats at ["chaos-fresh-member-a-6352", "chaos-fresh-member-b-6352", "chaos-fresh-member-d-6352"]
+chaos a member that never held the log at a takeover: chaos-fresh-member-a-6352 replaced by a fresh member, rejoined at 2.920228554s
+chaos a member that never held the log at a takeover: chaos-fresh-member-e-6352 stopped at 3.299805241s
+chaos a member that never held the log at a takeover: 474 writes acknowledged; owner crashed; holders chaos-fresh-member-b-6352 (with the log) and chaos-fresh-member-e-6352 (stale)
+chaos a member that never held the log at a takeover: chaos-fresh-member-b-6352 adopted the registers; it holds the log itself, so this run cannot show the defect
+chaos a member that never held the log at a takeover: decisive false; phase one waited for the holders 0 times while the holder was stopped
+chaos a member that never held the log at a takeover: chaos-fresh-member-b-6352 served the volume after 18.913178ms
+chaos a member that never held the log at a takeover:
+  owner chaos-fresh-member-c-6352; council seats at ["chaos-fresh-member-a-6352", "chaos-fresh-member-b-6352", "chaos-fresh-member-d-6352"]
+  chaos-fresh-member-a-6352 replaced by a fresh member, rejoined at 2.920228554s
+  chaos-fresh-member-e-6352 stopped at 3.299805241s
+  474 writes acknowledged; owner crashed; holders chaos-fresh-member-b-6352 (with the log) and chaos-fresh-member-e-6352 (stale)
+  chaos-fresh-member-b-6352 adopted the registers; it holds the log itself, so this run cannot show the defect
+  decisive false; phase one waited for the holders 0 times while the holder was stopped
+  chaos-fresh-member-b-6352 served the volume after 18.913178ms
+  NoLoss (successor): held
+  StaleNeverCommits (fences): held
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 13.60s
+== run 1 exit 0
+== run 2 at 11:07:21, load 1.71 1.95 0.95
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["1001534157415327832", "14143039034264644251", "17177403303939534978", "9344043615409154861", "4531852268722967801"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-b-7590; council seats at ["chaos-fresh-member-a-7590", "chaos-fresh-member-d-7590", "chaos-fresh-member-e-7590"]
+chaos a member that never held the log at a takeover: chaos-fresh-member-c-7590 replaced by a fresh member, rejoined at 1.95702624s
+chaos a member that never held the log at a takeover: chaos-fresh-member-e-7590 stopped at 2.723052048s
+chaos a member that never held the log at a takeover: 329 writes acknowledged; owner crashed; holders chaos-fresh-member-d-7590 (with the log) and chaos-fresh-member-e-7590 (stale)
+chaos a member that never held the log at a takeover: chaos-fresh-member-d-7590 adopted the registers; it holds the log itself, so this run cannot show the defect
+chaos a member that never held the log at a takeover: decisive false; phase one waited for the holders 0 times while the holder was stopped
+chaos a member that never held the log at a takeover: chaos-fresh-member-d-7590 served the volume after 27.320699ms
+chaos a member that never held the log at a takeover:
+  owner chaos-fresh-member-b-7590; council seats at ["chaos-fresh-member-a-7590", "chaos-fresh-member-d-7590", "chaos-fresh-member-e-7590"]
+  chaos-fresh-member-c-7590 replaced by a fresh member, rejoined at 1.95702624s
+  chaos-fresh-member-e-7590 stopped at 2.723052048s
+  329 writes acknowledged; owner crashed; holders chaos-fresh-member-d-7590 (with the log) and chaos-fresh-member-e-7590 (stale)
+  chaos-fresh-member-d-7590 adopted the registers; it holds the log itself, so this run cannot show the defect
+  decisive false; phase one waited for the holders 0 times while the holder was stopped
+  chaos-fresh-member-d-7590 served the volume after 27.320699ms
+  NoLoss (successor): held
+  StaleNeverCommits (fences): held
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 12.62s
+== run 2 exit 0
+== run 3 at 11:07:34, load 2.25 2.06 1.01
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["9389151459190237158", "17465983691871998684", "16151359129182110405", "8853561627067604103", "13260774664983026357"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-b-8824; council seats at ["chaos-fresh-member-a-8824", "chaos-fresh-member-d-8824", "chaos-fresh-member-e-8824"]
+chaos a member that never held the log at a takeover: chaos-fresh-member-d-8824 replaced by a fresh member, rejoined at 1.7685154s
+chaos a member that never held the log at a takeover: chaos-fresh-member-c-8824 stopped at 2.909885593s
+chaos a member that never held the log at a takeover: 371 writes acknowledged; owner crashed; holders chaos-fresh-member-a-8824 (with the log) and chaos-fresh-member-c-8824 (stale)
+chaos a member that never held the log at a takeover:
+  owner chaos-fresh-member-b-8824; council seats at ["chaos-fresh-member-a-8824", "chaos-fresh-member-d-8824", "chaos-fresh-member-e-8824"]
+  chaos-fresh-member-d-8824 replaced by a fresh member, rejoined at 1.7685154s
+  chaos-fresh-member-c-8824 stopped at 2.909885593s
+  371 writes acknowledged; owner crashed; holders chaos-fresh-member-a-8824 (with the log) and chaos-fresh-member-c-8824 (stale)
+  the registers' takeover: 1 violations
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (8825) panicked at crates/cli/tests/live_chaos.rs:1036:5:
+chaos a member that never held the log at a takeover: the registers' takeover: no survivor adopted the volume's registers within the fleet wait
+FAILED
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 51.93s
+== run 3 exit 101
+== run 4 at 11:08:26, load 2.95 2.31 1.15
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["15328336205268718263", "7558615219557682807", "11724486635527512143", "5004620053678171299", "12765638102632715080"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-a-13891; council seats at ["chaos-fresh-member-b-13891", "chaos-fresh-member-c-13891", "chaos-fresh-member-d-13891"]
+chaos a member that never held the log at a takeover: chaos-fresh-member-b-13891 replaced by a fresh member, rejoined at 2.022863265s
+chaos a member that never held the log at a takeover: chaos-fresh-member-e-13891 stopped at 2.28198117s
+chaos a member that never held the log at a takeover: 674 writes acknowledged; owner crashed; holders chaos-fresh-member-d-13891 (with the log) and chaos-fresh-member-e-13891 (stale)
+chaos a member that never held the log at a takeover: chaos-fresh-member-b-13891 adopted the registers; chaos-fresh-member-d-13891 stopped for 3s
+chaos a member that never held the log at a takeover: decisive true; phase one waited for the holders 1 times while the holder was stopped
+chaos a member that never held the log at a takeover:
+  owner chaos-fresh-member-a-13891; council seats at ["chaos-fresh-member-b-13891", "chaos-fresh-member-c-13891", "chaos-fresh-member-d-13891"]
+  chaos-fresh-member-b-13891 replaced by a fresh member, rejoined at 2.022863265s
+  chaos-fresh-member-e-13891 stopped at 2.28198117s
+  674 writes acknowledged; owner crashed; holders chaos-fresh-member-d-13891 (with the log) and chaos-fresh-member-e-13891 (stale)
+  chaos-fresh-member-b-13891 adopted the registers; chaos-fresh-member-d-13891 stopped for 3s
+  decisive true; phase one waited for the holders 1 times while the holder was stopped
+  a takeover once the holder answers: 1 violations
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (13892) panicked at crates/cli/tests/live_chaos.rs:1036:5:
+chaos a member that never held the log at a takeover: a takeover once the holder answers: no survivor served the volume within the fleet wait
+FAILED
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 55.44s
+== run 4 exit 101
+== run 5 at 11:09:21, load 1.88 2.16 1.17
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["767208715911531453", "15988852520962375174", "6402905017027843066", "2958833920436210733", "14612995672398404381"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-b-15531; council seats at ["chaos-fresh-member-a-15531", "chaos-fresh-member-c-15531", "chaos-fresh-member-d-15531"]
+chaos a member that never held the log at a takeover: chaos-fresh-member-e-15531 replaced by a fresh member, rejoined at 2.441453305s
+chaos a member that never held the log at a takeover: chaos-fresh-member-d-15531 stopped at 2.635758017s
+chaos a member that never held the log at a takeover: 1360 writes acknowledged; owner crashed; holders chaos-fresh-member-c-15531 (with the log) and chaos-fresh-member-d-15531 (stale)
+chaos a member that never held the log at a takeover: chaos-fresh-member-c-15531 adopted the registers; it holds the log itself, so this run cannot show the defect
+chaos a member that never held the log at a takeover: decisive false; phase one waited for the holders 0 times while the holder was stopped
+chaos a member that never held the log at a takeover: chaos-fresh-member-c-15531 served the volume after 17.776978ms
+chaos a member that never held the log at a takeover:
+  owner chaos-fresh-member-b-15531; council seats at ["chaos-fresh-member-a-15531", "chaos-fresh-member-c-15531", "chaos-fresh-member-d-15531"]
+  chaos-fresh-member-e-15531 replaced by a fresh member, rejoined at 2.441453305s
+  chaos-fresh-member-d-15531 stopped at 2.635758017s
+  1360 writes acknowledged; owner crashed; holders chaos-fresh-member-c-15531 (with the log) and chaos-fresh-member-d-15531 (stale)
+  chaos-fresh-member-c-15531 adopted the registers; it holds the log itself, so this run cannot show the defect
+  decisive false; phase one waited for the holders 0 times while the holder was stopped
+  chaos-fresh-member-c-15531 served the volume after 17.776978ms
+  NoLoss (successor): held
+  StaleNeverCommits (fences): held
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 17.78s
+== run 5 exit 0
