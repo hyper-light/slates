@@ -2566,3 +2566,97 @@ fn a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it() {
   );
   assert_eq!(resumed.0, 0, "once the candidates are back, FSYNC succeeds");
 }
+
+/// Each instance's members as its `status` lists them (`fleet_members`, itself included).
+fn members_of_each(instances: &[String]) -> Vec<(String, Vec<String>)> {
+  instances
+    .iter()
+    .map(|instance| {
+      let (_, out, _) = run(instance, &["status"]);
+      let members = value_of(&out, "fleet_members")
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+      (instance.clone(), members)
+    })
+    .collect()
+}
+
+/// §4.8 membership across an owner's warm restart: do restart, as a crash does, the daemon of the node that owns a
+/// volume (its anchor kept, so its member id is kept), then wait. Expect one membership again: every node lists every
+/// member, within four of the detector's membership horizons (`lease::horizon_ns`) after the restarted daemon
+/// answers: one to condemn what the others believed of the old process, one to spread its refutation, one to key a
+/// session afresh, and one for the load of the box the flows run on. Found by fixtures' primary-kill rungs (2026-11-07):
+/// after the primary restarted, the client node and the primary listed only each other and the two replicas only each
+/// other, never healing, so the owner could not commit and its lease never reconfirmed.
+#[test]
+fn a_fleet_is_one_membership_again_after_its_owners_warm_restart() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the membership-after-restart flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet_as("member-restart", "anchor");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let id = create_live_volume(&owner, "owned");
+  write_files(&owner, &id, 0..1);
+  let hosts: Vec<String> = fleet
+    .instances
+    .iter()
+    .map(|instance| value_of(&run_ready(instance, &["status"]), "fleet_host"))
+    .collect();
+  restart_warm(&owner);
+  let hosts_after: Vec<String> = fleet
+    .instances
+    .iter()
+    .map(|instance| value_of(&run_ready(instance, &["status"]), "fleet_host"))
+    .collect();
+  eprintln!("member restart: hosts before {hosts:?}, after {hosts_after:?} (owner {owner})");
+  let bound = Duration::from_nanos(slates_server::lease::horizon_ns().saturating_mul(4));
+  let began = Instant::now();
+  let whole = loop {
+    let views = members_of_each(&fleet.instances);
+    let one = views
+      .iter()
+      .all(|(_, members)| hosts.iter().all(|host| members.contains(host)));
+    if one || began.elapsed() > bound {
+      break (one, views);
+    }
+    pause();
+  };
+  let took = began.elapsed();
+  // Every node's whole status, for the record of a failing run.
+  for instance in &fleet.instances {
+    let (_, out, _) = run(instance, &["status"]);
+    let path = format!("{}/{instance}.status", env!("CARGO_TARGET_TMPDIR"));
+    #[allow(clippy::disallowed_methods)]
+    let _ = std::fs::write(&path, out);
+    eprintln!("member restart: status of {instance} at {path}");
+  }
+  let counters: Vec<_> = fleet
+    .instances
+    .iter()
+    .map(|instance| {
+      let (_, out, _) = run(instance, &["status"]);
+      let detector: Vec<String> = out
+        .lines()
+        .filter(|line| line.starts_with("fleet_detector ") || line.starts_with("restarts:"))
+        .map(|line| line.chars().take(160).collect())
+        .collect();
+      (instance.clone(), detector)
+    })
+    .collect();
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!(
+    "member restart: one membership {} after {took:?} (bound {bound:?}); members {:?}; {counters:?}",
+    whole.0, whole.1
+  );
+  assert!(
+    whole.0,
+    "every node lists every member within {bound:?} of the owner's warm restart: {:?}",
+    whole.1
+  );
+}
