@@ -1,0 +1,180 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 17:25:40 UTC 2026, head abb19af87bd84f09ca35465f1f33df2957da88ab
+== run 1 at 17:25:40, load 1.88 1.51 0.66
+chaos: fleet long-log (Bare) formed and settled: hosts ["7236061816139177385", "1981356261783734247", "7221134583810829170"]
+
+thread 'a_long_live_log_is_taken_over_whole' (6119) panicked at crates/cli/tests/live_chaos.rs:1236:7:
+the stream made 40 writes durable on chaos-long-log-c-6118 (from 983, now Some(1001)):
+--- chaos-long-log-a-6118 (status exit 0; live Some([LiveState { holding: true, head: Some(1001), durable: None, owed: false, epoch: Some(1), identity: Some("dbf1cbadd561f36cc5a1af8ddb34811257b6be4eba8df8e80ffd853ef00a3a90"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 7236061816139177385
+  fleet_host_epoch: 1
+  fleet_members: 1981356261783734247 7221134583810829170 7236061816139177385
+  fleet_held_records: 2
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 4
+  fleet_settled_generation: 2
+  fleet_neighbourhood_generation: 2
+  fleet_session 1981356261783734247: lent=false cwnd=130934 srtt_ns=539371 pto_ns=3334587 spurious_losses=0 persistent_collapses=0 consumed=4707 mtu=65496
+  fleet_session 7221134583810829170: lent=false cwnd=130934 srtt_ns=771676 pto_ns=2884412 spurious_losses=0 persistent_collapses=0 consumed=3482 mtu=65496
+  shard 0 refused fleet.link.stale_return: 1
+  shard 0 refused fleet.live.held: 1002
+  shard 0 refused fleet.plane.announce_lends: 6
+  shard 0 refused fleet.plane.announcements_sent: 6
+  shard 0 refused fleet.plane.peer_reconnected: 2
+  shard 0 refused fleet.seal.pair_served: 4
+  shard 0 live held 64369fa50f552b72000000000000009b head=1001 durable=none owed=false epoch=1 identity=dbf1cbadd561f36cc5a1af8ddb34811257b6be4eba8df8e80ffd853ef00a3a90 fence=1 holders=none moving_to=none recorded=none
+--- chaos-long-log-b-6118 (status exit 0; live Some([LiveState { holding: true, head: Some(1001), durable: None, owed: false, epoch: Some(1), identity: Some("dbf1cbadd561f36cc5a1af8ddb34811257b6be4eba8df8e80ffd853ef00a3a90"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 1981356261783734247
+  fleet_host_epoch: 1
+  fleet_members: 1981356261783734247 7221134583810829170 7236061816139177385
+  fleet_held_records: 2
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 4
+  fleet_settled_generation: 2
+  fleet_neighbourhood_generation: 2
+  fleet_session 7221134583810829170: lent=false cwnd=130934 srtt_ns=819444 pto_ns=5160764 spurious_losses=0 persistent_collapses=0 consumed=43436 mtu=65496
+  fleet_session 7236061816139177385: lent=false cwnd=130934 srtt_ns=2170942 pto_ns=12170974 spurious_losses=0 persistent_collapses=0 consumed=43670 mtu=65496
+  shard 0 refused fleet.live.held: 754
+  shard 0 refused fleet.plane.announce_lends: 4
+  shard 0 refused fleet.plane.announcements_sent: 4
+  shard 0 refused fleet.seal.pair_served: 4
+  shard 0 live held 64369fa50f552b72000000000000009b head=1001 durable=none owed=false epoch=1 identity=dbf1cbadd561f36cc5a1af8ddb34811257b6be4eba8df8e80ffd853ef00a3a90 fence=1 holders=none moving_to=none recorded=none
+--- chaos-long-log-c-6118 (status exit 0; live Some([LiveState { holding: false, head: Some(1001), durable: Some(1001), owed: false, epoch: Some(1), identity: Some("dbf1cbadd561f36cc5a1af8ddb34811257b6be4eba8df8e80ffd853ef00a3a90"), fence: 1, holders: ["1981356261783734247", "7236061816139177385"], moving_to: [], recorded: ["1981356261783734247", "7236061816139177385"] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 7221134583810829170
+  fleet_host_epoch: 1
+  fleet_members: 1981356261783734247 7221134583810829170 7236061816139177385
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 4
+  fleet_settled_generation: 2
+  fleet_neighbourhood_generation: 2
+  fleet_session 1981356261783734247: lent=false cwnd=130934 srtt_ns=656053 pto_ns=3410601 spurious_losses=0 persistent_collapses=0 consumed=41870 mtu=65496
+  fleet_session 7236061816139177385: lent=false cwnd=130934 srtt_ns=715309 pto_ns=3134817 spurious_losses=0 persistent_collapses=0 consumed=54005 mtu=65496
+  shard 0 refused fleet.link.stale_return: 1
+  shard 0 refused fleet.live.appended: 1002
+  shard 0 refused fleet.live.awaited: 1000
+  shard 0 refused fleet.live.durable: 1002
+  shard 0 refused fleet.live.held_back.placement: 1
+  shard 0 refused fleet.live.holders_recorded: 1
+  shard 0 refused fleet.live.install_image: 1
+  shard 0 refused fleet.live.no_session: 4
+  shard 0 refused fleet.live.resolved: 1000
+  shard 0 refused fleet.live.whole: 1
+  shard 0 refused fleet.plane.announce_lends: 5
+  shard 0 refused fleet.plane.announcements_sent: 5
+  shard 0 refused fleet.plane.peer_reconnected: 1
+  shard 0 refused fleet.seal.pair_served: 4
+  shard 0 live shipping 64369fa50f552b72000000000000009b head=1001 durable=1001 owed=false epoch=1 identity=dbf1cbadd561f36cc5a1af8ddb34811257b6be4eba8df8e80ffd853ef00a3a90 fence=1 holders=1981356261783734247,7236061816139177385 moving_to=none recorded=1981356261783734247,7236061816139177385
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+--
+    a_long_live_log_is_taken_over_whole
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 42.85s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 1 exit 101
+== run 2 at 17:26:23, load 4.13 2.14 0.91
+chaos: fleet long-log (Bare) formed and settled: hosts ["15414583177997523567", "15595916312864715078", "1562175653441857014"]
+chaos a long live log taken over: 1000 writes, 1000 acknowledged: p50 586 us, p99 22421 us, p999 25959 us, max 176335 us; 1 over 50ms (sent+took): 0.00s+176ms
+chaos a long live log taken over: 333 samples, 240 heads seen
+chaos a long live log taken over: taken over by chaos-long-log-c-12656 after 2.197418151s
+chaos a long live log taken over:
+  1000 writes, 1000 acknowledged: p50 586 us, p99 22421 us, p999 25959 us, max 176335 us; 1 over 50ms (sent+took): 0.00s+176ms
+  333 samples, 240 heads seen
+  Agreement: held
+  Convergence: held
+  taken over by chaos-long-log-c-12656 after 2.197418151s
+  NoLoss (successor): held
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 7.24s
+
+== run 2 exit 0
+== run 3 at 17:26:30, load 4.28 2.20 0.94
+chaos: fleet long-log (Bare) formed and settled: hosts ["808131284754328899", "10874114433206355646", "6682382650618205179"]
+
+thread 'a_long_live_log_is_taken_over_whole' (13417) panicked at crates/cli/tests/live_chaos.rs:1236:7:
+the stream made 40 writes durable on chaos-long-log-b-13416 (from 980, now Some(1003)):
+--- chaos-long-log-a-13416 (status exit 0; live Some([LiveState { holding: true, head: Some(1003), durable: None, owed: false, epoch: Some(1), identity: Some("18c7e072a60783a1aa45fed709dd0e640dd3a6baebd8cf2abadf99dc9b0e5e90"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 808131284754328899
+  fleet_host_epoch: 1
+  fleet_members: 808131284754328899 6682382650618205179 10874114433206355646
+  fleet_held_records: 2
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 4
+  fleet_settled_generation: 2
+  fleet_neighbourhood_generation: 2
+  fleet_session 6682382650618205179: lent=false cwnd=130934 srtt_ns=794438 pto_ns=4274982 spurious_losses=0 persistent_collapses=0 consumed=45292 mtu=65496
+  fleet_session 10874114433206355646: lent=false cwnd=130934 srtt_ns=722636 pto_ns=3672664 spurious_losses=0 persistent_collapses=0 consumed=45302 mtu=65496
+  shard 0 refused fleet.live.held: 909
+  shard 0 refused fleet.plane.announce_lends: 4
+  shard 0 refused fleet.plane.announcements_sent: 4
+  shard 0 refused fleet.seal.pair_served: 4
+  shard 0 live held 96e89d76a63686be000000000000004f head=1003 durable=none owed=false epoch=1 identity=18c7e072a60783a1aa45fed709dd0e640dd3a6baebd8cf2abadf99dc9b0e5e90 fence=1 holders=none moving_to=none recorded=none
+--- chaos-long-log-b-13416 (status exit 0; live Some([LiveState { holding: false, head: Some(1003), durable: Some(1003), owed: false, epoch: Some(1), identity: Some("18c7e072a60783a1aa45fed709dd0e640dd3a6baebd8cf2abadf99dc9b0e5e90"), fence: 1, holders: ["808131284754328899", "6682382650618205179"], moving_to: [], recorded: ["808131284754328899", "6682382650618205179"] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 10874114433206355646
+  fleet_host_epoch: 1
+  fleet_members: 808131284754328899 6682382650618205179 10874114433206355646
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 4
+  fleet_settled_generation: 2
+  fleet_neighbourhood_generation: 2
+  fleet_session 808131284754328899: lent=false cwnd=130934 srtt_ns=1297533 pto_ns=8075213 spurious_losses=0 persistent_collapses=0 consumed=49484 mtu=65496
+  fleet_session 6682382650618205179: lent=false cwnd=512721 srtt_ns=1128349 pto_ns=6013601 spurious_losses=0 persistent_collapses=0 consumed=52914 mtu=65496
+  shard 0 refused fleet.live.appended: 1004
+  shard 0 refused fleet.live.awaited: 1000
+  shard 0 refused fleet.live.durable: 1004
+  shard 0 refused fleet.live.held_back.placement: 1
+  shard 0 refused fleet.live.holders_recorded: 1
+  shard 0 refused fleet.live.install_image: 1
+  shard 0 refused fleet.live.no_session: 3
+  shard 0 refused fleet.live.resolved: 1000
+  shard 0 refused fleet.live.whole: 1
+  shard 0 refused fleet.plane.announce_lends: 5
+  shard 0 refused fleet.plane.announcements_sent: 5
+  shard 0 refused fleet.plane.peer_reconnected: 1
+  shard 0 refused fleet.seal.pair_served: 4
+  shard 0 live shipping 96e89d76a63686be000000000000004f head=1003 durable=1003 owed=false epoch=1 identity=18c7e072a60783a1aa45fed709dd0e640dd3a6baebd8cf2abadf99dc9b0e5e90 fence=1 holders=808131284754328899,6682382650618205179 moving_to=none recorded=808131284754328899,6682382650618205179
+--- chaos-long-log-c-13416 (status exit 0; live Some([LiveState { holding: true, head: Some(1003), durable: None, owed: false, epoch: Some(1), identity: Some("18c7e072a60783a1aa45fed709dd0e640dd3a6baebd8cf2abadf99dc9b0e5e90"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 6682382650618205179
+  fleet_host_epoch: 1
+  fleet_members: 808131284754328899 6682382650618205179 10874114433206355646
+  fleet_held_records: 2
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 4
+  fleet_settled_generation: 2
+  fleet_neighbourhood_generation: 2
+  fleet_session 808131284754328899: lent=false cwnd=130934 srtt_ns=840364 pto_ns=3886184 spurious_losses=0 persistent_collapses=0 consumed=4718 mtu=65496
+  fleet_session 10874114433206355646: lent=false cwnd=130934 srtt_ns=1024147 pto_ns=4794115 spurious_losses=0 persistent_collapses=0 consumed=4701 mtu=65496
+  shard 0 refused fleet.live.held: 1004
+  shard 0 refused fleet.plane.announce_lends: 6
+  shard 0 refused fleet.plane.announcements_sent: 6
+  shard 0 refused fleet.plane.peer_reconnected: 2
+  shard 0 refused fleet.seal.pair_served: 4
+  shard 0 live held 96e89d76a63686be000000000000004f head=1003 durable=none owed=false epoch=1 identity=18c7e072a60783a1aa45fed709dd0e640dd3a6baebd8cf2abadf99dc9b0e5e90 fence=1 holders=none moving_to=none recorded=none
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+--
+    a_long_live_log_is_taken_over_whole
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 43.84s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 3 exit 101
