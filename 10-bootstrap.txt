@@ -51,3 +51,6 @@ test measure_what_live_shipping_adds_to_a_stable_nfs_write ... skipping the live
 test three_daemon_processes_ship_a_live_volumes_writes_to_both_candidates ... slates daemon: fleet node `c` of `slates-fleet`: member 8104354723151373576 with 2 peer(s) at f = 1
 test writes_stay_durable_through_injected_candidate_stalls ... slates daemon: fleet node `c` of `slates-fleet`: member 8968496169431155175 with 2 peer(s) at f = 1
 test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 223.12s
+=== boot-1 exit 0 load { 15.16 14.15 11.59 }
+test a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates ... slates daemon: fleet node `a` of `slates-fleet`: member 14584345337675801646slates daemon: fleet node `b` of `slates-fleet`: member 12026455468667511999 with 2 peer(s) at f = 1
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 4.40s
