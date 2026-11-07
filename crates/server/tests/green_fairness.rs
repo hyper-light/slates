@@ -29,11 +29,13 @@ use common::target::{TargetDir, target_dir};
 /// Shape: one shard, so the green's walk and the probing client share it — the shard is the subject.
 const TEST_SHARDS: u16 = 1;
 /// Shape: the files of the base, spread over [`DIRS`] directories: enough that walking them into an origin spans many
-/// of the shard's step quanta on any machine, and few enough that the pin that makes the base complete stays short
-/// (a pin costs 0.26 to 0.43 ms a file over a real disk on a Mac, 2026-11-06).
-const FILES: usize = 4_000;
+/// of the shard's step quanta on any machine (4,000 of these files were one poll of 549 ms on CI's x86_64 runner and
+/// 3.8 s on its arm64 one, 2026-11-07), and few enough that the sliced walk ends within [`CREATE_WAIT`] on a box
+/// several times oversubscribed, where a slice's yield costs the shard a scheduler quantum (4,000 took over two
+/// minutes on an 18-core Mac at load 51).
+const FILES: usize = 1_000;
 /// Shape: the directories the files are spread over, so the walk walks a tree, not one directory.
-const DIRS: usize = 40;
+const DIRS: usize = 20;
 /// Shape: each file's bytes: large enough that copying and hashing the tree's bytes is most of the walk's work, as it
 /// is over a real source tree (the kernel's `fs/` averages about 16 KB a file).
 const FILE_BYTES: usize = 16 * 1024;
@@ -153,7 +155,7 @@ fn quantile(samples: &mut [Duration], ppm: u64) -> Duration {
   samples[usize::try_from(rank).unwrap() - 1]
 }
 
-/// §4.16 "Green creation", §4.3, R9. Do: on a one-shard daemon, overlay a base of 4,000 files of 16 KiB in 40
+/// §4.16 "Green creation", §4.3, R9. Do: on a one-shard daemon, overlay a base of 1,000 files of 16 KiB in 20
 /// directories, pin it whole and snapshot it; take each probe's baseline latency; then create a green over the snapshot
 /// on one thread while another client keeps probing the same shard, pausing its baseline median between probes: a
 /// status read, and a volume created and destroyed. Expect: the green is created; the shard answered probes while the

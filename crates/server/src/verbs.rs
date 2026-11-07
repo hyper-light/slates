@@ -5328,7 +5328,8 @@ impl GreenJob {
         Ok(None)
       }
       GreenStage::Load { identity, mut load } => {
-        let share = usize::try_from(state.config.copy_slice_bytes()).unwrap_or(usize::MAX);
+        // A file's seeding is bound by hashing its bytes into the head identity, so its share is the hash rate's.
+        let share = usize::try_from(state.config.archive_slice_bytes()).unwrap_or(usize::MAX);
         match load.step(share) {
           Some(engine) => Ok(Some((identity, engine))),
           None => {

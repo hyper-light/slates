@@ -61,16 +61,14 @@ impl Origin {
   /// Sorts every table by its key and drops a repeated key (the last declared wins), so the
   /// encoding is one sequence whatever order the service walked the snapshot in.
   pub fn canonicalize(&mut self) {
-    dedup_by_key(&mut self.specials, |(path, _)| path.clone());
-    dedup_by_key(&mut self.files, |(path, _)| path.clone());
+    dedup_by(&mut self.specials, |a, b| a.0.cmp(&b.0));
+    dedup_by(&mut self.files, |a, b| a.0.cmp(&b.0));
     self.dirs.sort();
     self.dirs.dedup();
-    dedup_by_key(&mut self.modes, |(path, _)| path.clone());
-    dedup_by_key(&mut self.symlinks, |(path, _)| path.clone());
-    dedup_by_key(&mut self.hardlinks, |(path, _)| path.clone());
-    dedup_by_key(&mut self.xattrs, |(path, name, _)| {
-      (path.clone(), name.clone())
-    });
+    dedup_by(&mut self.modes, |a, b| a.0.cmp(&b.0));
+    dedup_by(&mut self.symlinks, |a, b| a.0.cmp(&b.0));
+    dedup_by(&mut self.hardlinks, |a, b| a.0.cmp(&b.0));
+    dedup_by(&mut self.xattrs, |a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
   }
 
   /// The canonical bytes: the magic and version, then each table as a count and its entries, every
@@ -352,13 +350,14 @@ fn strictly<T>(table: &[T], before: impl Fn(&T, &T) -> bool) -> bool {
   })
 }
 
-/// Sorts `table` by `key` and keeps the last entry of each repeated key.
-fn dedup_by_key<T, K: Ord>(table: &mut Vec<T>, key: impl Fn(&T) -> K) {
+/// Sorts `table` by `order` (its key's order) and keeps the last entry of each repeated key. Compares the keys where
+/// they lie: a key cloned per comparison cost a kernel-sized origin (97,229 files) millions of string copies a sort.
+fn dedup_by<T>(table: &mut Vec<T>, order: impl Fn(&T, &T) -> std::cmp::Ordering) {
   // A stable sort keeps declaration order among equal keys, so "the last declared wins" is
   // reversing before the dedup (which keeps the first of a run) and reversing back.
-  table.sort_by_key(&key);
+  table.sort_by(&order);
   table.reverse();
-  table.dedup_by(|a, b| key(a) == key(b));
+  table.dedup_by(|a, b| order(a, b) == std::cmp::Ordering::Equal);
   table.reverse();
 }
 

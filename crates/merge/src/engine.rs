@@ -302,10 +302,12 @@ pub struct OriginLoad {
 }
 
 impl OriginLoad {
-  /// A load of `origin`, canonicalized in place (later declarations of a repeated key win, as
-  /// [`crate::origin::Origin::canonicalize`] keeps them).
+  /// A load of `origin`, canonicalized in place unless it already is (later declarations of a repeated key win, as
+  /// [`crate::origin::Origin::canonicalize`] keeps them); a walk of a snapshot gives a canonical one.
   pub fn new(mut origin: crate::origin::Origin) -> OriginLoad {
-    origin.canonicalize();
+    if !origin.is_canonical() {
+      origin.canonicalize();
+    }
     OriginLoad {
       green: Green::default(),
       origin,
