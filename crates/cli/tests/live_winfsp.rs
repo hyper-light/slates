@@ -334,10 +334,14 @@ struct Suspended {
 impl Suspended {
   /// Suspends the daemon `instance`'s anchor supervises, named by the `pid` its `status` reports.
   fn daemon_of(instance: &str) -> Suspended {
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SUSPEND_RESUME};
     let (code, out, err) = run(instance, &["status"]);
     assert_eq!(code, 0, "status: {err}");
-    let pid: u32 = value_of(&out, "pid").trim().parse().unwrap();
+    Suspended::process(value_of(&out, "pid").trim().parse().unwrap())
+  }
+
+  /// Suspends process `pid`.
+  fn process(pid: u32) -> Suspended {
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SUSPEND_RESUME};
     // SAFETY: opens a handle to a process by id; the result is checked before use and closed on drop.
     let process = unsafe { OpenProcess(PROCESS_SUSPEND_RESUME, 0, pid) };
     assert!(!process.is_null(), "OpenProcess({pid})");
@@ -357,6 +361,36 @@ impl Drop for Suspended {
     }
     // SAFETY: as above; closed once.
     unsafe { windows_sys::Win32::Foundation::CloseHandle(self.process) };
+  }
+}
+
+/// A fleet node partitioned whole: its anchor suspended first, then its daemon. An anchor whose daemon stopped beating
+/// past the liveness budget kills it and starts a successor under a fresh identity (`slates anchor: daemon exited
+/// (Some(143)); restarted`, CI run 3 of round 2, 2026-11-06), which is a crash, not a partition. Resumed on drop in the
+/// other order: the daemon, then, a few heartbeats later, the anchor, so the anchor never reads a stale beat.
+struct PartitionedNode {
+  daemon: Option<Suspended>,
+  anchor: Option<Suspended>,
+}
+
+impl PartitionedNode {
+  fn of(instance: &str, anchor: &OwnedProcess) -> PartitionedNode {
+    let anchor = Suspended::process(anchor.child.id());
+    PartitionedNode {
+      daemon: Some(Suspended::daemon_of(instance)),
+      anchor: Some(anchor),
+    }
+  }
+}
+
+impl Drop for PartitionedNode {
+  fn drop(&mut self) {
+    drop(self.daemon.take());
+    // Shape: three heartbeats, so the resumed daemon has beaten before its anchor looks.
+    std::thread::sleep(Duration::from_nanos(
+      3 * slates_server::daemon::HEARTBEAT_NS,
+    ));
+    drop(self.anchor.take());
   }
 }
 
@@ -407,7 +441,7 @@ fn synced_once_served(file: &std::fs::File) -> std::io::Result<()> {
 /// A-200 over WinFsp (§4.6 "Windows"): `FlushFileBuffers` through a drive is the caller's durability claim, which on a
 /// live volume holds only once `f` candidates hold what the flush published. Do: form a three-node fleet of anchors,
 /// make a live volume on one, mount it at a free drive, write a file and flush it (`File::sync_all`) once healthy, once
-/// with both candidates' daemons suspended, and once more after they resume. Expect: healthy, success; suspended, an
+/// with both candidates suspended (each anchor, then its daemon), and once more after they resume. Expect: healthy, success; suspended, an
 /// error after the liveness budget, never success; resumed, success.
 #[test]
 fn a_winfsp_flush_on_a_live_volume_answers_only_once_a_candidate_holds_it() {
@@ -439,15 +473,12 @@ fn a_winfsp_flush_on_a_live_volume_answers_only_once_a_candidate_holds_it() {
   let mut file = std::fs::File::create(&path).unwrap();
   file.write_all(b"held by a candidate").unwrap();
   let healthy = file.sync_all();
-  let candidates: Vec<&String> = instances
+  let suspended: Vec<PartitionedNode> = instances
     .iter()
+    .zip(&anchors)
     .enumerate()
     .filter(|(index, _)| *index != owner_index)
-    .map(|(_, instance)| instance)
-    .collect();
-  let suspended: Vec<Suspended> = candidates
-    .iter()
-    .map(|candidate| Suspended::daemon_of(candidate))
+    .map(|(_, (instance, anchor))| PartitionedNode::of(instance, anchor))
     .collect();
   file.write_all(b", then by no one").unwrap();
   let began = Instant::now();
