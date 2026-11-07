@@ -797,6 +797,77 @@ fn cleanup_once(
   let _reply = answer.recv().unwrap();
 }
 
+/// GAPS, "A private purge's intent can wait up to the 1 s transaction timeout". Do: on an idle drive, purge four files
+/// whose names the kernel refuses before any request reaches the host (a component one unit longer than the volume
+/// allows), so each purge's Begin and End are published with nothing received between them. Expect: the round's outcome
+/// within one transaction timeout. Before, every publish past the channel's two waited for the idle receive to time out.
+#[test]
+fn purges_the_kernel_refuses_on_an_idle_drive_do_not_wait_out_the_transaction_timeout() {
+  if std::env::var_os("WINFSP_TEST_MOUNT").is_none() {
+    eprintln!("SKIP: the idle purge oracle needs WINFSP_TEST_MOUNT=1 and WinFsp installed");
+    return;
+  }
+  install_purge_client();
+  let drive = free_drive();
+  let mut store = fixed_store();
+  let (mut volume, cx) = fixed_volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut volume, &mut store);
+  let (send, receive) = sync_channel(REQUEST_BOUND);
+  let mut mount = MountThread::start(
+    &drive,
+    false,
+    send,
+    Waker::noop().clone(),
+    slates_bridge_core::volume_bridge::MAX_OPEN_HANDLES,
+    None,
+  )
+  .unwrap();
+  let mut ready = await_ready(&mut mount);
+  let root = ObjectId::new(bridge.root(&cx).unwrap(), 0);
+  let file = bridge.lookup(root, &cx, "file").unwrap();
+  let refused = "a".repeat(usize::from(MAX_COMPONENT_LENGTH) + 1);
+  let purges: Vec<crate::purge::Purge> = (0..4)
+    .map(|_| crate::purge::Purge {
+      object: ObjectId::new(file.ino, file.generation),
+      path: format!("\\{refused}"),
+      offset: 0,
+      len: u64::try_from(PAGE).unwrap(),
+    })
+    .collect();
+  let mut names = OpenNames::new();
+  let started = Instant::now();
+  mount.purge(purges).unwrap();
+  let purged = loop {
+    match mount.outcome() {
+      Some(Outcome::Purged(purged)) => break purged,
+      Some(Outcome::Failed(error)) => panic!("the receive worker failed: {error}"),
+      Some(Outcome::Stopped) => panic!("the mount stopped during the purge round"),
+      Some(_) | None => {}
+    }
+    match receive.recv_timeout(POLL) {
+      Ok(request) => assert!(
+        request
+          .serve(&mut bridge, &cx, &mut names, &mut ready.ledger)
+          .send()
+      ),
+      Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+      Err(error) => panic!("the fixture's request channel: {error}"),
+    }
+    assert!(started.elapsed() < ROLE_WAIT, "the purge round never ended");
+  };
+  let took = started.elapsed();
+  eprintln!(
+    "WINFSP IDLE PURGE: {} purges whose opens the kernel refused took {took:?}",
+    purged.outcomes.len()
+  );
+  assert_eq!(purged.outcomes.len(), 4, "every purge must be made");
+  let timeout = Duration::from_millis(u64::from(crate::dispatcher::TRANSACT_TIMEOUT_MS));
+  assert!(
+    took < timeout,
+    "the purge round took {took:?}, waiting out the idle receive's {timeout:?} transaction timeout"
+  );
+}
+
 /// This test binary as a mount's purge client, the role `slates winfsp-purge-client` plays for the daemon.
 fn install_purge_client() {
   crate::purge_client::install(crate::purge_client::Program {
