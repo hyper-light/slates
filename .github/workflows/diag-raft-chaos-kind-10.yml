@@ -1,0 +1,77 @@
+name: DIAG raft-chaos A-240 (not for main)
+
+# Diagnostics branch of the raft-chaos agent; never merged. A-240 (phase one counts f + 1 among the holders the shipper
+# recorded; heads first, then the adopted holder's log under a size-derived budget):
+# - the KIND live leg (`cargo xtask kind live`): live-shipped writes unshaped and under wan, wan-loss and ceiling, the
+#   owner's pod deleted for a takeover over the shaped paths;
+# - the five-node process flow `a_member_that_never_held_the_log_never_stands_in_for_its_holder`, three runs, release.
+# Results to diag-results/diag-raft-chaos-kind-10-fresh-member by git push (read with git fetch, no API call).
+
+on:
+  push:
+    branches: [diag-raft-chaos-kind-10]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  SLATES_TEST_CLI: "1"
+
+jobs:
+  kind-live:
+    name: KIND live leg on ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.3.0
+      - uses: helm/kind-action@v1
+        with:
+          version: v0.33.0
+          install_only: true
+      - name: The live leg
+        run: cargo xtask kind live
+  fresh-member:
+    name: A-240 five-node fresh-member flow x3 (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked -p slates-cli --bin slates --test live_chaos
+      - name: The fresh-member flow, three runs
+        run: |
+          R=../results.txt
+          echo "runner ubuntu-latest, $(nproc) CPUs, $(date -u), head $(git rev-parse HEAD)" > $R
+          for run in 1 2 3; do
+            echo "== run $run at $(date -u +%H:%M:%S), load $(cut -d' ' -f1-3 /proc/loadavg)" | tee -a $R
+            status=0
+            timeout 900 cargo test --release --locked -p slates-cli --test live_chaos -- --nocapture --test-threads=1 --exact a_member_that_never_held_the_log_never_stands_in_for_its_holder > ../run.log 2>&1 || status=$?
+            grep -E '^chaos|panicked|violat|FAILED|test result|^  |^---' ../run.log | cut -c1-900 | tail -300 >> $R
+            echo "== run $run exit $status" | tee -a $R
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/diag-raft-chaos-kind-10-fresh-member"
+          git config user.name "diag-raft-chaos"
+          git config user.email "diag-raft-chaos@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-raft-chaos-kind-10 results"
+          git push -q origin "HEAD:refs/heads/$branch"
