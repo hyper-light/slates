@@ -6001,10 +6001,10 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > 42318867890: `wan` at durable 123 of 126, `wan-loss` 199 of 202, `ceiling` 0 of 3). The lanes with the catalogued
 > holders alone acknowledged every write in every profile (run 42357764313: `wan` p99 979 ms, max 1.59 s), and so did
 > the lanes with the stragglers' wait (run 42326682216: `wan` p99 1.36 s). So KIND does not separate the stragglers'
-> wait's own effect, and it has no local failing test: the stranding needs a request still in flight as its lane ends.
-> What argues for it is the mechanism (a cancelled child drops the session it holds) and `live_chaos`'s rolling
-> partition: 3 of 10 runs stalled without it at load 118, 0 of 10 with it at load 41–58. Those loads differ, so this
-> is not an A/B. The first write's ~99 ms in some runs is a lane waiting one record period for its holder's session,
+> wait's own effect. Its failing test is on the simulated fabric, where the mechanism is deterministic:
+> `a_lane_that_ends_with_a_holder_unanswered_gets_every_session_back` (`crates/cluster/tests/live.rs`) ships from a task
+> of its own with one holder silent, settles (`Stragglers::settle`, which the lane's `finish_stragglers` calls) and ends;
+> both sessions come back. With the settle removed, only the answering holder's does ([HostId(2)] against both). The first write's ~99 ms in some runs is a lane waiting one record period for its holder's session,
 > lent to the record plane (`ship_head`); open.
 >
 > **An install image beside the log (2026-11-07).** A holder that falls behind the retained tail is installed with the

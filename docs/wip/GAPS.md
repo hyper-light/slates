@@ -875,7 +875,7 @@
 > to holders of its catalog, and a lane waits for its requests before it ends (§4.10 status "One lane a holder"): a
 > write no longer waits for a stopped candidate (main: 406–1,064 ms for the first write after a stop, now 3–99 ms), and
 > no holder's session is left lent with a cancelled request (KIND `wan`, `wan-loss` and `ceiling` acknowledged every
-> write, where main stalled; the lanes alone did too, so KIND does not separate the stragglers' wait). Open: a large install over a slow path is still cut at the live budget, as on main; it
+> write, where main stalled; the lanes alone did too, so KIND does not separate the stragglers' wait; its failing test is on the simulated fabric, `a_lane_that_ends_with_a_holder_unanswered_gets_every_session_back`). Open: a large install over a slow path is still cut at the live budget, as on main; it
 > waits on raft-chaos's size-derived exchange budget. And a lane may wait one record period for a session the record
 > plane has lent (`ship_head`). Fixed the same day: a holder behind the retained tail no longer puts a whole copy of the volume on the log ahead of every later write; it is installed from an image made beside the log (§4.10 status "An install image beside the log"). Open: one exchange per message to every holder starved the second holder (never
 > accepted an entry, in six of nine process flows) and was rejected; why is not pinned down. Open, toward a filesystem
