@@ -1,0 +1,35 @@
+tested 888e3ae300339543ebbb748cf23100d6e9b20c62 variant after on x86_64, 4 cpus
+merge exit 0 12s
+  merge: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+  merge: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+  merge: test a_hostile_checkpoint_is_refused_typed ... ok
+  merge: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+  merge: test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+  merge: test an_increment_whose_ops_run_past_the_base_is_judged_not_panicked ... ok
+  merge: test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+  merge: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+  merge: test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+  merge: test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+  merge: test a_path_that_is_not_utf8_is_refused_by_type ... ok
+  merge: test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+  merge: test an_increments_evidence_round_trips_and_a_wild_count_is_refused ... ok
+  merge: test a_malformed_origin_is_refused_typed_at_every_cut ... ok
+  merge: test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  merge: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+  merge: test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  merge: test an_ipc_creation_with_an_invalid_path_reference_is_refused ... ok
+  merge: test hostile_ipc_metadata_refuses_unknown_kinds_and_every_truncation ... ok
+  merge: test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  merge: test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+  merge: test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  merge: test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+retention exit 0 70s
+  retention: warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+  retention: test a_connect_past_the_client_bound_is_refused_typed_at_the_rendezvous ... ok
+  retention: test a_client_that_never_acknowledges_is_refused_at_its_bound_and_served_once_it_acknowledges ... ok
+  retention: test a_works_edits_are_charged_and_refused_typed_when_the_budget_cannot_hold_them ... ok
+  retention: test a_write_the_declared_durability_cannot_cover_is_refused_typed ... ok
+  retention: slates-server: a client's claim was refused: send refused (code Some(32)) (first occurrence; later ones are counted)
+  retention: test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.39s
+  retention: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+  retention: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s
