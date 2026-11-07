@@ -5171,6 +5171,21 @@ integration still require the A-9 tests.
 > until the ledger-prefix transfer ships the history, so its owner stays unsettled (safe: the joint writes go
 > on).
 
+> **Status (2026-11-06, A-234, reviewed by raft-chaos;
+> `docs/bugs/2026-11-06-a-submit-in-a-three-process-fleet-is-never-answered.md`).** Two corrections, both found where a
+> green was made on a bootstrapper before its council grew:
+> - **A cohort smaller than the quorum.** A bootstrap settles the first node's neighbourhood as itself alone, so while
+>   it grows to the region a record's placement is joint with that one-member cohort. At `f = 1` a cohort of one can
+>   never give `f + 1`, so no such record committed, and the change waiting for the owner's greens never settled. A
+>   joint write now needs, of each cohort, `f + 1` or every member when it has fewer (`Quorum::committed_within`). A
+>   cohort of `f + 1` or more is judged as before. A takeover's phase one through a sub-quorum cohort already needs one
+>   promise (`Quorum::recovery`), which meets a commit every member holds.
+> - **Merge records are re-placed like heads.** A pending merge record kept the placement it was enqueued under; it
+>   now follows the owner's current placement each period (`PendingGreen::retarget`), keeping its acknowledgements.
+> Regressions: `a_submit_made_while_the_council_forms_is_answered_once_its_record_commits`,
+> `a_submit_in_a_three_process_fleet_is_answered_once_its_record_commits` (CLI), and
+> `a_joint_placement_with_a_cohort_smaller_than_the_quorum_needs_every_member_of_it`.
+
 **Leases and reads.** Epoch fencing alone does not authorize linearizable owner-local reads.
 Use the explicit lease safety obligations above: only an owner with a currently confirmed,
 conservatively bounded lease may serve the latest head locally. Expiry/uncertainty stops those
@@ -5883,6 +5898,47 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > the flow: with both candidates stopped the `fsync` fails `EIO` after 1.0006 s (the liveness budget); healthy and after
 > the candidates resume, it succeeds.
 >
+> **Every other durability claim (2026-11-05, the sibling sweep of FUSE `fsync`).** Each place a client is told data is
+> durable on a live volume now waits for the position its barrier published, and the same failing test holds each to
+> it across three real daemon processes (`crates/cli/tests/live_fleet.rs`): with both candidates' processes stopped
+> the claim fails or waits, never succeeds; healthy and after they resume, it succeeds.
+> - *A Shards stream's `FSYNC`* (`crate::shards`; its DAX compare-back runs before it): answered `0` in 337 µs with
+>   both candidates stopped, red first; now held until durable, `EIO` after 1.0011–1.0025 s (3 of 3).
+> - *A writable map's `MapSync`* and a writable `ReleaseMap` (`crate::direct_map`): a deferred verb, which the recorded
+>   verb's wait passed over, answered `MapSynced` in 683 µs with the log durable at none; now completed through
+>   `live_ship::defer`, so it waits as `slates write` does: unanswered through three liveness budgets stopped,
+>   answered at once after the resume with the log durable at its head (3 of 3).
+> - *A green's `checkout`* into its live base (`crate::checkout`, `image::complete_once_durable`): answered `CheckedOut`
+>   with both stopped, red first; now waits the same way (3 of 3).
+> - *NFSv4 `COMMIT` and stable `WRITE`* need no change: the v4 front end serves each through the v3 procedure
+>   (`RoutedBackend::call_v3` → `serve_v3`), whose wait is `stable_once_durable`. Held to it now: with both candidates
+>   stopped a `COMMIT` answers `NFS4ERR_DELAY` after 1.0008–1.0024 s (3 of 3); red-checked with the wait removed, it
+>   and a `FILE_SYNC` write answered `NFS4_OK` in 285 and 349 µs. Once the candidates' confirmations lapse, the
+>   owner's lease fence (AUD-29-83) answers every call `NFS4ERR_DELAY` at once until a heartbeat after they resume.
+> - *A virtio-fs or vhost-user guest's `FSYNC`* (`slates_bridge_virtiofs`'s device holds it, the guest's later chains
+>   served meanwhile; `BridgeAccess::durable_owed`/`durability`/`durable`): through `slates vhost-user` with a stand-in
+>   VMM on CI's Linux runners, answered `0` in 368–679 µs with both candidates stopped (red, x86_64 and arm64); now `EIO`
+>   after 1.0006–1.0017 s, 8 of 8 on each lane, and once in 3 more on x86_64 answered `0` after 1.000358 s, unexplained
+>   (that run printed no log line; the flow now prints the log and the hold's counters at that point and requires the
+>   hold's refusal). The device's own tests hold both legs on every Unix host: never durable, `EIO` at the bound with a
+>   later read published first; durable, `0` at once.
+> - *A WinFsp flush* (`FlushFileBuffers` of a handle, held on the mount, `STATUS_UNEXPECTED_IO_ERROR` past the budget),
+>   and a *volume* flush, which answered success on WinFsp's thread with no publication at all, now publishes and waits
+>   the same way. Three anchored fleet nodes on CI's `windows-latest` (`crates/cli/tests/live_winfsp.rs`): red, the
+>   flush succeeded in 995 µs with both candidates suspended; fixed, error 1117 after 1.0010–1.0283 s (3 of 3), success
+>   after the resume. Forming that fleet found a Windows defect in the runtime: a UDP socket reported a
+>   port-unreachable an earlier send drew as `WSAECONNRESET` on its next `recvfrom`, which ended a fleet serve socket's
+>   receive loop at its first probe of a peer still starting (3 of 4 starts never formed). The fix that landed is
+>   liveness's (00c4add1, first pushed as d8a8d859: every Windows datagram socket, an adopted one too, made with
+>   `SIO_UDP_CONNRESET` and `SIO_UDP_NETRESET` off); the WinFsp flow needs it to form its fleet.
+> - *Landings* need no wait: a landing claims what it wrote to disk, which holds it; a takeover that loses the volume's
+>   undurable tail serves the disk's bytes through the base, and a later landing that would revert the disk is refused
+>   by the witness check.
+> Found on the way and handed to live-fixes with the fleet re-formation defects: on Windows, a candidate's anchor kills a
+> daemon suspended past the liveness budget and starts a successor under a fresh identity, after which the owner's mount
+> stayed fenced and the fleet did not re-form within 40 minutes (CI, 1 run); the flow now suspends each anchor with its
+> daemon.
+
 > **Phase one with a candidate that holds no copy (2026-11-05).** Every candidate's report counts toward `f + 1`, an empty
 > one too, and every reporter raises its fence to the takeover's epoch, an empty one too: a candidate with no copy makes
 > an empty copy fenced at that epoch (`live_ship::fenced_copy`, at the successor's own report and at a remote
@@ -7369,6 +7425,17 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > the remaining holders' input debt, so their catch-up transfers inputs before records. Selecting
 > work reads one position per holder rather than rescanning the retained chain. Transfer to a new
 > candidate set and full green takeover remain owed (AUD-14).
+
+> **Status (2026-11-06, A-235: the record plane runs when there is merge work).**
+> The merge record plane ran once per coordinator period (100 ms), putting a version's inputs at one period and its
+> record at the next, so every answer at `f > 0` waited at least one period, and usually two. One submit at a time on an
+> idle three-node fleet at `f = 1` took 208 to 647 ms, and at 1,000 clients every accepted submit was answered
+> `Overloaded` (`docs/bugs/2026-11-06-a-submit-at-f1-waited-for-the-coordinators-period.md`). Now an enqueued version, an
+> input newly placed, or a record newly acknowledged with versions still pending nudges the coordinator. It runs the
+> merge plane at once, between its periods, and the council, root, seals and heads keep the period. A version's inputs
+> are put only to the holders whose next record it is: a holder keeps only its newest placement ahead of its records, so
+> a later version's inputs had released a lagging holder's next. Median answer now 2.7 to 4.4 ms on the debug build.
+> Still owed: pipelining, more than one version to a holder per pass.
 
 > **Status (2026-11-04, A-202: a submit's cost follows what it changed).** A work holds only the files it changed
 > since its base and reads the rest from the green's history there; an accept moves its base and clears that, in
@@ -13602,6 +13669,13 @@ the server takes it as the work's delta over its new base (`WorkFiles::from_chan
 > wire and runtime tests; on the incumbent harness the 64 MiB write's best of eighteen was 1,278.1 MiB/s against main's
 > 1,021.9 (BENCHMARKS).
 
+> **Status (2026-11-07): the purge's walk keeps what was freed behind it.** Re-landed on main (2f70a86b), A-214 failed
+> A-205's give-back on Windows in 6 of 10 runs (main CI 42184319025 and `diag-liveness-4`). The reserve kept a purge
+> walk under way, and a delete's blocks released behind its cursor were dropped from the resident count at the walk's
+> end, so the purge stopped for good. `ChunkArena::purge_keeping` now ends a walk at what the regions' sets record and
+> asks the sets whether it has anything to do. The give-back then passed 10 of 10 on both Windows runners, and
+> A-214's recovery tests 5 of 5 on both Linux runners (`diag-liveness-6`). The reserve's rule is unchanged.
+
 Status: accepted 2026-11-05 (Ada's decision through the supervisor: option (a) of GAPS' large-file write gap); built
 2026-11-05. It amends A-105's "every free block back at the first idle tick". Applied in the same change to:
 `crates/mem/src/buddy.rs` (`Buddy::upcoming`), `crates/mem/src/arena.rs` (`upcoming`, `purge_keeping`, `prefault`,
@@ -14573,6 +14647,42 @@ Applied in the same change to: §4.7 (data model, wake strategy, status); `slate
 and settle, `DaemonEnd::reply`'s stamp and confirmation) and `crates/ipc/tests/rings.rs`; GAPS. Evidence:
 `docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`. A client and a daemon of
 different layout versions refuse each other by name; no consensus rule or capability changes.
+
+### A-235 — The merge record plane runs when there is merge work, and a version's inputs go only to holders whose next record it is (accepted 2026-11-06)
+
+§4.16 "Commit" ran the record plane only on the coordinator's period, so a submit at `f > 0`, answered once its record
+commits, waited one to two periods (208 to 647 ms at `f = 1`), against goal 4's 1 ms. Replace that: an owner shard
+nudges the coordinator when it has merge work it can do now, which is a version enqueued, a version's inputs newly
+acknowledged, or a record newly acknowledged with versions still pending. The coordinator runs the merge plane at once
+between its periods, and everything else keeps the period. Only events that make new work nudge, so an unanswering
+holder adds no passes. Put a version's inputs only to the candidates whose first missing record is that version. Hedging
+them to every candidate gave a lagging holder two placements ahead of its records, and content retention keeps only the
+newest of those, so it let go of the one its next record needed. Rejected: a separate shipping task per version as live
+shipping uses (A-200). The owner's acceptor and the holders' sessions belong to the coordinator, and a second
+dispatcher would contend for both. Also rejected: a shorter period, which charges every node the council's and the
+heads' work more often to buy what an event gives for free.
+
+Applied in the same change to: §4.16 (Commit status); `slates-server` (`merge_service::nudge_record_plane`, `nudged`,
+`MergeShardState::nudged`, `put_inputs`'s recipients, `fleet::pace_running_merges`); the fleet test; GAPS. Evidence:
+`docs/bugs/2026-11-06-a-submit-at-f1-waited-for-the-coordinators-period.md`. No wire, layout or capability change.
+
+### A-234 — A joint write's sub-quorum cohort needs every member, and pending merge records follow the current placement (accepted 2026-11-06)
+
+A bootstrap installs a one-candidate placement on the bootstrapping node and settles its neighbourhood as itself, so
+a green made there before the council grows was enqueued under that placement and then, re-placed, met a joint
+placement whose settled cohort has one member. Joint writes required `f + 1` of each cohort, which a cohort of one
+can never give at `f = 1`; nothing committed and the neighbourhood change never settled. Replace the rule: each
+cohort of a joint write commits at `f + 1` of it, or at every member when it has fewer (`Quorum::committed_within`),
+and pending merge records are re-placed from the owner's current configuration each period, as head records are.
+Safety: a takeover's phase one needs `max(cohort − f, 1)` promises of a cohort (`Quorum::recovery`), and a commit in a
+sub-quorum cohort is held by all of it, so one promise meets it; every reader of a placement judges through
+`Placement::placed_with`. Rejected: refusing writes until the council has formed, which leaves the deadlock for any
+object placed before then and fixes neither half. Reviewed by raft-chaos (2026-11-06).
+
+Applied in the same change to: §4.8 (Neighbourhood changes, status); `slates-db` (`Quorum::committed_within`,
+`Placement::placed_with`, `Quorum::recovery`'s doc); `slates-server` (`merge_service::PendingGreen::retarget`); the
+fleet and CLI tests; GAPS. Evidence: `docs/bugs/2026-11-06-a-submit-in-a-three-process-fleet-is-never-answered.md`. No
+wire, layout or capability change.
 
 ### A-197 — pmem over a handed copy: a socket route for every pmem VMM (accepted and built on Linux x86_64 2026-11-01, Step 6 of the VFS and DAX plan; Firecracker on arm64 owed)
 Applied in the same change to: A-186 (the copy's length), GAPS, `crates/ipc` (`protocol.rs`: `MapWrite`'s `granule`;

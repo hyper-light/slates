@@ -115,6 +115,11 @@ const FRAME_REFUSED: &str = "shards.frame_refused";
 const CONTROL_REFUSED: &str = "shards.control_refused";
 /// Format: the refusal-ledger name of a barrier that did not capture its volume: the reply was answered `EIO`.
 const BARRIER_REFUSED: &str = "shards.barrier_refused";
+/// Counter: an `FSYNC` reply held until its live-shipped volume's log was durable where its barrier put it (A-200).
+const LIVE_FSYNC_HELD: &str = "shards.live_fsync_held";
+/// Counter: a held `FSYNC` answered `EIO`: its volume's log was not durable within the liveness budget, or never will
+/// be here (the volume destroyed, its owner superseded).
+const LIVE_FSYNC_REFUSED: &str = "shards.live_fsync_refused";
 /// Format: the refusal-ledger name of the references and open handles given back for a reply refused after it was
 /// made.
 const REPLY_RECLAIMED: &str = "shards.reply_reclaimed";
@@ -214,6 +219,18 @@ pub(crate) struct ShardsStream {
   /// What the owed reply waits for before it is sent: every FUSE mount of the volume told through the newest record its
   /// request made (AC-3.3, A-196). Shards' VMM asks one request at a time, so nothing else waits behind it.
   told: Option<crate::told::Owed>,
+  /// The owed reply is an `FSYNC` whose barrier published a live-shipped volume not yet durable there (A-200): it is
+  /// sent once the volume's log is durable at this position, and replaced by `EIO` (to request `unique`) if it is not
+  /// within the liveness budget, since a guest's `fsync` must not claim what no candidate holds.
+  durable: Option<DurableOwed>,
+}
+
+/// What an owed `FSYNC` reply waits for on a live-shipped volume (A-200): the log position its barrier published, and
+/// the request it answers.
+#[derive(Clone, Copy, Debug)]
+struct DurableOwed {
+  target: u64,
+  unique: u64,
 }
 
 impl std::fmt::Debug for ShardsStream {
@@ -383,6 +400,7 @@ pub(crate) fn attach(s: &mut ShardState, ask: ShardsAsk) -> Result<ShardsAttache
       ingested_at_end: false,
       told_mark: None,
       told: None,
+      durable: None,
     },
   );
   if futures::spawn(serve(attachment))
@@ -829,6 +847,9 @@ enum Turned {
   /// The owed reply waits for every FUSE mount of the volume to have been told of its request's change (AC-3.3, A-196):
   /// the task awaits that, bounded, then sends it.
   Told(crate::told::Owed),
+  /// The owed reply is an `FSYNC` that waits for its live-shipped volume's log to be durable at this position (A-200):
+  /// the task awaits that within the liveness budget, then sends it, or `EIO` in its place.
+  Durable(u64),
   /// The attachment ended.
   Ended,
 }
@@ -871,6 +892,19 @@ async fn serve(attachment: u64) {
           crate::daemon::pace(crate::daemon::HEARTBEAT_NS).await;
           break;
         }
+        Some(Turned::Durable(target)) => {
+          // The guest's `fsync` is answered once `f` candidates hold what its barrier published, or `EIO` past the
+          // liveness budget (A-200): never a durability no candidate has. Shards' VMM sends nothing more meanwhile.
+          let Some(Some(volume)) = state::with_state(|s| {
+            s.shards_streams
+              .get(&attachment)
+              .map(|stream| stream.volume)
+          }) else {
+            return;
+          };
+          let durable = crate::live_ship::wait_durable(volume, target).await;
+          let _ = state::with_state_counted(|s| settle_durable(s, attachment, durable));
+        }
         Some(Turned::Told(owed)) => {
           // Every FUSE mount of the volume is told of the change, or the bound passes, before the reply goes out
           // (AC-3.3); the next turn sends it. Shards' VMM sends nothing more meanwhile, since it waits for this reply.
@@ -912,6 +946,9 @@ fn turn_with(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
   // show the change waits for it.
   let refill_owed = !stream.ending && dax::refill_owed(s, stream);
   if !refill_owed {
+    if let Some(target) = durable_owed(stream) {
+      return Turned::Durable(target);
+    }
     if let Some(owed) = told_owed(s, stream) {
       return Turned::Told(owed);
     }
@@ -1013,6 +1050,9 @@ fn flush_unless_refill_owed(s: &mut ShardState, stream: &mut ShardsStream) -> Tu
   if !stream.ending && dax::refill_owed(s, stream) {
     return Turned::Served;
   }
+  if let Some(target) = durable_owed(stream) {
+    return Turned::Durable(target);
+  }
   if let Some(owed) = told_owed(s, stream) {
     return Turned::Told(owed);
   }
@@ -1022,6 +1062,31 @@ fn flush_unless_refill_owed(s: &mut ShardState, stream: &mut ShardsStream) -> Tu
       s.count(STREAM_FAILED, 1);
       Turned::Ended
     }
+  }
+}
+
+/// The log position the owed `FSYNC` reply of `stream` waits to be durable at (A-200); an ending stream, whose peer
+/// reads no reply, waits for nothing.
+fn durable_owed(stream: &mut ShardsStream) -> Option<u64> {
+  if stream.ending {
+    stream.durable = None;
+  }
+  stream.durable.map(|owed| owed.target)
+}
+
+/// Settles the owed `FSYNC` of stream `attachment` once its wait for durability is over: sent as it is when the log
+/// became durable at its position, replaced by `EIO` when it did not (counted).
+fn settle_durable(s: &mut ShardState, attachment: u64, durable: bool) {
+  let Some(stream) = s.shards_streams.get_mut(&attachment) else {
+    return;
+  };
+  let Some(owed) = stream.durable.take() else {
+    return;
+  };
+  if !durable {
+    stream.owed = refuse(owed.unique, EIO, &mut stream.outbound);
+    stream.sent = 0;
+    s.count(LIVE_FSYNC_REFUSED, 1);
   }
 }
 
@@ -1241,6 +1306,7 @@ fn serve_request(
   // reserves (A-150), or a release of an open the committed publication counts (A-154).
   let awaits_publication = crate::verbs::awaits_publication(s, stream.volume);
   // An ingest that wrote the guest's stores before this request is published before its reply too (step 3).
+  let mut refused = false;
   if needs_barrier(answered.opcode, answered.error) || awaits_publication || ingested.wrote {
     let captured =
       crate::verbs::publish_shard(s).is_ok_and(|published| published.captured(stream.volume));
@@ -1248,6 +1314,7 @@ fn serve_request(
       s.count(BARRIER_REFUSED, 1);
       reclaim(s, stream, &answered);
       stream.owed = refuse(answered.unique, EIO, &mut stream.outbound);
+      refused = true;
     }
   }
   if let Some(errno) = ingested.refused
@@ -1257,6 +1324,21 @@ fn serve_request(
     )
   {
     stream.owed = refuse(answered.unique, errno, &mut stream.outbound);
+    refused = true;
+  }
+  // A guest's `fsync` of a live-shipped volume is answered once its log is durable on `f` candidates where this barrier
+  // put it (A-200; AC-8.3), as a FUSE mount's is (`crate::fuse`): held, the task waits for it ([`Turned::Durable`]).
+  stream.durable = None;
+  if !refused
+    && answered.error == 0
+    && matches!(answered.opcode, Some(Opcode::FSync | Opcode::FSyncDir))
+    && let Some(target) = crate::live_ship::durable_target(s, stream.volume)
+  {
+    stream.durable = Some(DurableOwed {
+      target,
+      unique: answered.unique,
+    });
+    s.count(LIVE_FSYNC_HELD, 1);
   }
   stream.told = told_mark.and_then(|mark| crate::told::owed(s, mark));
   true

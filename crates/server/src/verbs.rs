@@ -833,7 +833,9 @@ fn is_forwardable_write(body: &RequestBody) -> bool {
 ///   watermark prunes this client's forwarded completions first (RIFL, banned item 8).
 /// - Anything else is refused `Unsupported`.
 ///
-/// `control` is the shard this serve loop runs on (the `xshard` origin).
+/// `control` is the shard this serve loop runs on (the `xshard` origin). Each call to the owner shard is waited for in
+/// that shard's own time (`xshard::call_in_shard_time`, R3 class A): before, a peer's read of a volume whose owner shard
+/// was given a fifth of a core for 1.5 s was answered `NotFound` at the wall second.
 pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) -> Vec<u8> {
   let Ok(ForwardedRequest {
     principal,
@@ -891,7 +893,7 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
   let origin_host = origin.0;
   let id = RequestId::from_word(request);
   let reply = if is_forwardable_read(&body) {
-    crate::xshard::call_within(
+    crate::xshard::call_in_shard_time(
       control,
       shard,
       move |s| dispatch(s, FORWARDED_CLIENT, &principal, body),
@@ -899,7 +901,7 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     )
     .await
   } else if is_forwardable_write(&body) {
-    let forwarded = crate::xshard::call_within(
+    let forwarded = crate::xshard::call_in_shard_time(
       control,
       shard,
       move |s| {
@@ -918,7 +920,7 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
         // A change the verb recorded is told to every FUSE mount of its volume before the exchange answers (AC-3.3):
         // the wait runs on the owner shard, where the mounts are, and is bounded by its own deadline.
         if let Some(owed) = owed {
-          let _ = crate::xshard::task_within(
+          let _ = crate::xshard::task_in_shard_time(
             control,
             shard,
             move || crate::told::wait(owed),
@@ -958,7 +960,7 @@ async fn await_deferred_completion(
     slates_rt::futures::sleep(crate::daemon::HEARTBEAT_NS)
       .await
       .ok()?;
-    let recorded = crate::xshard::call_within(
+    let recorded = crate::xshard::call_in_shard_time(
       control,
       shard,
       move |s| match s
@@ -3146,6 +3148,18 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
           (
             crate::xshard::RUN_REFUSED_COUNTER,
             crate::xshard::run_refused(),
+          ),
+          (
+            crate::fleet::SERVE_RECEIVE_EARLIER_SEND,
+            demux_sum(state, |c| c.receive_refused_earlier_send),
+          ),
+          (
+            crate::fleet::SERVE_RECEIVE_RESOURCES,
+            demux_sum(state, |c| c.receive_refused_resources),
+          ),
+          (
+            crate::fleet::SERVE_RECEIVE_OTHER,
+            demux_sum(state, |c| c.receive_refused_other),
           ),
         ]
         .into_iter()

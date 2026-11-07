@@ -143,6 +143,40 @@ impl RtError {
     }
   }
 
+  /// What a refused receive on a datagram socket says about the socket (§4.10a; the receive loops'
+  /// rule): it is gone and cannot be read again; an earlier send's report reached it; the OS was short of
+  /// memory for it; or something else. Only [`ReceiveRefusal::SocketGone`] ends a loop: Linux reports an
+  /// earlier packet's error on a socket's next receive even when it is not connected (udp(7), "ERRORS"), and
+  /// Windows an earlier send's ICMP port unreachable (WSAECONNRESET) or expired time to live (WSAENETRESET)
+  /// [B: man7.org udp(7), recv(2); Microsoft Learn, "recvfrom function"]. A refusal by the runtime itself (its
+  /// driver lost, its shard gone, no shard to serve the read) is the socket gone for the loop that asked.
+  pub fn receive_refusal(&self) -> ReceiveRefusal {
+    match self {
+      Self::DriverRefused {
+        code: Some(code), ..
+      } if SOCKET_GONE.contains(code) => ReceiveRefusal::SocketGone,
+      Self::DriverRefused {
+        code: Some(code), ..
+      } if EARLIER_SEND.contains(code) => ReceiveRefusal::EarlierSend,
+      Self::DriverRefused {
+        code: Some(code), ..
+      } if SHORT_OF_RESOURCES.contains(code) => ReceiveRefusal::Resources,
+      Self::DriverRefused { .. } | Self::WouldBlock { .. } | Self::Mem(_) => ReceiveRefusal::Other,
+      Self::DriverLost
+      | Self::NotOnShardThread
+      | Self::ShardGone { .. }
+      | Self::TooManyTasks { .. }
+      | Self::StaleTask { .. }
+      | Self::TooManyShards { .. }
+      | Self::BadConfig { .. }
+      | Self::ControlFull { .. }
+      | Self::KeptInUse { .. }
+      | Self::RingClaimed { .. }
+      | Self::WorkerFailed { .. }
+      | Self::InterestsExhausted { .. } => ReceiveRefusal::SocketGone,
+    }
+  }
+
   /// Whether this is a send the local stack refused as too large for a datagram (`EMSGSIZE`; Winsock's
   /// `WSAEMSGSIZE`): past the interface's MTU with don't-fragment set, or past the host's UDP datagram cap —
   /// the answer a path-MTU probe that is too large for this host gets at once (RFC 8899 §4.4).
@@ -151,9 +185,119 @@ impl RtError {
   }
 }
 
+/// What a refused receive says about its datagram socket ([`RtError::receive_refusal`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReceiveRefusal {
+  /// The socket cannot be read again: its descriptor is no socket, it was shut down for receiving, or the runtime
+  /// can no longer serve it. A receive loop ends.
+  SocketGone,
+  /// An earlier send's error reached the socket (a peer's port or host unreachable, a time to live expired): the
+  /// socket is fine and the next receive may deliver a datagram.
+  EarlierSend,
+  /// The OS had no memory or buffers for the receive now.
+  Resources,
+  /// Any other refusal: counted, and the loop reads on.
+  Other,
+}
+
+/// Format: the receive error codes that mean the socket is gone (Unix): `EBADF`, `ENOTSOCK` (recv(2)).
+#[cfg(unix)]
+const SOCKET_GONE: [i32; 2] = [libc::EBADF, libc::ENOTSOCK];
+/// Format: the receive error codes that report an earlier send (Unix): `ECONNREFUSED` (udp(7)), and a host or
+/// network unreachable.
+#[cfg(unix)]
+const EARLIER_SEND: [i32; 3] = [libc::ECONNREFUSED, libc::EHOSTUNREACH, libc::ENETUNREACH];
+/// Format: the receive error codes of an OS short of memory (Unix): `ENOMEM` (recv(2)), `ENOBUFS`.
+#[cfg(unix)]
+const SHORT_OF_RESOURCES: [i32; 2] = [libc::ENOMEM, libc::ENOBUFS];
+/// Format: the receive error codes that mean the socket is gone (Windows): `WSAENOTSOCK`, `WSAESHUTDOWN`.
+#[cfg(windows)]
+const SOCKET_GONE: [i32; 2] = [
+  windows_sys::Win32::Networking::WinSock::WSAENOTSOCK,
+  windows_sys::Win32::Networking::WinSock::WSAESHUTDOWN,
+];
+/// Format: the receive error codes that report an earlier send (Windows): `WSAECONNRESET` (ICMP port unreachable on a
+/// datagram socket), `WSAENETRESET` (time to live expired), and a host or network unreachable.
+#[cfg(windows)]
+const EARLIER_SEND: [i32; 4] = [
+  windows_sys::Win32::Networking::WinSock::WSAECONNRESET,
+  windows_sys::Win32::Networking::WinSock::WSAENETRESET,
+  windows_sys::Win32::Networking::WinSock::WSAEHOSTUNREACH,
+  windows_sys::Win32::Networking::WinSock::WSAENETUNREACH,
+];
+/// Format: the receive error code of an OS short of buffers (Windows): `WSAENOBUFS`.
+#[cfg(windows)]
+const SHORT_OF_RESOURCES: [i32; 1] = [windows_sys::Win32::Networking::WinSock::WSAENOBUFS];
+
 /// Format: the OS error code of a datagram too large to send — `EMSGSIZE` on Unix.
 #[cfg(unix)]
 const MESSAGE_TOO_LARGE: i32 = libc::EMSGSIZE;
 /// Format: the OS error code of a datagram too large to send — `WSAEMSGSIZE` on Windows.
 #[cfg(windows)]
 const MESSAGE_TOO_LARGE: i32 = windows_sys::Win32::Networking::WinSock::WSAEMSGSIZE;
+
+#[cfg(test)]
+mod tests {
+  use super::{ReceiveRefusal, RtError};
+
+  /// Asserts each of `codes`, refused on a receive, names `kind`.
+  fn each_names(codes: &[i32], kind: ReceiveRefusal) {
+    for code in codes {
+      let refusal = RtError::DriverRefused {
+        call: "recvfrom",
+        code: Some(*code),
+      };
+      assert_eq!(refusal.receive_refusal(), kind, "{code}");
+    }
+  }
+
+  /// §4.10a, the receive loops' rule, by use of the codes each platform's documentation names (recv(2), udp(7);
+  /// Microsoft Learn's recvfrom): a socket that is no socket or is shut down is gone; an earlier send's report and a
+  /// shortage are not; an unknown code, and a refusal with none, are other, never gone; a refusal by the runtime
+  /// itself is gone for the loop.
+  #[test]
+  fn a_refused_receive_names_whether_its_socket_is_gone() {
+    #[cfg(unix)]
+    {
+      each_names(&[libc::EBADF, libc::ENOTSOCK], ReceiveRefusal::SocketGone);
+      each_names(
+        &[libc::ECONNREFUSED, libc::EHOSTUNREACH, libc::ENETUNREACH],
+        ReceiveRefusal::EarlierSend,
+      );
+      each_names(&[libc::ENOMEM, libc::ENOBUFS], ReceiveRefusal::Resources);
+      each_names(&[libc::EINVAL], ReceiveRefusal::Other);
+    }
+    #[cfg(windows)]
+    {
+      use windows_sys::Win32::Networking::WinSock as ws;
+      each_names(
+        &[ws::WSAENOTSOCK, ws::WSAESHUTDOWN],
+        ReceiveRefusal::SocketGone,
+      );
+      each_names(
+        &[
+          ws::WSAECONNRESET,
+          ws::WSAENETRESET,
+          ws::WSAEHOSTUNREACH,
+          ws::WSAENETUNREACH,
+        ],
+        ReceiveRefusal::EarlierSend,
+      );
+      each_names(&[ws::WSAENOBUFS], ReceiveRefusal::Resources);
+      each_names(&[ws::WSAENETDOWN], ReceiveRefusal::Other);
+    }
+    let no_code = RtError::DriverRefused {
+      call: "recvfrom",
+      code: None,
+    };
+    assert_eq!(no_code.receive_refusal(), ReceiveRefusal::Other);
+    assert_eq!(
+      RtError::DriverLost.receive_refusal(),
+      ReceiveRefusal::SocketGone
+    );
+    assert_eq!(
+      RtError::ShardGone { shard: 0 }.receive_refusal(),
+      ReceiveRefusal::SocketGone
+    );
+  }
+}

@@ -370,6 +370,10 @@ pub struct SimFabric {
   send_blocked: std::collections::BTreeSet<u16>,
   /// One-shot write interest on a blocked port, woken when the scenario releases it.
   send_interests: BTreeMap<u16, u64>,
+  /// A receive refusal the scenario has queued for a port (`sim_udp_refuse_next_recv`): the port's next
+  /// receive answers it instead of a datagram, as an OS reports an asynchronous error on a socket's next
+  /// receive (an earlier send's ICMP report, udp(7); WSAECONNRESET on Windows).
+  recv_refusals: BTreeMap<u16, RtError>,
 }
 
 /// Format: the salt that separates the fabric's generator stream from the shards' (both are seeded from
@@ -398,6 +402,7 @@ impl SimFabric {
       stats: SimFabricStats::default(),
       send_blocked: std::collections::BTreeSet::new(),
       send_interests: BTreeMap::new(),
+      recv_refusals: BTreeMap::new(),
     }
   }
 
@@ -600,10 +605,11 @@ impl SimFabric {
 
   /// Records one-shot read interest; returns a waker word to wake now if a datagram already waits.
   fn register(&mut self, port: u16, word: u64) -> Option<u64> {
-    if self
-      .mailboxes
-      .get(&port)
-      .is_some_and(|mailbox| !mailbox.queue.is_empty())
+    if self.recv_refusals.contains_key(&port)
+      || self
+        .mailboxes
+        .get(&port)
+        .is_some_and(|mailbox| !mailbox.queue.is_empty())
     {
       return Some(word);
     }
@@ -744,6 +750,25 @@ pub fn sim_udp_send(dest: u16, bytes: &[u8], from: u16) {
 /// Receives one simulated datagram, or `None` when the mailbox is empty.
 pub fn sim_udp_recv(port: u16) -> Option<(Vec<u8>, u16)> {
   SIM_FABRIC.with(|f| f.borrow_mut().recv(port))
+}
+
+/// Queues a receive refusal on socket port `port`: its next receive answers `refusal` instead of a datagram, once,
+/// and a reader waiting on the port is woken for it, as an OS reports an asynchronous error on a socket's next
+/// receive. A fault knob for the receive loops' tests.
+pub fn sim_udp_refuse_next_recv(port: u16, refusal: RtError) {
+  let wake = SIM_FABRIC.with(|f| {
+    let mut fabric = f.borrow_mut();
+    fabric.recv_refusals.insert(port, refusal);
+    fabric.interests.remove(&port)
+  });
+  if let Some(word) = wake {
+    crate::registry::wake(Encoded::from_word(word));
+  }
+}
+
+/// The receive refusal queued on socket port `port`, taken: `None` when none is.
+pub(crate) fn sim_udp_take_refusal(port: u16) -> Option<RtError> {
+  SIM_FABRIC.with(|f| f.borrow_mut().recv_refusals.remove(&port))
 }
 
 /// Blocks socket port `port`'s sends from now on: each would block, as on a host whose send buffer is full
