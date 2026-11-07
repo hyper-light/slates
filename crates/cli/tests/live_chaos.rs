@@ -3059,10 +3059,16 @@ fn judge_served(verdict: &mut Verdict, survivors: &[&str], volume: &str, outcome
       verdict.note(format!(
         "the successor's recorded and active holders among the survivors: {counted:?}"
       ));
-      verdict.check(
-        "StaleNeverCommits (the counted holders' fences)",
-        fenced_at_or_above(&counted, volume, epoch),
-      );
+      let unfenced = fenced_at_or_above(&counted, volume, epoch);
+      if !unfenced.is_empty() {
+        let mut shown: Vec<String> = vec![successor.to_owned()];
+        shown.extend(counted.iter().map(|survivor| (*survivor).to_owned()));
+        verdict.note(format!(
+          "a counted holder unfenced; the successor and the counted holders:\n{}",
+          diagnosis(&shown, volume)
+        ));
+      }
+      verdict.check("StaleNeverCommits (the counted holders' fences)", unfenced);
       let others: Vec<&str> = survivors
         .iter()
         .copied()
