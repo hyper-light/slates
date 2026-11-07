@@ -1,0 +1,21 @@
+tested f7b79d92b83b9da6d845e12f6fb694bdcb4de982 variant before-rate on aarch64, 4 cpus
+  reverted:  crates/db/src/replay.rs | 4 +---
+  reverted:  1 file changed, 1 insertion(+), 3 deletions(-)
+budget exit 101 21s
+  budget: budget 10000000 ns: cadence 2930000 bytes, 293 bytes/us as the commits measured it; tail 2929896 bytes, replayed 2929896 bytes; recoveries [211551976, 209454009, 208737147, 208957458, 208847767] ns, median 208957458 ns (14 bytes/us), 20895 per mille of the budget
+  budget: thread 'a_fresh_partitions_longest_tail_replays_within_its_recovery_budget' (3337) panicked at crates/db/tests/snapshot_cadence.rs:293:3:
+  budget: test a_fresh_partitions_longest_tail_replays_within_its_recovery_budget ... FAILED
+  budget: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 2.96s
+  budget: error: test failed, to rerun pass `-p slates-db --test snapshot_cadence`
+budget-again exit 101 3s
+  budget-again: budget 10000000 ns: cadence 2870000 bytes, 287 bytes/us as the commits measured it; tail 2869920 bytes, replayed 2869920 bytes; recoveries [206994908, 204583215, 204540374, 204393153, 204323047] ns, median 204540374 ns (14 bytes/us), 20454 per mille of the budget
+  budget-again: thread 'a_fresh_partitions_longest_tail_replays_within_its_recovery_budget' (3351) panicked at crates/db/tests/snapshot_cadence.rs:293:3:
+  budget-again: test a_fresh_partitions_longest_tail_replays_within_its_recovery_budget ... FAILED
+  budget-again: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 2.91s
+  budget-again: error: test failed, to rerun pass `-p slates-db --test snapshot_cadence`
+budget-third exit 101 3s
+  budget-third: budget 10000000 ns: cadence 2880000 bytes, 288 bytes/us as the commits measured it; tail 2879856 bytes, replayed 2879856 bytes; recoveries [207278364, 205024741, 204759117, 204813366, 204842767] ns, median 204842767 ns (14 bytes/us), 20484 per mille of the budget
+  budget-third: thread 'a_fresh_partitions_longest_tail_replays_within_its_recovery_budget' (3365) panicked at crates/db/tests/snapshot_cadence.rs:293:3:
+  budget-third: test a_fresh_partitions_longest_tail_replays_within_its_recovery_budget ... FAILED
+  budget-third: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 2.91s
+  budget-third: error: test failed, to rerun pass `-p slates-db --test snapshot_cadence`
