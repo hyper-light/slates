@@ -1,0 +1,4 @@
+tested 9c1d8b27a51d6e33f0342054a0a5f7b4db7c6bcf variant after on aarch64, 4 cpus
+client exit 0 131s
+harness exit 0 193s
+clippy exit 0 65s
