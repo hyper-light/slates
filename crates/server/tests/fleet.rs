@@ -5029,6 +5029,139 @@ fn a_forward_waits_for_the_owners_session_while_it_is_out() {
   );
 }
 
+/// Shape: how long [`forwards_to_one_owner_never_wait_behind_each_other`] holds the owner's non-control shard: half
+/// a liveness budget, so the forward of a read there waits that long inside its own one-budget bound, and a forward
+/// that waited behind it is told from one that did not by hundreds of milliseconds.
+const OWNER_SHARD_HOLD: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS / 2);
+/// Shape: how long after the slow forward is sent the fast one goes: a tenth of the hold, so the slow one has
+/// reached the owner and is waiting on its held shard.
+const SLOW_FORWARD_LEAD: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS / 20);
+/// Shape: the volumes made while looking for one a given shard of two owns; a run that finds none in this many is a
+/// fault of the placement, not luck.
+const PLACEMENT_TRIES: usize = 64;
+/// Raised by the owner's held shard when its hold begins.
+static OWNER_SHARD_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A volume created through `client` that the daemon's shard at `partition` owns.
+fn volume_owned_by(client: &mut Client, partition: usize, tag: &str) -> VolumeId {
+  for attempt in 0..PLACEMENT_TRIES {
+    let ReplyBody::Created { id } = client.call(&scratch(&format!("{tag}-{attempt}"))) else {
+      panic!("create {tag}-{attempt}")
+    };
+    if usize::from(slates_server::verbs::owner_of(id)) == partition {
+      return id;
+    }
+  }
+  panic!("no volume of {PLACEMENT_TRIES} landed on partition {partition}");
+}
+
+/// The network load test's fault one (GAPS, "The many-client load test over the network": a forwarded `CreateWork`
+/// p50 1.71 s at 300 clients and 4.30 s at 1,000, against 45 µs on the owner's own node). §4.8 "Lookup", §4.10. Do:
+/// three nodes, each its own region, two shards each. On a, create two volumes, `slow` owned by a's non-control
+/// shard and `fast` by its control shard. Through two clients of b read each once, so b routes both to a. Then hold
+/// a's non-control shard for half a liveness budget. Inside the hold, read `slow` through the first client of b; a
+/// tenth of the hold later, read `fast` through the second. Expect: both are served, and `fast` answers in under a
+/// quarter of the hold, since nothing it needs is held. Forwards to one owner share the origin's one session to
+/// it, and a forward that borrowed that session for its whole round trip, while the owner served one forward at a
+/// time a session, made every forward behind it wait for it.
+#[test]
+fn forwards_to_one_owner_never_wait_behind_each_other() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let regions: std::collections::BTreeMap<HostId, RegionId> = hosts
+    .iter()
+    .enumerate()
+    .map(|(index, host)| (*host, RegionId(u64::try_from(index).unwrap())))
+    .collect();
+  let daemons = start_mesh_with(
+    nodes,
+    &hosts,
+    &certs,
+    &serve,
+    1,
+    2,
+    &regions,
+    &std::collections::BTreeMap::new(),
+  );
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut client_a = Client::connect(daemons[0].instance());
+  let slow = volume_owned_by(&mut client_a, 1, "slow");
+  let fast = volume_owned_by(&mut client_a, 0, "fast");
+  let mut slow_client = Client::connect(daemons[1].instance());
+  let mut fast_client = Client::connect(daemons[1].instance());
+  let (slow_routed, slow_last) =
+    poll_status_served(&daemons, &mut slow_client, slow, COUNCIL_RETIRE_DEADLINE);
+  let (fast_routed, fast_last) =
+    poll_status_served(&daemons, &mut fast_client, fast, COUNCIL_RETIRE_DEADLINE);
+  let measured = (slow_routed && fast_routed).then(|| {
+    OWNER_SHARD_HELD.store(false, std::sync::atomic::Ordering::Release);
+    let hold = daemons[0]
+      .observation(
+        Some(daemons[0].shards()[1]),
+        slates_server::daemon::OBSERVE_BUDGET_NS,
+        |_: &mut slates_server::state::ShardState| {
+          OWNER_SHARD_HELD.store(true, std::sync::atomic::Ordering::Release);
+          // The held shard's thread runs nothing else for the hold: the read of `slow` waits there.
+          #[allow(clippy::disallowed_methods)]
+          std::thread::sleep(OWNER_SHARD_HOLD);
+        },
+      )
+      .unwrap();
+    let holder = std::thread::spawn(move || hold.wait());
+    let began = Instant::now();
+    while !OWNER_SHARD_HELD.load(std::sync::atomic::Ordering::Acquire) {
+      assert!(began.elapsed() < OWNER_SHARD_HOLD, "the hold began");
+      std::thread::yield_now();
+    }
+    let slow_read = std::thread::spawn(move || {
+      let reply = slow_client.call(&RequestBody::Status { volume: slow });
+      (reply, slow_client)
+    });
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(SLOW_FORWARD_LEAD);
+    let sent = Instant::now();
+    let fast_reply = fast_client.call(&RequestBody::Status { volume: fast });
+    let fast_took = sent.elapsed();
+    let (slow_reply, _) = slow_read.join().unwrap();
+    holder.join().unwrap().unwrap();
+    (fast_reply, fast_took, slow_reply)
+  });
+  let counters = daemons[1].fleet_refusals();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  let (fast_reply, fast_took, slow_reply) = measured.unwrap_or_else(|| {
+    panic!("b routed both reads to a before the hold (last replies: {slow_last:?}, {fast_last:?})")
+  });
+  eprintln!(
+    "the forward of a read on a free shard took {fast_took:?} while another forward to its owner waited out a \
+     {OWNER_SHARD_HOLD:?} hold; b's fleet counters {counters:?}"
+  );
+  assert!(
+    matches!(slow_reply, ReplyBody::Status { .. }),
+    "the read on the held shard is served once the hold ends: {slow_reply:?}"
+  );
+  assert!(
+    matches!(fast_reply, ReplyBody::Status { .. }),
+    "the read on the free shard is served: {fast_reply:?}"
+  );
+  assert!(
+    fast_took < OWNER_SHARD_HOLD / 4,
+    "the forward of a read on a free shard took {fast_took:?}, waiting behind another forward to the same owner \
+     ({OWNER_SHARD_HOLD:?} hold)"
+  );
+}
+
 /// §4.8 Lookup (docs/bugs/2026-09-25-a-forward-refused-while-the-owners-session-was-out.md, found 1): a
 /// location round asks every admitted home-region peer, and a peer whose session is out when the round
 /// starts (a dispatch or a discovery page has it) is asked once it comes back, inside the round's one

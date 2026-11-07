@@ -132,6 +132,8 @@ pub fn run_on(
 /// call ran on this shard; `None` if the target's state was unavailable, the call was delivered back
 /// as something else, or the entry vanished.
 pub struct CrossShardCall<T> {
+  /// The shard the call runs on, whose own time [`within_shard_time`] judges the wait by.
+  target: u16,
   id: Option<u64>,
   ready: Option<Option<T>>,
   // The registration belongs to this thread; neither polling nor dropping may migrate it.
@@ -298,6 +300,7 @@ pub fn call_on<T: Send + 'static>(
 ) -> Result<CrossShardCall<T>, RtError> {
   if shard == origin {
     return Ok(CrossShardCall {
+      target: shard,
       id: None,
       ready: Some(work()),
       _thread: PhantomData,
@@ -319,6 +322,7 @@ pub fn call_on<T: Send + 'static>(
   );
   match registry::send_control(shard, Control::Spawn(Box::new(task))) {
     Ok(()) => Ok(CrossShardCall {
+      target: shard,
       id: Some(id),
       ready: None,
       _thread: PhantomData,
@@ -330,9 +334,11 @@ pub fn call_on<T: Send + 'static>(
   }
 }
 
-/// Runs `work` on `shard` and awaits its result for at most `deadline_ns`; `None` if the call could not
-/// be sent, the target's state was unavailable, or the deadline passed (the entry is forgotten, so a late
-/// result is dropped rather than delivered to a caller that moved on).
+/// Runs `work` on `shard` and awaits its result for at most `deadline_ns` of wall time; `None` if the call could not
+/// be sent, the target's state was unavailable, or the deadline passed (the entry is forgotten, so a late result is
+/// dropped rather than delivered to a caller that moved on). For a wait bounded by the caller's own clock (a coordinator
+/// period, a client's remaining deadline); a wait for the target's answer while it lives is
+/// [`call_in_shard_time`].
 pub async fn call_within<T: Send + 'static>(
   origin: u16,
   shard: u16,
@@ -345,13 +351,29 @@ pub async fn call_within<T: Send + 'static>(
   within(call, deadline_ns).await
 }
 
+/// Runs `work` on `shard` and awaits its result while the target is working, up to `budget_ns` of the target's own
+/// CPU time ([`within_shard_time`]); `None` as [`call_within`] answers, and when the target made no progress for a
+/// window or ran its budget without answering.
+pub async fn call_in_shard_time<T: Send + 'static>(
+  origin: u16,
+  shard: u16,
+  work: impl FnOnce(&mut ShardState) -> T + Send + 'static,
+  budget_ns: u64,
+) -> Option<T> {
+  let Ok(call) = call_on(origin, shard, move || state::with_state(work)) else {
+    return None;
+  };
+  within_shard_time(call, budget_ns).await
+}
+
 /// Runs the future `start` makes as a task on `shard`, and awaits its result on this shard (`origin`) for at most
-/// `deadline_ns`: the call for work that must yield on its shard as it goes (a write-back a copy slice a turn, §4.3's
-/// bounded work, A-188), which [`call_within`]'s closure, run in one turn, cannot be. The future is made on the target, so
-/// it may hold what is not `Send` across its turns; only its result crosses back. `None` as [`call_within`] answers, and
-/// when the target's task arena refused the task. A late result is dropped, as `call_within`'s is, while the task runs
-/// to its end on its shard. A call to this shard is the same task, spawned here: it too runs
-/// to its end however long it takes, so dropping it never loses what the future holds mid-way (§4.3).
+/// `deadline_ns` of wall time: the call for work that must yield on its shard as it goes (a write-back a copy slice a
+/// turn, §4.3's bounded work, A-188), which [`call_within`]'s closure, run in one turn, cannot be. The future is made on
+/// the target, so it may hold what is not `Send` across its turns; only its result crosses back. `None` as
+/// [`call_within`] answers, and when the target's task arena refused the task. A late result is dropped, as
+/// `call_within`'s is, while the task runs to its end on its shard. A call to this shard is the same task, spawned
+/// here: it too runs to its end however long it takes, so dropping it never loses what the future holds mid-way
+/// (§4.3). A wait for the target's answer while it lives is [`task_in_shard_time`].
 pub async fn task_within<T, F>(
   origin: u16,
   shard: u16,
@@ -362,23 +384,47 @@ where
   T: Send + 'static,
   F: Future<Output = T> + 'static,
 {
+  within(task_on(origin, shard, start)?, deadline_ns).await
+}
+
+/// [`task_within`], awaited while the target is working, up to `budget_ns` of the target's own CPU time
+/// ([`within_shard_time`]).
+pub async fn task_in_shard_time<T, F>(
+  origin: u16,
+  shard: u16,
+  start: impl FnOnce() -> F + Send + 'static,
+  budget_ns: u64,
+) -> Option<T>
+where
+  T: Send + 'static,
+  F: Future<Output = T> + 'static,
+{
+  within_shard_time(task_on(origin, shard, start)?, budget_ns).await
+}
+
+/// Sends the task of a [`task_within`] to `shard` and returns the call its result arrives on; `None` when it could not
+/// be sent or this shard's task arena refused it.
+fn task_on<T, F>(
+  origin: u16,
+  shard: u16,
+  start: impl FnOnce() -> F + Send + 'static,
+) -> Option<CrossShardCall<T>>
+where
+  T: Send + 'static,
+  F: Future<Output = T> + 'static,
+{
   let id = register();
+  let call = CrossShardCall {
+    target: shard,
+    id: Some(id),
+    ready: None,
+    _thread: PhantomData,
+  };
   if shard == origin {
     // A call to this shard is a task here, carrying its result home like any other: dropped at the deadline in place,
     // the future lost whatever it held mid-way (a live dispatch's borrowed sessions, which were never returned).
-    if !spawn_carrying_home(origin, id, start) {
-      forget(id);
-      return None;
-    }
-    return within(
-      CrossShardCall {
-        id: Some(id),
-        ready: None,
-        _thread: PhantomData,
-      },
-      deadline_ns,
-    )
-    .await;
+    // Dropping `call` forgets the registration.
+    return spawn_carrying_home(origin, id, start).then_some(call);
   }
   let task = SpawnRequest::new(
     Box::pin(async move {
@@ -394,23 +440,9 @@ where
     }),
     None,
   );
-  match registry::send_control(shard, Control::Spawn(Box::new(task))) {
-    Ok(()) => {
-      within(
-        CrossShardCall {
-          id: Some(id),
-          ready: None,
-          _thread: PhantomData,
-        },
-        deadline_ns,
-      )
-      .await
-    }
-    Err(_) => {
-      forget(id);
-      None
-    }
-  }
+  registry::send_control(shard, Control::Spawn(Box::new(task)))
+    .is_ok()
+    .then_some(call)
 }
 
 /// On the target of a [`task_within`]: spawns the future `start` makes as a task of this shard, which carries its result
@@ -446,6 +478,33 @@ pub async fn within<T: 'static>(call: CrossShardCall<T>, deadline_ns: u64) -> Op
     .ok()
     .flatten()
     .flatten()
+}
+
+/// Awaits a registered call in its target shard's own time (§4.3, §4.14, A-65; the R3 debt of `LIVENESS_BUDGET_NS`,
+/// class A): a wall window of `budget_ns` first, then, while the target made CPU progress in the window just ended,
+/// another for the part of `budget_ns` of CPU it has not yet run ([`crate::observe::ShardTime`]). A starved target,
+/// runnable but given little CPU, is waited for until it answers; a wedged one, which runs nothing, is given up at the
+/// end of the first whole window it spends off the CPU; a busy one that never answers, once it has run `budget_ns` of
+/// CPU, which an uncontended shard does at the wall clock's pace. A target whose clock cannot be read (no registry slot,
+/// or Miri) is waited for the one wall window. `None` as [`within`] answers. Measured: a bootstrap from a client on
+/// the second shard while the control shard ran one poll of 1.5 s on the CPU a fifth of the time was refused
+/// `Overloaded` after 1.003 s on main (2026-11-06, `crates/server/tests/cross_shard_wait.rs`).
+pub async fn within_shard_time<T: 'static>(
+  mut call: CrossShardCall<T>,
+  budget_ns: u64,
+) -> Option<T> {
+  let mut time = registry::holder_of(call.target)
+    .map(|holder| crate::observe::ShardTime::new(holder, budget_ns));
+  let mut window_ns = budget_ns;
+  loop {
+    match slates_rt::futures::within(window_ns, &mut call).await {
+      Ok(Some(answer)) => return answer,
+      // The window ended with no answer: another while the target is working, else given up (dropping the call
+      // forgets its registration, so a late answer is dropped).
+      Ok(None) => window_ns = time.as_mut()?.next_window_ns()?,
+      Err(_) => return None,
+    }
+  }
 }
 
 #[cfg(test)]
@@ -648,6 +707,7 @@ mod tests {
     for delivered_first in [false, true] {
       let id = register();
       let call = CrossShardCall::<Released> {
+        target: 0,
         id: Some(id),
         ready: None,
         _thread: PhantomData,
