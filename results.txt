@@ -1,0 +1,46 @@
+runner ubuntu-24.04-arm, 4 CPUs, Sat Nov  7 10:58:03 UTC 2026, tree L c959a13468d16ae19a390b87cac8f3aad8bea0f5
+== run 1 at 10:58:03, load 1.54 1.49 0.68
+live turns: live-turns-b-6194 stopped: writes [3.712091ms, 3.424693ms, 3.468314ms, 3.550701ms]
+live turns: live-turns-c-6194 stopped: writes [3.558268ms, 3.499344ms, 3.677622ms, 3.755064ms]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 1.17s
+== run 1 each_candidate_stopped_in_turn_holds_no_write_and_catches_up exit 0
+live catalog: refusals [("live-catalog-a-6375", 4075), ("live-catalog-b-6375", 1905)]
+no entry sent to a candidate without the volume's catalog: [("live-catalog-a-6375", 4075), ("live-catalog-b-6375", 1905)]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 1.32s
+== run 1 a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog exit 101
+== run 2 at 10:58:06, load 1.57 1.49 0.69
+live turns: live-turns-a-6543 stopped: writes [3.416576ms, 3.240763ms, 3.358963ms, 3.288687ms]
+live turns: live-turns-b-6543 stopped: writes [3.443878ms, 11.034679ms, 3.459397ms, 3.240379ms]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 1.23s
+== run 2 each_candidate_stopped_in_turn_holds_no_write_and_catches_up exit 0
+live catalog: refusals [("live-catalog-b-6722", 2278), ("live-catalog-c-6722", 2268)]
+no entry sent to a candidate without the volume's catalog: [("live-catalog-b-6722", 2278), ("live-catalog-c-6722", 2268)]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 1.40s
+== run 2 a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog exit 101
+== run 3 at 10:58:09, load 1.57 1.49 0.69
+live turns: live-turns-c-6900 stopped: writes [99.061084ms, 3.444254ms, 3.327654ms, 3.175391ms]
+live turns: live-turns-a-6900 stopped: writes [4.053833ms, 3.35074ms, 3.132041ms, 10.744617ms]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 1.24s
+== run 3 each_candidate_stopped_in_turn_holds_no_write_and_catches_up exit 0
+live catalog: refusals [("live-catalog-b-7065", 1458), ("live-catalog-c-7065", 442)]
+no entry sent to a candidate without the volume's catalog: [("live-catalog-b-7065", 1458), ("live-catalog-c-7065", 442)]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 1.22s
+== run 3 a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog exit 101
+== run 4 at 10:58:12, load 1.69 1.52 0.70
+live turns: live-turns-a-7231 stopped: writes [3.719453ms, 3.512258ms, 3.440326ms, 3.337212ms]
+live turns: live-turns-b-7231 stopped: writes [3.523433ms, 3.438823ms, 3.446598ms, 3.315038ms]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 1.26s
+== run 4 each_candidate_stopped_in_turn_holds_no_write_and_catches_up exit 0
+live catalog: refusals [("live-catalog-a-7419", 406), ("live-catalog-c-7419", 1469)]
+no entry sent to a candidate without the volume's catalog: [("live-catalog-a-7419", 406), ("live-catalog-c-7419", 1469)]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 1.22s
+== run 4 a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog exit 101
+== run 5 at 10:58:14, load 1.69 1.52 0.70
+live turns: live-turns-b-7583 stopped: writes [99.515602ms, 3.651977ms, 3.427942ms, 3.470684ms]
+live turns: live-turns-c-7583 stopped: writes [3.578726ms, 3.316238ms, 3.309886ms, 3.473244ms]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 2.14s
+== run 5 each_candidate_stopped_in_turn_holds_no_write_and_catches_up exit 0
+live catalog: refusals [("live-catalog-a-7859", 1505), ("live-catalog-c-7859", 1506)]
+no entry sent to a candidate without the volume's catalog: [("live-catalog-a-7859", 1505), ("live-catalog-c-7859", 1506)]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 2.11s
+== run 5 a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog exit 101
