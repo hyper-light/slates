@@ -3074,12 +3074,18 @@ fn judge_served(verdict: &mut Verdict, survivors: &[&str], volume: &str, outcome
         .copied()
         .filter(|survivor| !counted.contains(survivor) && *survivor != successor)
         .collect();
-      let left = fenced_at_or_above(&others, volume, epoch);
-      if !left.is_empty() {
+      let unfenced_others = fenced_at_or_above(&others, volume, epoch);
+      if !unfenced_others.is_empty() {
         verdict.note(format!(
-          "copies left on members no longer holders: {left:?}"
+          "copies on members no longer holders, at the takeover: {unfenced_others:?}"
         ));
       }
+      // A member a transition dropped is counted by no one, so its copy is memory held for nothing: it must be let go
+      // (live-fixes' release, 2026-11-07), within the fleet wait.
+      verdict.check(
+        "members no longer holders let their copies go",
+        copies_kept(&others, volume),
+      );
     }
     None => {
       let live: Vec<String> = survivors
@@ -3095,6 +3101,28 @@ fn judge_served(verdict: &mut Verdict, survivors: &[&str], volume: &str, outcome
         vec!["no survivor served the volume within the fleet wait".to_owned()],
       );
     }
+  }
+}
+
+/// The members of `instances` that still hold a copy of `volume`'s log at the end of the fleet wait: none once each has let
+/// its copy go.
+fn copies_kept(instances: &[&str], volume: &str) -> Vec<String> {
+  let deadline = Instant::now() + FLEET_WAIT;
+  loop {
+    let kept: Vec<String> = instances
+      .iter()
+      .filter(|instance| {
+        live_states(instance, volume)
+          .unwrap_or_default()
+          .iter()
+          .any(|state| state.holding)
+      })
+      .map(|instance| format!("{instance} keeps its copy"))
+      .collect();
+    if kept.is_empty() || Instant::now() >= deadline {
+      return kept;
+    }
+    pause();
   }
 }
 
