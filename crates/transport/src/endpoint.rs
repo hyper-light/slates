@@ -1700,11 +1700,12 @@ impl Endpoint {
   pub async fn next_request(&mut self) -> Result<(u64, u64, Vec<u8>), EndpointError> {
     loop {
       self.drain();
-      self.flush()?;
+      // EXPERIMENT (item 2): a ready request is returned before the flush, so its acknowledgement rides the reply.
       if let Some(id) = self.most_urgent_ready() {
         let request = self.ready.remove(&id).unwrap_or_default();
         return Ok((id, crate::streams::kind(id), request));
       }
+      self.flush()?;
       self.receive_or_probe().await?;
     }
   }
@@ -1738,6 +1739,8 @@ impl Endpoint {
     F: core::future::Future<Output = Vec<u8>>,
   {
     let (id, kind, request) = self.next_request().await?;
+    // Acknowledged before the handler awaits, so the peer waits for the reply, not to resend the request.
+    self.flush()?;
     let reply = handler(kind, request).await;
     self.reply(id, &reply)
   }
