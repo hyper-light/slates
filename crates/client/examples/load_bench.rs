@@ -251,10 +251,12 @@ fn walk(client: &mut Client, green: VolumeId) -> Vec<(String, u64)> {
   let mut files = Vec::new();
   let mut dirs = vec![String::new()];
   while let Some(dir) = dirs.pop() {
-    for entry in client
-      .list_dir(green, &dir, ReadAt::Version { version: 0 })
-      .unwrap()
-    {
+    // Patient: a kill rung's node may go down while the setup walks (fixtures' 1,000-client primary kill answered a
+    // listing `OwnerUnreachable` 23 s in, 2026-11-07).
+    let entries = patiently(client, &format!("list {dir}"), |client| {
+      client.list_dir(green, &dir, ReadAt::Version { version: 0 })
+    });
+    for entry in entries {
       let path = if dir.is_empty() {
         entry.name.clone()
       } else {
@@ -1618,7 +1620,7 @@ fn patiently<T>(
           std::thread::yield_now();
         }
       }
-      Err(e) => panic!("oracle {what}: {e} after {:?}", started.elapsed()),
+      Err(e) => panic!("harness {what}: {e} after {:?}", started.elapsed()),
     }
   }
 }

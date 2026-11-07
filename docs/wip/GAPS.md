@@ -151,6 +151,13 @@
 >   `docs/bugs/2026-11-07-a-partitions-snapshot-cadence-never-left-its-boot-guess.md`). The local 10k rung went from
 >   2,197 to 3,128 clients done in 900 s. Still owed: the snapshot is encoded whole on the committing shard's turn.
 >
+> - **A forward refused at admission left its client waiting** (found 2026-11-07 by fixtures' f = 1 replica-kill
+>   rung, placed by the forward hop counters). A shard with a full task arena drops a spawn unrun, and the forwards
+>   owing a client its reply read no admission, so 87 vanished and their clients waited for good. A guard in each
+>   such task now answers its client `Overloaded` if it is dropped unrun (red on both Linux runners, run 42417663905;
+>   `docs/bugs/2026-11-07-a-forward-refused-at-admission-left-its-client-waiting.md`). Still owed: the control shard's
+>   arena is sized for its own clients' one request each, not every shard's in-flight forwards; and tasks carrying a
+>   reply home share the loss.>
 > - **A held request kept every later completion of its client** (found 2026-11-07 by fixtures' `f = 1` rungs, and
 >   the quiet arm's 10k backpressure). The acknowledgement was one watermark, which stopped below the lowest id still
 >   owed, so one submit held for its resend kept all its client's later records, and past `2 × slots` the owner

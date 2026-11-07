@@ -5077,6 +5077,128 @@ fn volume_owned_by(client: &mut Client, partition: usize, tag: &str) -> VolumeId
   panic!("no volume of {PLACEMENT_TRIES} landed on partition {partition}");
 }
 
+/// Shape: how long [`fill_task_arena`] may take to fill a shard's arena, and each filler's admission wait.
+const FILL_DEADLINE: Duration = Duration::from_secs(30);
+/// Shape: how long a forward refused at admission may take to be answered: a liveness budget is far more than
+/// the moment its guard takes, and far less than the forever it waited before.
+const UNSTARTED_ANSWER_NS: u64 = slates_server::daemon::LIVENESS_BUDGET_NS;
+
+/// Fills `shard`'s task arena with tasks that wait until cancelled, until the shard refuses one at admission: the
+/// admitted tasks, to cancel. A control channel momentarily full is waited out.
+fn fill_task_arena(shard: u16) -> Vec<slates_rt::shard::TaskId> {
+  let mut admitted = Vec::new();
+  let began = Instant::now();
+  loop {
+    assert!(
+      began.elapsed() < FILL_DEADLINE,
+      "the arena filled within {FILL_DEADLINE:?} ({} admitted)",
+      admitted.len()
+    );
+    let (request, receipt) =
+      slates_rt::task::SpawnRequest::with_receipt(Box::pin(std::future::pending::<()>()), None);
+    if slates_rt::registry::send_control(
+      shard,
+      slates_rt::control::Control::Spawn(Box::new(request)),
+    )
+    .is_err()
+    {
+      std::thread::yield_now();
+      continue;
+    }
+    match receipt.wait(FILL_DEADLINE) {
+      Some(slates_rt::task::Admission::Admitted(task)) => admitted.push(task),
+      Some(slates_rt::task::Admission::Refused(_)) => return admitted,
+      other => panic!("a filler's admission: {other:?}"),
+    }
+  }
+}
+
+/// §4.9, found by fixtures' 1,000-client replica-kill rung (2026-11-07): the client node's control shard refused 117
+/// spawns at admission, its task arena full, and 87 forwards handed to it never started, so their clients, which wait
+/// for a forwarded verb while the daemon lives, waited for good (`fleet.forward.client.to_control` 85,750 against
+/// `control_started` 85,663). Do: three nodes, each its own region; on a, create a volume and route b's client to it;
+/// fill b's control shard's arena; then read the volume through b's client. Expect: the read is answered within a
+/// liveness budget, refused `Overloaded` (retryable under its own id: the verb never ran), b counts the answer
+/// (`xshard.unstarted_answered`), and once the arena is freed the read sent again under its id is served. Before: no
+/// answer at all.
+#[test]
+fn a_forward_refused_at_admission_answers_its_client() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let regions: std::collections::BTreeMap<HostId, RegionId> = hosts
+    .iter()
+    .enumerate()
+    .map(|(index, host)| (*host, RegionId(u64::try_from(index).unwrap())))
+    .collect();
+  let daemons = start_mesh_with(
+    nodes,
+    &hosts,
+    &certs,
+    &serve,
+    1,
+    2,
+    &regions,
+    &std::collections::BTreeMap::new(),
+  );
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut client_a = Client::connect(daemons[0].instance());
+  let volume = volume_owned_by(&mut client_a, 0, "unstarted");
+  let mut client_b = Client::connect(daemons[1].instance());
+  let (routed, last) = poll_status_served(&daemons, &mut client_b, volume, COUNCIL_RETIRE_DEADLINE);
+  let read = RequestBody::Status { volume };
+  let outcome = routed.then(|| {
+    let control = daemons[1].shards()[0].0;
+    let fillers = fill_task_arena(control);
+    let began = Instant::now();
+    let first = client_b.try_call(&read, UNSTARTED_ANSWER_NS);
+    let answered_in = began.elapsed();
+    for task in &fillers {
+      let _ =
+        slates_rt::registry::send_control(control, slates_rt::control::Control::Cancel(task.0));
+    }
+    let counters = daemons[1].fleet_refusals();
+    let again = client_b.try_retry(&read, UNSTARTED_ANSWER_NS);
+    (fillers.len(), first, answered_in, counters, again)
+  });
+  for daemon in daemons {
+    daemon.stop();
+  }
+  let (fillers, first, answered_in, counters, again) = outcome
+    .unwrap_or_else(|| panic!("b routed the read to a before the fill (last reply: {last:?})"));
+  let unstarted = counters
+    .as_ref()
+    .map(|map| map.get("xshard.unstarted_answered").copied().unwrap_or(0))
+    .unwrap_or(0);
+  assert!(
+    matches!(
+      first,
+      Ok(ReplyBody::Refused {
+        refusal: Refusal::Overloaded { .. }
+      })
+    ),
+    "a read whose forward was refused at admission (b's control arena full, {fillers} fillers) is answered \
+     Overloaded within a liveness budget: {first:?} after {answered_in:?}"
+  );
+  assert!(
+    unstarted >= 1,
+    "b counted the answer: xshard.unstarted_answered {unstarted}; all {counters:?}"
+  );
+  assert!(
+    matches!(again, Ok(ReplyBody::Status { .. })),
+    "sent again under its id once the arena is freed, the read is served: {again:?}"
+  );
+}
+
 /// The network load test's fault one (GAPS, "The many-client load test over the network": a forwarded `CreateWork`
 /// p50 1.71 s at 300 clients and 4.30 s at 1,000, against 45 µs on the owner's own node). §4.8 "Lookup", §4.10. Do:
 /// three nodes, each its own region, two shards each. On a, create two volumes, `slow` owned by a's non-control
