@@ -1,0 +1,11 @@
+tested 546ff0b9c1cf6862b41a9670fcb04d4beff89580 variant before-walk on x86_64, 4 cpus
+  reverted:  crates/merge/src/engine.rs | 2 +-
+  reverted:  1 file changed, 1 insertion(+), 1 deletion(-)
+verdict exit 101 18s
+  verdict: thread 'a_verdict_consults_only_the_deltas_that_changed_its_paths' (2903) panicked at crates/merge/tests/engine.rs:429:3:
+  verdict: assertion `left == right` failed: the verdict consulted the one delta that changed `a`
+  verdict:   left: 2000
+  verdict:  right: 1
+  verdict: test a_verdict_consults_only_the_deltas_that_changed_its_paths ... FAILED
+  verdict: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 45 filtered out; finished in 0.01s
+  verdict: error: test failed, to rerun pass `-p slates-merge --test engine`
