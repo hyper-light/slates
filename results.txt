@@ -1,0 +1,39 @@
+kind live: unshaped: installed and rolled out in 7.7 s
+kind live: unshaped: live-write: count=1000 acknowledged=1000 refused=0 p50_us=393 p99_us=1123 p999_us=3640 max_us=23197 first_refusal=""
+kind live: wan: installed and rolled out in 8.7 s
+kind live: wan: live-write: count=300 acknowledged=300 refused=0 p50_us=154313 p99_us=678519 p999_us=5350528 max_us=5350528 first_refusal=""
+kind live: wan: kind live: Convergence: not within 120s: owner Some(LiveState { holding: false, head: Some(361), durable: Some(361), owed: false, epoch: Some(1), identity: Some("8f40872481319df16cf35ddcfa03f851725c77e49780e28f79ccb05f2c636662"), fence: 1 }), candidates [Some(LiveState { holding: true, head: Some(360), durable: None, owed: false, epoch: Some(1), identity: Some("0b42d4e474b4336dd133694913287663ddc8db1306ba4023936ed368a4948967"), fence: 1 }), Some(LiveState { holding: true, head: Some(361), durable: None, owed: false, epoch: Some(1), identity: Some("8f40872481319df16cf35ddcfa03f8
+kind live: wan-loss: installed and rolled out in 7.8 s
+kind live: wan-loss: live-write: count=300 acknowledged=300 refused=0 p50_us=282342 p99_us=744136 p999_us=109955112 max_us=109955112 first_refusal=""
+kind live: wan-loss: kind live: Convergence: not within 120s: owner Some(LiveState { holding: false, head: Some(396), durable: Some(396), owed: false, epoch: Some(1), identity: Some("c70518a30e6a787b74819ffd1eb3973f08b5ac1dc2796e193168ae84aea74164"), fence: 1 }), candidates [Some(LiveState { holding: true, head: Some(395), durable: None, owed: false, epoch: Some(1), identity: Some("57806d497b8491eec3297a3f69a61842c8b0975a378590ea32fef6ae0ed2f9a1"), fence: 1 }), Some(LiveState { holding: true, head: Some(396), durable: None, owed: false, epoch: Some(1), identity: Some("c70518a30e6a787b74819ffd1
+kind live: ceiling: installed and rolled out in 7.6 s
+kind live: slates-0:
+  fleet_session 6222125795745537470: lent=true cwnd=11710 srtt_ns=700180857 pto_ns=701180857 spurious_losses=0 persistent_collapses=0 consumed=71034 mtu=1466
+  fleet_session 10064505874399531847: lent=true cwnd=11710 srtt_ns=350147544 pto_ns=351147544 spurious_losses=0 persistent_collapses=0 consumed=70248 mtu=1466
+  shard 0 refused fleet.live.held: 57
+  shard 0 live held 8bac4ec4cb6a93470000000000000009 head=9 durable=none owed=false epoch=1 identity=1cc4ad5012c389fa6c80f6867d622f89f22266201ffafdff170058c6087a9f4f fence=1
+kind live: slates-1:
+  fleet_session 3607418756402708592: lent=false cwnd=11710 srtt_ns=700210801 pto_ns=701210801 spurious_losses=0 persistent_collapses=0 consumed=7891 mtu=1466
+  fleet_session 10064505874399531847: lent=false cwnd=11710 srtt_ns=350151173 pto_ns=351151173 spurious_losses=0 persistent_collapses=0 consumed=8211 mtu=1466
+  shard 0 refused fleet.live.held: 8
+  shard 0 live held 8bac4ec4cb6a93470000000000000009 head=6 durable=none owed=false epoch=1 identity=cf4881428d82fb24ea9f3ad5be8e0cb305933ea9ec71e38018826c7782a08d69 fence=1
+kind live: slates-2:
+  fleet_session 3607418756402708592: lent=true cwnd=0 srtt_ns=0 pto_ns=0 spurious_losses=0 persistent_collapses=0 consumed=0 mtu=0
+  fleet_session 6222125795745537470: lent=true cwnd=11710 srtt_ns=350491368 pto_ns=745494732 spurious_losses=0 persistent_collapses=0 consumed=996 mtu=1451
+  shard 0 refused fleet.live.appended: 12
+  shard 0 refused fleet.live.awaited: 6
+  shard 0 refused fleet.live.durable: 9
+  shard 0 refused fleet.live.link_lost: 474
+  shard 0 refused fleet.live.no_session: 6079
+  shard 0 refused fleet.live.refused: 3
+  shard 0 refused fleet.live.refused.no_credit: 3
+  shard 0 refused fleet.live.resolved: 5
+  shard 0 refused fleet.live.unanswered: 6174
+  shard 0 refused fleet.live.whole: 4
+  shard 0 live shipping 8bac4ec4cb6a93470000000000000009 head=11 durable=8 owed=true epoch=1 identity=588721ee672e39f0220844f05e530e3421581ce099a28d647bb41fcb4a8dbeb0 fence=1
+kind live: ceiling: kind live: the probe live-writer did not finish within 600s
+kind live:   unshaped: count=1000 acknowledged=1000 refused=0 p50_us=393 p99_us=1123 p999_us=3640 max_us=23197 first_refusal=""; converged at head Some(1000) epoch Some(1); 1 heads seen, one identity each; owner read back whole=1000 missing=0 torn=0; taken over by slates-1 after 2.7 s, epoch 2, read back whole=1000 missing=0 torn=0
+kind live:   wan: FAILED: kind live: Convergence: not within 120s: owner Some(LiveState { holding: false, head: Some(361), durable: Some(361), owed: false, epoch: Some(1), identity: Some("8f40872481319df16cf35ddcfa03f851725c77e49780e28f79ccb05f2c636662"), fence: 1 }), candidates [Some(LiveState { holding: true, head: Some(360), durable: None, owed: false, epoch: Some(1), identity: Some("0b42d4e474b4336dd133694913287663ddc8db1306ba4023936ed368a4948967"), fence: 1 }), Some(LiveState { holding: true, head: Some(361), durable: None, owed: false, epoch: Some(1), identity: Some("8f40872481319df16cf3
+kind live:   wan-loss: FAILED: kind live: Convergence: not within 120s: owner Some(LiveState { holding: false, head: Some(396), durable: Some(396), owed: false, epoch: Some(1), identity: Some("c70518a30e6a787b74819ffd1eb3973f08b5ac1dc2796e193168ae84aea74164"), fence: 1 }), candidates [Some(LiveState { holding: true, head: Some(395), durable: None, owed: false, epoch: Some(1), identity: Some("57806d497b8491eec3297a3f69a61842c8b0975a378590ea32fef6ae0ed2f9a1"), fence: 1 }), Some(LiveState { holding: true, head: Some(396), durable: None, owed: false, epoch: Some(1), identity: Some("c70518a30e6a787
+kind live:   ceiling: FAILED: kind live: the probe live-writer did not finish within 600s
+exit 1
