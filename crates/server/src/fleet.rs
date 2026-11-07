@@ -1061,8 +1061,9 @@ impl PeerDriver {
 }
 
 /// A serve socket's receive loop as a task, for the daemon's life: it routes every datagram to its session.
-/// The socket refusing ends it, counted (`fleet.serve`), so an operator sees a node that stopped accepting
-/// rather than a mesh that silently never re-forms.
+/// Only the socket gone ends it, counted (`fleet.serve`), so an operator sees a node that stopped accepting
+/// rather than a mesh that silently never re-forms; every other refused receive is counted by its kind
+/// ([`SERVE_RECEIVE_EARLIER_SEND`] and its siblings) and the loop reads on.
 async fn run_demux(demux: DemuxId) {
   if let Err(e) = demux.run().await {
     // Counted for `status`, and said once in the log with its reason: a node that silently stopped
@@ -3858,6 +3859,17 @@ fn spawn_detached(future: impl std::future::Future<Output = ()> + 'static, refus
 /// because the socket refused — the node no longer accepts sessions on that plane.
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 const SERVE_REFUSED: &str = "fleet.serve";
+/// The status refusal counts of the serve sockets' refused receives that did not end their loops, summed over the
+/// planes, one per kind (`slates_rt::error::ReceiveRefusal`; `DemuxCounters::receive_refused_earlier_send` and its
+/// siblings): an earlier send's report, the OS short of memory, anything else.
+/// Format: refusal names in the daemon's status report.
+pub(crate) const SERVE_RECEIVE_EARLIER_SEND: &str = "fleet.serve.receive_refused.earlier_send";
+/// See [`SERVE_RECEIVE_EARLIER_SEND`].
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const SERVE_RECEIVE_RESOURCES: &str = "fleet.serve.receive_refused.resources";
+/// See [`SERVE_RECEIVE_EARLIER_SEND`].
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const SERVE_RECEIVE_OTHER: &str = "fleet.serve.receive_refused.other";
 
 /// A dial still in its handshake dropped at its peer's retirement, so the resume dials afresh at the
 /// peer's current address.

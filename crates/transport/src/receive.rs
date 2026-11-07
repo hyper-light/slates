@@ -22,6 +22,40 @@ use crate::params::DEFAULT_MAX_UDP_PAYLOAD;
 /// ([`DEFAULT_MAX_UDP_PAYLOAD`], RFC 9000 §18.2), so no datagram the declaration admits is truncated.
 pub const RECEIVE_BUFFER_BYTES: usize = DEFAULT_MAX_UDP_PAYLOAD as usize;
 
+/// Refused receives a loop counted and read past, by kind (`slates_rt::error::ReceiveRefusal`; §4.10a, the receive
+/// loops' rule: only the socket gone ends a loop).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReceiveRefusals {
+  /// An earlier send's report (a peer's port or host unreachable, a time to live expired).
+  pub earlier_send: u64,
+  /// The OS short of memory or buffers.
+  pub resources: u64,
+  /// Any other refusal but the socket's end.
+  pub other: u64,
+}
+
+impl ReceiveRefusals {
+  /// These counts with one more of `kind`; a socket gone is not a refusal read past, and is not counted here.
+  pub fn counted(self, kind: slates_rt::error::ReceiveRefusal) -> ReceiveRefusals {
+    use slates_rt::error::ReceiveRefusal;
+    match kind {
+      ReceiveRefusal::EarlierSend => ReceiveRefusals {
+        earlier_send: self.earlier_send.saturating_add(1),
+        ..self
+      },
+      ReceiveRefusal::Resources => ReceiveRefusals {
+        resources: self.resources.saturating_add(1),
+        ..self
+      },
+      ReceiveRefusal::Other => ReceiveRefusals {
+        other: self.other.saturating_add(1),
+        ..self
+      },
+      ReceiveRefusal::SocketGone => self,
+    }
+  }
+}
+
 thread_local! {
   /// This thread's spare receive buffer, when no read holds it.
   static SPARE: Cell<Option<Vec<u8>>> = const { Cell::new(None) };

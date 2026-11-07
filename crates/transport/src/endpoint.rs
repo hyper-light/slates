@@ -492,6 +492,9 @@ pub struct Endpoint {
   /// many exchanges open asks only after these instead of probing every one each turn (a fetch with ~340 chunk
   /// requests open on a session spent its time doing that, 2026-10-05).
   completed: std::collections::BTreeSet<u64>,
+  /// Refused receives on this end's own socket that its receive read past, by kind ([`Endpoint::receive_refusals`]);
+  /// a socket gone is the one refusal that ends a receive.
+  receive_refused: crate::receive::ReceiveRefusals,
 }
 
 impl Drop for Endpoint {
@@ -549,6 +552,7 @@ impl Endpoint {
       arriving: BTreeMap::new(),
       ready: BTreeMap::new(),
       completed: std::collections::BTreeSet::new(),
+      receive_refused: crate::receive::ReceiveRefusals::default(),
     })
   }
 
@@ -595,6 +599,7 @@ impl Endpoint {
       arriving: BTreeMap::new(),
       ready: BTreeMap::new(),
       completed: std::collections::BTreeSet::new(),
+      receive_refused: crate::receive::ReceiveRefusals::default(),
     })
   }
 
@@ -643,6 +648,7 @@ impl Endpoint {
       arriving: BTreeMap::new(),
       ready: BTreeMap::new(),
       completed: std::collections::BTreeSet::new(),
+      receive_refused: crate::receive::ReceiveRefusals::default(),
     })
   }
 
@@ -734,19 +740,33 @@ impl Endpoint {
   /// retransmission. On a shared link the datagram comes from this session's inbox, which the
   /// demultiplexer fills; `Closed` once the demultiplexer closed the session.
   async fn recv_within(
-    &self,
+    &mut self,
     timeout_ns: u64,
   ) -> Result<Option<(Vec<u8>, SocketAddrV4)>, EndpointError> {
-    let outcome = match &self.link {
+    let Self {
+      link,
+      receive_refused,
+      ..
+    } = self;
+    let outcome = match link {
       // The shard's receive buffer is lent only for the synchronous read, never across the await
       // (`crate::receive`), so one buffer of the largest UDP payload serves every session on the shard.
       // A deadline that cannot be armed (off a shard) is the receive's refusal, never a timeout.
+      // A refused receive other than the socket gone is counted and read past within the deadline: an earlier
+      // send's report reaches the socket's next receive (udp(7); Windows' WSAECONNRESET), and is no reply's loss.
       Link::Own(socket) => slates_rt::futures::within(timeout_ns, async {
         loop {
-          if let Some(datagram) = crate::receive::try_receive(socket)? {
-            return Ok(datagram);
+          match crate::receive::try_receive(socket) {
+            Ok(Some(datagram)) => return Ok(datagram),
+            Ok(None) => socket.readable().await?,
+            Err(refusal) => match refusal.receive_refusal() {
+              slates_rt::error::ReceiveRefusal::SocketGone => return Err(refusal),
+              kind => {
+                *receive_refused = receive_refused.counted(kind);
+                slates_rt::futures::yield_now().await;
+              }
+            },
           }
-          socket.readable().await?;
         }
       })
       .await
@@ -763,6 +783,12 @@ impl Endpoint {
       .map_err(EndpointError::Io)?,
     };
     outcome.transpose()
+  }
+
+  /// Refused receives on this end's own socket that its receive read past, by kind (a non-vacuity count for the
+  /// receive loops' rule, §4.10a).
+  pub fn receive_refusals(&self) -> crate::receive::ReceiveRefusals {
+    self.receive_refused
   }
 
   /// The smoothed round-trip time this end has estimated (nanoseconds), zero before any acknowledgement

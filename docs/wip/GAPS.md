@@ -1,5 +1,12 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **One refused receive ended a fleet node's transport (found 2026-11-06 as the UDP reset's sibling, fixed
+> 2026-11-07).** `Demux::run` read every refused receive as the socket's end, so an earlier send's report stopped a
+> node's serve socket for the daemon's life. Now every receive loop in `rt`, `transport` and `server` ends only on the
+> socket gone (`RtError::receive_refusal`), and counts the rest by kind in status. Tests on the simulated fabric hold
+> the demultiplexer, an endpoint's handshake and a DNS lookup each failing before its change; see the bug record of
+> 2026-11-07. Owed: the membership plane's change has no test of its own.
+
 > **The anchor kills live daemons on a busy machine (found 2026-11-06, audit step 7; fixed by A-228, Windows CI owed).** Under the
 > A/B bar's load, two spinners a logical CPU (8 on CI's 4-CPU Windows runners), the anchor killed daemons that were
 > alive and serving because their heartbeat lapsed its 1,000 ms liveness budget. A busy machine is the normal case

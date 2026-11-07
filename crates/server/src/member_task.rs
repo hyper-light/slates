@@ -37,6 +37,7 @@ use rustls::pki_types::CertificateDer;
 use slates_cluster::member_plane::{Fleet, MemberPlane, PlaneEvent};
 use slates_cluster::membership::MemberState;
 use slates_db::register::HostId;
+use slates_rt::error::ReceiveRefusal;
 use slates_rt::futures;
 use slates_rt::shard::Kept;
 use slates_rt::udp::{SocketAddrV4, UdpSocket};
@@ -70,7 +71,12 @@ const RECEIVE_BYTES: usize = hyper_datagram::MAX_DATAGRAM_BYTES;
 const EPOCH_REFUSED: &str = "fleet.plane.epoch_refused";
 const EPOCH_UNANSWERED: &str = "fleet.plane.epoch_unanswered";
 const SEND_REFUSED: &str = "fleet.plane.send_refused";
-const RECEIVE_REFUSED: &str = "fleet.plane.receive_refused";
+/// Refused receives the plane read past, by kind (`slates_rt::error::ReceiveRefusal`), and the one that ended it (the
+/// socket gone).
+const RECEIVE_REFUSED_EARLIER_SEND: &str = "fleet.plane.receive_refused.earlier_send";
+const RECEIVE_REFUSED_RESOURCES: &str = "fleet.plane.receive_refused.resources";
+const RECEIVE_REFUSED_OTHER: &str = "fleet.plane.receive_refused.other";
+const RECEIVE_SOCKET_GONE: &str = "fleet.plane.receive_socket_gone";
 const ADDRESS_UNRESOLVED: &str = "fleet.plane.address_unresolved";
 const FOLD_REFUSED: &str = "fleet.plane.fold_refused";
 /// Event counters (`slates status`): record sessions lent to the announcement pass, and announcements sent on them. A
@@ -796,9 +802,26 @@ pub(crate) async fn run(
           fold_membership(origin, &shards).await;
         }
       }
-      Ok(Some(Err(_))) => {
-        crate::fleet::count_refusal(RECEIVE_REFUSED);
-      }
+      // Only the socket gone ends the plane (counted); any other refused receive is counted by its kind and the
+      // plane reads on. Before 2026-11-07 a gone socket was counted and read again every turn, without end.
+      Ok(Some(Err(refusal))) => match refusal.receive_refusal() {
+        ReceiveRefusal::SocketGone => {
+          crate::fleet::count_refusal(RECEIVE_SOCKET_GONE);
+          slates_machine::log_line!(
+            "slates-server: fleet: the membership plane's socket is gone: {refusal}"
+          );
+          return;
+        }
+        ReceiveRefusal::EarlierSend => {
+          crate::fleet::count_refusal(RECEIVE_REFUSED_EARLIER_SEND);
+        }
+        ReceiveRefusal::Resources => {
+          crate::fleet::count_refusal(RECEIVE_REFUSED_RESOURCES);
+        }
+        ReceiveRefusal::Other => {
+          crate::fleet::count_refusal(RECEIVE_REFUSED_OTHER);
+        }
+      },
       // The detector's wake, or the heartbeat: the next turn steps it.
       Ok(None) => {}
       Err(_) => return,

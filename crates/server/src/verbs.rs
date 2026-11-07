@@ -3143,6 +3143,18 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
             crate::xshard::RUN_REFUSED_COUNTER,
             crate::xshard::run_refused(),
           ),
+          (
+            crate::fleet::SERVE_RECEIVE_EARLIER_SEND,
+            demux_sum(state, |c| c.receive_refused_earlier_send),
+          ),
+          (
+            crate::fleet::SERVE_RECEIVE_RESOURCES,
+            demux_sum(state, |c| c.receive_refused_resources),
+          ),
+          (
+            crate::fleet::SERVE_RECEIVE_OTHER,
+            demux_sum(state, |c| c.receive_refused_other),
+          ),
         ]
         .into_iter()
         .filter(|(_, count)| *count > 0)
