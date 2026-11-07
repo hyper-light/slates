@@ -38,7 +38,6 @@ use std::task::{Poll, Waker};
 
 use slates_cluster::BatchReplies;
 use slates_db::HostId;
-use slates_machine::derived;
 use slates_rt::futures;
 use slates_transport::connection::Priority;
 use slates_transport::endpoint::{ConnectionId, Endpoint, EndpointError};
@@ -117,15 +116,10 @@ pub(crate) struct ForwardLanes {
 /// flight (`clients_per_shard × slots`, each shard's credit, over every shard). Forwards come only from those
 /// requests (and the cold control verbs), so a lane at its bound means a fault, refused rather than queued.
 fn lane_bound(state: &state::ShardState) -> usize {
-  derived!(
-    state
-      .config
-      .clients_per_shard
-      .saturating_mul(usize::try_from(state.config.region.slots).unwrap_or(usize::MAX))
-      .saturating_mul(state.shards.len().max(1))
-      .max(1),
-    "clients_per_shard × slots × shards",
-    ["clients_per_shard", "region.slots", "shards"]
+  crate::config::forward_lane_bound(
+    state.config.clients_per_shard,
+    state.config.region.slots,
+    u16::try_from(state.shards.len()).unwrap_or(u16::MAX),
   )
   .get()
 }
