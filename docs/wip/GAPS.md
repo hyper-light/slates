@@ -53,9 +53,10 @@
 > volume's placement.** The shipper counted a position durable at the `f`-th highest holder, right for `2f` holders but
 > not for `2f + 1` (every other candidate a holder): at f = 1 a write on one of three was "durable", and a successor
 > counted the other two (raft-chaos, CI diag-20 run 7: a holder left at fence 1, NoLoss held only because it was the
-> stale one). Now `n − f` of `n` holders (never durable at `n <= f`, from which no phase one counts `f + 1`).
-> `a_write_is_durable_only_where_every_takeover_quorum_meets_it` was red on the old count; the model, now also naming
-> `2f + 1` and short sets, passes 20 of 20.
+> stale one). Now `W = max(n − f, f)` of `n` holders (raft's review: `n − f` alone answered a write on the owner and one
+> holder at `f = 2` with three holders, two copies that two failures lose), never durable on fewer than `f`.
+> `a_write_is_durable_only_where_every_takeover_quorum_meets_it` was red on both earlier counts; the model, naming
+> `2f + 1` and `1..2f − 1` sets and taking owners over inside each transition window, passes.
 >
 > **Open (live-fixes): an ex-holder keeps its live copy until the volume's tombstone.** A holder the joint transition
 > drops keeps its copy at an old fence (memory, not safety: no phase one counts it, and with `n − f` no owner commits

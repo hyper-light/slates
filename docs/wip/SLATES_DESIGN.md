@@ -14507,6 +14507,10 @@ holder set now changes as Vertical Paxos changes a configuration (Lamport, Malkh
   kept against a later change until activated, since its record may be in flight.
 - A successor's holders are the set its takeover counted, less itself, with the lost owner; it moves to its
   configuration's candidates by a transition of its own.
+- Over a holder set of `n`, a write is durable once `W = max(n − f, f)` of them hold it (never on fewer than `f`): every
+  `f + 1` reports meet it (`W + f + 1 > n`) and the owner and `W` holders survive `f` failures. The `f`-th highest
+  holder, right for `2f`, counted one of three when the owner fell outside its own placement (raft-chaos, CI); `n − f`
+  alone counted the owner and one holder at `f = 2` with three (raft's review).
 
 The record is A-240's (raft-chaos: the shipper records its holders in the volume's catalog and phase one counts them).
 `live_ship::follow_candidates` commits the target as the holder set once `target_recordable` holds (transferred, and the
@@ -14562,8 +14566,14 @@ status, GAPS.
        for the activation (`Shipper::begin_transition`); before that, the newest target replaces the pending one.
     6. A takeover is the same steps from the counted set (H_old → H′): the successor answers nothing until its own
        record is placed, and in that window the record still names H_old.
-    Kept red in the model: recording H′ before the transfer. Owed there (live-fixes): durability on the intersection,
-    and dropping H before the placement.
+    Kept red in the model: recording H′ before the transfer (`recording_a_new_holder_set_before_it_holds_the_log_…`);
+    dropping H before the record names H′ (`dropping_the_old_holders_before_the_record_names_the_new_loses_durable_…`,
+    a history test: as a nemesis variant it broke 0 of 400, since a successor adopts the newest report it can reach);
+    and `W = n − f` short of `f` at `f = 2`, three holders (a unit case). Durability on the intersection of H and H′
+    broke 0 of 400 seeds; it is not used, and is safe only where the sets are of `2f` (`f` of the intersection lie in a
+    set every `f + 1` of its `2f` reports meet), not at `2f + 1`. The model aims every owner takeover inside a
+    transition window (short, transferred but unrecorded, record lagging), half with a host cut off (live-fixes,
+    d263229f).
   - Phase one counts `f + 1` reports only among the holders the adopted catalog records. Every member asked still
     reports, and the greatest head among all reports is adopted.
   - When too few recorded holders answer, phase one waits (`fleet.live.takeover_waits_quorum`). It never falls back to
