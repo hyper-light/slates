@@ -97,6 +97,20 @@ pub(crate) fn forget(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
   wake_parked(state, id.bytes);
 }
 
+/// The sealing of the last whole entry of each live log this node holds for another owner: what a successor opens that
+/// log through (`crate::seal_keys::sealed_under` keeps the pair keys these name).
+pub(crate) fn held_sealings(
+  state: &ShardState,
+) -> impl Iterator<Item = crate::head::HeadSealing> + '_ {
+  state.live.held.values().filter_map(|held| {
+    held
+      .entries
+      .front()
+      .and_then(|first| sealed_body(first))
+      .and_then(|body| body.sealing)
+  })
+}
+
 pub(crate) fn let_go(state: &mut ShardState, object: ObjectId) {
   if state.live.held.remove(&object).is_some() {
     state.count(LIVE_LET_GO, 1);
@@ -1099,7 +1113,7 @@ fn coverable_now(state: &ShardState, volume: [u8; 16]) -> bool {
     state
       .member_anchors
       .get(&candidate)
-      .is_some_and(|anchor| state.pairs_delivered.contains(anchor))
+      .is_some_and(|anchor| state.pairs_delivered.contains_key(anchor))
   })
 }
 

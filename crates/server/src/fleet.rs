@@ -6829,10 +6829,14 @@ async fn deliver_pairs(origin: u16, shard: u16, local: HostId, budget: CommitBud
       .collect()
   })
   .unwrap_or_default();
+  // A pair is owed to a neighbour this shard has not delivered one to, or delivered one to another incarnation of: a
+  // node back at its anchor with fresh RAM holds none of the keys it was delivered, and one marked delivered by anchor
+  // alone was never delivered again, so the replacement could not open this node's heads as their successor (the same
+  // key again is accepted by a node that kept it, so a redelivery to a warm restart changes nothing).
   let owed: Vec<(HostId, u64)> = anchors
     .iter()
     .copied()
-    .filter(|(_, anchor)| !delivered.contains(anchor))
+    .filter(|(member, anchor)| delivered.get(anchor) != Some(member))
     .collect();
   // The owner shard learns every neighbour's anchor, so it can tell which candidates a head's sealing covers.
   let resolved: std::collections::BTreeMap<HostId, u64> = anchors.into_iter().collect();
@@ -6884,8 +6888,10 @@ async fn deliver_pairs(origin: u16, shard: u16, local: HostId, budget: CommitBud
         origin,
         shard,
         move |s| {
-          if s.pairs_delivered.len() < s.config.fleet_peer_capacity.max(1) {
-            s.pairs_delivered.insert(anchor);
+          if s.pairs_delivered.len() < s.config.fleet_peer_capacity.max(1)
+            || s.pairs_delivered.contains_key(&anchor)
+          {
+            s.pairs_delivered.insert(anchor, member);
           }
         },
         HEARTBEAT_NS,

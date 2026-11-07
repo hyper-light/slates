@@ -11436,6 +11436,15 @@ keyed first by member id, a candidate's restart would have made a new pair each 
 bound (found by the test's first run, which looked the pair up by anchor). Proven by
 `an_owner_shards_pair_key_reaches_its_candidate_under_its_recipient` (a key wrapped under the owner shard's pair key
 unwraps to the same bytes under the candidate's); the fleet suite (70) passes with delivery running every period.
+Amended (2026-11-07, live-fixes): a node back at its anchor with fresh RAM. Named by anchor alone, a pair was refused
+when that anchor's node came back with fresh RAM and a new key (789 of 793 deliveries refused, CI
+diag-raft-chaos-three-25), and an owner shard that had delivered to the anchor never delivered to the new incarnation.
+Now a receiver takes another key from a recorded anchor and shard as the newer incarnation's
+(`seal_keys::accept_pair`): the old key becomes `SealKeyOwner::PairRetired`, named by its id, while a head or live log
+this node holds is still sealed under it, and is erased once nothing held names it (the count is bounded by the held
+records). A successor picks the pair key a head's entry names (`Wrapped.parent`). An owner shard records the member id
+it delivered to and delivers again to a new one. Proven by
+`a_node_replaced_with_fresh_ram_at_its_anchor_exchanges_pair_keys_with_its_survivors`, red on each half alone.
 Built (2026-10-05): piece 4c, the lineage key in the head. A volume's lineage key is made when its first seal starts
 (off the hot path). A head that names content carries `HeadSealing`: the owner's anchor and partition, the lineage
 key's id, and the lineage key wrapped under each pair key the owner shard has delivered (61 bytes a neighbour, in
