@@ -619,10 +619,11 @@ pub(crate) fn attach_green(
   if !rights_of(record, principal).read {
     return forbidden("attach");
   }
-  let consumer = match crate::verbs::consumer_of(form, client_id) {
-    Ok(consumer) => consumer,
-    Err(refusal) => return refused(refusal),
-  };
+  let consumer =
+    match crate::verbs::consumer_of(form, client_id, crate::verbs::termed_expiry(state)) {
+      Ok(consumer) => consumer,
+      Err(refusal) => return refused(refusal),
+    };
   let Some(engine) = state.greens.get(&record.id) else {
     return refused(Refusal::NotFound);
   };
@@ -699,6 +700,10 @@ pub(crate) fn advance(
   attachment: u64,
   version: Option<u64>,
 ) -> ReplyBody {
+  // A CLI attachment is renewed by the verb, or refused once its term lapsed (A-230).
+  if let Err(refusal) = crate::verbs::use_attachment(state, attachment) {
+    return refused(refusal);
+  }
   let Some(record) = state.db.partition().attachment(attachment).cloned() else {
     return refused(Refusal::NotFound);
   };
@@ -1108,6 +1113,8 @@ pub(crate) fn destroy_merge_volume(
       return Some(refused(refusal_of_db(&e)));
     }
   }
+  // A volume whose name hashes elsewhere gives its alias back there (A-236).
+  crate::verbs::release_name_alias(state, id, &record.name);
   crate::verbs::retire_local_tombstones(state);
   // A retired work may have held the oldest reachable version of its green: fold and credit. A
   // destroyed green credits everything it charged as retention.

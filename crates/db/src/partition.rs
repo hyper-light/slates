@@ -20,10 +20,10 @@ use slates_wire::request::{ClientWindow, Seen};
 use crate::Art;
 use crate::catalog::{
   AttachmentRecord, AuditRecord, CompletionRecord, Consumer, ConsumerRecord, GrantRecord,
-  LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge, NfsCallRecord, NfsClientRecord,
-  NfsDelegationRecord, NfsLockRecord, NfsOpenRecord, NfsPurgeRecord, NfsSessionRecord, Principal,
-  SEAL_KEY_RECORD_BYTES, SEAL_RECIPIENT_RECORD_MAX, SealKeyOwner, SealKeyRecord, SnapshotId,
-  SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
+  LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge, NameAliasRecord, NfsCallRecord,
+  NfsClientRecord, NfsDelegationRecord, NfsLockRecord, NfsOpenRecord, NfsPurgeRecord,
+  NfsSessionRecord, Principal, SEAL_KEY_RECORD_BYTES, SEAL_RECIPIENT_RECORD_MAX, SealKeyOwner,
+  SealKeyRecord, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
 };
 use crate::error::DbError;
 use crate::op::Op;
@@ -132,6 +132,10 @@ pub struct PartitionSnapshot {
   pub work_logs: Vec<WorkLog>,
   /// Each green's origin held as a reference to its base snapshot (A-217; 2026-11-05; appended).
   pub green_origin_refs: Vec<GreenOriginRef>,
+  /// The names this partition holds for volumes other partitions hold, by name (A-236; appended).
+  pub name_aliases: Vec<NameAliasRecord>,
+  /// The CLI attachments whose term lapsed, oldest first (A-230; appended).
+  pub expired_attachments: Vec<u64>,
 }
 
 /// A green's origin as a reference (A-217): the base volume and snapshot it was walked from, and the BLAKE3 of the
@@ -220,6 +224,12 @@ pub struct Partition {
   /// The purges this shard owes its owners (2026-10-10): one per client dropped or session destroyed here and not yet
   /// acknowledged by every owner, bounded by the drops a round could not settle.
   nfs_purges: BTreeSet<NfsPurgeRecord>,
+  /// The names this partition holds for volumes other partitions hold (A-236): at most one a name, and at most
+  /// `caps.volumes` of them, since each stands for a volume another partition holds under the same cap.
+  name_aliases: BTreeMap<String, NameAliasRecord>,
+  /// The CLI attachments whose term lapsed, oldest first (A-230), so a later use is refused as expired rather than as
+  /// unknown. At most `caps.attachments` of them: the oldest leaves when a lapse would pass it.
+  expired_attachments: std::collections::VecDeque<u64>,
   nfs_instance: u32,
   /// The destroyed volumes whose tombstone this owner still owes its candidate holders (AUD-29-43), by volume,
   /// each with the register sequence it is written at. A tombstone keeps its volume's slot of the volume
@@ -273,6 +283,8 @@ impl Partition {
       nfs_sessions: BTreeMap::new(),
       nfs_calls: BTreeMap::new(),
       nfs_purges: BTreeSet::new(),
+      name_aliases: BTreeMap::new(),
+      expired_attachments: std::collections::VecDeque::new(),
       nfs_instance: 0,
       landing_leases: Art::new(),
       landings: BTreeMap::new(),
@@ -345,6 +357,21 @@ impl Partition {
     self.volumes.get(h).ok()
   }
 
+  /// Whether attachment `id` was a CLI attachment whose term lapsed (A-230), among the most recent the partition keeps.
+  pub fn attachment_expired(&self, id: u64) -> bool {
+    self.expired_attachments.contains(&id)
+  }
+
+  /// The alias this partition holds for `name`, if any (A-236): a name another partition's volume holds.
+  pub fn name_alias(&self, name: &str) -> Option<&NameAliasRecord> {
+    self.name_aliases.get(name)
+  }
+
+  /// Every alias this partition holds, by name (A-236): what a recovery reconciles.
+  pub fn name_aliases(&self) -> impl Iterator<Item = &NameAliasRecord> {
+    self.name_aliases.values()
+  }
+
   /// A volume by name.
   pub fn volume_by_name(&self, name: &str) -> Option<&VolumeRecord> {
     let h = *self.by_name.get(name.as_bytes())?;
@@ -414,6 +441,11 @@ impl Partition {
       )
       .map(|(_, a)| a)
       .collect()
+  }
+
+  /// Every attachment this partition holds, in slab order: what a sweep over all of them walks (A-230's lapse).
+  pub fn attachments(&self) -> impl Iterator<Item = &AttachmentRecord> {
+    self.attachments.iter().map(|(_, record)| record)
   }
 
   /// The attachments other hosts' clients hold here (§4.10, A-222: those of a host that left the configuration end).
@@ -704,6 +736,41 @@ impl Partition {
 
   // ------------------------------------------------------------------ the guard
 
+  /// [`Partition::check`] for a name alias (A-236) and a CLI attachment's term (A-230).
+  fn check_alias_or_term(&self, op: &Op) -> Result<(), DbError> {
+    match op {
+      // A name is held once on its partition: by a volume there, or by one alias for another partition's volume.
+      Op::NameAliasReserved { record } => {
+        if let Some(existing) = self.volume_by_name(&record.name) {
+          return Err(DbError::AlreadyExists {
+            existing: existing.id.bytes,
+          });
+        }
+        if let Some(alias) = self.name_alias(&record.name) {
+          return Err(DbError::AlreadyExists {
+            existing: alias.volume.bytes,
+          });
+        }
+        if self.name_aliases.len() >= self.caps.volumes {
+          return Err(DbError::Capacity {
+            table: "name aliases",
+          });
+        }
+        Ok(())
+      }
+      Op::NameAliasConfirmed { name } | Op::NameAliasReleased { name } => {
+        self.name_alias(name).map(|_| ()).ok_or(DbError::NotFound)
+      }
+      // Only a CLI attachment holds a term.
+      Op::AttachmentRenewed { id, .. } | Op::AttachmentExpired { id } => match self.attachment(*id)
+      {
+        Some(record) if matches!(record.consumer, Consumer::Termed { .. }) => Ok(()),
+        _ => Err(DbError::NotFound),
+      },
+      _ => Ok(()),
+    }
+  }
+
   /// The guard the live path runs before appending: refuses what the log must never record.
   pub fn check(&self, op: &Op, now_ns: u64) -> Result<(), DbError> {
     match op {
@@ -716,6 +783,12 @@ impl Partition {
         if let Some(existing) = self.volume_by_name(&record.name) {
           return Err(DbError::AlreadyExists {
             existing: existing.id.bytes,
+          });
+        }
+        // A name this partition holds for another partition's volume is that volume's (A-236), confirmed or not.
+        if let Some(alias) = self.name_alias(&record.name) {
+          return Err(DbError::AlreadyExists {
+            existing: alias.volume.bytes,
           });
         }
         if self.tombstones.contains_key(&record.id) {
@@ -834,6 +907,11 @@ impl Partition {
       | Op::NfsCallsCleared { .. }
       | Op::NfsPurgeOwed { .. }
       | Op::NfsPurgeSettled { .. } => Ok(()),
+      Op::NameAliasReserved { .. }
+      | Op::NameAliasConfirmed { .. }
+      | Op::NameAliasReleased { .. }
+      | Op::AttachmentRenewed { .. }
+      | Op::AttachmentExpired { .. } => self.check_alias_or_term(op),
       // A key is made once: a second record for its owner would leave two keys sealing one owner's content. A record
       // is hyper-seal's fixed length, so a malformed one never enters the log.
       Op::SealKeySet { record } => {
@@ -1148,6 +1226,41 @@ impl Partition {
         self.apply_nfs(op);
         Ok(())
       }
+      Op::AttachmentRenewed { id, expires_ns } => {
+        let h = *self
+          .attachment_index
+          .get(&id.to_be_bytes())
+          .ok_or(DbError::NotFound)?;
+        let record = self.attachments.get_mut(h).map_err(|_| DbError::NotFound)?;
+        record.consumer = Consumer::Termed {
+          expires_ns: *expires_ns,
+        };
+        Ok(())
+      }
+      Op::AttachmentExpired { id } => {
+        self.remove_attachment(*id)?;
+        if self.expired_attachments.len() >= self.caps.attachments.max(1) {
+          self.expired_attachments.pop_front();
+        }
+        self.expired_attachments.push_back(*id);
+        Ok(())
+      }
+      Op::NameAliasReserved { record } => {
+        self
+          .name_aliases
+          .insert(record.name.clone(), record.clone());
+        Ok(())
+      }
+      Op::NameAliasConfirmed { name } => {
+        let alias = self.name_aliases.get_mut(name).ok_or(DbError::NotFound)?;
+        alias.confirmed = true;
+        Ok(())
+      }
+      Op::NameAliasReleased { name } => self
+        .name_aliases
+        .remove(name)
+        .map(|_| ())
+        .ok_or(DbError::NotFound),
       Op::SealKeySet { record } => {
         self.seal_keys.insert(record.owner, record.clone());
         Ok(())
@@ -1556,6 +1669,8 @@ impl Partition {
           entries: entries.clone(),
         })
         .collect(),
+      name_aliases: self.name_aliases.values().cloned().collect(),
+      expired_attachments: self.expired_attachments.iter().copied().collect(),
       nfs_instance: self.nfs_instance,
       tombstones: self.tombstones().collect(),
       green_chains: {
@@ -1586,6 +1701,20 @@ impl Partition {
     }
     for tombstone in &snapshot.tombstones {
       self.tombstones.insert(tombstone.volume, tombstone.sequence);
+    }
+  }
+
+  /// Restores the expired CLI attachments a snapshot carries (A-230).
+  fn restore_expired_attachments(&mut self, snapshot: &PartitionSnapshot) {
+    self.expired_attachments = snapshot.expired_attachments.iter().copied().collect();
+  }
+
+  /// Restores the name aliases a snapshot carries (A-236).
+  fn restore_name_aliases(&mut self, snapshot: &PartitionSnapshot) {
+    for record in &snapshot.name_aliases {
+      self
+        .name_aliases
+        .insert(record.name.clone(), record.clone());
     }
   }
 
@@ -1664,6 +1793,8 @@ impl Partition {
     p.audit = snapshot.audit.clone();
     p.restore_merge(snapshot);
     p.restore_nfs(snapshot);
+    p.restore_name_aliases(snapshot);
+    p.restore_expired_attachments(snapshot);
     p.restore_consumers_and_tombstones(snapshot);
     Ok(p)
   }

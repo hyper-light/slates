@@ -178,6 +178,28 @@ jobs:
           SLATES_TEST_CLI: "1"
         run: |
           cargo test -p slates-cli --test cli --test fs_server -- --test-threads=1 --nocapture
+      # `slates exec`'s FUSE flow (§4.6 "The launcher") on a host whose AppArmor does not confine unprivileged user
+      # namespaces. GitHub's Ubuntu runner does (kernel.apparmor_restrict_unprivileged_userns=1), so every step above,
+      # on the default policy, proves the launcher's refusal that names the sysctl
+      # (`the_launcher_binds_a_volume_or_names_the_host_setting_that_forbids_it`). This step lifts the restriction for
+      # itself alone: test setup on the runner, not a privilege the product needs, modelling hosts without the
+      # restriction (Fedora's and Debian's defaults), so the bind is proven too. It puts the restriction back whatever the
+      # tests answer. The supervisor's decision, 2026-11-06 (GAPS 8a-launcher-ci).
+      - name: The slates exec FUSE flow, user namespaces unconfined (Linux)
+        if: runner.os == 'Linux'
+        env:
+          SLATES_TEST_CLI: "1"
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          status=0
+          cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture --exact \
+            the_launcher_refuses_a_path_it_would_have_to_create_and_leaves_the_host_untouched \
+            the_launcher_binds_a_volume_or_names_the_host_setting_that_forbids_it > exec.log 2>&1 || status=$?
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
+          cat exec.log
+          if grep -q "SKIP" exec.log; then echo "the exec flow skipped where it must run"; exit 1; fi
+          grep -q "test result: ok. 2 passed" exec.log
+          exit "$status"
       # The FSKit shim's Swift wire codec must agree with the Rust codec byte for byte (it shares the
       # golden vector). Compile and run its cross-check on the macOS runner, where swiftc lives.
       # ShimWire.swift is a pure library of the codec types; ShimWireMain.swift is the @main driver,
@@ -448,8 +470,11 @@ jobs:
       # until then. **`slates-cluster` joined on 2026-11-05**: it was built here only as the daemon's dependency, so its
       # tests and examples, which asked `rustix::param` for the page size (configured out on Windows), never compiled for
       # Windows; they ask `slates_machine::facts::Facts::page_bytes` now (`cargo xwin clippy` red before, clean after).
+      # **`slates-bridge-virtiofs` joined on 2026-11-07**: the daemon builds it, but only listed crates are
+      # linted, and its Unix-only DAX reply type and an `opcode` only Unix read failed `-D warnings` for Windows unseen
+      # (found by `cargo xwin clippy` from a Mac).
       - name: Clippy the Windows-buildable crates (native Windows)
-        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp -p slates-cluster --all-targets -- -D warnings
+        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-bridge-virtiofs -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp -p slates-cluster --all-targets -- -D warnings
       # The shipped Windows binary, linted without `--all-targets` and as a step of its own so its exit code
       # is checked on its own (the Windows shell is `pwsh`, where a native command failing mid-script does not
       # end the script — only the last line decides the step, which would mask this).
@@ -1148,7 +1173,7 @@ jobs:
           if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
           "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Clippy the Windows-buildable crates
-        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp -p slates-cluster --all-targets -- -D warnings
+        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-bridge-virtiofs -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp -p slates-cluster --all-targets -- -D warnings
       # The shipped Windows binary, linted without `--all-targets` and as a step of its own so its exit code
       # is checked on its own (the Windows shell is `pwsh`, where a native command failing mid-script does not
       # end the script — only the last line decides the step, which would mask this).

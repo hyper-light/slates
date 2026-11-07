@@ -3768,6 +3768,12 @@ impl Volume {
     Ok(no)
   }
 
+  /// The first inode number this volume has not issued: every number it can issue from now on is at or past it, so a
+  /// number below it names an inode made before now (A-231: the files a client may have cached before a takeover).
+  pub fn issued_below(&self) -> InodeNo {
+    InodeNo::compose(self.prefix, self.next_counter)
+  }
+
   /// The counter a publication records for this volume (A-150): its counter plus the store's reserve, never below the
   /// ceiling a committed publication already recorded. A successor starts there, past every number this volume can
   /// hand out before its next publication commits.

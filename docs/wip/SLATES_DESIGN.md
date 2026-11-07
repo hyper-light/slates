@@ -2421,7 +2421,11 @@ outside FUSE is answered only once every FUSE mount of its volume has been told*
 SDKs, the CLI, MCP, the merge plane's verbs), an NFS call, a direct map's write-back — **and since A-196 so is a guest's
 write through slates' own virtio-fs device or a Shards stream**: the device holds the write's reply and serves the
 guest's later requests meanwhile, completing the held reply out of order, which virtio permits (virtio 1.2 §2.6), and a
-Shards stream, whose VMM sends one request at a time, holds its reply frame. Each mount's told point is its coherence
+Shards stream, whose VMM sends one request at a time, holds its reply frame. **A guest's own stale page** is judged
+too (2026-11-06): its device delivers no invalidation, so a page the guest dirtied and launders at a revalidation can
+carry bytes another path changed since. The device keeps per-guest byte states, fed by the guest's reads, its own
+writes and the journal's other changes, and refuses a `FUSE_WRITE_CACHE` write-back holding a stale byte `EIO` whole:
+A-192's rule, not the host mount's mask (`slates_bridge_fuse::guest_writeback`). Each mount's told point is its coherence
 cursor, held back while a round is out (`ServeState::told_through`); the writer's reply waits on the volume's owner shard
 without blocking it, at most half the liveness budget, past which it is answered and the late mount counted. A write through a FUSE mount is still answered first, since requests on two mounts, each waiting for the
 other mount's notification, could deadlock; AC-3.3 states that window. **What the kernel is told to
@@ -2622,8 +2626,10 @@ client takes the refusal without telling the program (`msync` returns 0), so a p
 through the socket route (A-186).
 > Status (2026-10-31): built and measured, Ada's A/B against applying the write-back (A-192). Through Apple's client the
 > other path's write is kept 9 of 9 (arm A lost it 9 of 9); the adversarial suite passes 6 of 6 (arm A 2 of 6). It costs
-> nothing measurable quiet, and 2–3 % a write-back while another connection writes (`docs/wip/BENCHMARKS.md`). A
-> restart starts the states empty (GAPS).
+> nothing measurable quiet, and 2–3 % a write-back while another connection writes (`docs/wip/BENCHMARKS.md`).
+> Status (2026-11-07, A-231): a takeover no longer starts a held connection's states empty. Each publication carries
+> the held connections' states; a successor takes them back, and judges every file made before the takeover as possibly
+> cached by a connection the anchor handed it, so a change since makes those bytes stale.
 
 **NFS versions (direction, 2026-09-26).** One NFS server speaks several versions over the shared
 bridge core: v3 as today, and v4.1 and v4.2 (RFC 8881, RFC 7862, RFC 8276, and pNFS flexfiles
@@ -4162,7 +4168,10 @@ spike measures whether open files recover or must be reopened); macOS NFS fallba
 hang or soft-mount `EIO` until the restarted server answers the retried RPCs (Degraded); Windows:
 the volume disappears and reappears (Degraded, open handles error). Extension crash on macOS:
 FSKit unmounts the volume; the daemon's state is intact; the anchor re-mounts (Degraded).
-Unprivileged user namespaces disabled: Refused for the launcher form with the exact remedy.
+Unprivileged user namespaces disabled: Refused for the launcher form with the exact remedy. That includes
+a host whose AppArmor confines them (Ubuntu 24.04's `kernel.apparmor_restrict_unprivileged_userns=1`): `unshare`
+succeeds there, but the namespace gets no capability, so the launcher names that sysctl, or an AppArmor profile
+granting `userns,` to the binary, as the operator's remedy (2026-11-05; GAPS `8a-launcher-ci`).
 `allow_other` requested but not permitted: Refused with the `/etc/fuse.conf` line. FSKit module
 not enabled: Refused with the exact System Settings path. Any separately selected limited
 NFS form reports its weaker semantics and cannot satisfy a full-POSIX request. Base
@@ -4198,6 +4207,10 @@ root-relative path as an explicit alternative; it does not report that the reque
 > instrumented CI case first fails at 5.01 s; 100 corrected native Linux runs and all nine ring cases pass, as do
 > all nine on macOS (0.53 s). Record:
 > `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
+
+> **Status (2026-11-06, A-230).** A CLI attachment (`slates attach`) is not the client's to take with it. It holds a
+> term, the failover SLO as the write lease's, renewed by each verb that names it. It ends at the lapse with its lease,
+> and a later use is refused `AttachmentExpired`. Only an SDK client's attachments end with the client, as below.
 
 > **Status (2026-09-20, A-28).** Client retirement reserves the dead client's seat and id
 > until every owner shard has removed its SDK attachments. Unsent forwards are cancelled;
@@ -5305,6 +5318,20 @@ context. A name is not a host pathname or a bearer capability. Fleet-wide enumer
 owners, each answer linearizable at its owner and the whole labelled with the configuration
 version.
 
+> **Status (2026-11-06, A-236: a clone's name at its name's partition).** Within a daemon a name routes by its hash to
+> one partition (`owner_of_name`), where it is looked up and where its uniqueness is decided. A clone lives beside its
+> origin, for copy-on-write, so when its name hashes elsewhere, the name's partition holds an alias pointing at the
+> clone (`slates_db::catalog::NameAliasRecord`). A lookup by name still routes by hash, and the name's partition says
+> where the name is served: its own volume, or the clone's partition through a confirmed alias (`nfs::routed`). A
+> second create of the name meets the alias there and is refused `AlreadyExists`. The clone is made by a reservation
+> protocol over the two partitions (`slates_db::alias`): reserve the alias, make the clone, confirm the alias. A
+> reserved alias holds the name and resolves nothing until it is confirmed. A refused clone releases its reservation,
+> a destroyed clone releases its alias, and a recovery reconciles every alias against the clone it names, before any
+> client is admitted. Proven by a crash at every step of both protocols (`crates/db/tests/alias.rs`) and by a
+> two-partition history and its one-partition differential (R8), restart included
+> (`a_clone_named_on_another_partition_is_reached_by_name_and_held_once`, `crates/server/tests/recovery.rs`). With one
+> partition no alias is ever made.
+
 > **Status (2026-11-06, forwards to one owner share its session).** A forward borrowed the record session to its owner
 > for its whole round trip, and the owner served one request of a session at a time. So a client node's forwards
 > went one at a time: a forwarded `CreateWork` took 4.30 s at the median at 1,000 clients, against 45 µs on the
@@ -5604,6 +5631,21 @@ the mirror does not exist and `await placed(mirror)` is refused `Unsupported`, a
 window is the process-restart window (zero, thanks to the anchor). Same code, zero modes.
 
 ### 4.9 Wire protocol (D-15)
+
+> **Status (2026-11-07, A-241: a client proves its id).** A client's id names its seat: its retained completion records,
+> its attachments, every verb after. The rendezvous carries only the id a client wants, which a stranger can name, and
+> a request carries its id in its slot word. So now:
+> - **A session key per id** (`slates_server::session_key`): keyed BLAKE3 over the id under the node's session secret,
+>   which the first daemon under an anchor makes and publishes in the supervision block, and every later one adopts.
+>   The key travels only in the client's own region (its header's bytes 64 to 96, region layout 4): written by the
+>   daemon for an id it issues fresh, and by a client resuming an id before its first request. `Session` carries it.
+> - **Checked once a slot**, in constant time, before its first request. A slot that does not prove its id is refused
+>   `SessionUnproven` with nothing recorded, and ended without retiring anything of the id's; the id is given back.
+> - **A request names its own client.** One whose id names another client than its slot's is refused `BadRequest`
+>   before any effect, recorded nowhere.
+> Proven by `a_stranger_with_a_dead_clients_id_gets_neither_its_seat_nor_its_records` and
+> `a_client_cannot_send_a_request_under_another_clients_id` (`crates/client/tests/client.rs`), each red before and
+> red-checked (`docs/bugs/2026-11-07-a-stranger-took-a-dead-clients-seat-and-planted-its-replies.md`).
 
 > **Status (2026-09-30, AUD-29-21).** A client's request sequence never wraps.
 > - **Range and marker.** Sequences run from 1 to `LAST_SEQUENCE = u32::MAX − 1`, and `u32::MAX` is kept
@@ -13357,6 +13399,177 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
+### A-231 — A held NFS connection's byte states cross a takeover, and what the successor cannot know is judged stale (accepted 2026-11-07, the supervisor's decision)
+Applied in the same change to: §4.6 "NFS v3" (its status), A-192 (its restart line), GAPS, `crates/vfs`
+(`recover.rs`: `HeldNfsStates`, `CarriedFile`, `CarriedRange`, `CarriedByte`, `ShardImage::nfs_states`, image version
+22; `checkpoint_log.rs`: `ShardDelta::nfs_states`, delta version 5; `volume.rs`: `Volume::issued_below`),
+`crates/bridge-fuse` (`coherence.rs`: `PageStates::carried`, `restored`, `opened_unknown`), `crates/server`
+(`nfs_writeback.rs`: the held and inherited connections, `carry`, `restore`, the takeover bound; `nfs.rs`: a connection
+the anchor handed back is marked inherited; `verbs.rs`: both publication paths carry the states, recovery restores them
+last), `crates/cli/tests/nfs_held.rs` (the history test).
+- **What was wrong.** A-192 keeps, per connection, what its client's cache of each file is as of, and refuses a
+  write-back of stale bytes. A held connection (A-113) outlives its daemon, but its states did not: a successor started
+  them empty and judged every file untracked as never fetched, so a stale write-back of a page fetched before the
+  takeover was applied over another path's newer change.
+- **The rule.**
+  - Each publication carries the held connections' states, every tracker consumed through its journal's head first, each
+    range's journal point dropped (a successor's journal begins again): never fetched, fresh, stale or unknown.
+  - A successor takes them back once the volumes are rebuilt, every byte placed before its own journal's first record,
+    so every change since the publication that touched a byte, replayed or newer, marks it stale.
+  - What the successor cannot know is judged stale too. A READ after the last publication was not carried, and a held
+    connection may have touched nothing before it. So a connection the anchor handed back treats every file made before
+    the takeover (an inode below the volume's counter at recovery, A-150) as possibly cached: a change since the takeover
+    makes those bytes stale. A file it first tracks after its tracker consumed changes is taken from the journal's
+    changes to it since the successor's first record, or as unknown once the journal no longer reaches back, and a
+    write-back over unknown bytes is refused until a fetch makes them fresh. Files made after the takeover are judged as
+    A-192 judges them.
+- **What it costs.** A program store into bytes another path changed after the takeover, made through a page the client
+  fetched after the last publication, is refused with the rest of its write-back, and Apple's client drops it silently.
+  Each delta carries the held connections' states whole: a READ changes them without a publication of its own.
+- **Evidence.** `a_stale_write_back_is_refused_at_every_crash_point_of_its_history` (`crates/cli/tests/nfs_held.rs`,
+  macOS, `SLATES_TEST_CLI=1`): a held connection fetches a page, another path changes its first bytes, the connection
+  writes its page back from before the change, fetches again and writes back a fresh page; the daemon killed before each
+  step and after the last, on a fresh anchor each time. At all six crash points the stale write-back was refused
+  `NFS3ERR_IO`, the other path's bytes kept and the fresh write-back applied, and the successors took back carried
+  states. Red-checked: with nothing taken back, the crash after the fetch let the stale write-back apply (`0`, not `NFS3ERR_IO`). The carried states' round trip is unit-tested (`carried_states_come_back_before_the_successors_records`),
+  and both encodings of the image and the delta are compared with the field (`crates/vfs/tests`).
+- **Format.** Image version 22, delta version 5: earlier images and logs are refused by version, as before.
+
+### A-241 — A client proves its id with a session key, and a request names its own client (accepted 2026-11-07, the supervisor's order)
+Applied in the same change to: §4.9 (its status), GAPS (GAP-A9-9's entry), the bug record of 2026-11-07,
+`crates/anchor` (`layout::SUP_SESSION_PRESENT`, `SUP_SESSION_SECRET`, `SESSION_SECRET_BYTES`, appended;
+`AnchorSegment::publish_session_secret`, `session_secret`), `crates/ipc` (`region.rs`: the session key at header byte
+64, layout version 4; `Refusal::SessionUnproven`, appended), `crates/mem` (`SharedObject::read_racy`, `write_racy`),
+`crates/server` (`session_key.rs`, new; `daemon.rs`: the secret adopted or made at start, the key written for an id
+issued fresh; `state.rs`: `ClientSlot::proven`, `ShardState::session_secret`; `verbs.rs`: `session_proven`,
+`refuse_foreign_request`; `reap.rs`: `end_unproven`), `crates/client` (`Session::key`, `SESSION_KEY_BYTES`; every
+resume and reconnect writes the key; tests).
+- **What was wrong.** `Listener::accept_pending` granted a wanted id to whoever named it while no live client held it,
+  so a same-uid stranger resuming under a dead client's id after a restart was served that client's seat and read its
+  completion records. And `serve` took a request's client from its slot word without comparing it with the slot's, so
+  any client could run a request under another's id and record its reply there; the daemon dropped the reply on its
+  way back, but that client's own request of the id then met the planted record and never ran.
+- **The rule.** A client proves its id with a session key only it and the daemon hold, before its slot serves anything;
+  a request naming another client than its slot's is refused before any effect. Neither refusal records a completion.
+- **Why a derived key, not a stored one.** A key per id derived under one secret needs no table that grows with every
+  id a node ever issues, survives a daemon restart with the secret, and is checked on whichever shard serves the
+  client. The issuer secret could not serve: it is made afresh at every start, and resumption crosses starts.
+- **Evidence.** `a_stranger_with_a_dead_clients_id_gets_neither_its_seat_nor_its_records`: red before ("the stranger
+  took client 1's seat; its retry of the victim's create answered Ok(Created …)"), green after, and red again with the
+  proof check forced true. `a_client_cannot_send_a_request_under_another_clients_id`: red before (the victim's create
+  of `victims-next` answered the planted volume's id; listed `["forged-victims", "planted"]`), green after.
+- **Residual.** A stranger that claims a dead id and sends nothing holds the slot until the reaper finds its process
+  gone, delaying the owner's resume, reading and changing nothing. On macOS the anchor segment, and the secret in it,
+  opens by name to a same-uid process: the exposure with Ada.
+
+### A-230 — A CLI attachment holds a term, renewed by each verb that names it (accepted 2026-11-06, the supervisor's decision: option 2)
+Applied in the same change to: §4.7 (a dead client's attachments: the CLI's are excepted), `docs/cli.md`, GAPS,
+`crates/db` (`Consumer::Termed`, appended; `AttachmentRenewed` and `AttachmentExpired`, appended; the partition's expired
+attachments and their snapshot field, appended), `crates/ipc` (`AttachRequest::Termed` and `Refusal::AttachmentExpired`,
+appended), `crates/server` (`verbs::attachment_term`, `use_attachment`, `expire_lapsed_attachments`, `Ending::Expired`;
+the reaper's loop; the verbs that name an attachment), `crates/cli` (`slates attach` makes the termed form),
+`xtask/src/kind_export.rs` (its helper's note).
+- **What was wrong.** The reaper ends a dead client's attachments (A-28), and `slates attach` is a client that prints an
+  id and exits. So the documented flow of `attach`, then `write ID ATTACHMENT` or `detach ATTACHMENT` from later runs,
+  worked only if they came within about a second (red 3 of 3 with a 2.5 s pause, GAPS 2026-10-23).
+- **The rule.** A CLI attachment (`Consumer::Termed`) is exempt from the dead-client reaper and holds a term instead.
+  - The term is the operator's failover SLO, derived as the write lease's: `derived!(failover_slo_ns, …)`, 10 s by
+    default. A write attachment holds the lease, so its term is the lease's.
+  - Every verb that names it (`Fs*`, `detach`, `advance`, `bind`) renews it once less than half the term is left:
+    one durable record per half term of use, never one per verb.
+  - It ends at the lapse, by the reaper's sweep or the first use after, as a detach does. The write lease goes with
+    it, recorded `AttachmentExpired`.
+  - A later use is refused `AttachmentExpired`, never `NotFound`. The partition keeps the expired ids, at most its
+    attachment capacity of them, oldest first out.
+- **Why not the others.** A CLI attachment until `detach` would let an abandoned write attachment hold the lease forever:
+  a count bounds how many, not how long. A process holding it breaks the documented flow. A term is bounded by
+  construction.
+- **Evidence.**
+  - `a_cli_attachment_outlives_the_process_that_made_it` (`crates/cli/tests/cli.rs`): attach, 2.5 s, write, 2.5 s,
+    detach. Red `NotFound` before, green after.
+  - `a_cli_attachment_lives_its_term_renewed_by_use_and_is_refused_as_expired_after` (`crates/server/tests/
+    attachment_term.rs`, a 3 s term): it survives its client, a use past half the term renews it past the first term's
+    end, it is refused `AttachmentExpired` by a write and by a detach after a lapse, and its write lease is free.
+  - Red-checked: with the renewal off, the second write is refused; with the expired ids ignored, `NotFound`.
+
+### A-236 — A clone's name is held at its name's partition by an alias, made by a reservation protocol (accepted 2026-11-06, the supervisor's decision: option 3)
+Renumbered 2026-11-07 from A-229 (the supervisor's allocation: A-229 was taken elsewhere). The commit that made it,
+c69f0d92, carries the old number in its message; history is not rewritten.
+Applied in the same change to: §4.8 "Lookup" (its status), GAPS, the bug record of 2026-09-13
+(`clone-name-not-routable-by-hash`), `crates/db` (`alias.rs`, new; `catalog::NameAliasRecord`; three appended ops,
+`NameAliasReserved`, `NameAliasConfirmed`, `NameAliasReleased`; the partition's alias table, its guards, its snapshot
+field, appended; `tests/alias.rs`, new), and `crates/server` (`verbs.rs`: the clone across two partitions, the alias's
+release at each destroy; `nfs.rs`: a name-routed call asks the name's partition where it is served; `daemon.rs`: the
+recovery's reconcile, and `mount_capability` follows the alias; `image.rs`: `publish_new_volume` shared;
+`tests/recovery.rs`: the history and its N=1 differential).
+- **What was wrong.** A clone lives on its origin's partition, since it shares the origin's copy-on-write tree, but a
+  name is looked up, and kept unique, on the partition its hash names. A clone whose name hashed elsewhere answered
+  `NOENT` by name over the mount transport, and a second volume of its name could be created.
+- **The rule.** The name's partition holds the name, as a volume of its own or as an alias of a clone another partition
+  holds. A lookup routes by hash, and the name's partition answers where the name is served. A create of a held name is
+  refused by kind there.
+- **The protocol** (`slates_db::alias::CLONE_STEPS`, each step one durable operation on one partition):
+  1. reserve the alias at the name's partition, refused `AlreadyExists` when the name is held;
+  2. make the clone at the origin's partition under the id the alias names, with its completion record;
+  3. confirm the alias, or release it when the clone was refused, before the reply.
+
+  A destroy releases the alias after the clone's record goes, and only while the alias still names it.
+- **Crash safety.** A reserved alias holds the name and resolves nothing. A recovery reconciles each alias against the
+  volume its id names (`slates_db::alias::reconcile`): it confirms one whose clone exists under its name and releases
+  the rest. It runs before any client is admitted, the one moment no clone is between its steps; a reconcile while one
+  was would release its reservation. After a crash at any step and its recovery, the name belongs to no one or
+  resolves to the clone that holds it.
+- **Rejected:** refusing a clone name that hashes elsewhere (a rule a user cannot predict), and scattering a lookup
+  over every partition on a miss (against D-14's "ids route to owners" at fleet scale).
+- **Evidence.**
+  - `crates/db/tests/alias.rs`: a crash after every step of the clone and of the destroy, with both partitions dropped
+    and recovered from the segment, checks the unreconciled name, then the reconciled one; a refused clone gives its
+    name back; a name is held once by a volume or an alias.
+  - `a_clone_named_on_another_partition_is_reached_by_name_and_held_once`: two shards and one, restart included. Red at
+    main (`00e5269c`: no volume by the clone's name on its name's partition). Red again with the alias routing
+    disabled (`MNT` answered `NOENT`). Green after.
+  - slates-db 124/0 (the alias suite 5); slates-server lib, daemon, recovery and nfs_mount 294/0.
+- **What it does not change.** Lookups by id, and a create whose name hashes to its own partition. The siblings found
+  are left as they were: `ImageBuild` and `ImageMerge` make a named volume on the origin's partition with the same
+  local-only name check, and a fleet takeover that moves a clone off its host is outside this daemon's partitions.
+
+### A-233 — macOS hands a client its region as a Mach fileport, never by a name a stranger could open (accepted 2026-11-06, GAP-A9-9's ring half)
+Renumbered 2026-11-07 from A-220 (the supervisor's allocation: A-220 was taken elsewhere). The commit that made it,
+d0087a8b, carries the old number in its message; history is not rewritten.
+Applied in the same change to: §4.7 (the macOS rendezvous), GAPS (GAP-A9-9), `crates/ipc` (`mach_claim.rs`, new;
+`owner_name.rs`: the token's port and its look-up; `rendezvous.rs`: the macOS `Owner` serves the token, the answer names
+nothing, the claimant fetches its region; `region.rs`: a region from a descriptor, a second mapping by a duplicate, its
+name unlinked; `completion.rs`: the bridge's mappings by duplicate), `crates/mem` (`SharedObject::from_descriptor`,
+`unlink_name`), `unsafe-budget.toml`, and the bug record of 2026-10-18.
+- **What was wrong.** The macOS rendezvous wrote each client's region name into the bootstrap object's claim slot, which
+  any same-uid process maps. A stranger that never connected read every request and reply another client exchanged and
+  wrote into them (measured 2026-10-18). Since A-176 the names carry a per-start key, but a stranger that connected once
+  learns the key from its own region's name, and any stranger reads each name from the slot as it is published.
+- **The rule.** The daemon unlinks a region's name before it answers, so no process opens it by name. The region crosses
+  only as a fileport, through the instance owner's Mach token, which launchd refuses to any other process while its
+  holder lives (A-178). The owner serves the token on a thread of its own and keeps a region only from its own process or
+  a child of it. It hands that region only to the process whose audit token sent the fetch and whose pid the slot names.
+- **Why each piece.**
+  - A name taken from the slot would not authenticate the owner: the slot is shared writable memory, so a forged answer
+    could point a client at a name a stranger registered.
+  - A keep from any process would let a stranger plant a region of its own for a victim to fetch.
+  - A fetch answered to any process would hand one client's region to another.
+  - A stranger that rewrites a victim's slot pid before the answer gets a fresh region the victim never uses, and the
+    victim's claim fails: the refusal a slot's writer could always cause, never another client's ring.
+- **Evidence.**
+  - Red first: `a_stranger_finds_no_clients_region_by_name` (`rendezvous.rs`): the slot named the region and a stranger
+    opened it. Green after.
+  - `mach_claim`'s tests: a fetch is handed over once; a region kept for another process is refused to this one; a
+    stranger's keep is refused. That last one runs a non-child process, and with the parent check disabled the victim
+    fetched the stranger's region.
+  - `slates-ipc` 38 lib tests and its cross-process rendezvous suite, `slates-client` 60, and the anchor-supervised CLI
+    flows on macOS: `the_anchor_supervises_…`, `slates_run_…`, `nfs_held`. The CLI flows put the daemon in a child process
+    of the anchor and restart it under the anchor.
+- **What it does not change.** The claim protocol and its restart rules (AUD-29-09/19, A-114, A-143, A-176), Linux (a
+  descriptor over the abstract socket since 2026-09), and Windows, which still hands a region over by name and is GAP-A9-9's
+  other half. Nor the anchor's segment and the bootstrap object, which are still opened by name; the segment's name is the
+  macOS issuer surface (§4.13), whose closing is a decision recorded in GAPS.
+
 ### A-222 — Another host's attachment is served by the owner, under a consumer that names the origin (accepted and built 2026-11-05)
 
 - **What it answers.** §4.10 and D-16 say "a write-intent attachment that stays on another host migrates [ownership]
@@ -15245,7 +15458,7 @@ decided); in a third, `.github/workflows/ci.yml` (the three Windows NFS steps ru
   a program's stores in a refused page go without a word. When they came before the other path's write, that is the
   order of events; when they came after, through a page the client had not refetched, they were the newer write and
   are lost, the case only a byte-level merge could keep. A program that needs both kept maps through the socket route
-  (A-186). A daemon restart starts the states empty, so a page fetched before it is not judged.
+  (A-186). A daemon restart started the states empty, so a page fetched before it was not judged; A-231 carries them.
 - **Found and fixed on the way**, each failing a test first, each recorded in `docs/bugs/`:
   - The byte states panicked on an empty range, which an NFS WRITE of no bytes reached and no FUSE kernel sends: a
     release daemon would have aborted on it.
