@@ -859,7 +859,10 @@ fn status(client: &mut Client, volume: VolumeId) -> slates_ipc::protocol::Status
   };
   let up_to = client.sequence;
   assert!(matches!(
-    client.call(&RequestBody::Acknowledge { up_to }),
+    client.call(&RequestBody::Acknowledge {
+      up_to,
+      owed: Vec::new(),
+    }),
     ReplyBody::Acknowledged
   ));
   report

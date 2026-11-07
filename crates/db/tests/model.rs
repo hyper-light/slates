@@ -330,7 +330,7 @@ enum Step {
   Attach(usize, u32),
   Detach(usize),
   Complete(u32, u32),
-  Acknowledge(u32, u32),
+  Acknowledge(u32, u32, Vec<u32>),
   Grant(usize),
   GrantState(usize, u8),
   LandingLease(u32, u64),
@@ -389,7 +389,7 @@ fn step() -> impl Strategy<Value = Step> {
     1 => (0..8usize, 0..3u32).prop_map(|(v, c)| Step::Attach(v, c)),
     1 => (0..8usize).prop_map(Step::Detach),
     2 => (0..3u32, 0..16u32).prop_map(|(c, s)| Step::Complete(c, s)),
-    1 => (0..3u32, 0..16u32).prop_map(|(c, s)| Step::Acknowledge(c, s)),
+    1 => (0..3u32, 0..16u32, proptest::collection::vec(0..16u32, 0..4)).prop_map(|(c, s, owed)| Step::Acknowledge(c, s, owed)),
     1 => (0..8usize).prop_map(Step::Grant),
     1 => (0..8usize, 0..4u8).prop_map(|(g, s)| Step::GrantState(g, s)),
     1 => (0..2u32, 1..100u64).prop_map(|(h, t)| Step::LandingLease(h, t)),
@@ -622,10 +622,11 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
         result: vec![u8::try_from(*s).unwrap_or(0); 3],
       },
     },
-    Step::Acknowledge(c, s) => Op::CompletionsAcknowledged {
+    Step::Acknowledge(c, s, owed) => Op::CompletionsAcknowledged {
       origin: 0,
       client: *c,
       up_to: *s,
+      owed: owed.clone(),
     },
     step @ (Step::Grant(..)
     | Step::GrantState(..)
@@ -1359,6 +1360,7 @@ fn completions_are_exactly_once_across_recovery() {
       origin: 0,
       client: 7,
       up_to: 3,
+      owed: Vec::new(),
     },
     0,
   )
@@ -1408,6 +1410,7 @@ fn completions_from_distinct_origins_do_not_collide() {
       origin: 1,
       client: 7,
       up_to: 3,
+      owed: Vec::new(),
     },
     0,
   )
@@ -1777,4 +1780,157 @@ fn a_tenants_key_is_erased_with_its_last_volume_on_the_partition() {
   drop(db);
   let recovered = open(&mut segment);
   assert!(!tenant_key(&recovered, first_account) && tenant_key(&recovered, other_account));
+}
+
+// ---------------------------------------------------------------- acknowledgements that name owed ids
+
+/// One step of a client whose acknowledgements name the ids it still owes (§4.9), and of their delivery to the
+/// database, in any order, more than once, late.
+#[derive(Clone, Debug)]
+enum OwedStep {
+  /// The client issues its next id, owed until answered.
+  Issue,
+  /// The server records the completion of the client's `n`-th owed id, and the client takes the answer (no longer
+  /// owed).
+  Answer(usize),
+  /// The server records the completion of the `n`-th owed id, and the client holds it for a resend under it (still
+  /// owed: an `Overloaded` answer to a verb that ran).
+  Hold(usize),
+  /// The client releases its `n`-th owed id unanswered (gives the resend up).
+  Release(usize),
+  /// The client sends an acknowledgement of where it stands: every id issued, the owed ones named.
+  Acknowledge,
+  /// The `n`-th acknowledgement in flight is delivered, and stays in flight too when `again` (a duplicate).
+  Deliver(usize, bool),
+  /// The database is dropped and recovered.
+  Crash,
+}
+
+fn owed_step() -> impl Strategy<Value = OwedStep> {
+  prop_oneof![
+    3 => Just(OwedStep::Issue),
+    2 => (0..8usize).prop_map(OwedStep::Answer),
+    1 => (0..8usize).prop_map(OwedStep::Hold),
+    1 => (0..8usize).prop_map(OwedStep::Release),
+    2 => Just(OwedStep::Acknowledge),
+    3 => (0..8usize, any::<bool>()).prop_map(|(n, again)| OwedStep::Deliver(n, again)),
+    1 => Just(OwedStep::Crash),
+  ]
+}
+
+/// Shape: the client of the owed-acknowledgement model.
+const OWING_CLIENT: u32 = 9;
+
+/// The model client: its last issued id, the ids it owes, and the acknowledgements it sent not yet delivered.
+#[derive(Default)]
+struct OwingClient {
+  issued: u32,
+  owed: std::collections::BTreeSet<u32>,
+  recorded: std::collections::BTreeSet<u32>,
+  in_flight: Vec<(u32, Vec<u32>)>,
+}
+
+impl OwingClient {
+  /// The `n`-th owed id, wrapping.
+  fn nth_owed(&self, n: usize) -> Option<u32> {
+    let count = self.owed.len();
+    (count > 0)
+      .then(|| self.owed.iter().nth(n % count).copied())
+      .flatten()
+  }
+}
+
+/// Applies one step of the owed-acknowledgement model.
+fn owed_step_applied(
+  step: &OwedStep,
+  client: &mut OwingClient,
+  db: &mut Db,
+  seg: &mut AnchorSegment,
+) -> Result<(), TestCaseError> {
+  let record = |sequence: u32| Op::CompletionRecorded {
+    record: CompletionRecord {
+      origin: 0,
+      client: OWING_CLIENT,
+      sequence,
+      result: sequence.to_le_bytes().to_vec(),
+    },
+  };
+  match step {
+    OwedStep::Issue => {
+      client.issued += 1;
+      client.owed.insert(client.issued);
+    }
+    OwedStep::Answer(n) | OwedStep::Hold(n) => {
+      if let Some(sequence) = client.nth_owed(*n) {
+        if !client.recorded.contains(&sequence) {
+          db.mutate(seg, &record(sequence), 0).map_err(failed)?;
+          client.recorded.insert(sequence);
+        }
+        if matches!(step, OwedStep::Answer(_)) {
+          client.owed.remove(&sequence);
+        }
+      }
+    }
+    OwedStep::Release(n) => {
+      if let Some(sequence) = client.nth_owed(*n) {
+        client.owed.remove(&sequence);
+      }
+    }
+    OwedStep::Acknowledge => client
+      .in_flight
+      .push((client.issued, client.owed.iter().copied().collect())),
+    OwedStep::Deliver(n, again) => {
+      let count = client.in_flight.len();
+      if count > 0 {
+        let (up_to, owed) = if *again {
+          client.in_flight[n % count].clone()
+        } else {
+          client.in_flight.remove(n % count)
+        };
+        let acknowledged = Op::CompletionsAcknowledged {
+          origin: 0,
+          client: OWING_CLIENT,
+          up_to,
+          owed,
+        };
+        db.mutate(seg, &acknowledged, 0).map_err(failed)?;
+      }
+    }
+    OwedStep::Crash => {}
+  }
+  Ok(())
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(120), ..ProptestConfig::default() }))]
+
+  /// §4.9, raft's check of the owed-id rule: a client issues ids, has some answered, holds some for a resend (the
+  /// server recorded them), releases some, and sends acknowledgements of where it stands, which reach the database in
+  /// any order, duplicated and late, with crashes between, under a small pinned snapshot cadence. Expect after every
+  /// step: no id the client still owes is released (`Seen::Acknowledged`), an owed id the server recorded is answered
+  /// from its record, and every recovery equals the live partition whole.
+  #[test]
+  fn no_owed_id_is_released_whatever_order_its_acknowledgements_arrive_in(steps in proptest::collection::vec(owed_step(), 1..200), snapshot_every in 64u64..4_096) {
+    let mut seg = segment("slates-db-owed", LOG_BYTES);
+    let mut db = open(&mut seg);
+    db.set_policy(SnapshotPolicy { bytes_between_snapshots: snapshot_every });
+    let mut client = OwingClient::default();
+    for step in &steps {
+      owed_step_applied(step, &mut client, &mut db, &mut seg)?;
+      if matches!(step, OwedStep::Crash) {
+        let live = db.partition().to_snapshot(0);
+        drop(db);
+        db = recover(&mut seg, 0, caps(), 0).map_err(failed)?.0;
+        db.set_policy(SnapshotPolicy { bytes_between_snapshots: snapshot_every });
+        prop_assert_eq!(db.partition().to_snapshot(0), live, "recovery differs from the live partition");
+      }
+      for owed in &client.owed {
+        let seen = db.partition().completion(0, OWING_CLIENT, *owed);
+        prop_assert!(seen != Seen::Acknowledged, "owed id {} released after {:?}", owed, step);
+        if client.recorded.contains(owed) {
+          prop_assert_eq!(seen, Seen::Completed(owed.to_le_bytes().to_vec()), "owed id {} lost its record", owed);
+        }
+      }
+    }
+  }
 }
