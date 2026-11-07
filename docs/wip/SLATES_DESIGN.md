@@ -7286,6 +7286,10 @@ stays in the overlay.
 > - **The source.** An unnamed landing lands an implicit snapshot of the head, taken when it begins.
 > - **One at a time.** One granted landing per volume runs at a time.
 > - **Large files.** A large file is copied one content window per unit, so no unit grows with a file.
+> - **The fences' clock.** Every entry is fenced against its lease and grant on the landing's clock, which counts from
+>   the instant its request's clock was read: the plan, the sweep and the validation count. Until 2026-11-08 it
+>   counted from the first write, so a landing paused before it wrote past its term
+>   (`docs/bugs/2026-11-08-a-landings-fence-counted-its-time-from-its-first-write.md`).
 > - **The lease keepalive.** A running landing renews its target lease between slices once half its term
 >   has passed, by taking it again as its own holder. Until 2026-11-07 the partition refused that take while the
 >   lease held, so a renewal only succeeded once the lease had lapsed. The entries a landing reached in between
