@@ -427,17 +427,20 @@ impl Fleet {
       .iter()
       .map(|node| format!("chaos-{tag}-{node}-{pid}"))
       .collect();
+    // One node at a time, each answering before the next starts: a daemon's boot measures the machine
+    // (`MachineProfile::measure_patiently`, about 13 s for a lone debug daemon on a loaded Mac, 2026-11-07), and three
+    // measuring at once disturb each other past the start wait, so every flow failed at start (live-durability, at load
+    // 12 with no other fleet running).
     let processes = FLEET_NODES
       .iter()
       .zip(&instances)
       .zip(&blocks)
       .map(|((node, instance), held)| {
-        Some(start_node(instance, &manifest, node, held, supervision))
+        let process = start_node(instance, &manifest, node, held, supervision);
+        wait_answers(instance);
+        Some(process)
       })
       .collect();
-    for instance in &instances {
-      wait_answers(instance);
-    }
     let hosts = wait_formed(&instances);
     let bootstrap = (0..hosts.len())
       .min_by_key(|index| hosts[*index].parse::<u64>().unwrap())
