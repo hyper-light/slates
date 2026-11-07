@@ -112,8 +112,19 @@ pub enum TargetRefusal {
   EscapesTarget,
   /// The target is owned by another user.
   TargetNotOwned,
+  /// The target's drive, or one a junction along it reaches, is a mount this daemon serves (§4.6: no daemon thread
+  /// opens a path on a volume the daemon serves; A-227): refused before any open, so the landing wrote nothing.
+  OwnMount,
   /// The host refused.
   Unavailable(HostError),
+}
+
+/// A host's refusal of the target as the writer's: a mount this daemon serves is [`TargetRefusal::OwnMount`].
+fn host_refusal(error: HostError) -> TargetRefusal {
+  match error {
+    HostError::OwnMount(_) => TargetRefusal::OwnMount,
+    other => TargetRefusal::Unavailable(other),
+  }
 }
 
 /// A temporary's bookkeeping: where it was created and under which name.
@@ -512,7 +523,7 @@ impl OsLand {
   pub fn open_target(path: &Path) -> Result<(Self, LandingTarget), TargetRefusal> {
     let current = walk_target(path)?;
     let root = Path::new(path.ancestors().last().unwrap_or(path));
-    let (host, _) = OsHost::open_root(root).map_err(TargetRefusal::Unavailable)?;
+    let (host, _) = OsHost::open_root(root).map_err(host_refusal)?;
     Self::adopt_target(host, current, key_of(path)).map_err(|(_, refusal)| refusal)
   }
 
@@ -592,7 +603,7 @@ fn walk_target(path: &Path) -> Result<OwnedHandle, TargetRefusal> {
   let current = walk_dir(path).map_err(|refusal| match refusal {
     WalkRefusal::NotAbsolute => TargetRefusal::NotAbsolute,
     WalkRefusal::Escapes => TargetRefusal::EscapesTarget,
-    WalkRefusal::Host(error) => TargetRefusal::Unavailable(error),
+    WalkRefusal::Host(error) => host_refusal(error),
   })?;
   if !owned_by_this_user(current.as_handle()).map_err(TargetRefusal::Unavailable)? {
     return Err(TargetRefusal::TargetNotOwned);

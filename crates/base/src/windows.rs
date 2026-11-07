@@ -721,6 +721,9 @@ pub fn walk_dir(path: &Path) -> Result<OwnedHandle, WalkRefusal> {
   else {
     return Err(WalkRefusal::NotAbsolute);
   };
+  // A-227 before any open: a target on one of this daemon's own drives is refused `OwnMount`, since opening it would
+  // send this thread's request to the volume only this daemon answers.
+  check_root_volume(path).map_err(WalkRefusal::Host)?;
   let mut root = std::path::PathBuf::from(prefix.as_os_str());
   root.push(std::path::MAIN_SEPARATOR_STR);
   // structural: allow — a read-only open of the volume's root directory; nothing is written (R1).
