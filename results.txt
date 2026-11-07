@@ -1,0 +1,13 @@
+tested 6fe4b30dda9ab0222bcc10a53d0d3444faa11136 variant after on x86_64, 4 cpus
+silent exit 101 66s
+  silent: thread 'a_silent_forward_gives_up_while_its_session_carries_others' (5452) panicked at crates/server/tests/fleet.rs:5200:3:
+  silent: a forward its owner never answered was given up at its stall budget while the session carried 5554 other replies: batch_given_up 0; b's counters Ok({"content.purged_bytes": 698343424, "content.ticks.idle": 3, "fleet.discovery.pages": 15, "fleet.fan.sent": 3, "fleet.fan.unchanged": 32, "fleet.forward.batch_done": 5557, "fleet.forward.begun": 5557, "fleet.forward.client.control_started": 5557, "fleet.forward.client.delivered_home": 5555, "fleet.forward.client.resolved": 5557, "fleet.forward.client.to_control": 5555, "fleet.forward.taken_for_another": 2160, "fleet.learner.fetch_paced": 8, "fleet.learner.fetches": 2, "fleet.owner_location.direct": 5557, "fleet.owner_location.route_dropped.refused": 1, "fleet.plane.announce_lends": 4, "fleet.plane.announcements_sent": 4})
+  silent: test a_silent_forward_gives_up_while_its_session_carries_others ... FAILED
+  silent: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 98 filtered out; finished in 4.21s
+  silent: error: test failed, to rerun pass `-p slates-server --test fleet`
+silent-again exit 101 4s
+  silent-again: thread 'a_silent_forward_gives_up_while_its_session_carries_others' (5484) panicked at crates/server/tests/fleet.rs:5200:3:
+  silent-again: a forward its owner never answered was given up at its stall budget while the session carried 4416 other replies: batch_given_up 0; b's counters Ok({"content.purged_bytes": 698343424, "content.ticks.idle": 3, "fleet.discovery.pages": 15, "fleet.fan.sent": 3, "fleet.fan.unchanged": 31, "fleet.forward.batch_done": 4419, "fleet.forward.begun": 4419, "fleet.forward.client.control_started": 4419, "fleet.forward.client.delivered_home": 4417, "fleet.forward.client.resolved": 4419, "fleet.forward.client.to_control": 4417, "fleet.forward.session_out": 7, "fleet.forward.taken_for_another": 1700, "fleet.learner.fetch_paced": 8, "fleet.learner.fetches": 2, "fleet.lent_to.drive_root_replication": 6, "fleet.lent_to.take_campaign_sessions": 1, "fleet.owner_location.direct": 4419, "fleet.owner_location.route_dropped.refused": 1, "fleet.plane.announce_lends": 4, "fleet.plane.announcements_sent": 4})
+  silent-again: test a_silent_forward_gives_up_while_its_session_carries_others ... FAILED
+  silent-again: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 98 filtered out; finished in 4.15s
+  silent-again: error: test failed, to rerun pass `-p slates-server --test fleet`
