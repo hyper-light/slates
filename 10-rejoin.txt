@@ -153,3 +153,8 @@ rejoins: successor daemon 35848 answered after 40.289542ms
 slates-cluster: fleet: HostId(6497107281708264265) holds HostId(7262066432171168342) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
 rejoins: the fleet re-formed after 107.492375ms
 test a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet ... ok
+=== epochs 6 exit 0 load { 12.92 15.75 13.82 }
+rejoins: successor daemon 36192 answered after 38.569375ms
+slates-cluster: fleet: HostId(14212851855679839326) holds HostId(3910527254858612919) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+rejoins: the fleet re-formed after 280.285708ms
+slates daemon: the anchor is gone; leaving
