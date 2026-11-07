@@ -1930,13 +1930,14 @@ fn owed_catalog(
 
 /// Whether the green `id`'s catalog register is ready for its merge records to ship (A-237; see [`owed_catalog`]):
 /// a successor materializes a green only with its adopted catalog, so a merge record that could be adopted without
-/// one would leave the green unserved. Read on the green's owner shard.
+/// one would leave the green unserved. A green with no record here owes no catalog: a destroyed green's tombstone
+/// stands for both registers (AUD-29-43). Read on the green's owner shard.
 pub(crate) fn green_catalog_committed(state: &ShardState, id: DbVolumeId, local: HostId) -> bool {
   state
     .db
     .partition()
     .volume(id)
-    .is_some_and(|record| owed_catalog(state, state.fleet.configuration(), record, local).1)
+    .is_none_or(|record| owed_catalog(state, state.fleet.configuration(), record, local).1)
 }
 
 /// The stage of a destroyed volume's tombstone this owner still owes some candidate (AUD-29-43; see
