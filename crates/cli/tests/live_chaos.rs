@@ -298,11 +298,9 @@ fn wait_formed(instances: &[String], members: usize) -> Vec<String> {
       .map(|instance| fleet_view(instance))
       .collect();
     if views.iter().all(|view| {
-      view
-        .as_ref()
-        .is_some_and(|(_, held, probed)| {
-          *held == members && usize::try_from(*probed).ok() == members.checked_sub(1)
-        })
+      view.as_ref().is_some_and(|(_, held, probed)| {
+        *held == members && usize::try_from(*probed).ok() == members.checked_sub(1)
+      })
     }) {
       return views.into_iter().map(|view| view.unwrap().0).collect();
     }
@@ -2593,6 +2591,68 @@ fn clients_cut_off_mid_merge_leave_the_green_whole_across_a_takeover() {
   verdict.judge();
 }
 
+/// §4.8 "Membership" with an anchored daemon succeeded (raft-chaos report 8): do start an anchored three-node fleet, let
+/// it settle, then SIGKILL one candidate's daemon so that its anchor starts a successor under a fresh member identity.
+/// Expect the fleet to re-form within the fleet wait: every node holding three members alive with both peers probed, the
+/// successor voting and in the committed configuration, with a record session to each peer. Reported 2026-11-06: the
+/// successor answered in 0.3-0.9 s but held three members with no peer probed for the whole wait, while each other node
+/// held two members and one peer.
+#[test]
+fn a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet() {
+  if !gated("succeeded-rejoins") {
+    return;
+  }
+  let fleet = Fleet::start("rejoins", Supervision::Anchored);
+  let owner_index = fleet.owner_index();
+  let killed_index = fleet.others(owner_index)[0];
+  let began = Instant::now();
+  let successor = fleet.kill_daemon_and_await_successor(killed_index);
+  eprintln!(
+    "rejoins: successor daemon {successor} answered after {:?}",
+    began.elapsed()
+  );
+  let deadline = Instant::now() + FLEET_WAIT;
+  loop {
+    let views: Vec<_> = fleet
+      .instances
+      .iter()
+      .map(|instance| fleet_view(instance))
+      .collect();
+    let formed = views.iter().all(|view| {
+      view
+        .as_ref()
+        .is_some_and(|(_, members, probed)| *members == FLEET_NODES.len() && *probed == 2)
+    });
+    if formed {
+      break;
+    }
+    if Instant::now() >= deadline {
+      for instance in &fleet.instances {
+        let (_, out, _) = run(instance, &["status"]);
+        let lines: Vec<&str> = out
+          .lines()
+          .filter(|line| {
+            line.starts_with("fleet_")
+              || line.contains(" refused fleet.")
+              || line.contains(" refused member")
+              || line.contains(" refused probe")
+          })
+          .filter(|line| {
+            !line.contains("_base_periods")
+              && !line.contains("_rtt_")
+              && !line.contains("_priority")
+          })
+          .collect();
+        eprintln!("rejoins --- {instance}\n{}", lines.join("\n"));
+      }
+      panic!("the fleet re-formed after the successor: {views:?}");
+    }
+    pause();
+  }
+  fleet.wait_rejoined();
+  eprintln!("rejoins: the fleet re-formed after {:?}", began.elapsed());
+}
+
 /// How a volume whose destroy was never answered done settled: destroyed on every survivor (none lists it, each read
 /// refused `NotFound` or `OwnerUnreachable`), or served whole by one.
 enum Settled {
@@ -2843,50 +2903,51 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
   ));
   let mut roles = None;
   let fleet_cell = std::cell::RefCell::new(&mut fleet);
-  let (outcomes, _samples) = stream_through(&instances, &owner, &volume, 0..STREAM_FILES, |began| {
-    after_writes(&owner, &volume, BETWEEN_EVENTS);
-    let holders = wait_holders(&fleet_cell.borrow(), &volume, 2);
-    // A member that holds none of the log is replaced: its successor joins under a fresh identity. One without a seat
-    // first, so the council's seats stay where they were.
-    let seated = council_voters_by_index(&fleet_cell.borrow());
-    let replaced = fleet_cell
-      .borrow()
-      .others(owner_index)
-      .into_iter()
-      .filter(|index| !holders.contains(index))
-      .min_by_key(|index| seated.contains(index))
-      .unwrap();
-    fleet_cell.borrow_mut().kill_node(replaced);
-    fleet_cell.borrow_mut().replace_node(replaced);
-    fleet_cell.borrow().wait_rejoined();
-    verdict.note(format!(
-      "{} replaced by a fresh member, rejoined at {:?}",
-      instances[replaced],
-      began.elapsed()
-    ));
-    // The holder stopped at the takeover: one whose seat, with the owner's, leaves the council two of its three votes.
-    let seated = council_voters_by_index(&fleet_cell.borrow());
-    let owner_seated = seated.contains(&owner_index);
-    let current = holders
-      .iter()
-      .copied()
-      .find(|holder| !(owner_seated && seated.contains(holder)))
-      .expect("a holder whose stop with the owner's loss leaves the council a majority");
-    let stale = holders
-      .iter()
-      .copied()
-      .find(|holder| *holder != current)
-      .unwrap();
-    roles = Some((current, stale));
-    after_writes(&owner, &volume, BETWEEN_EVENTS);
-    fleet_cell.borrow().stop(stale);
-    verdict.note(format!(
-      "{} stopped at {:?}",
-      instances[stale],
-      began.elapsed()
-    ));
-    after_writes(&owner, &volume, BETWEEN_EVENTS);
-  });
+  let (outcomes, _samples) =
+    stream_through(&instances, &owner, &volume, 0..STREAM_FILES, |began| {
+      after_writes(&owner, &volume, BETWEEN_EVENTS);
+      let holders = wait_holders(&fleet_cell.borrow(), &volume, 2);
+      // A member that holds none of the log is replaced: its successor joins under a fresh identity. One without a seat
+      // first, so the council's seats stay where they were.
+      let seated = council_voters_by_index(&fleet_cell.borrow());
+      let replaced = fleet_cell
+        .borrow()
+        .others(owner_index)
+        .into_iter()
+        .filter(|index| !holders.contains(index))
+        .min_by_key(|index| seated.contains(index))
+        .unwrap();
+      fleet_cell.borrow_mut().kill_node(replaced);
+      fleet_cell.borrow_mut().replace_node(replaced);
+      fleet_cell.borrow().wait_rejoined();
+      verdict.note(format!(
+        "{} replaced by a fresh member, rejoined at {:?}",
+        instances[replaced],
+        began.elapsed()
+      ));
+      // The holder stopped at the takeover: one whose seat, with the owner's, leaves the council two of its three votes.
+      let seated = council_voters_by_index(&fleet_cell.borrow());
+      let owner_seated = seated.contains(&owner_index);
+      let current = holders
+        .iter()
+        .copied()
+        .find(|holder| !(owner_seated && seated.contains(holder)))
+        .expect("a holder whose stop with the owner's loss leaves the council a majority");
+      let stale = holders
+        .iter()
+        .copied()
+        .find(|holder| *holder != current)
+        .unwrap();
+      roles = Some((current, stale));
+      after_writes(&owner, &volume, BETWEEN_EVENTS);
+      fleet_cell.borrow().stop(stale);
+      verdict.note(format!(
+        "{} stopped at {:?}",
+        instances[stale],
+        began.elapsed()
+      ));
+      after_writes(&owner, &volume, BETWEEN_EVENTS);
+    });
   let (current, stale) = roles.expect("the flow chose its holders' roles");
   let survivors: Vec<&str> = (0..instances.len())
     .filter(|index| *index != owner_index)
@@ -2928,7 +2989,10 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
     pause();
   };
   let Some(adopted_by) = adopted_by else {
-    let live: Vec<String> = survivors.iter().map(|survivor| (*survivor).to_owned()).collect();
+    let live: Vec<String> = survivors
+      .iter()
+      .map(|survivor| (*survivor).to_owned())
+      .collect();
     verdict.note(format!(
       "no survivor adopted the registers; the survivors:\n{}",
       diagnosis(&live, &volume)
@@ -2998,7 +3062,10 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
       );
     }
     None => {
-      let live: Vec<String> = survivors.iter().map(|survivor| (*survivor).to_owned()).collect();
+      let live: Vec<String> = survivors
+        .iter()
+        .map(|survivor| (*survivor).to_owned())
+        .collect();
       verdict.note(format!(
         "no survivor served the volume; the survivors:\n{}",
         diagnosis(&live, &volume)

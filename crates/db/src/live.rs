@@ -27,6 +27,13 @@
 //! entry commit (10 of 400 seeds in `tests/live.rs`, 2026-11-06). Each shipper, a successor's too, commits its own
 //! holders before it ships.
 //!
+//! **Holder change.** The holders follow the volume's candidates by a joint transition, as Vertical Paxos changes a
+//! configuration (Lamport, Malkhi and Zhou, PODC 2009): [`Shipper::begin_transition`] ships to the old and the new set
+//! and counts a position durable only once `f` of each hold it; [`Shipper::transferred`] says the new set holds every
+//! durable entry and the head the shipper started from; the record may name it only then, and
+//! [`Shipper::activate`] switches once it does. Replacing the holders outright let a takeover count a set that held none
+//! of the durable entries (NoLoss broken in `tests/live.rs`, 2026-11-07).
+//!
 //! **Bounds.** The owner holds at most `credit` entries not yet durable ([`LiveError::NoCredit`] past it: the writer
 //! waits, AC-8.9) and retains at most `retain` entries for laggards; a holder behind the retained tail is installed.
 //! Both are the caller's to derive (A-200: Little's law over the measured apply rate and holder round trip).
@@ -743,6 +750,8 @@ pub struct Shipper {
   /// The holders whose last answer said they need an install (off the chain, or behind the retained tail), until one
   /// answers with a head on the chain: [`Shipper::pending`] answers `Install` for them.
   owed_install: std::collections::BTreeSet<HostId>,
+  /// The holder set it is moving to ([`Shipper::begin_transition`]), sorted, until the record names it.
+  transition: Option<Vec<HostId>>,
 }
 
 impl Shipper {
@@ -776,6 +785,7 @@ impl Shipper {
       durable: None,
       checkpoint: None,
       owed_install: std::collections::BTreeSet::new(),
+      transition: None,
     };
     shipper.durable = shipper.recompute_durable();
     shipper
@@ -805,6 +815,115 @@ impl Shipper {
   /// The holders it ships to.
   pub fn holders(&self) -> &[HostId] {
     &self.holders
+  }
+
+  /// The holder set it is moving to, while a transition is under way ([`Shipper::begin_transition`]).
+  pub fn transition(&self) -> Option<&[HostId]> {
+    self.transition.as_deref()
+  }
+
+  /// Every host it ships to: the holders, then the transition's members not among them.
+  pub fn targets(&self) -> impl Iterator<Item = HostId> + '_ {
+    let joining = self
+      .transition
+      .iter()
+      .flatten()
+      .filter(|host| !self.holders.contains(host));
+    self.holders.iter().chain(joining).copied()
+  }
+
+  /// Begins moving to `next` (the volume's other candidates as the configuration now names them; the owner is left
+  /// out), a change of holder set in the manner of Vertical Paxos (Lamport, Malkhi and Zhou, PODC 2009): until the
+  /// record names `next` ([`Shipper::activate`]), the shipper ships to both sets and counts a position durable only once
+  /// `f` of each hold it, so a takeover counting either set meets every durable entry. A member of `next` is owed
+  /// everything it lacks (entries, or an install once the retained tail no longer reaches back). Whether the target
+  /// changed.
+  ///
+  /// A target that already holds every durable entry ([`Shipper::transferred`]) is kept until it is activated, since its
+  /// record may be in flight; before that a new target replaces it, and naming the holders again ends the transition.
+  /// Replacing the holders outright let a takeover count a new set that held none of the durable entries: 0 of `f`
+  /// common members at `f = 1` broke NoLoss in the model (`tests/live.rs`, 2026-11-07).
+  pub fn begin_transition(&mut self, next: &[HostId]) -> bool {
+    let named = self.named(next);
+    if self.transition.as_deref() == Some(named.as_slice())
+      || (self.transition.is_some() && self.transferred())
+    {
+      return false;
+    }
+    let mut active = self.holders.clone();
+    active.sort_unstable();
+    let changed = if named == active {
+      self.transition.take().is_some()
+    } else {
+      self.transition = Some(named);
+      true
+    };
+    self.forget_unnamed();
+    self.durable = self.recompute_durable();
+    changed
+  }
+
+  /// Whether the transition's target holds every durable entry: `f` of its members each hold the durable position and
+  /// the head the shipper started from (always, while neither exists). Only then may the record name it, and the shipper activate it. `false` with no
+  /// transition.
+  pub fn transferred(&self) -> bool {
+    let Some(next) = &self.transition else {
+      return false;
+    };
+    // A successor's start may hold writes made durable under the owner it took over, which its own durable position
+    // has not counted yet: the target holds them too before the record may name it. Without this a successor moved to
+    // a set disjoint from the old at once, and the next takeover adopted nothing (the model, f = 2, 2026-11-07).
+    let start = self.start.map(|start| start.position);
+    let Some(floor) = self.durable.max(start) else {
+      return true;
+    };
+    self
+      .reached_by(next)
+      .is_some_and(|reached| reached >= floor)
+  }
+
+  /// Ends the transition once the record names its target: `recorded` is the holder set the volume's record now holds.
+  /// Refused (`false`) unless it is the transition's target and that target holds every durable entry
+  /// ([`Shipper::transferred`]); from then on the shipper ships to it alone and counts durability over it alone.
+  pub fn activate(&mut self, recorded: &[HostId]) -> bool {
+    let named = self.named(recorded);
+    if self.transition.as_deref() != Some(named.as_slice()) || !self.transferred() {
+      return false;
+    }
+    self.holders = named;
+    self.transition = None;
+    self.forget_unnamed();
+    self.durable = self.recompute_durable();
+    true
+  }
+
+  /// `hosts` without the owner, sorted, each once.
+  fn named(&self, hosts: &[HostId]) -> Vec<HostId> {
+    let mut named: Vec<HostId> = hosts
+      .iter()
+      .copied()
+      .filter(|host| *host != self.owner)
+      .collect();
+    named.sort_unstable();
+    named.dedup();
+    named
+  }
+
+  /// Whether the shipper ships to `host` (a holder, or a member of the transition's target).
+  fn ships_to(&self, host: HostId) -> bool {
+    self.holders.contains(&host)
+      || self
+        .transition
+        .as_ref()
+        .is_some_and(|next| next.contains(&host))
+  }
+
+  /// Forgets what hosts it no longer ships to reported, and trims for those it does.
+  fn forget_unnamed(&mut self) {
+    let named: Vec<HostId> = self.targets().collect();
+    self.held.retain(|host, _| named.contains(host));
+    self.owed_install.retain(|host| named.contains(host));
+    self.trim();
   }
 
   /// The entries appended here that are not yet durable.
@@ -886,7 +1005,7 @@ impl Shipper {
   /// acknowledgement of every position up to it; a head off the chain or behind the retained tail draws an install; a
   /// fence above this epoch means the owner has been superseded.
   pub fn on_reply(&mut self, holder: HostId, reply: Result<Option<Head>, LiveError>) -> Next {
-    if !self.holders.contains(&holder) {
+    if !self.ships_to(holder) {
       return Next::Nothing;
     }
     let held = match reply {
@@ -945,7 +1064,7 @@ impl Shipper {
   /// every write it took waited (`live_fleet`, a write stuck 21 minutes; the model, driven as the daemon drives it,
   /// failed Convergence).
   pub fn pending(&self, holder: HostId) -> Next {
-    if self.head.is_none() || !self.holders.contains(&holder) {
+    if self.head.is_none() || !self.ships_to(holder) {
       return Next::Nothing;
     }
     if self.owed_install.contains(&holder) {
@@ -1013,12 +1132,12 @@ impl Shipper {
     }
   }
 
-  /// Drops retained entries every holder holds, then the oldest past `retain` (a laggard behind them is installed).
+  /// Drops retained entries every host it ships to holds, then the oldest past `retain` (a laggard behind them is
+  /// installed).
   fn trim(&mut self) {
     let everyone = self
-      .holders
-      .iter()
-      .map(|holder| self.held.get(holder).map(|head| head.position))
+      .targets()
+      .map(|holder| self.held.get(&holder).map(|head| head.position))
       .min()
       .flatten();
     let mut bytes = self
@@ -1047,21 +1166,39 @@ impl Shipper {
   }
 
   /// The highest position the owner and `f` holders hold: the `f`-th highest holder position, capped at the owner's
-  /// head. At `f = 0` the owner's head.
+  /// head; during a transition, the lower of that over the holders and over the target, so a takeover counting either
+  /// meets it. At `f = 0` the owner's head. It never falls: an older answer arriving late, or a set with fewer than `f`
+  /// members holding anything, leaves it where it was.
   fn recompute_durable(&self) -> Option<u64> {
     let own = self.head?.position;
+    if self.quorum.f == 0 {
+      return Some(own);
+    }
+    let reached = match &self.transition {
+      None => self.reached_by(&self.holders),
+      Some(next) => self
+        .reached_by(&self.holders)
+        .zip(self.reached_by(next))
+        .map(|(holders, next)| holders.min(next)),
+    };
+    match (reached.map(|reached| reached.min(own)), self.durable) {
+      (Some(reached), Some(durable)) => Some(durable.max(reached)),
+      (reached, durable) => reached.or(durable),
+    }
+  }
+
+  /// The `f`-th highest position the members of `set` hold (`None`: fewer than `f` hold anything; at `f = 0`, the
+  /// owner's head).
+  fn reached_by(&self, set: &[HostId]) -> Option<u64> {
     let needed = usize::try_from(self.quorum.f).ok()?;
     let Some(rank) = needed.checked_sub(1) else {
-      return Some(own);
+      return self.head.map(|head| head.position);
     };
-    let mut positions: Vec<u64> = self
-      .holders
+    let mut positions: Vec<u64> = set
       .iter()
       .filter_map(|holder| self.held.get(holder).map(|head| head.position))
       .collect();
     positions.sort_unstable_by(|a, b| b.cmp(a));
-    let reached = positions.get(rank).copied()?.min(own);
-    // Durability only advances: an older answer arriving late never lowers it.
-    Some(self.durable.map_or(reached, |durable| durable.max(reached)))
+    positions.get(rank).copied()
   }
 }
