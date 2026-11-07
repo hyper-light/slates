@@ -979,6 +979,17 @@ fn follow_candidates(state: &mut ShardState, volume: [u8; 16]) {
     state.count(LIVE_HOLDERS_TRANSITION, 1);
   }
   if !target_recordable(state, volume) {
+    // A transition whose target cannot be recorded yet (short of the holders its count needs, or of a whole entry they
+    // can open) holds every write on the joint count: named each period, as `answerable`'s reasons name the active
+    // set's (raft's review, 2026-11-07).
+    if state
+      .live
+      .shipping
+      .get(&volume)
+      .is_some_and(|live| live.shipper.transition().is_some())
+    {
+      state.count(LIVE_HOLDERS_UNPLACED, 1);
+    }
     return;
   }
   let Some(live) = state.live.shipping.get(&volume) else {
@@ -1038,6 +1049,8 @@ fn target_recordable(state: &ShardState, volume: [u8; 16]) -> bool {
 
 /// Counter: a live volume began moving its holders to a changed set of candidates.
 const LIVE_HOLDERS_TRANSITION: &str = "fleet.live.holders_transition";
+/// Counter: a record period in which a live volume's transition target could not be recorded yet.
+const LIVE_HOLDERS_UNPLACED: &str = "fleet.live.holders_unplaced";
 /// Counter: a live volume's new holder set held every durable entry and became its holders.
 const LIVE_HOLDERS_ACTIVATED: &str = "fleet.live.holders_activated";
 
