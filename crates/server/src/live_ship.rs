@@ -103,6 +103,101 @@ pub(crate) fn let_go(state: &mut ShardState, object: ObjectId) {
   }
 }
 
+/// What an accepted catalog record means for this node's copy of the volume's log ([`copy_under_record`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopyUnderRecord {
+  /// The record names this node a holder: the copy is the log's, and is marked so.
+  Named,
+  /// Nothing changes.
+  Kept,
+  /// The copy goes: a newer record than one that named this node omits it.
+  LetGo,
+}
+
+/// Judges this node's copy of a live log under a catalog record it accepted (A-240's holder record): `named_at` is the
+/// sequence of the record that last named this node while it held the copy; `sequence`, `recorded_epoch` and
+/// `names_local` are the new record's; `fence` the copy's. A record is made only once its holder set holds every durable
+/// entry (`target_recordable`), so a holder a newer record omits holds nothing the log needs. But a copy no record has
+/// named yet may be a transition target's, which the shipper already counts: it is kept. A record of an epoch below the
+/// fence is a superseded owner's, and a record no newer than the naming one is late: both keep it.
+fn copy_under_record(
+  named_at: Option<u64>,
+  sequence: u64,
+  recorded_epoch: u64,
+  fence: u64,
+  names_local: bool,
+) -> CopyUnderRecord {
+  if names_local {
+    return CopyUnderRecord::Named;
+  }
+  if named_at.is_some_and(|named| named < sequence) && recorded_epoch >= fence {
+    CopyUnderRecord::LetGo
+  } else {
+    CopyUnderRecord::Kept
+  }
+}
+
+/// The sequence of the newest catalog record of `object` this node accepted, when it names this node among the log's
+/// holders: a copy made after that record arrived is the record's holder's from the start.
+fn named_in_newest_catalog(state: &ShardState, object: ObjectId) -> Option<u64> {
+  let catalog = object.catalog();
+  let local = state.fleet.configuration().owner;
+  let (sequence, bytes) = state.holder_records.get(&catalog)?.highest(catalog)?;
+  let value = crate::catalog::CatalogValue::from_record_bytes(bytes)?;
+  value
+    .live_holders?
+    .holders
+    .contains(&local.0)
+    .then_some(sequence)
+}
+
+/// A catalog record of a live volume was accepted here (`fleet::after_held_record`): marks this node's copy of the log
+/// as the record's holder's when it is named, and lets the copy go once a newer record omits it
+/// ([`copy_under_record`], counted `fleet.live.let_go_unnamed`). Before, an ex-holder kept its copy, at a fence no
+/// takeover raised, until the volume's tombstone (raft-chaos, CI diag-17's five-node flow, 2026-11-07).
+pub(crate) fn on_catalog_accepted(
+  state: &mut ShardState,
+  catalog: ObjectId,
+  sequence: u64,
+  value: &[u8],
+) {
+  let Some(recorded) =
+    crate::catalog::CatalogValue::from_record_bytes(value).and_then(|value| value.live_holders)
+  else {
+    return;
+  };
+  let newest = state
+    .holder_records
+    .get(&catalog)
+    .and_then(|acceptor| acceptor.highest(catalog))
+    .map(|(newest, _)| newest);
+  if newest != Some(sequence) {
+    return;
+  }
+  let object = catalog.placement_key();
+  let local = state.fleet.configuration().owner;
+  let Some(held) = state.live.held.get_mut(&object) else {
+    return;
+  };
+  match copy_under_record(
+    held.named_at,
+    sequence,
+    recorded.epoch,
+    held.replica.fence().0,
+    recorded.holders.contains(&local.0),
+  ) {
+    CopyUnderRecord::Named => held.named_at = Some(sequence),
+    CopyUnderRecord::Kept => {}
+    CopyUnderRecord::LetGo => {
+      state.live.held.remove(&object);
+      state.count(LIVE_LET_GO_UNNAMED, 1);
+    }
+  }
+}
+
+/// Counter: a copy of a live log let go once a newer holder record omitted this node.
+const LIVE_LET_GO_UNNAMED: &str = "fleet.live.let_go_unnamed";
+
 /// Counter: takeover fetches this node answered with what it holds.
 const LIVE_FETCHED: &str = "fleet.live.fetched";
 /// Counter: entries and installs this node kept as a candidate.
@@ -193,6 +288,9 @@ pub(crate) struct Held {
   entries: VecDeque<Vec<u8>>,
   /// Their bytes.
   bytes: usize,
+  /// The sequence of the catalog record that last named this node among the log's holders while it held this copy
+  /// ([`on_catalog_accepted`]); `None` until one has.
+  named_at: Option<u64>,
 }
 
 /// The node's live-shipping state, on every shard: the volumes this shard owns and ships, and (on the control shard)
@@ -2117,10 +2215,12 @@ fn refused_counter(error: &LiveError) -> &'static str {
 /// The holder's copy of `object`, kept for `owner`: the configuration names `owner` the volume's acting owner (the caller
 /// checked it, [`admitted`]), so a successor takes the copy over; the fence still refuses any stale epoch.
 fn held_entry(state: &mut ShardState, owner: HostId, object: ObjectId) -> &mut Held {
+  let named_at = named_in_newest_catalog(state, object);
   let held = state.live.held.entry(object).or_insert_with(|| Held {
     replica: Replica::new(owner, object),
     entries: VecDeque::new(),
     bytes: 0,
+    named_at,
   });
   held.replica.reassign(owner);
   held
@@ -2218,10 +2318,12 @@ fn fenced_copy(
   object: ObjectId,
   epoch: slates_db::register::HostEpoch,
 ) -> Result<&mut Held, LiveError> {
+  let named_at = named_in_newest_catalog(state, object);
   let held = state.live.held.entry(object).or_insert_with(|| Held {
     replica: Replica::new(successor, object),
     entries: VecDeque::new(),
     bytes: 0,
+    named_at,
   });
   held.replica.prepare(epoch)?;
   Ok(held)
@@ -2826,6 +2928,103 @@ mod tests {
       "a lineage refusal is this node's own record, retried"
     );
     assert!(owes_refetch(None, refused_at), "nothing refused yet: fetched");
+  }
+
+  /// A-200 with A-240's record: a copy is let go only once a newer record than one that named this node omits it, under
+  /// an epoch at or past the copy's fence. Do judge each case at the extremes of sequence and epoch. Expect: named, kept
+  /// named; never named (a member of a transition target the record does not name yet), kept whatever the record says,
+  /// since the shipper may already count it; named at the same or a later sequence (a late or repeated record), kept;
+  /// omitted by a newer record of an older epoch (a superseded owner's), kept; omitted by a newer record at or past the
+  /// fence, let go.
+  #[test]
+  fn a_copy_goes_only_when_a_newer_record_omits_a_holder_it_named() {
+    use CopyUnderRecord::{Kept, LetGo, Named};
+    type Case = (
+      Option<u64>,
+      u64,
+      u64,
+      u64,
+      bool,
+      CopyUnderRecord,
+      &'static str,
+    );
+    // (named_at, sequence, recorded epoch, fence, names this node) -> the judgement, and why.
+    let cases: [Case; 11] = [
+      (None, 0, 0, 0, true, Named, "named"),
+      (Some(5), u64::MAX, u64::MAX, 0, true, Named, "named again"),
+      (
+        None,
+        0,
+        u64::MAX,
+        0,
+        false,
+        Kept,
+        "never named: a target member the shipper may count",
+      ),
+      (
+        None,
+        1,
+        u64::MAX,
+        0,
+        false,
+        Kept,
+        "never named: a target member the shipper may count",
+      ),
+      (
+        None,
+        u64::MAX,
+        u64::MAX,
+        0,
+        false,
+        Kept,
+        "never named: a target member the shipper may count",
+      ),
+      (Some(7), 7, 3, 3, false, Kept, "the same record again"),
+      (Some(7), 6, 3, 3, false, Kept, "an older record late"),
+      (
+        Some(u64::MAX),
+        u64::MAX,
+        3,
+        3,
+        false,
+        Kept,
+        "no sequence past the last",
+      ),
+      (
+        Some(7),
+        8,
+        2,
+        3,
+        false,
+        Kept,
+        "a superseded owner's record, below the fence",
+      ),
+      (
+        Some(7),
+        8,
+        3,
+        3,
+        false,
+        LetGo,
+        "omitted by a newer record at the fence",
+      ),
+      (
+        Some(0),
+        u64::MAX,
+        u64::MAX,
+        0,
+        false,
+        LetGo,
+        "omitted by a newer record past the fence",
+      ),
+    ];
+    for (named_at, sequence, epoch, fence, names_local, expected, why) in cases {
+      assert_eq!(
+        copy_under_record(named_at, sequence, epoch, fence, names_local),
+        expected,
+        "{why}"
+      );
+    }
   }
 
   /// Format: the key generation the tests' keys carry.

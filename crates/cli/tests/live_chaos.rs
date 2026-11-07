@@ -3282,6 +3282,37 @@ fn wait_reads<'a>(
   None
 }
 
+/// Runs `writes` on a thread of its own and waits for it within the fleet wait. `Err` with every node's state when it is
+/// not done by then (the writes are left to fail once the fleet's daemons are killed). A write held without an answer
+/// would otherwise hang the flow until its test's own timeout, with nothing printed: the kill-at-acknowledgement flow did,
+/// on every iteration whose owner was a freshly joined member (CI diag-17, 2026-11-07).
+fn answered_within(
+  instances: &[String],
+  volume: &str,
+  writes: impl FnOnce() + Send,
+) -> Result<(), String> {
+  std::thread::scope(|scope| {
+    let writer = scope.spawn(writes);
+    let began = Instant::now();
+    while !writer.is_finished() {
+      if began.elapsed() > FLEET_WAIT {
+        let state = diagnosis(instances, volume);
+        for instance in instances {
+          if let Some(pid) = daemon_pid(instance) {
+            send_signal(pid, rustix::process::Signal::KILL);
+          }
+        }
+        // The writer's client is told its daemon is gone and the thread ends (a panicked thread left unjoined would
+        // make the scope panic over this answer).
+        let _ = writer.join();
+        return Err(state);
+      }
+      pause();
+    }
+    writer.join().map_err(|_| "the writes panicked".to_owned())
+  })
+}
+
 /// A-200 NoLoss at the acknowledgement itself (live-durability's proposal, 2026-11-07): do, `ITERATIONS` times on one
 /// fleet, make a live volume on the owner, write `BEFORE` files, then write a probe file through a barrier (alternately
 /// the client's `fs_write` and a userspace NFS `FILE_SYNC` write) and SIGKILL the owner the instant the probe's answer
@@ -3316,10 +3347,21 @@ fn a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor
       })
       .collect();
     let (probe, before) = files.split_last().unwrap();
-    for (name, body) in before {
-      write_through(&owner, &volume, Barrier::ClientWrite, name, body);
+    let answered = answered_within(&fleet.instances, &volume, || {
+      for (name, body) in before {
+        write_through(&owner, &volume, Barrier::ClientWrite, name, body);
+      }
+      write_through(&owner, &volume, barrier, &probe.0, &probe.1);
+    });
+    if let Err(state) = answered {
+      verdict.check(
+        &format!("every write answered, iteration {iteration} ({barrier:?})"),
+        vec![format!(
+          "a write on {owner} was not answered within the fleet wait:\n{state}"
+        )],
+      );
+      break;
     }
-    write_through(&owner, &volume, barrier, &probe.0, &probe.1);
     // The instant the probe's answer is back, the owner is gone.
     fleet.kill_node(owner_index);
     let survivors: Vec<String> = fleet
