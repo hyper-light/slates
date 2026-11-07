@@ -1,0 +1,11 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 13:25:01 UTC 2026, head 31f8047aeb798c8d8196867f70ca121a41eaf663
+== run 1 at 13:25:01, load 1.86 1.74 0.78
+chaos: fleet kill-at-ack (Bare) formed and settled: hosts ["1221289959571877285", "14636241487956250892", "2111085295876700011"]
+chaos a write answered the instant before its owner dies: iteration 0 (ClientWrite): chaos-kill-at-ack-a-6105 served the probe 1.996543969s after the owner's death
+== run 1 exit 124
+== run 2 at 13:45:01, load 0.19 0.18 0.32
+== run 2 exit 124
+== run 3 at 14:05:01, load 0.16 0.15 0.18
+chaos: fleet kill-at-ack (Bare) formed and settled: hosts ["2091123017226416210", "18065091349633745442", "18053002180140035571"]
+chaos a write answered the instant before its owner dies: iteration 0 (ClientWrite): chaos-kill-at-ack-a-7113 served the probe 2.185063618s after the owner's death
+== run 3 exit 124
