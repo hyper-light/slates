@@ -1,0 +1,23 @@
+tested f7b79d92b83b9da6d845e12f6fb694bdcb4de982 variant after on x86_64, 4 cpus
+mix exit 101 18s
+  mix: thread 'a_tail_whose_records_change_size_still_replays_within_its_recovery_budget' (3747) panicked at crates/db/tests/snapshot_cadence.rs:396:7:
+  mix: a tail of 212620 bytes replayed in 10602163 ns at the median, past the 10000000 ns budget, with no snapshot due before 7920000 bytes; the checks (bytes, ns): [(4684, 1969823), (7708, 2036676), (12460, 2197700), (19588, 2474645), (29524, 2857958), (42484, 3386747), (58180, 3944300), (76684, 4867307), (96412, 5590213), (118012, 6589225), (140404, 7576087), (163588, 8456349), (187780, 9458592), (212620, 10602163)]
+  mix: test a_tail_whose_records_change_size_still_replays_within_its_recovery_budget ... FAILED
+  mix: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.28s
+  mix: error: test failed, to rerun pass `-p slates-db --test snapshot_cadence`
+mix-again exit 101 1s
+  mix-again: thread 'a_tail_whose_records_change_size_still_replays_within_its_recovery_budget' (3761) panicked at crates/db/tests/snapshot_cadence.rs:396:7:
+  mix-again: a tail of 216868 bytes replayed in 10657753 ns at the median, past the 10000000 ns budget, with no snapshot due before 8460000 bytes; the checks (bytes, ns): [(4684, 1833339), (7924, 1933622), (13108, 2192029), (20596, 2494666), (30964, 2904979), (44356, 3436469), (60556, 4128645), (78916, 4796208), (99508, 5800928), (120964, 6616659), (143860, 7615853), (167476, 8614649), (191812, 9582820), (216868, 10657753)]
+  mix-again: test a_tail_whose_records_change_size_still_replays_within_its_recovery_budget ... FAILED
+  mix-again: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.28s
+  mix-again: error: test failed, to rerun pass `-p slates-db --test snapshot_cadence`
+mix-third exit 101 0s
+  mix-third: thread 'a_tail_whose_records_change_size_still_replays_within_its_recovery_budget' (3775) panicked at crates/db/tests/snapshot_cadence.rs:396:7:
+  mix-third: a tail of 215212 bytes replayed in 10593087 ns at the median, past the 10000000 ns budget, with no snapshot due before 8590000 bytes; the checks (bytes, ns): [(4684, 1848349), (7852, 1979625), (12820, 2191863), (20164, 2472562), (30388, 2878058), (43636, 3431809), (59548, 4069311), (77908, 4825777), (98140, 5705047), (119668, 6637713), (142204, 7499418), (165964, 8535948), (190300, 9555748), (215212, 10593087)]
+  mix-third: test a_tail_whose_records_change_size_still_replays_within_its_recovery_budget ... FAILED
+  mix-third: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.28s
+  mix-third: error: test failed, to rerun pass `-p slates-db --test snapshot_cadence`
+budget exit 0 0s
+  budget: budget 10000000 ns: cadence 140000 bytes, 14 bytes/us as the commits measured it; tail 139896 bytes, replayed 139896 bytes; recoveries [6200263, 5979159, 5939290, 5899290, 5968837] ns, median 5968837 ns (23 bytes/us), 596 per mille of the budget
+  budget: test a_fresh_partitions_longest_tail_replays_within_its_recovery_budget ... ok
+  budget: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.09s
