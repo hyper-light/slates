@@ -13418,3 +13418,137 @@ fn a_settled_fleet_admits_a_create_on_every_node() {
     "every node of the settled fleet admits a create: {replies:?}"
   );
 }
+
+/// Shape: how long the owner's shard is kept in one starved poll: a window and a half, so an answer behind it comes past
+/// a wall window.
+const STARVED_OWNER: Duration = Duration::from_millis(1_500);
+/// Shape: the starved poll's time on the CPU and off it in each turn: a fifth of the time on it, as a thread kept off
+/// its core by spinners runs.
+const STARVED_BURST: Duration = Duration::from_millis(10);
+const STARVED_OFF: Duration = Duration::from_millis(40);
+/// Shape: the volumes created on node a while looking for one its second shard owns; with two shards a run that finds
+/// none in this many is a fault of the placement, not luck.
+const OWNER_TRIES: usize = 48;
+
+/// R3 class A, the forwarded verbs (`verbs.rs` `serve_forward`: the forwarded read's call from the control shard to the
+/// volume's owner shard), A-65, §4.3, §4.8. Do: three daemons of two shards, each its own region; create a volume node
+/// a's second shard owns; from a client on node b, read its `Status` until the forward path is up, then read it again
+/// while node a's second shard runs one starved poll for a window and a half (on the CPU a fifth of the time). Expect:
+/// the read is served, after more than a wall window. On main node a's control shard gave up on its owner shard at the
+/// wall second and answered `NotFound`: a live volume reported missing across the fleet.
+#[test]
+fn a_forwarded_read_whose_owner_shard_is_starved_is_served_past_a_wall_window() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let regions: std::collections::BTreeMap<HostId, RegionId> = [
+    (hosts[0], RegionId(0)),
+    (hosts[1], RegionId(1)),
+    (hosts[2], RegionId(2)),
+  ]
+  .into_iter()
+  .collect();
+  let daemons = start_mesh_with(
+    nodes,
+    &hosts,
+    &certs,
+    &serve,
+    1,
+    2,
+    &regions,
+    &std::collections::BTreeMap::new(),
+  );
+  let instances: Vec<String> = daemons
+    .iter()
+    .map(|daemon| daemon.instance().to_owned())
+    .collect();
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  let mut client_a = Client::connect(&instances[0].clone());
+  let id = (0..OWNER_TRIES)
+    .find_map(
+      |attempt| match client_a.call(&scratch(&format!("starved-owner-{attempt}"))) {
+        ReplyBody::Created { id } if slates_server::verbs::owner_of(id) == 1 => Some(id),
+        _ => None,
+      },
+    )
+    .expect("a volume node a's second shard owns");
+  let mut client_b = Client::connect(&instances[1].clone());
+  let ready = poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    COUNCIL_RETIRE_DEADLINE,
+    || {
+      Ok(matches!(
+        client_b.call(&RequestBody::Status { volume: id }),
+        ReplyBody::Status { .. }
+      ))
+    },
+  );
+  assert!(ready, "b's cross-region forward path to region 0 came up");
+
+  let begun = &*Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false)));
+  let owner_shard = daemons[0].shards()[1];
+  let starver = daemons[0]
+    .observation(
+      Some(owner_shard),
+      10 * LIVENESS_BUDGET_NS,
+      move |_: &mut slates_server::state::ShardState| {
+        begun.store(true, std::sync::atomic::Ordering::Release);
+        let started = Instant::now();
+        while started.elapsed() < STARVED_OWNER {
+          let burst = Instant::now();
+          while burst.elapsed() < STARVED_BURST {
+            std::hint::spin_loop();
+          }
+          let (_hold, rx) = std::sync::mpsc::channel::<()>();
+          let _ = rx.recv_timeout(STARVED_OFF);
+        }
+      },
+    )
+    .unwrap();
+  let starving = std::thread::spawn(move || {
+    let _ = starver.wait();
+  });
+  let began = Instant::now();
+  while !begun.load(std::sync::atomic::Ordering::Acquire) {
+    assert!(
+      began.elapsed() < COUNCIL_RETIRE_DEADLINE,
+      "the starved poll began"
+    );
+    std::thread::yield_now();
+  }
+  let started = Instant::now();
+  let reply = client_b.try_call(&RequestBody::Status { volume: id }, 10 * LIVENESS_BUDGET_NS);
+  let took = started.elapsed();
+  starving.join().unwrap();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  let served = matches!(reply, Ok(ReplyBody::Status { .. }));
+  println!(
+    "a forwarded read with its owner shard starved: {} after {took:?}",
+    if served {
+      "served".to_owned()
+    } else {
+      format!("{reply:?}")
+    }
+  );
+  assert!(
+    took > Duration::from_nanos(LIVENESS_BUDGET_NS),
+    "the answer came past a wall window ({took:?}), so the test is not vacuous"
+  );
+  assert!(
+    served,
+    "a starved owner shard's forwarded read was lost after {took:?}: {reply:?}"
+  );
+}
