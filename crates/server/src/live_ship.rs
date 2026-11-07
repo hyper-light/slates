@@ -208,6 +208,12 @@ pub(crate) struct LiveVolume {
   /// The head of the last whole entry on the log: what A-240's checks read ([`target_recordable`],
   /// [`covers_candidates`]). Unlike [`LiveVolume::whole`], never an install image made beside the log.
   whole_entry: Option<Head>,
+  /// The anchors the install image now in [`LiveVolume::whole`] is sealed for, when that is an image made beside the log
+  /// ([`refresh_image`]); `None` while it is the last whole entry. A holder installed from the image keeps it as its log's
+  /// first payload, so a successor adopting that holder must open it: [`covers_candidates`] judges it as well as the
+  /// whole entry. Pairs only accumulate, but one retired between the entry and the image (a node back at its anchor)
+  /// could leave the image short of a key the entry's check passed.
+  image_anchors: Option<Vec<u64>>,
 }
 
 /// What a candidate keeps of one live volume.
@@ -897,6 +903,7 @@ pub(crate) fn published(
       recorded: None,
       recording: None,
       whole_entry: None,
+      image_anchors: None,
     });
   follow_candidates(state, id.bytes);
   let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
@@ -944,6 +951,7 @@ pub(crate) fn published(
         live.owes_image = false;
         live.whole_anchors = anchors;
         live.whole_entry = Some(head);
+        live.image_anchors = None;
       }
       state.count(LIVE_APPENDED, 1);
       if whole {
@@ -1003,8 +1011,7 @@ fn refresh_image(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
   let Some(record) = whole_record(state, id) else {
     return;
   };
-  // An image's anchors are not recorded: A-240 reads those of the last whole entry ([`covers_candidates`]).
-  let Some((image, _)) = payload(state, id, true, record) else {
+  let Some((image, anchors)) = payload(state, id, true, record) else {
     return;
   };
   let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
@@ -1016,6 +1023,9 @@ fn refresh_image(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
   live.shipper.mark_checkpoint(head);
   live.shipper.retain_up_to(image.len());
   live.whole = Some((head, image));
+  // The entry's anchors stay what A-240 judges the log by (`whole_anchors`); the image's are judged beside them.
+  // An image sealed under no keys (a volume shipped in the clear) has none to judge.
+  live.image_anchors = anchors;
   live.owes_image = false;
   state.count(LIVE_IMAGE, 1);
 }
@@ -1203,9 +1213,18 @@ fn covers_candidates(state: &ShardState, volume: [u8; 16]) -> bool {
   let Some(live) = state.live.shipping.get(&volume) else {
     return true;
   };
+  let image_covers = live
+    .image_anchors
+    .as_ref()
+    .is_none_or(|anchors| anchors_cover(state, volume, anchors));
   let Some(anchors) = &live.whole_anchors else {
-    return live.whole_entry.is_some();
+    return live.whole_entry.is_some() && image_covers;
   };
+  anchors_cover(state, volume, anchors) && image_covers
+}
+
+/// Whether `anchors` hold a key for every remote candidate of `volume`.
+fn anchors_cover(state: &ShardState, volume: [u8; 16], anchors: &[u64]) -> bool {
   remote_candidates(state, volume).all(|candidate| {
     state
       .member_anchors
