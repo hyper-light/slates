@@ -2477,13 +2477,14 @@ fn takeover_text(report: &slates_client::TakeoverReport) -> String {
 fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> String {
   let members: Vec<String> = report.fleet.members.iter().map(u64::to_string).collect();
   let mut out = format!(
-    "pid: {}\ngeneration: {}\nrestarts: {}\nanchor_hold_refusals: {}\nanchor_log_lines_refused: {}\nlog_lines_refused: {}\nheartbeat_age_ns: {}\nclients_reaped: {}\nclients_refused: {}\nshards: {}\nfleet_host: {}\nfleet_f: {}\nfleet_host_epoch: {}\nfleet_members: {}\nfleet_peers_probed: {}\nfleet_unknown_id: {}\nfleet_inbox_full: {}\nfleet_sessions_refused: {}\nfleet_replaced: {}\nfleet_held_records: {}\nfleet_takeovers_pending: {}\nfleet_configuration_version: {}\n",
+    "pid: {}\ngeneration: {}\nrestarts: {}\nanchor_hold_refusals: {}\nanchor_log_lines_refused: {}\nlog_lines_refused: {}\ndumps_local_full: {}\nheartbeat_age_ns: {}\nclients_reaped: {}\nclients_refused: {}\nshards: {}\nfleet_host: {}\nfleet_f: {}\nfleet_host_epoch: {}\nfleet_members: {}\nfleet_peers_probed: {}\nfleet_unknown_id: {}\nfleet_inbox_full: {}\nfleet_sessions_refused: {}\nfleet_replaced: {}\nfleet_held_records: {}\nfleet_takeovers_pending: {}\nfleet_configuration_version: {}\n",
     report.pid,
     report.generation,
     report.restarts,
     report.anchor_hold_refusals,
     report.anchor_log_lines_refused,
     report.log_lines_refused,
+    report.dumps_local_full,
     report.heartbeat_age_ns,
     report.clients_reaped,
     report.clients_refused,
