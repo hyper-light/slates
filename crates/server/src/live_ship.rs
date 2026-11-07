@@ -479,6 +479,7 @@ pub(crate) fn defer(
       id,
       reply,
     });
+  if let Some(live) = state.live.shipping.get(&volume.bytes) { slates_machine::log_line!("TEMP {} defer target {target} head {:?} durable {:?} owes_whole {} in_flight {} lanes {:?} catalogued {:?} placed {}", slates_machine::clock::monotonic_ns() / 1000, live.shipper.head().map(|h| h.position), live.shipper.durable(), live.owes_whole, live.shipper.in_flight(), live.lanes.len(), live.catalogued.len(), head_placed(state, volume.bytes)); } // TEMPORARY
   state
     .live
     .awaiting_by_request
@@ -542,6 +543,7 @@ pub(crate) fn join(
 pub(crate) fn resolve(state: &mut ShardState, volume: [u8; 16]) {
   wake_parked(state, volume);
   if !head_placed(state, volume) {
+    if state.live.awaiting.range((volume, 0)..=(volume, u64::MAX)).next().is_some() { slates_machine::log_line!("TEMP {} resolve blocked: head unplaced", slates_machine::clock::monotonic_ns() / 1000); } // TEMPORARY
     return;
   }
   let Some(durable) = state
@@ -713,6 +715,7 @@ const LIVE_FENCED: &str = "fleet.live.fenced";
 /// Answers one waiting verb with `reply`: its completion recorded on this partition (one durable step, so a retry after
 /// meets it) and the reply delivered to its client's shard.
 fn answer(state: &mut ShardState, entry: Awaiting, reply: slates_ipc::protocol::ReplyBody) {
+  slates_machine::log_line!("TEMP {} answer", slates_machine::clock::monotonic_ns() / 1000); // TEMPORARY
   state
     .live
     .awaiting_by_request
