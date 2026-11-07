@@ -13602,6 +13602,13 @@ the server takes it as the work's delta over its new base (`WorkFiles::from_chan
 > wire and runtime tests; on the incumbent harness the 64 MiB write's best of eighteen was 1,278.1 MiB/s against main's
 > 1,021.9 (BENCHMARKS).
 
+> **Status (2026-11-07): the purge's walk keeps what was freed behind it.** Re-landed on main (2f70a86b), A-214 failed
+> A-205's give-back on Windows in 6 of 10 runs (main CI 42184319025 and `diag-liveness-4`). The reserve kept a purge
+> walk under way, and a delete's blocks released behind its cursor were dropped from the resident count at the walk's
+> end, so the purge stopped for good. `ChunkArena::purge_keeping` now ends a walk at what the regions' sets record and
+> asks the sets whether it has anything to do. The give-back then passed 10 of 10 on both Windows runners, and
+> A-214's recovery tests 5 of 5 on both Linux runners (`diag-liveness-6`). The reserve's rule is unchanged.
+
 Status: accepted 2026-11-05 (Ada's decision through the supervisor: option (a) of GAPS' large-file write gap); built
 2026-11-05. It amends A-105's "every free block back at the first idle tick". Applied in the same change to:
 `crates/mem/src/buddy.rs` (`Buddy::upcoming`), `crates/mem/src/arena.rs` (`upcoming`, `purge_keeping`, `prefault`,
