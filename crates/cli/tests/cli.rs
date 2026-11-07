@@ -614,6 +614,145 @@ fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
   );
 }
 
+/// Shape: how long the starved-start test starves its successor: three of the anchor's start budgets
+/// (`RECOVERY_BUDGET_NS`), so a start judged by a fixed wall second is killed at least twice over.
+const STARVED_FOR: Duration = Duration::from_nanos(3 * slates_db::replay::RECOVERY_BUDGET_NS);
+/// Shape: one starvation period: a heartbeat, the cadence the daemon's liveness is read at.
+const STARVED_PERIOD: Duration = Duration::from_nanos(slates_server::daemon::HEARTBEAT_NS);
+/// Shape: the share of each period the starved successor may run: one sixty-fourth, about the share a start got on
+/// this Mac under 144 spinners (16-18 ms of CPU across about 1.15 s of wall time from its first instruction to its
+/// profile read, 2026-11-07).
+const STARVED_RUNS_ONE_IN: u32 = 64;
+/// Format: the anchor's kill of a start that did not beat inside its fixed budget (`crates/cli/src/anchor.rs`).
+const START_KILL_LINE: &str = "the daemon never beat inside the recovery budget";
+
+/// A busy machine never kills a starting daemon that is making progress (supervisor's order of 2026-11-07; GAPS, "A
+/// daemon's restart can exceed the anchor's fixed recovery budget"). Do: start an anchor, kill its daemon, and starve
+/// the successor from its first instruction: stopped (`SIGSTOP`) nine tenths of every heartbeat and run the tenth, for
+/// three of the anchor's start budgets, then let it run. Expect: the starved successor is the one that answers, and
+/// the anchor never killed a start. On this Mac at load >= 150 the anchor killed 153 of 153 starts, each 1.07-1.22 s
+/// after its spawn, after the start had used 16-18 ms of CPU: starved, not stuck.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::disallowed_methods)] // the test starves a process by a duty cycle of its own: the sleeps are its periods
+fn a_starved_start_that_makes_progress_is_not_killed() {
+  use rustix::process::{Pid, Signal, kill_process};
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the starved-start flow: set SLATES_TEST_CLI=1 to run it (an anchor and its daemon)"
+    );
+    return;
+  }
+  let instance = format!("cli-starved-{}", std::process::id());
+  let (mut anchor, mut stderr) =
+    spawn_anchor_from(env!("CARGO_BIN_EXE_slates"), &instance, &[], SHARDS);
+  await_serving(&mut stderr, &instance, false);
+  let (lines, forwarding) = forward_lines(stderr);
+  anchor.drain = Some(forwarding);
+  await_stable_daemon(&instance, true);
+  let killed = daemon_pid(&instance).expect("the daemon answers");
+  let successor = successor_of(&anchor, killed);
+  let pid = Pid::from_raw(i32::try_from(successor).unwrap()).unwrap();
+  let runs = STARVED_PERIOD / STARVED_RUNS_ONE_IN;
+  let starving = Instant::now();
+  while starving.elapsed() < STARVED_FOR {
+    if kill_process(pid, Signal::STOP).is_err() {
+      break;
+    }
+    std::thread::sleep(STARVED_PERIOD - runs);
+    let _ = kill_process(pid, Signal::CONT);
+    std::thread::sleep(runs);
+  }
+  let _ = kill_process(pid, Signal::CONT);
+  let answered = await_daemon(&instance, Some(killed), &[]);
+  let start_kills = lines
+    .try_iter()
+    .filter(|line| line.contains(START_KILL_LINE))
+    .count();
+  drop(anchor);
+  assert_eq!(
+    start_kills, 0,
+    "the anchor killed a starved start {start_kills} times"
+  );
+  assert_eq!(
+    answered, successor,
+    "the starved successor is the daemon that answers"
+  );
+}
+
+/// The other side of the starved-start rule: a start that makes no progress at all is still killed, within the liveness
+/// window and the suite's start wait. Do: start an anchor, kill its daemon, and stop the successor (`SIGSTOP`) for good
+/// from its first instruction. Expect: another daemon answers, and the stopped one is gone.
+#[cfg(unix)]
+#[test]
+fn a_stuck_start_is_killed_and_restarted() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the stuck-start flow: set SLATES_TEST_CLI=1 to run it (an anchor and its daemon)"
+    );
+    return;
+  }
+  let instance = format!("cli-stuck-start-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let killed = daemon_pid(&instance).expect("the daemon answers");
+  let stuck = successor_of(&anchor, killed);
+  assert!(
+    Command::new("kill")
+      .args(["-STOP", &stuck.to_string()])
+      .status()
+      .unwrap()
+      .success()
+  );
+  let stopped = Instant::now();
+  let answered = await_daemon(&instance, Some(stuck), &[]);
+  let replaced_after = stopped.elapsed();
+  let stuck_alive = Command::new("kill")
+    .args(["-0", &stuck.to_string()])
+    .status()
+    .unwrap()
+    .success();
+  drop(anchor);
+  assert_ne!(answered, stuck);
+  assert!(!stuck_alive, "the stuck start was killed");
+  assert!(
+    replaced_after <= Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS) + START_WAIT,
+    "killed within the window and replaced: after {replaced_after:?}"
+  );
+}
+
+/// Kills the anchor's daemon `killed` (`SIGKILL`) and returns the pid of the successor the anchor starts, as soon as
+/// it exists: the anchor's child that is not `killed`.
+#[cfg(unix)]
+fn successor_of(anchor: &AnchorProcess, killed: u32) -> u32 {
+  let anchor_pid = anchor.child.id().to_string();
+  assert!(
+    Command::new("kill")
+      .args(["-9", &killed.to_string()])
+      .status()
+      .unwrap()
+      .success()
+  );
+  let started = Instant::now();
+  loop {
+    let out = Command::new("pgrep")
+      .args(["-P", &anchor_pid])
+      .output()
+      .unwrap();
+    let found = String::from_utf8_lossy(&out.stdout)
+      .split_whitespace()
+      .filter_map(|pid| pid.parse::<u32>().ok())
+      .find(|pid| *pid != killed);
+    if let Some(pid) = found {
+      return pid;
+    }
+    assert!(
+      started.elapsed() < START_WAIT,
+      "the anchor started no successor"
+    );
+    std::thread::yield_now();
+  }
+}
+
 /// Kills the daemon (`SIGKILL`) and waits for the anchor's restarted one to answer.
 fn kill_the_daemon_and_await_its_successor(instance: &str) {
   let killed = daemon_pid(instance).unwrap();
