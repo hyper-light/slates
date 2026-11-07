@@ -1,0 +1,51 @@
+=== bootstrap on 1 exit 101 load { 37.78 15.82 6.63 }
+live bootstrap: written=false caught_up=true shipping=Some(("0", "0", "false")) held=[Some(("0", "none", "false")), Some(("0", "none", "false"))] [("live-bootstrap-a-11535", {"held": 1, "hold_refused": 10, "hold_refused.no_catalog": 2, "hold_refused.not_a_member": 8}), ("live-bootstrap-b-11535", {"a
+live bootstrap --- live-bootstrap-a-11535
+fleet_host: 8937952362740305619
+fleet_host_epoch: 1
+fleet_members: 7504436276459746821 8937952362740305619 9052651928004737946
+fleet_configuration_version: 4
+fleet_configuration_members: 3
+fleet_council_leads: false
+fleet_council_voters: 3
+fleet_council_joint: false
+fleet_root_joint: false
+fleet_session 7504436276459746821: lent=false cwnd=18360 srtt_ns=172180 pto_ns=1172180 spurious_losses=0 persistent_collapses=0 consumed=4610 mtu=9209
+fleet_session 9052651928004737946: lent=false cwnd=18360 srtt_ns=178247 pto_ns=1178247 spurious_losses=0 persistent_collapses=0 consumed=4593 mtu=9209
+shard 0 refused fleet.learner.fetch_paced: 22
+shard 0 refused fleet.learner.fetches: 8
+shard 0 span consensus.step: absent/unknown (never; producer configuration group expected here)
+shard 1 span consensus.step: absent/unknown (never; producer configuration group expected here)
+live bootstrap --- live-bootstrap-b-11535
+fleet_host: 7504436276459746821
+fleet_host_epoch: 1
+fleet_members: 7504436276459746821 8937952362740305619 9052651928004737946
+fleet_configuration_version: 4
+fleet_configuration_members: 3
+fleet_council_leads: true
+fleet_council_voters: 3
+fleet_council_joint: false
+fleet_root_joint: false
+fleet_session 8937952362740305619: lent=false cwnd=18360 srtt_ns=258897 pto_ns=1258897 spurious_losses=0 persistent_collapses=0 consumed=42313 mtu=9209
+fleet_session 9052651928004737946: lent=false cwnd=18360 srtt_ns=289336 pto_ns=1289336 spurious_losses=0 persistent_collapses=0 consumed=42997 mtu=9209
+shard 0 refused fleet.learner.fetch_paced: 8
+shard 0 span consensus.step: absent/unknown (never; producer configuration group expected here)
+shard 1 span consensus.step: absent/unknown (never; producer configuration group expected here)
+live bootstrap --- live-bootstrap-c-11535
+fleet_host: 9052651928004737946
+fleet_host_epoch: 1
+fleet_members: 7504436276459746821 8937952362740305619 9052651928004737946
+fleet_configuration_version: 4
+fleet_configuration_members: 3
+fleet_council_leads: false
+fleet_council_voters: 3
+fleet_council_joint: false
+fleet_root_joint: false
+fleet_session 7504436276459746821: lent=false cwnd=18360 srtt_ns=228740 pto_ns=1228740 spurious_losses=0 persistent_collapses=0 consumed=4609 mtu=9209
+fleet_session 8937952362740305619: lent=false cwnd=18360 srtt_ns=230134 pto_ns=1230134 spurious_losses=0 persistent_collapses=0 consumed=3462 mtu=9209
+shard 0 refused fleet.learner.fetch_paced: 8
+shard 0 refused fleet.learner.fetches: 4
+shard 0 span consensus.step: absent/unknown (never; producer configuration group expected here)
+shard 1 span consensus.step: absent/unknown (never; producer configuration group expected here)
+thread 'a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates' (23905) panicked at crates/cli/tests/live_fleet.rs:1924:3:
+the bootstrap node's live writes became durable and both candidates hold them: Some(("0", "0", "false")) [Some(("0", "none", "false")), Some(("0", "none", "false"))] [("live-bootstrap-a-11535", {"held": 1, "hold_refused": 10, "hold_refused.no_catalog": 2, "hold_refused.not_a_member": 8}), ("live-boo
