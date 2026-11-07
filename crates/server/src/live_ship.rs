@@ -870,6 +870,9 @@ fn kept_reaches_size(state: &ShardState, id: slates_db::catalog::VolumeId) -> bo
 /// the holder set the shipper itself records in the volume's catalog; with that record, `activate` is called with the
 /// set the placed record names, once [`target_recordable`] has said the target may be recorded.
 fn follow_candidates(state: &mut ShardState, volume: [u8; 16]) {
+  if std::env::var_os("ZZ_NO_FOLLOW").is_some() {
+    return;
+  }
   let configuration = state.fleet.configuration();
   let local = configuration.owner;
   let candidates: Vec<HostId> = configuration
