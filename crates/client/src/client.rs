@@ -2366,6 +2366,18 @@ impl Client {
     Ok(())
   }
 
+  /// The pause before sending again a request the daemon refused for now (`LeaseUnconfirmed`, `AcknowledgementOwed`,
+  /// or a refusal retryable under its id), after `previous_ns` (zero for the first): the reconnect pacing's rule
+  /// ([`next_pause_ns`]), starting at the daemon's published spin window and doubling to a tenth of the reconnect
+  /// budget, so a caller that resends at once into a refusal for now does not make the refusal (a lease starved of its
+  /// probes by the resends; 20,000 a second in fixtures' 1,000-client primary-kill rung, 2026-11-07).
+  pub fn retry_pause_ns(&self, previous_ns: u64) -> u64 {
+    if previous_ns == 0 {
+      return self.published_spin_ns().max(1);
+    }
+    next_pause_ns(previous_ns, self.deadlines.reconnect_ns)
+  }
+
   /// The spin window the daemon published (nanoseconds): the async fast path spins this long taking
   /// the reply before it arms and yields to its event loop. The async path does not refine it: its wake
   /// is the event loop's, which the client does not time (the sync wait's estimate is

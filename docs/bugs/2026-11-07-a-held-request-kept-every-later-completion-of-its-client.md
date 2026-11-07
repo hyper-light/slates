@@ -39,6 +39,9 @@ so one held submit stopped the other 31 too.
     `AcknowledgementOwed { retained: 64, bound: 64 }`, with the hold alive through four resends.
   - Green with the fix on both runners, five of five across runs 42401021306, 42401558923 and 42402705671: all 128
     edits served, and the last resend answered `Submitted { version: Some(1) }`.
+- fixtures' 3,000-client `f = 1` rung after the fix (adacachy, e2882c6c merged with fixtures' 5cd6db04 and 8be0e745,
+  load 20 to 40): the owner's `acknowledgement_owed` was 15, against 513k on 5cd6db04 alone; 83.8 s, 9,000 accepted,
+  oracle 0.
 - `crates/db/tests/model.rs`, `no_owed_id_is_released_whatever_order_its_acknowledgements_arrive_in` (raft's check):
   green on both runners (runs 42401558923, 42402705671), with the db, client and server suites, the fleet's forward
   and resend tests, the CLI and clippy (run 42402705671).
