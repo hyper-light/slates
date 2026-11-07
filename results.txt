@@ -1,2 +1,7 @@
 tested 5fe6ed495c41a9ec4d0af0a5ef3f6a663a0ade36 on aarch64, 4 cpus
 build exit 0
+run 1 exit 101 2s load=2.11 0.80 0.29
+    slates daemon: the control shard's beat task ran 1056 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 244 steps and 248 polls (233 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 2 timers, waited 0 times, spawned 2 tasks and finished 3; 5 tasks live; its longest poll is 961 ms and its timer overrun 0 ms
+    green over 1000 files of 16384 bytes: 961.382847ms, reply GreenCreated { id: VolumeId { bytes: [206, 49, 10, 184, 188, 189, 32, 71, 0, 0, 0, 0, 0, 0, 0, 174] } }; 0 probes inside it — p50 0ns, p99 0ns, longest of all 961.49049ms; before it the longest 519.84µs
+    thread 'creating_a_green_over_a_large_base_never_holds_its_shard' (5472) panicked at crates/server/tests/green_fairness.rs:255:3:
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.94s
