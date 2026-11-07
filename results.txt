@@ -8,3 +8,7 @@ run 2 exit 101 4s load=2.18 0.89 0.37
     presentation of 1000 files of 16384 bytes: 294.407501ms, 1000 entries; 0 probes inside it — p50 0ns, p99 0ns, longest of all 294.40595ms; before it the longest 973.377µs
     thread 'presenting_a_large_landing_never_holds_its_shard' (6091) panicked at crates/server/tests/presentation_fairness.rs:226:3:
     test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.56s
+run 3 exit 101 4s load=2.16 0.91 0.38
+    presentation of 1000 files of 16384 bytes: 295.055969ms, 1000 entries; 0 probes inside it — p50 0ns, p99 0ns, longest of all 295.201605ms; before it the longest 680.843µs
+    thread 'presenting_a_large_landing_never_holds_its_shard' (6637) panicked at crates/server/tests/presentation_fairness.rs:226:3:
+    test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.55s
