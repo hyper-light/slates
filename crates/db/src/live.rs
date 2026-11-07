@@ -21,7 +21,11 @@
 //! **Takeover.** Every holder reports its head under the new epoch; the successor adopts the greatest
 //! `(epoch, position)` among `f + 1` reports ([`adopt`]). Along any chain `(epoch, position)` only grows, and a durable
 //! entry is held by `f + 1` candidates, which meet any `f + 1` reports, so the adopted head extends every durable entry
-//! (NoLoss; Raft's up-to-date rule, thesis §3.6.1).
+//! (NoLoss; Raft's up-to-date rule, thesis §3.6.1). The `f + 1` are counted among the holders the shipper being taken
+//! over committed before its first entry (A-240), never among the members placed now: a member that joined after the
+//! writes holds none of them, and counted in a holder's place it let a stale head be adopted and a fenced-out owner's
+//! entry commit (10 of 400 seeds in `tests/live.rs`, 2026-11-06). Each shipper, a successor's too, commits its own
+//! holders before it ships.
 //!
 //! **Bounds.** The owner holds at most `credit` entries not yet durable ([`LiveError::NoCredit`] past it: the writer
 //! waits, AC-8.9) and retains at most `retain` entries for laggards; a holder behind the retained tail is installed.
@@ -609,12 +613,23 @@ impl Replica {
   }
 }
 
-/// Phase one's choice (A-200): among the reports of at least `f + 1` candidates (each holder's head; `None` for one
-/// that holds nothing), the holder whose head ranks highest, and that head. `None` when too few reported, or when
-/// every report is empty (nothing was ever shipped).
-pub fn adopt(reports: &[(HostId, Option<Head>)], quorum: Quorum) -> Option<(HostId, Head)> {
+/// Phase one's choice (A-200, A-240): the holder whose head ranks highest among `reports` (each candidate's head;
+/// `None` for one that holds nothing), and that head, once at least `f + 1` of the reports come from `holders`, the
+/// holder set the shipper being taken over committed before its first entry. A durable entry is held by the owner and
+/// `f` of those `2f` holders, so `f + 1` of them meet every durable entry; a report from any other member (one that
+/// joined after the writes) counts for nothing, since it can stand in for a holder that was never asked. `None` when
+/// fewer than `f + 1` holders reported, or when every report is empty (nothing was ever shipped).
+pub fn adopt(
+  reports: &[(HostId, Option<Head>)],
+  holders: &[HostId],
+  quorum: Quorum,
+) -> Option<(HostId, Head)> {
   let needed = usize::try_from(quorum.f).ok()?.checked_add(1)?;
-  if reports.len() < needed {
+  let counted = reports
+    .iter()
+    .filter(|(host, _)| holders.contains(host))
+    .count();
+  if counted < needed {
     return None;
   }
   reports

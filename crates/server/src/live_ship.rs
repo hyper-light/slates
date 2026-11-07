@@ -162,6 +162,10 @@ pub(crate) struct LiveVolume {
   /// The bytes a candidate keeps of this log: the last whole entry and every entry since ([`keep`]). Once it reaches
   /// the volume's size the next publication ships whole, which clears them ([`kept_reaches_size`]).
   kept: usize,
+  /// The catalog version at which this shipper's epoch and holders were recorded (A-240, [`holders_placed`]), or `None`
+  /// until the record is made. Nothing ships before that version is placed at `f + 1`, so a takeover's phase one always
+  /// knows which hosts hold the log and counts its quorum among them alone.
+  recorded: Option<u64>,
 }
 
 /// What a candidate keeps of one live volume.
@@ -796,6 +800,7 @@ pub(crate) fn published(
       whole: None,
       fenced: None,
       kept: 0,
+      recorded: None,
     });
   let whole = live.owes_whole || record.is_none() || reaches_size;
   let built = if whole {
@@ -965,10 +970,89 @@ fn content_runs(
   Some(runs)
 }
 
+/// Counter: a shipper's holder set could not be recorded in its volume's catalog (A-240); retried at its next send.
+/// Format: a counter name in the daemon's status report.
+const LIVE_HOLDERS_UNRECORDED: &str = "fleet.live.holders_unrecorded";
+/// Counter: a shipper recorded its epoch and holders in its volume's catalog (A-240).
+/// Format: a counter name in the daemon's status report.
+const LIVE_HOLDERS_RECORDED: &str = "fleet.live.holders_recorded";
+
+/// Whether `volume`'s shipper may ship (A-240): its epoch and holders are recorded in the volume's catalog and that
+/// catalog version is placed at `f + 1`, as a head is (at `f = 0` the owner's own commit places it, [`head_placed`]).
+/// Records them first when this shipper has not yet. A takeover's phase one counts its `f + 1` reports among the
+/// holders the adopted catalog names; a shipper that shipped before its holders were placed could leave the log on
+/// hosts no successor counts. In the model a fresh member counted in a holder's place let a stale head commit (10 of
+/// 400 seeds, `crates/db/tests/live.rs`), and on KIND a holder kept fence 1 after a takeover at epoch 2 (runs
+/// 42326682216, `wan-loss` and `ceiling`, and 42331191530, `ceiling`).
+fn holders_placed(state: &mut ShardState, volume: [u8; 16]) -> bool {
+  let Some(recorded) = state
+    .live
+    .shipping
+    .get(&volume)
+    .map(|live| live.recorded)
+  else {
+    return false;
+  };
+  let Some(recorded) = recorded.or_else(|| record_holders(state, volume)) else {
+    return false;
+  };
+  let configuration = state.fleet.configuration();
+  configuration.quorum.f == 0
+    || state
+      .placed_heads
+      .get(&ObjectId(volume).catalog())
+      .is_some_and(|head| {
+        head.sequence >= recorded && configuration.region_placed(&head.placement)
+      })
+}
+
+/// Records `volume`'s shipper's epoch and holders in its catalog (`Op::LiveHoldersCommitted`, A-240) and returns the
+/// catalog version that holds them; the record plane ships it as any catalog change (`fleet::unplaced_heads`). `None`
+/// when the database refused the record, counted; the next send tries again.
+fn record_holders(state: &mut ShardState, volume: [u8; 16]) -> Option<u64> {
+  let id = slates_db::catalog::VolumeId { bytes: volume };
+  let holders = state.live.shipping.get(&volume).map(|live| {
+    slates_db::catalog::LiveHolders {
+      epoch: live.shipper.epoch().0,
+      holders: live.shipper.holders().iter().map(|host| host.0).collect(),
+    }
+  })?;
+  let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+  let op = slates_db::op::Op::LiveHoldersCommitted { id, holders };
+  if state.db.mutate(&mut state.segment, &op, now).is_err() {
+    state.count(LIVE_HOLDERS_UNRECORDED, 1);
+    return None;
+  }
+  let version = state.db.partition().volume(id)?.catalog_version;
+  state.count(LIVE_HOLDERS_RECORDED, 1);
+  if let Some(live) = state.live.shipping.get_mut(&volume) {
+    live.recorded = Some(version);
+  }
+  Some(version)
+}
+
+/// A catalog register's placement moved (`fleet::record_acks_in`): when it is a live volume's and now places that
+/// shipper's holders (A-240, [`holders_placed`]), ships what the holders lack at once, rather than at the next record
+/// period, so the shipper's first entry waits one catalog round and no more.
+pub(crate) fn catalog_placed(state: &mut ShardState, catalog: ObjectId) {
+  if !catalog.is_catalog() {
+    return;
+  }
+  let volume = catalog.placement_key().0;
+  if !state.live.shipping.contains_key(&volume) {
+    return;
+  }
+  let sends = pending_sends(state, volume);
+  dispatch(state, sends);
+}
+
 /// What each holder of the volume lacks, as messages: entries, or an install from the last whole entry. An install
 /// owed at a checkpoint the holder already holds cannot move it, so instead the volume is marked to owe a fresh whole
 /// record (its next publication or the period appends one, and the install is made from that).
 fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
+  if !holders_placed(state, volume) {
+    return Vec::new();
+  }
   let Some(live) = state.live.shipping.get_mut(&volume) else {
     return Vec::new();
   };
@@ -1593,12 +1677,17 @@ pub(crate) struct Fetched {
 
 /// Phase one for a live volume (A-200), on the control shard: raises this node's own copy's fence to `epoch`, asks every
 /// other candidate in `candidates` to do the same over its session, and adopts the greatest head among the answers
-/// (`slates_db::live::adopt`, at least `f + 1` of them). `Ok(None)` when no candidate holds any of the volume's log
-/// (it was never shipped); `Err` with what the takeover waits for when too few answered.
+/// (`slates_db::live::adopt`). The `f + 1` it needs are counted among `holders` alone, the hosts the shipper being
+/// taken over recorded in the volume's catalog before it shipped (A-240): a host outside them (a member that joined
+/// since) holds none of the log, and counted in a holder's place it let a head the log had passed be adopted. A host
+/// asked that is not a holder still reports, and its head is adopted when it is the greatest. `Ok(None)` when no
+/// candidate holds any of the volume's log (it was never shipped); `Err` with what the takeover waits for when too few
+/// holders answered.
 pub(crate) async fn fetch(
   object: ObjectId,
   epoch: slates_db::register::HostEpoch,
   candidates: Vec<HostId>,
+  holders: Vec<HostId>,
 ) -> Result<Option<Fetched>, &'static str> {
   let local = state::with_state(|s| s.fleet.configuration().owner)
     .ok_or("fleet.live.takeover_waits_state")?;
@@ -1623,10 +1712,15 @@ pub(crate) async fn fetch(
     reports.push((local, own.0));
     kept.insert(local, own.1);
   }
-  let others: Vec<HostId> = candidates
+  let mut others: Vec<HostId> = candidates
     .into_iter()
     .filter(|host| *host != local)
     .collect();
+  for holder in &holders {
+    if *holder != local && !others.contains(holder) {
+      others.push(*holder);
+    }
+  }
   let sessions =
     crate::fleet::take_sessions("fleet.lent_to.live_takeover", |host| others.contains(&host));
   let request = slates_db::live::Fetch { object, epoch }.encode();
@@ -1653,10 +1747,14 @@ pub(crate) async fn fetch(
     .ok()
     .and_then(|f| f.checked_add(1))
     .unwrap_or(usize::MAX);
-  if reports.len() < needed {
+  let counted = reports
+    .iter()
+    .filter(|(host, _)| holders.contains(host))
+    .count();
+  if counted < needed {
     return Err("fleet.live.takeover_waits_quorum");
   }
-  let Some((holder, _)) = slates_db::live::adopt(&reports, quorum) else {
+  let Some((holder, _)) = slates_db::live::adopt(&reports, &holders, quorum) else {
     return Ok(None);
   };
   let payloads = kept.remove(&holder).unwrap_or_default();

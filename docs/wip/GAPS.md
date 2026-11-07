@@ -818,7 +818,7 @@
 > successor holding nothing never counts itself and `f + 1` is out of reach once the owner is gone. Owner: raft,
 > before any other live-shipping work.
 >
-> **Chaos from outside the processes (raft-chaos, 2026-11-06): two defects fixed, a third open.**
+> **Chaos from outside the processes (raft-chaos, 2026-11-06): defects fixed and open, below.**
 > The harness is `crates/cli/tests/live_chaos.rs` (`SLATES_TEST_CLI=1`): three fleet daemons, a Rust client streaming
 > 4 KiB writes, every node's live lines sampled throughout (status now prints each log's head epoch, chain identity and
 > fence), and each flow ending with the register invariants checked from outside the processes:
@@ -877,8 +877,20 @@
 >   - A candidate's node replaced by a fresh anchor was promoted to voter after 41 s in one run, and never in the other.
 >   These are counted apart from the invariant results.
 >
+> - **Fixed (A-240): a live takeover counted members that never held the log** (record
+>   `docs/bugs/2026-11-06-a-live-takeover-counted-members-that-never-held-the-log.md`).
+>   - Phase one took `f + 1` reports from the current placement. A member placed after the writes (a replacement pod
+>     on KIND) stood in for a holder that could not answer, so a stale head could be adopted. KIND runs 42326682216
+>     and 42331191530 saw a holder at fence 1 after a takeover at epoch 2. The model broke 10 of 400 seeds.
+>   - Each shipper now records its epoch and holders in the volume's catalog and ships only once that catalog is
+>     placed at `f + 1`. Phase one counts `f + 1` among those holders alone, and waits typed when too few answer.
+>   - The model passes 0 broken of 400 seeds. The process flow is
+>     `a_member_that_never_held_the_log_never_stands_in_for_its_holder` (five nodes).
+>   - Owed: the KIND `ceiling` leg re-run on the fix.
+>
 > Touched: `crates/server/src/{live_ship,verbs,fleet}.rs` (the destroy's wait; the successor's routing at a
-> tombstone's retirement), the status line (`crates/ipc`
+> tombstone's retirement; A-240's holder record and phase-one count), `crates/db/src/{live,catalog,op,partition}.rs`
+> (A-240), the status line (`crates/ipc`
 > `LiveReport`, `crates/cli` status), the harness, the KIND leg (`xtask/src/kind_live.rs`,
 > `crates/cli/examples/pod_live_probe.rs`).
 
