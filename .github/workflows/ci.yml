@@ -666,6 +666,14 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-server --test give_back -- --nocapture
+      # The daemon's own unit tests, which no Windows lane ran until 2026-11-06. Two landing tests failed on both runners
+      # because Windows had no landing writer; they pass through it (A-185). One test at a time: each test daemon sizes
+      # itself from the whole machine, and Windows charges commit when memory is made, so at 4 threads the suite met the
+      # commit limit and at 32 it aborted (the oversubscription GAPS records for the client binary).
+      - name: Test the daemon's unit tests, one test at a time (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-server --lib -- --test-threads=1
       # The client binary whole on Windows, and the async driver: an in-process `slates-server` daemon found through the
       # Win32 rendezvous bootstrap object, driven over the rings through the whole lifecycle; the same-kernel direct map
       # by handle duplication (§4.6, A-175: zero copy asserted, the hostile holder's escalations refused, the neighbour's
@@ -981,6 +989,14 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-server --test give_back -- --nocapture
+      # The daemon's own unit tests, which no Windows lane ran until 2026-11-06. Two landing tests failed on both runners
+      # because Windows had no landing writer; they pass through it (A-185). One test at a time: each test daemon sizes
+      # itself from the whole machine, and Windows charges commit when memory is made, so at 4 threads the suite met the
+      # commit limit and at 32 it aborted (the oversubscription GAPS records for the client binary).
+      - name: Test the daemon's unit tests, one test at a time (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-server --lib -- --test-threads=1
       - name: Test the NFS server, its write-back judgment and the network export (native arm64 Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 20
