@@ -5881,14 +5881,16 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   flush succeeded in 995 µs with both candidates suspended; fixed, error 1117 after 1.0010–1.0283 s (3 of 3), success
 >   after the resume. Forming that fleet found a Windows defect in the runtime: a UDP socket reported a
 >   port-unreachable an earlier send drew as `WSAECONNRESET` on its next `recvfrom`, which ended a fleet serve socket's
->   receive loop at its first probe of a peer still starting (3 of 4 starts never formed). Datagram sockets are now
->   made with `SIO_UDP_CONNRESET` off (`crates/rt/src/netsys.rs`, red then green on the runner).
+>   receive loop at its first probe of a peer still starting (3 of 4 starts never formed). The fix that lands is
+>   liveness's (d8a8d859: every Windows datagram socket, an adopted one too, made with `SIO_UDP_CONNRESET` and
+>   `SIO_UDP_NETRESET` off); the WinFsp flow needs it to form its fleet.
 > - *Landings* need no wait: a landing claims what it wrote to disk, which holds it; a takeover that loses the volume's
 >   undurable tail serves the disk's bytes through the base, and a later landing that would revert the disk is refused
 >   by the witness check.
-> Open, found on the way: on Windows, a candidate's anchor kills a daemon suspended past the liveness budget and starts
-> a successor under a fresh identity, after which the owner's mount stayed fenced and the fleet did not re-form within
-> 40 minutes (CI, 1 run); the flow now suspends each anchor with its daemon.
+> Found on the way and handed to live-fixes with the fleet re-formation defects: on Windows, a candidate's anchor kills a
+> daemon suspended past the liveness budget and starts a successor under a fresh identity, after which the owner's mount
+> stayed fenced and the fleet did not re-form within 40 minutes (CI, 1 run); the flow now suspends each anchor with its
+> daemon.
 
 > **Phase one with a candidate that holds no copy (2026-11-05).** Every candidate's report counts toward `f + 1`, an empty
 > one too, and every reporter raises its fence to the takeover's epoch, an empty one too: a candidate with no copy makes
