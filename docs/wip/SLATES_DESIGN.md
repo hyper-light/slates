@@ -7385,6 +7385,19 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > identity is a set hash over the green's entries, brought up to date when read, so a record at `f > 0` costs what its
 > version changed. Since part 3 (2026-11-06) a clean rebase returns only what the work changed over the head.
 
+> **Status (2026-11-07, AMENDMENT-W2: the history is copy-on-write, and an increment carries what it adds).**
+> - **The history.** The engine kept a whole copy of a file per version that changed it, and charged the whole
+>   previous file to each submit. A version now holds pieces of shared chunks (`crates/merge/src/history.rs`): the
+>   bytes it added and its piece list. That is the "Splice" below, done in the engine's history.
+> - **The increment.** Its post-state laid out each edited file's whole final content, zero-filled but for the runs,
+>   and the seal read each run at its op's base-coordinate offset. A run after an earlier length change in the same
+>   file therefore merged zeros into the green. The post-state now holds only the runs, each read from where the
+>   work's file holds it (`increment::compose_volume_planned`).
+> - Measured on CI: behind a held floor, 64 versions of 64-byte overwrites of a 1 MiB file under a 16 MiB budget,
+>   16 of 64 accepted before and 64 after. The corruption's test: the green's head was `cd\0\0`, now `cdXY`.
+>   (`docs/bugs/2026-11-07-a-greens-history-kept-a-copy-of-every-file-per-version.md`,
+>   `docs/bugs/2026-11-07-a-run-after-a-length-change-merged-zeros.md`.)
+
 > **Status (2026-11-06, A-238: a green's chain is checkpointed at its reachable floor).** The partition kept
 > every accepted increment for good, and the "fold into checkpoint deltas" below had no durable form.
 > - Now, after each accept, the owner checkpoints the chain at the floor. The floor is the oldest version a live work
@@ -14146,6 +14159,49 @@ green's base, the other half of the load test's first finding, is A-202's.
 - **Unchanged:** a work's state is owner-local and lost with its host (D-18's host boundary), not placed at f + 1.
 - **Cost (measured on the branch it comes from):** every edit now appends to the partition log, so the partition's
   snapshots come at the rate edits arrive.
+
+### AMENDMENT-W2 — A green's content history is copy-on-write, and an increment's post-state holds only the runs it adds (accepted and built 2026-11-07, W2 of the load test's walls)
+
+Applied in the same change to:
+- §4.16: its status.
+- GAPS: the load-test blockquote.
+- `crates/merge`:
+  - `history.rs` (new): `Chunks`, `Value`, `Value::spliced`, `Value::read`.
+  - `engine.rs`: `content_history`, the running totals and `history_bytes()`, `history_reservation` and
+    `edit_reservation`, `content_ref_at`/`files_at` as `Cow`, and the new `content_len_at`, `file_lens_at` and
+    `content_page_at`.
+  - `increment.rs`: `compose_volume_planned`, `PostStatePlan`, and the compact layout in `seal`/`push_content`.
+- `crates/server`:
+  - `verbs.rs`: `assemble_post_state` reads each run where the plan says.
+  - `work_files.rs`: `Cow`, `page`, `sizes`.
+  - `merge_service.rs` and `listing.rs`: paged reads and sizes.
+- The tests: `crates/server/tests/green_retention.rs`, `crates/server/tests/green_post_state.rs`, the history's
+  proptest oracle, and the increment oracle's post-state built independently of the plan. The engine's and the
+  daemon's amplification tests now assert the bound.
+- **What was there.**
+  - The history kept each version of a file as a whole copy, and admission charged the whole previous file per
+    submit: a one-byte overwrite of a large file retained the file.
+  - The post-state laid out each edited file's whole final content as a zero-filled region.
+  - The seal read each run at its op's base-coordinate offset, which merged zeros for a run after an earlier length
+    change in the same file. That has been so since 34548a59.
+- **The rule.**
+  - A history value is pieces over refcounted immutable chunks: no shared-ownership pointer, freed with the last
+    piece.
+  - A version is spliced from the one before by `apply`'s walk, sharing every kept run and copying only the added
+    bytes. It is checked against its bytes and stored whole when the check fails or its list would outweigh it.
+  - Retention is chunks and lists less the current values' bytes and lists: what the history holds beyond the
+    current files, as before.
+  - Admission charges an edit's overwritten, deleted and truncated bytes and the old list, or the old value when
+    stored whole, and a replaced path's old value.
+  - The head stays contiguous. A read below the head is borrowed when the file is unchanged since, copied out of the
+    pieces when not, and a page copies only the page.
+  - An increment's post-state is the runs its ops add, laid out compactly. The deriver plans each run's offset in the
+    work's file, and the seal reads it there.
+- **Measured.** The bug records and BENCHMARKS.
+- **Owed.**
+  - A rename copies its source's bytes into one chunk rather than sharing its pieces.
+  - A base-seeded green's origin is held as chunks beside the head copy (W4, reland-a207's).
+  - Greens merged before the fix may hold zeros a run after a length change put there.
 
 ### A-238 — A green's durable chain is checkpointed at its reachable floor, and a base below the checkpoint is unknown (accepted and built 2026-11-06, W3 of the load test's walls)
 

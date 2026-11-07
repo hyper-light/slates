@@ -947,8 +947,12 @@ pub(crate) fn read_window(
     Role::Green { .. } => read_green_range(state, record.id, key, at, (offset, want)),
     Role::Work { .. } => match at {
       ReadAt::Head => match state.works.get(&record.id) {
-        Some(w) => match w.files.get(work_base(state, w), key) {
-          Ok(Some(bytes)) => page_of(bytes, (offset, want), w.revision),
+        Some(w) => match w.files.page(work_base(state, w), key, (offset, want)) {
+          Ok(Some((bytes, total))) => ReplyBody::ReadPage {
+            bytes,
+            total,
+            stamp: w.revision,
+          },
           Ok(None) => refused(Refusal::NotFound),
           Err(_) => refused(unreadable_base(w)),
         },
@@ -967,18 +971,6 @@ pub(crate) fn read_window(
   }
 }
 
-/// The page of `bytes` from `offset`, at most `want` long, stamped `stamp`.
-fn page_of(bytes: &[u8], (offset, want): (u64, u64), stamp: u64) -> ReplyBody {
-  let total = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-  let start = usize::try_from(offset.min(total)).unwrap_or(bytes.len());
-  let end = usize::try_from(offset.saturating_add(want).min(total)).unwrap_or(bytes.len());
-  ReplyBody::ReadPage {
-    bytes: bytes.get(start..end).unwrap_or_default().to_vec(),
-    total,
-    stamp,
-  }
-}
-
 /// A green's file page at a view; the resolved version is its stamp.
 fn read_green_range(
   state: &ShardState,
@@ -994,8 +986,12 @@ fn read_green_range(
     Ok(version) => version,
     Err(refusal) => return refused(refusal),
   };
-  match engine.content_ref_at(path, version) {
-    Some(bytes) => page_of(bytes, range, version),
+  match engine.content_page_at(path, version, range) {
+    Some((bytes, total)) => ReplyBody::ReadPage {
+      bytes,
+      total,
+      stamp: version,
+    },
     None => refused(Refusal::NotFound),
   }
 }
@@ -1265,9 +1261,9 @@ pub(crate) fn status_merge_volume(
       (
         work
           .files
-          .files(work_base(state, work))
+          .sizes(work_base(state, work))
           .iter()
-          .map(|(_, bytes)| bytes.len() as u64)
+          .map(|(_, len)| *len)
           .sum(),
         work.base_version,
       )
