@@ -189,6 +189,8 @@ struct CaptureView {
   address: usize,
   offset: usize,
   _section: OwnedHandle,
+  /// The view's exclusion from crash dumps (A-239): the receive buffer holds a write's bytes in flight.
+  excluded: slates_mem::dump_exclusion::DumpExclusion,
 }
 
 impl CaptureView {
@@ -213,6 +215,10 @@ impl CaptureView {
       address: view.Value.addr(),
       offset,
       _section: section,
+      excluded: slates_mem::dump_exclusion::DumpExclusion::exclude(
+        view.Value.cast::<u8>().cast_const(),
+        length,
+      ),
     })
   }
 
@@ -231,6 +237,8 @@ impl CaptureView {
 
 impl Drop for CaptureView {
   fn drop(&mut self) {
+    // Unregistered before the unmap, so no view another thread maps at this address meanwhile loses its own.
+    self.excluded.release();
     // SAFETY: address is this object's sole live MapViewOfFile view, and all transactions using it have ended.
     if unsafe {
       UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {

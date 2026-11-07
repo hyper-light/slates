@@ -1616,6 +1616,11 @@ pub struct DaemonReport {
   pub log_lines_refused: u64,
   /// Log lines the anchor could not write over its life, as it last wrote the count to the segment (A-213). Appended.
   pub anchor_log_lines_refused: u64,
+  /// Mappings of the daemon's private bytes (content regions, shared-object views, copies, the key region) that a crash
+  /// dump may carry because Windows Error Reporting refused their exclusion (A-239): its 512-block limit reached, or a
+  /// Windows without the call. Zero is the healthy reading, and always zero on Unix, where the process is excluded
+  /// whole. Appended.
+  pub dumps_unexcluded: u64,
 }
 
 /// The node's sealing at rest (A-92): how its root came (`unavailable`, `minted`, `minted-daemon-only` or

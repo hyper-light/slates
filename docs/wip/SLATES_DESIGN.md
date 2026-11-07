@@ -129,7 +129,9 @@ Four separate claims follow from it, each needing its own evidence:
    hold a byte, or refuse to start — core size limit 0 soft and hard (every Unix) and an empty
    core filter (Linux), observed from outside the real processes (AUD-29-41 in part, 2026-10-01). Not claimed
    yet: pageout — only a strict create locks the content arena; metadata, rings, logs, completion records,
-   codec and transport buffers are pageable; and Windows dump exclusion (WER) is not set (AUD-29-41).
+   codec and transport buffers are pageable. On Windows, which has no unprivileged whole-process exclusion, each
+   mapping of private bytes is registered with Windows Error Reporting as excluded when it is mapped (A-239); stacks
+   and the heap stay in a dump, and a mapping WER refuses is counted (`dumps_unexcluded`).
 3. *No private byte is disclosed across consumers or hosts.* A grant binds its consumer (AUD-29-01); owed:
    per-consumer authority for fleet content (AUD-29-45).
 4. *Ownership is bounded through cancellation, restart and destroy.* Partly evidenced by §4.2's admission;
@@ -13282,6 +13284,32 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Arm64 Windows proven** since (2026-10-27): the direct-map client tests, 20 of 20, on CI's `windows-11-arm` (run
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
+
+### A-239 — Windows keeps each mapping of private bytes out of a crash dump, registered as it is mapped (accepted 2026-11-07, the supervisor's decision)
+Applied in the same change to: §1's RAM-only guarantee 2 (above), GAPS (`8a-win-dumps`), `crates/mem`
+(`dump_exclusion.rs`, new; `region.rs`, `shared.rs`, `dax_object.rs`: each Windows mapping owns its exclusion),
+`crates/bridge-winfsp/src/dispatcher.rs` (the receive buffer's view), `crates/server` (`seal_keys.rs`: the key region;
+`verbs.rs`: `dumps_unexcluded` in the daemon's status; `tests/dump_exclusion.rs`, new), `crates/ipc` (`DaemonReport`'s
+appended field), `crates/cli` (`dumps.rs`: the Windows arm's doc; the status line), `crates/mcp` (the status field),
+`vendor/hyper-raft/hyper-seal` (`key_region`, a local patch owed upstream), `unsafe-budget.toml` (slates-mem 63 → 72),
+`.github/workflows/ci.yml` (WER's `LocalDumps` on the Windows job, and the test).
+- **What was wrong.** On Unix the anchor and the daemon exclude their whole process from core dumps before they map a
+  private byte. Windows has no unprivileged equivalent: a crash dump is written by Windows Error Reporting, and turning
+  it off for a process is a registry setting an administrator makes, which R10 refuses to require. So a Windows crash
+  could write tenant content and keys to a dump file (GAPS `8a-win-dumps`, open since 2026-10-20).
+- **The rule.** Each mapping that holds tenant content or keys registers itself with `WerRegisterExcludedMemoryBlock`
+  when it is mapped and unregisters before it is unmapped (`slates_mem::dump_exclusion::DumpExclusion`, owned by the
+  mapping): every content region of the chunk arena, every view of a shared memory object (the anchor segment with
+  the seal root, the content object, write logs and image slots, the copies a client or a VMM maps), the DAX copy
+  sections, WinFsp's receive buffer, and hyper-seal's key region (once per process). The two calls are found with
+  `GetProcAddress`, not imported, so a Windows without them still loads the binary.
+- **What stays in a dump (the residual).** Stacks and the heap, which can hold fragments in flight: a request's
+  buffer, an inline file in a tree node, aws-lc's key schedules and the node recipient's decapsulation key. A mapping
+  WER refuses, past its limit of 512 blocks a process (`WER_MAX_REGISTERED_ENTRIES`; a block is at most `u32::MAX`
+  bytes, so a larger mapping takes several) or on a Windows without the call, stays in, counted and reported by
+  `slates status` as `dumps_unexcluded`. A dump another tool takes on purpose (a debugger, `procdump`) does not consult
+  the registration; such a tool runs as the same user or an administrator, who can read the memory directly anyway.
+- **Evidence.** EVIDENCE
 
 ### A-230 — A CLI attachment holds a term, renewed by each verb that names it (accepted 2026-11-06, the supervisor's decision: option 2)
 Applied in the same change to: §4.7 (a dead client's attachments: the CLI's are excepted), `docs/cli.md`, GAPS,
