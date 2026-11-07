@@ -7,12 +7,12 @@
 //! descriptor over a socket, which no stranger can open; this is that hand-off on macOS.
 //!
 //! **The shape.** The instance's owner (the anchor, or a daemon run alone) holds its token, a Mach bootstrap name kept
-//! for the instance's whole life (`crate::owner_name`, A-178), and serves it on a thread of its own ([`OwnerService`]),
+//! for the instance's whole life (`crate::owner_name`, A-178), and serves it on a thread of its own (`OwnerService`),
 //! which keeps every piece of the state it serves, so nothing is shared between threads. The daemon creates a region
 //! and unlinks its name before it answers the claim, so no process can open it by name, and sends the region to the
 //! token as a fileport (`fileport_makeport`, a Mach port that is a capability for the descriptor), kept for the claim's
-//! slot and the process that claimed it ([`keep`]). The claimant, once its slot is answered, fetches it from the token
-//! with a reply port of its own ([`fetch`]): the owner answers with the fileport, and only the claimant holds the reply
+//! slot and the process that claimed it (`keep`). The claimant, once its slot is answered, fetches it from the token
+//! with a reply port of its own (`fetch`): the owner answers with the fileport, and only the claimant holds the reply
 //! port. The token's queue is first in, first out, and the daemon's keep is queued before it publishes the answer, so a
 //! fetch always finds the keep it follows.
 //!
