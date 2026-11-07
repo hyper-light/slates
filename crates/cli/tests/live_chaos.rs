@@ -1285,6 +1285,15 @@ fn judge_healed(
   verdict.note(format!("{} samples, {heads} heads seen", samples.len()));
   verdict.check("Agreement", disagreements);
   verdict.check("NoLoss", no_loss(owner, volume, outcomes));
+  // Each node's refusals of the owner's messages by why, passing or not: a candidate refusing every entry for want of
+  // the volume's catalog (`no_catalog`) was much of an install storm that a passing flow hid (live-durability,
+  // 2026-11-06).
+  for instance in std::iter::once(owner).chain(candidates.iter().map(String::as_str)) {
+    verdict.note(format!(
+      "{instance} refused the owner: {:?}",
+      counters(instance, "fleet.live.hold_refused.")
+    ));
+  }
 }
 
 /// Shape: the bound a healed candidate catches up within, from its resume to holding the owner's head at that moment:
@@ -1927,7 +1936,7 @@ fn a_destroy_then_the_owners_loss(live: bool, unheard: bool) {
       "after the unanswered destroy: {outcome}; {views:?}"
     ));
     verdict.check(
-      "an unanswered destroy settles: destroyed everywhere, or served whole",
+      "an unanswered destroy settles: destroyed everywhere (NotFound or OwnerUnreachable, never Overloaded), or served whole",
       if settled.is_some() {
         Vec::new()
       } else {
@@ -2457,7 +2466,8 @@ fn clients_cut_off_mid_merge_leave_the_green_whole_across_a_takeover() {
   verdict.judge();
 }
 
-/// How a volume whose destroy was never answered done settled: destroyed on every survivor, or served whole by one.
+/// How a volume whose destroy was never answered done settled: destroyed on every survivor (none lists it, each read
+/// refused `NotFound` or `OwnerUnreachable`), or served whole by one.
 enum Settled {
   Destroyed,
   Served(String),
@@ -2474,8 +2484,14 @@ fn wait_settled_after_destroy(
   let deadline = Instant::now() + FLEET_WAIT;
   loop {
     let views = survivor_views(survivors, volume);
+    // Destroyed: nobody lists it, nobody serves it, and every answer is NotFound or OwnerUnreachable (a destroyed
+    // volume of a departed creator: once its tombstone retires no member remembers it and its id routes to the gone
+    // creator; answering NotFound there is an open design item, GAPS). Never a stuck Overloaded, the successor that
+    // kept its routing to a retired volume (2026-11-06).
     let destroyed = views.iter().all(|view| {
-      !view.listed && matches!(&view.read, Some(Err(error)) if error.contains("NotFound"))
+      !view.listed
+        && matches!(&view.read, Some(Err(error))
+          if error.contains("NotFound") || error.contains("OwnerUnreachable"))
     });
     if destroyed {
       return (Some(Settled::Destroyed), views);
@@ -2493,4 +2509,57 @@ fn wait_settled_after_destroy(
     }
     pause();
   }
+}
+
+/// A-200 takeover of a live volume with a long log: do stream `LONG_LOG` writes to a live volume (the log goes past
+/// whole records and their deltas), let both candidates hold it, then kill the owner's node. Expect a survivor to take
+/// the volume over from its live log and serve every acknowledged write. On KIND (runs 42178128960 and 42318867890,
+/// 1,000 writes) both survivors held the log at its head while the successor refused to rebuild it 1,512 times
+/// (`fleet.live.takeover_refused`), and the volume was never served.
+#[test]
+fn a_long_live_log_is_taken_over_whole() {
+  /// Shape: the writes before the owner's loss: the KIND leg's unshaped count.
+  const LONG_LOG: usize = 1000;
+  if !gated("long-log") {
+    return;
+  }
+  let mut fleet = Fleet::start("long-log", Supervision::Bare);
+  let owner_index = fleet.owner_index();
+  let owner = fleet.instances[owner_index].clone();
+  let candidates = candidates_of(&fleet, owner_index);
+  let volume = create_volume(&owner, "long-log", true);
+  let mut verdict = Verdict::new("a long live log taken over");
+  let never = AtomicBool::new(false);
+  let outcomes = Stream {
+    instance: &owner,
+    volume: volume_id_of(&volume),
+    began: Instant::now(),
+  }
+  .run(0..LONG_LOG, &never);
+  verdict.note(latency_line(&outcomes));
+  let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+  let (caught_up, last) = converged(&owner, &refs, &volume);
+  verdict.check(
+    "Convergence",
+    if caught_up { Vec::new() } else { vec![last] },
+  );
+  fleet.kill_node(owner_index);
+  match wait_serving(&refs, &volume, &outcomes) {
+    Some((successor, took)) => {
+      verdict.note(format!("taken over by {successor} after {took:?}"));
+      verdict.check("NoLoss (successor)", no_loss(successor, &volume, &outcomes));
+    }
+    None => verdict.check(
+      "NoLoss (successor)",
+      vec![format!(
+        "no survivor served the volume within the fleet wait: {:?}",
+        refs
+          .iter()
+          .map(|survivor| (*survivor, counters(survivor, "fleet.live.")))
+          .collect::<Vec<_>>()
+      )],
+    ),
+  }
+  drop(fleet);
+  verdict.judge();
 }
