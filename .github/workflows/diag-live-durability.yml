@@ -1,0 +1,67 @@
+name: diag-live-durability
+
+# Diagnostics only, never on main (A-200, item 2): diag-34 found the rolling partition's Convergence failing 2 of 3 on
+# ubuntu-24.04-arm at the landing tip straggler-3 @ 8b0f0341 (green 3 of 3 on x86). The flow x6 per leg, keeping the
+# converged line (each node's head and counters) and the panic: the tip on both arches, and on arm the stack before the
+# 7e42ce80/82a5f8ce merges (0ad0ba6b, the tree diag-30/31 passed 10/10). Results to diag-results/live-durability-35-<leg>.
+on:
+  push:
+    branches: ["diag-live-durability-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  SLATES_TEST_CLI: "1"
+
+jobs:
+  check:
+    name: partition (${{ matrix.leg }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { leg: tip-arm, os: ubuntu-24.04-arm, ref: 8b0f034178282d8ffb2c6c7c96b13655931653ea }
+          - { leg: tip-x86, os: ubuntu-latest, ref: 8b0f034178282d8ffb2c6c7c96b13655931653ea }
+          - { leg: pre-merge-arm, os: ubuntu-24.04-arm, ref: 0ad0ba6bfbd83261f50b4630026449749b3041af }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.leg }}
+      - name: The runs
+        shell: bash {0}
+        run: |
+          R=../results.txt
+          echo "leg ${{ matrix.leg }}, ${{ matrix.os }}, $(nproc) CPUs, $(date -u), tree $(git rev-parse HEAD)" > $R
+          timeout 1800 cargo build --release --locked -p slates-cli --bin slates --test live_chaos > ../build.log 2>&1; status=$?
+          echo "== release build exit $status" >> $R
+          [ $status -ne 0 ] && grep -E '^error' -A8 ../build.log | head -40 >> $R
+          for run in 1 2 3 4 5 6; do
+            timeout 900 cargo test --release --locked -p slates-cli --test live_chaos -- --nocapture --test-threads=1 --exact candidates_partitioned_in_turn_mid_stream_lose_nothing > ../run.log 2>&1; status=$?
+            grep -E '^  [0-9]+ writes|violations|refused the owner|converged:|^    [a-z]|panicked' ../run.log | grep -v '^chaos' | cut -c1-1200 >> $R || true
+            [ $status -ne 0 ] && { echo "-- tail"; tail -40 ../run.log | cut -c1-600; } >> $R
+            echo "== partition $run exit $status" >> $R
+          done
+          exit 0
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/live-durability-35-${{ matrix.leg }}"
+          git config user.name "diag-live-durability"
+          git config user.email "diag-live-durability@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-live-durability-35 results, ${{ matrix.leg }}"
+          git push -q origin "HEAD:refs/heads/$branch"
