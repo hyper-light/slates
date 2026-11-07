@@ -5619,7 +5619,7 @@ window is the process-restart window (zero, thanks to the anchor). Same code, ze
 
 ### 4.9 Wire protocol (D-15)
 
-> **Status (2026-11-07, A-SEAT: a client proves its id).** A client's id names its seat: its retained completion records,
+> **Status (2026-11-07, A-241: a client proves its id).** A client's id names its seat: its retained completion records,
 > its attachments, every verb after. The rendezvous carries only the id a client wants, which a stranger can name, and
 > a request carries its id in its slot word. So now:
 > - **A session key per id** (`slates_server::session_key`): keyed BLAKE3 over the id under the node's session secret,
@@ -13405,7 +13405,8 @@ last), `crates/cli/tests/nfs_held.rs` (the history test).
   and both encodings of the image and the delta are compared with the field (`crates/vfs/tests`).
 - **Format.** Image version 22, delta version 5: earlier images and logs are refused by version, as before.
 
-### A-SEAT — A client proves its id with a session key, and a request names its own client (accepted 2026-11-07, the supervisor's order)
+### A-241 — A client proves its id with a session key, and a request names its own client (accepted 2026-11-07, the supervisor's order)
+Numbered 2026-11-07 by the supervisor; the commit that made it, 28885a6d, names it "A-SEAT, number pending".
 Applied in the same change to: §4.9 (its status), GAPS (GAP-A9-9's entry), the bug record of 2026-11-07,
 `crates/anchor` (`layout::SUP_SESSION_PRESENT`, `SUP_SESSION_SECRET`, `SESSION_SECRET_BYTES`, appended;
 `AnchorSegment::publish_session_secret`, `session_secret`), `crates/ipc` (`region.rs`: the session key at header byte

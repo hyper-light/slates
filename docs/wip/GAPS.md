@@ -33,7 +33,7 @@
 > - **Windows**, the same shape by name (`Local\` sections with the default DACL); the fix is a section DACL and handle
 >   duplication, as `delivery.rs` already does.
 > - **Found on the way, every platform: a wanted client id was granted to whoever asked while it was not live.** Fixed
->   2026-11-07 by A-SEAT, with a sibling found on the way: any client could run a request under another client's id and
+>   2026-11-07 by A-241, with a sibling found on the way: any client could run a request under another client's id and
 >   plant its reply there, where that client's own request of the id later met it. A client now proves its id with a
 >   session key only it holds, and a request naming another client is refused
 >   (`docs/bugs/2026-11-07-a-stranger-took-a-dead-clients-seat-and-planted-its-replies.md`).
