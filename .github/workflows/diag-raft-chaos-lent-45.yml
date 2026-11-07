@@ -1,0 +1,64 @@
+name: DIAG raft-chaos lent sessions, stack against main a2cf9af7 (not for main)
+
+# Diagnostics branch of the raft-chaos agent; never merged. The tree: live-durability's lanes, live-fixes' joint holder
+# transition, and A-240 (phase one counting the recorded holders; heads, then the adopted holder's log; a new shipper
+# starting from the recorded set). Three jobs, each publishing its results to a branch by git push (read with git
+# fetch, no API call): the KIND live leg; the five-node fresh-member flow x5; the kill-at-acknowledgement flow x3.
+
+on:
+  push:
+    branches: [diag-raft-chaos-lent-45]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  SLATES_TEST_CLI: "1"
+
+jobs:
+  kind-live:
+    name: KIND live leg ${{ matrix.arm }} ${{ matrix.sample }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [stack, main]
+        sample: [1, 2, 3, 4, 5, 6]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: The main arm builds main a2cf9af7
+        if: matrix.arm == 'main'
+        run: git checkout --detach a2cf9af737e85df69884869d8bbf1ebdd0d32cd0 && git log -1 --oneline
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.3.0
+      - uses: helm/kind-action@v1
+        with:
+          version: v0.33.0
+          install_only: true
+      - name: The live leg
+        run: |
+          status=0
+          cargo xtask kind live > ../kind.log 2>&1 || status=$?
+          grep -E 'kind live: (unshaped|wan|wan-loss|ceiling|  |slates-|the successor)|live-write:|StaleNever|fenced|FAILED|takeover|lent=|  shard|  fleet_host|  fleet_members' ../kind.log | cut -c1-600 | tail -400 > ../results.txt
+          echo "exit $status arm ${{ matrix.arm }} head $(git rev-parse HEAD)" >> ../results.txt
+          exit $status
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          git config user.name "diag-raft-chaos"
+          git config user.email "diag-raft-chaos@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-raft-chaos-lent-45 kind results ${{ matrix.arm }} ${{ matrix.sample }}"
+          git push -q origin "HEAD:refs/heads/diag-results/diag-raft-chaos-lent-45-kind-${{ matrix.arm }}-${{ matrix.sample }}"
