@@ -44,6 +44,13 @@
 >   the growth came after the pin. A pin past its volume's quota is refused `NoSpace`
 >   (`docs/bugs/2026-11-06-a-pin-held-its-shard-for-the-whole-tree.md`).
 >
+> - **A kept forward waited for another request** (found 2026-11-07, the 10k stall). A forward refused by its owner
+>   shard's full control channel was kept, but the serve loop idled until a ring woke it, so a shard whose clients
+>   all waited on kept forwards slept until some other request came. While a forward is kept, the loop now idles at
+>   most its idle window (`forward_retry.rs`, red on both Linux runners, run 42374532065:
+>   `docs/bugs/2026-11-07-a-kept-forward-waited-for-another-request.md`). The 10k rung then met the verdict's walk of
+>   every delta since a work's base on the green's owner shard, open below.
+>
 > - **A run after a length change in its file merged zeros** (found 2026-11-07 proving W2, since 34548a59, the
 >   submit flow's first version). The seal read each added run at its op's base-coordinate offset rather than where
 >   the work's file holds it, so a work that deleted a file's first two bytes and then overwrote its last two merged
