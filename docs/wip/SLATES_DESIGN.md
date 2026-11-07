@@ -13941,7 +13941,16 @@ tests named below.
   (`@ANCHOR`); and every fleet test that reaches a volume from another node now shares it with that node's account by
   its anchor (`share_with_node`), the two takeover tests before the owner dies, so a survivor enforces the scoped owner.
   The sealing tenant's test derives each tenant from its owner (`Principal::tenant`), since a tenant is no longer the
-  bare uid. Passing on macOS: anchor, db, the server's unit tests (194), consumers, daemon (24) and virtiofs (9)..
+  bare uid. The two-host test's second half shares the volume with exactly the principal the refusal named, and node
+  b's read is then served. Takeover: `a_dead_owners_volume_refuses_an_unshared_host_through_its_successor` (the
+  survivor whose share was withdrawn is refused `NotShared`, naming its own anchor, through the successor) and
+  `a_restarted_peer_is_learned_on_contact_under_its_fresh_identity` (the owner's account, through its restarted host,
+  reaches its volume on the successor, since a restart keeps the anchor). Windows→Unix-root by rule:
+  `verbs::tests::uid_zero_on_another_host_is_not_this_hosts_root`. CI (diag `clients-host-5`, on main `e86fb417`,
+  2026-11-07): wire, db, anchor, the server's unit tests, consumers, daemon, virtiofs and the CLI green on ubuntu x86_64
+  and arm64; the fleet suite 94 of 95 on both, the one a test new on main whose forward needed its share
+  (`green_and_work_on`, fixed after); Windows x86_64 and arm64 green but for the two landing tests that fail on main
+  there too.
 
 ### A-228 — A daemon's liveness is judged in its shards' own CPU time, by an owned watchdog thread (accepted and built 2026-11-06)
 Applied in the same change to: §4.14 (its status on `daemon.alive`), `crates/server/src/watchdog.rs` (new),
