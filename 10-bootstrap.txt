@@ -142,3 +142,5 @@ live bootstrap: written=true caught_up=true shipping=Some(("5", "5", "false")) h
 live bootstrap: written=true caught_up=true shipping=Some(("5", "5", "false")) held=[Some(("5", "none", "false")), Some(("5", "none", "false"))] [("live-bootstrap-a-20967", {"held": 6, "hold_refused": 12, "hold_refused.no_catalog": 2, "hold_refused.not_a_member": 10}), ("live-bootstrap-b-20967", {"a
 === bootstrap on 2 exit 0 load { 48.76 34.37 21.50 }
 live bootstrap: written=true caught_up=true shipping=Some(("5", "5", "false")) held=[Some(("5", "none", "false")), Some(("5", "none", "false"))] [("live-bootstrap-a-21390", {"appended": 6, "awaited": 5, "durable": 6, "held_back.placement": 7, "no_session": 5, "resolved": 5, "unanswered": 4, "whole":
+=== bootstrap on 3 exit 0 load { 49.42 34.74 21.71 }
+live bootstrap: written=true caught_up=true shipping=Some(("5", "5", "false")) held=[Some(("5", "none", "false")), Some(("5", "none", "false"))] [("live-bootstrap-a-21728", {"held": 7, "hold_refused": 6, "hold_refused.no_catalog": 2, "hold_refused.not_a_candidate": 4}), ("live-bootstrap-b-21728", {"
