@@ -1,0 +1,277 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 17:23:08 UTC 2026, head 8fed3056048f7640670cc47fb78d026c8df08004
+== run 1 at 17:23:08, load 1.93 2.02 0.93
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["13263539515814432392", "15311379117864735166", "6878570561278141545", "16738980778287081036", "16061441154904791764"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-d-6107; council seats at ["chaos-fresh-member-a-6107", "chaos-fresh-member-b-6107", "chaos-fresh-member-c-6107"]
+slates daemon: fleet node `e` of `slates-fleet`: member 6150739121346413993 with 4 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a member that never held the log at a takeover: chaos-fresh-member-e-6107 replaced by a fresh member, rejoined at 2.451463097s
+chaos a member that never held the log at a takeover: the owner's holders once settled: ["chaos-fresh-member-e-6107", "chaos-fresh-member-b-6107"]
+
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (6108) panicked at crates/cli/tests/live_chaos.rs:348:5:
+every neighbourhood settled, or kept changing, within each fleet wait: [(Some(12), Some(12)), (Some(12), Some(12)), (Some(9), Some(9)), (Some(9), Some(9)), (Some(9), Some(9))]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+--
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 44.92s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 1 exit 101
+== run 2 at 17:23:53, load 7.70 3.52 1.49
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["16668623031365284265", "16073376887568056902", "5110324601294159224", "10508871172817926430", "6262299656412017233"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-a-13502; council seats at ["chaos-fresh-member-c-13502", "chaos-fresh-member-d-13502", "chaos-fresh-member-e-13502"]
+slates daemon: fleet node `b` of `slates-fleet`: member 8198391439132535333 with 4 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a member that never held the log at a takeover: chaos-fresh-member-b-13502 replaced by a fresh member, rejoined at 2.579696724s
+chaos a member that never held the log at a takeover: the owner's holders once settled: ["chaos-fresh-member-c-13502", "chaos-fresh-member-d-13502"]
+
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (13503) panicked at crates/cli/tests/live_chaos.rs:348:5:
+every neighbourhood settled, or kept changing, within each fleet wait: [(Some(4), Some(4)), (Some(9), Some(11)), (Some(4), Some(4)), (Some(11), Some(11)), (Some(4), Some(4))]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+--
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 44.29s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 2 exit 101
+== run 3 at 17:24:37, load 10.93 4.96 2.07
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["8841596421120088253", "7107256298219851076", "7063174799754428106", "1780022455417104466", "3773529712975208380"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-a-20730; council seats at ["chaos-fresh-member-c-20730", "chaos-fresh-member-d-20730", "chaos-fresh-member-e-20730"]
+slates daemon: fleet node `c` of `slates-fleet`: member 12909910218880036937 with 4 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a member that never held the log at a takeover: chaos-fresh-member-c-20730 replaced by a fresh member, rejoined at 2.8691307s
+chaos a member that never held the log at a takeover: the owner's holders once settled: ["chaos-fresh-member-e-20730", "chaos-fresh-member-b-20730"]
+
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (20731) panicked at crates/cli/tests/live_chaos.rs:348:5:
+every neighbourhood settled, or kept changing, within each fleet wait: [(Some(4), Some(4)), (Some(3), Some(3)), (Some(8), Some(8)), (Some(10), Some(10)), (Some(10), Some(10))]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+--
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 45.70s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 3 exit 101
+== run 4 at 17:25:23, load 12.89 6.33 2.67
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["3332089428152401308", "13038924661144260839", "6079299418078073518", "3425515865177255670", "11295242401241621362"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-b-27107; council seats at ["chaos-fresh-member-a-27107", "chaos-fresh-member-c-27107", "chaos-fresh-member-d-27107"]
+slates daemon: fleet node `a` of `slates-fleet`: member 6669299530618237932 with 4 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a member that never held the log at a takeover: chaos-fresh-member-a-27107 replaced by a fresh member, rejoined at 2.319075494s
+chaos a member that never held the log at a takeover: the owner's holders once settled: ["chaos-fresh-member-c-27107", "chaos-fresh-member-e-27107"]
+
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (27108) panicked at crates/cli/tests/live_chaos.rs:348:5:
+every neighbourhood settled, or kept changing, within each fleet wait: [(Some(8), Some(8)), (Some(4), Some(4)), (Some(9), Some(9)), (Some(4), Some(4)), (Some(3), Some(3))]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+--
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 44.10s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 4 exit 101
+== run 5 at 17:26:07, load 12.97 7.25 3.16
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["17811060447956340843", "10264778458402502110", "2210294573693096776", "15318061143762924698", "184087301409699344"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-a-35544; council seats at ["chaos-fresh-member-b-35544", "chaos-fresh-member-c-35544", "chaos-fresh-member-e-35544"]
+slates daemon: fleet node `d` of `slates-fleet`: member 17286773344940405342 with 4 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a member that never held the log at a takeover: chaos-fresh-member-d-35544 replaced by a fresh member, rejoined at 1.58307797s
+chaos a member that never held the log at a takeover: the owner's holders once settled: ["chaos-fresh-member-d-35544", "chaos-fresh-member-b-35544"]
+
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (35545) panicked at crates/cli/tests/live_chaos.rs:348:5:
+every neighbourhood settled, or kept changing, within each fleet wait: [(Some(9), Some(9)), (Some(12), Some(12)), (Some(2), Some(2)), (Some(9), Some(12)), (Some(2), Some(2))]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+--
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 43.95s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 5 exit 101
+== run 6 at 17:26:51, load 13.07 8.05 3.62
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["1803013199933457847", "15224846225294370638", "2176726715853295275", "13877332034089822864", "16174816426338966816"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-b-43400; council seats at ["chaos-fresh-member-a-43400", "chaos-fresh-member-c-43400", "chaos-fresh-member-d-43400"]
+slates daemon: fleet node `a` of `slates-fleet`: member 4248541122189516501 with 4 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a member that never held the log at a takeover: chaos-fresh-member-a-43400 replaced by a fresh member, rejoined at 3.658406351s
+chaos a member that never held the log at a takeover: the owner's holders once settled: ["chaos-fresh-member-d-43400", "chaos-fresh-member-e-43400"]
+
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (43401) panicked at crates/cli/tests/live_chaos.rs:348:5:
+every neighbourhood settled, or kept changing, within each fleet wait: [(Some(0), Some(0)), (Some(9), Some(9)), (Some(3), Some(3)), (Some(9), Some(9)), (Some(4), Some(4))]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+chaos: a write on chaos-fresh-member-b-43400 was never answered within 40s of the stream's stop:
+--- chaos-fresh-member-a-43400 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 16712234190309089717
+  fleet_host_epoch: 1
+  fleet_members: 2176726715853295275 13877332034089822864 15224846225294370638 16174816426338966816 16712234190309089717
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  shard 0 refused fleet.seal.pair_served: 4
+--- chaos-fresh-member-b-43400 (status exit 0; live Some([LiveState { holding: false, head: Some(292), durable: Some(289), owed: false, epoch: Some(1), identity: Some("d03ecb0a7cfdc171ff1afb1222283103ef7e3803b6b2319dd9d884772cf27de1"), fence: 1, holders: ["13877332034089822864", "16174816426338966816"], moving_to: ["13877332034089822864", "16174816426338966816", "16712234190309089717"], recorded: ["13877332034089822864", "16174816426338966816"] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 15224846225294370638
+  fleet_host_epoch: 1
+  fleet_members: 2176726715853295275 13877332034089822864 15224846225294370638 16174816426338966816 16712234190309089717
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 14
+  fleet_settled_generation: 9
+  fleet_neighbourhood_generation: 9
+  fleet_session 2176726715853295275: lent=false cwnd=130934 srtt_ns=183187 pto_ns=1183187 spurious_losses=0 persistent_collapses=0 consumed=3627 mtu=65496
+  fleet_session 13877332034089822864: lent=true cwnd=130902 srtt_ns=154495 pto_ns=1154495 spurious_losses=0 persistent_collapses=0 consumed=17724 mtu=65480
+  fleet_session 16174816426338966816: lent=false cwnd=130934 srtt_ns=131582 pto_ns=1131582 spurious_losses=0 persistent_collapses=0 consumed=19464 mtu=65496
+  fleet_session 16712234190309089717: lent=false cwnd=130934 srtt_ns=109200 pto_ns=1109200 spurious_losses=0 persistent_collapses=0 consumed=4760 mtu=65496
+  shard 0 refused fleet.live.appended: 293
+  shard 0 refused fleet.live.awaited: 288
+  shard 0 refused fleet.live.durable: 289
+  shard 0 refused fleet.live.held_back.keys: 3
+  shard 0 refused fleet.live.held_back.placement: 1
+  shard 0 refused fleet.live.held_back.whole: 1490
+  shard 0 refused fleet.live.holders_activated: 1
+  shard 0 refused fleet.live.holders_recorded: 2
+  shard 0 refused fleet.live.holders_transition: 2
+  shard 0 refused fleet.live.holders_unplaced: 750
+  shard 0 refused fleet.live.install_image: 1
+  shard 0 refused fleet.live.no_session: 7
+  shard 0 refused fleet.live.refused: 1
+  shard 0 refused fleet.live.refused.no_credit: 1
+  shard 0 refused fleet.live.resolved: 287
+  shard 0 refused fleet.live.whole: 3
+  shard 0 refused fleet.seal.pair_served: 8
+  shard 0 live shipping d34984fa2a9e274e0000000000000077 head=292 durable=289 owed=false epoch=1 identity=d03ecb0a7cfdc171ff1afb1222283103ef7e3803b6b2319dd9d884772cf27de1 fence=1 holders=13877332034089822864,16174816426338966816 moving_to=13877332034089822864,16174816426338966816,16712234190309089717 recorded=13877332034089822864,16174816426338966816
+--- chaos-fresh-member-c-43400 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 2176726715853295275
+  fleet_host_epoch: 1
+  fleet_members: 2176726715853295275 13877332034089822864 15224846225294370638 16174816426338966816 16712234190309089717
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 14
+  fleet_settled_generation: 3
+  fleet_neighbourhood_generation: 3
+  fleet_session 13877332034089822864: lent=false cwnd=130934 srtt_ns=83526 pto_ns=1083526 spurious_losses=0 persistent_collapses=0 consumed=4831 mtu=65496
+  fleet_session 15224846225294370638: lent=false cwnd=130934 srtt_ns=124108 pto_ns=1124108 spurious_losses=0 persistent_collapses=0 consumed=7847 mtu=65496
+  fleet_session 16174816426338966816: lent=false cwnd=130934 srtt_ns=102522 pto_ns=1102522 spurious_losses=0 persistent_collapses=0 consumed=3136 mtu=65496
+  fleet_session 16712234190309089717: lent=false cwnd=130934 srtt_ns=107833 pto_ns=1107833 spurious_losses=0 persistent_collapses=0 consumed=3106 mtu=65496
+  shard 0 refused fleet.seal.pair_served: 4
+--- chaos-fresh-member-d-43400 (status exit 0; live Some([LiveState { holding: true, head: Some(289), durable: None, owed: false, epoch: Some(1), identity: Some("1afd9ddfe7e32c32508ece80bb4393230b06cfd69ee3cf12942d9dc96af956b9"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 13877332034089822864
+  fleet_host_epoch: 1
+  fleet_members: 2176726715853295275 13877332034089822864 15224846225294370638 16174816426338966816 16712234190309089717
+  fleet_held_records: 2
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 14
+  fleet_settled_generation: 9
+  fleet_neighbourhood_generation: 9
+  fleet_session 2176726715853295275: lent=false cwnd=130934 srtt_ns=127693 pto_ns=1127693 spurious_losses=0 persistent_collapses=0 consumed=82909 mtu=65496
+  fleet_session 15224846225294370638: lent=false cwnd=130934 srtt_ns=163930 pto_ns=1163930 spurious_losses=0 persistent_collapses=0 consumed=83779 mtu=65496
+  fleet_session 16174816426338966816: lent=false cwnd=130934 srtt_ns=125838 pto_ns=1125838 spurious_losses=0 persistent_collapses=0 consumed=4820 mtu=65496
+  fleet_session 16712234190309089717: lent=false cwnd=130934 srtt_ns=123084 pto_ns=1123084 spurious_losses=0 persistent_collapses=0 consumed=4790 mtu=65496
+  shard 0 refused fleet.live.held: 275
+  shard 0 refused fleet.live.hold_refused: 49939
+  shard 0 refused fleet.live.hold_refused.not_a_candidate: 49939
+  shard 0 refused fleet.seal.pair_served: 4
+  shard 0 live held d34984fa2a9e274e0000000000000077 head=289 durable=none owed=false epoch=1 identity=1afd9ddfe7e32c32508ece80bb4393230b06cfd69ee3cf12942d9dc96af956b9 fence=1 holders=none moving_to=none recorded=none
+--- chaos-fresh-member-e-43400 (status exit 0; live Some([LiveState { holding: true, head: Some(292), durable: None, owed: false, epoch: Some(1), identity: Some("d03ecb0a7cfdc171ff1afb1222283103ef7e3803b6b2319dd9d884772cf27de1"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 16174816426338966816
+  fleet_host_epoch: 1
+  fleet_members: 2176726715853295275 13877332034089822864 15224846225294370638 16174816426338966816 16712234190309089717
+  fleet_held_records: 2
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 8
+  fleet_settled_generation: 4
+  fleet_neighbourhood_generation: 4
+  fleet_session 2176726715853295275: lent=false cwnd=130934 srtt_ns=117224 pto_ns=1117224 spurious_losses=0 persistent_collapses=0 consumed=7945 mtu=65496
+  fleet_session 13877332034089822864: lent=false cwnd=130934 srtt_ns=93825 pto_ns=1093825 spurious_losses=0 persistent_collapses=0 consumed=6261 mtu=65496
+  fleet_session 15224846225294370638: lent=false cwnd=130934 srtt_ns=120422 pto_ns=1120422 spurious_losses=0 persistent_collapses=0 consumed=7799 mtu=65496
+  fleet_session 16712234190309089717: lent=false cwnd=130934 srtt_ns=157395 pto_ns=1157395 spurious_losses=0 persistent_collapses=0 consumed=3106 mtu=65496
+  shard 0 refused fleet.live.held: 293
+  shard 0 refused fleet.seal.pair_served: 4
+  shard 0 live held d34984fa2a9e274e0000000000000077 head=292 durable=none owed=false epoch=1 identity=d03ecb0a7cfdc171ff1afb1222283103ef7e3803b6b2319dd9d884772cf27de1 fence=1 holders=none moving_to=none recorded=none
+FAILED
+
+failures:
+--
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 128.87s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 6 exit 101
+== run 7 at 17:29:00, load 3.49 6.72 3.76
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["723413141265795073", "12933690901411175407", "16815521556152098617", "3371438215653853281", "15368222478199630498"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-c-52172; council seats at ["chaos-fresh-member-a-52172", "chaos-fresh-member-b-52172", "chaos-fresh-member-d-52172"]
+slates daemon: fleet node `e` of `slates-fleet`: member 4622246508726898587 with 4 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a member that never held the log at a takeover: chaos-fresh-member-e-52172 replaced by a fresh member, rejoined at 2.454610255s
+chaos a member that never held the log at a takeover: the owner's holders once settled: ["chaos-fresh-member-a-52172", "chaos-fresh-member-d-52172"]
+
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (52173) panicked at crates/cli/tests/live_chaos.rs:348:5:
+every neighbourhood settled, or kept changing, within each fleet wait: [(Some(4), Some(4)), (Some(8), Some(8)), (Some(4), Some(4)), (Some(10), Some(10)), (Some(8), Some(8))]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+--
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 44.86s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 7 exit 101
+== run 8 at 17:29:45, load 7.52 7.36 4.12
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["15611442140561986218", "5260714409816277628", "8490840126125192747", "5144969315110719181", "4034359430319240218"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-a-60314; council seats at ["chaos-fresh-member-b-60314", "chaos-fresh-member-d-60314", "chaos-fresh-member-e-60314"]
+slates daemon: fleet node `b` of `slates-fleet`: member 7205012327373448830 with 4 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a member that never held the log at a takeover: chaos-fresh-member-b-60314 replaced by a fresh member, rejoined at 2.002302858s
+chaos a member that never held the log at a takeover: the owner's holders once settled: ["chaos-fresh-member-c-60314", "chaos-fresh-member-b-60314"]
+
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (60315) panicked at crates/cli/tests/live_chaos.rs:348:5:
+every neighbourhood settled, or kept changing, within each fleet wait: [(Some(9), Some(9)), (Some(9), Some(13)), (Some(13), Some(13)), (Some(13), Some(13)), (Some(9), Some(9))]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+--
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 44.12s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 8 exit 101
