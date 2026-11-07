@@ -3535,6 +3535,8 @@ fn gather(request: u64, part: Vec<VolumeSummary>) {
 pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
   match r {
     Refusal::NotFound => "not_found",
+    Refusal::AttachmentExpired { .. } => "attachment_expired",
+    Refusal::SessionUnproven => "session_unproven",
     Refusal::AlreadyExists { .. } => "already_exists",
     Refusal::StaleLease { .. } => "stale_lease",
     Refusal::LeaseHeld { .. } => "lease_held",
@@ -6322,14 +6324,14 @@ fn clone(
   if !rights_of(&record, principal).write {
     return forbidden("clone");
   }
-  if state.db.partition().volume_by_name(name).is_some() {
-    let existing = state
-      .db
-      .partition()
-      .volume_by_name(name)
-      .map(|v| to_wire_volume(v.id))
-      .unwrap_or_default();
+  if let Some(existing) = name_held(state, name) {
     return refused(Refusal::AlreadyExists { existing });
+  }
+  // A name that hashes to another partition is held there by an alias of the clone, which lives here beside its origin
+  // for copy-on-write (A-236, §4.8 "Lookup"): the clone is made across the two partitions by the alias protocol.
+  let name_partition = owner_of_name(name, state.shards.len());
+  if name_partition != state.partition {
+    return clone_named_elsewhere(state, principal, (volume, snapshot, name), name_partition);
   }
   let admitted = match admit_clone(state, handle, &record, snapshot) {
     Ok(admitted) => admitted,
@@ -6348,6 +6350,178 @@ fn clone(
     },
     Err(refusal) => refused(refusal),
   }
+}
+
+/// The volume holding `name` on this partition: one of its own volumes, or one another partition holds under an alias
+/// here (A-236), confirmed or reserved.
+fn name_held(state: &ShardState, name: &str) -> Option<VolumeId> {
+  let partition = state.db.partition();
+  partition
+    .volume_by_name(name)
+    .map(|volume| to_wire_volume(volume.id))
+    .or_else(|| {
+      partition
+        .name_alias(name)
+        .map(|alias| to_wire_volume(alias.volume))
+    })
+}
+
+/// Records one step of a name alias on this, the name's, partition (A-236): its own durable record.
+pub(crate) fn alias_step(state: &mut ShardState, op: &Op) -> Result<(), Refusal> {
+  let now = state.clock.monotonic_ns();
+  state
+    .db
+    .mutate(&mut state.segment, op, now)
+    .map(drop)
+    .map_err(|e| refusal_of_db(&e))
+}
+
+/// Format: the status counter of alias steps whose name's shard did not take them (A-236): a reserved alias left for
+/// the next recovery to confirm or release, so the name resolves nothing until then.
+const ALIAS_STEP_UNTAKEN: &str = "names.alias_step_untaken";
+
+/// Makes a clone whose name hashes to `name_partition`, another partition (A-236, `slates_db::alias::CLONE_STEPS`):
+/// the alias reserved at the name's partition, the clone made here beside its origin with its completion record, and
+/// the alias confirmed (or released, when the clone could not be made) before the reply. The reply is deferred to a
+/// task of this shard, so a retry meanwhile joins it.
+fn clone_named_elsewhere(
+  state: &mut ShardState,
+  principal: &Principal,
+  (volume, snapshot, name): (VolumeId, SnapshotId, &str),
+  name_partition: u16,
+) -> ReplyBody {
+  let Some(request) = state.current_request else {
+    return refused(Refusal::Unsupported {
+      feature: "a clone outside a recorded request".to_owned(),
+    });
+  };
+  let Some(name_shard) = shard_of_partition(state, name_partition) else {
+    return refused(Refusal::NotFound);
+  };
+  let Some(id) = fresh_volume_id(state) else {
+    return refused(ids_exhausted());
+  };
+  let this = state.shard;
+  let principal = principal.clone();
+  let name = name.to_owned();
+  crate::image::defer(state, async move {
+    let reservation = Op::NameAliasReserved {
+      record: slates_db::catalog::NameAliasRecord {
+        name: name.clone(),
+        volume: id,
+        confirmed: false,
+      },
+    };
+    let reserved = crate::xshard::call_within(
+      this,
+      name_shard,
+      move |s| alias_step(s, &reservation),
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await
+    .unwrap_or_else(|| {
+      Err(Refusal::Unpublished {
+        reason: "the name's shard did not answer its reservation".to_owned(),
+      })
+    });
+    let made = crate::state::with_state(|s| {
+      crate::image::complete(s, request, |s| match &reserved {
+        Err(refusal) => refused(refusal.clone()),
+        Ok(()) => clone_as(s, &principal, (volume, snapshot, &name), id),
+      })
+    });
+    let Some((reply, route)) = made else {
+      return;
+    };
+    if reserved.is_ok() {
+      let settle = if matches!(reply, ReplyBody::Cloned { .. }) {
+        Op::NameAliasConfirmed { name }
+      } else {
+        Op::NameAliasReleased { name }
+      };
+      let settled = crate::xshard::call_within(
+        this,
+        name_shard,
+        move |s| alias_step(s, &settle),
+        crate::daemon::LIVENESS_BUDGET_NS,
+      )
+      .await;
+      if !matches!(settled, Some(Ok(()))) {
+        let _ = crate::state::with_state(|s| s.count(ALIAS_STEP_UNTAKEN, 1));
+      }
+    }
+    let _ = crate::state::with_state(|s| crate::image::deliver(s, reply, route));
+  })
+}
+
+/// The clone step of [`clone_named_elsewhere`], on the origin's partition with the name reserved: the origin found and
+/// the caller's right checked again (the volume could have gone while the reservation was asked for), the clone made
+/// under the id the alias names, and published before its completion; the reply.
+fn clone_as(
+  state: &mut ShardState,
+  principal: &Principal,
+  (volume, snapshot, name): (VolumeId, SnapshotId, &str),
+  id: DbVolumeId,
+) -> ReplyBody {
+  use crate::merge_service::{StoreVerb, find_store_backed};
+  let (handle, record) = match find_store_backed(state, volume, StoreVerb::Clone) {
+    Ok(x) => x,
+    Err(r) => return *r,
+  };
+  if !rights_of(&record, principal).write {
+    return forbidden("clone");
+  }
+  if let Some(existing) = state.db.partition().volume_by_name(name) {
+    return refused(Refusal::AlreadyExists {
+      existing: to_wire_volume(existing.id),
+    });
+  }
+  let admitted = match admit_clone(state, handle, &record, snapshot) {
+    Ok(admitted) => admitted,
+    Err(reply) => return *reply,
+  };
+  match publish_clone_as(
+    state,
+    principal,
+    handle,
+    &record,
+    (snapshot, name),
+    admitted,
+    id,
+  )
+  .and_then(|id| crate::image::publish_new_volume(state, id).map(|()| id))
+  {
+    Ok(id) => ReplyBody::Cloned {
+      id: to_wire_volume(id),
+    },
+    Err(refusal) => refused(refusal),
+  }
+}
+
+/// Releases the alias the name's partition holds for `id`, a volume of this partition destroyed under `name` (A-236,
+/// `slates_db::alias::DESTROY_STEPS`). Nothing when the name hashes here, which holds no alias for it. The release is a
+/// message to the name's shard, which takes it only while its alias still names `id`; one not taken (refused,
+/// counted) is the next recovery's to release.
+pub(crate) fn release_name_alias(state: &ShardState, id: DbVolumeId, name: &str) {
+  let name_partition = owner_of_name(name, state.shards.len());
+  if name_partition == state.partition {
+    return;
+  }
+  let Some(name_shard) = shard_of_partition(state, name_partition) else {
+    return;
+  };
+  let name = name.to_owned();
+  crate::xshard::run_on_counted(state.shard, name_shard, move |s| {
+    if s
+      .db
+      .partition()
+      .name_alias(&name)
+      .is_some_and(|alias| alias.volume == id)
+      && alias_step(s, &Op::NameAliasReleased { name }).is_err()
+    {
+      s.count(ALIAS_STEP_UNTAKEN, 1);
+    }
+  });
 }
 
 /// Admits a clone of `record`'s volume (in slot `handle`) at `snapshot` (§4.2: every credit reserved, or none) and
@@ -6521,6 +6695,28 @@ pub(crate) fn publish_clone(
     discard_clone(state, origin, snapshot, admitted);
     return Err(ids_exhausted());
   };
+  publish_clone_as(
+    state,
+    principal,
+    origin,
+    record,
+    (snapshot, name),
+    admitted,
+    id,
+  )
+}
+
+/// [`publish_clone`] under an id chosen before (A-236: the id the name's alias already names).
+#[allow(clippy::too_many_arguments)] // publish_clone's arguments and the id it would choose
+pub(crate) fn publish_clone_as(
+  state: &mut ShardState,
+  principal: &Principal,
+  origin: Handle<VolumeSlot>,
+  record: &VolumeRecord,
+  (snapshot, name): (SnapshotId, &str),
+  admitted: Admitted,
+  id: DbVolumeId,
+) -> Result<DbVolumeId, Refusal> {
   let now = state.clock.monotonic_ns();
   let mut new_record = record.clone();
   new_record.id = id;
@@ -6633,9 +6829,14 @@ fn attach(
     Ok(binding) => binding,
     Err(refusal) => return refused(refusal),
   };
+  let expires_ns = termed_expiry(state);
   let resolved = binding.as_ref().map_or_else(
-    // Another host's client's attachment names its host and client (A-222); a local client's is its own.
-    || crate::remote_attach::consumer(state, &form, client_id).map(|consumer| (consumer, false)),
+    // Another host's client's attachment names its host and client (A-222); a local client's is its own, a CLI one's
+    // lapsing at `expires_ns` (A-230).
+    || {
+      crate::remote_attach::consumer(state, &form, client_id, expires_ns)
+        .map(|consumer| (consumer, false))
+    },
     |binding| {
       binding.consumer(
         state.db.partition(),
@@ -7249,7 +7450,11 @@ pub(crate) fn mint_mount_token() -> Option<[u8; 16]> {
 /// keeps the listener across a restart), ending with the kernel's `UMNT`, a `detach`, or the volume's
 /// destroy. A root record is the ring client's. OCI requires a verified source dependency,
 /// constructed separately by `oci::Binding::consumer`; a guest requires its owned device seam.
-pub(crate) fn consumer_of(form: &AttachRequest, client_id: u32) -> Result<Consumer, Refusal> {
+pub(crate) fn consumer_of(
+  form: &AttachRequest,
+  client_id: u32,
+  expires_ns: u64,
+) -> Result<Consumer, Refusal> {
   match form {
     AttachRequest::HostMount
     | AttachRequest::FuseMount { .. }
@@ -7259,6 +7464,8 @@ pub(crate) fn consumer_of(form: &AttachRequest, client_id: u32) -> Result<Consum
     | AttachRequest::BoundHostMount { .. }
     | AttachRequest::WinFspMount { .. } => Ok(Consumer::Bridge),
     AttachRequest::Root => Ok(Consumer::Sdk { client: client_id }),
+    // A CLI attachment outlives its client for a term (A-230), lapsing at `expires_ns`.
+    AttachRequest::Termed => Ok(Consumer::Termed { expires_ns }),
     AttachRequest::Oci { .. } => Err(Refusal::AttachmentUnsupported {
       transport: AttachTransport::Oci,
       reason: UnsupportedReason::HostMountRequired,
@@ -7271,6 +7478,25 @@ pub(crate) fn consumer_of(form: &AttachRequest, client_id: u32) -> Result<Consum
     // vhost-user device the verb hands out (G-vhost).
     AttachRequest::ShardsFs { .. } | AttachRequest::VhostUserFs { .. } => Ok(Consumer::Guest),
   }
+}
+
+/// A CLI attachment's term (A-230, §4.7): the operator's failover SLO, as the write lease's (`take_write_lease`). The
+/// attachment holds the volume's write lease for an attach-for-write, so its term is the lease's: a renewal by each verb
+/// naming it keeps both for a user at work, and an abandoned one lets the lease go within one term, past which the
+/// failover SLO would be broken for any other writer anyway.
+pub(crate) fn attachment_term(state: &ShardState) -> u64 {
+  derived!(
+    state.config.failover_slo_ns,
+    "the operator's failover SLO, the write lease's term (a renewal is a verb's own round trip, microseconds)",
+    ["failover_slo_ns"]
+  )
+  .get()
+}
+
+/// When a CLI attachment made or renewed now lapses (A-230): one [`attachment_term`] from the shard's clock.
+pub(crate) fn termed_expiry(state: &mut ShardState) -> u64 {
+  let term = attachment_term(state);
+  state.clock.monotonic_ns().saturating_add(term)
 }
 
 /// The rights an attachment records (§4.13 "Access lists"; AUD-01): the principal's rights on the volume
@@ -7298,10 +7524,10 @@ fn establish_form(
   form: &AttachRequest,
 ) -> Result<Option<crate::oci::Binding>, Refusal> {
   let (source, destination) = match form {
-    // The record forms: nothing to establish — the SDK's record, and the host mount the requesting
-    // process establishes itself with the capability the reply carries (`mount_nfs`, R10: no privilege
-    // and nothing of the daemon's touches the mount table).
-    AttachRequest::Root => return Ok(None),
+    // The record forms: nothing to establish — the SDK's record, a CLI's (A-230), and the host mount the
+    // requesting process establishes itself with the capability the reply carries (`mount_nfs`, R10: no
+    // privilege and nothing of the daemon's touches the mount table).
+    AttachRequest::Root | AttachRequest::Termed => return Ok(None),
     // A scoped host mount presents the live head beneath one directory; a snapshot of a subtree is not
     // presented (its scope and its version would both have to hold through one view). A bound host mount
     // presents the live head too (§4.6 A-115).
@@ -7443,6 +7669,10 @@ fn detach_of(
   volume: Option<VolumeId>,
   attachment: u64,
 ) -> ReplyBody {
+  // A CLI attachment past its term is refused as expired, never as unknown (A-230).
+  if let Err(refusal) = use_attachment(state, attachment) {
+    return refused(refusal);
+  }
   let Some(record) = state.db.partition().attachment(attachment).cloned() else {
     return refused(Refusal::NotFound);
   };
@@ -7484,6 +7714,10 @@ fn bind_mount(
   attachment: u64,
   path: &str,
 ) -> ReplyBody {
+  // A CLI attachment is renewed by the verb, or refused once its term lapsed (A-230).
+  if let Err(refusal) = use_attachment(state, attachment) {
+    return refused(refusal);
+  }
   let Some(record) = state.db.partition().attachment(attachment).cloned() else {
     return refused(Refusal::NotFound);
   };
@@ -7570,6 +7804,67 @@ pub(crate) enum Ending {
   /// Anything else (a revocation, the mount's own end, a protocol's unmount): the mount, if any, stays until its
   /// user unmounts it.
   Otherwise,
+  /// A CLI attachment's term lapsed (A-230): recorded as expired, so a later use is refused `AttachmentExpired`.
+  Expired,
+}
+
+/// A verb's use of attachment `attachment` against its term (A-230, §4.7). A CLI attachment within its term is renewed
+/// when less than half of the term is left, so a user at work keeps it with one durable record per half term, never one
+/// a verb; one past its term is ended now, as its lapse would end it, and refused. An id the partition recorded as
+/// expired is refused `AttachmentExpired`, never `NotFound`. Any other attachment, or none, passes, for the verb's own
+/// lookup to answer.
+pub(crate) fn use_attachment(state: &mut ShardState, attachment: u64) -> Result<(), Refusal> {
+  let expired = Refusal::AttachmentExpired { attachment };
+  let Some(record) = state.db.partition().attachment(attachment).cloned() else {
+    return if state.db.partition().attachment_expired(attachment) {
+      Err(expired)
+    } else {
+      Ok(())
+    };
+  };
+  let Consumer::Termed { expires_ns } = record.consumer else {
+    return Ok(());
+  };
+  let now = state.clock.monotonic_ns();
+  if expires_ns <= now {
+    end_attachment(state, &record, Ending::Expired).map_err(|e| refusal_of_db(&e))?;
+    return Err(expired);
+  }
+  let term = attachment_term(state);
+  if expires_ns.saturating_sub(now) < term / 2 {
+    let renewal = Op::AttachmentRenewed {
+      id: attachment,
+      expires_ns: now.saturating_add(term),
+    };
+    state
+      .db
+      .mutate(&mut state.segment, &renewal, now)
+      .map_err(|e| refusal_of_db(&e))?;
+  }
+  Ok(())
+}
+
+/// Ends every CLI attachment of this partition whose term has lapsed (A-230): as a detach would, releasing the write
+/// lease it held, recorded as expired. Run at the reaper's cadence, so an abandoned one ends within a term and a sweep.
+/// The attachments ended.
+pub(crate) fn expire_lapsed_attachments(state: &mut ShardState) -> usize {
+  let now = state.clock.monotonic_ns();
+  let lapsed: Vec<AttachmentRecord> = state
+    .db
+    .partition()
+    .attachments()
+    .filter(
+      |record| matches!(record.consumer, Consumer::Termed { expires_ns } if expires_ns <= now),
+    )
+    .cloned()
+    .collect();
+  let mut ended = 0usize;
+  for record in lapsed {
+    if end_attachment(state, &record, Ending::Expired).is_ok() {
+      ended = ended.saturating_add(1);
+    }
+  }
+  ended
 }
 
 /// Ends an attachment on its owner shard — the `detach` verb's effect, and the kernel's `UMNT` of a host
@@ -7583,11 +7878,11 @@ pub(crate) fn end_attachment(
   ending: Ending,
 ) -> Result<(), DbError> {
   let now = state.clock.monotonic_ns();
-  state.db.mutate(
-    &mut state.segment,
-    &Op::AttachmentRemoved { id: record.id },
-    now,
-  )?;
+  let removal = match ending {
+    Ending::Expired => Op::AttachmentExpired { id: record.id },
+    Ending::Detached | Ending::Otherwise => Op::AttachmentRemoved { id: record.id },
+  };
+  state.db.mutate(&mut state.segment, &removal, now)?;
   crate::merge_service::forget_attachment(state, record.id);
   // A guest device's record ends its device: the loop is asked to revoke and runs its terminal step, which
   // sweeps the device's references through its view and only then closes it (AUD-29-68).
@@ -7998,6 +8293,11 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
           },
         );
       let now = state.clock.monotonic_ns();
+      let name = state
+        .db
+        .partition()
+        .volume(id)
+        .map(|record| record.name.clone());
       if let Err(e) = state
         .db
         .mutate(&mut state.segment, &Op::VolumeDestroyed { id }, now)
@@ -8010,6 +8310,10 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
         continue;
       }
       any = true;
+      // A clone whose name hashes elsewhere gives its alias back there (A-236).
+      if let Some(name) = name {
+        release_name_alias(state, id, &name);
+      }
       if let Some((origin_volume, origin_snapshot)) = origin_pin
         && let Some(origin_handle) = state.by_id.get(&origin_volume).copied()
       {
@@ -9240,6 +9544,92 @@ fn retry_deferred(state: &mut ShardState) -> bool {
   any
 }
 
+/// Whether a request passes the gates before it is served, neither of which records a completion:
+/// - a request names its client in its id, and a completion is keyed by that id (§4.9): one naming another client than
+///   this slot's would run under that client's id and record its reply there, where that client's own request of the
+///   same id would meet it, so it is refused before any effect (`refuse_foreign_request`);
+/// - a client serves nothing until it has proven its id (`crate::session_key`): a stranger that names a dead client's
+///   id is refused `SessionUnproven`, and its slot is ended without retiring anything of the id's.
+fn gate(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, request: u64) -> bool {
+  if refuse_foreign_request(state, handle, request) {
+    return false;
+  }
+  if session_proven(state, handle) {
+    return true;
+  }
+  let mut reply = refused(Refusal::SessionUnproven);
+  // Not recorded: the id's completion records are its owner's. A refusal the full ring cannot take is lost with the
+  // slot, which ends next either way.
+  let _answered = send_reply(state, index, request, &mut reply);
+  crate::reap::end_unproven(state, handle);
+  false
+}
+
+/// Refuses, `BadRequest`, a request whose id names another client than the slot's (`serve_client`): answered on this
+/// slot's ring under the id it carried, so its sender learns why, and recorded nowhere. `true` when refused. Counted.
+fn refuse_foreign_request(
+  state: &mut ShardState,
+  handle: Handle<ClientSlot>,
+  request: u64,
+) -> bool {
+  let Ok(client) = state.clients.get_mut(handle) else {
+    return false;
+  };
+  if client.client_id == RequestId::from_word(request).client {
+    return false;
+  }
+  let refusal = refused(Refusal::BadRequest {
+    reason: "a request names another client's id".to_owned(),
+  });
+  // A full ring loses the refusal; the request is refused either way, and the sender's wait ends at its deadline.
+  let _answered = client.end.reply_message(request, &refusal);
+  state.count("client.foreign_request", 1);
+  true
+}
+
+/// Whether the client in `handle` has proven its id: once, the first time it is asked, by the session key its region
+/// holds (`crate::session_key::proves`); every later call reads the slot's flag. A refusal is counted.
+fn session_proven(state: &mut ShardState, handle: Handle<ClientSlot>) -> bool {
+  let secret = state.session_secret;
+  let Ok(client) = state.clients.get_mut(handle) else {
+    return false;
+  };
+  if client.proven {
+    return true;
+  }
+  let proven = client
+    .end
+    .region()
+    .session_key()
+    .is_ok_and(|key| crate::session_key::proves(&secret, client.client_id, &key));
+  client.proven = proven;
+  if !proven {
+    state.count("client.session_unproven", 1);
+  }
+  proven
+}
+
+/// What a taken slot asks before it is served: the client is seen; a cancel clears its status pages; a heartbeat or a
+/// cancel is done with; any other request is served if it passes the gates (`gate`).
+fn to_serve(
+  state: &mut ShardState,
+  index: u32,
+  handle: Handle<ClientSlot>,
+  request: &Request,
+  now: u64,
+) -> bool {
+  if let Ok(client) = state.clients.get_mut(handle) {
+    client.last_seen_ns = now;
+    if request.kind == SlotKind::Cancel {
+      client.status_pages.clear(&mut state.store.metadata);
+    }
+  }
+  if matches!(request.kind, SlotKind::Heartbeat | SlotKind::Cancel) {
+    return false;
+  }
+  gate(state, index, handle, request.request)
+}
+
 /// Up to a batch of one client's requests.
 fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, now: u64) -> bool {
   let mut any = false;
@@ -9258,15 +9648,8 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
       }
     };
     any = true;
-    if let Ok(c) = state.clients.get_mut(handle) {
-      c.last_seen_ns = now;
-    }
-    if request.kind == SlotKind::Cancel
-      && let Ok(client) = state.clients.get_mut(handle)
-    {
-      client.status_pages.clear(&mut state.store.metadata);
-    }
-    if matches!(request.kind, SlotKind::Heartbeat | SlotKind::Cancel) {
+    // A slot the gate ended is gone, and the next take finds it so.
+    if !to_serve(state, index, handle, &request, now) {
       continue;
     }
     // The `ring.request` span (§4.14) opens the request's trace as a root at the slot read: the client
@@ -9479,6 +9862,8 @@ pub struct Rebuilt {
   pub blocks_swept: usize,
   /// Host mounts of snapshots whose read-only views were rebuilt (AUD-29-76).
   pub snapshot_views: usize,
+  /// Held NFSv3 connections' byte states taken back (A-231), one per connection and volume.
+  pub nfs_states_restored: usize,
   /// Merge volumes rebuilt (§4.16): greens with their persisted chain replayed, works with their log replayed over
   /// their green (A-207: their acknowledged edits survive).
   pub merge_volumes: usize,
@@ -9524,6 +9909,7 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
     replies,
     calls,
     nfs_replies,
+    nfs_states,
   } = recover_images(state);
   restore_nfs_answers(state, calls, nfs_replies);
   // The barrier replies the dead daemon published and never delivered, for the mounts the anchor held (A-61).
@@ -9651,6 +10037,9 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
   rebuilt.pins_reconciled = reconcile_clone_pins(state);
   // The recorded snapshot mounts' views, once the volumes and their pins are back (AUD-29-76).
   rebuilt.snapshot_views = crate::snapshot_view::rebuild(state);
+  // The held connections' byte states, once the volumes are back and every write since the publication replayed onto
+  // them (A-231): each change the successor's journal holds is one the states have not seen.
+  rebuilt.nfs_states_restored = crate::nfs_writeback::restore(state, nfs_states);
   rebuilt
 }
 
@@ -9739,12 +10128,21 @@ fn complete_recovered_destroys(state: &mut ShardState) -> usize {
   let now = state.clock.monotonic_ns();
   let mut completed: usize = 0;
   for id in destroying {
+    let name = state
+      .db
+      .partition()
+      .volume(id)
+      .map(|record| record.name.clone());
     if state
       .db
       .mutate(&mut state.segment, &Op::VolumeDestroyed { id }, now)
       .is_ok()
     {
       completed = completed.saturating_add(1);
+      // A clone whose name hashes elsewhere gives its alias back there (A-236).
+      if let Some(name) = name {
+        release_name_alias(state, id, &name);
+      }
     }
   }
   retire_local_tombstones(state);
@@ -10108,6 +10506,7 @@ fn recover_images(state: &mut ShardState) -> RecoveredImages {
         replies: shard.replies,
         calls: shard.calls,
         nfs_replies: shard.nfs_replies,
+        nfs_states: shard.nfs_states,
       }
     }
     Ok((None, _)) => RecoveredImages::default(),
@@ -10130,6 +10529,7 @@ struct RecoveredImages {
   replies: Vec<slates_vfs::recover::HeldReply>,
   calls: Vec<slates_vfs::recover::HeldCall>,
   nfs_replies: Vec<slates_vfs::recover::HeldNfsReply>,
+  nfs_states: Vec<slates_vfs::recover::HeldNfsStates>,
 }
 
 /// What a shard publish committed (§4.8): the volumes the new image carries, and the ones it could
@@ -10365,6 +10765,8 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   let mut replies = pending_replies(state);
   let mut calls = call_records_checkpoint(state);
   let mut nfs_replies = held_nfs_replies(state);
+  // The held connections' byte states (A-231), each tracker consumed through now first.
+  let mut nfs_states = crate::nfs_writeback::carry(state);
   // A volume that cannot be captured restarts the checkpoint without it: the image's bytes before it may already be
   // in the slot, and the slot commits only when its header is written last, so the abandoned stream commits nothing.
   // Each restart leaves out one more volume, so there are at most as many restarts as volumes.
@@ -10375,7 +10777,7 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
       &handles,
       &skipped,
       &held,
-      (&mut replies, &mut calls, &mut nfs_replies),
+      (&mut replies, &mut calls, &mut nfs_replies, &mut nfs_states),
     ) {
       Ok(Streamed::Uncaptured(id, e)) => skipped.push((id, e)),
       Ok(Streamed::Committed(published)) => break Ok(published),
@@ -10441,10 +10843,11 @@ fn stream_checkpoint(
   handles: &[Handle<VolumeSlot>],
   skipped: &[(DbVolumeId, slates_vfs::VfsError)],
   held: &[u8],
-  (replies, calls, nfs_replies): (
+  (replies, calls, nfs_replies, nfs_states): (
     &mut Vec<slates_vfs::recover::HeldReply>,
     &mut Vec<slates_vfs::recover::HeldCall>,
     &mut Vec<slates_vfs::recover::HeldNfsReply>,
+    &mut Vec<slates_vfs::recover::HeldNfsStates>,
   ),
 ) -> Result<Streamed, slates_vfs::VfsError> {
   let left_out = |slot: &VolumeSlot| {
@@ -10497,7 +10900,11 @@ fn stream_checkpoint(
     }
     published.volumes.push(id);
   }
-  ShardImage::encode_finish(stream.buf(), held, (replies, calls, nfs_replies));
+  ShardImage::encode_finish(
+    stream.buf(),
+    held,
+    (replies, calls, nfs_replies, nfs_states),
+  );
   match state.journal.finish_checkpoint(stream) {
     Ok(frame_bytes) => published.frame_bytes = frame_bytes,
     Err(e) => return Ok(Streamed::Refused(e)),
@@ -10631,6 +11038,9 @@ fn publish_delta_into(
   let held_changed = held != state.published_held;
   let (mut calls, mut calls_removed) = call_records_delta(state);
   let mut nfs_replies = held_nfs_replies_changed(state).then(|| held_nfs_replies(state));
+  // The held connections' byte states (A-231), whole in every delta: a READ changes them without a publication of its
+  // own, so a delta carries them as of its own moment.
+  let mut nfs_states = crate::nfs_writeback::carry(state);
   slates_vfs::checkpoint_log::ShardDelta::encode_finish(
     encoded,
     count_at,
@@ -10639,7 +11049,7 @@ fn publish_delta_into(
     held_changed.then_some(&held[..]),
     Some(&pending_replies(state)),
     (&mut calls, &mut calls_removed),
-    nfs_replies.as_deref_mut(),
+    (nfs_replies.as_deref_mut(), Some(&mut nfs_states[..])),
   )?;
   let (start, end) = state.delta_range;
   let Some(object) = state.content.as_mut() else {

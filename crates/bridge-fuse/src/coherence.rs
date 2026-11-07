@@ -270,6 +270,20 @@ impl PageStates {
     self.settle(ino, 0);
   }
 
+  /// The file `ino` is tracked from here on with every byte unknown, as of `point`: what a client holds of it cannot be
+  /// told, so a write-back over any of it is refused until a fetch makes those bytes fresh (A-231: a file a connection
+  /// may have cached before a takeover, whose changes since the journal no longer holds). A file already tracked keeps
+  /// its states.
+  pub fn opened_unknown(&mut self, ino: u64, point: u64) {
+    if self.files.contains_key(&ino) {
+      return;
+    }
+    let mut file = FileStates::fresh(point);
+    file.ranges.insert(0, (u64::MAX, point, Byte::Unknown));
+    self.files.insert(ino, file);
+    self.settle(ino, 0);
+  }
+
   /// Whether `ino` is tracked.
   pub fn tracks(&self, ino: u64) -> bool {
     self.files.contains_key(&ino)
@@ -374,6 +388,75 @@ impl PageStates {
     }
     self.touched.clear();
     self.held = 0;
+  }
+
+  /// These states as a publication carries them (A-231): each tracked file's ranges with their journal points dropped,
+  /// in inode order. A fresh byte at `absent`, the point of a byte never fetched, is carried as never fetched.
+  pub fn carried(&self, absent: u64) -> Vec<slates_vfs::recover::CarriedFile> {
+    use slates_vfs::recover::{CarriedByte, CarriedFile, CarriedRange};
+    self
+      .files
+      .iter()
+      .map(|(&ino, file)| CarriedFile {
+        ino,
+        lost: file.lost,
+        ranges: file
+          .ranges
+          .iter()
+          .map(|(&start, &(end, point, byte))| CarriedRange {
+            start,
+            end,
+            byte: match byte {
+              Byte::Fresh if point == absent => CarriedByte::Absent,
+              Byte::Fresh => CarriedByte::Fresh,
+              Byte::Stale => CarriedByte::Stale,
+              Byte::Unknown => CarriedByte::Unknown,
+            },
+          })
+          .collect(),
+      })
+      .collect()
+  }
+
+  /// Takes back states a publication carried (A-231), for files not tracked here: a never-fetched byte at `absent`, and
+  /// every other byte as of `point`, before every record the journal holds now, so each change since the publication
+  /// that touched it marks it stale when consumed. A file whose carried ranges do not cover every byte in order is
+  /// lost, as is one the ledger has no room for.
+  pub fn restored(&mut self, files: &[slates_vfs::recover::CarriedFile], point: u64, absent: u64) {
+    use slates_vfs::recover::CarriedByte;
+    for carried in files {
+      if self.files.contains_key(&carried.ino) {
+        continue;
+      }
+      let mut file = FileStates {
+        ranges: std::collections::BTreeMap::new(),
+        lost: carried.lost,
+        touched: false,
+      };
+      let mut next = 0u64;
+      for range in &carried.ranges {
+        if range.start != next || range.end <= range.start {
+          file.lost = true;
+          break;
+        }
+        let (at, byte) = match range.byte {
+          CarriedByte::Absent => (absent, Byte::Fresh),
+          CarriedByte::Fresh => (point, Byte::Fresh),
+          CarriedByte::Stale => (point, Byte::Stale),
+          CarriedByte::Unknown => (point, Byte::Unknown),
+        };
+        file.ranges.insert(range.start, (range.end, at, byte));
+        next = range.end;
+      }
+      if next != u64::MAX {
+        file.lost = true;
+      }
+      if file.lost {
+        file.ranges.clear();
+      }
+      self.files.insert(carried.ino, file);
+      self.settle(carried.ino, 0);
+    }
   }
 
   /// The file `ino` has no writable open left on this mount: its states go. No write-back of it can follow, since a
@@ -703,6 +786,47 @@ impl KernelHolds {
 #[cfg(test)]
 mod tests {
   use super::{OwnRecords, PageStates};
+
+  /// A-231, the states a takeover carries. Do: a connection's states with a never-fetched range, a fetched one, and one
+  /// another path changed after its fetch; carry them, restore them into a successor's empty states before its journal's
+  /// first record, and consume a successor record over part of the fetched bytes and part of the never-fetched ones.
+  /// Expect: the carried stale bytes still stale, the fetched bytes the successor's record touched stale too, the
+  /// never-fetched bytes it touched not stale, and a carried file already tracked here left as it is.
+  #[test]
+  fn carried_states_come_back_before_the_successors_records() {
+    /// Shape: the point of a byte never fetched (the NFS tracker's `ABSENT`).
+    const ABSENT: u64 = u64::MAX;
+    let mut dead = PageStates::default();
+    dead.grow_room(64);
+    dead.opened(7, ABSENT);
+    dead.fetched(7, 0..8192, 40);
+    dead.changed(7, 0..100, 41, false);
+    dead.consumed(41);
+    let carried = dead.carried(ABSENT);
+
+    let mut successor = PageStates::default();
+    successor.grow_room(64);
+    successor.restored(&carried, 0, ABSENT);
+    successor.changed(7, 4000..10000, 1, false);
+    successor.consumed(1);
+    let stale = successor.stale_after(7, 0..20000, ABSENT, &[]);
+    let expected: Vec<std::ops::Range<u64>> = vec![0..100, 4000..8192];
+    assert_eq!(
+      stale,
+      Some(expected),
+      "the carried stale bytes, and the fetched bytes the successor's record changed; never the unfetched ones"
+    );
+
+    let mut already = PageStates::default();
+    already.grow_room(64);
+    already.opened(7, ABSENT);
+    already.restored(&carried, 0, ABSENT);
+    assert_eq!(
+      already.stale_after(7, 0..20000, ABSENT, &[]),
+      Some(Vec::new()),
+      "a file already tracked keeps its own states"
+    );
+  }
 
   /// A-192, hostile input: an NFS client sends a WRITE of no bytes, and one at the very end of the offset range, which no
   /// FUSE kernel does. Do: on a tracked file, judge, fetch and change empty ranges and ranges ending at `u64::MAX`.

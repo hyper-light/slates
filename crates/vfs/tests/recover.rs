@@ -2267,10 +2267,11 @@ fn stream_into(
   store: &Store,
   volumes: &[([u8; 16], Volume)],
   held: &[u8],
-  (replies, calls, nfs_replies): (
+  (replies, calls, nfs_replies, nfs_states): (
     &mut Vec<slates_vfs::recover::HeldReply>,
     &mut Vec<slates_vfs::recover::HeldCall>,
     &mut Vec<slates_vfs::recover::HeldNfsReply>,
+    &mut Vec<slates_vfs::recover::HeldNfsStates>,
   ),
 ) -> Result<usize, VfsError> {
   let mut stage = Vec::new();
@@ -2280,7 +2281,11 @@ fn stream_into(
     stream.buf().extend_from_slice(key);
     vol.encode_image_into(store, None, &mut stream)?;
   }
-  ShardImage::encode_finish(stream.buf(), held, (replies, calls, nfs_replies));
+  ShardImage::encode_finish(
+    stream.buf(),
+    held,
+    (replies, calls, nfs_replies, nfs_states),
+  );
   journal.finish_checkpoint(stream)
 }
 
@@ -2289,10 +2294,11 @@ fn shard_of(
   store: &Store,
   volumes: &[([u8; 16], Volume)],
   held: &[u8],
-  (replies, calls, nfs_replies): (
+  (replies, calls, nfs_replies, nfs_states): (
     &[slates_vfs::recover::HeldReply],
     &[slates_vfs::recover::HeldCall],
     &[slates_vfs::recover::HeldNfsReply],
+    &[slates_vfs::recover::HeldNfsStates],
   ),
 ) -> ShardImage {
   ShardImage::new(
@@ -2308,6 +2314,7 @@ fn shard_of(
   .with_replies(replies.to_vec())
   .with_calls(calls.to_vec())
   .with_nfs_replies(nfs_replies.to_vec())
+  .with_nfs_states(nfs_states.to_vec())
 }
 
 /// The streamed checkpoint (2026-10-06; call records A-127). Do: stream a shard — the varied volumes plus one of 2,000
@@ -2343,7 +2350,37 @@ fn a_streamed_shard_checkpoint_equals_the_shard_image_and_recovers() {
       results: Vec::new(),
     },
   ];
-  let expected = shard_of(&store, &volumes, &held, (&replies, &calls, &nfs_replies));
+  // Two held connections' byte states (A-231), out of order, so the streamed encoder's sort is compared too.
+  let carried = |connection: u64, byte| slates_vfs::recover::HeldNfsStates {
+    connection,
+    volume: [u8::try_from(connection).unwrap(); 16],
+    files: vec![slates_vfs::recover::CarriedFile {
+      ino: 3,
+      lost: false,
+      ranges: vec![
+        slates_vfs::recover::CarriedRange {
+          start: 0,
+          end: 4096,
+          byte,
+        },
+        slates_vfs::recover::CarriedRange {
+          start: 4096,
+          end: u64::MAX,
+          byte: slates_vfs::recover::CarriedByte::Absent,
+        },
+      ],
+    }],
+  };
+  let mut nfs_states = vec![
+    carried(8, slates_vfs::recover::CarriedByte::Stale),
+    carried(2, slates_vfs::recover::CarriedByte::Fresh),
+  ];
+  let expected = shard_of(
+    &store,
+    &volumes,
+    &held,
+    (&replies, &calls, &nfs_replies, &nfs_states),
+  );
   let encoded = expected.to_content();
   assert!(
     encoded.len() > 2 * slates_vfs::recover::STREAM_STAGE_BYTES,
@@ -2358,7 +2395,7 @@ fn a_streamed_shard_checkpoint_equals_the_shard_image_and_recovers() {
     &store,
     &volumes,
     &held,
-    (&mut replies, &mut calls, &mut nfs_replies),
+    (&mut replies, &mut calls, &mut nfs_replies, &mut nfs_states),
   )
   .unwrap();
   assert_eq!(frame, FRAME_BYTES + encoded.len(), "the frame's bytes");
@@ -2390,7 +2427,7 @@ fn a_refused_or_abandoned_streamed_checkpoint_leaves_the_committed_one() {
   let (volumes, _, _) = streamed_shard(&mut store);
   let mut small_sorted = varied_volumes(&mut store);
   small_sorted.sort_by_key(|(key, _)| *key);
-  let small_image = shard_of(&store, &small_sorted, &[], (&[], &[], &[]));
+  let small_image = shard_of(&store, &small_sorted, &[], (&[], &[], &[], &[]));
   let slot_bytes = small_image.to_content().len() + slates_vfs::recover::STREAM_STAGE_BYTES;
   let mut slots = vec![0u8; 2 * slot_bytes];
   let mut journal = slates_vfs::checkpoint_log::Journal::default();
@@ -2400,7 +2437,12 @@ fn a_refused_or_abandoned_streamed_checkpoint_leaves_the_committed_one() {
     &store,
     &small_sorted,
     &[],
-    (&mut Vec::new(), &mut Vec::new(), &mut Vec::new()),
+    (
+      &mut Vec::new(),
+      &mut Vec::new(),
+      &mut Vec::new(),
+      &mut Vec::new(),
+    ),
   )
   .unwrap();
 

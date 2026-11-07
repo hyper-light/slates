@@ -152,6 +152,11 @@ fn agent(agent: usize, requests: SyncSender<Request>) {
       Outcome::Conflict { windows } => {
         assert!(!windows.is_empty(), "a conflict names its windows");
       }
+      Outcome::BaseUnavailable { base, floor } => {
+        panic!(
+          "the shuttle green is never checkpointed, so no base is below its floor: base {base}, floor {floor}"
+        )
+      }
     }
   }
   requests.send(Request::Done).unwrap();

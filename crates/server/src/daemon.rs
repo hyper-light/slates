@@ -687,6 +687,9 @@ impl Daemon {
       .map_err(|e| ServerError::IssuerSecret(e.to_string()))?;
     segment.publish_issuer_secret(&issuer_secret)?;
     let region_names = region_name_key(&issuer_secret);
+    // The client session secret (`crate::session_key`): adopted from the daemon before this one under the anchor, or
+    // made and published by the first, so a client's session key still opens its session after a restart.
+    crate::session_key::adopt_or_mint(&mut segment)?;
     // The node's sealing root (A-92): adopted from the previous daemon under this anchor, or made and published into
     // the anchor's locked page; sealing reports itself unavailable, never unlocked, where the OS refuses the lock.
     let sealing = crate::seal_keys::init(&mut segment, config.seal_key_slots);
@@ -2688,7 +2691,23 @@ impl Daemon {
   /// not a wire surface); the typed refusal when the name's owner shard could not be observed, `Ok(None)`
   /// when no volume has that name there or the secure random could not mint a token.
   pub fn mount_capability(&self, name: &str) -> Result<Option<String>, ObserveError> {
+    // The name's partition says where its volume is served: its own, or a clone's beside its origin (A-236).
     let partition = verbs::owner_of_name(name, self.shards.len());
+    let asked = name.to_owned();
+    let partition = self.observe(self.shards.get(usize::from(partition)).copied(), move |s| {
+      let held = s.db.partition();
+      match held.volume_by_name(&asked) {
+        Some(_) => s.partition,
+        None => held
+          .name_alias(&asked)
+          .and_then(slates_db::alias::resolve)
+          .map_or(s.partition, |volume| {
+            verbs::owner_of(slates_ipc::protocol::VolumeId {
+              bytes: volume.bytes,
+            })
+          }),
+      }
+    })?;
     let name = name.to_owned();
     self.observe(self.shards.get(usize::from(partition)).copied(), move |s| {
       let record = s.db.partition().volume_by_name(&name)?.clone();
@@ -2843,6 +2862,11 @@ impl Daemon {
     // question already waiting there instead of terminating it (§4.6; AUD-29-64).
     if let Some(mut doorbell) = self.doorbell.take() {
       doorbell.stop();
+    }
+    // The shutdown ends the control loop before the watchdog stops: told first, it does not take that end for one the
+    // anchor should restart (A-228).
+    if let Some(watchdog) = self.watchdog.as_ref() {
+      watchdog.stopping();
     }
     if let Some(runtime) = self.runtime.take()
       && let Err(error) = runtime.shutdown()
@@ -3320,6 +3344,9 @@ fn init_shard(
   // before the segment moves into the state; every shard reads the same value, so a `Grant` verifies on
   // whichever shard serves the client.
   let issuer_secret = segment.issuer_secret()?;
+  // The client session secret (`crate::session_key`), published before any shard starts: a client's key is checked
+  // on the shard that serves it.
+  let session_secret = crate::session_key::secret_of(&segment)?;
   // The attachment counter starts past every attachment recovered with the partition — a host mount's
   // survives a restart (AUD-01) — so a fresh mint never meets a kept record's id.
   let next_attachment = verbs::next_attachment_counter(db.partition());
@@ -3329,6 +3356,7 @@ fn init_shard(
     config: config.clone(),
     segment,
     issuer_secret,
+    session_secret,
     seal_root,
     seal_state: sealing,
     seal_recipient: None,
@@ -3643,6 +3671,8 @@ async fn reap_loop() {
     pace(cadence).await;
     state::with_state(|s| {
       let _ = verbs::expire_leases(s);
+      // A CLI attachment whose term lapsed ends here, within a term and a sweep of its last use (A-230).
+      let _ = verbs::expire_lapsed_attachments(s);
       // A destroy whose completion the catalog refused is recorded again here, at the reaper's cadence
       // (`verbs::step_destroys`), rather than in a busy serve round.
       let _ = verbs::step_destroys(s);
@@ -4387,6 +4417,69 @@ async fn restore_client_ids(listener: &mut Listener, origin: u16, shards: &[Shar
   true
 }
 
+/// A recovery's reconciliation of every name alias (A-236, `slates_db::alias::reconcile`): each shard's aliases asked
+/// for, the volume each names asked of its partition, and the alias confirmed when that volume holds the name, released
+/// when it does not. Run before any client is admitted, when no clone is between its steps. An alias whose question is
+/// unanswered is left as it is, for the next start: a reserved one resolves nothing meanwhile. The aliases reconciled.
+async fn reconcile_name_aliases(origin: u16, shards: &[ShardId]) -> usize {
+  let mut reconciled = 0usize;
+  for shard in shards {
+    let Some(aliases) = crate::xshard::call_within(
+      origin,
+      shard.0,
+      |s| s.db.partition().name_aliases().cloned().collect::<Vec<_>>(),
+      LIVENESS_BUDGET_NS,
+    )
+    .await
+    else {
+      continue;
+    };
+    for alias in aliases {
+      let partition = crate::verbs::owner_of(slates_ipc::protocol::VolumeId {
+        bytes: alias.volume.bytes,
+      });
+      let id = alias.volume;
+      let volume = match shards.get(usize::from(partition)) {
+        Some(owner) => {
+          let Some(volume) = crate::xshard::call_within(
+            origin,
+            owner.0,
+            move |s| s.db.partition().volume(id).cloned(),
+            LIVENESS_BUDGET_NS,
+          )
+          .await
+          else {
+            continue;
+          };
+          volume
+        }
+        // A partition this daemon does not have holds nothing.
+        None => None,
+      };
+      let op = match slates_db::alias::reconcile(&alias, volume.as_ref()) {
+        slates_db::alias::Reconciled::Keep => continue,
+        slates_db::alias::Reconciled::Confirm => {
+          slates_db::Op::NameAliasConfirmed { name: alias.name }
+        }
+        slates_db::alias::Reconciled::Release => {
+          slates_db::Op::NameAliasReleased { name: alias.name }
+        }
+      };
+      let settled = crate::xshard::call_within(
+        origin,
+        shard.0,
+        move |s| crate::verbs::alias_step(s, &op).is_ok(),
+        LIVENESS_BUDGET_NS,
+      )
+      .await;
+      if settled == Some(true) {
+        reconciled = reconciled.saturating_add(1);
+      }
+    }
+  }
+  reconciled
+}
+
 /// Shard `shard`'s retained client-id high-water mark. The question is asked once and awaited one liveness window at a
 /// time for as long as the shard is still working: it queues behind the shard's start, which runs recovery as one step
 /// and may outlast a window (GAPS boot, 2026-10-05). After a window with no answer, the shard's thread must have used
@@ -4432,7 +4525,9 @@ async fn retained_client_ids(origin: u16, shard: u16) -> Option<u32> {
 
 /// Persist admission before its region can reach the client. A refused publication or exhausted
 /// id space refuses the handoff; no new caller can inherit a retained completion identity (§4.9).
-fn reserve_client_identity(client: u32, instance: &str) -> Result<(), slates_ipc::IpcError> {
+/// `true` for an id issued here for the first time, `false` for one issued before (a resumed session, whose
+/// client must prove its key before it is served: `crate::session_key`).
+fn reserve_client_identity(client: u32, instance: &str) -> Result<bool, slates_ipc::IpcError> {
   let unavailable = |why| slates_ipc::IpcError::DaemonUnavailable {
     endpoint: instance.to_owned(),
     why,
@@ -4447,7 +4542,7 @@ fn reserve_client_identity(client: u32, instance: &str) -> Result<(), slates_ipc
         .partition()
         .client_id_high_water(state.origin_anchor.0)
     {
-      return Ok(());
+      return Ok(false);
     }
     let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
     state
@@ -4457,10 +4552,10 @@ fn reserve_client_identity(client: u32, instance: &str) -> Result<(), slates_ipc
         &slates_db::Op::ClientIdReserved { client },
         now,
       )
-      .map(|_| ())
+      .map(|_| true)
   });
   match reserved {
-    Some(Ok(())) => Ok(()),
+    Some(Ok(fresh)) => Ok(fresh),
     _ => Err(unavailable("client identity reservation was not published")),
   }
 }
@@ -4508,6 +4603,14 @@ async fn control_loop(
     );
     return;
   }
+  // Every shard has recovered and no client is admitted yet, so no clone is between its steps: the names' aliases are
+  // reconciled with the clones they name (A-236).
+  let reconciled = reconcile_name_aliases(control, &shards).await;
+  if reconciled > 0 {
+    slates_machine::log_line!(
+      "slates-server: {reconciled} name alias(es) reconciled with their clones at recovery"
+    );
+  }
   // Clients this daemon handed out, so a wanted id that is live is not given twice; bounded
   // by the daemon's client capacity, refused typed beyond it (AC-2.6). A client's shard is
   // its id's residue, so a client reconnecting under its old id after a restart lands on the
@@ -4530,7 +4633,7 @@ async fn control_loop(
           CLIENTS_REFUSED.fetch_add(1, Ordering::AcqRel);
           return Err(slates_ipc::IpcError::TooManyClients { limit: bound });
         }
-        reserve_client_identity(client_id, &config.instance)?;
+        let fresh = reserve_client_identity(client_id, &config.instance)?;
         // The id is reserved in the live set **here**, at admission, not once the accept round returns:
         // an accept round serves every pending connection before it returns, so a burst of connects
         // inside one round was admitted against a live set that did not yet count the earlier ones —
@@ -4549,7 +4652,20 @@ async fn control_loop(
         state::with_handed(|h| h.insert(client_id));
         let name = format!("slates-cr-{region_names:016x}-{regions_made:08x}");
         regions_made = regions_made.wrapping_add(1);
-        let region = match ClientRegion::create(&name, client_id, shard.0, config.region) {
+        let region = ClientRegion::create(&name, client_id, shard.0, config.region).and_then(|mut region| {
+          // An id issued fresh gets its session key in its region, which only its client is handed; an id issued
+          // before is resumed, and its client must write its own key there (`crate::session_key`).
+          if fresh {
+            let key = state::with_state(|state| crate::session_key::key_of(&state.session_secret, client_id))
+              .ok_or(slates_ipc::IpcError::DaemonUnavailable {
+                endpoint: config.instance.clone(),
+                why: "the client's session key has no shard state to be derived on",
+              })?;
+            region.set_session_key(&key)?;
+          }
+          Ok(region)
+        });
+        let region = match region {
           Ok(region) => region,
           Err(e) => {
             state::with_handed(|h| h.remove(&client_id));
@@ -4626,6 +4742,7 @@ async fn control_loop(
                 pid,
                 last_seen_ns,
                 retiring: false,
+                proven: false,
                 control,
                 revoked: false,
                 owner_route: None,

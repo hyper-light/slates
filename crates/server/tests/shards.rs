@@ -224,13 +224,19 @@ fn attach(
 struct Guest {
   stream: UnixStream,
   unique: u64,
+  /// When the guest last sent a frame: how long an answer that never came was waited for.
+  sent_at: Instant,
 }
 
 impl Guest {
   fn over(attached: ShardsAttached) -> Guest {
     let stream = UnixStream::from(attached.stream);
     stream.set_read_timeout(Some(CREDIT_WAIT)).unwrap();
-    Guest { stream, unique: 0 }
+    Guest {
+      stream,
+      unique: 0,
+      sent_at: Instant::now(),
+    }
   }
 
   /// Sends one guest request and returns its reply's bytes (empty for a request that takes none).
@@ -244,6 +250,7 @@ impl Guest {
   /// Writes one frame: the length word (with `flag` set in it) and `bytes`.
   fn send_frame(&mut self, flag: u32, bytes: &[u8]) {
     let word = u32::try_from(bytes.len()).unwrap() | flag;
+    self.sent_at = Instant::now();
     self.stream.write_all(&word.to_le_bytes()).unwrap();
     self.stream.write_all(bytes).unwrap();
   }
@@ -484,7 +491,14 @@ impl Guest {
       &mut control,
       RecvFlags::empty(),
     )
-    .unwrap();
+    // The errno tells a wait past the stream's read timeout (`EAGAIN`) from a stream the daemon ended with the ask
+    // unread (`ECONNRESET`): a parallel run on adacachy failed here with only its line kept (2026-11-06).
+    .unwrap_or_else(|errno| {
+      panic!(
+        "the descriptor ask's answer: {errno:?} after {:?}, against the stream's read timeout of {CREDIT_WAIT:?}",
+        self.sent_at.elapsed()
+      )
+    });
     let mut descriptors: Vec<OwnedFd> = Vec::new();
     for message in control.drain() {
       if let RecvAncillaryMessage::ScmRights(fds) = message {

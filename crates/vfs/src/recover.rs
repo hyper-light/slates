@@ -79,7 +79,7 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// many of them are open handles, so a successor gives back the open of a handle the dead daemon issued at its release.
 /// Format: the image layout version, bumped with any change to the types below or to the held replicas'
 /// image they carry.
-const IMAGE_VERSION: u16 = 21;
+const IMAGE_VERSION: u16 = 22;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
@@ -523,6 +523,9 @@ pub struct ShardImage {
   /// The NFSv3 replies a barrier published for connections the anchor holds and had not yet sent (A-128), in
   /// (connection, xid) order: the mutations of each held connection's turn in progress.
   pub nfs_replies: Vec<HeldNfsReply>,
+  /// The byte states of the connections the anchor holds (A-231), in (connection, volume) order: what each one's client
+  /// cache is as of, so a successor judges its write-backs as the daemon that published this would have.
+  pub nfs_states: Vec<HeldNfsStates>,
 }
 
 /// An NFSv3 reply published with the effect it answers (A-128): the anchor-held connection the request came on, the
@@ -538,6 +541,55 @@ pub struct HeldNfsReply {
   pub accepted: bool,
   /// The procedure's results.
   pub results: Vec<u8>,
+}
+
+/// A held NFSv3 connection's byte states for one volume (A-231; A-192's states): every file it tracks there, each range's
+/// journal point dropped, since a successor's journal begins again. A successor places every fetched byte before its
+/// own first record, so each change it makes or replays after this publication marks the bytes it touched stale.
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+pub struct HeldNfsStates {
+  /// The held connection's id.
+  pub connection: u64,
+  /// The volume's id bytes.
+  pub volume: [u8; 16],
+  /// Each tracked file's states, in inode order.
+  pub files: Vec<CarriedFile>,
+}
+
+/// One file's byte states as a publication carries them (A-231).
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+pub struct CarriedFile {
+  /// The file's inode number.
+  pub ino: u64,
+  /// What the client holds can no longer be told: its write-backs are refused.
+  pub lost: bool,
+  /// Its ranges, ascending, disjoint and covering every byte; none when lost.
+  pub ranges: Vec<CarriedRange>,
+}
+
+/// One range of a carried file's states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
+pub struct CarriedRange {
+  /// The first byte.
+  pub start: u64,
+  /// The byte after the last.
+  pub end: u64,
+  /// What the client's copy of these bytes is.
+  pub byte: CarriedByte,
+}
+
+/// What a client's copy of a carried byte is (A-231): never fetched, fetched and current, fetched and since changed by
+/// another path, or one of the last two that could not be told.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
+pub enum CarriedByte {
+  /// Never fetched: no change makes it stale.
+  Absent,
+  /// Fetched, and no other path changed it since.
+  Fresh,
+  /// Fetched, and another path changed it since.
+  Stale,
+  /// Fresh or stale, which could not be told.
+  Unknown,
 }
 
 /// A transport's reply published with the effect it answers (A-61): the mount's attachment, the request's unique
@@ -577,16 +629,17 @@ impl ShardImage {
     slates_wire::codec::encode_len(volumes, out);
   }
 
-  /// Ends a streamed shard image: the held replicas, the replies, the call records and the held NFSv3 replies, as
-  /// `ShardImage::new(volumes).with_held(held).with_replies(replies).with_calls(calls).with_nfs_replies(nfs)`'s
-  /// `encode` writes them after the volumes.
+  /// Ends a streamed shard image: the held replicas, the replies, the call records, the held NFSv3 replies and the held
+  /// connections' byte states, as `ShardImage::new(volumes).with_held(held).with_replies(replies).with_calls(calls)
+  /// .with_nfs_replies(nfs).with_nfs_states(states)`'s `encode` writes them after the volumes.
   pub fn encode_finish(
     out: &mut Vec<u8>,
     held: &[u8],
-    (replies, calls, nfs_replies): (
+    (replies, calls, nfs_replies, nfs_states): (
       &mut Vec<HeldReply>,
       &mut Vec<HeldCall>,
       &mut Vec<HeldNfsReply>,
+      &mut Vec<HeldNfsStates>,
     ),
   ) {
     slates_wire::codec::encode_len(held.len(), out);
@@ -597,6 +650,8 @@ impl ShardImage {
     calls.encode(out);
     nfs_replies.sort_by_key(|reply| (reply.connection, reply.xid));
     nfs_replies.encode(out);
+    nfs_states.sort_by_key(|states| (states.connection, states.volume));
+    nfs_states.encode(out);
   }
 
   /// A shard image of the given volumes, in key order, holding nothing for others.
@@ -610,6 +665,7 @@ impl ShardImage {
       replies: Vec::new(),
       calls: Vec::new(),
       nfs_replies: Vec::new(),
+      nfs_states: Vec::new(),
     }
   }
 
@@ -637,6 +693,12 @@ impl ShardImage {
       nfs_replies,
       ..self
     }
+  }
+
+  /// This image carrying `nfs_states`, the held connections' byte states (A-231), in (connection, volume) order.
+  pub fn with_nfs_states(self, mut nfs_states: Vec<HeldNfsStates>) -> ShardImage {
+    nfs_states.sort_by_key(|states| (states.connection, states.volume));
+    ShardImage { nfs_states, ..self }
   }
 
   /// Decodes a shard image from content-object bytes, refusing a foreign magic, an unknown version
