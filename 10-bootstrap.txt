@@ -23,3 +23,8 @@ live bootstrap: written=false caught_up=false shipping=Some(("1", "none", "false
 
 thread 'a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates' (81219) panicked at crates/cli/tests/live_fleet.rs:1901:3:
 the bootstrap node's live writes became durable and both candidates hold them: Some(("1", "none", "false")) [None, None] [("live-bootstrap-a-36943", {}), ("live-bootstrap-b-36943", {}), ("live-bootstrap-c-36943", {"appended": 2, "awaited": 1, "whole": 2})]
+=== bootstrap off 6 exit 101 load { 9.63 10.48 10.06 }
+live bootstrap: written=false caught_up=false shipping=Some(("1", "none", "false")) held=[None, None] [("live-bootstrap-a-39860", {}), ("live-bootstrap-b-39860", {"appended": 2, "awaited": 1, "whole": 2}), ("live-bootstrap-c-39860", {})]
+
+thread 'a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates' (86522) panicked at crates/cli/tests/live_fleet.rs:1901:3:
+the bootstrap node's live writes became durable and both candidates hold them: Some(("1", "none", "false")) [None, None] [("live-bootstrap-a-39860", {}), ("live-bootstrap-b-39860", {"appended": 2, "awaited": 1, "whole": 2}), ("live-bootstrap-c-39860", {})]
