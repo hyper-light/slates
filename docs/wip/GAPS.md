@@ -207,6 +207,35 @@
 >   1,044 ms bound: the window plus a 44 ms lateness p99). Owed: the Windows runners under the bar's load (diag branch),
 >   then macOS and Linux beside them. Record: `docs/bugs/2026-11-06-the-anchor-killed-live-daemons-on-a-busy-machine.md`.
 >
+> **A principal is compared across hosts with no host (security, open, 2026-11-07; owner: clients; fix: A-237).** A
+> verb forwarded to a volume's owner on another node carries the requester's principal "as the origin node authenticated
+> it" (`crates/server/src/verbs.rs` `ForwardedRequest`). The owner dispatches a read under it, and runs a write under
+> it, as is (`serve_forward`); the origin's host keys only the completion record. `rights_of` then grants a principal
+> equal to a volume's owner or access entry, and a host account carries no host (`slates_db::catalog::Principal::Uid {
+> uid }`). Three collisions follow:
+> - every Windows channel is `Uid { uid: 0 }` (the bootstrap object's mode is the authentication: only the daemon's
+>   user opens it, and `slates_ipc::rendezvous`'s `current_uid` is 0 on Windows), so any two Windows users on different
+>   nodes are one principal across a forward;
+> - a Windows user is Unix root's principal: a forward from any Windows node meets a root-run daemon's volumes as their
+>   owner, and the other way round;
+> - one uid on two Unix hosts, usually two people, is one principal across a forward.
+>
+> What does not cross hosts: grants and landings (issued on the local control channel), remote attachments
+> (`Consumer::Remote { host, client }`) and enrolled consumers (found by id on their record's partition). Decided
+> (supervisor, 2026-11-07): every principal that crosses hosts is scoped by its origin host's authenticated identity,
+> owner and access entries record (host, account), and `rights_of` compares the scoped principal (A-237). A fleet account
+> mapping, one person's accounts on several hosts as one principal, is a separate open design item for Ada; until it
+> exists, cross-host access needs an access entry naming (host, account). Found while checking a wrong premise: a
+> Windows consumer does attest (`crates/server/tests/consumers.rs`, green on main on ubuntu x86_64 and arm64, Windows
+> x86_64 and arm64 and macOS, diag `consumers-1`). What remains of that is naming: on Windows the host account is
+> recorded as uid 0, Unix root's number, and §4.13 says the rendezvous authenticates "uid/SID" while the code
+> authenticates by the object's ACL and never reads a SID (held; the supervisor decides after A-237).
+>
+> **A fleet account mapping (open design item for Ada, 2026-11-07).** After A-237 a local account means something only
+> on its host, so one person's accounts on several hosts are several principals: a volume shared across the fleet needs
+> an access entry for each (host, account). Whether the fleet should map accounts to one fleet principal, and who may
+> assert such a mapping (it is an authority over every node's volumes), is undecided.
+
 > **`LIVENESS_BUDGET_NS` is still a fixed second (R3 debt, 2026-11-06; follow-on, not A-228).** It is A-228's window and
 > the reply-deadline unit of about 60 files (the client's and the server's deadlines, observations, the scatter's room
 > wait). A-228 judges the window in each shard's own CPU time, which keeps a starved daemon alive, but the window's length
