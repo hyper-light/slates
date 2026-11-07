@@ -1,0 +1,66 @@
+name: diag-clients
+
+# Diagnostics only, never on main (A-228's wedged-shard test flakes 2 of 5 on adacachy, in a capped unit at 1-2 CPUs
+# running the wider suites): main's whole liveness suite with the default test threads, pinned by taskset to one CPU
+# and to two, ten rounds each, every printout and panic message kept. Results go to diag-results/clients-wedged-2-<os>.
+on:
+  push:
+    branches: ["diag-clients-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cross-shard-wait:
+    name: R3 class A on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Build the tests
+        run: cargo test --locked -p slates-server --test liveness --no-run
+      - name: The whole liveness suite pinned to one and two CPUs
+        run: |
+          set +e
+          R=../results.txt
+          echo "runner ${{ matrix.os }}, $(nproc) CPUs, $(date -u), commit $(git rev-parse --short HEAD)" > $R
+          for cpus in 0 0,1; do
+            for round in $(seq 1 10); do
+              echo "== cpus $cpus round $round" | tee -a $R
+              taskset -c $cpus cargo test --locked -q -p slates-server --test liveness -- --nocapture 2>&1 | grep -E -A3 'wedged shard:|largest|spinning shard:|panicked|test result|^    [a-z_]+$' | grep -v '^--$' | tee -a $R
+            done
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/clients-wedged-2-${{ matrix.os }}"
+          git config user.name "diag-clients"
+          git config user.email "diag-clients@users.noreply.github.com"
+          git stash -q || true
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-clients wedged-2 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
