@@ -310,52 +310,29 @@ fn mount_verb(
 }
 
 /// `unmount` on Windows (§4.6 "Windows"): the WinFsp volume at drive `path` is the daemon's own, so it is unmounted by
-/// detaching its attachment, found among the volumes' reported mounts; the daemon then removes the drive. Every volume
-/// is asked: one whose status is refused (a volume recovery could not rebuild answers `NotFound`) cannot report its
-/// mounts, so it is passed over and named on standard error by its refusal, and the drive is still released when
-/// another volume reports it. Only when no volume that answered reports the drive is the unmount refused, naming the
-/// volumes that did not answer. A channel or daemon failure ends the scan, since no later volume can be asked either.
+/// detaching its attachment, found among the volumes' reported mounts; the daemon then removes the drive.
 #[cfg(windows)]
 fn unmount_verb(instance: &str, path: &str) -> Result<(), Failure> {
   let mut client = connect(instance)?;
   let volumes = client.list().map_err(|e| failure_of(e, instance))?;
-  let mut found = None;
-  let mut unreported = Vec::new();
   for summary in volumes {
-    match client.status(summary.id) {
-      Ok(report) => {
-        if found.is_none() {
-          found = report
-            .mounts
-            .iter()
-            .find(|mount| mount.path.eq_ignore_ascii_case(path))
-            .map(|mount| mount.attachment);
-        }
-      }
-      Err(ClientError::Refused(refusal)) => unreported.push(format!(
-        "volume {} ({}) refused {refusal:?}",
-        summary.name,
-        volume_id_text(summary.id)
-      )),
-      Err(other) => return Err(failure_of(other, instance)),
+    let report = client
+      .status(summary.id)
+      .map_err(|e| failure_of(e, instance))?;
+    if let Some(mount) = report
+      .mounts
+      .iter()
+      .find(|mount| mount.path.eq_ignore_ascii_case(path))
+    {
+      client
+        .detach(mount.attachment)
+        .map_err(|e| failure_of(e, instance))?;
+      return Ok(());
     }
   }
-  for volume in &unreported {
-    slates_machine::log_line!("slates: {volume}: its mounts are unknown");
-  }
-  match found {
-    Some(attachment) => client
-      .detach(attachment)
-      .map_err(|e| failure_of(e, instance)),
-    None if unreported.is_empty() => Err(Failure::Refused(format!(
-      "no slates volume is mounted at {path}"
-    ))),
-    None => Err(Failure::Refused(format!(
-      "no slates volume that reported its mounts is mounted at {path}; {} did not report: {}",
-      unreported.len(),
-      unreported.join("; ")
-    ))),
-  }
+  Err(Failure::Refused(format!(
+    "no slates volume is mounted at {path}"
+  )))
 }
 
 /// `unmount` off Windows is the OS's own (`umount`, `fusermount3 -u`): it needs no daemon, so a stale mount is
