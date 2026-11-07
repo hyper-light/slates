@@ -257,3 +257,55 @@ shard 0 span consensus.step: absent/unknown (never; producer configuration group
 shard 1 span consensus.step: absent/unknown (never; producer configuration group expected here)
 thread 'a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates' (30137) panicked at crates/cli/tests/live_fleet.rs:1924:3:
 the bootstrap node's live writes became durable and both candidates hold them: Some(("1", "1", "false")) [Some(("1", "none", "false")), Some(("1", "none", "false"))] [("live-bootstrap-a-14037", {"appended": 2, "awaited": 1, "durable": 2, "held_back.placement": 3, "holders_changed": 1, "no_session": 
+=== bootstrap on 6 exit 101 load { 32.90 26.43 13.56 }
+live bootstrap: written=false caught_up=true shipping=Some(("0", "0", "false")) held=[Some(("0", "none", "false")), Some(("0", "none", "false"))] [("live-bootstrap-a-14722", {"appended": 1, "awaited": 1, "durable": 1, "held_back.placement": 2, "no_session": 3, "whole": 1}), ("live-bootstrap-b-14722"
+live bootstrap --- live-bootstrap-a-14722
+fleet_host: 5268176222564812133
+fleet_host_epoch: 1
+fleet_members: 5268176222564812133 8105776652410723144 13657266415430071080
+fleet_configuration_version: 4
+fleet_configuration_members: 3
+fleet_council_leads: true
+fleet_council_voters: 3
+fleet_council_joint: false
+fleet_root_joint: false
+fleet_session 8105776652410723144: lent=false cwnd=18360 srtt_ns=495606 pto_ns=1495606 spurious_losses=0 persistent_collapses=0 consumed=42203 mtu=9209
+fleet_session 13657266415430071080: lent=false cwnd=18360 srtt_ns=443968 pto_ns=1443968 spurious_losses=0 persistent_collapses=0 consumed=42601 mtu=9209
+shard 0 refused fleet.learner.fetch_paced: 14
+shard 0 refused fleet.learner.fetches: 4
+shard 0 span consensus.step: absent/unknown (never; producer configuration group expected here)
+shard 1 span consensus.step: absent/unknown (never; producer configuration group expected here)
+live bootstrap --- live-bootstrap-b-14722
+fleet_host: 8105776652410723144
+fleet_host_epoch: 1
+fleet_members: 5268176222564812133 8105776652410723144 13657266415430071080
+fleet_configuration_version: 4
+fleet_configuration_members: 3
+fleet_council_leads: false
+fleet_council_voters: 3
+fleet_council_joint: false
+fleet_root_joint: false
+fleet_session 5268176222564812133: lent=false cwnd=18360 srtt_ns=469165 pto_ns=1502521 spurious_losses=0 persistent_collapses=0 consumed=5055 mtu=9209
+fleet_session 13657266415430071080: lent=false cwnd=18360 srtt_ns=486554 pto_ns=1486554 spurious_losses=0 persistent_collapses=0 consumed=4595 mtu=9209
+shard 0 refused fleet.learner.fetch_paced: 22
+shard 0 refused fleet.learner.fetches: 8
+shard 0 span consensus.step: absent/unknown (never; producer configuration group expected here)
+shard 1 span consensus.step: absent/unknown (never; producer configuration group expected here)
+live bootstrap --- live-bootstrap-c-14722
+fleet_host: 13657266415430071080
+fleet_host_epoch: 1
+fleet_members: 5268176222564812133 8105776652410723144 13657266415430071080
+fleet_configuration_version: 4
+fleet_configuration_members: 3
+fleet_council_leads: false
+fleet_council_voters: 3
+fleet_council_joint: false
+fleet_root_joint: false
+fleet_session 5268176222564812133: lent=false cwnd=18360 srtt_ns=396856 pto_ns=1396856 spurious_losses=0 persistent_collapses=0 consumed=4611 mtu=9209
+fleet_session 8105776652410723144: lent=false cwnd=18360 srtt_ns=425010 pto_ns=1425010 spurious_losses=0 persistent_collapses=0 consumed=3464 mtu=9209
+shard 0 refused fleet.learner.fetch_paced: 8
+shard 0 refused fleet.learner.fetches: 4
+shard 0 span consensus.step: absent/unknown (never; producer configuration group expected here)
+shard 1 span consensus.step: absent/unknown (never; producer configuration group expected here)
+thread 'a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates' (31985) panicked at crates/cli/tests/live_fleet.rs:1924:3:
+the bootstrap node's live writes became durable and both candidates hold them: Some(("0", "0", "false")) [Some(("0", "none", "false")), Some(("0", "none", "false"))] [("live-bootstrap-a-14722", {"appended": 1, "awaited": 1, "durable": 1, "held_back.placement": 2, "no_session": 3, "whole": 1}), ("liv
