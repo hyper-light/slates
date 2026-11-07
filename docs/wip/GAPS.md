@@ -21,8 +21,9 @@
 > `2f + 1` and `1..2f − 1` sets and taking owners over inside each transition window, passes. The interim count of
 > 6dd512b4 ("never durable at `n <= f`") also had a liveness hole the floor closes: a three-node fleet's successor ships
 > to one holder (`n = f = 1`), so none of its writes became durable, and `a_superseded_owner_resumed_after_its_takeover_is_fenced`
-> hung 3 of 3 on a tree carrying it (live-durability's bisect, CI diag-live-durability-33); with `W = f = 1` there it passes
-> in 3.6 to 4.5 s (raft-chaos, CI diag-raft-chaos-sup-red-35 and -green-36).
+> timed out 3 of 3 on raft-chaos-1 at 43bb3a27, which carries it (live-durability's bisect, CI diag-live-durability-33);
+> on trees carrying the floor (d263229f) it passes: 2 of 2 each in CI diag-raft-chaos-sup-red-35 and -green-36, and 3 of 3
+> in diag-raft-chaos-final-37-superseded (live-durability's straggler-3, 8b0f0341).
 >
 > **Open (live-fixes): an ex-holder keeps its live copy until the volume's tombstone.** A holder the joint transition
 > drops keeps its copy at an old fence (memory, not safety: no phase one counts it, and with `n − f` no owner commits
