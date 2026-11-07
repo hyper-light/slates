@@ -1,0 +1,26 @@
+kind live: unshaped: installed and rolled out in 7.8 s
+kind live: unshaped: live-write: count=1000 acknowledged=1000 refused=0 p50_us=586 p99_us=1438 p999_us=8053 max_us=38633 first_refusal=""
+kind live: wan: installed and rolled out in 8.9 s
+kind live: wan: live-write: count=300 acknowledged=300 refused=0 p50_us=155347 p99_us=424978 p999_us=25917709 max_us=25917709 first_refusal=""
+kind live: wan-loss: installed and rolled out in 8.9 s
+kind live: wan-loss: live-write: count=300 acknowledged=300 refused=0 p50_us=154528 p99_us=417352 p999_us=468881 max_us=468881 first_refusal=""
+kind live: slates-0:
+  fleet_session 571781033440708266: lent=true cwnd=7154 srtt_ns=77845171 pto_ns=101427931 spurious_losses=2 persistent_collapses=0 consumed=32392 mtu=1466
+  fleet_session 4872545147408854864: lent=false cwnd=4110 srtt_ns=228087112 pto_ns=564345868 spurious_losses=0 persistent_collapses=0 consumed=56155 mtu=1466
+  shard 0 refused fleet.live.held: 355
+  shard 0 live held 73af3dfa5e033f68000000000000000b head=357 durable=none owed=false epoch=1 identity=c8c9bb5a2cae77df02fd223a3e7f337597e4b3f2f4b87b163daeea3b82ae7a37 fence=1 holders=none moving_to=none recorded=none
+kind live: slates-1:
+  fleet_session 571781033440708266: lent=true cwnd=6955 srtt_ns=78853272 pto_ns=122114424 spurious_losses=2 persistent_collapses=0 consumed=5187 mtu=1466
+  fleet_session 2655257609045905345: lent=true cwnd=11654 srtt_ns=317847923 pto_ns=1409344959 spurious_losses=0 persistent_collapses=0 consumed=2157 mtu=1466
+  shard 0 refused fleet.live.held: 358
+  shard 0 refused fleet.live.takeover_waits_quorum: 425
+  shard 0 refused fleet.takeover.adopted: 2
+  shard 0 live held 73af3dfa5e033f68000000000000000b head=357 durable=none owed=false epoch=1 identity=c8c9bb5a2cae77df02fd223a3e7f337597e4b3f2f4b87b163daeea3b82ae7a37 fence=2 holders=none moving_to=none recorded=none
+kind live: wan-loss: kind live: no survivor took the volume over within 120s
+kind live: ceiling: installed and rolled out in 8.9 s
+kind live: ceiling: live-write: count=50 acknowledged=50 refused=0 p50_us=1547397 p99_us=5391395 p999_us=5391395 max_us=5391395 first_refusal=""
+kind live:   unshaped: count=1000 acknowledged=1000 refused=0 p50_us=586 p99_us=1438 p999_us=8053 max_us=38633 first_refusal=""; converged at head Some(1001) epoch Some(1); 1 heads seen, one identity each; owner read back whole=1000 missing=0 torn=0; taken over by slates-0 after 3.9 s, epoch 2, read back whole=1000 missing=0 torn=0
+kind live:   wan: count=300 acknowledged=300 refused=0 p50_us=155347 p99_us=424978 p999_us=25917709 max_us=25917709 first_refusal=""; converged at head Some(359) epoch Some(1); 1 heads seen, one identity each; owner read back whole=300 missing=0 torn=0; taken over by slates-1 after 18.9 s, epoch 2, read back whole=300 missing=0 torn=0
+kind live:   wan-loss: FAILED: kind live: no survivor took the volume over within 120s
+kind live:   ceiling: count=50 acknowledged=50 refused=0 p50_us=1547397 p99_us=5391395 p999_us=5391395 max_us=5391395 first_refusal=""; converged at head Some(98) epoch Some(1); 1 heads seen, one identity each; owner read back whole=50 missing=0 torn=0; taken over by slates-0 after 54.5 s, epoch 2, read back whole=50 missing=0 torn=0
+exit 1
