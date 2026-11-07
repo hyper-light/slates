@@ -172,10 +172,108 @@ fn a_refused_receive_does_not_end_the_demultiplexer() {
     .await;
     served.unwrap();
     assert_eq!(reply.unwrap(), b"after the refusal");
+    let counters = demux.with(Demux::counters).unwrap();
+    assert_eq!(
+      counters.receive_refused_other, 1,
+      "the refused receive was counted by its kind, once: {counters:?}"
+    );
   });
   let ended = ended.try_recv().ok();
   assert!(
     completed && ended.is_none(),
     "the peer was served after the refused receive ({completed}) and the loop still runs (it ended: {ended:?})"
   );
+}
+
+/// AC (§4.10a): do start a demultiplexer and queue a refusal that names its socket gone (the runtime's driver lost),
+/// then let its loop read. Expect the loop to end with that refusal, as the one kind a receive loop ends on, and no
+/// refusal counted as one it read past.
+#[test]
+fn a_receive_that_finds_the_socket_gone_ends_the_demultiplexer() {
+  let (ended_tx, ended) = std::sync::mpsc::sync_channel(1);
+  let completed = run_history(move || async move {
+    let server = identities(1).pop().unwrap();
+    let kept = slates_rt::registry::with_current(|context| context.keep(server))
+      .unwrap()
+      .unwrap();
+    let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let demux = Demux::start(socket, kept, Vec::new(), shape(), PEERS).unwrap();
+    slates_rt::sim::sim_udp_refuse_next_recv(port, slates_rt::error::RtError::DriverLost);
+    let outcome = demux.run().await;
+    let counters = demux.with(Demux::counters).unwrap();
+    let _ = ended_tx.send((format!("{outcome:?}"), counters));
+  });
+  let (outcome, counters) = ended.try_recv().expect("the loop ended");
+  assert!(completed, "the history ran to the loop's end");
+  assert_eq!(outcome, "Err(Io(DriverLost))");
+  assert_eq!(
+    counters.receive_refused_earlier_send
+      + counters.receive_refused_resources
+      + counters.receive_refused_other,
+    0,
+    "{counters:?}"
+  );
+}
+
+/// AC (§4.10a): do queue one refused receive on a dialing client's own socket, then establish its session with a
+/// demultiplexer and exchange a request. Expect the handshake to complete and the request answered, with the refusal
+/// counted once on the client (`Endpoint::receive_refusals`). Before 2026-11-07 the client's receive returned the
+/// refusal and its handshake failed.
+#[test]
+fn a_refused_receive_does_not_end_a_clients_handshake() {
+  let completed = run_history(|| async {
+    let server = identities(1).pop().unwrap();
+    let client = identities(1).pop().unwrap();
+    let certificate = server.certificate();
+    let kept = slates_rt::registry::with_current(|context| context.keep(server))
+      .unwrap()
+      .unwrap();
+    let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let demux = Demux::start(socket, kept, vec![client.certificate()], shape(), PEERS).unwrap();
+    let task = futures::spawn(async move {
+      let _ = demux.run().await;
+    })
+    .unwrap();
+    futures::detach(task).unwrap();
+    let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+    slates_rt::sim::sim_udp_refuse_next_recv(
+      socket.local_addr().unwrap().port(),
+      slates_rt::error::RtError::DriverRefused {
+        call: "recvfrom",
+        code: None,
+      },
+    );
+    let mut dialer = Endpoint::client(
+      socket,
+      demux.with(Demux::local_addr).unwrap().unwrap(),
+      &client,
+      &certificate,
+      NAME,
+      shape(),
+    )
+    .unwrap();
+    let (dialed, (mut server, accepted)) = together(dialer.establish(), async {
+      let mut server = demux.accept().await.unwrap();
+      let accepted = server.establish().await;
+      (server, accepted)
+    })
+    .await;
+    dialed.expect("the client's handshake completes after the refused receive");
+    accepted.unwrap();
+    let (reply, served) = together(
+      dialer.request(1, Priority::Control, b"after the client's refusal"),
+      server.serve_once(|_, request| request.to_vec()),
+    )
+    .await;
+    served.unwrap();
+    assert_eq!(reply.unwrap(), b"after the client's refusal");
+    assert_eq!(
+      dialer.receive_refusals().other,
+      1,
+      "{:?}",
+      dialer.receive_refusals()
+    );
+  });
+  assert!(completed, "the history completed");
 }

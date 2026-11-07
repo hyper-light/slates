@@ -28,6 +28,7 @@
 > resident and uncounted. Now a walk ends at what the regions' sets record, and the purge's "nothing to do" asks the
 > sets. Main failed 6 of 10 Windows runs of the test; the fix passed 10 of 10 (`diag-liveness-4`, `-6`). The bug record
 > of 2026-11-07 has the log.
+
 > **A Windows UDP socket died on an earlier send's ICMP error (found 2026-11-06, fixed 2026-11-06).** With Windows'
 > default `SIO_UDP_CONNRESET`, a port-unreachable for a datagram sent earlier failed the socket's next `recvfrom` with
 > WSAECONNRESET. A fleet node's demultiplexer ends on a receive refusal, so its socket stopped receiving, and
@@ -141,6 +142,13 @@
 > `rebase_conflicts` of exactly 100 at 100 clients, in both forms, was coincidence: a third run counted 99. Every named
 > window is one of the client's own hot slots, rewritten by another client between its resolution read and its
 > rebase, so the head really moved (the harness names the first five a worker meets).
+
+> **One refused receive ended a fleet node's transport (found 2026-11-06 as the UDP reset's sibling, fixed
+> 2026-11-07).** `Demux::run` read every refused receive as the socket's end, so an earlier send's report stopped a
+> node's serve socket for the daemon's life. Now every receive loop in `rt`, `transport` and `server` ends only on the
+> socket gone (`RtError::receive_refusal`), and counts the rest by kind in status. Tests on the simulated fabric hold
+> the demultiplexer, an endpoint's handshake and a DNS lookup each failing before its change; see the bug record of
+> 2026-11-07. Owed: the membership plane's change has no test of its own.
 
 > **The anchor kills live daemons on a busy machine (found 2026-11-06, audit step 7; fixed by A-228, Windows CI owed).** Under the
 > A/B bar's load, two spinners a logical CPU (8 on CI's 4-CPU Windows runners), the anchor killed daemons that were
