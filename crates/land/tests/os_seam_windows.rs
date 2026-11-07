@@ -1,9 +1,10 @@
 //! The Windows writer's own promises, each verb driven directly over real NTFS (§4.15 step 6, AUD-29-04, A-185): a name
 //! that exists is never replaced or written through, and a junction is moved or removed as itself, never as what it
-//! names. A landing's oracles did not hold these: with the rename set to replace, the opens set to follow junctions, or
-//! a temporary's create set to overwrite, `os`, `os_escape` and `os_removal` all still passed (jupiter, 2026-11-06),
-//! since the engine picks fresh names and looks before it moves. Only a verb called on the name that exists can tell.
-//! The directories are real ones in the build output (`CARGO_TARGET_TMPDIR`; A-50), removed at the end.
+//! names. A landing's oracles did not hold all of these: with an entry's open set to follow junctions, or a temporary's
+//! create set to overwrite, `os`, `os_escape` and `os_removal` all still passed (jupiter, 2026-11-06), since the engine
+//! picks fresh names and walks around links; a rename set to replace failed `os_removal` alone. Only a verb called on the
+//! name that exists tells them apart. The directories are real ones in the build output (`CARGO_TARGET_TMPDIR`; A-50),
+//! removed at the end.
 
 #![cfg(windows)]
 // Test harness code: an unwrap here is a failed test, and the outsider's edits are `std::fs`'s.

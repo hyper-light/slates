@@ -7126,7 +7126,8 @@ stays in the overlay.
 > with POSIX semantics, removals by `FileDispositionInfoEx` with POSIX semantics, a batch's barrier as each file's
 > `FlushFileBuffers` on ⌈√n⌉ threads, a directory's sync through the directory opened again to write. NTFS has no
 > atomic exchange, so the engine moves the old entry aside, as on the other unixes. The target is walked from its
-> drive's root one component at a time, refusing a link or a junction, and must be owned by this user. Not built: a
+> drive's root one component at a time, refusing a link or a junction, and must be owned by this token's user or its
+> default owner (A-185). Not built: a
 > symbolic link, which Windows makes only with a privilege slates never asks for (R10), so such an entry fails,
 > typed. Proven on jupiter (Windows 10.0.26200): the land suite whole, among it the real kill test (T-1.15) on NTFS,
 > the escape oracle with junction and hard-link swaps at every seam call, and the removal oracle with real outsider
@@ -15779,8 +15780,13 @@ backslashes), `crates/server/src/landing.rs` (no Unix gate; the delegation recal
   first. A symbolic link is refused `EPERM`: Windows makes one only through a path (`CreateSymbolicLinkW`) or with a
   privilege, and slates writes through handles and asks for no privilege (R10).
 - **Containment.** The target is walked from its drive's root one component at a time with `FILE_OPEN_REPARSE_POINT`,
-  refusing `..`, a link, a junction or a mount point (`slates_base::walk_dir`), and must be owned by this process's
-  user, compared by security identifier.
+  refusing `..`, a link, a junction or a mount point (`slates_base::walk_dir`), and must be this process's user's: its
+  owner, by security identifier, is the token's user or the token's default owner, the owner this process's own
+  creations get, which is what Unix's `st_uid == geteuid` asks. They differ on an elevated token, whose default owner
+  is `BUILTIN\Administrators` (both CI runners and an elevated shell on jupiter, 2026-11-06). Git Bash sets its token's
+  default owner to the user, so a Windows test run from it does not see this: every landing suite passed there and
+  failed `TargetNotOwned` from PowerShell. An unelevated token's default owner is its user, so it refuses what the
+  administrators own.
 - **Two Windows facts the engine met** (each measured on jupiter, then fixed):
   - The base host's fingerprint carried the raw file attributes as the mode, so the engine read a witnessed
     directory as a file (`Conflict(TypeChanged)` on the worked example's tree removal). The mode is now POSIX-form:
@@ -15789,8 +15795,9 @@ backslashes), `crates/server/src/landing.rs` (no Unix gate; the delegation recal
   - NTFS gives a file renamed onto a name another file left moments before that file's creation time (tunneling),
     and the engine's fallback does exactly that, so every replacement was undone `TargetInUse`, the birth time the
     only other difference. A moved object is now judged on the device, the file index, the size, the mtime and the
-    mode, the birth time set aside with the ctime and owner (`same_object_after_a_move`, one check where three
-    sites had their own).
+    mode, the ctime and owner set aside as before, one check where three sites had their own
+    (`same_object_after_a_move`). The birth time is set aside on Windows alone (`BIRTH_SURVIVES_A_MOVE`): NTFS's file
+    index carries a sequence number, while ext4 reuses a freed inode number (A-151), so Unix still needs it.
 - **What a landing means for a DAX map** (A-180's last check, decided with Ada). A landing never writes a file in
   place (R1's old-or-new): it places a new file at the name. So a guest holding the old file open keeps its bytes,
   as POSIX does (measured: its `READ` returned them), and a node with no descriptor held answers `ESTALE` (A-151);
@@ -15802,6 +15809,10 @@ backslashes), `crates/server/src/landing.rs` (no Unix gate; the delegation recal
   land suite whole. Red-checked on jupiter: a rename that may replace failed the removal oracle; a walk that follows a
   junction failed the escape test (`None` where `EscapesTarget` was asserted); a placement made a no-op failed the
   fresh-map test.
+- **Ported onto main and proven on both Windows runners, 2026-11-06** (`docs/bugs/2026-11-06-an-elevated-token-owned-nothing-it-made.md`):
+  `crates/land/tests/os_seam_windows.rs` calls each verb directly on a name that exists and on a real junction, since
+  with an entry's open following junctions, or a temporary's create overwriting, the landing suites still passed.
+  arm64 Windows runs what x86_64 runs. Not held by any test: a flush reaching the device, which would take a power cut.
 
 ### A-181 — `slates shards` on Windows starts its command holding the stream end as a named handle, and waits for it (accepted 2026-10-26)
 Applied in the same change to: §4.6 (the Shards form's Windows status), GAPS, `crates/ipc` (`win_spawn.rs`, new: the
