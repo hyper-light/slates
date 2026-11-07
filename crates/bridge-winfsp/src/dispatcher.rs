@@ -42,6 +42,9 @@ thread_local! {
   static TERMINAL_REFUSAL: Cell<i32> = const { Cell::new(0) };
   /// Set while recovery runs a dead daemon's captured Cleanup or Close again, so the shard can find its effect done.
   static REPLAYING: Cell<bool> = const { Cell::new(false) };
+  /// DIAG ONLY: when this worker's last transaction returned, and the profile slot of the request it last served.
+  static LAST_RETURN: Cell<u64> = const { Cell::new(0) };
+  static LAST_KIND: Cell<usize> = const { Cell::new(crate::phases::RECEIVER) };
 }
 
 /// Whether this worker is replaying a dead daemon's captured Cleanup or Close (`crate::host::Request`).
@@ -256,6 +259,34 @@ fn transaction(
   output: &mut [u8],
   intents: &mut crate::purge_intents::Intents,
 ) -> Result<usize, WinFspError> {
+  let called = crate::phases::now();
+  let last = LAST_RETURN.replace(0);
+  if last != 0 {
+    crate::phases::record(LAST_KIND.get(), crate::phases::SERVICE, last, called);
+  }
+  let done = transaction_untimed(control, code, input, output, intents);
+  LAST_RETURN.set(crate::phases::now());
+  if output.is_empty() {
+    // A send alone: the service it ends continues past it, for the same request.
+    crate::phases::record(
+      LAST_KIND.get(),
+      crate::phases::SEND_ALONE,
+      called,
+      crate::phases::now(),
+    );
+  } else {
+    LAST_KIND.set(crate::phases::RECEIVER);
+  }
+  done
+}
+
+fn transaction_untimed(
+  control: HANDLE,
+  code: u32,
+  input: &[u8],
+  output: &mut [u8],
+  intents: &mut crate::purge_intents::Intents,
+) -> Result<usize, WinFspError> {
   let mut overlapped = OVERLAPPED {
     hEvent: intents.completion_event(),
     ..OVERLAPPED::default()
@@ -381,6 +412,7 @@ fn operation(
   };
   PRIVATE_PURGE.set(purge);
   CURRENT_HINT.set(request.hint());
+  let called = crate::phases::now();
   // SAFETY: callback is the DLL's initialized operation for this checked kind; both packet addresses have native
   // eight-byte alignment and protocol maximum capacity, and file_system stays live throughout the synchronous call.
   let callback_status = unsafe {
@@ -390,6 +422,12 @@ fn operation(
       packet.0.as_mut_ptr().cast(),
     )
   };
+  crate::phases::record(
+    crate::phases::kind_slot(request.kind()),
+    crate::phases::CALLBACK,
+    called,
+    crate::phases::now(),
+  );
   let terminal_status = TERMINAL_REFUSAL.replace(0);
   let status = if callback_status == 0 {
     terminal_status
@@ -462,7 +500,14 @@ fn settle(
   // SAFETY: same owner/worker lifetime as operation; volume control remains owned by the DLL object.
   let control = unsafe { (*file_system).volume_handle };
   let mut settled = Settled::default();
-  while let Some(request) = batch.next_request().map_err(WinFspError::Capture)? {
+  loop {
+    let decoding = crate::phases::now();
+    let Some(request) = batch.next_request().map_err(WinFspError::Capture)? else {
+      break;
+    };
+    let kind = crate::phases::kind_slot(request.kind());
+    LAST_KIND.set(kind);
+    crate::phases::record(kind, crate::phases::DECODE, decoding, crate::phases::now());
     if recovered {
       let saved = batch.response_for(&request).map_err(WinFspError::Capture)?;
       // Only Create's saved result is needed to preserve a possibly issued context. Read completion can reference
@@ -499,7 +544,10 @@ fn settle(
         )?;
       }
     } else {
+      let operating = crate::phases::now();
       let length = operation(file_system, &request, owned)?;
+      let operated = crate::phases::now();
+      crate::phases::record(kind, crate::phases::OPERATION, operating, operated);
       let response = owned
         .response
         .0
@@ -508,6 +556,7 @@ fn settle(
       batch
         .record_response(&request, response)
         .map_err(WinFspError::Capture)?;
+      crate::phases::record(kind, crate::phases::RECORD, operated, crate::phases::now());
       if let Some((from, to)) = request
         .successful_rename(response)
         .map_err(WinFspError::Capture)?
@@ -524,12 +573,26 @@ fn settle(
       if let Some((_, context)) =
         inflight::opened_context(response).map_err(WinFspError::Capture)?
       {
+        let confirming = crate::phases::now();
         crate::host::confirm_open(confirmations, wake, context)?;
+        crate::phases::record(
+          kind,
+          crate::phases::CONFIRM_FINISH,
+          confirming,
+          crate::phases::now(),
+        );
       }
     }
+    let acknowledging = crate::phases::now();
     batch
       .acknowledge(request.hint())
       .map_err(WinFspError::Capture)?;
+    crate::phases::record(
+      kind,
+      crate::phases::ACKNOWLEDGE,
+      acknowledging,
+      crate::phases::now(),
+    );
     settled.answered = settled.answered.saturating_add(1);
   }
   Ok(settled)
@@ -622,7 +685,14 @@ fn receive_loop(
     if is_stopped(&stopped) {
       return Ok(());
     }
+    let beginning = crate::phases::now();
     let mut receiving = view.capture()?.begin(used).map_err(WinFspError::Capture)?;
+    crate::phases::record(
+      crate::phases::RECEIVER,
+      crate::phases::BEGIN,
+      beginning,
+      crate::phases::now(),
+    );
     let reported = transaction(
       control,
       TRANSACT_BATCH,
@@ -635,9 +705,16 @@ fn receive_loop(
       return Ok(());
     }
     used = Some(inflight::capture::filled(reported).map_err(WinFspError::Capture)?);
+    let capturing = crate::phases::now();
     let mut batch = receiving
       .received(reported, &mut scratch)
       .map_err(WinFspError::Capture)?;
+    crate::phases::record(
+      crate::phases::RECEIVER,
+      crate::phases::CAPTURE,
+      capturing,
+      crate::phases::now(),
+    );
     settle(
       file_system,
       &mut batch,

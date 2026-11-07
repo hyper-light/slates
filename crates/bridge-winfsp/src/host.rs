@@ -372,12 +372,92 @@ pub struct Request {
   /// Whether recovery is replaying this request from a dead daemon's journal (`crate::dispatcher`), so a Close the
   /// dead daemon already applied may be found done.
   replayed: bool,
+  /// DIAG ONLY: when it was posted, and its operation's profile slot.
+  posted: u64,
+  slot: usize,
+}
+
+/// DIAG ONLY: each operation's profile name, from `crate::phases::OP_BASE`.
+const OP_NAMES: [&str; 22] = [
+  "RenameName",
+  "Confirm",
+  "VolumeInfo",
+  "Resolve",
+  "Open",
+  "PurgeResolve",
+  "PurgeOpen",
+  "Create",
+  "Read",
+  "Write",
+  "Info",
+  "ReadDir",
+  "SetSize",
+  "Truncate",
+  "Rename",
+  "SetAllocation",
+  "SetTimes",
+  "CanDelete",
+  "Flush",
+  "FlushVolume",
+  "Cleanup",
+  "Release",
+];
+
+/// DIAG ONLY: an operation's profile slot.
+fn op_slot<T>(op: &Op<T>) -> usize {
+  let index = match op {
+    Op::RenameName { .. } => 0,
+    Op::Confirm { .. } => 1,
+    Op::VolumeInfo { .. } => 2,
+    Op::Resolve { .. } => 3,
+    Op::Open { .. } => 4,
+    Op::PurgeResolve { .. } => 5,
+    Op::PurgeOpen { .. } => 6,
+    Op::Create { .. } => 7,
+    Op::Read { .. } => 8,
+    Op::Write { .. } => 9,
+    Op::Info { .. } => 10,
+    Op::ReadDir { .. } => 11,
+    Op::SetSize { .. } => 12,
+    Op::Truncate { .. } => 13,
+    Op::Rename { .. } => 14,
+    Op::SetAllocation { .. } => 15,
+    Op::SetTimes { .. } => 16,
+    Op::CanDelete { .. } => 17,
+    Op::Flush { .. } => 18,
+    Op::FlushVolume { .. } => 19,
+    Op::Cleanup { .. } => 20,
+    Op::Release { .. } => 21,
+  };
+  crate::phases::OP_BASE + index
+}
+
+/// DIAG ONLY: the profile's dump at a mount's end.
+fn dump_phases() {
+  crate::phases::dump(&OP_NAMES);
 }
 
 impl Request {
   /// Serves on the owner shard. Kernel contexts are resolved here, never on a foreign dispatcher thread. Opens are
   /// recorded before their contexts are returned; only a successful close retires a token.
   pub fn serve(
+    self,
+    bridge: &mut dyn Bridge,
+    cx: &OpContext,
+    names: &mut OpenNames,
+    ledger: &mut Ledger<SparseObject>,
+  ) -> Served {
+    let (slot, posted) = (self.slot, self.posted);
+    let entered = crate::phases::now();
+    if posted != 0 {
+      crate::phases::record(slot, crate::phases::HOP_IN, posted, entered);
+    }
+    let served = self.serve_untimed(bridge, cx, names, ledger);
+    crate::phases::record(slot, crate::phases::SERVE, entered, crate::phases::now());
+    served
+  }
+
+  fn serve_untimed(
     self,
     bridge: &mut dyn Bridge,
     cx: &OpContext,
@@ -708,6 +788,7 @@ impl Served {
 
   /// Sends the reply to the waiting dispatcher thread. `false` when that thread is gone (the mount is being torn down).
   pub fn send(self) -> bool {
+    crate::phases::LAST_SENT.store(crate::phases::now(), std::sync::atomic::Ordering::Relaxed);
     self.sender.send(self.reply).is_ok()
   }
 }
@@ -1139,6 +1220,8 @@ impl Handler {
 }
 
 fn call_on(requests: &SyncSender<Request>, wake: &Waker, op: Op<u64>) -> Reply {
+  let slot = op_slot(&op);
+  let start = crate::phases::now();
   let (reply, answer) = sync_channel(1);
   if requests
     .send(Request {
@@ -1146,13 +1229,23 @@ fn call_on(requests: &SyncSender<Request>, wake: &Waker, op: Op<u64>) -> Reply {
       reply,
       hint: crate::dispatcher::current_hint(),
       replayed: crate::dispatcher::replaying(),
+      posted: crate::phases::now(),
+      slot,
     })
     .is_err()
   {
     return Reply::Err(crate::status_unsuccessful());
   }
   wake.wake_by_ref();
-  crate::reply::await_reply(&answer).unwrap_or(Reply::Err(crate::status_unsuccessful()))
+  let reply =
+    crate::reply::await_reply(&answer).unwrap_or(Reply::Err(crate::status_unsuccessful()));
+  let end = crate::phases::now();
+  crate::phases::record(slot, crate::phases::ROUND, start, end);
+  let sent = crate::phases::LAST_SENT.load(std::sync::atomic::Ordering::Relaxed);
+  if sent >= start {
+    crate::phases::record(slot, crate::phases::TO_ANSWER, sent, end);
+  }
+  reply
 }
 
 pub(crate) fn confirm_open(
@@ -1261,6 +1354,7 @@ unsafe fn wide_to_string(wide: Pwstr) -> String {
 const MAX_WIDE_UNITS: usize = 32_767;
 
 extern "C" fn get_volume_info(fs: *mut FileSystem, out: *mut VolumeInfo) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(0);
   // SAFETY: WinFsp passes our live file system and a writable VolumeInfo.
   let handler = unsafe { handler(fs) };
   match handler.call(Op::VolumeInfo) {
@@ -1285,6 +1379,7 @@ extern "C" fn get_security_by_name(
   security_descriptor: PSecurityDescriptor,
   p_sd_size: *mut usize,
 ) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(1);
   // SAFETY: our file system; `file_name` a NUL-terminated path.
   let handler = unsafe { handler(fs) };
   // SAFETY: `file_name` is a NUL-terminated UTF-16 path WinFsp owns for this call.
@@ -1380,6 +1475,7 @@ extern "C" fn create(
   p_context: *mut Pvoid,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(2);
   // SAFETY: our file system; `file_name` a path.
   let handler = unsafe { handler(fs) };
   // SAFETY: `file_name` is a NUL-terminated UTF-16 path WinFsp owns for this call.
@@ -1400,6 +1496,7 @@ extern "C" fn open_trampoline(
   p_context: *mut Pvoid,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(3);
   // SAFETY: our file system; `file_name` a path.
   let handler = unsafe { handler(fs) };
   // SAFETY: `file_name` is a NUL-terminated UTF-16 path WinFsp owns for this call.
@@ -1424,6 +1521,7 @@ extern "C" fn overwrite(
   _allocation_size: u64,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(4);
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   let object = context_key(context);
@@ -1439,6 +1537,7 @@ extern "C" fn overwrite(
 }
 
 extern "C" fn cleanup(fs: *mut FileSystem, context: Pvoid, file_name: Pwstr, flags: u32) {
+  let _timer = crate::phases::Timer::start(5);
   if flags & CLEANUP_CHANGED == 0 {
     return;
   }
@@ -1460,6 +1559,7 @@ extern "C" fn cleanup(fs: *mut FileSystem, context: Pvoid, file_name: Pwstr, fla
 }
 
 extern "C" fn close(fs: *mut FileSystem, context: Pvoid) {
+  let _timer = crate::phases::Timer::start(6);
   // SAFETY: the file system remains live for this callback; the context is only an integer token.
   let handler = unsafe { handler(fs) };
   if context.is_null() {
@@ -1488,6 +1588,7 @@ extern "C" fn read(
   length: u32,
   p_bytes: *mut u32,
 ) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(7);
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   let object = context_key(context);
@@ -1523,6 +1624,7 @@ extern "C" fn write(
   p_bytes: *mut u32,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(8);
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   let object = context_key(context);
@@ -1552,6 +1654,7 @@ extern "C" fn write(
 }
 
 extern "C" fn flush(fs: *mut FileSystem, context: Pvoid, p_info: *mut FileInfo) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(9);
   // SAFETY: our file system, and a live open-file context when it is not null.
   let handler = unsafe { handler(fs) };
   // A volume flush passes a null context: the shard publishes, as every handle's flush makes it, and answers once that
@@ -1581,6 +1684,7 @@ extern "C" fn get_file_info(
   context: Pvoid,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(10);
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   let object = context_key(context);
@@ -1605,6 +1709,7 @@ extern "C" fn set_basic_info(
   change_time: u64,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(11);
   // The access, write and change times are applied (A-209); the attribute bits and the creation time are not kept by
   // the volume (A-209's stated differences), and the object's live info is returned so the caller sees what it holds.
   // SAFETY: our file system and a live open-file context.
@@ -1633,6 +1738,7 @@ extern "C" fn set_file_size(
   set_allocation_size: Boolean,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(12);
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   let object = context_key(context);
@@ -1655,6 +1761,7 @@ extern "C" fn set_file_size(
 }
 
 extern "C" fn can_delete(fs: *mut FileSystem, context: Pvoid, _file_name: Pwstr) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(13);
   // The delete itself happens in Cleanup, which answers the kernel nothing, so the refusal a program must see (a
   // directory with a child, `ERROR_DIR_NOT_EMPTY`) is decided here, before Windows marks the object for deletion. Only a
   // directory's emptiness needs the volume: a file's context says it is a file, so it is answered here, with no shard
@@ -1683,6 +1790,7 @@ extern "C" fn rename(
   new_file_name: Pwstr,
   replace: Boolean,
 ) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(14);
   // SAFETY: our file system; both names are paths.
   let handler = unsafe { handler(fs) };
   // SAFETY: `file_name` is a NUL-terminated UTF-16 path WinFsp owns for this call.
@@ -1709,6 +1817,7 @@ extern "C" fn read_directory(
   length: u32,
   p_bytes: *mut u32,
 ) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(15);
   // SAFETY: our file system.
   let handler = unsafe { handler(fs) };
   // SAFETY: `marker` is null or a NUL-terminated UTF-16 name WinFsp owns for this call.
@@ -2298,6 +2407,7 @@ fn run_mount(
     Ok(channel) => channel,
     Err(error) => {
       report(Outcome::Mounted(Err(error)));
+      dump_phases();
       report(Outcome::Stopped);
       return;
     }
@@ -2412,6 +2522,7 @@ fn run_mount(
         Err(error) => {
           report(Outcome::Failed(error));
           drop(mounted);
+          dump_phases();
           report(Outcome::Stopped);
           return;
         }
@@ -2420,6 +2531,7 @@ fn run_mount(
     }
     Err(error) => {
       report(Outcome::Mounted(Err(error)));
+      dump_phases();
       report(Outcome::Stopped);
       return;
     }
@@ -2450,6 +2562,7 @@ fn run_mount(
       },
     }
   }
+  dump_phases();
   drop(mounted);
   report(Outcome::Stopped);
 }
