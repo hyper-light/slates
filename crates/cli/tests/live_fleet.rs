@@ -1390,8 +1390,8 @@ fn a_live_volumes_writes_ship_their_changes_not_the_volume() {
 /// A-200: a candidate that falls behind the owner's retained entries is installed, and the log stays a chain of changes.
 /// Do make stable NFS writes to a live volume from one sequential writer (so the credit never refuses a write), stop one
 /// candidate's process for the middle third of them, then resume it. Expect the paused candidate to catch up to the
-/// owner's head, at least one install sent (it fell behind the retained tail), and the log's first record still the only
-/// whole one. Found 2026-11-07 (CI, `diag-live-durability-14`): a laggard that already held the last whole record set
+/// owner's head, at least one install image made (it fell behind the retained tail), and the log's first record still
+/// the only whole one. Found 2026-11-07 (CI, `diag-live-durability-14`): a laggard that already held the last whole record set
 /// `owes_whole`, so the next write's record carried the whole volume (20–45 MB in the chaos flows) to every holder. The
 /// up-to-date candidate had to take it before any later write was durable: 100–600 ms a time, and 1.2–1.9 s writes.
 #[test]
@@ -1440,8 +1440,9 @@ fn a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_t
     caught_up,
     "the paused candidate caught up: {shipping:?} {held:?}"
   );
+  // The non-vacuity counter: an install image is made only for a holder behind the retained tail.
   assert!(
-    of("install_sent") >= 1,
+    of("install_image") >= 1,
     "the paused candidate fell behind the retained tail and was installed: {counters:?}"
   );
   assert_eq!(
