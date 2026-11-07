@@ -1,0 +1,20 @@
+tested e2882c6c83b0c6855a3735801829b78cc3cc348c variant after on aarch64, 4 cpus
+held exit 101 55s
+  held: error: missing documentation for a function
+  held: error: could not compile `slates-server` (lib) due to 1 previous error
+held-again exit 101 5s
+  held-again: error: missing documentation for a function
+  held-again: error: could not compile `slates-server` (lib) due to 1 previous error
+lane exit 101 4s
+  lane: error: missing documentation for a function
+  lane: error: could not compile `slates-server` (lib) due to 1 previous error
+fleet-forward exit 101 5s
+  fleet-forward: error: missing documentation for a function
+  fleet-forward: error: could not compile `slates-server` (lib) due to 1 previous error
+server-lib exit 101 5s
+  server-lib: error: missing documentation for a function
+  server-lib: error: could not compile `slates-server` (lib test) due to 1 previous error
+clippy exit 101 57s
+  clippy: error: missing documentation for a function
+  clippy: error: could not compile `slates-server` (lib) due to 1 previous error
+  clippy: error: could not compile `slates-server` (lib test) due to 1 previous error
