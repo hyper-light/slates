@@ -1420,6 +1420,50 @@ mod tests {
     (arena, blocks)
   }
 
+  /// A-205 against A-214 (main CI 42184319025: the Windows give-back test counted 118,337,536 of 134,217,728 deleted
+  /// bytes given back). Do: free two blocks, purge one block a call so the pass stops between them, free a third block
+  /// behind the pass's cursor (as a publication releases a delete's blocks while an interrupted pass waits for an idle
+  /// tick), then purge to the end and once more. Expect every freed page given back and counted, and nothing left
+  /// counted resident. Before the fix the pass's end set the resident count to what that pass had kept, zero here, so
+  /// the block freed behind the cursor stayed resident and every later purge returned at once.
+  #[test]
+  fn a_block_freed_behind_an_unfinished_purge_still_goes_back() {
+    let p = page();
+    let mut arena = ChunkArena::new(p).discarding_from(p);
+    arena
+      .add_region(Region::map(p * 8, p, false).unwrap())
+      .unwrap();
+    let blocks: Vec<Extent> = (0..4).map(|_| arena.alloc(p).unwrap()).collect();
+    for block in &blocks {
+      arena.bytes_mut(*block).unwrap().fill(7);
+    }
+    arena.free(blocks[1]).unwrap();
+    arena.free(blocks[3]).unwrap();
+    let first = arena.purge_keeping(1, &[]);
+    assert!(
+      first.more,
+      "the pass stops between the two freed blocks: {first:?}"
+    );
+    arena.free(blocks[0]).unwrap();
+    let given = first.bytes
+      + purge_to_the_end_keeping(&mut arena, &[])
+      + purge_to_the_end_keeping(&mut arena, &[]);
+    // Miri models no madvise, so under it no page goes back and the purge counts none; the count of what stays
+    // resident holds either way.
+    if !cfg!(miri) {
+      assert_eq!(given, 3 * p, "every freed page goes back");
+    }
+    assert_eq!(
+      arena.resident_free_bytes(),
+      0,
+      "nothing freed is left counted resident"
+    );
+    assert!(
+      all_are(arena.bytes_mut(blocks[2]).unwrap(), 0, p, 7),
+      "the live block keeps its bytes"
+    );
+  }
+
   /// A-214. Do: free two of four one-page blocks; purge keeping the reserve of the next three one-page allocations
   /// (`upcoming`), then keeping one of one page. Expect: the first purge gives nothing back and keeps both freed pages
   /// counted resident; the second gives back the freed page outside the reserve and keeps one counted.
