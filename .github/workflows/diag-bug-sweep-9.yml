@@ -1,0 +1,71 @@
+name: DIAG bug-sweep 9, crash-dump exclusion on Windows (not for main)
+
+# A diagnostics branch, never merged: A-231 (GAPS 8a-win-dumps), the fix.
+
+on:
+  push:
+    branches: [diag-bug-sweep-9]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: WER's state on this runner
+        run: |
+          Get-Service WerSvc | Format-List Name,Status,StartType
+          Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting' -ErrorAction SilentlyContinue | Format-List
+          Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Error Reporting' -ErrorAction SilentlyContinue | Format-List
+          [System.Environment]::OSVersion.Version
+      - name: Have WER write full crash dumps (LocalDumps)
+        run: |
+          $dumps = Join-Path $env:RUNNER_TEMP 'wer-dumps'
+          New-Item -ItemType Directory -Force -Path $dumps | Out-Null
+          $key = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps'
+          New-Item -Force -Path $key | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpFolder -PropertyType ExpandString -Value $dumps | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpType -PropertyType DWord -Value 2 | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpCount -PropertyType DWord -Value 10 | Out-Null
+          "SLATES_WER_DUMP_DIR=$dumps" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Test that a crash dump leaves out the private mappings
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: cargo test -p slates-server --test dump_exclusion -- --nocapture
+      - name: LocalDumps control, a .NET FailFast of a child pwsh
+        if: ${{ !cancelled() }}
+        run: |
+          $child = Start-Process pwsh -ArgumentList '-NoProfile','-Command','[System.Environment]::FailFast("slates diag control")' -PassThru -Wait
+          "control child $($child.Id) exited $($child.ExitCode)"
+          Start-Sleep -Seconds 20
+          Get-ChildItem -Force $env:SLATES_WER_DUMP_DIR | Format-Table Name,Length
+      - name: What WER saw of the crash
+        if: ${{ !cancelled() }}
+        run: |
+          Get-ChildItem -Force $env:SLATES_WER_DUMP_DIR | Format-Table Name,Length
+          Get-Service WerSvc | Format-List Name,Status
+          foreach ($dir in 'C:\ProgramData\Microsoft\Windows\WER\ReportQueue', 'C:\ProgramData\Microsoft\Windows\WER\ReportArchive', "$env:LOCALAPPDATA\CrashDumps", "$env:LOCALAPPDATA\Microsoft\Windows\WER\ReportQueue") {
+            "== $dir"; Get-ChildItem -Force -Recurse $dir -ErrorAction SilentlyContinue | Select-Object -First 20 | Format-Table FullName,Length
+          }
+          Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=(Get-Date).AddMinutes(-60)} -ErrorAction SilentlyContinue | Where-Object { $_.Id -in 1000,1001,1002,1005 } | Select-Object -First 10 | Format-List TimeCreated,Id,ProviderName,Message
+          Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps' | Format-List
+      - name: Clippy the Windows crates
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p slates-mem -p slates-ipc -p slates-server -p slates-mcp -p slates-anchor -p slates-client --all-targets -- -D warnings
+      - name: Test the Win32 shared memory
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-mem
+      - name: Test the Windows anchor
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p slates-anchor -- --test-threads=1

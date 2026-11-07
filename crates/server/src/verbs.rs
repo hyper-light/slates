@@ -3404,6 +3404,7 @@ fn daemon_report(state: &mut ShardState, shards: Vec<ShardReport>) -> ReplyBody 
       anchor_hold_refusals,
       log_lines_refused: slates_machine::log::log_lines_refused(),
       anchor_log_lines_refused,
+      dumps_unexcluded: slates_mem::dump_exclusion::refused(),
     }),
   }
 }
