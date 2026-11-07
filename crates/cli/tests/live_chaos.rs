@@ -2646,3 +2646,79 @@ fn a_long_live_log_is_taken_over_whole() {
   drop(fleet);
   verdict.judge();
 }
+
+/// A-200 takeover of a live entry past one archive chunk: do write one file of `BIG` (past 1 MiB, the cap no chunk
+/// opens beyond, `slates_archive::format::MAX_CHUNK_BYTES`) and two small ones to a live volume, let both candidates
+/// hold the log, then kill the owner's node. Expect a survivor to take the volume over and serve all three byte for
+/// byte. The big write's entry is one publication past 1 MiB; sealed as one chunk it could never be opened, so its
+/// successor refused the takeover at open for good (KIND runs 42326682216 and 42331191530).
+#[test]
+fn a_live_entry_past_one_chunk_is_taken_over_whole() {
+  /// Shape: the big file: one and a half archive chunks.
+  const BIG: usize = 3 << 19;
+  if !gated("big-entry") {
+    return;
+  }
+  let mut fleet = Fleet::start("big-entry", Supervision::Bare);
+  let owner_index = fleet.owner_index();
+  let owner = fleet.instances[owner_index].clone();
+  let candidates = candidates_of(&fleet, owner_index);
+  let volume = create_volume(&owner, "big-entry", true);
+  let mut verdict = Verdict::new("a live entry past one chunk taken over");
+  let id = volume_id_of(&volume);
+  let big: Vec<u8> = (0..BIG).map(|at| u8::try_from(at % 251).unwrap()).collect();
+  let files: Vec<(String, Vec<u8>)> = vec![
+    ("small-0".to_owned(), chaos_body(0)),
+    ("big".to_owned(), big),
+    ("small-1".to_owned(), chaos_body(1)),
+  ];
+  let mut client = Client::connect(&owner, deadlines()).unwrap();
+  let attachment = client.attach(id, None, Intent::Write).unwrap().attachment;
+  for (name, bytes) in &files {
+    client
+      .fs_write((id, attachment), name, bytes, FILE_MODE)
+      .unwrap_or_else(|error| panic!("write {name}: {error}"));
+  }
+  let _ = client.detach(attachment);
+  drop(client);
+  let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+  let (caught_up, last) = converged(&owner, &refs, &volume);
+  verdict.check(
+    "Convergence",
+    if caught_up { Vec::new() } else { vec![last] },
+  );
+  fleet.kill_node(owner_index);
+  let began = Instant::now();
+  let served = loop {
+    let whole = refs.iter().find(|survivor| {
+      Client::connect(survivor, deadlines()).is_ok_and(|mut reader| {
+        files.iter().all(|(name, bytes)| {
+          reader
+            .read(id, &format!("/{name}"), ReadAt::Head)
+            .is_ok_and(|read| read == *bytes)
+        })
+      })
+    });
+    if whole.is_some() || began.elapsed() > FLEET_WAIT {
+      break whole.map(|survivor| ((*survivor).to_owned(), began.elapsed()));
+    }
+    pause();
+  };
+  verdict.note(format!("served whole after the owner's loss: {served:?}"));
+  verdict.check(
+    "NoLoss (successor)",
+    if served.is_some() {
+      Vec::new()
+    } else {
+      vec![format!(
+        "no survivor served the three files: {:?}",
+        refs
+          .iter()
+          .map(|survivor| (*survivor, counters(survivor, "fleet.live.")))
+          .collect::<Vec<_>>()
+      )]
+    },
+  );
+  drop(fleet);
+  verdict.judge();
+}
