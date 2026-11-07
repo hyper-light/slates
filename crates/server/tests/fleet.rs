@@ -9899,6 +9899,119 @@ fn submit_one_version(client: &mut Client) -> (VolumeId, VolumeId) {
   (green, work)
 }
 
+/// Shape: how long the forwarded submit's client waits for any one answer: past the owner's liveness budget, after
+/// which a deferred acceptance is answered `Overloaded`, with the record plane's placement on top.
+const FORWARDED_ANSWER_WAIT: Duration = PLACEMENT_DEADLINE;
+
+/// Polls `client` for `word`'s reply within [`FORWARDED_ANSWER_WAIT`]: the reply or the refusal, `None` if neither
+/// came.
+fn answer_within(
+  client: &mut slates_client::Client,
+  word: u64,
+) -> Option<Result<ReplyBody, String>> {
+  let began = Instant::now();
+  while began.elapsed() < FORWARDED_ANSWER_WAIT {
+    match client.poll_reply_word(word) {
+      Ok(Some(reply)) => return Some(Ok(reply)),
+      Ok(None) => std::thread::sleep(Duration::from_nanos(HEARTBEAT_NS)),
+      Err(slates_client::ClientError::Refused(refusal)) => {
+        return Some(Err(format!("{refusal:?}")));
+      }
+      Err(e) => return Some(Err(format!("{e}"))),
+    }
+  }
+  None
+}
+
+/// §4.9 "Exactly-once", §4.16 "Commit" (AUD-11), found by fixtures' 1,000-client `f = 1` rung on 2026-11-06 (447
+/// submits answered `DuplicateRequest`): in a two-node `f = 1` fleet whose holder B withholds every merge record, a
+/// client on B submits a work whose green A owns. The forwarded submit runs on A, and its acceptance waits for the
+/// commit past the owner's liveness budget, so B's client is answered `Overloaded`, the refusal retryable under the
+/// same id. Do: the client acknowledges everything it may; the holder's fault is lifted and the version commits; the
+/// client sends the submit again under its id (`begin_again`). Expect: the first answer `Overloaded`; the resend
+/// answered `Submitted { version: Some(1) }` from the completion the commit recorded. Before: the acknowledgement
+/// covered the refused id, so A pruned it and refused the resend `DuplicateRequest`.
+#[test]
+fn a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let mut owner_client = Client::connect(&instance_a);
+  let ReplyBody::GreenCreated { id: green } = owner_client.call(&RequestBody::CreateGreen {
+    name: "forwarded-green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("create green");
+  };
+  let ReplyBody::WorkCreated { id: work, .. } = owner_client.call(&RequestBody::CreateWork {
+    green,
+    name: "forwarded-work".to_owned(),
+  }) else {
+    panic!("create work");
+  };
+  let withheld = daemon_b.inject_merge_fault(slates_server::merge_service::MergeFault {
+    refuse_content_puts: false,
+    corrupt_next_inputs: false,
+    refuse_records: true,
+  });
+  let mut client = common::client::connect(daemon_b.instance());
+  let edited = client.edit(work, "f", 0, 0, b"hello");
+  let submit = RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  };
+  let word = client.begin(&submit).map(|id| id.word());
+  let first = word
+    .as_ref()
+    .ok()
+    .and_then(|word| answer_within(&mut client, *word));
+  let acknowledged = client.acknowledge_all();
+  let lifted = daemon_b.inject_merge_fault(slates_server::merge_service::MergeFault::default());
+  let both = [&daemon_a, &daemon_b];
+  let committed = poll_until(&both, PLACEMENT_DEADLINE, || {
+    daemon_a.merge_record_placed(green, 1)
+  });
+  let resent = word
+    .as_ref()
+    .ok()
+    .map(|word| client.begin_again(*word, &submit).map(|sent| (*word, sent)));
+  let answer = match resent {
+    Some(Ok((word, true))) => answer_within(&mut client, word),
+    _ => None,
+  };
+  drop(client);
+  daemon_a.stop();
+  daemon_b.stop();
+  assert!(
+    withheld.is_ok() && lifted.is_ok(),
+    "the holder's fault installs and lifts"
+  );
+  assert!(edited.is_ok(), "the forwarded edit is served: {edited:?}");
+  assert!(word.is_ok(), "the submit is sent: {word:?}");
+  assert!(
+    matches!(&first, Some(Err(refusal)) if refusal.starts_with("Overloaded")),
+    "the forwarded submit's acceptance outlived the owner's budget: {first:?}"
+  );
+  assert!(
+    acknowledged.is_ok(),
+    "the client acknowledges: {acknowledged:?}"
+  );
+  assert!(
+    committed,
+    "the version commits once the holder takes its record"
+  );
+  assert!(
+    matches!(
+      answer,
+      Some(Ok(ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }))
+    ),
+    "the resend under its id meets the committed result: {answer:?}"
+  );
+}
+
 /// AC-8.19/T-8.17 and §4.16 "Commit" ("committed at f+1 acknowledgements … issued only when every
 /// identity the version references is placed"; §4.10 placed-before-committed): in a two-node `f = 1`
 /// fleet the holder B is made to **refuse every content put** (an injected placement refusal). A green's

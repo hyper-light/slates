@@ -5638,6 +5638,14 @@ provisioning is therefore safe to retry after any failure.
 > awaited therefore meets `AcknowledgementOwed` at the `2 × slots` bound, as backpressure until that request answers
 > (`slates_client` `ack_watermark`; `an_acknowledgement_never_covers_a_request_still_awaited`;
 > `docs/bugs/2026-11-06-an-acknowledgement-covered-requests-still-awaited.md`).
+>
+> The same day it was extended to the refusals retryable under the same id. A forwarded submit whose acceptance
+> outlived the owner's budget is answered `Overloaded`: the verb ran, and its completion is recorded at the commit.
+> The next acknowledgement covered it, so its resend was refused `DuplicateRequest` (447 in fixtures' `f = 1`
+> 1,000-client rung). An async caller's `Overloaded` or `OwnerUnreachable` id now holds the watermark below it until
+> it is resent or released (`release_retryable`), within the reconnect budget, so a caller that never resends cannot
+> pin it (`a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id`;
+> `docs/bugs/2026-11-06-a-resend-under-its-id-was-already-acknowledged.md`).
 
 > **Status (2026-11-05, A-216: an acknowledgement is answered once its own shard has released).** An `Acknowledge
 > { up_to }` releases the client's records at or below `up_to` on every partition that may hold them. Its reply now

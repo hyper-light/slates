@@ -34,6 +34,19 @@
 >   the growth came after the pin. A pin past its volume's quota is refused `NoSpace`
 >   (`docs/bugs/2026-11-06-a-pin-held-its-shard-for-the-whole-tree.md`).
 >
+> - **A resend under its own id was already acknowledged** (found by fixtures' `f = 1` 1,000-client rung on
+>   12596890, 2026-11-06).
+>   - The defect: a forwarded submit whose acceptance outlived the owner's budget is answered `Overloaded`, retryable
+>     under its id. The client's next acknowledgement covered that id, so the resend was refused `DuplicateRequest`:
+>     447 submits, a 264 s rung against 17.6 s.
+>   - The fix: the client keeps its watermark below an `Overloaded` or `OwnerUnreachable` id for the reconnect budget,
+>     or until it is resent or released. The harness no longer resends `ContentUnavailable`, which the verb recorded.
+>   - The proof: `a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id`, red
+>     `DuplicateRequest`, green `Submitted { version: Some(1) }`
+>     (`docs/bugs/2026-11-06-a-resend-under-its-id-was-already-acknowledged.md`).
+>   - Open: an `Overloaded` raised inside a verb is recorded as its completion, so a resend under its id meets it for
+>     good.
+>
 > - **The whole kernel as the workload: the pin holds, creating the green does not** (open; reported to fixtures, A-217's
 >   re-lander, 2026-11-06). In-process daemon on the Mac (loaded arm, load 30 to 47), Linux v7.4-rc1 whole (97,229
 >   files on APFS, 1.67 GB), the sliced pin:

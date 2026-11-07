@@ -161,10 +161,10 @@ struct Agent {
   resolutions: usize,
   /// The request in flight: its word, its send instant and its kind.
   inflight: Option<(u64, u64, Kind)>,
-  /// A request the daemon refused retryable under its own id (`Overloaded`, `OwnerUnreachable`, `Unpublished`,
-  /// `ContentUnavailable`), to send again under that word: its word, its first send's instant and its kind. The verb may
-  /// have run (a forwarded submit waiting on the fleet commit is answered `Overloaded` while its acceptance commits),
-  /// and only the same id meets its completion record.
+  /// A request the daemon refused retryable under its own id (`Overloaded`, `OwnerUnreachable`, `Unpublished`), to
+  /// send again under that word: its word, its first send's instant and its kind. The verb may have run (a forwarded
+  /// submit waiting on the fleet commit is answered `Overloaded` while its acceptance commits), and only the same id
+  /// meets its completion record; the client keeps its acknowledgement below the id until the resend.
   retry: Option<(u64, u64, Kind)>,
 }
 
@@ -682,14 +682,13 @@ fn keep_works() -> bool {
 const NS_PER_US: u64 = 1_000;
 
 /// Whether `refusal` is one the protocol marks retryable under the request's own id: the verb was not run, or ran and
-/// its completion record answers the same id once it is durable (§4.8, §4.9).
+/// its completion record answers the same id once it is durable (§4.8, §4.9). Not `ContentUnavailable`: the verb
+/// recorded it as its completion (a fenced green, unreadable content), so a resend under the id only meets it again;
+/// 12596890 resent it until its budget ran out.
 fn retryable_under_its_id(refusal: &Refusal) -> bool {
   matches!(
     refusal,
-    Refusal::Overloaded { .. }
-      | Refusal::OwnerUnreachable { .. }
-      | Refusal::Unpublished { .. }
-      | Refusal::ContentUnavailable
+    Refusal::Overloaded { .. } | Refusal::OwnerUnreachable { .. } | Refusal::Unpublished { .. }
   )
 }
 
@@ -901,6 +900,8 @@ impl Worker {
         let waited = now.saturating_sub(sent_ns);
         let budget = conn_reconnect_ns(&self.conns, agent.conn).saturating_mul(reply_patience());
         if waited > budget {
+          // Given up: the client need no longer keep its acknowledgement below the id.
+          self.conns[agent.conn].client.release_retryable(word);
           agent.inflight = Some((word, sent_ns, kind));
           agent.give_up(
             &mut self.tally,
