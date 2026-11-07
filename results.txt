@@ -1,0 +1,21 @@
+runner ubuntu-latest, 4 CPUs, a30adc5 diag: liveness-21, test (a) at two windows on 1158bfc9, quiet and loaded, 2633:const BUSY_START_NS: u64 = 2 * slates_server::daemon::LIVENESS_BUDGET_NS;, Sat Nov  7 14:14:40 UTC 2026
+slates daemon: shard 1 is spinning: 1000 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+== quiet run 1 exit 0
+slates daemon: shard 1 is spinning: 1001 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+== quiet run 2 exit 0
+slates daemon: shard 1 is spinning: 1000 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+== quiet run 3 exit 0
+slates daemon: shard 1 is spinning: 1000 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+== quiet run 4 exit 0
+slates daemon: shard 1 is spinning: 1000 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+== quiet run 5 exit 0
+slates daemon: shard 1 is spinning: 1079 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+== loaded run 1, load 3.01 exit 0
+slates daemon: shard 1 is spinning: 1005 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+== loaded run 2, load 3.41 exit 0
+slates daemon: shard 1 is spinning: 1096 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+== loaded run 3, load 3.41 exit 0
+slates daemon: shard 1 is spinning: 1099 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+== loaded run 4, load 4.02 exit 0
+slates daemon: shard 1 is spinning: 1007 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+== loaded run 5, load 4.42 exit 0
