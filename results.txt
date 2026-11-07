@@ -9,3 +9,5 @@ loaded run 1 an_async_patient_landing_outlasting_the_reply_deadline_is_waited_fo
 loaded run 2 a_landing_longer_than_its_lease_term_renews_it_and_lands_everything exit 0 431s late_beats=0 longest_poll_ms=0 load=10.43 10.50 8.41
     calibration: 500 files in 336.891497ms, twice that in 622.064146ms (570.345µs per file at the margin); 3507 files to last 2s
     landing of 3507 files: 1.963031359s under a 1000000000 ns term, 1 renewals: 3507 written, done
+loaded run 2 an_async_patient_landing_outlasting_the_reply_deadline_is_waited_for exit 124 900s late_beats=0 longest_poll_ms=0 load=11.01 11.00 10.10
+    calibration: 500 files in 266.759152ms, twice that in 412.981305ms (292.444µs per file at the margin); 6839 files to last 2s
