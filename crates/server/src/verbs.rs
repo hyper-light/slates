@@ -6292,7 +6292,7 @@ fn clone(
 
 /// The volume holding `name` on this partition: one of its own volumes, or one another partition holds under an alias
 /// here (A-236), confirmed or reserved.
-fn name_held(state: &ShardState, name: &str) -> Option<VolumeId> {
+pub(crate) fn name_held(state: &ShardState, name: &str) -> Option<VolumeId> {
   let partition = state.db.partition();
   partition
     .volume_by_name(name)
@@ -6316,7 +6316,7 @@ pub(crate) fn alias_step(state: &mut ShardState, op: &Op) -> Result<(), Refusal>
 
 /// Format: the status counter of alias steps whose name's shard did not take them (A-236): a reserved alias left for
 /// the next recovery to confirm or release, so the name resolves nothing until then.
-const ALIAS_STEP_UNTAKEN: &str = "names.alias_step_untaken";
+pub(crate) const ALIAS_STEP_UNTAKEN: &str = "names.alias_step_untaken";
 
 /// Makes a clone whose name hashes to `name_partition`, another partition (A-236, `slates_db::alias::CLONE_STEPS`):
 /// the alias reserved at the name's partition, the clone made here beside its origin with its completion record, and
