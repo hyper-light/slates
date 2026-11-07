@@ -178,6 +178,28 @@ jobs:
           SLATES_TEST_CLI: "1"
         run: |
           cargo test -p slates-cli --test cli --test fs_server -- --test-threads=1 --nocapture
+      # `slates exec`'s FUSE flow (§4.6 "The launcher") on a host whose AppArmor does not confine unprivileged user
+      # namespaces. GitHub's Ubuntu runner does (kernel.apparmor_restrict_unprivileged_userns=1), so every step above,
+      # on the default policy, proves the launcher's refusal that names the sysctl
+      # (`the_launcher_binds_a_volume_or_names_the_host_setting_that_forbids_it`). This step lifts the restriction for
+      # itself alone: test setup on the runner, not a privilege the product needs, modelling hosts without the
+      # restriction (Fedora's and Debian's defaults), so the bind is proven too. It puts the restriction back whatever the
+      # tests answer. The supervisor's decision, 2026-11-06 (GAPS 8a-launcher-ci).
+      - name: The slates exec FUSE flow, user namespaces unconfined (Linux)
+        if: runner.os == 'Linux'
+        env:
+          SLATES_TEST_CLI: "1"
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          status=0
+          cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture --exact \
+            the_launcher_refuses_a_path_it_would_have_to_create_and_leaves_the_host_untouched \
+            the_launcher_binds_a_volume_or_names_the_host_setting_that_forbids_it > exec.log 2>&1 || status=$?
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
+          cat exec.log
+          if grep -q "SKIP" exec.log; then echo "the exec flow skipped where it must run"; exit 1; fi
+          grep -q "test result: ok. 2 passed" exec.log
+          exit "$status"
       # The FSKit shim's Swift wire codec must agree with the Rust codec byte for byte (it shares the
       # golden vector). Compile and run its cross-check on the macOS runner, where swiftc lives.
       # ShimWire.swift is a pure library of the codec types; ShimWireMain.swift is the @main driver,

@@ -1760,9 +1760,13 @@ still fails `-D clippy::disallowed-methods` with the flag in place, and the plan
 >   - Green with the fix: run 42173285810, `diag-bug-sweep-3`. Both runs covered x86_64 and arm64.
 >   - Its bind path passes in a container (Linux 6.12, seccomp unconfined), and its outright-refusal path passes under
 >     Docker's default seccomp.
-> - The FUSE flow's gate now asks the sysctl (`the_launcher_can_bind_here`). Still owed: the full FUSE `slates exec`
->   flow runs on no lane, since every Linux runner here confines user namespaces. A lane needs a host without the
->   restriction (a container with seccomp unconfined has no `/dev/fuse` mount route), or Ada's AppArmor profile.
+> - The FUSE flow's gate now asks the sysctl (`the_launcher_can_bind_here`). **The FUSE flow runs in `gates` since
+>   2026-11-06** (the supervisor's decision). A Linux step after the CLI flow sets
+>   `kernel.apparmor_restrict_unprivileged_userns=0` for itself and puts it back. That is test setup modelling hosts
+>   without the restriction (Fedora's and Debian's defaults), not a privilege the product needs. The step runs both
+>   launcher tests and fails if either skips. The refusal stays proven on the default policy, everywhere else. First
+>   run: diagnostics run 42318731003 (`diag-bug-sweep-4`, `ubuntu-latest`), 2 passed, the first time `slates exec`
+>   bound a volume through a FUSE mount on any lane.
 >   Record: `docs/bugs/2026-10-20-the-launcher-writes-its-own-userns-maps.md`, "Correction (2026-11-05)".
 >
 > The entry as found:
