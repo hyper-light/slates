@@ -1390,3 +1390,9 @@ slates daemon: nfs_v4_locks = 2484716: max_inodes × shards (anchors ["max_inode
 slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
 slates daemon: instance fsb-985-1-main serving on 1 shards under the anchor
 ## run 1 of 1 done, 2026-11-07T19:41:51Z
+remote: 
+remote: Create a pull request for 'diag-winfsp-overlap-results-42406233399-profile-x86-product-4' on GitHub by visiting:        
+remote:      https://github.com/hyper-light/slates/pull/new/diag-winfsp-overlap-results-42406233399-profile-x86-product-4        
+remote: 
+To https://github.com/hyper-light/slates
+ * [new branch]      c2eb7fd4f9d1c1a3d8f26dd83429ac99b4c6707e -> diag-winfsp-overlap-results-42406233399-profile-x86-product-4
