@@ -33,8 +33,8 @@
 //! as `EEXIST` (17), no room as `ENOSPC` (28), the missing exchange as `EOPNOTSUPP` (95).
 //!
 //! Containment (§4.15 step 4, §4.13): [`OsLand::open_target`] walks the target from its drive's root
-//! (`slates_base::walk_dir`), and the target must be owned by this process's user (`TargetNotOwned`), compared by
-//! security identifier.
+//! (`slates_base::walk_dir`), and the target must be this process's user's (`TargetNotOwned`): its owner, by security
+//! identifier, is the token's user or the token's default owner ([`owned_by_this_user`]).
 
 use std::collections::BTreeMap;
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
@@ -98,6 +98,10 @@ const HUNDRED_NS: i64 = 100;
 /// Format: the access a directory's flush is made through: adding entries (`FILE_ADD_FILE`, the directory's
 /// `FILE_WRITE_DATA`) and waiting synchronously; `FlushFileBuffers` needs a handle that may write.
 const DIR_FLUSH_ACCESS: u32 = windows_sys::Win32::Storage::FileSystem::FILE_ADD_FILE | SYNCHRONIZE;
+
+/// Format: 64-bit words of a buffer for a token's `TOKEN_USER` or `TOKEN_OWNER` and its SID, aligned for the record: far
+/// past both, since a SID is at most 68 bytes (`SECURITY_MAX_SID_SIZE`, winnt.h) and the record two pointers.
+const TOKEN_SID_WORDS: usize = 64;
 
 /// Why a target path was refused before the lease (§4.15 step 4).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -420,12 +424,41 @@ fn ticks_of_unix_ns(ns: i64) -> i64 {
     .saturating_add(FILETIME_UNIX_EPOCH_TICKS)
 }
 
-/// Whether the directory `target` is owned by this process's user, by security identifier.
+/// Reads the token's `class` record (one holding a SID) into `buffer`, aligned for it.
+fn token_information(
+  token: BorrowedHandle<'_>,
+  class: windows_sys::Win32::Security::TOKEN_INFORMATION_CLASS,
+  buffer: &mut [u64; TOKEN_SID_WORDS],
+) -> Result<(), HostError> {
+  let mut needed = 0u32;
+  let size = u32::try_from(size_of_val(buffer)).unwrap_or(0);
+  // SAFETY: the token is open with `TOKEN_QUERY`; `buffer` is writable for `size` bytes and aligned for the record;
+  // `needed` is a local.
+  let got = unsafe {
+    windows_sys::Win32::Security::GetTokenInformation(
+      token.as_raw_handle().cast(),
+      class,
+      buffer.as_mut_ptr().cast(),
+      size,
+      &mut needed,
+    )
+  };
+  if got == 0 {
+    return Err(last_refusal());
+  }
+  Ok(())
+}
+
+/// Whether the directory `target` is this process's user's, by security identifier: its owner is the token's user, or
+/// the token's default owner, the owner this process's own creations get. The second is what Unix's `st_uid == geteuid`
+/// asks, and they differ on an elevated token, whose default owner is `BUILTIN\Administrators` (CI's runners, an elevated
+/// shell; measured 2026-11-06). A process without that group's rights has a default owner of its user, so it still
+/// refuses a directory the administrators own.
 fn owned_by_this_user(target: BorrowedHandle<'_>) -> Result<bool, HostError> {
   use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
   use windows_sys::Win32::Security::{
-    EqualSid, GetTokenInformation, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    TOKEN_QUERY, TOKEN_USER, TokenUser,
+    EqualSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_OWNER, TOKEN_QUERY,
+    TOKEN_USER, TokenOwner, TokenUser,
   };
   use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
   let mut owner: PSID = std::ptr::null_mut();
@@ -455,28 +488,19 @@ fn owned_by_this_user(target: BorrowedHandle<'_>) -> Result<bool, HostError> {
   } else {
     // SAFETY: the token just opened, owned here alone and closed on drop.
     let token = unsafe { OwnedHandle::from_raw_handle(token.cast()) };
-    // A buffer far past any `TOKEN_USER` and its SID (a SID is at most 68 bytes), aligned for the record.
-    let mut buffer = [0u64; 64];
-    let mut needed = 0u32;
-    let size = u32::try_from(size_of_val(&buffer)).unwrap_or(0);
-    // SAFETY: the token is open with `TOKEN_QUERY`; `buffer` is writable for `size` bytes and aligned for
-    // `TOKEN_USER`; `needed` is a local.
-    let got = unsafe {
-      GetTokenInformation(
-        token.as_raw_handle().cast(),
-        TokenUser,
-        buffer.as_mut_ptr().cast(),
-        size,
-        &mut needed,
-      )
-    };
-    if got == 0 {
-      Err(last_refusal())
-    } else {
-      // SAFETY: the call filled a `TOKEN_USER` at the buffer's start, whose SID points inside the buffer, which
-      // outlives this comparison; `owner` points into the descriptor, alive until it is freed below.
-      Ok(unsafe { EqualSid((*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid, owner) != 0 })
-    }
+    let mut user = [0u64; TOKEN_SID_WORDS];
+    let mut default_owner = [0u64; TOKEN_SID_WORDS];
+    token_information(token.as_handle(), TokenUser, &mut user)
+      .and_then(|()| token_information(token.as_handle(), TokenOwner, &mut default_owner))
+      .map(|()| {
+        // SAFETY: the call filled a `TOKEN_USER` at the buffer's start, whose SID points inside the buffer, which
+        // outlives this comparison; `owner` points into the descriptor, alive until it is freed below.
+        let is_user = unsafe { EqualSid((*user.as_ptr().cast::<TOKEN_USER>()).User.Sid, owner) };
+        // SAFETY: as above, for the `TOKEN_OWNER` the call filled at its buffer's start.
+        let is_default_owner =
+          unsafe { EqualSid((*default_owner.as_ptr().cast::<TOKEN_OWNER>()).Owner, owner) };
+        is_user != 0 || is_default_owner != 0
+      })
   };
   // SAFETY: the descriptor `GetSecurityInfo` allocated, freed once; nothing reads `owner` after.
   unsafe { windows_sys::Win32::Foundation::LocalFree(descriptor) };
