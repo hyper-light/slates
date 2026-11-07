@@ -37,3 +37,15 @@ rejoins: successor daemon 19006 answered after 59.063667ms
 slates-cluster: fleet: HostId(3666715384715302856) holds HostId(2044903771924264446) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
 rejoins: the fleet re-formed after 333.1215ms
 slates daemon: the anchor is gone; leaving
+=== off 6 exit 101 load { 65.02 36.65 19.87 }
+rejoins: successor daemon 19158 answered after 56.001667ms
+slates-cluster: fleet: HostId(10595190872482525974) holds HostId(8495320467819523826) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+thread 'a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet' (39220) panicked at crates/cli/tests/live_chaos.rs:2455:7:
+the fleet re-formed after the successor: [Some(("15382339574540597226", 2, 1)), Some(("10595190872482525974", 1, 0)), Some(("8495320467819523826", 2, 1))]
+fleet_host: 15382339574540597226
+fleet_peers_probed: 1
+shard 0 refused fleet.link.invalid.believed_dead: 1
+fleet_host: 10595190872482525974
+fleet_peers_probed: 0
+fleet_host: 8495320467819523826
+fleet_peers_probed: 1
