@@ -194,6 +194,66 @@ mod tests {
     );
   }
 
+  /// Format: the variable that turns this test binary into the off-main-thread spinner
+  /// ([`spinner_off_the_main_thread`]).
+  const SPINNER: &str = "SLATES_PROCESS_CLOCK_SPINNER";
+
+  /// Shape: how long the re-invoked spinner spins: twenty of [`SPIN`], one second, the anchor's liveness window; the
+  /// parent reads it inside that.
+  const SPINNER_SPANS: u32 = 20;
+
+  /// The re-invoked child of [`a_process_whose_work_runs_off_its_main_thread_shows_its_cpu_rise`]: libtest runs it on a
+  /// thread of its own while the binary's main thread waits for it, so all the process's work runs off its main
+  /// thread. Ignored like the anchor crate's supervised child, and run by the parent with `--ignored`.
+  #[test]
+  #[ignore = "the off-main-thread spinner; run by its parent with --ignored"]
+  fn spinner_off_the_main_thread() {
+    if std::env::var_os(SPINNER).is_none() {
+      return;
+    }
+    let started = std::time::Instant::now();
+    let mut spin = 0u64;
+    while started.elapsed() < SPIN * SPINNER_SPANS {
+      spin = std::hint::black_box(spin.wrapping_add(1));
+    }
+  }
+
+  /// §2.6, the anchor's start judgment: a daemon's work runs on its shard and watchdog threads while its main thread
+  /// may wait on them, and its progress is the whole process's. Do: start a child of this binary whose main thread
+  /// waits while another thread spins ([`spinner_off_the_main_thread`]), let it settle a span, and read its clock a span
+  /// apart. Expect its progress to rise. On Linux the clock was `/proc/<pid>/schedstat`, which is the main thread's
+  /// alone (`task->se.sum_exec_runtime`), so a start whose main thread waited a window on its shards' recovery read as
+  /// making no progress.
+  #[test]
+  #[allow(clippy::disallowed_methods)] // the spans the child is watched across
+  fn a_process_whose_work_runs_off_its_main_thread_shows_its_cpu_rise() {
+    if !cfg!(any(target_os = "linux", target_os = "macos", windows)) {
+      eprintln!("skipped: no process clock on this platform");
+      return;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+      .args([
+        "--ignored",
+        "--exact",
+        "process_clock::tests::spinner_off_the_main_thread",
+      ])
+      .env(SPINNER, "1")
+      .stdout(std::process::Stdio::null())
+      .spawn()
+      .unwrap();
+    let pid = child.id();
+    std::thread::sleep(SPIN * 2);
+    let before = process_cpu(pid);
+    std::thread::sleep(SPIN * 2);
+    let after = process_cpu(pid);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+      matches!((before, after), (Some(b), Some(a)) if a.progress > b.progress && a.spent_ns > b.spent_ns),
+      "{before:?} → {after:?}"
+    );
+  }
+
   /// Shape: the spans a stopped child's clock gets to come to rest in: twenty of [`SPIN`], one second, the anchor's
   /// liveness window, inside which the start judgment needs it at rest.
   #[cfg(unix)]
