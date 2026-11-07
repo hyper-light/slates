@@ -3,3 +3,6 @@ build exit 0
 run 1 exit 0 3s load=2.42 0.93 0.37
     green over 1000 files of 16384 bytes: 1.714842763s, reply GreenCreated { id: VolumeId { bytes: [180, 30, 138, 41, 62, 83, 6, 135, 0, 0, 0, 0, 0, 0, 12, 201] } }; 1193 probes inside it — p50 979.243µs, p99 6.682375ms, longest of all 7.628829ms; before it the longest 669.673µs
     test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.72s
+run 2 exit 0 3s load=2.23 0.92 0.37
+    green over 1000 files of 16384 bytes: 1.743325491s, reply GreenCreated { id: VolumeId { bytes: [69, 144, 228, 189, 162, 230, 250, 193, 0, 0, 0, 0, 0, 0, 14, 237] } }; 1404 probes inside it — p50 789.769µs, p99 3.830744ms, longest of all 10.015876ms; before it the longest 564.161µs
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.74s
