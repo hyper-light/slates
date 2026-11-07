@@ -2366,7 +2366,11 @@ outside FUSE is answered only once every FUSE mount of its volume has been told*
 SDKs, the CLI, MCP, the merge plane's verbs), an NFS call, a direct map's write-back — **and since A-196 so is a guest's
 write through slates' own virtio-fs device or a Shards stream**: the device holds the write's reply and serves the
 guest's later requests meanwhile, completing the held reply out of order, which virtio permits (virtio 1.2 §2.6), and a
-Shards stream, whose VMM sends one request at a time, holds its reply frame. Each mount's told point is its coherence
+Shards stream, whose VMM sends one request at a time, holds its reply frame. **A guest's own stale page** is judged
+too (2026-11-06): its device delivers no invalidation, so a page the guest dirtied and launders at a revalidation can
+carry bytes another path changed since. The device keeps per-guest byte states, fed by the guest's reads, its own
+writes and the journal's other changes, and refuses a `FUSE_WRITE_CACHE` write-back holding a stale byte `EIO` whole:
+A-192's rule, not the host mount's mask (`slates_bridge_fuse::guest_writeback`). Each mount's told point is its coherence
 cursor, held back while a round is out (`ServeState::told_through`); the writer's reply waits on the volume's owner shard
 without blocking it, at most half the liveness budget, past which it is answered and the late mount counted. A write through a FUSE mount is still answered first, since requests on two mounts, each waiting for the
 other mount's notification, could deadlock; AC-3.3 states that window. **What the kernel is told to

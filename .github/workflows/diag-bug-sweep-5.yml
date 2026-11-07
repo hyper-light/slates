@@ -1,0 +1,30 @@
+name: DIAG bug-sweep 5, the guest write-back rule on Linux (not for main)
+
+# A diagnostics branch, never merged: the virtio-fs device's guest write-back rule (bug-sweep U3) under the Linux-only
+# suites it drives, before it lands.
+
+on:
+  push:
+    branches: [diag-bug-sweep-5]
+
+jobs:
+  suites:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy -p slates-bridge-fuse -p slates-bridge-virtiofs -p slates-server --all-targets -- -D warnings
+      - name: The FUSE and virtio-fs bridges
+        run: cargo test -p slates-bridge-fuse -p slates-bridge-virtiofs
+      - name: The server's virtio-fs and Shards suites
+        run: cargo test -p slates-server --test virtiofs --test shards

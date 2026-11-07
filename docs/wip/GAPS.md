@@ -11960,7 +11960,12 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
 - **macOS:** NFS v3 has no write-back mark and no callback. The choice is NFSv4 with delegations (the Mac client is
   v4.0, which D-2 rejects) or recording such sharing as unsupported over v3. Ada's decision.
 - **The direct virtio-fs route** shares `serve_write`, and a guest's page cache gets no invalidation, so its stale
-  write-backs are not judged. Its byte states would come from the guest's READs.
+  write-backs are not judged. Its byte states would come from the guest's READs. **Fixed 2026-11-06 (bug-sweep):**
+  the device judges a guest's `FUSE_WRITE_CACHE` write-backs by per-guest byte states, fed by its reads, its own
+  writes and the journal's other changes (`crates/bridge-fuse/src/guest_writeback.rs`). It refuses a stale one `EIO`
+  whole, A-192's rule, never the host mount's mask. Red first: 4,095 of 4,095 other-path bytes reverted in
+  `a_guests_stale_cache_write_back_never_reverts_another_paths_write`. Record:
+  `docs/bugs/2026-11-06-a-guests-stale-cache-write-back-reverted-another-paths-write.md`.
 - **The invalidation feed's eviction gap — fixed 2026-10-22 (A-141).** A mount whose cursor fell behind the journal's
   retention silently missed invalidations, because `OpLog::since` started at the oldest retained record, and its
   kernel served the old bytes indefinitely. It was reproduced on the bare-metal box: one SDK client pipelining a ring
