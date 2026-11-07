@@ -126,13 +126,20 @@ struct LivePublication {
   runs: Vec<LiveRun>,
 }
 
-/// A sealed body: the sealed chunk's keyed name and bytes (`slates_cluster::sealed`), and on a whole entry the volume's
-/// lineage key wrapped for each neighbour (the `sealing` a head carries, A-92 piece 4c), so a successor can open the log
-/// whether or not the volume ever sealed a snapshot.
+/// A sealed body: its pieces, each a sealed chunk's keyed name and bytes (`slates_cluster::sealed`), and on a whole entry
+/// the volume's lineage key wrapped for each neighbour (the `sealing` a head carries, A-92 piece 4c), so a successor can
+/// open the log whether or not the volume ever sealed a snapshot.
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 struct SealedBody {
   /// The lineage key for successors, on a whole entry.
   sealing: Option<crate::head::HeadSealing>,
+  /// The body's pieces in order ([`seal_body`]).
+  pieces: Vec<SealedPiece>,
+}
+
+/// One piece of a sealed body: a sealed chunk of at most an archive chunk's bytes.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+struct SealedPiece {
   /// The keyed name.
   name: Vec<u8>,
   /// The sealed bytes.
@@ -897,9 +904,8 @@ fn payload(
   let account = crate::seal_keys::tenant_of(&state.db.partition().volume(id)?.owner);
   let lineage = crate::seal_keys::lineage(state, id, account).ok()?;
   let namer = crate::seal_keys::namer(state, id, account).ok()?;
-  let chunk = slates_archive::Archive::raw_chunk(body);
   let segment = u32::try_from(state.config.page).ok()?;
-  let sealed = slates_cluster::sealed::seal_chunk(&lineage, &namer, &chunk, segment).ok()?;
+  let pieces = seal_body(&lineage, &namer, body, segment)?;
   let sealing = if whole {
     let owner = state.db.partition().volume(id)?.owner.clone();
     crate::seal_keys::head_sealing(state, id, &owner)
@@ -907,14 +913,7 @@ fn payload(
     None
   };
   let mut payload = vec![kind, BODY_SEALED];
-  payload.extend_from_slice(
-    &SealedBody {
-      sealing,
-      name: sealed.name.to_vec(),
-      bytes: sealed.bytes,
-    }
-    .to_bytes(),
-  );
+  payload.extend_from_slice(&SealedBody { sealing, pieces }.to_bytes());
   Some(payload)
 }
 
@@ -1568,6 +1567,19 @@ fn keep(held: &mut Held, payload: &[u8], bound: usize) -> Result<(), LiveError> 
 /// Counter: a takeover of a live volume that could not rebuild it from the adopted log (its first entry not whole, an
 /// entry that would not open or apply, or content missing for an extent): the volume is not served from it.
 const LIVE_TAKEOVER_REFUSED: &str = "fleet.live.takeover_refused";
+/// Counter: a takeover refused because the lineage key the log's whole entry carries could not be adopted.
+const REFUSED_LINEAGE: &str = "fleet.live.takeover_refused.lineage";
+/// Counter: a takeover refused because an entry's payload would not open (its seal, or its bytes).
+const REFUSED_OPEN: &str = "fleet.live.takeover_refused.open";
+/// Counter: a takeover refused because an opened entry's record would not decode.
+const REFUSED_RECORD: &str = "fleet.live.takeover_refused.record";
+/// Counter: a takeover refused because a delta would not apply to the image before it.
+const REFUSED_APPLY: &str = "fleet.live.takeover_refused.apply";
+/// Counter: a takeover refused because the log's first entry is not a whole record (or there is none).
+const REFUSED_NOT_WHOLE_FIRST: &str = "fleet.live.takeover_refused.not_whole_first";
+/// Counter: a takeover refused because the rebuilt image could not be laid out as an archive (no root, a cycle,
+/// content missing for an extent).
+const REFUSED_LAYOUT: &str = "fleet.live.takeover_refused.layout";
 /// Counter: a taken-over live volume rebuilt from the adopted log.
 const LIVE_TAKEN_OVER: &str = "fleet.live.taken_over";
 
@@ -1685,7 +1697,12 @@ pub(crate) fn archive_from_live(
   let rebuilt = rebuild(state, id, owner, fetched);
   match &rebuilt {
     Ok(_) => state.count(LIVE_TAKEN_OVER, 1),
-    Err(_) => state.count(LIVE_TAKEOVER_REFUSED, 1),
+    Err(why) => {
+      // In total and by why (`fleet.live.takeover_refused.*`), as a holder's refusals are counted: one counter for nine
+      // refusals hid which step a 1,000-write log failed at on KIND (runs 42178128960, 42318867890: 1,512 refusals).
+      state.count(LIVE_TAKEOVER_REFUSED, 1);
+      state.count(why, 1);
+    }
   }
   rebuilt
 }
@@ -1698,34 +1715,83 @@ fn rebuild(
 ) -> Result<slates_archive::Archive, &'static str> {
   if let Some(lineage) = fetched.lineage.clone() {
     crate::seal_keys::adopt_lineage(state, id, owner, lineage, fetched.naming.as_ref())
-      .map_err(|_| LIVE_TAKEOVER_REFUSED)?;
+      .map_err(|_| REFUSED_LINEAGE)?;
   }
   let mut publications = Vec::new();
   for payload in &fetched.payloads {
-    publications.push(open_payload(state, id, owner, payload).ok_or(LIVE_TAKEOVER_REFUSED)?);
+    publications.push(open_payload(state, id, owner, payload).ok_or(REFUSED_OPEN)?);
   }
   let mut image = None;
   let mut runs: BTreeMap<(u64, u64), Vec<u8>> = BTreeMap::new();
   for publication in publications {
-    let record = <VolumeRecord as Wire>::decode(&mut &publication.record[..])
-      .map_err(|_| LIVE_TAKEOVER_REFUSED)?;
+    let record =
+      <VolumeRecord as Wire>::decode(&mut &publication.record[..]).map_err(|_| REFUSED_RECORD)?;
     match (record, image.as_mut()) {
       (VolumeRecord::Full { image: whole }, _) => {
         image = Some(whole);
         runs.clear();
       }
       (VolumeRecord::Delta { delta }, Some(image)) => {
-        slates_vfs::recover::VolumeImage::apply(image, &delta)
-          .map_err(|_| LIVE_TAKEOVER_REFUSED)?;
+        slates_vfs::recover::VolumeImage::apply(image, &delta).map_err(|_| REFUSED_APPLY)?;
       }
-      (VolumeRecord::Delta { .. }, None) => return Err(LIVE_TAKEOVER_REFUSED),
+      (VolumeRecord::Delta { .. }, None) => return Err(REFUSED_NOT_WHOLE_FIRST),
     }
     for run in publication.runs {
       runs.insert((run.inode, run.offset), run.bytes);
     }
   }
-  let image = image.ok_or(LIVE_TAKEOVER_REFUSED)?;
+  let image = image.ok_or(REFUSED_NOT_WHOLE_FIRST)?;
   archive_of(&image, &runs, ObjectId(id.bytes).local(), state.config.page)
+}
+
+/// A publication's body sealed under the volume's lineage key, in pieces of at most an archive chunk's bytes
+/// (`slates_archive::format::MAX_CHUNK_BYTES`, 1 MiB), since no chunk opens past it (`Archive::content`). Sealed as one
+/// chunk, a body past it sealed and shipped but never opened: a whole record carries the volume's content, so a live
+/// volume holding more than 1 MiB could not be taken over (KIND runs 42326682216 and 42331191530: every refusal
+/// `fleet.live.takeover_refused.open`, a 1,000-write volume never served).
+fn seal_body(
+  lineage: &hyper_seal::keys::WrappingKey,
+  namer: &hyper_seal::name::Namer,
+  body: Vec<u8>,
+  segment: u32,
+) -> Option<Vec<SealedPiece>> {
+  let cap = usize::try_from(slates_archive::format::MAX_CHUNK_BYTES).ok()?;
+  body
+    .chunks(cap.max(1))
+    .map(|piece| {
+      let chunk = slates_archive::Archive::raw_chunk(piece.to_vec());
+      let sealed = slates_cluster::sealed::seal_chunk(lineage, namer, &chunk, segment).ok()?;
+      Some(SealedPiece {
+        name: sealed.name.to_vec(),
+        bytes: sealed.bytes,
+      })
+    })
+    .collect()
+}
+
+/// A body [`seal_body`] sealed, opened piece by piece and joined: the publication's bytes. `None` when any piece will
+/// not open, or there are none.
+fn open_body(
+  lineage: &hyper_seal::keys::WrappingKey,
+  namer: &hyper_seal::name::Namer,
+  pieces: Vec<SealedPiece>,
+) -> Option<Vec<u8>> {
+  if pieces.is_empty() {
+    return None;
+  }
+  let mut body = Vec::new();
+  for piece in pieces {
+    let chunk = slates_cluster::sealed::SealedChunk {
+      name: piece.name.as_slice().try_into().ok()?,
+      bytes: piece.bytes,
+    };
+    body.extend_from_slice(
+      &slates_cluster::sealed::open_chunk(lineage, namer, &chunk)
+        .ok()?
+        .payload,
+    );
+  }
+  Some(body)
 }
 
 /// One payload's body, opened under the volume's lineage key when sealed.
@@ -1741,13 +1807,7 @@ fn open_payload(
     let account = crate::seal_keys::tenant_of(owner);
     let lineage = crate::seal_keys::lineage(state, id, account).ok()?;
     let namer = crate::seal_keys::namer(state, id, account).ok()?;
-    let chunk = slates_cluster::sealed::SealedChunk {
-      name: sealed.name.as_slice().try_into().ok()?,
-      bytes: sealed.bytes,
-    };
-    slates_cluster::sealed::open_chunk(&lineage, &namer, &chunk)
-      .ok()?
-      .payload
+    open_body(&lineage, &namer, sealed.pieces)?
   } else {
     body.to_vec()
   };
@@ -1770,7 +1830,7 @@ fn archive_of(
   let inodes: BTreeMap<u64, &InodeImage> =
     image.inodes.iter().map(|inode| (inode.no, inode)).collect();
   let mut chunks = Vec::new();
-  let root = inodes.get(&image.root_no).ok_or(LIVE_TAKEOVER_REFUSED)?;
+  let root = inodes.get(&image.root_no).ok_or(REFUSED_LAYOUT)?;
   let root_meta = meta_of(root);
   let mut visiting = Vec::new();
   let manifest = node_of(root, &inodes, runs, &mut chunks, &mut visiting)?;
@@ -1806,7 +1866,7 @@ fn node_of(
   match &inode.body {
     BodyImage::Directory { entries, .. } => {
       if visiting.contains(&inode.no) {
-        return Err(LIVE_TAKEOVER_REFUSED);
+        return Err(REFUSED_LAYOUT);
       }
       visiting.push(inode.no);
       let mut children = Vec::new();
@@ -1838,9 +1898,9 @@ fn node_of(
         .map(|extent| (extent.offset, extent.len))
         .chain(open.iter().map(|open| (open.offset, open.len)));
       for (offset, len) in spans {
-        let bytes = runs.get(&(inode.no, offset)).ok_or(LIVE_TAKEOVER_REFUSED)?;
+        let bytes = runs.get(&(inode.no, offset)).ok_or(REFUSED_LAYOUT)?;
         if u64::try_from(bytes.len()).ok() != Some(len) {
-          return Err(LIVE_TAKEOVER_REFUSED);
+          return Err(REFUSED_LAYOUT);
         }
         let chunk = slates_archive::Archive::raw_chunk(bytes.clone());
         laid.push(slates_archive::Extent {
@@ -1902,5 +1962,40 @@ fn meta_of(inode: &InodeImage) -> slates_archive::NodeMeta {
     uid: attrs.uid,
     gid: attrs.gid,
     xattrs: Vec::new(),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Format: the key generation the tests' keys carry.
+  const GENERATION: u32 = 1;
+  /// Shape: keys the tests may hold at once in the process's locked region (as `crates/cluster/tests/sealed.rs`).
+  const KEYS: usize = 256;
+
+  /// A-200 takeover of a live volume holding more than one chunk's worth: do seal publication bodies of sizes up to
+  /// and past an archive chunk's cap (`slates_archive::format::MAX_CHUNK_BYTES`, 1 MiB) and open each under the same
+  /// keys. Expect every body back byte for byte. A whole record carries the volume's content, so on KIND a 1,000-write
+  /// volume's could not be opened by its successor: every refusal was `fleet.live.takeover_refused.open` (runs
+  /// 42326682216, 42331191530), and the volume was never served.
+  #[test]
+  fn a_body_past_one_chunk_opens_as_it_was_sealed() {
+    // The process's locked key region may already be set by another test; that is the same region.
+    let _ = hyper_seal::lock_keys(KEYS);
+    let tenant = hyper_seal::keys::WrappingKey::generate(GENERATION).unwrap();
+    let (naming, _) = tenant.make_child().unwrap();
+    let namer = hyper_seal::name::Namer::new(&naming).unwrap();
+    let lineage = hyper_seal::keys::WrappingKey::generate(GENERATION).unwrap();
+    let cap = usize::try_from(slates_archive::format::MAX_CHUNK_BYTES).unwrap();
+    for len in [1, cap - 1, cap, cap + 1, 3 * cap + 17] {
+      let body: Vec<u8> = (0..len).map(|at| u8::try_from(at % 251).unwrap()).collect();
+      let pieces = seal_body(&lineage, &namer, body.clone(), 16_384).unwrap();
+      assert_eq!(
+        open_body(&lineage, &namer, pieces).as_ref(),
+        Some(&body),
+        "a body of {len} bytes opens as it was sealed"
+      );
+    }
   }
 }
