@@ -1,0 +1,2 @@
+tested 7f6afcb2be00153a970674494b7ef7471cf8c4d8 on aarch64, 4 cpus
+build exit 0
