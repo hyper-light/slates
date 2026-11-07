@@ -1321,3 +1321,9 @@ slates-server: shard 0: recovered 1 volumes from their images (0 refused), 0 mer
 slates-server: shard 0: held 0 replicas again from the image
 slates-server: shard 0 initialized in 26891 µs
 ## run 1 of 1 done, 2026-11-07T19:42:05Z
+remote: 
+remote: Create a pull request for 'diag-winfsp-overlap-results-42406233399-profile-x86-product-3' on GitHub by visiting:        
+remote:      https://github.com/hyper-light/slates/pull/new/diag-winfsp-overlap-results-42406233399-profile-x86-product-3        
+remote: 
+To https://github.com/hyper-light/slates
+ * [new branch]      7eccbd2e8b41038c5cdab8374e5c161c7b0f3243 -> diag-winfsp-overlap-results-42406233399-profile-x86-product-3
