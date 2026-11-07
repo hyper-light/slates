@@ -1,0 +1,35 @@
+runner ubuntu-24.04-arm, 4 CPUs, Sat Nov  7 03:43:49 UTC 2026, tree 5574c3dc5cd03dc42fd8ad46c5718b208311e6da
+test a_destroyed_live_volumes_copies_are_let_go_by_its_candidates ... ok
+live fsync: healthy Ok(()); candidates stopped Err(Os { code: 5, kind: Uncategorized, message: "Input/output error" }) after 1.000897423s; resumed Ok(()); owner's live counters {"appended": 4, "durable": 4, "link_lost": 1, "no_session": 21, "unanswered": 14}
+test a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+live checkout: candidates stopped None; resumed Some((0, "{\"report\":{\"made\":0,\"moded\":0,\"removed\":0,\"written\":1},\"version\":1}\n", "")); owner's live counters {"appended": 3, "awaited": 3, "durable": 3, "link_lost": 1, "no_session": 53, "resolved": 3, "unanswered": 40}
+test a_checkout_into_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+test a_paused_candidate_neither_stops_writes_nor_stays_behind ... ok
+test a_live_volumes_acknowledged_writes_survive_its_owners_death ... ok
+live shards fsync: healthy (0, 88.528ms); candidates stopped (5, 1.001278s); resumed (0, 100.795ms); device ExitStatus(unix_wait_status(0)); owner's live counters {"appended": 3, "awaited": 1, "durable": 3, "durable_late": 1, "link_lost": 1, "no_session": 21, "resolved": 2, "unanswered": 11}
+test a_shards_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+test a_stable_nfs_write_to_a_live_volume_is_answered_once_a_candidate_holds_it ... ok
+test a_successor_that_holds_no_copy_still_takes_a_live_volume_over ... ok
+test a_superseded_owner_resumed_after_its_takeover_is_fenced ... ok
+live vhost fsync: healthy (0, 10.365ms); candidates stopped (5, 1.000802s) (log Some(("2", "1", "false")), hold (waited, refused) (1, 1)); resumed (0, 101.298ms); vmm ExitStatus(unix_wait_status(0)); owner's live counters {"appended": 3, "awaited": 1, "durable": 3, "link_lost": 1, "no_session": 26, "resolved": 1, "unanswered": 13}
+test a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+live map sync: healthy Ok(4); candidates stopped None (log Some(("2", "1", "false"))); resumed Some((Ok(4), 3.071708783s)) (log Some(("2", "2", "false"))); owner's live counters {"appended": 3, "awaited": 3, "durable": 3, "link_lost": 1, "no_session": 45, "resolved": 3, "unanswered": 38}
+test a_writable_maps_sync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+live nfs4: healthy write (None, 41.417296ms) commit (None, 43.613287ms); candidates stopped: unstable write (None, 41.368599ms), commit (Some(10008), 1.042196356s), stable write (Some(10008), 612.886µs); resumed commit (None, 44.814388ms); owner's live counters {"appended": 3, "durable": 3, "durable_late": 1, "link_lost": 1, "no_session": 22, "resolved": 2, "unanswered": 12}
+test an_nfs_v4_commit_and_stable_write_to_a_live_volume_answer_only_once_a_candidate_holds_them ... ok
+test measure_what_live_shipping_adds_to_a_stable_nfs_write ... ok
+test three_daemon_processes_ship_a_live_volumes_writes_to_both_candidates ... ok
+test clients_cut_off_mid_write_leave_the_live_log_whole ... ok
+test writes_stay_durable_through_injected_candidate_stalls ... ok
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.87s
+== live_fleet exit 0
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== bridge-virtiofs exit 0
+test result: ok. 22 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 12.09s
+test result: ok. 28 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.04s
+== server virtiofs+shards exit 0
