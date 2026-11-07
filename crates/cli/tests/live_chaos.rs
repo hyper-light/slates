@@ -312,8 +312,8 @@ fn wait_formed(instances: &[String], members: usize) -> Vec<String> {
   }
 }
 
-/// Waits until every node in `instances` stands at the same neighbourhood generation and has settled at it (the fleet's
-/// objects re-placed onto the neighbourhood after a membership change), judged by progress ([`FrozenWindow`]).
+/// Waits until every node in `instances` has settled at its own neighbourhood generation (the fleet's objects re-placed
+/// onto the neighbourhood after a membership change), judged by progress ([`FrozenWindow`]).
 fn wait_neighbourhood_settled(instances: &[String]) {
   let mut window = FrozenWindow::new();
   loop {
@@ -333,16 +333,13 @@ fn wait_neighbourhood_settled(instances: &[String]) {
         )
       })
       .collect();
-    // Every node at the same, newest generation, each settled at it: a node whose view froze (retired while away)
-    // settles at its own old generation, which proves nothing about the others (diag-30 run 4: one at 4 = 4 while the
-    // rest stood at 24).
-    let newest = views
+    // Each node settled at its own neighbourhood generation. The generations are each node's own count and differ
+    // between nodes in a settled fleet (3, 8 and 11 side by side in diag-31), so they are not compared across nodes; a
+    // node retired while away is kept out by the stale holder's short stop instead.
+    if views
       .iter()
-      .filter_map(|(_, neighbourhood)| *neighbourhood)
-      .max();
-    if views.iter().all(|(settled, neighbourhood)| {
-      settled.is_some() && settled == neighbourhood && *neighbourhood == newest
-    }) {
+      .all(|(settled, neighbourhood)| settled.is_some() && settled == neighbourhood)
+    {
       return;
     }
     assert!(
