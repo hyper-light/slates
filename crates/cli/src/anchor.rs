@@ -2,9 +2,17 @@
 //! the profile, create the segment, publish the profile, supervise the daemon.
 //!
 //! The loop is the supervisor's `step` at the heartbeat cadence with two observations the
-//! supervisor itself does not make: a daemon that never beats inside the recovery budget is
-//! killed (a start that is not a start), and a daemon whose heartbeat lapses past the
-//! liveness budget is killed (wedged, so a failure like a crash; the policy then decides).
+//! supervisor itself does not make: a starting daemon that stops making progress before its
+//! first beat is killed (a start that is not a start), and a daemon whose heartbeat lapses past
+//! the liveness budget is killed (wedged, so a failure like a crash; the policy then decides).
+//! A start is judged in the daemon's own CPU time, read from the OS
+//! (`slates_machine::process_clock`), by the rule its watchdog judges each shard by once it runs
+//! (`slates_server::watchdog::ShardWatch`): no CPU progress for a liveness window is a start
+//! that is stuck, and a window of CPU with no first beat is one that spins; a start that keeps
+//! progressing, however slowly, is starved and waited for. Until 2026-11-07 a start that had not
+//! beaten within the fixed recovery budget, a wall second, was killed, and every restart started
+//! over: on this Mac at 144 spinners on 18 CPUs the anchor killed 153 starts of 153, each
+//! 1.07-1.22 s after its spawn, after it had used 16-18 ms of CPU.
 //! The restart policy is re-derived from the measured daemon start: the longest start seen
 //! is the p99 until enough starts exist to take a real one.
 
@@ -15,6 +23,7 @@ use slates_db::replay::RECOVERY_BUDGET_NS;
 use slates_machine::MachineProfile;
 use slates_server::DaemonConfig;
 use slates_server::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS};
+use slates_server::watchdog::{Look, ShardWatch, Verdict};
 use slates_vfs::clock::{Clock, HostClock};
 
 use crate::args::ProcessOptions;
@@ -330,6 +339,43 @@ fn stop_gracefully(supervisor: &mut Supervisor, clock: &mut HostClock) -> Result
   }
 }
 
+/// One look at the starting daemon in its own CPU time (`slates_machine::process_clock`), judged by the watchdog's
+/// rule over the liveness window ([`LIVENESS_BUDGET_NS`]; A-232 derives it for both): a start's first instructions are
+/// its one step, so it is alive while its CPU progresses and has run less than a window of it. With no reading (no
+/// process clock, or the process already gone) the wall window stands alone, as for a shard with no thread clock.
+fn judge_start(supervisor: &Supervisor, watch: &mut ShardWatch, now: u64) -> Verdict {
+  let cpu = supervisor
+    .child_pid()
+    .and_then(slates_machine::process_clock::process_cpu)
+    .map(|reading| (reading.spent_ns, reading.progress));
+  let look = Look {
+    steps: 0,
+    parked: false,
+    cpu,
+    now_ns: now,
+  };
+  let (verdict, next) = watch.judge(look, LIVENESS_BUDGET_NS);
+  *watch = next;
+  verdict
+}
+
+/// What a start's verdict says when it is to be killed: `None` while it is alive.
+fn start_stuck(verdict: Verdict) -> Option<String> {
+  match verdict {
+    Verdict::Alive => None,
+    Verdict::Wedged { for_ns } => Some(format!(
+      "made no progress for {} ms (the {} ms liveness window)",
+      for_ns / NS_PER_MS,
+      LIVENESS_BUDGET_NS / NS_PER_MS
+    )),
+    Verdict::Spinning { cpu_ns } => Some(format!(
+      "ran {} ms of CPU without beating (the {} ms liveness window)",
+      cpu_ns / NS_PER_MS,
+      LIVENESS_BUDGET_NS / NS_PER_MS
+    )),
+  }
+}
+
 /// The observation loop.
 fn observe(
   supervisor: &mut Supervisor,
@@ -337,6 +383,8 @@ fn observe(
   started: u64,
 ) -> Result<(), Failure> {
   let mut starting_since = Some(started);
+  // The start under way, judged in the daemon's own CPU time until its first beat (the module doc).
+  let mut start_watch = ShardWatch::default();
   let mut longest_start_ns = 0u64;
   let mut watch = Watch::default();
   let mut daemon_watch = DaemonWatch::default();
@@ -349,6 +397,20 @@ fn observe(
   // A kill already sent to the daemon that has not been reaped yet: it is not sent again, and the loop waits on the
   // daemon's exit (its exit watch ends the wait) rather than judging the same stale heartbeat each turn. Before
   // 2026-10-10 a lapsed daemon was killed and logged again every pause until reaped.
+  slates_machine::log_line!(
+    "slates anchor: a starting daemon is killed once it makes no CPU progress for the {} ms liveness window, or runs \
+     that much CPU without its first beat, in its own CPU time ({})",
+    LIVENESS_BUDGET_NS / NS_PER_MS,
+    if supervisor
+      .child_pid()
+      .and_then(slates_machine::process_clock::process_cpu)
+      .is_some()
+    {
+      "read from the OS"
+    } else {
+      "none read here: the wall window stands alone"
+    }
+  );
   let mut kill_sent = false;
   loop {
     if signal::stop_requested() {
@@ -384,13 +446,13 @@ fn observe(
               .set_policy(RestartPolicy::derive(RECOVERY_BUDGET_NS, longest_start_ns).get());
             starting_since = None;
           }
-          Some(since) if now.saturating_sub(since) > RECOVERY_BUDGET_NS && !kill_sent => {
-            slates_machine::log_line!(
-              "slates anchor: the daemon never beat inside the recovery budget; killing it"
-            );
-            supervisor.kill().map_err(|e| failed("kill", e))?;
-            kill_sent = true;
-            starting_since = None;
+          Some(_) if !kill_sent => {
+            if let Some(said) = start_stuck(judge_start(supervisor, &mut start_watch, now)) {
+              slates_machine::log_line!("slates anchor: the starting daemon {said}; killing it");
+              supervisor.kill().map_err(|e| failed("kill", e))?;
+              kill_sent = true;
+              starting_since = None;
+            }
           }
           Some(_) => {}
           None if !alive && !kill_sent => {
@@ -426,6 +488,7 @@ fn observe(
           "slates anchor: daemon exited ({exit_code:?}); restarted ({in_window} in the window)"
         );
         starting_since = Some(clock.monotonic_ns());
+        start_watch = ShardWatch::default();
         kill_sent = false;
       }
       slates_anchor::Step::CrashLoop {

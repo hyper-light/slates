@@ -6676,6 +6676,14 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > debt). Proven by `crates/server/tests/liveness.rs`: a starved control-shard poll, which gapped the beat 1.53 s on main,
 > keeps it under 0.26 s; a wedged or spinning non-control shard, which main never saw, stops it.
 
+> **Status (2026-11-07): a start is judged by its progress too.** Until its first beat the anchor judges a starting
+> daemon by the same rule, in the daemon's own CPU time read from the OS (`slates_machine::process_clock`;
+> `crates/cli/src/anchor.rs`): killed once it makes no CPU progress for a window or runs a window of CPU without beating,
+> waited for while it progresses. Before, a start not beaten within the fixed recovery budget, a wall second, was killed;
+> under 144 spinners on 18 CPUs the anchor killed 153 starts of 153 after each had used 16-18 ms of CPU
+> (`docs/bugs/2026-11-07-the-anchor-killed-every-start-a-busy-machine-starved.md`). A shard's recovery still runs as
+> one poll, which the watchdog counts as spinning past a window of CPU: GAPS holds it open.
+
 > **Telemetry oracle correction (2026-09-20, AC-0.11).** A drain request itself emits spans.
 > The daemon integration oracle now derives convergence from the reply quota minus the
 > maximum spans a drain emits, and checks progress on each batch. A four-span reply scenario

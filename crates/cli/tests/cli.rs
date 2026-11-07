@@ -623,8 +623,10 @@ const STARVED_PERIOD: Duration = Duration::from_nanos(slates_server::daemon::HEA
 /// this Mac under 144 spinners (16-18 ms of CPU across about 1.15 s of wall time from its first instruction to its
 /// profile read, 2026-11-07).
 const STARVED_RUNS_ONE_IN: u32 = 64;
-/// Format: the anchor's kill of a start that did not beat inside its fixed budget (`crates/cli/src/anchor.rs`).
-const START_KILL_LINE: &str = "the daemon never beat inside the recovery budget";
+/// Format: the anchor's kill of a start (`crates/cli/src/anchor.rs`): "the starting daemon made no progress …" or "…
+/// ran … ms of CPU without beating …". Until 2026-11-07 it read "the daemon never beat inside the recovery budget";
+/// the test also holds the starved successor to be the one that answers, so a kill under any wording fails it.
+const START_KILL_LINE: &str = "slates anchor: the starting daemon";
 
 /// A busy machine never kills a starting daemon that is making progress (supervisor's order of 2026-11-07; GAPS, "A
 /// daemon's restart can exceed the anchor's fixed recovery budget"). Do: start an anchor, kill its daemon, and starve

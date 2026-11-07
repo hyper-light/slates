@@ -1,5 +1,17 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **The anchor killed every start a busy machine starved (found 2026-11-06, the start judgment fixed 2026-11-07; recovery
+> in one poll, open).** A start not beaten within the fixed recovery budget (a wall second) was killed, and every restart
+> started over. Now a start is judged in its own CPU time by the watchdog's rule: killed only when it makes no progress for
+> a window or runs a window of CPU without beating. Measured on this Mac under 144 spinners: 153 of 153 starts killed
+> before, each having used 16-18 ms of CPU. `a_starved_start_that_makes_progress_is_not_killed` was red on main and
+> passes. Open:
+> - a shard's recovery is one poll, which past a window of CPU stops the watchdog's beat;
+> - the client's reconnect budget (recovery + liveness, 2 s) can still be outlasted by a starved restart (owner clients);
+> - `Facts::query()` gathers every fact to read the identity (676 ms p50 under that load);
+> - the anchor's own profile was refused under the same load (`measurement timeout: wake`).
+> The bug record of 2026-11-07 has the per-phase table.
+
 > **The anchor kills live daemons on a busy machine (found 2026-11-06, audit step 7; fixed by A-228, Windows CI owed).** Under the
 > A/B bar's load, two spinners a logical CPU (8 on CI's 4-CPU Windows runners), the anchor killed daemons that were
 > alive and serving because their heartbeat lapsed its 1,000 ms liveness budget. A busy machine is the normal case
