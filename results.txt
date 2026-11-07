@@ -1,0 +1,107 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 15:52:22 UTC 2026, head 5f599d272d98a8554f7f5045a631a2b85d517f62
+== run 1 at 15:52:22, load 1.92 1.70 0.76
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["2219312361021971057", "1265426922689437367", "11689311259728596453", "2010855983597341437", "708253557136292704"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-a-6109; council seats at ["chaos-fresh-member-b-6109", "chaos-fresh-member-d-6109", "chaos-fresh-member-e-6109"]
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (6110) panicked at crates/cli/tests/live_chaos.rs:307:5:
+FAILED
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 42.79s
+== run 1 exit 101
+== run 2 at 15:53:04, load 7.00 3.01 1.24
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["3955480949025902709", "14628515955582433239", "2336360577591811231", "11097209826181063264", "9149889038935572453"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-b-13873; council seats at ["chaos-fresh-member-a-13873", "chaos-fresh-member-c-13873", "chaos-fresh-member-e-13873"]
+chaos a member that never held the log at a takeover: chaos-fresh-member-a-13873 replaced by a fresh member, rejoined at 2.966420792s
+chaos a member that never held the log at a takeover: the owner's holders once settled: ["chaos-fresh-member-c-13873", "chaos-fresh-member-d-13873"]
+chaos a member that never held the log at a takeover: chaos-fresh-member-d-13873 stopped at 4.001656089s
+chaos a member that never held the log at a takeover: 402 writes acknowledged; owner crashed; holders chaos-fresh-member-c-13873 (with the log) and chaos-fresh-member-d-13873 (stale)
+chaos a member that never held the log at a takeover: chaos-fresh-member-e-13873 adopted the registers; chaos-fresh-member-c-13873 stopped for 3s
+chaos a member that never held the log at a takeover: chaos-fresh-member-e-13873 took the volume over while the holder of the log was stopped
+chaos a member that never held the log at a takeover: decisive true; phase one waited for the holders 0 times while the holder was stopped
+chaos a member that never held the log at a takeover: chaos-fresh-member-e-13873 served the volume after 37.730935ms
+chaos a member that never held the log at a takeover: the successor's recorded and active holders among the survivors: ["chaos-fresh-member-c-13873"]
+chaos a member that never held the log at a takeover: copies on members no longer holders, at the takeover: ["chaos-fresh-member-d-13873 holds a copy fenced below 2: LiveState { holding: true, head: Some(358), durable: None, owed: false, epoch: Some(1), identity: Some(\"f22996d6fae40c183fdb944a572848493dd5da0abbf1edef3a3fe0b372bd4c82\"), fence: 1, holders: [], moving_to: [], recorded: [] }"]
+chaos a member that never held the log at a takeover: copies dropped holders still keep: ["chaos-fresh-member-a-13873 keeps its copy", "chaos-fresh-member-d-13873 keeps its copy"]
+chaos a member that never held the log at a takeover:
+  owner chaos-fresh-member-b-13873; council seats at ["chaos-fresh-member-a-13873", "chaos-fresh-member-c-13873", "chaos-fresh-member-e-13873"]
+  chaos-fresh-member-a-13873 replaced by a fresh member, rejoined at 2.966420792s
+  the owner's holders once settled: ["chaos-fresh-member-c-13873", "chaos-fresh-member-d-13873"]
+  chaos-fresh-member-d-13873 stopped at 4.001656089s
+  402 writes acknowledged; owner crashed; holders chaos-fresh-member-c-13873 (with the log) and chaos-fresh-member-d-13873 (stale)
+  chaos-fresh-member-e-13873 adopted the registers; chaos-fresh-member-c-13873 stopped for 3s
+  chaos-fresh-member-e-13873 took the volume over while the holder of the log was stopped
+  NoLoss (a takeover without the log's holder): held
+  decisive true; phase one waited for the holders 0 times while the holder was stopped
+  chaos-fresh-member-e-13873 served the volume after 37.730935ms
+  NoLoss (successor): held
+  the successor's recorded and active holders among the survivors: ["chaos-fresh-member-c-13873"]
+  StaleNeverCommits (the counted holders' fences): held
+  copies on members no longer holders, at the takeover: ["chaos-fresh-member-d-13873 holds a copy fenced below 2: LiveState { holding: true, head: Some(358), durable: None, owed: false, epoch: Some(1), identity: Some(\"f22996d6fae40c183fdb944a572848493dd5da0abbf1edef3a3fe0b372bd4c82\"), fence: 1, holders: [], moving_to: [], recorded: [] }"]
+  copies dropped holders still keep: ["chaos-fresh-member-a-13873 keeps its copy", "chaos-fresh-member-d-13873 keeps its copy"]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 52.15s
+== run 2 exit 0
+== run 3 at 15:53:57, load 4.53 2.95 1.32
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["10477413469387346269", "1086313223398869085", "31938591067928404", "9845902767975078323", "988785459067058788"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-a-18141; council seats at ["chaos-fresh-member-b-18141", "chaos-fresh-member-c-18141", "chaos-fresh-member-e-18141"]
+chaos a member that never held the log at a takeover: chaos-fresh-member-b-18141 replaced by a fresh member, rejoined at 2.549279128s
+chaos a member that never held the log at a takeover: the owner's holders once settled: ["chaos-fresh-member-c-18141", "chaos-fresh-member-d-18141"]
+chaos a member that never held the log at a takeover: chaos-fresh-member-d-18141 stopped at 3.337659089s
+chaos a member that never held the log at a takeover: 324 writes acknowledged; owner crashed; holders chaos-fresh-member-c-18141 (with the log) and chaos-fresh-member-d-18141 (stale)
+chaos a member that never held the log at a takeover: chaos-fresh-member-c-18141 adopted the registers; it holds the log itself, so this run cannot show the defect
+chaos a member that never held the log at a takeover: decisive false; phase one waited for the holders 0 times while the holder was stopped
+chaos a member that never held the log at a takeover: chaos-fresh-member-c-18141 served the volume after 26.251566ms
+chaos a member that never held the log at a takeover: the successor's recorded and active holders among the survivors: ["chaos-fresh-member-e-18141"]
+chaos a member that never held the log at a takeover: copies on members no longer holders, at the takeover: ["chaos-fresh-member-d-18141 holds a copy fenced below 2: LiveState { holding: true, head: Some(277), durable: None, owed: false, epoch: Some(1), identity: Some(\"f1a8255bb45c199312700d8a6e0f44815210ee40ccf4c429dcecaea92448c857\"), fence: 1, holders: [], moving_to: [], recorded: [] }"]
+chaos a member that never held the log at a takeover: copies dropped holders still keep: ["chaos-fresh-member-d-18141 keeps its copy"]
+chaos a member that never held the log at a takeover:
+  owner chaos-fresh-member-a-18141; council seats at ["chaos-fresh-member-b-18141", "chaos-fresh-member-c-18141", "chaos-fresh-member-e-18141"]
+  chaos-fresh-member-b-18141 replaced by a fresh member, rejoined at 2.549279128s
+  the owner's holders once settled: ["chaos-fresh-member-c-18141", "chaos-fresh-member-d-18141"]
+  chaos-fresh-member-d-18141 stopped at 3.337659089s
+  324 writes acknowledged; owner crashed; holders chaos-fresh-member-c-18141 (with the log) and chaos-fresh-member-d-18141 (stale)
+  chaos-fresh-member-c-18141 adopted the registers; it holds the log itself, so this run cannot show the defect
+  decisive false; phase one waited for the holders 0 times while the holder was stopped
+  chaos-fresh-member-c-18141 served the volume after 26.251566ms
+  NoLoss (successor): held
+  the successor's recorded and active holders among the survivors: ["chaos-fresh-member-e-18141"]
+  StaleNeverCommits (the counted holders' fences): held
+  copies on members no longer holders, at the takeover: ["chaos-fresh-member-d-18141 holds a copy fenced below 2: LiveState { holding: true, head: Some(277), durable: None, owed: false, epoch: Some(1), identity: Some(\"f1a8255bb45c199312700d8a6e0f44815210ee40ccf4c429dcecaea92448c857\"), fence: 1, holders: [], moving_to: [], recorded: [] }"]
+  copies dropped holders still keep: ["chaos-fresh-member-d-18141 keeps its copy"]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 59.50s
+== run 3 exit 0
+== run 4 at 15:54:56, load 3.88 3.12 1.49
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["15461498434632505351", "9719612240487396502", "415821354624609444", "7925475345654675747", "15540409876008403401"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-a-22846; council seats at ["chaos-fresh-member-b-22846", "chaos-fresh-member-c-22846", "chaos-fresh-member-d-22846"]
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (22847) panicked at crates/cli/tests/live_chaos.rs:307:5:
+FAILED
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 42.97s
+== run 4 exit 101
+== run 5 at 15:55:39, load 8.83 4.47 2.01
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["16962085419322644890", "16913687448493295602", "16597029131245157046", "289545691530875798", "8358985625357685873"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-a-29720; council seats at ["chaos-fresh-member-c-29720", "chaos-fresh-member-d-29720", "chaos-fresh-member-e-29720"]
+chaos a member that never held the log at a takeover: chaos-fresh-member-b-29720 replaced by a fresh member, rejoined at 2.335067626s
+chaos a member that never held the log at a takeover: the owner's holders once settled: ["chaos-fresh-member-d-29720", "chaos-fresh-member-c-29720"]
+chaos a member that never held the log at a takeover: chaos-fresh-member-c-29720 stopped at 2.570749671s
+chaos a member that never held the log at a takeover: 1241 writes acknowledged; owner crashed; holders chaos-fresh-member-d-29720 (with the log) and chaos-fresh-member-c-29720 (stale)
+chaos a member that never held the log at a takeover: chaos-fresh-member-d-29720 adopted the registers; it holds the log itself, so this run cannot show the defect
+chaos a member that never held the log at a takeover: decisive false; phase one waited for the holders 0 times while the holder was stopped
+chaos a member that never held the log at a takeover: chaos-fresh-member-d-29720 served the volume after 20.335843ms
+chaos a member that never held the log at a takeover: the successor's recorded and active holders among the survivors: ["chaos-fresh-member-e-29720"]
+chaos a member that never held the log at a takeover: copies on members no longer holders, at the takeover: ["chaos-fresh-member-c-29720 holds a copy fenced below 2: LiveState { holding: true, head: Some(1182), durable: None, owed: false, epoch: Some(1), identity: Some(\"d289295a4b9839d8d3e89dd399bcf7616bd6fff7ee7f0c38b84152b492a6416a\"), fence: 1, holders: [], moving_to: [], recorded: [] }"]
+chaos a member that never held the log at a takeover: copies dropped holders still keep: ["chaos-fresh-member-c-29720 keeps its copy"]
+chaos a member that never held the log at a takeover:
+  owner chaos-fresh-member-a-29720; council seats at ["chaos-fresh-member-c-29720", "chaos-fresh-member-d-29720", "chaos-fresh-member-e-29720"]
+  chaos-fresh-member-b-29720 replaced by a fresh member, rejoined at 2.335067626s
+  the owner's holders once settled: ["chaos-fresh-member-d-29720", "chaos-fresh-member-c-29720"]
+  chaos-fresh-member-c-29720 stopped at 2.570749671s
+  1241 writes acknowledged; owner crashed; holders chaos-fresh-member-d-29720 (with the log) and chaos-fresh-member-c-29720 (stale)
+  chaos-fresh-member-d-29720 adopted the registers; it holds the log itself, so this run cannot show the defect
+  decisive false; phase one waited for the holders 0 times while the holder was stopped
+  chaos-fresh-member-d-29720 served the volume after 20.335843ms
+  NoLoss (successor): held
+  the successor's recorded and active holders among the survivors: ["chaos-fresh-member-e-29720"]
+  StaleNeverCommits (the counted holders' fences): held
+  copies on members no longer holders, at the takeover: ["chaos-fresh-member-c-29720 holds a copy fenced below 2: LiveState { holding: true, head: Some(1182), durable: None, owed: false, epoch: Some(1), identity: Some(\"d289295a4b9839d8d3e89dd399bcf7616bd6fff7ee7f0c38b84152b492a6416a\"), fence: 1, holders: [], moving_to: [], recorded: [] }"]
+  copies dropped holders still keep: ["chaos-fresh-member-c-29720 keeps its copy"]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 52.82s
+== run 5 exit 0
