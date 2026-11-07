@@ -13764,6 +13764,9 @@ timeouts would keep a server that never answers looking busy. Under the same loa
 with 1,019–1,379 answered in 28–51 s. Pointed at a listener that accepts and never answers, it still fails (0 answered,
 180 unanswered, 21.7 s). The cross-tenant test shares the rule and passed 10 of 10 under the same load (1,070–2,048
 answered).
+On `windows-latest` with the binary's tests in parallel (diagnostics run 42334762487), the fixed rule passed 10 of 10
+whole runs (stale-handle 1,010–1,344 answered, cross-tenant 1,054–2,950); the old rule failed the binary in its fourth
+run, the failing test not captured.
 
 Siblings seen running the whole binary in parallel under that load, not fixed here: three tests' `provision` calls
 refused `Stalled { after_ns: 1000000000 }` (`nfs_hostile.rs:71`); `common/nfs.rs:76` got RPC accept status 5
