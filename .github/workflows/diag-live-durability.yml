@@ -1,0 +1,82 @@
+name: diag-live-durability
+
+# Diagnostics only, never on main (A-200, item 2). Interleaved A/B of the live stable-write bench in release with
+# temporary per-hop counters: arm A, the dispatch as it stands (957492bb, round 3's tree); arm B, the same with live
+# shipping noted as shard activity (each holder's serve and each owner exchange), so the control shards spin out their
+# idle window instead of parking between a stream's messages. Quiet and with two spinning shell loops per CPU, three
+# rounds each, the arms alternating and the first rotating, both Linux arches. Results to
+# diag-results/live-durability-4-<os> by git push.
+on:
+  push:
+    branches: ["diag-live-durability-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  SLATES_TEST_CLI: "1"
+  SLATES_TEST_MEASURE: "1"
+  ARM_A_SHA: 957492bb6217084129b421eb8382fa3e7699636b
+
+jobs:
+  linux:
+    name: A-200 shard activity A/B (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build both arms
+        run: |
+          git worktree add ../arm-a "$ARM_A_SHA"
+          ( cd ../arm-a && CARGO_TARGET_DIR=../target-a cargo build --release --locked -p slates-cli --bin slates --test live_fleet )
+          cargo build --release --locked -p slates-cli --bin slates --test live_fleet
+      - name: The bench, quiet and busy, three rounds each, the arms alternating
+        run: |
+          R=../results.txt
+          cpus=$(nproc)
+          echo "runner ${{ matrix.os }}, $cpus CPUs, $(date -u), arm B $(git rev-parse HEAD)" > $R
+          for round in 1 2 3; do
+            if [ $((round % 2)) = 1 ]; then order="a b"; else order="b a"; fi
+            for cond in quiet busy; do
+              for arm in $order; do
+                pids=""
+                if [ $cond = busy ]; then
+                  for i in $(seq 1 $((cpus * 2))); do ( while :; do :; done ) & pids="$pids $!"; done
+                fi
+                echo "== $cond round $round arm $arm at $(date -u +%H:%M:%S), load $(cut -d' ' -f1-3 /proc/loadavg)" | tee -a $R
+                status=0
+                if [ $arm = a ]; then
+                  ( cd ../arm-a && CARGO_TARGET_DIR=../target-a timeout 1500 cargo test --release --locked -p slates-cli --test live_fleet measure_what_live_shipping -- --nocapture ) > ../run.log 2>&1 || status=$?
+                else
+                  timeout 1500 cargo test --release --locked -p slates-cli --test live_fleet measure_what_live_shipping -- --nocapture > ../run.log 2>&1 || status=$?
+                fi
+                for p in $pids; do kill "$p" 2>/dev/null || true; done
+                wait 2>/dev/null || true
+                grep -E '^measure|^  (plain|live|added)|^hop |panicked|test result' ../run.log | cut -c1-600 | tee -a $R
+                echo "== $cond round $round arm $arm exit $status" | tee -a $R
+              done
+            done
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/live-durability-4-${{ matrix.os }}"
+          git config user.name "diag-live-durability"
+          git config user.email "diag-live-durability@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-live-durability-4 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
