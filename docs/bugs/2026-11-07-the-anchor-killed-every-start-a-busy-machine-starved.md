@@ -64,6 +64,14 @@ Before the fix, clients counted 104 kills in one frozen run at load 150-233. The
 fixed waits, not the anchor: `await_daemon`'s 20 s `START_WAIT` for a successor that at about 1.5% of a CPU serves
 just after it (`cli.rs:3212`), and `await_stable_daemon`'s attempt streak (`cli.rs:291`). Told clients, 2026-11-07.
 
+Those waits are now judged as the anchor judges a start (`StartProgress` in `cli.rs`): a wait fails once the instance's
+daemon processes made no CPU progress for the start wait, or at a ceiling of the start wait at the slowest share the
+suite holds a start to (1/64). The frozen and stuck tests no longer bound the successor's whole boot on the wall: the
+frozen test checks the kill came within a window of the lapse, and the stuck test reads the anchor's start-kill line
+and checks "no progress for N ms" lies in [window, 2 × window). `held_rendezvous.rs`, the rendezvous handoff, ran on
+Unix only because it killed with `kill`; it now ends the daemon with `TerminateProcess` on Windows and runs in all three
+Windows CI lanes.
+
 On CI (diag-liveness-10, two spinners a CPU on four runners), the stuck start was killed at 1,001-1,007 ms on both
 Linux runners, 1,007-1,070 ms on windows-latest and 1,002-1,009 ms on windows-11-arm, three runs each, and the
 starved start was never killed (`start_judgment.rs` on Windows, `cli.rs` on Linux).
