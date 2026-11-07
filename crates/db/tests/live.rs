@@ -113,6 +113,10 @@ enum Following {
   /// A mutation, the daemon before 2026-11-07: the shipper keeps the holders it was made with, and phase one counts the
   /// configuration's candidates.
   Fixed,
+  /// A mutation of the successor's rule alone: everything as [`Following::Joint`], but a successor's shipper starts from
+  /// the configuration's candidates rather than the set its takeover counted, as `live_ship::published` made every new
+  /// shipper before 2026-11-07.
+  SuccessorFromConfiguration,
 }
 
 /// Whose reports phase one counts toward `f + 1` (A-240).
@@ -210,6 +214,9 @@ struct Run {
   newcomers: bool,
   /// The members that joined so.
   joined: u64,
+  /// The takeovers of a successor made at once after its own takeover, before any message moved (the `following` runs:
+  /// a second owner loss while the successor's install has reached none of its new set).
+  chained: u64,
   /// Whether the history is printed as it happens ([`Run::traced`]): what each step did that bears on the invariants.
   traced: bool,
 }
@@ -275,6 +282,7 @@ impl Run {
       counting: Counting::Holders,
       newcomers: false,
       joined: 0,
+      chained: 0,
       traced: false,
     }
   }
@@ -686,7 +694,9 @@ impl Run {
     let mut holders: Vec<HostId> = match self.following {
       None => self.holders.keys().copied().collect(),
       Some(Following::Joint) => self.owners[old].recorded.clone(),
-      Some(Following::RecordAtOnce | Following::Fixed) => self.configuration.clone(),
+      Some(
+        Following::RecordAtOnce | Following::Fixed | Following::SuccessorFromConfiguration,
+      ) => self.configuration.clone(),
     };
     holders.retain(|host| *host != successor && *host != old_host);
     // The old owner was a candidate; it is gone, but stays in the holder list as a dead candidate it ships to.
@@ -728,6 +738,13 @@ impl Run {
     });
     self.current = self.owners.len() - 1;
     self.takeovers += 1;
+    // A second owner loss at once, while the successor's first entries are still in flight (A-240): only the set the
+    // successor recorded is counted, so it must be a set that holds the log. At `f = 2` the loss budget allows it.
+    if self.following.is_some() && self.lost < self.f && self.rng.chance(CHAINED_PER_MILLE) {
+      self.chained += 1;
+      self.note(|| "the successor is lost at once".to_owned());
+      self.take_over();
+    }
   }
 
   /// Phase one's hosts: those asked, and the set whose reports count toward `f + 1`; `None` when too few of that set are
@@ -745,7 +762,7 @@ impl Run {
       return self.phase_one_hosts(old, reachable);
     };
     let recorded: Vec<HostId> = match following {
-      Following::Joint => self.owners[old].recorded.clone(),
+      Following::Joint | Following::SuccessorFromConfiguration => self.owners[old].recorded.clone(),
       Following::RecordAtOnce | Following::Fixed => self.configuration.clone(),
     };
     let old_host = self.owners[old].host;
@@ -794,7 +811,9 @@ impl Run {
   fn follow(&mut self) {
     if matches!(
       self.following,
-      Some(Following::Joint | Following::RecordAtOnce)
+      Some(
+        Following::Joint | Following::RecordAtOnce | Following::SuccessorFromConfiguration
+      )
     ) {
       let named = self.configuration.clone();
       let owner = &mut self.owners[self.current];
@@ -809,7 +828,10 @@ impl Run {
   /// ([`Shipper::transferred`]). From then on phase one counts the target; the shipper activates it later
   /// ([`Run::activate`]), when it learns the record is placed.
   fn record(&mut self) {
-    if self.following != Some(Following::Joint) {
+    if !matches!(
+      self.following,
+      Some(Following::Joint | Following::SuccessorFromConfiguration)
+    ) {
       return;
     }
     let owner = &mut self.owners[self.current];
@@ -830,7 +852,7 @@ impl Run {
   fn activate(&mut self) {
     if !matches!(
       self.following,
-      Some(Following::Joint | Following::RecordAtOnce)
+      Some(Following::Joint | Following::RecordAtOnce | Following::SuccessorFromConfiguration)
     ) {
       return;
     }
@@ -1367,7 +1389,10 @@ fn a_new_holder_set_counts_only_once_it_holds_every_durable_entry() {
 
 /// What a nemesis run under [`Following`] counted: reconfigurations, activations, activations past the overlap,
 /// takeovers, durable positions.
-type FollowingCounts = (u64, u64, u64, u64, u64);
+type FollowingCounts = (u64, u64, u64, u64, u64, u64);
+
+/// Shape: the chance, per mille, that a `following` run's takeover is followed at once by its successor's loss.
+const CHAINED_PER_MILLE: u64 = 250;
 
 /// A broken seed: its `f`, its seed, and the failed check's message.
 type BrokenSeed = (u64, u64, String);
@@ -1377,7 +1402,7 @@ type BrokenSeed = (u64, u64, String);
 /// overlap, takeovers, durable positions) of the passing ones.
 fn run_following(following: Following) -> (Vec<BrokenSeed>, FollowingCounts) {
   let mut broken = Vec::new();
-  let mut totals = (0, 0, 0, 0, 0);
+  let mut totals = (0, 0, 0, 0, 0, 0);
   for f in [1, 2] {
     for seed in 0..SEEDS {
       let outcome = std::panic::catch_unwind(|| {
@@ -1392,6 +1417,7 @@ fn run_following(following: Following) -> (Vec<BrokenSeed>, FollowingCounts) {
           run.activations_past_the_overlap,
           run.takeovers,
           u64::try_from(run.durable.len()).unwrap(),
+          run.chained,
         )
       });
       match outcome {
@@ -1401,6 +1427,7 @@ fn run_following(following: Following) -> (Vec<BrokenSeed>, FollowingCounts) {
           totals.2 += counts.2;
           totals.3 += counts.3;
           totals.4 += counts.4;
+          totals.5 += counts.5;
         }
         Err(panic) => {
           let message = panic
@@ -1415,13 +1442,14 @@ fn run_following(following: Following) -> (Vec<BrokenSeed>, FollowingCounts) {
   }
   eprintln!(
     "{following:?}: {} broken seeds, first {:?}; passing seeds: {} reconfigurations, {} activations ({} keeping fewer \
-     than f holders), {} takeovers, {} durable positions",
+     than f holders), {} takeovers ({} of a successor at once), {} durable positions",
     broken.len(),
     broken.first(),
     totals.0,
     totals.1,
     totals.2,
     totals.3,
+    totals.5,
     totals.4
   );
   if let Some((f, seed, _)) = broken.first().cloned() {
@@ -1447,11 +1475,16 @@ fn run_following(following: Following) -> (Vec<BrokenSeed>, FollowingCounts) {
 /// not vacuous, sets activated that kept fewer than `f` of the old holders, takeovers, and durable writes.
 #[test]
 fn a_live_logs_holders_follow_its_candidates_through_a_joint_transition() {
-  let (broken, (reconfigurations, activations, past_the_overlap, takeovers, durable)) =
+  let (broken, (reconfigurations, activations, past_the_overlap, takeovers, durable, chained)) =
     run_following(Following::Joint);
   assert!(broken.is_empty(), "joint transition: {broken:?}");
   assert!(
-    reconfigurations > 0 && activations > 0 && past_the_overlap > 0 && takeovers > 0 && durable > 0
+    reconfigurations > 0
+      && activations > 0
+      && past_the_overlap > 0
+      && takeovers > 0
+      && durable > 0
+      && chained > 0
   );
 }
 
@@ -1468,6 +1501,31 @@ fn recording_a_new_holder_set_before_it_holds_the_log_loses_durable_writes() {
         || message.contains("Agreement")
     }),
     "recorded at once: {broken:?}"
+  );
+}
+
+/// A-240 at a takeover, the successor's rule alone, kept as a test: do run the same nemesis with every rule of the joint
+/// transition but one, a successor's shipper starting from the configuration's candidates rather than the set its
+/// takeover counted. Expect a history to break NoLoss, StaleNeverCommits or Agreement: the configuration may name a set
+/// the old owner was still moving to, which holds none of the durable writes, and the successor records it at once, so a
+/// second owner loss before its install lands (the chained takeover, at `f = 2`) counts that set. Red on f = 2 seed 43
+/// (NoLoss at epoch 3); without the chained step, 0 of 400 seeds broke. The daemon made every new shipper from the
+/// configuration before 2026-11-07 (`live_ship::published`).
+#[test]
+fn a_successor_that_starts_from_the_configuration_loses_durable_writes() {
+  let (broken, _) = run_following(Following::SuccessorFromConfiguration);
+  eprintln!(
+    "successor from the configuration: {} broken seeds; first {:?}",
+    broken.len(),
+    broken.first()
+  );
+  assert!(
+    broken.iter().any(|(_, _, message)| {
+      message.contains("NoLoss")
+        || message.contains("StaleNeverCommits")
+        || message.contains("Agreement")
+    }),
+    "successor from the configuration: {broken:?}"
   );
 }
 
