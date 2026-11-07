@@ -1,0 +1,145 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 02:18:38 UTC 2026
+== main round 1 at 02:18:38;  02:18:38 up 7 min,  0 user,  load average: 1.54, 1.78, 0.94
+nfs_large_write	v3	0	515.2	3264759	1.54 1.78 0.94
+nfs_large_write	v4	0	1084.4	1252774	1.54 1.78 0.94
+nfs_large_write	v3	1	1035.5	1330308	1.54 1.78 0.94
+nfs_large_write	v4	1	1012.4	1354343	1.50 1.77 0.94
+nfs_large_write	v3	2	1018.2	1323713	1.50 1.77 0.94
+nfs_large_write	v4	2	1172.0	1149285	1.50 1.77 0.94
+nfs_large_write	v3	3	1245.6	1069898	1.50 1.77 0.94
+nfs_large_write	v4	3	1207.5	1107185	1.50 1.77 0.94
+nfs_large_write	v3	4	1243.6	1076499	1.50 1.77 0.94
+nfs_large_write	v4	4	1177.2	1137013	1.50 1.77 0.94
+nfs_large_write	v3	5	1097.9	1250431	1.50 1.77 0.94
+nfs_large_write	v4	5	1068.8	1275670	1.50 1.77 0.94
+nfs_large_write	v3	6	874.4	1453414	1.50 1.77 0.94
+nfs_large_write	v4	6	1016.3	1347237	1.46 1.76 0.94
+nfs_large_write_best	v3	1245.6	515.2 1035.5 1018.2 1245.6 1243.6 1097.9 874.4
+nfs_large_write_best	v4	1207.5	1084.4 1012.4 1172.0 1207.5 1177.2 1068.8 1016.3
+nfs_kept_after_idle	0	544.0	0	13107118080
+nfs_kept_after_idle	1	1036.4	67108864	13107118080
+nfs_kept_after_idle	2	1146.1	201326592	13107118080
+nfs_kept_after_idle	3	1122.2	335544320	13107118080
+nfs_kept_after_idle	4	1126.8	469762048	13107118080
+nfs_kept_after_idle_all	544.0 1036.4 1146.1 1122.2 1126.8
+== main round 1 exit 0
+== fix round 1 at 02:18:53;  02:18:53 up 7 min,  0 user,  load average: 1.34, 1.73, 0.93
+nfs_large_write	v3	0	577.2	2568034	1.34 1.73 0.93
+nfs_large_write	v4	0	856.5	2112191	1.34 1.73 0.93
+nfs_large_write	v3	1	1021.0	1331459	1.34 1.73 0.93
+nfs_large_write	v4	1	1083.2	1256684	1.31 1.71 0.93
+nfs_large_write	v3	2	1157.9	1173563	1.31 1.71 0.93
+nfs_large_write	v4	2	1135.0	1190386	1.31 1.71 0.93
+nfs_large_write	v3	3	1100.5	1240176	1.31 1.71 0.93
+nfs_large_write	v4	3	1241.9	1072801	1.31 1.71 0.93
+nfs_large_write	v3	4	1258.1	1060182	1.31 1.71 0.93
+nfs_large_write	v4	4	1185.7	1131011	1.31 1.71 0.93
+nfs_large_write	v3	5	1176.9	1149411	1.31 1.71 0.93
+nfs_large_write	v4	5	1144.8	1173617	1.31 1.71 0.93
+nfs_large_write	v3	6	1250.3	1069917	1.31 1.71 0.93
+nfs_large_write	v4	6	1116.5	1207778	1.37 1.72 0.94
+nfs_large_write_best	v3	1258.1	577.2 1021.0 1157.9 1100.5 1258.1 1176.9 1250.3
+nfs_large_write_best	v4	1241.9	856.5 1083.2 1135.0 1241.9 1185.7 1144.8 1116.5
+nfs_kept_after_idle	0	592.6	0	13107118080
+nfs_kept_after_idle	1	1127.7	67108864	13107118080
+nfs_kept_after_idle	2	1128.7	201326592	13107118080
+nfs_kept_after_idle	3	967.6	335544320	13107118080
+nfs_kept_after_idle	4	985.4	469762048	13107118080
+nfs_kept_after_idle_all	592.6 1127.7 1128.7 967.6 985.4
+== fix round 1 exit 0
+== main round 2 at 02:19:08;  02:19:08 up 8 min,  0 user,  load average: 1.26, 1.69, 0.94
+nfs_large_write	v3	0	484.0	3584469	1.26 1.69 0.94
+nfs_large_write	v4	0	1006.0	1354639	1.26 1.69 0.94
+nfs_large_write	v3	1	1142.2	1194233	1.26 1.69 0.94
+nfs_large_write	v4	1	1093.6	1238515	1.32 1.70 0.94
+nfs_large_write	v3	2	1159.5	1174765	1.32 1.70 0.94
+nfs_large_write	v4	2	1079.2	1266719	1.32 1.70 0.94
+nfs_large_write	v3	3	1101.7	1243264	1.32 1.70 0.94
+nfs_large_write	v4	3	1026.3	1336243	1.32 1.70 0.94
+nfs_large_write	v3	4	1239.2	1088011	1.32 1.70 0.94
+nfs_large_write	v4	4	1101.7	1224515	1.32 1.70 0.94
+nfs_large_write	v3	5	1141.1	1201636	1.32 1.70 0.94
+nfs_large_write	v4	5	1112.3	1218776	1.32 1.70 0.94
+nfs_large_write	v3	6	1157.9	1176650	1.37 1.70 0.95
+nfs_large_write	v4	6	1006.4	1360451	1.37 1.70 0.95
+nfs_large_write_best	v3	1239.2	484.0 1142.2 1159.5 1101.7 1239.2 1141.1 1157.9
+nfs_large_write_best	v4	1112.3	1006.0 1093.6 1079.2 1026.3 1101.7 1112.3 1006.4
+nfs_kept_after_idle	0	545.0	338870272	13445988352
+nfs_kept_after_idle	1	964.7	405979136	13445988352
+nfs_kept_after_idle	2	974.6	540196864	13445988352
+nfs_kept_after_idle	3	964.3	674414592	13445988352
+nfs_kept_after_idle	4	974.2	808632320	13445988352
+nfs_kept_after_idle_all	545.0 964.7 974.6 964.3 974.2
+== main round 2 exit 0
+== fix round 2 at 02:19:24;  02:19:24 up 8 min,  0 user,  load average: 1.26, 1.67, 0.94
+nfs_large_write	v3	0	616.5	2365113	1.26 1.67 0.94
+nfs_large_write	v4	0	1048.4	1284880	1.26 1.67 0.94
+nfs_large_write	v3	1	1111.1	1233691	1.24 1.66 0.94
+nfs_large_write	v4	1	1115.2	1204394	1.24 1.66 0.94
+nfs_large_write	v3	2	1085.5	1261580	1.24 1.66 0.94
+nfs_large_write	v4	2	1111.9	1224951	1.24 1.66 0.94
+nfs_large_write	v3	3	1064.2	1292331	1.24 1.66 0.94
+nfs_large_write	v4	3	1101.2	1238293	1.24 1.66 0.94
+nfs_large_write	v3	4	1077.2	1276497	1.24 1.66 0.94
+nfs_large_write	v4	4	1026.6	1335123	1.24 1.66 0.94
+nfs_large_write	v3	5	1059.2	1298235	1.24 1.66 0.94
+nfs_large_write	v4	5	1098.1	1239160	1.22 1.65 0.94
+nfs_large_write	v3	6	1208.9	1122298	1.22 1.65 0.94
+nfs_large_write	v4	6	1212.1	1108710	1.22 1.65 0.94
+nfs_large_write_best	v3	1208.9	616.5 1111.1 1085.5 1064.2 1077.2 1059.2 1208.9
+nfs_large_write_best	v4	1212.1	1048.4 1115.2 1111.9 1101.2 1026.6 1098.1 1212.1
+nfs_kept_after_idle	0	548.3	338264064	24618938368
+nfs_kept_after_idle	1	1045.3	405372928	24618938368
+nfs_kept_after_idle	2	1133.4	539590656	24618938368
+nfs_kept_after_idle	3	1051.2	673808384	24618938368
+nfs_kept_after_idle	4	973.4	808026112	24618938368
+nfs_kept_after_idle_all	548.3 1045.3 1133.4 1051.2 973.4
+== fix round 2 exit 0
+== main round 3 at 02:19:39;  02:19:39 up 8 min,  0 user,  load average: 1.12, 1.62, 0.94
+nfs_large_write	v3	0	626.9	2337481	1.11 1.61 0.94
+nfs_large_write	v4	0	1058.7	1277524	1.11 1.61 0.94
+nfs_large_write	v3	1	1217.7	1108265	1.11 1.61 0.94
+nfs_large_write	v4	1	1195.7	1106853	1.11 1.61 0.94
+nfs_large_write	v3	2	1251.7	1072745	1.11 1.61 0.94
+nfs_large_write	v4	2	1199.8	1105836	1.11 1.61 0.94
+nfs_large_write	v3	3	1143.3	1191132	1.11 1.61 0.94
+nfs_large_write	v4	3	1196.0	1111851	1.11 1.61 0.94
+nfs_large_write	v3	4	1098.3	1249348	1.11 1.61 0.94
+nfs_large_write	v4	4	1065.9	1274723	1.11 1.61 0.94
+nfs_large_write	v3	5	1162.0	1173953	1.19 1.62 0.94
+nfs_large_write	v4	5	1038.2	1306997	1.19 1.62 0.94
+nfs_large_write	v3	6	1066.5	1295901	1.19 1.62 0.94
+nfs_large_write	v4	6	1011.9	1341821	1.19 1.62 0.94
+nfs_large_write_best	v3	1251.7	626.9 1217.7 1251.7 1143.3 1098.3 1162.0 1066.5
+nfs_large_write_best	v4	1199.8	1058.7 1195.7 1199.8 1196.0 1065.9 1038.2 1011.9
+nfs_kept_after_idle	0	559.0	350126080	24630800384
+nfs_kept_after_idle	1	1138.0	417234944	24630800384
+nfs_kept_after_idle	2	1144.4	551452672	24630800384
+nfs_kept_after_idle	3	1161.5	685670400	24630800384
+nfs_kept_after_idle	4	1133.1	819888128	24630800384
+nfs_kept_after_idle_all	559.0 1138.0 1144.4 1161.5 1133.1
+== main round 3 exit 0
+== fix round 3 at 02:19:54;  02:19:54 up 8 min,  0 user,  load average: 1.17, 1.61, 0.94
+nfs_large_write	v3	0	587.6	2892629	1.17 1.61 0.94
+nfs_large_write	v4	0	1139.2	1172598	1.24 1.61 0.95
+nfs_large_write	v3	1	1083.1	1268646	1.24 1.61 0.95
+nfs_large_write	v4	1	1071.8	1265525	1.24 1.61 0.95
+nfs_large_write	v3	2	1092.9	1251552	1.24 1.61 0.95
+nfs_large_write	v4	2	1090.8	1242294	1.24 1.61 0.95
+nfs_large_write	v3	3	1037.5	1324601	1.24 1.61 0.95
+nfs_large_write	v4	3	1079.1	1252155	1.24 1.61 0.95
+nfs_large_write	v3	4	1099.6	1250623	1.24 1.61 0.95
+nfs_large_write	v4	4	994.3	1378808	1.24 1.61 0.95
+nfs_large_write	v3	5	1040.4	1321956	1.22 1.60 0.95
+nfs_large_write	v4	5	1015.3	1344886	1.22 1.60 0.95
+nfs_large_write	v3	6	1177.0	1158625	1.22 1.60 0.95
+nfs_large_write	v4	6	1168.9	1134597	1.22 1.60 0.95
+nfs_large_write_best	v3	1177.0	587.6 1083.1 1092.9 1037.5 1099.6 1040.4 1177.0
+nfs_large_write_best	v4	1168.9	1139.2 1071.8 1090.8 1079.1 994.3 1015.3 1168.9
+nfs_kept_after_idle	0	587.8	377651200	13484769280
+nfs_kept_after_idle	1	1132.5	444760064	13484769280
+nfs_kept_after_idle	2	1123.0	578977792	13484769280
+nfs_kept_after_idle	3	1133.2	713195520	13484769280
+nfs_kept_after_idle	4	1120.0	847413248	13484769280
+nfs_kept_after_idle_all	587.8 1132.5 1123.0 1133.2 1120.0
+== fix round 3 exit 0
