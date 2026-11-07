@@ -1,0 +1,46 @@
+runner ubuntu-latest, 4 CPUs, 58e1622 diag: liveness-22, the long-recovery red test on 8011d73a, both Linux ru, Sat Nov  7 23:15:02 UTC 2026
+long recovery: 1 units recovered in 6.728063ms of CPU, the beat's largest gap 100.181783ms
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+--
+long recovery: 2 units recovered in 6.490615ms of CPU, the beat's largest gap 100.174144ms
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+--
+long recovery: 4 units recovered in 7.162945ms of CPU, the beat's largest gap 100.237563ms
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+--
+long recovery: 8 units recovered in 8.026975ms of CPU, the beat's largest gap 100.183611ms
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+--
+long recovery: 16 units recovered in 9.284939ms of CPU, the beat's largest gap 100.216753ms
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+--
+long recovery: 32 units recovered in 14.66311ms of CPU, the beat's largest gap 100.184712ms
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+--
+long recovery: 64 units recovered in 34.015597ms of CPU, the beat's largest gap 100.18432ms
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+--
+long recovery: 128 units recovered in 102.043823ms of CPU, the beat's largest gap 100.191493ms
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+--
+long recovery: 256 units recovered in 373.413727ms of CPU, the beat's largest gap 100.192642ms
+slates daemon: the control loop ended; the watchdog withholds the beat so the anchor restarts the daemon
+--
+slates daemon: shard 1 is spinning: 1001 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+slates-server: shard 1: recovered 0 volumes from their images (0 refused), 1025 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clon
+--
+long recovery: 512 units recovered in 1.399001902s of CPU, the beat's largest gap 400.608937ms
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+--
+slates daemon: shard 1 is spinning: 1001 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+slates-server: shard 1 is still starting; the control loop waits a further window
+--
+long recovery: 1024 units recovered in 5.550880841s of CPU, the beat's largest gap 4.607254402s
+
+thread 'a_daemon_keeps_its_beat_through_a_recovery_longer_than_a_window_and_recovers_everything' (5653) panicked at crates/server/tests/recovery.rs:2817:3:
+the beat went 4.607254402s without advancing while the daemon recovered 1024 units, past the 1s window plus a 100ms beat: the watchdog withheld it
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 47 filtered out; finished in 32.07s
+
+== a_daemon_keeps_its_beat_through_a_recovery_longer_than_a_window_and_recovers_everything exit 101
