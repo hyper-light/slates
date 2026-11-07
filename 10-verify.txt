@@ -46,3 +46,5 @@ the fleet re-formed after the successor: [Some(("8741851865324486714", 3, 0)), S
 mounts 0
 === mirror 1 exit 0 load { 44.63 42.75 27.48 }
 mounts 0
+=== mirror 2 exit 0 load { 44.90 42.83 27.60 }
+mounts 0
