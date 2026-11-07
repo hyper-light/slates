@@ -1,0 +1,89 @@
+name: diag-clients
+
+# Diagnostics only, never on main (R3 class A, a cross-shard wait judged in its target's own time): on CI's Linux and
+# Windows runners, the direct map's starved hand-off test (crates/client/tests/client.rs) at the fix, quiet and under the A/B bar's load (two spinning
+# shell loops a logical CPU), the server suites beside it, and last the same test over main's server sources (d61c3be2),
+# where every starved case must fail. Each job pushes its result lines to diag-results/clients-r3a-6-<os> with the
+# Actions token, read by git fetch at no API quota.
+on:
+  push:
+    branches: ["diag-clients-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cross-shard-wait:
+    name: R3 class A on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Build the tests
+        run: cargo test --locked -p slates-client --test client --no-run
+      - name: The family test at the fix, quiet and busy; the suites; then over main's sources
+        run: |
+          set +e
+          R=../results.txt
+          cpus=$(nproc 2>/dev/null || echo "$NUMBER_OF_PROCESSORS")
+          echo "runner ${{ matrix.os }}, $cpus CPUs, $(date -u), commit $(git rev-parse --short HEAD)" > $R
+          T="cargo test --locked -q -p slates-client --test client -- --nocapture --exact a_map_whose_clients_shard_is_starved_at_its_hand_off_is_direct_past_a_wall_window"
+          for round in 1 2 3; do
+            echo "== fix quiet round $round at $(date -u +%H:%M:%S)" | tee -a $R
+            $T 2>&1 | grep -E '^a map|panicked|test result|error' | tee -a $R
+          done
+          for round in 1 2 3; do
+            pids=""
+            for i in $(seq 1 $((cpus * 2))); do ( while :; do :; done ) & pids="$pids $!"; done
+            echo "== fix busy (two spinners a CPU) round $round at $(date -u +%H:%M:%S)" | tee -a $R
+            $T 2>&1 | grep -E '^a map|panicked|test result|error' | tee -a $R
+            for p in $pids; do kill "$p" 2>/dev/null || true; done
+            wait 2>/dev/null || true
+          done
+          for cmd in \
+            "cargo clippy --locked -p slates-client --test client -- -D warnings" \
+            "cargo test --locked -q -p slates-client --test client -- --test-threads=1"; do
+            echo "== $cmd" | tee -a $R
+            $cmd 2>&1 | grep -E 'test result|FAILED|panicked|^error|^warning|-->|^    [a-z_:]+$' | tee -a $R
+            echo "== exit ${PIPESTATUS[0]}" | tee -a $R
+          done
+          git checkout d61c3be2 -- crates/server/src
+          echo "== main's server sources (d61c3be2), the test unchanged: every starved case must fail" | tee -a $R
+          for round in 1 2; do
+            echo "== main quiet round $round at $(date -u +%H:%M:%S)" | tee -a $R
+            $T 2>&1 | grep -E '^a map|panicked|test result|error' | tee -a $R
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/clients-r3a-6-${{ matrix.os }}"
+          git config user.name "diag-clients"
+          git config user.email "diag-clients@users.noreply.github.com"
+          git stash -q || true
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-clients r3a-6 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
