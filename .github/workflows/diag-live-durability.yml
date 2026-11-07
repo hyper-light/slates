@@ -1,0 +1,69 @@
+name: diag-live-durability
+
+# Diagnostics only, never on main (A-200): live-fixes' 1b41b1dd (a holder the volume's record names takes its owner's
+# entries though its own configuration has not placed it) alone on the landing tip d26f35d1, against the tip, both
+# arches; the rolling partition x10 per leg, counting not_a_candidate and writes over 1 s. Both legs carry diag-38's
+# stuck-write watcher (diag only). Results to diag-results/live-durability-39-<leg>.
+on:
+  push:
+    branches: ["diag-live-durability-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  SLATES_TEST_CLI: "1"
+
+jobs:
+  check:
+    name: partition (${{ matrix.leg }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { leg: admit-x86, os: ubuntu-latest, ref: 62a3b21d8973f35e10cab5413d4482c23ace6a7f }
+          - { leg: admit-arm, os: ubuntu-24.04-arm, ref: 62a3b21d8973f35e10cab5413d4482c23ace6a7f }
+          - { leg: tip-x86, os: ubuntu-latest, ref: 691f8c494b0ce138b161ede92ca51f3df7b915bc }
+          - { leg: tip-arm, os: ubuntu-24.04-arm, ref: 691f8c494b0ce138b161ede92ca51f3df7b915bc }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.leg }}
+      - name: The runs
+        shell: bash {0}
+        run: |
+          R=../results.txt
+          echo "leg ${{ matrix.leg }}, ${{ matrix.os }}, $(nproc) CPUs, $(date -u), tree $(git rev-parse HEAD)" > $R
+          timeout 1800 cargo build --release --locked -p slates-cli --bin slates --test live_chaos > ../build.log 2>&1; status=$?
+          echo "== release build exit $status" >> $R
+          [ $status -ne 0 ] && grep -E '^error' -A8 ../build.log | head -40 >> $R
+          for run in $(seq 1 10); do
+            timeout 900 cargo test --release --locked -p slates-cli --test live_chaos -- --nocapture --test-threads=1 --exact candidates_partitioned_in_turn_mid_stream_lose_nothing > ../run.log 2>&1; status=$?
+            grep -E '^  [0-9]+ writes|violations|refused the owner|panicked|^  chaos-rolling.*partitioned' ../run.log | grep -v '^chaos' | cut -c1-600 >> $R || true
+            sed -n '/^LD-STUCK/,/^LD-END/p' ../run.log | cut -c1-700 >> $R
+            [ $status -ne 0 ] && { echo "-- tail"; tail -40 ../run.log | cut -c1-600; } >> $R
+            echo "== partition $run exit $status" >> $R
+          done
+          exit 0
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/live-durability-39-${{ matrix.leg }}"
+          git config user.name "diag-live-durability"
+          git config user.email "diag-live-durability@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-live-durability-39 results, ${{ matrix.leg }}"
+          git push -q origin "HEAD:refs/heads/$branch"
