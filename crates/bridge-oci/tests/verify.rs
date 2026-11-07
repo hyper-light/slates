@@ -145,28 +145,11 @@ const MOUNTINFO: &str = "\
 95 27 0:50 / /var/lib/docker/overlay2/x/merged rw,relatime - overlay overlay rw,lowerdir=/a,upperdir=/b,workdir=/c
 ";
 
-/// A source that is not `slates:` and exactly sixteen lowercase hex digits names no attachment.
-fn a_malformed_attachment_source_names_none() {
-  for malformed in [
-    "slates:ab",
-    "slates:00000000000000AB",
-    "slates:000000000000000g",
-    "other:00000000000000ab",
-  ] {
-    assert_eq!(
-      slates_bridge_oci::verify::attachment_of_source(malformed),
-      None,
-      "{malformed}"
-    );
-  }
-}
-
-/// AUD-29-64. The Linux table parses with its escapes undone; a slates FUSE mount is verified by its type
-/// and the attachment its source names (`slates:<16 hex digits>`), which the daemon then holds to its record;
-/// a FUSE mount whose source names no attachment — the old shared `slates` form, or anything else — is not
-/// this volume's, and a malformed id is no attachment.
+/// AUD-29-64, A-227. The Linux table parses with its escapes undone; a slates FUSE mount is verified by its type and
+/// a `slates:<tag>` source, with the table's id of the mount, which the daemon then holds to its own mounts and its
+/// record; a FUSE mount whose source is the old shared `slates` form, or anything else, is not this volume's.
 #[test]
-fn a_fuse_mount_is_verified_by_the_attachment_its_source_names() {
+fn a_fuse_mount_is_verified_by_its_slates_source_and_table_id() {
   let table = parse_mountinfo(MOUNTINFO).unwrap();
   assert_eq!(table.len(), 5);
   assert_eq!(table[2].mount_point, "/home/runner/mnt point");
@@ -181,7 +164,7 @@ fn a_fuse_mount_is_verified_by_the_attachment_its_source_names() {
   )
   .unwrap();
   assert!(verified.names_volume);
-  assert_eq!(verified.attachment, Some(0xab));
+  assert_eq!(verified.table_id, table[2].identity.mount);
   assert_eq!(
     verify_host_mount(
       &table,
@@ -193,7 +176,6 @@ fn a_fuse_mount_is_verified_by_the_attachment_its_source_names() {
       source: "slates".to_owned()
     })
   );
-  a_malformed_attachment_source_names_none();
   assert_eq!(
     verify_host_mount(&table, "/", &expected, MountIdentity::default()),
     Err(HostPathRefusal::ForeignFilesystem {

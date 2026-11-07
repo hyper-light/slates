@@ -1314,6 +1314,7 @@ dependencies = [
  "blake3",
  "libc",
  "rustix",
+ "slates-bridge-oci",
  "slates-machine",
  "slates-mem",
  "slates-vfs",

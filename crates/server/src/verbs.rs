@@ -833,7 +833,9 @@ fn is_forwardable_write(body: &RequestBody) -> bool {
 ///   watermark prunes this client's forwarded completions first (RIFL, banned item 8).
 /// - Anything else is refused `Unsupported`.
 ///
-/// `control` is the shard this serve loop runs on (the `xshard` origin).
+/// `control` is the shard this serve loop runs on (the `xshard` origin). Each call to the owner shard is waited for in
+/// that shard's own time (`xshard::call_in_shard_time`, R3 class A): before, a peer's read of a volume whose owner shard
+/// was given a fifth of a core for 1.5 s was answered `NotFound` at the wall second.
 pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) -> Vec<u8> {
   let Ok(ForwardedRequest {
     principal,
@@ -891,7 +893,7 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
   let origin_host = origin.0;
   let id = RequestId::from_word(request);
   let reply = if is_forwardable_read(&body) {
-    crate::xshard::call_within(
+    crate::xshard::call_in_shard_time(
       control,
       shard,
       move |s| dispatch(s, FORWARDED_CLIENT, &principal, body),
@@ -899,7 +901,7 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     )
     .await
   } else if is_forwardable_write(&body) {
-    let forwarded = crate::xshard::call_within(
+    let forwarded = crate::xshard::call_in_shard_time(
       control,
       shard,
       move |s| {
@@ -918,7 +920,7 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
         // A change the verb recorded is told to every FUSE mount of its volume before the exchange answers (AC-3.3):
         // the wait runs on the owner shard, where the mounts are, and is bounded by its own deadline.
         if let Some(owed) = owed {
-          let _ = crate::xshard::task_within(
+          let _ = crate::xshard::task_in_shard_time(
             control,
             shard,
             move || crate::told::wait(owed),
@@ -958,7 +960,7 @@ async fn await_deferred_completion(
     slates_rt::futures::sleep(crate::daemon::HEARTBEAT_NS)
       .await
       .ok()?;
-    let recorded = crate::xshard::call_within(
+    let recorded = crate::xshard::call_in_shard_time(
       control,
       shard,
       move |s| match s
@@ -3147,6 +3149,18 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
             crate::xshard::RUN_REFUSED_COUNTER,
             crate::xshard::run_refused(),
           ),
+          (
+            crate::fleet::SERVE_RECEIVE_EARLIER_SEND,
+            demux_sum(state, |c| c.receive_refused_earlier_send),
+          ),
+          (
+            crate::fleet::SERVE_RECEIVE_RESOURCES,
+            demux_sum(state, |c| c.receive_refused_resources),
+          ),
+          (
+            crate::fleet::SERVE_RECEIVE_OTHER,
+            demux_sum(state, |c| c.receive_refused_other),
+          ),
         ]
         .into_iter()
         .filter(|(_, count)| *count > 0)
@@ -3480,6 +3494,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::HolderPending => "holder_pending",
     Refusal::MapsHeld { .. } => "maps_held",
     Refusal::RemoteAttachmentsFull { .. } => "remote_attachments_full",
+    Refusal::OwnMount { .. } => "own_mount",
     Refusal::TableAtCapacity { .. } => "table_at_capacity",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
@@ -4932,11 +4947,19 @@ fn open_base(
   config: VolumeConfig,
 ) -> Result<(Volume, Option<OsHost>), Box<ReplyBody>> {
   let (mut host, root) = OsHost::open_root(std::path::Path::new(path)).map_err(|e| {
-    Box::new(refused(Refusal::BaseUnavailable {
-      path: path.to_owned(),
-      errno: match e {
-        slates_vfs::host::HostError::Unavailable(code) => code,
-        _ => 0,
+    Box::new(refused(match e {
+      // A-227: a base on one of this daemon's own mounts, refused before anything opened it.
+      slates_vfs::host::HostError::OwnMount(_) => Refusal::OwnMount {
+        path: path.to_owned(),
+        used_as: slates_ipc::protocol::OwnMountUse::Base,
+      },
+      slates_vfs::host::HostError::Unavailable(code) => Refusal::BaseUnavailable {
+        path: path.to_owned(),
+        errno: code,
+      },
+      _ => Refusal::BaseUnavailable {
+        path: path.to_owned(),
+        errno: 0,
       },
     }))
   })?;
@@ -7403,6 +7426,13 @@ fn bind_mount(
       reason: "a mount point is a non-empty path within the OS limit".to_owned(),
     });
   }
+  // The mount the CLI just made is this daemon's own from here (A-227): the kernel's table names it at exactly the
+  // bound path, the one the kernel records (a point holding no mount of the volume records nothing).
+  #[cfg(target_os = "macos")]
+  let own = match crate::own_nfs::bound(state, &record, path) {
+    Ok(own) => own,
+    Err(refusal) => return refused(refusal),
+  };
   let now = state.clock.monotonic_ns();
   match state.db.mutate(
     &mut state.segment,
@@ -7412,7 +7442,13 @@ fn bind_mount(
     },
     now,
   ) {
-    Ok(_) => ReplyBody::MountBound,
+    Ok(_) => {
+      #[cfg(target_os = "macos")]
+      if let Some(own) = own {
+        state.own_nfs_mounts.insert(attachment, own);
+      }
+      ReplyBody::MountBound
+    }
     Err(e) => refused(refusal_of_db(&e)),
   }
 }
@@ -7504,6 +7540,10 @@ pub(crate) fn end_attachment(
   // write by path to reach, so nothing is exposed by removing it (§4.6 "Windows").
   #[cfg(windows)]
   crate::winfsp::end_if_mounted(state, record.id);
+  // A macOS NFS mount is no longer this daemon's once its attachment ends: its requests are refused under the revoked
+  // registry attachment below, and a path on it is a stranger's (A-227).
+  #[cfg(target_os = "macos")]
+  state.own_nfs_mounts.remove(&record.id);
   // The registry attachment a mount's requests rode ends with the record: revoked so no later request
   // is admitted under it, drained so its slot is reused (GAP-A9-4).
   if let Some(mount) = state.mount_attachments.remove(&record.id) {

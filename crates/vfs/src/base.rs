@@ -704,7 +704,7 @@ fn host_refusal(e: HostError) -> VfsError {
     HostError::NotDirectory => VfsError::NotDirectory,
     HostError::NotFile => VfsError::IsDirectory,
     HostError::StaleHandle => VfsError::StaleHandle,
-    HostError::Unavailable(errno) => VfsError::BaseUnavailable(errno),
+    HostError::Unavailable(errno) | HostError::OwnMount(errno) => VfsError::BaseUnavailable(errno),
   }
 }
 

@@ -506,7 +506,7 @@ fn land_verb_unix(
   // escapes containment, is a typed refusal with no write.
   let (os, land_target) = match OsLand::open_target(std::path::Path::new(target)) {
     Ok(pair) => pair,
-    Err(refusal) => return refused(target_refusal(&refusal)),
+    Err(refusal) => return refused(target_refusal(&refusal, target)),
   };
   let prepared = Prepared {
     handle,
@@ -597,7 +597,7 @@ fn run_landing(
       Ok(pair) => pair,
       Err((host, refusal)) => {
         slot.host = Some(host);
-        return refused(target_refusal(&refusal));
+        return refused(target_refusal(&refusal, &prepared.target));
       }
     }
   } else {
@@ -1252,7 +1252,7 @@ fn begin_granted(
       Err((host, refusal)) => {
         slot.host = Some(host);
         drop_implicit(slot, &mut state.store, implicit, &mut state.refusals);
-        return Begun::Refused(refused(target_refusal(&refusal)));
+        return Begun::Refused(refused(target_refusal(&refusal, &prepared.target)));
       }
     }
   } else {
@@ -2076,7 +2076,8 @@ fn answer_of(error: HostError) -> HostAnswer {
     HostError::NotDirectory => HostAnswer::NotDirectory,
     HostError::NotFile => HostAnswer::NotFile,
     HostError::StaleHandle => HostAnswer::StaleHandle,
-    HostError::Unavailable(errno) => HostAnswer::Errno { errno },
+    // A-227: a path on a mount this daemon serves carries the platform's deadlock-avoided errno.
+    HostError::Unavailable(errno) | HostError::OwnMount(errno) => HostAnswer::Errno { errno },
   }
 }
 
@@ -2398,12 +2399,19 @@ fn summary_of(manifest: &Manifest) -> LandingSummary {
 }
 
 #[cfg(unix)]
-fn target_refusal(refusal: &TargetRefusal) -> Refusal {
+fn target_refusal(refusal: &TargetRefusal, target: &str) -> Refusal {
+  if matches!(refusal, TargetRefusal::OwnMount) {
+    return Refusal::OwnMount {
+      path: target.to_owned(),
+      used_as: slates_ipc::protocol::OwnMountUse::LandingTarget,
+    };
+  }
   Refusal::TargetUnavailable {
     reason: match refusal {
       TargetRefusal::NotAbsolute => "the target path is not absolute".to_owned(),
       TargetRefusal::EscapesTarget => "a component escapes the target directory".to_owned(),
       TargetRefusal::TargetNotOwned => "the target is owned by another user".to_owned(),
+      TargetRefusal::OwnMount => "a component lies on a mount this daemon serves".to_owned(),
       TargetRefusal::Unavailable(e) => format!("{e:?}"),
     },
   }
