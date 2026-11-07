@@ -1,0 +1,67 @@
+runner ubuntu-24.04-arm, 4 CPUs, Sat Nov  7 01:54:27 UTC 2026, commit 87708c1f
+== ack_release_main busy round 1 at 01:54:27
+status on a starved shard answered in 566.999018ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.65s
+== ack_release busy round 1 at 01:54:31
+status on a starved shard answered in 548.975234ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.91s
+== ack_release_main busy round 2 at 01:54:34
+status on a starved shard answered in 569.984988ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.75s
+== ack_release busy round 2 at 01:54:38
+status on a starved shard answered in 542.710599ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.67s
+== ack_release_main busy round 3 at 01:54:41
+thread 'a_listing_whose_part_cannot_be_sent_is_refused_overloaded' (5641) panicked at crates/server/tests/ack_release_main.rs:455:3:
+list with the other shard's control channel full: Listed { volumes: [] }
+status on a starved shard answered in 564.014259ms
+    a_listing_whose_part_cannot_be_sent_is_refused_overloaded
+test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.60s
+== ack_release busy round 3 at 01:54:45
+status on a starved shard answered in 521.995787ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.92s
+== ack_release_main busy round 4 at 01:54:49
+status on a starved shard answered in 551.010526ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.93s
+== ack_release busy round 4 at 01:54:54
+status on a starved shard answered in 552.284469ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.04s
+== ack_release_main busy round 5 at 01:54:57
+status on a starved shard answered in 531.018277ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.84s
+== ack_release busy round 5 at 01:55:01
+status on a starved shard answered in 526.136464ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.47s
+== ack_release_main busy round 6 at 01:55:05
+thread 'a_listing_whose_part_cannot_be_sent_is_refused_overloaded' (5972) panicked at crates/server/tests/ack_release_main.rs:455:3:
+list with the other shard's control channel full: Listed { volumes: [] }
+status on a starved shard answered in 552.992483ms
+    a_listing_whose_part_cannot_be_sent_is_refused_overloaded
+test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.98s
+== ack_release busy round 6 at 01:55:09
+status on a starved shard answered in 539.855285ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.31s
+== ack_release_main busy round 7 at 01:55:12
+status on a starved shard answered in 538.922996ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.27s
+== ack_release busy round 7 at 01:55:16
+status on a starved shard answered in 553.017162ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.06s
+== ack_release_main busy round 8 at 01:55:19
+status on a starved shard answered in 534.028052ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.77s
+== ack_release busy round 8 at 01:55:24
+status on a starved shard answered in 558.831142ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.96s
+== ack_release_main busy round 9 at 01:55:27
+status on a starved shard answered in 541.009882ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.14s
+== ack_release busy round 9 at 01:55:30
+status on a starved shard answered in 543.977745ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.78s
+== ack_release_main busy round 10 at 01:55:33
+status on a starved shard answered in 536.993384ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.85s
+== ack_release busy round 10 at 01:55:38
+status on a starved shard answered in 538.027026ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.44s
