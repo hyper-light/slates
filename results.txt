@@ -1,0 +1,8 @@
+tested 3ac85f45207de5742f74438ed840c92d04144c09 variant after on x86_64, 4 cpus
+unstarted exit 0 98s
+unstarted-again exit 0 2s
+held exit 0 93s
+fleet-forward exit 0 146s
+server-lib exit 0 27s
+server exit 0 21s
+clippy exit 0 94s
