@@ -93,6 +93,11 @@ pub struct Db {
   since_snapshot_bytes: u64,
   next_slot: u8,
   snapshots_taken: u64,
+  /// The bytes the snapshots taken since recovery wrote: with `log_bytes_appended`, the measure of what snapshots cost
+  /// against the log they absorb (A-243's non-vacuity count).
+  snapshot_bytes_written: u64,
+  /// The log bytes appended since recovery.
+  log_bytes_appended: u64,
   /// Operations applied since `begin`, waiting to go into one record at `commit`.
   pending: Option<Vec<Op>>,
   /// The clock the last mutation ran at: the time a partition re-derived on a rolled-back
@@ -187,6 +192,8 @@ pub fn recover(
     since_snapshot_bytes: replayed.bytes,
     next_slot: snapshot.map_or(0, |(slot, _)| other_slot(slot)),
     snapshots_taken: 0,
+    snapshot_bytes_written: 0,
+    log_bytes_appended: 0,
     pending: None,
     last_now_ns: now_ns,
     rollbacks: 0,
@@ -279,6 +286,16 @@ impl Db {
     self.snapshots_taken
   }
 
+  /// The bytes the snapshots taken since recovery wrote.
+  pub fn snapshot_bytes_written(&self) -> u64 {
+    self.snapshot_bytes_written
+  }
+
+  /// The log bytes appended since recovery.
+  pub fn log_bytes_appended(&self) -> u64 {
+    self.log_bytes_appended
+  }
+
   /// Guard, append, apply: the mutation is durable in the segment when this returns; a reply
   /// may follow. Returns the record's sequence.
   pub fn mutate(
@@ -311,6 +328,7 @@ impl Db {
     self.partition.apply(op)?;
     self.next_seq = seq.saturating_add(1);
     self.since_snapshot_bytes = self.since_snapshot_bytes.saturating_add(bytes);
+    self.log_bytes_appended = self.log_bytes_appended.saturating_add(bytes);
     self.maintain(segment);
     Ok(seq)
   }
@@ -376,6 +394,7 @@ impl Db {
     };
     self.next_seq = seq.saturating_add(1);
     self.since_snapshot_bytes = self.since_snapshot_bytes.saturating_add(bytes);
+    self.log_bytes_appended = self.log_bytes_appended.saturating_add(bytes);
     self.maintain(segment);
     Ok(Some(seq))
   }
@@ -464,14 +483,15 @@ impl Db {
   pub fn snapshot(&mut self, segment: &mut AnchorSegment) -> Result<(), DbError> {
     let seq = self.next_seq.saturating_sub(1);
     let snapshot = self.partition.to_snapshot(seq);
-    segment.publish(
-      RegionKind::Snapshot(self.index, self.next_slot),
-      &snapshot.to_bytes(),
-    )?;
+    let bytes = snapshot.to_bytes();
+    segment.publish(RegionKind::Snapshot(self.index, self.next_slot), &bytes)?;
     self.log.trim(segment, self.next_seq)?;
     self.next_slot = other_slot(self.next_slot);
     self.since_snapshot_bytes = 0;
     self.snapshots_taken = self.snapshots_taken.saturating_add(1);
+    self.snapshot_bytes_written = self
+      .snapshot_bytes_written
+      .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
     Ok(())
   }
 
