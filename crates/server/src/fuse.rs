@@ -243,7 +243,7 @@ pub(crate) fn check_mount_point(path: &str, principal: &Principal) -> Result<(),
   if owner != rustix::process::geteuid().as_raw() {
     return refuse(format!("belongs to uid {owner}, not the daemon's user"));
   }
-  if let Principal::Uid { uid } = principal
+  if let Principal::Uid { uid, .. } = principal
     && *uid != owner
   {
     return refuse(format!(

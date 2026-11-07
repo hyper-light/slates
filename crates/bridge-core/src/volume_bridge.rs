@@ -557,7 +557,7 @@ impl<'v> VolumeBridge<'v> {
   ) -> Result<(), VfsError> {
     let uid = match (cx.owner_uid, &cx.subject) {
       (Some(uid), _) => uid,
-      (None, Principal::Uid { uid }) => *uid,
+      (None, Principal::Uid { uid, .. }) => *uid,
       // An enrolled consumer is a workload *within* its host account (§4.13): what it creates is the
       // account's, as the host filesystem will report it.
       (None, Principal::Consumer { account, .. }) => *account,

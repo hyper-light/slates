@@ -665,11 +665,17 @@ const SOCKET_KEY: u64 = u64::MAX;
 
 impl VhostUserSeam {
   /// Adopts `socket`, a connected stream socket whose other end is the VMM's vhost-user front end, for a
-  /// device of `config`'s queues. The consumer is the peer's uid, read now, before any message.
-  pub fn adopt(socket: OwnedFd, config: &DeviceConfig) -> Result<VhostUserSeam, VhostError> {
+  /// device of `config`'s queues. The consumer is the peer's uid, read now, before any message, as an account of `host`,
+  /// this node's certificate anchor: the peer is a process of this host (A-237).
+  pub fn adopt(
+    socket: OwnedFd,
+    config: &DeviceConfig,
+    host: slates_db::HostId,
+  ) -> Result<VhostUserSeam, VhostError> {
     let credentials =
       slates_ipc::peer::peer_credentials(socket.as_fd()).map_err(|_| VhostError::PeerUnverified)?;
     let consumer = Principal::Uid {
+      host,
       uid: credentials.uid,
     };
     VhostUserSeam::adopt_for(socket, config, consumer)

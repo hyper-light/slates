@@ -229,7 +229,7 @@ fn admit(
 /// Unix identity (the bridge's default owner).
 fn unix_uid(principal: &Principal) -> Option<u32> {
   match principal {
-    Principal::Uid { uid } => Some(*uid),
+    Principal::Uid { uid, .. } => Some(*uid),
     Principal::Consumer { account, .. } => Some(*account),
     Principal::Sid { .. } | Principal::Certificate { .. } => None,
   }

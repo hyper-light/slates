@@ -519,13 +519,21 @@ pub(crate) enum Verb {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SharePrincipal {
   /// A host account.
-  Uid(u32),
+  Uid {
+    /// The uid.
+    uid: u32,
+    /// The host whose account it is, by its certificate anchor as `slates status` prints it, or this daemon's own
+    /// when none is given (A-237).
+    host: Option<u64>,
+  },
   /// An enrolled consumer.
   Consumer {
     /// The account, or the caller's own when none is given.
     account: Option<u32>,
     /// The consumer id.
     consumer: u64,
+    /// The host whose account the consumer was enrolled under, or this daemon's own when none is given (A-237).
+    host: Option<u64>,
   },
 }
 
@@ -1224,23 +1232,36 @@ fn account(text: &str) -> Result<u32, ParseError> {
   })
 }
 
-/// `uid:N`, `consumer:N` or `consumer:ACCOUNT/N`.
+/// `uid:N`, `consumer:N` or `consumer:ACCOUNT/N`, each optionally `@ANCHOR`: the host whose account it is, by the
+/// `anchor` `slates status` prints on that host (A-237; a uid means something only on its host). Without one, this
+/// daemon's own host.
 fn share_principal(text: &str) -> Result<SharePrincipal, ParseError> {
   let bad = || ParseError::BadValue {
     what: "PRINCIPAL",
-    reason: format!("{text} (uid:N, consumer:N or consumer:ACCOUNT/N)"),
+    reason: format!(
+      "{text} (uid:N, consumer:N or consumer:ACCOUNT/N, each optionally @ANCHOR from `slates status`)"
+    ),
   };
   let (kind, value) = text.split_once(':').ok_or_else(bad)?;
+  let (value, host) = match value.split_once('@') {
+    Some((value, anchor)) => (value, Some(number(anchor).map_err(|_| bad())?)),
+    None => (value, None),
+  };
   match kind {
-    "uid" => Ok(SharePrincipal::Uid(account(value).map_err(|_| bad())?)),
+    "uid" => Ok(SharePrincipal::Uid {
+      uid: account(value).map_err(|_| bad())?,
+      host,
+    }),
     "consumer" => match value.split_once('/') {
       Some((owner, consumer)) => Ok(SharePrincipal::Consumer {
         account: Some(account(owner).map_err(|_| bad())?),
         consumer: number(consumer).map_err(|_| bad())?,
+        host,
       }),
       None => Ok(SharePrincipal::Consumer {
         account: None,
         consumer: number(value).map_err(|_| bad())?,
+        host,
       }),
     },
     _ => Err(bad()),
@@ -2564,6 +2585,7 @@ mod tests {
         SharePrincipal::Consumer {
           account: None,
           consumer: 7,
+          host: None,
         },
         Rights {
           read: true,
@@ -2578,6 +2600,7 @@ mod tests {
         SharePrincipal::Consumer {
           account: Some(501),
           consumer: 7,
+          host: None,
         },
         Rights {
           read: false,
@@ -2588,7 +2611,39 @@ mod tests {
     );
     assert_eq!(
       client_verb(&format!("share {id} uid:501")),
-      share(SharePrincipal::Uid(501), Rights::default())
+      share(
+        SharePrincipal::Uid {
+          uid: 501,
+          host: None
+        },
+        Rights::default()
+      )
+    );
+    // A-237: another host's account names that host by the anchor its `slates status` prints.
+    assert_eq!(
+      client_verb(&format!("share {id} uid:501@12345 --read")),
+      share(
+        SharePrincipal::Uid {
+          uid: 501,
+          host: Some(12345)
+        },
+        Rights {
+          read: true,
+          write: false,
+          admin: false,
+        },
+      )
+    );
+    assert_eq!(
+      client_verb(&format!("share {id} consumer:501/7@12345")),
+      share(
+        SharePrincipal::Consumer {
+          account: Some(501),
+          consumer: 7,
+          host: Some(12345),
+        },
+        Rights::default()
+      )
     );
     assert!(matches!(
       parse(&args(&format!("share {id} nobody:1"))),

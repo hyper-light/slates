@@ -366,7 +366,14 @@ impl AnchorSegment {
         reason: "wrong magic",
       });
     }
-    if read_u32(bytes, AT_VERSION) != LAYOUT_VERSION {
+    let version = read_u32(bytes, AT_VERSION);
+    if version == crate::layout::LAYOUT_BEFORE_HOST_SCOPED_PRINCIPALS {
+      return Err(AnchorError::Layout {
+        reason: "a layout-4 segment names accounts with no host (before A-237); start a new instance and re-enroll \
+                 its consumers and re-share its volumes",
+      });
+    }
+    if version != LAYOUT_VERSION {
       return Err(AnchorError::Layout {
         reason: "wrong layout version",
       });

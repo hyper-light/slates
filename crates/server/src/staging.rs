@@ -217,7 +217,10 @@ mod tests {
   }
 
   fn owner() -> Principal {
-    Principal::Uid { uid: 501 }
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 501,
+    }
   }
 
   /// §4.12 (staging): do stage twelve bytes in two puts and take them; expect the bytes whole and the budget's
@@ -278,7 +281,10 @@ mod tests {
     let token = staging
       .begin((work(), &owner()), 4, (1, LATER), &mut budget)
       .unwrap();
-    let stranger = Principal::Uid { uid: 1000 };
+    let stranger = Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 1000,
+    };
     assert_eq!(
       staging.put((work(), &stranger, token), 0, b"abcd", LATER),
       Err(Refusal::NotFound)
