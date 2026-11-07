@@ -2773,15 +2773,23 @@ fn a_long_live_log_is_taken_over_whole() {
   let mut verdict = Verdict::new("a long live log taken over");
   // Streamed in steps the stall guard watches (40 durable writes within the fleet wait each), so a write the daemon
   // never answers fails the flow with the fleet printed, where one long stream ran into the test's own timeout.
+  // Each step asks for no more than the positions left before `LONG_LOG`: every write adds at least one, so the step can
+  // always be met. A fixed 40 asked near the end for positions a stream of `LONG_LOG` writes never makes (from 983, 40
+  // more, where the log ends near 1,002), and the flow failed there on every tree (raft, 2026-11-07; CI diag-34).
+  let target = u64::try_from(LONG_LOG).unwrap();
   let (outcomes, samples) = stream_through(&fleet.instances, &owner, &volume, 0..LONG_LOG, |_| {
-    while live_states(&owner, &volume)
-      .unwrap_or_default()
-      .into_iter()
-      .find(|state| !state.holding)
-      .and_then(|state| state.durable)
-      .is_none_or(|durable| durable < u64::try_from(LONG_LOG).unwrap())
-    {
-      after_writes(&owner, &volume, BETWEEN_EVENTS);
+    loop {
+      let durable = live_states(&owner, &volume)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|state| !state.holding)
+        .and_then(|state| state.durable)
+        .unwrap_or(0);
+      let left = target.saturating_sub(durable);
+      if left == 0 {
+        break;
+      }
+      after_writes(&owner, &volume, left.min(BETWEEN_EVENTS));
     }
   });
   verdict.note(latency_line(&outcomes));
