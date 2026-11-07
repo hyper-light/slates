@@ -1,0 +1,40 @@
+runner windows-latest, 4 CPUs, Sat Nov  7 19:26:30 UTC 2026, commit 295df20a
+== cargo test --locked -q -p slates-wire
+test result: ok. 32 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 25.12s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-db
+test result: ok. 63 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.53s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.32s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.71s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.81s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.32s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-anchor -- --test-threads=1
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 16 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.92s
+test result: ok. 8 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out; finished in 0.49s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-server --lib
+verbs::tests::a_landing_of_a_named_snapshot_presents_that_snapshot_whatever_the_head_became --- FAILED
+verbs::tests::a_presentation_past_the_bound_is_refused_and_changes_nothing --- FAILED
+thread 'slates-shard-1' (4640) panicked at crates\server\src\verbs.rs:12517:18:
+thread 'verbs::tests::a_landing_of_a_named_snapshot_presents_that_snapshot_whatever_the_head_became' (2412) panicked at crates\server\src\daemon.rs:5350:12:
+thread 'slates-shard-2' (4540) panicked at crates\server\src\verbs.rs:12407:9:
+thread 'verbs::tests::a_presentation_past_the_bound_is_refused_and_changes_nothing' (7188) panicked at crates\server\src\daemon.rs:5350:12:
+    verbs::tests::a_landing_of_a_named_snapshot_presents_that_snapshot_whatever_the_head_became
+    verbs::tests::a_presentation_past_the_bound_is_refused_and_changes_nothing
+test result: FAILED. 192 passed; 2 failed; 2 ignored; 0 measured; 0 filtered out; finished in 1.84s
+== exit 101
+== cargo test --locked -q -p slates-server --test consumers
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+== exit 0
