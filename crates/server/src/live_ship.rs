@@ -61,6 +61,10 @@ const RETAIN: usize = 4;
 const LIVE_REFUSED: &str = "fleet.live.refused";
 /// Counter: whole records appended to a live log, each a copy of the volume's content.
 const LIVE_WHOLE: &str = "fleet.live.whole";
+/// Counter: the bytes of the whole records appended.
+const LIVE_WHOLE_BYTES: &str = "fleet.live.whole_bytes";
+/// Counter: the bytes of the changes (delta records) appended.
+const LIVE_CHANGE_BYTES: &str = "fleet.live.change_bytes";
 /// Counter: entries appended to a live volume's log on this owner shard.
 const LIVE_APPENDED: &str = "fleet.live.appended";
 /// Counter: entries a holder refused to keep (over its bound, unauthorized, malformed).
@@ -155,6 +159,90 @@ pub(crate) struct LiveVolume {
   /// The bytes a candidate keeps of this log: the last whole entry and every entry since ([`keep`]). Once it reaches
   /// the volume's size the next publication ships whole, which clears them ([`kept_reaches_size`]).
   kept: usize,
+}
+
+/// One candidate's copy of a live log as its shard's recovery image keeps it (A-200; §4.8 "Recovery": a warm restart
+/// keeps every replica the node acknowledged): its owner, its fence, the head it holds and the sealed entries since the
+/// last whole one.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HeldLive {
+  object: [u8; 16],
+  owner: u64,
+  fence: u64,
+  head: Option<HeldHead>,
+  entries: Vec<Vec<u8>>,
+}
+
+/// A held copy's head, as [`HeldLive`] keeps it.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeldHead {
+  epoch: u64,
+  position: u64,
+  identity: [u8; 32],
+}
+
+/// This shard's copies of other owners' live logs, for its recovery image (`content_holder::held_image`).
+pub(crate) fn held_copies(state: &ShardState) -> Vec<HeldLive> {
+  state
+    .live
+    .held
+    .iter()
+    .map(|(object, held)| HeldLive {
+      object: object.0,
+      owner: held.replica.owner().0,
+      fence: held.replica.fence().0,
+      head: held.replica.head().map(|head| HeldHead {
+        epoch: head.epoch.0,
+        position: head.position,
+        identity: head.identity,
+      }),
+      entries: held.entries.iter().cloned().collect(),
+    })
+    .collect()
+}
+
+/// Holds again, after a warm restart, the copies a recovered image kept ([`held_copies`]), each with its fence.
+pub(crate) fn restore_copies(state: &mut ShardState, copies: Vec<HeldLive>) {
+  for copy in copies {
+    let object = ObjectId(copy.object);
+    let head = copy.head.map(|head| Head {
+      epoch: HostEpoch(head.epoch),
+      position: head.position,
+      identity: head.identity,
+    });
+    let bytes = copy
+      .entries
+      .iter()
+      .map(Vec::len)
+      .fold(0usize, usize::saturating_add);
+    state.live.held.insert(
+      object,
+      Held {
+        replica: Replica::recovered(HostId(copy.owner), object, HostEpoch(copy.fence), head),
+        entries: copy.entries.into(),
+        bytes,
+      },
+    );
+    state.count(LIVE_RESTORED, 1);
+  }
+}
+
+/// Counter: live copies a warm restart held again from the recovery image.
+const LIVE_RESTORED: &str = "fleet.live.restored";
+
+/// Counter: a holder's answer withheld because the publication that would keep what it acknowledged did not commit;
+/// the owner re-ships it.
+const LIVE_UNPUBLISHED: &str = "fleet.live.unpublished";
+
+/// Commits this shard's recovery image before a holder acknowledges what it now keeps (§4.8 "Recovery", as content and
+/// register holders do): `reply`, or nothing when the publication did not commit, which the owner reads as no answer
+/// and re-ships. A warm restart must hold again everything acknowledged, and its fence.
+fn acknowledged(state: &mut ShardState, reply: Vec<u8>) -> Vec<u8> {
+  if crate::verbs::publish_shard(state).is_err() {
+    state.count(LIVE_UNPUBLISHED, 1);
+    return Vec::new();
+  }
+  reply
 }
 
 /// What a candidate keeps of one live volume.
@@ -815,6 +903,7 @@ pub(crate) fn published(
   };
   match appended {
     Ok(entry) => {
+      let shipped = u64::try_from(payload.len()).unwrap_or(u64::MAX);
       live.owes_whole = false;
       live.kept = if whole {
         payload.len()
@@ -829,6 +918,9 @@ pub(crate) fn published(
       state.count(LIVE_APPENDED, 1);
       if whole {
         state.count(LIVE_WHOLE, 1);
+        state.count(LIVE_WHOLE_BYTES, shipped);
+      } else {
+        state.count(LIVE_CHANGE_BYTES, shipped);
       }
       resolve(state, id.bytes);
       let sends = pending_sends(state, id.bytes);
@@ -838,14 +930,27 @@ pub(crate) fn published(
   }
 }
 
-/// Whether what a candidate keeps of `id`'s log has reached the volume's size, so its next publication ships whole: a
+/// Whether `id`'s next publication ships whole: once the changes since the last whole entry are as large as it, or
+/// once what a candidate keeps reaches the volume's size. A
 /// candidate keeps a whole entry and the entries since, within twice the volume's size ([`hold_bound`]), and a whole
 /// entry clears them. Shipped at the volume's size, the entry that crosses it still fits under the bound whatever it
 /// is, since no publication is larger than the volume. Never the case for a volume this shard does not know.
 fn kept_reaches_size(state: &ShardState, id: slates_db::catalog::VolumeId) -> bool {
-  let Some(kept) = state.live.shipping.get(&id.bytes).map(|live| live.kept) else {
+  let Some((kept, whole)) = state.live.shipping.get(&id.bytes).map(|live| {
+    (
+      live.kept,
+      live.whole.as_ref().map_or(0, |(_, payload)| payload.len()),
+    )
+  }) else {
     return false;
   };
+  // The changes since the last whole entry are as large as it: a whole entry now costs no more than they did, so the
+  // log ships at most twice the bytes it must, and a candidate keeps about two whole entries. Held only to the
+  // volume's size, a candidate kept up to that size of changes to a volume holding one page, and its recovery image,
+  // committed before each acknowledgement, carried them all (a live write added 1.4-4.5 ms at the median, 2026-11-06).
+  if whole > 0 && kept.saturating_sub(whole) >= whole {
+    return true;
+  }
   let Some(volume) = state.db.partition().volume(id) else {
     return false;
   };
@@ -1343,10 +1448,15 @@ pub(crate) fn serve_entry(
     }
   });
   match &reply {
-    Err(error) => count_refused(state, refused_counter(error)),
-    Ok(_) => state.count(LIVE_HELD, 1),
+    Err(error) => {
+      count_refused(state, refused_counter(error));
+      encode_reply(&reply)
+    }
+    Ok(_) => {
+      state.count(LIVE_HELD, 1);
+      acknowledged(state, encode_reply(&reply))
+    }
   }
-  encode_reply(&reply)
 }
 
 /// A candidate's answer to an install from `peer`, as [`serve_entry`]: the install's state replaces what it held.
@@ -1382,10 +1492,15 @@ pub(crate) fn serve_install(
     }
   });
   match &reply {
-    Err(error) => count_refused(state, refused_counter(error)),
-    Ok(_) => state.count(LIVE_HELD, 1),
+    Err(error) => {
+      count_refused(state, refused_counter(error));
+      encode_reply(&reply)
+    }
+    Ok(_) => {
+      state.count(LIVE_HELD, 1);
+      acknowledged(state, encode_reply(&reply))
+    }
   }
-  encode_reply(&reply)
 }
 
 /// Why a holder will not serve a message about `object` made under `epoch`: below the fence its copy has promised it is
@@ -1503,7 +1618,9 @@ pub(crate) fn serve_fetch(
       let head = held.replica.head();
       let entries: Vec<Vec<u8>> = held.entries.iter().cloned().collect();
       state.count(LIVE_FETCHED, 1);
-      slates_db::live::encode_fetched(&Ok(head), &entries)
+      // The fence this raised is a promise too: it outlives a restart before it is told.
+      let reply = slates_db::live::encode_fetched(&Ok(head), &entries);
+      acknowledged(state, reply)
     }
     Err(refusal) => slates_db::live::encode_fetched(&Err(refusal), &[]),
   }

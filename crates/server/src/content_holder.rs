@@ -179,13 +179,20 @@ struct HeldImage {
   registers: Vec<HeldRegister>,
   /// The mirror records this node holds for another region's owners (`crate::mirror`), each an encoded record.
   mirrored: Vec<Vec<u8>>,
+  /// This node's copies of other owners' live logs (A-200, `crate::live_ship`), each with its fence.
+  live: Vec<crate::live_ship::HeldLive>,
 }
 
 /// The bytes of everything this shard holds for other owners, for its recovery image: empty when it holds nothing,
 /// so a laptop's image is unchanged.
 pub(crate) fn held_image(state: &ShardState) -> Vec<u8> {
   let content = state.held_content.to_image();
-  if content.is_empty() && state.holder_records.is_empty() && state.mirror_records.is_empty() {
+  let live = crate::live_ship::held_copies(state);
+  if content.is_empty()
+    && state.holder_records.is_empty()
+    && state.mirror_records.is_empty()
+    && live.is_empty()
+  {
     return Vec::new();
   }
   let registers = state
@@ -219,6 +226,7 @@ pub(crate) fn held_image(state: &ShardState) -> Vec<u8> {
     content,
     registers,
     mirrored,
+    live,
   }
   .to_bytes()
 }
@@ -229,6 +237,7 @@ pub(crate) struct RecoveredHeld {
   pub(crate) content: Vec<u8>,
   registers: Vec<HeldRegister>,
   mirrored: Vec<Vec<u8>>,
+  live: Vec<crate::live_ship::HeldLive>,
 }
 
 /// Splits a recovered held image. Empty bytes hold nothing; bytes that do not decode are refused, never read as
@@ -239,6 +248,7 @@ pub(crate) fn split_held(bytes: &[u8]) -> Result<RecoveredHeld, slates_wire::Wir
       content: Vec::new(),
       registers: Vec::new(),
       mirrored: Vec::new(),
+      live: Vec::new(),
     });
   }
   let image = HeldImage::from_bytes(bytes)?;
@@ -246,6 +256,7 @@ pub(crate) fn split_held(bytes: &[u8]) -> Result<RecoveredHeld, slates_wire::Wir
     content: image.content,
     registers: image.registers,
     mirrored: image.mirrored,
+    live: image.live,
   })
 }
 
@@ -254,9 +265,10 @@ pub(crate) fn split_held(bytes: &[u8]) -> Result<RecoveredHeld, slates_wire::Wir
 pub(crate) fn restore_held_registers(
   state: &mut ShardState,
   local: HostId,
-  held: RecoveredHeld,
+  mut held: RecoveredHeld,
 ) -> usize {
   let count = held.registers.len();
+  crate::live_ship::restore_copies(state, std::mem::take(&mut held.live));
   // The mirror records, each the newest of its object as it was published. One that does not decode, or that the
   // register refuses, is counted: the image held it, and this holder no longer does.
   for bytes in &held.mirrored {

@@ -623,6 +623,15 @@
 > volume's catalog keeps refusing, and the log rests on the other candidate alone (with it stopped, writes cannot be
 > durable; a soak run hung on exactly that). Owner: raft, next.
 >
+> **Open, found 2026-11-06 (raft): a restarted council leader never condemns a member that died during its restart.**
+> Under anchors, with a candidate's daemon restarted warm while the owner was stopped and then killed, no takeover
+> began in 40 s: the restarted node led the council (term 2, three voters) and still listed the owner a member, but its
+> failure detector held no entry for it (the owner was already stopped when it came back, so it never heard from it and
+> never suspected it); the other survivor had dropped the owner. The reproduction is
+> `a_candidates_restored_copy_serves_its_owners_takeover` (`crates/cli/tests/live_fleet.rs`, ignored until fixed).
+> Owner: raft. Also open there: the holder's live copies ride its recovery image, rebuilt whole at each acknowledgement
+> (`live_ship::acknowledged`), which costs about 100 µs a live write now and grows with what a candidate keeps.
+>
 > **As found, landing 13 (2026-11-05): a live takeover can wait for its quorum and never serve.** On adacachy in a
 > capped unit (`CPUQuota=1200%`, load 18–25), `a_superseded_owner_resumed_after_its_takeover_is_fenced`
 > (`crates/cli/tests/live_fleet.rs`) failed 1 of 2 runs on the landing's tree: with the owner stopped, the survivor that

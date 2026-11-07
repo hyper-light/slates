@@ -498,6 +498,28 @@ impl Replica {
     }
   }
 
+  /// A replica rebuilt from what its holder kept of it ([`Replica::owner`], [`Replica::fence`], [`Replica::head`]): a
+  /// warm restart keeps every replica the holder acknowledged, its fence with it (§4.8 "Recovery"), or a holder that
+  /// restarted would report less than it acknowledged, and promise less than it had.
+  pub fn recovered(
+    owner: HostId,
+    object: ObjectId,
+    fence: HostEpoch,
+    head: Option<Head>,
+  ) -> Replica {
+    Replica {
+      owner,
+      object,
+      fence: Fence { seen: fence },
+      head,
+    }
+  }
+
+  /// The owner it takes messages from.
+  pub fn owner(&self) -> HostId {
+    self.owner
+  }
+
   /// The head it holds.
   pub fn head(&self) -> Option<Head> {
     self.head

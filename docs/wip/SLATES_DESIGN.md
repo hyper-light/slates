@@ -5877,6 +5877,18 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > it still fits, since no publication is larger than the volume. After: 768 writes answered, 4 whole records, no
 > refusal for the bound.
 >
+> **A candidate's copy survives its own restart (2026-11-06).** A candidate's copies of live logs were not in its shard's
+> recovery image, and it acknowledged an entry before anything was published: after a warm restart (its anchor kept) it
+> held nothing it had acknowledged (`a_candidates_copy_survives_its_own_daemons_restart`, red first: head 4 before, none
+> after). Now each copy, with its owner, fence and head, rides the held image (`live_ship::HeldLive` in
+> `content_holder::HeldImage`), and an entry, an install or a fetch is answered only once the publication carrying it
+> commits (`live_ship::acknowledged`), as content and register holders answer; a warm restart holds it again
+> (`restore_copies`). The cost is that publication on each acknowledgement, and the held image is rebuilt whole at each
+> one, so the owner ships a whole entry once the changes since the last are as large as it (at most twice the bytes the
+> log must ship; a candidate keeps about two whole entries). Measured (release, adacachy, load 58–107): a live stable
+> 4 KiB write adds 193–196 µs at the median, p99 513–715 µs, where it added 95–134 µs without the publication. Owed:
+> an incremental held image, so the cost no longer grows with what a candidate keeps of a large volume.
+>
 > **Chaos from outside the processes (2026-11-06).** `crates/cli/tests/live_chaos.rs` streams writes through the Rust
 > client while it partitions or kills processes. It ends every flow with Agreement, NoLoss, StaleNeverCommits and
 > Convergence, checked from every node's `status`; each live line now carries its head's epoch and chain identity and
