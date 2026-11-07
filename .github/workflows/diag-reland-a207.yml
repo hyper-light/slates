@@ -1,0 +1,113 @@
+name: DIAG reland-a207 -- A-217, the checkout by identity and A-207 re-landed, on Linux and Windows (not for main)
+
+# The branch's own commits (this diag commit's tree is its parent's plus this file) under main's gates on Linux, and the Windows lint wall over
+# ci.yml's Windows crate list natively. Each job publishes its step results as one commit on
+# diag-reland-a207-results-<run>-<job>, so the outcome is read with git, not the API.
+
+on:
+  push:
+    branches: ['diag-reland-a207-[0-9]*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    name: linux gates on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    env:
+      RESULTS_BRANCH: diag-reland-a207-results-${{ github.run_id }}-${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.3.0
+      - name: gates
+        shell: bash
+        env:
+          SLATES_FLEET_TRACE: "1"
+          SLATES_TEST_HEDGE_STARVATION_SECS: "20"
+          SLATES_TEST_RESTART_SLOWDOWN: "10"
+          SLATES_TEST_FLEET_DEADLINE_SECS: "120"
+          RUSTDOCFLAGS: -D warnings -A rustdoc::private_intra_doc_links
+        run: |
+          set -u +e +o pipefail
+          out="$RUNNER_TEMP/results.txt"; : > "$out"
+          step() { name=$1; shift; start=$(date +%s); "$@" > "$RUNNER_TEMP/$name.log" 2>&1; code=$?
+            echo "$name exit $code $(( $(date +%s) - start ))s" >> "$out"
+            grep -E '^test result|FAILED|panicked|^error' "$RUNNER_TEMP/$name.log" | head -60 | sed "s/^/  $name: /" >> "$out"; }
+          echo "tested $(git rev-parse HEAD^) on $(uname -m), $(nproc) cpus" >> "$out"
+          step fmt cargo fmt --all --check
+          step clippy cargo clippy --workspace --all-targets -- -D warnings
+          step doc cargo doc --workspace --no-deps --document-private-items
+          step xtask cargo xtask check
+          step server-lib cargo test -p slates-server --lib
+          for t in checkout merge_load recovery daemon; do step server-$t cargo test -p slates-server --test $t; done
+          step workspace cargo test --workspace --no-fail-fast
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          tail -c 200000 "$RUNNER_TEMP/workspace.log" > "$RUNNER_TEMP/workspace-tail.log"
+          blob=$(git hash-object -w "$out"); tail=$(git hash-object -w "$RUNNER_TEMP/workspace-tail.log")
+          tree=$(printf '100644 blob %s\tresults.txt\n100644 blob %s\tworkspace-tail.log\n' "$blob" "$tail" | git mktree)
+          commit=$(git commit-tree "$tree" -m "results of run $GITHUB_RUN_ID on ${{ matrix.runner }}")
+          git push origin "$commit:refs/heads/$RESULTS_BRANCH" || echo "::warning::could not publish the results"
+          cat "$out"
+          ! grep -q ' exit [1-9]' "$out"
+
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest]
+    name: windows lint wall on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+      RESULTS_BRANCH: diag-reland-a207-results-${{ github.run_id }}-${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: lint and the merge-load suite
+        shell: bash
+        run: |
+          set -u +e +o pipefail
+          out="$RUNNER_TEMP/results.txt"; : > "$out"
+          step() { name=$1; shift; start=$(date +%s); "$@" > "$RUNNER_TEMP/$name.log" 2>&1; code=$?
+            echo "$name exit $code $(( $(date +%s) - start ))s" >> "$out"
+            grep -E '^test result|FAILED|panicked|^error|^warning: unused|never used' "$RUNNER_TEMP/$name.log" | head -60 | sed "s/^/  $name: /" >> "$out"; }
+          echo "tested $(git rev-parse HEAD^) on windows" >> "$out"
+          step clippy cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp --all-targets -- -D warnings
+          step clippy-cli cargo clippy -p slates-cli -- -D warnings
+          step server-merge_load cargo test -p slates-server --test merge_load
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          blob=$(git hash-object -w "$out")
+          tree=$(printf '100644 blob %s\tresults.txt\n' "$blob" | git mktree)
+          commit=$(git commit-tree "$tree" -m "results of run $GITHUB_RUN_ID on ${{ matrix.runner }}")
+          git push origin "$commit:refs/heads/$RESULTS_BRANCH" || echo "::warning::could not publish the results"
+          cat "$out"
+          ! grep -q ' exit [1-9]' "$out"
