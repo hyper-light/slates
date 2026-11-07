@@ -1,0 +1,9 @@
+head 0333e90a2442ce57f9d5a2ec9f1e62744331ce88, Sat Nov  7 18:44:19 UTC 2026
+live fence: the old owner's live counters {"appended": 4, "awaited": 4, "durable": 3, "fenced": 1, "held_back.placement": 1, "holders_recorded": 1, "no_session": 2, "resolved": 4, "whole": 1}, its log Some(("3", "2", "false"))
+live fence: taken over by live-fence-b-6082 after 1.938945016s; stale write outcome Some(Some(1)); successor read of /stale: 1 ""
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out; finished in 4.46s
+== run 1 exit 0
+live fence: the old owner's live counters {"appended": 4, "awaited": 4, "durable": 3, "fenced": 1, "holders_recorded": 1, "no_session": 8, "resolved": 4, "whole": 1}, its log Some(("3", "2", "false"))
+live fence: taken over by live-fence-b-6532 after 1.965432358s; stale write outcome Some(Some(1)); successor read of /stale: 1 ""
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out; finished in 3.58s
+== run 2 exit 0
