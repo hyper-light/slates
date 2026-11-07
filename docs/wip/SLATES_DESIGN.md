@@ -14905,9 +14905,22 @@ Applied in the same change to: §4.16's status, A-9's "recorded durably" (now: r
   is placed.
 - **Measured** (BENCHMARKS): one client over the kernel's `fs/` (48 MB), interleaved best of three, peak RSS 549,520 KiB
   before and 225,776 KiB after; `CreateGreen` 415,498,814 ns before and 157,915,124 ns after.
-- **Owed.** A green taken over by another host still records its origin as bytes (the successor holds no base snapshot;
-  raft's fleet path). The engine still holds the origin twice (current content and history), and the overlay holds the
-  pinned copy.
+- **Created in slices (2026-11-07).** `CreateGreen { base }` checks at once, then defers its reply to a task of the
+  owner shard. The task walks the snapshot one listing or one file a unit (`merge_service::OriginWalk`), hashes the
+  origin's identity as its canonical bytes are written (`slates_merge::origin::IdentityCursor`, no buffer), and seeds
+  the engine a share at a time (`slates_merge::engine::OriginLoad`; `Green::with_origin` takes the origin by value).
+  Each unit runs through `image::sliced`, and the green's records commit with the request's completion as one atom. It
+  was one poll: the whole kernel for 48 to 69 s, and 1,000 files of 16 KiB for 134 ms on CI's x86_64 runner, with no
+  other verb on the shard answered (`crates/server/tests/green_fairness.rs`;
+  `docs/bugs/2026-11-07-creating-a-green-held-its-shard-for-the-whole-walk.md`). Peak RSS over `fs/` and the whole kernel
+  is in BENCHMARKS.
+- **Owed.**
+  - A green taken over by another host still records its origin as bytes (the successor holds no base snapshot; raft's
+    fleet path).
+  - The engine still holds the origin twice (current content and version 0's history value); loadtest-scale shares
+    them after W2.
+  - The overlay holds the pinned copy.
+  - Recovery walks a held origin in `init_shard` in one call.
 
 ### A-201 — A green's head lands through a checkout: written into the volume the green was created from, which lands under a grant like any volume (accepted and built 2026-11-04)
 

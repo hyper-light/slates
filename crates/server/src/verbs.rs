@@ -5142,6 +5142,16 @@ fn destroy_snapshot_verb(
 /// Creates a green volume (§4.16): a shared merge target. It is not a store-backed VFS tree — its
 /// merged content lives in the in-memory merge engine kept in `state.greens`, keyed by the id — so it
 /// takes no byte or version reservation. The catalog records the `Green` role and its head version.
+///
+/// A green over a base (§4.16 "Green creation"; A-9's complete immutable base; A-217) is checked at once and then
+/// built in a task of the base's owner shard a slice of the shard's step quantum at a time (§4.3 "Bounded work
+/// everywhere"), the reply deferred to it as a pin's and a checkout's are: the snapshot walked into the origin
+/// (`merge_service::OriginWalk`), the origin's identity hashed as its bytes are written
+/// (`slates_merge::origin::IdentityCursor`), and the engine seeded from it (`slates_merge::engine::OriginLoad`); the
+/// green is recorded with the request's completion as one atom ([`found_green`]). It was one synchronous call: a
+/// green over the whole Linux kernel (97,229 files) held its shard for one poll of 69,028 ms (2026-11-06), and 4,000
+/// files of 16 KiB for 549 ms on CI's x86_64 runner, 3.8 s on its arm64 one, every verb on the shard waiting for it
+/// (`crates/server/tests/green_fairness.rs`). A scratch green has nothing to walk and is created at once.
 fn create_green(
   state: &mut ShardState,
   principal: &Principal,
@@ -5154,31 +5164,71 @@ fn create_green(
       existing: to_wire_volume(existing.id),
     });
   }
-  // The chain starts from scratch or from a complete immutable base (§4.16; A-9): the base is
-  // walked into the origin before anything is recorded, so a refusal (an incomplete snapshot, a
-  // torn read) changes nothing.
-  let origin = match base {
-    None => None,
-    Some(base) => match crate::merge_service::seed_origin(state, principal, base) {
-      Ok(origin) => Some(origin),
-      Err(refusal) => return refused(refusal),
-    },
+  // The chain starts from scratch or from a complete immutable base (§4.16; A-9): the base is checked and walked
+  // into the origin before anything is recorded, so a refusal (an incomplete snapshot, a torn read) changes nothing.
+  let Some(base) = base else {
+    return found_green(state, principal, name, require_evidence, None);
   };
+  let handle = match crate::merge_service::check_origin_base(state, principal, base) {
+    Ok(handle) => handle,
+    Err(refusal) => return refused(refusal),
+  };
+  let Some(request) = state.current_request else {
+    return refused(Refusal::Unsupported {
+      feature: "a green over a base outside a recorded request".to_owned(),
+    });
+  };
+  let job = GreenJob {
+    request,
+    principal: principal.clone(),
+    name: name.to_owned(),
+    require_evidence,
+    base,
+    handle,
+    stage: GreenStage::Walk(crate::merge_service::OriginWalk::new(core_snapshot(
+      base.snapshot,
+    ))),
+  };
+  crate::image::defer(state, run_green(job))
+}
+
+/// What a green over a base was built from, for its record: the base it holds, the origin's identity, and the engine
+/// seeded from the origin.
+struct Seeded {
+  base: slates_ipc::protocol::GreenBase,
+  identity: [u8; 32],
+  engine: slates_merge::engine::Green,
+}
+
+/// Records green `name` and installs its engine (scratch when `seeded` is `None`), the reply. A name taken meanwhile
+/// (a green built over many slices, another created under its name before it ended) is refused `AlreadyExists`, and
+/// so is nothing recorded. A base-seeded green holds its base snapshot for as long as it lives (A-217): pinned in the
+/// base volume first, so nothing the green names can be freed under it, and given back if a later step refuses.
+fn found_green(
+  state: &mut ShardState,
+  principal: &Principal,
+  name: &str,
+  require_evidence: bool,
+  seeded: Option<Seeded>,
+) -> ReplyBody {
+  if let Some(existing) = state.db.partition().volume_by_name(name) {
+    return refused(Refusal::AlreadyExists {
+      existing: to_wire_volume(existing.id),
+    });
+  }
   let Some(id) = fresh_volume_id(state) else {
     return refused(ids_exhausted());
   };
-  // A base-seeded green holds its base snapshot for as long as it lives (A-217): pinned in the base volume first, so
-  // nothing the green names can be freed under it, and given back if a later step refuses.
-  let held = match (base, &origin) {
-    (Some(base), Some(origin)) => match hold_origin_snapshot(state, base) {
+  let held = match &seeded {
+    Some(seeded) => match hold_origin_snapshot(state, seeded.base) {
       Ok(()) => Some(slates_db::partition::OriginRef {
-        volume: to_db_volume(base.volume),
-        snapshot: to_db_snapshot(base.snapshot),
-        identity: crate::merge_service::origin_identity(origin),
+        volume: to_db_volume(seeded.base.volume),
+        snapshot: to_db_snapshot(seeded.base.snapshot),
+        identity: seeded.identity,
       }),
       Err(refusal) => return refused(refusal),
     },
-    _ => None,
+    None => None,
   };
   let record = VolumeRecord {
     id,
@@ -5216,10 +5266,10 @@ fn create_green(
     return refused(refusal_of_db(&e));
   }
   // A base-seeded green records its origin as the reference it holds (A-217: the snapshot and the origin's
-  // identity, never the tree's bytes), before the engine is seeded, so a refused record leaves no engine ahead of its
-  // log; recovery walks the held snapshot again before the chain (`rebuild_green`).
-  let engine = match (origin, held) {
-    (Some(origin), Some(held)) => {
+  // identity, never the tree's bytes), before the engine is installed, so a refused record leaves no engine ahead of
+  // its log; recovery walks the held snapshot again before the chain (`rebuild_green`).
+  let mut engine = match (seeded, held) {
+    (Some(seeded), Some(held)) => {
       let record = Op::GreenOriginHeld {
         green: id,
         origin: held,
@@ -5228,11 +5278,10 @@ fn create_green(
         release_origin_snapshot(state, Some(&held));
         return refused(refusal_of_db(&e));
       }
-      slates_merge::engine::Green::with_origin(&origin)
+      seeded.engine
     }
     _ => slates_merge::engine::Green::new(),
   };
-  let mut engine = engine;
   engine.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
   state.greens.insert(id, engine);
   // Version 0's merge record — the origin, placed before the record names it (§4.16 "Commit").
@@ -5240,6 +5289,136 @@ fn create_green(
   ReplyBody::GreenCreated {
     id: to_wire_volume(id),
   }
+}
+
+/// A green over a base between its slices ([`create_green`]).
+struct GreenJob {
+  request: (u64, RequestId),
+  principal: Principal,
+  name: String,
+  require_evidence: bool,
+  base: slates_ipc::protocol::GreenBase,
+  handle: Handle<crate::state::VolumeSlot>,
+  stage: GreenStage,
+}
+
+/// Where a green over a base has reached.
+enum GreenStage {
+  /// The base snapshot being walked into the origin.
+  Walk(crate::merge_service::OriginWalk),
+  /// The origin's identity being hashed.
+  Identity {
+    origin: slates_merge::origin::Origin,
+    /// Boxed: a BLAKE3 hasher's state is about two kilobytes, far past the other stages.
+    cursor: Box<slates_merge::origin::IdentityCursor>,
+  },
+  /// The engine being seeded from the origin.
+  Load {
+    identity: [u8; 32],
+    /// Boxed: it holds the engine being seeded, far past the other stages.
+    load: Box<slates_merge::engine::OriginLoad>,
+  },
+  /// Ended: the engine was handed to the record.
+  Ended,
+}
+
+impl GreenJob {
+  /// One unit: a directory listed or a file read, a share of the identity hashed, or a share of the engine seeded; the
+  /// identity and the engine once the last is done. The base volume destroyed meanwhile is a stale handle, refused
+  /// `NotFound`; its snapshot gone, the volume core's refusal.
+  fn step(
+    &mut self,
+    state: &mut ShardState,
+  ) -> Result<Option<([u8; 32], slates_merge::engine::Green)>, Refusal> {
+    match std::mem::replace(&mut self.stage, GreenStage::Ended) {
+      GreenStage::Walk(mut walk) => {
+        let slot = state
+          .volumes
+          .get(self.handle)
+          .map_err(|_| Refusal::NotFound)?;
+        self.stage = match walk
+          .unit(&slot.volume, &state.store)
+          .map_err(|e| refusal_of_vfs(&e))?
+        {
+          Some(origin) => {
+            // The walk canonicalizes what it gives, so a cursor is always had here.
+            let Some(cursor) = slates_merge::origin::IdentityCursor::new(&origin) else {
+              return Err(Refusal::ContentUnavailable);
+            };
+            GreenStage::Identity {
+              origin,
+              cursor: Box::new(cursor),
+            }
+          }
+          None => GreenStage::Walk(walk),
+        };
+        Ok(None)
+      }
+      GreenStage::Identity { origin, mut cursor } => {
+        let share = usize::try_from(state.config.archive_slice_bytes()).unwrap_or(usize::MAX);
+        self.stage = match cursor.step(&origin, share) {
+          Some(identity) => GreenStage::Load {
+            identity,
+            load: Box::new(slates_merge::engine::OriginLoad::new(origin)),
+          },
+          None => GreenStage::Identity { origin, cursor },
+        };
+        Ok(None)
+      }
+      GreenStage::Load { identity, mut load } => {
+        // A file's seeding is bound by hashing its bytes into the head identity, so its share is the hash rate's.
+        let share = usize::try_from(state.config.archive_slice_bytes()).unwrap_or(usize::MAX);
+        match load.step(share) {
+          Some(engine) => Ok(Some((identity, engine))),
+          None => {
+            self.stage = GreenStage::Load { identity, load };
+            Ok(None)
+          }
+        }
+      }
+      GreenStage::Ended => Err(Refusal::Unsupported {
+        feature: "a green's creation stepped after its end".to_owned(),
+      }),
+    }
+  }
+}
+
+/// Builds the green a slice at a time, then records it with the request's completion as one atom and delivers the
+/// reply. With the shard's state unreachable (its shutdown) no completion is recorded, so the client's retry creates
+/// the green again on the shard that succeeds it.
+async fn run_green(mut job: GreenJob) {
+  let built = loop {
+    match crate::image::with(|s| crate::image::sliced(s, |s| job.step(s))) {
+      Ok(Some(built)) => break Ok(built),
+      Ok(None) => slates_rt::futures::yield_now().await,
+      Err(refusal) => break Err(refusal),
+    }
+  };
+  let GreenJob {
+    request,
+    principal,
+    name,
+    require_evidence,
+    base,
+    ..
+  } = job;
+  let _ = crate::state::with_state(|s| {
+    let (reply, route) = crate::image::complete(s, request, |s| match built {
+      Ok((identity, engine)) => found_green(
+        s,
+        &principal,
+        &name,
+        require_evidence,
+        Some(Seeded {
+          base,
+          identity,
+          engine,
+        }),
+      ),
+      Err(refusal) => refused(refusal),
+    });
+    crate::image::deliver(s, reply, route);
+  });
 }
 
 /// Pins `base`'s snapshot in its volume for a green that names it (A-217), as a clone pins its origin: its destroy is
@@ -10205,13 +10384,13 @@ fn replay_green(
         .ok_or(GreenFence::CheckpointCorrupt)?;
       let origin = origin.unwrap_or_default();
       (
-        slates_merge::engine::Green::restore(&origin, &checkpoint),
+        slates_merge::engine::Green::restore(origin, &checkpoint),
         held,
       )
     }
     None => (
       origin.map_or_else(slates_merge::engine::Green::new, |origin| {
-        slates_merge::engine::Green::with_origin(&origin)
+        slates_merge::engine::Green::with_origin(origin)
       }),
       0,
     ),
