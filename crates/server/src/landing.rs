@@ -563,20 +563,6 @@ fn run_landing(
   let presented = prepared.grant.and_then(|g| presentation_for(state, g));
   let landing_id = presented
     .unwrap_or_else(|| crate::verbs::landing_id(state.partition, state.landing.next_landing));
-  let request = LandingRequest {
-    landing_id,
-    // The grant binds the caller by its exact principal (its key), never by the session number several
-    // principals can share, and the volume and snapshot this landing names (AUD-29-01).
-    consumer: prepared.principal.key().into_boxed_slice(),
-    volume: prepared.volume.bytes,
-    snapshot: prepared.snapshot.value,
-    source: prepared.source,
-    grant: prepared.grant.map(GrantId),
-    filter: prepared.filter.clone(),
-    now_ns: state.clock.monotonic_ns(),
-    media_durability: false,
-    large_class_bytes: state.config.large_class_bytes,
-  };
   let slot = match state.volumes.get_mut(prepared.handle) {
     Ok(s) => s,
     Err(_) => return refused(Refusal::NotFound),
@@ -610,6 +596,22 @@ fn run_landing(
     .unwrap_or(1)
     .max(1);
   let mut spans = SpanObserver::with_capacity(telemetry_capacity);
+  let request = LandingRequest {
+    landing_id,
+    // The grant binds the caller by its exact principal (its key), never by the session number several
+    // principals can share, and the volume and snapshot this landing names (AUD-29-01).
+    consumer: prepared.principal.key().into_boxed_slice(),
+    volume: prepared.volume.bytes,
+    snapshot: prepared.snapshot.value,
+    source: prepared.source,
+    grant: prepared.grant.map(GrantId),
+    filter: prepared.filter.clone(),
+    // Read as the landing begins: its fences count its time from `begin_landing`'s start, so nothing between the read
+    // and the run (the target's opening) may lie outside that count.
+    now_ns: state.clock.monotonic_ns(),
+    media_durability: false,
+    large_class_bytes: state.config.large_class_bytes,
+  };
   let outcome = land(
     &mut os,
     &land_target,
@@ -1214,18 +1216,6 @@ fn begin_granted(
     },
     named => (named, None),
   };
-  let request = LandingRequest {
-    landing_id,
-    consumer: prepared.principal.key().into_boxed_slice(),
-    volume: prepared.volume.bytes,
-    snapshot: prepared.snapshot.value,
-    source,
-    grant: prepared.grant.map(GrantId),
-    filter: prepared.filter.clone(),
-    now_ns: state.clock.monotonic_ns(),
-    media_durability: false,
-    large_class_bytes: state.config.large_class_bytes,
-  };
   let was_overlay = slot.volume.is_overlay();
   let not_run = |refusal: LandingRefusal, principal: Principal| {
     Begun::NotRun(Box::new(NotRun {
@@ -1257,6 +1247,19 @@ fn begin_granted(
     }
   } else {
     (prepared.os, prepared.land_target)
+  };
+  let request = LandingRequest {
+    landing_id,
+    consumer: prepared.principal.key().into_boxed_slice(),
+    volume: prepared.volume.bytes,
+    snapshot: prepared.snapshot.value,
+    source,
+    grant: prepared.grant.map(GrantId),
+    filter: prepared.filter.clone(),
+    // Read as the run begins: its fences count its time from `begin_landing`'s start (see `run_landing`).
+    now_ns: state.clock.monotonic_ns(),
+    media_durability: false,
+    large_class_bytes: state.config.large_class_bytes,
   };
   let begun = begin_landing(
     HostSlot::Owned(os),
