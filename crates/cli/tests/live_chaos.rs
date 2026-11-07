@@ -785,6 +785,8 @@ struct LiveState {
   holders: Vec<String>,
   /// On the owner, the member ids of the set a holder transition is moving to; empty when none is in flight.
   moving_to: Vec<String>,
+  /// On the owner, the member ids of the holder set its volume's catalog records (what a takeover counts).
+  recorded: Vec<String>,
 }
 
 fn field<'a>(fields: &'a str, key: &str) -> Option<&'a str> {
@@ -823,6 +825,7 @@ fn live_states(instance: &str, volume: &str) -> Option<Vec<LiveState>> {
           fence: number(field(fields, "fence=")).unwrap_or(0),
           holders: id_list(field(fields, "holders=")),
           moving_to: id_list(field(fields, "moving_to=")),
+          recorded: id_list(field(fields, "recorded=")),
         })
       })
       .collect(),
@@ -3075,33 +3078,38 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
   if decisive {
     fleet.resume(current);
   }
-  judge_served(
-    &mut verdict,
-    &survivors,
-    &volume,
-    &outcomes,
-    [instances[current].as_str(), instances[stale].as_str()],
-  );
+  judge_served(&mut verdict, &survivors, &volume, &outcomes);
   drop(fleet);
   verdict.judge();
 }
 
-/// The end of the fresh-member flow: a survivor serves `volume` with every acknowledged write, the holders the takeover
-/// counted (`counted`) are fenced at its epoch, and a copy left on a member that is no longer a holder is noted.
-fn judge_served(
-  verdict: &mut Verdict,
-  survivors: &[&str],
-  volume: &str,
-  outcomes: &[Outcome],
-  counted: [&str; 2],
-) {
+/// The end of the fresh-member flow: a survivor serves `volume` with every acknowledged write, and every holder the
+/// takeover counted is fenced at its epoch. Those are read from the successor: the holder set its catalog records (the
+/// set its phase one counted, which a transition may have recorded before the old owner activated it) and its own
+/// holders. A copy left on any other survivor, a member a transition dropped, is counted by no one and is noted.
+fn judge_served(verdict: &mut Verdict, survivors: &[&str], volume: &str, outcomes: &[Outcome]) {
   match wait_serving(survivors, volume, outcomes) {
     Some((successor, took)) => {
       verdict.note(format!("{successor} served the volume after {took:?}"));
       verdict.check("NoLoss (successor)", no_loss(successor, volume, outcomes));
       let epoch = takeover_epoch(successor, volume);
-      // The holders the takeover counts are fenced; a copy left on a member the shipper's transition dropped is counted
-      // by no one, and is noted.
+      let hosts: BTreeMap<String, &str> = survivors
+        .iter()
+        .filter_map(|survivor| fleet_view(survivor).map(|(host, _, _)| (host, *survivor)))
+        .collect();
+      let named: Vec<String> = live_states(successor, volume)
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|state| state.recorded.into_iter().chain(state.holders))
+        .collect();
+      let counted: Vec<&str> = hosts
+        .iter()
+        .filter(|(host, survivor)| named.contains(host) && **survivor != successor)
+        .map(|(_, survivor)| *survivor)
+        .collect();
+      verdict.note(format!(
+        "the successor's recorded and active holders among the survivors: {counted:?}"
+      ));
       verdict.check(
         "StaleNeverCommits (the counted holders' fences)",
         fenced_at_or_above(&counted, volume, epoch),
@@ -3109,7 +3117,7 @@ fn judge_served(
       let others: Vec<&str> = survivors
         .iter()
         .copied()
-        .filter(|survivor| !counted.contains(survivor))
+        .filter(|survivor| !counted.contains(survivor) && *survivor != successor)
         .collect();
       let left = fenced_at_or_above(&others, volume, epoch);
       if !left.is_empty() {

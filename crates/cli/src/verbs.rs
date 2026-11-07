@@ -200,6 +200,11 @@ fn mount_verb(
         .to_owned(),
     ));
   }
+  // The mount point as the kernel records it (a read, never a write), as on Linux: the daemon finds the mount it binds
+  // and the mounts it keeps across a restart in the kernel's table by exactly this path (A-227).
+  let real = std::fs::canonicalize(path)
+    .map_err(|e| Failure::Failed(format!("the mount point {path}: {e}")))?;
+  let real = real.to_string_lossy().into_owned();
   let report = client.status(volume).map_err(|e| failure_of(e, instance))?;
   // The mount's own attachment (§4.6, §4.13): it outlives this process and a daemon restart, and
   // ends with the kernel's `UMNT` when the mount is removed. A write mount takes the write lease
@@ -220,7 +225,7 @@ fn mount_verb(
         .to_owned(),
     ));
   };
-  let mounted = crate::mount::establish(&report, (attachment.attachment, token), path, read_only)?;
+  let mounted = crate::mount::establish(&report, (attachment.attachment, token), &real, read_only)?;
   // The established mount point is reported back (§4.4 `Binding → Bound`), so the record names it
   // and `status` shows it; a bind the daemon refuses takes the mount down again rather than leave a
   // mount whose record says it is bound nowhere.
@@ -2631,7 +2636,7 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
     ));
     for live in &shard.live {
       out.push_str(&format!(
-        "shard {} live {} {} head={} durable={} owed={} epoch={} identity={} fence={} holders={} moving_to={}\n",
+        "shard {} live {} {} head={} durable={} owed={} epoch={} identity={} fence={} holders={} moving_to={} recorded={}\n",
         shard.partition,
         if live.holding { "held" } else { "shipping" },
         volume_id_text(live.volume),
@@ -2642,7 +2647,8 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
         option_text(live.head_identity.as_ref().map(hex32)),
         live.fence,
         id_list_text(&live.holders),
-        id_list_text(&live.moving_to)
+        id_list_text(&live.moving_to),
+        id_list_text(&live.recorded)
       ));
     }
     if let Some(batch) = telemetry

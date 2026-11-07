@@ -12,8 +12,8 @@ use crate::mount_table::{MountEntry, MountIdentity};
 pub enum HostMountKind {
   /// The macOS NFS loopback mount: source `slates:/<name>` (§4.6 A-34; no capability in the table).
   NfsLoopback,
-  /// The Linux FUSE mount: type `fuse.slates`, source `slates:<attachment>` — the attachment the daemon
-  /// recorded for the mount, in sixteen hex digits (`crates/server/src/fuse.rs`; AUD-29-64).
+  /// The Linux FUSE mount: type `fuse.slates`, source `slates:<tag>`, the tag of the daemon that made it (a random
+  /// value per daemon start that names nothing else, A-227: the table is world-readable, so it carries no attachment).
   Fuse,
 }
 
@@ -42,10 +42,10 @@ pub struct ExpectedMount {
 pub enum SourceRule {
   /// Exactly this source: the macOS loopback mount's `slates:/<volume name>`.
   Exactly(String),
-  /// An attachment: `slates:` and sixteen hex digits, the attachment the daemon recorded for the mount. The
-  /// table names it; the daemon then holds it to its own live record (the volume, the principal, the mount
-  /// point), since a name in a table is no authority by itself.
-  Attachment,
+  /// A slates FUSE source (`slates:` and a daemon's tag). The daemon then holds the mount's table id to its own
+  /// mounts (A-227) and the mount point to its live record (the volume, the principal), since a name in a table is no
+  /// authority by itself.
+  Slates,
 }
 
 /// Format: the filesystem type the macOS NFS client records for a mount (`statfs.f_fstypename`).
@@ -55,23 +55,9 @@ const NFS_FSTYPE: &str = "nfs";
 const NFS_SOURCE_PREFIX: &str = "slates:/";
 /// Format: the FUSE filesystem type the kernel records for `subtype=slates` (`fuse.<subtype>`).
 const FUSE_FSTYPE: &str = "fuse.slates";
-/// Format: the prefix of a FUSE mount's source, before its attachment's hex digits.
-const ATTACHMENT_SOURCE_PREFIX: &str = "slates:";
-/// Format: the hex digits of an attachment id (a `u64`).
-const ATTACHMENT_HEX_DIGITS: usize = 16;
-/// Format: hexadecimal.
-const HEX: u32 = 16;
+/// Format: the prefix of a slates FUSE mount's source, before the tag of the daemon that made it.
+const SLATES_SOURCE_PREFIX: &str = "slates:";
 
-/// The attachment a FUSE mount's source names: `slates:` and exactly sixteen lowercase hex digits.
-pub fn attachment_of_source(source: &str) -> Option<u64> {
-  let hex = source.strip_prefix(ATTACHMENT_SOURCE_PREFIX)?;
-  let lowercase_hex = hex
-    .bytes()
-    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-  (hex.len() == ATTACHMENT_HEX_DIGITS && lowercase_hex)
-    .then(|| u64::from_str_radix(hex, HEX).ok())
-    .flatten()
-}
 /// The table entry a host mount of `volume_name` shows.
 pub fn expected_mount(kind: HostMountKind, volume_name: &str) -> ExpectedMount {
   match kind {
@@ -81,7 +67,7 @@ pub fn expected_mount(kind: HostMountKind, volume_name: &str) -> ExpectedMount {
     },
     HostMountKind::Fuse => ExpectedMount {
       fstype: FUSE_FSTYPE,
-      source: SourceRule::Attachment,
+      source: SourceRule::Slates,
     },
   }
 }
@@ -120,11 +106,12 @@ pub struct VerifiedHostMount {
   pub fstype: String,
   /// The source the table records.
   pub source: String,
-  /// Whether the source names what the mount serves: the volume itself, or the attachment the daemon then
-  /// holds to its record.
+  /// Whether the source names what the mount serves: the volume itself (macOS), or a slates FUSE mount whose table id
+  /// and mount point the daemon then holds to its own mounts and record (Linux).
   pub names_volume: bool,
-  /// The attachment the source names, for a mount whose source is one ([`SourceRule::Attachment`]).
-  pub attachment: Option<u64>,
+  /// The table's own id of the verified mount, which the kernel reuses: what the daemon holds to its own mounts for a
+  /// slates FUSE source ([`SourceRule::Slates`], A-227).
+  pub table_id: u64,
   /// The kernel's identity of the verified mount instance, which the harness checks again just before its
   /// runtime binds the path ([`source_unchanged`]; AUD-29-66).
   pub identity: MountIdentity,
@@ -228,17 +215,17 @@ pub fn verify_host_mount(
   let not_this = || HostPathRefusal::NotThisVolume {
     source: entry.source.clone(),
   };
-  let attachment = match &expected.source {
-    SourceRule::Exactly(source) if entry.source == *source => None,
-    SourceRule::Exactly(_) => return Err(not_this()),
-    SourceRule::Attachment => Some(attachment_of_source(&entry.source).ok_or_else(not_this)?),
-  };
+  match &expected.source {
+    SourceRule::Exactly(source) if entry.source == *source => {}
+    SourceRule::Slates if entry.source.starts_with(SLATES_SOURCE_PREFIX) => {}
+    SourceRule::Exactly(_) | SourceRule::Slates => return Err(not_this()),
+  }
   Ok(VerifiedHostMount {
     mount_point: entry.mount_point.clone(),
     fstype: entry.fstype.clone(),
     source: entry.source.clone(),
     names_volume: true,
-    attachment,
+    table_id: entry.identity.mount,
     identity,
   })
 }

@@ -404,7 +404,15 @@ async fn ask(
     }
     match recv_within(&socket, &mut buf, remaining).await {
       None => return Ok(None),
-      Some(Err(e)) => return Err(DnsError::Io(e)),
+      // Only the socket gone ends the query; any other refused receive (an earlier send's report reaching the
+      // socket's next receive, udp(7); Windows' WSAECONNRESET) is skipped as a stray datagram is, within the deadline.
+      Some(Err(e)) if e.receive_refusal() == slates_rt::error::ReceiveRefusal::SocketGone => {
+        return Err(DnsError::Io(e));
+      }
+      Some(Err(_)) => {
+        slates_rt::futures::yield_now().await;
+        continue;
+      }
       Some(Ok((len, from))) => {
         if from != nameserver {
           continue;
@@ -524,6 +532,17 @@ mod tests {
     attempts: u32,
     nameservers: usize,
   ) -> (Result<Ipv4Addr, DnsError>, u64) {
+    resolve_with_a_refusal(answer, attempts, nameservers, None)
+  }
+
+  /// [`resolve_on_the_fabric`], with `refusal` queued on the lookup's query socket before it sends: the fabric hands
+  /// out ports in order, so the query socket is the one bound after the nameserver's.
+  fn resolve_with_a_refusal(
+    answer: Option<Answer>,
+    attempts: u32,
+    nameservers: usize,
+    refusal: Option<slates_rt::error::RtError>,
+  ) -> (Result<Ipv4Addr, DnsError>, u64) {
     let mut sim = slates_rt::SimRuntime::new(&sim_config(), 1).unwrap();
     let shard = sim.shard_ids()[0];
     let (port_tx, port_rx) = std::sync::mpsc::channel::<u16>();
@@ -557,6 +576,9 @@ mod tests {
           timeout_ns: SIM_TIMEOUT_NS,
           attempts,
         };
+        if let Some(refusal) = refusal {
+          slates_rt::sim::sim_udp_refuse_next_recv(port.saturating_add(1), refusal);
+        }
         let started = now_ns();
         let outcome = lookup(&resolver, HOST).await;
         let _ = outcome_tx.send((outcome, now_ns().saturating_sub(started)));
@@ -584,6 +606,19 @@ mod tests {
   #[test]
   fn a_lookup_resolves_through_a_nameserver_on_the_fabric() {
     let (outcome, _) = resolve_on_the_fabric(Some(answer_with_address), 2, 1);
+    assert_eq!(outcome, Ok(Ipv4Addr::new(10, 244, 0, 9)));
+  }
+
+  /// §4.10a, the receive loops' rule (2026-11-07). Do: queue a refused receive (an earlier send's report) on the
+  /// lookup's query socket, then look up through a nameserver that answers. Expect the address: the refusal is
+  /// skipped as a stray datagram is, within the query's deadline. Before, the lookup failed with it.
+  #[test]
+  fn a_refused_receive_does_not_end_a_lookup() {
+    let refusal = slates_rt::error::RtError::DriverRefused {
+      call: "recvfrom",
+      code: None,
+    };
+    let (outcome, _) = resolve_with_a_refusal(Some(answer_with_address), 1, 1, Some(refusal));
     assert_eq!(outcome, Ok(Ipv4Addr::new(10, 244, 0, 9)));
   }
 

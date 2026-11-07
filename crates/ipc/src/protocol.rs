@@ -1250,6 +1250,11 @@ pub struct LiveReport {
   /// On the owner, the member ids of the set a holder transition is moving to, ascending; empty when none is in
   /// flight, and on a candidate. Appended (2026-11-07).
   pub moving_to: Vec<u64>,
+  /// On the owner, the member ids of the holder set its volume's catalog records (A-240: what a takeover's phase one
+  /// counts), ascending; it can name a transition's target before the shipper activates it. On a candidate, the same
+  /// when the volume is served here (a successor before its first publication); otherwise empty, as when nothing is
+  /// recorded. Appended (2026-11-07).
+  pub recorded: Vec<u64>,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.
@@ -2929,6 +2934,26 @@ pub enum Refusal {
     /// The bound.
     bound: u64,
   },
+  /// A host path the daemon was given lies on a mount it serves itself (§4.6: no daemon thread opens a path on a volume
+  /// the daemon serves; A-227): opening it would send the daemon a request only it can answer. Nothing was opened.
+  /// Appended.
+  OwnMount {
+    /// The path as given.
+    path: String,
+    /// What the daemon was asked to use it as.
+    used_as: OwnMountUse,
+  },
+}
+
+/// What a path refused [`Refusal::OwnMount`] was given as (A-227). Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnMountUse {
+  /// A volume's base directory, or an entry below it.
+  Base,
+  /// A granted landing's target.
+  LandingTarget,
+  /// A FUSE mount point.
+  MountPoint,
 }
 
 /// The writes a snapshot is known to include (§4.6 "Writeback and snapshot barrier"): every write the

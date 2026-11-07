@@ -48,6 +48,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::task::{Context, Poll, Waker};
 
 use rustls::pki_types::CertificateDer;
+use slates_rt::error::ReceiveRefusal;
 use slates_rt::shard::{Kept, ShardContext};
 use slates_rt::udp::{SocketAddrV4, UdpSocket};
 
@@ -96,25 +97,38 @@ impl DemuxId {
     self.0.with_in(context, f)
   }
 
-  /// The receive loop: reads every datagram off the socket and routes it. Runs until the socket refuses
-  /// (or the demultiplexer is unreachable, `Closed`); the caller owns the task (spawns it on this shard and
-  /// cancels it at shutdown).
+  /// The receive loop: reads every datagram off the socket and routes it. Runs until the socket is gone
+  /// ([`ReceiveRefusal::SocketGone`]) or the demultiplexer is unreachable (`Closed`); the caller owns the task
+  /// (spawns it on this shard and cancels it at shutdown). Any other refused receive is counted by its kind
+  /// ([`DemuxCounters::receive_refused_earlier_send`] and its siblings) and the loop reads on, after yielding
+  /// the shard, so a refusal that repeats costs a turn each and never holds it. Before 2026-11-07 every refusal
+  /// ended the loop, and one earlier send's ICMP report (Windows' WSAECONNRESET, which Linux reports as
+  /// ECONNREFUSED, udp(7)) stopped a node's plane for the daemon's life.
   pub async fn run(self) -> Result<(), EndpointError> {
     loop {
       // Routed straight out of the shard's receive buffer (`crate::receive`), lent only for the read; an
       // empty socket hands back its readiness future, awaited outside the handle's borrow.
-      let empty = with_demux(self, |demux| -> Result<_, EndpointError> {
-        let routed = crate::receive::with_datagram(&demux.socket, |datagram, from| {
+      let next = with_demux(self, |demux| -> Result<_, EndpointError> {
+        match crate::receive::with_datagram(&demux.socket, |datagram, from| {
           demux.route(datagram, from)
-        })?;
-        Ok(routed.is_none().then(|| demux.socket.readable()))
+        }) {
+          Ok(Some(())) => Ok(Next::Routed),
+          Ok(None) => Ok(Next::Empty(demux.socket.readable())),
+          Err(refusal) => match refusal.receive_refusal() {
+            ReceiveRefusal::SocketGone => Err(EndpointError::Io(refusal)),
+            kind => {
+              demux.count_receive_refusal(kind);
+              Ok(Next::Refused)
+            }
+          },
+        }
       })
       .ok_or(EndpointError::Closed)??;
-      match empty {
-        Some(readable) => readable.await?,
+      match next {
+        Next::Empty(readable) => readable.await?,
         // Yield between datagrams: a burst queued in the kernel would otherwise be routed whole before any
-        // session task ran, filling an inbox the session had no chance to drain.
-        None => slates_rt::futures::yield_now().await,
+        // session task ran, filling an inbox the session had no chance to drain. A refused receive yields too.
+        Next::Routed | Next::Refused => slates_rt::futures::yield_now().await,
       }
     }
   }
@@ -124,6 +138,16 @@ impl DemuxId {
   pub fn accept(self) -> Accept {
     Accept { demux: self }
   }
+}
+
+/// What one turn of the receive loop found.
+enum Next<Readable> {
+  /// A datagram, routed.
+  Routed,
+  /// Nothing waiting: the socket's readiness to await.
+  Empty(Readable),
+  /// A refused receive that does not end the loop, counted.
+  Refused,
 }
 
 /// A session's slot in the demultiplexer's table: an index and the generation it was allotted under,
@@ -157,6 +181,13 @@ pub struct DemuxCounters {
   pub replaced: u64,
   /// Server sessions opened for a new source.
   pub opened: u64,
+  /// Receives refused by an earlier send's report (a peer's port or host unreachable, a time to live expired:
+  /// `ReceiveRefusal::EarlierSend`); the loop read on.
+  pub receive_refused_earlier_send: u64,
+  /// Receives refused for want of the OS's memory or buffers (`ReceiveRefusal::Resources`); the loop read on.
+  pub receive_refused_resources: u64,
+  /// Receives refused for any other reason but the socket's end (`ReceiveRefusal::Other`); the loop read on.
+  pub receive_refused_other: u64,
   /// The most sessions ever held at once — opened and not yet released, a pending handshake and a
   /// replaced-but-undropped session both counting — against [`Demux::capacity`]: the pool's high-water mark.
   pub high_water: u64,
@@ -324,6 +355,19 @@ impl Demux {
   /// The counters so far.
   pub fn counters(&self) -> DemuxCounters {
     self.inner.borrow().counters
+  }
+
+  /// Counts a refused receive of `kind` that did not end the loop.
+  fn count_receive_refusal(&self, kind: ReceiveRefusal) {
+    let mut inner = self.inner.borrow_mut();
+    let counter = match kind {
+      ReceiveRefusal::EarlierSend => &mut inner.counters.receive_refused_earlier_send,
+      ReceiveRefusal::Resources => &mut inner.counters.receive_refused_resources,
+      ReceiveRefusal::Other | ReceiveRefusal::SocketGone => {
+        &mut inner.counters.receive_refused_other
+      }
+    };
+    *counter = counter.saturating_add(1);
   }
 
   /// The most recent setup refusal's error ([`DemuxCounters::setup_refused`]), if any — what an operator
