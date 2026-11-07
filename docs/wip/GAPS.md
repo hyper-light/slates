@@ -73,11 +73,14 @@
 > stalled runs were exactly those with two transitions). Such a set is no longer moved to: no takeover counts `f + 1`
 > reports from it. With the fix, 1 of 12 CI runs (diag-live-durability-36) and 0 of 6 Mac runs had a write over 1 s; the
 > Mac runs counted no transition.
-> **Open (owner live-fixes): a resumed candidate refuses entries while its own view still places the volume elsewhere.**
-> That one CI run (arm, 2.34 s) is another shape: the resumed X refused 2,086 entries `not_a_candidate` while the other
-> was stopped, so no holder answered (pre-merge's one 2.6 s stall counted no refusal; its shape is unknown). The holder
-> set already names X, and the owner's fence decides who may ship. Wanted: a holder in the owner's named set does not
-> refuse on its own placement view, or the shipper does not count on a holder until that holder's view places it again.
+> **Fixed (live-fixes 1b41b1dd and 07daf5fa, 2026-11-07): a resumed candidate refused entries while its own view still
+> placed the volume elsewhere.** The resumed X refused its owner's entries `not_a_candidate` while the other holder was
+> stopped, so no holder answered: a write held 2.34 s (diag-live-durability-36), and once a refusal for a whole fleet
+> wait, the candidate never caught up and Convergence failed (195,928 refusals, diag-live-durability-39; the shape of
+> diag-34's two arm failures). A holder the volume's newest catalog record names among its live holders now takes the
+> acting owner's entries though its configuration lags (`live_ship::live_admission`, red with the exception removed).
+> The A/B, rolling partition x10 per leg per arch (diag-live-durability-39): without, `not_a_candidate` in 4 of 20 runs,
+> a write over 1 s in 4, Convergence failed in 1; with, none of the three in 20.
 
 > **Fixed (live-fixes, 2026-11-07): a live shipper made before its candidates were known shipped to nobody** (A-200's
 > amendment of that date). A shipper kept the holders of its first publication, so a live volume made on a fleet's
