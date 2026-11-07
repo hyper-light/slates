@@ -4117,7 +4117,12 @@ last busy period grew nothing holds none: a written and deleted file nets zero, 
 unchanged (`a_deleted_files_memory_goes_back_to_the_os`). Measured:
 - `a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted`: a 16,777,200-byte burst left 16,711,680 bytes
   pre-faulted at idle, and the content object grew 184,320 bytes during the next 16 MiB write, against 16,961,536
-  without A-214;
+  without A-214. Under the whole `recovery` suite in parallel, on a host whose shmem grants `MADV_HUGEPAGE`
+  (`shmem_enabled` advise; adacachy, load 43–50, 2026-11-06), what a write needs beyond the reserve arrives in whole
+  2 MiB pages: the next write grew the object 2,097,152–4,194,304 bytes in ten runs, against 18,874,368–20,971,520 for
+  the first burst, and 16,777,216 against 18,874,368 with the pre-fault stubbed out (three of three). So the test holds
+  the second burst under half of the first's growth, not under a quarter of the file, which 4,194,304 bytes broke on
+  ubuntu-24.04-arm (CI run 42323710064) and on adacachy;
 - in the harness, the volume's shard faulted 342 MiB in over a run of three 64 MiB rounds and their mixed phases.
 
 **How the refill finds idle time.** A first build refilled at the reap tick only. On the Mac the harness pauses slates
