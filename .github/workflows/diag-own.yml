@@ -1,0 +1,87 @@
+name: DIAG the own-drive test under two deliberate breaks (not for main)
+
+# Windows legs run from pwsh, as CI's real steps do. Git Bash sets its token's default owner to the user, which hid a
+# refusal every elevated process meets (2026-11-06), so a Windows leg must never run under it.
+
+on:
+  push:
+    branches: ['diag-winfsp-bench-land-[0-9]*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+jobs:
+  ownmount:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, windows-11-arm]
+        tree:
+          - { label: red-no-check, sha: f7b889fa }
+          - { label: red-mapping, sha: 344d2bcd }
+    name: own drive ${{ matrix.tree.label }} on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+      WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+      WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: The tree under test
+        shell: pwsh
+        run: git -c advice.detachedHead=false switch --detach ${{ matrix.tree.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64)
+        if: matrix.runner == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64)
+        if: matrix.runner == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install WinFsp
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi
+          $found = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
+          $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: The own-drive tests, from pwsh
+        continue-on-error: true
+        shell: pwsh
+        env:
+          SLATES_TEST_CLI: "1"
+          WINFSP_TEST_MOUNT: "1"
+        run: |
+          $ErrorActionPreference = 'Continue'
+          cmd /c "cargo test -p slates-cli --locked --test winfsp own_drive -- --test-threads=1 --nocapture > own.log 2>&1"
+          "$(git rev-parse --short=8 HEAD) ${{ matrix.tree.label }} on ${{ matrix.runner }}: exit $LASTEXITCODE" | Out-File results.txt -Encoding ascii
+          Select-String -Path own.log -Pattern '^test |^test result|panicked at|OwnMount|did not answer|SKIP|refused' -Context 0,1 | Select-Object -First 30 | ForEach-Object { $_.ToString() } | Out-File results.txt -Append -Encoding ascii
+      - name: Publish
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set +e
+          [ -f results.txt ] || echo "the test step wrote nothing" > results.txt
+          git config user.name diag; git config user.email diag@invalid
+          tree=$(printf '100644 blob %s\tresults.txt\n' "$(git hash-object -w results.txt)" | git mktree)
+          commit=$(git commit-tree "$tree" -m ownmount)
+          git push -f origin "$commit:refs/heads/diag-winfsp-bench-land-results-${{ github.run_id }}-own-${{ matrix.tree.label }}-${{ matrix.runner }}"
