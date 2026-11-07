@@ -14200,7 +14200,22 @@ status, GAPS.
     the set always meet it: `f` alone was right only for a set of `2f`, and a set of `2f + 1` (the placement moved off
     the owner) left a holder unfenced (CI diag-20 run 7).
   - **The invariant** (raft's review, 2026-11-07): every write ever answered was answered while the recorded holder
-    set held it, so the recorded set always holds everything answered, and phase one may count only it.
+    set held it, so the recorded set always holds everything answered, and phase one may count only it. It rests on
+    these conditions, each held by the code:
+    1. The joint count stays in force until the record of H′ is placed, not just until the transfer check passes: a
+       write answered between the check and the placement must be durable on both sets (`Shipper::activate` runs only
+       on a placed record).
+    2. H is dropped only once H′'s record is placed at `f + 1`; phase one reads the catalog at quorum (the register
+       takeover's adopted catalog), so it meets a placed record and never acts on a dropped H.
+    3. Phase one fences every reporter and counts only the recorded set.
+    4. "Durable on a set" counts its members other than the owner, at `n − f` of `n`; a set of `f` or fewer is never
+       durable, so its transition waits rather than weakening `f`.
+    5. One transition at a time: once a target is transferred its record may be in flight, and a further change waits
+       for the activation (`Shipper::begin_transition`); before that, the newest target replaces the pending one.
+    6. A takeover is the same steps from the counted set (H_old → H′): the successor answers nothing until its own
+       record is placed, and in that window the record still names H_old.
+    Kept red in the model: recording H′ before the transfer. Owed there (live-fixes): durability on the intersection,
+    and dropping H before the placement.
   - Phase one counts `f + 1` reports only among the holders the adopted catalog records. Every member asked still
     reports, and the greatest head among all reports is adopted.
   - When too few recorded holders answer, phase one waits (`fleet.live.takeover_waits_quorum`). It never falls back to
