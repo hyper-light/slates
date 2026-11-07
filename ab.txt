@@ -1596,3 +1596,5 @@ slates daemon: the control shard's beat task ran 516 ms after its last turn (a n
 slates daemon: the control shard's beat task ran 568 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 626 steps and 442 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 118 unattributed), fired 2 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 712 ms and its timer overrun 23 ms
 slates daemon: the control shard's beat task ran 748 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 712 ms and its timer overrun 23 ms
 ## run 5 of 5 done, 2026-11-07T09:02:08Z
+To https://github.com/hyper-light/slates
+   b0349de..f8fbc86  f8fbc86b517eadde307ea0ddceba5cf58f51dd6d -> diag-winfsp-overlap-results-42354811410-form-x86
