@@ -1,0 +1,52 @@
+runner ubuntu-24.04-arm, 4 CPUs, 62ad93f diag: liveness-9, the give-back fix on main 4326a9d8: A-205's give-back , Sat Nov  7 03:54:14 UTC 2026
+test result: ok. 94 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.34s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+== mem exit 0
+test a_deleted_files_memory_goes_back_to_the_os ... ok
+test a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it ... ok
+test an_idle_small_file_is_sealed_by_the_daemons_sweep ... ok
+test a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted ... ok
+test a_volume_past_the_reserves_power_of_two_part_fills_and_survives_a_restart ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 13.21s
+== recovery run 1 exit 0
+test a_deleted_files_memory_goes_back_to_the_os ... ok
+test a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it ... ok
+test an_idle_small_file_is_sealed_by_the_daemons_sweep ... ok
+test a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted ... ok
+test a_volume_past_the_reserves_power_of_two_part_fills_and_survives_a_restart ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 11.90s
+== recovery run 2 exit 0
+test a_deleted_files_memory_goes_back_to_the_os ... ok
+test a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it ... ok
+test a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted ... ok
+test an_idle_small_file_is_sealed_by_the_daemons_sweep ... ok
+test a_volume_past_the_reserves_power_of_two_part_fills_and_survives_a_restart ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 12.51s
+== recovery run 3 exit 0
+test a_deleted_files_memory_goes_back_to_the_os ... ok
+test an_idle_small_file_is_sealed_by_the_daemons_sweep ... ok
+test a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted ... ok
+test a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it ... ok
+test a_volume_past_the_reserves_power_of_two_part_fills_and_survives_a_restart ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 9.97s
+== recovery run 4 exit 0
+test a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it ... ok
+test a_deleted_files_memory_goes_back_to_the_os ... ok
+test an_idle_small_file_is_sealed_by_the_daemons_sweep ... ok
+test a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted ... ok
+test a_volume_past_the_reserves_power_of_two_part_fills_and_survives_a_restart ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 12.31s
+== recovery run 5 exit 0
