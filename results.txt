@@ -1,0 +1,46 @@
+runner windows-latest, 4 CPUs, e8b7fd1 diag: liveness-14 on 52c91447: held_rendezvous x5 quiet and x5 beside tw, Sat Nov  7 09:00:57 UTC 2026
+test a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon ... held rendezvous: 6 connects at a kill, all answered by the next daemon, longest 47.3224ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.65s
+== quiet run 1 exit 0
+test a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon ... held rendezvous: 6 connects at a kill, all answered by the next daemon, longest 43.4716ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.62s
+== quiet run 2 exit 0
+test a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon ... held rendezvous: 6 connects at a kill, all answered by the next daemon, longest 43.8832ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.63s
+== quiet run 3 exit 0
+test a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon ... held rendezvous: 6 connects at a kill, all answered by the next daemon, longest 46.9652ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.63s
+== quiet run 4 exit 0
+test a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon ... held rendezvous: 6 connects at a kill, all answered by the next daemon, longest 45.4923ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.63s
+== quiet run 5 exit 0
+test a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon ... 
+thread 'a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon' (1252) panicked at crates\cli\tests\held_rendezvous.rs:169:5:
+round 0: answered in 1.1504037s, inside the claim wait
+    a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.42s
+== loaded run 1 exit 101
+test a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon ... 
+thread 'a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon' (7880) panicked at crates\cli\tests\held_rendezvous.rs:169:5:
+round 0: answered in 1.2778511s, inside the claim wait
+    a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.28s
+== loaded run 2 exit 101
+test a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon ... 
+thread 'a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon' (1884) panicked at crates\cli\tests\held_rendezvous.rs:169:5:
+round 0: answered in 1.1731732s, inside the claim wait
+    a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.70s
+== loaded run 3 exit 101
+test a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon ... 
+thread 'a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon' (4344) panicked at crates\cli\tests\held_rendezvous.rs:169:5:
+round 0: answered in 1.1287082s, inside the claim wait
+    a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.33s
+== loaded run 4 exit 101
+test a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon ... 
+thread 'a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon' (3284) panicked at crates\cli\tests\held_rendezvous.rs:169:5:
+round 0: answered in 1.0471482s, inside the claim wait
+    a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.92s
+== loaded run 5 exit 101
