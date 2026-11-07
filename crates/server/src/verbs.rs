@@ -11392,6 +11392,38 @@ mod tests {
     )
   }
 
+  /// The design's Phase 4 step 6 owes the Windows landing writer; until it lands, the verb is refused and
+  /// keeps nothing, so nothing is presented that a grant could never carry out. Do: on a platform with no
+  /// writer, present a landing of a volume into this crate's directory. Expect: `Unsupported`, naming
+  /// landing; the status report counts no presentation, and the audit log gains no `landing_planned`. Until
+  /// 2026-11-06 no test ran this refusal: the two presentation tests beside it, now Unix alone, asked Windows
+  /// for what only Unix serves.
+  #[cfg(not(unix))]
+  #[test]
+  fn a_landing_with_no_writer_on_this_platform_is_refused_and_changes_nothing() {
+    crate::daemon::audit_on_shard(|state| {
+      let principal = Principal::Uid { uid: 1234 };
+      let volume = created(state, &principal, "no-writer");
+      let planned = planned_records(state, &principal);
+      let reply = present_landing(state, &principal, volume, env!("CARGO_MANIFEST_DIR"));
+      assert!(
+        matches!(
+          &reply,
+          super::ReplyBody::Refused {
+            refusal: Refusal::Unsupported { feature }
+          } if feature == "landing"
+        ),
+        "{reply:?}"
+      );
+      assert_eq!(awaiting_count(state), 0, "the refusal presented nothing");
+      assert_eq!(
+        planned_records(state, &principal),
+        planned,
+        "nor recorded anything"
+      );
+    });
+  }
+
   /// The landings the shard's status report counts awaiting a grant.
   fn awaiting_count(state: &mut crate::state::ShardState) -> u64 {
     super::shard_report(state).landings_awaiting
@@ -11417,6 +11449,7 @@ mod tests {
   /// still counts one presentation, the audit log still one `landing_planned`, and A's re-presentation takes
   /// the very next id, so none was spent on B; A's second presentation replaces its first (still one), and
   /// the first's id is no longer grantable. Before 2026-09-29 nothing bounded the presentations.
+  #[cfg(unix)]
   #[test]
   fn a_presentation_past_the_bound_is_refused_and_changes_nothing() {
     crate::daemon::audit_on_shard(|state| {
@@ -11479,6 +11512,7 @@ mod tests {
   /// presentation carries its first's manifest and the head's another; the unknown one is `NotFound`. Before
   /// 2026-09-30 the changed head was refused `Unsupported`; before 2026-09-29 the head was landed under the
   /// snapshot's name.
+  #[cfg(unix)]
   #[test]
   fn a_landing_of_a_named_snapshot_presents_that_snapshot_whatever_the_head_became() {
     crate::daemon::audit_on_shard(|state| {

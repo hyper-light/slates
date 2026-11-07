@@ -2917,7 +2917,9 @@ Deviations and owed items from tasks 11–13:
 - The directory sync strategy is one `fsync` per touched directory; the `syncfs` alternative
   waits on the measured per-directory cost the report now carries (`Durability.dir_sync_ns`).
 - Windows has no OS writer yet (`FileRenameInfoEx` with `POSIX_SEMANTICS`, the sharing-mode
-  verify): the Windows bridge of Phase 4; the crate compiles there without the `os` module.
+  verify): the Windows bridge of Phase 4; the crate compiles there without the `os` module. The verb refuses
+  `Unsupported` there, held by `a_landing_with_no_writer_on_this_platform_is_refused_and_changes_nothing`
+  (`docs/bugs/2026-11-06-two-landing-tests-asked-windows-for-a-unix-verb.md`).
 - `TargetIsVolume` is not checked: there is no mount table before Phase 3.
 - The real-target tests and the OS rows of the bench run in the Linux lane; on this machine
   they skip loudly (no RAM disk authorized), so their first numbers are the lane's.
@@ -12692,7 +12694,9 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       test at a time. Not yet found: what spends the long polls' CPU (the wheel's reservation touches no page). The trace also showed a
       runtime's shard ids handed out again after an earlier daemon's runtime ended (two daemons' shard 16 seated a
       client 43 ms apart), harmless here since every named object carries the instance or its daemon's key. CI runs
-      the client binary one test at a time on Windows meanwhile;
+      the client binary one test at a time on Windows meanwhile. The server's lib tests meet the same limit on jupiter
+      (2026-11-06: aborted 4 of 4 at 32 threads on the same 1,746,925,056 bytes; 4 to 10 of 186 failed at 4 threads, each
+      on `VirtualAlloc(MEM_COMMIT)` code 1455; none at 1 thread), so they need one test at a time on Windows too;
     - **fixed 2026-10-25 (A-176): the client binary's restart tests on Windows.** They had never run there; on jupiter
       all six failed, the restarted daemon meeting its predecessor's still-live named section (`CreateFileMappingW`
       refused `ERROR_ALREADY_EXISTS`). Beneath it, the harness played the anchor's segment but not its rendezvous (now
