@@ -69,12 +69,17 @@ fn mount_of<'a>(state: &'a ShardState, record: &'a AttachmentRecord) -> Option<(
   Some((point, volume.name.as_str()))
 }
 
-/// Records the mount the CLI just bound for `record` at `mount_point`, before the bind is committed: refused when the
-/// kernel's table names no mount of the volume there (the path the kernel records, which the CLI binds), or at the
-/// bound of mounts this daemon records. `None` when this shard holds the mount already (a bind made again), whose
-/// holder stays.
+/// Counter: binds whose point the kernel's table names no mount of the volume at, so nothing was recorded (A-227). The
+/// CLI binds the point the kernel records once `mount(2)` has returned, so a count here is a bind of a point with no
+/// mount (the `UMNT` confirmation's tests make one on purpose) or a point the CLI and the kernel name differently.
+pub(crate) const BIND_UNCONFIRMED: &str = "own_nfs.bind_unconfirmed";
+
+/// Records the mount the CLI just bound for `record` at `mount_point`, before the bind is committed. The record mirrors
+/// the kernel's table: a point the table names no mount of the volume at holds nothing this daemon serves, so nothing is
+/// recorded and the bind is counted [`BIND_UNCONFIRMED`]. `None` then, and when this shard holds the mount already (a
+/// bind made again, whose holder stays); refused at the bound of mounts this daemon records.
 pub(crate) fn bound(
-  state: &ShardState,
+  state: &mut ShardState,
   record: &AttachmentRecord,
   mount_point: &str,
 ) -> Result<Option<OwnNfsMount>, Refusal> {
@@ -83,8 +88,10 @@ pub(crate) fn bound(
     .partition()
     .volume(record.volume)
     .ok_or(Refusal::NotFound)?;
-  let id =
-    id_at(mount_point, &volume.name).ok_or_else(|| refusal(Unrecorded::NotMounted, mount_point))?;
+  let Some(id) = id_at(mount_point, &volume.name) else {
+    state.count(BIND_UNCONFIRMED, 1);
+    return Ok(None);
+  };
   if held(state, id) {
     return Ok(None);
   }

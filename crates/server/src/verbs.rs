@@ -7172,7 +7172,7 @@ fn bind_mount(
     });
   }
   // The mount the CLI just made is this daemon's own from here (A-227): the kernel's table names it at exactly the
-  // bound path, the one the kernel records, or the bind is refused and the CLI takes the mount down again.
+  // bound path, the one the kernel records (a point holding no mount of the volume records nothing).
   #[cfg(target_os = "macos")]
   let own = match crate::own_nfs::bound(state, &record, path) {
     Ok(own) => own,

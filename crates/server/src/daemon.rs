@@ -713,6 +713,9 @@ impl Daemon {
     #[cfg(windows)]
     configure_windows_hold_owner(windows_channel.is_some(), &shards)?;
     let handed_connections = handed.connections;
+    // This daemon's learning gate (A-227): its shards' crossing checks wait on its own shards' learning alone.
+    #[cfg(unix)]
+    let gate = slates_base::own_mounts::Gate::new(LIVENESS_BUDGET_NS);
     for (index, shard) in shards.iter().enumerate() {
       let env = segment.handoff_env()?;
       let config = config.clone();
@@ -733,11 +736,17 @@ impl Daemon {
           None
         },
       );
-      // This shard's learning of the mounts it keeps, taken before it starts so no crossing anywhere in the process is
-      // judged before the shard has recorded them (A-227).
-      #[cfg(unix)]
-      let learning = slates_base::own_mounts::learning(LIVENESS_BUDGET_NS);
+      // This shard's learning of the mounts it keeps, taken before it starts so none of the daemon's crossings is
+      // judged before the shard has recorded them (A-227). A Linux shard the anchor handed no FUSE device keeps no mount
+      // that could wait on it (a kept mount with no device answers `ENOTCONN`), so it counts as learned at once. A
+      // macOS shard learns its kept NFS mounts from its catalog, which it reads only as it starts.
+      #[cfg(target_os = "linux")]
+      let learning = (!held.is_empty()).then(|| gate.learning());
+      #[cfg(target_os = "macos")]
+      let learning = Some(gate.learning());
       runtime.spawn_on(*shard, async move {
+        #[cfg(unix)]
+        gate.enter();
         // How long a shard's start takes (its recovery included) is in the boot log: the control loop's first call to
         // each shard queues behind it (GAPS, boot, 2026-10-05).
         let started = std::time::Instant::now();
@@ -3118,7 +3127,7 @@ fn init_shard(
     Vec<crate::winfsp::InheritedMount>,
     Option<std::os::windows::io::OwnedHandle>,
   ),
-  #[cfg(unix)] learning: slates_base::own_mounts::Learning,
+  #[cfg(unix)] learning: Option<slates_base::own_mounts::Learning>,
 ) -> Result<(), ServerError> {
   let (handoff, len) = handoff_of(env)?;
   let mut segment = AnchorSegment::attach(&handoff, len, identity)?;

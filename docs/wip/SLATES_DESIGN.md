@@ -13965,17 +13965,23 @@ own-mount records, `check_mount_point`, the refusals' mapping), `crates/bridge-w
     daemon, so the daemon's own record is the one source of truth: each mount is recorded when the CLI binds it, by the
     kernel's filesystem id for it (`getfsstat(MNT_NOWAIT)`, no RPC, the entry at exactly the bound point whose source
     is the volume's), never by a path prefix. The CLI binds the path the kernel records (`canonicalize`, as on Linux),
-    and a bind the table does not confirm is refused, so the CLI takes the mount down. A crossing is the kernel's path
-    of the parent (`F_GETPATH`, on a filesystem that is not ours, since every crossing to it was checked) with the
-    entry's name, compared exactly with each recorded mount's point; a thread reads the points once and again only
+    and the record mirrors the table: a bind of a point the table names no mount of the volume at records nothing
+    and is counted (`own_nfs.bind_unconfirmed`; the `UMNT` confirmation's tests make one on purpose). A crossing is
+    the kernel's path of the parent (`F_GETPATH`, on a filesystem that is not ours, since every crossing to it was
+    checked) with the entry's name, compared exactly with each recorded mount's point; a thread reads the points once and again only
     when the set changes (a generation word).
   - **A successor's kept mounts (supervisor's condition, 2026-11-06).** The record covers mounts the daemon did not
     bind itself. Recovery reacquired bases before a shard adopted the mounts its predecessor kept, so a base under a
     kept mount was entered before the mount was this daemon's, on every platform. Each shard now learns its kept
     mounts from its catalog (Linux FUSE by point and the `slates:` prefix, macOS NFS by point and source) before it
     reacquires any base or resumes any landing; a shard's base can lie under another shard's mount, so every crossing
-    check in the process waits until every shard has learned (a ticket per shard, taken before it starts; bounded by
-    the liveness budget, refused `EAGAIN` past it). Windows learns its held volumes before any shard starts, from the
+    check of the daemon's waits until every one of its shards has learned (a ticket per shard, taken before it starts;
+    bounded by the liveness budget, refused `EAGAIN` past it). The gate is the daemon's: its shard threads enter it as
+    they start, and a check waits on its own daemon's shards alone. A Linux shard the anchor handed no FUSE device keeps
+    no mount that could wait on it (a kept mount with no device answers `ENOTCONN`), so it takes no ticket. (The first
+    form counted every shard of the process: in a test binary that starts daemons side by side, a landing's target
+    check waited the whole 1 s budget on other daemons' starting shards, 3 to 5 of them at once, and four recovery
+    tests stalled, found by the stack's gates on 2026-11-06.) Windows learns its held volumes before any shard starts, from the
     records the anchor hands over. A mount is recorded once (a repeat takes no slot) and has one holder, which forgets
     it in every slot it lies in. A learned record is moved to its mount, a bind made again keeps the holder it has, and
     two catalog records naming one point learn it once. (Until the fix of 2026-11-06 a repeat took a second slot, so a
