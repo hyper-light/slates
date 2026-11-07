@@ -289,13 +289,20 @@ fn fleet_view(instance: &str) -> Option<(String, usize, u32)> {
   ))
 }
 
-/// Whether a node's probe mesh ([`mesh_of`]) is up as its daemon judges it: every peer it keeps direct contact with is
-/// probed (`fleet_peers_unmeshed` zero), and it keeps contact with at least one. Not "every member less one probed": two
-/// members that neither hold for each other nor vote keep no direct contact (§4.8), so a five-node fleet's two
-/// non-voters probe each other only in formation's first window (raft-chaos's flow took that for a stall, CI
-/// diag-live-fixes-30 runs 5 and 6).
-fn meshed(mesh: Option<(u32, u32)>) -> bool {
-  mesh.is_some_and(|(in_contact, unmeshed)| in_contact > 0 && unmeshed == 0)
+/// Whether a node holding `members` members alive, `probed` of its peers probed, has its probe mesh up, with `mesh`
+/// its `(fleet_peers_in_contact, fleet_peers_unmeshed)` ([`mesh_of`]). Once a configuration is installed it keeps
+/// direct contact only with its holders and the voters (§4.8, amended 2026-10-10), so the mesh is up when every peer
+/// in contact is probed (unmeshed zero): a five-node fleet's two non-voters keep none with each other, and the flow
+/// took them for a stall at 3 of 4 peers probed (CI diag-live-fixes-30 runs 5 and 6). Before one is installed the
+/// daemon counts none in contact (the counts are over the installed configuration's members), while formation keeps
+/// a full mesh, so then the mesh is up at every member less one probed: judged by the counts alone the wait never
+/// ended (both 0 on every node, CI diag-raft-chaos-mesh-42).
+fn meshed(members: usize, probed: u32, mesh: Option<(u32, u32)>) -> bool {
+  match mesh {
+    Some((0, 0)) => usize::try_from(probed).ok() == members.checked_sub(1),
+    Some((_, unmeshed)) => unmeshed == 0,
+    None => false,
+  }
 }
 
 /// `instance`'s probe mesh from `status`: the peers it keeps direct contact with (`fleet_peers_in_contact`) and how
@@ -324,11 +331,11 @@ fn wait_formed(instances: &[String], members: usize) -> Vec<String> {
     // Each node's (in contact, unmeshed), as `status` prints them.
     let meshes: Vec<Option<(u32, u32)>> =
       instances.iter().map(|instance| mesh_of(instance)).collect();
-    if views
-      .iter()
-      .all(|view| view.as_ref().is_some_and(|(_, held, _)| *held == members))
-      && meshes.iter().all(|mesh| meshed(*mesh))
-    {
+    if views.iter().zip(&meshes).all(|(view, mesh)| {
+      view
+        .as_ref()
+        .is_some_and(|(_, held, probed)| *held == members && meshed(members, *probed, *mesh))
+    }) {
       return views.into_iter().map(|view| view.unwrap().0).collect();
     }
     // Progress counts a node's mesh coming up as well as its members and probes changing.
