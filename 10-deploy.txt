@@ -67,3 +67,5 @@ fleet_configuration_members: 2
 fleet_council_leads: false
 --- the council did not widen to every node within 40s after the refusal
 0
+=== run 4 exit 0 load { 15.38 8.88 8.11 }
+0
