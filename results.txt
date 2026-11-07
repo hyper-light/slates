@@ -1,0 +1,7 @@
+344d2bcd red-mapping on windows-11-arm: exit 0
+> C:\a\slates\slates\own.log:3081:test a_base_on_the_daemons_own_drive_is_refused_before_any_open ... slates anchor: instance wfownbase7096 up; daemon pid 9936; 1 shards
+  C:\a\slates\slates\own.log:3082:slates anchor: issuer surface: export SLATES_ANCHOR=slates-seg-wfownbase7096 SLATES_ANCHOR_LEN=18600230912 SLATES_ANCHOR_CONTENT=slates-con-wfownbase7096 SLATES_ANCHOR_CONTENT_LEN=24323424256
+> C:\a\slates\slates\own.log:3125:test a_landing_target_on_the_daemons_own_drive_is_refused_before_any_open ... slates anchor: instance wfownland7096 up; daemon pid 4476; 1 shards
+  C:\a\slates\slates\own.log:3126:slates anchor: issuer surface: export SLATES_ANCHOR=slates-seg-wfownland7096 SLATES_ANCHOR_LEN=18600230912 SLATES_ANCHOR_CONTENT=slates-con-wfownland7096 SLATES_ANCHOR_CONTENT_LEN=24323424256
+> C:\a\slates\slates\own.log:3170:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 2.08s
+  C:\a\slates\slates\own.log:3171:
