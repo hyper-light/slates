@@ -1,0 +1,108 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 01:47:02 UTC 2026, commit 24931ceb
+== ack_release_main busy round 1 at 01:47:02
+status on a starved shard answered in 551.44984ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.52s
+== ack_release busy round 1 at 01:47:06
+thread 'a_grants_listing_whose_part_cannot_be_sent_is_refused_overloaded' (5589) panicked at crates/server/tests/ack_release.rs:497:3:
+status on a starved shard answered in 526.797655ms
+    a_grants_listing_whose_part_cannot_be_sent_is_refused_overloaded
+test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.88s
+== ack_release_main busy round 2 at 01:47:09
+thread 'a_daemon_status_whose_part_cannot_be_sent_is_refused_overloaded' (5642) panicked at crates/server/tests/ack_release_main.rs:455:3:
+status on a starved shard answered in 572.016768ms
+    a_daemon_status_whose_part_cannot_be_sent_is_refused_overloaded
+test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.70s
+== ack_release busy round 2 at 01:47:14
+thread 'a_daemon_status_whose_part_cannot_be_sent_is_refused_overloaded' (5697) panicked at crates/server/tests/ack_release.rs:497:3:
+thread 'a_listing_whose_part_cannot_be_sent_is_refused_overloaded' (5700) panicked at crates/server/tests/ack_release.rs:497:3:
+list with the other shard's control channel full: Listed { volumes: [] }
+status on a starved shard answered in 528.017854ms
+    a_daemon_status_whose_part_cannot_be_sent_is_refused_overloaded
+    a_listing_whose_part_cannot_be_sent_is_refused_overloaded
+test result: FAILED. 4 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.07s
+== ack_release_main busy round 3 at 01:47:17
+status on a starved shard answered in 557.016376ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.34s
+== ack_release busy round 3 at 01:47:21
+thread 'a_grants_listing_whose_part_cannot_be_sent_is_refused_overloaded' (5809) panicked at crates/server/tests/ack_release.rs:497:3:
+status on a starved shard answered in 552.009375ms
+    a_grants_listing_whose_part_cannot_be_sent_is_refused_overloaded
+test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.34s
+== ack_release_main busy round 4 at 01:47:24
+status on a starved shard answered in 538.025979ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.97s
+== ack_release busy round 4 at 01:47:28
+thread 'a_listing_whose_part_cannot_be_sent_is_refused_overloaded' (5919) panicked at crates/server/tests/ack_release.rs:497:3:
+list with the other shard's control channel full: Listed { volumes: [] }
+thread 'a_daemon_status_whose_part_cannot_be_sent_is_refused_overloaded' (5916) panicked at crates/server/tests/ack_release.rs:497:3:
+status on a starved shard answered in 543.0155ms
+    a_daemon_status_whose_part_cannot_be_sent_is_refused_overloaded
+    a_listing_whose_part_cannot_be_sent_is_refused_overloaded
+test result: FAILED. 4 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.76s
+== ack_release_main busy round 5 at 01:47:31
+status on a starved shard answered in 541.012574ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.00s
+== ack_release busy round 5 at 01:47:34
+thread 'a_listing_whose_part_cannot_be_sent_is_refused_overloaded' (6031) panicked at crates/server/tests/ack_release.rs:497:3:
+list with the other shard's control channel full: Listed { volumes: [] }
+status on a starved shard answered in 561.917507ms
+    a_listing_whose_part_cannot_be_sent_is_refused_overloaded
+test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.73s
+== ack_release_main busy round 6 at 01:47:37
+status on a starved shard answered in 552.904168ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.42s
+== ack_release busy round 6 at 01:47:41
+thread 'a_listing_whose_part_cannot_be_sent_is_refused_overloaded' (6140) panicked at crates/server/tests/ack_release.rs:497:3:
+list with the other shard's control channel full: Listed { volumes: [] }
+thread 'a_daemon_status_whose_part_cannot_be_sent_is_refused_overloaded' (6137) panicked at crates/server/tests/ack_release.rs:497:3:
+status on a starved shard answered in 567.882919ms
+    a_daemon_status_whose_part_cannot_be_sent_is_refused_overloaded
+    a_listing_whose_part_cannot_be_sent_is_refused_overloaded
+test result: FAILED. 4 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.49s
+== ack_release_main busy round 7 at 01:47:44
+thread 'a_daemon_status_whose_part_cannot_be_sent_is_refused_overloaded' (6191) panicked at crates/server/tests/ack_release_main.rs:455:3:
+status on a starved shard answered in 542.018315ms
+    a_daemon_status_whose_part_cannot_be_sent_is_refused_overloaded
+test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.33s
+== ack_release busy round 7 at 01:47:48
+thread 'a_daemon_status_whose_part_cannot_be_sent_is_refused_overloaded' (6247) panicked at crates/server/tests/ack_release.rs:497:3:
+thread 'a_listing_whose_part_cannot_be_sent_is_refused_overloaded' (6250) panicked at crates/server/tests/ack_release.rs:497:3:
+list with the other shard's control channel full: Listed { volumes: [] }
+thread 'a_grants_listing_whose_part_cannot_be_sent_is_refused_overloaded' (6248) panicked at crates/server/tests/ack_release.rs:497:3:
+status on a starved shard answered in 563.013244ms
+    a_daemon_status_whose_part_cannot_be_sent_is_refused_overloaded
+    a_grants_listing_whose_part_cannot_be_sent_is_refused_overloaded
+    a_listing_whose_part_cannot_be_sent_is_refused_overloaded
+test result: FAILED. 3 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.24s
+== ack_release_main busy round 8 at 01:47:50
+status on a starved shard answered in 565.514462ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.08s
+== ack_release busy round 8 at 01:47:54
+thread 'a_daemon_status_whose_part_cannot_be_sent_is_refused_overloaded' (6356) panicked at crates/server/tests/ack_release.rs:497:3:
+thread 'a_grants_listing_whose_part_cannot_be_sent_is_refused_overloaded' (6357) panicked at crates/server/tests/ack_release.rs:497:3:
+status on a starved shard answered in 550.856571ms
+    a_daemon_status_whose_part_cannot_be_sent_is_refused_overloaded
+    a_grants_listing_whose_part_cannot_be_sent_is_refused_overloaded
+test result: FAILED. 4 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.50s
+== ack_release_main busy round 9 at 01:47:57
+status on a starved shard answered in 520.488412ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.15s
+== ack_release busy round 9 at 01:48:00
+thread 'a_listing_whose_part_cannot_be_sent_is_refused_overloaded' (6468) panicked at crates/server/tests/ack_release.rs:497:3:
+list with the other shard's control channel full: Listed { volumes: [] }
+thread 'a_grants_listing_whose_part_cannot_be_sent_is_refused_overloaded' (6466) panicked at crates/server/tests/ack_release.rs:497:3:
+status on a starved shard answered in 531.045026ms
+    a_grants_listing_whose_part_cannot_be_sent_is_refused_overloaded
+    a_listing_whose_part_cannot_be_sent_is_refused_overloaded
+test result: FAILED. 4 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.93s
+== ack_release_main busy round 10 at 01:48:03
+status on a starved shard answered in 547.513886ms
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.40s
+== ack_release busy round 10 at 01:48:07
+thread 'a_grants_listing_whose_part_cannot_be_sent_is_refused_overloaded' (6576) panicked at crates/server/tests/ack_release.rs:497:3:
+thread 'a_listing_whose_part_cannot_be_sent_is_refused_overloaded' (6578) panicked at crates/server/tests/ack_release.rs:497:3:
+list with the other shard's control channel full: Listed { volumes: [] }
+status on a starved shard answered in 535.999752ms
+    a_grants_listing_whose_part_cannot_be_sent_is_refused_overloaded
+    a_listing_whose_part_cannot_be_sent_is_refused_overloaded
+test result: FAILED. 4 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.20s
