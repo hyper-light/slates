@@ -2746,23 +2746,28 @@ fn holders_of(fleet: &Fleet, volume: &str) -> Vec<usize> {
 
 /// A-240, phase one with a member that is not a holder: on a five-node fleet (f = 1, so a volume has two holders beside
 /// its owner, and the council seats three voters), do stream writes to a live volume owned by a member without a seat,
-/// replace a node that holds none of the log (a fresh member identity joins), partition one holder (SIGSTOP) while the
-/// writes go on through the other, stop the stream, then partition that other holder, crash the owner and resume the
-/// stale holder. The partitioned holder is one that leaves the council two of its three votes, so the takeover can run. Expect no survivor ever to serve the volume without every
-/// acknowledged write (NoLoss), and a phase one that waits for the holder of the log (`takeover_waits_quorum`) rather
-/// than counting the replacement or another member in its place; once the partitioned holder is resumed, a survivor
-/// may serve it whole. Before A-240 phase one counted `f + 1` among the current placement, so the stale holder and a
-/// member that never held the log made a quorum (the model's 10 of 400 seeds; on KIND a holder kept its fence at the
-/// old epoch after a takeover, 2026-11-06).
+/// replace a node that holds none of the log (a fresh member identity joins), and stop one holder (SIGSTOP) while the
+/// writes go on through the other, so it falls behind. Then stop the stream, crash the owner and resume the stale
+/// holder. Both holders answer the registers' takeover (the head and catalog promotion needs `f + 1` of the volume's
+/// original candidates); the moment a survivor has adopted them, the holder with the log is stopped for
+/// [`HOLDER_PAUSE`], past one phase-one exchange, so the live log's phase one meets the stale holder and members that
+/// never held the log. Expect no survivor ever to serve the volume without every acknowledged write (NoLoss), and, when
+/// phase one ran inside the pause, that it waited for the holder (`takeover_waits_quorum`) rather than counting another
+/// member in its place; once the holder resumes, a survivor serves the volume whole. This is KIND's shape: the holder's
+/// reply over a shaped path missed the 1 s exchange, and the successor counted itself and the replacement pod (runs
+/// 42326682216, 42331191530, 42341005472: a holder left at fence 1 after a takeover at epoch 2).
 #[test]
 fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
+  /// Shape: how long the holder with the log is stopped once the registers are adopted: past one phase-one exchange
+  /// (the liveness budget, 1 s) and the record period after it.
+  const HOLDER_PAUSE: Duration = Duration::from_secs(3);
   if !gated("fresh-member") {
     return;
   }
   let mut fleet = Fleet::start_with("fresh-member", Supervision::Bare, &WIDE_NODES);
   let instances = fleet.instances.clone();
   // The owner holds no council seat, so its loss costs the council no vote and the takeover can run with a holder
-  // partitioned too (the council seats three of the five).
+  // stopped too (the council seats three of the five).
   let seated = council_voters_by_index(&fleet);
   let owner_index = (0..instances.len())
     .filter(|index| !seated.contains(index))
@@ -2778,17 +2783,11 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
       .map(|index| instances[*index].as_str())
       .collect::<Vec<_>>()
   ));
-  let mut holders = Vec::new();
   let mut roles = None;
   let fleet_cell = std::cell::RefCell::new(&mut fleet);
   let (outcomes, _samples) = stream_through(&instances, &owner, &volume, 0..STREAM_FILES, |began| {
     after_writes(&owner, &volume, BETWEEN_EVENTS);
-    holders = holders_of(&fleet_cell.borrow(), &volume);
-    assert_eq!(
-      holders.len(),
-      2,
-      "the volume has two holders beside its owner: {holders:?}"
-    );
+    let holders = wait_holders(&fleet_cell.borrow(), &volume, 2);
     // A member that holds none of the log is replaced: its successor joins under a fresh identity. One without a seat
     // first, so the council's seats stay where they were.
     let seated = council_voters_by_index(&fleet_cell.borrow());
@@ -2807,15 +2806,14 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
       instances[replaced],
       began.elapsed()
     ));
-    // The holder partitioned at the owner's loss: one whose seat, with the owner's, leaves the council two of its three
-    // votes. The other holder falls behind first.
+    // The holder stopped at the takeover: one whose seat, with the owner's, leaves the council two of its three votes.
     let seated = council_voters_by_index(&fleet_cell.borrow());
     let owner_seated = seated.contains(&owner_index);
     let current = holders
       .iter()
       .copied()
       .find(|holder| !(owner_seated && seated.contains(holder)))
-      .expect("a holder whose partition with the owner's loss leaves the council a majority");
+      .expect("a holder whose stop with the owner's loss leaves the council a majority");
     let stale = holders
       .iter()
       .copied()
@@ -2832,80 +2830,131 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
     after_writes(&owner, &volume, BETWEEN_EVENTS);
   });
   let (current, stale) = roles.expect("the flow chose its holders' roles");
-  // The writes since the stale holder stopped are durable on the owner and `current` alone. Once the stream has
-  // stopped (every write answered), `current` is partitioned and the owner crashed, and only then is the stale holder
-  // resumed, so nothing reaches it and it stays behind.
-  fleet.stop(current);
+  let survivors: Vec<&str> = (0..instances.len())
+    .filter(|index| *index != owner_index)
+    .map(|index| instances[index].as_str())
+    .collect();
+  let adopted_before: u64 = survivors
+    .iter()
+    .map(|survivor| counter(survivor, "fleet.takeover.adopted"))
+    .sum();
+  // The writes since the stale holder stopped are durable on the owner and `current` alone. Once the stream has stopped
+  // (every write answered), the owner is crashed and the stale holder resumed: nothing reaches it any more.
   fleet.kill_node(owner_index);
   fleet.resume(stale);
-  verdict.note(format!(
-    "{} stopped, owner {owner} crashed and {} resumed stale",
-    instances[current], instances[stale]
-  ));
   let acknowledged = outcomes
     .iter()
     .filter(|outcome| outcome.refused.is_none())
     .count();
   verdict.note(format!(
-    "{acknowledged} writes acknowledged; holders {} (partitioned) and {} (stale)",
+    "{acknowledged} writes acknowledged; owner crashed; holders {} (with the log) and {} (stale)",
     instances[current], instances[stale]
   ));
-  let survivors: Vec<&str> = (0..instances.len())
-    .filter(|index| *index != owner_index && *index != current)
-    .map(|index| instances[index].as_str())
-    .collect();
-  // A survivor that takes the volume over in the window must serve every acknowledged write; with the fix none can
-  // until the partitioned holder answers.
-  match wait_taken_over(&survivors, &volume) {
-    Some((successor, took)) => {
-      verdict.note(format!(
-        "{successor} took the volume over after {took:?} without the partitioned holder"
-      ));
-      verdict.check(
-        "NoLoss (a takeover without the log's holder)",
-        no_loss(successor, &volume, &outcomes),
-      );
+  // The moment a survivor has adopted the registers, the holder with the log is stopped, so the live log's phase one
+  // runs without it.
+  let deadline = Instant::now() + FLEET_WAIT;
+  let adopted_by = loop {
+    if let Some(survivor) = survivors.iter().find(|survivor| {
+      counter(survivor, "fleet.takeover.adopted") > 0
+        && survivors
+          .iter()
+          .map(|survivor| counter(survivor, "fleet.takeover.adopted"))
+          .sum::<u64>()
+          > adopted_before
+    }) {
+      break Some(*survivor);
     }
-    None => verdict.note(format!(
-      "no survivor took the volume over within {FLEET_WAIT:?} without the log's holder"
-    )),
+    if Instant::now() >= deadline {
+      break None;
+    }
+    pause();
+  };
+  let Some(adopted_by) = adopted_by else {
+    verdict.check(
+      "the registers' takeover",
+      vec!["no survivor adopted the volume's registers within the fleet wait".to_owned()],
+    );
+    drop(fleet);
+    return verdict.judge();
+  };
+  let decisive = adopted_by != instances[current].as_str();
+  if decisive {
+    fleet.stop(current);
   }
-  let waited: u64 = survivors
+  let stopped_at = Instant::now();
+  verdict.note(format!(
+    "{adopted_by} adopted the registers; {}",
+    if decisive {
+      format!("{} stopped for {HOLDER_PAUSE:?}", instances[current])
+    } else {
+      "it holds the log itself, so this run cannot show the defect".to_owned()
+    }
+  ));
+  let others: Vec<&str> = survivors
+    .iter()
+    .copied()
+    .filter(|survivor| *survivor != instances[current].as_str())
+    .collect();
+  let mut served_without = None;
+  while decisive && stopped_at.elapsed() < HOLDER_PAUSE {
+    if let Some(successor) = others.iter().find(|survivor| {
+      counter(survivor, "fleet.live.taken_over") > 0 || serving_epoch(survivor, &volume) > 0
+    }) {
+      served_without = Some(*successor);
+      break;
+    }
+    pause();
+  }
+  let waited: u64 = others
     .iter()
     .map(|survivor| counter(survivor, "fleet.live.takeover_waits_quorum"))
     .sum();
+  if let Some(successor) = served_without {
+    verdict.note(format!(
+      "{successor} took the volume over while the holder of the log was stopped"
+    ));
+    verdict.check(
+      "NoLoss (a takeover without the log's holder)",
+      no_loss(successor, &volume, &outcomes),
+    );
+  }
   verdict.note(format!(
-    "phase one waited for the holders {waited} times across the survivors"
+    "decisive {decisive}; phase one waited for the holders {waited} times while the holder was stopped"
   ));
-  verdict.check(
-    "phase one ran and waited for the log's holders",
-    if waited > 0 {
-      Vec::new()
-    } else {
-      vec!["no survivor's phase one waited for the holders".to_owned()]
-    },
-  );
-  // Liveness, noted: the partitioned holder answers again, and a takeover may now count it.
-  fleet.resume(current);
-  let mut everyone = survivors.clone();
-  everyone.push(instances[current].as_str());
-  match wait_serving(&everyone, &volume, &outcomes) {
+  if decisive {
+    fleet.resume(current);
+  }
+  match wait_serving(&survivors, &volume, &outcomes) {
     Some((successor, took)) => {
-      verdict.note(format!(
-        "after the holder resumed, {successor} served the volume after {took:?}"
-      ));
+      verdict.note(format!("{successor} served the volume after {took:?}"));
       verdict.check("NoLoss (successor)", no_loss(successor, &volume, &outcomes));
       let epoch = takeover_epoch(successor, &volume);
       verdict.check(
         "StaleNeverCommits (fences)",
-        fenced_at_or_above(&everyone, &volume, epoch),
+        fenced_at_or_above(&survivors, &volume, epoch),
       );
     }
-    None => verdict.note(
-      "after the holder resumed, no node served the volume within the fleet wait (the holder may have been retired)"
-        .to_owned(),
+    None => verdict.check(
+      "a takeover once the holder answers",
+      vec!["no survivor served the volume within the fleet wait".to_owned()],
     ),
   }
   drop(fleet);
   verdict.judge();
+}
+
+/// The nodes of `fleet` holding a copy of `volume`'s log, once at least `count` do, within the fleet wait.
+fn wait_holders(fleet: &Fleet, volume: &str, count: usize) -> Vec<usize> {
+  let deadline = Instant::now() + FLEET_WAIT;
+  loop {
+    let holders = holders_of(fleet, volume);
+    if holders.len() >= count {
+      return holders;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "{count} nodes hold the volume's log within the fleet wait: {holders:?}"
+    );
+    pause();
+  }
 }
