@@ -49,27 +49,31 @@ impl SnapshotPolicy {
     )
   }
 
-  /// Derived at a snapshot of `snapshot_bytes` (A-243): the log bytes the measured apply throughput covers inside the
+  /// Derived at a snapshot of `snapshot_bytes` (A-243): the log bytes the measured replay throughput covers inside the
   /// recovery budget, and never fewer than the snapshot's own size. The first term is the boot policy's, measured on
-  /// the apply every commit runs (the work a replay repeats) rather than only at a boot that may have had nothing to
-  /// replay; the second is the doubling rule, so a snapshot is taken only once the log has absorbed what it costs and
-  /// snapshot work stays within about twice the log written, whatever the partition's size. Recovery is then bounded by
-  /// decoding the snapshot and replaying at most `max(budget bytes, snapshot_bytes)` of log: by the budget while the
-  /// partition fits in it, by about twice the snapshot's own cost once it outgrows it.
+  /// each commit's append and apply (the work a replay repeats per record) rather than only at a boot that may have had
+  /// nothing to replay; the second is the doubling rule, so a snapshot is taken only once the log has absorbed what it
+  /// costs and snapshot work stays within about twice the log written, whatever the partition's size. Recovery is then
+  /// bounded by decoding the snapshot and replaying at most `max(budget bytes, snapshot_bytes)` of log: by the budget
+  /// while the partition fits in it, by about twice the snapshot's own cost once it outgrows it.
   pub fn at_snapshot(
     recovery_budget_ns: u64,
-    apply_bytes_per_us: u64,
+    replay_bytes_per_us: u64,
     snapshot_bytes: u64,
   ) -> Derived<SnapshotPolicy> {
     let budget_us = recovery_budget_ns / NS_PER_US;
     derived!(
       SnapshotPolicy {
         bytes_between_snapshots: budget_us
-          .saturating_mul(apply_bytes_per_us.max(1))
+          .saturating_mul(replay_bytes_per_us.max(1))
           .max(snapshot_bytes),
       },
-      "bytes_between_snapshots = max((recovery_budget_ns / 1000) * apply_bytes_per_us, snapshot_bytes)",
-      ["recovery_budget_ns", "apply_bytes_per_us", "snapshot_bytes"]
+      "bytes_between_snapshots = max((recovery_budget_ns / 1000) * replay_bytes_per_us, snapshot_bytes)",
+      [
+        "recovery_budget_ns",
+        "replay_bytes_per_us",
+        "snapshot_bytes"
+      ]
     )
   }
 }
@@ -89,8 +93,9 @@ pub struct DbStats {
   pub log_bytes_appended: u64,
   /// The cadence now: log bytes between snapshots.
   pub bytes_between_snapshots: u64,
-  /// The apply throughput measured since the last snapshot, bytes a microsecond (zero until measured).
-  pub apply_bytes_per_us: u64,
+  /// The replay throughput measured at the commits since the last snapshot, bytes a microsecond (zero until measured):
+  /// the log's bytes over the time their appends and applies took.
+  pub replay_bytes_per_us: u64,
 }
 
 /// What recovery found.
@@ -134,16 +139,21 @@ pub struct Db {
   next_seq: u64,
   policy: SnapshotPolicy,
   /// Whether `policy` was set by the caller ([`Db::set_policy`]) and stays, rather than re-derived at every snapshot
-  /// ([`SnapshotPolicy::after_snapshot`]).
+  /// ([`SnapshotPolicy::at_snapshot`]).
   policy_pinned: bool,
   since_snapshot_bytes: u64,
   next_slot: u8,
   snapshots_taken: u64,
   /// The running figures ([`DbStats`]).
   stats: DbStats,
-  /// The time the partition's apply took since the last snapshot, over the log bytes since it
-  /// (`since_snapshot_bytes`): the live apply throughput the cadence is derived from.
-  apply_ns_since_snapshot: u64,
+  /// The time the commits since the last snapshot spent on what a replay repeats per record: the record's append
+  /// (encode, checksum, copy into the ring), the mirror of the replay's read, checksum and decode, and its apply. Over
+  /// the log bytes since the snapshot (`since_snapshot_bytes`) it is the live replay throughput the cadence is derived
+  /// from. Timing the apply alone overstated the replay's speed by its decode share (raft, A-243).
+  replay_work_ns_since_snapshot: u64,
+  /// The recovery budget the cadence is derived from: [`RECOVERY_BUDGET_NS`] unless the operator set one
+  /// ([`Db::set_recovery_budget`]; GAPS §5).
+  recovery_budget_ns: u64,
   /// The replay throughput recovery measured, bytes a microsecond (zero when it replayed nothing): the cadence's rate
   /// until a commit has measured its own.
   boot_bytes_per_us: u64,
@@ -180,6 +190,15 @@ impl std::fmt::Debug for Db {
       .field("policy", &self.policy)
       .finish()
   }
+}
+
+/// Runs `work`, adding its wall time to `spent_ns`: the replay work a commit does, timed where it already runs.
+fn replay_work<T>(spent_ns: &mut u64, work: impl FnOnce() -> T) -> T {
+  let started = Instant::now();
+  let done = work();
+  let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+  *spent_ns = spent_ns.saturating_add(elapsed);
+  done
 }
 
 /// The newest valid snapshot slot of a partition.
@@ -243,7 +262,8 @@ pub fn recover(
     next_slot: snapshot.map_or(0, |(slot, _)| other_slot(slot)),
     snapshots_taken: 0,
     stats: DbStats::default(),
-    apply_ns_since_snapshot: 0,
+    replay_work_ns_since_snapshot: 0,
+    recovery_budget_ns: RECOVERY_BUDGET_NS,
     boot_bytes_per_us: recovered.replay_bytes_per_us(),
     pending: None,
     last_now_ns: now_ns,
@@ -334,38 +354,58 @@ impl Db {
     self.policy_pinned = true;
   }
 
+  /// Sets the recovery budget the cadence is derived from (an operator input, GAPS §5) and re-derives the cadence from
+  /// it now, at the boot replay's rate, unless a caller pinned one; the snapshots after it derive theirs from it.
+  pub fn set_recovery_budget(&mut self, recovery_budget_ns: u64) {
+    self.recovery_budget_ns = recovery_budget_ns;
+    if !self.policy_pinned {
+      self.policy = SnapshotPolicy::derive(recovery_budget_ns, self.boot_bytes_per_us).get();
+    }
+  }
+
   /// Snapshots taken since recovery.
   pub fn snapshots_taken(&self) -> u64 {
     self.snapshots_taken
   }
 
   /// The running figures: snapshots and their bytes and longest duration, the log appended, the cadence and the
-  /// measured apply throughput.
+  /// measured replay throughput.
   pub fn stats(&self) -> DbStats {
     DbStats {
       bytes_between_snapshots: self.policy.bytes_between_snapshots,
-      apply_bytes_per_us: self.apply_bytes_per_us(),
+      replay_bytes_per_us: self.replay_bytes_per_us(),
       ..self.stats
     }
   }
 
-  /// The apply throughput since the last snapshot, bytes a microsecond: zero until a commit's apply was timed.
-  fn apply_bytes_per_us(&self) -> u64 {
+  /// The replay throughput the commits since the last snapshot measured, bytes a microsecond: zero until one was timed.
+  fn replay_bytes_per_us(&self) -> u64 {
     self
       .since_snapshot_bytes
       .saturating_mul(NS_PER_US)
-      .checked_div(self.apply_ns_since_snapshot)
+      .checked_div(self.replay_work_ns_since_snapshot)
       .unwrap_or(0)
   }
 
-  /// Applies `op` to the partition, timing it: the work a replay repeats, measured where every commit already does
-  /// it (A-243). The time decides nothing inside the apply; the cadence is derived from it at the next snapshot.
+  /// Applies `op` to the partition, timing it as replay work (A-243). The time decides nothing inside the apply; the
+  /// cadence is derived from it at the next snapshot.
   fn apply_timed(&mut self, op: &Op) -> Result<(), DbError> {
-    let started = Instant::now();
-    let applied = self.partition.apply(op);
-    let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    self.apply_ns_since_snapshot = self.apply_ns_since_snapshot.saturating_add(elapsed);
-    applied
+    replay_work(&mut self.replay_work_ns_since_snapshot, || {
+      self.partition.apply(op)
+    })
+  }
+
+  /// Appends `entry` as record `seq`, timing it as replay work: the encode, checksum and copy a replay mirrors with its
+  /// read, checksum and decode (A-243). A refused append's time counts too, so the measured rate errs slow.
+  fn append_timed(
+    &mut self,
+    segment: &mut AnchorSegment,
+    seq: u64,
+    entry: &LogEntry,
+  ) -> Result<u64, DbError> {
+    replay_work(&mut self.replay_work_ns_since_snapshot, || {
+      self.log.append(segment, seq, entry)
+    })
   }
 
   /// Guard, append, apply: the mutation is durable in the segment when this returns; a reply
@@ -390,12 +430,12 @@ impl Db {
     let entry = LogEntry {
       ops: vec![op.clone()],
     };
-    let bytes = match self.log.append(segment, seq, &entry) {
+    let bytes = match self.append_timed(segment, seq, &entry) {
       Ok(bytes) => bytes,
       Err(DbError::LogFull { .. }) => {
         // A full ring: the snapshot releases everything before it, then the append retries.
         self.snapshot(segment)?;
-        self.log.append(segment, seq, &entry)?
+        self.append_timed(segment, seq, &entry)?
       }
       Err(e) => return Err(e),
     };
@@ -448,7 +488,7 @@ impl Db {
     {
       Err(DbError::Anchor(AnchorError::PublicationInProgress))
     } else {
-      self.log.append(segment, seq, &entry)
+      self.append_timed(segment, seq, &entry)
     };
     let bytes = match appended {
       Ok(bytes) => bytes,
@@ -562,21 +602,23 @@ impl Db {
     segment.publish(RegionKind::Snapshot(self.index, self.next_slot), &bytes)?;
     let snapshot_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    // The cadence after it (A-243), decided here at the commit, never inside an apply: the apply throughput measured
-    // since the last snapshot (the boot replay's until one was), and never less than this snapshot's size.
+    // The cadence after it (A-243), decided here at the commit, never inside an apply: the replay throughput the
+    // commits measured since the last snapshot (the boot replay's until one was), and never less than this snapshot's
+    // size.
     if !self.policy_pinned {
-      let measured = self.apply_bytes_per_us();
+      let measured = self.replay_bytes_per_us();
       let rate = if measured > 0 {
         measured
       } else {
         self.boot_bytes_per_us
       };
-      self.policy = SnapshotPolicy::at_snapshot(RECOVERY_BUDGET_NS, rate, snapshot_bytes).get();
+      self.policy =
+        SnapshotPolicy::at_snapshot(self.recovery_budget_ns, rate, snapshot_bytes).get();
     }
     self.log.trim(segment, self.next_seq)?;
     self.next_slot = other_slot(self.next_slot);
     self.since_snapshot_bytes = 0;
-    self.apply_ns_since_snapshot = 0;
+    self.replay_work_ns_since_snapshot = 0;
     self.snapshots_taken = self.snapshots_taken.saturating_add(1);
     self.stats.snapshots = self.snapshots_taken;
     self.stats.snapshot_ns_max = self.stats.snapshot_ns_max.max(elapsed);

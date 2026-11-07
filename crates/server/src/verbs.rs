@@ -3232,7 +3232,7 @@ fn snapshot_report(stats: slates_db::replay::DbStats) -> slates_ipc::protocol::D
     longest_ns: stats.snapshot_ns_max,
     log_bytes_appended: stats.log_bytes_appended,
     bytes_between: stats.bytes_between_snapshots,
-    apply_bytes_per_us: stats.apply_bytes_per_us,
+    replay_bytes_per_us: stats.replay_bytes_per_us,
   }
 }
 
