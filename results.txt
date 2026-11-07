@@ -1,0 +1,60 @@
+49a49f7f4e3af2de3a316eb2b662f311005a9d8d Windows X64; token default owner BUILTIN\Administrators
+=== clippy: exit 0
+=== land: exit 0
+1 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.32s
+1 test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+1 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+1 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+1 test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.89s
+2 test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+1 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+=== base: exit 0
+1 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+1 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.00s
+=== os-again-1: exit 0
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.13s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.62s
+1 test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+1 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+=== os-again-2: exit 0
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.02s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.38s
+1 test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+1 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+=== os-again-3: exit 0
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.02s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.40s
+1 test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+1 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+=== server-lib: exit 0
+1 test result: ok. 197 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 5.18s
+> D:\a\slates\slates\diag-logs\server-lib.log:389:slates-server: partition 0: volume f9d68ad4fc880b750000000000000002 was not imaged, skipped: EIO (first on this shard; later ones are counted as publish.volume_skipped)
+  D:\a\slates\slates\diag-logs\server-lib.log:390:ok
+  D:\a\slates\slates\diag-logs\server-lib.log:391:test verbs::tests::a_taken_over_archive_lands_at_its_offsets_and_an_oversized_one_is_refused ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+=== server-verb: exit 0
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+1 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+1 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 21.89s
+> D:\a\slates\slates\diag-logs\server-verb.log:23:slates-server: partition 0: volume a1c0a7547875981b0000000000000002 was not imaged, skipped: EIO (first on this shard; later ones are counted as publish.volume_skipped)
+  D:\a\slates\slates\diag-logs\server-verb.log:24:ok
+  D:\a\slates\slates\diag-logs\server-verb.log:25:test an_async_patient_landing_outlasting_the_reply_deadline_is_waited_for ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+> D:\a\slates\slates\diag-logs\server-verb.log:27:slates-server: partition 0: volume 1d9c326b9632d0250000000000000018 was not imaged, skipped: EIO (first on this shard; later ones are counted as publish.volume_skipped)
+  D:\a\slates\slates\diag-logs\server-verb.log:28:ok
+  D:\a\slates\slates\diag-logs\server-verb.log:29:
+=== client-presentation: exit 0
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.29s
+=== client-shards: exit 0
+1 test result: ok. 13 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 3.19s
+=== mcp: exit 0
+1 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.08s
+1 test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.11s
+> D:\a\slates\slates\diag-logs\mcp.log:49:slates-server: partition 1: volume 899132a4cb32824d0001000000000189 was not imaged, skipped: ESTALE (first on this shard; later ones are counted as publish.volume_skipped)
+  D:\a\slates\slates\diag-logs\mcp.log:50:slates daemon: the control loop ended; the watchdog withholds the beat so the anchor restarts the daemon
+  D:\a\slates\slates\diag-logs\mcp.log:51:ok
+=== end
