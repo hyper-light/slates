@@ -387,6 +387,52 @@ fn an_increment_whose_ops_run_past_the_base_is_judged_not_panicked() {
   );
 }
 
+/// Shape: versions changing another file between a work's base and its submit: a lagging work at scale.
+const OTHER_VERSIONS: u64 = 2_000;
+
+/// A distinct identity for the `n`th increment of a long history.
+fn long_id(n: u64) -> [u8; 32] {
+  let mut id = [0xD0; 32];
+  id[..8].copy_from_slice(&n.to_le_bytes());
+  id
+}
+
+/// §4.16 "Position mapping" (the 10,000-client rung, 2026-11-07): a verdict maps an increment through the deltas that
+/// changed its paths since its base, not through every delta since. Do: create `a`, then 2,000 versions that change
+/// `b` with one change to `a` among them, then submit an overwrite of `a` based on its creation. Expect: accepted at
+/// the shifted place, and the verdict consulted one delta, `a`'s one change. It consulted all 2,001: on the green's one
+/// owner shard at 10,000 clients, whose works lag by thousands of versions, the verdict's walk was the wall.
+#[test]
+fn a_verdict_consults_only_the_deltas_that_changed_its_paths() {
+  let mut green = Green::new();
+  green.submit(&Build::new().create("a", b"aaaaaaaa").at(1, 0));
+  green.submit(&Build::new().create("b", b"b").with_id(long_id(0), 1));
+  for n in 1..OTHER_VERSIONS {
+    let base = green.head();
+    let build = if n == OTHER_VERSIONS / 2 {
+      Build::new()
+        .overwrite("a", 0, b"X")
+        .with_id(long_id(n), base)
+    } else {
+      Build::new()
+        .overwrite("b", 0, &[u8::try_from(n % 251).unwrap()])
+        .with_id(long_id(n), base)
+    };
+    assert!(matches!(green.submit(&build), Outcome::Accepted { .. }));
+  }
+  let before = green.deltas_visited();
+  let lagging = Build::new()
+    .overwrite("a", 4, b"Y")
+    .with_id(long_id(OTHER_VERSIONS), 1);
+  assert!(matches!(green.submit(&lagging), Outcome::Accepted { .. }));
+  assert_eq!(green.content("a"), Some(b"XaaaYaaa".as_slice()));
+  assert_eq!(
+    green.deltas_visited() - before,
+    1,
+    "the verdict consulted the one delta that changed `a`"
+  );
+}
+
 /// The fast path fires when a path is unchanged since the increment's base, and it is counted.
 #[test]
 fn the_fast_path_fires_for_an_unchanged_path() {

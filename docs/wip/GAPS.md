@@ -73,6 +73,14 @@
 >   the growth came after the pin. A pin past its volume's quota is refused `NoSpace`
 >   (`docs/bugs/2026-11-06-a-pin-held-its-shard-for-the-whole-tree.md`).
 >
+> - **A verdict walked every delta since its base** (found 2026-11-07, the 10k stall's second wall). On the green's one
+>   owner shard each verdict looked its path up in every delta since the work's base, thousands at 10,000 clients:
+>   that shard was idle 5 of 1,201 samples, in `intervening`. It now reads only the versions the path's history names
+>   (`a_verdict_consults_only_the_deltas_that_changed_its_paths`: 2,000 deltas consulted before, 1 after, CI run
+>   42376010762; `docs/bugs/2026-11-07-a-verdict-walked-every-delta-since-its-base.md`). **Open, the next wall:** the
+>   owner partition's snapshot, re-encoded whole each time its log fills (about 1,800 of 2,241 samples of the owner
+>   shard at 10,000 works), wants §4.8's snapshot incremental or sized to the partition.
+>
 > - **A kept forward waited for another request** (found 2026-11-07, the 10k stall). A forward refused by its owner
 >   shard's full control channel was kept, but the serve loop idled until a ring woke it, so a shard whose clients
 >   all waited on kept forwards slept until some other request came. While a forward is kept, the loop now idles at
