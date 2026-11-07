@@ -468,6 +468,8 @@ jobs:
         run: cargo clippy -p slates-cli --test winfsp --test winfsp_semantics -- -D warnings
       - name: Clippy the Shards hand-off CLI test (native Windows)
         run: cargo clippy -p slates-cli --test shards -- -D warnings
+      - name: Clippy the start-judgment CLI test (native Windows)
+        run: cargo clippy -p slates-cli --test start_judgment --test held_rendezvous -- -D warnings
       # The other half of the documentation gate in `gates`. That one runs on ubuntu and macos, so it checks
       # every reference those two hosts can resolve — and a reference resolves or not *per platform*, because
       # an item behind `#[cfg(windows)]` exists for no other. Of the errors that gate found, five were visible
@@ -650,6 +652,23 @@ jobs:
         env:
           SLATES_TEST_CLI: "1"
         run: cargo test -p slates-cli --test shards -- --nocapture
+      # The anchor's start judgment (§2.6 boot step 1; docs/bugs/2026-11-07-the-anchor-killed-every-start-a-busy-machine-
+      # starved.md): a successor suspended all but a sixty-fourth of every heartbeat is waited for, not killed; one
+      # suspended for good is killed and replaced. Gated by `SLATES_TEST_CLI=1`.
+      - name: The anchor's start judgment through the CLI (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        env:
+          SLATES_TEST_CLI: "1"
+        run: cargo test -p slates-cli --test start_judgment -- --test-threads=1 --nocapture
+      # A-114: a client connecting as its daemon dies is answered by the next one (the anchor holds the rendezvous).
+      # Gated by `SLATES_TEST_CLI=1`.
+      - name: The held rendezvous through the CLI (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        env:
+          SLATES_TEST_CLI: "1"
+        run: cargo test -p slates-cli --test held_rendezvous -- --test-threads=1 --nocapture
       # A-209: Win32 semantics through the drive that winfstest found broken (a move not asked to replace, a directory
       # holding a file, SetFileTime's times, an open that truncates), then WinFsp's own two suites over the drive through
       # the harness: the fsx port and winfstest, each built from billziss-gh/secfs.test@6ac65cd with MSVC; winfstest is
@@ -859,7 +878,7 @@ jobs:
           -p slates-bridge-winfsp -p slates-mcp -p slates-cluster --all-targets -- -D warnings
       - name: Clippy the shipped binary and its Shards and WinFsp tests natively on arm64 Windows
         if: ${{ !cancelled() }}
-        run: cargo clippy -p slates-cli --bin slates --test shards --test winfsp --test winfsp_semantics -- -D warnings
+        run: cargo clippy -p slates-cli --bin slates --test shards --test start_judgment --test held_rendezvous --test winfsp --test winfsp_semantics -- -D warnings
       # The daemon on a weak memory model: an in-process daemon found through the rendezvous, its verbs over the rings,
       # the async driver; one test at a time, as on x86_64 (each daemon is sized from the whole machine).
       - name: Test the client binary and the async driver, one test at a time (native arm64 Windows)
@@ -885,6 +904,23 @@ jobs:
         env:
           SLATES_TEST_CLI: "1"
         run: cargo test -p slates-cli --test shards -- --nocapture
+      # The anchor's start judgment (§2.6 boot step 1; docs/bugs/2026-11-07-the-anchor-killed-every-start-a-busy-machine-
+      # starved.md): a successor suspended all but a sixty-fourth of every heartbeat is waited for, not killed; one
+      # suspended for good is killed and replaced. Gated by `SLATES_TEST_CLI=1`.
+      - name: The anchor's start judgment through the CLI (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        env:
+          SLATES_TEST_CLI: "1"
+        run: cargo test -p slates-cli --test start_judgment -- --test-threads=1 --nocapture
+      # A-114: a client connecting as its daemon dies is answered by the next one (the anchor holds the rendezvous).
+      # Gated by `SLATES_TEST_CLI=1`.
+      - name: The held rendezvous through the CLI (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        env:
+          SLATES_TEST_CLI: "1"
+        run: cargo test -p slates-cli --test held_rendezvous -- --test-threads=1 --nocapture
       # The WinFsp mount on arm64 (the DAX matrix's bare-metal Windows arm64 mount-route cell, docs/wip/virtiofs.md §8):
       # WinFsp's package carries its arm64 driver and library (`winfsp-a64.sys`, `winfsp-a64.dll`, which the bridge
       # loads by name on this target), and the same tests as the x86_64 lanes run: a cached read follows another path's
@@ -1210,6 +1246,23 @@ jobs:
         env:
           SLATES_TEST_CLI: "1"
         run: cargo test -p slates-cli --test shards -- --nocapture
+      # The anchor's start judgment (§2.6 boot step 1; docs/bugs/2026-11-07-the-anchor-killed-every-start-a-busy-machine-
+      # starved.md): a successor suspended all but a sixty-fourth of every heartbeat is waited for, not killed; one
+      # suspended for good is killed and replaced. Gated by `SLATES_TEST_CLI=1`.
+      - name: The anchor's start judgment through the CLI (Windows, every push to main)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        env:
+          SLATES_TEST_CLI: "1"
+        run: cargo test -p slates-cli --test start_judgment -- --test-threads=1 --nocapture
+      # A-114: a client connecting as its daemon dies is answered by the next one (the anchor holds the rendezvous).
+      # Gated by `SLATES_TEST_CLI=1`.
+      - name: The held rendezvous through the CLI (Windows, every push to main)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        env:
+          SLATES_TEST_CLI: "1"
+        run: cargo test -p slates-cli --test held_rendezvous -- --test-threads=1 --nocapture
 
   # Part 6 "Conformance" and "Real workloads", example 8 "Hermeticity"; AC-9.7/T-9.1 (GAP-A9-15): the
   # suites the design names — pjdfstest, fsx, fsstress — plus the workload suite and the filesystem-write

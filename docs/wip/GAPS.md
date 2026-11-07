@@ -29,6 +29,32 @@
 > sets. Main failed 6 of 10 Windows runs of the test; the fix passed 10 of 10 (`diag-liveness-4`, `-6`). The bug record
 > of 2026-11-07 has the log.
 
+> **The anchor killed every start a busy machine starved (found 2026-11-06, closed 2026-11-07; recovery in one poll and
+> the client's deadlines stay open, below).** A start not beaten within the fixed recovery budget (a wall second) was
+> killed, and every restart started over. Now a start is judged in its own CPU time by the watchdog's rule: killed only
+> when it makes no progress for a window or runs a window of CPU without beating. Measured on this Mac under 144
+> spinners: 153 of 153 starts killed before, each having used 16-18 ms of CPU. `a_starved_start_that_makes_progress_is_not_killed`
+> was red on main and passes. At the extremes (`agents/liveness-restart` @ 469b92e5): 0 progressing starts killed in 15
+> runs of clients' recipe at 183-292 runnable processes and in loadtest-scale's memrung beside the same spinners; stuck
+> starts killed at 1,001-1,294 ms on this Mac, both Linux and both Windows CI runners; the restart, handoff and start
+> suites green on all four. Open:
+> - a shard's recovery is one poll, which past a window of CPU stops the watchdog's beat;
+> - the client's reconnect budget (recovery + liveness, 2 s) can still be outlasted by a starved restart (owner clients);
+> - `Facts::query()` gathers every fact to read the identity (676 ms p50 under that load);
+> - the anchor's own profile was refused under the same load (`measurement timeout: wake`). Closed the same day: the
+>   wake probe now runs past its wall while each round's waiter runs at all, rounds doubling from one window to 4 s (7.75 s
+>   in all), and refuses after a round whose waiter never ran
+>   (`docs/bugs/2026-11-07-a-busy-machine-refused-the-anchors-boot-at-the-wake-probe.md`). That closes the standing
+>   limitation of 2026-10-18's "busy-machine discipline" (1): "a machine too busy for the floor in 250 ms still refuses".
+> - Also closed the same day: the Linux process clock read `/proc/<pid>/schedstat`, the main thread's alone, so a start
+>   whose main thread waited on its shards read as stuck; it now reads the process's CPU-time clock
+>   (`docs/bugs/2026-11-07-the-linux-process-clock-read-the-main-thread-alone.md`). And the test suites that measured
+>   the machine at this load were fixed: the crash-loop test's wall clock, the CLI suite's daemon waits and the
+>   held-rendezvous answer bound (`docs/bugs/2026-11-07-the-crash-loop-test-timed-its-children-on-the-wall.md` and the
+>   start judgment's bug). Still the client's (clients, A-232): its wall-second reply deadline stalls a verb against a
+>   live, starved daemon ("no reply within 1000000000 ns" for `bootstrap root`, 5 of 15 runs at 8 spinners a CPU).
+> The bug record of 2026-11-07 has the per-phase table.
+
 > **A Windows UDP socket died on an earlier send's ICMP error (found 2026-11-06, fixed 2026-11-06).** With Windows'
 > default `SIO_UDP_CONNRESET`, a port-unreachable for a datagram sent earlier failed the socket's next `recvfrom` with
 > WSAECONNRESET. A fleet node's demultiplexer ends on a receive refusal, so its socket stopped receiving, and
@@ -405,6 +431,12 @@
 > - **The same class as the liveness entry above:** a fixed second, a shard task as the beat, and a busy machine as
 >   the normal case. A busy machine must not kill a daemon that is making progress, and a client's reconnect budget
 >   follows the same constant.
+> - **2026-11-07, the start judgment closed** (the entry "The anchor killed every start a busy machine starved"): a
+>   start is judged in its own CPU time, not by the fixed second. Recovery in one poll and the client's reconnect
+>   budget stay open here. Seen since by loadtest-scale (memrung on a24e8e40, run A): after a restart, shard 0 recovered
+>   one volume image and 1,001 merge volumes in 1,498,306 µs, past the 1 s window, and the start was waited for, not
+>   killed (`~/.cache/slates-agents-scratch/loadtest-scale/mem-liveness/live-k32-r3-n1000/anchor.err`). Slicing the
+>   recovery is liveness's next goal.
 
 > **A private purge's intent can wait up to the 1 s transaction timeout (found 2026-11-05, audit step 7; open).**
 > WinFsp's transact never goes pending: the control dispatch calls `FspVolumeTransact` inline (v2.1 `src/sys/fsctl.c:95-99`),
@@ -10282,7 +10314,8 @@ caller's budget at face value. Canonical: `crates/machine/src/wake.rs` — a rou
 short of the sample floor, bounded by `PROBE_WALL_BUDGET`. The caller's budget then sets the *per-round* size,
 which is why handing it 250 ms instead of 5 ms still matters (rounds fifty times larger from the first), and
 why it does **not** buy more wall time. A machine too busy for the floor in 250 ms still refuses; that ceiling
-is the standing limitation.
+is the standing limitation. *(Closed 2026-11-07: past the wall the probe runs on while each round's waiter runs
+at all, within 31 more windows; see the top entry.)*
 
 **2. "This operation was fast."** A tight bound — one the same order as scheduling noise — must say whether
 the code did its job, not whether the machine was fast while it did. Attribute with `getrusage`'s involuntary

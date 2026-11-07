@@ -423,14 +423,20 @@ fn a_crashing_daemon_is_restarted_until_the_derived_bound_and_the_segment_says_s
   assert_crash_loop_recorded(&supervisor);
 }
 
-/// A-119, supervision never gives up: do supervise a child that beats and exits, under a short window that holds one
-/// restart. Expect the crash loop reported with a restart scheduled a window away, the supervisor backing off until
-/// then (the segment saying `CrashLoop`), the daemon started again once the window passed (the segment `Running`),
-/// and the next crash loop's backoff twice the first. Before A-119 the first crash loop ended supervision for good,
-/// and every hard NFS mount on the daemon hung (2026-10-08, `realworld_chaos.sh` on a loaded host).
+/// A-119, supervision never gives up: do supervise a child that beats and exits at once, under a short window that
+/// holds one restart. Expect the crash loop reported with a restart scheduled a window away, the supervisor backing off
+/// until then (the segment saying `CrashLoop`), the daemon started again once the window passed (the segment
+/// `Running`), and the next crash loop's backoff twice the first. Before A-119 the first crash loop ended supervision for
+/// good, and every hard NFS mount on the daemon hung (2026-10-08, `realworld_chaos.sh` on a loaded host).
+///
+/// The supervisor is driven by the test's own clock, which stands still while a child lives and jumps to each
+/// backoff's end: the claim is about a daemon that exits **at once**, so its life takes no time on that clock however
+/// long the machine takes to run it. On the wall clock, a re-invoked child under eight spinners a CPU outlived the
+/// 300 ms window, so no two exits fell in one window and no crash loop was seen: main failed it 2 of 3 times on this
+/// Mac at 212-238 runnable processes, and once on windows-latest beside two spinners a CPU (diag-liveness-10).
 #[test]
 fn a_crash_loop_is_restarted_after_a_doubling_backoff_never_given_up() {
-  /// Shape: the window and the backoff it starts: short, so the test waits two of them.
+  /// Shape: the window and the backoff it starts.
   const WINDOW_NS: u64 = 300_000_000;
   let segment = AnchorSegment::create(
     &unique_name("slates-anchor-test-backoff"),
@@ -456,24 +462,34 @@ fn a_crash_loop_is_restarted_after_a_doubling_backoff_never_given_up() {
     std::env::set_var(CHILD_BEATS, BEATS.to_string());
     std::env::set_var(CHILD_EXIT, EXIT.to_string());
   }
-  let clock = Instant::now();
-  supervisor.start(now_ns(clock)).unwrap();
+  // The test's clock starts one window in, so no difference the supervisor takes reaches below its zero.
+  let mut now = WINDOW_NS;
+  supervisor.start(now).unwrap();
   let mut backoffs = Vec::new();
   let mut backed_off_in_crash_loop = false;
   let mut restarted_after_backoff = false;
-  let deadline = Duration::from_millis(CHILD_WAIT_MS);
-  while clock.elapsed() < deadline && backoffs.len() < 2 {
-    match supervisor.step(now_ns(clock)).unwrap() {
+  // A child that never exits ends the test: each child gets the wait a child gets to attach and beat, on the wall.
+  let life = Duration::from_millis(CHILD_WAIT_MS);
+  let mut child_began = Instant::now();
+  while backoffs.len() < 2 {
+    assert!(
+      child_began.elapsed() < life,
+      "a child neither exited nor was restarted within {life:?}"
+    );
+    match supervisor.step(now).unwrap() {
       Step::CrashLoop { retry_in_ns, .. } => backoffs.push(retry_in_ns),
-      Step::BackingOff { .. } => {
+      Step::BackingOff { retry_at_ns } => {
         backed_off_in_crash_loop |=
           supervisor.segment().supervision().unwrap().state() == State::CrashLoop;
+        now = retry_at_ns;
       }
       Step::Restarted { .. } if !backoffs.is_empty() => {
         restarted_after_backoff |=
           supervisor.segment().supervision().unwrap().state() == State::Running;
+        child_began = Instant::now();
       }
-      Step::Running | Step::Restarted { .. } => {}
+      Step::Restarted { .. } => child_began = Instant::now(),
+      Step::Running => {}
       Step::Stopped => panic!("stopped without being asked"),
     }
     // The test harness paces the poll; shipped code parks on its driver (D-9).

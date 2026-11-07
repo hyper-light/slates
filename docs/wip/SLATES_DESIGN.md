@@ -606,6 +606,17 @@ the measured wake cost before parking (the 2-competitive rule). The mount is nev
 > a daemon), or refused `ENOENT`, which ended the anchor and its instance. Record:
 > `docs/bugs/2026-10-22-an-anchor-restarted-its-daemon-by-a-path-an-upgrade-can-replace.md`.
 
+> **A busy machine starves boot steps 1 and 2; it no longer ends them (2026-11-07).** Both steps were bounded by a
+> wall where only progress tells a starved step from a stuck one.
+> - **Step 1:** the profile's wake probe refused once its 250 ms wall passed short of its sample floor, and the anchor
+>   with it, 19 times in 20 under 144 nice-19 spinners on 18 CPUs. It now runs on while each round's waiter runs at
+>   all, within 7.75 s more (§4.1 status).
+> - **Step 2:** the anchor killed a daemon that had not beaten one wall second after its spawn; 153 of 153 starts under
+>   the same load. It now judges a start in the daemon's own CPU time, read from the OS (§4.14 status).
+>
+> Records: `docs/bugs/2026-11-07-a-busy-machine-refused-the-anchors-boot-at-the-wake-probe.md`,
+> `docs/bugs/2026-11-07-the-anchor-killed-every-start-a-busy-machine-starved.md`.
+
 1. The anchor process starts (or is already running), maps or creates the shared segment, and
    loads or rebuilds the machine profile.
 2. The daemon starts, attaches the segment, and either replays the op logs into fresh in-memory
@@ -928,6 +939,8 @@ A microbenchmark exceeding its wall-time bound: Degraded, widened interval recor
 volume requires a matching profile), `MeasurementTimeout`.
 
 > **Status (2026-09-25, the wake probe measures one event and reports its mean).** The probe timed every park/unpark round trip, so it mixed an on-CPU handoff (about 0.45 µs, the waiter still running or on the waker's CPU) with a real wake (about 10 µs); thread placement holds for a run, so runs split between the two (median 416 ns or 10,041 ns on the same two container cores, a minute apart), and it stopped on the median's interval while its consumers read the p99 — often the maximum of 64 samples (667 ns to 511,042 ns). Now the waiter is confirmed asleep (Linux `/proc` state, macOS `thread_info`; Windows the waiter's announcement, reported unconfirmed), the pair is placed as production is (the control core waking a shard core where the OS pins; unpinned on macOS, with the same-CPU share recorded), the probe converges the mean — the spin-then-park rule's threshold is the expected cost of parking, and a spinning waiter on the same pinned cores never saw the tail (p99 ≤ 209 ns) while a parked one did (285–639 µs) — and five fresh-thread rounds are compared by their medians (a disagreement lists the probe degraded, `wake.rounds`). Measured on a quiet host: the median held at 8.9–10.8 µs over ten container runs and the mean at 15.1–17.6 µs on four CPUs; macOS's mean held at 2.03–2.49 µs. The spin window, the step quantum and the timer tick now read the mean, the runtime's inbound ring the p99 at its overflow target, the guest credit's kick round trip the mean; a profile of another format version is refused by name, and a daemon handed one by an older anchor measures its own. The boot mean is quick on a virtual machine (±20–30 % in 250 ms at a coefficient of variation of five to seven); since A-31 (2026-09-25) it is only the prior of each shard's and each client's online estimate, refined from the confirmed wakes they pay (§4.3 and §4.7 status), and the long-step count attributes each long poll to its task or to the host rather than reading wall time. Record: `docs/bugs/2026-09-22-wake-probe-mixes-two-events-and-reports-an-unconverged-tail.md`.
+
+> **Status (2026-11-07, a starved wake probe measures; a stuck one refuses).** Past its wall (`PROBE_WALL_BUDGET`, 250 ms) the probe runs on while each round's waiter runs at all, rounds doubling from one window to `PROBE_WALL_BUDGET · 2^(WAKE_ROUNDS − 1)` (4 s), and refuses `MeasurementTimeout` after a round whose waiter was never scheduled. That is the watchdog's rule (A-228) and the anchor's start judgment applied to the probe: slow progress is starvation, no progress is stuck. The extension past the wall is bounded by 31 windows (7.75 s). Under 144 nice-19 spinners on 18 CPUs a wake took 68-174 ms at the median, the floor needed over a second, and the 250 ms wall refused the quick profile, and the anchor's boot with it, 19 times in 20. Record: `docs/bugs/2026-11-07-a-busy-machine-refused-the-anchors-boot-at-the-wake-probe.md`.
 
 **Derived constants.** Spin window = wake_ns.mean (Karlin: the 2-competitive threshold is the
 expected cost of parking, and the wake's heavy tail is part of that cost, not noise); the cooperative
@@ -6782,6 +6795,18 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > (`crates/cli/src/anchor.rs`, `Lateness`). The window is the existing liveness budget, still a fixed number (GAPS, R3
 > debt). Proven by `crates/server/tests/liveness.rs`: a starved control-shard poll, which gapped the beat 1.53 s on main,
 > keeps it under 0.26 s; a wedged or spinning non-control shard, which main never saw, stops it.
+
+> **Status (2026-11-07): a start is judged by its progress too.** Until its first beat the anchor judges a starting
+> daemon by the same rule, in the daemon's own CPU time read from the OS (`slates_machine::process_clock`;
+> `crates/cli/src/anchor.rs`): killed once it makes no CPU progress for a window or runs a window of CPU without beating,
+> waited for while it progresses. Before, a start not beaten within the fixed recovery budget, a wall second, was killed;
+> under 144 spinners on 18 CPUs the anchor killed 153 starts of 153 after each had used 16-18 ms of CPU
+> (`docs/bugs/2026-11-07-the-anchor-killed-every-start-a-busy-machine-starved.md`). On Linux the clock is the process's
+> CPU-time clock: `/proc/<pid>/schedstat`, read first, is the main thread's alone
+> (`docs/bugs/2026-11-07-the-linux-process-clock-read-the-main-thread-alone.md`). At the extremes, 0 progressing starts
+> were killed at 183-292 runnable processes, and a stuck start was killed at 1,001-1,294 ms on macOS, Linux and Windows.
+> A shard's recovery still runs as one poll, which the watchdog counts as spinning past a window of CPU: GAPS holds it
+> open.
 
 > **Telemetry oracle correction (2026-09-20, AC-0.11).** A drain request itself emits spans.
 > The daemon integration oracle now derives convergence from the reply quota minus the
