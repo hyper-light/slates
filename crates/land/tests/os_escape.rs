@@ -10,12 +10,16 @@
 //! as it was — the same entries, the same inodes, the same bytes and modification times — and no entry of the
 //! target names an outside inode except the outsider's own link. The directory is a real one in the build output
 //! (`CARGO_TARGET_TMPDIR`; A-50), removed at the end.
+//!
+//! On Windows (A-180, the Windows write seam) the directory link is a junction, which an outsider makes without
+//! privilege (`mklink /J`), and the hard link is NTFS's; a file symbolic link needs a privilege outsiders and slates
+//! lack (or developer mode), so that swap runs on Unix alone. An entry's identity is its file index there.
 
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-#![cfg(unix)]
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -42,19 +46,80 @@ const SECRET: &[u8] = b"the file outside the target";
 /// The link an outsider swaps in.
 #[derive(Clone, Copy, Debug)]
 enum Swap {
-  /// `target/dir` becomes a symlink to `outside/`.
+  /// `target/dir` becomes a symlink (Unix) or a junction (Windows) to `outside/`.
   DirectorySymlink,
-  /// `target/dir/existing` becomes a symlink to `outside/secret`.
+  /// `target/dir/existing` becomes a symlink to `outside/secret` (Unix: Windows makes none without a privilege).
+  #[cfg(unix)]
   FileSymlink,
   /// `target/dir/existing` becomes a hard link to `outside/secret`.
   FileHardlink,
 }
 
+#[cfg(unix)]
 const SWAPS: [Swap; 3] = [
   Swap::DirectorySymlink,
   Swap::FileSymlink,
   Swap::FileHardlink,
 ];
+#[cfg(windows)]
+const SWAPS: [Swap; 2] = [Swap::DirectorySymlink, Swap::FileHardlink];
+
+/// An entry's identity, size and modification time, unfollowed: its inode (Unix).
+#[cfg(unix)]
+fn identity(_path: &Path, meta: &std::fs::Metadata) -> (u64, u64, i64) {
+  (meta.ino(), meta.size(), meta.mtime())
+}
+
+/// An entry's identity, size and modification time, unfollowed: its file index, read through a handle of the entry
+/// itself (`FILE_FLAG_OPEN_REPARSE_POINT`), since the standard library's `file_index` is unstable (Windows).
+#[cfg(windows)]
+#[allow(clippy::disallowed_methods)]
+fn identity(path: &Path, meta: &std::fs::Metadata) -> (u64, u64, i64) {
+  use std::os::windows::fs::OpenOptionsExt;
+  use std::os::windows::io::AsRawHandle;
+  use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+  };
+  /// Format: `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT`: a directory or a link, opened as itself.
+  const ITSELF: u32 = 0x0200_0000 | 0x0020_0000;
+  let opened = std::fs::OpenOptions::new()
+    .access_mode(0)
+    .custom_flags(ITSELF)
+    .open(path)
+    .unwrap();
+  // SAFETY: an all-zero `BY_HANDLE_FILE_INFORMATION` is a valid value (integers and `FILETIME`s) for the call to fill.
+  let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+  // SAFETY: a handle this test just opened and a writable record of the type the call fills.
+  let read = unsafe { GetFileInformationByHandle(opened.as_raw_handle().cast(), &mut info) };
+  assert_ne!(read, 0);
+  let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+  let mtime = meta
+    .modified()
+    .unwrap()
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap()
+    .as_secs();
+  (index, meta.len(), i64::try_from(mtime).unwrap())
+}
+
+/// Makes `link` a link to the directory `to`, as an outsider does without privilege: a symlink (Unix), a junction
+/// (Windows, `mklink /J`, whose arguments take backslashes).
+#[allow(clippy::disallowed_methods)]
+fn link_dir(to: &Path, link: &Path) {
+  #[cfg(unix)]
+  std::os::unix::fs::symlink(to, link).unwrap();
+  #[cfg(windows)]
+  {
+    let backslashed = |path: &Path| path.to_string_lossy().replace('/', "\\");
+    let made = std::process::Command::new("cmd")
+      .args(["/C", "mklink", "/J"])
+      .arg(backslashed(link))
+      .arg(backslashed(to))
+      .output()
+      .unwrap();
+    assert!(made.status.success(), "mklink /J: {made:?}");
+  }
+}
 
 /// A fresh working directory, removed on drop.
 struct Workspace {
@@ -125,7 +190,8 @@ fn snapshot(dir: &Path) -> Listing {
       if meta.is_dir() {
         stack.push((entry.path(), name.clone()));
       }
-      out.insert(name, (meta.ino(), meta.size(), meta.mtime(), bytes));
+      let (id, size, mtime) = identity(&entry.path(), &meta);
+      out.insert(name, (id, size, mtime, bytes));
     }
   }
   out
@@ -161,8 +227,9 @@ impl Interfering {
       Swap::DirectorySymlink => {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&dir);
-        std::os::unix::fs::symlink(&outside, &dir).unwrap();
+        link_dir(&outside, &dir);
       }
+      #[cfg(unix)]
       Swap::FileSymlink => {
         if std::fs::symlink_metadata(&dir).is_ok_and(|meta| meta.is_dir()) {
           let _ = std::fs::remove_file(&existing);

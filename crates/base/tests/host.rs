@@ -503,10 +503,13 @@ fn a_real_directory_shows_descriptor_semantics_nofollow_and_hints() {
 /// A junction at `link` to `target`, as a user makes one (`mklink /J`, no privilege needed).
 #[cfg(windows)]
 fn junction(link: &std::path::Path, target: &std::path::Path) {
+  // `mklink` reads a `/` in a path as a switch ("Invalid switch - \"Users\"" for `C:/Users/...`, which
+  // `CARGO_TARGET_TMPDIR` can be), so the paths go to it with backslashes.
+  let backslashed = |path: &std::path::Path| path.to_string_lossy().replace('/', "\\");
   let made = std::process::Command::new("cmd")
     .args(["/C", "mklink", "/J"])
-    .arg(link)
-    .arg(target)
+    .arg(backslashed(link))
+    .arg(backslashed(target))
     .output()
     .unwrap();
   assert!(made.status.success(), "mklink /J: {made:?}");

@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 use std::os::windows::fs::{FileExt, OpenOptionsExt};
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 
 use slates_vfs::host::{
@@ -40,7 +40,7 @@ use windows_sys::Win32::Storage::FileSystem::{
   FILE_GENERIC_READ, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
   FILE_SHARE_WRITE, FILE_TRAVERSE, FileAttributeTagInfo, FileFullDirectoryInfo,
   FileFullDirectoryRestartInfo, GetFileInformationByHandleEx, MAXIMUM_REPARSE_DATA_BUFFER_SIZE,
-  SYNCHRONIZE,
+  READ_CONTROL, SYNCHRONIZE,
 };
 use windows_sys::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
 
@@ -184,6 +184,13 @@ fn open_relative(
 
 /// The opened object's attributes and, for a reparse point, its tag.
 fn attribute_tag(handle: &OwnedHandle) -> Result<FILE_ATTRIBUTE_TAG_INFO, HostError> {
+  attribute_tag_of(handle.as_raw_handle())
+}
+
+/// [`attribute_tag`] of a raw handle the caller holds open for the call.
+fn attribute_tag_of(
+  handle: std::os::windows::io::RawHandle,
+) -> Result<FILE_ATTRIBUTE_TAG_INFO, HostError> {
   let mut info = FILE_ATTRIBUTE_TAG_INFO {
     FileAttributes: 0,
     ReparseTag: 0,
@@ -193,7 +200,7 @@ fn attribute_tag(handle: &OwnedHandle) -> Result<FILE_ATTRIBUTE_TAG_INFO, HostEr
   // passed.
   let ok = unsafe {
     GetFileInformationByHandleEx(
-      handle.as_raw_handle().cast(),
+      handle.cast(),
       FileAttributeTagInfo,
       (&raw mut info).cast(),
       size,
@@ -388,7 +395,7 @@ fn fingerprint_of_handle(
       info.ftLastWriteTime.dwLowDateTime,
     ),
     ctime_ns: change_time,
-    mode: info.dwFileAttributes,
+    mode: posix_mode(&attribute_tag_of(handle)?),
     // Windows has no POSIX owner; a base entry reports the root's, as the WinFsp bridge maps every file.
     uid: 0,
     gid: 0,
@@ -399,6 +406,41 @@ fn fingerprint_of_handle(
       info.ftCreationTime.dwLowDateTime,
     ),
   })
+}
+
+/// Format: the POSIX type bits of a directory, a regular file and a symbolic link (`S_IFDIR`, `S_IFREG`, `S_IFLNK`).
+const S_IFDIR: u32 = 0o040_000;
+/// Format: `S_IFREG`.
+const S_IFREG: u32 = 0o100_000;
+/// Format: `S_IFLNK`.
+const S_IFLNK: u32 = 0o120_000;
+/// Format: the permissions a Windows directory is shown with (Windows keeps no POSIX mode; the owner's access is
+/// decided by the DACL, which slates does not translate).
+const DIR_PERMISSIONS: u32 = 0o755;
+/// Format: the permissions a writable Windows file is shown with.
+const FILE_PERMISSIONS: u32 = 0o644;
+/// Format: the permissions a read-only Windows file (`FILE_ATTRIBUTE_READONLY`) is shown with: no write bit, the one
+/// permission Windows keeps on the file itself, and the one the landing writes back (`slates-land`'s `set_mode`).
+const READ_ONLY_PERMISSIONS: u32 = 0o444;
+/// Format: the permissions a link is shown with, as POSIX shows every symbolic link.
+const LINK_PERMISSIONS: u32 = 0o777;
+
+/// A Windows entry's mode in POSIX form, as every host's fingerprint carries it (the Unix host's is `st_mode`): its
+/// type from its attributes and reparse tag, and the permissions above. Before 2026-10-26 the fingerprint carried the
+/// raw attributes, so the landing read a witnessed directory as a file (`TypeChanged`) and the archive bit a rename
+/// sets read as a changed mode (G-shards-windows step 5, A-180).
+fn posix_mode(info: &FILE_ATTRIBUTE_TAG_INFO) -> u32 {
+  if redirects(info) {
+    S_IFLNK | LINK_PERMISSIONS
+  } else if info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+    S_IFDIR | DIR_PERMISSIONS
+  } else if info.FileAttributes & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_READONLY
+    != 0
+  {
+    S_IFREG | READ_ONLY_PERMISSIONS
+  } else {
+    S_IFREG | FILE_PERMISSIONS
+  }
 }
 
 /// A `FILETIME` as nanoseconds since the Unix epoch, the domain every host's fingerprints are in.
@@ -464,6 +506,107 @@ impl OsHost {
   pub fn open_handles(&self) -> usize {
     self.dirs.len().saturating_add(self.files.len())
   }
+
+  /// The handle behind a directory handle id, for the landing crate's write verbs (the Unix host's `dir_fd`).
+  pub fn dir_handle(&self, dir: HostDir) -> Result<BorrowedHandle<'_>, HostError> {
+    self.dir(dir).map(AsHandle::as_handle)
+  }
+
+  /// The handle behind a file handle id (the Unix host's `file_fd`).
+  pub fn file_handle(&self, file: HostFile) -> Result<BorrowedHandle<'_>, HostError> {
+    self
+      .files
+      .get(&file.0)
+      .map(AsHandle::as_handle)
+      .ok_or(HostError::StaleHandle)
+  }
+
+  /// The fingerprint of the entry `name` under `dir` itself — a link's own, never its target's (opened with
+  /// `FILE_OPEN_REPARSE_POINT`): the landing's check of an entry it moved aside (AUD-29-04). A read, like
+  /// [`HostFs::list`]'s own per-entry open.
+  pub fn entry_fingerprint(&self, dir: HostDir, name: &str) -> Result<Fingerprint, HostError> {
+    let entry = open_relative(
+      self.dir(dir)?,
+      name,
+      ENTRY_ACCESS,
+      nt::FILE_OPEN_REPARSE_POINT | nt::FILE_SYNCHRONOUS_IO_NONALERT,
+    )?;
+    fingerprint_of_handle(entry.as_raw_handle())
+  }
+
+  /// Takes ownership of a directory handle the caller opened (with containment); refused once the handle ids
+  /// are spent ([`OsHost::allocate`]).
+  pub fn adopt_dir(&mut self, handle: OwnedHandle) -> Result<HostDir, HostError> {
+    let h = self.allocate()?;
+    self.dirs.insert(h, handle);
+    Ok(HostDir(h))
+  }
+
+  /// Takes ownership of a file handle the caller opened (a temporary); refused once the handle ids are spent.
+  pub fn adopt_file(&mut self, handle: OwnedHandle) -> Result<HostFile, HostError> {
+    let h = self.allocate()?;
+    self.files.insert(h, std::fs::File::from(handle));
+    Ok(HostFile(h))
+  }
+}
+
+/// Why [`walk_dir`] refused a path.
+#[derive(Debug)]
+pub enum WalkRefusal {
+  /// The path is not absolute (a drive or a share and a root).
+  NotAbsolute,
+  /// A component is `..`, a link, a junction or a mount point: the path would leave the directory it names.
+  Escapes,
+  /// The host refused a component.
+  Host(HostError),
+}
+
+/// Opens the absolute directory `path` one component at a time from its root, each with `FILE_OPEN_REPARSE_POINT`
+/// relative to the handle before it, refusing `..` and any component that redirects the namespace (a symbolic link,
+/// a junction, a mount point): the landing target's containment (§4.15 step 4), the Windows form of the Unix walk with
+/// `O_DIRECTORY|O_NOFOLLOW`. Each handle has the directory access the host retains, and `READ_CONTROL` (the owner's
+/// check). A read: nothing is created or written.
+pub fn walk_dir(path: &Path) -> Result<OwnedHandle, WalkRefusal> {
+  use std::path::Component;
+  let mut components = path.components();
+  let (Some(Component::Prefix(prefix)), Some(Component::RootDir)) =
+    (components.next(), components.next())
+  else {
+    return Err(WalkRefusal::NotAbsolute);
+  };
+  let mut root = std::path::PathBuf::from(prefix.as_os_str());
+  root.push(std::path::MAIN_SEPARATOR_STR);
+  // structural: allow — a read-only open of the volume's root directory; nothing is written (R1).
+  let mut current = std::fs::OpenOptions::new()
+    .access_mode(DIRECTORY_ACCESS | READ_CONTROL)
+    .share_mode(SHARE_ALL)
+    .custom_flags(BACKUP_SEMANTICS | OPEN_REPARSE_POINT)
+    .open(&root)
+    .map(OwnedHandle::from)
+    .map_err(|e| WalkRefusal::Host(refusal(&e)))?;
+  for component in components {
+    let name = match component {
+      Component::Normal(name) => name.to_str().ok_or(WalkRefusal::Escapes)?,
+      Component::CurDir => continue,
+      _ => return Err(WalkRefusal::Escapes),
+    };
+    let next = open_relative(
+      &current,
+      name,
+      DIRECTORY_ACCESS | READ_CONTROL,
+      nt::FILE_OPEN_REPARSE_POINT | nt::FILE_SYNCHRONOUS_IO_NONALERT,
+    )
+    .map_err(WalkRefusal::Host)?;
+    let info = attribute_tag(&next).map_err(WalkRefusal::Host)?;
+    if redirects(&info) {
+      return Err(WalkRefusal::Escapes);
+    }
+    if info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+      return Err(WalkRefusal::Host(HostError::NotDirectory));
+    }
+    current = next;
+  }
+  Ok(current)
 }
 
 /// The entry `units` of `parent` as a listing shows it: fingerprinted and kinded through its own contained

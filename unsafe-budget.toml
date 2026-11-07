@@ -309,7 +309,15 @@ slates-mem = 61
 slates-rt = 95
 slates-base = 10
 slates-vfs = 0
-slates-land = 4
+slates-land = 22
+# 2026-10-26 (+18, §4.15 A-185, landing on Windows, `os_windows.rs` compiled only for Windows): Win32 and the NT layer
+#   have no safe wrapper for a write relative to a directory handle. The create relative to a handle (`NtCreateFile`
+#   with `FILE_CREATE`, and its handle owned, 2) and the directory reopened to flush it (`NtCreateFile` with an empty
+#   name, owned, 2); the rename that never replaces (`NtSetInformationFile(FileRenameInformationEx)` and the variable
+#   record written into its buffer, 2); the removal (`FileDispositionInfoEx`, 1), the attributes and times
+#   (`FileBasicInfo`, 1) and an entry's attributes read (`FileAttributeTagInfo`, 1); `FlushFileBuffers` (1); the two
+#   error translations (`GetLastError`, `RtlNtStatusToDosError`, 2); and the target's owner check (`GetSecurityInfo`,
+#   the process token opened and owned, its user read, the two SIDs compared, the descriptor freed: 6).
 slates-anchor = 6
 slates-db = 0
 slates-ipc = 103

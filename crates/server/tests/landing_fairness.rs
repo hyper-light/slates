@@ -11,7 +11,6 @@
   clippy::unwrap_in_result
 )]
 // The daemon's NFS loopback transport and a real landing target: macOS and Linux.
-#![cfg(unix)]
 
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
