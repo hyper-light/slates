@@ -1,0 +1,56 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 13:58:50 UTC 2026, tree R 86012d108a1e329ff31e4ed52f85135e2e766f54
+live storm: unanswered sends while both stopped 58 (bound 66)
+== run 1 both_candidates_stopped_draw_no_storm_of_sends exit 0
+live turns: live-turns-c-6286 stopped: writes [700.467496ms, 3.375269ms, 3.390597ms, 3.423376ms]
+live turns: live-turns-a-6286 stopped: writes [478.926685ms, 3.54471ms, 3.496963ms, 3.523378ms]
+== run 1 each_candidate_stopped_in_turn_holds_no_write_and_catches_up exit 101
+live catalog: refusals [("live-catalog-b-6634", 1), ("live-catalog-c-6634", 1)]
+== run 1 a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog exit 101
+== run 1 a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log exit 0
+live storm: unanswered sends while both stopped 34 (bound 66)
+== run 2 both_candidates_stopped_draw_no_storm_of_sends exit 0
+live turns: live-turns-c-7201 stopped: writes [600.919893ms, 3.764547ms, 3.505624ms, 3.431983ms]
+live turns: live-turns-a-7201 stopped: writes [468.60751ms, 3.322588ms, 3.233633ms, 3.174433ms]
+== run 2 each_candidate_stopped_in_turn_holds_no_write_and_catches_up exit 101
+live catalog: refusals [("live-catalog-a-7535", 1), ("live-catalog-c-7535", 1)]
+== run 2 a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog exit 101
+== run 2 a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log exit 0
+live storm: unanswered sends while both stopped 32 (bound 66)
+== run 3 both_candidates_stopped_draw_no_storm_of_sends exit 0
+live turns: live-turns-a-7891 stopped: writes [797.152914ms, 3.361364ms, 3.235635ms, 3.322005ms]
+live turns: live-turns-b-7891 stopped: writes [480.662518ms, 3.35824ms, 3.189876ms, 3.354935ms]
+== run 3 each_candidate_stopped_in_turn_holds_no_write_and_catches_up exit 101
+live catalog: refusals [("live-catalog-a-8241", 1), ("live-catalog-c-8241", 1)]
+== run 3 a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog exit 101
+== run 3 a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log exit 0
+live storm: unanswered sends while both stopped 32 (bound 66)
+== run 4 both_candidates_stopped_draw_no_storm_of_sends exit 0
+live turns: live-turns-c-8594 stopped: writes [407.762369ms, 3.419692ms, 3.159447ms, 3.145416ms]
+live turns: live-turns-a-8594 stopped: writes [584.164696ms, 3.658108ms, 3.427974ms, 3.213644ms]
+== run 4 each_candidate_stopped_in_turn_holds_no_write_and_catches_up exit 101
+live catalog: refusals [("live-catalog-b-8914", 1), ("live-catalog-c-8914", 1)]
+== run 4 a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog exit 101
+== run 4 a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log exit 0
+live storm: unanswered sends while both stopped 60 (bound 66)
+== run 5 both_candidates_stopped_draw_no_storm_of_sends exit 0
+live turns: live-turns-c-9273 stopped: writes [633.917341ms, 3.809442ms, 3.700138ms, 3.612064ms]
+live turns: live-turns-a-9273 stopped: writes [572.148546ms, 3.490881ms, 3.271919ms, 3.220612ms]
+== run 5 each_candidate_stopped_in_turn_holds_no_write_and_catches_up exit 101
+live catalog: refusals [("live-catalog-a-9494", 1), ("live-catalog-c-9494", 1)]
+== run 5 a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog exit 101
+== run 5 a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log exit 0
+== live_fleet quiet at 13:59:41, load 1.60 1.68 0.82
+test a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog ... FAILED
+test each_candidate_stopped_in_turn_holds_no_write_and_catches_up ... FAILED
+thread 'a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog' (10875) panicked at crates/cli/tests/live_fleet.rs:1006:3:
+thread 'each_candidate_stopped_in_turn_holds_no_write_and_catches_up' (13364) panicked at crates/cli/tests/live_fleet.rs:871:3:
+test result: FAILED. 19 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.18s
+== live_fleet quiet exit 101
+== live_fleet loaded at 14:00:09, load 1.57 1.67 0.84
+test a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... FAILED
+test each_candidate_stopped_in_turn_holds_no_write_and_catches_up ... FAILED
+live fsync: healthy Ok(()); candidates stopped Ok(()) after 1.06081995s; resumed Ok(()); owner's live counters {"appended": 4, "durable": 4, "link_lost": 2, "no_session": 29, "unanswered": 27, "whole": 1}
+thread 'a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it' (14277) panicked at crates/cli/tests/live_fleet.rs:1611:3:
+thread 'each_candidate_stopped_in_turn_holds_no_write_and_catches_up' (16169) panicked at crates/cli/tests/live_fleet.rs:871:3:
+test result: FAILED. 19 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 45.79s
+== live_fleet loaded exit 101
