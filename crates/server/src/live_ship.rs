@@ -1048,6 +1048,17 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
     // A holder that has not acknowledged the volume's catalog refuses the log (its bound is the catalog's size,
     // `hold_bound`): the record plane places the catalog there first, re-shipped each period, and the next dispatch after
     // that ships it the log.
+    if busy.contains(holder) {
+      if let Some(began) = live.lanes.get(holder) {
+        let age = now.saturating_sub(*began);
+        if age >= 250_000_000 {
+          slates_machine::log_line!(
+            "LANEPROBE busy-skip holder={holder:?} lane_age_ms={}",
+            age / 1_000_000
+          );
+        }
+      }
+    }
     if !catalogued.contains(holder) || busy.contains(holder) {
       continue;
     }
@@ -1192,7 +1203,15 @@ fn lane_ended(state: &mut ShardState, holder: HostId, objects: Vec<ObjectId>, an
     let Some(live) = state.live.shipping.get_mut(&object.0) else {
       continue;
     };
-    live.lanes.remove(&holder);
+    if let Some(began) = live.lanes.remove(&holder) {
+      let age = slates_rt::futures::now_ns().saturating_sub(began);
+      if age >= 100_000_000 {
+        slates_machine::log_line!(
+          "LANEPROBE ended holder={holder:?} answered={answered} lane_age_ms={}",
+          age / 1_000_000
+        );
+      }
+    }
     if live.fenced.is_none() {
       sends.extend(
         pending_sends(state, object.0)
@@ -1287,8 +1306,13 @@ async fn ship_lane(
   sends: Vec<Send>,
   budget: slates_cluster::CommitBudget,
 ) -> bool {
+  let lane_began = slates_rt::futures::now_ns();
+  let lane_sends = sends.len();
   for send in sends {
+    let t0 = slates_rt::futures::now_ns();
     let sessions = borrow_session(holder, budget.max_deadline_ns()).await;
+    let t1 = slates_rt::futures::now_ns();
+    let had_session = !sessions.is_empty();
     // Each message under its own budget: the liveness budget plus its transfer on the session it rides, so an install
     // of the whole volume is not given up the moment an entry would be (`exchange_budget`).
     let exchange = exchange_budget(send.bytes.len(), &sessions);
@@ -1296,6 +1320,7 @@ async fn ship_lane(
       slates_cluster::live::exchange((send.stream, &send.bytes), sessions, exchange, |_, _| true)
         .await;
     let answered = !exchanged.replies.is_empty();
+    let t2 = slates_rt::futures::now_ns();
     if !answered {
       let _ = state::with_state(|s| {
         s.count(LIVE_UNANSWERED, 1);
@@ -1317,6 +1342,19 @@ async fn ship_lane(
     }
     // After the answers are on their way to the owner, so durability waits for no straggler.
     finish_stragglers(origin, send.object, exchanged.stragglers).await;
+    let t3 = slates_rt::futures::now_ns();
+    // TEMPORARY (item 2 lane probe): a lane step past 100 ms, logged with where it went.
+    if t3.saturating_sub(t0) >= 100_000_000 {
+      slates_machine::log_line!(
+        "LANEPROBE step holder={holder:?} stream={} bytes={} session={had_session} borrow_ms={} exchange_ms={} stragglers_ms={} answered={answered} lane_age_ms={} lane_sends={lane_sends}",
+        send.stream,
+        send.bytes.len(),
+        t1.saturating_sub(t0) / 1_000_000,
+        t2.saturating_sub(t1) / 1_000_000,
+        t3.saturating_sub(t2) / 1_000_000,
+        t3.saturating_sub(lane_began) / 1_000_000
+      );
+    }
     if !answered {
       return false;
     }
@@ -1378,6 +1416,12 @@ async fn borrow_session(
         let _ = state::with_state(|s| s.count(LIVE_NO_SESSION, 1));
       }
       return sessions;
+    }
+    if !missed {
+      let holder_tag =
+        state::with_state(|s| s.record_sessions.get(&holder).and_then(|link| link.lent_to))
+          .flatten();
+      slates_machine::log_line!("LANEPROBE borrow-miss holder={holder:?} lent_to={holder_tag:?}");
     }
     missed = true;
     // Shape: one tick of the shard's timer wheel, the finest park there is (`sleep` rounds up to it).
