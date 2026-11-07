@@ -5858,6 +5858,25 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > good), and a remote candidate's empty report raised no fence, which the nemesis model shows breaks StaleNeverCommits
 > (10 seeds; bug record `docs/bugs/2026-11-05-a-live-takeover-counted-no-empty-report-and-fenced-no-empty-copy.md`).
 >
+> **A checkpoint ships a live volume's changes, not the volume (2026-11-05).** A live log's whole record copies every
+> byte of the volume; it is owed only when a delta would not apply to what the candidates hold (the log's first record,
+> a holder behind the retained tail, a publication that could not be shipped). A shard's local checkpoint is none of
+> those: it restarts the recovery journal once the deltas reach the size of the shard's metadata, and it had been mapped
+> to a whole record, so one write in three copied the volume (68 of 201 records) and the record behind it was refused
+> for credit (431 of 2,395). Now the checkpoint takes each changed live volume's record as a delta publication does
+> (`verbs::capture_live_changes`) and ships it once the checkpoint commits, for the volumes the checkpoint carried
+> (`live_ship::note_checkpoint`). Held by `a_live_volumes_writes_ship_their_changes_not_the_volume` (red first: 68 whole;
+> after: 1, the log's first). Interleaved with main, the stable-write latency is unchanged (BENCHMARKS "What a
+> checkpoint shipped"); the whole copies and the credit refusals are gone.
+>
+> **A candidate's copy stays within its bound (2026-11-06).** A candidate keeps a whole entry and the entries after it,
+> within twice the volume's size (`live_ship::hold_bound`). With whole records rare, the copies grew to that bound and
+> both candidates refused every entry after it, so no write was durable (at 454 stable 4 KiB writes to a 1 MiB volume:
+> `a_long_writer_keeps_the_candidates_copies_within_their_bound`, red first). The owner now counts what a candidate keeps
+> (`LiveVolume::kept`) and ships whole once that reaches the volume's size (`kept_reaches_size`): the entry that crosses
+> it still fits, since no publication is larger than the volume. After: 768 writes answered, 4 whole records, no
+> refusal for the bound.
+>
 > **Chaos from outside the processes (2026-11-06).** `crates/cli/tests/live_chaos.rs` streams writes through the Rust
 > client while it partitions or kills processes. It ends every flow with Agreement, NoLoss, StaleNeverCommits and
 > Convergence, checked from every node's `status`; each live line now carries its head's epoch and chain identity and
