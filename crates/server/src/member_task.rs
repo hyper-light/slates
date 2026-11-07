@@ -68,6 +68,18 @@ const RECEIVE_BYTES: usize = hyper_datagram::MAX_DATAGRAM_BYTES;
 
 /// Refusal counters (`slates status`).
 const EPOCH_REFUSED: &str = "fleet.plane.epoch_refused";
+/// Counter: an epoch announcement that was not one (bytes that do not decode).
+const EPOCH_REFUSED_MALFORMED: &str = "fleet.plane.epoch_refused.malformed";
+/// Counter: an announced identity the session's anchor and boot nonce do not derive.
+const EPOCH_REFUSED_FORGED: &str = "fleet.plane.epoch_refused.forged";
+/// Counter: an epoch announced on a session that is not the pair's canonical one (this node the lower anchor).
+const EPOCH_REFUSED_NOT_CANONICAL: &str = "fleet.plane.epoch_refused.not_canonical";
+/// Counter: an epoch the plane would not install (not newer than the peer's last, or the peer table full).
+const EPOCH_REFUSED_INSTALL: &str = "fleet.plane.epoch_refused.install";
+/// Counter: an announced epoch not newer than the peer's last, taken as the start of its restarted sequence.
+const EPOCH_RESTARTED: &str = "fleet.plane.epoch_restarted";
+/// Counter: an acceptor's answer that was empty or named another epoch.
+const EPOCH_REFUSED_ANSWER: &str = "fleet.plane.epoch_refused.answer";
 const EPOCH_UNANSWERED: &str = "fleet.plane.epoch_unanswered";
 const SEND_REFUSED: &str = "fleet.plane.send_refused";
 const RECEIVE_REFUSED: &str = "fleet.plane.receive_refused";
@@ -191,19 +203,21 @@ pub(crate) fn accept_announcement(
   secret: &[u8; hyper_datagram::SECRET_BYTES],
   request: &[u8],
 ) -> Vec<u8> {
-  let refuse = |state: &mut ShardState| {
+  let refuse = |state: &mut ShardState, why: &'static str| {
     crate::fleet::count_refusal_in(state, EPOCH_REFUSED);
+    crate::fleet::count_refusal_in(state, why);
     Vec::new()
   };
   let Some(announced) = Announcement::decode(request) else {
-    return refuse(state);
+    return refuse(state, EPOCH_REFUSED_MALFORMED);
   };
   // Every dialer's identity is learned on contact (or refused, counted as forged), whatever the session keys.
   if crate::fleet::learn_member(state, anchor, announced.boot_nonce, announced.member)
     == crate::fleet::LearnedOutcome::Forged
   {
-    return refuse(state);
+    return refuse(state, EPOCH_REFUSED_FORGED);
   }
+  note_returned(state, announced.member);
   let answer = Announcement {
     epoch: announced.epoch,
     member: state.fleet.host(),
@@ -214,23 +228,61 @@ pub(crate) fn accept_announcement(
     return answer.encode().to_vec();
   }
   if anchor >= state.origin_anchor {
-    return refuse(state);
+    return refuse(state, EPOCH_REFUSED_NOT_CANONICAL);
   }
-  let installed = state.plane.plane.as_mut().map(|plane| {
-    plane.install_epoch(
-      announced.member,
-      announced.epoch,
-      &ExporterSecret::new(*secret),
-      Role::Acceptor,
-    )
-  });
+  let exported = ExporterSecret::new(*secret);
+  let mut installed =
+    state.plane.plane.as_mut().map(|plane| {
+      plane.install_epoch(announced.member, announced.epoch, &exported, Role::Acceptor)
+    });
+  // The pair's canonical dialer announces once per connection, each epoch above the last, so an authenticated
+  // announcement that is not newer comes from a dialer whose sequence started over: its process restarted under the
+  // same member id (an anchor's warm restart keeps the id). Refused, the pair stayed unkeyed for good: the restarted
+  // daemon held no probed peer, and the acceptor refused its epochs 344 times in 40 s
+  // (`a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet` in `crates/cli/tests/live_chaos.rs`). The
+  // sequence starts over here too; its keys come from this session's exporter secret.
+  if matches!(
+    installed,
+    Some(Err(
+      slates_cluster::member_plane::PlaneRefusal::EpochNotNewer
+    ))
+  ) {
+    crate::fleet::count_refusal_in(state, EPOCH_RESTARTED);
+    installed = state.plane.plane.as_mut().map(|plane| {
+      plane.restart_epochs(announced.member, announced.epoch, &exported, Role::Acceptor)
+    });
+  }
   if !matches!(installed, Some(Ok(()))) {
-    return refuse(state);
+    return refuse(state, EPOCH_REFUSED_INSTALL);
   }
   state.plane.keyed.insert(announced.member, false);
   forget_address(state, anchor);
   answer.encode().to_vec()
 }
+
+/// Notes that `member`, which this node holds dead, has just announced itself over an authenticated session: its process
+/// is alive under the same id (an anchor's warm restart), so contact with it is kept (`fleet::direct_contact`) until its
+/// probes refute the death. Without it, the pair's canonical dialer, holding the member dead, never dialed it again, the
+/// pair's plane was never keyed, and the member could never hear of its death to refute it: the restarted daemon held
+/// no probed peer for the whole 40 s wait (`a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet`).
+fn note_returned(state: &mut ShardState, member: HostId) {
+  let Some(belief) = state.fleet.membership().state(member) else {
+    return;
+  };
+  if belief.liveness != slates_cluster::membership::Liveness::Dead {
+    state.returned_members.remove(&member);
+    return;
+  }
+  if state.returned_members.contains_key(&member)
+    || state.returned_members.len() < state.config.fleet_peer_capacity
+  {
+    state.returned_members.insert(member, belief.incarnation);
+    crate::fleet::count_refusal_in(state, MEMBER_RETURNED);
+  }
+}
+
+/// Counter: an announcement from a member this node held dead, whose contact is kept so it can refute the death.
+const MEMBER_RETURNED: &str = "fleet.plane.member_returned";
 
 /// Marks `anchor`'s resolved plane address stale so the next turn resolves it afresh: a new connection may come from a
 /// new address (a replaced pod keeps its name and certificate, not its IP). The address stays the manifest's or
@@ -343,6 +395,7 @@ async fn announce_on(member: HostId, endpoint: &mut Endpoint, canonical: bool) {
   let _ = state::with_state_counted(|state| {
     let Some(answer) = Announcement::decode(&reply).filter(|answer| answer.epoch == epoch) else {
       crate::fleet::count_refusal_in(state, EPOCH_REFUSED);
+      crate::fleet::count_refusal_in(state, EPOCH_REFUSED_ANSWER);
       return;
     };
     if crate::fleet::learn_member(state, anchor, answer.boot_nonce, answer.member)
@@ -368,6 +421,7 @@ async fn announce_on(member: HostId, endpoint: &mut Endpoint, canonical: bool) {
       forget_address(state, anchor);
     } else {
       crate::fleet::count_refusal_in(state, EPOCH_REFUSED);
+      crate::fleet::count_refusal_in(state, EPOCH_REFUSED_INSTALL);
     }
   });
 }

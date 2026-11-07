@@ -4030,6 +4030,10 @@ enum DirectContact {
   /// dropped a member outside its neighbourhood, never announced the pair's epoch once formation's
   /// everyone-contacts-everyone window closed, and the member's probes to it went unanswered for 4,000 periods.
   AsVoter,
+  /// Believed dead, but it announced itself since over an authenticated session at the incarnation it died at: its
+  /// process lives under the same id (an anchor's warm restart). Contact is kept so the pair's plane is keyed and its
+  /// probes, answered with the death, let it refute (hyper-swim's refutation needs the dead member's probe to be heard).
+  Returned,
   /// Dropped: this node believes the peer dead.
   BelievedDead,
   /// Dropped: a council member outside this node's neighbourhood and no voter.
@@ -4042,6 +4046,27 @@ impl DirectContact {
   }
 }
 
+/// The contact kept with `peer`, which this node holds dead: see [`DirectContact`]'s first three dead variants.
+fn dead_contact(state: &ShardState, peer: HostId) -> DirectContact {
+  if is_unlearned_seed(state, peer) {
+    DirectContact::UnlearnedSeed
+  } else if returned_since_death(state, peer) {
+    DirectContact::Returned
+  } else {
+    DirectContact::BelievedDead
+  }
+}
+
+/// Whether `peer`, held dead here, has announced itself since at the incarnation it died at (`ShardState::returned_members`).
+fn returned_since_death(state: &ShardState, peer: HostId) -> bool {
+  let incarnation = state
+    .fleet
+    .membership()
+    .state(peer)
+    .map(|belief| belief.incarnation);
+  incarnation.is_some() && state.returned_members.get(&peer).copied() == incarnation
+}
+
 fn direct_contact(state: &ShardState, peer: HostId) -> DirectContact {
   let believed_dead = state
     .fleet
@@ -4049,11 +4074,7 @@ fn direct_contact(state: &ShardState, peer: HostId) -> DirectContact {
     .state(peer)
     .is_some_and(|belief| belief.liveness == Liveness::Dead);
   if believed_dead {
-    if is_unlearned_seed(state, peer) {
-      DirectContact::UnlearnedSeed
-    } else {
-      DirectContact::BelievedDead
-    }
+    dead_contact(state, peer)
   } else if !state.council.initialized() || !state.root.initialized() {
     DirectContact::Forming
   } else if !state.council.configuration().members.contains(&peer) {

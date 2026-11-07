@@ -406,6 +406,21 @@ impl MemberPlane {
     self.joined.insert(peer.0);
   }
 
+  /// Installs `epoch` for `peer` as the start of a new sequence: `peer`'s keys and pending datagrams are forgotten first,
+  /// so an epoch not newer than the last is taken. For a peer whose process restarted under the same member id and
+  /// announced from a fresh authenticated session, whose epochs therefore start over; the keys still come from that
+  /// session's exporter secret, so nothing of the old sequence opens under them.
+  pub fn restart_epochs(
+    &mut self,
+    peer: HostId,
+    epoch: Epoch,
+    secret: &ExporterSecret,
+    role: Role,
+  ) -> Result<(), PlaneRefusal> {
+    self.plane.remove_peer(peer.0);
+    self.plane.install_epoch(peer.0, epoch, secret, role)
+  }
+
   /// Forgets `peer`'s keys and pending messages (a retired member id).
   pub fn remove_peer(&mut self, peer: HostId) {
     self.plane.remove_peer(peer.0);
