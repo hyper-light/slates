@@ -1,0 +1,13 @@
+after: tested 10c1be2b7d10bae7fc58163f9d1691d4198e8e3a on x86_64, 4 cpus, load 0.39 0.10 0.03
+build exit 0
+killed daemon 5821, anchor held 4 s
+bench exit 0
+level	300	wall_ns	4563768865	workers	1
+refusal	300	247	the daemon did not come back within the reconnect budget
+harness	300	starved	0	rebase_conflicts	274	max_sweep_ns	3400815	max_drain_gap_ns	3666961	reconnects	0	resent	0	max_outage_ns	0	backpressure	0	retried	0
+oracle	300	accepted	389	conflicts	465	unknown	26	files_checked	654	oracle_failures	0
+oracle	300	own_files_failures	0
+slates anchor: instance chaos-2443 up; daemon pid 5821; 1 shards
+slates anchor: daemon exited (None); restarted (1 in the window)
+slates-server: shard 0: recovered 1 volumes from their images (0 refused), 248 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone
+slates anchor: stopped (daemon exit Some(0))
