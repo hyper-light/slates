@@ -103,9 +103,9 @@ struct Holder {
 /// phase one counts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Following {
-  /// The design (Vertical Paxos): the shipper begins a transition to the candidates named, ships to both sets and counts
-  /// durability over each; the record names the new set only once it holds every durable entry, and phase one counts the
-  /// set the record names.
+  /// The design (Vertical Paxos): the shipper begins a transition to the candidates named, ships to both sets and
+  /// counts durability over each; the record names the new set only once it holds every durable entry, and phase one
+  /// counts the set the record names.
   Joint,
   /// A mutation: the record names the new candidates at once, as replacing the shipper's holders outright did, so phase
   /// one counts a set that may hold none of the durable entries.
@@ -208,8 +208,8 @@ struct Run {
   window_takeovers: [u64; 3],
   /// Whose reports phase one counts ([`Counting`]).
   counting: Counting,
-  /// Whether a fresh member may join the candidates when an owner is lost, as a replaced pod does under a fresh identity
-  /// (KIND runs 42326682216, 42331191530): it never held the log, and the shipper's holders never name it.
+  /// Whether a fresh member may join the candidates when an owner is lost, as a replaced pod does under a fresh
+  /// identity (KIND runs 42326682216, 42331191530): it never held the log, and the shipper's holders never name it.
   newcomers: bool,
   /// The members that joined so.
   joined: u64,
@@ -734,10 +734,10 @@ impl Run {
     self.takeovers += 1;
   }
 
-  /// Phase one's hosts: those asked, and the set whose reports count toward `f + 1`; `None` when too few of that set are
-  /// reachable. Without `following`, by the run's counting rule ([`Run::phase_one_hosts`]). With it, every reachable
-  /// live host the configuration or the record names is asked, and `f + 1` of them must be in the holder set the record
-  /// names for the owner being taken over ([`Following`]).
+  /// Phase one's hosts: those asked, and the set whose reports count toward `f + 1`; `None` when too few of that set
+  /// are reachable. Without `following`, by the run's counting rule ([`Run::phase_one_hosts`]). With it, every
+  /// reachable live host the configuration or the record names is asked, and `f + 1` of them must be in the holder set
+  /// the record names for the owner being taken over ([`Following`]).
   fn phase_one_asked(
     &self,
     old: usize,
@@ -837,8 +837,9 @@ impl Run {
     }
   }
 
-  /// Takes the current owner over when its log is inside one of a holder transition's windows, counting which: the target
-  /// short of the durable entries, the target transferred but not yet recorded, or the record lagging the holders.
+  /// Takes the current owner over when its log is inside one of a holder transition's windows, counting which: the
+  /// target short of the durable entries, the target transferred but not yet recorded, or the record lagging the
+  /// holders.
   fn take_over_in_a_window(&mut self) {
     let owner = &self.owners[self.current];
     let shipper = &owner.shipper;
@@ -1293,8 +1294,8 @@ fn a_refused_entry_is_never_counted_as_held() {
 }
 
 /// A-200: a shipper made before its candidates were known ships to them once they are named. Do make the owner's
-/// shipper with no holders (a volume made on a fleet's bootstrap node, whose configuration named only itself), append two
-/// entries, then begin a transition to the two candidates. Expect nothing durable before or during it (no holder is
+/// shipper with no holders (a volume made on a fleet's bootstrap node, whose configuration named only itself), append
+/// two entries, then begin a transition to the two candidates. Expect nothing durable before or during it (no holder is
 /// recorded yet), each candidate owed every entry, the target transferred at once (nothing is durable), and the log
 /// durable once the record names the candidates and one of them holds the entries. Found by the Linux conformance pair
 /// (diag run 42325923902): such a log stood at head=2 durable=none for a whole fsx run.
@@ -1602,15 +1603,15 @@ fn a_shipper_that_keeps_its_first_holders_never_reaches_new_candidates() {
   );
 }
 
-/// A-200's intersection over a holder set of any size: a write is durable only once every `f + 1` reports a takeover can
-/// count from the set meet a holder of it and `f` failures leave a copy, so on `n` holders it needs `max(n − f, f)` of
-/// them (`f` of `2f`, `f + 1` of `2f + 1`, all of `f`), and on fewer than `f` it is never durable. Do ship one
-/// entry at `f = 1` to three holders (the owner outside its own volume's placement, so every other candidate holds),
+/// A-200's intersection over a holder set of any size: a write is durable only once every `f + 1` reports a takeover
+/// can count from the set meet a holder of it and `f` failures leave a copy, so on `n` holders it needs `max(n − f, f)`
+/// of them (`f` of `2f`, `f + 1` of `2f + 1`, all of `f`), and on fewer than `f` it is never durable. Do ship one entry
+/// at `f = 1` to three holders (the owner outside its own volume's placement, so every other candidate holds),
 /// acknowledged by one. Expect it not durable, and a takeover counting the other two adopting no head; durable once a
 /// second holds it. Then the same with two holders and one acknowledgement: durable. With one holder: durable once it
-/// holds it (all `f`); with none: never. At `f = 2` with three holders: not durable on one, durable on two.
-/// Found by raft-chaos on CI (diag-20 run 7): with three recorded holders the owner counted a write durable on one,
-/// and a successor counted the other two and never asked it.
+/// holds it (all `f`); with none: never. At `f = 2` with three holders: not durable on one, durable on two. Found by
+/// raft-chaos on CI (diag-20 run 7): with three recorded holders the owner counted a write durable on one, and a
+/// successor counted the other two and never asked it.
 #[test]
 fn a_write_is_durable_only_where_every_takeover_quorum_meets_it() {
   let owner = HostId(1);
@@ -1661,8 +1662,8 @@ fn a_write_is_durable_only_where_every_takeover_quorum_meets_it() {
 }
 
 /// A-200: a holder set of `f` or fewer members is never moved to, since no takeover can count `f + 1` reports from it.
-/// Do begin transitions from two holders at `f = 1` and from four at `f = 2` to sets of every size. Expect sets of `f` or
-/// fewer refused (no transition begun, the holders kept and still making `W` alone) and larger ones begun. Found by
+/// Do begin transitions from two holders at `f = 1` and from four at `f = 2` to sets of every size. Expect sets of `f`
+/// or fewer refused (no transition begun, the holders kept and still making `W` alone) and larger ones begun. Found by
 /// live-durability's rolling partition flow at 8b0f0341: a candidate found dead left one other, the log moved to it,
 /// and writes stalled for a partition's length when that one stopped before the move back was recorded (4 of 6 runs on
 /// each arch).
