@@ -1,0 +1,18 @@
+tested 9d9ca24e0019355dafb75588910c9793a3b75d6e variant after on x86_64, 4 cpus
+server-lib exit 0 89s
+  server-lib: test result: ok. 203 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 1.37s
+ack-release exit 0 24s
+  ack-release: test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.81s
+daemon exit 0 5s
+  daemon: test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.54s
+shards exit 0 19s
+  shards: test result: ok. 22 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 17.22s
+recovery exit 101 39s
+  recovery: test an_unpublished_verb_stays_retryable_across_the_clients_acknowledgement ... FAILED
+  recovery: ---- an_unpublished_verb_stays_retryable_across_the_clients_acknowledgement stdout ----
+  recovery: thread 'an_unpublished_verb_stays_retryable_across_the_clients_acknowledgement' (6884) panicked at crates/server/tests/recovery.rs:182:3:
+  recovery: test result: FAILED. 46 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 36.36s
+  recovery: error: test failed, to rerun pass `-p slates-server --test recovery`
+  recovery: error: 1 target failed:
+forward-retry exit 0 3s
+  forward-retry: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.22s
