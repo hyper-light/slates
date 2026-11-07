@@ -1,0 +1,8 @@
+tested e2882c6c83b0c6855a3735801829b78cc3cc348c variant after on aarch64, 4 cpus
+held exit 0 172s
+held-again exit 0 93s
+lane exit 0 3s
+  lane: the forward of a read on a free shard took 4.657764ms while another forward to its owner waited out a 500ms hold; b's fleet counters Ok({"content.purged_bytes": 696492032, "content.ticks.idle": 1, "fleet.discovery.pages": 13, "fleet.fan.sent": 3, "fleet.fan.unchanged": 13, "fleet.forward.batch_done": 4, "fleet.forward.begun": 4, "fleet.forward.client.control_started": 4, "fleet.forward.client.delivered_home": 2, "fleet.forward.client.resolved": 4, "fleet.forward.client.to_control": 2, "fleet.forward.taken_for_another": 1, "fleet.learner.fetch_paced": 8, "fleet.learner.fetches": 2, "fleet.owner_location.direct": 4, "fleet.plane.announce_lends": 4, "fleet.plane.announcements_sent": 4})
+fleet-forward exit 0 133s
+server-lib exit 0 28s
+clippy exit 0 59s
