@@ -2924,6 +2924,15 @@ pub enum Refusal {
     /// The bound.
     bound: u64,
   },
+  /// A host path the daemon was given lies on a mount it serves itself (§4.6: no daemon thread opens a path on a volume
+  /// the daemon serves; A-227): opening it would send the daemon a request only it can answer. Nothing was opened.
+  /// Appended.
+  OwnMount {
+    /// The path as given.
+    path: String,
+    /// What the daemon was asked to use it as.
+    used_as: OwnMountUse,
+  },
   /// A verb named a CLI attachment whose term lapsed (§4.7, A-230): it ended then, its write lease with it, and is
   /// named here rather than as unknown, so a user who paused past the term learns why. Attach again. Appended.
   AttachmentExpired {
@@ -2934,6 +2943,17 @@ pub enum Refusal {
   /// completion records under that id belong to the client it was issued to, so nothing is served on this channel,
   /// which the daemon then ends. A client resumes only the session it was handed (`Session`, with its key). Appended.
   SessionUnproven,
+}
+
+/// What a path refused [`Refusal::OwnMount`] was given as (A-227). Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnMountUse {
+  /// A volume's base directory, or an entry below it.
+  Base,
+  /// A granted landing's target.
+  LandingTarget,
+  /// A FUSE mount point.
+  MountPoint,
 }
 
 /// The writes a snapshot is known to include (§4.6 "Writeback and snapshot barrier"): every write the

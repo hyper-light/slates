@@ -89,6 +89,12 @@ pub struct MergeShardState {
   /// The waiting requests by completion key (origin, client, sequence), so a retry of one joins its
   /// entry instead of running the verb again.
   pub awaiting_by_request: BTreeMap<(u64, u32, u32), (ObjectId, u64)>,
+  /// On the control shard: whether some owner shard has merge work the record plane can do now (a version
+  /// enqueued, an input or a record newly acknowledged), so the coordinator runs the merge plane at once rather
+  /// than at its next period (`nudge_record_plane`, `nudged`).
+  pub nudged: bool,
+  /// On the control shard: the coordinator's waker while it waits for its next period, woken by a nudge.
+  pub nudge_waker: Option<std::task::Waker>,
 }
 
 /// A green attachment's pin: the green and the version its view is fixed at.
@@ -1213,7 +1219,7 @@ pub(crate) fn status_merge_volume(
 // `crate::fleet::run_record_period`) works each holder's first missing version per green per period, in two steps that never reorder: while the version's inputs — the
 // increment's ops document and post-state (or the origin) as one archive — are not placed at `f + 1`
 // candidates they are put through the same content exchange the seals use (§4.10, verified on
-// arrival, hedged to every candidate at once: the inputs are small); only then does the record ship,
+// arrival, hedged at once to every candidate whose next record it is: the inputs are small); only then does the record ship,
 // and only to a candidate that already acknowledged the version before it, so every holder sees the
 // chain in order. A record that waits on its inputs is counted (`merge.inputs_unplaced`), the
 // non-vacuity counter for placed-before-reference. The pending state is bounded by the chain: the
@@ -1378,6 +1384,49 @@ impl PendingGreen {
       }
     }
     self.records.insert(version, record);
+  }
+
+  /// Re-derives every pending position's placement from `placement`, the owner's current placement of the green: a
+  /// position keeps the acknowledgements it gathered (each a durable hold) and is owed to the candidates that still
+  /// lack it. A position is enqueued under the configuration the owner holds then, which can be the one-candidate
+  /// placement a bootstrap installs before its council grows (§4.8); at `f = 1` that placement can never commit, so
+  /// a position kept to it never placed and no submit to the green was answered (the bug record of 2026-11-06). Head
+  /// records are placed by the current configuration each period (`fleet::owed_record`); merge records now are too.
+  fn retarget(&mut self, placement: &Placement) {
+    let mut changed = false;
+    for pending in self.records.values_mut() {
+      if pending.record.candidates != placement.candidates
+        || pending.record.joint != placement.joint
+      {
+        pending.record = Placement {
+          acked: std::mem::take(&mut pending.record.acked),
+          mirror_acked: pending.record.mirror_acked.take(),
+          ..placement.clone()
+        };
+        changed = true;
+      }
+      if pending.inputs.candidates != placement.candidates
+        || pending.inputs.joint != placement.joint
+      {
+        pending.inputs = Placement {
+          acked: std::mem::take(&mut pending.inputs.acked),
+          mirror_acked: pending.inputs.mirror_acked.take(),
+          ..placement.clone()
+        };
+        changed = true;
+      }
+    }
+    if !changed {
+      return;
+    }
+    self.owed.clear();
+    for (version, pending) in &self.records {
+      for host in &pending.record.candidates {
+        if !pending.record.acked.contains(host) {
+          self.owed.entry(*host).or_default().insert(*version);
+        }
+      }
+    }
   }
 
   /// One first missing position per remote holder, grouped into the record dispatches that may
@@ -1601,6 +1650,47 @@ pub(crate) fn enqueue_record(
       },
     },
   );
+  nudge_record_plane(state);
+}
+
+/// Tells the record plane that this owner shard has merge work it can do now (§4.16 "Commit"): a version to
+/// place, or one whose inputs or predecessor were just acknowledged. The coordinator runs the merge plane at once
+/// rather than waiting out its period, so a submit's answer waits for the exchange, not for the coordinator
+/// (before, every answer at `f > 0` waited out at least one period and usually two, 208 ms at the least: the bug
+/// record of 2026-11-06, a submit at `f = 1` waited for the coordinator's period). Only an event that makes new
+/// work nudges, so a holder that never answers costs no pass beyond the period's own.
+pub(crate) fn nudge_record_plane(state: &mut ShardState) {
+  let control = state.shards.first().copied().unwrap_or(state.shard);
+  if control == state.shard {
+    nudge(state);
+  } else {
+    crate::xshard::run_on_counted(state.shard, control, nudge);
+  }
+}
+
+/// Marks the control shard's record plane nudged and wakes the coordinator if it is waiting.
+fn nudge(state: &mut ShardState) {
+  state.merge.nudged = true;
+  if let Some(waker) = state.merge.nudge_waker.take() {
+    waker.wake();
+  }
+}
+
+/// Ready once the record plane has been nudged since it last ran (on the control shard, by the coordinator); the
+/// nudge is consumed.
+pub(crate) async fn nudged() {
+  std::future::poll_fn(|cx| {
+    crate::state::with_state(|s| {
+      if std::mem::take(&mut s.merge.nudged) {
+        std::task::Poll::Ready(())
+      } else {
+        s.merge.nudge_waker = Some(cx.waker().clone());
+        std::task::Poll::Pending
+      }
+    })
+    .unwrap_or(std::task::Poll::Pending)
+  })
+  .await;
 }
 
 /// `await placed(green, region)` (§4.4, §4.16): whether every committed version's merge record
@@ -1677,6 +1767,8 @@ pub(crate) enum MergeWork {
     archive: Archive,
     /// Every candidate.
     candidates: Vec<HostId>,
+    /// The candidates whose next record is this version: the only ones put to.
+    to: Vec<HostId>,
     /// The candidates that already hold the inputs.
     acked: Vec<HostId>,
     /// The quorum.
@@ -1712,9 +1804,11 @@ pub(crate) fn next_merge_work(state: &mut ShardState, local: HostId) -> Vec<Merg
   let mut work = Vec::new();
   let objects: Vec<ObjectId> = state.merge.pending.keys().copied().collect();
   for object in objects {
-    let Some(pending_green) = state.merge.pending.get(&object) else {
+    let placement = config.place(object);
+    let Some(pending_green) = state.merge.pending.get_mut(&object) else {
       continue;
     };
+    pending_green.retarget(&placement);
     let selected = pending_green.next(local);
     for (version, targets) in selected {
       let Some(pending) = state
@@ -1739,6 +1833,7 @@ pub(crate) fn next_merge_work(state: &mut ShardState, local: HostId) -> Vec<Merg
           version,
           archive: MergeShardState::inputs_archive(&bytes, 0, page),
           candidates: pending.inputs.candidates.clone(),
+          to: targets.clone(),
           acked: pending.inputs.acked.clone(),
           quorum: config.quorum,
         });
@@ -1814,11 +1909,12 @@ pub(crate) async fn run_merge_period(
         version,
         archive,
         candidates,
+        to,
         acked,
         quorum,
       } => {
         put_inputs(
-          origin, shard, local, object, version, archive, candidates, acked, quorum, budget,
+          origin, shard, local, object, version, archive, candidates, to, acked, quorum, budget,
         )
         .await
       }
@@ -1853,9 +1949,13 @@ pub(crate) async fn run_merge_period(
   }
 }
 
-/// Puts a version's inputs to every candidate that does not hold them (the inputs are small, so
-/// every remaining candidate at once), folding the acknowledgements into the pending record on the
-/// owner shard. A late acknowledgement is dropped; the next period's offer round finds the holder
+/// Puts a version's inputs to every candidate whose next record is this version and that does not hold
+/// them (`to`; the inputs are small, so all of them at once), folding the acknowledgements into the
+/// pending record on the owner shard. Never to a candidate still owed an earlier version: a holder keeps
+/// only its newest placement ahead of its accepted records (`crate::content_retention`), so a later
+/// version's inputs released the inputs its next record needed, and that record was refused
+/// `merge.inputs_unheld` until a period re-put them (53 and 71 refusals in two runs of twenty submits on an
+/// idle three-node fleet at `f = 1`, 2026-11-06). A late acknowledgement is dropped; the next period's offer round finds the holder
 /// holding the content and re-acknowledges it at no cost.
 #[allow(clippy::too_many_arguments)]
 async fn put_inputs(
@@ -1866,12 +1966,13 @@ async fn put_inputs(
   version: u64,
   archive: Archive,
   candidates: Vec<HostId>,
+  to: Vec<HostId>,
   acked: Vec<HostId>,
   quorum: Quorum,
   budget: CommitBudget,
 ) -> Option<Dispatch> {
   let holders = take_sessions("fleet.lent_to.put_inputs", |host| {
-    host != local && candidates.contains(&host) && !acked.contains(&host)
+    host != local && to.contains(&host) && !acked.contains(&host)
   });
   if holders.is_empty() {
     return None;
@@ -1907,10 +2008,16 @@ async fn put_inputs(
       .get_mut(&object)
       .and_then(|pending_green| pending_green.records.get_mut(&version))
     {
+      let mut acknowledged = false;
       for host in placement.acked {
         if !pending.inputs.acked.contains(&host) {
           pending.inputs.acked.push(host);
+          acknowledged = true;
         }
+      }
+      // The record may ship now that its inputs placed further.
+      if acknowledged {
+        nudge_record_plane(s);
       }
     }
   });
@@ -2018,9 +2125,11 @@ fn record_merge_acks(
   let Some(pending) = pending_green.records.get_mut(&version) else {
     return;
   };
+  let mut acknowledged = false;
   for host in placement.acked {
     if pending.record.candidates.contains(&host) && !pending.record.acked.contains(&host) {
       pending.record.acked.push(host);
+      acknowledged = true;
       if let Some(versions) = pending_green.owed.get_mut(&host) {
         versions.remove(&version);
         if versions.is_empty() {
@@ -2052,6 +2161,10 @@ fn record_merge_acks(
     if pending_green.records.is_empty() {
       state.merge.pending.remove(&object);
     }
+  }
+  // A holder that acknowledged this version may take the next one now.
+  if acknowledged && state.merge.pending.contains_key(&object) {
+    nudge_record_plane(state);
   }
   // The version is committed at the quorum: every submit whose acceptance waited on it is answered
   // now — its completion recorded, its reply delivered (§4.16 "Commit"; AUD-11).

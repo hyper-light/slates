@@ -445,13 +445,19 @@ async fn run(mut job: Job) {
   let request = job.request;
   // With the shard's state unreachable (its shutdown) no completion is recorded, so the client's retry runs the
   // checkout again on the shard that succeeds it, from the volume as it stands.
+  // On a live-shipped volume the checkout is answered once `f` candidates hold what it wrote (A-200), as a file verb on
+  // that volume is: until then its completion waits with the verbs' (`crate::live_ship::resolve` delivers it).
+  let volume = to_db_volume(job.volume);
   let _ = crate::state::with_state(|s| {
-    let (reply, route) =
-      crate::image::complete(s, request, |s| match outcome.and_then(|()| job.finish(s)) {
+    let completed = crate::image::complete_once_durable(s, request, volume, |s| {
+      match outcome.and_then(|()| job.finish(s)) {
         Ok(reply) => reply,
         Err(refusal) => refused(refusal),
-      });
-    crate::image::deliver(s, reply, route);
+      }
+    });
+    if let Some((reply, route)) = completed {
+      crate::image::deliver(s, reply, route);
+    }
   });
 }
 

@@ -166,6 +166,15 @@ impl Quorum {
     acked >= self.commit()
   }
 
+  /// Whether `acked` acknowledgements from a joint write's cohort of `cohort` hosts satisfy that cohort (§4.8 "joint
+  /// writes"): `f + 1` of it, or every member when it has fewer than `f + 1`, and at least one. A cohort smaller than
+  /// the quorum is the one a bootstrap settles (the first node alone) while its neighbourhood grows to the region; it
+  /// could never give `f + 1`, so a record joined with it never committed and the change it waited on never settled
+  /// (the bug record of 2026-11-06). Every member of it is the most a takeover recovering through it could meet.
+  pub fn committed_within(self, acked: usize, cohort: usize) -> bool {
+    acked >= self.commit().min(cohort).max(1)
+  }
+
   /// Derived: the promises a takeover's phase one needs from a recovery cohort of `cohort` hosts before it
   /// adopts, so that its answers meet every record that could have committed there. A commit is `f + 1`
   /// acknowledgements of the cohort, so `cohort − f` promises meet every such set — `q1 + q2 > n`, the
@@ -174,8 +183,9 @@ impl Quorum {
   /// (`cohort = 2f + 1`) that is `f + 1`. A cohort a forming region fixed with fewer hosts needs fewer: a
   /// commit there is held by more of its hosts, so fewer answers meet it (two hosts at `f = 1` commit only with
   /// both, so either one's promise suffices); demanding `f + 1` there declared a record lost while its cohort's
-  /// survivor held it. A cohort of `f` or fewer hosts never committed anything, yet a round adopts only what a
-  /// promise reports, so it needs one.
+  /// survivor held it. A cohort of `f` or fewer hosts commits a joint write only with every one of its hosts
+  /// ([`Quorum::committed_within`]), so one promise meets it, and a round adopts only what a promise reports, so it
+  /// needs one.
   pub fn recovery(self, cohort: usize) -> usize {
     cohort
       .saturating_sub(usize::try_from(self.f).unwrap_or(usize::MAX))
@@ -298,7 +308,7 @@ impl Placement {
     self
       .joint
       .iter()
-      .all(|cohort| quorum.committed(distinct_acks_within(cohort, acked)))
+      .all(|cohort| quorum.committed_within(distinct_acks_within(cohort, acked), cohort.len()))
   }
 
   /// The single-cohort placement of `candidates` that nothing has acknowledged yet — the shape a dispatch to
@@ -2808,6 +2818,40 @@ impl RootConfiguration {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// §4.8 "joint writes" (the bug record of 2026-11-06). A bootstrap settles the first node's cohort as itself
+  /// alone, so while its neighbourhood grows to the region a record's placement joins that one-member cohort with the
+  /// new one. At `f = 1` a cohort of one can never give `f + 1` acknowledgements, so no record of an object placed in
+  /// that window ever committed. Do: judge the joint placement `[[a], [a, b, c]]` at `f = 1` against acknowledgement
+  /// sets. Expect it placed by `{a, b, c}` and `{a, b}` (all of the old cohort, `f + 1` of the new), and not by `{a}`
+  /// (one of the new) or `{b, c}` (none of the old).
+  #[test]
+  fn a_joint_placement_with_a_cohort_smaller_than_the_quorum_needs_every_member_of_it() {
+    let (a, b, c) = (HostId(1), HostId(2), HostId(3));
+    let placement = Placement {
+      candidates: vec![a, b, c],
+      acked: Vec::new(),
+      mirror_acked: None,
+      joint: vec![vec![a], vec![a, b, c]],
+    };
+    let quorum = Quorum { f: 1 };
+    assert!(
+      placement.placed_with(&[a, b, c], quorum),
+      "every candidate acknowledged"
+    );
+    assert!(
+      placement.placed_with(&[a, b], quorum),
+      "all of the old cohort and f + 1 of the new"
+    );
+    assert!(
+      !placement.placed_with(&[a], quorum),
+      "one of the new cohort"
+    );
+    assert!(
+      !placement.placed_with(&[b, c], quorum),
+      "none of the old cohort"
+    );
+  }
 
   /// docs/wip/mirroring.md decision 4. Do: assign a promoted object's adoption to a member and to a non-member, report
   /// it adopted by another member, then by its successor. Expect: only the member's assignment and only its own

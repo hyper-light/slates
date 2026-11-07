@@ -418,12 +418,30 @@ async fn answer_after(
         s.count(RELEASED, 1);
       }
     }
+    // `MapSynced` on a live-shipped volume claims that `f` candidates hold the stores (A-200), as every verb that
+    // changes that volume claims: its completion and reply wait with theirs (`crate::live_ship::resolve` delivers it).
+    let live = matches!(reply, ReplyBody::MapSynced { .. })
+      .then_some(sync.held.writer)
+      .flatten()
+      .map(|(volume, _)| crate::verbs::to_db_volume(volume))
+      .and_then(|volume| {
+        crate::live_ship::durable_target(s, volume).map(|target| (volume, target))
+      });
+    if let Some(live) = live {
+      let route = s
+        .direct_map
+        .in_flight
+        .remove(&(request.0, request.1.client, request.1.sequence))
+        .flatten();
+      return crate::live_ship::defer(s, live, request, route, reply)
+        .map(|refusal| (refusal, route, s.shard, None));
+    }
     let (reply, route) = complete(s, request, reply);
     let owed = mark.and_then(|mark| crate::told::owed(s, mark));
-    (reply, route, s.shard, owed)
+    Some((reply, route, s.shard, owed))
   });
   // Delivered after the state's borrow ends, since delivery takes it again.
-  if let Some((reply, Some(route), here, owed)) = answered {
+  if let Some(Some((reply, Some(route), here, owed))) = answered {
     if let Some(owed) = owed {
       let _ = crate::told::wait(owed).await;
     }
@@ -1448,7 +1466,8 @@ mod served {
         crate::held_copy::hold(s, mapping.mapping_id, record, descriptor.as_fd());
       });
     }
-    let delivered = crate::xshard::call_within(
+    // Waited for in the client's shard's own time (R3 class A): a starved shard's hand-off is heard, not given up.
+    let delivered = crate::xshard::call_in_shard_time(
       here,
       home,
       move |s| send_to_client(s, client_id, &descriptor, mapping),
@@ -1486,7 +1505,8 @@ mod served {
       let _counted = crate::state::with_state(|s| s.count(FELL_BACK, 1));
       return refused(Refusal::MapUnavailable);
     };
-    let pid = crate::xshard::call_within(
+    // Waited for in the client's shard's own time (R3 class A), as the Linux hand-off is.
+    let pid = crate::xshard::call_in_shard_time(
       here,
       home,
       move |s| pid_of(s, client_id),

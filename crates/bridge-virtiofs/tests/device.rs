@@ -121,7 +121,7 @@ fn serve(
   let mut pass =
     device.service_queue(queue, &mut driver.memory, bridge, cx, batch, &mut Unlimited)?;
   if pass.barrier_owed {
-    device.complete_awaiting(&mut driver.memory, bridge, cx, true, &mut Unlimited)?;
+    device.complete_awaiting(&mut driver.memory, bridge, cx, (true, None), &mut Unlimited)?;
     pass.served += 1;
     pass.barrier_owed = false;
   }
@@ -766,7 +766,13 @@ fn a_mutations_used_element_waits_for_the_owners_barrier() {
     "no used element before the barrier"
   );
   let completed = device
-    .complete_awaiting(&mut driver.memory, &mut bridge, &cx, false, &mut Unlimited)
+    .complete_awaiting(
+      &mut driver.memory,
+      &mut bridge,
+      &cx,
+      (false, None),
+      &mut Unlimited,
+    )
     .unwrap()
     .unwrap();
   assert!(completed.refused);
@@ -1155,7 +1161,7 @@ fn exchange_charged(
     .unwrap_or_else(|e| panic!("{opcode:?} served: {e}"));
   if pass.barrier_owed {
     device
-      .complete_awaiting(&mut driver.memory, bridge, &cx, true, ledger)
+      .complete_awaiting(&mut driver.memory, bridge, &cx, (true, None), ledger)
       .unwrap();
   }
   let (id, len) = driver.reap(usize::from(queue)).expect("a used element");
@@ -1789,7 +1795,7 @@ mod backed {
             &mut self.driver.memory,
             &mut bridge,
             &self.cx,
-            true,
+            (true, None),
             &mut Unlimited,
           )
           .unwrap();
@@ -1815,7 +1821,7 @@ mod backed {
                 &mut self.driver.memory,
                 &mut bridge,
                 &self.cx,
-                true,
+                (true, None),
                 &mut Unlimited,
               )
               .unwrap();

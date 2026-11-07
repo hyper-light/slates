@@ -168,34 +168,45 @@ fn spin(stop: &AtomicBool) {
   }
 }
 
-/// Shape: the attacks a pressure test makes before it may stop — enough that a race in what they attack had many
-/// chances to open.
+/// Shape: the attacks a pressure test has answered before it may stop — enough that a race in what they attack had
+/// many chances to open.
 const ATTACKS: u64 = 1000;
-/// Shape: how often a pressure test reads its attack count.
+/// Shape: how often a pressure test reads its answered count.
 const ATTACK_POLL: Duration = Duration::from_millis(20);
 
-/// Holds a pressure test's attack on for at least `window`, and on past it until `attempts` exceeds [`ATTACKS`].
-/// Returns `false` only when the count stopped moving for a whole `window`: the attackers made no progress at all,
-/// which is a failure of the thing under test. A busy machine makes them slower, never stopped, so it stretches the
-/// test instead of failing it. A fixed window with a fixed floor failed on four cores at 861 attacks (2026-10-22,
-/// `docs/wip/GAPS.md`), the spinners each test starts per core taking the CPU the attackers needed. The fleet tests'
-/// waits are charged to progress the same way (`tests/fleet.rs`, `poll_until`).
-fn hold_until_enough_attacks(attempts: &AtomicU64, window: Duration) -> bool {
+/// Holds a pressure test's attack on for at least `window`, and on past it until `answered` exceeds [`ATTACKS`].
+/// Returns `false` only when no attack was answered through a whole `window` of the time this thread was itself run on
+/// time: the server stopped answering, which is a failure of the thing under test. A busy machine makes the server
+/// slower, never stopped, so it stretches the test instead of failing it, and the run measures how busy: each poll is
+/// charged only the `ATTACK_POLL` it slept for, never its oversleep, which is the machine's delay in running a thread.
+/// A fixed window with a fixed floor failed on four cores at 861 attacks (2026-10-22, `docs/wip/GAPS.md`), the
+/// spinners each test starts per core taking the CPU the attackers needed. A window of wall time, as long as each
+/// attacker's read timeout, failed with no attack answered yet (2 of 10 runs under two spinners a core on an 18-core
+/// Mac, 2026-11-06; the same assertion failed on `windows-latest` without `--test-threads=1`): the one shard, starved
+/// by the test's own
+/// spinners, answered the first reads late, and this thread overslept 2,013 ms of the 2,136 it waited. Only an answered
+/// read counts: a read that timed out judged nothing, and a window stretched past the attackers' read timeout would let
+/// counted timeouts keep a server that never answers looking busy. With these rules a listener that accepts and never
+/// answers fails the hold (0 answered, 180 unanswered, 21.7 s with the test's own spinners). The fleet tests' waits are
+/// charged to progress the same way (`tests/fleet.rs`, `poll_until`).
+fn hold_until_enough_attacks(answered: &AtomicU64, window: Duration) -> bool {
   let started = Instant::now();
-  let mut seen = attempts.load(Ordering::Relaxed);
-  let mut moved_at = Instant::now();
+  let mut seen = answered.load(Ordering::Relaxed);
+  let mut stalled = Duration::ZERO;
   loop {
+    let asleep = Instant::now();
     #[allow(clippy::disallowed_methods)]
     std::thread::sleep(ATTACK_POLL);
-    let now = attempts.load(Ordering::Relaxed);
+    stalled = stalled.saturating_add(asleep.elapsed().min(ATTACK_POLL));
+    let now = answered.load(Ordering::Relaxed);
     if now != seen {
       seen = now;
-      moved_at = Instant::now();
+      stalled = Duration::ZERO;
     }
     if started.elapsed() >= window && now > ATTACKS {
       return true;
     }
-    if moved_at.elapsed() >= window {
+    if stalled >= window {
       return false;
     }
   }
@@ -1273,8 +1284,8 @@ fn a_symlink_target_naming_a_host_path_is_stored_opaque_and_a_nul_or_overlong_ta
 /// flight — a serial shard still yields at its awaits, so interleavings exist. Many attacker threads hammer two
 /// crafted handles for volume B's secret — one carrying volume A's VALID capability, one a zero capability — while
 /// churn threads reconnect+mount B and write/remove in it (attachment-id and epoch churn), all under a spinner per
-/// core. Expect: across every attempt, B's secret bytes are NEVER returned; the attempt count proves the attackers
-/// actually ran (non-vacuity).
+/// core. Expect: across every attempt, B's secret bytes are NEVER returned; the count of crafted reads the server
+/// answered proves the attack ran (non-vacuity).
 #[test]
 fn a_cross_tenant_craft_never_reads_through_under_contention_and_churn() {
   const SECRET: &[u8] = b"volume B's private bytes, never disclosed to another tenant under churn";
@@ -1317,7 +1328,8 @@ fn a_cross_tenant_craft_never_reads_through_under_contention_and_churn() {
 
   let cores = std::thread::available_parallelism().map_or(1, usize::from);
   let stop = AtomicBool::new(false);
-  let attempts = AtomicU64::new(0);
+  let answered = AtomicU64::new(0);
+  let unanswered = AtomicU64::new(0);
   let leaks = AtomicU64::new(0);
   let progressed = std::thread::scope(|scope| {
     for _ in 0..cores {
@@ -1359,7 +1371,8 @@ fn a_cross_tenant_craft_never_reads_through_under_contention_and_churn() {
     }
     // Attackers: hammer both crafts; B's secret must never come back under any interleaving.
     for _ in 0..cores.max(4) {
-      let (crafts, stop, attempts, leaks) = (&crafts, &stop, &attempts, &leaks);
+      let (crafts, stop, answered, unanswered, leaks) =
+        (&crafts, &stop, &answered, &unanswered, &leaks);
       scope.spawn(move || {
         let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) else {
           return;
@@ -1381,11 +1394,14 @@ fn a_cross_tenant_craft_never_reads_through_under_contention_and_churn() {
               continue;
             }
             match read_reply(&mut s) {
-              Some((0, data)) if data.windows(SECRET.len()).any(|w| w == SECRET) => {
-                leaks.fetch_add(1, Ordering::Relaxed);
+              Some((status, data)) => {
+                if status == 0 && data.windows(SECRET.len()).any(|w| w == SECRET) {
+                  leaks.fetch_add(1, Ordering::Relaxed);
+                }
+                answered.fetch_add(1, Ordering::Relaxed);
               }
-              Some(_) => {}
               None => {
+                unanswered.fetch_add(1, Ordering::Relaxed);
                 let Ok(fresh) = TcpStream::connect(("127.0.0.1", port)) else {
                   return;
                 };
@@ -1393,19 +1409,20 @@ fn a_cross_tenant_craft_never_reads_through_under_contention_and_churn() {
                 let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
               }
             }
-            attempts.fetch_add(1, Ordering::Relaxed);
           }
         }
       });
     }
-    let progressed = hold_until_enough_attacks(&attempts, PRESSURE);
+    let progressed = hold_until_enough_attacks(&answered, PRESSURE);
     stop.store(true, Ordering::Relaxed);
     progressed
   });
-  let total = attempts.load(Ordering::Relaxed);
+  let total = answered.load(Ordering::Relaxed);
   assert!(
     progressed && total > ATTACKS,
-    "non-vacuity: the attackers hammered the crafts many times and never stopped making progress ({total})"
+    "non-vacuity: the server answered the crafts many times and never stopped answering ({total} answered, {} \
+     unanswered)",
+    unanswered.load(Ordering::Relaxed)
   );
   assert_eq!(
     leaks.load(Ordering::Relaxed),
@@ -1423,7 +1440,8 @@ fn a_cross_tenant_craft_never_reads_through_under_contention_and_churn() {
 /// is a typed miss, never a dangling read). Under a spinner per core, three churn threads create and delete files
 /// over a small name set (so inode numbers are freed and reallocated rapidly) while attacker threads hammer a
 /// stale handle's READ. Expect: the stale handle NEVER returns status-0 data — it always misses, however often its
-/// inode number is reused — and never the victim's secret; the attempt count is the non-vacuity evidence.
+/// inode number is reused — and never the victim's secret; the count of stale reads the server answered is the
+/// non-vacuity evidence.
 #[test]
 fn a_stale_handle_never_reads_a_reused_inode_under_churn() {
   const SECRET: &[u8] =
@@ -1451,7 +1469,8 @@ fn a_stale_handle_never_reads_a_reused_inode_under_churn() {
 
   let cores = std::thread::available_parallelism().map_or(1, usize::from);
   let stop = AtomicBool::new(false);
-  let attempts = AtomicU64::new(0);
+  let answered = AtomicU64::new(0);
+  let unanswered = AtomicU64::new(0);
   let resolved = AtomicU64::new(0); // the stale handle returned status-0 (resolved to a reused inode) — a bug
   let secret_leaks = AtomicU64::new(0); // ... and the bytes were the victim's secret
   let progressed = std::thread::scope(|scope| {
@@ -1478,8 +1497,14 @@ fn a_stale_handle_never_reads_a_reused_inode_under_churn() {
     }
     // Attacker: hammer the stale handle; every read must miss. A status-0 read means it resolved to a reused inode.
     for _ in 0..cores.max(2) {
-      let (stale, stop, attempts, resolved, secret_leaks) =
-        (&stale, &stop, &attempts, &resolved, &secret_leaks);
+      let (stale, stop, answered, unanswered, resolved, secret_leaks) = (
+        &stale,
+        &stop,
+        &answered,
+        &unanswered,
+        &resolved,
+        &secret_leaks,
+      );
       scope.spawn(move || {
         let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) else {
           return;
@@ -1500,14 +1525,17 @@ fn a_stale_handle_never_reads_a_reused_inode_under_churn() {
             continue;
           }
           match read_reply(&mut s) {
-            Some((0, data)) => {
-              resolved.fetch_add(1, Ordering::Relaxed);
-              if data.windows(SECRET.len()).any(|w| w == SECRET) {
-                secret_leaks.fetch_add(1, Ordering::Relaxed);
+            Some((status, data)) => {
+              if status == 0 {
+                resolved.fetch_add(1, Ordering::Relaxed);
+                if data.windows(SECRET.len()).any(|w| w == SECRET) {
+                  secret_leaks.fetch_add(1, Ordering::Relaxed);
+                }
               }
+              answered.fetch_add(1, Ordering::Relaxed);
             }
-            Some(_) => {}
             None => {
+              unanswered.fetch_add(1, Ordering::Relaxed);
               let Ok(fresh) = TcpStream::connect(("127.0.0.1", port)) else {
                 return;
               };
@@ -1515,18 +1543,19 @@ fn a_stale_handle_never_reads_a_reused_inode_under_churn() {
               let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
             }
           }
-          attempts.fetch_add(1, Ordering::Relaxed);
         }
       });
     }
-    let progressed = hold_until_enough_attacks(&attempts, PRESSURE);
+    let progressed = hold_until_enough_attacks(&answered, PRESSURE);
     stop.store(true, Ordering::Relaxed);
     progressed
   });
-  let total = attempts.load(Ordering::Relaxed);
+  let total = answered.load(Ordering::Relaxed);
   assert!(
     progressed && total > ATTACKS,
-    "non-vacuity: the attackers hammered the stale handle many times and never stopped making progress ({total})"
+    "non-vacuity: the server answered the stale handle's reads many times and never stopped answering ({total} \
+     answered, {} unanswered)",
+    unanswered.load(Ordering::Relaxed)
   );
   assert_eq!(
     secret_leaks.load(Ordering::Relaxed),

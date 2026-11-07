@@ -28,7 +28,7 @@ use slates_bridge_virtiofs::admission::{
   VmmSeam, admit,
 };
 use slates_bridge_virtiofs::credit::AttachmentCredits;
-use slates_bridge_virtiofs::device::{DeviceConfig, FIRST_REQUEST_QUEUE, FsTag};
+use slates_bridge_virtiofs::device::{DeviceConfig, Durability, FIRST_REQUEST_QUEUE, FsTag};
 use slates_bridge_virtiofs::memory::{GuestMemory, GuestMemoryError, GuestRange};
 use slates_bridge_virtiofs::serve::{
   BridgeAccess, DeviceId, EndReason, ServeEnd, TOLD_ABANDONED, register, request_revoke, serve_loop,
@@ -114,6 +114,15 @@ thread_local! {
   static TOLD_COUNTED: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
   /// The replies the loop counted as still held for the stand-in mount when it ended ([`TOLD_ABANDONED`]).
   static ABANDONED: Cell<u64> = const { Cell::new(0) };
+  /// The position of the stand-in owner's live-shipped log a barrier leaves an `FSYNC` waiting for (A-200); `None`, the
+  /// default, is a volume that is not live-shipped.
+  static DURABLE_OWED: Cell<Option<u64>> = const { Cell::new(None) };
+  /// Where the stand-in log is durable through; `None` before anything is.
+  static DURABLE_AT: Cell<Option<u64>> = const { Cell::new(None) };
+  /// The waits parked on the stand-in log, woken as it becomes durable.
+  static DURABLE_WAKERS: RefCell<Vec<Waker>> = const { RefCell::new(Vec::new()) };
+  /// What the loop counted of its `FSYNC` replies held for durability: released after a wait, and answered `EIO`.
+  static DURABLE_COUNTED: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
   /// When the guest of the guest-kill test hung up, for the loop's task to measure its end from.
   static HUNG_UP: Cell<Option<Instant>> = const { Cell::new(None) };
 }
@@ -152,6 +161,34 @@ impl std::future::Future for StandInTold {
 impl Drop for StandInTold {
   fn drop(&mut self) {
     self.live.fetch_sub(1, Ordering::Relaxed);
+  }
+}
+
+/// The stand-in log's wait for durability at a position.
+struct StandInDurable {
+  target: u64,
+}
+
+impl std::future::Future for StandInDurable {
+  type Output = ();
+
+  fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    if DURABLE_AT
+      .with(Cell::get)
+      .is_some_and(|at| at >= self.target)
+    {
+      return Poll::Ready(());
+    }
+    DURABLE_WAKERS.with(|wakers| wakers.borrow_mut().push(cx.waker().clone()));
+    Poll::Pending
+  }
+}
+
+/// Makes the stand-in log durable through `at` and wakes its waits.
+fn durable_through(at: u64) {
+  DURABLE_AT.with(|durable| durable.set(Some(at)));
+  for waker in DURABLE_WAKERS.with(|wakers| std::mem::take(&mut *wakers.borrow_mut())) {
+    waker.wake();
   }
 }
 
@@ -382,6 +419,35 @@ impl BridgeAccess for OwnedVolume {
     TOLD_COUNTED.with(|counted| {
       let (before_waited, before_overdue) = counted.get();
       counted.set((before_waited + waited, before_overdue + overdue));
+    });
+  }
+
+  fn durable_owed(&mut self) -> Option<u64> {
+    DURABLE_OWED.with(Cell::get)
+  }
+
+  fn durability(&mut self, target: u64) -> Durability {
+    if DURABLE_AT.with(Cell::get).is_some_and(|at| at >= target) {
+      Durability::Durable
+    } else {
+      Durability::Pending
+    }
+  }
+
+  type Durable = StandInDurable;
+
+  fn durable(&mut self, target: u64) -> StandInDurable {
+    StandInDurable { target }
+  }
+
+  fn durable_bound_ns(&mut self) -> u64 {
+    TOLD_BOUND_NS
+  }
+
+  fn durable_settled(&mut self, waited: u64, refused: u64) {
+    DURABLE_COUNTED.with(|counted| {
+      let (before_waited, before_refused) = counted.get();
+      counted.set((before_waited + waited, before_refused + refused));
     });
   }
 }
@@ -1108,4 +1174,132 @@ fn a_daemon_stopped_while_a_guest_writes_reply_waits_leaves_no_wait_behind() {
     end_rx.recv_timeout(Duration::from_millis(1)).is_err(),
     "the loop never ended on its own: the stop took it"
   );
+}
+
+/// Format: `fuse_fsync_in` (`include/uapi/linux/fuse.h`): `fh` (8), `fsync_flags` (4) and padding (4).
+const FSYNC_IN_BYTES: usize = 16;
+
+/// What the guest saw of an `FSYNC` of node `node` with a `READ` sent after it: the `FSYNC`'s errno, how long after it
+/// was sent its element was published, and whether the read's element came first.
+async fn fsync_then_read(
+  node: u64,
+  kick: &OwnedFd,
+  call: &OwnedFd,
+  durable_at: Option<u64>,
+) -> (i32, Duration, bool) {
+  let rq = usize::from(FIRST_REQUEST_QUEUE);
+  let sent = Instant::now();
+  let fsync = with_guest(|g| {
+    g.submit(
+      rq,
+      &message(Opcode::FSync.to_wire(), 1, node, &[0u8; FSYNC_IN_BYTES]),
+      REPLY_CAP,
+      1,
+    )
+  });
+  rustix::io::write(kick, &[1u8]).unwrap();
+  let _ = futures::yield_now().await;
+  let read = with_guest(|g| g.submit(rq, &read_request(2, node), REPLY_CAP, 1));
+  rustix::io::write(kick, &[1u8]).unwrap();
+  notified(call).await;
+  let (first, _) = with_guest(|g| g.reap(rq)).expect("a used element after the notification");
+  if let Some(at) = durable_at {
+    durable_through(at);
+  }
+  let mut published = None;
+  while published.is_none() {
+    if let Some((head, len)) = with_guest(|g| g.reap(rq)) {
+      published = Some((head, len));
+    } else {
+      notified(call).await;
+    }
+  }
+  let (head, len) = published.unwrap();
+  assert_eq!(head, fsync, "the FSYNC's element is the second published");
+  let reply = with_guest(|g| g.reply_of(rq, head, len));
+  (reply_error(&reply), sent.elapsed(), first == read)
+}
+
+/// Runs one guest `FSYNC` (and a `READ` after it) through a loop whose barrier leaves the `FSYNC` waiting for the stand-in
+/// log's position 1, which becomes durable after the read is published when `durable_at` says so: the guest's view
+/// ([`fsync_then_read`]), what the loop counted, and whether it ended on the guest's hangup with its terminal step run.
+fn fsync_on_a_live_volume(durable_at: Option<u64>) -> ((i32, Duration, bool), (u64, u64), bool) {
+  static LIVE: AtomicU64 = AtomicU64::new(0);
+  let rt = Runtime::start(&config()).unwrap();
+  let shard = rt.shard_ids().first().copied().unwrap();
+  let (end_tx, end_rx) = channel::<bool>();
+  let (guest_tx, guest_rx) = channel();
+  rt.spawn_on(shard, async move {
+    let (mut owned, node, _) = OwnedVolume::with_file(&LIVE);
+    DURABLE_OWED.with(|owed| owed.set(Some(1)));
+    DURABLE_AT.with(|at| at.set(None));
+    DURABLE_COUNTED.with(|counted| counted.set((0, 0)));
+    let (admitted, kick_write, call_read) = admitted_over_pipes(&mut owned.registry);
+    let id = register(DEVICE_BOUND).unwrap();
+    let device_task = futures::spawn(async move {
+      let end = serve_loop(id, admitted, owned).await;
+      let _ = end_tx.send(end.why == EndReason::DoorbellHungUp && end.reclaimed.is_ok());
+    })
+    .unwrap();
+    let _ = futures::detach(device_task);
+    let guest_task = futures::spawn(async move {
+      let seen = fsync_then_read(node, &kick_write, &call_read, durable_at).await;
+      let counted = DURABLE_COUNTED.with(Cell::get);
+      drop(kick_write);
+      let _ = guest_tx.send((seen, counted));
+    })
+    .unwrap();
+    let _ = futures::detach(guest_task);
+  })
+  .unwrap();
+  let (seen, counted) = guest_rx.recv_timeout(WAIT).expect("the guest finished");
+  let ended = end_rx.recv_timeout(WAIT).expect("the loop ended");
+  rt.shutdown().unwrap();
+  (seen, counted, ended)
+}
+
+/// A-200 for a guest's `fsync` (§4.6): an `FSYNC` whose barrier published a live-shipped volume claims durability only
+/// once `f` candidates hold the log there. Do: the stand-in owner's barrier leaves the guest's `FSYNC` of `f` waiting for
+/// log position 1, which never becomes durable; the guest reads `f` after it. Expect: the read's element is published
+/// first, while the `FSYNC` waits; the `FSYNC` is answered `EIO` once the bound has passed since it was sent, counted
+/// refused, never `0`; the loop ends cleanly.
+#[test]
+fn a_guests_fsync_of_a_live_volume_never_durable_is_answered_eio_at_the_bound() {
+  let ((errno, after, read_first), counted, ended) = fsync_on_a_live_volume(None);
+  println!("the FSYNC was answered {errno} after {after:?}");
+  assert!(
+    read_first,
+    "the later read is published while the FSYNC waits"
+  );
+  assert_eq!(
+    errno,
+    -rustix::io::Errno::IO.raw_os_error(),
+    "the FSYNC is refused EIO"
+  );
+  assert!(
+    after >= Duration::from_nanos(TOLD_BOUND_NS),
+    "at the bound, not before: {after:?}"
+  );
+  assert_eq!(counted, (0, 1), "counted refused");
+  assert!(ended, "the loop ended on the hangup, its terminal step run");
+}
+
+/// A-200 for a guest's `fsync` (§4.6), its other leg. Do: as above, but the log becomes durable at position 1 once the
+/// read is published. Expect: the read's element first; then the `FSYNC` answered `0`, before the bound, counted as a
+/// reply that waited and was released.
+#[test]
+fn a_guests_fsync_of_a_live_volume_is_answered_once_durable() {
+  let ((errno, after, read_first), counted, ended) = fsync_on_a_live_volume(Some(1));
+  println!("the FSYNC was answered {errno} after {after:?}");
+  assert!(
+    read_first,
+    "the later read is published while the FSYNC waits"
+  );
+  assert_eq!(errno, 0, "the FSYNC succeeds once durable");
+  assert!(
+    after < Duration::from_nanos(TOLD_BOUND_NS),
+    "released by durability, not the bound: {after:?}"
+  );
+  assert_eq!(counted, (1, 0), "counted as waited");
+  assert!(ended, "the loop ended on the hangup, its terminal step run");
 }

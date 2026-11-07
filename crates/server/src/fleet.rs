@@ -1061,8 +1061,9 @@ impl PeerDriver {
 }
 
 /// A serve socket's receive loop as a task, for the daemon's life: it routes every datagram to its session.
-/// The socket refusing ends it, counted (`fleet.serve`), so an operator sees a node that stopped accepting
-/// rather than a mesh that silently never re-forms.
+/// Only the socket gone ends it, counted (`fleet.serve`), so an operator sees a node that stopped accepting
+/// rather than a mesh that silently never re-forms; every other refused receive is counted by its kind
+/// ([`SERVE_RECEIVE_EARLIER_SEND`] and its siblings) and the loop reads on.
 async fn run_demux(demux: DemuxId) {
   if let Err(e) = demux.run().await {
     // Counted for `status`, and said once in the log with its reason: a node that silently stopped
@@ -3889,6 +3890,17 @@ fn spawn_detached(future: impl std::future::Future<Output = ()> + 'static, refus
 /// because the socket refused — the node no longer accepts sessions on that plane.
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 const SERVE_REFUSED: &str = "fleet.serve";
+/// The status refusal counts of the serve sockets' refused receives that did not end their loops, summed over the
+/// planes, one per kind (`slates_rt::error::ReceiveRefusal`; `DemuxCounters::receive_refused_earlier_send` and its
+/// siblings): an earlier send's report, the OS short of memory, anything else.
+/// Format: refusal names in the daemon's status report.
+pub(crate) const SERVE_RECEIVE_EARLIER_SEND: &str = "fleet.serve.receive_refused.earlier_send";
+/// See [`SERVE_RECEIVE_EARLIER_SEND`].
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const SERVE_RECEIVE_RESOURCES: &str = "fleet.serve.receive_refused.resources";
+/// See [`SERVE_RECEIVE_EARLIER_SEND`].
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const SERVE_RECEIVE_OTHER: &str = "fleet.serve.receive_refused.other";
 
 /// A dial still in its handshake dropped at its peer's retirement, so the resume dials afresh at the
 /// peer's current address.
@@ -6572,7 +6584,62 @@ async fn run_record_plane(local: HostId) {
     // the share once done (§4.8 "Promotion and takeover"; the takeover module). The holds and the rounds are
     // this node's (they arrive over this shard's sessions), so this runs here.
     adopt_and_serve(origin, local, budget, &mut in_flight).await;
-    crate::daemon::pace(HEARTBEAT_NS).await;
+    pace_running_merges(
+      origin,
+      &shards,
+      local,
+      budget,
+      &mut owner_acceptor,
+      &mut in_flight,
+    )
+    .await;
+  }
+}
+
+/// Waits out the coordinator's period ([`HEARTBEAT_NS`]), running the merge record plane at once each time an owner
+/// shard nudges it (§4.16 "Commit"; `merge_service::nudge_record_plane`): a version enqueued, or an input or record of
+/// one newly acknowledged. A submit at `f > 0` is answered when its record commits, so its answer waits for the
+/// exchange rather than the period; the council, the root, the seals and the heads keep the period. The merge plane
+/// runs here, on the coordinator, because the owner's acceptor and the holders' sessions are the coordinator's.
+/// Before, each version's inputs were put at one period and its record shipped at the next: one submit at a time on an
+/// idle three-node fleet at `f = 1` took 208 to 647 ms (2026-11-06, the bug record of that day, "a submit at f = 1
+/// waited for the coordinator's period").
+async fn pace_running_merges(
+  origin: u16,
+  shards: &[u16],
+  local: HostId,
+  budget: CommitBudget,
+  owner_acceptor: &mut Acceptor,
+  in_flight: &mut Vec<Dispatch>,
+) {
+  let period_ends = slates_rt::futures::now_ns().saturating_add(HEARTBEAT_NS);
+  loop {
+    let remaining = period_ends.saturating_sub(slates_rt::futures::now_ns());
+    if remaining == 0 {
+      return;
+    }
+    match slates_rt::futures::within(remaining, crate::merge_service::nudged()).await {
+      Ok(Some(())) => {
+        in_flight.retain_mut(|dispatch| !dispatch.settle());
+        for shard in shards.iter().copied() {
+          crate::merge_service::run_merge_period(
+            origin,
+            shard,
+            local,
+            budget,
+            owner_acceptor,
+            in_flight,
+          )
+          .await;
+        }
+      }
+      Ok(None) => return,
+      // The timer refused: the period's own pace counts and reports it, and the loop stops there as before.
+      Err(_) => {
+        crate::daemon::pace(remaining).await;
+        return;
+      }
+    }
   }
 }
 
@@ -6980,6 +7047,17 @@ async fn retire_shard_tombstones(
   for object in retired {
     owner_acceptor.forget_object(object);
     owner_acceptor.forget_object(object.catalog());
+    // The routing forgets the volume too, as a holder's does when it accepts the retirement (`tombstone::on_held`).
+    // A successor that took a destroyed volume over tracks itself its owner (`takeover::record_adoption`); kept after
+    // the retirement, it answered every verb on the volume `Overloaded` as an owned volume not yet materialized, for
+    // good, while the other survivor answered `NotFound` (6 of 6 runs, 2026-11-06, `crates/cli/tests/live_chaos.rs`:
+    // an unanswered destroy, then its owner's loss).
+    let _ = state::with_state(|s| {
+      for register in [object, object.catalog()] {
+        s.fleet.forget_object(register);
+        s.departed_owners.remove(&register);
+      }
+    });
   }
 }
 

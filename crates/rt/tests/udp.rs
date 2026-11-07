@@ -731,3 +731,46 @@ fn a_socket_that_sent_to_a_closed_port_still_receives_from_a_live_peer() {
     "an adopted socket"
   );
 }
+
+/// §4.10a, the receive loops' rule (2026-11-07). Do: make a datagram socket unreadable for good under the runtime —
+/// on Unix replace its descriptor with a pipe's, so it is no socket; on Windows shut it down for receiving — and read
+/// it. Expect a refusal that names the socket gone (`RtError::receive_refusal`), the one kind a receive loop ends on.
+#[test]
+fn a_receive_on_a_socket_that_is_gone_names_it_gone() {
+  let held = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+  #[cfg(unix)]
+  let socket = {
+    use std::os::fd::AsRawFd;
+    let fd = held.as_raw_fd();
+    let socket = UdpSocket::adopt(held.into()).unwrap();
+    let mut ends = [0i32; 2];
+    // SAFETY: `ends` is this frame's own pair of ints, written by the call.
+    assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+    // SAFETY: `fd` is the adopted socket's descriptor, open for the socket's life; replacing it with the pipe's read
+    // end is the test's point, and the adopted socket closes the pipe end it then holds when it drops.
+    assert_eq!(unsafe { libc::dup2(ends[0], fd) }, fd);
+    // SAFETY: the pipe's two original ends, this test's own, closed once.
+    unsafe {
+      libc::close(ends[0]);
+      libc::close(ends[1]);
+    }
+    socket
+  };
+  #[cfg(windows)]
+  let socket = {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{SD_RECEIVE, shutdown};
+    let raw = usize::try_from(held.as_raw_socket()).unwrap();
+    // SAFETY: the held socket's own handle, live for the call.
+    let shut = unsafe { shutdown(raw, SD_RECEIVE) };
+    assert_eq!(shut, 0);
+    UdpSocket::adopt(held.into()).unwrap()
+  };
+  let mut buf = [0u8; 16];
+  let refusal = socket.try_recv_from(&mut buf).unwrap_err();
+  assert_eq!(
+    refusal.receive_refusal(),
+    slates_rt::error::ReceiveRefusal::SocketGone,
+    "{refusal}"
+  );
+}

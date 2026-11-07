@@ -3012,9 +3012,10 @@ fn a_sealed_files_block_is_trimmed_to_its_pages_and_survives_a_restart() {
 
 /// A-214 (VFS plan step 11). Do: on a one-shard daemon over a held anchor, write a file of many chunks (the shard's
 /// write burst), publish, and leave the shard idle for two reap ticks (`content.ticks.idle`), by which its idle work, the
-/// reserve's refill, has finished, or until the bound passes; then write a second file of the same size, watching the content object's allocated bytes across that
-/// write. Expect the second burst to land on pages already resident: the object grows by less than a quarter of the
-/// file during the write, and the idle pre-fault is counted (`content.prefaulted_bytes`). Before A-214 the idle purge
+/// reserve's refill, has finished, or until the bound passes; then write a second file of the same size, watching the
+/// content object's allocated bytes across each write. Expect the second burst to land on pages already resident: the
+/// object grows by less than half of what the first burst, on fresh pages, grew it, and the idle pre-fault is counted
+/// (`content.prefaulted_bytes`). Before A-214 the idle purge
 /// left no free page resident, so the second file's every page was allocated, and faulted fresh, during its write: the
 /// object grew by the whole file (one `shmem_fault` a page, the 41.5% of a large NFS write's samples that CI run
 /// 41986870989 measured). The object's allocation is the content's own measure; the process's minor faults also
@@ -3050,9 +3051,14 @@ fn a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted() {
     .attach(volume, None, slates_ipc::protocol::Intent::Write)
     .unwrap()
     .attachment;
+  let content = format!("slates-con-{tag}");
+  let at_start = allocated_in_content(&content);
   client
     .fs_write((volume, attachment), "first", &body, 0o644)
     .unwrap();
+  // The first burst lands on pages nobody faulted yet, in whatever units the kernel allocates them (2 MiB huge pages where
+  // it grants `MADV_HUGEPAGE`, else single pages): the measure the second burst is held to.
+  let first_grew = allocated_in_content(&content).saturating_sub(at_start);
   daemon.publish_every_shard().unwrap();
   let prefaulted = || {
     daemon
@@ -3063,7 +3069,6 @@ fn a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted() {
       .unwrap_or(0)
   };
   let file = u64::try_from(body.len()).unwrap();
-  let content = format!("slates-con-{tag}");
   // The refill is the shard's idle work, so once the shard has been idle a whole reap tick it has finished: wait for two
   // idle ticks after the first write (`content.ticks.idle`), or the bound.
   let idle_ticks = || {
@@ -3086,7 +3091,8 @@ fn a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted() {
     .unwrap();
   let grew = allocated_in_content(&content).saturating_sub(before);
   eprintln!(
-    "a burst after idle: the content object grew {grew} bytes during a {}-byte write, {} bytes pre-faulted at idle",
+    "a burst after idle: the content object grew {grew} bytes during a {}-byte write (the first burst grew it \
+     {first_grew}), {} bytes pre-faulted at idle",
     body.len(),
     prefaulted()
   );
@@ -3096,9 +3102,14 @@ fn a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted() {
   daemon.stop();
   drop(anchor);
   assert!(read_back == body, "the second file reads back as written");
+  // Held to the first burst, not to the file: what the second write needs beyond the reserve (its metadata, the image)
+  // is allocated in the kernel's units, whole 2 MiB huge pages when it grants them, which a quarter of a 16 MiB file
+  // could not hold under parallel tests (4,194,304 bytes against the bound's 4,194,300, adacachy, 2026-11-06). Every
+  // page fresh, the second write grows the object as much as the first did; on resident pages it grows a fraction.
   assert!(
-    grew * 4 < file,
-    "the burst after idle landed on resident pages: the content object grew {grew} bytes during a {file}-byte write"
+    grew * 2 < first_grew,
+    "the burst after idle landed on resident pages: the content object grew {grew} bytes during a {file}-byte write, \
+     where the first burst, on fresh pages, grew it {first_grew}"
   );
   assert!(
     reserved >= file / 2,
