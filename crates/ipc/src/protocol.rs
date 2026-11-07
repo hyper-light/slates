@@ -1250,6 +1250,11 @@ pub struct LiveReport {
   /// On the owner, the member ids of the set a holder transition is moving to, ascending; empty when none is in
   /// flight, and on a candidate. Appended (2026-11-07).
   pub moving_to: Vec<u64>,
+  /// On the owner, the member ids of the holder set its volume's catalog records (A-240: what a takeover's phase one
+  /// counts), ascending; it can name a transition's target before the shipper activates it. On a candidate, the same
+  /// when the volume is served here (a successor before its first publication); otherwise empty, as when nothing is
+  /// recorded. Appended (2026-11-07).
+  pub recorded: Vec<u64>,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.

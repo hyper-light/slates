@@ -1669,6 +1669,7 @@ pub(crate) fn reports(state: &ShardState) -> Vec<slates_ipc::protocol::LiveRepor
         fence: live.shipper.epoch().0,
         holders: sorted_ids(live.shipper.holders()),
         moving_to: live.shipper.transition().map(sorted_ids).unwrap_or_default(),
+        recorded: recorded_ids(state, *volume),
       });
   let held = state
     .live
@@ -1685,8 +1686,22 @@ pub(crate) fn reports(state: &ShardState) -> Vec<slates_ipc::protocol::LiveRepor
       fence: held.replica.fence().0,
       holders: Vec::new(),
       moving_to: Vec::new(),
+      recorded: recorded_ids(state, object.0),
     });
   shipping.chain(held).collect()
+}
+
+/// The member ids of the holder set `volume`'s catalog records (A-240), ascending; empty when it records none.
+fn recorded_ids(state: &ShardState, volume: [u8; 16]) -> Vec<u64> {
+  let mut ids: Vec<u64> = state
+    .db
+    .partition()
+    .volume(slates_db::catalog::VolumeId { bytes: volume })
+    .and_then(|record| record.policy.live_holders.as_ref())
+    .map(|recorded| recorded.holders.clone())
+    .unwrap_or_default();
+  ids.sort_unstable();
+  ids
 }
 
 /// `hosts`' member ids, ascending.

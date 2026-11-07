@@ -2636,7 +2636,7 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
     ));
     for live in &shard.live {
       out.push_str(&format!(
-        "shard {} live {} {} head={} durable={} owed={} epoch={} identity={} fence={} holders={} moving_to={}\n",
+        "shard {} live {} {} head={} durable={} owed={} epoch={} identity={} fence={} holders={} moving_to={} recorded={}\n",
         shard.partition,
         if live.holding { "held" } else { "shipping" },
         volume_id_text(live.volume),
@@ -2647,7 +2647,8 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
         option_text(live.head_identity.as_ref().map(hex32)),
         live.fence,
         id_list_text(&live.holders),
-        id_list_text(&live.moving_to)
+        id_list_text(&live.moving_to),
+        id_list_text(&live.recorded)
       ));
     }
     if let Some(batch) = telemetry
