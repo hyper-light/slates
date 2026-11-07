@@ -2397,3 +2397,61 @@ fn clients_cut_off_mid_merge_leave_the_green_whole_across_a_takeover() {
   drop(fleet);
   verdict.judge();
 }
+
+/// §4.8 "Membership" with an anchored daemon succeeded (raft-chaos report 8): do start an anchored three-node fleet, let
+/// it settle, then SIGKILL one candidate's daemon so that its anchor starts a successor under a fresh member identity.
+/// Expect the fleet to re-form within the fleet wait: every node holding three members alive with both peers probed, the
+/// successor voting and in the committed configuration, with a record session to each peer. Reported 2026-11-06: the
+/// successor answered in 0.3-0.9 s but held three members with no peer probed for the whole wait, while each other node
+/// held two members and one peer.
+#[test]
+fn a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet() {
+  if !gated("succeeded-rejoins") {
+    return;
+  }
+  let fleet = Fleet::start("rejoins", Supervision::Anchored);
+  let owner_index = fleet.owner_index();
+  let killed_index = fleet.others(owner_index)[0];
+  let began = Instant::now();
+  let successor = fleet.kill_daemon_and_await_successor(killed_index);
+  eprintln!(
+    "rejoins: successor daemon {successor} answered after {:?}",
+    began.elapsed()
+  );
+  let deadline = Instant::now() + FLEET_WAIT;
+  loop {
+    let views: Vec<_> = fleet
+      .instances
+      .iter()
+      .map(|instance| fleet_view(instance))
+      .collect();
+    let formed = views.iter().all(|view| {
+      view
+        .as_ref()
+        .is_some_and(|(_, members, probed)| *members == FLEET_NODES.len() && *probed == 2)
+    });
+    if formed {
+      break;
+    }
+    if Instant::now() >= deadline {
+      for instance in &fleet.instances {
+        let (_, out, _) = run(instance, &["status"]);
+        let lines: Vec<&str> = out
+          .lines()
+          .filter(|line| {
+            line.starts_with("fleet_")
+              || line.contains(" refused fleet.")
+              || line.contains(" refused member")
+              || line.contains(" refused probe")
+          })
+          .filter(|line| !line.contains("_base_periods") && !line.contains("_rtt_") && !line.contains("_priority"))
+          .collect();
+        eprintln!("rejoins --- {instance}\n{}", lines.join("\n"));
+      }
+      panic!("the fleet re-formed after the successor: {views:?}");
+    }
+    pause();
+  }
+  fleet.wait_rejoined();
+  eprintln!("rejoins: the fleet re-formed after {:?}", began.elapsed());
+}

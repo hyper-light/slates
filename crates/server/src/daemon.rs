@@ -3387,6 +3387,7 @@ fn init_shard(
     staging: crate::staging::Staging::default(),
     member_boot_nonce: incarnation,
     learned_members: std::collections::BTreeMap::new(),
+    returned_members: std::collections::BTreeMap::new(),
     authenticated_members: std::collections::BTreeSet::new(),
     council_death_watch: std::collections::BTreeMap::new(),
     discovery: None,
