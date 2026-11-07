@@ -14294,9 +14294,14 @@ Mac, binaries built on `d61c3be2`):
   ends. `a_stopped_daemon_does_not_say_its_control_loop_ended` (`crates/server/tests/liveness.rs`) stops a daemon
   while a poll holds a shard for three beats, in a child process whose standard error it reads: 3 of 3 said it before
   the fix, 10 of 10 under two spinners a core did not after (adacachy).
-- Found with them, not fixed here: when an honest client's thread panics,
-  `a_mount_survives_connections_broken_and_tampered_mid_call_under_load` never lowers its stop flags, so its breakers
-  and spinners run on and the scope never ends. One run hung for 36 minutes at load ~100 until stopped by hand.
+- Found with them, and fixed after: when an honest client's thread panicked,
+  `a_mount_survives_connections_broken_and_tampered_mid_call_under_load` never lowered its stop flags, so its breakers
+  and spinners ran on and the scope never ended. One run hung for 36 minutes at load ~100 until stopped by hand. Its
+  scope body lowered them on its last line; four more scopes in the file did the same after an `expect` or `unwrap`.
+  Each now sets `LowerOnDrop` at its top, which lowers them however the body ends. Red first:
+  `a_scope_whose_body_panics_still_stops_its_spinners` timed out at its 10 s bound with the guard made a no-op; and with
+  a panic injected into one honest client, the test failed in 12.85 s, where main's ran on past a 120 s bound
+  (adacachy).
 
 ### 2026-11-07: a daemon killed inside its profile's republication refused every successor — fixed
 
