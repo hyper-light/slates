@@ -1,0 +1,103 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 01:24:42 UTC 2026, commit 43a399f7
+== fix quiet round 1 at 01:24:42
+a bootstrap with its control shard starved: Ok(Acknowledged) after 1.503438935s
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.000576085s
+a host root listing with a starved shard: accept status 0 after 1.503110572s
+a revoke with a starved shard: Ok(Revoked) after 1.502885649s
+a revoke with a wedged shard: Err(Refused(NotFound)) after 1.000627178s
+an attest with its record's shard starved: Ok(Attested) after 1.503085482s
+an NFS state call to a starved owner: Err(10025) after 1.503008856s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.96s
+== fix quiet round 2 at 01:24:56
+a bootstrap with its control shard starved: Ok(Acknowledged) after 1.503452057s
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.000780546s
+a host root listing with a starved shard: accept status 0 after 1.503465899s
+a revoke with a starved shard: Ok(Revoked) after 1.50304622s
+a revoke with a wedged shard: Err(Refused(NotFound)) after 1.000825594s
+an attest with its record's shard starved: Ok(Attested) after 1.502949102s
+an NFS state call to a starved owner: Err(10025) after 1.502917026s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.96s
+== fix quiet round 3 at 01:25:10
+a bootstrap with its control shard starved: Ok(Acknowledged) after 1.503271796s
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.000577429s
+a host root listing with a starved shard: accept status 0 after 1.503238824s
+a revoke with a starved shard: Ok(Revoked) after 1.502941283s
+a revoke with a wedged shard: Err(Refused(NotFound)) after 1.000573124s
+an attest with its record's shard starved: Ok(Attested) after 1.502794206s
+an NFS state call to a starved owner: Err(10025) after 1.502882709s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.95s
+== fix busy (two spinners a CPU) round 1 at 01:25:24
+a bootstrap with its control shard starved: Ok(Acknowledged) after 1.50301812s
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.007818499s
+a host root listing with a starved shard: accept status 0 after 1.502676836s
+a revoke with a starved shard: Ok(Revoked) after 1.509026755s
+a revoke with a wedged shard: Err(Refused(NotFound)) after 1.011021416s
+an attest with its record's shard starved: Ok(Attested) after 1.525091208s
+an NFS state call to a starved owner: Err(10025) after 1.548021714s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.28s
+== fix busy (two spinners a CPU) round 2 at 01:25:40
+a bootstrap with its control shard starved: Ok(Acknowledged) after 1.521014771s
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.009964818s
+a host root listing with a starved shard: accept status 0 after 1.512070341s
+a revoke with a starved shard: Ok(Revoked) after 1.516104366s
+a revoke with a wedged shard: Err(Refused(NotFound)) after 1.005011016s
+an attest with its record's shard starved: Ok(Attested) after 1.512091467s
+an NFS state call to a starved owner: Err(10025) after 1.507031764s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.50s
+== fix busy (two spinners a CPU) round 3 at 01:25:56
+a bootstrap with its control shard starved: Ok(Acknowledged) after 1.541544508s
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.006029198s
+a host root listing with a starved shard: accept status 0 after 1.518785398s
+a revoke with a starved shard: Ok(Revoked) after 1.525980461s
+a revoke with a wedged shard: Err(Refused(NotFound)) after 1.004018101s
+an attest with its record's shard starved: Ok(Attested) after 1.532022342s
+an NFS state call to a starved owner: Err(10025) after 1.519011062s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.52s
+== cargo clippy --locked -p slates-server --test cross_shard_wait -- -D warnings
+== exit 0
+== cargo test --locked -q -p slates-server --test observe --test nfs_writeback --test nfs_hostile
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.11s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.18s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.90s
+== exit 0
+== cargo test --locked -q -p slates-server --test recovery
+test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 35.46s
+== exit 0
+== cargo test --locked -q -p slates-server --test liveness -- --test-threads=1
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.83s
+== exit 0
+== main's server sources (d61c3be2), the test unchanged: every starved case must fail
+== main quiet round 1 at 01:28:12
+a bootstrap with its control shard starved: Err(Refused(Overloaded { shard: 0 })) after 1.001363536s
+thread 'a_bootstrap_whose_control_shard_is_starved_is_acknowledged_past_a_wall_window' (9270) panicked at crates/server/tests/cross_shard_wait.rs:213:3:
+a starved control shard's bootstrap was lost after 1.001363536s: Err(Refused(Overloaded { shard: 0 }))
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.001059774s
+a host root listing with a starved shard: accept status 5 after 1.041312471s
+thread 'a_host_root_listing_with_a_starved_shard_lists_past_a_wall_window' (9286) panicked at crates/server/tests/cross_shard_wait.rs:545:3:
+a revoke with a starved shard: Err(Refused(NotFound)) after 1.00076472s
+thread 'a_revoke_with_a_starved_shard_is_revoked_past_a_wall_window' (9291) panicked at crates/server/tests/cross_shard_wait.rs:320:3:
+a starved shard's revocation was lost after 1.00076472s: Err(Refused(NotFound))
+a revoke with a wedged shard: Err(Refused(NotFound)) after 1.000906848s
+an attest with its record's shard starved: Err(Refused(NotFound)) after 1.001100071s
+thread 'an_attest_whose_record_shard_is_starved_is_attested_past_a_wall_window' (9301) panicked at crates/server/tests/cross_shard_wait.rs:379:3:
+a starved shard's attestation was lost after 1.001100071s: Err(Refused(NotFound))
+an NFS state call to a starved owner: Err(10008) after 1.041232754s
+thread 'an_nfs_state_call_to_a_starved_owner_hears_its_answer_past_a_wall_window' (9306) panicked at crates/server/tests/cross_shard_wait.rs:475:3:
+test result: FAILED. 2 passed; 5 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.96s
+== main quiet round 2 at 01:28:47
+a bootstrap with its control shard starved: Err(Refused(Overloaded { shard: 0 })) after 1.000710713s
+thread 'a_bootstrap_whose_control_shard_is_starved_is_acknowledged_past_a_wall_window' (9324) panicked at crates/server/tests/cross_shard_wait.rs:213:3:
+a starved control shard's bootstrap was lost after 1.000710713s: Err(Refused(Overloaded { shard: 0 }))
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.000526957s
+a host root listing with a starved shard: accept status 5 after 1.040869196s
+thread 'a_host_root_listing_with_a_starved_shard_lists_past_a_wall_window' (9340) panicked at crates/server/tests/cross_shard_wait.rs:545:3:
+a revoke with a starved shard: Err(Refused(NotFound)) after 1.000698791s
+thread 'a_revoke_with_a_starved_shard_is_revoked_past_a_wall_window' (9345) panicked at crates/server/tests/cross_shard_wait.rs:320:3:
+a starved shard's revocation was lost after 1.000698791s: Err(Refused(NotFound))
+a revoke with a wedged shard: Err(Refused(NotFound)) after 1.000708825s
+an attest with its record's shard starved: Err(Refused(NotFound)) after 1.000964387s
+thread 'an_attest_whose_record_shard_is_starved_is_attested_past_a_wall_window' (9356) panicked at crates/server/tests/cross_shard_wait.rs:379:3:
+a starved shard's attestation was lost after 1.000964387s: Err(Refused(NotFound))
+an NFS state call to a starved owner: Err(10008) after 1.042101045s
+thread 'an_nfs_state_call_to_a_starved_owner_hears_its_answer_past_a_wall_window' (9362) panicked at crates/server/tests/cross_shard_wait.rs:475:3:
+test result: FAILED. 2 passed; 5 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.95s
