@@ -1,0 +1,27 @@
+tested f7b79d92b83b9da6d845e12f6fb694bdcb4de982 variant after on aarch64, 4 cpus
+model exit 0 22s
+  model: test a_snapshot_is_due_only_once_the_tail_took_the_budget_and_reached_the_floor ... ok
+  model: test hostile_records_are_refused_without_a_panic ... ok
+  model: test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.26s
+cadence exit 0 5s
+  cadence: check 1: a tail of 4684 bytes replayed in 2463304 ns at the median
+  cadence: check 2: a tail of 7060 bytes replayed in 2612394 ns at the median; the commits measured 855331 ns
+  cadence: check 3: a tail of 10444 bytes replayed in 2846342 ns at the median; the commits measured 1254240 ns
+  cadence: budget 10000000 ns: tail 84672 bytes, 9986168 ns of replay work as the commits measured it (8 bytes/us), floor 226 bytes; replayed 84672 bytes; recoveries [6273619, 6036894, 6032142, 6023055, 6018399] ns, median 6032142 ns (14 bytes/us), 603 per mille of the budget
+  cadence: test a_fresh_partitions_longest_tail_replays_within_its_recovery_budget ... ok
+  cadence: check 4: a tail of 15052 bytes replayed in 3192431 ns at the median; the commits measured 1795287 ns
+  cadence: check 5: a tail of 20956 bytes replayed in 3582157 ns at the median; the commits measured 2500054 ns
+  cadence: check 6: a tail of 28300 bytes replayed in 4096726 ns at the median; the commits measured 3369410 ns
+  cadence: check 7: a tail of 36940 bytes replayed in 4691779 ns at the median; the commits measured 4384931 ns
+  cadence: check 8: a tail of 46804 bytes replayed in 5391651 ns at the median; the commits measured 5551982 ns
+  cadence: check 9: a tail of 57676 bytes replayed in 6157096 ns at the median; the commits measured 6850978 ns
+  cadence: check 10: a tail of 69412 bytes replayed in 6996298 ns at the median; the commits measured 8238787 ns
+  cadence: check 11: a tail of 81868 bytes replayed in 7862955 ns at the median; the commits measured 9708498 ns
+  cadence: budget 10000000 ns: the small records' tail checked (bytes, median ns): [(4684, 2463304), (7060, 2612394), (10444, 2846342), (15052, 3192431), (20956, 3582157), (28300, 4096726), (36940, 4691779), (46804, 5391651), (57676, 6157096), (69412, 6996298), (81868, 7862955)]; snapshot after 84240 bytes of them
+  cadence: test a_tail_whose_records_change_size_still_replays_within_its_recovery_budget ... ok
+  cadence: ring 67108864: partition 8388983 bytes; 16777224 bytes of log in 233017 records; snapshots wrote 8388983 bytes; tail Tail { bytes: 8414352, replay_ns: 984920187 }, floor 8388983 bytes, longest snapshot 141836460 ns
+  cadence: ring 8388608: partition 8388983 bytes; 16777224 bytes of log in 233017 records; snapshots wrote 16777966 bytes; tail Tail { bytes: 262440, replay_ns: 30752848 }, floor 8388983 bytes, longest snapshot 138439238 ns
+  cadence: test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.61s
+clippy exit 0 61s
+  clippy:   Downloaded ring v0.17.14
+  clippy: warning: aws-lc-sys@0.45.0: Target platform: 'aarch64-unknown-linux-gnu'
