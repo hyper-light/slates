@@ -3053,9 +3053,26 @@ fn hold_start(fault: crate::config::BootFault) {
     // tests): the boot tests' `Stuck` fault, never set in a deployment.
     #[allow(clippy::disallowed_methods)]
     crate::config::BootFaultKind::Stuck => std::thread::sleep(duration),
+    // A long recovery needs CPU, so the fault spins until its thread has run the whole time on the CPU, read from the
+    // shard's own thread clock: on a busy machine a wall-timed spin got about 4% of a CPU and never ran a window of it
+    // (2026-11-07). Where the thread has no clock, the wall stands in.
     crate::config::BootFaultKind::Busy => {
+      let cpu = || {
+        registry::current_shard()
+          .and_then(registry::holder_of)
+          .and_then(registry::shard_cpu)
+          .map(|reading| reading.spent_ns)
+      };
       let started = std::time::Instant::now();
-      while started.elapsed() < duration {
+      let started_cpu = cpu();
+      loop {
+        let spent = match (started_cpu, cpu()) {
+          (Some(from), Some(now)) => std::time::Duration::from_nanos(now.saturating_sub(from)),
+          _ => started.elapsed(),
+        };
+        if spent >= duration {
+          break;
+        }
         std::hint::spin_loop();
       }
     }
