@@ -3220,6 +3220,19 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     detector_relays: detector_relay_report(state),
     registry_attachments: u64::try_from(state.attachments.live()).unwrap_or(u64::MAX),
     live: crate::live_ship::reports(state),
+    snapshots: snapshot_report(state.db.stats()),
+  }
+}
+
+/// A partition's snapshot figures as the status report carries them (A-243).
+fn snapshot_report(stats: slates_db::replay::DbStats) -> slates_ipc::protocol::DbSnapshotReport {
+  slates_ipc::protocol::DbSnapshotReport {
+    snapshots: stats.snapshots,
+    bytes_written: stats.snapshot_bytes_written,
+    longest_ns: stats.snapshot_ns_max,
+    log_bytes_appended: stats.log_bytes_appended,
+    bytes_between: stats.bytes_between_snapshots,
+    apply_bytes_per_us: stats.apply_bytes_per_us,
   }
 }
 

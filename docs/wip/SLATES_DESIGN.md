@@ -5497,6 +5497,16 @@ snapshot's record and content are acknowledged there; elapsed time includes any 
 content transfer and quorum acknowledgement, not a guaranteed single WAN round trip. Region loss promotes the mirror through the root group at operator cadence; the loss
 window is the mirror lag at that moment, zero for every operation that awaited the mirror.
 
+> **Status (2026-11-07, A-243: a partition's snapshot cadence follows the partition).** The cadence was derived once at
+> boot from the replay throughput recovery measured. A daemon booted fresh replayed nothing, took one byte a
+> microsecond, and re-encoded its whole partition every 1 MB of log for its whole life: at 10,000 works the green's
+> owner shard spent about 1,800 of 2,241 samples doing it. At every snapshot the cadence is now re-derived as
+> `max(budget × the apply throughput measured since the last snapshot, the snapshot's size)` (`SnapshotPolicy::at_snapshot`),
+> so snapshot work stays within about twice the log it absorbs, whatever the partition's size, and `slates status`
+> shows each shard's snapshots, their bytes and longest duration, the log appended, the cadence and the measured rate.
+> Recovery's bound changes with it (the paragraph below). The snapshot still runs whole on the committing shard's
+> turn; slicing it is owed. (`docs/bugs/2026-11-07-a-partitions-snapshot-cadence-never-left-its-boot-guess.md`.)
+
 **Recovery.** Node restart: the anchor segment replays the local log and `put_wal` into fresh
 indexes; the node rejoins with a new ephemeral id (a restart is a join); its owned objects are
 taken over by its neighbours after the membership horizon. A **warm** restart, with the anchor
@@ -5505,7 +5515,11 @@ its shard's recovery image carrying the put is committed into anchor-owned RAM, 
 the image's replicas again, re-verified, before the node serves (A-51). A whole-anchor loss is the
 RAM-fault case; that node holds nothing for others until re-replication fills it. RAMCloud's recovery-time budget is a reference, not a Slates result;
 metadata takeover uses a configuration decision and phase-one exchange. A read may additionally
-need content fetch and a confirmed lease; measure that complete recovery boundary.
+need content fetch and a confirmed lease; measure that complete recovery boundary. A partition's own part is decoding
+its last snapshot and replaying the log after it, and the log between snapshots is at most
+`max(recovery budget × measured apply throughput, the last snapshot's size)` (A-243). So local recovery holds the
+budget while a partition's snapshot decodes within it, and is bounded by about twice its own snapshot's cost once the
+partition outgrows it.
 
 **Failure matrix.** A candidate holder slow: Masked (the hedge completes the put elsewhere;
 the slow holder goes on probation after the derived count and the group replaces it). Fewer than
@@ -7983,7 +7997,8 @@ SDKs.
    daemon (start, restart on exit, hand back held fds later in Phase 3/4).
 2. Partition data model and indexes; the op log in the segment; replay on start; snapshots of
    partition state into the segment on a cadence derived from measured replay throughput and the
-   recovery budget.
+   recovery budget (since A-243 re-derived at every snapshot from the measured apply throughput, and never shorter
+   than the snapshot's own size).
 3. Rendezvous per OS; ring regions; wake words; the completion fd; peer authentication.
 4. The lifecycle verbs of Part 4.4 through the server, with completion records (exactly-once),
    leases with epochs, attachments (client form only), quotas fed by the real pressure sources.
@@ -14235,6 +14250,37 @@ green's base, the other half of the load test's first finding, is A-202's.
 - **Unchanged:** a work's state is owner-local and lost with its host (D-18's host boundary), not placed at f + 1.
 - **Cost (measured on the branch it comes from):** every edit now appends to the partition log, so the partition's
   snapshots come at the rate edits arrive.
+
+### A-243 — A partition's snapshot cadence is re-derived at every snapshot, from the measured apply throughput and the snapshot's own size (accepted and built 2026-11-07, the 10,000-client rung's snapshot wall; raft agreed)
+
+Applied in the same change to:
+- §4.8: its status and the Recovery paragraph's bound.
+- Phase 2 task 2's cadence.
+- GAPS: the load-test blockquote.
+- `crates/db/src/replay.rs`: `SnapshotPolicy::at_snapshot`, `DbStats`, `Db::stats`, the timed apply, `set_policy`
+  pinning.
+- `crates/ipc` (`ShardReport::snapshots`, `DbSnapshotReport`), `crates/server` (`shard_report`) and `crates/cli`
+  (`slates status`).
+- The test `crates/db/tests/snapshot_cadence.rs`.
+- **What was there.**
+  - `bytes_between_snapshots = budget × replay throughput`, measured once at boot.
+  - A fresh boot replayed nothing, took 1 B/µs, and kept a 1 MB cadence for life.
+  - Each snapshot re-encodes the whole partition, so snapshot work was partition size / 1 MB per byte of log.
+- **The rule.**
+  - At every snapshot, `bytes_between_snapshots = max(budget × apply throughput, snapshot size)`.
+  - The apply throughput is measured live: the partition's apply, timed around each commit's apply (the work replay
+    repeats), over the log bytes since the last snapshot; the boot replay's rate stands until one is measured.
+  - The second term is the doubling rule, so snapshot work stays within about twice the log written.
+  - The decision is the commit's, never the apply's: replay sees no clock.
+  - A cadence a caller sets is pinned.
+  - A log ring smaller than the cadence still forces a snapshot when full; at a ring about the partition's size the
+    same bound holds (tested).
+  - Recovery is bounded by decode(P) + replay(max(budget bytes, P)): the budget while P fits it, about twice P's own
+    cost beyond (raft's request that the change be stated).
+- **Measured.** The bug record.
+- **Owed.**
+  - The snapshot runs whole on the committing shard's turn (an 8 MiB encode stalls it; `longest_ns` names it).
+  - An incremental snapshot for partitions far past the budget.
 
 ### A-242 — A green's content history is copy-on-write, and an increment's post-state holds only the runs it adds (accepted and built 2026-11-07, W2 of the load test's walls)
 
