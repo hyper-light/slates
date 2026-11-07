@@ -1,0 +1,45 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 13:35:51 UTC 2026, tree R 86012d108a1e329ff31e4ed52f85135e2e766f54
+live fsync: healthy Ok(()); candidates stopped Ok(()) after 284.157µs; resumed Ok(()); owner's live counters {"appended": 4, "durable": 4, "no_session": 2, "whole": 2}
+thread 'a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it' (6103) panicked at crates/cli/tests/live_fleet.rs:1611:3:
+assertion `left == right` failed: an fsync no candidate can hold fails EIO, not success: Ok(())
+== run 1 a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it exit 101 load 1.84 1.62 0.72
+live changes: 200 writes: {"appended": 201, "durable": 201, "no_session": 6, "resolved": 201, "whole": 1}
+== run 1 a_live_volumes_writes_ship_their_changes_not_the_volume exit 0 load 2.65 1.79 0.78
+live fsync: healthy Ok(()); candidates stopped Err(Os { code: 5, kind: Uncategorized, message: "Input/output error" }) after 1.006003173s; resumed Ok(()); owner's live counters {"appended": 4, "durable": 4, "link_lost": 2, "no_session": 49, "unanswered": 50, "whole": 1}
+== run 2 a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it exit 0 load 3.32 1.95 0.84
+live changes: 200 writes: {"appended": 201, "durable": 201, "no_session": 5, "resolved": 201, "whole": 1}
+== run 2 a_live_volumes_writes_ship_their_changes_not_the_volume exit 0 load 3.32 1.95 0.84
+live fsync: healthy Ok(()); candidates stopped Err(Os { code: 5, kind: Uncategorized, message: "Input/output error" }) after 1.00204391s; resumed Ok(()); owner's live counters {"appended": 4, "durable": 4, "link_lost": 1, "no_session": 28, "unanswered": 18, "whole": 1}
+== run 3 a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it exit 0 load 4.42 2.20 0.92
+live changes: 200 writes: {"appended": 201, "durable": 201, "no_session": 4, "resolved": 201, "whole": 1}
+== run 3 a_live_volumes_writes_ship_their_changes_not_the_volume exit 0 load 5.50 2.46 1.01
+live fsync: healthy Ok(()); candidates stopped Err(Os { code: 5, kind: Uncategorized, message: "Input/output error" }) after 1.001469321s; resumed Ok(()); owner's live counters {"appended": 4, "durable": 4, "link_lost": 1, "no_session": 21, "unanswered": 14, "whole": 1}
+== run 4 a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it exit 0 load 6.02 2.62 1.07
+live changes: 200 writes: {"appended": 201, "durable": 201, "no_session": 17, "resolved": 201, "whole": 1}
+== run 4 a_live_volumes_writes_ship_their_changes_not_the_volume exit 0 load 6.02 2.62 1.07
+live fsync: healthy Ok(()); candidates stopped Err(Os { code: 5, kind: Uncategorized, message: "Input/output error" }) after 1.001000569s; resumed Ok(()); owner's live counters {"appended": 4, "durable": 4, "no_session": 17, "whole": 1}
+== run 5 a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it exit 0 load 6.74 2.82 1.15
+live changes: 200 writes: {"appended": 201, "durable": 201, "no_session": 9, "resolved": 201, "whole": 1}
+== run 5 a_live_volumes_writes_ship_their_changes_not_the_volume exit 0 load 7.08 2.96 1.20
+live fsync: healthy Ok(()); candidates stopped Err(Os { code: 5, kind: Uncategorized, message: "Input/output error" }) after 1.002006605s; resumed Ok(()); owner's live counters {"appended": 5, "durable": 4, "link_lost": 2, "no_session": 29, "unanswered": 25, "whole": 2}
+== run 6 a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it exit 0 load 7.24 3.06 1.24
+live changes: 200 writes: {"appended": 201, "durable": 201, "no_session": 3, "resolved": 201, "whole": 1}
+== run 6 a_live_volumes_writes_ship_their_changes_not_the_volume exit 0 load 7.24 3.06 1.24
+live fsync: healthy Ok(()); candidates stopped Err(Os { code: 5, kind: Uncategorized, message: "Input/output error" }) after 1.004978197s; resumed Ok(()); owner's live counters {"appended": 4, "durable": 4, "link_lost": 2, "no_session": 58, "unanswered": 60, "whole": 1}
+== run 7 a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it exit 0 load 8.10 3.31 1.33
+live changes: 200 writes: {"appended": 202, "durable": 202, "no_session": 17, "resolved": 201, "whole": 2}
+thread 'a_live_volumes_writes_ship_their_changes_not_the_volume' (7587) panicked at crates/cli/tests/live_fleet.rs:1350:3:
+assertion `left == right` failed: only the log's first record is whole: {"appended": 202, "durable": 202, "no_session": 17, "resolved": 201, "whole": 2}
+== run 7 a_live_volumes_writes_ship_their_changes_not_the_volume exit 101 load 8.57 3.49 1.40
+live fsync: healthy Ok(()); candidates stopped Err(Os { code: 5, kind: Uncategorized, message: "Input/output error" }) after 1.000473446s; resumed Ok(()); owner's live counters {"appended": 4, "durable": 4, "no_session": 20, "unanswered": 3, "whole": 1}
+== run 8 a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it exit 0 load 8.93 3.64 1.47
+live changes: 200 writes: {"appended": 201, "durable": 201, "no_session": 5, "resolved": 201, "whole": 1}
+== run 8 a_live_volumes_writes_ship_their_changes_not_the_volume exit 0 load 9.09 3.77 1.52
+live fsync: healthy Ok(()); candidates stopped Err(Os { code: 5, kind: Uncategorized, message: "Input/output error" }) after 1.001691924s; resumed Ok(()); owner's live counters {"appended": 5, "durable": 4, "link_lost": 1, "no_session": 17, "unanswered": 17, "whole": 2}
+== run 9 a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it exit 0 load 9.09 3.77 1.52
+live changes: 200 writes: {"appended": 201, "durable": 201, "no_session": 19, "resolved": 201, "whole": 1}
+== run 9 a_live_volumes_writes_ship_their_changes_not_the_volume exit 0 load 9.25 3.89 1.57
+live fsync: healthy Ok(()); candidates stopped Err(Os { code: 5, kind: Uncategorized, message: "Input/output error" }) after 1.00090257s; resumed Ok(()); owner's live counters {"appended": 4, "durable": 4, "no_session": 13, "whole": 1}
+== run 10 a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it exit 0 load 9.95 4.12 1.66
+live changes: 200 writes: {"appended": 201, "durable": 201, "no_session": 8, "resolved": 201, "whole": 1}
+== run 10 a_live_volumes_writes_ship_their_changes_not_the_volume exit 0 load 10.19 4.27 1.72
