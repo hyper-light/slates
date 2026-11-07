@@ -48,6 +48,31 @@ impl SnapshotPolicy {
       ["recovery_budget_ns", "replay_bytes_per_us"]
     )
   }
+
+  /// Derived after a snapshot of `snapshot_bytes` took `snapshot_ns` to encode and publish (A-243): the bytes that
+  /// throughput covers inside the recovery budget, and never fewer than the snapshot's own size. The first term is the
+  /// boot policy's, measured where a fresh partition has nothing to replay; the second is the doubling rule, so a
+  /// snapshot is taken only once the log has absorbed what it costs and snapshot work stays within about twice the log
+  /// written, whatever the partition's size. Re-derived at every snapshot, so the cadence follows the partition.
+  pub fn after_snapshot(
+    recovery_budget_ns: u64,
+    snapshot_bytes: u64,
+    snapshot_ns: u64,
+  ) -> Derived<SnapshotPolicy> {
+    let budget_us = recovery_budget_ns / NS_PER_US;
+    let bytes_per_us = snapshot_bytes
+      .saturating_mul(NS_PER_US)
+      .checked_div(snapshot_ns)
+      .unwrap_or(0)
+      .max(1);
+    derived!(
+      SnapshotPolicy {
+        bytes_between_snapshots: budget_us.saturating_mul(bytes_per_us).max(snapshot_bytes),
+      },
+      "bytes_between_snapshots = max((recovery_budget_ns / 1000) * snapshot_bytes_per_us, snapshot_bytes)",
+      ["recovery_budget_ns", "snapshot_bytes", "snapshot_ns"]
+    )
+  }
 }
 
 /// What recovery found.
@@ -90,9 +115,17 @@ pub struct Db {
   log: LogRing,
   next_seq: u64,
   policy: SnapshotPolicy,
+  /// Whether `policy` was set by the caller ([`Db::set_policy`]) and stays, rather than re-derived at every snapshot
+  /// ([`SnapshotPolicy::after_snapshot`]).
+  policy_pinned: bool,
   since_snapshot_bytes: u64,
   next_slot: u8,
   snapshots_taken: u64,
+  /// The bytes the snapshots taken since recovery wrote: with `log_bytes_appended`, the measure of what snapshots cost
+  /// against the log they absorb (A-243's non-vacuity count).
+  snapshot_bytes_written: u64,
+  /// The log bytes appended since recovery.
+  log_bytes_appended: u64,
   /// Operations applied since `begin`, waiting to go into one record at `commit`.
   pending: Option<Vec<Op>>,
   /// The clock the last mutation ran at: the time a partition re-derived on a rolled-back
@@ -184,9 +217,12 @@ pub fn recover(
     log,
     next_seq: recovered.next_seq,
     policy,
+    policy_pinned: false,
     since_snapshot_bytes: replayed.bytes,
     next_slot: snapshot.map_or(0, |(slot, _)| other_slot(slot)),
     snapshots_taken: 0,
+    snapshot_bytes_written: 0,
+    log_bytes_appended: 0,
     pending: None,
     last_now_ns: now_ns,
     rollbacks: 0,
@@ -269,14 +305,26 @@ impl Db {
     self.policy
   }
 
-  /// Sets the policy (the caller re-derives it after a measured replay).
+  /// Sets the policy and pins it: the snapshots after it keep this cadence rather than re-derive one (a test that
+  /// drives snapshots at a chosen rate; a caller that measured its own replay).
   pub fn set_policy(&mut self, policy: SnapshotPolicy) {
     self.policy = policy;
+    self.policy_pinned = true;
   }
 
   /// Snapshots taken since recovery.
   pub fn snapshots_taken(&self) -> u64 {
     self.snapshots_taken
+  }
+
+  /// The bytes the snapshots taken since recovery wrote.
+  pub fn snapshot_bytes_written(&self) -> u64 {
+    self.snapshot_bytes_written
+  }
+
+  /// The log bytes appended since recovery.
+  pub fn log_bytes_appended(&self) -> u64 {
+    self.log_bytes_appended
   }
 
   /// Guard, append, apply: the mutation is durable in the segment when this returns; a reply
@@ -311,6 +359,7 @@ impl Db {
     self.partition.apply(op)?;
     self.next_seq = seq.saturating_add(1);
     self.since_snapshot_bytes = self.since_snapshot_bytes.saturating_add(bytes);
+    self.log_bytes_appended = self.log_bytes_appended.saturating_add(bytes);
     self.maintain(segment);
     Ok(seq)
   }
@@ -376,6 +425,7 @@ impl Db {
     };
     self.next_seq = seq.saturating_add(1);
     self.since_snapshot_bytes = self.since_snapshot_bytes.saturating_add(bytes);
+    self.log_bytes_appended = self.log_bytes_appended.saturating_add(bytes);
     self.maintain(segment);
     Ok(Some(seq))
   }
@@ -463,15 +513,21 @@ impl Db {
   /// Publishes the partition into the alternate snapshot slot and trims the log behind it.
   pub fn snapshot(&mut self, segment: &mut AnchorSegment) -> Result<(), DbError> {
     let seq = self.next_seq.saturating_sub(1);
+    let started = Instant::now();
     let snapshot = self.partition.to_snapshot(seq);
-    segment.publish(
-      RegionKind::Snapshot(self.index, self.next_slot),
-      &snapshot.to_bytes(),
-    )?;
+    let bytes = snapshot.to_bytes();
+    segment.publish(RegionKind::Snapshot(self.index, self.next_slot), &bytes)?;
+    let snapshot_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if !self.policy_pinned {
+      let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+      self.policy =
+        SnapshotPolicy::after_snapshot(RECOVERY_BUDGET_NS, snapshot_bytes, elapsed).get();
+    }
     self.log.trim(segment, self.next_seq)?;
     self.next_slot = other_slot(self.next_slot);
     self.since_snapshot_bytes = 0;
     self.snapshots_taken = self.snapshots_taken.saturating_add(1);
+    self.snapshot_bytes_written = self.snapshot_bytes_written.saturating_add(snapshot_bytes);
     Ok(())
   }
 
