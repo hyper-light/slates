@@ -87,6 +87,14 @@
 >   `docs/bugs/2026-11-07-a-partitions-snapshot-cadence-never-left-its-boot-guess.md`). The local 10k rung went from
 >   2,197 to 3,128 clients done in 900 s. Still owed: the snapshot is encoded whole on the committing shard's turn.
 >
+> - **A held request kept every later completion of its client** (found 2026-11-07 by fixtures' `f = 1` rungs, and
+>   the quiet arm's 10k backpressure). The acknowledgement was one watermark, which stopped below the lowest id still
+>   owed, so one submit held for its resend kept all its client's later records, and past `2 × slots` the owner
+>   refused the client's next requests `AcknowledgementOwed`: 906,317 against 59,646 served on fixtures' 1k owner
+>   shard, 2.46 million at the 10k. An acknowledgement now names the ids still owed and every partition releases the
+>   rest; an owed id closes once and never reopens (§4.9's status; red on both Linux runners, run 42396554623: refused
+>   at the 64th edit past a held submit; `docs/bugs/2026-11-07-a-held-request-kept-every-later-completion-of-its-client.md`).
+>
 > - **A kept forward waited for another request** (found 2026-11-07, the 10k stall). A forward refused by its owner
 >   shard's full control channel was kept, but the serve loop idled until a ring woke it, so a shard whose clients
 >   all waited on kept forwards slept until some other request came. While a forward is kept, the loop now idles at
