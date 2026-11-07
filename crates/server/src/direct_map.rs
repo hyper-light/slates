@@ -457,13 +457,10 @@ async fn deliver_to(route: ReplyRoute, reply: ReplyBody, here: u16) {
     crate::state::deliver(route.client_index, route.request, reply, true);
     return;
   }
-  let delivery = slates_rt::task::SpawnRequest::new(
-    Box::pin(async move {
-      crate::state::deliver(route.client_index, route.request, reply, true);
-    }),
-    None,
-  );
-  crate::xshard::send_back(route.shard, delivery).await;
+  crate::xshard::send_reply_home(route.shard, move || {
+    crate::state::deliver(route.client_index, route.request, reply, true);
+  })
+  .await;
 }
 
 /// Writes back every writable map the dead client `client_id` holds on this shard (§4.6, A-186, A-188), before its reap

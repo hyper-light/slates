@@ -23,11 +23,8 @@
 //! (`fleet.forward.lane_full`), never queued. The session's own stream credit bounds the open exchanges, and a
 //! forward past it waits queued (`Backlogged`, refused typed by the endpoint) until a stream frees. Each forwarder
 //! bounds its own wait: the batch is given up once none of its forwards has made progress for its stall budget,
-//! where progress is a reply completed or bytes of one of its own replies read. Its open exchanges are abandoned on
-//! the next turn and its queued ones dropped. Until 2026-11-07 progress was any byte the session consumed while a
-//! forward was open: a session busy with other replies kept a forward its owner never answered alive for good (298 in
-//! fixtures' 1,000-client primary-kill rung, the owner unable to commit and the session full of `LeaseUnconfirmed`
-//! replies), so the origin's resend and its `OwnerUnreachable` never came.
+//! where progress is a reply completed or bytes consumed on the session while one of them was open. Its open
+//! exchanges are abandoned on the next turn and its queued ones dropped.
 //!
 //! **What a session change does.** An exchange is tied to the session it was begun on (its connection id). If the
 //! link replaced the session meanwhile, the forward is answered as unanswered, as a forward cut off by its session's
@@ -80,10 +77,8 @@ struct Ticket {
   forwarder: u64,
   request: Vec<u8>,
   stage: Stage,
-  /// When it last made progress: queued, begun, or bytes of its own reply read while it was open.
+  /// When it last made progress: queued, begun, or bytes consumed on its session while it was open.
   progress_ns: u64,
-  /// The bytes of its reply read when its progress was last marked ([`mark_progress`]).
-  reply_bytes: usize,
 }
 
 /// One peer's forwards.
@@ -162,7 +157,6 @@ fn enqueue(peer: HostId, requests: &[Vec<u8>]) -> Option<(u64, Vec<u64>)> {
           request: request.clone(),
           stage: Stage::Queued,
           progress_ns: now,
-          reply_bytes: 0,
         },
       );
       lane.queued.push_back(*ticket);
@@ -466,7 +460,7 @@ async fn turn(peer: HostId, left_ns: u64) -> Turn {
   let progressed = endpoint.bytes_consumed() != consumed;
   any_reply |= settle(peer, &mut endpoint, session);
   if progressed {
-    mark_progress(peer, &mut endpoint, session);
+    mark_progress(peer, session);
   }
   crate::fleet::return_sessions(vec![(peer, endpoint)]);
   match driven {
@@ -614,26 +608,13 @@ fn wake_answered(lane: &mut Lane) -> (bool, u64) {
   (any, woken)
 }
 
-/// Marks each forward open on `session` whose own reply has more bytes read than when it was last marked as having made
-/// progress now. Bytes the session consumed for other exchanges are not this forward's progress.
-fn mark_progress(peer: HostId, endpoint: &mut Endpoint, session: Option<ConnectionId>) {
+/// Marks every forward open on `session` as having made progress now (bytes were consumed on it).
+fn mark_progress(peer: HostId, session: Option<ConnectionId>) {
   let now = futures::now_ns();
   let _ = state::with_state(|s| {
     if let Some(lane) = s.forward_lanes.lanes.get_mut(&peer) {
       for ticket in lane.tickets.values_mut() {
-        let Stage::Open {
-          exchange,
-          session: on,
-        } = ticket.stage
-        else {
-          continue;
-        };
-        if Some(on) != session {
-          continue;
-        }
-        let read = endpoint.reply_bytes_read(exchange).unwrap_or(0);
-        if read > ticket.reply_bytes {
-          ticket.reply_bytes = read;
+        if matches!(ticket.stage, Stage::Open { session: on, .. } if Some(on) == session) {
           ticket.progress_ns = now;
         }
       }
