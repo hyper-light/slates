@@ -1,0 +1,121 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 14:02:07 UTC 2026, head 656120b4f4eee1b61adb2704930bee0c3931956d
+== run 1 at 14:02:07, load 1.64 1.79 0.87
+chaos: fleet kill-at-ack (Bare) formed and settled: hosts ["16363435855185440511", "4825044447869909860", "11652043835823428995"]
+chaos a write answered the instant before its owner dies: iteration 0 (ClientWrite): chaos-kill-at-ack-a-6372 served the probe 2.006920302s after the owner's death
+thread '<unnamed>' (6590) panicked at crates/cli/tests/live_chaos.rs:3244:10:
+chaos a write answered the instant before its owner dies:
+  iteration 0 (ClientWrite): chaos-kill-at-ack-a-6372 served the probe 2.006920302s after the owner's death
+  NoLoss, iteration 0 (earlier files): held
+  every write answered, iteration 1 (NfsFileSync): 1 violations
+thread 'a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor' (6373) panicked at crates/cli/tests/live_chaos.rs:1055:5:
+chaos a write answered the instant before its owner dies: every write answered, iteration 1 (NfsFileSync): a write on chaos-kill-at-ack-c-6372 was not answered within the fleet wait:
+--- chaos-kill-at-ack-a-6372 (status exit 0; live Some([LiveState { holding: true, head: Some(1), durable: None, owed: false, epoch: Some(1), identity: Some("54bf5b9a9dc0ca5c57593f50a0f1b7e6631c7530f281afa34ae951fc5e5f1750"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  fleet_members: 4825044447869909860 16363435855185440511 17836081310755117616
+  fleet_session 4825044447869909860: lent=false cwnd=130934 srtt_ns=109214 pto_ns=1109214 spurious_losses=0 persistent_collapses=0 consumed=52426 mtu=65496
+  fleet_session 17836081310755117616: lent=false cwnd=130934 srtt_ns=105007 pto_ns=1105007 spurious_losses=0 persistent_collapses=0 consumed=1991 mtu=65496
+  shard 0 refused fleet.live.appended: 1
+  shard 0 refused fleet.live.durable: 1
+  shard 0 refused fleet.live.held: 3
+  shard 0 refused fleet.live.holders_activated: 1
+  shard 0 refused fleet.live.holders_recorded: 2
+  shard 0 refused fleet.live.holders_transition: 1
+  shard 0 refused fleet.live.install_bytes: 40068
+  shard 0 refused fleet.live.install_sent: 1
+  shard 0 refused fleet.live.no_session: 1
+  shard 0 refused fleet.live.taken_over: 1
+  shard 0 refused fleet.live.whole: 1
+  shard 0 refused fleet.takeover.adopted: 2
+  shard 0 refused fleet.takeover.stale_configuration: 2
+  shard 0 live shipping a1b460222d891583000000000000003b head=0 durable=0 owed=false epoch=2 identity=a341cc06b54d5843faef59acd809eb3d16134b1e28eaad8585193e59dd5121bd fence=2 holders=4825044447869909860,17836081310755117616 moving_to=none recorded=4825044447869909860
+  shard 0 live held a1b460222d891583000000000000003b head=0 durable=none owed=false epoch=1 identity=f85e0c4d96e44a376fdc11cd8f39e0a48b8a2c28a3ce4a0d8022363e28ee4e17 fence=2 holders=none moving_to=none recorded=4825044447869909860
+  shard 0 live held f7867d73d88ada30000100000000001f head=1 durable=none owed=false epoch=1 identity=54bf5b9a9dc0ca5c57593f50a0f1b7e6631c7530f281afa34ae951fc5e5f1750 fence=1 holders=none moving_to=none recorded=none
+--- chaos-kill-at-ack-b-6372 (status exit 0; live Some([LiveState { holding: true, head: Some(1), durable: None, owed: false, epoch: Some(1), identity: Some("54bf5b9a9dc0ca5c57593f50a0f1b7e6631c7530f281afa34ae951fc5e5f1750"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  fleet_members: 4825044447869909860 16363435855185440511 17836081310755117616
+  fleet_session 16363435855185440511: lent=false cwnd=130934 srtt_ns=111453 pto_ns=1111453 spurious_losses=0 persistent_collapses=0 consumed=47086 mtu=65496
+  fleet_session 17836081310755117616: lent=false cwnd=130934 srtt_ns=129632 pto_ns=1129632 spurious_losses=0 persistent_collapses=0 consumed=42284 mtu=65496
+  shard 0 refused fleet.live.fetched: 1
+  shard 0 refused fleet.live.held: 12
+  shard 0 refused fleet.live.hold_refused: 1
+  shard 0 refused fleet.live.hold_refused.behind: 1
+  shard 0 refused fleet.live.reported: 1
+  shard 0 live held a1b460222d891583000000000000003b head=0 durable=none owed=false epoch=2 identity=a341cc06b54d5843faef59acd809eb3d16134b1e28eaad8585193e59dd5121bd fence=2 holders=none moving_to=none recorded=none
+  shard 0 live held f7867d73d88ada30000100000000001f head=1 durable=none owed=false epoch=1 identity=54bf5b9a9dc0ca5c57593f50a0f1b7e6631c7530f281afa34ae951fc5e5f1750 fence=1 holders=none moving_to=none recorded=none
+--- chaos-kill-at-ack-c-6372 (status exit 0; live Some([LiveState { holding: false, head: Some(1), durable: Some(1), owed: false, epoch: Some(1), identity: Some("54bf5b9a9dc0ca5c57593f50a0f1b7e6631c7530f281afa34ae951fc5e5f1750"), fence: 1, holders: ["4825044447869909860", "16363435855185440511"], moving_to: [], recorded: ["4825044447869909860", "16363435855185440511"] }])):
+  fleet_members: 4825044447869909860 16363435855185440511 17836081310755117616
+  fleet_session 4825044447869909860: lent=false cwnd=130934 srtt_ns=116818 pto_ns=1116818 spurious_losses=0 persistent_collapses=0 consumed=6394 mtu=65496
+  fleet_session 16363435855185440511: lent=false cwnd=130934 srtt_ns=91925 pto_ns=1091925 spurious_losses=0 persistent_collapses=0 consumed=6348 mtu=65496
+  shard 0 refused fleet.live.held: 1
+  shard 0 refused fleet.live.no_session: 1
+  shard 0 live held a1b460222d891583000000000000003b head=0 durable=none owed=false epoch=2 identity=a341cc06b54d5843faef59acd809eb3d16134b1e28eaad8585193e59dd5121bd fence=2 holders=none moving_to=none recorded=none
+  shard 1 refused fleet.live.appended: 2
+  shard 1 refused fleet.live.awaited: 1
+  shard 1 refused fleet.live.durable: 2
+  shard 1 refused fleet.live.held_back.keys: 392
+  shard 1 refused fleet.live.held_back.placement: 1
+  shard 1 refused fleet.live.holders_recorded: 1
+  shard 1 refused fleet.live.whole: 1
+  shard 1 live shipping f7867d73d88ada30000100000000001f head=1 durable=1 owed=false epoch=1 identity=54bf5b9a9dc0ca5c57593f50a0f1b7e6631c7530f281afa34ae951fc5e5f1750 fence=1 holders=4825044447869909860,16363435855185440511 moving_to=none recorded=4825044447869909860,16363435855185440511
+FAILED
+    a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 47.26s
+== run 1 exit 101
+== run 2 at 14:02:55, load 0.82 1.56 0.84
+chaos: fleet kill-at-ack (Bare) formed and settled: hosts ["9976003419696406214", "13425120137747281766", "16207382635657325136"]
+chaos a write answered the instant before its owner dies: iteration 0 (ClientWrite): chaos-kill-at-ack-a-6628 served the probe 2.161727871s after the owner's death
+thread '<unnamed>' (6971) panicked at crates/cli/tests/live_chaos.rs:3244:10:
+chaos a write answered the instant before its owner dies:
+  iteration 0 (ClientWrite): chaos-kill-at-ack-a-6628 served the probe 2.161727871s after the owner's death
+  NoLoss, iteration 0 (earlier files): held
+  every write answered, iteration 1 (NfsFileSync): 1 violations
+thread 'a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor' (6629) panicked at crates/cli/tests/live_chaos.rs:1055:5:
+chaos a write answered the instant before its owner dies: every write answered, iteration 1 (NfsFileSync): a write on chaos-kill-at-ack-b-6628 was not answered within the fleet wait:
+--- chaos-kill-at-ack-a-6628 (status exit 0; live Some([LiveState { holding: true, head: Some(1), durable: None, owed: false, epoch: Some(1), identity: Some("7a88968147e8b1c6a04fc141c208aaa67def44bf487f9db0e583d13bbd9f9131"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  fleet_members: 9976003419696406214 16207382635657325136 18052451447259793263
+  fleet_session 16207382635657325136: lent=false cwnd=130934 srtt_ns=103063 pto_ns=1103063 spurious_losses=0 persistent_collapses=0 consumed=89651 mtu=65496
+  fleet_session 18052451447259793263: lent=false cwnd=130934 srtt_ns=144622 pto_ns=1144622 spurious_losses=0 persistent_collapses=0 consumed=42272 mtu=65496
+  shard 0 refused fleet.live.fetched: 1
+  shard 0 refused fleet.live.held: 12
+  shard 0 refused fleet.live.hold_refused: 1
+  shard 0 refused fleet.live.hold_refused.behind: 1
+  shard 0 refused fleet.live.reported: 1
+  shard 0 live held ba4f9ba2cd5eb7660000000000000087 head=0 durable=none owed=false epoch=2 identity=3db5e5b5d0d09ec042627d989fb64652d40206abd281e92e5ba6431e7d9bd3e5 fence=2 holders=none moving_to=none recorded=none
+  shard 0 live held fa8730f1fee8076f0001000000000023 head=1 durable=none owed=false epoch=1 identity=7a88968147e8b1c6a04fc141c208aaa67def44bf487f9db0e583d13bbd9f9131 fence=1 holders=none moving_to=none recorded=none
+--- chaos-kill-at-ack-b-6628 (status exit 0; live Some([LiveState { holding: false, head: Some(1), durable: Some(1), owed: false, epoch: Some(1), identity: Some("7a88968147e8b1c6a04fc141c208aaa67def44bf487f9db0e583d13bbd9f9131"), fence: 1, holders: ["9976003419696406214", "16207382635657325136"], moving_to: [], recorded: ["9976003419696406214", "16207382635657325136"] }])):
+  fleet_members: 9976003419696406214 16207382635657325136 18052451447259793263
+  fleet_session 9976003419696406214: lent=false cwnd=130934 srtt_ns=114082 pto_ns=1114082 spurious_losses=0 persistent_collapses=0 consumed=6330 mtu=65496
+  fleet_session 16207382635657325136: lent=false cwnd=130934 srtt_ns=91463 pto_ns=1091463 spurious_losses=0 persistent_collapses=0 consumed=6408 mtu=65496
+  shard 0 refused fleet.live.held: 1
+  shard 0 refused fleet.live.no_session: 1
+  shard 0 live held ba4f9ba2cd5eb7660000000000000087 head=0 durable=none owed=false epoch=2 identity=3db5e5b5d0d09ec042627d989fb64652d40206abd281e92e5ba6431e7d9bd3e5 fence=2 holders=none moving_to=none recorded=none
+  shard 1 refused fleet.live.appended: 2
+  shard 1 refused fleet.live.awaited: 1
+  shard 1 refused fleet.live.durable: 2
+  shard 1 refused fleet.live.held_back.keys: 392
+  shard 1 refused fleet.live.held_back.placement: 1
+  shard 1 refused fleet.live.holders_recorded: 1
+  shard 1 refused fleet.live.whole: 1
+  shard 1 live shipping fa8730f1fee8076f0001000000000023 head=1 durable=1 owed=false epoch=1 identity=7a88968147e8b1c6a04fc141c208aaa67def44bf487f9db0e583d13bbd9f9131 fence=1 holders=9976003419696406214,16207382635657325136 moving_to=none recorded=9976003419696406214,16207382635657325136
+--- chaos-kill-at-ack-c-6628 (status exit 0; live Some([LiveState { holding: true, head: Some(1), durable: None, owed: false, epoch: Some(1), identity: Some("7a88968147e8b1c6a04fc141c208aaa67def44bf487f9db0e583d13bbd9f9131"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  fleet_members: 9976003419696406214 16207382635657325136 18052451447259793263
+  fleet_session 9976003419696406214: lent=false cwnd=130934 srtt_ns=124381 pto_ns=1124381 spurious_losses=0 persistent_collapses=0 consumed=48593 mtu=65496
+  fleet_session 18052451447259793263: lent=false cwnd=130934 srtt_ns=117174 pto_ns=1117174 spurious_losses=0 persistent_collapses=0 consumed=2043 mtu=65496
+  shard 0 refused fleet.live.appended: 1
+  shard 0 refused fleet.live.durable: 1
+  shard 0 refused fleet.live.held: 11
+  shard 0 refused fleet.live.holders_activated: 1
+  shard 0 refused fleet.live.holders_recorded: 2
+  shard 0 refused fleet.live.holders_transition: 1
+  shard 0 refused fleet.live.install_bytes: 40068
+  shard 0 refused fleet.live.install_sent: 1
+  shard 0 refused fleet.live.no_session: 1
+  shard 0 refused fleet.live.taken_over: 1
+  shard 0 refused fleet.live.whole: 1
+  shard 0 refused fleet.takeover.adopted: 2
+  shard 0 refused fleet.takeover.stale_configuration: 2
+  shard 0 live shipping ba4f9ba2cd5eb7660000000000000087 head=0 durable=0 owed=false epoch=2 identity=3db5e5b5d0d09ec042627d989fb64652d40206abd281e92e5ba6431e7d9bd3e5 fence=2 holders=9976003419696406214,18052451447259793263 moving_to=none recorded=9976003419696406214
+  shard 0 live held ba4f9ba2cd5eb7660000000000000087 head=8 durable=none owed=false epoch=1 identity=57db35b059823387a5e223873c233c14b9aec75f6ed9878d95870b3c9a676a01 fence=2 holders=none moving_to=none recorded=9976003419696406214
+  shard 0 live held fa8730f1fee8076f0001000000000023 head=1 durable=none owed=false epoch=1 identity=7a88968147e8b1c6a04fc141c208aaa67def44bf487f9db0e583d13bbd9f9131 fence=1 holders=none moving_to=none recorded=none
+FAILED
+    a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 48.24s
+== run 2 exit 101
