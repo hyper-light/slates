@@ -1,0 +1,241 @@
+runner windows-11-arm, 4 CPUs, 76b838e diag: liveness-15 on b5603105: the anchor suite x3, held_rendezvous x3 o, Sat Nov  7 09:23:11 UTC 2026
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_PREBUILT_NASM': '0'
+warning: aws-lc-sys@0.45.0: Value: 0 is false.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'aarch64-pc-windows-msvc'
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CC_aarch64_pc_windows_msvc': 'clang-cl'
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CC_aarch64_pc_windows_msvc': 'clang-cl'
+warning: aws-lc-sys@0.45.0: Setting CC_aarch64_pc_windows_msvc: clang-cl
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CXX_aarch64_pc_windows_msvc': 'clang-cl'
+warning: aws-lc-sys@0.45.0: Setting CXX_aarch64_pc_windows_msvc: clang-cl
+warning: aws-lc-sys@0.45.0: C:\a\slates\slates\vendor\AWS-LC~2\aws-lc\tests\compiler_features_tests\stdalign_check.c(12,14): error: unused parameter 'argc' [-Werror,-Wunused-parameter]
+warning: aws-lc-sys@0.45.0:    12 | int main(int argc, char **argv) {
+warning: aws-lc-sys@0.45.0:       |              ^
+warning: aws-lc-sys@0.45.0: C:\a\slates\slates\vendor\AWS-LC~2\aws-lc\tests\compiler_features_tests\stdalign_check.c(12,27): error: unused parameter 'argv' [-Werror,-Wunused-parameter]
+warning: aws-lc-sys@0.45.0:    12 | int main(int argc, char **argv) {
+warning: aws-lc-sys@0.45.0:       |                           ^
+== clippy exit 0
+== spinners: 8
+test process_clock::tests::a_process_that_runs_shows_its_cpu_rise ... ok
+test profile::tests::a_profile_whose_wake_was_not_measured_is_refused ... ok
+test wake::tests::a_budget_too_short_for_its_rounds_extends_to_the_full_probe_budget ... ok
+test wake::tests::a_probe_whose_waiter_runs_measures_past_the_wall_and_one_whose_waiter_never_runs_refuses ... ok
+test wake::tests::a_round_past_the_wall_gets_a_window_and_doubles_to_the_longest_round ... ok
+test wake::tests::rounds_in_two_modes_disagree_and_rounds_of_one_do_not ... ok
+test wake::tests::a_probe_that_measured_no_wake_refuses_rather_than_report_a_mean ... ok
+test wake::tests::the_estimate_window_follows_the_probes_spread ... ok
+test wake::tests::the_online_estimate_tracks_the_mean_without_rounding_drift ... ok
+test wake::tests::the_pairs_follow_the_runtimes_shard_placement ... ok
+test wake::tests::a_wake_is_a_confirmed_sleepers_wake_on_the_production_placement ... ok
+test profile::tests::a_refused_wake_re_measure_keeps_the_measured_wake ... ok
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 49 filtered out; finished in 2.57s
+== machine exit 0 in 5 s
+test handles::tests::a_changed_message_is_refused_before_a_handle_is_selected ... ok
+test handles::tests::a_hold_encodes_to_its_golden_bytes ... ok
+test handles::tests::a_hold_outside_the_shapes_is_refused_at_encoding ... ok
+test handles::tests::a_refusal_is_logged_once_and_the_lines_stay_bounded ... ok
+test handles::tests::every_message_round_trips ... ok
+test handles::tests::hostile_environments_are_refused ... ok
+test handles::tests::hostile_messages_are_refused ... ok
+test handles::tests::one_inherited_handle_cannot_have_two_owners ... ok
+test handles::tests::the_environment_round_trips ... ok
+test held_windows::tests::a_hold_duplicates_handles_and_the_handoff_names_them ... ok
+test held_windows::tests::a_value_that_will_not_duplicate_is_refused ... ok
+test held_windows::tests::releasing_one_entry_keeps_the_other_available_for_the_successor ... ok
+test held_windows::tests::the_bound_and_a_duplicate_id_are_refused ... ok
+test held_windows::tests::the_channel_carries_a_hold_and_its_answer ... ok
+test layout::tests::every_region_is_found_at_its_place_in_the_layout_and_no_other ... ok
+test layout::tests::regions_are_page_aligned_and_disjoint_and_the_geometry_round_trips ... ok
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.99s
+test a_crash_loop_is_restarted_after_a_doubling_backoff_never_given_up ... 
+test a_crashing_daemon_is_restarted_until_the_derived_bound_and_the_segment_says_so ... 
+test a_daemon_that_never_acknowledges_a_stop_is_killed_after_the_liveness_budget ... 
+test a_daemon_whose_heartbeat_lapses_while_stopping_is_killed_before_its_declared_deadline ... 
+test a_delayed_child_and_its_restart_beat_in_the_anchors_clock_domain ... 
+test a_graceful_stop_waits_for_the_daemon_to_drain_and_exit_without_a_kill ... 
+test a_pool_extent_is_claimed_by_one_partition_and_released_only_by_it ... ok
+test a_published_sealing_root_is_adopted_by_a_later_attachment ... ok
+test a_segment_is_created_attached_and_read_through_the_seqlock ... ok
+test a_segment_with_process_relative_deadlines_is_refused_before_recovery ... ok
+test deaf_stopping_child ... ignored, a stopping child; run by a_daemon_that_never_acknowledges_... with --ignored
+test graceful_stopping_child ... ignored, a stopping child; run by a_graceful_stop_... with --ignored
+test host_clock_heartbeat_child ... ignored, heartbeat child; invoked by the supervision history
+test oversize_payloads_foreign_identities_and_wrong_lengths_are_refused ... ok
+test racing_claimants_take_each_pool_extent_exactly_once_and_the_claims_outlive_the_mapping ... ok
+test supervised_child ... ignored, the supervised child; run by a_crashing_daemon_... with --ignored
+test the_content_object_survives_a_daemon_restart_through_the_handoff ... ok
+test the_restart_policy_derives_from_the_recovery_budget ... ok
+test wedged_stopping_child ... ignored, a stopping child; run by a_daemon_whose_heartbeat_lapses_... with --ignored
+test result: ok. 14 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 4.74s
+test a_held_handle_outlives_its_sender_and_is_inherited_by_the_successor ... 
+test a_hold_is_answered_at_its_channels_wake_not_at_the_supervisors_pause ... 
+test a_malformed_hold_message_is_refused_and_counted_and_supervision_goes_on ... 
+test a_read_tells_no_message_from_a_message_of_no_bytes_and_refuses_a_long_one ... ok
+test alternating_role ... ignored, the alternating hold fixture; run by its parent
+test an_oversized_hold_message_is_refused_and_counted_and_supervision_goes_on ... 
+test anchor_role ... ignored, the anchor whose log is read; run by its parent
+test checker_role ... ignored, the hold channel checker; run by the parent with --ignored
+test every_refusal_is_counted_and_the_log_says_each_kind_once ... ok
+test garbling_role ... ignored, the garbling hold fixture; run by its parent
+test gone_role ... ignored, the hold channel gone-checker; run by the parent with --ignored
+test oversizing_role ... ignored, the oversizing hold fixture; run by its parent
+test prompt_role ... ignored, the prompt hold fixture; run by its parent
+test sender_role ... ignored, the hold channel sender; run by the parent with --ignored
+test supervised_role ... ignored, the supervised hold fixture; run by its parent
+test the_supervisor_acknowledges_the_hold_before_commit_and_hands_it_to_its_successor ... 
+test without_the_hold_the_object_dies_with_its_sender ... 
+test result: ok. 8 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out; finished in 4.59s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== anchor run 1 exit 0 in 14 s
+test handles::tests::a_changed_message_is_refused_before_a_handle_is_selected ... ok
+test handles::tests::a_hold_encodes_to_its_golden_bytes ... ok
+test handles::tests::a_hold_outside_the_shapes_is_refused_at_encoding ... ok
+test handles::tests::a_refusal_is_logged_once_and_the_lines_stay_bounded ... ok
+test handles::tests::every_message_round_trips ... ok
+test handles::tests::hostile_environments_are_refused ... ok
+test handles::tests::hostile_messages_are_refused ... ok
+test handles::tests::one_inherited_handle_cannot_have_two_owners ... ok
+test handles::tests::the_environment_round_trips ... ok
+test held_windows::tests::a_hold_duplicates_handles_and_the_handoff_names_them ... ok
+test held_windows::tests::a_value_that_will_not_duplicate_is_refused ... ok
+test held_windows::tests::releasing_one_entry_keeps_the_other_available_for_the_successor ... ok
+test held_windows::tests::the_bound_and_a_duplicate_id_are_refused ... ok
+test held_windows::tests::the_channel_carries_a_hold_and_its_answer ... ok
+test layout::tests::every_region_is_found_at_its_place_in_the_layout_and_no_other ... ok
+test layout::tests::regions_are_page_aligned_and_disjoint_and_the_geometry_round_trips ... ok
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.98s
+test a_crash_loop_is_restarted_after_a_doubling_backoff_never_given_up ... 
+test a_crashing_daemon_is_restarted_until_the_derived_bound_and_the_segment_says_so ... 
+test a_daemon_that_never_acknowledges_a_stop_is_killed_after_the_liveness_budget ... 
+test a_daemon_whose_heartbeat_lapses_while_stopping_is_killed_before_its_declared_deadline ... 
+test a_delayed_child_and_its_restart_beat_in_the_anchors_clock_domain ... 
+test a_graceful_stop_waits_for_the_daemon_to_drain_and_exit_without_a_kill ... 
+test a_pool_extent_is_claimed_by_one_partition_and_released_only_by_it ... ok
+test a_published_sealing_root_is_adopted_by_a_later_attachment ... ok
+test a_segment_is_created_attached_and_read_through_the_seqlock ... ok
+test a_segment_with_process_relative_deadlines_is_refused_before_recovery ... ok
+test deaf_stopping_child ... ignored, a stopping child; run by a_daemon_that_never_acknowledges_... with --ignored
+test graceful_stopping_child ... ignored, a stopping child; run by a_graceful_stop_... with --ignored
+test host_clock_heartbeat_child ... ignored, heartbeat child; invoked by the supervision history
+test oversize_payloads_foreign_identities_and_wrong_lengths_are_refused ... ok
+test racing_claimants_take_each_pool_extent_exactly_once_and_the_claims_outlive_the_mapping ... ok
+test supervised_child ... ignored, the supervised child; run by a_crashing_daemon_... with --ignored
+test the_content_object_survives_a_daemon_restart_through_the_handoff ... ok
+test the_restart_policy_derives_from_the_recovery_budget ... ok
+test wedged_stopping_child ... ignored, a stopping child; run by a_daemon_whose_heartbeat_lapses_... with --ignored
+test result: ok. 14 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 4.59s
+test a_held_handle_outlives_its_sender_and_is_inherited_by_the_successor ... 
+test a_hold_is_answered_at_its_channels_wake_not_at_the_supervisors_pause ... 
+test a_malformed_hold_message_is_refused_and_counted_and_supervision_goes_on ... 
+test a_read_tells_no_message_from_a_message_of_no_bytes_and_refuses_a_long_one ... ok
+test alternating_role ... ignored, the alternating hold fixture; run by its parent
+test an_oversized_hold_message_is_refused_and_counted_and_supervision_goes_on ... 
+test anchor_role ... ignored, the anchor whose log is read; run by its parent
+test checker_role ... ignored, the hold channel checker; run by the parent with --ignored
+test every_refusal_is_counted_and_the_log_says_each_kind_once ... ok
+test garbling_role ... ignored, the garbling hold fixture; run by its parent
+test gone_role ... ignored, the hold channel gone-checker; run by the parent with --ignored
+test oversizing_role ... ignored, the oversizing hold fixture; run by its parent
+test prompt_role ... ignored, the prompt hold fixture; run by its parent
+test sender_role ... ignored, the hold channel sender; run by the parent with --ignored
+test supervised_role ... ignored, the supervised hold fixture; run by its parent
+test the_supervisor_acknowledges_the_hold_before_commit_and_hands_it_to_its_successor ... 
+test without_the_hold_the_object_dies_with_its_sender ... 
+test result: ok. 8 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out; finished in 4.72s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== anchor run 2 exit 0 in 14 s
+test handles::tests::a_changed_message_is_refused_before_a_handle_is_selected ... ok
+test handles::tests::a_hold_encodes_to_its_golden_bytes ... ok
+test handles::tests::a_hold_outside_the_shapes_is_refused_at_encoding ... ok
+test handles::tests::a_refusal_is_logged_once_and_the_lines_stay_bounded ... ok
+test handles::tests::every_message_round_trips ... ok
+test handles::tests::hostile_environments_are_refused ... ok
+test handles::tests::hostile_messages_are_refused ... ok
+test handles::tests::one_inherited_handle_cannot_have_two_owners ... ok
+test handles::tests::the_environment_round_trips ... ok
+test held_windows::tests::a_hold_duplicates_handles_and_the_handoff_names_them ... ok
+test held_windows::tests::a_value_that_will_not_duplicate_is_refused ... ok
+test held_windows::tests::releasing_one_entry_keeps_the_other_available_for_the_successor ... ok
+test held_windows::tests::the_bound_and_a_duplicate_id_are_refused ... ok
+test held_windows::tests::the_channel_carries_a_hold_and_its_answer ... ok
+test layout::tests::every_region_is_found_at_its_place_in_the_layout_and_no_other ... ok
+test layout::tests::regions_are_page_aligned_and_disjoint_and_the_geometry_round_trips ... ok
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.98s
+test a_crash_loop_is_restarted_after_a_doubling_backoff_never_given_up ... 
+test a_crashing_daemon_is_restarted_until_the_derived_bound_and_the_segment_says_so ... 
+test a_daemon_that_never_acknowledges_a_stop_is_killed_after_the_liveness_budget ... 
+test a_daemon_whose_heartbeat_lapses_while_stopping_is_killed_before_its_declared_deadline ... 
+test a_delayed_child_and_its_restart_beat_in_the_anchors_clock_domain ... 
+test a_graceful_stop_waits_for_the_daemon_to_drain_and_exit_without_a_kill ... 
+test a_pool_extent_is_claimed_by_one_partition_and_released_only_by_it ... ok
+test a_published_sealing_root_is_adopted_by_a_later_attachment ... ok
+test a_segment_is_created_attached_and_read_through_the_seqlock ... ok
+test a_segment_with_process_relative_deadlines_is_refused_before_recovery ... ok
+test deaf_stopping_child ... ignored, a stopping child; run by a_daemon_that_never_acknowledges_... with --ignored
+test graceful_stopping_child ... ignored, a stopping child; run by a_graceful_stop_... with --ignored
+test host_clock_heartbeat_child ... ignored, heartbeat child; invoked by the supervision history
+test oversize_payloads_foreign_identities_and_wrong_lengths_are_refused ... ok
+test racing_claimants_take_each_pool_extent_exactly_once_and_the_claims_outlive_the_mapping ... ok
+test supervised_child ... ignored, the supervised child; run by a_crashing_daemon_... with --ignored
+test the_content_object_survives_a_daemon_restart_through_the_handoff ... ok
+test the_restart_policy_derives_from_the_recovery_budget ... ok
+test wedged_stopping_child ... ignored, a stopping child; run by a_daemon_whose_heartbeat_lapses_... with --ignored
+test result: ok. 14 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 4.60s
+test a_held_handle_outlives_its_sender_and_is_inherited_by_the_successor ... 
+test a_hold_is_answered_at_its_channels_wake_not_at_the_supervisors_pause ... 
+test a_malformed_hold_message_is_refused_and_counted_and_supervision_goes_on ... 
+test a_read_tells_no_message_from_a_message_of_no_bytes_and_refuses_a_long_one ... ok
+test alternating_role ... ignored, the alternating hold fixture; run by its parent
+test an_oversized_hold_message_is_refused_and_counted_and_supervision_goes_on ... 
+test anchor_role ... ignored, the anchor whose log is read; run by its parent
+test checker_role ... ignored, the hold channel checker; run by the parent with --ignored
+test every_refusal_is_counted_and_the_log_says_each_kind_once ... ok
+test garbling_role ... ignored, the garbling hold fixture; run by its parent
+test gone_role ... ignored, the hold channel gone-checker; run by the parent with --ignored
+test oversizing_role ... ignored, the oversizing hold fixture; run by its parent
+test prompt_role ... ignored, the prompt hold fixture; run by its parent
+test sender_role ... ignored, the hold channel sender; run by the parent with --ignored
+test supervised_role ... ignored, the supervised hold fixture; run by its parent
+test the_supervisor_acknowledges_the_hold_before_commit_and_hands_it_to_its_successor ... 
+test without_the_hold_the_object_dies_with_its_sender ... 
+test result: ok. 8 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out; finished in 4.59s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== anchor run 3 exit 0 in 14 s
+test a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon ... held rendezvous: 6 connects at a kill, all answered by the next daemon, longest 675.9388ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.92s
+== held_rendezvous run 1 exit 0 in 15 s
+test a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon ... held rendezvous: 6 connects at a kill, all answered by the next daemon, longest 616.6661ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.42s
+== held_rendezvous run 2 exit 0 in 14 s
+test a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon ... held rendezvous: 6 connects at a kill, all answered by the next daemon, longest 678.3717ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.97s
+== held_rendezvous run 3 exit 0 in 15 s
+test a_starved_start_that_makes_progress_is_not_killed ... slates anchor: instance cli-starved-6916 up; daemon pid 10408; 2 shards
+slates anchor: daemon exited (Some(1)); restarted as pid 4732 (1 in the window)
+test a_stuck_start_is_killed_and_restarted ... slates anchor: instance cli-stuck-start-6916 up; daemon pid 1632; 2 shards
+slates anchor: daemon exited (Some(1)); restarted as pid 10196 (1 in the window)
+slates anchor: the starting daemon (pid 10196) made no progress for 1007 ms (the 1000 ms liveness window); killing it
+slates anchor: daemon exited (Some(1)); restarted as pid 6728 (1 in the window)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.40s
+== start_judgment run 1 exit 0 in 19 s
+test a_starved_start_that_makes_progress_is_not_killed ... slates anchor: instance cli-starved-5472 up; daemon pid 11004; 2 shards
+slates anchor: daemon exited (Some(1)); restarted as pid 9956 (1 in the window)
+test a_stuck_start_is_killed_and_restarted ... slates anchor: instance cli-stuck-start-5472 up; daemon pid 10684; 2 shards
+slates anchor: daemon exited (Some(1)); restarted as pid 2916 (1 in the window)
+slates anchor: the starting daemon (pid 2916) made no progress for 1017 ms (the 1000 ms liveness window); killing it
+slates anchor: daemon exited (Some(1)); restarted as pid 2040 (1 in the window)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.11s
+== start_judgment run 2 exit 0 in 20 s
+test a_starved_start_that_makes_progress_is_not_killed ... slates anchor: instance cli-starved-6572 up; daemon pid 4680; 2 shards
+slates anchor: daemon exited (Some(1)); restarted as pid 1452 (1 in the window)
+test a_stuck_start_is_killed_and_restarted ... slates anchor: instance cli-stuck-start-6572 up; daemon pid 8820; 2 shards
+slates anchor: daemon exited (Some(1)); restarted as pid 10484 (1 in the window)
+slates anchor: the starting daemon (pid 10484) made no progress for 1007 ms (the 1000 ms liveness window); killing it
+slates anchor: daemon exited (Some(1)); restarted as pid 5128 (1 in the window)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.57s
+== start_judgment run 3 exit 0 in 19 s
