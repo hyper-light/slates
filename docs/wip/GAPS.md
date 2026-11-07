@@ -871,7 +871,13 @@
 > load 8–30 (2026-11-05). The rare 100 ms tail is explained and removed (two waits for the record period; and a
 > superseded owner that held a write unanswered is now refused, and a destroyed volume's shipper is let go: §4.10
 > status "The tail and three more defects"). Open: the added median is the cross-shard dispatch round (50 µs not met);
-> p999 under 1 ms at load 30. Open: one exchange per message to every holder starved the second holder (never
+> p999 under 1 ms at load 30. Since 2026-11-07 a live volume's log goes to each holder on its own lane, the holders at once, only
+> to holders of its catalog, and a lane waits for its requests before it ends (§4.10 status "One lane a holder"): a
+> write no longer waits for a stopped candidate (main: 406–1,064 ms for the first write after a stop, now 3–99 ms), and
+> no holder's session is left lent with a cancelled request (KIND `wan`, `wan-loss` and `ceiling` acknowledged every
+> write, where main stalled; the lanes alone did too, so KIND does not separate the stragglers' wait). Open: a large install over a slow path is still cut at the live budget, as on main; it
+> waits on raft-chaos's size-derived exchange budget. And a lane may wait one record period for a session the record
+> plane has lent (`ship_head`). Open: one exchange per message to every holder starved the second holder (never
 > accepted an entry, in six of nine process flows) and was rejected; why is not pinned down. Open, toward a filesystem
 > server replicated per write in under 1 ms: AC-8.9's credit backpressure (since 2026-11-05 a local checkpoint ships a
 > live volume's changes, not a whole copy: 1 whole record in 2,051 where main made about 420; the credit itself is
