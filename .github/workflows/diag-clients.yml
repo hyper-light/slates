@@ -1,0 +1,79 @@
+name: diag-clients
+
+# Diagnostics only, never on main (the frozen-daemon test's lower bound, main CI run 42184319025; and ack_release's
+# scatter hold, run 42206043007): on macOS (where the frozen test failed) and Linux, under the A/B bar's load (two
+# spinning shell loops a logical CPU), ten interleaved rounds of main's frozen-daemon test (carried as cli_main.rs) and
+# the fixed one; on macOS also ten of main's ack_release (ack_release_main.rs) and the fixed one. Each job pushes its
+# result lines to diag-results/clients-frozen-1-<os> with the Actions token, read by git fetch at no API quota.
+on:
+  push:
+    branches: ["diag-clients-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  frozen:
+    name: frozen daemon under load on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the tests
+        run: cargo test --locked -p slates-cli --test cli --test cli_main -p slates-server --test ack_release --test ack_release_main --no-run
+      - name: Main's and the fixed tests, interleaved, under the bar's load
+        run: |
+          set +e
+          R=../results.txt
+          cpus=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+          echo "runner ${{ matrix.os }}, $cpus CPUs, $(date -u), commit $(git rev-parse --short HEAD)" > $R
+          pids=""
+          for i in $(seq 1 $((cpus * 2))); do ( while :; do :; done ) & pids="$pids $!"; done
+          F=a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted
+          for round in $(seq 1 10); do
+            for t in cli_main cli; do
+              echo "== $t busy round $round at $(date -u +%H:%M:%S)" | tee -a $R
+              SLATES_TEST_CLI=1 cargo test --locked -q -p slates-cli --test $t -- --exact $F --nocapture 2>&1 | grep -E 'replaced after|frozen daemon:|not killed|killed at the lapse|heartbeat lapsed \(|never beat|test result' | tee -a $R
+            done
+          done
+          if [ "${{ matrix.os }}" = "macos-latest" ]; then
+            for round in $(seq 1 10); do
+              for t in ack_release_main ack_release; do
+                echo "== $t busy round $round at $(date -u +%H:%M:%S)" | tee -a $R
+                cargo test --locked -q -p slates-server --test $t -- --nocapture 2>&1 | grep -E 'answered in|panicked|Listed|test result|^    [a-z_:]+$' | tee -a $R
+              done
+            done
+          fi
+          for p in $pids; do kill "$p" 2>/dev/null || true; done
+          wait 2>/dev/null || true
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/clients-frozen-1-${{ matrix.os }}"
+          git config user.name "diag-clients"
+          git config user.email "diag-clients@users.noreply.github.com"
+          git stash -q || true
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-clients frozen-1 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
