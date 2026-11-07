@@ -115,6 +115,17 @@ enum Following {
   Fixed,
 }
 
+/// Whose reports phase one counts toward `f + 1` (A-240).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Counting {
+  /// The design: every reachable candidate is asked and fenced, and only reports from the holder set the superseded
+  /// shipper committed count.
+  Holders,
+  /// A mutation, the daemon before A-240: the first `f + 1` reachable candidates of the current configuration count,
+  /// whoever they are.
+  AnyCandidate,
+}
+
 /// What phase one does with a candidate that holds no copy of the log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EmptyReport {
@@ -192,6 +203,13 @@ struct Run {
   activations: u64,
   /// Of those, the ones whose target kept fewer than `f` of the holders it replaced.
   activations_past_the_overlap: u64,
+  /// Whose reports phase one counts ([`Counting`]).
+  counting: Counting,
+  /// Whether a fresh member may join the candidates when an owner is lost, as a replaced pod does under a fresh identity
+  /// (KIND runs 42326682216, 42331191530): it never held the log, and the shipper's holders never name it.
+  newcomers: bool,
+  /// The members that joined so.
+  joined: u64,
   /// Whether the history is printed as it happens ([`Run::traced`]): what each step did that bears on the invariants.
   traced: bool,
 }
@@ -254,6 +272,9 @@ impl Run {
       reconfigurations: 0,
       activations: 0,
       activations_past_the_overlap: 0,
+      counting: Counting::Holders,
+      newcomers: false,
+      joined: 0,
       traced: false,
     }
   }
@@ -292,6 +313,18 @@ impl Run {
       (8, 16),
     );
     self.owners[0].recorded.clone_from(&self.configuration);
+    self
+  }
+
+  /// This run with phase one counting by `counting`.
+  fn counting(mut self, counting: Counting) -> Run {
+    self.counting = counting;
+    self
+  }
+
+  /// This run with fresh members joining the candidates at an owner's loss ([`Run::newcomers`]).
+  fn with_newcomers(mut self) -> Run {
+    self.newcomers = true;
     self
   }
 
@@ -512,10 +545,58 @@ impl Run {
     }
   }
 
+  /// The lost owner's replacement joins under a fresh identity, before phase one (half the time, when the run has
+  /// newcomers): a candidate of the configuration now, holding nothing of the log.
+  fn maybe_join_fresh_member(&mut self, old_host: HostId) {
+    if !self.newcomers || !self.rng.chance(500) {
+      return;
+    }
+    let fresh = HostId(self.hosts.iter().map(|host| host.0).max().unwrap_or(0) + 1);
+    self.hosts.push(fresh);
+    self.holders.insert(
+      fresh,
+      Holder {
+        replica: None,
+        configured: old_host,
+        state: Vec::new(),
+        alive: true,
+      },
+    );
+    self.joined += 1;
+    self.note(|| format!("host {} joins as a fresh member", fresh.0));
+  }
+
+  /// Phase one's hosts under the run's counting rule: those asked, and those whose reports count toward `f + 1`; `None`
+  /// when too few of them are reachable. Under A-240 every reachable candidate is asked and `f + 1` of the superseded
+  /// shipper's committed holders must answer; the mutation asks the first `f + 1` reachable candidates and counts them.
+  fn phase_one_hosts(
+    &self,
+    old: usize,
+    reachable: &[HostId],
+  ) -> Option<(Vec<HostId>, Vec<HostId>)> {
+    let needed = usize::try_from(self.f + 1).unwrap();
+    match self.counting {
+      Counting::Holders => {
+        // The holder set the superseded shipper committed (A-240): what phase one counts.
+        let committed: Vec<HostId> = self.owners[old].shipper.holders().to_vec();
+        let answering = reachable
+          .iter()
+          .filter(|host| committed.contains(host))
+          .count();
+        (answering >= needed).then(|| (reachable.to_vec(), committed))
+      }
+      Counting::AnyCandidate => {
+        let asked: Vec<HostId> = reachable.iter().copied().take(needed).collect();
+        (asked.len() >= needed).then(|| (asked.clone(), asked))
+      }
+    }
+  }
+
   /// Loses the current owner and takes it over: phase one over `f + 1` reachable live candidates under a new epoch.
   fn take_over(&mut self) {
     let old = self.current;
     let old_host = self.owners[old].host;
+    self.maybe_join_fresh_member(old_host);
     let candidates: Vec<HostId> = self
       .hosts
       .iter()
@@ -536,7 +617,7 @@ impl Run {
         !self.cut.contains(&(successor, *host)) && !self.cut.contains(&(*host, successor))
       })
       .collect();
-    let Some(asked) = self.phase_one_asked(old, successor, &reachable) else {
+    let Some((asked, counted)) = self.phase_one_asked(old, successor, &reachable) else {
       return;
     };
     self.epoch += 1;
@@ -569,6 +650,7 @@ impl Run {
     });
     let adopted = adopt(
       &reports,
+      &counted,
       Quorum {
         f: u32::try_from(self.f).unwrap(),
       },
@@ -648,18 +730,19 @@ impl Run {
     self.takeovers += 1;
   }
 
-  /// Phase one's asked hosts: without `following`, the first `f + 1` reachable candidates, all counted. With it, every
-  /// reachable live host the configuration or the record names, of which `f + 1` must be in the holder set the record
-  /// names for the owner being taken over ([`Following`]); `None` when too few are.
+  /// Phase one's hosts: those asked, and the set whose reports count toward `f + 1`; `None` when too few of that set are
+  /// reachable. Without `following`, by the run's counting rule ([`Run::phase_one_hosts`]). With it, every reachable
+  /// live host the configuration or the record names is asked, and `f + 1` of them must be in the holder set the record
+  /// names for the owner being taken over ([`Following`]).
   fn phase_one_asked(
     &self,
     old: usize,
     successor: HostId,
     reachable: &[HostId],
-  ) -> Option<Vec<HostId>> {
+  ) -> Option<(Vec<HostId>, Vec<HostId>)> {
     let needed = usize::try_from(self.f + 1).unwrap();
     let Some(following) = self.following else {
-      return (reachable.len() >= needed).then(|| reachable.iter().copied().take(needed).collect());
+      return self.phase_one_hosts(old, reachable);
     };
     let recorded: Vec<HostId> = match following {
       Following::Joint => self.owners[old].recorded.clone(),
@@ -679,7 +762,7 @@ impl Run {
       })
       .collect();
     let counted = asked.iter().filter(|host| recorded.contains(host)).count();
-    (counted >= needed).then_some(asked)
+    (counted >= needed).then_some((asked, recorded))
   }
 
   /// The configuration names a new candidate set for the volume: `2f` hosts other than the owner, drawn at random (any
@@ -950,16 +1033,25 @@ impl Run {
     }
   }
 
-  /// Every live holder holds the owner's state. With `following`, the holders are the configuration's live candidates,
-  /// the record names them, and the owner knows each holds its head, so every write is durable.
+  /// Every live holder holds the owner's state. Without `following`, the holders are the current shipper's (A-240: a
+  /// member that joined while this owner shipped is no holder of this log; it becomes one under the next shipper that
+  /// names it). With `following`, they are the configuration's live candidates, the record names them, and the owner
+  /// knows each holds its head, so every write is durable.
   fn converged(&self) -> bool {
     let owner = &self.owners[self.current];
     let following = self.following.is_some();
+    let holders = owner.shipper.holders();
     let holders_converged = self
       .holders
       .iter()
       .filter(|(host, holder)| {
-        holder.alive && **host != owner.host && (!following || self.configuration.contains(host))
+        holder.alive
+          && **host != owner.host
+          && if following {
+            self.configuration.contains(host)
+          } else {
+            holders.contains(host)
+          }
       })
       .all(|(host, holder)| {
         holder.state == owner.state
@@ -1521,6 +1613,68 @@ fn hostile_fetches_are_refused() {
   assert_eq!(Fetch::decode(&install_tag), Err(LiveError::Malformed));
 }
 
+/// A-240 hostile input on phase one's report: a report round-trips and is told from a fetch and an install; every
+/// truncation, a fetch's tag where a report is read, and trailing bytes are refused, never a panic.
+#[test]
+fn hostile_reports_are_refused() {
+  use slates_db::live::{Report, is_fetch, is_report, object_of_state};
+  let report = Report {
+    object: OBJECT,
+    epoch: HostEpoch(4),
+  };
+  let bytes = report.encode();
+  assert!(is_report(&bytes) && !is_fetch(&bytes));
+  assert_eq!(object_of_state(&bytes), Some(OBJECT));
+  assert_eq!(Report::decode(&bytes), Ok(report));
+  for length in 0..bytes.len() {
+    assert_eq!(Report::decode(&bytes[..length]), Err(LiveError::Malformed));
+  }
+  let mut longer = bytes.clone();
+  longer.push(0);
+  assert_eq!(Report::decode(&longer), Err(LiveError::Malformed));
+  let mut fetch_tag = bytes.clone();
+  fetch_tag[0] = 2;
+  assert_eq!(Report::decode(&fetch_tag), Err(LiveError::Malformed));
+}
+
+/// A-240 hostile input on a report's answer: it round-trips with a head, with nothing held and with a fence refusal,
+/// and every cut short of the kept bytes is refused, never a panic; no longer cut reads as the head.
+#[test]
+fn hostile_report_answers_are_refused() {
+  use slates_db::live::{decode_reported, encode_reported};
+  let head = Head {
+    epoch: HostEpoch(2),
+    position: 9,
+    identity: [5; 32],
+  };
+  for (reply, kept) in [
+    (Ok(Some(head)), 4096u64),
+    (Ok(None), 0),
+    (
+      Err(LiveError::StaleEpoch {
+        current: HostEpoch(6),
+      }),
+      0,
+    ),
+  ] {
+    let answer = encode_reported(&reply, kept);
+    assert_eq!(decode_reported(&answer), Ok((reply, kept)));
+  }
+  let answer = encode_reported(&Ok(Some(head)), 4096);
+  for length in 0..8 {
+    assert_eq!(
+      decode_reported(&answer[..length]),
+      Err(LiveError::Malformed)
+    );
+  }
+  for length in 8..answer.len() {
+    assert!(
+      decode_reported(&answer[..length]).is_ok_and(|(reply, _)| reply != Ok(Some(head))),
+      "a cut answer never reads as the head"
+    );
+  }
+}
+
 /// Hostile input on a fetched reply: it round-trips; a payload over the cap is refused, and no cut of it decodes whole.
 #[test]
 fn hostile_fetched_replies_are_refused() {
@@ -1545,4 +1699,103 @@ fn hostile_fetched_replies_are_refused() {
       );
     }
   }
+}
+
+/// A-200 phase one with the membership changing: do run the nemesis with the lost owner's replacement joining the
+/// candidates under a fresh identity before phase one (it never held the log; the shipper's holders never name it), at
+/// `f = 1` and `f = 2`. Expect every history to hold Agreement, NoLoss, StaleNeverCommits and Convergence: phase one's
+/// `f + 1` reports must meet the holders the writes were durable on, so a newcomer's empty report cannot stand in for
+/// one of them. Found on KIND (runs 42326682216 and 42331191530): a takeover completed with the successor's report and
+/// the replacement pod's, while the other holder of the log was never asked and kept its fence at the old epoch.
+#[test]
+fn phase_one_meets_the_logs_holders_when_a_fresh_member_has_joined() {
+  let mut broken = Vec::new();
+  let mut joined = 0;
+  for f in [1, 2] {
+    for seed in 0..SEEDS {
+      let outcome = std::panic::catch_unwind(|| {
+        let mut run = Run::new(f, seed, EmptyReport::FenceAndCount).with_newcomers();
+        for _ in 0..STEPS {
+          run.step();
+        }
+        run.settle();
+        run.joined
+      });
+      match outcome {
+        Ok(count) => joined += count,
+        Err(panic) => {
+          let message = panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+            .unwrap_or_default();
+          broken.push((f, seed, message));
+        }
+      }
+    }
+  }
+  eprintln!(
+    "fresh members at owner loss: {joined} joined in the passing seeds; {} broken seeds; first {:?}",
+    broken.len(),
+    broken.first()
+  );
+  if let Some((f, seed, _)) = broken.first().cloned() {
+    eprintln!("history of f={f} seed {seed}:");
+    let _ = std::panic::catch_unwind(|| {
+      let mut run = Run::new(f, seed, EmptyReport::FenceAndCount)
+        .with_newcomers()
+        .traced();
+      for _ in 0..STEPS {
+        run.step();
+      }
+      run.settle();
+    });
+  }
+  assert!(
+    broken.is_empty(),
+    "phase one with fresh members: {broken:?}"
+  );
+}
+
+/// A-240's mutation, kept as a test: do run the nemesis with fresh members joining at an owner's loss and phase one
+/// counting the first `f + 1` reachable candidates of the current configuration, whoever they are (the daemon before
+/// A-240). Expect a history to break NoLoss, StaleNeverCommits or Agreement in some seed: a newcomer's empty report
+/// stands in for a holder that was never asked.
+#[test]
+fn counting_any_candidate_lets_a_fresh_member_stand_in_for_a_holder() {
+  let mut broken = Vec::new();
+  for f in [1, 2] {
+    for seed in 0..SEEDS {
+      let outcome = std::panic::catch_unwind(|| {
+        let mut run = Run::new(f, seed, EmptyReport::FenceAndCount)
+          .counting(Counting::AnyCandidate)
+          .with_newcomers();
+        for _ in 0..STEPS {
+          run.step();
+        }
+        run.settle();
+      });
+      if let Err(panic) = outcome {
+        let message = panic
+          .downcast_ref::<String>()
+          .cloned()
+          .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+          .unwrap_or_default();
+        broken.push((f, seed, message));
+      }
+    }
+  }
+  eprintln!(
+    "counting any candidate with fresh members: {} broken seeds; first {:?}",
+    broken.len(),
+    broken.first()
+  );
+  assert!(
+    broken.iter().any(|(_, _, message)| {
+      message.contains("NoLoss")
+        || message.contains("StaleNeverCommits")
+        || message.contains("Agreement")
+    }),
+    "a fresh member's report stood in for a holder: {broken:?}"
+  );
 }

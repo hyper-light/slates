@@ -21,7 +21,11 @@
 //! **Takeover.** Every holder reports its head under the new epoch; the successor adopts the greatest
 //! `(epoch, position)` among `f + 1` reports ([`adopt`]). Along any chain `(epoch, position)` only grows, and a durable
 //! entry is held by `f + 1` candidates, which meet any `f + 1` reports, so the adopted head extends every durable entry
-//! (NoLoss; Raft's up-to-date rule, thesis §3.6.1).
+//! (NoLoss; Raft's up-to-date rule, thesis §3.6.1). The `f + 1` are counted among the holders the shipper being taken
+//! over committed before its first entry (A-240), never among the members placed now: a member that joined after the
+//! writes holds none of them, and counted in a holder's place it let a stale head be adopted and a fenced-out owner's
+//! entry commit (10 of 400 seeds in `tests/live.rs`, 2026-11-06). Each shipper, a successor's too, commits its own
+//! holders before it ships.
 //!
 //! **Holder change.** The holders follow the volume's candidates by a joint transition, as Vertical Paxos changes a
 //! configuration (Lamport, Malkhi and Zhou, PODC 2009): [`Shipper::begin_transition`] ships to the old and the new set
@@ -63,6 +67,8 @@ const INSTALL_PREFIX_BYTES: usize =
 const TAG_INSTALL: u8 = 1;
 /// Format: a whole-state message's first byte: a takeover's fetch (successor to holder).
 const TAG_FETCH: u8 = 2;
+/// Format: a whole-state message's first byte: phase one's report (successor to holder; A-240).
+const TAG_REPORT: u8 = 3;
 /// Format: a reply's first byte: a head held, a holder with nothing, or a fence refusal.
 const REPLY_HEAD: u8 = 1;
 /// Format: see [`REPLY_HEAD`].
@@ -293,9 +299,14 @@ pub fn object_of_state(bytes: &[u8]) -> Option<ObjectId> {
       reader.word().ok()?;
       reader.object().ok()
     }
-    TAG_FETCH => reader.object().ok(),
+    TAG_FETCH | TAG_REPORT => reader.object().ok(),
     _ => None,
   }
+}
+
+/// Whether a whole-state message is a [`Report`] (phase one's question, A-240).
+pub fn is_report(bytes: &[u8]) -> bool {
+  bytes.first() == Some(&TAG_REPORT)
 }
 
 /// Whether a whole-state message is a [`Fetch`] (otherwise an [`Install`], or malformed).
@@ -339,6 +350,62 @@ impl Fetch {
       Err(LiveError::Malformed)
     }
   }
+}
+
+/// Phase one's question for a live volume (A-200, A-240): the successor asks a holder to raise its fence to `epoch` and
+/// report its head and how many bytes it keeps, nothing more. Every answer is a few bytes, so phase one runs within the
+/// liveness budget over any path; the log itself is fetched afterwards from the one holder adopted ([`Fetch`]), under a
+/// budget its reported bytes derive. Asked in one exchange, every holder's whole log missed a 1 s budget over KIND's
+/// shaped paths, and no takeover finished (run 42357611870, `wan`, `wan-loss` and `ceiling`, 2026-11-07).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Report {
+  /// The volume.
+  pub object: ObjectId,
+  /// The epoch the successor ships under.
+  pub epoch: HostEpoch,
+}
+
+impl Report {
+  /// The canonical bytes: its tag, the object, the epoch.
+  pub fn encode(&self) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(TAG_REPORT);
+    out.extend_from_slice(&self.object.0);
+    out.extend_from_slice(&self.epoch.0.to_le_bytes());
+    out
+  }
+
+  /// Parses bytes that crossed the network.
+  pub fn decode(bytes: &[u8]) -> Result<Report, LiveError> {
+    let mut reader = Reader { bytes };
+    if reader.byte()? != TAG_REPORT {
+      return Err(LiveError::Malformed);
+    }
+    let report = Report {
+      object: reader.object()?,
+      epoch: HostEpoch(reader.word()?),
+    };
+    if reader.bytes.is_empty() {
+      Ok(report)
+    } else {
+      Err(LiveError::Malformed)
+    }
+  }
+}
+
+/// A holder's answer to a [`Report`]: the bytes it keeps of the log, then its reply (the head, or the fence refusing a
+/// stale successor).
+pub fn encode_reported(reply: &Result<Option<Head>, LiveError>, kept: u64) -> Vec<u8> {
+  let mut out = kept.to_le_bytes().to_vec();
+  out.extend_from_slice(&encode_reply(reply));
+  out
+}
+
+/// Parses a holder's answer to a [`Report`]: its reply and the bytes it keeps.
+pub fn decode_reported(bytes: &[u8]) -> Result<(Result<Option<Head>, LiveError>, u64), LiveError> {
+  let mut reader = Reader { bytes };
+  let kept = reader.word()?;
+  Ok((decode_reply(reader.bytes), kept))
 }
 
 /// A holder's answer to a [`Fetch`]: its reply (the head, or the fence refusing a stale successor) and the payloads it
@@ -616,12 +683,23 @@ impl Replica {
   }
 }
 
-/// Phase one's choice (A-200): among the reports of at least `f + 1` candidates (each holder's head; `None` for one
-/// that holds nothing), the holder whose head ranks highest, and that head. `None` when too few reported, or when
-/// every report is empty (nothing was ever shipped).
-pub fn adopt(reports: &[(HostId, Option<Head>)], quorum: Quorum) -> Option<(HostId, Head)> {
+/// Phase one's choice (A-200, A-240): the holder whose head ranks highest among `reports` (each candidate's head;
+/// `None` for one that holds nothing), and that head, once at least `f + 1` of the reports come from `holders`, the
+/// holder set the shipper being taken over committed before its first entry. A durable entry is held by the owner and
+/// `f` of those `2f` holders, so `f + 1` of them meet every durable entry; a report from any other member (one that
+/// joined after the writes) counts for nothing, since it can stand in for a holder that was never asked. `None` when
+/// fewer than `f + 1` holders reported, or when every report is empty (nothing was ever shipped).
+pub fn adopt(
+  reports: &[(HostId, Option<Head>)],
+  holders: &[HostId],
+  quorum: Quorum,
+) -> Option<(HostId, Head)> {
   let needed = usize::try_from(quorum.f).ok()?.checked_add(1)?;
-  if reports.len() < needed {
+  let counted = reports
+    .iter()
+    .filter(|(host, _)| holders.contains(host))
+    .count();
+  if counted < needed {
     return None;
   }
   reports

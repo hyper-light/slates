@@ -44,8 +44,11 @@ over each, and switch only once the new set holds every durable write and the re
   is activated, since its record may be in flight.
 - `crates/server/src/live_ship.rs`: `follow_candidates` begins a transition to the volume's other candidates as the
   shard's configuration names them now, at every publication and every record period (counted
-  `fleet.live.holders_transition`), and activates it once transferred (`fleet.live.holders_activated`). Until A-240's
-  record lands (raft-chaos), the record is the configuration itself. `pending_sends` ships to every target.
+  `fleet.live.holders_transition`). Once `target_recordable` holds (the target is transferred, and the last whole entry
+  carries a key for every candidate and is itself durable, so the target can open what it holds: raft-chaos saw
+  `fleet.live.takeover_refused.open` 814 on a successor outside the holders, CI diag-raft-chaos-kind-14 run 3), it commits
+  the target to the volume's catalog as its holder set (A-240's `Op::LiveHoldersCommitted`), and activates it once that
+  catalog version is placed at `f + 1` (`fleet.live.holders_activated`). `pending_sends` ships to every target.
 
 ## Evidence
 

@@ -6,9 +6,10 @@
 > follow the candidates by a joint transition (ship to both sets, count durability over each, switch once the new set
 > holds every durable write and the record names it). The first fix, replacing the holders outright, was unsafe
 > (raft-chaos); the model shows it (the record-at-once mutation breaks NoLoss) and 0 of 400 seeds broken under the
-> joint rule. **For raft-chaos:** the record that names each target is A-240's; until it lands the daemon activates
-> against the configuration's candidates. A successor must record the set its takeover counted, not its configuration's
-> candidates when they differ. Bug record `docs/bugs/2026-11-07-a-live-shipper-made-before-its-candidates-were-known-shipped-to-nobody.md`.
+> joint rule. The target is recorded in the volume's catalog (A-240, merged
+> from raft-chaos) once it holds every durable write under a key it can open, and activated once that record is placed.
+> **Open, raft-chaos's:** a successor's recorded set must be the set its takeover counted, then its own transition.
+> Bug record `docs/bugs/2026-11-07-a-live-shipper-made-before-its-candidates-were-known-shipped-to-nobody.md`.
 
 > **Fixed (live-fixes, 2026-11-06 and 07): a daemon restarted under its anchor never rejoined its fleet (raft-chaos
 > report 8).** The successor keeps the member id; the other nodes hold that id dead. Its restarted plane epochs were
@@ -882,7 +883,7 @@
 > successor holding nothing never counts itself and `f + 1` is out of reach once the owner is gone. Owner: raft,
 > before any other live-shipping work.
 >
-> **Chaos from outside the processes (raft-chaos, 2026-11-06): two defects fixed, a third open.**
+> **Chaos from outside the processes (raft-chaos, 2026-11-06): defects fixed and open, below.**
 > The harness is `crates/cli/tests/live_chaos.rs` (`SLATES_TEST_CLI=1`): three fleet daemons, a Rust client streaming
 > 4 KiB writes, every node's live lines sampled throughout (status now prints each log's head epoch, chain identity and
 > fence), and each flow ending with the register invariants checked from outside the processes:
@@ -909,17 +910,62 @@
 >   `candidates_partitioned_in_turn_mid_stream_lose_nothing`) failed 3 of 5 runs before: two writes were never
 >   answered, one for over 20 minutes. After the fix, 6 of 7 runs pass and none hangs. Red-checked by
 >   `xshard::tests::a_call_to_its_own_shard_runs_its_future_to_the_end_past_the_deadline`.
-> - **Open: an install never finishes inside the liveness budget** (record
->   `docs/bugs/2026-11-06-an-install-never-finished-inside-the-liveness-budget.md`). A candidate left behind the retained
->   tail is sent the whole volume (0.5-1.5 MB) under the 1 s budget an entry gets. In one run 1,391 installs (2.06 GB)
->   went out, both candidates held the owner's head, and no write became durable. Edits in progress (raft-chaos, with
->   live-durability building on them in the dispatch round): a size-derived exchange budget, replies folded as they
->   come, one task a holder, and a byte-bounded retained tail. With them, 3 of 8 runs still failed: of 425 installs
->   logged in one, about 400 found no session, as the holder's tasks raced for its one session.
-> - **The anchored flows** (a candidate's daemon SIGKILLed and succeeded, a candidate's node replaced) are counted apart
->   from the invariant results until A-228 lands: at load 60–80 the anchor kills live daemons whose heartbeat lapses.
+> - **Open (live-durability): an install never finishes inside the liveness budget, and a dispatch strands its
+>   sessions** (record `docs/bugs/2026-11-06-an-install-never-finished-inside-the-liveness-budget.md`).
+>   - The size-derived budget is `live_ship::exchange_budget` (`bytes × smoothed RTT / congestion window` plus the
+>     liveness budget), on raft-chaos's branch with A-240, where phase one's log fetch uses it. live-durability's
+>     lanes take it after A-240 lands. Until then an install over a slow path is cut at the liveness budget, on main
+>     and on live-durability's landable branch alike (agreed 2026-11-07).
+>   - A candidate left behind the retained tail is sent the whole volume (0.5-1.5 MB) under the 1 s budget an entry
+>     gets. In one run 1,391 installs (2.06 GB) went out, both candidates held the owner's head, and no write became
+>     durable.
+>   - raft-chaos's edits (a size-derived exchange budget, replies folded as they come, a byte-bounded retained tail)
+>     are merged into live-durability's dispatch round. It adds one lane per (volume, holder), ships only to candidates
+>     holding the catalog, and waits for each exchange's stragglers before a lane ends. A straggler cancelled with its
+>     lane had taken its session with it, which is the KIND `wan` stall: both owner sessions `lent=true`, `no_session`
+>     24-40 k, runs 42178128960 and 42318867890.
+> - **Fixed: an unanswered destroy never settled.** Both candidates stopped, the destroy unanswered (correct), the owner
+>   killed. The destroy's records still reach the candidates once they resume, so it takes effect. But the successor,
+>   which adopted the tombstone in its takeover and retired it, kept its routing to the volume and answered every verb
+>   `Overloaded` for good (`fleet.owner_location.owned_unmaterialized`), while the other survivor answered `NotFound`.
+>   That happened in 6 of 6 runs, live and plain, macOS, 2026-11-06. `fleet::retire_shard_tombstones` now forgets the
+>   successor's routing at retirement, as a holder does in `tombstone::on_held`. The settled answer for a retired
+>   destroyed volume of a departed creator is `OwnerUnreachable`: no member remembers it and its id routes to the gone
+>   creator. Nobody lists or serves it. Flow: `a_{live,plain}_volumes_unheard_destroy_then_its_owners_loss`.
+> - **Open design item, not built: `NotFound` for a retired destroyed volume of a departed creator.** Today such a
+>   volume answers `OwnerUnreachable` (retryable, and true while a takeover could still be pending), because an owner
+>   location round never reports an unavailable view as `NotFound` (`owner_location::LocationError`). `NotFound` would
+>   be correct once no member can still adopt the id. A node's own view cannot show that: "this node has no unfinished
+>   takeover of the creator" is local, and another member may still be mid-adoption of that id, declining for now. So
+>   the rule needs the creator's takeover known complete fleet-wide, for example committed in the configuration group,
+>   before any member answers `NotFound` for the creator's ids.
+> - **Open (live-fixes): the anchored flows fail in fleet membership** on main 76e5b502 with A-228 (macOS, debug, load
+>   45-59, 2 runs each).
+>   - A candidate's daemon SIGKILLed under its anchor is succeeded in under 1 s but never readmitted within 40 s: the
+>     successor holds 3 members with 0 peers probed, while the others hold 2.
+>   - A candidate's node replaced by a fresh anchor was promoted to voter after 41 s in one run, and never in the other.
+>   These are counted apart from the invariant results.
 >
-> Touched: `crates/server/src/{live_ship,verbs,fleet}.rs` (the destroy's wait), the status line (`crates/ipc`
+> - **Fixed (A-240): a live takeover counted members that never held the log** (record
+>   `docs/bugs/2026-11-06-a-live-takeover-counted-members-that-never-held-the-log.md`).
+>   - Phase one took `f + 1` reports from the current placement. A member placed after the writes (a replacement pod
+>     on KIND) stood in for a holder that could not answer, so a stale head could be adopted. KIND runs 42326682216
+>     and 42331191530 saw a holder at fence 1 after a takeover at epoch 2. The model broke 10 of 400 seeds.
+>   - Each shipper now records its epoch and holders in the volume's catalog and ships only once that catalog is
+>     placed at `f + 1`. Phase one counts `f + 1` among those holders alone, and waits typed when too few answer.
+>   - The model passes 0 broken of 400 seeds. The process flow is
+>     `a_member_that_never_held_the_log_never_stands_in_for_its_holder` (five nodes).
+>   - KIND run 42365340676 passed all four profiles end to end with A-240 and the two-step fetch: every write
+    acknowledged, every volume taken over whole at epoch 2 (unshaped 2.5 s, wan and wan-loss 16.9 s, ceiling 57.2 s).
+  - Process red-check, CI, 13 runs a side: the mutation (counting the current placement) left a holder at fence 1 in 4.
+    A-240 left none, and lost no write.
+  - Open: the holder set changing under a live log (joint transition and activation, with live-fixes and raft); a
+    successor outside the holders cannot open the log (`takeover_refused.open`); and a refused rebuild refetches the
+    log every period (backoff owed, raft-chaos).
+>
+> Touched: `crates/server/src/{live_ship,verbs,fleet}.rs` (the destroy's wait; the successor's routing at a
+> tombstone's retirement; A-240's holder record and phase-one count), `crates/db/src/{live,catalog,op,partition}.rs`
+> (A-240), the status line (`crates/ipc`
 > `LiveReport`, `crates/cli` status), the harness, the KIND leg (`xtask/src/kind_live.rs`,
 > `crates/cli/examples/pod_live_probe.rs`).
 

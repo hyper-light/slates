@@ -65,6 +65,8 @@ pub struct CatalogValue {
   pub access: Vec<AccessEntry>,
   /// Whether the volume is live-shipped (A-200), so a successor keeps shipping it. Appended.
   pub live_shipped: bool,
+  /// The live shipper's committed holder set (A-240): the hosts a takeover's phase one counts reports from. Appended.
+  pub live_holders: Option<slates_db::catalog::LiveHolders>,
 }
 
 impl CatalogValue {
@@ -78,6 +80,7 @@ impl CatalogValue {
       require_locked: record.policy.require_locked,
       access: record.access.clone(),
       live_shipped: record.policy.live_shipped,
+      live_holders: record.policy.live_holders.clone(),
     }
   }
 
@@ -115,6 +118,7 @@ mod tests {
         },
       }],
       live_shipped: false,
+      live_holders: None,
     }
   }
 

@@ -3679,9 +3679,15 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
     None => return,
   };
   // A live-shipped volume is served from its live log, which holds every acknowledged write (A-200): phase one over its
-  // candidates under the takeover's epoch, the greatest head adopted. A volume whose log was never shipped has none and
-  // is served from its placed seal as before.
-  let live = if catalog.live_shipped {
+  // candidates under the takeover's epoch, the greatest head adopted, `f + 1` counted among the holders the catalog
+  // records (A-240). A catalog that records none had a shipper that never shipped (it ships only once its holders are
+  // placed with the catalog, `live_ship::holders_placed`): no log exists, and the volume is served from its placed seal.
+  let live = if let Some(recorded) = catalog
+    .live_holders
+    .as_ref()
+    .filter(|_| catalog.live_shipped)
+  {
+    let holders: Vec<HostId> = recorded.holders.iter().copied().map(HostId).collect();
     let mut candidates = placed.placement.candidates.clone();
     let current =
       state::with_state(|s| s.fleet.configuration().place(object).candidates).unwrap_or_default();
@@ -3690,7 +3696,7 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
         candidates.push(host);
       }
     }
-    match crate::live_ship::fetch(object, placed.epoch, candidates).await {
+    match crate::live_ship::fetch(object, placed.epoch, candidates, holders).await {
       Ok(fetched) => fetched,
       Err(waits) => {
         count_refusal(waits);
@@ -7001,6 +7007,17 @@ async fn retire_shard_tombstones(
   for object in retired {
     owner_acceptor.forget_object(object);
     owner_acceptor.forget_object(object.catalog());
+    // The routing forgets the volume too, as a holder's does when it accepts the retirement (`tombstone::on_held`).
+    // A successor that took a destroyed volume over tracks itself its owner (`takeover::record_adoption`); kept after
+    // the retirement, it answered every verb on the volume `Overloaded` as an owned volume not yet materialized, for
+    // good, while the other survivor answered `NotFound` (6 of 6 runs, 2026-11-06, `crates/cli/tests/live_chaos.rs`:
+    // an unanswered destroy, then its owner's loss).
+    let _ = state::with_state(|s| {
+      for register in [object, object.catalog()] {
+        s.fleet.forget_object(register);
+        s.departed_owners.remove(&register);
+      }
+    });
   }
 }
 
@@ -7172,6 +7189,8 @@ fn record_acks_in(
   crate::live_ship::resolve(state, object.0);
   // A destroy is answered once its tombstone is placed (`live_ship::defer_destroy`).
   crate::live_ship::resolve_destroys(state, object.0);
+  // A live shipper waits for its holders' catalog to be placed before it ships (A-240).
+  crate::live_ship::catalog_placed(state, object);
 }
 
 /// Borrows out of the shard state the live sessions of the holders satisfying `wanted`, leaving each borrowed

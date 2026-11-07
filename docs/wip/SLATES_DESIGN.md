@@ -5115,6 +5115,10 @@ reconnaissance because the touched partitions are named up front).
 > does not close the broader AC-8.18 state-transfer obligation. Cross-region forwarding's independent
 > all-alive-members owner guess is corrected by the owner-location exchange below. Record:
 > `docs/bugs/2026-09-17-takeover-ranks-an-empty-replacement.md`.
+>
+> **A live log's holders (2026-11-06, A-240).** A live-shipped volume's log has no held record per holder to retain
+> a candidate set, so its shipper records its holders in the volume's catalog before it ships. Phase one counts
+> `f + 1` among those holders alone, never among a placement rebuilt after a member joined.
 
 **Promotion and takeover.** When SWIM declares a host dead, or an operator moves it, the regional
 group bumps the host's epoch and assigns each of its objects to the surviving candidate holder
@@ -5924,6 +5928,12 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > entry with no key for it, and that candidate, the successor, never served the volume. A takeover also acts on a
 > holder's `ConfigurationStale` now (pages and the adopted record), so a learner successor one version behind fetches
 > the configuration rather than asking under it for good (same bug record).
+>
+> **Phase one counts among the recorded holders (2026-11-06, A-240).** "Every candidate's report counts" above now
+> holds only for a candidate the shipper recorded as a holder. A member placed after the writes still reports and is
+> fenced, but does not count toward `f + 1`. Each shipper records its epoch and holders in the volume's catalog and
+> ships nothing until that catalog is placed. Phase one waits for `f + 1` of those holders and never falls back to the
+> current placement.
 >
 > **A checkpoint ships a live volume's changes, not the volume (2026-11-05).** A live log's whole record copies every
 > byte of the volume; it is owed only when a delta would not apply to what the candidates hold (the log's first record,
@@ -14000,7 +14010,8 @@ than the owner's retained tail is caught up by a checkpoint, never by an unbound
 phase one every answering holder raises its fence to the new epoch and reports, per live-shipped volume, the epoch of
 its last entry, its position and that entry's identity. The successor adopts the report with the greatest
 (last epoch, position), which is Raft's up-to-date rule (Ongaro, thesis §3.6.1). A durable entry is held by `f + 1`
-candidates and phase one's answers come from `f + 1` candidates, so the two sets meet in at least one live holder of
+candidates and phase one's answers come from `f + 1` of the holders the shipper recorded before it shipped (A-240), so
+the two sets meet in at least one live holder of
 it whenever at most `f` candidates are lost (the owner among them); a holder whose last entry is under a later epoch received a log its owner adopted the same way. The successor
 serves from the adopted replica, which loses no acknowledged write (AC-8.3), and re-ships from there under its own
 epoch: a holder holding an entry the old owner never made durable fails the chain and takes a checkpoint.
@@ -14067,11 +14078,69 @@ holder set now changes as Vertical Paxos changes a configuration (Lamport, Malkh
   configuration's candidates by a transition of its own.
 
 The record is A-240's (raft-chaos: the shipper records its holders in the volume's catalog and phase one counts them).
-Until it lands the daemon activates against the configuration's candidates, which phase one counts today. Model:
+`live_ship::follow_candidates` commits the target as the holder set once `target_recordable` holds (transferred, and the
+last whole entry covers every candidate and is durable) and activates it once that catalog version is placed at `f + 1`;
+the successor's counted set and the record's model cases are raft-chaos's, on top. Model:
 `crates/db/tests/live.rs` with `Following` (400 seeds, 0 broken under the rule; the record-at-once and fixed-holder
 mutations broken). Bug record `docs/bugs/2026-11-07-a-live-shipper-made-before-its-candidates-were-known-shipped-to-nobody.md`.
 **Applied in the same change to:** `crates/db/src/live.rs`, `crates/server/src/live_ship.rs`, §4.10's live-shipping
 status, GAPS.
+
+### A-240 — A live log's phase one counts its quorum among the holders its shipper recorded before it shipped (accepted and built 2026-11-06; the supervisor's option (C))
+
+- **Why.** A-200's phase one took any `f + 1` reports. Its argument needs them to come from the hosts that hold the
+  durable entries, and nothing recorded which those were: the takeover counted the current placement. A member placed
+  after the writes holds none of the log. Counted in place of a holder that could not answer, it let a stale head be
+  adopted. The model found 10 broken seeds of 400 (StaleNeverCommits). On KIND a holder kept fence 1 after a takeover
+  at epoch 2 (runs 42326682216 and 42331191530). Bug record:
+  `docs/bugs/2026-11-06-a-live-takeover-counted-members-that-never-held-the-log.md`.
+- **The rule.**
+  - Each shipper, a successor's too, records its epoch and holder set in the volume's catalog register before its
+    first entry (`Op::LiveHoldersCommitted`, `PolicyRecord::live_holders`).
+  - It ships nothing until that catalog version is placed at `f + 1`, as a head's catalog is. At `f = 0` the owner's
+    commit places it, with the same code (R8).
+  - Phase one counts `f + 1` reports only among the holders the adopted catalog records. Every member asked still
+    reports, and the greatest head among all reports is adopted.
+  - When too few recorded holders answer, phase one waits (`fleet.live.takeover_waits_quorum`). It never falls back to
+    the current placement.
+  - A catalog that records no holders belongs to a shipper that never shipped: there is no log, and the volume is
+    served from its placed seal.
+  - A successor keeps the recorded holders in its own record until its shipper records its own, so a catalog it ships
+    meanwhile still names the hosts that hold the log.
+  - Phase one asks for heads only (`slates_db::live::Report`): each holder raises its fence and reports its head and
+    the bytes it keeps, a few bytes each, within the liveness budget. Only the adopted holder's log is then fetched
+    (`live_ship::fetch_log`), under a budget its reported bytes derive (`bytes × smoothed RTT / congestion window`
+    plus the liveness budget). Asking every holder for its whole log in one exchange held to 1 s, no takeover
+    finished over KIND's shaped paths once A-240 needed a remote holder's answer (run 42357611870: `wan`, `wan-loss`
+    and `ceiling`, 621 waits for the quorum, the successor's sessions left lent).
+- **Rejected.**
+  - Asking the old placement alone: a takeover's placement retention (§4.8, 2026-09-17) covers registers, but a
+    shipper's holders are fixed when it starts, and only a record says which they were.
+  - Counting reachable candidates and trusting the fence: a fresh member's empty report is fenced too (2026-11-05), and
+    the model still broke 10 seeds when `f + 1` reachable candidates were counted.
+- **Cost.** A shipper's first entry waits one catalog round: the catalog's placement ships the entry at once
+  (`live_ship::catalog_placed`). Later entries pay nothing.
+- **Evidence.**
+  - The model: `phase_one_meets_the_logs_holders_when_a_fresh_member_has_joined` in `crates/db/tests/live.rs` adds a
+    fresh member before half the takeovers, at f = 1 and f = 2. 0 of 400 seeds broken, 218 members joined. The
+    mutation (counting the first `f + 1` reachable candidates) stays as a test and breaks 10 seeds.
+  - Processes: `a_member_that_never_held_the_log_never_stands_in_for_its_holder` in `crates/cli/tests/live_chaos.rs`,
+    on five nodes at f = 1, CI ubuntu-latest, release, 2026-11-07. The holder with the log is stopped for 3 s the moment
+    a survivor adopts the registers. With phase one counting the current placement (the mutation), 4 of 13 runs left a
+    holder at fence 1 below the takeover's epoch 2. With A-240, 0 of 13 did, and none lost a write.
+  - KIND (run 42365340676, live-durability 480a620a with A-240): every write acknowledged in all four profiles. Each
+    volume was taken over whole at epoch 2: unshaped after 2.5 s (1,000 writes), wan and wan-loss after 16.9 s (300
+    each), ceiling after 57.2 s (50). Before the two-step fetch, no takeover finished under the shaped profiles (run
+    42357611870). Before A-240, a holder was left at fence 1 (run 42341005472).
+- **Open.** The holder set is fixed for a shipper's life, and the placement is not. A survivor outside the log's
+  holders cannot open the log (`takeover_refused.open`, CI), and a recorded set must change only after the new set
+  holds the log (Vertical Paxos activation). The joint transition's Shipper side is built (A-200's amendment of 2026-11-07,
+  live-fixes); the record that names each target is raft-chaos's, on top of it.
+
+Applied in the same change to: §4.10 (A-200's takeover paragraph and status), §4.8 (the note on takeover placement
+retention), `crates/db/src/{live,catalog,op,partition}.rs`, `crates/server/src/{live_ship,fleet,catalog,verbs}.rs`, the
+`PolicyRecord` sites (`oci.rs`, `image.rs`, the db tests and bench), `crates/db/tests/live.rs`,
+`crates/cli/tests/live_chaos.rs`, GAPS, and the bug record.
 
 ### A-212 — What a live WinFsp receive reads and clears, and what a rename visits (2026-11-05)
 

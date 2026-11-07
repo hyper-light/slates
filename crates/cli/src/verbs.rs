@@ -2414,7 +2414,7 @@ fn telemetry_text(batch: &TelemetryReport) -> String {
 /// election state — term, priority, rank, lease and the campaigns it began.
 fn group_text(group: &str, report: &slates_client::GroupReport) -> String {
   format!(
-    "fleet_{group}_leads: {}\nfleet_{group}_base_periods: {}\nfleet_{group}_span_periods: {}\nfleet_{group}_rtt_tail_ns: {}\nfleet_{group}_rtt_spread_ns: {}\nfleet_{group}_samples: {}\nfleet_{group}_term: {}\nfleet_{group}_priority_ns: {}\nfleet_{group}_priority_spread_ns: {}\nfleet_{group}_rank: {}\nfleet_{group}_leader_lease: {}\nfleet_{group}_pre_elections: {}\nfleet_{group}_elections: {}\nfleet_{group}_pre_votes_granted: {}\nfleet_{group}_pre_votes_refused: {}\nfleet_{group}_refused_role: {}\nfleet_{group}_refused_leased: {}\nfleet_{group}_refused_term: {}\nfleet_{group}_refused_log: {}\nfleet_{group}_voters: {}\nfleet_{group}_joint: {}\n",
+    "fleet_{group}_leads: {}\nfleet_{group}_base_periods: {}\nfleet_{group}_span_periods: {}\nfleet_{group}_rtt_tail_ns: {}\nfleet_{group}_rtt_spread_ns: {}\nfleet_{group}_samples: {}\nfleet_{group}_term: {}\nfleet_{group}_priority_ns: {}\nfleet_{group}_priority_spread_ns: {}\nfleet_{group}_rank: {}\nfleet_{group}_leader_lease: {}\nfleet_{group}_pre_elections: {}\nfleet_{group}_elections: {}\nfleet_{group}_pre_votes_granted: {}\nfleet_{group}_pre_votes_refused: {}\nfleet_{group}_refused_role: {}\nfleet_{group}_refused_leased: {}\nfleet_{group}_refused_term: {}\nfleet_{group}_refused_log: {}\nfleet_{group}_voters: {}\nfleet_{group}_joint: {}\nfleet_{group}_voter_ids: {}\n",
     report.leads,
     report.base_periods,
     report.span_periods,
@@ -2435,7 +2435,13 @@ fn group_text(group: &str, report: &slates_client::GroupReport) -> String {
     report.refused_term,
     report.refused_log,
     report.voters,
-    report.joint
+    report.joint,
+    report
+      .voter_ids
+      .iter()
+      .map(u64::to_string)
+      .collect::<Vec<String>>()
+      .join(" ")
   )
 }
 
