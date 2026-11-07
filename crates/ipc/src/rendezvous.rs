@@ -11,10 +11,12 @@
 //! - macOS: the daemon creates a bootstrap object with `shm_open` (per-user name, mode 0600,
 //!   the kernel's uid check is the authentication) holding a table of claim slots; a client
 //!   claims a free slot by compare-and-swap, writes its pid, and waits on the slot's state
-//!   word; the daemon's control shard finds the claim, creates the region, writes its name
-//!   and length into the slot and releases the state to ready; the client opens the region
-//!   and marks the slot done so the daemon can reclaim it. Liveness of a client is its
-//!   heartbeat slot (§4.7's "slot heartbeat lapse").
+//!   word; the daemon's control shard finds the claim, creates the region, unlinks its name,
+//!   keeps it with the instance owner's Mach token for that slot and that pid (`crate::mach_claim`),
+//!   writes its length into the slot and releases the state to ready; the client fetches the
+//!   region from the token as a fileport and marks the slot done so the daemon can reclaim it.
+//!   No region is ever named where a same-uid stranger could open it (GAP-A9-9). Liveness of a
+//!   client is its heartbeat slot (§4.7's "slot heartbeat lapse").
 //! - Windows: the same bootstrap shape over a `Local\` section (the DACL is the
 //!   authentication), with a named Event per claim slot. A section's name lives while any
 //!   process maps it and cannot be unlinked, and every connected client's doorbell maps the
@@ -2807,8 +2809,7 @@ pub mod platform {
     /// moment the bootstrap object does (Windows; [`Bell`]).
     #[cfg(windows)]
     _doorbell_event: crate::wake::Event,
-    /// The instance, for the doorbell waiters' own handles.
-    #[cfg(windows)]
+    /// The instance: for the doorbell waiters' own handles (Windows), and the token its regions are kept with (macOS).
     instance: String,
     /// This daemon's ownership of the object when it made its own (A-176); none when it adopted its anchor's.
     _owner: Option<Owner>,
@@ -3010,8 +3011,10 @@ pub mod platform {
   pub(super) struct Owner {
     #[cfg(windows)]
     _token: crate::wake::Event,
+    /// The token, served on a thread of its own, through which every client of the instance fetches its region
+    /// (GAP-A9-9, `crate::mach_claim`).
     #[cfg(target_os = "macos")]
-    _token: crate::owner_name::OwnerName,
+    _service: crate::mach_claim::OwnerService,
   }
 
   /// The name of the owner's token (Windows), beside the bootstrap object's.
@@ -3055,7 +3058,9 @@ pub mod platform {
         instance: instance.to_owned(),
       }
     })?;
-    Ok(Owner { _token: token })
+    Ok(Owner {
+      _service: crate::mach_claim::OwnerService::start(token, SLOTS, STALE_SLOT_NS)?,
+    })
   }
 
   /// A fresh bootstrap object for `instance`, owned by this process: the header's magic and slot count, every slot
@@ -3204,7 +3209,6 @@ pub mod platform {
           .collect::<Result<Vec<_>, _>>()?,
         #[cfg(windows)]
         _doorbell_event: crate::wake::Event::open(&doorbell_event_name(instance))?,
-        #[cfg(windows)]
         instance: instance.to_owned(),
         _owner: owner,
       })
@@ -3332,7 +3336,7 @@ pub mod platform {
       let wanted = read_u32(&self.object, at.saturating_add(AT_CLIENT))?;
       let pid = read_u32(&self.object, at.saturating_add(AT_PID))?;
       let client_id = assign(wanted);
-      let Prepared { region, .. } = match make_region(client_id) {
+      let Prepared { mut region, .. } = match make_region(client_id) {
         Ok(prepared) => prepared,
         Err(error) => {
           self.refuse(index, &error)?;
@@ -3345,17 +3349,7 @@ pub mod platform {
         client_id,
         cause: Box::new(cause),
       };
-      let (handoff, len) = region.handoff().map_err(lost)?;
-      let Handoff::Name(name) = handoff else {
-        return Err(lost(IpcError::Layout {
-          reason: "a region here hands off a name",
-        }));
-      };
-      if name.len() > NAME_BYTES {
-        return Err(lost(IpcError::Layout {
-          reason: "region name longer than the slot holds",
-        }));
-      }
+      let (name, len) = self.hand_over(index, pid, &mut region).map_err(lost)?;
       write_answer(&mut self.object, at, client_id, len, &name).map_err(lost)?;
       write_answerer(&mut self.object, at, self.stamp, current_pid()).map_err(lost)?;
       self.publish(index, READY).map_err(lost)?;
@@ -3368,6 +3362,49 @@ pub mod platform {
         region,
         control: Some(Control),
       })
+    }
+
+    /// What the claim in slot `index`, made by process `pid`, is answered with, and the region's length (macOS,
+    /// GAP-A9-9): no name. The region's name is unlinked, so no process can open it by name, and the region is kept with
+    /// the instance's token for that claim and that process alone (`crate::mach_claim`), before the answer is published.
+    #[cfg(target_os = "macos")]
+    fn hand_over(
+      &self,
+      index: usize,
+      pid: u32,
+      region: &mut ClientRegion,
+    ) -> Result<(String, usize), IpcError> {
+      region.unlink_name()?;
+      let len = region.object().len();
+      crate::mach_claim::keep(
+        &owner_token_name(&self.instance),
+        index,
+        pid,
+        region.object().as_fd(),
+      )?;
+      Ok((String::new(), len))
+    }
+
+    /// What the claim in slot `index` is answered with (Windows): the region's name, which the claimant opens.
+    #[cfg(windows)]
+    fn hand_over(
+      &self,
+      _index: usize,
+      _pid: u32,
+      region: &mut ClientRegion,
+    ) -> Result<(String, usize), IpcError> {
+      let (handoff, len) = region.handoff()?;
+      let Handoff::Name(name) = handoff else {
+        return Err(IpcError::Layout {
+          reason: "a region here hands off a name",
+        });
+      };
+      if name.len() > NAME_BYTES {
+        return Err(IpcError::Layout {
+          reason: "region name longer than the slot holds",
+        });
+      }
+      Ok((name, len))
     }
 
     /// Answers slot `index` with `error`: the client bound when that is the reason, else no bound — the
@@ -3640,9 +3677,11 @@ pub mod platform {
       let (name, len) = read_answer(&self.object, at)?;
       // Read before the slot is finished, refused after: an answer that names no daemon still frees its slot.
       let answerer = read_answerer(&self.object, at);
+      // The region is fetched while the slot is still this claim's, so no later claim of the slot is kept in its place.
+      let region = self.region(name, len);
       finish(&self.object, self.index, READY, &self.instance)?;
       let (stamp, daemon_pid) = answerer?;
-      let region = ClientRegion::open(&Handoff::Name(name), len)?;
+      let region = region?;
       // The daemon that answered was alive: watch its process from here, and judge it by its own stamp (A-143). The
       // header names whichever daemon published last; a claim begun before a restart is answered by the next daemon
       // (A-114), and one answered just before a restart is read after it.
@@ -3664,6 +3703,32 @@ pub mod platform {
       })
     }
   }
+
+  impl Claim {
+    /// The answered claim's region (macOS, GAP-A9-9): fetched from the instance's token, which keeps it for this claim
+    /// and this process alone; the answer names nothing.
+    #[cfg(target_os = "macos")]
+    fn region(&self, _name: String, len: usize) -> Result<ClientRegion, IpcError> {
+      let wait_ms = u32::try_from(CLAIM_WAIT_NS.div_ceil(NS_PER_MS)).unwrap_or(u32::MAX);
+      let fd = crate::mach_claim::fetch(
+        &self.instance,
+        &owner_token_name(&self.instance),
+        self.index,
+        wait_ms,
+      )?;
+      ClientRegion::from_descriptor(fd, len)
+    }
+
+    /// The answered claim's region (Windows): opened by the name the answer carries.
+    #[cfg(windows)]
+    fn region(&self, name: String, len: usize) -> Result<ClientRegion, IpcError> {
+      ClientRegion::open(&Handoff::Name(name), len)
+    }
+  }
+
+  /// Format: nanoseconds in a millisecond, a Mach timeout's unit.
+  #[cfg(target_os = "macos")]
+  const NS_PER_MS: u64 = 1_000_000;
 
   impl Drop for Claim {
     /// A claim dropped unanswered (a cancelled connect) gives its slot back, only while it is still
@@ -3793,6 +3858,59 @@ pub mod platform {
       assert_eq!(state(&client, index).unwrap().load(Acquire), CLAIMED);
       drop(claim);
       assert_eq!(state(&client, index).unwrap().load(Acquire), FREE);
+    }
+
+    /// GAP-A9-9 (a same-uid stranger opened any client's ring by name, `docs/bugs/2026-10-18-macos-shares-by-name-so-a-
+    /// stranger-opens-any-clients-ring.md`). Do: a client claims and the daemon answers it with a real region, and the
+    /// client connects; then, as a stranger that never claimed, read every claim slot of the bootstrap object for the
+    /// region's name, and open the region by the name the daemon made it under. Expect: the client holds its region, no
+    /// slot holds the name, and the open is refused: the region is reachable only through what the daemon handed its
+    /// claimant.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stranger_finds_no_clients_region_by_name() {
+      let name = instance("stranger");
+      let mut listener = Listener::open(&name, None).unwrap();
+      let mut claim = begin(&name, 0, CLAIM_WAIT_NS).unwrap();
+      let accepted = accept(&mut listener, "victim")
+        .unwrap()
+        .expect("the claim is answered");
+      let region_name = format!("rdvr-victim-{}-{}", accepted.client_id, std::process::id());
+      let connected = loop {
+        if let Some(connected) = claim.poll().unwrap() {
+          break connected;
+        }
+        accept(&mut listener, "late").unwrap();
+      };
+      assert_eq!(
+        connected.region.client_id(),
+        accepted.client_id,
+        "the client holds its own region"
+      );
+      let object_name = match SharedObject::handoff_for_name(&region_name) {
+        Some(Handoff::Name(object_name)) => object_name,
+        other => panic!("a macOS object is named: {other:?}"),
+      };
+      let stranger = client_mapping(&name);
+      for index in 0..SLOTS {
+        let mut slot = [0u8; NAME_BYTES];
+        stranger.read(slot_at(index) + AT_NAME, &mut slot).unwrap();
+        let named = slot
+          .windows(object_name.len())
+          .any(|window| window == object_name.as_bytes());
+        assert!(
+          !named,
+          "claim slot {index} names the client's region {object_name}"
+        );
+      }
+      let opened = ClientRegion::open(
+        &Handoff::Name(object_name.clone()),
+        connected.region.object().len(),
+      );
+      assert!(
+        opened.is_err(),
+        "a stranger opened the client's region {object_name} by name"
+      );
     }
 
     /// AUD-29-09 (header publication). Do: create the bootstrap object with its header written but the

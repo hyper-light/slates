@@ -24,7 +24,8 @@ use crate::state::ShardState;
 /// The transport a form asks for, for its refusal by kind.
 fn transport_of(form: &AttachRequest) -> AttachTransport {
   match form {
-    AttachRequest::Root => AttachTransport::Root,
+    // A CLI attachment is a root attachment with a term (A-230).
+    AttachRequest::Root | AttachRequest::Termed => AttachTransport::Root,
     AttachRequest::HostMount
     | AttachRequest::ScopedHostMount { .. }
     | AttachRequest::BoundHostMount { .. } => AttachTransport::NfsLoopback,
@@ -107,9 +108,10 @@ pub(crate) fn consumer(
   state: &ShardState,
   form: &AttachRequest,
   client_id: u32,
+  expires_ns: u64,
 ) -> Result<Consumer, Refusal> {
   if client_id != crate::verbs::FORWARDED_CLIENT {
-    return crate::verbs::consumer_of(form, client_id);
+    return crate::verbs::consumer_of(form, client_id, expires_ns);
   }
   if let Some(refusal) = foreign_form(form) {
     return Err(refusal);
@@ -161,6 +163,7 @@ pub(crate) fn may_use(state: &ShardState, record: &AttachmentRecord) -> bool {
   match record.consumer {
     Consumer::Remote { host, .. } => !local && host == requester,
     Consumer::Sdk { .. }
+    | Consumer::Termed { .. }
     | Consumer::Bridge
     | Consumer::Launcher
     | Consumer::Mount { .. }

@@ -1565,7 +1565,8 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
           source: source.to_owned(),
           destination: destination.to_owned(),
         },
-        (None, None) => slates_client::AttachRequest::Root,
+        // A CLI attachment outlives this process for a term, for later `slates` processes to name (A-230).
+        (None, None) => slates_client::AttachRequest::Termed,
         (Some(_), None) => return Err(ParseError::Missing("--oci-destination CONTAINER_PATH")),
         (None, Some(_)) => return Err(ParseError::Missing("--oci-source HOST_PATH")),
       };
@@ -2253,7 +2254,7 @@ mod tests {
         volume: parse_volume_id("00000000000000000000000000000001").unwrap(),
         snapshot: Some(slates_client::SnapshotId { value: 3 }),
         intent: Intent::Write,
-        form: slates_client::AttachRequest::Root,
+        form: slates_client::AttachRequest::Termed,
       }
     );
     assert_eq!(

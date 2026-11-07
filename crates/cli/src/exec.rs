@@ -96,10 +96,36 @@ fn enter_namespace() -> Result<(), Failure> {
     ))
   })?;
   // The mapping: deny setgroups, then map this uid and gid to themselves inside the namespace.
-  write_proc("/proc/self/setgroups", "deny")?;
-  write_proc("/proc/self/gid_map", &format!("{gid} {gid} 1"))?;
-  write_proc("/proc/self/uid_map", &format!("{uid} {uid} 1"))?;
-  Ok(())
+  write_proc("/proc/self/setgroups", "deny")
+    .and_then(|()| write_proc("/proc/self/gid_map", &format!("{gid} {gid} 1")))
+    .and_then(|()| write_proc("/proc/self/uid_map", &format!("{uid} {uid} 1")))
+    .map_err(|refused| confined_by_apparmor().unwrap_or(refused))
+}
+
+/// Format: the sysctl through which Ubuntu's AppArmor (24.04 and later) confines every unprivileged user namespace.
+const APPARMOR_USERNS_SYSCTL: &str = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
+/// Format: the bytes of that sysctl's value, a flag and its newline (`0\n` or `1\n`).
+const SYSCTL_FLAG_BYTES: usize = 2;
+
+/// The refusal for a host whose AppArmor confines unprivileged user namespaces, or `None` when it does not. There
+/// `unshare` succeeds, but it moves the process into the `unprivileged_userns` profile, which denies the namespace every
+/// capability: its own maps are refused, and so is the bind. That holds whoever writes the maps, so no other unprivileged
+/// sequence exists (CI's ubuntu-latest and ubuntu-24.04-arm, diagnostics run 42169647315: `apparmor="DENIED"
+/// operation="capable" profile="unprivileged_userns" capname="sys_admin"`). Lifting it is the operator's, and needs root
+/// (R10), so the refusal names both ways.
+fn confined_by_apparmor() -> Option<Failure> {
+  // structural: allow — a read of a /proc/sys value (a kernel pseudo-file, not disk, R1).
+  let fd = rustix::fs::open(APPARMOR_USERNS_SYSCTL, OFlags::RDONLY, Mode::empty()).ok()?;
+  let mut value = [0u8; SYSCTL_FLAG_BYTES];
+  let read = rustix::io::read(&fd, &mut value).ok()?;
+  (read > 0 && value.first() == Some(&b'1')).then(|| {
+    Failure::Failed(
+      "this host's AppArmor confines unprivileged user namespaces (kernel.apparmor_restrict_unprivileged_userns=1), \
+       so the launcher's namespace has no capability to bind the volume; an administrator can allow it with an \
+       AppArmor profile for the slates binary that grants `userns,`, or set the sysctl to 0"
+        .to_owned(),
+    )
+  })
 }
 
 /// Writes `contents` to a `/proc/self` control file (a kernel pseudo-file, not disk, so this
