@@ -1,2 +1,5 @@
 tested ef588f4c02268c3bf64c7af92c6ba1c0a88f46ca on x86_64, 4 cpus
 build exit 0
+run 1 exit 0 2s load=2.70 1.00 0.37
+    green over 4000 files of 16384 bytes: 975.248493ms, reply GreenCreated { id: VolumeId { bytes: [77, 63, 55, 150, 152, 55, 253, 184, 0, 0, 0, 0, 0, 0, 11, 246] } }; 1112 probes inside it — p50 410.003µs, p99 732.327µs, longest of all 79.995174ms; before it the longest 487.317µs
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.16s
