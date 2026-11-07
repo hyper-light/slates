@@ -345,10 +345,13 @@ fn wait_neighbourhood_settled(instances: &[String]) {
     {
       return;
     }
-    assert!(
-      window.moving(&format!("{views:?}")),
-      "every neighbourhood settled, or kept changing, within each fleet wait: {views:?}"
-    );
+    if !window.moving(&format!("{views:?}")) {
+      // What the stuck node reported and shipped toward its new cohort (live-fixes, 2026-11-07).
+      panic!(
+        "every neighbourhood settled, or kept changing, within each fleet wait: {views:?}\n{}",
+        diagnosis(instances, "")
+      );
+    }
     pause();
   }
 }
@@ -1313,6 +1316,9 @@ fn diagnosis(instances: &[String], volume: &str) -> String {
             || line.contains("fleet.materialize")
             || line.contains("fleet.seal.")
             || line.contains("fleet.plane.")
+            || line.contains("fleet.report.")
+            || line.contains("fleet.ship.")
+            || line.starts_with("fleet_record_link")
             || line.contains("fleet.link.")
             || line.contains("fleet.accept.")
             || line.starts_with("fleet_formed_probe_peers")

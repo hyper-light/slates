@@ -14511,6 +14511,10 @@ holder set now changes as Vertical Paxos changes a configuration (Lamport, Malkh
   `f + 1` reports meet it (`W + f + 1 > n`) and the owner and `W` holders survive `f` failures. The `f`-th highest
   holder, right for `2f`, counted one of three when the owner fell outside its own placement (raft-chaos, CI); `n − f`
   alone counted the owner and one holder at `f = 2` with three (raft's review).
+- A holder set of `f` or fewer members is never moved to (`Shipper::begin_transition` refuses it): no takeover counts
+  `f + 1` reports from it, and a candidate found dead leaving one other at `f = 1` moved the log onto that one, so
+  writes stalled for a partition's length when it stopped before the move back was recorded (live-durability's rolling
+  partition flow, 4 of 6 runs on each arch at 8b0f0341). The current holders keep making `W` with those still alive.
 
 The record is A-240's (raft-chaos: the shipper records its holders in the volume's catalog and phase one counts them).
 `live_ship::follow_candidates` commits the target as the holder set once `target_recordable` holds (transferred, and the
