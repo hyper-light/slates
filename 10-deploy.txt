@@ -119,3 +119,5 @@ shard 0 refused fleet.takeover.adopted: 2
 shard 1 refused attach.foreign_refused.owner_unknown: 1
 --- the council did not widen to every node within 40s after the refusal
 0
+=== run 9 exit 0 load { 14.07 10.84 9.03 }
+0
