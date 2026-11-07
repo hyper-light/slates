@@ -140,3 +140,5 @@ the bootstrap node's live writes became durable and both candidates hold them: S
 live bootstrap: written=true caught_up=true shipping=Some(("5", "5", "false")) held=[Some(("5", "none", "false")), Some(("5", "none", "false"))] [("live-bootstrap-a-20809", {"held": 10, "hold_refused": 9, "hold_refused.no_catalog": 2, "hold_refused.not_a_member": 7}), ("live-bootstrap-b-20809", {"ap
 === bootstrap on 1 exit 0 load { 48.23 33.77 21.14 }
 live bootstrap: written=true caught_up=true shipping=Some(("5", "5", "false")) held=[Some(("5", "none", "false")), Some(("5", "none", "false"))] [("live-bootstrap-a-20967", {"held": 6, "hold_refused": 12, "hold_refused.no_catalog": 2, "hold_refused.not_a_member": 10}), ("live-bootstrap-b-20967", {"a
+=== bootstrap on 2 exit 0 load { 48.76 34.37 21.50 }
+live bootstrap: written=true caught_up=true shipping=Some(("5", "5", "false")) held=[Some(("5", "none", "false")), Some(("5", "none", "false"))] [("live-bootstrap-a-21390", {"appended": 6, "awaited": 5, "durable": 6, "held_back.placement": 7, "no_session": 5, "resolved": 5, "unanswered": 4, "whole":
