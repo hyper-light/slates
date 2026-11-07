@@ -14194,8 +14194,13 @@ status, GAPS.
     The shipper drops H once that record is placed (`Shipper::activate`). Recording H′ first, as A-240 first said, let
     a successor that died before its install was durable leave the next phase one counting a set that held none of the
     log. The model breaks NoLoss with the record made at once (`recording_a_new_holder_set_before_it_holds_the_log_…`).
-  - A write is answered only once a successor could open the log at it (`live_ship::answerable`): the last whole entry
-    carries a key for every candidate and is itself durable.
+  - A write is answered only once the set its durability counts is recorded at `f + 1`, and a successor could open the
+    log at it (`live_ship::answerable`: the last whole entry carries a key for every candidate and is itself durable).
+    A write is durable once `n − f` of each set's `n` holders hold it (live-fixes, 2026-11-07), so `f + 1` reports from
+    the set always meet it: `f` alone was right only for a set of `2f`, and a set of `2f + 1` (the placement moved off
+    the owner) left a holder unfenced (CI diag-20 run 7).
+  - **The invariant** (raft's review, 2026-11-07): every write ever answered was answered while the recorded holder
+    set held it, so the recorded set always holds everything answered, and phase one may count only it.
   - Phase one counts `f + 1` reports only among the holders the adopted catalog records. Every member asked still
     reports, and the greatest head among all reports is adopted.
   - When too few recorded holders answer, phase one waits (`fleet.live.takeover_waits_quorum`). It never falls back to
