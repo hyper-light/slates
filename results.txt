@@ -1,2 +1,5 @@
 tested 906964d37a2891b348e043d556bae2d3d7d1629d on aarch64, 4 cpus
 build exit 0
+run 1 exit 0 4s load=2.31 0.91 0.34
+    presentation of 1000 files of 16384 bytes: 659.902063ms, 1000 entries; 493 probes inside it — p50 665.286µs, p99 1.294167ms, longest of all 18.216574ms; before it the longest 736.674µs
+    test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.62s
