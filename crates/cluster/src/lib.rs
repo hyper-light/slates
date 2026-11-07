@@ -518,6 +518,9 @@ pub async fn request_within(
 pub struct BatchReplies {
   /// The replies, in the order of the requests.
   pub replies: Vec<Option<Vec<u8>>>,
+  /// How many of the requests were begun: a prefix, since the session's stream credit refused the rest. A reply missing
+  /// within it was not answered before the batch stalled; one past it was never sent.
+  pub begun: usize,
   /// The stream bytes consumed after the first turn that consumed any.
   pub streamed_bytes: u64,
   /// Nanoseconds from that turn to the last that consumed any.
@@ -540,7 +543,22 @@ pub async fn requests_within(
   requests: &[Vec<u8>],
   stall_ns: u64,
 ) -> (BatchReplies, Endpoint) {
-  let exchanges = begin_prefix(&mut endpoint, stream_id, priority, requests);
+  let replies = requests_on(&mut endpoint, stream_id, priority, requests, stall_ns).await;
+  (replies, endpoint)
+}
+
+/// [`requests_within`] on a session the caller keeps: the same batch, given up only once it stalls for `stall_ns`, its
+/// unanswered exchanges abandoned, the endpoint never leaving the caller's hands. For a caller that holds the session in
+/// its own state while the batch runs (a live log's lane, `slates_server::live_ship`), so the session goes back to its
+/// pool whatever happens to the batch.
+pub async fn requests_on(
+  endpoint: &mut Endpoint,
+  stream_id: u64,
+  priority: Priority,
+  requests: &[Vec<u8>],
+  stall_ns: u64,
+) -> BatchReplies {
+  let exchanges = begin_prefix(endpoint, stream_id, priority, requests);
   let mut replies: Vec<Option<Vec<u8>>> = vec![None; requests.len()];
   let mut streaming = Streaming::from(endpoint.bytes_consumed());
   let mut progress_ns = now_ns();
@@ -548,7 +566,7 @@ pub async fn requests_within(
     if streaming.observe(endpoint.bytes_consumed(), now_ns()) {
       progress_ns = now_ns();
     }
-    let (open, completed) = take_completed_replies(&mut endpoint, &exchanges, &mut replies);
+    let (open, completed) = take_completed_replies(endpoint, &exchanges, &mut replies);
     if completed {
       progress_ns = now_ns();
     }
@@ -570,14 +588,15 @@ pub async fn requests_within(
     }
   }
   let (streamed_bytes, streamed_ns) = streaming.measured();
-  (
-    BatchReplies {
-      replies,
-      streamed_bytes,
-      streamed_ns,
-    },
-    endpoint,
-  )
+  BatchReplies {
+    begun: exchanges
+      .iter()
+      .filter(|exchange| exchange.is_some())
+      .count(),
+    replies,
+    streamed_bytes,
+    streamed_ns,
+  }
 }
 
 /// Begins one exchange per request on `endpoint`, in order, stopping at the first the session refuses (its stream

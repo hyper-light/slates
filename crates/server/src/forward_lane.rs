@@ -277,6 +277,8 @@ pub(crate) async fn forward_batch(
         let bytes: usize = replies.iter().flatten().map(Vec::len).sum();
         let (first_ns, first_len) = first_reply.unwrap_or((last_ns, bytes));
         return Some(BatchReplies {
+          // A forward lane's tickets are all sent: its caller reads the replies, not how many began.
+          begun: replies.len(),
           replies,
           streamed_bytes: u64::try_from(bytes.saturating_sub(first_len)).unwrap_or(u64::MAX),
           streamed_ns: last_ns.saturating_sub(first_ns),
@@ -348,6 +350,7 @@ fn given_up(peer: HostId, held: &Held, begun: bool) -> Option<BatchReplies> {
     return None;
   }
   Some(BatchReplies {
+    begun: replies.len(),
     replies,
     streamed_bytes: 0,
     streamed_ns: 0,

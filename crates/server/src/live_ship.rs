@@ -171,15 +171,28 @@ pub(crate) struct LiveVolume {
   /// the shipper: dropped, the writes waiting on it were never answered (the resumed old owner held one for the fence
   /// flow's whole 40 s wait), and a stable NFS write parked there read "no shipper" as nothing to wait for.
   fenced: Option<HostEpoch>,
-  /// The holders a lane is shipping to now, each with when it began ([`dispatch`]): at most one lane a holder, so the
-  /// messages a holder lacks queue here, not as tasks waiting for its one session.
-  lanes: BTreeMap<HostId, u64>,
+  /// The holders a lane is shipping to now ([`dispatch`]): at most one lane a holder, so the messages a holder lacks
+  /// queue here, not as tasks waiting for its one session.
+  lanes: BTreeMap<HostId, Lane>,
+  /// Holders that answered a lane without moving forward (a refusal, or an answer off the chain), each with when it may
+  /// be sent to again and how long it last waited ([`lane_ended`]): the wait doubles while it keeps not moving.
+  stalled: BTreeMap<HostId, (u64, u64)>,
   /// The holders known to hold a version of the volume's catalog, which a holder's bound is derived from
   /// ([`hold_bound`]): every holder any of the catalog's placements named, kept. Bounded by the candidates.
   catalogued: Vec<HostId>,
   /// The bytes a candidate keeps of this log: the last whole entry and every entry since ([`keep`]). Once it reaches
   /// the volume's size the next publication ships whole, which clears them ([`kept_reaches_size`]).
   kept: usize,
+}
+
+/// One holder's lane on its owner shard ([`dispatch`]).
+#[derive(Clone, Copy, Debug)]
+struct Lane {
+  /// When the lane opened or the holder last moved forward on it ([`fold_into`]): a lane is busy while this is within
+  /// [`lane_expiry_ns`], so one shipping a long catch-up stays one lane.
+  heard_ns: u64,
+  /// What the holder held when the lane opened: whether the lane moved it forward ([`lane_ended`]).
+  held: Option<Head>,
 }
 
 /// What a candidate keeps of one live volume.
@@ -847,6 +860,7 @@ pub(crate) fn published(
       whole: None,
       fenced: None,
       lanes: BTreeMap::new(),
+      stalled: BTreeMap::new(),
       catalogued: Vec::new(),
       kept: 0,
     });
@@ -1099,11 +1113,19 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
   // A holder a lane is shipping to is sent its messages when the lane ends ([`lane_ended`]): nothing is built for it
   // now, an install least of all (a clone of the whole volume each: 1,631 built in one run, 2.3 GB copied on the owner
   // shard, for lanes that sent none of them).
+  // A holder backed off for answering without moving forward ([`lane_ended`]) is not sent to until its wait is over.
   let busy: Vec<HostId> = live
     .lanes
     .iter()
-    .filter(|(_, began)| now.saturating_sub(**began) < expiry)
+    .filter(|(_, lane)| now.saturating_sub(lane.heard_ns) < expiry)
     .map(|(holder, _)| *holder)
+    .chain(
+      live
+        .stalled
+        .iter()
+        .filter(|(_, (until, _))| now < *until)
+        .map(|(holder, _)| *holder),
+    )
     .collect();
   let mut sends = Vec::new();
   let mut stale_checkpoint = false;
@@ -1213,12 +1235,21 @@ fn dispatch(state: &mut ShardState, sends: Vec<Send>) {
       let busy = live
         .lanes
         .get(&send.holder)
-        .is_some_and(|began| now.saturating_sub(*began) < expiry)
+        .is_some_and(|lane| now.saturating_sub(lane.heard_ns) < expiry)
         && !opened.contains(&(send.object, send.holder));
       if busy {
         return false;
       }
-      live.lanes.insert(send.holder, now);
+      if !opened.contains(&(send.object, send.holder)) {
+        let held = live.shipper.held_by(send.holder);
+        live.lanes.insert(
+          send.holder,
+          Lane {
+            heard_ns: now,
+            held,
+          },
+        );
+      }
       if !opened.contains(&(send.object, send.holder)) {
         opened.push((send.object, send.holder));
       }
@@ -1238,8 +1269,12 @@ fn dispatch(state: &mut ShardState, sends: Vec<Send>) {
   }
 }
 
-/// Derived: how long a lane is taken to be shipping before it is passed over: the dispatch's own deadline (twice the
-/// live exchange's longest budget, [`send_from_control`]), past which its task cannot still be running.
+/// Derived: how long a lane may go without its holder moving forward before it is passed over (its task ended without
+/// reporting: its shard's shutdown, or its report refused): twice the live exchange's longest budget, past which a
+/// batch that made no progress has given up ([`ship_lane`]). Measured from the holder's last progress, not the lane's
+/// start: a lane shipping a long catch-up is still one lane. Until 2026-11-07 it was the lane's age, and a healed
+/// holder's catch-up of 1,015 entries outlived it: a second lane opened beside the first, and the two fought for the
+/// one session (`live_chaos`, CI `diag-live-durability-18`, writes of 2.3-2.4 s).
 fn lane_expiry_ns() -> u64 {
   crate::fleet::live_budget()
     .max_deadline_ns()
@@ -1251,30 +1286,57 @@ fn lane_expiry_ns() -> u64 {
 /// the next publication or the record period: sent again at once, a holder with no link (dropped to be dialed afresh)
 /// would end each new lane at once and loop between the shards at their speed.
 fn lane_ended(state: &mut ShardState, holder: HostId, objects: Vec<ObjectId>, answered: bool) {
+  let now = slates_rt::futures::now_ns();
   let mut sends = Vec::new();
   for object in objects {
     let Some(live) = state.live.shipping.get_mut(&object.0) else {
       continue;
     };
-    live.lanes.remove(&holder);
+    let lane = live.lanes.remove(&holder);
+    let moved = lane.is_some_and(|lane| live.shipper.held_by(holder) != lane.held);
+    // A holder that answered without moving forward (a refusal, an answer off the chain) is backed off ([`backoff`]):
+    // sent again at once, a refused install of the whole volume went straight back, 8,824 times and 16.4 GB in one run
+    // (`live_chaos`, CI `diag-live-durability-18`, a healed candidate refusing `not_a_candidate`).
+    if answered && !moved {
+      let waited = live.stalled.get(&holder).map_or(0, |(_, waited)| *waited);
+      let wait = backoff(waited);
+      live
+        .stalled
+        .insert(holder, (now.saturating_add(wait), wait));
+    } else if moved {
+      live.stalled.remove(&holder);
+    }
     if live.fenced.is_none() {
       sends.extend(
         pending_sends(state, object.0)
           .into_iter()
-          .filter(|send| answered || send.holder != holder),
+          .filter(|send| (answered && moved) || send.holder != holder),
       );
     }
   }
   dispatch(state, sends);
 }
 
+/// Derived: how long a holder that answered without moving forward waits before it is sent to again, given its last
+/// wait: one record poll at first (the live budget's poll interval, [`crate::fleet::live_budget`]), doubling, at most
+/// the lane expiry ([`lane_expiry_ns`]), so a holder that will never accept is sent at most once per expiry and one
+/// that recovers is found within one.
+fn backoff(waited_ns: u64) -> u64 {
+  let first = crate::fleet::live_budget().poll_interval_ns;
+  waited_ns
+    .saturating_mul(2)
+    .max(first)
+    .min(lane_expiry_ns().max(first))
+}
+
 /// Sends each message over the control shard's session to its holder, the holders at once: one lane per holder, its
 /// messages in order on its session, every lane polled together, and each lane's replies handed to the owner shard
-/// (`origin`) the moment its exchange ends. So a write is durable as soon as the fastest `f` holders answer, and a
-/// holder that does not answer delays no other: before 2026-11-06 the holders were asked in turn, each within up to a
-/// liveness budget for its session and again for its reply, and with one candidate stopped a write waited for it before
-/// the healthy one was asked (`live_chaos`'s rolling partition: writes at 1.0–6.6 s, at or past the budget, in 3 of 3
-/// runs). The stragglers' replies follow through [`fold_into`] when they come.
+/// (`origin`) the moment its batch ends ([`ship_lane`]). So a write is durable as soon as the fastest `f` holders
+/// answer, and a holder that does not answer delays no other: before 2026-11-06 the holders were asked in turn, each
+/// within up to a liveness budget for its session and again for its reply, and with one candidate stopped a write
+/// waited for it before the healthy one was asked (`live_chaos`'s rolling partition: writes at 1.0–6.6 s, at or past the
+/// budget, in 3 of 3 runs). The deadline only ends this shard's wait: the lanes run to their end on the control shard
+/// (`xshard::task_within`).
 async fn send_from_control(origin: u16, control: u16, sends: Vec<Send>) {
   let budget = crate::fleet::live_budget();
   let deadline = budget.max_deadline_ns().saturating_mul(2);
@@ -1285,7 +1347,7 @@ async fn send_from_control(origin: u16, control: u16, sends: Vec<Send>) {
       drain_stragglers();
       let mut lanes: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>> = Vec::new();
       for (holder, sends) in by_holder(sends) {
-        lanes.push(Box::pin(ship_to_holder(origin, holder, sends, budget)));
+        lanes.push(Box::pin(ship_to_holder(origin, holder, sends)));
       }
       every(lanes).await;
     },
@@ -1320,23 +1382,19 @@ async fn every(mut lanes: Vec<std::pin::Pin<Box<dyn std::future::Future<Output =
   .await;
 }
 
-/// One holder's lane of a dispatch, on the control shard: each message over the holder's session in turn, each answer
-/// folded on the owner shard as it comes. A message the holder did not answer ends the lane: the rest would each wait
-/// out the same budget, and the link it rode is dropped to be dialed afresh ([`lose_links`]), after which the next
-/// dispatch or the record period sends what the holder lacks.
-async fn ship_to_holder(
-  origin: u16,
-  holder: HostId,
-  sends: Vec<Send>,
-  budget: slates_cluster::CommitBudget,
-) {
+/// One holder's lane of a dispatch, on the control shard: its messages over the holder's session, each run of entries
+/// as one batch and each install alone ([`ship_lane`]), each batch's answers folded on the owner shard as they come. A
+/// batch the holder stopped answering ends the lane: the rest would wait out the same budget, and the link it rode is
+/// dropped to be dialed afresh ([`lose_links`]), after which the next dispatch or the record period sends what the
+/// holder lacks.
+async fn ship_to_holder(origin: u16, holder: HostId, sends: Vec<Send>) {
   let mut objects: Vec<ObjectId> = Vec::new();
   for send in &sends {
     if !objects.contains(&send.object) {
       objects.push(send.object);
     }
   }
-  let answered = ship_lane(origin, holder, sends, budget).await;
+  let answered = ship_lane(origin, holder, sends).await;
   // After the lane's own folds, so the owner sends what the holder lacks given its last answer.
   let control = state::with_state(|s| s.shard).unwrap_or(origin);
   crate::xshard::run_on_counted(control, origin, move |s| {
@@ -1344,78 +1402,84 @@ async fn ship_to_holder(
   });
 }
 
-/// The messages of one lane in turn ([`ship_to_holder`]): whether the holder answered every one it was sent.
-async fn ship_lane(
-  origin: u16,
-  holder: HostId,
-  sends: Vec<Send>,
-  budget: slates_cluster::CommitBudget,
-) -> bool {
-  for send in sends {
-    let sessions = borrow_session(holder, budget.max_deadline_ns()).await;
-    // Each message under its own budget: the liveness budget plus its transfer on the session it rides, so an install
-    // of the whole volume is not given up the moment an entry would be (`exchange_budget`).
-    let exchange = exchange_budget(send.bytes.len(), &sessions);
-    let exchanged =
-      slates_cluster::live::exchange((send.stream, &send.bytes), sessions, exchange, |_, _| true)
-        .await;
-    let answered = !exchanged.replies.is_empty();
-    if !answered {
-      let _ = state::with_state(|s| {
-        s.count(LIVE_UNANSWERED, 1);
-        if send.stream == slates_cluster::live::LIVE_STATE_STREAM {
-          s.count(LIVE_INSTALL_UNANSWERED, 1);
-        }
-      });
-    }
-    lose_links(&exchanged.unanswered);
-    crate::fleet::return_sessions(exchanged.reusable);
-    let replies: Vec<(ObjectId, HostId, Vec<u8>)> = exchanged
-      .replies
-      .into_iter()
-      .map(|(host, bytes)| (send.object, host, bytes))
-      .collect();
-    if !replies.is_empty() {
-      let control = state::with_state(|s| s.shard).unwrap_or(origin);
-      crate::xshard::run_on_counted(control, origin, move |s| fold_into(s, replies));
-    }
-    // After the answers are on their way to the owner, so durability waits for no straggler.
-    finish_stragglers(origin, send.object, exchanged.stragglers).await;
-    if !answered {
+/// The messages of one lane ([`ship_to_holder`]): whether the holder answered every one it was sent. A run of entries
+/// goes as one batch of exchanges on the holder's session (`slates_cluster::requests_on`), pipelined, so a holder
+/// catching up after a partition takes its missing entries at the path's rate, not one round trip each; an install goes
+/// alone, in the bulk class. A batch is given up only once it makes no progress for the liveness budget, so an install
+/// of the whole volume over a slow path is never cut off while it moves. The session stays in this task's hands for the
+/// batch and goes back to the pool after it. Until 2026-11-07 each message was its own exchange, run as a child task
+/// with a deadline estimated from its size: a healed holder 1,015 entries behind took them one round trip at a time,
+/// over 2 s, while the other candidate was stopped and every write waited (`live_chaos`, CI
+/// `diag-live-durability-18`, writes of 2.3-2.4 s).
+async fn ship_lane(origin: u16, holder: HostId, sends: Vec<Send>) -> bool {
+  let stall_ns = crate::fleet::live_budget().max_deadline_ns();
+  let mut queue: std::collections::VecDeque<Send> = sends.into();
+  while let Some(stream) = queue.front().map(|send| send.stream) {
+    let run = if stream == slates_cluster::live::LIVE_ENTRY_STREAM {
+      queue
+        .iter()
+        .take_while(|send| send.stream == stream)
+        .count()
+    } else {
+      1
+    };
+    let batch: Vec<Send> = queue.drain(..run).collect();
+    let Some(begun) = ship_batch(origin, holder, &batch, stall_ns).await else {
+      count_unanswered(stream);
       return false;
+    };
+    // What the session's stream credit did not admit goes first in the next batch.
+    for send in batch.into_iter().skip(begun).rev() {
+      queue.push_front(send);
     }
   }
   true
 }
 
-/// The budget one message to one holder gets: the liveness budget a reply gets, plus the time its bytes take at the
-/// session's window-limited rate. Derived: `bytes × smoothed RTT / congestion window` (one window a round trip, the
-/// slowest a sender in congestion avoidance moves), so an install of the whole volume is given its transfer and an
-/// entry, a few kilobytes, about nothing more. Under the liveness budget alone an install of 1.5 MB never finished
-/// over a session a partition had left at an initial window and a 100–240 ms smoothed RTT: each was cut off, its link
-/// dropped and dialed afresh, at an initial window again, and the whole volume sent again, 1,391 times (2.06 GB) while
-/// both candidates already held the owner's head, and no write became durable (2026-11-06, `live_chaos.rs`).
-fn exchange_budget(
-  bytes: usize,
-  sessions: &[(HostId, slates_transport::endpoint::Endpoint)],
-) -> slates_cluster::CommitBudget {
-  let live = crate::fleet::live_budget();
-  let transfer_ns = sessions.first().map_or(0, |(_, endpoint)| {
-    // Before any sample the smoothed RTT reads zero; the probe timeout, twice the initial RTT then, stands in.
-    let round_trip = match endpoint.smoothed_rtt() {
-      0 => endpoint.pto(),
-      measured => measured,
-    };
-    u64::try_from(bytes)
-      .unwrap_or(u64::MAX)
-      .saturating_mul(round_trip)
-      .checked_div(endpoint.congestion_window().max(1))
-      .unwrap_or(0)
+/// One batch of a lane ([`ship_lane`]), all on `batch`'s stream, over `holder`'s session: its answers folded on the owner
+/// shard (`origin`), and how many of it were begun (the rest go in the next batch). `None` when the holder had no
+/// session or stopped answering, whose link is then dropped to be dialed afresh: a session that went quiet may be dead
+/// at the holder's end, so it is not lent again.
+async fn ship_batch(origin: u16, holder: HostId, batch: &[Send], stall_ns: u64) -> Option<usize> {
+  let stream = batch.first()?.stream;
+  let (host, mut endpoint) = borrow_session(holder, stall_ns).await.pop()?;
+  let priority = if stream == slates_cluster::live::LIVE_STATE_STREAM {
+    slates_transport::streams::Priority::Bulk
+  } else {
+    slates_transport::streams::Priority::Control
+  };
+  let requests: Vec<Vec<u8>> = batch.iter().map(|send| send.bytes.clone()).collect();
+  let answers =
+    slates_cluster::requests_on(&mut endpoint, stream, priority, &requests, stall_ns).await;
+  let begun = answers.begun.min(batch.len());
+  let replies: Vec<(ObjectId, HostId, Vec<u8>)> = batch
+    .iter()
+    .zip(answers.replies)
+    .take(begun)
+    .filter_map(|(send, reply)| reply.map(|bytes| (send.object, holder, bytes)))
+    .collect();
+  let answered = replies.len() == begun;
+  if answered {
+    crate::fleet::return_sessions(vec![(host, endpoint)]);
+  } else {
+    drop(endpoint);
+    lose_links(&[host]);
+  }
+  if !replies.is_empty() {
+    let control = state::with_state(|s| s.shard).unwrap_or(origin);
+    crate::xshard::run_on_counted(control, origin, move |s| fold_into(s, replies));
+  }
+  answered.then_some(begun)
+}
+
+/// Counts a lane's message the holder did not answer (an install apart).
+fn count_unanswered(stream: u64) {
+  let _ = state::with_state(|s| {
+    s.count(LIVE_UNANSWERED, 1);
+    if stream == slates_cluster::live::LIVE_STATE_STREAM {
+      s.count(LIVE_INSTALL_UNANSWERED, 1);
+    }
   });
-  slates_cluster::CommitBudget::hard(
-    live.deadline_ns.saturating_add(transfer_ns),
-    live.poll_interval_ns,
-  )
 }
 
 /// Borrows `holder`'s record session, waiting for it while another dispatch has it out, one timer tick at a time,
@@ -1505,29 +1569,6 @@ fn recover_stragglers(
   done
 }
 
-/// Waits, on the lane's own task, for an exchange's stragglers to report, and recovers them ([`recover_stragglers`]).
-/// An exchange's requests are children of the task that made it (`slates_cluster::live::exchange`), and a task's end
-/// cancels its children: a request still in flight when its lane's task ended was dropped with its holder's session in
-/// it, never reported, and its slot stayed lent for good, so the owner shipped that holder nothing again (both of an
-/// owner's sessions `lent=true` with its log stuck two short of its head: `live_chaos` at load 118, 3 of 10 runs stalled
-/// without this and 0 of 10 with it at load 41-58; and the KIND leg's 80 ms WAN in 50-100 writes, raft-chaos run
-/// 42178128960, 2026-11-06). Each request is bounded by the exchange's own deadline, so this waits at most the gap
-/// between the exchange giving up and its requests doing so: a timer tick or two. A shard that can no longer time the
-/// wait leaves them to the drain ([`drain_stragglers`]).
-async fn finish_stragglers(
-  origin: u16,
-  object: ObjectId,
-  mut stragglers: slates_cluster::Stragglers,
-) {
-  while !recover_stragglers(origin, object, &mut stragglers) {
-    // Shape: one tick of the shard's timer wheel, the finest park there is (`sleep` rounds up to it).
-    if slates_rt::futures::sleep(1).await.is_err() {
-      settle_stragglers(origin, object, stragglers);
-      return;
-    }
-  }
-}
-
 /// Drops the record links of holders that answered nothing (on the control shard, where the links live): their link
 /// tasks dial afresh, as an unanswered discovery exchange's does (`fleet::exchange_discovery`). Returned to the pool, a
 /// session dead at a resumed peer's end was lent to every later message and none was ever answered: a candidate stopped
@@ -1568,6 +1609,13 @@ fn fold_into(state: &mut ShardState, replies: Vec<(ObjectId, HostId, Vec<u8>)>) 
     // looped at the network's speed: 982 and 5,501 refusals on the two holders of one five-write run, and later a holder
     // installed at a checkpoint the tail had passed, re-installed there without end (2026-11-05, `live_fleet`).
     let progressed = live.shipper.held_by(host) != held_before;
+    if progressed {
+      // The holder's lane is shipping, however long its catch-up ([`lane_expiry_ns`]).
+      if let Some(lane) = live.lanes.get_mut(&host) {
+        lane.heard_ns = slates_rt::futures::now_ns();
+      }
+      live.stalled.remove(&host);
+    }
     if live.shipper.durable() > before {
       state.count(LIVE_DURABLE, 1);
       resolve(state, object.0);
