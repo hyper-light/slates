@@ -1955,6 +1955,7 @@ impl Mounted {
     // SAFETY: the DLL object now owns the final control handle (including substitution on adoption), and remains
     // live throughout the zero-length readiness transaction. This never takes a request from the kernel.
     let control = unsafe { (*file_system).volume_handle };
+    mounted.purge_intents.cancel_on(control);
     crate::dispatcher::announce_ready(control, private_opens)?;
     if mounted.drive.is_none() {
       mounted.drive = Some(Drive::create(&mounted.record)?);

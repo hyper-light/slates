@@ -474,7 +474,11 @@ slates-bridge-fskit = 9
 # 2026-11-05 (131 -> 132, A-209): the `CanDelete` callback reads the handler from the file system's user context, as every
 # other callback does (`host.rs`, `can_delete`), so a directory with a child refuses before Windows marks it for
 # deletion; it had answered success unread (winfstest `t/base/03.t` case 3).
-slates-bridge-winfsp = 132
+# 2026-11-07 (132 -> 133, the purge intent's wait, GAPS): a full purge-intent publisher cancels the receiver's control
+# call (`purge_intents.rs`, `Sender::cancel_receive`, `CancelIoEx` on the volume's handle), and the receiver tests the
+# intent event before reading a cancellation as an empty receive (`Intents::cancelled_by_publisher`,
+# `WaitForSingleObject` with a zero timeout): two sites on main's 131, each with its SAFETY line.
+slates-bridge-winfsp = 133
 # Raised 3 -> 5 on 2026-10-19 for `udmabuf.rs` (the `UDMABUF_CREATE` ioctl and the descriptor it returns), which
 # confined a guest's DAX window to a descriptor covering only that window
 # (docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md). Lowered 5 -> 3 on 2026-10-25

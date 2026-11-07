@@ -8,7 +8,7 @@ use std::os::windows::io::{AsRawHandle, BorrowedHandle, OwnedHandle};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::thread::JoinHandle;
 
-use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, HANDLE};
+use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, HANDLE};
 use windows_sys::Win32::System::IO::{DeviceIoControl, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Memory::{
   FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
@@ -288,6 +288,14 @@ fn transaction(
   };
   if accepted == 0 {
     let error = std::io::Error::last_os_error();
+    // A full purge-intent publisher cancelled this call's wait for a request: every response it carried was consumed,
+    // and it delivered nothing (`crate::purge_intents`). Drain, and answer an empty receive, as a timeout's.
+    if error.raw_os_error() == i32::try_from(ERROR_OPERATION_ABORTED).ok()
+      && intents.cancelled_by_publisher()
+    {
+      intents.progress()?;
+      return Ok(0);
+    }
     if error.raw_os_error() != i32::try_from(ERROR_IO_PENDING).ok() {
       return Err(WinFspError::Os {
         call: "WinFsp control transaction",
