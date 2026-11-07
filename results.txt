@@ -1,0 +1,86 @@
+tested 26c0eff4fb3e8e5431234110f74cca0afb980edd variant after on x86_64, 4 cpus
+forward-retry exit 0 69s
+  forward-retry: warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+  forward-retry: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+server-lib exit 0 20s
+  server-lib: warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+  server-lib: test catalog::tests::truncated_padded_and_foreign_class_values_are_refused ... ok
+  server-lib: test checkout::tests::a_symlink_difference_is_refused_by_path ... ok
+  server-lib: slates-server: client 41's seat was refused by its shard; its id is given back (first occurrence; later ones are counted)
+  server-lib: test daemon::tests::an_empty_fetch_reply_is_neither_adopted_nor_a_refused_join ... ok
+  server-lib: test deploy::tests::a_bad_address_is_refused ... ok
+  server-lib: test deploy::tests::a_bad_manifest_is_refused_by_name ... ok
+  server-lib: test daemon::tests::refused_merge_authority_leaves_the_replica_unchanged ... ok
+  server-lib: test deploy::tests::an_unusable_identity_is_refused_at_plan_time ... ok
+  server-lib: test direct_map::tests::a_copy_past_a_clients_share_is_refused_with_the_counts ... ok
+  server-lib: test dns::tests::a_hostile_name_or_length_is_refused ... ok
+  server-lib: test dns::tests::a_bad_name_is_refused_by_reason ... ok
+  server-lib: test dns::tests::a_reply_for_another_query_is_refused ... ok
+  server-lib: test dns::tests::a_truncated_reply_is_refused ... ok
+  server-lib: test discovery::tests::refused_revalidation_keeps_the_complete_roster_for_the_next_restart ... ok
+  server-lib: test head::tests::truncated_and_padded_values_are_refused ... ok
+  server-lib: test lease::tests::every_promotion_quorum_meets_the_lease_confirmations_and_no_fewer_suffice ... ok
+  server-lib: test member_task::tests::an_announcement_round_trips_and_a_wrong_length_is_refused ... ok
+  server-lib: test merge_service::tests::a_truncated_or_padded_merge_record_value_is_refused ... ok
+  server-lib: slates-server: consensus retention refused; control shard stopped: consensus publication of 13955 bytes exceeds its 12272-byte budget
+  server-lib: test status_pages::tests::refused_capture_leaves_credit_available ... ok
+  server-lib: test tombstone::tests::truncated_padded_non_canonical_and_foreign_class_values_are_refused ... ok
+  server-lib: test verbs::tests::a_presentation_past_the_bound_is_refused_and_changes_nothing ... ok
+  server-lib: test verbs::tests::a_recovered_volume_over_its_acknowledged_size_is_refused_without_leaking_its_records ... ok
+  server-lib: test verbs::tests::a_taken_over_archive_lands_at_its_offsets_and_an_oversized_one_is_refused ... ok
+  server-lib: test work_log::tests::a_truncated_or_overlong_entry_is_refused ... ok
+  server-lib: test result: ok. 201 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.97s
+server-tests exit 0 6s
+  server-tests: warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+  server-tests: test a_listing_whose_part_cannot_be_sent_is_refused_overloaded ... ok
+  server-tests: test a_daemon_status_whose_part_cannot_be_sent_is_refused_overloaded ... ok
+  server-tests: test a_grants_listing_whose_part_cannot_be_sent_is_refused_overloaded ... ok
+  server-tests: test a_status_on_a_starved_shard_is_refused_overloaded_on_time ... ok
+  server-tests: test a_refused_release_is_counted_and_the_next_watermark_takes_it_over ... ok
+  server-tests: test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.02s
+  server-tests: test a_connect_past_the_client_bound_is_refused_typed_at_the_rendezvous ... ok
+  server-tests: test a_client_that_never_acknowledges_is_refused_at_its_bound_and_served_once_it_acknowledges ... ok
+  server-tests: test a_works_edits_are_charged_and_refused_typed_when_the_budget_cannot_hold_them ... ok
+  server-tests: test a_write_the_declared_durability_cannot_cover_is_refused_typed ... ok
+  server-tests: slates-server: a client's claim was refused: send refused (code Some(32)) (first occurrence; later ones are counted)
+  server-tests: test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.40s
+client exit 0 57s
+  client: warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+  client: test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  client: slates-server: shard 1: recovered 2 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  client: slates-server: shard 0: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  client: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.19s
+  client: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+  client: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.14s
+  client: slates-server: shard 6: recovered 1 volumes from their images (0 refused), 3 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 1 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  client: test a_client_past_its_share_of_maps_is_refused_typed_with_nothing_made ... ok
+  client: test a_destroyed_volumes_map_keeps_its_copy_until_released ... ok
+  client: slates-server: shard 4: recovered 0 volumes from their images (0 refused), 3 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  client: test a_released_map_gives_its_copy_back_and_the_file_maps_again ... ok
+  client: test a_removed_files_map_keeps_its_copy_until_released ... ok
+  client: slates-server: shard 3: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  client: slates-server: shard 3: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  client: slates-server: shard 4: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  client: slates-server: shard 3: recovered 2 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  client: slates-server: shard 1: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  client: slates-server: shard 1: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  client: slates-server: client 5's seat was refused by its shard; its id is given back (first occurrence; later ones are counted)
+  client: test a_session_outlives_a_daemon_restart_and_its_retry_meets_the_completion_record ... ok
+  client: slates-server: a client's claim was refused: daemon unavailable at cl-id-end-6523: client identity space exhausted (first occurrence; later ones are counted)
+  client: slates-server: shard 0: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  client: test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.77s
+  client: slates-server: shard 0: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+  client: test result: ok. 3 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 2.21s
+  client: slates-server: a client's claim was refused: send refused (code Some(32)) (first occurrence; later ones are counted)
+  client: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.26s
+  client: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.81s
+  client: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+  client: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+  client: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+  client: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+  client: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.18s
+  client: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.21s
+  client: test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.29s
+  client: test delivered::naming_a_holder_is_refused_by_kind_on_unix ... ok
+  client: test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+  client: test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
