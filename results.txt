@@ -9,3 +9,4 @@ run 2 exit 0 2s load=2.48 0.94 0.34
 run 3 exit 0 3s load=2.36 0.94 0.35
     presentation of 1000 files of 16384 bytes: 286.231786ms, 1000 entries; 303 probes inside it — p50 467.383µs, p99 2.204689ms, longest of all 23.572998ms; before it the longest 520.702µs
     test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.22s
+DONE
