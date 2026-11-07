@@ -1,0 +1,70 @@
+name: diag-live-durability
+
+# Diagnostics only, never on main (A-200, item 2): the laggard flow's red check (R: main ecb86b4f with the landing
+# branch's final tests; F: the landing branch), ten runs each, quiet, then the whole live_fleet suite once quiet. Release,
+# both Linux arches. Results to diag-results/live-durability-28-<tree>-<os> by git push.
+on:
+  push:
+    branches: ["diag-live-durability-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  SLATES_TEST_CLI: "1"
+
+jobs:
+  landing:
+    name: landing (${{ matrix.tree.name }}, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+        tree:
+          - { name: R, sha: d1e3424f9dce868dc5c75f85725e342c66dc05ce }
+          - { name: F, sha: a610ccf74364f80fc2dd1e99351e863b8bc8c62a }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the tree
+        run: |
+          git worktree add ../tree "${{ matrix.tree.sha }}"
+          cd ../tree && cargo build --release --locked -p slates-cli --bin slates --test live_fleet
+      - name: The laggard flow ten times, then live_fleet
+        run: |
+          R=../results.txt
+          cpus=$(nproc)
+          echo "runner ${{ matrix.os }}, $cpus CPUs, $(date -u), tree ${{ matrix.tree.name }} ${{ matrix.tree.sha }}" > $R
+          cd ../tree
+                    for run in $(seq 1 10); do
+            for t in a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log; do
+              status=0
+              timeout 600 cargo test --release --locked -p slates-cli --test live_fleet -- --nocapture --test-threads=1 --exact $t > ../run.log 2>&1 || status=$?
+              grep -E '^live laggard|panicked at' ../run.log | cut -c1-700 >> ../results.txt
+              echo "== run $run $t exit $status load $(cut -d' ' -f1-3 /proc/loadavg)" >> ../results.txt
+            done
+          done
+          status=0
+          timeout 2400 cargo test --release --locked -p slates-cli --test live_fleet -- --test-threads=2 > ../run.log 2>&1 || status=$?
+          grep -E '^test .* FAILED|test result' ../run.log >> ../results.txt
+          echo "== live_fleet quiet exit $status" >> ../results.txt
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/live-durability-28-${{ matrix.tree.name }}-${{ matrix.os }}"
+          git config user.name "diag-live-durability"
+          git config user.email "diag-live-durability@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-live-durability-28 results, ${{ matrix.tree.name }}, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
