@@ -158,8 +158,10 @@ fn an_unpublished_verb_is_refused_typed_a_retry_re_executes_and_a_restart_agrees
 /// ring is small that acknowledgement fell between the refusal and the retry, took the refused
 /// sequence with it, and the retry was answered `DuplicateRequest` — the contract's "retry under the
 /// same id" lost to the bookkeeping. Here the acknowledgement is forced right after the refusal: the
-/// retry must still re-execute, so the client's watermark must stop below an unpublished id until it
-/// is retried. Non-vacuous: before the fix the retry was refused `DuplicateRequest`.
+/// retry must still re-execute, so the acknowledgement must name an unpublished id owed until it is
+/// retried (since 2026-11-07 it covers the id and names it, rather than stopping below it, §4.9).
+/// Non-vacuous: the acknowledgement's watermark passes the id, and before the 2026-09 fix the retry was
+/// refused `DuplicateRequest`.
 #[test]
 fn an_unpublished_verb_stays_retryable_across_the_clients_acknowledgement() {
   let profile = common::machine_profile();
@@ -180,8 +182,8 @@ fn an_unpublished_verb_stays_retryable_across_the_clients_acknowledgement() {
     .acknowledge_all()
     .expect("the acknowledgement is served");
   assert!(
-    client.acknowledged() < create_id.sequence,
-    "the watermark stops below the unpublished id ({} < {})",
+    client.acknowledged() >= create_id.sequence,
+    "the acknowledgement covers the unpublished id ({} >= {}), naming it owed",
     client.acknowledged(),
     create_id.sequence
   );
@@ -191,13 +193,30 @@ fn an_unpublished_verb_stays_retryable_across_the_clients_acknowledgement() {
     panic!("the retry re-executes the create after the acknowledgement: {retried:?}");
   };
   assert_ne!(created, durable, "a distinct volume");
-  // Retried and answered, the id no longer holds the watermark back.
+  // Retried and answered, the id is no longer owed: the next acknowledgement releases it like any other.
   client
     .acknowledge_all()
     .expect("the acknowledgement is served");
+  let again = client.retry(
+    create_id,
+    &RequestBody::Create {
+      name: "unpublished".to_owned(),
+      size: SizeClass::Bounded { limit: 1 << 20 },
+      names: NamePolicy::Exact,
+      require_locked: false,
+      base: None,
+    },
+  );
   assert!(
-    client.acknowledged() >= create_id.sequence,
-    "once retried the id is acknowledged like any other"
+    matches!(
+      again,
+      Err(ClientError::Refused(
+        slates_ipc::protocol::Refusal::DuplicateRequest
+      )) | Ok(ReplyBody::Refused {
+        refusal: slates_ipc::protocol::Refusal::DuplicateRequest
+      })
+    ),
+    "once retried and acknowledged, the id is released like any other: {again:?}"
   );
   assert_eq!(
     names_listed(&mut client),

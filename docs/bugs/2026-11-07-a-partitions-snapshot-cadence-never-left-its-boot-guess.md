@@ -47,7 +47,8 @@ every volume, and its log fills constantly. The shard spent its time re-encoding
     within 0.85 of the budget with a snapshot after 84 KB (aarch64) and 162 to 164 KB (x86_64) of small records, and
     the longest tail's median recovery took 0.61 to 0.69 of it. The model's generated histories pass under the
     measured trigger too, the state compared whole after every crash.
-- The clock's cost (`db_bench`, release, the quiet Studio, 3 interleaved rounds of 5 runs, load 3.7 to 8.3, medians):
+- The clock's cost (`db_bench`, release, the quiet Studio, macOS arm64, 3 interleaved rounds of 5 runs, load 3.7 to
+  8.3, medians; the figure is this platform's: Linux reads the clock through the vDSO, usually cheaper):
   `db.mutate_guard_append_apply_per_record` 349, 356 and 352 ns with one clock pair a mutate, against 295, 309 and
   300 ns with none: about 50 ns, a sixth of the cheapest commit (one accounting record). Two pairs a mutate (the
   append and the apply timed apart) measured 367, 351 and 362 ns. `db.replay_per_record` was 191 to 214 ns in every
