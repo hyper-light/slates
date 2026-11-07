@@ -1,0 +1,178 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 23:17:19 UTC 2026, head c8c5f9411b75b510ba9ddd9dd2d9ad6b0fac34aa
+== run 1 at 23:17:19, load 1.50 1.97 1.04
+thread 'a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor' (6714) panicked at crates/cli/tests/live_chaos.rs:327:7:
+the fleet formed, or kept changing, within each fleet wait: [Some(("9252778111729252677", 3, 2)), Some(("7783791703808416632", 3, 2)), Some(("1050085948245807431", 3, 2))] meshed [false, false, false]
+--- chaos-kill-at-ack-a-6713 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 9252778111729252677
+  fleet_host_epoch: 1
+  fleet_members: 1050085948245807431 7783791703808416632 9252778111729252677
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 1050085948245807431: lent=false cwnd=130934 srtt_ns=639346 pto_ns=3369070 spurious_losses=0 persistent_collapses=0 consumed=1787 mtu=65496
+  fleet_session 7783791703808416632: lent=false cwnd=130934 srtt_ns=737061 pto_ns=3219097 spurious_losses=0 persistent_collapses=0 consumed=1787 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 4
+  shard 0 refused fleet.plane.announcements_sent: 4
+--- chaos-kill-at-ack-b-6713 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 7783791703808416632
+  fleet_host_epoch: 1
+  fleet_members: 1050085948245807431 7783791703808416632 9252778111729252677
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 1050085948245807431: lent=false cwnd=130934 srtt_ns=160553 pto_ns=1160553 spurious_losses=0 persistent_collapses=0 consumed=1787 mtu=65496
+  fleet_session 9252778111729252677: lent=false cwnd=130934 srtt_ns=320900 pto_ns=1346728 spurious_losses=0 persistent_collapses=0 consumed=1787 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 4
+  shard 0 refused fleet.plane.announcements_sent: 4
+--- chaos-kill-at-ack-c-6713 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 1050085948245807431
+  fleet_host_epoch: 1
+  fleet_members: 1050085948245807431 7783791703808416632 9252778111729252677
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 7783791703808416632: lent=false cwnd=130934 srtt_ns=356162 pto_ns=1838382 spurious_losses=0 persistent_collapses=0 consumed=1787 mtu=65496
+  fleet_session 9252778111729252677: lent=false cwnd=130934 srtt_ns=247613 pto_ns=1247613 spurious_losses=0 persistent_collapses=0 consumed=1787 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 4
+  shard 0 refused fleet.plane.announcements_sent: 4
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+--
+    a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 40.55s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 1 exit 101
+== run 2 at 23:18:00, load 2.55 2.20 1.16
+thread 'a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor' (11252) panicked at crates/cli/tests/live_chaos.rs:327:7:
+the fleet formed, or kept changing, within each fleet wait: [Some(("11670044570522368379", 3, 2)), Some(("5774545142502313695", 3, 2)), Some(("15628609716344307831", 3, 2))] meshed [false, false, false]
+--- chaos-kill-at-ack-a-11251 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 11670044570522368379
+  fleet_host_epoch: 1
+  fleet_members: 5774545142502313695 11670044570522368379 15628609716344307831
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 5774545142502313695: lent=false cwnd=130934 srtt_ns=478736 pto_ns=3377616 spurious_losses=0 persistent_collapses=0 consumed=1786 mtu=65496
+  fleet_session 15628609716344307831: lent=false cwnd=130934 srtt_ns=313420 pto_ns=1670200 spurious_losses=0 persistent_collapses=0 consumed=1786 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 4
+  shard 0 refused fleet.plane.announcements_sent: 4
+--- chaos-kill-at-ack-b-11251 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 5774545142502313695
+  fleet_host_epoch: 1
+  fleet_members: 5774545142502313695 11670044570522368379 15628609716344307831
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 11670044570522368379: lent=false cwnd=130934 srtt_ns=426217 pto_ns=2357985 spurious_losses=0 persistent_collapses=0 consumed=1786 mtu=65496
+  fleet_session 15628609716344307831: lent=false cwnd=130934 srtt_ns=187390 pto_ns=1187390 spurious_losses=0 persistent_collapses=0 consumed=1786 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 4
+  shard 0 refused fleet.plane.announcements_sent: 4
+--- chaos-kill-at-ack-c-11251 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 15628609716344307831
+  fleet_host_epoch: 1
+  fleet_members: 5774545142502313695 11670044570522368379 15628609716344307831
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 5774545142502313695: lent=false cwnd=130934 srtt_ns=196273 pto_ns=1196273 spurious_losses=0 persistent_collapses=0 consumed=1786 mtu=65496
+  fleet_session 11670044570522368379: lent=false cwnd=130934 srtt_ns=257738 pto_ns=1300582 spurious_losses=0 persistent_collapses=0 consumed=1786 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 4
+  shard 0 refused fleet.plane.announcements_sent: 4
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+--
+    a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 40.71s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 2 exit 101
+== run 3 at 23:18:41, load 2.67 2.27 1.23
+thread 'a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor' (16844) panicked at crates/cli/tests/live_chaos.rs:327:7:
+the fleet formed, or kept changing, within each fleet wait: [Some(("1551669117459508917", 3, 2)), Some(("13501051552960443451", 3, 2)), Some(("8396399773866642996", 3, 2))] meshed [false, false, false]
+--- chaos-kill-at-ack-a-16843 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 1551669117459508917
+  fleet_host_epoch: 1
+  fleet_members: 1551669117459508917 8396399773866642996 13501051552960443451
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 8396399773866642996: lent=false cwnd=130934 srtt_ns=732790 pto_ns=4798314 spurious_losses=0 persistent_collapses=0 consumed=1787 mtu=65496
+  fleet_session 13501051552960443451: lent=false cwnd=130934 srtt_ns=384924 pto_ns=2601488 spurious_losses=0 persistent_collapses=0 consumed=1787 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 4
+  shard 0 refused fleet.plane.announcements_sent: 4
+--- chaos-kill-at-ack-b-16843 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 13501051552960443451
+  fleet_host_epoch: 1
+  fleet_members: 1551669117459508917 8396399773866642996 13501051552960443451
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 1551669117459508917: lent=false cwnd=130934 srtt_ns=242444 pto_ns=1302408 spurious_losses=0 persistent_collapses=0 consumed=1787 mtu=65496
+  fleet_session 8396399773866642996: lent=false cwnd=130934 srtt_ns=330233 pto_ns=1330233 spurious_losses=0 persistent_collapses=0 consumed=1787 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 4
+  shard 0 refused fleet.plane.announcements_sent: 4
+--- chaos-kill-at-ack-c-16843 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 8396399773866642996
+  fleet_host_epoch: 1
+  fleet_members: 1551669117459508917 8396399773866642996 13501051552960443451
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 0
+  fleet_settled_generation: 0
+  fleet_neighbourhood_generation: 0
+  fleet_session 1551669117459508917: lent=false cwnd=130934 srtt_ns=384145 pto_ns=1982577 spurious_losses=0 persistent_collapses=0 consumed=1787 mtu=65496
+  fleet_session 13501051552960443451: lent=false cwnd=130934 srtt_ns=508001 pto_ns=2683829 spurious_losses=0 persistent_collapses=0 consumed=1787 mtu=65496
+  shard 0 refused fleet.plane.announce_lends: 4
+  shard 0 refused fleet.plane.announcements_sent: 4
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+--
+    a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 40.66s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 3 exit 101
