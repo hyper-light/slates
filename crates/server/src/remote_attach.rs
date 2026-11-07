@@ -167,31 +167,102 @@ pub(crate) fn reap(
   end_all(state, &ended)
 }
 
-/// Ends, on this shard, every attachment of a host that is no longer among the configuration's `members`: the fleet
-/// retired it (§4.8 "Promotion and takeover"), and no reap of its clients will come. An empty member list (a node
-/// before its fleet formed) ends nothing: a remote attachment's host was a member when it forwarded the attach. The
-/// number ended; a refusal is counted and the next install tries again.
-pub(crate) fn end_departed(state: &mut ShardState, members: &[slates_db::register::HostId]) -> u64 {
-  if members.is_empty() {
-    return 0;
+/// The anchors that left the fleet's members between two looks: in `previous` and not in `now`. A host in neither, one
+/// the fleet has not configured yet (a configuration installed while the fleet forms names fewer members than it will),
+/// has not departed, though its clients may already hold attachments here: it forwarded over its session before the
+/// council configured it. An empty `now` (no configuration yet) departs nobody.
+pub(crate) fn departed(previous: &[u64], now: &[u64]) -> Vec<u64> {
+  if now.is_empty() {
+    return Vec::new();
+  }
+  previous
+    .iter()
+    .copied()
+    .filter(|host| !now.contains(host))
+    .collect()
+}
+
+/// On the control shard, where the fleet's learned identities live: the anchors of hosts that left the fleet's members
+/// since the last look ([`departed`]). A remote attachment names its host by the forwarding peer's certificate anchor
+/// (the id a forward authenticates), while a configuration names members by their current member ids, so each member
+/// is mapped to its anchor (`member_task::anchor_of`); a member not learned yet maps to none and departs nobody. The
+/// departed anchors are kept owed until every shard has ended their attachments ([`settle_departed`]).
+pub(crate) fn departed_anchors(state: &mut ShardState) -> Vec<u64> {
+  let members: Vec<slates_db::register::HostId> = state.fleet.members().to_vec();
+  let now: Vec<u64> = members
+    .iter()
+    .filter_map(|member| crate::member_task::anchor_of(state, *member))
+    .map(|anchor| anchor.0)
+    .collect();
+  let mut gone = departed(&state.configured_members, &now);
+  gone.append(&mut state.departed_owed);
+  gone.sort_unstable();
+  gone.dedup();
+  if !now.is_empty() {
+    state.configured_members = now;
+  }
+  state.departed_owed.clone_from(&gone);
+  gone
+}
+
+/// Records that every shard ended the departed anchors' attachments: nothing is owed until another departs.
+pub(crate) fn settle_departed(state: &mut ShardState) {
+  state.departed_owed.clear();
+}
+
+/// Ends, on this shard, every attachment whose host is one of the departed `anchors`: the fleet retired those hosts
+/// (§4.8 "Promotion and takeover"), and no reap of their clients will come. A walk of the shard's attachments; the
+/// number ended, or the refusal.
+pub(crate) fn end_hosts(state: &mut ShardState, anchors: &[u64]) -> Result<u64, Refusal> {
+  if anchors.is_empty() {
+    return Ok(0);
   }
   let ended: Vec<AttachmentRecord> = state
     .db
     .partition()
     .remote_attachments()
     .into_iter()
-    .filter(|record| {
-      matches!(record.consumer, Consumer::Remote { host, .. }
-        if !members.iter().any(|member| member.0 == host))
-    })
+    .filter(
+      |record| matches!(record.consumer, Consumer::Remote { host, .. } if anchors.contains(&host)),
+    )
     .cloned()
     .collect();
-  match end_all(state, &ended) {
-    Ok(ended) => ended,
-    Err(refusal) => {
-      state.count(crate::verbs::refusal_name(&refusal), 1);
-      0
+  end_all(state, &ended)
+}
+
+/// The reap loop's look at departures (A-222), run on the control shard each liveness budget: the departed anchors,
+/// then their attachments ended on every shard, each through a call bounded by the budget. Owed again at the next look
+/// unless every shard answered.
+pub(crate) async fn sweep_departed() {
+  let Some((control, shards, gone)) = crate::state::with_state(|state| {
+    let control = state.shards.first().copied()?;
+    if state.shard != control {
+      return None;
     }
+    Some((control, state.shards.clone(), departed_anchors(state)))
+  })
+  .flatten() else {
+    return;
+  };
+  if gone.is_empty() {
+    return;
+  }
+  let mut settled = true;
+  for shard in shards {
+    let anchors = gone.clone();
+    let ended = crate::xshard::call_within(
+      control,
+      shard,
+      move |state| end_hosts(state, &anchors),
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await;
+    if !matches!(ended, Some(Ok(_))) {
+      settled = false;
+    }
+  }
+  if settled {
+    let _ = crate::state::with_state(settle_departed);
   }
 }
 
@@ -344,4 +415,21 @@ pub(crate) async fn reap_at_owners(
   )
   .await
   .unwrap_or(Err(Refusal::Overloaded { shard: control }))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::departed;
+
+  /// A-222: a host the fleet has not configured yet has not departed; only one among the members at the last look and
+  /// absent at this one has. Main CI 42335884062 and its loaded reproduction: following configuration installs missed
+  /// the retirement (it arrives by several install paths), and ending every non-member ended a forming host's fresh
+  /// attachment (1 of 20 runs).
+  #[test]
+  fn only_a_host_that_was_a_member_and_is_not_now_has_departed() {
+    assert_eq!(departed(&[1, 2], &[1, 2, 3]), Vec::<u64>::new());
+    assert_eq!(departed(&[1, 2, 3], &[1, 3]), vec![2]);
+    assert_eq!(departed(&[], &[1]), Vec::<u64>::new());
+    assert_eq!(departed(&[1, 2], &[]), Vec::<u64>::new());
+  }
 }

@@ -3309,6 +3309,8 @@ fn init_shard(
     origin_anchor,
     landing: crate::landing::LandingState::default(),
     image: crate::image::ImageState::default(),
+    configured_members: Vec::new(),
+    departed_owed: Vec::new(),
     direct_map: crate::direct_map::DirectMapState::default(),
     store,
     volumes: Slab::new(config.caps.segment_slots, config.caps.volumes),
@@ -3567,6 +3569,8 @@ async fn reap_loop() {
       // (`verbs::step_destroys`), rather than in a busy serve round.
       let _ = verbs::step_destroys(s);
     });
+    // Another host's attachments end once the fleet no longer counts that host a member (A-222; control shard).
+    crate::remote_attach::sweep_departed().await;
     let reaped = crate::reap::sweep(cadence).await;
     // The taken-back writable copies no holder claimed within the reconnect budget (A-197).
     #[cfg(target_os = "linux")]
