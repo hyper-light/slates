@@ -11019,8 +11019,19 @@ allocation fix).**
   forms equal within 0.3 µs, run 42190796283), not our interface callbacks (level or faster than `dll`'s), and not the
   DLL's op function (its access check 0.5 µs in `dll`, 0.6 in `comb2`). User-mode timing places it no further.
 
+- Not crash safety's, and kept, because the baseline is wrong without it: an unlink's `CanDelete` asks the shard (2.6 µs at
+  the p50 in `comb2`, run 42185624364) where `dll` answers at once (0.3 µs). `71cf09ac`'s `can_delete` answers success
+  without reading the volume, leaving the empty-directory check to Cleanup's `rmdir`, but Cleanup answers the kernel
+  nothing. So `RemoveDirectoryW` of a directory holding a file returned success and removed nothing. winfstest's
+  `t/base/03.t` found it on both runners (diagnostics run 41982130174), and main fixed it in `045c0f62`, held by
+  `a_directory_holding_a_file_is_not_removed` (`crates/cli/tests/winfsp_semantics.rs`). The baseline's unlink is cheaper
+  because it is wrong. For a file the shard only reads the object's kind and answers yes. The trip stays because the
+  receiver cannot tell a file's context from a directory's without the shard; carrying the kind in the open's context
+  would let a file's `CanDelete` answer at once (a lever, not taken here).
+
 **What follows.** Crash safety's price on arm64 is about 18 µs a stat and 30 to 35 µs a rename or an unlink, quiet: the
-journal, the ledger and A-198's barriers, with direct output and the kernel's share. The DLL dispatcher it is measured
+journal, the ledger and A-198's barriers, with direct output and the kernel's share. Of an unlink's gap, about 2.3 µs is
+`CanDelete`'s check, which the baseline skips at the cost of a wrong answer. The DLL dispatcher it is measured
 against is faster and carries the crash defect A-198 fixes. On x86_64 main's form and `comb1` are nearly level with `dll`
 quiet. The trade is Ada's to decide; until then the combined form does not replace main's separate form.
 
