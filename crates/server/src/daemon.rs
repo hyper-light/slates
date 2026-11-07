@@ -3691,6 +3691,10 @@ async fn seal_idle_content() {
   // A refused publication is retried by the next tick.
   let deferred =
     state::with_state(|s| s.store.content.arena().deferred_bytes() > 0).unwrap_or(false);
+  if sealed_this_tick > 0 || deferred { slates_machine::log_line!(
+    "DIAG-GB tick: sealed {sealed_this_tick} deferred {deferred} allocations {:?}",
+    state::with_state(|s| (s.store.content.arena().allocations(), s.store.content.arena().allocated_bytes()))
+  ); }
   if sealed_this_tick > 0 || deferred {
     let _ = state::with_state_counted(crate::verbs::publish_shard);
     // The idle test asks whether the arena allocated since the previous tick, so this tick, which ends here, records
@@ -3793,14 +3797,36 @@ async fn purge_if_idle() {
     let step = state::with_state(|s| {
       let allocations = s.store.content.arena().allocations();
       let idle = allocations == s.purge_seen_allocations;
+      let seen_before = s.purge_seen_allocations;
       s.purge_seen_allocations = allocations;
       if !idle {
         s.count(TICKS_BUSY, 1);
+        slates_machine::log_line!(
+          "DIAG-GB busy: allocations {seen_before}->{allocations} allocated {} free {} deferred {} burst_seen {:?} last_burst {}",
+          s.store.content.arena().allocated_bytes(),
+          s.store.content.arena().free_bytes(),
+          s.store.content.arena().deferred_bytes(),
+          s.burst_seen,
+          s.last_burst
+        );
         return None;
       }
       s.count(TICKS_IDLE, 1);
+      let diag_before = (s.burst_seen, s.last_burst);
       note_burst(s, allocations);
       let keep = prefault_reserve(s);
+      let diag_keep: usize = keep.iter().map(slates_mem::arena::KeptRun::len).sum();
+      if diag_before != (s.burst_seen, s.last_burst) { slates_machine::log_line!(
+        "DIAG-GB idle: allocations {allocations} allocated {} free {} resident_free {} deferred {} burst {:?}->{:?} last_burst {}->{} keep {diag_keep}",
+        s.store.content.arena().allocated_bytes(),
+        s.store.content.arena().free_bytes(),
+        s.store.content.arena().resident_free_bytes(),
+        s.store.content.arena().deferred_bytes(),
+        diag_before.0,
+        s.burst_seen,
+        diag_before.1,
+        s.last_burst
+      ); }
       let slice_blocks = usize::try_from(s.config.archive_slice_bytes())
         .unwrap_or(usize::MAX)
         .checked_div(s.config.discard_from_bytes.max(1))
@@ -3817,6 +3843,17 @@ async fn purge_if_idle() {
         purge_write_log(s).saturating_add(return_dead_recovery(s))
       };
       let bytes = purged.bytes.saturating_add(log);
+      if purged.bytes > 0 || !purged.more {
+        let diag_keep: usize = keep.iter().map(slates_mem::arena::KeptRun::len).sum();
+        slates_machine::log_line!(
+          "DIAG-GB purge: {} bytes (log {log}), more {}, keep {diag_keep}, last_burst {}, allocated {}, resident_free {}",
+          purged.bytes,
+          purged.more,
+          s.last_burst,
+          s.store.content.arena().allocated_bytes(),
+          s.store.content.arena().resident_free_bytes()
+        );
+      }
       s.count(CONTENT_PURGED, u64::try_from(bytes).unwrap_or(u64::MAX));
       if purged.more {
         return Some(true);

@@ -137,9 +137,6 @@ pub struct ChunkArena {
   discard_from: usize,
   /// Bytes released and zeroed in place since the last complete purge: resident RAM no allocation holds.
   resident_free: usize,
-  /// The reserve's bytes the purge walk under way has kept resident (A-214): what the resident free count holds once
-  /// the walk completes.
-  purge_kept: usize,
   /// Where an unfinished purge resumes: the region id and the byte within it.
   purge_cursor: Option<(u16, usize)>,
   /// Allocations so far, monotone: a caller that sees it unchanged across an interval knows the arena was idle.
@@ -278,7 +275,6 @@ impl ChunkArena {
       source: None,
       discard_from: usize::MAX,
       resident_free: 0,
-      purge_kept: 0,
       purge_cursor: None,
       allocations: 0,
       reused: 0,
@@ -333,8 +329,8 @@ impl ChunkArena {
   /// resuming where the last call stopped (A-105). Decay-based, as jemalloc purges (Evans, "dirty page decay"): a
   /// block freed under load is zeroed in place and stays resident for the next allocation, which then takes no page
   /// faults (measured: alloc+touch+free of a 64 KiB block costs 0.4 µs zeroed in place against 7 µs given back and
-  /// faulted in again), and an idle arena returns what it no longer uses. Nothing to do while no byte was released
-  /// since the last complete purge.
+  /// faulted in again), and an idle arena returns what it no longer uses. Nothing to do while no region records a
+  /// resident free unit and no walk is under way.
   pub fn purge(&mut self, max_blocks: usize) -> Purged {
     self.purge_keeping(max_blocks, &[])
   }
@@ -343,7 +339,10 @@ impl ChunkArena {
   /// [`ChunkArena::upcoming`]): every other resident free block of at least the discard size goes back. The kept
   /// bytes stay in the resident free count.
   pub fn purge_keeping(&mut self, max_blocks: usize, keep: &[KeptRun]) -> Purged {
-    if self.resident_free == 0 {
+    // Nothing to do only when no walk is under way and no region records a resident free unit: the sets are what the
+    // walk visits, so they answer, not the count, which a walk that stopped between calls once left at zero with
+    // freed blocks still recorded (A-205's give-back on Windows, main CI 42184319025: every later purge returned here).
+    if self.purge_cursor.is_none() && self.held().all(|slot| slot.dirty.is_empty()) {
       return Purged::default();
     }
     let discard_from = self.discard_from;
@@ -351,9 +350,6 @@ impl ChunkArena {
     let mut visited = 0usize;
     let order = self.order.clone();
     let start = self.purge_cursor.take();
-    if start.is_none() {
-      self.purge_kept = 0;
-    }
     let mut started = start.is_none();
     for region in order {
       let from = match start {
@@ -369,11 +365,9 @@ impl ChunkArena {
       };
       let mut at = from;
       let mut drained = 0usize;
-      let mut kept_here = 0usize;
       let size = slot.region.len();
       while let Some((first, reach)) = slot.dirty.next_run_from(at, size) {
         if visited >= max_blocks {
-          self.purge_kept = self.purge_kept.saturating_add(kept_here);
           self.resident_free = self.resident_free.saturating_sub(drained);
           self.purge_cursor = Some((region, first));
           done.more = true;
@@ -382,15 +376,21 @@ impl ChunkArena {
         visited = visited.saturating_add(1);
         let (kept, discarded) = purge_run(slot, region, (first, reach), keep, discard_from);
         drained = drained.saturating_add(reach.saturating_sub(first).saturating_sub(kept));
-        kept_here = kept_here.saturating_add(kept);
         done.bytes = done.bytes.saturating_add(discarded);
         at = reach;
       }
-      self.purge_kept = self.purge_kept.saturating_add(kept_here);
       self.resident_free = self.resident_free.saturating_sub(drained);
     }
-    // Every set is drained: nothing freed is left resident but the reserve kept, whatever the count drifted to.
-    self.resident_free = self.purge_kept;
+    // The walk is done: what is left resident and free is what the regions' sets still record, the reserve this walk kept
+    // and whatever was freed or faulted in behind its cursor while it waited between calls (a publication releasing a
+    // delete's blocks, the reserve's refill), whatever the count drifted to. Before 2026-11-07 the count became what
+    // this walk had kept, so a block released behind the cursor was left resident, uncounted, and every later purge
+    // returned at once: A-205's give-back counted 118,337,536 of 134,217,728 deleted bytes on Windows (main CI
+    // 42184319025; `a_block_freed_behind_an_unfinished_purge_still_goes_back`).
+    self.resident_free = self
+      .held()
+      .map(|slot| slot.dirty.recorded_bytes())
+      .fold(0usize, usize::saturating_add);
     done
   }
 
