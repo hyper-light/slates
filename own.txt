@@ -1,0 +1,807 @@
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded bincode v1.3.3
+  Downloaded dunce v1.0.5
+  Downloaded target-lexicon v0.12.16
+  Downloaded fnv v1.0.7
+  Downloaded rustversion v1.0.23
+  Downloaded bit-set v0.8.0
+  Downloaded cfg-if v1.0.4
+  Downloaded deranged v0.5.8
+  Downloaded arrayvec v0.7.8
+  Downloaded ctor v0.2.9
+  Downloaded bitflags v2.13.1
+  Downloaded memoffset v0.9.1
+  Downloaded fastrand v2.5.0
+  Downloaded fs_extra v1.3.0
+  Downloaded convert_case v0.6.0
+  Downloaded cmake v0.1.58
+  Downloaded glob v0.3.4
+  Downloaded iai-callgrind v0.16.1
+  Downloaded once_cell v1.21.4
+  Downloaded getrandom v0.4.3
+  Downloaded jobserver v0.1.35
+  Downloaded rustc_version v0.4.1
+  Downloaded zstd-safe v7.3.0
+  Downloaded derive_more v2.1.1
+  Downloaded num-conv v0.2.2
+  Downloaded serde_spanned v1.1.1
+  Downloaded getrandom v0.2.17
+  Downloaded crc32c v0.6.8
+  Downloaded napi-build v2.4.1
+  Downloaded subtle v2.6.1
+  Downloaded lz4_flex v0.11.6
+  Downloaded cpufeatures v0.3.1
+  Downloaded target-triple v1.0.1
+  Downloaded quick-error v1.2.3
+  Downloaded pkg-config v0.3.34
+  Downloaded rusty-fork v0.3.1
+  Downloaded indexmap v2.14.2
+  Downloaded napi-derive v2.16.13
+  Downloaded quote v1.0.47
+  Downloaded powerfmt v0.2.0
+  Downloaded zeroize v1.9.0
+  Downloaded errno v0.3.14
+  Downloaded indoc v2.0.7
+  Downloaded napi-derive-backend v1.0.75
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded pyo3-build-config v0.22.6
+  Downloaded rand_chacha v0.9.0
+  Downloaded rustls-pki-types v1.15.1
+  Downloaded termcolor v1.4.1
+  Downloaded rand_core v0.9.5
+  Downloaded shlex v2.0.1
+  Downloaded iai-callgrind-macros v0.6.1
+  Downloaded num-traits v0.2.19
+  Downloaded thiserror-impl v2.0.21
+  Downloaded itoa v1.0.18
+  Downloaded rcgen v0.13.2
+  Downloaded hashbrown v0.17.1
+  Downloaded getrandom v0.3.4
+  Downloaded constant_time_eq v0.4.2
+  Downloaded serde_core v1.0.229
+  Downloaded memmap2 v0.9.11
+  Downloaded proc-macro2 v1.0.107
+  Downloaded pyo3-ffi v0.22.6
+  Downloaded pyo3-macros-backend v0.22.6
+  Downloaded cc v1.4.5
+  Downloaded rustls-webpki v0.103.15
+  Downloaded bit-vec v0.8.0
+  Downloaded derive_more-impl v2.1.1
+  Downloaded toml_parser v1.1.3+spec-1.1.0
+  Downloaded napi v2.16.17
+  Downloaded aho-corasick v1.1.5
+  Downloaded equivalent v1.0.2
+  Downloaded heck v0.5.0
+  Downloaded proc-macro-error-attr2 v2.0.0
+  Downloaded serde_json v1.0.151
+  Downloaded thiserror v2.0.21
+  Downloaded time-core v0.1.9
+  Downloaded tinyvec v1.13.2
+  Downloaded unicode-segmentation v1.13.3
+  Downloaded autocfg v1.5.1
+  Downloaded blake3 v1.8.7
+  Downloaded napi-sys v2.4.0
+  Downloaded proptest v1.11.0
+  Downloaded pyo3-macros v0.22.6
+  Downloaded rand_xorshift v0.4.0
+  Downloaded semver v1.0.28
+  Downloaded serde_derive v1.0.229
+  Downloaded tempfile v3.27.0
+  Downloaded proc-macro-error2 v2.0.1
+  Downloaded serde_spanned v0.6.9
+  Downloaded regex v1.13.1
+  Downloaded serde v1.0.229
+  Downloaded syn v2.0.119
+  Downloaded syn v3.0.5
+  Downloaded iai-callgrind-runner v0.16.1
+  Downloaded regex-syntax v0.8.11
+  Downloaded rand v0.9.5
+  Downloaded find-msvc-tools v0.1.12
+  Downloaded twox-hash v2.1.4
+  Downloaded rustls v0.23.44
+  Downloaded regex-automata v0.4.18
+  Downloaded libc v0.2.189
+  Downloaded pyo3 v0.22.6
+  Downloaded rustix v1.1.4
+  Downloaded ring v0.17.14
+  Downloaded memchr v2.8.3
+  Downloaded linux-raw-sys v0.12.1
+  Downloaded zstd v0.13.3
+  Downloaded zmij v1.0.23
+  Downloaded unindent v0.2.4
+  Downloaded tinyvec_macros v0.1.1
+  Downloaded toml_datetime v0.6.11
+  Downloaded toml_write v0.1.2
+  Downloaded unarray v0.1.4
+  Downloaded untrusted v0.9.0
+  Downloaded toml_writer v1.1.2+spec-1.1.0
+  Downloaded wait-timeout v0.2.1
+  Downloaded toml_datetime v1.1.1+spec-1.1.0
+  Downloaded yasna v0.5.2
+  Downloaded toml v0.8.23
+  Downloaded trybuild v1.0.120
+  Downloaded unicode-ident v1.0.24
+  Downloaded toml v1.1.5+spec-1.1.0
+  Downloaded toml_edit v0.22.27
+  Downloaded unicode-normalization v0.1.25
+  Downloaded winnow v1.0.4
+  Downloaded winnow v0.7.15
+  Downloaded time v0.3.55
+  Downloaded zerocopy v0.8.56
+  Downloaded zstd-sys v2.1.0+zstd.1.5.7
+   Compiling libc v0.2.189
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.12
+    Checking cfg-if v1.0.4
+    Checking bitflags v2.13.1
+   Compiling rustix v1.1.4
+    Checking linux-raw-sys v0.12.1
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling jobserver v0.1.35
+    Checking arrayvec v0.7.8
+    Checking cpufeatures v0.3.1
+   Compiling cc v1.4.5
+    Checking constant_time_eq v0.4.2
+   Compiling pkg-config v0.3.34
+   Compiling syn v3.0.5
+   Compiling serde_core v1.0.229
+   Compiling blake3 v1.8.7
+   Compiling serde v1.0.229
+   Compiling serde_derive v1.0.229
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+   Compiling zmij v1.0.23
+   Compiling zstd-safe v7.3.0
+   Compiling serde_json v1.0.151
+    Checking twox-hash v2.1.4
+    Checking lz4_flex v0.11.6
+    Checking itoa v1.0.18
+    Checking memchr v2.8.3
+    Checking memmap2 v0.9.11
+   Compiling syn v2.0.119
+    Checking once_cell v1.21.4
+   Compiling getrandom v0.4.3
+   Compiling autocfg v1.5.1
+   Compiling getrandom v0.3.4
+   Compiling zerocopy v0.8.56
+    Checking rand_core v0.9.5
+   Compiling num-traits v0.2.19
+    Checking fastrand v2.5.0
+    Checking tempfile v3.27.0
+    Checking wait-timeout v0.2.1
+    Checking bit-vec v0.8.0
+    Checking quick-error v1.2.3
+    Checking fnv v1.0.7
+    Checking rusty-fork v0.3.1
+    Checking bit-set v0.8.0
+    Checking rand_xorshift v0.4.0
+    Checking rand v0.9.5
+    Checking unarray v0.1.4
+    Checking regex-syntax v0.8.11
+    Checking slates-image v0.1.0 (/home/runner/work/slates/slates/crates/image)
+    Checking ppv-lite86 v0.2.21
+    Checking rand_chacha v0.9.0
+    Checking tinyvec_macros v0.1.1
+   Compiling slates-wire-derive v0.1.0 (/home/runner/work/slates/slates/crates/wire-derive)
+    Checking proptest v1.11.0
+    Checking tinyvec v1.13.2
+    Checking unicode-normalization v0.1.25
+   Compiling cmake v0.1.58
+   Compiling fs_extra v1.3.0
+   Compiling dunce v1.0.5
+   Compiling aws-lc-rs v1.18.1 (/home/runner/work/slates/slates/vendor/aws-lc-rs)
+   Compiling aws-lc-sys v0.45.0 (/home/runner/work/slates/slates/vendor/aws-lc-sys)
+    Checking zeroize v1.9.0
+   Compiling thiserror v2.0.21
+   Compiling thiserror-impl v2.0.21
+    Checking slates-test-seeds v0.1.0 (/home/runner/work/slates/slates/crates/test-seeds)
+    Checking rustls-pki-types v1.15.1
+   Compiling rustls v0.23.44
+    Checking untrusted v0.9.0
+    Checking subtle v2.6.1
+   Compiling semver v1.0.28
+    Checking hyper-timing v0.1.0 (/home/runner/work/slates/slates/vendor/hyper-raft/hyper-timing)
+   Compiling rustc_version v0.4.1
+    Checking hyper-swim v0.1.0 (/home/runner/work/slates/slates/vendor/hyper-raft/hyper-swim)
+   Compiling crc32c v0.6.8
+    Checking deranged v0.5.8
+    Checking powerfmt v0.2.0
+    Checking time-core v0.1.9
+    Checking num-conv v0.2.2
+    Checking slates-merge v0.1.0 (/home/runner/work/slates/slates/crates/merge)
+    Checking time v0.3.55
+    Checking slates-bridge-oci v0.1.0 (/home/runner/work/slates/slates/crates/bridge-oci)
+    Checking yasna v0.5.2
+   Compiling derive_more-impl v2.1.1
+   Compiling proc-macro-error-attr2 v2.0.0
+   Compiling iai-callgrind-runner v0.16.1
+   Compiling proc-macro-error2 v2.0.1
+   Compiling derive_more v2.1.1
+   Compiling iai-callgrind v0.16.1
+    Checking bincode v1.3.3
+    Checking slates-conformance v0.1.0 (/home/runner/work/slates/slates/crates/conformance)
+   Compiling iai-callgrind-macros v0.6.1
+    Checking slates-guest-probe v0.1.0 (/home/runner/work/slates/slates/crates/guest-probe)
+   Compiling target-lexicon v0.12.16
+    Checking hashbrown v0.17.1
+   Compiling pyo3-build-config v0.22.6
+    Checking zstd v0.13.3
+   Compiling target-triple v1.0.1
+    Checking slates-machine v0.1.0 (/home/runner/work/slates/slates/crates/machine)
+    Checking slates-archive v0.1.0 (/home/runner/work/slates/slates/crates/archive)
+    Checking equivalent v1.0.2
+    Checking winnow v1.0.4
+    Checking toml_parser v1.1.3+spec-1.1.0
+    Checking indexmap v2.14.2
+    Checking slates-mem v0.1.0 (/home/runner/work/slates/slates/crates/mem)
+    Checking slates-wire v0.1.0 (/home/runner/work/slates/slates/crates/wire)
+    Checking toml_datetime v0.6.11
+    Checking serde_spanned v0.6.9
+    Checking toml_datetime v1.1.1+spec-1.1.0
+    Checking serde_spanned v1.1.1
+    Checking winnow v0.7.15
+    Checking toml_writer v1.1.2+spec-1.1.0
+    Checking slates-rt v0.1.0 (/home/runner/work/slates/slates/crates/rt)
+    Checking slates-vfs v0.1.0 (/home/runner/work/slates/slates/crates/vfs)
+    Checking slates-anchor v0.1.0 (/home/runner/work/slates/slates/crates/anchor)
+    Checking slates-db v0.1.0 (/home/runner/work/slates/slates/crates/db)
+    Checking slates-ipc v0.1.0 (/home/runner/work/slates/slates/crates/ipc)
+    Checking toml_write v0.1.2
+    Checking toml_edit v0.22.27
+    Checking toml v1.1.5+spec-1.1.0
+    Checking slates-bridge-core v0.1.0 (/home/runner/work/slates/slates/crates/bridge-core)
+    Checking slates-base v0.1.0 (/home/runner/work/slates/slates/crates/base)
+    Checking slates-land v0.1.0 (/home/runner/work/slates/slates/crates/land)
+    Checking slates-bridge-fuse v0.1.0 (/home/runner/work/slates/slates/crates/bridge-fuse)
+    Checking slates-bridge-nfs v0.1.0 (/home/runner/work/slates/slates/crates/bridge-nfs)
+   Compiling pyo3-ffi v0.22.6
+   Compiling pyo3-macros-backend v0.22.6
+    Checking slates-bridge-virtiofs v0.1.0 (/home/runner/work/slates/slates/crates/bridge-virtiofs)
+   Compiling aho-corasick v1.1.5
+    Checking termcolor v1.4.1
+    Checking glob v0.3.4
+    Checking trybuild v1.0.120
+    Checking toml v0.8.23
+   Compiling memoffset v0.9.1
+   Compiling heck v0.5.0
+   Compiling unicode-segmentation v1.13.3
+   Compiling convert_case v0.6.0
+   Compiling pyo3 v0.22.6
+   Compiling regex-automata v0.4.18
+   Compiling napi-build v2.4.1
+   Compiling slates-sdk-node v0.1.0 (/home/runner/work/slates/slates/crates/sdk-node)
+   Compiling ctor v0.2.9
+   Compiling slates-sdk-python v0.1.0 (/home/runner/work/slates/slates/crates/sdk-python)
+   Compiling indoc v2.0.7
+    Checking unindent v0.2.4
+    Checking napi-sys v2.4.0
+    Checking napi v2.16.17
+   Compiling regex v1.13.1
+   Compiling pyo3-macros v0.22.6
+   Compiling napi-derive-backend v1.0.75
+    Checking slates-bridge-fskit v0.1.0 (/home/runner/work/slates/slates/crates/bridge-fskit)
+   Compiling napi-derive v2.16.13
+    Checking slates-bridge-winfsp v0.1.0 (/home/runner/work/slates/slates/crates/bridge-winfsp)
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-42c31b829b6af06e/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-42c31b829b6af06e/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-42c31b829b6af06e/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-42c31b829b6af06e/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+    Checking hyper-seal v0.1.0 (/home/runner/work/slates/slates/vendor/hyper-raft/hyper-seal)
+    Checking rustls-webpki v0.103.15
+    Checking hyper-datagram v0.1.0 (/home/runner/work/slates/slates/vendor/hyper-raft/hyper-datagram)
+    Checking rcgen v0.13.2
+    Checking slates-seal v0.1.0 (/home/runner/work/slates/slates/crates/seal)
+    Checking slates-client v0.1.0 (/home/runner/work/slates/slates/crates/client)
+    Checking slates-mcp v0.1.0 (/home/runner/work/slates/slates/crates/mcp)
+    Checking xtask v0.1.0 (/home/runner/work/slates/slates/xtask)
+    Checking slates-transport v0.1.0 (/home/runner/work/slates/slates/crates/transport)
+    Checking slates-cluster v0.1.0 (/home/runner/work/slates/slates/crates/cluster)
+    Checking slates-server v0.1.0 (/home/runner/work/slates/slates/crates/server)
+    Checking slates-cli v0.1.0 (/home/runner/work/slates/slates/crates/cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 02s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+## workspace clippy exit 0
+   Compiling libc v0.2.189
+   Compiling serde_core v1.0.229
+   Compiling syn v3.0.5
+   Compiling cpufeatures v0.3.1
+   Compiling rustix v1.1.4
+   Compiling cfg-if v1.0.4
+   Compiling arrayvec v0.7.8
+   Compiling constant_time_eq v0.4.2
+   Compiling zmij v1.0.23
+   Compiling itoa v1.0.18
+   Compiling jobserver v0.1.35
+   Compiling memchr v2.8.3
+   Compiling cc v1.4.5
+   Compiling bitflags v2.13.1
+   Compiling linux-raw-sys v0.12.1
+   Compiling serde_derive v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+   Compiling blake3 v1.8.7
+   Compiling memmap2 v0.9.11
+   Compiling syn v2.0.119
+   Compiling serde v1.0.229
+   Compiling tinyvec_macros v0.1.1
+   Compiling twox-hash v2.1.4
+   Compiling lz4_flex v0.11.6
+   Compiling tinyvec v1.13.2
+   Compiling unicode-normalization v0.1.25
+   Compiling slates-image v0.1.0 (/home/runner/work/slates/slates/crates/image)
+   Compiling slates-machine v0.1.0 (/home/runner/work/slates/slates/crates/machine)
+   Compiling slates-wire-derive v0.1.0 (/home/runner/work/slates/slates/crates/wire-derive)
+   Compiling slates-mem v0.1.0 (/home/runner/work/slates/slates/crates/mem)
+   Compiling slates-wire v0.1.0 (/home/runner/work/slates/slates/crates/wire)
+   Compiling zstd-safe v7.3.0
+   Compiling zstd v0.13.3
+   Compiling slates-archive v0.1.0 (/home/runner/work/slates/slates/crates/archive)
+   Compiling slates-vfs v0.1.0 (/home/runner/work/slates/slates/crates/vfs)
+   Compiling slates-base v0.1.0 (/home/runner/work/slates/slates/crates/base)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 16.25s
+     Running unittests src/lib.rs (target/debug/deps/slates_base-929d3e150c4be1b2)
+
+running 11 tests
+test own_mounts::linux::tests::a_mount_table_line_names_its_id_point_and_source ... ok
+test own_mounts::linux::tests::a_path_on_no_mount_of_this_daemons_is_admitted ... ok
+test own_mounts::tests::a_forget_clears_every_slot_holding_its_id ... ok
+test tests::a_name_that_is_not_one_entry_is_refused_as_absent ... ok
+test own_mounts::tests::the_set_records_its_own_mounts_up_to_its_bound ... ok
+test windows_records::tests::a_link_record_yields_the_target_a_user_sees ... ok
+test tests::the_granularity_table_is_what_the_racy_rule_assumes_and_unknown_is_the_coarse_arm ... ok
+test windows_records::tests::a_directory_chain_yields_its_names_in_order ... ok
+test windows_records::tests::a_malformed_directory_chain_is_refused_typed ... ok
+test windows_records::tests::a_malformed_link_record_is_refused_typed ... ok
+test own_mounts::tests::a_forget_after_two_threads_record_one_id_at_once_leaves_it_unrecorded ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/host.rs (target/debug/deps/host-0b9b17ed922a8344)
+
+running 13 tests
+test a_lookup_that_is_not_one_entry_never_leaves_the_base ... ok
+test a_base_symlink_pointing_outside_is_never_followed_to_the_host ... ok
+test a_final_component_swapped_for_a_link_is_refused_and_an_open_file_keeps_its_bytes ... ok
+test a_files_times_are_unix_nanoseconds_and_an_in_place_edit_moves_them ... ok
+test a_retained_root_keeps_naming_the_base_after_its_path_becomes_a_junction ... ok
+test a_real_directory_shows_descriptor_semantics_nofollow_and_hints ... ok
+test an_in_place_write_to_an_opened_base_file_hints_its_directory ... ok
+test an_intermediate_swapped_for_a_junction_is_never_traversed ... ok
+test an_overlay_over_the_workspace_tree_costs_one_open_and_reads_the_disk ... ok
+test the_host_lists_opens_and_reads_the_workspace_tree ... ok
+test an_overlay_over_the_workspace_tree_digests_a_file_as_the_disk_holds_it ... ok
+test the_host_refuses_the_wrong_kind_and_releases_handles ... ok
+test a_real_directory_digest_follows_the_disk_through_the_watcher ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests slates_base
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+## base unit tests exit 0
+   Compiling serde v1.0.229
+   Compiling cmake v0.1.58
+   Compiling zeroize v1.9.0
+   Compiling once_cell v1.21.4
+   Compiling getrandom v0.4.3
+   Compiling getrandom v0.3.4
+   Compiling rustls-pki-types v1.15.1
+   Compiling rand_core v0.9.5
+   Compiling aws-lc-sys v0.45.0 (/home/runner/work/slates/slates/vendor/aws-lc-sys)
+   Compiling slates-machine v0.1.0 (/home/runner/work/slates/slates/crates/machine)
+   Compiling untrusted v0.9.0
+   Compiling zerocopy v0.8.56
+   Compiling fastrand v2.5.0
+   Compiling subtle v2.6.1
+   Compiling tempfile v3.27.0
+   Compiling thiserror v2.0.21
+   Compiling crc32c v0.6.8
+   Compiling wait-timeout v0.2.1
+   Compiling slates-mem v0.1.0 (/home/runner/work/slates/slates/crates/mem)
+   Compiling slates-wire v0.1.0 (/home/runner/work/slates/slates/crates/wire)
+   Compiling slates-rt v0.1.0 (/home/runner/work/slates/slates/crates/rt)
+   Compiling slates-anchor v0.1.0 (/home/runner/work/slates/slates/crates/anchor)
+   Compiling slates-vfs v0.1.0 (/home/runner/work/slates/slates/crates/vfs)
+   Compiling slates-db v0.1.0 (/home/runner/work/slates/slates/crates/db)
+   Compiling slates-ipc v0.1.0 (/home/runner/work/slates/slates/crates/ipc)
+   Compiling slates-base v0.1.0 (/home/runner/work/slates/slates/crates/base)
+   Compiling slates-bridge-core v0.1.0 (/home/runner/work/slates/slates/crates/bridge-core)
+   Compiling ppv-lite86 v0.2.21
+   Compiling quick-error v1.2.3
+   Compiling time-core v0.1.9
+   Compiling fnv v1.0.7
+   Compiling bit-vec v0.8.0
+   Compiling deranged v0.5.8
+   Compiling powerfmt v0.2.0
+   Compiling hyper-timing v0.1.0 (/home/runner/work/slates/slates/vendor/hyper-raft/hyper-timing)
+   Compiling num-conv v0.2.2
+   Compiling time v0.3.55
+   Compiling hyper-swim v0.1.0 (/home/runner/work/slates/slates/vendor/hyper-raft/hyper-swim)
+   Compiling bit-set v0.8.0
+   Compiling rusty-fork v0.3.1
+   Compiling rand_chacha v0.9.0
+   Compiling slates-bridge-fuse v0.1.0 (/home/runner/work/slates/slates/crates/bridge-fuse)
+   Compiling num-traits v0.2.19
+   Compiling rand_xorshift v0.4.0
+   Compiling rand v0.9.5
+   Compiling unarray v0.1.4
+   Compiling regex-syntax v0.8.11
+   Compiling slates-bridge-virtiofs v0.1.0 (/home/runner/work/slates/slates/crates/bridge-virtiofs)
+   Compiling proptest v1.11.0
+   Compiling yasna v0.5.2
+   Compiling slates-bridge-nfs v0.1.0 (/home/runner/work/slates/slates/crates/bridge-nfs)
+   Compiling slates-land v0.1.0 (/home/runner/work/slates/slates/crates/land)
+   Compiling slates-merge v0.1.0 (/home/runner/work/slates/slates/crates/merge)
+   Compiling slates-bridge-oci v0.1.0 (/home/runner/work/slates/slates/crates/bridge-oci)
+   Compiling slates-test-seeds v0.1.0 (/home/runner/work/slates/slates/crates/test-seeds)
+   Compiling slates-conformance v0.1.0 (/home/runner/work/slates/slates/crates/conformance)
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+   Compiling aws-lc-rs v1.18.1 (/home/runner/work/slates/slates/vendor/aws-lc-rs)
+   Compiling rustls v0.23.44
+   Compiling rustls-webpki v0.103.15
+   Compiling hyper-datagram v0.1.0 (/home/runner/work/slates/slates/vendor/hyper-raft/hyper-datagram)
+   Compiling hyper-seal v0.1.0 (/home/runner/work/slates/slates/vendor/hyper-raft/hyper-seal)
+   Compiling slates-seal v0.1.0 (/home/runner/work/slates/slates/crates/seal)
+   Compiling slates-client v0.1.0 (/home/runner/work/slates/slates/crates/client)
+   Compiling rcgen v0.13.2
+   Compiling slates-transport v0.1.0 (/home/runner/work/slates/slates/crates/transport)
+   Compiling slates-cluster v0.1.0 (/home/runner/work/slates/slates/crates/cluster)
+   Compiling slates-server v0.1.0 (/home/runner/work/slates/slates/crates/server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 52.30s
+     Running tests/fuse_mount.rs (target/debug/deps/fuse_mount-519cb20fc7464c8f)
+
+running 3 tests
+slates-server: shard 0 initialized in 2162 µs
+slates-server: shard 1 initialized in 1412 µs
+slates-server: shard 1 initialized in 1424 µs
+slates-server: shard 0 initialized in 2457 µs
+slates-server: shard 0 initialized in 2995 µs
+test a_fenced_shards_fuse_mount_ends_with_the_daemon ... ok
+test a_scoped_fuse_mount_presents_one_directory_and_follows_it ... ok
+test a_volume_mounted_through_fuse_serves_the_kernel_and_ends_with_its_mount ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+
+     Running tests/recovery.rs (target/debug/deps/recovery-b0648274904f9ee2)
+
+running 43 tests
+slates-server: shard 1 initialized in 1980 µs
+slates-server: shard 0 initialized in 1665 µs
+slates-server: shard 0 initialized in 1243 µs
+slates-server: shard 1 initialized in 742 µs
+slates-server: shard 1 initialized in 2616 µs
+slates-server: shard 0 initialized in 5951 µs
+slates-server: shard 1 initialized in 2103 µs
+slates-server: shard 0 initialized in 2919 µs
+slates-server: shard 0 initialized in 1315 µs
+slates-server: shard 7: recovered 2 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 7: held 0 replicas again from the image
+slates-server: shard 1 initialized in 1957 µs
+slates-server: shard 1 initialized in 1252 µs
+slates-server: shard 1: recovered 2 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 2 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 1 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 1: held 0 replicas again from the image
+slates-server: shard 0 initialized in 6179 µs
+slates-server: shard 1 initialized in 1328 µs
+slates-server: shard 0: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 0: held 0 replicas again from the image
+slates-server: shard 0 initialized in 2329 µs
+slates-server: shard 0 initialized in 1686 µs
+slates-server: shard 6: recovered 2 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 6: held 0 replicas again from the image
+slates-server: shard 1 initialized in 2398 µs
+test a_compound_retried_across_a_daemon_restart_is_answered_never_run_again ... ok
+slates-server: shard 1 initialized in 901 µs
+slates-server: shard 0 initialized in 1510 µs
+slates-server: shard 1 initialized in 1003 µs
+slates-server: shard 0 initialized in 1496 µs
+slates-server: shard 1 initialized in 863 µs
+slates-server: shard 0 initialized in 1391 µs
+test a_clone_recovers_over_its_recovered_origin_serving_inherited_and_its_own_files ... ok
+slates-server: shard 1 initialized in 1042 µs
+slates-server: shard 0 initialized in 1650 µs
+test a_cut_transfer_resumes_with_exactly_the_chunks_still_owed ... ok
+slates-server: shard 0 initialized in 1303 µs
+slates-server: shard 0 initialized in 1611 µs
+slates-server: shard 7: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 1 destroys in flight, corrected 1 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 7: held 0 replicas again from the image
+slates-server: shard 1 initialized in 1756 µs
+test a_clones_rewrite_of_a_file_its_origin_holds_open_survives_a_restart_beside_the_origin ... ok
+slates-server: shard 1 initialized in 755 µs
+slates-server: shard 0 initialized in 1168 µs
+slates-server: shard 1 initialized in 1015 µs
+slates-server: shard 0 initialized in 1560 µs
+slates-server: shard 0 initialized in 1421 µs
+slates-server: shard 1 initialized in 1936 µs
+test a_clone_pin_and_a_destroy_in_flight_reconcile_to_the_catalog_across_a_restart ... ok
+slates-server: shard 0 initialized in 1336 µs
+slates-server: shard 1 initialized in 2001168 µs
+test a_daemon_stopped_while_its_boot_waits_on_a_shard_stops ... ok
+slates-server: shard 1 initialized in 846 µs
+slates-server: shard 0 initialized in 2284 µs
+slates-server: shard 1 initialized in 2357 µs
+slates-server: shard 0 initialized in 3190 µs
+slates-server: shard 0 initialized in 3847 µs
+slates-server: shard 5: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 5: held 0 replicas again from the image
+slates-server: shard 1 initialized in 4637 µs
+test a_deleted_files_memory_goes_back_to_the_os ... ok
+slates-server: shard 1 initialized in 1050 µs
+slates-server: shard 0 initialized in 1676 µs
+slates-server: shard 1 initialized in 1187 µs
+slates-server: shard 0 initialized in 1597 µs
+slates-server: shard 0 initialized in 1457 µs
+slates-server: shard 5: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 5: held 0 replicas again from the image
+slates-server: shard 1 initialized in 2652 µs
+slates-server: shard 1 initialized in 1188 µs
+slates-server: shard 2: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 2: held 0 replicas again from the image
+slates-server: shard 0 initialized in 3037 µs
+test a_destroyed_sessions_records_are_purged_and_stay_purged_across_a_restart ... ok
+slates-server: shard 1 initialized in 774 µs
+slates-server: shard 0 initialized in 1314 µs
+slates-server: shard 1 initialized in 1184 µs
+slates-server: shard 2: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 2: held 0 replicas again from the image
+slates-server: shard 0 initialized in 3019 µs
+slates-server: shard 1 initialized in 984 µs
+slates-server: shard 0 initialized in 1552 µs
+slates-server: shard 0 initialized in 1331 µs
+slates-server: shard 5: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 5: held 0 replicas again from the image
+slates-server: shard 1 initialized in 2403 µs
+test a_dropped_clients_purge_owed_at_a_restart_is_sent_after_it ... ok
+slates-server: shard 1 initialized in 950 µs
+slates-server: shard 0 initialized in 1435 µs
+test a_deleted_files_plaintext_leaves_the_content_object ... ok
+slates-server: shard 1 initialized in 993 µs
+slates-server: shard 0 initialized in 1517 µs
+slates-server: shard 1 initialized in 903 µs
+slates-server: shard 0 initialized in 1473 µs
+slates-server: shard 0 initialized in 1818 µs
+slates-server: shard 5: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 5: held 0 replicas again from the image
+slates-server: shard 1 initialized in 2474 µs
+slates-server: bytes budget refuse-all (first occurrence): requested=66846720 config[reserve_per_shard=16711680 shards=2 max_inodes=1212334 max_chunks=681938 metadata_class=2793218048] bytes[capacity=25034752 committed=22413312 retained=0 headroom=2621440 replicated=0] versions[capacity=1212334 committed=133412 retained=0 headroom=1] held[stages=0 charged=0]
+test a_hold_finer_than_the_pools_free_extents_is_owed_by_the_next_shard_to_grow ... ok
+slates-server: shard 1 initialized in 918 µs
+slates-server: shard 0 initialized in 1371 µs
+slates-server: shard 0 initialized in 1776 µs
+slates-server: shard 7: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 7: held 0 replicas again from the image
+slates-server: shard 1 initialized in 2667 µs
+slates-server: shard 1 initialized in 833 µs
+slates-server: shard 0 initialized in 1407 µs
+test a_hold_the_pool_cannot_cover_is_taken_from_the_free_room_the_shards_hold ... ok
+slates-server: shard 1 initialized in 775 µs
+slates-server: shard 0 initialized in 1191 µs
+slates-server: shard 6: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 6: held 0 replicas again from the image
+slates-server: shard 0 initialized in 2358 µs
+slates-server: shard 1 initialized in 2352 µs
+slates-server: shard 5: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 5: held 0 replicas again from the image
+slates-server: shard 1 initialized in 1884 µs
+slates-server: shard 0 initialized in 2340 µs
+test a_landed_scratch_volume_keeps_its_base_across_a_restart ... ok
+slates-server: shard 1 initialized in 732 µs
+slates-server: shard 0 initialized in 1211 µs
+test a_landing_presented_before_a_restart_does_not_block_the_first_landing_after_it ... ok
+slates-server: shard 1 initialized in 897 µs
+slates-server: shard 0 initialized in 1305 µs
+test a_refused_admission_leaves_the_pool_to_the_other_shards ... ok
+slates-server: shard 1 initialized in 738 µs
+slates-server: shard 0 initialized in 1320 µs
+test a_replica_is_admitted_only_from_the_holders_unpromised_capacity ... ok
+slates-server: shard 0 initialized in 1098 µs
+slates-server: shard 1 initialized in 875 µs
+slates-server: shard 0 initialized in 1084 µs
+slates-server: shard 0 initialized in 1642 µs
+slates-server: shard 5: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 5: held 0 replicas again from the image
+slates-server: shard 1 initialized in 2814 µs
+test a_pressured_daemons_hold_is_withheld_whole_from_a_volume_on_any_one_shard ... ok
+slates-server: shard 1 initialized in 988 µs
+slates-server: shard 0 initialized in 1754 µs
+slates-server: shard 0 initialized in 1633 µs
+slates-server: shard 1 initialized in 2070 µs
+slates-server: shard 5: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 1 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 5: held 0 replicas again from the image
+slates-server: shard 0 initialized in 3510 µs
+slates-server: shard 1 initialized in 3558 µs
+slates-server: shard 3: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 1 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 3: held 0 replicas again from the image
+slates-server: shard 0 initialized in 14782 µs
+slates-server: shard 1 initialized in 958 µs
+slates-server: shard 0 initialized in 1566 µs
+slates-server: shard 0 initialized in 2111 µs
+slates-server: shard 5: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 5: held 0 replicas again from the image
+slates-server: shard 1 initialized in 2683 µs
+test a_sealed_files_block_is_trimmed_to_its_pages_and_survives_a_restart ... ok
+slates-server: shard 1 initialized in 845 µs
+slates-server: shard 0 initialized in 1507 µs
+slates-server: shard 0 initialized in 1433 µs
+slates-server: shard 7: recovered 2 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 7: held 0 replicas again from the image
+slates-server: shard 1 initialized in 2983 µs
+test a_sealed_files_plaintext_leaves_the_content_object ... ok
+slates-server: shard 1 initialized in 806 µs
+slates-server: shard 0 initialized in 1362 µs
+test a_shard_is_refused_while_another_holds_the_pool_and_admitted_once_it_returns ... ok
+slates-server: shard 0 initialized in 1110 µs
+slates-server: shard 1 initialized in 1015 µs
+slates-server: shard 0 initialized in 1513 µs
+slates-server: shard 0 initialized in 1690 µs
+slates-server: shard 5: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 5: held 0 replicas again from the image
+slates-server: shard 1 initialized in 2865 µs
+test a_session_grant_outlives_a_restart_and_a_single_use_grant_stays_spent ... ok
+slates-server: shard 0 initialized in 1392 µs
+slates-server: client identity recovery refused on shard 6
+slates-server: the boot is refused; the heartbeat stops so the anchor restarts this daemon
+test a_daemons_own_growth_is_not_memory_pressure ... ok
+slates-server: shard 1 initialized in 1137 µs
+slates-server: shard 0 initialized in 1729 µs
+slates-server: shard 0 initialized in 1492 µs
+slates-server: shard 4: recovered 2 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 4: held 0 replicas again from the image
+slates-server: shard 1 initialized in 7203 µs
+slates-server: shard 1 initialized in 910 µs
+slates-server: shard 0 initialized in 1428 µs
+slates-server: shard 0 initialized in 2206 µs
+slates-server: shard 5: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 5: held 0 replicas again from the image
+slates-server: shard 1 initialized in 2612 µs
+slates-server: shard 7 is still starting; the control loop waits a further window
+slates-server: shard 1 initialized in 2001291 µs
+test a_shard_stuck_in_its_start_stops_the_heartbeat_so_the_anchor_restarts_the_daemon ... ok
+slates-server: shard 1 initialized in 843 µs
+slates-server: shard 0 initialized in 1502 µs
+test a_target_lease_outlives_its_daemon_and_blocks_landings_until_its_term ... ok
+slates-server: shard 0 initialized in 1343 µs
+slates-server: shard 1 initialized in 2001477 µs
+test a_shard_whose_start_outlasts_a_liveness_window_while_working_does_not_stop_the_daemon ... ok
+slates-server: shard 0 initialized in 1468 µs
+slates-server: shard 1 initialized in 901 µs
+slates-server: shard 1 initialized in 957 µs
+slates-server: shard 0 initialized in 1481 µs
+slates-server: shard 5: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 5: held 0 replicas again from the image
+slates-server: shard 1 initialized in 2681 µs
+slates-server: shard 0 initialized in 3611 µs
+slates-server: shard 0 initialized in 5000 µs
+slates-server: shard 4: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 4: held 0 replicas again from the image
+slates-server: shard 1 initialized in 6112 µs
+slates-server: shard 1: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 1 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 1: held 0 replicas again from the image
+slates-server: shard 0 initialized in 53046 µs
+slates-server: shard 1 initialized in 2852 µs
+slates-server: shard 2: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 1 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 2: held 0 replicas again from the image
+slates-server: shard 0 initialized in 36756 µs
+slates-server: shard 1 initialized in 992 µs
+slates-server: shard 0 initialized in 1521 µs
+slates-server: shard 0 initialized in 1685 µs
+slates-server: shard 5: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 5: held 0 replicas again from the image
+slates-server: shard 1 initialized in 2783 µs
+test acknowledged_content_and_its_snapshot_survive_a_daemon_restart_byte_for_byte ... ok
+slates-server: shard 1 initialized in 1056 µs
+slates-server: shard 0 initialized in 1595 µs
+test an_abandoned_transfer_returns_every_charge_when_replaced ... ok
+slates-server: shard 1 initialized in 779 µs
+slates-server: shard 0 initialized in 1333 µs
+slates-server: shard 1 initialized in 840 µs
+slates-server: shard 3: recovered 0 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 3: held 0 replicas again from the image
+slates-server: shard 0 initialized in 1399 µs
+test an_acknowledged_held_record_survives_a_warm_daemon_restart ... ok
+slates-server: shard 1 initialized in 698 µs
+slates-server: shard 0 initialized in 1200 µs
+slates-server: shard 1 initialized in 744 µs
+slates-server: shard 3: recovered 0 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 3: held 1 replicas again from the image
+slates-server: shard 0 initialized in 2517 µs
+test an_acknowledged_replica_survives_a_warm_daemon_restart ... ok
+slates-server: shard 1 initialized in 700 µs
+slates-server: shard 0 initialized in 1257 µs
+slates-server: shard 1 initialized in 1221 µs
+slates-server: shard 3: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 1 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 3: held 0 replicas again from the image
+slates-server: shard 0 initialized in 5207 µs
+slates-server: shard 0 initialized in 1584 µs
+slates-server: shard 1 initialized in 791 µs
+slates-server: shard 5: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 5: held 0 replicas again from the image
+slates-server: shard 1 initialized in 3262 µs
+slates-server: shard 0 initialized in 4065 µs
+test an_extent_claimed_just_before_a_crash_is_returned_at_the_first_publication ... ok
+slates-server: shard 1 initialized in 920 µs
+slates-server: shard 0 initialized in 1701 µs
+test a_crash_at_every_durable_step_recovers_and_the_resume_reaches_the_reference ... ok
+slates-server: shard 0 initialized in 1583 µs
+slates-server: shard 1 initialized in 739 µs
+slates-server: shard 0 initialized in 1870 µs
+slates-server: shard 5: recovered 2 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 5: held 0 replicas again from the image
+slates-server: shard 1 initialized in 4940 µs
+test an_image_volumes_pin_on_its_snapshot_reconciles_across_a_restart ... ok
+slates-server: shard 1 initialized in 4730 µs
+slates-server: shard 0 initialized in 6436 µs
+slates-server: shard 1 initialized in 1183 µs
+slates-server: shard 0: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 0: held 0 replicas again from the image
+slates-server: shard 0 initialized in 10158 µs
+test an_open_and_a_close_retried_across_a_daemon_restart_are_answered_never_run_again ... ok
+slates-server: shard 1 initialized in 863 µs
+slates-server: shard 0 initialized in 1419 µs
+slates-server: shard 0 initialized in 4609 µs
+slates-server: shard 5: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 5: held 0 replicas again from the image
+slates-server: shard 1 initialized in 10610 µs
+test an_idle_small_file_is_sealed_by_the_daemons_sweep ... ok
+slates-server: shard 0 initialized in 1800 µs
+slates-server: shard 1 initialized in 2466 µs
+test an_overlays_copied_up_and_created_files_survive_a_restart_over_their_base ... ok
+slates-server: shard 1 initialized in 5007 µs
+slates-server: shard 3: recovered 2 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 3: held 0 replicas again from the image
+slates-server: shard 0 initialized in 6964 µs
+slates-server: shard 0 initialized in 1877 µs
+slates-server: shard 1 initialized in 1658 µs
+test an_unpublished_verb_stays_retryable_across_the_clients_acknowledgement ... ok
+slates-server: shard 1 initialized in 760 µs
+slates-server: shard 0 initialized in 1347 µs
+test a_volume_past_the_reserves_power_of_two_part_fills_and_survives_a_restart ... ok
+slates-server: shard 0 initialized in 1704 µs
+test an_unpublished_verb_is_refused_typed_a_retry_re_executes_and_a_restart_agrees ... ok
+slates-server: shard 1 initialized in 1018 µs
+slates-server: shard 0 initialized in 1434 µs
+slates-server: shard 1: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 1 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 1: held 0 replicas again from the image
+slates-server: shard 0 initialized in 33413 µs
+slates-server: shard 0 initialized in 5102 µs
+slates-server: shard 4: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 1 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 4: held 0 replicas again from the image
+slates-server: shard 1 initialized in 10959 µs
+test a_volume_larger_than_its_shards_slice_fills_from_the_pool_and_survives_a_restart ... ok
+slates-server: shard 1 initialized in 940 µs
+slates-server: shard 0 initialized in 1471 µs
+slates-server: shard 1: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains replayed, works reset), reconciled out 0 unrecovered local snapshots and 1 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 1: held 0 replicas again from the image
+slates-server: shard 0 initialized in 24737 µs
+slates-server: shard 1 initialized in 963 µs
+slates-server: shard 0 initialized in 1527 µs
+test sealed_content_reads_back_byte_for_byte_after_a_restart ... ok
+test recovery_memory_no_restart_reads_goes_back_and_a_restart_recovers_every_file ... ok
+test two_daemons_in_one_process_measure_memory_pressure_from_their_own_start ... ok
+test memory_others_take_from_a_roomy_host_is_held_only_where_it_eats_into_the_daemons_room ... ok
+
+test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 33.21s
+
+## fuse_mount and recovery exit 0
