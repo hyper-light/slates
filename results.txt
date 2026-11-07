@@ -1,0 +1,2 @@
+tested 5fe6ed495c41a9ec4d0af0a5ef3f6a663a0ade36 on x86_64, 4 cpus
+build exit 0
