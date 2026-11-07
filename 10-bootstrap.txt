@@ -21,3 +21,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 16 filtered out; fin
 rejoins: successor daemon 20629 answered after 42.19075ms
 rejoins: the fleet re-formed after 1.535314084s
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 16 filtered out; finished in 8.36s
+=== rejoin-5 exit 0 load { 50.24 31.84 20.79 }
+rejoins: successor daemon 21071 answered after 44.2595ms
+rejoins: the fleet re-formed after 296.1275ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 16 filtered out; finished in 7.82s
