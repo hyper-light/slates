@@ -74,3 +74,8 @@ rejoins: successor daemon 22008 answered after 41.596916ms
 slates-cluster: fleet: HostId(327997053889412881) holds HostId(11727317198165279145) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
 rejoins: the fleet re-formed after 487.387625ms
 test a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet ... ok
+=== on 6 exit 0 load { 73.23 41.93 22.47 }
+rejoins: successor daemon 22268 answered after 61.655625ms
+slates-cluster: fleet: HostId(8834698215191009876) holds HostId(5496576464882012399) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+rejoins: the fleet re-formed after 656.323042ms
+slates daemon: the anchor is gone; leaving
