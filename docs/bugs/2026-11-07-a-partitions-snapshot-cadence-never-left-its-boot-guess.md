@@ -31,26 +31,56 @@ every volume, and its log fills constantly. The shard spent its time re-encoding
 - The local 10k rung, 900 s bound, on this Mac at load 11 to 139:
   - before: 2,197 of 10,000 clients done and 56,375 submits;
   - after (the first version of the cadence): 3,128 done and 92,542 submits.
+- raft's review asked that the bound be checked, not only stated. Two tests now time recovery against the budget
+  (debug builds on CI's two Linux runners, a 10 ms budget, median of the recoveries, three runs each):
+  - `a_fresh_partitions_longest_tail_replays_within_its_recovery_budget` (the longest tail the cadence allows, five
+    recoveries). With the rate timed on the apply alone, red: the commits measured 272 to 383 bytes a microsecond
+    while the replay ran 13 to 22, so the median recovery took 15.6 to 20.9 times the budget (runs 42389990113 and
+    42390241110). Timed on the append and apply: 0.58 to 0.67 of the budget, the recoveries within 6% of each other.
+  - `a_tail_whose_records_change_size_still_replays_within_its_recovery_budget` (large records, then small ones, a
+    recovery timed after each eighth of a budget's replay, median of three). With the cadence extrapolated from the
+    last stretch of log, red (run 42390792946): the small records' tail passed the budget at about 121 KB (aarch64)
+    and 213 to 217 KB (x86_64), with no snapshot due before 6.75 to 8.59 MB. In the cadence test the large records
+    had measured 442 to 455 bytes a microsecond and the small ones 12 to 24: a 442 MB cadence, about 37 s of replay
+    against a 1 s budget.
+  - Under the measured trigger (run 42391262461) both pass, three of three on each runner: the mix test's tails stayed
+    within 0.85 of the budget with a snapshot after 84 KB (aarch64) and 162 to 164 KB (x86_64) of small records, and
+    the longest tail's median recovery took 0.61 to 0.69 of it. The model's generated histories pass under the
+    measured trigger too, the state compared whole after every crash.
+- The clock's cost (`db_bench`, release, the quiet Studio, 3 interleaved rounds of 5 runs, load 3.7 to 8.3, medians):
+  `db.mutate_guard_append_apply_per_record` 349, 356 and 352 ns with one clock pair a mutate, against 295, 309 and
+  300 ns with none: about 50 ns, a sixth of the cheapest commit (one accounting record). Two pairs a mutate (the
+  append and the apply timed apart) measured 367, 351 and 362 ns. `db.replay_per_record` was 191 to 214 ns in every
+  build, so the commit's measure is about 1.7 times the replay's per record and errs early.
 
 ## Root cause
 
 The cadence was derived from a throughput measured only at boot, and a boot that replays nothing measures nothing.
+The two versions after it each extrapolated a rate: one timed on less than a replay does, the other measured on one
+stretch of log and applied to the next.
 
 ## Fix
 
-- At every snapshot, the cadence is re-derived (`SnapshotPolicy::at_snapshot`) as
-  `max(budget × the apply throughput measured since the last snapshot, the snapshot's size)`.
-  - The apply throughput is timed around the partition's apply in every commit: the work a replay repeats, measured
-    at no extra pass (raft's choice over the encode or a decode).
-  - The boot replay's rate stands until one is measured.
-- The second term is the doubling rule: a snapshot comes only once the log has absorbed what it costs, so snapshot
-  work stays within about twice the log written.
+- A partition snapshots once its tail, the log since its last snapshot, has taken the recovery budget's worth of
+  replay work as its commits measured it, **and** is at least that snapshot's size (`replay::snapshot_due`; the
+  conditions are raft's).
+  - The work is timed on each commit's append (encode, checksum, copy into the ring) and apply, never on a wait outside
+    them: the work a replay repeats per record, the append mirroring its read, checksum and decode, measured at no
+    extra pass. It is slower per byte than the replay, and a preempted commit counts its stall, so it errs early.
+  - Nothing is extrapolated: the tail's own work decides, whatever its records' sizes.
+  - After a boot the tail's work starts at the recovery's own time, the snapshot's decode included, and the floor at the
+    recovered snapshot's size.
+  - The budget is the operator's input (`Db::set_recovery_budget`, GAPS §5), one second by default.
+- The second condition is the doubling rule: a snapshot comes only once the log has absorbed what it costs, so snapshot
+  work stays within about twice the log written. Work alone would break that bound.
 - The decision is the commit's, never the apply's.
-- A cadence a caller sets (`Db::set_policy`, the model tests) is pinned.
+- A cadence a caller sets (`Db::set_policy`, the model tests, the bench) is pinned. Snapshot points under the
+  measured trigger follow the clock, so the model's generated histories run under it too, the recovered state
+  compared whole after every crash.
 - `Db::stats()` (`DbStats`) gives the figures, and `slates status` prints them per shard: snapshots, bytes written,
-  longest duration, log appended, cadence, and the measured apply rate.
-- Recovery's bound changes: decode(P) + replay(max(budget bytes, P)). That is the budget while the partition's
-  snapshot decodes within it, and about twice its own cost beyond. It is stated in §4.8.
+  longest duration, log appended, the tail's bytes and measured work, the budget and the floor.
+- Recovery's bound changes: decode(P) + max(budget, the replay of P bytes of log). That is the budget while the
+  partition is small enough, and about twice its own snapshot's cost beyond. It is stated in §4.8.
 
 ## Impact
 

@@ -1230,10 +1230,15 @@ pub struct DbSnapshotReport {
   pub longest_ns: u64,
   /// The log bytes appended since the daemon recovered.
   pub log_bytes_appended: u64,
-  /// The cadence now: log bytes between snapshots.
-  pub bytes_between: u64,
-  /// The partition's apply throughput measured since the last snapshot, bytes a microsecond (zero until measured).
-  pub apply_bytes_per_us: u64,
+  /// The log since the last snapshot, bytes.
+  pub tail_bytes: u64,
+  /// The replay work its commits measured (each record's append and apply), nanoseconds: the next snapshot comes once
+  /// it reaches `budget_ns` and `tail_bytes` reaches `floor_bytes`.
+  pub tail_replay_ns: u64,
+  /// The recovery budget the tail's work is held to, nanoseconds.
+  pub budget_ns: u64,
+  /// The last snapshot's size, bytes: the doubling rule's floor for the tail.
+  pub floor_bytes: u64,
 }
 
 /// One live-shipped volume's log as a shard sees it (A-200): as its owner (`holding` false: the head it appended and

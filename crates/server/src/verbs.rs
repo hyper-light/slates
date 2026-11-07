@@ -3231,8 +3231,10 @@ fn snapshot_report(stats: slates_db::replay::DbStats) -> slates_ipc::protocol::D
     bytes_written: stats.snapshot_bytes_written,
     longest_ns: stats.snapshot_ns_max,
     log_bytes_appended: stats.log_bytes_appended,
-    bytes_between: stats.bytes_between_snapshots,
-    apply_bytes_per_us: stats.apply_bytes_per_us,
+    tail_bytes: stats.tail.bytes,
+    tail_replay_ns: stats.tail.replay_ns,
+    budget_ns: stats.recovery_budget_ns,
+    floor_bytes: stats.snapshot_floor_bytes,
   }
 }
 
