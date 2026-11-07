@@ -1852,3 +1852,88 @@ fn a_writer_on_a_macos_mount_waits_for_stopped_candidates_rather_than_fail() {
     "the change waited for the candidates rather than answering while both were stopped: {answered:?}"
   );
 }
+
+/// A-200 on the node that bootstrapped the fleet: do bootstrap a fresh fleet and, at once, make a live-shipped volume on
+/// the bootstrap node and write to it. Expect each write to return durable and both candidates to hold the owner's head.
+/// Found 2026-11-07 by the Linux conformance pair (diag run 42325923902, native-linux-fuse fsx over a live volume on node
+/// a, which had bootstrapped): the owner's log stood at head=2 durable=none owed=true for the whole run with 49
+/// publications refused for credit, and both candidates' `fleet.live` counters were empty: nothing was ever sent to them.
+/// The owner's shipper had taken its holders from the configuration at the volume's first publication, when the
+/// bootstrap node's configuration named only itself, and kept that empty set for good.
+#[test]
+fn a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the bootstrap-node live flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet_bootstrapped("live-bootstrap");
+  let owner = fleet.instances[fleet.bootstrap].clone();
+  let others: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| **instance != owner)
+    .collect();
+  let (sender, receiver) = std::sync::mpsc::channel();
+  {
+    let owner = owner.clone();
+    std::thread::spawn(move || {
+      let id = create_live_volume(&owner, "bootstrapped");
+      sender.send(id.clone()).unwrap();
+      write_files(&owner, &id, 0..FILES);
+      sender.send(id).unwrap();
+    });
+  }
+  let id = receiver
+    .recv_timeout(FLEET_WAIT)
+    .expect("the live volume was made");
+  let written = receiver.recv_timeout(FLEET_WAIT).is_ok();
+  let (caught_up, shipping, held) = wait_caught_up(&owner, &others, &id);
+  let counters: Vec<_> = fleet
+    .instances
+    .iter()
+    .map(|instance| (instance.clone(), live_counters(instance)))
+    .collect();
+  eprintln!(
+    "live bootstrap: written={written} caught_up={caught_up} shipping={shipping:?} held={held:?} {counters:?}"
+  );
+  if !(written && caught_up) {
+    for instance in &fleet.instances {
+      let (_, out, _) = run(instance, &["status"]);
+      let lines: Vec<&str> = out
+        .lines()
+        .filter(|line| {
+          line.starts_with("fleet_host")
+            || line.starts_with("fleet_configuration_version")
+            || line.starts_with("fleet_configuration_members")
+            || line.starts_with("fleet_council_voters")
+            || line.starts_with("fleet_council_leads")
+            || line.starts_with("fleet_members")
+            || line.starts_with("fleet_session ")
+            || line.contains("learner")
+            || line.contains("consensus")
+            || line.contains("join")
+            || line.contains("fleet.record")
+            || line.contains("fleet.accept")
+            || line.contains("head")
+            || line.contains("catalog")
+            || line.contains("place")
+            || line.contains("commit")
+            || line.contains(" live ")
+        })
+        .filter(|line| !line.contains("catalog.volumes"))
+        .collect();
+      eprintln!("live bootstrap --- {instance}\n{}", lines.join("\n"));
+    }
+    let (_, stat, stat_err) = run(&owner, &["volume", "stat", &id]);
+    eprintln!("live bootstrap --- the owner's volume stat\n{stat}{stat_err}");
+  }
+  assert!(
+    written && caught_up,
+    "the bootstrap node's live writes became durable and both candidates hold them: {shipping:?} {held:?} \
+     {counters:?}"
+  );
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+}
