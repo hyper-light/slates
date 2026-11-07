@@ -1,0 +1,55 @@
+tested 2bdaa7c03f6bc5f9ff018a377cb6b550c2f7aa51 variant after on aarch64, 4 cpus
+admitted exit 101 196s
+  admitted: b: clients_per_shard 2576 slots 32 shards 2 tasks_per_shard 10314 lane bound 164864; 645 clients x 32 forwards
+  admitted: 20520 of 20640 answered: 13966 served, 0 Overloaded; control tasks refused 0
+  admitted: thread 'a_silent_owner_leaves_no_forward_the_lane_admitted_unrun' (5454) panicked at crates/server/tests/fleet.rs:5271:3:
+  admitted: assertion `left == right` failed: every read is answered; b's hop counters summed over its shards: {"fleet.forward.batch_done": 14154, "fleet.forward.batch_given_up": 6557, "fleet.forward.begun": 14427, "fleet.forward.client.control_started": 20641, "fleet.forward.client.delivered_home": 20641, "fleet.forward.client.resolved": 20641, "fleet.forward.client.to_control": 20641, "fleet.forward.no_session": 1, "fleet.forward.retried": 70, "fleet.forward.session_never_returned": 6277, "fleet.forward.taken_for_another": 14139, "fleet.owner_location.direct": 20641, "fleet.owner_location.forward_unanswered": 280, "fleet.owner_location.forward_unsent": 6277, "fleet.owner_location.route_dropped.refused": 6590}
+  admitted:   left: 20520
+  admitted:  right: 20640
+  admitted: test a_silent_owner_leaves_no_forward_the_lane_admitted_unrun ... FAILED
+  admitted: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 99 filtered out; finished in 108.59s
+  admitted: error: test failed, to rerun pass `-p slates-server --test fleet`
+admitted-again exit 101 105s
+  admitted-again: b: clients_per_shard 2576 slots 32 shards 2 tasks_per_shard 10314 lane bound 164864; 645 clients x 32 forwards
+  admitted-again: 20520 of 20640 answered: 14918 served, 0 Overloaded; control tasks refused 0
+  admitted-again: thread 'a_silent_owner_leaves_no_forward_the_lane_admitted_unrun' (5531) panicked at crates/server/tests/fleet.rs:5271:3:
+  admitted-again: assertion `left == right` failed: every read is answered; b's hop counters summed over its shards: {"fleet.forward.batch_done": 15106, "fleet.forward.batch_given_up": 5687, "fleet.forward.begun": 15419, "fleet.forward.client.control_started": 20641, "fleet.forward.client.delivered_home": 20641, "fleet.forward.client.resolved": 20641, "fleet.forward.client.to_control": 20641, "fleet.forward.no_session": 1, "fleet.forward.retried": 152, "fleet.forward.session_never_returned": 5324, "fleet.forward.taken_for_another": 15092, "fleet.owner_location.direct": 20641, "fleet.owner_location.forward_unanswered": 363, "fleet.owner_location.forward_unsent": 5324, "fleet.owner_location.route_dropped.refused": 5638}
+  admitted-again:   left: 20520
+  admitted-again:  right: 20640
+  admitted-again: test a_silent_owner_leaves_no_forward_the_lane_admitted_unrun ... FAILED
+  admitted-again: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 99 filtered out; finished in 104.57s
+  admitted-again: error: test failed, to rerun pass `-p slates-server --test fleet`
+silent exit 0 4s
+silent-again exit 0 4s
+unstarted exit 0 4s
+fleet-forward exit 101 257s
+  fleet-forward: test a_forward_answered_within_its_bounds_is_never_reported_stalled ... ok
+  fleet-forward: test a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id ... ok
+  fleet-forward: test an_unanswered_forward_is_sent_again_within_the_takeover_bound has been running for over 60 seconds
+  fleet-forward: test a_silent_owner_leaves_no_forward_the_lane_admitted_unrun ... FAILED
+  fleet-forward: test an_unanswered_forward_is_sent_again_within_the_takeover_bound ... ok
+  fleet-forward: ---- a_silent_owner_leaves_no_forward_the_lane_admitted_unrun stdout ----
+  fleet-forward: b: clients_per_shard 2576 slots 32 shards 2 tasks_per_shard 10314 lane bound 164864; 645 clients x 32 forwards
+  fleet-forward: 20529 of 20640 answered: 14231 served, 0 Overloaded; control tasks refused 0
+  fleet-forward: thread 'a_silent_owner_leaves_no_forward_the_lane_admitted_unrun' (5764) panicked at crates/server/tests/fleet.rs:5271:3:
+  fleet-forward: assertion `left == right` failed: every read is answered; b's hop counters summed over its shards: {"fleet.forward.batch_done": 17756, "fleet.forward.batch_given_up": 3028, "fleet.forward.begun": 18068, "fleet.forward.client.control_started": 20641, "fleet.forward.client.delivered_home": 20641, "fleet.forward.client.resolved": 20641, "fleet.forward.client.to_control": 20641, "fleet.forward.no_session": 19, "fleet.forward.retried": 143, "fleet.forward.session_never_returned": 2675, "fleet.forward.session_out": 1, "fleet.forward.session_replaced": 3342, "fleet.forward.taken_for_another": 17744, "fleet.owner_location.direct": 20641, "fleet.owner_location.forward_unanswered": 3695, "fleet.owner_location.forward_unsent": 2675, "fleet.owner_location.route_dropped.refused": 6330}
+  fleet-forward:   left: 20529
+  fleet-forward:  right: 20640
+  fleet-forward: test result: FAILED. 17 passed; 1 failed; 0 ignored; 0 measured; 82 filtered out; finished in 256.16s
+  fleet-forward: error: test failed, to rerun pass `-p slates-server --test fleet`
+  fleet-forward: error: 1 target failed:
+rt exit 0 16s
+server-lib exit 0 30s
+server exit 0 74s
+  server: test a_compound_retried_across_a_daemon_restart_is_answered_never_run_again ... ok
+  server: test an_open_and_a_close_retried_across_a_daemon_restart_are_answered_never_run_again ... ok
+  server: test a_guests_write_over_a_shards_stream_is_answered_once_every_fuse_mount_of_its_volume_was_told ... ok
+client exit 0 64s
+  client: test a_connect_is_answered_within_a_tenth_of_the_claim_wait ... ok
+harness exit 0 208s
+clippy exit 101 57s
+  clippy: error: the function has a cognitive complexity of (11/10)
+  clippy:     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#cognitive_complexity
+  clippy:     = note: requested on the command line with `-D clippy::cognitive-complexity`
+  clippy: error: could not compile `slates-server` (lib) due to 1 previous error
+  clippy: error: could not compile `slates-server` (lib test) due to 1 previous error
