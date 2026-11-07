@@ -2627,6 +2627,200 @@ fn a_shard_stuck_in_its_start_stops_the_heartbeat_so_the_anchor_restarts_the_dae
   drop(anchor);
 }
 
+/// Derived: the least recovery CPU a daemon whose recovery runs as one poll cannot beat through. The watchdog judges a shard
+/// spinning once it has run one liveness window of CPU without completing a step, and withholds the beat until the step
+/// ends, so such a recovery leaves a beat gap of its CPU less one window. That gap passes the bound the test holds the beat
+/// to (one window plus one beat) once the recovery runs past two windows and a beat; one beat more covers the watchdog
+/// looking once a beat.
+const UNBEATABLE_RECOVERY_NS: u64 =
+  2 * slates_server::daemon::LIVENESS_BUDGET_NS + 2 * slates_server::daemon::HEARTBEAT_NS;
+
+/// One unit of merge state: a version accepted from a work that adds a file, and a work left open with an edit of its own,
+/// returned.
+fn add_merge_unit(client: &mut Client, green: VolumeId, unit: u64) -> VolumeId {
+  let (work, _) = client
+    .create_work(green, &format!("accepted-{unit}"))
+    .unwrap();
+  client
+    .edit(work, &accepted_file(unit), 0, 0, &accepted_bytes(unit))
+    .unwrap();
+  assert_eq!(
+    client.submit(work).unwrap(),
+    slates_client::Submitted::Accepted(unit)
+  );
+  let (open, _) = client.create_work(green, &open_work_name(unit)).unwrap();
+  client
+    .edit(open, &open_file(unit), 0, 0, &open_bytes(unit))
+    .unwrap();
+  open
+}
+
+fn accepted_file(unit: u64) -> String {
+  format!("v{unit}")
+}
+
+fn accepted_bytes(unit: u64) -> Vec<u8> {
+  format!("accepted as version {unit}\n").into_bytes()
+}
+
+fn open_work_name(unit: u64) -> String {
+  format!("open-{unit}")
+}
+
+fn open_file(unit: u64) -> String {
+  format!("w{unit}")
+}
+
+fn open_bytes(unit: u64) -> Vec<u8> {
+  format!("open work {unit}'s edit\n").into_bytes()
+}
+
+/// A restarted daemon's recovery, watched: the CPU the slowest shard ran from the start's return until an observation of
+/// it was answered (its start's poll ended), and the largest gap between the anchor's beats, from this daemon's first beat
+/// (the word holds the last daemon's until then) until a window past every shard's start.
+#[allow(clippy::disallowed_methods)] // the test plays the anchor, which watches the heartbeat from its own thread
+fn watch_recovery(daemon: &Daemon, anchor: &Anchor) -> (Duration, Duration) {
+  let shards: Vec<slates_rt::ShardId> = daemon.shards().to_vec();
+  let cpu_of = |shard: slates_rt::ShardId| {
+    slates_rt::registry::holder_of(shard.0)
+      .and_then(slates_rt::registry::shard_cpu)
+      .map_or(0, |reading| reading.spent_ns)
+  };
+  let started_cpu: Vec<u64> = shards.iter().map(|shard| cpu_of(*shard)).collect();
+  let (said, done) = std::sync::mpsc::channel();
+  let mut waiters = Vec::new();
+  for shard in &shards {
+    let observation = daemon
+      .observation(
+        Some(*shard),
+        slates_server::daemon::OBSERVE_BUDGET_NS,
+        |_: &mut slates_server::state::ShardState| (),
+      )
+      .unwrap();
+    let said = said.clone();
+    waiters.push(std::thread::spawn(move || {
+      let _ = observation.wait();
+      let _ = said.send(());
+    }));
+  }
+  drop(said);
+  let read = || anchor.segment.supervision().unwrap().heartbeat_ns();
+  let every = Duration::from_nanos(slates_server::daemon::HEARTBEAT_NS);
+  let after = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
+  let watching = Instant::now();
+  let mut answered = 0;
+  let mut ended: Option<Instant> = None;
+  let mut last = read();
+  let mut last_seen = watching.elapsed();
+  let mut beating = false;
+  let mut largest = Duration::ZERO;
+  while ended.is_none_or(|at| at.elapsed() < after) {
+    std::thread::sleep(every);
+    while done.try_recv().is_ok() {
+      answered += 1;
+    }
+    if ended.is_none() && answered == shards.len() {
+      ended = Some(Instant::now());
+    }
+    let now = read();
+    if now != last {
+      if beating {
+        largest = largest.max(Duration::from_nanos(now.saturating_sub(last)));
+      }
+      beating = true;
+      last = now;
+      last_seen = watching.elapsed();
+    }
+  }
+  if beating {
+    largest = largest.max(watching.elapsed().saturating_sub(last_seen));
+  }
+  for waiter in waiters {
+    let _ = waiter.join();
+  }
+  let recovered_cpu = shards
+    .iter()
+    .zip(&started_cpu)
+    .map(|(shard, from)| cpu_of(*shard).saturating_sub(*from))
+    .max()
+    .unwrap_or(0);
+  (Duration::from_nanos(recovered_cpu), largest)
+}
+
+/// §2.6 boot step 2, §4.14 `daemon.alive`, §4.16 (the recovery-slicing plan): a daemon whose recovery needs more CPU than
+/// it could spend in one poll and still beat keeps its beat while it recovers, and recovers everything. Do: grow merge state
+/// on a green (each unit a version accepted from a work and a work left open with an edit), doubling it and restarting the
+/// daemon over the same segment, until one recovery's CPU on its slowest shard reaches [`UNBEATABLE_RECOVERY_NS`] (the
+/// partition's own caps bound the growth: past them a work is refused and the test ends there); watch
+/// the anchor's heartbeat word every beat through that recovery. Expect: the beat never older than one liveness window
+/// plus a beat; the green at its head, every version's file at its version, and every open work's edit read back. With
+/// recovery as one poll the watchdog finds the shard spinning after a window of CPU and withholds the beat until it ends,
+/// and an anchor would kill the daemon, whose successor repeats the same recovery.
+#[test]
+fn a_daemon_keeps_its_beat_through_a_recovery_longer_than_a_window_and_recovers_everything() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-long-recovery-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let anchor = held_anchor("long-recovery", &profile, &config);
+  let mut daemon = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let green = client.create_green("long-recovery", false).unwrap();
+  let window = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
+  let beat = Duration::from_nanos(slates_server::daemon::HEARTBEAT_NS);
+  let unbeatable = Duration::from_nanos(UNBEATABLE_RECOVERY_NS);
+  let mut units = 0u64;
+  let mut open = Vec::new();
+  let gap = loop {
+    let target = (units * 2).max(1);
+    while units < target {
+      units += 1;
+      open.push(add_merge_unit(&mut client, green, units));
+    }
+    daemon.stop();
+    daemon = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+    let (cpu, gap) = watch_recovery(&daemon, &anchor);
+    eprintln!(
+      "long recovery: {units} units recovered in {cpu:?} of CPU, the beat's largest gap {gap:?}"
+    );
+    if cpu >= unbeatable {
+      break gap;
+    }
+  };
+  assert_eq!(
+    client.versions(green).unwrap(),
+    units,
+    "the green recovered at its head"
+  );
+  for unit in 1..=units {
+    let at = slates_client::ReadAt::Version { version: unit };
+    assert_eq!(
+      client.read(green, &accepted_file(unit), at).unwrap(),
+      accepted_bytes(unit),
+      "version {unit}'s file"
+    );
+  }
+  for (unit, work) in (1..).zip(&open) {
+    assert_eq!(
+      client
+        .read(*work, &open_file(unit), slates_client::ReadAt::Head)
+        .unwrap(),
+      open_bytes(unit),
+      "open work {unit}'s edit"
+    );
+  }
+  drop(client);
+  daemon.stop();
+  drop(anchor);
+  assert!(
+    gap <= window + beat,
+    "the beat went {gap:?} without advancing while the daemon recovered {units} units, past the {window:?} window plus a \
+     {beat:?} beat: the watchdog withheld it"
+  );
+}
+
 /// Boot (A-100): do start a daemon whose second shard spends two liveness windows on the CPU in its start, and stop the
 /// daemon at once, while its control loop still waits on that shard; expect the stop to finish within the client's
 /// start wait. (The heartbeat kept joinable until the boot was accepted hung `Daemon::stop` in
