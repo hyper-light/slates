@@ -10,3 +10,8 @@ fleet_host: 6470196106963798563
 fleet_peers_probed: 0
 fleet_host: 2737771555087033969
 fleet_peers_probed: 1
+=== off 2 exit 0 load { 32.76 25.01 14.20 }
+rejoins: successor daemon 16477 answered after 96.859542ms
+slates-cluster: fleet: HostId(2450655314112288226) holds HostId(11206284559380455804) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+rejoins: the fleet re-formed after 1.754377042s
+test a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet ... ok
