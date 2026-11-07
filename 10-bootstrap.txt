@@ -5,3 +5,10 @@ note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 --
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 95 filtered out; finished in 417.26s
 
+=== learner-2 exit 101 load { 24.16 36.71 35.20 }
+thread 'a_learner_learns_configurations_that_leave_the_membership_alone' (44168) panicked at crates/server/tests/fleet.rs:6116:3:
+every member's council reached the newest configuration (installed, council) per member: [Ok((9, 9)), Ok((6, 6)), Ok((7, 7)), Ok((9, 9)), Ok((9, 9))]; voters Ok(Some([HostId(2561381660072262381), HostId(2961635954522331644), HostId(3849453419080456029)]))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 95 filtered out; finished in 418.98s
+
