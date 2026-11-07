@@ -1062,6 +1062,11 @@
     at f = 1). The shipper counts a write durable at f of a set, and phase one counts f+1. 1 + 2 = 3 = |H|, so they need
     not meet: the successor counted itself and c, and b was never fenced. Fix proposed: durability counts |H| − f of
     each set. The Shipper's count is live-fixes'; the model must name 2f+1 sets too. The stack is held from landing.
+  - Open (memory, not safety): a holder a transition dropped keeps its copy, since it is no longer a catalog candidate
+    and never sees the record that omits it. A plain release (on that record, or from the owner) can drop the copy of a
+    host re-included meanwhile, whose replies the shipper may already count, so it needs a holder-set generation in
+    entries and replies (live-fixes; 2ba5572d reverted in eab618f2). Phase one never counts such a copy, and with the
+    n − f count no owner commits through it alone.
   - Open: the holder set changing under a live log (joint transition and activation, with live-fixes and raft); a
     successor outside the holders cannot open the log (`takeover_refused.open`); and a refused rebuild refetched the
     log every period, fixed 2026-11-07 (`live_ship::owes_refetch`: no refetch at a head whose bytes were refused; bug
