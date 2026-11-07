@@ -1072,11 +1072,11 @@
     acknowledged, every volume taken over whole at epoch 2 (unshaped 2.5 s, wan and wan-loss 16.9 s, ceiling 57.2 s).
   - Process red-check, CI, 13 runs a side: the mutation (counting the current placement) left a holder at fence 1 in 4.
     A-240 left none, and lost no write.
-  - **Open, safety (found 2026-11-07, CI diag-20 run 7): a holder set of 2f+1 under an f-count.** Once the shipper
-    follows the placement, a set can have 2f+1 members (the placement moved off the owner: the recorded set was e, c, b
-    at f = 1). The shipper counts a write durable at f of a set, and phase one counts f+1. 1 + 2 = 3 = |H|, so they need
-    not meet: the successor counted itself and c, and b was never fenced. Fix proposed: durability counts |H| − f of
-    each set. The Shipper's count is live-fixes'; the model must name 2f+1 sets too. The stack is held from landing.
+  - **Fixed (2026-11-07): a holder set of 2f+1 under an f-count.** Once the shipper follows the placement, a set can
+    have 2f+1 members (the placement moved off the owner: CI diag-20 run 7 recorded e, c, b at f = 1). The shipper
+    counted a write durable at f of a set while phase one counts f+1, and 1 + 2 = |H|: the successor counted itself and
+    c, and holder b was never fenced. A write is now durable once n − f of a set's n holders hold it, never for n ≤ f
+    (live-fixes, 6dd512b4; `a_write_is_durable_only_where_every_takeover_quorum_meets_it`, red on the old count).
   - Open (memory, not safety): a holder a transition dropped keeps its copy, since it is no longer a catalog candidate
     and never sees the record that omits it. A plain release (on that record, or from the owner) can drop the copy of a
     host re-included meanwhile, whose replies the shipper may already count, so it needs a holder-set generation in
