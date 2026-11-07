@@ -5898,6 +5898,47 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > the flow: with both candidates stopped the `fsync` fails `EIO` after 1.0006 s (the liveness budget); healthy and after
 > the candidates resume, it succeeds.
 >
+> **Every other durability claim (2026-11-05, the sibling sweep of FUSE `fsync`).** Each place a client is told data is
+> durable on a live volume now waits for the position its barrier published, and the same failing test holds each to
+> it across three real daemon processes (`crates/cli/tests/live_fleet.rs`): with both candidates' processes stopped
+> the claim fails or waits, never succeeds; healthy and after they resume, it succeeds.
+> - *A Shards stream's `FSYNC`* (`crate::shards`; its DAX compare-back runs before it): answered `0` in 337 µs with
+>   both candidates stopped, red first; now held until durable, `EIO` after 1.0011–1.0025 s (3 of 3).
+> - *A writable map's `MapSync`* and a writable `ReleaseMap` (`crate::direct_map`): a deferred verb, which the recorded
+>   verb's wait passed over, answered `MapSynced` in 683 µs with the log durable at none; now completed through
+>   `live_ship::defer`, so it waits as `slates write` does: unanswered through three liveness budgets stopped,
+>   answered at once after the resume with the log durable at its head (3 of 3).
+> - *A green's `checkout`* into its live base (`crate::checkout`, `image::complete_once_durable`): answered `CheckedOut`
+>   with both stopped, red first; now waits the same way (3 of 3).
+> - *NFSv4 `COMMIT` and stable `WRITE`* need no change: the v4 front end serves each through the v3 procedure
+>   (`RoutedBackend::call_v3` → `serve_v3`), whose wait is `stable_once_durable`. Held to it now: with both candidates
+>   stopped a `COMMIT` answers `NFS4ERR_DELAY` after 1.0008–1.0024 s (3 of 3); red-checked with the wait removed, it
+>   and a `FILE_SYNC` write answered `NFS4_OK` in 285 and 349 µs. Once the candidates' confirmations lapse, the
+>   owner's lease fence (AUD-29-83) answers every call `NFS4ERR_DELAY` at once until a heartbeat after they resume.
+> - *A virtio-fs or vhost-user guest's `FSYNC`* (`slates_bridge_virtiofs`'s device holds it, the guest's later chains
+>   served meanwhile; `BridgeAccess::durable_owed`/`durability`/`durable`): through `slates vhost-user` with a stand-in
+>   VMM on CI's Linux runners, answered `0` in 368–679 µs with both candidates stopped (red, x86_64 and arm64); now `EIO`
+>   after 1.0006–1.0017 s, 8 of 8 on each lane, and once in 3 more on x86_64 answered `0` after 1.000358 s, unexplained
+>   (that run printed no log line; the flow now prints the log and the hold's counters at that point and requires the
+>   hold's refusal). The device's own tests hold both legs on every Unix host: never durable, `EIO` at the bound with a
+>   later read published first; durable, `0` at once.
+> - *A WinFsp flush* (`FlushFileBuffers` of a handle, held on the mount, `STATUS_UNEXPECTED_IO_ERROR` past the budget),
+>   and a *volume* flush, which answered success on WinFsp's thread with no publication at all, now publishes and waits
+>   the same way. Three anchored fleet nodes on CI's `windows-latest` (`crates/cli/tests/live_winfsp.rs`): red, the
+>   flush succeeded in 995 µs with both candidates suspended; fixed, error 1117 after 1.0010–1.0283 s (3 of 3), success
+>   after the resume. Forming that fleet found a Windows defect in the runtime: a UDP socket reported a
+>   port-unreachable an earlier send drew as `WSAECONNRESET` on its next `recvfrom`, which ended a fleet serve socket's
+>   receive loop at its first probe of a peer still starting (3 of 4 starts never formed). The fix that landed is
+>   liveness's (00c4add1, first pushed as d8a8d859: every Windows datagram socket, an adopted one too, made with
+>   `SIO_UDP_CONNRESET` and `SIO_UDP_NETRESET` off); the WinFsp flow needs it to form its fleet.
+> - *Landings* need no wait: a landing claims what it wrote to disk, which holds it; a takeover that loses the volume's
+>   undurable tail serves the disk's bytes through the base, and a later landing that would revert the disk is refused
+>   by the witness check.
+> Found on the way and handed to live-fixes with the fleet re-formation defects: on Windows, a candidate's anchor kills a
+> daemon suspended past the liveness budget and starts a successor under a fresh identity, after which the owner's mount
+> stayed fenced and the fleet did not re-form within 40 minutes (CI, 1 run); the flow now suspends each anchor with its
+> daemon.
+
 > **Phase one with a candidate that holds no copy (2026-11-05).** Every candidate's report counts toward `f + 1`, an empty
 > one too, and every reporter raises its fence to the takeover's epoch, an empty one too: a candidate with no copy makes
 > an empty copy fenced at that epoch (`live_ship::fenced_copy`, at the successor's own report and at a remote

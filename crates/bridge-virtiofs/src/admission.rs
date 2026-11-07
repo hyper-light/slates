@@ -746,16 +746,61 @@ impl<S: VmmSeam> AdmittedDevice<S> {
     Ok(settled)
   }
 
+  /// The oldest `FSYNC` reply waiting for its live-shipped volume's durability, if one does
+  /// ([`Device::durable_oldest`]).
+  #[must_use]
+  pub fn durable_oldest(&self) -> Option<crate::device::DurableOldest> {
+    self.device.durable_oldest()
+  }
+
+  /// Settles the device's `FSYNC` replies held for durability (`durability`, within `bound_ns` as of `now_ns`;
+  /// [`Device::settle_durable`]) and notifies each queue whose driver asks. Nothing to do once the device is not live.
+  pub fn settle_durable(
+    &mut self,
+    durability: &mut dyn FnMut(u64) -> crate::device::Durability,
+    (now_ns, bound_ns): (u64, u64),
+  ) -> Result<crate::device::DurableSettled, ServeError> {
+    if self.state != AttachmentState::Live {
+      return Ok(crate::device::DurableSettled::default());
+    }
+    let settled = {
+      let memory = self.seam.memory().map_err(ServeError::Seam)?;
+      self
+        .device
+        .settle_durable(memory, durability, (now_ns, bound_ns), &mut self.ledger)
+        .map_err(ServeError::Device)?
+    };
+    self.notify_completed(&settled.completed)?;
+    Ok(settled)
+  }
+
+  /// Notifies each queue of `completed` whose driver asks, once.
+  fn notify_completed(&mut self, completed: &[Completed]) -> Result<(), ServeError> {
+    let mut notified: Vec<u16> = Vec::new();
+    for done in completed {
+      if done.interrupt_wanted && !notified.contains(&done.queue) {
+        notified.push(done.queue);
+        self
+          .seam
+          .notify_used(done.queue)
+          .map_err(ServeError::Seam)?;
+        self.counters.notifications = self.counters.notifications.saturating_add(1);
+      }
+    }
+    Ok(())
+  }
+
   /// Completes the chain a pass held for the owner's barrier (AUD-29-82): `captured` says whether the owner's
   /// recovery publication covered the volume. Captured, the guest learns its reply; refused, it is answered
-  /// `EIO` and the reply's grants are given back. The queue is notified when its driver asks. `Ok(None)` when
-  /// no chain is held. Refused typed — and nothing touched — once the device is revoked (the terminal step
-  /// owns a held chain then).
+  /// `EIO` and the reply's grants are given back. An `FSYNC` whose barrier published a live-shipped volume not yet
+  /// durable (`durable`, the position to wait for; A-200) is held for it ([`AdmittedDevice::settle_durable`]). The
+  /// queue is notified when its driver asks. `Ok(None)` when no chain is held, or it is held. Refused typed — and
+  /// nothing touched — once the device is revoked (the terminal step owns a held chain then).
   pub fn complete_barrier(
     &mut self,
     bridge: &mut dyn Bridge,
     registry: &Attachments,
-    captured: bool,
+    (captured, durable): (bool, Option<u64>),
   ) -> Result<Option<Completed>, ServeError> {
     if self.state != AttachmentState::Live {
       return Err(ServeError::Revoked);
@@ -767,7 +812,7 @@ impl<S: VmmSeam> AdmittedDevice<S> {
       let memory = self.seam.memory().map_err(ServeError::Seam)?;
       self
         .device
-        .complete_awaiting(memory, bridge, &cx, captured, &mut self.ledger)
+        .complete_awaiting(memory, bridge, &cx, (captured, durable), &mut self.ledger)
         .map_err(ServeError::Device)?
     };
     if let Some(done) = completed

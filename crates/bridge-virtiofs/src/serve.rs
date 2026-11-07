@@ -20,6 +20,12 @@
 //! reply; one still held when the loop ends goes unsent with the device, counted
 //! [`TOLD_ABANDONED`].
 //!
+//! An `FSYNC` (or `FSYNCDIR`) whose barrier published a live-shipped volume (§4.10, A-200) is held the same way until
+//! the volume's log is durable on `f` candidates where the barrier put it, and answered `EIO` past the owner's bound
+//! or once it never can be, as a FUSE mount's `fsync` is: a guest's `fsync` never claims what no candidate holds. The
+//! loop waits on the oldest such reply as it waits on the oldest told one; one still held at its end is counted
+//! [`DURABLE_ABANDONED`].
+//!
 //! The loop owns the device, so revocation reaches it as a message: [`request_revoke`] marks the
 //! loop's entry in a per-shard, thread-local control map (no lock, D-7) and wakes the loop with
 //! the waker it registered, and the loop runs the owned terminal step ([`AdmittedDevice::reclaim`])
@@ -49,6 +55,9 @@ use crate::admission::{
 /// Format: the status counter of guest replies still held for the volume's FUSE mounts when their device ended (AC-3.3,
 /// A-196). Each one's write was applied; its reply goes unsent with the device, as every reply in flight at an end does.
 pub const TOLD_ABANDONED: &str = "virtiofs.told_abandoned";
+/// Counter: `FSYNC` replies still held for their live-shipped volume's durability when the loop ended (A-200), unsent
+/// with the device.
+pub const DURABLE_ABANDONED: &str = "virtiofs.durable_abandoned";
 
 /// The identity of one device loop on this shard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -233,17 +242,37 @@ async fn doorbell_or_request(id: DeviceId, raw: i32) -> Result<Woke, slates_rt::
   .await
 }
 
+/// What is left of a held reply's bound `bound_ns` that began at `since_ns` (the whole bound before a settle saw it).
+fn left_of(since_ns: Option<u64>, bound_ns: u64) -> u64 {
+  since_ns.map_or(bound_ns, |since| {
+    bound_ns.saturating_sub(futures::now_ns().saturating_sub(since))
+  })
+}
+
 /// Waits as [`doorbell_or_request`] does, and, while a reply waits for the volume's FUSE mounts (AC-3.3), until `told`
-/// — the oldest such reply's wait — is ready or its bound's remaining `left_ns` passes.
-async fn doorbell_request_or_told<T: Future<Output = ()>>(
+/// — the oldest such reply's wait — is ready or its bound's remaining time passes; and the same for `durable`, the
+/// oldest `FSYNC` reply's wait for the volume's durability (A-200). Either held wait's waking answers [`Woke::Told`],
+/// after which the loop settles both.
+async fn doorbell_request_or_held<T: Future<Output = ()>, D: Future<Output = ()>>(
   id: DeviceId,
   raw: i32,
   told: Option<(T, u64)>,
+  durable: Option<(D, u64)>,
 ) -> Result<Woke, slates_rt::RtError> {
-  let Some((told, left_ns)) = told else {
+  if told.is_none() && durable.is_none() {
     return doorbell_or_request(id, raw).await;
-  };
-  let mut told = std::pin::pin!(told);
+  }
+  let left_ns = [
+    &told.as_ref().map(|(_, left)| *left),
+    &durable.as_ref().map(|(_, left)| *left),
+  ]
+  .into_iter()
+  .flatten()
+  .copied()
+  .min()
+  .unwrap_or(0);
+  let mut told = std::pin::pin!(told.map(|(wait, _)| wait));
+  let mut durable = std::pin::pin!(durable.map(|(wait, _)| wait));
   let mut either = std::pin::pin!(doorbell_or_request(id, raw));
   let raced = futures::within(
     left_ns,
@@ -251,7 +280,17 @@ async fn doorbell_request_or_told<T: Future<Output = ()>>(
       if let Poll::Ready(woke) = either.as_mut().poll(cx) {
         return Poll::Ready(woke);
       }
-      told.as_mut().poll(cx).map(|()| Ok(Woke::Told))
+      if let Some(told) = told.as_mut().as_pin_mut()
+        && told.poll(cx).is_ready()
+      {
+        return Poll::Ready(Ok(Woke::Told));
+      }
+      if let Some(durable) = durable.as_mut().as_pin_mut()
+        && durable.poll(cx).is_ready()
+      {
+        return Poll::Ready(Ok(Woke::Told));
+      }
+      Poll::Pending
     }),
   )
   .await;
@@ -261,6 +300,26 @@ async fn doorbell_request_or_told<T: Future<Output = ()>>(
     Ok(None) => Ok(Woke::Told),
     Err(refused) => Err(refused),
   }
+}
+
+/// Settles the device's `FSYNC` replies held for their volume's durability (A-200): each durable one released, each
+/// past its bound or never to be durable answered `EIO`, and counts what it did.
+fn settle_durable<S: VmmSeam, B: BridgeAccess>(
+  admitted: &mut AdmittedDevice<S>,
+  bridge: &mut B,
+) -> Result<(), ServeError> {
+  if admitted.durable_oldest().is_none() {
+    return Ok(());
+  }
+  let bound = bridge.durable_bound_ns();
+  let settled = admitted.settle_durable(
+    &mut |target| bridge.durability(target),
+    (futures::now_ns(), bound),
+  )?;
+  if settled.waited > 0 || settled.refused > 0 {
+    bridge.durable_settled(settled.waited, settled.refused);
+  }
+  Ok(())
 }
 
 /// Publishes the device's held replies whose volume's FUSE mounts were told, or whose bound passed (AC-3.3), and counts
@@ -379,6 +438,30 @@ pub trait BridgeAccess {
   /// Counts what one settle of the device's held replies did: replies that waited for the volume's FUSE mounts to be
   /// told, and replies published at the bound with a mount untold.
   fn told_settled(&mut self, waited: u64, overdue: u64);
+
+  /// After a barrier that captured the volume: the position of the volume's live-shipped log (§4.10, A-200) that a reply
+  /// claiming durability (`FSYNC`, `FSYNCDIR`) must wait for, or `None` when it need not wait (the volume is not
+  /// live-shipped, or is durable there already).
+  fn durable_owed(&mut self) -> Option<u64>;
+
+  /// Whether the volume's log is durable at `target` now, never will be (destroyed, its owner superseded), or not yet.
+  fn durability(&mut self, target: u64) -> crate::device::Durability;
+
+  /// What a reply waiting for durability waits on: a future ready once the volume's log is durable at a position, or
+  /// never will be. It holds no borrow of the access; dropped early, it leaves at most a waker the log's next advance
+  /// wakes and lets go.
+  type Durable: Future<Output = ()> + 'static;
+
+  /// A wait for the volume's log to be durable at `target`.
+  fn durable(&mut self, target: u64) -> Self::Durable;
+
+  /// How long a reply waits for durability before it is answered `EIO`: the owner's bound for every transport's
+  /// durability claim.
+  fn durable_bound_ns(&mut self) -> u64;
+
+  /// Counts what one settle of the device's `FSYNC` replies held for durability did: released once durable after a
+  /// wait, and answered `EIO`.
+  fn durable_settled(&mut self, waited: u64, refused: u64);
 }
 
 /// Why the loop ended.
@@ -449,7 +532,9 @@ async fn serve_until_idle<S: VmmSeam, B: BridgeAccess>(
       // A reply the pass held for the volume's FUSE mounts is published here once they have been told: at the pass's
       // end on a volume no mount holds anything of; else when the mount's task, which shares this shard, has run
       // (AC-3.3, A-196).
-      settle_told(admitted, bridge).map(|()| more)
+      settle_durable(admitted, bridge)
+        .and_then(|()| settle_told(admitted, bridge))
+        .map(|()| more)
     }) {
       Ok(more) => {
         // A message-based SETUPMAPPING may have parked for the front end's map-acks (§4.6); await them and answer
@@ -498,8 +583,9 @@ fn one_pass<S: VmmSeam, B: BridgeAccess>(
       // A request the step served changed what survives a restart, or its ingest wrote: publish before the guest
       // learns its reply, as a mutation's pass does.
       let captured = bridge.barrier();
+      let durable = captured.then(|| bridge.durable_owed()).flatten();
       bridge
-        .with_bridge(|b, registry| admitted.complete_barrier(b, registry, captured))
+        .with_bridge(|b, registry| admitted.complete_barrier(b, registry, (captured, durable)))
         .map_err(ServeError::Authority)??;
     }
     if turned.busy {
@@ -516,8 +602,9 @@ fn one_pass<S: VmmSeam, B: BridgeAccess>(
     // A mutation's reply waits for the owner's barrier: publish, then let the guest learn the reply (or
     // `EIO`, when the publication did not capture the volume) before any later chain is served.
     let captured = bridge.barrier();
+    let durable = captured.then(|| bridge.durable_owed()).flatten();
     bridge
-      .with_bridge(|b, registry| admitted.complete_barrier(b, registry, captured))
+      .with_bridge(|b, registry| admitted.complete_barrier(b, registry, (captured, durable)))
       .map_err(ServeError::Authority)??;
   }
   // A guest's requests are client activity: the shard spins out its idle window after a pass, so the
@@ -735,21 +822,31 @@ async fn serve_round<S: VmmSeam, B: BridgeAccess>(
     Doorbell::InProcess => return Some(EndReason::NoDoorbell),
     Doorbell::Descriptor(raw) => raw,
   };
-  // While a reply waits for the volume's FUSE mounts, the round waits on the oldest's too, and on its bound (AC-3.3).
+  // While a reply waits for the volume's FUSE mounts, the round waits on the oldest's too, and on its bound (AC-3.3);
+  // and while an `FSYNC` waits for the volume's durability, on the oldest's and its bound (A-200).
   let told = admitted.told_oldest().map(|oldest| {
     let bound = bridge.told_bound_ns();
-    let left = oldest.since_ns.map_or(bound, |since| {
-      bound.saturating_sub(futures::now_ns().saturating_sub(since))
-    });
-    (bridge.told(oldest.seq), left)
+    (bridge.told(oldest.seq), left_of(oldest.since_ns, bound))
   });
-  match doorbell_request_or_told(id, raw, told).await {
+  let durable = admitted.durable_oldest().map(|oldest| {
+    let bound = bridge.durable_bound_ns();
+    (
+      bridge.durable(oldest.target),
+      left_of(oldest.since_ns, bound),
+    )
+  });
+  match doorbell_request_or_held(id, raw, told, durable).await {
     Err(error) => return Some(EndReason::DoorbellLost(error)),
     // The shard asked something of the loop while it waited: the next round takes it at its top (a revoke ends
     // the loop, a kick marks its backings stale), with no guest kick needed.
     Ok(Woke::Request) => return None,
     // A held reply's mounts were told, or its bound passed: it is published, and the next round waits again.
-    Ok(Woke::Told) => return settle_told(admitted, bridge).err().map(end_of),
+    Ok(Woke::Told) => {
+      return settle_durable(admitted, bridge)
+        .and_then(|()| settle_told(admitted, bridge))
+        .err()
+        .map(end_of);
+    }
     Ok(Woke::Doorbell) => {}
   }
   counters.wakes = counters.wakes.saturating_add(1);
@@ -783,6 +880,13 @@ pub async fn serve_loop<S: VmmSeam, B: BridgeAccess>(
   let abandoned = admitted.device().told_held();
   if abandoned > 0 {
     bridge.count(TOLD_ABANDONED, u64::try_from(abandoned).unwrap_or(u64::MAX));
+  }
+  let abandoned = admitted.device().durable_held();
+  if abandoned > 0 {
+    bridge.count(
+      DURABLE_ABANDONED,
+      u64::try_from(abandoned).unwrap_or(u64::MAX),
+    );
   }
   // The guest's stores through its DAX maps reach the volume before anything of the attachment is let go.
   drive_end_ingest(&mut admitted, &mut bridge).await;
