@@ -1,0 +1,10 @@
+=== keyed-1 exit 0 load { 9.76 3.93 3.75 }
+live keyed: created ab7c0d7805c18c3c0000000000000010 after 517.457542ms
+live keyed: ab7c0d7805c18c3c0000000000000010's successor is the stopped node, after 517.583875ms
+live keyed: live-shipped and writing, after 517.683375ms
+live keyed: ZZ owner counters before the kill {"appended": 6, "awaited": 5, "durable": 6, "held_back.keys": 8, "held_back.placement": 1, "held_back.whole": 1, "holders_recorded": 1, "no_session": 14, "resolved": 5, "unanswered": 8, "whole": 2}
+live keyed: ZZ live-keyed-a-44740 counters {"appended": 6, "awaited": 5, "durable": 6, "held_back.keys": 8, "held_back.placement": 1, "held_back.whole": 1, "holders_recorded": 1, "no_session": 14, "resolved": 5, "unanswered": 8, "whole": 2}
+live keyed: ZZ live-keyed-b-44740 counters {"held": 10}
+live keyed: ZZ live-keyed-c-44740 counters {"held": 9}
+live keyed: the writes returned while the candidate was stopped: false; served whole by live-keyed-b-44740 after 2.5701765s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 8.26s
