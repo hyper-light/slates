@@ -687,7 +687,8 @@ impl Replica {
 /// Phase one's choice (A-200, A-240): the holder whose head ranks highest among `reports` (each candidate's head;
 /// `None` for one that holds nothing), and that head, once at least `f + 1` of the reports come from `holders`, the
 /// holder set the shipper being taken over committed before its first entry. A durable entry is held by the owner and
-/// `f` of those `2f` holders, so `f + 1` of them meet every durable entry; a report from any other member (one that
+/// `W` of those `n` holders, and `W + f + 1 > n` ([`Shipper::reached_by`]), so `f + 1` of them meet every durable entry;
+/// a report from any other member (one that
 /// joined after the writes) counts for nothing, since it can stand in for a holder that was never asked. `None` when
 /// fewer than `f + 1` holders reported, or when every report is empty (nothing was ever shipped).
 pub fn adopt(
@@ -754,7 +755,8 @@ pub struct Shipper {
 }
 
 impl Shipper {
-  /// The owner's side for `object` under `epoch`, shipping to `holders` (the other `2f` candidates), starting from
+  /// The owner's side for `object` under `epoch`, shipping to `holders` (the candidates other than the owner: `2f` of
+  /// them usually, `2f + 1` when the placement moved off the owner, fewer while a fleet forms), starting from
   /// `start` (`None` for a new volume; a takeover's adopted head otherwise). `credit` bounds the entries appended here
   /// that are not yet durable and `retain` the entries kept for laggards; each is at least one.
   pub fn new(

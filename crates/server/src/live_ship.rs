@@ -2004,9 +2004,9 @@ pub(crate) fn serve_report(
 const LIVE_REPORTED: &str = "fleet.live.reported";
 
 /// This candidate's copy of `object` with its fence raised to a takeover's `epoch` (phase one): the copy it holds, or
-/// an empty one made now for `successor`. An empty report counts toward phase one's `f + 1` (any `f + 1` of the `2f`
-/// other candidates include one of the `f` that hold every durable entry), so it must leave the same fence a full one
-/// does, or a superseded owner resumed could still ship to this candidate after it reported and commit outside the
+/// an empty one made now for `successor`. An empty report counts toward phase one's `f + 1` (a durable entry is held by
+/// `W` of the recorded set's `n` holders, and `W + f + 1 > n`, so any `f + 1` of them include one that holds it), so it
+/// must leave the same fence a full one does, or a superseded owner resumed could still ship to this candidate after it reported and commit outside the
 /// adopted head. The nemesis model decides both: counted with its fence, every invariant holds; counted without one,
 /// StaleNeverCommits fails (`crates/db/tests/live.rs`, `an_empty_report_without_a_fence_lets_a_superseded_owner_commit`,
 /// 10 seeds). Refused, with the fence, when `epoch` is below it.

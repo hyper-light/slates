@@ -18,8 +18,9 @@ holder of the log was never asked.
 ## Root cause
 
 `slates_db::live::adopt` took any `f + 1` reports. The A-200 argument holds only when the `f + 1` reports come from the
-hosts that hold the durable entries: an entry is durable on the owner and `f` of its `2f` holders, so `f + 1` of those
-holders meet it. Nothing recorded which hosts those were. `fleet::materialize` passed the current placement, which
+hosts that hold the durable entries: an entry is durable on the owner and `W` of its `n` holders, and `W + f + 1 > n`,
+so `f + 1` of those holders meet it. (`W = f` for the usual `n = 2f`; 2026-11-07 showed that `n` varies and `W` must
+follow it, `max(n − f, f)`: see the durable-count fix in GAPS.) Nothing recorded which hosts those were. `fleet::materialize` passed the current placement, which
 changes with membership.
 
 ## Impact
