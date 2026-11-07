@@ -3316,17 +3316,20 @@ fn group_report(
 /// formed probe sessions summed over the shards' parts (only the control shard forms any) and the
 /// consensus groups' state taken from the control shard's part (the only live one).
 /// The members this node keeps direct contact with, this node left out (`fleet::keeps_direct_contact_with`), and how
-/// many of them have no formed probe session yet: the probe mesh's peers and what keeps it down, as
-/// `Daemon::fleet_meshed` judges them.
+/// many of them have no formed probe session yet: the probe mesh's peers and what keeps it down. Counted over the
+/// members the membership holds alive (what `fleet_members` reports), not the configuration's members: before the
+/// council's first commit that list is empty, so every fleet read none in contact while it probed every peer
+/// (raft-chaos's and live-fixes' flows on CI, diag-live-fixes-32: `in_contact=0 probed=4` on a forming five-node fleet).
 fn peers_in_contact(state: &ShardState) -> (u32, u32) {
   let host = state.fleet.host();
   let (contact, unmeshed) = state
     .fleet
-    .members()
-    .iter()
-    .filter(|peer| **peer != host && crate::fleet::keeps_direct_contact_with(state, **peer))
+    .membership()
+    .alive()
+    .into_iter()
+    .filter(|peer| *peer != host && crate::fleet::keeps_direct_contact_with(state, *peer))
     .fold((0usize, 0usize), |(contact, unmeshed), peer| {
-      let missing = usize::from(!state.formed_probe_peers.contains(peer));
+      let missing = usize::from(!state.formed_probe_peers.contains(&peer));
       (contact.saturating_add(1), unmeshed.saturating_add(missing))
     });
   (
