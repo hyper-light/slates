@@ -232,3 +232,93 @@ fn presenting_a_large_landing_never_holds_its_shard() {
     "no probe waited for half the presentation or more ({longest:?} of {took:?})"
   );
 }
+
+/// §4.15 steps 1–4, AUD-29-25, §4.3, R9 (a granted landing's plan). Do: on a one-shard daemon, write 1,000 files of 16
+/// KiB into a scratch volume, approve its landing into an empty target, take the probes' baseline, then land it under
+/// the grant on one thread while another client probes the same shard. Expect: the landing is done with every file
+/// written; the shard answered probes while it ran, and none waited for half the landing or more. The run's writes were
+/// sliced (AUD-29-25); until 2026-11-08 its plan was not, and the plan of these files (6.2 s on a Mac in a debug build)
+/// was one poll longer than all its sliced writes together.
+#[test]
+fn a_granted_landing_never_holds_its_shard_while_it_is_planned() {
+  let (daemon, instance) = daemon("granted");
+  let target = target_dir();
+  let mut client = connect(&instance);
+  let volume = client
+    .create(&CreateSpec {
+      size: SizeClass::Dynamic {
+        max: (FILES * FILE_BYTES) as u64 * BOUND_FACTOR,
+      },
+      ..scratch("granted-volume")
+    })
+    .unwrap();
+  let attachment = client
+    .attach(volume, None, Intent::Write)
+    .unwrap()
+    .attachment;
+  for f in 0..FILES {
+    let mut bytes = format!("file {f}\n").into_bytes();
+    bytes.resize(FILE_BYTES, b'x');
+    client
+      .fs_write((volume, attachment), &format!("f{f:04}.c"), &bytes, 0o644)
+      .unwrap();
+  }
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let grant = common::landing::approve(&mut client, &secret, volume, None, &target.path);
+  let mut prober = connect(&instance);
+  let status_of = prober.create(&scratch("granted-status")).unwrap();
+  let mut round = 0usize;
+  let mut baseline = Vec::new();
+  for _ in 0..BASELINE_PROBES {
+    for kind in PROBES {
+      baseline.push(probe(&mut prober, kind, round, status_of));
+      round += 1;
+    }
+  }
+  let target_path = target.path.clone();
+  let landing = std::thread::spawn(move || {
+    let began = Instant::now();
+    let landed = client.land(volume, None, &target_path, Filter::default(), Some(grant));
+    (began, began.elapsed(), landed)
+  });
+  let pace = quantile(&mut baseline.clone(), 500_000);
+  let mut during = Vec::new();
+  while !landing.is_finished() {
+    let kind = PROBES[round % PROBES.len()];
+    let at = Instant::now();
+    let took = probe(&mut prober, kind, round, status_of);
+    during.push((at, took));
+    round += 1;
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(pace);
+  }
+  let (began, took, landed) = landing.join().unwrap();
+  drop(prober);
+  daemon.stop();
+  let probes_inside = during
+    .iter()
+    .filter(|(at, probe)| *at >= began && *at + *probe <= began + took)
+    .count();
+  let longest = during
+    .iter()
+    .map(|(_, probe)| *probe)
+    .max()
+    .unwrap_or_default();
+  eprintln!(
+    "granted landing of {FILES} files of {FILE_BYTES} bytes: {took:?}, {landed:?}; {probes_inside} probes inside it, \
+     the longest of all {longest:?}"
+  );
+  let Ok(slates_client::Landing::Landed(outcome)) = landed else {
+    panic!("the granted landing: {landed:?}");
+  };
+  assert_eq!(outcome.state, "done");
+  assert_eq!(outcome.written, FILES as u64);
+  assert!(
+    probes_inside > 1,
+    "the shard answered probes while the landing ran ({probes_inside} inside its {took:?})"
+  );
+  assert!(
+    longest * 2 < took,
+    "no probe waited for half the landing or more ({longest:?} of {took:?})"
+  );
+}
