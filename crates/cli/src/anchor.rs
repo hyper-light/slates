@@ -448,7 +448,12 @@ fn observe(
           }
           Some(_) if !kill_sent => {
             if let Some(said) = start_stuck(judge_start(supervisor, &mut start_watch, now)) {
-              slates_machine::log_line!("slates anchor: the starting daemon {said}; killing it");
+              slates_machine::log_line!(
+                "slates anchor: the starting daemon (pid {}) {said}; killing it",
+                supervisor
+                  .child_pid()
+                  .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string())
+              );
               supervisor.kill().map_err(|e| failed("kill", e))?;
               kill_sent = true;
               starting_since = None;
@@ -485,7 +490,10 @@ fn observe(
         in_window,
       } => {
         slates_machine::log_line!(
-          "slates anchor: daemon exited ({exit_code:?}); restarted ({in_window} in the window)"
+          "slates anchor: daemon exited ({exit_code:?}); restarted as pid {} ({in_window} in the window)",
+          supervisor
+            .child_pid()
+            .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string())
         );
         starting_since = Some(clock.monotonic_ns());
         start_watch = ShardWatch::default();

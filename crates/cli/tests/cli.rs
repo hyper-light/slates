@@ -749,7 +749,8 @@ fn a_stuck_start_is_killed_and_restarted() {
   }
   let instance = format!("cli-stuck-start-{}", std::process::id());
   let anchor = start_anchor(&instance);
-  let killed = daemon_pid(&instance).expect("the daemon answers");
+  // Awaited, not asked once: a status that lands in the anchor's one startup restart is refused (seen once at load 29).
+  let killed = await_daemon(&instance, None, &[]);
   let stuck = successor_of(&anchor, killed);
   assert!(
     Command::new("kill")

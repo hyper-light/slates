@@ -44,6 +44,10 @@ the two apart. A running daemon was already judged by progress, in each shard's 
   spawn; with the fix it is the daemon that answers, with no start killed.
 - `a_stuck_start_is_killed_and_restarted`: a successor stopped for good is killed, "made no progress for 1081 ms (the
   1000 ms liveness window)", and replaced.
+- On Windows, the same two tests in `crates/cli/tests/start_judgment.rs` (`cli.rs` is Unix as a whole). They suspend the
+  successor whole (`NtSuspendProcess`), as `winfsp.rs` suspends its anchor, and the stuck one also requires the anchor's
+  start-kill line. To name the successor without `pgrep -P`, the anchor's restart line now says "restarted as pid N",
+  and its start-kill line says "the starting daemon (pid N)". Both CI Windows lanes run them.
 
 ## Left open
 
@@ -53,5 +57,6 @@ the two apart. A running daemon was already judged by progress, in each shard's 
 - **The client's reconnect budget** is still `recovery + liveness` (2 s, `Deadlines::derive`); a starved restart that is
   no longer killed can outlast it. Owner: clients.
 - **`Facts::query()` for the identity** gathers every machine fact to read one (676 ms at the p50 above).
-- **The anchor itself** refused to start twice under the same load: "measure the machine profile: measurement timeout:
-  wake".
+- **The anchor itself** refused to start under the same load: "measure the machine profile: measurement timeout:
+  wake". Fixed separately, by the same rule applied to the wake probe:
+  `2026-11-07-a-busy-machine-refused-the-anchors-boot-at-the-wake-probe.md`.
