@@ -7506,6 +7506,15 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > work reads one position per holder rather than rescanning the retained chain. Transfer to a new
 > candidate set and full green takeover remain owed (AUD-14).
 
+> **Status (2026-11-07, amendment number owed by the supervisor: a restarted owner re-enqueues its chain's records).**
+> The pending merge records and the submits waiting on them live in memory, and a restarted owner rebuilt each green from
+> its chain without them. So a version appended before the crash and not yet committed at `f + 1` was never shipped
+> again, and its retried submit waited forever. Goal 4's primary-kill rung at 1,000 clients found it: versions 507 to
+> 514 on the green, no client told
+> (`docs/bugs/2026-11-07-a-version-appended-before-its-owner-restarted-never-committed.md`). Now the restart's replay
+> returns each version's record fields, with the green's head identity at that version, and the owner re-enqueues
+> them. A holder that already holds a version acknowledges it again at no cost. A takeover keeps its own path.
+
 > **Status (2026-11-07, amendment number owed by the supervisor: a version commits in one exchange).** A-235 still put a
 > version's inputs through the content exchange (an offer, then the transfer) and shipped its record after, each behind
 > its own wake of the record plane: five hops, so one submit at `f = 1` took 6.7 ms at p50 quiet and 15 ms at load 130
@@ -15031,6 +15040,27 @@ Applied in the same change to: §4.7 (data model, wake strategy, status); `slate
 and settle, `DaemonEnd::reply`'s stamp and confirmation) and `crates/ipc/tests/rings.rs`; GAPS. Evidence:
 `docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`. A client and a daemon of
 different layout versions refuse each other by name; no consensus rule or capability changes.
+
+### A-(second number owed by the supervisor) — A restarted owner re-enqueues the merge records its chain holds (accepted 2026-11-07)
+
+AUD-11 answers a submit at `f > 0` once its version's record commits at the quorum. The records an owner owes and the
+submits waiting on them were in memory only, and a restart rebuilt greens from their chains without them, so a version
+appended before a crash and not yet placed was never shipped again. Replace that: the restart's replay of each green
+(`verbs::replay_green`) yields every replayed version's record fields with the green's head identity there. Those are
+version 0 when no checkpoint stands for it, then each chain entry. The owner enqueues them as pending records, placed
+from the configuration it holds when it ships. A holder that already applied a version re-acknowledges it from its
+acceptor, so re-shipping what was already placed costs one exchange a version and changes nothing.
+
+Rejected:
+- Persisting each record's placement. That is a durable write per commit, to save a re-ship only after a restart.
+- Asking the holders for their heads before shipping. That is a new exchange whose answer the re-acknowledgement
+  already gives.
+- Re-enqueueing on a takeover too. A takeover adopts its placed head under the promotion epoch and keeps that path.
+
+Applied in the same change to: §4.16 (Commit status); `slates-server` (`verbs::replay_green`, `rebuild_green`,
+`rebuild_recovered`; `merge_service::ReplayedVersion`, `enqueue_recovered_record`, `enqueue_record_with`); the fleet
+test; GAPS. Evidence: `docs/bugs/2026-11-07-a-version-appended-before-its-owner-restarted-never-committed.md`. No wire,
+layout or capability change.
 
 ### A-(number owed by the supervisor) — A merge record carries its inputs, so a version commits in one exchange (accepted 2026-11-07)
 

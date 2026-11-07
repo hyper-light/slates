@@ -1,5 +1,14 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A version appended before its owner restarted never committed: fixed (2026-11-07, §4.16 Commit, AUD-11; amendment
+> number owed by the supervisor).** A restarted owner rebuilt its greens from their chains, but not the merge records
+> it still owed its holders (they lived in memory), so a version appended before the crash and not yet placed was never
+> shipped again and its retried submit was refused `Overloaded` until the client gave up. Goal 4's primary-kill rung
+> at 1,000 clients, `f = 1`: 1,770 oracle failures, versions 507 to 514 on the green with no client told. The restart
+> now re-enqueues every replayed version's record. Red test: the version never committed in 60 s after the restart;
+> now it commits, and the test ends in 3.3 s. Record:
+> `docs/bugs/2026-11-07-a-version-appended-before-its-owner-restarted-never-committed.md`.
+
 > **A version commits in one exchange, and retention no longer decodes the whole ledger per put: fixed (2026-11-07, §4.16
 > Commit, §4.10 retention; amendment number owed by the supervisor).** A-235 left five hops a version (the inputs' offer
 > and transfer, then the record, each behind a wake), and a holder's retention decoded every merge record for every held

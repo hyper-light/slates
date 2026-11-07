@@ -9904,7 +9904,13 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
   for record in &records {
     match record.policy.role {
       Role::Green { .. } => {
-        rebuild_green(state, record);
+        // A restarted owner owes its holders every merge record its chain holds that they may not: the pending
+        // records lived in memory, so a version appended before the restart and not yet committed at `f + 1` was
+        // never shipped again (the bug record of 2026-11-07). Re-enqueued, each is placed from the current
+        // configuration; a holder that already holds a version acknowledges it again at no cost.
+        for version in rebuild_green(state, record) {
+          crate::merge_service::enqueue_recovered_record(state, record.id, version);
+        }
         rebuilt.merge_volumes = rebuilt.merge_volumes.saturating_add(1);
       }
       Role::Work { green, .. } => {
@@ -10152,10 +10158,16 @@ fn reconcile_clone_pins(state: &mut ShardState) -> usize {
 /// replayed in order, so its content, versions, last-changed index and dedup set return exactly as
 /// before the restart. A corrupt chain entry stops the replay there — the green recovers to its last
 /// good version, logged, rather than presenting a wrong later state.
-fn rebuild_green(state: &mut ShardState, record: &VolumeRecord) {
-  let green = match replay_green(state, record.id) {
-    Ok(green) => green,
-    Err(fence) => return fence_green(state, record, fence),
+fn rebuild_green(
+  state: &mut ShardState,
+  record: &VolumeRecord,
+) -> Vec<crate::merge_service::ReplayedVersion> {
+  let (green, replayed) = match replay_green(state, record.id) {
+    Ok(rebuilt) => rebuilt,
+    Err(fence) => {
+      fence_green(state, record, fence);
+      return Vec::new();
+    }
   };
   state.greens.insert(record.id, green);
   // The replay rebuilt every history in full; fold it oldest-first back to the budget and re-take the retention the
@@ -10171,7 +10183,9 @@ fn rebuild_green(state: &mut ShardState, record: &VolumeRecord) {
       record,
       crate::merge_service::GreenFence::Retention { short },
     );
+    return Vec::new();
   }
+  replayed
 }
 
 /// Replays green `id`'s durable origin and chain into a fresh engine (§4.16): every chain entry was an
@@ -10182,7 +10196,13 @@ fn rebuild_green(state: &mut ShardState, record: &VolumeRecord) {
 fn replay_green(
   state: &ShardState,
   id: DbVolumeId,
-) -> Result<slates_merge::engine::Green, crate::merge_service::GreenFence> {
+) -> Result<
+  (
+    slates_merge::engine::Green,
+    Vec<crate::merge_service::ReplayedVersion>,
+  ),
+  crate::merge_service::GreenFence,
+> {
   use crate::merge_service::GreenFence;
   let origin = recovered_origin(state, id)?;
   let partition = state.db.partition();
@@ -10206,6 +10226,18 @@ fn replay_green(
       0,
     ),
   };
+  // Each replayed version's merge record, as its owner enqueued it: version 0 too when no checkpoint stands for
+  // it, then every chain entry, each with the head identity the green has at that version.
+  let mut replayed = Vec::new();
+  if held == 0 {
+    replayed.push(crate::merge_service::ReplayedVersion {
+      version: 0,
+      increment: [0u8; 32],
+      base: 0,
+      evidence: Vec::new(),
+      identity: green.head_identity(),
+    });
+  }
   for (index, bytes) in partition.green_chain(id).iter().enumerate() {
     let version = u64::try_from(index)
       .unwrap_or(u64::MAX)
@@ -10214,7 +10246,15 @@ fn replay_green(
     let increment = slates_merge::engine::Increment::decode(bytes)
       .map_err(|_| GreenFence::EntryCorrupt { version })?;
     match green.submit(&increment) {
-      slates_merge::engine::Outcome::Accepted { version: accepted } if accepted == version => {}
+      slates_merge::engine::Outcome::Accepted { version: accepted } if accepted == version => {
+        replayed.push(crate::merge_service::ReplayedVersion {
+          version,
+          increment: increment.id,
+          base: increment.base,
+          evidence: increment.evidence.clone(),
+          identity: green.head_identity(),
+        });
+      }
       slates_merge::engine::Outcome::Accepted { version: accepted } => {
         return Err(GreenFence::WrongVersion { version, accepted });
       }
@@ -10225,7 +10265,7 @@ fn replay_green(
     }
   }
   green.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
-  Ok(green)
+  Ok((green, replayed))
 }
 
 /// Green `id`'s origin as recovery finds it (§4.16): a held origin (A-217) walked again from its base snapshot,

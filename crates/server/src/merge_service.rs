@@ -1700,6 +1700,72 @@ pub(crate) fn enqueue_record(
   base: u64,
   evidence: Vec<[u8; 32]>,
 ) {
+  enqueue_record_with(
+    state,
+    green,
+    version,
+    (increment, base, evidence),
+    |state| {
+      state
+        .greens
+        .get_mut(&green)
+        .map(Green::head_identity)
+        .unwrap_or_default()
+    },
+  );
+}
+
+/// One version's merge record as a recovery replay rebuilt it (§4.16): what its owner enqueued when the version
+/// was appended, with the head identity the green had at that version.
+pub(crate) struct ReplayedVersion {
+  /// The version.
+  pub(crate) version: u64,
+  /// The increment's identity (zero for version 0, the green's creation).
+  pub(crate) increment: [u8; 32],
+  /// The version the increment was based on.
+  pub(crate) base: u64,
+  /// The evidence the increment carried.
+  pub(crate) evidence: Vec<[u8; 32]>,
+  /// The green's head identity at this version.
+  pub(crate) identity: [u8; 32],
+}
+
+/// Enqueues a recovered version's merge record on a restarted owner (§4.16 "Commit", AUD-11): the pending records
+/// lived in memory, so without this a version appended before the restart and not yet committed at `f + 1` was never
+/// shipped again and a submit waiting on it was never answered (the bug record of 2026-11-07, a version appended
+/// before its owner restarted never committed). The record is placed from the configuration the owner holds when it
+/// ships, as every pending record is (`PendingGreen::retarget`); a holder that already holds the version acknowledges
+/// it again at no cost.
+pub(crate) fn enqueue_recovered_record(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  replayed: ReplayedVersion,
+) {
+  let ReplayedVersion {
+    version,
+    increment,
+    base,
+    evidence,
+    identity,
+  } = replayed;
+  enqueue_record_with(
+    state,
+    green,
+    version,
+    (increment, base, evidence),
+    move |_| identity,
+  );
+}
+
+/// [`enqueue_record`] with the version's head identity from `identity_of`, asked only for a record that goes to
+/// holders.
+fn enqueue_record_with(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  version: u64,
+  (increment, base, evidence): ([u8; 32], u64, Vec<[u8; 32]>),
+  identity_of: impl FnOnce(&mut ShardState) -> [u8; 32],
+) {
   let object = ObjectId(green.bytes);
   let config = state.fleet.configuration();
   let local = state.fleet.host();
@@ -1748,11 +1814,7 @@ pub(crate) fn enqueue_record(
   // they are made only for a record that goes to holders. The laptop's owner is the only holder and
   // answers above: there the head identity, a hash of every byte the green holds, had been made on
   // every accept and dropped (113 of 120 profile samples of a 1,000-file green's submit, 2026-11-04).
-  let identity = state
-    .greens
-    .get_mut(&green)
-    .map(Green::head_identity)
-    .unwrap_or_default();
+  let identity = identity_of(state);
   let inputs_identity = inputs_of(state, green, version)
     .map(|bytes| MergeShardState::inputs_identity(&bytes, archive_page(state)));
   state.merge.pending.entry(object).or_default().insert(
