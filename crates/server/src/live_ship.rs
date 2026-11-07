@@ -1129,10 +1129,10 @@ fn lane_expiry_ns() -> u64 {
     .saturating_mul(2)
 }
 
-/// A lane to `holder` has ended for `objects`: each volume's lane is closed, and what any holder of those volumes lacks
-/// now is sent ([`dispatch`]), the ended holder's at once when it `answered`. A holder that did not answer is left to
-/// the next publication or the record period: sent again at once, a holder with no link (dropped to be dialed afresh)
-/// would end each new lane at once and loop between the shards at their speed.
+/// A lane to `holder` has ended for `objects`: each volume's lane is closed, and what the holder lacks now is sent at
+/// once when it `answered` ([`dispatch`]). A holder that did not answer is left to the next publication or the record
+/// period: sent again at once, a holder with no link (dropped to be dialed afresh) would end each new lane at once and
+/// loop between the shards at their speed.
 fn lane_ended(state: &mut ShardState, holder: HostId, objects: Vec<ObjectId>, answered: bool) {
   let mut sends = Vec::new();
   for object in objects {
@@ -1140,11 +1140,15 @@ fn lane_ended(state: &mut ShardState, holder: HostId, objects: Vec<ObjectId>, an
       continue;
     };
     live.lanes.remove(&holder);
-    if live.fenced.is_none() {
+    // Only the ended holder's own messages, and only when it answered: every other holder is sent its own when its lane
+    // ends, a publication comes or the record period runs. Sent what every other holder lacked, two holders with no link
+    // (both stopped) each ended its lane at once and sent the other's, back and forth at the shards' speed (1,658
+    // unanswered sends in one stop, CI macos-latest, `diag-live-durability-23`).
+    if live.fenced.is_none() && answered {
       sends.extend(
         pending_sends(state, object.0)
           .into_iter()
-          .filter(|send| answered || send.holder != holder),
+          .filter(|send| send.holder == holder),
       );
     }
   }
