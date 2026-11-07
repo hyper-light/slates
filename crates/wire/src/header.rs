@@ -9,8 +9,10 @@ use crate::request::RequestId;
 pub const HEADER_LEN: usize = 32;
 /// Format: the magic, `SLTS` in little-endian ASCII.
 pub const MAGIC: u32 = 0x5354_4C53;
-/// Format: the protocol major this build speaks; a mismatch is refused outright.
-pub const MAJOR: u16 = 1;
+/// Format: the protocol major this build speaks; a mismatch is refused outright. Major 2 (A-237): a consumer's host
+/// account became a uid or a Windows SID where it was a uid alone, which no append-only change can say; a major-1 peer
+/// is refused, never decoded.
+pub const MAJOR: u16 = 2;
 /// Format: the protocol minor this build speaks; minors add kinds and fields, append-only.
 pub const MINOR: u16 = 0;
 
@@ -203,7 +205,7 @@ mod tests {
     let bytes = h.encode();
     assert_eq!(bytes.len(), HEADER_LEN);
     assert_eq!(&bytes[0..4], b"SLTS");
-    assert_eq!(&bytes[4..6], &[1, 0]);
+    assert_eq!(&bytes[4..6], &MAJOR.to_le_bytes());
     assert_eq!(&bytes[16..20], &4096u32.to_le_bytes());
     assert_eq!(Header::decode(&bytes).unwrap(), h);
   }
@@ -216,14 +218,15 @@ mod tests {
       Header::decode(&bytes),
       Err(WireError::BadMagic { .. })
     ));
+    // A peer of the previous major (A-237: the u32 account) is refused before its body is looked at.
     let mut bytes = sample().encode();
-    bytes[4] = 2;
+    bytes[4] = 1;
     bytes[12] = 200; // an unknown class too, which must not be reached
     assert!(matches!(
       Header::decode(&bytes),
       Err(WireError::UnsupportedMajor {
-        got: 2,
-        supported: 1
+        got: 1,
+        supported: 2
       })
     ));
     let mut bytes = sample().encode();
