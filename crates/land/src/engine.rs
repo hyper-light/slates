@@ -52,7 +52,7 @@ use crate::grant::{
   GrantBinding, GrantId, GrantRecord, GrantRefusal, GrantScope, Grants, LandingLease,
   LandingLeaseHeld, TargetIdentity, lease_key,
 };
-use crate::manifest::{Action, Filter, LandingEntry, Manifest, OverlayIdentity, Summary, plan};
+use crate::manifest::{Action, Filter, LandingEntry, Manifest, OverlayIdentity, Summary};
 pub use crate::source::Source;
 use crate::verdict::{ConflictClass, DiskState, Verdict, verdict};
 
@@ -969,16 +969,6 @@ impl<H: LandFs> Landing<'_, H> {
       }
       _ => Ok(false),
     }
-  }
-
-  /// The verdict pass over every entry (no writes).
-  fn validate(&mut self, manifest: &Manifest) -> Result<Vec<EntryReport>, HostError> {
-    let mut out = Vec::with_capacity(manifest.entries.len());
-    let ours = owned_paths(manifest);
-    for entry in &manifest.entries {
-      out.push(self.validate_entry(entry, &ours)?);
-    }
-    Ok(out)
   }
 
   /// One entry's verdict against the disk now (the unit a sliced landing validates per step).
@@ -2879,7 +2869,7 @@ pub fn settle_grant(
 /// against its grant before any write-capable step, and checks the lease; then the [`LandingRun`] that does
 /// the rest, which the caller steps in slices and ends with [`settle_grant`]. Refused with the host given
 /// back: `GrantRequired` (the presentation, with the preliminary verdicts), a grant or lease refusal, or the
-/// volume's or the target's.
+/// volume's or the target's. [`Beginning`] run to its end in one call, then [`begin_planned`].
 #[allow(clippy::too_many_arguments)]
 pub fn begin_landing<'h, H: LandFs>(
   mut host: HostSlot<'h, H>,
@@ -2891,62 +2881,226 @@ pub fn begin_landing<'h, H: LandFs>(
   audit: &mut Audit,
   request: &LandingRequest,
 ) -> Result<LandingRun<'h, H>, (HostSlot<'h, H>, LandingRefusal)> {
-  // The instant `request.now_ns` stands for: its caller read the clock as it called this, and every fence counts the
-  // run's time from here, the plan's included.
-  let began = Instant::now();
-  // Plan.
-  let planned = match host.get() {
-    Some(lent) => plan(vol, store, lent, &request.filter, request.source),
-    None => return Err((host, LandingRefusal::HostAway)),
-  };
-  let manifest = match planned {
-    Ok(manifest) => manifest,
-    Err(error) => return Err((host, LandingRefusal::Volume(error))),
-  };
-  audit.push(AuditRecord {
-    seq: 0,
-    at_ns: request.now_ns,
-    kind: AuditKind::LandingPlanned,
-    grant: request.grant,
-    landing: request.landing_id,
-    manifest: manifest.hash,
-    outcome: None,
-  });
-  // Grant: the landing's own binding — the consumer, the volume and snapshot, and the target as opened now —
-  // must be the one the grant was approved for (§4.13 "Grants"), before any write-capable step.
-  let bound = match host.get() {
-    Some(lent) => binding_of(lent, target, request),
-    None => Err(LandingRefusal::HostAway),
-  };
-  let binding = match bound {
-    Ok(binding) => binding,
+  let mut beginning = match Beginning::new(vol, target, request) {
+    Ok(beginning) => beginning,
     Err(refusal) => return Err((host, refusal)),
   };
-  let grant = match grants.check(request.grant, &binding, manifest.hash, request.now_ns) {
-    Ok(g) => g,
-    Err(GrantRefusal::GrantRequired) => {
-      let verdicts = match host.get() {
-        Some(lent) => preliminary_verdicts(lent, target, request, &manifest),
-        None => Err(LandingRefusal::HostAway),
-      };
-      let preliminary = match verdicts {
-        Ok(preliminary) => preliminary,
-        Err(refusal) => return Err((host, refusal)),
-      };
-      return Err((
-        host,
-        LandingRefusal::GrantRequired(Box::new(Presented {
-          manifest,
-          preliminary,
-          binding,
-        })),
-      ));
+  let planned = loop {
+    let stepped = match host.get() {
+      Some(lent) => beginning.unit(lent, vol, store, grants, audit),
+      None => Err(LandingRefusal::HostAway),
+    };
+    match stepped {
+      Ok(Some(planned)) => break planned,
+      Ok(None) => {}
+      Err(refusal) => return Err((host, refusal)),
     }
-    Err(e) => return Err((host, LandingRefusal::Grant(e))),
   };
-  // Lease (AUD-29-03): the caller took the landing lease on the target's canonical identity from the
-  // target's one host-local owner; it must name this target and still be live, and every entry is fenced by
-  // its term. The engine neither takes nor releases it.
+  match planned {
+    Planned::Presented(presented) => Err((host, LandingRefusal::GrantRequired(presented))),
+    Planned::Granted(granted) => begin_planned(host, lease, *granted),
+  }
+}
+
+/// A landing being begun a unit at a time (§4.15 steps 1–3; §4.3 "Bounded work everywhere"): its plan
+/// ([`crate::manifest::PlanWalk`]), then its grant checked against the binding, then, for a landing with no grant yet,
+/// its preliminary verdicts one entry a unit. A presentation of 1,000 files of 16 KiB had held its shard for one poll
+/// of 6.77 s, 6.20 s of it the plan (2026-11-08). It holds no host between units: its caller lends the host to each
+/// [`Beginning::unit`], so an overlay's base host can serve its volume between them. What it plans must not move
+/// under it, so a sliced beginning plans a snapshot.
+pub struct Beginning {
+  target: LandingTarget,
+  request: LandingRequest,
+  began: Instant,
+  stage: BeginStage,
+}
+
+enum BeginStage {
+  /// The manifest being planned.
+  Plan(crate::manifest::PlanWalk),
+  /// A landing with no grant: its entries checked against the target one a unit. Boxed: the landing's saved state is
+  /// far past the plan's.
+  Verdicts(Box<Verdicting>),
+  /// Ended: what it planned was given out.
+  Ended,
+}
+
+/// A landing with no grant between the units of its preliminary verdicts.
+struct Verdicting {
+  manifest: Manifest,
+  binding: GrantBinding,
+  saved: Saved,
+  ours: BTreeSet<String>,
+  reports: Vec<EntryReport>,
+}
+
+/// What a [`Beginning`] ends with.
+#[derive(Debug)]
+pub enum Planned {
+  /// No grant yet: the presentation, its manifest and preliminary verdicts, for a human to grant.
+  Presented(Box<Presented>),
+  /// Granted: what [`begin_planned`] begins the run with.
+  Granted(Box<GrantedPlan>),
+}
+
+/// A granted landing's plan, ready for its lease and its run ([`begin_planned`]).
+#[derive(Debug)]
+pub struct GrantedPlan {
+  target: LandingTarget,
+  request: LandingRequest,
+  manifest: Manifest,
+  binding: GrantBinding,
+  grant: GrantRecord,
+  began: Instant,
+}
+
+impl Beginning {
+  /// A landing of `request` into `target` from its start. The instant `request.now_ns` stands for is taken here: its
+  /// caller reads the clock as it calls this, and every fence counts the landing's time from it, the plan included.
+  pub fn new(
+    vol: &Volume,
+    target: &LandingTarget,
+    request: &LandingRequest,
+  ) -> Result<Beginning, LandingRefusal> {
+    let began = Instant::now();
+    let walk =
+      crate::manifest::PlanWalk::new(vol, request.source).map_err(LandingRefusal::Volume)?;
+    Ok(Beginning {
+      target: target.clone(),
+      request: request.clone(),
+      began,
+      stage: BeginStage::Plan(walk),
+    })
+  }
+
+  /// One unit with `host` lent for it: a unit of the plan, the grant's check, or one entry's preliminary verdict; what
+  /// was planned once the last is done. A refusal ends the beginning (the volume's, the target's, the grant's).
+  pub fn unit<H: LandFs>(
+    &mut self,
+    host: &mut H,
+    vol: &mut Volume,
+    store: &mut Store,
+    grants: &mut Grants,
+    audit: &mut Audit,
+  ) -> Result<Option<Planned>, LandingRefusal> {
+    match std::mem::replace(&mut self.stage, BeginStage::Ended) {
+      BeginStage::Plan(mut walk) => {
+        let Some(manifest) = walk
+          .unit(vol, store, host, &self.request.filter)
+          .map_err(LandingRefusal::Volume)?
+        else {
+          self.stage = BeginStage::Plan(walk);
+          return Ok(None);
+        };
+        self.planned(host, manifest, grants, audit)
+      }
+      BeginStage::Verdicts(verdicting) => {
+        let Verdicting {
+          manifest,
+          binding,
+          saved,
+          ours,
+          mut reports,
+        } = *verdicting;
+        let mut landing = Landing::resume(host, &self.request, saved);
+        let Some(entry) = manifest.entries.get(reports.len()) else {
+          landing.close_dirs();
+          return Ok(Some(Planned::Presented(Box::new(Presented {
+            manifest,
+            preliminary: reports,
+            binding,
+          }))));
+        };
+        match landing.validate_entry(entry, &ours) {
+          Ok(report) => reports.push(report),
+          Err(error) => {
+            landing.close_dirs();
+            return Err(LandingRefusal::Target(error));
+          }
+        }
+        let saved = landing.suspend();
+        self.stage = BeginStage::Verdicts(Box::new(Verdicting {
+          manifest,
+          binding,
+          saved,
+          ours,
+          reports,
+        }));
+        Ok(None)
+      }
+      BeginStage::Ended => Err(LandingRefusal::HostAway),
+    }
+  }
+
+  /// The plan is whole: recorded, and its binding checked against the grant (§4.13 "Grants") before any write-capable
+  /// step. A granted landing is ready for its lease; one with no grant goes on to its preliminary verdicts.
+  fn planned<H: LandFs>(
+    &mut self,
+    host: &mut H,
+    manifest: Manifest,
+    grants: &mut Grants,
+    audit: &mut Audit,
+  ) -> Result<Option<Planned>, LandingRefusal> {
+    let request = &self.request;
+    audit.push(AuditRecord {
+      seq: 0,
+      at_ns: request.now_ns,
+      kind: AuditKind::LandingPlanned,
+      grant: request.grant,
+      landing: request.landing_id,
+      manifest: manifest.hash,
+      outcome: None,
+    });
+    // The landing's own binding — the consumer, the volume and snapshot, and the target as opened now — must be the
+    // one the grant was approved for.
+    let binding = binding_of(host, &self.target, request)?;
+    match grants.check(request.grant, &binding, manifest.hash, request.now_ns) {
+      Ok(grant) => Ok(Some(Planned::Granted(Box::new(GrantedPlan {
+        target: self.target.clone(),
+        request: self.request.clone(),
+        manifest,
+        binding,
+        grant,
+        began: self.began,
+      })))),
+      Err(GrantRefusal::GrantRequired) => {
+        // The preliminary verdict pass reads only, with no capability a write would use.
+        let read_only = LandCapabilities {
+          exchange: false,
+          reflink: false,
+          unnamed_temporaries: false,
+        };
+        self.stage = BeginStage::Verdicts(Box::new(Verdicting {
+          ours: owned_paths(&manifest),
+          reports: Vec::with_capacity(manifest.entries.len()),
+          saved: Saved::start(&self.target, read_only),
+          manifest,
+          binding,
+        }));
+        Ok(None)
+      }
+      Err(e) => Err(LandingRefusal::Grant(e)),
+    }
+  }
+}
+
+/// Begins a granted landing's run from its plan: its lease checked (AUD-29-03: the caller took the landing lease on
+/// the target's canonical identity from the target's one host-local owner; it must name this target and still be
+/// live, and every entry is fenced by its term — the engine neither takes nor releases it), then the
+/// [`LandingRun`]. Refused `LeaseRequired` with the host given back.
+pub fn begin_planned<'h, H: LandFs>(
+  host: HostSlot<'h, H>,
+  lease: Option<&LandingLease>,
+  plan: GrantedPlan,
+) -> Result<LandingRun<'h, H>, (HostSlot<'h, H>, LandingRefusal)> {
+  let GrantedPlan {
+    target,
+    request,
+    manifest,
+    binding,
+    grant,
+    began,
+  } = plan;
   let lease = match lease {
     Some(held)
       if held.target.as_ref() == lease_key(&binding.target) && held.expires_ns > request.now_ns =>
@@ -2955,15 +3109,7 @@ pub fn begin_landing<'h, H: LandFs>(
     }
     _ => return Err((host, LandingRefusal::LeaseRequired)),
   };
-  LandingRun::begin(
-    host,
-    target.clone(),
-    request.clone(),
-    manifest,
-    grant,
-    lease,
-    began,
-  )
+  LandingRun::begin(host, target, request, manifest, grant, lease, began)
 }
 
 /// The binding a landing presents: its consumer, volume and snapshot, and its target identified by the
@@ -2987,24 +3133,6 @@ fn binding_of<H: LandFs>(
       inode: identity.ino,
     },
   })
-}
-
-/// The preliminary verdict pass a `GrantRequired` reply carries (reads only).
-fn preliminary_verdicts<H: LandFs>(
-  host: &mut H,
-  target: &LandingTarget,
-  request: &LandingRequest,
-  manifest: &Manifest,
-) -> Result<Vec<EntryReport>, LandingRefusal> {
-  let read_only = LandCapabilities {
-    exchange: false,
-    reflink: false,
-    unnamed_temporaries: false,
-  };
-  let mut landing = Landing::start(host, target, request, read_only);
-  let verdicts = landing.validate(manifest);
-  landing.close_dirs();
-  verdicts.map_err(LandingRefusal::Target)
 }
 
 /// A landing's state between slices: everything a [`Landing`] holds but its host and request, which the run
@@ -3053,15 +3181,6 @@ impl Saved {
 }
 
 impl<'a, H: LandFs> Landing<'a, H> {
-  fn start(
-    host: &'a mut H,
-    target: &LandingTarget,
-    request: &'a LandingRequest,
-    caps: LandCapabilities,
-  ) -> Self {
-    Self::resume(host, request, Saved::start(target, caps))
-  }
-
   /// The landing over its saved state, with its host and request lent for one slice.
   fn resume(host: &'a mut H, request: &'a LandingRequest, saved: Saved) -> Self {
     Self {
