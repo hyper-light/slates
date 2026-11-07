@@ -8499,6 +8499,27 @@ and on a large volume would copy all of it each time. Round 3's slow tail on the
 slowed as well (p999 465.7 µs).
 
 
+### Measured and rejected: queueing the deltas the credit turns away (A-200; 2026-11-06)
+
+**Hardware:** this Mac (Apple arm64, 128 GiB), other agents' work running, load 40–63. **Command (the contract):**
+`SLATES_TEST_CLI=1 cargo test -p slates-cli --test live_chaos -- candidates_partitioned_in_turn --nocapture` (debug),
+each arm from its own worktree and target directory, the arms alternating, five pairs.
+
+A delta the credit (two entries not yet durable) turns away leaves the volume owing a whole record, which the next
+publication ships to every holder: 4.27 MB in one run, with writes queued behind it. The experiment queued such deltas
+in order, up to the last whole record's size, and appended them as the credit freed. Rolling partition, base
+(9afea76d) then queue (with the lanes' straggler wait), p50 / p99 / max write in ms, caught-up times in s:
+
+| pair | base | queue |
+|---|---|---|
+| 1 | pass, 688 writes, 2.0 / 189 / 501, 0.91 0.26 | pass, 482 writes, 1.8 / 210 / 880, 0.26 0.86 |
+| 2 | fail (one write ≥ 1 s), 573 writes, 2.2 / 299 / 1,176, 1.52 1.16 | fail (catch-up 2.99 s), 499 writes, 5.8 / 266 / 957 |
+| 3 | fail, 140 writes, 129 / 1,396 / 1,414, 1.58 none | fail, 193 writes, 78 / 816 / 1,095, 1.25 1.99 |
+| 4 | pass, 844 writes, 1.6 / 88 / 577, 0.30 0.34 | pass, 1,030 writes, 1.5 / 93 / 811, 0.44 0.66 |
+| 5 | pass, 1,075 writes, 1.5 / 89 / 611, 0.51 0.22 | fail (one write 2.3 s), 737 writes, 1.5 / 109 / 2,330 |
+
+Dead even (3 of 5 against 2 of 5, medians and tails overlapping), so it does not land; the patch is kept off the tree.
+
 ## What a WinFsp mount and unmount wait for the Windows anchor (A-213; 2026-11-05)
 
 Each WinFsp mount sends the anchor a hold and each unmount a release, and waits for the answer (A-198, A-206). The
