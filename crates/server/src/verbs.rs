@@ -477,13 +477,10 @@ fn promote_region_on_root(
       if origin == control {
         crate::state::deliver(client_index, request, reply, false);
       } else {
-        let back = SpawnRequest::new(
-          Box::pin(async move {
-            crate::state::deliver(client_index, request, reply, false);
-          }),
-          None,
-        );
-        crate::xshard::send_back(origin, back).await;
+        crate::xshard::send_reply_home(origin, move || {
+          crate::state::deliver(client_index, request, reply, false);
+        })
+        .await;
       }
     }),
     None,
@@ -1849,13 +1846,10 @@ async fn deliver_owner_forward(
     finish_owner_forward(client, request, reply, after);
     return;
   }
-  let back = SpawnRequest::new(
-    Box::pin(async move {
-      finish_owner_forward(client, request, reply, after);
-    }),
-    None,
-  );
-  crate::xshard::send_back(origin, back).await;
+  crate::xshard::send_reply_home(origin, move || {
+    finish_owner_forward(client, request, reply, after);
+  })
+  .await;
 }
 
 fn finish_owner_forward(
@@ -2625,18 +2619,15 @@ fn send_forward(
       let Some(reply) = reply else {
         return;
       };
-      let back = SpawnRequest::new(
-        Box::pin(async move {
-          // What the verb owes its client besides the reply (a stream end, A-161) goes home with it, for `send_reply`
-          // to hand over first. A shard whose state is out of reach drops it, counted, and the stream then ends.
-          if let Some(carried) = carried {
-            let _ = crate::state::with_state_counted(|s| keep_carried(s, request, carried));
-          }
-          crate::state::deliver(client_index, request, reply, true);
-        }),
-        None,
-      );
-      crate::xshard::send_back(origin, back).await;
+      crate::xshard::send_reply_home(origin, move || {
+        // What the verb owes its client besides the reply (a stream end, A-161) goes home with it, for `send_reply`
+        // to hand over first. A shard whose state is out of reach drops it, counted, and the stream then ends.
+        if let Some(carried) = carried {
+          let _ = crate::state::with_state_counted(|s| keep_carried(s, request, carried));
+        }
+        crate::state::deliver(client_index, request, reply, true);
+      })
+      .await;
     }),
     None,
   );
@@ -2656,13 +2647,10 @@ async fn forward_for_local_client(
   request_bytes: Vec<u8>,
 ) {
   let deliver_home = move |reply: ReplyBody| {
-    SpawnRequest::new(
-      Box::pin(async move {
-        crate::state::with_state_counted(|s| s.count(FORWARD_LOCAL_DELIVERED_HOME, 1));
-        crate::state::deliver(client_index, request, reply, true);
-      }),
-      None,
-    )
+    move || {
+      crate::state::with_state_counted(|s| s.count(FORWARD_LOCAL_DELIVERED_HOME, 1));
+      crate::state::deliver(client_index, request, reply, true);
+    }
   };
   let sent = control.is_some_and(|control| {
     let mut unstarted = crate::xshard::AnswerUnstarted::new(
@@ -2679,7 +2667,7 @@ async fn forward_for_local_client(
         let (replies, _) = resolve_and_forward(volume, region, None, vec![request_bytes]).await;
         crate::state::with_state_counted(|s| s.count(FORWARD_LOCAL_RESOLVED, 1));
         let reply = replies.first;
-        crate::xshard::send_back(origin, deliver_home(reply)).await;
+        crate::xshard::send_reply_home(origin, deliver_home(reply)).await;
       }),
       None,
     );
@@ -2696,7 +2684,7 @@ async fn forward_for_local_client(
     );
   });
   if !sent {
-    crate::xshard::send_back(
+    crate::xshard::send_reply_home(
       origin,
       deliver_home(refused(Refusal::HomedElsewhere { region })),
     )
@@ -2788,13 +2776,10 @@ fn scatter_list(
           Some(ReplyBody::Listed { volumes }) => volumes,
           _ => Vec::new(),
         };
-        let back = SpawnRequest::new(
-          Box::pin(async move {
-            gather(request, part);
-          }),
-          None,
-        );
-        crate::xshard::send_back(origin, back).await;
+        crate::xshard::send_reply_home(origin, move || {
+          gather(request, part);
+        })
+        .await;
       }),
       None,
     );
@@ -2839,13 +2824,10 @@ fn scatter_grants(
           Some(ReplyBody::Grants { grants }) => grants,
           _ => Vec::new(),
         };
-        let back = SpawnRequest::new(
-          Box::pin(async move {
-            gather_grants(request, part);
-          }),
-          None,
-        );
-        crate::xshard::send_back(origin, back).await;
+        crate::xshard::send_reply_home(origin, move || {
+          gather_grants(request, part);
+        })
+        .await;
       }),
       None,
     );
@@ -2901,13 +2883,10 @@ fn scatter_status(state: &mut ShardState, client_index: u32, request: u64) -> Se
     let task = SpawnRequest::new(
       Box::pin(async move {
         let part = crate::state::with_state(shard_report);
-        let back = SpawnRequest::new(
-          Box::pin(async move {
-            gather_status(request, part);
-          }),
-          None,
-        );
-        crate::xshard::send_back(origin, back).await;
+        crate::xshard::send_reply_home(origin, move || {
+          gather_status(request, part);
+        })
+        .await;
       }),
       None,
     );
@@ -3118,13 +3097,10 @@ fn scatter_acknowledge(
       Box::pin(async move {
         let part = crate::state::with_state(|s| acknowledge(s, client_id, up_to, &owed))
           .unwrap_or_else(|| refused(Refusal::NotFound));
-        let back = SpawnRequest::new(
-          Box::pin(async move {
-            crate::state::with_state_counted(|s| release_part_back(s, request, &part));
-          }),
-          None,
-        );
-        crate::xshard::send_back(origin, back).await;
+        crate::xshard::send_reply_home(origin, move || {
+          crate::state::with_state_counted(|s| release_part_back(s, request, &part));
+        })
+        .await;
       }),
       None,
     );

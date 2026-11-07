@@ -834,3 +834,77 @@ pub(crate) fn send_owing(target: u16, task: SpawnRequest) -> Result<(), RtError>
 pub(crate) const UNSTARTED_ANSWERED: &str = "xshard.unstarted_answered";
 /// Counter: such a task whose answer could not be sent home either (the client's shard's channel refused it).
 pub(crate) const UNSTARTED_UNANSWERED: &str = "xshard.unstarted_unanswered";
+
+/// The synchronous end of a reply carried home ([`send_reply_home`]): run on the client's shard by its task, or, when
+/// that shard drops the task unrun (its arena full at admission), run there by the drop. Dropped anywhere else (its
+/// sender's wait for room ran out, counted `xshard.reply_dropped`), it does nothing.
+struct RunUnstarted {
+  at: u16,
+  body: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl RunUnstarted {
+  /// Runs the body now (the task started), once.
+  fn run(&mut self) {
+    if let Some(body) = self.body.take() {
+      body();
+    }
+  }
+}
+
+impl Drop for RunUnstarted {
+  fn drop(&mut self) {
+    if DISCARDING_UNSENT.with(Cell::get) || self.body.is_none() {
+      return;
+    }
+    if state::with_state(|s| s.shard) != Some(self.at) {
+      return;
+    }
+    state::with_state_counted(|s| s.count(REPLY_RUN_UNSTARTED, 1));
+    self.run();
+  }
+}
+
+/// Carries a reply home to `origin`, the client's shard, as [`send_back`] carries a result: `body` is the reply's
+/// synchronous end there (writing it into the client's ring, with what goes with it). It runs on `origin` whether its
+/// arena admits the task or refuses it at admission, so a reply that reached the client's shard is never lost to a full
+/// arena there. The sibling of [`AnswerUnstarted`] the supervisor ordered fixed with it (2026-11-07).
+pub async fn send_reply_home(origin: u16, body: impl FnOnce() + Send + 'static) {
+  let mut guard = RunUnstarted {
+    at: origin,
+    body: Some(Box::new(body)),
+  };
+  let back = SpawnRequest::new(
+    Box::pin(async move {
+      guard.run();
+    }),
+    None,
+  );
+  send_back(origin, back).await;
+}
+
+/// Counter: a reply carried home whose task the client's shard refused at admission, run there by its drop instead
+/// ([`send_reply_home`]).
+pub(crate) const REPLY_RUN_UNSTARTED: &str = "xshard.reply_run_unstarted";
+
+/// [`send_reply_home`] for a caller that cannot wait for room (it holds its shard's state): `body` is handed to
+/// `target`'s control channel once, and the channel's refusal is returned for the caller to count, as before. Once
+/// the channel takes it, `body` runs on `target` whether its arena admits the task or refuses it at admission.
+pub(crate) fn hand_reply_home(
+  target: u16,
+  body: impl FnOnce() + Send + 'static,
+) -> Result<(), RtError> {
+  let mut guard = RunUnstarted {
+    at: target,
+    body: Some(Box::new(body)),
+  };
+  send_owing(
+    target,
+    SpawnRequest::new(
+      Box::pin(async move {
+        guard.run();
+      }),
+      None,
+    ),
+  )
+}
