@@ -6070,6 +6070,56 @@ fn a_committed_promotion_reaches_every_shards_lookup_view() {
   );
 }
 
+/// §4.8, D-14, learners: a learner learns every configuration the council commits, not only those that change the
+/// membership. Do form five members at `f = 1` (three voters, two learners) and let the council commit what a forming
+/// fleet commits (voter changes, each owner's neighbourhood settlement), none of which changes the membership a learner
+/// sees. Expect every member's council configuration to reach the newest any member holds, within the fleet's progress
+/// budget. Found by live-fixes' run of raft-chaos's fresh-member flow (CI diag-live-fixes-21, runs 2 and 6): a learner
+/// held configuration version 12 while the others held 17, reported its neighbourhood settlement 359 times for a
+/// generation the council had moved past, and never settled, since a learner fetched only when its membership view
+/// diverged from its configuration.
+#[test]
+fn a_learner_learns_configurations_that_leave_the_membership_alone() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c", "d", "e"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 1);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let mut versions: Vec<Result<(u64, u64), ObserveError>> = Vec::new();
+  let caught_up = poll_until(&observed, formation_deadline(), || {
+    versions = daemons.iter().map(Daemon::configuration_versions).collect();
+    let councils: Vec<u64> = versions
+      .iter()
+      .filter_map(|version| version.as_ref().ok().map(|(_, council)| *council))
+      .collect();
+    let newest = councils.iter().copied().max().unwrap_or(0);
+    Ok(
+      councils.len() == daemons.len()
+        && newest > 0
+        && councils.iter().all(|council| *council == newest),
+    )
+  });
+  let voters = daemons[0].council_voters();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    caught_up,
+    "every member's council reached the newest configuration (installed, council) per member: {versions:?}; voters \
+     {voters:?}"
+  );
+}
+
 /// AC (§4.8, D-14, learners): the council votes with a **small** set — the members up to the candidate floor
 /// `2f + 1` — and the rest are **learners** that do not vote but fetch the committed configuration over the
 /// transport. Five members at `f = 1` gives three voters and two learners. A learner never leads; and when
