@@ -2324,6 +2324,10 @@ pub enum AttachRequest {
     /// The drive letter and its colon (`S:`).
     mount_point: String,
   },
+  /// A CLI attachment (§4.7, A-230): the record form, made by a process that exits for later processes to name. It
+  /// outlives its client for a term, the failover SLO as the write lease's, renewed by every verb that names it, and
+  /// ends at the term's lapse; a verb naming it after is refused `AttachmentExpired`. Appended.
+  Termed,
 }
 
 impl AttachRequest {
@@ -2928,6 +2932,25 @@ pub enum Refusal {
     path: String,
     /// What the daemon was asked to use it as.
     used_as: OwnMountUse,
+  },
+  /// A verb named a CLI attachment whose term lapsed (§4.7, A-230): it ended then, its write lease with it, and is
+  /// named here rather than as unknown, so a user who paused past the term learns why. Attach again. Appended.
+  AttachmentExpired {
+    /// The attachment.
+    attachment: u64,
+  },
+  /// A client named an id its session key does not prove (§4.9; `slates_server::session_key`): the seat and the
+  /// completion records under that id belong to the client it was issued to, so nothing is served on this channel,
+  /// which the daemon then ends. A client resumes only the session it was handed (`Session`, with its key). Appended.
+  SessionUnproven,
+  /// A durable table of the partition the verb records into is at its derived capacity (§4.8; CLAUDE.md banned item
+  /// 8): `green_chains`, the merge byte budget a partition's green chains, origins, checkpoints and work logs share,
+  /// when what live readers still hold below their greens' checkpoints fills it. Nothing was recorded. Until 2026-11-06
+  /// (A-238) it reached the client as `BadRequest { reason: "<table> at capacity" }`, as if the request were
+  /// malformed. Appended.
+  TableAtCapacity {
+    /// The table.
+    table: String,
   },
 }
 

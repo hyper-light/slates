@@ -10,9 +10,10 @@ use crate::layout::{
   AT_GENERATION, AT_GEOMETRY, AT_IDENTITY, AT_MAGIC, AT_TOTAL, AT_VERSION, GEOMETRY_BYTES,
   Geometry, HEADER_BYTES, IDENTITY_BYTES, ISSUER_SECRET_BYTES, LAYOUT_VERSION, MAGIC,
   PAYLOAD_BYTES, PAYLOAD_GENERATION, PAYLOAD_LEN, RING_CAPACITY, RING_HEAD, RING_SEQ_BASE,
-  RING_TAIL, RegionKind, RegionSpec, SEAL_ROOT_ID_BYTES, SEAL_ROOT_KEY_BYTES, SUP_GENERATION,
-  SUP_HEARTBEAT, SUP_HOLD_REFUSALS, SUP_ISSUER, SUP_LOG_REFUSALS, SUP_PID, SUP_RESTARTS,
-  SUP_SEAL_PRESENT, SUP_SEAL_ROOT, SUP_STARTED, SUP_STATE, SUP_STOP, SUP_STOP_BY, State,
+  RING_TAIL, RegionKind, RegionSpec, SEAL_ROOT_ID_BYTES, SEAL_ROOT_KEY_BYTES, SESSION_SECRET_BYTES,
+  SUP_GENERATION, SUP_HEARTBEAT, SUP_HOLD_REFUSALS, SUP_ISSUER, SUP_LOG_REFUSALS, SUP_PID,
+  SUP_RESTARTS, SUP_SEAL_PRESENT, SUP_SEAL_ROOT, SUP_SESSION_PRESENT, SUP_SESSION_SECRET,
+  SUP_STARTED, SUP_STATE, SUP_STOP, SUP_STOP_BY, State,
 };
 
 /// The node's sealing root as the anchor holds it (A-92): its key id and its key bytes.
@@ -75,6 +76,14 @@ fn segment_words(geometry: &Geometry) -> Words {
         .with(WordRun::one(
           at.saturating_add(SUP_LOG_REFUSALS),
           Width::U64,
+        ))
+        .with(WordRun::one(
+          at.saturating_add(SUP_SESSION_PRESENT),
+          Width::U64,
+        ))
+        .with(WordRun::racy(
+          at.saturating_add(SUP_SESSION_SECRET),
+          SESSION_SECRET_BYTES,
         )),
       // The content pool's owner words (A-98), each claimed by compare-and-swap.
       RegionKind::Pool => words.with(WordRun::strided(
@@ -584,6 +593,46 @@ impl AnchorSegment {
         .object
         .lock_range(range.start, range.end.saturating_sub(range.start))?,
     )
+  }
+
+  /// Publishes the node's client session secret (`layout::SUP_SESSION_PRESENT`): the secret, then the published word,
+  /// released after it, so a reader that sees the word sees the whole secret. One daemon runs under an anchor at a
+  /// time, so there is one writer, and it publishes only where it found none.
+  pub fn publish_session_secret(
+    &mut self,
+    secret: &[u8; SESSION_SECRET_BYTES],
+  ) -> Result<(), AnchorError> {
+    let at = self.region_span(
+      RegionKind::Supervision,
+      SUP_SESSION_SECRET,
+      SESSION_SECRET_BYTES,
+    )?;
+    self.object.write_racy(at, secret)?;
+    let spec = self.spec(RegionKind::Supervision)?;
+    self
+      .word_at(spec, SUP_SESSION_PRESENT)?
+      .store(1, Ordering::Release);
+    Ok(())
+  }
+
+  /// The node's client session secret, if a daemon under this anchor has published one.
+  pub fn session_secret(&self) -> Result<Option<[u8; SESSION_SECRET_BYTES]>, AnchorError> {
+    let spec = self.spec(RegionKind::Supervision)?;
+    if self
+      .word_at(spec, SUP_SESSION_PRESENT)?
+      .load(Ordering::Acquire)
+      != 1
+    {
+      return Ok(None);
+    }
+    let at = self.region_span(
+      RegionKind::Supervision,
+      SUP_SESSION_SECRET,
+      SESSION_SECRET_BYTES,
+    )?;
+    let mut secret = [0u8; SESSION_SECRET_BYTES];
+    self.object.read_racy(at, &mut secret)?;
+    Ok(Some(secret))
   }
 
   /// Publishes the node's sealing root (A-92): its key id and bytes, then the published word, released after

@@ -161,10 +161,10 @@ struct Agent {
   resolutions: usize,
   /// The request in flight: its word, its send instant and its kind.
   inflight: Option<(u64, u64, Kind)>,
-  /// A request the daemon refused retryable under its own id (`Overloaded`, `OwnerUnreachable`, `Unpublished`,
-  /// `ContentUnavailable`), to send again under that word: its word, its first send's instant and its kind. The verb may
-  /// have run (a forwarded submit waiting on the fleet commit is answered `Overloaded` while its acceptance commits),
-  /// and only the same id meets its completion record.
+  /// A request the daemon refused retryable under its own id (`Overloaded`, `OwnerUnreachable`, `Unpublished`), to
+  /// send again under that word: its word, its first send's instant and its kind. The verb may have run (a forwarded
+  /// submit waiting on the fleet commit is answered `Overloaded` while its acceptance commits), and only the same id
+  /// meets its completion record; the client keeps its acknowledgement below the id until the resend.
   retry: Option<(u64, u64, Kind)>,
 }
 
@@ -184,6 +184,8 @@ struct Tally {
   max_outage_ns: u64,
   /// Requests the daemon refused retryable under their own id and the client sent again under it.
   retried: u64,
+  /// Requests the daemon refused `LeaseUnconfirmed` (not run) and the client sent again as new.
+  unconfirmed: u64,
   /// Requests the daemon refused `AcknowledgementOwed` and the client sent again: the multiplexed connection's
   /// backpressure while an older request of the connection is still awaited (its acknowledgement cannot pass it).
   backpressure: u64,
@@ -536,6 +538,13 @@ impl Agent {
       tally.backpressure += 1;
       return;
     }
+    // `LeaseUnconfirmed` refuses before the verb runs, a write too (§4.8 "Leases and reads"): the owner's lease
+    // was not confirmed within its bound, and the protocol says to retry after it. Sent again as new, never under
+    // its own id, whose recorded refusal would only answer the same.
+    if matches!(refusal, Refusal::LeaseUnconfirmed { .. }) {
+      tally.unconfirmed += 1;
+      return;
+    }
     // A request the daemon could not read is named in full: its reason says which part of the slot was wrong.
     if matches!(refusal, Refusal::BadRequest { .. }) {
       return self.give_up(tally, &format!("{kind:?}: {refusal:?}"));
@@ -673,14 +682,13 @@ fn keep_works() -> bool {
 const NS_PER_US: u64 = 1_000;
 
 /// Whether `refusal` is one the protocol marks retryable under the request's own id: the verb was not run, or ran and
-/// its completion record answers the same id once it is durable (§4.8, §4.9).
+/// its completion record answers the same id once it is durable (§4.8, §4.9). Not `ContentUnavailable`: the verb
+/// recorded it as its completion (a fenced green, unreadable content), so a resend under the id only meets it again;
+/// 12596890 resent it until its budget ran out.
 fn retryable_under_its_id(refusal: &Refusal) -> bool {
   matches!(
     refusal,
-    Refusal::Overloaded { .. }
-      | Refusal::OwnerUnreachable { .. }
-      | Refusal::Unpublished { .. }
-      | Refusal::ContentUnavailable
+    Refusal::Overloaded { .. } | Refusal::OwnerUnreachable { .. } | Refusal::Unpublished { .. }
   )
 }
 
@@ -892,6 +900,8 @@ impl Worker {
         let waited = now.saturating_sub(sent_ns);
         let budget = conn_reconnect_ns(&self.conns, agent.conn).saturating_mul(reply_patience());
         if waited > budget {
+          // Given up: the client need no longer keep its acknowledgement below the id.
+          self.conns[agent.conn].client.release_retryable(word);
           agent.inflight = Some((word, sent_ns, kind));
           agent.give_up(
             &mut self.tally,
@@ -1202,7 +1212,7 @@ fn report(n: usize, tally: &mut Tally) {
     println!("refusal\t{n}\t{count}\t{why}");
   }
   println!(
-    "harness\t{n}\tstarved\t{}\trebase_conflicts\t{}\tmax_sweep_ns\t{}\tmax_drain_gap_ns\t{}\treconnects\t{}\tresent\t{}\tmax_outage_ns\t{}\tbackpressure\t{}\tretried\t{}",
+    "harness\t{n}\tstarved\t{}\trebase_conflicts\t{}\tmax_sweep_ns\t{}\tmax_drain_gap_ns\t{}\treconnects\t{}\tresent\t{}\tmax_outage_ns\t{}\tbackpressure\t{}\tretried\t{}\tunconfirmed\t{}",
     tally.starved,
     tally.rebase_conflicts,
     tally.max_sweep_ns,
@@ -1211,7 +1221,8 @@ fn report(n: usize, tally: &mut Tally) {
     tally.resent,
     tally.max_outage_ns,
     tally.backpressure,
-    tally.retried
+    tally.retried,
+    tally.unconfirmed
   );
 }
 
@@ -1642,6 +1653,7 @@ fn level(
     total.max_outage_ns = total.max_outage_ns.max(tally.max_outage_ns);
     total.backpressure += tally.backpressure;
     total.retried += tally.retried;
+    total.unconfirmed += tally.unconfirmed;
     total.max_drain_gap_ns = total.max_drain_gap_ns.max(tally.max_drain_gap_ns);
   }
   println!(

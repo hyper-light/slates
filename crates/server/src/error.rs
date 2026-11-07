@@ -42,6 +42,10 @@ pub enum ServerError {
   /// refused. Fail-closed — a daemon with no issuer authority would make every landing un-grantable while
   /// looking healthy — so the daemon does not start; the provider's reason is carried.
   IssuerSecret(String),
+  /// The client session secret could not be minted at the first start under an anchor (`session_key`): the crypto
+  /// provider's secure random refused. Fail-closed: a daemon with no secret could not tell a client resuming its
+  /// session from a stranger naming its id, so it does not start; the provider's reason is carried.
+  SessionSecret(String),
 }
 
 impl fmt::Display for ServerError {
@@ -62,6 +66,9 @@ impl fmt::Display for ServerError {
       ),
       Self::IssuerSecret(reason) => {
         write!(f, "the grant-issuer secret could not be minted: {reason}")
+      }
+      Self::SessionSecret(reason) => {
+        write!(f, "the client session secret could not be minted: {reason}")
       }
     }
   }
@@ -160,8 +167,9 @@ pub fn refusal_of_db(e: &DbError) -> Refusal {
     DbError::StaleLease { current } => Refusal::StaleLease { current: *current },
     DbError::LeaseHeld { epoch } => Refusal::LeaseHeld { epoch: *epoch },
     DbError::StaleCompletion { .. } => Refusal::DuplicateRequest,
-    DbError::Capacity { table } => Refusal::BadRequest {
-      reason: format!("{table} at capacity"),
+    // Typed (A-238): a full table is the partition's bound, not a malformed request.
+    DbError::Capacity { table } => Refusal::TableAtCapacity {
+      table: (*table).to_owned(),
     },
     // Nothing of the verb is durable — the transaction was rolled back (`Unpublished`), or a record
     // could not be appended for want of log space a snapshot did not release (`LogFull` reaching

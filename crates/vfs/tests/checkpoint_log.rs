@@ -307,6 +307,20 @@ fn a_streamed_shard_delta_equals_the_shard_delta_and_recovers() {
       results: b"remove".to_vec(),
     },
   ];
+  // A held connection's byte states (A-231), carried whole when they changed.
+  let nfs_states = vec![slates_vfs::recover::HeldNfsStates {
+    connection: 2,
+    volume: [5; 16],
+    files: vec![slates_vfs::recover::CarriedFile {
+      ino: 7,
+      lost: false,
+      ranges: vec![slates_vfs::recover::CarriedRange {
+        start: 0,
+        end: u64::MAX,
+        byte: slates_vfs::recover::CarriedByte::Unknown,
+      }],
+    }],
+  }];
   ShardDelta::encode_finish(
     &mut streamed,
     at,
@@ -315,7 +329,10 @@ fn a_streamed_shard_delta_equals_the_shard_delta_and_recovers() {
     Some(&held),
     Some(&replies),
     (&mut calls.clone(), &mut calls_removed.clone()),
-    Some(&mut nfs_replies.clone()),
+    (
+      Some(&mut nfs_replies.clone()),
+      Some(&mut nfs_states.clone()),
+    ),
   )
   .unwrap();
   let value = ShardDelta::new(
@@ -334,7 +351,8 @@ fn a_streamed_shard_delta_equals_the_shard_delta_and_recovers() {
     Some(replies),
   )
   .with_calls(calls, calls_removed)
-  .with_nfs_replies(nfs_replies.clone());
+  .with_nfs_replies(nfs_replies.clone())
+  .with_nfs_states(nfs_states.clone());
   assert!(
     matches!(
       value.volumes[0].record,

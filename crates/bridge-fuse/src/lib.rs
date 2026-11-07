@@ -31,6 +31,7 @@ pub mod bridge;
 pub mod channel;
 pub mod coherence;
 pub mod error;
+pub mod guest_writeback;
 pub mod init;
 #[cfg(unix)]
 pub mod mount;

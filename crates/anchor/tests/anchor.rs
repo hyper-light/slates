@@ -423,14 +423,20 @@ fn a_crashing_daemon_is_restarted_until_the_derived_bound_and_the_segment_says_s
   assert_crash_loop_recorded(&supervisor);
 }
 
-/// A-119, supervision never gives up: do supervise a child that beats and exits, under a short window that holds one
-/// restart. Expect the crash loop reported with a restart scheduled a window away, the supervisor backing off until
-/// then (the segment saying `CrashLoop`), the daemon started again once the window passed (the segment `Running`),
-/// and the next crash loop's backoff twice the first. Before A-119 the first crash loop ended supervision for good,
-/// and every hard NFS mount on the daemon hung (2026-10-08, `realworld_chaos.sh` on a loaded host).
+/// A-119, supervision never gives up: do supervise a child that beats and exits at once, under a short window that
+/// holds one restart. Expect the crash loop reported with a restart scheduled a window away, the supervisor backing off
+/// until then (the segment saying `CrashLoop`), the daemon started again once the window passed (the segment
+/// `Running`), and the next crash loop's backoff twice the first. Before A-119 the first crash loop ended supervision for
+/// good, and every hard NFS mount on the daemon hung (2026-10-08, `realworld_chaos.sh` on a loaded host).
+///
+/// The supervisor is driven by the test's own clock, which stands still while a child lives and jumps to each
+/// backoff's end: the claim is about a daemon that exits **at once**, so its life takes no time on that clock however
+/// long the machine takes to run it. On the wall clock, a re-invoked child under eight spinners a CPU outlived the
+/// 300 ms window, so no two exits fell in one window and no crash loop was seen: main failed it 2 of 3 times on this
+/// Mac at 212-238 runnable processes, and once on windows-latest beside two spinners a CPU (diag-liveness-10).
 #[test]
 fn a_crash_loop_is_restarted_after_a_doubling_backoff_never_given_up() {
-  /// Shape: the window and the backoff it starts: short, so the test waits two of them.
+  /// Shape: the window and the backoff it starts.
   const WINDOW_NS: u64 = 300_000_000;
   let segment = AnchorSegment::create(
     &unique_name("slates-anchor-test-backoff"),
@@ -456,24 +462,34 @@ fn a_crash_loop_is_restarted_after_a_doubling_backoff_never_given_up() {
     std::env::set_var(CHILD_BEATS, BEATS.to_string());
     std::env::set_var(CHILD_EXIT, EXIT.to_string());
   }
-  let clock = Instant::now();
-  supervisor.start(now_ns(clock)).unwrap();
+  // The test's clock starts one window in, so no difference the supervisor takes reaches below its zero.
+  let mut now = WINDOW_NS;
+  supervisor.start(now).unwrap();
   let mut backoffs = Vec::new();
   let mut backed_off_in_crash_loop = false;
   let mut restarted_after_backoff = false;
-  let deadline = Duration::from_millis(CHILD_WAIT_MS);
-  while clock.elapsed() < deadline && backoffs.len() < 2 {
-    match supervisor.step(now_ns(clock)).unwrap() {
+  // A child that never exits ends the test: each child gets the wait a child gets to attach and beat, on the wall.
+  let life = Duration::from_millis(CHILD_WAIT_MS);
+  let mut child_began = Instant::now();
+  while backoffs.len() < 2 {
+    assert!(
+      child_began.elapsed() < life,
+      "a child neither exited nor was restarted within {life:?}"
+    );
+    match supervisor.step(now).unwrap() {
       Step::CrashLoop { retry_in_ns, .. } => backoffs.push(retry_in_ns),
-      Step::BackingOff { .. } => {
+      Step::BackingOff { retry_at_ns } => {
         backed_off_in_crash_loop |=
           supervisor.segment().supervision().unwrap().state() == State::CrashLoop;
+        now = retry_at_ns;
       }
       Step::Restarted { .. } if !backoffs.is_empty() => {
         restarted_after_backoff |=
           supervisor.segment().supervision().unwrap().state() == State::Running;
+        child_began = Instant::now();
       }
-      Step::Running | Step::Restarted { .. } => {}
+      Step::Restarted { .. } => child_began = Instant::now(),
+      Step::Running => {}
       Step::Stopped => panic!("stopped without being asked"),
     }
     // The test harness paces the poll; shipped code parks on its driver (D-9).
@@ -1212,5 +1228,86 @@ fn every_bad_device_message_is_counted_and_the_log_says_each_kind_once() {
     stderr.matches(DEVICE_REFUSAL_LINE).count(),
     BAD_DEVICE_KINDS,
     "one line per kind: {stderr}"
+  );
+}
+
+/// Format: the role of [`tearing_child`]: set, the child is it.
+const CHILD_TEAR: &str = "SLATES_ANCHOR_TEST_TEAR";
+/// Format: the exit of a [`tearing_child`] that left the profile's publication unfinished, as a daemon the anchor
+/// killed inside its `publish` leaves it.
+const TORE: i32 = 21;
+/// Format: the exit of one that read the anchor's profile whole.
+const READ_WHOLE: i32 = 0;
+/// Format: the exit of one refused the profile, the daemon's own exit for a refused start.
+const REFUSED: i32 = 4;
+/// Format: the profile the test's anchor publishes.
+const PROFILE: &[u8] = b"{\"the anchor's profile\":1}";
+
+/// The child [`a_daemon_killed_mid_publication_leaves_its_successor_the_anchors_profile`] supervises. Its first start
+/// does what a daemon's `publish` does first, making the profile's generation odd, and exits there, as a daemon the
+/// anchor kills inside it does; a later start reads the profile as a daemon does at its start.
+#[test]
+#[ignore = "the tearing child; run by a_daemon_killed_mid_publication_leaves_its_successor_the_anchors_profile"]
+fn tearing_child() {
+  if std::env::var_os(CHILD_TEAR).is_none() {
+    return;
+  }
+  let segment = AnchorSegment::attach_from_env(&identity()).unwrap();
+  if segment.supervision().unwrap().restarts() == 0 {
+    segment
+      .payload_generation(RegionKind::Profile)
+      .unwrap()
+      .fetch_or(1, Ordering::AcqRel);
+    std::process::exit(TORE);
+  }
+  match segment.read_published(RegionKind::Profile) {
+    Ok(Some(profile)) if profile == PROFILE => std::process::exit(READ_WHOLE),
+    _ => std::process::exit(REFUSED),
+  }
+}
+
+/// §4.14, A-119. Do: publish a profile as `slates anchor` does, and supervise a child whose first start leaves the
+/// profile's publication unfinished and exits, as a daemon killed inside its own republication of the profile does.
+/// Expect its successor to read the anchor's profile whole. Before, the successor was refused it
+/// (`PublicationInProgress`, "a payload publication is unfinished") and exited 4, and so did every daemon after it:
+/// only the anchor's first publication ever wrote the region again. Under two spinners a core the anchor killed two
+/// starting daemons in a row at its recovery budget, and the third exited 4 into a crash loop that failed
+/// `slates_run_spawns_the_command_as_an_ephemeral_consumer` (1 of 10 runs, an 18-core Mac, 2026-11-07).
+#[test]
+fn a_daemon_killed_mid_publication_leaves_its_successor_the_anchors_profile() {
+  let mut segment = AnchorSegment::create(
+    &unique_name("slates-anchor-test-tear"),
+    &identity(),
+    geometry(),
+  )
+  .unwrap();
+  segment.publish(RegionKind::Profile, PROFILE).unwrap();
+  let args = ["--ignored", "--exact", "tearing_child", "--nocapture"].map(str::to_owned);
+  // Shape: a window long enough to hold every restart of this test.
+  let policy = RestartPolicy {
+    window_ns: 60_000_000_000,
+    max_restarts: 3,
+  };
+  let mut supervisor = Supervisor::new(segment, &args, policy).unwrap();
+  supervisor.hold_environment(CHILD_TEAR, "1".to_owned());
+  let clock = Instant::now();
+  supervisor.start(now_ns(clock)).unwrap();
+  let mut exits = Vec::new();
+  while exits.len() < 2 && clock.elapsed() < Duration::from_millis(CHILD_WAIT_MS) {
+    match supervisor.step(now_ns(clock)).unwrap() {
+      Step::Restarted { exit_code, .. } => exits.push(exit_code),
+      Step::Running => {
+        // The test harness paces the poll; shipped code parks on its driver (D-9).
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(Duration::from_micros(POLL_US));
+      }
+      other => panic!("the supervisor stepped to {other:?}"),
+    }
+  }
+  assert_eq!(
+    exits,
+    vec![Some(TORE), Some(READ_WHOLE)],
+    "the child after the one that left the publication unfinished read the anchor's profile whole (exit {READ_WHOLE}, \
+     not {REFUSED})"
   );
 }

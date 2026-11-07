@@ -626,6 +626,9 @@ struct Requester {
   /// holds, and its READs and own changes keep that current (`crate::nfs_writeback`). `None` for an NFSv4 operation's
   /// call, which its own delegations keep coherent.
   connection: Option<u64>,
+  /// The connection was handed to this daemon by its anchor at its start, held for a daemon before it (A-231): its client
+  /// may hold pages fetched before the takeover, which its WRITEs are judged against conservatively.
+  inherited: bool,
 }
 
 impl Requester {
@@ -644,6 +647,7 @@ impl Requester {
         call: None,
         held: None,
         connection: None,
+        inherited: false,
       },
       None => Requester::root(),
     }
@@ -662,6 +666,7 @@ impl Requester {
       call: None,
       held: None,
       connection: None,
+      inherited: false,
     }
   }
 
@@ -702,6 +707,61 @@ fn route(program: u32, procedure: u32, args: &[u8]) -> Option<u16> {
     s.shards.get(usize::from(owner_partition)).copied()
   })
   .flatten()
+}
+
+/// [`route`], with a call that names a volume by its mount name (a root `LOOKUP`, a `MNT`, a `UMNT`) asked of the
+/// name's partition first (A-236): that partition holds the name, as a volume of its own or as an alias of a clone
+/// another partition holds beside its origin, and says which partition serves it.
+async fn routed(this: u16, program: u32, procedure: u32, args: &[u8]) -> Option<u16> {
+  let Some(name) = root_mount_name(program, procedure, args) else {
+    return route(program, procedure, args);
+  };
+  let (name_partition, name_shard, here) = state::with_state(|s| {
+    let partition = owner_of_name(&name, s.shards.len());
+    (
+      partition,
+      s.shards.get(usize::from(partition)).copied(),
+      partition == s.partition,
+    )
+  })?;
+  let served = if here {
+    state::with_state(|s| served_partition(s, &name))?
+  } else {
+    let name_shard = name_shard?;
+    crate::xshard::call_within(
+      this,
+      name_shard,
+      move |s| served_partition(s, &name),
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await
+    // Unanswered, the call goes to the name's own shard, as it did before aliases: a clone's name then misses there.
+    .unwrap_or(name_partition)
+  };
+  state::with_state(|s| {
+    if served == s.partition {
+      return None;
+    }
+    s.shards.get(usize::from(served)).copied()
+  })
+  .flatten()
+}
+
+/// The partition that serves the volume `name` names, as its name's partition (this one) holds it (A-236): this one
+/// when it holds a volume of that name or nothing for it (a lookup then misses here), the clone's when a confirmed
+/// alias names one. A reserved alias resolves nothing until confirmed, so a lookup of it misses here, by kind.
+fn served_partition(s: &mut ShardState, name: &str) -> u16 {
+  let partition = s.db.partition();
+  if partition.volume_by_name(name).is_none()
+    && let Some(volume) = partition
+      .name_alias(name)
+      .and_then(slates_db::alias::resolve)
+  {
+    return owner_of(slates_ipc::protocol::VolumeId {
+      bytes: volume.bytes,
+    });
+  }
+  s.partition
 }
 
 /// The shard for the partition that owns `name` (`owner_of_name` over `state.shards.len()`, the same
@@ -1099,7 +1159,9 @@ fn serve_local(
     let fetched = (program == NFS_PROGRAM && procedure == NFSPROC3_READ)
       .then(|| read_range(args, &result.1))
       .flatten();
+    let (held, inherited) = (requester.held.is_some(), requester.inherited);
     let _ = state::with_state_counted(|s| {
+      crate::nfs_writeback::note_connection(s, connection, held, inherited);
       crate::nfs_writeback::made(s, connection, volume, before);
       if let Some((ino, range)) = fetched {
         crate::nfs_writeback::fetched(s, connection, (volume, ino), range);
@@ -1132,7 +1194,9 @@ fn stale_write_back(
   let _count = reader.u32().ok()?;
   let _stable = reader.u32().ok()?;
   let data = reader.opaque(MAX_MESSAGE).ok()?;
+  let (held, inherited) = (requester.held.is_some(), requester.inherited);
   let verdict = state::with_state(|s| {
+    crate::nfs_writeback::note_connection(s, connection, held, inherited);
     crate::nfs_writeback::judge(s, connection, (handle.volume, handle.inode), at, data)
   })?;
   if verdict == crate::nfs_writeback::Verdict::Apply {
@@ -1507,7 +1571,7 @@ async fn serve_v3(
   }
   let started = slates_machine::clock::monotonic_ns();
   let started_cpu = thread_cpu_ns();
-  let (forwarded, served) = match route(program, procedure, &args) {
+  let (forwarded, served) = match routed(this, program, procedure, &args).await {
     Some(owner) => (
       true,
       serve_remote(owner, this, requester, xid, program, procedure, args, port).await,
@@ -2426,7 +2490,7 @@ pub(crate) async fn reply_to_message(
   if keeps_states(&call) {
     footprint.note(route(call.program, call.procedure, call.args()).unwrap_or(this));
   }
-  reply_to(this, call, port, (None, footprint.connection())).await
+  reply_to(this, call, port, (None, footprint.connection(), false)).await
 }
 
 /// The RPC reply for one call, framed as one record ([`reply_record`]). An NFSv4 call goes to the v4 front end, which presents a
@@ -2439,7 +2503,7 @@ async fn reply_to(
   this: u16,
   mut call: Call,
   port: u16,
-  (held, connection): (Option<u64>, u64),
+  (held, connection, inherited): (Option<u64>, u64, bool),
 ) -> Vec<u8> {
   if call.program == NFS_PROGRAM && call.version == NFS_V4 {
     return reply_v4(this, call, port).await;
@@ -2458,6 +2522,7 @@ async fn reply_to(
     std::mem::replace(&mut call.requester, Requester::root()).with_capability(capability);
   requester.held = held;
   requester.connection = Some(connection);
+  requester.inherited = inherited;
   let (xid, program, version, procedure) = (call.xid, call.program, call.version, call.procedure);
   reply_for(
     this,
@@ -2632,7 +2697,9 @@ pub(crate) fn adopt_held(
       continue;
     }
     note(NFS_CONNECTIONS_ADOPTED);
-    spawn_connection(Connection::new(stream, port, Some(connection)));
+    let mut adopted = Connection::new(stream, port, Some(connection));
+    adopted.inherited = true;
+    spawn_connection(adopted);
   }
 }
 
@@ -2674,6 +2741,8 @@ struct Connection {
   carry: Option<(SessionId, DepartedSession)>,
   /// The connection's id while the anchor holds it.
   held: Option<u64>,
+  /// Handed to this daemon by its anchor at its start (A-231; `Requester::inherited`).
+  inherited: bool,
   /// The receive low-water mark last set, so it is set only when it changes (0: not known on this shard).
   #[cfg(unix)]
   wanted: usize,
@@ -2693,6 +2762,7 @@ impl Connection {
       home: registry::current_shard().unwrap_or(0),
       carry: None,
       held,
+      inherited: false,
       #[cfg(unix)]
       wanted: 0,
       #[cfg(windows)]
@@ -3094,7 +3164,7 @@ async fn serve_turn(
         this,
         call,
         connection.port,
-        (connection.held, connection.id),
+        (connection.held, connection.id, connection.inherited),
       )
       .await
     };
@@ -3363,6 +3433,7 @@ fn migrate(owner: u16, connection: Connection) {
     home,
     carry,
     held,
+    inherited,
     #[cfg(windows)]
     inbox,
     ..
@@ -3392,6 +3463,7 @@ fn migrate(owner: u16, connection: Connection) {
         home,
         carry: None,
         held,
+        inherited,
         #[cfg(unix)]
         wanted: 0,
         // The requests read here and not yet answered, the call that moved the connection among them, go with it.

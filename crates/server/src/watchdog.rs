@@ -23,7 +23,10 @@
 //! debt in GAPS. A-228 adds no number to it. While every shard is alive and the control loop lives, the thread beats; once
 //! a shard is stuck it logs what it saw and withholds the beat, and the anchor, which judges the beat's age by its own
 //! measured lateness, kills the daemon. When the control loop ends (a refused boot, A-100), the thread withholds the
-//! beat too, so the anchor restarts the daemon as before. Under Miri, which has no thread clock, the wall window stands
+//! beat too, so the anchor restarts the daemon as before. A stop tells the thread first ([`Watchdog::stopping`]), since
+//! the shutdown ends the control loop before it stops the thread: a control loop that ends then is the stop's, and is
+//! not announced as one to restart (under two spinners a core, 8 of 18 daemons stopped in one `nfs_hostile` run said
+//! so before, an 18-core Mac, 2026-11-07). Under Miri, which has no thread clock, the wall window stands
 //! alone, as it does for observations.
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
@@ -72,6 +75,14 @@ impl Watchdog {
       stop: Some(stop),
       handle: Some(handle),
     })
+  }
+
+  /// Tells the thread the daemon is stopping, before the shutdown ends the control loop, so that end is not announced
+  /// as one the anchor restarts. The thread beats on as before until [`Watchdog::stop`].
+  pub fn stopping(&self) {
+    if let Some(stop) = self.stop.as_ref() {
+      let _ = stop.send(());
+    }
   }
 
   /// Stops the thread and joins it.
@@ -205,16 +216,21 @@ fn run(
   let mut watches = vec![ShardWatch::default(); holders.len()];
   let mut reported = vec![false; holders.len()];
   let mut control_ended = false;
+  let mut stopping = false;
   loop {
     match stop.recv_timeout(std::time::Duration::from_nanos(HEARTBEAT_NS)) {
       Err(RecvTimeoutError::Timeout) => {}
-      Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+      // The daemon is stopping: the control loop's end that follows is the stop's.
+      Ok(()) => stopping = true,
+      Err(RecvTimeoutError::Disconnected) => return,
     }
     if !control_ended && matches!(control.try_recv(), Err(TryRecvError::Disconnected)) {
       control_ended = true;
-      slates_machine::log_line!(
-        "slates daemon: the control loop ended; the watchdog withholds the beat so the anchor restarts the daemon"
-      );
+      if !stopping {
+        slates_machine::log_line!(
+          "slates daemon: the control loop ended; the watchdog withholds the beat so the anchor restarts the daemon"
+        );
+      }
     }
     let now = clock.monotonic_ns();
     let mut all_alive = true;
