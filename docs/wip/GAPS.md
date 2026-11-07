@@ -1072,6 +1072,16 @@
     acknowledged, every volume taken over whole at epoch 2 (unshaped 2.5 s, wan and wan-loss 16.9 s, ceiling 57.2 s).
   - Process red-check, CI, 13 runs a side: the mutation (counting the current placement) left a holder at fence 1 in 4.
     A-240 left none, and lost no write.
+  - **The stack's evidence (CI, 2026-11-07, three-way tree with live-durability's lanes, diag-24).** KIND passed all
+    four profiles end to end, every volume taken over whole at epoch 2: unshaped 1,000 writes, p99 1.2 ms, 2.5 s;
+    wan 300, p99 423 ms, 17.7 s; wan-loss 300, p99 407 ms, 18.8 s; ceiling 50, p50 1.55 s, 52.6 s. The five-node flow
+    passed 7 of 8 with no fence or NoLoss violation, judged on the successor's recorded holders; in its decisive run
+    phase one waited 28 times for the stopped holder, then took the volume over whole. The eighth was the open register
+    stall (`fleet.takeover.lost`, live-fixes).
+  - Open (live-fixes): a node replaced at the same machine anchor (same certificate) never answers a live write. Its
+    neighbours keep the old node's pair key and refuse the new one (`fleet.seal.pair_refused` 789 of 793 served, the
+    owner `pair_undelivered` 1,580), so the whole entry never carries their keys (`held_back.keys` 394). Before the
+    answering gate such writes were answered and could not be served at a takeover (`takeover_refused.open`).
   - **Fixed (2026-11-07): a holder set of 2f+1 under an f-count.** Once the shipper follows the placement, a set can
     have 2f+1 members (the placement moved off the owner: CI diag-20 run 7 recorded e, c, b at f = 1). The shipper
     counted a write durable at f of a set while phase one counts f+1, and 1 + 2 = |H|: the successor counted itself and
