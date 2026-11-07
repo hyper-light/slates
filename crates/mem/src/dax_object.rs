@@ -1871,6 +1871,8 @@ mod imp {
   struct SectionView {
     address: usize,
     len: usize,
+    /// The view's exclusion from crash dumps (A-231): a copy holds a file's bytes.
+    excluded: crate::dump_exclusion::DumpExclusion,
   }
 
   impl SectionView {
@@ -1898,8 +1900,15 @@ mod imp {
         return Err(os("MapViewOfFile"));
       }
       let address = view.Value.expose_provenance();
+      let excluded = |len: usize| {
+        crate::dump_exclusion::DumpExclusion::exclude(view.Value.cast::<u8>().cast_const(), len)
+      };
       if len > 0 {
-        return Ok(SectionView { address, len });
+        return Ok(SectionView {
+          address,
+          len,
+          excluded: excluded(len),
+        });
       }
       let mut region = MEMORY_BASIC_INFORMATION::default();
       // SAFETY: asks about the view just made; the answer is written to a local of the size passed.
@@ -1913,6 +1922,7 @@ mod imp {
       let mapped = SectionView {
         address,
         len: region.RegionSize,
+        excluded: excluded(region.RegionSize),
       };
       if answered == 0 {
         return Err(os("VirtualQuery"));
@@ -1923,6 +1933,8 @@ mod imp {
 
   impl Drop for SectionView {
     fn drop(&mut self) {
+      // Unregistered before the unmap, so no view another thread maps at this address meanwhile loses its own.
+      self.excluded.release();
       // SAFETY: the view this value mapped and alone holds; nothing reaches it after the drop.
       unsafe {
         UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {

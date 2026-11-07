@@ -1971,7 +1971,7 @@ pub fn gather_daemon_status(
 /// text form's per-shard lines and this are one definition). A shard whose drain was not gathered
 /// carries `"telemetry": null`.
 pub fn daemon_json(r: &DaemonReport, telemetry: &[TelemetryReport]) -> Value {
-  json!({
+  let mut report = json!({
     "pid": r.pid,
     "generation": r.generation,
     "restarts": r.restarts,
@@ -2044,7 +2044,12 @@ pub fn daemon_json(r: &DaemonReport, telemetry: &[TelemetryReport]) -> Value {
         "path_mtu": session.path_mtu,
       })).collect::<Vec<_>>(),
     },
-  })
+  });
+  // Inserted after: one more key in the literal passes `json!`'s macro recursion limit.
+  if let Some(fields) = report.as_object_mut() {
+    fields.insert("dumps_unexcluded".to_owned(), json!(r.dumps_unexcluded));
+  }
+  report
 }
 
 /// The takeover block of the fleet status as JSON (§4.8): this node's settled and current neighbourhood

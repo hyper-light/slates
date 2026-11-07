@@ -524,6 +524,23 @@ jobs:
       # BlobNotFound), and one step running five binaries could not say which hung. A step compiles one
       # crate's tests and runs them; clippy of every crate here took 23-66 s over four runs (2026-09-25),
       # so fifteen minutes is over ten times the slowest measured build, and a hang is cut with its log.
+      # A-231 (GAPS 8a-win-dumps): a crashed child's WER dump carries none of the private mappings. WER writes a full dump
+      # only where `LocalDumps` says (a machine setting on this throwaway runner, made with the OS's own registry
+      # provider); the test reads the folder from `SLATES_WER_DUMP_DIR` and skips loudly without it.
+      - name: Have WER write full crash dumps (LocalDumps)
+        run: |
+          $dumps = Join-Path $env:RUNNER_TEMP 'wer-dumps'
+          New-Item -ItemType Directory -Force -Path $dumps | Out-Null
+          $key = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps'
+          New-Item -Force -Path $key | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpFolder -PropertyType ExpandString -Value $dumps | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpType -PropertyType DWord -Value 2 | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpCount -PropertyType DWord -Value 10 | Out-Null
+          "SLATES_WER_DUMP_DIR=$dumps" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Test that a crash dump leaves out the private mappings (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-server --test dump_exclusion -- --nocapture
       - name: Test the Win32 shared memory (native Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 15
