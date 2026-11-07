@@ -36,3 +36,23 @@ fleet_peers_probed: 1
 shard 0 refused fleet.plane.epoch_refused: 405
 shard 0 refused fleet.plane.epoch_refused.install: 405
 shard 0 refused fleet.plane.member_returned: 392
+=== neither 3 exit 101 load { 19.26 19.04 13.63 }
+rejoins: successor daemon 21613 answered after 66.715958ms
+rejoins --- chaos-rejoins-a-21286
+thread 'a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet' (46377) panicked at crates/cli/tests/live_chaos.rs:2451:7:
+the fleet re-formed after the successor: [Some(("6908594352638895190", 2, 1)), Some(("11842323577962073855", 3, 0)), Some(("5996868093669514481", 2, 1))]
+fleet_host: 6908594352638895190
+fleet_peers_probed: 1
+shard 0 refused fleet.link.invalid.believed_dead: 1
+shard 0 refused fleet.plane.epoch_refused: 413
+shard 0 refused fleet.plane.epoch_refused.install: 413
+shard 0 refused fleet.plane.member_returned: 393
+fleet_host: 11842323577962073855
+fleet_peers_probed: 0
+shard 0 refused fleet.plane.epoch_refused: 827
+shard 0 refused fleet.plane.epoch_refused.answer: 827
+fleet_host: 5996868093669514481
+fleet_peers_probed: 1
+shard 0 refused fleet.plane.epoch_refused: 414
+shard 0 refused fleet.plane.epoch_refused.install: 414
+shard 0 refused fleet.plane.member_returned: 394
