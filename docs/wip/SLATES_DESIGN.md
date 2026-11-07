@@ -1606,7 +1606,10 @@ metadata provisioning path, not arbitrary host pathname resolution. A scratch vo
   client of its own (the verb wakes the owner's serve rounds; the reaper's cadence retries a refused
   record) — release quota, tombstone; the base directory is untouched. In a fleet the tombstone is the
   volume's final register value, shipped to every candidate holder and retired once all hold it (§4.10
-  status, AUD-29-43); a takeover adopts it and never re-materializes the volume. A volume being destroyed is left
+  status, AUD-29-43); a takeover adopts it and never re-materializes the volume. The destroy is answered only once
+  its tombstone is placed at `f + 1` (at once on a laptop): answered before, an owner lost at once let a takeover serve
+  the volume again (2026-11-06, `docs/bugs/2026-11-06-a-destroy-was-answered-before-its-tombstone-was-placed.md`). A
+  volume being destroyed is left
   out of the shard's recovery image (its record says Destroying; recovery completes it). Before 2026-09-29
   a destroy forwarded to a shard without a client was never stepped
   (`docs/bugs/2026-09-29-a-destroy-on-a-shard-without-a-client-never-completed.md`).
@@ -5778,7 +5781,9 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > entries since the last whole one within twice the volume's size, and answer with their head (record kinds 22, 23).
 > A publication that cannot become an entry (the credit full, a read or seal refused) leaves the volume owing a whole
 > record, which the next publication or the record period appends. `status` reports each live log
-> (`shard N live shipping|held VOLUME head= durable= owed=`). Across three real daemon processes
+> (`shard N live shipping|held VOLUME head= durable= owed= epoch= identity= fence=`: since 2026-11-06 the head's epoch
+> and chain identity and the copy's fence too, so a chaos run checks Agreement and fencing from outside the processes,
+> `crates/cli/tests/live_chaos.rs`). Across three real daemon processes
 > (`crates/cli/tests/live_fleet.rs`, `SLATES_TEST_CLI=1`), five writes end with the owner durable at its head, nothing
 > owed and both candidates at that head, 4 of 4 runs. Two defects that run found are fixed in the slice: a refusal was
 > re-shipped at once, so a holder that did not hold the volume's catalog yet looped with its owner (982 and 5,501
@@ -5890,6 +5895,38 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > candidate's). Before, the successor counted itself only when it held a copy (a takeover could wait for its quorum for
 > good), and a remote candidate's empty report raised no fence, which the nemesis model shows breaks StaleNeverCommits
 > (10 seeds; bug record `docs/bugs/2026-11-05-a-live-takeover-counted-no-empty-report-and-fenced-no-empty-copy.md`).
+>
+> **A checkpoint ships a live volume's changes, not the volume (2026-11-05).** A live log's whole record copies every
+> byte of the volume; it is owed only when a delta would not apply to what the candidates hold (the log's first record,
+> a holder behind the retained tail, a publication that could not be shipped). A shard's local checkpoint is none of
+> those: it restarts the recovery journal once the deltas reach the size of the shard's metadata, and it had been mapped
+> to a whole record, so one write in three copied the volume (68 of 201 records) and the record behind it was refused
+> for credit (431 of 2,395). Now the checkpoint takes each changed live volume's record as a delta publication does
+> (`verbs::capture_live_changes`) and ships it once the checkpoint commits, for the volumes the checkpoint carried
+> (`live_ship::note_checkpoint`). Held by `a_live_volumes_writes_ship_their_changes_not_the_volume` (red first: 68 whole;
+> after: 1, the log's first). Interleaved with main, the stable-write latency is unchanged (BENCHMARKS "What a
+> checkpoint shipped"); the whole copies and the credit refusals are gone.
+>
+> **A candidate's copy stays within its bound (2026-11-06).** A candidate keeps a whole entry and the entries after it,
+> within twice the volume's size (`live_ship::hold_bound`). With whole records rare, the copies grew to that bound and
+> both candidates refused every entry after it, so no write was durable (at 454 stable 4 KiB writes to a 1 MiB volume:
+> `a_long_writer_keeps_the_candidates_copies_within_their_bound`, red first). The owner now counts what a candidate keeps
+> (`LiveVolume::kept`) and ships whole once that reaches the volume's size (`kept_reaches_size`): the entry that crosses
+> it still fits, since no publication is larger than the volume. After: 768 writes answered, 4 whole records, no
+> refusal for the bound.
+>
+> **Chaos from outside the processes (2026-11-06).** `crates/cli/tests/live_chaos.rs` streams writes through the Rust
+> client while it partitions or kills processes. It ends every flow with Agreement, NoLoss, StaleNeverCommits and
+> Convergence, checked from every node's `status`; each live line now carries its head's epoch and chain identity and
+> its fence.
+> - **The early destroy (fixed).** A destroy was answered before its tombstone was placed, and an owner lost at once let
+>   a takeover serve the volume again. A destroy now answers once its tombstone is region-placed, and never waits on
+>   the live log.
+> - **A write never answered under a partitioned candidate (fixed).** A dispatch on the control shard was dropped at
+>   its deadline and stranded its sessions. A same-shard `xshard::task_within` now runs to its end, as a cross-shard one
+>   does.
+> - **An install never finishing inside an entry's budget (open).** The whole volume, sent to a candidate behind the
+>   retained tail, is resent without end (GAPS "Chaos from outside the processes").
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
@@ -6684,6 +6721,17 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 *Metric names.* One namespace, dotted, unit-suffixed, labels in braces; counters end in `_total`, histograms in `_ns` or `_bytes`. Per host: `slates.requests_total{kind,outcome}`, `slates.refusals_total{kind}`, `slates.provision_ns` (the AC-2.1 histogram: p50, p99, p999, max, spinning and parked), `slates.ring_wait_ns{client}`, `slates.wake_ns`, `slates.spin_to_park_ratio`. Per shard: `slates.shard.step_ns`, `slates.shard.batch`, `slates.shard.parks_total`, `slates.shard.kicks_total`, `slates.shard.arena_exhausted_total`. Per volume (readable through `status`): `referenced_bytes`, `unique_bytes`, `locked_bytes`, `unlocked_bytes`, `hashing_backlog_bytes`, `dedup_hit_ratio`, `compression_ratio`, `lease_epoch`, `attachments`, `base_cache_hit_ratio`, `drifted_entries`, `watcher_state`; per green: `head_version`, `merges_per_s`, `verdict_p99_ns`, `merge_path_p99_ns`, `conflict_rate{source}`, `rebase_retry_rate`, `base_lag_p99_ns`, `stale_epoch_refusals_total`, `holder_mismatch_total`. Per landing (in the report and the audit log): `entries{outcome}`, `bytes_written`, `dir_sync_ns`, `window_ns_max`, `barriers`. The machine profile and every derived constant are exported as `slates.derived{name}` with their inputs.
 
 *Content-freedom.* No metric, span or health signal carries a path, a name or file content; the audit log carries the paths a landing touched and nothing else; a test in the observability crate asserts every emitted label against this rule.
+
+> **Status (2026-11-06, A-228): `daemon.alive` judges a shard in its own CPU time.** The beat's writer is the daemon's
+> watchdog, an owned thread pinned to no core (`crates/server/src/watchdog.rs`), not a task on the control shard. Each
+> beat it judges every shard by A-65's rule (`crate::observe`'s `ShardTime`): a shard that is not parked and has
+> completed no step is stuck once a whole window passes with no CPU progress (wedged: a deadlock, or a host call that
+> never returns) or once it has run a window of CPU (spinning: a task that never yields). A starved shard, given a
+> little CPU at a time, is alive. The watchdog withholds the beat while a shard is stuck or the control loop has ended.
+> The anchor holds the beat to the window plus its own measured lateness p99 over its last 100 timed waits
+> (`crates/cli/src/anchor.rs`, `Lateness`). The window is the existing liveness budget, still a fixed number (GAPS, R3
+> debt). Proven by `crates/server/tests/liveness.rs`: a starved control-shard poll, which gapped the beat 1.53 s on main,
+> keeps it under 0.26 s; a wedged or spinning non-control shard, which main never saw, stops it.
 
 > **Telemetry oracle correction (2026-09-20, AC-0.11).** A drain request itself emits spans.
 > The daemon integration oracle now derives convergence from the reply quota minus the
@@ -13323,6 +13371,33 @@ GAPS, BENCHMARKS ("The spin policy, measured and rejected").
 - **What stays.** Main's macOS spin: a nap of about 15 µs at each driver harvest, busy steps included, which is what
   keeps its tails under load. The decision rests on Ada's rule that p99 under load is the target. The true spin's change
   is kept on record, not landed (`agents/clients-spin`, a75f9213).
+
+### A-228 — A daemon's liveness is judged in its shards' own CPU time, by an owned watchdog thread (accepted and built 2026-11-06)
+Applied in the same change to: §4.14 (its status on `daemon.alive`), `crates/server/src/watchdog.rs` (new),
+`crates/server/src/daemon.rs` (`Daemon::start`, `stop_parts`, `control_loop`, `heartbeat_loop`), `crates/cli/src/anchor.rs`
+(`Lateness`, the lapse bound), GAPS, `docs/bugs/2026-11-06-the-anchor-killed-live-daemons-on-a-busy-machine.md`, and the
+tests named below.
+- **Why.** The beat was a task on the control shard, a pinned thread, and the anchor killed a daemon once its beat was
+  older than a fixed second. Under the A/B bar's two spinners a logical CPU on CI's 4-CPU Windows runners, the control
+  shard ran 2–4 steps in about a second, its longest poll 503–576 ms, and the anchor killed live daemons serving their
+  mounts (diagnostics runs 42161838327, 42130583401, 42080252187; GAPS). And a wedged or spinning shard other than the
+  control shard never stopped the beat, so the anchor could not see it.
+- **The rule.** The competitive question is "starved or hung", and A-65 already answers it for observations: judge a
+  shard in its own CPU time. A shard is alive while it is parked or stepping; with no step, it is stuck once a whole
+  window passes with no CPU progress (wedged) or once it has run a window of CPU (spinning); otherwise it is starved, and
+  alive. The window is the liveness budget. The beat is written by a watchdog thread outside the runtime, owned by the
+  daemon and joined after its shards, which reads the pulse's step count and parking flag and the shard's thread clock
+  (`slates_rt::registry::shard_cpu`; cycles on Windows). It withholds the beat while a shard is stuck or the control loop
+  has ended (A-100's refused boot still restarts the daemon).
+- **The one new bound.** The anchor finds a beat lapsed once it is older than the window plus its own measured lateness
+  p99 (the last 100 timed waits that ran their pause; 100 is the fewest whose p99 is one reading). A machine that starves
+  the watchdog starves the anchor about as much, since neither is pinned.
+- **What it does not change.** `LIVENESS_BUDGET_NS` stays the window, and stays the reply-deadline unit of about 60
+  files: R3 debt, recorded in GAPS as a follow-on.
+- **Tests:** `crates/server/tests/liveness.rs` (starved control-shard poll; wedged and spinning non-control shards; a
+  half-window block not killed; two spinners a core beside the daemon), the rule's unit tests in
+  `crates/server/src/watchdog.rs`, the lateness tests in `crates/cli/src/anchor.rs`, and the real-process frozen-daemon
+  test in `crates/cli/tests/cli.rs`.
 
 ### A-209 — Windows conformance is WinFsp's own two suites over the slates drive in both Windows lanes, with a reviewed list and stated differences; the POSIX suites run on arm64 Linux (accepted 2026-11-05, Step 10 of the VFS and DAX plan)
 Applied in the same change to: Part 6 ("Conformance"), §4.6 ("Windows" and its status), GAPS, `docs/wip/platforms.md`,

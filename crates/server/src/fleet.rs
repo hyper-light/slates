@@ -7098,6 +7098,8 @@ fn record_acks_in(
   // A live volume's writes wait for its head's placement as well as their own durability (A-200): answer those it was
   // the last thing they waited for.
   crate::live_ship::resolve(state, object.0);
+  // A destroy is answered once its tombstone is placed (`live_ship::defer_destroy`).
+  crate::live_ship::resolve_destroys(state, object.0);
 }
 
 /// Borrows out of the shard state the live sessions of the holders satisfying `wanted`, leaving each borrowed

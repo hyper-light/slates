@@ -1,5 +1,15 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A Windows UDP socket died on an earlier send's ICMP error (found 2026-11-06, fixed 2026-11-06).** With Windows'
+> default `SIO_UDP_CONNRESET`, a port-unreachable for a datagram sent earlier failed the socket's next `recvfrom` with
+> WSAECONNRESET. A fleet node's demultiplexer ends on a receive refusal, so its socket stopped receiving, and
+> conformance's three-node fleet never formed (run 42150662467). Every datagram socket the Windows seam makes or
+> adopts now turns both ICMP reports off (`netsys::ignore_earlier_datagrams_errors`). On both CI Windows runners the
+> failing test failed on main (10054) and passes with the fix (`diag-liveness-3`). Conformance's live fleet failed 4 of
+> 4 runs without the fix and passed 4 of 4 with it. Owed: a fleet test on Windows in a lane on main, since `fleet.rs`
+> is Unix-only (owner release, 2026-11-07); `slates-cluster`'s tests build on Windows since conformance's a0015062
+> landed as 12e57aa8 (the bug record of 2026-11-06).
+
 > **The many-client load test from 10,000 to 100,000 clients (loadtest-scale; 2026-11-06): in progress.** The
 > harness (`crates/client/examples/load_bench.rs`) multiplexes logical clients over connections
 > (`--per-connection k`). Each logical client keeps its own work volume, rounds, merges and conflicts, and has one
@@ -135,7 +145,7 @@
 > window is one of the client's own hot slots, rewritten by another client between its resolution read and its
 > rebase, so the head really moved (the harness names the first five a worker meets).
 
-> **The anchor kills live daemons on a busy machine (found 2026-11-06, audit step 7; open, to be assigned).** Under the
+> **The anchor kills live daemons on a busy machine (found 2026-11-06, audit step 7; fixed by A-228, Windows CI owed).** Under the
 > A/B bar's load, two spinners a logical CPU (8 on CI's 4-CPU Windows runners), the anchor killed daemons that were
 > alive and serving because their heartbeat lapsed its 1,000 ms liveness budget. A busy machine is the normal case
 > (Ada's rule), so a starved but live daemon must not be killed.
@@ -161,7 +171,35 @@
 >   42080252187). Neither that arm nor the normal one lapsed there, each alone beside the spinners. It was not adopted
 >   because it cost x86_64's loaded p50s. **The heartbeat alone at a raised priority was never tried, and cannot be as
 >   built:** it is a task on a shard, not a thread of its own.
-> - Not fixed on the Step 7 branches; to be assigned.
+> - **Fixed by A-228** (2026-11-06): the beat is written by an owned watchdog thread pinned to no core, which judges
+>   each shard in its own CPU time (A-65's rule): stuck once a window passes with no step and no CPU progress, or with a
+>   window's CPU run; starved otherwise, and alive. The anchor holds the beat to the window plus its own measured
+>   lateness p99. Tests, each failing first where it can: `crates/server/tests/liveness.rs` — a starved control-shard
+>   poll gapped the beat 1.53 s on main and 0.26 s with A-228 (macOS arm64, load 54–70); a wedged non-control shard
+>   and a spinning one never stopped main's beat, and with A-228 stop it (1.007 s after the wedge; after 1,063 ms of the
+>   spinner's CPU, 2.98 s of wall at load 56). A half-window block and two spinners a core beside the daemon keep the
+>   beat under the window on both. The real-process frozen-daemon test still kills at the lapse (1,045 ms old against a
+>   1,044 ms bound: the window plus a 44 ms lateness p99). Owed: the Windows runners under the bar's load (diag branch),
+>   then macOS and Linux beside them. Record: `docs/bugs/2026-11-06-the-anchor-killed-live-daemons-on-a-busy-machine.md`.
+>
+> **`LIVENESS_BUDGET_NS` is still a fixed second (R3 debt, 2026-11-06; follow-on, not A-228).** It is A-228's window and
+> the reply-deadline unit of about 60 files (the client's and the server's deadlines, observations, the scatter's room
+> wait). A-228 judges the window in each shard's own CPU time, which keeps a starved daemon alive, but the window's length
+> is still the `Shape:` constant "a second", not measured.
+>
+> - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for
+>   another shard's answer gave up at the wall second while the target was alive and starved, and the work went on to
+>   take effect with the client refused. `xshard::within_shard_time` (`call_in_shard_time`, `task_in_shard_time`)
+>   waits by A-65's rule instead, one commit per call family, each failing first
+>   (`crates/server/tests/cross_shard_wait.rs`). Done: the consensus verbs (a bootstrap with the control shard on the
+>   CPU a fifth of the time, refused `Overloaded` after 1.003 s on main, acknowledged after 1.52–1.68 s; a wedged control
+>   shard still refused after 1.000–1.004 s; the same on CI's four Linux and Windows runners, quiet and busy); the consumer
+>   verbs (a revoke and an attestation with a starved shard refused `NotFound` after 1.003 s and 1.075 s, now answered
+>   after 1.57–1.80 s); the NFS bridge (a host-root listing refused `SYSTEM_ERR` after 1.262 s and a v4 state call told
+>   `NFS4ERR_DELAY` after 1.296 s with a starved shard; now listed after 1.59–1.80 s and answered by the owner after
+>   1.52–1.58 s). Open: the forwarded verbs, the direct map's delivery, the remote reap. Found on
+>   the way: a Windows channel (a `Sid`) can never attest a consumer (`verify_attestation` takes a uid only), and two
+>   server unit tests of landing fail on Windows, where CI does not run them. Record: `docs/bugs/2026-11-06-a-cross-shard-wait-lost-a-starved-shards-answer.md`.
 
 > **A-190's purge client leaves the daemon's process (2026-11-06, fixed); the sweep for the rest (open).** No daemon
 > thread opens a path on a volume the daemon serves (§4.6). The coherent purge's opens, writes and reads now run in a
@@ -204,6 +242,48 @@
 >   - If combined + 2 is within the DLL's spread at the p50 and p99 on both runners, quiet and loaded, it replaces the
 >     separate form.
 >   - If no one form passes both runners, the per-machine form question goes to Ada with that table.
+
+> **A live-shipped volume fails a waiting writer when its candidates are slow (2026-11-05, A-200; OPEN, owner raft).**
+> A-200 says holders that do not answer "make the writer wait: backpressure, never a false success". A stable reply on a
+> live-shipped volume waits at most the daemon's liveness budget (1 s, `live_ship::DURABLE_WAIT_NS`) and is then answered
+> `NFS3ERR_JUKEBOX` (NFS) or `EIO` (a held FUSE reply, `fuse.rs`). The macOS mount is `soft,intr` (§4.6), so its client
+> turns repeated "try again" into `ETIMEDOUT`. The writer's call fails instead of waiting. Found by the conformance
+> suites over a live-shipped volume (`cargo xtask conformance run --live-ship`, this Mac, 2026-11-05): at load averages
+> 26 to 37, fsx failed `Operation timed out` at its first `open(O_CREAT|O_TRUNC)` and in another run at operation 40's
+> `ftruncate`. The owner's `fleet.live.durable_late` was 14 and the candidates' `hold_refused` 2 and 4 (a refused entry
+> waits for the record period's re-ship), where the plain volume passed the same 1,000 operations in 19.2 s at load 44.
+> At load 22 the live run passed (41.6 s, `durable_late` 0). Held deterministically by the red test
+> `a_live_shipped_volume_makes_a_writer_wait_for_stopped_candidates_rather_than_fail`
+> (`xtask/src/conformance/live_fleet.rs`): with both candidates stopped (anchor, then daemon), a size change failed
+> `ETIMEDOUT` after 57.07 s and 57.09 s in two runs; the same call on a plain volume returns at once. Gated on
+> `SLATES_TEST_LIVE_CONFORMANCE=1` and `SLATES_TEST_BINARY` until raft's fix, when it joins a CI step. Owner: raft
+> (`crates/server/src/live_ship.rs`, the barrier waits; `crates/server/src/nfs.rs` `stable_once_durable`; `fuse.rs`'s
+> held replies).
+> - **The same suites found two more faults, 2026-11-06, this Mac, each a fresh fleet a suite (OPEN, raft).** Plain:
+>   fsx 10,000 operations passed in 21.1 s, fsstress 4 × 500 in about 11 s, pjdfstest's 238 files in about 5.5 minutes.
+>   Live-shipped:
+>   - fsstress (319 of 2,000 operations logged) and pjdfstest (16 files in 10 minutes, its calls answered `ETIMEDOUT`,
+>     `tests/chmod/00.t:2` "create … got ETIMEDOUT") ran against a log that never shipped: the owner's `live shipping`
+>     line stood at `head=2 durable=none owed=true` from the start, with `fleet.live.refused` 137 and 52 (a publication
+>     that could not be appended, so the next ships the whole volume) and `durable_late` 305 and 74, while both
+>     candidates held no live log at all.
+>   - fsx: the owner's daemon missed its heartbeat under the run ("the daemon's heartbeat lapsed; killing it", load
+>     average about 14), its anchor restarted it, and the fleet took the volume over to candidate c (`taken_over` 1,
+>     b `fetched` 1). The mount stayed on node a, whose restarted daemon recovered the volume from its own image ("held
+>     0 replicas again"), so fsx failed.
+>   `cargo xtask conformance compare --plain … --live …` names 8,647 differences. The commands and records:
+>   `docs/wip/conformance.md` (the live-shipped pair).
+> - **Linux and Windows, diagnostics run 42150662467 (2026-11-06; OPEN, raft).** On `ubuntu-latest` the live fsx passed
+>   on all three transports, its log durable at its head and held by both candidates (head 6801 or 4422), as plain. The
+>   live fsstress over the NFSv3 adapter then hung for over three hours until the run was cancelled, so no live fsstress
+>   or pjdfstest result exists for Linux; plain, all three transports passed every suite against their lists. On
+>   Windows, where no fleet test had run before:
+>   - `windows-latest`: the live fleet did not form within 40 s in either run. Each node counted 3 members (one 2)
+>     but probed only 1 or 2 peers, after a handshake's `recvfrom` failed with Winsock error 10054 (WSAECONNRESET), and
+>     the node dialed afresh from a new port. `compare`: winfstest's 628 cases absent.
+>   - `windows-11-arm`: the fleet did not form for fsx. It formed for winfstest, whose 628 cases matched plain exactly
+>     (0 differing), but shipping failed: candidate b held no live log, the owner counted `no_session` 7,663,
+>     `unanswered` 5,596 and `refused` 138, and only candidate c held entries (4,741).
 
 > **The many-client load test over the network (loadtest; 2026-11-05).** The harness
 > (`crates/client/examples/load_bench.rs`, `--green` to drive a green on another node) and its launcher
@@ -250,7 +330,7 @@
 >   under Miri.
 
 > **A daemon's restart can exceed the anchor's fixed recovery budget (found 2026-11-06 re-landing A-207 and A-217;
-> open, to be assigned).** A starting daemon that has not beaten 1 s after its spawn is killed ("the daemon never beat
+> open, owner liveness with clients, A-228's family, assigned 2026-11-07).** A starting daemon that has not beaten 1 s after its spawn is killed ("the daemon never beat
 > inside the recovery budget"). The budget is `slates_db::replay::RECOVERY_BUDGET_NS`, a `Shape:` constant: RAMCloud's
 > target, not derived from the machine. The heartbeat is a task on the control shard, and recovery runs in that
 > shard's `init_shard` before any beat. So the whole start, including recovery, must fit in 1 s.
@@ -474,6 +554,13 @@
 > true sub-millisecond naps (a `timerfd` in the epoll set on the 5.10 floor; a high-resolution waitable timer on
 > Windows), after measuring what each delivers. The true spin's change stays on record, not landed (`agents/clients-spin`,
 > a75f9213), with its test (`a_spinning_shard_answers_sooner_than_a_parked_one`).
+
+> **A wait for room counted tries, not time (2026-11-06, §4.9, §4.14; fixed).** A scatter part's wait for room
+> (`xshard::given_room_within`, 51 tries) and a result's carried home (`send_back`, 11 tries) were counts of a 10 ms
+> pause. On a busy shard each try lasted a pause plus a busy poll. Measured on macOS arm64 with the shard busy 20 ms a
+> poll: a status answered in 1.96 s, past the hold, and was not refused; a result's 100 ms wait gave up after 986 ms.
+> Both are now deadlines on the shard's clock: 542–724 ms and 102–127 ms. Swept: no other counted wait. Record:
+> `docs/bugs/2026-11-06-a-wait-for-room-counted-tries-not-time.md`.
 
 > **A scatter whose part could not be sent never answered (2026-11-05, §4.9, §4.14; fixed).** `scatter_acknowledge`,
 > `scatter_list`, `scatter_grants` and `scatter_status`, the server's four scatter tables, settled a part whose spawn
@@ -720,7 +807,9 @@
 > status "The tail and three more defects"). Open: the added median is the cross-shard dispatch round (50 µs not met);
 > p999 under 1 ms at load 30. Open: one exchange per message to every holder starved the second holder (never
 > accepted an entry, in six of nine process flows) and was rejected; why is not pinned down. Open, toward a filesystem
-> server replicated per write in under 1 ms: AC-8.9's credit backpressure; a candidate's copy kept across its own
+> server replicated per write in under 1 ms: AC-8.9's credit backpressure (since 2026-11-05 a local checkpoint ships a
+> live volume's changes, not a whole copy: 1 whole record in 2,051 where main made about 420; the credit itself is
+> still the fixed two, not yet derived from the measured apply rate and round trip); a candidate's copy kept across its own
 > restart; real-process chaos
 > (partitions, injected latency, volume failure, client disconnect). `put_wal` and the
 > loss-window report are unbuilt; a head still waits up to the 100 ms record period before its commit starts.
@@ -759,6 +848,47 @@
 > own report only when it holds a copy, while a remote candidate that holds nothing answers `None` and counts, so a
 > successor holding nothing never counts itself and `f + 1` is out of reach once the owner is gone. Owner: raft,
 > before any other live-shipping work.
+>
+> **Chaos from outside the processes (raft-chaos, 2026-11-06): two defects fixed, a third open.**
+> The harness is `crates/cli/tests/live_chaos.rs` (`SLATES_TEST_CLI=1`): three fleet daemons, a Rust client streaming
+> 4 KiB writes, every node's live lines sampled throughout (status now prints each log's head epoch, chain identity and
+> fence), and each flow ending with the register invariants checked from outside the processes:
+> - Agreement: one identity at every epoch and position any copy reported;
+> - NoLoss: every acknowledged write served byte for byte, nothing torn;
+> - StaleNeverCommits: writes through a superseded owner refused, survivors fenced at the takeover's epoch;
+> - Convergence: every candidate at the owner's head, durable, nothing owed.
+>
+> - **Fixed: a destroy was answered before its tombstone was placed** (record
+>   `docs/bugs/2026-11-06-a-destroy-was-answered-before-its-tombstone-was-placed.md`).
+>   - With both candidates stopped, a live volume's destroy was answered done; the owner was SIGKILLed, and a survivor
+>     listed the volume and served its file again. This is a safety defect.
+>   - With a write waiting, the destroy was told `NotFound` by its own teardown, though it happened.
+>
+>   Every fleet destroy now answers once its tombstone is region-placed (`live_ship::defer_destroy`), and never waits
+>   on the live log, so the teardown's `forget` never sees it. Results, live and plain, after the fix: an unheard
+>   destroy is never answered done (its client is told the daemon is gone), and a heard one is answered done and stays
+>   destroyed across the owner's loss.
+> - **Fixed: a write never answered under a partitioned candidate** (record
+>   `docs/bugs/2026-11-06-a-call-to-its-own-shard-dropped-its-future-and-a-live-owner-lost-its-sessions.md`).
+>   `xshard::task_within` to its own shard dropped its future at the deadline, so a live dispatch on the control shard
+>   was dropped mid-exchange. Its borrowed sessions stayed `lent=true` for good (`no_session` 129), and the owner sent to
+>   no candidate again. Candidates partitioned in turn (SIGSTOP 2 s each,
+>   `candidates_partitioned_in_turn_mid_stream_lose_nothing`) failed 3 of 5 runs before: two writes were never
+>   answered, one for over 20 minutes. After the fix, 6 of 7 runs pass and none hangs. Red-checked by
+>   `xshard::tests::a_call_to_its_own_shard_runs_its_future_to_the_end_past_the_deadline`.
+> - **Open: an install never finishes inside the liveness budget** (record
+>   `docs/bugs/2026-11-06-an-install-never-finished-inside-the-liveness-budget.md`). A candidate left behind the retained
+>   tail is sent the whole volume (0.5-1.5 MB) under the 1 s budget an entry gets. In one run 1,391 installs (2.06 GB)
+>   went out, both candidates held the owner's head, and no write became durable. Edits in progress (raft-chaos, with
+>   live-durability building on them in the dispatch round): a size-derived exchange budget, replies folded as they
+>   come, one task a holder, and a byte-bounded retained tail. With them, 3 of 8 runs still failed: of 425 installs
+>   logged in one, about 400 found no session, as the holder's tasks raced for its one session.
+> - **The anchored flows** (a candidate's daemon SIGKILLed and succeeded, a candidate's node replaced) are counted apart
+>   from the invariant results until A-228 lands: at load 60–80 the anchor kills live daemons whose heartbeat lapses.
+>
+> Touched: `crates/server/src/{live_ship,verbs,fleet}.rs` (the destroy's wait), the status line (`crates/ipc`
+> `LiveReport`, `crates/cli` status), the harness, the KIND leg (`xtask/src/kind_live.rs`,
+> `crates/cli/examples/pod_live_probe.rs`).
 
 > **VFS plan step 14, Shards' WHP window's three edge cases (2026-11-05): done, patches with the owner's folder.** Six
 > real-guest tests and one fix for Shards' owner, in `docs/wip/shards-patches/` (never pushed to Shards; README there), and

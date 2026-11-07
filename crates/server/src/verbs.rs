@@ -379,7 +379,11 @@ fn home_redirect(
 }
 
 /// Route bootstrap to the sole shard that drives consensus. The bounded call owns its reply
-/// registration through cancellation; an unavailable shard cannot produce a successful bootstrap.
+/// registration through cancellation; an unavailable shard cannot produce a successful bootstrap. Each call (the
+/// operation on the control shard, then its publication on every other) is waited for in its target's own time
+/// (`xshard::call_in_shard_time`): a starved shard's answer is heard, and a wedged one is refused `Overloaded` after a
+/// window with no progress (R3 class A; before, a control shard given a fifth of a core for 1.5 s was refused at the
+/// wall second while the bootstrap went on).
 fn consensus_on_control(
   state: &ShardState,
   client_index: u32,
@@ -391,7 +395,7 @@ fn consensus_on_control(
   };
   let origin = state.shard;
   let task = slates_rt::futures::spawn(async move {
-    let outcome = crate::xshard::call_within(
+    let outcome = crate::xshard::call_in_shard_time(
       origin,
       control,
       move |state| {
@@ -414,7 +418,7 @@ fn consensus_on_control(
         let mut reply = reply;
         for shard in shards.into_iter().filter(|shard| *shard != control) {
           let publication = publication.clone();
-          if crate::xshard::call_within(
+          if crate::xshard::call_in_shard_time(
             origin,
             shard,
             move |state| publication.apply(state),
@@ -2193,12 +2197,9 @@ fn run_recorded(
   let mut deferred = std::mem::take(&mut state.acceptance_deferred);
   // A verb on a live-shipped volume answers once its publication is durable on `f` candidates (A-200): like a deferred
   // acceptance, its effects commit now and its completion and reply follow (`crate::live_ship::resolve`).
-  let live_target = live_volume
-    .filter(|_| label == 1 && !deferred && !matches!(reply, ReplyBody::Refused { .. }))
-    .and_then(|volume| {
-      crate::live_ship::durable_target(state, volume).map(|target| (volume, target))
-    });
-  deferred |= live_target.is_some();
+  let (live_target, destroy_target) =
+    replicated_waits(state, live_volume.filter(|_| !deferred), label, &reply);
+  deferred |= live_target.is_some() || destroy_target.is_some();
   let reply = if deferred {
     reply
   } else {
@@ -2233,6 +2234,11 @@ fn run_recorded(
   {
     return crate::live_ship::defer(state, live_target, (origin, id), route, reply);
   }
+  if let Some(destroy_target) = destroy_target
+    && !matches!(reply, ReplyBody::Refused { .. })
+  {
+    return crate::live_ship::defer_destroy(state, destroy_target, (origin, id), route, reply);
+  }
   if deferred && !matches!(reply, ReplyBody::Refused { .. }) {
     return None;
   }
@@ -2249,6 +2255,36 @@ fn run_recorded(
       Some(reply)
     }
   }
+}
+
+/// A volume and the position (a live log's) or sequence (a tombstone's) a verb's reply waits for.
+type ReplicatedWait = (DbVolumeId, u64);
+
+/// What a verb that just committed on `volume` must wait for before it answers, beyond its own partition: a mutation of
+/// a live-shipped volume, its log durable where its publication put it (A-200; `live_ship::durable_target`); a destroy,
+/// its tombstone placed at `f + 1` (`live_ship::tombstone_target`). A destroy never waits on the live log: it publishes
+/// no content to make durable, and its teardown refuses whatever waits on the log `NotFound`, which had told a client
+/// its successful destroy had not happened; and answered before its tombstone was placed, an owner lost at once left a
+/// takeover that served the volume again (2026-11-06, `crates/cli/tests/live_chaos.rs`).
+fn replicated_waits(
+  state: &ShardState,
+  volume: Option<DbVolumeId>,
+  label: u32,
+  reply: &ReplyBody,
+) -> (Option<ReplicatedWait>, Option<ReplicatedWait>) {
+  let Some(volume) = volume else {
+    return (None, None);
+  };
+  if matches!(reply, ReplyBody::Destroyed) {
+    let destroy =
+      crate::live_ship::tombstone_target(state, volume).map(|sequence| (volume, sequence));
+    return (None, destroy);
+  }
+  if label != 1 || matches!(reply, ReplyBody::Refused { .. }) {
+    return (None, None);
+  }
+  let live = crate::live_ship::durable_target(state, volume).map(|target| (volume, target));
+  (live, None)
 }
 
 /// The owner's side of a forwarded verb: its own completion window first (a retry of a
@@ -3980,10 +4016,12 @@ fn revoke_on_channel(
 }
 
 /// The revocation's two bounded steps: the durable record on `owner`, then the mark on every shard.
-/// Returns the reply to deliver. Each call is bounded by the liveness budget; one that does not answer
-/// refuses `NotFound` (the record, if written, stands for the retry).
+/// Returns the reply to deliver. Each call is waited for in its target's own time, up to the liveness budget of its CPU
+/// (`xshard::call_in_shard_time`); one whose target made no progress for a window, or ran the budget without answering,
+/// refuses `NotFound` (the record, if written, stands for the retry). R3 class A: before, a shard given a fifth of a
+/// core for 1.5 s was refused at the wall second.
 async fn revoke_everywhere(origin: u16, owner: u16, shards: &[u16], consumer: u64) -> ReplyBody {
-  let recorded = crate::xshard::call_within(
+  let recorded = crate::xshard::call_in_shard_time(
     origin,
     owner,
     move |s| {
@@ -4002,7 +4040,7 @@ async fn revoke_everywhere(origin: u16, owner: u16, shards: &[u16], consumer: u6
     Some(Ok(())) => {}
   }
   for shard in shards.iter().copied() {
-    let marked = crate::xshard::call_within(
+    let marked = crate::xshard::call_in_shard_time(
       origin,
       shard,
       move |s| mark_revoked(s, consumer),
@@ -4206,7 +4244,8 @@ fn attest_on_channel(
     return Served::Reply(refused(Refusal::NotFound));
   };
   let task = slates_rt::futures::spawn(async move {
-    let facts: Option<ConsumerFacts> = crate::xshard::call_within(
+    // Waited for in the record's shard's own time (R3 class A): a starved shard's record is read, not taken for absent.
+    let facts: Option<ConsumerFacts> = crate::xshard::call_in_shard_time(
       origin,
       owner,
       move |s| {
@@ -10179,6 +10218,7 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
     .collect();
   keyed.sort_by_key(|(key, _)| *key);
   let handles: Vec<_> = keyed.iter().map(|(_, handle)| *handle).collect();
+  capture_live_changes(state, &handles)?;
   let (_, end) = state.content_range;
   match state.content.as_ref() {
     None => return Err(slates_vfs::VfsError::RecoveryIncomplete),
@@ -10328,9 +10368,44 @@ fn stream_checkpoint(
     Ok(frame_bytes) => published.frame_bytes = frame_bytes,
     Err(e) => return Ok(Streamed::Refused(e)),
   }
-  // A checkpoint ships each live-shipped volume's whole image once it commits (A-200, `crate::live_ship`).
+  // What a live volume changed ships once the checkpoint commits, for the volumes it carried (A-200,
+  // `crate::live_ship`).
   crate::live_ship::note_checkpoint(state, &published.volumes);
   Ok(Streamed::Committed(published))
+}
+
+/// Takes each changed live-shipped volume's record before a checkpoint, as a delta publication takes it: a checkpoint is
+/// this shard's recovery journal restarting, which says nothing about what a live log needs, and it is due when the
+/// deltas reach the size of the shard's metadata, while a whole record carries every byte of the volume's content. Mapped
+/// to whole records, one write in three copied the volume (68 of 201 records, 2026-11-05, `live_fleet`). An unchanged
+/// live volume ships nothing. A record that cannot be taken is `None`: the volume ships whole.
+fn capture_live_changes(
+  state: &mut ShardState,
+  handles: &[Handle<VolumeSlot>],
+) -> Result<(), slates_vfs::VfsError> {
+  for handle in handles {
+    let slot = state.volumes.get_mut(*handle)?;
+    let id = slot.id;
+    let live = state
+      .db
+      .partition()
+      .volume(id)
+      .is_some_and(|volume| volume.policy.live_shipped);
+    if !live || being_destroyed(&slot.volume) || slot.volume.is_clean(&state.store) {
+      continue;
+    }
+    let mut record = Vec::new();
+    let encoded = slot.volume.encode_publication(
+      &state.store,
+      slot.host.as_mut().map(|host| host as &mut dyn HostFs),
+      &mut record,
+    );
+    state
+      .live
+      .captured
+      .push((id, encoded.ok().map(|()| record)));
+  }
+  Ok(())
 }
 
 /// A delta of what changed since the last publication, appended to the shard's delta log (A-68): each changed

@@ -3454,7 +3454,7 @@ impl TestSpace {
   const BLOCKS: usize = 32;
 
   pub(crate) fn new() -> TestSpace {
-    let page = rustix::param::page_size();
+    let page = usize::try_from(slates_machine::facts::Facts::page_bytes()).unwrap();
     let mut arena = ChunkArena::new(page);
     arena
       .add_region(slates_mem::region::Region::map(page * Self::BLOCKS, page, false).unwrap())
@@ -5182,7 +5182,7 @@ mod ownership_oracle {
     let mut room = TestSpace::new();
     let capacity = room.budget.capacity();
     // Every block but one is promised to someone else: the put needs three (two chunks, the manifest).
-    let page = u64::try_from(rustix::param::page_size()).unwrap();
+    let page = slates_machine::facts::Facts::page_bytes();
     let promised = room.budget.reserve(capacity - 2 * page).unwrap();
     let mut hold = ContentHold::new();
     let refused = hold.hold(
