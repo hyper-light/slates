@@ -505,8 +505,9 @@ pub struct ShardState {
   /// unavailable.
   pub seal_recipient: Option<hyper_seal::recipient::Recipient>,
   /// The candidate nodes, by stable anchor, this shard's pair key was delivered to in this daemon's life (A-92 piece 4b),
-  /// bounded by the fleet's peer capacity.
-  pub pairs_delivered: std::collections::BTreeSet<u64>,
+  /// each with the member id it was delivered to, so a node back at its anchor with fresh RAM (a new member id) is
+  /// delivered it again; bounded by the fleet's peer capacity.
+  pub pairs_delivered: std::collections::BTreeMap<u64, slates_db::HostId>,
   /// The stable anchor of each neighbour, by member id, as this owner shard's pair delivery last resolved them (A-92
   /// piece 4c): a head naming sealed content ships only once it carries a key entry for every remote candidate's
   /// anchor. Refreshed each record period, so a member that restarts under a new id with the same anchor resolves;

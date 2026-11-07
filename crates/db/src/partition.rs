@@ -592,6 +592,11 @@ impl Partition {
     self.seal_keys.get(owner)
   }
 
+  /// Every sealing key recorded at this partition, by owner.
+  pub fn seal_keys(&self) -> impl Iterator<Item = &SealKeyRecord> {
+    self.seal_keys.values()
+  }
+
   /// Applies one NFSv4 record operation (A-37): an upsert, a clear, or a client's purge.
   fn apply_nfs(&mut self, op: &Op) {
     match op {

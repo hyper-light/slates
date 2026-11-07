@@ -10245,6 +10245,129 @@ fn a_fresh_restart_keeps_its_serve_session_while_the_predecessor_retires() {
   assert!(stable, "the re-admission held — the rejoin did not flap");
 }
 
+/// A-92 piece 4b across a whole-RAM replacement: do form three nodes, let their owner shards exchange pair keys, then
+/// replace one with a fresh daemon at the same machine anchor (its RAM, and with it every key it made and received,
+/// gone). Expect, within the formation wait: every survivor accepts the replacement's new pair keys (none refused), and
+/// every survivor delivers its own pair keys to the replacement again (the replacement is served pairs). Found by
+/// raft-chaos (CI diag-25, kill-at-ack): the survivors kept the old incarnation's key for that anchor and refused the
+/// new one 789 times in 793, so the replacement's sealed entries never covered them and its live writes waited for
+/// good; and a survivor marks a pair delivered by anchor, so it never delivered again to the replacement, which then
+/// could not open the survivors' heads as their successor.
+#[test]
+fn a_node_replaced_with_fresh_ram_at_its_anchor_exchanges_pair_keys_with_its_survivors() {
+  let _serial = serialize_fleet_tests();
+  let pid = std::process::id();
+  let profiles: Vec<MachineProfile> = ["pair-fresh-a", "pair-fresh-b", "pair-fresh-c"]
+    .into_iter()
+    .map(profile)
+    .collect();
+  let anchors: Vec<HostId> = profiles.iter().map(anchor_of).collect();
+  let seeds: Vec<HostId> = anchors.iter().map(|anchor| member_id(*anchor, 0)).collect();
+  let mut identities: Vec<Vec<Identity>> = profiles.iter().map(|_| same_identity(2)).collect();
+  let certificates: Vec<_> = identities
+    .iter()
+    .map(|pair| pair[0].certificate())
+    .collect();
+  let (_ports_lease, ports) = mesh_serve_ports(profiles.len());
+  let peers = |node: usize| -> Vec<FleetPeer> {
+    profiles
+      .iter()
+      .enumerate()
+      .filter(|(peer, _)| *peer != node)
+      .map(|(peer, _)| fleet_peer_at(anchors[peer], seeds[peer], ports[peer], &certificates[peer]))
+      .collect()
+  };
+  let configs: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      fleet_config(
+        profile,
+        &format!("pair-fresh-{node}-{pid}"),
+        anchors[node],
+        seeds[node],
+        &peers(node),
+        &Default::default(),
+      )
+    })
+    .collect();
+  let mut daemons: Vec<Daemon> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      start_fleet_node(
+        profile,
+        configs[node].clone(),
+        identities[node].pop().unwrap(),
+        ports[node],
+        peers(node),
+        SegmentSource::Create {
+          name: format!("pair-fresh-{node}-{pid}"),
+        },
+      )
+    })
+    .collect();
+  daemons[0]
+    .bootstrap(true)
+    .expect("the operator explicitly creates this test's new fleet");
+  settle_initial_consensus(&daemons, &seeds, &Default::default(), Quorum { f: 1 });
+  // Every node was delivered pairs by both others before the replacement.
+  assert!(
+    audit_wait(|| all_hold(daemons.iter().map(|daemon| {
+      refusal_count(daemon, "fleet.seal.pair_served").map(|served| served >= 2)
+    }))),
+    "the pairs were exchanged before the replacement"
+  );
+  let replaced = daemons
+    .iter()
+    .position(|daemon| daemon.root_leads() == Ok(false))
+    .unwrap();
+  let old = daemons[replaced].member_identity().unwrap();
+  daemons.remove(replaced).stop();
+  let refused_before: Vec<u64> = daemons
+    .iter()
+    .map(|daemon| refusal_count(daemon, "fleet.seal.pair_refused").unwrap_or(0))
+    .collect();
+  let replacement = start_fleet_node(
+    &profiles[replaced],
+    configs[replaced].clone(),
+    identities[replaced].pop().unwrap(),
+    ports[replaced],
+    peers(replaced),
+    SegmentSource::Create {
+      name: format!("pair-fresh-replacement-{pid}"),
+    },
+  );
+  let fresh = replacement.member_identity().unwrap();
+  assert_ne!(old, fresh, "the replacement is a new incarnation");
+  daemons.push(replacement);
+  let survivors = daemons.len() - 1;
+  // The replacement is served a pair by each survivor, and no survivor refuses one of its pairs: a survivor's
+  // refusal is retried every period, so a refusing survivor's count keeps growing.
+  let exchanged = audit_wait(|| {
+    let served = refusal_count(&daemons[survivors], "fleet.seal.pair_served")?;
+    Ok(served >= u64::try_from(survivors).unwrap_or(u64::MAX))
+  });
+  let refused_after: Vec<u64> = daemons[..survivors]
+    .iter()
+    .map(|daemon| refusal_count(daemon, "fleet.seal.pair_refused").unwrap_or(0))
+    .collect();
+  let served_on_replacement = refusal_count(&daemons[survivors], "fleet.seal.pair_served");
+  let undelivered_on_replacement =
+    refusal_count(&daemons[survivors], "fleet.seal.pair_undelivered");
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert_eq!(
+    refused_after, refused_before,
+    "no survivor refused the replacement's pairs (the replacement counted undelivered {undelivered_on_replacement:?})"
+  );
+  assert!(
+    exchanged,
+    "each survivor delivered its pairs to the replacement again: served {served_on_replacement:?}"
+  );
+}
+
 /// AC-8.1, §4.8, AUD-07: lose a whole anchor, rejoin through the surviving council under a
 /// fresh identity, then lose the leader and require the replacement's vote for the next election.
 /// The loss is **forced into the interrupted-discovery phase**: the victim holds its discovery replies

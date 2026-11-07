@@ -993,6 +993,18 @@ pub enum SealKeyOwner {
     /// The owner's partition.
     partition: u16,
   },
+  /// A pair key an earlier incarnation of `host` delivered for `partition` (A-92 piece 4b), kept on this node's control
+  /// shard while a head or live log this node holds is still sealed under it, so the volumes of a node that came back
+  /// with fresh RAM at the same anchor (its keys gone, a new pair made) can still be taken over: `key` is its id, which
+  /// a head's key entry names as its wrapping key. Appended.
+  PairRetired {
+    /// The owner node.
+    host: u64,
+    /// The owner's partition.
+    partition: u16,
+    /// The retired key's id.
+    key: [u8; 16],
+  },
 }
 
 /// Format: the most bytes a sealed recipient record holds: hyper-seal's `Recipient::seal` of a hybrid recipient is one

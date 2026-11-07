@@ -3298,7 +3298,7 @@ fn init_shard(
     seal_root,
     seal_state: sealing,
     seal_recipient: None,
-    pairs_delivered: std::collections::BTreeSet::new(),
+    pairs_delivered: std::collections::BTreeMap::new(),
     member_anchors: std::collections::BTreeMap::new(),
     peer_recipients: std::collections::BTreeMap::new(),
     content,

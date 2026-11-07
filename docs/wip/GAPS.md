@@ -1,5 +1,16 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Fixed (live-fixes, 2026-11-07): a node back at its anchor with fresh RAM had every pair key refused (A-92 piece 4b).**
+> A receiver kept one pair key per sender anchor and shard and refused any other, so a node replaced at its anchor (its
+> keys gone) was refused for good (789 of 793, raft-chaos's kill-at-ack, CI diag-raft-chaos-three-25): its sealed live
+> entries never covered its candidates and its writes waited for ever (`held_back.keys` 394). And an owner shard marked
+> a pair delivered by anchor, so it never delivered to the new incarnation, which could not open its heads as a
+> successor. Now the newer key replaces the recorded one, the old kept as retired while anything held is sealed under
+> it, and an owner shard delivers again to a new member id. Test:
+> `a_node_replaced_with_fresh_ram_at_its_anchor_exchanges_pair_keys_with_its_survivors` (red on each half alone).
+> Open: no process test yet takes over an old incarnation's volume after its replacement's key arrived (the retired
+> key's path). Bug record `docs/bugs/2026-11-07-a-node-back-at-its-anchor-with-fresh-ram-had-every-pair-key-refused.md`.
+
 > **Fixed (live-fixes, 2026-11-07): a live write counted durable on too few holders when the owner fell outside its own
 > volume's placement.** The shipper counted a position durable at the `f`-th highest holder, right for `2f` holders but
 > not for `2f + 1` (every other candidate a holder): at f = 1 a write on one of three was "durable", and a successor
@@ -13,7 +24,7 @@
 > through it alone). A let-go on the newer holder record (2ba5572d) was reverted (eab618f2): a holder dropped while it was
 > no catalog candidate receives that record only when the configuration names it again, by then a counted member of the
 > next transition. A safe release needs a holder-set generation the entries and replies carry. raft-chaos's five-node
-> flow asserts the release and stays red until then.
+> flow notes the copies dropped holders keep, and asserts their release once that lands.
 
 > **Fixed (live-fixes, 2026-11-07): a live shipper made before its candidates were known shipped to nobody** (A-200's
 > amendment of that date). A shipper kept the holders of its first publication, so a live volume made on a fleet's
