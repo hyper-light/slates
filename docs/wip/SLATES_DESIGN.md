@@ -7154,7 +7154,12 @@ stays in the overlay.
 > - **One at a time.** One granted landing per volume runs at a time.
 > - **Large files.** A large file is copied one content window per unit, so no unit grows with a file.
 > - **The lease keepalive.** A running landing renews its target lease between slices once half its term
->   has passed.
+>   has passed, by taking it again as its own holder. Until 2026-11-07 the partition refused that take while the
+>   lease held, so a renewal only succeeded once the lease had lapsed. The entries a landing reached in between
+>   were skipped `LeaseEnded`, and it ended `partial`
+>   (`docs/bugs/2026-11-07-a-landings-lease-renewal-was-refused-while-it-held.md`). The longest a landing goes
+>   between two looks at its lease is measured (`LandingState::longest_lease_gap_ns`), the gap a term's margin is
+>   judged against.
 > - **Owed:** the shard-step percentile lane
 >   (`docs/bugs/2026-10-01-a-granted-landing-held-its-shard-for-all-of-its-work.md`).
 >

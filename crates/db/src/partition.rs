@@ -992,15 +992,21 @@ impl Partition {
     }
   }
 
-  /// One holder per target, whoever asks (§4.15 step 4; AUD-29-03): a take is refused while the current
-  /// lease is unexpired — even by its own holder, whose id names one landing attempt and is not a renewal —
-  /// and a lease's fencing generation never goes backwards. Before 2026-09-29 the same holder could take an
-  /// unexpired lease again; no path wrote these records then.
+  /// One holder per target (§4.15 step 4; AUD-29-03): a take by another attempt is refused while the current
+  /// lease is unexpired, and a lease's fencing generation never goes backwards. The holder is one landing attempt,
+  /// so its own take of a live lease is that attempt's renewal (the keepalive, AUD-29-25). Before 2026-09-29 the
+  /// holder was the caller's session, so two landings of one principal took each other's lease; from then until
+  /// 2026-11-07 the attempt's own renewal was refused while its lease held, so it only renewed once lapsed.
   fn check_landing_lease(&self, record: &LandingLeaseRecord, now_ns: u64) -> Result<(), DbError> {
     match self.landing_lease(&record.target) {
-      Some(held) if held.expires_ns > now_ns => Err(DbError::LeaseHeld {
-        epoch: held.generation,
-      }),
+      // A live lease is its holder's: another attempt is refused, and the holder itself takes it again to renew it
+      // (§4.15 "The lease keepalive", AUD-29-25) under the newer generation the next arm requires. Before 2026-11-07
+      // the holder was refused too, so a running landing's renewal only succeeded once its lease had lapsed.
+      Some(held) if held.expires_ns > now_ns && held.holder != record.holder => {
+        Err(DbError::LeaseHeld {
+          epoch: held.generation,
+        })
+      }
       Some(held) if record.generation <= held.generation => Err(DbError::StaleLease {
         current: held.generation,
       }),
