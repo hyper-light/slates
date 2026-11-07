@@ -122,7 +122,6 @@ pub enum TargetRefusal {
 /// A host's refusal of the target as the writer's: a mount this daemon serves is [`TargetRefusal::OwnMount`].
 fn host_refusal(error: HostError) -> TargetRefusal {
   match error {
-    HostError::OwnMount(_) => TargetRefusal::OwnMount,
     other => TargetRefusal::Unavailable(other),
   }
 }
