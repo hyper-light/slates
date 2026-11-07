@@ -797,6 +797,82 @@ fn cleanup_once(
   let _reply = answer.recv().unwrap();
 }
 
+/// The deleting client: removes the fixed file and the empty directory through the drive, as `del` and `rmdir` do.
+// The paths are on slates' own RAM-backed drive, not the host's disk, so R1's ban on host-file writes does not apply
+// (as in `crates/cli/tests/winfsp_semantics.rs`).
+#[allow(clippy::disallowed_methods)]
+fn deleter(drive: &str) -> ! {
+  std::fs::remove_file(format!("{drive}\\file")).unwrap();
+  std::fs::remove_dir(format!("{drive}\\dir")).unwrap();
+  eprintln!("WINFSP CAN DELETE: the client removed the file and the empty directory");
+  std::process::exit(ROLE_EXIT);
+}
+
+/// Audit step 7, the CanDelete lever (2026-11-07). Do: through the drive, a client process deletes a file and removes an
+/// empty directory, while this process serves the mount and counts the CanDelete requests that reach the shard. Expect:
+/// one, the directory's, which only the shard can judge empty; a file's context says it is a file, so its CanDelete is
+/// answered at once. Before, both asked the shard: 2.6 µs at the p50 on arm64 (diagnostics run 42185624364).
+#[test]
+fn a_files_can_delete_makes_no_shard_trip_and_a_directorys_does() {
+  if std::env::var_os("WINFSP_TEST_MOUNT").is_none() {
+    eprintln!("SKIP: the CanDelete oracle needs WINFSP_TEST_MOUNT=1 and WinFsp installed");
+    return;
+  }
+  let drive = free_drive();
+  let mut store = fixed_store();
+  let (mut volume, cx) = fixed_volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut volume, &mut store);
+  let root = ObjectId::new(bridge.root(&cx).unwrap(), 0);
+  bridge.mkdir(root, &cx, "dir", 0o755).unwrap();
+  let (send, receive) = sync_channel(REQUEST_BOUND);
+  let mut mount = MountThread::start(
+    &drive,
+    false,
+    send,
+    Waker::noop().clone(),
+    slates_bridge_core::volume_bridge::MAX_OPEN_HANDLES,
+    None,
+  )
+  .unwrap();
+  // Declared after the mount, so dropped before it: the mount's thread joins only once the request channel's receiver
+  // is gone (`MountThread::stop`).
+  let receive = receive;
+  let mut ready = await_ready(&mut mount);
+  let mut client = spawn("deleter", &drive, &[], &[]);
+  let mut names = OpenNames::new();
+  let mut can_deletes = 0u32;
+  let started = Instant::now();
+  let exit = loop {
+    match receive.recv_timeout(POLL) {
+      Ok(request) => {
+        if matches!(request.op, Op::CanDelete { .. }) {
+          can_deletes += 1;
+        }
+        assert!(
+          request
+            .serve(&mut bridge, &cx, &mut names, &mut ready.ledger)
+            .send()
+        );
+      }
+      Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+      Err(error) => panic!("the fixture's request channel: {error}"),
+    }
+    if let Some(code) = client.wait_within(0) {
+      break code;
+    }
+    assert!(
+      started.elapsed() < ROLE_WAIT,
+      "the deleting client never ended"
+    );
+  };
+  eprintln!("WINFSP CAN DELETE: {can_deletes} CanDelete requests reached the shard");
+  assert_eq!(exit, ROLE_EXIT, "the client's deletes must succeed");
+  assert_eq!(
+    can_deletes, 1,
+    "only the directory's CanDelete may ask the shard; {can_deletes} did"
+  );
+}
+
 /// This test binary as a mount's purge client, the role `slates winfsp-purge-client` plays for the daemon.
 fn install_purge_client() {
   crate::purge_client::install(crate::purge_client::Program {
@@ -826,6 +902,9 @@ fn request_role() {
   let drive = std::env::var(DRIVE).unwrap();
   if role == "closer" || role == "holder" {
     closer(&role, &drive);
+  }
+  if role == "deleter" {
+    deleter(&drive);
   }
   if role != "reader" && role != "probe" {
     serve(&role, &drive);
