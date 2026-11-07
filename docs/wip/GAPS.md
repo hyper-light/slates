@@ -1,5 +1,15 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A version commits in one exchange, and retention no longer decodes the whole ledger per put: fixed (2026-11-07, §4.16
+> Commit, §4.10 retention; amendment number owed by the supervisor).** A-235 left five hops a version (the inputs' offer
+> and transfer, then the record, each behind a wake), and a holder's retention decoded every merge record for every held
+> manifest per put, quadratic in a green's history. Now a record carries its inputs in one shipment, and retention reads
+> the one ledger position a held input can be named by. 500 sequential submits at `f = 1`, release, load about 10: p50
+> 265 µs, p99 731 µs, max 1.13 ms (was p50 6.7 ms, p99 34.7 ms, max 62.4 ms). Still owed: a smaller per-version cost
+> (116 µs to 473 µs median across 500 versions), and more than one version a holder per pass. Records:
+> `docs/bugs/2026-11-07-a-versions-inputs-and-record-took-five-hops.md`,
+> `docs/bugs/2026-11-07-retention-decoded-every-merge-record-per-put.md`.
+
 > **A path on a volume this daemon serves is refused before any open (A-227, 2026-11-06): built on Linux, Windows and
 > macOS.** A base directory and every lookup below it, a landing's target and a FUSE mount point are refused typed
 > (`HostError::OwnMount`, `TargetRefusal::OwnMount`, the wire's `Refusal::OwnMount`) when they lie on a mount this

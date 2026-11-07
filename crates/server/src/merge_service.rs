@@ -1234,8 +1234,8 @@ use std::collections::BTreeSet;
 
 use slates_archive::Archive;
 use slates_archive::manifest::{Entry, Extent, Node, NodeMeta};
-use slates_cluster::content::put_content;
-use slates_cluster::{ClusterError, CommitBudget, commit_record_on};
+use slates_cluster::content::{chunk_requests, offer_request};
+use slates_cluster::{ClusterError, CommitBudget, commit_record_sent_as};
 use slates_db::register::{Acceptor, HostId, ObjectId, Placement, Quorum, Record};
 use slates_merge::engine::{Green, Increment, Outcome};
 use slates_wire::Wire;
@@ -1254,6 +1254,9 @@ pub(crate) const MERGE_RECORD_STREAM: u64 = 12;
 /// non-vacuity counter of placed-before-reference.
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 pub(crate) const INPUTS_UNPLACED: &str = "merge.inputs_unplaced";
+/// Counted on a holder for each merge record that arrived with the inputs it names (§4.16 "Commit" in one exchange a
+/// version): the non-vacuity counter for inputs placed inside the record that references them.
+pub(crate) const INPUTS_CARRIED: &str = "merge.inputs_carried";
 /// Counted on a holder that refused a content put under an injected fault (a test's placement
 /// refusal), so a record's wait is shown to be the refusal's doing.
 /// Format: a refusal name in the daemon's status report.
@@ -1728,45 +1731,71 @@ pub(crate) fn await_placed_green(
   })
 }
 
-/// The holders ready for this record: the inputs are placed at quorum first, and each target
-/// itself holds them before recomputing (§4.16). Missing input holders remain catch-up work even
-/// after other holders placed the inputs; quorum placement never erases that debt.
-fn record_targets(pending: &PendingMergeRecord, targets: &[HostId], quorum: Quorum) -> Vec<HostId> {
-  if pending.value.inputs.is_none() {
-    return targets.to_vec();
-  }
-  if !pending.inputs.placed(quorum) {
-    return Vec::new();
-  }
-  targets
-    .iter()
-    .copied()
-    .filter(|host| pending.inputs.acked.contains(host))
-    .collect()
+/// Whether this version's record must carry its inputs to `targets` (§4.16 "Commit", one exchange a version): some
+/// target does not hold them yet. A holder accepts a merge record only once it holds the inputs the record names
+/// (`accept_merge_record`), so a record that commits at `f + 1` has its inputs held at `f + 1` by construction —
+/// placed before it is referenced, with no separate put ahead of it. A version without inputs (an empty green's
+/// creation) never carries any.
+fn carries_inputs(pending: &PendingMergeRecord, targets: &[HostId]) -> bool {
+  pending.value.inputs.is_some()
+    && targets
+      .iter()
+      .any(|host| !pending.inputs.acked.contains(host))
 }
 
-/// One position owed by at least one candidate this period: the inputs put while they are
-/// unplaced, the record ship once they are.
+/// Format: a merge shipment's frame count, and each frame's length before it, are little-endian `u32`s.
+const SHIPMENT_LENGTH_BYTES: usize = size_of::<u32>();
+
+/// A merge shipment (the bytes a holder is sent on [`MERGE_RECORD_STREAM`]): the record, then the content requests
+/// that place its inputs (an offer and its chunks), each frame behind its length.
+fn encode_shipment(frames: &[Vec<u8>]) -> Vec<u8> {
+  let total = frames.iter().fold(SHIPMENT_LENGTH_BYTES, |sum, frame| {
+    sum
+      .saturating_add(SHIPMENT_LENGTH_BYTES)
+      .saturating_add(frame.len())
+  });
+  let mut bytes = Vec::with_capacity(total);
+  bytes.extend_from_slice(
+    &u32::try_from(frames.len())
+      .unwrap_or(u32::MAX)
+      .to_le_bytes(),
+  );
+  for frame in frames {
+    bytes.extend_from_slice(&u32::try_from(frame.len()).unwrap_or(u32::MAX).to_le_bytes());
+    bytes.extend_from_slice(frame);
+  }
+  bytes
+}
+
+/// The frames of a merge shipment, or `None` for bytes that are not one (a count or a length past the bytes, or
+/// bytes left over). Hostile input never allocates beyond what the bytes themselves can hold: the count is
+/// checked against the bytes before any frame is read.
+pub(crate) fn decode_shipment(bytes: &[u8]) -> Option<Vec<&[u8]>> {
+  let count = read_length(bytes, 0)?;
+  if count > bytes.len() / SHIPMENT_LENGTH_BYTES {
+    return None;
+  }
+  let mut frames = Vec::with_capacity(count);
+  let mut at = SHIPMENT_LENGTH_BYTES;
+  for _ in 0..count {
+    let length = read_length(bytes, at)?;
+    let begin = at.checked_add(SHIPMENT_LENGTH_BYTES)?;
+    let end = begin.checked_add(length)?;
+    frames.push(bytes.get(begin..end)?);
+    at = end;
+  }
+  (at == bytes.len()).then_some(frames)
+}
+
+/// The little-endian `u32` length at `at` in `bytes`, as a `usize`.
+fn read_length(bytes: &[u8], at: usize) -> Option<usize> {
+  let end = at.checked_add(SHIPMENT_LENGTH_BYTES)?;
+  let word: [u8; SHIPMENT_LENGTH_BYTES] = bytes.get(at..end)?.try_into().ok()?;
+  usize::try_from(u32::from_le_bytes(word)).ok()
+}
+
+/// One position owed by at least one candidate this period: the record, with its inputs while a target lacks them.
 pub(crate) enum MergeWork {
-  /// Put the version's inputs to the candidates that do not hold them yet.
-  PutInputs {
-    /// The owner shard the pending record lives on.
-    shard: u16,
-    /// The green.
-    object: ObjectId,
-    /// The version.
-    version: u64,
-    /// The inputs archive.
-    archive: Archive,
-    /// Every candidate.
-    candidates: Vec<HostId>,
-    /// The candidates whose next record is this version: the only ones put to.
-    to: Vec<HostId>,
-    /// The candidates that already hold the inputs.
-    acked: Vec<HostId>,
-    /// The quorum.
-    quorum: Quorum,
-  },
   /// Ship the record to the candidates that hold the version before it and not this one.
   Ship {
     /// The owner shard the pending record lives on.
@@ -1779,6 +1808,8 @@ pub(crate) enum MergeWork {
     record: Record,
     /// The candidates to reach this period (in order behind the version before).
     targets: Vec<HostId>,
+    /// The version's inputs, while a target does not hold them: they travel with the record.
+    inputs: Option<Archive>,
     /// The placement the record commits against: every candidate, and the cohorts joined while the owner's
     /// neighbourhood change is in flight, with nothing acknowledged.
     shape: Placement,
@@ -1814,26 +1845,15 @@ pub(crate) fn next_merge_work(state: &mut ShardState, local: HostId) -> Vec<Merg
         continue;
       };
       let green = DbVolumeId { bytes: object.0 };
-      let ready = record_targets(&pending, &targets, config.quorum);
-      if ready.len() < targets.len() {
+      let inputs = if carries_inputs(&pending, &targets) {
         let Some(bytes) = inputs_of(state, green, version) else {
           continue; // The chain no longer holds the entry (the green was destroyed): nothing to place.
         };
         state.count(INPUTS_UNPLACED, 1);
-        work.push(MergeWork::PutInputs {
-          shard: state.shard,
-          object,
-          version,
-          archive: MergeShardState::inputs_archive(&bytes, 0, page),
-          candidates: pending.inputs.candidates.clone(),
-          to: targets.clone(),
-          acked: pending.inputs.acked.clone(),
-          quorum: config.quorum,
-        });
-      }
-      if ready.is_empty() {
-        continue;
-      }
+        Some(MergeShardState::inputs_archive(&bytes, 0, page))
+      } else {
+        None
+      };
       // Each target is waiting for this version's first missing position. Another holder can be
       // at a later position; a missing candidate therefore cannot stall an available commit quorum.
       // The record is written at the host's epoch — or, for a green this node **took over**, at the
@@ -1862,7 +1882,8 @@ pub(crate) fn next_merge_work(state: &mut ShardState, local: HostId) -> Vec<Merg
           generation: config.version,
           value: pending.value.to_record_bytes(),
         },
-        targets: ready,
+        targets,
+        inputs,
         shape: Placement {
           acked: Vec::new(),
           ..pending.record.clone()
@@ -1896,27 +1917,13 @@ pub(crate) async fn run_merge_period(
   .unwrap_or_default();
   for item in work {
     let dispatch = match item {
-      MergeWork::PutInputs {
-        shard,
-        object,
-        version,
-        archive,
-        candidates,
-        to,
-        acked,
-        quorum,
-      } => {
-        put_inputs(
-          origin, shard, local, object, version, archive, candidates, to, acked, quorum, budget,
-        )
-        .await
-      }
       MergeWork::Ship {
         shard,
         object,
         version,
         record,
         targets,
+        inputs,
         shape,
         quorum,
       } => {
@@ -1925,9 +1932,7 @@ pub(crate) async fn run_merge_period(
           shard,
           local,
           owner_acceptor,
-          object,
-          version,
-          record,
+          (object, version, record, inputs),
           targets,
           shape,
           quorum,
@@ -1942,94 +1947,18 @@ pub(crate) async fn run_merge_period(
   }
 }
 
-/// Puts a version's inputs to every candidate whose next record is this version and that does not hold
-/// them (`to`; the inputs are small, so all of them at once), folding the acknowledgements into the
-/// pending record on the owner shard. Never to a candidate still owed an earlier version: a holder keeps
-/// only its newest placement ahead of its accepted records (`crate::content_retention`), so a later
-/// version's inputs released the inputs its next record needed, and that record was refused
-/// `merge.inputs_unheld` until a period re-put them (53 and 71 refusals in two runs of twenty submits on an
-/// idle three-node fleet at `f = 1`, 2026-11-06). A late acknowledgement is dropped; the next period's offer round finds the holder
-/// holding the content and re-acknowledges it at no cost.
-#[allow(clippy::too_many_arguments)]
-async fn put_inputs(
-  origin: u16,
-  shard: u16,
-  local: HostId,
-  object: ObjectId,
-  version: u64,
-  archive: Archive,
-  candidates: Vec<HostId>,
-  to: Vec<HostId>,
-  acked: Vec<HostId>,
-  quorum: Quorum,
-  budget: CommitBudget,
-) -> Option<Dispatch> {
-  let holders = take_sessions("fleet.lent_to.put_inputs", |host| {
-    host != local && to.contains(&host) && !acked.contains(&host)
-  });
-  if holders.is_empty() {
-    return None;
-  }
-  let taken: Vec<HostId> = holders.iter().map(|(host, _)| *host).collect();
-  let placed = put_content(
-    local,
-    &archive,
-    object,
-    version,
-    &candidates,
-    quorum,
-    holders,
-    budget,
-  )
-  .await;
-  let dispatch = Dispatch::new(
-    taken,
-    &placed.reusable,
-    placed.stragglers,
-    LateReplies::Discard,
-  );
-  return_sessions(placed.reusable);
-  let placement = match placed.outcome {
-    Ok(placement) => placement,
-    Err(ClusterError::Uncertain { placement } | ClusterError::NotPlaced { placement }) => placement,
-    Err(_) => return Some(dispatch),
-  };
-  crate::xshard::run_on_counted(origin, shard, move |s| {
-    if let Some(pending) = s
-      .merge
-      .pending
-      .get_mut(&object)
-      .and_then(|pending_green| pending_green.records.get_mut(&version))
-    {
-      let mut acknowledged = false;
-      for host in placement.acked {
-        if !pending.inputs.acked.contains(&host) {
-          pending.inputs.acked.push(host);
-          acknowledged = true;
-        }
-      }
-      // The record may ship now that its inputs placed further.
-      if acknowledged {
-        nudge_record_plane(s);
-      }
-    }
-  });
-  Some(dispatch)
-}
-
 /// Ships a version's record to its targets over [`MERGE_RECORD_STREAM`] through the owner's own
-/// acceptor at `f + 1`, and records every acknowledgement on the owner shard: the version is
-/// placed once the distinct acknowledgements reach the quorum, and its entry leaves the pending
-/// map once every remote candidate holds it.
+/// acceptor at `f + 1` — with its inputs (the content exchange's offer and every chunk) in the same message while
+/// a target lacks them, so a version commits in one exchange — and records every acknowledgement on the owner
+/// shard: the version is placed once the distinct acknowledgements reach the quorum, each acknowledging holder
+/// holds its inputs, and its entry leaves the pending map once every remote candidate holds it.
 #[allow(clippy::too_many_arguments)]
 async fn ship_record(
   origin: u16,
   shard: u16,
   local: HostId,
   owner_acceptor: &mut Acceptor,
-  object: ObjectId,
-  version: u64,
-  record: Record,
+  (object, version, record, inputs): (ObjectId, u64, Record, Option<Archive>),
   targets: Vec<HostId>,
   shape: Placement,
   quorum: Quorum,
@@ -2040,12 +1969,19 @@ async fn ship_record(
     return None;
   }
   let taken: Vec<HostId> = holders.iter().map(|(host, _)| *host).collect();
-  let committed = commit_record_on(
+  let mut frames = vec![record.encode()];
+  if let Some(archive) = &inputs {
+    let every_chunk: Vec<[u8; 32]> = archive.chunks.iter().map(|chunk| chunk.identity).collect();
+    frames.push(offer_request(archive, object, version));
+    frames.extend(chunk_requests(archive, object, version, &every_chunk));
+  }
+  let committed = commit_record_sent_as(
     MERGE_RECORD_STREAM,
     local,
     owner_acceptor,
     &shape,
     &record,
+    encode_shipment(&frames),
     quorum,
     holders,
     budget,
@@ -2115,22 +2051,10 @@ fn record_merge_acks(
   let Some(pending_green) = state.merge.pending.get_mut(&object) else {
     return;
   };
+  let acknowledged = fold_acknowledgements(pending_green, version, placement.acked);
   let Some(pending) = pending_green.records.get_mut(&version) else {
     return;
   };
-  let mut acknowledged = false;
-  for host in placement.acked {
-    if pending.record.candidates.contains(&host) && !pending.record.acked.contains(&host) {
-      pending.record.acked.push(host);
-      acknowledged = true;
-      if let Some(versions) = pending_green.owed.get_mut(&host) {
-        versions.remove(&version);
-        if versions.is_empty() {
-          pending_green.owed.remove(&host);
-        }
-      }
-    }
-  }
   let everyone = pending
     .record
     .candidates
@@ -2164,6 +2088,37 @@ fn record_merge_acks(
   if let Some(placed) = newly_placed {
     resolve_accepted(state, object, placed);
   }
+}
+
+/// Folds a round's acknowledgements into `version`'s pending record, never overwriting earlier ones, and clears
+/// what each acknowledging holder was owed of it. A holder accepts a merge record only once it holds the inputs the
+/// record names, so its acknowledgement places them too. Whether any holder newly acknowledged the record.
+fn fold_acknowledgements(
+  pending_green: &mut PendingGreen,
+  version: u64,
+  acked: Vec<HostId>,
+) -> bool {
+  let PendingGreen { records, owed } = pending_green;
+  let Some(pending) = records.get_mut(&version) else {
+    return false;
+  };
+  let mut acknowledged = false;
+  for host in acked {
+    if pending.inputs.candidates.contains(&host) && !pending.inputs.acked.contains(&host) {
+      pending.inputs.acked.push(host);
+    }
+    if pending.record.candidates.contains(&host) && !pending.record.acked.contains(&host) {
+      pending.record.acked.push(host);
+      acknowledged = true;
+      if let Some(versions) = owed.get_mut(&host) {
+        versions.remove(&version);
+        if versions.is_empty() {
+          owed.remove(&host);
+        }
+      }
+    }
+  }
+  acknowledged
 }
 
 /// Where a deferred reply is written (AUD-11): the shard whose client ring holds the request, the
@@ -2644,12 +2599,11 @@ mod tests {
     );
   }
 
-  /// AC-8.19 / T-8.17, AUD-13: a record's inputs reached quorum without C. Expect to ship
-  /// to B now and leave C waiting for inputs; after C holds them its record becomes dispatchable.
+  /// AC-8.19 / T-8.17, AUD-13, §4.16 "Commit" in one exchange a version: B holds a record's inputs and C does not.
+  /// Expect the record to carry its inputs to a set of targets that includes C, and to go bare once C holds them.
   #[test]
-  fn quorum_input_placement_preserves_a_lagging_holders_input_debt() {
+  fn a_record_carries_its_inputs_while_a_target_lacks_them() {
     let (local, second, third) = (HostId(1), HostId(2), HostId(3));
-    let quorum = Quorum { f: 1 };
     let candidates = vec![local, second, third];
     let mut pending = PendingMergeRecord {
       value: MergeRecordValue {
@@ -2676,12 +2630,54 @@ mod tests {
         joint: Vec::new(),
       },
     };
-    assert_eq!(
-      record_targets(&pending, &[second, third], quorum),
-      vec![second]
-    );
+    assert!(carries_inputs(&pending, &[second, third]));
+    assert!(!carries_inputs(&pending, &[second]));
     pending.inputs.acked.push(third);
-    assert_eq!(record_targets(&pending, &[third], quorum), vec![third]);
+    assert!(!carries_inputs(&pending, &[second, third]));
+    pending.value.inputs = None;
+    pending.inputs.acked.clear();
+    assert!(
+      !carries_inputs(&pending, &[second, third]),
+      "a version without inputs carries none"
+    );
+  }
+
+  /// §4.16 "Commit" in one exchange a version: a shipment's frames come back as they were framed, an empty set too.
+  #[test]
+  fn a_merge_shipment_decodes_to_the_frames_it_was_made_from() {
+    let frames = vec![b"record".to_vec(), Vec::new(), vec![7; 300]];
+    let bytes = encode_shipment(&frames);
+    let decoded = decode_shipment(&bytes).expect("a shipment decodes");
+    assert_eq!(
+      decoded,
+      frames.iter().map(Vec::as_slice).collect::<Vec<_>>()
+    );
+    assert_eq!(decode_shipment(&encode_shipment(&[])), Some(Vec::new()));
+  }
+
+  /// CLAUDE.md §4 hostile input: a shipment whose count or a length runs past its bytes, a truncated header, bytes
+  /// left over, or a count of `u32::MAX`, is refused, never read past its end or allocated for.
+  #[test]
+  fn a_hostile_merge_shipment_is_refused() {
+    let good = encode_shipment(&[b"record".to_vec(), b"offer".to_vec()]);
+    for cut in 0..good.len() {
+      assert_eq!(decode_shipment(&good[..cut]), None, "truncated at {cut}");
+    }
+    let mut extra = good.clone();
+    extra.push(0);
+    assert_eq!(decode_shipment(&extra), None, "bytes left over");
+    assert_eq!(
+      decode_shipment(&u32::MAX.to_le_bytes()),
+      None,
+      "a count of u32::MAX"
+    );
+    let mut long = encode_shipment(&[b"record".to_vec()]);
+    long[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(
+      decode_shipment(&long),
+      None,
+      "a frame length past the bytes"
+    );
   }
 
   /// AC-6.3, §4.16 ordered holder replication; AUD-13: A and B place version 0 while C is
@@ -2744,12 +2740,11 @@ mod tests {
       let shipments = |state: &mut ShardState| {
         next_merge_work(state, local)
           .into_iter()
-          .filter_map(|work| match work {
-            MergeWork::Ship {
-              version, targets, ..
-            } => Some((version, targets)),
-            _ => None,
-          })
+          .map(
+            |MergeWork::Ship {
+               version, targets, ..
+             }| (version, targets),
+          )
           .collect::<Vec<_>>()
       };
       let before = shipments(state);

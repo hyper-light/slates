@@ -11385,6 +11385,138 @@ fn a_submit_at_f1_is_answered_without_waiting_for_the_coordinators_period() {
   );
 }
 
+/// §4.16 "Commit" in one exchange a version (A-235's follow-up; the bug record of 2026-11-07, a version's inputs and
+/// record took five hops). A version's inputs were put through the content exchange (an offer, then the transfer) and
+/// its record shipped after, each behind its own wake of the record plane, so one submit at `f = 1` crossed five hops:
+/// 15 ms at load 130, 6.7 ms quiet. Do: on a settled three-node fleet at `f = 1`, submit twenty works over one green one
+/// after another. Expect every submit accepted as the next version, and every version's inputs carried to a holder
+/// inside the merge record that names them (`merge.inputs_carried`), in the one exchange that commits it.
+#[test]
+fn a_merge_version_reaches_each_holder_with_its_inputs_in_one_exchange() {
+  /// Shape: submits made, one after another (the same count as the coordinator-period test).
+  const SUBMITS: u64 = 20;
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<_> = names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<_> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<_> = nodes
+    .iter()
+    .map(|(_, _, identity)| identity.certificate())
+    .collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 1);
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("create green");
+  };
+  let answers = timed_submits(&mut client, green, SUBMITS);
+  let counters = merge_and_content_counters(&daemons);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  for (index, _, submitted, _) in &answers {
+    assert_eq!(
+      *submitted,
+      ReplyBody::Submitted {
+        version: Some(index + 1),
+        conflicts: Vec::new(),
+      },
+      "submit {index} is accepted as the next version"
+    );
+  }
+  let carried: u64 = counters
+    .iter()
+    .skip(1)
+    .flatten()
+    .filter(|(name, _)| name == "merge.inputs_carried")
+    .map(|(_, count)| count)
+    .sum();
+  assert!(
+    carried >= SUBMITS,
+    "every version's inputs reached a holder inside its merge record ({carried} of at least {SUBMITS}): {counters:?}"
+  );
+}
+
+/// §4.10 content retention, §4.16 "Commit" (the bug record of 2026-11-07, retention decoded every merge record per put).
+/// A holder's retention rule asked, for each manifest it held, whether any position of the green's merge ledger named it,
+/// decoding every position each time: quadratic in the green's history, so a submit at `f = 1` slowed by about 40 µs a
+/// version (247 µs over the first 50 submits, 20 ms by the 500th). Do: on a settled three-node fleet at `f = 1`, submit
+/// 300 works over one green one after another. Expect every submit accepted, and the median of the last 50 answers no
+/// more than four times the first 50's plus 2 ms: a submit late in a green's history costs what an early one does.
+#[test]
+fn a_submit_late_in_a_greens_history_is_answered_as_fast_as_an_early_one() {
+  /// Shape: submits made, one after another; enough history for a per-version cost to show (12 ms by the 300th).
+  const SUBMITS: u64 = 300;
+  /// Shape: the submits each end's median is taken over.
+  const WINDOW: usize = 50;
+  /// Shape: how much slower the late window may be than the early one before a per-version cost is declared, and the
+  /// absolute slack for a loaded machine's scheduling.
+  const SLOWER_AT_MOST: u32 = 4;
+  /// Shape: see [`SLOWER_AT_MOST`].
+  const SLACK: Duration = Duration::from_millis(2);
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<_> = names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<_> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<_> = nodes
+    .iter()
+    .map(|(_, _, identity)| identity.certificate())
+    .collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 1);
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("create green");
+  };
+  let answers = timed_submits(&mut client, green, SUBMITS);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  for (index, _, submitted, _) in &answers {
+    assert_eq!(
+      *submitted,
+      ReplyBody::Submitted {
+        version: Some(index + 1),
+        conflicts: Vec::new(),
+      },
+      "submit {index} is accepted as the next version"
+    );
+  }
+  let median_of = |window: &[(u64, ReplyBody, ReplyBody, Duration)]| {
+    let mut waits: Vec<Duration> = window.iter().map(|(_, _, _, waited)| *waited).collect();
+    waits.sort();
+    waits.get(waits.len() / 2).copied().unwrap_or(Duration::MAX)
+  };
+  let early = median_of(answers.get(..WINDOW).unwrap_or_default());
+  let late = median_of(
+    answers
+      .get(answers.len().saturating_sub(WINDOW)..)
+      .unwrap_or_default(),
+  );
+  eprintln!(
+    "submit answers at f = 1 over {SUBMITS} versions: early median {early:?}, late median {late:?}"
+  );
+  assert!(
+    late <= early * SLOWER_AT_MOST + SLACK,
+    "a submit late in the green's history is answered as fast as an early one: early median {early:?}, late median \
+     {late:?} over {WINDOW} submits each"
+  );
+}
+
 /// `count` works over `green`, each with one edit declared and then submitted, one after another: each work's index,
 /// its edit's reply, its submit's reply and how long the submit took to answer.
 fn timed_submits(
