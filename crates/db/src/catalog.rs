@@ -388,6 +388,13 @@ pub enum Consumer {
   /// the record's principal names. It ends with the device: the guest's hangup, a revocation, a detach, the
   /// volume's destroy, and the daemon's process (recovery ends it, as it ends a FUSE mount). Appended.
   Guest,
+  /// A CLI attachment (§4.7, A-230): one a process makes and exits, for later processes to name, so it outlives the
+  /// client that made it. It holds a term, the failover SLO as the write lease's does, renewed by every verb that names
+  /// it, and ends at the term's lapse: an abandoned one releases its volume's write lease within one term. Appended.
+  Termed {
+    /// When its term lapses, on the shard's monotonic clock.
+    expires_ns: u64,
+  },
 }
 
 /// The form of an attachment. Append-only.

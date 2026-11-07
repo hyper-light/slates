@@ -869,6 +869,44 @@ fn a_create_before_bootstrap_is_refused_naming_the_command_that_fixes_it() {
   drop(anchor);
 }
 
+/// Shape: how long `a_cli_attachment_outlives_the_process_that_made_it` waits between its verbs: past the reaper's
+/// silence (one liveness budget) and its next sweep (one more), which ended a CLI attachment before A-230 (GAPS
+/// 2026-10-23 and 2026-10-27, measured 3 of 3 with a 2.5 s pause).
+const PAST_THE_REAPER: Duration = Duration::from_millis(2_500);
+
+/// A-230 (§4.7; docs/cli.md's flow). Do: `slates attach --write` a volume, which exits; wait past the reaper's sweep;
+/// `slates write` a file under the attachment from a later process; wait again; `slates detach` it. Expect: the write
+/// and the detach succeed: a CLI attachment outlives the process that made it, for its term, renewed by each verb that
+/// names it. Before A-230 the reaper ended it with its client, about a second after `attach` exited, and the write was
+/// refused `NotFound`.
+#[test]
+fn a_cli_attachment_outlives_the_process_that_made_it() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the CLI attachment's term: set SLATES_TEST_CLI=1 to run it (a real anchor and daemon)"
+    );
+    return;
+  }
+  let instance = format!("cli-term-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let id = created_volume(&instance, "termed");
+  let (code, out, err) = run(&instance, &["attach", &id, "--write"]);
+  assert_eq!(code, 0, "attach: {err}");
+  let attachment = value_of(&out, "attachment");
+  #[allow(clippy::disallowed_methods)] // a test waiting out the reaper it checks
+  std::thread::sleep(PAST_THE_REAPER);
+  let (code, _, err) = run_with_stdin(&instance, &["write", &id, &attachment, "kept.txt"], b"kept");
+  assert_eq!(
+    code, 0,
+    "a write under the attachment after its process exited: {err}"
+  );
+  #[allow(clippy::disallowed_methods)] // the same wait again, after the renewal
+  std::thread::sleep(PAST_THE_REAPER);
+  let (code, _, err) = run(&instance, &["detach", &attachment]);
+  assert_eq!(code, 0, "detach: {err}");
+  drop(anchor);
+}
+
 #[test]
 fn the_anchor_supervises_a_daemon_the_verbs_answer_and_the_daemon_leaves_with_the_anchor() {
   // This spawns a real anchor and daemon (subprocesses with spinning shards) and a `slates`

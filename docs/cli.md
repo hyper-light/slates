@@ -10,7 +10,11 @@ locked backing, and bounded/dynamic claims do not yet provide the design's host-
 guarantee. A daemon restart under the same anchor keeps acknowledged content and its snapshots
 (`acknowledged_content_and_its_snapshot_survive_a_daemon_restart_byte_for_byte`); the anchor's own death
 loses RAM by design.
-`attach` returns an attachment record without creating a mounted path. `exec` is Linux-only
+`attach` returns an attachment record without creating a mounted path. A CLI attachment outlives the `slates attach`
+that made it, for later `slates` runs to name (`write ID ATTACHMENT`, `detach ATTACHMENT`, `advance`). It lasts one
+term, the daemon's failover SLO (10 s unless `slates anchor` is given another), and every verb that names it renews the
+term. It ends at the term's lapse with the write lease it held. A verb that names it after is refused
+`AttachmentExpired`, never `NotFound`: attach again. An SDK client's attachments end with the client instead. `exec` is Linux-only
 and currently expects an externally supplied `SLATES_ROOT` naming an established root mount.
 There is no implemented CLI/MCP virtio-fs or OCI attachment flow; the MCP server (`slates mcp`)
 and the Python and Node SDKs are implemented (§4.12). On macOS a volume can be mounted for real

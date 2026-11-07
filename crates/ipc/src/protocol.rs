@@ -2282,6 +2282,10 @@ pub enum AttachRequest {
     /// The drive letter and its colon (`S:`).
     mount_point: String,
   },
+  /// A CLI attachment (§4.7, A-230): the record form, made by a process that exits for later processes to name. It
+  /// outlives its client for a term, the failover SLO as the write lease's, renewed by every verb that names it, and
+  /// ends at the term's lapse; a verb naming it after is refused `AttachmentExpired`. Appended.
+  Termed,
 }
 
 impl AttachRequest {
@@ -2870,6 +2874,12 @@ pub enum Refusal {
   MapsHeld {
     /// The writable maps held under the attachment.
     maps: u64,
+  },
+  /// A verb named a CLI attachment whose term lapsed (§4.7, A-230): it ended then, its write lease with it, and is
+  /// named here rather than as unknown, so a user who paused past the term learns why. Attach again. Appended.
+  AttachmentExpired {
+    /// The attachment.
+    attachment: u64,
   },
 }
 

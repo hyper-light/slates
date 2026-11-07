@@ -4125,6 +4125,10 @@ root-relative path as an explicit alternative; it does not report that the reque
 > all nine on macOS (0.53 s). Record:
 > `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
 
+> **Status (2026-11-06, A-230).** A CLI attachment (`slates attach`) is not the client's to take with it. It holds a
+> term, the failover SLO as the write lease's, renewed by each verb that names it. It ends at the lapse with its lease,
+> and a later use is refused `AttachmentExpired`. Only an SDK client's attachments end with the client, as below.
+
 > **Status (2026-09-20, A-28).** Client retirement reserves the dead client's seat and id
 > until every owner shard has removed its SDK attachments. Unsent forwards are cancelled;
 > read-only gathers follow already-admitted synchronous attachment verbs, and removal names
@@ -13101,6 +13105,36 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Arm64 Windows proven** since (2026-10-27): the direct-map client tests, 20 of 20, on CI's `windows-11-arm` (run
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
+
+### A-230 — A CLI attachment holds a term, renewed by each verb that names it (accepted 2026-11-06, the supervisor's decision: option 2)
+Applied in the same change to: §4.7 (a dead client's attachments: the CLI's are excepted), `docs/cli.md`, GAPS,
+`crates/db` (`Consumer::Termed`, appended; `AttachmentRenewed` and `AttachmentExpired`, appended; the partition's expired
+attachments and their snapshot field, appended), `crates/ipc` (`AttachRequest::Termed` and `Refusal::AttachmentExpired`,
+appended), `crates/server` (`verbs::attachment_term`, `use_attachment`, `expire_lapsed_attachments`, `Ending::Expired`;
+the reaper's loop; the verbs that name an attachment), `crates/cli` (`slates attach` makes the termed form),
+`xtask/src/kind_export.rs` (its helper's note).
+- **What was wrong.** The reaper ends a dead client's attachments (A-28), and `slates attach` is a client that prints an
+  id and exits. So the documented flow of `attach`, then `write ID ATTACHMENT` or `detach ATTACHMENT` from later runs,
+  worked only if they came within about a second (red 3 of 3 with a 2.5 s pause, GAPS 2026-10-23).
+- **The rule.** A CLI attachment (`Consumer::Termed`) is exempt from the dead-client reaper and holds a term instead.
+  - The term is the operator's failover SLO, derived as the write lease's: `derived!(failover_slo_ns, …)`, 10 s by
+    default. A write attachment holds the lease, so its term is the lease's.
+  - Every verb that names it (`Fs*`, `detach`, `advance`, `bind`) renews it once less than half the term is left:
+    one durable record per half term of use, never one per verb.
+  - It ends at the lapse, by the reaper's sweep or the first use after, as a detach does. The write lease goes with
+    it, recorded `AttachmentExpired`.
+  - A later use is refused `AttachmentExpired`, never `NotFound`. The partition keeps the expired ids, at most its
+    attachment capacity of them, oldest first out.
+- **Why not the others.** A CLI attachment until `detach` would let an abandoned write attachment hold the lease forever:
+  a count bounds how many, not how long. A process holding it breaks the documented flow. A term is bounded by
+  construction.
+- **Evidence.**
+  - `a_cli_attachment_outlives_the_process_that_made_it` (`crates/cli/tests/cli.rs`): attach, 2.5 s, write, 2.5 s,
+    detach. Red `NotFound` before, green after.
+  - `a_cli_attachment_lives_its_term_renewed_by_use_and_is_refused_as_expired_after` (`crates/server/tests/
+    attachment_term.rs`, a 3 s term): it survives its client, a use past half the term renews it past the first term's
+    end, it is refused `AttachmentExpired` by a write and by a detach after a lapse, and its write lease is free.
+  - Red-checked: with the renewal off, the second write is refused; with the expired ids ignored, `NotFound`.
 
 ### A-229 — A clone's name is held at its name's partition by an alias, made by a reservation protocol (accepted 2026-11-06, the supervisor's decision: option 3)
 Applied in the same change to: §4.8 "Lookup" (its status), GAPS, the bug record of 2026-09-13

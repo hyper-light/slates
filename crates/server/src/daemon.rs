@@ -3546,6 +3546,8 @@ async fn reap_loop() {
     pace(cadence).await;
     state::with_state(|s| {
       let _ = verbs::expire_leases(s);
+      // A CLI attachment whose term lapsed ends here, within a term and a sweep of its last use (A-230).
+      let _ = verbs::expire_lapsed_attachments(s);
       // A destroy whose completion the catalog refused is recorded again here, at the reaper's cadence
       // (`verbs::step_destroys`), rather than in a busy serve round.
       let _ = verbs::step_destroys(s);

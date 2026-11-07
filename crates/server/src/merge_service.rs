@@ -584,10 +584,11 @@ pub(crate) fn attach_green(
   if !rights_of(record, principal).read {
     return forbidden("attach");
   }
-  let consumer = match crate::verbs::consumer_of(form, client_id) {
-    Ok(consumer) => consumer,
-    Err(refusal) => return refused(refusal),
-  };
+  let consumer =
+    match crate::verbs::consumer_of(form, client_id, crate::verbs::termed_expiry(state)) {
+      Ok(consumer) => consumer,
+      Err(refusal) => return refused(refusal),
+    };
   let Some(engine) = state.greens.get(&record.id) else {
     return refused(Refusal::NotFound);
   };
@@ -664,6 +665,10 @@ pub(crate) fn advance(
   attachment: u64,
   version: Option<u64>,
 ) -> ReplyBody {
+  // A CLI attachment is renewed by the verb, or refused once its term lapsed (A-230).
+  if let Err(refusal) = crate::verbs::use_attachment(state, attachment) {
+    return refused(refusal);
+  }
   let Some(record) = state.db.partition().attachment(attachment).cloned() else {
     return refused(Refusal::NotFound);
   };

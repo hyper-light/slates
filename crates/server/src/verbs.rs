@@ -3397,6 +3397,7 @@ fn gather(request: u64, part: Vec<VolumeSummary>) {
 pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
   match r {
     Refusal::NotFound => "not_found",
+    Refusal::AttachmentExpired { .. } => "attachment_expired",
     Refusal::AlreadyExists { .. } => "already_exists",
     Refusal::StaleLease { .. } => "stale_lease",
     Refusal::LeaseHeld { .. } => "lease_held",
@@ -6499,8 +6500,9 @@ fn attach(
     Ok(binding) => binding,
     Err(refusal) => return refused(refusal),
   };
+  let expires_ns = termed_expiry(state);
   let resolved = binding.as_ref().map_or_else(
-    || consumer_of(&form, client_id).map(|consumer| (consumer, false)),
+    || consumer_of(&form, client_id, expires_ns).map(|consumer| (consumer, false)),
     |binding| {
       binding.consumer(
         state.db.partition(),
@@ -7114,7 +7116,11 @@ pub(crate) fn mint_mount_token() -> Option<[u8; 16]> {
 /// keeps the listener across a restart), ending with the kernel's `UMNT`, a `detach`, or the volume's
 /// destroy. A root record is the ring client's. OCI requires a verified source dependency,
 /// constructed separately by `oci::Binding::consumer`; a guest requires its owned device seam.
-pub(crate) fn consumer_of(form: &AttachRequest, client_id: u32) -> Result<Consumer, Refusal> {
+pub(crate) fn consumer_of(
+  form: &AttachRequest,
+  client_id: u32,
+  expires_ns: u64,
+) -> Result<Consumer, Refusal> {
   match form {
     AttachRequest::HostMount
     | AttachRequest::FuseMount { .. }
@@ -7124,6 +7130,8 @@ pub(crate) fn consumer_of(form: &AttachRequest, client_id: u32) -> Result<Consum
     | AttachRequest::BoundHostMount { .. }
     | AttachRequest::WinFspMount { .. } => Ok(Consumer::Bridge),
     AttachRequest::Root => Ok(Consumer::Sdk { client: client_id }),
+    // A CLI attachment outlives its client for a term (A-230), lapsing at `expires_ns`.
+    AttachRequest::Termed => Ok(Consumer::Termed { expires_ns }),
     AttachRequest::Oci { .. } => Err(Refusal::AttachmentUnsupported {
       transport: AttachTransport::Oci,
       reason: UnsupportedReason::HostMountRequired,
@@ -7136,6 +7144,25 @@ pub(crate) fn consumer_of(form: &AttachRequest, client_id: u32) -> Result<Consum
     // vhost-user device the verb hands out (G-vhost).
     AttachRequest::ShardsFs { .. } | AttachRequest::VhostUserFs { .. } => Ok(Consumer::Guest),
   }
+}
+
+/// A CLI attachment's term (A-230, §4.7): the operator's failover SLO, as the write lease's (`take_write_lease`). The
+/// attachment holds the volume's write lease for an attach-for-write, so its term is the lease's: a renewal by each verb
+/// naming it keeps both for a user at work, and an abandoned one lets the lease go within one term, past which the
+/// failover SLO would be broken for any other writer anyway.
+pub(crate) fn attachment_term(state: &ShardState) -> u64 {
+  derived!(
+    state.config.failover_slo_ns,
+    "the operator's failover SLO, the write lease's term (a renewal is a verb's own round trip, microseconds)",
+    ["failover_slo_ns"]
+  )
+  .get()
+}
+
+/// When a CLI attachment made or renewed now lapses (A-230): one [`attachment_term`] from the shard's clock.
+pub(crate) fn termed_expiry(state: &mut ShardState) -> u64 {
+  let term = attachment_term(state);
+  state.clock.monotonic_ns().saturating_add(term)
 }
 
 /// The rights an attachment records (§4.13 "Access lists"; AUD-01): the principal's rights on the volume
@@ -7163,10 +7190,10 @@ fn establish_form(
   form: &AttachRequest,
 ) -> Result<Option<crate::oci::Binding>, Refusal> {
   let (source, destination) = match form {
-    // The record forms: nothing to establish — the SDK's record, and the host mount the requesting
-    // process establishes itself with the capability the reply carries (`mount_nfs`, R10: no privilege
-    // and nothing of the daemon's touches the mount table).
-    AttachRequest::Root => return Ok(None),
+    // The record forms: nothing to establish — the SDK's record, a CLI's (A-230), and the host mount the
+    // requesting process establishes itself with the capability the reply carries (`mount_nfs`, R10: no
+    // privilege and nothing of the daemon's touches the mount table).
+    AttachRequest::Root | AttachRequest::Termed => return Ok(None),
     // A scoped host mount presents the live head beneath one directory; a snapshot of a subtree is not
     // presented (its scope and its version would both have to hold through one view). A bound host mount
     // presents the live head too (§4.6 A-115).
@@ -7296,6 +7323,10 @@ fn take_write_lease(
 }
 
 fn detach(state: &mut ShardState, principal: &Principal, attachment: u64) -> ReplyBody {
+  // A CLI attachment past its term is refused as expired, never as unknown (A-230).
+  if let Err(refusal) = use_attachment(state, attachment) {
+    return refused(refusal);
+  }
   let Some(record) = state.db.partition().attachment(attachment).cloned() else {
     return refused(Refusal::NotFound);
   };
@@ -7334,6 +7365,10 @@ fn bind_mount(
   attachment: u64,
   path: &str,
 ) -> ReplyBody {
+  // A CLI attachment is renewed by the verb, or refused once its term lapsed (A-230).
+  if let Err(refusal) = use_attachment(state, attachment) {
+    return refused(refusal);
+  }
   let Some(record) = state.db.partition().attachment(attachment).cloned() else {
     return refused(Refusal::NotFound);
   };
@@ -7407,6 +7442,67 @@ pub(crate) enum Ending {
   /// Anything else (a revocation, the mount's own end, a protocol's unmount): the mount, if any, stays until its
   /// user unmounts it.
   Otherwise,
+  /// A CLI attachment's term lapsed (A-230): recorded as expired, so a later use is refused `AttachmentExpired`.
+  Expired,
+}
+
+/// A verb's use of attachment `attachment` against its term (A-230, §4.7). A CLI attachment within its term is renewed
+/// when less than half of the term is left, so a user at work keeps it with one durable record per half term, never one
+/// a verb; one past its term is ended now, as its lapse would end it, and refused. An id the partition recorded as
+/// expired is refused `AttachmentExpired`, never `NotFound`. Any other attachment, or none, passes, for the verb's own
+/// lookup to answer.
+pub(crate) fn use_attachment(state: &mut ShardState, attachment: u64) -> Result<(), Refusal> {
+  let expired = Refusal::AttachmentExpired { attachment };
+  let Some(record) = state.db.partition().attachment(attachment).cloned() else {
+    return if state.db.partition().attachment_expired(attachment) {
+      Err(expired)
+    } else {
+      Ok(())
+    };
+  };
+  let Consumer::Termed { expires_ns } = record.consumer else {
+    return Ok(());
+  };
+  let now = state.clock.monotonic_ns();
+  if expires_ns <= now {
+    end_attachment(state, &record, Ending::Expired).map_err(|e| refusal_of_db(&e))?;
+    return Err(expired);
+  }
+  let term = attachment_term(state);
+  if expires_ns.saturating_sub(now) < term / 2 {
+    let renewal = Op::AttachmentRenewed {
+      id: attachment,
+      expires_ns: now.saturating_add(term),
+    };
+    state
+      .db
+      .mutate(&mut state.segment, &renewal, now)
+      .map_err(|e| refusal_of_db(&e))?;
+  }
+  Ok(())
+}
+
+/// Ends every CLI attachment of this partition whose term has lapsed (A-230): as a detach would, releasing the write
+/// lease it held, recorded as expired. Run at the reaper's cadence, so an abandoned one ends within a term and a sweep.
+/// The attachments ended.
+pub(crate) fn expire_lapsed_attachments(state: &mut ShardState) -> usize {
+  let now = state.clock.monotonic_ns();
+  let lapsed: Vec<AttachmentRecord> = state
+    .db
+    .partition()
+    .attachments()
+    .filter(
+      |record| matches!(record.consumer, Consumer::Termed { expires_ns } if expires_ns <= now),
+    )
+    .cloned()
+    .collect();
+  let mut ended = 0usize;
+  for record in lapsed {
+    if end_attachment(state, &record, Ending::Expired).is_ok() {
+      ended = ended.saturating_add(1);
+    }
+  }
+  ended
 }
 
 /// Ends an attachment on its owner shard — the `detach` verb's effect, and the kernel's `UMNT` of a host
@@ -7420,11 +7516,11 @@ pub(crate) fn end_attachment(
   ending: Ending,
 ) -> Result<(), DbError> {
   let now = state.clock.monotonic_ns();
-  state.db.mutate(
-    &mut state.segment,
-    &Op::AttachmentRemoved { id: record.id },
-    now,
-  )?;
+  let removal = match ending {
+    Ending::Expired => Op::AttachmentExpired { id: record.id },
+    Ending::Detached | Ending::Otherwise => Op::AttachmentRemoved { id: record.id },
+  };
+  state.db.mutate(&mut state.segment, &removal, now)?;
   crate::merge_service::forget_attachment(state, record.id);
   // A guest device's record ends its device: the loop is asked to revoke and runs its terminal step, which
   // sweeps the device's references through its view and only then closes it (AUD-29-68).

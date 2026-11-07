@@ -12118,7 +12118,10 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
 - **Two rounds are built whole in one turn (open, from A-158).** A-141's `everything_told` and the journal gather each
   build a round over everything they name on the serving thread, against the bounded-work rule the takeover round now
   follows. Not measured.
-- **A CLI attachment dies about a second after its `attach` exits (open, found 2026-10-23).** A dead client's
+- **A CLI attachment dies about a second after its `attach` exits (open, found 2026-10-23; fixed 2026-11-06 by A-230,
+  bug-sweep).** A CLI attachment now holds a term, the failover SLO as the write lease's, renewed by each verb that names
+  it. It ends at the lapse with its lease, and a later use is refused `AttachmentExpired`. Red first:
+  `a_cli_attachment_outlives_the_process_that_made_it`. The record as found: A dead client's
   attachments are removed everywhere by design (§4.7, A-28). `slates attach` is a process that prints the id and
   exits, so its attachment is reaped once the reaper sees the client silent past the liveness budget (1 s, seen
   within two). `docs/cli.md`'s flow of `attach`, then `write ID ATTACHMENT` or `detach ATTACHMENT` from later
@@ -13163,7 +13166,8 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   `-C target-feature=+crt-static` it runs there whole, the daemon included (run 40582122662). **Addressed 2026-11-04
   (A-210):** `release.yml` builds both Windows binaries with `+crt-static`, and the x86_64 one must answer `slates
   version` in a process-isolated `nanoserver:ltsc2025` container before it may ship. The CI run is recorded in A-210.
-- **A CLI attachment ends about a second after the `slates attach` that made it (open, seen 2026-10-27).** The reaper
+- **A CLI attachment ends about a second after the `slates attach` that made it (open, seen 2026-10-27; fixed
+  2026-11-06 by A-230, the entry above).** The reaper
   removes a dead client's attachments at the liveness cadence (`crates/server/src/reap.rs`, every 1 s), and each `slates`
   run is a client of its own. So `slates attach`, then `slates write`, then `slates detach`, each a process, races the
   sweep. The KIND legs' helper (`write_through_slates` in `xtask/src/kind_export.rs`) does exactly that. On this Mac at

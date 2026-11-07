@@ -379,6 +379,19 @@ pub enum Op {
     /// The name.
     name: String,
   },
+  /// A CLI attachment's term was renewed by a verb naming it (A-230). Appended.
+  AttachmentRenewed {
+    /// The attachment.
+    id: u64,
+    /// When its renewed term lapses.
+    expires_ns: u64,
+  },
+  /// A CLI attachment's term lapsed: it is removed, and its id kept among the expired so a later use is refused by kind
+  /// (A-230). Appended.
+  AttachmentExpired {
+    /// The attachment.
+    id: u64,
+  },
 }
 
 impl Op {
@@ -441,6 +454,8 @@ impl Op {
       Op::NameAliasReserved { .. } => "name_alias_reserved",
       Op::NameAliasConfirmed { .. } => "name_alias_confirmed",
       Op::NameAliasReleased { .. } => "name_alias_released",
+      Op::AttachmentRenewed { .. } => "attachment_renewed",
+      Op::AttachmentExpired { .. } => "attachment_expired",
       Op::LiveShippingChanged { .. } => "live_shipping_changed",
     }
   }
