@@ -99,6 +99,9 @@ enum Kind {
 enum Outcome {
   Accepted(u64),
   Conflict(Vec<(String, u64, u64)>),
+  /// The client gave up with the submit in flight (the daemon gone past its reconnect budget, a reply lost): the
+  /// green may or may not have taken it, which the oracle settles from the green itself ([`resolve_unknown`]).
+  Unknown,
 }
 
 /// The conflict classes a conflict reply named, kept beside the windows for the event dump.
@@ -429,6 +432,20 @@ impl Agent {
 
   fn give_up(&mut self, tally: &mut Tally, why: &str) {
     *tally.refusals.entry(why.to_owned()).or_default() += 1;
+    // A submit in flight when the client gives up has an outcome the client never learned: kept, so the oracle can
+    // settle it from the green rather than take it for never accepted.
+    if let Some((_, sent_ns, Kind::SubmitAccepted)) = self.inflight {
+      tally.submits.push(SubmitEvent {
+        base: self.base,
+        sent_ns,
+        replied_ns: sent_ns,
+        slots: self.slots().to_vec(),
+        outcome: Outcome::Unknown,
+        agent: self.id,
+        round: self.round,
+        classes: Vec::new(),
+      });
+    }
     self.step = Step::Done;
     self.inflight = None;
   }
@@ -1224,7 +1241,7 @@ fn oracle(
     .collect();
   accepted.sort_by_key(|e| match e.outcome {
     Outcome::Accepted(v) => v,
-    Outcome::Conflict(_) => 0,
+    Outcome::Conflict(_) | Outcome::Unknown => 0,
   });
   for (index, event) in accepted.iter().enumerate() {
     if let Outcome::Accepted(v) = event.outcome
@@ -1248,6 +1265,8 @@ fn oracle(
           ));
         }
       }
+      // An outcome still unknown after `resolve_unknown` was not taken by the green: it judges nothing.
+      Outcome::Unknown => {}
       Outcome::Conflict(windows) => {
         let reported: BTreeSet<(String, u64, u64)> = windows.iter().cloned().collect();
         let low = accepted
@@ -1284,12 +1303,73 @@ fn oracle(
     }
   }
   println!(
-    "oracle\t{n}\taccepted\t{}\tconflicts\t{}\tfiles_checked\t{}\toracle_failures\t{failures}",
+    "oracle\t{n}\taccepted\t{}\tconflicts\t{}\tunknown\t{}\tfiles_checked\t{}\toracle_failures\t{failures}",
     accepted.len(),
-    submits.len() - accepted.len(),
+    submits
+      .iter()
+      .filter(|e| matches!(e.outcome, Outcome::Conflict(_)))
+      .count(),
+    submits
+      .iter()
+      .filter(|e| matches!(e.outcome, Outcome::Unknown))
+      .count(),
     replayed.len()
   );
   failures
+}
+
+/// Settles the submits whose outcome their clients never learned, from the green itself: every version of this level
+/// the green holds that no known acceptance names is matched to the unknown submit whose slots hold that client's own
+/// bytes at it and did not all hold them at the version before (each client's bytes are unique to it and its round).
+/// A matched submit becomes accepted at that version; an unmatched one was never taken. Returns the versions no submit
+/// explains, each a failure: a version nobody of this level submitted. Version numbers here are this level's (rebased
+/// to `head_before`), as the oracle's are.
+fn resolve_unknown(
+  reader: &mut Client,
+  green: VolumeId,
+  head_before: u64,
+  submits: &mut [SubmitEvent],
+) -> Vec<u64> {
+  let head = reader.versions(green).unwrap().saturating_sub(head_before);
+  let known: BTreeSet<u64> = submits
+    .iter()
+    .filter_map(|e| match e.outcome {
+      Outcome::Accepted(v) => Some(v),
+      _ => None,
+    })
+    .collect();
+  let mut unexplained = Vec::new();
+  for version in (1..=head).filter(|v| !known.contains(v)) {
+    let matched = submits.iter().position(|event| {
+      matches!(event.outcome, Outcome::Unknown)
+        && holds_its_bytes(reader, green, event, head_before + version)
+        && !holds_its_bytes(reader, green, event, head_before + version - 1)
+    });
+    match matched {
+      Some(index) => submits[index].outcome = Outcome::Accepted(version),
+      None => unexplained.push(version),
+    }
+  }
+  unexplained
+}
+
+/// Whether every slot of `event` holds the event's own bytes at the green's `version`.
+fn holds_its_bytes(
+  reader: &mut Client,
+  green: VolumeId,
+  event: &SubmitEvent,
+  version: u64,
+) -> bool {
+  event.slots.iter().all(|slot| {
+    let reply = reader.call(&RequestBody::ReadRange {
+      volume: green,
+      path: slot.path.clone(),
+      at: ReadAt::Version { version },
+      offset: slot.at,
+      max: SLOT_BYTES,
+    });
+    matches!(reply, Ok(ReplyBody::ReadPage { bytes, .. }) if bytes == slot.bytes)
+  })
 }
 
 /// Reads every file the plan names at the green's `at` view.
@@ -1464,6 +1544,7 @@ fn level(
       *v -= head_before;
     }
   }
+  let unexplained = resolve_unknown(&mut reader, green, head_before, &mut total.submits);
   let head = read_files(&mut reader, green, &paths, ReadAt::Head);
   if std::env::args().any(|a| a == "--events") {
     for event in &total.submits {
@@ -1484,7 +1565,14 @@ fn level(
       );
     }
   }
-  oracle(n, &total.submits, &base, &head) + own_files_oracle(n, &mut reader, green, &total.submits)
+  for version in &unexplained {
+    println!(
+      "oracle_failure\t{n}\tversion {version} is on the green but no submit of this level, known or unknown, explains it"
+    );
+  }
+  u64::try_from(unexplained.len()).unwrap_or(u64::MAX)
+    + oracle(n, &total.submits, &base, &head)
+    + own_files_oracle(n, &mut reader, green, &total.submits)
 }
 
 /// Format: the hexadecimal digits of a volume id, as the CLI prints it.
