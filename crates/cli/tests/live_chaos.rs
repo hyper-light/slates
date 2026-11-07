@@ -312,12 +312,12 @@ fn wait_formed(instances: &[String], members: usize) -> Vec<String> {
   }
 }
 
-/// Waits until every node in `instances` reports its settled generation equal to its neighbourhood generation (the
-/// fleet's objects re-placed onto the neighbourhood after a membership change), judged by progress ([`FrozenWindow`]).
+/// Waits until every node in `instances` stands at the same neighbourhood generation and has settled at it (the fleet's
+/// objects re-placed onto the neighbourhood after a membership change), judged by progress ([`FrozenWindow`]).
 fn wait_neighbourhood_settled(instances: &[String]) {
   let mut window = FrozenWindow::new();
   loop {
-    let views: Vec<(String, String)> = instances
+    let views: Vec<(Option<u64>, Option<u64>)> = instances
       .iter()
       .map(|instance| {
         let (_, out, _) = run(instance, &["status"]);
@@ -325,9 +325,7 @@ fn wait_neighbourhood_settled(instances: &[String]) {
           out
             .lines()
             .find_map(|line| line.strip_prefix(&format!("{key}: ")))
-            .unwrap_or("?")
-            .trim()
-            .to_owned()
+            .and_then(|value| value.trim().parse::<u64>().ok())
         };
         (
           read("fleet_settled_generation"),
@@ -335,10 +333,16 @@ fn wait_neighbourhood_settled(instances: &[String]) {
         )
       })
       .collect();
-    if views
+    // Every node at the same, newest generation, each settled at it: a node whose view froze (retired while away)
+    // settles at its own old generation, which proves nothing about the others (diag-30 run 4: one at 4 = 4 while the
+    // rest stood at 24).
+    let newest = views
       .iter()
-      .all(|(settled, neighbourhood)| settled != "?" && settled == neighbourhood)
-    {
+      .filter_map(|(_, neighbourhood)| *neighbourhood)
+      .max();
+    if views.iter().all(|(settled, neighbourhood)| {
+      settled.is_some() && settled == neighbourhood && *neighbourhood == newest
+    }) {
       return;
     }
     assert!(
@@ -3006,7 +3010,10 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
         instances[stale],
         began.elapsed()
       ));
-      after_writes(&owner, &volume, BETWEEN_EVENTS);
+      // One write durable without it makes it stale. More only lengthens its stop, and a stop past the failure detector
+      // retires it: with the owner's crash that is two failures at f = 1, which the register takeover rightly calls lost
+      // (diag-30 run 4, diag-28 run 8: the stale holder's configuration frozen at version 8 while the others moved on).
+      after_writes(&owner, &volume, 1);
     });
   let (current, stale) = roles.expect("the flow chose its holders' roles");
   let survivors: Vec<&str> = (0..instances.len())
