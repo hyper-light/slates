@@ -1,0 +1,43 @@
+tested 2bdaa7c03f6bc5f9ff018a377cb6b550c2f7aa51 variant after on aarch64, 4 cpus
+admitted exit 101 128s
+  admitted: b: clients_per_shard 2576 slots 32 shards 2 tasks_per_shard 10314 lane bound 164864; 645 clients x 32 forwards
+  admitted: 20609 of 20640 answered: 10207 served, 0 Overloaded; control tasks refused 0
+  admitted: thread 'a_silent_owner_leaves_no_forward_the_lane_admitted_unrun' (5543) panicked at crates/server/tests/fleet.rs:5271:3:
+  admitted: assertion `left == right` failed: every read is answered; b's hop counters summed over its shards: {"fleet.forward.batch_done": 10342, "fleet.forward.batch_given_up": 111, "fleet.forward.begun": 10447, "fleet.forward.client.control_refused": 10298, "fleet.forward.client.control_started": 10343, "fleet.forward.client.delivered_home": 10343, "fleet.forward.client.resolved": 10343, "fleet.forward.client.to_control": 10343, "fleet.forward.retried": 110, "fleet.forward.taken_for_another": 10329, "fleet.owner_location.direct": 10343, "fleet.owner_location.forward_unanswered": 111, "fleet.owner_location.route_dropped.refused": 104}
+  admitted:   left: 20609
+  admitted:  right: 20640
+  admitted: test a_silent_owner_leaves_no_forward_the_lane_admitted_unrun ... FAILED
+  admitted: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 99 filtered out; finished in 38.86s
+  admitted: error: test failed, to rerun pass `-p slates-server --test fleet`
+silent exit 101 6s
+  silent: test a_silent_forward_gives_up_while_its_session_carries_others ... FAILED
+  silent: ---- a_silent_forward_gives_up_while_its_session_carries_others stdout ----
+  silent: thread 'a_silent_forward_gives_up_while_its_session_carries_others' (5579) panicked at crates/server/tests/fleet.rs:5398:3:
+  silent: a forward its owner never answered was given up at its stall budget while the session carried 2194 other replies: batch_given_up 0; b's counters Ok({"content.purged_bytes": 696492032, "content.ticks.idle": 3, "fleet.discovery.pages": 15, "fleet.fan.sent": 3, "fleet.fan.unchanged": 31, "fleet.forward.batch_done": 2197, "fleet.forward.begun": 2197, "fleet.forward.client.control_started": 2197, "fleet.forward.client.delivered_home": 2195, "fleet.forward.client.resolved": 2197, "fleet.forward.client.to_control": 2195, "fleet.forward.session_out": 1, "fleet.forward.taken_for_another": 786, "fleet.learner.fetch_paced": 8, "fleet.learner.fetches": 2, "fleet.lent_to.take_campaign_sessions": 1, "fleet.owner_location.direct": 2197, "fleet.owner_location.route_dropped.refused": 1, "fleet.plane.announce_lends": 4, "fleet.plane.announcements_sent": 4})
+  silent: test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 98 filtered out; finished in 5.75s
+  silent: error: test failed, to rerun pass `-p slates-server --test fleet`
+server-lib exit 0 28s
+server exit 0 69s
+  server: test a_compound_retried_across_a_daemon_restart_is_answered_never_run_again ... ok
+  server: test an_open_and_a_close_retried_across_a_daemon_restart_are_answered_never_run_again ... ok
+  server: test a_guests_write_over_a_shards_stream_is_answered_once_every_fuse_mount_of_its_volume_was_told ... ok
+fleet-forward exit 101 196s
+  fleet-forward: test a_forward_answered_within_its_bounds_is_never_reported_stalled ... ok
+  fleet-forward: test a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id ... ok
+  fleet-forward: test a_silent_forward_gives_up_while_its_session_carries_others ... FAILED
+  fleet-forward: test a_silent_owner_leaves_no_forward_the_lane_admitted_unrun ... FAILED
+  fleet-forward: test an_unanswered_forward_is_sent_again_within_the_takeover_bound ... ok
+  fleet-forward: ---- a_silent_forward_gives_up_while_its_session_carries_others stdout ----
+  fleet-forward: thread 'a_silent_forward_gives_up_while_its_session_carries_others' (6876) panicked at crates/server/tests/fleet.rs:5398:3:
+  fleet-forward: a forward its owner never answered was given up at its stall budget while the session carried 2403 other replies: batch_given_up 0; b's counters Ok({"content.purged_bytes": 696492032, "content.ticks.idle": 3, "fleet.discovery.pages": 16, "fleet.fan.sent": 3, "fleet.fan.unchanged": 32, "fleet.forward.batch_done": 2406, "fleet.forward.begun": 2406, "fleet.forward.client.control_started": 2406, "fleet.forward.client.delivered_home": 2404, "fleet.forward.client.resolved": 2406, "fleet.forward.client.to_control": 2404, "fleet.forward.session_out": 8, "fleet.forward.taken_for_another": 888, "fleet.learner.fetch_paced": 8, "fleet.learner.fetches": 2, "fleet.lent_to.drive_root_replication": 6, "fleet.lent_to.link": 1, "fleet.lent_to.take_campaign_sessions": 1, "fleet.owner_location.direct": 2406, "fleet.owner_location.route_dropped.refused": 1, "fleet.plane.announce_lends": 4, "fleet.plane.announcements_sent": 4})
+  fleet-forward: ---- a_silent_owner_leaves_no_forward_the_lane_admitted_unrun stdout ----
+  fleet-forward: b: clients_per_shard 2576 slots 32 shards 2 tasks_per_shard 10314 lane bound 164864; 645 clients x 32 forwards
+  fleet-forward: 20604 of 20640 answered: 10202 served, 0 Overloaded; control tasks refused 0
+  fleet-forward: thread 'a_silent_owner_leaves_no_forward_the_lane_admitted_unrun' (6883) panicked at crates/server/tests/fleet.rs:5271:3:
+  fleet-forward: assertion `left == right` failed: every read is answered; b's hop counters summed over its shards: {"fleet.forward.batch_done": 10547, "fleet.forward.batch_given_up": 108, "fleet.forward.begun": 10651, "fleet.forward.client.control_refused": 10298, "fleet.forward.client.control_started": 10343, "fleet.forward.client.delivered_home": 10343, "fleet.forward.client.resolved": 10343, "fleet.forward.client.to_control": 10343, "fleet.forward.no_session": 1, "fleet.forward.retried": 312, "fleet.forward.session_replaced": 205, "fleet.forward.taken_for_another": 10531, "fleet.owner_location.direct": 10343, "fleet.owner_location.forward_unanswered": 313, "fleet.owner_location.route_dropped.refused": 104}
+  fleet-forward:   left: 20604
+  fleet-forward:  right: 20640
+  fleet-forward: test result: FAILED. 15 passed; 2 failed; 0 ignored; 0 measured; 83 filtered out; finished in 195.72s
+  fleet-forward: error: test failed, to rerun pass `-p slates-server --test fleet`
+  fleet-forward: error: 1 target failed:
+clippy exit 0 59s
