@@ -3384,6 +3384,7 @@ fn init_shard(
     plane: crate::member_task::PlaneState::default(),
     nfs_service: crate::nfs::ServiceTimes::default(),
     callbacks: crate::callback::Callbacks::default(),
+    forward_lanes: crate::forward_lane::ForwardLanes::default(),
     staging: crate::staging::Staging::default(),
     member_boot_nonce: incarnation,
     learned_members: std::collections::BTreeMap::new(),

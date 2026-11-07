@@ -10,6 +10,110 @@
 > is Unix-only (owner release, 2026-11-07); `slates-cluster`'s tests build on Windows since conformance's a0015062
 > landed as 12e57aa8 (the bug record of 2026-11-06).
 
+> **The many-client load test from 10,000 to 100,000 clients (loadtest-scale; 2026-11-06): in progress.** The
+> harness (`crates/client/examples/load_bench.rs`) multiplexes logical clients over connections
+> (`--per-connection k`). Each logical client keeps its own work volume, rounds, merges and conflicts, and has one
+> request in flight. A sweep drains every connection's ring before it moves any client on, so a latency is stamped
+> when its reply arrives, not when the harness reaches the client. Fixed, failing test first:
+> - **An acknowledgement covered requests still awaited.** A client with several in flight released their completion
+>   records, so a resend after a restart was answered `DuplicateRequest` for an applied create. The watermark now
+>   stops below the first request with no reply (`an_acknowledgement_never_covers_a_request_still_awaited`;
+>   `docs/bugs/2026-11-06-an-acknowledgement-covered-requests-still-awaited.md`).
+> - **A ring slot's bulk body was overwritten before it was read.** The ring's credit covered the 64-byte slot, not the
+>   bulk chunk it names, which every message at that ring position shares. So a body was overwritten in two ways: by
+>   a consumer that released the slot before reading the body, and by a producer that packed before it knew the ring
+>   had room. A request then ran another request's body under its own id (red: request 0 decoded as request 8), or
+>   failed `BadRequest { "body does not decode" }`. That happened 1 to 3 times in every 300-client run at 32 clients a
+>   connection, and in none of 3 after the fix
+>   (`docs/bugs/2026-11-06-a-ring-slots-bulk-body-was-overwritten-before-it-was-read.md`).
+> - **Forwards to one owner went one at a time** (the network load test's fault one, below). The origin borrowed
+>   the session to the owner for each forward's round trip, and the owner served one request of a session at a
+>   time. Now they share the session through a per-peer lane, and the owner runs each forwarded verb on its own
+>   task. A forward to a free shard, behind one waiting on a held shard: 471.8 ms before, 1.77 to 2.41 ms after
+>   (`forwards_to_one_owner_never_wait_behind_each_other`;
+>   `docs/bugs/2026-11-06-forwards-to-one-owner-went-one-at-a-time.md`). A sibling is fixed with it: three
+>   borrowers abandoned the session's newest exchange on a failure, which on a shared session can be a forward's
+>   (`Endpoint::abandon_begun_since`).
+>
+> - **A pin held its shard for the whole tree.** `Documentation/` (11,608 files) took one poll of 9,194 ms on a Mac,
+>   past the anchor's 1,000 ms liveness budget, and every verb on the shard waited. The pin is now a walk stepped a
+>   slice at a time in a task of the owner shard, its reply deferred, as a checkout's is. Red: no probe was answered
+>   inside the pin, and the one waiting was refused `Stalled` at 1 s. Green: 238 probes inside an 8.49 s pin, the
+>   longest 318 ms (`a_pin_of_a_large_base_never_holds_its_shard`). The pin's own memory is linear, 1.4 to 3.5 KB of
+>   heap a file on Linux and macOS. The quiet Linux CI runner's daemon peaked at 552 MB pinning `Documentation/`, and
+>   the growth came after the pin. A pin past its volume's quota is refused `NoSpace`
+>   (`docs/bugs/2026-11-06-a-pin-held-its-shard-for-the-whole-tree.md`).
+>
+> - **The whole kernel as the workload: the pin holds, creating the green does not** (open; reported to fixtures, A-217's
+>   re-lander, 2026-11-06). In-process daemon on the Mac (loaded arm, load 30 to 47), Linux v7.4-rc1 whole (97,229
+>   files on APFS, 1.67 GB), the sliced pin:
+>   - pin 64.4 s, RSS 42 MB to 3.4 GB (the content, granule-rounded);
+>   - snapshot 0.71 s;
+>   - `CreateGreen` 69.05 s as one shard poll of 69,028 ms, RSS 3.4 to 17.8 GB, holding 10 GB after: the origin
+>     `seed_origin` copies whole (`walk_origin`), unsliced.
+>
+>   A 10-client rung then ran (1.93 s; Edit p50 91 µs, p99 1.20 s; SubmitAccepted p99 645 ms) while the shard's polls
+>   stayed at 509 to 717 ms. Then the process peaked at 24.07 GB and was gone at 652 s before its oracle: no panic,
+>   with heartbeats 2.5 to 4.2 s late and unattributed (memory pressure is the inference, not proven). Owed:
+>   `CreateGreen` sliced, and its origin held by reference (A-217), before the rungs use the whole kernel.
+>
+> - **On a busy machine the anchor kills a live daemon, and then its successor, and the clients give up** (open; the
+>   anchor's half is the top entry's, unassigned). Mac, single-node anchored daemon, load 60 to 89, 300 to 1,000
+>   clients:
+>   - The anchor killed a live daemon whose heartbeat lapsed. The successor "never beat inside the recovery budget",
+>     recovering 300 to 1,000 works and their green's versions, and was killed again: twice, and four times in another
+>     run.
+>   - The clients' reconnect budget ran out first (0 reconnects, 172 and 439 clients gave up), and the restart reset
+>     the works (A-207's port is reverted on main).
+>   - The harness's oracle then failed 30 checks: versions it never saw accepted, and heads it could not replay. Those
+>     are submits whose outcome their clients never learned, and the oracle treats them as never accepted. It owes a
+>     sound treatment: read which versions the green took and fit the unknown submits to them.
+>
+> - **Memory per client, attributed** (2026-11-06). Mac, in-process daemon over `kernel/`, 300 clients at 32 a
+>   connection, works kept (`--keep-works`). Memory is not load-sensitive.
+>   - **Per same-machine connection, about 8.4 MB of daemon RSS.** At 1,000 clients, 1,000 connections peaked at
+>     12.5 GB and 32 at 4.4 GB. Multiplexing 32 a connection makes it about 0.26 MB a logical client, and over the
+>     network the server pays none of it.
+>   - **Per accepted version, about 0.16 MB of live heap**, but RSS grew about 3.4 MB a version (one round, 300
+>     versions: 1.15 GB; three, 900 versions: 3.20 GB). `vmmap` puts the difference in freed large blocks still
+>     resident ("MALLOC_LARGE (empty)", 597 MB to 2.5 GB). A counting allocator found 464 allocations of 1 MiB or more,
+>     9.4 GB in one level, from `Partition::to_snapshot` ← `Db::snapshot` ← `Db::commit`, with buffers growing to
+>     134 MB.
+>   - **The cause.** The partition keeps every accepted increment in `green_chains` (bounded, refused
+>     `Capacity { table: "green_chains" }` at the cap) "until checkpointing folds old chain entries (owed)". So each
+>     version costs its increment for good, and each snapshot taken when the log fills re-encodes the whole chain.
+>   - **What it means at 100k** (extrapolation): 3 rounds × 100k clients is 300k increments, about 48 GB of chain,
+>     each snapshot re-encoding it, and the cap refusing submits well before. Green chain checkpointing is the 100k
+>     rung's wall (owner to be decided).
+>
+> - **The quiet arm's first rungs: correct, and far from 1 ms** (Mac Studio, load 5 to 9, one node; BENCHMARKS, "The
+>   load test's quiet arm"). At 1,000 clients p50 is 35 to 73 ms and p99 158 to 227 ms; at 3,000, p50 197 to 219 ms.
+>   The oracle had 0 failures. Every operation of a green's works is served on the green's one shard (about 112 µs
+>   an operation, 8,960 a second), so a closed-loop client's latency is clients × service time. At 3,000 clients the
+>   green's retention cap refused 2,405 submits `BudgetExceeded`: a version keeps the whole previous bytes of every
+>   file it overwrote, and the history folds only down to the oldest base a live work holds. Walls owed for the
+>   10k–100k rungs, besides the green chain's checkpointing above:
+>   - a green's works served off its owner's shard, with only the verdict serialized;
+>   - history that keeps what a version overwrote, not whole files;
+>   - a stated offered load per client for the 1 ms bound. At zero think time, 100k clients at 1 ms is 10⁸
+>     operations a second.
+>
+> The topology launcher is `crates/cli/tests/load_scale.rs`. It runs one primary and two replica server nodes in
+> region 0 at `f = 1`, and client nodes in region 1, so the client nodes are never the green's holders. One harness
+> drives every client node (`--instance a,b,…`), so one oracle judges every submit. It is portable (`ps`, `pgrep`),
+> so it runs on macOS. Not yet through a rung: with a debug daemon on the loaded Mac, `base pin` of `kernel/`
+> outlasts the CLI's 1 s reply deadline, and the green is then refused `ConsistentBaseUnavailable`. In release the
+> pin takes 278 to 637 ms for 754 files. That is the open "pinning a tree of many files" item (loadtest's, above),
+> and it is the wall for the whole kernel as the workload.
+>
+> Sanity rungs, Mac, in-process daemon, loaded arm (load 46 to 62 on 18 CPUs, the fleet suite running): 10 and 100
+> clients over `kernel/`, at one and ten logical clients a connection, oracle and own files 0 failures, no
+> backpressure, no starved clients. The latencies measure the box, not slates: the worker threads were descheduled
+> for up to 147 ms between drains of one ring (`max_drain_gap_ns`), so the quiet arm is on the Studio. A
+> `rebase_conflicts` of exactly 100 at 100 clients, in both forms, was coincidence: a third run counted 99. Every named
+> window is one of the client's own hot slots, rewritten by another client between its resolution read and its
+> rebase, so the head really moved (the harness names the first five a worker meets).
+
 > **The anchor kills live daemons on a busy machine (found 2026-11-06, audit step 7; fixed by A-228, Windows CI owed).** Under the
 > A/B bar's load, two spinners a logical CPU (8 on CI's 4-CPU Windows runners), the anchor killed daemons that were
 > alive and serving because their heartbeat lapsed its 1,000 ms liveness budget. A busy machine is the normal case
@@ -135,6 +239,30 @@
 >   - `windows-11-arm`: the fleet did not form for fsx. It formed for winfstest, whose 628 cases matched plain exactly
 >     (0 differing), but shipping failed: candidate b held no live log, the owner counted `no_session` 7,663,
 >     `unanswered` 5,596 and `refused` 138, and only candidate c held entries (4,741).
+
+> **The many-client load test over the network (loadtest; 2026-11-05).** The harness
+> (`crates/client/examples/load_bench.rs`, `--green` to drive a green on another node) and its launcher
+> (`crates/cli/tests/load_fleet.rs`, gated on `SLATES_LOADTEST_TREE` and `SLATES_LOADTEST_BENCH`).
+> - **Over the network (2026-11-05, `crates/cli/tests/load_fleet.rs`: a server node and a client node under anchors,
+>   f = 0, loopback; the harness at the client node against the server's green over `kernel/`):** 100, 300 and 1,000
+>   clients, the oracle and every own file 0 failures. The server pays about 1.2 to 1.4 MB a client at peak (121,096 to
+>   484,900 KiB at 300), the client node about 64 to 100 KB a local client (30,180 to 59,828 KiB at 300). Three faults:
+>   - **Forwards to one owner go one at a time** (fixed 2026-11-06 by agents/loadtest-scale, above). `forward_batch_over_leader_session` (`crates/server/src/fleet.rs`)
+>     takes the peer's one session for a forward's whole round trip, so a client node's verbs to its server serialize:
+>     a forwarded `CreateWork` p50 1.71 s at 300 clients and 4.30 s at 1,000 (45 µs on the owner's own node).
+>   - **A forward queued past the failover bound is refused `OwnerUnreachable`** though the owner is alive and served
+>     everything else: 536 `CreateWork` and 7 edits at 1,000 clients. Typed, but the wrong cause.
+>   - **After the server's daemon is killed and its anchor restarts it, the client node's forwards stay refused
+>     `OwnerUnreachable`**: at 300 clients 207 `CreateWork`, 41 edits, 7 submits, 2 destroys; at 100 clients the
+>     harness's final read 20 s after the kill. The server recovered its green (`1 merge volumes`; whether the
+>     forwarded works existed at the kill is not yet settled).
+>   The 1,000-client "hang" seen in 3 of 10 runs (minutes with both daemons idle) was the harness's own oracle, which
+>   replayed a whole copy of every touched file for every version (1,600 × 677 at 1,000 clients); it now keeps each
+>   slot's writes and judges by lookup, and two runs finish in 19 to 20 s with 0 failures (red-checked: blinded, it
+>   flags 13 of 13 conflicts). Owners of the three faults: the fleet forward and session code (raft, fs-server).
+> - **Memory per same-machine connection is a client node's, about 64 to 100 KB a local client** (the 20 to 29 MB
+>   measured before was the daemon and the harness in one process, both touching every ring); a client node derives
+>   about 7,900 seats here, so the 10k-100k rungs need several client nodes, and fault one above caps each.
 
 > **A-214, A-217 and A-207's port reverted from main (2026-11-05, by the supervisor); all three are re-landed (A-214 in
 > `2f70a86b`; A-217 and A-207 from `agents/reland-a207-1`, 2026-11-06).** Main CI 42119714654 on b502cf96 failed six jobs,
@@ -273,7 +401,8 @@
 > - **A volume promised the whole version slab is refused at recovery** (bug record of 2026-11-05): a recovered
 >   snapshot rebuilds its directories privately, one retained version slot each the live volume did not hold (465,831
 >   committed slots before a restart, 465,832 after). Fix owed in `crates/vfs/src/recover.rs`.
-> - **Pinning a tree of many files grows memory far faster than its files, in one unsliced verb**: `kernel/` (754
+> - **Pinning a tree of many files grows memory far faster than its files, in one unsliced verb** (the slicing fixed
+>   2026-11-06 by agents/loadtest-scale, and the memory not reproduced: see that entry above): `kernel/` (754
 >   files) 86,848 KiB, `fs/` (2,365) about 226,000 KiB in 3 of 3 runs, `Documentation/` (11,608, 59 MB) past 12 GB and
 >   `arch/` (18,944, 127 MB) past 9.9 GB inside the pin, which also outlasts the client's 1 s reply deadline; the whole
 >   kernel is killed at a 24 GB cap in its pin. Not root-caused; samples show `Overlay::read_whole` → `copy_up`.

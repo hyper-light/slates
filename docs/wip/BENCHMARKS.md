@@ -9892,6 +9892,23 @@ A second receiver cannot simply be added: two journals need the multi-worker cra
 second worker would also make x86_64 slower unless it ran on arm64 alone, and a mode chosen per architecture would need
 a derivation the rules accept.
 
+### The load test over the network: a client node and a server node (2026-11-05)
+
+`SLATES_LOADTEST_TREE=<linux-v7.4-rc1>/kernel SLATES_LOADTEST_BENCH=<release load_bench> SLATES_LOADTEST_CLIENTS=<n>
+SLATES_LOADTEST_ARGS="--hot-files <0.8 n> --reply-patience 60" cargo test --release -p slates-cli --test load_fleet --
+--nocapture`: two `slates anchor --fleet` nodes from one manifest (f = 0, loopback), the green on the server node, the
+harness at the client node; same machine as above, load 22 to 45, one run each. Nanoseconds, p50:
+
+| Clients | CreateWork | Edit | Submit (accepted) | Accepted / conflicts | Server RSS before → peak (KiB) | Client node RSS before → peak (KiB) | Refused |
+|---|---|---|---|---|---|---|---|
+| 100 | 509,673,093 | 96,438 | 277,486 | 300 / 20 | 102,124 → 244,528 | not recorded | none |
+| 300 | 1,709,859,756 | 69,688 | 185,272 | 900 / 45 | 121,096 → 484,900 | 30,180 → 59,828 | none |
+| 1,000 | 4,296,230,485 | 89,061 | 212,021 | 1,376 / 156 | 121,540 → 785,832 | 30,008 → 93,732 | 536 CreateWork, 7 Edit `OwnerUnreachable` |
+
+The oracle and every own file: 0 failures at each rung. A forwarded verb waits for the client node's one session to
+its server (GAPS), so the creates queue. With the server daemon SIGKILLed 1 s (100 clients) and 3 s (300) into the rung
+and restarted by its anchor, the client node's forwards stayed refused `OwnerUnreachable` (GAPS).
+
 ## Raising the shard threads' priority, and where the receiver stands against the DLL (A-212; 2026-11-05)
 
 **Measured and not taken (2026-11-05).** A test of what would fix a loaded SetSize (a shard preempted just after it answers, above):
@@ -10613,3 +10630,34 @@ after every thread has exited. On both runners of both runs:
 - the CLI mount suites then sat 75-90 minutes with no output until the cancel at 01:40 UTC;
 - no killed daemon was seen to exit, so the 5-minute bound itself is not observed here.
 So A-219's runtime (`e070f31e`, and `5b5f7ba1` over the combined call) stays off main.
+
+### The load test's quiet arm: 1,000 and 3,000 clients on one node (2026-11-06, agents/loadtest-scale)
+
+`rung.sh <label> <bound> --tree <linux-v7.4-rc1>/kernel --clients <n> --hot-files <0.8 n> --per-connection 32 --rounds 3
+--reply-patience 60`, against a single-node `slates anchor --quick`. Mac Studio (adas-mac-studio.local-2, 32 CPUs, Apple
+silicon), release binaries of agents/loadtest-scale-1 at 6f7c5306, load 5.0 to 9.1, one run each. Linux v7.4-rc1
+(6628e7d4) `kernel/`, 754 files. Milliseconds:
+
+| Clients | Connections | Kind | p50 | p99 | p999 | max |
+|---|---|---|---|---|---|---|
+| 1,000 | 32 | CreateWork | 34.7 | 66.2 | 66.3 | 66.3 |
+| 1,000 | 32 | Edit | 62.3 | 160.8 | 201.5 | 242.0 |
+| 1,000 | 32 | SubmitAccepted | 66.0 | 204.8 | 229.4 | 242.0 |
+| 1,000 | 32 | SubmitConflict | 72.7 | 226.5 | 233.1 | 242.0 |
+| 1,000 | 32 | Rebase | 67.4 | 157.6 | 196.2 | 196.7 |
+| 3,000 | 94 | CreateWork | 400.0 | 423.2 | 424.2 | 424.5 |
+| 3,000 | 94 | Edit | 197.4 | 447.2 | 543.5 | 544.8 |
+| 3,000 | 94 | SubmitAccepted | 203.0 | 478.2 | 543.3 | 543.8 |
+| 3,000 | 94 | SubmitConflict | 205.7 | 428.5 | 543.3 | 544.6 |
+| 3,000 | 94 | Rebase | 210.3 | 478.5 | 543.9 | 544.8 |
+
+- **Correctness:** the oracle and every own file had 0 failures in both runs.
+- **Resolution:** the longest gap between two drains of a ring was 0.70 ms (1,000) and 3.12 ms (3,000).
+- **Throughput:** 95,867 operations in 10.7 s at 1,000 clients, about 8,960 a second, about 112 µs an operation. Every
+  operation of a green's works is served by the green's shard, since `CreateWork` places each work on the green's
+  partition. The harness keeps one request in flight per client, so a latency is about clients × service time
+  (Little's law): 1,000 × 112 µs ≈ 112 ms, and 3,000 triples it.
+- **Daemon peak RSS:** 14.3 GB (1,000) and 14.9 GB (3,000).
+- **The 3,000 rung's refusals:** 2,405 submits were refused `BudgetExceeded`, at the green's retention cap. A version
+  keeps the whole previous bytes of every file it overwrote, and the history folds only down to the oldest base a
+  live work holds. 3,766 versions were accepted.

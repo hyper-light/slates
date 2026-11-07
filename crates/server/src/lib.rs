@@ -56,6 +56,7 @@ pub mod dns;
 pub mod doorbell;
 pub mod error;
 pub mod fleet;
+mod forward_lane;
 mod fs_verbs;
 #[cfg(target_os = "linux")]
 mod fuse;
