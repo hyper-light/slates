@@ -1643,3 +1643,99 @@ fn a_live_volume_made_while_its_successor_was_stopped_is_served_by_it() {
   drop(fleet.daemons);
   drop(fleet.scratch);
 }
+
+/// Shape: how long the test keeps both candidates stopped while a change waits on the macOS mount: past the give-up a
+/// soft mount imposed, measured at 57.1 s on 2026-11-05 (conformance's `a_live_shipped_volume_makes_a_writer_wait_…`,
+/// both candidates stopped), with a margin of a few of the client's own retry waits.
+#[cfg(target_os = "macos")]
+const PAST_SOFT_GIVE_UP: Duration = Duration::from_secs(75);
+
+/// A kernel mount made by `slates mount`, unmounted when dropped, by force if the plain unmount is refused. Declared
+/// after the fleet it mounts, so it drops first: no daemon is stopped under it.
+#[cfg(target_os = "macos")]
+struct KernelMount {
+  path: String,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for KernelMount {
+  fn drop(&mut self) {
+    let plain = Command::new("umount").arg(&self.path).output();
+    if !plain.is_ok_and(|out| out.status.success()) {
+      let _ = Command::new("umount").args(["-f", &self.path]).output();
+    }
+  }
+}
+
+/// A-200 through the macOS kernel's own NFS client (§4.6): do mount a live-shipped volume with `slates mount`, open a
+/// file there, stop both candidates (SIGSTOP), ask the file for a new size, and resume the candidates once the
+/// soft mount's measured give-up has passed. Expect the size change to wait for the candidates and then succeed: A-200
+/// "holders that do not answer make the writer wait: backpressure, never a false success". Found 2026-11-05 by the
+/// conformance agent: the macOS mount was `soft,intr`, so the kernel itself ended the waiting call `ETIMEDOUT` after
+/// 57.1 s whatever the daemon answered (a held reply or `NFS3ERR_JUKEBOX`). The mount is now `hard,intr`
+/// (`slates_bridge_nfs::client::MountArgs`): the kernel waits as long as the daemon asks, and a signal still interrupts
+/// the caller. Only the candidates stop; the daemon serving the mount never does.
+#[cfg(target_os = "macos")]
+#[test]
+#[allow(clippy::disallowed_methods)] // a program's calls on the slates mount, the point of the test
+fn a_writer_on_a_macos_mount_waits_for_stopped_candidates_rather_than_fail() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping kernel-mount flow: set SLATES_TEST_CLI=1 to run it (three daemons, a kernel mount)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-mounted");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let id = write_live_volume(&owner, 1);
+  let path = format!("{}/mnt", fleet.scratch.path);
+  assert!(
+    Command::new("mkdir")
+      .args(["-p", &path])
+      .output()
+      .unwrap()
+      .status
+      .success()
+  );
+  let (code, _, err) = run(&owner, &["mount", &id, &path]);
+  assert_eq!(code, 0, "slates mount: {err}");
+  let mount = KernelMount { path: path.clone() };
+  #[allow(clippy::disallowed_methods)]
+  // a program's call on the slates mount, the point of the test
+  let handle = std::fs::OpenOptions::new()
+    .read(true)
+    .write(true)
+    .create(true)
+    .truncate(true)
+    .open(format!("{path}/sized.bin"))
+    .unwrap();
+  let candidates: Vec<usize> = (0..fleet.instances.len())
+    .filter(|index| *index != owner_index)
+    .collect();
+  for index in &candidates {
+    signal(&fleet.daemons[*index], rustix::process::Signal::STOP);
+  }
+  let began = Instant::now();
+  let (changed, answered) = std::thread::scope(|scope| {
+    let change = scope.spawn(|| (handle.set_len(4096), began.elapsed()));
+    while !change.is_finished() && began.elapsed() < PAST_SOFT_GIVE_UP {
+      pause();
+    }
+    for index in &candidates {
+      signal(&fleet.daemons[*index], rustix::process::Signal::CONT);
+    }
+    change.join().unwrap()
+  });
+  eprintln!("live mounted: the size change answered after {answered:?}: {changed:?}");
+  drop(handle);
+  drop(mount);
+  assert!(
+    changed.is_ok(),
+    "a writer waiting for stopped candidates failed after {answered:?}: {changed:?}"
+  );
+  assert!(
+    answered >= PAST_SOFT_GIVE_UP,
+    "the change waited for the candidates rather than answering while both were stopped: {answered:?}"
+  );
+}

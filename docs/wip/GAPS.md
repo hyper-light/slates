@@ -20,6 +20,11 @@
 >   never served (`takeover::ask_pages`, `takeover::adopt`; counted `fleet.takeover.stale_configuration`). Red 1 of 8
 >   with the edits off, green 8 of 8.
 > - The live fleet suite's settled wait now also waits for every node's pair keys (`fleet.seal.pair_served`).
+> - **Fixed (2026-11-06, A-229, Ada's choice): a writer on a macOS mount failed rather than waited.** The mount was
+>   `soft,intr`, and macOS ends any soft call after about a minute: with both candidates stopped a size change failed
+>   `ETIMEDOUT` after 57.2 s. The mount is `hard,intr`: the same call waited through the stop and succeeded (90.6 s and
+>   102.4 s; `a_writer_on_a_macos_mount_waits_for_stopped_candidates_rather_than_fail`, red then green on this Mac at
+>   load 15 to 104).
 > - **Open: a killed owner was never condemned** in one forming-fleet run: both survivors' detectors held it with one
 >   suspicion and no condemnation for 40 s (`configured=false`, `CorrelationUnmeasured`). About 1 run in 20.
 > - **Open: a live dispatch's replies are dropped with its whole task** (`live_ship::send_from_control` returns its

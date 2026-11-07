@@ -2529,7 +2529,7 @@ unavailable or disabled).** One TCP loopback listener held by the anchor, and si
 so a daemon restart is a slow reply to the kernel client, never a dropped connection (Linux owed); ONC RPC record
 marking; NFSv3 + MOUNT + a minimal portmap responder; the root mount at an existing user-owned mount point
 (or an already established RAM-backed target)
-with `nfsv3,tcp,port,mountport,soft,intr,locallocks,nosuid,rdirplus` and attribute-cache
+with `nfsv3,tcp,port,mountport,hard,intr,locallocks,nosuid,rdirplus` (hard since A-229) and attribute-cache
 timeouts derived from the measured loopback GETATTR RTT; file handles encode
 `(volume, inode no, gen)`; invalidation by directory attribute change after snapshot swaps
 (EdenFS's no-op chmod) and by short timeouts; inode GC because NFS never says "forget"; the
@@ -4077,8 +4077,8 @@ physical volume's device identity or cross-volume rename is not promised.
 **Failure matrix.** Daemon crash: Linux requests wait on the device the anchor holds until the restarted
 daemon takes it back and asks the kernel to resend what the dead one read (A-61; Degraded, seconds); macOS FSKit: the extension's forwarding calls fail typed until
 the daemon is back, and the extension survives because it is a separate process (Degraded; the
-spike measures whether open files recover or must be reopened); macOS NFS fallback: hard-mount
-hang or soft-mount `EIO` until the restarted server answers the retried RPCs (Degraded); Windows:
+spike measures whether open files recover or must be reopened); macOS NFS fallback: the hard mount
+waits until the restarted server answers the retried RPCs, a signal ending the wait `EINTR` (Degraded; A-229); Windows:
 the volume disappears and reappears (Degraded, open handles error). Extension crash on macOS:
 FSKit unmounts the volume; the daemon's state is intact; the anchor re-mounts (Degraded).
 Unprivileged user namespaces disabled: Refused for the launcher form with the exact remedy.
@@ -8029,8 +8029,8 @@ form; the conformance and workload suites on both platforms.
   volume to unmount and re-mount with state intact.
 - T-4.4 (edge, macOS NFS) Delete a file another process holds open; expect the `.nfs` temporary
   file behaviour documented and cleaned on close.
-- T-4.5 (fault, macOS NFS) Kill the daemon during a read on a soft mount; expect `EIO` after the
-  derived `retrans`; on a hard mount expect the read to complete after restart.
+- T-4.5 (fault, macOS NFS) Kill the daemon during a read on the mount (hard since A-229); expect the read to
+  complete after the anchor's restart, and a signal to end the wait with `EINTR`.
 - T-4.6 (edge, Windows) Case-insensitive lookup on a case-fold volume; expect one entry and
   `EEXIST` on a folded duplicate.
 - T-4.7 (fault, Windows) Kill the daemon with open handles; expect the volume to disappear, the
@@ -17541,3 +17541,22 @@ Applied in the same change to: D-9 (decision text and evidence tier), §4.3 (Dri
 - **What it does not change.** kqueue, IOCP and the simulation driver are untouched; the `Driver` seam, its paired-`#[cfg]` shape and every readiness contract are the same. The one Linux driver still carries `register_readable`/`register_writable` (the trait's doc had gone stale claiming the completion-native drivers refused them; corrected in the same pass).
 - **Evidence:** `BENCHMARKS.md` "io_uring against epoll on Linux" (2026-10-18, 32-core cachyos, interleaved, arms verified by descriptor; the box was loaded 13→29 so only the p50 rows carry signal, and a quiesced re-run is owed to tighten the parked figure — it does not change the direction). Verified after removal: the daemon holds `eventpoll=4, io_uring=0` for 4 shards; `slates-rt` suites green; the recovery oracle 41/41 on four consecutive runs where it had been failing a differing subset every other run.
 
+### A-229 — The macOS NFS mount is hard, so a writer waits under backpressure (accepted 2026-11-06, Ada's choice)
+Applied in the same change to: §4.6 (macOS fallback options, failure matrix), T-4.5, `crates/bridge-nfs/src/client.rs`
+(`MountArgs` clears `NFS_MFLAG_SOFT`), `crates/cli/src/mount.rs` and `crates/cli/examples/slates_mount.rs` (the
+`mount_nfs` options), `crates/cli/tests/live_fleet.rs`, GAPS.
+- **Changes §4.6:** the loopback NFS mount was `soft,intr`; it is `hard,intr`.
+- **Why:** A-200 says holders that do not answer make the writer wait: backpressure, never a false success. On a soft
+  mount macOS's own NFS client ends any call it has waited on for about a minute, whether the daemon holds the reply
+  or answers `NFS3ERR_JUKEBOX`, so no daemon design can keep a writer waiting there. Measured: with both candidates of a
+  live-shipped volume stopped, a size change through the mount failed `ETIMEDOUT` after 57.2 s (57.1 s in conformance's
+  run); hard, the same call waited through the stop and succeeded once the candidates resumed (90.6 s and 102.4 s, the
+  candidates resumed at 75 s; `a_writer_on_a_macos_mount_waits_for_stopped_candidates_rather_than_fail`).
+- **What keeps it escapable:** `intr` lets a signal end a waiting caller (`EINTR`), and a forced unmount ends a mount
+  whose daemon is gone. Since A-113 the anchor holds the listener and every accepted connection across a daemon restart,
+  so a restart is a slow reply, which a hard mount waits through where a soft one failed it.
+- **Cost:** a mount whose anchor is gone for good blocks the programs touching it until they are signalled or the mount
+  is force-unmounted. Tests unmount (forced if refused) before they stop any daemon (`MountPoint`, `KernelMount`).
+- **What it does not change:** Linux's mounts (FUSE; conformance's own NFS options), Windows, or the daemon's answers:
+  a stable reply still waits for durability up to the liveness budget and is then answered "try again", which the hard
+  mount retries.
