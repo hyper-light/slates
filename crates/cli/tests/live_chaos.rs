@@ -1912,26 +1912,34 @@ fn a_destroy_then_the_owners_loss(live: bool, unheard: bool) {
     latency_line(&outcomes)
   ));
   judge_destroy(&mut verdict, unheard, &destroyed, &views);
-  // A live volume whose destroy was never answered done keeps every write that was: no tombstone was placed, so the
-  // survivors take it over and must serve them all (NoLoss).
-  if live && destroyed.code != 0 {
-    let survivors: Vec<&str> = candidates.iter().map(String::as_str).collect();
-    match wait_serving(&survivors, &volume, &outcomes) {
-      Some((successor, took)) => {
-        verdict.note(format!("the undestroyed volume taken over by {successor} after {took:?} more"));
-        verdict.check("NoLoss (successor)", no_loss(successor, &volume, &outcomes));
-      }
-      None => verdict.check(
-        "NoLoss (successor)",
+  // A destroy never answered done may still take effect (its records reach the candidates once they resume), so the
+  // volume must settle, within the fleet wait, into one of two states on every survivor: destroyed (none lists it,
+  // each read refused NotFound), or served with every acknowledged write (NoLoss). Neither, and the fleet holds a
+  // volume no one serves or destroys.
+  if destroyed.code != 0 {
+    let (settled, views) = wait_settled_after_destroy(&candidates, &volume, &outcomes, live);
+    let outcome = match &settled {
+      Some(Settled::Destroyed) => "destroyed on every survivor".to_owned(),
+      Some(Settled::Served(by)) => format!("served whole by {by}"),
+      None => "unsettled".to_owned(),
+    };
+    verdict.note(format!(
+      "after the unanswered destroy: {outcome}; {views:?}"
+    ));
+    verdict.check(
+      "an unanswered destroy settles: destroyed everywhere, or served whole",
+      if settled.is_some() {
+        Vec::new()
+      } else {
         vec![format!(
-          "no survivor served the acknowledged writes of a volume whose destroy was never answered done: {:?}",
-          survivors
+          "unsettled after the fleet wait: {views:?}; {:?}",
+          candidates
             .iter()
-            .map(|survivor| (*survivor, counters(survivor, "fleet.")))
+            .map(|candidate| (candidate.clone(), counters(candidate, "fleet.")))
             .collect::<Vec<_>>()
-        )],
-      ),
-    }
+        )]
+      },
+    );
   }
   drop(fleet);
   verdict.judge();
@@ -2447,4 +2455,42 @@ fn clients_cut_off_mid_merge_leave_the_green_whole_across_a_takeover() {
   }
   drop(fleet);
   verdict.judge();
+}
+
+/// How a volume whose destroy was never answered done settled: destroyed on every survivor, or served whole by one.
+enum Settled {
+  Destroyed,
+  Served(String),
+}
+
+/// Waits up to the fleet wait for `volume` to settle on `survivors` ([`Settled`]); what it settled as (`None`: neither)
+/// and the survivors' last views.
+fn wait_settled_after_destroy(
+  survivors: &[String],
+  volume: &str,
+  outcomes: &[Outcome],
+  live: bool,
+) -> (Option<Settled>, Vec<SurvivorView>) {
+  let deadline = Instant::now() + FLEET_WAIT;
+  loop {
+    let views = survivor_views(survivors, volume);
+    let destroyed = views.iter().all(|view| {
+      !view.listed && matches!(&view.read, Some(Err(error)) if error.contains("NotFound"))
+    });
+    if destroyed {
+      return (Some(Settled::Destroyed), views);
+    }
+    // A plain volume promises only its placed snapshot, so being served at all is its settled state; a live one must
+    // serve every acknowledged write.
+    if let Some(view) = views
+      .iter()
+      .find(|view| view.listed && (!live || no_loss(&view.instance, volume, outcomes).is_empty()))
+    {
+      return (Some(Settled::Served(view.instance.clone())), views);
+    }
+    if Instant::now() >= deadline {
+      return (None, views);
+    }
+    pause();
+  }
 }

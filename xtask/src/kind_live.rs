@@ -330,6 +330,7 @@ fn run_probe(
       break code.to_owned();
     }
     if started.elapsed() > PROBE_WAIT {
+      diagnose(lane, pod, container);
       return Err(Failure(format!(
         "kind live: the probe {container} did not finish within {PROBE_WAIT:?}"
       )));
@@ -525,10 +526,61 @@ fn wait_taken_over(lane: &Lane, survivors: &[String]) -> Result<String, Failure>
       }
     }
     if started.elapsed() > SETTLE_WAIT {
+      for survivor in survivors {
+        diagnose_pod(lane, survivor);
+      }
       return Err(Failure(format!(
         "kind live: no survivor took the volume over within {SETTLE_WAIT:?}"
       )));
     }
     pause(POLL_CLUSTER);
+  }
+}
+
+/// What a stalled probe leaves to read: its output so far, its container's state, and every pod's live lines and live
+/// counters. Evidence only: errors here are printed, never raised, so the leg's own failure stays the one reported.
+fn diagnose(lane: &Lane, pod: &str, container: &str) {
+  match lane.kubectl(&["logs", pod, "-c", container]) {
+    Ok(logs) => eprintln!(
+      "kind live: the probe {container}'s output so far:\n{}",
+      logs.stdout
+    ),
+    Err(e) => eprintln!("kind live: the probe's output: {e}"),
+  }
+  let state =
+    format!("jsonpath={{.status.ephemeralContainerStatuses[?(@.name==\"{container}\")]}}");
+  match lane.kubectl(&["get", "pod", pod, "-o", &state]) {
+    Ok(status) => eprintln!(
+      "kind live: the probe {container}'s container: {}",
+      status.stdout
+    ),
+    Err(e) => eprintln!("kind live: the probe's container: {e}"),
+  }
+  for index in 0..LANE_REPLICAS {
+    diagnose_pod(lane, &lane.pod(index));
+  }
+}
+
+/// One pod's live lines, sessions, and live, takeover, tombstone and owner-location counters, as `status` prints them.
+fn diagnose_pod(lane: &Lane, each: &str) {
+  match lane.kubectl(&["exec", each, "--", "/slates", "status"]) {
+    Ok(status) => {
+      let lines: Vec<&str> = status
+        .stdout
+        .lines()
+        .filter(|line| {
+          line.contains(" live ")
+            || line.contains("fleet.live.")
+            || line.contains("fleet.takeover")
+            || line.contains("fleet.materialize")
+            || line.contains("fleet.owner_location")
+            || line.starts_with("fleet_session ")
+            || line.starts_with("fleet_host")
+            || line.starts_with("fleet_members")
+        })
+        .collect();
+      eprintln!("kind live: {each}:\n  {}", lines.join("\n  "));
+    }
+    Err(e) => eprintln!("kind live: {each}: status: {e}"),
   }
 }
