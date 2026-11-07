@@ -237,6 +237,12 @@ fn profile(lane: &Lane, name: &str, shaping: Option<&Shaping>) -> Result<String,
   for survivor in &survivors {
     for state in states(lane, survivor, &volume)? {
       if state.holding && state.fence < epoch {
+        // Every survivor's live lines and counters, the successor's own included, so a copy left unfenced shows whose
+        // it is and when it was made.
+        for each in &survivors {
+          diagnose_pod(lane, each);
+        }
+        eprintln!("kind live: {name}: the successor was {successor}");
         return Err(Failure(format!(
           "kind live: {name}: StaleNeverCommits: {survivor}'s copy is fenced at {} below the takeover's epoch {epoch}",
           state.fence
