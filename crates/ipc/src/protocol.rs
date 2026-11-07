@@ -1244,6 +1244,12 @@ pub struct LiveReport {
   /// On a candidate, the fence its copy has promised: no message made under a lower epoch is served. On the owner, the
   /// epoch it ships under. Appended.
   pub fence: u64,
+  /// On the owner, the member ids of the holders its durability counts (during a transition, the set it is moving
+  /// from), ascending; empty on a candidate. Appended (2026-11-07).
+  pub holders: Vec<u64>,
+  /// On the owner, the member ids of the set a holder transition is moving to, ascending; empty when none is in
+  /// flight, and on a candidate. Appended (2026-11-07).
+  pub moving_to: Vec<u64>,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.
