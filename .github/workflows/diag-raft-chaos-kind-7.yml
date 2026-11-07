@@ -1,0 +1,33 @@
+name: DIAG raft-chaos KIND live leg (not for main)
+
+# The KIND live leg (`cargo xtask kind live`, xtask/src/kind_live.rs): live-shipped writes on real pods unshaped and
+# under the lane's WAN profiles (wan 80 ms +- 20 ms, wan-loss with 1 % loss, ceiling 350 ms), each write timed by a
+# probe in the owner's pod, the register invariants read from every pod, and the owner's pod deleted for a takeover
+# over the shaped paths. Diagnostics branch of the raft-chaos agent; never merged.
+
+on:
+  push:
+    branches: [diag-raft-chaos-kind-7]
+
+jobs:
+  kind-live:
+    name: KIND live leg on ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.3.0
+      - uses: helm/kind-action@v1
+        with:
+          version: v0.33.0
+          install_only: true
+      - name: The machine
+        run: uname -a && nproc && free -g && docker version --format '{{.Server.Version}} {{.Server.Os}}/{{.Server.Arch}}' && kind version
+      - name: The live leg
+        run: cargo xtask kind live
