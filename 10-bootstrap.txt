@@ -62,3 +62,5 @@ shard 1 span consensus.step: absent/unknown (never; producer configuration group
 live bootstrap --- the owner's volume stat
 journal_grown_bytes: 0 (growth refused 0)
 thread 'a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates' (41413) panicked at crates/cli/tests/live_fleet.rs:1932:3:
+=== bootstrap off 2 exit 0 load { 53.36 36.86 22.56 }
+live bootstrap: written=true caught_up=true shipping=Some(("4", "4", "false")) held=[Some(("4", "none", "false")), Some(("4", "none", "false"))] [("live-bootstrap-a-21353", {"held": 5, "hold_refused": 1, "hold_refused.not_a_member": 1}), ("live-bootstrap-b-21353", {"appended": 5, "awaited": 5, "dura
