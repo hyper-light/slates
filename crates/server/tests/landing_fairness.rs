@@ -445,13 +445,29 @@ fn daemon_with_term(term_ns: Option<u64>) -> (Daemon, Client) {
   (daemon, client)
 }
 
+/// Shape: the renewals one landing must count before it is known, on the daemon's clock, to have outlasted the term
+/// it began under. A landing renews once half its lease's term has passed, at a slice boundary
+/// (`RENEW_AT_REMAINING_PERMILLE`), so its first renewal is at least half a term after the lease was taken and its
+/// second at least half the renewed term after that: a whole term past the take.
+const RENEWALS_PAST_THE_TERM: u64 = 2;
+
 /// AUD-29-25 (the lease keepalive). Do: on a daemon with the default term, measure this machine's per-file
 /// landing cost and the longest gap a landing goes between two looks at its lease (two calibration landings);
 /// then, on a daemon whose term is derived from that gap ([`term_for_gap`]), land enough files to last twice the
-/// term under a grant. Expect: the landing is done with every file written, having renewed its lease between
-/// slices at least once; without the renewal its entries past the term were skipped (`LeaseEnded`) and it ended
-/// partial. A run whose landing went longer between two looks than its renewal margin, or did not outlast its
-/// term, tested nothing: it is made again with the term or the files it showed were needed, up to the most files.
+/// term under a grant, doubling them until one landing renews its lease [`RENEWALS_PAST_THE_TERM`] times, which
+/// places its leased run past the term it began under on the daemon's clock. Expect: that landing is done with every
+/// file written; without the renewal its entries past the term were skipped (`LeaseEnded`) and it ended partial.
+///
+/// Two judgments come from the daemon, never the client's clock:
+/// - **Whether the landing outlasted its term:** by its renewals (bug-sweep's `b61ca46c`). The client's whole call
+///   also holds the request, the plan, the checks before the lease and the reply. CI run 40095492759 counted 6,833
+///   files in 1.011 s under a 1 s term, 0 renewals, done: a landing that never needed a renewal, counted as one that
+///   failed to make one.
+/// - **Whether its renewals could be made in time:** by the longest gap it went between two looks at its lease. A run
+///   whose gap reached its margin lapsed as a paused holder must; it tested a lapse, not the keepalive, so it is made
+///   again with the term that gap needs.
+///
+/// A landing that ended partial with every look inside its margin is the failure itself and ends the loop.
 #[test]
 fn a_landing_longer_than_its_lease_term_renews_it_and_lands_everything() {
   let (daemon, mut client) = daemon_with_term(None);
@@ -461,12 +477,12 @@ fn a_landing_longer_than_its_lease_term_renews_it_and_lands_everything() {
   drop(client);
   daemon.stop();
   let mut files = 0;
-  let (outcome, took, renewed, gap_ns) = loop {
+  let (outcome, renewed, gap_ns) = loop {
     let term = Duration::from_nanos(term_ns);
     files = files.max(files_lasting(per_file, term).unwrap_or(usize::MAX));
     if files > MOST_FILES {
       eprintln!(
-        "SKIP: no landing of up to {MOST_FILES} files both outlasted its term and renewed within its margin here"
+        "SKIP: no landing of up to {MOST_FILES} files renewed its lease {RENEWALS_PAST_THE_TERM} times within its margin here"
       );
       return;
     }
@@ -496,8 +512,8 @@ fn a_landing_longer_than_its_lease_term_renews_it_and_lands_everything() {
       panic!("the granted landing: {landed:?}");
     };
     eprintln!(
-      "landing of {files} files: {took:?} under a {term_ns} ns term, {renewed} renewals, longest lease gap \
-       {gap_ns} ns: {} written, {}",
+      "landing of {files} files: {took:?} on the client's clock under a {term_ns} ns term, {renewed} renewals, \
+       longest lease gap {gap_ns} ns: {} written, {}",
       outcome.written, outcome.state
     );
     if gap_ns.saturating_mul(2) >= term_ns {
@@ -506,24 +522,25 @@ fn a_landing_longer_than_its_lease_term_renews_it_and_lands_everything() {
       term_ns = term_for_gap(gap_ns);
       continue;
     }
-    if took > term {
-      break (outcome, took, renewed, gap_ns);
+    // Every look was inside the margin: a landing that lost entries to its term is the failure itself, whatever its
+    // renewals, and one that renewed past the term is the proof. Either ends the loop.
+    if renewed >= RENEWALS_PAST_THE_TERM || outcome.state != "done" {
+      break (outcome, renewed, gap_ns);
     }
     // A landing that did not outlast its term proves nothing: the landing's cost grows faster than its file
     // count (measured 2026-10-01), so no calibration alone sizes it.
     files = files.saturating_mul(2);
   };
   assert!(
-    took > Duration::from_nanos(term_ns),
-    "the landing outlasted its term ({took:?})"
-  );
-  assert!(
     gap_ns.saturating_mul(2) < term_ns,
     "it looked at its lease within the margin"
   );
   assert_eq!(outcome.state, "done");
   assert_eq!(outcome.written, u64::try_from(files).unwrap());
-  assert!(renewed >= 1, "the lease was renewed between slices");
+  assert!(
+    renewed >= RENEWALS_PAST_THE_TERM,
+    "the lease was renewed past the term between slices ({renewed})"
+  );
 }
 
 /// Shape: the volume an impatient call lands beside the patient one.
