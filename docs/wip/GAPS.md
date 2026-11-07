@@ -126,21 +126,44 @@
 >     (0 differing), but shipping failed: candidate b held no live log, the owner counted `no_session` 7,663,
 >     `unanswered` 5,596 and `refused` 138, and only candidate c held entries (4,741).
 
-> **A-214, A-217 and A-207's port reverted from main (2026-11-05, by the supervisor); their re-landing is owed.** Main CI
-> 42119714654 on b502cf96 failed six jobs, all from this pairing of landed changes, each green on its own branch:
-> - **A-217 against A-201's checkout.** A-217 records a green's origin as a reference to its base snapshot, and
->   `checkout` (`crates/server/src/checkout.rs`) compares the recorded origin's bytes with a fresh `seed_origin`'s
->   encoding, so every checkout was refused `ConsistentBaseUnavailable`: `crates/server/tests/checkout.rs`, 3 of 3 on
->   Linux and macOS. A-207's port (`661b41b2`) and the load record (`21240d01`) use A-217's ops, so they go with it.
-> - **A-214 against A-205's give-back.** The reserve keeps a write burst's worth of freed content pages pre-faulted,
->   so `a_deleted_files_memory_leaves_the_working_set_and_recreating_it_reads_every_byte` failed on windows-latest and
->   windows-11-arm; and A-214's own `arena::tests::an_idle_purge_keeps_the_reserve_and_gives_back_the_rest` fails
+> **A-214, A-217 and A-207's port reverted from main (2026-11-05, by the supervisor); all three are re-landed (A-214 in
+> `2f70a86b`; A-217 and A-207 from `agents/reland-a207-1`, 2026-11-06).** Main CI 42119714654 on b502cf96 failed six jobs,
+> all from two pairs of landed changes, each green on its own branch:
+> - **A-217 against A-201's checkout (fixed).** A-217 records a green's origin as a reference to its base snapshot,
+>   and `checkout` (`crates/server/src/checkout.rs`) compared the recorded origin's bytes with a fresh
+>   `seed_origin`'s encoding. So every checkout was refused `ConsistentBaseUnavailable`:
+>   `crates/server/tests/checkout.rs`, 3 of 3 on Linux and macOS. The checkout now compares origin identities
+>   (fs-server's `ab9e706c`, `docs/bugs/2026-11-05-a-held-origin-refused-every-checkout.md`). Re-landed with it are
+>   A-217, A-207 over A-202's delta rebase, and `edits_before_a_restart` built only where its caller is.
+>   - Linux, diag run 42173694626 (ubuntu-latest and ubuntu-24.04-arm): fmt, clippy, doc, `xtask check`, server lib
+>     195, checkout 3, merge_load 5, recovery 45, daemon 24, and `cargo test --workspace`, all passing.
+>   - Windows, the same run (windows-latest): the native lint wall over ci.yml's crate list and `slates-cli`, and
+>     merge_load 4. Also `cargo xwin clippy` clean from macOS.
+>   - The load test's macOS runs (BENCHMARKS): 0 oracle failures in every run but one. That one is the next entry's.
+> - **A-214 against A-205's give-back (re-landed in `2f70a86b`; the large-file NFS write entry has its evidence).** The
+>   reserve kept a write burst's worth of freed content pages pre-faulted, so
+>   `a_deleted_files_memory_leaves_the_working_set_and_recreating_it_reads_every_byte` failed on windows-latest and
+>   windows-11-arm, and A-214's own `arena::tests::an_idle_purge_keeps_the_reserve_and_gives_back_the_rest` failed
 >   under Miri.
-> The reverted tree passes the checkout, mem, rt, merge, recovery and daemon suites on macOS. Owed: nfs-write re-lands
-> A-214 reconciled with A-205's give-back (a reserve the give-back test accounts for, or one that decays) and green
-> under Miri; loadtest re-lands A-217 and A-207 with checkout comparing the base by what A-217 records. Both must run
-> `crates/server/tests/checkout.rs`, the Windows give-back test and Miri before they are handed over. A-204, the
-> harness (`93483514`), the merge windows fix (`d0389720`) and winfsp-overlap-3 stay on main.
+
+> **A daemon's restart can exceed the anchor's fixed recovery budget (found 2026-11-06 re-landing A-207 and A-217;
+> open, owner liveness with clients, A-228's family, assigned 2026-11-07).** A starting daemon that has not beaten 1 s after its spawn is killed ("the daemon never beat
+> inside the recovery budget"). The budget is `slates_db::replay::RECOVERY_BUDGET_NS`, a `Shape:` constant: RAMCloud's
+> target, not derived from the machine. The heartbeat is a task on the control shard, and recovery runs in that
+> shard's `init_shard` before any beat. So the whole start, including recovery, must fit in 1 s.
+> - **Seen** (macOS, Apple M5 Max, load 31 to 53; BENCHMARKS, the macOS re-land record):
+>   - Shard 0's recovery of one green over the kernel's `kernel/` and its works took 245,701 to 936,422 µs.
+>   - In 1 chaos run of 10, the anchor killed three successors in a row, and all 100 clients passed their reconnect
+>     budget (2 s). Another run saw 7 successors killed and passed.
+>   - main `00e5269c` at the same load had starting daemons killed before any green existed, beside the lapses the
+>     entry "The anchor kills live daemons on a busy machine" records.
+> - **What recovery does there:** the green's chain replayed version by version over its origin. Since A-217 the
+>   origin is walked again from the held snapshot (a `CreateGreen`'s walk; 158 to 466 ms for the trees measured). Since
+>   A-207 each work's log is replayed. None of it is sliced, so a large green holds the first beat for all of it. The
+>   cost per part is not yet measured.
+> - **The same class as the liveness entry above:** a fixed second, a shard task as the beat, and a busy machine as
+>   the normal case. A busy machine must not kill a daemon that is making progress, and a client's reconnect budget
+>   follows the same constant.
 
 > **A private purge's intent can wait up to the 1 s transaction timeout (found 2026-11-05, audit step 7; open).**
 > WinFsp's transact never goes pending: the control dispatch calls `FspVolumeTransact` inline (v2.1 `src/sys/fsctl.c:95-99`),
@@ -233,6 +256,10 @@
 > (it was the first); a pinned large-class file reads across its extents (no green could start from the kernel tree);
 > A-217, a green's origin is a reference to the base snapshot it holds (peak RSS over `fs/` 549,520 to 225,776 KiB,
 > `CreateGreen` 415 to 158 ms, best of three; `a_greens_base_snapshot_is_held_and_its_origin_recovered_from_it`). Open:
+> - **Fixed (A-207): a work's acknowledged edits were lost at a daemon restart.** A work's changes are logged in the
+>   partition and replayed at recovery (`acknowledged_work_edits_survive_a_daemon_restart`, red on main). Chaos on the
+>   branch it comes from: twenty daemon kills under the anchor at 10 and 100 clients, every client reconnected and
+>   resent its request in flight under its own id, the oracle and each client's own file 0 failures in every run.
 > - **A volume promised the whole version slab is refused at recovery** (bug record of 2026-11-05): a recovered
 >   snapshot rebuilds its directories privately, one retained version slot each the live volume did not hold (465,831
 >   committed slots before a restart, 465,832 after). Fix owed in `crates/vfs/src/recover.rs`.
@@ -710,7 +737,9 @@
 > written), presented 1 create and 3 replaces (manifest `06ca7f70…`), the human's `slates grant` at the Mac's anchor
 > issued grant 1, and the landing ended `done`: 4 written, 74 bytes, data and 2 directories synced; the Mac's disk
 > held every merged byte. Two Mac Studios had frozen the server earlier the same day (the kiln runner's headroom
-> guard, the anchor in state `T`); the MacBook did not. Open, found on the way:
+> guard, the anchor in state `T`); the MacBook did not. On main b502cf96 A-217's held origin made every checkout of a
+> based green refuse `ConsistentBaseUnavailable` (3 of 3 checkout tests red on main); fixed by comparing identities
+> (`docs/bugs/2026-11-05-a-held-origin-refused-every-checkout.md`). Open, found on the way:
 > - **The daemon cannot clone an overlay volume.** `admit_clone` gives every clone no host, so `volume clone` of an
 >   overlay is refused `ContentUnavailable` (pinned or not; fleet and standalone), though the volume core can.
 > - **No grant can be issued on Linux from the CLI.** The anchor's issuer segment is a descriptor only its children

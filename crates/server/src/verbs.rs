@@ -5123,6 +5123,19 @@ fn create_green(
   let Some(id) = fresh_volume_id(state) else {
     return refused(ids_exhausted());
   };
+  // A base-seeded green holds its base snapshot for as long as it lives (A-217): pinned in the base volume first, so
+  // nothing the green names can be freed under it, and given back if a later step refuses.
+  let held = match (base, &origin) {
+    (Some(base), Some(origin)) => match hold_origin_snapshot(state, base) {
+      Ok(()) => Some(slates_db::partition::OriginRef {
+        volume: to_db_volume(base.volume),
+        snapshot: to_db_snapshot(base.snapshot),
+        identity: crate::merge_service::origin_identity(origin),
+      }),
+      Err(refusal) => return refused(refusal),
+    },
+    _ => None,
+  };
   let record = VolumeRecord {
     id,
     name: name.to_owned(),
@@ -5154,23 +5167,25 @@ fn create_green(
     .db
     .mutate(&mut state.segment, &Op::VolumeCreated { record }, now)
   {
+    release_origin_snapshot(state, held.as_ref());
     return refused(refusal_of_db(&e));
   }
-  // A base-seeded green records its origin durably — guarded (the chain budget) before the engine
-  // is seeded, so a refused origin leaves no engine ahead of its log — and replays it before the
-  // chain on recovery (`rebuild_green`).
-  let engine = match origin {
-    None => slates_merge::engine::Green::new(),
-    Some(origin) => {
-      let record = Op::GreenOriginated {
+  // A base-seeded green records its origin as the reference it holds (A-217: the snapshot and the origin's
+  // identity, never the tree's bytes), before the engine is seeded, so a refused record leaves no engine ahead of its
+  // log; recovery walks the held snapshot again before the chain (`rebuild_green`).
+  let engine = match (origin, held) {
+    (Some(origin), Some(held)) => {
+      let record = Op::GreenOriginHeld {
         green: id,
-        origin: origin.encode(),
+        origin: held,
       };
       if let Err(e) = state.db.mutate(&mut state.segment, &record, now) {
+        release_origin_snapshot(state, Some(&held));
         return refused(refusal_of_db(&e));
       }
       slates_merge::engine::Green::with_origin(&origin)
     }
+    _ => slates_merge::engine::Green::new(),
   };
   let mut engine = engine;
   engine.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
@@ -5179,6 +5194,46 @@ fn create_green(
   crate::merge_service::enqueue_record(state, id, 0, [0u8; 32], 0, Vec::new());
   ReplyBody::GreenCreated {
     id: to_wire_volume(id),
+  }
+}
+
+/// Pins `base`'s snapshot in its volume for a green that names it (A-217), as a clone pins its origin: its destroy is
+/// then refused until the green is gone.
+fn hold_origin_snapshot(
+  state: &mut ShardState,
+  base: slates_ipc::protocol::GreenBase,
+) -> Result<(), Refusal> {
+  let (handle, _) = find(state, base.volume).map_err(|reply| match *reply {
+    ReplyBody::Refused { refusal } => refusal,
+    _ => Refusal::NotFound,
+  })?;
+  let slot = state
+    .volumes
+    .get_mut(handle)
+    .map_err(|_| Refusal::NotFound)?;
+  slot
+    .volume
+    .pin(core_snapshot(base.snapshot))
+    .map_err(|e| refusal_of_vfs(&e))
+}
+
+/// Gives back the pin a green held on its origin's snapshot (A-217): at the green's destroy, or when its creation was
+/// refused after the pin.
+pub(crate) fn release_origin_snapshot(
+  state: &mut ShardState,
+  held: Option<&slates_db::partition::OriginRef>,
+) {
+  let Some(held) = held else {
+    return;
+  };
+  if let Some(handle) = state.by_id.get(&held.volume).copied() {
+    unpin_origin(
+      state,
+      handle,
+      SnapshotId {
+        value: held.snapshot.value,
+      },
+    );
   }
 }
 
@@ -5456,45 +5511,24 @@ fn edit(
       version: w.base_version,
     });
   };
-  let old_len = old.map_or(0, |c| c.len() as u64);
-  // The journal operations this edit records, built before anything changes so its charge is exact.
-  let mut ops = Vec::new();
-  if old.is_none() {
-    ops.push(VolumeOp::Create {
-      path: path.to_owned(),
-    });
-  }
-  if delete_len > 0 {
-    ops.push(VolumeOp::Delete {
-      path: path.to_owned(),
-      at,
-      len: delete_len,
-    });
-  }
-  if !bytes.is_empty() {
-    let len = bytes.len() as u64;
-    ops.push(if at >= old_len {
-      VolumeOp::Extend {
-        path: path.to_owned(),
-        at,
-        len,
-      }
-    } else {
-      VolumeOp::Insert {
-        path: path.to_owned(),
-        at,
-        len,
-      }
-    });
-  }
+  // The journal operations this edit records, built before anything changes so its charge is exact, by the one
+  // builder the work log's replay uses too (`crate::work_log`, A-207).
+  let inserted = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+  let ops = crate::work_log::edit_ops(path, old, (at, delete_len, inserted));
   // The work is charged for what the edit adds before it changes anything (`crate::work_charge`): the file it now
   // holds (copied from the base when it had not changed it), less what the splice deletes, and the journal's ops.
   let (spliced, removed) = w
     .files
     .splice_delta(path, old, (at, delete_len, bytes.len()));
   let added = crate::work_charge::journal_footprint(&ops).saturating_add(spliced);
-  if let Err(available) = crate::work_charge::grow(state, work_id, added) {
-    return refused(Refusal::BudgetExceeded { available });
+  let entry = crate::work_log::WorkLogEntry::Edit {
+    path: path.to_owned(),
+    at,
+    delete_len,
+    bytes: bytes.to_vec(),
+  };
+  if let Err(refusal) = record_work_change(state, work_id, added, entry) {
+    return refused(refusal);
   }
   let (works, greens) = (&mut state.works, &state.greens);
   let Some(w) = works.get_mut(&work_id) else {
@@ -5505,16 +5539,69 @@ fn edit(
     version: w.base_version,
   };
   // The base was read above on this single-threaded shard, so it still is; a refusal here gives the charge back.
-  if w.files.splice(base, path, (at, delete_len), bytes).is_err() {
+  if crate::work_log::apply_edit(
+    (&mut w.files, &mut w.journal),
+    base,
+    (path, at, delete_len, bytes),
+    ops,
+  )
+  .is_err()
+  {
     let green = to_wire_volume(w.green);
     let version = w.base_version;
     crate::work_charge::shrink(state, work_id, added);
     return refused(Refusal::UnknownBase { green, version });
   }
   w.revision = w.revision.wrapping_add(1);
-  w.journal.extend(ops);
   crate::work_charge::shrink(state, work_id, removed);
   ReplyBody::Edited
+}
+
+/// Records a change to `work` in its log, in the verb's transaction (A-207; D-18: an acknowledged change survives a
+/// daemon restart; `crate::work_log`), after charging the `added` bytes it brings: refused, with nothing changed, when
+/// the partition's merge budget cannot hold the entry or the budget cannot cover the bytes.
+fn record_work_change(
+  state: &mut ShardState,
+  work: DbVolumeId,
+  added: u64,
+  entry: crate::work_log::WorkLogEntry,
+) -> Result<(), Refusal> {
+  let op = Op::WorkLogged {
+    work,
+    entry: slates_wire::Wire::to_bytes(&entry),
+  };
+  let now = state.clock.monotonic_ns();
+  state
+    .db
+    .partition()
+    .check(&op, now)
+    .map_err(|e| refusal_of_db(&e))?;
+  crate::work_charge::grow(state, work, added)
+    .map_err(|available| Refusal::BudgetExceeded { available })?;
+  if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
+    crate::work_charge::shrink(state, work, added);
+    return Err(refusal_of_db(&e));
+  }
+  Ok(())
+}
+
+/// The `WorkRestated` record of `work` restated as `entry` (A-207): what an accepted submit or a rebase records.
+fn restatement(work: DbVolumeId, entry: &crate::work_log::WorkLogEntry) -> Op {
+  Op::WorkRestated {
+    work,
+    entry: slates_wire::Wire::to_bytes(entry),
+  }
+}
+
+/// The restatement of a work an accepted submit resets to `version`: based there, holding nothing of its own, with an
+/// empty journal. Its length does not depend on the version (the wire codec writes a `u64` at its fixed width), so the
+/// submit checks it before the verdict.
+fn accepted_restatement(version: u64) -> crate::work_log::WorkLogEntry {
+  crate::work_log::WorkLogEntry::Restated {
+    base: version,
+    files: Vec::new(),
+    journal: Vec::new(),
+  }
 }
 
 /// Declares a namespace or metadata operation on a work volume (§4.16): appends the corresponding
@@ -5597,8 +5684,11 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
     });
   };
   let added = volume_op.footprint().saturating_add(moved);
-  if let Err(available) = crate::work_charge::grow(state, work_id, added) {
-    return refused(Refusal::BudgetExceeded { available });
+  let entry = crate::work_log::WorkLogEntry::Declared {
+    op: crate::work_log::LoggedOp::of(&volume_op),
+  };
+  if let Err(refusal) = record_work_change(state, work_id, added, entry) {
+    return refused(refusal);
   }
   let (works, greens) = (&mut state.works, &state.greens);
   let Some(w) = works.get_mut(&work_id) else {
@@ -5608,13 +5698,12 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
     green: greens.get(&w.green),
     version: w.base_version,
   };
-  if w.files.declare(base, &volume_op).is_err() {
+  if crate::work_log::apply_declare((&mut w.files, &mut w.journal), base, volume_op).is_err() {
     let green = to_wire_volume(w.green);
     let version = w.base_version;
     crate::work_charge::shrink(state, work_id, added);
     return refused(Refusal::UnknownBase { green, version });
   }
-  w.journal.push(volume_op);
   w.revision = w.revision.wrapping_add(1);
   crate::work_charge::shrink(state, work_id, removed);
   ReplyBody::Declared
@@ -5852,6 +5941,12 @@ fn submit(
   if let Err(e) = state.db.partition().check(&record, now) {
     return refused(refusal_of_db(&e));
   }
+  // So is the work's restatement an acceptance records with it (A-207): guard-then-apply, the whole submit is refused
+  // before the verdict rather than after the chain moved.
+  let reset = restatement(work_id, &accepted_restatement(inc.base));
+  if let Err(e) = state.db.partition().check(&reset, now) {
+    return refused(refusal_of_db(&e));
+  }
   // Charge superseded values before the verdict. Incoming bytes do not bound the retained
   // history: unlink carries none and a short overwrite retains the complete previous file.
   let Some(engine) = state.greens.get(&green_id) else {
@@ -5905,6 +6000,13 @@ fn submit(
       if chain_len < version
         && let Err(e) = state.db.mutate(&mut state.segment, &record, now)
       {
+        return refused(refusal_of_db(&e));
+      }
+      if let Err(e) = state.db.mutate(
+        &mut state.segment,
+        &restatement(work_id, &accepted_restatement(version)),
+        now,
+      ) {
         return refused(refusal_of_db(&e));
       }
       reset_accepted_work(state, work_id, version);
@@ -6005,12 +6107,28 @@ fn rebase(state: &mut ShardState, principal: &Principal, work: VolumeId) -> Repl
     } => {
       // The work moves onto the head; the green is untouched. The engine returns only what the work's mapped edits
       // leave different from the head (`Rebased::changed`), which becomes the work's delta over its new base
-      // (`crate::work_files`): O(what the work changed). Its new footprint is charged first: refused, the work stays
-      // where it was. `build_increment` proved the work exists, so this lookup finds it.
+      // (`crate::work_files`): O(what the work changed). The restatement's log entry is checked first (A-207), then
+      // its new footprint is charged: refused either way, the work stays where it was. `build_increment` proved the
+      // work exists, so this lookup finds it.
       let changed = crate::work_files::WorkFiles::from_changed(changed);
       let wanted = crate::work_charge::footprint(&changed, &journal);
+      let op = restatement(
+        work_id,
+        &crate::work_log::WorkLogEntry::restated(version, &changed, &journal),
+      );
+      let now = state.clock.monotonic_ns();
+      if let Err(e) = state.db.partition().check(&op, now) {
+        return refused(refusal_of_db(&e));
+      }
+      let charged_before = state.works.get(&work_id).map_or(0, |w| w.charged);
       if let Err(available) = crate::work_charge::set_to(state, work_id, wanted) {
         return refused(Refusal::BudgetExceeded { available });
+      }
+      if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
+        // Not recorded, so the work stays where it was and so does its charge (a return to what it held cannot be
+        // refused).
+        let _ = crate::work_charge::set_to(state, work_id, charged_before);
+        return refused(refusal_of_db(&e));
       }
       if let Some(w) = state.works.get_mut(&work_id) {
         w.files = changed;
@@ -7513,6 +7631,16 @@ fn destroy(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> R
   };
   if !rights_of(&record, principal).admin {
     return forbidden("destroy");
+  }
+  // A volume whose snapshot a green names as its origin is held with it (A-217): the green's recovery walks that
+  // snapshot, so the volume is refused as the pinned snapshot's own destroy is, until the green is gone.
+  if state
+    .db
+    .partition()
+    .green_origin_refs()
+    .any(|(_, held)| held.volume == record.id)
+  {
+    return refused(refusal_of_vfs(&slates_vfs::VfsError::Pinned));
   }
   let now = state.clock.monotonic_ns();
   let ops = [
@@ -9117,8 +9245,8 @@ pub struct Rebuilt {
   pub blocks_swept: usize,
   /// Host mounts of snapshots whose read-only views were rebuilt (AUD-29-76).
   pub snapshot_views: usize,
-  /// Merge volumes rebuilt (§4.16): greens with their persisted chain replayed, works reset to a
-  /// fresh clone of their green's head (their scratch edits did not survive).
+  /// Merge volumes rebuilt (§4.16): greens with their persisted chain replayed, works with their log replayed over
+  /// their green (A-207: their acknowledged edits survive).
   pub merge_volumes: usize,
   /// Manifests held for other owners that recovery held again from the image (AUD-29-59).
   pub replicas: usize,
@@ -9223,21 +9351,24 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
     rebuilt.records = crate::content_holder::restore_held_registers(state, local, held);
   }
   let mut max_prefix = state.next_prefix;
-  // Greens first, so a work can seed from a rebuilt green (§4.16): a green's merge chain is replayed
-  // into a fresh engine, restoring its content and versions.
-  for record in &records {
-    if matches!(record.policy.role, Role::Green { .. }) {
-      rebuild_green(state, record);
-      rebuilt.merge_volumes = rebuilt.merge_volumes.saturating_add(1);
-    }
-  }
-  // Origins before their clones (A-64): a clone is rebuilt over its recovered origin's snapshot.
+  // Plain volumes first, origins before their clones (A-64: a clone is rebuilt over its recovered origin's snapshot);
+  // then greens, whose held origin is walked from a plain volume's snapshot (A-217); then works, each replayed over its
+  // rebuilt green (§4.16, A-207). Every record is then reconciled the same way.
   let mut records = records;
-  records.sort_by_key(|record| lineage_depth(state, record.id));
+  records.sort_by_key(|record| {
+    let pass = match record.policy.role {
+      Role::Plain => 0u8,
+      Role::Green { .. } => 1,
+      Role::Work { .. } => 2,
+    };
+    (pass, lineage_depth(state, record.id))
+  });
   for record in &records {
     match record.policy.role {
-      // Rebuilt in the pass above; here only its content-less attachments are reconciled out.
-      Role::Green { .. } => {}
+      Role::Green { .. } => {
+        rebuild_green(state, record);
+        rebuilt.merge_volumes = rebuilt.merge_volumes.saturating_add(1);
+      }
       Role::Work { green, .. } => {
         rebuild_work(state, record, green);
         rebuilt.merge_volumes = rebuilt.merge_volumes.saturating_add(1);
@@ -9402,8 +9533,9 @@ pub(crate) fn retire_local_tombstones(state: &mut ShardState) {
 /// ahead would refuse the snapshot's destroy forever; one left behind would free a clone's shared
 /// tree. An image volume pins the snapshot it was built from as a clone does (A-160), and is counted with the clones.
 /// Returns how many pins were changed.
-fn reconcile_clone_pins(state: &mut ShardState) -> usize {
-  // The catalog's live clones and image volumes per (origin volume, origin snapshot).
+/// The pins the catalog records per (origin volume, origin snapshot): its live clones, its image volumes (A-160) and
+/// its greens' held origins (A-217). What recovery brings each rebuilt snapshot's pins up to.
+fn recorded_pins(state: &ShardState) -> std::collections::BTreeMap<([u8; 16], u64), u32> {
   let mut recorded: std::collections::BTreeMap<([u8; 16], u64), u32> =
     std::collections::BTreeMap::new();
   for record in state.db.partition().volumes() {
@@ -9424,7 +9556,19 @@ fn reconcile_clone_pins(state: &mut ShardState) -> usize {
       let count = recorded.entry((volume.bytes, snapshot.value)).or_insert(0);
       *count = count.saturating_add(1);
     }
+    // So does a green its origin's snapshot (A-217).
+    if let Some(held) = state.db.partition().green_origin_ref(record.id) {
+      let count = recorded
+        .entry((held.volume.bytes, held.snapshot.value))
+        .or_insert(0);
+      *count = count.saturating_add(1);
+    }
   }
+  recorded
+}
+
+fn reconcile_clone_pins(state: &mut ShardState) -> usize {
+  let recorded = recorded_pins(state);
   let rebuilt: Vec<(DbVolumeId, Handle<VolumeSlot>)> =
     state.by_id.iter().map(|(id, h)| (*id, *h)).collect();
   let mut changed: usize = 0;
@@ -9464,10 +9608,13 @@ fn rebuild_green(state: &mut ShardState, record: &VolumeRecord) {
     Err(fence) => return fence_green(state, record, fence),
   };
   state.greens.insert(record.id, green);
-  // The replay rebuilt every history in full; the recovered works are reset to the head and a green's
-  // attachments are reconciled out at boot, so nothing reachable lies below the head: fold to it and
-  // re-take the retention the remaining histories hold, ahead of new claims (§4.2 recovery order). A
-  // retention the budget cannot hold fences the green rather than serve it over budget.
+  // The replay rebuilt every history in full; fold it oldest-first back to the budget and re-take the retention the
+  // remaining histories hold, ahead of new claims (§4.2 recovery order). The works are rebuilt after their greens,
+  // at the bases their logs restore (A-207), so no work's base is in the floor here; the fold still never passes one.
+  // Before the restart a claim past the green's budget was refused (`secure_green_retention`), so the history the
+  // live engine held, folded to where it had folded, was within the budget; folding oldest-first therefore stops at
+  // or below that point, which no live work's base was under. A retention the budget cannot hold fences the green
+  // rather than serve it over budget.
   if let Err(short) = crate::merge_service::settle_green_retention(state, record.id) {
     fence_green(
       state,
@@ -9487,11 +9634,19 @@ fn replay_green(
   id: DbVolumeId,
 ) -> Result<slates_merge::engine::Green, crate::merge_service::GreenFence> {
   use crate::merge_service::GreenFence;
-  let mut green = match state.db.partition().green_origin(id) {
-    None => slates_merge::engine::Green::new(),
-    Some(bytes) => slates_merge::origin::Origin::decode(bytes)
+  let partition = state.db.partition();
+  let mut green = match (partition.green_origin_ref(id), partition.green_origin(id)) {
+    // A held origin (A-217) is walked again from its base snapshot, rebuilt before any green, and must give the
+    // origin the green was created from.
+    (Some(held), _) => match crate::merge_service::walk_held_origin(state, held) {
+      Ok(origin) => slates_merge::engine::Green::with_origin(&origin),
+      Err(Refusal::ContentUnavailable) => return Err(GreenFence::OriginCorrupt),
+      Err(_) => return Err(GreenFence::OriginUnavailable),
+    },
+    (None, Some(bytes)) => slates_merge::origin::Origin::decode(bytes)
       .map(|origin| slates_merge::engine::Green::with_origin(&origin))
       .map_err(|_| GreenFence::OriginCorrupt)?,
+    (None, None) => slates_merge::engine::Green::new(),
   };
   for (index, bytes) in state.db.partition().green_chain(id).iter().enumerate() {
     let version = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
@@ -9534,29 +9689,51 @@ fn fence_green(
 /// report, alongside the verbs' refusal kinds.
 const GREEN_FENCED: &str = "merge.green_fenced";
 
-/// Rebuilds a recovered work volume as a fresh clone of its green's current head (§4.16): a work's
-/// declared edits are scratch and do not survive a restart (BUG-11 class), so the work is reset —
-/// based on its green's head and holding nothing of its own (`crate::work_files`) — never presenting
-/// lost edits as if kept. Skipped when its green is gone (the work has nothing to be over). A work that
-/// holds nothing is charged nothing, so no budget can refuse the rebuild (a whole copy of the green was
-/// charged, and could be refused, before 2026-11-04).
+/// Rebuilds a recovered work volume from its log (§4.16, A-207; D-18): its base, what it holds of its own and its
+/// journal, replayed over its rebuilt green, so every change it acknowledged before the restart is there after it.
+/// Skipped when its green is gone (the work has nothing to be over). Charged for what it keeps, like any work; a log
+/// that does not replay, or a budget that cannot hold the work, leaves it unbuilt and counted
+/// (`WORK_REBUILD_REFUSED`), never presented reset as if its edits were kept.
 fn rebuild_work(state: &mut ShardState, record: &VolumeRecord, green: DbVolumeId) {
   let Some(engine) = state.greens.get(&green) else {
     return;
   };
-  let base_version = engine.head();
+  // A work comes back from its log (A-207; D-18): its base, what it holds of its own and its journal, replayed over its
+  // green through the verbs' own change path. It was rebuilt as a fresh clone of the head, so its acknowledged edits
+  // read back as the green's bytes and its next submit was accepted without them.
+  let created_at = match record.policy.role {
+    Role::Work { base_version, .. } => base_version,
+    _ => engine.head(),
+  };
+  let entries = state.db.partition().work_log(record.id);
+  let Ok((base_version, files, journal)) =
+    crate::work_log::replay(Some(engine), created_at, entries)
+  else {
+    state.count(WORK_REBUILD_REFUSED, 1);
+    return;
+  };
+  // Charged like any work for what it keeps; a budget that cannot hold it leaves the work unbuilt and counted.
+  let charged = crate::work_charge::footprint(&files, &journal);
+  if state.store.grow(charged).is_err() {
+    state.count(WORK_REBUILD_REFUSED, 1);
+    return;
+  }
   state.works.insert(
     record.id,
     crate::state::WorkState {
       green,
       base_version,
-      journal: Vec::new(),
-      files: crate::work_files::WorkFiles::default(),
+      journal,
+      files,
       revision: 0,
-      charged: 0,
+      charged,
     },
   );
 }
+
+/// The status count of recovered works left unbuilt because their log did not replay or the shard's budget could not
+/// hold them (A-207). Format: a refusal name in the daemon's status report.
+const WORK_REBUILD_REFUSED: &str = "merge.work_rebuild_refused";
 
 /// A shard's slice of the anchor content object, read by copies (§4.8): the object is sparse (backed
 /// only where it is touched) and hands out no reference to its bytes (AUD-29-09), so the image is found

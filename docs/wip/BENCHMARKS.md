@@ -9750,6 +9750,59 @@ for p in $(pgrep -f "instance $instance"); do kill -9 $p 2>/dev/null; done
 sleep 0.5; echo "left: $(pgrep -f "instance $instance" | tr '\n' ' ')" >> $dir/chaos-$tag.pids
 ```
 
+### The many-client load test after the re-landing of A-207 and A-217, macOS (2026-11-06)
+
+`agents/reland-a207-1` at `827092dd` (A-217, the checkout by identity, A-207 over A-202's delta rebase), release.
+Apple M5 Max, 18 cores, macOS 26.4.1, 5 shards (the harness's own daemon) or `--shards 4` (chaos under the anchor);
+load 31 to 53 from other agents' builds and runs; 2026-11-06 06:44 to 06:52 UTC. The tree is the kernel's `kernel/`
+(754 files, 16,321,721 bytes). main's harness cannot run on macOS: `tree_bytes` calls `du -sb`, and BSD `du` has no
+`-b`. So the harness binary was built with loadtest-scale's `tree_bytes` (`-sAk` x 1024 on macOS, on
+`agents/loadtest-scale-1`). That hunk was applied for the build and then removed, and is not in the branch. Two
+readings of main's harness (loadtest-scale):
+- Its oracle replays a whole copy of every touched file per version. That takes seconds at 10 and 100 clients and
+  does not scale to 1,000; the per-slot oracle is `c35c532f` on `agents/loadtest-scale-1`.
+- A refusal row is the harness's own error string, not a typed refusal.
+
+`load_bench --tree kernel --clients 10,100 --hot-files 80`, three runs, all shown. Nanoseconds, p50:
+
+| Clients | Edit, runs 1 / 2 / 3 | Accepted submit, runs 1 / 2 / 3 | CreateWork, runs 1 / 2 / 3 | Oracle |
+|---|---|---|---|---|
+| 10 | 87,291 / 299,917 / 212,833 | 246,250 / 539,083 / 300,125 | 113,729,958 / 881,042 / 4,975,834 | 30 accepted, 5 conflicts, 0 failures each |
+| 100 | 28,640,208 / 28,857,875 / 25,886,958 | 38,721,417 / 61,656,459 / 38,997,667 | 54,042,000 / 1,719,875 / 1,027,083 | 300 accepted, 199 to 229 conflicts, 0 failures each |
+
+Every client's own file held its accepted rounds once each in all six levels.
+
+Chaos: the procedure above, 10 clients x 200 rounds and 100 x 20, the daemon SIGKILLed 0.5, 1.5, 2.5, 3.5 and 5 s
+into the run phase. No mount was live, so no kill landed under a kernel NFS mount.
+- **Nine of the ten runs:** 2,000 accepted, 0 oracle and 0 own-file failures, harness exit 0.
+  - Reconnected and resent: 10, 10, 10, 10 and 8 of 10 (the rest had finished), and 100 of 100 in each 100-client run.
+  - Longest outage: 7,105,042 to 150,410,292 ns at 10 clients and 65,804,250 to 357,513,750 ns at 100.
+- **One run failed: 100 clients, killed at 3.5 s.** The anchor killed three successors in a row ("the daemon never
+  beat inside the recovery budget"), and the fourth recovered. In each, shard 0's recovery (one green, at least 322
+  versions, 100 work logs) held its first beat. The one that finished logged shard 0 initialized in 936,422 µs. By then
+  every client had passed its reconnect budget (recovery plus liveness, 2 s) and was refused "the daemon did not come
+  back within the reconnect budget": 0 reconnects.
+  - The oracle then found 4 file failures and 1 own-file failure, all of one kind. Client `100000003`'s file holds its
+    round 6, but the harness never saw round 6 accepted: the daemon accepted the submit and the client gave up before
+    it could resend.
+  - So nothing acknowledged was lost. The run fails on the restart's time, not its content (GAPS, "A daemon's restart
+    can exceed the anchor's fixed recovery budget").
+- **The 10-client run killed at 0.5 s passed, after the anchor killed 7 successors** (never beat) and 1 running
+  daemon (heartbeat lapsed).
+
+Shard 0's recovery time in the other eight runs, the successor that served: 245,701 to 548,338 µs with 101 merge
+volumes, 269,660 to 366,273 µs with 9 to 11.
+
+**main on the same machine, interleaved, two configurations each (2026-11-06, `00e5269c` built with the same
+`tree_bytes`; four runs, then stopped):** main's harness aborted in setup in both of its runs. Each time
+`pin(overlay)` over the tree was refused `Stalled` after the client's 1 s reply deadline, and the anchor had already
+killed a starting daemon (never beat) and lapsed running ones (2 and 1). The branch's two runs aborted too: in one the
+anchor killed 5 starting daemons, some before they logged "serving"; in the other it lapsed 5. So at this load the
+anchor's fixed 1 s budgets kill daemons on main too, before any recovery. The comparison of restart cost did not
+complete.
+A pin over about 1 s answering `Stalled` is main's client behaviour. loadtest-scale is making Pin a deferred reply
+sliced on its owner shard, to land on `agents/loadtest-scale-1` as its own commit (not yet committed on 2026-11-06).
+
 ### What a successful open costs under each serving pattern: arm64's remainder is the DLL's second waiting thread (2026-11-05)
 
 **The question (the supervisor's).** Does completing our open cost the kernel more than the DLL's, or is the time on the
