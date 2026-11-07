@@ -207,6 +207,9 @@ struct Run {
   activations: u64,
   /// Of those, the ones whose target kept fewer than `f` of the holders it replaced.
   activations_past_the_overlap: u64,
+  /// Takeovers made inside a transition's windows: before its target held every durable entry, between that and the
+  /// record naming it, and while the record lagged the shipper's holders.
+  window_takeovers: [u64; 3],
   /// Whose reports phase one counts ([`Counting`]).
   counting: Counting,
   /// Whether a fresh member may join the candidates when an owner is lost, as a replaced pod does under a fresh identity
@@ -279,6 +282,7 @@ impl Run {
       reconfigurations: 0,
       activations: 0,
       activations_past_the_overlap: 0,
+      window_takeovers: [0; 3],
       counting: Counting::Holders,
       newcomers: false,
       joined: 0,
@@ -793,12 +797,12 @@ impl Run {
       .filter(|host| *host != owner)
       .collect();
     // The set's size: none now and then; `2f + 1` now and then (the owner outside its own volume's placement, so every
-    // other candidate a holder: raft-chaos, CI diag-20 run 7); `1..=f` now and then (too few for phase one); `2f`
-    // otherwise.
+    // other candidate a holder: raft-chaos, CI diag-20 run 7); `1..=2f − 1` now and then (too few for phase one, or at
+    // f >= 2 between `f + 1` and `2f − 1`, where `n − f` holders are fewer than `f`: raft's review); `2f` otherwise.
     let size = match self.rng.below(10) {
       0 => 0,
       1 => 2 * self.f + 1,
-      2 => 1 + u64::try_from(self.rng.below(usize::try_from(self.f).unwrap())).unwrap(),
+      2 => 1 + u64::try_from(self.rng.below(usize::try_from(2 * self.f - 1).unwrap())).unwrap(),
       _ => 2 * self.f,
     };
     let mut next = Vec::new();
@@ -852,6 +856,48 @@ impl Run {
       owner.recorded.clone_from(&next);
       let named = format!("{next:?}");
       self.note(|| format!("the record names holders {named}"));
+    }
+  }
+
+  /// Takes the current owner over when its log is inside one of a holder transition's windows, counting which: the target
+  /// short of the durable entries, the target transferred but not yet recorded, or the record lagging the holders.
+  fn take_over_in_a_window(&mut self) {
+    let owner = &self.owners[self.current];
+    let shipper = &owner.shipper;
+    let mut holders = shipper.holders().to_vec();
+    holders.sort_unstable();
+    let mut recorded = owner.recorded.clone();
+    recorded.sort_unstable();
+    let window = match (shipper.transition(), shipper.transferred()) {
+      (Some(_), false) => Some(0),
+      (Some(target), true) if owner.recorded.as_slice() != target => Some(1),
+      _ if recorded != holders => Some(2),
+      _ => None,
+    };
+    if let Some(window) = window {
+      // Half the time a host the configuration names but the record does not is cut off first: a successor that asks
+      // everyone reachable meets a new set's holder otherwise, and only an unreachable one shows what the record names.
+      if self.rng.chance(500) {
+        let recorded = self.owners[self.current].recorded.clone();
+        let outside: Vec<HostId> = self
+          .configuration
+          .iter()
+          .copied()
+          .filter(|host| !recorded.contains(host))
+          .collect();
+        if let Some(isolated) = outside.get(self.rng.below(outside.len())).copied() {
+          for host in self.hosts.clone() {
+            if host != isolated {
+              self.cut.insert((isolated, host));
+            }
+          }
+        }
+      }
+      let before = self.takeovers;
+      self.take_over();
+      if self.takeovers > before {
+        self.window_takeovers[window] += 1;
+      }
     }
   }
 
@@ -918,6 +964,20 @@ impl Run {
     }
   }
 
+  /// A superseded owner keeps writing and re-shipping.
+  fn stale_owner_step(&mut self) {
+    let stale: Vec<usize> = (0..self.owners.len())
+      .filter(|index| *index != self.current)
+      .collect();
+    if let Some(index) = stale.get(self.rng.below(stale.len())).copied() {
+      if self.rng.chance(500) {
+        self.write(index);
+      } else {
+        self.tick(index);
+      }
+    }
+  }
+
   fn step(&mut self) {
     let roll = self.rng.below(100);
     match roll {
@@ -943,18 +1003,12 @@ impl Run {
       }
       79..=83 => self.tick(self.current),
       84..=86 => self.toggle_cut(),
-      87..=89 => {
-        // A superseded owner keeps writing and re-shipping.
-        let stale: Vec<usize> = (0..self.owners.len())
-          .filter(|index| *index != self.current)
-          .collect();
-        if let Some(index) = stale.get(self.rng.below(stale.len())).copied() {
-          if self.rng.chance(500) {
-            self.write(index);
-          } else {
-            self.tick(index);
-          }
-        }
+      87..=89 => self.stale_owner_step(),
+      // With `following`, every takeover waits for a holder transition's window, so the owner losses the run allows (at
+      // most `f`) land where a wrong transition rule would show (raft's review asked for owners and successors killed
+      // inside each window).
+      90..=91 | 99 if self.lost < self.f && self.following.is_some() => {
+        self.take_over_in_a_window()
       }
       90..=91 if self.lost < self.f => self.take_over(),
       93..=95 => self.learn(),
@@ -1395,11 +1449,16 @@ fn a_new_holder_set_counts_only_once_it_holds_every_durable_entry() {
 }
 
 /// What a nemesis run under [`Following`] counted: reconfigurations, activations, activations past the overlap,
+<<<<<<< HEAD
 /// takeovers, durable positions.
 type FollowingCounts = (u64, u64, u64, u64, u64, u64);
 
 /// Shape: the chance, per mille, that a `following` run's takeover is followed at once by its successor's loss.
 const CHAINED_PER_MILLE: u64 = 250;
+=======
+/// takeovers, durable positions, and the takeovers made inside each transition window ([`Run::take_over_in_a_window`]).
+type FollowingCounts = (u64, u64, u64, u64, u64, [u64; 3]);
+>>>>>>> origin/agents/live-fixes-1
 
 /// A broken seed: its `f`, its seed, and the failed check's message.
 type BrokenSeed = (u64, u64, String);
@@ -1409,7 +1468,11 @@ type BrokenSeed = (u64, u64, String);
 /// overlap, takeovers, durable positions) of the passing ones.
 fn run_following(following: Following) -> (Vec<BrokenSeed>, FollowingCounts) {
   let mut broken = Vec::new();
+<<<<<<< HEAD
   let mut totals = (0, 0, 0, 0, 0, 0);
+=======
+  let mut totals = (0, 0, 0, 0, 0, [0; 3]);
+>>>>>>> origin/agents/live-fixes-1
   for f in [1, 2] {
     for seed in 0..SEEDS {
       let outcome = std::panic::catch_unwind(|| {
@@ -1424,7 +1487,11 @@ fn run_following(following: Following) -> (Vec<BrokenSeed>, FollowingCounts) {
           run.activations_past_the_overlap,
           run.takeovers,
           u64::try_from(run.durable.len()).unwrap(),
+<<<<<<< HEAD
           run.chained,
+=======
+          run.window_takeovers,
+>>>>>>> origin/agents/live-fixes-1
         )
       });
       match outcome {
@@ -1434,7 +1501,13 @@ fn run_following(following: Following) -> (Vec<BrokenSeed>, FollowingCounts) {
           totals.2 += counts.2;
           totals.3 += counts.3;
           totals.4 += counts.4;
+<<<<<<< HEAD
           totals.5 += counts.5;
+=======
+          for (total, count) in totals.5.iter_mut().zip(counts.5) {
+            *total += count;
+          }
+>>>>>>> origin/agents/live-fixes-1
         }
         Err(panic) => {
           let message = panic
@@ -1449,7 +1522,12 @@ fn run_following(following: Following) -> (Vec<BrokenSeed>, FollowingCounts) {
   }
   eprintln!(
     "{following:?}: {} broken seeds, first {:?}; passing seeds: {} reconfigurations, {} activations ({} keeping fewer \
+<<<<<<< HEAD
      than f holders), {} takeovers ({} of a successor at once), {} durable positions",
+=======
+     than f holders), {} takeovers ({:?} inside the windows: short, transferred unrecorded, record lagging), {} \
+     durable positions",
+>>>>>>> origin/agents/live-fixes-1
     broken.len(),
     broken.first(),
     totals.0,
@@ -1482,7 +1560,11 @@ fn run_following(following: Following) -> (Vec<BrokenSeed>, FollowingCounts) {
 /// not vacuous, sets activated that kept fewer than `f` of the old holders, takeovers, and durable writes.
 #[test]
 fn a_live_logs_holders_follow_its_candidates_through_a_joint_transition() {
+<<<<<<< HEAD
   let (broken, (reconfigurations, activations, past_the_overlap, takeovers, durable, chained)) =
+=======
+  let (broken, (reconfigurations, activations, past_the_overlap, takeovers, durable, windows)) =
+>>>>>>> origin/agents/live-fixes-1
     run_following(Following::Joint);
   assert!(broken.is_empty(), "joint transition: {broken:?}");
   assert!(
@@ -1492,6 +1574,56 @@ fn a_live_logs_holders_follow_its_candidates_through_a_joint_transition() {
       && takeovers > 0
       && durable > 0
       && chained > 0
+  );
+  assert!(
+    windows[0] > 0 && windows[1] > 0,
+    "owners were taken over before their transition's target held the log and before its record: {windows:?}"
+  );
+}
+
+/// raft's mutation (iii), as a history: a shipper must not drop its old holder set before the record names the new one.
+/// Do move holders `{2, 3}` to `{4, 5}` at `f = 1`; once the target holds the durable entry, activate it while the
+/// record still names `{2, 3}` (the mutation), make a second entry durable on host 4 alone, and take over with host 4
+/// unreachable, counting the recorded set. Expect that takeover to adopt a head without the durable entry: a write
+/// lost. With the design, the record names `{4, 5}` before the shipper drops `{2, 3}`, and the same takeover can count
+/// only one of the two recorded holders, so it adopts nothing and waits. (As a nemesis variant it broke no seed in 400:
+/// a successor asks every reachable host and adopts the newest report, so only an unreachable new holder shows it.)
+#[test]
+fn dropping_the_old_holders_before_the_record_names_the_new_loses_durable_writes() {
+  let owner = HostId(1);
+  let (old, new) = ([HostId(2), HostId(3)], [HostId(4), HostId(5)]);
+  let quorum = Quorum { f: 1 };
+  let mut shipper = Shipper::new((owner, OBJECT, HostEpoch(1)), quorum, &old, None, (4, 8));
+  let first = shipper.append(vec![1]).unwrap();
+  shipper.on_reply(old[0], Ok(held_after(owner, std::slice::from_ref(&first))));
+  assert!(shipper.begin_transition(&new));
+  shipper.on_reply(new[0], Ok(held_after(owner, std::slice::from_ref(&first))));
+  assert!(
+    shipper.transferred() && shipper.activate(&new),
+    "the target held the log"
+  );
+  let second = shipper.append(vec![2]).unwrap();
+  shipper.on_reply(new[0], Ok(held_after(owner, &[first.clone(), second])));
+  assert_eq!(
+    shipper.durable(),
+    Some(1),
+    "durable on f of the activated set"
+  );
+  // Host 4 unreachable; the others report.
+  let reports = [
+    (old[0], held_after(owner, std::slice::from_ref(&first))),
+    (old[1], None),
+    (new[1], None),
+  ];
+  assert_eq!(
+    adopt(&reports, &old, quorum).map(|(_, head)| head.position),
+    Some(0),
+    "counting the record that still named the old set, the takeover adopts position 0 and loses durable position 1"
+  );
+  assert_eq!(
+    adopt(&reports, &new, quorum),
+    None,
+    "counting the record that names the new set, the same takeover waits for host 4"
   );
 }
 
@@ -1551,11 +1683,12 @@ fn a_shipper_that_keeps_its_first_holders_never_reaches_new_candidates() {
 }
 
 /// A-200's intersection over a holder set of any size: a write is durable only once every `f + 1` reports a takeover can
-/// count from the set meet a holder of it, so on `n` holders it needs `n − f` of them (`f` of `2f`, `f + 1` of
-/// `2f + 1`), and on fewer than `f + 1` it is never durable, since no takeover can count `f + 1` there. Do ship one
+/// count from the set meet a holder of it and `f` failures leave a copy, so on `n` holders it needs `max(n − f, f)` of
+/// them (`f` of `2f`, `f + 1` of `2f + 1`, all of `f`), and on fewer than `f` it is never durable. Do ship one
 /// entry at `f = 1` to three holders (the owner outside its own volume's placement, so every other candidate holds),
 /// acknowledged by one. Expect it not durable, and a takeover counting the other two adopting no head; durable once a
-/// second holds it. Then the same with two holders and one acknowledgement: durable. With one holder: never durable.
+/// second holds it. Then the same with two holders and one acknowledgement: durable. With one holder: durable once it
+/// holds it (all `f`); with none: never. At `f = 2` with three holders: not durable on one, durable on two.
 /// Found by raft-chaos on CI (diag-20 run 7): with three recorded holders the owner counted a write durable on one,
 /// and a successor counted the other two and never asked it.
 #[test]
@@ -1587,9 +1720,24 @@ fn a_write_is_durable_only_where_every_takeover_quorum_meets_it() {
   shipper.on_reply(three[0], Ok(held));
   assert_eq!(
     shipper.durable(),
-    None,
-    "one holder: no takeover can count f + 1, never durable"
+    Some(0),
+    "one holder at f = 1: all f of them hold it with the owner, f + 1 copies (no phase one can count f + 1 of one, so \
+     nothing it could miss was answered)"
   );
+  let (shipper, _) = ship(&[]);
+  assert_eq!(shipper.durable(), None, "no holder: never durable");
+  // At f = 2 with three holders, `n − f` = 1 would count the owner and one holder: two copies, which two failures lose.
+  let quorum = Quorum { f: 2 };
+  let mut shipper = Shipper::new((owner, OBJECT, HostEpoch(1)), quorum, &three, None, (4, 8));
+  let held = held_after(owner, &[shipper.append(vec![1]).unwrap()]);
+  shipper.on_reply(three[0], Ok(held));
+  assert_eq!(
+    shipper.durable(),
+    None,
+    "f = 2: one of three holders is not durable"
+  );
+  shipper.on_reply(three[1], Ok(held));
+  assert_eq!(shipper.durable(), Some(0), "f = 2: f of three holders is");
 }
 
 /// R8: at `f = 0` there are no holders and every entry is durable at its append, by the same code.

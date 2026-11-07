@@ -1,7 +1,7 @@
 //! Live shipping's log (§4.10 "Live shipping", A-200; §4.8 the register rules it rides): the owner of a
 //! `live-shipped` volume ships each of its publications to the volume's other candidates as a fenced, hash-chained log,
 //! and a publication is durable once the owner and enough holders hold it that every `f + 1` of them a takeover can count
-//! meets one (`f` of the usual `2f`; `n − f` of `n`). This module is the protocol alone — sans-io,
+//! meets one and `f` failures leave a copy (`max(n − f, f)` of `n`: `f` of the usual `2f`). This module is the protocol alone — sans-io,
 //! deterministic, no clock — so the same code is the laptop (`f = 0`: no holders, every entry durable at once) and the
 //! fleet (R8), and the simulation in `crates/db/tests/live.rs` drives it under a nemesis.
 //!
@@ -1172,21 +1172,23 @@ impl Shipper {
     }
   }
 
-  /// The highest position held by enough members of `set` that every `f + 1` of them a takeover's phase one can count
-  /// meets one holding it: the `(n − f)`-th highest held position over its `n` members (`f` of `2f`; `f + 1` of
-  /// `2f + 1`, a set without the owner, whose placement moved off it). `None` when fewer hold anything, and always for a
-  /// set of `f` or fewer members, from which no phase one can count `f + 1`. At `f = 0`, the owner's head. Counting the
-  /// `f`-th highest whatever the set's size let a write held by one of three holders count as durable, and a successor
-  /// counted the other two (raft-chaos, CI diag-20 run 7).
+  /// The highest position held by `W = max(n − f, f)` of `set`'s `n` members: every `f + 1` of them a takeover's phase
+  /// one can count meets one holding it (`W + f + 1 > n`), and the owner and `W` holders are `f + 1` copies, which
+  /// survive `f` failures. `f` of `2f`; `f + 1` of `2f + 1` (a set without the owner, whose placement moved off it); all
+  /// `f` of `f`; never for fewer than `f`. `None` too while fewer hold anything. At `f = 0`, the owner's head (R8, the
+  /// same formula). Counting the `f`-th highest whatever the set's size let a write held by one of three holders count as
+  /// durable, and a successor counted the other two (raft-chaos, CI diag-20 run 7); `n − f` alone answered a write on the
+  /// owner and one holder at `f = 2` with three holders, two copies that `f` failures lose (raft's review).
   fn reached_by(&self, set: &[HostId]) -> Option<u64> {
     let tolerated = usize::try_from(self.quorum.f).ok()?;
     if tolerated == 0 {
       return self.head.map(|head| head.position);
     }
-    if set.len() <= tolerated {
+    if set.len() < tolerated {
       return None;
     }
-    let rank = set.len().checked_sub(tolerated)?.checked_sub(1)?;
+    let needed = set.len().saturating_sub(tolerated).max(tolerated);
+    let rank = needed.checked_sub(1)?;
     let mut positions: Vec<u64> = set
       .iter()
       .filter_map(|holder| self.held.get(holder).map(|head| head.position))

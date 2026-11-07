@@ -988,7 +988,7 @@ fn follow_candidates(state: &mut ShardState, volume: [u8; 16]) {
       .get(&volume)
       .is_some_and(|live| live.shipper.transition().is_some())
     {
-      state.count(LIVE_HOLDERS_UNPLACED, 1);
+      state.count(LIVE_HOLDERS_SHORT, 1);
     }
     return;
   }
@@ -1050,7 +1050,7 @@ fn target_recordable(state: &ShardState, volume: [u8; 16]) -> bool {
 /// Counter: a live volume began moving its holders to a changed set of candidates.
 const LIVE_HOLDERS_TRANSITION: &str = "fleet.live.holders_transition";
 /// Counter: a record period in which a live volume's transition target could not be recorded yet.
-const LIVE_HOLDERS_UNPLACED: &str = "fleet.live.holders_unplaced";
+const LIVE_HOLDERS_SHORT: &str = "fleet.live.holders_short";
 /// Counter: a live volume's new holder set held every durable entry and became its holders.
 const LIVE_HOLDERS_ACTIVATED: &str = "fleet.live.holders_activated";
 
