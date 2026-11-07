@@ -659,6 +659,9 @@ pub struct ShardState {
   /// This start's random nonce, announced with its derived member id on SWIM contact (§4.8).
   /// It survives a warm restart with the complete retained Raft state; whole-anchor loss changes it.
   pub member_boot_nonce: u64,
+  /// A word fresh at every start of this daemon process (keyed from the issuer secret minted at each start), announced
+  /// with this node's identity so a peer tells a restarted process from a redial of this one (`member_task::Announcement`).
+  pub member_process_nonce: u64,
   /// One authenticated identity per rostered certificate anchor, bounded by the roster.
   /// A different nonce retires the previous id; nonces cannot establish numeric age order.
   /// Only the control shard updates it. Empty before contact, and on a laptop.

@@ -58,10 +58,10 @@ const IDENTITY_ONLY: u32 = 0;
 
 /// Format: an announcement's epoch field, a little-endian `u32`.
 const EPOCH_BYTES: usize = size_of::<u32>();
-/// Format: an announcement's member id and boot nonce fields, each a little-endian `u64`.
+/// Format: an announcement's member id, boot nonce and process nonce fields, each a little-endian `u64`.
 const WORD_BYTES: usize = size_of::<u64>();
-/// Format: an announcement's bytes: the epoch, the announcer's member id and its boot nonce.
-const ANNOUNCEMENT_BYTES: usize = EPOCH_BYTES + WORD_BYTES + WORD_BYTES;
+/// Format: an announcement's bytes: the epoch, the announcer's member id, its boot nonce and its process nonce.
+const ANNOUNCEMENT_BYTES: usize = EPOCH_BYTES + WORD_BYTES + WORD_BYTES + WORD_BYTES;
 
 /// Shape: the largest datagram the plane's socket reads: UDP's largest payload, so no datagram is truncated whatever
 /// a peer's path allows (hyper-datagram `MAX_DATAGRAM_BYTES`).
@@ -106,6 +106,10 @@ pub(crate) struct Announcement {
   pub member: HostId,
   /// The announcer's boot nonce, which its member id is validated against.
   pub boot_nonce: u64,
+  /// The announcer's process nonce, fresh at every start of its daemon process (`ShardState::member_process_nonce`):
+  /// a warm restart under the anchor keeps the member id and boot nonce, and this alone tells the new process from the
+  /// old one ([`note_reconnected`]).
+  pub process: u64,
 }
 
 impl Announcement {
@@ -113,10 +117,12 @@ impl Announcement {
   pub(crate) fn encode(&self) -> [u8; ANNOUNCEMENT_BYTES] {
     let mut bytes = [0u8; ANNOUNCEMENT_BYTES];
     let (epoch, rest) = bytes.split_at_mut(EPOCH_BYTES);
-    let (member, boot) = rest.split_at_mut(WORD_BYTES);
+    let (member, rest) = rest.split_at_mut(WORD_BYTES);
+    let (boot, process) = rest.split_at_mut(WORD_BYTES);
     epoch.copy_from_slice(&self.epoch.to_le_bytes());
     member.copy_from_slice(&self.member.0.to_le_bytes());
     boot.copy_from_slice(&self.boot_nonce.to_le_bytes());
+    process.copy_from_slice(&self.process.to_le_bytes());
     bytes
   }
 
@@ -124,12 +130,14 @@ impl Announcement {
   pub(crate) fn decode(bytes: &[u8]) -> Option<Announcement> {
     let bytes: &[u8; ANNOUNCEMENT_BYTES] = bytes.try_into().ok()?;
     let (epoch, rest) = bytes.split_first_chunk::<EPOCH_BYTES>()?;
-    let (member, boot) = rest.split_first_chunk::<WORD_BYTES>()?;
-    let boot: &[u8; WORD_BYTES] = boot.try_into().ok()?;
+    let (member, rest) = rest.split_first_chunk::<WORD_BYTES>()?;
+    let (boot, process) = rest.split_first_chunk::<WORD_BYTES>()?;
+    let process: &[u8; WORD_BYTES] = process.try_into().ok()?;
     Some(Announcement {
       epoch: u32::from_le_bytes(*epoch),
       member: HostId(u64::from_le_bytes(*member)),
       boot_nonce: u64::from_le_bytes(*boot),
+      process: u64::from_le_bytes(*process),
     })
   }
 }
@@ -170,19 +178,10 @@ pub(crate) struct PlaneState {
   /// Members keyed by an installed epoch, and whether each has been joined to the detector: a member joins once it is
   /// also addressable (`MemberPlane::join`).
   pub keyed: BTreeMap<HostId, bool>,
-  /// Per member, a fingerprint of the session it last announced itself on to this node (the first bytes of that
-  /// session's exporter secret, which differs per connection): a member announcing on another session reconnected, its
-  /// process perhaps restarted under the same id ([`note_reconnected`]). Bounded by the fleet's peer capacity.
-  pub announced_from: BTreeMap<HostId, [u8; RECONNECT_FINGERPRINT_BYTES]>,
-  /// Members that reconnected, whose pair this node (their canonical dialer) announces again on the session it holds
-  /// ([`note_reconnected`]): answered, the pair is keyed afresh; unanswered, that session led to a process that is gone
-  /// and is dropped so the link dials anew. Bounded by the fleet's peer capacity, as `announced_from` is.
-  pub reannouncing: std::collections::BTreeSet<HostId>,
+  /// Per member, the process nonce it last announced itself with to this node: another one is a new process under the
+  /// same id ([`note_reconnected`]). Bounded by the fleet's peer capacity.
+  pub announced_from: BTreeMap<HostId, u64>,
 }
-
-/// Format: the bytes of a session's exporter secret kept to tell one connection from the next: enough that two
-/// connections' secrets, uniformly random, coincide with probability 2^-128.
-pub(crate) const RECONNECT_FINGERPRINT_BYTES: usize = 16;
 
 impl std::fmt::Debug for PlaneState {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -236,11 +235,12 @@ pub(crate) fn accept_announcement(
     return refuse(state, EPOCH_REFUSED_FORGED);
   }
   note_returned(state, announced.member);
-  note_reconnected(state, anchor, announced.member, secret);
+  note_reconnected(state, anchor, announced.member, announced.process);
   let answer = Announcement {
     epoch: announced.epoch,
     member: state.fleet.host(),
     boot_nonce: state.member_boot_nonce,
+    process: state.member_process_nonce,
   };
   // Epoch zero announces identity only: a session that is not the pair's canonical one keys nothing.
   if announced.epoch == IDENTITY_ONLY {
@@ -300,45 +300,34 @@ fn note_returned(state: &mut ShardState, member: HostId) {
   }
 }
 
-/// Notes that `member` (of `anchor`) announced itself on `secret`'s session. Announced before on another session, it
-/// reconnected: a redial of a live process, or a process restarted under the same id within the moment it took the
-/// others to suspect it (5 of 6 anchored rejoins under load on macOS CI, diag run 42342444105, successor up in 50 to
-/// 90 ms). Where this node is the pair's canonical dialer (the lower anchor) it announces the pair's next epoch again
-/// on the session it holds ([`announce_on`]): a live process answers and the pair is keyed afresh; a session to a
-/// process that is gone goes unanswered and only then is dropped, so the link dials the new one. Dropping the session
-/// at every reconnect (f31f6b21) tore down a live pair's keyed session each time its member's record link redialed
-/// under load: a five-node fleet's node held 3 of 4 peers probed for a whole fleet wait with
-/// `fleet.plane.peer_reconnected` 5 (raft-chaos, CI diag-raft-chaos-final-37).
-fn note_reconnected(
-  state: &mut ShardState,
-  anchor: HostId,
-  member: HostId,
-  secret: &[u8; hyper_datagram::SECRET_BYTES],
-) {
-  let mut fingerprint = [0u8; RECONNECT_FINGERPRINT_BYTES];
-  for (kept, byte) in fingerprint.iter_mut().zip(secret.iter()) {
-    *kept = *byte;
-  }
+/// Notes that `member` (of `anchor`) announced itself with process nonce `process`. Announced before with another, its
+/// process restarted under the same id (an anchor's warm restart keeps the member id and boot nonce), and where this
+/// node is the pair's canonical dialer (the lower anchor) the session this node dialed leads to a process that is gone:
+/// it is dropped, so the link dials afresh and announces the pair's next epoch to the new one. Kept, a member restarted
+/// within the moment it took the others to suspect it announced itself while still held alive, the pair stayed unkeyed,
+/// and the member was then condemned with no way to refute it (5 of 6 anchored rejoins under load on macOS CI, diag run
+/// 42342444105; `fleet.plane.peer_reconnected`). Until 2026-11-07 a new session alone counted as a restart, so every
+/// redial of a live member's record link under load dropped its pair's keyed session: a five-node fleet's node held 3
+/// of 4 peers probed for a whole fleet wait with `peer_reconnected` 5 (raft-chaos, CI diag-raft-chaos-final-37).
+fn note_reconnected(state: &mut ShardState, anchor: HostId, member: HostId, process: u64) {
   if !state.plane.announced_from.contains_key(&member)
     && state.plane.announced_from.len() >= state.config.fleet_peer_capacity
   {
     return;
   }
-  let previous = state.plane.announced_from.insert(member, fingerprint);
-  let reconnected = previous.is_some_and(|previous| previous != fingerprint);
-  if reconnected && anchor > state.origin_anchor {
+  let previous = state.plane.announced_from.insert(member, process);
+  let restarted = previous.is_some_and(|previous| previous != process);
+  if restarted && anchor > state.origin_anchor {
+    state.record_sessions.remove(&member);
     state.plane.announced_on.remove(&member);
-    state.plane.reannouncing.insert(member);
+    crate::fleet::wake_link_waiter_of(state, member);
     crate::fleet::count_refusal_in(state, PEER_RECONNECTED);
   }
 }
 
-/// Counter: a member that announced itself on a new session, whose pair this node (its canonical dialer) announces again.
+/// Counter: a member that announced itself from a new process, whose session this node dialed as the pair's canonical
+/// dialer was dropped to be dialed afresh.
 const PEER_RECONNECTED: &str = "fleet.plane.peer_reconnected";
-
-/// Counter: a reconnected member's session this node held went unanswered at its re-announcement and was dropped to be
-/// dialed afresh.
-const PEER_REDIALED: &str = "fleet.plane.peer_redialed";
 
 /// Counter: an announcement from a member this node held dead, whose contact is kept so it can refute the death.
 const MEMBER_RETURNED: &str = "fleet.plane.member_returned";
@@ -428,6 +417,7 @@ async fn announce_on(member: HostId, endpoint: &mut Endpoint, canonical: bool) {
       epoch,
       member: state.fleet.host(),
       boot_nonce: state.member_boot_nonce,
+      process: state.member_process_nonce,
     };
     Some((anchor, epoch, request))
   })
@@ -447,15 +437,6 @@ async fn announce_on(member: HostId, endpoint: &mut Endpoint, canonical: bool) {
     _ => {
       endpoint.abandon_begun_since(before);
       crate::fleet::count_refusal(EPOCH_UNANSWERED);
-      // A re-announcement after the member reconnected that goes unanswered: the session leads to a process that is
-      // gone, so it is dropped and the link dials the member's new one ([`note_reconnected`]).
-      let _ = state::with_state(|state| {
-        if state.plane.reannouncing.remove(&member) {
-          state.record_sessions.remove(&member);
-          crate::fleet::wake_link_waiter_of(state, member);
-          crate::fleet::count_refusal_in(state, PEER_REDIALED);
-        }
-      });
       return;
     }
   };
@@ -471,9 +452,6 @@ async fn announce_on(member: HostId, endpoint: &mut Endpoint, canonical: bool) {
       return;
     }
     state.plane.announced_on.insert(member, connection);
-    state.plane.reannouncing.remove(&member);
-    // An answer is the member's own: one this node holds dead is alive, and keeps its contact to refute the death.
-    note_returned(state, answer.member);
     if epoch == IDENTITY_ONLY {
       return;
     }
@@ -608,19 +586,6 @@ fn changed_members(state: &mut ShardState) -> Vec<(HostId, MemberState)> {
       && let Some(anchor) = anchor_of(state, *member)
     {
       forget_address(state, anchor);
-    }
-    // A member condemned while this node holds a record session to it: the death is put to that session by announcing
-    // on it again ([`announce_on`]). Answered, the member is alive (a process restarted under its id faster than the
-    // others suspected it), so contact with it is kept until its probes refute the death; unanswered, the session is
-    // dropped. Without it, a successor that announced itself while still held alive was condemned afterwards with
-    // nothing new to announce, and was never re-admitted (3 of 6 anchored rejoins under load on macOS CI, diag run
-    // 42405661792).
-    if belief.liveness == slates_cluster::membership::Liveness::Dead
-      && state.record_sessions.contains_key(member)
-      && state.plane.reannouncing.len() < state.config.fleet_peer_capacity
-    {
-      state.plane.announced_on.remove(member);
-      state.plane.reannouncing.insert(*member);
     }
   }
   changed
@@ -1088,6 +1053,7 @@ mod tests {
       epoch: 9,
       member: HostId(0x0102_0304_0506_0708),
       boot_nonce: u64::MAX,
+      process: 0x1122_3344_5566_7788,
     };
     let bytes = announced.encode();
     assert_eq!(Announcement::decode(&bytes), Some(announced));
