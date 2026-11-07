@@ -184,6 +184,8 @@ struct Tally {
   max_outage_ns: u64,
   /// Requests the daemon refused retryable under their own id and the client sent again under it.
   retried: u64,
+  /// Requests the daemon refused `LeaseUnconfirmed` (not run) and the client sent again as new.
+  unconfirmed: u64,
   /// Requests the daemon refused `AcknowledgementOwed` and the client sent again: the multiplexed connection's
   /// backpressure while an older request of the connection is still awaited (its acknowledgement cannot pass it).
   backpressure: u64,
@@ -534,6 +536,13 @@ impl Agent {
     // pass. The step is sent again, as new, once the worker next finds this client idle.
     if matches!(refusal, Refusal::AcknowledgementOwed { .. }) {
       tally.backpressure += 1;
+      return;
+    }
+    // `LeaseUnconfirmed` refuses before the verb runs, a write too (§4.8 "Leases and reads"): the owner's lease
+    // was not confirmed within its bound, and the protocol says to retry after it. Sent again as new, never under
+    // its own id, whose recorded refusal would only answer the same.
+    if matches!(refusal, Refusal::LeaseUnconfirmed { .. }) {
+      tally.unconfirmed += 1;
       return;
     }
     // A request the daemon could not read is named in full: its reason says which part of the slot was wrong.
@@ -1202,7 +1211,7 @@ fn report(n: usize, tally: &mut Tally) {
     println!("refusal\t{n}\t{count}\t{why}");
   }
   println!(
-    "harness\t{n}\tstarved\t{}\trebase_conflicts\t{}\tmax_sweep_ns\t{}\tmax_drain_gap_ns\t{}\treconnects\t{}\tresent\t{}\tmax_outage_ns\t{}\tbackpressure\t{}\tretried\t{}",
+    "harness\t{n}\tstarved\t{}\trebase_conflicts\t{}\tmax_sweep_ns\t{}\tmax_drain_gap_ns\t{}\treconnects\t{}\tresent\t{}\tmax_outage_ns\t{}\tbackpressure\t{}\tretried\t{}\tunconfirmed\t{}",
     tally.starved,
     tally.rebase_conflicts,
     tally.max_sweep_ns,
@@ -1211,7 +1220,8 @@ fn report(n: usize, tally: &mut Tally) {
     tally.resent,
     tally.max_outage_ns,
     tally.backpressure,
-    tally.retried
+    tally.retried,
+    tally.unconfirmed
   );
 }
 
@@ -1642,6 +1652,7 @@ fn level(
     total.max_outage_ns = total.max_outage_ns.max(tally.max_outage_ns);
     total.backpressure += tally.backpressure;
     total.retried += tally.retried;
+    total.unconfirmed += tally.unconfirmed;
     total.max_drain_gap_ns = total.max_drain_gap_ns.max(tally.max_drain_gap_ns);
   }
   println!(
