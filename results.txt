@@ -1,0 +1,62 @@
+runner ubuntu-latest, 4 CPUs, Sat Nov  7 10:50:26 UTC 2026, head 5783c5e647dcbc7bad6b0dc34f432b756525adef
+== run 1 at 10:50:26, load 1.96 1.76 0.79
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["899473990788697843", "12835754602494407191", "14104852187789892048", "15007848574370939769", "6085882807243382634"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-c-6114; council seats at ["chaos-fresh-member-a-6114", "chaos-fresh-member-b-6114", "chaos-fresh-member-e-6114"]
+chaos a member that never held the log at a takeover: chaos-fresh-member-d-6114 replaced by a fresh member, rejoined at 2.017998149s
+chaos a member that never held the log at a takeover: chaos-fresh-member-e-6114 stopped at 2.384496473s
+chaos a member that never held the log at a takeover: chaos-fresh-member-b-6114 stopped, owner chaos-fresh-member-c-6114 crashed and chaos-fresh-member-e-6114 resumed stale
+chaos a member that never held the log at a takeover: 543 writes acknowledged; holders chaos-fresh-member-b-6114 (partitioned) and chaos-fresh-member-e-6114 (stale)
+chaos a member that never held the log at a takeover: no survivor took the volume over within 40s without the log's holder
+chaos a member that never held the log at a takeover: phase one waited for the holders 0 times across the survivors
+chaos a member that never held the log at a takeover: after the holder resumed, no node served the volume within the fleet wait (the holder may have been retired)
+chaos a member that never held the log at a takeover:
+  owner chaos-fresh-member-c-6114; council seats at ["chaos-fresh-member-a-6114", "chaos-fresh-member-b-6114", "chaos-fresh-member-e-6114"]
+  chaos-fresh-member-d-6114 replaced by a fresh member, rejoined at 2.017998149s
+  chaos-fresh-member-e-6114 stopped at 2.384496473s
+  chaos-fresh-member-b-6114 stopped, owner chaos-fresh-member-c-6114 crashed and chaos-fresh-member-e-6114 resumed stale
+  543 writes acknowledged; holders chaos-fresh-member-b-6114 (partitioned) and chaos-fresh-member-e-6114 (stale)
+  no survivor took the volume over within 40s without the log's holder
+  phase one waited for the holders 0 times across the survivors
+  phase one ran and waited for the log's holders: 1 violations
+  after the holder resumed, no node served the volume within the fleet wait (the holder may have been retired)
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (6115) panicked at crates/cli/tests/live_chaos.rs:1036:5:
+chaos a member that never held the log at a takeover: phase one ran and waited for the log's holders: no survivor's phase one waited for the holders
+FAILED
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 96.43s
+== run 1 exit 101
+== run 2 at 10:52:03, load 0.83 1.50 0.80
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["1335147208733581952", "16171901945488206667", "16585299476873402890", "15822051926711465626", "943719976469751689"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-b-14312; council seats at ["chaos-fresh-member-a-14312", "chaos-fresh-member-d-14312", "chaos-fresh-member-e-14312"]
+chaos a member that never held the log at a takeover: chaos-fresh-member-d-14312 replaced by a fresh member, rejoined at 2.867767215s
+chaos a member that never held the log at a takeover: chaos-fresh-member-c-14312 stopped at 3.248805119s
+chaos a member that never held the log at a takeover: chaos-fresh-member-a-14312 stopped, owner chaos-fresh-member-b-14312 crashed and chaos-fresh-member-c-14312 resumed stale
+chaos a member that never held the log at a takeover: 508 writes acknowledged; holders chaos-fresh-member-a-14312 (partitioned) and chaos-fresh-member-c-14312 (stale)
+chaos a member that never held the log at a takeover: no survivor took the volume over within 40s without the log's holder
+chaos a member that never held the log at a takeover: phase one waited for the holders 0 times across the survivors
+chaos a member that never held the log at a takeover: after the holder resumed, no node served the volume within the fleet wait (the holder may have been retired)
+chaos a member that never held the log at a takeover:
+  owner chaos-fresh-member-b-14312; council seats at ["chaos-fresh-member-a-14312", "chaos-fresh-member-d-14312", "chaos-fresh-member-e-14312"]
+  chaos-fresh-member-d-14312 replaced by a fresh member, rejoined at 2.867767215s
+  chaos-fresh-member-c-14312 stopped at 3.248805119s
+  chaos-fresh-member-a-14312 stopped, owner chaos-fresh-member-b-14312 crashed and chaos-fresh-member-c-14312 resumed stale
+  508 writes acknowledged; holders chaos-fresh-member-a-14312 (partitioned) and chaos-fresh-member-c-14312 (stale)
+  no survivor took the volume over within 40s without the log's holder
+  phase one waited for the holders 0 times across the survivors
+  phase one ran and waited for the log's holders: 1 violations
+  after the holder resumed, no node served the volume within the fleet wait (the holder may have been retired)
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (14313) panicked at crates/cli/tests/live_chaos.rs:1036:5:
+chaos a member that never held the log at a takeover: phase one ran and waited for the log's holders: no survivor's phase one waited for the holders
+FAILED
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 96.39s
+== run 2 exit 101
+== run 3 at 10:53:40, load 0.72 1.39 0.83
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["2436439952720550928", "16619378956712413717", "6537804628154985883", "1748858791722457843", "6865778365971732448"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-b-22327; council seats at ["chaos-fresh-member-a-22327", "chaos-fresh-member-c-22327", "chaos-fresh-member-d-22327"]
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (22328) panicked at crates/cli/tests/live_chaos.rs:2838:5:
+  left: 1
+FAILED
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 2.39s
+== run 3 exit 101
