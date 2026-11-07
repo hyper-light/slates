@@ -1,0 +1,2 @@
+runner ubuntu-latest, 4 CPUs, a2a9824 diag: liveness-11, the anchor crate A/B main 4326a9d8 vs 2810a612 x5 on , Sat Nov  7 07:49:23 UTC 2026
+== process_clock and wake: 0 of 20 runs failed, load 3.06
