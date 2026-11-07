@@ -1,0 +1,68 @@
+name: DIAG reland-a207 -- landing_fairness under two spinners a CPU, red first (not for main)
+
+# crates/server/tests/landing_fairness.rs's two tests that fail under load on a Mac (fixtures 2 of 6 on adacachy),
+# run 10 times each with no load and 10 times beside two `yes` spinners a CPU (the A/B bar's load), each run's outcome,
+# its landing and late-beat lines kept. Results go to diag-reland-a207-lf-results-<run>-<runner> as one commit.
+
+on:
+  push:
+    branches: ['diag-reland-a207-lf-[0-9]*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  flake:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    name: landing_fairness under load on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    env:
+      RESULTS_BRANCH: diag-reland-a207-lf-results-${{ github.run_id }}-${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: runs
+        shell: bash
+        run: |
+          set -u +e +o pipefail
+          out="$RUNNER_TEMP/results.txt"; : > "$out"; logs="$RUNNER_TEMP/logs"; mkdir -p "$logs"
+          echo "tested $(git rev-parse HEAD^) on $(uname -m), $(nproc) cpus" >> "$out"
+          cargo test -p slates-server --test landing_fairness --no-run > "$logs/build.log" 2>&1; built=$?
+          bin=$(ls -t target/debug/deps/landing_fairness-* | grep -v '\.d$' | head -1)
+          echo "build exit $built bin $bin" >> "$out"
+          run_set() {
+            arm=$1
+            for n in $(seq 1 10); do
+              for t in a_landing_longer_than_its_lease_term_renews_it_and_lands_everything an_async_patient_landing_outlasting_the_reply_deadline_is_waited_for; do
+                log="$logs/$arm-$n-$t.log"; start=$(date +%s)
+                timeout 900 "$bin" --test-threads=1 --exact "$t" --nocapture > "$log" 2>&1; code=$?
+                beats=$(grep -c 'a heartbeat came' "$log"); longest=$(grep -o 'longest poll is [0-9]* ms' "$log" | awk '{print $4}' | sort -n | tail -1)
+                echo "$arm run $n $t exit $code $(( $(date +%s) - start ))s late_beats=$beats longest_poll_ms=${longest:-0} load=$(cut -d' ' -f1-3 /proc/loadavg)" >> "$out"
+                grep -E '^calibration|^landing of|files; reply|panicked|SKIP|Stalled|LeaseLost' "$log" | head -8 | cut -c1-400 | sed 's/^/    /' >> "$out"
+              done
+            done
+          }
+          run_set quiet
+          spinners=""
+          for i in $(seq 1 $(( 2 * $(nproc) ))); do yes > /dev/null & spinners="$spinners $!"; done
+          sleep 2
+          run_set loaded
+          kill $spinners
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          tar -czf "$RUNNER_TEMP/logs.tgz" -C "$RUNNER_TEMP" logs
+          blob=$(git hash-object -w "$out"); tgz=$(git hash-object -w "$RUNNER_TEMP/logs.tgz")
+          tree=$(printf '100644 blob %s\tresults.txt\n100644 blob %s\tlogs.tgz\n' "$blob" "$tgz" | git mktree)
+          commit=$(git commit-tree "$tree" -m "results of run $GITHUB_RUN_ID on ${{ matrix.runner }}")
+          git push origin "$commit:refs/heads/$RESULTS_BRANCH" || echo "::warning::could not publish the results"
+          cat "$out"
