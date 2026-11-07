@@ -7,8 +7,9 @@
 //!
 //! A reading carries the CPU time the process has run ([`ProcessCpu::spent_ns`]) and a count that grows whenever it
 //! runs at all ([`ProcessCpu::progress`]):
-//! - Linux: `/proc/<pid>/schedstat`'s first field, the nanoseconds the process's threads have run (a kernel
-//!   pseudo-file, never a disk read; R1); the progress is the time itself.
+//! - Linux: the process's CPU-time clock (`clock_getcpuclockid`, read with `clock_gettime`), the nanoseconds all its
+//!   threads have run; the progress is the time itself. Until 2026-11-07 it was `/proc/<pid>/schedstat`, which is the
+//!   main thread's alone, so a start whose main thread waited on its shards read as making no progress.
 //! - macOS: `proc_pidinfo(PROC_PIDTASKINFO)`'s user plus system time, in Mach absolute time units, turned into
 //!   nanoseconds by `mach_timebase_info`; the progress is the raw count.
 //! - Windows: `GetProcessTimes`' kernel plus user time, which the scheduler charges a tick at a time (15.6 ms by
@@ -35,15 +36,37 @@ pub fn process_cpu(pid: u32) -> Option<ProcessCpu> {
 mod platform {
   use super::ProcessCpu;
 
-  /// `/proc/<pid>/schedstat`: "time on the CPU (ns), time waiting to run (ns), timeslices"; the first field.
+  /// The process's CPU-time clock (`clock_getcpuclockid`), read with `clock_gettime`: the run time of all its threads,
+  /// in nanoseconds. Not `/proc/<pid>/schedstat`, which is the main thread's alone.
   pub(super) fn process_cpu(pid: u32) -> Option<ProcessCpu> {
-    let text = std::fs::read_to_string(format!("/proc/{pid}/schedstat")).ok()?;
-    let ran: u64 = text.split_whitespace().next()?.parse().ok()?;
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    let mut clock: libc::clockid_t = 0;
+    // SAFETY: `clock` is this frame's own value for the call to write; the call returns an error number, checked
+    // before it is read.
+    if unsafe { libc::clock_getcpuclockid(pid, &raw mut clock) } != 0 {
+      return None;
+    }
+    let mut time = libc::timespec {
+      tv_sec: 0,
+      tv_nsec: 0,
+    };
+    // SAFETY: `time` is this frame's own record of the C layout the call fills; its status is checked before it is
+    // read.
+    if unsafe { libc::clock_gettime(clock, &raw mut time) } != 0 {
+      return None;
+    }
+    let ran = u64::try_from(time.tv_sec)
+      .ok()?
+      .checked_mul(NS_PER_S)?
+      .checked_add(u64::try_from(time.tv_nsec).ok()?)?;
     Some(ProcessCpu {
       spent_ns: ran,
       progress: ran,
     })
   }
+
+  /// Format: nanoseconds a second.
+  const NS_PER_S: u64 = 1_000_000_000;
 }
 
 #[cfg(target_os = "macos")]
