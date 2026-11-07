@@ -1,0 +1,66 @@
+name: diag-live-durability
+
+# Diagnostics only, never on main (A-200, item 2): which tree hangs a_superseded_owner_resumed_after_its_takeover_is_fenced
+# (live_fleet timed out at 40 min on the merged stack, diag-live-durability-32): raft-chaos-1's head alone (RC), the
+# landing series alone (S, 20095823, which passed live_fleet 22/22), and the merged stack's tip (M). Three runs each, ten
+# minutes each, the test's tail kept. Release, ubuntu-latest. Results to diag-results/live-durability-33-<tree>.
+on:
+  push:
+    branches: ["diag-live-durability-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  SLATES_TEST_CLI: "1"
+
+jobs:
+  bisect:
+    name: superseded-owner bisect (${{ matrix.tree.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        tree:
+          - { name: RC, sha: 43bb3a2744aece20408e34ceb47d257a87404cad }
+          - { name: S, sha: 200958233e1b861f376004f9956b30771b8f3b21 }
+          - { name: M, sha: 0ad0ba6bfbd83261f50b4630026449749b3041af }
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: |
+          git worktree add ../tree "${{ matrix.tree.sha }}"
+          cd ../tree && cargo build --release --locked -p slates-cli --bin slates --test live_fleet
+      - name: The test three times
+        shell: bash {0}
+        run: |
+          R=../results.txt
+          echo "tree ${{ matrix.tree.name }} ${{ matrix.tree.sha }}, $(date -u)" > $R
+          cd ../tree
+          for run in 1 2 3; do
+            timeout 600 cargo test --release --locked -p slates-cli --test live_fleet -- --nocapture --exact a_superseded_owner_resumed_after_its_takeover_is_fenced > ../run.log 2>&1; status=$?
+            echo "== run $run exit $status" >> ../results.txt
+            grep -E 'test result|panicked|^live ' ../run.log | cut -c1-400 >> ../results.txt || true
+            [ $status -ne 0 ] && grep -v 'slates daemon: [a-z_0-9]* =' ../run.log | tail -25 | cut -c1-300 >> ../results.txt
+          done
+          exit 0
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/live-durability-33-${{ matrix.tree.name }}"
+          git config user.name "diag-live-durability"
+          git config user.email "diag-live-durability@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-live-durability-33 results, ${{ matrix.tree.name }}"
+          git push -q origin "HEAD:refs/heads/$branch"
