@@ -14341,6 +14341,22 @@ first-beat kill itself stays with that open entry, and the Mac's runs add to it:
 killed (1 to 236), and in the bounded run none of the 236 printed its first configuration line, so they were killed
 before any shard started or recovered anything.
 
+### 2026-11-07: the MCP edge test held a slow connection open past the edge's own deadline — fixed
+
+`the_mcp_surface_serves_the_tools` (`crates/mcp/tests/mcp.rs`) failed "the slow connection is still open, unanswered"
+in 1 of 4 runs at load ~14 (bug-sweep). The HTTP edge bounds a request's arrival by its deadline, the client's reply
+deadline of 1 s, and ends a connection whose request is unfinished when it passes: the slowloris bound. The test
+opened such a connection, ran its other HTTP checks, and only then required it open. Those checks took 517–637 ms
+idle and under two spinners a core (adacachy), half of it the listen check's wait for a keep-alive comment at half the
+deadline, so a slower machine brought the probe past the deadline, where the edge had rightly closed it. Not a defect
+of the edge.
+
+The test now holds each claim to the rule: the slow connection is open and unanswered right after the valid client is
+served (judged only while its deadline has not passed), and past the deadline the slow and idle connections are each
+ended with no answer, which it had not checked. Red first, on adacachy: the old test with a 1 s pause before its
+probe failed as in the field, and the new one passed; with the edge's arrival bound removed, the new close check
+failed after its 10 s wait. Under two spinners a core: 10 of 10.
+
 ### 2026-10-22: two pressure tests failed on a busy machine, not on the property — fixed
 
 `a_stale_handle_never_reads_a_reused_inode_under_churn` and
