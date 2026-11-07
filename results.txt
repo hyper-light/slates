@@ -30,3 +30,6 @@ loaded run 5 a_landing_longer_than_its_lease_term_renews_it_and_lands_everything
 loaded run 5 an_async_patient_landing_outlasting_the_reply_deadline_is_waited_for exit 0 822s late_beats=0 longest_poll_ms=0 load=11.19 11.12 10.83
     calibration: 500 files in 518.327924ms, twice that in 772.001237ms (507.346µs per file at the margin)
     3943 files; reply deadline 1s; plain call ended at 6.14087953s: Ok(Some(Landed(LandingOutcome { landing: 4, state: "done", written: 3943, skipped: 0, conflicts: 0, failed: 0, bytes_written: 34377, held: 0, durability: LandingDurability { data_synced: true, dirs_synced: true, media: false, media_requested: false, dirs: 1 }, degraded: [BarriersOnly], barriers: 247 }))); patient call at 6.005863213s
+loaded run 6 a_landing_longer_than_its_lease_term_renews_it_and_lands_everything exit 0 260s late_beats=0 longest_poll_ms=0 load=10.51 10.68 10.70
+    calibration: 500 files in 668.996829ms, twice that in 1.346435064s (1.354876ms per file at the margin)
+    landing of 1477 files: 1.674361494s under a 1000000000 ns term, 3 renewals, longest lease gap 63634794 ns: 1477 written, done
