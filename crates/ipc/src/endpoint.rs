@@ -444,6 +444,30 @@ impl ClientEnd {
     self.next_request
   }
 
+  /// Sends `message` as request `request`: packed for the next ring position (a body past a slot's inline payload goes
+  /// to that position's bulk chunk) and pushed; `RingFull` when the daemon has not taken the slot the ring wraps onto.
+  /// Room is checked before anything is packed: the position's bulk chunk is the oldest unread request's until the
+  /// daemon takes it, and a body packed there before a push refused `RingFull` was written over that request's
+  /// (`a_request_refused_ring_full_never_writes_over_an_unread_body`). The only way a request is packed.
+  pub fn send_message<M: slates_wire::Wire>(
+    &mut self,
+    request: u64,
+    message: &M,
+  ) -> Result<(), IpcError> {
+    let index = self.next_request;
+    if !self.region.cmd().can_push(self.region.object(), index)? {
+      return Err(IpcError::RingFull);
+    }
+    let slot = crate::protocol::pack(
+      &mut self.region,
+      crate::protocol::Direction::Request,
+      index,
+      request,
+      message,
+    )?;
+    self.send(&slot)
+  }
+
   /// Writes a request slot; `RingFull` when the daemon has not taken the slot the ring wraps
   /// onto (the caller blocks on credit and retries; nothing is dropped). Rings the doorbell
   /// when the daemon's shard has announced it is going idle — read after the doorbell protocol's
@@ -464,12 +488,16 @@ impl ClientEnd {
     Ok(())
   }
 
-  /// Takes the next reply if one is there.
+  /// Takes the next reply if one is there, its body owned: a bulk body is copied out before the slot is released, so
+  /// a daemon replying on into the freed slot's chunk never changes it ([`crate::protocol::owned`]).
   pub fn try_take(&mut self) -> Result<Option<Reply>, IpcError> {
     let cpl = self.region.cpl();
-    let Some(slot) = cpl.pop(self.region.object(), self.next_reply)? else {
+    let Some(peeked) = cpl.peek(self.region.object(), self.next_reply)? else {
       return Ok(None);
     };
+    let owned = peeked.and_then(|slot| crate::protocol::owned(&self.region, slot));
+    cpl.release(self.region.object(), self.next_reply)?;
+    let slot = owned?;
     self.next_reply = self.next_reply.wrapping_add(1);
     self.replies = self.replies.saturating_add(1);
     Ok(Some(Reply {
@@ -670,14 +698,23 @@ impl DaemonEnd {
     self.next_reply
   }
 
-  /// Takes the next request if one is there. A hostile slot is released and reported.
+  /// Takes the next request if one is there, its body owned: a bulk body is copied out before the slot is released,
+  /// so a client sending on into the freed slot's chunk never changes it ([`crate::protocol::owned`]). A hostile slot
+  /// is released and reported.
   pub fn try_take(&mut self) -> Result<Option<Request>, IpcError> {
     let cmd = self.region.cmd();
-    let taken = cmd.pop(self.region.object(), self.next_request);
-    if !matches!(taken, Ok(None)) {
-      self.next_request = self.next_request.wrapping_add(1);
-    }
-    let Some(slot) = taken? else {
+    let peeked = match cmd.peek(self.region.object(), self.next_request) {
+      Ok(None) => return Ok(None),
+      Ok(Some(peeked)) => Some(peeked.and_then(|slot| crate::protocol::owned(&self.region, slot))),
+      Err(e) => {
+        self.next_request = self.next_request.wrapping_add(1);
+        return Err(e);
+      }
+    };
+    let released = cmd.release(self.region.object(), self.next_request);
+    self.next_request = self.next_request.wrapping_add(1);
+    released?;
+    let Some(slot) = peeked.transpose()? else {
       return Ok(None);
     };
     Ok(Some(Request {
@@ -685,6 +722,29 @@ impl DaemonEnd {
       kind: slot.kind,
       payload: slot.payload,
     }))
+  }
+
+  /// Replies `message` to request `request`: packed for the next completion-ring position and written, waking the client
+  /// if it parked; `RingFull` when the client has not taken the slot the ring wraps onto. Room is checked before
+  /// anything is packed, as [`ClientEnd::send_message`] checks it: the position's bulk chunk holds the oldest reply the
+  /// client has not taken until it does. The only way a reply is packed.
+  pub fn reply_message<M: slates_wire::Wire>(
+    &mut self,
+    request: u64,
+    message: &M,
+  ) -> Result<(), IpcError> {
+    let index = self.next_reply;
+    if !self.region.cpl().can_push(self.region.object(), index)? {
+      return Err(IpcError::RingFull);
+    }
+    let slot = crate::protocol::pack(
+      &mut self.region,
+      crate::protocol::Direction::Reply,
+      index,
+      request,
+      message,
+    )?;
+    self.reply(&slot)
   }
 
   /// Writes a reply and wakes the client if it parked.

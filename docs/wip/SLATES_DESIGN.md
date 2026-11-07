@@ -1586,7 +1586,16 @@ metadata provisioning path, not arbitrary host pathname resolution. A scratch vo
   change" step; slates never merges.
 - pin(volume, paths?) → Pinned: read the named subtrees (default: the whole base) into the store
   and witness them, so the view of those entries is stable regardless of later disk changes;
-  cost proportional to what is pinned and reported in the reply; never implicit.
+  cost proportional to what is pinned and reported in the reply; never implicit. Run a slice at a time on the
+  volume's owner shard, its reply deferred until the walk ends (§4.3). Its copy is the volume's content, charged to
+  the volume's quota and refused `NoSpace` past it.
+
+  > **Status (2026-11-06, sliced).** The pin was one synchronous call on the owner shard: Linux's `Documentation/`
+  > (11,608 files) held it for one poll of 9,194 ms on a Mac, past the anchor's liveness budget, and the client gave
+  > up at its 1 s reply deadline. It is now a walk (`PinWalk`, one file or one listing a unit, no handle held between
+  > units) stepped in a task of the owner shard. Its completion and reply commit together after the shard is
+  > published. A retry joins the walk (`a_pin_of_a_large_base_never_holds_its_shard`;
+  > `docs/bugs/2026-11-06-a-pin-held-its-shard-for-the-whole-tree.md`).
 - materialize(snapshot, target, filter?, grant?) → LandingRequest | LandingReport: the landing
   of §4.15. Without a grant the reply is `GrantRequired{request_id, manifest_hash, summary}` and
   the request waits (or returns at once if the caller asked not to wait); a human issues the
@@ -5285,6 +5294,16 @@ context. A name is not a host pathname or a bearer capability. Fleet-wide enumer
 owners, each answer linearizable at its owner and the whole labelled with the configuration
 version.
 
+> **Status (2026-11-06, forwards to one owner share its session).** A forward borrowed the record session to its owner
+> for its whole round trip, and the owner served one request of a session at a time. So a client node's forwards
+> went one at a time: a forwarded `CreateWork` took 4.30 s at the median at 1,000 clients, against 45 µs on the
+> owner. A forward waiting on a held owner shard made a forward to a free shard of the same owner wait 471.8 ms.
+> Now each peer has a forward lane in the control shard's state. The waiting forwarders drive it a turn at a time,
+> each turn beginning every queued forward as its own exchange on the session and taking every reply that has come;
+> between turns the session is free for other borrowers. The owner runs each forwarded verb on its own task. The same
+> read now takes 1.8 to 2.4 ms (`crate::forward_lane`; `forwards_to_one_owner_never_wait_behind_each_other`;
+> `docs/bugs/2026-11-06-forwards-to-one-owner-went-one-at-a-time.md`).
+
 > **Status (2026-10-07, same-region lookups).** A lookup by id now reaches its creator from any node of the
 > creator's own region, not only from another region. Before, the server forwarded only a volume homed in another
 > region, and a client of another node in the owner's region was answered `NotFound` (found on two Docker
@@ -5631,6 +5650,17 @@ provisioning is therefore safe to retry after any failure.
 > unretried, which holds its acknowledgement back; it retries that id first. Regression
 > `a_client_that_never_acknowledges_is_refused_at_its_bound_and_served_once_it_acknowledges`.
 
+> **Status (2026-11-06, the watermark stops below the first request still awaited).** The client's acknowledgement
+> covered every sequence it had sent, so a client with several requests in flight (any async caller; the load
+> harness multiplexing logical clients over one connection) acknowledged requests whose replies had not come. Their
+> completion records were then released, so a resend after a restart was answered `DuplicateRequest` for a create
+> that had been applied, and a deferred verb (a fleet forward, a submit awaiting its commit) recording after the
+> watermark was refused `StaleCompletion`. The watermark is now RIFL's: just below the first request with no reply
+> (Lee et al., SOSP 2015), as well as below an `Unpublished` id. A client that keeps sending past an old request still
+> awaited therefore meets `AcknowledgementOwed` at the `2 × slots` bound, as backpressure until that request answers
+> (`slates_client` `ack_watermark`; `an_acknowledgement_never_covers_a_request_still_awaited`;
+> `docs/bugs/2026-11-06-an-acknowledgement-covered-requests-still-awaited.md`).
+
 > **Status (2026-11-05, A-216: an acknowledgement is answered once its own shard has released).** An `Acknowledge
 > { up_to }` releases the client's records at or below `up_to` on every partition that may hold them. Its reply now
 > promises one thing: the client's own shard has released them. The other shards' releases run as tasks the shard
@@ -5885,6 +5915,25 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > entry with no key for it, and that candidate, the successor, never served the volume. A takeover also acts on a
 > holder's `ConfigurationStale` now (pages and the adopted record), so a learner successor one version behind fetches
 > the configuration rather than asking under it for good (same bug record).
+>
+> **A checkpoint ships a live volume's changes, not the volume (2026-11-05).** A live log's whole record copies every
+> byte of the volume; it is owed only when a delta would not apply to what the candidates hold (the log's first record,
+> a holder behind the retained tail, a publication that could not be shipped). A shard's local checkpoint is none of
+> those: it restarts the recovery journal once the deltas reach the size of the shard's metadata, and it had been mapped
+> to a whole record, so one write in three copied the volume (68 of 201 records) and the record behind it was refused
+> for credit (431 of 2,395). Now the checkpoint takes each changed live volume's record as a delta publication does
+> (`verbs::capture_live_changes`) and ships it once the checkpoint commits, for the volumes the checkpoint carried
+> (`live_ship::note_checkpoint`). Held by `a_live_volumes_writes_ship_their_changes_not_the_volume` (red first: 68 whole;
+> after: 1, the log's first). Interleaved with main, the stable-write latency is unchanged (BENCHMARKS "What a
+> checkpoint shipped"); the whole copies and the credit refusals are gone.
+>
+> **A candidate's copy stays within its bound (2026-11-06).** A candidate keeps a whole entry and the entries after it,
+> within twice the volume's size (`live_ship::hold_bound`). With whole records rare, the copies grew to that bound and
+> both candidates refused every entry after it, so no write was durable (at 454 stable 4 KiB writes to a 1 MiB volume:
+> `a_long_writer_keeps_the_candidates_copies_within_their_bound`, red first). The owner now counts what a candidate keeps
+> (`LiveVolume::kept`) and ships whole once that reaches the volume's size (`kept_reaches_size`): the entry that crosses
+> it still fits, since no publication is larger than the volume. After: 768 writes answered, 4 whole records, no
+> refusal for the bound.
 >
 > **Chaos from outside the processes (2026-11-06).** `crates/cli/tests/live_chaos.rs` streams writes through the Rust
 > client while it partitions or kills processes. It ends every flow with Agreement, NoLoss, StaleNeverCommits and
@@ -14088,10 +14137,35 @@ Applied in the same change to: §4.5 (data model), `crates/vfs/src/{dirblocks,di
   build compacted on every few rounds of a create and unlink. A fixed history grows one directory through ten classes, splits
   it, snapshots it and shrinks it, and must see eight classes, the largest among them.
 
+### A-207 — A work volume's state is durable at the process boundary: every change is logged in the partition and replayed at recovery (accepted 2026-11-04, the many-client load test)
+
+> **Status (2026-11-05): reverted from main with A-217 (`f5396e3b`), then re-landed.** A rebase's restatement is the
+> delta A-202's engine now returns (`Rebased::changed`), so it costs what the work changed, as the rebase does.
+
+Applied in the same change to: §4.16's status, GAPS (the load-test blockquote), `crates/db` (`Op::WorkLogged`,
+`Op::WorkRestated`, `PartitionSnapshot::work_logs`), `crates/server` (`work_log.rs`; `work_files.rs`:
+`changed_entries`, `from_changed`; `verbs.rs`: `edit`, `declare`, `submit`, `rebase`, `rebuild_work`) and
+`crates/server/tests/merge_load.rs` (`acknowledged_work_edits_survive_a_daemon_restart`). A work as a delta over its
+green's base, the other half of the load test's first finding, is A-202's.
+- **What was there.** D-18 promises daemon-restart survival to a local acknowledgement only when what it acknowledged is
+  recoverable from anchor-owned RAM. A work's edits, declarations, base and journal lived in shard memory alone, and
+  recovery rebuilt every work as a fresh clone of its green's head, so an edit answered `Edited` read back as the
+  green's bytes after a restart and the next submit would have been accepted without it.
+- **The rule.** Every change to a work is recorded in a per-work log in the partition, in the verb's own transaction,
+  checked before the work changes: an edit or a declaration appends an entry; an accepted submit or a rebase restates the
+  work whole (its base, the files it holds of its own, its journal), checked before the verdict or the restatement.
+  Recovery replays the log over the recovered green through the verbs' own change path (`WorkFiles::splice`,
+  `WorkFiles::declare`, the one journal builder). The log counts against the partition's merge byte budget, so it is
+  bounded and refused typed at the bound, and is reclaimed with the work.
+- **Unchanged:** a work's state is owner-local and lost with its host (D-18's host boundary), not placed at f + 1.
+- **Cost (measured on the branch it comes from):** every edit now appends to the partition log, so the partition's
+  snapshots come at the rate edits arrive.
+
 ### A-217 — A green's origin is a reference to the base snapshot it holds, not a copy of the tree in the partition (accepted 2026-11-05, the supervisor's decision (a))
 
-> **Status (2026-11-05): reverted from main, with A-207's port.** Checkout (A-201) compares the recorded origin's
-> bytes, so every checkout was refused `ConsistentBaseUnavailable` (main CI 42119714654; GAPS). Re-landing owed.
+> **Status (2026-11-05): reverted from main with A-207's port (`f5396e3b`), then re-landed.** Checkout (A-201) had
+> compared the recorded origin's bytes, which a held origin does not keep, so every checkout was refused
+> `ConsistentBaseUnavailable` (main CI 42119714654). The checkout now compares origin identities (A-201's entry).
 
 Applied in the same change to: §4.16's status, A-9's "recorded durably" (now: recorded as a reference and held), GAPS
 (the load-test blockquote), BENCHMARKS, `crates/db` (`Op::GreenOriginHeld`, `OriginRef`,
@@ -14139,7 +14213,11 @@ Applied in the same change to: §4.16's status, A-9's "recorded durably" (now: r
   snapshot they came from, so the checkout names the base and is refused `ConsistentBaseUnavailable` unless the
   snapshot's origin, captured the way `green --base` captures it, encodes byte for byte to the green's recorded
   origin. An equal path is not evidence of an equal source (§4.10 "Overlay volumes in a fleet"). A scratch green has
-  no base to write into and is refused the same way.
+  no base to write into and is refused the same way. **Since A-217 (2026-11-05)** a based green records a reference
+  to its base snapshot with the origin's BLAKE3 identity instead of the bytes, so the check compares identities: the
+  named snapshot's origin against the reference's, or against the BLAKE3 of the bytes a taken-over green still records.
+  A-217 landed with the byte comparison in place, and every checkout of a based green was refused until this was
+  changed (`docs/bugs/2026-11-05-a-held-origin-refused-every-checkout.md`).
 - **The volume must still be the base.** It is refused `Unsupported` unless every op-log record since the snapshot
   is a snapshot's own and none was dropped (`Volume::unchanged_since`), so nothing the volume gained since is
   overwritten by the head without a word.

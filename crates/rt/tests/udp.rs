@@ -673,3 +673,61 @@ fn a_send_under_local_pressure_waits_for_writability_and_sends_once() {
     "the datagram arrived exactly once"
   );
 }
+
+/// Shape: how long the unreachable-port test waits for the live peer's datagram on loopback, where it takes
+/// microseconds: long enough for a loaded runner, short enough to fail a lost datagram promptly.
+const LIVE_WAIT: Duration = Duration::from_secs(5);
+
+/// Sends to a port nothing listens on from `receiver`, then has a live peer send to `receiver`, and reads until the
+/// peer's datagram comes: every read must be a datagram or nothing waiting, never an error.
+fn receive_after_an_unreachable_send(receiver: &UdpSocket) -> Result<Vec<u8>, String> {
+  let closed = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+  let closed_port = closed.local_addr().unwrap().port();
+  drop(closed);
+  receiver
+    .send_to(
+      b"to nobody",
+      SocketAddrV4::new(Ipv4Addr::LOCALHOST, closed_port),
+    )
+    .map_err(|e| format!("the send to the closed port was refused: {e}"))?;
+  let peer = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+  let to = receiver.local_addr().unwrap();
+  peer.send_to(b"live", to).unwrap();
+  let started = std::time::Instant::now();
+  let mut buf = [0u8; 64];
+  while started.elapsed() < LIVE_WAIT {
+    match receiver.try_recv_from(&mut buf) {
+      Ok(Some((n, _))) => return Ok(buf[..n].to_vec()),
+      Ok(None) => std::thread::yield_now(),
+      Err(e) => {
+        return Err(format!("a read after the unreachable send failed: {e}"));
+      }
+    }
+  }
+  Err(format!(
+    "the live peer's datagram did not come within {LIVE_WAIT:?}"
+  ))
+}
+
+/// §4.10a, the fleet's handshakes (conformance run 42150662467, windows-latest: a three-node fleet never formed in
+/// 40 s, its nodes probing one or two peers after a handshake's `recvfrom` failed with WSAECONNRESET, 10054). Do send
+/// from a socket to a closed port, then send to that socket from a live peer, and read. Expect the peer's datagram
+/// whole and no read refused, for a socket the runtime bound and one it adopted. On Windows the ICMP port-unreachable
+/// the closed port answers surfaces as WSAECONNRESET on the socket's next `recvfrom` unless `SIO_UDP_CONNRESET` is off
+/// (Microsoft Learn, "WSAIoctl", `SIO_UDP_CONNRESET`); Linux and macOS report no ICMP error to an unconnected socket.
+#[test]
+fn a_socket_that_sent_to_a_closed_port_still_receives_from_a_live_peer() {
+  let bound = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+  assert_eq!(
+    receive_after_an_unreachable_send(&bound).as_deref(),
+    Ok(&b"live"[..]),
+    "a bound socket"
+  );
+  let held = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+  let adopted = UdpSocket::adopt(held.into()).unwrap();
+  assert_eq!(
+    receive_after_an_unreachable_send(&adopted).as_deref(),
+    Ok(&b"live"[..]),
+    "an adopted socket"
+  );
+}

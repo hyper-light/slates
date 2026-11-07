@@ -323,8 +323,12 @@ impl<T> Op<T> {
 
 /// The shard's reply to an [`Op`].
 enum Reply {
-  /// The last context visited by a cooperative name update, or None when all live contexts were visited.
-  RenamedName(Option<u64>),
+  /// A cooperative name update's turn: the context it renamed (None when no open was beneath the old name), and whether
+  /// any open is still beneath it, so the receiver asks for no turn only to learn that none is left.
+  RenamedName {
+    renamed: Option<u64>,
+    more: bool,
+  },
   Volume {
     total: u64,
     free: u64,
@@ -473,7 +477,10 @@ fn rename_one_name(
   to: &str,
 ) -> Reply {
   let Some((context, inode)) = names.first_beneath(from) else {
-    return Reply::RenamedName(None);
+    return Reply::RenamedName {
+      renamed: None,
+      more: false,
+    };
   };
   let result = ledger
     .rename_name(context, from, to)
@@ -481,7 +488,10 @@ fn rename_one_name(
   match result {
     Ok(name) => {
       names.opened(context, inode, &name);
-      Reply::RenamedName(Some(context))
+      Reply::RenamedName {
+        renamed: Some(context),
+        more: names.first_beneath(from).is_some(),
+      }
     }
     Err(error) => {
       slates_machine::log_line!("slates-winfsp: durable kernel rename refused: {error}");
@@ -1153,8 +1163,11 @@ pub(crate) fn rename_open_names(
         to: to.to_owned(),
       },
     ) {
-      Reply::RenamedName(None) => return Ok(()),
-      Reply::RenamedName(Some(context)) if previous != Some(context) => previous = Some(context),
+      Reply::RenamedName { more: false, .. } => return Ok(()),
+      Reply::RenamedName {
+        renamed: Some(context),
+        more: true,
+      } if previous != Some(context) => previous = Some(context),
       Reply::Err(status) => {
         return Err(WinFspError::Api {
           call: "record kernel rename",
