@@ -1,0 +1,89 @@
+name: diag-liveness-demux
+
+# Diagnostics only, never on main (one refused receive ended a fleet node's transport): on four runners, the red arm
+# (the failing test alone) and the fix's rt, transport and server suites, the fleet suite where it runs (Unix).
+# Results go to diag-results/liveness-8-<os>.
+on:
+  push:
+    branches: ["diag-liveness-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RED_SHA: a1f2dce8
+
+jobs:
+  suites:
+    name: receive refusals (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+      SLATES_TEST_FLEET_DEADLINE_SECS: "120"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64 Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64 Windows)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: The red arm
+        run: |
+          R=../results.txt
+          echo "runner ${{ matrix.os }}, $(date -u)" > $R
+          git worktree add ../src-red "$RED_SHA"
+          status=0
+          ( cd ../src-red && CARGO_TARGET_DIR=../target-red cargo test --locked -p slates-transport --test receive_refusal ) > ../red.log 2>&1 || status=$?
+          grep -E '^test |test result|panicked|loop still runs' ../red.log | cut -c1-400 | tee -a $R || true
+          echo "== red exit $status" | tee -a $R
+      - name: The fix's suites
+        if: ${{ !cancelled() }}
+        run: |
+          R=../results.txt
+          suites="slates-rt|slates-transport|slates-server --lib"
+          case "${{ matrix.os }}" in ubuntu*) suites="$suites|slates-server --test fleet";; esac
+          IFS='|'
+          for pkg in $suites; do
+            unset IFS
+            status=0
+            cargo test --locked -p $pkg > ../suite.log 2>&1 || status=$?
+            grep -E '^test .*FAILED|test result|panicked' ../suite.log | cut -c1-300 | tee -a $R || true
+            echo "== fix suite $pkg exit $status" | tee -a $R
+            IFS='|'
+          done
+          unset IFS
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/liveness-8-${{ matrix.os }}"
+          git config user.name "diag-liveness"
+          git config user.email "diag-liveness@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-liveness-8 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
