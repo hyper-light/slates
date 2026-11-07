@@ -80,8 +80,9 @@
 >   42376010762; `docs/bugs/2026-11-07-a-verdict-walked-every-delta-since-its-base.md`). **Open, the next wall:** the
 >   owner partition's snapshot, re-encoded whole each time its log fills (about 1,800 of 2,241 samples of the owner
 >   shard at 10,000 works), wants §4.8's snapshot incremental or sized to the partition. **Closed by A-243 (2026-11-07):**
->   the cadence was a 1 MB boot guess for a fresh daemon's whole life; it is now re-derived at every snapshot from the
->   measured apply rate and never shorter than the snapshot's size, so snapshots cost at most about twice the log
+>   the cadence was a 1 MB boot guess for a fresh daemon's whole life; a partition now snapshots once the log since its
+>   last snapshot has taken the recovery budget's replay work, as each commit's append and apply measure it, and is at
+>   least that snapshot's size, so snapshots cost at most about twice the log
 >   (`snapshot_cadence.rs`, red on CI run 42385009677;
 >   `docs/bugs/2026-11-07-a-partitions-snapshot-cadence-never-left-its-boot-guess.md`). The local 10k rung went from
 >   2,197 to 3,128 clients done in 900 s. Still owed: the snapshot is encoded whole on the committing shard's turn.

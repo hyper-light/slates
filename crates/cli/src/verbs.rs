@@ -2630,14 +2630,17 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
     ));
     let snapshots = &shard.snapshots;
     out.push_str(&format!(
-      "shard {} snapshots: taken={} written={} longest_ns={} log_appended={} cadence={} apply_bytes_per_us={}\n",
+      "shard {} snapshots: taken={} written={} longest_ns={} log_appended={} tail_bytes={} tail_replay_ns={} \
+       budget_ns={} floor_bytes={}\n",
       shard.partition,
       snapshots.snapshots,
       snapshots.bytes_written,
       snapshots.longest_ns,
       snapshots.log_bytes_appended,
-      snapshots.bytes_between,
-      snapshots.apply_bytes_per_us
+      snapshots.tail_bytes,
+      snapshots.tail_replay_ns,
+      snapshots.budget_ns,
+      snapshots.floor_bytes
     ));
     for live in &shard.live {
       out.push_str(&format!(
