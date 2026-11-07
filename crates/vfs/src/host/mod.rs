@@ -91,6 +91,10 @@ pub enum HostError {
   StaleHandle,
   /// The host cannot serve it: the errno.
   Unavailable(i32),
+  /// The path lies on a mount this daemon serves (§4.6: no daemon thread opens a path on a volume the daemon serves;
+  /// A-227): nothing was opened, since the daemon would have waited on its own answer. The errno the platform names a
+  /// deadlock avoided by.
+  OwnMount(i32),
 }
 
 impl std::fmt::Display for HostError {
@@ -101,6 +105,7 @@ impl std::fmt::Display for HostError {
       Self::NotFile => f.write_str("not a regular file"),
       Self::StaleHandle => f.write_str("stale host handle"),
       Self::Unavailable(errno) => write!(f, "host unavailable (errno {errno})"),
+      Self::OwnMount(errno) => write!(f, "on a mount this daemon serves (errno {errno})"),
     }
   }
 }

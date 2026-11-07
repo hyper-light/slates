@@ -22,8 +22,12 @@
 //! ([`resolve`]), and a retry meanwhile joins the wait ([`join`]), so no client reads a success that `f` candidates
 //! do not hold. Holders that never answer make the writer wait: backpressure, never a false success.
 //!
-//! Not yet: NFS `COMMIT` and FUSE `fsync` replies do not wait yet, a holder's replicas do not survive its own daemon's
-//! restart, and a takeover does not read them.
+//! **Every other durability claim waits for the same position.** A transport's sync reply is held on [`durability`]
+//! (FUSE `fsync`, a virtio-fs or vhost-user `FSYNC`, a WinFsp flush, a Shards stream's `FSYNC`) or [`wait_durable`] (an NFS stable write or `COMMIT`, v3 and v4 alike),
+//! answered "not durable" past the liveness budget; a deferred verb that changes the volume (a writable map's
+//! `MapSync`, a checkout) completes through [`defer`] as a recorded verb does.
+//!
+//! Not yet: a holder's replicas do not survive its own daemon's restart.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -281,7 +285,8 @@ pub(crate) enum Durability {
 
 /// Whether `volume`'s log is durable at `target` on this (its owner) shard; when it is not yet and `waker` is given,
 /// parks it on the volume. Shared by every transport that holds a reply for durability: an NFS stable write or `COMMIT`
-/// ([`wait_durable`]) and a FUSE `fsync` (`crate::fuse`).
+/// and a Shards stream's `FSYNC` ([`wait_durable`]), a FUSE `fsync` (`crate::fuse`) and a virtio-fs `FSYNC`
+/// (`crate::virtiofs`, [`DurableWait`]).
 pub(crate) fn durability(
   state: &mut ShardState,
   volume: slates_db::catalog::VolumeId,
@@ -306,10 +311,41 @@ pub(crate) fn durability(
 }
 
 /// Derived: how long a held reply waits for durability before its transport answers that it is not (NFS `JUKEBOX`,
-/// FUSE `EIO`): [`DURABLE_WAIT_NS`]. Only the FUSE transport asks for it, so it is compiled where FUSE is.
-#[cfg(target_os = "linux")]
+/// FUSE and virtio-fs `EIO`, WinFsp `STATUS_UNEXPECTED_IO_ERROR`): [`DURABLE_WAIT_NS`]. Asked by those transports, so
+/// compiled where they are.
 pub(crate) const fn durable_wait_ns() -> u64 {
   DURABLE_WAIT_NS
+}
+
+/// A wait on this (the volume's owner) shard for `volume`'s log to be durable at `target`, or never to be ([`durability`]):
+/// ready then, or once the shard's state is out of reach (its shutdown). Parked on the volume as every held reply is, so
+/// a wait dropped early leaves at most a waker the volume's next advance wakes and drops ([`wake_parked`]). The virtio-fs
+/// loop's wait ([`crate::virtiofs`]).
+#[cfg(unix)]
+pub(crate) struct DurableWait {
+  volume: slates_db::catalog::VolumeId,
+  target: u64,
+}
+
+#[cfg(unix)]
+impl DurableWait {
+  /// The wait for `volume`'s log at `target`.
+  pub(crate) fn new(volume: slates_db::catalog::VolumeId, target: u64) -> DurableWait {
+    DurableWait { volume, target }
+  }
+}
+
+#[cfg(unix)]
+impl std::future::Future for DurableWait {
+  type Output = ();
+
+  fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+    let (volume, target) = (self.volume, self.target);
+    match state::with_state(|s| durability(s, volume, target, Some(cx.waker()))) {
+      Some(Durability::Pending) => std::task::Poll::Pending,
+      Some(Durability::Durable | Durability::Never) | None => std::task::Poll::Ready(()),
+    }
+  }
 }
 
 /// Counter: a transport reply whose volume did not become durable within [`DURABLE_WAIT_NS`]; it was answered "try
@@ -386,9 +422,9 @@ fn awaiting_bound(state: &ShardState) -> usize {
   awaiting_bound_of(&state.config)
 }
 
-/// Derived: the replies one FUSE mount may hold for durability: the bound a shard's held verbs use
-/// ([`awaiting_bound`]). Compiled where FUSE is, its only caller.
-#[cfg(target_os = "linux")]
+/// Derived: the replies one FUSE or WinFsp mount may hold for durability: the bound a shard's held verbs use
+/// ([`awaiting_bound`]). Compiled where those transports are, its only callers.
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) fn reply_hold_bound(state: &ShardState) -> usize {
   awaiting_bound_of(&state.config)
 }

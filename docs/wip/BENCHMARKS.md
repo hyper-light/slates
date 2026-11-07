@@ -2157,6 +2157,49 @@ item), a block naming its buffer by class and handle: XFS's progression from in-
 forms (Sweeney et al., USENIX 1996) without the global allocator. Built 2026-11-05 (A-203, "Directory blocks in size
 classes" above): AC-1.5 350,460,030 → 292,914,814 B.
 
+### The own-mount check on macOS (§4.6, A-227; 2026-11-06) — unresolved under load
+
+On macOS a crossing below a base is compared with the mount points of this daemon's own NFS mounts: with none recorded
+the check is one atomic load, and with one recorded it is the kernel's path of the parent (`F_GETPATH`) and a string
+comparison. `cargo build --release -p slates-base --example base_bench`, at `agents/slabs-siblings` after `ca5ba635`,
+whose last rows repeat the lookups with one mount recorded (`/dev`, which the directory does not lie on, so nothing is
+refused). The two arms run in one process, unrecorded first. The directory holds 810 files (alternating 4 KiB and
+128 KiB, made for the run). Apple M5 Max, 18 cores, macOS 26.4.1, shared with other agents' builds: 1-minute load 51
+to 54 (5-minute 71). Five runs; each run's median in ns:
+
+| row | none recorded | one recorded |
+|---|---|---|
+| list, per entry | 2,728, 2,317, 2,423, 2,484, 2,475 | 2,406, 2,730, 2,897, 2,645, 2,853 |
+| open and `fstat` a file | 31,542, 30,958, 32,666, 14,000, 16,041 | 35,542, 36,875, 27,333, 15,958, 34,708 |
+
+The load hides the difference. Each open's change, run by run, is +4.0, +5.9, −5.3, +2.0 and +18.7 µs, against opens
+that themselves range from 14.0 to 32.7 µs. A listing of files checks no entry, since only directories can be mount
+points, so the listings' +161 to +474 ns in four of five runs is the fixed order (the recorded arm runs second), not
+the check. Owed: the same rows at a quiet load. Linux's figures are in the section below.
+
+### The own-mount check on the base plane's lookups (§4.6, A-227; 2026-11-06, Linux)
+
+Every lookup below a base now opens the entry `O_PATH | O_NOFOLLOW` and reads its mount id from `/proc/self/fdinfo`
+before anything else touches it (A-227). Measured with `cargo build --release -p slates-base --example base_bench` at
+A = main `28359a75` and B = `agents/slabs-siblings` (the check, with each directory's mount id read once and a
+listing's file entries left unchecked), both over one directory of 810 files (alternating 4 KiB and 128 KiB, made for
+the run, since the bench's `target/debug/deps` is not under a kiln copy). adacachy (AMD Ryzen 9 9950X3D2, 32 threads,
+Linux 7.2.9-2-cachyos), loaded by other agents' CI builds: 1-minute load 62 to 85. Five rounds, A then B; each run's
+median in ns:
+
+| row | A (main) | B (the check) |
+|---|---|---|
+| list, per entry | 256, 270, 264, 258, 256 | 261, 261, 255, 254, 269 |
+| open and `fstat` a file | 501, 498, 503, 506, 498 | 1,764, 1,753, 1,753, 1,743, 1,774 |
+| `pread` 4 KiB | 85, 97, 86, 85, 83 | 86, 88, 87, 87, 86 |
+| fingerprint a directory | 89, 88, 88, 87, 88 | 88, 89, 88, 87, 88 |
+
+A checked open costs 1.25 µs more at the median (an `O_PATH` open and one fdinfo read), 3.5 times the open alone. A
+listing of files costs the same. A directory entry in a listing pays about the same as an open, which this directory
+(no subdirectories) does not show. The first form read the parent's mount id at every lookup and checked every listed
+entry: 2,699 to 2,983 ns a listed entry and 2,705 to 4,098 ns an open (five rounds each, load 78 to 107), and was
+replaced the same day.
+
 ### Directory blocks in size classes (§4.5, AC-1.5, AC-1.8, A-203; 2026-11-05) — adopted
 
 Owed since "Directory blocks against real trees" below. A block is the smallest of 17 classes, 256 B to 4 KiB, four to
@@ -4074,7 +4117,12 @@ last busy period grew nothing holds none: a written and deleted file nets zero, 
 unchanged (`a_deleted_files_memory_goes_back_to_the_os`). Measured:
 - `a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted`: a 16,777,200-byte burst left 16,711,680 bytes
   pre-faulted at idle, and the content object grew 184,320 bytes during the next 16 MiB write, against 16,961,536
-  without A-214;
+  without A-214. Under the whole `recovery` suite in parallel, on a host whose shmem grants `MADV_HUGEPAGE`
+  (`shmem_enabled` advise; adacachy, load 43–50, 2026-11-06), what a write needs beyond the reserve arrives in whole
+  2 MiB pages: the next write grew the object 2,097,152–4,194,304 bytes in ten runs, against 18,874,368–20,971,520 for
+  the first burst, and 16,777,216 against 18,874,368 with the pre-fault stubbed out (three of three). So the test holds
+  the second burst under half of the first's growth, not under a quarter of the file, which 4,194,304 bytes broke on
+  ubuntu-24.04-arm (CI run 42323710064) and on adacachy;
 - in the harness, the volume's shard faulted 342 MiB in over a run of three 64 MiB rounds and their mixed phases.
 
 **How the refill finds idle time.** A first build refilled at the reap tick only. On the Mac the harness pauses slates

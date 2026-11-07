@@ -154,6 +154,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     host.close_file(f);
   }
+  own_mount_rows(
+    &mut host,
+    root,
+    small.as_ref().map(|e| e.name.clone()),
+    entries,
+  )?;
   // Copy-up rows over the small `target/debug` directory itself (a dozen entries), so a
   // sample pays the copy-up and not a 43k-entry listing.
   let debug = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug");
@@ -177,6 +183,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
       e.name.clone()
     });
   copy_up_rows(&mut small_host, debug_root, debug_facts, small, large)?;
+  Ok(())
+}
+
+/// The lookup rows again with one mount recorded as this daemon's own (A-227), so each crossing pays the whole check:
+/// on macOS the kernel's path of the parent (`F_GETPATH`) and the comparison with the recorded points. The mount is
+/// `/dev`, which the directory does not lie on, so nothing is refused. macOS only: with no mount recorded the check
+/// is one atomic load, and the rows above are that case.
+#[cfg(target_os = "macos")]
+fn own_mount_rows(
+  host: &mut OsHost,
+  root: slates_vfs::host::HostDir,
+  small: Option<Box<str>>,
+  entries: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+  use slates_base::own_mounts;
+  own_mounts::install(1)?;
+  let devfs = slates_bridge_oci::mount_table::mount_table()?
+    .into_iter()
+    .find(|entry| entry.mount_point == "/dev")
+    .ok_or("no /dev in the mount table")?;
+  own_mounts::record(own_mounts::table_id(&devfs)).map_err(|full| format!("{full:?}"))?;
+  report_info(
+    &format!("list a {entries} entry directory per entry, one own mount recorded"),
+    &scale(
+      measure(
+        || {
+          std::hint::black_box(host.list(root).ok());
+        },
+        BUDGET,
+      ),
+      entries,
+    ),
+  );
+  if let Some(name) = small {
+    report(
+      "open and fstat a file, one own mount recorded",
+      &measure(
+        || {
+          if let Ok(f) = host.open_file(root, &name) {
+            std::hint::black_box(host.fstat(f).ok());
+            host.close_file(f);
+          }
+        },
+        BUDGET,
+      ),
+    );
+  }
+  Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn own_mount_rows(
+  _host: &mut OsHost,
+  _root: slates_vfs::host::HostDir,
+  _small: Option<Box<str>>,
+  _entries: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
   Ok(())
 }
 
