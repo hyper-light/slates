@@ -1615,6 +1615,156 @@ fn a_client_of_another_shard_maps_a_file_read_and_write() {
   );
 }
 
+/// Shape: the slices of a fill the starved-hand-off test's file spans: enough that the fill runs over many turns of its
+/// shard, so an observation finds it under way.
+#[cfg(any(target_os = "linux", windows))]
+const FILL_SLICES: u64 = 64;
+/// Shape: the maps the starved-hand-off test makes before it gives up on catching a fill under way. A map whose fill
+/// ended before the observation's turn (on a busy machine the observation can wait behind the whole fill: 4 of 6 busy
+/// rounds on CI's Windows runners, diag `r3a-5`) is let go and made again.
+#[cfg(any(target_os = "linux", windows))]
+const FILL_ATTEMPTS: usize = 8;
+/// Shape: how long the client's shard is starved at the hand-off: a window and a half, so a hand-off behind it is
+/// answered past a wall window.
+#[cfg(any(target_os = "linux", windows))]
+const HAND_OFF_STARVED: Duration = Duration::from_millis(1_500);
+/// Shape: the starved poll's time on the CPU and off it in each turn: a fifth of the time on it.
+#[cfg(any(target_os = "linux", windows))]
+const STARVED_BURST: Duration = Duration::from_millis(10);
+#[cfg(any(target_os = "linux", windows))]
+const STARVED_OFF: Duration = Duration::from_millis(40);
+
+/// R3 class A, the direct map's hand-off (`crates/server/src/direct_map.rs` `hand_off`: the copy's shard asks the
+/// client's shard to hand the copy over, A-187/A-188), A-65, §4.3, §4.6. Linux and Windows, where the hand-off crosses
+/// shards (macOS offers the copy on the copy's own shard). Do: on a two-shard daemon, map a file of sixteen copy slices
+/// on the volume of the shard that does not serve the client; while the fill is under way, hold the copy's shard, starve
+/// the client's shard in one poll of a window and a half (on the CPU a fifth of the time), and let the fill go on, so
+/// its hand-off meets the starved shard. Expect: the map is a direct one, after more than a wall window. On main the
+/// hand-off gave up at the wall second and the client was answered `MapUnavailable`, so it read by copy: a starved
+/// shard's hand-off lost.
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+fn a_map_whose_clients_shard_is_starved_at_its_hand_off_is_direct_past_a_wall_window() {
+  use std::sync::atomic::{AtomicBool, Ordering};
+  let slice = DaemonConfig::derive(&profile(), "starved-map-slice", Some(TEST_SHARDS))
+    .copy_slice_page_bytes();
+  let len = usize::try_from(slice.saturating_mul(FILL_SLICES)).unwrap();
+  let (daemon, mut client, _instance, id) = a_volume_of_the_other_shard("starvedmap", len);
+  write_file(&mut client, id, "/f.bin", &pattern(len, 11));
+  let copy_shard = daemon.shards()[usize::from(slates_server::verbs::owner_of(id))];
+  let home = *daemon
+    .shards()
+    .iter()
+    .find(|shard| **shard != copy_shard)
+    .unwrap();
+  let flag = || &*Box::leak(Box::new(AtomicBool::new(false)));
+  let (released, starving) = (flag(), flag());
+  let mut client = Some(client);
+  let mut attempts = 0;
+  // Each attempt maps the file on a thread and, on the copy's shard, holds the fill between two of its slices: once a
+  // copy is held there and this attempt's map is not yet answered.
+  let (mapper, held_mid_fill) = loop {
+    attempts += 1;
+    assert!(
+      attempts <= FILL_ATTEMPTS,
+      "a fill was found under way within {FILL_ATTEMPTS} maps"
+    );
+    let (answered, fill_held) = (flag(), flag());
+    let mut mapping = client.take().unwrap();
+    let mapper = std::thread::spawn(move || {
+      let started = Instant::now();
+      let read = mapping.map_read(id, "/f.bin").unwrap();
+      let took = started.elapsed();
+      answered.store(true, Ordering::Release);
+      let direct = read.is_zero_copy();
+      mapping.release_map(read).unwrap();
+      (mapping, direct, took)
+    });
+    let held = loop {
+      let observation = daemon
+        .observation(
+          Some(copy_shard),
+          10 * LIVENESS_BUDGET_NS,
+          move |state: &mut slates_server::state::ShardState| {
+            if state.store.shards_backings.peers_held().0 == 0 || answered.load(Ordering::Acquire) {
+              return false;
+            }
+            fill_held.store(true, Ordering::Release);
+            let held = Instant::now();
+            while !released.load(Ordering::Acquire) && held.elapsed() < *START_WAIT {
+              std::hint::spin_loop();
+            }
+            true
+          },
+        )
+        .unwrap();
+      let waiter = std::thread::spawn(move || observation.wait().unwrap());
+      while !fill_held.load(Ordering::Acquire) && !waiter.is_finished() {
+        std::thread::yield_now();
+      }
+      if fill_held.load(Ordering::Acquire) {
+        break Some(waiter);
+      }
+      let _ = waiter.join();
+      if answered.load(Ordering::Acquire) {
+        break None;
+      }
+    };
+    match held {
+      Some(waiter) => break (mapper, waiter),
+      // The fill ended before the observation's turn: let that map go and make another.
+      None => client = Some(mapper.join().unwrap().0),
+    }
+  };
+  // Starve the client's shard, then let the fill go on to its hand-off.
+  let starver = daemon
+    .observation(
+      Some(home),
+      10 * LIVENESS_BUDGET_NS,
+      move |_: &mut slates_server::state::ShardState| {
+        starving.store(true, Ordering::Release);
+        let started = Instant::now();
+        while started.elapsed() < HAND_OFF_STARVED {
+          let burst = Instant::now();
+          while burst.elapsed() < STARVED_BURST {
+            std::hint::spin_loop();
+          }
+          let (_hold, rx) = std::sync::mpsc::channel::<()>();
+          let _ = rx.recv_timeout(STARVED_OFF);
+        }
+      },
+    )
+    .unwrap();
+  let starved = std::thread::spawn(move || {
+    let _ = starver.wait();
+  });
+  while !starving.load(Ordering::Acquire) {
+    std::thread::yield_now();
+  }
+  let hand_off_began = Instant::now();
+  released.store(true, Ordering::Release);
+  assert!(
+    held_mid_fill.join().unwrap(),
+    "the hold ran on the copy's shard"
+  );
+  let (_client, direct, took) = mapper.join().unwrap();
+  starved.join().unwrap();
+  let since_starved = hand_off_began.elapsed();
+  daemon.stop();
+  println!(
+    "a map whose client's shard was starved at its hand-off: direct {direct}, answered after {took:?} \
+     ({since_starved:?} after the starve began; the fill caught under way at map {attempts})"
+  );
+  assert!(
+    since_starved > Duration::from_nanos(LIVENESS_BUDGET_NS),
+    "the hand-off met the starved shard past a wall window ({since_starved:?}), so the test is not vacuous"
+  );
+  assert!(
+    direct,
+    "a starved shard's hand-off was lost after {took:?}: the client read by copy"
+  );
+}
+
 /// Shape: the neighbour volume's marker: a byte run written into no other volume, so finding it inside a descriptor
 /// proves that descriptor reaches content the peer never asked for.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]

@@ -1466,7 +1466,8 @@ mod served {
         crate::held_copy::hold(s, mapping.mapping_id, record, descriptor.as_fd());
       });
     }
-    let delivered = crate::xshard::call_within(
+    // Waited for in the client's shard's own time (R3 class A): a starved shard's hand-off is heard, not given up.
+    let delivered = crate::xshard::call_in_shard_time(
       here,
       home,
       move |s| send_to_client(s, client_id, &descriptor, mapping),
@@ -1504,7 +1505,8 @@ mod served {
       let _counted = crate::state::with_state(|s| s.count(FELL_BACK, 1));
       return refused(Refusal::MapUnavailable);
     };
-    let pid = crate::xshard::call_within(
+    // Waited for in the client's shard's own time (R3 class A), as the Linux hand-off is.
+    let pid = crate::xshard::call_in_shard_time(
       here,
       home,
       move |s| pid_of(s, client_id),
