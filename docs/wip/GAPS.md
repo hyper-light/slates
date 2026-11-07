@@ -877,7 +877,7 @@
 > no holder's session is left lent with a cancelled request (KIND `wan`, `wan-loss` and `ceiling` acknowledged every
 > write, where main stalled; the lanes alone did too, so KIND does not separate the stragglers' wait). Open: a large install over a slow path is still cut at the live budget, as on main; it
 > waits on raft-chaos's size-derived exchange budget. And a lane may wait one record period for a session the record
-> plane has lent (`ship_head`). Open: one exchange per message to every holder starved the second holder (never
+> plane has lent (`ship_head`). Fixed the same day: a holder behind the retained tail no longer puts a whole copy of the volume on the log ahead of every later write; it is installed from an image made beside the log (§4.10 status "An install image beside the log"). Open: one exchange per message to every holder starved the second holder (never
 > accepted an entry, in six of nine process flows) and was rejected; why is not pinned down. Open, toward a filesystem
 > server replicated per write in under 1 ms: AC-8.9's credit backpressure (since 2026-11-05 a local checkpoint ships a
 > live volume's changes, not a whole copy: 1 whole record in 2,051 where main made about 420; the credit itself is
