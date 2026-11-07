@@ -1,0 +1,73 @@
+name: diag-liveness-gb
+
+# Diagnostics only, never on main (main CI 42184319025: A-205's give-back test against A-214's reserve). On both
+# Windows runners, the give-back test five times on this tree, with every reap tick's arena state logged (DIAG-GB), so
+# the tick that keeps the reserve after a delete is named. Results go to diag-results/liveness-4-<os>.
+on:
+  push:
+    branches: ["diag-liveness-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: give-back x5 (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build
+        run: cargo test --locked -p slates-server --test give_back --no-run
+      - name: The give-back test five times
+        run: |
+          R=../results.txt
+          echo "runner ${{ matrix.os }}, $NUMBER_OF_PROCESSORS CPUs, $(git log --oneline -1 | cut -c1-80), $(date -u)" > $R
+          for run in 1 2 3 4 5; do
+            echo "== run $run at $(date -u +%H:%M:%S)" | tee -a $R
+            status=0
+            cargo test --locked -p slates-server --test give_back -- --nocapture > ../gb.log 2>&1 || status=$?
+            grep -E 'DIAG-GB|round|panicked|test result' ../gb.log | grep -v 'DIAG-GB tick: sealed 0 deferred false' | cut -c1-400 | head -400 | tee -a $R || true
+            echo "== run $run exit $status" | tee -a $R
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/liveness-4-${{ matrix.os }}"
+          git config user.name "diag-liveness"
+          git config user.email "diag-liveness@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-liveness-4 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
