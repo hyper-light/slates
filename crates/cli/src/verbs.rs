@@ -1428,8 +1428,11 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
       intent,
       form,
     } => emit_attach(client, *volume, *snapshot, *intent, form.clone(), json)?,
-    Verb::Detach { attachment } => {
-      client.detach(*attachment)?;
+    Verb::Detach { attachment, volume } => {
+      match volume {
+        Some(volume) => client.detach_of(*volume, *attachment)?,
+        None => client.detach(*attachment)?,
+      }
       emit_ok("ok", json);
     }
     Verb::ReadBase { volume, path } => {
@@ -2627,13 +2630,16 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
     ));
     for live in &shard.live {
       out.push_str(&format!(
-        "shard {} live {} {} head={} durable={} owed={}\n",
+        "shard {} live {} {} head={} durable={} owed={} epoch={} identity={} fence={}\n",
         shard.partition,
         if live.holding { "held" } else { "shipping" },
         volume_id_text(live.volume),
         option_text(live.head),
         option_text(live.durable),
-        live.owed
+        live.owed,
+        option_text(live.head_epoch),
+        option_text(live.head_identity.as_ref().map(hex32)),
+        live.fence
       ));
     }
     if let Some(batch) = telemetry

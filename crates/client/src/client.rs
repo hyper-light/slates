@@ -8,11 +8,11 @@ use std::time::Instant;
 
 use slates_ipc::delivery::{Capability, Delivered, DeliveryFault, attest_proof};
 use slates_ipc::protocol::{
-  AttachRequest, AttachmentCapability, AuditEntry, CheckoutReport, DaemonReport, Direction,
-  Established, Filter, GrantScope, GrantSummary, GreenBase, ImageMergeReport, Intent,
-  LandingOutcome, LandingSummary, MergeWindow, NamePolicy, Principal, ReadAt, ReplyBody,
-  RequestBody, Rights, Scope, SizeClass, SnapshotCoverage, SnapshotId, StatusReport,
-  TelemetryReport, VolumeId, VolumeSummary, WorkOp, pack, unpack,
+  AttachRequest, AttachmentCapability, AuditEntry, CheckoutReport, DaemonReport, Established,
+  Filter, GrantScope, GrantSummary, GreenBase, ImageMergeReport, Intent, LandingOutcome,
+  LandingSummary, MergeWindow, NamePolicy, Principal, ReadAt, ReplyBody, RequestBody, Rights,
+  Scope, SizeClass, SnapshotCoverage, SnapshotId, StatusReport, TelemetryReport, VolumeId,
+  VolumeSummary, WorkOp, unpack,
 };
 #[cfg(unix)]
 use slates_ipc::rendezvous::ControlDelivery;
@@ -105,6 +105,9 @@ pub fn defers_reply(body: &RequestBody) -> bool {
         // A green's checkout writes its base volume in slices on the owner shard, as long as the difference takes
         // (A-201).
         | RequestBody::Checkout { .. }
+        // A pin reads the subtrees it names into the store in slices on the owner shard, as long as the tree takes
+        // (§4.4, §4.3).
+        | RequestBody::Pin { .. }
         // A direct map's copy is filled in slices on the owner shard, as long as the file takes (A-171).
         | RequestBody::MapRead { .. }
         // A writable map's copy is filled the same way, and its stores are compared back into the file in slices at
@@ -1688,12 +1691,25 @@ impl Client {
   /// The highest sequence the client may acknowledge now: everything it has received, unless a verb
   /// answered `Unpublished` awaits its retry — then the sequence just below the lowest such id, so
   /// the daemon keeps the ids above it new and the retry re-executes rather than meeting
-  /// `DuplicateRequest` (AC-2.3; AUD-06).
+  /// `DuplicateRequest` (AC-2.3; AUD-06). And never at or past a request still awaited whose reply has not come
+  /// (§4.9 "Exactly-once"; RIFL's first incomplete RPC, Lee et al., SOSP 2015): its completion record is what its
+  /// resend after a lost channel meets, and what a deferred verb (a fleet forward, a submit awaiting its commit)
+  /// records into when it ends, refused `StaleCompletion` below the watermark. A client with several requests in
+  /// flight had acknowledged them all: an applied create resent after a restart was answered `DuplicateRequest`
+  /// (`an_acknowledgement_never_covers_a_request_still_awaited`). A reply already drained into `pending` is received,
+  /// and its own poll answers from there first.
   fn ack_watermark(&self) -> u32 {
-    self
+    let received = self
       .unpublished
       .first()
-      .map_or(self.sequence, |&lowest| lowest.saturating_sub(1))
+      .map_or(self.sequence, |&lowest| lowest.saturating_sub(1));
+    let first_incomplete = self
+      .awaited
+      .keys()
+      .filter(|word| !self.pending.iter().any(|(held, _)| held == *word))
+      .map(|word| RequestId::from_word(*word).sequence)
+      .min();
+    first_incomplete.map_or(received, |lowest| received.min(lowest.saturating_sub(1)))
   }
 
   /// Notes what `word`'s reply means for the retryable set: an `Unpublished` refusal keeps the id
@@ -1872,6 +1888,25 @@ impl Client {
     // resent under their own ids ([`Self::resend_awaited`]).
     self.awaited.insert(id.word(), body.clone());
     Ok(id)
+  }
+
+  /// Sends `body` again under `word`, an id the caller already used and was answered with a refusal the protocol
+  /// marks retryable under the same id (`Overloaded`, `OwnerUnreachable`, `Unpublished`, `ContentUnavailable`): the
+  /// daemon answers from the verb's completion record once it is durable, or runs it if it never ran. The word is
+  /// awaited again, so its reply is taken as a [`Self::begin`]'s is, within the same in-flight bound. `Ok(false)` when
+  /// the ring has no slot (nothing was sent).
+  pub fn begin_again(&mut self, word: u64, body: &RequestBody) -> Result<bool, ClientError> {
+    if self.awaited.len() >= self.awaited_cap {
+      return Err(ClientError::TooManyOutstanding {
+        limit: self.awaited_cap,
+      });
+    }
+    self.bind_without_waiting()?;
+    if !self.try_send(RequestId::from_word(word), body)? {
+      return Ok(false);
+    }
+    self.awaited.insert(word, body.clone());
+    Ok(true)
   }
 
   /// Sends `body` under the next sequence, owned by no caller: a protocol-only request whose reply is
@@ -2776,15 +2811,7 @@ impl Client {
   /// found gone instead and the client reconnected (the caller binds and sends again).
   /// One attempt to put `body` under `id` on the command ring: `Ok(false)` when it has no slot.
   fn try_send(&mut self, id: RequestId, body: &RequestBody) -> Result<bool, ClientError> {
-    let index = self.end.next_request_index();
-    let slot = pack(
-      self.end.region_mut(),
-      Direction::Request,
-      index,
-      id.word(),
-      body,
-    )?;
-    match self.end.send(&slot) {
+    match self.end.send_message(id.word(), body) {
       Ok(()) => Ok(true),
       Err(IpcError::RingFull) => Ok(false),
       Err(e) => Err(ClientError::Ipc(e)),
@@ -2794,15 +2821,7 @@ impl Client {
   fn send(&mut self, id: RequestId, body: &RequestBody) -> Result<bool, ClientError> {
     let started = Instant::now();
     loop {
-      let index = self.end.next_request_index();
-      let slot = pack(
-        self.end.region_mut(),
-        Direction::Request,
-        index,
-        id.word(),
-        body,
-      )?;
-      match self.end.send(&slot) {
+      match self.end.send_message(id.word(), body) {
         Ok(()) => return Ok(true),
         Err(IpcError::RingFull) => {
           if elapsed_ns(started) < self.deadlines.reply_ns {
@@ -3598,6 +3617,15 @@ impl Client {
   /// Detaches.
   pub fn detach(&mut self, attachment: u64) -> Result<(), ClientError> {
     match self.call(&RequestBody::Detach { attachment })? {
+      ReplyBody::Detached => Ok(()),
+      _ => Err(ClientError::UnexpectedReply { verb: "detach" }),
+    }
+  }
+
+  /// Detaches an attachment of `volume`, routed by the volume (§4.10, A-222): the form for an attachment another
+  /// host's owner holds, which an attachment id alone cannot route to (it names its owner partition, not its host).
+  pub fn detach_of(&mut self, volume: VolumeId, attachment: u64) -> Result<(), ClientError> {
+    match self.call(&RequestBody::DetachOf { volume, attachment })? {
       ReplyBody::Detached => Ok(()),
       _ => Err(ClientError::UnexpectedReply { verb: "detach" }),
     }

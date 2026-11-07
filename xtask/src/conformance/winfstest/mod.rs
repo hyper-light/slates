@@ -239,7 +239,7 @@ pub(crate) fn run_winfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     write_file(&kept.join(output_name(path)), tap.as_bytes())?;
     parsed.push(parse_file(path, tap, &Runner::Root));
   }
-  let alive = session.daemon_alive();
+  let (alive, live_note) = session.alive_and_shipped();
   let mut notes = vec![
     built.note,
     format!(
@@ -259,6 +259,7 @@ pub(crate) fn run_winfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       session.anchor_log_tail()
     ));
   }
+  notes.extend(live_note);
   notes.extend(session.size_note.clone());
   drop(session);
   judged(run, &parsed, alive, notes)
