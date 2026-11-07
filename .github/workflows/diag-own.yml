@@ -14,7 +14,6 @@ env:
   CARGO_TERM_COLOR: never
 
 jobs:
-jobs:
   ownmount:
     strategy:
       fail-fast: false
