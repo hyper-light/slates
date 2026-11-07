@@ -1,0 +1,639 @@
+runner ubuntu-24.04-arm, 4 CPUs, Sat Nov  7 09:17:27 UTC 2026, head 108029b461acf0122ae937cbd2c4075ff2b2e27b
+== run 1 at 09:17:27, load 1.75 1.62 0.76
+  borrow-miss lines: 0
+  busy-skip lines: 0
+LANEPROBE step t=1226ms holder=HostId(5621360815853078279) stream=22 bytes=5088 session=true borrow_ms=100 exchange_ms=0 stragglers_ms=0 answered=true lane_age_ms=100 lane_sends=1
+LANEPROBE step t=2166ms holder=HostId(6786635421050618177) stream=22 bytes=4842 session=true borrow_ms=0 exchange_ms=1000 stragglers_ms=0 answered=false lane_age_ms=1000 lane_sends=1
+LANEPROBE step t=3601ms holder=HostId(6786635421050618177) stream=23 bytes=21964092 session=true borrow_ms=0 exchange_ms=106 stragglers_ms=0 answered=true lane_age_ms=106 lane_sends=1
+LANEPROBE step t=3707ms holder=HostId(6786635421050618177) stream=23 bytes=21964092 session=true borrow_ms=0 exchange_ms=103 stragglers_ms=0 answered=true lane_age_ms=103 lane_sends=1
+LANEPROBE step t=3831ms holder=HostId(6786635421050618177) stream=23 bytes=21964092 session=true borrow_ms=0 exchange_ms=122 stragglers_ms=0 answered=true lane_age_ms=122 lane_sends=1
+LANEPROBE step t=3942ms holder=HostId(6786635421050618177) stream=23 bytes=21964092 session=true borrow_ms=0 exchange_ms=101 stragglers_ms=0 answered=true lane_age_ms=101 lane_sends=1
+LANEPROBE step t=4175ms holder=HostId(6786635421050618177) stream=23 bytes=21964092 session=true borrow_ms=0 exchange_ms=138 stragglers_ms=0 answered=true lane_age_ms=138 lane_sends=1
+LANEPROBE step t=4538ms holder=HostId(6786635421050618177) stream=23 bytes=21964092 session=true borrow_ms=0 exchange_ms=104 stragglers_ms=0 answered=true lane_age_ms=105 lane_sends=1
+LANEPROBE step t=5648ms holder=HostId(5621360815853078279) stream=22 bytes=4846 session=true borrow_ms=0 exchange_ms=1000 stragglers_ms=0 answered=false lane_age_ms=1000 lane_sends=1
+LANEPROBE dispatch refused or timed out
+LANEPROBE lane EXPIRED holder=HostId(5621360815853078279) age_ms=2001
+LANEPROBE step t=9774ms holder=HostId(5621360815853078279) stream=22 bytes=4846 session=false borrow_ms=1001 exchange_ms=0 stragglers_ms=0 answered=false lane_age_ms=1001 lane_sends=1898
+LANEPROBE step t=10785ms holder=HostId(5621360815853078279) stream=22 bytes=4846 session=false borrow_ms=1003 exchange_ms=0 stragglers_ms=0 answered=false lane_age_ms=1003 lane_sends=1766
+LANEPROBE step t=11388ms holder=HostId(5621360815853078279) stream=22 bytes=4846 session=true borrow_ms=591 exchange_ms=0 stragglers_ms=0 answered=true lane_age_ms=591 lane_sends=1484
+LANEPROBE step t=12388ms holder=HostId(5621360815853078279) stream=22 bytes=4846 session=false borrow_ms=1000 exchange_ms=0 stragglers_ms=0 answered=false lane_age_ms=1000 lane_sends=1184
+LANEPROBE dispatch refused or timed out
+LANEPROBE step t=12962ms holder=HostId(5621360815853078279) stream=22 bytes=4846 session=true borrow_ms=568 exchange_ms=1 stragglers_ms=0 answered=true lane_age_ms=570 lane_sends=578
+LANEPROBE step t=13195ms holder=HostId(5621360815853078279) stream=22 bytes=4846 session=true borrow_ms=234 exchange_ms=0 stragglers_ms=0 answered=true lane_age_ms=235 lane_sends=16
+chaos: fleet rolling (Bare) formed and settled: hosts ["6786635421050618177", "5621360815853078279", "16384215017163205876"]
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-6201 partitioned from 180.217106ms to 2.18029681s, caught up after Some(1.372033288s)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-6201 partitioned from 3.660512806s to 5.660579095s, caught up after None
+chaos candidates partitioned in turn mid-stream: 9210 writes, 9210 acknowledged: p50 338 us, p99 9652 us, p999 34722 us, max 262608 us; 7 over 50ms (sent+took): 0.00s+137ms 0.18s+164ms 2.04s+88ms 2.34s+131ms 3.09s+68ms 3.16s+69ms 3.66s+263ms
+chaos candidates partitioned in turn mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(9220), durable: Some(9220), owed: false, epoch: Some(1), identity: Some("e19f3cf4baef87c091995483ee18d0496640a24090e1b3d5fb937170ee646fac"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(9220), durable: None, owed: false, epoch: Some(1), identity: Some("e19f3cf4baef87c091995483ee18d0496640a24090e1b3d5fb937170ee646fac"), fence: 1 }), Some(LiveState { holding: true, head: Some(9220), durable: None, owed: false, epoch: Some(1), identity: Some("e19f3cf4baef87c091995483ee18d0496640a24090e1b3d5fb937170ee646fac"), fence: 1 })]
+chaos candidates partitioned in turn mid-stream: 411 samples, 361 heads seen
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-6201 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-6201 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 10}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-6201 refused the owner: {}
+chaos candidates partitioned in turn mid-stream:
+  chaos-rolling-a-6201 partitioned from 180.217106ms to 2.18029681s, caught up after Some(1.372033288s)
+  chaos-rolling-b-6201 partitioned from 3.660512806s to 5.660579095s, caught up after None
+  every write acknowledged: held
+  no write waited for the stopped candidate: held
+  each healed candidate caught up within the bound: 1 violations
+  9210 writes, 9210 acknowledged: p50 338 us, p99 9652 us, p999 34722 us, max 262608 us; 7 over 50ms (sent+took): 0.00s+137ms 0.18s+164ms 2.04s+88ms 2.34s+131ms 3.09s+68ms 3.16s+69ms 3.66s+263ms
+  converged: true: owner Some(LiveState { holding: false, head: Some(9220), durable: Some(9220), owed: false, epoch: Some(1), identity: Some("e19f3cf4baef87c091995483ee18d0496640a24090e1b3d5fb937170ee646fac"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(9220), durable: None, owed: false, epoch: Some(1), identity: Some("e19f3cf4baef87c091995483ee18d0496640a24090e1b3d5fb937170ee646fac"), fence: 1 }), Some(LiveState { holding: true, head: Some(9220), durable: None, owed: false, epoch: Some(1), identity: Some("e19f3cf4baef87c091995483ee18d0496640a24090e1b3d5fb937170ee646fac"), fence: 1 })]
+  Convergence: held
+  411 samples, 361 heads seen
+  Agreement: held
+  NoLoss: held
+  chaos-rolling-c-6201 refused the owner: {}
+  chaos-rolling-a-6201 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 10}
+  chaos-rolling-b-6201 refused the owner: {}
+thread 'candidates_partitioned_in_turn_mid_stream_lose_nothing' (6202) panicked at crates/cli/tests/live_chaos.rs:990:5:
+chaos candidates partitioned in turn mid-stream: each healed candidate caught up within the bound: chaos-rolling-b-6201: None against 2s
+    candidates_partitioned_in_turn_mid_stream_lose_nothing
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 13.95s
+== run 1 exit 101
+== run 2 at 09:17:41, load 1.99 1.67 0.79
+  borrow-miss lines: 0
+  busy-skip lines: 0
+LANEPROBE step t=1119ms holder=HostId(9811114474307739500) stream=22 bytes=5088 session=true borrow_ms=100 exchange_ms=0 stragglers_ms=0 answered=true lane_age_ms=100 lane_sends=1
+LANEPROBE step t=2039ms holder=HostId(8866545129961043919) stream=22 bytes=4842 session=true borrow_ms=0 exchange_ms=1000 stragglers_ms=0 answered=false lane_age_ms=1000 lane_sends=1
+LANEPROBE step t=4191ms holder=HostId(8866545129961043919) stream=23 bytes=22105906 session=true borrow_ms=0 exchange_ms=141 stragglers_ms=0 answered=true lane_age_ms=141 lane_sends=1
+LANEPROBE step t=4349ms holder=HostId(8866545129961043919) stream=23 bytes=22105906 session=true borrow_ms=0 exchange_ms=103 stragglers_ms=0 answered=true lane_age_ms=103 lane_sends=1
+LANEPROBE step t=5524ms holder=HostId(9811114474307739500) stream=22 bytes=4846 session=true borrow_ms=0 exchange_ms=1000 stragglers_ms=0 answered=false lane_age_ms=1000 lane_sends=1
+LANEPROBE step t=6439ms holder=HostId(8866545129961043919) stream=22 bytes=5818063 session=true borrow_ms=0 exchange_ms=180 stragglers_ms=16 answered=true lane_age_ms=197 lane_sends=1
+LANEPROBE step t=6913ms holder=HostId(9811114474307739500) stream=23 bytes=36090576 session=true borrow_ms=0 exchange_ms=133 stragglers_ms=0 answered=true lane_age_ms=133 lane_sends=1
+chaos: fleet rolling (Bare) formed and settled: hosts ["8866545129961043919", "12220769954305597593", "9811114474307739500"]
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-7237 partitioned from 137.711204ms to 2.1378957s, caught up after Some(1.311744778s)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-7237 partitioned from 3.616597601s to 5.616718196s, caught up after Some(423.960645ms)
+chaos candidates partitioned in turn mid-stream: 8413 writes, 8413 acknowledged: p50 348 us, p99 6256 us, p999 71009 us, max 214962 us; 13 over 50ms (sent+took): 0.00s+115ms 0.14s+185ms 2.12s+64ms 2.32s+138ms 2.60s+50ms 3.20s+111ms 3.61s+164ms 5.34s+215ms 5.55s+81ms 5.64s+61ms 5.70s+55ms 5.75s+84ms 5.84s+71ms
+chaos candidates partitioned in turn mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(8417), durable: Some(8417), owed: false, epoch: Some(1), identity: Some("11e55c7b60a0a6d19bc21404329dd51a5d66ec177fa3e730aa566dd416e818e4"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(8417), durable: None, owed: false, epoch: Some(1), identity: Some("11e55c7b60a0a6d19bc21404329dd51a5d66ec177fa3e730aa566dd416e818e4"), fence: 1 }), Some(LiveState { holding: true, head: Some(8417), durable: None, owed: false, epoch: Some(1), identity: Some("11e55c7b60a0a6d19bc21404329dd51a5d66ec177fa3e730aa566dd416e818e4"), fence: 1 })]
+chaos candidates partitioned in turn mid-stream: 140 samples, 91 heads seen
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-7237 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-7237 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 10}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-7237 refused the owner: {}
+chaos candidates partitioned in turn mid-stream:
+  chaos-rolling-a-7237 partitioned from 137.711204ms to 2.1378957s, caught up after Some(1.311744778s)
+  chaos-rolling-c-7237 partitioned from 3.616597601s to 5.616718196s, caught up after Some(423.960645ms)
+  every write acknowledged: held
+  no write waited for the stopped candidate: held
+  each healed candidate caught up within the bound: held
+  8413 writes, 8413 acknowledged: p50 348 us, p99 6256 us, p999 71009 us, max 214962 us; 13 over 50ms (sent+took): 0.00s+115ms 0.14s+185ms 2.12s+64ms 2.32s+138ms 2.60s+50ms 3.20s+111ms 3.61s+164ms 5.34s+215ms 5.55s+81ms 5.64s+61ms 5.70s+55ms 5.75s+84ms 5.84s+71ms
+  converged: true: owner Some(LiveState { holding: false, head: Some(8417), durable: Some(8417), owed: false, epoch: Some(1), identity: Some("11e55c7b60a0a6d19bc21404329dd51a5d66ec177fa3e730aa566dd416e818e4"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(8417), durable: None, owed: false, epoch: Some(1), identity: Some("11e55c7b60a0a6d19bc21404329dd51a5d66ec177fa3e730aa566dd416e818e4"), fence: 1 }), Some(LiveState { holding: true, head: Some(8417), durable: None, owed: false, epoch: Some(1), identity: Some("11e55c7b60a0a6d19bc21404329dd51a5d66ec177fa3e730aa566dd416e818e4"), fence: 1 })]
+  Convergence: held
+  140 samples, 91 heads seen
+  Agreement: held
+  NoLoss: held
+  chaos-rolling-b-7237 refused the owner: {}
+  chaos-rolling-a-7237 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 10}
+  chaos-rolling-c-7237 refused the owner: {}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 7.38s
+== run 2 exit 0
+== run 3 at 09:17:48, load 1.91 1.67 0.79
+  borrow-miss lines: 0
+  busy-skip lines: 0
+LANEPROBE step t=1121ms holder=HostId(16345376874499776529) stream=22 bytes=4840 session=true borrow_ms=100 exchange_ms=0 stragglers_ms=0 answered=true lane_age_ms=100 lane_sends=1
+LANEPROBE step t=2070ms holder=HostId(1217473763768373669) stream=22 bytes=4842 session=true borrow_ms=0 exchange_ms=1000 stragglers_ms=0 answered=false lane_age_ms=1000 lane_sends=1
+LANEPROBE step t=4206ms holder=HostId(1217473763768373669) stream=23 bytes=20105916 session=true borrow_ms=0 exchange_ms=120 stragglers_ms=0 answered=true lane_age_ms=120 lane_sends=1
+LANEPROBE step t=4913ms holder=HostId(1217473763768373669) stream=23 bytes=20105916 session=true borrow_ms=0 exchange_ms=122 stragglers_ms=0 answered=true lane_age_ms=122 lane_sends=1
+LANEPROBE step t=5301ms holder=HostId(1217473763768373669) stream=23 bytes=20105916 session=true borrow_ms=0 exchange_ms=108 stragglers_ms=0 answered=true lane_age_ms=108 lane_sends=1
+LANEPROBE step t=5726ms holder=HostId(1217473763768373669) stream=23 bytes=20105916 session=true borrow_ms=0 exchange_ms=133 stragglers_ms=0 answered=true lane_age_ms=133 lane_sends=1
+LANEPROBE step t=5841ms holder=HostId(1217473763768373669) stream=23 bytes=20105916 session=true borrow_ms=0 exchange_ms=110 stragglers_ms=0 answered=true lane_age_ms=110 lane_sends=1
+LANEPROBE step t=5991ms holder=HostId(1217473763768373669) stream=23 bytes=20105916 session=true borrow_ms=0 exchange_ms=147 stragglers_ms=0 answered=true lane_age_ms=147 lane_sends=1
+LANEPROBE step t=6111ms holder=HostId(1217473763768373669) stream=23 bytes=20105916 session=true borrow_ms=0 exchange_ms=116 stragglers_ms=0 answered=true lane_age_ms=116 lane_sends=1
+LANEPROBE step t=6228ms holder=HostId(1217473763768373669) stream=23 bytes=20105916 session=true borrow_ms=0 exchange_ms=114 stragglers_ms=0 answered=true lane_age_ms=114 lane_sends=1
+LANEPROBE step t=6532ms holder=HostId(1217473763768373669) stream=23 bytes=20105916 session=true borrow_ms=0 exchange_ms=125 stragglers_ms=0 answered=true lane_age_ms=125 lane_sends=1
+LANEPROBE step t=6660ms holder=HostId(1217473763768373669) stream=23 bytes=20105916 session=true borrow_ms=0 exchange_ms=124 stragglers_ms=0 answered=true lane_age_ms=124 lane_sends=1
+LANEPROBE step t=7198ms holder=HostId(1217473763768373669) stream=23 bytes=20105916 session=true borrow_ms=0 exchange_ms=100 stragglers_ms=0 answered=true lane_age_ms=100 lane_sends=1
+LANEPROBE step t=8169ms holder=HostId(16345376874499776529) stream=22 bytes=4846 session=true borrow_ms=0 exchange_ms=1000 stragglers_ms=0 answered=false lane_age_ms=1000 lane_sends=1
+LANEPROBE step t=8506ms holder=HostId(1217473763768373669) stream=23 bytes=20105916 session=true borrow_ms=0 exchange_ms=202 stragglers_ms=0 answered=true lane_age_ms=202 lane_sends=1
+LANEPROBE step t=9256ms holder=HostId(1217473763768373669) stream=23 bytes=29365184 session=true borrow_ms=0 exchange_ms=104 stragglers_ms=0 answered=true lane_age_ms=104 lane_sends=1
+LANEPROBE step t=9392ms holder=HostId(1217473763768373669) stream=23 bytes=29365184 session=true borrow_ms=0 exchange_ms=109 stragglers_ms=0 answered=true lane_age_ms=109 lane_sends=1
+LANEPROBE step t=9641ms holder=HostId(16345376874499776529) stream=22 bytes=2129059 session=true borrow_ms=0 exchange_ms=10 stragglers_ms=188 answered=true lane_age_ms=222 lane_sends=3
+LANEPROBE step t=9743ms holder=HostId(1217473763768373669) stream=23 bytes=29365184 session=true borrow_ms=0 exchange_ms=322 stragglers_ms=0 answered=true lane_age_ms=323 lane_sends=1
+LANEPROBE step t=9872ms holder=HostId(16345376874499776529) stream=22 bytes=29365175 session=true borrow_ms=0 exchange_ms=206 stragglers_ms=23 answered=true lane_age_ms=452 lane_sends=3
+LANEPROBE step t=9908ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=153 stragglers_ms=0 answered=true lane_age_ms=153 lane_sends=1
+LANEPROBE step t=10070ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=156 stragglers_ms=0 answered=true lane_age_ms=156 lane_sends=1
+LANEPROBE step t=10087ms holder=HostId(16345376874499776529) stream=22 bytes=29369493 session=true borrow_ms=0 exchange_ms=211 stragglers_ms=0 answered=true lane_age_ms=212 lane_sends=1
+LANEPROBE step t=10188ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=114 stragglers_ms=0 answered=true lane_age_ms=114 lane_sends=1
+LANEPROBE step t=11157ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=103 stragglers_ms=0 answered=true lane_age_ms=104 lane_sends=1
+LANEPROBE step t=13954ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=103 stragglers_ms=0 answered=true lane_age_ms=103 lane_sends=1
+LANEPROBE step t=14059ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=101 stragglers_ms=0 answered=true lane_age_ms=101 lane_sends=1
+LANEPROBE step t=14319ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=106 stragglers_ms=0 answered=true lane_age_ms=106 lane_sends=1
+LANEPROBE step t=14594ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=111 stragglers_ms=0 answered=true lane_age_ms=111 lane_sends=1
+LANEPROBE step t=17841ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=111 stragglers_ms=0 answered=true lane_age_ms=111 lane_sends=1
+LANEPROBE step t=18280ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=126 stragglers_ms=0 answered=true lane_age_ms=126 lane_sends=1
+LANEPROBE step t=18540ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=110 stragglers_ms=0 answered=true lane_age_ms=110 lane_sends=1
+LANEPROBE step t=19109ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=104 stragglers_ms=0 answered=true lane_age_ms=104 lane_sends=1
+LANEPROBE step t=19911ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=109 stragglers_ms=0 answered=true lane_age_ms=109 lane_sends=1
+LANEPROBE step t=20284ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=105 stragglers_ms=0 answered=true lane_age_ms=105 lane_sends=1
+LANEPROBE step t=20837ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=105 stragglers_ms=0 answered=true lane_age_ms=105 lane_sends=1
+LANEPROBE step t=20951ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=109 stragglers_ms=0 answered=true lane_age_ms=109 lane_sends=1
+LANEPROBE step t=21232ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=112 stragglers_ms=0 answered=true lane_age_ms=112 lane_sends=1
+LANEPROBE step t=22999ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=103 stragglers_ms=0 answered=true lane_age_ms=103 lane_sends=1
+LANEPROBE step t=23103ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=100 stragglers_ms=0 answered=true lane_age_ms=100 lane_sends=1
+LANEPROBE step t=23215ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=106 stragglers_ms=0 answered=true lane_age_ms=106 lane_sends=1
+LANEPROBE step t=23327ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=109 stragglers_ms=0 answered=true lane_age_ms=109 lane_sends=1
+LANEPROBE step t=23436ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=104 stragglers_ms=0 answered=true lane_age_ms=104 lane_sends=1
+LANEPROBE step t=23543ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=103 stragglers_ms=0 answered=true lane_age_ms=103 lane_sends=1
+LANEPROBE step t=23658ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=111 stragglers_ms=0 answered=true lane_age_ms=111 lane_sends=1
+LANEPROBE step t=24053ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=116 stragglers_ms=0 answered=true lane_age_ms=116 lane_sends=1
+LANEPROBE step t=24170ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=113 stragglers_ms=0 answered=true lane_age_ms=113 lane_sends=1
+LANEPROBE step t=24347ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=103 stragglers_ms=0 answered=true lane_age_ms=103 lane_sends=1
+LANEPROBE step t=24458ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=107 stragglers_ms=0 answered=true lane_age_ms=107 lane_sends=1
+LANEPROBE step t=24755ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=101 stragglers_ms=0 answered=true lane_age_ms=101 lane_sends=1
+LANEPROBE step t=25257ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=109 stragglers_ms=0 answered=true lane_age_ms=109 lane_sends=1
+LANEPROBE step t=25454ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=100 stragglers_ms=0 answered=true lane_age_ms=100 lane_sends=1
+LANEPROBE step t=25562ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=104 stragglers_ms=0 answered=true lane_age_ms=104 lane_sends=1
+LANEPROBE step t=25668ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=103 stragglers_ms=0 answered=true lane_age_ms=103 lane_sends=1
+LANEPROBE step t=26823ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=100 stragglers_ms=0 answered=true lane_age_ms=100 lane_sends=1
+LANEPROBE step t=27211ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=100 stragglers_ms=0 answered=true lane_age_ms=100 lane_sends=1
+LANEPROBE step t=28010ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=113 stragglers_ms=0 answered=true lane_age_ms=113 lane_sends=1
+LANEPROBE step t=28299ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=109 stragglers_ms=0 answered=true lane_age_ms=109 lane_sends=1
+LANEPROBE step t=29449ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=110 stragglers_ms=0 answered=true lane_age_ms=110 lane_sends=1
+LANEPROBE step t=29565ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=113 stragglers_ms=0 answered=true lane_age_ms=113 lane_sends=1
+LANEPROBE step t=29691ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=120 stragglers_ms=0 answered=true lane_age_ms=120 lane_sends=1
+LANEPROBE step t=29795ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=101 stragglers_ms=0 answered=true lane_age_ms=101 lane_sends=1
+LANEPROBE step t=30099ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=106 stragglers_ms=0 answered=true lane_age_ms=106 lane_sends=1
+LANEPROBE step t=30203ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=100 stragglers_ms=0 answered=true lane_age_ms=100 lane_sends=1
+LANEPROBE step t=30310ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=103 stragglers_ms=0 answered=true lane_age_ms=103 lane_sends=1
+LANEPROBE step t=30610ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=104 stragglers_ms=0 answered=true lane_age_ms=104 lane_sends=1
+LANEPROBE step t=30714ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=100 stragglers_ms=0 answered=true lane_age_ms=100 lane_sends=1
+LANEPROBE step t=31320ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=102 stragglers_ms=0 answered=true lane_age_ms=102 lane_sends=1
+LANEPROBE step t=31438ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=114 stragglers_ms=0 answered=true lane_age_ms=114 lane_sends=1
+LANEPROBE step t=31559ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=117 stragglers_ms=0 answered=true lane_age_ms=117 lane_sends=1
+LANEPROBE step t=31696ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=133 stragglers_ms=0 answered=true lane_age_ms=133 lane_sends=1
+LANEPROBE step t=31918ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=117 stragglers_ms=0 answered=true lane_age_ms=117 lane_sends=1
+LANEPROBE step t=32025ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=104 stragglers_ms=0 answered=true lane_age_ms=104 lane_sends=1
+LANEPROBE step t=32213ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=108 stragglers_ms=0 answered=true lane_age_ms=108 lane_sends=1
+LANEPROBE step t=33077ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=104 stragglers_ms=0 answered=true lane_age_ms=104 lane_sends=1
+LANEPROBE step t=33196ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=115 stragglers_ms=0 answered=true lane_age_ms=115 lane_sends=1
+LANEPROBE step t=33343ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=144 stragglers_ms=0 answered=true lane_age_ms=144 lane_sends=1
+LANEPROBE step t=33544ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=194 stragglers_ms=0 answered=true lane_age_ms=194 lane_sends=1
+LANEPROBE step t=33657ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=109 stragglers_ms=0 answered=true lane_age_ms=109 lane_sends=1
+LANEPROBE step t=33798ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=138 stragglers_ms=0 answered=true lane_age_ms=138 lane_sends=1
+LANEPROBE step t=33911ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=109 stragglers_ms=0 answered=true lane_age_ms=109 lane_sends=1
+LANEPROBE step t=34120ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=102 stragglers_ms=0 answered=true lane_age_ms=102 lane_sends=1
+LANEPROBE step t=34260ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=137 stragglers_ms=0 answered=true lane_age_ms=137 lane_sends=1
+LANEPROBE step t=34408ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=144 stragglers_ms=0 answered=true lane_age_ms=144 lane_sends=1
+LANEPROBE step t=34538ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=127 stragglers_ms=0 answered=true lane_age_ms=127 lane_sends=1
+LANEPROBE step t=34649ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=105 stragglers_ms=0 answered=true lane_age_ms=105 lane_sends=1
+LANEPROBE step t=34774ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=119 stragglers_ms=0 answered=true lane_age_ms=119 lane_sends=1
+LANEPROBE step t=34894ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=117 stragglers_ms=0 answered=true lane_age_ms=117 lane_sends=1
+LANEPROBE step t=35006ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=105 stragglers_ms=0 answered=true lane_age_ms=105 lane_sends=1
+LANEPROBE step t=35131ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=122 stragglers_ms=0 answered=true lane_age_ms=122 lane_sends=1
+LANEPROBE step t=35267ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=131 stragglers_ms=0 answered=true lane_age_ms=131 lane_sends=1
+LANEPROBE step t=35499ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=128 stragglers_ms=0 answered=true lane_age_ms=128 lane_sends=1
+LANEPROBE step t=35623ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=120 stragglers_ms=0 answered=true lane_age_ms=120 lane_sends=1
+LANEPROBE step t=35755ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=128 stragglers_ms=0 answered=true lane_age_ms=128 lane_sends=1
+LANEPROBE step t=35872ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=111 stragglers_ms=0 answered=true lane_age_ms=111 lane_sends=1
+LANEPROBE step t=35993ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=118 stragglers_ms=0 answered=true lane_age_ms=118 lane_sends=1
+LANEPROBE step t=36113ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=115 stragglers_ms=0 answered=true lane_age_ms=115 lane_sends=1
+LANEPROBE step t=36238ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=122 stragglers_ms=0 answered=true lane_age_ms=122 lane_sends=1
+LANEPROBE step t=36371ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=128 stragglers_ms=0 answered=true lane_age_ms=128 lane_sends=1
+LANEPROBE step t=36484ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=110 stragglers_ms=0 answered=true lane_age_ms=110 lane_sends=1
+LANEPROBE step t=36588ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=100 stragglers_ms=0 answered=true lane_age_ms=100 lane_sends=1
+LANEPROBE step t=36705ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=113 stragglers_ms=0 answered=true lane_age_ms=113 lane_sends=1
+LANEPROBE step t=36825ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=117 stragglers_ms=0 answered=true lane_age_ms=117 lane_sends=1
+LANEPROBE step t=37033ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=112 stragglers_ms=0 answered=true lane_age_ms=112 lane_sends=1
+LANEPROBE step t=38633ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=130 stragglers_ms=0 answered=true lane_age_ms=130 lane_sends=1
+LANEPROBE step t=38772ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=135 stragglers_ms=0 answered=true lane_age_ms=135 lane_sends=1
+LANEPROBE step t=39120ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=109 stragglers_ms=0 answered=true lane_age_ms=109 lane_sends=1
+LANEPROBE step t=39247ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=124 stragglers_ms=0 answered=true lane_age_ms=124 lane_sends=1
+LANEPROBE step t=39642ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=114 stragglers_ms=0 answered=true lane_age_ms=114 lane_sends=1
+LANEPROBE step t=39932ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=110 stragglers_ms=0 answered=true lane_age_ms=110 lane_sends=1
+LANEPROBE step t=40039ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=104 stragglers_ms=0 answered=true lane_age_ms=104 lane_sends=1
+LANEPROBE step t=40551ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=129 stragglers_ms=0 answered=true lane_age_ms=129 lane_sends=1
+LANEPROBE step t=40662ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=107 stragglers_ms=0 answered=true lane_age_ms=107 lane_sends=1
+LANEPROBE step t=40888ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=126 stragglers_ms=0 answered=true lane_age_ms=126 lane_sends=1
+LANEPROBE step t=41000ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=108 stragglers_ms=0 answered=true lane_age_ms=108 lane_sends=1
+LANEPROBE step t=41107ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=104 stragglers_ms=0 answered=true lane_age_ms=104 lane_sends=1
+LANEPROBE step t=41215ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=104 stragglers_ms=0 answered=true lane_age_ms=104 lane_sends=1
+LANEPROBE step t=41327ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=108 stragglers_ms=0 answered=true lane_age_ms=108 lane_sends=1
+LANEPROBE step t=41448ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=118 stragglers_ms=0 answered=true lane_age_ms=118 lane_sends=1
+LANEPROBE step t=41554ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=102 stragglers_ms=0 answered=true lane_age_ms=102 lane_sends=1
+LANEPROBE step t=41915ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=100 stragglers_ms=0 answered=true lane_age_ms=100 lane_sends=1
+LANEPROBE step t=42203ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=106 stragglers_ms=0 answered=true lane_age_ms=106 lane_sends=1
+LANEPROBE step t=42496ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=102 stragglers_ms=0 answered=true lane_age_ms=102 lane_sends=1
+LANEPROBE step t=43373ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=118 stragglers_ms=0 answered=true lane_age_ms=118 lane_sends=1
+LANEPROBE step t=43488ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=112 stragglers_ms=0 answered=true lane_age_ms=112 lane_sends=1
+LANEPROBE step t=43600ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=108 stragglers_ms=0 answered=true lane_age_ms=108 lane_sends=1
+LANEPROBE step t=43731ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=127 stragglers_ms=0 answered=true lane_age_ms=127 lane_sends=1
+LANEPROBE step t=43856ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=119 stragglers_ms=0 answered=true lane_age_ms=119 lane_sends=1
+LANEPROBE step t=43980ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=121 stragglers_ms=0 answered=true lane_age_ms=121 lane_sends=1
+LANEPROBE step t=44093ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=109 stragglers_ms=0 answered=true lane_age_ms=109 lane_sends=1
+LANEPROBE step t=44231ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=134 stragglers_ms=0 answered=true lane_age_ms=134 lane_sends=1
+LANEPROBE step t=44369ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=135 stragglers_ms=0 answered=true lane_age_ms=135 lane_sends=1
+LANEPROBE step t=44489ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=116 stragglers_ms=0 answered=true lane_age_ms=116 lane_sends=1
+LANEPROBE step t=44601ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=108 stragglers_ms=0 answered=true lane_age_ms=108 lane_sends=1
+LANEPROBE step t=45060ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=104 stragglers_ms=0 answered=true lane_age_ms=104 lane_sends=1
+LANEPROBE step t=45169ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=106 stragglers_ms=0 answered=true lane_age_ms=106 lane_sends=1
+LANEPROBE step t=45296ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=123 stragglers_ms=0 answered=true lane_age_ms=123 lane_sends=1
+LANEPROBE step t=45434ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=134 stragglers_ms=0 answered=true lane_age_ms=135 lane_sends=1
+LANEPROBE step t=45560ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=122 stragglers_ms=0 answered=true lane_age_ms=122 lane_sends=1
+LANEPROBE step t=45675ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=110 stragglers_ms=0 answered=true lane_age_ms=110 lane_sends=1
+LANEPROBE step t=45794ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=113 stragglers_ms=0 answered=true lane_age_ms=113 lane_sends=1
+LANEPROBE step t=46003ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=112 stragglers_ms=0 answered=true lane_age_ms=112 lane_sends=1
+LANEPROBE step t=46221ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=118 stragglers_ms=0 answered=true lane_age_ms=118 lane_sends=1
+LANEPROBE step t=46444ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=117 stragglers_ms=0 answered=true lane_age_ms=117 lane_sends=1
+LANEPROBE step t=47025ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=113 stragglers_ms=0 answered=true lane_age_ms=113 lane_sends=1
+LANEPROBE step t=47405ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=106 stragglers_ms=0 answered=true lane_age_ms=106 lane_sends=1
+LANEPROBE step t=47512ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=104 stragglers_ms=0 answered=true lane_age_ms=104 lane_sends=1
+LANEPROBE step t=47618ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=103 stragglers_ms=0 answered=true lane_age_ms=103 lane_sends=1
+LANEPROBE step t=47741ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=119 stragglers_ms=0 answered=true lane_age_ms=119 lane_sends=1
+LANEPROBE step t=48191ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=101 stragglers_ms=0 answered=true lane_age_ms=101 lane_sends=1
+LANEPROBE step t=48644ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=105 stragglers_ms=0 answered=true lane_age_ms=105 lane_sends=1
+LANEPROBE step t=49253ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=104 stragglers_ms=0 answered=true lane_age_ms=104 lane_sends=1
+LANEPROBE step t=49373ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=117 stragglers_ms=0 answered=true lane_age_ms=117 lane_sends=1
+LANEPROBE step t=49689ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=127 stragglers_ms=0 answered=true lane_age_ms=127 lane_sends=1
+LANEPROBE step t=50090ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=119 stragglers_ms=0 answered=true lane_age_ms=119 lane_sends=1
+LANEPROBE step t=50199ms holder=HostId(1217473763768373669) stream=23 bytes=29369502 session=true borrow_ms=0 exchange_ms=106 stragglers_ms=0 answered=true lane_age_ms=106 lane_sends=1
+chaos: fleet rolling (Bare) formed and settled: hosts ["1217473763768373669", "12606704723957933809", "16345376874499776529"]
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-7661 partitioned from 159.33543ms to 2.159455292s, caught up after None
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-7661 partitioned from 6.258520937s to 8.258607779s, caught up after Some(681.479043ms)
+chaos slow write chaos-6682 sent 6.258543448s took 2.274451193s refused None: 52 samples
+      5.760s chaos-rolling-b-7661 shipping head=Some(6312) durable=Some(6312) owed=false epoch=Some(1) fence=1
+      5.765s chaos-rolling-c-7661 held head=Some(6314) durable=None owed=false epoch=Some(1) fence=1
+      5.807s chaos-rolling-a-7661 held head=Some(60) durable=None owed=false epoch=Some(1) fence=1
+      5.812s chaos-rolling-b-7661 shipping head=Some(6358) durable=Some(6358) owed=false epoch=Some(1) fence=1
+      5.816s chaos-rolling-c-7661 held head=Some(6359) durable=None owed=false epoch=Some(1) fence=1
+      5.851s chaos-rolling-a-7661 held head=Some(60) durable=None owed=false epoch=Some(1) fence=1
+      5.857s chaos-rolling-b-7661 shipping head=Some(6390) durable=Some(6389) owed=false epoch=Some(1) fence=1
+      5.861s chaos-rolling-c-7661 held head=Some(6392) durable=None owed=false epoch=Some(1) fence=1
+      5.902s chaos-rolling-a-7661 held head=Some(60) durable=None owed=false epoch=Some(1) fence=1
+      5.910s chaos-rolling-b-7661 shipping head=Some(6449) durable=Some(6449) owed=false epoch=Some(1) fence=1
+      5.922s chaos-rolling-c-7661 held head=Some(6452) durable=None owed=false epoch=Some(1) fence=1
+      5.953s chaos-rolling-a-7661 held head=Some(60) durable=None owed=false epoch=Some(1) fence=1
+      5.959s chaos-rolling-b-7661 shipping head=Some(6482) durable=Some(6482) owed=false epoch=Some(1) fence=1
+      5.967s chaos-rolling-c-7661 held head=Some(6485) durable=None owed=false epoch=Some(1) fence=1
+      6.008s chaos-rolling-a-7661 held head=Some(60) durable=None owed=false epoch=Some(1) fence=1
+      6.014s chaos-rolling-b-7661 shipping head=Some(6513) durable=Some(6512) owed=false epoch=Some(1) fence=1
+      6.019s chaos-rolling-c-7661 held head=Some(6513) durable=None owed=false epoch=Some(1) fence=1
+      6.047s chaos-rolling-a-7661 held head=Some(60) durable=None owed=false epoch=Some(1) fence=1
+      6.052s chaos-rolling-b-7661 shipping head=Some(6543) durable=Some(6542) owed=false epoch=Some(1) fence=1
+      6.056s chaos-rolling-c-7661 held head=Some(6544) durable=None owed=false epoch=Some(1) fence=1
+      6.097s chaos-rolling-a-7661 held head=Some(60) durable=None owed=false epoch=Some(1) fence=1
+      6.103s chaos-rolling-b-7661 shipping head=Some(6586) durable=Some(6586) owed=false epoch=Some(1) fence=1
+      6.109s chaos-rolling-c-7661 held head=Some(6591) durable=None owed=false epoch=Some(1) fence=1
+      6.138s chaos-rolling-a-7661 held head=Some(60) durable=None owed=false epoch=Some(1) fence=1
+      6.145s chaos-rolling-b-7661 shipping head=Some(6615) durable=Some(6614) owed=false epoch=Some(1) fence=1
+      6.149s chaos-rolling-c-7661 held head=Some(6616) durable=None owed=false epoch=Some(1) fence=1
+      6.185s chaos-rolling-a-7661 held head=Some(60) durable=None owed=false epoch=Some(1) fence=1
+      6.190s chaos-rolling-b-7661 shipping head=Some(6645) durable=Some(6645) owed=false epoch=Some(1) fence=1
+      6.201s chaos-rolling-c-7661 held head=Some(6647) durable=None owed=false epoch=Some(1) fence=1
+      6.226s chaos-rolling-a-7661 held head=Some(60) durable=None owed=false epoch=Some(1) fence=1
+      6.233s chaos-rolling-b-7661 shipping head=Some(6669) durable=Some(6668) owed=false epoch=Some(1) fence=1
+      6.238s chaos-rolling-c-7661 held head=Some(6674) durable=None owed=false epoch=Some(1) fence=1
+      6.265s chaos-rolling-a-7661 held head=Some(60) durable=None owed=false epoch=Some(1) fence=1
+      6.268s chaos-rolling-b-7661 shipping head=Some(6687) durable=Some(6686) owed=false epoch=Some(1) fence=1
+      6.272s chaos-rolling-c-7661 held head=Some(6687) durable=None owed=false epoch=Some(1) fence=1
+      8.283s chaos-rolling-a-7661 held head=Some(60) durable=None owed=false epoch=Some(1) fence=1
+      8.286s chaos-rolling-b-7661 shipping head=Some(6689) durable=Some(6686) owed=false epoch=Some(1) fence=1
+      8.291s chaos-rolling-c-7661 held head=Some(6687) durable=None owed=false epoch=Some(1) fence=1
+      8.316s chaos-rolling-a-7661 held head=Some(60) durable=None owed=false epoch=Some(1) fence=1
+      8.321s chaos-rolling-b-7661 shipping head=Some(6689) durable=Some(6686) owed=false epoch=Some(1) fence=1
+      8.323s chaos-rolling-c-7661 held head=Some(6687) durable=None owed=false epoch=Some(1) fence=1
+      8.347s chaos-rolling-a-7661 held head=Some(60) durable=None owed=false epoch=Some(1) fence=1
+      8.350s chaos-rolling-b-7661 shipping head=Some(6689) durable=Some(6686) owed=false epoch=Some(1) fence=1
+      8.413s chaos-rolling-c-7661 held head=Some(6687) durable=None owed=false epoch=Some(1) fence=1
+      8.438s chaos-rolling-a-7661 held head=Some(60) durable=None owed=false epoch=Some(1) fence=1
+      8.442s chaos-rolling-b-7661 shipping head=Some(6689) durable=Some(6686) owed=false epoch=Some(1) fence=1
+      8.445s chaos-rolling-c-7661 held head=Some(6687) durable=None owed=false epoch=Some(1) fence=1
+      8.469s chaos-rolling-a-7661 held head=Some(60) durable=None owed=false epoch=Some(1) fence=1
+      8.474s chaos-rolling-b-7661 shipping head=Some(6689) durable=Some(6686) owed=false epoch=Some(1) fence=1
+      8.531s chaos-rolling-c-7661 held head=Some(6687) durable=None owed=false epoch=Some(1) fence=1
+      8.555s chaos-rolling-a-7661 held head=Some(60) durable=None owed=false epoch=Some(1) fence=1
+      8.559s chaos-rolling-b-7661 shipping head=Some(6690) durable=Some(6688) owed=false epoch=Some(1) fence=1
+chaos candidates partitioned in turn mid-stream: 6729 writes, 6729 acknowledged: p50 463 us, p99 7661 us, p999 79067 us, max 2274451 us; 7 over 50ms (sent+took): 0.00s+108ms 0.16s+156ms 2.13s+79ms 2.31s+108ms 3.20s+81ms 6.26s+2274ms 8.53s+644ms
+chaos candidates partitioned in turn mid-stream: converged: false: owner Some(LiveState { holding: false, head: Some(6736), durable: Some(6736), owed: false, epoch: Some(1), identity: Some("520940ab51181c45bf2ac193af40852b5fcd65f9583bed7a7c0341d4cc61b107"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(60), durable: None, owed: false, epoch: Some(1), identity: Some("8c902c722b168c14c45b652bb8f39bcd12ccbdfcc88121da25c98adb9cb5f3a5"), fence: 1 }), Some(LiveState { holding: true, head: Some(6736), durable: None, owed: false, epoch: Some(1), identity: Some("520940ab51181c45bf2ac193af40852b5fcd65f9583bed7a7c0341d4cc61b107"), fence: 1 })]
+    chaos-rolling-b-7661: {"fleet.live.appended": 6737, "fleet.live.awaited": 6729, "fleet.live.durable": 6737, "fleet.live.install_bytes": 16429070478, "fleet.live.install_image": 2, "fleet.live.install_sent": 8824, "fleet.live.install_unanswered": 4157, "fleet.live.link_lost": 2, "fleet.live.no_session": 4212, "fleet.live.refused": 2, "fleet.live.refused.no_credit": 2, "fleet.live.resolved": 6729, "fleet.live.unanswered": 4179, "fleet.live.whole": 3}
+    chaos-rolling-a-7661: {"fleet.live.held": 61, "fleet.live.hold_refused": 506, "fleet.live.hold_refused.not_a_candidate": 506}
+    chaos-rolling-c-7661: {"fleet.live.held": 6680}
+chaos candidates partitioned in turn mid-stream: 365 samples, 196 heads seen
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-7661 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-7661 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 586}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-7661 refused the owner: {}
+chaos candidates partitioned in turn mid-stream:
+  chaos-rolling-a-7661 partitioned from 159.33543ms to 2.159455292s, caught up after None
+  chaos-rolling-c-7661 partitioned from 6.258520937s to 8.258607779s, caught up after Some(681.479043ms)
+  every write acknowledged: held
+  no write waited for the stopped candidate: 1 violations
+  each healed candidate caught up within the bound: 1 violations
+  6729 writes, 6729 acknowledged: p50 463 us, p99 7661 us, p999 79067 us, max 2274451 us; 7 over 50ms (sent+took): 0.00s+108ms 0.16s+156ms 2.13s+79ms 2.31s+108ms 3.20s+81ms 6.26s+2274ms 8.53s+644ms
+  converged: false: owner Some(LiveState { holding: false, head: Some(6736), durable: Some(6736), owed: false, epoch: Some(1), identity: Some("520940ab51181c45bf2ac193af40852b5fcd65f9583bed7a7c0341d4cc61b107"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(60), durable: None, owed: false, epoch: Some(1), identity: Some("8c902c722b168c14c45b652bb8f39bcd12ccbdfcc88121da25c98adb9cb5f3a5"), fence: 1 }), Some(LiveState { holding: true, head: Some(6736), durable: None, owed: false, epoch: Some(1), identity: Some("520940ab51181c45bf2ac193af40852b5fcd65f9583bed7a7c0341d4cc61b107"), fence: 1 })]
+    chaos-rolling-b-7661: {"fleet.live.appended": 6737, "fleet.live.awaited": 6729, "fleet.live.durable": 6737, "fleet.live.install_bytes": 16429070478, "fleet.live.install_image": 2, "fleet.live.install_sent": 8824, "fleet.live.install_unanswered": 4157, "fleet.live.link_lost": 2, "fleet.live.no_session": 4212, "fleet.live.refused": 2, "fleet.live.refused.no_credit": 2, "fleet.live.resolved": 6729, "fleet.live.unanswered": 4179, "fleet.live.whole": 3}
+    chaos-rolling-a-7661: {"fleet.live.held": 61, "fleet.live.hold_refused": 506, "fleet.live.hold_refused.not_a_candidate": 506}
+    chaos-rolling-c-7661: {"fleet.live.held": 6680}
+  Convergence: 1 violations
+  365 samples, 196 heads seen
+  Agreement: held
+  NoLoss: 1 violations
+  chaos-rolling-b-7661 refused the owner: {}
+  chaos-rolling-a-7661 refused the owner: {"fleet.live.hold_refused.not_a_candidate": 586}
+  chaos-rolling-c-7661 refused the owner: {}
+thread 'candidates_partitioned_in_turn_mid_stream_lose_nothing' (7662) panicked at crates/cli/tests/live_chaos.rs:990:5:
+chaos candidates partitioned in turn mid-stream: no write waited for the stopped candidate: Outcome { file: 6682, sent: 6.258543448s, took: 2.274451193s, refused: None }
+    chaos-rolling-b-7661: {"fleet.live.appended": 6737, "fleet.live.awaited": 6729, "fleet.live.durable": 6737, "fleet.live.install_bytes": 16429070478, "fleet.live.install_image": 2, "fleet.live.install_sent": 8824, "fleet.live.install_unanswered": 4157, "fleet.live.link_lost": 2, "fleet.live.no_session": 4212, "fleet.live.refused": 2, "fleet.live.refused.no_credit": 2, "fleet.live.resolved": 6729, "fleet.live.unanswered": 4179, "fleet.live.whole": 3}
+    chaos-rolling-a-7661: {"fleet.live.held": 61, "fleet.live.hold_refused": 506, "fleet.live.hold_refused.not_a_candidate": 506}
+    chaos-rolling-c-7661: {"fleet.live.held": 6680}
+    candidates_partitioned_in_turn_mid_stream_lose_nothing
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 55.23s
+== run 3 exit 101
+== run 4 at 09:18:44, load 3.39 2.14 1.01
+  borrow-miss lines: 0
+  busy-skip lines: 0
+LANEPROBE step t=2084ms holder=HostId(16773952890502547727) stream=22 bytes=4842 session=true borrow_ms=0 exchange_ms=1000 stragglers_ms=0 answered=false lane_age_ms=1000 lane_sends=1
+LANEPROBE step t=4463ms holder=HostId(6495792092600678372) stream=22 bytes=4846 session=true borrow_ms=0 exchange_ms=1000 stragglers_ms=0 answered=false lane_age_ms=1004 lane_sends=10
+chaos: fleet rolling (Bare) formed and settled: hosts ["16773952890502547727", "6495792092600678372", "6948819170771168027"]
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-11839 partitioned from 179.734217ms to 2.179889935s, caught up after Some(315.083962ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-11839 partitioned from 2.560595128s to 4.560735273s, caught up after Some(534.144805ms)
+chaos candidates partitioned in turn mid-stream: 3669 writes, 3669 acknowledged: p50 776 us, p99 6422 us, p999 51310 us, max 117131 us; 4 over 50ms (sent+took): 0.00s+117ms 2.10s+53ms 3.56s+51ms 5.19s+52ms
+chaos candidates partitioned in turn mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(3673), durable: Some(3673), owed: false, epoch: Some(1), identity: Some("44c074eed6c648602a40a208cc6bdf38eedd004527103e1e78feb68f3eb246d6"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(3673), durable: None, owed: false, epoch: Some(1), identity: Some("44c074eed6c648602a40a208cc6bdf38eedd004527103e1e78feb68f3eb246d6"), fence: 1 }), Some(LiveState { holding: true, head: Some(3673), durable: None, owed: false, epoch: Some(1), identity: Some("44c074eed6c648602a40a208cc6bdf38eedd004527103e1e78feb68f3eb246d6"), fence: 1 })]
+chaos candidates partitioned in turn mid-stream: 99 samples, 78 heads seen
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-11839 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-11839 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-11839 refused the owner: {}
+chaos candidates partitioned in turn mid-stream:
+  chaos-rolling-a-11839 partitioned from 179.734217ms to 2.179889935s, caught up after Some(315.083962ms)
+  chaos-rolling-b-11839 partitioned from 2.560595128s to 4.560735273s, caught up after Some(534.144805ms)
+  every write acknowledged: held
+  no write waited for the stopped candidate: held
+  each healed candidate caught up within the bound: held
+  3669 writes, 3669 acknowledged: p50 776 us, p99 6422 us, p999 51310 us, max 117131 us; 4 over 50ms (sent+took): 0.00s+117ms 2.10s+53ms 3.56s+51ms 5.19s+52ms
+  converged: true: owner Some(LiveState { holding: false, head: Some(3673), durable: Some(3673), owed: false, epoch: Some(1), identity: Some("44c074eed6c648602a40a208cc6bdf38eedd004527103e1e78feb68f3eb246d6"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(3673), durable: None, owed: false, epoch: Some(1), identity: Some("44c074eed6c648602a40a208cc6bdf38eedd004527103e1e78feb68f3eb246d6"), fence: 1 }), Some(LiveState { holding: true, head: Some(3673), durable: None, owed: false, epoch: Some(1), identity: Some("44c074eed6c648602a40a208cc6bdf38eedd004527103e1e78feb68f3eb246d6"), fence: 1 })]
+  Convergence: held
+  99 samples, 78 heads seen
+  Agreement: held
+  NoLoss: held
+  chaos-rolling-c-11839 refused the owner: {}
+  chaos-rolling-a-11839 refused the owner: {}
+  chaos-rolling-b-11839 refused the owner: {}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 6.59s
+== run 4 exit 0
+== run 5 at 09:18:51, load 3.92 2.27 1.06
+  borrow-miss lines: 0
+  busy-skip lines: 0
+LANEPROBE step t=1917ms holder=HostId(16950318975428226584) stream=22 bytes=4840 session=false borrow_ms=893 exchange_ms=0 stragglers_ms=0 answered=false lane_age_ms=893 lane_sends=1
+LANEPROBE step t=4394ms holder=HostId(3784809831122400680) stream=22 bytes=4846 session=true borrow_ms=0 exchange_ms=1000 stragglers_ms=0 answered=false lane_age_ms=1000 lane_sends=1
+LANEPROBE step t=5417ms holder=HostId(16950318975428226584) stream=22 bytes=4004032 session=true borrow_ms=0 exchange_ms=88 stragglers_ms=18 answered=true lane_age_ms=107 lane_sends=1
+chaos: fleet rolling (Bare) formed and settled: hosts ["16950318975428226584", "3784809831122400680", "15985904504793149835"]
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-12183 partitioned from 149.845071ms to 2.149924948s, caught up after Some(306.340485ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-12183 partitioned from 2.491625406s to 4.49172753s, caught up after Some(425.060555ms)
+chaos candidates partitioned in turn mid-stream: 6034 writes, 6034 acknowledged: p50 373 us, p99 7200 us, p999 56414 us, max 165097 us; 8 over 50ms (sent+took): 0.00s+121ms 1.02s+53ms 2.15s+70ms 2.22s+56ms 3.49s+119ms 4.28s+126ms 4.41s+165ms 4.57s+106ms
+chaos candidates partitioned in turn mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(6037), durable: Some(6037), owed: false, epoch: Some(1), identity: Some("44886c921340299b8314c3e3bf4fdbdff0afb7169f928b844bb5fd8fe7c763ac"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(6037), durable: None, owed: false, epoch: Some(1), identity: Some("44886c921340299b8314c3e3bf4fdbdff0afb7169f928b844bb5fd8fe7c763ac"), fence: 1 }), Some(LiveState { holding: true, head: Some(6037), durable: None, owed: false, epoch: Some(1), identity: Some("44886c921340299b8314c3e3bf4fdbdff0afb7169f928b844bb5fd8fe7c763ac"), fence: 1 })]
+chaos candidates partitioned in turn mid-stream: 67 samples, 42 heads seen
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-12183 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-12183 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-12183 refused the owner: {}
+chaos candidates partitioned in turn mid-stream:
+  chaos-rolling-a-12183 partitioned from 149.845071ms to 2.149924948s, caught up after Some(306.340485ms)
+  chaos-rolling-b-12183 partitioned from 2.491625406s to 4.49172753s, caught up after Some(425.060555ms)
+  every write acknowledged: held
+  no write waited for the stopped candidate: held
+  each healed candidate caught up within the bound: held
+  6034 writes, 6034 acknowledged: p50 373 us, p99 7200 us, p999 56414 us, max 165097 us; 8 over 50ms (sent+took): 0.00s+121ms 1.02s+53ms 2.15s+70ms 2.22s+56ms 3.49s+119ms 4.28s+126ms 4.41s+165ms 4.57s+106ms
+  converged: true: owner Some(LiveState { holding: false, head: Some(6037), durable: Some(6037), owed: false, epoch: Some(1), identity: Some("44886c921340299b8314c3e3bf4fdbdff0afb7169f928b844bb5fd8fe7c763ac"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(6037), durable: None, owed: false, epoch: Some(1), identity: Some("44886c921340299b8314c3e3bf4fdbdff0afb7169f928b844bb5fd8fe7c763ac"), fence: 1 }), Some(LiveState { holding: true, head: Some(6037), durable: None, owed: false, epoch: Some(1), identity: Some("44886c921340299b8314c3e3bf4fdbdff0afb7169f928b844bb5fd8fe7c763ac"), fence: 1 })]
+  Convergence: held
+  67 samples, 42 heads seen
+  Agreement: held
+  NoLoss: held
+  chaos-rolling-c-12183 refused the owner: {}
+  chaos-rolling-a-12183 refused the owner: {}
+  chaos-rolling-b-12183 refused the owner: {}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 6.50s
+== run 5 exit 0
+== run 6 at 09:18:57, load 3.77 2.26 1.06
+  borrow-miss lines: 0
+  busy-skip lines: 0
+LANEPROBE step t=3049ms holder=HostId(6337288827771615430) stream=22 bytes=4842 session=true borrow_ms=0 exchange_ms=1000 stragglers_ms=0 answered=false lane_age_ms=1000 lane_sends=1
+LANEPROBE step t=5425ms holder=HostId(2641356428426904410) stream=22 bytes=4846 session=true borrow_ms=0 exchange_ms=1000 stragglers_ms=0 answered=false lane_age_ms=1000 lane_sends=1
+LANEPROBE step t=6687ms holder=HostId(2641356428426904410) stream=23 bytes=31575436 session=true borrow_ms=0 exchange_ms=126 stragglers_ms=0 answered=true lane_age_ms=127 lane_sends=1
+chaos: fleet rolling (Bare) formed and settled: hosts ["12565599207711381962", "6337288827771615430", "2641356428426904410"]
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-12480 partitioned from 213.82205ms to 2.213916843s, caught up after Some(318.577675ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-12480 partitioned from 2.588010327s to 4.588118597s, caught up after Some(367.920376ms)
+chaos candidates partitioned in turn mid-stream: 7605 writes, 7605 acknowledged: p50 390 us, p99 9283 us, p999 41354 us, max 186471 us; 7 over 50ms (sent+took): 0.00s+186ms 0.21s+180ms 2.19s+56ms 2.35s+104ms 3.26s+59ms 3.59s+114ms 4.36s+61ms
+chaos candidates partitioned in turn mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(7608), durable: Some(7608), owed: false, epoch: Some(1), identity: Some("b780047e5196f680bb7d948769629c62780e8718219c76a5171ea1dec155c7ad"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(7608), durable: None, owed: false, epoch: Some(1), identity: Some("b780047e5196f680bb7d948769629c62780e8718219c76a5171ea1dec155c7ad"), fence: 1 }), Some(LiveState { holding: true, head: Some(7608), durable: None, owed: false, epoch: Some(1), identity: Some("b780047e5196f680bb7d948769629c62780e8718219c76a5171ea1dec155c7ad"), fence: 1 })]
+chaos candidates partitioned in turn mid-stream: 70 samples, 45 heads seen
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-12480 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-12480 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-12480 refused the owner: {}
+chaos candidates partitioned in turn mid-stream:
+  chaos-rolling-b-12480 partitioned from 213.82205ms to 2.213916843s, caught up after Some(318.577675ms)
+  chaos-rolling-c-12480 partitioned from 2.588010327s to 4.588118597s, caught up after Some(367.920376ms)
+  every write acknowledged: held
+  no write waited for the stopped candidate: held
+  each healed candidate caught up within the bound: held
+  7605 writes, 7605 acknowledged: p50 390 us, p99 9283 us, p999 41354 us, max 186471 us; 7 over 50ms (sent+took): 0.00s+186ms 0.21s+180ms 2.19s+56ms 2.35s+104ms 3.26s+59ms 3.59s+114ms 4.36s+61ms
+  converged: true: owner Some(LiveState { holding: false, head: Some(7608), durable: Some(7608), owed: false, epoch: Some(1), identity: Some("b780047e5196f680bb7d948769629c62780e8718219c76a5171ea1dec155c7ad"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(7608), durable: None, owed: false, epoch: Some(1), identity: Some("b780047e5196f680bb7d948769629c62780e8718219c76a5171ea1dec155c7ad"), fence: 1 }), Some(LiveState { holding: true, head: Some(7608), durable: None, owed: false, epoch: Some(1), identity: Some("b780047e5196f680bb7d948769629c62780e8718219c76a5171ea1dec155c7ad"), fence: 1 })]
+  Convergence: held
+  70 samples, 45 heads seen
+  Agreement: held
+  NoLoss: held
+  chaos-rolling-a-12480 refused the owner: {}
+  chaos-rolling-b-12480 refused the owner: {}
+  chaos-rolling-c-12480 refused the owner: {}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 7.20s
+== run 6 exit 0
+== run 7 at 09:19:05, load 3.27 2.20 1.05
+  borrow-miss lines: 0
+  busy-skip lines: 0
+LANEPROBE step t=1220ms holder=HostId(700888230672287543) stream=22 bytes=4840 session=true borrow_ms=100 exchange_ms=0 stragglers_ms=0 answered=true lane_age_ms=100 lane_sends=1
+LANEPROBE step t=2140ms holder=HostId(8628000003272813104) stream=22 bytes=4842 session=true borrow_ms=0 exchange_ms=1000 stragglers_ms=0 answered=false lane_age_ms=1000 lane_sends=1
+LANEPROBE step t=4527ms holder=HostId(700888230672287543) stream=22 bytes=4846 session=true borrow_ms=0 exchange_ms=1000 stragglers_ms=0 answered=false lane_age_ms=1000 lane_sends=1
+LANEPROBE step t=5891ms holder=HostId(700888230672287543) stream=23 bytes=34020232 session=true borrow_ms=0 exchange_ms=158 stragglers_ms=0 answered=true lane_age_ms=159 lane_sends=1
+chaos: fleet rolling (Bare) formed and settled: hosts ["8628000003272813104", "700888230672287543", "14742917665160947118"]
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-12897 partitioned from 147.567303ms to 2.147649749s, caught up after Some(357.498378ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-12897 partitioned from 2.533326546s to 4.533417111s, caught up after Some(393.210646ms)
+chaos candidates partitioned in turn mid-stream: 7993 writes, 7993 acknowledged: p50 338 us, p99 1530 us, p999 95522 us, max 257989 us; 14 over 50ms (sent+took): 0.00s+125ms 0.15s+184ms 2.04s+51ms 2.33s+111ms 3.53s+258ms 3.79s+92ms 3.88s+96ms 3.98s+137ms 4.12s+92ms 4.21s+92ms 4.30s+134ms 4.43s+89ms 4.52s+145ms 4.67s+58ms
+chaos candidates partitioned in turn mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(7996), durable: Some(7996), owed: false, epoch: Some(1), identity: Some("2c5dcef085f5c14838db603e39f540e6c11a3fc053256f16c35c8ddb9eb263ea"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(7996), durable: None, owed: false, epoch: Some(1), identity: Some("2c5dcef085f5c14838db603e39f540e6c11a3fc053256f16c35c8ddb9eb263ea"), fence: 1 }), Some(LiveState { holding: true, head: Some(7996), durable: None, owed: false, epoch: Some(1), identity: Some("2c5dcef085f5c14838db603e39f540e6c11a3fc053256f16c35c8ddb9eb263ea"), fence: 1 })]
+chaos candidates partitioned in turn mid-stream: 69 samples, 43 heads seen
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-12897 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-12897 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-12897 refused the owner: {}
+chaos candidates partitioned in turn mid-stream:
+  chaos-rolling-a-12897 partitioned from 147.567303ms to 2.147649749s, caught up after Some(357.498378ms)
+  chaos-rolling-b-12897 partitioned from 2.533326546s to 4.533417111s, caught up after Some(393.210646ms)
+  every write acknowledged: held
+  no write waited for the stopped candidate: held
+  each healed candidate caught up within the bound: held
+  7993 writes, 7993 acknowledged: p50 338 us, p99 1530 us, p999 95522 us, max 257989 us; 14 over 50ms (sent+took): 0.00s+125ms 0.15s+184ms 2.04s+51ms 2.33s+111ms 3.53s+258ms 3.79s+92ms 3.88s+96ms 3.98s+137ms 4.12s+92ms 4.21s+92ms 4.30s+134ms 4.43s+89ms 4.52s+145ms 4.67s+58ms
+  converged: true: owner Some(LiveState { holding: false, head: Some(7996), durable: Some(7996), owed: false, epoch: Some(1), identity: Some("2c5dcef085f5c14838db603e39f540e6c11a3fc053256f16c35c8ddb9eb263ea"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(7996), durable: None, owed: false, epoch: Some(1), identity: Some("2c5dcef085f5c14838db603e39f540e6c11a3fc053256f16c35c8ddb9eb263ea"), fence: 1 }), Some(LiveState { holding: true, head: Some(7996), durable: None, owed: false, epoch: Some(1), identity: Some("2c5dcef085f5c14838db603e39f540e6c11a3fc053256f16c35c8ddb9eb263ea"), fence: 1 })]
+  Convergence: held
+  69 samples, 43 heads seen
+  Agreement: held
+  NoLoss: held
+  chaos-rolling-c-12897 refused the owner: {}
+  chaos-rolling-a-12897 refused the owner: {}
+  chaos-rolling-b-12897 refused the owner: {}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 6.36s
+== run 7 exit 0
+== run 8 at 09:19:11, load 3.17 2.20 1.06
+  borrow-miss lines: 0
+  busy-skip lines: 0
+LANEPROBE step t=1715ms holder=HostId(7884694704987599207) stream=22 bytes=5088 session=false borrow_ms=682 exchange_ms=0 stragglers_ms=0 answered=false lane_age_ms=682 lane_sends=1
+LANEPROBE step t=3478ms holder=HostId(7884694704987599207) stream=23 bytes=26040722 session=true borrow_ms=0 exchange_ms=115 stragglers_ms=0 answered=true lane_age_ms=116 lane_sends=1
+LANEPROBE step t=4566ms holder=HostId(13113879549156446890) stream=22 bytes=4846 session=true borrow_ms=0 exchange_ms=1000 stragglers_ms=0 answered=false lane_age_ms=1000 lane_sends=1
+LANEPROBE step t=5091ms holder=HostId(7884694704987599207) stream=22 bytes=4846 session=true borrow_ms=0 exchange_ms=85 stragglers_ms=24 answered=true lane_age_ms=109 lane_sends=1
+LANEPROBE step t=5367ms holder=HostId(7884694704987599207) stream=22 bytes=4846 session=true borrow_ms=0 exchange_ms=84 stragglers_ms=25 answered=true lane_age_ms=109 lane_sends=1
+LANEPROBE step t=5654ms holder=HostId(7884694704987599207) stream=22 bytes=4846 session=true borrow_ms=0 exchange_ms=92 stragglers_ms=27 answered=true lane_age_ms=119 lane_sends=1
+LANEPROBE step t=6085ms holder=HostId(13113879549156446890) stream=23 bytes=39629518 session=true borrow_ms=0 exchange_ms=198 stragglers_ms=0 answered=true lane_age_ms=199 lane_sends=1
+chaos: fleet rolling (Bare) formed and settled: hosts ["7884694704987599207", "10487849568796561173", "13113879549156446890"]
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-13217 partitioned from 184.10318ms to 2.184268276s, caught up after Some(372.346188ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-13217 partitioned from 2.643830877s to 4.643976487s, caught up after Some(540.891283ms)
+chaos candidates partitioned in turn mid-stream: 9304 writes, 9304 acknowledged: p50 319 us, p99 1876 us, p999 109434 us, max 276051 us; 13 over 50ms (sent+took): 0.00s+109ms 2.11s+88ms 2.30s+161ms 3.19s+57ms 3.64s+276ms 3.92s+114ms 4.03s+165ms 4.20s+111ms 4.31s+165ms 4.47s+110ms 4.59s+180ms 4.76s+115ms 4.88s+97ms
+chaos candidates partitioned in turn mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(9307), durable: Some(9307), owed: false, epoch: Some(1), identity: Some("5ee7624318e37c06e50ab53a6a52fa2a61babd923a20eafbf5803adaa57d51a1"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(9307), durable: None, owed: false, epoch: Some(1), identity: Some("5ee7624318e37c06e50ab53a6a52fa2a61babd923a20eafbf5803adaa57d51a1"), fence: 1 }), Some(LiveState { holding: true, head: Some(9307), durable: None, owed: false, epoch: Some(1), identity: Some("5ee7624318e37c06e50ab53a6a52fa2a61babd923a20eafbf5803adaa57d51a1"), fence: 1 })]
+chaos candidates partitioned in turn mid-stream: 62 samples, 45 heads seen
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-13217 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-13217 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-13217 refused the owner: {}
+chaos candidates partitioned in turn mid-stream:
+  chaos-rolling-a-13217 partitioned from 184.10318ms to 2.184268276s, caught up after Some(372.346188ms)
+  chaos-rolling-c-13217 partitioned from 2.643830877s to 4.643976487s, caught up after Some(540.891283ms)
+  every write acknowledged: held
+  no write waited for the stopped candidate: held
+  each healed candidate caught up within the bound: held
+  9304 writes, 9304 acknowledged: p50 319 us, p99 1876 us, p999 109434 us, max 276051 us; 13 over 50ms (sent+took): 0.00s+109ms 2.11s+88ms 2.30s+161ms 3.19s+57ms 3.64s+276ms 3.92s+114ms 4.03s+165ms 4.20s+111ms 4.31s+165ms 4.47s+110ms 4.59s+180ms 4.76s+115ms 4.88s+97ms
+  converged: true: owner Some(LiveState { holding: false, head: Some(9307), durable: Some(9307), owed: false, epoch: Some(1), identity: Some("5ee7624318e37c06e50ab53a6a52fa2a61babd923a20eafbf5803adaa57d51a1"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(9307), durable: None, owed: false, epoch: Some(1), identity: Some("5ee7624318e37c06e50ab53a6a52fa2a61babd923a20eafbf5803adaa57d51a1"), fence: 1 }), Some(LiveState { holding: true, head: Some(9307), durable: None, owed: false, epoch: Some(1), identity: Some("5ee7624318e37c06e50ab53a6a52fa2a61babd923a20eafbf5803adaa57d51a1"), fence: 1 })]
+  Convergence: held
+  62 samples, 45 heads seen
+  Agreement: held
+  NoLoss: held
+  chaos-rolling-b-13217 refused the owner: {}
+  chaos-rolling-a-13217 refused the owner: {}
+  chaos-rolling-c-13217 refused the owner: {}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 6.55s
+== run 8 exit 0
+== run 9 at 09:19:18, load 2.91 2.18 1.06
+  borrow-miss lines: 0
+  busy-skip lines: 0
+LANEPROBE step t=2076ms holder=HostId(10030093379290728714) stream=22 bytes=4842 session=true borrow_ms=0 exchange_ms=1000 stragglers_ms=0 answered=false lane_age_ms=1000 lane_sends=1
+LANEPROBE step t=4421ms holder=HostId(4546972641488341677) stream=22 bytes=4846 session=true borrow_ms=0 exchange_ms=1000 stragglers_ms=0 answered=false lane_age_ms=1000 lane_sends=1
+LANEPROBE step t=5262ms holder=HostId(10030093379290728714) stream=22 bytes=4830286 session=true borrow_ms=0 exchange_ms=92 stragglers_ms=17 answered=true lane_age_ms=110 lane_sends=1
+LANEPROBE step t=5719ms holder=HostId(4546972641488341677) stream=23 bytes=23800166 session=true borrow_ms=0 exchange_ms=102 stragglers_ms=0 answered=true lane_age_ms=103 lane_sends=1
+chaos: fleet rolling (Bare) formed and settled: hosts ["10030093379290728714", "4546972641488341677", "9844550922030663991"]
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-13502 partitioned from 192.713869ms to 2.19282876s, caught up after Some(290.324345ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-13502 partitioned from 2.539688494s to 4.539802371s, caught up after Some(435.671967ms)
+chaos candidates partitioned in turn mid-stream: 5805 writes, 5805 acknowledged: p50 430 us, p99 6767 us, p999 64372 us, max 143551 us; 9 over 50ms (sent+took): 0.00s+144ms 2.13s+59ms 3.54s+121ms 4.23s+139ms 4.37s+104ms 4.47s+60ms 4.53s+64ms 4.59s+61ms 4.65s+64ms
+chaos candidates partitioned in turn mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(5808), durable: Some(5808), owed: false, epoch: Some(1), identity: Some("cd04f9104063e0ad443a523443b46b4b76e27873316709961ea12377066c0a78"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(5808), durable: None, owed: false, epoch: Some(1), identity: Some("cd04f9104063e0ad443a523443b46b4b76e27873316709961ea12377066c0a78"), fence: 1 }), Some(LiveState { holding: true, head: Some(5808), durable: None, owed: false, epoch: Some(1), identity: Some("cd04f9104063e0ad443a523443b46b4b76e27873316709961ea12377066c0a78"), fence: 1 })]
+chaos candidates partitioned in turn mid-stream: 72 samples, 49 heads seen
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-13502 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-13502 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-13502 refused the owner: {}
+chaos candidates partitioned in turn mid-stream:
+  chaos-rolling-a-13502 partitioned from 192.713869ms to 2.19282876s, caught up after Some(290.324345ms)
+  chaos-rolling-b-13502 partitioned from 2.539688494s to 4.539802371s, caught up after Some(435.671967ms)
+  every write acknowledged: held
+  no write waited for the stopped candidate: held
+  each healed candidate caught up within the bound: held
+  5805 writes, 5805 acknowledged: p50 430 us, p99 6767 us, p999 64372 us, max 143551 us; 9 over 50ms (sent+took): 0.00s+144ms 2.13s+59ms 3.54s+121ms 4.23s+139ms 4.37s+104ms 4.47s+60ms 4.53s+64ms 4.59s+61ms 4.65s+64ms
+  converged: true: owner Some(LiveState { holding: false, head: Some(5808), durable: Some(5808), owed: false, epoch: Some(1), identity: Some("cd04f9104063e0ad443a523443b46b4b76e27873316709961ea12377066c0a78"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(5808), durable: None, owed: false, epoch: Some(1), identity: Some("cd04f9104063e0ad443a523443b46b4b76e27873316709961ea12377066c0a78"), fence: 1 }), Some(LiveState { holding: true, head: Some(5808), durable: None, owed: false, epoch: Some(1), identity: Some("cd04f9104063e0ad443a523443b46b4b76e27873316709961ea12377066c0a78"), fence: 1 })]
+  Convergence: held
+  72 samples, 49 heads seen
+  Agreement: held
+  NoLoss: held
+  chaos-rolling-c-13502 refused the owner: {}
+  chaos-rolling-a-13502 refused the owner: {}
+  chaos-rolling-b-13502 refused the owner: {}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 6.27s
+== run 9 exit 0
+== run 10 at 09:19:24, load 2.76 2.16 1.06
+  borrow-miss lines: 0
+  busy-skip lines: 0
+LANEPROBE step t=1122ms holder=HostId(11680286435454101134) stream=22 bytes=4840 session=true borrow_ms=100 exchange_ms=0 stragglers_ms=0 answered=true lane_age_ms=100 lane_sends=1
+LANEPROBE step t=2044ms holder=HostId(8306238235755232754) stream=22 bytes=4842 session=true borrow_ms=0 exchange_ms=1000 stragglers_ms=0 answered=false lane_age_ms=1000 lane_sends=1
+LANEPROBE step t=4437ms holder=HostId(11680286435454101134) stream=22 bytes=4846 session=true borrow_ms=0 exchange_ms=1000 stragglers_ms=0 answered=false lane_age_ms=1000 lane_sends=1
+LANEPROBE step t=5838ms holder=HostId(11680286435454101134) stream=23 bytes=34229132 session=true borrow_ms=0 exchange_ms=167 stragglers_ms=0 answered=true lane_age_ms=168 lane_sends=1
+chaos: fleet rolling (Bare) formed and settled: hosts ["8306238235755232754", "17008935608416294319", "11680286435454101134"]
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-13809 partitioned from 158.939552ms to 2.159022366s, caught up after Some(364.716424ms)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-13809 partitioned from 2.552958289s to 4.553043925s, caught up after Some(430.24952ms)
+chaos candidates partitioned in turn mid-stream: 8034 writes, 8034 acknowledged: p50 329 us, p99 1467 us, p999 99766 us, max 233549 us; 16 over 50ms (sent+took): 0.00s+137ms 0.16s+183ms 2.15s+72ms 2.34s+127ms 3.23s+51ms 3.55s+234ms 3.79s+100ms 3.89s+146ms 4.03s+98ms 4.13s+98ms 4.23s+96ms 4.33s+142ms 4.47s+95ms 4.56s+100ms 4.66s+100ms 4.76s+57ms
+chaos candidates partitioned in turn mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(8037), durable: Some(8037), owed: false, epoch: Some(1), identity: Some("0b1488f660a1b415c95f0315b9381f995102b8f9c4b43972c5318e6c05cabceb"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(8037), durable: None, owed: false, epoch: Some(1), identity: Some("0b1488f660a1b415c95f0315b9381f995102b8f9c4b43972c5318e6c05cabceb"), fence: 1 }), Some(LiveState { holding: true, head: Some(8037), durable: None, owed: false, epoch: Some(1), identity: Some("0b1488f660a1b415c95f0315b9381f995102b8f9c4b43972c5318e6c05cabceb"), fence: 1 })]
+chaos candidates partitioned in turn mid-stream: 70 samples, 42 heads seen
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-13809 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-13809 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-13809 refused the owner: {}
+chaos candidates partitioned in turn mid-stream:
+  chaos-rolling-a-13809 partitioned from 158.939552ms to 2.159022366s, caught up after Some(364.716424ms)
+  chaos-rolling-c-13809 partitioned from 2.552958289s to 4.553043925s, caught up after Some(430.24952ms)
+  every write acknowledged: held
+  no write waited for the stopped candidate: held
+  each healed candidate caught up within the bound: held
+  8034 writes, 8034 acknowledged: p50 329 us, p99 1467 us, p999 99766 us, max 233549 us; 16 over 50ms (sent+took): 0.00s+137ms 0.16s+183ms 2.15s+72ms 2.34s+127ms 3.23s+51ms 3.55s+234ms 3.79s+100ms 3.89s+146ms 4.03s+98ms 4.13s+98ms 4.23s+96ms 4.33s+142ms 4.47s+95ms 4.56s+100ms 4.66s+100ms 4.76s+57ms
+  converged: true: owner Some(LiveState { holding: false, head: Some(8037), durable: Some(8037), owed: false, epoch: Some(1), identity: Some("0b1488f660a1b415c95f0315b9381f995102b8f9c4b43972c5318e6c05cabceb"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(8037), durable: None, owed: false, epoch: Some(1), identity: Some("0b1488f660a1b415c95f0315b9381f995102b8f9c4b43972c5318e6c05cabceb"), fence: 1 }), Some(LiveState { holding: true, head: Some(8037), durable: None, owed: false, epoch: Some(1), identity: Some("0b1488f660a1b415c95f0315b9381f995102b8f9c4b43972c5318e6c05cabceb"), fence: 1 })]
+  Convergence: held
+  70 samples, 42 heads seen
+  Agreement: held
+  NoLoss: held
+  chaos-rolling-b-13809 refused the owner: {}
+  chaos-rolling-a-13809 refused the owner: {}
+  chaos-rolling-c-13809 refused the owner: {}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 6.26s
+== run 10 exit 0
+== quiet 1 at 09:19:30, load 2.62 2.14 1.06
+  borrow-miss lines: 0
+  busy-skip lines: 0
+LANEPROBE step t=1122ms holder=HostId(2493433425246954081) stream=22 bytes=4840 session=true borrow_ms=99 exchange_ms=0 stragglers_ms=0 answered=true lane_age_ms=100 lane_sends=1
+chaos: fleet quiet (Bare) formed and settled: hosts ["2493433425246954081", "8309155398496782899", "7803503924544257726"]
+chaos writes on a quiet fleet: 12199 writes, 12199 acknowledged: p50 473 us, p99 4973 us, p999 14799 us, max 111853 us; 5 over 50ms (sent+took): 0.00s+112ms 2.11s+59ms 5.21s+60ms 7.28s+75ms 8.32s+63ms
+chaos writes on a quiet fleet: converged: true: owner Some(LiveState { holding: false, head: Some(12207), durable: Some(12207), owed: false, epoch: Some(1), identity: Some("47d4f032641db09d4fb7aae6c82d778afd0a8b8f17d47a62feeef306efbe0527"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(12207), durable: None, owed: false, epoch: Some(1), identity: Some("47d4f032641db09d4fb7aae6c82d778afd0a8b8f17d47a62feeef306efbe0527"), fence: 1 }), Some(LiveState { holding: true, head: Some(12207), durable: None, owed: false, epoch: Some(1), identity: Some("47d4f032641db09d4fb7aae6c82d778afd0a8b8f17d47a62feeef306efbe0527"), fence: 1 })]
+chaos writes on a quiet fleet: 880 samples, 829 heads seen
+chaos writes on a quiet fleet: chaos-quiet-b-14121 refused the owner: {}
+chaos writes on a quiet fleet: chaos-quiet-a-14121 refused the owner: {}
+chaos writes on a quiet fleet: chaos-quiet-c-14121 refused the owner: {}
+chaos writes on a quiet fleet:
+  every write acknowledged: held
+  12199 writes, 12199 acknowledged: p50 473 us, p99 4973 us, p999 14799 us, max 111853 us; 5 over 50ms (sent+took): 0.00s+112ms 2.11s+59ms 5.21s+60ms 7.28s+75ms 8.32s+63ms
+  converged: true: owner Some(LiveState { holding: false, head: Some(12207), durable: Some(12207), owed: false, epoch: Some(1), identity: Some("47d4f032641db09d4fb7aae6c82d778afd0a8b8f17d47a62feeef306efbe0527"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(12207), durable: None, owed: false, epoch: Some(1), identity: Some("47d4f032641db09d4fb7aae6c82d778afd0a8b8f17d47a62feeef306efbe0527"), fence: 1 }), Some(LiveState { holding: true, head: Some(12207), durable: None, owed: false, epoch: Some(1), identity: Some("47d4f032641db09d4fb7aae6c82d778afd0a8b8f17d47a62feeef306efbe0527"), fence: 1 })]
+  Convergence: held
+  880 samples, 829 heads seen
+  Agreement: held
+  NoLoss: held
+  chaos-quiet-b-14121 refused the owner: {}
+  chaos-quiet-a-14121 refused the owner: {}
+  chaos-quiet-c-14121 refused the owner: {}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 11.57s
+== quiet 1 exit 0
+== quiet 2 at 09:19:42, load 3.29 2.30 1.13
+  borrow-miss lines: 0
+  busy-skip lines: 0
+LANEPROBE step t=1140ms holder=HostId(7453694896259633664) stream=22 bytes=4840 session=true borrow_ms=102 exchange_ms=0 stragglers_ms=0 answered=true lane_age_ms=102 lane_sends=1
+chaos: fleet quiet (Bare) formed and settled: hosts ["1055408773344968304", "14868302736972553379", "7453694896259633664"]
+chaos writes on a quiet fleet: 11241 writes, 11241 acknowledged: p50 486 us, p99 5278 us, p999 26523 us, max 117763 us; 4 over 50ms (sent+took): 0.01s+118ms 3.16s+71ms 4.19s+64ms 4.26s+71ms
+chaos writes on a quiet fleet: converged: true: owner Some(LiveState { holding: false, head: Some(11249), durable: Some(11249), owed: false, epoch: Some(1), identity: Some("6a72478d7267adf0a9c2c5330f7b26c30ec99f4210f2aece706c04c579455c32"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(11249), durable: None, owed: false, epoch: Some(1), identity: Some("6a72478d7267adf0a9c2c5330f7b26c30ec99f4210f2aece706c04c579455c32"), fence: 1 }), Some(LiveState { holding: true, head: Some(11249), durable: None, owed: false, epoch: Some(1), identity: Some("6a72478d7267adf0a9c2c5330f7b26c30ec99f4210f2aece706c04c579455c32"), fence: 1 })]
+chaos writes on a quiet fleet: 854 samples, 800 heads seen
+chaos writes on a quiet fleet: chaos-quiet-b-15194 refused the owner: {}
+chaos writes on a quiet fleet: chaos-quiet-a-15194 refused the owner: {}
+chaos writes on a quiet fleet: chaos-quiet-c-15194 refused the owner: {}
+chaos writes on a quiet fleet:
+  every write acknowledged: held
+  11241 writes, 11241 acknowledged: p50 486 us, p99 5278 us, p999 26523 us, max 117763 us; 4 over 50ms (sent+took): 0.01s+118ms 3.16s+71ms 4.19s+64ms 4.26s+71ms
+  converged: true: owner Some(LiveState { holding: false, head: Some(11249), durable: Some(11249), owed: false, epoch: Some(1), identity: Some("6a72478d7267adf0a9c2c5330f7b26c30ec99f4210f2aece706c04c579455c32"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(11249), durable: None, owed: false, epoch: Some(1), identity: Some("6a72478d7267adf0a9c2c5330f7b26c30ec99f4210f2aece706c04c579455c32"), fence: 1 }), Some(LiveState { holding: true, head: Some(11249), durable: None, owed: false, epoch: Some(1), identity: Some("6a72478d7267adf0a9c2c5330f7b26c30ec99f4210f2aece706c04c579455c32"), fence: 1 })]
+  Convergence: held
+  854 samples, 800 heads seen
+  Agreement: held
+  NoLoss: held
+  chaos-quiet-b-15194 refused the owner: {}
+  chaos-quiet-a-15194 refused the owner: {}
+  chaos-quiet-c-15194 refused the owner: {}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 11.63s
+== quiet 2 exit 0
+== quiet 3 at 09:19:54, load 3.55 2.40 1.18
+  borrow-miss lines: 0
+  busy-skip lines: 0
+LANEPROBE step t=1125ms holder=HostId(2126362800503542286) stream=22 bytes=4840 session=true borrow_ms=99 exchange_ms=1 stragglers_ms=0 answered=true lane_age_ms=100 lane_sends=1
+chaos: fleet quiet (Bare) formed and settled: hosts ["8499223269708790645", "2126362800503542286", "16791608738076415801"]
+chaos writes on a quiet fleet: 4634 writes, 4634 acknowledged: p50 941 us, p99 10788 us, p999 37163 us, max 137148 us; 1 over 50ms (sent+took): 0.00s+137ms
+chaos writes on a quiet fleet: converged: true: owner Some(LiveState { holding: false, head: Some(4642), durable: Some(4642), owed: false, epoch: Some(1), identity: Some("c223bf0e02f4ee1c8d6f0ccdf806f8e6b4c2897110d85c119ac876fe743a255f"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(4642), durable: None, owed: false, epoch: Some(1), identity: Some("c223bf0e02f4ee1c8d6f0ccdf806f8e6b4c2897110d85c119ac876fe743a255f"), fence: 1 }), Some(LiveState { holding: true, head: Some(4642), durable: None, owed: false, epoch: Some(1), identity: Some("c223bf0e02f4ee1c8d6f0ccdf806f8e6b4c2897110d85c119ac876fe743a255f"), fence: 1 })]
+chaos writes on a quiet fleet: 726 samples, 677 heads seen
+chaos writes on a quiet fleet: chaos-quiet-c-16238 refused the owner: {}
+chaos writes on a quiet fleet: chaos-quiet-a-16238 refused the owner: {}
+chaos writes on a quiet fleet: chaos-quiet-b-16238 refused the owner: {}
+chaos writes on a quiet fleet:
+  every write acknowledged: held
+  4634 writes, 4634 acknowledged: p50 941 us, p99 10788 us, p999 37163 us, max 137148 us; 1 over 50ms (sent+took): 0.00s+137ms
+  converged: true: owner Some(LiveState { holding: false, head: Some(4642), durable: Some(4642), owed: false, epoch: Some(1), identity: Some("c223bf0e02f4ee1c8d6f0ccdf806f8e6b4c2897110d85c119ac876fe743a255f"), fence: 1 }); candidates [Some(LiveState { holding: true, head: Some(4642), durable: None, owed: false, epoch: Some(1), identity: Some("c223bf0e02f4ee1c8d6f0ccdf806f8e6b4c2897110d85c119ac876fe743a255f"), fence: 1 }), Some(LiveState { holding: true, head: Some(4642), durable: None, owed: false, epoch: Some(1), identity: Some("c223bf0e02f4ee1c8d6f0ccdf806f8e6b4c2897110d85c119ac876fe743a255f"), fence: 1 })]
+  Convergence: held
+  726 samples, 677 heads seen
+  Agreement: held
+  NoLoss: held
+  chaos-quiet-c-16238 refused the owner: {}
+  chaos-quiet-a-16238 refused the owner: {}
+  chaos-quiet-b-16238 refused the owner: {}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 11.38s
+== quiet 3 exit 0
