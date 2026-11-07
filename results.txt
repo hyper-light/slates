@@ -1,0 +1,12 @@
+tested 9d9ca24e0019355dafb75588910c9793a3b75d6e variant after on aarch64, 4 cpus
+held exit 0 176s
+held-again exit 0 93s
+wire exit 0 9s
+owed-model exit 0 12s
+db exit 0 32s
+client exit 0 66s
+server-lib exit 0 29s
+server exit 0 76s
+fleet-forward exit 0 136s
+cli exit 0 45s
+clippy exit 0 65s
