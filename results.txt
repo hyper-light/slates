@@ -1,0 +1,56 @@
+runner windows-11-arm, 4 CPUs, Sat Nov  7 00:35:17 UTC 2026, commit 1ac4d968
+== fix quiet round 1 at 00:35:17
+a bootstrap with its control shard starved: Ok(Acknowledged) after 1.5171001s
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.0018096s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.92s
+== fix quiet round 2 at 00:35:23
+a bootstrap with its control shard starved: Ok(Acknowledged) after 1.5154523s
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.0055392s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.91s
+== fix quiet round 3 at 00:35:28
+a bootstrap with its control shard starved: Ok(Acknowledged) after 1.513505s
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.0068142s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.90s
+== fix busy (two spinners a CPU) round 1 at 00:35:36
+a bootstrap with its control shard starved: Ok(Acknowledged) after 1.6022813s
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.0420982s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.69s
+== fix busy (two spinners a CPU) round 2 at 00:35:48
+a bootstrap with its control shard starved: Ok(Acknowledged) after 1.5302343s
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.0626275s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.76s
+== fix busy (two spinners a CPU) round 3 at 00:36:01
+a bootstrap with its control shard starved: Ok(Acknowledged) after 1.5973963s
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.0427922s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.91s
+== cargo test --locked -q -p slates-server --lib
+verbs::tests::a_landing_of_a_named_snapshot_presents_that_snapshot_whatever_the_head_became --- FAILED
+verbs::tests::a_presentation_past_the_bound_is_refused_and_changes_nothing --- FAILED
+thread 'slates-shard-0' (6776) panicked at crates\server\src\verbs.rs:11541:18:
+thread 'verbs::tests::a_landing_of_a_named_snapshot_presents_that_snapshot_whatever_the_head_became' (4972) panicked at crates\server\src\daemon.rs:5123:12:
+thread 'slates-shard-0' (2192) panicked at crates\server\src\verbs.rs:11434:9:
+thread 'verbs::tests::a_presentation_past_the_bound_is_refused_and_changes_nothing' (10304) panicked at crates\server\src\daemon.rs:5123:12:
+    verbs::tests::a_landing_of_a_named_snapshot_presents_that_snapshot_whatever_the_head_became
+    verbs::tests::a_presentation_past_the_bound_is_refused_and_changes_nothing
+test result: FAILED. 185 passed; 2 failed; 2 ignored; 0 measured; 0 filtered out; finished in 1.74s
+== exit 101
+== cargo test --locked -q -p slates-server --test observe
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.16s
+== exit 0
+== cargo test --locked -q -p slates-server --test recovery
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-server --test liveness -- --test-threads=1
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.13s
+== exit 0
+== main's server sources (d61c3be2), the test unchanged: the starved case must fail
+== main quiet round 1 at 00:36:39
+a bootstrap with its control shard starved: Err(Refused(Overloaded { shard: 0 })) after 1.002874s
+thread 'a_bootstrap_whose_control_shard_is_starved_is_acknowledged_past_a_wall_window' (5484) panicked at crates\server\tests\cross_shard_wait.rs:206:3:
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.0099451s
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.91s
+== main quiet round 2 at 00:37:22
+a bootstrap with its control shard starved: Err(Refused(Overloaded { shard: 0 })) after 1.0163475s
+thread 'a_bootstrap_whose_control_shard_is_starved_is_acknowledged_past_a_wall_window' (5980) panicked at crates\server\tests\cross_shard_wait.rs:206:3:
+a bootstrap with its control shard wedged: Err(Refused(Overloaded { shard: 0 })) after 1.0091883s
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.90s
