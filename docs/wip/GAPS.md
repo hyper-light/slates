@@ -130,6 +130,12 @@
 > An adoption's owner now reaches every shard (`takeover::track_owner_on_every_shard`); 10 of 10 green under the same
 > load. The test now also requires the other survivor to refuse the mount by kind. Bug record
 > `docs/bugs/2026-11-06-a-successor-refused-its-own-volumes-mount-on-a-shard-that-never-learned-the-takeover.md`.
+>
+> **Open again (2026-11-07): the macOS fleet mount was refused `OwnedByAnotherHost` on main CI once more**, after that
+> fix, the supervisor reported, on a main before 4811191a. Main CI on 4811191a (run 42434181746) passed 20 of 20 jobs,
+> the macOS lane among them; 4811191a's A-222 change ends a retired host's remote attachments within a liveness
+> budget, on the same path. One green run does not clear an intermittent: open until a cause is found or many runs are
+> clean (live-fixes).
 
 > **A forming fleet lost its takeovers (live-fixes, 2026-11-05, A-200 and §4.8; three fixed, for raft).** raft's soak
 > found that a fleet acting before it settled could leave a killed owner's volume unserved; the tests were made to wait
@@ -8544,6 +8550,24 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   relay-retirement test. Both are intermittent, are owed root causes, and are not tolerated.
 - Nothing in this day's changes touches session formation or the contact rule: A-127 and A-128 are NFS state and its
   records, and the pressure hold is admission.
+
+### 2026-11-07: a bootstrapped node with no probe session counted itself meshed (fixed)
+
+- **Found** by the supervisor beside 518a1e82 (the same predicate in status). `Daemon::fleet_meshed` judged the mesh
+  over the council configuration's members, which name the bootstrapping node alone until the others are admitted, so a
+  fleet test's formation wait (`form_and_settle`, `assert_fleet_forms`) could pass with no session formed.
+- **Measured:** one node of a three-node manifest, its peers never started, bootstrapped alone: `fleet_meshed` true,
+  council members `[itself]`, two peers unmeshed, no session (red in 38 s). Before the bootstrap the old predicate
+  answered false.
+- **Fixed:** one predicate, `fleet::probe_mesh` over the members held alive, read by `fleet_meshed`, `fleet_unmeshed` and
+  status's `fleet_peers_in_contact`/`fleet_peers_unmeshed`. A fleet that knows another member is meshed only with a peer
+  in contact and every one probed; a laptop is meshed (R8). `assert_fleet_forms` asserts each node of a fleet of several
+  held a probe session when it passed. Tests: `a_node_whose_peers_never_answer_is_never_meshed`,
+  `a_mesh_over_no_peer_is_meshed_only_on_a_laptop`. Bug doc:
+  `docs/bugs/2026-11-07-a-fleet-with-no-probe-session-counted-itself-meshed.md`.
+- **Sibling, reported, not changed:** `verbs.rs` `owned_by_another_host` judges "a node alone" by the configuration's
+  members, so a bootstrapped node answers another member's volume `NotFound` as a laptop would until the others are
+  admitted.
 
 ### 2026-10-09: a refused admission claimed the whole content pool (fixed)
 

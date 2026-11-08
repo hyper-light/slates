@@ -4022,6 +4022,59 @@ pub(crate) fn count_refusal(kind: &'static str) -> u64 {
   .unwrap_or(0)
 }
 
+/// This node's **direct probe mesh** (§4.8): the members its membership holds alive that it keeps direct contact with
+/// ([`keeps_direct_contact_with`]), this node left out, and those of them with no formed probe session yet. Over the
+/// alive membership, not the council's configuration: from the bootstrap until the others are admitted the configuration
+/// names the bootstrapping node alone, so a mesh judged over it was formed over nothing, and a fleet test's formation
+/// wait could pass before any session existed (live-fixes, 2026-11-07, red in 38 s; status showed `in_contact=0
+/// probed=4` the same way, diag-live-fixes-32).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProbeMesh {
+  /// The peers held alive that this node keeps direct contact with.
+  pub(crate) in_contact: Vec<HostId>,
+  /// Those with no formed probe session.
+  pub(crate) unmeshed: Vec<HostId>,
+  /// Every member held alive, this node among them.
+  pub(crate) alive: Vec<HostId>,
+  /// Whether the membership knows any member but this node, alive, suspected or dead.
+  pub(crate) others_known: bool,
+}
+
+impl ProbeMesh {
+  /// Whether the mesh is up: every peer in contact has a formed probe session, and once the membership knows another
+  /// member at least one peer is in contact, so a fleet of several members never counts itself meshed over no peer
+  /// at all (its peers not reached yet, or all of them dead). A laptop, which knows no other member, is meshed (R8).
+  pub(crate) fn meshed(&self) -> bool {
+    self.unmeshed.is_empty() && (!self.others_known || !self.in_contact.is_empty())
+  }
+}
+
+/// This node's probe mesh as it stands ([`ProbeMesh`]).
+pub(crate) fn probe_mesh(state: &ShardState) -> ProbeMesh {
+  let host = state.fleet.host();
+  let membership = state.fleet.membership();
+  let alive = membership.alive();
+  let others_known = alive.iter().any(|member| *member != host)
+    || !membership.suspects().is_empty()
+    || !membership.dead().is_empty();
+  let in_contact: Vec<HostId> = alive
+    .iter()
+    .copied()
+    .filter(|peer| *peer != host && keeps_direct_contact_with(state, *peer))
+    .collect();
+  let unmeshed = in_contact
+    .iter()
+    .copied()
+    .filter(|peer| !state.formed_probe_peers.contains(peer))
+    .collect();
+  ProbeMesh {
+    in_contact,
+    unmeshed,
+    alive,
+    others_known,
+  }
+}
+
 /// Whether this node keeps **direct contact** with `peer` — a record session dialed and kept up for the
 /// coordinator ([`establish_record_link`]) and a SWIM probe of its own: the peers the
 /// coordinator ever borrows a session to ([`take_sessions`]) and whose liveness it must see first-hand. That
@@ -7402,6 +7455,42 @@ pub(crate) async fn forward_batch_over_leader_session(
   stall_ns: u64,
 ) -> Option<slates_cluster::BatchReplies> {
   crate::forward_lane::forward_batch(peer, requests, stall_ns).await
+}
+
+#[cfg(test)]
+mod probe_mesh_tests {
+  use super::{HostId, ProbeMesh};
+
+  /// §4.8, the mesh's predicate at its edges: do judge a laptop (no other member known), a fleet with every
+  /// in-contact peer probed, one with a peer unprobed, and a fleet of several with no peer in contact (none reached, or
+  /// all dead). Expect only the laptop and the fully probed fleet meshed.
+  #[test]
+  fn a_mesh_over_no_peer_is_meshed_only_on_a_laptop() {
+    let (a, b, c) = (HostId(1), HostId(2), HostId(3));
+    let mesh =
+      |in_contact: &[HostId], unmeshed: &[HostId], alive: &[HostId], others_known| ProbeMesh {
+        in_contact: in_contact.to_vec(),
+        unmeshed: unmeshed.to_vec(),
+        alive: alive.to_vec(),
+        others_known,
+      };
+    assert!(
+      mesh(&[], &[], &[a], false).meshed(),
+      "a laptop is meshed (R8)"
+    );
+    assert!(
+      mesh(&[b, c], &[], &[a, b, c], true).meshed(),
+      "every peer probed"
+    );
+    assert!(
+      !mesh(&[b, c], &[c], &[a, b, c], true).meshed(),
+      "c unprobed"
+    );
+    assert!(
+      !mesh(&[], &[], &[a], true).meshed(),
+      "a fleet of several with no peer in contact"
+    );
+  }
 }
 
 #[cfg(test)]
