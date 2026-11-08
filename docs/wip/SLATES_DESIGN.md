@@ -13887,6 +13887,77 @@ GAPS, BENCHMARKS ("The spin policy, measured and rejected").
   keeps its tails under load. The decision rests on Ada's rule that p99 under load is the target. The true spin's change
   is kept on record, not landed (`agents/clients-spin`, a75f9213).
 
+### A-247 — A green's works are served where they live; only the verdict is the green's (accepted 2026-11-07, the supervisor's W1)
+Applied in the same change to: §4.16 (Data model, Submission, Rebase, Laptop degenerate), §4.8 (Lookup: a work's id
+routes to its own shard and node), `crates/server/src/verbs.rs` (`create_work`, `edit`, `edit_staged`, `declare`,
+`submit`, `rebase`, `build_increment`), `crates/server/src/merge_service.rs` (the floor records, `reachable_floor`,
+the verdict call), `crates/server/src/work_files.rs` (the base cache), `crates/server/src/state.rs` (`WorkState`),
+`crates/db` (the `WorkFloor` record), the forward lanes (`crates/server/src/forward_lane.rs`) for a remote node,
+the tests named below, BENCHMARKS, GAPS.
+
+Status: accepted 2026-11-07; built in two steps (one node, then across nodes).
+
+- **Why.** Every operation of a green's works is served on the green's one owner shard, because a work is placed
+  on its green's partition and reads its base from the green's engine there. A closed-loop client's latency is then
+  the clients times the owner's service time (Little's law):
+  - one node, think time 0: 1,000 clients at about 112 µs an operation, p50 35 to 73 ms; 10,000 clients, p50 50 ms
+    (loadtest-scale, the supervisor's baseline);
+  - three nodes at `f = 1`, every verb forwarded: about 500 µs an operation, and at 3,000 clients the accepted
+    submit's p50 411 ms (fixtures, the supervisor's baseline). The owner's CPU was 7 to 8 s a run while its replicas idled, and 893 to 1,000 of 1,000
+    submits were refused `Overloaded` behind its backlog (fixtures, adacachy).
+  Of a rung's operations, edits, reads, rebases and creations are about 92%. None of them needs the green's
+  sequence. Only a submit's verdict does: it must see every accepted increment before it in one order.
+- **The rule.**
+  - *Where a work lives.* A work is created on the shard, and the node, of the client that creates it. Its id
+    routes there, so its edits, its reads, its staging and its submit arrive there.
+  - *Creation.* `CreateWork` asks the green's owner once: may this principal create a work, and at which head.
+    The owner records the work's base as a floor (below) in the same step and answers the head. The work's record is
+    then made on its own partition.
+  - *The work's base.* A work holds the files it changed (A-202's `WorkFiles`). The first time it touches a file it
+    has not changed (an edit, a read, a declare, the seal), its shard fetches that file from the owner as the base
+    holds it: bytes, mode, kind, links. The bytes are paged as the green's reads already are (`content_page_at`), and
+    kept in the work's base cache. A verb that needs a fetch is parked, as `lease_wait` parks one, and run again once
+    the fetch lands, so the verb itself stays one synchronous step with no await. A work's base never changes while
+    the work holds it, so the cache needs no invalidation. It goes with the work's next base (an accept, a rebase) or
+    the work.
+  - *Submission.* The work's shard seals and composes its increment, as `build_increment` does now, over its base
+    cache with W2's planned composition (`compose_volume_planned`), and sends only the increment to the owner. The
+    owner runs the verdict and the commit, records the merge, moves the work's floor to the new head, and answers the
+    verdict. The work's shard resets the work on an accept. The verdict is the green's one serialized step.
+  - *Rebase.* The work's shard sends its increment. The owner maps it through its deltas and answers the changed
+    delta (A-202 part 3's `Rebased::changed`) and the new base, and moves the floor. Nothing about the green
+    changes.
+  - *Floors (loadtest-scale, W3's coupling).* The owner keeps one durable record per live work of its green:
+    the work, its base version, and the node and shard that hold it. The record is made at creation and moved by the
+    work's accept and rebase. It is dropped by the work's destroy, and by the reap of its node or of its client's
+    session. The record survives the owner's restart, being in the partition. `reachable_floor` (W3, `crates/server/src/merge_service.rs`) is the minimum over
+    these records and the green's pins, in place of the bases of the works on the owner's shard alone, so a checkpoint never folds past a live remote work's base. An orphaned
+    record left by a crash between the owner's step and the work's creation is found at the owner's checkpoint:
+    the owner asks the record's shard whether the work exists, on that cold path only. It is dropped when it does
+    not.
+  - *Exactly once.* Each cross-shard or cross-node call is part of a client request with its own completion
+    record. The verdict's increment identity (work, base, ops, post-state) is the engine's retry key, and a retried
+    request meets its record at the work's shard, as A-225 and A-226's tests hold.
+- **Laptop degenerate (R8).** One node with one shard: the work's shard is the owner's, every fetch and verdict call is
+  a direct call (`xshard`'s own-shard path), and the behaviour is today's. The same code, `f = 0`.
+- **What it does not change.** The verdict, its windows, the merge record, the increment's identity and format, the
+  holders' recomputation, and every refusal. They run on the owner as now.
+- **Proven by (failing first where a test of a defect).**
+  - The merge oracles run over both placements and compare every verdict and every file: a work on the owner's
+    shard, on another shard, and on another node. Histories include a length change followed by an edit past it
+    (loadtest-scale's `merge_post_state.rs`).
+  - Floors: a remote work based below the head keeps its base across a checkpoint. Its submit and rebase are judged,
+    not answered `UnknownBase`. The owner's restart keeps the floor. The work's destroy, or its node's reap,
+    releases it, and the next checkpoint folds past it.
+  - Exactly once: an edit and a submit retried across the work's daemon's restart, and across the owner's, answer
+    their records.
+- **Measured (owed):**
+  - the owner's serialized cost per verdict, which is the green's ceiling;
+  - loadtest-scale's one-node rung at 1,000, 3,000 and 10,000 clients, and fixtures' three-node `f = 1` rung at
+    1,000 and 3,000, interleaved against main;
+  - A-225's two-machine measurement with the work on the client's node, where the edit is then local and only the
+    submit crosses the link.
+
 ### A-228 — A daemon's liveness is judged in its shards' own CPU time, by an owned watchdog thread (accepted and built 2026-11-06)
 Applied in the same change to: §4.14 (its status on `daemon.alive`), `crates/server/src/watchdog.rs` (new),
 `crates/server/src/daemon.rs` (`Daemon::start`, `stop_parts`, `control_loop`, `heartbeat_loop`), `crates/cli/src/anchor.rs`
