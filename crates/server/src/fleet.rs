@@ -3253,7 +3253,10 @@ fn content_work(
       (hedge, content_budget_at(hedge, round))
     }
   };
-  let now = state.clock.monotonic_ns();
+  // The clock the first round's dispatch was stamped on (`put_seal_content`). Until 2026-11-08 this read the machine's
+  // boot clock against that shard-driver stamp, so the difference was the machine's uptime and every seal hedged at its
+  // next look, whatever the measured p95 said.
+  let now = futures::now_ns();
   let shard = state.shard;
   let job = seal_jobs(state, track).get_mut(&object)?;
   if job.content.placed(quorum) {
@@ -8067,6 +8070,77 @@ mod tests {
       LearnedOutcome::Restarted { old: seed },
       "first contact retires the non-voting manifest placeholder"
     );
+  }
+
+  /// A seal job for [`the_hedge_waits_out_its_delay_on_the_clock_its_first_round_was_stamped_on`]: its first round
+  /// outstanding since `first_round_at_ns`, nothing acknowledged, its archive ready for a hedge.
+  fn outstanding_seal(candidates: Vec<HostId>, first_round_at_ns: u64) -> crate::head::SealJob {
+    crate::head::SealJob {
+      snapshot: DbSnapshotId::default(),
+      sequence: 1,
+      archiver: None,
+      archive: Some(slates_archive::Archive {
+        base_page_size: 4096,
+        chunk_min: 4096,
+        chunk_max: 4096,
+        created_unix: 0,
+        volume_id: 0,
+        snapshot_id: 0,
+        name_policy_id: 0,
+        unicode_version: 0,
+        root_meta: slates_archive::NodeMeta::default(),
+        manifest: slates_archive::Node::Directory(Vec::new()),
+        chunks: Vec::new(),
+      }),
+      manifest: None,
+      content: Placement {
+        candidates,
+        acked: Vec::new(),
+        mirror_acked: None,
+        joint: Vec::new(),
+      },
+      rounds: 0,
+      first_round_at_ns: Some(first_round_at_ns),
+      healing: false,
+      records_acked: Vec::new(),
+      shipment: None,
+    }
+  }
+
+  /// §4.8 "hedged to the remaining candidates after the measured p95 put latency". Do: on a real shard, a seal whose
+  /// first round was stamped on the shard's dispatch clock just now, with no acknowledgement; judge it with a measured
+  /// p95 of ten seconds, then of one nanosecond. Expect: inside the delay no content round is handed out, so a seal
+  /// that places within it never sends a third copy; past the delay the round is a hedge. Before 2026-11-08 the first
+  /// was judged on the machine's boot clock against the dispatch stamp, the difference was the machine's uptime, and
+  /// every seal hedged at its next look (found by making the delay thirty seconds and seeing the hedge test still pass).
+  #[test]
+  fn the_hedge_waits_out_its_delay_on_the_clock_its_first_round_was_stamped_on() {
+    let (inside, past) = crate::daemon::audit_on_shard(|state| {
+      let object = ObjectId([9; 16]);
+      let quorum = state.fleet.configuration().quorum;
+      let candidates = vec![HostId(1), HostId(2), HostId(3)];
+      let stamped = futures::now_ns();
+      for _ in 0..PUT_LATENCY_WINDOW {
+        state.put_latency.record(10_000 * MS);
+      }
+      state
+        .seals
+        .insert(object, outstanding_seal(candidates.clone(), stamped));
+      let inside = content_work(state, Track::Home, object, quorum, consensus_budget(None))
+        .map(|work| work.hedged);
+      state.put_latency = LatencyWindow::default();
+      for _ in 0..PUT_LATENCY_WINDOW {
+        state.put_latency.record(1);
+      }
+      while futures::now_ns() <= stamped.saturating_add(1) {
+        std::hint::spin_loop();
+      }
+      let past = content_work(state, Track::Home, object, quorum, consensus_budget(None))
+        .map(|work| work.hedged);
+      (inside, past)
+    });
+    assert_eq!(inside, None, "inside the measured delay no round goes out");
+    assert_eq!(past, Some(true), "past the delay the round is a hedge");
   }
 
   /// The hedge delay follows the design's law, by use: one period before any reading (the first seal of a
