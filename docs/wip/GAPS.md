@@ -8932,8 +8932,10 @@ new process. In simulation the session ended one round trip after its first pack
   - An accepting session whose dialer restarted onto another port is not reset, since nothing answers at the old
     port. It ends on its own timers, as before. A restart that rebinds the old port does reset it: a dialer's own
     socket answers strays too.
-  - A peer restarted under another identity, a lost reset, and an older build all fall to loadtest-scale's lane-side
-    check (the peer's generation changed).
+  - A peer restarted under another identity, a lost reset, a silent peer and an older build all fall to
+    loadtest-scale's borrower check. That check is transport-only: at each turn, a session that failed, or one with
+    bytes in flight and no authenticated packet for a liveness budget, is judged dead. The membership offers no signal
+    here: the restarted primary rejoined with the same member id at incarnation 0, and every peer kept it `Alive`.
 
 ### 2026-11-07: a bootstrapped node with no probe session counted itself meshed (fixed)
 

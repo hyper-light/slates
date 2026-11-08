@@ -19618,8 +19618,10 @@ otherwise silent.
 - **The fleet** never puts a reset session back in its slot (`fleet::return_sessions`). It drops the link instead,
   counted as `fleet.link.peer_reset`, and the link task dials the new process at its next pace (one heartbeat). Every
   borrower returns through that one place: the forward lane, live shipping and the coordinator's dispatches.
-  loadtest-scale's lane-side check (the peer's generation changed) stays as the backstop for a lost reset, for a peer
-  restarted under another identity, and for an older build.
+  loadtest-scale's borrower check stays as the backstop for a lost reset, a silent peer, a peer restarted under
+  another identity, and an older build. It is transport-only: at each turn, a session that failed, or one with bytes
+  in flight and no authenticated packet for a liveness budget, is judged dead. The membership offers no signal for
+  this case: the restarted primary rejoined with the same member id at incarnation 0, and every peer kept it `Alive`.
 - **What it does not cover.** An accepting end whose dialer restarted onto another port holds a session no reset can
   end, since nothing answers at the old port. That session ends on its own timers or the link's discovery deadline, as
   before. An accepting end's serve loop counts a reset it does hear (`fleet.serve.peer_reset`).

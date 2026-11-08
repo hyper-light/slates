@@ -10,7 +10,7 @@ to drop the session. No dial counter moved, so this was not the handshake stall 
 its demultiplexer received the client node's packets for the old session. It held no session under that connection id,
 so it dropped each packet, counting it in `unknown_id` and telling no one. On the client node the session looked alive:
 nothing failed, packets went unanswered, and each borrower waited out its own budget before the session went back to
-the slot for the next one. Only the link's discovery deadline, or the lane-side check loadtest-scale is adding,
+the slot for the next one. Only the link's discovery deadline, or the borrower check loadtest-scale is adding,
 eventually dropped it.
 
 **Impact.** Liveness only. Every forwarded request through a peer of a restarted node waited up to 135 s. Nothing was
