@@ -194,6 +194,59 @@ const IDENTITY_KEPT_BYTES: usize = 40;
 /// files' worth between them, with the same again for the increments' framing.
 const UNFOLDED_EDITS: usize = 4;
 
+/// W3, §4.8 recovery. Do: under a played anchor, from a green at version 0, make two works; submit one, accepted as version
+/// 1, so its base rises to 1, then the other, accepted as version 2 over base 0 (they touch different files), so its base
+/// rises to 2 and the reachable floor to 1. Restart over the same anchor. Expect: the recovered green's head is version 2
+/// and both files read their bytes. A chain checkpointed at the floor alone restored the green at version 1 and replayed
+/// version 2, whose recorded base 0 is below the restored history: refused `BaseUnavailable` at replay, and the whole green
+/// fenced, every acknowledged version unreadable.
+#[test]
+fn a_checkpoint_leaves_every_later_entry_a_base_recovery_can_replay() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-chain-below-{}", std::process::id());
+  let config = config(&profile, &instance);
+  let anchor = common::anchor::held_anchor(
+    &format!("chain-below-{}", std::process::id()),
+    &profile,
+    &config,
+  );
+  let first = Daemon::start(&profile, config.clone(), common::anchor::source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let green = client.create_green("chain-green", false).unwrap();
+  let (first_work, _) = client.create_work(green, "first-work").unwrap();
+  let (second_work, _) = client.create_work(green, "second-work").unwrap();
+  client
+    .edit(first_work, "first", 0, 0, &bytes_of(1))
+    .unwrap();
+  client
+    .edit(second_work, "second", 0, 0, &bytes_of(2))
+    .unwrap();
+  assert_eq!(client.submit(first_work).unwrap(), Submitted::Accepted(1));
+  assert_eq!(client.submit(second_work).unwrap(), Submitted::Accepted(2));
+  drop(client);
+  first.stop();
+  let second = Daemon::start(&profile, config, common::anchor::source_of(&anchor)).unwrap();
+  second
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let recovered_head = client.versions(green);
+  let first_bytes = client.read(green, "first", ReadAt::Head);
+  let second_bytes = client.read(green, "second", ReadAt::Head);
+  drop(client);
+  second.stop();
+  assert_eq!(
+    recovered_head.ok(),
+    Some(2),
+    "the recovered head is version 2"
+  );
+  assert_eq!(first_bytes.ok(), Some(bytes_of(1)), "version 1's file");
+  assert_eq!(second_bytes.ok(), Some(bytes_of(2)), "version 2's file");
+}
+
 /// W3, §4.8. Do: on a one-shard daemon with its derived caps, submit 40 versions as above and read the bytes the
 /// partition's snapshot encodes to; submit 160 more and read it again. Expect: it grew by less than four edits' bytes
 /// plus what a checkpoint keeps of each accepted increment (40 bytes): the chain past the checkpoint stays under the
