@@ -87,7 +87,10 @@ compares identity and content at every version.
   dimension), the rebuilt green compared whole at every crash: head, identity at every version, every retained
   version's content, every accepted increment's retry, and every later verdict. A fixed history records every kind of
   effect across a checkpoint above a retained base; two alternating clients fold to at most two entries; hostile bytes
-  are refused typed. **Reverse red-check:** replaying by re-deciding each entry fails four of the five (the oracle with
+  are refused typed. `an_entry_over_a_change_below_its_checkpoint_replays_through_each_base_read`, and a generated step
+  of the same shape: an entry based below a checkpoint on a path that changed between its base and the checkpoint,
+  through each of the verdict's three reads at the base (`content_at` for a length-changing overlap, `content_len_at` in
+  `fits_base`, `history_at` in `special_kind_changed`), each accepted live and replayed whole. **Reverse red-check:** replaying by re-deciding each entry fails five of the six (the oracle with
   the entry refused at the checkpoint).
 
 ## Siblings

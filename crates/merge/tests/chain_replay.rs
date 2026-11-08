@@ -20,7 +20,7 @@ use proptest::prelude::*;
 use slates_merge::chain_entry;
 use slates_merge::checkpoint::Checkpoint;
 use slates_merge::engine::{Green, Increment, Outcome};
-use slates_merge::ops_doc::DocDecodeError;
+use slates_merge::ops_doc::{DocDecodeError, OpKind};
 
 /// Shape: the alphabet's indices the content comparison walks: every path `common::generated::path` can name.
 const PATH_INDICES: u8 = 7;
@@ -36,6 +36,9 @@ enum Step {
   Edit(u8, u8, u8),
   /// Two works make one identical edit of a file over one base: the second is accepted with nothing to do.
   Convergent(u8),
+  /// A path changes, and another work then changes it over the base before that change, through one of the verdict's
+  /// reads at the base ([`BaseRead`]).
+  OverAChange(u8),
   /// An accepted increment, by its position among the accepted, is retried.
   Retry(u8),
   /// A checkpoint is taken this far above the held one, within the live bases.
@@ -51,6 +54,7 @@ fn step() -> impl Strategy<Value = Step> {
       3..=6 => Step::Fresh(first % 8),
       7..=9 => Step::Edit(first, second % 16, third % 8),
       10 => Step::Convergent(first),
+      11 if second.is_multiple_of(2) => Step::OverAChange(first),
       11 => Step::Retry(first),
       12 => Step::Checkpoint(first),
       _ => Step::Crash,
@@ -137,6 +141,30 @@ fn assert_same(
       Outcome::Accepted { version: *version },
       "a retry is answered its original version"
     );
+  }
+}
+
+/// A verdict's read of the green at an increment's base (`crates/merge/src/engine.rs`), each of which a green restored
+/// from a checkpoint above that base cannot answer as the live green did.
+#[derive(Clone, Copy, Debug)]
+enum BaseRead {
+  /// `content_at`: a length-changing op overlapping an intervening change, accepted when it ends where the head is.
+  OverlapBytes,
+  /// `content_len_at` in `fits_base`: an op that fits the file's length at its base, not at the head.
+  FitsLength,
+  /// `history_at` in `special_kind_changed`: a mode set on an IPC node whose metadata changed since its base.
+  SpecialKind,
+}
+
+impl BaseRead {
+  const ALL: [BaseRead; 3] = [
+    BaseRead::OverlapBytes,
+    BaseRead::FitsLength,
+    BaseRead::SpecialKind,
+  ];
+
+  fn of(seed: u8) -> BaseRead {
+    Self::ALL[usize::from(seed) % Self::ALL.len()]
   }
 }
 
@@ -306,6 +334,9 @@ impl History {
           self.submit(&build, base);
         }
       }
+      Step::OverAChange(seed) => {
+        self.over_a_change(BaseRead::of(*seed));
+      }
       Step::Retry(which) => {
         if !self.accepted.is_empty() {
           let (increment, version) = &self.accepted[usize::from(*which) % self.accepted.len()];
@@ -325,6 +356,55 @@ impl History {
       }
       Step::Crash => self.crash(),
     }
+  }
+
+  /// A fresh path made, changed once, then changed again by a work based before that change, through `read`. Returns the
+  /// base the last work was based on. Each of the three is accepted live.
+  fn over_a_change(&mut self, read: BaseRead) -> u64 {
+    let name = format!("over-{}", self.next_id);
+    let mut made = common::Build::new();
+    match read {
+      BaseRead::SpecialKind => {
+        made.special(&name, common::generated::node(2));
+      }
+      BaseRead::OverlapBytes | BaseRead::FitsLength => {
+        made.create(&name, b"0123456789");
+      }
+    }
+    let base = self.base(0);
+    assert!(matches!(self.submit(&made, base), Outcome::Accepted { .. }));
+    if !matches!(read, BaseRead::SpecialKind) {
+      self.fresh.push(name.clone());
+    }
+    let before = self.base(0);
+    let mut changed = common::Build::new();
+    let mut late = common::Build::new();
+    match read {
+      BaseRead::OverlapBytes => {
+        changed.overwrite(&name, 0, b"ab");
+        late
+          .content(OpKind::Delete, &name, 0, b"01")
+          .content(OpKind::Insert, &name, 0, b"ab");
+      }
+      BaseRead::FitsLength => {
+        changed.content(OpKind::Extend, &name, 10, b"XY");
+        late.overwrite(&name, 8, b"zz");
+      }
+      BaseRead::SpecialKind => {
+        changed.special(&name, common::generated::node(4));
+        late.setmode(&name, 0o600);
+      }
+    }
+    assert!(matches!(
+      self.submit(&changed, before),
+      Outcome::Accepted { .. }
+    ));
+    let outcome = self.submit(&late, before);
+    assert!(
+      matches!(outcome, Outcome::Accepted { .. }),
+      "{read:?} over a change is accepted live: {outcome:?}"
+    );
+    before
   }
 
   /// The final crash, and what the history did.
@@ -483,6 +563,35 @@ fn an_entry_based_below_a_checkpoint_replays_across_it() {
     ran.entries_below_a_checkpoint, 1,
     "version 2's entry, based at 0, outlived the checkpoint at 1"
   );
+}
+
+/// A-257: an entry based below a checkpoint, on a path that changed between its base and the checkpoint, through each of
+/// the verdict's three reads at the base (`content_at` for a length-changing overlap, `content_len_at` in `fits_base`,
+/// `history_at` in `special_kind_changed`). Do: for each, make the path, change it, have another work change it over the
+/// base before that change (accepted live), checkpoint at the version between, crash. Expect: the entry outlived the
+/// checkpoint and the rebuilt green equals the live one. Judged again at recovery, a restored green answers each read
+/// as of the checkpoint, not the base: a different verdict.
+#[test]
+fn an_entry_over_a_change_below_its_checkpoint_replays_through_each_base_read() {
+  for read in BaseRead::ALL {
+    let mut history = History::new(&[]);
+    let base = history.over_a_change(read);
+    let checkpoint = base + 1;
+    assert!(
+      checkpoint < history.live.head(),
+      "{read:?}: the late entry is above the checkpoint"
+    );
+    history.checkpoint(checkpoint);
+    assert_eq!(
+      history.durable.held, checkpoint,
+      "{read:?}: the checkpoint was taken"
+    );
+    let ran = history.finish();
+    assert_eq!(
+      ran.entries_below_a_checkpoint, 1,
+      "{read:?}: the late entry, based below the checkpoint, outlived it"
+    );
+  }
 }
 
 /// Two clients taking turns: each is based on its own last version, so every entry's base trails its version, and a
