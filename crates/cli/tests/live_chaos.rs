@@ -966,6 +966,43 @@ struct Sampler<'a> {
   instances: &'a [String],
   volume: &'a str,
   began: Instant,
+  holds: &'a SamplerHolds,
+}
+
+/// A flow's way to take one node out of the [`Sampler`] before it stops that node. A `status` call to a stopped node
+/// returns only when its client gives up, and the flow waits for the sampler at the stream's end, so a holder meant to be
+/// stopped briefly stayed stopped 4 to 6 s, in whole seconds, past the failure detector (diag-live-fixes-44).
+struct SamplerHolds {
+  wanted: Vec<AtomicBool>,
+  idle: Vec<AtomicBool>,
+}
+
+impl SamplerHolds {
+  fn new(nodes: usize) -> SamplerHolds {
+    let flags = || (0..nodes).map(|_| AtomicBool::new(false)).collect();
+    SamplerHolds {
+      wanted: flags(),
+      idle: flags(),
+    }
+  }
+
+  /// Takes `node` out of the sampling, and returns once its thread has no `status` call in flight (within the fleet wait).
+  fn hold(&self, node: usize) {
+    self.wanted[node].store(true, Ordering::Release);
+    let deadline = Instant::now() + FLEET_WAIT;
+    while !self.idle[node].load(Ordering::Acquire) && Instant::now() < deadline {
+      pause();
+    }
+  }
+
+  /// Whether `node` is held; the sampling thread's asking says it has no call in flight.
+  fn held(&self, node: usize) -> bool {
+    let held = self.wanted[node].load(Ordering::Acquire);
+    if held {
+      self.idle[node].store(true, Ordering::Release);
+    }
+    held
+  }
 }
 
 impl Sampler<'_> {
@@ -983,10 +1020,14 @@ impl Sampler<'_> {
           scope.spawn(move || {
             let mut samples = Vec::new();
             while !stop.load(Ordering::Acquire) {
-              samples.extend(self.once(node, instance));
+              if !self.holds.held(node) {
+                samples.extend(self.once(node, instance));
+              }
               pause();
             }
-            samples.extend(self.once(node, instance));
+            if !self.holds.held(node) {
+              samples.extend(self.once(node, instance));
+            }
             samples
           })
         })
@@ -1190,7 +1231,20 @@ fn stream_through<F: FnOnce(&Instant)>(
   files: std::ops::Range<usize>,
   chaos: F,
 ) -> (Vec<Outcome>, Vec<Sample>) {
+  stream_through_holding(instances, owner, volume, files, |began, _| chaos(began))
+}
+
+/// [`stream_through`], for a chaos that stops a node and leaves it stopped past the stream's end: it gets the
+/// [`SamplerHolds`] to take that node out of the sampling first.
+fn stream_through_holding<F: FnOnce(&Instant, &SamplerHolds)>(
+  instances: &[String],
+  owner: &str,
+  volume: &str,
+  files: std::ops::Range<usize>,
+  chaos: F,
+) -> (Vec<Outcome>, Vec<Sample>) {
   let began = Instant::now();
+  let holds = SamplerHolds::new(instances.len());
   let stop_stream = AtomicBool::new(false);
   let stop_sampling = AtomicBool::new(false);
   std::thread::scope(|scope| {
@@ -1199,6 +1253,7 @@ fn stream_through<F: FnOnce(&Instant)>(
         instances,
         volume,
         began,
+        holds: &holds,
       }
       .run(&stop_sampling)
     });
@@ -1222,7 +1277,8 @@ fn stream_through<F: FnOnce(&Instant)>(
     let stop = StopAll(&stop_stream, &stop_sampling);
     // The chaos's own failure is passed on only after the stream is in hand, or a write never answered would hang the
     // scope's join behind it (one run did until its timeout, 2026-11-06).
-    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| chaos(&began))).err();
+    let failed =
+      std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| chaos(&began, &holds))).err();
     drop(stop);
     // A write the daemon never answers would hang the join for good (one run hung 20 minutes, 2026-11-06): past the
     // fleet wait, the fleet is shown whole and its daemons killed, so the client is told and the flow fails.
@@ -2004,12 +2060,14 @@ fn clients_killed_while_their_writes_wait_leave_no_reply_held() {
   let mut verdict = Verdict::new("clients killed while their writes wait");
   let began = Instant::now();
   let stop_sampling = AtomicBool::new(false);
+  let holds = SamplerHolds::new(fleet.instances.len());
   let samples = std::thread::scope(|scope| {
     let sampler = scope.spawn(|| {
       Sampler {
         instances: &fleet.instances,
         volume: &volume,
         began,
+        holds: &holds,
       }
       .run(&stop_sampling)
     });
@@ -3010,8 +3068,15 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
   ));
   let mut roles = None;
   let fleet_cell = std::cell::RefCell::new(&mut fleet);
-  let (outcomes, _samples) =
-    stream_through(&instances, &owner, &volume, 0..STREAM_FILES, |began| {
+  // Read before the stale holder stops: a `status` call to a stopped node returns only when its client gives up.
+  let mut stale_adopted = 0;
+  let mut stale_stopped = None;
+  let (outcomes, _samples) = stream_through_holding(
+    &instances,
+    &owner,
+    &volume,
+    0..STREAM_FILES,
+    |began, holds| {
       after_writes(&owner, &volume, BETWEEN_EVENTS);
       let holders = wait_holders(&fleet_cell.borrow(), &volume, 2);
       // A member that holds none of the log is replaced: its successor joins under a fresh identity. One without a seat
@@ -3061,7 +3126,10 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
         .unwrap();
       roles = Some((current, stale));
       after_writes(&owner, &volume, BETWEEN_EVENTS);
+      stale_adopted = counter(&instances[stale], "fleet.takeover.adopted");
+      holds.hold(stale);
       fleet_cell.borrow().stop(stale);
+      stale_stopped = Some(Instant::now());
       verdict.note(format!(
         "{} stopped at {:?}",
         instances[stale],
@@ -3071,20 +3139,29 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
       // retires it: with the owner's crash that is two failures at f = 1, which the register takeover rightly calls lost
       // (diag-30 run 4, diag-28 run 8: the stale holder's configuration frozen at version 8 while the others moved on).
       after_writes(&owner, &volume, 1);
-    });
+    },
+  );
   let (current, stale) = roles.expect("the flow chose its holders' roles");
   let survivors: Vec<&str> = (0..instances.len())
     .filter(|index| *index != owner_index)
     .map(|index| instances[index].as_str())
     .collect();
-  let adopted_before: u64 = survivors
-    .iter()
-    .map(|survivor| counter(survivor, "fleet.takeover.adopted"))
-    .sum();
+  let adopted_before = stale_adopted
+    + survivors
+      .iter()
+      .filter(|survivor| **survivor != instances[stale].as_str())
+      .map(|survivor| counter(survivor, "fleet.takeover.adopted"))
+      .sum::<u64>();
   // The writes since the stale holder stopped are durable on the owner and `current` alone. Once the stream has stopped
   // (every write answered), the owner is crashed and the stale holder resumed: nothing reaches it any more.
   fleet.kill_node(owner_index);
   fleet.resume(stale);
+  if let Some(stopped) = stale_stopped {
+    verdict.note(format!(
+      "the stale holder stayed stopped {:?}",
+      stopped.elapsed()
+    ));
+  }
   let acknowledged = outcomes
     .iter()
     .filter(|outcome| outcome.refused.is_none())
