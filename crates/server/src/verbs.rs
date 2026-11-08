@@ -17,10 +17,10 @@ use slates_db::register::{HostId, ObjectId, RegionId, RootConfiguration};
 use slates_db::{DbError, Partition};
 use slates_ipc::protocol::{
   AttachRequest, AttachTransport, DaemonReport, Established, FleetReport, FreshnessBasis,
-  GroupReport, HealthSignal, Intent, NamePolicy, PlacedState, ReadAt, ReadWritePolicy, Refusal,
-  RefusalCount, ReplyBody, RequestBody, Scope, ShardReport, Signal, SizeClass, SnapshotId,
-  StatusReport, UnsupportedReason, VolumeId, VolumeSummary, WorkOp, decode_body, encode_body,
-  unpack,
+  GroupReport, HealthSignal, Intent, NamePolicy, PlacedState, ReadAt, ReadWritePolicy,
+  RecoveryCause, Refusal, RefusalCount, ReplyBody, RequestBody, Scope, ShardReport, Signal,
+  SizeClass, SnapshotId, StatusReport, UnsupportedReason, VolumeId, VolumeSummary, WorkOp,
+  decode_body, encode_body, unpack,
 };
 use slates_ipc::slot::SlotKind;
 use slates_ipc::{IpcError, Request};
@@ -3508,6 +3508,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::RemoteAttachmentsFull { .. } => "remote_attachments_full",
     Refusal::OwnMount { .. } => "own_mount",
     Refusal::TableAtCapacity { .. } => "table_at_capacity",
+    Refusal::NotRecovered { .. } => "not_recovered",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",
@@ -3551,6 +3552,7 @@ fn claims_placed_durability(body: &RequestBody) -> bool {
       | RequestBody::Clone { .. }
       | RequestBody::Snapshot { .. }
       | RequestBody::Submit { .. }
+      | RequestBody::EditSubmit { .. }
       | RequestBody::ImageBuild { .. }
       | RequestBody::ImageMerge { .. }
   )
@@ -3722,6 +3724,25 @@ fn dispatch_inner(
     } => edit(state, principal, work, &path, at, delete_len, &bytes),
     RequestBody::Declare { work, op } => declare(state, principal, work, op),
     RequestBody::Submit { work, evidence } => submit(state, principal, work, evidence),
+    RequestBody::EditSubmit {
+      work,
+      path,
+      at,
+      delete_len,
+      insert,
+      evidence,
+    } => edit_and_submit(
+      state,
+      principal,
+      work,
+      Splice {
+        path: &path,
+        at,
+        delete_len,
+        insert,
+      },
+      evidence,
+    ),
     RequestBody::Rebase { work } => rebase(state, principal, work),
     RequestBody::Advance {
       attachment,
@@ -4349,10 +4370,15 @@ pub(crate) fn find(
   volume: VolumeId,
 ) -> Result<(Handle<VolumeSlot>, VolumeRecord), Box<ReplyBody>> {
   let id = to_db_volume(volume);
-  let handle = *state
-    .by_id
-    .get(&id)
-    .ok_or_else(|| Box::new(refused(absent(state, volume))))?;
+  let handle = *state.by_id.get(&id).ok_or_else(|| {
+    // A volume recovery could not rebuild is listed, so it answers why, never `NotFound`.
+    Box::new(refused(match state.unrecovered.get(&id) {
+      Some(cause) => Refusal::NotRecovered {
+        cause: cause.clone(),
+      },
+      None => absent(state, volume),
+    }))
+  })?;
   let record = state
     .db
     .partition()
@@ -5682,6 +5708,55 @@ fn fs_write_staged(
       mode,
     },
   )
+}
+
+/// The splice an [`edit_and_submit`] makes before it submits: `edit`'s arguments, with the bytes inline or staged.
+struct Splice<'a> {
+  /// The file.
+  path: &'a str,
+  /// The offset.
+  at: u64,
+  /// Bytes removed at `at`.
+  delete_len: u64,
+  /// Bytes inserted at `at`.
+  insert: slates_ipc::protocol::EditBytes,
+}
+
+/// `edit` and then `submit`, as one request (§4.16 "Edit and submit in one request", A-225): the edit exactly as
+/// [`edit`] (or [`edit_staged`]) makes it and, if it is accepted, the submit exactly as [`submit`] makes it. Both run in
+/// the request's one durable step under its one completion record (`run_recorded`), so a restart replays both or
+/// neither. The edit's refusal is the answer when the edit is refused, and nothing is submitted, as a client that saw
+/// `edit` refused would not submit; otherwise the answer is the submit's, verdict, windows and refusals alike.
+fn edit_and_submit(
+  state: &mut ShardState,
+  principal: &Principal,
+  work: VolumeId,
+  splice: Splice<'_>,
+  evidence: Vec<[u8; 32]>,
+) -> ReplyBody {
+  let edited = match splice.insert {
+    slates_ipc::protocol::EditBytes::Inline { bytes } => edit(
+      state,
+      principal,
+      work,
+      splice.path,
+      splice.at,
+      splice.delete_len,
+      &bytes,
+    ),
+    slates_ipc::protocol::EditBytes::Staged { token } => edit_staged(
+      state,
+      principal,
+      (work, token),
+      splice.path,
+      splice.at,
+      splice.delete_len,
+    ),
+  };
+  match edited {
+    ReplyBody::Edited => submit(state, principal, work, evidence),
+    refused_edit => refused_edit,
+  }
 }
 
 fn edit_staged(
@@ -10187,7 +10262,14 @@ async fn rebuild_record(
 ) -> bool {
   match record.policy.role {
     Role::Green { .. } => {
-      rebuild_green_sliced(state, record, slices).await;
+      // A restarted owner owes its holders every merge record its chain holds that they may not: the pending records
+      // lived in memory, so a version appended before the restart and not yet committed at `f + 1` was never shipped
+      // again (the bug record of 2026-11-07). Re-enqueued, each is placed from the current configuration; a holder that
+      // already holds a version acknowledges it again at no cost.
+      for version in rebuild_green_sliced(state, record, slices).await {
+        crate::merge_service::enqueue_recovered_record(state, record.id, version);
+        slices.unit_done().await;
+      }
       rebuilt.merge_volumes = rebuilt.merge_volumes.saturating_add(1);
     }
     Role::Work { green, .. } => {
@@ -10202,13 +10284,14 @@ async fn rebuild_record(
           .snapshots_trimmed
           .saturating_add(trim_unrecorded_snapshots(state, record.id));
       }
-      Err(reason) => {
+      Err(cause) => {
         rebuilt.skipped = rebuilt.skipped.saturating_add(1);
         slates_machine::log_line!(
-          "slates-server: partition {}: volume {} not rebuilt: {reason}",
+          "slates-server: partition {}: volume {} not rebuilt: {cause:?}",
           state.partition,
           record.name
         );
+        state.unrecovered.insert(record.id, cause);
         return false;
       }
     },
@@ -10407,9 +10490,12 @@ fn reconcile_clone_pins(state: &mut ShardState) -> usize {
 /// replayed in order, so its content, versions, last-changed index and dedup set return exactly as
 /// before the restart. A corrupt chain entry stops the replay there — the green recovers to its last
 /// good version, logged, rather than presenting a wrong later state.
-fn rebuild_green(state: &mut ShardState, record: &VolumeRecord) {
+fn rebuild_green(
+  state: &mut ShardState,
+  record: &VolumeRecord,
+) -> Vec<crate::merge_service::ReplayedVersion> {
   let replayed = replay_green(state, record.id);
-  install_green(state, record, replayed);
+  install_green(state, record, replayed)
 }
 
 /// [`rebuild_green`] in a recovery's slices (§2.6 boot step 2): the same replay, a directory of the held origin or a
@@ -10418,20 +10504,24 @@ async fn rebuild_green_sliced(
   state: &mut ShardState,
   record: &VolumeRecord,
   slices: &mut crate::recovery_slices::RecoverySlices,
-) {
+) -> Vec<crate::merge_service::ReplayedVersion> {
   let replayed = replay_green_sliced(state, record.id, slices).await;
-  install_green(state, record, replayed);
+  install_green(state, record, replayed)
 }
 
-/// Installs a replayed green, or fences it with why its replay was refused (AUD-29-18).
+/// Installs a replayed green and returns the versions its replay rebuilt, each owed to its holders again; or fences it
+/// with why its replay was refused (AUD-29-18), owing nothing.
 fn install_green(
   state: &mut ShardState,
   record: &VolumeRecord,
-  replayed: Result<slates_merge::engine::Green, crate::merge_service::GreenFence>,
-) {
-  let green = match replayed {
-    Ok(green) => green,
-    Err(fence) => return fence_green(state, record, fence),
+  replayed: Result<ReplayedGreen, crate::merge_service::GreenFence>,
+) -> Vec<crate::merge_service::ReplayedVersion> {
+  let (green, replayed) = match replayed {
+    Ok(rebuilt) => rebuilt,
+    Err(fence) => {
+      fence_green(state, record, fence);
+      return Vec::new();
+    }
   };
   state.greens.insert(record.id, green);
   // The replay rebuilt every history in full; fold it oldest-first back to the budget and re-take the retention the
@@ -10447,7 +10537,9 @@ fn install_green(
       record,
       crate::merge_service::GreenFence::Retention { short },
     );
+    return Vec::new();
   }
+  replayed
 }
 
 /// Replays green `id`'s durable origin and chain into a fresh engine (§4.16): every chain entry was an
@@ -10458,7 +10550,7 @@ fn install_green(
 fn replay_green(
   state: &ShardState,
   id: DbVolumeId,
-) -> Result<slates_merge::engine::Green, crate::merge_service::GreenFence> {
+) -> Result<ReplayedGreen, crate::merge_service::GreenFence> {
   let mut replay = GreenReplay::begin(state, id)?;
   while !replay.step(state)? {}
   replay.finish(state)
@@ -10469,13 +10561,19 @@ async fn replay_green_sliced(
   state: &ShardState,
   id: DbVolumeId,
   slices: &mut crate::recovery_slices::RecoverySlices,
-) -> Result<slates_merge::engine::Green, crate::merge_service::GreenFence> {
+) -> Result<ReplayedGreen, crate::merge_service::GreenFence> {
   let mut replay = GreenReplay::begin(state, id)?;
   while !replay.step(state)? {
     slices.unit_done().await;
   }
   replay.finish(state)
 }
+
+/// A green's engine as its replay rebuilt it, and each version the replay rebuilt, with what its merge record needs.
+type ReplayedGreen = (
+  slates_merge::engine::Green,
+  Vec<crate::merge_service::ReplayedVersion>,
+);
 
 /// A green's replay a unit at a time ([`replay_green`]): its held origin walked a directory a step (A-217), then the
 /// engine restored at its checkpoint (W3) or built over the origin, then its chain an entry a step. Holds no borrow of
@@ -10491,12 +10589,13 @@ struct GreenReplay {
 enum GreenReplayPhase {
   /// Walking the held origin's base snapshot.
   Origin(Box<crate::merge_service::HeldWalk>),
-  /// Replaying the chain: the engine so far, the version its checkpoint holds (0 with none), and the index of the next
-  /// entry.
+  /// Replaying the chain: the engine so far, the version its checkpoint holds (0 with none), the index of the next
+  /// entry, and the versions rebuilt so far.
   Chain {
     green: Box<slates_merge::engine::Green>,
     held: u64,
     next: usize,
+    replayed: Vec<crate::merge_service::ReplayedVersion>,
   },
 }
 
@@ -10535,9 +10634,12 @@ impl GreenReplay {
         }
         Ok(false)
       }
-      GreenReplayPhase::Chain { green, held, next } => {
-        replay_chain_entry(state, id, green, *held, next)
-      }
+      GreenReplayPhase::Chain {
+        green,
+        held,
+        next,
+        replayed,
+      } => replay_chain_entry(state, id, green, *held, next, replayed),
     }
   }
 
@@ -10547,6 +10649,7 @@ impl GreenReplay {
       green: Box::new(slates_merge::engine::Green::new()),
       held: 0,
       next: 0,
+      replayed: Vec::new(),
     };
     if let GreenReplayPhase::Origin(walk) = std::mem::replace(&mut self.phase, placeholder) {
       let origin = walk.finish().map_err(held_origin_fence)?;
@@ -10555,29 +10658,32 @@ impl GreenReplay {
     Ok(())
   }
 
-  /// The replayed engine, with the shard's rejected-cache budget; `OriginUnavailable` if called before the origin's
-  /// walk was whole (a caller that stopped stepping early).
-  fn finish(
-    self,
-    state: &ShardState,
-  ) -> Result<slates_merge::engine::Green, crate::merge_service::GreenFence> {
+  /// The replayed engine, with the shard's rejected-cache budget, and the versions it rebuilt; `OriginUnavailable` if
+  /// called before the origin's walk was whole (a caller that stopped stepping early).
+  fn finish(self, state: &ShardState) -> Result<ReplayedGreen, crate::merge_service::GreenFence> {
     match self.phase {
-      GreenReplayPhase::Chain { mut green, .. } => {
+      GreenReplayPhase::Chain {
+        mut green,
+        replayed,
+        ..
+      } => {
         green.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
-        Ok(*green)
+        Ok((*green, replayed))
       }
       GreenReplayPhase::Origin(_) => Err(crate::merge_service::GreenFence::OriginUnavailable),
     }
   }
 }
 
-/// Submits green `id`'s next chain entry at its own version; true once no entry is left.
+/// Submits green `id`'s next chain entry at its own version, keeping the version's merge record as its owner enqueued
+/// it, with the head identity the green has at that version; true once no entry is left.
 fn replay_chain_entry(
   state: &ShardState,
   id: DbVolumeId,
   green: &mut slates_merge::engine::Green,
   held: u64,
   next: &mut usize,
+  replayed: &mut Vec<crate::merge_service::ReplayedVersion>,
 ) -> Result<bool, crate::merge_service::GreenFence> {
   use crate::merge_service::GreenFence;
   let Some(bytes) = state.db.partition().green_chain(id).get(*next) else {
@@ -10590,7 +10696,15 @@ fn replay_chain_entry(
   let increment = slates_merge::engine::Increment::decode(bytes)
     .map_err(|_| GreenFence::EntryCorrupt { version })?;
   match green.submit(&increment) {
-    slates_merge::engine::Outcome::Accepted { version: accepted } if accepted == version => {}
+    slates_merge::engine::Outcome::Accepted { version: accepted } if accepted == version => {
+      replayed.push(crate::merge_service::ReplayedVersion {
+        version,
+        increment: increment.id,
+        base: increment.base,
+        evidence: increment.evidence.clone(),
+        identity: green.head_identity(),
+      });
+    }
     slates_merge::engine::Outcome::Accepted { version: accepted } => {
       return Err(GreenFence::WrongVersion { version, accepted });
     }
@@ -10612,7 +10726,7 @@ fn chain_phase(
   origin: Option<slates_merge::origin::Origin>,
 ) -> Result<GreenReplayPhase, crate::merge_service::GreenFence> {
   use crate::merge_service::GreenFence;
-  let (green, held) = match state.db.partition().green_checkpoint(id) {
+  let (mut green, held) = match state.db.partition().green_checkpoint(id) {
     Some((held, bytes)) => {
       let checkpoint = slates_merge::checkpoint::Checkpoint::decode(bytes)
         .ok()
@@ -10631,10 +10745,23 @@ fn chain_phase(
       0,
     ),
   };
+  // Version 0's merge record, as its owner enqueued it, when no checkpoint stands for it; `replay_chain_entry` keeps
+  // the rest.
+  let mut replayed = Vec::new();
+  if held == 0 {
+    replayed.push(crate::merge_service::ReplayedVersion {
+      version: 0,
+      increment: [0u8; 32],
+      base: 0,
+      evidence: Vec::new(),
+      identity: green.head_identity(),
+    });
+  }
   Ok(GreenReplayPhase::Chain {
     green: Box::new(green),
     held,
     next: 0,
+    replayed,
   })
 }
 
@@ -11528,7 +11655,7 @@ fn rebuild_volume(
   record: &VolumeRecord,
   image: Option<&VolumeImage>,
   claims: Option<&slates_vfs::recover::Claims>,
-) -> Result<u16, String> {
+) -> Result<u16, RecoveryCause> {
   let size = wire_size(record.policy.size);
   let reservation = match size {
     SizeClass::Bounded { limit } => Some(
@@ -11536,7 +11663,7 @@ fn rebuild_volume(
         .store
         .budget
         .reserve(limit)
-        .map_err(|e| e.to_string())?,
+        .map_err(|e| resources(format!("the shard's byte budget: {e}")))?,
     ),
     SizeClass::Dynamic { .. } => None,
   };
@@ -11548,7 +11675,9 @@ fn rebuild_volume(
     if let Some(r) = reservation {
       state.store.budget.release(r);
     }
-    return Err("a strict volume's content could not be locked in this process".to_owned());
+    return Err(resources(
+      "a strict volume's content could not be locked in this process".to_owned(),
+    ));
   }
   let lock_credit = match record
     .policy
@@ -11561,20 +11690,20 @@ fn rebuild_volume(
       if let Some(r) = reservation {
         state.store.budget.release(r);
       }
-      return Err(format!(
+      return Err(resources(format!(
         "a strict volume's entitlement exceeds this process's lock capacity: {}",
         refusal_name(&refusal)
-      ));
+      )));
     }
   };
   let built = build_recovered_volume(state, record, image, claims, size);
   let (mut volume, host, prefix) = match built {
     Ok(triple) => triple,
-    Err(reason) => {
+    Err(cause) => {
       if let Some(r) = reservation {
         state.store.budget.release(r);
       }
-      return Err(reason);
+      return Err(cause);
     }
   };
   // A recovered dynamic volume's growth was committed to the shard budget before the crash; re-acquire
@@ -11589,7 +11718,9 @@ fn rebuild_volume(
     if let Some(r) = reservation {
       state.store.budget.release(r);
     }
-    return Err("recovered dynamic growth exceeds the shard budget".to_string());
+    return Err(resources(
+      "recovered dynamic growth exceeds the shard budget".to_owned(),
+    ));
   }
   // Re-admit the inode dimension (§4.2): the fair share, but never below what the recovered volume
   // already holds — recovery does not refuse inodes that were admitted before the restart.
@@ -11608,7 +11739,7 @@ fn rebuild_volume(
       Err(reason) => {
         let discarded = volume.discard_partial(&mut state.store);
         count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
-        return Err(reason);
+        return Err(resources(reason));
       }
     };
   // Re-acquire the records' metadata reservation (§4.2 accounting through recovery), giving every
@@ -11623,10 +11754,10 @@ fn rebuild_volume(
         state.store.versions.release(c);
       }
       release_recovered_bytes(&mut state.store, reservation, held);
-      return Err(format!(
+      return Err(resources(format!(
         "recovered volume records exceed the metadata ledger: {}",
         refusal_name(&refusal)
-      ));
+      )));
     }
   };
   let mut volume = volume;
@@ -11642,7 +11773,10 @@ fn rebuild_volume(
     metadata_credit,
     lock_credit,
   };
-  let handle = state.volumes.insert(slot).map_err(|e| e.to_string())?;
+  let handle = state
+    .volumes
+    .insert(slot)
+    .map_err(|e| resources(format!("the volume table: {e}")))?;
   state.by_id.insert(record.id, handle);
   Ok(prefix)
 }
@@ -11655,26 +11789,21 @@ fn build_recovered_volume(
   image: Option<&VolumeImage>,
   claims: Option<&slates_vfs::recover::Claims>,
   size: SizeClass,
-) -> Result<(Volume, Option<OsHost>, u16), String> {
-  let image =
-    image.ok_or_else(|| "RecoveryIncomplete: no content image for the volume".to_owned())?;
+) -> Result<(Volume, Option<OsHost>, u16), RecoveryCause> {
+  let image = image.ok_or(RecoveryCause::NoImage)?;
   let quota = quota_for(size);
   let journal = journal_floor_bytes(state);
   let mut opened = match &record.base {
     // An image volume holds its content itself, as a scratch one does; its base names only the snapshot it pins.
     BaseRecord::Scratch | BaseRecord::Image { .. } => None,
-    BaseRecord::Path { path } => Some(
-      OsHost::open_root(std::path::Path::new(path))
-        .map_err(|error| format!("RecoveryIncomplete: cannot reacquire the base: {error}"))?,
-    ),
+    BaseRecord::Path { path } => {
+      Some(OsHost::open_root(std::path::Path::new(path)).map_err(|error| base_cause(path, error))?)
+    }
   };
   let source = opened
     .as_mut()
     .map(|(host, root)| (host as &mut dyn HostFs, *root));
-  let claims = claims.ok_or_else(|| {
-    "RecoveryIncomplete: the shard's recovery images name blocks that could not be claimed"
-      .to_owned()
-  })?;
+  let claims = claims.ok_or(RecoveryCause::BlocksUnclaimed)?;
   // A clone shares its origin snapshot's records (A-64), so it is rebuilt beside its recovered origin, which
   // `rebuild_recovered` rebuilds first.
   let lineage = state.db.partition().lineage(record.id).cloned();
@@ -11692,13 +11821,11 @@ fn build_recovered_volume(
         .by_id
         .get(&edge.origin_volume)
         .copied()
-        .ok_or_else(|| {
-          "RecoveryIncomplete: the clone's origin volume was not recovered".to_owned()
-        })?;
+        .ok_or(RecoveryCause::OriginNotRecovered)?;
       let ShardState { store, volumes, .. } = &mut *state;
-      let origin = volumes.get(origin).map_err(|_| {
-        "RecoveryIncomplete: the clone's origin volume was not recovered".to_owned()
-      })?;
+      let origin = volumes
+        .get(origin)
+        .map_err(|_| RecoveryCause::OriginNotRecovered)?;
       Volume::clone_from_image(
         store,
         image,
@@ -11713,7 +11840,9 @@ fn build_recovered_volume(
       )
     }
   };
-  let mut volume = rebuilt.map_err(|error| error.to_string())?;
+  let mut volume = rebuilt.map_err(|error| RecoveryCause::ImageRefused {
+    reason: error.to_string(),
+  })?;
   // The catalog is the authority on the acknowledged size policy (§4.8, AC-2.3): a resize
   // publishes its image before its record commits. Refuse content exceeding that policy.
   let acknowledged = quota.limit();
@@ -11724,11 +11853,29 @@ fn build_recovered_volume(
     let host = opened.as_mut().map(|(host, _)| host as &mut dyn HostFs);
     let discarded = volume.discard_partial_releasing(&mut state.store, host);
     count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
-    return Err(format!(
-      "RecoveryIncomplete: the image's quota exceeds the acknowledged size policy: {error}"
-    ));
+    return Err(RecoveryCause::ImageRefused {
+      reason: format!("the image's quota exceeds the acknowledged size policy: {error}"),
+    });
   }
   Ok((volume, opened.map(|(host, _)| host), image.prefix))
+}
+
+/// A recovered volume's resources that do not fit this process, named by `reason`.
+fn resources(reason: String) -> RecoveryCause {
+  RecoveryCause::ResourcesUnavailable { reason }
+}
+
+/// Why the overlay's base at `path` could not be reacquired, by the host's refusal.
+fn base_cause(path: &str, error: slates_vfs::host::HostError) -> RecoveryCause {
+  let path = path.to_owned();
+  match error {
+    slates_vfs::host::HostError::NotFound => RecoveryCause::BaseMissing { path },
+    slates_vfs::host::HostError::OwnMount(_) => RecoveryCause::BaseOnOwnMount { path },
+    other => RecoveryCause::BaseUnavailable {
+      path,
+      reason: other.to_string(),
+    },
+  }
 }
 
 /// Trims the rebuilt volume back to the catalog (§4.8, AC-2.3): a verb publishes its effect before
@@ -13581,8 +13728,8 @@ mod tests {
       let overlay = super::build_recovered_volume(state, &record, None, None, size).err();
       (scratch, overlay)
     });
-    assert!(scratch.is_some_and(|reason| reason.contains("RecoveryIncomplete")));
-    assert!(overlay.is_some_and(|reason| reason.contains("RecoveryIncomplete")));
+    assert_eq!(scratch, Some(slates_ipc::protocol::RecoveryCause::NoImage));
+    assert_eq!(overlay, Some(slates_ipc::protocol::RecoveryCause::NoImage));
   }
 
   /// AC-2.3, §4.8 (the catalog is the authority on the size policy): rebuild an image whose content exceeds the
@@ -13630,7 +13777,10 @@ mod tests {
       let after = (state.store.inodes.len(), state.store.dirs.len());
       (refusal, before, after)
     });
-    assert!(refusal.is_some_and(|reason| reason.contains("size policy")));
+    assert!(refusal.is_some_and(|cause| matches!(
+      cause,
+      slates_ipc::protocol::RecoveryCause::ImageRefused { reason } if reason.contains("size policy")
+    )));
     assert_eq!(after, before, "the refused rebuild returned its records");
   }
 

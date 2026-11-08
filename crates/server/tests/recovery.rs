@@ -3362,6 +3362,61 @@ fn recovery_memory_no_restart_reads_goes_back_and_a_restart_recovers_every_file(
   }
 }
 
+/// A-117 and A-226, an idle shard gives back only the recovery memory written since its last give-back: do write a
+/// round of files, publish (a checkpoint) and give the dead memory back; then write one small file, publish again (a
+/// delta appended past the tail) and give back again. Expect the second give-back to return nothing, since the delta
+/// is live and nothing past it was written; then expect every file after a restart. Before A-226 every publication
+/// re-armed a give-back of the whole stale slot and the whole log past the tail, written or not: 18,325,143,552 bytes
+/// marked reusable on a Mac Studio, 18–21 ms of the shard's CPU in one poll, which every request arriving meanwhile
+/// waited behind (the late-request tail of BENCHMARKS' macOS paced runs).
+#[test]
+fn a_give_back_returns_only_recovery_memory_written_since_the_last() {
+  /// Shape: files in the first round, so its checkpoint is many times the later delta.
+  const ROUND: u64 = 200;
+  let profile = common::machine_profile();
+  let instance = format!("srv-recovery-written-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let anchor = held_anchor("recovery-written", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let volume = client
+    .create(&CreateSpec {
+      size: SizeClass::Bounded { limit: 64 << 20 },
+      ..scratch("written")
+    })
+    .unwrap();
+  let attachment = client
+    .attach(volume, None, slates_ipc::protocol::Intent::Write)
+    .unwrap()
+    .attachment;
+  for index in 0..ROUND {
+    let body = format!("file {index} of round 0").into_bytes();
+    client
+      .fs_write((volume, attachment), &format!("r{index}"), &body, 0o644)
+      .unwrap();
+  }
+  first.publish_every_shard().unwrap();
+  let _ = first.give_back_recovery_on_every_shard().unwrap();
+  let body = format!("file {ROUND} of round 1").into_bytes();
+  client
+    .fs_write((volume, attachment), &format!("r{ROUND}"), &body, 0o644)
+    .unwrap();
+  first.publish_every_shard().unwrap();
+  let after_delta = first.give_back_recovery_on_every_shard().unwrap();
+  assert_eq!(
+    after_delta, 0,
+    "a delta-only publication left nothing dead to give back, yet {after_delta} bytes were given back"
+  );
+  first.stop();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  assert_every_file(&mut client, volume, ROUND + 1, ROUND);
+  second.stop();
+  drop(anchor);
+}
+
 /// The recovery bytes `daemon` counts given back once its shard goes idle, above `before`, waiting up to the bound.
 fn returned_after_idle(daemon: &Daemon, before: u64) -> u64 {
   let returned = || {
