@@ -1433,7 +1433,7 @@ fn landing_refusal_scenario() {
   ));
   assert!(matches!(
     client.call(&RequestBody::Audit { since: 0 }),
-    ReplyBody::Audit { records } if records.is_empty()
+    ReplyBody::Audit { records, .. } if records.is_empty()
   ));
   daemon.stop();
 }

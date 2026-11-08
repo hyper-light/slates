@@ -78,6 +78,10 @@ pub struct LandingState {
   pub grants: Grants,
   /// The runtime audit log (mirrored to `AuditRecord`).
   pub audit: Audit,
+  /// The audit records this shard's current atom built while it is not the control shard (A-265): sent to the control
+  /// partition, one batch, once the atom commits, and dropped with it when it is refused. Empty between atoms, so it
+  /// holds one atom's records at most.
+  pub audit_owed: Vec<DbAuditRecord>,
   /// The next landing id.
   pub next_landing: u64,
   /// A landing awaiting a grant: its id, the manifest it planned, the volume and the target,
@@ -189,6 +193,7 @@ impl Default for LandingState {
     LandingState {
       grants: Grants::default(),
       audit: Audit::new(AUDIT_RETAIN),
+      audit_owed: Vec::new(),
       next_landing: 1,
       awaiting: std::collections::BTreeMap::new(),
       in_flight: std::collections::BTreeMap::new(),
@@ -732,7 +737,7 @@ async fn run_presentation(mut job: PresentJob) {
     }
   };
   let request = job.request_id;
-  let _ = crate::state::with_state(|s| {
+  let Some((reply, route, owed, (shard, budget))) = crate::state::with_state(|s| {
     job.settle(s);
     let (reply, route) = crate::image::complete(s, request, |s| {
       let ids = LandingIds {
@@ -759,8 +764,14 @@ async fn run_presentation(mut job: PresentJob) {
         None => refused(Refusal::NotFound),
       }
     });
-    crate::image::deliver(s, reply, route);
-  });
+    let owed = std::mem::take(&mut s.landing.audit_owed);
+    (reply, route, owed, (s.shard, s.config.failover_slo_ns))
+  }) else {
+    return;
+  };
+  // The presentation's record reaches the audit before its reply does (A-265).
+  append_owed_audit(shard, owed, budget).await;
+  let _ = crate::state::with_state(|s| crate::image::deliver(s, reply, route));
 }
 
 /// The reply to a landing the engine did not land: its presentation when it needs a grant, else the typed
@@ -886,6 +897,14 @@ fn defer_granted_landing(state: &mut ShardState, mut prepared: Prepared) -> Repl
     };
     let finished =
       drive_granted_landing(prepared, taken, request, cause, (renew, key.clone())).await;
+    // The landing's records reach the audit before its reply does (A-265).
+    let finished = match finished {
+      Some((reply, route, owed)) => {
+        append_owed_audit(shard, owed, term).await;
+        Some((reply, route))
+      }
+      None => None,
+    };
     // The lease goes before the reply, so the caller's next landing into the target finds it free.
     let released = !held
       || crate::xshard::call_within(
@@ -985,6 +1004,25 @@ enum Stepped {
   Ended(Box<Result<LandingReport, LandingRefusal>>),
 }
 
+/// A granted landing's completed reply, where it goes, and the audit records its completion owed the control partition
+/// (A-265), sent before the reply.
+#[cfg(unix)]
+type Finished = (
+  ReplyBody,
+  Option<crate::merge_service::ReplyRoute>,
+  Vec<DbAuditRecord>,
+);
+
+/// `completed` with the audit records its atom owed, taken in the same turn of the shard, so no other verb's send
+/// takes them first (`send_owed_audit`).
+#[cfg(unix)]
+fn owing(
+  state: &mut ShardState,
+  (reply, route): (ReplyBody, Option<crate::merge_service::ReplyRoute>),
+) -> Finished {
+  (reply, route, std::mem::take(&mut state.landing.audit_owed))
+}
+
 /// Drives a granted landing under its lease: begins it, steps it one slice per turn of the shard (yielding
 /// between, so the shard serves its other clients, lease checks and shutdown while a large landing runs),
 /// and finishes it where its records and the request's completion commit as one atom.
@@ -995,7 +1033,7 @@ async fn drive_granted_landing(
   request: (u64, slates_wire::request::RequestId),
   cause: Option<slates_wire::observe::SpanContext>,
   (renew, key): (LeaseAsk, String),
-) -> Option<(ReplyBody, Option<crate::merge_service::ReplyRoute>)> {
+) -> Option<Finished> {
   let mut granted = match start_granted(prepared, lease, renew, &key).await? {
     Begun::Running(granted) => granted,
     ended => return finish_unrun(request, cause, ended),
@@ -1021,12 +1059,16 @@ async fn drive_granted_landing(
         recall_before_finish(&mut granted, renew, &key).await;
         let outcome = advance_granted(&mut granted, renew, &key).await?;
         return crate::state::with_state(move |s| {
-          complete_landing_with(s, request, cause, |s| complete_finish(s, *granted, outcome))
+          let completed =
+            complete_landing_with(s, request, cause, |s| complete_finish(s, *granted, outcome));
+          owing(s, completed)
         });
       }
       Stepped::Ended(ended) => {
         return crate::state::with_state(move |s| {
-          complete_landing_with(s, request, cause, |s| complete_finish(s, *granted, *ended))
+          let completed =
+            complete_landing_with(s, request, cause, |s| complete_finish(s, *granted, *ended));
+          owing(s, completed)
         });
       }
     }
@@ -1076,9 +1118,10 @@ fn finish_unrun(
   request: (u64, slates_wire::request::RequestId),
   cause: Option<slates_wire::observe::SpanContext>,
   ended: Begun,
-) -> Option<(ReplyBody, Option<crate::merge_service::ReplyRoute>)> {
+) -> Option<Finished> {
   crate::state::with_state(move |s| {
-    complete_landing_with(s, request, cause, |s| answer_unrun(s, ended))
+    let completed = complete_landing_with(s, request, cause, |s| answer_unrun(s, ended));
+    owing(s, completed)
   })
 }
 
@@ -2248,25 +2291,22 @@ fn present(
     written: 0,
     conflicts: u32::try_from(conflicts.len()).unwrap_or(u32::MAX),
   };
-  let ops = [
-    Op::LandingRecorded { record },
-    Op::AuditAppended {
-      record: DbAuditRecord {
-        seq: 0,
-        at_ns: now,
-        kind: DbAuditKind::LandingPlanned,
-        principal: principal.clone(),
-        grant: None,
-        landing: Some(landing_id),
-        manifest: Some(hash),
-        outcome: None,
-      },
-    },
-  ];
-  for op in &ops {
-    if let Err(e) = state.db.mutate(&mut state.segment, op, now) {
-      return refused(crate::error::refusal_of_db(&e));
-    }
+  let planned = DbAuditRecord {
+    seq: 0,
+    at_ns: now,
+    kind: DbAuditKind::LandingPlanned,
+    principal: principal.clone(),
+    grant: None,
+    landing: Some(landing_id),
+    manifest: Some(hash),
+    outcome: None,
+  };
+  if let Err(e) = state
+    .db
+    .mutate(&mut state.segment, &Op::LandingRecorded { record }, now)
+    .and_then(|_| write_audit(state, vec![planned], now))
+  {
+    return refused(crate::error::refusal_of_db(&e));
   }
   ReplyBody::GrantRequired {
     landing: landing_id,
@@ -2322,19 +2362,23 @@ fn finish(
       conflicts: record.conflicts,
     }
   }];
-  // Mirror the engine's audit records for this landing into the durable log.
-  for audit in state.landing.audit.records() {
-    if audit.landing == landing_id {
-      ops.push(Op::AuditAppended {
-        record: db_audit(audit, principal),
-      });
-    }
-  }
   ops.extend(closing_ops(state, ids, grant));
+  // Mirror the engine's audit records for this landing into the durable log, on the control partition (A-265).
+  let records: Vec<DbAuditRecord> = state
+    .landing
+    .audit
+    .records()
+    .into_iter()
+    .filter(|audit| audit.landing == landing_id)
+    .map(|audit| db_audit(audit, principal))
+    .collect();
   for op in &ops {
     if let Err(e) = state.db.mutate(&mut state.segment, op, now) {
       return refused(crate::error::refusal_of_db(&e));
     }
+  }
+  if let Err(e) = write_audit(state, records, now) {
+    return refused(crate::error::refusal_of_db(&e));
   }
   if let Some(refusal) = publish_landed(state, ids, report) {
     return refusal;
@@ -2664,15 +2708,11 @@ pub fn issue_grant(
     manifest: Some(awaiting.manifest),
     outcome: None,
   };
-  for op in [
-    Op::GrantIssued { record },
-    Op::AuditAppended { record: audit },
-  ] {
-    state
-      .db
-      .mutate(&mut state.segment, &op, now)
-      .map_err(|e| crate::error::refusal_of_db(&e))?;
-  }
+  state
+    .db
+    .mutate(&mut state.segment, &Op::GrantIssued { record }, now)
+    .and_then(|_| write_audit(state, vec![audit], now))
+    .map_err(|e| crate::error::refusal_of_db(&e))?;
   Ok(id.0)
 }
 
@@ -2737,26 +2777,139 @@ pub fn grants_verb(state: &ShardState, principal: &Principal) -> ReplyBody {
   ReplyBody::Grants { grants }
 }
 
-/// The audit log from `since`, from the durable records.
+/// One page of the audit (§4.15, A-265), answered on the control shard, whose partition holds every record: the
+/// retained records from sequence `since` on, as many as one reply chunk holds, and whether more follow.
 pub fn audit_verb(state: &ShardState, since: u64) -> ReplyBody {
-  let records = state
-    .db
-    .partition()
-    .audit()
-    .iter()
-    .filter(|r| r.seq >= since)
-    .map(|r| AuditEntry {
-      seq: r.seq,
-      at_ns: r.at_ns,
-      kind: audit_kind_name(r.kind),
-      grant: r.grant,
-      landing: r.landing,
-      manifest: r.manifest,
-      outcome: r.outcome.map(landing_state_name),
-    })
-    .collect();
-  ReplyBody::Audit { records }
+  let room = audit_page_room();
+  let mut used = 0usize;
+  let mut records = Vec::new();
+  let mut more = false;
+  for record in state.db.partition().audit().filter(|r| r.seq >= since) {
+    let entry = AuditEntry {
+      seq: record.seq,
+      at_ns: record.at_ns,
+      kind: audit_kind_name(record.kind),
+      grant: record.grant,
+      landing: record.landing,
+      manifest: record.manifest,
+      outcome: record.outcome.map(landing_state_name),
+    };
+    let bytes = crate::verbs::encoded_len(&entry);
+    if !records.is_empty() && used.saturating_add(bytes) > room {
+      more = true;
+      break;
+    }
+    used = used.saturating_add(bytes);
+    records.push(entry);
+  }
+  ReplyBody::Audit { records, more }
 }
+
+/// The bytes an audit page's records may take: one reply chunk less the page's own framing (§4.3). A record is a fixed
+/// kind name, ids, a manifest hash and a terminal state's name, so every record fits a page alone.
+pub(crate) fn audit_page_room() -> usize {
+  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+  let empty = ReplyBody::Audit {
+    records: Vec::new(),
+    more: true,
+  };
+  chunk.saturating_sub(slates_ipc::protocol::framed_len(&empty))
+}
+
+/// Format: the partition that holds the audit (§4.15 "written through the control shard", §4.8's one `AuditLog`):
+/// the control shard's, the first of the daemon's shards.
+pub(crate) const AUDIT_PARTITION: u16 = 0;
+
+/// Writes `records` to the audit (A-265): applied in the current atom when this shard is the control shard, else owed
+/// to it, as one batch the atom's caller sends once the atom commits ([`send_owed_audit`], [`append_owed_audit`]).
+fn write_audit(
+  state: &mut ShardState,
+  records: Vec<DbAuditRecord>,
+  now: u64,
+) -> Result<(), slates_db::DbError> {
+  if state.partition != AUDIT_PARTITION {
+    state.landing.audit_owed.extend(records);
+    return Ok(());
+  }
+  for record in records {
+    state
+      .db
+      .mutate(&mut state.segment, &Op::AuditAppended { record }, now)?;
+  }
+  Ok(())
+}
+
+/// Appends a batch of audit records another shard's atom owed (A-265), on the control shard, as one transaction:
+/// whether it committed. A record's sequence is the control partition's next, decided as it applies.
+fn append_audit_batch(state: &mut ShardState, records: Vec<DbAuditRecord>) -> bool {
+  let now = state.clock.monotonic_ns();
+  state.db.begin();
+  let applied = records.into_iter().all(|record| {
+    state
+      .db
+      .mutate(&mut state.segment, &Op::AuditAppended { record }, now)
+      .is_ok()
+  });
+  let committed = state.db.commit(&mut state.segment).is_ok();
+  if !(applied && committed) {
+    state.count(AUDIT_UNAPPENDED, 1);
+  }
+  applied && committed
+}
+
+/// Sends what this shard's committed verb owed the audit to the control shard (A-265), a counted refusal when it
+/// cannot reach it ([`AUDIT_UNAPPENDED`]): after a sync verb's transaction (`verbs::run_recorded`), which cannot wait.
+/// Nothing when nothing is owed. A refused transaction's owed records went with it (`reconcile_unpublished_effects`).
+pub(crate) fn send_owed_audit(state: &mut ShardState) {
+  if state.landing.audit_owed.is_empty() {
+    return;
+  }
+  let records = std::mem::take(&mut state.landing.audit_owed);
+  let Some(control) = crate::verbs::shard_of_partition(state, AUDIT_PARTITION) else {
+    state.count(AUDIT_UNAPPENDED, 1);
+    return;
+  };
+  crate::xshard::run_on_waiting(
+    state.shard,
+    control,
+    move |s| {
+      append_audit_batch(s, records);
+    },
+    AUDIT_UNAPPENDED,
+  );
+}
+
+/// Appends `owed` on the control shard and waits for it, at most `budget_ns` (A-265): a task's completion owed it, and
+/// its reply waits on it, so the caller's next `audit` reads it. Whether it was appended; counted when not.
+#[cfg(unix)]
+async fn append_owed_audit(shard: u16, owed: Vec<DbAuditRecord>, budget_ns: u64) -> bool {
+  if owed.is_empty() {
+    return true;
+  }
+  let control =
+    crate::state::with_state(|s| crate::verbs::shard_of_partition(s, AUDIT_PARTITION)).flatten();
+  let answered = match control {
+    Some(control) => {
+      crate::xshard::call_within(
+        shard,
+        control,
+        move |s| append_audit_batch(s, owed),
+        budget_ns,
+      )
+      .await
+    }
+    None => None,
+  };
+  // A batch the control shard refused is counted there; one that never reached it, here.
+  if answered.is_none() {
+    let _ = crate::state::with_state(|s| s.count(AUDIT_UNAPPENDED, 1));
+  }
+  answered.unwrap_or(false)
+}
+
+/// Format: the landing-plane counter of an audit batch that did not reach the control partition (A-265): refused at
+/// its channel, unanswered within its budget, or refused by its transaction.
+pub(crate) const AUDIT_UNAPPENDED: &str = "landing.audit_unappended";
 
 fn to_wire_volume(id: DbVolumeId) -> VolumeId {
   VolumeId { bytes: id.bytes }

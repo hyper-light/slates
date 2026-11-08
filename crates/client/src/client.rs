@@ -4231,11 +4231,27 @@ impl Client {
     }
   }
 
-  /// The audit log from `since`.
+  /// The audit log from `since`, in sequence order: walked a page at a time, as one reply holds one page (§4.3), so
+  /// an audit of any length is answered.
   pub fn audit(&mut self, since: u64) -> Result<Vec<AuditEntry>, ClientError> {
-    match self.call(&RequestBody::Audit { since })? {
-      ReplyBody::Audit { records } => Ok(records),
-      _ => Err(ClientError::UnexpectedReply { verb: "audit" }),
+    let mut records: Vec<AuditEntry> = Vec::new();
+    let mut from = since;
+    loop {
+      let ReplyBody::Audit {
+        records: page,
+        more,
+      } = self.call(&RequestBody::Audit { since: from })?
+      else {
+        return Err(ClientError::UnexpectedReply { verb: "audit" });
+      };
+      // A page that says more must bring a record, so the walk moves and always ends.
+      let next = page.last().map(|record| record.seq.saturating_add(1));
+      records.extend(page);
+      match (more, next) {
+        (false, _) => return Ok(records),
+        (true, Some(next)) => from = next,
+        (true, None) => return Err(ClientError::UnexpectedReply { verb: "audit" }),
+      }
     }
   }
 

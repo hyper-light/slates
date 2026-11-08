@@ -319,7 +319,6 @@ fn fixture_segment() -> AnchorSegment {
     profile_bytes: 8192,
     log_bytes: 8192,
     snapshot_bytes: 8192,
-    audit_bytes: 8192,
     landing_slots: 1,
     landing_slot_bytes: 4096,
   };

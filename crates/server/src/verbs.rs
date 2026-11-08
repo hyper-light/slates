@@ -2235,6 +2235,8 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
     RequestBody::Grant { landing, .. } => Some(owner_of_landing(*landing)),
     // A telemetry drain names its shard: it runs there, on that shard's own ring (§4.14).
     RequestBody::Telemetry { partition } => Some(*partition),
+    // The audit is one partition's, the control shard's (§4.15, A-265).
+    RequestBody::Audit { .. } => Some(crate::landing::AUDIT_PARTITION),
     other => volume_of(other).map(owner_of),
   };
   if let Some(owner) = owner
@@ -2425,6 +2427,8 @@ fn run_recorded(
       refused(refusal)
     }
   };
+  // What the committed verb owed the audit goes to the control shard now, after its transaction (A-265).
+  crate::landing::send_owed_audit(state);
   let end_ns = state.clock.monotonic_ns();
   state.current_span = outer;
   let partition_label = u32::from(state.partition);
@@ -5866,7 +5870,7 @@ fn changed_page_room() -> usize {
 }
 
 /// The encoded bytes `value` adds to a reply.
-fn encoded_len<T: Wire>(value: &T) -> usize {
+pub(crate) fn encoded_len<T: Wire>(value: &T) -> usize {
   let mut encoded = Vec::new();
   value.encode(&mut encoded);
   encoded.len()
@@ -8751,6 +8755,8 @@ fn destroy(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> R
 /// so its destroy completes within the destroy slice budget the cooperative path uses; the loop is
 /// bounded by that volume's own extent. Returns how many volumes were released.
 pub(crate) fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
+  // The audit records the refused atom owed the control partition went with it (A-265).
+  state.landing.audit_owed.clear();
   let orphans: Vec<(DbVolumeId, Handle<VolumeSlot>)> = state
     .by_id
     .iter()

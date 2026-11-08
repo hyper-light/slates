@@ -431,7 +431,9 @@ pub enum RequestBody {
   },
   /// The caller's grants (a read; creating a grant is off-ring).
   Grants,
-  /// The audit log from a sequence (a read).
+  /// One page of the audit (§4.15, A-265): the records from sequence `since` on, in sequence order, as many as one
+  /// reply chunk holds. One partition holds the audit, the control shard's, so the sequence numbers the daemon's
+  /// records and a walk continues from one past the last record a page held. A read.
   Audit {
     /// Every record at or after this sequence.
     since: u64,
@@ -3320,10 +3322,12 @@ pub enum ReplyBody {
     /// The grants.
     grants: Vec<GrantSummary>,
   },
-  /// The audit log.
+  /// One page of the audit (`Audit`, A-265): records in sequence order, as many as one reply chunk holds (§4.3).
   Audit {
-    /// The records.
+    /// The records of this page.
     records: Vec<AuditEntry>,
+    /// Whether more follow: the next page is asked from one past the last record's sequence.
+    more: bool,
   },
   /// A grant was issued for a presented landing (the reply to a verified `Grant`).
   Granted {

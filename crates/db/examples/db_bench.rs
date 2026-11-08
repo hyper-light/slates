@@ -58,6 +58,7 @@ fn caps() -> PartitionCaps {
     timers: 1 << 15,
     tick_ns: 1_000,
     green_chain_bytes: 1 << 20,
+    audit_records: 1 << 12,
   }
 }
 
@@ -152,7 +153,6 @@ fn segment(name: &str) -> AnchorSegment {
       profile_bytes: PAGE,
       log_bytes: LOG_BYTES,
       snapshot_bytes: SNAPSHOT_BYTES,
-      audit_bytes: PAGE,
       landing_slots: 1,
       landing_slot_bytes: PAGE,
     },

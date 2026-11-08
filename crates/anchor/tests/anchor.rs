@@ -64,7 +64,6 @@ fn geometry() -> Geometry {
     profile_bytes: 8192,
     log_bytes: 65_536,
     snapshot_bytes: 8192,
-    audit_bytes: 8192,
     landing_slots: 2,
     landing_slot_bytes: 4096,
   }

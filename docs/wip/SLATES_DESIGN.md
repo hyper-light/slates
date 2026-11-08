@@ -7508,7 +7508,7 @@ with every finished entry listed.
 | Racy window | filesystem timestamp granularity (cited table by filesystem type) + measured clock resolution | `statfs` type; `clock_getres` |
 | Landing lease term | measured landing duration p99 × k, renewed by keepalive while entries are in flight | landing duration histogram |
 | Grant term | the session's lifetime for session grants; the measured plan-to-grant interval p99 × k for single-use grants | audit log intervals |
-| Audit retention | landing rate × operator audit horizon × record size | measured landing rate |
+| Audit retention | the partition's table bytes / the record's size (the memory ceiling, `PartitionCaps::audit_records`, A-265); an operator horizon × the measured landing rate may lower it once a rate is measured (none is yet) | table bytes; measured landing rate |
 | Watcher coalescing window | p50 inter-arrival of event bursts | watcher event timestamps |
 
 **Worked example.** An agent overlays `/home/u/proj` (300k files); edits twelve files, deletes
@@ -19542,3 +19542,28 @@ Applied in the same change to: §4.16 (the merge verbs), `crates/merge/src/engin
 - **One path always fits a page:** a green's paths arrive in requests, whose framing is larger than a page's (the longest
   an edit carries, 4,044 bytes, is answered); merging a mounted work is owed and must bound its paths when it lands.
 
+### A-265 — The audit is numbered, bounded, and held by the control shard alone (accepted 2026-11-08)
+Applied in the same change to: §4.15 (the audit retention row), `crates/db/src/partition.rs` (`append_audit`,
+`audit_next_seq`, `audit_dropped`, `PartitionCaps::audit_records`), `crates/anchor/src/layout.rs` (the audit region
+removed; layout version 7), `crates/server/src/config.rs`, `crates/server/src/landing.rs` (`audit_verb`,
+`write_audit`, `send_owed_audit`, `append_owed_audit`, `AUDIT_PARTITION`), `crates/server/src/verbs.rs` (the route, the
+send after a verb's transaction), `crates/ipc/src/protocol.rs` (`Audit { since }` answered `{ records, more }`),
+`crates/client/src/client.rs`, GAPS, `docs/bugs/2026-11-08-the-audit-numbered-nothing-and-kept-everything.md`.
+- **Numbered:** every record was numbered 0. The partition numbers each in `apply` from a snapshotted counter, so a
+  replay numbers them as the live partition did.
+- **Bounded:** the audit grew for the partition's life. A window of `table_bytes / size_of::<AuditRecord>()` is kept,
+  the oldest dropped past it and counted; the formula's horizon applies once a landing rate is measured.
+- **The ring removed:** the audit region was never written; the log and the snapshots in the anchor segment hold the
+  records, as §4.8 asks. Replaced, not kept beside.
+- **One partition:** each shard kept its own audit and a client read its own shard's alone. The control shard's
+  partition now holds every record (§4.15 "written through the control shard", §4.8's one `AuditLog`), so one sequence
+  numbers the daemon's audit and `--since N` keeps its meaning; `Audit` is served there, a page at a time.
+- **The crossing:** a record made on another shard is owed to the control partition by its atom and sent as one batch
+  once the atom commits: a presentation's and a granted landing's completion wait for it before replying, and a grant
+  (a sync verb) sends after its transaction, a refusal counted (`landing.audit_unappended`). On the control shard the
+  records stay in the atom. A crash between the owner's commit and the batch loses the batch; the owner's records and
+  the completion stand.
+- **Cost:** a granted landing of 1,000 files of 1 KiB from the shard that is not the control shard, its 1,000 `entry_written` records and its others crossing as one batch (`crates/server/tests/audit_land_cost.rs`, release, two shards, this Mac at load 40 to 100, before and after alternated ABBA three times, 2026-11-09): before, a landing's median 968 ms and fastest 430 ms; after, 827 ms and 424 ms (25 landings each, the first pair dropped as the warm-up). No cost shows within the noise: the crossing is one message and one transaction against a landing's own writes and fsyncs.
+- **Proven:** numbering and recovery, and the bounded window over a replay and a snapshot, in the database; a client on
+  either of two shards reads every shard's records at once after a landing's reply
+  (`a_client_on_any_shard_reads_every_shards_audit`); the audit paged by use.

@@ -60,7 +60,6 @@ fn segment(name: &str, log_bytes: u64) -> AnchorSegment {
       profile_bytes: PAGE,
       log_bytes,
       snapshot_bytes: SNAPSHOT_BYTES,
-      audit_bytes: PAGE,
       landing_slots: 1,
       landing_slot_bytes: PAGE,
     },
@@ -77,6 +76,7 @@ fn caps() -> PartitionCaps {
     timers: 1 << 12,
     tick_ns: 1_000,
     green_chain_bytes: 1 << 20,
+    audit_records: 1 << 12,
   }
 }
 
@@ -1476,6 +1476,7 @@ const CHECKPOINT_GREEN: u64 = 1;
 fn checkpoint_caps() -> PartitionCaps {
   PartitionCaps {
     green_chain_bytes: BUDGET_INCREMENTS * INCREMENT_BYTES,
+    audit_records: 1 << 12,
     ..caps()
   }
 }

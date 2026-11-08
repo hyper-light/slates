@@ -1,15 +1,16 @@
 //! The segment's geometry and its regions (§4.8's `Partition` fields that live "in the anchor
-//! segment": the op log, the audit log, the landing manifests, plus the profile and the
-//! catalog snapshots). Every offset is a page multiple so a region can be locked or advised on
+//! segment": the op log, which carries the audit log's records, the landing manifests, plus the profile and the
+//! catalog snapshots, which carry the audit's retained window). Every offset is a page multiple so a region can be locked or advised on
 //! its own, and every word two processes touch sits at an 8-byte offset.
 
 /// Format: the segment's magic, `SLAN` in little-endian ASCII.
 pub const MAGIC: u32 = 0x4E41_4C53;
-/// Format: the layout version, changed for header, region, timestamp or record semantics: 3 a host-wide monotonic
-/// origin, 4 the content pool's owner words (A-98), 5 every principal recorded with the host whose account it is
-/// (A-237), 6 a green's chain entries record what each version changed (A-257). An older segment is refused, never read
-/// under semantics it was not written with.
-pub const LAYOUT_VERSION: u32 = 6;
+/// The layout version's history: 3 a host-wide monotonic origin, 4 the content pool's owner words (A-98), 5 every
+/// principal recorded with the host whose account it is (A-237), 6 a green's chain entries record what each version
+/// changed (A-257), 7 the audit ring removed, whose records the op log and the snapshots already held (A-265).
+/// Format: the layout version, changed for header, region, timestamp or record semantics; an older segment is refused,
+/// never read under semantics it was not written with.
+pub const LAYOUT_VERSION: u32 = 7;
 /// Format: the layout before A-237's host-scoped principals, refused with what to do about it.
 pub const LAYOUT_BEFORE_HOST_SCOPED_PRINCIPALS: u32 = 4;
 /// Format: one content-pool extent's owner word (A-98): 0 while the extent is free, else its owning partition plus
@@ -23,7 +24,7 @@ const SNAPSHOT_SLOTS: usize = 2;
 /// Format: the node-wide consensus publications (regional and root).
 const CONSENSUS_PUBLICATIONS: usize = 2;
 /// Format: the header's size: magic (4), version (4), identity (32), generation (8), total
-/// length (8), then the encoded geometry (64), padded to two cache lines.
+/// length (8), then the encoded geometry (56), padded to two cache lines.
 pub const HEADER_BYTES: usize = 128;
 /// Format: the magic's offset.
 pub const AT_MAGIC: usize = 0;
@@ -40,7 +41,7 @@ pub const AT_TOTAL: usize = 48;
 /// Format: the encoded geometry's offset.
 pub const AT_GEOMETRY: usize = 56;
 /// Format: the encoded geometry's width.
-pub const GEOMETRY_BYTES: usize = 64;
+pub const GEOMETRY_BYTES: usize = 56;
 /// Format: the encoded geometry's fields, by offset: partitions (u16).
 const GEO_PARTITIONS: usize = 0;
 /// Format: the page (u64).
@@ -51,12 +52,10 @@ const GEO_PROFILE: usize = 16;
 const GEO_LOG: usize = 24;
 /// Format: one snapshot slot's bytes (u64).
 const GEO_SNAPSHOT: usize = 32;
-/// Format: the audit ring's bytes (u64).
-const GEO_AUDIT: usize = 40;
 /// Format: the landing slot count (u32).
-const GEO_LANDING_SLOTS: usize = 48;
+const GEO_LANDING_SLOTS: usize = 40;
 /// Format: one landing slot's bytes (u64).
-const GEO_LANDING_SLOT_BYTES: usize = 56;
+const GEO_LANDING_SLOT_BYTES: usize = 48;
 
 /// Format: the supervision block's words, by offset inside its region: the daemon's pid.
 pub const SUP_PID: usize = 0;
@@ -196,8 +195,6 @@ pub struct Geometry {
   /// Derived: one snapshot slot's bytes (the measured partition state size × the growth
   /// headroom); two slots per partition.
   pub snapshot_bytes: u64,
-  /// Derived: the audit ring's bytes (landing rate × audit horizon × record size).
-  pub audit_bytes: u64,
   /// Derived: landing slots (landings in flight the host allows).
   pub landing_slots: u32,
   /// Derived: one landing slot's bytes (the measured manifest size p99).
@@ -217,8 +214,6 @@ pub enum RegionKind {
   Snapshot(u16, u8),
   /// One of the two node-wide Raft publications, owned by the control shard.
   Consensus(u8),
-  /// The audit ring.
-  Audit,
   /// A landing slot.
   Landing(u32),
   /// The content pool's owner words (A-98): [`POOL_EXTENTS_PER_PARTITION`] per partition.
@@ -232,7 +227,6 @@ struct Runs {
   logs: (u64, u64),
   snapshots: (u64, u64),
   consensus: (u64, u64),
-  audit: (u64, u64),
   landings: (u64, u64),
   pool: (u64, u64),
 }
@@ -290,7 +284,6 @@ impl Geometry {
     }
     push(RegionKind::Consensus(0), self.consensus_bytes());
     push(RegionKind::Consensus(1), self.consensus_bytes());
-    push(RegionKind::Audit, self.audit_bytes);
     for slot in 0..self.landing_slots {
       push(RegionKind::Landing(slot), self.landing_slot_bytes);
     }
@@ -335,7 +328,6 @@ impl Geometry {
         runs.consensus,
         bounded(usize::from(c), CONSENSUS_PUBLICATIONS)?,
       )?,
-      RegionKind::Audit => runs.audit,
       RegionKind::Landing(slot) => nth(
         runs.landings,
         bounded(
@@ -378,14 +370,10 @@ impl Geometry {
       self.aligned(self.consensus_bytes()),
     );
     let publications = u64::try_from(CONSENSUS_PUBLICATIONS).ok()?;
-    let audit = run(
+    let landings = run(
       consensus
         .0
         .checked_add(publications.checked_mul(consensus.1)?)?,
-      self.aligned(self.audit_bytes),
-    );
-    let landings = run(
-      audit.0.checked_add(audit.1)?,
       self.aligned(self.landing_slot_bytes),
     );
     let pool = run(
@@ -400,7 +388,6 @@ impl Geometry {
       logs,
       snapshots,
       consensus,
-      audit,
       landings,
       pool,
     })
@@ -429,7 +416,6 @@ impl Geometry {
     put(&mut out, GEO_PROFILE, &self.profile_bytes.to_le_bytes());
     put(&mut out, GEO_LOG, &self.log_bytes.to_le_bytes());
     put(&mut out, GEO_SNAPSHOT, &self.snapshot_bytes.to_le_bytes());
-    put(&mut out, GEO_AUDIT, &self.audit_bytes.to_le_bytes());
     put(
       &mut out,
       GEO_LANDING_SLOTS,
@@ -451,7 +437,6 @@ impl Geometry {
       profile_bytes: word(bytes, GEO_PROFILE),
       log_bytes: word(bytes, GEO_LOG),
       snapshot_bytes: word(bytes, GEO_SNAPSHOT),
-      audit_bytes: word(bytes, GEO_AUDIT),
       landing_slots: u32::from_le_bytes([
         bytes[GEO_LANDING_SLOTS],
         bytes[GEO_LANDING_SLOTS + 1],
@@ -497,7 +482,6 @@ mod tests {
         profile_bytes: 8192,
         log_bytes: 1 << 16,
         snapshot_bytes: 8192,
-        audit_bytes: 4096,
         landing_slots,
         landing_slot_bytes: 4096,
       };
@@ -529,7 +513,6 @@ mod tests {
       profile_bytes: 10_000,
       log_bytes: 1 << 20,
       snapshot_bytes: 8192,
-      audit_bytes: 4096,
       landing_slots: 2,
       landing_slot_bytes: 100,
     };

@@ -92,7 +92,7 @@ fn segment_words(geometry: &Geometry) -> Words {
         usize::from(geometry.partitions).saturating_mul(crate::layout::POOL_EXTENTS_PER_PARTITION),
         Width::U64,
       )),
-      RegionKind::Log(_) | RegionKind::Audit => words.with(WordRun::strided(
+      RegionKind::Log(_) => words.with(WordRun::strided(
         at.saturating_add(RING_HEAD),
         size_of::<u64>(),
         RING_WORDS,
@@ -854,7 +854,7 @@ impl AnchorSegment {
       .regions()
       .iter()
       .map(|r| r.kind)
-      .filter(|k| matches!(k, RegionKind::Log(_) | RegionKind::Audit))
+      .filter(|k| matches!(k, RegionKind::Log(_)))
       .collect();
     for kind in kinds {
       if let (Ok(spec), Ok(words)) = (self.spec(kind), self.ring_words(kind)) {

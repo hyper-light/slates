@@ -14,7 +14,14 @@
 >   fits a page alone: a green's paths arrive in requests, whose framing is larger than a page's (the longest an edit
 >   carries, 4,044 bytes, is answered). Merging a mounted work is owed and must bound its paths to one page when it lands
 >   (`docs/bugs/2026-11-08-a-greens-changed-since-outgrew-one-reply.md`).
-> - **Still open, the same one-reply shape**, by their code and not reproduced: `audit`, `grants`, a status's `drifted`
+> - **`audit`: numbered, bounded, one partition (A-265, 2026-11-08).** Refused between 50 and 100 records; paging it
+>   found every record numbered 0, the audit unbounded in memory and snapshots, and each shard keeping its own, a client
+>   reading its own shard's alone. Now numbered in `apply`, a derived window kept (`table_bytes / size_of::<AuditRecord>()`,
+>   the oldest dropped and counted; the operator horizon waits for a measured landing rate), the unwritten audit ring
+>   removed, every record held by the control shard's partition, and the read paged. **Open:** a record made on another
+>   shard reaches the control partition after its own atom commits, so a crash between the two loses that batch
+>   (`docs/bugs/2026-11-08-the-audit-numbered-nothing-and-kept-everything.md`).
+> - **Still open, the same one-reply shape**, by their code and not reproduced: `grants`, a status's `drifted`
 >   list, and the conflict and invalidation lists of `Submitted`, `Rebased`, `GrantRequired` and `Advanced`. Each needs
 >   a cursor the way `List`, `ChangedSince` and `ReadDir` have, or a derived bound and a typed refusal.
 
