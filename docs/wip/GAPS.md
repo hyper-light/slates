@@ -1278,6 +1278,14 @@
     host re-included meanwhile, whose replies the shipper may already count, so it needs a holder-set generation in
     entries and replies (live-fixes; 2ba5572d reverted in eab618f2). Phase one never counts such a copy, and with the
     n − f count no owner commits through it alone.
+  - **Fixed (2026-11-08): a takeover question that timed out left its holder's link lent for good** (record
+    `docs/bugs/2026-11-08-a-takeover-question-that-timed-out-left-its-holders-link-lent-for-good.md`). Phase one and
+    the log fetch never dropped the link of a holder whose request timed out (`Exchanged::unanswered`), so its slot
+    kept the takeover's borrow with no session behind it, and every later phase one skipped that holder. KIND wan-loss
+    stalled once in 16 runs this way: 425 waits for the quorum with the holder alive at the head (CI
+    diag-raft-chaos-final-41). Every live exchange's caller now goes through `live_ship::settle_sessions`.
+    `a_takeover_question_a_holder_never_answered_leaves_its_link_dialed_afresh` (`crates/server/tests/fleet.rs`) was
+    red before the fix: the link was lent to `fleet.lent_to.live_takeover` after the wait.
   - Open: the holder set changing under a live log (joint transition and activation, with live-fixes and raft); a
     successor outside the holders cannot open the log (`takeover_refused.open`); and a refused rebuild refetched the
     log every period, fixed 2026-11-07 (`live_ship::owes_refetch`: no refetch at a head whose bytes were refused; bug

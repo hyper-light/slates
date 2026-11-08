@@ -95,6 +95,17 @@ pub enum SessionHold {
   },
 }
 
+/// What [`Daemon::ask_live_reports`] left of this node's record link to a peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkAfter {
+  /// The link holds its session, lendable.
+  Up,
+  /// No link: it was dropped, and its task dials afresh.
+  Absent,
+  /// Its session is out, lent to the named borrower (`fleet::take_sessions`'s label).
+  Lent(&'static str),
+}
+
 /// Where the segment comes from, and with it the client rendezvous: what an anchor holds for its daemons (§4.8,
 /// A-114), or nothing.
 #[derive(Clone, Debug)]
@@ -1169,6 +1180,127 @@ impl Daemon {
         budget_ns: OBSERVE_BUDGET_NS,
         attempts: 1,
         waited_ns: OBSERVE_BUDGET_NS,
+        last_refusal: None,
+      })
+  }
+
+  /// Test support: asks `peers` for a live log's report `rounds` times, as a takeover's phase one does
+  /// (`live_ship::ask_reports`), each under a budget of `budget_ns`, then waits `settle_ns` (a record period or more,
+  /// so queued stragglers are drained) and reports what is left of this node's record link to each peer
+  /// ([`LinkAfter`]), with how many rounds found a peer's session in its link to ask over. A round waits for the
+  /// session as [`Self::hold_record_session`] does, for at most the longer of [`SESSION_WAIT_NS`] and `settle_ns`, since
+  /// a link an earlier round dropped is dialed afresh meanwhile; a round that finds none ends the asking. Runs on the control shard, where the record sessions live. A budget too short for any reply makes each
+  /// question unanswered, as a reply past the liveness budget is on a lossy path (KIND's wan-loss profile, CI
+  /// diag-raft-chaos-final-41).
+  pub fn ask_live_reports(
+    &self,
+    peers: Vec<slates_db::HostId>,
+    budget_ns: u64,
+    rounds: usize,
+    settle_ns: u64,
+  ) -> Result<(usize, Vec<(slates_db::HostId, LinkAfter)>), ObserveError> {
+    let shard = self.shards.first().copied().ok_or(ObserveError::NoTarget)?;
+    let runtime = self.runtime.as_ref().ok_or(ObserveError::NoRuntime)?;
+    let (told, answer) =
+      std::sync::mpsc::sync_channel::<(usize, Vec<(slates_db::HostId, LinkAfter)>)>(1);
+    let receipt = runtime
+      .spawn_on_with_receipt(shard, async move {
+        let poll_ns = (HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD).max(1);
+        // A link dropped by an earlier round is dialed afresh by its task, which can take longer than a session wait.
+        let session_wait_ns = SESSION_WAIT_NS.max(settle_ns);
+        let mut asked = 0usize;
+        for _ in 0..rounds {
+          let began = slates_rt::futures::now_ns();
+          let lendable = loop {
+            let lendable = crate::state::with_state(|s| {
+              peers.iter().any(|peer| {
+                s.record_sessions
+                  .get(peer)
+                  .is_some_and(|link| link.endpoint.is_some())
+              })
+            })
+            .unwrap_or(false);
+            if lendable || slates_rt::futures::now_ns().saturating_sub(began) >= session_wait_ns {
+              break lendable;
+            }
+            pace(poll_ns).await;
+          };
+          if !lendable {
+            break;
+          }
+          let budget = slates_cluster::CommitBudget::hard(budget_ns, poll_ns);
+          let object = slates_db::register::ObjectId([0; 16]);
+          let _ = crate::live_ship::ask_reports(
+            object,
+            slates_db::register::HostEpoch(1),
+            &peers,
+            budget,
+          )
+          .await;
+          asked = asked.saturating_add(1);
+        }
+        pace(settle_ns).await;
+        let after = crate::state::with_state(|s| {
+          peers
+            .iter()
+            .map(|peer| {
+              let link = match s.record_sessions.get(peer) {
+                None => LinkAfter::Absent,
+                Some(link) if link.endpoint.is_some() => LinkAfter::Up,
+                Some(link) => LinkAfter::Lent(link.lent_to.unwrap_or("none")),
+              };
+              (*peer, link)
+            })
+            .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+        let _ = told.send((asked, after));
+      })
+      .map_err(|refusal| ObserveError::Submission {
+        refusal,
+        attempts: 1,
+        waited_ns: 0,
+      })?;
+    let budget = std::time::Duration::from_nanos(OBSERVE_BUDGET_NS);
+    match receipt.wait(budget) {
+      Some(slates_rt::Admission::Admitted(_)) => {}
+      Some(slates_rt::Admission::Refused(refusal)) => {
+        return Err(ObserveError::Admission {
+          refusal,
+          attempts: 1,
+          waited_ns: 0,
+        });
+      }
+      Some(slates_rt::Admission::Terminated) => {
+        return Err(ObserveError::Terminated {
+          stage: ObserveStage::Admission,
+          attempts: 1,
+        });
+      }
+      None => {
+        return Err(ObserveError::Deadline {
+          stage: ObserveStage::Admission,
+          budget_ns: OBSERVE_BUDGET_NS,
+          attempts: 1,
+          waited_ns: OBSERVE_BUDGET_NS,
+          last_refusal: None,
+        });
+      }
+    }
+    // Every round's session wait and question, and the settle, on top of the observe budget.
+    let rounds_ns = u64::try_from(rounds)
+      .unwrap_or(u64::MAX)
+      .saturating_mul(SESSION_WAIT_NS.max(settle_ns).saturating_add(budget_ns));
+    let bound_ns = OBSERVE_BUDGET_NS
+      .saturating_add(rounds_ns)
+      .saturating_add(settle_ns);
+    answer
+      .recv_timeout(std::time::Duration::from_nanos(bound_ns))
+      .map_err(|_| ObserveError::Deadline {
+        stage: ObserveStage::Execution,
+        budget_ns: bound_ns,
+        attempts: 1,
+        waited_ns: bound_ns,
         last_refusal: None,
       })
   }
@@ -2404,6 +2536,20 @@ impl Daemon {
     })
   }
 
+  /// Test support: while `withhold` is set, this node's record serve side holds each live-state reply (a takeover's
+  /// report or log fetch) after its request arrived, and answers everything else, probes included, as usual: a holder
+  /// alive and in contact whose answer to a takeover misses the asker's budget. Delivered like
+  /// [`Self::inject_discovery_fault`]; `Ok` once installed, else the typed refusal.
+  pub fn inject_live_state_withhold(&self, withhold: bool) -> Result<(), ObserveError> {
+    // On every shard: a record session's serve side runs on whichever shard took its connection.
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| {
+        s.live_state_withhold_replies = withhold;
+      })?;
+    }
+    Ok(())
+  }
+
   /// Test support: the host memory available that this daemon's pressure sampler reads from now on, in
   /// place of the platform's reading (§4.2; admission.md §5.5) — so a test drives the sampler's
   /// arithmetic (its baseline and shortfall) deterministically. Installed on every shard, since the
@@ -3499,6 +3645,7 @@ fn init_shard(
     record_sessions: std::collections::BTreeMap::new(),
     link_waiters: std::collections::BTreeMap::new(),
     discovery_withhold_replies: false,
+    live_state_withhold_replies: false,
     peer_paths: std::collections::BTreeMap::new(),
     probe_windows: crate::fleet::ProbeWindows::default(),
     probe_deaf_to: std::collections::BTreeSet::new(),
