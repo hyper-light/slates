@@ -11548,9 +11548,12 @@ const DERIVATION_LINES: usize = 512;
 #[test]
 fn a_full_profile_daemon_derives_an_archive_policy_with_codec_candidates() {
   use std::io::{BufRead, BufReader};
-  let instance = "codec-derivation";
+  // The instance names the anchor's rendezvous and segment, so it carries this process's id: under a bare name, a
+  // second copy of the test on the machine found the instance owned and its anchor printed no derivation (1 of 6
+  // copies in 3 concurrent pairs; 2 of 2 alone passed).
+  let instance = format!("codec-derivation-{}", std::process::id());
   let child = slates()
-    .args(["--instance", instance, "anchor", "--shards", SHARDS])
+    .args(["--instance", &instance, "anchor", "--shards", SHARDS])
     .stdout(Stdio::null())
     .stderr(Stdio::piped())
     .spawn()

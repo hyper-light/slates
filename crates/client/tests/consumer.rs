@@ -457,16 +457,20 @@ struct RestartAnchor {
   rendezvous: HeldRendezvous,
 }
 
-/// The anchor the test plays for `config`'s instance, its segment and content object under `name`.
+/// The anchor the test plays for `config`'s instance, its segment and content object under `name` and this process's
+/// id. On macOS both are named shared-memory objects, and a creation unlinks any holder's: under a bare `name`, two
+/// copies of the test on one machine took each other's (10 of 10 copies failed in 5 concurrent pairs,
+/// `ConsumerNotEnrolled` or `NotFound`; 3 of 3 alone passed).
 fn restart_anchor(name: &str, profile: &MachineProfile, config: &DaemonConfig) -> RestartAnchor {
   let content_bytes = config.content_bytes();
+  let process = std::process::id();
   let segment = AnchorSegment::create(
-    &format!("slates-seg-{name}"),
+    &format!("slates-seg-{name}-{process}"),
     &profile.facts.identity,
     config.geometry,
   )
   .unwrap()
-  .with_content(&format!("slates-con-{name}"), content_bytes)
+  .with_content(&format!("slates-con-{name}-{process}"), content_bytes)
   .unwrap();
   RestartAnchor {
     segment,
