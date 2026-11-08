@@ -3500,6 +3500,8 @@ fn init_shard(
     member_boot_nonce: incarnation,
     member_process_nonce: keyed_word(&issuer_secret, b"slates/member-process/v1"),
     learned_members: std::collections::BTreeMap::new(),
+    death_reports: std::collections::BTreeMap::new(),
+    death_watch_started_ns: None,
     returned_members: std::collections::BTreeMap::new(),
     authenticated_members: std::collections::BTreeSet::new(),
     council_death_watch: std::collections::BTreeMap::new(),
@@ -5863,6 +5865,99 @@ mod tests {
       .install_configuration(configuration, &regional.members);
   }
 
+  /// §4.8 "Promotion and takeover", the f + 1 rule: do make the audit node the leader-to-be of a three-voter `f = 1`
+  /// council, then judge who it may retire as the voters' views change. Expect its own lone death vote for a member the
+  /// others hold alive (a member it keyed slowly after a restart) to retire nothing, one other voter's fresh report to
+  /// make it `f + 1` and retire the member, and a report below the incarnation the leader holds the member alive at to
+  /// count for nothing. Before this rule the leader's own view alone retired a member.
+  #[test]
+  fn a_lone_voters_suspicion_never_retires_a_member() {
+    let (alone, confirmed, refuted) = audit_on_shard(|state| {
+      use slates_cluster::config_group::RegionalCouncil;
+      use slates_cluster::membership::{Liveness, MemberState};
+      use slates_db::register::{HostId, Quorum};
+      let local = state.fleet.host();
+      let (suspected, other) = (HostId(local.0 ^ 1), HostId(local.0 ^ 2));
+      state.council = RegionalCouncil::new(
+        local,
+        vec![local, suspected, other],
+        vec![local, suspected, other],
+        Quorum { f: 1 },
+        std::collections::BTreeMap::new(),
+        3,
+        false,
+      );
+      install_council(state);
+      // This node's own stable vote: its death watch past the confirmation window.
+      state.council_death_watch.insert(suspected, u32::MAX);
+      let alone = crate::fleet::confirmed_dead_council_members(state);
+      let now = slates_rt::futures::now_ns();
+      state
+        .death_reports
+        .entry(suspected)
+        .or_default()
+        .insert(other, (0, now));
+      let confirmed = crate::fleet::confirmed_dead_council_members(state);
+      // The member refuted at incarnation 3; the report names incarnation 0, so it no longer counts.
+      state.fleet.observe(
+        suspected,
+        MemberState {
+          liveness: Liveness::Alive,
+          incarnation: 3,
+        },
+      );
+      let refuted = crate::fleet::confirmed_dead_council_members(state);
+      (alone, confirmed, refuted)
+    });
+    assert!(
+      alone.is_empty(),
+      "one voter's vote retires nothing: {alone:?}"
+    );
+    assert_eq!(
+      confirmed.len(),
+      1,
+      "f + 1 voters retire the member: {confirmed:?}"
+    );
+    assert!(
+      refuted.is_empty(),
+      "a refutation cancels the reports below it: {refuted:?}"
+    );
+  }
+
+  /// §4.8 "Promotion and takeover", the f + 1 rule's floor: do make the audit node the sole voter of a forming `f = 1`
+  /// region of three members (the council widens only by steps that raise the failures it tolerates, so it stays at
+  /// its bootstrap alone until both others vote), and hold a member dead past the confirmation window. Expect its own
+  /// vote to retire the member: there is no other voter to report, as a joint write needs every member of a cohort
+  /// smaller than `f + 1` (`Quorum::committed_within`). Demanding `f + 1` votes from one voter retired nobody, so an
+  /// owner killed while its fleet formed was never taken over (`an_owner_killed_while_its_fleet_still_forms_is_taken_over`,
+  /// red 3 of 3 alone).
+  #[test]
+  fn a_sole_voters_own_view_retires_a_member_while_its_council_forms() {
+    let confirmed = audit_on_shard(|state| {
+      use slates_cluster::config_group::RegionalCouncil;
+      use slates_db::register::{HostId, Quorum};
+      let local = state.fleet.host();
+      let (suspected, other) = (HostId(local.0 ^ 1), HostId(local.0 ^ 2));
+      state.council = RegionalCouncil::new(
+        local,
+        vec![local, suspected, other],
+        vec![local],
+        Quorum { f: 1 },
+        std::collections::BTreeMap::new(),
+        3,
+        false,
+      );
+      install_council(state);
+      state.council_death_watch.insert(suspected, u32::MAX);
+      crate::fleet::confirmed_dead_council_members(state)
+    });
+    assert_eq!(
+      confirmed.len(),
+      1,
+      "the sole voter's own vote retires the member: {confirmed:?}"
+    );
+  }
+
   /// Makes the audit node one of three members of an `f = 1` region whose council it alone votes in, holding
   /// one record of `object` written by the second member; then retires that member and installs the result, so
   /// the object resolves to its successor among the two survivors. Returns the retired member and the successor.
@@ -6106,6 +6201,104 @@ mod tests {
     install_council(state);
     crate::takeover::resolve_held_objects(state, local);
     departed
+  }
+
+  /// §4.8 "Promotion and takeover", persistence before reply: do make the audit node a holder of a record the second
+  /// member of an `f = 1` region wrote, restart it warm through its held image (routing is not persisted), and then
+  /// retire that member and install the result. Expect the restored copy to move to its successor as a live holder's
+  /// does, and a record the successor adopts it under at the new generation to be accepted. Before the fix the
+  /// restored acceptor had no owner in routing: the install neither moved it nor raised its authority, and the
+  /// successor's adoption was refused `ForeignGeneration` every period, so a member that died while a voter
+  /// restarted was never served (`a_member_down_through_a_voters_restart_is_still_taken_over`, 1,056 refusals in a
+  /// minute).
+  #[test]
+  fn a_restored_holders_copy_moves_to_its_successor_and_accepts_its_adoption() {
+    let (moved, accepted) = audit_on_shard(|state| {
+      use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+      use slates_db::register::{
+        Acceptor, Ack, Authority, FIRST_EPOCH, HostId, ObjectId, Quorum, Record,
+      };
+      let local = state.fleet.host();
+      let departed = HostId(local.0 ^ 1);
+      let third = HostId(local.0 ^ 2);
+      let object = ObjectId([31; 16]);
+      state.council = RegionalCouncil::new(
+        local,
+        vec![local],
+        vec![local],
+        Quorum { f: 1 },
+        std::collections::BTreeMap::new(),
+        3,
+        false,
+      );
+      for host in [departed, third] {
+        assert!(
+          state
+            .council
+            .propose(Reconfiguration::Admit { host, domain: None })
+        );
+      }
+      install_council(state);
+      let generation = state.fleet.configuration().version;
+      let mut acceptor = Acceptor::new(
+        local,
+        Authority {
+          generation,
+          owner: departed,
+        },
+      );
+      acceptor
+        .accept(&Record {
+          owner: departed,
+          object,
+          sequence: 0,
+          epoch: FIRST_EPOCH,
+          generation,
+          value: b"head".to_vec(),
+        })
+        .unwrap();
+      state.holder_records.insert(object, acceptor);
+      state.fleet.track_object_owner(object, departed);
+
+      // The warm restart: the held image is what survives; the acceptors and the routing do not.
+      let image = crate::content_holder::held_image(state);
+      state.holder_records.clear();
+      state.fleet.forget_object(object);
+      let held = crate::content_holder::split_held(&image).unwrap();
+      assert_eq!(
+        crate::content_holder::restore_held_registers(state, local, held),
+        1
+      );
+
+      assert!(state.council.propose(Reconfiguration::TakeOver(departed)));
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      crate::fleet::reconcile_held_authority(state);
+      let regional = state.council.configuration().clone();
+      let successor = regional.successor(departed, object).unwrap();
+      let moved = state.fleet.object_owner(object) == Some(successor);
+      let epoch = regional
+        .epochs
+        .get(&departed)
+        .copied()
+        .unwrap_or(FIRST_EPOCH);
+      let adopted = Record {
+        owner: successor,
+        object,
+        sequence: 0,
+        epoch,
+        generation: regional.version,
+        value: b"head".to_vec(),
+      };
+      let reply = crate::fleet::accept_held_record(state, local, successor, &adopted);
+      let accepted = Ack::decode(&reply).is_ok_and(|ack| ack.binds(&adopted));
+      (moved, accepted)
+    });
+    assert!(moved, "the restored copy moves to its successor");
+    assert!(
+      accepted,
+      "the restored holder accepts the successor's adoption at the new generation"
+    );
   }
 
   /// §4.8 "Promotion and takeover" (Flexible Paxos's intersection, research record): an owner retired while its
