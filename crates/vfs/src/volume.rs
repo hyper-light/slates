@@ -5385,10 +5385,22 @@ impl Volume {
         self.unreference_n(store, no, u64::from(count))?;
       }
     }
-    if let RefOwner::Attachment(id) = attachment
-      && self.takeover_holders.remove(&id)
-      && self.takeover_holders.is_empty()
-    {
+    if let RefOwner::Attachment(id) = attachment {
+      self.end_takeover_holder(store, id)?;
+    }
+    Ok(())
+  }
+
+  /// `attachment` has ended: if it was a mount that survived a takeover, it can hold no handle any more, and with the
+  /// last such mount the files kept for them are reclaimed (U10). Called from the attachment's end as well as its sweep,
+  /// since Linux sends `FUSE_DESTROY`, which is what sweeps a mount, only to fuseblk and virtio-fs mounts: an ordinary
+  /// mount just disconnects, and its kept files stayed charged after its unmount.
+  pub fn end_takeover_holder(
+    &mut self,
+    store: &mut Store,
+    attachment: u64,
+  ) -> Result<(), VfsError> {
+    if self.takeover_holders.remove(&attachment) && self.takeover_holders.is_empty() {
       self.release_takeover_kept(store)?;
     }
     Ok(())

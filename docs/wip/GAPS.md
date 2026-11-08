@@ -12667,6 +12667,16 @@ one is shown. If a replaced path is the cause, the hardening would be for the an
 
 ### 2026-10-21: a dirty shared-map page is written back over a later write through another path — fixed on Linux (A-139, A-140); macOS open
 
+> **2026-11-07 (bug-sweep): the Linux rule is A-248's since Ada's decision "Refuse, like NFS".** A stale write-back is
+> no longer applied outside its stale bytes (the rule below, a merge banned item 11 forbids): one whose stale bytes
+> differ from the file's is refused `EIO` whole, by the rule the guest device and NFS share
+> (`slates_bridge_fuse::coherence::judge_writeback`). `fuse.writeback_conflicts` replaces
+> `fuse.writeback_bytes_kept_back`. A refused `WRITE` can carry contiguous pages no other path touched; the mount drops
+> all of them from its kernel's cache after the reply. **Open, found by reading and not measured:** a virtio-fs guest
+> and an NFS client cannot be told to drop them, so a refused batch's untouched pages stay cached there, holding the
+> refused stores, until the client revalidates. Record:
+> `docs/bugs/2026-11-07-a-fuse-write-back-was-applied-around-its-stale-bytes.md`.
+
 > **2026-11-06 (bug-sweep): macOS settled by A-192 on 2026-10-31** (further down this file: a stale write-back is
 > refused `NFS3ERR_IO`, and `a_dirty_shared_map_page_never_undoes_a_later_write_through_the_nfs_mount` holds it on CI's
 > macOS runner). Two cases are still open, listed under A-192: Apple's client tells the program nothing of the refusal;
@@ -12996,9 +13006,10 @@ without a user namespace, which needs root.
     reconciliation. An image merge's clone shares the path. The fix: the reconciliation unpins the origin of every
     orphan that carries one (the lineage the rolled-back record named must be read before the rollback).
 
-  AC-3.3's residual applies to a guest as to any map: a store into bytes another path is changing, made between the
-  page's fetch and the change's delivery, is kept back (since A-191 only a store concurrent with the other path's call,
-  or with a write through another FUSE mount).
+  AC-3.3's residual applies to a guest as to any map: a store into a page another path is changing, made between the
+  page's fetch and the change's delivery, is refused with its page's write-back (A-248; kept back before it), and the
+  guest's sync says so (since A-191 only a store concurrent with the other path's call, or with a write through another
+  FUSE mount).
 - **Found by the guest takeover test: a restored mount lost a store made after a re-fetch — fixed (A-147).** With a
   daemon killed under the guest's live map, a store the guest made after re-fetching another path's write was kept
   back after the takeover, 3 of 3. The same holds for any process's map, without a VM. The entry "A restored mount's

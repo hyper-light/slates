@@ -1,0 +1,125 @@
+name: DIAG bug-sweep 22, U10 and A-248 on Linux, and the live chaos flows against their base (not for main)
+
+# A diagnostics branch, never merged. A-248 refuses a FUSE cache write-back whole when a stale byte differs from the
+# file's ("Refuse, like NFS"). The supervisor's gate, on both arches: the bridge-fuse suites, the server's FUSE suites,
+# fuse_mount, the CLI suite with the rewritten dirty-page test, and the conformance suites (pjdfstest, fsx, fsstress)
+# over every Linux transport (oci-linux is the real FUSE mount; native-linux-fuse runs through the NFS adapter). Each step
+# runs whatever the one before answered. diag 19's suite steps piped into tail under plain `bash -e`, which reported
+# tail's exit: its three CLI failures showed green. Here `shell: bash` sets pipefail and nothing is piped.
+
+on:
+  push:
+    branches: [diag-bug-sweep-22]
+
+jobs:
+  a248:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_INCREMENTAL: "0"
+      SLATES_TEST_CLI: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: Suite tools and the operator's grant
+        run: |
+          sudo apt-get update && sudo apt-get install -y strace nfs-common fuse3 inotify-tools ripgrep sqlite3 vim
+          grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+          uname -a
+      - name: The dirty-page test, three runs
+        if: ${{ !cancelled() }}
+        run: |
+          for run in 1 2 3; do
+            cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture --exact \
+              a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path 2>&1 | tee "dirty-$run.log"
+            grep -q "test result: ok. 1 passed" "dirty-$run.log"
+          done
+      - name: bridge-fuse, every suite
+        if: ${{ !cancelled() }}
+        run: cargo test --no-fail-fast -p slates-bridge-fuse -- --test-threads=1 --nocapture
+      - name: The server's FUSE suites and the NFS write-back suite
+        if: ${{ !cancelled() }}
+        run: cargo test --no-fail-fast -p slates-server --lib --test fuse_mount --test fuse_told --test fuse_idle --test nfs_writeback --test recovery -- --test-threads=1
+      - name: The virtio-fs device (a guest's write-backs)
+        if: ${{ !cancelled() }}
+        run: cargo test --no-fail-fast -p slates-bridge-virtiofs -- --test-threads=1
+      - name: bridge-core and vfs (U10)
+        if: ${{ !cancelled() }}
+        run: cargo test --no-fail-fast -p slates-bridge-core -p slates-vfs
+      - name: Every CLI suite but the live chaos flows, which the job below compares with their base
+        if: ${{ !cancelled() }}
+        run: |
+          targets=$(ls crates/cli/tests/*.rs | xargs -n1 basename | sed 's/\.rs$//' | grep -vx live_chaos | sed 's/^/--test /' | tr '\n' ' ')
+          cargo test --no-fail-fast -p slates-cli --lib --bins $targets -- --test-threads=1
+      - name: fsx over every Linux transport
+        if: ${{ !cancelled() }}
+        run: cargo xtask conformance run --suite fsx --records target/conformance-records --scratch target/conformance-scratch --keep
+      - name: fsstress over every Linux transport
+        if: ${{ !cancelled() }}
+        run: cargo xtask conformance run --suite fsstress --records target/conformance-records --scratch target/conformance-scratch --keep
+      - name: pjdfstest over every Linux transport, against the reviewed lists
+        if: ${{ !cancelled() }}
+        run: cargo xtask conformance run --suite pjdfstest --records target/conformance-records --scratch target/conformance-scratch --keep
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diag22-records-${{ matrix.os }}
+          path: |
+            target/conformance-records
+            target/conformance-scratch/*/*.log
+            dirty-*.log
+          if-no-files-found: ignore
+
+  # diag 21 ran live_chaos for the first time on this stack and it failed (1 test on arm64, 3 on x86_64), in fleet code
+  # neither change touches, and no CI lane runs it. Each tree has its own target dir (diag 15 and 16's lesson), three
+  # rounds interleaved on one runner, every test's outcome printed. The job's own conclusion means nothing: read the lines.
+  live-chaos-ab:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_INCREMENTAL: "0"
+      SLATES_TEST_CLI: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 5805be68
+          path: base
+      - uses: actions/checkout@v4
+        with:
+          path: stack
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: Build each tree's live chaos flows
+        run: |
+          for tree in base stack; do
+            (cd "$tree" && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-$tree" cargo test -p slates-cli --test live_chaos --no-run) || echo "BUILD $tree FAILED"
+          done
+      - name: live_chaos, interleaved
+        run: |
+          set +e
+          for round in 1 2 3; do
+            for tree in base stack; do
+              echo "=== live_chaos $tree round $round start $(date -u +%H:%M:%S) load $(cut -d' ' -f1 /proc/loadavg)"
+              (cd "$tree" && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-$tree" cargo test -p slates-cli --test live_chaos -- --test-threads=1) > "$tree-$round.log" 2>&1
+              echo "=== live_chaos $tree round $round exit $?"
+              grep -E '^test .* \.\.\. FAILED|^test result' "$tree-$round.log"
+            done
+          done
+          exit 0
