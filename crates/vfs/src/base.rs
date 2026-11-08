@@ -39,7 +39,9 @@ use crate::host::{
   BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, HostKind, WatchState,
 };
 use crate::ids::{Epoch, InodeNo, SnapshotId};
-use crate::inode::{BaseBody, Body, FileTag, Fingerprint, Home, Inode, Kind, Witness};
+use crate::inode::{
+  BaseBody, Body, FileTag, Fingerprint, Home, Inode, Kind, WindowsAttributes, Witness,
+};
 use crate::journal::Op;
 use crate::volume::{DirRow, Located, Store, Volume, VolumeConfig};
 
@@ -1555,7 +1557,7 @@ impl Overlay<'_> {
     let inode = store.inodes.get_mut(handle)?;
     let changed = inode.adopt_observed(
       fp.size,
-      Some((fp.mode, fp.uid, fp.gid)),
+      Some((fp.mode, fp.uid, fp.gid, fp.windows)),
       fp.mtime_ns,
       fp.ctime_ns,
     );
@@ -1690,6 +1692,8 @@ impl Overlay<'_> {
         inode.attrs.mtime = fp.mtime_ns;
         inode.attrs.ctime = fp.ctime_ns;
         (inode.attrs.uid, inode.attrs.gid) = (fp.uid, fp.gid);
+        // The disk's Windows attribute bits, as an untouched base entry reports them (A-262).
+        inode.windows = WindowsAttributes::from_image(fp.windows);
         inode.home = Home::new(parent_no, self.vol.policy.hash(&entry.name));
         let handle = store.inodes.insert(inode)?;
         self.vol.table_set(store, no, handle)?;
@@ -1707,6 +1711,7 @@ impl Overlay<'_> {
         inode.attrs.mtime = fp.mtime_ns;
         inode.attrs.ctime = fp.ctime_ns;
         (inode.attrs.uid, inode.attrs.gid) = (fp.uid, fp.gid);
+        inode.windows = WindowsAttributes::from_image(fp.windows);
         inode.home = Home::new(parent_no, self.vol.policy.hash(&entry.name));
         let handle = store.inodes.insert(inode)?;
         self.vol.table_set(store, no, handle)?;
@@ -1724,6 +1729,7 @@ impl Overlay<'_> {
         let mut inode = Inode::new(no, epoch, Kind::Dir, fp.mode, Body::Directory(child));
         inode.attrs.nlink = 2;
         (inode.attrs.uid, inode.attrs.gid) = (fp.uid, fp.gid);
+        inode.windows = WindowsAttributes::from_image(fp.windows);
         inode.attrs.mtime = fp.mtime_ns;
         inode.attrs.ctime = fp.ctime_ns;
         let handle = store.inodes.insert(inode)?;
@@ -2552,7 +2558,7 @@ impl Overlay<'_> {
       let inode = store.inodes.get_mut(handle)?;
       let changed = inode.adopt_observed(
         fp.size,
-        Some((fp.mode, fp.uid, fp.gid)),
+        Some((fp.mode, fp.uid, fp.gid, fp.windows)),
         fp.mtime_ns,
         fp.ctime_ns,
       );

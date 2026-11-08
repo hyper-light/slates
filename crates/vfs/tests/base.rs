@@ -2780,3 +2780,42 @@ fn an_overlay_never_follows_a_base_symlink_out_of_the_overlaid_subtree_cwe_59() 
     b"legitimate"
   );
 }
+
+/// A-262. Do: over a disk whose file holds Windows attribute bits (`HIDDEN | ARCHIVE`, as `attrib +h` leaves one on a
+/// Windows disk), make an overlay and read the untouched file's attributes; then, as an outsider, clear `HIDDEN` on the
+/// disk and add a file beside it, and read again. Expect: the volume reports the disk's bits for the untouched file, and
+/// takes the outsider's change at the directory's relist, as it takes an outsider's `chmod`; the file's mode is the
+/// disk's own throughout.
+#[test]
+fn an_untouched_base_file_reports_the_disks_windows_attribute_bits_and_follows_their_change() {
+  let mut host = SimHost::new();
+  host.replace_file("/kept.txt", b"kept on the disk");
+  host.set_windows_attributes("/kept.txt", 0x22);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  let no = vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/kept.txt")
+    .unwrap()
+    .inode;
+  let first = vol.with_host(&mut host).observe(&mut store, no).unwrap();
+  assert_eq!(first.windows.bits(), 0x22, "the disk's bits, untouched");
+  host.advance_ns(1_000_000_000);
+  host.set_windows_attributes("/kept.txt", 0x20);
+  host.replace_file("/beside.txt", b"a change to the directory");
+  let root = vol.root();
+  vol
+    .with_host(&mut host)
+    .lookup(&mut store, root, "beside.txt")
+    .unwrap();
+  let after = vol.with_host(&mut host).observe(&mut store, no).unwrap();
+  assert_eq!(
+    after.windows.bits(),
+    0x20,
+    "the outsider's change, at the relist"
+  );
+  assert_eq!(
+    after.attrs.mode, first.attrs.mode,
+    "the mode is the disk's own"
+  );
+}

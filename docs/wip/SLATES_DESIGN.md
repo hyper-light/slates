@@ -16118,7 +16118,7 @@ Applied in the same change to: A-26 (its device refusal's answer), the condition
   MKNOD with 10007, and through the Linux kernel's NFSv4 client by `a_device_node_is_refused_eperm`
   (`crates/server/tests/nfs_v4_kernel.rs`, as root on CI).
 
-### A-262 — The volume keeps Windows' attribute bits beside the mode, and a file's read-only state is its mode (accepted 2026-11-08; the drive and the volume built, the merge, the landings and the base plane owed)
+### A-262 — The volume keeps Windows' attribute bits beside the mode, and a file's read-only state is its mode (accepted 2026-11-08; the drive, the volume and the Windows base plane built; a Windows landing and the merge owed)
 Applied in the same change to: §4.5 (the inode), §4.6 (the Windows conformance status), A-209 (amended: ATTRIBUTES),
 GAPS, `docs/wip/conformance.md`, the winfstest list
 (`docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt`, 373 to 355 entries), `crates/vfs`
@@ -16148,12 +16148,28 @@ overwrite, `SetBasicInfo`, `CanDelete` and rename in `host.rs`).
   a reviewed golden vector (`an_inode_images_encoding_is_its_golden_vector`). WinFsp's wire already carries the word.
 - **What other platforms do with them.** NFS, FUSE and FSKit expose none and set none. A Linux or macOS landing carries
   them in the volume and applies none (not yet built on any platform; below). An overlay reports none of them for a
-  file whose disk attributes it never read: no bit, so `NORMAL`, or `READONLY` from the mode, whatever the disk's
-  Windows attributes are, until a Windows base plane reads them (owed, below).
-- **Owed, each its own change under this amendment.** (1) The merge's metadata dimension: the bits merged as the mode is,
-  accept, identical or conflict, never inferred (D-27); until then a merge carries none of them, so a green made by
-  merging keeps none. (2) A Windows landing applying them (`SetFileAttributesW`). (3) A Windows base plane reading
-  them from the disk.
+  file whose disk attributes it never read: no bit, so `NORMAL`, or `READONLY` from the mode. Since stage 3's base half
+  an overlay of a Windows directory reads them from its disk; an overlay of a Linux or macOS directory has none to read.
+- **Each stage's state.**
+  - **Stage 1, built 2026-11-08:** the volume, the image (layout 23), the drive, the list (373 to 355).
+  - **Stage 3's base half, built 2026-11-08:** the Windows base plane reads them. A fingerprint carries the disk's bits
+    apart from its mode (`Fingerprint::windows`, image layout 24, delta 7, `a_witness_encoding_is_its_golden_vector`), and
+    the Windows base reports a POSIX mode by DrvFs's mapping (`windows_mode_and_bits` in `crates/base/src/lib.rs`: a
+    directory `S_IFDIR | 0o755`, a file `S_IFREG | 0o644`, `0o444` when `READONLY`, a reparse point `S_IFLNK | 0o777`).
+    An untouched base entry reports the disk's bits, and takes an outsider's change to them at its directory's relist,
+    as it takes an outsider's `chmod`
+    (`an_untouched_base_file_reports_the_disks_windows_attribute_bits_and_follows_their_change`, `crates/vfs/tests/base.rs`),
+    and on CI's Windows runner through an overlay of a real directory mounted as a drive
+    (`an_overlay_of_a_windows_directory_keeps_its_files_read_only_state_and_attributes`, `crates/cli/tests/winfsp.rs`:
+    an ordinary file is writable and deletable, an `attrib +R` one refuses both, an `attrib +H` one reads hidden).
+    It also fixes what stage 1 would have exposed: the Windows base had reported the attribute word itself as the mode, so
+    an ordinary file (`ARCHIVE`, `0x20`) read as `0o040`, which the drive would have reported read-only and refused to
+    delete (`docs/bugs/2026-11-08-a-windows-base-files-mode-was-its-attribute-word.md`).
+  - **Stage 3's landing half, owed:** a Windows landing applying the bits (`SetFileAttributesW`). It waits on a Windows
+    landing writer, which does not exist yet (`crates/land`'s writer is `cfg(unix)`). Linux and macOS landings carry
+    the bits in the volume and apply none.
+  - **Stage 2, owed when works are mountable:** the merge's metadata dimension, the bits merged as the mode is, accept,
+    identical or conflict, never inferred (D-27). No work can set the bits today (below), so no merge can drop them.
 - **Invisible to the merge and the landing until then (checked 2026-11-08).** A work's increment is composed from the
   operations declared through the SDK (`WorkState::journal`: edits and declarations, `WorkOp`), and no `WorkOp` carries
   the bits, so no work can set them and two increments can never differ in them alone; a mounted work would be derived

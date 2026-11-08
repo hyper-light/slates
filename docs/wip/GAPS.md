@@ -11,10 +11,12 @@
 > permission is POSIX's mode"), so `SetFileAttributes` answered success and kept nothing and every file reported
 > `NORMAL`. Now a file's READONLY is its mode's write bits (DrvFs's and Samba's mapping), and the other bits, with a
 > directory's READONLY, are kept in the inode's two bytes of tail padding (168 B, unchanged; tree_heap 260, 275 and 293
-> B per entry, unchanged). winfstest's 18 ATTRIBUTES cases come off its list (373 to 355). **Still owed under A-262:** the
-> merge's dimension (a merge carries none of the bits yet), a Windows landing applying them (no landing applies them on
-> any platform; Linux and macOS will carry them unapplied), and a Windows base plane reading them (an overlay reports
-> none for a file it never saw set).
+> B per entry, unchanged). winfstest's 18 ATTRIBUTES cases come off its list (373 to 355). The Windows base plane reads
+> them since stage 3's base half: a fingerprint carries the disk's bits apart from a DrvFs-mapped mode (until then the
+> Windows base reported the attribute word itself as the mode, `0x20` as `0o040`). **Still owed under A-262:** a Windows
+> landing applying them (it waits on a Windows landing writer, which does not exist; Linux and macOS carry them
+> unapplied), and the merge's dimension, owed when works are mountable (no work can set the bits today, so no merge
+> drops them).
 
 > **A file removed while open over NFSv4 was reclaimed at once, and the client renamed it aside: fixed (2026-11-08,
 > §4.6 NFSv4 state; A-260).** An NFSv4 open held nothing in the volume, so a REMOVE of an open file reclaimed it (its

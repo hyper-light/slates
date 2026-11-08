@@ -2683,3 +2683,51 @@ const GOLDEN_INODE_IMAGE: &str = concat!(
   "0000",                             // attribute_of: None; sidecar: None
   "2200",                             // windows: HIDDEN | ARCHIVE (image version 23, A-262)
 );
+
+/// A-262's golden vector for a base file's witness, as image version 24 writes it: its fingerprint now ends with the
+/// disk's Windows attribute bits (`HIDDEN | ARCHIVE`, `22 00`), after the birth time, and the content identity and the
+/// witness's own fields follow. A change to the layout fails it.
+#[test]
+fn a_witness_encoding_is_its_golden_vector() {
+  use slates_wire::Wire;
+  let witness = slates_vfs::inode::Witness {
+    fingerprint: slates_vfs::inode::Fingerprint {
+      dev: 1,
+      ino: 2,
+      size: 3,
+      mtime_ns: 4,
+      ctime_ns: 5,
+      mode: 0o100_644,
+      uid: 501,
+      gid: 20,
+      birth_ns: 6,
+      windows: 0x22,
+    },
+    identity: [0xab; 32],
+    witnessed_at: 7,
+    racy: false,
+  };
+  let mut bytes = Vec::new();
+  witness.encode(&mut bytes);
+  let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+  assert_eq!(hex, GOLDEN_WITNESS, "the witness's encoding");
+  let back = slates_vfs::inode::Witness::decode(&mut bytes.as_slice()).unwrap();
+  assert_eq!(
+    back, witness,
+    "the golden decodes to the witness it encodes"
+  );
+}
+
+/// Format: the golden encoding of [`a_witness_encoding_is_its_golden_vector`]'s witness.
+const GOLDEN_WITNESS: &str = concat!(
+  "0100000000000000",                                                 // dev
+  "0200000000000000",                                                 // ino
+  "0300000000000000",                                                 // size
+  "04000000000000000500000000000000",                                 // mtime, ctime
+  "a4810000f501000014000000", // mode 0o100644, uid 501, gid 20
+  "0600000000000000",         // birth time
+  "2200",                     // windows: HIDDEN | ARCHIVE (image version 24, A-262)
+  "abababababababababababababababababababababababababababababababab", // identity
+  "0700000000000000",         // witnessed at
+  "00",                       // racy: false
+);

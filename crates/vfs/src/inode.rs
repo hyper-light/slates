@@ -164,6 +164,10 @@ pub struct Fingerprint {
   /// the device and inode number it tells a file from one that took its number since (A-151, [`FileTag`]). A host
   /// reports the same value for a file whether it lists it or opens it.
   pub birth_ns: i64,
+  /// The Windows attribute bits the disk holds for the entry, those [`WindowsAttributes::kept`] keeps for its kind
+  /// (A-262): an untouched base entry reports them through the WinFsp drive as the disk holds them. Zero on every host but
+  /// Windows, which holds none.
+  pub windows: u16,
 }
 
 impl Fingerprint {
@@ -507,7 +511,7 @@ impl Inode {
   }
 
   /// Takes attributes observed on the host beneath an overlay (an outsider's edit, §4.5): the size,
-  /// the mode and owner when the observation carries them, and the host's times. The change counter
+  /// the mode, owner and Windows attribute bits (A-262) when the observation carries them, and the host's times. The change counter
   /// moves when any of them differs from what the volume held, so a client caching by the counter
   /// sees the edit, and stays where it is when none does, so an unchanged file's cache is kept (A-38).
   /// Whether anything differed: the caller tells the file's Shards backings (Shards part 3, step 4).
@@ -515,13 +519,19 @@ impl Inode {
   pub(crate) fn adopt_observed(
     &mut self,
     size: u64,
-    mode_and_owner: Option<(u32, u32, u32)>,
+    metadata: Option<(u32, u32, u32, u16)>,
     mtime: i64,
     ctime: i64,
   ) -> bool {
     let changed = self.attrs.size != size
-      || mode_and_owner.is_some_and(|(mode, uid, gid)| {
-        (mode, uid, gid) != (self.attrs.mode, self.attrs.uid, self.attrs.gid)
+      || metadata.is_some_and(|(mode, uid, gid, windows)| {
+        (mode, uid, gid, WindowsAttributes::from_image(windows))
+          != (
+            self.attrs.mode,
+            self.attrs.uid,
+            self.attrs.gid,
+            self.windows,
+          )
       })
       || self.attrs.mtime != mtime
       || self.attrs.ctime != ctime;
@@ -529,10 +539,11 @@ impl Inode {
       return false;
     }
     self.attrs.size = size;
-    if let Some((mode, uid, gid)) = mode_and_owner {
+    if let Some((mode, uid, gid, windows)) = metadata {
       self.attrs.mode = mode;
       self.attrs.uid = uid;
       self.attrs.gid = gid;
+      self.windows = WindowsAttributes::from_image(windows);
     }
     self.attrs.mtime = mtime;
     self.stamp_change(ctime);
