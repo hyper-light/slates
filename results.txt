@@ -1,0 +1,20 @@
+runner ubuntu-latest, 4 CPUs, Sun Nov  8 08:15:03 UTC 2026, head ed2f8430f82c987cfa15baff7cfdad0a456276c8
+spinners: 8
+== round 1 at 08:15:03, load 2.86, 1.23, 0.46
+test a_taken_over_scratch_volume_becomes_servable_and_never_answers_notfound ... ignored, heavy fleet regression (1024-volume takeover); run alone
+test takeover_periods_scale_with_the_retired_hosts_object_count ... ignored, measurement, not a gate; prints periods-to-recover vs the retired host's object count
+test transient_false_condemnation_cost_is_flat_in_the_owners_object_count ... ignored, heavy fleet measurement (false condemnation of an N-object owner); run alone
+test result: ok. 96 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 458.75s
+== round 1 exit 0, load 11.24, 9.46, 4.93
+== round 2 at 08:22:42, load 11.24, 9.46, 4.93
+test a_taken_over_scratch_volume_becomes_servable_and_never_answers_notfound ... ignored, heavy fleet regression (1024-volume takeover); run alone
+test takeover_periods_scale_with_the_retired_hosts_object_count ... ignored, measurement, not a gate; prints periods-to-recover vs the retired host's object count
+test transient_false_condemnation_cost_is_flat_in_the_owners_object_count ... ignored, heavy fleet measurement (false condemnation of an N-object owner); run alone
+test result: ok. 96 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 476.20s
+== round 2 exit 0, load 11.39, 11.14, 7.64
+== round 3 at 08:30:39, load 11.39, 11.14, 7.64
+test a_taken_over_scratch_volume_becomes_servable_and_never_answers_notfound ... ignored, heavy fleet regression (1024-volume takeover); run alone
+test takeover_periods_scale_with_the_retired_hosts_object_count ... ignored, measurement, not a gate; prints periods-to-recover vs the retired host's object count
+test transient_false_condemnation_cost_is_flat_in_the_owners_object_count ... ignored, heavy fleet measurement (false condemnation of an N-object owner); run alone
+test result: ok. 96 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 438.60s
+== round 3 exit 0, load 11.55, 11.62, 9.23
