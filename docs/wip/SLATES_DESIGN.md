@@ -15665,7 +15665,8 @@ Applied in the same change to:
   - After a takeover the resend is refused retryable and nothing runs twice, but the version is not named. That falls
     short of §4.16's failure matrix (Masked after takeover) and is owed as A-255, not accepted here.
 - **Measured.** The bug record (`docs/bugs/2026-11-08-a-submit-resent-after-its-owner-restarted-was-applied-twice.md`):
-  the rung's 109 to 4,261 oracle failures fall to 0, five runs of five.
+  the rung's 109 to 4,261 oracle failures fall to 0 on every run that finished. 7 of 18 runs stalled on W3's checkpoint
+  fence, which is independent of this rule (A-257).
 
 ### A-246 — A restarted owner re-enqueues the merge records its chain holds (accepted 2026-11-07)
 

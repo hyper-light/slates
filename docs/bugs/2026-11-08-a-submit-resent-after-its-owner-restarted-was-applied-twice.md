@@ -25,8 +25,10 @@ own id meets its original answer" (§4.9) was broken.
     (CI run 42484881444), answered `Submitted { version: Some(2) }`; green with the fix (42484884876).
   - `a_submit_resent_while_its_version_still_waits_after_the_restart_joins_the_wait`: red (the head went to 2); green
     with the fix: no answer and no second version while the record is withheld, then version 1.
-- After the fix, the same rung (adacachy, release, primary killed at 5 s): five runs, 0 oracle failures, harness exit
-  0, 13.1 to 13.9 s. `merge.acceptance_rejoined` counted the resends joining the wait (95 in one run).
+- After the fix, the same rung (adacachy, release, primary killed at 5 s): every run that finished had 0 oracle failures.
+  Five such runs took 13.1 to 13.9 s, harness exit 0, and `merge.acceptance_rejoined` counted the resends joining the
+  wait (95 in one run). Across all the builds of this fix, 7 of 18 runs did not finish: the green fenced at recovery and
+  they stalled. That is a different bug, below.
 
 ## Fix
 
@@ -57,8 +59,9 @@ model gains a wait step, so random acknowledgement orders with recoveries hold t
 committed. Nothing runs twice (the head stays 1), and the resend is refused `OwnerUnreachable` without end, so the client
 never learns its version. That is not what the design promises: §4.16's failure matrix has a green's owner loss Masked
 after takeover, and §4.8's walk-through has retries return their original completion records from the new owner. It is
-owed as A-255: the submit's completion carried in the merge record (RIFL ties a completion record to the object it
-modified; D-15, to be verified against the paper), and the resend reaching the green's successor.
+owed as A-255: the submit's completion carried in the merge record, and the resend reaching the green's successor. RIFL
+states the rule (Lee et al., SOSP 2015, §3, read 2026-11-08): "the completion record is stored wherever that object is
+stored. If the object migrates, then the completion record must move with it."
 
 Why nothing runs twice meanwhile, by test (`a_works_head_is_never_placed_so_a_takeover_cannot_bring_it_back_to_run_a_resend`):
 a work's head can never reach a holder. `Snapshot` refuses a work (`Unsupported`), `LiveShip` finds no store slot for one
@@ -68,9 +71,17 @@ it sent to the successor is refused, not run.
 
 ## The fence the rung met
 
-Some rungs on this fix fenced the green at recovery and stalled: `NotAccepted`, at versions 260 to 448 (4 of 4 runs, then
-0 of 5, then 2 of 3 on a build from an empty target directory, so not a mixed build, as first suspected). It is not this
-fix's: a build printing the refusal showed `version 251 held 250: increment base 0: BaseUnavailable { base: 0, floor: 250
-}`. The W3 checkpoint folds to the reachable floor without looking at the increments above it, which can have bases
-below it, accepted before their works moved on. Recovery restores at the checkpoint and cannot replay them. Its own
-record and fix follow.
+7 of 18 rungs on this fix fenced the green at recovery and stalled: `NotAccepted`, at versions 260 to 448 (4 of 4 runs,
+then 0 of 5, then 2 of 3 on a build from an empty target directory, so not a mixed build, as first suspected, then 1 of
+6). The fence is W3's and independent of this fix. A build printing the refusal showed `version 251 held 250: increment
+base 0: BaseUnavailable { base: 0, floor: 250 }`: a checkpoint's floor and an increment's base, neither of which this fix
+reads or writes. The W3 checkpoint folds to the reachable floor without looking at the increments above it, which can
+have bases below it, accepted before their works moved on. Recovery restores at the checkpoint and cannot replay them.
+
+liveness's reproduction needs no primary kill and no part of this fix:
+`a_checkpoint_leaves_every_later_entry_a_base_recovery_can_replay` (`crates/server/tests/green_checkpoint.rs`,
+agents/liveness-checkpoint-floor at e35fc17e, on main 9a996608, which has no `Op::CompletionAwaiting`). The fix is
+liveness's, A-257: replay stops deciding again what was accepted, and applies it. A floor rule was tried on paper first
+and is wrong: under steady concurrency no version qualifies, so a checkpoint would never fold.
+
+Until A-257 lands this rung can stall, and its count cannot be read as this fix's.
