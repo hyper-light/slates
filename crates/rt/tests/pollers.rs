@@ -123,6 +123,8 @@ fn a_ring_during_the_idle_spin_wakes_a_consuming_poller() {
 static LIVE_ASKED: AtomicU64 = AtomicU64::new(0);
 /// How many times the ended task's poller was asked. Must stop climbing once its task is gone.
 static GONE_ASKED: AtomicU64 = AtomicU64::new(0);
+/// Set by the ending task in its last poll, the step after which its slot is free: what the sweeps are counted from.
+static GONE_ENDED: AtomicBool = AtomicBool::new(false);
 
 /// Registers a poller and stays alive, never woken: the control that proves the shard is still
 /// sweeping pollers while the assertion below watches the other counter stand still.
@@ -167,6 +169,28 @@ async fn gone_poller_task() {
   for _ in 0..GONE_TASK_STEPS {
     futures::yield_now().await;
   }
+  GONE_ENDED.store(true, Ordering::Release);
+}
+
+/// Shape: sweeps the shard must make after the ending task's last step before the ended poller's count is taken. A
+/// sweep is one pass of `wake_ready_pollers`, which asks the living poller once, so the living count measures them. The
+/// step that set [`GONE_ENDED`] may still be finishing when it is seen, and a sweep may be under way, so the count
+/// starts one sweep later than the first that could have begun after it.
+const SWEEPS_TO_FORGET: u64 = 2;
+/// Shape: sweeps watched after that, across which the ended poller's count must not move: far more than the one sweep
+/// that would ask a remembered poller, so a poller forgotten only by luck is not missed.
+const SWEEPS_WATCHED: u64 = 1_000;
+/// Shape: the wall-clock backstop for each wait, which only ends a test whose shard stopped altogether. The waits are
+/// on sweeps, which a shard starved of its CPU still makes, late (the old 50 ms windows saw no sweep at all 1 run in 30
+/// at load 40 on an 18-core Mac, 4 of 20 at load 82); a minute is past any starvation a test machine has shown.
+const BACKSTOP: Duration = Duration::from_secs(60);
+
+/// Waits until the living poller has been asked `more` times past `from`: that many sweeps. Its count, when the wait
+/// ended, and whether the sweeps happened before [`BACKSTOP`].
+fn sweeps_past(from: u64, more: u64) -> (u64, bool) {
+  let target = from.saturating_add(more);
+  let swept = wait_until(BACKSTOP, || LIVE_ASKED.load(Ordering::Acquire) >= target);
+  (LIVE_ASKED.load(Ordering::Acquire), swept)
 }
 
 /// Keeps the shard stepping, so `wake_ready_pollers` keeps running for the duration of the test. Without
@@ -180,8 +204,9 @@ async fn busy_task() {
 
 /// §4.3, CLAUDE.md #8 (every structure bounded) — a poller is forgotten when its task ends. Do: on a shard
 /// kept stepping, register one poller from a task that stays alive and one from a task that returns
-/// immediately; once both have been asked, let the shard sweep and compare. Expect: the living task's
-/// poller keeps being asked while the ended task's is never asked again.
+/// after a few steps; once that task has ended and the shard has swept past it, watch [`SWEEPS_WATCHED`] more sweeps,
+/// counted by the living poller, not by the wall clock. Expect: the ended task's poller was asked while its task lived
+/// and is never asked again.
 ///
 /// This is what bounds `ShardInner::pollers`, which `register_poller` pushes to with no bound of its own:
 /// the sweep in `wake_ready_pollers` retains only pollers whose slot still holds the generation they
@@ -197,30 +222,28 @@ fn a_poller_is_forgotten_when_its_task_ends() {
   rt.spawn_on(shard, live_poller_task()).unwrap();
   rt.spawn_on(shard, gone_poller_task()).unwrap();
 
-  assert!(
-    wait_until(WAKE_DEADLINE, || LIVE_ASKED.load(Ordering::Acquire) >= 1
-      && GONE_ASKED.load(Ordering::Acquire) >= 1),
-    "both pollers were registered and asked at least once: live {}, gone {}",
-    LIVE_ASKED.load(Ordering::Acquire),
-    GONE_ASKED.load(Ordering::Acquire)
-  );
-
-  // The ending task has returned by now. Let the shard sweep, then take the two counters together.
-  let _ = wait_until(SETTLE, || false);
-  let live_at_rest = LIVE_ASKED.load(Ordering::Acquire);
+  let ended = wait_until(BACKSTOP, || GONE_ENDED.load(Ordering::Acquire));
+  let gone_while_alive = GONE_ASKED.load(Ordering::Acquire);
+  let (live_at_rest, forgotten) = sweeps_past(LIVE_ASKED.load(Ordering::Acquire), SWEEPS_TO_FORGET);
   let gone_at_rest = GONE_ASKED.load(Ordering::Acquire);
-  let _ = wait_until(SETTLE, || false);
-  let live_after = LIVE_ASKED.load(Ordering::Acquire);
+  let (live_after, watched) = sweeps_past(live_at_rest, SWEEPS_WATCHED);
   let gone_after = GONE_ASKED.load(Ordering::Acquire);
   let _ = rt.shutdown();
 
   assert!(
-    live_after > live_at_rest,
-    "non-vacuity: the shard was still sweeping pollers across the window ({live_at_rest} then \
-     {live_after}), so a frozen counter means forgotten and not parked"
+    ended && forgotten && watched,
+    "the shard swept within {BACKSTOP:?} of each wait: the ending task ended {ended}, then {SWEEPS_TO_FORGET} sweeps \
+     {forgotten} and {SWEEPS_WATCHED} more {watched} (the living poller asked {live_at_rest} then {live_after} times)"
+  );
+  assert!(
+    gone_while_alive >= 1,
+    "non-vacuity: the ending task's poller was asked while its task lived ({gone_while_alive} times), so a count that \
+     stands still means forgotten and not never registered"
   );
   assert_eq!(
-    gone_after, gone_at_rest,
-    "the ended task's poller is never asked again ({gone_at_rest} then {gone_after})"
+    gone_after,
+    gone_at_rest,
+    "the ended task's poller is never asked again across {} sweeps ({gone_at_rest} then {gone_after})",
+    live_after - live_at_rest
   );
 }
