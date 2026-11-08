@@ -1,0 +1,78 @@
+name: diag-a228
+
+# Diagnostics only, never on main (A-228, starved is not stuck). On both Windows runners, the shared scheduler reader's
+# tests and clippy over the crates it changes. Results go to diag-results/a228-<n>-<os>.
+on:
+  push:
+    branches: ["diag-a228-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  windows:
+    name: reader tests and clippy (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: The reader's tests, the watchdog's rule tests, and clippy
+        run: |
+          R=../results.txt
+          echo "runner ${{ matrix.os }}, $NUMBER_OF_PROCESSORS CPUs, $(git log --oneline -1 | cut -c1-80), $(date -u)" > $R
+          for run in 1 2 3 4 5; do
+            status=0
+            cargo test --locked -p slates-rt --lib thread_clock > ../rt.log 2>&1 || status=$?
+            grep -E '^test |test result|panicked|^error' ../rt.log | cut -c1-300 | tee -a $R || true
+            echo "== reader tests, run $run, exit $status" | tee -a $R
+          done
+          status=0
+          cargo test --locked -p slates-server --lib watchdog > ../wd.log 2>&1 || status=$?
+          grep -E '^test |test result|^error' ../wd.log | cut -c1-300 | tee -a $R || true
+          echo "== watchdog rule tests, exit $status (four starved replays are red until the rule lands)" | tee -a $R
+          status=0
+          cargo clippy --locked -p slates-rt -p slates-server --all-targets -- -D warnings > ../clippy.log 2>&1 || status=$?
+          grep -E '^error|-->|Finished' ../clippy.log | cut -c1-300 | tee -a $R || true
+          echo "== clippy, exit $status" | tee -a $R
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/a228-3-${{ matrix.os }}"
+          git config user.name "diag-a228"
+          git config user.email "diag-a228@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-a228-3 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
