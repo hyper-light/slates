@@ -228,18 +228,18 @@ mod tests {
   #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
   use super::*;
 
-  #[cfg(loom)]
-  use loom::sync::atomic::{AtomicU8, AtomicU64};
   #[cfg(not(loom))]
   use std::sync::atomic::{AtomicU8, AtomicU64};
 
   /// A slot in plain atomics: its word and its racy bytes, each copied through an atomic byte as the section's are. Both
   /// threads hold it by shared reference, so the writer's copy-in needs no exclusive borrow.
+  #[cfg(not(loom))]
   struct Atomics {
     word: AtomicU64,
     bytes: Vec<AtomicU8>,
   }
 
+  #[cfg(not(loom))]
   impl Atomics {
     /// A slot whose racy span holds a purge's head and `path` bytes of path.
     fn new(path: usize) -> Self {
@@ -250,6 +250,7 @@ mod tests {
     }
   }
 
+  #[cfg(not(loom))]
   impl Memory for &Atomics {
     fn load(&self, order: Ordering) -> Result<u64, Refusal> {
       Ok(self.word.load(order))
@@ -359,7 +360,62 @@ mod tests {
   #[cfg(loom)]
   mod model {
     use super::*;
+    use loom::sync::atomic::{AtomicU8, AtomicU64};
     use slates_mem::loom_bounds;
+
+    /// The slot with its racy span coarsened to three relaxed words: the purge's inode, its offset, and the last byte of
+    /// its path. A copy that spans two publications still reads a mix of them, which is the defect the model looks for.
+    /// With each byte its own atomic the model had not finished after 39 minutes (2026-11-07): a relaxed load may read any
+    /// earlier store, so the choices multiply per byte. The other fields are functions of these in [`intent`].
+    struct Coarse {
+      word: AtomicU64,
+      inode: AtomicU64,
+      offset: AtomicU64,
+      path_end: AtomicU8,
+    }
+
+    impl Memory for &Coarse {
+      fn load(&self, order: Ordering) -> Result<u64, Refusal> {
+        Ok(self.word.load(order))
+      }
+      fn store(&self, value: u64, order: Ordering) -> Result<(), Refusal> {
+        self.word.store(value, order);
+        Ok(())
+      }
+      fn copy_out(&self, at: usize, into: &mut [u8]) -> Result<(), Refusal> {
+        let shape = intent(1, CLIENT).purge;
+        if at == 0 {
+          let inode = self.inode.load(Ordering::Relaxed);
+          let fields = [
+            (INODE_AT, inode),
+            (OBJECT_GENERATION_AT, inode + 1),
+            (OFFSET_AT, self.offset.load(Ordering::Relaxed)),
+            (LEN_AT, shape.len),
+            (PATH_LEN_AT, u64::try_from(shape.path.len()).unwrap()),
+          ];
+          for (field_at, value) in fields {
+            into[field_at..field_at + size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
+          }
+        } else {
+          into.copy_from_slice(shape.path.as_bytes());
+          *into.last_mut().unwrap() = self.path_end.load(Ordering::Relaxed);
+        }
+        Ok(())
+      }
+      fn copy_in(&mut self, at: usize, from: &[u8]) -> Result<(), Refusal> {
+        if at == 0 {
+          self.inode.store(field(from, INODE_AT)?, Ordering::Relaxed);
+          self
+            .offset
+            .store(field(from, OFFSET_AT)?, Ordering::Relaxed);
+        } else {
+          self
+            .path_end
+            .store(*from.last().unwrap(), Ordering::Relaxed);
+        }
+        Ok(())
+      }
+    }
 
     /// A-249 (AC-0.7). Do: a writer publishes two purges for the same client, then no purge, while a Create of that
     /// client and a program's read the slot, in every interleaving within the workspace's bounds. Expect: the client's
@@ -369,7 +425,12 @@ mod tests {
       loom_bounds::explore("purge slot: a publish racing a Create", || {
         // Test scaffolding under `cfg(loom)` only (D-8 exception 3): the model's writer and reader share it, leaked for
         // the `'static` loom's threads need, as `slates-ipc`'s park model does.
-        let memory: &'static Atomics = Box::leak(Box::new(Atomics::new(size_of::<u64>())));
+        let memory: &'static Coarse = Box::leak(Box::new(Coarse {
+          word: AtomicU64::new(0),
+          inode: AtomicU64::new(0),
+          offset: AtomicU64::new(0),
+          path_end: AtomicU8::new(0),
+        }));
         let writer = loom::thread::spawn(move || {
           let mut writer = Writer::new();
           let mut slot = memory;
