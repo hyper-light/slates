@@ -1,0 +1,95 @@
+name: DIAG bug-sweep 24, U10 and A-248 merged onto main fb435eac, the Linux gate (not for main)
+
+# A diagnostics branch, never merged. The gate of diag 21-23 again, on the merge with main fb435eac (wire major 2,
+# layout 5, A-237, A-228, A-253). live_chaos is left out: diag 23 measured it failing as often on the base (10 failed
+# tests in 6 runs) as on the stack (9 in 6). Each step's outcome and every test-result line are pushed to
+# diag-results/bug-sweep-24-<arch>, watched with git fetch (the supervisor's order: no API status polling).
+
+on:
+  push:
+    branches: [diag-bug-sweep-24]
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_INCREMENTAL: "0"
+      SLATES_TEST_CLI: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: Suite tools and the operator's grant
+        run: |
+          sudo apt-get update && sudo apt-get install -y strace nfs-common fuse3 inotify-tools ripgrep sqlite3 vim
+          grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+          mkdir -p out && uname -a | tee out/uname.txt
+      - id: dirty
+        name: The dirty-page test, three runs
+        if: ${{ !cancelled() }}
+        run: |
+          for run in 1 2 3; do
+            cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture --exact \
+              a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path > "out/dirty-$run.log" 2>&1
+            code=$?; echo "dirty run $run exit $code"; [ $code = 0 ] || exit 1
+          done
+      - id: fuse
+        name: bridge-fuse, every suite
+        if: ${{ !cancelled() }}
+        run: cargo test --no-fail-fast -p slates-bridge-fuse -- --test-threads=1 > out/bridge-fuse.log 2>&1
+      - id: server
+        name: The server's FUSE, recovery and NFS write-back suites and its lib
+        if: ${{ !cancelled() }}
+        run: cargo test --no-fail-fast -p slates-server --lib --test fuse_mount --test fuse_told --test fuse_idle --test nfs_writeback --test recovery -- --test-threads=1 > out/server.log 2>&1
+      - id: virtiofs
+        name: The virtio-fs device
+        if: ${{ !cancelled() }}
+        run: cargo test --no-fail-fast -p slates-bridge-virtiofs -- --test-threads=1 > out/virtiofs.log 2>&1
+      - id: core
+        name: bridge-core and vfs
+        if: ${{ !cancelled() }}
+        run: cargo test --no-fail-fast -p slates-bridge-core -p slates-vfs > out/core.log 2>&1
+      - id: cli
+        name: Every CLI suite but live_chaos
+        if: ${{ !cancelled() }}
+        run: |
+          targets=$(ls crates/cli/tests/*.rs | xargs -n1 basename | sed 's/\.rs$//' | grep -vx live_chaos | sed 's/^/--test /' | tr '\n' ' ')
+          cargo test --no-fail-fast -p slates-cli --bins $targets -- --test-threads=1 > out/cli.log 2>&1
+      - id: conformance
+        name: fsx, fsstress and pjdfstest over every Linux transport
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          for suite in fsx fsstress pjdfstest; do
+            cargo xtask conformance run --suite $suite --records target/conformance-records --scratch target/conformance-scratch --keep 2>&1 | tee -a out/conformance.log || exit 1
+          done
+      - name: Publish the results
+        if: always()
+        env:
+          OUTCOMES: "dirty=${{ steps.dirty.outcome }} fuse=${{ steps.fuse.outcome }} server=${{ steps.server.outcome }} virtiofs=${{ steps.virtiofs.outcome }} core=${{ steps.core.outcome }} cli=${{ steps.cli.outcome }} conformance=${{ steps.conformance.outcome }}"
+        run: |
+          arch=$(uname -m)
+          {
+            echo "run ${{ github.run_id }} commit ${{ github.sha }} $(cat out/uname.txt)"
+            echo "$OUTCOMES" | tr ' ' '\n'
+            for log in out/*.log; do
+              echo "== $log"
+              grep -aE '^test result|\.\.\. FAILED|^---- |panicked at|SKIP|conformance: .* × ' "$log" | cut -c1-400 | head -80
+            done
+          } > summary.txt
+          git config user.name diag && git config user.email diag@invalid
+          git checkout --orphan results && git rm -rfq .
+          git add summary.txt && git commit -qm "diag-bug-sweep-24 $arch results"
+          git push origin "HEAD:refs/heads/diag-results/bug-sweep-24-$arch"
