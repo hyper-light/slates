@@ -1865,21 +1865,34 @@ const ROUTED_BY_WORK_GREEN: &str = "fleet.owner_location.routed_by_work_green";
 /// without running it. `None` when this node holds no catalog record naming a green for `volume`, or the green's owner is
 /// not found within the location budget.
 async fn locate_work_green(volume: VolumeId, region: u64) -> WorkGreen {
-  let found = crate::state::with_state(|state| {
-    let catalog = ObjectId(volume.bytes).catalog();
-    let (_, bytes) = state.holder_records.get(&catalog)?.highest(catalog)?;
-    let green = ObjectId(
-      crate::catalog::CatalogValue::from_record_bytes(bytes)?
-        .work_of?
-        .bytes,
-    );
-    let here = state.fleet.object_owner(green) == Some(state.fleet.host());
-    Some((
-      here,
-      crate::owner_location::Query::new(state, green, region),
-    ))
+  // This node's own held copy of the work's catalog record first; else one bounded location round asks the peers that
+  // hold one (`owner_location::locate_work_of`, the round's own bound and counters).
+  let held = crate::state::with_state(|state| {
+    crate::owner_location::held_work_of(state, ObjectId(volume.bytes))
   })
   .flatten();
+  let green = match held {
+    Some(green) => green,
+    None => {
+      let Some(query) = crate::state::with_state(|state| {
+        crate::owner_location::Query::new(state, ObjectId(volume.bytes), region)
+      }) else {
+        return WorkGreen::Unknown;
+      };
+      match crate::owner_location::locate_work_of(query).await {
+        Some(green) => green,
+        None => return WorkGreen::Unknown,
+      }
+    }
+  };
+  let green = ObjectId(green);
+  let found = crate::state::with_state(|state| {
+    let here = state.fleet.object_owner(green) == Some(state.fleet.host());
+    (
+      here,
+      crate::owner_location::Query::new(state, green, region),
+    )
+  });
   let Some((here, query)) = found else {
     return WorkGreen::Unknown;
   };
