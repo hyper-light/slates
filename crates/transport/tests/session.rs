@@ -1710,9 +1710,13 @@ const FLOOD_BURST_DATAGRAMS: usize = 64;
 /// Shape: the flood's pause between bursts, a millisecond of the simulated clock.
 const FLOOD_PAUSE_NS: u64 = 1_000_000;
 
+/// What a handshake's `establish` reported when it gave up, kept apart from `Option` so the helper may assert freely.
+#[derive(Debug, PartialEq, Eq)]
+struct Reported(Option<HandshakeStall>);
+
 /// What ended one end's `establish`, with a bound peer that never takes part: `garbage`, it floods that end with
 /// datagrams that are no flight; otherwise it says nothing. `dialing`, the end under test is the client.
-fn stall_against_a_peer_that_never_joins(dialing: bool, garbage: bool) -> Option<HandshakeStall> {
+fn stall_against_a_peer_that_never_joins(dialing: bool, garbage: bool) -> Reported {
   let mut sim = SimRuntime::new(&config(), 1).unwrap();
   let id = *sim.shard_ids().first().unwrap();
   let identity = self_signed(NAME);
@@ -1767,7 +1771,7 @@ fn stall_against_a_peer_that_never_joins(dialing: bool, garbage: bool) -> Option
     })
     .unwrap();
   sim.run_until_idle();
-  stall_rx.try_recv().unwrap()
+  Reported(stall_rx.try_recv().unwrap())
 }
 
 /// §4.8 formation: a handshake that gives up names the bound it reached, so a fleet whose dials keep failing says why
@@ -1778,17 +1782,17 @@ fn stall_against_a_peer_that_never_joins(dialing: bool, garbage: bool) -> Option
 fn a_handshake_that_gives_up_names_the_bound_it_reached() {
   assert_eq!(
     stall_against_a_peer_that_never_joins(true, false),
-    Some(HandshakeStall::Silence),
+    Reported(Some(HandshakeStall::Silence)),
     "a dialer whose peer stays silent"
   );
   assert_eq!(
     stall_against_a_peer_that_never_joins(false, false),
-    Some(HandshakeStall::Silence),
+    Reported(Some(HandshakeStall::Silence)),
     "an accepted end whose peer stays silent"
   );
   assert_eq!(
     stall_against_a_peer_that_never_joins(true, true),
-    Some(HandshakeStall::Fragments),
+    Reported(Some(HandshakeStall::Fragments)),
     "a dialer flooded with datagrams that are no flight"
   );
 }
