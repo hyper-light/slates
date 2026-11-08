@@ -968,8 +968,9 @@ async fn await_deferred_completion(
         .partition()
         .completion(origin_host, id.client, id.sequence)
       {
-        Seen::Completed(bytes) => Some(bytes),
-        Seen::Acknowledged | Seen::New => None,
+        // An awaiting marker is no completion yet: the acceptance still waits for its commit.
+        Seen::Completed(bytes) if crate::merge_service::decode_awaiting_marker(&bytes).is_none() => Some(bytes),
+        Seen::Completed(_) | Seen::Acknowledged | Seen::New => None,
       },
       crate::daemon::LIVENESS_BUDGET_NS,
     )
@@ -1895,6 +1896,11 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
     .completion(origin, id.client, id.sequence)
   {
     Seen::Completed(bytes) => {
+      // A submit's completion slot may hold the marker of an acceptance still awaiting its commit: the request rejoins
+      // the wait (or is answered, the version having committed), never runs again.
+      if let Some(handled) = crate::merge_service::serve_awaiting_marker(state, origin, id, &bytes) {
+        return handled.map_or(Served::Forwarded, Served::Reply);
+      }
       return Served::Reply(
         ReplyBody::from_bytes(&bytes).unwrap_or_else(|_| refused(Refusal::DuplicateRequest)),
       );
@@ -2310,6 +2316,9 @@ fn run_forwarded(
     .completion(origin, id.client, id.sequence)
   {
     Seen::Completed(bytes) => {
+      if let Some(handled) = crate::merge_service::serve_awaiting_marker(state, origin, id, &bytes) {
+        return handled;
+      }
       return Some(
         ReplyBody::from_bytes(&bytes).unwrap_or_else(|_| refused(Refusal::DuplicateRequest)),
       );

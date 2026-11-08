@@ -2363,8 +2363,86 @@ pub(crate) fn defer_acceptance(state: &mut ShardState, green: DbVolumeId, versio
     .merge
     .awaiting_by_request
     .insert((origin, id.client, id.sequence), (object, version));
+  // The wait is durable too, in the same transaction as the version's append: the request's completion slot holds a
+  // marker naming the version it awaits, which the real completion replaces at the commit (`resolve_accepted`). Kept
+  // in memory alone, the wait was lost with a restart, and the request's resend under its own id ran the verb again
+  // and was accepted as a second version (the bug record of 2026-11-07, a submit resent after its owner restarted was
+  // applied twice).
+  let marker = slates_db::op::Op::CompletionRecorded {
+    record: slates_db::catalog::CompletionRecord {
+      origin,
+      client: id.client,
+      sequence: id.sequence,
+      result: awaiting_marker(object, version),
+    },
+  };
+  let now = state.clock.monotonic_ns();
+  if state.db.mutate(&mut state.segment, &marker, now).is_err() {
+    state.count(AWAITING_UNRECORDED, 1);
+  }
   state.acceptance_deferred = true;
   state.count(ACCEPTANCE_DEFERRED, 1);
+}
+
+/// Format: the prefix of a completion slot's marker for a request whose acceptance waits for its version's commit:
+/// bytes no reply encoding begins with, then the green's 16 bytes and the version's 8, little-endian.
+const AWAITING_MARKER_PREFIX: &[u8] = b"\0slates.merge.awaiting-commit\0";
+
+/// The completion slot's marker for a request awaiting `version` of `object`'s commit ([`defer_acceptance`]).
+fn awaiting_marker(object: ObjectId, version: u64) -> Vec<u8> {
+  let mut bytes = Vec::with_capacity(AWAITING_MARKER_PREFIX.len() + object.0.len() + size_of::<u64>());
+  bytes.extend_from_slice(AWAITING_MARKER_PREFIX);
+  bytes.extend_from_slice(&object.0);
+  bytes.extend_from_slice(&version.to_le_bytes());
+  bytes
+}
+
+/// The green and version a completion slot's bytes say the request awaits, or `None` for an ordinary completion.
+pub(crate) fn decode_awaiting_marker(bytes: &[u8]) -> Option<(ObjectId, u64)> {
+  let rest = bytes.strip_prefix(AWAITING_MARKER_PREFIX)?;
+  let object: [u8; 16] = rest.get(..16)?.try_into().ok()?;
+  let version: [u8; 8] = rest.get(16..)?.try_into().ok()?;
+  Some((ObjectId(object), u64::from_le_bytes(version)))
+}
+
+/// Serves a request whose completion slot holds an awaiting marker (a resend under its own id, typically after the
+/// owner restarted and lost the in-memory wait): never runs the verb again. `None` when `bytes` is not a marker; else
+/// `Some(Some(reply))` when the version has committed (the completion recorded now, replacing the marker), or
+/// `Some(None)` when it still waits, the request having joined the wait so [`resolve_accepted`] answers it.
+pub(crate) fn serve_awaiting_marker(
+  state: &mut ShardState,
+  origin: u64,
+  id: RequestId,
+  bytes: &[u8],
+) -> Option<Option<ReplyBody>> {
+  let (object, version) = decode_awaiting_marker(bytes)?;
+  if placed_version(state, object).is_some_and(|placed| placed >= version) {
+    let reply = ReplyBody::Submitted {
+      version: Some(version),
+      conflicts: Vec::new(),
+    };
+    state.db.begin();
+    let recorded = crate::verbs::record_completion(state, origin, id, reply);
+    if state.db.commit(&mut state.segment).is_err() {
+      state.count(ACCEPTANCE_UNRECORDED, 1);
+      return Some(None);
+    }
+    state.count(ACCEPTANCE_RESOLVED, 1);
+    return Some(Some(recorded));
+  }
+  let route = state.reply_route.take();
+  state
+    .merge
+    .awaiting
+    .entry((object, version))
+    .or_default()
+    .push(AwaitingAcceptance { route, origin, id });
+  state
+    .merge
+    .awaiting_by_request
+    .insert((origin, id.client, id.sequence), (object, version));
+  state.count(ACCEPTANCE_REJOINED, 1);
+  Some(None)
 }
 
 /// A retry of a request whose acceptance is still waiting joins the waiting entry — it will be
@@ -2460,6 +2538,12 @@ pub(crate) fn awaiting_count(state: &ShardState, green: DbVolumeId) -> usize {
 const ACCEPTANCE_DEFERRED: &str = "merge.acceptance_deferred";
 /// A deferred acceptance resolved: the version committed, the completion recorded, the reply sent.
 const ACCEPTANCE_RESOLVED: &str = "merge.acceptance_resolved";
+/// A request whose completion slot held an awaiting marker rejoined its version's wait rather than run again (a resend
+/// under its own id after the owner restarted).
+const ACCEPTANCE_REJOINED: &str = "merge.acceptance_rejoined";
+/// A deferred acceptance whose awaiting marker could not be staged in its transaction: a restart before its commit
+/// loses the wait, as before the marker.
+const AWAITING_UNRECORDED: &str = "merge.awaiting_unrecorded";
 /// A resolved acceptance whose completion record could not be made durable (rolled back); the
 /// client's retry re-executes and meets the idempotent accept.
 const ACCEPTANCE_UNRECORDED: &str = "merge.acceptance_unrecorded";
