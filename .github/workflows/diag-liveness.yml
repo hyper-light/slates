@@ -1,0 +1,166 @@
+name: diag-liveness-slice
+
+# Diagnostics only, never on main (recovery slicing, step 4: extremes). On four runners, beside two nice-19 spinners a
+# logical CPU: the runtime's hold tests (rt tests/alone.rs), the server's unit tests, liveness suite, and on Linux the
+# recovery, daemon and green-checkpoint suites (the slicing test among them); the restart and handoff suites of the CLI.
+# Results go to diag-results/liveness-24-<os>.
+on:
+  push:
+    branches: ["diag-liveness-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  windows:
+    name: slicing (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build
+        run: |
+          cargo test --locked -p slates-rt --test alone --no-run
+          cargo test --locked -p slates-server --lib --test liveness --no-run
+          cargo test --locked -p slates-cli --test start_judgment --test held_rendezvous --no-run
+      - name: Clippy the changed crates and the binary
+        run: |
+          status=0
+          cargo clippy --locked -p slates-rt -p slates-server -p slates-cli --all-targets -- -D warnings > ../clippy.log 2>&1 || status=$?
+          echo "runner ${{ matrix.os }}, $NUMBER_OF_PROCESSORS CPUs, $(git log --oneline -1 | cut -c1-80), $(date -u)" > ../results.txt
+          grep -E '^(warning|error)' ../clippy.log | head -20 >> ../results.txt || true
+          echo "== clippy exit $status" >> ../results.txt
+      - name: The suites beside two spinners a CPU
+        env:
+          SLATES_TEST_CLI: "1"
+        run: |
+          R=../results.txt
+          pids=""
+          for i in $(seq 1 $((NUMBER_OF_PROCESSORS * 2))); do (while :; do :; done) & pids="$pids $!"; done
+          trap 'for p in $pids; do kill $p 2>/dev/null; done' EXIT
+          echo "== spinners: $(echo $pids | wc -w)" | tee -a $R
+          suite() {
+            name="$1"; shift
+            status=0
+            started=$(date +%s)
+            "$@" > ../suite.log 2>&1 || status=$?
+            grep -E -A2 '^test .*(FAILED|ok)$|panicked|test result|is spinning|is wedged|slates anchor: (the starting daemon|daemon exited|the daemon.s heartbeat)' ../suite.log | grep -vE '^test .* ok$|^--$' | cut -c1-300 | tee -a $R || true
+            echo "== $name exit $status in $(( $(date +%s) - started )) s" | tee -a $R
+          }
+          suite "rt alone" cargo test --locked -p slates-rt --test alone
+          suite "server lib" cargo test --locked -p slates-server --lib
+          suite "server liveness" cargo test --locked -p slates-server --test liveness -- --test-threads=1
+          for run in 1 2 3; do
+            suite "held_rendezvous run $run" cargo test --locked -p slates-cli --test held_rendezvous -- --test-threads=1 --nocapture
+          done
+          suite start_judgment cargo test --locked -p slates-cli --test start_judgment -- --test-threads=1 --nocapture
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/liveness-24-${{ matrix.os }}"
+          git config user.name "diag-liveness"
+          git config user.email "diag-liveness@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-liveness-24 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
+
+  linux:
+    name: slicing (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Grant user_allow_other
+        run: grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+      - name: Build
+        run: |
+          cargo test --locked -p slates-rt --test alone --no-run
+          cargo test --locked -p slates-server --lib --test recovery --test liveness --test daemon --test green_checkpoint --no-run
+          cargo test --locked -p slates-cli --test cli --test held_rendezvous --no-run
+      - name: Clippy the changed crates
+        run: |
+          echo "runner ${{ matrix.os }}, $(nproc) CPUs, $(git log --oneline -1 | cut -c1-80), $(date -u)" > ../results.txt
+          status=0
+          cargo clippy --locked -p slates-rt -p slates-db -p slates-server --all-targets -- -D warnings > ../clippy.log 2>&1 || status=$?
+          grep -E '^(warning|error)' ../clippy.log | head -20 >> ../results.txt || true
+          echo "== clippy exit $status" >> ../results.txt
+      - name: The suites beside two spinners a CPU
+        env:
+          SLATES_TEST_CLI: "1"
+        run: |
+          R=../results.txt
+          pids=""
+          for i in $(seq 1 $(( $(nproc) * 2 ))); do nice -n 19 bash -c 'while :; do :; done' & pids="$pids $!"; done
+          trap 'for p in $pids; do kill $p 2>/dev/null; done' EXIT
+          echo "== spinners: $(echo $pids | wc -w)" | tee -a $R
+          suite() {
+            name="$1"; shift
+            status=0
+            started=$(date +%s)
+            "$@" > ../suite.log 2>&1 || status=$?
+            grep -E -A2 '^test .*(FAILED|ok)$|panicked|test result|is spinning|is wedged|long recovery|slates anchor: (the starting daemon|daemon exited|the daemon.s heartbeat)' ../suite.log | grep -vE '^test .* ok$|^--$' | cut -c1-300 | tee -a $R || true
+            echo "== $name exit $status in $(( $(date +%s) - started )) s, load $(cut -d' ' -f1 /proc/loadavg)" | tee -a $R
+          }
+          suite "rt alone" cargo test --locked -p slates-rt --test alone
+          suite "server lib" cargo test --locked -p slates-server --lib
+          suite "the slicing test" cargo test --locked -p slates-server --test recovery a_daemon_keeps_its_beat -- --nocapture
+          suite "recovery suite" cargo test --locked -p slates-server --test recovery
+          suite "liveness suite" cargo test --locked -p slates-server --test liveness -- --test-threads=1
+          suite "daemon suite" cargo test --locked -p slates-server --test daemon
+          suite "green checkpoint" cargo test --locked -p slates-server --test green_checkpoint
+          suite held_rendezvous cargo test --locked -p slates-cli --test held_rendezvous -- --test-threads=1 --nocapture
+          suite "cli restart" cargo test --locked -p slates-cli --test cli -- --test-threads=1 --nocapture restart frozen anchor supervises killed start
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/liveness-24-${{ matrix.os }}"
+          git config user.name "diag-liveness"
+          git config user.email "diag-liveness@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-liveness-24 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
