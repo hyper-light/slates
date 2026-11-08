@@ -1,0 +1,4 @@
+tested 6a35c0b3453232d5c4daeed9741ae3aea310a2a8 variant after on x86_64, 4 cpus
+placed exit 0 504s
+restart exit 0 133s
+clippy exit 0 85s
