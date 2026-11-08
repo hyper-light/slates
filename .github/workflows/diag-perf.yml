@@ -1,0 +1,37 @@
+name: diag-perf
+
+# The Linux checks of a change whose Linux code no development machine could reach (kiln's agents unreachable,
+# 2026-11-08): clippy of the changed crates, and the Linux-only tests of the FUSE write log's give-back and the
+# recovery give-back. A diagnostics lane run only from `diag-perf-*` branches (never main).
+
+on:
+  push:
+    branches: ["diag-perf-*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-checks:
+    name: linux checks (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy, the changed crates, every target
+        run: cargo clippy -p slates-server -p slates-vfs -p slates-client --all-targets -- -D warnings
+      - name: The write log's tests
+        run: cargo test -p slates-server --lib write_log
+      - name: The recovery give-back tests
+        run: cargo test -p slates-server --test recovery -- a_give_back recovery_memory a_boot_give_back --nocapture
+      - name: The journal's tests and oracle
+        run: cargo test -p slates-vfs --test checkpoint_log
