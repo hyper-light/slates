@@ -128,3 +128,59 @@ fn thread_cpu_ns() -> Option<u64> {
   let holder = slates_rt::registry::holder_of(shard.0)?;
   slates_rt::registry::shard_cpu(holder).map(|reading| reading.spent_ns)
 }
+
+#[cfg(test)]
+mod tests {
+  use super::RecoverySlices;
+
+  /// What slicing may add to a recovery's time, in percent: the recovery-slicing plan's limit on its CPU cost.
+  const ALLOWED_RISE_PERCENT: u64 = 10;
+  /// Shape: how many yields are timed for the cost of one; the least of them is a yield nothing interrupted.
+  const YIELDS_TIMED: u64 = 1024;
+  /// Shape: the recovery's units, enough that the slices a limit allows are many more than the one a recovery always
+  /// ends with.
+  const UNITS: u64 = 4096;
+  /// Shape: how long the test thread waits for the shard's report.
+  const REPORT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+  /// §2.6 boot step 2, A-228: a recovery whose every unit is cheaper than a yield, on a shard whose live step quantum
+  /// is the least there is, spends no more than the plan's limit of its time yielding. The units are as long as the
+  /// cheapest yield this machine ran, so a recovery that yielded after each spent half its time doing it.
+  #[test]
+  // The test thread waits off the shard for what the shard's task reports.
+  #[allow(clippy::disallowed_methods)]
+  fn a_recovery_of_units_cheaper_than_a_yield_keeps_its_yields_within_the_limit() {
+    let daemon = crate::daemon::audit_daemon();
+    let (report, report_seen) = std::sync::mpsc::sync_channel::<(u64, u64, u64)>(1);
+    crate::daemon::observe_first(&daemon, move |_state| {
+      let recovery = slates_rt::futures::spawn(async move {
+        let mut least_yield_ns = u64::MAX;
+        for _ in 0..YIELDS_TIMED {
+          let before = slates_rt::futures::now_ns();
+          slates_rt::futures::yield_now().await;
+          least_yield_ns = least_yield_ns.min(slates_rt::futures::now_ns().saturating_sub(before));
+        }
+        let began = slates_rt::futures::now_ns();
+        let mut slices = RecoverySlices::begin(1);
+        for _ in 0..UNITS {
+          let unit_began = slates_rt::futures::now_ns();
+          while slates_rt::futures::now_ns().saturating_sub(unit_began) < least_yield_ns {
+            std::hint::spin_loop();
+          }
+          slices.unit_done().await;
+        }
+        let sliced = slices.finish();
+        let elapsed = slates_rt::futures::now_ns().saturating_sub(began);
+        let _ = report.try_send((least_yield_ns, sliced.slices, elapsed));
+      })
+      .unwrap();
+      slates_rt::futures::detach(recovery).unwrap();
+    });
+    let (least_yield_ns, slices, elapsed_ns) = report_seen.recv_timeout(REPORT_WAIT).unwrap();
+    let yielding_ns = slices.saturating_sub(1).saturating_mul(least_yield_ns);
+    assert!(
+      yielding_ns.saturating_mul(100) <= elapsed_ns.saturating_mul(ALLOWED_RISE_PERCENT),
+      "{slices} slices of a cheapest yield of {least_yield_ns} ns are {yielding_ns} ns of a recovery of {elapsed_ns} ns"
+    );
+  }
+}
