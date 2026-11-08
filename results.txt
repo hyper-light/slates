@@ -1,0 +1,28 @@
+red on macos-latest, 3 CPUs, Sun Nov  8 08:33:01 UTC 2026, head c249ef5ed82e746ee306d7451e09af381d3139a3
+== run 1 exit 101
+thread 'a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone' (26614) panicked at crates/server/tests/fleet.rs:6235:3:
+every survivor's council passed version 9 and reached the newest (installed, council) per survivor: [Ok((12, 12)), Ok((9, 9)), Ok((12, 12)), Ok((12, 12))]; the learners' views at the stop [(HostId(16900040477734459993), [HostId(11120859116970893316)]), (HostId(12770794288876430346), [HostId(11120859116970893316)])]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone ... FAILED
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 98 filtered out; finished in 414.51s
+
+error: test failed, to rerun pass `-p slates-server --test fleet`
+== run 2 exit 101
+thread 'a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone' (49571) panicked at crates/server/tests/fleet.rs:6235:3:
+every survivor's council passed version 9 and reached the newest (installed, council) per survivor: [Ok((12, 12)), Ok((9, 9)), Ok((12, 12)), Ok((12, 12))]; the learners' views at the stop [(HostId(13239376949718866625), [HostId(5352256764320296184)]), (HostId(12462715296108399323), [HostId(5352256764320296184)])]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone ... FAILED
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 98 filtered out; finished in 410.49s
+
+error: test failed, to rerun pass `-p slates-server --test fleet`
+== run 3 exit 101
+thread 'a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone' (72903) panicked at crates/server/tests/fleet.rs:6235:3:
+every survivor's council passed version 8 and reached the newest (installed, council) per survivor: [Ok((12, 12)), Ok((8, 8)), Ok((12, 12)), Ok((12, 12))]; the learners' views at the stop [(HostId(11511436097958652822), [HostId(14257612090890861008)]), (HostId(11330610276015343870), [HostId(14257612090890861008)])]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone ... FAILED
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 98 filtered out; finished in 412.47s
+
+error: test failed, to rerun pass `-p slates-server --test fleet`
