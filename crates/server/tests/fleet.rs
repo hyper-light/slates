@@ -13869,6 +13869,184 @@ fn a_works_catalog_is_placed_like_a_plain_volumes() {
   assert!(work_placed, "a work's catalog is placed");
 }
 
+/// A-255, the supervisor's second condition: two failures in sequence, each within the fault budget and the fleet
+/// healed between them, still leave a submit's resend answered. After its owner's takeover a work has no owner, so its
+/// route is its catalog record, which the takeover re-commits under the successor's placement like every adopted record
+/// (`takeover::adopt`), and the green's merge records carry the completion through a second takeover of the green. Do:
+/// four nodes at `f = 1`; on a, a green and a work; through b's client, an edit and a submit, answered version 1; a
+/// dies and the survivors take over; then one survivor holding the work's catalog record (not b) dies too; b's client
+/// resends the submit under its id. Expect: the second victim held the record (non-vacuous), and the resend is answered
+/// version 1, the green holding one version.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn a_submit_resent_after_two_takeovers_in_sequence_is_answered_its_version() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c", "d"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut owner_client = Client::connect(daemons[0].instance());
+  let (green, work) = green_with_work(&mut owner_client, "resent-over-two-takeovers", &daemons);
+  let mut client = Client::connect(daemons[1].instance());
+  let (routed, last) = poll_status_served(&daemons, &mut client, work, COUNCIL_RETIRE_DEADLINE);
+  let submit = RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  };
+  if routed {
+    edit_work(&mut client, work, 0, "hello");
+  }
+  let first = routed.then(|| client.call(&submit));
+  let catalog = ObjectId(work.bytes).catalog();
+  let everyone: Vec<&Daemon> = daemons.iter().collect();
+  // Both of the green's other candidates hold version 1, and the work's catalog record is held, before a dies.
+  let ready = poll_until(&everyone, PLACEMENT_DEADLINE, || {
+    let versions = daemons[1..]
+      .iter()
+      .map(|holder| holder.merge_holder_state(green).map(|state| state.version))
+      .collect::<Result<Vec<_>, _>>()?;
+    let records = daemons[1..]
+      .iter()
+      .map(|holder| holder.fleet_held_record(catalog))
+      .collect::<Result<Vec<_>, _>>()?;
+    Ok(
+      versions
+        .iter()
+        .filter(|version| **version == Some(1))
+        .count()
+        >= 2
+        && records.iter().filter(|held| held.is_some()).count() >= 2,
+    )
+  });
+  drop(everyone);
+  daemons.remove(0).stop();
+  // The first takeover: some survivor serves the green at version 1 again, and the catalog record is re-committed at a
+  // newer epoch than a's.
+  // The first takeover: some survivor serves the green at version 1 again, the work's catalog record is re-committed at a
+  // newer epoch than a's, and its owner keeps it placed at every survivor, all three now its candidates
+  // (`fleet::owed_adopted_work_catalogs`).
+  let everyone: Vec<&Daemon> = daemons.iter().collect();
+  let first_takeover = poll_until(&everyone, PLACEMENT_DEADLINE, || {
+    let placed = daemons
+      .iter()
+      .map(|daemon| daemon.merge_record_placed(green, 1))
+      .collect::<Result<Vec<_>, _>>()?;
+    let records = daemons
+      .iter()
+      .map(|daemon| daemon.fleet_held_record(catalog))
+      .collect::<Result<Vec<_>, _>>()?;
+    Ok(
+      placed.iter().any(|placed| *placed)
+        && records
+          .iter()
+          .all(|held| held.as_ref().is_some_and(|held| held.epoch > 0)),
+    )
+  });
+  drop(everyone);
+  let green_owner = daemons
+    .iter()
+    .position(|daemon| daemon.merge_record_placed(green, 1) == Ok(true));
+  let held_after: Vec<(usize, u64)> = daemons
+    .iter()
+    .enumerate()
+    .filter_map(|(index, daemon)| {
+      daemon
+        .fleet_held_record(catalog)
+        .ok()
+        .flatten()
+        .map(|held| (index, held.epoch))
+    })
+    .collect();
+  // The second victim: a holder of the work's catalog record that is neither b (index 0 now), whose client resends, nor
+  // the green's owner. Losing the green's owner a second time is the ledger-prefix transfer GAPS owes (GAP-A9-7): a
+  // successor holding only part of the green's records cannot rebuild it, whatever routes to it.
+  let victim = held_after
+    .iter()
+    .map(|(index, _)| *index)
+    .find(|index| *index != 0 && Some(*index) != green_owner);
+  let victim_held = victim.is_some();
+  if let Some(index) = victim {
+    daemons.remove(index).stop();
+  }
+  // After the second death every survivor still holds the record: its owner keeps it placed under its own placement
+  // (`fleet::owed_adopted_work_catalogs`). The green serving version 1 is read below; whether its committed merge records
+  // are placed again under the new configuration is the ledger-prefix transfer GAPS owes (GAP-A9-7), not asked here.
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let second_takeover = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    let records = daemons
+      .iter()
+      .map(|daemon| daemon.fleet_held_record(catalog))
+      .collect::<Result<Vec<_>, _>>()?;
+    Ok(records.iter().all(Option::is_some))
+  });
+  drop(survivors);
+  let again = resend_while_refused_retryable(&mut client, &submit);
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let mut head = None;
+  poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    head = daemons
+      .iter()
+      .map(|daemon| Client::connect(daemon.instance()).call(&RequestBody::Versions { green }))
+      .find(|reply| matches!(reply, ReplyBody::Versions { .. }));
+    Ok(head.is_some())
+  });
+  drop(survivors);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "first takeover {first_takeover}, holders after it {held_after:?}, second victim {victim:?}, second takeover \
+     {second_takeover}; the resend was answered {again:?}; head {head:?}"
+  );
+  assert!(routed, "b routed the work to its owner: {last:?}");
+  assert_eq!(
+    first,
+    Some(ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    }),
+    "the submit committed at version 1"
+  );
+  assert!(
+    ready,
+    "the green's candidates held version 1 and the work's catalog record before a died"
+  );
+  assert!(
+    first_takeover,
+    "the survivors took the green and the work's catalog record over"
+  );
+  assert!(
+    victim_held,
+    "a survivor other than b held the work's catalog record after the first takeover: {held_after:?}"
+  );
+  assert!(
+    second_takeover,
+    "every survivor holds the work's catalog record after the second death"
+  );
+  assert_eq!(
+    again.expect("the resend after two takeovers is answered"),
+    ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    },
+    "the resend after two takeovers in sequence is answered the version it was accepted as"
+  );
+  assert_eq!(
+    head,
+    Some(ReplyBody::Versions { head: 1 }),
+    "nothing ran again: the green holds the one version"
+  );
+}
+
 /// §4.16 "Commit", A-252: "nothing runs twice after a takeover" rests on a work never coming back on a successor, since
 /// a work come back with no completion record would run a resend again, and an older one would make a different
 /// increment and so a second version. Do: three nodes at `f = 1`; on a, a green and a work; through b's client an edit

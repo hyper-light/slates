@@ -2172,6 +2172,7 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
     ));
   }
   heads.extend(owed_merge_catalogs(state, config, local));
+  heads.extend(owed_adopted_work_catalogs(state, config, local));
   for tombstone in state.db.partition().tombstones() {
     heads.extend(owed_tombstone(state, config, tombstone, local));
   }
@@ -2195,6 +2196,35 @@ fn owed_merge_catalogs(
     .chain(state.works.keys())
     .filter_map(|id| state.db.partition().volume(*id))
     .filter_map(|record| owed_catalog(state, config, record, local).0)
+    .collect()
+}
+
+/// The catalog registers of works this node adopted at a takeover, as it still owes them to some remote candidate
+/// (A-255). After its owner's takeover a work has no owner and is never materialized, so its catalog record, which names
+/// its green, is the only route a resend of its submit has, and the successor that adopted it is that record's owner. It
+/// keeps the record placed as any owner keeps its records, under its own placement at its configuration's epoch: a
+/// second failure among the record's holders, within the fault budget, then leaves it held. Kept until the work's
+/// tombstone replaces it (`crate::tombstone`).
+fn owed_adopted_work_catalogs(
+  state: &ShardState,
+  config: &slates_db::register::Configuration,
+  local: HostId,
+) -> Vec<Head> {
+  state
+    .pending_catalogs
+    .iter()
+    .filter(|(_, (_, catalog))| catalog.work_of.is_some())
+    .map(|(key, (sequence, catalog))| (key.catalog(), *sequence, catalog))
+    .filter(|(object, _, _)| state.fleet.object_owner(*object) == Some(local))
+    .filter_map(|(object, sequence, catalog)| {
+      owed_record(
+        state,
+        config,
+        (object, sequence),
+        catalog.to_record_bytes(),
+        local,
+      )
+    })
     .collect()
 }
 
