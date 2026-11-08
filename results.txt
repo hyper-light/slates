@@ -1,0 +1,23 @@
+runner ubuntu-latest, 4 CPUs, commit 6840ab2d
+== cargo test --locked -q -p slates-server --lib
+test result: ok. 217 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.78s
+== exit 0
+== cargo test --locked -q -p slates-server --test fleet
+test result: ok. 107 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 502.27s
+== exit 0
+== cargo test --locked -q -p slates-cli --test cli --test fs_server -- --test-threads=1
+test result: ok. 91 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 77.47s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.96s
+== exit 0
+== cargo test --locked -q -p slates-cli --test live_fleet -- --test-threads=1
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 78.01s
+== exit 0
+== cargo test --locked -q -p slates-cli --test live_chaos -- --test-threads=1
+a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover --- FAILED
+a_long_live_log_is_taken_over_whole --- FAILED
+thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (21386) panicked at crates/cli/tests/live_chaos.rs:1169:5:
+thread 'a_long_live_log_is_taken_over_whole' (22800) panicked at crates/cli/tests/live_chaos.rs:1278:7:
+    a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover
+    a_long_live_log_is_taken_over_whole
+test result: FAILED. 16 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 389.02s
+== exit 101
