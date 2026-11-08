@@ -288,7 +288,7 @@
 > - **A forward its owner never answered stayed open on a busy session** (found 2026-11-07 by fixtures' f = 1
 >   primary kill). A forward's stall budget counted any byte its session consumed, so 298 forwards to an owner that
 >   never answered them stayed open for good while the session carried other replies. Progress is now its own
->   reply's bytes (red 4/4 on both Linux runners, run 42425119057;
+>   reply's bytes, landed in 2bdaa7c0 beside A-245's docs (red 4/4 on both Linux runners, run 42425119057;
 >   `docs/bugs/2026-11-07-a-forward-its-owner-never-answered-stayed-open-on-a-busy-session.md`). The owner's side of
 >   that rung, a membership split after the primary's restart that never merged, is open with membership's owner.>
 > - **A held request kept every later completion of its client** (found 2026-11-07 by fixtures' `f = 1` rungs, and
