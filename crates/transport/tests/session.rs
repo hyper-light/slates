@@ -18,7 +18,7 @@ use slates_rt::sim::SimRuntime;
 use slates_rt::udp::UdpSocket;
 use slates_transport::connection::Priority;
 use slates_transport::demux::{Demux, DemuxCounters, DemuxId};
-use slates_transport::endpoint::{Endpoint, EndpointError};
+use slates_transport::endpoint::{Endpoint, EndpointError, HandshakeStall};
 use slates_transport::handshake::Identity;
 use slates_transport::params::TransportParameters;
 
@@ -1701,6 +1701,96 @@ async fn discard_queued(socket: &UdpSocket) -> usize {
     discarded += 1;
   }
   discarded
+}
+
+/// Shape: how many bursts the flood in [`stall_against_a_peer_that_never_joins`] sends at most, and how many datagrams
+/// each: together past the handshake's bound on datagrams that make no flight, which is under two thousand.
+const FLOOD_BURSTS: usize = 256;
+const FLOOD_BURST_DATAGRAMS: usize = 64;
+/// Shape: the flood's pause between bursts, a millisecond of the simulated clock.
+const FLOOD_PAUSE_NS: u64 = 1_000_000;
+
+/// What ended one end's `establish`, with a bound peer that never takes part: `garbage`, it floods that end with
+/// datagrams that are no flight; otherwise it says nothing. `dialing`, the end under test is the client.
+fn stall_against_a_peer_that_never_joins(dialing: bool, garbage: bool) -> Option<HandshakeStall> {
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = *sim.shard_ids().first().unwrap();
+  let identity = self_signed(NAME);
+  let certificate = identity.certificate();
+  let (near_tx, near_rx) = channel();
+  let (far_tx, far_rx) = channel();
+  let (done_tx, done_rx) = channel::<()>();
+  let (stall_tx, stall_rx) = channel();
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = near_tx.send(socket.local_addr().unwrap().port());
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(far_rx).await);
+      let mut end = if dialing {
+        Endpoint::client(socket, peer, &identity, &certificate, NAME, shape()).unwrap()
+      } else {
+        Endpoint::server(
+          socket,
+          peer,
+          &identity,
+          std::slice::from_ref(&certificate),
+          shape(),
+        )
+        .unwrap()
+      };
+      let outcome = end.establish().await;
+      assert!(
+        matches!(outcome, Err(EndpointError::NotReady)),
+        "{outcome:?}"
+      );
+      let _ = stall_tx.send(end.handshake_stall());
+      let _ = done_tx.send(());
+    })
+    .unwrap();
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = far_tx.send(socket.local_addr().unwrap().port());
+      let near = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(near_rx).await);
+      let stray = [0xFFu8; 64];
+      // A bounded flood: a burst, then a parked millisecond, so the end under test reads what was sent and the runtime's
+      // clock moves. The turn's bound on such datagrams is under two thousand, so this is well past it.
+      for _ in 0..FLOOD_BURSTS {
+        if !garbage || done_rx.try_recv().is_ok() {
+          break;
+        }
+        for _ in 0..FLOOD_BURST_DATAGRAMS {
+          let _ = socket.send_to(&stray, near);
+        }
+        slates_rt::futures::sleep(FLOOD_PAUSE_NS).await.unwrap();
+      }
+    })
+    .unwrap();
+  sim.run_until_idle();
+  stall_rx.try_recv().unwrap()
+}
+
+/// §4.8 formation: a handshake that gives up names the bound it reached, so a fleet whose dials keep failing says why
+/// (a 72 s formation at load 127-176, 2026-11-08, had only "no reply" to go on). Do: run `establish` on a dialer and on
+/// an accepted end whose peer never joins, once silent and once flooding datagrams that are no flight. Expect: the
+/// dialer and the accepted end report `Silence` against a silent peer, and the dialer `Fragments` against the flood.
+#[test]
+fn a_handshake_that_gives_up_names_the_bound_it_reached() {
+  assert_eq!(
+    stall_against_a_peer_that_never_joins(true, false),
+    Some(HandshakeStall::Silence),
+    "a dialer whose peer stays silent"
+  );
+  assert_eq!(
+    stall_against_a_peer_that_never_joins(false, false),
+    Some(HandshakeStall::Silence),
+    "an accepted end whose peer stays silent"
+  );
+  assert_eq!(
+    stall_against_a_peer_that_never_joins(true, true),
+    Some(HandshakeStall::Fragments),
+    "a dialer flooded with datagrams that are no flight"
+  );
 }
 
 /// AC (§4.8 formation; RFC 9002 §6.2 the probe timeout retransmits the pending flight): a dialer whose
