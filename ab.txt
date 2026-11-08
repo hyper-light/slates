@@ -1216,3 +1216,244 @@ slates-server: shard 1 initialized in 1615 µs
 slates daemon: instance fsb-158-5-c serving on 3 shards under the anchor
 slates-winfsp: reply spin window = 7700 ns: the median one-way channel wake of 15 (the 2-competitive spin)
 ## run 5 of 6 done, 2026-11-08T14:53:20Z
+To https://github.com/hyper-light/slates
+   5c51122..b58e46e  b58e46e6f15b11a5e07826c28fa9f3fb9a3a147b -> diag-winfsp-overlap-results-42486022157-aaa-fixed-arm
+## run 6 of 6, 2026-11-08T14:53:22Z
+# c started first: a=T: b=U: c=S:
+# host: windows 0x23f00206 on windows processor architecture 12 level 3401 revision 0 (aarch64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 1048576 B, cache line 64 B
+# workload: 10 rounds of 1000 files of 4096 B per arm and pass, arms interleaved, first arm rotating
+# arm a: T:/d
+# arm b: U:/d
+# arm c: S:/d
+# warm-up: one untimed round per arm (1000 files each)
+# pass quiet: spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 23.8 µs, p99 40.2 µs, p999 1557.6 µs, max 4439.6 µs over 39755 probes; 209.0 s
+fsbench	quiet	a	create	10000	208100	303700	738900	4698600
+fsbench	quiet	a	write	10000	89800	212800	483000	17525100
+fsbench	quiet	a	fsync	10000	109000	169800	364400	16981600
+fsbench	quiet	a	close	10000	4053500	16835700	17808700	21294700
+fsbench	quiet	a	stat	10000	158100	249700	679800	12322200
+fsbench	quiet	a	open	10000	1194800	5280400	20691300	103433700
+fsbench	quiet	a	read	10000	46200	66400	147100	5343000
+fsbench	quiet	a	rename	10000	457100	922400	3920300	63113100
+fsbench	quiet	a	unlink	10000	289100	478100	1772400	82996000
+fsbench	quiet	b	create	10000	207400	469700	17662400	17988600
+fsbench	quiet	b	write	10000	92100	230600	508200	17354000
+fsbench	quiet	b	fsync	10000	113200	178500	496500	17718000
+fsbench	quiet	b	close	10000	3857600	6953100	17598000	25950000
+fsbench	quiet	b	stat	10000	147800	235300	626400	1796600
+fsbench	quiet	b	open	10000	984000	5173800	13996100	129163900
+fsbench	quiet	b	read	10000	43700	62200	123900	200200
+fsbench	quiet	b	rename	10000	460400	1214600	3308700	62894500
+fsbench	quiet	b	unlink	10000	287700	561100	3062100	165418700
+fsbench	quiet	c	create	10000	207400	317300	1191000	17894700
+fsbench	quiet	c	write	10000	92400	214000	469600	92971800
+fsbench	quiet	c	fsync	10000	111500	175900	469000	16946600
+fsbench	quiet	c	close	10000	4067500	16841900	17734700	51528000
+fsbench	quiet	c	stat	10000	150400	228100	595500	3072000
+fsbench	quiet	c	open	10000	1071500	5265700	8360000	66389600
+fsbench	quiet	c	read	10000	45400	64100	146000	4761200
+fsbench	quiet	c	rename	10000	455300	1042500	3287400	62696600
+fsbench	quiet	c	unlink	10000	286100	518900	778200	247887600
+
+**quiet** (spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 23.8 µs, p99 40.2 µs, p999 1557.6 µs, max 4439.6 µs over 39755 probes; 209.0 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | a | b | c |
+|---|---|---|---|
+| create | 208.1 · 303.7 · 738.9 · 4698.6 | 207.4 · 469.7 · 17662.4 · 17988.6 | 207.4 · 317.3 · 1191.0 · 17894.7 |
+| write | 89.8 · 212.8 · 483.0 · 17525.1 | 92.1 · 230.6 · 508.2 · 17354.0 | 92.4 · 214.0 · 469.6 · 92971.8 |
+| fsync | 109.0 · 169.8 · 364.4 · 16981.6 | 113.2 · 178.5 · 496.5 · 17718.0 | 111.5 · 175.9 · 469.0 · 16946.6 |
+| close | 4053.5 · 16835.7 · 17808.7 · 21294.7 | 3857.6 · 6953.1 · 17598.0 · 25950.0 | 4067.5 · 16841.9 · 17734.7 · 51528.0 |
+| stat | 158.1 · 249.7 · 679.8 · 12322.2 | 147.8 · 235.3 · 626.4 · 1796.6 | 150.4 · 228.1 · 595.5 · 3072.0 |
+| open | 1194.8 · 5280.4 · 20691.3 · 103433.7 | 984.0 · 5173.8 · 13996.1 · 129163.9 | 1071.5 · 5265.7 · 8360.0 · 66389.6 |
+| read | 46.2 · 66.4 · 147.1 · 5343.0 | 43.7 · 62.2 · 123.9 · 200.2 | 45.4 · 64.1 · 146.0 · 4761.2 |
+| rename | 457.1 · 922.4 · 3920.3 · 63113.1 | 460.4 · 1214.6 · 3308.7 · 62894.5 | 455.3 · 1042.5 · 3287.4 · 62696.6 |
+| unlink | 289.1 · 478.1 · 1772.4 · 82996.0 | 287.7 · 561.1 · 3062.1 · 165418.7 | 286.1 · 518.9 · 778.2 · 247887.6 |
+
+# pass contended: spinners 8 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 24.8 µs, p99 40.1 µs, p999 18868.2 µs, max 70729.5 µs over 101927 probes; 530.2 s
+fsbench	contended	a	create	10000	200600	738000	33357400	43219800
+fsbench	contended	a	write	10000	191100	1722900	34562400	67506700
+fsbench	contended	a	fsync	10000	100900	244300	38407200	68239800
+fsbench	contended	a	close	10000	4617400	40505500	63608800	91792100
+fsbench	contended	a	stat	10000	153100	700300	46998700	92625000
+fsbench	contended	a	open	10000	3769500	39001100	72874100	166091200
+fsbench	contended	a	read	10000	46500	77100	162200	760800
+fsbench	contended	a	rename	10000	503000	35487300	73514100	157949900
+fsbench	contended	a	unlink	10000	333300	27087700	68764200	392279500
+fsbench	contended	b	create	10000	206300	729800	34174500	56545400
+fsbench	contended	b	write	10000	195100	573900	21944300	49885300
+fsbench	contended	b	fsync	10000	111400	223600	27524900	59391400
+fsbench	contended	b	close	10000	4982600	45095900	67678100	93816300
+fsbench	contended	b	stat	10000	151800	2961800	42142200	97302200
+fsbench	contended	b	open	10000	3938100	42676300	85795500	193947700
+fsbench	contended	b	read	10000	47500	80500	168900	879900
+fsbench	contended	b	rename	10000	490600	35065300	67087500	103168700
+fsbench	contended	b	unlink	10000	326100	26795600	74918000	388232800
+fsbench	contended	c	create	10000	204700	768800	35821100	66794900
+fsbench	contended	c	write	10000	194400	3176400	34083500	54797300
+fsbench	contended	c	fsync	10000	109800	295100	34040000	81686200
+fsbench	contended	c	close	10000	4637700	41646600	63810300	99365300
+fsbench	contended	c	stat	10000	151900	724600	39780500	84466000
+fsbench	contended	c	open	10000	3773300	38795000	85076600	182357900
+fsbench	contended	c	read	10000	46700	77700	156600	334900
+fsbench	contended	c	rename	10000	497700	34870000	57921200	119223600
+fsbench	contended	c	unlink	10000	327300	23896100	62681300	380056300
+
+**contended** (spinners 8 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 24.8 µs, p99 40.1 µs, p999 18868.2 µs, max 70729.5 µs over 101927 probes; 530.2 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | a | b | c |
+|---|---|---|---|
+| create | 200.6 · 738.0 · 33357.4 · 43219.8 | 206.3 · 729.8 · 34174.5 · 56545.4 | 204.7 · 768.8 · 35821.1 · 66794.9 |
+| write | 191.1 · 1722.9 · 34562.4 · 67506.7 | 195.1 · 573.9 · 21944.3 · 49885.3 | 194.4 · 3176.4 · 34083.5 · 54797.3 |
+| fsync | 100.9 · 244.3 · 38407.2 · 68239.8 | 111.4 · 223.6 · 27524.9 · 59391.4 | 109.8 · 295.1 · 34040.0 · 81686.2 |
+| close | 4617.4 · 40505.5 · 63608.8 · 91792.1 | 4982.6 · 45095.9 · 67678.1 · 93816.3 | 4637.7 · 41646.6 · 63810.3 · 99365.3 |
+| stat | 153.1 · 700.3 · 46998.7 · 92625.0 | 151.8 · 2961.8 · 42142.2 · 97302.2 | 151.9 · 724.6 · 39780.5 · 84466.0 |
+| open | 3769.5 · 39001.1 · 72874.1 · 166091.2 | 3938.1 · 42676.3 · 85795.5 · 193947.7 | 3773.3 · 38795.0 · 85076.6 · 182357.9 |
+| read | 46.5 · 77.1 · 162.2 · 760.8 | 47.5 · 80.5 · 168.9 · 879.9 | 46.7 · 77.7 · 156.6 · 334.9 |
+| rename | 503.0 · 35487.3 · 73514.1 · 157949.9 | 490.6 · 35065.3 · 67087.5 · 103168.7 | 497.7 · 34870.0 · 57921.2 · 119223.6 |
+| unlink | 333.3 · 27087.7 · 68764.2 · 392279.5 | 326.1 · 26795.6 · 74918.0 · 388232.8 | 327.3 · 23896.1 · 62681.3 · 380056.3 |
+
+unmounted: T:
+unmounted: U:
+unmounted: S:
+# fsb-158-6-a's error output, 46 lines:
+slates anchor: instance fsb-158-6-a up; daemon pid 8516; 3 shards
+slates anchor: issuer surface: export SLATES_ANCHOR=slates-seg-fsb-158-6-a SLATES_ANCHOR_LEN=10969415680 SLATES_ANCHOR_CONTENT=slates-con-fsb-158-6-a SLATES_ANCHOR_CONTENT_LEN=24323555328
+slates anchor: a daemon's beat is lapsed once older than the 1000 ms liveness window plus this anchor's own measured lateness p99, over its last 100 timed waits
+slates anchor: a starting daemon is killed once it makes no CPU progress for the 1000 ms liveness window, or runs that much CPU without its first beat, in its own CPU time (read from the OS)
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 17169387520: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 1907709724: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 1413120: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 476927431: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 1419426: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 1039: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 476927431: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 953854862: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 759: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 30727501831: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 15962: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: page_fault_ns = 356: the profile's measured base-page fault cost (at least one) (anchors ["faults.base_ns"])
+slates daemon: prefault_reserve_bytes = min(the shard's last write burst, reserve_per_shard = 1907709724, the arena's free bytes): the free content pages an idle shard keeps pre-faulted; the burst is measured at each idle tick (anchors ["reserve_per_shard", "content.allocated_bytes"])
+slates daemon: codec = lz4 true, zstd levels [1, 3, 9, 19], byte worth 32 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 384: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 827999: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 624659: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 465749: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 1907709724: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 77624: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 19: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 1764: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 465749: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5292: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 3533: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 103900: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_listing_entries = 0: none: a Windows guest's stream ends with its daemon, so no number it holds outlives a restart (anchors [])
+slates daemon: inode_reserve = 18876: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 1754: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 238463715: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2483997: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2483997: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates-server: shard 2 initialized in 1341 µs
+slates-server: shard 1 initialized in 910 µs
+slates-server: shard 0 initialized in 1598 µs
+slates daemon: instance fsb-158-6-a serving on 3 shards under the anchor
+slates-winfsp: reply spin window = 8700 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+# fsb-158-6-b's error output, 46 lines:
+slates anchor: instance fsb-158-6-b up; daemon pid 8696; 3 shards
+slates anchor: issuer surface: export SLATES_ANCHOR=slates-seg-fsb-158-6-b SLATES_ANCHOR_LEN=10969415680 SLATES_ANCHOR_CONTENT=slates-con-fsb-158-6-b SLATES_ANCHOR_CONTENT_LEN=24323555328
+slates anchor: a daemon's beat is lapsed once older than the 1000 ms liveness window plus this anchor's own measured lateness p99, over its last 100 timed waits
+slates anchor: a starting daemon is killed once it makes no CPU progress for the 1000 ms liveness window, or runs that much CPU without its first beat, in its own CPU time (read from the OS)
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 17169387520: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 1907709724: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 1413120: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 476927431: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 1419426: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 870: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 476927431: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 953854862: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 634: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 31787070860: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 13827: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: page_fault_ns = 480: the profile's measured base-page fault cost (at least one) (anchors ["faults.base_ns"])
+slates daemon: prefault_reserve_bytes = min(the shard's last write burst, reserve_per_shard = 1907709724, the arena's free bytes): the free content pages an idle shard keeps pre-faulted; the burst is measured at each idle tick (anchors ["reserve_per_shard", "content.allocated_bytes"])
+slates daemon: codec = lz4 true, zstd levels [1, 3, 9, 19], byte worth 31 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 384: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 827999: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 624659: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 465749: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 1907709724: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 77624: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 21: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 1764: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 465749: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5292: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 3533: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 87000: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_listing_entries = 0: none: a Windows guest's stream ends with its daemon, so no number it holds outlives a restart (anchors [])
+slates daemon: inode_reserve = 18876: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 1754: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 238463715: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2483997: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2483997: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates-server: shard 1 initialized in 1642 µs
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates-server: shard 2 initialized in 1766 µs
+slates-server: shard 0 initialized in 2105 µs
+slates daemon: instance fsb-158-6-b serving on 3 shards under the anchor
+slates-winfsp: reply spin window = 5400 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+# fsb-158-6-c's error output, 46 lines:
+slates anchor: instance fsb-158-6-c up; daemon pid 8572; 3 shards
+slates anchor: issuer surface: export SLATES_ANCHOR=slates-seg-fsb-158-6-c SLATES_ANCHOR_LEN=10969415680 SLATES_ANCHOR_CONTENT=slates-con-fsb-158-6-c SLATES_ANCHOR_CONTENT_LEN=24323555328
+slates anchor: a daemon's beat is lapsed once older than the 1000 ms liveness window plus this anchor's own measured lateness p99, over its last 100 timed waits
+slates anchor: a starting daemon is killed once it makes no CPU progress for the 1000 ms liveness window, or runs that much CPU without its first beat, in its own CPU time (read from the OS)
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 17169387520: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 1907709724: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 1413120: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 476927431: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 1419426: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 976: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 476927431: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 953854862: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 712: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 30851813166: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 15055: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: page_fault_ns = 366: the profile's measured base-page fault cost (at least one) (anchors ["faults.base_ns"])
+slates daemon: prefault_reserve_bytes = min(the shard's last write burst, reserve_per_shard = 1907709724, the arena's free bytes): the free content pages an idle shard keeps pre-faulted; the burst is measured at each idle tick (anchors ["reserve_per_shard", "content.allocated_bytes"])
+slates daemon: codec = lz4 true, zstd levels [1, 3, 9, 19], byte worth 32 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 384: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 827999: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 624659: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 465749: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 1907709724: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 77624: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 20: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 1764: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 465749: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5292: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 3533: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 97600: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_listing_entries = 0: none: a Windows guest's stream ends with its daemon, so no number it holds outlives a restart (anchors [])
+slates daemon: inode_reserve = 18876: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 1754: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 238463715: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2483997: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2483997: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates-server: shard 2 initialized in 1180 µs
+slates-server: shard 0 initialized in 1365 µs
+slates daemon: instance fsb-158-6-c serving on 3 shards under the anchor
+slates-server: shard 1 initialized in 2901 µs
+slates-winfsp: reply spin window = 6100 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+## run 6 of 6 done, 2026-11-08T15:06:12Z
