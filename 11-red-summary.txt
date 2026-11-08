@@ -1,0 +1,8 @@
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' failed - Err(Error { kind: ToolExecError, message: "command did not execute successfully (status code exit code: 2): \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Tools\\\\MSVC\\\\14.51.36231\\\\bin\\\\HostX64\\\\x64\\\\cl.exe\" \"-nologo\" \"-MD\" \"-Z7\" \"-Brepro\" \"-WX\" \"-W4\" \"-FoD:\\\\a\\\\slates\\\\slates\\\\target\\\\debug\\\\build\\\\aws-lc-sys-0bf3c6c5352b74c6\\\\out\\\\out-stdalign_check\\\\e1bacabfea35bee3-stdalign_check.o\" \"-c\" \"D:\\\\a\\\\slates\\\\slates\\\\vendor\\\\aws-lc-sys\\\\aws-lc\\\\tests\\\\compiler_features_tests\\\\stdalign_check.c\"" }).
+test a_files_creation_time_set_through_the_drive_is_kept ... slates anchor: instance wscreated3428 up; daemon pid 4188; 2 shards
+thread 'a_files_creation_time_set_through_the_drive_is_kept' (5716) panicked at crates\cli\tests\winfsp_semantics.rs:477:3:
+assertion `left == right` failed: the creation time set is kept
+  left: SystemTime { intervals: 134386362567274370 }
+ right: SystemTime { intervals: 157468320000000000 }
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.60s
+exit 101
