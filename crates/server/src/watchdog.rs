@@ -33,7 +33,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel}
 use std::thread::JoinHandle;
 
 use slates_anchor::AnchorSegment;
-use slates_rt::{RunState, SlotHolder};
+use slates_rt::{RunReading, SlotHolder};
 use slates_vfs::clock::{Clock, HostClock};
 
 use crate::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS};
@@ -137,15 +137,6 @@ pub struct ShardWatch {
   progressed_ns: u64,
 }
 
-/// What the scheduler says of a shard's thread at one look.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RunReading {
-  /// Whether the thread is on a CPU or waiting for one, or off them both.
-  pub state: RunState,
-  /// The time it has waited for a CPU so far, nanoseconds, where the platform keeps one.
-  pub waited_ns: Option<u64>,
-}
-
 /// One look at a shard: its step count, whether it is parked, its thread clock reading (CPU nanoseconds, progress),
 /// what the scheduler says of its thread, and the watchdog's clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,6 +154,17 @@ pub struct Look {
 }
 
 impl ShardWatch {
+  /// Whether `look` leaves the shard under suspicion, so the scheduler is asked about its thread: it is not parked, has
+  /// completed no step since the last look, and its CPU clock did not rise. A shard that steps or parks costs nothing.
+  fn suspects(&self, look: &Look) -> bool {
+    !look.parked
+      && look.steps == self.steps
+      && self.stepped_ns != 0
+      && look
+        .cpu
+        .is_none_or(|(_, progress)| self.progress.is_none_or(|before| progress <= before))
+  }
+
   /// Judges one look against the history (A-65's rule; `window_ns` is the liveness budget) and returns the verdict
   /// and the history for the next look. Pure, so the rule is tested on every host with no thread under it.
   pub fn judge(self, look: Look, window_ns: u64) -> (Verdict, ShardWatch) {
@@ -245,8 +247,10 @@ fn run(
     }
     let now = clock.monotonic_ns();
     let mut all_alive = true;
-    for (index, holder) in holders.iter().enumerate() {
-      let Some(look) = look_at(*holder, now) else {
+    let mut looks: Vec<Option<Look>> = holders.iter().map(|holder| look_at(*holder, now)).collect();
+    read_runs(holders, &watches, &mut looks);
+    for (index, (holder, look)) in holders.iter().zip(looks).enumerate() {
+      let Some(look) = look else {
         continue;
       };
       let Some(watch) = watches.get_mut(index) else {
@@ -292,6 +296,27 @@ fn look_at(holder: SlotHolder, now_ns: u64) -> Option<Look> {
   })
 }
 
+/// Asks the scheduler about the shards under suspicion, all at once: at most one Windows snapshot a beat.
+fn read_runs(holders: &[SlotHolder], watches: &[ShardWatch], looks: &mut [Option<Look>]) {
+  let suspects: Vec<(&mut Look, SlotHolder)> = looks
+    .iter_mut()
+    .zip(watches)
+    .zip(holders)
+    .filter_map(|((look, watch), holder)| {
+      let look = look.as_mut()?;
+      watch.suspects(look).then_some((look, *holder))
+    })
+    .collect();
+  if suspects.is_empty() {
+    return;
+  }
+  let asked: Vec<SlotHolder> = suspects.iter().map(|(_, holder)| *holder).collect();
+  let readings = slates_rt::registry::shard_run_readings(&asked);
+  for ((look, _), reading) in suspects.into_iter().zip(readings) {
+    look.run = reading;
+  }
+}
+
 /// Logs a stuck shard once per episode, with what the watchdog saw.
 fn log_stuck(shard: u16, verdict: Verdict) {
   match verdict {
@@ -313,6 +338,8 @@ fn log_stuck(shard: u16, verdict: Verdict) {
 
 #[cfg(test)]
 mod tests {
+  use slates_rt::RunState;
+
   use super::*;
 
   /// Shape: the window the rule is tested at (a second, the liveness budget).
@@ -461,6 +488,36 @@ mod tests {
       "spinning at a window of CPU since its first look: {verdicts:?}"
     );
     assert!(verdicts.iter().take(10).all(|v| *v == Verdict::Alive));
+  }
+
+  /// A-228. Do: ask whether a look leaves the shard under suspicion: a look before any history, after a step, parked,
+  /// with its CPU clock risen, and with none of those. Expect: only the last, or the same with no clock to read, since
+  /// the scheduler is asked about a shard only when the cheap signs say nothing.
+  #[test]
+  fn only_a_shard_with_no_step_and_no_cpu_rise_is_suspected() {
+    assert!(
+      !ShardWatch::default().suspects(&look(5, false, Some((10, 10)), TURN)),
+      "no history yet"
+    );
+    let (_, watch) = ShardWatch::default().judge(look(5, false, Some((10, 10)), TURN), WINDOW);
+    let at = 2 * TURN;
+    assert!(
+      !watch.suspects(&look(6, false, Some((10, 10)), at)),
+      "stepped"
+    );
+    assert!(
+      !watch.suspects(&look(5, true, Some((10, 10)), at)),
+      "parked"
+    );
+    assert!(
+      !watch.suspects(&look(5, false, Some((20, 20)), at)),
+      "CPU rose"
+    );
+    assert!(watch.suspects(&look(5, false, Some((10, 10)), at)));
+    assert!(
+      watch.suspects(&look(5, false, None, at)),
+      "no clock to read"
+    );
   }
 
   /// Shape: the run-queue wait of fixtures' shard 0 as it stood frozen (`rungs9/ab-clean-2.samples`, nanoseconds).

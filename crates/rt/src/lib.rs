@@ -57,7 +57,7 @@ pub mod shard;
 pub mod sim;
 pub mod task;
 mod thread_clock;
-pub use thread_clock::{CpuReading, RunState};
+pub use thread_clock::{CpuReading, RunReading, RunState};
 // Async TCP on every platform, through the socket seam (`netsys`): the NFS servers, the MCP HTTP edge and the
 // network export ride it (`docs/wip/platforms.md`, gap 1).
 pub mod tcp;
