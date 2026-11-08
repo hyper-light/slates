@@ -1,0 +1,32 @@
+runner ubuntu-latest, x86_64, 4 CPUs, 3b030c5 DIAG, not for main: the A-228 fleet at HEAD, ten repetitions of reader, , Sun Nov  8 14:17:17 UTC 2026
+clippy exit 0
+run 1 reader 0 rule 0 liveness 0
+starved shard: 63 spinners, its CPU clock stood still for 3.006648191s at most in 3.008647052s; largest beat gap 90.998964ms
+scheduler reader: /proc task stat state and schedstat run-queue wait; asked once a beat: runnable 29, blocked 0, unread 0; run-queue wait first Some(10593) ns, last Some(10593) ns
+run 2 reader 0 rule 0 liveness 0
+starved shard: 63 spinners, its CPU clock stood still for 3.006246481s at most in 3.007871786s; largest beat gap 90.845845ms
+scheduler reader: /proc task stat state and schedstat run-queue wait; asked once a beat: runnable 29, blocked 0, unread 0; run-queue wait first Some(0) ns, last Some(0) ns
+run 3 reader 0 rule 0 liveness 0
+starved shard: 63 spinners, its CPU clock stood still for 3.008122448s at most in 3.009744824s; largest beat gap 90.971722ms
+scheduler reader: /proc task stat state and schedstat run-queue wait; asked once a beat: runnable 29, blocked 0, unread 0; run-queue wait first Some(0) ns, last Some(0) ns
+run 4 reader 0 rule 0 liveness 0
+starved shard: 63 spinners, its CPU clock stood still for 3.005119797s at most in 3.006774197s; largest beat gap 90.907372ms
+scheduler reader: /proc task stat state and schedstat run-queue wait; asked once a beat: runnable 29, blocked 0, unread 0; run-queue wait first Some(0) ns, last Some(0) ns
+run 5 reader 0 rule 0 liveness 0
+starved shard: 63 spinners, its CPU clock stood still for 3.007359261s at most in 3.0089452s; largest beat gap 91.021404ms
+scheduler reader: /proc task stat state and schedstat run-queue wait; asked once a beat: runnable 29, blocked 0, unread 0; run-queue wait first Some(53567) ns, last Some(53567) ns
+run 6 reader 0 rule 0 liveness 0
+starved shard: 63 spinners, its CPU clock stood still for 3.005711083s at most in 3.007323119s; largest beat gap 90.886436ms
+scheduler reader: /proc task stat state and schedstat run-queue wait; asked once a beat: runnable 29, blocked 0, unread 0; run-queue wait first Some(0) ns, last Some(0) ns
+run 7 reader 0 rule 0 liveness 0
+starved shard: 63 spinners, its CPU clock stood still for 3.005466943s at most in 3.007273097s; largest beat gap 90.875922ms
+scheduler reader: /proc task stat state and schedstat run-queue wait; asked once a beat: runnable 29, blocked 0, unread 0; run-queue wait first Some(0) ns, last Some(0) ns
+run 8 reader 0 rule 0 liveness 0
+starved shard: 63 spinners, its CPU clock stood still for 3.006585563s at most in 3.008317756s; largest beat gap 90.875934ms
+scheduler reader: /proc task stat state and schedstat run-queue wait; asked once a beat: runnable 29, blocked 0, unread 0; run-queue wait first Some(0) ns, last Some(0) ns
+run 9 reader 0 rule 0 liveness 0
+starved shard: 63 spinners, its CPU clock stood still for 3.007315354s at most in 3.008989027s; largest beat gap 90.955966ms
+scheduler reader: /proc task stat state and schedstat run-queue wait; asked once a beat: runnable 29, blocked 0, unread 0; run-queue wait first Some(11285) ns, last Some(11285) ns
+run 10 reader 0 rule 0 liveness 0
+starved shard: 63 spinners, its CPU clock stood still for 3.005116856s at most in 3.006849348s; largest beat gap 90.849028ms
+scheduler reader: /proc task stat state and schedstat run-queue wait; asked once a beat: runnable 29, blocked 0, unread 0; run-queue wait first Some(0) ns, last Some(0) ns

@@ -1,0 +1,16 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/deps/slates_rt-d570541c5f85f3a3)
+
+running 7 tests
+test thread_clock::tests::a_schedstat_line_gives_its_second_field ... ok
+test thread_clock::tests::a_snapshot_gives_the_state_of_the_thread_asked_for ... ok
+test thread_clock::tests::a_damaged_snapshot_is_refused_without_a_panic ... ok
+test thread_clock::tests::a_stat_line_gives_the_state_after_the_last_parenthesis ... ok
+test thread_clock::tests::a_windows_thread_state_maps_to_a_run_state ... ok
+test thread_clock::tests::a_threads_run_state_tells_a_spinning_thread_from_a_waiting_one ... ok
+test thread_clock::tests::a_threads_cpu_clock_reads_from_another_thread_and_grows_as_it_runs ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 43 filtered out; finished in 0.02s
+

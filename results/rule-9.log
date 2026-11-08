@@ -1,0 +1,33 @@
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_PREBUILT_NASM': '0'
+warning: aws-lc-sys@0.45.0: Value: 0 is false.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src/lib.rs (target/debug/deps/slates_server-59a27c73b9247e24)
+
+running 11 tests
+test watchdog::tests::a_runnable_shard_whose_wait_stands_still_is_not_wedged ... ok
+test watchdog::tests::a_runnable_shard_whose_wait_is_credited_late_is_not_wedged ... ok
+test watchdog::tests::a_runnable_shard_with_no_wait_to_read_is_not_wedged ... ok
+test watchdog::tests::a_shard_running_a_window_of_cpu_without_a_step_is_spinning ... ok
+test watchdog::tests::a_shard_the_scheduler_never_saw_runnable_is_wedged_within_the_window ... ok
+test watchdog::tests::a_shard_with_no_cpu_for_a_window_is_wedged_and_a_shorter_block_is_not ... ok
+test watchdog::tests::a_shard_woken_and_kept_waiting_is_wedged_a_window_after_it_last_moved ... ok
+test watchdog::tests::a_starved_shard_that_then_blocks_is_wedged_a_window_later ... ok
+test watchdog::tests::a_stepping_parked_or_starved_shard_is_alive ... ok
+slates daemon: shard 1 is starved: no step and no CPU progress for 1000 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is wedged: no step, no CPU progress and no wait for a CPU for 1000 ms, past the 1000 ms window; the watchdog withholds the beat
+test watchdog::tests::only_a_shard_with_no_step_and_no_cpu_rise_is_suspected ... ok
+test watchdog::tests::each_kind_of_verdict_is_logged_once_an_episode_and_only_a_stuck_shard_stops_the_beat ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 211 filtered out; finished in 0.00s
+
