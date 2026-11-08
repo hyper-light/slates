@@ -108,7 +108,7 @@ fn a_write_through_one_of_two_fuse_mounts_leaves_the_daemon_idle_afterwards() {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-fuse-idle-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "fuse-idle"),
     },
   )
   .unwrap();

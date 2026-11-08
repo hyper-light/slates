@@ -45,7 +45,7 @@ fn daemon(name: &str) -> (Daemon, ShardId, ShardId) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-liveness-{name}-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", &format!("liveness-{name}")),
     },
   )
   .unwrap();

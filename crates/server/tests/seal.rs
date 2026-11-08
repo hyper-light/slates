@@ -9,6 +9,8 @@
   clippy::unwrap_in_result
 )]
 
+mod common;
+
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -57,13 +59,13 @@ struct PlayedAnchor {
 /// The anchor the test plays for `config`'s instance, its segment and content object under `tag`.
 fn played_anchor(config: &DaemonConfig, tag: &str) -> PlayedAnchor {
   let segment = AnchorSegment::create(
-    &format!("slates-seg-{tag}-{}", std::process::id()),
+    &common::fixture_object("slates-seg", tag),
     &profile().facts.identity,
     config.geometry,
   )
   .unwrap()
   .with_content(
-    &format!("slates-con-{tag}-{}", std::process::id()),
+    &common::fixture_object("slates-con", tag),
     config.content_bytes(),
   )
   .unwrap();

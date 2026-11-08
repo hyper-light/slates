@@ -111,7 +111,7 @@ fn single_shard_daemon(name: &str) -> (Daemon, String) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{name}"),
+      name: common::fixture_object("slates-seg", name),
     },
   )
   .unwrap();
@@ -137,7 +137,7 @@ fn two_shard_daemon_with(name: &str, adjust: impl FnOnce(&mut DaemonConfig)) -> 
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{name}"),
+      name: common::fixture_object("slates-seg", name),
     },
   )
   .unwrap();

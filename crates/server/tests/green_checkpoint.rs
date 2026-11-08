@@ -82,7 +82,7 @@ fn a_green_whose_readers_keep_up_holds_versions_past_its_chain_cap() {
     &profile,
     config(&profile, &instance),
     slates_server::SegmentSource::Create {
-      name: format!("slates-seg-chain-cap-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "chain-cap"),
     },
   )
   .unwrap();
@@ -207,7 +207,7 @@ fn a_partitions_snapshot_holds_what_its_green_is_not_what_it_has_been() {
     &profile,
     DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS)),
     slates_server::SegmentSource::Create {
-      name: format!("slates-seg-chain-flat-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "chain-flat"),
     },
   )
   .unwrap();
@@ -288,7 +288,7 @@ fn held_cap_daemon(instance: &str) -> Daemon {
     &profile,
     config,
     slates_server::SegmentSource::Create {
-      name: format!("slates-seg-chain-held-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "chain-held"),
     },
   )
   .unwrap();

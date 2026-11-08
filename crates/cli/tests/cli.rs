@@ -887,6 +887,97 @@ fn a_daemon_killed_after_its_anchors_executable_is_replaced_restarts_from_the_an
   drop(anchor);
 }
 
+/// A-254, under A-176 and A-178's rule. Do: start an anchor with its daemon and write a file through the SDK; run a second
+/// anchor for the same instance and let it be refused; kill the live anchor's daemon. Expect the second anchor to exit
+/// refused, the live anchor's next daemon to adopt its segment by name and serve, and the file to read back whole. A start
+/// that is refused must leave the running instance untouched: before, on macOS, the second anchor created its segment
+/// before it asked who owned the instance, and that creation and its drop each unlinked the live segment's name, so the
+/// next daemon found nothing to attach (`shm_open` `ENOENT`, a crash loop). Linux's segment has no name, so there the
+/// test holds either way.
+#[cfg(unix)]
+#[test]
+fn a_refused_second_anchor_leaves_the_live_instance_its_segment_and_its_bytes() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the refused second anchor: set SLATES_TEST_CLI=1 to run it (starts daemons)"
+    );
+    return;
+  }
+  const BYTES: &[u8] =
+    b"the live anchor's volume keeps these bytes through a refused second anchor";
+  let instance = format!("cli-second-anchor-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "kept", "--bounded", "4MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let volume = volume_id_of(&value_of(&out, "id"));
+  let deadlines = || {
+    slates_client::Deadlines::derive(
+      slates_server::daemon::LIVENESS_BUDGET_NS,
+      slates_db::replay::RECOVERY_BUDGET_NS,
+    )
+    .get()
+  };
+  let mut writer = slates_client::Client::connect(&instance, deadlines()).unwrap();
+  let attachment = writer
+    .attach(volume, None, slates_client::Intent::Write)
+    .unwrap()
+    .attachment;
+  writer
+    .fs_write((volume, attachment), "kept.txt", BYTES, FILE_MODE)
+    .unwrap();
+  drop(writer);
+  let mut second = Command::new(env!("CARGO_BIN_EXE_slates"))
+    .args([
+      "--instance",
+      &instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      SHARDS,
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .unwrap();
+  // It measures the machine before it is refused, which a loaded host stretches: the file's widest wait for a process.
+  let began = Instant::now();
+  let mut refused = second.try_wait().unwrap();
+  while refused.is_none() && began.elapsed() < FLEET_WAIT {
+    pause();
+    refused = second.try_wait().unwrap();
+  }
+  let exited = refused.is_some();
+  if !exited {
+    let _ = second.kill();
+    let _ = second.wait();
+  }
+  assert!(
+    exited && refused.is_some_and(|status| !status.success()),
+    "the second anchor for a live instance was refused: {refused:?}"
+  );
+  let killed = daemon_pid(&instance).expect("the live anchor's daemon answers");
+  assert!(
+    Command::new("kill")
+      .args(["-9", &killed.to_string()])
+      .status()
+      .unwrap()
+      .success()
+  );
+  await_daemon(&instance, Some(killed), &[]);
+  let mut reader = slates_client::Client::connect(&instance, deadlines()).unwrap();
+  let read = reader
+    .read(volume, "kept.txt", slates_ipc::protocol::ReadAt::Head)
+    .unwrap();
+  assert_eq!(
+    read, BYTES,
+    "the file reads back whole through the next daemon"
+  );
+  drop(anchor);
+}
+
 /// Shape: what replaces the anchor's executable in the test above: another program, which exits at once.
 #[cfg(unix)]
 const REPLACEMENT_SCRIPT: &str = "#!/bin/sh\nexit 3\n";

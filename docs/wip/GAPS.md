@@ -14661,14 +14661,29 @@ window (adacachy); with the old one-window wait it failed at 5.0 s. The loaded r
 answer past one window, the longest 0.53–1.17 s; the reproduction's 5.06 s at load 150–170 did not recur with that
 load. 9 of those 10 passed; the other failed on a different defect, recorded next.
 
-### 2026-11-07: the Shards DAX fixture names every daemon's segment alike, and one case's start found it gone — open
+### 2026-11-07: the Shards DAX fixture named every daemon's segment alike, and one case's start found it gone — fixed
 
 In the same loaded runs, one case of `the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte` failed before
 its first act: "shard 0 failed to initialize after 273138 µs: segment: shared memory: shm_open refused (code
-Some(2))" (`ENOENT`), then `ConsensusNotInitialized` at its bootstrap. `dax_provisioned_in` names the segment
-`slates-seg-{name}` with neither the process id nor a per-daemon count, so a proptest's successive cases, and two
-processes of the binary, use one name; a dropped daemon that removes the name after its successor created it leaves
-the successor's shard nothing to open. Owed: a segment name unique to each daemon, failing test first.
+Some(2))" (`ENOENT`), then `ConsensusNotInitialized` at its bootstrap. The name was the fixture's:
+`dax_provisioned_in`, `single_shard_daemon` and `common::anchor::held_anchor` named a segment `slates-seg-{name}` (and
+the held anchor's content object `slates-con-{name}`) with neither the process id nor a per-call count. On macOS a
+shared-memory name is the user's, a creation first unlinks any holder's (`slates-mem`'s `create_object`), and a
+creator's drop unlinks the name again, so with one name for two fixtures, a proptest's successive cases or two
+processes of one binary, the first's drop unlinked the second's. `common::fixture_object` now names each one
+`{prefix}-{name}-{pid}-{n}`, as `daemon.rs`'s audit fixtures name an instance per call (2026-09-15). Red first:
+`a_dropped_fixture_segment_leaves_the_next_ones_in_place` creates two segments under one fixture name, drops the
+first, and attaches to the second by its handoff; on this Mac it failed `shm_open` `ENOENT` and passes now (Linux names
+no segment, so there it holds either way). Every other server test fixture moved to the helper, each read
+first: 12 took a literal name from their callers and carried no process id at all (`attach_forms`, `daemon`'s `daemon`,
+`fleet_daemon` and `capped_daemon`, `live_ship`, `merge_load`, `nfs_mount`'s two, `nfs_v4_kernel`, `observe`,
+`virtiofs`'s two), so two processes of one binary shared each name; the rest carried one, directly or through their
+instance, but no per-call count. No test depended on a name's shape: `recovery.rs` finds a content object by a substring
+the suffix leaves whole. `a_refused_second_daemon_leaves_the_live_ones_segment_in_place` keeps one name on purpose, since
+its two daemons must share it.
+
+The product's side of it was fixed by A-254: `slates anchor` and a daemon run alone decide the instance's owner before
+they create a segment, so a refused start unlinks nothing (`docs/bugs/2026-11-08-a-refused-second-anchor-unlinked-the-live-instances-segment.md`).
 
 ### 2026-10-22: two pressure tests failed on a busy machine, not on the property — fixed
 
