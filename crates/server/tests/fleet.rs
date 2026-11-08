@@ -12889,6 +12889,7 @@ struct ResentAfterRestart {
 
 /// The restart cases' expectations: the submit waited, was resent once reconnected, joined the wait while the record
 /// was withheld, and is answered the version it was accepted as, the green holding it once.
+#[allow(clippy::cognitive_complexity)]
 fn check_resent_after_restart(seen: ResentAfterRestart) {
   assert!(
     matches!(seen.edited, ReplyBody::Edited),

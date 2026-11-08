@@ -66,10 +66,11 @@ a work's head can never reach a holder. `Snapshot` refuses a work (`Unsupported`
 `Snapshot` and a takeover's own materialization advance one). So a takeover has no work to bring back, and a submit of
 it sent to the successor is refused, not run.
 
-## A note on the first rung
+## The fence the rung met
 
-The first four rungs on this fix fenced the green at recovery (`NotAccepted`, at versions 260 to 448) and stalled. Their
-build's target directory had been seeded from another tree's, the hazard of cargo reusing a crate built from a
-different worktree (its hash leaves out the workspace's path). The next build, in a target directory of its own, ran
-the rung clean five times of five. The cause was not proven beyond that, so the landing hash is built from an empty
-target directory and run again.
+Some rungs on this fix fenced the green at recovery and stalled: `NotAccepted`, at versions 260 to 448 (4 of 4 runs, then
+0 of 5, then 2 of 3 on a build from an empty target directory, so not a mixed build, as first suspected). It is not this
+fix's: a build printing the refusal showed `version 251 held 250: increment base 0: BaseUnavailable { base: 0, floor: 250
+}`. The W3 checkpoint folds to the reachable floor without looking at the increments above it, which can have bases
+below it, accepted before their works moved on. Recovery restores at the checkpoint and cannot replay them. Its own
+record and fix follow.
