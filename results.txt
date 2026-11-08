@@ -1,0 +1,112 @@
+runner windows-latest, 4 CPUs, f37c03d diag-liveness-24: the recovery-slicing extremes on four runners, handoff, Sun Nov  8 08:31:05 UTC 2026
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_PREBUILT_NASM': '0'
+warning: aws-lc-sys@0.45.0: Value: 0 is false.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-pc-windows-msvc'
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' failed - Err(Error { kind: ToolExecError, message: "command did not execute successfully (status code exit code: 2): \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Tools\\\\MSVC\\\\14.51.36231\\\\bin\\\\HostX64\\\\x64\\\\cl.exe\" \"-nologo\" \"-MD\" \"-Z7\" \"-Brepro\" \"-WX\" \"-W4\" \"-FoD:\\\\a\\\\slates\\\\slates\\\\target\\\\debug\\\\build\\\\aws-lc-sys-adc05d15a5129420\\\\out\\\\out-stdalign_check\\\\e1bacabfea35bee3-stdalign_check.o\" \"-c\" \"D:\\\\a\\\\slates\\\\slates\\\\vendor\\\\aws-lc-sys\\\\aws-lc\\\\tests\\\\compiler_features_tests\\\\stdalign_check.c\"" }).
+error[E0433]: cannot find module or crate `slates_bridge_nfs` in this scope
+error[E0433]: cannot find module or crate `slates_bridge_nfs` in this scope
+error[E0433]: cannot find module or crate `slates_bridge_nfs` in this scope
+error[E0433]: cannot find `time` in `rustix`
+error[E0433]: cannot find `time` in `rustix`
+error: could not compile `slates-cli` (example "nfs_writeback_ab") due to 5 previous errors
+warning: build failed, waiting for other jobs to finish...
+== clippy exit 101
+== spinners: 8
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.59s
+
+== rt alone exit 0 in 7 s
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates-server: shard 0 initialized in 13774 µs, 15625 µs of its CPU, in 7 slices of 6 units; the longest slice 12282 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 1 µs)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates-server: shard 0 initialized in 11815 µs, 0 µs of its CPU, in 7 slices of 6 units; the longest slice 10904 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's budget 0 µs)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates-server: client 41's seat was refused by its shard; its id is given back (first occurrence; later ones are counted)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+test daemon::tests::condemnation_cost_per_object_is_flat_and_sub_microsecond ... ignored, measurement, not a gate; prints the per-object takeover cost
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates-server: shard 0 initialized in 11941 µs, 15625 µs of its CPU, in 7 slices of 6 units; the longest slice 11032 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 1 µs)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates-server: shard 0 initialized in 11864 µs, 15625 µs of its CPU, in 7 slices of 6 units; the longest slice 11015 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 0 µs)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates-server: shard 0 initialized in 11801 µs, 0 µs of its CPU, in 7 slices of 6 units; the longest slice 10943 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's budget 0 µs)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates-server: shard 0 initialized in 11498 µs, 0 µs of its CPU, in 7 slices of 6 units; the longest slice 10754 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's budget 1 µs)
+slates-cluster: fleet: HostId(9362352886784918822) holds HostId(9362352886784918824) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates\server\src\member_task.rs:998:21
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates-server: shard 0 initialized in 11942 µs, 15625 µs of its CPU, in 7 slices of 6 units; the longest slice 11023 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 1 µs)
+slates-server: shard 0 initialized in 69709 µs, 15625 µs of its CPU, in 7 slices of 6 units; the longest slice 58437 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 0 µs)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates-server: shard 0 initialized in 11872 µs, 15625 µs of its CPU, in 7 slices of 6 units; the longest slice 10985 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 1 µs)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates-server: shard 0 initialized in 11729 µs, 15625 µs of its CPU, in 7 slices of 6 units; the longest slice 10941 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 0 µs)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates-server: shard 0 initialized in 11875 µs, 15625 µs of its CPU, in 7 slices of 6 units; the longest slice 10958 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 1 µs)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates-server: shard 0 initialized in 11820 µs, 0 µs of its CPU, in 7 slices of 6 units; the longest slice 10942 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's budget 1 µs)
+slates daemon: the control shard's beat task ran 660 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 2 steps and 2 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 2 unattributed), fired 1 time
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates-server: shard 0 initialized in 11876 µs, 15625 µs of its CPU, in 7 slices of 6 units; the longest slice 11016 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 0 µs)
+slates-server: partition 0: shard image not published: ENOSPC
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates-server: shard 0 initialized in 12249 µs, 0 µs of its CPU, in 7 slices of 6 units; the longest slice 11366 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's budget 1 µs)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates-server: partition 0: volume a7eac1b2e46ae2ad0000000000000002 was not imaged, skipped: EIO (first on this shard; later ones are counted as publish.volume_skipped)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+test verbs::tests::checkpoint_cost_scales_with_the_hosted_volume_count ... ignored, measurement, not a gate; prints the per-checkpoint cost vs the hosted-volume count
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+
+test result: ok. 197 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 41.29s
+
+== server lib exit 0 in 47 s
+slates daemon: shard 1 is spinning: 1000 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+ok
+test a_starved_poll_on_the_control_shard_does_not_stop_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+test a_stopping_daemon_role ... ignored, a role: run by a_stopped_daemon_does_not_say_its_control_loop_ended in a child process
+test a_wedged_shard_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1120 ms, past the 1000 ms window; the watchdog withholds the beat
+ok
+
+test result: ok. 6 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 27.26s
+
+== server liveness exit 0 in 32 s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.50s
+
+== held_rendezvous run 1 exit 0 in 25 s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.68s
+
+== held_rendezvous run 2 exit 0 in 25 s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.73s
+
+== held_rendezvous run 3 exit 0 in 25 s
+slates anchor: daemon exited (Some(1)); restarted as pid 6120 (1 in the window)
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 17174360064: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates anchor: daemon exited (Some(1)); restarted as pid 6260 (1 in the window)
+slates anchor: the starting daemon (pid 6260) made no progress for 1154 ms (the 1000 ms liveness window); killing it
+slates anchor: daemon exited (Some(1)); restarted as pid 5936 (1 in the window)
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 17174360064: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 25.83s
+
+== start_judgment exit 0 in 31 s
