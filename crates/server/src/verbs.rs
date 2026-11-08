@@ -5583,6 +5583,18 @@ fn create_work(
   {
     return refused(refusal_of_db(&e));
   }
+  // The green keeps this base while the work holds it (A-247).
+  if let Err(e) = state.db.mutate(
+    &mut state.segment,
+    &Op::WorkFloorSet {
+      green: green_id,
+      work: id,
+      base,
+    },
+    now,
+  ) {
+    return refused(refusal_of_db(&e));
+  }
   // A new work holds nothing of its own, so it starts charged for nothing; each change charges what it adds.
   let charged = 0;
   state.works.insert(
@@ -6324,6 +6336,18 @@ fn submit(
       ) {
         return refused(refusal_of_db(&e));
       }
+      // The work now holds the new version, not its old base (A-247).
+      if let Err(e) = state.db.mutate(
+        &mut state.segment,
+        &Op::WorkFloorSet {
+          green: green_id,
+          work: work_id,
+          base: version,
+        },
+        now,
+      ) {
+        return refused(refusal_of_db(&e));
+      }
       reset_accepted_work(state, work_id, version);
       // The version's merge record, issued only once its inputs — the increment just appended — are
       // placed (§4.16 "Commit"; at `f = 0` the append is the placement).
@@ -6473,6 +6497,18 @@ fn rebase(state: &mut ShardState, principal: &Principal, work: VolumeId) -> Repl
       if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
         // Not recorded, so the work stays where it was and so does its charge (a return to what it held cannot be
         // refused).
+        let _ = crate::work_charge::set_to(state, work_id, charged_before);
+        return refused(refusal_of_db(&e));
+      }
+      if let Err(e) = state.db.mutate(
+        &mut state.segment,
+        &Op::WorkFloorSet {
+          green: green_id,
+          work: work_id,
+          base: version,
+        },
+        now,
+      ) {
         let _ = crate::work_charge::set_to(state, work_id, charged_before);
         return refused(refusal_of_db(&e));
       }

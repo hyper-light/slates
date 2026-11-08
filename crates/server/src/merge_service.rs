@@ -121,18 +121,15 @@ pub(crate) fn rejected_cache_budget(state: &ShardState) -> usize {
 /// Never past the head.
 pub(crate) fn reachable_floor(state: &ShardState, green: DbVolumeId) -> u64 {
   let head = state.greens.get(&green).map_or(0, Green::head);
-  let work_bases = state
-    .works
-    .values()
-    .filter(|work| work.green == green)
-    .map(|work| work.base_version);
   let pins = state
     .merge
     .attachments
     .values()
     .filter(|pin| pin.green == green)
     .map(|pin| pin.version);
-  work_bases.chain(pins).min().unwrap_or(head).min(head)
+  // Every work's base is held in the partition wherever the work lives (A-247).
+  let oldest_work = state.db.partition().oldest_work_floor(green);
+  pins.chain(oldest_work).min().unwrap_or(head).min(head)
 }
 
 /// The version a green's durable chain may be checkpointed at (W3; §4.16): the reachable floor, kept below the
@@ -1277,6 +1274,16 @@ pub(crate) fn destroy_merge_volume(
       return Some(refused(refusal_of_db(&e)));
     }
     state.merge.attachments.remove(attachment);
+  }
+  // A destroyed work releases its hold on its green's base (A-247).
+  if let Some(green) = state.works.get(&id).map(|work| work.green)
+    && let Err(e) = state.db.mutate(
+      &mut state.segment,
+      &Op::WorkFloorDropped { green, work: id },
+      now,
+    )
+  {
+    return Some(refused(refusal_of_db(&e)));
   }
   let ops = [
     Op::VolumeStateChanged {

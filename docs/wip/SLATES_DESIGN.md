@@ -13942,36 +13942,55 @@ Status: accepted 2026-11-07; built in two steps (one node, then across nodes).
   Of a rung's operations, edits, reads, rebases and creations are about 92%. None of them needs the green's
   sequence. Only a submit's verdict does: it must see every accepted increment before it in one order.
 - **The rule.**
-  - *Where a work lives.* A work is created on the shard, and the node, of the client that creates it. Its id
-    routes there, so its edits, its reads, its staging and its submit arrive there.
-  - *Creation.* `CreateWork` asks the green's owner once: may this principal create a work, and at which head.
-    The owner records the work's base as a floor (below) in the same step and answers the head. The work's record is
-    then made on its own partition.
-  - *The work's base.* A work holds the files it changed (A-202's `WorkFiles`). The first time it touches a file it
-    has not changed (an edit, a read, a declare, the seal), its shard fetches that file from the owner as the base
-    holds it: bytes, mode, kind, links. The bytes are paged as the green's reads already are (`content_page_at`), and
-    kept in the work's base cache. A verb that needs a fetch is parked, as `lease_wait` parks one, and run again once
-    the fetch lands, so the verb itself stays one synchronous step with no await. A work's base never changes while
-    the work holds it, so the cache needs no invalidation. It goes with the work's next base (an accept, a rebase) or
-    the work.
-  - *Submission.* The work's shard seals and composes its increment, as `build_increment` does now, over its base
-    cache with W2's planned composition (`compose_volume_planned`), and sends only the increment to the owner. The
-    owner runs the verdict and the commit, records the merge, moves the work's floor to the new head, and answers the
-    verdict. The work's shard resets the work on an accept. The verdict is the green's one serialized step.
-  - *Rebase.* The work's shard sends its increment. The owner maps it through its deltas and answers the changed
-    delta (A-202 part 3's `Rebased::changed`) and the new base, and moves the floor. Nothing about the green
-    changes.
-  - *Floors (loadtest-scale, W3's coupling).* The owner keeps one durable record per live work of its green:
-    the work, its base version, and the node and shard that hold it. The record is made at creation and moved by the
-    work's accept and rebase. It is dropped by the work's destroy, and by the reap of its node or of its client's
-    session. The record survives the owner's restart, being in the partition. `reachable_floor` (W3, `crates/server/src/merge_service.rs`) is the minimum over
-    these records and the green's pins, in place of the bases of the works on the owner's shard alone, so a checkpoint never folds past a live remote work's base. An orphaned
-    record left by a crash between the owner's step and the work's creation is found at the owner's checkpoint:
-    the owner asks the record's shard whether the work exists, on that cold path only. It is dropped when it does
-    not.
-  - *Exactly once.* Each cross-shard or cross-node call is part of a client request with its own completion
-    record. The verdict's increment identity (work, base, ops, post-state) is the engine's retry key, and a retried
-    request meets its record at the work's shard, as A-225 and A-226's tests hold.
+  - *Where a work lives.* A work is placed on the partition its name hashes to (`owner_of_name`), on the green's node in
+    this first step, and its id carries that partition, so its edits, reads, staging and submit arrive there. The name
+    rule is the plain volumes': a name is created and looked up on the partition it hashes to, so a work's name is
+    unique beside theirs and no alias is needed. Hashing spreads a green's works over the shards whatever shard their
+    clients came in on, and a request forwarded from another node, which has no creating shard, places the same way.
+    The second step (across nodes) amends this rule when it is built.
+  - *Creation.* `CreateWork` runs on the work's partition. It asks the green's owner once: may this principal create a
+    work, and at which head. The owner records the work's base as a floor (below) in the same step and answers the head.
+    The work's record is then made on its own partition, under the request's completion key.
+  - *A verb that needs the owner.* A verb of a work runs on the work's shard as one synchronous step, with no await.
+    One that needs something only the owner has is parked at `dispatch`'s gate, as `lease_wait` parks one, and the ask
+    runs as a task of the work's shard, bounded by a deadline (past it the verb is refused `Overloaded`, and the retry
+    runs it again). The answer resumes the verb under the same completion key. Bounded by the shard's client credit, as
+    `lease_wait` is.
+  - *A work's order.* While a verb of a work is parked, every later verb of that work parks behind it, and they resume
+    in arrival order, so an edit never overtakes a submit pipelined after it, and no edit lands during a submit's
+    verdict.
+  - *The work's base.* A work holds the files it changed (A-202's `WorkFiles`). An edit, a read or a declare of a file it
+    has not changed needs that file as the base holds it. Its shard fetches the file from the owner for that one verb,
+    and the verb consumes it: an edit moves it into the work's own files, as today. A base file is never cached on the
+    work's shard, so the work's charge and footprint are unchanged and there is nothing to invalidate.
+  - *Submission.* The work's shard moves the work's journal and changed files out to the owner, which composes the
+    increment from them over the green's base (`build_increment`, W2's planned composition), runs the verdict and the
+    commit, moves the work's floor, and records the completion under the request's key, exactly as a forwarded verb
+    records it there (deferred to the quorum as AUD-11 defers it). The verdict is the green's one serialized step. The
+    answer goes back to the work's shard, which, in one transaction, restates the work (reset on an accept, its journal
+    and files put back on a conflict), records the completion on its own partition, and only then replies.
+  - *Rebase* rides the same path: the owner maps the increment through its deltas, moves the floor, and answers the
+    changed delta and the new base. Nothing about the green changes.
+  - *An edit-and-submit (A-225)* applies its edit to what it moves to the owner, not to the work, so nothing of it is
+    durable until the answer: an accept resets the work, a conflict applies the edit, each in the settling transaction
+    with the completion.
+  - *Floors (loadtest-scale, W3's coupling).* The owner keeps one durable record per live work of its green: the work
+    and its base version. It is made at creation, moved by the work's accept and rebase, and dropped by the work's
+    destroy (a message after the destroy commits, whose loss is an orphan as below). `reachable_floor` is the minimum
+    over these records and the green's pins, for a work on the owner's shard too (R8), so a checkpoint never folds past
+    a live work's base wherever it lives. An orphan (a record whose work's creation or destroy a crash cut short) is
+    found at the daemon's start, as A-236's name aliases are: each record's work is looked up on its partition, and the
+    record is dropped if it is gone. Only a crash leaves one.
+  - *Recovery.* A work replays its durable log (A-207). Its entries need the old bytes only for an edit whose file the
+    work had not changed, so the log's replay is given the base through the same ask of the owner, once the partitions
+    are all recovered, and the work is unserved (`Unpublished`) until it has. A work's recovery no longer needs a local
+    engine.
+  - *Exactly once.* A client's retry meets, in order: the work's shard's completion record; a parked verb it joins; or a
+    re-run, which sends the owner the same request id. The owner answers a request it has completed from its record,
+    whatever the work now holds, so a crash between the owner's accept and the work's reset resolves to the same answer,
+    and the work's reset is idempotent by version. The engine's identity cache (`Green::accepted`, restored from the
+    chain) answers a re-seal under a new request id. A-252's defect (a submit resent after its owner's restart while its
+    acceptance waited at the quorum) is in the owner's deferred path that this uses, and is fixed there.
 - **Reads of a green off its owner (the supervisor's decision of 2026-11-08).**
   - *`ReadAt::Head` is unchanged.* It stays on the owner, as §4.8 pins it ("head reads at the owner under its lease or
     from f+1 candidates"). A replica's own head answered as `Head` could be older than the client's own accepted

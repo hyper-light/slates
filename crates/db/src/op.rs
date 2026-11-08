@@ -409,6 +409,23 @@ pub enum Op {
     /// The name.
     name: String,
   },
+  /// A work's base is held for it on its green's partition, wherever the work lives (A-247): made at the work's
+  /// creation, moved by its accept and rebase. Appended.
+  WorkFloorSet {
+    /// The green.
+    green: VolumeId,
+    /// The work.
+    work: VolumeId,
+    /// The version the work is based on.
+    base: u64,
+  },
+  /// A work's floor is released: it was destroyed, or found gone at recovery (A-247). Appended.
+  WorkFloorDropped {
+    /// The green.
+    green: VolumeId,
+    /// The work.
+    work: VolumeId,
+  },
   /// A CLI attachment's term was renewed by a verb naming it (A-230). Appended.
   AttachmentRenewed {
     /// The attachment.
@@ -508,6 +525,8 @@ impl Op {
       Op::NameAliasReserved { .. } => "name_alias_reserved",
       Op::NameAliasConfirmed { .. } => "name_alias_confirmed",
       Op::NameAliasReleased { .. } => "name_alias_released",
+      Op::WorkFloorSet { .. } => "work_floor_set",
+      Op::WorkFloorDropped { .. } => "work_floor_dropped",
       Op::AttachmentRenewed { .. } => "attachment_renewed",
       Op::AttachmentExpired { .. } => "attachment_expired",
       Op::LiveShippingChanged { .. } => "live_shipping_changed",

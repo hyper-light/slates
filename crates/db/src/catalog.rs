@@ -969,6 +969,19 @@ pub struct NameAliasRecord {
   pub confirmed: bool,
 }
 
+/// A live work's hold on a version of its green (A-247), kept on the green's partition whichever partition the work
+/// lives on: the green's reachable floor is the minimum over these and its pins, so a checkpoint never folds past a
+/// base a work still reads and composes against.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkFloorRecord {
+  /// The green.
+  pub green: VolumeId,
+  /// The work, on the partition its id encodes.
+  pub work: VolumeId,
+  /// The version the work is based on.
+  pub base: u64,
+}
+
 /// Format: the bytes of hyper-seal's wrapped key record (version, parent id, parent generation, AES-256-KW of the key;
 /// seal.md §3.3).
 pub const SEAL_KEY_RECORD_BYTES: usize = 61;
