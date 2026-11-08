@@ -1,0 +1,58 @@
+leg main-x86, 4 CPUs, Sun Nov  8 14:25:31 UTC 2026, tree 6880041fb7498994bf6c7197dafa806173f8788d
+== release build exit 0
+   r1 LD-TL stopped_on_install Some(6120) after 22.553µs
+   r1 LD-TL successor after 5.948884ms
+   r1 LD-TL caught Some(20.49691ms)
+   r1 LD-TL durable Some(1103) then Some(1116) after 72.978694ms
+   r1 LD-TL writes 1116
+   r1 counts: installs 3 taken 3 images 2 why 2
+== run 1 exit 0
+   r2 LD-TL stopped_on_install Some(7092) after 20.901µs
+   r2 LD-TL successor after 8.39256ms
+   r2 LD-TL caught Some(22.711004ms)
+   r2 LD-TL durable Some(6233) then Some(6238) after 74.356373ms
+   r2 LD-TL writes 6240
+   r2 counts: installs 3 taken 2 images 1 why 1
+== run 2 exit 0
+   r3 LD-TL stopped_on_install Some(7722) after 21.482µs
+   r3 LD-TL successor after 2.716998ms
+   r3 LD-TL caught Some(674.988656ms)
+   r3 LD-TL durable Some(11158) then Some(11175) after 8.352368ms
+   r3 LD-TL writes 11177
+   r3 counts: installs 2 taken 2 images 2 why 1
+== run 3 exit 0
+   r4 LD-TL stopped_on_install Some(8119) after 22.794µs
+   r4 LD-TL successor after 9.569896ms
+   r4 LD-TL caught Some(26.91478ms)
+   r4 LD-TL durable Some(5126) then Some(5139) after 14.561682ms
+   r4 LD-TL writes 5139
+   r4 counts: installs 3 taken 3 images 2 why 2
+== run 4 exit 0
+   r5 LD-TL stopped_on_install Some(9013) after 18.047µs
+   r5 LD-TL successor after 4.902377ms
+   r5 LD-TL caught Some(616.82636ms)
+   r5 LD-TL durable Some(12411) then Some(12424) after 6.837297ms
+   r5 LD-TL writes 12425
+   r5 counts: installs 3 taken 3 images 3 why 2
+== run 5 exit 0
+   r6 LD-TL stopped_on_install Some(9424) after 19.219µs
+   r6 LD-TL successor after 4.235108ms
+   r6 LD-TL caught None
+   r6 LD-TL durable Some(21640) then Some(21645) after 29.902688ms
+   r6 LD-TL writes 21598
+   r6 counts: installs 4 taken 3 images 3 why 1667
+== run 6 exit 0
+   r7 LD-TL stopped_on_install Some(18294) after 23.444µs
+   r7 LD-TL successor after 9.733639ms
+   r7 LD-TL caught Some(54.350913ms)
+   r7 LD-TL durable Some(2719) then Some(2740) after 67.909143ms
+   r7 LD-TL writes 2740
+   r7 counts: installs 3 taken 3 images 3 why 4
+== run 7 exit 0
+   r8 LD-TL stopped_on_install Some(18976) after 23.515µs
+   r8 LD-TL successor after 17.621514ms
+   r8 LD-TL caught Some(48.772472ms)
+   r8 LD-TL durable Some(3721) then Some(3723) after 30.141008ms
+   r8 LD-TL writes 3724
+   r8 counts: installs 3 taken 2 images 1 why 1
+== run 8 exit 0
