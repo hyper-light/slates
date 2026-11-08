@@ -13940,11 +13940,12 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     (harness-only exposure: `writable_dax`, DAX unadvertised);
   - `DaxRegistry::has_writable_of` keys by number alone: the backed session's `EBUSY` over-refuses across volumes;
   - `volume_config` wraps `next_prefix` at 65,535 with no check against live volumes' prefixes.
-- **Open, found by the new tests: a read-only attachment is not a read-only file system to its client.** On every FUSE
-  transport (the shared bridge) an open for writing is granted and each write through it refused `EPERM`; NFS answers
-  `PERM`. A read-only file system answers `EROFS`, at the open for an open. Every change is refused and nothing lands,
-  so nothing is unsafe; a client's message and its retry logic differ. The decision spans every transport: the bridge's
-  `authorize_write` maps a read-only attachment to `NotPermitted`, which every edge maps to its permission error.
+- **Fixed 2026-11-08 (slabs), found by the new tests: a read-only attachment was not a read-only file system to its
+  client.** On every FUSE transport an open for writing was granted and each write refused `EPERM`; NFS answered `PERM`.
+  Now an attachment that may read but not write, and a snapshot's view, answer `EROFS` (at the open for a write-mode
+  open, and at every mutating verb): `NFS3ERR_ROFS`/`NFS4ERR_ROFS` over NFS, `STATUS_MEDIA_WRITE_PROTECTED` from WinFsp,
+  one mapping in the bridge's `authorize_write` (§4.6 "A read-only attachment is a read-only file system"). An
+  attachment with no rights stays `EPERM`. Record: `docs/bugs/2026-11-08-a-read-only-attachment-was-not-a-read-only-file-system.md`.
 - **Open, performance: `INIT`'s page count follows the host's page.** `init::max_pages` is `MAX_WRITE` in host pages,
   so a 4 KiB-page guest of a 16 KiB-page Mac is told 16 pages: 64 KiB a request where a write may be 256 KiB. The
   kernel mount needs the host's count (its channel buffer is fixed); a VM route could name 64. Not measured yet; owed
@@ -14355,8 +14356,9 @@ Found while fixing A-151.
   directory's untouched entries refuse `BaseUnavailable`, overlay entries serve, and the next image keeps its record. A
   directory another replaced is treated the same (never substituted, no longer the whole volume). Proven by use:
   SimHost (`crates/vfs/tests/base.rs`), the server's restart over NFS and the client (`crates/server/tests/recovery.rs`),
-  and a kernel mount kept across the restart (`crates/cli/tests/cli.rs`). Record:
-  `docs/bugs/2026-11-07-a-removed-base-directory-refused-the-whole-volume-at-recovery.md`.
+  and a kernel mount kept across the restart (`crates/cli/tests/cli.rs`; Linux FUSE with a kill, diag-slabs-33, run
+  42434266219: the vfs base suite 47, recovery 49, the CLI flow 91; red with main's base plane, diag-slabs-34, run
+  42434266313). Record: `docs/bugs/2026-11-07-a-removed-base-directory-refused-the-whole-volume-at-recovery.md`.
 
 ### 2026-10-23: a release the dead daemon answered after the last publication came back as an open — fixed (A-154)
 

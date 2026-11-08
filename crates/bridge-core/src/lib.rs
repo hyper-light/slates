@@ -315,7 +315,9 @@ pub trait Bridge {
   fn lookup(&mut self, parent: ObjectId, cx: &OpContext, name: &str) -> Result<NodeAttr, VfsError>;
   /// The attributes of `object` under `cx`.
   fn getattr(&mut self, object: ObjectId, cx: &OpContext) -> Result<NodeAttr, VfsError>;
-  /// Open `object` under `cx`; the file handle.
+  /// Open `object` under `cx`; the file handle. `flags` are the open's flags as the FUSE protocol carries them (Linux
+  /// `O_*`), or `O_RDONLY` (0) from a transport without them; an open for writing (a write access mode, or `O_TRUNC`)
+  /// is a change, refused `ReadOnly` before any handle on an attachment that may not write.
   fn open(&mut self, object: ObjectId, cx: &OpContext, flags: u32) -> Result<u64, VfsError>;
   /// Read `size` bytes at `offset` from `object` into `out`, under the authenticated `cx`. The
   /// object is addressed by identity (§4.6), not an open handle; `cx` carries the view and the

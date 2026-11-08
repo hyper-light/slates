@@ -3042,6 +3042,9 @@ fn nfsstat_of(e: &VfsError) -> Nfsstat3 {
     VfsError::NotEmpty => Nfsstat3::Notempty,
     VfsError::NoSpace => Nfsstat3::Nospc,
     VfsError::NotPermitted => Nfsstat3::Perm,
+    // A read-only attachment or a snapshot's view is a read-only file system (`NFS3ERR_ROFS`; v4's `NFS4ERR_ROFS` by
+    // `Nfsstat4::of_v3`).
+    VfsError::ReadOnly => Nfsstat3::Rofs,
     VfsError::LinkProtected => Nfsstat3::Acces,
     VfsError::SpecialFileOperation => Nfsstat3::Notsupp,
     VfsError::Invalid | VfsError::InvalidName => Nfsstat3::Inval,

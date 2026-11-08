@@ -2008,6 +2008,18 @@ neither the server nor a mounted client is granted device activation by a volume
 Device-metadata preservation is a separate, unimplemented decision. Mounted acceptance
 must exercise local communication and isolation between clones as well as namespace calls.
 
+**A read-only attachment is a read-only file system (decided 2026-11-08, from POSIX).** An attachment that may read but
+not write, and a snapshot's view, refuse every change as POSIX's read-only file system does: `EROFS`, at the open for
+an open for writing (a write access mode or `O_TRUNC`) and at every mutating verb. One mapping makes it, the bridge's
+`authorize_write` (`VfsError::ReadOnly`), carried by every edge: FUSE, virtio-fs and the vhost route answer `EROFS`
+(the DAX windows' writable asks too); NFS answers `NFS3ERR_ROFS` and `NFS4ERR_ROFS`; WinFsp answers
+`STATUS_MEDIA_WRITE_PROTECTED` and reports the volume read-only (`ReadOnlyVolume`), so Windows refuses most changes
+before they reach a shard; the wire answers `ReadOnlyVolume`. An attachment with no rights at all is refused for
+permission (`EPERM`, `NFS3ERR_PERM`, `STATUS_ACCESS_DENIED`). A kernel that mounts the attachment `ro` (Linux FUSE,
+macOS NFS) refuses most changes itself before the request, with the same `EROFS`. Until 2026-11-08 the bridge granted
+an open for writing and answered each change `NotPermitted`
+(`docs/bugs/2026-11-08-a-read-only-attachment-was-not-a-read-only-file-system.md`).
+
 **Kubernetes publication without privilege (AUD-29-75; decided 2026-10-01).** Kubernetes has two ways to put a
 mount a component makes into a pod, and both need a privilege R10 forbids:
 
@@ -17117,7 +17129,7 @@ Applied in the same change to:
   five seconds; with a close mid-frame taken for a clean one the truncated count stays 0.
 - **Found on the way, recorded in GAPS, not changed here:** a read-only attachment grants a write-mode open and answers
   each write `EPERM` on every FUSE transport, and NFS answers `PERM`, where a read-only file system answers `EROFS` at
-  the open; `INIT`'s page count follows the host's page, so a 4 KiB-page guest of a 16 KiB-page Mac is told 16 pages,
+  the open (fixed 2026-11-08, §4.6 "A read-only attachment is a read-only file system"); `INIT`'s page count follows the host's page, so a 4 KiB-page guest of a 16 KiB-page Mac is told 16 pages,
   64 KiB a request, a quarter of the largest write.
 - **Over the wire on Linux (2026-10-24, part 1 step 2).** `attach` takes `AttachRequest::ShardsFs { subtree }`. On the
   volume's owner shard, inside the verb's transaction, the stream is made and served as above and its end kept under

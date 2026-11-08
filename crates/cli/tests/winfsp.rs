@@ -1911,3 +1911,48 @@ fn a_base_a_held_drive_covers_is_not_reacquired_through_it() {
   let (code, _, err) = run(&instance, &["detach", &attachment]);
   assert_eq!(code, 0, "detach: {err}");
 }
+
+/// Changes the drive at `path`'s file in each of the ways a read-only file system refuses: an overwrite, a create
+/// beside it, a directory, a deletion. The Win32 errors, in that order.
+#[allow(clippy::disallowed_methods)]
+fn changes_through_drive(path: &str) -> [Option<i32>; 4] {
+  let beside = format!("{path}.new");
+  let dir = format!("{path}.dir");
+  [
+    std::fs::write(path, b"no")
+      .err()
+      .and_then(|e| e.raw_os_error()),
+    std::fs::write(&beside, b"no")
+      .err()
+      .and_then(|e| e.raw_os_error()),
+    std::fs::create_dir(&dir)
+      .err()
+      .and_then(|e| e.raw_os_error()),
+    std::fs::remove_file(path)
+      .err()
+      .and_then(|e| e.raw_os_error()),
+  ]
+}
+
+/// GAPS (2026-11-08): a read-only attachment is a read-only file system on every transport. WinFsp reports the volume
+/// read-only (`ReadOnlyVolume`) and a change that reaches the mount is answered `STATUS_MEDIA_WRITE_PROTECTED`, which
+/// Win32 names `ERROR_WRITE_PROTECT`. Do: mount a volume read-only; through the drive overwrite `file.bin`, create a file
+/// beside it, make a directory, delete `file.bin`. Expect each refused `ERROR_WRITE_PROTECT`, and `file.bin` reading its
+/// first bytes still.
+#[test]
+fn a_read_only_drive_refuses_every_change_as_write_protected() {
+  if !live_mount_runs() {
+    return;
+  }
+  let fixture = ChangedElsewhere::new("rodrive", b'A');
+  let write_protect = i32::try_from(windows_sys::Win32::Foundation::ERROR_WRITE_PROTECT).unwrap();
+  assert_eq!(
+    changes_through_drive(&fixture.file),
+    [Some(write_protect); 4],
+    "every change through the read-only drive is refused as write-protected"
+  );
+  assert_eq!(
+    std::fs::read(&fixture.file).unwrap(),
+    vec![b'A'; FILE_BYTES]
+  );
+}
