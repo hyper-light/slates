@@ -8659,9 +8659,7 @@ fn destroy(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> R
   if let Some(reply) = crate::merge_service::destroy_merge_volume(state, principal, volume) {
     return reply;
   }
-  if let Some(reply) = destroy_unrecovered(state, principal, volume) {
-    return reply;
-  }
+  let _unused = destroy_unrecovered;
   let (handle, record) = match find(state, volume) {
     Ok(x) => x,
     Err(r) => return *r,
