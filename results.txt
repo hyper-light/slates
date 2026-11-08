@@ -1,0 +1,17 @@
+runner ubuntu-24.04-arm, 4 CPUs, commit 6840ab2d
+== cargo test --locked -q -p slates-server --lib
+test result: ok. 217 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 1.27s
+== exit 0
+== cargo test --locked -q -p slates-server --test fleet
+test result: ok. 107 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 594.05s
+== exit 0
+== cargo test --locked -q -p slates-cli --test cli --test fs_server -- --test-threads=1
+test result: ok. 91 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 103.61s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.96s
+== exit 0
+== cargo test --locked -q -p slates-cli --test live_fleet -- --test-threads=1
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 77.04s
+== exit 0
+== cargo test --locked -q -p slates-cli --test live_chaos -- --test-threads=1
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 326.86s
+== exit 0
