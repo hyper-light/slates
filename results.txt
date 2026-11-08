@@ -1,0 +1,36 @@
+runner ubuntu-latest, 4 CPUs, commit b08342c1
+== a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover run 1 exit 101
+thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (7107) panicked at crates/cli/tests/live_chaos.rs:1247:5:
+chaos a candidate's store destroyed mid-stream: NoLoss (successor): no survivor served the volume within the fleet wait
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover --- FAILED
+     37 SERVEDIAG chaos-replaced-c-7106: Err(Refused(NotFound))
+     37 SERVEDIAG chaos-replaced-b-7106: Err(Refused(Overloaded { shard: 1 }))
+      1 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 2.394350613s
+      1 chaos a candidate's store destroyed mid-stream: chaos-replaced-c-7106 refused the owner: {}
+      1 chaos a candidate's store destroyed mid-stream: chaos-replaced-b-7106 refused the owner: {}
+      1 chaos a candidate's store destroyed mid-stream: chaos-replaced-a-7106 refused the owner: {}
+      1 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-b-7106 destroyed at 393.926125ms
+      1 chaos a candidate's store destroyed mid-stream: NoLoss (successor): no survivor served the volume within the fleet wait
+== a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover run 2 exit 101
+thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (7754) panicked at crates/cli/tests/live_chaos.rs:1247:5:
+chaos a candidate's store destroyed mid-stream: NoLoss (successor): no survivor served the volume within the fleet wait
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover --- FAILED
+     37 SERVEDIAG chaos-replaced-c-7753: Err(Refused(NotFound))
+     37 SERVEDIAG chaos-replaced-a-7753: Err(Refused(Overloaded { shard: 1 }))
+      1 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.525539195s
+      1 chaos a candidate's store destroyed mid-stream: chaos-replaced-c-7753 refused the owner: {"fleet.live.hold_refused.behind": 1}
+      1 chaos a candidate's store destroyed mid-stream: chaos-replaced-b-7753 refused the owner: {}
+      1 chaos a candidate's store destroyed mid-stream: chaos-replaced-a-7753 refused the owner: {}
+      1 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-7753 destroyed at 542.470674ms
+      1 chaos a candidate's store destroyed mid-stream: NoLoss (successor): no survivor served the volume within the fleet wait
+== a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover run 3 exit 0
+      1 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 2.524504733s
+      1 chaos a candidate's store destroyed mid-stream: taken over by chaos-replaced-c-8375 after 2.378931509s
+      1 chaos a candidate's store destroyed mid-stream: chaos-replaced-c-8375 refused the owner: {}
+      1 chaos a candidate's store destroyed mid-stream: chaos-replaced-b-8375 refused the owner: {}
+      1 chaos a candidate's store destroyed mid-stream: chaos-replaced-a-8375 refused the owner: {}
+      1 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-b-8375 destroyed at 416.411931ms
+      1 SERVEDIAG chaos-replaced-c-8375: Err(Refused(Overloaded { shard: 1 }))
+      1 SERVEDIAG chaos-replaced-b-8375: Err(Refused(NotFound))
