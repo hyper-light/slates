@@ -46,6 +46,23 @@ fn on_sim() -> bool {
   registry::with_current(|ctx| ctx.driver_is_sim()).unwrap_or(false)
 }
 
+/// Refuses a readiness wait on a driver that cannot watch the socket: one handle names an OS descriptor on a real
+/// driver and a fabric port on the simulation's, so an OS socket awaited on the simulation driver waited on the fabric
+/// port of its descriptor's number, where nothing arrives (its task woken only by its timers), and a fabric port
+/// awaited on a real driver would watch the descriptor of its number. Off a shard the wait itself refuses
+/// (`NotOnShardThread`).
+fn on_its_driver(sim: bool) -> Result<(), RtError> {
+  match registry::with_current(|ctx| ctx.driver_is_sim()) {
+    Some(true) if !sim => Err(RtError::BadConfig {
+      what: "an OS socket awaited on the simulation driver (bind it on a simulation shard)",
+    }),
+    Some(false) if sim => Err(RtError::BadConfig {
+      what: "a simulation fabric port awaited on a real driver",
+    }),
+    _ => Ok(()),
+  }
+}
+
 impl UdpSocket {
   /// Binds a non-blocking UDP socket to `addr` (use port 0 for an OS-assigned port, then
   /// [`UdpSocket::local_addr`]). On the simulation runtime the requested address is ignored and a
@@ -171,10 +188,11 @@ impl UdpSocket {
   /// Awaits the socket's write readiness through the driver (send-buffer space), or a spurious wake — so a
   /// caller follows it with [`UdpSocket::try_send_to`] and loops on `None`.
   pub fn writable(&self) -> impl Future<Output = Result<(), RtError>> + use<> {
-    crate::readiness::writable(match &self.inner {
-      Inner::Real { socket } => socket.raw_id(),
-      Inner::Sim { port } => i32::from(*port),
-    })
+    let (raw, sim) = self.handle();
+    async move {
+      on_its_driver(sim)?;
+      crate::readiness::writable(raw).await
+    }
   }
 
   /// Receives one datagram, awaiting readability through the driver when none is ready. Returns the
@@ -196,10 +214,19 @@ impl UdpSocket {
   /// names the socket by its descriptor (or fabric port), not by a borrow, so a task that reaches the socket
   /// through a handle (a kept demultiplexer, AUD-29-08) can await it outside the handle's borrow.
   pub fn readable(&self) -> impl Future<Output = Result<(), RtError>> + use<> {
-    readable(match &self.inner {
-      Inner::Real { socket } => socket.raw_id(),
-      Inner::Sim { port } => i32::from(*port),
-    })
+    let (raw, sim) = self.handle();
+    async move {
+      on_its_driver(sim)?;
+      readable(raw).await
+    }
+  }
+
+  /// The handle a readiness wait names, and whether it is a fabric port.
+  fn handle(&self) -> (i32, bool) {
+    match &self.inner {
+      Inner::Real { socket } => (socket.raw_id(), false),
+      Inner::Sim { port } => (i32::from(*port), true),
+    }
   }
 
   /// Takes one waiting datagram into `buf` without blocking: the byte count and the sender, or `None`

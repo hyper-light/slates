@@ -27,6 +27,11 @@
 > now it commits, and the test ends in 3.3 s. Record:
 > `docs/bugs/2026-11-07-a-version-appended-before-its-owner-restarted-never-committed.md`.
 
+> **Open (perf, 2026-11-08): the give-back's slice is learned from wall time.** `learn_give_back_rate` divides by the
+> shard's clock, so on a loaded host a preempted step teaches a small slice and a give-back takes thousands of steps
+> (2,572 to 3,042 at load about 100, on a Mac whose whole give-back is 18 to 21 ms of CPU) rather than hundreds. Since
+> A-226's amendment it no longer costs other work a turn, only time to finish on a shard otherwise idle. Not changed.
+
 > **A submit resent after its owner's restart was applied a second time: fixed (2026-11-08, §4.16 "Commit", §4.9; A-252).**
 > The waiting submit lived in memory, so after a restart its resend under the same id found no completion and ran
 > again as a new version: 4,261 oracle failures on fixtures' 1,000-client primary kill, 83 versions no client was told.
@@ -81,8 +86,8 @@
 >   The logs are on jupiter under `C:\Users\corph\slates-wincov-each` and `slates-wincov-rest`. Handed to their owners
 >   through the supervisor.
 > - **Built for Windows by no lane:** the `slates` binary's unit tests and `slates-bridge-fuse`'s `abi` test did not
->   compile there (fixed). Three `slates-cli` benchmark examples still do not compile (`nfs_writeback_ab`,
->   `nfs_large_write`, `vfs_tails`), and `bridge-virtiofs`'s device and `land_bench` warn there (open).
+>   compile there (fixed). Three `slates-cli` benchmark examples did not compile and `land_bench` warned there; fixed
+>   2026-11-08, and the Windows lanes now lint `slates-cli` and `slates-land` with `--all-targets`.
 > - **Run by no lane on a platform they build for (open), with the cheapest lane for each:**
 >   - `slates-cli`'s `held_rendezvous`, `merge_kill`, `nfs_held` (ubuntu, macOS): every test skips without
 >     `SLATES_TEST_CLI`; add them to `gates`' CLI step.
@@ -171,6 +176,23 @@
 > Open: no process test yet takes over an old incarnation's volume after its replacement's key arrived (the retired
 > key's path). Bug record `docs/bugs/2026-11-07-a-node-back-at-its-anchor-with-fresh-ram-had-every-pair-key-refused.md`.
 
+> **Fixed (live-durability, 2026-11-08): an OS socket awaited on the simulation driver woke only on its timers.**
+> The simulation driver took a readiness wait's handle for a fabric port, so an OS socket bound off a shard waited
+> on the fabric port of its descriptor's number, where nothing arrives. `crates/cluster/tests/live.rs` bound its
+> sessions that way, and everything it showed about the fabric's timing came from its probe timeouts. A wait on a
+> driver that cannot watch the socket is now refused, typed (`UdpSocket::readable`, `writable`), and the test binds
+> on the shard and asserts its datagrams crossed the fabric. Only that file was affected (a sweep of rt, transport,
+> cluster and the server's lib); its two tests' assertions hold on the fabric
+> (`docs/bugs/2026-11-08-an-os-socket-awaited-on-the-simulation-driver-woke-only-on-its-timers.md`).
+
+> **Explained (live-durability, 2026-11-08): on the simulated fabric a 60 KB request crossed a slow link in 47.7 s.**
+> One `Endpoint::request` was made after a 256 kbit/s link with a 1 MiB queue was added, mid-session, to both
+> directions. It was answered after 47,661 ms of virtual time. The path set no MTU, so path-MTU discovery climbed to
+> 65,512-byte datagrams (13 probes, 12 acknowledged). Each such datagram takes 2.05 s to cross the link, and the data
+> went in datagrams that size as well. The queue peaked at 132 KB, never near its 1 MiB. With the path's MTU at
+> 1,200 bytes the same request took 2,563 ms (the 60 KB alone is 1.9 s at the link's rate), and the queue peaked at
+> 9,672 bytes. A fabric path at a WAN rate wants an MTU; real ones have one.
+
 > **Fixed (live-durability, 2026-11-08): the transport fell a session to the 1,200-byte MTU floor on loss every size
 > suffered (A-253, §4.10a, RFC 8899 §4.3).** Three consecutive above-floor losses, or three probe timeouts while a
 > full-size packet was out, declared a black hole, so a SIGSTOPped peer or a burst a full receive buffer dropped left a
@@ -183,6 +205,60 @@
 > (diag-live-durability-48), 87 suspicions and no black hole on the fix (-51). The stall rate is unchanged within what
 > 60 runs can show (0 stalls against 1, at about 1 in 100). Bug record
 > `docs/bugs/2026-11-08-a-session-fell-to-the-mtu-floor-on-loss-every-size-suffered.md`.
+
+> **Fixed (live-durability, 2026-11-08): a holder back from a stop took a second whole install, because the image it was
+> sent was stale.** The image was the one made when it fell behind: a median of 1,332 and 1,395 entries old when last
+> built, while the install's own transit added 0 or 1 (diag-live-durability-54). It landed past the retained tail and
+> took another. A holder owed an install when its session returns now waits for an image made at the log's head
+> (`live_ship::send_to_reached`). `a_holder_back_from_a_stop_takes_one_install`: 2 installs in 10 of 10 runs before, 1
+> in 10 of 10 after. Rolling partition, 30 runs a leg per arch (diag-live-durability-57): resumes that took one install,
+> 16 of 59 and 9 of 58 before, 59 of 59 on each arch after; the last install after a resume, median 242 to 324 ms on x86
+> and 270 to 264 ms on arm (the wait for a fresh image costs the typical x86 holder 82 ms), p90 557 to 471 ms and 473 to
+> 381 ms, worst 2,359 to 635 ms and 510 to 509 ms; writes in a run, median 6,014 to 10,426 and 6,138 to 6,455; 60 of 60
+> passed with it, 59 of 60 without.
+
+> **Open (live-durability, 2026-11-08): a lane's install exchange ends only on its reply or its deadline, and the
+> deadline has no ceiling.** `exchange_budget` derives it from the bytes and the session's srtt and cwnd at the start:
+> up to 77 s and 614 s measured (diag-live-durability-56). A holder stopped before replying held its exchange for the
+> whole of a 30 s budget in 12 of 12 runs (30.01 to 30.02 s, -58), though the owner had dropped it from membership 1 to
+> 15 s in; the transport has no idle timeout. A bytes-only ceiling would be wrong: a 404 MB install took 21.6 s and was
+> answered. Owed: end the exchange when the owner stops keeping contact with the holder, re-sending safely if it was a
+> false suspicion.
+
+> **Open (live-durability, 2026-11-08): hundreds of writes reach the log as one entry.** Entries of 64 KiB or more were
+> 507 deltas and 178 whole records in 60 rolling partition runs (diag-live-durability-56); a delta carried a median of
+> 638 inodes on x86 and 474 on arm, up to 3,112, about 4 KB each. That is what makes entries MB-sized and the tail's
+> byte bound run out. Why that many writes land in one publication is not known.
+
+> **Fixed (live-durability, 2026-11-08): the owner rebuilt a whole install for a stopped holder on every write.**
+> `pending_sends` skipped a holder whose lane was busy, but a holder with no session ended its lane at once, so it was
+> never busy, and each publication cloned and encoded the volume's whole image for it: a median of 2,396 and 2,769
+> builds a run, 10.9 GB, against about 3.5 installs served (diag-live-durability-54). A holder whose lane ends
+> unanswered is now left alone until the record period retries it or its session is back (`live_ship::holder_reached`),
+> so a returning link does not wait for the period. `a_stopped_holders_install_is_built_once_a_period_not_once_a_write`:
+> 402 to 412 builds over 200 writes before, 8 to 11 after (bound 12). Rolling partition, 30 runs a leg per arch
+> (diag-live-durability-55): writes in a run, median 4,467 to 8,430 on x86 and 4,061 to 5,772 on arm; write p99, median
+> 8 to 3 ms and 6 to 4 ms; resume to the first install unchanged (114 to 114 ms and 108 to 101 ms); 120 of 120 passed.
+
+> **Fixed (live-durability, 2026-11-08): a record link's redial waited a whole link period before its handshake began.**
+> `establish_session` built a fresh dial in one call and ran its handshake in the next, a median of 101 ms later over
+> 487 redials (diag-live-durability-50), on the way of every resumed peer's catch-up. It now runs the handshake in the
+> call that builds the dial (`a_redial_starts_its_handshake_in_the_call_that_builds_it`). Rolling partition, main
+> against the fix, 30 runs a leg on each arch (diag-live-durability-53): resume to established, median 124 to 36 ms on
+> x86 and 127 to 33 ms on arm; resume to the first install, median 231 to 118 ms and 224 to 95 ms; 60 of 60 passed on
+> each side. An RTT seeded from the dropped session was considered and not built: none of 820 handshakes across 118
+> resumes waited on the retry cap it would shorten (diag-live-durability-50).
+
+> **Fixed (live-durability, 2026-11-08): a holder repeating the head it last acknowledged was taken for one off the
+> chain.** An entry every holder holds is trimmed, so `Shipper::on_chain` no longer knew a head its holder had already
+> had accepted, and a holder reporting it again (refusing an entry it was not ready for) was answered with an install,
+> though the entries after it were all retained. A head that holder last acknowledged is now on the chain: a head of the
+> same position and identity, from the same holder, while it is a holder. Being on the chain only reaches
+> `entries_after`, which still answers an install when the tail does not reach it. Holder restarted mid-install, 24 runs
+> at the budgets the code computes (diag-live-durability-62 and -63, on the live-durability stack at 53dfa6cc): slower
+> than 1 s in 2 to 0 of 24 (1.96 and 42.8 s before), install decisions 4,576 to 22. **Open:** under a 30 s install
+> budget forced for that measurement, 10 and 9 of 24 runs took over 1 s, with and without this; those holders report
+> positions well below the tail, and what holds them is not known.
 
 > **Fixed (live-fixes, 2026-11-07): a live write counted durable on too few holders when the owner fell outside its own
 > volume's placement.** The shipper counted a position durable at the `f`-th highest holder, right for `2f` holders but
@@ -563,6 +639,13 @@
 >     `docs/bugs/2026-11-06-a-greens-chain-kept-every-version-it-ever-took.md`).** A green's chain is checkpointed at
 >     its reachable floor once the increments to fold reach the checkpoint's size. Recovery restores from the
 >     checkpoint and replays only the tail. The settle before a submit folds until its claim fits.
+>     - **Its recovery fenced the green until 2026-11-08 (A-257).** A checkpoint at the floor passed the base of an
+>       entry left above it, and recovery re-judged that entry at a base the restored green no longer held:
+>       `BaseUnavailable`, the green fenced, every acknowledged version unreadable (5 of 5 restarts in every
+>       recovery-slicing run, 7 of 18 primary-kill rungs). A chain entry now records what its verdict resolved and
+>       recovery applies it; holders still judge the increment. Entries 789 bytes against 611, the accept's p50 +4-5 µs.
+>       At f = 0 the entries after the last checkpoint are checked by digest alone. A green fenced before stays fenced
+>       (`docs/bugs/2026-11-08-a-checkpoint-passed-a-retained-entrys-base-and-recovery-fenced-the-green.md`).
 >     - Under a 256 KiB cap, 200 versions of 8 KiB from a work that keeps up are all accepted. Before, the chain cap
 >       refused at version 31, and then the retention fold at version 34.
 >     - The partition's snapshot grows by at most 39,168 bytes from version 40 to 200; before, it grew 1,329,920
@@ -752,8 +835,10 @@
 > - **Siblings with the same blind spot (open, reported, unchanged).** `crate::observe::ShardTime`
 >   (`next_window_ns`), used by observations and the cross-shard waits (`xshard`), gives up on a window with no CPU
 >   progress, so a starved shard's observation or call can end early. The anchor's start judgment
->   (`crates/cli/src/anchor.rs`, `process_clock`) judges a whole process by CPU time, has no thread to ask about, and
->   passes no reading: a start starved for a whole window is still killed.
+>   (`crates/cli/src/anchor.rs`, `process_clock`) passes no scheduler reading: a start starved for a whole window is still
+>   killed. Since 2026-11-08 its spinning half reads each thread (the busiest one's CPU), not the process's sum, which
+>   had killed every start of 23 shards on a 32-CPU Studio
+>   (`docs/bugs/2026-11-08-the-start-judgment-held-a-processs-summed-cpu-to-one-threads-window.md`).
 > - **A transitive wait reads as stuck (open).** A shard blocked for a whole window on something held by a starved thread
 >   is never runnable itself, so it is wedged by this rule. Not measured. Fixtures' shard 1 (S S S R R S S) may be one.
 > - **macOS is proven by replays (limit).** A full window of flat CPU came in 1 of 20 CI runs, so its real-thread test
@@ -1083,21 +1168,22 @@
 > Wi-Fi LAN an accepted edit and merge is one forwarded round trip, 6.9 to 7.8 ms p50, against 14.1 to 18.6 ms for
 > edit then submit (ping 6.1 to 7.7 ms). Oracle: `edit_and_submit_answers_what_edit_then_submit_does_over_generated_histories`
 > (`crates/client/tests/edit_and_submit.rs`) compares every answer and every head over generated histories, red under
-> both mutations tried. Exactly once: `an_edit_and_submit_retried_across_a_restart_answers_its_record_once`. **Open:**
-> the SDKs, MCP and the CLI do not offer the combined verb yet. Also open: the link's p99 (70 to 158 ms over Wi-Fi), a
-> wired pair, and Windows as either node.
+> both mutations tried. Exactly once: `an_edit_and_submit_retried_across_a_restart_answers_its_record_once`. **Owed
+> (owner: agents/perf, after W1 unless clients asks sooner; the supervisor, 2026-11-07):** the combined verb in the
+> Python and Node SDKs, MCP and the CLI; Windows as either node of the two-machine measurement; and a wired pair.
+> Also open: the link's p99 (70 to 158 ms over Wi-Fi).
+>
 > **Merge, macOS: the paced tail was the recovery give-back, not the doorbell (A-226, 2026-11-06, agents/perf-2).** An
 > idle shard's give-back of the recovery memory no restart reads (A-117) marked the whole stale slot and log, 18 GB
 > a shard, at every publication: 18 to 21 ms of the shard's CPU in one reap-loop poll, which paced requests waited
 > behind. It now gives back only what was written since its last give-back. In one paced run, reap polls of 5 ms CPU
 > or more went from 46 to 6. Failing first: `a_give_back_returns_only_recovery_memory_written_since_the_last` (91.6 GB
 > given back after a one-file delta, against 0). Oracle: `a_give_back_names_every_dead_written_byte_and_stops_at_the_last`.
-> **Open:** the 6 left are each shard's first two give-backs after a boot, over memories the journal did not write
-> (12 to 43 ms each), owed slices under the step quantum (built on agents/perf-2, to land after this). On CI
-> (diag-perf-5, run 42173825162) A-226 is even on Linux and halves Windows x86_64's paced accept p99 (1.21 to 1.40 ms
-> became 0.42 to 0.76 ms). Also open: the latency A/B on a quiet Mac (this one ran at load 50 to 95), and the sibling of
-> the same shape, the Linux FUSE write log's purge (`crates/server/src/write_log.rs`, its whole capacity once per
-> emptying).
+> The 6 left were each shard's first two give-backs after a boot, over memories the journal did not write (12 to 43 ms
+> each). **Sliced 2026-11-07:** a give-back takes one measured slice a step from the top down. So does its sibling,
+> the Linux FUSE write log's purge, which gave back its whole area per emptying (red first: 12,288 bytes for one
+> 15-byte record). On CI (diag-perf-5, run 42173825162) A-226 is even on Linux and halves Windows x86_64's paced accept
+> p99 (1.21 to 1.40 ms became 0.42 to 0.76 ms). **Open:** the latency A/B on a quiet Mac.
 >
 >
 
@@ -1106,9 +1192,10 @@
 > `windows-arm64`: winfstest (a Rust transcription of its Python 2.7 scripts, held to them by a golden of 733 cases)
 > and the WinFsp fsx port, each built from `billziss-gh/secfs.test@6ac65cd` with MSVC. winfstest: 628 cases, the same
 > verdicts on x86_64 and arm64 (254 pass; diagnostics run 42061904713, every step green), every failure on the reviewed list
-> (`docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt`) with its reason, the five Windows
-> features the drive does not keep (attribute bits, security descriptors, a settable creation time, reparse points and
-> symbolic links, named streams). The suites found four Win32 bugs in `crates/bridge-winfsp`, each fixed with a failing
+> (`docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt`) with its reason, the four Windows
+> features the drive does not keep (attribute bits, security descriptors, reparse points and symbolic links, named
+> streams). The fifth, a settable creation time, was built in A-259 (2026-11-08): the drive reports the volume's
+> birth time and keeps the one `SetFileTime` sets, and `t/base/06.t` case 5 came off the list (374 to 373 entries). The suites found four Win32 bugs in `crates/bridge-winfsp`, each fixed with a failing
 > test first (`crates/cli/tests/winfsp_semantics.rs`; `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`):
 > a move not asked to replace replaced a taken name (and one asked replaced a directory), a directory holding a file
 > answered its removal with success, `SetFileTime` kept nothing, and an open with `TRUNCATE_EXISTING` kept the file.
@@ -1406,10 +1493,11 @@
 > and f=2, Agreement, NoLoss, StaleNeverCommits and Convergence held, each check red under a mutation; §4.10 status).
 > Over the fleet transport (`crates/cluster/src/live.rs`) a live-shipped write is durable on two hosts in 17–20 µs at
 > the median for 64 B and 23–27 µs for 4 KiB, every quiet p99 under 1 ms (64 KiB: 160–292 µs), unchanged with one
-> holder dead (BENCHMARKS "Live shipping over the transport"). Open, found on the way: on the simulated fabric one
-> session's round trip grew about 1.7 times an exchange over sequential exchanges (9, 14, 23 … 621 ms of virtual time,
-> nine writes, `crates/cluster/tests/live.rs`), which the real runtime does not show; it is unexplained and owes a
-> failing test in the transport. The policy is built: `slates live-ship ID [--off]` records it on the owner partition,
+> holder dead (BENCHMARKS "Live shipping over the transport"). Found on the way, and explained 2026-11-08: a
+> session's round trip in `crates/cluster/tests/live.rs` grew about 1.7 times an exchange (9, 14, 23 … 621 ms of virtual
+> time). That test's sockets were OS sockets, which the simulation driver never watched, so its sessions were woken
+> only by their timers (`docs/bugs/2026-11-08-an-os-socket-awaited-on-the-simulation-driver-woke-only-on-its-timers.md`).
+> Bound on the fabric, each write takes no virtual time. The policy is built: `slates live-ship ID [--off]` records it on the owner partition,
 > `list` shows it, the catalog register carries it, and the db model test recovers it
 > (`crates/server/tests/live_ship.rs`). The daemon ships (2026-11-05, §4.10 status "slice one"): across three real
 > daemon processes a live volume's writes reach both candidates and become durable (`crates/cli/tests/live_fleet.rs`,
@@ -5586,6 +5674,12 @@ round asked no one and it waited out a whole election timeout. No late grant was
   of 10 won their first pre-election.
 [Bug record](../bugs/2026-09-29-a-campaign-asked-no-one-while-a-session-was-out.md).
 
+**Open (A-251, raft-chaos): a holder's page can leave out a copy it holds and still count as its promise.** A successor counts a
+complete answer as a promise for every object not listed, so an omitted copy reads as a copy not held, and an older record can
+be adopted. **Fixed so far, step (c):** a copy the holder cannot promise (`HostPromise::unpromised`, record
+`docs/bugs/2026-11-08-a-holder-that-could-not-promise-a-copy-read-as-holding-nothing.md`). Still owed: the counting rule as a pure
+`crates/db` function with a paged model and an omission nemesis, then a per-object question by name, then the process test.
+
 **Open — one session per peer is lent exclusively.** A discovery page, a coordinator dispatch, a forward and
 a campaign each take the whole session out of its link, though the transport runs several exchanges on one
 session at once (`Endpoint::begin`/`drive`). Campaigns and forwards now wait for it. Replication rounds and
@@ -5655,11 +5749,12 @@ submitted to it) so no exchange waits for another's.
 > - Over that run the shards were not short of CPU: control shards runnable in about 8 % of samples, 0.6–0.8 s of CPU.
 >   The machine was: 31–88 % in system code, idle 29 % on average, 11,654 disk operations a second, and timers running
 >   about 2.3 times late. Memory was not the limit (5.7–10 GB free, no swapping).
-> - So the slow formation is not this entry's lending and not shard starvation. Its logs show the lead: all three slow
->   formations (72.3 s, 40.0 s, 40.9 s) had an accepted handshake give up early and then dialers reporting no reply through
->   two handshake budgets, about 20 s each, just before formation completed; the seven fast runs of the second window
->   had neither. It is three cases, and what released them is not yet shown by counters. `fleet.dial.stall.<reason>`
->   and `fleet.accept.stall.<reason>` now name which bound ends a handshake. Formation adds no
+> - So the slow formation is not this entry's lending and not shard starvation. **Fixed (2026-11-08):** an accepting end
+>   gave up on a dialer's repeats, a count that load spends, and the dialer then waited out two 22 s confirmation deadlines
+>   before redialing (record `docs/bugs/2026-11-08-an-accepting-end-gave-up-on-repeats-and-its-dialer-waited-out-two-deadlines.md`).
+>   `fleet.dial.stall.<reason>` and `fleet.accept.stall.<reason>` name which bound ends a handshake. Still open: an
+>   accepting end gave up silently, so a dialer waited out one deadline: it now sends a close sealed under the Handshake
+  keys, and the dialer redials within a round trip (A-258, RFC 9000 §10.2.3). Formation adds no
 >   evidence for the shared session; the `live_ship` polls above are one dump from a build without the link fix.
 
 ### 2026-09-29: a lone owner refused its own objects — fixed; campaign counters added for the open KIND items

@@ -1825,6 +1825,8 @@ fn setattr_changes(
       _ => set(SetAttrIn::FATTR_MTIME).then_some(s.mtime),
     },
     ctime: set(SetAttrIn::FATTR_CTIME).then_some(s.ctime),
+    // FUSE carries no birth time to set.
+    btime: None,
   })
 }
 

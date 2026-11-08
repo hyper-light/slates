@@ -215,7 +215,12 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 70
+slates-machine = 77
+# 2026-11-08 (+7, the start judgment per thread): another process's threads, each one's CPU (`process_clock.rs`,
+#   `busiest_of` and `busiest_thread_ns`): on macOS `proc_pidinfo(PROC_PIDLISTTHREADS)` and `proc_pidinfo
+#   (PROC_PIDTHREADINFO)` (the thread record built field by field, not zeroed); on Windows `CreateToolhelp32Snapshot`,
+#   `Thread32First`, `Thread32Next`, `OpenThread` with the limited query right and `GetThreadTimes`. Linux reads `/proc`
+#   (none). None has a safe wrapper.
 # 2026-11-06 (+7, A-223, compiled only for Windows): the wake probe confirms its waiter asleep by its cycle count
 #   (`wake.rs`, `platform::Watch`): `GetCurrentThreadId`, `OpenThread` with query rights, `QueryThreadCycleTime` and
 #   the handle's `CloseHandle`; and a thread reads its own context switches (`switches.rs`): `EnableThreadProfiling`,

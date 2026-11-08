@@ -64,6 +64,9 @@ windows-sys = { version = "0.60", features = [
   "Win32_System_SystemInformation",
   "Win32_System_Memory",
   "Win32_System_Threading",
+  # Another process's threads, each one's CPU time read by the anchor's start judgment (`slates-machine`'s
+  # `process_clock`): a ToolHelp snapshot lists them.
+  "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_Power",
   "Win32_System_Performance",
   # The calling thread's own context-switch count (`EnableThreadProfiling`, `ReadThreadProfilingData`), which tells a

@@ -3002,8 +3002,9 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 
 > **Status (2026-11-05, A-209: Windows conformance).** WinFsp's own suites run over the drive in `windows-lint` and
 > `windows-arm64`. winfstest's 628 cases give the same verdicts on x86_64 and arm64; every failure is on the reviewed
-> list with one of five stated differences (attribute bits, security descriptors, a settable creation time, reparse
-> points and symbolic links, named streams). Four Win32 bugs it found are fixed with failing tests first
+> list with one of four stated differences (attribute bits, security descriptors, reparse points and symbolic links,
+> named streams; the fifth, a settable creation time, was built in A-259 and `t/base/06.t` case 5 came off the
+> list). Four Win32 bugs it found are fixed with failing tests first
 > (`crates/cli/tests/winfsp_semantics.rs`): a move not asked to replace, a directory holding a file, `SetFileTime`, and
 > an open with `TRUNCATE_EXISTING` (WinFsp's allocation below a file's size truncates it). Open: the fsx port wedges at an
 > extension after a cached write past a hole and a shrink, inside Windows below the single receiver; it is a listed
@@ -7126,6 +7127,9 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > CPU-time clock: `/proc/<pid>/schedstat`, read first, is the main thread's alone
 > (`docs/bugs/2026-11-07-the-linux-process-clock-read-the-main-thread-alone.md`). At the extremes, 0 progressing starts
 > were killed at 183-292 runnable processes, and a stuck start was killed at 1,001-1,294 ms on macOS, Linux and Windows.
+> Since 2026-11-08 the spinning half is judged on the start's busiest thread, as the rule is a thread's: the process's
+> summed CPU, held to one window, killed every start of 23 shards on a 32-CPU Studio and of 48 on an 18-CPU Mac
+> (`docs/bugs/2026-11-08-the-start-judgment-held-a-processs-summed-cpu-to-one-threads-window.md`).
 > A shard's recovery still runs as one poll, which the watchdog counts as spinning past a window of CPU: GAPS holds it
 > open.
 
@@ -7863,6 +7867,26 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 >   16 of 64 accepted before and 64 after. The corruption's test: the green's head was `cd\0\0`, now `cdXY`.
 >   (`docs/bugs/2026-11-07-a-greens-history-kept-a-copy-of-every-file-per-version.md`,
 >   `docs/bugs/2026-11-07-a-run-after-a-length-change-merged-zeros.md`.)
+
+> **Status (2026-11-08, A-257: a chain entry records what its verdict resolved, and recovery applies it).** A
+> checkpoint at the floor can pass the base of an entry left above it, and recovery re-judged each entry at its base,
+> which a restored green no longer holds: the entry was refused and the green fenced, every acknowledged version
+> unreadable (every restart of the load harness's state, 2026-11-08).
+> - The durable entry is now the increment as submitted, byte for byte, then the effects its verdict resolved it to
+>   (content by reference to its post-state; a splice whose ops were not mapped by its path alone), then a digest.
+>   Recovery applies the effects unconditionally (`slates_merge::chain_entry`, `Green::apply_recorded`). The position
+>   of a checkpoint no longer matters to replay, and a straggler pins nothing.
+> - A merge record's inputs are still the increment as submitted (`inputs_of`): holders ("Apply on holders") and a
+>   successor (`recover_green_inputs`) judge it afresh, so a wrong resolution on the owner cannot reach them.
+> - Integrity: the digest on every entry; the head identity recorded and compared at every checkpoint, at every
+>   version whose record goes to holders, and at the head wherever one is recorded (`GreenFence::IdentityDiverged`).
+>   At f = 0 the entries after the last checkpoint are checked by digest alone: a divergence there is found at the
+>   next recorded identity, not at its own version (an identity at every f = 0 accept cost 287-363 µs against a
+>   35-42 µs verdict). The oracle (`crates/merge/tests/chain_replay.rs`) compares identity at every version.
+> - Cost: 789 bytes an entry against the increment's 611 (+29%), and 4-5 µs on the p50 of an accept over a base behind
+>   the head (32 to 36-37 µs; p99 within noise). Layout 6; a version-5 segment is refused, and a green already fenced
+>   by a wrong checkpoint stays fenced.
+>   (`docs/bugs/2026-11-08-a-checkpoint-passed-a-retained-entrys-base-and-recovery-fenced-the-green.md`.)
 
 > **Status (2026-11-06, A-238: a green's chain is checkpointed at its reachable floor).** The partition kept
 > every accepted increment for good, and the "fold into checkpoint deltas" below had no durable form.
@@ -10782,6 +10806,8 @@ vfs, cluster and server crates.
   NFS (red with the attribute restore disabled, green with it).
 - What it does not change: the bridges' own time surfaces (WinFsp's creation time is a reported sibling),
   the merge engine's metadata dimension, R1–R10.
+- **Amended by A-259 (2026-11-08):** the bridges' attributes carry the birth time now, and WinFsp reports it as the
+  creation time and sets it through `SetFileTime`.
 
 ### A-54 — Content transfers resume from verified chunks, and holders progress independently (2026-10-01)
 Applied in the same change to: §4.10 "Content replication", GAPS (AUD-29-55–58), the shard image version (9),
@@ -14293,7 +14319,8 @@ fsx verdict), `xtask/src/conformance` (the WinFsp mount step, the MSVC builds, t
   - **SECURITY**: no per-file security descriptor. Every object reports the volume's one descriptor and access is the
     volume's own rule; a DACL set or asked for at create is not kept.
   - **CREATION-TIME**: no settable birth time. The bridge's attributes carry none (creation time reports the change
-    time), and POSIX has no setter.
+    time), and POSIX has no setter. **Amended by A-259 (2026-11-08):** the bridges' attributes carry the volume's
+    birth time, the drive reports it and keeps the one `SetFileTime` sets, and `t/base/06.t` case 5 is off the list.
   - **REPARSE and SYMLINK**: no reparse points, so no Windows symbolic links through the drive
     (`ERROR_INVALID_FUNCTION`).
   - **STREAMS**: no named streams (`ERROR_INVALID_NAME`; stream enumeration refused).
@@ -14543,8 +14570,28 @@ Status: built 2026-11-06.
   limit): paced p99 before 12.3 to 39.2 ms at load 52 to 82 (149 and 234 ms in round 1, 142 to 361 ms at load 95),
   after 6.8 to 29.2 ms (54 and 94 ms in one run); unpaced p99 before 0.64 to 32 ms, after 0.43 to 6.8 ms. That load
   dominates both arms' tails, so the latency rows are informational and the CPU count is the measurement.
-- Owed: a boot's two whole give-backs a shard (memories this journal did not write) still hold the shard 12 to 43 ms
-  each. They should be given back in slices under the step quantum, from a measured discard rate (GAPS).
+- Sliced (2026-11-06, the supervisor's item 3): a give-back no longer takes a region whole in one step. Each idle step
+  gives back one slice from the top of each region down, and the journal records it (`Journal::given_back_from`).
+  The slice is what the OS gave back in one step quantum the previous step, measured by each step for the next
+  (`give_back_slice`, `learn_give_back_rate`; a page the first time). `purge_if_idle` yields between slices while any
+  is left. So a boot's give-back of memories the journal did not write (18 GB a shard on adas-macbook-pro-2, 12 to 43
+  ms in one poll before) holds the shard one quantum a step. The oracle gives back generated shares from the top
+  (`JournalStep::GiveBack { quarters }`). The test of the shard held is
+  `a_boot_give_back_holds_its_shard_no_longer_than_its_noise_floor`: a probe's longest wait through the boot's
+  give-back against its own quiet floor, skipping loudly on a host too loaded to judge.
+- The sibling of the same shape, sliced the same day: the Linux FUSE write log (A-63) gave back its whole record
+  area once per emptying (`WriteLog::purge`), whatever its records had reached. It now gives back only as far as
+  records reached since its last give-back (the whole area once, for a log opened over a predecessor's object), a slice
+  a call from the same measured slice. Failing first: `a_purge_gives_back_only_what_the_log_wrote_since_its_last`
+  (12,288 bytes, the 16 KiB log's whole area, after one 15-byte record; Linux 6.19.10).
+
+- **A give-back makes way (amended 2026-11-08, reland-a207's measurement).** Sliced give-backs (a30e4209) took one step per
+  yield for as long as the arena allocated nothing, and a granted landing allocates nothing. So under load the landing
+  and the give-back took turns, one short landing step for each whole quantum of give-back: 2,859 to 4,965 give-back
+  steps ran through each landing. Now a task that ran across the yield ends the give-back for this reap tick
+  (`purge_if_idle`; `content.give_back.left_for_next_tick`), so a landing pays for at most one step a tick. An idle shard
+  still goes on to the end. Measured in BENCHMARKS ("A give-back makes way"): landing median 21.5 s -> 4.2 s, the base's
+  own 4.2 s, 8 interleaved rounds each. Proven by `a_give_back_leaves_the_rest_for_the_next_tick_when_another_task_is_running`.
 
 ### A-214 — An idle shard keeps its last write burst's worth of free content pages pre-faulted (accepted 2026-11-05, VFS plan step 11; amends A-105)
 
@@ -15941,6 +15988,27 @@ and settle, `DaemonEnd::reply`'s stamp and confirmation) and `crates/ipc/tests/r
 `docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`. A client and a daemon of
 different layout versions refuse each other by name; no consensus rule or capability changes.
 
+### A-257 — A green's chain entry records what its verdict resolved, and recovery applies it (accepted and built 2026-11-08)
+
+A checkpoint at the reachable floor (A-238) can pass the base of an entry left in the chain, and recovery, which judged
+each entry again at its base, refused it and fenced the green. Holding the checkpoint below every retained base never
+folds under steady concurrency; carrying the deltas down to it is not enough, since a verdict reads files' lengths and
+bytes at the base. So the decision is recorded where it is made: the verdict at accept is the guard, the entry its
+result, and recovery applies it (`crates/db/src/partition.rs`'s guard-then-apply). The merge record's inputs stay the
+increment, so holders keep their independent judgement. Integrity at f = 0 between checkpoints is the entry's digest;
+the head identity is compared at checkpoints, holder-bound versions and recorded heads.
+
+Applied in the same change to:
+- §4.16: its status ("Commit").
+- GAPS: the load-test blockquote (W3's recovery).
+- `crates/merge`: `chain_entry.rs` (new), `Green::submit_resolved`, `Green::apply_recorded`, `Checkpoint::head_check`
+  (encoding version 2).
+- `crates/server`: `verbs::submit`, `record_accepted`, `replay_green`, the takeover's chain; `merge_service::inputs_of`,
+  `checkpoint_green_when`, `record_goes_to_holders`, `GreenFence::IdentityDiverged` (and `NotAccepted` removed).
+- `crates/anchor`: `LAYOUT_VERSION` 6.
+- Tests: `crates/merge/tests/chain_replay.rs` (new), `crates/server/tests/green_checkpoint.rs`.
+- Bug record: `docs/bugs/2026-11-08-a-checkpoint-passed-a-retained-entrys-base-and-recovery-fenced-the-green.md`.
+
 ### A-252 — A request waiting for a version to commit is a typed durable state, so a resend after a restart never runs again (accepted and built 2026-11-08, fixtures' primary-kill rung; supervisor's two changes to the first cut)
 
 Applied in the same change to:
@@ -16029,6 +16097,31 @@ Applied in the same change to: §4.7 (the rendezvous's status), GAPS, `crates/cl
 - **Proven** on this Mac by two tests that failed on the old order: `a_refused_second_anchor_leaves_the_live_instance_its_segment_and_its_bytes`
   (across processes: a live anchor and its daemon, a second anchor refused, the daemon killed, its successor adopting the
   segment by name and reading the file back) and `a_refused_second_daemon_leaves_the_live_ones_segment_in_place`.
+
+### A-259 — The WinFsp drive reports and keeps the creation time a caller sets (accepted 2026-11-08)
+Applied in the same change to: §4.6 (the Windows conformance status and its stated differences), A-53 (amended),
+GAPS, `docs/wip/conformance.md`, the winfstest list
+(`docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt`, 374 to 373 entries),
+`crates/bridge-core` (`NodeAttr::btime`, `SetAttr::btime`, the access rule, the volume bridge and its read-only view),
+`crates/bridge-winfsp/src/host.rs` (`SetBasicInfo`, `file_info`), the FUSE, NFS and FSKit bridges (each sets none), and
+the record `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`.
+- **What was missing.** The volume keeps a birth time per object (A-53, `Volume::set_times` takes one), but the bridges'
+  attributes carried none. WinFsp reported the change time as every object's creation time and dropped the creation
+  time `SetFileTime` set, so winfstest's `t/base/06.t` case 5 was listed as CREATION-TIME, one of A-209's five stated
+  differences.
+- **The rule.** A bridge's attributes report the volume's birth time, and a `setattr` may set it. Only a host whose API
+  sets a creation time asks for one (WinFsp's `SetBasicInfo`, from `SetFileTime` and `SetFileInformationByHandle`);
+  POSIX has no call that sets a birth time, so the FUSE, NFS and FSKit bridges never set it. Setting it is an explicit
+  time, so it asks for the owner or root, as an explicit access or modification time does (`setattr_denial`); a read-only
+  view refuses it, as it refuses every time.
+- **What it does not change.** The wire and the archive (the birth time was already in both, A-53), FUSE, NFS and FSKit's
+  answers, and the other stated differences (ATTRIBUTES, SECURITY, REPARSE and SYMLINK, STREAMS).
+- **Proven** by `setattr_sets_and_reports_a_birth_time` (`crates/bridge-core/tests/volume_bridge.rs`; with the volume
+  bridge passing no birth time, as before, the reply read back 1794155205189903000 instead of the 333 set),
+  `a_creation_time_asks_for_the_owner` (`crates/bridge-core/src/access.rs`; with the birth time out of the owner check,
+  a writer who is not the owner was allowed), and on CI's Windows runner by
+  `a_files_creation_time_set_through_the_drive_is_kept` (`crates/cli/tests/winfsp_semantics.rs`) and winfstest judged
+  against the shortened list.
 
 ### A-235 — The merge record plane runs when there is merge work, and a version's inputs go only to holders whose next record it is (accepted 2026-11-06)
 
@@ -19464,3 +19557,48 @@ Applied in the same change to: §4.6 (macOS fallback options, failure matrix), T
 - **What it does not change:** Linux's mounts (FUSE; conformance's own NFS options), Windows, or the daemon's answers:
   a stable reply still waits for durability up to the liveness budget and is then answered "try again", which the hard
   mount retries.
+
+### A-258 — A handshake gives up on time, not on a peer's resends; a dialer past its confirmation redials at once; an accepting end that abandons says so, sealed (accepted 2026-11-08)
+
+The fleet formed in 40 to 72 s instead of about a second on a loaded machine (load 127–244). Per-reason counters caught
+one of those formations (41.9 s, load about 170): an accepting end gave up its half of a handshake on the dialer's
+resends (`fleet.accept.stall.repeats`), and the dialer, already past its own side of TLS, waited out its confirmation
+deadline twice before it dialed afresh (`fleet.dial.stall.confirm_deadline`, then `fleet.dial.redial`).
+
+- **Repeats are bounded by time.** A resend of a flight this end has already answered is load's to spend: a dialer
+  slow to read the reply keeps resending, and each fragment of a resent flight counted as a repeat. So the accepting end
+  gave up on a live dialer within a second or two. A turn now gives up on repeats only at its derived deadline (33 × the
+  initial probe timeout, about 22 s). It answers them at its own backoff, and counts a resent flight once however many
+  fragments it spans (`Reassembly::RepeatRest`). `MAX_HANDSHAKE_RETRANSMITS` now bounds only waits paced by this end's
+  own timer.
+- **A dialer past its confirmation redials at once.** The second handshake budget on a socket
+  (`ESTABLISH_BUDGETS_BEFORE_REDIAL`, 2026-09-14) is for a peer that has not answered: one booting, or starved. A dialer
+  waiting on its confirmation has heard from its peer, and its peer's half is what is gone, so a second budget there
+  was 22 s more waiting on nothing (`fleet::keeps_its_socket`).
+- **An accepting end that abandons tells its dialer** (RFC 9000 §10.2.3, a SHOULD), in a close sealed under the
+  Handshake keys (`flight::SEALED_CLOSE_TAG`). The dialer then ends `PeerClosed` and redials within a round trip
+  instead of waiting out its deadline. It is sent only once the accepting end holds those keys; before that it has
+  answered nothing, and the dialer is still in its first budget, where waiting is right.
+  - **Why not the unprotected Initial-level close.** The RFC has a server also send its close in an Initial packet,
+    for a client that may not have the Handshake keys yet. In this dialect anyone who can send to a dialer's port could
+    forge one and cost the dialer its socket and a fresh dial. A dialer past the point where a close helps it holds the
+    Handshake keys already, since it has read the accepting end's sealed flight. So the close is sealed, and a dialer
+    ignores any close that does not open under those keys.
+  - Within the anti-amplification limit (RFC 9000 §8.1, which has no exemption for a close): the close is 22 bytes,
+    against an allowance of three times a received client flight of at least 1,200 bytes.
+  - A dialer sends no close: it may still retry on its socket.
+
+Applied in the same change to:
+- `crates/transport/src/endpoint.rs`: `HandshakeStall`, `handshake_stall`, `handshake_deadline`, the repeat handling
+  in `receive_flight`, `close_abandoned_handshake`, `is_peer_close`, `closes_sent`, and `EndpointError::PeerClosed`.
+- `crates/transport/src/flight.rs`: `Reassembly::RepeatRest`, `SEALED_CLOSE_TAG`, `seal_close`, `open_close`.
+- `crates/server/src/fleet.rs`: `keeps_its_socket`, and the `fleet.dial.stall.<reason>`, `fleet.accept.stall.<reason>`
+  and `fleet.dial.fault.<kind>` counters, `peer_closed` among them.
+- Bug record `docs/bugs/2026-11-08-an-accepting-end-gave-up-on-repeats-and-its-dialer-waited-out-two-deadlines.md`;
+  GAPS's formation entry.
+- Tests, each red-checked: `an_accepted_handshake_is_not_given_up_for_a_dialers_repeats`,
+  `a_dialer_that_only_repeats_is_given_up_at_the_handshakes_deadline`, `a_dialer_past_its_confirmation_redials_at_once`,
+  `a_dialer_hears_its_peer_abandon_the_handshake_within_a_round_trip` (red with no close sent),
+  `a_dialer_ignores_a_close_no_one_sealed` (red with a dialer that believed any close-shaped datagram), and the sealed
+  close's hostile-input tests in `flight.rs`.
+
