@@ -1,0 +1,16 @@
+runner ubuntu-latest, 4 CPUs, Sun Nov  8 02:04:59 UTC 2026, head 7f6af0d969a7012fb5a6566f6b79967723d38d40
+unanswered questions: asked 3, the links after them [(HostId(5255982652320246071), Absent), (HostId(16045360097866651063), Absent)]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 98 filtered out; finished in 7.93s
+== run 1 exit 0
+unanswered questions: asked 3, the links after them [(HostId(5678882285202840610), Absent), (HostId(14723290636930397237), Absent)]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 98 filtered out; finished in 8.02s
+== run 2 exit 0
+unanswered questions: asked 3, the links after them [(HostId(4532895679400271227), Absent), (HostId(17065256934725079646), Absent)]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 98 filtered out; finished in 7.93s
+== run 3 exit 0
+unanswered questions: asked 3, the links after them [(HostId(4664550022860717527), Absent), (HostId(12558509288680892083), Absent)]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 98 filtered out; finished in 7.91s
+== run 4 exit 0
+unanswered questions: asked 3, the links after them [(HostId(16310200054033246026), Absent), (HostId(12236868447072005329), Absent)]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 98 filtered out; finished in 7.93s
+== run 5 exit 0
