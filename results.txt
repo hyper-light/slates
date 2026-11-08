@@ -1,0 +1,288 @@
+runner ubuntu-24.04-arm, 4 CPUs, Sun Nov  8 03:37:45 UTC 2026, tree 8a734875c4f4caf09f89f3765fa78a24fcc4d564
+== release build exit 0
+  3946 writes, 3946 acknowledged: p50 543 us, p99 5037 us, p999 38306 us, max 197566 us; 3 over 50ms (sent+took): 0.00s+198ms 2.24s+78ms 2.41s+150ms
+  chaos-rolling-a-6192 partitioned from 233.836922ms to 2.233939536s
+  chaos-rolling-a-6192 refused the owner: {}
+  chaos-rolling-b-6192 refused the owner: {}
+  chaos-rolling-c-6192 partitioned from 2.413609826s to 4.413758427s
+  chaos-rolling-c-6192 refused the owner: {}
+== partition 1 exit 0 stuck 0 long5 0
+   pmtu: falls 1 pto_lines 54 pto_falls 1 loss_falls 0 grows 199
+LD-PMTU at 4251824831 trigger pto fell true before (8, 65496, 65512, 2, false, Some(601421728377)) after (8, 1200, 65496, 0, true, None)
+  2844 writes, 2844 acknowledged: p50 876 us, p99 6800 us, p999 76897 us, max 278481 us; 3 over 50ms (sent+took): 0.00s+220ms 2.44s+278ms 4.64s+77ms
+  chaos-rolling-a-6903 partitioned from 306.105239ms to 2.306215419s
+  chaos-rolling-a-6903 refused the owner: {}
+  chaos-rolling-b-6903 refused the owner: {}
+  chaos-rolling-c-6903 partitioned from 2.44330656s to 4.444056032s
+  chaos-rolling-c-6903 refused the owner: {}
+== partition 2 exit 0 stuck 0 long5 0
+   pmtu: falls 2 pto_lines 79 pto_falls 2 loss_falls 0 grows 212
+LD-PMTU at 1335266107 trigger pto fell true before (5, 65496, 65512, 2, false, Some(601026209187)) after (5, 1200, 65496, 0, true, None)
+LD-PMTU at 3473921086 trigger pto fell true before (8, 65496, 65512, 2, false, Some(601026321195)) after (8, 1200, 65496, 0, true, None)
+  3855 writes, 3855 acknowledged: p50 572 us, p99 5685 us, p999 40748 us, max 220889 us; 2 over 50ms (sent+took): 0.00s+142ms 2.19s+221ms
+  chaos-rolling-a-7512 partitioned from 205.174771ms to 2.205273392s
+  chaos-rolling-a-7512 refused the owner: {}
+  chaos-rolling-b-7512 partitioned from 2.527841752s to 4.527935421s
+  chaos-rolling-b-7512 refused the owner: {}
+  chaos-rolling-c-7512 refused the owner: {}
+== partition 3 exit 0 stuck 0 long5 0
+   pmtu: falls 1 pto_lines 83 pto_falls 1 loss_falls 0 grows 202
+LD-PMTU at 3421559208 trigger pto fell true before (6, 65496, 65512, 2, false, Some(600924376371)) after (6, 1200, 65496, 0, true, None)
+  4551 writes, 4551 acknowledged: p50 398 us, p99 5366 us, p999 34860 us, max 292739 us; 4 over 50ms (sent+took): 0.01s+116ms 1.15s+57ms 2.07s+68ms 2.26s+293ms
+  chaos-rolling-a-8145 partitioned from 153.751304ms to 2.153829745s
+  chaos-rolling-a-8145 refused the owner: {}
+  chaos-rolling-b-8145 partitioned from 2.262793319s to 4.262884767s
+  chaos-rolling-b-8145 refused the owner: {}
+  chaos-rolling-c-8145 refused the owner: {}
+== partition 4 exit 0 stuck 0 long5 0
+   pmtu: falls 1 pto_lines 43 pto_falls 1 loss_falls 0 grows 203
+LD-PMTU at 3275419060 trigger pto fell true before (5, 65496, 65512, 2, false, Some(601021277431)) after (5, 1200, 65496, 0, true, None)
+  4371 writes, 4371 acknowledged: p50 433 us, p99 3831 us, p999 15296 us, max 313976 us; 2 over 50ms (sent+took): 0.00s+131ms 2.26s+314ms
+  chaos-rolling-a-8771 partitioned from 171.8363ms to 2.172033984s
+  chaos-rolling-a-8771 refused the owner: {}
+  chaos-rolling-b-8771 partitioned from 2.25575568s to 4.255864923s
+  chaos-rolling-b-8771 refused the owner: {}
+  chaos-rolling-c-8771 refused the owner: {}
+== partition 5 exit 0 stuck 0 long5 0
+   pmtu: falls 1 pto_lines 45 pto_falls 1 loss_falls 0 grows 190
+LD-PMTU at 3967293855 trigger pto fell true before (6, 65496, 65512, 2, false, Some(601423625714)) after (6, 1200, 65496, 0, true, None)
+  4711 writes, 4711 acknowledged: p50 412 us, p99 4032 us, p999 75641 us, max 142689 us; 5 over 50ms (sent+took): 0.00s+119ms 2.16s+77ms 2.33s+143ms 4.26s+76ms 4.56s+123ms
+  chaos-rolling-a-9462 partitioned from 153.89475ms to 2.156166307s
+  chaos-rolling-a-9462 refused the owner: {}
+  chaos-rolling-b-9462 refused the owner: {}
+  chaos-rolling-c-9462 partitioned from 2.325715446s to 4.325867165s
+  chaos-rolling-c-9462 refused the owner: {}
+== partition 6 exit 0 stuck 0 long5 0
+   pmtu: falls 1 pto_lines 50 pto_falls 1 loss_falls 0 grows 209
+LD-PMTU at 4247543771 trigger pto fell true before (8, 65496, 65512, 2, false, Some(601424434932)) after (8, 1200, 65496, 0, true, None)
+  3718 writes, 3718 acknowledged: p50 640 us, p99 4979 us, p999 33249 us, max 143325 us; 3 over 50ms (sent+took): 0.00s+139ms 2.19s+72ms 2.38s+143ms
+  chaos-rolling-a-10190 partitioned from 165.868861ms to 2.167289907s
+  chaos-rolling-a-10190 refused the owner: {}
+  chaos-rolling-b-10190 partitioned from 2.377578404s to 4.377694365s
+  chaos-rolling-b-10190 refused the owner: {}
+  chaos-rolling-c-10190 refused the owner: {}
+== partition 7 exit 0 stuck 0 long5 0
+   pmtu: falls 1 pto_lines 41 pto_falls 1 loss_falls 0 grows 195
+LD-PMTU at 3282488832 trigger pto fell true before (5, 65496, 65512, 2, false, Some(600619701874)) after (5, 1200, 65496, 0, true, None)
+  2681 writes, 2681 acknowledged: p50 1143 us, p99 5873 us, p999 34722 us, max 182483 us; 2 over 50ms (sent+took): 0.00s+135ms 2.33s+182ms
+  chaos-rolling-a-10809 partitioned from 220.313842ms to 2.220405972s
+  chaos-rolling-a-10809 refused the owner: {}
+  chaos-rolling-b-10809 partitioned from 2.329175278s to 4.331868322s
+  chaos-rolling-b-10809 refused the owner: {}
+  chaos-rolling-c-10809 refused the owner: {}
+== partition 8 exit 0 stuck 0 long5 0
+   pmtu: falls 1 pto_lines 90 pto_falls 1 loss_falls 0 grows 192
+LD-PMTU at 3237190830 trigger pto fell true before (5, 65496, 65512, 2, false, Some(600618354520)) after (5, 1200, 65496, 0, true, None)
+  4542 writes, 4542 acknowledged: p50 415 us, p99 4112 us, p999 41800 us, max 183994 us; 2 over 50ms (sent+took): 0.00s+184ms 2.36s+177ms
+  chaos-rolling-a-11397 refused the owner: {}
+  chaos-rolling-b-11397 partitioned from 225.518732ms to 2.225615365s
+  chaos-rolling-b-11397 refused the owner: {}
+  chaos-rolling-c-11397 partitioned from 2.365905249s to 4.366033144s
+  chaos-rolling-c-11397 refused the owner: {}
+== partition 9 exit 0 stuck 0 long5 0
+   pmtu: falls 2 pto_lines 49 pto_falls 2 loss_falls 0 grows 205
+LD-PMTU at 3337072402 trigger pto fell true before (8, 65496, 65512, 2, false, Some(600809459339)) after (8, 1200, 65496, 0, true, None)
+LD-PMTU at 4532302730 trigger pto fell true before (9, 65496, 65512, 2, false, Some(603300874964)) after (9, 1200, 65496, 0, true, None)
+  4230 writes, 4230 acknowledged: p50 449 us, p99 4184 us, p999 33175 us, max 277897 us; 3 over 50ms (sent+took): 0.00s+122ms 2.17s+69ms 2.32s+278ms
+  chaos-rolling-a-12010 partitioned from 148.095944ms to 2.148181064s
+  chaos-rolling-a-12010 refused the owner: {}
+  chaos-rolling-b-12010 partitioned from 2.315456179s to 4.315651438s
+  chaos-rolling-b-12010 refused the owner: {}
+  chaos-rolling-c-12010 refused the owner: {}
+== partition 10 exit 0 stuck 0 long5 0
+   pmtu: falls 2 pto_lines 61 pto_falls 2 loss_falls 0 grows 203
+LD-PMTU at 3224920998 trigger pto fell true before (6, 65496, 65512, 2, false, Some(600710221125)) after (6, 1200, 65496, 0, true, None)
+LD-PMTU at 4423494249 trigger pto fell true before (9, 65496, 65512, 2, false, Some(603316472216)) after (9, 1200, 65496, 0, true, None)
+  2879 writes, 2879 acknowledged: p50 939 us, p99 5347 us, p999 147595 us, max 351337 us; 3 over 50ms (sent+took): 0.00s+153ms 0.22s+148ms 2.31s+351ms
+  chaos-rolling-a-12610 refused the owner: {}
+  chaos-rolling-b-12610 partitioned from 216.401388ms to 2.216501391s
+  chaos-rolling-b-12610 refused the owner: {}
+  chaos-rolling-c-12610 partitioned from 2.306992195s to 4.307080476s
+  chaos-rolling-c-12610 refused the owner: {}
+== partition 11 exit 0 stuck 0 long5 0
+   pmtu: falls 2 pto_lines 54 pto_falls 2 loss_falls 0 grows 192
+LD-PMTU at 2107734421 trigger pto fell true before (6, 65496, 65512, 2, false, Some(601421637084)) after (6, 1200, 65496, 0, true, None)
+LD-PMTU at 4193130400 trigger pto fell true before (8, 65496, 65512, 2, false, Some(601420585486)) after (8, 1200, 65496, 0, true, None)
+  4153 writes, 4153 acknowledged: p50 440 us, p99 7344 us, p999 68151 us, max 169178 us; 6 over 50ms (sent+took): 0.00s+128ms 2.04s+169ms 3.36s+87ms 4.23s+54ms 4.45s+74ms 4.52s+68ms
+  chaos-rolling-a-13311 partitioned from 178.252864ms to 2.178367391s
+  chaos-rolling-a-13311 refused the owner: {}
+  chaos-rolling-b-13311 partitioned from 2.356071526s to 4.35616699s
+  chaos-rolling-b-13311 refused the owner: {}
+  chaos-rolling-c-13311 refused the owner: {}
+== partition 12 exit 0 stuck 0 long5 0
+   pmtu: falls 1 pto_lines 43 pto_falls 1 loss_falls 0 grows 194
+LD-PMTU at 3387662701 trigger pto fell true before (6, 65496, 65512, 2, false, Some(600625102912)) after (6, 1200, 65496, 0, true, None)
+  3121 writes, 3121 acknowledged: p50 890 us, p99 6005 us, p999 26969 us, max 294029 us; 2 over 50ms (sent+took): 0.00s+173ms 2.31s+294ms
+  chaos-rolling-a-13923 refused the owner: {}
+  chaos-rolling-b-13923 partitioned from 222.639687ms to 2.22275366s
+  chaos-rolling-b-13923 refused the owner: {}
+  chaos-rolling-c-13923 partitioned from 2.307857587s to 4.307946258s
+  chaos-rolling-c-13923 refused the owner: {}
+== partition 13 exit 0 stuck 0 long5 0
+   pmtu: falls 1 pto_lines 55 pto_falls 1 loss_falls 0 grows 208
+LD-PMTU at 3261233376 trigger pto fell true before (8, 65496, 65512, 2, false, Some(601017881457)) after (8, 1200, 65496, 0, true, None)
+  4830 writes, 4830 acknowledged: p50 427 us, p99 4586 us, p999 51618 us, max 123683 us; 5 over 50ms (sent+took): 0.00s+124ms 1.18s+52ms 2.15s+77ms 2.35s+110ms 4.25s+53ms
+  chaos-rolling-a-14523 partitioned from 175.456371ms to 2.17563542s
+  chaos-rolling-a-14523 refused the owner: {}
+  chaos-rolling-b-14523 refused the owner: {}
+  chaos-rolling-c-14523 partitioned from 2.356495892s to 4.35659737s
+  chaos-rolling-c-14523 refused the owner: {}
+== partition 14 exit 0 stuck 0 long5 0
+   pmtu: falls 2 pto_lines 52 pto_falls 2 loss_falls 0 grows 213
+LD-PMTU at 1083366727 trigger pto fell true before (5, 65496, 65512, 2, false, Some(600922845939)) after (5, 1200, 65496, 0, true, None)
+LD-PMTU at 1440907939 trigger pto fell true before (8, 65496, 65512, 2, false, Some(600922980825)) after (8, 1200, 65496, 0, true, None)
+  3660 writes, 3660 acknowledged: p50 550 us, p99 6514 us, p999 41535 us, max 108080 us; 3 over 50ms (sent+took): 0.00s+108ms 2.23s+56ms 2.34s+75ms
+  chaos-rolling-a-15146 partitioned from 148.529822ms to 2.148671662s
+  chaos-rolling-a-15146 refused the owner: {}
+  chaos-rolling-b-15146 refused the owner: {}
+  chaos-rolling-c-15146 partitioned from 2.346480708s to 4.347191477s
+  chaos-rolling-c-15146 refused the owner: {}
+== partition 15 exit 0 stuck 0 long5 0
+   pmtu: falls 2 pto_lines 86 pto_falls 2 loss_falls 0 grows 186
+LD-PMTU at 1981770078 trigger pto fell true before (5, 65496, 65512, 2, false, Some(601419090076)) after (5, 1200, 65496, 0, true, None)
+LD-PMTU at 4202507613 trigger pto fell true before (8, 65496, 65512, 2, false, Some(601420150529)) after (8, 1200, 65496, 0, true, None)
+  3916 writes, 3916 acknowledged: p50 595 us, p99 5143 us, p999 33069 us, max 137070 us; 2 over 50ms (sent+took): 0.00s+137ms 2.35s+121ms
+  chaos-rolling-a-15853 partitioned from 203.715031ms to 2.203912879s
+  chaos-rolling-a-15853 refused the owner: {}
+  chaos-rolling-b-15853 partitioned from 2.35864211s to 4.358757133s
+  chaos-rolling-b-15853 refused the owner: {}
+  chaos-rolling-c-15853 refused the owner: {}
+== partition 16 exit 0 stuck 0 long5 0
+   pmtu: falls 1 pto_lines 41 pto_falls 1 loss_falls 0 grows 188
+LD-PMTU at 4174732037 trigger pto fell true before (5, 65496, 65512, 2, false, Some(601425069249)) after (5, 1200, 65496, 0, true, None)
+  5559 writes, 5559 acknowledged: p50 420 us, p99 4997 us, p999 46534 us, max 314865 us; 5 over 50ms (sent+took): 0.00s+132ms 0.16s+176ms 2.14s+56ms 2.28s+315ms 4.32s+59ms
+  chaos-rolling-a-16569 partitioned from 164.951958ms to 2.16505275s
+  chaos-rolling-a-16569 refused the owner: {}
+  chaos-rolling-b-16569 partitioned from 2.280163343s to 4.281419806s
+  chaos-rolling-b-16569 refused the owner: {}
+  chaos-rolling-c-16569 refused the owner: {}
+== partition 17 exit 0 stuck 0 long5 0
+   pmtu: falls 1 pto_lines 43 pto_falls 1 loss_falls 0 grows 189
+LD-PMTU at 1063686892 trigger pto fell true before (5, 65496, 65512, 2, false, Some(600921943465)) after (5, 1200, 65496, 0, true, None)
+  1558 writes, 1558 acknowledged: p50 1220 us, p99 6209 us, p999 121218 us, max 2361898 us; 2 over 50ms (sent+took): 0.00s+121ms 2.32s+2362ms
+  chaos-rolling-a-17192 partitioned from 233.099027ms to 2.235499069s
+  chaos-rolling-a-17192 refused the owner: {}
+  chaos-rolling-b-17192 partitioned from 2.324557196s to 4.324756768s
+  chaos-rolling-b-17192 refused the owner: {}
+  chaos-rolling-c-17192 refused the owner: {}
+== partition 18 exit 0 stuck 2 long5 0
+   pmtu: falls 4 pto_lines 55 pto_falls 4 loss_falls 0 grows 261
+LD-PMTU at 1256849198 trigger pto fell true before (5, 65496, 65512, 2, false, Some(601031484699)) after (5, 1200, 65496, 0, true, None)
+LD-PMTU at 1530166412 trigger pto fell true before (6, 65496, 65512, 2, false, Some(600712578675)) after (6, 1200, 65496, 0, true, None)
+LD-PMTU at 3347521918 trigger pto fell true before (6, 65480, 65496, 2, false, Some(601540867203)) after (6, 1200, 65480, 0, true, None)
+LD-PMTU at 6204098739 trigger pto fell true before (11, 65496, 65512, 2, false, Some(606192750996)) after (11, 1200, 65496, 0, true, None)
+  4418 writes, 4418 acknowledged: p50 412 us, p99 3505 us, p999 40011 us, max 275964 us; 4 over 50ms (sent+took): 0.00s+118ms 2.13s+71ms 2.29s+276ms 4.27s+50ms
+  chaos-rolling-a-17937 partitioned from 146.790706ms to 2.146881338s
+  chaos-rolling-a-17937 refused the owner: {}
+  chaos-rolling-b-17937 refused the owner: {}
+  chaos-rolling-c-17937 partitioned from 2.286804447s to 4.286906438s
+  chaos-rolling-c-17937 refused the owner: {}
+== partition 19 exit 0 stuck 0 long5 0
+   pmtu: falls 1 pto_lines 47 pto_falls 1 loss_falls 0 grows 208
+LD-PMTU at 4217321863 trigger pto fell true before (8, 65496, 65512, 2, false, Some(601423085795)) after (8, 1200, 65496, 0, true, None)
+  4039 writes, 4039 acknowledged: p50 543 us, p99 6641 us, p999 49052 us, max 137037 us; 4 over 50ms (sent+took): 0.00s+130ms 0.20s+137ms 2.35s+73ms 4.34s+110ms
+  chaos-rolling-a-18648 partitioned from 203.988093ms to 2.204146752s
+  chaos-rolling-a-18648 refused the owner: {}
+  chaos-rolling-b-18648 refused the owner: {}
+  chaos-rolling-c-18648 partitioned from 2.419038438s to 4.41915434s
+  chaos-rolling-c-18648 refused the owner: {}
+== partition 20 exit 0 stuck 0 long5 0
+   pmtu: falls 1 pto_lines 54 pto_falls 1 loss_falls 0 grows 211
+LD-PMTU at 2013044507 trigger pto fell true before (6, 65496, 65512, 2, false, Some(601420340038)) after (6, 1200, 65496, 0, true, None)
+  3637 writes, 3637 acknowledged: p50 598 us, p99 4753 us, p999 34105 us, max 273073 us; 3 over 50ms (sent+took): 0.00s+146ms 2.16s+51ms 2.31s+273ms
+  chaos-rolling-a-19359 partitioned from 223.956154ms to 2.224065335s
+  chaos-rolling-a-19359 refused the owner: {}
+  chaos-rolling-b-19359 partitioned from 2.307198725s to 4.307281769s
+  chaos-rolling-b-19359 refused the owner: {}
+  chaos-rolling-c-19359 refused the owner: {}
+== partition 21 exit 0 stuck 0 long5 0
+   pmtu: falls 1 pto_lines 66 pto_falls 1 loss_falls 0 grows 192
+LD-PMTU at 3191757701 trigger pto fell true before (5, 65496, 65512, 2, false, Some(600620020440)) after (5, 1200, 65496, 0, true, None)
+  4693 writes, 4693 acknowledged: p50 400 us, p99 3924 us, p999 33821 us, max 216058 us; 3 over 50ms (sent+took): 0.00s+185ms 2.02s+63ms 2.33s+216ms
+  chaos-rolling-a-19956 refused the owner: {}
+  chaos-rolling-b-19956 partitioned from 216.900625ms to 2.21698918s
+  chaos-rolling-b-19956 refused the owner: {}
+  chaos-rolling-c-19956 partitioned from 2.329412638s to 4.331640999s
+  chaos-rolling-c-19956 refused the owner: {}
+== partition 22 exit 0 stuck 0 long5 0
+   pmtu: falls 1 pto_lines 47 pto_falls 1 loss_falls 0 grows 212
+LD-PMTU at 3388030746 trigger pto fell true before (8, 65496, 65512, 2, false, Some(600814276237)) after (8, 1200, 65496, 0, true, None)
+  3523 writes, 3523 acknowledged: p50 671 us, p99 5995 us, p999 47333 us, max 158776 us; 3 over 50ms (sent+took): 0.00s+159ms 2.26s+56ms 3.55s+50ms
+  chaos-rolling-a-20580 refused the owner: {}
+  chaos-rolling-b-20580 partitioned from 260.598282ms to 2.260682106s
+  chaos-rolling-b-20580 refused the owner: {}
+  chaos-rolling-c-20580 partitioned from 2.548591653s to 4.548677312s
+  chaos-rolling-c-20580 refused the owner: {}
+== partition 23 exit 0 stuck 0 long5 0
+   pmtu: falls 2 pto_lines 90 pto_falls 2 loss_falls 0 grows 199
+LD-PMTU at 2036113974 trigger pto fell true before (6, 65496, 65512, 2, false, Some(601420158747)) after (6, 1200, 65496, 0, true, None)
+LD-PMTU at 4323983329 trigger pto fell true before (8, 65496, 65512, 2, false, Some(601419256563)) after (8, 1200, 65496, 0, true, None)
+  3426 writes, 3426 acknowledged: p50 625 us, p99 5069 us, p999 32371 us, max 272682 us; 2 over 50ms (sent+took): 0.01s+138ms 2.29s+273ms
+  chaos-rolling-a-21285 partitioned from 200.307968ms to 2.20038924s
+  chaos-rolling-a-21285 refused the owner: {}
+  chaos-rolling-b-21285 refused the owner: {}
+  chaos-rolling-c-21285 partitioned from 2.293184129s to 4.295076722s
+  chaos-rolling-c-21285 refused the owner: {}
+== partition 24 exit 0 stuck 0 long5 0
+   pmtu: falls 1 pto_lines 74 pto_falls 1 loss_falls 0 grows 203
+LD-PMTU at 3282438852 trigger pto fell true before (8, 65496, 65512, 2, false, Some(601023862499)) after (8, 1200, 65496, 0, true, None)
+  4532 writes, 4532 acknowledged: p50 519 us, p99 11813 us, p999 64536 us, max 320137 us; 5 over 50ms (sent+took): 0.00s+176ms 0.22s+163ms 2.19s+65ms 2.31s+320ms 4.46s+71ms
+  chaos-rolling-a-21876 refused the owner: {}
+  chaos-rolling-b-21876 partitioned from 222.984895ms to 2.22307792s
+  chaos-rolling-b-21876 refused the owner: {}
+  chaos-rolling-c-21876 partitioned from 2.308650418s to 4.308773122s
+  chaos-rolling-c-21876 refused the owner: {}
+== partition 25 exit 0 stuck 0 long5 0
+   pmtu: falls 2 pto_lines 58 pto_falls 2 loss_falls 0 grows 194
+LD-PMTU at 2085454594 trigger pto fell true before (6, 65496, 65512, 2, false, Some(601420197850)) after (6, 1200, 65496, 0, true, None)
+LD-PMTU at 4170920844 trigger pto fell true before (8, 65496, 65512, 2, false, Some(601419300657)) after (8, 1200, 65496, 0, true, None)
+  4229 writes, 4229 acknowledged: p50 519 us, p99 3970 us, p999 28943 us, max 204419 us; 3 over 50ms (sent+took): 0.00s+176ms 2.30s+204ms 4.19s+55ms
+  chaos-rolling-a-22598 refused the owner: {}
+  chaos-rolling-b-22598 partitioned from 214.340357ms to 2.214422472s
+  chaos-rolling-b-22598 refused the owner: {}
+  chaos-rolling-c-22598 partitioned from 2.300752821s to 4.300853863s
+  chaos-rolling-c-22598 refused the owner: {}
+== partition 26 exit 0 stuck 0 long5 0
+   pmtu: falls 2 pto_lines 40 pto_falls 2 loss_falls 0 grows 210
+LD-PMTU at 1482013336 trigger pto fell true before (8, 65496, 65512, 2, false, Some(600812247980)) after (8, 1200, 65496, 0, true, None)
+LD-PMTU at 3255589011 trigger pto fell true before (8, 65480, 65496, 2, false, Some(601486876043)) after (8, 1200, 65480, 0, true, None)
+  4376 writes, 4376 acknowledged: p50 497 us, p99 5686 us, p999 48329 us, max 150111 us; 4 over 50ms (sent+took): 0.00s+150ms 2.16s+53ms 3.42s+83ms 4.25s+60ms
+  chaos-rolling-a-23203 refused the owner: {}
+  chaos-rolling-b-23203 partitioned from 201.898967ms to 2.201975152s
+  chaos-rolling-b-23203 refused the owner: {}
+  chaos-rolling-c-23203 partitioned from 2.423093108s to 4.423209423s
+  chaos-rolling-c-23203 refused the owner: {}
+== partition 27 exit 0 stuck 0 long5 0
+   pmtu: falls 2 pto_lines 64 pto_falls 2 loss_falls 0 grows 207
+LD-PMTU at 2088079484 trigger pto fell true before (6, 65496, 65512, 2, false, Some(601418944547)) after (6, 1200, 65496, 0, true, None)
+LD-PMTU at 4363432076 trigger pto fell true before (8, 65496, 65512, 2, false, Some(601417934330)) after (8, 1200, 65496, 0, true, None)
+  3794 writes, 3794 acknowledged: p50 545 us, p99 6897 us, p999 88056 us, max 302774 us; 4 over 50ms (sent+took): 0.00s+131ms 0.17s+165ms 2.27s+303ms 4.51s+88ms
+  chaos-rolling-a-23940 partitioned from 178.524468ms to 2.178633575s
+  chaos-rolling-a-23940 refused the owner: {}
+  chaos-rolling-b-23940 refused the owner: {}
+  chaos-rolling-c-23940 partitioned from 2.271450952s to 4.273745462s
+  chaos-rolling-c-23940 refused the owner: {}
+== partition 28 exit 0 stuck 0 long5 0
+   pmtu: falls 2 pto_lines 73 pto_falls 2 loss_falls 0 grows 199
+LD-PMTU at 2124423895 trigger pto fell true before (5, 65496, 65512, 2, false, Some(601423427671)) after (5, 1200, 65496, 0, true, None)
+LD-PMTU at 4180861941 trigger pto fell true before (8, 65496, 65512, 2, false, Some(601424401058)) after (8, 1200, 65496, 0, true, None)
+  4277 writes, 4277 acknowledged: p50 460 us, p99 6297 us, p999 43444 us, max 138245 us; 4 over 50ms (sent+took): 0.01s+138ms 2.27s+85ms 2.39s+98ms 4.59s+110ms
+  chaos-rolling-a-24646 partitioned from 196.185051ms to 2.196271661s
+  chaos-rolling-a-24646 refused the owner: {}
+  chaos-rolling-b-24646 refused the owner: {}
+  chaos-rolling-c-24646 partitioned from 2.389911731s to 4.390016397s
+  chaos-rolling-c-24646 refused the owner: {}
+== partition 29 exit 0 stuck 0 long5 0
+   pmtu: falls 1 pto_lines 46 pto_falls 1 loss_falls 0 grows 201
+LD-PMTU at 4197185156 trigger pto fell true before (8, 65496, 65512, 2, false, Some(601428282150)) after (8, 1200, 65496, 0, true, None)
+  3032 writes, 3032 acknowledged: p50 844 us, p99 4594 us, p999 33231 us, max 346364 us; 2 over 50ms (sent+took): 0.01s+166ms 2.34s+346ms
+  chaos-rolling-a-25367 refused the owner: {}
+  chaos-rolling-b-25367 partitioned from 258.648893ms to 2.258784618s
+  chaos-rolling-b-25367 refused the owner: {}
+  chaos-rolling-c-25367 partitioned from 2.343761118s to 4.343874293s
+  chaos-rolling-c-25367 refused the owner: {}
+== partition 30 exit 0 stuck 0 long5 0
+   pmtu: falls 2 pto_lines 46 pto_falls 2 loss_falls 0 grows 189
+LD-PMTU at 2136666790 trigger pto fell true before (6, 65496, 65512, 2, false, Some(601420131389)) after (6, 1200, 65496, 0, true, None)
+LD-PMTU at 4213005607 trigger pto fell true before (8, 65496, 65512, 2, false, Some(601419041082)) after (8, 1200, 65496, 0, true, None)
+== captured 1

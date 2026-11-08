@@ -1,0 +1,991 @@
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'aarch64-unknown-linux-gnu'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/home/runner/work/slates/slates/target/release/build/aws-lc-sys-427dd49efe2825e4/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Using flag: -ffile-prefix-map=/home/runner/work/slates/slates/vendor/aws-lc-sys=
+warning: aws-lc-sys@0.45.0: Using assembler flag: -Wa,--debug-prefix-map=/home/runner/work/slates/slates/vendor/aws-lc-sys=
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/release/build/aws-lc-sys-427dd49efe2825e4/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/release/build/aws-lc-sys-427dd49efe2825e4/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'neon_sha3_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/release/build/aws-lc-sys-427dd49efe2825e4/out/out-neon_sha3_check/7dfda64fdf5a526c-neon_sha3_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/runner/work/slates/slates/target/release/build/aws-lc-sys-427dd49efe2825e4/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+    Finished `release` profile [optimized] target(s) in 0.09s
+     Running tests/live_chaos.rs (target/release/deps/live_chaos-fd40aae5916a4dbd)
+
+running 1 test
+test candidates_partitioned_in_turn_mid_stream_lose_nothing ... slates daemon: fleet node `a` of `slates-fleet`: member 13391802469103003313 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 16715927552: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 2785987925: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 8388608: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 696496981: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 2072907: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 7428: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 696496981: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 1392993962: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 5371: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 5365144946: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 19926: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: page_fault_ns = 1083: the profile's measured base-page fault cost (at least one) (anchors ["faults.base_ns"])
+slates daemon: prefault_reserve_bytes = min(the shard's last write burst, reserve_per_shard = 2785987925, the arena's free bytes): the free content pages an idle shard keeps pre-faulted; the burst is measured at each idle tick (anchors ["reserve_per_shard", "content.allocated_bytes"])
+slates daemon: codec = lz4 false, zstd levels [], byte worth 186 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 256: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 1209196: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 912242: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 680172: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 2785987925: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 113362: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 5: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 2576: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 16384: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5152: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 5157: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 742800: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_bandwidth_bytes_per_ns = 5: memcpy bytes per second at the largest measured copy size / 1e9 (at least one byte per nanosecond) (anchors ["memcpy"])
+slates daemon: guest_requests_credit = 20: the owning shard's admission limit (Little's law: request rate × p99 service time); one attachment may use its shard's whole in-flight budget, which the daemon splits among attachments (anchors ["rt.requests_in_flight_per_shard"])
+slates daemon: guest_bytes_credit = 4456544: clamp(bandwidth × rtt, one frame cap, bandwidth × class latency budget) (anchors ["wire.bandwidth", "wire.rtt_p50", "wire.frame_cap", "wire.class_budget"])
+slates daemon: guest_listing_entries = 131072: guest writable cap / smallest fuse_dirent (anchors ["guest.writable_cap"])
+slates daemon: inode_reserve = 262144: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 2561: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 348248490: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2418392: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2418392: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: fleet_sessions_per_plane = 1932: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120168: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77388192: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5157: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates-server: shard 0 initialized in 560 µs
+slates-server: shard 1 initialized in 345 µs
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: instance chaos-rolling-a-17192 serving on 2 shards alone
+slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, extensions 10 × 100000000 ns; no path measured yet
+slates daemon: fleet node `b` of `slates-fleet`: member 17291882324335258767 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 16715927552: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 2785987925: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 8388608: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 696496981: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 2072907: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 7514: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 696496981: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 1392993962: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 5435: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 4990670241: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 18749: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: page_fault_ns = 1089: the profile's measured base-page fault cost (at least one) (anchors ["faults.base_ns"])
+slates daemon: prefault_reserve_bytes = min(the shard's last write burst, reserve_per_shard = 2785987925, the arena's free bytes): the free content pages an idle shard keeps pre-faulted; the burst is measured at each idle tick (anchors ["reserve_per_shard", "content.allocated_bytes"])
+slates daemon: codec = lz4 false, zstd levels [], byte worth 200 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 256: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 1209196: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 912242: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 680172: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 2785987925: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 113362: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 6: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 2576: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 16384: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5152: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 5157: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 751400: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_bandwidth_bytes_per_ns = 4: memcpy bytes per second at the largest measured copy size / 1e9 (at least one byte per nanosecond) (anchors ["memcpy"])
+slates daemon: guest_requests_credit = 20: the owning shard's admission limit (Little's law: request rate × p99 service time); one attachment may use its shard's whole in-flight budget, which the daemon splits among attachments (anchors ["rt.requests_in_flight_per_shard"])
+slates daemon: guest_bytes_credit = 4456544: clamp(bandwidth × rtt, one frame cap, bandwidth × class latency budget) (anchors ["wire.bandwidth", "wire.rtt_p50", "wire.frame_cap", "wire.class_budget"])
+slates daemon: guest_listing_entries = 131072: guest writable cap / smallest fuse_dirent (anchors ["guest.writable_cap"])
+slates daemon: inode_reserve = 262144: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 2561: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 348248490: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2418392: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2418392: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: fleet_sessions_per_plane = 1932: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120168: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77388192: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5157: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: instance chaos-rolling-b-17192 serving on 2 shards alone
+slates-server: shard 1 initialized in 854 µs
+slates-server: shard 0 initialized in 1175 µs
+slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, extensions 10 × 100000000 ns; no path measured yet
+LD-PMTU at 54212794 trigger probe_acked before (1, 1200, 65528, 0, true, None) after (1, 33364, 65528, 0, true, None)
+LD-PMTU at 8036315 trigger probe_acked before (2, 1200, 65528, 0, true, None) after (2, 33364, 65528, 0, true, None)
+slates daemon: fleet node `c` of `slates-fleet`: member 17216644013248113021 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 16715927552: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 2785987925: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 8388608: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 696496981: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 2072907: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 7360: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 696496981: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 1392993962: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 5296: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 5036212715: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 18533: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: page_fault_ns = 1093: the profile's measured base-page fault cost (at least one) (anchors ["faults.base_ns"])
+slates daemon: prefault_reserve_bytes = min(the shard's last write burst, reserve_per_shard = 2785987925, the arena's free bytes): the free content pages an idle shard keeps pre-faulted; the burst is measured at each idle tick (anchors ["reserve_per_shard", "content.allocated_bytes"])
+slates daemon: codec = lz4 false, zstd levels [], byte worth 198 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 256: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 1209196: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 912242: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 680172: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 2785987925: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 113362: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 4: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 2576: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 16384: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5152: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 5157: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 736000: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_bandwidth_bytes_per_ns = 5: memcpy bytes per second at the largest measured copy size / 1e9 (at least one byte per nanosecond) (anchors ["memcpy"])
+slates daemon: guest_requests_credit = 20: the owning shard's admission limit (Little's law: request rate × p99 service time); one attachment may use its shard's whole in-flight budget, which the daemon splits among attachments (anchors ["rt.requests_in_flight_per_shard"])
+slates daemon: guest_bytes_credit = 4456544: clamp(bandwidth × rtt, one frame cap, bandwidth × class latency budget) (anchors ["wire.bandwidth", "wire.rtt_p50", "wire.frame_cap", "wire.class_budget"])
+slates daemon: guest_listing_entries = 131072: guest writable cap / smallest fuse_dirent (anchors ["guest.writable_cap"])
+slates daemon: inode_reserve = 262144: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 2561: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 348248490: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2418392: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2418392: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: fleet_sessions_per_plane = 1932: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120168: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77388192: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5157: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: instance chaos-rolling-c-17192 serving on 2 shards alone
+slates-server: shard 1 initialized in 853 µs
+slates-server: shard 0 initialized in 1183 µs
+slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, extensions 10 × 100000000 ns; no path measured yet
+LD-PMTU at 54211595 trigger probe_acked before (3, 1200, 65528, 0, true, None) after (3, 33364, 65528, 0, true, None)
+LD-PMTU at 101516355 trigger probe_acked before (3, 1200, 65528, 0, true, None) after (3, 33364, 65528, 0, true, None)
+LD-PMTU at 103206028 trigger probe_acked before (4, 1200, 65528, 0, true, None) after (4, 33364, 65528, 0, true, None)
+LD-PMTU at 9437688 trigger probe_acked before (3, 1200, 65528, 0, true, None) after (3, 33364, 65528, 0, true, None)
+slates-cluster: fleet: HostId(11727339590226714187) holds HostId(12352607336441940457) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(12352607336441940457) holds HostId(11727339590226714187) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+LD-PMTU at 103927481 trigger probe_acked before (2, 1200, 65528, 0, true, None) after (2, 33364, 65528, 0, true, None)
+LD-PMTU at 10315882 trigger probe_acked before (3, 33364, 65528, 0, true, None) after (3, 49446, 65528, 0, true, None)
+slates-cluster: fleet: HostId(3991910119844571067) holds HostId(12352607336441940457) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(12352607336441940457) holds HostId(3991910119844571067) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+LD-PMTU at 58249143 trigger probe_acked before (2, 33364, 65528, 0, true, None) after (2, 49446, 65528, 0, true, None)
+LD-PMTU at 11705785 trigger probe_acked before (4, 1200, 65528, 0, true, None) after (4, 33364, 65528, 0, true, None)
+LD-PMTU at 104839842 trigger probe_acked before (1, 1200, 65528, 0, true, None) after (1, 33364, 65528, 0, true, None)
+LD-PMTU at 152060727 trigger probe_acked before (1, 33364, 65528, 0, LD-PMTU at true105110279,  trigger probe_acked before None()4 after , (12001, , 6552849446, , 065528, , true0, , Nonetrue),  after None()4
+, 33364, 65528, 0, true, None)
+slates-cluster: fleet: HostId(11727339590226714187) holds HostId(3991910119844571067) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(3991910119844571067) holds HostId(11727339590226714187) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+LD-PMTU at 58408147 trigger probe_acked before (4, 33364, 65528, 0, true, None) after (4, 49446, 65528, 0, true, None)
+slates-cluster: fleet: HostId(3991910119844571067) holds HostId(12352607336441940457) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+slates-cluster: fleet: HostId(12352607336441940457) holds HostId(3991910119844571067) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+LD-PMTU at 104292920 trigger probe_acked before (2, 1200, 65528, 0, true, None) after (2, 33364, 65528, 0, true, None)
+LD-PMTU at 198408003 trigger probe_acked before (3, 33364, 65528, 0, true, None) after (3, 49446, 65528, 0, true, None)
+LD-PMTU at 104542942 trigger probe_acked before (1, 1200, 65528, 0, true, None) after (1, 33364, 65528, 0, true, None)
+slates-cluster: fleet: HostId(11727339590226714187) holds HostId(3991910119844571067) alive: LD-PMTU at None151650253 ->  trigger probe_acked before MemberState( { 3liveness, : 33364Alive, , 65528incarnation, : 00,  }true, folded at , crates/server/src/member_task.rsNone) after (3, 49446, :65528718, :09, 
+trueslates-cluster: fleet: , HostIdNone()11727339590226714187
+) holds HostId(12352607336441940457) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+slates-cluster: fleet: HostId(3991910119844571067) holds HostId(11727339590226714187) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+slates-cluster: fleet: HostId(12352607336441940457) holds HostId(11727339590226714187) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+LD-PMTU at 257040663 trigger probe_acked before (5, 1200, 65528, 0, true, None) after (5, 33364, 65528, 0, true, None)
+LD-PMTU at 210260954 trigger probe_acked before (6, 1200, 65528, 0, true, None) after (6, 33364, 65528, 0, true, None)
+LD-PMTU at 303852202 trigger probe_acked before (7, 1200, 65528, 0, true, None) after (7, 33364, 65528, 0, true, None)
+LD-PMTU at LD-PMTU at 257596304210698011 trigger probe_acked before  trigger probe_acked before ((56, , 12001200, , 6552865528, , 00, , truetrue, , NoneNone)) after  after ((56, , 3336433364, , 6552865528, , 00, , truetrue, , NoneNone))
+
+LD-PMTU at 257811393 trigger probe_acked before (7, 1200, 65528, 0, true, None) after (7, 33364, 65528, 0, true, None)
+LD-PMTU at 304937206 trigger probe_acked before (6, 1200, 65528, 0, true, None) after (6, 33364, 65528, 0, true, None)
+LD-PMTU at 258140274 trigger probe_acked before (6, 33364, 65528, 0, true, None) after (6, 49446, 65528, 0, true, None)
+LD-PMTU at 211280386 trigger probe_acked before (5, 1200, 65528, 0, true, None) after (5, 33364, 65528, 0, true, None)
+LD-PMTU at 258271585 trigger probe_acked before (7, 33364, 65528, 0, true, None) after (7, 49446, 65528, 0, true, None)
+LD-PMTU at 305318579 trigger probe_acked before (5, 33364, 65528, 0, true, None) after (5, 49446, 65528, 0, true, None)
+LD-PMTU at 211603187 trigger probe_acked before (7, 1200, 65528, 0, true, None) after (7, 33364, 65528, 0, true, None)
+LD-PMTU at 305614494 trigger probe_acked before (7, 33364, 65528, 0, true, None) after (7, 49446, 65528, 0, true, None)
+LD-PMTU at 215077463 trigger probe_acked before (8, 1200, 65528, 0, true, None) after (8, 33364, 65528, 0, true, None)
+LD-PMTU at 286636998 trigger probe_acked before (8, 1200, 65528, 0, true, None) after (8, 33364, 65528, 0, true, None)
+LD-PMTU at 239956361 trigger probe_acked before (8, 33364, 65528, 0, true, None) after (8, 49446, 65528, 0, true, None)
+LD-PMTU at 311144202 trigger probe_acked before (5, 33364, 65528, 0, true, None) after (5, 49446, 65528, 0, true, None)
+LD-PMTU at 358193500 trigger probe_acked before (6, 33364, 65528, 0, true, None) after (6, 49446, 65528, 0, true, None)
+LD-PMTU at 311482826 trigger probe_acked before (6, 49446, 65528, 0, true, None) after (6, 57487, 65528, 0, true, None)
+LD-PMTU at 358605959 trigger probe_acked before (5, 49446, 65528, 0, true, None) after (5, 57487, 65528, 0, true, None)
+LD-PMTU at 310194868 trigger probe_acked before (5, 33364, 65528, 0, true, None) after (5, 49446, 65528, 0, true, None)
+LD-PMTU at 404337230 trigger probe_acked before (7, 49446, 65528, 0, true, None) after (7, 57487, 65528, 0, true, None)
+LD-PMTU at 311554213 trigger probe_acked before (6, 33364, 65528, 0, true, None) after (6, 49446, 65528, 0, true, None)
+LD-PMTU at 405576551 trigger probe_acked before (8, 1200, 65528, 0, true, None) after (8, 33364, 65528, 0, true, None)
+LD-PMTU at 358684346 trigger probe_acked before (7, 49446, 65528, 0, true, None) after (7, 57487, 65528, 0, true, None)
+LD-PMTU at 311949889 trigger probe_acked before (7, 33364, 65528, 0, true, NoneLD-PMTU at )405860243 after  trigger probe_acked before ((78, , 4944633364, , 6552865528, , 00, , truetrue, , NoneNone))
+ after (8, 49446, 65528, 0, true, None)
+LD-PMTU at 312228453 trigger probe_acked before (7, 49446, 65528, 0, true, None) after (7, 57487, 65528, 0, true, None)
+LD-PMTU at 362937718 trigger probe_acked before (8, 33364, 65528, 0, true, None) after (8, 49446, 65528, 0, true, None)
+LD-PMTU at 316422222 trigger probe_acked before (8, 49446, 65528, 0, true, None) after (8, 57487, 65528, 0, true, None)
+LD-PMTU at 412016002 trigger probe_acked before (5, 49446, 65528, 0, true, None) after LD-PMTU at (4590487575 trigger probe_acked before , 57487(, 665528, , 494460, , 65528true, , 0None, )true
+, None) after (6, 57487, 65528, 0, true, None)
+LD-PMTU at 412452275 trigger probe_acked before (6LD-PMTU at , 45945110557487 trigger probe_acked before , (655285, , 057487, , true65528, , None0),  after true(, 6None, )61507 after , (655285, , 061507, , true65528, , None0), 
+true, None)
+LD-PMTU at 410874026 trigger probe_acked before (5, 49446, 65528, 0, true, None) after (5, 57487, 65528, 0, true, None)
+LD-PMTU at 505410048 trigger probe_acked before (7, 57487, 65528, 0, true, None) after (7, 61507, 65528, 0, true, None)
+LD-PMTU at 411801153 trigger probe_acked before (6, 49446, 65528, 0, true, None) after (6, 57487, 65528, 0, true, None)
+LD-PMTU at 458916415 trigger probe_acked before (7, 57487, 65528, 0, true, None) after (7, 61507, 65528, 0, true, None)
+LD-PMTU at 506724052 trigger probe_acked before (8, 49446, 65528, 0, true, None) after (8, 57487, 65528, 0, true, None)
+LD-PMTU at 413056697 trigger probe_acked before (7, 57487, 65528, 0, true, None) after (7, 61507, 65528, 0, true, None)
+LD-PMTU at 464148391 trigger probe_acked before (8, 49446, 65528, 0, true, None) after (8, 57487, 65528, 0, true, None)
+LD-PMTU at 417473818 trigger probe_acked before (8, 57487, 65528, 0, true, None) after (8, 61507, 65528, 0, true, None)
+LD-PMTU at LD-PMTU at 513564715560556385 trigger probe_acked before  trigger probe_acked before ((56, , 5748757487, , 6552865528, , 00, , truetrue, , NoneNone)) after  after ((56, , 6150761507, , 6552865528, , 00, , truetrue, , NoneNone))
+
+LD-PMTU at LD-PMTU at 514038082561031016 trigger probe_acked before  trigger probe_acked before ((65, , 6150761507, , 6552865528, , 00, , truetrue, , NoneNone)) after  after ((65, , 6351763517, , 6552865528, , 00, , truetrue, , NoneNone))
+
+LD-PMTU at 511758090 trigger probe_acked before (5, 57487, 65528, 0, true, None) after (5, 61507, 65528, 0, true, None)
+LD-PMTU at LD-PMTU at 605939049512047101 trigger probe_acked before  trigger probe_acked before ((76, , 6150757487, , 6552865528, , 00, , truetrue, , NoneNone)) after  after ((76, , 6351761507, , 6552865528, , 00, , truetrue, , NoneNone))
+
+LD-PMTU at 559244390 trigger probe_acked before (7, 61507, 65528, 0, true, None) after (7, 63517, 65528, 0, true, None)
+LD-PMTU at 608545745 trigger probe_acked before (8, 57487, 65528, 0, true, None) after (8, 61507, 65528, 0, true, None)
+LD-PMTU at 608790552 trigger probe_acked before (6, 61507, 65528, 0, true, None) after (6, 63517, 65528, 0, true, None)
+LD-PMTU at 515451446 trigger probe_acked before (7, 61507, 65528, 0, true, None) after (7, 63517, 65528, 0, true, None)
+LD-PMTU at 562583083 trigger probe_acked before (6, 63517LD-PMTU at , 60958369665528 trigger probe_acked before , (06, , true63517, , None65528),  after 0(, 6true, , 64522None, )65528 after , (06, , true64522, , None65528), 
+0, true, None)
+LD-PMTU at 562846376 trigger probe_acked before (6, 64522, 65528, 0, true, None) after (6, 65025, 65528, 0, true, None)
+LD-PMTU at 564501340 trigger probe_acked before (8, 57487, 65528, 0, true, None) after (8, 61507, 65528, 0, true, None)
+LD-PMTU at 518083685 trigger probe_acked before (8, 61507, 65528, 0, true, None) after (8, 63517, 65528, 0, true, None)
+LD-PMTU at 610070030 trigger probe_acked before (8, 61507, 65528, 0, true, None) after (8, 63517, 65528, 0, true, None)
+LD-PMTU at 563476396 trigger probe_acked before (8, 63517, 65528, 0, true, None) after (8, 64522, 65528, 0, true, None)
+LD-PMTU at 610765550 trigger probe_acked before (8, 63517, 65528, 0, true, None) after (8, 64522, 65528, 0, true, None)
+LD-PMTU at 611219582 trigger probe_acked before (5, 61507, 65528, 0, true, None) after (5, 63517, 65528, 0, true, None)
+LD-PMTU at 564383164 trigger probe_acked before (8, 64522, 65528, 0, true, None) after (8, 65025, 65528, 0, true, None)
+LD-PMTU at 658435052 trigger probe_acked before (5, 63517, 65528, 0, true, None) after (5, 64522, 65528, 0, true, None)
+LD-PMTU at 611786086 trigger probe_acked before (5, 63517, 65528, 0, true, None) after (5, 64522, 65528, 0, true, None)
+LD-PMTU at 659257722 trigger probe_acked before (5, 64522, 65528, 0, true, None) after (5, 65025, 65528, 0, true, None)
+LD-PMTU at 612910135 trigger probe_acked before (8, 64522, 65528, 0, true, None) after (8, 65025, 65528, 0, true, None)
+LD-PMTU at 566476385 trigger probe_acked before (8, 65025, 65528, 0, true, None) after (8, 65276, 65528, 0, true, None)
+LD-PMTU at 613685512 trigger probe_acked before (5, 64522, 65528, 0, true, None) after (5, 65025, 65528, 0, true, None)
+LD-PMTU at 661159036 trigger probe_acked before (5, 65025, 65528, 0, true, None) after (5, 65276, 65528, 0, true, None)
+LD-PMTU at 616238852 trigger probe_acked before (6, 61507, 65528, 0, true, None) after (6, 63517, 65528, 0, true, None)
+LD-PMTU at 616588300 trigger probe_acked before (5, 61507, 65528, 0, true, None) after (5, 63517, 65528, 0, true, None)
+LD-PMTU at 663528670 trigger probe_acked before (7, 63517, 65528, 0, true, None) after (7, 64522, 65528, 0, true, None)
+LD-PMTU at 710625053 trigger probe_acked before (6, 64522, 65528, 0, true, None) after (6, 65025, 65528, 0, true, None)
+LD-PMTU at 616997159 trigger probe_acked before (6, 63517, 65528, 0, true, None) after (6, 64522, 65528, 0, true, None)
+LD-PMTU at 663958296 trigger probe_acked before (6, 65025, 65528, 0, true, None) after (6, 65276, 65528, 0, true, None)
+LD-PMTU at 711084164 trigger probe_acked before (6, 65025, 65528, 0, true, None) after (6, 65276, 65528, 0, true, None)
+LD-PMTU at 664179320 trigger probe_acked before LD-PMTU at (6172798117 trigger probe_acked before , (64522, 565528, , 635170, , 65528true, , 0None, )true after , (None7),  after 65025(, 565528, , 645220, , 65528true, , 0None, )true
+, None)
+LD-PMTU at 664392033 trigger probe_acked before (6, 65276, 65528, 0, true, None) after (6, 65402, 65528, 0, true, None)
+LD-PMTU at 711688802 trigger probe_acked before (6, 65276, 65528, 0, true, None) after (6, 65402, 65528, 0, true, None)
+LD-PMTU at 711866981 trigger probe_acked before (7, 63517, 65528, 0, true, None) after (7, 64522, 65528, 0, true, None)
+LD-PMTU at 712115668 trigger probe_acked before LD-PMTU at (6651292857 trigger probe_acked before , (645226, , 6552865402, , 065528, , true0, , Nonetrue),  after None()7 after , (650256, , 6552865465, , 065528, , true0, , Nonetrue), 
+None)
+LD-PMTU at 618334601 trigger probe_acked before (6, 64522, 65528, 0, true, None) after (6, 65025, 65528, 0, true, None)
+LD-PMTU at 712272913 trigger probe_acked before (8, 61507, 65528, 0, true, None) after (8, 63517, 65528, 0, true, None)
+LD-PMTU at 665484508 trigger probe_acked before (7, 65025, 65528, 0, true, None) after (7, 65276, 65528, 0, true, None)
+LD-PMTU at 618619389 trigger probe_acked before (6, 65025, 65528, 0, true, None) after (6, 65276, 65528, 0, true, None)
+LD-PMTU at 665799174 trigger probe_acked before (7, 65276, 65528, 0, true, None) after (7, 65402, 65528, 0, true, None)
+LD-PMTU at 619359041 trigger probe_acked before (6, 65276, 65528, 0, true, None) after (6, 65402, 65528, 0, true, None)
+LD-PMTU at 619745086 trigger probe_acked before (7, 63517, 65528, 0, true, None) after (7, 64522, 65528, 0, true, None)LD-PMTU at 
+666669553 trigger probe_acked before (7, 65402, 65528, 0, true, None) after (7, 65465, 65528, 0, true, None)
+LD-PMTU at 619889979 trigger probe_acked before (5, 64522, 65528, 0, true, None) after (5, 65025, 65528, 0, true, None)
+LD-PMTU at 713918157 trigger probe_acked before (8, 63517, 65528, 0, true, None) after (8, 64522, 65528, 0, true, None)
+LD-PMTU at 714250742 trigger probe_acked before (7, 65025, 65528, 0, true, None) after (7, 65276, 65528, 0, true, None)
+LD-PMTU at 620964688 trigger probe_acked before (5, 65025, 65528, 0, true, None) after (5, 65276, 65528, 0, true, None)
+LD-PMTU at 621219886 trigger probe_acked before (7, 64522, 65528, 0, true, None) after (7, 65025, 65528, 0, true, None)
+LD-PMTU at 715277269 trigger probe_acked before (7, 65276, 65528, 0, true, None) after (7, 65402, 65528, 0, true, None)
+LD-PMTU at 715382662 trigger probe_acked before (6, 65402, 65528, 0, true, None) after (6, 65465, 65528, 0, true, None)
+LD-PMTU at 621759616 trigger probe_acked before (6, 65402, 65528, 0, true, None) after (6, 65465, 65528, 0, true, None)
+LD-PMTU at 668943377 trigger probe_acked before (6, 65465, 65528, 0, true, None) after (6, 65496, 65528, 0, true, None)
+LD-PMTU at 669435031 trigger probe_acked before (7, 65465, 65528, 0, true, None) after (7, 65496, 65528, 0, true, None)
+LD-PMTU at 622772393 trigger probe_acked before (5, 65276, 65528, 0, true, None) after (5, 65402, 65528, 0, true, None)
+LD-PMTU at 717091518 trigger probe_acked before (7, 65402, 65528, 0, true, None) after (7, 65465, 65528, 0, true, None)
+LD-PMTU at 717188599 trigger probe_acked before (8, 64522, 65528, 0, true, None) after (8, 65025, 65528, 0, true, None)
+LD-PMTU at 623742980 trigger probe_acked before (7, 65025, 65528, 0, true, None) after (7, 65276, 65528, 0, true, None)
+LD-PMTU at 761414968 trigger probe_acked before (6, 65465, 65528, 0, true, None) after (6, 65496, 65528, 0, true, None)
+LD-PMTU at 714484286 trigger probe_acked before (5, 65025, 65528, 0, true, None) after (5, 65276, 65528, 0, true, None)
+LD-PMTU at 761717611 trigger probe_acked before (5, 65276, 65528, 0, true, None) after (5, 65402, 65528, 0, true, None)
+LD-PMTU at 714828653 trigger probe_acked before (8, 65025, 65528, 0, true, None) after (8, 65276, 65528, 0, true, None)
+LD-PMTU at LD-PMTU at 715109178668211708 trigger probe_acked before  trigger probe_acked before ((58, , 6527665276, , 6552865528, , 00, , truetrue, , NoneNone)) after  after ((58, , 6540265402, , 6552865528, , 00, , true, trueNone, )None
+)
+LD-PMTU at 762519978 trigger probe_acked before (5, 65402, 65528, 0, true, None) after (5, 65465, 65528, 0, true, None)
+LD-PMTU at 712211069 trigger probe_acked before (5, 65402, 65528, 0, true, None) after (5, 65465, 65528, 0, true, None)
+LD-PMTU at 806361662 trigger probe_acked before (7, 65465, 65528, 0, true, None) after (7, 65496, 65528, 0, true, None)
+LD-PMTU at 712513128 trigger probe_acked before (6, 65465, 65528, 0, true, None) after (6, 65496, 65528, 0, true, None)
+LD-PMTU at 810563511 trigger probe_acked before (8, 65025, 65528, 0, true, None) after (8, 65276, 65528, 0, true, None)
+LD-PMTU at 716969327 trigger probe_acked before (7, 65276, 65528, 0, true, None) after (7, 65402, 65528, 0, true, None)
+LD-PMTU at 765724881 trigger probe_acked before (8, 65276, 65528, 0, true, None) after (8, 65402, 65528, 0, true, None)
+LD-PMTU at 719141806 trigger probe_acked before (8, 65402, 65528, 0, true, None) after (8, 65465, 65528, 0, true, None)
+LD-PMTU at 815829277 trigger probe_acked before (8, 65402, 65528, 0, true, None) after (8, 65465, 65528, 0, true, None)
+LD-PMTU at 769267072 trigger probe_acked before (8, 65465, 65528, 0, true, None) after (8, 65496, 65528, 0, true, None)
+LD-PMTU at 816313643 trigger probe_acked before (5, 65402, 65528, 0, true, None) after (5, 65465, 65528, 0, true, None)
+LD-PMTU at 863740106 trigger probe_acked before (5, 65465, 65528, 0, true, None) after (5, 65496, 65528, 0, true, None)
+LD-PMTU at 917342688 trigger probe_acked before (8, 65465, 65528, 0, true, None) after (8, 65496, 65528, 0, true, None)
+LD-PMTU at 917710998 trigger probe_acked before (5, 65465, 65528, 0, true, None) after (5, 65496, 65528, 0, true, None)
+chaos: fleet rolling (Bare) formed and settled: hosts ["12352607336441940457", "3991910119844571067", "11727339590226714187"]
+LD-PMTU at 1031340437 trigger probe_acked before (5, 65465, 65528, 0, true, None) after (5, 65496, 65528, 0, true, None)
+LD-PMTU at 1214099413 trigger probe_acked before (8, 65276, 65528, 0, true, None) after (8, 65402, 65528, 0, true, None)
+LD-PMTU at 1120784449 trigger probe_acked before (7, 65402, 65528, 0, true, None) after (7, 65465, 65528, 0, true, None)
+LD-PMTU at 1165716488 trigger pto fell false before (6, 65496, 65512, 0, false, Some(600712578675)) after (6, 65496, 65512, 1, false, Some(600712578675))
+LD-PMTU at 1209555621 trigger pto fell false before (6, 65496, 65512, 0, false, Some(600712578675)) after (6, 65496, 65512, 1, false, Some(600712578675))
+LD-PMTU at 1227856581 trigger pto fell false before (6, 65496, 65512, 0, false, Some(600712578675)) after (6, 65496, 65512, 1, false, Some(600712578675))
+LD-SERVE at 1328817591 entry from 11727339590226714187 bytes 4840 took_ns 11847 gap_ns Some(202769472)
+LD-PMTU at 1248614633 trigger pto fell false before (5, 65496, 65512, 0, false, Some(601031484699)) after (5, 65496, 65512, 1, false, Some(601031484699))
+LD-PMTU at 1251381751 trigger pto fell false before (5, 65496, 65512, 1, false, Some(601031484699)) after (5, 65496, 65512, 2, false, Some(601031484699))
+LD-PMTU at 1256849198 trigger pto fell true before (5, 65496, 65512, 2, false, Some(601031484699)) after (5, 1200, 65496, 0, true, None)
+LD-PMTU at 1267793244 trigger pto fell false before (5, 1200, 65496, 0, true, None) after (5, 1200, 65496, 0, true, None)
+LD-PMTU at 1289551330 trigger pto fell false before (5, 1200, 65496, 0, true, None) after (5, 1200, 65496, 0, true, None)
+LD-PMTU at 1336093576 trigger pto fell false before (5, 1200, 65496, 0, true, None) after (5, 1200, 65496, 0, true, None)
+LD-PMTU at 1405050573 trigger pto fell false before (6, 65496, 65512, 0, false, Some(600712578675)) after (6, 65496, 65512, 1, false, Some(600712578675))
+LD-PMTU at 1422860808 trigger pto fell false before (5, 1200, 65496, 0, true, None) after (5, 1200, 65496, 0, true, None)
+LD-PMTU at 1522192565 trigger pto fell false before (6, 65496, 65512, 0, false, Some(600712578675)) after (6, 65496, 65512, 1, false, Some(600712578675))
+LD-PMTU at 1524877456 trigger pto fell false before (6, 65496, 65512, 1, false, Some(600712578675)) after (6, 65496, 65512, 2, false, Some(600712578675))
+LD-PMTU at 1530166412 trigger pto fell true before (6, 65496, 65512, 2, false, Some(600712578675)) after (6, 1200, 65496, 0, true, None)
+LD-PMTU at 1530948189 trigger probe_acked before (6, 1200, 65496, 0, true, None) after (6, 33348, 65496, 0, true, None)
+LD-PMTU at 1533419831 trigger probe_acked before (6, 33348, 65496, 0, true, None) after (6, 49422, 65496, 0, true, None)
+LD-PMTU at 1533829042 trigger probe_acked before (6, 49422, 65496, 0, true, None) after (6, 57459, 65496, 0, true, None)
+LD-PMTU at 1537306646 trigger probe_acked before (6, 57459, 65496, 0, true, None) after (6, 61477, 65496, 0, true, None)
+LD-PMTU at 1537940617 trigger probe_acked before (6, 61477, 65496, 0, true, None) after (6, 63486, 65496, 0, true, None)
+LD-PMTU at 1538323678 trigger probe_acked before (6, 63486, 65496, 0, true, None) after (6, 64491, 65496, 0, true, None)
+LD-PMTU at 1538853001 trigger probe_acked before (6, 64491, 65496, 0, true, None) after (6, 64993, 65496, 0, true, None)
+LD-PMTU at 1539176674 trigger probe_acked before (6, 64993, 65496, 0, true, None) after (6, 65244, 65496, 0, true, None)
+LD-PMTU at 1539696702 trigger probe_acked before (6, 65244, 65496, 0, true, None) after (6, 65370, 65496, 0, true, None)
+LD-PMTU at 1540051277 trigger probe_acked before (6, 65370, 65496, 0, true, None) after (6, 65433, 65496, 0, true, None)
+LD-PMTU at 1540570072 trigger probe_acked before (6, 65433, 65496, 0, true, None) after (6, 65464, 65496, 0, true, None)
+LD-PMTU at 1540867203 trigger probe_acked before (6, 65464, 65496, 0, true, None) after (6, 65480, 65496, 0, false, Some(601540867203))
+LD-PMTU at 1596287857 trigger pto fell false before (5, 1200, 65496, 0, true, None) after (5, 1200, 65496, 0, true, None)
+LD-PMTU at 1943006724 trigger pto fell false before (5, 1200, 65496, 0, true, None) after (5, 1200, 65496, 0, true, None)
+LD-PMTU at 2009726878 trigger pto fell false before (6, 65480, 65496, 0, false, Some(601540867203)) after (6, 65480, 65496, 1, false, Some(601540867203))
+LD-PMTU at 2031547999 trigger pto fell false before (6, 65480, 65496, 0, false, Some(601540867203)) after (6, 65480, 65496, 1, false, Some(601540867203))
+LD-PMTU at 2095765530 trigger pto fell false before (6, 65480, 65496, 0, false, Some(601540867203)) after (6, 65480, 65496, 1, false, Some(601540867203))
+LD-PMTU at 2143730788 trigger pto fell false before (6, 65480, 65496, 0, false, Some(601540867203)) after (6, 65480, 65496, 1, false, Some(601540867203))
+LD-LANE at 1247165903 holder 12352607336441940457 stream 22 bytes 4842 budget_ns 1000013087 took_ns 1000184268 answered false unanswered 1 path_before Some((130934, 353907, 1353907, Some(65496), 0, 0, Some((12, 11, 0, 0)))) path_after None
+LD-PMTU at 2406150561 trigger pto fell false before (6, 65480, 65496, 0, false, Some(601540867203)) after (6, 65480, 65496, 1, false, Some(601540867203))
+LD-PMTU at 2589137297 trigger pto fell false before (6, 65480, 65496, 0, false, Some(601540867203)) after (6, 65480, 65496, 1, false, Some(601540867203))
+LD-SERVE at 3094524315 entry from 11727339590226714187 bytes 2207798 took_ns 3813524 gap_ns Some(33478845)
+LD-SERVE at 3106186103 entry from 11727339590226714187 bytes 1049196 took_ns 1463249 gap_ns Some(7848264)
+LD-PMTU at 3142730916 trigger pto fell false before (6, 65480, 65496, 0, false, Some(601540867203)) after (6, 65480, 65496, 1, false, Some(601540867203))
+LD-PMTU at 3193802443 trigger pto fell false before (6, 65480, 65496, 0, false, Some(601540867203)) after (6, 65480, 65496, 1, false, Some(601540867203))
+slates-cluster: fleet: HostId(3991910119844571067) holds HostId(12352607336441940457) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:618:8
+slates-cluster: fleet: HostId(3991910119844571067) holds HostId(12352607336441940457) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:718:9
+slates-cluster: fleet: HostId(11727339590226714187) holds HostId(12352607336441940457) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:618:8
+slates daemon: the control shard's beat task ran 2029 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 5169 steps and 5201 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 11 timers, waited 18 times, spawned 12 tasks and finished 12; 13 tasks live; its longest poll is 2 ms and its timer overrun 1976 ms
+LD-PMTU at 3338237803 trigger probe_acked before (8, 65402, 65528, 0, true, None) after (8, 65465, 65528, 0, true, None)
+LD-PMTU at 3244557049 trigger probe_acked before (7, 65465, 65528, 0, true, None) after (7, 65496, 65528, 0, true, None)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-17192 partitioned from 233.099027ms to 2.235499069s
+slates-cluster: fleet: HostId(11727339590226714187) holds HostId(12352607336441940457) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:718:9
+LD-PMTU at 3249366951 trigger pto fell false before (6, 65480, 65496, 0, false, Some(601540867203)) after (6, 65480, 65496, 1, false, Some(601540867203))
+LD-PMTU at 3296557191 trigger pto fell false before (6, 65480, 65496, 0, false, Some(601540867203)) after (6, 65480, 65496, 1, false, Some(601540867203))
+LD-PMTU at 3300691116 trigger pto fell false before (6, 65480, 65496, 0, false, Some(601540867203)) after (6, 65480, 65496, 1, false, Some(601540867203))
+LD-PMTU at 3324884118 trigger pto fell false before (6, 65480, 65496, 0, false, Some(601540867203)) after (6, 65480, 65496, 1, false, Some(601540867203))
+LD-PMTU at 3337621527 trigger pto fell false before (6, 65480, 65496, 0, false, Some(601540867203)) after (6, 65480, 65496, 1, false, Some(601540867203))
+LD-PMTU at 3340953260 trigger pto fell false before (6, 65480, 65496, 1, false, Some(601540867203)) after (6, 65480, 65496, 2, false, Some(601540867203))
+LD-PMTU at 3347521918 trigger pto fell true before (6, 65480, 65496, 2, false, Some(601540867203)) after (6, 1200, 65480, 0, true, None)
+LD-PMTU at 3360668513 trigger pto fell false before (6, 1200, 65480, 0, true, None) after (6, 1200, 65480, 0, true, None)
+LD-PMTU at 3386867958 trigger pto fell false before (6, 1200, 65480, 0, true, None) after (6, 1200, 65480, 0, true, None)
+LD-PMTU at 3439138634 trigger pto fell false before (6, 1200, 65480, 0, true, None) after (6, 1200, 65480, 0, true, None)
+LD-PMTU at 3589557532 trigger probe_acked before (9, 1200, 65528, 0, true, None) after (9, 33364, 65528, 0, true, None)
+LD-PMTU at 3504505803 trigger probe_acked before (9, 1200, 65528, 0, true, None) after (9, 33364, 65528, 0, true, None)
+LD-PMTU at 3543491461 trigger pto fell false before (6, 1200, 65480, 0, true, None) after (6, 1200, 65480, 0, true, None)
+LD-PMTU at 3651258768 trigger probe_acked before (9, 33364, 65528, 0, true, None) after (9, 49446, 65528, 0, true, None)
+LD-PMTU at 3560048848 trigger probe_acked before (9, 33364, 65528, 0, true, None) after (9, 49446, 65528, 0, true, None)
+LD-PMTU at 3714132753 trigger probe_acked before (9, 49446, 65528, 0, true, None) after (9, 57487, 65528, 0, true, None)
+LD-PMTU at 3620413458 trigger probe_acked before (9, 49446, 65528, 0, true, None) after (9, 57487, 65528, 0, true, None)
+LD-PMTU at 3776620030 trigger probe_acked before (9, 57487, 65528, 0, true, None) after (9, 61507, 65528, 0, true, None)
+LD-PMTU at 3682941868 trigger probe_acked before (9, 57487, 65528, 0, true, None) after (9, 61507, 65528, 0, true, None)
+LD-PMTU at 3839489336 trigger probe_acked before (9, 61507, 65528, 0, true, None) after (9, 63517, 65528, 0, true, None)
+LD-PMTU at 3745899935 trigger probe_acked before (9, 61507, 65528, 0, true, None) after (9, 63517, 65528, 0, true, None)
+LD-PMTU at 3752089268 trigger pto fell false before (6, 1200, 65480, 0, true, None) after (6, 1200, 65480, 0, true, None)
+LD-PMTU at 3901995363 trigger probe_acked before (9, 63517, 65528, 0, true, None) after (9, 64522, 65528, 0, true, None)
+LD-PMTU at 3808251997 trigger probe_acked before (9, 63517, 65528, 0, true, None) after (9, 64522, 65528, 0, true, None)
+LD-PMTU at 3964859557 trigger probe_acked before (9, 64522, 65528, 0, true, None) after (9, 65025, 65528, 0, true, None)
+LD-PMTU at 3871162124 trigger probe_acked before (9, 64522, 65528, 0, true, None) after (9, 65025, 65528, 0, true, None)
+LD-PMTU at 4027439547 trigger probe_acked before (9, 65025, 65528, 0, true, None) after (9, 65276, 65528, 0, true, None)
+LD-PMTU at 3934032765 trigger probe_acked before (9, 65025, 65528, 0, true, None) after (9, 65276, 65528, 0, true, None)
+LD-PMTU at 4090443091 trigger probe_acked before (9, 65276, 65528, 0, true, None) after (9, 65402, 65528, 0, true, None)
+LD-PMTU at 3996810557 trigger probe_acked before (9, 65276, 65528, 0, true, None) after (9, 65402, 65528, 0, true, None)
+LD-PMTU at 4152969396 trigger probe_acked before (9, 65402, 65528, 0, true, None) after (9, 65465, 65528, 0, true, None)
+LD-PMTU at 4059296770 trigger probe_acked before (9, 65402, 65528, 0, true, None) after (9, 65465, 65528, 0, true, None)
+LD-PMTU at 4215728878 trigger probe_acked before (9, 65465, 65528, 0, true, None) after (9, 65496, 65528, 0, true, None)
+LD-PMTU at 4122033357 trigger probe_acked before (9, 65465, 65528, 0, true, None) after (9, 65496, 65528, 0, true, None)
+LD-PMTU at 4238563328 trigger probe_acked before (8, 65465, 65528, 0, true, None) after (8, 65496, 65528, 0, true, None)
+LD-PMTU at 4169053713 trigger pto fell false before (6, 1200, 65480, 0, true, None) after (6, 1200, 65480, 0, true, None)
+LD-LANE at 3335956620 holder 3991910119844571067 stream 22 bytes 4846 budget_ns 1000019631 took_ns 1000244016 answered false unanswered 1 path_before Some((130902, 530291, 1628387, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after None
+LD-WAIT at 4362135851 shard 0 waiters [(1517, 1004336968)] (position, age_ns) head Some(1518) durable Some(1516) whole_entry Some(0) head_placed true active_set_recorded true covers_candidates true recorded Some(2) recording None transition None owes_whole false owes_image false fenced None
+LD-WAIT at 4462711448 shard 0 waiters [(1517, 1104912565)] (position, age_ns) head Some(1518) durable Some(1516) whole_entry Some(0) head_placed true active_set_recorded true covers_candidates true recorded Some(2) recording None transition None owes_whole false owes_image false fenced None
+LD-WAIT at 4563243777 shard 0 waiters [(1517, 1205444894)] (position, age_ns) head Some(1518) durable Some(1516) whole_entry Some(0) head_placed true active_set_recorded true covers_candidates true recorded Some(2) recording None transition None owes_whole false owes_image false fenced None
+LD-WAIT at 4663813166 shard 0 waiters [(1517, 1306014283)] (position, age_ns) head Some(1518) durable Some(1516) whole_entry Some(0) head_placed true active_set_recorded true covers_candidates true recorded Some(2) recording None transition None owes_whole false owes_image false fenced None
+LD-WAIT at 4764417850 shard 0 waiters [(1517, 1406618967)] (position, age_ns) head Some(1518) durable Some(1516) whole_entry Some(0) head_placed true active_set_recorded true covers_candidates true recorded Some(2) recording None transition None owes_whole false owes_image false fenced None
+LD-WAIT at 4865041843 shard 0 waiters [(1517, 1507242960)] (position, age_ns) head Some(1518) durable Some(1516) whole_entry Some(0) head_placed true active_set_recorded true covers_candidates true recorded Some(2) recording None transition None owes_whole false owes_image false fenced None
+LD-WAIT at 4965637663 shard 0 waiters [(1517, 1607838780)] (position, age_ns) head Some(1518) durable Some(1516) whole_entry Some(0) head_placed true active_set_recorded true covers_candidates true recorded Some(2) recording None transition None owes_whole false owes_image false fenced None
+LD-WAIT at 5066280696 shard 0 waiters [(1517, 1708481813)] (position, age_ns) head Some(1518) durable Some(1516) whole_entry Some(0) head_placed true active_set_recorded true covers_candidates true recorded Some(2) recording None transition None owes_whole true owes_image false fenced None
+LD-WAIT at 5207946611 shard 0 waiters [(1517, 1850147728)] (position, age_ns) head Some(1519) durable Some(1516) whole_entry Some(1519) head_placed true active_set_recorded true covers_candidates true recorded Some(2) recording None transition None owes_whole false owes_image false fenced None
+LD-WAIT at 5309224934 shard 0 waiters [(1517, 1951426051)] (position, age_ns) head Some(1519) durable Some(1516) whole_entry Some(1519) head_placed true active_set_recorded true covers_candidates true recorded Some(2) recording None transition None owes_whole false owes_image false fenced None
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-17192 partitioned from 2.324557196s to 4.324756768s
+slates daemon: the control shard's beat task ran 2065 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 6050 steps and 6132 polls (3 long in a task, 0 blocked in the kernel, 1 preempted by the host, 4 unattributed), fired 11 timers, waited 59 times, spawned 8 tasks and finished 7; 14 tasks live; its longest poll is 9 ms and its timer overrun 0 ms
+slates-cluster: fleet: HostId(11727339590226714187) holds HostId(3991910119844571067) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:618:8
+slates-cluster: fleet: HostId(11727339590226714187) holds HostId(3991910119844571067) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:718:9
+slates-cluster: fleet: HostId(12352607336441940457) holds HostId(3991910119844571067) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:618:8
+slates-cluster: fleet: HostId(12352607336441940457) holds HostId(3991910119844571067) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:718:9
+LD-STUCK write sent at 2324ms, in flight 1079ms (at 3403ms):
+--- chaos-rolling-a-17192 (status exit 0; live Some([LiveState { holding: true, head: Some(43), durable: None, owed: false, epoch: Some(1), identity: Some("aa9353fa3e0915f696dc92c2076f241d538ceb30eb08b923f39832450357b8a8"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 12352607336441940457
+  fleet_host_epoch: 1
+  fleet_members: 11727339590226714187 12352607336441940457
+  fleet_held_records: 2
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 4
+  fleet_settled_generation: 2
+  fleet_neighbourhood_generation: 2
+  fleet_session 11727339590226714187: lent=false cwnd=130934 srtt_ns=903904 pto_ns=4735328 spurious_losses=0 persistent_collapses=0 consumed=3115 mtu=65496
+  shard 0 refused fleet.live.held: 4
+  shard 0 refused fleet.plane.announce_lends: 4
+  shard 0 refused fleet.plane.announcements_sent: 4
+  shard 0 refused fleet.seal.pair_served: 4
+  shard 0 live held a2bfe13923d69e4b000000000000004d head=43 durable=none owed=false epoch=1 identity=aa9353fa3e0915f696dc92c2076f241d538ceb30eb08b923f39832450357b8a8 fence=1 holders=none moving_to=none recorded=none
+--- chaos-rolling-b-17192 (status exit 0; live Some([LiveState { holding: true, head: Some(1516), durable: None, owed: false, epoch: Some(1), identity: Some("30084de285786dd2d2bf069754c035e4911ae3b44741cf6317159a6f89bdaf99"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 3991910119844571067
+  fleet_host_epoch: 1
+  fleet_members: 3991910119844571067 11727339590226714187 12352607336441940457
+  fleet_held_records: 2
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 8
+  fleet_settled_generation: 5
+  fleet_neighbourhood_generation: 5
+  fleet_retirement: host=12352607336441940457 version=5 survivors=[3991910119844571067 11727339590226714187] confirmed=[3991910119844571067] unconfirmed=[]
+  fleet_session 11727339590226714187: lent=false cwnd=130934 srtt_ns=774285 pto_ns=3158085 spurious_losses=0 persistent_collapses=0 consumed=5557 mtu=65496
+  shard 0 refused fleet.link.stale_return: 1
+  shard 0 refused fleet.live.held: 1517
+  shard 0 refused fleet.plane.announce_lends: 4
+  shard 0 refused fleet.plane.announcements_sent: 4
+  shard 0 refused fleet.report.sent: 3
+  shard 0 refused fleet.seal.pair_served: 4
+  shard 0 live held a2bfe13923d69e4b000000000000004d head=1516 durable=none owed=false epoch=1 identity=30084de285786dd2d2bf069754c035e4911ae3b44741cf6317159a6f89bdaf99 fence=1 holders=none moving_to=none recorded=none
+--- chaos-rolling-c-17192 (status exit 0; live Some([LiveState { holding: false, head: Some(1519), durable: Some(1516), owed: false, epoch: Some(1), identity: Some("e0c7aec7e56931b4699b7727db06e9c0a17b2d9bed961c7bf336f8cf87805122"), fence: 1, holders: ["3991910119844571067", "12352607336441940457"], moving_to: [], recorded: ["3991910119844571067", "12352607336441940457"] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 11727339590226714187
+  fleet_host_epoch: 1
+  fleet_members: 3991910119844571067 11727339590226714187 12352607336441940457
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 7
+  fleet_settled_generation: 5
+  fleet_neighbourhood_generation: 5
+  fleet_retirement: host=12352607336441940457 version=5 survivors=[3991910119844571067 11727339590226714187] confirmed=[] unconfirmed=[]
+  fleet_session 12352607336441940457: lent=true cwnd=66670 srtt_ns=20612682 pto_ns=91736782 spurious_losses=0 persistent_collapses=0 consumed=884 mtu=33364
+  shard 0 refused fleet.live.appended: 1520
+  shard 0 refused fleet.live.awaited: 1517
+  shard 0 refused fleet.live.durable: 1517
+  shard 0 refused fleet.live.held_back.placement: 1
+  shard 0 refused fleet.live.held_back.whole: 3
+  shard 0 refused fleet.live.holders_recorded: 1
+  shard 0 refused fleet.live.install_image: 2
+  shard 0 refused fleet.live.link_lost: 2
+  shard 0 refused fleet.live.no_session: 1088
+  shard 0 refused fleet.live.refused: 1
+  shard 0 refused fleet.live.refused.no_credit: 1
+  shard 0 refused fleet.live.resolved: 1516
+  shard 0 refused fleet.live.unanswered: 1087
+  shard 0 refused fleet.live.whole: 2
+  shard 0 refused fleet.plane.announce_lends: 5
+  shard 0 refused fleet.plane.announcements_sent: 5
+  shard 0 refused fleet.report.sent: 3
+  shard 0 refused fleet.seal.pair_served: 4
+  shard 0 refused fleet.ship.catalog.placed: 2
+  shard 0 refused fleet.ship.head.placed: 2
+  shard 0 live shipping a2bfe13923d69e4b000000000000004d head=1519 durable=1516 owed=false epoch=1 identity=e0c7aec7e56931b4699b7727db06e9c0a17b2d9bed961c7bf336f8cf87805122 fence=1 holders=3991910119844571067,12352607336441940457 moving_to=none recorded=3991910119844571067,12352607336441940457
+LD-END
+LD-WAIT at 5410547767 shard 0 waiters [(1517, 2052748884)] (position, age_ns) head Some(1519) durable Some(1516) whole_entry Some(1519) head_placed true active_set_recorded true covers_candidates true recorded Some(2) recording None transition None owes_whole false owes_image false fenced None
+LD-PMTU at 5522642698 trigger probe_acked before (9, 1200, 65528, 0, true, None) after (9, 33364, 65528, 0, true, None)
+LD-PMTU at 5594526513 trigger probe_acked before (10, 1200, 65528, 0, true, None) after (10, 33364, 65528, 0, true, None)
+LD-PMTU at 5595001120 trigger probe_acked before (10, 33364, 65528, 0, true, None) after (10, 49446, 65528, 0, true, None)
+LD-WAIT at 5511918516 shard 0 waiters [(1517, 2154119633)] (position, age_ns) head Some(1519) durable Some(1516) whole_entry Some(1519) head_placed true active_set_recorded true covers_candidates true recorded Some(2) recording None transition None owes_whole false owes_image false fenced None
+LD-PMTU at 5568120787 trigger probe_acked before (10, 1200, 65528, 0, true, None) after (10, 33364, 65528, 0, true, None)
+LD-PMTU at 5530217925 trigger probe_acked before (10, 1200, 65528, 0, true, None) after (10, 33364, 65528, 0, true, None)
+LD-PMTU at 5577363417 trigger probe_acked before (10, 33364, 65528, 0, true, None) after (10, 49446, 65528, 0, true, None)
+LD-PMTU at 5585866123 trigger probe_acked before (9, 33364, 65528, 0, true, None) after (9, 49446, 65528, 0, true, None)
+LD-PMTU at 5597722953 trigger probe_acked before (11, 1200, 65528, 0, true, None) after (11, 33364, 65528, 0, true, None)
+LD-PMTU at 5657901575 trigger probe_acked before (11, 1200, 65528, 0, true, None) after (11, 33364, 65528, 0, true, None)
+LD-PMTU at 5611074494 trigger probe_acked before (11, 33364, 65528, 0, true, None) after (11, 49446, 65528, 0, true, None)
+LD-PMTU at 5658369142 trigger probe_acked before (10, 49446, 65528, 0, true, None) after (10, 57487, 65528, 0, true, None)
+LD-WAIT at 5613328703 shard 0 waiters [(1517, 2255529820)] (position, age_ns) head Some(1519) durable Some(1516) whole_entry Some(1519) head_placed true active_set_recorded true covers_candidates true recorded Some(2) recording None transition None owes_whole false owes_image false fenced None
+LD-PMTU at 5617491138 trigger probe_acked before (10, 33364, 65528, 0, true, None) after (10, 49446, 65528, 0, true, None)
+LD-PMTU at LD-PMTU at 56658228995618932317 trigger probe_acked before  trigger probe_acked before ((1010, , 4944649446, , 6552865528, , 00, , truetrue, , NoneNone)) after  after ((1010, , 5748757487, , 6552865528, , 00, , truetrue, , NoneNone))
+
+LD-PMTU at 5666106023 trigger probe_acked before (10, 57487, 65528, 0, true, None) after (10, 61507, 65528, 0, true, None)
+LD-PMTU at 5620545979 trigger probe_acked before (10, 57487, 65528, 0, true, None) after (10, 61507, 65528, 0, true, None)
+LD-PMTU at 5667646666 trigger probe_acked before (10, 61507, 65528, 0, true, NoneLD-PMTU at )5620763276 after  trigger probe_acked before (10(, 1063517, , 6150765528, , 655280, , 0true, , trueNone, )None
+) after (10, 63517, 65528, 0, true, None)
+LD-PMTU at 5667835533 trigger probe_acked before (10, 63517, 65528, 0, true, None) after (10, 64522, 65528, 0, true, None)
+LD-PMTU at 5620970109 trigger probe_acked before (10, 63517, 65528, 0, true, None) after (10, 64522, 65528, 0, true, None)
+LD-PMTU at 5668079100 trigger probe_acked before (10, 64522, 65528, 0, true, None) after (10, 65025, 65528, 0, true, None)
+LD-PMTU at 5621219148 trigger probe_acked before (10, 64522, 65528, 0, true, None) after (10, 65025, 65528, 0, true, None)
+LD-PMTU at 5668293517 trigger probe_acked before (10, 65025, 65528, 0, true, None) after (10, 65276, 65528, 0, true, None)
+LD-PMTU at 5621438732 trigger probe_acked before (10, 65025, 65528, 0, true, None) after (10, 65276, 65528, 0, true, None)
+LD-PMTU at 5668520189 trigger probe_acked before (10, 65276, 65528, 0, true, None) after (10, 65402, 65528, 0, true, None)
+LD-PMTU at 5621716673 trigger probe_acked before (10, 65276, 65528, 0, true, None) after (10, 65402, 65528, 0, true, None)
+LD-PMTU at 5668792162 trigger probe_acked before (10, 65402, 65528, 0, true, None) after (10, 65465, 65528, 0, true, None)
+LD-PMTU at 5622049273 trigger probe_acked before (10, 65402, 65528, 0, true, None) after (10, 65465, 65528, 0, true, None)
+LD-PMTU at 5669142401 trigger probe_acked before (10, 65465, 65528, 0, true, None) after (10, 65496, 65528, 0, true, None)
+LD-PMTU at 5622336941 trigger probe_acked before (10, 65465, 65528, 0, true, None) after (10, 65496, 65528, 0, true, None)
+LD-SERVE at 5684022770 entry from 11727339590226714187 bytes 2767077 took_ns 3127492 gap_ns Some(17996430)
+LD-PMTU at 5744759433 trigger probe_acked before (11, 33364, 65528, 0, true, None) after (11, 49446, 65528, 0, true, None)
+LD-PMTU at 5698162496 trigger probe_acked before (11, 49446, 65528, 0, true, None) after (11, 57487, 65528, 0, true, None)
+LD-PMTU at 5700797806 trigger pto fell false before (11, 57487, 65528, 0, true, None) after (11, 57487, 65528, 1, true, None)
+LD-PMTU at 5705781328 trigger pto fell false before (11, 57487, 65528, 1, true, None) after (11, 57487, 65528, 2, true, None)
+LD-PMTU at 5660706234 trigger pto fell false before (10, 65496, 65512, 0, false, Some(605622393457)) after (10, 65496, 65512, 1, false, Some(605622393457))
+LD-PMTU at 5757283281 trigger pto fell false before (11, 49446, 65528, 0, true, None) after (11, 49446, 65528, 1, true, None)
+LD-PMTU at 5665386273 trigger pto fell false before (10, 65496, 65512, 0, false, Some(605622393457)) after (10, 65496, 65512, 1, false, Some(605622393457))
+LD-PMTU at 5712685666 trigger probe_acked before (9, 49446, 65528, 0, true, None) after (9, 57487, 65528, 0, true, None)
+LD-PMTU at 5670156801 trigger pto fell false before (10, 65496, 65512, 0, false, Some(605622393457)) after (10, 65496, 65512, 1, false, Some(605622393457))
+LD-PMTU at 5678223938 trigger pto fell false before (10, 65496, 65512, 0, false, Some(605622393457)) after (10, 65496, 65512, 1, false, Some(605622393457))
+LD-PMTU at 5782994664 trigger probe_acked before (10, 57487, 65528, 0, true, None) after (10, 61507, 65528, 0, true, None)
+LD-SERVE at 5732640998 entry from 11727339590226714187 bytes 6665415 took_ns 10782978 gap_ns Some(45490736)
+LD-PMTU at 5728378802 trigger pto fell false before (10, 65496, 65512, 0, false, Some(605622393457)) after (10, 65496, 65512, 1, false, Some(605622393457))
+LD-STUCK write sent at 2324ms, in flight 2145ms (at 4469ms):
+--- chaos-rolling-a-17192 (status exit 0; live Some([LiveState { holding: true, head: Some(43), durable: None, owed: false, epoch: Some(1), identity: Some("aa9353fa3e0915f696dc92c2076f241d538ceb30eb08b923f39832450357b8a8"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 12352607336441940457
+  fleet_host_epoch: 1
+  fleet_members: 3991910119844571067 11727339590226714187 12352607336441940457
+  fleet_held_records: 2
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 4
+  fleet_settled_generation: 2
+  fleet_neighbourhood_generation: 2
+  fleet_session 3991910119844571067: lent=false cwnd=66670 srtt_ns=2956798 pto_ns=12461074 spurious_losses=0 persistent_collapses=0 consumed=884 mtu=33364
+  fleet_session 11727339590226714187: lent=false cwnd=130934 srtt_ns=1385325 pto_ns=8110261 spurious_losses=0 persistent_collapses=0 consumed=3125 mtu=65496
+  shard 0 refused fleet.live.held: 4
+  shard 0 refused fleet.plane.announce_lends: 5
+  shard 0 refused fleet.plane.announcements_sent: 5
+  shard 0 refused fleet.seal.pair_served: 4
+  shard 0 live held a2bfe13923d69e4b000000000000004d head=43 durable=none owed=false epoch=1 identity=aa9353fa3e0915f696dc92c2076f241d538ceb30eb08b923f39832450357b8a8 fence=1 holders=none moving_to=none recorded=none
+--- chaos-rolling-b-17192 (status exit 0; live Some([LiveState { holding: true, head: Some(1520), durable: None, owed: false, epoch: Some(1), identity: Some("73832ec674fe38c251ed7c761a01d0f7b5da1713f09d9c6738b4338369b1c6e6"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 3991910119844571067
+  fleet_host_epoch: 1
+  fleet_members: 3991910119844571067 11727339590226714187 12352607336441940457
+  fleet_held_records: 2
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 8
+  fleet_settled_generation: 5
+  fleet_neighbourhood_generation: 5
+  fleet_retirement: host=12352607336441940457 version=5 survivors=[3991910119844571067 11727339590226714187] confirmed=[3991910119844571067] unconfirmed=[]
+  fleet_session 11727339590226714187: lent=false cwnd=130934 srtt_ns=654058 pto_ns=2272854 spurious_losses=0 persistent_collapses=0 consumed=5863 mtu=65496
+  fleet_session 12352607336441940457: lent=false cwnd=114916 srtt_ns=34652313 pto_ns=99453729 spurious_losses=0 persistent_collapses=0 consumed=1327 mtu=57487
+  shard 0 refused fleet.link.stale_return: 1
+  shard 0 refused fleet.live.held: 1520
+  shard 0 refused fleet.plane.announce_lends: 5
+  shard 0 refused fleet.plane.announcements_sent: 5
+  shard 0 refused fleet.report.sent: 3
+  shard 0 refused fleet.seal.pair_served: 4
+  shard 0 live held a2bfe13923d69e4b000000000000004d head=1519 durable=none owed=false epoch=1 identity=e0c7aec7e56931b4699b7727db06e9c0a17b2d9bed961c7bf336f8cf87805122 fence=1 holders=none moving_to=none recorded=none
+--- chaos-rolling-c-17192 (status exit 0; live Some([LiveState { holding: false, head: Some(1521), durable: Some(1520), owed: false, epoch: Some(1), identity: Some("ce7c3d01fedcdcf86286fec0179bf2aa96d8bd317154cde801904c9c1ca71a8a"), fence: 1, holders: ["3991910119844571067", "12352607336441940457"], moving_to: [], recorded: ["3991910119844571067", "12352607336441940457"] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 11727339590226714187
+  fleet_host_epoch: 1
+  fleet_members: 3991910119844571067 11727339590226714187 12352607336441940457
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 8
+  fleet_settled_generation: 5
+  fleet_neighbourhood_generation: 5
+  fleet_retirement: host=12352607336441940457 version=5 survivors=[3991910119844571067 11727339590226714187] confirmed=[3991910119844571067] unconfirmed=[]
+  fleet_session 3991910119844571067: lent=false cwnd=199345 srtt_ns=390006 pto_ns=1390006 spurious_losses=0 persistent_collapses=0 consumed=1080 mtu=65496
+  fleet_session 12352607336441940457: lent=true cwnd=66670 srtt_ns=20612682 pto_ns=91736782 spurious_losses=0 persistent_collapses=0 consumed=884 mtu=33364
+  shard 0 refused fleet.live.appended: 1521
+  shard 0 refused fleet.live.awaited: 1518
+  shard 0 refused fleet.live.durable: 1521
+  shard 0 refused fleet.live.held_back.placement: 1
+  shard 0 refused fleet.live.held_back.whole: 8
+  shard 0 refused fleet.live.holders_recorded: 1
+  shard 0 refused fleet.live.install_image: 2
+  shard 0 refused fleet.live.link_lost: 2
+  shard 0 refused fleet.live.no_session: 1090
+  shard 0 refused fleet.live.refused: 1
+  shard 0 refused fleet.live.refused.no_credit: 1
+  shard 0 refused fleet.live.resolved: 1518
+  shard 0 refused fleet.live.unanswered: 1089
+  shard 0 refused fleet.live.whole: 2
+  shard 0 refused fleet.plane.announce_lends: 6
+  shard 0 refused fleet.plane.announcements_sent: 6
+  shard 0 refused fleet.report.sent: 3
+  shard 0 refused fleet.seal.pair_served: 4
+  shard 0 refused fleet.ship.catalog.placed: 2
+  shard 0 refused fleet.ship.head.placed: 2
+  shard 0 live shipping a2bfe13923d69e4b000000000000004d head=1520 durable=1520 owed=false epoch=1 identity=73832ec674fe38c251ed7c761a01d0f7b5da1713f09d9c6738b4338369b1c6e6 fence=1 holders=3991910119844571067,12352607336441940457 moving_to=none recorded=3991910119844571067,12352607336441940457
+LD-END
+LD-PMTU at 5857478320 trigger probe_acked before (11, 49446, 65528, 1, true, None) after (11, 57487, 65528, 0, true, None)
+LD-PMTU at 5810773518 trigger probe_acked before (11, 57487, 65528, 2, true, None) after (11, 61507, 65528, 0, true, None)
+LD-PMTU at 5783020390 trigger pto fell false before (10, 65496, 65512, 0, false, Some(605622393457)) after (10, 65496, 65512, 1, false, Some(605622393457))
+LD-PMTU at 5844146187 trigger probe_acked before (9, 57487, 65528, 0, true, None) after (9, 61507, 65528, 0, true, None)
+LD-PMTU at 5800671333 trigger pto fell false before (10, 65496, 65512, 0, false, Some(605622393457)) after (10, 65496, 65512, 1, false, Some(605622393457))
+LD-PMTU at 5908179298 trigger probe_acked before (10, 61507, 65528, 0, true, None) after (10, 63517, 65528, 0, true, None)
+LD-PMTU at 5817411467 trigger pto fell false before (10, 65496, 65512, 0, false, Some(605622393457)) after (10, 65496, 65512, 1, false, Some(605622393457))
+LD-PMTU at 5958112186 trigger probe_acked before (11, 57487, 65528, 0, true, None) after (11, 61507, 65528, 0, true, None)
+LD-PMTU at 5912400186 trigger probe_acked before (11, 61507, 65528, 0, true, None) after (11, 63517, 65528, 0, true, None)
+LD-LANE at 3559481496 holder 12352607336441940457 stream 23 bytes 4254661 budget_ns 2315433841 took_ns 2316293970 answered false unanswered 1 path_before Some((66670, 20612682, 91736782, Some(33364), 0, 0, Some((2, 1, 0, 0)))) path_after None
+chaos slow write chaos-1516 sent 2.324985846s took 2.361898321s refused None: 187 samples
+      1.829s chaos-rolling-c-17192 shipping head=Some(1284) durable=Some(1283) owed=false epoch=Some(1) fence=1
+      1.838s chaos-rolling-b-17192 held head=Some(1286) durable=None owed=false epoch=Some(1) fence=1
+      1.852s chaos-rolling-c-17192 shipping head=Some(1296) durable=Some(1295) owed=false epoch=Some(1) fence=1
+      1.861s chaos-rolling-b-17192 held head=Some(1299) durable=None owed=false epoch=Some(1) fence=1
+      1.876s chaos-rolling-c-17192 shipping head=Some(1309) durable=Some(1308) owed=false epoch=Some(1) fence=1
+      1.883s chaos-rolling-b-17192 held head=Some(1312) durable=None owed=false epoch=Some(1) fence=1
+      1.900s chaos-rolling-c-17192 shipping head=Some(1321) durable=Some(1320) owed=false epoch=Some(1) fence=1
+      1.912s chaos-rolling-b-17192 held head=Some(1326) durable=None owed=false epoch=Some(1) fence=1
+      1.923s chaos-rolling-c-17192 shipping head=Some(1334) durable=Some(1333) owed=false epoch=Some(1) fence=1
+      1.934s chaos-rolling-b-17192 held head=Some(1339) durable=None owed=false epoch=Some(1) fence=1
+      1.947s chaos-rolling-c-17192 shipping head=Some(1345) durable=Some(1344) owed=false epoch=Some(1) fence=1
+      1.957s chaos-rolling-b-17192 held head=Some(1350) durable=None owed=false epoch=Some(1) fence=1
+      1.970s chaos-rolling-c-17192 shipping head=Some(1358) durable=Some(1358) owed=false epoch=Some(1) fence=1
+      1.980s chaos-rolling-b-17192 held head=Some(1363) durable=None owed=false epoch=Some(1) fence=1
+      1.994s chaos-rolling-c-17192 shipping head=Some(1372) durable=Some(1372) owed=false epoch=Some(1) fence=1
+      2.002s chaos-rolling-b-17192 held head=Some(1376) durable=None owed=false epoch=Some(1) fence=1
+      2.017s chaos-rolling-c-17192 shipping head=Some(1378) durable=Some(1376) owed=false epoch=Some(1) fence=1
+      2.025s chaos-rolling-b-17192 held head=Some(1376) durable=None owed=false epoch=Some(1) fence=1
+      2.048s chaos-rolling-b-17192 held head=Some(1378) durable=None owed=false epoch=Some(1) fence=1
+      2.049s chaos-rolling-c-17192 shipping head=Some(1381) durable=Some(1380) owed=false epoch=Some(1) fence=1
+      2.074s chaos-rolling-b-17192 held head=Some(1392) durable=None owed=false epoch=Some(1) fence=1
+      2.077s chaos-rolling-c-17192 shipping head=Some(1392) durable=Some(1391) owed=false epoch=Some(1) fence=1
+      2.100s chaos-rolling-c-17192 shipping head=Some(1404) durable=Some(1403) owed=false epoch=Some(1) fence=1
+      2.102s chaos-rolling-b-17192 held head=Some(1404) durable=None owed=false epoch=Some(1) fence=1
+      2.123s chaos-rolling-c-17192 shipping head=Some(1416) durable=Some(1415) owed=false epoch=Some(1) fence=1
+      2.128s chaos-rolling-b-17192 held head=Some(1418) durable=None owed=false epoch=Some(1) fence=1
+      2.147s chaos-rolling-c-17192 shipping head=Some(1428) durable=Some(1427) owed=false epoch=Some(1) fence=1
+      2.156s chaos-rolling-b-17192 held head=Some(1433) durable=None owed=false epoch=Some(1) fence=1
+      2.170s chaos-rolling-c-17192 shipping head=Some(1440) durable=Some(1440) owed=false epoch=Some(1) fence=1
+      2.179s chaos-rolling-b-17192 held head=Some(1445) durable=None owed=false epoch=Some(1) fence=1
+      2.195s chaos-rolling-c-17192 shipping head=Some(1454) durable=Some(1453) owed=false epoch=Some(1) fence=1
+      2.206s chaos-rolling-b-17192 held head=Some(1459) durable=None owed=false epoch=Some(1) fence=1
+      2.218s chaos-rolling-c-17192 shipping head=Some(1467) durable=Some(1466) owed=false epoch=Some(1) fence=1
+      2.229s chaos-rolling-b-17192 held head=Some(1473) durable=None owed=false epoch=Some(1) fence=1
+      2.243s chaos-rolling-c-17192 shipping head=Some(1479) durable=Some(1478) owed=false epoch=Some(1) fence=1
+      2.252s chaos-rolling-b-17192 held head=Some(1485) durable=None owed=false epoch=Some(1) fence=1
+      2.260s chaos-rolling-a-17192 held head=Some(43) durable=None owed=false epoch=Some(1) fence=1
+      2.266s chaos-rolling-c-17192 shipping head=Some(1491) durable=Some(1490) owed=false epoch=Some(1) fence=1
+      2.281s chaos-rolling-b-17192 held head=Some(1497) durable=None owed=false epoch=Some(1) fence=1
+      2.291s chaos-rolling-c-17192 shipping head=Some(1502) durable=Some(1501) owed=false epoch=Some(1) fence=1
+      2.309s chaos-rolling-b-17192 held head=Some(1511) durable=None owed=false epoch=Some(1) fence=1
+      2.316s chaos-rolling-c-17192 shipping head=Some(1513) durable=Some(1513) owed=false epoch=Some(1) fence=1
+      2.336s chaos-rolling-b-17192 held head=Some(1516) durable=None owed=false epoch=Some(1) fence=1
+      2.340s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.366s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.380s chaos-rolling-a-17192 held head=Some(43) durable=None owed=false epoch=Some(1) fence=1
+      2.389s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.414s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.437s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.460s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.483s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.506s chaos-rolling-a-17192 held head=Some(43) durable=None owed=false epoch=Some(1) fence=1
+      2.517s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.540s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.563s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.586s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.609s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.633s chaos-rolling-a-17192 held head=Some(43) durable=None owed=false epoch=Some(1) fence=1
+      2.634s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.657s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.680s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.707s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.730s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.758s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.758s chaos-rolling-a-17192 held head=Some(43) durable=None owed=false epoch=Some(1) fence=1
+      2.781s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.807s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.830s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.855s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.877s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.882s chaos-rolling-a-17192 held head=Some(43) durable=None owed=false epoch=Some(1) fence=1
+      2.903s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.926s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.951s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.974s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      2.999s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.007s chaos-rolling-a-17192 held head=Some(43) durable=None owed=false epoch=Some(1) fence=1
+      3.022s chaos-rolling-c-17192 shipping head=Some(1517) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.045s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.068s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.092s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.115s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.132s chaos-rolling-a-17192 held head=Some(43) durable=None owed=false epoch=Some(1) fence=1
+      3.140s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.163s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.187s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.210s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.235s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.257s chaos-rolling-a-17192 held head=Some(43) durable=None owed=false epoch=Some(1) fence=1
+      3.260s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.285s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.307s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.333s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.355s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.381s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.384s chaos-rolling-a-17192 held head=Some(43) durable=None owed=false epoch=Some(1) fence=1
+      3.403s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.426s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.449s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.475s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.497s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.510s chaos-rolling-a-17192 held head=Some(43) durable=None owed=false epoch=Some(1) fence=1
+      3.523s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.546s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.570s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.593s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.618s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.635s chaos-rolling-a-17192 held head=Some(43) durable=None owed=false epoch=Some(1) fence=1
+      3.640s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.666s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.689s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.714s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.737s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.760s chaos-rolling-a-17192 held head=Some(43) durable=None owed=false epoch=Some(1) fence=1
+      3.763s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.791s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.814s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.837s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.860s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.883s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.884s chaos-rolling-a-17192 held head=Some(43) durable=None owed=false epoch=Some(1) fence=1
+      3.906s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.929s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.952s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.975s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      3.998s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      4.009s chaos-rolling-a-17192 held head=Some(43) durable=None owed=false epoch=Some(1) fence=1
+      4.021s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      4.045s chaos-rolling-c-17192 shipping head=Some(1518) durable=Some(1516) owed=true epoch=Some(1) fence=1
+      4.070s chaos-rolling-c-17192 shipping head=Some(1519) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      4.120s chaos-rolling-c-17192 shipping head=Some(1519) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      4.135s chaos-rolling-a-17192 held head=Some(43) durable=None owed=false epoch=Some(1) fence=1
+      4.143s chaos-rolling-c-17192 shipping head=Some(1519) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      4.166s chaos-rolling-c-17192 shipping head=Some(1519) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      4.189s chaos-rolling-c-17192 shipping head=Some(1519) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      4.212s chaos-rolling-c-17192 shipping head=Some(1519) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      4.235s chaos-rolling-c-17192 shipping head=Some(1519) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      4.259s chaos-rolling-c-17192 shipping head=Some(1519) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      4.260s chaos-rolling-a-17192 held head=Some(43) durable=None owed=false epoch=Some(1) fence=1
+      4.282s chaos-rolling-c-17192 shipping head=Some(1519) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      4.307s chaos-rolling-c-17192 shipping head=Some(1519) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      4.330s chaos-rolling-c-17192 shipping head=Some(1519) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      4.360s chaos-rolling-c-17192 shipping head=Some(1519) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      4.365s chaos-rolling-b-17192 held head=Some(1516) durable=None owed=false epoch=Some(1) fence=1
+      4.385s chaos-rolling-c-17192 shipping head=Some(1519) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      4.390s chaos-rolling-b-17192 held head=Some(1516) durable=None owed=false epoch=Some(1) fence=1
+      4.397s chaos-rolling-a-17192 held head=Some(43) durable=None owed=false epoch=Some(1) fence=1
+      4.408s chaos-rolling-c-17192 shipping head=Some(1519) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      4.415s chaos-rolling-b-17192 held head=Some(1516) durable=None owed=false epoch=Some(1) fence=1
+      4.432s chaos-rolling-c-17192 shipping head=Some(1519) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      4.438s chaos-rolling-b-17192 held head=Some(1516) durable=None owed=false epoch=Some(1) fence=1
+      4.455s chaos-rolling-c-17192 shipping head=Some(1519) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      4.464s chaos-rolling-b-17192 held head=Some(1516) durable=None owed=false epoch=Some(1) fence=1
+      4.479s chaos-rolling-c-17192 shipping head=Some(1519) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      4.487s chaos-rolling-b-17192 held head=Some(1516) durable=None owed=false epoch=Some(1) fence=1
+      4.503s chaos-rolling-c-17192 shipping head=Some(1519) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      4.512s chaos-rolling-b-17192 held head=Some(1516) durable=None owed=false epoch=Some(1) fence=1
+      4.515s chaos-rolling-a-17192 held head=Some(43) durable=None owed=false epoch=Some(1) fence=1
+      4.532s chaos-rolling-c-17192 shipping head=Some(1519) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      4.534s chaos-rolling-b-17192 held head=Some(1516) durable=None owed=false epoch=Some(1) fence=1
+      4.556s chaos-rolling-c-17192 shipping head=Some(1519) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      4.562s chaos-rolling-b-17192 held head=Some(1516) durable=None owed=false epoch=Some(1) fence=1
+      4.583s chaos-rolling-c-17192 shipping head=Some(1519) durable=Some(1516) owed=false epoch=Some(1) fence=1
+      4.589s chaos-rolling-b-17192 held head=Some(1516) durable=None owed=false epoch=Some(1) fence=1
+      4.607s chaos-rolling-c-17192 shipping head=Some(1519) durable=Some(1517) owed=false epoch=Some(1) fence=1
+      4.615s chaos-rolling-b-17192 held head=Some(1517) durable=None owed=false epoch=Some(1) fence=1
+      4.638s chaos-rolling-c-17192 shipping head=Some(1519) durable=Some(1518) owed=false epoch=Some(1) fence=1
+      4.639s chaos-rolling-a-17192 held head=Some(43) durable=None owed=false epoch=Some(1) fence=1
+      4.643s chaos-rolling-b-17192 held head=Some(1518) durable=None owed=false epoch=Some(1) fence=1
+      4.663s chaos-rolling-c-17192 shipping head=Some(1519) durable=Some(1518) owed=false epoch=Some(1) fence=1
+      4.669s chaos-rolling-b-17192 held head=Some(1518) durable=None owed=false epoch=Some(1) fence=1
+      4.690s chaos-rolling-c-17192 shipping head=Some(1520) durable=Some(1520) owed=false epoch=Some(1) fence=1
+      4.714s chaos-rolling-b-17192 held head=Some(1520) durable=None owed=false epoch=Some(1) fence=1
+      4.716s chaos-rolling-c-17192 shipping head=Some(1521) durable=Some(1521) owed=false epoch=Some(1) fence=1
+      4.740s chaos-rolling-b-17192 held head=Some(1524) durable=None owed=false epoch=Some(1) fence=1
+      4.744s chaos-rolling-c-17192 shipping head=Some(1524) durable=Some(1524) owed=false epoch=Some(1) fence=1
+      4.762s chaos-rolling-a-17192 held head=Some(43) durable=None owed=false epoch=Some(1) fence=1
+      4.770s chaos-rolling-c-17192 shipping head=Some(1529) durable=Some(1528) owed=false epoch=Some(1) fence=1
+      4.773s chaos-rolling-b-17192 held head=Some(1530) durable=None owed=false epoch=Some(1) fence=1
+      4.795s chaos-rolling-c-17192 shipping head=Some(1540) durable=Some(1540) owed=false epoch=Some(1) fence=1
+      4.799s chaos-rolling-b-17192 held head=Some(1541) durable=None owed=false epoch=Some(1) fence=1
+      4.819s chaos-rolling-c-17192 shipping head=Some(1549) durable=Some(1548) owed=false epoch=Some(1) fence=1
+      4.828s chaos-rolling-b-17192 held head=Some(1549) durable=None owed=false epoch=Some(1) fence=1
+      4.844s chaos-rolling-c-17192 shipping head=Some(1553) durable=Some(1553) owed=false epoch=Some(1) fence=1
+      4.853s chaos-rolling-b-17192 held head=Some(1558) durable=None owed=false epoch=Some(1) fence=1
+      4.870s chaos-rolling-c-17192 shipping head=Some(1560) durable=Some(1560) owed=false epoch=Some(1) fence=1
+      4.880s chaos-rolling-b-17192 held head=Some(1560) durable=None owed=false epoch=Some(1) fence=1
+chaos candidates partitioned in turn mid-stream: 1558 writes, 1558 acknowledged: p50 1220 us, p99 6209 us, p999 121218 us, max 2361898 us; 2 over 50ms (sent+took): 0.00s+121ms 2.32s+2362ms
+LD-PMTU at 6061958833 trigger probe_acked before (9, 61507, 65528, 0, true, None) after (9, 63517, 65528, 0, true, None)
+LD-PMTU at 6159403426 trigger probe_acked before (10, 63517, 65528, 0, true, None) after (10, 64522, 65528, 0, true, None)
+LD-PMTU at 6170807568 trigger probe_acked before (11, 61507, 65528, 0, true, None) after (11, 63517, 65528, 0, true, None)
+LD-PMTU at 6124023571 trigger probe_acked before (11, 63517, 65528, 0, true, None) after (11, 64522, 65528, 0, true, None)
+LD-PMTU at 6223156606 trigger probe_acked before (12, 1200, 65528, 0, true, None) after (12, 33364, 65528, 0, true, None)
+LD-PMTU at 6134945131 trigger probe_acked before (11, 1200, 65528, 0, true, None) after (11, 33364, 65528, 0, true, None)
+LD-PMTU at LD-PMTU at 62840492146190158099 trigger probe_acked before  trigger probe_acked before ((1211, , 3336433364, , 6552865528, , 00, , truetrue, , NoneNone) after )( after 12(, 1149446, , 4944665528, 65528, , 00, , truetrue, , NoneNone))
+
+LD-PMTU at 6284286453 trigger probe_acked before (12, 49446, 65528, 0, LD-PMTU at true6190400649,  trigger probe_acked before None()11 after , (4944612, , 6552857487, , 065528, , true0, , Nonetrue),  after None()11
+, 57487, 65528, 0, true, None)
+LD-PMTU at 6284477896 trigger probe_acked before (12, 57487, 65528, 0, true, None) after (12, 61507, 65528, LD-PMTU at 06190601011,  trigger probe_acked before true(, 11None, )57487
+, 65528, 0, true, None) after (11, 61507, 65528, 0, true, None)
+LD-PMTU at 6284668402 trigger probe_acked before (12, 61507, 65528, 0, true, None) after (12, 63517, 65528, 0, true, None)
+LD-PMTU at 6190822604 trigger probe_acked before (11, 61507, 65528, 0, true, None) after (11, 63517, 65528, 0, true, None)
+LD-PMTU at 6284922152 trigger probe_acked before (12, 63517, 65528, 0, true, None) after (12, 64522, 65528, 0, true, None)
+LD-PMTU at 6191104320 trigger probe_acked before (11, 63517, 65528, 0, true, None) after (11, 64522, 65528, 0, true, None)
+LD-PMTU at 6285178214 trigger probe_acked before (12, 64522, 65528, 0, true, None) after (12, 65025, 65528, 0, true, None)
+LD-PMTU at 6191353446 trigger probe_acked before (11, 64522, 65528, 0, true, None) after (11, 65025, 65528, 0, true, None)
+LD-PMTU at LD-PMTU at 62855185426191624427 trigger probe_acked before  trigger probe_acked before ((1211, , 6502565025, , 6552865528, , 00, , truetrue, , NoneNone)) after  after ((1211, , 6527665276, , 6552865528, , 00, , truetrue, , NoneNone))
+
+LD-PMTU at LD-PMTU at 6191930638 trigger probe_acked before 6285827112( trigger probe_acked before 11(, 1265276, , 6527665528, , 655280, , 0true, , trueNone, )None after )( after 11(, 1265402, , 6540265528, , 655280, 0, , truetrue, , NoneNone))
+
+LD-PMTU at 6286258994 trigger probe_acked before (12, 65402, 65528, 0, true, None) after (12, 65465, LD-PMTU at 655286192382726,  trigger probe_acked before 0(, 11true, , 65402None, )65528
+, 0, true, None) after (11, 65465, 65528, 0, true, None)
+LD-PMTU at 6286551957 trigger probe_acked before (LD-PMTU at 126192661418,  trigger probe_acked before (6546511, , 6552865465, , 065528, , true0, , Nonetrue),  after None()12 after , (6549611, , 6552865496, , 065528, , true0, , Nonetrue), 
+None)
+LD-PMTU at 6195676165 trigger pto fell false before (11, 65496, 65512, 0, false, Some(606192750996)) after (11, 65496, 65512, 1, false, Some(606192750996))
+LD-PMTU at 6198885707 trigger pto fell false before (11, 65496, 65512, 1, false, Some(606192750996)) after (11, 65496, 65512, 2, false, Some(606192750996))
+LD-PMTU at 6204098739 trigger pto fell true before (11, 65496, 65512, 2, false, Some(606192750996)) after (11, 1200, 65496, 0, true, None)
+LD-PMTU at 6213948004 trigger pto fell false before (11, 1200, 65496, 0, true, None) after (11, 1200, 65496, 0, true, None)
+LD-PMTU at 6233533142 trigger pto fell false before (11, 1200, 65496, 0, true, None) after (11, 1200, 65496, 0, true, None)
+LD-PMTU at 6253580423 trigger probe_acked before (11, 1200, 65496, 0, true, None) after (11, 33348, 65496, 0, true, None)
+LD-PMTU at 6315508093 trigger probe_acked before (11, 33348, 65496, 0, true, None) after (11, 49422, 65496, 0, true, None)
+LD-PMTU at 6378344859 trigger probe_acked before (11, 49422, 65496, 0, true, None) after (11, 57459, 65496, 0, true, None)
+LD-PMTU at 6378624007 trigger probe_acked before (11, 57459, 65496, 0, true, None) after (11, 61477, 65496, 0, true, None)
+LD-PMTU at 6378864934 trigger probe_acked before (11, 61477, 65496, 0, true, None) after (11, 63486, 65496, 0, true, None)
+LD-PMTU at 6379073536 trigger probe_acked before (11, 63486, 65496, 0, true, None) after (11, 64491, 65496, 0, true, None)
+LD-PMTU at 6379283817 trigger probe_acked before (11, 64491, 65496, 0, true, None) after (11, 64993, 65496, 0, true, None)
+LD-PMTU at 6379487674 trigger probe_acked before (11, 64993, 65496, 0, true, None) after (11, 65244, 65496, 0, true, None)
+LD-PMTU at 6379701627 trigger probe_acked before (11, 65244, 65496, 0, true, None) after (11, 65370, 65496, 0, true, None)
+LD-PMTU at 6379895294 trigger probe_acked before (11, 65370, 65496, 0, true, None) after (11, 65433, 65496, 0, true, None)
+LD-PMTU at 6380136869 trigger probe_acked before (11, 65433, 65496, 0, true, None) after (11, 65464, 65496, 0, true, None)
+LD-PMTU at 6380400338 trigger probe_acked before (11, 65464, 65496, 0, true, None) after (11, 65480, 65496, 0, false, Some(606380400338))
+LD-PMTU at 6391588452 trigger pto fell false before (11, 65480, 65496, 0, false, Some(606380400338)) after (11, 65480, 65496, 1, false, Some(606380400338))
+LD-PMTU at 6414170123 trigger pto fell false before (11, 65480, 65496, 1, false, Some(606380400338)) after (11, 65480, 65496, 2, false, Some(606380400338))
+LD-PMTU at 6513934670 trigger probe_acked before (9, 63517, 65528, 0, true, None) after (9, 64522, 65528, 0, true, None)
+LD-PMTU at 6571081679 trigger probe_acked before (11, 63517, 65528, 0, true, None) after (11, 64522, 65528, 0, true, None)
+LD-PMTU at 6524290595 trigger probe_acked before (11, 64522, 65528, 0, true, None) after (11, 65025, 65528, 0, true, None)
+LD-PMTU at 6597990212 trigger probe_acked before (10, 64522, 65528, 0, true, None) after (10, 65025, 65528, 0, true, None)
+LD-PMTU at 6636402372 trigger probe_acked before (9, 64522, 65528, 0, true, None) after (9, 65025, 65528, 0, true, None)
+LD-PMTU at 6723260588 trigger probe_acked before (10, 65025, 65528, 0, true, None) after (10, 65276, 65528, 0, true, None)
+LD-PMTU at 6779332982 trigger probe_acked before (9, 65025, 65528, 0, true, None) after (9, 65276, 65528, 0, true, None)
+LD-PMTU at 6848701289 trigger probe_acked before (10, 65276, 65528, 0, true, None) after (10, 65402, 65528, 0, true, None)
+LD-PMTU at 6902619090 trigger probe_acked before (9, 65276, 65528, 0, true, None) after (9, 65402, 65528, 0, true, None)
+LD-PMTU at 6973991359 trigger probe_acked before (10, 65402, 65528, 0, true, None) after (10, 65465, 65528, 0, true, None)
+LD-PMTU at 7028424500 trigger probe_acked before (9, 65402, 65528, 0, true, None) after (9, 65465, 65528, 0, true, None)
+LD-PMTU at 7099476288 trigger probe_acked before (10, 65465, 65528, 0, true, None) after (10, 65496, 65528, 0, true, None)
+LD-SERVE at 7118302894 entry from 11727339590226714187 bytes 179557 took_ns 153925 gap_ns Some(1200765390)
+LD-PMTU at 7153505354 trigger probe_acked before (9, 65465, 65528, 0, true, None) after (9, 65496, 65528, 0, true, None)
+LD-PMTU at 7371388293 trigger probe_acked before (11, 64522, 65528, 0, true, None) after (11, 65025, 65528, 0, true, None)
+LD-PMTU at 7324612031 trigger probe_acked before (11, 65025, 65528, 0, true, None) after (11, 65276, 65528, 0, true, None)
+LD-SERVE at 7663055295 install from 11727339590226714187 bytes 6665424 took_ns 3352643 gap_ns Some(6328237238)
+LD-LANE at 6132625774 holder 12352607336441940457 stream 23 bytes 6665424 budget_ns 28945308668 took_ns 1440673962 answered true unanswered 0 path_before Some((11710, 49095086, 187781498, Some(1200), 0, 0, Some((1, 0, 0, 0)))) path_after Some((130902, 20221491, 136395759, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 7913656011 entry from 11727339590226714187 bytes 4846 took_ns 20070 gap_ns Some(125380537)
+LD-LANE at 7694511198 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1000907588 took_ns 125369225 answered true unanswered 0 path_before Some((130902, 24516129, 150339061, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 33444161, 166083421, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 8101928277 entry from 11727339590226714187 bytes 4846 took_ns 18151 gap_ns Some(125302518)
+LD-LANE at 7882845180 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1001201623 took_ns 125365786 answered true unanswered 0 path_before Some((130902, 32458707, 165966007, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 39539913, 163836049, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 8227266273 entry from 11727339590226714187 bytes 4846 took_ns 17718 gap_ns Some(125319845)
+LD-LANE at 8008349996 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1001463769 took_ns 125161952 answered true unanswered 0 path_before Some((130902, 39539913, 163836049, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 44926978, 152168510, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-PMTU at 8271689362 trigger probe_acked before (11, 65025, 65528, 0, true, None) after (11, 65276, 65528, 0, true, None)
+LD-PMTU at 8224942195 trigger probe_acked before (11, 65276, 65528, 0, true, None) after (11, 65402, 65528, 0, true, None)
+LD-SERVE at 8352575606 entry from 11727339590226714187 bytes 4846 took_ns 18175 gap_ns Some(125291615)
+LD-LANE at 8133638211 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1001663199 took_ns 125172943 answered true unanswered 0 path_before Some((130902, 44926978, 152168510, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 49052719, 138055263, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 8477953703 entry from 11727339590226714187 bytes 4846 took_ns 17486 gap_ns Some(125359922)
+LD-LANE at 8258944288 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1001815934 took_ns 125236851 answered true unanswered 0 path_before Some((130902, 49052719, 138055263, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 52219809, 124318545, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 8603320768 entry from 11727339590226714187 bytes 4846 took_ns 16647 gap_ns Some(125349579)
+LD-LANE at 8384310338 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1001933180 took_ns 125233363 answered true unanswered 0 path_before Some((130902, 52219809, 124318545, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 54646408, 112112760, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 8728698265 entry from 11727339590226714187 bytes 4846 took_ns 16686 gap_ns Some(125360850)
+LD-LANE at 8509672516 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002023013 took_ns 125264368 answered true unanswered 0 path_before Some((130902, 54646408, 112112760, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 56506868, 101811688, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 8854034172 entry from 11727339590226714187 bytes 4846 took_ns 16767 gap_ns Some(125319221)
+LD-LANE at 8635086594 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002091887 took_ns 125183790 answered true unanswered 0 path_before Some((130902, 56506868, 101811688, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 57920327, 93287171, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 8979379551 entry from 11727339590226714187 bytes 4846 took_ns 17223 gap_ns Some(125328612)
+LD-LANE at 8760386928 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002144214 took_ns 125214484 answered true unanswered 0 path_before Some((130902, 57920327, 93287171, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 59008136, 86518860, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 9104758103 entry from 11727339590226714187 bytes 4846 took_ns 17991 gap_ns Some(125361329)
+LD-LANE at 8885725475 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002184484 took_ns 125287223 answered true unanswered 0 path_before Some((130902, 59008136, 86518860, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 59846729, 81225373, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-PMTU at 9172040460 trigger probe_acked before (11, 65276, 65528, 0, true, None) after (11, 65402, 65528, 0, true, None)
+LD-PMTU at 9125251023 trigger probe_acked before (11, 65402, 65528, 0, true, None) after (11, 65465, 65528, 0, true, None)
+LD-SERVE at 9230165190 entry from 11727339590226714187 bytes 4846 took_ns 17255 gap_ns Some(125389096)
+LD-LANE at 9011136249 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002215529 took_ns 125289447 answered true unanswered 0 path_before Some((130902, 59846729, 81225373, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 60488299, 77042095, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 9355431894 entry from 11727339590226714187 bytes 4846 took_ns 17399 gap_ns Some(125249449)
+LD-LANE at 9136545120 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002239280 took_ns 125097836 answered true unanswered 0 path_before Some((130902, 60488299, 77042095, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 60967765, 73695749, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 9480832589 entry from 11727339590226714187 bytes 4846 took_ns 20143 gap_ns Some(125383296)
+LD-LANE at 9261757980 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002257030 took_ns 125365793 answered true unanswered 0 path_before Some((130902, 60967765, 73695749, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 61340054, 71142306, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 9606195927 entry from 11727339590226714187 bytes 4846 took_ns 16959 gap_ns Some(125343195)
+LD-LANE at 9387254844 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002270812 took_ns 125161168 answered true unanswered 0 path_before Some((130902, 61340054, 71142306, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 61620285, 69165157, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 9731614077 entry from 11727339590226714187 bytes 4846 took_ns 22710 gap_ns Some(125401191)
+LD-LANE at 9512538939 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002281186 took_ns 125307446 answered true unanswered 0 path_before Some((130902, 61620285, 69165157, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 61846199, 67742183, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 9982237911 entry from 11727339590226714187 bytes 4846 took_ns 19583 gap_ns Some(125164839)
+LD-LANE at 9763279869 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1001816242 took_ns 125184671 answered true unanswered 0 path_before Some((130902, 49061044, 142189900, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 52220239, 126587595, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-PMTU at 10072363031 trigger probe_acked before (11, 65402, 65528, 0, true, None) after (11, 65465, 65528, 0, true, None)
+LD-PMTU at 10025580107 trigger probe_acked before (11, 65465, 65528, 0, true, None) after (11, 65496, 65528, 0, true, None)
+LD-SERVE at 10107652733 entry from 11727339590226714187 bytes 4846 took_ns 17479 gap_ns Some(125395239)
+LD-LANE at 9888584075 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1001933196 took_ns 125291807 answered true unanswered 0 path_before Some((130902, 52220239, 126587595, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 54652137, 113426881, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 10232947236 entry from 11727339590226714187 bytes 4846 took_ns 18430 gap_ns Some(125277024)
+LD-LANE at 10014002201 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002023225 took_ns 125173639 answered true unanswered 0 path_before Some((130902, 54652137, 113426881, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 56500412, 102462468, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 10358289391 entry from 11727339590226714187 bytes 4846 took_ns 18302 gap_ns Some(125323725)
+LD-LANE at 10139292528 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002091648 took_ns 125233498 answered true unanswered 0 path_before Some((130902, 56500412, 102462468, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 57919998, 93681286, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 10483672623 entry from 11727339590226714187 bytes 4846 took_ns 18095 gap_ns Some(125364930)
+LD-LANE at 10264644266 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002144201 took_ns 125268264 answered true unanswered 0 path_before Some((130902, 57919998, 93681286, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 59005411, 86720155, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 10609079757 entry from 11727339590226714187 bytes 4846 took_ns 18119 gap_ns Some(125389039)
+LD-LANE at 10390052025 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002184383 took_ns 125257801 answered true unanswered 0 path_before Some((130902, 59005411, 86720155, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 59843129, 81333097, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 10734453286 entry from 11727339590226714187 bytes 4846 took_ns 17127 gap_ns Some(125355410)
+LD-LANE at 10515419794 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002215396 took_ns 125253977 answered true unanswered 0 path_before Some((130902, 59843129, 81333097, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 60486405, 77126669, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 10859769219 entry from 11727339590226714187 bytes 4846 took_ns 18391 gap_ns Some(125298806)
+LD-LANE at 10640796426 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002239210 took_ns 125221596 answered true unanswered 0 path_before Some((130902, 60486405, 77126669, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 60970021, 73762925, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-PMTU at 10972693187 trigger probe_acked before (11, 65465, 65528, 0, true, None) after (11, 65496, 65528, 0, true, None)
+LD-SERVE at 10985108206 entry from 11727339590226714187 bytes 4846 took_ns 17135 gap_ns Some(125320596)
+LD-LANE at 10766138094 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002257113 took_ns 125209964 answered true unanswered 0 path_before Some((130902, 60970021, 73762925, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 61339725, 71170473, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 11110512477 entry from 11727339590226714187 bytes 4846 took_ns 17239 gap_ns Some(125387136)
+LD-LANE at 10891450539 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002270800 took_ns 125288447 answered true unanswered 0 path_before Some((130902, 61339725, 71170473, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 61633842, 69280478, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 11235817627 entry from 11727339590226714187 bytes 4846 took_ns 17551 gap_ns Some(125287911)
+LD-LANE at 11016842650 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002281688 took_ns 125237459 answered true unanswered 0 path_before Some((130902, 61633842, 69280478, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 61850229, 67736621, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 11361196931 entry from 11727339590226714187 bytes 4846 took_ns 18007 gap_ns Some(125361753)
+LD-LANE at 11142195573 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002289699 took_ns 125238962 answered true unanswered 0 path_before Some((130902, 61850229, 67736621, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 62017752, 66565944, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 11486542134 entry from 11727339590226714187 bytes 4846 took_ns 15159 gap_ns Some(125327196)
+LD-LANE at 11267543415 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002295900 took_ns 125234891 answered true unanswered 0 path_before Some((130902, 62017752, 66565944, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 62145253, 65651133, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 11611916663 entry from 11727339590226714187 bytes 4846 took_ns 17711 gap_ns Some(125359370)
+LD-LANE at 11392882067 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002300621 took_ns 125265576 answered true unanswered 0 path_before Some((130902, 62145253, 65651133, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 62246679, 64989463, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 11737297159 entry from 11727339590226714187 bytes 4846 took_ns 17207 gap_ns Some(125362785)
+LD-LANE at 11518267331 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002304375 took_ns 125250657 answered true unanswered 0 path_before Some((130902, 62246679, 64989463, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 62323524, 64460256, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 11862637147 entry from 11727339590226714187 bytes 4846 took_ns 17590 gap_ns Some(125322781)
+LD-LANE at 11643634356 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002307220 took_ns 125224483 answered true unanswered 0 path_before Some((130902, 62323524, 64460256, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 62377327, 64195539, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 11988017043 entry from 11727339590226714187 bytes 4846 took_ns 16511 gap_ns Some(125362306)
+LD-LANE at 11768960768 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002309212 took_ns 125300934 answered true unanswered 0 path_before Some((130902, 62377327, 64195539, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 62428559, 64038963, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 12113325697 entry from 11727339590226714187 bytes 4846 took_ns 17910 gap_ns Some(125292143)
+LD-LANE at 11894358391 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002311109 took_ns 125189982 answered true unanswered 0 path_before Some((130902, 62428559, 64038963, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 62456277, 63887389, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 12238716208 entry from 11727339590226714187 bytes 4846 took_ns 17527 gap_ns Some(125372601)
+LD-LANE at 12019652174 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002312135 took_ns 125289391 answered true unanswered 0 path_before Some((130902, 62456277, 63887389, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 62488519, 63840715, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 12364080258 entry from 11727339590226714187 bytes 4846 took_ns 18471 gap_ns Some(125346523)
+LD-LANE at 12145056757 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002313328 took_ns 125267152 answered true unanswered 0 path_before Some((130902, 62488519, 63840715, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 62508801, 63872501, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 12489434028 entry from 11727339590226714187 bytes 4846 took_ns 16079 gap_ns Some(125335299)
+LD-LANE at 12270452596 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002314079 took_ns 125231827 answered true unanswered 0 path_before Some((130902, 62508801, 63872501, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 62520463, 63865759, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 12615142469 entry from 11727339590226714187 bytes 179557 took_ns 151398 gap_ns Some(125692362)
+LD-LANE at 12395810070 holder 12352607336441940457 stream 22 bytes 179557 budget_ns 1085758710 took_ns 125716577 answered true unanswered 0 path_before Some((130902, 62520463, 63865759, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 54795848, 118179080, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+LD-SERVE at 12740146560 entry from 11727339590226714187 bytes 4846 took_ns 17519 gap_ns Some(124852693)
+LD-LANE at 12521652182 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002028545 took_ns 124745013 answered true unanswered 0 path_before Some((130902, 54795848, 118179080, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 56561805, 104605197, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+chaos candidates partitioned in turn mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(1561), durable: Some(1561), owed: false, epoch: Some(1), identity: Some("baba06c539c96f942d8e9ee679ffbcdf7b7346129d7f9db945295d9eef806d68"), fence: 1, holders: ["3991910119844571067", "12352607336441940457"], moving_to: [], recorded: ["3991910119844571067", "12352607336441940457"] }); candidates [Some(LiveState { holding: true, head: Some(1561), durable: None, owed: false, epoch: Some(1), identity: Some("baba06c539c96f942d8e9ee679ffbcdf7b7346129d7f9db945295d9eef806d68"), fence: 1, holders: [], moving_to: [], recorded: [] }), Some(LiveState { holding: true, head: Some(1561), durable: None, owed: false, epoch: Some(1), identity: Some("baba06c539c96f942d8e9ee679ffbcdf7b7346129d7f9db945295d9eef806d68"), fence: 1, holders: [], moving_to: [], recorded: [] })]
+chaos candidates partitioned in turn mid-stream: 343 samples, 193 heads seen
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-17192 refused the owner: {}
+LD-SERVE at 12865297009 entry from 11727339590226714187 bytes 4846 took_ns 18695 gap_ns Some(125132930)
+LD-LANE at 12646511707 holder 12352607336441940457 stream 22 bytes 4846 budget_ns 1002093921 took_ns 125080645 answered true unanswered 0 path_before Some((130902, 56561805, 104605197, Some(65480), 0, 0, Some((24, 23, 0, 1)))) path_after Some((130902, 57960522, 94782546, Some(65480), 0, 0, Some((24, 23, 0, 1))))
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-17192 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-17192 refused the owner: {}
+chaos candidates partitioned in turn mid-stream:
+  chaos-rolling-a-17192 partitioned from 233.099027ms to 2.235499069s
+  chaos-rolling-b-17192 partitioned from 2.324557196s to 4.324756768s
+  every write acknowledged: held
+  1558 writes, 1558 acknowledged: p50 1220 us, p99 6209 us, p999 121218 us, max 2361898 us; 2 over 50ms (sent+took): 0.00s+121ms 2.32s+2362ms
+  converged: true: owner Some(LiveState { holding: false, head: Some(1561), durable: Some(1561), owed: false, epoch: Some(1), identity: Some("baba06c539c96f942d8e9ee679ffbcdf7b7346129d7f9db945295d9eef806d68"), fence: 1, holders: ["3991910119844571067", "12352607336441940457"], moving_to: [], recorded: ["3991910119844571067", "12352607336441940457"] }); candidates [Some(LiveState { holding: true, head: Some(1561), durable: None, owed: false, epoch: Some(1), identity: Some("baba06c539c96f942d8e9ee679ffbcdf7b7346129d7f9db945295d9eef806d68"), fence: 1, holders: [], moving_to: [], recorded: [] }), Some(LiveState { holding: true, head: Some(1561), durable: None, owed: false, epoch: Some(1), identity: Some("baba06c539c96f942d8e9ee679ffbcdf7b7346129d7f9db945295d9eef806d68"), fence: 1, holders: [], moving_to: [], recorded: [] })]
+  Convergence: held
+  343 samples, 193 heads seen
+  Agreement: held
+  NoLoss: held
+  chaos-rolling-c-17192 refused the owner: {}
+  chaos-rolling-a-17192 refused the owner: {}
+  chaos-rolling-b-17192 refused the owner: {}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 13.00s
+
