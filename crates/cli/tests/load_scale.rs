@@ -337,6 +337,23 @@ fn primary_green(primary: &str, tree: &str) -> String {
     .to_owned()
 }
 
+/// Shares `green` through `primary` with this test's account on `client`'s node (A-237): a local account means something
+/// only on its host, so the green a client node's clients make their works from and submit to is shared with that node.
+/// Reading is the right it needs: a work is made from a green its maker may read, and a submit writes only the work, which
+/// each client creates through its node, so its node's account owns it (`merge_service::require_green`, `require_work`).
+fn share_with_client(primary: &str, green: &str, client: &str) {
+  let status = ok(client, &["status"]);
+  let anchor = status
+    .lines()
+    .find_map(|line| line.strip_prefix("anchor: "))
+    .unwrap_or_else(|| panic!("no anchor in {status:?}"));
+  let account = rustix::process::getuid().as_raw();
+  ok(
+    primary,
+    &["share", green, &format!("uid:{account}@{anchor}"), "--read"],
+  );
+}
+
 /// One node of the run: its name, its anchor and its instance.
 struct Node {
   name: String,
@@ -499,6 +516,7 @@ fn many_clients_through_client_nodes_against_one_primary_and_two_replicas() {
   eventually(&nodes[0].instance, &["bootstrap", "root"]);
   let green = primary_green(&nodes[0].instance, &tree);
   for node in nodes.iter().skip(SERVERS.len()) {
+    share_with_client(&nodes[0].instance, &green, &node.instance);
     eventually(&node.instance, &["versions", &green]);
   }
   println!("rung\tgreen\t{green}\ttree\t{tree}\tclient_nodes\t{client_nodes}");
