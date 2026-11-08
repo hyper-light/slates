@@ -1351,6 +1351,12 @@ fn diagnosis(instances: &[String], volume: &str) -> String {
             || line.contains("anchor")
             || line.starts_with("fleet_host")
             || line.contains("lent_to")
+            // Whether a member behind the council's configuration fetched it, and from which voters (diag-35 runs 5
+            // and 8: a stale holder resumed at version 7 against 23, with nothing here to say whether it asked).
+            || line.starts_with("fleet_council_")
+            || line.contains("fleet.learner.")
+            || line.contains("fleet.council.")
+            || line.contains("consensus")
         })
         .collect();
       format!(
@@ -2935,6 +2941,27 @@ fn council_voters_by_index(fleet: &Fleet) -> Vec<usize> {
     .collect()
 }
 
+/// Each of `instances`' configuration version and voters as its status reports them (none for a node that does not
+/// answer).
+fn configuration_versions(instances: &[String]) -> Vec<(Option<String>, Option<String>)> {
+  instances
+    .iter()
+    .map(|instance| {
+      let (_, out, _) = run(instance, &["status"]);
+      let read = |key: &str| {
+        out
+          .lines()
+          .find_map(|line| line.strip_prefix(&format!("{key}: ")))
+          .map(str::to_owned)
+      };
+      (
+        read("fleet_configuration_version"),
+        read("fleet_council_voter_ids"),
+      )
+    })
+    .collect()
+}
+
 /// The nodes of `fleet` holding a copy of `volume`'s log as candidates, by index.
 fn holders_of(fleet: &Fleet, volume: &str) -> Vec<usize> {
   (0..fleet.instances.len())
@@ -3039,9 +3066,12 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
         .unwrap();
       roles = Some((current, stale));
       after_writes(&owner, &volume, BETWEEN_EVENTS);
+      // Each node's configuration version as the holder stops: whether the stale holder was already behind the
+      // council before its stop (diag-35 runs 5 and 8 found it at version 7 against 23 after it resumed).
+      let versions = configuration_versions(&instances);
       fleet_cell.borrow().stop(stale);
       verdict.note(format!(
-        "{} stopped at {:?}",
+        "{} stopped at {:?}; configuration versions then {versions:?}",
         instances[stale],
         began.elapsed()
       ));
