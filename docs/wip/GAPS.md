@@ -14544,6 +14544,67 @@ first-beat kill itself stays with that open entry, and the Mac's runs add to it:
 killed (1 to 236), and in the bounded run none of the 236 printed its first configuration line, so they were killed
 before any shard started or recovered anything.
 
+### 2026-11-07: the MCP edge test held a slow connection open past the edge's own deadline — fixed
+
+`the_mcp_surface_serves_the_tools` (`crates/mcp/tests/mcp.rs`) failed "the slow connection is still open, unanswered"
+in 1 of 4 runs at load ~14 (bug-sweep). The HTTP edge bounds a request's arrival by its deadline, the client's reply
+deadline of 1 s, and ends a connection whose request is unfinished when it passes: the slowloris bound. The test
+opened such a connection, ran its other HTTP checks, and only then required it open. Those checks took 517–637 ms
+idle and under two spinners a core (adacachy), half of it the listen check's wait for a keep-alive comment at half the
+deadline, so a slower machine brought the probe past the deadline, where the edge had rightly closed it. Not a defect
+of the edge.
+
+The test now holds each claim to the rule: the slow connection is open and unanswered right after the valid client is
+served (judged only while its deadline has not passed), and past the deadline the slow and idle connections are each
+ended with no answer, which it had not checked. Red first, on adacachy: the old test with a 1 s pause before its
+probe failed as in the field, and the new one passed; with the edge's arrival bound removed, the new close check
+failed after its 10 s wait. Under two spinners a core: 10 of 10.
+
+### 2026-11-07: the git workload signed its commits where the harness's parent did — fixed
+
+`a_host_reference_run_over_a_kept_scratch_starts_from_an_empty_tree` (`xtask/src/conformance/workloads.rs`) failed on
+this Mac at load ~14 (bug-sweep): the two host runs' `git log --format='%H %T %P'` agreed on the tree and differed in
+the commit and its parent. kiln configures commit signing for its agent sessions through the environment
+(`GIT_CONFIG_COUNT=11` with `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`: `commit.gpgsign true`, an x509 signer), which
+`GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1` do not reach. So the workload's commits were signed, each
+signature carrying its signing time: two runs inside one second matched, and two a second apart did not. The same
+leak would make a host and a mount run differ on any machine that signs this way; CI's runners set no such variables.
+
+The workload's environment now sets `GIT_CONFIG_COUNT=0` and removes `GIT_CONFIG_PARAMETERS` (`workload_environment`).
+Red first: `the_workload_environment_keeps_a_parents_git_configuration_out` commits from a parent environment that
+configures signing with a program that always fails; under the old environment the commit failed ("gpg failed to sign
+the data"), and it is made unsigned now (adacachy).
+
+### 2026-11-07: the Shards tests' guest gave a live daemon five seconds of wall time — fixed
+
+`the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte` (`crates/server/tests/shards.rs`) failed in
+live-durability's macOS runs at load 120–156 with `EAGAIN` from the guest's 5 s socket read timeout (`CREDIT_WAIT`) on
+its setup's writable DAX map, the "hostile_descriptor" flake's same read. Reproduced on this Mac (load 150–170): 1 of 2
+runs failed, `EAGAIN` after 5.06 s, while that run's other answers took 1.0–3.0 s and the watchdog logged no wedged or
+spinning shard. Under that load the machine profile's memcpy rate measured low, so the copy slice was one 16 KiB page
+and the fill took about 128 shard turns. The daemon was answering; the fixed wall wait was the test's assumption.
+
+The guest now waits by the daemon's rule (`Guest::await_answer`): in windows of `CREDIT_WAIT`, the next only while one
+of the daemon's shards ran on the CPU in the window just ended, and within `CREDIT_WAIT` of their CPU since the wait
+began; a daemon whose shards ran nothing for a window, or ran the budget without answering, fails the test by name.
+Red first: with the daemon's one shard held asleep, the new wait failed after 5.0 s, "ran nothing for a whole window".
+Each guest counts the answers it waited for past one window and its longest wait (`Waits`), and
+`a_guest_waits_past_one_window_for_a_starved_daemon_and_counts_it` asserts the count moved: with the daemon's one
+shard in a poll on the CPU a fifth of the time for 7.5 s, its map ask was answered after 7.53 s, one answer past one
+window (adacachy); with the old one-window wait it failed at 5.0 s. The loaded runs do not exercise it reliably: on
+`4811191a` plus the count, 10 runs under four spinners a core on this Mac (load 130–310 around each run) counted no
+answer past one window, the longest 0.53–1.17 s; the reproduction's 5.06 s at load 150–170 did not recur with that
+load. 9 of those 10 passed; the other failed on a different defect, recorded next.
+
+### 2026-11-07: the Shards DAX fixture names every daemon's segment alike, and one case's start found it gone — open
+
+In the same loaded runs, one case of `the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte` failed before
+its first act: "shard 0 failed to initialize after 273138 µs: segment: shared memory: shm_open refused (code
+Some(2))" (`ENOENT`), then `ConsensusNotInitialized` at its bootstrap. `dax_provisioned_in` names the segment
+`slates-seg-{name}` with neither the process id nor a per-daemon count, so a proptest's successive cases, and two
+processes of the binary, use one name; a dropped daemon that removes the name after its successor created it leaves
+the successor's shard nothing to open. Owed: a segment name unique to each daemon, failing test first.
+
 ### 2026-10-22: two pressure tests failed on a busy machine, not on the property — fixed
 
 `a_stale_handle_never_reads_a_reused_inode_under_churn` and
