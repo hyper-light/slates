@@ -8939,6 +8939,11 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   a period with nobody to ask. Test `a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone`: without the
   fix 8 of 8 failed on macOS and Linux (CI diag-live-fixes-45), with it 24 of 24 passed (diag-live-fixes-46). Bug doc:
   `docs/bugs/2026-11-08-a-learner-lost-the-only-voters-it-knew.md`.
+- **Same list, two more uses, fixed:** a learner's reports (`send_council_report`: without the fix 5 of 8 left a node
+  unsettled, diag-live-fixes-51; with it 23 of 24, diag-live-fixes-52) and its contact rule (`known_voters`, learned from
+  the fetch reply: without it 8 of 8 failed, diag-live-fixes-54; with it 32 of 32, diag-live-fixes-55, and the report test
+  60 of 60, diag-live-fixes-56). A voter promoted after the last configuration commit stays unknown to a learner until
+  the next one.
 - **Open sibling:** `drive_root_learner_fetch` filters on the root's voters the same way, and has no test yet.
 
 ### 2026-11-08: a takeover can call an object lost through a cohort that never held it (open)
