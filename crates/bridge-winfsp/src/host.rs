@@ -1235,7 +1235,7 @@ fn call_on(requests: &SyncSender<Request>, wake: &Waker, op: Op<u64>) -> Reply {
   }
   wake.wake_by_ref();
   let waiting = crate::phases::now();
-  let (answered, parked, spun) = crate::reply::await_reply_timed(&answer);
+  let (answered, ended, spun) = crate::reply::await_reply_timed(&answer);
   let end = crate::phases::now();
   crate::phases::record(slot, crate::phases::ROUND, start, end);
   let Ok((reply, sent)) = answered else {
@@ -1243,11 +1243,16 @@ fn call_on(requests: &SyncSender<Request>, wake: &Waker, op: Op<u64>) -> Reply {
   };
   // This request's own send stamp, carried with its reply: the old global stamp was another thread's on the DLL arm.
   crate::phases::record(slot, crate::phases::TO_ANSWER, sent, end);
-  if parked {
-    crate::phases::record(slot, crate::phases::TO_ANSWER_PARKED, sent, end);
-    crate::phases::record(slot, crate::phases::SPIN_BEFORE_PARK, waiting, waiting.saturating_add(spun));
-  } else {
-    crate::phases::record(slot, crate::phases::TO_ANSWER_SPUN, sent, end);
+  match ended {
+    crate::reply::Ended::Spun => crate::phases::record(slot, crate::phases::TO_ANSWER_SPUN, sent, end),
+    crate::reply::Ended::Late => {
+      crate::phases::record(slot, crate::phases::TO_ANSWER_LATE, sent, end);
+      crate::phases::record(slot, crate::phases::SPIN_BEFORE_PARK, waiting, waiting.saturating_add(spun));
+    }
+    crate::reply::Ended::Slept => {
+      crate::phases::record(slot, crate::phases::TO_ANSWER_PARKED, sent, end);
+      crate::phases::record(slot, crate::phases::SPIN_BEFORE_PARK, waiting, waiting.saturating_add(spun));
+    }
   }
   reply
 }

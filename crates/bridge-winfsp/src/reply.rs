@@ -33,6 +33,8 @@ enum Waited {
   Spun,
   /// The window passed, and the thread parked.
   Parked,
+  /// The window passed and the reply was already there: no sleep (diag only).
+  Late,
 }
 
 /// Measures this machine's one-way wake through a bounded channel and adopts it as this thread's window. A thread the OS
@@ -87,16 +89,28 @@ pub(crate) fn await_reply<T>(answer: &Receiver<T>) -> Result<T, RecvError> {
 }
 
 /// [`await_reply`], answering too whether the thread parked and how long it spun first, in nanoseconds (diag only).
-pub(crate) fn await_reply_timed<T>(answer: &Receiver<T>) -> (Result<T, RecvError>, bool, u64) {
+/// How a profiled wait ended (diag only): caught spinning, caught just after the window, or after a real sleep.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ended {
+  Spun,
+  Late,
+  Slept,
+}
+
+pub(crate) fn await_reply_timed<T>(answer: &Receiver<T>) -> (Result<T, RecvError>, Ended, u64) {
   let started = Instant::now();
   let (answered, waited) = wait_within(answer, WINDOW.get());
-  let parked = waited == Waited::Parked;
-  let spun = if parked {
-    u64::try_from(WINDOW.get().as_nanos()).unwrap_or(u64::MAX)
-  } else {
-    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+  let ended = match waited {
+    Waited::Spun => Ended::Spun,
+    Waited::Late => Ended::Late,
+    Waited::Parked => Ended::Slept,
   };
-  (answered, parked, spun)
+  let spun = if ended == Ended::Spun {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+  } else {
+    u64::try_from(WINDOW.get().as_nanos()).unwrap_or(u64::MAX)
+  };
+  (answered, ended, spun)
 }
 
 fn wait_within<T>(answer: &Receiver<T>, window: Duration) -> (Result<T, RecvError>, Waited) {
@@ -107,6 +121,10 @@ fn wait_within<T>(answer: &Receiver<T>, window: Duration) -> (Result<T, RecvErro
       Err(TryRecvError::Disconnected) => return (Err(RecvError), Waited::Spun),
       Err(TryRecvError::Empty) => std::hint::spin_loop(),
     }
+  }
+  // Diag only: a reply already waiting when the window ends is a late catch, not a wake.
+  if let Ok(reply) = answer.try_recv() {
+    return (Ok(reply), Waited::Late);
   }
   (answer.recv(), Waited::Parked)
 }

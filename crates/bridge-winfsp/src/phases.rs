@@ -54,8 +54,10 @@ pub(crate) const TO_ANSWER_SPUN: usize = 19;
 pub(crate) const TO_ANSWER_PARKED: usize = 20;
 /// The spin a waiter spent before it parked: the window, paid in full by every wait that parks.
 pub(crate) const SPIN_BEFORE_PARK: usize = 21;
+/// The reply's way back when the window had just passed and the reply was already there: no sleep.
+pub(crate) const TO_ANSWER_LATE: usize = 22;
 /// Shape: the phases above.
-const PHASES: usize = 22;
+const PHASES: usize = 23;
 /// Format: each phase's printed name, in order.
 const NAMES: [&str; PHASES] = [
   "stamp",
@@ -80,6 +82,7 @@ const NAMES: [&str; PHASES] = [
   "to_answer_spun",
   "to_answer_parked",
   "spin_before_park",
+  "to_answer_late",
 ];
 /// Format: the first operation slot; the receiver's slot for a request of no kind is one below it.
 pub(crate) const OP_BASE: usize = 32;
@@ -252,7 +255,7 @@ pub(crate) fn dump(ops: &[&str]) {
       );
       // The reply's way back is bimodal (a waiter still spinning or one parked), so its whole histogram is printed, and
       // the round trip's with it: `phases_hist <slot> <phase> <upper edge ns>:<count> ...`, non-empty buckets only.
-      if matches!(phase, TO_ANSWER | ROUND | TO_ANSWER_SPUN | TO_ANSWER_PARKED) {
+      if matches!(phase, TO_ANSWER | ROUND | TO_ANSWER_SPUN | TO_ANSWER_PARKED | TO_ANSWER_LATE) {
         let buckets: Vec<String> = counts
           .iter()
           .enumerate()
