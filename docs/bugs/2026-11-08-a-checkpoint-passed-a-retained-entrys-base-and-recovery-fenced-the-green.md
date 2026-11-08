@@ -49,6 +49,8 @@ measurement (liveness) and by loadtest-scale's primary-kill rungs (7 of 18 runs 
   appends the entry (`record_accepted`); `replay_green` applies each entry, compares any recorded identity (the entry's,
   or the checkpoint's at its head) and fences `GreenFence::IdentityDiverged` on a miss; a takeover judges each adopted
   increment afresh and records what it resolved to.
+  A restore from a checkpoint logs what it crossed: "slates-server: partition P: green G restored at checkpoint N,
+  applied K chain entries above it, L of them based below it" (L is the count a re-judging replay would have refused).
 - `crates/server/src/merge_service.rs`: `inputs_of` returns the increment as submitted, so a holder (§4.16 "Apply on
   holders") and a successor (`recover_green_inputs`) still re-decide from it and a wrong resolution on the owner
   cannot reach them; a checkpoint carries the head's identity; `record_goes_to_holders` says when a version's identity

@@ -10919,6 +10919,7 @@ fn replay_green(
       identity: green.head_identity(),
     });
   }
+  let mut below_checkpoint = 0usize;
   for (index, bytes) in partition.green_chain(id).iter().enumerate() {
     let version = u64::try_from(index)
       .unwrap_or(u64::MAX)
@@ -10928,6 +10929,9 @@ fn replay_green(
     // the identity the entry recorded is fenced, in place of judging the entry again.
     let entry =
       slates_merge::chain_entry::decode(bytes).map_err(|_| GreenFence::EntryCorrupt { version })?;
+    if entry.increment.base < held {
+      below_checkpoint = below_checkpoint.saturating_add(1);
+    }
     let accepted = green.apply_recorded(&entry.increment, &entry.applied);
     if accepted != version {
       return Err(GreenFence::WrongVersion { version, accepted });
@@ -10949,8 +10953,23 @@ fn replay_green(
       identity,
     });
   }
+  if held > 0 {
+    // What the replay crossed (A-257): a restore from a checkpoint, and the entries above it based below it, each of
+    // which a replay that judged entries again would have refused.
+    slates_machine::log_line!(
+      "slates-server: partition {}: green {} restored at checkpoint {held}, applied {} chain entries above it, {below_checkpoint} of them based below it",
+      state.partition,
+      hex_of(&id.bytes),
+      partition.green_chain(id).len()
+    );
+  }
   green.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
   Ok((green, replayed))
+}
+
+/// A volume id's bytes in hexadecimal, as the CLI prints a volume id.
+fn hex_of(bytes: &[u8]) -> String {
+  bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Green `id`'s origin as recovery finds it (§4.16): a held origin (A-217) walked again from its base snapshot,
