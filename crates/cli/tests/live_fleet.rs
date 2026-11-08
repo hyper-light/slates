@@ -1071,6 +1071,59 @@ fn a_stopped_holders_install_is_built_once_a_period_not_once_a_write() {
   );
 }
 
+/// A-200 with a candidate back from a stop while writes go on: do stop a candidate past its liveness budget, make many
+/// writes, resume it and keep writing until it has caught up. Expect it to take one install: the image it is sent is made
+/// at the log's head, so the entries after it are still retained. Before, the image was the one made when it fell behind,
+/// a median of 1,332 and 1,395 entries old when last built (the install's own transit added 0 or 1, diag-live-durability-54),
+/// so the holder landed behind the tail and took a second whole install.
+#[test]
+fn a_holder_back_from_a_stop_takes_one_install() {
+  /// Shape: enough writes during the stop that an image from its start is far behind the tail, each a few CLI round trips.
+  const WRITES: usize = 200;
+  /// Shape: writes after the resume, so the owner has publications to refresh the image at.
+  const AFTER: usize = 40;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping one-install flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-one-install");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let others: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| **instance != owner)
+    .collect();
+  let id = create_live_volume(&owner, "one-install");
+  write_files(&owner, &id, 0..8);
+  let stopped = (owner_index + 1) % fleet.instances.len();
+  let holder = fleet.instances[stopped].clone();
+  signal(&fleet.daemons[stopped], rustix::process::Signal::STOP);
+  // Past the budget, so its lane has gone unanswered and its link been dropped.
+  #[allow(clippy::disallowed_methods)]
+  std::thread::sleep(Duration::from_nanos(
+    2 * slates_server::daemon::LIVENESS_BUDGET_NS,
+  ));
+  write_files(&owner, &id, 8..8 + WRITES);
+  signal(&fleet.daemons[stopped], rustix::process::Signal::CONT);
+  let before = counter(&holder, "fleet.live.install_taken");
+  write_files(&owner, &id, 8 + WRITES..8 + WRITES + AFTER);
+  let (caught_up, shipping, held) = wait_caught_up(&owner, &others, &id);
+  let taken = counter(&holder, "fleet.live.install_taken").saturating_sub(before);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!(
+    "live one install: {taken} installs taken after the resume; then {shipping:?} {held:?}"
+  );
+  assert!(
+    caught_up,
+    "the candidate caught up once resumed: {shipping:?} {held:?}"
+  );
+  assert_eq!(taken, 1, "a holder back from a stop takes one install");
+}
+
 /// A-200: a new live volume's log is shipped only to candidates that hold its catalog. Do make a volume live-shipped and
 /// write files to it at once. Expect neither candidate to refuse an entry for not holding the volume's catalog
 /// (`fleet.live.hold_refused.no_catalog`): a candidate derives what it keeps from the catalog, which the record plane

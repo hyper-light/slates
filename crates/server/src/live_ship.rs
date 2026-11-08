@@ -70,6 +70,8 @@ const LIVE_WHOLE: &str = "fleet.live.whole";
 const LIVE_IMAGE: &str = "fleet.live.install_image";
 /// Counter: an install built to send a holder, the volume's whole state copied on the owner's shard.
 const LIVE_INSTALL_BUILT: &str = "fleet.live.install_built";
+/// Counter: an install a holder applied (its log replaced by the owner's whole state).
+const LIVE_INSTALL_TAKEN: &str = "fleet.live.install_taken";
 /// Counter: entries appended to a live volume's log on this owner shard.
 const LIVE_APPENDED: &str = "fleet.live.appended";
 /// Counter: entries a holder refused to keep (over its bound, unauthorized, malformed).
@@ -2239,6 +2241,8 @@ pub(crate) fn serve_install(
   peer: HostId,
   request: &[u8],
 ) -> Vec<u8> {
+  // Diag only (live-durability-53, never on main).
+  let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("LD-SERVE wall_ns {} install bytes {}\n", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos()), request.len()).as_bytes());
   let object = slates_db::live::object_of_state(request);
   let bound = match admitted(state, local, peer, object) {
     Ok(bound) => bound,
@@ -2259,11 +2263,15 @@ pub(crate) fn serve_install(
         held.bytes = 0;
         keep(held, &install.state, bound)?;
         held.replica.commit(install.epoch, head);
-        Ok(Some(head))
+        Ok((Some(head), true))
       }
-      Admitted::Held => Ok(held.replica.head()),
+      Admitted::Held => Ok((held.replica.head(), false)),
     }
   });
+  if matches!(reply, Ok((_, true))) {
+    state.count(LIVE_INSTALL_TAKEN, 1);
+  }
+  let reply = reply.map(|(head, _)| head);
   match &reply {
     Err(error) => count_refused(state, refused_counter(error)),
     Ok(_) => state.count(LIVE_HELD, 1),
