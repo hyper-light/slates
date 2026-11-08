@@ -6398,6 +6398,9 @@ mirroring have no targets and their verbs refuse `Unsupported`.
 >   register.
 > - **Class bytes.** Register values lead with a class byte. Volume ids refuse typed at the class bit
 >   (`docs/bugs/2026-09-30-a-takeover-rebuilt-a-weaker-volume-and-lost-its-grants.md`).
+> - **Greens (2026-11-07).** A green ships its catalog register too, and no merge record of it ships before the
+>   register's current version is committed. Its successor waits for the adopted register and rebuilds the green with
+>   its access list (`docs/bugs/2026-11-07-a-taken-over-green-lost-its-access-list.md`).
 >
 > **Status (2026-09-30, connection credit in priority order).** A control exchange no longer waits for
 > connection credit that a bulk exchange spent (the constrained-link design §5.3).
@@ -6771,6 +6774,13 @@ peer uid alone cannot establish consumer identity. Between hosts, authenticated 
 also binds the delegated consumer scope. Rights are checked before resource admission,
 namespace lookup that reveals protected content, queue creation or any VFS/device effect.
 Replay/session resumption preserves that binding; it cannot change the authenticated consumer.
+
+> **Status (2026-11-07, A-237): a host account carries its host.** Every principal names the host whose account it is
+> by that host's certificate anchor, a forwarded request is rescoped by its TLS session's anchor, and owner and access
+> entries record (host, account), so a uid is never taken for another host's. A client of another node is refused
+> `NotShared` naming the (anchor, account) a share would name. On Windows the account is still recorded as uid 0 (the
+> rendezvous authenticates by the bootstrap object's mode and reads no SID), now host-qualified; naming it by its SID is
+> held.
 
 This requires a harness boundary when untrusted processes share an OS account. Slates cannot
 prevent an unsandboxed same-uid process from reading other process memory or writing host files
@@ -7691,6 +7701,8 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > chain, pipelined and hedged merge records.
 
 > **Status (2026-09-18, AUD-14: a taken-over green is servable).** The generic takeover promoted one adopted record and materialized content only for a plain volume's `HeadValue`; a green's adopted `MergeRecordValue` left the successor with a holder replica and nothing to serve — no catalog record, origin, chain, engine or placed version. Now the record value carries the green's name, evidence policy and owner (from the catalog, at `enqueue_record`), the takeover completion routes an adopted merge record to `pending_green_materializations`, and `materialize_pending_greens` gathers the chain from the successor's **own accepted records** (its holder acceptor's persisted positions give every version's input manifest; the held content gives the origin and each increment, `recover_green_inputs`) and materializes it on the shard the id routes to (`materialize_taken_over_green`): the catalog entry, the origin and every increment re-recorded durably, the engine replayed by the boot derivation and its head identity checked against the adopted record's — a mismatch refuses the green loudly — then the head placed. A successor whose accepted prefix is shorter than the adopted head stays pending, counted (`merge.takeover_incomplete`): the ledger-prefix transfer is GAP-A9-7's contract. Regression: three-node `f = 1`, three versions, owner dies, the successor's chain identities equal the owner's, `versions`/reads/a new submit and its retry serve through the public client (`docs/bugs/2026-09-18-green-takeover-left-no-servable-chain.md`).
+>
+> **Status (2026-11-07, AUD-29-17: a taken-over green keeps its shares).** The rebuilt green's access list was empty: a green shipped no catalog register. It now does, its merge records wait for the register's current version to commit, and the successor rebuilds the green from the adopted register's access list and sequence, waiting for it counted (`merge.takeover_waits_catalog`). Regression: `a_share_of_a_green_made_after_its_last_version_survives_a_takeover` (`docs/bugs/2026-11-07-a-taken-over-green-lost-its-access-list.md`).
 
 > **Status (2026-09-18, AUD-11: acceptance waits for the commit).** `submit` returned `Submitted{version}` on the owner's local append, with the version's merge record still pending on the record plane at `f > 0` — a version a surviving quorum might not hold, and a completion record saying otherwise. Now the acceptance **waits for the commit**: when `placed_version` has not reached the version, the verb registers the request as awaiting (`MergeShardState::awaiting`: the reply route and the completion key, bounded by the clients' credit) and `run_recorded` commits its effects with no completion and no reply; when `record_merge_acks` places the version at the quorum, `resolve_accepted` records the acceptance as each waiting request's completion on the owner partition (one durable step) and delivers the reply by a task on the request's shard. A retry while waiting joins the wait; a cross-node forward polls the completion within the liveness budget, else is refused retryable. At `f = 0` the append is the commit and nothing changes (R8). Regression: two-node `f = 1`, the holder withholding content puts, then acknowledgements (`MergeFault::refuse_records`) — no acceptance under either, the wait resolving once both lift, the retry answered from the record (`docs/bugs/2026-09-18-submit-acceptance-before-fleet-commit.md`). The retry after the owner's loss belongs to AUD-14's takeover recovery.
 
@@ -14025,6 +14037,59 @@ Status: measured and rejected 2026-11-08.
 - Not established, and what would reopen it: why a sliced shard's median request waits milliseconds in some
   rounds. A candidate, unproven: EEVDF's lag, which lets a short-slice thread that ran ahead wait out its peers'
   slices. A slice that keeps the p50 (or a client that can ask for its own) would need the same rule met.
+
+### A-237 — A host account means something only on its host: every principal that crosses hosts is scoped by its origin's certificate anchor (accepted and built 2026-11-07)
+Applied in the same change to: §4.13 (its status on principals), `slates_db::catalog::Principal` (a host on `Uid`,
+`Sid` and `Consumer`; the tenant and the index key over it; `rehosted`), `slates_ipc::protocol` (the wire `Principal`'s
+host, `DaemonReport::anchor`, `Refusal::NotShared`), `slates_wire::header::MAJOR` (2), `slates_anchor::layout`
+(`LAYOUT_VERSION` 5, a typed refusal of layout 4), `crates/server/src/verbs.rs` (`serve_forward` rescopes the forwarded
+principal by the session's anchor; `not_shared_with`; `to_db_principal`, `to_wire_principal`), `crates/server/src/daemon.rs`
+(`local_anchor`, the rendezvous's principal, `Daemon::anchor`), `crates/server/src/nfs.rs` (an NFS caller's host),
+`crates/bridge-virtiofs/src/vhost_user.rs` (`adopt` takes the host), the CLI (`slates status` prints `anchor:`; `slates
+share` takes `@ANCHOR`), GAPS, `docs/bugs/2026-11-07-a-principal-was-compared-across-hosts-with-no-host.md`, and the
+tests named below.
+- **Why.** A verb forwarded to a volume's owner on another node carried the requester's principal "as the origin node
+  authenticated it", and the owner judged it by `rights_of`'s bare equality: a principal is equal to an owner or an
+  access entry, and a uid carried no host. So one uid on two hosts was one principal; every Windows channel is
+  recorded as uid 0 (the bootstrap object's mode is the authentication), so any two Windows users on different nodes
+  were one principal, and a Windows user was Unix root's principal. Found 2026-11-07 while checking a wrong premise
+  (that a Windows consumer could never attest; it can, `crates/server/tests/consumers.rs`).
+- **The rule.** A local account is meaningful only on its host. A uid, a SID and a consumer each carry the host whose
+  account it is, by that host's certificate anchor: the fleet's pinned certificate's, else the machine identity's
+  (`daemon::local_anchor`), stable across the host's restarts and never the per-boot member id, which would orphan every
+  user's volumes at a restart. A local request is the local anchor's; a forwarded request is rescoped by the anchor of
+  the TLS session it arrived on (`Principal::rehosted`), never by a host the origin's request names. Owner and access
+  entries record (host, account), and `rights_of`'s equality compares them whole. A certificate names itself on every
+  host. This is §4.13's "between hosts, authenticated transport also binds the delegated consumer scope".
+- **What a user meets.** A client of node B reaching a volume owned on node A is refused `NotShared { verb, principal }`,
+  naming (B's anchor, its account): the share that lets it in. `slates status` prints each node's `anchor:`, and `slates
+  share ID uid:N@ANCHOR` (or `consumer:ACCOUNT/ID@ANCHOR`) names another node's account. One person's accounts on
+  several hosts as one principal, a fleet account mapping, is not part of this: an open design item for Ada (GAPS).
+- **A taken-over green kept no shares.** Found by this change's tests: a green shipped no catalog register, so its
+  successor rebuilt it with an empty access list, which uid equality had hidden. Fixed in its own change just before
+  this one (AUD-29-17's catalog register for greens; `docs/bugs/2026-11-07-a-taken-over-green-lost-its-access-list.md`),
+  so it could land first. Here its test names node a's account by its anchor.
+- **Format.** The wire principal and the catalog's records change shape, so the wire major is 2 (a major-1 peer is
+  refused before its body is read) and the segment layout is 5 (a layout-4 segment is refused at start, saying to start
+  afresh and re-enroll and re-share). Pre-release; no shim. Neither SDK encodes a principal or `Enroll`.
+- **Tests:** `crates/server/tests/fleet.rs`
+  `a_forwarded_read_by_the_same_uid_on_another_host_is_forbidden_without_a_share` (three in-process daemons, one uid,
+  each its own region: before, a client of node b read node a's volume, served in 22 s; after, refused `NotShared`
+  naming node b's anchor, 7.7 s, macOS arm64, 2026-11-07); `crates/anchor/tests/anchor.rs`
+  `a_segment_from_before_host_scoped_principals_is_refused_at_start_saying_to_re_enroll`; the CLI's share parse
+  (`@ANCHOR`); and every fleet test that reaches a volume from another node now shares it with that node's account by
+  its anchor (`share_with_node`), the two takeover tests before the owner dies, so a survivor enforces the scoped owner.
+  The sealing tenant's test derives each tenant from its owner (`Principal::tenant`), since a tenant is no longer the
+  bare uid. The two-host test's second half shares the volume with exactly the principal the refusal named, and node
+  b's read is then served. Takeover: `a_dead_owners_volume_refuses_an_unshared_host_through_its_successor` (the
+  survivor whose share was withdrawn is refused `NotShared`, naming its own anchor, through the successor) and
+  `a_restarted_peer_is_learned_on_contact_under_its_fresh_identity` (the owner's account, through its restarted host,
+  reaches its volume on the successor, since a restart keeps the anchor). Windows→Unix-root by rule:
+  `verbs::tests::uid_zero_on_another_host_is_not_this_hosts_root`. CI (diag `clients-host-5`, on main `e86fb417`,
+  2026-11-07): wire, db, anchor, the server's unit tests, consumers, daemon, virtiofs and the CLI green on ubuntu x86_64
+  and arm64; the fleet suite 94 of 95 on both, the one a test new on main whose forward needed its share
+  (`green_and_work_on`, fixed after); Windows x86_64 and arm64 green but for the two landing tests that fail on main
+  there too.
 
 ### A-228 — A daemon's liveness is judged in its shards' own CPU time, by an owned watchdog thread (accepted and built 2026-11-06)
 Applied in the same change to: §4.14 (its status on `daemon.alive`), `crates/server/src/watchdog.rs` (new),

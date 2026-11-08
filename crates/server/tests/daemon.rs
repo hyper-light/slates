@@ -1541,7 +1541,11 @@ fn a_read_only_consumer_cannot_grant_itself_more_rights(
 ) {
   let escalate = RequestBody::Share {
     volume: id,
-    principal: slates_ipc::protocol::Principal::Consumer { account, consumer },
+    principal: slates_ipc::protocol::Principal::Consumer {
+      host: common::this_host(),
+      account,
+      consumer,
+    },
     rights: slates_ipc::protocol::Rights {
       read: true,
       write: true,
@@ -1686,7 +1690,11 @@ fn the_consumer_holds_only_the_right_shared(
   assert!(matches!(
     owner.call(&RequestBody::Share {
       volume: id,
-      principal: slates_ipc::protocol::Principal::Consumer { account, consumer },
+      principal: slates_ipc::protocol::Principal::Consumer {
+        host: common::this_host(),
+        account,
+        consumer,
+      },
       rights: slates_ipc::protocol::Rights {
         read: true,
         write: false,
@@ -1864,7 +1872,11 @@ fn a_consumer_with_a_shared_volume(
   assert!(matches!(
     owner.call(&RequestBody::Share {
       volume: id,
-      principal: slates_ipc::protocol::Principal::Consumer { account, consumer },
+      principal: slates_ipc::protocol::Principal::Consumer {
+        host: common::this_host(),
+        account,
+        consumer,
+      },
       rights: slates_ipc::protocol::Rights {
         read: true,
         write: true,
@@ -2754,7 +2766,11 @@ fn a_shared_green_is_read_and_worked_by_the_principal_it_names() {
 fn share_green_for_reading(owner: &mut Client, green: VolumeId, account: u32, consumer: u64) {
   let shared = owner.call(&RequestBody::Share {
     volume: green,
-    principal: slates_ipc::protocol::Principal::Consumer { account, consumer },
+    principal: slates_ipc::protocol::Principal::Consumer {
+      host: common::this_host(),
+      account,
+      consumer,
+    },
     rights: slates_ipc::protocol::Rights {
       read: true,
       write: false,
