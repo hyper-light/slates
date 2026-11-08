@@ -27,17 +27,15 @@ const HOLDERS: [HostId; 2] = [HostId(2), HostId(3)];
 const OBJECT: ObjectId = ObjectId([5; 16]);
 /// Shape: a holder's decode cap: far above the test's payloads.
 const CAP: usize = 1 << 16;
-/// Shape: a dispatch's deadline: ten seconds of virtual time. The fabric's paths are instant, yet on it one session's
-/// round trip grew about 1.7 times an exchange (9, 14, 23 … 621 ms of virtual time over nine sequential writes,
-/// 2026-11-04; GAPS), which the real runtime does not show (`replication_bench … silent`). The deadline must not be what
-/// this test measures.
+/// Shape: a dispatch's deadline: ten seconds of virtual time, far past any exchange over the fabric's instant paths
+/// (each write here takes no virtual time), so the deadline is never what this test measures.
 const DEADLINE_NS: u64 = 10_000_000_000;
 /// Shape: the collector's poll, the daemon's 10 ms.
 const POLL_NS: u64 = 10_000_000;
 /// Shape: a serve loop's park between checks of its stop channel.
 const SERVE_SLICE_NS: u64 = 1_000_000;
 /// Shape: the writes shipped before the late holder joins: more than the retained tail ([`shipper`]'s two), so it
-/// is installed, and few enough that the fabric's growing round trip stays far inside the deadline.
+/// is installed.
 const WRITES: u64 = 6;
 
 fn config() -> RuntimeConfig {
@@ -77,9 +75,7 @@ fn shape() -> slates_transport::connection::ConnectionShape {
 const STOP_KIND: u64 = 99;
 
 /// A holder: once `start` says so (at once unless silent), serves entries and installs into its replica of [`OBJECT`]
-/// until the owner's stop request, then reports its final head and state. Its serving is never cut into slices: a
-/// serve cancelled by a timer every millisecond starved its session, and a round trip over the fabric's instant paths
-/// took 9 to 14 ms of virtual time.
+/// until the owner's stop request, then reports its final head and state.
 async fn holder(
   mut endpoint: Endpoint,
   start: Receiver<()>,
@@ -141,16 +137,27 @@ fn run(
 ) -> BTreeMap<HostId, (Option<slates_db::live::Head>, Vec<u8>)> {
   let mut sim = SimRuntime::new(&config(), 1).unwrap();
   let shard = sim.shard_ids()[0];
+  // Every socket is bound on the shard, so it is a port on the simulated fabric: one bound on this thread is an OS
+  // socket, which the simulation driver cannot watch (refused since 2026-11-08; before, its sessions were woken only
+  // by their timers).
+  let (sockets_tx, sockets_rx) = channel();
+  sim
+    .spawn_on(shard, async move {
+      let bind = || UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = sockets_tx.send(HOLDERS.map(|_| (bind(), bind())));
+    })
+    .unwrap();
+  sim.run_until_idle();
+  let sockets = sockets_rx.try_recv().unwrap();
   let owner_identity = identity();
   let owner_certificate = owner_identity.certificate();
   let mut dials = Vec::new();
   let mut commands = BTreeMap::new();
   let (done_tx, done_rx) = channel();
-  for (index, host) in HOLDERS.into_iter().enumerate() {
+  for ((index, host), (holder_socket, owner_socket)) in HOLDERS.into_iter().enumerate().zip(sockets)
+  {
     let holder_identity = identity();
     let holder_certificate = holder_identity.certificate();
-    let holder_socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let owner_socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
     let holder_address = holder_socket.local_addr().unwrap();
     let owner_address = owner_socket.local_addr().unwrap();
     let owner_certificate = owner_certificate.clone();
