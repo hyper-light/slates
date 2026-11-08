@@ -1,0 +1,23 @@
+runner macos-latest, 3 CPUs, Sun Nov  8 17:30:21 UTC 2026, head 6310b00bf7ecf8558b9ad0e581e1af9dbe89a2f6
+spinners: 6
+== round 1 at 17:30:22, load 21.80 24.70 12.82
+test a_forward_refused_at_admission_answers_its_client ... FAILED
+test a_taken_over_scratch_volume_becomes_servable_and_never_answers_notfound ... ignored, heavy fleet regression (1024-volume takeover); run alone
+test takeover_periods_scale_with_the_retired_hosts_object_count ... ignored, measurement, not a gate; prints periods-to-recover vs the retired host's object count
+test transient_false_condemnation_cost_is_flat_in_the_owners_object_count ... ignored, heavy fleet measurement (false condemnation of an N-object owner); run alone
+thread 'a_forward_refused_at_admission_answers_its_client' (31847) panicked at crates/server/tests/fleet.rs:5618:5:
+    a_forward_refused_at_admission_answers_its_client
+test result: FAILED. 113 passed; 1 failed; 3 ignored; 0 measured; 0 filtered out; finished in 1145.63s
+== round 1 exit 101, load 28.81 43.23 41.26
+== round 2 at 17:49:28, load 28.81 43.23 41.26
+test a_taken_over_scratch_volume_becomes_servable_and_never_answers_notfound ... ignored, heavy fleet regression (1024-volume takeover); run alone
+test takeover_periods_scale_with_the_retired_hosts_object_count ... ignored, measurement, not a gate; prints periods-to-recover vs the retired host's object count
+test transient_false_condemnation_cost_is_flat_in_the_owners_object_count ... ignored, heavy fleet measurement (false condemnation of an N-object owner); run alone
+test result: ok. 114 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 1156.06s
+== round 2 exit 0, load 13.36 27.39 34.60
+== round 3 at 18:08:45, load 13.36 27.39 34.60
+test a_taken_over_scratch_volume_becomes_servable_and_never_answers_notfound ... ignored, heavy fleet regression (1024-volume takeover); run alone
+test takeover_periods_scale_with_the_retired_hosts_object_count ... ignored, measurement, not a gate; prints periods-to-recover vs the retired host's object count
+test transient_false_condemnation_cost_is_flat_in_the_owners_object_count ... ignored, heavy fleet measurement (false condemnation of an N-object owner); run alone
+test result: ok. 114 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 1133.93s
+== round 3 exit 0, load 54.63 35.72 33.49
