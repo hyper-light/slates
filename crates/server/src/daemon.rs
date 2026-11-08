@@ -3658,7 +3658,43 @@ async fn init_shard(
     };
   }
   slices.unit_done().await;
-  let rebuilt = verbs::rebuild_recovered(&mut state, &mut slices).await;
+  rebuild_and_report(&mut state, shard, &mut slices).await;
+  start_burst_measure(&mut state);
+  #[cfg(windows)]
+  crate::anchor_hold::install(
+    windows_channel,
+    *config_shards.first().ok_or(ServerError::NotOnShard)?,
+  )
+  .map_err(crate::anchor_hold::HoldRefusal::into_server)?;
+  state::install(state);
+  register_idle_refill(shard);
+  // The FUSE mounts whose devices the anchor held, served again (A-61); then the dead ones of a killed
+  // predecessor counted and left for their users to unmount (AUD-29-64, A-102).
+  #[cfg(target_os = "linux")]
+  crate::fuse::adopt_held();
+  #[cfg(windows)]
+  crate::winfsp::adopt_held();
+  #[cfg(target_os = "linux")]
+  crate::fuse::leave_stale();
+  // Detached: the loop lives as long as the shard; nothing joins it (a joinable task stays in
+  // the arena after it ends, which would hold the shard's shutdown).
+  // A shard whose serve or reap loop the arena refuses serves nothing: a typed initialization failure
+  // (surfaced by the boot as `INIT_FAILURES`), never a silently loop-less shard (banned item 9).
+  let serve = futures::spawn(serve_loop()).map_err(ServerError::Runtime)?;
+  let _ = futures::detach(serve);
+  let reap = futures::spawn(reap_loop()).map_err(ServerError::Runtime)?;
+  let _ = futures::detach(reap);
+  Ok(slices.finish())
+}
+
+/// Rebuilds what the shard recovered into live state (`verbs::rebuild_recovered`, in `slices`) and says what it did in
+/// the boot log: only what happened, never more.
+async fn rebuild_and_report(
+  state: &mut ShardState,
+  shard: u16,
+  slices: &mut crate::recovery_slices::RecoverySlices,
+) {
+  let rebuilt = verbs::rebuild_recovered(state, slices).await;
   if rebuilt.skipped > 0 {
     RECOVERY_SKIPPED.fetch_add(
       u64::try_from(rebuilt.skipped).unwrap_or(u64::MAX),
@@ -3693,32 +3729,6 @@ async fn init_shard(
       }
     );
   }
-  start_burst_measure(&mut state);
-  #[cfg(windows)]
-  crate::anchor_hold::install(
-    windows_channel,
-    *config_shards.first().ok_or(ServerError::NotOnShard)?,
-  )
-  .map_err(crate::anchor_hold::HoldRefusal::into_server)?;
-  state::install(state);
-  register_idle_refill(shard);
-  // The FUSE mounts whose devices the anchor held, served again (A-61); then the dead ones of a killed
-  // predecessor counted and left for their users to unmount (AUD-29-64, A-102).
-  #[cfg(target_os = "linux")]
-  crate::fuse::adopt_held();
-  #[cfg(windows)]
-  crate::winfsp::adopt_held();
-  #[cfg(target_os = "linux")]
-  crate::fuse::leave_stale();
-  // Detached: the loop lives as long as the shard; nothing joins it (a joinable task stays in
-  // the arena after it ends, which would hold the shard's shutdown).
-  // A shard whose serve or reap loop the arena refuses serves nothing: a typed initialization failure
-  // (surfaced by the boot as `INIT_FAILURES`), never a silently loop-less shard (banned item 9).
-  let serve = futures::spawn(serve_loop()).map_err(ServerError::Runtime)?;
-  let _ = futures::detach(serve);
-  let reap = futures::spawn(reap_loop()).map_err(ServerError::Runtime)?;
-  let _ = futures::detach(reap);
-  Ok(slices.finish())
 }
 
 /// The shard's sweep for dead clients and expired leases, at the liveness cadence: the same
