@@ -4233,6 +4233,7 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
     let absent =
       state::with_state(|s| !s.record_sessions.contains_key(&peer_host)).unwrap_or(false);
     if absent {
+      let _ = state::with_state(|s| s.count(diag_name(peer_host, Some("dial"), "attempts"), 1));
       let (kept, session) = establish_session(
         client,
         None,
@@ -4244,7 +4245,20 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
       )
       .await;
       client = kept;
+      let established = session.is_some();
+      let _ = state::with_state(|s| {
+        let kind = if established { "established" } else { "failed" };
+        s.count(diag_name(peer_host, Some("dial"), kind), 1);
+      });
       enroll_record_session(session, peer_host, anchor, &mut discovery_cursor, driver).await;
+      let _ = state::with_state(|s| {
+        let kind = if s.record_sessions.contains_key(&peer_host) {
+          "enrolled"
+        } else {
+          "not_enrolled"
+        };
+        s.count(diag_name(peer_host, Some("dial"), kind), 1);
+      });
       discovery_wait = HEARTBEAT_NS;
       discovery_due = 0;
     }
@@ -4427,21 +4441,42 @@ async fn refresh_discovery(
   driver: PeerDriver,
 ) {
   let session = state::with_state(|state| {
-    state
+    let session = state
       .record_sessions
       .get_mut(&peer_host)
-      .and_then(|link| link.endpoint.take())
+      .and_then(|link| link.endpoint.take());
+    if session.is_some() {
+      if let Some(link) = state.record_sessions.get_mut(&peer_host) {
+        link.lent_to = Some(DIAG_DISCOVERY);
+      }
+      diag_lent(state, peer_host, Some(DIAG_DISCOVERY));
+    } else if state.record_sessions.contains_key(&peer_host) {
+      let holder = state
+        .record_sessions
+        .get(&peer_host)
+        .and_then(|link| link.lent_to);
+      diag_wanted_out(state, peer_host, DIAG_DISCOVERY, holder);
+    }
+    session
   })
   .flatten();
   if let Some(mut session) = session {
     let outcome = exchange_discovery(&mut session, anchor, peer_host, cursor, driver).await;
     state::with_state(|state| {
+      let lent_at = state
+        .record_sessions
+        .get(&peer_host)
+        .and_then(|link| link.lent_at_ns);
       if outcome == DiscoveryOutcome::Answered {
         if let Some(link) = state.record_sessions.get_mut(&peer_host) {
           link.endpoint = Some(session);
+          link.lent_to = None;
+          link.lent_at_ns = None;
         }
+        diag_returned(state, peer_host, Some(DIAG_DISCOVERY), lent_at);
       } else {
         state.record_sessions.remove(&peer_host);
+        state.count(diag_name(peer_host, Some(DIAG_DISCOVERY), "dropped"), 1);
       }
     });
   }
@@ -7310,6 +7345,77 @@ fn record_acks_in(
   crate::live_ship::catalog_placed(state, object);
 }
 
+thread_local! {
+  /// DIAG (never for main): counter names made once per (kind, peer, borrower), so a session's lends, returns, hold
+  /// times and the borrowers that found it out show in status. Bounded by the peers times the borrow tags.
+  static DIAG_NAMES: std::cell::RefCell<std::collections::BTreeMap<String, &'static str>> =
+    const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+/// DIAG (never for main): the counter `diag.link.<peer>.<who>.<kind>`, made once.
+fn diag_name(peer: HostId, who: Option<&'static str>, kind: &str) -> &'static str {
+  let who = who
+    .map(|tag| tag.strip_prefix("fleet.lent_to.").unwrap_or(tag))
+    .unwrap_or("untagged");
+  let name = format!("diag.link.{}.{who}.{kind}", peer.0);
+  DIAG_NAMES.with(|names| {
+    *names
+      .borrow_mut()
+      .entry(name.clone())
+      .or_insert_with(|| Box::leak(name.into_boxed_str()))
+  })
+}
+
+/// DIAG (never for main): a borrow of `peer`'s session by `who` began.
+fn diag_lent(s: &mut ShardState, peer: HostId, who: Option<&'static str>) {
+  s.count(diag_name(peer, who, "lends"), 1);
+  let now = futures::now_ns();
+  if let Some(link) = s.record_sessions.get_mut(&peer) {
+    link.lent_at_ns = Some(now);
+  }
+}
+
+/// DIAG (never for main): `peer`'s session came back from `who`'s borrow that began at `lent_at_ns`.
+fn diag_returned(
+  s: &mut ShardState,
+  peer: HostId,
+  who: Option<&'static str>,
+  lent_at_ns: Option<u64>,
+) {
+  s.count(diag_name(peer, who, "returns"), 1);
+  let held = lent_at_ns.map_or(0, |at| futures::now_ns().saturating_sub(at));
+  s.count(diag_name(peer, who, "held_ns"), held);
+  let max_name = diag_name(peer, who, "held_max_ns");
+  let max = s.refusals.get(max_name).copied().unwrap_or(0);
+  if held > max {
+    s.count(max_name, held.saturating_sub(max));
+  }
+}
+
+/// DIAG (never for main): `wanter` wanted `peer`'s session while `holder` had it out.
+fn diag_wanted_out(
+  s: &mut ShardState,
+  peer: HostId,
+  wanter: &'static str,
+  holder: Option<&'static str>,
+) {
+  let wanter = wanter.strip_prefix("fleet.lent_to.").unwrap_or(wanter);
+  let holder = holder
+    .map(|tag| tag.strip_prefix("fleet.lent_to.").unwrap_or(tag))
+    .unwrap_or("untagged");
+  let name = format!("diag.link.{}.{holder}.out_for.{wanter}", peer.0);
+  let name = DIAG_NAMES.with(|names| {
+    *names
+      .borrow_mut()
+      .entry(name.clone())
+      .or_insert_with(|| Box::leak(name.into_boxed_str()))
+  });
+  s.count(name, 1);
+}
+
+/// DIAG (never for main): the borrow tag discovery's own page takes a session under.
+const DIAG_DISCOVERY: &str = "fleet.lent_to.discovery_page";
+
 /// Borrows out of the shard state the live sessions of the holders satisfying `wanted`, leaving each borrowed
 /// entry `None` (out on a dispatch — the link task leaves it alone) until [`return_sessions`] puts it back. A
 /// holder with no live session is skipped — the dispatch proceeds with the holders it can reach and the rest
@@ -7320,7 +7426,11 @@ pub(crate) fn take_sessions(
 ) -> Vec<(HostId, Endpoint)> {
   state::with_state(|s| {
     let mut taken = Vec::new();
+    let mut out: Vec<(HostId, Option<&'static str>)> = Vec::new();
     for (host, link) in s.record_sessions.iter_mut() {
+      if wanted(*host) && link.endpoint.is_none() {
+        out.push((*host, link.lent_to));
+      }
       if wanted(*host)
         && let Some(mut endpoint) = link.endpoint.take()
       {
@@ -7329,6 +7439,12 @@ pub(crate) fn take_sessions(
         link.lent_to = Some(lent_to);
         taken.push((*host, endpoint));
       }
+    }
+    for (host, holder) in out {
+      diag_wanted_out(s, host, lent_to, holder);
+    }
+    for (host, _) in &taken {
+      diag_lent(s, *host, Some(lent_to));
     }
     taken
   })
@@ -7345,14 +7461,23 @@ pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
   state::with_state(|s| {
     for (host, mut endpoint) in sessions {
       let returned = endpoint.connection_id().ok();
+      let (holder, lent_at) = s
+        .record_sessions
+        .get(&host)
+        .map_or((None, None), |link| (link.lent_to, link.lent_at_ns));
       match s.record_sessions.get_mut(&host) {
         Some(link) if link.endpoint.is_none() && link.borrowed == returned => {
           link.last_seen = Some(crate::state::RecordLink::seen(host, &endpoint));
           link.endpoint = Some(endpoint);
           link.borrowed = None;
           link.lent_to = None;
+          link.lent_at_ns = None;
+          diag_returned(s, host, holder, lent_at);
         }
-        _ => s.count(LINK_STALE_RETURN, 1),
+        _ => {
+          s.count(LINK_STALE_RETURN, 1);
+          s.count(diag_name(host, holder, "stale_returns"), 1);
+        }
       }
     }
   });

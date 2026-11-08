@@ -134,6 +134,8 @@ pub struct RecordLink {
   /// The session's congestion state when it was last returned or established, so status reports it while a borrower
   /// has it out (a cross-region read keeps it borrowed for the whole transfer).
   pub last_seen: Option<slates_ipc::protocol::SessionReport>,
+  /// DIAG (never for main): when the session went out on its current borrow, for the hold time counted at its return.
+  pub lent_at_ns: Option<u64>,
 }
 
 impl RecordLink {
@@ -144,6 +146,7 @@ impl RecordLink {
       borrowed: None,
       lent_to: None,
       last_seen: None,
+      lent_at_ns: None,
     }
   }
 

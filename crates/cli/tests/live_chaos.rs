@@ -314,11 +314,26 @@ fn mesh_of(instance: &str) -> Option<(u32, u32)> {
   ))
 }
 
+/// DIAG (never for main): once a formation wait has run past [`FLEET_WAIT`], prints the fleet's record-session lends,
+/// returns, hold times and the borrowers that found each session out, with the discovery and link counters, once.
+fn slow_formation(began: Instant, dumped: &mut bool, stage: &str, instances: &[String]) {
+  if !*dumped && began.elapsed() >= FLEET_WAIT {
+    *dumped = true;
+    eprintln!(
+      "DIAG slow formation: {stage} still waiting after {:?}\n{}",
+      began.elapsed(),
+      diagnosis(instances, "")
+    );
+  }
+}
+
 /// Waits until every node holds all `members` members alive with its probe mesh up ([`meshed`]); returns their member
 /// ids.
 fn wait_formed(instances: &[String], members: usize) -> Vec<String> {
   let mut window = FrozenWindow::new();
+  let (began, mut dumped) = (Instant::now(), false);
   loop {
+    slow_formation(began, &mut dumped, "formation", instances);
     let views: Vec<_> = instances
       .iter()
       .map(|instance| fleet_view(instance))
@@ -331,6 +346,7 @@ fn wait_formed(instances: &[String], members: usize) -> Vec<String> {
         .as_ref()
         .is_some_and(|(_, held, _)| *held == members && meshed(*mesh))
     }) {
+      eprintln!("DIAG formation took {:?}", began.elapsed());
       return views.into_iter().map(|view| view.unwrap().0).collect();
     }
     // Progress counts a node's mesh coming up as well as its members and probes changing.
@@ -417,7 +433,9 @@ impl FrozenWindow {
 /// a record session to each peer (`live_fleet.rs`'s `wait_settled`, which says why).
 fn wait_settled(instances: &[String], members: usize) {
   let mut window = FrozenWindow::new();
+  let (began, mut dumped) = (Instant::now(), false);
   loop {
+    slow_formation(began, &mut dumped, "settlement", instances);
     let views: Vec<(String, String, usize)> = instances
       .iter()
       .map(|instance| {
@@ -460,6 +478,7 @@ fn wait_settled(instances: &[String], members: usize) {
         .all(|(_, _, sessions)| Some(*sessions) == members.checked_sub(1));
     let whole = configured_everywhere && seated >= expected && meshed;
     if whole {
+      eprintln!("DIAG settlement took {:?}", began.elapsed());
       return;
     }
     assert!(
@@ -1350,6 +1369,10 @@ fn diagnosis(instances: &[String], volume: &str) -> String {
             || line.contains("fleet.ship.")
             || line.starts_with("fleet_record_link")
             || line.contains("fleet.link.")
+            || line.contains("diag.link.")
+            || line.contains("fleet.discovery")
+            || line.starts_with("fleet_peers_")
+            || line.starts_with("fleet_council")
             || line.contains("fleet.accept.")
             || line.starts_with("fleet_formed_probe_peers")
             || line.starts_with("fleet_contacts")
