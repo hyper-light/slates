@@ -7,3 +7,14 @@ error[E0433]: cannot find module or crate `slates_bridge_nfs` in this scope
 error[E0433]: cannot find `time` in `rustix`
 error[E0433]: cannot find `time` in `rustix`
 error: could not compile `slates-cli` (example "nfs_large_write") due to 6 previous errors
+server exit 101
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test a_volume_that_lives_through_a_paged_walk_is_listed_exactly_once ... FAILED
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.38s
+error: test failed, to rerun pass `-p slates-server --test volume_list`
+error: 1 target failed:
+thread 'a_volume_that_lives_through_a_paged_walk_is_listed_exactly_once' (4916) panicked at crates\server\tests\volume_list.rs:180:3:
+no volume listed after its destroy
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
