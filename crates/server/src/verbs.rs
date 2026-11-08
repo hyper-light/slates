@@ -3317,24 +3317,15 @@ fn group_report(
 /// consensus groups' state taken from the control shard's part (the only live one).
 /// The members this node keeps direct contact with, this node left out (`fleet::keeps_direct_contact_with`), and how
 /// many of them have no formed probe session yet: the probe mesh's peers and what keeps it down. Counted over the
-/// members the membership holds alive (what `fleet_members` reports), not the configuration's members: before the
-/// council's first commit that list is empty, so every fleet read none in contact while it probed every peer
+/// members the membership holds alive (what `fleet_members` reports), not the configuration's members: from the
+/// bootstrap until the others are admitted that list names the bootstrapping node alone, so a forming fleet read none
+/// in contact while it probed every peer
 /// (raft-chaos's and live-fixes' flows on CI, diag-live-fixes-32: `in_contact=0 probed=4` on a forming five-node fleet).
 fn peers_in_contact(state: &ShardState) -> (u32, u32) {
-  let host = state.fleet.host();
-  let (contact, unmeshed) = state
-    .fleet
-    .membership()
-    .alive()
-    .into_iter()
-    .filter(|peer| *peer != host && crate::fleet::keeps_direct_contact_with(state, *peer))
-    .fold((0usize, 0usize), |(contact, unmeshed), peer| {
-      let missing = usize::from(!state.formed_probe_peers.contains(&peer));
-      (contact.saturating_add(1), unmeshed.saturating_add(missing))
-    });
+  let mesh = crate::fleet::probe_mesh(state);
   (
-    u32::try_from(contact).unwrap_or(u32::MAX),
-    u32::try_from(unmeshed).unwrap_or(u32::MAX),
+    u32::try_from(mesh.in_contact.len()).unwrap_or(u32::MAX),
+    u32::try_from(mesh.unmeshed.len()).unwrap_or(u32::MAX),
   )
 }
 

@@ -2869,6 +2869,38 @@ fn start_mesh_unsettled(
     slates_db::register::RegionId,
   >,
 ) -> Vec<Daemon> {
+  let daemons = start_mesh_unbootstrapped(
+    nodes,
+    hosts.len(),
+    hosts,
+    certs,
+    serve,
+    f,
+    shards,
+    regions,
+    mirrors,
+  );
+  bootstrap_mesh(&daemons, hosts, regions);
+  daemons
+}
+
+/// [`start_mesh_unsettled`] before the explicit bootstrap: the first `started` of `nodes` started over one manifest
+/// naming them all, no consensus group created, so the council's configuration lists no member yet.
+#[allow(clippy::too_many_arguments)]
+fn start_mesh_unbootstrapped(
+  nodes: Vec<(MachineProfile, HostId, Identity)>,
+  started: usize,
+  hosts: &[HostId],
+  certs: &[rustls::pki_types::CertificateDer<'static>],
+  serve: &[(u16, u16)],
+  f: u32,
+  shards: u16,
+  regions: &std::collections::BTreeMap<HostId, slates_db::register::RegionId>,
+  mirrors: &std::collections::BTreeMap<
+    slates_db::register::RegionId,
+    slates_db::register::RegionId,
+  >,
+) -> Vec<Daemon> {
   let pid = std::process::id();
   let n = hosts.len();
   // Each node's stable anchor (the machine-identity hash its member ids derive from, task #22), so every
@@ -2879,6 +2911,7 @@ fn start_mesh_unsettled(
     .collect();
   let daemons: Vec<Daemon> = nodes
     .into_iter()
+    .take(started)
     .enumerate()
     .map(|(i, (profile, host, identity))| {
       let peers: Vec<FleetPeer> = (0..n)
@@ -2924,7 +2957,6 @@ fn start_mesh_unsettled(
       .expect("the fleet daemon starts")
     })
     .collect();
-  bootstrap_mesh(&daemons, hosts, regions);
   daemons
 }
 
@@ -6484,6 +6516,74 @@ fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losin
   );
 }
 
+/// §4.8, the probe mesh judged non-vacuously: a node of a three-node manifest is started alone, its two peers never
+/// started, so no probe session can ever form. Do ask whether it is meshed before its bootstrap, after it (the council's
+/// first configuration names this node alone), and again once its detector has had a liveness budget's worth of
+/// periods to condemn the silent peers. Expect never: it keeps direct contact with peers it has no session to, and once they are
+/// held dead it is a fleet of several with no peer in contact, not a laptop. Before, the mesh was judged over the
+/// council configuration's members, which name the bootstrapping node alone until the others are admitted, so
+/// `form_and_settle`'s wait passed with no session at all (live-fixes, 2026-11-07, the same predicate as status's
+/// `fleet_peers_in_contact`, 518a1e82).
+#[test]
+fn a_node_whose_peers_never_answer_is_never_meshed() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh_unbootstrapped(
+    nodes,
+    1,
+    &hosts,
+    &certs,
+    &serve,
+    1,
+    1,
+    &std::collections::BTreeMap::new(),
+    &std::collections::BTreeMap::new(),
+  );
+  let daemon = &daemons[0];
+  assert_eq!(
+    (daemon.fleet_meshed(), daemon.fleet_formed_probe_peers()),
+    (Ok(false), Ok(Vec::new())),
+    "before the bootstrap, a node with no session to either peer is not meshed: unmeshed {:?}",
+    daemon.fleet_unmeshed()
+  );
+  // The bootstrap, as `form_and_settle` runs it before its wait: the council's first configuration names this node
+  // alone until the others are admitted over sessions that cannot form.
+  daemon
+    .bootstrap(true)
+    .expect("the lone node bootstraps the root and its region's council");
+  assert_eq!(
+    (daemon.fleet_meshed(), daemon.fleet_formed_probe_peers()),
+    (Ok(false), Ok(Vec::new())),
+    "after the bootstrap, a node with no session to either peer is not meshed: council members {:?}, unmeshed {:?}",
+    daemon.council_members(),
+    daemon.fleet_unmeshed()
+  );
+  // A liveness budget's worth of this node's own periods: long enough for the detector to condemn both silent peers.
+  let started = daemon.fleet_progress();
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let _ = poll_until(&observed, formation_deadline(), || {
+    Ok(daemon.fleet_progress().saturating_sub(started) >= SILENT_PEER_PERIODS)
+  });
+  assert_eq!(
+    daemon.fleet_meshed(),
+    Ok(false),
+    "a node whose peers were never reached is not meshed after {} periods: members {:?}, unmeshed {:?}",
+    daemon.fleet_progress().saturating_sub(started),
+    daemon.fleet_members(),
+    daemon.fleet_unmeshed()
+  );
+}
+
+/// Shape: the coordinator periods [`a_node_whose_peers_never_answer_is_never_meshed`] waits after start before it asks
+/// again: ten liveness budgets of one second at the 100 ms period, past the detector's condemnation of a silent peer.
+const SILENT_PEER_PERIODS: u64 = 100;
+
 /// Polls until every daemon's **direct probe mesh** has formed — each node has a live probe session to
 /// each of its peers ([`Daemon::fleet_meshed`]) — or fails at the formation deadline naming who is still
 /// unmeshed. It waits for the real mesh, not the membership's optimistically seeded alive set (every
@@ -6496,6 +6596,20 @@ fn assert_fleet_forms(daemons: &[Daemon], _hosts: &[HostId], names: &[&str]) {
   if poll_until(&observed, formation_deadline(), || {
     all_hold(daemons.iter().map(|daemon| daemon.fleet_meshed()))
   }) {
+    // Non-vacuity: the sessions each node had formed when the mesh passed. A fleet of several whose node formed none
+    // was judged meshed over nothing, as a bootstrapped node was until the others were admitted, until 2026-11-07.
+    let formed: Vec<usize> = daemons
+      .iter()
+      .map(|daemon| {
+        daemon
+          .fleet_formed_probe_peers()
+          .map_or(0, |peers| peers.len())
+      })
+      .collect();
+    assert!(
+      daemons.len() < 2 || formed.iter().all(|sessions| *sessions > 0),
+      "the mesh passed with a node holding no probe session: sessions formed {formed:?} ({names:?})"
+    );
     return;
   }
   // Still not meshed: assert with a message naming every node's state — meshed or not, the members it
