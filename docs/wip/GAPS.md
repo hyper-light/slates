@@ -5441,6 +5441,9 @@ submitted to it) so no exchange waits for another's.
 > own exchange, not on the session. Record: `docs/bugs/2026-11-07-the-control-shard-could-not-run-what-its-lane-admitted.md`;
 > the load-test entries "A forward refused at admission left its client waiting" and "A forward its owner never
 > answered stayed open on a busy session".
+>
+> The formation case is measured in the 2026-11-08 status below: not reproduced at 2 and 8 spinners per CPU, every
+> session returned, so the forward lane is the case for the shared session.
 
 ### 2026-09-29: a lone owner refused its own objects — fixed; campaign counters added for the open KIND items
 

@@ -979,7 +979,7 @@ async fn await_deferred_completion(
         .completion(origin_host, id.client, id.sequence)
       {
         Seen::Completed(bytes) => Some(bytes),
-        Seen::Acknowledged | Seen::New => None,
+        Seen::Acknowledged | Seen::New | Seen::Awaiting { .. } => None,
       },
       crate::daemon::LIVENESS_BUDGET_NS,
     )
@@ -1981,6 +1981,11 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
       );
     }
     Seen::Acknowledged => return Served::Reply(refused(Refusal::DuplicateRequest)),
+    // It ran and waits for its version's commit (A-252): answered, or joined to the wait, never run again.
+    Seen::Awaiting { object, version } => {
+      return crate::merge_service::serve_awaiting(state, origin, id, (object, version))
+        .map_or(Served::Forwarded, Served::Reply);
+    }
     Seen::New => {
       // A retry of a submit whose acceptance still waits for its commit joins the wait: it is answered
       // with the committed result when the version places, never a success from memory. A retry of a
@@ -2402,6 +2407,9 @@ fn run_forwarded(
       );
     }
     Seen::Acknowledged => return Some(refused(Refusal::DuplicateRequest)),
+    Seen::Awaiting { object, version } => {
+      return crate::merge_service::serve_awaiting(state, origin, id, (object, version));
+    }
     Seen::New => {
       // A retry of a submit whose acceptance still waits for its commit joins the wait, as does a retry
       // of a granted landing still running (AUD-29-03).
@@ -6478,6 +6486,10 @@ fn submit(
   crate::telemetry::emit(state, verdict.end(accepted, verdict_end));
   match outcome {
     slates_merge::engine::Outcome::Accepted { version } => {
+      // The wait goes first, in this transaction, so a version is never durable without it (A-252).
+      if let Err(e) = crate::merge_service::stage_awaiting(state, green_id, version) {
+        return refused(refusal_of_db(&e));
+      }
       // The pre-check passed and the shard is single-threaded, so this append fits the budget; a
       // segment-full failure refuses like any other verb. A resubmit the engine answered from its
       // idempotent accept names a version the chain already holds: nothing is appended twice.

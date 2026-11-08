@@ -1799,6 +1799,9 @@ enum OwedStep {
   Hold(usize),
   /// The client releases its `n`-th owed id unanswered (gives the resend up).
   Release(usize),
+  /// The server runs the client's `n`-th owed id and it waits for a version to commit (A-252): it stays owed, durable as
+  /// waiting until its completion replaces that.
+  Await(usize),
   /// The client sends an acknowledgement of where it stands: every id issued, the owed ones named.
   Acknowledge,
   /// The `n`-th acknowledgement in flight is delivered, and stays in flight too when `again` (a duplicate).
@@ -1813,6 +1816,7 @@ fn owed_step() -> impl Strategy<Value = OwedStep> {
     2 => (0..8usize).prop_map(OwedStep::Answer),
     1 => (0..8usize).prop_map(OwedStep::Hold),
     1 => (0..8usize).prop_map(OwedStep::Release),
+    1 => (0..8usize).prop_map(OwedStep::Await),
     2 => Just(OwedStep::Acknowledge),
     3 => (0..8usize, any::<bool>()).prop_map(|(n, again)| OwedStep::Deliver(n, again)),
     1 => Just(OwedStep::Crash),
@@ -1821,6 +1825,8 @@ fn owed_step() -> impl Strategy<Value = OwedStep> {
 
 /// Shape: the client of the owed-acknowledgement model.
 const OWING_CLIENT: u32 = 9;
+/// Shape: the green its waiting requests wait on.
+const OWED_GREEN: VolumeId = VolumeId { bytes: [5; 16] };
 
 /// The model client: its last issued id, the ids it owes, and the acknowledgements it sent not yet delivered.
 #[derive(Default)]
@@ -1828,6 +1834,8 @@ struct OwingClient {
   issued: u32,
   owed: std::collections::BTreeSet<u32>,
   recorded: std::collections::BTreeSet<u32>,
+  /// The ids waiting for a version, by that version (A-252).
+  awaiting: std::collections::BTreeMap<u32, u64>,
   in_flight: Vec<(u32, Vec<u32>)>,
 }
 
@@ -1870,6 +1878,26 @@ fn owed_step_applied(
         if matches!(step, OwedStep::Answer(_)) {
           client.owed.remove(&sequence);
         }
+      }
+    }
+    OwedStep::Await(n) => {
+      if let Some(sequence) = client.nth_owed(*n)
+        && !client.recorded.contains(&sequence)
+      {
+        let version = u64::from(sequence) + 100;
+        db.mutate(
+          seg,
+          &Op::CompletionAwaiting {
+            origin: 0,
+            client: OWING_CLIENT,
+            sequence,
+            green: OWED_GREEN,
+            version,
+          },
+          0,
+        )
+        .map_err(failed)?;
+        client.awaiting.insert(sequence, version);
       }
     }
     OwedStep::Release(n) => {
@@ -1930,8 +1958,79 @@ proptest! {
         prop_assert!(seen != Seen::Acknowledged, "owed id {} released after {:?}", owed, step);
         if client.recorded.contains(owed) {
           prop_assert_eq!(seen, Seen::Completed(owed.to_le_bytes().to_vec()), "owed id {} lost its record", owed);
+        } else if let Some(version) = client.awaiting.get(owed) {
+          // Never `New`: a request that ran and waits is never run again, across any recovery (A-252).
+          prop_assert_eq!(
+            seen,
+            Seen::Awaiting { object: OWED_GREEN.bytes, version: *version },
+            "owed id {} lost its wait", owed
+          );
         }
       }
     }
   }
+}
+
+/// §4.16 "Commit", A-252: a request's wait and the effect it waits on are one durable step. Do: in one transaction, a
+/// wait and a second operation; drop the database before the commit, recover; then the same and commit, recover. Expect:
+/// before the commit neither is there, the request `New` (it never ran as far as the log knows); after it the wait is
+/// there, and a completion recorded later replaces it through a further recovery.
+#[test]
+fn a_wait_and_its_transaction_are_one_durable_step() {
+  let mut seg = segment("slates-db-await-atomic", LOG_BYTES);
+  let mut db = open(&mut seg);
+  let wait = Op::CompletionAwaiting {
+    origin: 0,
+    client: OWING_CLIENT,
+    sequence: 3,
+    green: OWED_GREEN,
+    version: 7,
+  };
+  let other = Op::CompletionRecorded {
+    record: CompletionRecord {
+      origin: 0,
+      client: OWING_CLIENT,
+      sequence: 1,
+      result: b"other".to_vec(),
+    },
+  };
+  db.begin();
+  db.mutate(&mut seg, &wait, 0).unwrap();
+  db.mutate(&mut seg, &other, 0).unwrap();
+  drop(db);
+  let (mut db, ..) = recover(&mut seg, 0, caps(), 0).unwrap();
+  assert_eq!(db.partition().completion(0, OWING_CLIENT, 3), Seen::New);
+  assert_eq!(db.partition().completion(0, OWING_CLIENT, 1), Seen::New);
+  db.begin();
+  db.mutate(&mut seg, &wait, 0).unwrap();
+  db.mutate(&mut seg, &other, 0).unwrap();
+  db.commit(&mut seg).unwrap();
+  drop(db);
+  let (mut db, ..) = recover(&mut seg, 0, caps(), 0).unwrap();
+  assert_eq!(
+    db.partition().completion(0, OWING_CLIENT, 3),
+    Seen::Awaiting {
+      object: OWED_GREEN.bytes,
+      version: 7
+    }
+  );
+  db.mutate(
+    &mut seg,
+    &Op::CompletionRecorded {
+      record: CompletionRecord {
+        origin: 0,
+        client: OWING_CLIENT,
+        sequence: 3,
+        result: b"seven".to_vec(),
+      },
+    },
+    0,
+  )
+  .unwrap();
+  drop(db);
+  let (db, ..) = recover(&mut seg, 0, caps(), 0).unwrap();
+  assert_eq!(
+    db.partition().completion(0, OWING_CLIENT, 3),
+    Seen::Completed(b"seven".to_vec())
+  );
 }
