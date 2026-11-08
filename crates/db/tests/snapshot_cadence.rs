@@ -15,7 +15,7 @@ use slates_db::catalog::{
   VolumeRecord, VolumeState,
 };
 use slates_db::partition::PartitionCaps;
-use slates_db::replay::{Tail, recover};
+use slates_db::replay::{Recovered, Tail, recover};
 use slates_machine::facts::Identity;
 
 /// Shape: the segment page.
@@ -292,10 +292,10 @@ fn a_fresh_partitions_longest_tail_replays_within_its_recovery_budget() {
   let mut replay_ns = Vec::with_capacity(RECOVERIES);
   let mut replayed = 0u64;
   for _ in 0..RECOVERIES {
-    let recovered = recover(&mut seg, 0, caps(), 0).unwrap().1;
+    let (recovered, cost_ns) = recovery_cost_ns(|| recover(&mut seg, 0, caps(), 0).unwrap().1);
     assert!(!recovered.torn, "the tail verifies");
     replayed = recovered.replayed_bytes;
-    replay_ns.push(recovered.replay_ns);
+    replay_ns.push(cost_ns);
   }
   let in_order = {
     let mut sorted = replay_ns.clone();
@@ -363,21 +363,46 @@ fn advance_and_fold(db: &mut slates_db::replay::Db, seg: &mut AnchorSegment, id:
   .unwrap();
 }
 
-/// The median of `CHECK_RECOVERIES` timed recoveries of the segment's tail as it stands, and the bytes it replayed.
+/// The median cost of `CHECK_RECOVERIES` recoveries of the segment's tail as it stands ([`recovery_cost_ns`]), and the
+/// bytes it replayed.
 fn timed_tail(seg: &mut AnchorSegment) -> (u64, u64) {
   let mut replay_ns = Vec::with_capacity(CHECK_RECOVERIES);
   let mut replayed = 0u64;
   for _ in 0..CHECK_RECOVERIES {
-    let recovered = recover(seg, 0, caps(), 0).unwrap().1;
+    let (recovered, cost_ns) = recovery_cost_ns(|| recover(seg, 0, caps(), 0).unwrap().1);
     assert!(!recovered.torn, "the tail verifies");
     replayed = recovered.replayed_bytes;
-    replay_ns.push(recovered.replay_ns);
+    replay_ns.push(cost_ns);
   }
   replay_ns.sort_unstable();
   (
     replay_ns.get(CHECK_RECOVERIES / 2).copied().unwrap(),
     replayed,
   )
+}
+
+/// A recovery and what it cost, as the calling thread's CPU time: the work the replay did, which a loaded machine does
+/// not stretch. Its wall time (`Recovered::replay_ns`) failed the 10 ms budget on Macs at moderate load: 12.2 ms 3 of 3
+/// (liveness) and 4 of 4 at load about 44 (live-durability), 2026-11-08. The recovery runs on this thread, whose clock
+/// starts and ends it.
+#[cfg(unix)]
+fn recovery_cost_ns(recovery: impl FnOnce() -> Recovered) -> (Recovered, u64) {
+  let before =
+    slates_rt::registry::calling_thread_cpu().expect("a Unix thread reads its CPU clock");
+  let recovered = recovery();
+  let after = slates_rt::registry::calling_thread_cpu().expect("a Unix thread reads its CPU clock");
+  let cost_ns = after.spent_ns.saturating_sub(before.spent_ns);
+  (recovered, cost_ns)
+}
+
+/// [`recovery_cost_ns`] on Windows, by wall time: the thread's CPU time is charged a scheduler tick at a time there
+/// (15.6 ms by default, more than the 10 ms budget), so it cannot judge a span this short. CI's Windows runner is not
+/// the loaded machine the CPU clock answers.
+#[cfg(not(unix))]
+fn recovery_cost_ns(recovery: impl FnOnce() -> Recovered) -> (Recovered, u64) {
+  let recovered = recovery();
+  let cost_ns = recovered.replay_ns;
+  (recovered, cost_ns)
 }
 
 /// A-243, §4.8 (the record mix). Do: on a fresh segment with a 10 ms recovery budget, append large records (64 KiB
