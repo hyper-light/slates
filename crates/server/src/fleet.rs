@@ -1211,7 +1211,13 @@ async fn establish_session(
     None => client_for(identity, name, (address, plane), certificate, resolver).await,
   };
   match client {
-    Some(mut endpoint) => match endpoint.establish().await {
+    Some(mut endpoint) => match {
+      // Diag only (live-durability-53, never on main).
+      let began = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos());
+      let outcome = endpoint.establish().await;
+      let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("LD-DIAL {name} to {address} began_wall {began} ended_wall {} ok {}\n", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos()), outcome.is_ok()).as_bytes());
+      outcome
+    } {
       Ok(()) => (None, Some(endpoint)),
       // The handshake ran out a budget with the peer silent: keep the socket and its pending flight for
       // the next period's call, which resends the flight (`Endpoint::establish`), up to
@@ -4441,6 +4447,7 @@ async fn enroll_record_session(
         .record_sessions
         .insert(peer_host, crate::state::RecordLink::up(session));
     });
+    crate::live_ship::holder_reached(peer_host);
   }
 }
 

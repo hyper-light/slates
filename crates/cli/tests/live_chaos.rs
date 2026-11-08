@@ -590,6 +590,8 @@ impl Fleet {
 
   fn resume(&self, index: usize) {
     send_signal(self.daemon_pid(index), rustix::process::Signal::CONT);
+    // Diag only (live-durability-53, never on main).
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("LD-RESUME {} wall_ns {}\n", self.instances[index], std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos())).as_bytes());
   }
 
   /// Kills node `index` whole (its anchor too): what a crashed machine is.
