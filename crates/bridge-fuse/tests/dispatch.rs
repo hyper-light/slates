@@ -88,6 +88,10 @@ impl Bridge for Mock {
   fn awaits_publication(&self) -> bool {
     false
   }
+  // The mock's every context may change it, as its write verbs answer.
+  fn authorize_change(&self, _cx: &OpContext) -> Result<(), VfsError> {
+    Ok(())
+  }
   fn lookup(
     &mut self,
     parent: ObjectId,

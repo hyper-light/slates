@@ -457,6 +457,7 @@ fn list_page(state: &mut ShardState, local: HostId, prepare: &HostPrepare) -> Ho
     entries: Vec::new(),
     next: None,
     fenced: None,
+    unpromised: 0,
   };
   let mut used = slates_db::register::HOST_PROMISE_HEADER_BYTES;
   let mut last = prepare.after;
@@ -474,16 +475,44 @@ fn list_page(state: &mut ShardState, local: HostId, prepare: &HostPrepare) -> Ho
         used = used.saturating_add(size);
         promise.entries.push((object, highest));
       }
+      // The acceptor holds nothing for this object, and promised that by raising its fence.
       Ok(None) => {}
-      Err(RegisterError::StaleEpoch { current }) => {
-        let fence = HostEpoch(current);
-        promise.fenced = Some(promise.fenced.map_or(fence, |seen| seen.max(fence)));
-      }
-      Err(_) => {}
+      Err(refusal) => note_refusal(&mut promise, refusal, &mut state.refusals),
     }
     last = Some(object);
   }
   promise
+}
+
+/// Counter: a copy a holder could not promise for a reason other than a higher fence (a generation newer than the
+/// asker's), so its page is no answer for it.
+const TAKEOVER_PAGE_UNPROMISED: &str = "fleet.takeover.page_unpromised";
+
+/// Records why `promise` could not cover one held copy. A fence above the epoch is the asker's to retry above; any
+/// other refusal leaves the page short of an answer ([`HostPromise::unpromised`]), since a copy left out would otherwise
+/// read as a copy not held, and a successor could adopt an older record over it.
+fn note_refusal(
+  promise: &mut HostPromise,
+  refusal: RegisterError,
+  counters: &mut BTreeMap<&'static str, u64>,
+) {
+  if let RegisterError::StaleEpoch { current } = refusal {
+    let fence = HostEpoch(current);
+    promise.fenced = Some(promise.fenced.map_or(fence, |seen| seen.max(fence)));
+  } else {
+    promise.unpromised = promise.unpromised.saturating_add(1);
+    let count = counters.entry(TAKEOVER_PAGE_UNPROMISED).or_insert(0);
+    *count = count.saturating_add(1);
+  }
+}
+
+/// How far a holder's answer has come: where its next page starts, and whether it has answered in full. A page that
+/// could not promise a copy it holds is not a full answer, however little was left to list.
+fn page_of(promise: &HostPromise) -> Page {
+  Page {
+    after: promise.next,
+    complete: promise.next.is_none() && promise.unpromised == 0,
+  }
 }
 
 /// Promises `object` to the asker: installs the asker's authority under the round's generation and runs the
@@ -795,6 +824,7 @@ fn fold_answers(state: &mut ShardState, departed: HostId, answers: Vec<(HostId, 
       take.fenced = Some(take.fenced.map_or(fence, |seen| seen.max(fence)));
       continue;
     }
+    let page = page_of(&promise);
     for (object, highest) in promise.entries {
       if !take.adopted.contains(&object) {
         take
@@ -804,13 +834,7 @@ fn fold_answers(state: &mut ShardState, departed: HostId, answers: Vec<(HostId, 
           .insert(host, highest);
       }
     }
-    take.pages.insert(
-      host,
-      Page {
-        after: promise.next,
-        complete: promise.next.is_none(),
-      },
-    );
+    take.pages.insert(host, page);
   }
 }
 
@@ -1130,7 +1154,112 @@ fn round_done(state: &ShardState, departed: HostId, local: HostId) -> bool {
 mod tests {
   use super::*;
   use crate::head::{HeadKey, HeadSealing};
-  use slates_db::register::HostEpoch;
+  use slates_db::register::{Authority, HostEpoch, HostId as RegisterHost, Record};
+
+  /// §4.8 phase one: a holder's page is a promise only for what it could actually promise. Do: have a real acceptor,
+  /// holding a record under a newer generation, refuse a prepare from an older one, and record that refusal in a page;
+  /// also record a higher fence. Expect: the generation refusal leaves the page not complete and counted, so the holder is
+  /// not read as holding nothing; the fence is left for the asker to retry above and does not.
+  #[test]
+  fn a_holder_that_could_not_promise_a_copy_has_not_answered_for_it() {
+    let host = RegisterHost(7);
+    let object = ObjectId::new(host, 1);
+    let mut acceptor = Acceptor::new(
+      RegisterHost(2),
+      Authority {
+        generation: 9,
+        owner: host,
+      },
+    );
+    acceptor
+      .accept(&Record {
+        owner: host,
+        object,
+        sequence: 1,
+        epoch: HostEpoch(1),
+        generation: 9,
+        value: b"newer".to_vec(),
+      })
+      .unwrap();
+    let prepare = HostPrepare {
+      departed: host,
+      owner: RegisterHost(3),
+      epoch: HostEpoch(4),
+      generation: 5,
+      after: None,
+    };
+    let refusal = promise_object(&mut acceptor, object, &prepare).unwrap_err();
+    let mut promise = HostPromise {
+      holder: RegisterHost(2),
+      departed: host,
+      epoch: prepare.epoch,
+      generation: prepare.generation,
+      entries: Vec::new(),
+      next: None,
+      fenced: None,
+      unpromised: 0,
+    };
+    let mut counters = BTreeMap::new();
+    assert!(page_of(&promise).complete, "an empty answer is a full one");
+    note_refusal(&mut promise, refusal, &mut counters);
+    assert_eq!(promise.unpromised, 1);
+    assert!(
+      !page_of(&promise).complete,
+      "a copy left out is not answered for"
+    );
+    assert_eq!(counters.get(TAKEOVER_PAGE_UNPROMISED), Some(&1));
+
+    let mut fenced = HostPromise {
+      unpromised: 0,
+      ..promise.clone()
+    };
+    note_refusal(
+      &mut fenced,
+      RegisterError::StaleEpoch { current: 8 },
+      &mut counters,
+    );
+    assert_eq!(fenced.fenced, Some(HostEpoch(8)));
+    assert_eq!(
+      fenced.unpromised, 0,
+      "the fence is the asker's to retry above"
+    );
+  }
+
+  /// §4.8 phase one: `None` from a holder means it holds nothing, so the empty promise stands. Do: prepare on a fresh
+  /// acceptor and on one holding a record. Expect: `None` and the record.
+  #[test]
+  fn a_holder_lists_every_copy_it_holds_and_only_those() {
+    let host = RegisterHost(7);
+    let object = ObjectId::new(host, 1);
+    let authority = Authority {
+      generation: 5,
+      owner: host,
+    };
+    let prepare = HostPrepare {
+      departed: host,
+      owner: host,
+      epoch: HostEpoch(4),
+      generation: 5,
+      after: None,
+    };
+    let mut empty = Acceptor::new(RegisterHost(2), authority);
+    assert_eq!(promise_object(&mut empty, object, &prepare), Ok(None));
+    let mut holding = Acceptor::new(RegisterHost(2), authority);
+    holding
+      .accept(&Record {
+        owner: host,
+        object,
+        sequence: 1,
+        epoch: HostEpoch(1),
+        generation: 5,
+        value: b"held".to_vec(),
+      })
+      .unwrap();
+    assert!(matches!(
+      promise_object(&mut holding, object, &prepare),
+      Ok(Some(_))
+    ));
+  }
 
   fn sealed(keys: &[u64], manifest: u8) -> HeadValue {
     HeadValue {

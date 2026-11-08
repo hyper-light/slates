@@ -577,7 +577,7 @@ impl Db {
     self.pending.is_some()
   }
 
-  /// Publishes the partition into the alternate snapshot slot and trims the log behind it.
+  /// Publishes the partition into the alternate snapshot slot and releases the log behind it.
   pub fn snapshot(&mut self, segment: &mut AnchorSegment) -> Result<(), DbError> {
     let seq = self.next_seq.saturating_sub(1);
     let started = Instant::now();
@@ -588,7 +588,7 @@ impl Db {
     let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     // The next snapshot's floor (A-243): the tail must reach this one's size first.
     self.snapshot_floor_bytes = snapshot_bytes;
-    self.log.trim(segment, self.next_seq)?;
+    self.log.release_all(segment, self.next_seq)?;
     self.next_slot = other_slot(self.next_slot);
     self.since_snapshot_bytes = 0;
     self.replay_work_ns_since_snapshot = 0;

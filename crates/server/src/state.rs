@@ -233,6 +233,10 @@ pub struct ShardState {
   /// The content arena's allocation count when the reserve's refill last found nothing to fault (A-214): until the
   /// arena allocates again, or the burst measure moves, an idle moment's refill has nothing to do.
   pub(crate) refill_settled: Option<u64>,
+  /// The bytes one idle give-back step walks (A-226), the recovery memory's and the write log's alike: what the OS gave
+  /// back in one step quantum the last time, measured by each step for the next (`daemon::learn_give_back_rate`); zero
+  /// until the first, which takes a page.
+  pub(crate) give_back_slice_bytes: usize,
   /// The half-open byte range `[start, end)` of `content` this shard publishes into and recovers
   /// from; `0..0` when there is no content object.
   pub content_range: (usize, usize),
@@ -256,9 +260,10 @@ pub struct ShardState {
   /// itself, by its write verifier).
   #[cfg(target_os = "linux")]
   pub(crate) write_log: Option<crate::write_log::WriteLog>,
-  /// What the previous daemon's log held to replay, consumed when the volumes are rebuilt (A-63).
+  /// What the previous daemon's log held to replay, its writes and `FORGET`s, consumed when the volumes are rebuilt
+  /// (A-63).
   #[cfg(target_os = "linux")]
-  pub(crate) replay: Vec<crate::write_log::Record>,
+  pub(crate) replay: Vec<crate::write_log::Logged>,
   /// Whether the previous daemon acknowledged a write it could not log (its log overflowed and the publication that
   /// would have emptied it was refused): every file a taken-over mount had open is then reported as having lost
   /// writes (A-61, A-63). Linux only, as FUSE is.

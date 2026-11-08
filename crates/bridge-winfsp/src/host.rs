@@ -104,6 +104,13 @@ pub enum WinFspError {
   },
 }
 
+impl From<crate::inflight::Refusal> for WinFspError {
+  /// A journal refusal ends the receive worker as a capture refusal (`crate::inflight::settle`).
+  fn from(refusal: crate::inflight::Refusal) -> Self {
+    Self::Capture(refusal)
+  }
+}
+
 impl std::fmt::Display for WinFspError {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
@@ -1039,14 +1046,18 @@ fn op_set_times(
 /// first, and one child, which is enough to refuse.
 const DOTS_AND_ONE_CHILD: usize = 3;
 
-/// Whether `object` may be deleted: a directory refuses `NotEmpty` (`STATUS_DIRECTORY_NOT_EMPTY`) while it has any child,
-/// read from the first few entries of its listing; any other object may.
+/// Whether `object` may be deleted: refused before Windows marks it for deletion when the attachment may not change the
+/// volume (`ReadOnly`, `STATUS_MEDIA_WRITE_PROTECTED`: the delete itself happens at the cleanup, which has no reply, so
+/// a refusal there was silent and `DeleteFile` reported success); a directory refuses `NotEmpty`
+/// (`STATUS_DIRECTORY_NOT_EMPTY`) while it has any child, read from the first few entries of its listing; any other
+/// object may.
 fn op_can_delete(
   bridge: &mut dyn Bridge,
   cx: &OpContext,
   object: ObjectId,
   fh: u64,
 ) -> Result<Reply, VfsError> {
+  bridge.authorize_change(cx)?;
   if !matches!(bridge.getattr(object, cx)?.kind, Kind::Dir) {
     return Ok(Reply::Ok);
   }
@@ -2319,14 +2330,8 @@ fn run_mount(
       .read(at, &mut captured)
       .map_err(|error| WinFspError::Ledger(crate::opens::Refusal::Memory(error)))?;
     let mut scratch = crate::inflight::Scratch::new().map_err(WinFspError::Capture)?;
-    let saved_open = crate::inflight::capture::Capture::new(&mut captured)
-      .map_err(WinFspError::Capture)?
-      .resume(&mut scratch)
-      .map_err(WinFspError::Capture)?
-      .map(|batch| batch.saved_open())
-      .transpose()
-      .map_err(WinFspError::Capture)?
-      .flatten();
+    let saved_open = crate::inflight::settle::saved_open(&mut captured, &mut scratch)
+      .map_err(WinFspError::Capture)?;
     ledger
       .settle_pending(saved_open)
       .map_err(WinFspError::Ledger)?;

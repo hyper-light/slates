@@ -539,6 +539,15 @@ pub fn record_cpu_clock(shard: u16) {
   }
 }
 
+/// The calling thread's CPU clock now, or `None` where the platform reads none (Miri): for a caller that judges its own
+/// work by the CPU it spent rather than the wall time it took, which a loaded machine stretches (§4.14's rule for an
+/// observation's budget, applied by `crates/db/tests/snapshot_cadence.rs` to a recovery's cost). Windows charges the
+/// time a scheduler tick at a time (15.6 ms by default; see `thread_clock`), so a span shorter than a few ticks reads
+/// coarsely there.
+pub fn calling_thread_cpu() -> Option<crate::thread_clock::CpuReading> {
+  crate::thread_clock::current().and_then(crate::thread_clock::read)
+}
+
 /// The CPU clock of the shard `holder` names: `None` when that registration no longer holds its slot, its thread
 /// recorded no clock, or the platform has none. An observer reads it to tell a starved shard, still consuming CPU, from
 /// a wedged one (§4.14).
@@ -551,16 +560,30 @@ pub fn shard_cpu(holder: SlotHolder) -> Option<crate::thread_clock::CpuReading> 
   .and_then(crate::thread_clock::read)
 }
 
-/// The scheduler state of the shard `holder` names at this instant: `None` when that registration no longer holds its
-/// slot, its thread recorded no clock, or the platform reads no run state (macOS only). With [`shard_cpu`] over a
-/// window, it tells a starved shard (runnable, its clock barely moving) from one blocked in a call.
+/// What the scheduler says of each shard `holders` name at this instant, in their order (`crate::thread_clock`'s note
+/// says what each platform reads): `None` for one whose registration no longer holds its slot, whose thread recorded no
+/// clock, or where the platform reads nothing. A batch, since Windows reads the whole system's threads at once. With
+/// [`shard_cpu`] over a window, it tells a starved shard (runnable, its clock barely moving) from one blocked in a call.
+pub fn shard_run_readings(holders: &[SlotHolder]) -> Vec<Option<crate::thread_clock::RunReading>> {
+  let handles: Vec<u64> = holders
+    .iter()
+    .map(|holder| {
+      with_entry(holder.shard, |entry| {
+        (entry.holder() == *holder).then(|| entry.cpu_clock.load(Ordering::Acquire))
+      })
+      .flatten()
+      .unwrap_or(0)
+    })
+    .collect();
+  crate::thread_clock::run_readings(&handles)
+}
+
+/// The scheduler state of the shard `holder` names at this instant ([`shard_run_readings`]).
 pub fn shard_run_state(holder: SlotHolder) -> Option<crate::thread_clock::RunState> {
-  with_entry(holder.shard, |entry| {
-    (entry.holder() == holder).then(|| entry.cpu_clock.load(Ordering::Acquire))
-  })
-  .flatten()
-  .filter(|handle| *handle != 0)
-  .and_then(crate::thread_clock::run_state)
+  shard_run_readings(&[holder])
+    .pop()
+    .flatten()
+    .map(|reading| reading.state)
 }
 
 /// Release the reader pin even when a test callback unwinds.

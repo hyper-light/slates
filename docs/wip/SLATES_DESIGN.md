@@ -2030,6 +2030,19 @@ neither the server nor a mounted client is granted device activation by a volume
 Device-metadata preservation is a separate, unimplemented decision. Mounted acceptance
 must exercise local communication and isolation between clones as well as namespace calls.
 
+**A read-only attachment is a read-only file system (decided 2026-11-08, from POSIX).** An attachment that may read but
+not write, and a snapshot's view, refuse every change as POSIX's read-only file system does: `EROFS`, at the open for
+an open for writing (a write access mode or `O_TRUNC`) and at every mutating verb. One mapping makes it, the bridge's
+`authorize_write` (`VfsError::ReadOnly`), carried by every edge: FUSE, virtio-fs and the vhost route answer `EROFS`
+(the DAX windows' writable asks too); NFS answers `NFS3ERR_ROFS` and `NFS4ERR_ROFS`; WinFsp answers
+`STATUS_MEDIA_WRITE_PROTECTED` and reports the volume read-only (`ReadOnlyVolume`), so Windows refuses most changes
+before they reach a shard, and its `CanDelete` asks the bridge (`authorize_change`) before Windows marks a file for a
+delete that happens at the reply-less cleanup; the wire answers `ReadOnlyVolume`. An attachment with no rights at all is refused for
+permission (`EPERM`, `NFS3ERR_PERM`, `STATUS_ACCESS_DENIED`). A kernel that mounts the attachment `ro` (Linux FUSE,
+macOS NFS) refuses most changes itself before the request, with the same `EROFS`. Until 2026-11-08 the bridge granted
+an open for writing and answered each change `NotPermitted`
+(`docs/bugs/2026-11-08-a-read-only-attachment-was-not-a-read-only-file-system.md`).
+
 **Kubernetes publication without privilege (AUD-29-75; decided 2026-10-01).** Kubernetes has two ways to put a
 mount a component makes into a pod, and both need a privilege R10 forbids:
 
@@ -2569,6 +2582,15 @@ before the report is published, so a tool never reads attributes newer than the 
 > barrier's publication to its reply's write, is microseconds wide, too narrow for a kill to target, so no
 > end-to-end test reaches it. Per-shard channels were measured and rejected (A-62). Every acknowledged write now
 > survives (A-63).
+> **A `FORGET` after the last publication is logged (2026-11-08, A-154's sibling).** A `FORGET` gives back lookup
+> references the kernel held, takes no reply, and is never resent, so one served after the last publication and lost
+> with its daemon left the references the image recorded counted for good: an unlinked file the kernel had let go was
+> never reclaimed. Each turn's `FORGET`s are logged beside the writes in the write log (A-63; a record of its own kind:
+> the attachment, the inode and the count), and the replay gives them back in their place among the writes, as the
+> attachment's own (`Volume::forget_for`). A `FORGET` the log cannot take forces a publication; one still refused is
+> counted (`write_log.forget_unlogged`), never taken for a lost write. Proven by
+> `the_lookups_a_dead_daemon_was_given_back_after_its_last_publication_stay_given_back`
+> (`docs/bugs/2026-11-08-a-forget-after-the-last-publication-leaked-its-lookup-reference.md`).
 > **The takeover round is built (2026-10-23, A-158).** A restored mount tells its kernel what its predecessor may not
 > have: the epoch bump and an invalidation of the root and of every restored reference and replayed inode, in slices.
 > Proven on Linux 7.2.9 through the real binary, each test red with the change's files at the previous commit:
@@ -4373,6 +4395,10 @@ well-known name.
 > Mach bootstrap name registered at the top of the caller's bootstrap chain, which launchd gives its first registrant
 > and frees when that registrant's port dies (`crates/ipc/src/owner_name.rs`). Proven on this Mac and fedora, and
 > the refusal across processes on every platform; red-checked.
+>
+> **Status (2026-11-08, A-254).** The owner is decided before anything is created: an anchor holds the rendezvous, and a
+> daemon opens its listener, before a segment is created or attached, so a start refused as a live instance's second
+> owner has created and unlinked nothing, on every platform.
 
 **Protocol.** Requests and replies are fixed-layout 64-byte slots; request ids are `(client_id,
 sequence)`; the daemon keeps a completion record per client until acknowledged (RIFL), so a retry
@@ -4637,13 +4663,25 @@ hard links and snapshot versions. No live kernel endpoint state is part of the i
 > - **The search** (`crates/transport/src/pmtud.rs`) binary-searches from the 1,200-byte floor with
 >   `Ping` probes padded to size. It judges a size too large after three losses or at once on `EMSGSIZE`,
 >   stops within one packet overhead (29 bytes), and re-searches after 600 s.
-> - **Black holes.** Losses of above-floor packets, and probe timeouts while such packets are out, fall
->   the session back to the floor.
+> - **Black holes** (amended 2026-11-08). A black hole needs size-specific evidence, never loss every size
+>   suffers (A-253; RFC 8899 §4.3, "excessive loss of data sent with a specific packet size"; §3 item 4, of a
+>   probe "lost due to other reasons (including link transmission error, congestion)"). Three in a row of above-floor
+>   packets lost or probe timeouts while one is out only make the size *suspect*: the session sends
+>   at the floor, so packets that cross keep loss detection running, and probes at the size it had. One
+>   acknowledged probe, or any above-floor packet, and the size stands. Three probes at it declared lost while
+>   the floor's packets cross (§5.2) are the black hole, and the session falls to the floor and searches below
+>   the size that stopped. A probe timeout counts toward no black hole: a stopped peer acknowledges nothing at
+>   any size. Before, the losses, and each timeout counted as a loss of one, fell the session at once. A
+>   SIGSTOPped peer, or a burst a full receive buffer dropped, left a loopback session at the floor
+>   (`docs/bugs/2026-11-08-a-session-fell-to-the-mtu-floor-on-loss-every-size-suffered.md`).
 > - **Probes stay out of the controller.** Probes never enter congestion accounting or RTT samples.
 > - **The congestion gate.** It is sized by the controller following each datagram-size change: Copa's
 >   window is lifted to at least two datagrams at the new size, so the 2026-09-13 stall cannot recur.
 > - **Proven by use.** A session finds a 9,000-byte simulated path, falls back through a shrink to 1,500
->   and loses nothing (`a_session_finds_its_paths_mtu_and_falls_back_when_the_path_shrinks`).
+>   and loses nothing (`a_session_finds_its_paths_mtu_and_falls_back_when_the_path_shrinks`). A peer silent
+>   for two seconds and a burst lost at every size each leave a 1,500-byte path's size standing with no black
+>   hole counted (`a_peer_silent_for_several_probe_timeouts_keeps_its_path_mtu`,
+>   `a_burst_that_loses_every_size_keeps_the_path_mtu`; both red on the earlier rule).
 > - **Records.** The research note's slices 3a–3c, and
 >   `docs/bugs/2026-09-28-a-lone-path-probe-silenced-the-blocked-report.md` and
 >   `docs/bugs/2026-09-28-a-shrunken-path-deadlocked-before-its-black-hole-was-seen.md`.
@@ -4932,7 +4970,17 @@ retry must recover the same result and contents. Rebuilding a scratch volume fro
 and id loses acknowledged data. Live directory handles require an anchor handoff or validated
 reacquisition of the same source identity; reopening a path alone cannot substitute another
 base. The identity is the device, inode number and birth time (A-153): a change to a directory's
-entries is not a change of source, while a directory another replaced is. Missing resources return `RecoveryIncomplete`/`BaseUnavailable`, never empty success.
+entries is not a change of source, while a directory another replaced is. A recorded directory recovery cannot
+reacquire as the same one, gone from the disk, unreadable, or another at the path, is the failure matrix's "base
+directory unreadable or gone": its untouched entries refuse `BaseUnavailable{path, errno}` (`ENOENT` when the host says
+only that it is not there), the volume's own entries in it serve, and the next image keeps its record so a later
+recovery tries it again; it never refuses the whole volume, and another directory is never substituted for it
+(2026-11-07, `docs/bugs/2026-11-07-a-removed-base-directory-refused-the-whole-volume-at-recovery.md`). A question that
+needs a listing the recovered plane has not read yet reads it then rather than take its absence for an answer: a green's
+base snapshot is judged complete against its directories' listings read from the host, uncached, so their first real
+listing still renumbers their untouched entries (A-151; 2026-11-08,
+`docs/bugs/2026-11-08-a-pinned-snapshot-was-refused-as-a-greens-base-after-a-restart.md`). Missing resources
+return `RecoveryIncomplete`/`BaseUnavailable`, never empty success.
 The version-2 volume image now preserves overlay source paths and full directory fingerprints,
 witnesses, whiteouts, redirects, metadata copy-ups and private large-file ranges, including snapshots.
 Recovery validates no-follow source acquisition before reinstating lazy reads and invalidates caches.
@@ -5811,6 +5859,14 @@ failure.
 > it is resent or released (`release_retryable`), within the reconnect budget, so a caller that never resends cannot
 > pin it (`a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id`;
 > `docs/bugs/2026-11-06-a-resend-under-its-id-was-already-acknowledged.md`).
+
+> **Status (2026-11-08, A-252: a request waiting for a version is a durable state).** A submit whose acceptance waits for
+> its version's commit was waited on in memory, so after a restart its resend under its own id found no record and ran
+> again as a new version. The accept now logs `Op::CompletionAwaiting` in the transaction that appends the version, so
+> the window answers `Seen::Awaiting` (never `New`) across any restart: the resend joins the wait, or is answered its
+> version once it has placed. The wait counts toward the client's bound and leaves when its completion replaces it or the
+> client acknowledges it. After a takeover the resend is refused retryable and nothing runs twice, but its version is not
+> named, short of the failure matrix's Masked: owed as A-255 (GAPS).
 
 > **Status (2026-11-07, A-245: an acknowledgement names the ids still owed).** A watermark is contiguous, so one held or
 > slow request kept every later completion of its client: the owner pruned none of them, and past `2 × slots` refused
@@ -7069,6 +7125,27 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > A shard's recovery still runs as one poll, which the watchdog counts as spinning past a window of CPU: GAPS holds it
 > open.
 
+> **Status (2026-11-08, A-228): a starved shard is not a stuck one.** A CPU clock cannot tell a thread held off the CPU
+> from one blocked in a call: both stand still. On adacachy at `CPUWeight=1` two anchors killed live daemons on
+> `shard N is wedged` lines, and the sampled shard read state `R` throughout. The watchdog now asks the scheduler about a
+> shard with no step and no CPU rise (`slates_rt::registry::shard_run_readings`, one batch a beat). **Wedged** is a whole
+> window in which the shard moved in no way: no CPU progress, never runnable, no wait for a CPU credited. **Starved** is
+> a whole window with no CPU progress but one of the others: it goes on beating and is logged once an episode.
+> **Spinning** is unchanged.
+>
+> | Platform | Source | Time waited for a CPU |
+> |---|---|---|
+> | Linux | `/proc/self/task/<tid>/stat` state and `schedstat` field 2 | Yes, credited late, so the state decides |
+> | macOS | `thread_basic_info.run_state` (`TH_RUN`, on a CPU or the run queue) | None per thread: the state at each look |
+> | Windows | `SYSTEM_THREAD_INFORMATION.ThreadState`, `NtQuerySystemInformation` linked at run time | None: the state at each look |
+> | Miri, or an unreadable source | None | The CPU clock stands alone, as before |
+>
+> Proven by `crates/server/tests/liveness.rs` and the rule's replays in `crates/server/src/watchdog.rs`, red first
+> (`docs/bugs/2026-11-08-a-starved-shard-was-judged-wedged.md`). Held off its CPU for 3.0 s, the beat gapped at most
+> 91.6 ms on Linux and 111.0 ms on Windows, where before it stopped for 2.01 s and 1.91 s; a shard blocked in a read
+> still stops the beat within 1.08 s on both. A frozen process is still killed at its lapse. macOS could not be held off
+> the CPU on demand (a full window in 1 of 20 CI runs), so there the replays carry the rule.
+
 > **Telemetry oracle correction (2026-09-20, AC-0.11).** A drain request itself emits spans.
 > The daemon integration oracle now derives convergence from the reply quota minus the
 > maximum spans a drain emits, and checks progress on each batch. A four-span reply scenario
@@ -7782,6 +7859,26 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 >   16 of 64 accepted before and 64 after. The corruption's test: the green's head was `cd\0\0`, now `cdXY`.
 >   (`docs/bugs/2026-11-07-a-greens-history-kept-a-copy-of-every-file-per-version.md`,
 >   `docs/bugs/2026-11-07-a-run-after-a-length-change-merged-zeros.md`.)
+
+> **Status (2026-11-08, A-257: a chain entry records what its verdict resolved, and recovery applies it).** A
+> checkpoint at the floor can pass the base of an entry left above it, and recovery re-judged each entry at its base,
+> which a restored green no longer holds: the entry was refused and the green fenced, every acknowledged version
+> unreadable (every restart of the load harness's state, 2026-11-08).
+> - The durable entry is now the increment as submitted, byte for byte, then the effects its verdict resolved it to
+>   (content by reference to its post-state; a splice whose ops were not mapped by its path alone), then a digest.
+>   Recovery applies the effects unconditionally (`slates_merge::chain_entry`, `Green::apply_recorded`). The position
+>   of a checkpoint no longer matters to replay, and a straggler pins nothing.
+> - A merge record's inputs are still the increment as submitted (`inputs_of`): holders ("Apply on holders") and a
+>   successor (`recover_green_inputs`) judge it afresh, so a wrong resolution on the owner cannot reach them.
+> - Integrity: the digest on every entry; the head identity recorded and compared at every checkpoint, at every
+>   version whose record goes to holders, and at the head wherever one is recorded (`GreenFence::IdentityDiverged`).
+>   At f = 0 the entries after the last checkpoint are checked by digest alone: a divergence there is found at the
+>   next recorded identity, not at its own version (an identity at every f = 0 accept cost 287-363 µs against a
+>   35-42 µs verdict). The oracle (`crates/merge/tests/chain_replay.rs`) compares identity at every version.
+> - Cost: 789 bytes an entry against the increment's 611 (+29%), and 4-5 µs on the p50 of an accept over a base behind
+>   the head (32 to 36-37 µs; p99 within noise). Layout 6; a version-5 segment is refused, and a green already fenced
+>   by a wrong checkpoint stays fenced.
+>   (`docs/bugs/2026-11-08-a-checkpoint-passed-a-retained-entrys-base-and-recovery-fenced-the-green.md`.)
 
 > **Status (2026-11-06, A-238: a green's chain is checkpointed at its reachable floor).** The partition kept
 > every accepted increment for good, and the "fold into checkpoint deltas" below had no durable form.
@@ -13698,6 +13795,48 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
+### A-253 — A path-MTU black hole needs failed probes at the size, not loss every size suffers (accepted 2026-11-08, the supervisor's order; amends §4.10a's black-hole rule)
+
+Applied in the same change to:
+- §4.10a: the "Black holes" bullet and "Proven by use".
+- GAPS and `docs/bugs/2026-11-08-a-session-fell-to-the-mtu-floor-on-loss-every-size-suffered.md`.
+- `crates/transport`: `pmtud.rs` (`PathMtu`'s suspect state, `on_silence`, the confirming probes) and `connection.rs`
+  (`note_mtu_timeout`, `note_mtu_losses`, `note_mtu_acknowledged`).
+- The tests: `a_peer_silent_for_several_probe_timeouts_keeps_its_path_mtu` and
+  `a_burst_that_loses_every_size_keeps_the_path_mtu` (`tests/session.rs`), and the unit cases in `pmtud.rs`.
+
+- **The rule amended.** §4.10a said: "Losses of above-floor packets, and probe timeouts while such packets are out,
+  fall the session back to the floor."
+- **Why.** At a confirmed size of 65 KB every data packet is above the floor, so loss that hits every size counted the
+  same as a path that shrank. On loopback, a SIGSTOPped peer's third probe timeout dropped the session from 65,496 bytes
+  to 1,200: 89 falls in 60 rolling-partition runs, every one by probe timeout and none by a loss pass
+  (diag-live-durability-48), and resumed candidates ran there.
+- **What the RFCs say.**
+  - RFC 8899 §4.3 allows data loss as evidence through "a mechanism implemented within the PL to detect excessive loss
+    of data sent with a specific packet size", which can "conclude that this excessive loss could be a result of an
+    invalid PLPMTU".
+  - RFC 8899 §3 item 4: "The PL is REQUIRED to be robust in the case where probe packets are lost due to other reasons
+    (including link transmission error, congestion)." It speaks of probes; the rule applies the same reasoning to data.
+  - RFC 8899 §5.2, SEARCH_COMPLETE: "If MAX_PROBES successive PLPMTUD-sized probes fail to be acknowledged, the method
+    enters the BASE state."
+  - RFC 9000 §14 ties no PMTU reduction to data loss or to probe timeouts; its one loss-tied reduction is the provisional
+    ICMP one (§14.2.1).
+- **The rule now.** Three in a row, with none acknowledged between, of above-floor packets declared lost or probe
+  timeouts with one in flight make the size *suspect*. A suspect session sends at the floor and probes at the size it
+  had. One probe acknowledged, or any above-floor packet, and the size stands. `MAX_PROBES` of those probes declared lost
+  is the black hole, and the session falls to the floor and searches below the size that stopped.
+- **Stricter than the RFC.** §4.3 sets the lower PLPMTU first and confirms it after ("The PL then confirms that the new
+  PLPMTU can be successfully used across the path"); nothing there requires probing the old size before falling. This
+  rule does, because the evidence that reaches a session here is mostly not about size.
+- **Sending at the floor while suspect is what keeps the 2026-09-28 deadlock away.** In a real shrink nothing at the old
+  size is ever acknowledged, so a probe at it is declared lost only if smaller packets keep acknowledgements flowing.
+- **A probe timeout counts toward no black hole.** A stopped peer acknowledges nothing at any size, so it declares no
+  probe lost and never makes one. Three timeouts still start the confirmation; one does not (a single timeout was enough
+  in the first cut: at least 1,230 and 1,525 suspicions in 30 partition runs per arch, diag-live-durability-49).
+- **Measured.** Rolling partition, 60 runs on each build: 89 falls to the floor on the old rule (diag-live-durability-48);
+  87 suspicions and no black hole on this rule (-51), every suspicion by probe timeout. No session of those runs lost
+  its size. The stall rate is unchanged within what 60 runs can show (0 stalls against 1, at about 1 in 100).
+
 ### A-231 — A held NFS connection's byte states cross a takeover, and what the successor cannot know is judged stale (accepted 2026-11-07, the supervisor's decision)
 Applied in the same change to: §4.6 "NFS v3" (its status), A-192 (its restart line), GAPS, `crates/vfs`
 (`recover.rs`: `HeldNfsStates`, `CarriedFile`, `CarriedRange`, `CarriedByte`, `ShardImage::nfs_states`, image version
@@ -14404,8 +14543,28 @@ Status: built 2026-11-06.
   limit): paced p99 before 12.3 to 39.2 ms at load 52 to 82 (149 and 234 ms in round 1, 142 to 361 ms at load 95),
   after 6.8 to 29.2 ms (54 and 94 ms in one run); unpaced p99 before 0.64 to 32 ms, after 0.43 to 6.8 ms. That load
   dominates both arms' tails, so the latency rows are informational and the CPU count is the measurement.
-- Owed: a boot's two whole give-backs a shard (memories this journal did not write) still hold the shard 12 to 43 ms
-  each. They should be given back in slices under the step quantum, from a measured discard rate (GAPS).
+- Sliced (2026-11-06, the supervisor's item 3): a give-back no longer takes a region whole in one step. Each idle step
+  gives back one slice from the top of each region down, and the journal records it (`Journal::given_back_from`).
+  The slice is what the OS gave back in one step quantum the previous step, measured by each step for the next
+  (`give_back_slice`, `learn_give_back_rate`; a page the first time). `purge_if_idle` yields between slices while any
+  is left. So a boot's give-back of memories the journal did not write (18 GB a shard on adas-macbook-pro-2, 12 to 43
+  ms in one poll before) holds the shard one quantum a step. The oracle gives back generated shares from the top
+  (`JournalStep::GiveBack { quarters }`). The test of the shard held is
+  `a_boot_give_back_holds_its_shard_no_longer_than_its_noise_floor`: a probe's longest wait through the boot's
+  give-back against its own quiet floor, skipping loudly on a host too loaded to judge.
+- The sibling of the same shape, sliced the same day: the Linux FUSE write log (A-63) gave back its whole record
+  area once per emptying (`WriteLog::purge`), whatever its records had reached. It now gives back only as far as
+  records reached since its last give-back (the whole area once, for a log opened over a predecessor's object), a slice
+  a call from the same measured slice. Failing first: `a_purge_gives_back_only_what_the_log_wrote_since_its_last`
+  (12,288 bytes, the 16 KiB log's whole area, after one 15-byte record; Linux 6.19.10).
+
+- **A give-back makes way (amended 2026-11-08, reland-a207's measurement).** Sliced give-backs (a30e4209) took one step per
+  yield for as long as the arena allocated nothing, and a granted landing allocates nothing. So under load the landing
+  and the give-back took turns, one short landing step for each whole quantum of give-back: 2,859 to 4,965 give-back
+  steps ran through each landing. Now a task that ran across the yield ends the give-back for this reap tick
+  (`purge_if_idle`; `content.give_back.left_for_next_tick`), so a landing pays for at most one step a tick. An idle shard
+  still goes on to the end. Measured in BENCHMARKS ("A give-back makes way"): landing median 21.5 s -> 4.2 s, the base's
+  own 4.2 s, 8 interleaved rounds each. Proven by `a_give_back_leaves_the_rest_for_the_next_tick_when_another_task_is_running`.
 
 ### A-214 — An idle shard keeps its last write burst's worth of free content pages pre-faulted (accepted 2026-11-05, VFS plan step 11; amends A-105)
 
@@ -15802,6 +15961,54 @@ and settle, `DaemonEnd::reply`'s stamp and confirmation) and `crates/ipc/tests/r
 `docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`. A client and a daemon of
 different layout versions refuse each other by name; no consensus rule or capability changes.
 
+### A-257 — A green's chain entry records what its verdict resolved, and recovery applies it (accepted and built 2026-11-08)
+
+A checkpoint at the reachable floor (A-238) can pass the base of an entry left in the chain, and recovery, which judged
+each entry again at its base, refused it and fenced the green. Holding the checkpoint below every retained base never
+folds under steady concurrency; carrying the deltas down to it is not enough, since a verdict reads files' lengths and
+bytes at the base. So the decision is recorded where it is made: the verdict at accept is the guard, the entry its
+result, and recovery applies it (`crates/db/src/partition.rs`'s guard-then-apply). The merge record's inputs stay the
+increment, so holders keep their independent judgement. Integrity at f = 0 between checkpoints is the entry's digest;
+the head identity is compared at checkpoints, holder-bound versions and recorded heads.
+
+Applied in the same change to:
+- §4.16: its status ("Commit").
+- GAPS: the load-test blockquote (W3's recovery).
+- `crates/merge`: `chain_entry.rs` (new), `Green::submit_resolved`, `Green::apply_recorded`, `Checkpoint::head_check`
+  (encoding version 2).
+- `crates/server`: `verbs::submit`, `record_accepted`, `replay_green`, the takeover's chain; `merge_service::inputs_of`,
+  `checkpoint_green_when`, `record_goes_to_holders`, `GreenFence::IdentityDiverged` (and `NotAccepted` removed).
+- `crates/anchor`: `LAYOUT_VERSION` 6.
+- Tests: `crates/merge/tests/chain_replay.rs` (new), `crates/server/tests/green_checkpoint.rs`.
+- Bug record: `docs/bugs/2026-11-08-a-checkpoint-passed-a-retained-entrys-base-and-recovery-fenced-the-green.md`.
+
+### A-252 — A request waiting for a version to commit is a typed durable state, so a resend after a restart never runs again (accepted and built 2026-11-08, fixtures' primary-kill rung; supervisor's two changes to the first cut)
+
+Applied in the same change to:
+- §4.9: its status of 2026-11-08.
+- GAPS: the load-test blockquote.
+- `crates/wire/src/request.rs`: `Seen::Awaiting`, `ClientWindow::await_version`, `awaiting_entries`; `retained` counts a wait.
+- `crates/db`: `Op::CompletionAwaiting` (appended), `AwaitingCompletion`, `ClientCompletions::awaiting` (appended).
+- `crates/server`: `merge_service::stage_awaiting` (the `Accepted` arm, ahead of the append) and `serve_awaiting`; the
+  `Seen::Awaiting` arms in `serve`, `run_forwarded` and `await_deferred_completion`.
+- The tests: fixtures' restart test and the still-waiting and takeover cases (`fleet.rs`),
+  `a_wait_and_its_transaction_are_one_durable_step` and the owed model's wait step (`model.rs`), the window's unit tests.
+- **What was there.** At `f > 0` the wait for a version's commit was in memory, and the version's append and the work's
+  reset were durable. A restart lost the wait, and a resend under its id ran again as a new version.
+- **The rule.**
+  - A request that ran and waits for a version is `Seen::Awaiting`, never `New`: answered that version once it has
+    placed, else joined to the wait, and never run again.
+  - The wait is logged in the transaction that appends the version, staged first, so the two are one durable step and a
+    failure fails the accept.
+  - It counts toward the client's bound and leaves when its completion replaces it or the client acknowledges it.
+  - It is a type, not reply bytes, so no reply encoding can be mistaken for it, and recovery and snapshots carry it by
+    type.
+  - After a takeover the resend is refused retryable and nothing runs twice, but the version is not named. That falls
+    short of §4.16's failure matrix (Masked after takeover) and is owed as A-255, not accepted here.
+- **Measured.** The bug record (`docs/bugs/2026-11-08-a-submit-resent-after-its-owner-restarted-was-applied-twice.md`):
+  the rung's 109 to 4,261 oracle failures fall to 0 on every run that finished. 7 of 18 runs stalled on W3's checkpoint
+  fence, which is independent of this rule (A-257).
+
 ### A-246 — A restarted owner re-enqueues the merge records its chain holds (accepted 2026-11-07)
 
 AUD-11 answers a submit at `f > 0` once its version's record commits at the quorum. The records an owner owes and the
@@ -15844,6 +16051,25 @@ Applied in the same change to: §4.16 (Commit status); §4.10 content retention 
 tests; GAPS. Evidence: `docs/bugs/2026-11-07-a-versions-inputs-and-record-took-five-hops.md`,
 `docs/bugs/2026-11-07-retention-decoded-every-merge-record-per-put.md`. Wire: the merge record stream's payload is now a
 shipment. A holder of an older build fails to decode it and answers nothing, so a mixed fleet refuses safely.
+
+### A-254 — The owner of an instance is decided before anything is created (accepted 2026-11-08)
+Applied in the same change to: §4.7 (the rendezvous's status), GAPS, `crates/cli/src/anchor.rs` (`run`),
+`crates/server/src/daemon.rs` (`Daemon::start_with_fleet`), `crates/cli/tests/cli.rs` and `crates/server/tests/daemon.rs`
+(the tests below), and `docs/bugs/2026-11-08-a-refused-second-anchor-unlinked-the-live-instances-segment.md`.
+- **What was wrong.** A-176 and A-178 made the rendezvous refuse a live instance's second owner, but both start paths
+  created their segment first. On macOS a shared-memory name is the user's, a creation unlinks any holder's, and the
+  creator's drop unlinks the name again, so a refused second anchor or lone daemon took the live instance's segment name
+  with it. The live anchor's next daemon could not attach (`shm_open` `ENOENT`) and looped until the anchor was restarted.
+- **The rule.** A start decides that it owns the instance before it creates anything: the anchor holds the rendezvous, and
+  a daemon opens its listener, ahead of the segment and the content object. A refused start has created nothing, so it
+  unlinks nothing and a running instance is untouched.
+- **On every platform, though two hid it.** Linux's segment has no name (a memfd), and on Windows a live section's name
+  refuses the second creation. Both took the same wrong order; all three now take one.
+- **What it does not change.** The owner's token on each platform, the adoption of a held rendezvous (A-114), and what a
+  client sees: a daemon opens its listener a few steps earlier in its start, and a claim waits for it as before.
+- **Proven** on this Mac by two tests that failed on the old order: `a_refused_second_anchor_leaves_the_live_instance_its_segment_and_its_bytes`
+  (across processes: a live anchor and its daemon, a second anchor refused, the daemon killed, its successor adopting the
+  segment by name and reading the file back) and `a_refused_second_daemon_leaves_the_live_ones_segment_in_place`.
 
 ### A-235 — The merge record plane runs when there is merge work, and a version's inputs go only to holders whose next record it is (accepted 2026-11-06)
 
@@ -17938,7 +18164,7 @@ Applied in the same change to:
   five seconds; with a close mid-frame taken for a clean one the truncated count stays 0.
 - **Found on the way, recorded in GAPS, not changed here:** a read-only attachment grants a write-mode open and answers
   each write `EPERM` on every FUSE transport, and NFS answers `PERM`, where a read-only file system answers `EROFS` at
-  the open; `INIT`'s page count follows the host's page, so a 4 KiB-page guest of a 16 KiB-page Mac is told 16 pages,
+  the open (fixed 2026-11-08, §4.6 "A read-only attachment is a read-only file system"); `INIT`'s page count follows the host's page, so a 4 KiB-page guest of a 16 KiB-page Mac is told 16 pages,
   64 KiB a request, a quarter of the largest write.
 - **Over the wire on Linux (2026-10-24, part 1 step 2).** `attach` takes `AttachRequest::ShardsFs { subtree }`. On the
   volume's owner shard, inside the verb's transaction, the stream is made and served as above and its end kept under
@@ -18582,10 +18808,49 @@ Applied in the same change to:
   (`a_release_of_an_open_no_publication_counted_waits_for_nothing`).
 - **Left open:** a `FORGET` processed after the last publication leaves its lookup reference counted in the image, and
   the kernel never resends a `FORGET` either. It has no reply to wait behind; it stays under A-61's stated limits, as
-  a bounded leak (GAPS).
+  a bounded leak (GAPS). **Closed 2026-11-08 by a1b44bb1:** each `FORGET` is logged beside the writes (A-63), and a
+  successor gives it back in its place (§4.6, "A `FORGET` after the last publication is logged").
 - **Evidence.** See the bug record's verification.
 
+### A-256 — A base directory recovery cannot reacquire costs only its own untouched entries (accepted 2026-11-08, the supervisor's confirmation)
+Applied in the same change to (the code and tests in 4db8c179, this entry and A-153's pointer after them):
+- §4.8 ("Required persistence and protocol invariants");
+- `docs/wip/recovery.md`;
+- `crates/vfs/src/base.rs` (`BasePlane::unavailable`) and `crates/vfs/src/base_recovery.rs` (`BasePlane::recover`,
+  `image`);
+- the tests:
+  - `crates/vfs/tests/base.rs`: A-153's guard as it now stands,
+    `an_overlay_whose_base_directory_another_replaced_never_serves_the_other` (it was
+    `an_overlay_whose_base_directory_another_replaced_is_refused`), and
+    `an_overlay_whose_loaded_base_directory_was_removed_recovers_and_refuses_only_that_directory`;
+  - `crates/server/tests/recovery.rs` `an_overlay_whose_base_directory_was_removed_serves_its_own_files_after_a_restart`;
+  - `crates/cli/tests/cli.rs` `an_overlay_whose_base_directory_was_removed_serves_its_own_files_through_a_kept_mount`;
+- GAPS;
+- `docs/bugs/2026-11-07-a-removed-base-directory-refused-the-whole-volume-at-recovery.md`.
+
+- **What A-153 said.** A directory another directory replaced is not the same source, and is refused: the restart
+  refused the whole volume (`RecoveryIncomplete`), and the guard test named that. It left open a loaded directory
+  removed after the last publication, which refused the whole volume the same way.
+- **What it says now.** A recorded directory recovery cannot reacquire as the same one, gone from the disk, unreadable,
+  or another at the path, costs only its own untouched entries.
+  - The volume recovers.
+  - Those entries refuse `BaseUnavailable{path, errno}` (`ENOENT` when the host says only that it is not there).
+  - The volume's own entries in that directory serve.
+  - The next image keeps the directory's record, so a later recovery tries it again.
+- **What it does not change.** A-153's identity rule (device, inode number and birth time) still decides whether a
+  directory is the recorded one. Another directory is never substituted for it: reopening a path alone cannot substitute
+  another base. Only the price of a failed reacquisition changed, from the whole volume to that directory.
+- **Why.** §4.8's failure matrix already gives the runtime rule in its row "Base directory unreadable or gone": refused
+  `BaseUnavailable` for untouched entries under it, witnessed and pinned entries serving. Recovery was harsher than that
+  row, and one directory removed beneath a base cost the user every file the volume held, its own writes included (the
+  bug record).
+- **Not covered.** A directory that comes back while the daemon runs stays unavailable until the next restart.
+- **Evidence.** See the bug record and GAPS (A-153's "Open, found here", closed).
+
 ### A-153 — A recovered base directory is judged by its identity, not its entries (accepted 2026-10-22)
+**Amended by A-256 (2026-11-08):** a directory recovery cannot reacquire, replaced or removed, now costs only its own
+untouched entries rather than the whole volume; the identity rule below stands.
+
 Applied in the same change to:
 - §4.8 ("Required persistence and protocol invariants");
 - `docs/wip/recovery.md`;

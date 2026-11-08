@@ -49,7 +49,18 @@ An earlier cut of the naming read such a step as "blocked in a call" by its CPU 
 preempted.
 
 So the stall was (b): a live, starved shard behind the client's fixed wall-second deadline, which is the clients' (A-232).
-Open beside it: 17 of the 62 waits held 100 to 164 ms of the shard's own CPU in at most 8 steps. That is one poll of
-around 100 ms, which the shard's wake estimate (4 to 57 µs) does not explain. A profile of a quiet run puts the
-candidate in a mutating verb's publication: a checkpoint of every volume (`publish_checkpoint`, `encode_head`), whose
-cost is the shard's size. It is not yet measured as that poll.
+Beside it: 17 of the 62 waits held 100 to 164 ms of the shard's own CPU in at most 8 steps. The shard's wake estimate (4
+to 57 µs) does not explain that. Two suspects read from a profile were wrong. A mutating verb's checkpoint costs about
+1.4 to 1.9 ms at these 1,000 files in debug, about 100 times too small (GAPS, "A checkpoint costs the whole shard"). The
+snapshot's log walk is a real defect, fixed separately, but 30 of 124 waits still held 100 ms or more without it
+(`2026-11-08-a-snapshot-decoded-the-log-it-released.md`). A per-poll CPU timer then named the poll:
+`return_dead_recovery`, reached from `reap_loop`'s tick through `seal_idle_content` and `purge_if_idle`, 115 to 171 ms of
+CPU in one poll. Perf's slicing of that give-back (`a30e4209` on `agents/perf-b3`) took it to 0 of 411 named waits at 100
+ms or more, the highest 78 ms, on the same test beside the same 144 spinners.
+
+That slicing has a cost this test measured and its owner has: a granted landing is about five times slower under the same
+load with `a30e4209` than without (median 20.9 s against 4.3 s, 8 runs each alternated at load 60 to 209), and landings
+past the test's 60 s grant term come back `partial`. A landing allocates no content, so the shard looked idle and the
+give-back took 2,859 to 4,965 steps through each landing (perf's measure). `c2d87528` on `agents/perf-b3` gives way to
+whatever else the shard is running: the same comparison gave a median of 4.2 s against the base's 5.9 s, and a per-task
+CPU timer found no `reap_loop` poll of 20 ms or more in 4 runs, against one of 121 to 175 ms in each of the base's 4.

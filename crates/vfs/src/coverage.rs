@@ -29,11 +29,28 @@ impl Volume {
   /// host: `true` for a scratch volume's snapshot; for an overlay's, `true` only when every merged
   /// directory in the frozen tree holds every name its base listing found and every base-backed file
   /// is witnessed, pinned whole and not lost. A stale snapshot id is a typed refusal.
+  /// Each merged directory's base names are its listing as this daemon has read it; one not yet read (after a
+  /// recovery, until its first use) counts as incomplete. [`crate::base::Overlay::snapshot_is_complete`] reads such a
+  /// listing from the host instead.
   pub fn snapshot_is_complete(&self, store: &Store, id: SnapshotId) -> Result<bool, VfsError> {
+    let plane = self.base_plane();
+    self.snapshot_is_complete_under(store, id, &mut |no| {
+      Ok(plane.and_then(|plane| plane.listed_names(no)))
+    })
+  }
+
+  /// [`Self::snapshot_is_complete`] with each merged directory's base names given by `listed` (`None`: not known, so
+  /// the snapshot cannot be shown complete).
+  pub(crate) fn snapshot_is_complete_under(
+    &self,
+    store: &Store,
+    id: SnapshotId,
+    listed: &mut dyn FnMut(crate::ids::InodeNo) -> Result<Option<Vec<Box<str>>>, VfsError>,
+  ) -> Result<bool, VfsError> {
     let (_, root) = self.snapshot_info(id)?;
-    let Some(plane) = self.base_plane() else {
+    if self.base_plane().is_none() {
       return Ok(true);
-    };
+    }
     let mut stack = vec![root];
     while let Some(dir) = stack.pop() {
       let node = store.dirs.get(dir).map_err(|_| VfsError::StaleHandle)?;
@@ -53,7 +70,7 @@ impl Volume {
       if node.base == BaseDirState::Merged {
         // Every name the base listing found must be in the frozen node — else the listing was read
         // after the freeze (or never), and the frozen directory would show the live disk.
-        let Some(listed) = plane.listed_names(node.inode) else {
+        let Some(listed) = listed(node.inode)? else {
           return Ok(false);
         };
         if listed.iter().any(|name| !names.contains(name.as_ref())) {
