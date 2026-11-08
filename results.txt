@@ -1,0 +1,56 @@
+runner ubuntu-latest, 4 CPUs, Sun Nov  8 22:23:54 UTC 2026, tree e7203a714718322645e7d525057bb9170b421e02
+== release build exit 0
+   r1 LD-COUNTERS chaos-replaced-a-6096 takeover {}
+   r1 LD-COUNTERS chaos-replaced-a-6096 live {"fleet.live.held": 721}
+   r1 LD-COUNTERS chaos-replaced-a-6096 materialize {}
+   r1 LD-COUNTERS chaos-replaced-b-6096 takeover {"fleet.takeover.page_unbound": 4, "fleet.takeover.page_unmatched": 2, "fleet.takeover.pages_unsent": 468}
+   r1 LD-COUNTERS chaos-replaced-b-6096 live {"fleet.live.held": 943}
+   r1 LD-COUNTERS chaos-replaced-b-6096 materialize {}
+   r1   NoLoss (successor): 1 violations
+   r1 thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (6097) panicked at crates/cli/tests/live_chaos.rs:1247:5:
+== run 1 exit 101
+   r2 LD-COUNTERS chaos-replaced-a-6667 takeover {}
+   r2 LD-COUNTERS chaos-replaced-a-6667 live {"fleet.live.held": 2}
+   r2 LD-COUNTERS chaos-replaced-a-6667 materialize {}
+   r2 LD-COUNTERS chaos-replaced-c-6667 takeover {"fleet.takeover.page_unbound": 3, "fleet.takeover.page_unmatched": 6, "fleet.takeover.stale_configuration": 3}
+   r2 LD-COUNTERS chaos-replaced-c-6667 live {"fleet.live.held": 447}
+   r2 LD-COUNTERS chaos-replaced-c-6667 materialize {}
+   r2   NoLoss (successor): 1 violations
+   r2 thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (6668) panicked at crates/cli/tests/live_chaos.rs:1247:5:
+== run 2 exit 101
+   r3 LD-COUNTERS chaos-replaced-a-7376 takeover {}
+   r3 LD-COUNTERS chaos-replaced-a-7376 live {"fleet.live.held": 51}
+   r3 LD-COUNTERS chaos-replaced-a-7376 materialize {}
+   r3 LD-COUNTERS chaos-replaced-b-7376 takeover {"fleet.takeover.page_unbound": 3}
+   r3 LD-COUNTERS chaos-replaced-b-7376 live {"fleet.live.held": 234}
+   r3 LD-COUNTERS chaos-replaced-b-7376 materialize {}
+   r3   NoLoss (successor): 1 violations
+   r3 thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (7377) panicked at crates/cli/tests/live_chaos.rs:1247:5:
+== run 3 exit 101
+   r4 LD-COUNTERS chaos-replaced-b-8046 takeover {}
+   r4 LD-COUNTERS chaos-replaced-b-8046 live {"fleet.live.held": 60}
+   r4 LD-COUNTERS chaos-replaced-b-8046 materialize {}
+   r4 LD-COUNTERS chaos-replaced-c-8046 takeover {"fleet.takeover.page_unbound": 5, "fleet.takeover.page_unmatched": 3}
+   r4 LD-COUNTERS chaos-replaced-c-8046 live {"fleet.live.held": 193}
+   r4 LD-COUNTERS chaos-replaced-c-8046 materialize {}
+   r4   NoLoss (successor): 1 violations
+   r4 thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (8047) panicked at crates/cli/tests/live_chaos.rs:1247:5:
+== run 4 exit 101
+   r5 LD-COUNTERS chaos-replaced-a-8713 takeover {}
+   r5 LD-COUNTERS chaos-replaced-a-8713 live {"fleet.live.held": 792}
+   r5 LD-COUNTERS chaos-replaced-a-8713 materialize {}
+   r5 LD-COUNTERS chaos-replaced-b-8713 takeover {"fleet.takeover.page_unbound": 3, "fleet.takeover.page_unmatched": 1, "fleet.takeover.pages_unsent": 461}
+   r5 LD-COUNTERS chaos-replaced-b-8713 live {"fleet.live.held": 1047}
+   r5 LD-COUNTERS chaos-replaced-b-8713 materialize {}
+   r5   NoLoss (successor): 1 violations
+   r5 thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (8714) panicked at crates/cli/tests/live_chaos.rs:1247:5:
+== run 5 exit 101
+   r6 LD-COUNTERS chaos-replaced-b-9353 takeover {}
+   r6 LD-COUNTERS chaos-replaced-b-9353 live {"fleet.live.held": 108}
+   r6 LD-COUNTERS chaos-replaced-b-9353 materialize {}
+   r6 LD-COUNTERS chaos-replaced-c-9353 takeover {"fleet.takeover.page_unbound": 4, "fleet.takeover.page_unmatched": 2}
+   r6 LD-COUNTERS chaos-replaced-c-9353 live {"fleet.live.held": 278}
+   r6 LD-COUNTERS chaos-replaced-c-9353 materialize {}
+   r6   NoLoss (successor): 1 violations
+   r6 thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (9354) panicked at crates/cli/tests/live_chaos.rs:1247:5:
+== run 6 exit 101

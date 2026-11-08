@@ -1,0 +1,732 @@
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/home/runner/work/slates/slates/target/release/build/aws-lc-sys-3d7eb136a6063351/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Using flag: -ffile-prefix-map=/home/runner/work/slates/slates/vendor/aws-lc-sys=
+warning: aws-lc-sys@0.45.0: Using assembler flag: -Wa,--debug-prefix-map=/home/runner/work/slates/slates/vendor/aws-lc-sys=
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/release/build/aws-lc-sys-3d7eb136a6063351/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/release/build/aws-lc-sys-3d7eb136a6063351/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/runner/work/slates/slates/target/release/build/aws-lc-sys-3d7eb136a6063351/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+    Finished `release` profile [optimized] target(s) in 0.07s
+     Running tests/live_chaos.rs (target/release/deps/live_chaos-12e0e667394c1712)
+
+running 1 test
+test a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover ... slates anchor: instance chaos-replaced-a-8713 up; daemon pid 8724; 2 shards
+slates anchor: a daemon's beat is lapsed once older than the 1000 ms liveness window plus this anchor's own measured lateness p99, over its last 100 timed waits
+slates anchor: a starting daemon is killed once it makes no CPU progress for the 1000 ms liveness window, or runs that much CPU without its first beat, in its own CPU time (read from the OS)
+slates daemon: fleet node `a` of `slates-fleet`: member 12068328294195470868 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 16760344576: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 2793390762: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 8388608: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 698347690: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 2078415: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 11239: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 698347690: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 1396695380: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 27670: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 5416257797: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 30436: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: page_fault_ns = 3113: the profile's measured base-page fault cost (at least one) (anchors ["faults.base_ns"])
+slates daemon: prefault_reserve_bytes = min(the shard's last write burst, reserve_per_shard = 2793390762, the arena's free bytes): the free content pages an idle shard keeps pre-faulted; the burst is measured at each idle tick (anchors ["reserve_per_shard", "content.allocated_bytes"])
+slates daemon: codec = lz4 false, zstd levels [], byte worth 184 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 256: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 1212409: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 914666: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 681980: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 2793390762: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 113663: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 13: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 2583: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 16384: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5166: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 5171: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 1123900: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_bandwidth_bytes_per_ns = 5: memcpy bytes per second at the largest measured copy size / 1e9 (at least one byte per nanosecond) (anchors ["memcpy"])
+slates daemon: guest_requests_credit = 20: the owning shard's admission limit (Little's law: request rate × p99 service time); one attachment may use its shard's whole in-flight budget, which the daemon splits among attachments (anchors ["rt.requests_in_flight_per_shard"])
+slates daemon: guest_bytes_credit = 4456544: clamp(bandwidth × rtt, one frame cap, bandwidth × class latency budget) (anchors ["wire.bandwidth", "wire.rtt_p50", "wire.frame_cap", "wire.class_budget"])
+slates daemon: guest_listing_entries = 131072: guest writable cap / smallest fuse_dirent (anchors ["guest.writable_cap"])
+slates daemon: inode_reserve = 262144: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 2568: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 349173845: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2424818: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2424818: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: fleet_sessions_per_plane = 1938: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120114: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77593644: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5173: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: control_shard_capacity = ShardCapacity { tasks: 175656, timers: 175656 }: tasks_per_shard + forward_lane_bound, timers_per_shard + forward_lane_bound (the lane's bound zero with no peers) (anchors ["tasks_per_shard", "timers_per_shard", "clients_per_shard", "region.slots", "shards", "fleet.peers"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates daemon: instance chaos-replaced-a-8713 serving on 2 shards under the anchor
+slates-server: shard 1 initialized in 1207 µs
+slates-server: shard 0 initialized in 1716 µs
+slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, extensions 10 × 100000000 ns; no path measured yet
+slates anchor: instance chaos-replaced-b-8713 up; daemon pid 8737; 2 shards
+slates anchor: a daemon's beat is lapsed once older than the 1000 ms liveness window plus this anchor's own measured lateness p99, over its last 100 timed waits
+slates anchor: a starting daemon is killed once it makes no CPU progress for the 1000 ms liveness window, or runs that much CPU without its first beat, in its own CPU time (read from the OS)
+slates daemon: fleet node `b` of `slates-fleet`: member 9232964544464296669 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 16760344576: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 2793390762: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 8388608: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 698347690: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 2078415: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 8418: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 698347690: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 1396695380: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 39071: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 4003527889: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 16850: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: page_fault_ns = 1512: the profile's measured base-page fault cost (at least one) (anchors ["faults.base_ns"])
+slates daemon: prefault_reserve_bytes = min(the shard's last write burst, reserve_per_shard = 2793390762, the arena's free bytes): the free content pages an idle shard keeps pre-faulted; the burst is measured at each idle tick (anchors ["reserve_per_shard", "content.allocated_bytes"])
+slates daemon: codec = lz4 false, zstd levels [], byte worth 249 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 256: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 1212409: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 914666: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 681980: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 2793390762: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 113663: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 6: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 2583: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 16384: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5166: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 5171: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 841800: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_bandwidth_bytes_per_ns = 4: memcpy bytes per second at the largest measured copy size / 1e9 (at least one byte per nanosecond) (anchors ["memcpy"])
+slates daemon: guest_requests_credit = 20: the owning shard's admission limit (Little's law: request rate × p99 service time); one attachment may use its shard's whole in-flight budget, which the daemon splits among attachments (anchors ["rt.requests_in_flight_per_shard"])
+slates daemon: guest_bytes_credit = 4456544: clamp(bandwidth × rtt, one frame cap, bandwidth × class latency budget) (anchors ["wire.bandwidth", "wire.rtt_p50", "wire.frame_cap", "wire.class_budget"])
+slates daemon: guest_listing_entries = 131072: guest writable cap / smallest fuse_dirent (anchors ["guest.writable_cap"])
+slates daemon: inode_reserve = 262144: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 2568: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 349173845: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2424818: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2424818: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: fleet_sessions_per_plane = 1938: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120114: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77593644: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5173: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: control_shard_capacity = ShardCapacity { tasks: 175656, timers: 175656 }: tasks_per_shard + forward_lane_bound, timers_per_shard + forward_lane_bound (the lane's bound zero with no peers) (anchors ["tasks_per_shard", "timers_per_shard", "clients_per_shard", "region.slots", "shards", "fleet.peers"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates daemon: instance chaos-replaced-b-8713 serving on 2 shards under the anchor
+slates-server: shard 0 initialized in 787 µs
+slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, extensions 10 × 100000000 ns; no path measured yet
+slates-server: shard 1 initialized in 433 µs
+slates-cluster: fleet: HostId(1083832416622351078) holds HostId(11184549531783745575) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(11184549531783745575) holds HostId(1083832416622351078) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates anchor: instance chaos-replaced-c-8713 up; daemon pid 8750; 2 shards
+slates anchor: a daemon's beat is lapsed once older than the 1000 ms liveness window plus this anchor's own measured lateness p99, over its last 100 timed waits
+slates anchor: a starting daemon is killed once it makes no CPU progress for the 1000 ms liveness window, or runs that much CPU without its first beat, in its own CPU time (read from the OS)
+slates daemon: fleet node `c` of `slates-fleet`: member 17373951935122913578 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 16760344576: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 2793390762: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 8388608: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 698347690: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 2078415: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 14434: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 698347690: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 1396695380: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 64891: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 4288987692: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 30953: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: page_fault_ns = 1477: the profile's measured base-page fault cost (at least one) (anchors ["faults.base_ns"])
+slates daemon: prefault_reserve_bytes = min(the shard's last write burst, reserve_per_shard = 2793390762, the arena's free bytes): the free content pages an idle shard keeps pre-faulted; the burst is measured at each idle tick (anchors ["reserve_per_shard", "content.allocated_bytes"])
+slates daemon: codec = lz4 false, zstd levels [], byte worth 233 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 256: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 1212409: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 914666: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 681980: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 2793390762: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 113663: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 14: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 2583: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 16384: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5166: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 5171: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 1443400: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_bandwidth_bytes_per_ns = 4: memcpy bytes per second at the largest measured copy size / 1e9 (at least one byte per nanosecond) (anchors ["memcpy"])
+slates daemon: guest_requests_credit = 20: the owning shard's admission limit (Little's law: request rate × p99 service time); one attachment may use its shard's whole in-flight budget, which the daemon splits among attachments (anchors ["rt.requests_in_flight_per_shard"])
+slates daemon: guest_bytes_credit = 4456544: clamp(bandwidth × rtt, one frame cap, bandwidth × class latency budget) (anchors ["wire.bandwidth", "wire.rtt_p50", "wire.frame_cap", "wire.class_budget"])
+slates daemon: guest_listing_entries = 131072: guest writable cap / smallest fuse_dirent (anchors ["guest.writable_cap"])
+slates daemon: inode_reserve = 262144: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 2568: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 349173845: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2424818: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2424818: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: fleet_sessions_per_plane = 1938: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120114: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77593644: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5173: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: control_shard_capacity = ShardCapacity { tasks: 175656, timers: 175656 }: tasks_per_shard + forward_lane_bound, timers_per_shard + forward_lane_bound (the lane's bound zero with no peers) (anchors ["tasks_per_shard", "timers_per_shard", "clients_per_shard", "region.slots", "shards", "fleet.peers"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates daemon: instance chaos-replaced-c-8713 serving on 2 shards under the anchor
+slates-server: shard 1 initialized in 602 µs
+slates-server: shard 0 initialized in 815 µs
+slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, extensions 10 × 100000000 ns; no path measured yet
+slates-cluster: fleet: HostId(5449320572718717257) holds HostId(1083832416622351078) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(1083832416622351078) holds HostId(5449320572718717257) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(1083832416622351078) holds HostId(11184549531783745575) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+slates-cluster: fleet: HostId(5449320572718717257) holds HostId(11184549531783745575) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(11184549531783745575) holds HostId(5449320572718717257) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(11184549531783745575) holds HostId(1083832416622351078) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+slates-cluster: fleet: HostId(5449320572718717257) holds HostId(1083832416622351078slates-cluster: fleet: )HostId alive: (None1083832416622351078 -> )MemberState holds  { HostIdliveness(: 5449320572718717257Alive),  alive: incarnationNone:  -> 0MemberState } { , folded at liveness: crates/server/src/member_task.rsAlive:, 718incarnation:: 90
+ }slates-cluster: fleet: , folded at HostIdcrates/server/src/member_task.rs(:5449320572718717257718): holds 9HostId
+(11184549531783745575) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+slates-cluster: fleet: HostId(11184549531783745575) holds HostId(5449320572718717257) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+chaos: fleet replaced (Anchored) formed and settled: hosts ["11184549531783745575", "1083832416622351078", "5449320572718717257"]
+chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-8713 destroyed at 158.958149ms
+slates anchor: instance chaos-replaced-a-8713 up; daemon pid 8967; 2 shards
+slates anchor: a daemon's beat is lapsed once older than the 1000 ms liveness window plus this anchor's own measured lateness p99, over its last 100 timed waits
+slates anchor: a starting daemon is killed once it makes no CPU progress for the 1000 ms liveness window, or runs that much CPU without its first beat, in its own CPU time (read from the OS)
+slates daemon: fleet node `a` of `slates-fleet`: member 12068328294195470868 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 16760344576: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 2793390762: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 8388608: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 698347690: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 2078415: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 5387: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 698347690: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 1396695380: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 24147: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 3826118527: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 10305: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: page_fault_ns = 1970: the profile's measured base-page fault cost (at least one) (anchors ["faults.base_ns"])
+slates daemon: prefault_reserve_bytes = min(the shard's last write burst, reserve_per_shard = 2793390762, the arena's free bytes): the free content pages an idle shard keeps pre-faulted; the burst is measured at each idle tick (anchors ["reserve_per_shard", "content.allocated_bytes"])
+slates daemon: codec = lz4 false, zstd levels [], byte worth 261 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 256: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 1212409: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 914666: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 681980: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 2793390762: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 113663: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 9: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 2583: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 16384: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5166: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 5171: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 538700: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_bandwidth_bytes_per_ns = 3: memcpy bytes per second at the largest measured copy size / 1e9 (at least one byte per nanosecond) (anchors ["memcpy"])
+slates daemon: guest_requests_credit = 20: the owning shard's admission limit (Little's law: request rate × p99 service time); one attachment may use its shard's whole in-flight budget, which the daemon splits among attachments (anchors ["rt.requests_in_flight_per_shard"])
+slates daemon: guest_bytes_credit = 4456544: clamp(bandwidth × rtt, one frame cap, bandwidth × class latency budget) (anchors ["wire.bandwidth", "wire.rtt_p50", "wire.frame_cap", "wire.class_budget"])
+slates daemon: guest_listing_entries = 131072: guest writable cap / smallest fuse_dirent (anchors ["guest.writable_cap"])
+slates daemon: inode_reserve = 262144: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 2568: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 349173845: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2424818: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2424818: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: fleet_sessions_per_plane = 1938: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120114: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77593644: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5173: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: control_shard_capacity = ShardCapacity { tasks: 175656, timers: 175656 }: tasks_per_shard + forward_lane_bound, timers_per_shard + forward_lane_bound (the lane's bound zero with no peers) (anchors ["tasks_per_shard", "timers_per_shard", "clients_per_shard", "region.slots", "shards", "fleet.peers"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates daemon: instance chaos-replaced-a-8713 serving on 2 shards under the anchor
+slates-server: shard 1 initialized in 424 µs
+slates-server: shard 0 initialized in 483 µs
+slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, extensions 10 × 100000000 ns; no path measured yet
+chaos a candidate's store destroyed mid-stream: replacement answering at 264.072883ms
+slates-cluster: fleet: HostId(1083832416622351078) holds HostId(16598610622296591052) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(16598610622296591052) holds HostId(1083832416622351078) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(5449320572718717257) holds HostId(16598610622296591052) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(16598610622296591052) holds HostId(5449320572718717257) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(5449320572718717257) holds HostId(16598610622296591052) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+slates-cluster: fleet: HostId(16598610622296591052) holds HostId(5449320572718717257) alive: None -> MemberStateslates-cluster: fleet:  { HostIdliveness(: 1083832416622351078Alive),  holds incarnationHostId: (016598610622296591052 }), folded at  alive: crates/server/src/member_task.rsNone: -> 718MemberState: { 9liveness
+: Aliveslates-cluster: fleet: , HostIdincarnation(: 165986106222965910520) } holds , folded at HostIdcrates/server/src/member_task.rs(:1083832416622351078718): alive: 9None
+ -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.655851496s
+chaos a candidate's store destroyed mid-stream: 1047 writes, 1047 acknowledged: p50 401 us, p99 8391 us, p999 211939 us, max 414958 us; 3 over 50ms (sent+took): 0.00s+114ms 0.32s+415ms 0.73s+212ms
+chaos a candidate's store destroyed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(1046), durable: Some(1046), owed: false, epoch: Some(1), identity: Some("d9532b6e437b77c1cc8539a76538eeffb53490ef638ce7b9386c56ff45507eb7"), fence: 1, holders: ["1083832416622351078", "16598610622296591052"], moving_to: [], recorded: ["1083832416622351078", "16598610622296591052"] }); candidates [Some(LiveState { holding: true, head: Some(1046), durable: None, owed: false, epoch: Some(1), identity: Some("d9532b6e437b77c1cc8539a76538eeffb53490ef638ce7b9386c56ff45507eb7"), fence: 1,
+chaos a candidate's store destroyed mid-stream: 164 samples, 91 heads seen
+chaos a candidate's store destroyed mid-stream: chaos-replaced-c-8713 refused the owner: {}
+chaos a candidate's store destroyed mid-stream: chaos-replaced-a-8713 refused the owner: {}
+chaos a candidate's store destroyed mid-stream: chaos-replaced-b-8713 refused the owner: {}
+LD-DUMP
+--- chaos-replaced-a-8713 (status exit 0; live Some([LiveState { holding: true, head: Some(1046), durable: None, owed: false, epoch: Some(1), identity: Some("d9532b6e437b77c1cc8539a76538eeffb53490ef638ce7b9386c56ff45507eb7"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 16598610622296591052
+  fleet_host_epoch: 1
+  fleet_members: 1083832416622351078 16598610622296591052
+  fleet_peers_probed: 1
+  fleet_held_records: 2
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 10
+  anchor: 14585128725341222777
+  fleet_settled_generation: 8
+  fleet_neighbourhood_generation: 8
+  fleet_retirement: host=11184549531783745575 version=8 survivors=[1083832416622351078 5449320572718717257] confirmed=[] unconfirmed=[]
+  fleet_peers_in_contact: 1
+  fleet_peers_unmeshed: 0
+  fleet_session 1083832416622351078: lent=false cwnd=130934 srtt_ns=58108 pto_ns=1058108 spurious_losses=0 persistent_collapses=0 consumed=94717 mtu=65496
+  shard 0 refused fleet.link.out_of_contact: 1
+  shard 0 refused fleet.link.stale_return: 1
+  shard 0 refused fleet.live.held: 792
+  shard 0 refused fleet.owner_location.declined.not_owner: 2252
+  shard 0 refused fleet.owner_location.direct: 1
+  shard 0 refused fleet.owner_location.forward_unanswered: 1
+  shard 0 refused fleet.owner_location.no_session: 2056
+  shard 0 refused fleet.owner_location.not_owner: 2074
+  shard 0 refused fleet.owner_location.retried: 2052
+  shard 0 refused fleet.owner_location.round: 2074
+  shard 0 refused fleet.owner_location.route_dropped.refused: 1
+  shard 0 refused fleet.owner_location.session_out: 18
+  shard 0 refused fleet.owner_location.unavailable: 2074
+  shard 0 refused fleet.plane.announce_lends: 4
+  shard 0 refused fleet.plane.announcements_sent: 4
+  shard 0 refused fleet.record.refused.unauthorized: 4
+  shard 0 refused fleet.report.sent: 2
+  shard 0 refused fleet.seal.pair_refused: 945
+  shard 0 refused fleet.seal.pair_served: 945
+  shard 0 live held 4b9fe0306c2099490001000000000036 head=1046 durable=none owed=false epoch=1 identity=d9532b6e437b77c1cc8539a76538eeffb53490ef638ce7b9386c56ff45507eb7 fence=1 holders=none moving_to=none recorded=none
+--- chaos-replaced-b-8713 (status exit 0; live Some([LiveState { holding: true, head: Some(1046), durable: None, owed: false, epoch: Some(1), identity: Some("d9532b6e437b77c1cc8539a76538eeffb53490ef638ce7b9386c56ff45507eb7"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 1083832416622351078
+  fleet_host_epoch: 1
+  fleet_members: 1083832416622351078 16598610622296591052
+  fleet_peers_probed: 1
+  fleet_held_records: 2
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 10
+  anchor: 10253093961685817796
+  fleet_settled_generation: 8
+  fleet_neighbourhood_generation: 8
+  fleet_retirement: host=11184549531783745575 version=8 survivors=[1083832416622351078 5449320572718717257] confirmed=[] unconfirmed=[]
+  fleet_peers_in_contact: 1
+  fleet_peers_unmeshed: 0
+  fleet_session 16598610622296591052: lent=false cwnd=130934 srtt_ns=48286 pto_ns=1048286 spurious_losses=0 persistent_collapses=0 consumed=97145 mtu=65496
+  shard 0 refused fleet.link.invalid.believed_dead: 1
+  shard 0 refused fleet.link.out_of_contact: 1
+  shard 0 refused fleet.link.stale_return: 1
+  shard 0 refused fleet.live.held: 1047
+  shard 0 refused fleet.owner_location.declined.not_owner: 2074
+  shard 0 refused fleet.owner_location.no_session: 2218
+  shard 0 refused fleet.owner_location.not_owner: 2252
+  shard 0 refused fleet.owner_location.retried: 2228
+  shard 0 refused fleet.owner_location.round: 2252
+  shard 0 refused fleet.owner_location.session_out: 34
+  shard 0 refused fleet.owner_location.unavailable: 2252
+  shard 0 refused fleet.plane.address_unresolved: 14
+  shard 0 refused fleet.plane.announce_lends: 5
+  shard 0 refused fleet.plane.announcements_sent: 5
+  shard 0 refused fleet.report.sent: 3
+  shard 0 refused fleet.seal.pair_no_session: 17
+  shard 0 refused fleet.seal.pair_served: 6
+  shard 0 refused fleet.seal.pair_unanswered: 929
+  shard 0 refused fleet.seal.pair_undelivered: 946
+  shard 0 refused fleet.takeover.page_unbound: 3
+  shard 0 refused fleet.takeover.page_unmatched: 1
+  shard 0 refused fleet.takeover.pages_unsent: 461
+  shard 0 live held 4b9fe0306c2099490001000000000036 head=1046 durable=none owed=false epoch=1 identity=d9532b6e437b77c1cc8539a76538eeffb53490ef638ce7b9386c56ff45507eb7 fence=1 holders=none moving_to=none recorded=none
+--- chaos-replaced-c-8713 (status exit 3; live None):
+  
+LD-DUMP-END
+LD-COUNTERS chaos-replaced-a-8713 takeover {}
+LD-COUNTERS chaos-replaced-a-8713 live {"fleet.live.held": 792}
+LD-COUNTERS chaos-replaced-a-8713 materialize {}
+LD-STATUS chaos-replaced-a-8713
+pid: 8967
+generation: 1
+restarts: 0
+anchor_hold_refusals: 0
+anchor_log_lines_refused: 0
+log_lines_refused: 0
+dumps_local_full: false
+heartbeat_age_ns: 35247535
+clients_reaped: 120
+clients_refused: 0
+shards: 2
+fleet_host: 16598610622296591052
+fleet_f: 1
+fleet_host_epoch: 1
+fleet_members: 1083832416622351078 16598610622296591052
+fleet_peers_probed: 1
+fleet_unknown_id: 43
+fleet_inbox_full: 0
+fleet_sessions_refused: 0
+fleet_replaced: 0
+fleet_held_records: 2
+fleet_takeovers_pending: 0
+fleet_configuration_version: 10
+anchor: 14585128725341222777
+seal: minted
+seal_root: 303e7f0467c14e3c2a7b9a94de730f37
+seal_recipient: 1a7d959abbc1bcefef4a70dcc777c611
+seal_key_slots: 256
+seal_keys_held: 4
+fleet_configuration_members: 3
+fleet_settled_generation: 8
+fleet_neighbourhood_generation: 8
+fleet_retirement: host=11184549531783745575 version=8 survivors=[1083832416622351078 5449320572718717257] confirmed=[] unconfirmed=[]
+fleet_council_leads: false
+fleet_council_base_periods: 10
+fleet_council_span_periods: 10
+fleet_council_rtt_tail_ns: 1078725
+fleet_council_rtt_spread_ns: 1000000
+fleet_council_samples: 577
+fleet_council_term: 1
+fleet_council_priority_ns: 78725
+fleet_council_priority_spread_ns: 1000000
+fleet_council_rank: 0
+fleet_council_leader_lease: false
+fleet_council_pre_elections: 30
+fleet_council_elections: 0
+fleet_council_pre_votes_granted: 30
+fleet_council_pre_votes_refused: 0
+fleet_council_refused_role: 0
+fleet_council_refused_leased: 0
+fleet_council_refused_term: 0
+fleet_council_refused_log: 0
+fleet_council_voters: 3
+fleet_council_joint: true
+fleet_council_voter_ids: 1083832416622351078 5449320572718717257 11184549531783745575 16598610622296591052
+fleet_root_leads: false
+fleet_root_base_periods: 10
+fleet_root_span_periods: 10
+fleet_root_rtt_tail_ns: 1052102
+fleet_root_rtt_spread_ns: 1000000
+fleet_root_samples: 533
+fleet_root_term: 1
+fleet_root_priority_ns: 0
+fleet_root_priority_spread_ns: 0
+fleet_root_rank: 0
+fleet_root_leader_lease: false
+fleet_root_pre_elections: 0
+fleet_root_elections: 0
+fleet_root_pre_votes_granted: 0
+fleet_root_pre_votes_refused: 0
+fleet_root_refused_role: 0
+fleet_root_refused_leased: 0
+fleet_root_refused_term: 0
+fleet_root_refused_log: 0
+fleet_root_voters: 1
+fleet_root_joint: false
+fleet_root_voter_ids: 1083832416622351078
+fleet_detector 1083832416622351078: configured=true judged_by=own expected_ns=58227 margin_ns=23405955 samples=188 mistake=8/1000 suspicions=0 (allowance 35347/1000) condemnations=0 (allowance 34323/1000) pool_misfit=false refused=
+fleet_detector_pool: configured=true samples=83 refused= expected_ns=63084 margin_ns=10764119
+fleet_detector_relays: due_ns=24002650 stated=1
+fleet_detector_granularity_ns: 600475
+fleet_peers_in_contact: 1
+fleet_peers_unmeshed: 0
+fleet_session 1083832416622351078: lent=false cwnd=130934 srtt_ns=58108 pto_ns=1058108 spurious_losses=0 persistent_collapses=0 consumed=94717 mtu=65496
+shard 0: clients=3 volumes=0 served=119 replayed=0 replay_ns=17456 torn=false mapped=0 locked=0 reserve=0 committed=0 retained=0 replicated=0 retained_versions=0 metadata=1774658538 committed_metadata=0 tasks_refused=0 landings_awaiting=0/5166 landings_in_flight=0 target_leases=0
+shard 0 refused content.purged_bytes: 6285115392
+shard 0 refused content.ticks.idle: 48
+shard 0 refused fleet.council.death_report_taken: 437
+shard 0 refused fleet.discovery.pages: 65
+shard 0 refused fleet.election.no_link: 60
+shard 0 refused fleet.election.session_awaited: 3
+shard 0 refused fleet.fan.sent: 476
+shard 0 refused fleet.fan.unchanged: 4
+shard 0 refused fleet.forward.batch_given_up: 1
+shard 0 refused fleet.forward.begun: 1
+shard 0 refused fleet.forward.client.control_started: 11
+shard 0 refused fleet.forward.client.resolved: 11
+shard 0 refused fleet.forward.local.control_started: 12
+shard 0 refused fleet.forward.local.delivered_home: 12
+shard 0 refused fleet.forward.local.resolved: 12
+shard 0 refused fleet.learner.fetch_paced: 8
+shard 0 refused fleet.learner.fetches: 21
+shard 0 refused fleet.link.out_of_contact: 1
+shard 0 refused fleet.link.stale_return: 1
+shard 0 refused fleet.live.held: 792
+shard 0 refused fleet.owner_location.declined.not_owner: 2252
+shard 0 refused fleet.owner_location.direct: 1
+shard 0 refused fleet.owner_location.forward_unanswered: 1
+shard 0 refused fleet.owner_location.no_session: 2056
+shard 0 refused fleet.owner_location.not_owner: 2074
+shard 0 refused fleet.owner_location.retried: 2052
+shard 0 refused fleet.owner_location.round: 2074
+shard 0 refused fleet.owner_location.route_dropped.refused: 1
+shard 0 refused fleet.owner_location.session_out: 18
+shard 0 refused fleet.owner_location.unavailable: 2074
+shard 0 refused fleet.plane.announce_lends: 4
+shard 0 refused fleet.plane.announcements_sent: 4
+shard 0 refused fleet.record.refused.unauthorized: 4
+shard 0 refused fleet.report.sent: 2
+shard 0 refused fleet.seal.pair_refused: 945
+shard 0 refused fleet.seal.pair_served: 945
+shard 0 refused recovery.returned_bytes: 5586771968
+shard 0 catalog.volumes: 0 (age 0 ns)
+shard 0 log.replay_ns: 17456 (age 48476506931 ns)
+shard 0 lease.expiring: 0 (age 0 ns)
+shard 0 ring.depth: 0 (age 0 ns)
+shard 0 shard.clients: 3 (age 0 ns)
+shard 0 shard.deferred: 0 (age 0 ns)
+shard 0 nfs.local_p50_ns: absent/unknown (age 48476506931 ns)
+shard 0 nfs.local_p99_ns: absent/unknown (age 48476506931 ns)
+shard 0 nfs.local_off_cpu_p99_ns: absent/unknown (age 48476506931 ns)
+shard 0 nfs.forwarded_p99_ns: absent/unknown (age 48476506931 ns)
+shard 0 telemetry: spans_held=2 spans_dropped=0
+shard 0 registry_attachments: 0
+shard 0 snapshots: taken=0 written=0 longest_ns=0 log_appended=121675 tail_bytes=121675 tail_replay_ns=859718 budget_ns=1000000000 floor_bytes=0
+shard 0 live held 4b9fe0306c2099490001000000000036 head=1046 durable=none owed=false epoch=1 identity=d9532b6e437b77c1cc8539a76538eeffb53490ef638ce7b9386c56ff45507eb7 fence=1 holders=none moving_to=none recorded=none
+shard 0 drain: spans=4 window_ns=1718054 horizon_ns=10000000000 shed_before=0 dropped_total=0 remaining=0 missing_links=0
+shard 0 span bridge.request: absent/unknown (never; producer filesystem bridge expected here)
+shard 0 span ring.request: spans=2 latest_age_ns=15663
+shard 0 span shard.op: spans=1 latest_age_ns=1711775
+shard 0 span log.append: spans=1 latest_age_ns=1711775
+shard 0 span ship.record: absent/unknown (never; producer record replication (f ≥ 1) expected here)
+shard 0 span consensus.step: absent/unknown (never; producer configuration group expected here)
+shard 0 span archive.chunk: absent/unknown (never; no producer here (archive codec))
+shard 0 span land.entry: absent/unknown (never; producer landing under grant expected here)
+shard 0 span merge.verdict: absent/unknown (never; producer client verb expected here)
+shard 1: clients=3 volumes=0 served=118 replayed=0 replay_ns=28773 torn=false mapped=0 locked=0 reserve=0 committed=0 retained=0 replicated=0 retained_versions=0 metadata=1774658538 committed_metadata=0 tasks_refused=0 landings_awaiting=0/5166 landings_in_flight=0 target_leases=0
+shard 1 refused content.purged_bytes: 698343424
+shard 1 refused content.ticks.idle: 48
+shard 1 refused fleet.forward.client.delivered_home: 11
+shard 1 refused fleet.forward.client.to_control: 11
+shard 1 refused fleet.forward.local.to_control: 12
+shard 1 catalog.volumes: 0 (age 0 ns)
+shard 1 log.replay_ns: 28773 (age 48478197269 ns)
+shard 1 lease.expiring: 0 (age 0 ns)
+shard 1 ring.depth: 0 (age 0 ns)
+shard 1 shard.clients: 3 (age 0 ns)
+shard 1 shard.deferred: 0 (age 0 ns)
+shard 1 nfs.local_p50_ns: absent/unknown (age 48478197269 ns)
+shard 1 nfs.local_p99_ns: absent/unknown (age 48478197269 ns)
+shard 1 nfs.local_off_cpu_p99_ns: absent/unknown (age 48478197269 ns)
+shard 1 nfs.forwarded_p99_ns: absent/unknown (age 48478197269 ns)
+shard 1 telemetry: spans_held=3 spans_dropped=0
+shard 1 registry_attachments: 0
+shard 1 snapshots: taken=0 written=0 longest_ns=0 log_appended=111144 tail_bytes=111144 tail_replay_ns=1556454 budget_ns=1000000000 floor_bytes=0
+shard 1 drain: spans=3 window_ns=1726126 horizon_ns=10000000000 shed_before=0 dropped_total=0 remaining=0 missing_links=0
+shard 1 span bridge.request: absent/unknown (never; producer filesystem bridge expected here)
+shard 1 span ring.request: spans=1 latest_age_ns=1713147
+shard 1 span shard.op: spans=1 latest_age_ns=1719266
+shard 1 span log.append: spans=1 latest_age_ns=1719266
+shard 1 span ship.record: absent/unknown (never; producer record replication (f ≥ 1) expected here)
+shard 1 span consensus.step: absent/unknown (never; producer configuration group expected here)
+shard 1 span archive.chunk: absent/unknown (never; no producer here (archive codec))
+shard 1 span land.entry: absent/unknown (never; producer landing under grant expected here)
+shard 1 span merge.verdict: absent/unknown (never; producer client verb expected here)
+
+LD-STATUS-END
+LD-COUNTERS chaos-replaced-b-8713 takeover {"fleet.takeover.page_unbound": 3, "fleet.takeover.page_unmatched": 1, "fleet.takeover.pages_unsent": 461}
+LD-COUNTERS chaos-replaced-b-8713 live {"fleet.live.held": 1047}
+LD-COUNTERS chaos-replaced-b-8713 materialize {}
+LD-STATUS chaos-replaced-b-8713
+pid: 8737
+generation: 1
+restarts: 0
+anchor_hold_refusals: 0
+anchor_log_lines_refused: 0
+log_lines_refused: 0
+dumps_local_full: false
+heartbeat_age_ns: 61417769
+clients_reaped: 184
+clients_refused: 0
+shards: 2
+fleet_host: 1083832416622351078
+fleet_f: 1
+fleet_host_epoch: 1
+fleet_members: 1083832416622351078 16598610622296591052
+fleet_peers_probed: 1
+fleet_unknown_id: 0
+fleet_inbox_full: 0
+fleet_sessions_refused: 0
+fleet_replaced: 0
+fleet_held_records: 2
+fleet_takeovers_pending: 0
+fleet_configuration_version: 10
+anchor: 10253093961685817796
+seal: minted
+seal_root: 88cf5b386b34cf413c322166df69f628
+seal_recipient: c49e56068003ed7a2331024e948d6520
+seal_key_slots: 256
+seal_keys_held: 4
+fleet_configuration_members: 3
+fleet_settled_generation: 8
+fleet_neighbourhood_generation: 8
+fleet_retirement: host=11184549531783745575 version=8 survivors=[1083832416622351078 5449320572718717257] confirmed=[] unconfirmed=[]
+fleet_council_leads: false
+fleet_council_base_periods: 10
+fleet_council_span_periods: 10
+fleet_council_rtt_tail_ns: 4444609
+fleet_council_rtt_spread_ns: 3675068
+fleet_council_samples: 643
+fleet_council_term: 1
+fleet_council_priority_ns: 151961
+fleet_council_priority_spread_ns: 1000000
+fleet_council_rank: 0
+fleet_council_leader_lease: false
+fleet_council_pre_elections: 30
+fleet_council_elections: 1
+fleet_council_pre_votes_granted: 30
+fleet_council_pre_votes_refused: 0
+fleet_council_refused_role: 0
+fleet_council_refused_leased: 0
+fleet_council_refused_term: 0
+fleet_council_refused_log: 0
+fleet_council_voters: 3
+fleet_council_joint: true
+fleet_council_voter_ids: 1083832416622351078 5449320572718717257 11184549531783745575 16598610622296591052
+fleet_root_leads: true
+fleet_root_base_periods: 10
+fleet_root_span_periods: 10
+fleet_root_rtt_tail_ns: 0
+fleet_root_rtt_spread_ns: 0
+fleet_root_samples: 0
+fleet_root_term: 1
+fleet_root_priority_ns: 0
+fleet_root_priority_spread_ns: 0
+fleet_root_rank: 0
+fleet_root_leader_lease: false
+fleet_root_pre_elections: 0
+fleet_root_elections: 1
+fleet_root_pre_votes_granted: 0
+fleet_root_pre_votes_refused: 0
+fleet_root_refused_role: 0
+fleet_root_refused_leased: 0
+fleet_root_refused_term: 0
+fleet_root_refused_log: 0
+fleet_root_voters: 1
+fleet_root_joint: false
+fleet_root_voter_ids: 1083832416622351078
+fleet_detector 16598610622296591052: configured=true judged_by=own expected_ns=52518 margin_ns=14433213 samples=161 mistake=10/1000 suspicions=0 (allowance 7499/1000) condemnations=0 (allowance 7362/1000) pool_misfit=false refused=
+fleet_detector_pool: configured=true samples=120 refused= expected_ns=91606 margin_ns=13007054
+fleet_detector_relays: due_ns=15086206 stated=1
+fleet_detector_granularity_ns: 538468
+fleet_peers_in_contact: 1
+fleet_peers_unmeshed: 0
+fleet_session 16598610622296591052: lent=false cwnd=130934 srtt_ns=48286 pto_ns=1048286 spurious_losses=0 persistent_collapses=0 consumed=97145 mtu=65496
+shard 0: clients=3 volumes=0 served=183 replayed=0 replay_ns=33279 torn=false mapped=0 locked=0 reserve=0 committed=0 retained=0 replicated=0 retained_versions=0 metadata=1774658538 committed_metadata=0 tasks_refused=0 landings_awaiting=0/5166 landings_in_flight=0 target_leases=0
+shard 0 refused content.purged_bytes: 9078501376
+shard 0 refused content.ticks.idle: 49
+shard 0 refused fleet.council.death_report_taken: 437
+shard 0 refused fleet.discovery.invalidated: 1
+shard 0 refused fleet.discovery.pages: 73
+shard 0 refused fleet.election.no_link: 60
+shard 0 refused fleet.election.session_awaited: 2
+shard 0 refused fleet.fan.sent: 482
+shard 0 refused fleet.fan.unchanged: 5
+shard 0 refused fleet.forward.client.control_started: 12
+shard 0 refused fleet.forward.client.resolved: 12
+shard 0 refused fleet.forward.local.control_started: 12
+shard 0 refused fleet.forward.local.delivered_home: 12
+shard 0 refused fleet.forward.local.resolved: 12
+shard 0 refused fleet.learner.fetch_paced: 8
+shard 0 refused fleet.link.invalid.believed_dead: 1
+shard 0 refused fleet.link.out_of_contact: 1
+shard 0 refused fleet.link.stale_return: 1
+shard 0 refused fleet.live.held: 1047
+shard 0 refused fleet.owner_location.declined.not_owner: 2074
+shard 0 refused fleet.owner_location.no_session: 2218
+shard 0 refused fleet.owner_location.not_owner: 2252
+shard 0 refused fleet.owner_location.retried: 2228
+shard 0 refused fleet.owner_location.round: 2252
+shard 0 refused fleet.owner_location.session_out: 34
+shard 0 refused fleet.owner_location.unavailable: 2252
+shard 0 refused fleet.plane.address_unresolved: 14
+shard 0 refused fleet.plane.announce_lends: 5
+shard 0 refused fleet.plane.announcements_sent: 5
+shard 0 refused fleet.report.sent: 3
+shard 0 refused fleet.seal.pair_no_session: 17
+shard 0 refused fleet.seal.pair_served: 6
+shard 0 refused fleet.seal.pair_unanswered: 929
+shard 0 refused fleet.seal.pair_undelivered: 946
+shard 0 refused fleet.takeover.page_unbound: 3
+shard 0 refused fleet.takeover.page_unmatched: 1
+shard 0 refused fleet.takeover.pages_unsent: 461
+shard 0 refused recovery.returned_bytes: 8380157952
+shard 0 catalog.volumes: 0 (age 0 ns)
+shard 0 log.replay_ns: 33279 (age 49804710700 ns)
+shard 0 lease.expiring: 0 (age 0 ns)
+shard 0 ring.depth: 0 (age 0 ns)
+shard 0 shard.clients: 3 (age 0 ns)
+shard 0 shard.deferred: 0 (age 0 ns)
+shard 0 nfs.local_p50_ns: absent/unknown (age 49804710700 ns)
+shard 0 nfs.local_p99_ns: absent/unknown (age 49804710700 ns)
+shard 0 nfs.local_off_cpu_p99_ns: absent/unknown (age 49804710700 ns)
+shard 0 nfs.forwarded_p99_ns: absent/unknown (age 49804710700 ns)
+shard 0 telemetry: spans_held=4 spans_dropped=0
+shard 0 registry_attachments: 0
+shard 0 snapshots: taken=0 written=0 longest_ns=0 log_appended=185937 tail_bytes=185937 tail_replay_ns=1269930 budget_ns=1000000000 floor_bytes=0
+shard 0 live held 4b9fe0306c2099490001000000000036 head=1046 durable=none owed=false epoch=1 identity=d9532b6e437b77c1cc8539a76538eeffb53490ef638ce7b9386c56ff45507eb7 fence=1 holders=none moving_to=none recorded=none
+shard 0 drain: spans=4 window_ns=1738214 horizon_ns=10000000000 shed_before=0 dropped_total=0 remaining=0 missing_links=0
+shard 0 span bridge.request: absent/unknown (never; producer filesystem bridge expected here)
+shard 0 span ring.request: spans=2 latest_age_ns=1685686
+shard 0 span shard.op: spans=1 latest_age_ns=1734349
+shard 0 span log.append: spans=1 latest_age_ns=1734349
+shard 0 span ship.record: absent/unknown (never; producer record replication (f ≥ 1) expected here)
+shard 0 span consensus.step: absent/unknown (never; producer configuration group expected here)
+shard 0 span archive.chunk: absent/unknown (never; no producer here (archive codec))
+shard 0 span land.entry: absent/unknown (never; producer landing under grant expected here)
+shard 0 span merge.verdict: absent/unknown (never; producer client verb expected here)
+shard 1: clients=4 volumes=0 served=183 replayed=0 replay_ns=25938 torn=false mapped=0 locked=0 reserve=0 committed=0 retained=0 replicated=0 retained_versions=0 metadata=1774658538 committed_metadata=0 tasks_refused=0 landings_awaiting=0/5166 landings_in_flight=0 target_leases=0
+shard 1 refused content.purged_bytes: 698343424
+shard 1 refused content.ticks.idle: 49
+shard 1 refused fleet.forward.client.delivered_home: 12
+shard 1 refused fleet.forward.client.to_control: 12
+shard 1 refused fleet.forward.local.to_control: 12
+shard 1 catalog.volumes: 0 (age 0 ns)
+shard 1 log.replay_ns: 25938 (age 49803864942 ns)
+shard 1 lease.expiring: 0 (age 0 ns)
+shard 1 ring.depth: 0 (age 0 ns)
+shard 1 shard.clients: 4 (age 0 ns)
+shard 1 shard.deferred: 0 (age 0 ns)
+shard 1 nfs.local_p50_ns: absent/unknown (age 49803864942 ns)
+shard 1 nfs.local_p99_ns: absent/unknown (age 49803864942 ns)
+shard 1 nfs.local_off_cpu_p99_ns: absent/unknown (age 49803864942 ns)
+shard 1 nfs.forwarded_p99_ns: absent/unknown (age 49803864942 ns)
+shard 1 telemetry: spans_held=2 spans_dropped=0
+shard 1 registry_attachments: 0
+shard 1 snapshots: taken=0 written=0 longest_ns=0 log_appended=171608 tail_bytes=171608 tail_replay_ns=887936 budget_ns=1000000000 floor_bytes=0
+shard 1 drain: spans=5 window_ns=1734089 horizon_ns=10000000000 shed_before=0 dropped_total=0 remaining=0 missing_links=0
+shard 1 span bridge.request: absent/unknown (never; producer filesystem bridge expected here)
+shard 1 span ring.request: spans=3 latest_age_ns=10326
+shard 1 span shard.op: spans=1 latest_age_ns=1726888
+shard 1 span log.append: spans=1 latest_age_ns=1726888
+shard 1 span ship.record: absent/unknown (never; producer record replication (f ≥ 1) expected here)
+shard 1 span consensus.step: absent/unknown (never; producer configuration group expected here)
+shard 1 span archive.chunk: absent/unknown (never; no producer here (archive codec))
+shard 1 span land.entry: absent/unknown (never; producer landing under grant expected here)
+shard 1 span merge.verdict: absent/unknown (never; producer client verb expected here)
+
+LD-STATUS-END
+chaos a candidate's store destroyed mid-stream:
+  candidate node chaos-replaced-a-8713 destroyed at 158.958149ms
+  replacement answering at 264.072883ms
+  the fleet rejoined at 1.655851496s
+  every write acknowledged: held
+  1047 writes, 1047 acknowledged: p50 401 us, p99 8391 us, p999 211939 us, max 414958 us; 3 over 50ms (sent+took): 0.00s+114ms 0.32s+415ms 0.73s+212ms
+  converged: true: owner Some(LiveState { holding: false, head: Some(1046), durable: Some(1046), owed: false, epoch: Some(1), identity: Some("d9532b6e437b77c1cc8539a76538eeffb53490ef638ce7b9386c56ff45507eb7"), fence: 1, holders: ["1083832416622351078", "16598610622296591052"], moving_to: [], recorded: ["1083832416622351078", "16598610622296591052"] }); candidates [Some(LiveState { holding: true, head: Some(1046), durable: None, owed: false, epoch: Some(1), identity: Some("d9532b6e437b77c1cc8539a76538eeffb53490ef638ce7b9386c56ff45507eb7"), fence: 1, holders: [], moving_to: [], recorded: [] }), 
+  Convergence: held
+  164 samples, 91 heads seen
+  Agreement: held
+  NoLoss: held
+  chaos-replaced-c-8713 refused the owner: {}
+  chaos-replaced-a-8713 refused the owner: {}
+  chaos-replaced-b-8713 refused the owner: {}
+  NoLoss (successor): 1 violations
+
+thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (8714) panicked at crates/cli/tests/live_chaos.rs:1247:5:
+chaos a candidate's store destroyed mid-stream: NoLoss (successor): no survivor served the volume within the fleet wait
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 49.95s
+
+error: test failed, to rerun pass `-p slates-cli --test live_chaos`
