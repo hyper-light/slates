@@ -3510,16 +3510,6 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     detector_relays: detector_relay_report(state),
     registry_attachments: u64::try_from(state.attachments.live()).unwrap_or(u64::MAX),
     live: crate::live_ship::reports(state),
-    peers_in_contact: if is_control_shard(state) {
-      peers_in_contact(state).0
-    } else {
-      0
-    },
-    peers_unmeshed: if is_control_shard(state) {
-      peers_in_contact(state).1
-    } else {
-      0
-    },
     snapshots: snapshot_report(state.db.stats()),
     peers_in_contact: if is_control_shard(state) {
       peers_in_contact(state).0
