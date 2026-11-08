@@ -1,0 +1,234 @@
+runner ubuntu-24.04-arm, 4 CPUs, Sun Nov  8 02:15:13 UTC 2026, commit 8ba15475
+== cargo test --locked -q -p slates-wire
+test result: ok. 32 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.13s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-db
+test result: ok. 63 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.23s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.00s
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 35.61s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.82s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.08s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-anchor -- --test-threads=1
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 19 passed; 0 failed; 10 ignored; 0 measured; 0 filtered out; finished in 0.85s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-server --lib
+test result: ok. 211 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 1.27s
+== exit 0
+== cargo test --locked -q -p slates-server --test consumers
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+== exit 0
+== cargo test --locked -q -p slates-cli --bins
+test result: ok. 50 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.76s
+== exit 0
+== cargo test --locked -q -p slates-server --test ack_release
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.90s
+== exit 0
+== cargo test --locked -q -p slates-server --test attach_forms
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.26s
+== exit 0
+== cargo test --locked -q -p slates-server --test attachment_term
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.37s
+== exit 0
+== cargo test --locked -q -p slates-server --test checkout
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.48s
+== exit 0
+== cargo test --locked -q -p slates-server --test cross_shard_wait
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.91s
+== exit 0
+== cargo test --locked -q -p slates-server --test daemon
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.57s
+== exit 0
+== cargo test --locked -q -p slates-server --test dump_exclusion
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-server --test fleet
+test result: ok. 98 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 383.90s
+== exit 0
+== cargo test --locked -q -p slates-server --test forward_retry
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.37s
+== exit 0
+== cargo test --locked -q -p slates-server --test fuse_idle
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.91s
+== exit 0
+== cargo test --locked -q -p slates-server --test fuse_mount
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.58s
+== exit 0
+== cargo test --locked -q -p slates-server --test fuse_told
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.93s
+== exit 0
+== cargo test --locked -q -p slates-server --test give_back
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-server --test green_checkpoint
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.09s
+== exit 0
+== cargo test --locked -q -p slates-server --test green_fairness
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.89s
+== exit 0
+== cargo test --locked -q -p slates-server --test green_post_state
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+== exit 0
+== cargo test --locked -q -p slates-server --test green_retention
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
+== exit 0
+== cargo test --locked -q -p slates-server --test landing_fairness
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 797.05s
+== exit 0
+== cargo test --locked -q -p slates-server --test lease
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s
+== exit 0
+== cargo test --locked -q -p slates-server --test live_ship
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+== exit 0
+== cargo test --locked -q -p slates-server --test liveness
+test result: ok. 6 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 5.16s
+== exit 0
+== cargo test --locked -q -p slates-server --test merge_load
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.38s
+== exit 0
+== cargo test --locked -q -p slates-server --test nfs_hostile
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.57s
+== exit 0
+== cargo test --locked -q -p slates-server --test nfs_mount
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.14s
+== exit 0
+== cargo test --locked -q -p slates-server --test nfs_tls
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+== exit 0
+== cargo test --locked -q -p slates-server --test nfs_v4_kernel
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-server --test nfs_writeback
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.26s
+== exit 0
+== cargo test --locked -q -p slates-server --test observe
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.10s
+== exit 0
+== cargo test --locked -q -p slates-server --test pin_fairness
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.31s
+== exit 0
+== cargo test --locked -q -p slates-server --test presentation_fairness
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.74s
+== exit 0
+== cargo test --locked -q -p slates-server --test presentations
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+== exit 0
+== cargo test --locked -q -p slates-server --test recovery
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 38.48s
+== exit 0
+== cargo test --locked -q -p slates-server --test seal
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s
+== exit 0
+== cargo test --locked -q -p slates-server --test shards
+a_descriptor_answers_with_an_object_holding_only_its_files_bytes --- FAILED
+a_closed_end_ends_the_attachment_and_a_detach_ends_the_stream --- FAILED
+a_change_through_another_path_reaches_the_guests_map_before_its_reply --- FAILED
+a_fill_past_the_shards_budget_is_refused_and_a_forget_gives_its_charge_back --- FAILED
+a_guest_history_over_the_stream_is_the_volume_the_host_sees --- FAILED
+a_guests_acknowledged_close_survives_a_daemon_restart --- FAILED
+a_guests_stores_reach_the_volume_at_close_forget_and_the_streams_end --- FAILED
+a_closed_stream_gives_back_what_its_guest_held --- FAILED
+a_guests_stores_through_its_map_reach_the_volume_at_fsync_and_survive_a_restart --- FAILED
+a_read_only_attachments_object_is_never_ingested --- FAILED
+a_guests_write_over_a_shards_stream_is_answered_once_every_fuse_mount_of_its_volume_was_told --- FAILED
+a_read_only_map_of_an_untouched_base_file_shows_an_outsiders_edit_before_the_reply_that_reveals_it --- FAILED
+a_read_only_stream_refuses_every_change --- FAILED
+a_writable_ask_after_an_outsiders_edit_finds_the_map_refilled_and_writes_back_only_the_guests_store --- FAILED
+a_write_back_the_volume_refuses_fails_the_fsync_that_asked_for_it --- FAILED
+hostile_descriptor_asks_are_refused_with_an_errno_and_no_descriptor --- FAILED
+hostile_frames_are_refused_and_end_only_their_own_stream --- FAILED
+a_scoped_stream_stays_in_its_directory --- FAILED
+the_stream_offers_per_inode_dax_for_files_of_a_range_or_more --- FAILED
+a_writable_map_of_an_untouched_base_file_never_takes_an_outsiders_edit_for_the_guests --- FAILED
+two_asks_for_one_node_answer_one_object_the_peer_cannot_resize --- FAILED
+the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte --- FAILED
+thread 'a_descriptor_answers_with_an_object_holding_only_its_files_bytes' (17790) panicked at crates/server/tests/shards.rs:1368:72:
+thread 'a_closed_end_ends_the_attachment_and_a_detach_ends_the_stream' (17788) panicked at crates/server/tests/shards.rs:888:58:
+thread 'a_change_through_another_path_reaches_the_guests_map_before_its_reply' (17787) panicked at crates/server/tests/shards.rs:1837:72:
+thread 'a_fill_past_the_shards_budget_is_refused_and_a_forget_gives_its_charge_back' (17804) panicked at crates/server/tests/shards.rs:1612:72:
+thread 'a_guest_history_over_the_stream_is_the_volume_the_host_sees' (17805) panicked at crates/server/tests/shards.rs:729:59:
+thread 'a_guests_acknowledged_close_survives_a_daemon_restart' (17806) panicked at crates/server/tests/shards.rs:963:71:
+thread 'a_guests_stores_reach_the_volume_at_close_forget_and_the_streams_end' (17811) panicked at crates/server/tests/shards.rs:1746:72:
+thread 'a_closed_stream_gives_back_what_its_guest_held' (17789) panicked at crates/server/tests/shards.rs:1027:71:
+thread 'a_guests_stores_through_its_map_reach_the_volume_at_fsync_and_survive_a_restart' (17812) panicked at crates/server/tests/shards.rs:1704:71:
+thread 'a_read_only_attachments_object_is_never_ingested' (17821) panicked at crates/server/tests/shards.rs:1781:73:
+thread 'a_guests_write_over_a_shards_stream_is_answered_once_every_fuse_mount_of_its_volume_was_told' (17815) panicked at crates/server/tests/shards.rs:2816:72:
+thread 'a_read_only_map_of_an_untouched_base_file_shows_an_outsiders_edit_before_the_reply_that_reveals_it' (17822) panicked at crates/server/tests/shards.rs:2239:76:
+thread 'a_read_only_stream_refuses_every_change' (17823) panicked at crates/server/tests/shards.rs:796:58:
+thread 'a_writable_ask_after_an_outsiders_edit_finds_the_map_refilled_and_writes_back_only_the_guests_store' (17833) panicked at crates/server/tests/shards.rs:2279:77:
+thread 'a_write_back_the_volume_refuses_fails_the_fsync_that_asked_for_it' (17839) panicked at crates/server/tests/shards.rs:2109:72:
+thread 'hostile_descriptor_asks_are_refused_with_an_errno_and_no_descriptor' (17844) panicked at crates/server/tests/shards.rs:1461:72:
+thread 'hostile_frames_are_refused_and_end_only_their_own_stream' (17845) panicked at crates/server/tests/shards.rs:1144:76:
+thread 'a_scoped_stream_stays_in_its_directory' (17832) panicked at crates/server/tests/shards.rs:814:3:
+thread 'the_stream_offers_per_inode_dax_for_files_of_a_range_or_more' (17851) panicked at crates/server/tests/shards.rs:1560:72:
+thread 'a_writable_map_of_an_untouched_base_file_never_takes_an_outsiders_edit_for_the_guests' (17838) panicked at crates/server/tests/shards.rs:2177:77:
+thread 'two_asks_for_one_node_answer_one_object_the_peer_cannot_resize' (17852) panicked at crates/server/tests/shards.rs:1416:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2043:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2043:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2043:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2043:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2043:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2043:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2043:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2043:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2043:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2043:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2043:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2043:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2043:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2043:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2043:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2043:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2043:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2043:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2043:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2043:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2043:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2043:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2043:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2043:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2043:72:
+thread 'the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte' (17850) panicked at crates/server/tests/shards.rs:2013:1:
+    a_change_through_another_path_reaches_the_guests_map_before_its_reply
+    a_closed_end_ends_the_attachment_and_a_detach_ends_the_stream
+    a_closed_stream_gives_back_what_its_guest_held
+    a_descriptor_answers_with_an_object_holding_only_its_files_bytes
+    a_fill_past_the_shards_budget_is_refused_and_a_forget_gives_its_charge_back
+    a_guest_history_over_the_stream_is_the_volume_the_host_sees
+    a_guests_acknowledged_close_survives_a_daemon_restart
+    a_guests_stores_reach_the_volume_at_close_forget_and_the_streams_end
+    a_guests_stores_through_its_map_reach_the_volume_at_fsync_and_survive_a_restart
+    a_guests_write_over_a_shards_stream_is_answered_once_every_fuse_mount_of_its_volume_was_told
+    a_read_only_attachments_object_is_never_ingested
+    a_read_only_map_of_an_untouched_base_file_shows_an_outsiders_edit_before_the_reply_that_reveals_it
+    a_read_only_stream_refuses_every_change
+    a_scoped_stream_stays_in_its_directory
+    a_writable_ask_after_an_outsiders_edit_finds_the_map_refilled_and_writes_back_only_the_guests_store
+    a_writable_map_of_an_untouched_base_file_never_takes_an_outsiders_edit_for_the_guests
+    a_write_back_the_volume_refuses_fails_the_fsync_that_asked_for_it
+    hostile_descriptor_asks_are_refused_with_an_errno_and_no_descriptor
+    hostile_frames_are_refused_and_end_only_their_own_stream
+    the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte
+    the_stream_offers_per_inode_dax_for_files_of_a_range_or_more
+    two_asks_for_one_node_answer_one_object_the_peer_cannot_resize
+test result: FAILED. 0 passed; 22 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.30s
+== exit 101
+== cargo test --locked -q -p slates-server --test snapshot_landing
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s
+== exit 0
+== cargo test --locked -q -p slates-server --test virtiofs
+test result: ok. 28 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.02s
+== exit 0
