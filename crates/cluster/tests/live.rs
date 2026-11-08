@@ -87,8 +87,15 @@ async fn holder(
   done: Sender<(HostId, Option<slates_db::live::Head>, Vec<u8>)>,
 ) {
   endpoint.establish().await.unwrap();
-  while start.try_recv().is_err() {
-    slates_rt::futures::sleep(SERVE_SLICE_NS).await.unwrap();
+  loop {
+    match start.try_recv() {
+      Ok(()) => break,
+      // Told nothing and let go: a holder its owner can no longer reach ends without serving.
+      Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+      Err(std::sync::mpsc::TryRecvError::Empty) => {
+        slates_rt::futures::sleep(SERVE_SLICE_NS).await.unwrap();
+      }
+    }
   }
   let mut replica = Replica::new(OWNER, OBJECT);
   let mut state: Vec<u8> = Vec::new();
@@ -358,4 +365,74 @@ async fn gather(
     }
     slates_rt::futures::sleep(SERVE_SLICE_NS).await.unwrap();
   }
+}
+
+/// A-200, the live lane's straggler wait (`slates_server::live_ship::finish_stragglers`, `Stragglers::settle`): do, in a
+/// task of its own as a live lane is, ship an entry to both holders with the second silent, take the first answer, settle
+/// the exchange's stragglers and end the task; then wait out the dispatch's deadline and recover anything still owed.
+/// Expect both holders' sessions back. An exchange's requests are children of the task that made it, and a task's end
+/// cancels its children: a request still in flight when the task ended was dropped with its holder's session in it,
+/// never reported, and the session's slot stayed lent for good, so the owner never shipped that holder again (KIND,
+/// both of an owner's sessions `lent=true`, raft-chaos run 42318867890). Red-checked by mutation: without the settle the
+/// silent holder's session never comes back.
+#[test]
+fn a_lane_that_ends_with_a_holder_unanswered_gets_every_session_back() {
+  let (report_tx, report_rx) = channel::<Vec<HostId>>();
+  let _ = run(
+    true,
+    Box::new(move |sessions, commands| {
+      Box::pin(async move {
+        let mut shipper = shipper(2, 2);
+        let entry = shipper.append(b"one".to_vec()).unwrap();
+        let bytes = entry.encode();
+        let (back_tx, back_rx) = channel();
+        let lane = slates_rt::futures::spawn(async move {
+          let exchanged = slates_cluster::live::exchange(
+            (LIVE_ENTRY_STREAM, &bytes),
+            sessions,
+            CommitBudget::hard(DEADLINE_NS, POLL_NS),
+            |_, _| true,
+          )
+          .await;
+          let mut back = exchanged.reusable;
+          let mut stragglers = exchanged.stragglers;
+          // The lane's wait: every request reports before its task ends.
+          let (late, _) = stragglers.settle().await;
+          back.extend(late.into_iter().map(|(host, _, endpoint)| (host, endpoint)));
+          let _ = back_tx.send((back, stragglers));
+        })
+        .unwrap();
+        let _ = slates_rt::futures::join(lane).await;
+        let (mut back, mut stragglers) = back_rx.try_recv().unwrap();
+        // Anything a straggler still owed comes back by the dispatch's deadline; a request cancelled with its task never
+        // does.
+        slates_rt::futures::sleep(DEADLINE_NS).await.unwrap();
+        back.extend(stragglers.recover().0);
+        let mut hosts: Vec<HostId> = back.iter().map(|(host, _)| *host).collect();
+        hosts.sort_by_key(|host| host.0);
+        let _ = report_tx.send(hosts);
+        // The silent holder serves from here if its session came back, and every holder whose session did is told to
+        // stop; one whose session did not is let go unstarted.
+        if back.iter().any(|(host, _)| *host == HOLDERS[1]) {
+          let _ = commands[&HOLDERS[1]].send(());
+        }
+        for (_, mut endpoint) in back {
+          let _ = endpoint
+            .request(
+              STOP_KIND,
+              slates_transport::connection::Priority::Control,
+              &[],
+            )
+            .await;
+        }
+        drop(commands);
+      })
+    }),
+  );
+  let hosts = report_rx.try_recv().unwrap();
+  assert_eq!(
+    hosts,
+    HOLDERS.to_vec(),
+    "every session the lane took came back"
+  );
 }

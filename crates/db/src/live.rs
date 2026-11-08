@@ -687,7 +687,8 @@ impl Replica {
 /// Phase one's choice (A-200, A-240): the holder whose head ranks highest among `reports` (each candidate's head;
 /// `None` for one that holds nothing), and that head, once at least `f + 1` of the reports come from `holders`, the
 /// holder set the shipper being taken over committed before its first entry. A durable entry is held by the owner and
-/// `f` of those `2f` holders, so `f + 1` of them meet every durable entry; a report from any other member (one that
+/// `W` of those `n` holders, and `W + f + 1 > n` ([`Shipper::reached_by`]), so `f + 1` of them meet every durable entry;
+/// a report from any other member (one that
 /// joined after the writes) counts for nothing, since it can stand in for a holder that was never asked. `None` when
 /// fewer than `f + 1` holders reported, or when every report is empty (nothing was ever shipped).
 pub fn adopt(
@@ -733,6 +734,8 @@ pub struct Shipper {
   holders: Vec<HostId>,
   credit: u64,
   retain: usize,
+  /// The payload bytes kept for laggards beyond `retain` entries ([`Shipper::retain_up_to`]); zero keeps `retain` alone.
+  retain_bytes: usize,
   /// The head the owner started from (a takeover's adopted head), which it holds and every holder may report.
   start: Option<Head>,
   /// The owner's head: its last entry, or `start` before its first.
@@ -754,7 +757,8 @@ pub struct Shipper {
 }
 
 impl Shipper {
-  /// The owner's side for `object` under `epoch`, shipping to `holders` (the other `2f` candidates), starting from
+  /// The owner's side for `object` under `epoch`, shipping to `holders` (the candidates other than the owner: `2f` of
+  /// them usually, `2f + 1` when the placement moved off the owner, fewer while a fleet forms), starting from
   /// `start` (`None` for a new volume; a takeover's adopted head otherwise). `credit` bounds the entries appended here
   /// that are not yet durable and `retain` the entries kept for laggards; each is at least one.
   pub fn new(
@@ -776,6 +780,7 @@ impl Shipper {
         .collect(),
       credit: credit.max(1),
       retain: retain.max(1),
+      retain_bytes: 0,
       start,
       head: start,
       retained: VecDeque::new(),
@@ -1084,8 +1089,9 @@ impl Shipper {
     }
   }
 
-  /// Records `head` as the last whole state shipped: the entry at it carries the owner's whole state, which an install
-  /// sends to a holder off the chain or behind the retained tail. Ignored unless it is the owner's head now.
+  /// Records `head` as the last whole state made: the owner's whole state as of the entry at it (that entry itself when
+  /// it is whole, or an image of the state it left, made beside the log), which an install sends to a holder off the
+  /// chain or behind the retained tail. Ignored unless it is the owner's head now.
   pub fn mark_checkpoint(&mut self, head: Head) {
     if Some(head) == self.head {
       self.checkpoint = Some(head);
@@ -1147,14 +1153,29 @@ impl Shipper {
       .map(|holder| self.held.get(&holder).map(|head| head.position))
       .min()
       .flatten();
+    let mut bytes = self
+      .retained
+      .iter()
+      .fold(0usize, |sum, entry| sum.saturating_add(entry.payload.len()));
     while let Some(oldest) = self.retained.front() {
       let held_by_all = everyone.is_some_and(|position| oldest.position <= position);
-      if held_by_all || self.retained.len() > self.retain {
-        self.retained.pop_front();
-      } else {
+      let over = self.retained.len() > self.retain && bytes > self.retain_bytes;
+      if !(held_by_all || over) {
         break;
       }
+      bytes = bytes.saturating_sub(oldest.payload.len());
+      self.retained.pop_front();
     }
+  }
+
+  /// Keeps entries for laggards up to `bytes` of payload as well as the `retain` entries: whichever keeps more.
+  /// Derived (by the caller): `bytes` is the size of the whole state an install would send, the owner's last whole
+  /// record; then a laggard is sent the entries it lacks for as long as they cost no more than an install. Kept to a count alone, an owner writing faster than an install's
+  /// round trip left a holder it had just installed behind the tail again, and installed it again without end
+  /// (2026-11-06, `crates/cli/tests/live_chaos.rs`: 803 installs, 571 MB, in one run).
+  pub fn retain_up_to(&mut self, bytes: usize) {
+    self.retain_bytes = bytes;
+    self.trim();
   }
 
   /// The highest position the owner and enough holders hold, capped at the owner's head: over the holders, every `f +

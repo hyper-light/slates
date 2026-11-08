@@ -296,3 +296,66 @@ fn a_daemon_beside_two_spinners_a_core_keeps_beating() {
   );
   daemon.stop();
 }
+
+/// Format: the environment variable under which [`a_stopping_daemon_role`] runs its role; unset, it returns at once.
+const STOP_ROLE_ENV: &str = "SLATES_LIVENESS_STOP_ROLE";
+/// Format: the tag the role prints once its daemon has stopped, so the parent knows the role ran to its end.
+const STOPPED_TAG: &str = "LIVENESS-ROLE-STOPPED";
+/// Format: what the watchdog says when the control loop ends on its own, after which the anchor restarts the daemon.
+const CONTROL_ENDED: &str = "the control loop ended";
+
+/// A-228, §4.14. Do: in a child process (this binary re-invoked as [`a_stopping_daemon_role`]), start a two-shard
+/// daemon, wait for its beat, put a poll of three beats on its second shard, and stop the daemon while that poll runs,
+/// so the shutdown spans beats after the control loop has ended. Expect: the child prints its stopped tag and its
+/// standard error never says the control loop ended, a line that tells the anchor's reader the daemon is to be
+/// restarted. Before, the watchdog, stopped last, saw the control loop end mid-shutdown and said so: under two
+/// spinners a core, 8 of the 18 daemons one `nfs_hostile` run stopped said it, each just before its test passed (an
+/// 18-core Mac, 2026-11-07).
+#[test]
+fn a_stopped_daemon_does_not_say_its_control_loop_ended() {
+  let output = std::process::Command::new(std::env::current_exe().unwrap())
+    .args([
+      "--ignored",
+      "--exact",
+      "a_stopping_daemon_role",
+      "--nocapture",
+    ])
+    .env(STOP_ROLE_ENV, "1")
+    .output()
+    .unwrap();
+  let said = format!(
+    "{}{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+  assert!(
+    output.status.success() && said.contains(STOPPED_TAG),
+    "the role stopped its daemon: {said}"
+  );
+  assert!(
+    !said.contains(CONTROL_ENDED),
+    "a daemon's own stop said its control loop ended: {said}"
+  );
+}
+
+/// The role [`a_stopped_daemon_does_not_say_its_control_loop_ended`] runs in a child process.
+#[test]
+#[ignore = "a role: run by a_stopped_daemon_does_not_say_its_control_loop_ended in a child process"]
+fn a_stopping_daemon_role() {
+  if std::env::var_os(STOP_ROLE_ENV).is_none() {
+    return;
+  }
+  let (daemon, _control, other) = daemon("stopping");
+  beating(&daemon);
+  let held: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+  let poll = on_shard(&daemon, other, move || {
+    held.store(true, Ordering::Release);
+    wait(BEAT * 3);
+  });
+  while !held.load(Ordering::Acquire) {
+    wait(SAMPLE);
+  }
+  daemon.stop();
+  poll.join().unwrap();
+  eprintln!("{STOPPED_TAG}");
+}

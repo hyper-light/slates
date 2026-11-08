@@ -362,6 +362,12 @@ fn files_to_outlast(
   secret: &[u8; 32],
   span: Duration,
 ) -> Option<usize> {
+  files_lasting(per_file_cost(daemon, client, secret), span)
+}
+
+/// The marginal cost of one file of a granted landing on this machine, from two calibration landings
+/// ([`files_to_outlast`]).
+fn per_file_cost(daemon: &Daemon, client: &mut Client, secret: &[u8; 32]) -> Duration {
   /// Shape: the calibration volumes' names.
   const SMALL: &str = "calibration-landing";
   const LARGE: &str = "calibration-landing-twice";
@@ -372,55 +378,116 @@ fn files_to_outlast(
     Some(marginal) if !marginal.is_zero() => marginal / u32::try_from(CALIBRATION_FILES).unwrap(),
     _ => large / u32::try_from(CALIBRATION_FILES * 2).unwrap(),
   };
+  eprintln!(
+    "calibration: {CALIBRATION_FILES} files in {small:?}, twice that in {large:?} ({per_file:?} per file at the margin)"
+  );
+  per_file
+}
+
+/// How many files at `per_file` last [`OUTLAST_FACTOR`] times `span`; `None` past [`MOST_FILES`].
+fn files_lasting(per_file: Duration, span: Duration) -> Option<usize> {
   let wanted = span * OUTLAST_FACTOR;
   let files = usize::try_from(wanted.as_nanos().div_ceil(per_file.as_nanos().max(1))).unwrap();
-  eprintln!(
-    "calibration: {CALIBRATION_FILES} files in {small:?}, twice that in {large:?} ({per_file:?} per file at the margin); {files} files to last {wanted:?}"
-  );
+  eprintln!("{files} files to last {wanted:?} at {per_file:?} a file");
   (files <= MOST_FILES).then_some(files.max(CALIBRATION_FILES))
 }
 
-/// Shape: the keepalive test's lease term (the daemon's failover bound): a second, which the landing outlasts,
-/// with a half-term renewal margin of 500 ms — past the longest single unit measured here (a 205 ms `fsync`
-/// stall, `docs/wip/BENCHMARKS.md`, 2026-10-01).
+/// Shape: the keepalive test's shortest lease term (the daemon's failover bound): a second, which the landing
+/// outlasts. On a quiet machine its half-term renewal margin, 500 ms, is past the longest gap a landing goes
+/// between two looks at its lease. A busy one goes longer, so the term the test runs is derived from the gap
+/// ([`term_for_gap`]) and this is only its floor.
 const SHORT_TERM_NS: u64 = 1_000_000_000;
+/// Shape: how many times the longest lease gap a landing was measured to go the renewal margin is made, so a
+/// landing that goes a little longer in the run than in its calibration still renews in time.
+const LEASE_GAP_HEADROOM: u64 = 2;
 
-/// AUD-29-25 (the lease keepalive). Do: on a daemon whose landing lease term is one second, land enough files
-/// to last twice the term on this machine (a calibration landing measures the per-file cost) under a grant. Expect: the landing is done with every file written, having renewed
-/// its lease between slices at least once; without the renewal its entries past the term were skipped
-/// (`LeaseEnded`) and it ended partial.
-#[test]
-fn a_landing_longer_than_its_lease_term_renews_it_and_lands_everything() {
+/// Derived: the lease term whose renewal margin (half of it, `RENEW_AT_REMAINING_PERMILLE` in
+/// `crates/server/src/landing.rs`) is [`LEASE_GAP_HEADROOM`] times `gap_ns`, the longest a landing was measured to go
+/// between two looks at its lease, and never shorter than [`SHORT_TERM_NS`]. A fixed second failed under load:
+/// with two spinners a logical CPU on an 18-core Mac, a landing went 1,205 ms between two looks, and its entries
+/// after the lapse were skipped `LeaseEnded` (2026-11-07).
+fn term_for_gap(gap_ns: u64) -> u64 {
+  gap_ns
+    .saturating_mul(LEASE_GAP_HEADROOM)
+    .saturating_mul(2)
+    .max(SHORT_TERM_NS)
+}
+
+/// A daemon whose landing lease term (its failover bound) is `term_ns`, bootstrapped, and a client to it.
+fn daemon_with_term(term_ns: Option<u64>) -> (Daemon, Client) {
   let profile = common::machine_profile();
-  let instance = format!("srv-renewland-{}", std::process::id());
-  let config =
-    DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS)).with_failover_slo(SHORT_TERM_NS);
+  let instance = format!(
+    "srv-renewland-{}-{}",
+    std::process::id(),
+    term_ns.unwrap_or(0)
+  );
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let config = match term_ns {
+    Some(term_ns) => config.with_failover_slo(term_ns),
+    None => config,
+  };
   let daemon = Daemon::start(
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-renewland-{}", std::process::id()),
+      name: format!(
+        "slates-seg-renewland-{}-{}",
+        std::process::id(),
+        term_ns.unwrap_or(0)
+      ),
     },
   )
   .unwrap();
   daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
-  let mut client = connect(&instance);
+  let client = connect(&instance);
+  (daemon, client)
+}
+
+/// Shape: the renewals one landing must count before it is known, on the daemon's clock, to have outlasted the term
+/// it began under. A landing renews once half its lease's term has passed, at a slice boundary
+/// (`RENEW_AT_REMAINING_PERMILLE`), so its first renewal is at least half a term after the lease was taken and its
+/// second at least half the renewed term after that: a whole term past the take.
+const RENEWALS_PAST_THE_TERM: u64 = 2;
+
+/// AUD-29-25 (the lease keepalive). Do: on a daemon with the default term, measure this machine's per-file
+/// landing cost and the longest gap a landing goes between two looks at its lease (two calibration landings);
+/// then, on a daemon whose term is derived from that gap ([`term_for_gap`]), land enough files to last twice the
+/// term under a grant, doubling them until one landing renews its lease [`RENEWALS_PAST_THE_TERM`] times, which
+/// places its leased run past the term it began under on the daemon's clock. Expect: that landing is done with every
+/// file written; without the renewal its entries past the term were skipped (`LeaseEnded`) and it ended partial.
+///
+/// Two judgments come from the daemon, never the client's clock:
+/// - **Whether the landing outlasted its term:** by its renewals (bug-sweep's `b61ca46c`). The client's whole call
+///   also holds the request, the plan, the checks before the lease and the reply. CI run 40095492759 counted 6,833
+///   files in 1.011 s under a 1 s term, 0 renewals, done: a landing that never needed a renewal, counted as one that
+///   failed to make one.
+/// - **Whether its renewals could be made in time:** by the longest gap it went between two looks at its lease. A run
+///   whose gap reached its margin lapsed as a paused holder must; it tested a lapse, not the keepalive, so it is made
+///   again with the term that gap needs.
+///
+/// A landing that ended partial with every look inside its margin is the failure itself and ends the loop.
+#[test]
+fn a_landing_longer_than_its_lease_term_renews_it_and_lands_everything() {
+  let (daemon, mut client) = daemon_with_term(None);
   let secret = daemon.segment().issuer_secret().unwrap();
-  let term = Duration::from_nanos(SHORT_TERM_NS);
-  let Some(estimate) = files_to_outlast(&daemon, &mut client, &secret, term) else {
-    daemon.stop();
-    eprintln!(
-      "SKIP: this disk lands faster than {MOST_FILES} files can outlast a {SHORT_TERM_NS} ns term"
-    );
-    return;
-  };
-  // The estimate is a start: a landing that did not outlast the term proves nothing, so the files are doubled
-  // and the landing made again — the landing's cost grows faster than its file count (measured 2026-10-01), so
-  // no calibration alone sizes it — up to the most files, past which the disk outruns the test.
-  let mut files = estimate;
-  let (outcome, took, renewed) = loop {
+  let per_file = per_file_cost(&daemon, &mut client, &secret);
+  let mut term_ns = term_for_gap(daemon.landing_slices().unwrap().longest_lease_gap_ns);
+  drop(client);
+  daemon.stop();
+  let mut files = 0;
+  let (outcome, renewed, gap_ns) = loop {
+    let term = Duration::from_nanos(term_ns);
+    files = files.max(files_lasting(per_file, term).unwrap_or(usize::MAX));
+    if files > MOST_FILES {
+      eprintln!(
+        "SKIP: no landing of up to {MOST_FILES} files renewed its lease {RENEWALS_PAST_THE_TERM} times within its margin here"
+      );
+      return;
+    }
+    let (daemon, mut client) = daemon_with_term(Some(term_ns));
+    let secret = daemon.segment().issuer_secret().unwrap();
     let name = format!("{VOLUME}-{files}");
     let Some(volume) = create_sized(&mut client, &name, files) else {
       daemon.stop();
@@ -438,31 +505,42 @@ fn a_landing_longer_than_its_lease_term_renews_it_and_lands_everything() {
       .get("landing.lease_renewed")
       .copied()
       .unwrap_or(0);
+    let gap_ns = daemon.landing_slices().unwrap().longest_lease_gap_ns;
+    drop(client);
+    daemon.stop();
     let Ok(Landing::Landed(outcome)) = landed else {
       panic!("the granted landing: {landed:?}");
     };
     eprintln!(
-      "landing of {files} files: {took:?} under a {SHORT_TERM_NS} ns term, {renewed} renewals: {} written, {}",
+      "landing of {files} files: {took:?} on the client's clock under a {term_ns} ns term, {renewed} renewals, \
+       longest lease gap {gap_ns} ns: {} written, {}",
       outcome.written, outcome.state
     );
-    if took > term {
-      break (outcome, took, renewed);
+    if gap_ns.saturating_mul(2) >= term_ns {
+      // The landing went past its renewal margin between two looks: the lease lapsed, as it must for a holder
+      // paused past its term, and the keepalive was not what was measured. Again with the term that gap needs.
+      term_ns = term_for_gap(gap_ns);
+      continue;
     }
-    client.destroy(volume).unwrap();
+    // Every look was inside the margin: a landing that lost entries to its term is the failure itself, whatever its
+    // renewals, and one that renewed past the term is the proof. Either ends the loop.
+    if renewed >= RENEWALS_PAST_THE_TERM || outcome.state != "done" {
+      break (outcome, renewed, gap_ns);
+    }
+    // A landing that did not outlast its term proves nothing: the landing's cost grows faster than its file
+    // count (measured 2026-10-01), so no calibration alone sizes it.
     files = files.saturating_mul(2);
-    if files > MOST_FILES {
-      daemon.stop();
-      eprintln!(
-        "SKIP: no landing of up to {MOST_FILES} files outlasted a {SHORT_TERM_NS} ns term here"
-      );
-      return;
-    }
   };
-  daemon.stop();
-  assert!(took > term, "the landing outlasted its term ({took:?})");
+  assert!(
+    gap_ns.saturating_mul(2) < term_ns,
+    "it looked at its lease within the margin"
+  );
   assert_eq!(outcome.state, "done");
   assert_eq!(outcome.written, u64::try_from(files).unwrap());
-  assert!(renewed >= 1, "the lease was renewed between slices");
+  assert!(
+    renewed >= RENEWALS_PAST_THE_TERM,
+    "the lease was renewed past the term between slices ({renewed})"
+  );
 }
 
 /// Shape: the volume an impatient call lands beside the patient one.

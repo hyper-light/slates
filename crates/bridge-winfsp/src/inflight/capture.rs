@@ -5,10 +5,10 @@
 //! first, so a second crash cannot lose an already-issued open by overwriting its only complete response.
 
 use super::{
-  BATCH_BYTES, RESPONSE_BASE, RESPONSE_MAX, Refusal, Request, put, read_u32, read_u64, requests,
+  BATCH_BYTES, RESPONSE_BASE, RESPONSE_MAX, Refusal, Request, Scratch, index, put, read_u32,
+  read_u64,
 };
 use slates_wire::crc32c::crc32c;
-use std::collections::VecDeque;
 
 /// Format: a phase byte and seven reserved zero bytes keep the direct-output request buffer eight-byte aligned.
 const PHASE_BYTES: usize = size_of::<u64>();
@@ -90,11 +90,11 @@ impl<'a> Capture<'a> {
 
   /// Takes the retained batch before the first new receive. Reset memory is ignored, including a partially cleared
   /// prior buffer whose responses all reached the driver before its owner recorded reset.
-  pub fn resume(self) -> Result<Option<Batch<'a>>, Refusal> {
+  pub fn resume(self, scratch: &'a mut Scratch) -> Result<Option<Batch<'a>>, Refusal> {
     if self.phase.first() == Some(&0) {
       return Ok(None);
     }
-    Batch::checked(self, BATCH_BYTES).map(Some)
+    Batch::checked(self, BATCH_BYTES, scratch).map(Some)
   }
 }
 
@@ -111,8 +111,9 @@ impl<'a> Receiving<'a> {
   /// Validates the bytes after kernel I/O completion, preserving their original order and any complete saved result.
   /// `reported` is the transfer the driver counted. Only those bytes are read: [`Capture::begin`] cleared the rest, and
   /// recovery, which knows no count, still checks the whole buffer (A-212).
-  pub fn received(self, reported: usize) -> Result<Batch<'a>, Refusal> {
-    Batch::checked(self.capture, filled(reported)?)
+  /// `scratch` is the receive owner's index, kept across its batches, so a batch allocates nothing.
+  pub fn received(self, reported: usize, scratch: &'a mut Scratch) -> Result<Batch<'a>, Refusal> {
+    Batch::checked(self.capture, filled(reported)?, scratch)
   }
 }
 
@@ -129,7 +130,9 @@ pub fn filled(reported: usize) -> Result<usize, Refusal> {
 /// Dropping this value preserves its receive state for the successor. Only the last acknowledged response resets it.
 pub struct Batch<'a> {
   phase: &'a mut [u8],
-  pending: VecDeque<Request<'a>>,
+  /// The batch's filled bytes, and its owner's index of the frames not yet taken, in driver order.
+  frames: &'a [u8],
+  pending: &'a mut Scratch,
   saved: &'a mut [u8],
   saved_first: Option<usize>,
   current: Option<u64>,
@@ -144,29 +147,37 @@ impl<'a> Batch<'a> {
       None => Ok(None),
     }
   }
-  fn checked(capture: Capture<'a>, filled: usize) -> Result<Self, Refusal> {
-    let frames: &'a [u8] = capture.request;
-    let pending = requests(frames.get(..filled).ok_or(Refusal::Length)?)?;
+  fn checked(
+    capture: Capture<'a>,
+    filled: usize,
+    pending: &'a mut Scratch,
+  ) -> Result<Self, Refusal> {
+    let whole: &'a [u8] = capture.request;
+    let frames = whole.get(..filled).ok_or(Refusal::Length)?;
+    index(frames, pending)?;
     let saved = saved_response(capture.saved)?;
     let saved_first = match saved {
       Some(saved) => {
         let hint = read_u64(saved, super::HINT_AT)?;
         let kind = read_u32(saved, super::KIND_AT)?;
-        Some(
-          pending
-            .iter()
-            .position(|request| request.hint() == hint && request.kind() == kind)
-            .ok_or(Refusal::Hint)?,
-        )
+        let mut found = None;
+        for (position, frame) in pending.frames.iter().enumerate() {
+          if frame.hint(frames)? == hint && frame.kind(frames)? == kind {
+            found = Some(position);
+            break;
+          }
+        }
+        Some(found.ok_or(Refusal::Hint)?)
       }
       None => None,
     };
-    if pending.is_empty() {
+    if pending.frames.is_empty() {
       *capture.phase.first_mut().ok_or(Refusal::Length)? = 0;
     }
     Ok(Self {
       phase: capture.phase,
-      pending: pending.into(),
+      frames,
+      pending,
       saved: capture.saved,
       saved_first,
       current: None,
@@ -179,10 +190,11 @@ impl<'a> Batch<'a> {
     if self.current.is_some() {
       return Err(Refusal::Unsettled);
     }
-    let request = match self.saved_first.take() {
-      Some(index) => Some(self.pending.remove(index).ok_or(Refusal::Hint)?),
-      None => self.pending.pop_front(),
+    let frame = match self.saved_first.take() {
+      Some(position) => Some(self.pending.frames.remove(position).ok_or(Refusal::Hint)?),
+      None => self.pending.frames.pop_front(),
     };
+    let request = frame.map(|frame| frame.request(self.frames)).transpose()?;
     self.current = request.as_ref().map(Request::hint);
     Ok(request)
   }
@@ -248,7 +260,7 @@ impl<'a> Batch<'a> {
       return Err(Refusal::Hint);
     }
     self.current = None;
-    if self.pending.is_empty() {
+    if self.pending.frames.is_empty() {
       *self.phase.first_mut().ok_or(Refusal::Length)? = 0;
     }
     Ok(())
@@ -346,6 +358,7 @@ mod tests {
   /// fresh receive; the recycled caller is never completed by that replay.
   #[test]
   fn a_response_completed_before_the_crash_is_replayed_before_a_fresh_receive() {
+    let mut scratch = Scratch::new().unwrap();
     let mut memory = vec![0; BYTES];
     let mut kernel = BTreeMap::from([(0x1000, "first"), (0x2000, "second")]);
     {
@@ -353,7 +366,7 @@ mod tests {
       receive
         .buffer_mut()
         .copy_from_slice(&reads(&[0x1000, 0x2000]));
-      let mut batch = receive.received(BATCH_BYTES).unwrap();
+      let mut batch = receive.received(BATCH_BYTES, &mut scratch).unwrap();
       let request = batch.next_request().unwrap().unwrap();
       let response = request.cancelled_response().unwrap();
       batch.record_response(&request, &response).unwrap();
@@ -368,7 +381,7 @@ mod tests {
     {
       let mut batch = Capture::new(&mut memory)
         .unwrap()
-        .resume()
+        .resume(&mut scratch)
         .unwrap()
         .unwrap();
       let request = batch.next_request().unwrap().unwrap();
@@ -391,6 +404,7 @@ mod tests {
   /// it. Expect: neither recovery overwrites that result by first replaying an earlier completed request.
   #[test]
   fn a_saved_result_in_the_middle_of_a_batch_survives_a_second_crash() {
+    let mut scratch = Scratch::new().unwrap();
     let mut memory = vec![0; BYTES];
     let mut kernel = BTreeMap::from([(0x1000, "first"), (0x2000, "second"), (0x3000, "third")]);
     {
@@ -398,7 +412,7 @@ mod tests {
       receive
         .buffer_mut()
         .copy_from_slice(&reads(&[0x1000, 0x2000, 0x3000]));
-      let mut batch = receive.received(BATCH_BYTES).unwrap();
+      let mut batch = receive.received(BATCH_BYTES, &mut scratch).unwrap();
       let first = batch.next_request().unwrap().unwrap();
       let response = first.cancelled_response().unwrap();
       batch.record_response(&first, &response).unwrap();
@@ -412,7 +426,7 @@ mod tests {
     {
       let mut batch = Capture::new(&mut memory)
         .unwrap()
-        .resume()
+        .resume(&mut scratch)
         .unwrap()
         .unwrap();
       let saved_request = batch.next_request().unwrap().unwrap();
@@ -425,7 +439,7 @@ mod tests {
     {
       let mut batch = Capture::new(&mut memory)
         .unwrap()
-        .resume()
+        .resume(&mut scratch)
         .unwrap()
         .unwrap();
       let saved_request = batch.next_request().unwrap().unwrap();
@@ -457,11 +471,12 @@ mod tests {
   /// Expect: refusal at each wrong step, and a fresh receive only after the original response's proper acknowledgement.
   #[test]
   fn an_unpublished_or_foreign_acknowledgement_cannot_admit_a_new_receive() {
+    let mut scratch = Scratch::new().unwrap();
     let mut memory = vec![0; BYTES];
     {
       let mut receive = Capture::new(&mut memory).unwrap().begin(None).unwrap();
       receive.buffer_mut().copy_from_slice(&reads(&[0x1000]));
-      let mut batch = receive.received(BATCH_BYTES).unwrap();
+      let mut batch = receive.received(BATCH_BYTES, &mut scratch).unwrap();
       let request = batch.next_request().unwrap().unwrap();
       assert_eq!(batch.acknowledge(request.hint()), Err(Refusal::Unsettled));
       assert!(matches!(batch.next_request(), Err(Refusal::Unsettled)));
@@ -478,6 +493,7 @@ mod tests {
   /// Expect: no replay, even when that old buffer is torn; the next request can be received without a stale completion.
   #[test]
   fn a_crash_while_clearing_a_settled_buffer_cannot_revive_its_requests() {
+    let mut scratch = Scratch::new().unwrap();
     let mut complete_memory = vec![0; BYTES];
     {
       let mut receive = Capture::new(&mut complete_memory)
@@ -485,7 +501,7 @@ mod tests {
         .begin(None)
         .unwrap();
       receive.buffer_mut().copy_from_slice(&reads(&[0x1000]));
-      let mut batch = receive.received(BATCH_BYTES).unwrap();
+      let mut batch = receive.received(BATCH_BYTES, &mut scratch).unwrap();
       let request = batch.next_request().unwrap().unwrap();
       batch
         .record_response(&request, &request.cancelled_response().unwrap())
@@ -498,7 +514,7 @@ mod tests {
       assert!(
         Capture::new(&mut memory)
           .unwrap()
-          .resume()
+          .resume(&mut scratch)
           .unwrap()
           .is_none()
       );
@@ -511,18 +527,21 @@ mod tests {
   /// Before A-212 every live receive scanned all 64 KiB (26.4 µs at p50 on arm64, run 41977769822).
   #[test]
   fn a_live_receive_reads_only_the_bytes_the_driver_reported() {
+    let mut scratch = Scratch::new().unwrap();
     let mut memory = vec![0; BYTES];
     let mut bytes = reads(&[0x1000]);
     *bytes.last_mut().unwrap() = 1;
     {
       let mut receive = Capture::new(&mut memory).unwrap().begin(None).unwrap();
       receive.buffer_mut().copy_from_slice(&bytes);
-      let mut batch = receive.received(super::super::REQUEST_BASE).unwrap();
+      let mut batch = receive
+        .received(super::super::REQUEST_BASE, &mut scratch)
+        .unwrap();
       assert_eq!(batch.next_request().unwrap().unwrap().hint(), 0x1000);
-      assert!(batch.pending.is_empty());
+      assert!(batch.pending.frames.is_empty());
     }
     assert!(matches!(
-      Capture::new(&mut memory).unwrap().resume(),
+      Capture::new(&mut memory).unwrap().resume(&mut scratch),
       Err(Refusal::Tail)
     ));
   }
@@ -532,6 +551,7 @@ mod tests {
   /// of the longer batch for a whole-buffer scan to refuse or replay.
   #[test]
   fn a_shorter_batch_after_a_longer_one_recovers_alone() {
+    let mut scratch = Scratch::new().unwrap();
     let mut memory = vec![0; BYTES];
     let used = 3 * super::super::REQUEST_BASE;
     {
@@ -539,7 +559,7 @@ mod tests {
       receive
         .buffer_mut()
         .copy_from_slice(&reads(&[0x1000, 0x2000, 0x3000]));
-      let mut batch = receive.received(used).unwrap();
+      let mut batch = receive.received(used, &mut scratch).unwrap();
       while let Some(request) = batch.next_request().unwrap() {
         batch
           .record_response(&request, &request.cancelled_response().unwrap())
@@ -558,22 +578,23 @@ mod tests {
     }
     let mut batch = Capture::new(&mut memory)
       .unwrap()
-      .resume()
+      .resume(&mut scratch)
       .unwrap()
       .unwrap();
     let request = batch.next_request().unwrap().unwrap();
     assert_eq!(request.hint(), 0x4000);
     assert!(batch.response_for(&request).unwrap().is_none());
-    assert!(batch.pending.is_empty());
+    assert!(batch.pending.frames.is_empty());
   }
 
   /// A-212. Do: report more than the buffer holds. Expect: a typed refusal, before any byte is read.
   #[test]
   fn a_reported_length_past_the_buffer_is_refused() {
+    let mut scratch = Scratch::new().unwrap();
     let mut memory = vec![0; BYTES];
     let receive = Capture::new(&mut memory).unwrap().begin(None).unwrap();
     assert!(matches!(
-      receive.received(BATCH_BYTES + 1),
+      receive.received(BATCH_BYTES + 1, &mut scratch),
       Err(Refusal::Length)
     ));
   }

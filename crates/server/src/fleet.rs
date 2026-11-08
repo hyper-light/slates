@@ -3713,6 +3713,9 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
     None
   };
   let region = head.content_holders.clone();
+  // The head the live log was adopted at, kept apart from the log (moved to the owner shard), so a refused rebuild is
+  // remembered at it (`live_ship::note_rebuild`).
+  let adopted_head = live.as_ref().map(|fetched| fetched.head);
   // The successor's own copy of the volume's lineage key (A-92 piece 4c), unwrapped here on the control shard, which
   // holds the pair keys, and handed to the owner shard wrapped under this node's root.
   let successor_lineage = head.sealing.as_ref().and_then(|sealing| {
@@ -3779,6 +3782,13 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
     HEARTBEAT_NS,
   )
   .await;
+  if let Some(adopted) = adopted_head {
+    match &served {
+      Some(Ok(())) => crate::live_ship::note_rebuild(object, adopted, None),
+      Some(Err(refusal)) => crate::live_ship::note_rebuild(object, adopted, Some(refusal)),
+      None => {}
+    }
+  }
   state::with_state(|s| match served {
     Some(Ok(())) => {
       s.pending_materializations.remove(&object);
@@ -6379,8 +6389,6 @@ fn sync_config_from_council(local: HostId) {
     // module).
     crate::takeover::resolve_held_objects(s, local);
     reconcile_held_authority(s);
-    // A retired host's clients' attachments end here: no reap of theirs will come (A-222).
-    crate::remote_attach::end_departed(s, &members);
   });
 }
 
@@ -6550,8 +6558,6 @@ impl Fan {
         .and_then(|membership| membership.durability)
         .and_then(|bound| bound.shortfall(&placement));
       s.fleet.install_configuration(placement, &members);
-      // A retired host's clients' attachments on this shard end with its departure (A-222).
-      crate::remote_attach::end_departed(s, &members);
     }
     if let Some(root) = self.root {
       s.root.adopt(root);

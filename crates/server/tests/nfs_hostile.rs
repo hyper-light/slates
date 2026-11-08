@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use slates_ipc::protocol::{NamePolicy, SizeClass};
+use slates_server::daemon::{LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS};
+use slates_server::state::ShardState;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
@@ -98,6 +100,62 @@ fn two_shard_daemon_with(name: &str, adjust: impl FnOnce(&mut DaemonConfig)) -> 
   (daemon, instance)
 }
 
+/// Shape: the liveness window by which the daemon judges a shard (its anchor's budget).
+const WINDOW: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);
+/// Shape: a starved poll's CPU burst and its time off the CPU, a fifth of the time on it, as a thread kept off its core
+/// by spinners runs a little at a time (as `tests/liveness.rs`).
+const STARVED_BURST: Duration = Duration::from_millis(10);
+const STARVED_OFF: Duration = Duration::from_millis(40);
+
+/// Holds `daemon`'s shard at `partition` in one poll for `span`, on the CPU in bursts when `starved` (a fifth of the
+/// time, as a starved thread runs) and asleep throughout when not (as a wedged one is). Returns once the poll has
+/// begun, with the thread that waits for it to end.
+fn hold_shard(
+  daemon: &Daemon,
+  partition: usize,
+  span: Duration,
+  starved: bool,
+) -> std::thread::JoinHandle<()> {
+  let began: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+  let observation = daemon
+    .observation(
+      Some(*daemon.shards().get(partition).unwrap()),
+      OBSERVE_BUDGET_NS,
+      move |_: &mut ShardState| {
+        began.store(true, Ordering::Release);
+        let started = Instant::now();
+        while started.elapsed() < span {
+          let burst = Instant::now();
+          while starved && burst.elapsed() < STARVED_BURST {
+            std::hint::spin_loop();
+          }
+          let (_hold, rx) = std::sync::mpsc::channel::<()>();
+          let _ = rx.recv_timeout(if starved { STARVED_OFF } else { span });
+        }
+      },
+    )
+    .unwrap();
+  let waiter = std::thread::spawn(move || {
+    let _ = observation.wait();
+  });
+  let started = Instant::now();
+  while !began.load(Ordering::Acquire) {
+    assert!(started.elapsed() < SETTLE, "the hold began");
+    std::thread::yield_now();
+  }
+  waiter
+}
+
+/// MOUNT MNT `export` over a fresh connection: the RPC accept status and how long the answer took.
+fn timed_mount(port: u16, export: &str) -> (u32, Duration) {
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let mut args = Vec::new();
+  opaque(export.as_bytes(), &mut args);
+  let started = Instant::now();
+  let accepted = call_accept_status(&mut stream, MOUNT_PROGRAM, 1, &args, 1);
+  (accepted, started.elapsed())
+}
+
 /// A record-marked NFSv3 call with no credential, as the test helpers build it.
 fn record(procedure: u32, args: &[u8], xid: u32) -> Vec<u8> {
   let mut body = Vec::new();
@@ -159,6 +217,22 @@ fn read_reply(stream: &mut TcpStream) -> Option<(u32, Vec<u8>)> {
       .get(data_at + 4..data_at + 4 + data_length)?
       .to_vec(),
   ))
+}
+
+/// Lowers its flags when dropped. Set at the top of a scope whose threads loop until a flag is lowered (the spinners,
+/// breakers and attackers), it tells them to stop however the scope's body ends, a failed expectation or a panicking
+/// join included, so the scope ends with the failure instead of waiting on them for good. Before, the body lowered the
+/// flags only on its last line: an honest client's thread that panicked under load (an RPC answered `SYSTEM_ERR`) left
+/// `a_mount_survives_connections_broken_and_tampered_mid_call_under_load` spinning a core per spinner for 36 minutes
+/// at load about 100 until it was killed (an 18-core Mac, 2026-11-07).
+struct LowerOnDrop<'a>(&'a [&'a AtomicBool]);
+
+impl Drop for LowerOnDrop<'_> {
+  fn drop(&mut self) {
+    for flag in self.0 {
+      flag.store(true, Ordering::Relaxed);
+    }
+  }
 }
 
 fn spin(stop: &AtomicBool) {
@@ -454,6 +528,10 @@ fn a_mount_survives_connections_broken_and_tampered_mid_call_under_load() {
   let mismatches = AtomicU64::new(0);
   let answered_bits: Vec<AtomicU64> = (0..victim.len() * 8).map(|_| AtomicU64::new(0)).collect();
   std::thread::scope(|scope| {
+    // However this body ends, a panicking honest thread's join included, the breakers and spinners are told to stop
+    // as it returns, so the scope ends and the test fails at once.
+    let flags = [&stop_breakers, &stop_spinners];
+    let _lower = LowerOnDrop(&flags);
     for _ in 0..cores {
       scope.spawn(|| spin(&stop_spinners));
     }
@@ -494,8 +572,6 @@ fn a_mount_survives_connections_broken_and_tampered_mid_call_under_load() {
     for handle in honest {
       handle.join().unwrap();
     }
-    stop_breakers.store(true, Ordering::Relaxed);
-    stop_spinners.store(true, Ordering::Relaxed);
   });
   let settled_at = Instant::now();
   while live_tasks(&daemon) > baseline && settled_at.elapsed() < SETTLE {
@@ -578,6 +654,8 @@ fn every_single_bit_flip_of_a_handle_outside_its_counter_is_refused() {
   let mut answered = Vec::new();
   let mut refused = 0usize;
   std::thread::scope(|scope| {
+    let flags = [&stop];
+    let _lower = LowerOnDrop(&flags);
     for _ in 0..cores {
       scope.spawn(|| spin(&stop));
     }
@@ -595,7 +673,6 @@ fn every_single_bit_flip_of_a_handle_outside_its_counter_is_refused() {
         _ => refused += 1,
       }
     }
-    stop.store(true, Ordering::Relaxed);
   });
   drop(stream);
   drop(daemon);
@@ -654,6 +731,8 @@ fn pipelined_calls_are_answered_in_order_and_their_replies_share_writes() {
   let stop = AtomicBool::new(false);
   let mut replies = Vec::new();
   std::thread::scope(|scope| {
+    let flags = [&stop];
+    let _lower = LowerOnDrop(&flags);
     for _ in 0..cores {
       scope.spawn(|| spin(&stop));
     }
@@ -666,7 +745,6 @@ fn pipelined_calls_are_answered_in_order_and_their_replies_share_writes() {
       let reply = reply_record(&mut stream).expect("the daemon answers every pipelined call");
       replies.push(reply);
     }
-    stop.store(true, Ordering::Relaxed);
   });
   for (at, reply) in replies.iter().enumerate() {
     assert_eq!(
@@ -1332,6 +1410,8 @@ fn a_cross_tenant_craft_never_reads_through_under_contention_and_churn() {
   let unanswered = AtomicU64::new(0);
   let leaks = AtomicU64::new(0);
   let progressed = std::thread::scope(|scope| {
+    let flags = [&stop];
+    let _lower = LowerOnDrop(&flags);
     for _ in 0..cores {
       scope.spawn(|| spin(&stop));
     }
@@ -1474,6 +1554,8 @@ fn a_stale_handle_never_reads_a_reused_inode_under_churn() {
   let resolved = AtomicU64::new(0); // the stale handle returned status-0 (resolved to a reused inode) — a bug
   let secret_leaks = AtomicU64::new(0); // ... and the bytes were the victim's secret
   let progressed = std::thread::scope(|scope| {
+    let flags = [&stop];
+    let _lower = LowerOnDrop(&flags);
     for _ in 0..cores {
       scope.spawn(|| spin(&stop));
     }
@@ -1682,4 +1764,62 @@ fn a_write_at_a_colossal_offset_is_refused_and_the_daemon_survives() {
 
   drop(s);
   drop(daemon);
+}
+
+/// §4.3, §4.14 (A-65, A-228). Do: on a two-shard daemon with a volume the second shard owns, hold that shard in one
+/// poll for two liveness windows, on the CPU a fifth of the time as a starved shard runs, and meanwhile MOUNT the volume
+/// over a connection the control shard serves, which routes the MNT to the owner; then hold it in a poll that sleeps two
+/// windows, as a wedged shard does, and MOUNT again. Expect: the first MOUNT accepted once the starved owner serves it,
+/// and the second answered `SYSTEM_ERR` before the wedged hold ends. A starved owner is alive by the rule the watchdog
+/// and observations judge a shard by, its own CPU time, and is waited for; a wedged one is not. Before `6b9de4a1` the
+/// control shard gave the owner one second of wall time, so a starved owner's MOUNT was answered `SYSTEM_ERR` (accept
+/// status 5): 8 honest MOUNTs in 2 of 4 runs of this binary under two spinners a core (an 18-core Mac, 2026-11-07), and
+/// this test's first MOUNT 3 of 3 times on `d61c3be2`, after 1.00 s (adacachy).
+#[test]
+fn a_mount_routed_to_a_starved_owner_is_answered_and_to_a_wedged_one_refused() {
+  let (daemon, instance) = two_shard_daemon("starved-owner");
+  let name = provision_remote_volume(&instance);
+  let export = daemon.mount_capability(&name).unwrap().unwrap();
+  let port = daemon.nfs_port().unwrap();
+  let starved = hold_shard(&daemon, 1, WINDOW * 2, true);
+  let (accepted, took) = timed_mount(port, &export);
+  starved.join().unwrap();
+  assert_eq!(
+    accepted, 0,
+    "a MOUNT routed to a starved owner was accepted (status {accepted} after {took:?}, against a {WINDOW:?} window)"
+  );
+  let wedged = hold_shard(&daemon, 1, WINDOW * 3, false);
+  let (accepted, took) = timed_mount(port, &export);
+  assert!(
+    accepted == 5 && took < WINDOW * 3,
+    "a MOUNT routed to a wedged owner was refused SYSTEM_ERR before the hold ended (status {accepted} after {took:?})"
+  );
+  wedged.join().unwrap();
+  drop(daemon);
+}
+
+/// The pressure tests' scopes end on a failure (2026-11-07). Do: in a scope, start a thread that spins until a flag is
+/// lowered, guard the flag with [`LowerOnDrop`], and panic in the scope's body, as a failed honest client's join does.
+/// Expect the scope to end and its panic to reach the caller within [`SETTLE`]. Without the guard the scope waited on
+/// its spinner for good.
+#[test]
+fn a_scope_whose_body_panics_still_stops_its_spinners() {
+  let (ended, outcome) = std::sync::mpsc::channel();
+  std::thread::spawn(move || {
+    let stop = AtomicBool::new(false);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      std::thread::scope(|scope| {
+        let flags = [&stop];
+        let _lower = LowerOnDrop(&flags);
+        scope.spawn(|| spin(&stop));
+        panic!("a deliberate failure in the scope's body, as a failed honest client's join is");
+      });
+    }));
+    let _ = ended.send(result.is_err());
+  });
+  assert_eq!(
+    outcome.recv_timeout(SETTLE),
+    Ok(true),
+    "the scope ended with its body's panic instead of waiting on its spinner"
+  );
 }

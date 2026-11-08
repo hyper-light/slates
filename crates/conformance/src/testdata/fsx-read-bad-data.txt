@@ -1,0 +1,103 @@
+Seed set to 1
+READ BAD DATA: offset = 0x4d, size = 0x233e
+OFFSET	GOOD	BAD	RANGE
+0x   4d	0x0000	0xffff	0x   73
+operation# (mod 256) for the bad data may be 255
+LOG DUMP (95 total operations):
+1(1 mod 256): TRUNCATE UP	from 0x0 to 0x13e76	******WWWW
+2(2 mod 256): WRITE	0x17098 thru 0x26857	(0xf7c0 bytes) HOLE
+3(3 mod 256): READ	0xc73e thru 0x1b801	(0xf0c4 bytes)
+4(4 mod 256): MAPWRITE 0x32e00 thru 0x331fc	(0x3fd bytes)
+5(5 mod 256): MAPWRITE 0x7ac1 thru 0x11029	(0x9569 bytes)
+6(6 mod 256): READ	0x1f62e thru 0x2177f	(0x2152 bytes)
+7(7 mod 256): WRITE	0x756 thru 0xede	(0x789 bytes)
+8(8 mod 256): READ	0x18f13 thru 0x27d18	(0xee06 bytes)
+9(9 mod 256): READ	0xf369 thru 0x1b0af	(0xbd47 bytes)
+10(10 mod 256): MAPWRITE 0x17461 thru 0x19892	(0x2432 bytes)
+11(11 mod 256): TRUNCATE DOWN	from 0x331fd to 0x2e52c
+12(12 mod 256): READ	0x23922 thru 0x2e52b	(0xac0a bytes)
+13(13 mod 256): MAPREAD	0x1fddb thru 0x283d7	(0x85fd bytes)
+14(14 mod 256): MAPREAD	0x6741 thru 0xf6cb	(0x8f8b bytes)
+15(15 mod 256): TRUNCATE DOWN	from 0x2e52c to 0x2858c
+16(16 mod 256): WRITE	0x2e42f thru 0x3bdce	(0xd9a0 bytes) HOLE
+17(17 mod 256): READ	0x2335c thru 0x2e8a9	(0xb54e bytes)
+18(18 mod 256): MAPREAD	0x224e2 thru 0x25c38	(0x3757 bytes)
+19(19 mod 256): TRUNCATE DOWN	from 0x3bdcf to 0x1535b
+20(20 mod 256): TRUNCATE UP	from 0x1535b to 0x2d2ba
+21(21 mod 256): TRUNCATE DOWN	from 0x2d2ba to 0x2bdeb
+22(22 mod 256): MAPWRITE 0x20108 thru 0x27432	(0x732b bytes)
+23(23 mod 256): MAPREAD	0x236e3 thru 0x266da	(0x2ff8 bytes)
+24(24 mod 256): READ	0x4a51 thru 0x52cc	(0x87c bytes)
+25(25 mod 256): MAPWRITE 0x94fa thru 0xeb0c	(0x5613 bytes)
+26(26 mod 256): TRUNCATE DOWN	from 0x2bdeb to 0x1d6f6
+27(27 mod 256): READ	0xae2f thru 0xce13	(0x1fe5 bytes)
+28(28 mod 256): MAPWRITE 0x18aaa thru 0x272a2	(0xe7f9 bytes)
+29(29 mod 256): MAPREAD	0x15816 thru 0x19f7a	(0x4765 bytes)
+30(30 mod 256): WRITE	0x26bdf thru 0x27595	(0x9b7 bytes) EXTEND
+31(31 mod 256): MAPWRITE 0x2fae1 thru 0x2ff67	(0x487 bytes)
+32(32 mod 256): READ	0x146c5 thru 0x1fc9d	(0xb5d9 bytes)
+33(33 mod 256): MAPWRITE 0x3ec56 thru 0x3f698	(0xa43 bytes)
+34(34 mod 256): MAPREAD	0x33128 thru 0x385b9	(0x5492 bytes)
+35(35 mod 256): MAPWRITE 0x30dd2 thru 0x36ee0	(0x610f bytes)
+36(36 mod 256): TRUNCATE DOWN	from 0x3f699 to 0x1e1cc
+37(37 mod 256): MAPREAD	0x12a3b thru 0x144fe	(0x1ac4 bytes)
+38(38 mod 256): READ	0x16f0e thru 0x1d9f1	(0x6ae4 bytes)
+39(39 mod 256): TRUNCATE UP	from 0x1e1cc to 0x26f79
+40(40 mod 256): WRITE	0x2dfe0 thru 0x36e81	(0x8ea2 bytes) HOLE
+41(41 mod 256): TRUNCATE DOWN	from 0x36e82 to 0x2ccf1
+42(42 mod 256): WRITE	0x2b16b thru 0x2f27d	(0x4113 bytes) EXTEND
+43(43 mod 256): MAPREAD	0x5503 thru 0x7faf	(0x2aad bytes)
+44(44 mod 256): MAPWRITE 0x335bd thru 0x33c84	(0x6c8 bytes)
+45(45 mod 256): MAPREAD	0x253ef thru 0x26faf	(0x1bc1 bytes)
+46(46 mod 256): MAPWRITE 0x324d6 thru 0x3b2d4	(0x8dff bytes)
+47(47 mod 256): READ	0x27b61 thru 0x28e44	(0x12e4 bytes)
+48(48 mod 256): READ	0x1f3e6 thru 0x23aca	(0x46e5 bytes)
+49(49 mod 256): TRUNCATE DOWN	from 0x3b2d5 to 0x7686
+50(50 mod 256): MAPWRITE 0x24d3d thru 0x31e64	(0xd128 bytes)
+51(51 mod 256): TRUNCATE DOWN	from 0x31e65 to 0x20f5d
+52(52 mod 256): READ	0x10357 thru 0x1485f	(0x4509 bytes)
+53(53 mod 256): TRUNCATE DOWN	from 0x20f5d to 0xaf56
+54(54 mod 256): READ	0x2b3e thru 0xaf55	(0x8418 bytes)
+55(55 mod 256): TRUNCATE UP	from 0xaf56 to 0x1ba8d
+56(56 mod 256): WRITE	0x12e0d thru 0x16dbe	(0x3fb2 bytes)
+57(57 mod 256): TRUNCATE UP	from 0x1ba8d to 0x3c2c2
+58(58 mod 256): WRITE	0x59e0 thru 0x8395	(0x29b6 bytes)
+59(59 mod 256): MAPWRITE 0x1e017 thru 0x25449	(0x7433 bytes)
+60(60 mod 256): TRUNCATE DOWN	from 0x3c2c2 to 0x150e3
+61(61 mod 256): MAPWRITE 0x255d4 thru 0x26b73	(0x15a0 bytes)
+62(62 mod 256): TRUNCATE DOWN	from 0x26b74 to 0x200e0
+63(63 mod 256): MAPWRITE 0x1d581 thru 0x25448	(0x7ec8 bytes)
+64(64 mod 256): MAPWRITE 0x3a556 thru 0x3ffff	(0x5aaa bytes)
+65(65 mod 256): TRUNCATE DOWN	from 0x40000 to 0x3a546
+66(66 mod 256): TRUNCATE UP	from 0x3a546 to 0x3b4c2
+67(67 mod 256): READ	0x2a625 thru 0x37882	(0xd25e bytes)
+68(68 mod 256): TRUNCATE DOWN	from 0x3b4c2 to 0x2a198
+69(69 mod 256): MAPWRITE 0x18df1 thru 0x19b53	(0xd63 bytes)
+70(70 mod 256): MAPREAD	0x21199 thru 0x2391f	(0x2787 bytes)
+71(71 mod 256): MAPREAD	0x20353 thru 0x26823	(0x64d1 bytes)
+72(72 mod 256): WRITE	0x2b787 thru 0x2b7be	(0x38 bytes) HOLE
+73(73 mod 256): MAPWRITE 0x299f6 thru 0x2ae13	(0x141e bytes)
+74(74 mod 256): MAPWRITE 0x20a1a thru 0x2824f	(0x7836 bytes)
+75(75 mod 256): TRUNCATE UP	from 0x2b7bf to 0x3f15f
+76(76 mod 256): MAPWRITE 0x344e4 thru 0x35f96	(0x1ab3 bytes)
+77(77 mod 256): READ	0x2cde0 thru 0x2e34a	(0x156b bytes)
+78(78 mod 256): TRUNCATE DOWN	from 0x3f15f to 0x311dd
+79(79 mod 256): MAPWRITE 0x368c4 thru 0x3f364	(0x8aa1 bytes)
+80(80 mod 256): WRITE	0x674c thru 0x15532	(0xede7 bytes)
+81(81 mod 256): TRUNCATE DOWN	from 0x3f365 to 0x17a5d
+82(82 mod 256): MAPWRITE 0x1f79 thru 0x56f6	(0x377e bytes)
+83(83 mod 256): READ	0x3bb0 thru 0xd5c0	(0x9a11 bytes)
+84(84 mod 256): WRITE	0xd860 thru 0x1ccf4	(0xf495 bytes) EXTEND
+85(85 mod 256): TRUNCATE UP	from 0x1ccf5 to 0x2f2c7
+86(86 mod 256): MAPREAD	0x1a514 thru 0x1df0a	(0x39f7 bytes)
+87(87 mod 256): TRUNCATE DOWN	from 0x2f2c7 to 0xec30
+88(88 mod 256): WRITE	0x27ee7 thru 0x2818e	(0x2a8 bytes) HOLE
+89(89 mod 256): WRITE	0x2dc47 thru 0x3a5a1	(0xc95b bytes) HOLE
+90(90 mod 256): TRUNCATE DOWN	from 0x3a5a2 to 0x4943
+91(91 mod 256): READ	0x3e30 thru 0x4942	(0xb13 bytes)
+92(92 mod 256): WRITE	0x334b0 thru 0x3d379	(0x9eca bytes) HOLE
+93(93 mod 256): READ	0x1d3a4 thru 0x237f3	(0x6450 bytes)
+94(94 mod 256): WRITE	0x2f291 thru 0x3bd36	(0xcaa6 bytes)
+95(95 mod 256): READ	0x4d thru 0x238a	(0x233e bytes)	***RRRR***
+Correct content saved for comparison
+(maybe hexdump "fsx.bin" vs "fsx.bin.fsxgood")

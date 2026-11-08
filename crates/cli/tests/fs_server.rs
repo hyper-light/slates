@@ -595,10 +595,27 @@ fn until(
     }
     assert!(
       started.elapsed() < bound,
-      "still {attachments} attachments, lease {lease:?}, after {bound:?}"
+      "still {attachments} attachments, lease {lease:?}, after {bound:?}; the owner's fleet: {}",
+      fleet_lines(server)
     );
     pause();
   }
+}
+
+/// The `fleet_` and remote-attachment lines of `instance`'s `status`, for a failure to show where membership stood.
+fn fleet_lines(instance: &str) -> String {
+  let (_, out, err) = run(instance, &["status"]);
+  out
+    .lines()
+    .filter(|line| {
+      line.starts_with("fleet_")
+        || line.contains("remote_attach")
+        || line.contains("fleet.fan")
+        || line.contains("takeover")
+    })
+    .collect::<Vec<_>>()
+    .join(" | ")
+    + &err
 }
 
 /// Derived: the bound on a silent remote holder (A-222): its node's reap within two liveness budgets (1 s each,
@@ -795,9 +812,30 @@ fn a_retired_hosts_attachments_end_at_the_owner() {
     1,
     "the owner records the remote attachment"
   );
+  // Non-vacuity: a live host's attachment stands across the owner's departure looks (one a liveness budget), so the
+  // end below is the retirement's, not a sweep that ends every remote attachment (one such ended them all in 1 s).
+  let held_since = Instant::now();
+  while held_since.elapsed() < LIVE_HOLD {
+    pause();
+  }
+  assert_eq!(
+    holders(&server, &volume).0,
+    1,
+    "a live host's remote attachment stands for {LIVE_HOLD:?}"
+  );
+  eprintln!("DIAG at the kill, the owner: {}", detector_lines(&server));
   let killed = Instant::now();
   drop(daemons.remove(1));
+  let printed = std::cell::Cell::new(Instant::now());
   let ended = until(&server, &volume, RETIREMENT_WAIT, |attachments, _| {
+    if attachments != 0 && printed.get().elapsed() >= Duration::from_secs(5) {
+      printed.set(Instant::now());
+      eprintln!(
+        "DIAG {:?} after the kill, the owner: {}",
+        killed.elapsed(),
+        detector_lines(&server)
+      );
+    }
     attachments == 0
   });
   eprintln!(
@@ -851,3 +889,24 @@ fn sdk(instance: &str) -> slates_client::Client {
   .get();
   slates_client::Client::connect(instance, deadlines).unwrap()
 }
+
+/// The owner's membership and detector lines, for the retired test's diagnosis.
+fn detector_lines(instance: &str) -> String {
+  let (_, out, _) = run(instance, &["status"]);
+  out
+    .lines()
+    .filter(|line| {
+      line.starts_with("fleet_members")
+        || line.starts_with("fleet_peers_probed")
+        || line.starts_with("fleet_configuration_version")
+        || line.starts_with("fleet_detector ")
+        || line.starts_with("fleet_council_leads")
+    })
+    .map(|line| line.chars().take(230).collect::<String>())
+    .collect::<Vec<_>>()
+    .join(" | ")
+}
+
+/// Derived: how long the retired test holds a live host's attachment before the kill: two and a half liveness budgets
+/// (1 s each, `LIVENESS_BUDGET_NS`), so the owner's departure look (one a budget) runs at least twice meanwhile.
+const LIVE_HOLD: Duration = Duration::from_millis(2_500);

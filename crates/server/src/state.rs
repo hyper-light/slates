@@ -37,6 +37,10 @@ pub struct ClientSlot {
   pub last_seen_ns: u64,
   /// Dead ring admission is closed while its attachments are retired on all owner shards (§4.7).
   pub(crate) retiring: bool,
+  /// Set once the client has proven its id with its session key (`crate::session_key`), checked before its first
+  /// request is served. A slot never proven is ended without retiring its id's attachments (`reap::end_unproven`):
+  /// they belong to the id's owner, whom a stranger naming the id is not.
+  pub(crate) proven: bool,
   /// The control channel, where the platform has one (Linux: the socket whose close is how
   /// the daemon learns of a dead client, and whose peer end closing tells the client the
   /// daemon died; held for the client's life).
@@ -380,6 +384,12 @@ pub struct ShardState {
   pub landing: crate::landing::LandingState,
   /// The image builds and merges running on this shard (§4.6, A-160).
   pub(crate) image: crate::image::ImageState,
+  /// The anchors of the fleet's members as the control shard last looked (A-222): a host that leaves them has its
+  /// clients' attachments ended on every shard (`crate::remote_attach::sweep_departed`). Bounded by the fleet's members.
+  pub(crate) configured_members: Vec<u64>,
+  /// Anchors that departed and whose attachments some shard has not yet ended, owed to the next look (A-222). Bounded
+  /// by the fleet's members.
+  pub(crate) departed_owed: Vec<u64>,
   /// The same-kernel direct maps being filled on this shard (§4.6, A-171).
   pub(crate) direct_map: crate::direct_map::DirectMapState,
   /// The store.
@@ -495,6 +505,9 @@ pub struct ShardState {
   /// (`landing::grant_proof`). Every shard reads the same secret, so a grant verifies on whichever shard
   /// serves the client; it is never sent on any channel.
   pub issuer_secret: [u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  /// The node's client session secret (`crate::session_key`), read from the anchor's supervision block at shard init:
+  /// what a client's session key is derived from and checked against on the shard that serves it. Never sent.
+  pub session_secret: [u8; slates_anchor::layout::SESSION_SECRET_BYTES],
   /// This shard's copy of the node's sealing root (A-92), in hyper-seal's locked region; `None` while sealing is
   /// unavailable. Tenant keys on this partition are wrapped under it.
   pub seal_root: Option<hyper_seal::keys::WrappingKey>,

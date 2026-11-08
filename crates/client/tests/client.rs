@@ -2420,6 +2420,181 @@ fn a_session_outlives_a_daemon_restart_and_its_retry_meets_the_completion_record
   drop(segment);
 }
 
+/// The body of the victim's create in [`a_stranger_with_a_dead_clients_id_gets_neither_its_seat_nor_its_records`].
+fn victims_create() -> RequestBody {
+  RequestBody::Create {
+    name: "victims".to_owned(),
+    size: SizeClass::Bounded { limit: 1 << 20 },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }
+}
+
+/// GAP-A9-9's threat model (§4.9, the seat a session resumes): do: a victim client sends a create and has not seen its
+/// reply when its daemon restarts (the test plays the anchor); before the victim comes back, a stranger of the same uid
+/// resumes a session under the victim's client id and the victim's next sequence (both small integers anyone can try),
+/// then retries the victim's request. Expect: the stranger gets neither the seat (its resume is refused) nor the
+/// victim's completion record; the victim then resumes its own session and its retry meets its record.
+#[test]
+fn a_stranger_with_a_dead_clients_id_gets_neither_its_seat_nor_its_records() {
+  let profile = profile();
+  let instance = format!("cl-seat-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let content_bytes = config.content_bytes();
+  let segment = AnchorSegment::create(
+    &format!("slates-seg-cl-seat-{}", std::process::id()),
+    &profile.facts.identity,
+    config.geometry,
+  )
+  .unwrap()
+  .with_content(
+    &format!("slates-con-cl-seat-{}", std::process::id()),
+    content_bytes,
+  )
+  .unwrap();
+  let rendezvous = HeldRendezvous::hold(&instance).unwrap();
+  let source = || {
+    let (handoff, len) = segment.handoff().unwrap();
+    let content = segment.content_handoff().unwrap();
+    SegmentSource::Handoff {
+      handoff,
+      len,
+      content,
+      rendezvous: rendezvous.adoption(),
+    }
+  };
+  let first = Daemon::start(&profile, config.clone(), source()).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut victim = connect(&instance);
+  let request = victim.begin(&victims_create()).unwrap();
+  let mut observer = connect(&instance);
+  wait_until_listed(&mut observer, &["victims"]);
+  let created = observer
+    .list()
+    .unwrap()
+    .into_iter()
+    .find(|volume| volume.name == "victims")
+    .unwrap()
+    .id;
+  discard_reply(&mut victim, request);
+  let session = victim.session();
+  drop(observer);
+  first.stop();
+  let second = Daemon::start(&profile, config, source()).unwrap();
+  second
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+
+  // The stranger knows the id and the sequence, not the key: it guesses one.
+  let guessed = slates_client::Session {
+    client_id: session.client_id,
+    next_sequence: session.next_sequence,
+    key: [0u8; slates_client::SESSION_KEY_BYTES],
+  };
+  match Client::resume(&instance, guessed, deadlines()) {
+    Err(refused) => eprintln!("the stranger's resume was refused: {refused}"),
+    Ok(mut stranger) => {
+      let answer = stranger.retry(request, &victims_create());
+      assert!(
+        matches!(answer, Err(ClientError::Refused(Refusal::SessionUnproven))),
+        "the stranger took client {}'s seat; its retry of the victim's create answered {answer:?}",
+        session.client_id
+      );
+    }
+  }
+  // The stranger's slot is ended and the id given back to the control shard by a message; the victim's reconnect may
+  // meet the id still held until it lands.
+  let started = Instant::now();
+  let retried = loop {
+    match victim.retry(request, &victims_create()) {
+      Err(ClientError::SessionTaken { .. }) if started.elapsed() < *START_WAIT => {
+        std::thread::yield_now()
+      }
+      other => break other.unwrap(),
+    }
+  };
+  assert_eq!(
+    retried,
+    slates_ipc::protocol::ReplyBody::Created { id: created },
+    "the victim's own retry meets its completion record"
+  );
+  second.stop();
+  drop(segment);
+}
+
+/// GAP-A9-9's threat model (§4.9, a request's completion key): do: a victim client creates a volume; a second client of
+/// the same daemon sends requests from its own slot under the victim's ids, one the victim has used and one it is about
+/// to use (its session's next sequence, a create of a volume the victim never asked for); then the victim makes its
+/// next request. Expect: each forged request refused `BadRequest`, nothing created for it, and the victim's next request
+/// served as its own, never answered from a record the stranger planted under its id.
+#[test]
+fn a_client_cannot_send_a_request_under_another_clients_id() {
+  let (daemon, mut victim, instance) = one_shard_daemon("forge");
+  let created = victim.create(&scratch("forged-victims")).unwrap();
+  let victims_request = victim.last_request();
+  let mut stranger = connect(&instance);
+  let read_back = stranger.retry(
+    victims_request,
+    &RequestBody::Create {
+      name: "forged-victims".to_owned(),
+      size: SizeClass::Bounded { limit: 1 << 20 },
+      names: NamePolicy::Exact,
+      require_locked: false,
+      base: None,
+    },
+  );
+  // The request the victim will send next, made first under its id by the stranger.
+  let next = slates_wire::request::RequestId {
+    client: victims_request.client,
+    sequence: victim.session().next_sequence,
+  };
+  let planted = stranger.retry(
+    next,
+    &RequestBody::Create {
+      name: "planted".to_owned(),
+      size: SizeClass::Bounded { limit: 1 << 20 },
+      names: NamePolicy::Exact,
+      require_locked: false,
+      base: None,
+    },
+  );
+  let made = victim.create(&scratch("victims-next"));
+  let listed: Vec<String> = victim
+    .list()
+    .unwrap()
+    .into_iter()
+    .map(|volume| volume.name)
+    .collect();
+  eprintln!(
+    "read back: {read_back:?}; planted: {planted:?}; the victim's next: {made:?}; listed: {listed:?}"
+  );
+  assert!(
+    listed.iter().any(|name| name == "victims-next"),
+    "the victim's next request never ran: {made:?}, listed {listed:?}"
+  );
+  assert!(
+    !listed.iter().any(|name| name == "planted"),
+    "the stranger's request under the victim's id ran: {listed:?}"
+  );
+  assert!(
+    made.as_ref().is_ok_and(|made| *made != created),
+    "the victim's next request was not its own: {made:?}"
+  );
+  for (what, answer) in [("read back", &read_back), ("planted", &planted)] {
+    assert!(
+      matches!(
+        answer,
+        Err(ClientError::Refused(Refusal::BadRequest { .. }))
+      ),
+      "the stranger's {what} request was not refused: {answer:?}"
+    );
+  }
+  daemon.stop();
+}
+
 /// AUD-29-21 (§4.9, RIFL): do: connect a client, restart its daemon over the same anchor-held segment, and
 /// resume the client's session seeded at the last request sequence; create a volume under it, then ask for
 /// more; expect the last create served, every later fresh request refused `SequencesExhausted` before it is
@@ -2459,7 +2634,10 @@ fn a_client_at_its_last_sequence_refuses_fresh_requests_and_keeps_its_retries() 
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
-  let client_id = connect(&instance).client_id();
+  let (client_id, key) = {
+    let first_client = connect(&instance);
+    (first_client.client_id(), first_client.session().key)
+  };
   first.stop();
   let second = Daemon::start(&profile, config, source()).unwrap();
   second
@@ -2470,6 +2648,7 @@ fn a_client_at_its_last_sequence_refuses_fresh_requests_and_keeps_its_retries() 
   let seeded = slates_client::Session {
     client_id,
     next_sequence: slates_client::LAST_SEQUENCE - 1,
+    key,
   };
   let mut client = Client::resume(&instance, seeded, deadlines()).unwrap();
   let last = client.create(&scratch("last")).unwrap();
@@ -2698,7 +2877,9 @@ fn host_dir_with_file() -> HostDir {
 }
 
 /// A green over a complete immutable base: an overlay over the host directory, pinned whole and
-/// snapshotted, then the green created over that snapshot and advanced once (`f.txt` prefixed).
+/// snapshotted, then the green created over that snapshot and advanced once (`f.txt` prefixed). A second work stays
+/// at version 0, so the reachable floor does too and version 0 stays readable across the restart: a version below
+/// the floor is folded into the green's checkpoint (W3) and refused `UnknownBase` after it.
 fn seed_green_over_base(client: &mut Client, dir: &str) -> slates_client::VolumeId {
   let overlay = client
     .create(&CreateSpec {
@@ -2727,6 +2908,8 @@ fn seed_green_over_base(client: &mut Client, dir: &str) -> slates_client::Volume
     .unwrap();
   let (work, base) = client.create_work(green, "w0").unwrap();
   assert_eq!(base, 0);
+  let (_, floor) = client.create_work(green, "floor").unwrap();
+  assert_eq!(floor, 0, "the floor's work stays at version 0");
   client.edit(work, "f.txt", 0, 0, b"agent: ").unwrap();
   assert!(matches!(
     client.submit(work).unwrap(),

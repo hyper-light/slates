@@ -2315,9 +2315,10 @@ fn run_mount(
       .memory()
       .read(at, &mut captured)
       .map_err(|error| WinFspError::Ledger(crate::opens::Refusal::Memory(error)))?;
+    let mut scratch = crate::inflight::Scratch::new().map_err(WinFspError::Capture)?;
     let saved_open = crate::inflight::capture::Capture::new(&mut captured)
       .map_err(WinFspError::Capture)?
-      .resume()
+      .resume(&mut scratch)
       .map_err(WinFspError::Capture)?
       .map(|batch| batch.saved_open())
       .transpose()

@@ -13,8 +13,8 @@
 use std::time::Duration;
 
 use slates_land::engine::{
-  LandingRefusal, LandingRequest, LandingState, LandingTarget, Observer, Outcome, SkipReason,
-  Unobserved, land,
+  HostSlot, LandingRefusal, LandingReport, LandingRequest, LandingState, LandingTarget, Observer,
+  Outcome, SkipReason, Unobserved, begin_landing, land,
 };
 use slates_land::grant::{GrantScope, Leases, Surface};
 use slates_land::manifest::LandingEntry;
@@ -237,4 +237,100 @@ fn a_holder_paused_past_its_term_places_nothing_after_it() {
   assert_eq!(resumed.state, LandingState::Done, "{resumed:?}");
   assert_eq!(host.bytes("/a").unwrap(), b"new a");
   assert_eq!(host.bytes("/b").unwrap(), b"new b");
+}
+
+/// AUD-29-03 (the entry fence's clock). Do: begin a sliced landing of two replacements under a lease whose term is
+/// shorter than a pause; step it one unit, so it has not reached its writes; pause past the term; step it to its end.
+/// Expect: as for a holder paused inside its writes, no entry is written after the term: both are
+/// `Skipped(LeaseEnded)`, the disk keeps both old files and the landing is `Partial`. Before 2026-11-08 the fence
+/// counted the landing's time only from its write phase's start (`WriteProgress::start`) on top of the request's
+/// clock, so the plan, the sweep, the validation and a shard descheduled among them went uncounted, and the entries
+/// were written past the lapse.
+#[test]
+fn a_holder_paused_before_its_writes_begin_writes_nothing_after_its_term() {
+  let (mut host, mut store, mut vol, target) = two_files();
+  let mut session = Session::new();
+  let req = granted(&mut host, &mut store, &mut vol, &target, &mut session);
+  let key = target_lease_key(&mut host, &target);
+  let mut leases = Leases::default();
+  let short = leases.take(&key, 7, req.now_ns, SHORT_TERM_NS).unwrap();
+  let report = land_paused_before_writes(
+    &mut host,
+    &target,
+    &mut vol,
+    &mut store,
+    &mut session,
+    &short,
+    &req,
+  );
+  let outcomes: Vec<_> = report.entries.iter().map(|e| e.outcome.clone()).collect();
+  assert_eq!(
+    outcomes,
+    vec![
+      Some(Outcome::Skipped(SkipReason::LeaseEnded)),
+      Some(Outcome::Skipped(SkipReason::LeaseEnded))
+    ],
+    "{report:?}"
+  );
+  assert_eq!(report.state, LandingState::Partial);
+  assert_eq!(
+    host.bytes("/a").unwrap(),
+    b"old a",
+    "nothing written after the term"
+  );
+  assert_eq!(
+    host.bytes("/b").unwrap(),
+    b"old b",
+    "nothing written after the term"
+  );
+}
+
+/// Lands `req` as a run stepped one unit a slice, pausing for [`PAUSE`] after its first unit (before its writes),
+/// running a batch's barrier where it is given out and the finish to its end.
+fn land_paused_before_writes(
+  host: &mut SimHost,
+  target: &LandingTarget,
+  vol: &mut Volume,
+  store: &mut Store,
+  session: &mut Session,
+  lease: &slates_land::grant::LandingLease,
+  req: &LandingRequest,
+) -> LandingReport {
+  let mut run = begin_landing(
+    HostSlot::Lent(host),
+    target,
+    vol,
+    store,
+    &mut session.grants,
+    Some(lease),
+    &mut session.audit,
+    req,
+  )
+  .map_err(|(_, refusal)| refusal)
+  .unwrap();
+  let mut observer = Unobserved;
+  let mut first = true;
+  let ended = loop {
+    if let Some(ended) = run.step(vol, store, &mut session.audit, &mut observer, 0) {
+      break ended;
+    }
+    if first {
+      first = false;
+      // A shard descheduled, or a slow plan or validation, before the landing's first write.
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(PAUSE);
+    }
+    if let Some(barrier) = run.take_barrier() {
+      run.barrier_ran(barrier.run());
+      continue;
+    }
+    if run.ready_to_finish() {
+      break loop {
+        if let Some(finished) = run.finish_step(vol, store, &mut session.audit, &mut observer, 0) {
+          break finished;
+        }
+      };
+    }
+  };
+  ended.unwrap()
 }

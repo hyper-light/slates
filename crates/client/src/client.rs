@@ -98,7 +98,9 @@ pub fn defers_reply(body: &RequestBody) -> bool {
   body.may_be_forwarded()
     || matches!(
       body,
-      RequestBody::Land { grant: Some(_), .. }
+      // A landing is planned in slices on the owner shard, as long as its tree takes, and a granted one runs in them
+      // (AUD-29-25; a presentation since 2026-11-08).
+      RequestBody::Land { .. }
         // An image's build and merge run in slices on the owner shard, as long as the image takes (A-160).
         | RequestBody::ImageBuild { .. }
         | RequestBody::ImageMerge { .. }
@@ -108,6 +110,9 @@ pub fn defers_reply(body: &RequestBody) -> bool {
         // A pin reads the subtrees it names into the store in slices on the owner shard, as long as the tree takes
         // (§4.4, §4.3).
         | RequestBody::Pin { .. }
+        // A green over a base walks the base snapshot into its origin in slices on the owner shard, as long as the
+        // tree takes (§4.16 "Green creation"); a scratch green is answered at once.
+        | RequestBody::CreateGreen { base: Some(_), .. }
         // A direct map's copy is filled in slices on the owner shard, as long as the file takes (A-171).
         | RequestBody::MapRead { .. }
         // A writable map's copy is filled the same way, and its stores are compared back into the file in slices at
@@ -136,15 +141,31 @@ pub fn defers_reply(body: &RequestBody) -> bool {
 /// ids already issued still reach their completion records.
 pub const LAST_SEQUENCE: u32 = u32::MAX - 1;
 
-/// What a client keeps to resume: its id and the next sequence it would use. A process that
-/// restarts with this retries what it had in flight and meets the completion record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a client keeps to resume: its id, the next sequence it would use, and the session key that proves the id is
+/// its own. A process that restarts with this retries what it had in flight and meets the completion record; one that
+/// names an id without its key is refused `SessionUnproven` (§4.9, `slates_server::session_key`). The key is a secret:
+/// keep a session where the process's other secrets are kept, never in a log (its `Debug` leaves the key out).
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Session {
   /// The client id the daemon bound to this principal.
   pub client_id: u32,
   /// The next sequence.
   pub next_sequence: u32,
+  /// The session key the daemon issued with the id.
+  pub key: [u8; SESSION_KEY_BYTES],
 }
+
+impl std::fmt::Debug for Session {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("Session")
+      .field("client_id", &self.client_id)
+      .field("next_sequence", &self.next_sequence)
+      .finish_non_exhaustive()
+  }
+}
+
+/// Format: a session key's width (`slates_ipc::region::SESSION_KEY_BYTES`).
+pub const SESSION_KEY_BYTES: usize = slates_ipc::region::SESSION_KEY_BYTES;
 
 /// What `attach_shards` returns (§4.6, the Shards route; A-161): the attachment, and the stream end to hand a Shards
 /// VMM, which reaches that attachment and nothing else.
@@ -257,6 +278,9 @@ pub struct Client {
   instance: String,
   end: ClientEnd,
   client_id: u32,
+  /// The session key that proves `client_id` is this client's (`Session::key`), written into every region it is
+  /// handed again under the id, before the first request there.
+  session_key: [u8; SESSION_KEY_BYTES],
   /// The last sequence used.
   sequence: u32,
   deadlines: Deadlines,
@@ -283,6 +307,17 @@ pub struct Client {
   unpublished_cap: usize,
   /// Unpublished ids forgotten at the bound.
   unpublished_forgotten: u64,
+  /// The sequences an async caller was answered `Overloaded` or `OwnerUnreachable`, the refusals retryable under the
+  /// same id, with when (§4.9, §4.16 "Commit"): a forwarded submit whose acceptance outlived the owner's budget ran,
+  /// and its completion is recorded once the version commits, so its resend must meet that record. The watermark stops
+  /// below the lowest held within the reconnect budget, the window in which a resend under the id is made, renewed by
+  /// each refusal; past it the id is released, so a caller that never resends cannot hold its watermark (and with it
+  /// the daemon's completion records, refused `AcknowledgementOwed` past their bound) for good. Before 2026-11-06 the
+  /// next acknowledgement covered the refused id and its resend was refused `DuplicateRequest` (447 submits of
+  /// fixtures' 1,000-client `f = 1` rung). Bounded by `unpublished_cap`, the oldest forgotten and counted.
+  retry_held: std::collections::BTreeMap<u32, Instant>,
+  /// Ids released from `retry_held` at its bound or released by their caller unanswered.
+  retry_released: u64,
   /// Replies drained from the completion ring while looking for another request's reply, held by
   /// their request-id word until their own [`Client::poll_reply`] takes them. The async path drains
   /// the ring on a completion-fd signal and matches by id, so replies that arrive out of order (a
@@ -949,7 +984,7 @@ impl Connecting {
       Ok(None) => Ok(None),
       Ok(Some(connected)) => {
         self.claim = None;
-        let mut client = Client::over(&self.instance, connected, 0, self.deadlines);
+        let mut client = Client::over(&self.instance, connected, 0, self.deadlines, None)?;
         // Bound on the first send, without waiting (`bind_without_waiting`).
         client.consumer = self.delivered.take();
         Ok(Some(client))
@@ -1000,7 +1035,7 @@ impl Client {
     let delivered = delivered_capability()?;
     install_seal();
     let connected = connect_as(instance, 0, deadlines.reconnect_ns)?;
-    let mut client = Client::over(instance, connected, 0, deadlines);
+    let mut client = Client::over(instance, connected, 0, deadlines, None)?;
     client.bind_delivered(delivered)?;
     Ok(client)
   }
@@ -1042,21 +1077,38 @@ impl Client {
       connected,
       session.next_sequence.saturating_sub(1),
       deadlines,
-    );
+      Some(session.key),
+    )?;
     client.bind_delivered(delivered)?;
     Ok(client)
   }
 
-  /// A client over a fresh rendezvous, its sequence at `sequence` (the last used).
-  fn over(instance: &str, connected: Connected, sequence: u32, deadlines: Deadlines) -> Client {
+  /// A client over a fresh rendezvous, its sequence at `sequence` (the last used). `key` is the session key of an id
+  /// being resumed, written into the region to prove it; `None` for an id issued fresh, whose key the daemon wrote
+  /// there.
+  fn over(
+    instance: &str,
+    mut connected: Connected,
+    sequence: u32,
+    deadlines: Deadlines,
+    key: Option<[u8; SESSION_KEY_BYTES]>,
+  ) -> Result<Client, ClientError> {
     let client_id = connected.region.client_id();
+    let session_key = match key {
+      Some(key) => {
+        connected.region.set_session_key(&key)?;
+        key
+      }
+      None => connected.region.session_key()?,
+    };
     let end = ClientEnd::connected(connected);
     let ack_every = ack_every_of(&end);
     let unpublished_cap = end.region().cmd().slots().max(1);
-    Client {
+    Ok(Client {
       instance: instance.to_owned(),
       end,
       client_id,
+      session_key,
       sequence,
       deadlines,
       reconnects: 0,
@@ -1066,6 +1118,8 @@ impl Client {
       unpublished: std::collections::BTreeSet::new(),
       unpublished_cap,
       unpublished_forgotten: 0,
+      retry_held: std::collections::BTreeMap::new(),
+      retry_released: 0,
       pending: Vec::new(),
       awaited: std::collections::BTreeMap::new(),
       edit_chains: std::collections::BTreeMap::new(),
@@ -1078,7 +1132,7 @@ impl Client {
       bound: false,
       rebinds: 0,
       reconnecting: None,
-    }
+    })
   }
 
   /// Binds the channel to the delivered consumer, when there is one.
@@ -1130,6 +1184,7 @@ impl Client {
       client_id: self.client_id,
       // At most `LAST_SEQUENCE + 1 = u32::MAX`, the exhausted marker: exact, never a wrap.
       next_sequence: self.sequence.saturating_add(1),
+      key: self.session_key,
     }
   }
 
@@ -1709,14 +1764,46 @@ impl Client {
       .filter(|word| !self.pending.iter().any(|(held, _)| held == *word))
       .map(|word| RequestId::from_word(*word).sequence)
       .min();
-    first_incomplete.map_or(received, |lowest| received.min(lowest.saturating_sub(1)))
+    let first_held = self
+      .retry_held
+      .iter()
+      .filter(|(_, refused)| elapsed_ns(**refused) < self.deadlines.reconnect_ns)
+      .map(|(sequence, _)| *sequence)
+      .next();
+    [first_incomplete, first_held]
+      .into_iter()
+      .flatten()
+      .fold(received, |watermark, lowest| {
+        watermark.min(lowest.saturating_sub(1))
+      })
   }
 
   /// Notes what `word`'s reply means for the retryable set: an `Unpublished` refusal keeps the id
   /// retryable (bounded, the oldest forgotten and counted past the ring's slots); any other answer
-  /// to a retried id releases it.
-  fn note_reply(&mut self, word: u64, body: &ReplyBody) {
+  /// to a retried id releases it. On the async path (`by_word`: a caller holding the id's word, which
+  /// [`Self::begin_again`] resends) an `Overloaded` or `OwnerUnreachable` refusal is held as well, within the
+  /// reconnect budget (`retry_held`).
+  fn note_reply(&mut self, word: u64, body: &ReplyBody, by_word: bool) {
     let sequence = RequestId::from_word(word).sequence;
+    let held_for_retry = by_word
+      && matches!(
+        body,
+        ReplyBody::Refused {
+          refusal: slates_ipc::protocol::Refusal::Overloaded { .. }
+            | slates_ipc::protocol::Refusal::OwnerUnreachable { .. }
+        }
+      );
+    if held_for_retry {
+      if self.retry_held.len() >= self.unpublished_cap
+        && !self.retry_held.contains_key(&sequence)
+        && self.retry_held.pop_first().is_some()
+      {
+        self.retry_released = self.retry_released.saturating_add(1);
+      }
+      self.retry_held.insert(sequence, Instant::now());
+    } else {
+      self.retry_held.remove(&sequence);
+    }
     if matches!(
       body,
       ReplyBody::Refused {
@@ -1740,6 +1827,21 @@ impl Client {
     self.unpublished_forgotten
   }
 
+  /// Releases `word`, an id the caller was answered with a refusal retryable under it and will not send again: the
+  /// acknowledgement watermark no longer stops below it, so the daemon may release its completion records past it.
+  pub fn release_retryable(&mut self, word: u64) {
+    let sequence = RequestId::from_word(word).sequence;
+    if self.retry_held.remove(&sequence).is_some() {
+      self.retry_released = self.retry_released.saturating_add(1);
+    }
+    self.unpublished.remove(&sequence);
+  }
+
+  /// Ids released from the hold for a resend under their own id unanswered: at its bound or by their caller.
+  pub fn retry_released(&self) -> u64 {
+    self.retry_released
+  }
+
   /// One request under the next sequence, without the automatic acknowledgement.
   fn call_plain(&mut self, body: &RequestBody) -> Result<ReplyBody, ClientError> {
     let id = self.fresh_id()?;
@@ -1759,7 +1861,7 @@ impl Client {
     loop {
       self.rebind_if_needed()?;
       if let Some(reply) = self.round_trip(id, body)? {
-        self.note_reply(id.word(), &reply);
+        self.note_reply(id.word(), &reply, false);
         return resolved(reply);
       }
     }
@@ -1891,8 +1993,10 @@ impl Client {
   }
 
   /// Sends `body` again under `word`, an id the caller already used and was answered with a refusal the protocol
-  /// marks retryable under the same id (`Overloaded`, `OwnerUnreachable`, `Unpublished`, `ContentUnavailable`): the
-  /// daemon answers from the verb's completion record once it is durable, or runs it if it never ran. The word is
+  /// marks retryable under the same id (`Overloaded`, `OwnerUnreachable`, `Unpublished`): the daemon answers from the
+  /// verb's completion record once it is durable, or runs it if it never ran. The acknowledgement watermark stops
+  /// below such an id from its refusal until this resend (within the reconnect budget for the first two;
+  /// [`Self::release_retryable`] releases one the caller gives up). The word is
   /// awaited again, so its reply is taken as a [`Self::begin`]'s is, within the same in-flight bound. `Ok(false)` when
   /// the ring has no slot (nothing was sent).
   pub fn begin_again(&mut self, word: u64, body: &RequestBody) -> Result<bool, ClientError> {
@@ -2005,11 +2109,12 @@ impl Client {
     }
     match polled {
       Ok(None) => Ok(false),
-      Ok(Some(connected)) => {
+      Ok(Some(mut connected)) => {
         let assigned = connected.region.client_id();
         if assigned != self.client_id {
           return Err(ClientError::SessionTaken { assigned });
         }
+        connected.region.set_session_key(&self.session_key)?;
         self.end = ClientEnd::connected(connected);
         self.reconnects = self.reconnects.saturating_add(1);
         self.bound = false;
@@ -2097,14 +2202,14 @@ impl Client {
     if let Some(pos) = self.pending.iter().position(|(held, _)| *held == word) {
       let (_, body) = self.pending.remove(pos);
       self.awaited.remove(&word);
-      self.note_reply(word, &body);
+      self.note_reply(word, &body, true);
       return resolved(body).map(Some);
     }
     while let Some(reply) = self.end.try_take()? {
       let body: ReplyBody = unpack(self.end.region(), reply.kind, &reply.payload)?;
       if reply.request == word {
         self.awaited.remove(&word);
-        self.note_reply(word, &body);
+        self.note_reply(word, &body, true);
         return resolved(body).map(Some);
       }
       self.buffer(reply.request, body);
@@ -2150,7 +2255,7 @@ impl Client {
     // A chain step's reply is its chain's: filed under the public word the caller awaits.
     if let Some(public) = self.chain_steps.remove(&id_word) {
       self.awaited.remove(&id_word);
-      self.note_reply(id_word, &body);
+      self.note_reply(id_word, &body, false);
       if !self.pending.iter().any(|(held, _)| *held == public) {
         self.pending.push((public, body));
       }
@@ -2171,6 +2276,9 @@ impl Client {
     }
     if self.awaited.contains_key(&id_word) && !self.pending.iter().any(|(held, _)| *held == id_word)
     {
+      // Held as soon as it is drained: a reply in `pending` counts as received, so an acknowledgement sent before
+      // its caller takes it must already stop below a refusal it will resend.
+      self.note_reply(id_word, &body, true);
       self.pending.push((id_word, body));
     } else {
       self.unawaited_dropped = self.unawaited_dropped.saturating_add(1);
@@ -2879,11 +2987,12 @@ impl Client {
     let mut pause_ns = self.end.wake_estimate_ns().max(1);
     loop {
       match connect_as(&self.instance, self.client_id, self.deadlines.reconnect_ns) {
-        Ok(connected) => {
+        Ok(mut connected) => {
           let assigned = connected.region.client_id();
           if assigned != self.client_id {
             return Err(ClientError::SessionTaken { assigned });
           }
+          connected.region.set_session_key(&self.session_key)?;
           self.end = ClientEnd::connected(connected);
           self.reconnects = self.reconnects.saturating_add(1);
           self.bound = false;

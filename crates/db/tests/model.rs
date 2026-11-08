@@ -340,6 +340,8 @@ enum Step {
   Audit(u8),
   GreenAdvance(usize),
   GreenOriginate(usize),
+  /// A green's checkpoint (W3) at a version, which folds the increments up to it.
+  GreenCheckpoint(usize, u64),
   NfsOpen(u8, u8, u32),
   NfsOpenClear(usize),
   NfsLock(usize, u64, u64, bool),
@@ -397,6 +399,7 @@ fn step() -> impl Strategy<Value = Step> {
     1 => (0..7u8).prop_map(Step::Audit),
     2 => (0..8usize).prop_map(Step::GreenAdvance),
     1 => (0..8usize).prop_map(Step::GreenOriginate),
+    1 => (0..8usize, 0..6u64).prop_map(|(v, at)| Step::GreenCheckpoint(v, at)),
     2 => (0..4u8, 0..8u8, 1..4u32).prop_map(|(c, f, a)| Step::NfsOpen(c, f, a)),
     1 => (0..8usize).prop_map(Step::NfsOpenClear),
     2 => (0..8usize, 0..1_000u64, 1..1_000u64, any::<bool>()).prop_map(|(o, a, l, w)| Step::NfsLock(o, a, l, w)),
@@ -632,7 +635,8 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
     | Step::LandingState(..)
     | Step::Audit(..)
     | Step::GreenAdvance(..)
-    | Step::GreenOriginate(..)) => return op_for_service(step, ids, now_ns),
+    | Step::GreenOriginate(..)
+    | Step::GreenCheckpoint(..)) => return op_for_service(step, ids, now_ns),
     step @ (Step::NfsOpen(..)
     | Step::NfsOpenClear(..)
     | Step::NfsLock(..)
@@ -741,6 +745,13 @@ fn op_for_service(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
     Step::GreenOriginate(v) => Op::GreenOriginated {
       green: vid(pick(&ids.live, *v)?),
       origin: (*v as u64).to_be_bytes().to_vec(),
+    },
+    // A checkpoint at a version the green's head may or may not reach: the partition refuses one at or below the
+    // checkpoint held or past the head, and the model checks a refused one was never recorded.
+    Step::GreenCheckpoint(v, at) => Op::GreenCheckpointed {
+      green: vid(pick(&ids.live, *v)?),
+      version: *at,
+      checkpoint: at.to_be_bytes().to_vec(),
     },
     _ => return None,
   })
@@ -993,7 +1004,7 @@ proptest! {
           note_applied(&op, &mut ids);
           applied += 1;
         }
-        Err(DbError::NotFound | DbError::AlreadyExists { .. } | DbError::LeaseHeld { .. } | DbError::StaleLease { .. } | DbError::StaleCompletion { .. } | DbError::Capacity { .. }) => {}
+        Err(DbError::NotFound | DbError::AlreadyExists { .. } | DbError::LeaseHeld { .. } | DbError::StaleLease { .. } | DbError::StaleCompletion { .. } | DbError::Capacity { .. } | DbError::CheckpointOutOfRange { .. }) => {}
         Err(other) => prop_assert!(false, "unexpected refusal {other:?}"),
       }
       for expired in db.partition_mut().expired_leases(now_ns) {
@@ -1385,6 +1396,142 @@ fn snapshots_trim_the_log_and_recovery_restores_them_with_the_tail() {
   assert_eq!(recovered.partition().to_snapshot(0), live);
   assert_eq!(recovered.partition().volume_count(), 200);
   assert_eq!(recovered.next_seq(), 200);
+}
+
+/// Shape: the bytes of each increment the checkpoint tests advance a green by.
+const INCREMENT_BYTES: usize = 100;
+/// Shape: the bytes of each checkpoint they take: less than what it folds, so the fold returns budget.
+const CHECKPOINT_BYTES: usize = 40;
+/// Shape: the increments the checkpoint tests' merge budget holds.
+const BUDGET_INCREMENTS: usize = 5;
+
+/// The checkpoint tests' green.
+const CHECKPOINT_GREEN: u64 = 1;
+
+/// The checkpoint tests' caps: a merge budget of [`BUDGET_INCREMENTS`] increments.
+fn checkpoint_caps() -> PartitionCaps {
+  PartitionCaps {
+    green_chain_bytes: BUDGET_INCREMENTS * INCREMENT_BYTES,
+    ..caps()
+  }
+}
+
+/// The green's increment `n`.
+fn advance(n: u8) -> Op {
+  Op::GreenAdvanced {
+    green: vid(CHECKPOINT_GREEN),
+    increment: vec![n; INCREMENT_BYTES],
+  }
+}
+
+/// The green's checkpoint at `version`.
+fn checkpoint_at(version: u64) -> Op {
+  Op::GreenCheckpointed {
+    green: vid(CHECKPOINT_GREEN),
+    version,
+    checkpoint: vec![0xC0; CHECKPOINT_BYTES],
+  }
+}
+
+/// W3, §4.16. Do: under a merge budget of five 100-byte increments, advance a green five versions and try a sixth;
+/// checkpoint it at version 3 with 40 bytes, then advance it until refused. Expect: the sixth is refused at the cap;
+/// after the checkpoint the chain holds only versions 4 and 5 and the head stays 5; exactly two more increments fit
+/// (the budget fell by the 300 bytes folded less the checkpoint's 40). Returns the database at head 7 and its segment.
+fn a_checkpoint_returns_what_it_folds() -> (AnchorSegment, Db) {
+  let green = vid(CHECKPOINT_GREEN);
+  let mut seg = segment("slates-db-checkpoint", LOG_BYTES);
+  let mut db = recover(&mut seg, 0, checkpoint_caps(), 0).unwrap().0;
+  let record = volume(CHECKPOINT_GREEN, "green");
+  db.mutate(&mut seg, &Op::VolumeCreated { record }, 0)
+    .unwrap();
+  for n in 0..5u8 {
+    db.mutate(&mut seg, &advance(n), 0).unwrap();
+  }
+  let sixth = db.mutate(&mut seg, &advance(5), 0);
+  assert!(matches!(sixth, Err(DbError::Capacity { .. })), "{sixth:?}");
+  db.mutate(&mut seg, &checkpoint_at(3), 0).unwrap();
+  let partition = db.partition();
+  assert_eq!(
+    partition.green_chain(green),
+    &[vec![3; INCREMENT_BYTES], vec![4; INCREMENT_BYTES]]
+  );
+  assert_eq!(
+    partition.green_checkpoint(green),
+    Some((3, &[0xC0; CHECKPOINT_BYTES][..]))
+  );
+  assert_eq!(partition.green_head(green), 5);
+  db.mutate(&mut seg, &advance(5), 0).unwrap();
+  db.mutate(&mut seg, &advance(6), 0).unwrap();
+  let eighth = db.mutate(&mut seg, &advance(7), 0);
+  assert!(
+    matches!(eighth, Err(DbError::Capacity { .. })),
+    "{eighth:?}"
+  );
+  (seg, db)
+}
+
+/// Asks for checkpoints at the one held (3), below it, and past the head (7): each refused `CheckpointOutOfRange`,
+/// none recorded.
+fn checkpoints_out_of_range_are_refused(seg: &mut AnchorSegment, db: &mut Db) {
+  let seq = db.next_seq();
+  for version in [3, 2, 8] {
+    let refused = db.mutate(seg, &checkpoint_at(version), 0);
+    let expected = DbError::CheckpointOutOfRange {
+      version,
+      held: 3,
+      head: 7,
+    };
+    assert_eq!(
+      refused.err(),
+      Some(expected),
+      "a checkpoint at {version} is refused"
+    );
+  }
+  assert_eq!(db.next_seq(), seq, "no refused checkpoint was recorded");
+}
+
+/// W3, §4.16. Do: the fold of [`a_checkpoint_returns_what_it_folds`]; then ask for checkpoints at 3, at 2 and past the
+/// head 7; recover; checkpoint at the head; snapshot and recover again. Expect: the three are refused
+/// `CheckpointOutOfRange`, never recorded; recovery from the log and from a snapshot holds the same checkpoint and
+/// chain; the checkpoint at the head leaves an empty chain, and a late origin is still refused.
+#[test]
+fn a_green_checkpoint_folds_its_chain_and_recovery_holds_it() {
+  let green = vid(CHECKPOINT_GREEN);
+  let (mut seg, mut db) = a_checkpoint_returns_what_it_folds();
+  checkpoints_out_of_range_are_refused(&mut seg, &mut db);
+  let live = db.partition().to_snapshot(0);
+  drop(db);
+  let (mut db, _) = recover(&mut seg, 0, checkpoint_caps(), 0).unwrap();
+  assert_eq!(
+    db.partition().to_snapshot(0),
+    live,
+    "recovery holds the checkpoint and the chain after it"
+  );
+  db.mutate(&mut seg, &checkpoint_at(7), 0).unwrap();
+  assert!(db.partition().green_chain(green).is_empty());
+  assert_eq!(db.partition().green_head(green), 7);
+  let late = db.mutate(
+    &mut seg,
+    &Op::GreenOriginated {
+      green,
+      origin: vec![1],
+    },
+    0,
+  );
+  assert!(
+    matches!(late, Err(DbError::AlreadyExists { .. })),
+    "{late:?}"
+  );
+  db.snapshot(&mut seg).unwrap();
+  let live = db.partition().to_snapshot(0);
+  drop(db);
+  let (recovered, stats) = recover(&mut seg, 0, checkpoint_caps(), 0).unwrap();
+  assert!(stats.snapshot.is_some());
+  assert_eq!(
+    recovered.partition().to_snapshot(0),
+    live,
+    "a snapshot carries the checkpoint"
+  );
 }
 
 /// A ring too small for many records: the append snapshots and retries, never refuses.

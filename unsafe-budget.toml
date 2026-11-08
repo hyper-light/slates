@@ -183,6 +183,8 @@
 #   and the daemon adopting a fleet node's inherited serve sockets (`fleet.rs` `adopt_inherited`,
 #   added 2026-09-28 with the anchor-held fleet ports, §4.8): the same `OwnedFd::from_raw_fd` on each
 #   number in `SLATES_ANCHOR_FLEET_SERVE`, one site called per plane (1, Unix only).
+#   The daemon reading Windows Error Reporting's `LocalDumps` setting (`local_dumps.rs`, 2026-11-07, A-239): one
+#   `RegGetValueW` of a DWORD into a local, unprivileged (1, Windows only). 7 → 8.
 # slates-db (0): records, indexes and the log are safe Rust over the segment's byte slices.
 # slates-merge (0): the verdict is a pure sweep over ranges and a memcmp; safe Rust throughout.
 # slates-client (0): the rings and the rendezvous are slates-ipc's. Raised 0 → 3 on 2026-10-15 for the
@@ -213,7 +215,14 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 53
+slates-machine = 63
+# 2026-11-07 (+2, compiled only for Linux): the process clock reads the whole process's CPU-time clock,
+#   `clock_getcpuclockid` and `clock_gettime`; `/proc/<pid>/schedstat`, which it read before, is the main thread's alone.
+#   Neither call has a safe wrapper in rustix.
+# 2026-11-07 (+8, the anchor's start judgment): another process's CPU clock (`process_clock.rs`): on macOS the zeroed
+#   `proc_taskinfo`, `proc_pidinfo(PROC_PIDTASKINFO)` and `mach_timebase_info` (declared here, as `facts.rs` declares
+#   `mach_host_self`); on Windows `OpenProcess` with the limited query right, `GetProcessTimes`, `QueryProcessCycleTime`
+#   and the handle's `CloseHandle`. None has a safe wrapper.
 # 2026-11-04 (+2, A-205, compiled only for Windows): `Facts::resident_now` reads the working set: the zeroed record and
 #   `K32GetProcessMemoryInfo`, which has no safe wrapper.
 #   Raised 19 → 22 on 2026-09-30 for AUD-29-09 (a shared object hands out no reference to its bytes):
@@ -337,7 +346,16 @@ slates-db = 0
 # 2026-11-02 (+3, A-198 Step 9.4): the holder's process descriptor is converted from SDDL, applied before acquiring
 # held objects, and freed with LocalFree (`process_access.rs`). CreateProcessW borrows that same descriptor at birth;
 # these Win32 security calls have no safe wrapper and add no file or privilege requirement.
-slates-ipc = 113
+slates-ipc = 139
+# 2026-11-06 (+26, GAP-A9-9, `mach_claim.rs` and one in `owner_name.rs`, compiled only for macOS): a client's region is
+#   handed over as a Mach fileport, never by a name a same-uid stranger could open. The Mach message calls the SDK
+#   wraps nothing for: `mach_msg` for the owner thread's receive, each answer (a refusal, a delivery), the client's fetch
+#   send and receive, the daemon's keep, and the owner's own control; `mach_msg_destroy` for each message refused or
+#   not expected, so no right a stranger sent is kept; `fileport_makeport`/`fileport_makefd` on each side;
+#   `audit_token_to_pid` for the sender of each message; `proc_pidinfo` for a keep's sender's parent;
+#   `mach_port_allocate`/`mach_port_mod_refs`/`mach_port_deallocate` for the client's reply port and the fileports;
+#   `OwnedFd::from_raw_fd` for a descriptor a fileport made; the byte view of the receive buffer the trailer is read
+#   from; `bootstrap_look_up` for the token's send right (`owner_name::look_up`); and the tests' plants.
 # 2026-11-01 (+1, Step 6.1 of the VFS and DAX plan, `stream.rs` `spawn_bound` compiled only for Linux): `slates pmem`
 #   must stay its VMM's parent to hold the VMM's map and compare it back, so it spawns rather than replacing itself as
 #   `exec_with` does. `pre_exec` (unsafe by signature) whose closure sets the parent-death signal (`prctl`, through
@@ -386,7 +404,7 @@ slates-ipc = 113
 #   range) the layout keeps: the daemon's copies reach only the write log and image slots.
 # 2026-11-02 (+1, A-198 Step 9.3): `anchor_hold_windows::adopted` takes unique ownership of an explicitly inherited
 # handle after the bounded handoff parser checked nonzero values and aliasing; its inheritance flag is cleared in IPC.
-slates-server = 7
+slates-server = 8
 slates-client = 0
 slates-cli = 7
 # 2026-11-01 (+2, Step 6.1 of the VFS and DAX plan, `signal.rs` `relay` compiled only for Linux): `slates pmem` waits on
