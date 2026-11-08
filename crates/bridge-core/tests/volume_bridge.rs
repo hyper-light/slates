@@ -148,6 +148,39 @@ fn volume(store: &mut Store) -> Volume {
   .unwrap()
 }
 
+/// A-259. Do: create a file through the bridge, then `setattr` only its birth time, as WinFsp's `SetFileTime` sets a
+/// creation time. Expect: the reply and a fresh `getattr` report the time set, the modification time left as it was,
+/// and a file made after it reporting its own birth time. Before, the bridge's attributes carried no birth time and its
+/// `setattr` passed none to the volume, so WinFsp reported the change time as every object's creation time.
+#[test]
+fn setattr_sets_and_reports_a_birth_time() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let cx = rw_cx();
+  let root = bridge.root(&cx).unwrap();
+  let (made, _fh) = bridge.create(oid(root), &cx, "born", 0o644, 0).unwrap();
+  let changed = bridge
+    .setattr(
+      oid(made.ino),
+      &cx,
+      SetAttr {
+        btime: Some(333),
+        ..SetAttr::default()
+      },
+    )
+    .unwrap();
+  assert_eq!(changed.btime, 333, "the reply reports the birth time set");
+  let stat = bridge.getattr(oid(made.ino), &cx).unwrap();
+  assert_eq!(
+    (stat.btime, stat.mtime),
+    (333, made.mtime),
+    "the birth time stuck, and the modification time is as it was"
+  );
+  let (later, _fh) = bridge.create(oid(root), &cx, "later", 0o644, 0).unwrap();
+  assert_ne!(later.btime, 333, "another file keeps its own birth time");
+}
+
 /// A `setattr` of ownership and times takes effect and is reported, and a later single-field
 /// `setattr` leaves the other fields alone — no field is ignored while success is returned (BUG-8).
 #[test]
