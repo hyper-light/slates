@@ -1,0 +1,1130 @@
+runner ubuntu-24.04-arm, 4 CPUs, Sun Nov  8 06:08:06 UTC 2026, tree c0cc33a12f4e44041d74732cebadb17cce70a243
+== release build exit 0
+  5089 writes, 5089 acknowledged: p50 416 us, p99 13270 us, p999 26466 us, max 183695 us; 5 over 50ms (sent+took): 0.00s+181ms 1.22s+53ms 2.11s+184ms 3.40s+113ms 4.31s+95ms
+  chaos-rolling-a-6152 refused the owner: {}
+  chaos-rolling-b-6152 partitioned from 217.8958ms to 2.217997001s
+  chaos-rolling-b-6152 refused the owner: {}
+  chaos-rolling-c-6152 partitioned from 2.393836929s to 4.393962647s
+  chaos-rolling-c-6152 refused the owner: {}
+== partition 1 exit 0 stuck 0 long5 0
+   r1 LD-DIAL slates-fleet to 127.0.0.1:39977 began_wall 1794118325593116387 ended_wall 1794118325594937290 budgets_spent_before 0 outcome Ok(())
+   r1 LD-DIAL slates-fleet to 127.0.0.1:39979 began_wall 1794118325547306972 ended_wall 1794118325596819621 budgets_spent_before 0 outcome Ok(())
+   r1 LD-DIAL slates-fleet to 127.0.0.1:39977 began_wall 1794118325642953383 ended_wall 1794118325644886327 budgets_spent_before 0 outcome Ok(())
+   r1 LD-DIAL slates-fleet to 127.0.0.1:39979 began_wall 1794118325643218182 ended_wall 1794118325645229272 budgets_spent_before 0 outcome Ok(())
+   r1 LD-DIAL slates-fleet to 127.0.0.1:39981 began_wall 1794118325547577746 ended_wall 1794118325647260529 budgets_spent_before 0 outcome Ok(())
+   r1 LD-DIAL slates-fleet to 127.0.0.1:39981 began_wall 1794118325593532504 ended_wall 1794118325648727960 budgets_spent_before 0 outcome Ok(())
+   r1 LD-DIAL slates-fleet to 127.0.0.1:39977 fresh_wall 1794118325695794452
+   r1 LD-DIAL slates-fleet to 127.0.0.1:39979 fresh_wall 1794118325697534464
+   r1 LD-DIAL slates-fleet to 127.0.0.1:39977 fresh_wall 1794118325745766031
+   r1 LD-DIAL slates-fleet to 127.0.0.1:39979 fresh_wall 1794118325746021702
+   r1 LD-DIAL LD-DIAL slates-fleetslates-fleet to  to 127127..00..00..11::3998139981 fresh_wall  fresh_wall 17941183257497406071794118325749748015
+   r1 LD-DIAL slates-fleet to 127.0.0.1:39977 began_wall 1794118325796253416 ended_wall 1794118325797607358 budgets_spent_before 0 outcome Ok(())
+   r1 LD-DIAL slates-fleet to 127.0.0.1:39979 began_wall 1794118325797890187 ended_wall 1794118325799127569 budgets_spent_before 0 outcome Ok(())
+   r1 LD-DIAL slates-fleet to 127.0.0.1:39979 began_wall 1794118325846329524 ended_wall 1794118325847905467 budgets_spent_before 0 outcome Ok(())
+   r1 LD-DIAL slates-fleet to 127.0.0.1:39977 began_wall 1794118325846250705 ended_wall 1794118325848179225 budgets_spent_before 0 outcome Ok(())
+   r1 LD-DIAL slates-fleet to 127.0.0.1:39981 began_wall 1794118325850031534 ended_wall 1794118325852861890 budgets_spent_before 0 outcome Ok(())
+   r1 LD-DIAL slates-fleet to 127.0.0.1:39981 began_wall 1794118325850030102 ended_wall 1794118325853042998 budgets_spent_before 0 outcome Ok(())
+   r1 LD-RESUME chaos-rolling-b-6152 wall_ns 1794118328700704524
+   r1 LD-DIAL slates-fleet to 127.0.0.1:39979 fresh_wall 1794118328711442507
+   r1 LD-DIAL slates-fleet to 127.0.0.1:39979 fresh_wall 1794118328741155183
+   r1 LD-DIAL slates-fleet to 127.0.0.1:39979 began_wall 1794118328811709844 ended_wall 1794118328813631909 budgets_spent_before 0 outcome Ok(())
+   r1 LD-DIAL slates-fleet to 127.0.0.1:39979 began_wall 1794118328841468837 ended_wall 1794118328842982472 budgets_spent_before 0 outcome Ok(())
+   r1 LD-SERVE at 3264602011 wall_ns 1794118328862757408 install from 15486862396333159623 bytes 12110764 took_ns 8454639 gap_ns Some(2153929454)
+   r1 LD-RESUME chaos-rolling-c-6152 wall_ns 1794118330876659756
+   r1 LD-DIAL slates-fleet to 127.0.0.1:39981 fresh_wall 1794118330897480030
+   r1 LD-DIAL slates-fleet to 127.0.0.1:39981 fresh_wall 1794118330918205270
+   r1 LD-DIAL slates-fleet to 127.0.0.1:39981 began_wall 1794118330998534042 ended_wall 1794118331002385306 budgets_spent_before 0 outcome Ok(())
+   r1 LD-DIAL slates-fleet to 127.0.0.1:39981 began_wall 1794118331018634868 ended_wall 1794118331023351971 budgets_spent_before 0 outcome Ok(())
+   r1 LD-SERVE at 5440980431 wall_ns 1794118331089571719 install from 15486862396333159623 bytes 21743578 took_ns 10657684 gap_ns Some(2202205273)
+  3819 writes, 3819 acknowledged: p50 609 us, p99 4667 us, p999 36584 us, max 244964 us; 2 over 50ms (sent+took): 0.00s+129ms 2.31s+245ms
+  chaos-rolling-a-6761 partitioned from 170.333547ms to 2.17066366s
+  chaos-rolling-a-6761 refused the owner: {}
+  chaos-rolling-b-6761 partitioned from 2.305070026s to 4.305982415s
+  chaos-rolling-b-6761 refused the owner: {}
+  chaos-rolling-c-6761 refused the owner: {}
+== partition 2 exit 0 stuck 0 long5 0
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47894 began_wall 1794118331794733633 ended_wall 1794118331796647474 budgets_spent_before 0 outcome Ok(())
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47896 began_wall 1794118331745722878 ended_wall 1794118331797654455 budgets_spent_before 0 outcome Ok(())
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47894 began_wall 1794118331842132327 ended_wall 1794118331845422764 budgets_spent_before 0 outcome Ok(())
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47896 began_wall 1794118331842379534 ended_wall 1794118331846225375 budgets_spent_before 0 outcome Ok(())
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47898 began_wall 1794118331745986804 ended_wall 1794118331849088273 budgets_spent_before 0 outcome Ok(())
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47898 began_wall 1794118331794998375 ended_wall 1794118331849426475 budgets_spent_before 0 outcome Ok(())
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47894 fresh_wall 1794118331897617796
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47896 fresh_wall 1794118331899136623
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47894 fresh_wall 1794118331947094240
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47896 fresh_wall 1794118331948778488
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47898 fresh_wall 1794118331949800676
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47898 fresh_wall 1794118331950622661
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47894 began_wall 1794118331997950424 ended_wall 1794118331999312453 budgets_spent_before 0 outcome Ok(())
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47896 began_wall 1794118331999363378 ended_wall 1794118332000773388 budgets_spent_before 0 outcome Ok(())
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47894 began_wall 1794118332047630654 ended_wall 1794118332049035089 budgets_spent_before 0 outcome Ok(())
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47896 began_wall 1794118332048974365 ended_wall 1794118332050276015 budgets_spent_before 0 outcome Ok(())
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47898 began_wall 1794118332050463002 ended_wall 1794118332051671234 budgets_spent_before 0 outcome Ok(())
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47898 began_wall 1794118332051669746 ended_wall 1794118332052938454 budgets_spent_before 0 outcome Ok(())
+   r2 LD-RESUME chaos-rolling-a-6761 wall_ns 1794118335712121729
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47894 fresh_wall 1794118335713936366
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47894 fresh_wall 1794118335764080562
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47894 began_wall 1794118335814193103 ended_wall 1794118335816607231 budgets_spent_before 0 outcome Ok(())
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47894 began_wall 1794118335864709268 ended_wall 1794118335866692679 budgets_spent_before 0 outcome Ok(())
+   r2 LD-SERVE at 4192623408 wall_ns 1794118335941570273 install from 7439864995062440811 bytes 7395128 took_ns 5316728 gap_ns Some(2224706802)
+   r2 LD-SERVE at 4344628584 wall_ns 1794118336092660147 install from 7439864995062440811 bytes 10140726 took_ns 4401466 gap_ns Some(146688448)
+   r2 LD-RESUME chaos-rolling-b-6761slates-cluster: fleet:  wall_ns HostId1794118337847446371(
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47896 fresh_wall 1794118337867788007
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47896 fresh_wall 1794118337920309341
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47896 began_wall 1794118337973442564 ended_wall 1794118337980289684 budgets_spent_before 0 outcome Ok(())
+   r2 LD-DIAL slates-fleet to 127.0.0.1:47896 began_wall 1794118338021060135 ended_wall 1794118338022993277 budgets_spent_before 0 outcome Ok(())
+   r2 LD-SERVE at 6270222131 wall_ns 1794118338075427520 install from 7439864995062440811 bytes 10140726 took_ns 15634629 gap_ns Some(2211655330)
+   r2 LD-SERVE at 6397329270 wall_ns 1794118338200016018 install from 7439864995062440811 bytes 16747792 took_ns 13116012 gap_ns Some(111472510)
+  4086 writes, 4086 acknowledged: p50 506 us, p99 8290 us, p999 50171 us, max 168094 us; 5 over 50ms (sent+took): 0.00s+168ms 2.09s+50ms 2.33s+153ms 4.17s+61ms 4.57s+97ms
+  chaos-rolling-a-7462 refused the owner: {}
+  chaos-rolling-b-7462 partitioned from 219.691813ms to 2.219791864s
+  chaos-rolling-b-7462 refused the owner: {}
+  chaos-rolling-c-7462 partitioned from 2.333843569s to 4.333950888s
+  chaos-rolling-c-7462 refused the owner: {}
+== partition 3 exit 0 stuck 0 long5 0
+   r3 LD-DIAL slates-fleet to 127.0.0.1:27007 began_wall 1794118338749457241 ended_wall 1794118338751049157 budgets_spent_before 0 outcome Ok(())
+   r3 LD-DIAL slates-fleet to 127.0.0.1:27009 began_wall 1794118338707386624 ended_wall 1794118338751557837 budgets_spent_before 0 outcome Ok(())
+   r3 LD-DIAL slates-fleet to 127.0.0.1:27007 began_wall 1794118338805701484 ended_wall 1794118338807757890 budgets_spent_before 0 outcome Ok(())
+   r3 LD-DIAL slates-fleet to 127.0.0.1:27009 began_wall 1794118338805950741 ended_wall 1794118338808634107 budgets_spent_before 0 outcome Ok(())
+   r3 LD-DIAL slates-fleet to 127.0.0.1:27011 began_wall 1794118338707676374 ended_wall 1794118338809546306 budgets_spent_before 0 outcome Ok(())
+   r3 LD-DIAL slates-fleet to 127.0.0.1:27011 began_wall 1794118338749703418 ended_wall 1794118338810076536 budgets_spent_before 0 outcome Ok(())
+   r3 LD-DIAL slates-fleet to 127.0.0.1:27007 fresh_wall 1794118338851772417
+   r3 LD-DIAL slates-fleet to 127.0.0.1:27009 fresh_wall 1794118338852687415
+   r3 LD-DIAL slates-fleet to 127.0.0.1:27007 fresh_wall 1794118338910224328
+   r3 LD-DIAL slates-fleet to 127.0.0.1:27009 fresh_wall 1794118338910498679
+   r3 LD-DIAL slates-fleet to 127.0.0.1:27011 fresh_wall 1794118338910955018
+   r3 LD-DIAL slates-fleet to 127.0.0.1:27011 fresh_wall 1794118338911280478
+   r3 LD-DIAL slates-fleet to 127.0.0.1:27007 began_wall 1794118338952675934 ended_wall 1794118338954300248 budgets_spent_before 0 outcome Ok(())
+   r3 LD-DIAL slates-fleet to 127.0.0.1:27009 began_wall 1794118338953297924 ended_wall 1794118338954952500 budgets_spent_before 0 outcome Ok(())
+   r3 LD-DIAL slates-fleet to 127.0.0.1:27009 began_wall 1794118339011757740 ended_wall 1794118339013998949 budgets_spent_before 0 outcome Ok(())
+   r3 LD-DIAL slates-fleet to 127LD-DIAL .slates-fleet0 to .1270..01.:027011. began_wall 11794118339011140294: ended_wall 270071794118339014424008 began_wall  budgets_spent_before 17941183390117079840 ended_wall  outcome 1794118339014436543Ok budgets_spent_before (0
+   r3 LD-DIAL slates-fleet to 127.0.0.1:27011 began_wall 1794118339011807577 ended_wall 1794118339015015688 budgets_spent_before 0 outcome Ok(())
+   r3 LD-RESUME chaos-rolling-b-7462 wall_ns 1794118341871592373
+   r3 LD-DIAL slates-fleet to 127.0.0.1:27009 fresh_wall 1794118341880750931
+   r3 LD-DIAL slates-fleet to 127.0.0.1:27009 fresh_wall 1794118341969801361
+   r3 LD-DIAL slates-fleet to 127.0.0.1:27009 began_wall 1794118341980994534 ended_wall 1794118341983063363 budgets_spent_before 0 outcome Ok(())
+   r3 LD-SERVE at 3266517372 wall_ns 1794118342018509246 install from 16391710673471241918 bytes 7865960 took_ns 5582312 gap_ns Some(2141829034)
+   r3 LD-SERVE at 3383825113 wall_ns 1794118342134628147 install from 16391710673471241918 bytes 10226476 took_ns 4393488 gap_ns Some(111725429)
+   r3 LD-RESUME chaos-rolling-c-7462 wall_ns 1794118343985743005
+   r3 LD-DIAL slates-fleet to 127.0.0.1:27009 began_wall 1794118343986397257 ended_wall 1794118343989963417 budgets_spent_before 0 outcome Ok(())
+   r3 LD-DIAL slates-fleet to 127.0.0.1:27011 fresh_wall 1794118344044104359
+   r3 LD-DIAL slates-fleet to 127.0.0.1:27011 fresh_wall 1794118344081538708
+   r3 LD-DIAL slates-fleet to 127.0.0.1:27011 began_wall 1794118344146935676 ended_wall 1794118344148664935 budgets_spent_before 0 outcome Ok(())
+   r3 LD-DIAL slates-fleet to 127.0.0.1:27011 began_wall 1794118344181771416 ended_wall 1794118344183677975 budgets_spent_before 0 outcome Ok(())
+   r3 LD-SERVE at 5407778368 wall_ns 1794118344219742256 install from 16391710673471241918 bytes 10226476 took_ns 9353193 gap_ns Some(2228400604)
+   r3 LD-SERVE at 5578029644 wall_ns 1794118344392861115 install from 16391710673471241918 bytes 17844114 took_ns 12221000 gap_ns Some(160898083)
+  3855 writes, 3855 acknowledged: p50 566 us, p99 4556 us, p999 42452 us, max 260521 us; 3 over 50ms (sent+took): 0.01s+127ms 2.16s+66ms 2.34s+261ms
+  chaos-rolling-a-8090 refused the owner: {}
+  chaos-rolling-b-8090 partitioned from 203.109758ms to 2.203232159s
+  chaos-rolling-b-8090 refused the owner: {}
+  chaos-rolling-c-8090 partitioned from 2.336610595s to 4.33676544s
+  chaos-rolling-c-8090 refused the owner: {}
+== partition 4 exit 0 stuck 0 long5 0
+   r4 LD-DIAL slates-fleet to 127.0.0.1:35173 began_wall 1794118344805309779 ended_wall 1794118344854001977 budgets_spent_before 0 outcome Ok(())
+   r4 LD-DIAL slates-fleet to 127.0.0.1:35171 began_wall 1794118344850308562 ended_wall 1794118344854394302 budgets_spent_before 0 outcome Ok(())
+   r4 LD-DIAL slates-fleet to 127.0.0.1:35171 began_wall 1794118344900265050 ended_wall 1794118344902823606 budgets_spent_before 0 outcome Ok(())
+   r4 LD-DIAL slates-fleet to 127.0.0.1:35173 began_wall 1794118344900544183 ended_wall 1794118344903014953 budgets_spent_before 0 outcome Ok(())
+   r4 LD-DIAL slates-fleet to 127.0.0.1:35175 began_wall 1794118344805579448 ended_wall 1794118344905356875 budgets_spent_before 0 outcome Ok(())
+   r4 LD-DIAL slates-fleet to 127.0.0.1:35175 began_wall 1794118344850564328 ended_wall 1794118344906327594 budgets_spent_before 0 outcome Ok(())
+   r4 LD-DIAL slates-fleet to 127.0.0.1:35171 fresh_wall 1794118344955288189
+   r4 LD-DIAL slates-fleet to 127.0.0.1:35173 fresh_wall 1794118344956219583
+   r4 LD-DIAL slates-fleet to 127.0.0.1:35171 fresh_wall 1794118345003271571
+   r4 LD-DIAL slates-fleet to 127.0.0.1:35173 fresh_wall 1794118345003598333
+   r4 LD-DIAL slates-fleet to 127.0.0.1:35175 fresh_wall 1794118345006979705
+   r4 LD-DIAL slates-fleet to 127.0.0.1:35175 fresh_wall 1794118345007287004
+   r4 LD-DIAL slates-fleet to 127.0.0.1:35171 began_wall 1794118345056028223 ended_wall 1794118345057769898 budgets_spent_before 0 outcome Ok(())
+   r4 LD-DIAL slates-fleet to 127.0.0.1:35173 began_wall 1794118345056719344 ended_wall 1794118345058448548 budgets_spent_before 0 outcome Ok(())
+   r4 LD-DIAL slates-fleet to 127.0.0.1:35171 began_wall 1794118345103880006 ended_wall 1794118345105911501 budgets_spent_before 0 outcome Ok(())
+   r4 LD-DIAL slates-fleet to 127.0.0.1:35173 began_wall 1794118345103961040 ended_wall 1794118345106221144 budgets_spent_before 0 outcome Ok(())
+   r4 LD-DIAL slates-fleet to 127.0.0.1:35175 began_wall 1794118345107538407 ended_wall 1794118345109099454 budgets_spent_before 0 outcome Ok(())
+   r4 LD-DIAL slates-fleet to 127.0.0LD-PMTU at .2142743251 trigger probe_acked before :(351757 began_wall , 17941183451076434641200 ended_wall , 179411834510956243965528 budgets_spent_before , 00 outcome , Oktrue(, ()None))
+   r4 LD-RESUME chaos-rolling-b-8090 wall_ns 1794118348897753267
+   r4 LD-DIAL slates-fleet to 127.0.0.1:35173 fresh_wall 1794118348925168013
+   r4 LD-DIAL slates-fleet to 127.0.0.1:35173 fresh_wall 1794118348978580632
+   r4 LD-DIAL slates-fleet to 127.0.0.1:35173 began_wall 1794118349025932525 ended_wall 1794118349029221159 budgets_spent_before 0 outcome Ok(())
+   r4 LD-DIAL slates-fleet to 127.0.0.1:35173 began_wall 1794118349078809483 ended_wall 1794118349080327831 budgets_spent_before 0 outcome Ok(())
+   r4 LD-SERVE at 4293055579 wall_ns 1794118349145041784 install from 11648604336484681367 bytes 6410208 took_ns 5023626 gap_ns Some(2406236527)
+   r4 LD-SERVE at 4438654223 wall_ns 1794118349290339443 install from 11648604336484681367 bytes 10528394 took_ns 4722625 gap_ns Some(140575018)
+   r4 LD-RESUME chaos-rolling-c-8090 wall_ns 1794118351031292772
+   r4 LD-DIAL slates-fleet to 127.0.0.1:35175 fresh_wall 1794118351070036074
+   r4 LD-DIAL slates-fleet to 127.0.0.1:35175 fresh_wall 1794118351099709954
+   r4 LD-DIAL slates-fleet to 127.0.0.1:35175 began_wall 1794118351170336098 ended_wall 1794118351171691726 budgets_spent_before 0 outcome Ok(())
+   r4 LD-DIAL slates-fleet to 127.0.0.1:35175 began_wall 1794118351200188185 ended_wall 1794118351201553884 budgets_spent_before 0 outcome Ok(())
+   r4 LD-SERVE at 6348689576 wall_ns 1794118351251636087 install from 11648604336484681367 bytes 10528394 took_ns 7645670 gap_ns Some(2211544684)
+   r4 LD-SERVE at 6550403423 wall_ns 1794118351457195204 install from 11648604336484681367 bytes 16898982 took_ns 11490956 gap_ns Some(194068177)
+  5800 writes, 5800 acknowledged: p50 338 us, p99 3813 us, p999 9309 us, max 175874 us; 3 over 50ms (sent+took): 0.00s+169ms 1.21s+60ms 2.34s+176ms
+  chaos-rolling-a-8786 refused the owner: {}
+  chaos-rolling-b-8786 partitioned from 208.699395ms to 2.208813363s
+  chaos-rolling-b-8786 refused the owner: {}
+  chaos-rolling-c-8786 partitioned from 2.337562921s to 4.337782941s
+  chaos-rolling-c-8786 refused the owner: {}
+== partition 5 exit 0 stuck 0 long5 0
+   r5 LD-DIAL LD-DIAL slates-fleet to 127.0.0slates-fleet. to 1127:.442190 began_wall .17941183519818799850 ended_wall .17941183519838822521 budgets_spent_before :044221 outcome  began_wall Ok1794118351935707225( ended_wall ()1794118351983872165) budgets_spent_befor
+   r5 LD-DIAL slates-fleet to 127.0.0.1:44219 began_wall 1794118352036115451 ended_wall 1794118352037973269 budgets_spent_before 0 outcome Ok(())
+   r5 LD-DIAL slates-fleet to 127.0.0.1:44221 began_wall 1794118352036380022 ended_wall 1794118352038289733 budgets_spent_before 0 outcome Ok(())
+   r5 LD-DIAL slates-fleet to 127.0.0.1:44223 began_wall 1794118351935978603 ended_wall 1794118352039628754 budgets_spent_before 0 outcome Ok(())
+   r5 LD-DIAL slates-fleet to 127.0.0.1:44223 began_wall 1794118351982132364 ended_wall 1794118352040222636 budgets_spent_before 0 outcome Ok(())
+   r5 LD-DIAL slates-fleet to 127.0.0.1:44221 fresh_wall 1794118352084373168
+   r5 LD-DIAL slates-fleet to 127.0.0.1:44219 fresh_wall 1794118352084396191
+   r5 LD-DIAL slates-fleet to 127.0.0.1:44219 fresh_wall 1794118352138972320
+   r5 LD-DIAL slates-fleet to 127.0.0.1:44221 fresh_wall 1794118352139200648
+   r5 LD-DIAL slates-fleet to 127.0.0.1:44223 fresh_wall 1794118352140959947
+   r5 LD-DIAL slates-fleet to 127.0.0.1:44223 fresh_wall 1794118352142277171
+   r5 LD-DIAL LD-DIAL slates-fleetslates-fleet to  to 127127..00..00..11::4421944221 began_wall  began_wall 17941183521848013511794118352184941174 ended_wall  ended_wall 17941183521862643581794118352186267126 budgets_spent_before  budgets_spent_before 00 outcome  ou
+   r5 LD-DIAL slates-fleet to 127.0.0.1:44219 began_wall 1794118352239320052 ended_wall 1794118352240883548 budgets_spent_before 0 outcome Ok(())
+   r5 LD-DIAL slates-fleet to 127.0.0.1:44221 began_wall 1794118352239381488 ended_wall 1794118352241139323 budgets_spent_before 0 outcome Ok(())
+   r5 LD-DIAL slates-fleet to 127.0.0.1:44223 began_wall 1794118352241203750 ended_wall 1794118352242458171 budgets_spent_before 0 outcome Ok(())
+   r5 LD-DIAL slates-fleet to 127.0.0.1:44223 began_wall 1794118352243226095 ended_wall 1794118352244426671 budgets_spent_before 0 outcome Ok(())
+   r5 LD-RESUME chaos-rolling-b-8786 wall_ns 1794118355897225079
+   r5 LD-DIAL slates-fleet to 127.0.0.1:44221 fresh_wall 1794118355899384887
+   r5 LD-DIAL slates-fleet to 127.0.0.1:44221 fresh_wall 1794118355935437051
+   r5 LD-DIAL slates-fleet to 127.0.0.1:44221 began_wall 1794118356000004977 ended_wall 1794118356002290465 budgets_spent_before 0 outcome Ok(())
+   r5 LD-SERVE at 4062472258 wall_ns 1794118356050038505 install from 13665175107407002410 bytes 12228842 took_ns 9044293 gap_ns Some(2144975772)
+   r5 LD-SERVE at 4212341640 wall_ns 1794118356201348735 install from 13665175107407002410 bytes 14530594 took_ns 10485101 gap_ns Some(140825089)
+   r5 LD-RESUME chaos-rolling-c-8786 wall_ns 1794118358026202217
+   r5 LD-DIAL slates-fleet to 127.0.0.1:44221 began_wall 1794118358026440249 ended_wall 1794118358028151176 budgets_spent_before 0 outcome Ok(())
+   r5 LD-DIAL slates-fleet to 127.0.0.1:44223 fresh_wall 1794118358108817838
+   r5 LD-DIAL slates-fleet to 127.0.0.1:44223 fresh_wall 1794118358116683269
+   r5 LD-DIAL slates-fleet to 127.0.0.1:44223 began_wall 1794118358209064043 ended_wall 1794118358216080586 budgets_spent_before 0 outcome Ok(())
+   r5 LD-DIAL slates-fleet to 127.0.0.1:44223 began_wall 1794118358242548624 ended_wall 1794118358250016457 budgets_spent_before 0 outcome Ok(())
+   r5 LD-SERVE at 6283067955 wall_ns 1794118358325385398 install from 13665175107407002410 bytes 14530594 took_ns 10069901 gap_ns Some(2290286388)
+   r5 LD-SERVE at 6512157037 wall_ns 1794118358556155977 install from 13665175107407002410 bytes 25457284 took_ns 11751094 gap_ns Some(219019181)
+  4904 writes, 4904 acknowledged: p50 411 us, p99 10439 us, p999 49124 us, max 296079 us; 4 over 50ms (sent+took): 0.00s+127ms 0.17s+165ms 2.27s+296ms 4.33s+56ms
+  chaos-rolling-a-9501 partitioned from 174.073584ms to 2.174201515s
+  chaos-rolling-a-9501 refused the owner: {}
+  chaos-rolling-b-9501 partitioned from 2.266072194s to 4.266213516s
+  chaos-rolling-b-9501 refused the owner: {}
+  chaos-rolling-c-9501 refused the owner: {}
+== partition 6 exit 0 stuck 0 long5 0
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23514 began_wall 1794118358997996864 ended_wall 1794118358999707174 budgets_spent_before 0 outcome Ok(())
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23516 began_wall 1794118358942198073 ended_wall 1794118359000079613 budgets_spent_before 0 outcome Ok(())
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23514 began_wall 1794118359053415175 ended_wall 1794118359055392500 budgets_spent_before 0 outcome Ok(())
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23516 began_wall 1794118359053668174 ended_wall 1794118359055724478 budgets_spent_before 0 outcome Ok(())
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23518 began_wall 1794118358942497510 ended_wall 1794118359056943397 budgets_spent_before 0 outcome Ok(())
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23518 began_wall 1794118358998326922 ended_wall 1794118359059360613 budgets_spent_before 0 outcome Ok(())
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23514 fresh_wall 1794118359100527397
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23516 fresh_wall 1794118359101572503
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23514 fresh_wall 1794118359155745689
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23516 fresh_wall 1794118359156160406
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23518 fresh_wall 1794118359158397738
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23518 fresh_wall 1794118359159927540
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23514 began_wall 1794118359201489594 ended_wall 1794118359203055858 budgets_spent_before 0 outcome Ok(())
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23516 began_wall 1794118359202087690 ended_wall 1794118359203730829 budgets_spent_before 0 outcome Ok(())
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23514 began_wall 1794118359256249637 ended_wall 1794118359257577197 budgets_spent_before 0 outcome Ok(())
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23516 began_wall 1794118359257328005 ended_wall 1794118359258585194 budgets_spent_before 0 outcome Ok(())
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23518 began_wall 1794118359258991055 ended_wall 1794118359260178400 budgets_spent_before 0 outcome Ok(())
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23518 began_wall 1794118359260959989 ended_wall 1794118359262666260 budgets_spent_before 0 outcome Ok(())
+   r6 LD-SERVE at 1283150805 wall_ns 1794118360278032059 install from 8157086774867823129 bytes 289992 took_ns 244512 gap_ns Some(104516474)
+   r6 LD-RESUME chaos-rolling-a-9501 wall_ns 1794118362113487502
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23514 fresh_wall 1794118362165532565
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23514 began_wall 1794118362266395673 ended_wall 1794118362267843953 budgets_spent_before 0 outcome Ok(())
+   r6 LD-SERVE at 3354365544 wall_ns 1794118362293234622 install from 8157086774867823129 bytes 289992 took_ns 120736 gap_ns Some(178819421)
+   r6 LD-SERVE at 3551643366 wall_ns 1794118362500061900 install from 8157086774867823129 bytes 13716038 took_ns 9670232 gap_ns Some(197157086)
+   r6 LD-RESUME chaos-rolling-b-9501 wall_ns 1794118364205495192
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23514 fresh_wall 1794118364206295779
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23516 fresh_wall 1794118364223976039
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23516 fresh_wall 1794118364304215540
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23514 began_wall 1794118364306543194 ended_wall 1794118364310700182 budgets_spent_before 0 outcome Ok(())
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23516 began_wall 1794118364327314162 ended_wall 1794118364328821407 budgets_spent_before 0 outcome Ok(())
+   r6 LD-DIAL slates-fleet to 127.0.0.1:23516 began_wall 1794118364407994589 ended_wall 1794118364410669708 budgets_spent_before 0 outcome Ok(())
+   r6 LD-SERVE at 5487792295 wall_ns 1794118364492257411 install from 8157086774867823129 bytes 13716038 took_ns 9828246 gap_ns Some(2277345309)
+   r6 LD-SERVE at 5747213417 wall_ns 1794118364750959388 install from 8157086774867823129 bytes 21530804 took_ns 9109149 gap_ns Some(249592876)
+  3989 writes, 3989 acknowledged: p50 511 us, p99 8333 us, p999 133851 us, max 299384 us; 4 over 50ms (sent+took): 0.00s+134ms 0.20s+141ms 2.27s+299ms 4.55s+156ms
+  chaos-rolling-a-10122 partitioned from 202.169936ms to 2.204729657s
+  chaos-rolling-a-10122 refused the owner: {}
+  chaos-rolling-b-10122 refused the owner: {}
+  chaos-rolling-c-10122 partitioned from 2.269330893s to 4.269452032s
+  chaos-rolling-c-10122 refused the owner: {}
+== partition 7 exit 0 stuck 0 long5 0
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31587 began_wall 1794118365294692904 ended_wall 1794118365296327612 budgets_spent_before 0 outcome Ok(())
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31589 began_wall 1794118365247477157 ended_wall 1794118365296827378 budgets_spent_before 0 outcome Ok(())
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31587 began_wall 1794118365352020740 ended_wall 1794118365354034039 budgets_spent_before 0 outcome Ok(())
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31589 began_wall 1794118365352292450 ended_wall 1794118365354222211 budgets_spent_before 0 outcome Ok(())
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31591 began_wall 1794118365247749451 ended_wall 1794118365355650020 budgets_spent_before 0 outcome Ok(())
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31591 began_wall 1794118365294949991 ended_wall 1794118365356293474 budgets_spent_before 0 outcome Ok(())
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31589 fresh_wall 1794118365397327221
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31587 fresh_wall 1794118365397358603
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31587 fresh_wall 1794118365455081878
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31589 fresh_wall 1794118365455336965
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31591 fresh_wall 1794118365456861152
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31591 fresh_wall 1794118365457763788
+   r7 LD-DIAL LD-DIAL slates-fleetslates-fleet to  to 127127..00..00..11::3158731589 began_wall  began_wall 17941183654977871781794118365497661195 ended_wall  ended_wall 17941183654990300641794118365499033392 budgets_spent_before  budgets_spent_before 00 outcome  ou
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31587 began_wall 1794118365556336078 ended_wall 1794118365557946652 budgets_spent_before 0 outcome Ok(())
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31589 began_wall 1794118365556387891 ended_wall 1794118365558712561 budgets_spent_before 0 outcome Ok(())
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31591 began_wall 1794118365557404744 ended_wall 1794118365559493709 budgets_spent_before 0 outcome Ok(())
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31591 began_wall 1794118365558102905 ended_wall 1794118365560074727 budgets_spent_before 0 outcome Ok(())
+   r7 LD-SERVE at 1268761365 wall_ns 1794118366616082792 install from 6613364264201965710 bytes 220920 took_ns 170252 gap_ns Some(103619620)
+   r7 LD-RESUME chaos-rolling-a-10122 wall_ns 1794118368478280159
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31587 fresh_wall 1794118368514068349
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31587 began_wall 1794118368614718270 ended_wall 1794118368616441548 budgets_spent_before 0 outcome Ok(())
+   r7 LD-SERVE at 3407023262 wall_ns 1794118368651100709 install from 6613364264201965710 bytes 220920 took_ns 91314 gap_ns Some(175119950)
+   r7 LD-SERVE at 3588788389 wall_ns 1794118368841485721 install from 6613364264201965710 bytes 12426848 took_ns 8710983 gap_ns Some(181673813)
+   r7 LD-RESUME chaos-rolling-c-10122 wall_ns 1794118370542987318
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31587 fresh_wall 1794118370545204467
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31591 fresh_wall 1794118370577496425
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31591 fresh_wall 1794118370609223933
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31587 began_wall 1794118370645481405 ended_wall 1794118370647330842 budgets_spent_before 0 outcome Ok(())
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31591 began_wall 1794118370677730606 ended_wall 1794118370679875664 budgets_spent_before 0 outcome Ok(())
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31591 began_wall 1794118370709710313 ended_wall 1794118370715584124 budgets_spent_before 0 outcome Ok(())
+   r7 LD-SERVE at 5453639124 wall_ns 1794118370812869651 install from 6613364264201965710 bytes 12426848 took_ns 12079488 gap_ns Some(2258557646)
+   r7 LD-SERVE at 5729429314 wall_ns 1794118371101067220 install from 6613364264201965710 bytes 17412668 took_ns 24486747 gap_ns Some(263710702)
+  3312 writes, 3312 acknowledged: p50 640 us, p99 6904 us, p999 28940 us, max 330030 us; 2 over 50ms (sent+took): 0.00s+156ms 2.33s+330ms
+  chaos-rolling-a-10755 refused the owner: {}
+  chaos-rolling-b-10755 partitioned from 241.412385ms to 2.244100521s
+  chaos-rolling-b-10755 refused the owner: {}
+  chaos-rolling-c-10755 partitioned from 2.331089548s to 4.331189374s
+  chaos-rolling-c-10755 refused the owner: {}
+== partition 8 exit 0 stuck 0 long5 0
+   r8 LD-DIAL slates-fleet to 127.0.0.1:39816 began_wall 1794118371574660579 ended_wall 1794118371576256345 budgets_spent_before 0 outcome Ok(())
+   r8 LD-DIAL slates-fleet to 127.0.0.1:39818 began_wall 1794118371522590426 ended_wall 1794118371576741137 budgets_spent_before 0 outcome Ok(())
+   r8 LD-DIAL slates-fleet to 127.0.0.1:39816 began_wall 1794118371635894797 ended_wall 1794118371637736779 budgets_spent_before 0 outcome Ok(())
+   r8 LD-DIAL slates-fleet to 127.0.0.1:39818 began_wall 1794118371636197225 ended_wall 1794118371640513667 budgets_spent_before 0 outcome Ok(())
+   r8 LD-DIAL slates-fleet to 127.0.0.1:39820 began_wall 1794118371574926313 ended_wall 1794118371641706628 budgets_spent_before 0 outcome Ok(())
+   r8 LD-DIAL slates-fleet to 127.0.0.1:39820 began_wall 1794118371522864552 ended_wall 1794118371642294789 budgets_spent_before 0 outcome Ok(())
+   r8 LD-DIAL slates-fleet to 127.0.0.1:39816 fresh_wall 1794118371677291920
+   r8 LD-DIAL slates-fleet to 127.0.0.1:39818 fresh_wall 1794118371677333190
+   r8 LD-DIAL slates-fleet to 127.0.0.1:39816 fresh_wall 1794118371739752001
+   r8 LD-DIAL slates-fleet to 127.0.0.1:39818 fresh_wall 1794118371743332164
+   r8 LD-DIAL slates-fleet to 127.0.0.1:39820 fresh_wall 1794118371743948436
+   r8 LD-DIAL slates-fleet to 127.0.0.1:39820 fresh_wall 1794118371744045285
+   r8 LD-DIAL slates-fleet to 127.0.0.1:39818 began_wall 1794118371777520957 ended_wall 1794118371778821855 budgets_spent_before 0 outcome Ok(())
+   r8 LD-DIAL slates-fleet to 127.0.0.1:39816 began_wall 1794118371777517325 ended_wall 1794118371778859940 budgets_spent_before 0 outcome Ok(())
+   r8 LD-DIAL slates-fleet to 127.0.0.1:39816 began_wall 1794118371840471510 ended_wall 1794118371842110497 budgets_spent_before 0 outcome Ok(())
+   r8 LD-DIAL slates-fleet to 127.0.0.1:39818 began_wall 1794118371843517492 ended_wall 1794118371845040271 budgets_spent_before 0 outcome Ok(())
+   r8 LD-DIAL slates-fleet to 127.0.0.1:39820 began_wall 1794118371844126988 ended_wall 1794118371845896406 budgets_spent_before 0 outcome Ok(())
+   r8 LD-DIAL LD-PMTU at slates-fleet214657709 to  trigger probe_acked before (1277., 01200., 065528., 10:, 39820true began_wall , 1794118371844569022None ended_wall )1794118371846261398 after  budgets_spent_before (07 outcome , Ok33364(, ()65528), 
+   r8 LD-RESUME chaos-rolling-b-10755 wall_ns 1794118374727289503
+   r8 LD-DIAL slates-fleet to 127.0.0.1:39818 fresh_wall 1794118374774962422
+   r8 LD-DIAL slates-fleet to 127.0.0.1:39818 fresh_wall 1794118374786816650
+   r8 LD-DIAL slates-fleet to 127.0.0.1:39818 began_wall 1794118374887067932 ended_wall 1794118374888398285 budgets_spent_before 0 outcome Ok(())
+   r8 LD-SERVE at 3430255117 wall_ns 1794118375004191129 install from 7197774603019477846 bytes 4556954 took_ns 3239331 gap_ns Some(2460159583)
+   r8 LD-SERVE at 3568202327 wall_ns 1794118375144884950 install from 7197774603019477846 bytes 8230036 took_ns 5985950 gap_ns Some(134707879)
+   r8 LD-RESUME chaos-rolling-c-10755 wall_ns 1794118376814377221
+   r8 LD-DIAL slates-fleet to 127.0.0.1:39818 began_wall 1794118376815927591 ended_wall 1794118376819827854 budgets_spent_before 0 outcome Ok(())
+   r8 LD-DIAL slates-fleet to 127.0.0.1:39820 fresh_wall 1794118376836960822
+   r8 LD-DIAL slates-fleet to 127.0.0.1:39820 fresh_wall 1794118376862549594
+   r8 LD-DIAL slates-fleet to 127.0.0.1:39820 began_wall 1794118376938276003 ended_wall 1794118376939846932 budgets_spent_before 0 outcome Ok(())
+   r8 LD-DIAL slates-fleet to 127.0.0.1:39820 began_wall 1794118376962772735 ended_wall 1794118376965743691 budgets_spent_before 0 outcome Ok(())
+   r8 LD-SERVE at 5378190951 wall_ns 1794118377017715031 install from 7197774603019477846 bytes 8230036 took_ns 7916015 gap_ns Some(2196322129)
+   r8 LD-SERVE at 5539756631 wall_ns 1794118377182008844 install from 7197774603019477846 bytes 14496470 took_ns 10644188 gap_ns Some(153649665)
+  6581 writes, 6581 acknowledged: p50 325 us, p99 4437 us, p999 18474 us, max 545533 us; 4 over 50ms (sent+took): 0.00s+132ms 2.04s+71ms 2.19s+546ms 3.15s+61ms
+  chaos-rolling-a-11358 partitioned from 152.276083ms to 2.152572845s
+  chaos-rolling-a-11358 refused the owner: {}
+  chaos-rolling-b-11358 partitioned from 2.187869291s to 4.188541731s
+  chaos-rolling-b-11358 refused the owner: {}
+  chaos-rolling-c-11358 refused the owner: {}
+== partition 9 exit 0 stuck 0 long5 0
+   r9 LD-DIAL slates-fleet to 127.0.0.1:47655 began_wall 1794118377685278613 ended_wall 1794118377687073710 budgets_spent_before 0 outcome Ok(())
+   r9 LD-DIAL slates-fleet to 127.0.0.1:47657 began_wall 1794118377639770239 ended_wall 1794118377687845924 budgets_spent_before 0 outcome Ok(())
+   r9 LD-DIAL slates-fleet to 127.0.0.1:47657 began_wall 1794118377733843153 ended_wall 1794118377735467814 budgets_spent_before 0 outcome Ok(())
+   r9 LD-DIAL slates-fleet to 127.0.0.1:47655 began_wall 1794118377733620423 ended_wall 1794118377735811911 budgets_spent_before 0 outcome Ok(())
+   r9 LD-DIAL slates-fleet to 127.0.0.1:47659 began_wall 1794118377640039030 ended_wall 1794118377737979728 budgets_spent_before 0 outcome Ok(())
+   r9 LD-DIAL slates-fleet to 127.0.0.1:47659 began_wall 1794118377685671987 ended_wall 1794118377739183713 budgets_spent_before 0 outcome Ok(())
+   r9 LD-DIAL slates-fleet to 127.0.0.1:47655 fresh_wall 1794118377788035258
+   r9 LD-DIAL slates-fleet to 127.0.0.1:47657 fresh_wall 1794118377788938375
+   r9 LD-DIAL slates-fleet to 127.0.0.1:47657 fresh_wall 1794118377835739503
+   r9 LD-DIAL slates-fleet to 127.0.0.1:47655 fresh_wall 1794118377836481246
+   r9 LD-DIAL slates-fleet to 127.0.0.1:47659 fresh_wall 1794118377840404668
+   r9 LD-DIAL slates-fleet to 127.0.0.1:47659 fresh_wall 1794118377840536243
+   r9 LD-DIAL LD-DIAL slates-fleetslates-fleet to  to 127127..00..00..11::4765747655 began_wall  began_wall 17941183778893821731794118377889243446 ended_wall 1794118377890585958 ended_wall  budgets_spent_before 17941183778906008130 budgets_spent_before  outcome 0 ou
+   r9 LD-DIAL slates-fleet to 127.0.0.1:47657 began_wall 1794118377936535422 ended_wall 1794118377937893628 budgets_spent_before 0 outcome Ok(())
+   r9 LD-DIAL slates-fleet to 127.0.0.1:47655 began_wall 1794118377937649637 ended_wall 1794118377938914609 budgets_spent_before 0 outcome Ok(())
+   r9 LD-DIAL slates-fleet to 127.0.0.1:47659 began_wall 1794118377940709915 ended_wall 1794118377941988559 budgets_spent_before 0 outcome Ok(())
+   r9 LD-DIAL LD-PMTU at slates-fleet214084544 to  trigger probe_acked before 127(.70, .12000, .655281, :047659,  began_wall true1794118377940808693,  ended_wall None1794118377942444569) budgets_spent_before  after 0( outcome 7Ok, (33364()), 
+   r9 LD-RESUME chaos-rolling-a-11358 wall_ns 1794118380870138637
+   r9 LD-DIAL slates-fleet to 127.0.0.1:47655 fresh_wall 1794118380897332254
+   r9 LD-DIAL slates-fleet to 127.0.0.1:47655 fresh_wall 1794118380948972278
+   r9 LD-DIAL slates-fleet to 127.0.0.1:47655 began_wall 1794118381050000684 ended_wall 1794118381051424837 budgets_spent_before 0 outcome Ok(())
+   r9 LD-SERVE at 3792607099 wall_ns 1794118381443892219 install from 12588124168514273232 bytes 22945088 took_ns 14918641 gap_ns Some(285961268)
+   r9 LD-RESUME chaos-rolling-b-11358 wall_ns 1794118382906098268
+   r9 LD-DIAL slates-fleet to 127.0.0.1:47655 began_wall 1794118382906685653 ended_wall 1794118382909230116 budgets_spent_before 0 outcome Ok(())
+   r9 LD-DIAL slates-fleet to 127.0.0.1:47657 fresh_wall 1794118382970558328
+   r9 LD-DIAL slates-fleet to 127.0.0.1:47657 fresh_wall 1794118382979945192
+   r9 LD-DIAL slates-fleet to 127.0.0.1:47657 began_wall 1794118383072270952 ended_wall 1794118383076848928 budgets_spent_before 0 outcome Ok(())
+   r9 LD-DIAL slates-fleet to 127.0.0.1:47657 began_wall 1794118383080285188 ended_wall 1794118383081696350 budgets_spent_before 0 outcome Ok(())
+  3315 writes, 3315 acknowledged: p50 679 us, p99 4285 us, p999 30566 us, max 248813 us; 2 over 50ms (sent+took): 0.00s+115ms 2.26s+249ms
+  chaos-rolling-a-12269 partitioned from 150.703857ms to 2.150806073s
+  chaos-rolling-a-12269 refused the owner: {}
+  chaos-rolling-b-12269 refused the owner: {}
+  chaos-rolling-c-12269 partitioned from 2.261446332s to 4.261650189s
+  chaos-rolling-c-12269 refused the owner: {}
+== partition 10 exit 0 stuck 0 long5 0
+   r10 LD-DIAL slates-fleet to 127.0.0.1:29498 began_wall 1794118387081014893 ended_wall 1794118387082880585 budgets_spent_before 0 outcome Ok(())
+   r10 LD-DIAL slates-fleet to 127.0.0.1:29500 began_wall 1794118387034018224 ended_wall 1794118387083231289 budgets_spent_before 0 outcome Ok(())
+   r10 LD-DIAL slates-fleet to 127.0.0.1:29498 began_wall 1794118387128649295 ended_wall 1794118387130580151 budgets_spent_before 0 outcome Ok(())
+   r10 LD-DIAL slates-fleet to 127.0.0.1:29500 began_wall 1794118387128895263 ended_wall 1794118387131677038 budgets_spent_before 0 outcome Ok(())
+   r10 LD-DIAL slates-fleet to 127.0.0.1:29502 began_wall 1794118387034329795 ended_wall 1794118387133164955 budgets_spent_before 0 outcome Ok(())
+   r10 LD-DIAL slates-fleet to 127.0.0.1:29498 fresh_wall 1794118387183781407
+   r10 LD-DIAL slates-fleet to 127.0.0.1:29500 fresh_wall 1794118387184175365
+   r10 LD-DIAL slates-fleet to 127.0.0.1:29498 fresh_wall 1794118387232470923
+   r10 LD-DIAL slates-fleet to 127.0.0.1:29500 fresh_wall 1794118387232747105
+   r10 LD-DIAL slates-fleet to 127.0.0.1:29502 fresh_wall 1794118387234764379
+   r10 LD-DIAL slates-fleet to 127.0.0.1:29502 fresh_wall 1794118387235257906
+   r10 LD-DIAL LD-DIAL slates-fleetslates-fleet to  to 127127..00..00..11::2949829500 began_wall  began_wall 17941183872846562471794118387284522880 ended_wall  ended_wall 17941183872860035661794118387286003510 budgets_spent_before  budgets_spent_before 00 outcome  ou
+   r10 LD-DIAL slates-fleet to 127.0.0.1:29498 began_wall 1794118387332810423 ended_wall 1794118387334302868 budgets_spent_before 0 outcome Ok(())
+   r10 LD-DIAL slates-fleet to 127.0.0.1:29500 began_wall 1794118387334035046 ended_wall 1794118387335689720 budgets_spent_before 0 outcome Ok(())
+   r10 LD-DIAL slates-fleet to 127.0.0.1:29502 began_wall 1794118387335377732 ended_wall 1794118387337025871 budgets_spent_before 0 outcome Ok(())
+   r10 LD-DIAL slates-fleet to 127.0.0.1:29502 began_wall 1794118387335559096 ended_wall 1794118387337648334 budgets_spent_before 0 outcome Ok(())
+   r10 LD-RESUME chaos-rolling-a-12269 wall_ns 1794118391153836015
+   r10 LD-DIAL slates-fleet to 127.0.0.1:29498 fresh_wall 1794118391171661236
+   r10 LD-DIAL slates-fleet to 127.0.0.1:29498 fresh_wall 1794118391208452490
+   r10 LD-DIAL slates-fleet to 127.0.0.1:29498 began_wall 1794118391308693957 ended_wall 1794118391310175899 budgets_spent_before 0 outcome Ok(())
+   r10 LD-SERVE at 4327254390 wall_ns 1794118391361998527 install from 10728533202187137416 bytes 6211382 took_ns 4346392 gap_ns Some(202747111)
+   r10 LD-SERVE at 4476181620 wall_ns 1794118391513315208 install from 10728533202187137416 bytes 8752282 took_ns 6735955 gap_ns Some(144580838)
+   r10 LD-RESUME chaos-rolling-c-12269 wall_ns 1794118393264677083
+   r10 LD-DIAL slates-fleet to 127.0.0.1:29498 began_wall 1794118393264610735 ended_wall 1794118393267375840 budgets_spent_before 0 outcome Ok(())
+   r10 LD-DIAL slates-fleet to 127.0.0.1:29502 fresh_wall 1794118393277609603
+   r10 LD-DIAL slates-fleet to 127.0.0.1:29502 fresh_wall 1794118393359672168
+   r10 LD-DIAL slates-fleet to 127.0.0.1:29502 began_wall 1794118393378340893 ended_wall 1794118393379906390 budgets_spent_before 0 outcome Ok(())
+   r10 LD-SERVE at 6297281433 wall_ns 1794118393426996779 install from 10728533202187137416 bytes 8752282 took_ns 6781351 gap_ns Some(2156185581)
+   r10 LD-DIAL slates-fleet to 127.0.0.1:29502 began_wall 1794118393460186960 ended_wall 1794118393461654311 budgets_spent_before 0 outcome Ok(())
+   r10 LD-SERVE at 6467468393 wall_ns 1794118393600935915 install from 10728533202187137416 bytes 14523992 took_ns 10533471 gap_ns Some(163405609)
+  5495 writes, 5495 acknowledged: p50 428 us, p99 3827 us, p999 12761 us, max 522162 us; 2 over 50ms (sent+took): 0.00s+200ms 2.27s+522ms
+  chaos-rolling-a-12984 refused the owner: {}
+  chaos-rolling-b-12984 partitioned from 245.199031ms to 2.245311193s
+  chaos-rolling-b-12984 refused the owner: {}
+  chaos-rolling-c-12984 partitioned from 2.273666457s to 4.273787778s
+  chaos-rolling-c-12984 refused the owner: {}
+== partition 11 exit 0 stuck 0 long5 0
+   r11 LD-DIAL slates-fleet to 127.0.0.1:38793 began_wall 1794118394140172108 ended_wall 1794118394141816671 budgets_spent_before 0 outcome Ok(())
+   r11 LD-DIAL slates-fleet to 127.0.0.1:38795 began_wall 1794118394096080184 ended_wall 1794118394142316662 budgets_spent_before 0 outcome Ok(())
+   r11 LD-DIAL slates-fleet to 127.0.0.1:38793 began_wall 1794118394185223968 ended_wall 1794118394187660327 budgets_spent_before 0 outcome Ok(())
+   r11 LD-DIAL slates-fleet to 127.0.0.1:38795 began_wall 1794118394185501886 ended_wall 1794118394187869210 budgets_spent_before 0 outcome Ok(())
+   r11 LD-DIAL slates-fleet to 127.0.0.1:38797 began_wall 1794118394096361973 ended_wall 1794118394189968391 budgets_spent_before 0 outcome Ok(())
+   r11 LD-DIAL slates-fleet to 127.0.0.1:38797 began_wall 1794118394140446202 ended_wall 1794118394191088661 budgets_spent_before 0 outcome Ok(())
+   r11 LD-DIAL slates-fleet to 127.0.0.1:38793 fresh_wall 1794118394242713934
+   r11 LD-DIAL slates-fleet to 127.0.0.1:38795 fresh_wall 1794118394243252795
+   r11 LD-DIAL slates-fleet to 127.0.0.1:38795 fresh_wall 1794118394288471076
+   r11 LD-DIAL slates-fleet to 127.0.0.1:38793 fresh_wall 1794118394289762399
+   r11 LD-DIAL slates-fleet to 127.0.0.1:38797 fresh_wall 1794118394290931297
+   r11 LD-DIAL slates-fleet to 127.0.0.1:38797 fresh_wall 1794118394292958891
+   r11 LD-DIAL slates-fleet to 127.0.0.1:38793 began_wall 1794118394343136117 ended_wall 1794118394344771240 budgets_spent_before 0 outcome Ok(())
+   r11 LD-DIAL slates-fleet to 127.0.0.1:38795 began_wall 1794118394343739725 ended_wall 1794118394345415422 budgets_spent_before 0 outcome Ok(())
+   r11 LD-DIAL slates-fleet to 127.0.0.1:38795 began_wall 1794118394389245331 ended_wall 1794118394390583403 budgets_spent_before 0 outcome Ok(())
+   r11 LD-DIAL slates-fleet to 127.0.0.1:38797 began_wall 1794118394391367959 ended_wall 1794118394393160288 budgets_spent_before 0 outcome Ok(())
+   r11 LD-DIAL slates-fleet to 127.0.0.1:38797 began_wall 1794118394394054285 ended_wall 1794118394395316873 budgets_spent_before 0 outcome Ok(())
+   r11 LD-RESUME chaos-rolling-b-12984 wall_ns 1794118398064520079
+   r11 LD-DIAL slates-fleet to 127.0.0.1:38795 fresh_wall 1794118398174461592
+   r11 LD-DIAL slates-fleet to 127.0.0.1:38795 began_wall 1794118398275299153 ended_wall 1794118398276641159 budgets_spent_before 0 outcome Ok(())
+   r11 LD-SERVE at 4463582996 wall_ns 1794118398613455645 install from 4452599765064079006 bytes 18196558 took_ns 12773354 gap_ns Some(223384423)
+   r11 LD-RESUME chaos-rolling-c-12984 wall_ns 1794118400092990841
+   r11 LD-DIAL slates-fleet to 127.0.0.1:38795 fresh_wall 1794118400093988438
+   r11 LD-DIAL slates-fleet to 127.0.0.1:38797 fresh_wall 1794118400153573566
+   r11 LD-DIAL slates-fleet to 127.0.0.1:38797 fresh_wall 1794118400176671165
+   r11 LD-DIAL slates-fleet to 127.0.0.1:38795 began_wall 1794118400194464895 ended_wall 1794118400195929262 budgets_spent_before 0 outcome Ok(())
+   r11 LD-DIAL slates-fleet to 127.0.0.1:38797 began_wall 1794118400259212342 ended_wall 1794118400260790165 budgets_spent_before 0 outcome Ok(())
+   r11 LD-DIAL slates-fleet to 127.0.0.1:38797 began_wall 1794118400277521758 ended_wall 1794118400281134484 budgets_spent_before 0 outcome Ok(())
+   r11 LD-SERVE at 6144161548 wall_ns 1794118400337702446 install from 4452599765064079006 bytes 18196558 took_ns 12437881 gap_ns Some(2232623054)
+   r11 LD-SERVE at 6367393757 wall_ns 1794118400559427131 install from 4452599765064079006 bytes 24121882 took_ns 10930389 gap_ns Some(210794328)
+  5286 writes, 5286 acknowledged: p50 337 us, p99 4881 us, p999 21184 us, max 301120 us; 4 over 50ms (sent+took): 0.00s+190ms 1.21s+56ms 2.14s+82ms 2.33s+301ms
+  chaos-rolling-a-13691 refused the owner: {}
+  chaos-rolling-b-13691 partitioned from 214.674605ms to 2.214746666s
+  chaos-rolling-b-13691 refused the owner: {}
+  chaos-rolling-c-13691 partitioned from 2.331602396s to 4.331702045s
+  chaos-rolling-c-13691 refused the owner: {}
+== partition 12 exit 0 stuck 0 long5 0
+   r12 LD-DIAL slates-fleet to 127.0.0.1:47984 began_wall 1794118400989452601 ended_wall 1794118400991056838 budgets_spent_before 0 outcome Ok(())
+   r12 LD-DIAL slates-fleet to 127.0.0.1:47986 began_wall 1794118400945754523 ended_wall 1794118400991647078 budgets_spent_before 0 outcome Ok(())
+   r12 LD-DIAL slates-fleet to 127.0.0.1:47986 began_wall 1794118401036212930 ended_wall 1794118401037591166 budgets_spent_before 0 outcome Ok(())
+   r12 LD-DIAL slates-fleet to 127.0.0.1:47984 began_wall 1794118401035967842 ended_wall 1794118401039111200 budgets_spent_before 0 outcome Ok(())
+   r12 LD-DIAL slates-fleet to 127.0.0.1:47988 began_wall 1794118400946018769 ended_wall 1794118401041604738 budgets_spent_before 0 outcome Ok(())
+   r12 LD-DIAL slates-fleet to 127.0.0.1:47988 began_wall 1794118400989692705 ended_wall 1794118401042302595 budgets_spent_before 0 outcome Ok(())
+   r12 LD-DIAL slates-fleet to 127.0.0.1:47984 fresh_wall 1794118401091463276
+   r12 LD-DIAL slates-fleet to 127.0.0.1:47986 fresh_wall 1794118401092191523
+   r12 LD-DIAL slates-fleet to 127.0.0.1:47986 fresh_wall 1794118401139031183
+   r12 LD-DIAL slates-fleet to 127.0.0.1:47984 fresh_wall 1794118401139947018
+   r12 LD-DIAL slates-fleet to 127.0.0.1:47988 fresh_wall 1794118401143670393
+   r12 LD-DIAL slates-fleet to 127.0.0.1:47988 fresh_wall 1794118401143727725
+   r12 LD-DIAL LD-DIAL slates-fleetslates-fleet to  to 127127..00..00..11::4798447986 began_wall  began_wall 17941184011922557601794118401192422885 ended_wall 1794118401193673905 ended_wall  budgets_spent_before 17941184011936740330 budgets_spent_before  outcome 0Ok 
+   r12 LD-DIAL slates-fleet to 127.0.0.1:47986 began_wall 1794118401239390520 ended_wall 1794118401240764812 budgets_spent_before 0 outcome Ok(())
+   r12 LD-DIAL slates-fleet to 127.0.0.1:47984 began_wall 1794118401240515885 ended_wall 1794118401241804407 budgets_spent_before 0 outcome Ok(())
+   r12 LD-DIAL slates-fleet to 127.0.0.1:47988 began_wall 1794118401243975342 ended_wall 1794118401245362089 budgets_spent_before 0 outcome Ok(())
+   r12 LD-DIAL slates-fleet to 127.0.0.1:47988 began_wall 1794118401244026426 ended_wall 1794118401245947778 budgets_spent_before 0 outcome Ok(())
+   r12 LD-RESUME chaos-rolling-b-13691 wall_ns 1794118404082264769
+   r12 LD-DIAL slates-fleet to 127.0.0.1:47986 fresh_wall 1794118404132367091
+   r12 LD-DIAL slates-fleet to 127.0.0.1:47986 fresh_wall 1794118404143499203
+   r12 LD-DIAL slates-fleet to 127.0.0.1:47986 began_wall 1794118404244023745 ended_wall 1794118404245340929 budgets_spent_before 0 outcome Ok(())
+   r12 LD-SERVE at 3351161365 wall_ns 1794118404345477420 install from 11015494957563670624 bytes 11693372 took_ns 8068848 gap_ns Some(252426393)
+   r12 LD-SERVE at 3504840511 wall_ns 1794118404500717543 install from 11015494957563670624 bytes 13888892 took_ns 9629681 gap_ns Some(145610298)
+   r12 LD-RESUME chaos-rolling-c-13691 wall_ns 1794118406199217964
+   r12 LD-DIAL slates-fleet to 127.0.0.1:47986 began_wall 1794118406199288040 ended_wall 1794118406201005382 budgets_spent_before 0 outcome Ok(())
+   r12 LD-DIAL slates-fleet to 127.0.0.1:47988 fresh_wall 1794118406278846373
+   r12 LD-DIAL slates-fleet to 127.0.0.1:47988 fresh_wall 1794118406288382180
+   r12 LD-DIAL slates-fleet to 127.0.0.1:47988 began_wall 1794118406379127147 ended_wall 1794118406380594618 budgets_spent_before 0 outcome Ok(())
+   r12 LD-DIAL slates-fleet to 127.0.0.1:47988 began_wall 1794118406388597975 ended_wall 1794118406391802235 budgets_spent_before 0 outcome Ok(())
+   r12 LD-SERVE at 5431235879 wall_ns 1794118406472637803 install from 11015494957563670624 bytes 13888892 took_ns 9324981 gap_ns Some(2264344976)
+   r12 LD-SERVE at 5657971789 wall_ns 1794118406706626929 install from 11015494957563670624 bytes 23179436 took_ns 16578277 gap_ns Some(217410929)
+  5831 writes, 5831 acknowledged: p50 384 us, p99 7391 us, p999 46629 us, max 373605 us; 5 over 50ms (sent+took): 0.00s+173ms 0.22s+165ms 2.27s+374ms 3.15s+53ms 4.31s+57ms
+  chaos-rolling-a-14320 refused the owner: {}
+  chaos-rolling-b-14320 partitioned from 217.952053ms to 2.21806126s
+  chaos-rolling-b-14320 refused the owner: {}
+  chaos-rolling-c-14320 partitioned from 2.271983237s to 4.27221986s
+  chaos-rolling-c-14320 refused the owner: {}
+== partition 13 exit 0 stuck 0 long5 0
+   r13 LD-DIAL slates-fleet to 127.0.0.1:26161 began_wall 1794118407335578642 ended_wall 1794118407337102853 budgets_spent_before 0 outcome Ok(())
+   r13 LD-DIAL slates-fleet to 127.0.0.1:26163 began_wall 1794118407289269321 ended_wall 1794118407337870938 budgets_spent_before 0 outcome Ok(())
+   r13 LD-DIAL slates-fleet to 127.0.0.1:26161 began_wall 1794118407380212315 ended_wall 1794118407382129227 budgets_spent_before 0 outcome Ok(())
+   r13 LD-DIAL slates-fleet to 127.0.0.1:26163 began_wall 1794118407380469770 ended_wall 1794118407382434231 budgets_spent_before 0 outcome Ok(())
+   r13 LD-DIAL slates-fleet to 127.0.0.1:26165 began_wall 1794118407289538199 ended_wall 1794118407383751752 budgets_spent_before 0 outcome Ok(())
+   r13 LD-DIAL slates-fleet to 127.0.0.1:26165 began_wall 1794118407335793908 ended_wall 1794118407384658812 budgets_spent_before 0 outcome Ok(())
+   r13 LD-DIAL slates-fleet to 127.0.0.1:26161 fresh_wall 1794118407437515995
+   r13 LD-DIAL slates-fleet to 127.0.0.1:26163 fresh_wall 1794118407438439862
+   r13 LD-DIAL slates-fleet to 127.0.0.1:26161 fresh_wall 1794118407482554720
+   r13 LD-DIAL slates-fleet to 127.0.0.1:26163 fresh_wall 1794118407482775121
+   r13 LD-DIAL slates-fleet to 127.0.0.1:26165 fresh_wall 1794118407484432867
+   r13 LD-DIAL slates-fleet to 127.0.0.1:26165 fresh_wall 1794118407486441334
+   r13 LD-DIAL LD-DIAL slates-fleetslates-fleet to  to 127127..00..00..11::2616126163 began_wall  began_wall 17941184075387110611794118407538834677 ended_wall  ended_wall 17941184075400702111794118407540070083 budgets_spent_before  budgets_spent_before 00 outcome  ou
+   r13 LD-DIAL slates-fleet to 127.0.0.1:26161 began_wall 1794118407582808553 ended_wall 1794118407584221324 budgets_spent_before 0 outcome Ok(())
+   r13 LD-DIAL slates-fleet to 127.0.0.1:26163 began_wall 1794118407582934857 ended_wall 1794118407585980503 budgets_spent_before 0 outcome Ok(())
+   r13 LD-DIAL slates-fleet to 127.0.0.1:26165 began_wall 1794118407584663830 ended_wall 1794118407586054506 budgets_spent_before 0 outcome Ok(())
+   r13 LD-DIAL slates-fleet to 127.0.0.1:26165 began_wall 1794118407586713310 ended_wall 1794118407588616928 budgets_spent_before 0 outcome Ok(())
+   r13 LD-SERVE at 1240783410 wall_ns 1794118408618032457 install from 10561984828883902650 bytes 285676 took_ns 210834 gap_ns Some(105359406)
+   r13 LD-RESUME chaos-rolling-b-14320 wall_ns 1794118410453155467
+   r13 LD-DIAL slates-fleet to 127.0.0.1:26163 fresh_wall 1794118410464763042
+   r13 LD-DIAL slates-fleet to 127.0.0.1:26163 began_wall 1794118410567201498 ended_wall 1794118410568577462 budgets_spent_before 0 outcome Ok(())
+   r13 LD-SERVE at 3534275789 wall_ns 1794118410879203034 install from 10561984828883902650 bytes 18683808 took_ns 13681108 gap_ns Some(224168937)
+   r13 LD-RESUME chaos-rolling-c-14320 wall_ns 1794118412507306748
+   r13 LD-DIAL slates-fleet to 127.0.0.1:26163 fresh_wall 1794118412507828162
+   r13 LD-DIAL slates-fleet to 127.0.0.1:26165 fresh_wall 1794118412539997580
+   r13 LD-DIAL slates-fleet to 127.0.0.1:26165 fresh_wall 1794118412561284402
+   r13 LD-DIAL slates-fleet to 127.0.0.1:26163 began_wall 1794118412608502288 ended_wall 1794118412614706204 budgets_spent_before 0 outcome Ok(())
+   r13 LD-DIAL slates-fleet to 127.0.0.1:26165 began_wall 1794118412640703552 ended_wall 1794118412643348212 budgets_spent_before 0 outcome Ok(())
+   r13 LD-DIAL slates-fleet to 127.0.0.1:26165 began_wall 1794118412662118790 ended_wall 1794118412663704927 budgets_spent_before 0 outcome Ok(())
+   r13 LD-SERVE at 5337276251 wall_ns 1794118412728982149 install from 10561984828883902650 bytes 18683808 took_ns 14667925 gap_ns Some(2207314175)
+   r13 LD-SERVE at 5667140649 wall_ns 1794118413056763403 install from 10561984828883902650 bytes 25595630 took_ns 12584557 gap_ns Some(315196473)
+  4060 writes, 4060 acknowledged: p50 526 us, p99 4473 us, p999 23758 us, max 283613 us; 2 over 50ms (sent+took): 0.00s+119ms 2.27s+284ms
+  chaos-rolling-a-14929 partitioned from 168.807338ms to 2.168946787s
+  chaos-rolling-a-14929 refused the owner: {}
+  chaos-rolling-b-14929 partitioned from 2.267304384s to 4.267519211s
+  chaos-rolling-b-14929 refused the owner: {}
+  chaos-rolling-c-14929 refused the owner: {}
+== partition 14 exit 0 stuck 0 long5 0
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34078 began_wall 1794118413510457412 ended_wall 1794118413512142950 budgets_spent_before 0 outcome Ok(())
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34080 began_wall 1794118413460073596 ended_wall 1794118413513418643 budgets_spent_before 0 outcome Ok(())
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34080 began_wall 1794118413557655163 ended_wall 1794118413561049606 budgets_spent_before 0 outcome Ok(())
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34078 began_wall 1794118413557369598 ended_wall 1794118413561227811 budgets_spent_before 0 outcome Ok(())
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34082 began_wall 1794118413510728186 ended_wall 1794118413562374160 budgets_spent_before 0 outcome Ok(())
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34082 began_wall 1794118413460367744 ended_wall 1794118413562702003 budgets_spent_before 0 outcome Ok(())
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34078 fresh_wall 1794118413612864593
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34080 fresh_wall 1794118413614067643
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34080 fresh_wall 1794118413662507001
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34082 fresh_wall 1794118413662970267
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34078 fresh_wall 1794118413663264376
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34082 fresh_wall 1794118413663631816
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34078 began_wall 1794118413714109458 ended_wall 1794118413715764542 budgets_spent_before 0 outcome Ok(())
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34080 began_wall 1794118413714750304 ended_wall 1794118413716437634 budgets_spent_before 0 outcome Ok(())
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34080 began_wall 1794118413763241860 ended_wall 1794118413765644599 budgets_spent_before 0 outcome Ok(())
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34082 began_wall 1794118413763356244 ended_wall 1794118413765716266 budgets_spent_before 0 outcome Ok(())
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34078 began_wall 1794118413763472749 ended_wall 1794118413765990337 budgets_spent_before 0 outcome Ok(())
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34082 began_wall 1794118413763854172 ended_wall 1794118413766334098 budgets_spent_before 0 outcome Ok(())
+   r14 LD-RESUME chaos-rolling-a-14929 wall_ns 1794118417424884993
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34078 fresh_wall 1794118417477862784
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34078 fresh_wall 1794118417490390633
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34078 began_wall 1794118417578136000 ended_wall 1794118417579530462 budgets_spent_before 0 outcome Ok(())
+   r14 LD-SERVE at 4182985403 wall_ns 1794118417643307206 install from 11195371111205612165 bytes 5204782 took_ns 3437896 gap_ns Some(2362374379)
+   r14 LD-SERVE at 4343046671 wall_ns 1794118417803776671 install from 11195371111205612165 bytes 9634872 took_ns 3846213 gap_ns Some(156623372)
+   r14 LD-RESUME chaos-rolling-b-14929 wall_ns 1794118419523453010
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34078 began_wall 1794118419524102160 ended_wall 1794118419529985089 budgets_spent_before 0 outcome Ok(())
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34080 fresh_wall 1794118419531297707
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34080 fresh_wall 1794118419584666689
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34080 began_wall 1794118419631531430 ended_wall 1794118419634409131 budgets_spent_before 0 outcome Ok(())
+   r14 LD-DIAL slates-fleet to 127.0.0.1:34080 began_wall 1794118419684953536 ended_wall 1794118419707134756 budgets_spent_before 0 outcome Ok(())
+   r14 LD-SERVE at 6239049018 wall_ns 1794118419752780337 install from 11195371111205612165 bytes 9634872 took_ns 7012896 gap_ns Some(2223325031)
+   r14 LD-SERVE at 6430130067 wall_ns 1794118419950024504 install from 11195371111205612165 bytes 17806554 took_ns 13176038 gap_ns Some(184068153)
+  3382 writes, 3382 acknowledged: p50 437 us, p99 4678 us, p999 51209 us, max 404202 us; 4 over 50ms (sent+took): 0.00s+164ms 1.22s+51ms 2.09s+67ms 2.32s+404ms
+  chaos-rolling-a-15620 refused the owner: {}
+  chaos-rolling-b-15620 partitioned from 215.470257ms to 2.21568696s
+  chaos-rolling-b-15620 refused the owner: {}
+  chaos-rolling-c-15620 partitioned from 2.323993971s to 4.324215233s
+  chaos-rolling-c-15620 refused the owner: {}
+== partition 15 exit 0 stuck 0 long5 0
+   r15 LD-DIAL slates-fleet to 127.0.0.1:43061 began_wall 1794118420484668917 ended_wall 1794118420486402291 budgets_spent_before 0 outcome Ok(())
+   r15 LD-DIAL slates-fleet to 127.0.0.1:43063 began_wall 1794118420438863389 ended_wall 1794118420487583550 budgets_spent_before 0 outcome Ok(())
+   r15 LD-DIAL slates-fleet to 127.0.0.1:43063 began_wall 1794118420533339002 ended_wall 1794118420535529226 budgets_spent_before 0 outcome Ok(())
+   r15 LD-DIAL slates-fleet to 127.0.0.1:43061 began_wall 1794118420533075203 ended_wall 1794118420538223810 budgets_spent_before 0 outcome Ok(())
+   r15 LD-DIAL slates-fleet to 127.0.0.1:43065 began_wall 1794118420439138747 ended_wall 1794118420539804426 budgets_spent_before 0 outcome Ok(())
+   r15 LD-DIAL slates-fleet to 127.0.0.1:43065 began_wall 1794118420484941915 ended_wall 1794118420539853455 budgets_spent_before 0 outcome Ok(())
+   r15 LD-DIAL slates-fleet to 127.0.0.1:43061 fresh_wall 1794118420586688796
+   r15 LD-DIAL slates-fleet to 127.0.0.1:43063 fresh_wall 1794118420589670072
+   r15 LD-DIAL slates-fleet to 127.0.0.1:43063 fresh_wall 1794118420636352063
+   r15 LD-DIAL slates-fleet to 127.0.0.1:43061 fresh_wall 1794118420640991151
+   r15 LD-DIAL slates-fleet to 127.0.0.1:43065 fresh_wall 1794118420641311850
+   r15 LD-DIAL slates-fleet to 127.0.0.1:43065 fresh_wall 1794118420642031651
+   r15 LD-DIAL slates-fleet to 127.0.0.1:43061 began_wall 1794118420687053799 ended_wall 1794118420688472954 budgets_spent_before 0 outcome Ok(())
+   r15 LD-DIAL LD-PMTU at slates-fleet209651854 to  trigger probe_acked before 127(.50, .12000, .655281, :043063,  began_wall true1794118420689880462,  ended_wall None1794118420691146107) budgets_spent_before  after 0( outcome 5Ok, (33364(), )65528
+   r15 LD-DIAL slates-fleet to 127.0.0.1:43063 began_wall 1794118420737465881 ended_wall 1794118420739034643 budgets_spent_before 0 outcome Ok(())
+   r15 LD-DIAL slates-fleet to 127.0.0.1:43065 began_wall 1794118420741521848 ended_wall 1794118420743460841 budgets_spent_before 0 outcome Ok(())
+   r15 LD-DIAL slates-fleet to 127.0.0.1:43061 began_wall 1794118420741647544 ended_wall 1794118420743795443 budgets_spent_before 0 outcome Ok(())
+   r15 LD-DIAL slates-fleet to 127.0.0.1:43065 began_wall 1794118420743450345 ended_wall 1794118420747776086 budgets_spent_before 0 outcome Ok(())
+   r15 LD-RESUME chaos-rolling-b-15620 wall_ns 1794118423606619046
+   r15 LD-DIAL slates-fleet to 127.0.0.1:43063 fresh_wall 1794118423631040575
+   r15 LD-DIAL slates-fleet to 127.0.0.1:43063 fresh_wall 1794118423704177665
+   r15 LD-DIAL slates-fleet to 127.0.0.1:43063 began_wall 1794118423804466321 ended_wall 1794118423807247731 budgets_spent_before 0 outcome Ok(())
+   r15 LD-SERVE at 3438381750 wall_ns 1794118423926719579 install from 13170597272189580869 bytes 9805574 took_ns 6840536 gap_ns Some(312604248)
+   r15 LD-SERVE at 3624099179 wall_ns 1794118424114206980 install from 13170597272189580869 bytes 12016290 took_ns 8610500 gap_ns Some(178876893)
+   r15 LD-RESUME chaos-rolling-c-15620 wall_ns 1794118425715174902
+   r15 LD-DIAL slates-fleet to 127.0.0.1:43063 began_wall 1794118425715082284 ended_wall 1794118425718649114 budgets_spent_before 0 outcome Ok(())
+   r15 LD-DIAL slates-fleet to 127.0.0.1:43065 fresh_wall 1794118425764401542
+   r15 LD-DIAL slates-fleet to 127.0.0.1:43065 fresh_wall 1794118425814578216
+   r15 LD-DIAL slates-fleet to 127.0.0.1:43065 began_wall 1794118425864693566 ended_wall 1794118425868367997 budgets_spent_before 0 outcome Ok(())
+   r15 LD-DIAL slates-fleet to 127.0.0.1:43065 began_wall 1794118425914848665 ended_wall 1794118425917513818 budgets_spent_before 0 outcome Ok(())
+  5590 writes, 5590 acknowledged: p50 391 us, p99 13270 us, p999 32043 us, max 390211 us; 5 over 50ms (sent+took): 0.00s+151ms 0.19s+168ms 2.25s+390ms 3.60s+75ms 3.68s+51ms
+  chaos-rolling-a-16248 partitioned from 191.183511ms to 2.191284109s
+  chaos-rolling-a-16248 refused the owner: {}
+  chaos-rolling-b-16248 partitioned from 2.248105147s to 4.248249702s
+  chaos-rolling-b-16248 refused the owner: {}
+  chaos-rolling-c-16248 refused the owner: {}
+== partition 16 exit 0 stuck 0 long5 0
+   r16 LD-DIAL slates-fleet to 127.0.0.1:21225 began_wall 1794118426764121726 ended_wall 1794118426765837534 budgets_spent_before 0 outcome Ok(())
+   r16 LD-DIAL slates-fleet to 127.0.0.1:21227 began_wall 1794118426709484289 ended_wall 1794118426766381251 budgets_spent_before 0 outcome Ok(())
+   r16 LD-DIAL slates-fleet to 127.0.0.1:21225 began_wall 1794118426822513510 ended_wall 1794118426824397507 budgets_spent_before 0 outcome Ok(())
+   r16 LD-DIAL slates-fleet to 127.0.0.1:21227 began_wall 1794118426822779557 ended_wall 1794118426824851021 budgets_spent_before 0 outcome Ok(())
+   r16 LD-DIAL slates-fleet to 127.0.0.1:21229 began_wall 1794118426764430666 ended_wall 1794118426827246488 budgets_spent_before 0 outcome Ok(())
+   r16 LD-DIAL slates-fleet to 127.0.0.1:21229 began_wall 1794118426709754279 ended_wall 1794118426827881671 budgets_spent_before 0 outcome Ok(())
+   r16 LD-DIAL slates-fleet to 127.0.0.1:21225 fresh_wall 1794118426866191474
+   r16 LD-DIAL slates-fleet to 127.0.0.1:21227 fresh_wall 1794118426866975191
+   r16 LD-DIAL slates-fleet to 127.0.0.1:21225 fresh_wall 1794118426924860184
+   r16 LD-DIAL slates-fleet to 127.0.0.1:21227 fresh_wall 1794118426926224294
+   r16 LD-DIAL slates-fleet to 127.0.0.1:21229 fresh_wall 1794118426928272408
+   r16 LD-DIAL slates-fleet to 127.0.0.1:21229 fresh_wall 1794118426928670718
+   r16 LD-DIAL LD-DIAL slates-fleetslates-fleet to  to 127127..00..00..11::2122721225 began_wall  began_wall 17941184269671795721794118426967378735 ended_wall  ended_wall 17941184269690081571794118426969003677 budgets_spent_before  budgets_spent_before 00 outcome  ou
+   r16 LD-DIAL slates-fleet to 127.0.0.1:21225 began_wall 1794118427025125785 ended_wall 1794118427026645766 budgets_spent_before 0 outcome Ok(())
+   r16 LD-DIAL slates-fleet to 127.0.0.1:21227 began_wall 1794118427026764134 ended_wall 1794118427028156643 budgets_spent_before 0 outcome Ok(())
+   r16 LD-DIAL slates-fleet to 127.0.0.1:21229 began_wall 1794118427028602166 ended_wall 1794118427029918232 budgets_spent_before 0 outcome Ok(())
+   r16 LD-DIAL slates-fleet to 127.0.0.1:21229 began_wall 1794118427029691238 ended_wall 1794118427031134488 budgets_spent_before 0 outcome Ok(())
+   r16 LD-SERVE at 2097444392 wall_ns 1794118428858508800 install from 6191139573254834008 bytes 363380 took_ns 333643 gap_ns Some(105288033)
+   r16 LD-RESUME chaos-rolling-a-16248 wall_ns 1794118430690978507
+   r16 LD-DIAL slates-fleet to 127.0.0.1:21225 fresh_wall 1794118430740057280
+   r16 LD-DIAL slates-fleet to 127.0.0.1:21225 began_wall 1794118430840497850 ended_wall 1794118430842004492 budgets_spent_before 0 outcome Ok(())
+   r16 LD-SERVE at 4414324199 wall_ns 1794118431132759388 install from 6191139573254834008 bytes 17197528 took_ns 12472486 gap_ns Some(208744766)
+   r16 LD-RESUME chaos-rolling-b-16248 wall_ns 1794118432747937252
+   r16 LD-DIAL slates-fleet to 127.0.0.1:21225 fresh_wall 1794118432748862026
+   r16 LD-DIAL slates-fleet to 127.0.0.1:21227 fresh_wall 1794118432802473026
+   r16 LD-DIAL slates-fleet to 127.0.0.1:21227 fresh_wall 1794118432828731988
+   r16 LD-DIAL slates-fleet to 127.0.0.1:21225 began_wall 1794118432849314668 ended_wall 1794118432850878345 budgets_spent_before 0 outcome Ok(())
+   r16 LD-DIAL slates-fleet to 127.0.0.1:21227 began_wall 1794118432902727880 ended_wall 1794118432904213538 budgets_spent_before 0 outcome Ok(())
+   r16 LD-DIAL slates-fleet to 127.0.0.1:21227 began_wall 1794118432934420772 ended_wall 1794118432947502788 budgets_spent_before 0 outcome Ok(())
+   r16 LD-SERVE at 6279660965 wall_ns 1794118433054841748 install from 6191139573254834008 bytes 17197528 took_ns 14450450 gap_ns Some(2292789757)
+  5866 writes, 5866 acknowledged: p50 395 us, p99 4415 us, p999 11031 us, max 356750 us; 4 over 50ms (sent+took): 0.00s+128ms 0.17s+161ms 2.22s+357ms 3.41s+65ms
+  chaos-rolling-a-17036 partitioned from 174.326566ms to 2.174540629s
+  chaos-rolling-a-17036 refused the owner: {}
+  chaos-rolling-b-17036 partitioned from 2.237857056s to 4.237978429s
+  chaos-rolling-b-17036 refused the owner: {}
+  chaos-rolling-c-17036 refused the owner: {}
+== partition 17 exit 0 stuck 0 long5 0
+   r17 LD-DIAL slates-fleet to 127.0.0.1:31471 began_wall 1794118434544923330 ended_wall 1794118434588560214 budgets_spent_before 0 outcome Ok(())
+   r17 LD-DIAL slates-fleet to 127.0.0.1:31469 began_wall 1794118434586325091 ended_wall 1794118434589319502 budgets_spent_before 0 outcome Ok(())
+   r17 LD-DIAL slates-fleet to 127.0.0.1:31469 began_wall 1794118434635110850 ended_wall 1794118434637657554 budgets_spent_before 0 outcome Ok(())
+   r17 LD-DIAL slates-fleet to 127.0.0.1:31471 began_wall 1794118434635397080 ended_wall 1794118434638489541 budgets_spent_before 0 outcome Ok(())
+   r17 LD-DIAL slates-fleet to 127.0.0.1:31473 began_wall 1794118434545151628 ended_wall 1794118434639887069 budgets_spent_before 0 outcome Ok(())
+   r17 LD-DIAL slates-fleet to 127.0.0.1:31473 began_wall 1794118434586578947 ended_wall 1794118434641162717 budgets_spent_before 0 outcome Ok(())
+   r17 LD-DIAL slates-fleet to LD-DIAL 127slates-fleet. to 0.1270..01.:031469. fresh_wall 11794118434690347555:
+   r17 LD-DIAL slates-fleet to 127.0.0.1:31469 fresh_wall 1794118434738505811
+   r17 LD-DIAL slates-fleet to 127.0.0.1:31471 fresh_wall 1794118434739854486
+   r17 LD-DIAL slates-fleet to 127.0.0.1:31473 fresh_wall 1794118434741602871
+   r17 LD-DIAL slates-fleet to 127.0.0.1:31473 fresh_wall 1794118434742105560
+   r17 LD-DIAL LD-DIAL slates-fleetslates-fleet to  to 127127..00..00..11::3147131469 began_wall  began_wall 17941184347907775751794118434790898591 ended_wall  ended_wall 17941184347922089091794118434792208829 budgets_spent_before  budgets_spent_before 00 outcome  ou
+   r17 LD-DIAL slates-fleet to 127.0.0.1:31469 began_wall 1794118434839497474 ended_wall 1794118434840929168 budgets_spent_before 0 outcome Ok(())
+   r17 LD-DIAL slates-fleet to 127.0.0.1:31471 began_wall 1794118434840679472 ended_wall 1794118434841949248 budgets_spent_before 0 outcome Ok(())
+   r17 LD-DIAL slates-fleet to 127.0.0.1:31473 began_wall 1794118434842345079 ended_wall 1794118434843641109 budgets_spent_before 0 outcome Ok(())
+   r17 LD-DIAL slates-fleet to 127.0.0.1:31473 began_wall 1794118434843350863 ended_wall 1794118434844831546 budgets_spent_before 0 outcome Ok(())
+   r17 LD-SERVE at 2194597500 wall_ns 1794118436778565179 install from 11397320704481116586 bytes 259780 took_ns 226162 gap_ns Some(104178189)
+   r17 LD-RESUME chaos-rolling-a-17036 wall_ns 1794118438618609794
+   r17 LD-DIAL slates-fleet to 127.0.0.1:31469 fresh_wall 1794118438652905086
+   r17 LD-DIAL slates-fleet to 127.0.0.1:31469 began_wall 1794118438753170408 ended_wall 1794118438754768085 budgets_spent_before 0 outcome Ok(())
+   r17 LD-SERVE at 4248420219 wall_ns 1794118438790446811 install from 11397320704481116586 bytes 259780 took_ns 126448 gap_ns Some(170676562)
+   r17 LD-SERVE at 4461087553 wall_ns 1794118439014936944 install from 11397320704481116586 bytes 17238222 took_ns 11949367 gap_ns Some(212540886)
+   r17 LD-RESUME chaos-rolling-b-17036 wall_ns 1794118440682048337
+   r17 LD-DIAL slates-fleet to 127.0.0.1:31469 fresh_wall 1794118440682193584
+   r17 LD-DIAL slates-fleet to 127.0.0.1:31471 fresh_wall 1794118440723527526
+   r17 LD-DIAL slates-fleet to 127.0.0.1:31471 fresh_wall 1794118440780312792
+   r17 LD-DIAL slates-fleet to 127.0.0.1:31469 began_wall 1794118440782504751 ended_wall 1794118440784113923 budgets_spent_before 0 outcome Ok(())
+   r17 LD-DIAL slates-fleet to 127.0.0.1:31471 began_wall 1794118440824651338 ended_wall 1794118440827576268 budgets_spent_before 0 outcome Ok(())
+   r17 LD-DIAL slates-fleet to 127.0.0.1:31471 began_wall 1794118440881079306 ended_wall 1794118440882595788 budgets_spent_before 0 outcome Ok(())
+   r17 LD-SERVE at 6433923325 wall_ns 1794118441029762920 install from 11397320704481116586 bytes 17238222 took_ns 12098198 gap_ns Some(2352441204)
+   r17 LD-SERVE at 6713623806 wall_ns 1794118441309748695 install from 11397320704481116586 bytes 25755096 took_ns 12383636 gap_ns Some(267602283)
+  4022 writes, 4022 acknowledged: p50 813 us, p99 3635 us, p999 25294 us, max 364309 us; 2 over 50ms (sent+took): 0.00s+157ms 2.29s+364ms
+  chaos-rolling-a-17755 refused the owner: {}
+  chaos-rolling-b-17755 partitioned from 227.135224ms to 2.227249951s
+  chaos-rolling-b-17755 refused the owner: {}
+  chaos-rolling-c-17755 partitioned from 2.290551652s to 4.290666395s
+  chaos-rolling-c-17755 refused the owner: {}
+== partition 18 exit 0 stuck 0 long5 0
+   r18 LD-DIAL slates-fleet to 127.0.0.1:40816 began_wall 1794118441962742331 ended_wall 1794118441964402683 budgets_spent_before 0 outcome Ok(())
+   r18 LD-DIAL slates-fleet to 127.0.0.1:40818 began_wall 1794118441918219076 ended_wall 1794118441964798906 budgets_spent_before 0 outcome Ok(())
+   r18 LD-DIAL slates-fleet to 127.0.0.1:40816 began_wall 1794118442011960693 ended_wall 1794118442016126105 budgets_spent_before 0 outcome Ok(())
+   r18 LD-DIAL slates-fleet to 127.0.0.1:40818 began_wall 1794118442012203221 ended_wall 1794118442016300486 budgets_spent_before 0 outcome Ok(())
+   r18 LD-DIAL slates-fleet to 127.0.0.1:40820 began_wall 1794118441918528745 ended_wall 1794118442018208967 budgets_spent_before 0 outcome Ok(())
+   r18 LD-DIAL slates-fleet to 127.0.0.1:40820 began_wall 1794118441963003874 ended_wall 1794118442019627446 budgets_spent_before 0 outcome Ok(())
+   r18 LD-DIAL slates-fleet to 127.0.0.1:40816 fresh_wall 1794118442064891903
+   r18 LD-DIAL slates-fleet to 127.0.0.1:40818 fresh_wall 1794118442065961972
+   r18 LD-DIAL slates-fleet to 127.0.0.1:40816 fresh_wall 1794118442117472487
+   r18 LD-DIAL slates-fleet to 127.0.0.1:40818 fresh_wall 1794118442117721855
+   r18 LD-DIAL slates-fleet to 127.0.0.1:40820 fresh_wall 1794118442120028200
+   r18 LD-DIAL slates-fleet to 127.0.0.1:40820 fresh_wall 1794118442120200461
+   r18 LD-DIAL slates-fleet to 127.0.0.1:40816 began_wall 1794118442165916457 ended_wall 1794118442167625231 budgets_spent_before 0 outcome Ok(())
+   r18 LD-DIAL slates-fleet to 127.0.0.1:40818 began_wall 1794118442166577168 ended_wall 1794118442168327219 budgets_spent_before 0 outcome Ok(())
+   r18 LD-DIAL slates-fleet to 127.0.0.1:40816 began_wall 1794118442218140032 ended_wall 1794118442219849821 budgets_spent_before 0 outcome Ok(())
+   r18 LD-DIAL slates-fleet to 127.0.0.1:40820 began_wall 1794118442220375692 ended_wall 1794118442222128055 budgets_spent_before 0 outcome Ok(())
+   r18 LD-DIAL slates-fleet to 127.0.0.1:40820 began_wall 1794118442220632668 ended_wall 1794118442222324691 budgets_spent_before 0 outcome Ok(())
+   r18 LD-RESUME chaos-rolling-b-17755 wall_ns 1794118445108782970
+   r18 LD-DIAL slates-fleet to 127.0.0.1:40818 fresh_wall 1794118445175439491
+   r18 LD-DIAL slates-fleet to 127.0.0.1:40818 began_wall 1794118445276156233 ended_wall 1794118445277500953 budgets_spent_before 0 outcome Ok(())
+   r18 LD-SERVE at 3571872650 wall_ns 1794118445538881918 install from 17323763516377003277 bytes 9433836 took_ns 6781260 gap_ns Some(167031214)
+   r18 LD-RESUME chaos-rolling-c-17755 wall_ns 1794118447172197246
+   r18 LD-DIAL slates-fleet to 127.0.0.1:40818 fresh_wall 1794118447173184966
+   r18 LD-DIAL slates-fleet to 127.0.0.1:40820 fresh_wall 1794118447213692229
+   r18 LD-DIAL slates-fleet to 127.0.0.1:40820 fresh_wall 1794118447236191142
+   r18 LD-DIAL slates-fleet to 127.0.0.1:40818 began_wall 1794118447273464760 ended_wall 1794118447276419551 budgets_spent_before 0 outcome Ok(())
+   r18 LD-DIAL slates-fleet to 127.0.0.1:40820 began_wall 1794118447314260565 ended_wall 1794118447315815991 budgets_spent_before 0 outcome Ok(())
+   r18 LD-DIAL slates-fleet to 127.0.0.1:40820 began_wall 1794118447337041707 ended_wall 1794118447338457903 budgets_spent_before 0 outcome Ok(())
+   r18 LD-SERVE at 5382437827 wall_ns 1794118447394703041 install from 17323763516377003277 bytes 9433836 took_ns 6661133 gap_ns Some(2217030887)
+   r18 LD-SERVE at 5592850933 wall_ns 1794118447610884785 install from 17323763516377003277 bytes 17600246 took_ns 12429747 gap_ns Some(203751973)
+  2338 writes, 2338 acknowledged: p50 1337 us, p99 10067 us, p999 32629 us, max 336539 us; 2 over 50ms (sent+took): 0.00s+177ms 2.42s+337ms
+  chaos-rolling-a-18345 refused the owner: {}
+  chaos-rolling-b-18345 partitioned from 321.132978ms to 2.321244977s
+  chaos-rolling-b-18345 refused the owner: {}
+  chaos-rolling-c-18345 partitioned from 2.428399747s to 4.428502247s
+  chaos-rolling-c-18345 refused the owner: {}
+== partition 19 exit 0 stuck 0 long5 0
+   r19 LD-DIAL slates-fleet to 127.0.0.1:48486 began_wall 1794118447997870945 ended_wall 1794118447999616854 budgets_spent_before 0 outcome Ok(())
+   r19 LD-DIAL slates-fleet to 127.0.0.1:48488 began_wall 1794118447954481790 ended_wall 1794118448000158411 budgets_spent_before 0 outcome Ok(())
+   r19 LD-DIAL slates-fleet to 127.0.0.1:48488 began_wall 1794118448048691622 ended_wall 1794118448050936723 budgets_spent_before 0 outcome Ok(())
+   r19 LD-DIAL slates-fleet to 127.0.0.1:48486 began_wall 1794118448048451909 ended_wall 1794118448052098815 budgets_spent_before 0 outcome Ok(())
+   r19 LD-DIAL slates-fleet to 127.0.0.1:48490 began_wall 1794118447998124512 ended_wall 1794118448054096724 budgets_spent_before 0 outcome Ok(())
+   r19 LD-DIAL slates-fleet to 127.0.0.1:48490 began_wall 1794118447954733781 ended_wall 1794118448054821181 budgets_spent_before 0 outcome Ok(())
+   r19 LD-DIAL slates-fleet to 127.0.0.1:48486 fresh_wall 1794118448100597132
+   r19 LD-DIAL slates-fleet to 127.0.0.1:48488 fresh_wall 1794118448100844611
+   r19 LD-DIAL slates-fleet to 127.0.0.1:48488 fresh_wall 1794118448152208909
+   r19 LD-DIAL slates-fleet to 127.0.0.1:48486 fresh_wall 1794118448152500450
+   r19 LD-DIAL slates-fleet to 127.0.0.1:48490 fresh_wall 1794118448154669404
+   r19 LD-DIAL slates-fleet to 127.0.0.1:48490 fresh_wall 1794118448156297297
+   r19 LD-DIAL LD-DIAL slates-fleetslates-fleet to  to 127127..00..00..11::4848848486 began_wall  began_wall 17941184482012138001794118448201370686 ended_wall  ended_wall 17941184482027008791794118448202703327 budgets_spent_before  budgets_spent_before 00 outcome  ou
+   r19 LD-DIAL slates-fleet to 127.0.0.1:48488 began_wall 1794118448253443353 ended_wall 1794118448255178808 budgets_spent_before 0 outcome Ok(())
+   r19 LD-DIAL slates-fleet to 127.0.0.1:48486 began_wall 1794118448253533539 ended_wall 1794118448255410344 budgets_spent_before 0 outcome Ok(())
+   r19 LD-DIAL slates-fleet to 127.0.0.1:48490 began_wall 1794118448254933816 ended_wall 1794118448257284902 budgets_spent_before 0 outcome Ok(())
+   r19 LD-DIAL slates-fleet to 127.LD-PMTU at 0215174706. trigger probe_acked before 0(.71, :120048490,  began_wall 655281794118448256490482,  ended_wall 01794118448257670181,  budgets_spent_before true0,  outcome NoneOk)( after ()()7
+   r19 LD-RESUME chaos-rolling-b-18345 wall_ns 1794118452136710609
+   r19 LD-DIAL slates-fleet to 127.0.0.1:48488 fresh_wall 1794118452183698408
+   r19 LD-DIAL slates-fleet to 127.0.0.1:48488 fresh_wall 1794118452220967276
+   r19 LD-DIAL slates-fleet to 127.0.0.1:48488 began_wall 1794118452321229584 ended_wall 1794118452324005650 budgets_spent_before 0 outcome Ok(())
+   r19 LD-SERVE at 4450333459 wall_ns 1794118452448920403 install from 16485163319521526300 bytes 5464224 took_ns 4492192 gap_ns Some(2308340864)
+   r19 LD-SERVE at 4575675157 wall_ns 1794118452576503710 install from 16485163319521526300 bytes 8059530 took_ns 6734073 gap_ns Some(120849506)
+   r19 LD-RESUME chaos-rolling-c-18345 wall_ns 1794118454243966743
+   r19 LD-DIAL slates-fleet to 127.0.0.1:48488 began_wall 1794118454244842287 ended_wall 1794118454249276683 budgets_spent_before 0 outcome Ok(())
+   r19 LD-DIAL slates-fleet to 127.0.0.1:48490 fresh_wall 1794118454273504932
+   r19 LD-DIAL slates-fleet to 127.0.0.1:48490 fresh_wall 1794118454339386292
+   r19 LD-DIAL slates-fleet to 127.0.0.1:48490 began_wall 1794118454374701552 ended_wall 1794118454381232974 budgets_spent_before 0 outcome Ok(())
+   r19 LD-DIAL slates-fleet to 127.0.0.1:48490 began_wall 1794118454439615742 ended_wall 1794118454444036123 budgets_spent_before 0 outcome Ok(())
+  4964 writes, 4964 acknowledged: p50 431 us, p99 4737 us, p999 47515 us, max 132204 us; 4 over 50ms (sent+took): 0.00s+114ms 2.28s+84ms 3.93s+132ms 4.60s+70ms
+  chaos-rolling-a-19079 partitioned from 186.939517ms to 2.189290821s
+  chaos-rolling-a-19079 refused the owner: {}
+  chaos-rolling-b-19079 partitioned from 2.471302902s to 4.471497591s
+  chaos-rolling-b-19079 refused the owner: {}
+  chaos-rolling-c-19079 refused the owner: {}
+== partition 20 exit 0 stuck 0 long5 0
+   r20 LD-DIAL slates-fleet to 127.0.0.1:28030 began_wall 1794118455357035278 ended_wall 1794118455407907231 budgets_spent_before 0 outcome Ok(())
+   r20 LD-DIAL slates-fleet to 127.0.0.1:28028 began_wall 1794118455405775351 ended_wall 1794118455408285686 budgets_spent_before 0 outcome Ok(())
+   r20 LD-DIAL slates-fleet to 127.0.0.1:28030 began_wall 1794118455452518960 ended_wall 1794118455454452580 budgets_spent_before 0 outcome Ok(())
+   r20 LD-DIAL slates-fleet to 127.0.0.1:28028 began_wall 1794118455452220811 ended_wall 1794118455456264688 budgets_spent_before 0 outcome Ok(())
+   r20 LD-DIAL slates-fleet to 127.0.0.1:28032 began_wall 1794118455358274999 ended_wall 1794118455457803494 budgets_spent_before 0 outcome Ok(())
+   r20 LD-DIAL slates-fleet to 127.0.0.1:28032 began_wall 1794118455406039334 ended_wall 1794118455458624585 budgets_spent_before 0 outcome Ok(())
+   r20 LD-DIAL slates-fleet to 127.0.0.1:28028 fresh_wall 1794118455508567613
+   r20 LD-DIAL slates-fleet to 127.0.0.1:28030 fresh_wall 1794118455509030239
+   r20 LD-DIAL slates-fleet to 127.0.0.1:28030 fresh_wall 1794118455556805782
+   r20 LD-DIAL slates-fleet to 127.0.0.1:28028 fresh_wall 1794118455557574868
+   r20 LD-DIAL slates-fleet to 127.0.0.1:28032 fresh_wall 1794118455559414207
+   r20 LD-DIAL slates-fleet to 127.0.0.1:28032 fresh_wall 1794118455559530303
+   r20 LD-DIAL slates-fleet to 127.0.0.1:28028 began_wall 1794118455608943109 ended_wall 1794118455610629673 budgets_spent_before 0 outcome Ok(())
+   r20 LD-DIAL slates-fleet to 127.0.0.1:28030 began_wall 1794118455609562965 ended_wall 1794118455612059214 budgets_spent_before 0 outcome Ok(())
+   r20 LD-DIAL slates-fleet to 127.0.0.1:28030 began_wall 1794118455657125202 ended_wall 1794118455658579293 budgets_spent_before 0 outcome Ok(())
+   r20 LD-DIAL slates-fleet to 127.0.0.1:28028 began_wall 1794118455658332260 ended_wall 1794118455659671431 budgets_spent_before 0 outcome Ok(())
+   r20 LD-DIAL slates-fleet to 127.0.0.1:28032 began_wall 1794118455659753745 ended_wall 1794118455661127482 budgets_spent_before 0 outcome Ok(())
+   r20 LD-DIAL LD-PMTU at slates-fleet213125809 to  trigger probe_acked before (1277., 01200., 065528., 10:, 28032true,  began_wall None1794118455659962988) ended_wall  after 1794118455661667687( budgets_spent_before 70,  outcome 33364Ok, (65528(), )0
+   r20 LD-RESUME chaos-rolling-a-19079 wall_ns 1794118459452904797
+   r20 LD-DIAL slates-fleet to 127.0.0.1:28028 fresh_wall 1794118459501800132
+   r20 LD-DIAL slates-fleet to 127.0.0.1:28028 fresh_wall 1794118459530125207
+   r20 LD-DIAL slates-fleet to 127.0.0.1:28028 began_wall 1794118459602080363 ended_wall 1794118459605480777 budgets_spent_before 0 outcome Ok(())
+   r20 LD-DIAL slates-fleet to 127.0.0.1:28028 began_wall 1794118459630376168 ended_wall 1794118459631647870 budgets_spent_before 0 outcome Ok(())
+   r20 LD-SERVE at 4327744408 wall_ns 1794118459691109409 install from 8154730787722408483 bytes 9732094 took_ns 8247096 gap_ns Some(2232067348)
+   r20 LD-SERVE at 4410648918 wall_ns 1794118459774195572 install from 8154730787722408483 bytes 12302006 took_ns 8428613 gap_ns Some(74657414)
+   r20 LD-RESUME chaos-rolling-b-19079 wall_ns 1794118461735099135
+   r20 LD-DIAL slates-fleet to 127.0.0.1:28030 fresh_wall 1794118461756186645
+   r20 LD-DIAL slates-fleet to 127.0.0.1:28030 fresh_wall 1794118461809486265
+   r20 LD-DIAL slates-fleet to 127.0.0.1:28030 began_wall 1794118461856463935 ended_wall 1794118461857800652 budgets_spent_before 0 outcome Ok(())
+   r20 LD-DIAL slates-fleet to 127.0.0.1:28030 began_wall 1794118461909904644 ended_wall 1794118461912270759 budgets_spent_before 0 outcome Ok(())
+   r20 LD-SERVE at 6621099470 wall_ns 1794118462044262453 install from 8154730787722408483 bytes 21378704 took_ns 20861194 gap_ns Some(2289398267)
+  2797 writes, 2797 acknowledged: p50 1089 us, p99 5651 us, p999 39895 us, max 345072 us; 2 over 50ms (sent+took): 0.01s+161ms 2.33s+345ms
+  chaos-rolling-a-19808 refused the owner: {}
+  chaos-rolling-b-19808 partitioned from 244.968453ms to 2.247192788s
+  chaos-rolling-b-19808 refused the owner: {}
+  chaos-rolling-c-19808 partitioned from 2.331241851s to 4.331358327s
+  chaos-rolling-c-19808 refused the owner: {}
+== partition 21 exit 0 stuck 0 long5 0
+   r21 LD-DIAL slates-fleet to 127.0.0.1:37505 began_wall 1794118462702102264 ended_wall 1794118462703790673 budgets_spent_before 0 outcome Ok(())
+   r21 LD-DIAL slates-fleet to 127.0.0.1:37507 began_wall 1794118462643213763 ended_wall 1794118462704103776 budgets_spent_before 0 outcome Ok(())
+   r21 LD-DIAL slates-fleet to 127.0.0.1:37505 began_wall 1794118462755133547 ended_wall 1794118462757625720 budgets_spent_before 0 outcome Ok(())
+   r21 LD-DIAL slates-fleet to 127.0.0.1:37507 began_wall 1794118462755390069 ended_wall 1794118462757809941 budgets_spent_before 0 outcome Ok(())
+   r21 LD-DIAL slates-fleet to 127.0.0.1:37509 began_wall 1794118462702389815 ended_wall 1794118462760878202 budgets_spent_before 0 outcome Ok(())
+   r21 LD-DIAL slates-fleet to 127.0.0.1:37509 began_wall 1794118462643497524 ended_wall 1794118462761003179 budgets_spent_before 0 outcome Ok(())
+   r21 LD-DIAL slates-fleet to 127.0.0.1:37505 fresh_wall 1794118462804263921
+   r21 LD-DIAL slates-fleet to 127.0.0.1:37507 fresh_wall 1794118462804776644
+   r21 LD-DIAL slates-fleet to 127.0.0.1:37507 fresh_wall 1794118462858063209
+   r21 LD-DIAL slates-fleet to 127.0.0.1:37505 fresh_wall 1794118462859678327
+   r21 LD-DIAL slates-fleet to 127.0.0.1:37509 fresh_wall 1794118462861657704
+   r21 LD-DIAL slates-fleet to 127.0.0.1:37509 fresh_wall 1794118462862337658
+   r21 LD-DIAL LD-DIAL slates-fleetslates-fleet to  to 127.1270..00..01.:137507: began_wall 375051794118462905402931 began_wall  ended_wall 17941184629052791861794118462906645133 ended_wall  budgets_spent_before 17941184629066519330 budgets_spent_before  outcome 0Ok 
+   r21 LD-DIAL slates-fleet to 127.0.0.1:37507 began_wall 1794118462958349883 ended_wall 1794118462959730182 budgets_spent_before 0 outcome Ok(())
+   r21 LD-DIAL slates-fleet to 127.0.0.1:37505 began_wall 1794118462959875894 ended_wall 1794118462961157390 budgets_spent_before 0 outcome Ok(())
+   r21 LD-DIAL slates-fleet to 127.0.0.1:37509 began_wall 1794118462962637643 ended_wall 1794118462963910692 budgets_spent_before 0 outcome Ok(())
+   r21 LD-RESUME chaos-rolling-b-19808 wall_ns 1794118466751753952
+   r21 LD-DIAL slates-fleet to 127.0.0.1:37507 fresh_wall 1794118466772834394
+   r21 LD-DIAL slates-fleet to 127.0.0.1:37507 fresh_wall 1794118466824922840
+   r21 LD-DIAL slates-fleet to 127.0.0.1:37507 began_wall 1794118466925159709 ended_wall 1794118466926617319 budgets_spent_before 0 outcome Ok(())
+   r21 LD-SERVE at 4336154060 wall_ns 1794118467037416111 install from 12152810096349397565 bytes 2660904 took_ns 2195914 gap_ns Some(2464881170)
+   r21 LD-SERVE at 4473663297 wall_ns 1794118467177890803 install from 12152810096349397565 bytes 7339576 took_ns 5161353 gap_ns Some(135313323)
+   r21 LD-RESUME chaos-rolling-c-19808 wall_ns 1794118468835911131
+   r21 LD-DIAL slates-fleet to 127.0.0.1:37507 began_wall 1794118468836020300 ended_wall 1794118468844307741 budgets_spent_before 0 outcome Ok(())
+   r21 LD-DIAL slates-fleet to 127.0.0.1:37509 fresh_wall 1794118468851652944
+   r21 LD-DIAL slates-fleet to 127.0.0.1:37509 fresh_wall 1794118468891598703
+   r21 LD-DIAL slates-fleet to 127.0.0.1:37509 began_wall 1794118468952251318 ended_wall 1794118468957463633 budgets_spent_before 0 outcome Ok(())
+   r21 LD-DIAL slates-fleet to 127.0.0.1:37509 began_wall 1794118468991808061 ended_wall 1794118468993663908 budgets_spent_before 0 outcome Ok(())
+   r21 LD-SERVE at 6367816050 wall_ns 1794118469126035154 install from 12152810096349397565 bytes 7339576 took_ns 6528532 gap_ns Some(282759854)
+   r21 LD-SERVE at 6530013605 wall_ns 1794118469286914605 install from 12152810096349397565 bytes 12247362 took_ns 5210396 gap_ns Some(155669023)
+  4752 writes, 4752 acknowledged: p50 402 us, p99 5312 us, p999 48815 us, max 222155 us; 4 over 50ms (sent+took): 0.00s+158ms 2.27s+222ms 4.09s+52ms 4.46s+108ms
+  chaos-rolling-a-20503 refused the owner: {}
+  chaos-rolling-b-20503 partitioned from 197.532699ms to 2.197656611s
+  chaos-rolling-b-20503 refused the owner: {}
+  chaos-rolling-c-20503 partitioned from 2.274743244s to 4.274858812s
+  chaos-rolling-c-20503 refused the owner: {}
+== partition 22 exit 0 stuck 0 long5 0
+   r22 LD-DIAL LD-DIAL slates-fleetslates-fleet to  to 127127..00..00..11::4654246540 began_wall  began_wall 17941184697624297511794118469816285730 ended_wall  ended_wall 17941184698181898141794118469818199070 budgets_spent_before  budgets_spent_before 00 outcome  ou
+   r22 LD-DIAL slates-fleet to 127.0.0.1:46540 began_wall 1794118469874854263 ended_wall 1794118469876869693 budgets_spent_before 0 outcome Ok(())
+   r22 LD-DIAL slates-fleet to 127.0.0.1:46542 began_wall 1794118469875105744 ended_wall 1794118469877040290 budgets_spent_before 0 outcome Ok(())
+   r22 LD-DIAL slates-fleet to 127.0.0.1:46544 began_wall 1794118469762672888 ended_wall 1794118469879657267 budgets_spent_before 0 outcome Ok(())
+   r22 LD-DIAL slates-fleet to 127.0.0.1:46544 began_wall 1794118469816585120 ended_wall 1794118469881256210 budgets_spent_before 0 outcome Ok(())
+   r22 LD-DIAL slates-fleet to 127.0.0.1:46540 fresh_wall 1794118469919472939
+   r22 LD-DIAL slates-fleet to 127.0.0.1:46542 fresh_wall 1794118469919745058
+   r22 LD-DIAL slates-fleet to 127.0.0.1:46542 fresh_wall 1794118469977418590
+   r22 LD-DIAL slates-fleet to 127.0.0.1:46540 fresh_wall 1794118469977688445
+   r22 LD-DIAL slates-fleet to 127.0.0.1:46544 fresh_wall 1794118469981176626
+   r22 LD-DIAL slates-fleet to 127.0.0.1:46544 fresh_wall 1794118469981829458
+   r22 LD-DIAL LD-DIAL slates-fleetslates-fleet to  to 127127..00..00..11::4654046542 began_wall  began_wall 17941184700201455961794118470020277300 ended_wall  ended_wall 17941184700215006341794118470021500602 budgets_spent_before  budgets_spent_before 00 outcome  ou
+   r22 LD-DIAL slates-fleet to 127.0.0.1:46540 began_wall 1794118470078436378 ended_wall 1794118470079965254 budgets_spent_before 0 outcome Ok(())
+   r22 LD-DIAL slates-fleet to 127.0.0.1:46542 began_wall 1794118470078371230 ended_wall 1794118470080204959 budgets_spent_before 0 outcome Ok(())
+   r22 LD-DIAL slates-fleet to 127.0.0.1:46544 began_wall 1794118470082209285 ended_wall 1794118470084151047 budgets_spent_before 0 outcome Ok(())
+   r22 LD-DIAL slates-fleet to 127.0.0.1:46544 began_wall 1794118470083000085 ended_wall 1794118470084710557 budgets_spent_before 0 outcome Ok(())
+   r22 LD-RESUME chaos-rolling-b-20503 wall_ns 1794118473013257454
+   r22 LD-DIAL slates-fleet to 127.0.0.1:46542 fresh_wall 1794118473035902143
+   r22 LD-DIAL slates-fleet to 127.0.0.1:46542 began_wall 1794118473136454760 ended_wall 1794118473137809766 budgets_spent_before 0 outcome Ok(())
+   r22 LD-SERVE at 3341503519 wall_ns 1794118473158264748 install from 10647486308933371139 bytes 4548318 took_ns 3372731 gap_ns Some(2278158860)
+   r22 LD-SERVE at 3490369628 wall_ns 1794118473311705939 install from 10647486308933371139 bytes 10422412 took_ns 7947925 gap_ns Some(145493378)
+   r22 LD-RESUME chaos-rolling-c-20503 wall_ns 1794118475090459207
+   r22 LD-DIAL slates-fleet to 127.0.0.1:46542 fresh_wall 1794118475091025789
+   r22 LD-DIAL slates-fleet to 127.0.0.1:46544 fresh_wall 1794118475097965816
+   r22 LD-DIAL slates-fleet to 127.0.0.1:46544 fresh_wall 1794118475121867157
+   r22 LD-DIAL slates-fleet to 127.0.0.1:46542 began_wall 1794118475192312433 ended_wall 1794118475197517117 budgets_spent_before 0 outcome Ok(())
+   r22 LD-DIAL slates-fleet to 127.0.0.1:46544 began_wall 1794118475201486364 ended_wall 1794118475202975210 budgets_spent_before 0 outcome Ok(())
+   r22 LD-DIAL slates-fleet to 127.0.0.1:46544 began_wall 1794118475222273231 ended_wall 1794118475226882735 budgets_spent_before 0 outcome Ok(())
+   r22 LD-SERVE at 5384117932 wall_ns 1794118475266398464 install from 10647486308933371139 bytes 10422412 took_ns 11630118 gap_ns Some(2164699178)
+   r22 LD-SERVE at 5560371586 wall_ns 1794118475439644573 install from 10647486308933371139 bytes 20801150 took_ns 8622685 gap_ns Some(164623536)
+  5348 writes, 5348 acknowledged: p50 364 us, p99 5303 us, p999 55516 us, max 201150 us; 7 over 50ms (sent+took): 0.00s+143ms 1.17s+56ms 2.16s+71ms 2.23s+56ms 2.39s+201ms 4.29s+56ms 4.62s+120ms
+  chaos-rolling-a-21138 partitioned from 167.110132ms to 2.167230024s
+  chaos-rolling-a-21138 refused the owner: {}
+  chaos-rolling-b-21138 refused the owner: {}
+  chaos-rolling-c-21138 partitioned from 2.390816227s to 4.390921416s
+  chaos-rolling-c-21138 refused the owner: {}
+== partition 23 exit 0 stuck 0 long5 0
+   r23 LD-DIAL slates-fleet to 127.0.0.1:24797 began_wall 1794118475793033327 ended_wall 1794118475841823271 budgets_spent_before 0 outcome Ok(())
+   r23 LD-DIAL slates-fleet to 127.0.0.1:24795 began_wall 1794118475839675385 ended_wall 1794118475842509355 budgets_spent_before 0 outcome Ok(())
+   r23 LD-DIAL slates-fleet to 127.0.0.1:24797 began_wall 1794118475886953203 ended_wall 1794118475889739055 budgets_spent_before 0 outcome Ok(())
+   r23 LD-DIAL slates-fleet to 127.0.0.1:24795 began_wall 1794118475886703499 ended_wall 1794118475890426883 budgets_spent_before 0 outcome Ok(())
+   r23 LD-DIAL slates-fleet to 127.0.0.1:24799 began_wall 1794118475839918410 ended_wall 1794118475892797866 budgets_spent_before 0 outcome Ok(())
+   r23 LD-DIAL slates-fleet to 127.0.0.1:24799 began_wall 1794118475793318028 ended_wall 1794118475893543090 budgets_spent_before 0 outcome Ok(())
+   r23 LD-DIAL slates-fleet to 127.0.0.1:24795 fresh_wall 1794118475942770830
+   r23 LD-DIAL slates-fleet to 127.0.0.1:24797 fresh_wall 1794118475943084162
+   r23 LD-DIAL slates-fleet to 127.0.0.1:24797 fresh_wall 1794118475990024457
+   r23 LD-DIAL slates-fleet to 127.0.0.1:24795 fresh_wall 1794118475990771033
+   r23 LD-DIAL slates-fleet to 127.0.0.1:24799 fresh_wall 1794118475993333740
+   r23 LD-DIAL slates-fleet to 127.0.0.1:24799 fresh_wall 1794118475994765696
+   r23 LD-DIAL LD-DIAL slates-fleetslates-fleet to  to 127127..00..00..11::2479724795 began_wall  began_wall 17941184760439734611794118476043857493 ended_wall  ended_wall 17941184760451684401794118476045176919 budgets_spent_before  budgets_spent_before 00 outcome  ou
+   r23 LD-DIAL slates-fleet to 127.0.0.1:24797 began_wall 1794118476090640334 ended_wall 1794118476092008126 budgets_spent_before 0 outcome Ok(())
+   r23 LD-DIAL slates-fleet to 127.0.0.1:24799 began_wall 1794118476094502829 ended_wall 1794118476096269835 budgets_spent_before 0 outcome Ok(())
+   r23 LD-DIAL slates-fleet to 127.0.0.1:24799 began_wall 1794118476095032675 ended_wall 1794118476096732869 budgets_spent_before 0 outcome Ok(())
+   r23 LD-RESUME chaos-rolling-a-21138 wall_ns 1794118478882113611
+   r23 LD-DIAL slates-fleet to 127.0.0.1:24795 fresh_wall 1794118478954608647
+   r23 LD-DIAL slates-fleet to 127.0.0.1:24795 fresh_wall 1794118478956206737
+   r23 LD-DIAL slates-fleet to 127.0.0.1:24795 began_wall 1794118479055085831 ended_wall 1794118479058500204 budgets_spent_before 0 outcome Ok(())
+   r23 LD-DIAL slates-fleet to 127.0.0.1:24795 began_wall 1794118479057264907 ended_wall 1794118479060152762 budgets_spent_before 0 outcome Ok(())
+   r23 LD-SERVE at 3308888457 wall_ns 1794118479109147098 install from 6640474344169918500 bytes 11304448 took_ns 10542460 gap_ns Some(2217421739)
+   r23 LD-SERVE at 3502730418 wall_ns 1794118479302083548 install from 6640474344169918500 bytes 13820736 took_ns 9636893 gap_ns Some(183299501)
+   r23 LD-RESUME chaos-rolling-c-21138 wall_ns 1794118481105804596
+   r23 LD-DIAL slates-fleet to 127.0.0.1:24799 fresh_wall 1794118481165719775
+   r23 LD-DIAL slates-fleet to 127.0.0.1:24799 fresh_wall 1794118481188139440
+   r23 LD-DIAL slates-fleet to 127.0.0.1:24799 began_wall 1794118481269153369 ended_wall 1794118481270907217 budgets_spent_before 0 outcome Ok(())
+   r23 LD-DIAL slates-fleet to 127.0.0.1:24799 began_wall 1794118481288393478 ended_wall 1794118481290868959 budgets_spent_before 0 outcome Ok(())
+   r23 LD-SERVE at 5444765013 wall_ns 1794118481328491865 install from 6640474344169918500 bytes 13820736 took_ns 1719434 gap_ns Some(220652511)
+   r23 LD-SERVE at 5613282599 wall_ns 1794118481507046119 install from 6640474344169918500 bytes 23448226 took_ns 11756198 gap_ns Some(166798152)
+  3687 writes, 3687 acknowledged: p50 489 us, p99 5488 us, p999 38207 us, max 257747 us; 2 over 50ms (sent+took): 0.00s+133ms 2.32s+258ms
+  chaos-rolling-a-21766 partitioned from 181.399431ms to 2.181489117s
+  chaos-rolling-a-21766 refused the owner: {}
+  chaos-rolling-b-21766 refused the owner: {}
+  chaos-rolling-c-21766 partitioned from 2.318220086s to 4.318318115s
+  chaos-rolling-c-21766 refused the owner: {}
+== partition 24 exit 0 stuck 0 long5 0
+   r24 LD-DIAL slates-fleet to 127.0.0.1:32959 began_wall 1794118482132389508 ended_wall 1794118482133984629 budgets_spent_before 0 outcome Ok(())
+   r24 LD-DIAL slates-fleet to 127.0.0.1:32961 began_wall 1794118482079274996 ended_wall 1794118482134414682 budgets_spent_before 0 outcome Ok(())
+   r24 LD-DIAL slates-fleet to 127.0.0.1:32959 began_wall 1794118482191078525 ended_wall 1794118482192931718 budgets_spent_before 0 outcome Ok(())
+   r24 LD-DIAL slates-fleet to 127.0.0.1:32961 began_wall 1794118482191335805 ended_wall 1794118482193157704 budgets_spent_before 0 outcome Ok(())
+   r24 LD-DIAL slates-fleet to 127.0.0.1:32963 began_wall 1794118482132635148 ended_wall 1794118482196197677 budgets_spent_before 0 outcome Ok(())
+   r24 LD-DIAL slates-fleet to 127.0.0.1:32963 began_wall 1794118482079546947 ended_wall 1794118482197341283 budgets_spent_before 0 outcome Ok(())
+   r24 LD-DIAL slates-fleet to 127.0.0.1:32959 fresh_wall 1794118482234594765
+   r24 LD-DIAL slates-fleet to 127.0.0.1:32961 fresh_wall 1794118482235115419
+   r24 LD-DIAL slates-fleet to 127.0.0.1:32959 fresh_wall 1794118482293605170
+   r24 LD-DIAL slates-fleet to 127.0.0.1:32961 fresh_wall 1794118482293882544
+   r24 LD-DIAL slates-fleet to 127.0.0.1:32963 fresh_wall 1794118482296859337
+   r24 LD-DIAL slates-fleet to 127.0.0.1:32963 fresh_wall 1794118482297974089
+   r24 LD-DIAL LD-DIAL slates-fleetslates-fleet to  to 127127..00..00..11::3296132959 began_wall  began_wall 17941184823354398371794118482335324268 ended_wall  ended_wall 17941184823366624151794118482336667606 budgets_spent_before  budgets_spent_before 00 outcome  ou
+   r24 LD-DIAL slates-fleet to 127.0.0.1:32961 began_wall 1794118482394107904 ended_wall 1794118482395672020 budgets_spent_before 0 outcome Ok(())
+   r24 LD-DIAL slates-fleet to 127.0.0.1:32959 began_wall 1794118482394037501 ended_wall 1794118482395940034 budgets_spent_before 0 outcome Ok(())
+   r24 LD-DIAL slates-fleet to 127.0.0.1:32963 began_wall 1794118482397741191 ended_wall 1794118482399491127 budgets_spent_before 0 outcome Ok(())
+   r24 LD-RESUME chaos-rolling-a-21766 wall_ns 1794118485395289707
+   r24 LD-DIAL slates-fleet to 127.0.0.1:32959 fresh_wall 1794118485413957135
+   r24 LD-DIAL slates-fleet to 127.0.0.1:32959 fresh_wall 1794118485446790127
+   r24 LD-DIAL slates-fleet to 127.0.0.1:32959 began_wall 1794118485514213000 ended_wall 1794118485516293371 budgets_spent_before 0 outcome Ok(())
+   r24 LD-DIAL slates-fleet to 127.0.0.1:32959 began_wall 1794118485547434808 ended_wall 1794118485550828630 budgets_spent_before 0 outcome Ok(())
+   r24 LD-SERVE at 3551867720 wall_ns 1794118485634205233 install from 17280433514993437322 bytes 8578724 took_ns 6497368 gap_ns Some(2232685138)
+   r24 LD-SERVE at 3704774693 wall_ns 1794118485785754789 install from 17280433514993437322 bytes 10884680 took_ns 5139951 gap_ns Some(146409605)
+   r24 LD-RESUME chaos-rolling-c-21766 wall_ns 1794118487532118481
+   r24 LD-DIAL slates-fleet to 127.0.0.1:32963 fresh_wall 1794118487554560419
+   r24 LD-DIAL slates-fleet to 127.0.0.1:32963 fresh_wall 1794118487596281898
+   r24 LD-DIAL slates-fleet to 127.0.0.1:32963 began_wall 1794118487655466563 ended_wall 1794118487659753744 budgets_spent_before 0 outcome Ok(())
+   r24 LD-DIAL slates-fleet to 127.0.0.1:32963 began_wall 1794118487698093992 ended_wall 1794118487702336368 budgets_spent_before 0 outcome Ok(())
+   r24 LD-SERVE at 5538029975 wall_ns 1794118487732243612 install from 17280433514993437322 bytes 10884680 took_ns 7896406 gap_ns Some(2193244848)
+   r24 LD-SERVE at 5733495237 wall_ns 1794118487930118640 install from 17280433514993437322 bytes 16152908 took_ns 10306404 gap_ns Some(187568856)
+  4860 writes, 4860 acknowledged: p50 387 us, p99 3077 us, p999 17370 us, max 323584 us; 2 over 50ms (sent+took): 0.00s+130ms 2.24s+324ms
+  chaos-rolling-a-22385 partitioned from 163.622142ms to 2.163720028s
+  chaos-rolling-a-22385 refused the owner: {}
+  chaos-rolling-b-22385 refused the owner: {}
+  chaos-rolling-c-22385 partitioned from 2.239763956s to 4.241763378s
+  chaos-rolling-c-22385 refused the owner: {}
+== partition 25 exit 0 stuck 0 long5 0
+   r25 LD-DIAL slates-fleet to 127.0.0.1:41006 began_wall 1794118488444768614 ended_wall 1794118488446419189 budgets_spent_before 0 outcome Ok(())
+   r25 LD-DIAL slates-fleet to 127.0.0.1:41008 began_wall 1794118488398523857 ended_wall 1794118488446894750 budgets_spent_before 0 outcome Ok(())
+   r25 LD-DIAL slates-fleet to 127.0.0.1:41006 began_wall 1794118488489111014 ended_wall 1794118488491534371 budgets_spent_before 0 outcome Ok(())
+   r25 LD-DIAL slates-fleet to 127.0.0.1:41008 began_wall 1794118488489378477 ended_wall 1794118488491866893 budgets_spent_before 0 outcome Ok(())
+   r25 LD-DIAL slates-fleet to 127.0.0.1:41010 began_wall 1794118488398791688 ended_wall 1794118488493871965 budgets_spent_before 0 outcome Ok(())
+   r25 LD-DIAL slates-fleet to 127.0.0.1:41010 began_wall 1794118488445017854 ended_wall 1794118488495220470 budgets_spent_before 0 outcome Ok(())
+   r25 LD-DIAL slates-fleet to 127.0.0.1:41006 fresh_wall 1794118488547500833
+   r25 LD-DIAL slates-fleet to 127.0.0.1:41008 fresh_wall 1794118488547577500
+   r25 LD-DIAL slates-fleet to 127.0.0.1:41006 fresh_wall 1794118488592270125
+   r25 LD-DIAL slates-fleet to 127.0.0.1:41008 fresh_wall 1794118488592482344
+   r25 LD-DIAL slates-fleet to 127.0.0.1:41010 fresh_wall 1794118488596235647
+   r25 LD-DIAL slates-fleet to 127.0.0.1:41010 fresh_wall 1794118488597926747
+   r25 LD-DIAL LD-DIAL slates-fleetslates-fleet to  to 127127..00..00..11::4100841006 began_wall  began_wall 17941184886479491421794118488647838509 ended_wall  ended_wall 17941184886491936541794118488649203878 budgets_spent_before  budgets_spent_before 00 outcome  ou
+   r25 LD-DIAL slates-fleet to 127.0.0.1:41006 began_wall 1794118488693165126 ended_wall 1794118488694726770 budgets_spent_before 0 outcome Ok(())
+   r25 LD-DIAL slates-fleet to 127.0.0.1:41008 began_wall 1794118488693224322 ended_wall 1794118488694956091 budgets_spent_before 0 outcome Ok(())
+   r25 LD-DIAL slates-fleet to 127.0.0.1:41010 began_wall 1794118488697091514 ended_wall 1794118488698280630 budgets_spent_before 0 outcome Ok(())
+   r25 LD-DIAL slates-fleet to 127.0.0.1:41010 began_wall 1794118488698331827 ended_wall 1794118488699674189 budgets_spent_before 0 outcome Ok(())
+   r25 LD-RESUME chaos-rolling-a-22385 wall_ns 1794118492405797167
+   r25 LD-DIAL slates-fleet to 127.0.0.1:41006 fresh_wall 1794118492463463473
+   r25 LD-DIAL slates-fleet to 127.0.0.1:41006 began_wall 1794118492564382806 ended_wall 1794118492565785766 budgets_spent_before 0 outcome Ok(())
+   r25 LD-SERVE at 4248037815 wall_ns 1794118492647418944 install from 17012415573024842267 bytes 5572116 took_ns 3846433 gap_ns Some(2371744774)
+   r25 LD-SERVE at 4402192088 wall_ns 1794118492802797713 install from 17012415573024842267 bytes 11401618 took_ns 5070881 gap_ns Some(150307840)
+   r25 LD-DIAL slates-fleet to 127.0.0.1:41006 fresh_wall 1794118494481985514
+   r25 LD-RESUME chaos-rolling-c-22385 wall_ns 1794118494483842349
+   r25 LD-DIAL slates-fleet to 127.0.0.1:41010 fresh_wall 1794118494513747139
+   r25 LD-DIAL slates-fleet to 127.0.0.1:41010 fresh_wall 1794118494528743823
+   r25 LD-DIAL slates-fleet to 127.0.0.1:41006 began_wall 1794118494582284672 ended_wall 1794118494587752519 budgets_spent_before 0 outcome Ok(())
+   r25 LD-DIAL slates-fleet to 127.0.0.1:41010 began_wall 1794118494619158169 ended_wall 1794118494620567560 budgets_spent_before 0 outcome Ok(())
+   r25 LD-DIAL slates-fleet to 127.0.0.1:41010 began_wall 1794118494644642776 ended_wall 1794118494647106575 budgets_spent_before 0 outcome Ok(())
+   r25 LD-SERVE at 6208981448 wall_ns 1794118494702632422 install from 17012415573024842267 bytes 11401618 took_ns 7942966 gap_ns Some(2212942837)
+   r25 LD-SERVE at 6412432515 wall_ns 1794118494906902804 install from 17012415573024842267 bytes 21319314 took_ns 8762249 gap_ns Some(195508101)
+  2862 writes, 2862 acknowledged: p50 1172 us, p99 5455 us, p999 37584 us, max 127610 us; 1 over 50ms (sent+took): 0.01s+128ms
+  chaos-rolling-a-23101 partitioned from 209.471229ms to 2.209591124s
+  chaos-rolling-a-23101 refused the owner: {}
+  chaos-rolling-b-23101 refused the owner: {}
+  chaos-rolling-c-23101 partitioned from 2.42865028s to 4.42879706s
+  chaos-rolling-c-23101 refused the owner: {}
+== partition 26 exit 0 stuck 0 long5 0
+   r26 LD-DIAL slates-fleet to 127.0.0.1:20314 began_wall 1794118495506397230 ended_wall 1794118495508175845 budgets_spent_before 0 outcome Ok(())
+   r26 LD-DIAL slates-fleet to 127.0.0.1:20316 began_wall 1794118495459872622 ended_wall 1794118495508599370 budgets_spent_before 0 outcome Ok(())
+   r26 LD-DIAL slates-fleet to 127.0.0.1:20314 began_wall 1794118495562993508 ended_wall 1794118495564853975 budgets_spent_before 0 outcome Ok(())
+   r26 LD-DIAL slates-fleet to 127.0.0.1:20316 began_wall 1794118495563211594 ended_wall 1794118495565175705 budgets_spent_before 0 outcome Ok(())
+   r26 LD-DIAL slates-fleet to 127.0.0.1:20318 began_wall 1794118495460153753 ended_wall 1794118495566501556 budgets_spent_before 0 outcome Ok(())
+   r26 LD-DIAL slates-fleet to 127.0.0.1:20318 began_wall 1794118495506650523 ended_wall 1794118495567100233 budgets_spent_before 0 outcome Ok(())
+   r26 LD-DIAL slates-fleet to 127.0.0.1:20314 fresh_wall 1794118495609497357
+   r26 LD-DIAL slates-fleet to 127.0.0.1:20316 fresh_wall 1794118495609589713
+   r26 LD-DIAL slates-fleet to 127.0.0.1:20314 fresh_wall 1794118495665838130
+   r26 LD-DIAL slates-fleet to 127.0.0.1:20316 fresh_wall 1794118495666107009
+   r26 LD-DIAL slates-fleet to 127.0.0.1:20318 fresh_wall 1794118495667954299
+   r26 LD-DIAL slates-fleet to 127.0.0.1:20318 fresh_wall 1794118495668749409
+   r26 LD-DIAL LD-DIAL slates-fleet to slates-fleet127 to .1270..00..01.:120316: began_wall 203141794118495710367837 began_wall  ended_wall 17941184957104850621794118495711759005 ended_wall  budgets_spent_before 17941184957117619640 budgets_spent_before  outcome 0Ok 
+   r26 LD-DIAL slates-fleet to 127.0.0.1:20314 began_wall 1794118495766762543 ended_wall 1794118495768386335 budgets_spent_before 0 outcome Ok(())
+   r26 LD-DIAL slates-fleet to 127.0.0.1:20316 began_wall 1794118495766836226 ended_wall 1794118495769101090 budgets_spent_before 0 outcome Ok(())
+   r26 LD-DIAL slates-fleet to 127.0.0.1:20318 began_wall 1794118495768472722 ended_wall 1794118495769985514 budgets_spent_before 0 outcome Ok(())
+   r26 LD-DIAL slates-fleet to 127.0.0.1:20318 began_wall 1794118495769163198 ended_wall 1794118495770571253 budgets_spent_before 0 outcome Ok(())
+   r26 LD-RESUME chaos-rolling-a-23101 wall_ns 1794118499611898793
+   r26 LD-DIAL slates-fleet to 127.0.0.1:20314 fresh_wall 1794118499625993713
+   r26 LD-DIAL slates-fleet to 127.0.0.1:20314 fresh_wall 1794118499680494619
+   r26 LD-DIAL slates-fleet to 127.0.0.1:20314 began_wall 1794118499726265184 ended_wall 1794118499731532057 budgets_spent_before 0 outcome Ok(())
+   r26 LD-SERVE at 4306663954 wall_ns 1794118499765916945 install from 10246162916820469709 bytes 3200881 took_ns 2430406 gap_ns Some(2330647618)
+   r26 LD-DIAL slates-fleet to 127.0.0.1:20314 began_wall 1794118499780746939 ended_wall 1794118499782647810 budgets_spent_before 0 outcome Ok(())
+   r26 LD-SERVE at 4385904912 wall_ns 1794118499848175263 install from 10246162916820469709 bytes 6931300 took_ns 5447886 gap_ns Some(76810552)
+   r26 LD-DIAL slates-fleet to 127.0.0.1:20318 fresh_wall 1794118501902217947
+   r26 LD-DIAL slates-fleet to 127.0.0.1:20318 fresh_wall 1794118501914329324
+   r26 LD-DIAL slates-fleet to 127.0.0.1:20318 began_wall 1794118502002535900 ended_wall 1794118502005536695 budgets_spent_before 0 outcome Ok(())
+   r26 LD-DIAL slates-fleet to 127.0.0.1:20318 began_wall 1794118502014575970 ended_wall 1794118502016767448 budgets_spent_before 0 outcome Ok(())
+   r26 LD-SERVE at 6507458600 wall_ns 1794118502072930045 install from 10246162916820469709 bytes 10787042 took_ns 8032148 gap_ns Some(2231881575)
+  4551 writes, 4551 acknowledged: p50 445 us, p99 4528 us, p999 42934 us, max 166604 us; 3 over 50ms (sent+took): 0.00s+167ms 2.32s+75ms 2.46s+158ms
+  chaos-rolling-a-23845 refused the owner: {}
+  chaos-rolling-b-23845 partitioned from 251.091658ms to 2.251199602s
+  chaos-rolling-b-23845 refused the owner: {}
+  chaos-rolling-c-23845 partitioned from 2.461380354s to 4.461508153s
+  chaos-rolling-c-23845 refused the owner: {}
+== partition 27 exit 0 stuck 0 long5 0
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29986 began_wall 1794118502791067946 ended_wall 1794118502793204387 budgets_spent_before 0 outcome Ok(())
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29988 began_wall 1794118502743433857 ended_wall 1794118502794818885 budgets_spent_before 0 outcome Ok(())
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29986 began_wall 1794118502838566859 ended_wall 1794118502841095547 budgets_spent_before 0 outcome Ok(())
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29988 began_wall 1794118502838835586 ended_wall 1794118502842539920 budgets_spent_before 0 outcome Ok(())
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29990 began_wall 1794118502743674322 ended_wall 1794118502844142146 budgets_spent_before 0 outcome Ok(())
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29990 began_wall 1794118502791340001 ended_wall 1794118502845064472 budgets_spent_before 0 outcome Ok(())
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29986 fresh_wall 1794118502894483264
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29988 fresh_wall 1794118502895142110
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29986 fresh_wall 1794118502941583810
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29988 fresh_wall 1794118502943954932
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29990 fresh_wall 1794118502944830189
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29990 fresh_wall 1794118502946009738
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29986 began_wall 1794118502994835911 ended_wall 1794118502996669971 budgets_spent_before 0 outcome Ok(())
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29988 began_wall 1794118502995567937 ended_wall 1794118502997361232 budgets_spent_before 0 outcome Ok(())
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29986 began_wall 1794118503042339792 ended_wall 1794118503046123137 budgets_spent_before 0 outcome Ok(())
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29988 began_wall 1794118503046309461 ended_wall 1794118503048771161 budgets_spent_before 0 outcome Ok(())
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29990 began_wall 1794118503046403983 ended_wall 1794118503049565839 budgets_spent_before 0 outcome Ok(())
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29990 began_wall 1794118503045042741 ended_wall 1794118503049730461 budgets_spent_before 0 outcome Ok(())
+   r27 LD-RESUME chaos-rolling-b-23845 wall_ns 1794118506753467244
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29988 fresh_wall 1794118506809595931
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29988 fresh_wall 1794118506851073898
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29988 began_wall 1794118506909869080 ended_wall 1794118506912089364 budgets_spent_before 0 outcome Ok(())
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29988 began_wall 1794118506951498797 ended_wall 1794118506955146278 budgets_spent_before 0 outcome Ok(())
+   r27 LD-SERVE at 4182235759 wall_ns 1794118506973533946 install from 15216768755813110750 bytes 8405732 took_ns 5868972 gap_ns Some(2214466472)
+   r27 LD-SERVE at 4324761297 wall_ns 1794118507115152222 install from 15216768755813110750 bytes 11064646 took_ns 4961790 gap_ns Some(136656566)
+   r27 LD-RESUME chaos-rolling-c-23845 wall_ns 1794118508963768475
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29990 fresh_wall 1794118509014933591
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29990 fresh_wall 1794118509056223358
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29990 began_wall 1794118509115355334 ended_wall 1794118509118228601 budgets_spent_before 0 outcome Ok(())
+   r27 LD-SERVE at 6318661339 wall_ns 1794118509161158474 install from 15216768755813110750 bytes 11064646 took_ns 8795528 gap_ns Some(2188841646)
+   r27 LD-DIAL slates-fleet to 127.0.0.1:29990 began_wall 1794118509157077266 ended_wall 1794118509163440890 budgets_spent_before 0 outcome Ok(())
+   r27 LD-SERVE at 6549341288 wall_ns 1794118509391473429 install from 15216768755813110750 bytes 19957358 took_ns 8430646 gap_ns Some(221884421)
+  3320 writes, 3320 acknowledged: p50 935 us, p99 6790 us, p999 46844 us, max 126013 us; 2 over 50ms (sent+took): 0.00s+126ms 2.22s+69ms
+  chaos-rolling-a-24538 partitioned from 184.6292ms to 2.185684378s
+  chaos-rolling-a-24538 refused the owner: {}
+  chaos-rolling-b-24538 refused the owner: {}
+  chaos-rolling-c-24538 partitioned from 2.438059708s to 4.438484518s
+  chaos-rolling-c-24538 refused the owner: {}
+== partition 28 exit 0 stuck 0 long5 0
+   r28 LD-DIAL slates-fleet to 127.0.0.1:38995 began_wall 1794118510034980794 ended_wall 1794118510036672176 budgets_spent_before 0 outcome Ok(())
+   r28 LD-DIAL slates-fleet to 127.0.0.1:38997 began_wall 1794118509990119963 ended_wall 1794118510037063839 budgets_spent_before 0 outcome Ok(())
+   r28 LD-DIAL slates-fleet to 127.0.0.1:38995 began_wall 1794118510081590948 ended_wall 1794118510083771491 budgets_spent_before 0 outcome Ok(())
+   r28 LD-DIAL slates-fleet to 127.0.0.1:38997 began_wall 1794118510081886817 ended_wall 1794118510084014899 budgets_spent_before 0 outcome Ok(())
+   r28 LD-DIAL slates-fleet to 127.0.0.1:38999 began_wall 1794118509990405729 ended_wall 1794118510086270782 budgets_spent_before 0 outcome Ok(())
+   r28 LD-DIAL slates-fleet to 127.0.0.1:38999 began_wall 1794118510035234378 ended_wall 1794118510087690437 budgets_spent_before 0 outcome Ok(())
+   r28 LD-DIAL slates-fleet to 127.0.0.1:38995 fresh_wall 1794118510137157635
+   r28 LD-DIAL slates-fleet to 127.0.0.1:38997 fresh_wall 1794118510137690721
+   r28 LD-DIAL slates-fleet to 127.0.0.1:38997 fresh_wall 1794118510184764494
+   r28 LD-DIAL slates-fleet to 127.0.0.1:38995 fresh_wall 1794118510185026917
+   r28 LD-DIAL slates-fleet to 127.0.0.1:38999 fresh_wall 1794118510187958189
+   r28 LD-DIAL slates-fleet to 127.0.0.1:38999 fresh_wall 1794118510189093310
+   r28 LD-DIAL LD-DIAL slates-fleetslates-fleet to  to 127127..00..00..11::3899538997 began_wall  began_wall 17941185102382933091794118510238440340 ended_wall  ended_wall 17941185102397103001794118510239708044 budgets_spent_before  budgets_spent_before 00 outcome  ou
+   r28 LD-DIAL slates-fleet to 127.0.0.1:38995 began_wall 1794118510285628697 ended_wall 1794118510287223797 budgets_spent_before 0 outcome Ok(())
+   r28 LD-DIAL slates-fleet to 127.0.0.1:38999 began_wall 1794118510288677593 ended_wall 1794118510289926851 budgets_spent_before 0 outcome Ok(())
+   r28 LD-DIAL slates-fleet to 127.0.0.1:38999 began_wall 1794118510289879614 ended_wall 1794118510291216442 budgets_spent_before 0 outcome Ok(())
+   r28 LD-RESUME chaos-rolling-a-24538 wall_ns 1794118514018471911
+   r28 LD-DIAL slates-fleet to 127.0.0.1:38995 fresh_wall 1794118514052992392
+   r28 LD-DIAL slates-fleet to 127.0.0.1:38995 fresh_wall 1794118514099129863
+   r28 LD-DIAL slates-fleet to 127.0.0.1:38995 began_wall 1794118514153917255 ended_wall 1794118514155756620 budgets_spent_before 0 outcome Ok(())
+   r28 LD-SERVE at 4197191764 wall_ns 1794118514189476455 install from 11725614283985673012 bytes 3187914 took_ns 5524157 gap_ns Some(2324240591)
+   r28 LD-DIAL slates-fleet to 127.0.0.1:38995 began_wall 1794118514199595683 ended_wall 1794118514201730229 budgets_spent_before 0 outcome Ok(())
+   r28 LD-SERVE at 4287202048 wall_ns 1794118514280523034 install from 11725614283985673012 bytes 8481800 took_ns 6560236 gap_ns Some(84486127)
+   r28 LD-RESUME chaos-rolling-c-24538 wall_ns 1794118516271274147
+   r28 LD-DIAL slates-fleet to 127.0.0.1:38999 fresh_wall 1794118516324852143
+   r28 LD-DIAL slates-fleet to 127.0.0.1:38999 fresh_wall 1794118516341380938
+   r28 LD-DIAL slates-fleet to 127.0.0.1:38999 began_wall 1794118516425101529 ended_wall 1794118516427147585 budgets_spent_before 0 outcome Ok(())
+   r28 LD-DIAL slates-fleet to 127.0.0.1:38999 began_wall 1794118516441615564 ended_wall 1794118516443468344 budgets_spent_before 0 outcome Ok(())
+   r28 LD-SERVE at 6449907934 wall_ns 1794118516538134277 install from 11725614283985673012 bytes 13369652 took_ns 10412406 gap_ns Some(2258420140)
+  3874 writes, 3874 acknowledged: p50 587 us, p99 4743 us, p999 46032 us, max 206907 us; 3 over 50ms (sent+took): 0.00s+129ms 2.14s+62ms 2.32s+207ms
+  chaos-rolling-a-25268 partitioned from 176.84809ms to 2.176980024s
+  chaos-rolling-a-25268 refused the owner: {}
+  chaos-rolling-b-25268 refused the owner: {}
+  chaos-rolling-c-25268 partitioned from 2.324223001s to 4.324370374s
+  chaos-rolling-c-25268 refused the owner: {}
+== partition 29 exit 0 stuck 0 long5 0
+   r29 LD-DIAL slates-fleet to 127.0.0.1:48485 began_wall 1794118517172032795 ended_wall 1794118517173809667 budgets_spent_before 0 outcome Ok(())
+   r29 LD-DIAL slates-fleet to 127.0.0.1:48487 began_wall 1794118517125536573 ended_wall 1794118517174306763 budgets_spent_before 0 outcome Ok(())
+   r29 LD-DIAL slates-fleet to 127.0.0.1:48485 began_wall 1794118517218916473 ended_wall 1794118517220879661 budgets_spent_before 0 outcome Ok(())
+   r29 LD-DIAL slates-fleet to 127.0.0.1:48487 began_wall 1794118517219178176 ended_wall 1794118517221115750 budgets_spent_before 0 outcome Ok(())
+   r29 LD-DIAL slates-fleet to 127.0.0.1:48489 began_wall 1794118517125807211 ended_wall 1794118517223342185 budgets_spent_before 0 outcome Ok(())
+   r29 LD-DIAL slates-fleet to 127.0.0.1:48489 began_wall 1794118517172304002 ended_wall 1794118517224066003 budgets_spent_before 0 outcome Ok(())
+   r29 LD-DIAL slates-fleet to 127.0.0.1:48485 fresh_wall 1794118517274098274
+   r29 LD-DIAL slates-fleet to 127.0.0.1:48487 fresh_wall 1794118517275125817
+   r29 LD-DIAL slates-fleet to 127.0.0.1:48487 fresh_wall 1794118517321399574
+   r29 LD-DIAL slates-fleet to 127.0.0.1:48485 fresh_wall 1794118517322733722
+   r29 LD-DIAL slates-fleet to 127.0.0.1:48489 fresh_wall 1794118517324889865
+   r29 LD-DIAL slates-fleet to 127.0.0.1:48489 fresh_wall 1794118517325399113
+   r29 LD-DIAL LD-DIAL slates-fleetslates-fleet to  to 127127..00..00..11::4848548487 began_wall  began_wall 17941185173744216001794118517377334792 ended_wall  ended_wall 17941185173786516931794118517378665828 budgets_spent_before  budgets_spent_before 00 outcome  ou
+   r29 LD-DIAL slates-fleet to 127.0.0.1:48487 began_wall 1794118517422528288 ended_wall 1794118517424055616 budgets_spent_before 0 outcome Ok(())
+   r29 LD-DIAL slates-fleet to 127.0.0.1:48485 began_wall 1794118517424603717 ended_wall 1794118517426823441 budgets_spent_before 0 outcome Ok(())
+   r29 LD-DIAL slates-fleet to 127.0.0.1:48489 began_wall 1794118517425153346 ended_wall 1794118517427743135 budgets_spent_before 0 outcome Ok(())
+   r29 LD-DIAL slates-fleet to 127.0.0.1:48489 began_wall 1794118517426049410 ended_wall 1794118517428283205 budgets_spent_before 0 outcome Ok(())
+   r29 LD-RESUME chaos-rolling-a-25268 wall_ns 1794118520235882858
+   r29 LD-DIAL slates-fleet to 127.0.0.1:48485 fresh_wall 1794118520258821225
+   r29 LD-DIAL slates-fleet to 127.0.0.1:48485 fresh_wall 1794118520285866500
+   r29 LD-DIAL slates-fleet to 127.0.0.1:48485 began_wall 1794118520359130375 ended_wall 1794118520360802430 budgets_spent_before 0 outcome Ok(())
+   r29 LD-DIAL slates-fleet to 127.0.0.1:48485 began_wall 1794118520386140853 ended_wall 1794118520387540996 budgets_spent_before 0 outcome Ok(())
+   r29 LD-SERVE at 3321051677 wall_ns 1794118520448668246 install from 12418623379646619461 bytes 7749358 took_ns 5591167 gap_ns Some(206326244)
+   r29 LD-SERVE at 3459554215 wall_ns 1794118520586166719 install from 12418623379646619461 bytes 10285122 took_ns 4587102 gap_ns Some(132911371)
+   r29 LD-RESUME chaos-rolling-c-25268 wall_ns 1794118522383271984
+   r29 LD-DIAL slates-fleet to 127.0.0.1:48489 fresh_wall 1794118522438126638
+   r29 LD-DIAL slates-fleet to 127.0.0.1:48489 fresh_wall 1794118522463584942
+   r29 LD-DIAL slates-fleet to 127.0.0.1:48489 began_wall 1794118522538414878 ended_wall 1794118522541663985 budgets_spent_before 0 outcome Ok(())
+   r29 LD-DIAL slates-fleet to 127.0.0.1:48489 began_wall 1794118522564111358 ended_wall 1794118522565532661 budgets_spent_before 0 outcome Ok(())
+   r29 LD-SERVE at 5424178048 wall_ns 1794118522648232684 install from 12418623379646619461 bytes 10285122 took_ns 8280101 gap_ns Some(2259469149)
+   r29 LD-SERVE at 5624080178 wall_ns 1794118522850874705 install from 12418623379646619461 bytes 16977472 took_ns 11019816 gap_ns Some(191622029)
+  2875 writes, 2875 acknowledged: p50 1063 us, p99 6304 us, p999 27289 us, max 257937 us; 2 over 50ms (sent+took): 0.01s+150ms 2.50s+258ms
+  chaos-rolling-a-25869 refused the owner: {}
+  chaos-rolling-b-25869 partitioned from 386.121538ms to 2.38786416s
+  chaos-rolling-b-25869 refused the owner: {}
+  chaos-rolling-c-25869 partitioned from 2.500868497s to 4.500984582s
+  chaos-rolling-c-25869 refused the owner: {}
+== partition 30 exit 0 stuck 0 long5 0
+   r30 LD-DIAL slates-fleet to 127.0.0.1:26298 began_wall 1794118523410331022 ended_wall 1794118523411961871 budgets_spent_before 0 outcome Ok(())
+   r30 LD-DIAL slates-fleet to 127.0.0.1:26300 began_wall 1794118523358639407 ended_wall 1794118523412488165 budgets_spent_before 0 outcome Ok(())
+   r30 LD-DIAL slates-fleet to 127.0.0.1:26300 began_wall 1794118523471932538 ended_wall 1794118523473344192 budgets_spent_before 0 outcome Ok(())
+   r30 LD-DIAL slates-fleet to 127.0.0.1:26302 began_wall 1794118523410603500 ended_wall 1794118523476035070 budgets_spent_before 0 outcome Ok(())
+   r30 LD-DIAL slates-fleet to 127.0.0.1:26302 began_wall 1794118523358917590 ended_wall 1794118523476337523 budgets_spent_before 0 outcome Ok(())
+   r30 LD-DIAL slates-fleet to 127.0.0.1:26298 began_wall 1794118523471656987 ended_wall 1794118523476817197 budgets_spent_before 0 outcome Ok(())
+   r30 LD-DIAL slates-fleet to 127.0.0.1:26298 fresh_wall 1794118523512458505
+   r30 LD-DIAL slates-fleet to 127.0.0.1:26300 fresh_wall 1794118523513154453
+   r30 LD-DIAL slates-fleet to 127.0.0.1:26300 fresh_wall 1794118523573931389
+   r30 LD-DIAL slates-fleet to 127.0.0.1:26302 fresh_wall 1794118523577045184
+   r30 LD-DIAL slates-fleet to 127.0.0.1:26298 fresh_wall 1794118523577469518
+   r30 LD-DIAL slates-fleet to 127.0.0.1:26302 fresh_wall 1794118523577826071
+   r30 LD-DIAL slates-fleet to 127.0.0.1:26298 began_wall 1794118523612678517 ended_wall 1794118523614578701 budgets_spent_before 0 outcome Ok(())
+   r30 LD-DIAL slates-fleet to 127.0.0.1:26300 began_wall 1794118523613787551 ended_wall 1794118523616065695 budgets_spent_before 0 outcome Ok(())
+   r30 LD-DIAL slates-fleet to 127.0.0.1:26300 began_wall 1794118523674160129 ended_wall 1794118523675781866 budgets_spent_before 0 outcome Ok(())
+   r30 LD-DIAL slates-fleet to 127.0.0LD-DIAL .slates-fleet1 to :12726298. began_wall 01794118523677808546. ended_wall 01794118523679286493. budgets_spent_before 10: outcome 26302Ok began_wall (1794118523677244374() ended_wall )1794118523679302964
+   r30 LD-DIAL slates-fleet to 127.0.0.1:26302 began_wall 1794118523678426043 ended_wall 1794118523680641607 budgets_spent_before 0 outcome Ok(())
+   r30 LD-RESUME chaos-rolling-b-25869 wall_ns 1794118527620273727
+   r30 LD-DIAL slates-fleet to 127.0.0.1:26300 fresh_wall 1794118527646463041
+   r30 LD-DIAL slates-fleet to 127.0.0.1:26300 fresh_wall 1794118527695757944
+   r30 LD-DIAL slates-fleet to 127.0.0.1:26300 began_wall 1794118527746744437 ended_wall 1794118527748300330 budgets_spent_before 0 outcome Ok(())
+   r30 LD-SERVE at 4431805287 wall_ns 1794118527842159956 install from 8405432697315643044 bytes 4487940 took_ns 3354901 gap_ns Some(2226487551)
+   r30 LD-SERVE at 4579402175 wall_ns 1794118527992119134 install from 8405432697315643044 bytes 7470222 took_ns 5717039 gap_ns Some(144241987)
+   r30 LD-RESUME chaos-rolling-c-25869 wall_ns 1794118529733390372
+   r30 LD-DIAL slates-fleet to 127.0.0.1:26300 began_wall 1794118529734159636 ended_wall 1794118529736740185 budgets_spent_before 0 outcome Ok(())
+   r30 LD-DIAL slates-fleet to 127.0.0.1:26302 fresh_wall 1794118529810812452
+   r30 LD-DIAL slates-fleet to 127.0.0.1:26302 fresh_wall 1794118529820030486
+   r30 LD-DIAL slates-fleet to 127.0.0.1:26302 began_wall 1794118529911620855 ended_wall 1794118529913091594 budgets_spent_before 0 outcome Ok(())
+   r30 LD-DIAL slates-fleet to 127.0.0.1:26302 began_wall 1794118529920889421 ended_wall 1794118529922325938 budgets_spent_before 0 outcome Ok(())
+   r30 LD-SERVE at 6544174598 wall_ns 1794118530016067955 install from 8405432697315643044 bytes 7470222 took_ns 5390868 gap_ns Some(2275151606)
+   r30 LD-SERVE at 6715103621 wall_ns 1794118530187777288 install from 8405432697315643044 bytes 12576946 took_ns 6171162 gap_ns Some(165538155)
+== captured 0
