@@ -3158,7 +3158,7 @@ async fn start_shard(
   let took_us = started.elapsed().as_micros();
   match outcome {
     Ok(sliced) => slates_machine::log_line!(
-      "slates-server: shard {partition} initialized in {took_us} µs, {} µs of its CPU, in {} slices of {} units; the longest slice {} µs, the most CPU in one {} µs, ending at unit {} (a slice's budget {} µs)",
+      "slates-server: shard {partition} initialized in {took_us} µs, {} µs of its CPU, in {} slices of {} units; the longest slice {} µs, the most CPU in one {} µs, ending at unit {} (a slice's floor {} µs, {} µs yielding)",
       sliced.cpu_ns.map_or_else(
         || "unread".to_owned(),
         |cpu| (cpu / NANOS_PER_MICRO).to_string()
@@ -3168,7 +3168,8 @@ async fn start_shard(
       sliced.longest_ns / NANOS_PER_MICRO,
       sliced.longest_cpu_ns / NANOS_PER_MICRO,
       sliced.longest_cpu_ended_at,
-      sliced.budget_ns / NANOS_PER_MICRO
+      sliced.budget_ns / NANOS_PER_MICRO,
+      sliced.yielding_ns / NANOS_PER_MICRO
     ),
     Err(e) => {
       INIT_FAILURES.fetch_add(1, Ordering::AcqRel);

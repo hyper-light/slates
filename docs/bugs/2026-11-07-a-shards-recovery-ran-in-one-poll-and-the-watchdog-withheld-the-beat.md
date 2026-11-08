@@ -37,8 +37,12 @@ lateness, and every successor ran the same recovery: a restart loop the start ju
   state before it is installed, and `init_shard` is async. The boot log's line now reads "shard N initialized in T µs,
   C µs of its CPU, in S slices of U units; the longest slice W µs, the most CPU in one X µs, ending at unit K (a slice's
   budget B µs)".
-- `crates/server/src/recovery_slices.rs` (new): the recovery's slices, each half the live step quantum
-  (`DaemonConfig::copy_slice_ns`), checked against the clock after every unit; the thread's CPU read once a slice.
+- `crates/server/src/recovery_slices.rs` (new): the recovery's slices, each at least half the live step quantum
+  (`DaemonConfig::copy_slice_ns`) and until the recovery has paid for its next yield (the time it spent yielding stays
+  within 5% of the time it has taken, half the plan's 10%), and at most a heartbeat period; checked against the clock
+  after every unit; the thread's CPU read once a slice. At first a slice ended at the live quantum alone: the quantum is
+  1-3 µs on a quiet shard, so nearly every unit ended a slice, and state B (100 works) rose against the unsliced build,
+  +8.7% ambient and +13.8% loaded (median of 5, the same interleaved comparison below).
 - `crates/server/src/verbs.rs`: `rebuild_recovered` is async and yields between units: each record rebuilt, a green's
   replay a unit at a time (`GreenReplay`: its held origin's walk, its engine built or restored at its checkpoint, each
   chain entry), each logged FUSE write replayed (Linux). The order, the fences and every count are unchanged; the sync
@@ -52,8 +56,19 @@ lateness, and every successor ran the same recovery: a restart loop the start ju
 ## Tests
 
 - The test above fails on main for its stated reason (the beat 2.20 s without advancing) and passes with the fix: 16
-  greens recovered in 2.51 s of CPU on shard 1 in 1,320 slices, the most CPU in one slice 152 ms (one green's engine
-  built over its origin, one unit), the beat never older than 495 ms; every green's every file read back.
+  greens over the 78 files the crate has with `recovery_slices.rs` recovered in 2.82 s of CPU in 959 slices of 1,403
+  units, the most CPU in one slice 235 ms (one green's engine built over its origin, one unit), the beat never older
+  than 496 ms, at load 160-220 on this Mac; every green's every file read back. On all four CI runners with the earlier
+  slice rule (diag-liveness-24): ubuntu-latest reached 256 greens, 3.0 s of CPU, the beat no older than 203 ms.
+- Recovery's cost against the unsliced build, interleaved on this Mac over the same recipe, 5 restarts each, release
+  binaries built alike (no LTO), shard 0's CPU from the boot log, median of 5, at 166-206 runnable processes without
+  and 317-357 with 8 nice-19 spinners a CPU (this shared Mac was never quiet; 0 spinning and 0 wedged lines in all 40
+  restarts, the recovered counts right every time). State A (1,000 works): 245.3 to 86.8 ms (-64.6%), 328.6 to 113.1 ms
+  (-65.6%). State B (100 works): 74.3 to 73.6 ms (-1.0%), 88.0 to 71.1 ms (-19.2%). State A falls because the records'
+  sort no longer lists the catalog at each comparison.
+- `crates/server/src/recovery_slices.rs`: a recovery of 4,096 units each as long as this machine's cheapest yield spends
+  at most the plan's 10% of its time yielding (red before the rule: 4,097 slices, 18.5%); a slice at the ceiling ends
+  whatever the yields cost, and a slice past its floor ends only once its yield is paid for.
 - `crates/rt/tests/alone.rs`: a task alone runs through its yields while a task queued before it, one polled in the
   very batch that started it, one spawned from another thread and one spawned by the task itself all wait, then run in
   their order; each of its polls is in a step of its own; a second hold is refused; a shutdown cancels the holder and
@@ -69,6 +84,9 @@ lateness, and every successor ran the same recovery: a restart loop the start ju
   on this Mac. It stays under a window until a partition several times that size.
 - A green's engine built over its origin (`Green::with_origin`, or `restore` at a checkpoint) is one unit: 152 ms here
   for a 77-file origin in a debug build.
+- The yield's own timing counts a preempted yield's whole wait, so under load a recovery yields less often than it
+  could (6-214 slices of 911 units at about 350 runnable processes), down to one a heartbeat period: the ceiling, not the
+  share, then bounds the slice.
 - Sibling, reported: after a restart, a pinned overlay's snapshot taken before it is refused `ConsistentBaseUnavailable`
   as a base for a new green, since the rebuilt base plane holds no listings (`crates/vfs/src/coverage.rs`
   `snapshot_is_complete`); recovery still walks existing greens' held origins from it.

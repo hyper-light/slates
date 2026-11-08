@@ -201,9 +201,9 @@
 > starts killed at 1,001-1,294 ms on this Mac, both Linux and both Windows CI runners; the restart, handoff and start
 > suites green on all four. Open:
 > - ~~a shard's recovery is one poll, which past a window of CPU stops the watchdog's beat~~ **closed 2026-11-07**: the
->   shard's start runs alone (`slates_rt::futures::spawn_alone`) and its recovery yields between units at half the live
->   step quantum; 16 greens over a held 77-file tree recovered in 2.51 s of CPU in 1,320 slices with the beat never older
->   than 495 ms, where main went 2.20 s without a beat
+>   shard's start runs alone (`slates_rt::futures::spawn_alone`) and its recovery yields between units, its yields held to
+>   5% of its time and a slice to a heartbeat period; 16 greens over a held 78-file tree recovered in 2.82 s of CPU in 959
+>   slices with the beat never older than 496 ms, where main went 2.20 s without a beat
 >   (`docs/bugs/2026-11-07-a-shards-recovery-ran-in-one-poll-and-the-watchdog-withheld-the-beat.md`);
 > - the client's reconnect budget (recovery + liveness, 2 s) can still be outlasted by a starved restart (owner clients);
 > - `Facts::query()` gathers every fact to read the identity (676 ms p50 under that load);
@@ -680,7 +680,9 @@
 >   killed (`~/.cache/slates-agents-scratch/loadtest-scale/mem-liveness/live-k32-r3-n1000/anchor.err`).
 > - **2026-11-07, recovery in one poll closed:** a shard's start runs alone and its recovery yields between units (each
 >   record, a green's held origin a directory listing or file a unit, its chain an entry a unit, each logged write),
->   half the live step quantum a slice; the records' sort computes each key once (it recomputed the lineage depth,
+>   at least half the live step quantum a slice, its yields held to 5% of its time, at most a heartbeat period a slice
+>   (state B's CPU -1.0% and -19.2% against the unsliced build, state A's -64.6% and -65.6%, 5 restarts each, 0 spinning
+>   lines; at the live quantum alone state B had risen 8.7% and 13.8%); the records' sort computes each key once (it recomputed the lineage depth,
 >   listing the whole catalog, at every comparison: 132-141 ms of a 1,001-volume recovery) and recovery decodes only the
 >   newest snapshot slot that decodes. The boot log names each shard's slices, units, CPU and its most CPU in one slice.
 >   Still one unit each: the catalog's replay (206-261 ms for 1,001 volumes on this Mac) and a green's engine built over

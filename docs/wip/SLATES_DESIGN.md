@@ -622,10 +622,10 @@ the measured wake cost before parking (the 2-competitive rule). The mount is nev
 > **Step 2's recovery runs in slices (2026-11-07).** A shard's start, its recovery included, was one poll, so a
 > recovery past a liveness window of CPU stopped the A-228 watchdog's beat until it ended, and an anchor would kill every
 > successor in turn. Now each shard's start runs alone on its shard (`slates_rt::futures::spawn_alone`: nothing else
-> the shard is sent runs before it ends, as behind one long poll), and its recovery yields between units at half the
-> live step quantum: each record in the order recovery always took them, a green's held origin a directory's listing or
-> a file's read a unit, its chain an entry a unit, each logged write. Measured: 16 greens over a held 77-file tree
-> recovered in 2.51 s of CPU in 1,320 slices with the beat never older than 495 ms, where the unsliced daemon went 2.20 s
+> the shard is sent runs before it ends, as behind one long poll), and its recovery yields between units, each slice at
+> least half the live step quantum, its yields held to 5% of its time, and at most a heartbeat period: each record in the order recovery always took them, a green's held origin a directory's listing or
+> a file's read a unit, its chain an entry a unit, each logged write. Measured: 16 greens over a held 78-file tree
+> recovered in 2.82 s of CPU in 959 slices with the beat never older than 496 ms, where the unsliced daemon went 2.20 s
 > without a beat. The catalog's replay and a green's engine built over its origin are each one unit still. Record:
 > `docs/bugs/2026-11-07-a-shards-recovery-ran-in-one-poll-and-the-watchdog-withheld-the-beat.md`.
 
