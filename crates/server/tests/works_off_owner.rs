@@ -606,6 +606,31 @@ fn a_conflict_whose_answer_was_lost_is_answered_as_it_was_first_judged() {
   daemon.stop();
 }
 
+/// A-247 "Exactly once". Do: submit a work off its green's shard with the owner's answer lost, so the green took the
+/// increment and the work does not know; then, before retrying, edit another file of the work, which is acknowledged;
+/// then retry the submit under its id. Expect: the retry answers the version the owner recorded, and the acknowledged
+/// edit is still in the work and goes into the next version. Settling the lost accept at the retry reset the work and
+/// dropped the edit made after it.
+#[test]
+fn an_edit_after_a_lost_answer_is_kept_when_the_submit_is_retried() {
+  let (daemon, instance) = daemon(MANY_SHARDS, "lost-then-edit");
+  let mut client = connect(&instance);
+  let (green, work) = green_and_edited_work(&mut client, "lost-then-edit");
+  let (id, request) = submit_with_the_answer_lost(&daemon, &mut client, green, work);
+  client.edit(work, "later", 0, 0, b"kept").unwrap();
+  assert_eq!(client.retry(id, &request).unwrap(), ACCEPTED_AT_TWO);
+  assert_eq!(
+    client.read(work, "later", ReadAt::Head).unwrap(),
+    b"kept",
+    "the acknowledged edit is still in the work"
+  );
+  assert_eq!(client.submit(work).unwrap(), Submitted::Accepted(3));
+  assert_eq!(client.read(green, "later", ReadAt::Head).unwrap(), b"kept");
+  assert_eq!(client.read(green, "f", ReadAt::Head).unwrap(), b"X...");
+  drop(client);
+  daemon.stop();
+}
+
 /// A-247 "Exactly once", across a restart. Do: as above, but restart the daemon before the retry, so the work comes
 /// back from its log still holding the edit the green already has. Expect: the same one version, the edit once, and a
 /// next edit and submit accepted on top of it.
