@@ -233,9 +233,6 @@ pub struct ShardState {
   /// The content arena's allocation count when the reserve's refill last found nothing to fault (A-214): until the
   /// arena allocates again, or the burst measure moves, an idle moment's refill has nothing to do.
   pub(crate) refill_settled: Option<u64>,
-  /// The journal generation whose dead recovery memory an idle shard last gave back (A-117,
-  /// `daemon::return_dead_recovery`): a later publication moves the generation and re-arms the return.
-  pub(crate) recovery_returned_at: Option<u64>,
   /// The half-open byte range `[start, end)` of `content` this shard publishes into and recovers
   /// from; `0..0` when there is no content object.
   pub content_range: (usize, usize),
@@ -417,6 +414,11 @@ pub struct ShardState {
   /// first request and revoked when the attachment ends (`verbs::end_attachment`). Bounded by the
   /// partition's attachment cap: one entry per live catalog attachment at most.
   pub mount_attachments: BTreeMap<u64, MountAttachment>,
+  /// The volumes this shard's catalog holds that recovery could not rebuild, and why (§4.8): each is listed, and every
+  /// verb on it answers `Refusal::NotRecovered` with its cause (`verbs::find`). Bounded by the partition's volume cap:
+  /// one entry per catalog volume at most, made once at the shard's start.
+  pub(crate) unrecovered:
+    BTreeMap<slates_db::catalog::VolumeId, slates_ipc::protocol::RecoveryCause>,
   /// The Linux FUSE mounts this shard serves, by attachment (§4.6 "Linux"; AUD-29-64; `crate::fuse`). Bounded
   /// by the partition's attachment cap: one entry per live FUSE attachment at most.
   #[cfg(target_os = "linux")]

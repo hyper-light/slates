@@ -2479,6 +2479,18 @@ impl Daemon {
     Ok(())
   }
 
+  /// Test support: gives back every shard's dead recovery memory now, as an idle shard's reap tick does
+  /// (`return_dead_recovery`, A-117), rather than waiting for the tick to find the shard idle: the bytes given back
+  /// over every shard.
+  pub fn give_back_recovery_on_every_shard(&self) -> Result<u64, ObserveError> {
+    let mut returned = 0u64;
+    for shard in self.shards.iter().copied() {
+      let bytes = self.observe(Some(shard), return_dead_recovery)?;
+      returned = returned.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+    }
+    Ok(returned)
+  }
+
   /// Test support: sets the memory-pressure hold on **every** shard's byte budget (§4.2; admission.md
   /// §5.5) — capacity withheld from new admission under host memory pressure. In production
   /// [`refresh_pressure_hold`] sets it from a sampled host shortfall at the liveness cadence; this
@@ -3369,7 +3381,6 @@ fn init_shard(
     burst_seen: None,
     last_burst: 0,
     refill_settled: None,
-    recovery_returned_at: None,
     content_range,
     delta_range: delta_range(config, partition, content_range),
     journal: slates_vfs::checkpoint_log::Journal::default(),
@@ -3415,6 +3426,7 @@ fn init_shard(
     next_attachment,
     attachments: slates_bridge_core::Attachments::new(),
     mount_attachments: std::collections::BTreeMap::new(),
+    unrecovered: std::collections::BTreeMap::new(),
     #[cfg(target_os = "linux")]
     fuse_mounts: std::collections::BTreeMap::new(),
     #[cfg(target_os = "linux")]
@@ -3852,14 +3864,11 @@ pub const CONTENT_PURGED: &str = "content.purged_bytes";
 pub const RECOVERY_RETURNED: &str = "recovery.returned_bytes";
 
 /// Gives back an idle shard's recovery memory that no restart reads (A-117): the checkpoint slot older than the
-/// committed one, and its delta log past the tail (`Journal::dead_ranges`). Once per publication: a later one re-arms
-/// it. A busy shard never runs this, so its next checkpoint and deltas write into resident pages; an idle one stops
-/// holding up to two dead images. The bytes given back.
+/// committed one, and its delta log past the tail, each only as far as it was written since its last give-back
+/// (`Journal::dead_ranges`, A-226), so a give-back costs what the publications since wrote. A busy shard never runs
+/// this, so its next checkpoint and deltas write into resident pages; an idle one stops holding up to two dead images.
+/// A range the object refuses stays owed and is asked for at the next give-back. The bytes given back.
 fn return_dead_recovery(s: &mut ShardState) -> usize {
-  let generation = s.journal.generation();
-  if s.recovery_returned_at == Some(generation) {
-    return 0;
-  }
   let (slots_start, slots_end) = s.content_range;
   let (log_start, log_end) = s.delta_range;
   let Some(dead) = s.journal.dead_ranges(
@@ -3871,22 +3880,19 @@ fn return_dead_recovery(s: &mut ShardState) -> usize {
   let Some(object) = s.content.as_mut() else {
     return 0;
   };
-  let mut returned = 0usize;
-  for (base, (offset, len)) in [
-    (slots_start, dead.stale_slot),
-    (log_start, dead.log_past_tail),
-  ] {
+  let mut give_back = |base: usize, (offset, len): (usize, usize)| -> Option<usize> {
     if len == 0 {
-      continue;
+      return Some(0);
     }
-    // A refused range (outside the object) is left resident; the next publication re-arms the attempt.
-    if let Some(at) = base.checked_add(offset)
-      && let Ok(bytes) = object.discard(at, len)
-    {
-      returned = returned.saturating_add(bytes);
-    }
-  }
-  s.recovery_returned_at = Some(generation);
+    object.discard(base.checked_add(offset)?, len).ok()
+  };
+  let stale_slot = give_back(slots_start, dead.stale_slot);
+  let log_past_tail = give_back(log_start, dead.log_past_tail);
+  s.journal
+    .given_back(stale_slot.is_some(), log_past_tail.is_some());
+  let returned = stale_slot
+    .unwrap_or(0)
+    .saturating_add(log_past_tail.unwrap_or(0));
   s.count(
     RECOVERY_RETURNED,
     u64::try_from(returned).unwrap_or(u64::MAX),

@@ -14,7 +14,7 @@ pub(crate) mod landing;
 #[cfg(unix)]
 pub(crate) mod lease;
 pub(crate) mod nfs;
-#[cfg(unix)]
+// The NFSv4.2 client speaks TCP alone, and the daemon serves NFS on Windows too (A-184).
 pub(crate) mod nfs4;
 pub(crate) mod target;
 // The vhost-user front end a VMM speaks, over `guest`'s driver (Linux, where vhost-user is built).
