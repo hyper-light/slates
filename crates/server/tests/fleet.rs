@@ -37,7 +37,7 @@ use slates_ipc::protocol::{
 use slates_ipc::{ClientEnd, HeldRendezvous, IpcError, connect};
 use slates_machine::MachineProfile;
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
-use slates_server::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS, SessionHold, host_id_of};
+use slates_server::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS, LinkAfter, SessionHold, host_id_of};
 use slates_server::deploy::member_id;
 use slates_server::head::HeadValue;
 use slates_server::observe::ObserveError;
@@ -8209,6 +8209,72 @@ fn settled_now(daemon: &Daemon, owner: HostId) -> Result<bool, ObserveError> {
   daemon
     .council_settlement(owner)
     .map(|settlement| settlement.is_some_and(|(settled, current)| settled == current))
+}
+
+/// Shape: the budget [`a_takeover_question_a_holder_never_answered_leaves_its_link_dialed_afresh`] asks under: two
+/// heartbeats, past the exchange's poll, so a question's own request can time out and report inside the exchange,
+/// as a reply past the liveness budget does on a lossy path. A budget shorter than the poll ends the exchange first,
+/// and every question is a straggler, which the drain already drops the link of (the first form of this test, which
+/// passed on the defect).
+const UNANSWERED_BUDGET_NS: u64 = 2 * HEARTBEAT_NS;
+
+/// Shape: how many questions [`a_takeover_question_a_holder_never_answered_leaves_its_link_dialed_afresh`] asks at
+/// most. A question lands as a straggler, not unanswered, when its exchange's wait falls due before its request's
+/// timer reports, and a straggler's link is dropped by the drain; one run in three of four rounds met no unanswered
+/// question and passed on the defect, so the rounds are more and each waits for the redialed link.
+const UNANSWERED_ROUNDS: usize = 6;
+
+/// Shape: how long [`a_takeover_question_a_holder_never_answered_leaves_its_link_dialed_afresh`] waits after the
+/// questions, and at most for a round's session: three liveness budgets, past the record periods whose drain recovers
+/// any straggler and past a dropped link's redial (one round found none within one budget).
+const UNANSWERED_SETTLE_NS: u64 = 3 * LIVENESS_BUDGET_NS;
+
+/// A-240, phase one's question to a holder whose answer misses the budget: KIND's wan-loss profile, where one
+/// retransmission (pto 1.41 s) took a holder's report past the 1 s liveness budget (CI diag-raft-chaos-final-41). Do:
+/// have both peers hold their live-state replies while they answer everything else
+/// (`Daemon::inject_live_state_withhold`), ask them for a live log's report [`UNANSWERED_ROUNDS`] times under [`UNANSWERED_BUDGET_NS`], and wait
+/// [`UNANSWERED_SETTLE_NS`]. Two peers are asked each round, since a question can end as a straggler instead (one
+/// peer alone passed on the defect in 1 of 5 runs). Each peer stays alive and in contact: a wedged peer stopped answering its probes too, and
+/// its lent slot was removed and dialed afresh about 540 ms later, which hid the defect (the test's second form).
+/// Expect: this node's record link to the peer is not left lent to the takeover with no session behind it; it was
+/// dropped and dialed afresh, or is up again. Before, a question that timed out dropped its
+/// session inside the exchange (`slates_cluster::live::Exchanged::unanswered`) and nothing dropped its link, so the slot
+/// stayed lent for good and every later phase one skipped the holder: `fleet.live.takeover_waits_quorum` 425 times
+/// with the holder alive and holding the head. Non-vacuous: at least one question rode the peer's session.
+#[test]
+fn a_takeover_question_a_holder_never_answered_leaves_its_link_dialed_afresh() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let withheld = [&daemons[1], &daemons[2]].map(|peer| peer.inject_live_state_withhold(true));
+  let asked = daemons[0].ask_live_reports(
+    vec![hosts[1], hosts[2]],
+    UNANSWERED_BUDGET_NS,
+    UNANSWERED_ROUNDS,
+    UNANSWERED_SETTLE_NS,
+  );
+  let released = [&daemons[1], &daemons[2]].map(|peer| peer.inject_live_state_withhold(false));
+  assert!(
+    withheld.iter().chain(&released).all(Result::is_ok),
+    "the peers held their live-state replies and let them go: {withheld:?} {released:?}"
+  );
+  for daemon in daemons {
+    daemon.stop();
+  }
+  let (rounds, after) = asked.expect("the control shard asked its questions");
+  eprintln!("unanswered questions: asked {rounds}, the links after them {after:?}");
+  assert!(
+    rounds > 0,
+    "at least one question rode a peer's session (asked {rounds}, links {after:?})"
+  );
+  let lent: Vec<_> = after
+    .iter()
+    .filter(|(_, link)| *link == LinkAfter::Lent("fleet.lent_to.live_takeover"))
+    .collect();
+  assert!(
+    lent.is_empty(),
+    "the link to a holder that never answered is dropped and dialed afresh, not left lent to the takeover with no \
+     session behind it (asked {rounds} times; left lent: {lent:?})"
+  );
 }
 
 /// Shape: how long [`a_takeover_completes_when_one_survivor_never_received_the_head`] holds the owner's record

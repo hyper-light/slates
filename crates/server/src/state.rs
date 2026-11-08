@@ -776,6 +776,11 @@ pub struct ShardState {
   /// borrowed — the interrupted-discovery restart the replacement-voter regression forces by stopping this
   /// node while it holds (`Daemon::inject_discovery_fault`).
   pub discovery_withhold_replies: bool,
+  /// Test support (never reachable from the wire): while set, the record serve side holds every live-state reply (a
+  /// takeover's report or log fetch, `slates_cluster::live::LIVE_STATE_STREAM`) after its request arrived, while every
+  /// other stream and the probe plane answer as usual: a holder alive and in contact whose report misses an asker's
+  /// budget, as one retransmission on a lossy path made it (`Daemon::inject_live_state_withhold`).
+  pub live_state_withhold_replies: bool,
   /// The measured **path** to each peer (§4.8 "Derived constants": "election timeout ≥ 10 × broadcast RTT
   /// p99"; `slates_cluster::timing::PathRtt`): the transport's RFC 9002 estimator over every round trip
   /// this node timed to that peer — its SWIM probe's acknowledgement each period, and every consensus

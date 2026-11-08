@@ -1571,6 +1571,13 @@ async fn serve_peer_records(
           count_refusal(ACCEPT_REFUSED);
           return Vec::new();
         }
+        // Test support: a fault holds a live-state reply after its request arrived (never reachable from the wire),
+        // so a takeover's question to this node misses its budget while the probe plane still answers.
+        if stream == slates_cluster::live::LIVE_STATE_STREAM {
+          while state::with_state(|state| state.live_state_withhold_replies).unwrap_or(false) {
+            crate::daemon::pace(HEARTBEAT_NS / POLL_PER_PERIOD).await;
+          }
+        }
         match stream {
           crate::member_task::PLANE_EPOCH_STREAM => plane_secret
             .and_then(|secret| {

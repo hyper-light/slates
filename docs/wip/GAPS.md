@@ -159,14 +159,31 @@
 > The resumed holder was not yet counting: its catch-up (an install, after 2 s away) or the owner's redial of its
 > session. A passing run prints no counters, so which is not known (the diag runs' stuck-write watcher,
 > diag-live-durability-38, dumps only from 3 s). Before the merge 1 of 6 runs had one too (2.6 s, no refusal).
-> **Open (raft-chaos, 2026-11-07; cause unknown): a live takeover over KIND's lossy WAN path never finished.** At
-> e140ca3a, 1 of 4 runs of the KIND lane's live takeover under 80 ms ± 20 ms with 1 % loss (raft-chaos's diag-41, the
-> tip plus a counter only) found no survivor serving the volume within `TAKEOVER_WAIT` (120 s, `xtask/src/kind.rs`);
-> the other 3 took it over in 17–21 s. Nothing was lost: all 300 writes read back, and both survivors hold one head.
-> The candidate received only its own report and retried phase one 425 times, while its session to the other holder
-> stayed lent out throughout; phase one losing its own session was ruled out. Main's rate is not measured (its one
-> sample, run 42403976587, passed). Owed before any fix: each session's lends and returns counted and dumped at the
-> missed budget, and an interleaved A/B of the lane against main.
+> **Fixed (raft-chaos, 2026-11-08): a live takeover over KIND's lossy WAN path never finished.** At e140ca3a, 1 of 4
+> runs of the KIND lane's live takeover under 80 ms ± 20 ms with 1 % loss (raft-chaos's diag-41) found no survivor
+> serving the volume within `TAKEOVER_WAIT` (120 s, `xtask/src/kind.rs`). Nothing was lost: all 300 writes read back,
+> and both survivors held one head. The candidate received only its own report and retried phase one 425 times while
+> its session to the other holder stayed lent out. Across diag-38 to diag-45 it was 1 of 16 wan-loss runs.
+> - Cause (record `docs/bugs/2026-11-08-a-takeover-question-that-timed-out-left-its-holders-link-lent-for-good.md`;
+>   found by live-durability from the code). A request that times out inside `slates_cluster::live::exchange` drops
+>   its session and lists its holder in `Exchanged::unanswered`. A-240's phase one and log fetch never dropped that
+>   holder's link, so its slot kept the takeover's borrow with no session behind it. Every later phase one skipped the
+>   holder, which was alive and never condemned, so nothing else replaced the link.
+> - Fix: every live exchange's caller goes through `live_ship::settle_sessions`, which drops the unanswered holders'
+>   links and returns the answered sessions.
+> - Test: `a_takeover_question_a_holder_never_answered_leaves_its_link_dialed_afresh` (`crates/server/tests/fleet.rs`).
+>   Two peers hold their live-state replies while answering probes. Red-checked 8 of 8 lent without the drop, 0 of 8
+>   with it.
+> - Main a2cf9af7 gave no rate: in an interleaved A/B (diag-raft-chaos-lent-45, 6 runs a side), each of main's 18
+>   shaped profiles timed out its writes at 600 s before any takeover. The stack passed all 24.
+> - With the fix, KIND passed all four profiles in 12 runs (diag-raft-chaos-unanswered-46 and -47 ×3 each,
+>   diag-raft-chaos-phase-one-50 ×6), with wan-loss takeovers in 16.9–23.7 s.
+> - Phase one's fixed liveness budget (1 s) against wan-loss's 1.41 s pto, measured: phase one's questions were counted
+>   by outcome over the 24 takeovers of diag-raft-chaos-phase-one-50. 61 were asked and 61 answered within the
+>   budget, with none unanswered or straggling. Every wait for the quorum was a holder with no session yet (the
+>   departed owner's, or a link still forming), never a question past the budget. So the budget is left as it is. A
+>   path-derived budget (srtt plus one pto, as the log fetch derives its own from the path) waits for a run that
+>   shows a miss.
 
 > **Fixed (live-fixes, 2026-11-07): a live shipper made before its candidates were known shipped to nobody** (A-200's
 > amendment of that date). A shipper kept the holders of its first publication, so a live volume made on a fleet's
