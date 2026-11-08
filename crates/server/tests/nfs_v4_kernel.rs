@@ -787,6 +787,26 @@ fn sparse_seek_and_copy(root: &Path) {
   std::fs::remove_file(&sparse).unwrap();
 }
 
+/// A-26, A-263: through the kernel's own client, `mknod` of a character and a block device as root fails with `EPERM`
+/// ("Operation not permitted"), what a local file system that holds no device nodes answers. It ran as root because a
+/// client without `CAP_MKNOD` refuses before it asks the server. Before, the server's `NFS4ERR_BADTYPE` reached the
+/// program as the client's internal errno 527 ("Unknown error 527").
+fn a_device_node_is_refused_eperm(root: &Path) {
+  for (kind, name) in [("c", "char"), ("b", "block")] {
+    let made = privileged("mknod")
+      .arg(root.join(name))
+      .args([kind, "1", "2"])
+      .output()
+      .unwrap();
+    let said = String::from_utf8_lossy(&made.stderr);
+    assert!(!made.status.success(), "no {name} device is made");
+    assert!(
+      said.contains("Operation not permitted"),
+      "the {name} device is refused EPERM, not an internal errno: {said}"
+    );
+  }
+}
+
 /// A-260: through the kernel's own client, a file unlinked while open keeps serving through its descriptor at a link
 /// count of zero, and the client renames nothing aside (`.nfs*`) to keep it, since the server answered its OPEN with
 /// `OPEN4_RESULT_PRESERVE_UNLINKED` and keeps the file itself; once closed, it is gone. Before, the client
@@ -856,6 +876,7 @@ fn the_linux_kernel_nfsv4_client_mounts_and_works_a_volume() {
       let mounted = kernel_mount(&source, port, minor);
       exercise(&mounted.path, &payload);
       an_unlinked_open_file_keeps_serving_with_no_silly_rename(&mounted.path);
+      a_device_node_is_refused_eperm(&mounted.path);
       large_sequential_writes_round_trip(&mounted.path);
       #[cfg(target_os = "linux")]
       if minor == 2 {

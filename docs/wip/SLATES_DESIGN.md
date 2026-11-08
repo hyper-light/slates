@@ -12048,7 +12048,7 @@ Status: built 2026-10-05 (condition 4).
   device node. `slates mount` asks for both flags whoever runs it (macOS `MNT_NOSUID | MNT_NODEV`; Linux FUSE was
   already `nosuid,nodev` as root, measured). The OCI binding entry states them. The PersistentVolume the operator
   writes carries them, and the KIND lane checks the kernel's own flags for kubelet's mount. The daemon keeps refusing
-  device nodes (NFS4ERR_BADTYPE).
+  device nodes (NFS4ERR_BADTYPE; `NFS3ERR_PERM`/`NFS4ERR_PERM`, a client's `EPERM`, since A-263).
 - Why: a root-owned setuid `id` planted on a volume mounted as the documented PersistentVolume did (no `nosuid`) ran as
   uid 0 for `nobody`; with `nosuid,nodev` it ran as 65534. This is the reason `nosuid` and `nodev` exist as mount
   flags (mount(8)); exports(5) also defaults to `root_squash` for the same threat. slates does not squash root: a
@@ -16090,6 +16090,29 @@ Applied in the same change to: §4.7 (the rendezvous's status), GAPS, `crates/cl
 - **Proven** on this Mac by two tests that failed on the old order: `a_refused_second_anchor_leaves_the_live_instance_its_segment_and_its_bytes`
   (across processes: a live anchor and its daemon, a second anchor refused, the daemon killed, its successor adopting the
   segment by name and reading the file back) and `a_refused_second_daemon_leaves_the_live_ones_segment_in_place`.
+
+### A-263 — A device node is refused as a file system without device nodes refuses it: EPERM, after the name and the directory (accepted 2026-11-08)
+Applied in the same change to: A-26 (its device refusal's answer), the condition-4 status (§4.6), GAPS, the record
+`docs/bugs/2026-09-19-pjdfstest-special-files-and-nfs-limits.md`, and `crates/bridge-nfs/src/procedures.rs`
+(`Export::refuse_device_node`; NFSv4's CREATE reaches it through MKNOD).
+- **What was wrong.** A MKNOD of a block or character device, and NFSv4's CREATE of one, answered `NFS3ERR_BADTYPE`
+  (`NFS4ERR_BADTYPE` over v4), the status RFC 1813 §3.3.11 names for a type the server does not make. The Linux client
+  maps both to its internal `EBADTYPE`, errno 527, which reached every program as "Unknown error 527": 331 cases of a
+  full pjdfstest run over NFSv4, and the same over NFSv3 (CI run 42498995934 and a CachyOS run, 2026-11-08). It was
+  also answered before the name was looked at.
+- **The rule.** Slates makes no device nodes (A-26), so it answers as a local file system that cannot hold one, in the
+  order Linux's `vfs_mknod` checks: a taken name is `EXIST` (an exclusive create over NFS skips the client's own lookup,
+  so only the server can say so), a directory the caller may not write is `ACCES`, then `PERM`, which a client reports
+  as `EPERM`, what `mknod(2)` answers when "the filesystem containing pathname does not support the type of node
+  requested".
+- **What it does not change.** A-26's boundary (no device node is made, on any path), FIFOs and sockets, and every
+  reviewed list: no pjdfstest case expects `EPERM` from a device `mknod` (each failing one expects success, or `EEXIST`
+  on a name the case before failed to make), so every listed case still fails, now reading `EPERM`.
+- **Proven** by `a_device_mknod_is_refused_eperm_as_a_file_system_without_device_nodes_refuses_it` and
+  `a_device_mknod_is_told_its_name_is_taken_or_its_directory_unwritable_first` (`crates/bridge-nfs/tests/procedures.rs`),
+  `a_device_create_is_refused_eperm_and_a_taken_name_eexist_first` (`crates/bridge-nfs/tests/v4.rs`), each red on the old
+  MKNOD with 10007, and through the Linux kernel's NFSv4 client by `a_device_node_is_refused_eperm`
+  (`crates/server/tests/nfs_v4_kernel.rs`, as root on CI).
 
 ### A-262 — The volume keeps Windows' attribute bits beside the mode, and a file's read-only state is its mode (accepted 2026-11-08; the drive and the volume built, the merge, the landings and the base plane owed)
 Applied in the same change to: §4.5 (the inode), §4.6 (the Windows conformance status), A-209 (amended: ATTRIBUTES),

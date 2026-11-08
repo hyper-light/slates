@@ -3708,3 +3708,51 @@ fn lookupp_names_the_parent_and_is_noent_at_the_root() {
     "LOOKUPP at the root is NOENT"
   );
 }
+
+/// A-26, A-263. Do: CREATE a character device and a block device in the root through NFSv4, then CREATE a directory
+/// and a character device of the directory's name. Expect: each device is `NFS4ERR_PERM` (a client's `EPERM`, what a
+/// local file system that holds no device nodes answers `mknod`), and the taken name is `NFS4ERR_EXIST` first. Before,
+/// both were `NFS4ERR_BADTYPE`, which the Linux client turns into its internal `EBADTYPE`, errno 527.
+#[test]
+fn a_device_create_is_refused_eperm_and_a_taken_name_eexist_first() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+  let mut service = export(&mut bridge, 0);
+  let mut server = Server::standalone();
+  let mut client = Client::connect(&mut service, &mut server, b"host-devices");
+  let mut create = |kind: u32, name: &[u8]| {
+    let mut args = client.sequenced(2);
+    args.u32(op::PUTROOTFH);
+    args.u32(op::CREATE);
+    args.u32(kind);
+    if kind == 3 || kind == 4 {
+      args.u32(1); // specdata4 major
+      args.u32(2); // specdata4 minor
+    }
+    args.opaque(name);
+    Bitmap::default().encode(&mut args);
+    args.opaque(b"");
+    Client::call(&mut service, &mut server, args.as_slice()).status
+  };
+  /// Format: `nfs_ftype4` NF4DIR, NF4BLK and NF4CHR (RFC 7863).
+  const NF4DIR: u32 = 2;
+  const NF4BLK: u32 = 3;
+  const NF4CHR: u32 = 4;
+  assert_eq!(
+    create(NF4CHR, b"char"),
+    Nfsstat4::Perm.wire(),
+    "a character device"
+  );
+  assert_eq!(
+    create(NF4BLK, b"block"),
+    Nfsstat4::Perm.wire(),
+    "a block device"
+  );
+  assert_eq!(create(NF4DIR, b"taken"), Nfsstat4::Ok.wire());
+  assert_eq!(
+    create(NF4CHR, b"taken"),
+    Nfsstat4::Exist.wire(),
+    "a taken name is EEXIST before the device's EPERM"
+  );
+}

@@ -1,5 +1,11 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A refused device node reached programs as "Unknown error 527": fixed (2026-11-08, §4.6, A-26; A-263).** MKNOD of a
+> block or character device, and NFSv4's CREATE of one, answered `BADTYPE`, which the Linux client turns into its
+> internal `EBADTYPE` (errno 527): 331 cases of a full pjdfstest run over NFSv4, and the NFSv3 lane alike. Now a taken
+> name is `EEXIST`, an unwritable directory `EACCES`, then `EPERM`, as a local file system without device nodes answers
+> `mknod`. No list changes: no case expects `EPERM` from a device `mknod`.
+
 > **The WinFsp drive keeps Windows' attribute bits, and a file's read-only state is its mode: built for the volume and
 > the drive (2026-11-08, §4.6; A-262).** A-209 had left HIDDEN, SYSTEM, ARCHIVE and READONLY out ("the volume's
 > permission is POSIX's mode"), so `SetFileAttributes` answered success and kept nothing and every file reported
