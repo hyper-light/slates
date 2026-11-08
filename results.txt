@@ -1,0 +1,5 @@
+tested eecb020a59babd90831236c5117ce62deafac137 variant after on x86_64, 4 cpus
+config exit 0 88s
+flood exit 0 62s
+admitted exit 0 78s
+clippy exit 0 83s
