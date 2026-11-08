@@ -1528,6 +1528,7 @@ pub fn status_json(r: &StatusReport) -> Value {
     "snapshots": r.snapshots,
     "watcher": r.watcher,
     "drifted": r.drifted,
+    "drifted_elided": r.drifted_elided,
     "nfs_port": r.nfs_port,
     "placed": {
       "region": r.placed.region,

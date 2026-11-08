@@ -112,7 +112,8 @@ fn parse_volume(hex: &str) -> Result<VolumeId> {
 /// camelCase keys (`referencedBytes`, `nfsPort`, `mirrorAgeNs`, `hostEpoch`, …). Ids cross as hex; every
 /// `u64` count is range-checked to a JS-safe integer before the object is built; the placement (§4.8,
 /// D-18) is flattened to `placed`/`mirrorAgeNs`/`hostEpoch`; `nfsPort` is the daemon's `mount_nfs` port
-/// or `null`; `drifted` is the full list of drifted overlay paths (the CLI shows only the count).
+/// or `null`; `drifted` holds the drifted overlay paths that fit beside the report's other fields in one reply, and
+/// `driftedElided` counts the rest, which `slates status --drift` walks (A-267).
 #[napi(object)]
 pub struct VolumeStatus {
   pub id: String,
@@ -125,6 +126,7 @@ pub struct VolumeStatus {
   pub snapshots: u32,
   pub watcher: String,
   pub drifted: Vec<String>,
+  pub drifted_elided: u32,
   pub nfs_port: Option<u32>,
   pub placed: bool,
   pub mirror_age_ns: Option<i64>,
@@ -418,6 +420,7 @@ fn volume_status(report: StatusReport) -> Result<VolumeStatus> {
     snapshots: report.snapshots,
     watcher: report.watcher,
     drifted: report.drifted,
+    drifted_elided: report.drifted_elided,
     nfs_port: report.nfs_port.map(u32::from),
     placed: report.placed.region,
     mirror_age_ns: status_opt_i64(report.placed.mirror_age_ns, "mirrorAgeNs")?,

@@ -1393,8 +1393,8 @@ impl Green {
   /// The green's current state as a deriver [`Base`](crate::increment::Base) — every file with its
   /// content length, and the directories, modes, symlinks, hard links and xattrs — so an increment
   /// based on the head can be composed against what the green actually holds. (An *older* version's
-  /// base, for a work that lagged behind an intervening submit, is reconstructed by [`Green::base_at`];
-  /// symlinks, hard links and xattrs at an older version are still owed there.)
+  /// base, for a work that lagged behind an intervening submit, is reconstructed by [`Green::base_at`], every
+  /// dimension from its own history.)
   pub fn current_base(&self) -> crate::increment::Base {
     crate::increment::Base {
       specials: self
@@ -1557,10 +1557,11 @@ impl Green {
   }
 
   /// The green's state at an older `version` as a deriver [`Base`](crate::increment::Base), for a
-  /// work whose base lagged behind an intervening submit. Files come from the content history (exact,
-  /// renames and deletes included); directories and modes are replayed from the deltas up to the
-  /// version. Symlinks, hard links and xattrs at an older version are owed — reconstructed empty here,
-  /// which is exact for the file-and-directory workflows and conservative otherwise.
+  /// work whose base lagged behind an intervening submit, or a listing of the green at that version. Every
+  /// dimension comes from its own `(version, value)` history, the last entry at or before `version`: files from the
+  /// content history (renames and deletes included), directories from their presence history, modes, symlinks, hard
+  /// links, xattrs and special nodes from their value histories. (Until 2026-11-09 this said symlinks, hard links and
+  /// xattrs were reconstructed empty; they have been read from their histories since those were kept.)
   pub fn base_at(&self, version: u64) -> crate::increment::Base {
     if version >= self.head() {
       return self.current_base();

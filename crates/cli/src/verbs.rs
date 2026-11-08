@@ -825,7 +825,9 @@ fn emit_daemon_status(client: &mut Client, json: bool) -> Result<(), ClientError
 }
 
 /// `status ID` / `volume stat ID`: the report as text, its drifted paths (`--drift`), or the whole
-/// report as JSON (the MCP `status_json` schema; `--drift` narrows only the text form).
+/// report as JSON (the MCP `status_json` schema; `--drift` narrows only the text form). `--drift` names every drifted
+/// entry: the report carries those that fit beside its other fields (A-267), so past them the paged read
+/// (`Client::drifted`) walks the rest; an entry too long for any page is counted on standard error.
 fn emit_status(
   client: &mut Client,
   volume: slates_client::VolumeId,
@@ -836,8 +838,18 @@ fn emit_status(
   if json {
     slates_machine::out_line!("{}", slates_mcp::status_json(&report));
   } else if drift {
-    for path in &report.drifted {
+    let (entries, oversized) = if report.drifted_elided > 0 {
+      client.drifted(volume)?
+    } else {
+      (report.drifted, 0)
+    };
+    for path in &entries {
       slates_machine::out_line!("{path}");
+    }
+    if oversized > 0 {
+      slates_machine::log_line!(
+        "{oversized} drifted entries too long for a reply were passed over"
+      );
     }
   } else {
     slates_machine::out_text!("{}", status_text(&report));
@@ -2338,7 +2350,11 @@ fn status_text(report: &StatusReport) -> String {
     report.head.value,
     report.snapshots,
     report.watcher,
-    report.drifted.len()
+    // Every drifted entry, those the report carried and those it counted (A-267).
+    report
+      .drifted
+      .len()
+      .saturating_add(usize::try_from(report.drifted_elided).unwrap_or(usize::MAX))
   ) + &format!(
     "placed: {}\nmirror_age_ns: {}\nhost_epoch: {}\n",
     report.placed.region,

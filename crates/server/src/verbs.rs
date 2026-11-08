@@ -631,7 +631,7 @@ fn serves_latest_state(body: &RequestBody) -> Option<VolumeId> {
       ..
     } => Some(*volume),
     RequestBody::Versions { green } | RequestBody::ChangedSince { green, .. } => Some(*green),
-    RequestBody::Status { volume } => Some(*volume),
+    RequestBody::Status { volume } | RequestBody::Drifted { volume, .. } => Some(*volume),
     _ => None,
   }
 }
@@ -4174,6 +4174,7 @@ fn dispatch_inner(
     RequestBody::Resize { volume, size } => resize(state, principal, volume, size),
     RequestBody::Destroy { volume } => destroy(state, principal, volume),
     RequestBody::Status { volume } => status(state, principal, volume),
+    RequestBody::Drifted { volume, from } => drifted(state, principal, volume, from),
     RequestBody::List { after } => list_page(vec![list_part(state, principal, after)]),
     RequestBody::DaemonStatus => {
       let mine = shard_report(state);
@@ -9143,29 +9144,9 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
   let accounting = slot.volume.accounting();
   let journal = journal_report(&slot.volume);
   let takeover_kept = u32::try_from(slot.volume.takeover_kept()).unwrap_or(u32::MAX);
-  let (drifted, watcher) = match slot.host.as_mut() {
-    Some(host) => match slot.volume.with_host(host).status(&mut state.store) {
-      Ok(s) => (
-        s.drift
-          .iter()
-          .map(|(p, k)| format!("{p} ({k:?})"))
-          .chain(
-            s.unverified
-              .iter()
-              .map(|(p, refusal)| format!("{p} (unverified: {refusal})")),
-          )
-          .collect(),
-        format!("{:?}", s.watcher),
-      ),
-      Err(e) => (
-        vec![format!("status refused: {e:?}")],
-        "unavailable".to_owned(),
-      ),
-    },
-    None => (Vec::new(), "scratch".to_owned()),
-  };
+  let (drift, watcher) = drift_entries(slot, &mut state.store);
   let attachments = state.db.partition().attachments_of(record.id).len();
-  ReplyBody::Status {
+  let reply = ReplyBody::Status {
     report: Box::new(StatusReport {
       id: volume,
       name: record.name.clone(),
@@ -9176,7 +9157,7 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
       head: SnapshotId {
         value: record.head.value,
       },
-      drifted,
+      drifted: Vec::new(),
       watcher,
       snapshots: u32::try_from(slot.volume.snapshot_count()).unwrap_or(u32::MAX),
       placed: placed_state(state, &record),
@@ -9189,7 +9170,124 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
       mounts_elided,
       journal,
       takeover_kept,
+      drifted_elided: 0,
     }),
+  };
+  with_drift(reply, drift)
+}
+
+/// A status reply's drift, filled in last (A-267): the status stays one reply, so it carries the first drifted entries
+/// that fit beside its other fields and counts the rest, which `Drifted` reads.
+fn with_drift(reply: ReplyBody, drift: Vec<String>) -> ReplyBody {
+  {
+    let ReplyBody::Status { mut report } = reply else {
+      return reply;
+    };
+    let total = drift.len();
+    report.drifted_elided = u32::try_from(total).unwrap_or(u32::MAX);
+    let framed = slates_ipc::protocol::framed_len(&ReplyBody::Status {
+      report: report.clone(),
+    });
+    let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+    let room = chunk.saturating_sub(framed);
+    let mut used = 0usize;
+    for entry in drift {
+      let bytes = encoded_len(&entry);
+      if used.saturating_add(bytes) > room {
+        break;
+      }
+      used = used.saturating_add(bytes);
+      report.drifted.push(entry);
+    }
+    report.drifted_elided =
+      u32::try_from(total.saturating_sub(report.drifted.len())).unwrap_or(u32::MAX);
+    ReplyBody::Status { report }
+  }
+}
+
+/// An overlay volume's drifted entries in path order, each its path and the kind of drift (a witnessed entry whose
+/// disk no longer matches, or one whose re-check the host refused), and the watcher's state; none for a scratch volume.
+fn drift_entries(
+  slot: &mut VolumeSlot,
+  store: &mut slates_vfs::volume::Store,
+) -> (Vec<String>, String) {
+  match slot.host.as_mut() {
+    Some(host) => match slot.volume.with_host(host).status(store) {
+      Ok(s) => {
+        let mut entries: Vec<(String, String)> = s
+          .drift
+          .iter()
+          .map(|(p, k)| (p.clone(), format!("{p} ({k:?})")))
+          .chain(
+            s.unverified
+              .iter()
+              .map(|(p, refusal)| (p.clone(), format!("{p} (unverified: {refusal})"))),
+          )
+          .collect();
+        entries.sort();
+        (
+          entries.into_iter().map(|(_, entry)| entry).collect(),
+          format!("{:?}", s.watcher),
+        )
+      }
+      Err(e) => (
+        vec![format!("status refused: {e:?}")],
+        "unavailable".to_owned(),
+      ),
+    },
+    None => (Vec::new(), "scratch".to_owned()),
+  }
+}
+
+/// `Drifted`: one page of the volume's drifted entries from position `from` (A-267), as many as one reply chunk holds.
+/// An entry too long for any page alone is passed over and counted.
+fn drifted(
+  state: &mut ShardState,
+  principal: &Principal,
+  volume: VolumeId,
+  from: u64,
+) -> ReplyBody {
+  let (handle, record) = match find(state, volume) {
+    Ok(x) => x,
+    Err(r) => return *r,
+  };
+  if !rights_of(&record, principal).read {
+    return forbidden("drifted");
+  }
+  let Ok(slot) = state.volumes.get_mut(handle) else {
+    return refused(Refusal::NotFound);
+  };
+  let (drift, _) = drift_entries(slot, &mut state.store);
+  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+  let room = chunk.saturating_sub(slates_ipc::protocol::framed_len(&ReplyBody::Drifted {
+    entries: Vec::new(),
+    next: Some(u64::MAX),
+    oversized: u32::MAX,
+  }));
+  let start = usize::try_from(from).unwrap_or(usize::MAX);
+  let mut used = 0usize;
+  let mut entries = Vec::new();
+  let mut oversized = 0u32;
+  let mut position = start;
+  for entry in drift.iter().skip(start) {
+    let bytes = encoded_len(entry);
+    if bytes > room {
+      oversized = oversized.saturating_add(1);
+      position = position.saturating_add(1);
+      continue;
+    }
+    if used.saturating_add(bytes) > room {
+      break;
+    }
+    used = used.saturating_add(bytes);
+    entries.push(entry.clone());
+    position = position.saturating_add(1);
+  }
+  let next = (position < drift.len()).then(|| u64::try_from(position).unwrap_or(u64::MAX));
+  ReplyBody::Drifted {
+    entries,
+    next,
+    oversized,
   }
 }
 

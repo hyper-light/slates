@@ -69,8 +69,12 @@
 >   target past what a grant's summary holds on one page (3,995 bytes) is refused before presenting. **Open:** an expiry
 >   writes no audit record, so an expired grant's history is its `grant_issued` alone
 >   (`docs/bugs/2026-11-08-a-principals-grants-outgrew-one-reply-and-were-kept-for-good.md`).
-> - **Still open, the same one-reply shape**, by their code and not reproduced: a status's `drifted`
->   list, and the conflict and invalidation lists of `Submitted`, `Rebased`, `GrantRequired` and `Advanced`. Each needs
+> - **A status's drift: the first that fit, a count, and a paged read (A-267, 2026-11-08).** A status with 600 drifted
+>   entries was refused; it now carries what fits beside its other fields and `drifted_elided`, `Drifted` reads them all a
+>   page at a time, and `slates status --drift` walks it. **Owed:** an SDK binding for the paged read
+>   (`docs/bugs/2026-11-08-a-status-with-much-drift-outgrew-one-reply.md`).
+> - **Still open, the same one-reply shape**, by their code and not reproduced: the conflict and invalidation lists of
+>   `Submitted`, `Rebased`, `GrantRequired` and `Advanced`. Each needs
 >   a cursor the way `List`, `ChangedSince` and `ReadDir` have, or a derived bound and a typed refusal.
 
 > **A version appended before its owner restarted never committed: fixed (2026-11-07, §4.16 Commit, AUD-11;

@@ -815,6 +815,17 @@ pub enum RequestBody {
     /// The evidence references (opaque to slates), possibly none.
     evidence: Vec<[u8; 32]>,
   },
+  /// One page of an overlay volume's drifted entries (§4.4 `status`, A-267): every witnessed entry whose disk no longer
+  /// matches its witness, and every one whose re-check the host refused, in path order from position `from`. A
+  /// status carries the first that fit; this reads them all. A position, not a path, continues it, so a long path never
+  /// rides in a request; a drift that changes between pages may repeat or skip an entry, as a directory listing may.
+  /// A read; never recorded. Appended.
+  Drifted {
+    /// The overlay volume.
+    volume: VolumeId,
+    /// The position to read from: 0 to begin, else the previous page's `next`.
+    from: u64,
+  },
 }
 
 /// The bytes an [`RequestBody::EditSubmit`] inserts (A-225): carried in the request, or, for an edit larger than one
@@ -1439,6 +1450,7 @@ impl RequestBody {
       | RequestBody::Resize { volume, .. }
       | RequestBody::Destroy { volume }
       | RequestBody::Status { volume }
+      | RequestBody::Drifted { volume, .. }
       | RequestBody::ReadBase { volume, .. }
       | RequestBody::Digest { volume, .. }
       | RequestBody::Rewitness { volume, .. }
@@ -2052,6 +2064,9 @@ pub struct StatusReport {
   /// daemon issued after its last publication, which no image counted, so such a file is kept, charged to the volume's
   /// quota, until that mount ends. Zero outside a takeover. Appended.
   pub takeover_kept: u32,
+  /// Drifted entries the report did not carry (A-267; appended): `drifted` holds the first that fit beside the
+  /// report's other fields, and `Drifted` reads every one.
+  pub drifted_elided: u32,
 }
 
 /// A volume's journal as its consuming rounds measured it (§4.5 "Journal"). The budget's formula is the mutation rate
@@ -3565,6 +3580,16 @@ pub enum ReplyBody {
   LiveShippingSet {
     /// Whether it is live-shipped now.
     live_shipped: bool,
+  },
+  /// One page of a volume's drifted entries (`Drifted`), each its path and the kind of drift. Appended.
+  Drifted {
+    /// The drifted entries of this page.
+    entries: Vec<String>,
+    /// The position the next page reads from, or `None` when this page ends the list.
+    next: Option<u64>,
+    /// Entries in this page's range too long for any page alone (a host path near Linux's `PATH_MAX`), passed over
+    /// and counted, never sent as a reply no chunk holds.
+    oversized: u32,
   },
 }
 

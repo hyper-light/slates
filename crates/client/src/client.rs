@@ -4239,6 +4239,33 @@ impl Client {
     }
   }
 
+  /// An overlay volume's drifted entries, each its path and the kind of drift, in path order (§4.4 `status`, A-267):
+  /// walked a page at a time from the volume's owner, since a status carries only the first that fit. Also the number
+  /// of entries too long for any reply, which no page carries.
+  pub fn drifted(&mut self, volume: VolumeId) -> Result<(Vec<String>, u64), ClientError> {
+    let mut entries = Vec::new();
+    let mut oversized = 0u64;
+    let mut from = 0u64;
+    loop {
+      let ReplyBody::Drifted {
+        entries: page,
+        next,
+        oversized: passed,
+      } = self.call(&RequestBody::Drifted { volume, from })?
+      else {
+        return Err(ClientError::UnexpectedReply { verb: "drifted" });
+      };
+      entries.extend(page);
+      oversized = oversized.saturating_add(u64::from(passed));
+      match next {
+        None => return Ok((entries, oversized)),
+        // A page must move the position forward, so a walk always ends.
+        Some(next) if next > from => from = next,
+        Some(_) => return Err(ClientError::UnexpectedReply { verb: "drifted" }),
+      }
+    }
+  }
+
   /// The caller's grants, in grant-id order: walked a page at a time, as one reply holds one page (§4.3).
   pub fn grants(&mut self) -> Result<Vec<GrantSummary>, ClientError> {
     let mut grants: Vec<GrantSummary> = Vec::new();

@@ -12849,6 +12849,82 @@ fn the_longest_recorded_base_is_named_whole_by_status() {
   );
 }
 
+/// Shape: the base files the drift test changes on disk after pinning: several replies' worth of drift.
+#[cfg(unix)]
+const CLI_DRIFTED: usize = 600;
+
+/// §4.4 `status`, A-267, by use. Do: overlay a host directory of 600 files, pin them, change every file on disk, and
+/// run `slates status ID --drift` until the drift is seen. Expect: it names all 600, once each, though the status reply
+/// carries only the first that fit; and `slates status ID` counts 600. Before, `--drift` printed the status's own list,
+/// and the text form counted only those.
+#[cfg(unix)]
+#[test]
+fn status_drift_names_every_drifted_entry_past_one_reply() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping status --drift past one reply: set SLATES_TEST_CLI=1 to run it (starts daemons)"
+    );
+    return;
+  }
+  let instance = format!("cli-drift-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-drift"),
+  };
+  let base = format!("{}/base", scratch.path);
+  shell(&format!(
+    "mkdir -p '{base}' && cd '{base}' && for n in $(seq -w 0 {}); do echo before > drifting-$n.txt; done",
+    CLI_DRIFTED - 1
+  ));
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "drifting",
+      "--bounded",
+      "64MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let (code, _, err) = run(&instance, &["base", "pin", &id]);
+  assert_eq!(code, 0, "{err}");
+  shell(&format!(
+    "cd '{base}' && for f in drifting-*.txt; do echo 'after, and longer' > \"$f\"; done"
+  ));
+  let started = std::time::Instant::now();
+  let named = loop {
+    let (code, out, err) = run(&instance, &["status", &id, "--drift"]);
+    assert_eq!(code, 0, "{err}");
+    let lines: Vec<String> = out.lines().map(str::to_owned).collect();
+    if lines.len() >= CLI_DRIFTED || started.elapsed() > std::time::Duration::from_secs(30) {
+      break lines;
+    }
+    // A test waiting on the base's watcher between asks; the daemon is another process.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(std::time::Duration::from_millis(200));
+  };
+  assert_eq!(
+    named.len(),
+    CLI_DRIFTED,
+    "every drifted entry, once: {} named",
+    named.len()
+  );
+  let distinct: std::collections::BTreeSet<&String> = named.iter().collect();
+  assert_eq!(distinct.len(), CLI_DRIFTED, "each once");
+  let (code, out, err) = run(&instance, &["status", &id]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    out
+      .lines()
+      .any(|line| line == format!("drifted: {CLI_DRIFTED}")),
+    "the status counts every drifted entry: {out}"
+  );
+}
+
 /// Bug (GAPS, 2026-11-08; §2 item 8, unbounded growth): a volume recovery could not rebuild was refused `NotRecovered`
 /// by `destroy` too, so its catalog record, its snapshots' records and its name stayed for good and an operator could
 /// not get rid of it. Do: make a volume over a host directory and snapshot it, remove the directory, restart the daemon

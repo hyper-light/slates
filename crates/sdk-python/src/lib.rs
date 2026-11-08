@@ -200,6 +200,7 @@ fn status_dict(py: Python<'_>, report: StatusReport) -> PyResult<Py<PyDict>> {
   dict.set_item("snapshots", report.snapshots)?;
   dict.set_item("watcher", report.watcher)?;
   dict.set_item("drifted", report.drifted)?;
+  dict.set_item("drifted_elided", report.drifted_elided)?;
   dict.set_item("nfs_port", report.nfs_port)?;
   dict.set_item("placed", report.placed.region)?;
   dict.set_item("mirror_age_ns", report.placed.mirror_age_ns)?;
@@ -344,10 +345,10 @@ impl Client {
   /// Reads the volume's status (§4.4) as a dict of plain Python values — the same fields `slates status`
   /// prints: its id and name, the byte accounting (`referenced_bytes`, `unique_bytes`), the held lease
   /// epoch (`None` when unheld), live `attachments`, the `head` snapshot sequence, `snapshots` held, the
-  /// overlay `watcher` state, and the `drifted` overlay paths (the full list; the CLI shows only the
-  /// count). The placement (§4.8, D-18) is flattened: `placed` is whether the head is placed in the
-  /// region, `mirror_age_ns` the mirror's lag (`None` where no mirror exists), `host_epoch` the owner's
-  /// authority. `nfs_port` is the daemon's loopback port for `mount_nfs`, or `None` when it serves no NFS.
+  /// overlay `watcher` state, and the `drifted` overlay paths (those that fit beside the report's other
+  /// fields in one reply; `drifted_elided` counts the rest, which `slates status --drift` walks, A-267). The
+  /// placement (§4.8, D-18) is flattened: `placed` is whether the head is placed in the region,
+  /// `mirror_age_ns` the mirror's lag (`None` where no mirror exists), `host_epoch` the owner's authority. `nfs_port` is the daemon's loopback port for `mount_nfs`, or `None` when it serves no NFS.
   fn status(&mut self, py: Python<'_>, volume: &str) -> PyResult<Py<PyDict>> {
     let id = parse_volume(volume)?;
     let report = self.inner.status(id).map_err(refusal)?;
