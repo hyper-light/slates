@@ -14199,6 +14199,12 @@ forwarded from another node still places the work on the green's shard.
     work had not changed, so the log's replay is given the base through the same ask of the owner, once the partitions
     are all recovered, and the work is unserved (`Unpublished`) until it has. A work's recovery no longer needs a local
     engine.
+  - *A submit not yet settled.* When a submit goes to the owner, the work's partition records it, whole, in the
+    verb's transaction (`Op::WorkSubmitPending`), and the settle clears it (`Op::WorkSubmitSettled`). While it is
+    recorded, every other verb of the work waits behind it, and the submit runs again first, under its own key, to take
+    the owner's answer. So an answer lost on its way back, or a restart between the owner's step and the work's, never
+    lets a later verb land on a work that the owner's accept has yet to reset: it did, and the reset then dropped an
+    acknowledged edit (`an_edit_after_a_lost_answer_is_kept_when_the_submit_is_retried`).
   - *Exactly once.* A client's retry meets, in order: the work's shard's completion record; a parked verb it joins; or a
     re-run, which sends the owner the same request id. The owner answers a request it has completed from its record,
     whatever the work now holds, so a crash between the owner's accept and the work's reset resolves to the same answer,

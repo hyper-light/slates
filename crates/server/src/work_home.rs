@@ -44,6 +44,11 @@ pub(crate) const ASKED_THE_OWNER: &str = "merge.work.asked_owner";
 /// Format: a deferred verdict resumed its parked verb when its record committed at the quorum (AUD-11), the non-vacuity
 /// count of [`answered_late`].
 pub(crate) const ANSWERED_LATE: &str = "merge.work.answered_late";
+/// Format: a work's pending submit settled ahead of another verb of the work (A-247), the non-vacuity count of
+/// [`settle_pending_first`].
+pub(crate) const PENDING_SETTLED_FIRST: &str = "merge.work.pending_settled_first";
+/// Format: a pending submit whose request could not be decoded; the work's verbs then run as though it had none.
+const PENDING_UNREADABLE: &str = "merge.work.pending_unreadable";
 /// Format: a verb refused because the shard's parked verbs are at their bound.
 const PARK_FULL: &str = "merge.work.park_full";
 /// Format: an ask of the green's owner unanswered within its deadline; the verb answers `Overloaded` and is retried.
@@ -381,6 +386,9 @@ pub(crate) fn gate(
   let Some((work, _green)) = remote_work(state, &body) else {
     return Gate::Run(body);
   };
+  if let Some(gate) = settle_pending_first(state, (client_id, principal), &body, work) {
+    return gate;
+  }
   let queued = state.work_home.resuming != Some(work) && state.work_home.queues.contains_key(&work);
   if let Some(refusal) = reset_refusal(state, work, &body) {
     return Gate::Answer(crate::verbs::refused(refusal));
@@ -450,6 +458,12 @@ fn park(
     _ => return refuse_unrecorded(state),
   };
   let asks = need.is_some() && (resuming || !state.work_home.queues.contains_key(&queue_key));
+  if asks
+    && matches!(need, Some(Need::Verdict { .. }))
+    && stage_pending(state, queue_key, (origin, id, client_id), principal, &body).is_err()
+  {
+    return refuse_unrecorded(state);
+  }
   if asks && !start_ask(state, queue_key, origin, id, principal, need) {
     return refuse_unrecorded(state);
   }
@@ -491,6 +505,96 @@ fn refuse_unrecorded(state: &mut ShardState) -> Gate {
   }
   state.acceptance_deferred = true;
   Gate::Answer(crate::lease_wait::parked_reply())
+}
+
+/// Records, in the running verb's transaction, that `work`'s submit is going to the green's owner and is to be settled
+/// on the work under its own key (A-247), unless it already is. Until it is settled every other verb of the work waits
+/// behind it ([`settle_pending_first`]), so nothing lands on the work between the owner's verdict and the work's reset,
+/// whether the answer comes, is lost, or a restart falls between.
+fn stage_pending(
+  state: &mut ShardState,
+  work: DbVolumeId,
+  (origin, id, client_id): (u64, RequestId, u32),
+  principal: &Principal,
+  body: &RequestBody,
+) -> Result<(), slates_db::DbError> {
+  let record = slates_db::catalog::PendingSubmitRecord {
+    work,
+    origin,
+    client: id.client,
+    sequence: id.sequence,
+    client_id,
+    principal: principal.clone(),
+    body: slates_wire::Wire::to_bytes(body),
+  };
+  if state.db.partition().pending_submit(work) == Some(&record) {
+    return Ok(());
+  }
+  let now = state.clock.monotonic_ns();
+  state
+    .db
+    .mutate(&mut state.segment, &Op::WorkSubmitPending { record }, now)
+    .map(|_| ())
+}
+
+/// When `work` has a submit to settle that is not the running request (A-247), parks the running verb behind it and
+/// puts that submit at the head of the work's queue, to be run again under its own key once the owner answers it: the
+/// verdict the owner recorded, or the one it gives now if it never had the request. `None` when there is nothing to
+/// settle first.
+fn settle_pending_first(
+  state: &mut ShardState,
+  (client_id, principal): (u32, &Principal),
+  body: &RequestBody,
+  work: DbVolumeId,
+) -> Option<Gate> {
+  let pending = state.db.partition().pending_submit(work)?.clone();
+  let pending_key = (pending.origin, pending.client, pending.sequence);
+  let running = state
+    .current_request
+    .map(|(origin, id)| (origin, id.client, id.sequence));
+  if running == Some(pending_key) || state.work_home.by_request.contains_key(&pending_key) {
+    return None;
+  }
+  let Ok(pending_body) = <RequestBody as slates_wire::Wire>::from_bytes(&pending.body) else {
+    state.count(PENDING_UNREADABLE, 1);
+    return None;
+  };
+  let gate = park(state, client_id, principal, body.clone(), Some(work), None);
+  if !matches!(gate, Gate::Answer(_)) || !state.work_home.queues.contains_key(&work) {
+    return Some(gate);
+  }
+  let id = RequestId {
+    client: pending.client,
+    sequence: pending.sequence,
+  };
+  let settle = ParkedVerb {
+    verb: ResumedVerb {
+      route: None,
+      origin: pending.origin,
+      id,
+      client_id: pending.client_id,
+      principal: pending.principal,
+      body: pending_body,
+    },
+    fetched: None,
+    verdict: None,
+    rebased: None,
+    admitted: None,
+  };
+  let home = &mut state.work_home;
+  home.by_request.insert(pending_key, work);
+  home.parked = home.parked.saturating_add(1);
+  if let Some(queue) = home.queues.get_mut(&work) {
+    queue.waiting.push_front(settle);
+  }
+  state.count(PENDING_SETTLED_FIRST, 1);
+  // Resumed after this verb's transaction, as an answer from the owner would be.
+  if let Ok(task) = slates_rt::futures::spawn(async move {
+    let _ = state::with_state_counted(|s| resume(s, work));
+  }) {
+    let _ = slates_rt::futures::detach(task);
+  }
+  Some(gate)
 }
 
 fn refused_overloaded(state: &ShardState) -> ReplyBody {
@@ -650,6 +754,20 @@ async fn ask(
       .map(Answered::Base),
     ),
     Need::Verdict { evidence, sealed } => {
+      // Only a submit whose pending record committed goes to the owner (`stage_pending`).
+      let work = sealed.work;
+      let staged = state::with_state(|s| {
+        s.db
+          .partition()
+          .pending_submit(work)
+          .is_some_and(|pending| {
+            (pending.origin, pending.client, pending.sequence) == (origin, id.client, id.sequence)
+          })
+      })
+      .unwrap_or(false);
+      if !staged {
+        return Asked::Unanswered;
+      }
       match call_within(
         here,
         owner,

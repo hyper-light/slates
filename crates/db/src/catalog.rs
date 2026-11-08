@@ -1034,6 +1034,28 @@ pub struct NameAliasRecord {
   pub confirmed: bool,
 }
 
+/// A work's submit that went to its green's owner and whose answer the work has not yet settled (A-247): kept on the
+/// work's partition from the ask until the settle, so no other verb of the work runs between the owner's verdict and
+/// the work's reset, across a lost answer or a restart. The request is kept whole, to be run again under its own key
+/// once the owner answers it.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct PendingSubmitRecord {
+  /// The work.
+  pub work: VolumeId,
+  /// The completion key's origin.
+  pub origin: u64,
+  /// The completion key's client.
+  pub client: u32,
+  /// The completion key's sequence.
+  pub sequence: u32,
+  /// The client the request was served for.
+  pub client_id: u32,
+  /// The principal it was asked as.
+  pub principal: Principal,
+  /// The request, in the wire's encoding.
+  pub body: Vec<u8>,
+}
+
 /// A live work's hold on a version of its green (A-247), kept on the green's partition whichever partition the work
 /// lives on: the green's reachable floor is the minimum over these and its pins, so a checkpoint never folds past a
 /// base a work still reads and composes against.

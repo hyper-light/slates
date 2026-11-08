@@ -144,6 +144,8 @@ pub struct PartitionSnapshot {
   pub green_checkpoints: Vec<GreenCheckpoint>,
   /// Each live work's hold on a version of a green of this partition (A-247; appended).
   pub work_floors: Vec<crate::catalog::WorkFloorRecord>,
+  /// Each work's submit awaiting its settle (A-247; appended).
+  pub pending_submits: Vec<crate::catalog::PendingSubmitRecord>,
 }
 
 /// One green's checkpoint, as a snapshot carries it (W3; §4.16): the version it is the green's state at, and its
@@ -253,6 +255,8 @@ pub struct Partition {
   name_aliases: BTreeMap<String, NameAliasRecord>,
   /// Each live work's base, by green and work (A-247), on the green's partition.
   work_floors: BTreeMap<(VolumeId, VolumeId), u64>,
+  /// Each work's submit awaiting its settle, at most one a work (A-247).
+  pending_submits: BTreeMap<VolumeId, crate::catalog::PendingSubmitRecord>,
   /// How many works hold each version of each green, so a green's reachable floor is one look-up per verdict rather
   /// than a walk of its works (A-247: a green with 10,000 works is judged once per accept).
   work_floor_counts: BTreeMap<(VolumeId, u64), u64>,
@@ -314,6 +318,7 @@ impl Partition {
       nfs_purges: BTreeSet::new(),
       name_aliases: BTreeMap::new(),
       work_floors: BTreeMap::new(),
+      pending_submits: BTreeMap::new(),
       work_floor_counts: BTreeMap::new(),
       expired_attachments: std::collections::VecDeque::new(),
       nfs_instance: 0,
@@ -482,6 +487,11 @@ impl Partition {
       .range((green, 0)..=(green, u64::MAX))
       .next()
       .map(|((_, base), _)| *base)
+  }
+
+  /// The work's submit awaiting its settle, when it has one (A-247).
+  pub fn pending_submit(&self, work: VolumeId) -> Option<&crate::catalog::PendingSubmitRecord> {
+    self.pending_submits.get(&work)
   }
 
   /// Every work's hold on a green of this partition (A-247), for the orphan check at recovery.
@@ -1122,6 +1132,14 @@ impl Partition {
         }
       }
       Op::WorkFloorDropped { .. } => Ok(()),
+      // One a work: a second while one waits is refused, so the first is never lost (A-247).
+      Op::WorkSubmitPending { record } => match self.pending_submits.get(&record.work) {
+        Some(pending) if pending != record => Err(DbError::AlreadyExists {
+          existing: record.work.bytes,
+        }),
+        _ => Ok(()),
+      },
+      Op::WorkSubmitSettled { .. } => Ok(()),
       Op::NameAliasReserved { .. }
       | Op::NameAliasConfirmed { .. }
       | Op::NameAliasReleased { .. }
@@ -1468,6 +1486,14 @@ impl Partition {
           self.expired_attachments.pop_front();
         }
         self.expired_attachments.push_back(*id);
+        Ok(())
+      }
+      Op::WorkSubmitPending { record } => {
+        self.pending_submits.insert(record.work, record.clone());
+        Ok(())
+      }
+      Op::WorkSubmitSettled { work } => {
+        self.pending_submits.remove(work);
         Ok(())
       }
       Op::WorkFloorSet { .. } | Op::WorkFloorDropped { .. } => {
@@ -1946,6 +1972,7 @@ impl Partition {
         .collect(),
       name_aliases: self.name_aliases.values().cloned().collect(),
       work_floors: self.work_floors().collect(),
+      pending_submits: self.pending_submits.values().cloned().collect(),
       expired_attachments: self.expired_attachments.iter().copied().collect(),
       nfs_instance: self.nfs_instance,
       tombstones: self.tombstones().collect(),
@@ -2075,6 +2102,9 @@ impl Partition {
     p.restore_merge(snapshot);
     p.restore_nfs(snapshot);
     p.restore_name_aliases(snapshot);
+    for pending in &snapshot.pending_submits {
+      p.pending_submits.insert(pending.work, pending.clone());
+    }
     for floor in &snapshot.work_floors {
       p.set_work_floor(floor.green, floor.work, floor.base);
     }

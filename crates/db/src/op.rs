@@ -422,6 +422,16 @@ pub enum Op {
     /// The version the work is based on.
     base: u64,
   },
+  /// A work's submit went to its green's owner and waits to be settled on the work (A-247). Appended.
+  WorkSubmitPending {
+    /// The submit.
+    record: crate::catalog::PendingSubmitRecord,
+  },
+  /// A work's pending submit was settled (A-247). Appended.
+  WorkSubmitSettled {
+    /// The work.
+    work: VolumeId,
+  },
   /// A work's floor is released: it was destroyed, or found gone at recovery (A-247). Appended.
   WorkFloorDropped {
     /// The green.
@@ -545,6 +555,8 @@ impl Op {
       Op::NameAliasReleased { .. } => "name_alias_released",
       Op::WorkFloorSet { .. } => "work_floor_set",
       Op::WorkFloorDropped { .. } => "work_floor_dropped",
+      Op::WorkSubmitPending { .. } => "work_submit_pending",
+      Op::WorkSubmitSettled { .. } => "work_submit_settled",
       Op::AttachmentRenewed { .. } => "attachment_renewed",
       Op::AttachmentExpired { .. } => "attachment_expired",
       Op::LiveShippingChanged { .. } => "live_shipping_changed",

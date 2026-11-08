@@ -6112,6 +6112,9 @@ fn edit_and_submit(
   // to the work: an accept moves past it and a conflict applies it now, so the work holds it as a client's two verbs
   // would have left it.
   if let Some(reply) = state.work_home.verdict.take() {
+    if let Err(e) = settle_pending(state, to_db_volume(work)) {
+      return refused(refusal_of_db(&e));
+    }
     return match crate::merge_service::require_work(state, principal, work, true, "edit") {
       Ok((record, green)) => {
         settle_edit_submit(state, principal, (record.id, green, work), splice, reply)
@@ -6687,7 +6690,13 @@ fn submit(
       Err(refusal) => return refused(refusal),
     };
   let reply = match state.work_home.verdict.take() {
-    Some(reply) => reply,
+    Some(reply) => {
+      // The owner's verdict on a submit the work recorded as pending (A-247): settled here, in this transaction.
+      if let Err(e) = settle_pending(state, work_id) {
+        return refused(refusal_of_db(&e));
+      }
+      reply
+    }
     None => {
       // The restatement an acceptance records must fit before the verdict (A-207), so a submit is refused rather than
       // accepted with the work's log unable to record it.
@@ -6704,6 +6713,18 @@ fn submit(
     }
   };
   settle_submit(state, work_id, green_id, reply)
+}
+
+/// Clears `work`'s pending submit (A-247), in the transaction that settles its verdict.
+fn settle_pending(state: &mut ShardState, work: DbVolumeId) -> Result<(), slates_db::DbError> {
+  if state.db.partition().pending_submit(work).is_none() {
+    return Ok(());
+  }
+  let now = state.clock.monotonic_ns();
+  state
+    .db
+    .mutate(&mut state.segment, &Op::WorkSubmitSettled { work }, now)
+    .map(|_| ())
 }
 
 /// Settles a verdict on the work, in the verb's transaction: an accept moves the work's base to the new version and
