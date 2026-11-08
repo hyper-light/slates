@@ -10731,6 +10731,60 @@ silicon), release binaries of agents/loadtest-scale-1 at 6f7c5306, load 5.0 to 9
   keeps the whole previous bytes of every file it overwrote, and the history folds only down to the oldest base a
   live work holds. 3,766 versions were accepted.
 
+### The f = 1 load test at 10,000 clients on Linux, clean and with a replica killed, interleaved (2026-11-07, fixtures)
+
+Tree: `4811191a` (main, B1) merged with `b38a9d66` (fixtures: A-244, the merge record carries its inputs; A-246, a
+restarted owner re-enqueues its records) and `6fe4b30d` (loadtest-scale: the acknowledgement fix, A-243, a forward
+refused at admission answers its client). All merged clean except a BENCHMARKS.md conflict, where both sides were kept.
+Local, never pushed. The harness carried one local, never-committed change: a tally of its same-id resends by verb and
+refusal (`retried_by`).
+
+Hardware: adacachy, AMD Ryzen 9 9950X3D2, 32 threads, Linux 7.2.9-2-cachyos, release build, 2026-11-07. Load is from
+other agents' work on the machine.
+
+Topology: `crates/cli/tests/load_scale.rs`, three server processes at `f = 1` (one primary, two replicas) and one client
+node, over `kernel/` of Linux v7.4-rc1 (754 files, 16,321,721 bytes). The harness was `load_bench --clients 10000
+--hot-files 8000 --reply-patience 60 --per-connection 32 --think-us 0`, 3 rounds. Every daemon and the harness ran in
+one `systemd-run --user` unit with CPUWeight=1, Nice=19, CPUQuota=800% and MemoryMax a quarter of available memory.
+
+Samplers, outside the unit at normal priority:
+- every 100 ms, each shard thread's `schedstat` (on-CPU and run-queue wait) and state;
+- every second, the box's load average and the unit's `cpu.pressure` and `cpu.stat`.
+
+In the kill arms, replica-1's daemon was SIGKILLed 50 s in and restarted by its anchor. The arms ran interleaved: clean,
+kill, clean, kill. Every run is shown.
+
+| Run | Box load min / median / max | Wall | Oracle | Accepted | SubmitAccepted p50 / p99 / p999 / max | Same-id resends (all `Overloaded`) |
+|---|---|---|---|---|---|---|
+| clean 1 | 19.6 / 29.5 / 39.7 | 199.5 s | 0 failures | 11,919 | 850 ms / 4.23 s / 4.84 s / 4.93 s | 381,769 |
+| kill 1 | 23.1 / 26.3 / 41.6 | 199.0 s | 0 failures | 12,930 | 742 ms / 5.60 s / 6.72 s / 6.97 s | 299,400 |
+| clean 2 (confounded) | 18.1 / 23.9 / 50.6 | 115.0 s | 0 failures, 191 unknown | 4,129 | 627 ms / 5.02 s / 6.73 s / 8.58 s | 255,110 |
+| kill 2 | 24.8 / 29.4 / 37.3 | 301.7 s | 0 failures | 14,352 | 887 ms / 10.2 s / 12.2 s / 12.7 s | 536,032 |
+
+Clean 2 is confounded twice and kept in the record:
+- 5,005 `CreateWork` were refused `HomedElsewhere`, so half its clients never began. A full control channel answered
+  `HomedElsewhere`; loadtest-scale's `2ae4e832` answers it `Overloaded`, and this tree predates that.
+- The client node's anchor killed its daemon once, after two false "shard N is wedged" verdicts. The sampler showed the
+  client node's shard 0 runnable throughout: in the 1,004 ms before the verdict it ran 0.8 ms and waited 1,002.7 ms for
+  a CPU. That's liveness's goal 9540fec7.
+
+What the runs show:
+- **The clean arm is not slower than the kill arm.** An earlier pair of single runs had read 12.4 s against 1.95 s at
+  p99. On comparable load, p99 is 4.2 to 5.0 s clean and 5.6 to 10.2 s with the kill, with a wide spread from run to run
+  in both arms.
+- **Every same-id resend is the owner shard's `Overloaded`.** By verb, clean 1, kill 1, clean 2 and kill 2:
+  - Edit: 184,145, 147,049, 126,123 and 259,437 (about 48%);
+  - ReadHead: 123,680, 99,819, 89,346 and 173,037 (about 33%);
+  - Rebase: 44,955, 30,298, 25,938 and 62,051 (about 12%);
+  - SubmitAccepted: 28,559, 21,874, 13,543 and 40,851 (about 7%);
+  - Destroy: 430, 360, 160 and 656.
+- **The other resend kinds are small.** `AcknowledgementOwed` (backpressure) came to 0 to 6 a run, and
+  `LeaseUnconfirmed` to 0 to 3,300.
+- So under load the latency is the green's one owner shard turning the works' traffic away (W1, perf's), not the
+  commit. A single submit at `f = 1` on an idle fleet is p50 265 µs and p99 731 µs (A-244).
+
+Logs and samples: adacachy `~/.cache/slates-agents-scratch/fixtures/rungs9/ab-{clean,kill1}-{1,2}.{log,samples,mon}`.
+
 ## Step 7's verdict: the receiver's regression fixed where it was not crash safety, and crash safety's price kept (audit step 7; R4; 2026-11-06 and 07)
 
 **The decision.** The WinFsp receiver (A-198) is slower than the DLL dispatcher it replaced (`71cf09ac`) on CI's arm64
