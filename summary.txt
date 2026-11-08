@@ -1,0 +1,15 @@
+run 42508255276 commit e5ded5fe7df05d341c985ede3e3eca7ad7a29999 windows-latest runs=success
+== out/liveness-1.log
+.spinning shard: a window of its CPU (1s) took 1.099343s of wall; 0 beat(s) after; the beat stopped true; its CPU by the end 1.984375s
+starved shard: 4 spinners at nice 0, its CPU clock stood still for 2.9601089s at most in 3.0082933s; largest beat gap 110.8778ms; the watchdog looked 28 times and withheld the beat at 0
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 12.57s
+== out/liveness-2.log
+spinning shard: a window of its CPU (1s) took 1.1777278s of wall; 0 beat(s) after; the beat stopped true; its CPU by the end 2s
+starved shard: 4 spinners at nice 0, its CPU clock stood still for 2.9442535s at most in 3.0062266s; largest beat gap 100.6192ms; the watchdog looked 27 times and withheld the beat at 0
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 12.74s
+== out/liveness-3.log
+spinning shard: a window of its CPU (1s) took 1.1725541s of wall; 1 beat(s) after; the beat stopped true; its CPU by the end 2.046875s
+starved shard: 4 spinners at nice 0, its CPU clock stood still for 2.9606481s at most in 3.0088658s; largest beat gap 110.7743ms; the watchdog looked 27 times and withheld the beat at 0
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 12.54s
+== out/pollers.log
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
