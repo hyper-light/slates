@@ -1,0 +1,21 @@
+tested f30e2f0349d94f0ad1af1e29525a6da9122ef565 variant after on x86_64, 4 cpus
+restart exit 0 147s
+still-waits exit 0 62s
+takeover exit 0 9s
+  takeover: the resend through the takeover was answered Ok(Refused { refusal: OwnerUnreachable { region: 0 } }); head Versions { head: 1 }
+wire exit 0 10s
+db exit 0 48s
+held exit 0 109s
+fleet-merge exit 0 274s
+server-lib exit 0 22s
+server exit 0 50s
+client exit 0 60s
+clippy exit 101 73s
+  clippy: error: the function has a cognitive complexity of (14/10)
+  clippy:      --> crates/server/tests/fleet.rs:12892:4
+  clippy:       = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#cognitive_complexity
+  clippy:       = note: requested on the command line with `-D clippy::cognitive-complexity`
+  clippy: error: the function has a cognitive complexity of (11/10)
+  clippy:      --> crates/server/tests/fleet.rs:13477:4
+  clippy:       = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#cognitive_complexity
+  clippy: error: could not compile `slates-server` (test "fleet") due to 2 previous errors
