@@ -1,0 +1,25 @@
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' failed - Err(Error { kind: ToolExecError, message: "command did not execute successfully (status code exit code: 2): \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Tools\\\\MSVC\\\\14.51.36231\\\\bin\\\\HostX64\\\\x64\\\\cl.exe\" \"-nologo\" \"-MD\" \"-Z7\" \"-Brepro\" \"-WX\" \"-W4\" \"-FoD:\\\\a\\\\slates\\\\slates\\\\target\\\\debug\\\\build\\\\aws-lc-sys-0bf3c6c5352b74c6\\\\out\\\\out-stdalign_check\\\\e1bacabfea35bee3-stdalign_check.o\" \"-c\" \"D:\\\\a\\\\slates\\\\slates\\\\vendor\\\\aws-lc-sys\\\\aws-lc\\\\tests\\\\compiler_features_tests\\\\stdalign_check.c\"" }).
+test a_base_a_held_drive_covers_is_not_reacquired_through_it ... slates-server: shard 0 initialized in 13172 µs
+test a_base_on_the_daemons_own_drive_is_refused_before_any_open ... slates-server: shard 0 initialized in 12572 µs
+test a_cached_read_through_a_winfsp_mount_shows_another_paths_change ... slates-server: shard 0 initialized in 13163 µs
+test a_file_at_a_two_thousand_unit_path_is_served_across_a_killed_daemon ... slates-server: shard 0 initialized in 12546 µs
+test a_mapped_view_through_a_winfsp_mount_after_another_paths_change ... slates-server: shard 1 initialized in 3089 µs
+test a_process_outside_the_anchor_cannot_take_either_holders_mount_handles ... slates-server: shard 0 initialized in 14824 µs
+test a_read_only_drive_refuses_every_change_as_write_protected ... slates-server: shard 0 initialized in 13285 µs
+test a_refused_mount_time_hold_leaves_nothing_mounted ... slates-server: shard 0 initialized in 12465 µs
+test a_release_the_anchor_does_not_answer_leaves_no_drive_held ... slates-server: shard 0 initialized in 12705 µs
+test a_second_daemon_cannot_take_an_instance_with_a_live_winfsp_drive ... slates-server: shard 0 initialized in 12529 µs
+test a_volume_mounted_through_winfsp_is_read_and_written_by_windows_programs ... slates-server: shard 1 initialized in 3070 µs
+test a_winfsp_drive_handle_and_view_survive_twenty_killed_daemons ... slates-server: shard 0 initialized in 12438 µs
+slates anchor: the daemon is in a crash loop (last exit Some(1)); restarting it in 1000 ms
+slates anchor: the daemon is in a crash loop (last exit Some(1)); restarting it in 2000 ms
+slates anchor: the daemon is in a crash loop (last exit Some(1)); restarting it in 4000 ms
+slates anchor: the daemon is in a crash loop (last exit Some(1)); restarting it in 1000 ms
+test a_winfsp_folder_bound_into_a_process_isolated_container ... slates-server: shard 1 initialized in 3932 µs
+test a_winfsp_view_follows_its_file_after_an_sdk_rename ... slates-server: shard 0 initialized in 13321 µs
+test a_winfsp_view_of_a_renamed_file_follows_its_successor ... slates-server: shard 0 initialized in 12939 µs
+test foreign_process_role ... ignored, the independent Windows access probe, re-invoked by its parent
+test opens_past_a_thousand_units_are_refused_only_by_the_winfsp_driver ... slates-server: shard 0 initialized in 12803 µs
+test unmount_releases_every_healthy_drive_beside_a_volume_recovery_could_not_rebuild ... slates-server: shard 0 initialized in 12486 µs
+test result: ok. 17 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 149.22s
+exit 0
