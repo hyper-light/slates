@@ -1,0 +1,635 @@
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'aarch64-unknown-linux-gnu'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/home/runner/work/slates/slates/target/release/build/aws-lc-sys-427dd49efe2825e4/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Using flag: -ffile-prefix-map=/home/runner/work/slates/slates/vendor/aws-lc-sys=
+warning: aws-lc-sys@0.45.0: Using assembler flag: -Wa,--debug-prefix-map=/home/runner/work/slates/slates/vendor/aws-lc-sys=
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/release/build/aws-lc-sys-427dd49efe2825e4/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/release/build/aws-lc-sys-427dd49efe2825e4/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'neon_sha3_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/release/build/aws-lc-sys-427dd49efe2825e4/out/out-neon_sha3_check/7dfda64fdf5a526c-neon_sha3_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/runner/work/slates/slates/target/release/build/aws-lc-sys-427dd49efe2825e4/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+    Finished `release` profile [optimized] target(s) in 0.08s
+     Running tests/live_chaos.rs (target/release/deps/live_chaos-fd40aae5916a4dbd)
+
+running 1 test
+test candidates_partitioned_in_turn_mid_stream_lose_nothing ... slates daemon: fleet node `a` of `slates-fleet`: member 4735723629297633029 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 16715923456: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 2785987242: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 8388608: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 696496810: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 2072907: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 7900: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 696496810: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 1392993620: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 5681: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 4729277506: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 18680: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: page_fault_ns = 1083: the profile's measured base-page fault cost (at least one) (anchors ["faults.base_ns"])
+slates daemon: prefault_reserve_bytes = min(the shard's last write burst, reserve_per_shard = 2785987242, the arena's free bytes): the free content pages an idle shard keeps pre-faulted; the burst is measured at each idle tick (anchors ["reserve_per_shard", "content.allocated_bytes"])
+slates daemon: codec = lz4 false, zstd levels [], byte worth 211 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 256: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 1209195: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 912242: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 680172: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 2785987242: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 113362: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 8: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 2576: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 16384: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5152: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 5157: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 790000: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_bandwidth_bytes_per_ns = 4: memcpy bytes per second at the largest measured copy size / 1e9 (at least one byte per nanosecond) (anchors ["memcpy"])
+slates daemon: guest_requests_credit = 20: the owning shard's admission limit (Little's law: request rate × p99 service time); one attachment may use its shard's whole in-flight budget, which the daemon splits among attachments (anchors ["rt.requests_in_flight_per_shard"])
+slates daemon: guest_bytes_credit = 4456544: clamp(bandwidth × rtt, one frame cap, bandwidth × class latency budget) (anchors ["wire.bandwidth", "wire.rtt_p50", "wire.frame_cap", "wire.class_budget"])
+slates daemon: guest_listing_entries = 131072: guest writable cap / smallest fuse_dirent (anchors ["guest.writable_cap"])
+slates daemon: inode_reserve = 262144: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 2561: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 348248405: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2418390: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2418390: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: fleet_sessions_per_plane = 1932: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120168: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77388192: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5157: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: instance chaos-rolling-a-36332 serving on 2 shards alone
+slates-server: shard 1 initialized in 887 µs
+slates-server: shard 0 initialized in 1121 µs
+slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, extensions 10 × 100000000 ns; no path measured yet
+slates daemon: fleet node `b` of `slates-fleet`: member 8016517304973252822 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 16715923456: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 2785987242: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 8388608: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 696496810: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 2072907: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 8170: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 696496810: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 1392993620: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 5885: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 5050132234: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 20629: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: page_fault_ns = 1159: the profile's measured base-page fault cost (at least one) (anchors ["faults.base_ns"])
+slates daemon: prefault_reserve_bytes = min(the shard's last write burst, reserve_per_shard = 2785987242, the arena's free bytes): the free content pages an idle shard keeps pre-faulted; the burst is measured at each idle tick (anchors ["reserve_per_shard", "content.allocated_bytes"])
+slates daemon: codec = lz4 false, zstd levels [], byte worth 198 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 256: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 1209195: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 912242: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 680172: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 2785987242: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 113362: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 9: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 2576: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 16384: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5152: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 5157: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 817000: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_bandwidth_bytes_per_ns = 5: memcpy bytes per second at the largest measured copy size / 1e9 (at least one byte per nanosecond) (anchors ["memcpy"])
+slates daemon: guest_requests_credit = 20: the owning shard's admission limit (Little's law: request rate × p99 service time); one attachment may use its shard's whole in-flight budget, which the daemon splits among attachments (anchors ["rt.requests_in_flight_per_shard"])
+slates daemon: guest_bytes_credit = 4456544: clamp(bandwidth × rtt, one frame cap, bandwidth × class latency budget) (anchors ["wire.bandwidth", "wire.rtt_p50", "wire.frame_cap", "wire.class_budget"])
+slates daemon: guest_listing_entries = 131072: guest writable cap / smallest fuse_dirent (anchors ["guest.writable_cap"])
+slates daemon: inode_reserve = 262144: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 2561: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 348248405: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2418390: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2418390: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: fleet_sessions_per_plane = 1932: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120168: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77388192: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5157: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: instance chaos-rolling-b-36332 serving on 2 shards alone
+slates-server: shard 1 initialized in 687 µs
+slates-server: shard 0 initialized in 968 µs
+slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, extensions 10 × 100000000 ns; no path measured yet
+slates daemon: fleet node `c` of `slates-fleet`: member 2374134196184131628 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 16715923456: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 2785987242: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 8388608: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 696496810: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 2072907: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 8830: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 696496810: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 1392993620: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 6350: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 5183605471: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 22885: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: page_fault_ns = 1084: the profile's measured base-page fault cost (at least one) (anchors ["faults.base_ns"])
+slates daemon: prefault_reserve_bytes = min(the shard's last write burst, reserve_per_shard = 2785987242, the arena's free bytes): the free content pages an idle shard keeps pre-faulted; the burst is measured at each idle tick (anchors ["reserve_per_shard", "content.allocated_bytes"])
+slates daemon: codec = lz4 false, zstd levels [], byte worth 192 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 256: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 1209195: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 912242: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 680172: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 2785987242: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 113362: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 7: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 2576: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 16384: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5152: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 5157: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 883000: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_bandwidth_bytes_per_ns = 5: memcpy bytes per second at the largest measured copy size / 1e9 (at least one byte per nanosecond) (anchors ["memcpy"])
+slates daemon: guest_requests_credit = 20: the owning shard's admission limit (Little's law: request rate × p99 service time); one attachment may use its shard's whole in-flight budget, which the daemon splits among attachments (anchors ["rt.requests_in_flight_per_shard"])
+slates daemon: guest_bytes_credit = 4456544: clamp(bandwidth × rtt, one frame cap, bandwidth × class latency budget) (anchors ["wire.bandwidth", "wire.rtt_p50", "wire.frame_cap", "wire.class_budget"])
+slates daemon: guest_listing_entries = 131072: guest writable cap / smallest fuse_dirent (anchors ["guest.writable_cap"])
+slates daemon: inode_reserve = 262144: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 2561: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 348248405: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2418390: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2418390: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: fleet_sessions_per_plane = 1932: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120168: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77388192: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5157: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: instance chaos-rolling-c-36332 serving on 2 shards alone
+slates-server: shard 1 initialized in 794 µs
+slates-server: shard 0 initialized in 1024 µs
+slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, extensions 10 × 100000000 ns; no path measured yet
+slates-cluster: fleet: HostId(1459392986655208072) holds HostId(5842768423731160719) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(5842768423731160719) holds HostId(1459392986655208072) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(5842768423731160719) holds HostId(1459392986655208072) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+slates-cluster: fleet: HostId(1459392986655208072) holds HostId(5842768423731160719) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+slates-cluster: fleet: HostId(3124369242414189463) holds HostId(5842768423731160719) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(5842768423731160719) holds HostId(3124369242414189463) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(3124369242414189463) holds HostId(1459392986655208072) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(1459392986655208072) holds HostId(3124369242414189463) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(3124369242414189463) holds HostId(1459392986655208072) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+slates-cluster: fleet: HostId(3124369242414189463) holds HostId(5842768423731160719) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+slates-cluster: fleet: HostId(5842768423731160719) holds HostId(3124369242414189463) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+slates-cluster: fleet: HostId(1459392986655208072) holds HostId(3124369242414189463) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+chaos: fleet rolling (Bare) formed and settled: hosts ["5842768423731160719", "1459392986655208072", "3124369242414189463"]
+LD-SERVE at 1177976390 entry from 3124369242414189463 bytes 4840 took_ns 12495 gap_ns Some(101086675)
+LD-LANE at 1173664652 holder 5842768423731160719 stream 22 bytes 4842 budget_ns 1000005746 took_ns 1000247997 answered false unanswered 1 path_before Some((130934, 155391, 1155391, Some(65496), 0, 0, Some((12, 11, 0, 0)))) path_after None
+LD-SERVE at 3090027968 entry from 3124369242414189463 bytes 708415 took_ns 1122239 gap_ns Some(12889371)
+LD-SERVE at 3141555121 entry from 3124369242414189463 bytes 4012851 took_ns 7228248 gap_ns Some(24560497)
+LD-SERVE at 3162164926 entry from 3124369242414189463 bytes 1718037 took_ns 2369834 gap_ns Some(13381557)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-36332 partitioned from 175.580884ms to 2.175852339s
+slates-cluster: fleet: HostId(3124369242414189463) holds HostId(5842768423731160719) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:618:8
+slates-cluster: fleet: HostId(3124369242414189463) holds HostId(5842768423731160719) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:718:9
+slates daemon: the control shard's beat task ran 2056 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 3317 steps and 3338 polls (28 long in a task, 0 blocked in the kernel, 0 preempted by the host, 42 unattributed), fired 12 timers, waited 171 times, spawned 16 tasks and finished 16; 13 tasks live; its longest poll is 1 ms and its timer overrun 0 ms
+slates-cluster: fleet: HostId(1459392986655208072) holds HostId(5842768423731160719) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:618:8
+slates-cluster: fleet: HostId(1459392986655208072) holds HostId(5842768423731160719) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:718:9
+LD-SERVE at 4223912682 install from 3124369242414189463 bytes 7943700 took_ns 6302535 gap_ns Some(2958382368)
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-36332 partitioned from 2.282624799s to 4.282737149s
+slates-cluster: fleet: HostId(3124369242414189463) holds HostId(1459392986655208072)slates-cluster: fleet:  alive: HostIdSome((5842768423731160719MemberState) {  holds livenessHostId: (Dead1459392986655208072, )incarnation alive: : Some3( }MemberState) {  -> livenessMemberState:  { Deadliveness, : incarnationAlive: , 3incarnation }: )4 ->  }MemberState, folded at  { crates/server/src/member_task.rsliveness:: 618Alive:, 8incarnation
+: 4 }, folded at crates/server/src/member_task.rs:618:8
+slates-cluster: fleet: HostId(3124369242414189463) holds HostId(1459392986655208072) alive: Some(MemberState { liveness: Dead, incarnation: 3 }) -> MemberState { liveness: Alive, incarnation: 4 }, folded at crates/server/src/member_task.rs:718:9
+slates daemon: the control shard's beat task ran 2014 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 2697 steps and 2726 polls (3 long in a task, 0 blocked in the kernel, 2 preempted by the host, 1 unattributed), fired 10 timers, waited 6 times, spawned 3 tasks and finished 3; 13 tasks live; its longest poll is 7 ms and its timer overrun 0 ms
+slates-cluster: fleet: HostId(5842768423731160719) holds HostId(1459392986655208072) alive: Some(MemberState { liveness: Dead, incarnation: 3 }) -> MemberState { liveness: Alive, incarnation: 4 }, folded at crates/server/src/member_task.rs:718:9
+LD-STUCK write sent at 2279ms, in flight 1024ms (at 3303ms):
+--- chaos-rolling-a-36332 (status exit 0; live Some([LiveState { holding: true, head: Some(1839), durable: None, owed: false, epoch: Some(1), identity: Some("d75d77251b7b3316263639f63f8405a08a020c71f21b6d86bc396662086922a0"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 5842768423731160719
+  fleet_host_epoch: 1
+  fleet_members: 3124369242414189463 5842768423731160719
+  fleet_held_records: 2
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 4
+  fleet_settled_generation: 2
+  fleet_neighbourhood_generation: 2
+  fleet_session 3124369242414189463: lent=false cwnd=130934 srtt_ns=322778 pto_ns=1322778 spurious_losses=0 persistent_collapses=0 consumed=3060 mtu=65496
+  shard 0 refused fleet.live.held: 61
+  shard 0 refused fleet.plane.announce_lends: 4
+  shard 0 refused fleet.plane.announcements_sent: 4
+  shard 0 refused fleet.seal.pair_served: 4
+  shard 0 live held 2b5bfd45b9410b970000000000000057 head=1839 durable=none owed=false epoch=1 identity=d75d77251b7b3316263639f63f8405a08a020c71f21b6d86bc396662086922a0 fence=1 holders=none moving_to=none recorded=none
+--- chaos-rolling-b-36332 (status exit 0; live Some([LiveState { holding: true, head: Some(2296), durable: None, owed: false, epoch: Some(1), identity: Some("5585356be319a8c9dec0167777a0f06a0cfc8da76eaf71cd20fc0c96568df3db"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 1459392986655208072
+  fleet_host_epoch: 1
+  fleet_members: 1459392986655208072 3124369242414189463 5842768423731160719
+  fleet_held_records: 2
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 8
+  fleet_settled_generation: 5
+  fleet_neighbourhood_generation: 5
+  fleet_retirement: host=5842768423731160719 version=5 survivors=[1459392986655208072 3124369242414189463] confirmed=[1459392986655208072] unconfirmed=[]
+  fleet_session 3124369242414189463: lent=false cwnd=130934 srtt_ns=531226 pto_ns=2369958 spurious_losses=0 persistent_collapses=0 consumed=5556 mtu=65496
+  fleet_session 5842768423731160719: lent=false cwnd=11710 srtt_ns=1753559280 pto_ns=6763380968 spurious_losses=0 persistent_collapses=0 consumed=856 mtu=1200
+  shard 0 refused fleet.link.stale_return: 1
+  shard 0 refused fleet.live.held: 2297
+  shard 0 refused fleet.plane.announce_lends: 4
+  shard 0 refused fleet.plane.announcements_sent: 4
+  shard 0 refused fleet.report.sent: 3
+  shard 0 refused fleet.seal.pair_served: 4
+  shard 0 live held 2b5bfd45b9410b970000000000000057 head=2296 durable=none owed=false epoch=1 identity=5585356be319a8c9dec0167777a0f06a0cfc8da76eaf71cd20fc0c96568df3db fence=1 holders=none moving_to=none recorded=none
+--- chaos-rolling-c-36332 (status exit 0; live Some([LiveState { holding: false, head: Some(2298), durable: Some(2296), owed: true, epoch: Some(1), identity: Some("d44878a5ebfeed088085a79111836cef74030676c4e69a6849759d58d6655f8a"), fence: 1, holders: ["1459392986655208072", "5842768423731160719"], moving_to: [], recorded: ["1459392986655208072", "5842768423731160719"] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 3124369242414189463
+  fleet_host_epoch: 1
+  fleet_members: 1459392986655208072 3124369242414189463 5842768423731160719
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 8
+  fleet_settled_generation: 5
+  fleet_neighbourhood_generation: 5
+  fleet_retirement: host=5842768423731160719 version=5 survivors=[1459392986655208072 3124369242414189463] confirmed=[1459392986655208072] unconfirmed=[]
+  fleet_session 5842768423731160719: lent=false cwnd=130934 srtt_ns=210678 pto_ns=1210678 spurious_losses=0 persistent_collapses=0 consumed=1415 mtu=65496
+  shard 0 refused fleet.link.stale_return: 1
+  shard 0 refused fleet.live.appended: 2299
+  shard 0 refused fleet.live.awaited: 2295
+  shard 0 refused fleet.live.durable: 2297
+  shard 0 refused fleet.live.held_back.placement: 1
+  shard 0 refused fleet.live.holders_recorded: 1
+  shard 0 refused fleet.live.install_image: 1
+  shard 0 refused fleet.live.link_lost: 1
+  shard 0 refused fleet.live.no_session: 930
+  shard 0 refused fleet.live.refused: 1
+  shard 0 refused fleet.live.refused.no_credit: 1
+  shard 0 refused fleet.live.resolved: 2294
+  shard 0 refused fleet.live.unanswered: 927
+  shard 0 refused fleet.live.whole: 1
+  shard 0 refused fleet.plane.announce_lends: 5
+  shard 0 refused fleet.plane.announcements_sent: 5
+  shard 0 refused fleet.report.sent: 4
+  shard 0 refused fleet.seal.pair_served: 4
+  shard 0 refused fleet.ship.catalog.placed: 2
+  shard 0 refused fleet.ship.head.no_session: 1
+  shard 0 refused fleet.ship.head.placed: 2
+  shard 0 refused fleet.takeover.stale_configuration: 2
+  shard 0 live shipping 2b5bfd45b9410b970000000000000057 head=2298 durable=2296 owed=true epoch=1 identity=d44878a5ebfeed088085a79111836cef74030676c4e69a6849759d58d6655f8a fence=1 holders=1459392986655208072,5842768423731160719 moving_to=none recorded=1459392986655208072,5842768423731160719
+LD-END
+LD-STUCK write sent at 2279ms, in flight 2126ms (at 4405ms):
+--- chaos-rolling-a-36332 (status exit 0; live Some([LiveState { holding: true, head: Some(1839), durable: None, owed: false, epoch: Some(1), identity: Some("d75d77251b7b3316263639f63f8405a08a020c71f21b6d86bc396662086922a0"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 5842768423731160719
+  fleet_host_epoch: 1
+  fleet_members: 1459392986655208072 3124369242414189463 5842768423731160719
+  fleet_held_records: 2
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 4
+  fleet_settled_generation: 2
+  fleet_neighbourhood_generation: 2
+  fleet_session 1459392986655208072: lent=false cwnd=66670 srtt_ns=592877 pto_ns=2411281 spurious_losses=0 persistent_collapses=0 consumed=883 mtu=33364
+  fleet_session 3124369242414189463: lent=false cwnd=130934 srtt_ns=282495 pto_ns=1282495 spurious_losses=0 persistent_collapses=0 consumed=3124 mtu=65496
+  shard 0 refused fleet.live.held: 61
+  shard 0 refused fleet.plane.announce_lends: 5
+  shard 0 refused fleet.plane.announcements_sent: 5
+  shard 0 refused fleet.seal.pair_served: 4
+  shard 0 live held 2b5bfd45b9410b970000000000000057 head=1839 durable=none owed=false epoch=1 identity=d75d77251b7b3316263639f63f8405a08a020c71f21b6d86bc396662086922a0 fence=1 holders=none moving_to=none recorded=none
+--- chaos-rolling-b-36332 (status exit 0; live Some([LiveState { holding: true, head: Some(2296), durable: None, owed: false, epoch: Some(1), identity: Some("5585356be319a8c9dec0167777a0f06a0cfc8da76eaf71cd20fc0c96568df3db"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 1459392986655208072
+  fleet_host_epoch: 1
+  fleet_members: 1459392986655208072 3124369242414189463 5842768423731160719
+  fleet_held_records: 2
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 8
+  fleet_settled_generation: 5
+  fleet_neighbourhood_generation: 5
+  fleet_retirement: host=5842768423731160719 version=5 survivors=[1459392986655208072 3124369242414189463] confirmed=[1459392986655208072] unconfirmed=[]
+  fleet_session 3124369242414189463: lent=true cwnd=130934 srtt_ns=559269 pto_ns=2711789 spurious_losses=0 persistent_collapses=0 consumed=5546 mtu=65496
+  fleet_session 5842768423731160719: lent=false cwnd=98834 srtt_ns=1342601211 pto_ns=7009932579 spurious_losses=0 persistent_collapses=0 consumed=1316 mtu=49446
+  shard 0 refused fleet.link.stale_return: 1
+  shard 0 refused fleet.live.held: 2297
+  shard 0 refused fleet.plane.announce_lends: 5
+  shard 0 refused fleet.plane.announcements_sent: 5
+  shard 0 refused fleet.report.sent: 3
+  shard 0 refused fleet.seal.pair_served: 4
+  shard 0 live held 2b5bfd45b9410b970000000000000057 head=2296 durable=none owed=false epoch=1 identity=5585356be319a8c9dec0167777a0f06a0cfc8da76eaf71cd20fc0c96568df3db fence=1 holders=none moving_to=none recorded=none
+--- chaos-rolling-c-36332 (status exit 0; live Some([LiveState { holding: false, head: Some(2299), durable: Some(2296), owed: false, epoch: Some(1), identity: Some("71a691255204d047a9a10d4174b63ca0ff1dd9761ae0900507dfb27609527650"), fence: 1, holders: ["1459392986655208072", "5842768423731160719"], moving_to: [], recorded: ["1459392986655208072", "5842768423731160719"] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 3124369242414189463
+  fleet_host_epoch: 1
+  fleet_members: 1459392986655208072 3124369242414189463 5842768423731160719
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 8
+  fleet_settled_generation: 5
+  fleet_neighbourhood_generation: 5
+  fleet_retirement: host=5842768423731160719 version=5 survivors=[1459392986655208072 3124369242414189463] confirmed=[1459392986655208072] unconfirmed=[]
+  fleet_session 5842768423731160719: lent=true cwnd=130934 srtt_ns=223697 pto_ns=1223697 spurious_losses=0 persistent_collapses=0 consumed=1395 mtu=65496
+  shard 0 refused fleet.link.stale_return: 1
+  shard 0 refused fleet.live.appended: 2300
+  shard 0 refused fleet.live.awaited: 2295
+  shard 0 refused fleet.live.durable: 2297
+  shard 0 refused fleet.live.held_back.placement: 1
+  shard 0 refused fleet.live.held_back.whole: 1
+  shard 0 refused fleet.live.holders_recorded: 1
+  shard 0 refused fleet.live.install_image: 1
+  shard 0 refused fleet.live.link_lost: 1
+  shard 0 refused fleet.live.no_session: 931
+  shard 0 refused fleet.live.refused: 1
+  shard 0 refused fleet.live.refused.no_credit: 1
+  shard 0 refused fleet.live.resolved: 2294
+  shard 0 refused fleet.live.unanswered: 928
+  shard 0 refused fleet.live.whole: 2
+  shard 0 refused fleet.plane.announce_lends: 5
+  shard 0 refused fleet.plane.announcements_sent: 5
+  shard 0 refused fleet.report.sent: 4
+  shard 0 refused fleet.seal.pair_served: 4
+  shard 0 refused fleet.ship.catalog.placed: 2
+  shard 0 refused fleet.ship.head.no_session: 1
+  shard 0 refused fleet.ship.head.placed: 2
+  shard 0 refused fleet.takeover.stale_configuration: 2
+  shard 0 live shipping 2b5bfd45b9410b970000000000000057 head=2299 durable=2296 owed=false epoch=1 identity=71a691255204d047a9a10d4174b63ca0ff1dd9761ae0900507dfb27609527650 fence=1 holders=1459392986655208072,5842768423731160719 moving_to=none recorded=1459392986655208072,5842768423731160719
+LD-END
+LD-SERVE at 5582637214 install from 3124369242414189463 bytes 10083968 took_ns 4790453 gap_ns Some(1352421997)
+LD-SERVE at 5558891953 entry from 3124369242414189463 bytes 3020543 took_ns 3399166 gap_ns Some(15593810)
+LD-SERVE at 5591360323 entry from 3124369242414189463 bytes 10083959 took_ns 24196454 gap_ns Some(29069204)
+chaos slow write chaos-2294 sent 2.279191266s took 2.217598231s refused None: 258 samples
+      1.788s chaos-rolling-b-36332 held head=Some(2112) durable=None owed=false epoch=Some(1) fence=1
+      1.792s chaos-rolling-c-36332 shipping head=Some(2114) durable=Some(2113) owed=false epoch=Some(1) fence=1
+      1.814s chaos-rolling-c-36332 shipping head=Some(2126) durable=Some(2125) owed=false epoch=Some(1) fence=1
+      1.815s chaos-rolling-b-36332 held head=Some(2125) durable=None owed=false epoch=Some(1) fence=1
+      1.838s chaos-rolling-c-36332 shipping head=Some(2136) durable=Some(2135) owed=false epoch=Some(1) fence=1
+      1.843s chaos-rolling-b-36332 held head=Some(2138) durable=None owed=false epoch=Some(1) fence=1
+      1.862s chaos-rolling-c-36332 shipping head=Some(2148) durable=Some(2147) owed=false epoch=Some(1) fence=1
+      1.869s chaos-rolling-b-36332 held head=Some(2151) durable=None owed=false epoch=Some(1) fence=1
+      1.885s chaos-rolling-c-36332 shipping head=Some(2159) durable=Some(2158) owed=false epoch=Some(1) fence=1
+      1.897s chaos-rolling-b-36332 held head=Some(2164) durable=None owed=false epoch=Some(1) fence=1
+      1.909s chaos-rolling-c-36332 shipping head=Some(2170) durable=Some(2169) owed=false epoch=Some(1) fence=1
+      1.923s chaos-rolling-b-36332 held head=Some(2176) durable=None owed=false epoch=Some(1) fence=1
+      1.933s chaos-rolling-c-36332 shipping head=Some(2180) durable=Some(2179) owed=false epoch=Some(1) fence=1
+      1.951s chaos-rolling-b-36332 held head=Some(2188) durable=None owed=false epoch=Some(1) fence=1
+      1.956s chaos-rolling-c-36332 shipping head=Some(2191) durable=Some(2190) owed=false epoch=Some(1) fence=1
+      1.977s chaos-rolling-b-36332 held head=Some(2201) durable=None owed=false epoch=Some(1) fence=1
+      1.981s chaos-rolling-c-36332 shipping head=Some(2203) durable=Some(2202) owed=false epoch=Some(1) fence=1
+      2.005s chaos-rolling-b-36332 held head=Some(2213) durable=None owed=false epoch=Some(1) fence=1
+      2.006s chaos-rolling-c-36332 shipping head=Some(2215) durable=Some(2214) owed=false epoch=Some(1) fence=1
+      2.031s chaos-rolling-b-36332 held head=Some(2226) durable=None owed=false epoch=Some(1) fence=1
+      2.032s chaos-rolling-c-36332 shipping head=Some(2227) durable=Some(2226) owed=false epoch=Some(1) fence=1
+      2.057s chaos-rolling-b-36332 held head=Some(2227) durable=None owed=false epoch=Some(1) fence=1
+      2.061s chaos-rolling-c-36332 shipping head=Some(2229) durable=Some(2227) owed=false epoch=Some(1) fence=1
+      2.084s chaos-rolling-b-36332 held head=Some(2228) durable=None owed=false epoch=Some(1) fence=1
+      2.099s chaos-rolling-c-36332 shipping head=Some(2230) durable=Some(2228) owed=false epoch=Some(1) fence=1
+      2.106s chaos-rolling-b-36332 held head=Some(2229) durable=None owed=false epoch=Some(1) fence=1
+      2.122s chaos-rolling-c-36332 shipping head=Some(2232) durable=Some(2231) owed=false epoch=Some(1) fence=1
+      2.133s chaos-rolling-b-36332 held head=Some(2237) durable=None owed=false epoch=Some(1) fence=1
+      2.146s chaos-rolling-c-36332 shipping head=Some(2243) durable=Some(2242) owed=false epoch=Some(1) fence=1
+      2.159s chaos-rolling-b-36332 held head=Some(2249) durable=None owed=false epoch=Some(1) fence=1
+      2.170s chaos-rolling-c-36332 shipping head=Some(2255) durable=Some(2254) owed=false epoch=Some(1) fence=1
+      2.185s chaos-rolling-b-36332 held head=Some(2260) durable=None owed=false epoch=Some(1) fence=1
+      2.194s chaos-rolling-c-36332 shipping head=Some(2265) durable=Some(2264) owed=false epoch=Some(1) fence=1
+      2.201s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.214s chaos-rolling-b-36332 held head=Some(2271) durable=None owed=false epoch=Some(1) fence=1
+      2.222s chaos-rolling-c-36332 shipping head=Some(2275) durable=Some(2275) owed=false epoch=Some(1) fence=1
+      2.226s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.242s chaos-rolling-b-36332 held head=Some(2282) durable=None owed=false epoch=Some(1) fence=1
+      2.247s chaos-rolling-c-36332 shipping head=Some(2283) durable=Some(2283) owed=false epoch=Some(1) fence=1
+      2.252s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.270s chaos-rolling-b-36332 held head=Some(2294) durable=None owed=false epoch=Some(1) fence=1
+      2.272s chaos-rolling-c-36332 shipping head=Some(2295) durable=Some(2294) owed=false epoch=Some(1) fence=1
+      2.276s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.294s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.296s chaos-rolling-b-36332 held head=Some(2296) durable=None owed=false epoch=Some(1) fence=1
+      2.302s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.316s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.324s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.339s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.346s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.361s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.368s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.383s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.391s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.406s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.413s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.428s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.435s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.450s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.457s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.473s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.480s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.495s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.502s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.517s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.524s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.540s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.546s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.562s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.569s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.584s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.591s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.607s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.613s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.629s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.635s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.651s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.657s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.673s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.679s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.695s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.701s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.718s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.723s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.740s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.745s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.762s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.768s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.784s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.790s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.806s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.812s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.829s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.834s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.851s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.856s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.873s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.878s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.895s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.900s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.918s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.923s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.940s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.945s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.962s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.967s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      2.985s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      2.989s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      3.007s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.011s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      3.030s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.033s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      3.052s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.056s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      3.074s chaos-rolling-c-36332 shipping head=Some(2297) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.078s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      3.097s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.100s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      3.122s chaos-rolling-a-36332 held head=Some(59) durable=None owed=false epoch=Some(1) fence=1
+      3.135s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.145s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.157s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.167s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.179s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.190s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.201s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.212s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.224s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.234s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.246s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.257s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.268s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.279s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.291s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.301s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.313s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.324s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.335s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.346s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.357s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.368s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.379s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.390s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.402s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.412s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.424s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.443s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.446s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.466s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.468s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.488s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.491s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.510s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.513s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.533s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.536s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.555s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.558s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.577s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.580s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.599s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.602s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.622s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.624s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.644s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.647s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.666s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.669s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.688s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.691s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.711s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.713s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.733s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.735s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.755s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.757s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.777s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.781s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.799s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.803s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.821s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.825s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.844s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.847s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.866s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.869s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.888s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.891s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.912s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.913s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.934s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.939s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.957s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.961s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      3.979s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      3.983s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      4.001s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      4.006s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      4.024s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      4.028s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      4.046s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      4.050s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      4.068s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      4.072s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      4.091s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      4.094s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      4.113s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      4.117s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=true epoch=Some(1) fence=1
+      4.135s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      4.139s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=true epoch=Some(1) fence=1
+      4.158s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      4.161s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=true epoch=Some(1) fence=1
+      4.180s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      4.183s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=true epoch=Some(1) fence=1
+      4.202s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      4.206s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=true epoch=Some(1) fence=1
+      4.225s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      4.228s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=true epoch=Some(1) fence=1
+      4.247s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      4.250s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=true epoch=Some(1) fence=1
+      4.269s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      4.272s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=true epoch=Some(1) fence=1
+      4.291s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      4.294s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=true epoch=Some(1) fence=1
+      4.307s chaos-rolling-b-36332 held head=Some(2296) durable=None owed=false epoch=Some(1) fence=1
+      4.323s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      4.325s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=true epoch=Some(1) fence=1
+      4.329s chaos-rolling-b-36332 held head=Some(2296) durable=None owed=false epoch=Some(1) fence=1
+      4.345s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      4.348s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=true epoch=Some(1) fence=1
+      4.351s chaos-rolling-b-36332 held head=Some(2296) durable=None owed=false epoch=Some(1) fence=1
+      4.367s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      4.370s chaos-rolling-c-36332 shipping head=Some(2298) durable=Some(2296) owed=true epoch=Some(1) fence=1
+      4.373s chaos-rolling-b-36332 held head=Some(2296) durable=None owed=false epoch=Some(1) fence=1
+      4.389s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      4.392s chaos-rolling-c-36332 shipping head=Some(2299) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      4.395s chaos-rolling-b-36332 held head=Some(2296) durable=None owed=false epoch=Some(1) fence=1
+      4.411s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      4.419s chaos-rolling-b-36332 held head=Some(2296) durable=None owed=false epoch=Some(1) fence=1
+      4.435s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      4.441s chaos-rolling-b-36332 held head=Some(2296) durable=None owed=false epoch=Some(1) fence=1
+      4.460s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      4.464s chaos-rolling-b-36332 held head=Some(2296) durable=None owed=false epoch=Some(1) fence=1
+      4.479s chaos-rolling-c-36332 shipping head=Some(2299) durable=Some(2296) owed=false epoch=Some(1) fence=1
+      4.484s chaos-rolling-a-36332 held head=Some(1839) durable=None owed=false epoch=Some(1) fence=1
+      4.490s chaos-rolling-b-36332 held head=Some(2296) durable=None owed=false epoch=Some(1) fence=1
+      4.503s chaos-rolling-c-36332 shipping head=Some(2303) durable=Some(2302) owed=false epoch=Some(1) fence=1
+      4.510s chaos-rolling-a-36332 held head=Some(2305) durable=None owed=false epoch=Some(1) fence=1
+      4.514s chaos-rolling-b-36332 held head=Some(2298) durable=None owed=false epoch=Some(1) fence=1
+      4.529s chaos-rolling-c-36332 shipping head=Some(2316) durable=Some(2316) owed=false epoch=Some(1) fence=1
+      4.533s chaos-rolling-a-36332 held head=Some(2317) durable=None owed=false epoch=Some(1) fence=1
+      4.544s chaos-rolling-b-36332 held head=Some(2298) durable=None owed=false epoch=Some(1) fence=1
+      4.554s chaos-rolling-c-36332 shipping head=Some(2335) durable=Some(2335) owed=false epoch=Some(1) fence=1
+      4.556s chaos-rolling-a-36332 held head=Some(2336) durable=None owed=false epoch=Some(1) fence=1
+      4.578s chaos-rolling-c-36332 shipping head=Some(2350) durable=Some(2349) owed=false epoch=Some(1) fence=1
+      4.585s chaos-rolling-a-36332 held head=Some(2350) durable=None owed=false epoch=Some(1) fence=1
+      4.595s chaos-rolling-b-36332 held head=Some(2350) durable=None owed=false epoch=Some(1) fence=1
+      4.601s chaos-rolling-c-36332 shipping head=Some(2350) durable=Some(2350) owed=false epoch=Some(1) fence=1
+chaos candidates partitioned in turn mid-stream: 2346 writes, 2346 acknowledged: p50 493 us, p99 4766 us, p999 62124 us, max 2217598 us; 3 over 50ms (sent+took): 0.00s+131ms 2.05s+62ms 2.28s+2218ms
+chaos candidates partitioned in turn mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(2350), durable: Some(2350), owed: false, epoch: Some(1), identity: Some("c262960c1edbae8433ec5467a0762d916a3eafc2ac66351dfb829d611e0e9e15"), fence: 1, holders: ["1459392986655208072", "5842768423731160719"], moving_to: [], recorded: ["1459392986655208072", "5842768423731160719"] }); candidates [Some(LiveState { holding: true, head: Some(2350), durable: None, owed: false, epoch: Some(1), identity: Some("c262960c1edbae8433ec5467a0762d916a3eafc2ac66351dfb829d611e0e9e15"), fence: 1, holders: [], moving_to: [], recorded: [] }), Some(LiveState { holding: true, head: Some(2350), durable: None, owed: false, epoch: Some(1), identity: Some("c262960c1edbae8433ec5467a0762d916a3eafc2ac66351dfb829d611e0e9e15"), fence: 1, holders: [], moving_to: [], recorded: [] })]
+chaos candidates partitioned in turn mid-stream: 403 samples, 177 heads seen
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-36332 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-36332 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-36332 refused the owner: {}
+chaos candidates partitioned in turn mid-stream:
+  chaos-rolling-a-36332 partitioned from 175.580884ms to 2.175852339s
+  chaos-rolling-b-36332 partitioned from 2.282624799s to 4.282737149s
+  every write acknowledged: held
+  2346 writes, 2346 acknowledged: p50 493 us, p99 4766 us, p999 62124 us, max 2217598 us; 3 over 50ms (sent+took): 0.00s+131ms 2.05s+62ms 2.28s+2218ms
+  converged: true: owner Some(LiveState { holding: false, head: Some(2350), durable: Some(2350), owed: false, epoch: Some(1), identity: Some("c262960c1edbae8433ec5467a0762d916a3eafc2ac66351dfb829d611e0e9e15"), fence: 1, holders: ["1459392986655208072", "5842768423731160719"], moving_to: [], recorded: ["1459392986655208072", "5842768423731160719"] }); candidates [Some(LiveState { holding: true, head: Some(2350), durable: None, owed: false, epoch: Some(1), identity: Some("c262960c1edbae8433ec5467a0762d916a3eafc2ac66351dfb829d611e0e9e15"), fence: 1, holders: [], moving_to: [], recorded: [] }), Some(LiveState { holding: true, head: Some(2350), durable: None, owed: false, epoch: Some(1), identity: Some("c262960c1edbae8433ec5467a0762d916a3eafc2ac66351dfb829d611e0e9e15"), fence: 1, holders: [], moving_to: [], recorded: [] })]
+  Convergence: held
+  403 samples, 177 heads seen
+  Agreement: held
+  NoLoss: held
+  chaos-rolling-c-36332 refused the owner: {}
+  chaos-rolling-a-36332 refused the owner: {}
+  chaos-rolling-b-36332 refused the owner: {}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 5.91s
+
