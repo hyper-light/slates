@@ -68,6 +68,8 @@ const LIVE_WHOLE: &str = "fleet.live.whole";
 /// Counter: install images made from a publication's state (or a clean volume's, on the record period) for a holder
 /// behind the retained tail, beside the log rather than on it ([`refresh_image`]).
 const LIVE_IMAGE: &str = "fleet.live.install_image";
+/// Counter: an install built to send a holder, the volume's whole state copied on the owner's shard.
+const LIVE_INSTALL_BUILT: &str = "fleet.live.install_built";
 /// Counter: entries appended to a live volume's log on this owner shard.
 const LIVE_APPENDED: &str = "fleet.live.appended";
 /// Counter: entries a holder refused to keep (over its bound, unauthorized, malformed).
@@ -1510,6 +1512,7 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
     .collect();
   let mut sends = Vec::new();
   let mut stale_checkpoint = false;
+  let mut installs_built = 0;
   let targets: Vec<HostId> = live.shipper.targets().collect();
   for holder in &targets {
     // A holder that has not acknowledged the volume's catalog refuses the log (its bound is the catalog's size,
@@ -1542,6 +1545,7 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
           stale_checkpoint = true;
           continue;
         }
+        installs_built += 1;
         let install = Install {
           owner: live.shipper.owner(),
           object,
@@ -1561,6 +1565,9 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
   }
   if stale_checkpoint {
     live.owes_image = true;
+  }
+  if installs_built > 0 {
+    state.count(LIVE_INSTALL_BUILT, installs_built);
   }
   sends
 }
@@ -2180,6 +2187,8 @@ pub(crate) fn serve_install(
   peer: HostId,
   request: &[u8],
 ) -> Vec<u8> {
+  // Diag only (live-durability-53, never on main).
+  let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("LD-SERVE wall_ns {} install bytes {}\n", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos()), request.len()).as_bytes());
   let object = slates_db::live::object_of_state(request);
   let bound = match admitted(state, local, peer, object) {
     Ok(bound) => bound,
