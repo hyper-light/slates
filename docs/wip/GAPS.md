@@ -8948,6 +8948,18 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
     `making_room_the_pool_cannot_cover_claims_nothing`, `room_another_arena_took_first_returns_what_was_claimed`.
   - Bug doc: `docs/bugs/2026-10-09-a-refused-admission-claimed-the-whole-pool.md`.
 
+### 2026-11-08: a learner lost the only voters it knew and stopped learning configurations (fixed)
+
+- **Found** by raft-chaos's five-node flow (diag-raft-chaos-mesh-52, runs 2 and 7 of 8): after the bootstrap voter was
+  replaced, both non-voters stayed at configuration version 8 for a 40 s fleet wait while the voters reached 11 and 12.
+- **Cause:** a learner fetched only from its join state's voters, which a fetched configuration does not update. With no
+  session to any of them it asked no one and counted nothing.
+- **Fixed:** a regional learner asks every member of its region it holds a session to; `fleet.learner.no_session` counts
+  a period with nobody to ask. Test `a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone`: without the
+  fix 8 of 8 failed on macOS and Linux (CI diag-live-fixes-45), with it 24 of 24 passed (diag-live-fixes-46). Bug doc:
+  `docs/bugs/2026-11-08-a-learner-lost-the-only-voters-it-knew.md`.
+- **Open sibling:** `drive_root_learner_fetch` filters on the root's voters the same way, and has no test yet.
+
 ### 2026-10-09: every shard sampled memory pressure and sent its hold to every shard (fixed)
 
 - Every shard runs a reap loop, and each one ran `refresh_pressure_hold`: N samplers, each sending N holds a second,
