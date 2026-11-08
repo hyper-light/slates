@@ -143,7 +143,7 @@ pub mod xshard;
 
 pub use config::{BootFault, BootFaultKind, DaemonConfig, DurabilityBound, FleetMembership};
 pub use daemon::{
-  Daemon, DrainReport, HeldRecordView, LeadershipHandoff, SegmentSource, SessionHold,
+  Daemon, DrainReport, HeldRecordView, LeadershipHandoff, LinkAfter, SegmentSource, SessionHold,
 };
 pub use deploy::{DeployError, FleetManifest, FleetNodeEntry, FleetPlan, NodeAddress};
 pub use dns::Resolver;

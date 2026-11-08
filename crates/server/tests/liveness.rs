@@ -59,14 +59,28 @@ fn beat(daemon: &Daemon) -> u64 {
   daemon.segment().supervision().unwrap().heartbeat_ns()
 }
 
-/// Waits until the daemon has beaten twice, so a test starts from a beating daemon.
-fn beating(daemon: &Daemon) {
+/// Waits until the daemon serves and has beaten twice, so a test starts from a booted, beating daemon; the returned
+/// connection is held for the test, so no client's reap runs inside it. The beat starts before the boot's client-id
+/// recovery asks every shard (`control_loop`), and a connection is accepted only after it, so a beat alone let a test's
+/// block land inside the boot, which then refused the boot (`liveness-repro.log` on adacachy, 2026-11-07).
+fn beating(daemon: &Daemon) -> slates_ipc::Connected {
   let started = Instant::now();
+  let serving = loop {
+    match slates_ipc::connect(daemon.instance()) {
+      Ok(connected) => break connected,
+      Err(slates_ipc::IpcError::DaemonUnavailable { .. }) => {
+        assert!(started.elapsed() < WINDOW * 10, "the daemon began serving");
+        wait(SAMPLE);
+      }
+      Err(refused) => panic!("the daemon refused a client: {refused}"),
+    }
+  };
   let first = beat(daemon);
   while beat(daemon) == first || beat(daemon) == 0 {
     assert!(started.elapsed() < WINDOW * 10, "the daemon began beating");
     wait(SAMPLE);
   }
+  serving
 }
 
 /// Waits `span` on the test thread (a channel nobody sends on, as the lint wall wants).
@@ -129,7 +143,7 @@ fn spin_for(burst: Duration) {
 #[test]
 fn a_starved_poll_on_the_control_shard_does_not_stop_the_beat() {
   let (daemon, control, _) = daemon("starved");
-  beating(&daemon);
+  let _serving = beating(&daemon);
   let span = WINDOW + WINDOW / 2;
   let worker = on_shard(&daemon, control, move || {
     let started = Instant::now();
@@ -159,7 +173,7 @@ fn a_starved_poll_on_the_control_shard_does_not_stop_the_beat() {
 #[test]
 fn a_wedged_shard_stops_the_beat() {
   let (daemon, _, other) = daemon("wedged");
-  beating(&daemon);
+  let _serving = beating(&daemon);
   let held = WINDOW * 3;
   let base = Instant::now();
   let began_us = &*Box::leak(Box::new(AtomicU64::new(0)));
@@ -171,11 +185,21 @@ fn a_wedged_shard_stops_the_beat() {
     let (_hold, rx) = std::sync::mpsc::channel::<()>();
     let _ = rx.recv_timeout(held);
   });
-  // Each beat's arrival, by the test's clock since `base`, until a whole window passes without one.
+  // Each beat's arrival, by the test's clock since `base`, until a whole window passes without one. The watch lasts
+  // until the block ends, timed from the block's own start: under load the observation reached the shard 1.05 s and
+  // 1.39 s after `base`, and a watch of `held` from `base` ended before the window-long gap could be seen, though the
+  // beat had stopped 0.97 s and 1.00 s after the block began (2 of 10 runs at load 126–147 on adacachy, 2026-11-07).
+  // A block that never began ends the watch once its observation has answered.
   let mut last = beat(&daemon);
   let mut last_seen = base.elapsed();
   let mut stopped_at = None;
-  while base.elapsed() < held {
+  loop {
+    let answered = worker.is_finished();
+    let began = began_us.load(Ordering::Acquire);
+    let block_over = began > 0 && base.elapsed() >= Duration::from_micros(began) + held;
+    if block_over || (began == 0 && answered) {
+      break;
+    }
     wait(SAMPLE);
     let now = beat(&daemon);
     if now != last {
@@ -213,7 +237,7 @@ fn a_wedged_shard_stops_the_beat() {
 #[test]
 fn a_spinning_shard_stops_the_beat() {
   let (daemon, _, other) = daemon("spinning");
-  beating(&daemon);
+  let _serving = beating(&daemon);
   let bound = WINDOW * 10;
   let running = &*Box::leak(Box::new(AtomicBool::new(true)));
   let worker = on_shard(&daemon, other, move || {
@@ -252,7 +276,7 @@ fn a_spinning_shard_stops_the_beat() {
 #[test]
 fn a_slow_blocking_call_shorter_than_a_window_does_not_stop_the_beat() {
   let (daemon, control, _) = daemon("slow");
-  beating(&daemon);
+  let _serving = beating(&daemon);
   let worker = on_shard(&daemon, control, move || {
     let (_hold, rx) = std::sync::mpsc::channel::<()>();
     let _ = rx.recv_timeout(WINDOW / 2);
@@ -272,7 +296,7 @@ fn a_slow_blocking_call_shorter_than_a_window_does_not_stop_the_beat() {
 #[test]
 fn a_daemon_beside_two_spinners_a_core_keeps_beating() {
   let (daemon, _, _) = daemon("busy");
-  beating(&daemon);
+  let _serving = beating(&daemon);
   let cpus = std::thread::available_parallelism().map_or(1, usize::from);
   let stop = &*Box::leak(Box::new(AtomicBool::new(false)));
   let spinners: Vec<_> = (0..cpus * 2)

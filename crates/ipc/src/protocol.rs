@@ -58,18 +58,23 @@ pub struct Filter {
   pub exclude: Vec<String>,
 }
 
-/// A principal on the wire (§4.13), as a `share` names one: the host account, or an enrolled consumer
-/// under one. The daemon maps it to the catalog's principal (`verbs::to_db_principal`); a certificate
-/// or SID principal is never named by a client, so neither is on the wire.
+/// A principal on the wire (§4.13), as a `share` names one: a host's account, or an enrolled consumer under one. A host
+/// account means something only on its host (A-237), so each names its host by that host's certificate anchor, as
+/// `slates status` shows it (`DaemonReport::anchor`). The daemon maps it to the catalog's principal
+/// (`verbs::to_db_principal`); a certificate or SID principal is never named by a client, so neither is on the wire.
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub enum Principal {
-  /// A Unix user.
+  /// A Unix user of a host.
   Uid {
+    /// The host whose user it is: its certificate anchor.
+    host: u64,
     /// The uid.
     uid: u32,
   },
-  /// An enrolled consumer under a host account.
+  /// An enrolled consumer under a host's account.
   Consumer {
+    /// The host whose account the consumer was enrolled under: its certificate anchor.
+    host: u64,
     /// The account.
     account: u32,
     /// The consumer id.
@@ -288,10 +293,13 @@ pub enum RequestBody {
   },
   /// List the caller's volumes.
   List,
-  /// Acknowledge completions up to a sequence (releases their records).
+  /// Acknowledge completions up to a sequence except the ids still owed (releases the others' records, §4.9).
   Acknowledge {
-    /// Every sequence up to and including this one.
+    /// Every sequence up to and including this one, except `owed`.
     up_to: u32,
+    /// The ids at or below `up_to` the client still owes (awaited, or held for a resend under the same id), whose
+    /// records stay: at most the ring's slots and the client's hold.
+    owed: Vec<u32>,
   },
   /// The base entry as the disk holds it now (§4.4 `read_base`).
   ReadBase {
@@ -1251,6 +1259,30 @@ pub struct ShardReport {
   /// Live shipping on this shard (A-200): each live volume it ships, and on the control shard each it holds as a
   /// candidate. Appended.
   pub live: Vec<LiveReport>,
+  /// This shard's partition snapshots against the log they absorb, and the cadence they follow (A-243). Appended.
+  pub snapshots: DbSnapshotReport,
+}
+
+/// A partition's snapshots and their cadence, as `slates status` shows them (A-243).
+#[derive(Wire, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DbSnapshotReport {
+  /// Snapshots taken since the daemon recovered.
+  pub snapshots: u64,
+  /// The bytes they wrote.
+  pub bytes_written: u64,
+  /// The longest one took, encode and publish, nanoseconds (it runs on this shard's turn).
+  pub longest_ns: u64,
+  /// The log bytes appended since the daemon recovered.
+  pub log_bytes_appended: u64,
+  /// The log since the last snapshot, bytes.
+  pub tail_bytes: u64,
+  /// The replay work its commits measured (each record's append and apply), nanoseconds: the next snapshot comes once
+  /// it reaches `budget_ns` and `tail_bytes` reaches `floor_bytes`.
+  pub tail_replay_ns: u64,
+  /// The recovery budget the tail's work is held to, nanoseconds.
+  pub budget_ns: u64,
+  /// The last snapshot's size, bytes: the doubling rule's floor for the tail.
+  pub floor_bytes: u64,
 }
 
 /// One live-shipped volume's log as a shard sees it (A-200): as its owner (`holding` false: the head it appended and
@@ -1670,6 +1702,9 @@ pub struct DaemonReport {
   /// included. An administrator's setting the daemon cannot override (R10); it reports it and serves. Always `false` on
   /// Unix, where the process is excluded from core dumps whole. Appended.
   pub dumps_local_full: bool,
+  /// This node's certificate anchor (A-237): the host a principal of this node names, as a share to one of its
+  /// accounts must name it. Stable across the node's restarts. Appended.
+  pub anchor: u64,
 }
 
 /// The node's sealing at rest (A-92): how its root came (`unavailable`, `minted`, `minted-daemon-only` or
@@ -3011,6 +3046,15 @@ pub enum Refusal {
   NotRecovered {
     /// Why recovery could not rebuild it.
     cause: RecoveryCause,
+  },
+  /// A request forwarded from another host for a volume nothing has shared with that host's account (A-237: a uid
+  /// means something only on its host). `principal` is the account as the owner judged it, its host included: the
+  /// share that would let it through names exactly this (`slates share ID uid:N@ANCHOR`).
+  NotShared {
+    /// The verb.
+    verb: String,
+    /// The requester, by its host's certificate anchor and its account.
+    principal: Principal,
   },
 }
 

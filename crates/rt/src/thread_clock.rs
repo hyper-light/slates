@@ -29,6 +29,16 @@ pub struct CpuReading {
   pub progress: u64,
 }
 
+/// A thread's scheduler state at one instant, which its CPU clock cannot tell: a thread whose clock barely moved over a
+/// window either waited for a CPU (starved) or waited on something else (blocked in a call).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunState {
+  /// On a CPU, or ready to run and waiting for one.
+  Runnable,
+  /// Off the CPU and not ready: waiting in a call, or stopped.
+  Blocked,
+}
+
 impl CpuReading {
   /// A reading whose progress is its time (Unix).
   #[cfg(all(unix, not(miri)))]
@@ -97,6 +107,25 @@ pub(crate) fn read(handle: u64) -> Option<CpuReading> {
   if handle & TAG == 0 {
     return None;
   }
+  let info = basic_info(handle)?;
+  let micros = |time: libc::time_value_t| {
+    u64::try_from(time.seconds)
+      .ok()?
+      .checked_mul(MICROS_PER_SECOND)?
+      .checked_add(u64::try_from(time.microseconds).ok()?)
+  };
+  micros(info.user_time)?
+    .checked_add(micros(info.system_time)?)?
+    .checked_mul(NS_PER_MICRO)
+    .map(CpuReading::of_time)
+}
+
+/// The Mach basic information of the thread `handle` names: its user and system time and its run state.
+#[cfg(all(target_os = "macos", not(miri)))]
+fn basic_info(handle: u64) -> Option<libc::thread_basic_info> {
+  if handle & TAG == 0 {
+    return None;
+  }
   let port = libc::mach_port_t::try_from(handle & !TAG).ok()?;
   // SAFETY: an all-zero `thread_basic_info` is a valid value of the C struct (integers and `time_value_t`s).
   let mut info: libc::thread_basic_info = unsafe { std::mem::zeroed() };
@@ -111,19 +140,26 @@ pub(crate) fn read(handle: u64) -> Option<CpuReading> {
       &mut count,
     )
   };
-  if status != libc::KERN_SUCCESS {
-    return None;
-  }
-  let micros = |time: libc::time_value_t| {
-    u64::try_from(time.seconds)
-      .ok()?
-      .checked_mul(MICROS_PER_SECOND)?
-      .checked_add(u64::try_from(time.microseconds).ok()?)
-  };
-  micros(info.user_time)?
-    .checked_add(micros(info.system_time)?)?
-    .checked_mul(NS_PER_MICRO)
-    .map(CpuReading::of_time)
+  (status == libc::KERN_SUCCESS).then_some(info)
+}
+
+/// Where the thread `handle` names is at this instant: `TH_STATE_RUNNING` is on a CPU or waiting in the run queue for
+/// one [B: XNU `osfmk/mach/thread_info.h`]; every other state (waiting, uninterruptible, stopped, halted) is off it.
+#[cfg(all(target_os = "macos", not(miri)))]
+pub(crate) fn run_state(handle: u64) -> Option<RunState> {
+  let info = basic_info(handle)?;
+  Some(if info.run_state == libc::TH_STATE_RUNNING {
+    RunState::Runnable
+  } else {
+    RunState::Blocked
+  })
+}
+
+/// No run state read here: Linux and Windows name a thread's clock, not the thread (`/proc`'s task state and
+/// `schedstat` would need its id), and Miri has no threads to read.
+#[cfg(any(not(target_os = "macos"), miri))]
+pub(crate) fn run_state(_handle: u64) -> Option<RunState> {
+  None
 }
 
 /// The calling thread's CPU-clock handle: its thread id, tagged.
@@ -217,6 +253,74 @@ fn nanos(seconds: u64, nanos: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+  /// §4.14. Do: on macOS, read the run state of a thread that spins and of one that waits on a channel, from this
+  /// thread. Expect: the spinner `Runnable`, the waiter `Blocked`; no state on platforms that read none.
+  #[test]
+  fn a_threads_run_state_tells_a_spinning_thread_from_a_waiting_one() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    let spin = AtomicBool::new(true);
+    let (handles, handed) = mpsc::channel();
+    let (release, waited) = mpsc::channel::<()>();
+    std::thread::scope(|scope| {
+      let spinner = handles.clone();
+      let spin = &spin;
+      scope.spawn(move || {
+        let _ = spinner.send(super::current());
+        while spin.load(Ordering::Relaxed) {
+          std::hint::spin_loop();
+        }
+      });
+      scope.spawn(move || {
+        let _ = handles.send(super::current());
+        let _ = waited.recv();
+      });
+      let first = handed.recv().ok().flatten();
+      let second = handed.recv().ok().flatten();
+      // Which thread sent first is a race; read both until each has settled into its state.
+      let settled = std::time::Instant::now();
+      let mut seen = (None, None);
+      while settled.elapsed() < std::time::Duration::from_secs(2) {
+        seen = (
+          first.and_then(super::run_state),
+          second.and_then(super::run_state),
+        );
+        if matches!(
+          seen,
+          (
+            Some(super::RunState::Runnable),
+            Some(super::RunState::Blocked)
+          ) | (
+            Some(super::RunState::Blocked),
+            Some(super::RunState::Runnable)
+          )
+        ) {
+          break;
+        }
+        std::thread::yield_now();
+      }
+      spin.store(false, Ordering::Relaxed);
+      let _ = release.send(());
+      if cfg!(all(target_os = "macos", not(miri))) {
+        assert!(
+          matches!(
+            seen,
+            (
+              Some(super::RunState::Runnable),
+              Some(super::RunState::Blocked)
+            ) | (
+              Some(super::RunState::Blocked),
+              Some(super::RunState::Runnable)
+            )
+          ),
+          "{seen:?}"
+        );
+      } else {
+        assert_eq!(seen, (None, None));
+      }
+    });
+  }
+
   /// §4.14. Do: take the calling thread's clock handle, spin a while, and read it from another thread. Expect: a
   /// reading on every platform with a clock (Linux, macOS, Windows), whose progress grew with the spin and whose time
   /// did not go back.

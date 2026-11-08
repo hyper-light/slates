@@ -57,7 +57,7 @@ pub mod shard;
 pub mod sim;
 pub mod task;
 mod thread_clock;
-pub use thread_clock::CpuReading;
+pub use thread_clock::{CpuReading, RunState};
 // Async TCP on every platform, through the socket seam (`netsys`): the NFS servers, the MCP HTTP edge and the
 // network export ride it (`docs/wip/platforms.md`, gap 1).
 pub mod tcp;
@@ -77,7 +77,7 @@ pub mod kqueue;
 pub use driver::{Driver, DriverKind};
 pub use error::RtError;
 pub use registry::SlotHolder;
-pub use runtime::{Runtime, RuntimeConfig, WakeTracking};
+pub use runtime::{Runtime, RuntimeConfig, ShardCapacity, WakeTracking};
 pub use shard::{ShardId, TaskId};
 pub use sim::SimRuntime;
 pub use task::Outcome;

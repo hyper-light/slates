@@ -38,7 +38,8 @@
 use std::collections::BTreeMap;
 
 use slates_db::catalog::{
-  AttachForm, AttachmentRecord, Principal, Role, VolumeId as DbVolumeId, VolumeRecord, VolumeState,
+  AccessEntry, AttachForm, AttachmentRecord, Principal, Role, VolumeId as DbVolumeId, VolumeRecord,
+  VolumeState,
 };
 use slates_db::op::Op;
 use slates_ipc::protocol::{GreenBase, Intent, ReadAt, Refusal, ReplyBody, SnapshotId, VolumeId};
@@ -1864,7 +1865,17 @@ fn enqueue_record_with(
         record.owner.clone(),
       )
     })
-    .unwrap_or_else(|| (String::new(), false, Principal::Uid { uid: 0 }));
+    // No record: an owner no real principal is (host 0 is no node's anchor, every anchor being a hash).
+    .unwrap_or_else(|| {
+      (
+        String::new(),
+        false,
+        Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 0,
+        },
+      )
+    });
   let local_hold = Placement {
     acked: vec![local],
     mirror_acked: None,
@@ -2093,6 +2104,11 @@ pub(crate) fn next_merge_work(state: &mut ShardState, local: HostId) -> Vec<Merg
   let mut work = Vec::new();
   let objects: Vec<ObjectId> = state.merge.pending.keys().copied().collect();
   for object in objects {
+    // The green's catalog register first (AUD-29-17): a successor that adopted a merge record and no catalog could
+    // not say who may use the green, so no record ships before the catalog's current version is committed.
+    if !crate::fleet::green_catalog_committed(state, DbVolumeId { bytes: object.0 }, local) {
+      continue;
+    }
     let placement = config.place(object);
     let Some(pending_green) = state.merge.pending.get_mut(&object) else {
       continue;
@@ -2502,22 +2518,15 @@ fn resolve_accepted(state: &mut ShardState, object: ObjectId, placed: u64) {
         continue;
       };
       let (origin, id) = (entry.origin, entry.id);
-      let delivery = slates_rt::task::SpawnRequest::new(
-        Box::pin(async move {
-          if route.through_work {
-            let _ = crate::state::with_state_counted(|s| {
-              crate::work_home::answered_late(s, origin, id, recorded);
-            });
-            return;
-          }
-          crate::state::deliver(route.client_index, route.request, recorded, true);
-        }),
-        None,
-      );
-      if slates_rt::registry::send_control(
-        route.shard,
-        slates_rt::control::Control::Spawn(Box::new(delivery)),
-      )
+      if crate::xshard::hand_reply_home(route.shard, move || {
+        if route.through_work {
+          let _ = crate::state::with_state_counted(|s| {
+            crate::work_home::answered_late(s, origin, id, recorded);
+          });
+          return;
+        }
+        crate::state::deliver(route.client_index, route.request, recorded, true);
+      })
       .is_err()
       {
         state.count(ACCEPTANCE_UNDELIVERED, 1);
@@ -2712,8 +2721,10 @@ fn recompute(
 }
 
 /// What a successor rebuilds a taken-over green from (AUD-14): the catalog facts the adopted record
-/// carries, the origin bytes for version 0 (none for a scratch green), the increments' bytes in
-/// version order, the adopted head and its identity — every input this node itself holds.
+/// carries, the access list of the green's adopted catalog register and that register's sequence (a
+/// share made on the departed owner must still admit its subject here), the origin bytes for version 0 (none
+/// for a scratch green), the increments' bytes in version order, the adopted head and its identity — every
+/// input this node itself holds.
 #[derive(Clone, Debug)]
 pub(crate) struct GreenRecovery {
   /// The green's mount name.
@@ -2722,6 +2733,10 @@ pub(crate) struct GreenRecovery {
   pub require_evidence: bool,
   /// The owning principal.
   pub owner: Principal,
+  /// The access list of the green's adopted catalog register.
+  pub access: Vec<AccessEntry>,
+  /// The adopted catalog register's sequence, which the rebuilt record's catalog version continues from.
+  pub catalog_sequence: u64,
   /// The origin's bytes (version 0), or none for a scratch green.
   pub origin: Option<Vec<u8>>,
   /// The increments' bytes, version 1 first.
@@ -2742,6 +2757,7 @@ pub(crate) fn recover_green_inputs(
   state: &mut ShardState,
   object: ObjectId,
   adopted: &MergeRecordValue,
+  (catalog_sequence, catalog): (u64, &crate::catalog::CatalogValue),
 ) -> Option<GreenRecovery> {
   let mut values: BTreeMap<u64, MergeRecordValue> = state
     .holder_records
@@ -2775,6 +2791,8 @@ pub(crate) fn recover_green_inputs(
     name: adopted.name.clone(),
     require_evidence: adopted.require_evidence,
     owner: adopted.owner.clone(),
+    access: catalog.access.clone(),
+    catalog_sequence,
     origin,
     chain,
     head: adopted.version,
@@ -2890,7 +2908,10 @@ mod tests {
         evidence: Vec::new(),
         name: String::new(),
         require_evidence: false,
-        owner: Principal::Uid { uid: 0 },
+        owner: Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 0,
+        },
       },
       inputs: Placement {
         candidates: candidates.clone(),
@@ -2981,7 +3002,10 @@ mod tests {
               evidence: Vec::new(),
               name: String::new(),
               require_evidence: false,
-              owner: Principal::Uid { uid: 0 },
+              owner: Principal::Uid {
+                host: slates_db::HostId(0),
+                uid: 0,
+              },
             },
             inputs: Placement {
               candidates: candidates.clone(),
@@ -3064,7 +3088,10 @@ mod tests {
       evidence: vec![[1u8; 32]],
       name: "green".to_owned(),
       require_evidence: true,
-      owner: Principal::Uid { uid: 1000 },
+      owner: Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1000,
+      },
     }
   }
 
@@ -3083,7 +3110,10 @@ mod tests {
       evidence: Vec::new(),
       name: String::new(),
       require_evidence: false,
-      owner: Principal::Uid { uid: 0 },
+      owner: Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 0,
+      },
     };
     assert_eq!(
       MergeRecordValue::from_record_bytes(&origin_only.to_record_bytes()),

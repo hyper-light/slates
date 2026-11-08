@@ -73,6 +73,19 @@ pub struct RuntimeConfig {
   pub wake_tracking: Option<WakeTracking>,
 }
 
+/// One shard's task and timer capacities, in place of the configuration's for that shard ([`Runtime::start_sized`]).
+/// The task capacity sizes the shard's task arena and its control channel alike. A shard that runs work for every
+/// other shard's clients (the daemon's control shard, which carries every forward to another node) needs room for
+/// all of it, while the others need only their own (the supervisor's order of 2026-11-07, after 117 forwards were
+/// refused at admission by a control shard sized like the rest).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShardCapacity {
+  /// The shard's task arena, and its control channel's bound.
+  pub tasks: usize,
+  /// The timers the shard may hold at once.
+  pub timers: usize,
+}
+
 /// What a shard needs to refine its wake estimate after boot (§4.1: the boot probe's mean converges
 /// slowly under a heavy tail — a virtual machine's needs 38,000–75,000 wakes where the probe's budget buys
 /// a few thousand — so the estimate a shard sizes its spin and its quantum by keeps learning from the
@@ -99,6 +112,17 @@ fn wake_ring_entries(derived: u64) -> usize {
 }
 
 impl RuntimeConfig {
+  /// The configuration the shard at `index` (in start order) is built from: this one, with `capacities[index]`'s task
+  /// and timer capacities when it names one.
+  pub fn for_shard(&self, index: usize, capacities: &[ShardCapacity]) -> RuntimeConfig {
+    let mut config = self.clone();
+    if let Some(capacity) = capacities.get(index) {
+      config.tasks_per_shard = capacity.tasks;
+      config.timers_per_shard = capacity.timers;
+    }
+    config
+  }
+
   /// A configuration from the profile: the shard count and their cores from the core classes,
   /// the tick, step budget, spin window and ring size from the derived constants, and the batch
   /// bound calibrated against `latency_budget_ns` (see [`RuntimeConfig::calibrate_batch`]). The
@@ -432,14 +456,20 @@ fn release_seeds(seeds: Vec<ShardSeed>) {
 /// slot claimed so far is given back.
 fn register_seeds(
   config: &RuntimeConfig,
+  capacities: &[ShardCapacity],
   prepare: &mut dyn FnMut() -> Result<Prepared, RtError>,
   notes: &mut Vec<String>,
 ) -> Result<Vec<ShardSeed>, RtError> {
   let mut seeds = Vec::new();
-  for _ in 0..config.shards {
+  for index in 0..usize::from(config.shards) {
+    let shard_config = config.for_shard(index, capacities);
     let registered = prepare().and_then(|prepared| {
       notes.extend(prepared.notes);
-      ShardSeed::register(config, prepared.seed, register_kick(prepared.kick_fd))
+      ShardSeed::register(
+        &shard_config,
+        prepared.seed,
+        register_kick(prepared.kick_fd),
+      )
     });
     match registered {
       Ok(seed) => seeds.push(seed),
@@ -462,6 +492,16 @@ impl Runtime {
     Self::start_with(config, &mut || os_driver())
   }
 
+  /// [`Runtime::start`] with the shards at the front of `capacities` sized by it rather than by `config`'s
+  /// `tasks_per_shard` and `timers_per_shard` (the shard at index `i`, in start order, by `capacities[i]`; the rest by
+  /// `config`).
+  pub fn start_sized(
+    config: &RuntimeConfig,
+    capacities: &[ShardCapacity],
+  ) -> Result<Runtime, RtError> {
+    Self::start_with_sized(config, capacities, &mut || os_driver())
+  }
+
   /// Starts `config.shards` shard threads over the drivers `prepare` makes, one call per shard: the OS
   /// drivers ([`Runtime::start`]) or a test double, as [`LocalRuntime::with_driver`] takes one. Returns once
   /// every shard's context is built on its own thread; any refusal — a driver `prepare` refuses, a
@@ -471,8 +511,17 @@ impl Runtime {
     config: &RuntimeConfig,
     prepare: &mut dyn FnMut() -> Result<Prepared, RtError>,
   ) -> Result<Runtime, RtError> {
+    Self::start_with_sized(config, &[], prepare)
+  }
+
+  /// [`Runtime::start_with`] with per-shard capacities ([`Runtime::start_sized`]).
+  pub fn start_with_sized(
+    config: &RuntimeConfig,
+    capacities: &[ShardCapacity],
+    prepare: &mut dyn FnMut() -> Result<Prepared, RtError>,
+  ) -> Result<Runtime, RtError> {
     let mut notes = Vec::new();
-    let seeds = register_seeds(config, prepare, &mut notes)?;
+    let seeds = register_seeds(config, capacities, prepare, &mut notes)?;
     let ids: Vec<ShardId> = seeds.iter().map(|s| ShardId(s.id)).collect();
     let (ready, acknowledged) = std::sync::mpsc::sync_channel(seeds.len().max(1));
     let mut workers = Vec::with_capacity(seeds.len());
