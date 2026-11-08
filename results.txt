@@ -1,0 +1,24 @@
+tested 4608ee7aa623b64143552b566757e69b21367185 variant after on x86_64, 4 cpus
+admitted exit 0 129s
+  admitted: b: clients_per_shard 2583 slots 32 shards 2 tasks_per_shard 10344 lane bound 165312; 647 clients x 32 forwards
+  admitted: first round: 19854 of 20704 replies in 53.066102556s; backstop 120.675993484s after the hold
+  admitted: unbroken wait of client 2 for 21 replies: 21 came, at [7.03µs, 51.527µs, 96.545µs, 127.241µs, 131.738µs, 136.034µs] into the wait
+  admitted: unbroken wait of client 3 for 21 replies: 21 came, at [6.931µs, 50.436µs, 93.711µs, 124.367µs, 128.894µs, 133.291µs] into the wait
+  admitted: unbroken wait of client 4 for 21 replies: 21 came, at [5.619µs, 49.495µs, 95.684µs, 126.351µs, 130.777µs, 135.224µs] into the wait
+  admitted: unbroken wait of client 5 for 21 replies: 21 came, at [6.219µs, 49.915µs, 93.19µs, 123.706µs, 128.142µs, 142.915µs] into the wait
+  admitted: unbroken wait of client 6 for 21 replies: 21 came, at [4.948µs, 51.458µs, 93.551µs, 123.987µs, 128.493µs, 132.92µs] into the wait
+  admitted: unbroken wait of client 7 for 21 replies: 21 came, at [5.989µs, 49.795µs, 95.193µs, 126.05µs, 130.476µs, 134.863µs] into the wait
+  admitted: 20704 of 20704 answered: 12999 served, 0 Overloaded, the last 53.070791651s after the hold; control tasks refused 0
+silent exit 0 3s
+held exit 0 97s
+fleet-forward exit 0 208s
+rt exit 0 14s
+transport exit 0 20s
+wire exit 0 6s
+db exit 0 41s
+server-lib exit 0 19s
+server exit 0 65s
+client exit 0 53s
+cli exit 0 41s
+harness exit 0 194s
+clippy exit 0 64s
