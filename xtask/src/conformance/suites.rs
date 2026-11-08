@@ -788,6 +788,8 @@ const OPEN_OF_A_FILE: &str = "open/14.t";
 /// right in one call and caches the answer, so its reads and lookups would fail too. Every change that reaches the
 /// server still answers [`READ_ONLY_ANSWER`] (slabs' reading of v6.8, agreed as the v3 limit, 2026-11-08).
 const NFS3_OPEN_LIMIT: &str = "EACCES";
+/// Format: where [`NFS3_OPEN_LIMIT`] comes from, as the probe's note names it: the Linux client's ACCESS check.
+const NFS3_OPEN_LIMIT_SOURCE: &str = "Linux v6.8 fs/nfs/dir.c nfs_do_access, lines 3219-3221";
 
 /// How the read-only probe judges one call's answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -871,7 +873,7 @@ fn read_only_probe(
     } else {
       format!(
         "; {at_limit} opens of an existing file answered {NFS3_OPEN_LIMIT}, NFSv3's limit (no OPEN: the client decides \
-         an open from ACCESS)"
+         an open from ACCESS, {NFS3_OPEN_LIMIT_SOURCE})"
       )
     },
     if others.is_empty() {
