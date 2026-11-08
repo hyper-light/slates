@@ -671,6 +671,20 @@ const FALSE_DEATH_INCARNATION: u64 = 1_000;
 fn poll_until(
   daemons: &[&Daemon],
   within: Duration,
+  condition: impl FnMut() -> Result<bool, ObserveError>,
+) -> bool {
+  poll_for_periods(daemons, within, PERIOD_BUDGET, condition)
+}
+
+/// [`poll_until`] charged `periods` of the slowest observed daemon's own periods instead of [`PERIOD_BUDGET`]: for a
+/// watch that expects nothing to happen and holds that over a stated number of the fleet's rounds. [`poll_until`]'s
+/// budget is sized for an operation to converge however slowly, so a watch that never holds spent all of it: 4,000
+/// periods, about 400 s on CI for a watch of four liveness budgets (`a_works_head_is_never_placed...`, 2026-11-08).
+#[track_caller]
+fn poll_for_periods(
+  daemons: &[&Daemon],
+  within: Duration,
+  periods: u64,
   mut condition: impl FnMut() -> Result<bool, ObserveError>,
 ) -> bool {
   let mut wait = WaitTrace::begin("poll", std::panic::Location::caller(), daemons);
@@ -714,7 +728,7 @@ fn poll_until(
       last_advance = Instant::now();
     }
     wait.asked(took, daemons, &advances, last_advance.elapsed());
-    if charged >= PERIOD_BUDGET {
+    if charged >= periods {
       // Every observed daemon ran a whole budget of its own periods, condition never met: a genuine
       // non-convergence (judged in daemon-time, so CPU load cannot cause it — periods, not wall-clock).
       wait.end("poll", "period budget spent", daemons, &advances);
@@ -13614,6 +13628,9 @@ fn a_taken_over_green_serves_every_version_and_accepts_new_work_on_the_successor
 
 /// Shape: how long a test watches for a work's head to be placed: several of the owner's seal rounds.
 const WORK_SEAL_WATCH: Duration = Duration::from_nanos(4 * LIVENESS_BUDGET_NS);
+/// Shape: [`WORK_SEAL_WATCH`] as the fleet's own periods, one a heartbeat, so the watch is charged in daemon time like
+/// every poll and a loaded runner stretches it rather than failing it ([`poll_for_periods`]).
+const WORK_SEAL_WATCH_PERIODS: u64 = 4 * LIVENESS_BUDGET_NS / slates_server::daemon::HEARTBEAT_NS;
 
 /// A-255's route (§4.16 failure matrix, RIFL §3 "retry rendezvous"): a resend names only its work, so what a work's
 /// successor knows of the work's green is what its catalog register carries, and that holds only if a work's catalog is
@@ -13644,7 +13661,7 @@ fn a_works_catalog_is_placed_like_a_plain_volumes() {
   let plain_placed = poll_until(&everyone, PLACEMENT_DEADLINE, || {
     daemons[0].fleet_head_placed(ObjectId(plain.bytes).catalog())
   });
-  let work_placed = poll_until(&everyone, WORK_SEAL_WATCH, || {
+  let work_placed = poll_for_periods(&everyone, WORK_SEAL_WATCH, WORK_SEAL_WATCH_PERIODS, || {
     daemons[0].fleet_head_placed(ObjectId(work.bytes).catalog())
   });
   drop(everyone);
@@ -13696,9 +13713,12 @@ fn a_works_head_is_never_placed_so_a_takeover_cannot_bring_it_back_to_run_a_rese
   });
   let object = ObjectId(work.bytes);
   let survivors_then: Vec<&Daemon> = daemons.iter().collect();
-  let placed = poll_until(&survivors_then, WORK_SEAL_WATCH, || {
-    daemons[0].fleet_head_placed(object)
-  });
+  let placed = poll_for_periods(
+    &survivors_then,
+    WORK_SEAL_WATCH,
+    WORK_SEAL_WATCH_PERIODS,
+    || daemons[0].fleet_head_placed(object),
+  );
   drop(survivors_then);
   let (caught_up, _) = holders_before_owner_death_at(&daemons, green, 1);
   daemons.remove(0).stop();
