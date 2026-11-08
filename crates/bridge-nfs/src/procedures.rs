@@ -177,6 +177,11 @@ pub mod extension {
   /// Format: one READDIR page encoded at the directory's owner (RFC 8881 §18.23; A-95). Arguments:
   /// `crate::v4::listing::PageRequest`. Result: the NFSv4 status, then (when it is OK) the READDIR4resok body.
   pub const READDIR4: u32 = 1054;
+  /// Format: whether the export may change anything (§4.6 "A read-only attachment is a read-only file system"), asked
+  /// by an NFSv4 OPEN for writing before its access check, so a read-only attachment's open answers `NFS4ERR_ROFS`
+  /// rather than the `NFS4ERR_ACCESS` a denied ACCESS bit would give. Arguments: a file handle. Result: the NFSv3
+  /// status, `NFS3ERR_ROFS` for a read-only attachment or a snapshot's view.
+  pub const CHANGE_ALLOWED: u32 = 1056;
   /// Format: drop a destroyed session's call records at an owner (A-127), sent to every owner (no file handle).
   /// Arguments: the client id and the session id (16 bytes). Result: the status (`NFS4ERR_DELAY` when the drop could
   /// not be made durable, so the sender keeps it queued).
@@ -864,6 +869,7 @@ impl<'b> Export<'b> {
       | extension::STATE_CHECK
       | extension::STATE_DELEGRETURN => Some(self.file_state(procedure, args)),
       extension::READDIR4 => Some(self.readdir_v4(args)),
+      extension::CHANGE_ALLOWED => Some(self.change_allowed(args)),
       _ => None,
     }
   }
@@ -975,10 +981,39 @@ impl<'b> Export<'b> {
     let requested = args.u32().map_err(|_| Nfsstat3::Inval)?;
     let identity = self.resolve_handle(&handle)?;
     let node = self.attrs_of(&identity)?;
-    Ok((
-      self.fattr3(&node),
-      granted_access(&self.caller, &node, requested),
-    ))
+    let mut granted = granted_access(&self.caller, &node, requested);
+    // A read-only attachment changes nothing, whatever the mode allows: the kernel decides an NFSv3 open from this
+    // reply alone (v3 has no OPEN), so a write bit granted here was an open for writing granted (GAPS, 2026-11-08).
+    if self.change_refusal().is_some() {
+      granted &= !(ACCESS3_MODIFY | ACCESS3_EXTEND | ACCESS3_DELETE);
+    }
+    Ok((self.fattr3(&node), granted))
+  }
+
+  /// The NFSv3 refusal of any change through this export (`Bridge::authorize_change`), or `None` when it may change.
+  fn change_refusal(&self) -> Option<Nfsstat3> {
+    match self.op_context() {
+      Err(e) => Some(nfsstat_of(&e)),
+      Ok(cx) => self
+        .bridge
+        .authorize_change(&cx)
+        .err()
+        .map(|e| nfsstat_of(&e)),
+    }
+  }
+
+  /// [`extension::CHANGE_ALLOWED`]: the NFSv3 status of a change through this export, before any change is named.
+  pub fn change_allowed(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+    let mut writer = XdrWriter::new();
+    let status = match Nfsfh3::decode(args) {
+      Err(_) => Nfsstat3::Badhandle,
+      Ok(handle) => match self.resolve_handle(&handle) {
+        Err(status) => status,
+        Ok(_) => self.change_refusal().unwrap_or(Nfsstat3::Ok),
+      },
+    };
+    status.encode(&mut writer);
+    writer.into_bytes()
   }
 
   /// NFSPROC3_READ: read up to `count` bytes at `offset` from the file a handle names, over the
@@ -1175,6 +1210,15 @@ impl<'b> Export<'b> {
         return writer.into_bytes();
       }
     };
+    // A change through a read-only attachment is refused as one before its state id is judged: an open for reading
+    // whose truncation (`O_RDONLY|O_TRUNC`) arrives as a SETATTR under its read state id answered the state id's
+    // `NFS4ERR_ACCESS` rather than `NFS4ERR_ROFS` (GAPS, 2026-11-08).
+    if !matches!(want, IoWant::Read)
+      && let Some(refusal) = self.change_refusal()
+    {
+      writer.u32(crate::v4::Nfsstat4::of_v3(refusal).wire());
+      return writer.into_bytes();
+    }
     // The acting caller, read before the file state is borrowed: a state id authorizes only the
     // principal that made it (`v4::files::FileState::check_io`).
     let acting = self.caller.uid;

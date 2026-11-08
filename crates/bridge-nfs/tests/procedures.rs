@@ -865,6 +865,28 @@ fn a_write_through_a_read_only_export_is_refused() {
     Nfsstat3::Ok.wire(),
     "but a read-only export can READ"
   );
+
+  // GAPS (2026-11-08), found by conformance's read-only run: its ACCESS grants no change, which the superuser's
+  // exemption granted before, so the kernel refuses an NFSv3 open for writing (v3 has no OPEN, and the kernel decides
+  // the open from this reply alone); and the change check an NFSv4 OPEN for writing asks answers NFS3ERR_ROFS.
+  assert_eq!(
+    access_granted(&mut export, &file_fh, 0x1 | 0x4 | 0x8 | 0x10),
+    0x1,
+    "a read-only export's ACCESS grants READ and none of MODIFY, EXTEND or DELETE"
+  );
+  let mut cargs = XdrWriter::new();
+  file_fh.encode(&mut cargs);
+  let creply = export
+    .serve_nfs(
+      slates_bridge_nfs::procedures::extension::CHANGE_ALLOWED,
+      &mut XdrReader::new(cargs.as_slice()),
+    )
+    .unwrap();
+  assert_eq!(
+    XdrReader::new(&creply).u32().unwrap(),
+    Nfsstat3::Rofs.wire(),
+    "a read-only export's change check answers NFS3ERR_ROFS"
+  );
 }
 
 /// REMOVE over the export unlinks the name from its directory: afterwards a LOOKUP of the name is
