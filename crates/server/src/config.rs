@@ -922,7 +922,67 @@ impl DaemonConfig {
       inode_reserve,
       derivations,
     }
+    .with_control_shard_noted()
   }
+
+  /// Derived: the control shard's task and timer capacities. The control shard runs every forward of every shard's
+  /// clients to another node (each a task there for its whole round), and its forward lane admits
+  /// [`forward_lane_bound`] of them, so its arena, its control channel (bounded by the same capacity) and its timers
+  /// hold that many beyond every shard's own share (`runtime.tasks_per_shard`, `runtime.timers_per_shard`). A lane
+  /// that admits work its shard's arena cannot run is the defect (the supervisor's order of 2026-11-07: the control
+  /// shard sized like the rest refused 117 spawns in fixtures' 1,000-client replica-kill rung, and its channel 10,198
+  /// to 10,298 forwards in `a_silent_owner_leaves_no_forward_the_lane_admitted_unrun`).
+  pub fn control_shard_capacity(&self) -> Derived<slates_rt::ShardCapacity> {
+    let lane = forward_lane_bound(
+      self.clients_per_shard,
+      self.region.slots,
+      self.runtime.shards,
+    )
+    .get();
+    derived!(
+      slates_rt::ShardCapacity {
+        tasks: self.runtime.tasks_per_shard.saturating_add(lane),
+        timers: self.runtime.timers_per_shard.saturating_add(lane),
+      },
+      "tasks_per_shard + forward_lane_bound, timers_per_shard + forward_lane_bound",
+      [
+        "tasks_per_shard",
+        "timers_per_shard",
+        "clients_per_shard",
+        "region.slots",
+        "shards"
+      ]
+    )
+  }
+
+  /// This configuration with its control shard's capacity in the boot log, in place of any earlier line for it (the
+  /// capacity follows `runtime`'s, which [`Self::with_fleet`] raises).
+  fn with_control_shard_noted(mut self) -> DaemonConfig {
+    let line = note("control_shard_capacity", &self.control_shard_capacity());
+    self
+      .derivations
+      .retain(|kept| !kept.starts_with("control_shard_capacity "));
+    self.derivations.push(line);
+    self
+  }
+}
+
+/// Derived: the forwards one forward lane may hold, queued and open together: every request this node's clients may
+/// hold in flight, `clients_per_shard × slots` on each of `shards` (`crate::forward_lane`). The control shard's
+/// capacity is sized from the same value ([`DaemonConfig::control_shard_capacity`]).
+pub(crate) fn forward_lane_bound(
+  clients_per_shard: usize,
+  slots: u32,
+  shards: u16,
+) -> Derived<usize> {
+  derived!(
+    clients_per_shard
+      .saturating_mul(usize::try_from(slots).unwrap_or(usize::MAX))
+      .saturating_mul(usize::from(shards.max(1)))
+      .max(1),
+    "clients_per_shard × slots × shards",
+    ["clients_per_shard", "region.slots", "shards"]
+  )
 }
 
 /// A fault injected into one shard's start (the boot tests): which partition, how it misbehaves, and for how long.
@@ -1324,7 +1384,7 @@ impl DaemonConfig {
       .timers_per_shard
       .saturating_add(fleet_tasks.get());
     self.fleet = Some(membership);
-    self
+    self.with_control_shard_noted()
   }
 }
 

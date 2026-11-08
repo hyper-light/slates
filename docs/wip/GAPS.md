@@ -155,9 +155,18 @@
 >   rung, placed by the forward hop counters). A shard with a full task arena drops a spawn unrun, and the forwards
 >   owing a client its reply read no admission, so 87 vanished and their clients waited for good. A guard in each
 >   such task now answers its client `Overloaded` if it is dropped unrun (red on both Linux runners, run 42417663905;
->   `docs/bugs/2026-11-07-a-forward-refused-at-admission-left-its-client-waiting.md`). Still owed: the control shard's
->   arena is sized for its own clients' one request each, not every shard's in-flight forwards; and tasks carrying a
->   reply home share the loss.>
+>   `docs/bugs/2026-11-07-a-forward-refused-at-admission-left-its-client-waiting.md`). The same day, on the
+>   supervisor's order, the control shard is sized from its lane's bound, a full channel is answered `Overloaded` (not
+>   `HomedElsewhere`), and every reply carried home runs whether admitted or not (§4.3's status;
+>   `docs/bugs/2026-11-07-the-control-shard-could-not-run-what-its-lane-admitted.md`). Still owed: a same-node owner
+>   shard is sized for its own clients' forwards only.
+>
+> - **A forward its owner never answered stayed open on a busy session** (found 2026-11-07 by fixtures' f = 1
+>   primary kill). A forward's stall budget counted any byte its session consumed, so 298 forwards to an owner that
+>   never answered them stayed open for good while the session carried other replies. Progress is now its own
+>   reply's bytes (red 4/4 on both Linux runners, run 42425119057;
+>   `docs/bugs/2026-11-07-a-forward-its-owner-never-answered-stayed-open-on-a-busy-session.md`). The owner's side of
+>   that rung, a membership split after the primary's restart that never merged, is open with membership's owner.>
 > - **A held request kept every later completion of its client** (found 2026-11-07 by fixtures' `f = 1` rungs, and
 >   the quiet arm's 10k backpressure). The acknowledgement was one watermark, which stopped below the lowest id still
 >   owed, so one submit held for its resend kept all its client's later records, and past `2 × slots` the owner

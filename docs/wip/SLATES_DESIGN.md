@@ -1453,6 +1453,26 @@ cluster.
 
 > **Status (2026-09-25, A-31: the shard learns its wake and attributes its long polls).** The boot probe's mean wake is `quick` on a virtual machine: at a coefficient of variation of five to seven, ±5 % needs 38,000–75,000 wakes where the 250 ms probe buys three to six thousand. A shard built from a profile now carries that mean as the prior of an online estimate (`WakeTracking`; `slates_machine::wake::WakeEstimate`, an exponentially weighted mean over about `2^shift` wakes, `shift` = ⌈log₂ (1.96 · sd / (0.05 · mean))²⌉ from the probe's own spread, kept in fixed point so no small correction rounds away) and folds in each wake it pays: the first sender to kick a park stamps the host clock, and the woken shard times the stamp to its own return. Only the probe's event counts — a sleeper woken: a stamp from before the park's announcement is stale, one from the park's setup found the shard awake, and on Linux a wait across which the thread's voluntary context switches (`getrusage(RUSAGE_THREAD)`) did not move never slept; each is counted (`wake_stale`, `wake_unslept`), none is measured. The step quantum, the idle spin (× the daemon's idle-window ratio), the I/O harvest cadence, the destroy and archive slices (`DaemonConfig::step_quantum_ns`) and the serve loop's idle window read the estimate live; the timer tick, fixed by the wheel's construction, keeps the boot mean. Each shard's estimate is mirrored in its pulse (`ShardPulse::wake_cost_ns`) and printed in the fleet suite's diagnostics. A poll past the quantum by the wall clock is now attributed (`slates_rt::attribution`): the task's when it ran past the quantum on the CPU or waited inside a call (the base plane's synchronous `pread`; the runtime's yield to a full peer ring), the host's when it stayed within the quantum on the CPU and never waited (preempted, or its virtual CPU stolen), else unattributed. The shard reads the thread's CPU clock and (Linux) its voluntary switches only at the end of a long poll and, while a long poll went unattributed, at each step's start and wait's end; a busy period with no long poll stops the reads. Measured in a Linux container on Apple silicon (2026-09-25, best of five rounds of 200,000 calls): `CLOCK_THREAD_CPUTIME_ID` 155–161 ns, `getrusage(RUSAGE_THREAD)` 130–134 ns. Proven by use in `crates/rt/tests/wake_estimate.rs` (a sleeping shard's kicks teach the estimate; a spinning poll is the task's; a sleeping poll is the task's on Linux and unattributed on macOS; a runnable poll held off its CPU by a pinned competitor is the host's, Linux) and the attribution module's cfg-free unit tests; 30 of 30 repeated runs on each platform. Record: `docs/bugs/2026-09-25-wake-estimate-frozen-at-boot-and-preemptions-counted-as-long-steps.md`. Only a shard that tracks an estimate on a real clock times its wakes (`Parking::time_wakes`, set as it is built): a simulated shard's parks and kicks read no host clock (D-20), which the first push broke — callgrind faulted in rustix's vDSO setup under the simulation's instruction-count benches, and Miri refused the boot clock (`docs/bugs/2026-09-25-simulated-parks-read-the-host-clock.md`).
 
+> **Status (2026-11-07, the control shard is sized for what its forward lane admits).** Every shard's arena, control
+> channel (bounded by the same capacity) and timers were sized for its own clients with one request each, while the
+> control shard runs every shard's forwards to other nodes and its lane admits `clients_per_shard × slots × shards`
+> (164,864 against 10,314 on CI's runners). A forward refused at admission was dropped unrun and its client waited for
+> good (117 refused in fixtures' f = 1 replica-kill rung), and one refused at the channel was answered `HomedElsewhere`.
+> - The runtime builds a shard from its own capacity when given one (`Runtime::start_sized`, `ShardCapacity`).
+> - The daemon gives the control shard its lane's bound beyond every shard's share
+>   (`DaemonConfig::control_shard_capacity`, logged at boot).
+> - A full channel is answered `Overloaded`, retryable under the same id.
+> - A task owing a client its reply answers it if dropped unrun (`xshard::AnswerUnstarted`), and a reply carried home
+>   runs on the client's shard whether that shard's arena admits it or not (`xshard::send_reply_home`,
+>   `hand_reply_home`).
+>
+> Test: `a_silent_owner_leaves_no_forward_the_lane_admitted_unrun` (about 20,700 forwards in flight through one control
+> shard, none refused). Records: `docs/bugs/2026-11-07-a-forward-refused-at-admission-left-its-client-waiting.md` and
+> `docs/bugs/2026-11-07-the-control-shard-could-not-run-what-its-lane-admitted.md`. Owed:
+> - a same-node owner shard receives forwards from every shard's clients and is sized for its own (answered
+>   `Overloaded` past it);
+> - the fleet's tasks are added to every shard though they run on the control shard alone.
+
 **Failure matrix.** Driver setup refused (seccomp): Masked (epoll). Task arena full: Refused
 (`TooManyTasks`, admission). A task exceeding the bounded-work rule (a poll past the step quantum on
 the CPU, or waiting inside a call past it): Degraded, counted (`long_steps`, `blocked_steps`), the

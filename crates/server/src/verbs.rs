@@ -477,13 +477,10 @@ fn promote_region_on_root(
       if origin == control {
         crate::state::deliver(client_index, request, reply, false);
       } else {
-        let back = SpawnRequest::new(
-          Box::pin(async move {
-            crate::state::deliver(client_index, request, reply, false);
-          }),
-          None,
-        );
-        crate::xshard::send_back(origin, back).await;
+        crate::xshard::send_reply_home(origin, move || {
+          crate::state::deliver(client_index, request, reply, false);
+        })
+        .await;
       }
     }),
     None,
@@ -1151,13 +1148,13 @@ fn forward_to_owner(
     }),
     None,
   );
-  if crate::xshard::send_owing(control, task).is_err() {
+  if let Err(refusal) = crate::xshard::send_owing(control, task) {
     state.count(FORWARD_CLIENT_CONTROL_REFUSED, 1);
     if let Ok(slot) = state.clients.get_mut(client) {
       slot.read_ahead_pending = slot.read_ahead_pending.saturating_sub(charged);
       state.read_ahead.credit(charged);
     }
-    return Served::Reply(refused(Refusal::HomedElsewhere { region }));
+    return Served::Reply(refused(control_refusal(&refusal, control, region)));
   }
   state.count(FORWARD_CLIENT_TO_CONTROL, 1);
   Served::Forwarded
@@ -1849,13 +1846,10 @@ async fn deliver_owner_forward(
     finish_owner_forward(client, request, reply, after);
     return;
   }
-  let back = SpawnRequest::new(
-    Box::pin(async move {
-      finish_owner_forward(client, request, reply, after);
-    }),
-    None,
-  );
-  crate::xshard::send_back(origin, back).await;
+  crate::xshard::send_reply_home(origin, move || {
+    finish_owner_forward(client, request, reply, after);
+  })
+  .await;
 }
 
 fn finish_owner_forward(
@@ -2625,18 +2619,15 @@ fn send_forward(
       let Some(reply) = reply else {
         return;
       };
-      let back = SpawnRequest::new(
-        Box::pin(async move {
-          // What the verb owes its client besides the reply (a stream end, A-161) goes home with it, for `send_reply`
-          // to hand over first. A shard whose state is out of reach drops it, counted, and the stream then ends.
-          if let Some(carried) = carried {
-            let _ = crate::state::with_state_counted(|s| keep_carried(s, request, carried));
-          }
-          crate::state::deliver(client_index, request, reply, true);
-        }),
-        None,
-      );
-      crate::xshard::send_back(origin, back).await;
+      crate::xshard::send_reply_home(origin, move || {
+        // What the verb owes its client besides the reply (a stream end, A-161) goes home with it, for `send_reply`
+        // to hand over first. A shard whose state is out of reach drops it, counted, and the stream then ends.
+        if let Some(carried) = carried {
+          let _ = crate::state::with_state_counted(|s| keep_carried(s, request, carried));
+        }
+        crate::state::deliver(client_index, request, reply, true);
+      })
+      .await;
     }),
     None,
   );
@@ -2656,15 +2647,12 @@ async fn forward_for_local_client(
   request_bytes: Vec<u8>,
 ) {
   let deliver_home = move |reply: ReplyBody| {
-    SpawnRequest::new(
-      Box::pin(async move {
-        crate::state::with_state_counted(|s| s.count(FORWARD_LOCAL_DELIVERED_HOME, 1));
-        crate::state::deliver(client_index, request, reply, true);
-      }),
-      None,
-    )
+    move || {
+      crate::state::with_state_counted(|s| s.count(FORWARD_LOCAL_DELIVERED_HOME, 1));
+      crate::state::deliver(client_index, request, reply, true);
+    }
   };
-  let sent = control.is_some_and(|control| {
+  let sent = control.map(|control| {
     let mut unstarted = crate::xshard::AnswerUnstarted::new(
       origin,
       control,
@@ -2679,15 +2667,26 @@ async fn forward_for_local_client(
         let (replies, _) = resolve_and_forward(volume, region, None, vec![request_bytes]).await;
         crate::state::with_state_counted(|s| s.count(FORWARD_LOCAL_RESOLVED, 1));
         let reply = replies.first;
-        crate::xshard::send_back(origin, deliver_home(reply)).await;
+        crate::xshard::send_reply_home(origin, deliver_home(reply)).await;
       }),
       None,
     );
-    crate::xshard::send_owing(control, task).is_ok()
+    crate::xshard::send_owing(control, task).map_err(|refusal| (refusal, control))
   });
+  count_local_handoff(sent.as_ref().is_some_and(Result::is_ok));
+  let refusal = match sent {
+    Some(Ok(())) => return,
+    Some(Err((refusal, control))) => control_refusal(&refusal, control, region),
+    None => Refusal::HomedElsewhere { region },
+  };
+  crate::xshard::send_reply_home(origin, deliver_home(refused(refusal))).await;
+}
+
+/// Counts a local client's forward handed to the control shard (`handed`) or refused there.
+fn count_local_handoff(handed: bool) {
   crate::state::with_state_counted(|s| {
     s.count(
-      if sent {
+      if handed {
         FORWARD_LOCAL_TO_CONTROL
       } else {
         FORWARD_LOCAL_CONTROL_REFUSED
@@ -2695,14 +2694,45 @@ async fn forward_for_local_client(
       1,
     );
   });
-  if !sent {
-    crate::xshard::send_back(
-      origin,
-      deliver_home(refused(Refusal::HomedElsewhere { region })),
-    )
-    .await;
+}
+
+/// The refusal answering a client whose forward the control shard's channel refused: `Overloaded` while that channel is
+/// full (retryable under the same id, since the verb never ran), `HomedElsewhere` when the control shard is gone, as an
+/// owner not found is. Until 2026-11-07 a full channel was answered `HomedElsewhere`, which tells the client its volume
+/// lives in another region: 10,198 to 10,298 reads of `a_silent_owner_leaves_no_forward_the_lane_admitted_unrun`.
+fn control_refusal(refusal: &slates_rt::RtError, control: u16, region: u64) -> Refusal {
+  match refusal {
+    slates_rt::RtError::ControlFull { .. } => Refusal::Overloaded { shard: control },
+    _ => Refusal::HomedElsewhere { region },
   }
 }
+
+/// Holds the forwarded verb `bytes` unanswered while a test's forward silence names its volume
+/// (`Daemon::inject_forward_silence`), polled at the heartbeat. In production the fault is unset and the request is not
+/// decoded: one field read. A sleep the runtime could not time ends the hold, counted.
+pub(crate) async fn injected_forward_silence(bytes: &[u8]) {
+  if !crate::state::with_state(|s| s.injected_forward_silence.is_some()).unwrap_or(false) {
+    return;
+  }
+  let Some(volume) = decode_body::<ForwardedRequest>(bytes)
+    .ok()
+    .and_then(|forwarded| volume_of(&forwarded.body))
+  else {
+    return;
+  };
+  while crate::state::with_state(|s| s.injected_forward_silence == Some(volume)).unwrap_or(false) {
+    if slates_rt::futures::sleep(crate::daemon::HEARTBEAT_NS)
+      .await
+      .is_err()
+    {
+      crate::state::with_state_counted(|s| s.count(FORWARD_SILENCE_UNTIMED, 1));
+      return;
+    }
+  }
+}
+
+/// Counter: a test's forward silence the runtime could not time; the verb was served at once.
+const FORWARD_SILENCE_UNTIMED: &str = "fleet.forward_silence_untimed";
 
 /// Counter: a local client's verb for a volume another host owns, handed from the volume's shard here to the control
 /// shard to be forwarded (`forward_for_local_client`). With the counters after it, each hop of the forward is counted,
@@ -2788,13 +2818,10 @@ fn scatter_list(
           Some(ReplyBody::Listed { volumes }) => volumes,
           _ => Vec::new(),
         };
-        let back = SpawnRequest::new(
-          Box::pin(async move {
-            gather(request, part);
-          }),
-          None,
-        );
-        crate::xshard::send_back(origin, back).await;
+        crate::xshard::send_reply_home(origin, move || {
+          gather(request, part);
+        })
+        .await;
       }),
       None,
     );
@@ -2839,13 +2866,10 @@ fn scatter_grants(
           Some(ReplyBody::Grants { grants }) => grants,
           _ => Vec::new(),
         };
-        let back = SpawnRequest::new(
-          Box::pin(async move {
-            gather_grants(request, part);
-          }),
-          None,
-        );
-        crate::xshard::send_back(origin, back).await;
+        crate::xshard::send_reply_home(origin, move || {
+          gather_grants(request, part);
+        })
+        .await;
       }),
       None,
     );
@@ -2901,13 +2925,10 @@ fn scatter_status(state: &mut ShardState, client_index: u32, request: u64) -> Se
     let task = SpawnRequest::new(
       Box::pin(async move {
         let part = crate::state::with_state(shard_report);
-        let back = SpawnRequest::new(
-          Box::pin(async move {
-            gather_status(request, part);
-          }),
-          None,
-        );
-        crate::xshard::send_back(origin, back).await;
+        crate::xshard::send_reply_home(origin, move || {
+          gather_status(request, part);
+        })
+        .await;
       }),
       None,
     );
@@ -3118,13 +3139,10 @@ fn scatter_acknowledge(
       Box::pin(async move {
         let part = crate::state::with_state(|s| acknowledge(s, client_id, up_to, &owed))
           .unwrap_or_else(|| refused(Refusal::NotFound));
-        let back = SpawnRequest::new(
-          Box::pin(async move {
-            crate::state::with_state_counted(|s| release_part_back(s, request, &part));
-          }),
-          None,
-        );
-        crate::xshard::send_back(origin, back).await;
+        crate::xshard::send_reply_home(origin, move || {
+          crate::state::with_state_counted(|s| release_part_back(s, request, &part));
+        })
+        .await;
       }),
       None,
     );
