@@ -1,0 +1,11 @@
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' failed - Err(Error { kind: ToolExecError, message: "command did not execute successfully (status code exit code: 2): \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Tools\\\\MSVC\\\\14.51.36231\\\\bin\\\\HostX64\\\\x64\\\\cl.exe\" \"-nologo\" \"-MD\" \"-Z7\" \"-Brepro\" \"-WX\" \"-W4\" \"-FoD:\\\\a\\\\slates\\\\slates\\\\target\\\\debug\\\\build\\\\aws-lc-sys-0bf3c6c5352b74c6\\\\out\\\\out-stdalign_check\\\\e1bacabfea35bee3-stdalign_check.o\" \"-c\" \"D:\\\\a\\\\slates\\\\slates\\\\vendor\\\\aws-lc-sys\\\\aws-lc\\\\tests\\\\compiler_features_tests\\\\stdalign_check.c\"" }).
+test a_directory_holding_a_file_is_not_removed ... slates anchor: instance wsrmdir9192 up; daemon pid 9116; 2 shards
+test a_file_shrunk_then_extended_by_its_end_reaches_the_size ... slates anchor: instance wsextend9192 up; daemon pid 3024; 2 shards
+test a_file_shrunk_then_extended_by_zero_writes_reaches_the_size ... slates anchor: instance wschsize9192 up; daemon pid 8132; 2 shards
+test a_files_creation_time_set_through_the_drive_is_kept ... slates anchor: instance wscreated9192 up; daemon pid 5556; 2 shards
+test a_files_write_and_access_times_set_through_the_drive_are_kept ... slates anchor: instance wstimes9192 up; daemon pid 1740; 2 shards
+test a_move_asked_to_replace_a_directory_is_refused ... slates anchor: instance wsmovedir9192 up; daemon pid 7112; 2 shards
+test a_move_not_asked_to_replace_refuses_a_taken_name_and_leaves_both_files ... slates anchor: instance wsmove9192 up; daemon pid 6268; 2 shards
+test an_open_that_truncates_leaves_the_file_empty ... slates anchor: instance wstrunc9192 up; daemon pid 5368; 2 shards
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 606.26s
+exit 0
