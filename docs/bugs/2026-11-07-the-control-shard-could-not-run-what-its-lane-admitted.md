@@ -38,11 +38,19 @@ the lane's bound).
   - b's control shard refused no spawn and its channel none;
   - every hop balanced, `fleet.forward.client.to_control` through `delivered_home` (20,641 and 20,705);
   - `deferred` was 0 on both shards.
-- Replies late, not lost. At the failover SLO plus one liveness budget, 76 to 120 replies had not come, and every one
-  came in the budget after (run 42426714842). At the SLO plus three, 38 to 98 had not (run 42427500000). They were
-  always the first clients' last requests. Those clients are read first, so they alone are measured from the hold's
-  end. A forward's resend loop is bounded by the SLO and its last forward by a stall budget whose path tail this burst
-  stretches on a 4-core runner. The test holds that nothing is lost, with twice the SLO as its backstop.
+- Replies late, not lost. Read client by client, the first clients' last replies came after every deadline tried
+  (the SLO plus one budget, plus three, twice the SLO, 60 s), and each time all of them came on the next read (runs
+  42426714842 to 42437055903). A probe at the first shortfall (run 42437675578) found:
+  - none of the client's requests untaken on its request ring and none of its replies untaken on its reply ring;
+  - nothing unwritten on b's other shard;
+  - b's control shard too busy to run the probe's task within its budget.
+  So the replies were still being produced on a saturated control shard. With about 20,700 forwards to an owner
+  silent for two budgets, it drains slowly on a 4-core runner (the last reply 64 to 105 s after the hold): thousands of
+  forwarders find the session lent and poll for it (`session_never_returned` about 5,000 to 6,000), and each resend
+  begins a new forwarder. The test reads every client once, measuring the rate the control shard served the burst at,
+  then gives each client still short one unbroken wait, timed, to a backstop derived from that rate: twice the time
+  it needs to serve the whole burst, plus the failover SLO. It asserts none refused and none lost, and prints the
+  arrivals.
 
 ## Fix
 
@@ -59,6 +67,10 @@ the lane's bound).
   the task or refuses it at admission, counted `xshard.reply_run_unstarted`. Every reply carrier above uses one.
 
 ## Not fixed here
+
+- The control shard's own cost under a large in-flight set: a forwarder that finds the session lent polls for it at a
+  tenth of a heartbeat, so thousands of them make the shard drain slowly (above). Measured, not fixed; it is the
+  shared session GAPS owes ("Open — one session per peer is lent exclusively", its 2026-11-07 status).
 
 - A same-node owner shard receives forwards from every shard's clients too (`send_forward`) and is sized for its
   own. Refused at admission, those are answered `Overloaded` by 6fe4b30d's guard; they no longer stall.
