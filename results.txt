@@ -1,0 +1,17 @@
+mutants, commit 5b6569bb, 4 CPUs
+== session_out_gives_up a_forward_waits_for_the_owners_session_while_it_is_out exit 101
+thread 'a_forward_waits_for_the_owners_session_while_it_is_out' (5780) panicked at crates/server/tests/fleet.rs:6384:5:
+b's write not served: Refused { refusal: OwnerUnreachable { region: 0 } }; 
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+a_forward_waits_for_the_owners_session_while_it_is_out --- FAILED
+== location_tried_once a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget exit 101
+thread 'a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget' (5875) panicked at crates/server/tests/fleet.rs:14872:5:
+assertion `left == right` failed: no call was refused while the false death lasted: [(true, true, 315.25689ms, 10), (true, true, 242.6704ms, 7), (true, true, 255.559677ms, 5), (true, true, 341.755108ms, 15), (true, true, 254.185719ms, 8)]; B's counters Ok({"content.purged_bytes": 12570247168, "content.ticks.idle": 7, "fleet.discovery.pages": 48, "fleet.forward.batch_done": 6, "fleet.forward.begun": 6, "fleet.forward.client.control_started": 51, "fleet.forward.client.delivered_home": 51, "fleet.forward.client.resolved": 51, "fleet.forward.client.to_control": 51, "fleet.forward.no_session": 5, "
+  left: 10
+ right: 0
+== free_read_on_the_held_shard forwards_to_one_owner_never_wait_behind_each_other exit 101
+thread 'forwards_to_one_owner_never_wait_behind_each_other' (5939) panicked at crates/server/tests/fleet.rs:5873:3:
+the read on the free shard was never answered while the hold stood, waiting behind another forward to the same owner: [ForwardRound { served: true, during_hold: false, fast_took: 485.93417ms }, ForwardRound { served: true, during_hold: false, fast_took: 501.187712ms }, ForwardRound { served: true, during_hold: false, fast_took: 501.104564ms }, ForwardRound { served: true, during_hold: false, fast_took: 501.163707ms }, ForwardRound { served: true, during_hold: false, fast_took: 501.53972ms }, ForwardRound { served: true, during_hold: false, fast_took: 501.425066ms }, ForwardRound { served: true
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+forwards_to_one_owner_never_wait_behind_each_other --- FAILED
+== hedge_after_the_hold a_slow_first_round_candidate_is_hedged_after_the_measured_p95 exit 0
