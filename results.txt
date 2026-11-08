@@ -1,0 +1,24 @@
+tested b81e6fc81c5ba432cad6bfaf45becb55595d606b variant after on x86_64, 4 cpus
+restart exit 101 164s
+  restart: thread 'a_submit_resent_under_its_id_after_its_owner_restarted_is_answered_its_version_once' (5634) panicked at crates/server/tests/fleet.rs:13065:3:
+  restart:   left: Some(Ok(Submitted { version: Some(2), conflicts: [] }))
+  restart:  right: Some(Ok(Submitted { version: Some(1), conflicts: [] }))
+  restart: test a_submit_resent_under_its_id_after_its_owner_restarted_is_answered_its_version_once ... FAILED
+  restart: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 107 filtered out; finished in 61.85s
+  restart: error: test failed, to rerun pass `-p slates-server --test fleet`
+still-waits exit 101 63s
+  still-waits: thread 'a_submit_resent_while_its_version_still_waits_after_the_restart_joins_the_wait' (5667) panicked at crates/server/tests/fleet.rs:13059:5:
+  still-waits:   left: Versions { head: 2 }
+  still-waits:  right: Versions { head: 1 }
+  still-waits: test a_submit_resent_while_its_version_still_waits_after_the_restart_joins_the_wait ... FAILED
+  still-waits: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 107 filtered out; finished in 62.53s
+  still-waits: error: test failed, to rerun pass `-p slates-server --test fleet`
+takeover exit 101 5s
+  takeover: the resend through the takeover was answered Ok(Refused { refusal: OwnerUnreachable { region: 0 } }); head Versions { head: 1 }
+  takeover: thread 'a_submit_resent_after_its_owner_was_taken_over_is_not_applied_again' (5704) panicked at crates/server/tests/fleet.rs:13477:3:
+  takeover: assertion `left == right` failed: the resend through the takeover is answered the version it was accepted as
+  takeover:   left: Some(Refused { refusal: OwnerUnreachable { region: 0 } })
+  takeover:  right: Some(Submitted { version: Some(1), conflicts: [] })
+  takeover: test a_submit_resent_after_its_owner_was_taken_over_is_not_applied_again ... FAILED
+  takeover: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 107 filtered out; finished in 5.17s
+  takeover: error: test failed, to rerun pass `-p slates-server --test fleet`
