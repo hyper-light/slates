@@ -375,6 +375,14 @@ fn pass(
           let (Some(arm), Some(into)) = (arms.get(index), samples.get_mut(index)) else {
             continue;
           };
+          // Outside every timed call: the lane's stall detector reads this line's arrival as the run's sign of life, and
+          // names the round a stalled run was in by it (`docs/wip/bench/fsbench/windows-ab.sh`).
+          eprintln!(
+            "progress: {name} round {} of {rounds}, arm {}, {:.1} s into the pass",
+            number.saturating_add(1),
+            arm.name,
+            started.elapsed().as_secs_f64()
+          );
           round(arm, name, number, files, into)?;
         }
       }

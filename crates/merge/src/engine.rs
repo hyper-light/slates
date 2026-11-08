@@ -631,7 +631,7 @@ fn touched_range(op: &Op) -> Range {
 }
 
 /// Whether an op kind carries content bytes (its `src` names post-state bytes).
-fn is_content(kind: OpKind) -> bool {
+pub(crate) fn is_content(kind: OpKind) -> bool {
   matches!(
     kind,
     OpKind::Overwrite | OpKind::Extend | OpKind::Truncate | OpKind::Insert | OpKind::Delete
@@ -766,8 +766,9 @@ enum Effect {
   Special(String, SpecialNode),
   /// Remove an IPC inode.
   RemoveSpecial(String),
-  /// Set the file to these bytes, recording these ops (head coordinates) as its content delta.
-  SetContent(String, Vec<u8>, Vec<Op>),
+  /// Set the file to these bytes, recording these ops (head coordinates) as its content delta; the last field says how a
+  /// replay arrives at the same bytes (`crate::chain_entry`).
+  SetContent(String, Vec<u8>, Vec<Op>, ContentSource),
   /// Remove the file.
   RemoveContent(String),
   /// Create a directory.
@@ -790,14 +791,54 @@ enum Effect {
   RemoveXattr(String, String),
 }
 
+/// How a [`Effect::SetContent`]'s bytes come from what a chain entry records (`crate::chain_entry`).
+#[derive(Clone, Debug)]
+enum ContentSource {
+  /// The effect's mapped ops, spliced into the file, from the increment's post-state.
+  Mapped,
+  /// These declared ops over nothing, from the increment's post-state.
+  Created(Vec<Op>),
+  /// The bytes another file holds at this version.
+  Copied(String),
+}
+
 impl Effect {
+  /// What a chain entry records of this effect: no file's bytes, only how to arrive at them from the increment.
+  fn applied(&self) -> crate::chain_entry::Applied {
+    use crate::chain_entry::Applied;
+    match self {
+      Effect::Special(path, node) => Applied::Special(path.clone(), *node),
+      Effect::RemoveSpecial(path) => Applied::RemoveSpecial(path.clone()),
+      Effect::SetContent(path, _, ops, ContentSource::Mapped) => {
+        Applied::Spliced(path.clone(), ops.clone())
+      }
+      Effect::SetContent(path, _, _, ContentSource::Created(declared)) => {
+        Applied::Created(path.clone(), declared.clone())
+      }
+      Effect::SetContent(path, _, _, ContentSource::Copied(from)) => Applied::Copied {
+        dst: path.clone(),
+        from: from.clone(),
+      },
+      Effect::RemoveContent(path) => Applied::RemoveContent(path.clone()),
+      Effect::MakeDir(path) => Applied::MakeDir(path.clone()),
+      Effect::RemoveDir(path) => Applied::RemoveDir(path.clone()),
+      Effect::Mode(path, mode) => Applied::Mode(path.clone(), *mode),
+      Effect::Symlink(path, target) => Applied::Symlink(path.clone(), target.clone()),
+      Effect::RemoveSymlink(path) => Applied::RemoveSymlink(path.clone()),
+      Effect::Hardlink(path, target) => Applied::Hardlink(path.clone(), target.clone()),
+      Effect::RemoveHardlink(path) => Applied::RemoveHardlink(path.clone()),
+      Effect::SetXattr(path, name, value) => {
+        Applied::SetXattr(path.clone(), name.clone(), value.clone())
+      }
+      Effect::RemoveXattr(path, name) => Applied::RemoveXattr(path.clone(), name.clone()),
+    }
+  }
+
   /// The one key of the green's state this effect sets or removes (A-202).
   fn identity_key(&self) -> IdentityKey {
     match self {
       Effect::Special(path, _) | Effect::RemoveSpecial(path) => IdentityKey::Special(path.clone()),
-      Effect::SetContent(path, _, _) | Effect::RemoveContent(path) => {
-        IdentityKey::File(path.clone())
-      }
+      Effect::SetContent(path, ..) | Effect::RemoveContent(path) => IdentityKey::File(path.clone()),
       Effect::MakeDir(path) | Effect::RemoveDir(path) => IdentityKey::Dir(path.clone()),
       Effect::Mode(path, _) => IdentityKey::Mode(path.clone()),
       Effect::Symlink(path, _) | Effect::RemoveSymlink(path) => IdentityKey::Symlink(path.clone()),
@@ -869,6 +910,7 @@ impl Green {
       hardlinks: changed_at(&self.hardlink_history, at),
       specials: changed_at(&self.special_history, at),
       xattrs: changed_at(&self.xattr_history, at),
+      head_check: None,
     };
     checkpoint.canonicalize();
     Some(checkpoint)
@@ -1899,7 +1941,12 @@ impl Green {
     // source follows the move, and removing the source name.
     if let Some(source) = self.content.get(from) {
       let ops = vec![insert_whole(source.len() as u64)];
-      effects.push(Effect::SetContent(dst.to_owned(), source.clone(), ops));
+      effects.push(Effect::SetContent(
+        dst.to_owned(),
+        source.clone(),
+        ops,
+        ContentSource::Copied(from.to_owned()),
+      ));
       effects.push(Effect::RemoveContent(from.to_owned()));
     } else if let Some(target) = self.symlinks.get(from) {
       effects.push(Effect::Symlink(dst.to_owned(), target.clone()));
@@ -1912,7 +1959,12 @@ impl Green {
   }
 
   /// Merges a create at `path` with `bytes`.
-  fn merge_create(&self, path: &str, bytes: Vec<u8>) -> Result<Option<Effect>, ConflictWindow> {
+  fn merge_create(
+    &self,
+    path: &str,
+    bytes: Vec<u8>,
+    declared: &[Op],
+  ) -> Result<Option<Effect>, ConflictWindow> {
     if self.occupied_by_nonfile(path) {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
@@ -1921,7 +1973,12 @@ impl Green {
       Some(_) => Err(Green::window(path, MergeConflictClass::CreateCreate)),
       None => {
         let ops = vec![insert_whole(bytes.len() as u64)];
-        Ok(Some(Effect::SetContent(path.to_owned(), bytes, ops)))
+        Ok(Some(Effect::SetContent(
+          path.to_owned(),
+          bytes,
+          ops,
+          ContentSource::Created(declared.to_vec()),
+        )))
       }
     }
   }
@@ -2085,7 +2142,12 @@ impl Green {
     let empty = Vec::new();
     let current = self.content.get(path).unwrap_or(&empty);
     let next = apply(current, &mapped, &inc.post_state);
-    Ok(Some(Effect::SetContent(path.to_owned(), next, mapped)))
+    Ok(Some(Effect::SetContent(
+      path.to_owned(),
+      next,
+      mapped,
+      ContentSource::Mapped,
+    )))
   }
 
   /// Merges a directory creation.
@@ -2369,7 +2431,7 @@ impl Green {
     for path in &r.creates {
       let content = r.content.get(path).map(Vec::as_slice).unwrap_or(&[]);
       let bytes = apply(&[], content, &inc.post_state);
-      record(effects, windows, self.merge_create(path, bytes));
+      record(effects, windows, self.merge_create(path, bytes, content));
     }
     for path in &r.unlinks {
       record(effects, windows, self.merge_unlink(path, inc.base));
@@ -2514,7 +2576,7 @@ impl Green {
       match effect {
         Effect::Special(path, node) => self.commit_special(path, node, version),
         Effect::RemoveSpecial(path) => self.remove_special(path, version),
-        Effect::SetContent(path, bytes, ops) => set_content.push((path, bytes, ops)),
+        Effect::SetContent(path, bytes, ops, _) => set_content.push((path, bytes, ops)),
         Effect::RemoveContent(path) => removed_content.push(path),
         Effect::MakeDir(path) => {
           self.dirs.insert(path.clone());
@@ -2625,33 +2687,122 @@ impl Green {
   /// windows are kept in the bounded rejected-result cache, from which a retry is answered while the
   /// entry survives and judged again once it was evicted.
   pub fn submit(&mut self, inc: &Increment) -> Outcome {
+    self.submit_resolved(inc).0
+  }
+
+  /// [`Green::submit`], and what its verdict resolved the increment to when it committed a new version: what the
+  /// durable chain records (`crate::chain_entry`). `None` beside every other outcome, an idempotent accept included,
+  /// whose version the chain already holds.
+  pub fn submit_resolved(
+    &mut self,
+    inc: &Increment,
+  ) -> (Outcome, Option<Vec<crate::chain_entry::Applied>>) {
     if let Some(version) = self.accepted.get(&inc.id) {
-      return Outcome::Accepted { version: *version };
+      return (Outcome::Accepted { version: *version }, None);
     }
     if let Some(windows) = self.rejected.get(&inc.id) {
-      return Outcome::Conflict {
-        windows: windows.clone(),
-      };
+      return (
+        Outcome::Conflict {
+          windows: windows.clone(),
+        },
+        None,
+      );
     }
     if inc.base < self.deltas_from {
-      return Outcome::BaseUnavailable {
-        base: inc.base,
-        floor: self.deltas_from,
-      };
+      return (
+        Outcome::BaseUnavailable {
+          base: inc.base,
+          floor: self.deltas_from,
+        },
+        None,
+      );
     }
     let resolved = Green::resolve(inc);
     match self.decide(inc, &resolved) {
       Ok(effects) => {
+        let applied = effects.iter().map(Effect::applied).collect();
         // A u64 version: 2^64 merges into one green cannot happen; saturating keeps the arithmetic total.
         let version = self.head().saturating_add(1);
         self.commit(effects, version);
         self.accepted.insert(inc.id, version);
-        Outcome::Accepted { version }
+        (Outcome::Accepted { version }, Some(applied))
       }
       Err(windows) => {
         self.retain_rejected(inc.id, &windows);
-        Outcome::Conflict { windows }
+        (Outcome::Conflict { windows }, None)
       }
+    }
+  }
+
+  /// Commits an accepted version as its chain entry recorded it, the next version after the head (§4.16, §4.8 recovery;
+  /// `crate::chain_entry`): nothing is judged, so what a checkpoint restored of the green below its version does not
+  /// matter. The state after it is a function of the entry and the state before: the same effects reach
+  /// [`Green::commit`] as reached it live, so the deltas, the histories and every last-changed index come out the same,
+  /// and the increment's identity is remembered, so a retry of it is answered its version. Returns the version; an
+  /// increment already accepted commits nothing and returns the version it was accepted as.
+  pub fn apply_recorded(
+    &mut self,
+    inc: &Increment,
+    applied: &[crate::chain_entry::Applied],
+  ) -> u64 {
+    // An increment already accepted is answered its version and commits nothing, as a submit would: a chain holding one
+    // increment twice is corrupt, and its caller sees the version differ from the one the entry was recorded as.
+    if let Some(version) = self.accepted.get(&inc.id) {
+      return *version;
+    }
+    let effects = applied
+      .iter()
+      .map(|effect| self.effect_of(effect, &inc.post_state))
+      .collect();
+    let version = self.head().saturating_add(1);
+    self.commit(effects, version);
+    self.accepted.insert(inc.id, version);
+    version
+  }
+
+  /// The effect a chain entry's resolved form stands for, its bytes read from the head and the increment's post-state.
+  fn effect_of(&self, applied: &crate::chain_entry::Applied, post_state: &[u8]) -> Effect {
+    use crate::chain_entry::Applied;
+    match applied {
+      Applied::Special(path, node) => Effect::Special(path.clone(), *node),
+      Applied::RemoveSpecial(path) => Effect::RemoveSpecial(path.clone()),
+      Applied::Spliced(path, ops) => {
+        let empty = Vec::new();
+        let current = self.content.get(path).unwrap_or(&empty);
+        Effect::SetContent(
+          path.clone(),
+          apply(current, ops, post_state),
+          ops.clone(),
+          ContentSource::Mapped,
+        )
+      }
+      Applied::Created(path, declared) => {
+        let bytes = apply(&[], declared, post_state);
+        let ops = vec![insert_whole(bytes.len() as u64)];
+        Effect::SetContent(
+          path.clone(),
+          bytes,
+          ops,
+          ContentSource::Created(declared.clone()),
+        )
+      }
+      Applied::Copied { dst, from } => {
+        let bytes = self.content.get(from).cloned().unwrap_or_default();
+        let ops = vec![insert_whole(bytes.len() as u64)];
+        Effect::SetContent(dst.clone(), bytes, ops, ContentSource::Copied(from.clone()))
+      }
+      Applied::RemoveContent(path) => Effect::RemoveContent(path.clone()),
+      Applied::MakeDir(path) => Effect::MakeDir(path.clone()),
+      Applied::RemoveDir(path) => Effect::RemoveDir(path.clone()),
+      Applied::Mode(path, mode) => Effect::Mode(path.clone(), *mode),
+      Applied::Symlink(path, target) => Effect::Symlink(path.clone(), target.clone()),
+      Applied::RemoveSymlink(path) => Effect::RemoveSymlink(path.clone()),
+      Applied::Hardlink(path, target) => Effect::Hardlink(path.clone(), target.clone()),
+      Applied::RemoveHardlink(path) => Effect::RemoveHardlink(path.clone()),
+      Applied::SetXattr(path, name, value) => {
+        Effect::SetXattr(path.clone(), name.clone(), value.clone())
+      }
+      Applied::RemoveXattr(path, name) => Effect::RemoveXattr(path.clone(), name.clone()),
     }
   }
 
@@ -3029,7 +3180,7 @@ impl Green {
           journal.push(VolumeOp::Mknod { path, node, mode });
         }
         Effect::RemoveSpecial(path) => journal.push(VolumeOp::Unlink { path }),
-        Effect::SetContent(path, bytes, ops) => {
+        Effect::SetContent(path, bytes, ops, _) => {
           if !self.content.contains_key(&path) {
             journal.push(VolumeOp::Create { path: path.clone() });
           }
