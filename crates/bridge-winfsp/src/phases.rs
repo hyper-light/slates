@@ -48,8 +48,14 @@ pub(crate) const BETWEEN: usize = 16;
 pub(crate) const BEGIN: usize = 17;
 /// Main's form: the journal's acknowledgement of a request once its response was sent.
 pub(crate) const ACKNOWLEDGE: usize = 18;
+/// The reply's way back when the waiter was still spinning: from the shard's send to the waiter having it.
+pub(crate) const TO_ANSWER_SPUN: usize = 19;
+/// The reply's way back when the waiter had parked: from the shard's send to the woken waiter having it, the wake's cost.
+pub(crate) const TO_ANSWER_PARKED: usize = 20;
+/// The spin a waiter spent before it parked: the window, paid in full by every wait that parks.
+pub(crate) const SPIN_BEFORE_PARK: usize = 21;
 /// Shape: the phases above.
-const PHASES: usize = 19;
+const PHASES: usize = 22;
 /// Format: each phase's printed name, in order.
 const NAMES: [&str; PHASES] = [
   "stamp",
@@ -71,6 +77,9 @@ const NAMES: [&str; PHASES] = [
   "between",
   "begin",
   "acknowledge",
+  "to_answer_spun",
+  "to_answer_parked",
+  "spin_before_park",
 ];
 /// Format: the first operation slot; the receiver's slot for a request of no kind is one below it.
 pub(crate) const OP_BASE: usize = 32;
@@ -144,8 +153,6 @@ static CELLS: [[[AtomicU64; BUCKETS]; PHASES]; SLOTS] =
 static SUMS: [[AtomicU64; PHASES]; SLOTS] =
   [const { [const { AtomicU64::new(0) }; PHASES] }; SLOTS];
 static BASE: OnceLock<Instant> = OnceLock::new();
-/// When the shard last sent a reply, for the callback's `to_answer`.
-pub(crate) static LAST_SENT: AtomicU64 = AtomicU64::new(0);
 
 /// Nanoseconds since the process's first stamp.
 pub(crate) fn now() -> u64 {
@@ -245,7 +252,7 @@ pub(crate) fn dump(ops: &[&str]) {
       );
       // The reply's way back is bimodal (a waiter still spinning or one parked), so its whole histogram is printed, and
       // the round trip's with it: `phases_hist <slot> <phase> <upper edge ns>:<count> ...`, non-empty buckets only.
-      if phase == TO_ANSWER || phase == ROUND {
+      if matches!(phase, TO_ANSWER | ROUND | TO_ANSWER_SPUN | TO_ANSWER_PARKED) {
         let buckets: Vec<String> = counts
           .iter()
           .enumerate()

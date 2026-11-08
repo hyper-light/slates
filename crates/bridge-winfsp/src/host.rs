@@ -370,7 +370,8 @@ enum Reply {
 /// from the channel [`MountThread::start`] was given and serves it on the owner shard ([`Request::serve`]).
 pub struct Request {
   op: Op<u64>,
-  reply: SyncSender<Reply>,
+  /// The reply, with the shard's send stamp for the profile's `to_answer` (diag only).
+  reply: SyncSender<(Reply, u64)>,
   hint: u64,
   /// Whether recovery is replaying this request from a dead daemon's journal (`crate::dispatcher`), so a Close the
   /// dead daemon already applied may be found done.
@@ -740,7 +741,7 @@ fn bind(op: Op<u64>, ledger: &Ledger<SparseObject>) -> Result<Op<Open>, crate::o
 /// A served request whose reply is still to be sent.
 pub struct Served {
   reply: Reply,
-  sender: SyncSender<Reply>,
+  sender: SyncSender<(Reply, u64)>,
   barrier: bool,
   echo: bool,
   restored_read: bool,
@@ -781,8 +782,7 @@ impl Served {
 
   /// Sends the reply to the waiting dispatcher thread. `false` when that thread is gone (the mount is being torn down).
   pub fn send(self) -> bool {
-    crate::phases::LAST_SENT.store(crate::phases::now(), std::sync::atomic::Ordering::Relaxed);
-    self.sender.send(self.reply).is_ok()
+    self.sender.send((self.reply, crate::phases::now())).is_ok()
   }
 }
 
@@ -1234,13 +1234,20 @@ fn call_on(requests: &SyncSender<Request>, wake: &Waker, op: Op<u64>) -> Reply {
     return Reply::Err(crate::status_unsuccessful());
   }
   wake.wake_by_ref();
-  let reply =
-    crate::reply::await_reply(&answer).unwrap_or(Reply::Err(crate::status_unsuccessful()));
+  let waiting = crate::phases::now();
+  let (answered, parked, spun) = crate::reply::await_reply_timed(&answer);
   let end = crate::phases::now();
   crate::phases::record(slot, crate::phases::ROUND, start, end);
-  let sent = crate::phases::LAST_SENT.load(std::sync::atomic::Ordering::Relaxed);
-  if sent >= start {
-    crate::phases::record(slot, crate::phases::TO_ANSWER, sent, end);
+  let Ok((reply, sent)) = answered else {
+    return Reply::Err(crate::status_unsuccessful());
+  };
+  // This request's own send stamp, carried with its reply: the old global stamp was another thread's on the DLL arm.
+  crate::phases::record(slot, crate::phases::TO_ANSWER, sent, end);
+  if parked {
+    crate::phases::record(slot, crate::phases::TO_ANSWER_PARKED, sent, end);
+    crate::phases::record(slot, crate::phases::SPIN_BEFORE_PARK, waiting, waiting.saturating_add(spun));
+  } else {
+    crate::phases::record(slot, crate::phases::TO_ANSWER_SPUN, sent, end);
   }
   reply
 }
