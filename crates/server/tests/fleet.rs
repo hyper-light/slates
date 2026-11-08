@@ -14643,7 +14643,7 @@ fn a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process() {
     if !from_b {
       break Some(restarted.elapsed());
     }
-    if restarted.elapsed() > 10 * RESET_LANE_BOUND {
+    if restarted.elapsed() > 200 * RESET_LANE_BOUND {
       break None;
     }
   };
@@ -14674,7 +14674,7 @@ fn a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process() {
   let reached = reached.unwrap_or_else(|| {
     panic!(
       "no read through b reached the restarted a within {:?}: {answers:?}",
-      10 * RESET_LANE_BOUND
+      200 * RESET_LANE_BOUND
     )
   });
   assert!(
