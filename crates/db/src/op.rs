@@ -422,6 +422,26 @@ pub enum Op {
     /// The attachment.
     id: u64,
   },
+  /// A green's checkpoint (W3; §4.16 "Deltas older than the derived retention fold into checkpoint deltas"): the
+  /// green's state at `version` beyond its origin, encoded (`slates_merge::checkpoint`), held in place of every
+  /// increment up to `version`, which applying it drops. Refused at or below the checkpoint held and past the head.
+  /// Appended (2026-11-06).
+  GreenCheckpointed {
+    /// The green volume.
+    green: VolumeId,
+    /// The version the checkpoint is the green's state at.
+    version: u64,
+    /// The encoded checkpoint.
+    checkpoint: Vec<u8>,
+  },
+  /// A live-shipped volume's shipper committed its holder set (A-240): carried by the catalog register to `f + 1`
+  /// before the shipper's first entry. Appended (2026-11-06).
+  LiveHoldersCommitted {
+    /// The volume.
+    id: VolumeId,
+    /// The shipper's epoch and holders.
+    holders: crate::catalog::LiveHolders,
+  },
 }
 
 impl Op {
@@ -432,6 +452,7 @@ impl Op {
       Op::WorkLogged { .. } => "work_logged",
       Op::GreenOriginHeld { .. } => "green_origin_held",
       Op::WorkRestated { .. } => "work_restated",
+      Op::GreenCheckpointed { .. } => "green_checkpointed",
       Op::VolumeStateChanged { .. } => "volume_state_changed",
       Op::VolumeResized { .. } => "volume_resized",
       Op::VolumeAccounted { .. } => "volume_accounted",
@@ -490,6 +511,7 @@ impl Op {
       Op::AttachmentRenewed { .. } => "attachment_renewed",
       Op::AttachmentExpired { .. } => "attachment_expired",
       Op::LiveShippingChanged { .. } => "live_shipping_changed",
+      Op::LiveHoldersCommitted { .. } => "live_holders_committed",
     }
   }
 }

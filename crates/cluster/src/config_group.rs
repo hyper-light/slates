@@ -464,6 +464,41 @@ pub fn council_voters(
   kept
 }
 
+/// Format: the halves a majority is counted in (Raft §5.2): of `n` voters a majority is more than `n / 2`, so `n` voters
+/// tolerate `⌊(n − 1) / 2⌋` failures and an even count no more than the odd one below it.
+const MAJORITY_HALVES: usize = 2;
+
+/// The voter set the council moves to from `sitting` toward `proposed` (both in id order): `proposed` itself, unless
+/// it only adds voters without raising the failures the council tolerates, `⌊(n − 1) / 2⌋` of `n` voters (Raft §6:
+/// a majority of the voters must answer). An even set tolerates no more than the odd one below it and is exposed to
+/// one more voter's death, so an adding step to an even count drops its highest added id, and a step that still
+/// raises nothing is not taken: `sitting` is returned. A change that also removes a voter is `proposed` unchanged (a
+/// voter taken over must leave the consensus set whatever the count), and so is a step that seats every one of the
+/// `members` (a region of two members keeps two copies of its log, which quorum-loss recovery can use; no further
+/// member could make the set odd). Growing a voter at a time, a council formed by
+/// its first node went from one voter to two whenever its third member caught up late, and two voters can lose
+/// neither: an owner killed in that window left both survivors at term 1 with no election and no takeover
+/// (2026-11-05, raft's soak; `an_owner_killed_while_its_fleet_still_forms_is_taken_over` in
+/// `crates/cli/tests/live_fleet.rs`).
+pub fn widening(sitting: &[HostId], proposed: Vec<HostId>, members: usize) -> Vec<HostId> {
+  let adds_only = sitting.iter().all(|voter| proposed.contains(voter));
+  if !adds_only || proposed.len() >= members {
+    return proposed;
+  }
+  let tolerated = |voters: usize| voters.saturating_sub(1) / MAJORITY_HALVES;
+  let mut step = proposed;
+  if step.len() > sitting.len()
+    && step.len().is_multiple_of(MAJORITY_HALVES)
+    && let Some(position) = step.iter().rposition(|host| !sitting.contains(host))
+  {
+    step.remove(position);
+  }
+  if step.len() > sitting.len() && tolerated(step.len()) <= tolerated(sitting.len()) {
+    return sitting.to_vec();
+  }
+  step
+}
+
 /// The **regional configuration council** on one node (§4.8, D-14 — the "configuration master", a small
 /// elected council per region): the multi-voter [`RaftNode`] over the council voters, producing the
 /// [`RegionalConfiguration`] every node learns. Membership changes commit at a majority over the transport
@@ -495,6 +530,10 @@ pub struct RegionalCouncil {
   invitation: Option<TimeoutNow>,
   /// Stagings aborted by [`reconcile_voters`](Self::reconcile_voters) (the non-vacuity counter).
   stagings_aborted: u64,
+  /// Members whose staging was judged stalled since the voter set last moved: a free seat goes past them to another
+  /// alive member ([`reconcile_voters`](Self::reconcile_voters)), and they are tried again once no other remains. A
+  /// subset of the members, so bounded by them.
+  passed_over: std::collections::BTreeSet<HostId>,
 }
 
 impl RegionalCouncil {
@@ -647,6 +686,7 @@ impl RegionalCouncil {
       leader_contact: 0,
       invitation: None,
       stagings_aborted: 0,
+      passed_over: std::collections::BTreeSet::new(),
     };
     group.finish_election(false);
     group
@@ -1149,12 +1189,15 @@ impl RegionalCouncil {
       return self.raft.complete_membership_change();
     }
     let sitting = self.raft.all_voters();
-    let target = council_voters(
-      &sitting,
-      &self.fold.state().members,
-      alive,
-      self.fold.state().quorum,
-    );
+    // A free seat goes past a member whose staging stalled to another alive member, so one slow member does not hold
+    // the council at its sitting voters while others could fill the seat: with five members and the second-lowest id
+    // stalled, the council stayed at its bootstrap voter for a whole formation wait (the fleet suite, 2026-11-05, under
+    // [`widening`]). Once no other member can fill it, the passed-over members are tried again.
+    let mut target = self.voter_target(&sitting, alive);
+    if target == sitting && !self.passed_over.is_empty() {
+      self.passed_over.clear();
+      target = self.voter_target(&sitting, alive);
+    }
     if target.is_empty() || target == sitting {
       // Nothing to add: unstage anything a previous target named.
       self.raft.catch_up(&sitting);
@@ -1163,14 +1206,50 @@ impl RegionalCouncil {
     // A member the change adds is caught up first (thesis §4.2.1), so the joint configuration never waits on
     // a voter with a stale log — the availability gap of the thesis's Figure 4.4.
     match self.raft.catch_up(&target) {
-      CatchUp::Ready => self.raft.begin_membership_change(target),
-      CatchUp::Aborted { .. } => {
+      CatchUp::Ready => {
+        self.passed_over.clear();
+        self.raft.begin_membership_change(target)
+      }
+      CatchUp::Aborted { member } => {
         self.stagings_aborted = self.stagings_aborted.saturating_add(1);
-        // One stalled member must not hold back the ones caught up (`RaftNode::promote_caught_up`).
-        self.raft.promote_caught_up(&target)
+        if self.fold.state().members.contains(&member) {
+          self.passed_over.insert(member);
+        }
+        // One stalled member must not hold back the ones caught up, as `RaftNode::promote_caught_up` does for
+        // the root group, but only by a step that raises what the council tolerates ([`widening`]).
+        let caught_up: Vec<HostId> = self
+          .raft
+          .staged()
+          .into_iter()
+          .filter_map(|(member, caught)| caught.then_some(member))
+          .collect();
+        let partial: Vec<HostId> = target
+          .iter()
+          .copied()
+          .filter(|host| sitting.contains(host) || caught_up.contains(host))
+          .collect();
+        let partial = widening(&sitting, partial, self.fold.state().members.len());
+        partial != sitting && self.raft.begin_membership_change(partial)
       }
       CatchUp::Pending | CatchUp::NotLeader => false,
     }
+  }
+
+  /// The voter set [`reconcile_voters`](Self::reconcile_voters) moves toward from `sitting`: [`council_voters`] of the
+  /// committed membership over the alive members not passed over, taken by a [`widening`] step.
+  fn voter_target(&self, sitting: &[HostId], alive: &[HostId]) -> Vec<HostId> {
+    let eligible: Vec<HostId> = alive
+      .iter()
+      .copied()
+      .filter(|host| !self.passed_over.contains(host))
+      .collect();
+    let target = council_voters(
+      sitting,
+      &self.fold.state().members,
+      &eligible,
+      self.fold.state().quorum,
+    );
+    widening(sitting, target, self.fold.state().members.len())
   }
 
   /// Whether this leader is catching `node` up to join the voters (thesis §4.2.1). The drive keeps direct
@@ -2342,16 +2421,15 @@ mod tests {
   /// period to commit; twelve is several times that.
   const WIDENING_PERIODS: usize = 12;
 
-  /// §4.8 (D-14) and thesis §4.2.1. Do: a council formed by its first node alone (voters `[OWNER]`) with A and B
-  /// admitted; the leader reaches A but never B (B's session down); drive leader periods as the fleet's leader
-  /// does — reconcile the voters, tick CheckQuorum, replicate to what it reaches. Expect: A is promoted — the
-  /// voters become `[OWNER, A]` once B's staging is judged stalled — and B, once reachable, is staged again,
-  /// caught up and promoted by the next change. Before 2026-09-30 the joint change waited for every added member at once, so one member that
-  /// could not catch up held back one that had: the council stayed at one voter of three members (three macOS
-  /// CI failures that day: a fleet formation, an enrollment, a three-process deploy refused
-  /// `LeaseUnconfirmed`).
+  /// §4.8 (D-14), thesis §4.2.1 and Raft §6. Do: a council formed by its first node alone (voters `[OWNER]`) with A
+  /// and B admitted at f=1; the leader reaches A but never B (B's session down); drive leader periods as the fleet's
+  /// leader does — reconcile the voters, tick CheckQuorum, replicate to what it reaches. Expect: the voters stay
+  /// `[OWNER]` while B cannot catch up, since `[OWNER, A]` tolerates no more failures than `[OWNER]` and loses the
+  /// council if either dies ([`widening`]); and once B is reachable it is staged again, caught up and promoted with A
+  /// in one change: `[OWNER, A, B]`. Until 2026-11-05 A was promoted alone, and an owner killed while the council sat at
+  /// two voters left both survivors at term 1 with no takeover (raft's soak).
   #[test]
-  fn a_member_that_cannot_catch_up_does_not_hold_back_one_that_has() {
+  fn a_council_widens_only_by_a_step_that_raises_what_it_tolerates() {
     let members = [OWNER, A, B];
     let quorum = Quorum { f: 1 };
     let mut councils: std::collections::BTreeMap<HostId, RegionalCouncil> = members
@@ -2383,10 +2461,13 @@ mod tests {
     }
     assert_eq!(
       councils[&OWNER].voters(),
-      vec![OWNER, A],
-      "A, caught up, was promoted though B could not catch up"
+      vec![OWNER],
+      "no two-voter council while B could not catch up"
     );
-    assert!(councils[&A].is_voter(A), "A knows itself a voter");
+    assert!(
+      councils[&OWNER].stagings_aborted() > 0,
+      "B's staging was judged stalled, so the partial promotion was weighed and declined"
+    );
     // B's session comes back: the next change stages it afresh, catches it up and promotes it.
     for _ in 0..WIDENING_PERIODS {
       if let Some(leader) = councils.get_mut(&OWNER) {
@@ -2399,6 +2480,208 @@ mod tests {
       councils[&OWNER].voters(),
       vec![OWNER, A, B],
       "the stalled member was promoted once it could catch up"
+    );
+  }
+
+  /// §4.8 (D-14): a council whose region has only two members seats both. Do: voters `[OWNER]`, members `[OWNER, A]`
+  /// at f=1, both reachable; drive leader periods. Expect `[OWNER, A]`: no further member could make the set odd, and
+  /// two copies of the log leave quorum-loss recovery one to take. Found by the fleet suite (2026-11-05,
+  /// `a_root_learner_fetches_the_committed_region_membership_over_the_transport`): declined as an even step, a
+  /// two-member region's council stayed at one voter.
+  #[test]
+  fn a_council_seats_every_member_of_a_region_smaller_than_its_floor() {
+    let members = [OWNER, A];
+    let quorum = Quorum { f: 1 };
+    let mut councils: std::collections::BTreeMap<HostId, RegionalCouncil> = members
+      .iter()
+      .map(|&node| {
+        (
+          node,
+          RegionalCouncil::new(
+            node,
+            members.to_vec(),
+            vec![OWNER],
+            quorum,
+            std::collections::BTreeMap::new(),
+            3,
+            false,
+          ),
+        )
+      })
+      .collect();
+    elect_among(&mut councils, OWNER, &[OWNER]);
+    for _ in 0..WIDENING_PERIODS {
+      if let Some(leader) = councils.get_mut(&OWNER) {
+        leader.reconcile_voters(&members);
+        leader.check_quorum();
+      }
+      settle(&mut councils, OWNER, &members, 2);
+    }
+    assert_eq!(councils[&OWNER].voters(), vec![OWNER, A]);
+  }
+
+  /// §4.8 (D-14): a free seat goes past a member that cannot catch up. Do: voters `[OWNER]`, members `[OWNER, A, B, C, D]`
+  /// at f=1, the leader reaching every member but B (an id the seats would name first); drive leader periods. Expect:
+  /// `[OWNER, A, C]`, C staged in B's place once B's staging is judged stalled, never a two-voter set. Found by the fleet
+  /// suite on 2026-11-05: with [`widening`] declining the even `[OWNER, A]`, the council waited on B and stayed at its
+  /// bootstrap voter through the whole formation wait in three tests.
+  #[test]
+  fn a_free_seat_goes_past_a_member_that_cannot_catch_up() {
+    const D: HostId = HostId(5);
+    let members = [OWNER, A, B, C, D];
+    let quorum = Quorum { f: 1 };
+    let mut councils: std::collections::BTreeMap<HostId, RegionalCouncil> = members
+      .iter()
+      .map(|&node| {
+        (
+          node,
+          RegionalCouncil::new(
+            node,
+            members.to_vec(),
+            vec![OWNER],
+            quorum,
+            std::collections::BTreeMap::new(),
+            3,
+            false,
+          ),
+        )
+      })
+      .collect();
+    elect_among(&mut councils, OWNER, &[OWNER]);
+    assert!(councils[&OWNER].is_leader());
+    let reachable = [OWNER, A, C, D];
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..WIDENING_PERIODS {
+      if let Some(leader) = councils.get_mut(&OWNER) {
+        leader.reconcile_voters(&members);
+        leader.check_quorum();
+      }
+      settle(&mut councils, OWNER, &reachable, 2);
+      seen.insert(councils[&OWNER].voters().len());
+    }
+    assert_eq!(
+      councils[&OWNER].voters(),
+      vec![OWNER, A, C],
+      "C took the seat B could not"
+    );
+    assert!(!seen.contains(&2), "never a two-voter set: {seen:?}");
+  }
+
+  /// §4.8 (D-14) and Raft §6 at f=2, where a partial promotion does raise what the council tolerates. Do: voters
+  /// `[OWNER]`, members `[OWNER, A, B, C, D]`, the leader reaching A, B and C but never D; drive leader periods; then
+  /// let D be reached. Expect: `[OWNER, A, B]` while D stalls (one failure tolerated where none was; C, the highest id
+  /// caught up, waits, since four voters tolerate no more than three), never a two- or four-voter set, and all five
+  /// once D catches up.
+  #[test]
+  fn a_council_at_f_two_promotes_the_caught_up_when_that_raises_what_it_tolerates() {
+    const D: HostId = HostId(5);
+    let members = [OWNER, A, B, C, D];
+    let quorum = Quorum { f: 2 };
+    let mut councils: std::collections::BTreeMap<HostId, RegionalCouncil> = members
+      .iter()
+      .map(|&node| {
+        (
+          node,
+          RegionalCouncil::new(
+            node,
+            members.to_vec(),
+            vec![OWNER],
+            quorum,
+            std::collections::BTreeMap::new(),
+            3,
+            false,
+          ),
+        )
+      })
+      .collect();
+    elect_among(&mut councils, OWNER, &[OWNER]);
+    assert!(councils[&OWNER].is_leader());
+    let (reachable, alive) = ([OWNER, A, B, C], [OWNER, A, B, C, D]);
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..WIDENING_PERIODS {
+      if let Some(leader) = councils.get_mut(&OWNER) {
+        leader.reconcile_voters(&alive);
+        leader.check_quorum();
+      }
+      settle(&mut councils, OWNER, &reachable, 2);
+      seen.insert(councils[&OWNER].voters().len());
+    }
+    assert_eq!(
+      councils[&OWNER].voters(),
+      vec![OWNER, A, B],
+      "the caught-up pair was promoted"
+    );
+    for _ in 0..WIDENING_PERIODS {
+      if let Some(leader) = councils.get_mut(&OWNER) {
+        leader.reconcile_voters(&alive);
+        leader.check_quorum();
+      }
+      settle(&mut councils, OWNER, &alive, 2);
+      seen.insert(councils[&OWNER].voters().len());
+    }
+    assert_eq!(councils[&OWNER].voters(), members.to_vec());
+    assert!(
+      !seen.contains(&2) && !seen.contains(&4),
+      "never an even voter set on the way: {seen:?}"
+    );
+  }
+
+  /// The length of the step [`widening`] must take from `sitting` voters toward `proposed` (the first ids of a list,
+  /// so the step is a prefix): the odd count at or below `proposed`, when it raises `⌊(n − 1) / 2⌋`; else `sitting`.
+  fn expected_step(sitting: usize, proposed: usize, members: usize) -> usize {
+    if proposed >= members {
+      return proposed;
+    }
+    let tolerated = |voters: usize| voters.saturating_sub(1) / 2;
+    let odd = if proposed.is_multiple_of(2) {
+      proposed.saturating_sub(1)
+    } else {
+      proposed
+    };
+    if odd > sitting && tolerated(odd) > tolerated(sitting) {
+      odd
+    } else {
+      sitting
+    }
+  }
+
+  /// [`widening`] over its cases. Do: weigh adding steps from every sitting size 0 to 6 to every larger proposed size,
+  /// under every membership at least that large, and steps that remove a voter. Expect: a step that seats every member
+  /// is taken as proposed; any other adding step only when `⌊(n − 1) / 2⌋` rises, to an odd count, dropping the highest
+  /// added id; a step that removes a voter is taken as proposed, even or odd.
+  #[test]
+  fn widening_takes_only_steps_that_raise_the_tolerated_failures() {
+    let hosts: Vec<HostId> = (1..=8).map(HostId).collect();
+    for sitting_len in 0..=6 {
+      for proposed_len in sitting_len..=hosts.len() {
+        for members in proposed_len..=hosts.len() {
+          let step = widening(
+            &hosts[..sitting_len],
+            hosts[..proposed_len].to_vec(),
+            members,
+          );
+          assert_eq!(
+            step,
+            hosts[..expected_step(sitting_len, proposed_len, members)].to_vec(),
+            "{sitting_len} -> {proposed_len} of {members}"
+          );
+        }
+      }
+    }
+    // A voter taken over leaves whatever the count: three to two, and three to a replacement's three.
+    let (one, two, three, four) = (hosts[0], hosts[1], hosts[2], hosts[3]);
+    assert_eq!(
+      widening(&[one, two, three], vec![one, two], 4),
+      vec![one, two]
+    );
+    assert_eq!(
+      widening(&[one, two, three], vec![one, two, four], 4),
+      vec![one, two, four]
+    );
+    // From two (a council left even by a takeover) to three is a gain.
+    assert_eq!(
+      widening(&[one, two], vec![one, two, three], 4),
+      vec![one, two, three]
     );
   }
 

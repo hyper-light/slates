@@ -608,6 +608,17 @@ the measured wake cost before parking (the 2-competitive rule). The mount is nev
 > a daemon), or refused `ENOENT`, which ended the anchor and its instance. Record:
 > `docs/bugs/2026-10-22-an-anchor-restarted-its-daemon-by-a-path-an-upgrade-can-replace.md`.
 
+> **A busy machine starves boot steps 1 and 2; it no longer ends them (2026-11-07).** Both steps were bounded by a
+> wall where only progress tells a starved step from a stuck one.
+> - **Step 1:** the profile's wake probe refused once its 250 ms wall passed short of its sample floor, and the anchor
+>   with it, 19 times in 20 under 144 nice-19 spinners on 18 CPUs. It now runs on while each round's waiter runs at
+>   all, within 7.75 s more (§4.1 status).
+> - **Step 2:** the anchor killed a daemon that had not beaten one wall second after its spawn; 153 of 153 starts under
+>   the same load. It now judges a start in the daemon's own CPU time, read from the OS (§4.14 status).
+>
+> Records: `docs/bugs/2026-11-07-a-busy-machine-refused-the-anchors-boot-at-the-wake-probe.md`,
+> `docs/bugs/2026-11-07-the-anchor-killed-every-start-a-busy-machine-starved.md`.
+
 1. The anchor process starts (or is already running), maps or creates the shared segment, and
    loads or rebuilds the machine profile.
 2. The daemon starts, attaches the segment, and either replays the op logs into fresh in-memory
@@ -930,6 +941,8 @@ A microbenchmark exceeding its wall-time bound: Degraded, widened interval recor
 volume requires a matching profile), `MeasurementTimeout`.
 
 > **Status (2026-09-25, the wake probe measures one event and reports its mean).** The probe timed every park/unpark round trip, so it mixed an on-CPU handoff (about 0.45 µs, the waiter still running or on the waker's CPU) with a real wake (about 10 µs); thread placement holds for a run, so runs split between the two (median 416 ns or 10,041 ns on the same two container cores, a minute apart), and it stopped on the median's interval while its consumers read the p99 — often the maximum of 64 samples (667 ns to 511,042 ns). Now the waiter is confirmed asleep (Linux `/proc` state, macOS `thread_info`; Windows the waiter's announcement, reported unconfirmed), the pair is placed as production is (the control core waking a shard core where the OS pins; unpinned on macOS, with the same-CPU share recorded), the probe converges the mean — the spin-then-park rule's threshold is the expected cost of parking, and a spinning waiter on the same pinned cores never saw the tail (p99 ≤ 209 ns) while a parked one did (285–639 µs) — and five fresh-thread rounds are compared by their medians (a disagreement lists the probe degraded, `wake.rounds`). Measured on a quiet host: the median held at 8.9–10.8 µs over ten container runs and the mean at 15.1–17.6 µs on four CPUs; macOS's mean held at 2.03–2.49 µs. The spin window, the step quantum and the timer tick now read the mean, the runtime's inbound ring the p99 at its overflow target, the guest credit's kick round trip the mean; a profile of another format version is refused by name, and a daemon handed one by an older anchor measures its own. The boot mean is quick on a virtual machine (±20–30 % in 250 ms at a coefficient of variation of five to seven); since A-31 (2026-09-25) it is only the prior of each shard's and each client's online estimate, refined from the confirmed wakes they pay (§4.3 and §4.7 status), and the long-step count attributes each long poll to its task or to the host rather than reading wall time. Record: `docs/bugs/2026-09-22-wake-probe-mixes-two-events-and-reports-an-unconverged-tail.md`.
+
+> **Status (2026-11-07, a starved wake probe measures; a stuck one refuses).** Past its wall (`PROBE_WALL_BUDGET`, 250 ms) the probe runs on while each round's waiter runs at all, rounds doubling from one window to `PROBE_WALL_BUDGET · 2^(WAKE_ROUNDS − 1)` (4 s), and refuses `MeasurementTimeout` after a round whose waiter was never scheduled. That is the watchdog's rule (A-228) and the anchor's start judgment applied to the probe: slow progress is starvation, no progress is stuck. The extension past the wall is bounded by 31 windows (7.75 s). Under 144 nice-19 spinners on 18 CPUs a wake took 68-174 ms at the median, the floor needed over a second, and the 250 ms wall refused the quick profile, and the anchor's boot with it, 19 times in 20. Record: `docs/bugs/2026-11-07-a-busy-machine-refused-the-anchors-boot-at-the-wake-probe.md`.
 
 **Derived constants.** Spin window = wake_ns.mean (Karlin: the 2-competitive threshold is the
 expected cost of parking, and the wake's heavy tail is part of that cost, not noise); the cooperative
@@ -2577,7 +2590,7 @@ unavailable or disabled).** One TCP loopback listener held by the anchor, and si
 so a daemon restart is a slow reply to the kernel client, never a dropped connection (Linux owed); ONC RPC record
 marking; NFSv3 + MOUNT + a minimal portmap responder; the root mount at an existing user-owned mount point
 (or an already established RAM-backed target)
-with `nfsv3,tcp,port,mountport,soft,intr,locallocks,nosuid,rdirplus` and attribute-cache
+with `nfsv3,tcp,port,mountport,hard,intr,locallocks,nosuid,rdirplus` (hard since A-229) and attribute-cache
 timeouts derived from the measured loopback GETATTR RTT; file handles encode
 `(volume, inode no, gen)`; invalidation by directory attribute change after snapshot swaps
 (EdenFS's no-op chmod) and by short timeouts; inode GC because NFS never says "forget"; the
@@ -4153,8 +4166,8 @@ physical volume's device identity or cross-volume rename is not promised.
 **Failure matrix.** Daemon crash: Linux requests wait on the device the anchor holds until the restarted
 daemon takes it back and asks the kernel to resend what the dead one read (A-61; Degraded, seconds); macOS FSKit: the extension's forwarding calls fail typed until
 the daemon is back, and the extension survives because it is a separate process (Degraded; the
-spike measures whether open files recover or must be reopened); macOS NFS fallback: hard-mount
-hang or soft-mount `EIO` until the restarted server answers the retried RPCs (Degraded); Windows:
+spike measures whether open files recover or must be reopened); macOS NFS fallback: the hard mount
+waits until the restarted server answers the retried RPCs, a signal ending the wait `EINTR` (Degraded; A-229); Windows:
 the volume disappears and reappears (Degraded, open handles error). Extension crash on macOS:
 FSKit unmounts the volume; the daemon's state is intact; the anchor re-mounts (Degraded).
 Unprivileged user namespaces disabled: Refused for the launcher form with the exact remedy. That includes
@@ -4683,6 +4696,17 @@ hard links and snapshot versions. No live kernel endpoint state is part of the i
 
 > **Status (2026-09-17, a bounded discovery exchange).** A survivor refreshing discovery over a peer's record session when that peer's process disappeared awaited the reply for good — a datagram socket reports no terminal error for a peer whose keys are gone — and the link task that alone notices the replacement identity and re-dials never returned to its loop: the leader made 271 replication attempts toward a replacement voter with no session and sent no append, so the replacement kept the pre-transition voter set (`docs/bugs/2026-09-16-discovery-await-strands-a-replacement-raft-voter.md`). Every discovery exchange is now bounded by one deadline armed once at the measured control-plane round budget's full span (`consensus_budget(slowest_path_tail_ns()).max_deadline_ns()` — the bound every other record-plane exchange runs under) and by the link's validity, re-checked whenever the exchange is woken: the anchor's learned member still the one addressed and the peer still in direct contact; a replacement learned on contact or a death folded wakes the exchange at once (`wake_link_waiter`, one waiter per anchor, bounded by the roster), and the timer bounds it even when no such notification comes (a warm restart with new keys). Every outcome is typed and counted (`fleet.discovery.deadline` / `.invalidated` / `.transport`; the protocol's own refusals as before); any but an answer abandons the exchange and releases the endpoint so the link re-dials on its cadence, an incarnation change also drops a dial still in its handshake and restarts the sweep, and a late page never re-creates a removed entry. A borrowed record session returns only to the slot it left, tagged with its own connection id (`RecordLink`): a late return — a retired peer's, a slot re-established since, another session — is dropped and counted (`fleet.link.stale_return`), never installed over a newer session. Raft's admission is unchanged: the replacement imports its prefix once and receives the rest through ordinary appends. Regression: the whole-RAM history forces the interrupted phase (the victim holds its discovery replies after their requests arrive, `Daemon::inject_discovery_fault`, so each survivor's link to it is shown borrowed by a pending exchange when it is stopped and replaced) and requires the exchanges to end typed, a link to the fresh member on each survivor, and the replacement's council contact climbing, before the voter set converges and the second loss.
 
+> **Status (2026-11-06, a daemon restarted under the same member id rejoins).** An anchor's warm restart keeps the member
+> id, which the other members hold dead at its old incarnation. Its restarted probe-plane epochs are taken as a new
+> sequence on the pair's acceptor (an authenticated canonical dialer announces each connection's epoch above the last, so
+> only a restart sends one that is not newer; `member_task::accept_announcement`, `fleet.plane.epoch_restarted`), and a
+> member held dead that announces itself over an authenticated session keeps its contact
+> (`DirectContact::Returned`), so the pair is keyed and its probes, answered with the death, refute it. 0 of 6 anchored
+> rejoins re-formed under load before, 5 of 6 after. A member that announces itself on a new session has its stale dialed
+> session dropped by the pair's canonical dialer, which dials afresh and keys the pair, so a restart quicker than the
+> others' suspicion rejoins too (`fleet.plane.peer_reconnected`; 6 of 6 under load; bug record
+> `docs/bugs/2026-11-06-a-daemon-restarted-under-its-anchor-never-rejoined-its-fleet.md`).
+
 > **Status (2026-09-18, the indirect-probe stage is live; AUD-15).** "Direct probe → k indirect proxies → SUSPECT" existed only in the pure detector (`Detector::request_indirect`); the daemon sent a direct probe and folded its acknowledgement or timeout, so a node that could not reach a peer directly while another could suspected and retired it without a relay. The daemon runs one detector per peer and each probe task owns its peer's session, so the stage is composed as a hand-off between probe tasks over bounded queues on the control shard (`ShardState::indirect`): a timed-out direct probe posts a ping-request for each of up to `k` relays — the alive peers this node holds a formed probe session to, ranked nearest the target in Vivaldi coordinate space from the coordinates their acknowledgements announced, `k` the bit-length of `n+1` (the gossip budget's size term, `indirect_fanout`) — and wakes the relays' probe tasks to send them (`carry_indirect_traffic`, under the probe deadline law); the relay's serve side accepts a request only from the member its session's anchor announces and only for a target it keeps direct contact with, posts the ask and wakes the target's probe task to probe now; the target's acknowledgement answers every ask, and the requester's probe task carries the answer back as a new wire message, `IndirectAck` (the requester's probe nonce echoed, the relay's boot_nonce announced, validated like any acknowledgement), which the requester credits **before** the tick that would resolve the unanswered probe (`Detector::on_indirect_ack`) — a lost direct packet no longer suspects a live peer; an answer older than the suspicion window is dropped. Probe tasks park on `sleep_or_wake`, cut short when traffic is posted for them, so the whole stage completes within a round trip of the miss. Every queue holds one entry per (member, member) pair keyed by authenticated ids this node keeps contact with — bounded by the neighbourhood squared, a request naming any other member refused and counted — and a retired peer's queues drop with its session. Counted: `fleet.probe.indirect.requested/.relayed/.acked/.refused/.undelivered`. Regression (`an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losing_both_paths_retires_it`): B deaf to A's direct probes only — B kept across a 100-period hold with a relayed answer credited on A and relayed on C, then both paths lost and B retired; the negative control with relays disabled fails with `acked=0` (`docs/bugs/2026-09-18-swim-indirect-probes-not-wired.md`).
 
 > **Status (2026-10-07, a relay answers every asker).** The member plane (`crates/cluster/src/member_plane.rs`, the
@@ -5018,6 +5042,16 @@ reconnaissance because the touched partitions are named up front).
 > committed in the first round after losing a voter instead of after 21. The safety explorer now explores
 > membership changes, including a removed leader stepping down (§4.2.2), with no violation at full scale.
 > The groups' `voters()` is the voter set; `replication_targets()` is what the drive replicates to.
+>
+> **A council widens only by steps that raise what it tolerates (2026-11-05).** `n` voters tolerate `⌊(n − 1) / 2⌋`
+> failures, so a step that only adds voters, and leaves a member unseated, is taken only when that number rises: to an
+> odd count, dropping its highest added id, or not at all (`config_group::widening`, applied to the full target and to
+> the partial promotion of the members caught up). A step that seats every member is taken as proposed (a two-member
+> region keeps two copies of its log for quorum-loss recovery), and so is one that removes a voter. A member whose
+> staging stalls is passed over for a free seat, so another alive member is staged in its place. Before, a council formed by its first node went
+> to two voters whenever its third member caught up late, and two voters can lose neither: an owner killed then was
+> never taken over (bug record `docs/bugs/2026-11-05-a-forming-fleet-lost-its-takeovers.md`). The root group is
+> unchanged; its voters are region representatives.
 
 > **Priority elections (2026-09-28; `docs/wip/research/consensus-enhancements.md`, slice 7).** A voter's
 > election priority is its measured quorum round trip: the `⌊n/2⌋`-th smallest smoothed round trip to the
@@ -5111,6 +5145,10 @@ reconnaissance because the touched partitions are named up front).
 > does not close the broader AC-8.18 state-transfer obligation. Cross-region forwarding's independent
 > all-alive-members owner guess is corrected by the owner-location exchange below. Record:
 > `docs/bugs/2026-09-17-takeover-ranks-an-empty-replacement.md`.
+>
+> **A live log's holders (2026-11-06, A-240).** A live-shipped volume's log has no held record per holder to retain
+> a candidate set, so its shipper records its holders in the volume's catalog before it ships. Phase one counts
+> `f + 1` among those holders alone, never among a placement rebuilt after a member joined.
 
 **Promotion and takeover.** When SWIM declares a host dead, or an operator moves it, the regional
 group bumps the host's epoch and assigns each of its objects to the surviving candidate holder
@@ -5702,6 +5740,14 @@ provisioning is therefore safe to retry after any failure.
 > awaited therefore meets `AcknowledgementOwed` at the `2 × slots` bound, as backpressure until that request answers
 > (`slates_client` `ack_watermark`; `an_acknowledgement_never_covers_a_request_still_awaited`;
 > `docs/bugs/2026-11-06-an-acknowledgement-covered-requests-still-awaited.md`).
+>
+> The same day it was extended to the refusals retryable under the same id. A forwarded submit whose acceptance
+> outlived the owner's budget is answered `Overloaded`: the verb ran, and its completion is recorded at the commit.
+> The next acknowledgement covered it, so its resend was refused `DuplicateRequest` (447 in fixtures' `f = 1`
+> 1,000-client rung). An async caller's `Overloaded` or `OwnerUnreachable` id now holds the watermark below it until
+> it is resent or released (`release_retryable`), within the reconnect budget, so a caller that never resends cannot
+> pin it (`a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id`;
+> `docs/bugs/2026-11-06-a-resend-under-its-id-was-already-acknowledged.md`).
 
 > **Status (2026-11-05, A-216: an acknowledgement is answered once its own shard has released).** An `Acknowledge
 > { up_to }` releases the client's records at or below `up_to` on every partition that may hold them. Its reply now
@@ -5814,6 +5860,13 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > unauthorized before checking its fence, so that owner never learned it was fenced and shipped on. The fence is now
 > checked first.
 >
+> **Holders follow the candidates (2026-11-07, A-200's amendment of that date).** The shipper's holder set changes by a
+> joint transition (`Shipper::begin_transition`, `transferred`, `activate`); the daemon begins one whenever the
+> configuration names other candidates for the volume (`fleet.live.holders_transition`) and switches once the new set
+> holds every durable write (`fleet.live.holders_activated`). The model runs the same nemesis over `4f + 1` hosts with
+> the configuration naming random candidate sets: 0 of 400 seeds broken, 3,622 activations, 599 of them keeping fewer
+> than `f` of the old holders.
+>
 > **On the transport (2026-11-04).** `crates/cluster/src/live.rs`: `ship` sends an entry or install to each holder
 > over its warm session (kinds 22 and 23) and folds the replies until the write is durable, through the
 > wake-on-reply collector; `serve_entry` and `serve_install` are the holder's answer. Measured over real loopback
@@ -5903,7 +5956,9 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   same way; `Shipper` now remembers holders owed an install, the model passes again (f=1: 309 installs, f=2: 455).
 >   And an install at a checkpoint a holder already holds is refreshed by a new whole record, which may go one entry
 >   past the credit (`Shipper::append_checkpoint`): with both candidates behind, waiting for credit no laggard could
->   free deadlocked the stall flow.
+>   free deadlocked the stall flow. (Since 2026-11-07 the refresh is an image beside the log while the log itself is
+>   whole; the whole record past the credit remains for a log that lost a change, as with both candidates behind. See
+>   "An install image beside the log" below.)
 > - *Clients cut off mid-write*: ten writers SIGKILLed right after starting, between finished writes: the log whole on
 >   every candidate, every deferred reply resolved (awaited 10, resolved 10).
 > - *A live volume destroyed*: its candidates let their copy of its log go once the tombstone reaches them
@@ -5990,6 +6045,21 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > good), and a remote candidate's empty report raised no fence, which the nemesis model shows breaks StaleNeverCommits
 > (10 seeds; bug record `docs/bugs/2026-11-05-a-live-takeover-counted-no-empty-report-and-fenced-no-empty-copy.md`).
 >
+> **A live log is durable only once every candidate could open it (2026-11-05, A-92 piece 4c).** A successor opens the
+> log through its own copy of the lineage key in the last whole entry, so a write is answered only once that entry
+> carries a key for every remote candidate in the neighbourhood and is itself durable (`live_ship::answerable`); a log
+> whose whole entry lacks one is checkpointed again once the owner's shard has delivered the missing pair. A sealed head
+> waits for the same coverage (`fleet::sealing_covers`). Before, a volume made while a candidate was stopped kept a whole
+> entry with no key for it, and that candidate, the successor, never served the volume. A takeover also acts on a
+> holder's `ConfigurationStale` now (pages and the adopted record), so a learner successor one version behind fetches
+> the configuration rather than asking under it for good (same bug record).
+>
+> **Phase one counts among the recorded holders (2026-11-06, A-240).** "Every candidate's report counts" above now
+> holds only for a candidate the shipper recorded as a holder. A member placed after the writes still reports and is
+> fenced, but does not count toward `f + 1`. Each shipper records its epoch and holders in the volume's catalog and
+> ships nothing until that catalog is placed. Phase one waits for `f + 1` of those holders and never falls back to the
+> current placement.
+>
 > **A checkpoint ships a live volume's changes, not the volume (2026-11-05).** A live log's whole record copies every
 > byte of the volume; it is owed only when a delta would not apply to what the candidates hold (the log's first record,
 > a holder behind the retained tail, a publication that could not be shipped). A shard's local checkpoint is none of
@@ -6008,6 +6078,73 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > (`LiveVolume::kept`) and ships whole once that reaches the volume's size (`kept_reaches_size`): the entry that crosses
 > it still fits, since no publication is larger than the volume. After: 768 writes answered, 4 whole records, no
 > refusal for the bound.
+>
+> **One lane a holder, only to holders of the catalog, and no session left with a cancelled request (2026-11-07).**
+> The dispatch round (`live_ship::dispatch`, `send_from_control`) now ships the way the record plane's sessions allow.
+> - *One lane a holder, the holders at once.* A dispatch sent a write's messages to the holders one after another, and
+>   folded their answers only once every holder's exchange had ended, so with one candidate stopped every write it
+>   carried waited for that candidate's exchange to give up. Now each holder has one lane, a dispatch's lanes run
+>   together on the control shard, each lane's answers are folded on the owner as its exchange ends, and a holder whose
+>   lane is shipping is sent nothing new until the lane ends (`lane_ended`), then what it lacks: only that holder's, and
+>   only when it answered. Sending every holder's let two holders with no link (both stopped) end each other's lanes
+>   at the shards' speed, 565,202 unanswered sends in one stop (`both_candidates_stopped_draw_no_storm_of_sends`).
+> - *Only to holders of the catalog.* A candidate derives what it keeps of a live log from the volume's catalog, which
+>   the record plane places within a record period; an entry sent before was refused
+>   (`fleet.live.hold_refused.no_catalog`), and installs drawn by it held the candidate's one session against the record
+>   plane's re-ship of that catalog. The owner now ships to the candidates any placement of the catalog named
+>   (`catalogued_holders`), kept as a union so a candidate away during one round is not dropped for good, and builds
+>   nothing for a holder whose lane is busy (an install clones the whole volume).
+> - *No session left with a cancelled request.* An exchange's requests are children of the task that made it, and a
+>   task's end cancels its children: a request still in flight when its lane ended was dropped with the holder's
+>   session in it, and the slot stayed lent for good, so the owner never shipped that holder again. A lane now waits for
+>   its exchange's stragglers to report before it ends (`finish_stragglers`).
+> Held by two failing tests in `crates/cli/tests/live_fleet.rs`, run on four trees (CI, release, both Linux arches, 5
+> runs each, `diag-live-durability-21`):
+> | tree | `each_candidate_stopped_in_turn_holds_no_write_and_catches_up` | `a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog` |
+> |---|---|---|
+> | main | 0 of 10 (the first write after each stop 406–1,064 ms) | 1 of 10 |
+> | one lane a holder | 10 of 10 (2.8–99.5 ms) | 1 of 10 |
+> | and only to catalog holders | 10 of 10 | 10 of 10 |
+> | and the stragglers' wait | 10 of 10 | 10 of 10 |
+> And `both_candidates_stopped_draw_no_storm_of_sends`: main 10 of 10 (30–58 unanswered sends while both are stopped),
+> the lanes without the rule above 8 of 10 (565,202 and 555,320 in the two failures), the whole series 10 of 10 (17–42,
+> bound 66; `diag-live-durability-24`).
+> On KIND (raft-chaos, release, real pods), main stalled with both of the owner's sessions `lent=true` (run
+> 42318867890: `wan` at durable 123 of 126, `wan-loss` 199 of 202, `ceiling` 0 of 3). The lanes with the catalogued
+> holders alone acknowledged every write in every profile (run 42357764313: `wan` p99 979 ms, max 1.59 s), and so did
+> the lanes with the stragglers' wait (run 42326682216: `wan` p99 1.36 s). So KIND does not separate the stragglers'
+> wait's own effect. Its failing test is on the simulated fabric, where the mechanism is deterministic:
+> `a_lane_that_ends_with_a_holder_unanswered_gets_every_session_back` (`crates/cluster/tests/live.rs`) ships from a task
+> of its own with one holder silent, settles (`Stragglers::settle`, which the lane's `finish_stragglers` calls) and ends;
+> both sessions come back. With the settle removed, only the answering holder's does ([HostId(2)] against both). The first write's ~99 ms in some runs is a lane waiting one record period for its holder's session,
+> lent to the record plane (`ship_head`); open.
+>
+> **An install image beside the log (2026-11-07).** A holder that falls behind the retained tail is installed with the
+> owner's last whole state. If it already holds that state, a newer one is needed. Until now that set `owes_whole`, so
+> the next write's record carried the whole volume as an entry to every holder. The up-to-date candidate had to take it
+> before any later write was durable, and `durable_target` made every waiting write wait for that record.
+>
+> The trigger was common because the retained tail's byte bound was the last whole record's size, fixed while the
+> volume grew. In the chaos flows (CI, `diag-live-durability-14`, release, both Linux arches) every run made such
+> records:
+> - 20–45 MB each, each exchange 100–600 ms;
+> - the lanes they held turned later writes away for credit, which owed further whole records;
+> - writes of 1.2–1.9 s followed.
+>
+> Now the stale checkpoint sets `owes_image` instead (`LiveVolume::owes_image`), and the log is untouched:
+> - the next publication appends its change as usual, and the volume's whole state, which is that publication's
+>   state, becomes the install at the head just appended (`live_ship::refresh_image`);
+> - on the record period a volume with nothing unpublished makes it the same way, so an idle writer leaves no holder
+>   waiting;
+> - the retained tail's bound follows the image, so a laggard is sent entries while they cost less than installing the
+>   volume as it is now;
+> - nothing waits on `owes_image`; only the lagging holder is installed;
+> - a log that lost a change (`owes_whole`) still takes a whole record, and an image is never made then, since the
+>   volume's state is past its head.
+>
+> Held by `a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log` (one candidate stopped
+> for the middle third of 180 sequential stable writes: one whole record, at least one install, and the candidate caught
+> up).
 >
 > **Chaos from outside the processes (2026-11-06).** `crates/cli/tests/live_chaos.rs` streams writes through the Rust
 > client while it partitions or kills processes. It ends every flow with Agreement, NoLoss, StaleNeverCommits and
@@ -6698,7 +6835,10 @@ it uses content addressing. The RAM-only trust boundary and any allowed sharing 
 > - **Bound to the object.** Every offer, put and fetch names its object (`Fetch` gained it). The holder
 >   decides authority from the committed configuration and its own records before any lookup or allocation.
 >   - A placement needs the object's acting owner (its owner, or a departed owner's takeover successor) and
->     must land on that owner's candidates.
+>     must land on that owner's candidates. A live log's entry (A-200) also lands on a holder the volume's
+>     newest catalog record names among its live holders (A-240), though the holder's own configuration does
+>     not place it yet: phase one counts the recorded holders, and a holder whose view lagged refused every
+>     entry while the other was stopped (2026-11-07, `live_ship::live_admission`).
 >   - A read needs the acting owner, one of its candidates, or a holder of its recovery cohort.
 > - **Scoped answers.** Answers come only from what the holder holds for that object: another object's
 >   chunks count as missing, cannot be leaned on by a put, and are never fetched. A refused request draws the
@@ -6826,6 +6966,18 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > (`crates/cli/src/anchor.rs`, `Lateness`). The window is the existing liveness budget, still a fixed number (GAPS, R3
 > debt). Proven by `crates/server/tests/liveness.rs`: a starved control-shard poll, which gapped the beat 1.53 s on main,
 > keeps it under 0.26 s; a wedged or spinning non-control shard, which main never saw, stops it.
+
+> **Status (2026-11-07): a start is judged by its progress too.** Until its first beat the anchor judges a starting
+> daemon by the same rule, in the daemon's own CPU time read from the OS (`slates_machine::process_clock`;
+> `crates/cli/src/anchor.rs`): killed once it makes no CPU progress for a window or runs a window of CPU without beating,
+> waited for while it progresses. Before, a start not beaten within the fixed recovery budget, a wall second, was killed;
+> under 144 spinners on 18 CPUs the anchor killed 153 starts of 153 after each had used 16-18 ms of CPU
+> (`docs/bugs/2026-11-07-the-anchor-killed-every-start-a-busy-machine-starved.md`). On Linux the clock is the process's
+> CPU-time clock: `/proc/<pid>/schedstat`, read first, is the main thread's alone
+> (`docs/bugs/2026-11-07-the-linux-process-clock-read-the-main-thread-alone.md`). At the extremes, 0 progressing starts
+> were killed at 183-292 runnable processes, and a stuck start was killed at 1,001-1,294 ms on macOS, Linux and Windows.
+> A shard's recovery still runs as one poll, which the watchdog counts as spinning past a window of CPU: GAPS holds it
+> open.
 
 > **Telemetry oracle correction (2026-09-20, AC-0.11).** A drain request itself emits spans.
 > The daemon integration oracle now derives convergence from the reply quota minus the
@@ -7255,8 +7407,21 @@ stays in the overlay.
 > - **The source.** An unnamed landing lands an implicit snapshot of the head, taken when it begins.
 > - **One at a time.** One granted landing per volume runs at a time.
 > - **Large files.** A large file is copied one content window per unit, so no unit grows with a file.
+> - **The plan.** A landing's beginning, the diverged walk, the plan and a presentation's preliminary verdicts, runs a
+>   unit at a time like its writes: a presentation's reply is deferred to it, on an implicit snapshot of the head, and
+>   a granted landing plans inside its task with its lease kept alive. Until 2026-11-08 it was one poll
+>   (`docs/bugs/2026-11-08-a-landings-plan-held-its-shard.md`).
+> - **The fences' clock.** Every entry is fenced against its lease and grant on the landing's clock, which counts from
+>   the instant its request's clock was read: the plan, the sweep and the validation count. Until 2026-11-08 it
+>   counted from the first write, so a landing paused before it wrote past its term
+>   (`docs/bugs/2026-11-08-a-landings-fence-counted-its-time-from-its-first-write.md`).
 > - **The lease keepalive.** A running landing renews its target lease between slices once half its term
->   has passed.
+>   has passed, by taking it again as its own holder. Until 2026-11-07 the partition refused that take while the
+>   lease held, so a renewal only succeeded once the lease had lapsed. The entries a landing reached in between
+>   were skipped `LeaseEnded`, and it ended `partial`
+>   (`docs/bugs/2026-11-07-a-landings-lease-renewal-was-refused-while-it-held.md`). The longest a landing goes
+>   between two looks at its lease is measured (`LandingState::longest_lease_gap_ns`), the gap a term's margin is
+>   judged against.
 > - **Owed:** the shard-step percentile lane
 >   (`docs/bugs/2026-10-01-a-granted-landing-held-its-shard-for-all-of-its-work.md`).
 >
@@ -7490,6 +7655,30 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > identity is a set hash over the green's entries, brought up to date when read, so a record at `f > 0` costs what its
 > version changed. Since part 3 (2026-11-06) a clean rebase returns only what the work changed over the head.
 
+> **Status (2026-11-07, A-242: the history is copy-on-write, and an increment carries what it adds).**
+> - **The history.** The engine kept a whole copy of a file per version that changed it, and charged the whole
+>   previous file to each submit. A version now holds pieces of shared chunks (`crates/merge/src/history.rs`): the
+>   bytes it added and its piece list. That is the "Splice" below, done in the engine's history.
+> - **The increment.** Its post-state laid out each edited file's whole final content, zero-filled but for the runs,
+>   and the seal read each run at its op's base-coordinate offset. A run after an earlier length change in the same
+>   file therefore merged zeros into the green. The post-state now holds only the runs, each read from where the
+>   work's file holds it (`increment::compose_volume_planned`).
+> - Measured on CI: behind a held floor, 64 versions of 64-byte overwrites of a 1 MiB file under a 16 MiB budget,
+>   16 of 64 accepted before and 64 after. The corruption's test: the green's head was `cd\0\0`, now `cdXY`.
+>   (`docs/bugs/2026-11-07-a-greens-history-kept-a-copy-of-every-file-per-version.md`,
+>   `docs/bugs/2026-11-07-a-run-after-a-length-change-merged-zeros.md`.)
+
+> **Status (2026-11-06, A-238: a green's chain is checkpointed at its reachable floor).** The partition kept
+> every accepted increment for good, and the "fold into checkpoint deltas" below had no durable form.
+> - Now, after each accept, the owner checkpoints the chain at the floor. The floor is the oldest version a live work
+>   or pin names, kept below any merge record still waiting for placement. The owner checkpoints once the increments
+>   to fold reach the size of the checkpoint they replace (`Op::GreenCheckpointed`, `slates_merge::checkpoint`).
+> - Recovery restores the green from its origin and the checkpoint and replays only the increments after it.
+> - A base below the checkpoint is no reader's and is answered `UnknownBase`. It is not mapped through deltas that
+>   are gone, so "every base back to green's origin" now holds back to the checkpoint.
+> - Under a 256 KiB cap, a green whose work kept up took 200 versions where it was refused at 31.
+>   (`docs/bugs/2026-11-06-a-greens-chain-kept-every-version-it-ever-took.md`.)
+
 > **Status (2026-11-04, A-201: a green's head lands through a checkout).** `checkout GREEN VOLUME ATTACHMENT
 > --snapshot N` writes the green's head into the volume it was created from (the server's overlay of the directory
 > it lands into), checked to be that base and unchanged since, and `land` lands the volume under a grant; a green
@@ -7559,7 +7748,9 @@ that lie strictly after p by d; ranges that overlap an intervening effect range 
 the verdict; a rename in an intervening delta remaps the increment's paths beneath it. Maps
 compose: `map(a..c) = map(b..c) ∘ map(a..b)`. Deltas older than the derived retention fold into
 checkpoint deltas by the same composition, which is exact, so every base back to green's origin
-maps at O(log) checkpoint lookups plus the raw deltas after the last checkpoint.
+maps at O(log) checkpoint lookups plus the raw deltas after the last checkpoint. (Since A-238 the durable
+checkpoint is the green's state at its reachable floor, and a base below it is refused `UnknownBase`: no live reader
+names one.)
 
 **The verdict, two pure passes.** Inputs: the mapped increment, the effect ranges of the
 intervening deltas, and the referenced immutable content. Pass one: a sweep line over the
@@ -8296,8 +8487,8 @@ form; the conformance and workload suites on both platforms.
   volume to unmount and re-mount with state intact.
 - T-4.4 (edge, macOS NFS) Delete a file another process holds open; expect the `.nfs` temporary
   file behaviour documented and cleaned on close.
-- T-4.5 (fault, macOS NFS) Kill the daemon during a read on a soft mount; expect `EIO` after the
-  derived `retrans`; on a hard mount expect the read to complete after restart.
+- T-4.5 (fault, macOS NFS) Kill the daemon during a read on the mount (hard since A-229); expect the read to
+  complete after the anchor's restart, and a signal to end the wait with `EINTR`.
 - T-4.6 (edge, Windows) Case-insensitive lookup on a case-fold volume; expect one entry and
   `EEXIST` on a folded duplicate.
 - T-4.7 (fault, Windows) Kill the daemon with open handles; expect the volume to disappear, the
@@ -11433,6 +11624,15 @@ keyed first by member id, a candidate's restart would have made a new pair each 
 bound (found by the test's first run, which looked the pair up by anchor). Proven by
 `an_owner_shards_pair_key_reaches_its_candidate_under_its_recipient` (a key wrapped under the owner shard's pair key
 unwraps to the same bytes under the candidate's); the fleet suite (70) passes with delivery running every period.
+Amended (2026-11-07, live-fixes): a node back at its anchor with fresh RAM. Named by anchor alone, a pair was refused
+when that anchor's node came back with fresh RAM and a new key (789 of 793 deliveries refused, CI
+diag-raft-chaos-three-25), and an owner shard that had delivered to the anchor never delivered to the new incarnation.
+Now a receiver takes another key from a recorded anchor and shard as the newer incarnation's
+(`seal_keys::accept_pair`): the old key becomes `SealKeyOwner::PairRetired`, named by its id, while a head or live log
+this node holds is still sealed under it, and is erased once nothing held names it (the count is bounded by the held
+records). A successor picks the pair key a head's entry names (`Wrapped.parent`). An owner shard records the member id
+it delivered to and delivers again to a new one. Proven by
+`a_node_replaced_with_fresh_ram_at_its_anchor_exchanges_pair_keys_with_its_survivors`, red on each half alone.
 Built (2026-10-05): piece 4c, the lineage key in the head. A volume's lineage key is made when its first seal starts
 (off the hot path). A head that names content carries `HeadSealing`: the owner's anchor and partition, the lineage
 key's id, and the lineage key wrapped under each pair key the owner shard has delivered (61 bytes a neighbour, in
@@ -13590,6 +13790,13 @@ name unlinked; `completion.rs`: the bridge's mappings by duplicate), `crates/mem
   another machine could push to a green but never write a volume. Found by the fs-server lab of 2026-11-04; red test
   `a_client_node_attaches_a_server_volume_for_writing_and_writes_through_it` (`crates/cli/tests/fs_server.rs`,
   refused `NotFound` for 40 s on main bbfdbddb).
+- **Status (2026-11-06): every shard knows a taken-over volume's owner.** The early refusal of a foreign form runs on
+  the shard serving the client and reads that shard's routing, while a takeover recorded the new owner on the control
+  shard alone, so a successor refused its own volume's mount `OwnedByAnotherHost` from its other shard (5 of 9 runs
+  under load on macOS CI, `attach.foreign_refused.owner_unknown`). An adoption's owner is now sent to every shard
+  (`takeover::track_owner_on_every_shard`), and the fleet-deploy test asserts both answers: the successor mounts, the
+  other survivor refuses by kind (10 of 10 under load; bug record
+  `docs/bugs/2026-11-06-a-successor-refused-its-own-volumes-mount-on-a-shard-that-never-learned-the-takeover.md`).
 - **Decided.**
   1. `Attach` in the record form (`AttachRequest::Root`) is forwarded to the volume's owner as a volume-scoped write
      is (`RequestBody::forwards_as_write`), under a completion record keyed by the origin's request id. Every other
@@ -13609,7 +13816,13 @@ name unlinked; `completion.rs`: the bridge's mappings by duplicate), `crates/mem
      client's ring slots, `remote_attach::bound`; past it `RemoteAttachmentsFull`), and its reap of a dead client
      sends each owner `RemoteReap { volume, client }`, which ends that host's client's attachments there (the host
      again the authenticated peer's, so a node reaps only its own clients). A host that leaves the configuration has
-     every remote attachment it held ended at each install that no longer lists it (`remote_attach::end_departed`).
+     every remote attachment it held ended: each liveness budget the control shard maps the configuration's members
+     to their certificate anchors (the id a forward authenticates, which `Remote` records; a member id is fresh per
+     incarnation), names each anchor among them at the last look and absent now, and has every shard end that
+     anchor's attachments (`remote_attach::sweep_departed`), owed again until every shard answered. **Corrected
+     2026-11-07:** the first form ended them at two of the nine paths that install a configuration, compared member
+     ids with anchors, and ended a not-yet-configured host's attachment mid-formation; main CI 42335884062 held a
+     retired host's attachment for 40 s (`docs/bugs/2026-11-07-a-retired-hosts-remote-attachment-was-never-ended.md`).
   6. **The bound on a silent holder is its write lease's term**, `failover_slo_ns` (derived in `take_write_lease`; 10
      s by default): a reap, like a local one, ends the record and leaves the lease to its term (D-16 "Lease holder
      crash: writes refused until the lease expires"); the owner's lease sweep releases it within one liveness budget
@@ -14287,7 +14500,8 @@ than the owner's retained tail is caught up by a checkpoint, never by an unbound
 phase one every answering holder raises its fence to the new epoch and reports, per live-shipped volume, the epoch of
 its last entry, its position and that entry's identity. The successor adopts the report with the greatest
 (last epoch, position), which is Raft's up-to-date rule (Ongaro, thesis §3.6.1). A durable entry is held by `f + 1`
-candidates and phase one's answers come from `f + 1` candidates, so the two sets meet in at least one live holder of
+candidates and phase one's answers come from `f + 1` of the holders the shipper recorded before it shipped (A-240), so
+the two sets meet in at least one live holder of
 it whenever at most `f` candidates are lost (the owner among them); a holder whose last entry is under a later epoch received a log its owner adopted the same way. The successor
 serves from the adopted replica, which loses no acknowledged write (AC-8.3), and re-ships from there under its own
 epoch: a holder holding an entry the old owner never made durable fails the chain and takes a checkpoint.
@@ -14335,6 +14549,136 @@ Then the real transport, measured; then the daemon and real processes under chao
 
 **Applied in the same change to:** this log only. §4.10's "Live shipping" paragraph, AC-8.3 and AC-8.9 are read
 through it; their status notes follow each built slice.
+
+**Amended 2026-11-07 (live-fixes): a log's holders follow its candidates by a joint transition.** A shipper kept the
+holders its configuration named at its first publication. A volume made on a fleet's bootstrap node therefore shipped
+to nobody for good (its configuration named only itself), and a neighbourhood change or a takeover left a log shipping
+to hosts that were no longer its candidates. Replacing the holders outright is unsafe: a new set that shares fewer than
+`f` members with the old holds none of the durable writes, so a takeover counting it adopts a head without them. The
+holder set now changes as Vertical Paxos changes a configuration (Lamport, Malkhi and Zhou, PODC 2009):
+
+- `Shipper::begin_transition(next)` ships to the holders and to `next`, and counts a position durable only once `f` of
+  each set hold it, so whichever set the record names when a takeover reads it, `f + 1` of its reports meet every
+  durable write.
+- `Shipper::transferred` holds once `f` of `next` hold the durable position and the head the shipper started from (a
+  successor's start holds writes made durable under the owner it took over, which its own count has not seen).
+- The record may name `next` only then, and `Shipper::activate(recorded)` switches once it does. A transferred target is
+  kept against a later change until activated, since its record may be in flight.
+- A successor's holders are the set its takeover counted, less itself, with the lost owner; it moves to its
+  configuration's candidates by a transition of its own.
+- Over a holder set of `n`, a write is durable once `W = max(n − f, f)` of them hold it (never on fewer than `f`): every
+  `f + 1` reports meet it (`W + f + 1 > n`) and the owner and `W` holders survive `f` failures. The `f`-th highest
+  holder, right for `2f`, counted one of three when the owner fell outside its own placement (raft-chaos, CI); `n − f`
+  alone counted the owner and one holder at `f = 2` with three (raft's review).
+- A holder set of `f` or fewer members is never moved to (`Shipper::begin_transition` refuses it): no takeover counts
+  `f + 1` reports from it, and a candidate found dead leaving one other at `f = 1` moved the log onto that one, so
+  writes stalled for a partition's length when it stopped before the move back was recorded (live-durability's rolling
+  partition flow, 4 of 6 runs on each arch at 8b0f0341). The current holders keep making `W` with those still alive.
+
+The record is A-240's (raft-chaos: the shipper records its holders in the volume's catalog and phase one counts them).
+`live_ship::follow_candidates` commits the target as the holder set once `target_recordable` holds (transferred, and the
+last whole entry covers every candidate and is durable) and activates it once that catalog version is placed at `f + 1`;
+the successor's counted set and the record's model cases are raft-chaos's, on top. Model:
+`crates/db/tests/live.rs` with `Following` (400 seeds, 0 broken under the rule; the record-at-once and fixed-holder
+mutations broken). Bug record `docs/bugs/2026-11-07-a-live-shipper-made-before-its-candidates-were-known-shipped-to-nobody.md`.
+**Applied in the same change to:** `crates/db/src/live.rs`, `crates/server/src/live_ship.rs`, §4.10's live-shipping
+status, GAPS.
+
+### A-240 — A live log's phase one counts its quorum among the holders its shipper recorded before it shipped (accepted and built 2026-11-06; the supervisor's option (C))
+
+- **Why.** A-200's phase one took any `f + 1` reports. Its argument needs them to come from the hosts that hold the
+  durable entries, and nothing recorded which those were: the takeover counted the current placement. A member placed
+  after the writes holds none of the log. Counted in place of a holder that could not answer, it let a stale head be
+  adopted. The model found 10 broken seeds of 400 (StaleNeverCommits). On KIND a holder kept fence 1 after a takeover
+  at epoch 2 (runs 42326682216 and 42331191530). Bug record:
+  `docs/bugs/2026-11-06-a-live-takeover-counted-members-that-never-held-the-log.md`.
+- **The rule.**
+  - Each shipper, a successor's too, records its epoch and holder set in the volume's catalog register before its
+    first entry (`Op::LiveHoldersCommitted`, `PolicyRecord::live_holders`). It ships nothing until that catalog version
+    is placed at `f + 1`, as a head's catalog is. At `f = 0` the owner's commit places it, with the same code (R8).
+  - A new shipper's first set is the one the volume's catalog records, less this node, when it records one. For a
+    successor that is the set its takeover counted (the dead owner's record); for an owner restarted at its epoch, its
+    own. Only a volume with no record starts from the configuration's candidates. Re-recording that set under the new
+    epoch names hosts that already hold the log.
+  - **The set changes by a joint transition, recorded only after the transfer (Vertical Paxos activation, amended
+    2026-11-07).** When the configuration names H′ ≠ H, the shipper ships to H ∪ H′ and counts a write durable only
+    once `f` of each hold it (`Shipper::begin_transition`; live-fixes). H′ is recorded only once it holds every durable
+    entry and the last whole entry, itself durable, carries a key for every candidate (`live_ship::target_recordable`).
+    The shipper drops H once that record is placed (`Shipper::activate`). Recording H′ first, as A-240 first said, let
+    a successor that died before its install was durable leave the next phase one counting a set that held none of the
+    log. The model breaks NoLoss with the record made at once (`recording_a_new_holder_set_before_it_holds_the_log_…`).
+  - A write is answered only once the set its durability counts is recorded at `f + 1`, and a successor could open the
+    log at it (`live_ship::answerable`: the last whole entry carries a key for every candidate and is itself durable).
+    A write is durable once `max(n − f, f)` of each set's `n` holders hold it, so `f + 1` reports from the set always
+    meet it and `f` failures never lose it: `f` alone was right only for a set of `2f`, and a set of `2f + 1` (the
+    placement moved off the owner) left a holder unfenced (CI diag-20 run 7).
+  - **The invariant** (raft's review, 2026-11-07): every write ever answered was answered while the recorded holder
+    set held it, so the recorded set always holds everything answered, and phase one may count only it. It rests on
+    these conditions, each held by the code:
+    1. The joint count stays in force until the record of H′ is placed, not just until the transfer check passes: a
+       write answered between the check and the placement must be durable on both sets (`Shipper::activate` runs only
+       on a placed record).
+    2. H is dropped only once H′'s record is placed at `f + 1`; phase one reads the catalog at quorum (the register
+       takeover's adopted catalog), so it meets a placed record and never acts on a dropped H.
+    3. Phase one fences every reporter and counts only the recorded set.
+    4. "Durable on a set" counts its members other than the owner, at `W = max(n − f, f)` of `n`, and never while
+       `n < f` (the write waits, counted). `W ≥ f` keeps `f + 1` copies with the owner, so any `f` failures leave one;
+       `W + f + 1 > n` meets phase one. Plain `n − f` is short at `f ≥ 2` for `f < n < 2f` (`f = 2, n = 3` gives one
+       holder), which `f = 1` cannot show (raft's review, 2026-11-07; the count is live-fixes').
+    5. One transition at a time: once a target is transferred its record may be in flight, and a further change waits
+       for the activation (`Shipper::begin_transition`); before that, the newest target replaces the pending one.
+    6. A takeover is the same steps from the counted set (H_old → H′): the successor answers nothing until its own
+       record is placed, and in that window the record still names H_old.
+    Kept red in the model: recording H′ before the transfer (`recording_a_new_holder_set_before_it_holds_the_log_…`);
+    dropping H before the record names H′ (`dropping_the_old_holders_before_the_record_names_the_new_loses_durable_…`,
+    a history test: as a nemesis variant it broke 0 of 400, since a successor adopts the newest report it can reach);
+    and `W = n − f` short of `f` at `f = 2`, three holders (a unit case). Durability on the intersection of H and H′
+    broke 0 of 400 seeds; it is not used, and is safe only where the sets are of `2f` (`f` of the intersection lie in a
+    set every `f + 1` of its `2f` reports meet), not at `2f + 1`. The model aims every owner takeover inside a
+    transition window (short, transferred but unrecorded, record lagging), half with a host cut off (live-fixes,
+    d263229f).
+  - Phase one counts `f + 1` reports only among the holders the adopted catalog records. Every member asked still
+    reports, and the greatest head among all reports is adopted.
+  - When too few recorded holders answer, phase one waits (`fleet.live.takeover_waits_quorum`). It never falls back to
+    the current placement.
+  - A catalog that records no holders belongs to a shipper that never shipped: there is no log, and the volume is
+    served from its placed seal.
+  - A successor keeps the recorded holders in its own record until its shipper records its own, so a catalog it ships
+    meanwhile still names the hosts that hold the log.
+  - Phase one asks for heads only (`slates_db::live::Report`): each holder raises its fence and reports its head and
+    the bytes it keeps, a few bytes each, within the liveness budget. Only the adopted holder's log is then fetched
+    (`live_ship::fetch_log`), under a budget its reported bytes derive (`bytes × smoothed RTT / congestion window`
+    plus the liveness budget). Asking every holder for its whole log in one exchange held to 1 s, no takeover
+    finished over KIND's shaped paths once A-240 needed a remote holder's answer (run 42357611870: `wan`, `wan-loss`
+    and `ceiling`, 621 waits for the quorum, the successor's sessions left lent).
+- **Rejected.**
+  - Asking the old placement alone: a takeover's placement retention (§4.8, 2026-09-17) covers registers, but a
+    shipper's holders are fixed when it starts, and only a record says which they were.
+  - Counting reachable candidates and trusting the fence: a fresh member's empty report is fenced too (2026-11-05), and
+    the model still broke 10 seeds when `f + 1` reachable candidates were counted.
+- **Cost.** A shipper's first entry waits one catalog round: the catalog's placement ships the entry at once
+  (`live_ship::catalog_placed`). Later entries pay nothing.
+- **Evidence.**
+  - The model: `phase_one_meets_the_logs_holders_when_a_fresh_member_has_joined` in `crates/db/tests/live.rs` adds a
+    fresh member before half the takeovers, at f = 1 and f = 2. 0 of 400 seeds broken, 218 members joined. The
+    mutation (counting the first `f + 1` reachable candidates) stays as a test and breaks 10 seeds.
+  - Processes: `a_member_that_never_held_the_log_never_stands_in_for_its_holder` in `crates/cli/tests/live_chaos.rs`,
+    on five nodes at f = 1, CI ubuntu-latest, release, 2026-11-07. The holder with the log is stopped for 3 s the moment
+    a survivor adopts the registers. With phase one counting the current placement (the mutation), 4 of 13 runs left a
+    holder at fence 1 below the takeover's epoch 2. With A-240, 0 of 13 did, and none lost a write.
+  - KIND (run 42365340676, live-durability 480a620a with A-240): every write acknowledged in all four profiles. Each
+    volume was taken over whole at epoch 2: unshaped after 2.5 s (1,000 writes), wan and wan-loss after 16.9 s (300
+    each), ceiling after 57.2 s (50). Before the two-step fetch, no takeover finished under the shaped profiles (run
+    42357611870). Before A-240, a holder was left at fence 1 (run 42341005472).
+- **Open.** The holder set is fixed for a shipper's life, and the placement is not. A survivor outside the log's
+  holders cannot open the log (`takeover_refused.open`, CI), and a recorded set must change only after the new set
+  holds the log (Vertical Paxos activation). The joint transition's Shipper side is built (A-200's amendment of 2026-11-07,
+  live-fixes); the record that names each target is raft-chaos's, on top of it.
+
+Applied in the same change to: §4.10 (A-200's takeover paragraph and status), §4.8 (the note on takeover placement
+retention), `crates/db/src/{live,catalog,op,partition}.rs`, `crates/server/src/{live_ship,fleet,catalog,verbs}.rs`, the
+`PolicyRecord` sites (`oci.rs`, `image.rs`, the db tests and bench), `crates/db/tests/live.rs`,
+`crates/cli/tests/live_chaos.rs`, GAPS, and the bug record.
 
 ### A-212 — What a live WinFsp receive reads and clears, and what a rename visits (2026-11-05)
 
@@ -14457,6 +14801,99 @@ green's base, the other half of the load test's first finding, is A-202's.
 - **Cost (measured on the branch it comes from):** every edit now appends to the partition log, so the partition's
   snapshots come at the rate edits arrive.
 
+### A-242 — A green's content history is copy-on-write, and an increment's post-state holds only the runs it adds (accepted and built 2026-11-07, W2 of the load test's walls)
+
+Applied in the same change to:
+- §4.16: its status.
+- GAPS: the load-test blockquote.
+- `crates/merge`:
+  - `history.rs` (new): `Chunks`, `Value`, `Value::spliced`, `Value::read`.
+  - `engine.rs`: `content_history`, the running totals and `history_bytes()`, `history_reservation` and
+    `edit_reservation`, `content_ref_at`/`files_at` as `Cow`, and the new `content_len_at`, `file_lens_at` and
+    `content_page_at`.
+  - `increment.rs`: `compose_volume_planned`, `PostStatePlan`, and the compact layout in `seal`/`push_content`.
+- `crates/server`:
+  - `verbs.rs`: `assemble_post_state` reads each run where the plan says.
+  - `work_files.rs`: `Cow`, `page`, `sizes`.
+  - `merge_service.rs` and `listing.rs`: paged reads and sizes.
+- The tests: `crates/server/tests/green_retention.rs`, `crates/server/tests/green_post_state.rs`, the history's
+  proptest oracle, and the increment oracle's post-state built independently of the plan. The engine's and the
+  daemon's amplification tests now assert the bound.
+- **What was there.**
+  - The history kept each version of a file as a whole copy, and admission charged the whole previous file per
+    submit: a one-byte overwrite of a large file retained the file.
+  - The post-state laid out each edited file's whole final content as a zero-filled region.
+  - The seal read each run at its op's base-coordinate offset, which merged zeros for a run after an earlier length
+    change in the same file. That has been so since 34548a59.
+- **The rule.**
+  - A history value is pieces over refcounted immutable chunks: no shared-ownership pointer, freed with the last
+    piece.
+  - A version is spliced from the one before by `apply`'s walk, sharing every kept run and copying only the added
+    bytes. It is checked against its bytes and stored whole when the check fails or its list would outweigh it.
+  - Retention is chunks and lists less the current values' bytes and lists: what the history holds beyond the
+    current files, as before.
+  - Admission charges an edit's overwritten, deleted and truncated bytes and the old list, or the old value when
+    stored whole, and a replaced path's old value.
+  - The head stays contiguous. A read below the head is borrowed when the file is unchanged since, copied out of the
+    pieces when not, and a page copies only the page.
+  - An increment's post-state is the runs its ops add, laid out compactly. The deriver plans each run's offset in the
+    work's file, and the seal reads it there.
+- **Measured.** The bug records and BENCHMARKS.
+- **Owed.**
+  - A rename copies its source's bytes into one chunk rather than sharing its pieces.
+  - A base-seeded green's origin is held as chunks beside the head copy (W4, reland-a207's).
+  - Greens merged before the fix may hold zeros a run after a length change put there.
+
+### A-238 — A green's durable chain is checkpointed at its reachable floor, and a base below the checkpoint is unknown (accepted and built 2026-11-06, W3 of the load test's walls)
+
+Applied in the same change to:
+- §4.16: its status and "Position mapping".
+- GAPS: the load-test blockquote, "Memory per client, attributed".
+- `crates/merge`: `checkpoint.rs`, `Green::checkpoint`, `Green::restore`, `Outcome::BaseUnavailable`,
+  `Rebased::BaseUnavailable`.
+- `crates/db`: `Op::GreenCheckpointed`, `GreenCheckpoint`, `PartitionSnapshot::green_checkpoints`,
+  `DbError::CheckpointOutOfRange`, `Partition::green_checkpoint` and `green_head`.
+- `crates/server`, in `merge_service.rs`: `checkpoint_floor`, `checkpoint_green`, `checkpoint_green_when`,
+  `settle_green_retention_leaving`, `inputs_of`, `green_version`, `GreenFence::CheckpointCorrupt`; in `error.rs`:
+  `refusal_of_db`.
+- `crates/ipc`: `Refusal::TableAtCapacity`.
+- `crates/server`, in `verbs.rs`: `replay_green`, `recovered_origin`, `submit`, `rebase`, the takeover's chain
+  adoption.
+- `crates/server`, in `daemon.rs`: `merge_chain_identities`, `partition_snapshot_bytes`.
+- The tests: `crates/merge/tests/checkpoint.rs`, `crates/db/tests/model.rs`,
+  `crates/server/tests/green_checkpoint.rs`, and the server's unit tests.
+- **What was there.** Every accepted increment stayed in the partition's `green_chains`, refused at the cap "until
+  checkpointing folds old chain entries (owed)". Each version cost its increment for good. Each snapshot re-encoded the
+  whole chain. Recovery replayed every version. A green whose readers all kept up was refused at the cap: version 31
+  under 256 KiB.
+- **The rule.**
+  - A checkpoint at `F` holds, for each key whose value at `F` was set after version 0, that version and value. It
+    also holds the identities of the increments accepted up to `F`.
+  - The partition holds it in place of the increments up to `F`. The owner takes one after an accept, at the
+    reachable floor kept below any merge record waiting for placement. It takes it only once the increments to fold
+    reach the size of the checkpoint they replace, so checkpointing costs at most the bytes appended.
+  - A version not past the held checkpoint, or past the head, is refused `CheckpointOutOfRange`. A checkpoint no
+    larger than what it releases is admitted at any fill.
+  - Recovery restores the green from the origin and the checkpoint, and fences one that does not decode
+    (`CheckpointCorrupt`).
+  - A submit or rebase based below `F` answers `UnknownBase`. No live reader names such a base, since `F` is never
+    above one.
+  - So does a read at a named version below the engine's fold: below the checkpoint after a restart, and below the
+    in-memory fold before it. It had been answered as the floor's state or `NotFound`.
+  - The settle before a submit folds until the submit's claim fits. Folding to the cap alone had refused version 34
+    `BudgetExceeded { available: 0 }`.
+  - A submit refused at the chain's cap checkpoints at the floor first, the doubling rule waived: the floor may have
+    risen since the last accept. What is still full is refused `TableAtCapacity { table }`, appended to `Refusal`;
+    it had reached the client as `BadRequest`.
+- **Measured** (the bug record):
+  - Under a 256 KiB cap, 200 of 200 versions are accepted, where the cap refused at version 31.
+  - Recovered at head 200, and version 201 is accepted.
+  - From version 40 to 200 the partition's snapshot grows at most 39,168 bytes, against 1,329,920 before.
+- **Owed.**
+  - At `f > 0` the holders' replicas and records grow per version, and a takeover adopts the whole chain.
+  - The 40 bytes a checkpoint keeps for each accepted identity.
+  - The checkpoint walk is not sliced.
+
 ### A-217 — A green's origin is a reference to the base snapshot it holds, not a copy of the tree in the partition (accepted 2026-11-05, the supervisor's decision (a))
 
 > **Status (2026-11-05): reverted from main with A-207's port (`f5396e3b`), then re-landed.** Checkout (A-201) had
@@ -14483,9 +14920,22 @@ Applied in the same change to: §4.16's status, A-9's "recorded durably" (now: r
   is placed.
 - **Measured** (BENCHMARKS): one client over the kernel's `fs/` (48 MB), interleaved best of three, peak RSS 549,520 KiB
   before and 225,776 KiB after; `CreateGreen` 415,498,814 ns before and 157,915,124 ns after.
-- **Owed.** A green taken over by another host still records its origin as bytes (the successor holds no base snapshot;
-  raft's fleet path). The engine still holds the origin twice (current content and history), and the overlay holds the
-  pinned copy.
+- **Created in slices (2026-11-07).** `CreateGreen { base }` checks at once, then defers its reply to a task of the
+  owner shard. The task walks the snapshot one listing or one file a unit (`merge_service::OriginWalk`), hashes the
+  origin's identity as its canonical bytes are written (`slates_merge::origin::IdentityCursor`, no buffer), and seeds
+  the engine a share at a time (`slates_merge::engine::OriginLoad`; `Green::with_origin` takes the origin by value).
+  Each unit runs through `image::sliced`, and the green's records commit with the request's completion as one atom. It
+  was one poll: the whole kernel for 48 to 69 s, and 1,000 files of 16 KiB for 134 ms on CI's x86_64 runner, with no
+  other verb on the shard answered (`crates/server/tests/green_fairness.rs`;
+  `docs/bugs/2026-11-07-creating-a-green-held-its-shard-for-the-whole-walk.md`). Peak RSS over `fs/` and the whole kernel
+  is in BENCHMARKS.
+- **Owed.**
+  - A green taken over by another host still records its origin as bytes (the successor holds no base snapshot; raft's
+    fleet path).
+  - The engine still holds the origin twice (current content and version 0's history value); loadtest-scale shares
+    them after W2.
+  - The overlay holds the pinned copy.
+  - Recovery walks a held origin in `init_shard` in one call.
 
 ### A-201 — A green's head lands through a checkout: written into the volume the green was created from, which lands under a grant like any volume (accepted and built 2026-11-04)
 
@@ -18279,3 +18729,22 @@ Applied in the same change to: D-9 (decision text and evidence tier), §4.3 (Dri
 - **What it does not change.** kqueue, IOCP and the simulation driver are untouched; the `Driver` seam, its paired-`#[cfg]` shape and every readiness contract are the same. The one Linux driver still carries `register_readable`/`register_writable` (the trait's doc had gone stale claiming the completion-native drivers refused them; corrected in the same pass).
 - **Evidence:** `BENCHMARKS.md` "io_uring against epoll on Linux" (2026-10-18, 32-core cachyos, interleaved, arms verified by descriptor; the box was loaded 13→29 so only the p50 rows carry signal, and a quiesced re-run is owed to tighten the parked figure — it does not change the direction). Verified after removal: the daemon holds `eventpoll=4, io_uring=0` for 4 shards; `slates-rt` suites green; the recovery oracle 41/41 on four consecutive runs where it had been failing a differing subset every other run.
 
+### A-229 — The macOS NFS mount is hard, so a writer waits under backpressure (accepted 2026-11-06, Ada's choice)
+Applied in the same change to: §4.6 (macOS fallback options, failure matrix), T-4.5, `crates/bridge-nfs/src/client.rs`
+(`MountArgs` clears `NFS_MFLAG_SOFT`), `crates/cli/src/mount.rs` and `crates/cli/examples/slates_mount.rs` (the
+`mount_nfs` options), `crates/cli/tests/live_fleet.rs`, GAPS.
+- **Changes §4.6:** the loopback NFS mount was `soft,intr`; it is `hard,intr`.
+- **Why:** A-200 says holders that do not answer make the writer wait: backpressure, never a false success. On a soft
+  mount macOS's own NFS client ends any call it has waited on for about a minute, whether the daemon holds the reply
+  or answers `NFS3ERR_JUKEBOX`, so no daemon design can keep a writer waiting there. Measured: with both candidates of a
+  live-shipped volume stopped, a size change through the mount failed `ETIMEDOUT` after 57.2 s (57.1 s in conformance's
+  run); hard, the same call waited through the stop and succeeded once the candidates resumed (90.6 s and 102.4 s, the
+  candidates resumed at 75 s; `a_writer_on_a_macos_mount_waits_for_stopped_candidates_rather_than_fail`).
+- **What keeps it escapable:** `intr` lets a signal end a waiting caller (`EINTR`), and a forced unmount ends a mount
+  whose daemon is gone. Since A-113 the anchor holds the listener and every accepted connection across a daemon restart,
+  so a restart is a slow reply, which a hard mount waits through where a soft one failed it.
+- **Cost:** a mount whose anchor is gone for good blocks the programs touching it until they are signalled or the mount
+  is force-unmounted. Tests unmount (forced if refused) before they stop any daemon (`MountPoint`, `KernelMount`).
+- **What it does not change:** Linux's mounts (FUSE; conformance's own NFS options), Windows, or the daemon's answers:
+  a stable reply still waits for durability up to the liveness budget and is then answered "try again", which the hard
+  mount retries.

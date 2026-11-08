@@ -1090,6 +1090,9 @@ pub struct GroupReport {
   pub voters: u64,
   /// Whether a joint change of the voter set is in flight (Raft §6).
   pub joint: bool,
+  /// The member ids of the voters in force (both sets while a joint change is in flight), ascending: which members a
+  /// loss costs the group a vote. Appended (2026-11-07).
+  pub voter_ids: Vec<u64>,
 }
 
 /// One shard's part of the daemon's status.
@@ -1241,6 +1244,17 @@ pub struct LiveReport {
   /// On a candidate, the fence its copy has promised: no message made under a lower epoch is served. On the owner, the
   /// epoch it ships under. Appended.
   pub fence: u64,
+  /// On the owner, the member ids of the holders its durability counts (during a transition, the set it is moving
+  /// from), ascending; empty on a candidate. Appended (2026-11-07).
+  pub holders: Vec<u64>,
+  /// On the owner, the member ids of the set a holder transition is moving to, ascending; empty when none is in
+  /// flight, and on a candidate. Appended (2026-11-07).
+  pub moving_to: Vec<u64>,
+  /// On the owner, the member ids of the holder set its volume's catalog records (A-240: what a takeover's phase one
+  /// counts), ascending; it can name a transition's target before the shipper activates it. On a candidate, the same
+  /// when the volume is served here (a successor before its first publication); otherwise empty, as when nothing is
+  /// recorded. Appended (2026-11-07).
+  pub recorded: Vec<u64>,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.
@@ -2948,6 +2962,15 @@ pub enum Refusal {
   /// completion records under that id belong to the client it was issued to, so nothing is served on this channel,
   /// which the daemon then ends. A client resumes only the session it was handed (`Session`, with its key). Appended.
   SessionUnproven,
+  /// A durable table of the partition the verb records into is at its derived capacity (§4.8; CLAUDE.md banned item
+  /// 8): `green_chains`, the merge byte budget a partition's green chains, origins, checkpoints and work logs share,
+  /// when what live readers still hold below their greens' checkpoints fills it. Nothing was recorded. Until 2026-11-06
+  /// (A-238) it reached the client as `BadRequest { reason: "<table> at capacity" }`, as if the request were
+  /// malformed. Appended.
+  TableAtCapacity {
+    /// The table.
+    table: String,
+  },
 }
 
 /// What a path refused [`Refusal::OwnMount`] was given as (A-227). Append-only.

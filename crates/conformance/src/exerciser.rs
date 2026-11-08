@@ -6,7 +6,7 @@
 //! without error and the daemon still answers", so its verdict is the exit status plus the count
 //! of operations its `-v` log shows completed, and the harness adds the daemon's liveness.
 
-use crate::record::detail;
+use crate::record::{DETAIL_CHARS, first_chars, last_chars};
 
 /// Format: fsx's success line (`fsx.c`, printed at the end of `main` when every op verified).
 pub const FSX_SUCCESS: &str = "All operations completed A-OK!";
@@ -23,11 +23,40 @@ pub struct ExerciserVerdict {
   pub detail: String,
 }
 
-/// The last lines of an output, joined and bounded.
+/// The last lines of an output, joined and bounded to [`DETAIL_CHARS`] from their end, where the exerciser printed
+/// last. Before 2026-11-07 the bound kept their first characters, so long lines lost the end.
 pub fn tail(output: &str) -> String {
-  let lines: Vec<&str> = output.lines().collect();
+  last_lines(output, DETAIL_CHARS)
+}
+
+/// The last [`TAIL_LINES`] lines of `text`, joined, bounded to `chars` from their end.
+fn last_lines(text: &str, chars: usize) -> String {
+  let lines: Vec<&str> = text.lines().collect();
   let start = lines.len().saturating_sub(TAIL_LINES);
-  detail(&lines.get(start..).unwrap_or_default().join("\n"))
+  last_chars(&lines.get(start..).unwrap_or_default().join("\n"), chars)
+}
+
+/// Format: the line fsx prints after its failure report and before replaying its operation log (`logdump` in FreeBSD's
+/// `fsx.c` at the pinned commit, and in Apple's, which the WinFsp port carries).
+const FSX_LOG_DUMP: &str = "LOG DUMP (";
+
+/// The detail of an fsx run: what fsx said went wrong and the operations that led there. fsx reports a failure (`READ
+/// BAD DATA: …` and its offset table, a size mismatch, an errno) and then replays up to a thousand operations, so the
+/// output's last lines are the replay and never the report: CI run 42395077767's record kept only replay lines. Here the
+/// report (the output before the dump, cut at its end, since it opens with the failure and its offset table follows)
+/// and the dump's last lines (the failing operation and the saved-copy hint last, cut at their front), each in half of
+/// [`DETAIL_CHARS`]; an output with no dump is its tail.
+pub fn fsx_detail(output: &str) -> String {
+  let Some(at) = output.rfind(FSX_LOG_DUMP) else {
+    return tail(output);
+  };
+  let (report, dump) = output.split_at(at);
+  let half = DETAIL_CHARS / 2;
+  format!(
+    "{}\n{}",
+    first_chars(report.trim_end(), half),
+    last_lines(dump, half)
+  )
 }
 
 /// Shape: fsx's operation count — enough to exercise every operation class many times (fsx picks among
@@ -49,7 +78,7 @@ pub const FSSTRESS_SEED: u64 = 1;
 pub fn judge_fsx(exit_success: bool, output: &str) -> ExerciserVerdict {
   ExerciserVerdict {
     ok: exit_success && output.contains(FSX_SUCCESS),
-    detail: tail(output),
+    detail: fsx_detail(output),
   }
 }
 
@@ -65,7 +94,7 @@ pub fn judge_winfsp_fsx(exit_success: bool, output: &str, operations: u64) -> Ex
   let line = winfsp_fsx_success(operations);
   ExerciserVerdict {
     ok: exit_success && output.lines().any(|candidate| candidate.trim() == line),
-    detail: tail(output),
+    detail: fsx_detail(output),
   }
 }
 
@@ -152,6 +181,39 @@ mod tests {
     let verdict = judge_fsx(true, bad);
     assert!(!verdict.ok);
     assert!(verdict.detail.contains("READ BAD DATA"));
+  }
+
+  /// A real fsx failure: the pinned FreeBSD fsx at seed 1 while another writer overwrote its file in place (this Mac,
+  /// 2026-11-07), `READ BAD DATA` on its second line, then a 95-operation log dump and the saved-copy hint. Expect the
+  /// detail to keep the failure line and the failing operation, the dump's last, within the bound. Before, the detail
+  /// kept the first characters of the output's last 12 lines: replay lines only (CI run 42395077767's record).
+  #[test]
+  fn an_fsx_failure_keeps_its_report_and_its_last_operation() {
+    let output = include_str!("testdata/fsx-read-bad-data.txt");
+    let verdict = judge_fsx(false, output);
+    assert!(!verdict.ok);
+    assert!(
+      verdict
+        .detail
+        .contains("READ BAD DATA: offset = 0x4d, size = 0x233e"),
+      "the failure line: {}",
+      verdict.detail
+    );
+    let last_operation = output
+      .lines()
+      .rev()
+      .find(|line| line.contains(" mod 256): "))
+      .unwrap_or_default();
+    assert!(
+      !last_operation.is_empty() && verdict.detail.contains(last_operation),
+      "the failing operation {last_operation:?}: {}",
+      verdict.detail
+    );
+    assert!(
+      verdict.detail.chars().count() <= DETAIL_CHARS + 3,
+      "bounded: {} characters",
+      verdict.detail.chars().count()
+    );
   }
 
   /// The WinFsp port's line passes only with the operation count asked for and a clean exit; FreeBSD's line, a short

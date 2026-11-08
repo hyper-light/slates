@@ -45,26 +45,6 @@ const RESTART_RETRIES: u32 = 50;
 /// Shape: consecutive daemon responses `start_anchor` waits for, so the anchor's one startup restart
 /// (a heartbeat-lapse recovery) has settled before a test runs its verbs.
 const STABLE_STREAK: u32 = 10;
-/// Derived: the most `volume list` attempts a startup wait makes, **counted from the daemon's serving line**
-/// ([`await_serving`]), before it calls the daemon absent — the streak it needs, plus the refusals a single verb
-/// already tolerates while the daemon's one startup restart settles ([`RESTART_RETRIES`]). Both numbers are ones
-/// this file already states.
-///
-/// **Counted in attempts, not wall time, on purpose.** Each attempt is a whole CLI process: spawn, connect, list,
-/// exit. A contended host makes each attempt slower, not more numerous, so a wall bound over eleven of them
-/// measures the host. Twenty seconds was enough alone and not enough inside a full `cargo test --workspace`,
-/// where this failed on 2026-10-18 with exit 3 while passing by itself in well under a second. An absent daemon
-/// still ends the wait — it refuses every attempt — and so does one that flaps, which never reaches the streak.
-///
-/// **Slower, not more numerous, holds only once the daemon serves.** Until the daemon publishes its rendezvous a
-/// client is refused at once ("the daemon has not yet published its rendezvous object"); after that, a client of a
-/// live anchor waits out a restart instead (A-114). Counting from the spawn, the anchor's own boot spent the budget
-/// on a loaded host: on 2026-10-21, at load 25–110 on an 18-core Mac, twelve of fifteen starts failed. Measured
-/// beside them — an anchor started as this file starts it, polled as this file polls, each attempt's start compared
-/// with the anchor's greeting and the daemon's serving line — the greeting came 3.6–5.4 s after the spawn with
-/// 30–51 attempts already refused before it; in four rounds at load 67–78 every refusal came before the serving
-/// line, and none of the 39 attempts begun after it was refused.
-const START_ATTEMPTS: u32 = STABLE_STREAK.saturating_add(RESTART_RETRIES);
 
 fn slates() -> Command {
   Command::new(env!("CARGO_BIN_EXE_slates"))
@@ -222,7 +202,7 @@ const CRASH_LOOP_LINE: &str = "slates anchor: the daemon is in a crash loop";
 /// Reads the anchor's stderr until the daemon says it serves — and, when `issuer` is asked on a platform that prints
 /// one ([`PRINTS_ISSUER_SURFACE`]), until the anchor has printed its issuer surface too — echoing every line to this
 /// process's stderr, where the anchor's output went before it was piped. Returns the issuer surface's exports when
-/// asked for and printed. The attempts a start counts begin after this ([`START_ATTEMPTS`] says why).
+/// asked for and printed. The waits for the daemon's answers begin after this ([`StartProgress`]).
 ///
 /// **The lines come from two processes, so they are taken in whichever order they arrive.** The anchor prints its
 /// greeting and its issuer surface; the daemon, a separate process, prints its serving line. Nothing orders a line of
@@ -268,18 +248,18 @@ fn echo_the_rest(mut stderr: impl std::io::Read + Send + 'static) -> std::thread
   })
 }
 
-/// Waits for [`STABLE_STREAK`] consecutive answers to `volume list` within [`START_ATTEMPTS`] attempts, then
-/// bootstraps the consensus group when `bootstrap` holds. Called once the daemon serves ([`await_serving`]).
+/// Waits for [`STABLE_STREAK`] consecutive answers to `volume list`, for as long as the instance's daemons make
+/// progress ([`StartProgress`]), then bootstraps the consensus group when `bootstrap` holds. Called once the daemon
+/// serves ([`await_serving`]).
 fn await_stable_daemon(instance: &str, bootstrap: bool) {
   // The anchor restarts the daemon once at startup if its first heartbeat lapses (a known liveness
   // recovery, logged as "heartbeat lapsed; killing it"). Wait for several *consecutive* successes so
   // that restart has settled before returning — otherwise a test verb lands in the restart window and
   // gets exit 3 (no daemon). A restart resets the streak.
   let mut streak = 0u32;
-  let mut attempts = 0u32;
+  let mut progress = StartProgress::new();
   loop {
     let (code, _, _) = run(instance, &["volume", "list"]);
-    attempts = attempts.saturating_add(1);
     streak = if code == 0 {
       streak.saturating_add(1)
     } else {
@@ -287,14 +267,13 @@ fn await_stable_daemon(instance: &str, bootstrap: bool) {
     };
     if streak >= STABLE_STREAK {
       if bootstrap {
-        let (code, _, error) = run(instance, &["bootstrap", "root"]);
-        assert_eq!(code, 0, "explicit first-time bootstrap: {error}");
+        bootstrap_through_stalls(instance, &mut progress);
       }
       return;
     }
-    assert!(
-      attempts < START_ATTEMPTS,
-      "the serving daemon answered {STABLE_STREAK} verbs in a row within {START_ATTEMPTS} attempts (last exit {code})"
+    progress.check(
+      instance,
+      &format!("{STABLE_STREAK} verbs in a row (last exit {code})"),
     );
     pause();
   }
@@ -601,7 +580,7 @@ fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
     }
   }));
   await_stable_daemon(&instance, true);
-  let frozen = daemon_pid(&instance).expect("the daemon answers");
+  let frozen = await_daemon(&instance, None, &[]);
   // A kill of the starting daemon (the start's own recovery, `await_stable_daemon`) is not this one.
   while killed.try_recv().is_ok() {}
   assert!(
@@ -638,9 +617,11 @@ fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
     age >= bound && age >= window,
     "not killed before its heartbeat lapsed: the beat was {age:?} old against a {bound:?} bound ({line})"
   );
+  // Killed at the lapse: within one more window of it. How soon the successor then answers is the machine's, and
+  // `await_daemon` judges it by the successor's progress.
   assert!(
-    replaced_after <= bound + START_WAIT,
-    "killed at the lapse and replaced: after {replaced_after:?}, against a {bound:?} bound"
+    age <= bound + window,
+    "killed within a window of the lapse: the beat was {age:?} old against a {bound:?} bound ({line})"
   );
 }
 
@@ -665,6 +646,185 @@ fn lapse_of(line: &str) -> (Duration, Duration, Duration) {
     Duration::from_millis(bound),
     Duration::from_millis(window),
   )
+}
+
+/// Shape: how long the starved-start test starves its successor: three of the anchor's start budgets
+/// (`RECOVERY_BUDGET_NS`), so a start judged by a fixed wall second is killed at least twice over.
+const STARVED_FOR: Duration = Duration::from_nanos(3 * slates_db::replay::RECOVERY_BUDGET_NS);
+/// Shape: one starvation period: a heartbeat, the cadence the daemon's liveness is read at.
+const STARVED_PERIOD: Duration = Duration::from_nanos(slates_server::daemon::HEARTBEAT_NS);
+/// Shape: the share of each period the starved successor may run: one sixty-fourth, about the share a start got on
+/// this Mac under 144 spinners (16-18 ms of CPU across about 1.15 s of wall time from its first instruction to its
+/// profile read, 2026-11-07).
+const STARVED_RUNS_ONE_IN: u32 = 64;
+/// Format: the anchor's kill of a start (`crates/cli/src/anchor.rs`): "the starting daemon made no progress …" or "…
+/// ran … ms of CPU without beating …". Until 2026-11-07 it read "the daemon never beat inside the recovery budget";
+/// the test also holds the starved successor to be the one that answers, so a kill under any wording fails it.
+const START_KILL_LINE: &str = "slates anchor: the starting daemon";
+
+/// A busy machine never kills a starting daemon that is making progress (supervisor's order of 2026-11-07; GAPS, "A
+/// daemon's restart can exceed the anchor's fixed recovery budget"). Do: start an anchor, kill its daemon, and starve
+/// the successor from its first instruction: stopped (`SIGSTOP`) nine tenths of every heartbeat and run the tenth, for
+/// three of the anchor's start budgets, then let it run. Expect: the starved successor is the one that answers, and
+/// the anchor never killed a start. On this Mac at load >= 150 the anchor killed 153 of 153 starts, each 1.07-1.22 s
+/// after its spawn, after the start had used 16-18 ms of CPU: starved, not stuck.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::disallowed_methods)] // the test starves a process by a duty cycle of its own: the sleeps are its periods
+fn a_starved_start_that_makes_progress_is_not_killed() {
+  use rustix::process::{Pid, Signal, kill_process};
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the starved-start flow: set SLATES_TEST_CLI=1 to run it (an anchor and its daemon)"
+    );
+    return;
+  }
+  let instance = format!("cli-starved-{}", std::process::id());
+  let (mut anchor, mut stderr) =
+    spawn_anchor_from(env!("CARGO_BIN_EXE_slates"), &instance, &[], SHARDS);
+  await_serving(&mut stderr, &instance, false);
+  let (lines, forwarding) = forward_lines(stderr);
+  anchor.drain = Some(forwarding);
+  await_stable_daemon(&instance, true);
+  let killed = await_daemon(&instance, None, &[]);
+  let successor = successor_of(&anchor, killed);
+  let pid = Pid::from_raw(i32::try_from(successor).unwrap()).unwrap();
+  let runs = STARVED_PERIOD / STARVED_RUNS_ONE_IN;
+  let starving = Instant::now();
+  while starving.elapsed() < STARVED_FOR {
+    if kill_process(pid, Signal::STOP).is_err() {
+      break;
+    }
+    std::thread::sleep(STARVED_PERIOD - runs);
+    let _ = kill_process(pid, Signal::CONT);
+    std::thread::sleep(runs);
+  }
+  let _ = kill_process(pid, Signal::CONT);
+  let answered = await_daemon(&instance, Some(killed), &[]);
+  let start_kills = lines
+    .try_iter()
+    .filter(|line| line.contains(START_KILL_LINE))
+    .count();
+  drop(anchor);
+  assert_eq!(
+    start_kills, 0,
+    "the anchor killed a starved start {start_kills} times"
+  );
+  assert_eq!(
+    answered, successor,
+    "the starved successor is the daemon that answers"
+  );
+}
+
+/// The other side of the starved-start rule: a start that makes no progress at all is still killed, as a start, within
+/// one more liveness window of its last progress. Do: start an anchor, kill its daemon, and stop the successor
+/// (`SIGSTOP`) for good from its first instruction. Expect: another daemon answers, the stopped one is gone, and the
+/// anchor's start-kill line says it made no progress for at least the window and less than two.
+#[cfg(unix)]
+#[test]
+fn a_stuck_start_is_killed_and_restarted() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the stuck-start flow: set SLATES_TEST_CLI=1 to run it (an anchor and its daemon)"
+    );
+    return;
+  }
+  let instance = format!("cli-stuck-start-{}", std::process::id());
+  let (mut anchor, mut stderr) =
+    spawn_anchor_from(env!("CARGO_BIN_EXE_slates"), &instance, &[], SHARDS);
+  await_serving(&mut stderr, &instance, false);
+  let (lines, forwarding) = forward_lines(stderr);
+  anchor.drain = Some(forwarding);
+  await_stable_daemon(&instance, true);
+  // Awaited, not asked once: a status that lands in the anchor's one startup restart is refused (seen once at load 29).
+  let killed = await_daemon(&instance, None, &[]);
+  // The successor is stopped as soon as the anchor names it, by signals sent from here, not by spawned `pgrep` and
+  // `kill` processes: at 240 runnable processes those were slow enough that a successor beat first, once in fifteen
+  // runs, and was then rightly killed at its heartbeat's lapse, not as a start (2026-11-07).
+  let pid = |raw: u32| rustix::process::Pid::from_raw(i32::try_from(raw).unwrap()).unwrap();
+  rustix::process::kill_process(pid(killed), rustix::process::Signal::KILL).unwrap();
+  let stuck = restarted_pid(&lines);
+  rustix::process::kill_process(pid(stuck), rustix::process::Signal::STOP).unwrap();
+  let answered = await_daemon(&instance, Some(stuck), &[]);
+  let stuck_alive = Command::new("kill")
+    .args(["-0", &stuck.to_string()])
+    .status()
+    .unwrap()
+    .success();
+  let kill_line = lines
+    .try_iter()
+    .find(|line| line.contains(START_KILL_LINE) && line.contains(STUCK_WORDS))
+    .unwrap_or_default();
+  drop(anchor);
+  assert_ne!(answered, stuck);
+  assert!(!stuck_alive, "the stuck start was killed");
+  let window = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
+  let still_for = kill_line
+    .split_once(STUCK_WORDS)
+    .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
+    .and_then(|ms| ms.parse().ok())
+    .map(Duration::from_millis);
+  assert!(
+    still_for.is_some_and(|still| still >= window && still < window * 2),
+    "killed as a start within a window of its last progress: {kill_line:?}"
+  );
+}
+
+/// Format: the anchor's restart line names the daemon it started after this (`crates/cli/src/anchor.rs`).
+const RESTARTED_AS: &str = "restarted as pid ";
+
+/// The pid the anchor's next restart line names, from its forwarded lines, within [`START_CEILING`].
+#[cfg(unix)]
+fn restarted_pid(lines: &std::sync::mpsc::Receiver<String>) -> u32 {
+  loop {
+    let line = lines
+      .recv_timeout(START_CEILING)
+      .expect("the anchor said it restarted the daemon");
+    if let Some(after) = line.split(RESTARTED_AS).nth(1) {
+      return after
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|pid| pid.parse().ok())
+        .unwrap_or_else(|| panic!("no pid in the restart line {line:?}"));
+    }
+  }
+}
+
+/// Format: the anchor's words for a start that made no progress (`crates/cli/src/anchor.rs`, `start_stuck`), before
+/// the milliseconds.
+const STUCK_WORDS: &str = "made no progress for ";
+
+/// Kills the anchor's daemon `killed` (`SIGKILL`) and returns the pid of the successor the anchor starts, as soon as
+/// it exists: the anchor's child that is not `killed`.
+#[cfg(unix)]
+fn successor_of(anchor: &AnchorProcess, killed: u32) -> u32 {
+  let anchor_pid = anchor.child.id().to_string();
+  assert!(
+    Command::new("kill")
+      .args(["-9", &killed.to_string()])
+      .status()
+      .unwrap()
+      .success()
+  );
+  let started = Instant::now();
+  loop {
+    let out = Command::new("pgrep")
+      .args(["-P", &anchor_pid])
+      .output()
+      .unwrap();
+    let found = String::from_utf8_lossy(&out.stdout)
+      .split_whitespace()
+      .filter_map(|pid| pid.parse::<u32>().ok())
+      .find(|pid| *pid != killed);
+    if let Some(pid) = found {
+      return pid;
+    }
+    assert!(
+      started.elapsed() < START_WAIT,
+      "the anchor started no successor"
+    );
+    std::thread::yield_now();
+  }
 }
 
 /// Kills the daemon (`SIGKILL`) and waits for the anchor's restarted one to answer.
@@ -715,7 +875,7 @@ fn a_daemon_killed_after_its_anchors_executable_is_replaced_restarts_from_the_an
   anchor.drain = Some(forwarding);
   await_stable_daemon(&instance, true);
   link_and_later_replace(&link, Some(REPLACEMENT_SCRIPT));
-  let killed = daemon_pid(&instance).expect("the daemon answers");
+  let killed = await_daemon(&instance, None, &[]);
   assert!(
     Command::new("kill")
       .args(["-9", &killed.to_string()])
@@ -3093,10 +3253,10 @@ fn an_anchored_node_serves_its_export_over_rpc_with_tls_across_a_daemon_restart(
   assert_an_export_is_published_and_detached(&fleet, &instance, port);
 }
 
-/// Waits (bounded by the start wait) for a daemon other than `replaced` to answer at `instance`, and
-/// returns its pid; on every look before it answers, each of `held` must still be taken.
+/// Waits for a daemon other than `replaced` to answer at `instance`, and returns its pid, for as long as the instance's
+/// daemons make progress ([`StartProgress`]); on every look before it answers, each of `held` must still be taken.
 fn await_daemon(instance: &str, replaced: Option<u32>, held: &[u16]) -> u32 {
-  let started = Instant::now();
+  let mut progress = StartProgress::new();
   loop {
     assert!(
       held.iter().all(|port| !port_is_free(*port)),
@@ -3105,12 +3265,112 @@ fn await_daemon(instance: &str, replaced: Option<u32>, held: &[u16]) -> u32 {
     if let Some(pid) = daemon_pid(instance).filter(|pid| Some(*pid) != replaced) {
       return pid;
     }
-    assert!(
-      started.elapsed() < START_WAIT,
-      "a fleet daemon answered at {instance}"
-    );
+    progress.check(instance, "a daemon other than the one replaced answered");
     pause();
   }
+}
+
+/// Format: the client's words when a live daemon has not answered inside its reply deadline (`ClientError::Stalled`,
+/// `crates/client/src/error.rs`).
+const STALLED_WORDS: &str = "no reply within";
+
+/// Bootstraps the consensus group, waiting out a reply that stalls while the daemon progresses ([`StartProgress`]). At 8
+/// spinners a CPU (2026-11-07) `bootstrap root` was refused "no reply within 1000000000 ns" in five of fifteen runs: the
+/// client's reply deadline is a wall second against a daemon that was alive and starved (the client's deadlines are
+/// clients' A-232). A stalled bootstrap may still land, so after a stall the group being already initialized is the
+/// bootstrap done; any other refusal fails the test.
+fn bootstrap_through_stalls(instance: &str, progress: &mut StartProgress) {
+  let mut stalled = false;
+  loop {
+    let (code, _, error) = run(instance, &["bootstrap", "root"]);
+    if code == 0 {
+      return;
+    }
+    let squashed = error.to_ascii_lowercase().replace('_', "");
+    if stalled && squashed.contains("consensusalreadyinitialized") {
+      return;
+    }
+    assert!(
+      error.contains(STALLED_WORDS),
+      "explicit first-time bootstrap: {error}"
+    );
+    stalled = true;
+    progress.check(instance, "the bootstrap's reply");
+    pause();
+  }
+}
+
+/// Derived: the longest any wait for a daemon runs, however it progresses: the start wait at the slowest share of a
+/// CPU this suite holds a start to ([`STARVED_RUNS_ONE_IN`]). A guard against a daemon that runs and never answers;
+/// the wait is judged by [`StartProgress`] well before it.
+const START_CEILING: Duration = START_WAIT.saturating_mul(STARVED_RUNS_ONE_IN);
+
+/// A wait for a daemon judged as the anchor judges a start (§2.6 boot step 1): by the instance's daemon processes' own
+/// CPU progress (`slates_machine::process_clock`), not the wall. The wait fails once they made none for [`START_WAIT`]
+/// (none running, or each stopped), or at [`START_CEILING`]. On a machine at 8 spinners a CPU (2026-11-07) a successor
+/// served about 20 s after its predecessor's kill at roughly 1.5% of a CPU, and the 20 s wall wait failed four runs
+/// in nine of the frozen and starved tests while the anchor killed no start.
+///
+/// It replaced two bounds. The wall wait: twenty seconds was enough alone and not inside a full `cargo test
+/// --workspace` (2026-10-18). And `START_ATTEMPTS`, the streak's attempts counted from the serving line (2026-10-21:
+/// a contended host makes each attempt slower, not more numerous), which still ran out at 240 runnable processes when
+/// the first daemon's beat lapsed during the streak and its successor took the attempts' time to come up. A daemon
+/// that flaps now ends the wait at [`START_CEILING`], or as a crash loop in the anchor's log ([`await_serving`]).
+struct StartProgress {
+  /// The daemons and the sum of their progress counts at the last look that saw them move.
+  seen: Option<(Vec<u32>, u64)>,
+  moved_at: Instant,
+  began: Instant,
+}
+
+impl StartProgress {
+  fn new() -> StartProgress {
+    let now = Instant::now();
+    StartProgress {
+      seen: None,
+      moved_at: now,
+      began: now,
+    }
+  }
+
+  /// Ends the test, saying it waited for `what`, once the daemons made no progress for [`START_WAIT`] or the wait
+  /// reached [`START_CEILING`].
+  fn check(&mut self, instance: &str, what: &str) {
+    let pids = daemon_processes(instance);
+    let total = pids
+      .iter()
+      .filter_map(|pid| slates_machine::process_clock::process_cpu(*pid))
+      .fold(0u64, |sum, cpu| sum.wrapping_add(cpu.progress));
+    let now = Some((pids, total));
+    if now != self.seen {
+      self.seen = now;
+      self.moved_at = Instant::now();
+    }
+    assert!(
+      self.moved_at.elapsed() < START_WAIT,
+      "waited for {what} at {instance}: its daemons made no progress for {START_WAIT:?} ({:?})",
+      self.seen
+    );
+    assert!(
+      self.began.elapsed() < START_CEILING,
+      "waited for {what} at {instance} for {START_CEILING:?} while its daemons ran ({:?})",
+      self.seen
+    );
+  }
+}
+
+/// The pids of `instance`'s daemon processes: an anchor runs its daemon as `slates --instance NAME daemon …`.
+fn daemon_processes(instance: &str) -> Vec<u32> {
+  let out = Command::new("pgrep")
+    .args(["-f", "--", &format!("--instance {instance} daemon")])
+    .output()
+    .unwrap();
+  let mut pids: Vec<u32> = String::from_utf8_lossy(&out.stdout)
+    .split_whitespace()
+    .filter_map(|pid| pid.parse().ok())
+    .collect();
+  pids.sort_unstable();
+  pids
 }
 
 /// AC-8.1 (§4.8 "Deployment"; typed refusals): a daemon handed serve sockets that are not what its plan
@@ -3514,6 +3774,29 @@ fn wait_successor(instances: &[String], id: &str) -> String {
   }
 }
 
+/// A-222 and §4.8: a kernel mount of a volume asked of a node that does not own it is refused by its kind
+/// (`AttachmentUnsupported { NfsLoopback, OwnedByAnotherHost }`), never served from a copy that node holds: the mount
+/// would hand the client something of this host's for another host's volume. Where `mount_nfs` exists; elsewhere it
+/// skips loudly.
+fn mount_refused_by_kind(instance: &str, id: &str, mountable: bool) {
+  if !mountable {
+    eprintln!("mount_nfs is not on this host: skipping the bystander's refused mount");
+    return;
+  }
+  let mount_point = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let (code, _, err) = run(instance, &["mount", id, &mount_point.path]);
+  assert!(
+    code != 0 && err.contains("AttachmentUnsupported") && err.contains("OwnedByAnotherHost"),
+    "a node that does not own the volume refuses its mount by kind: exit {code}: {err}"
+  );
+  assert!(
+    !is_mounted(&mount_point.path),
+    "nothing was mounted at the refused path"
+  );
+}
+
 /// The payload written on the dead owner reads back through a real kernel mount of the successor's
 /// volume — where `mount_nfs` exists; elsewhere the read-back skips loudly.
 fn read_on_successor(instance: &str, id: &str, mountable: bool) {
@@ -3548,7 +3831,9 @@ fn read_on_successor(instance: &str, id: &str, mountable: bool) {
 /// is retired by both survivors (their `status` drops it), and the survivor rendezvous ranks first takes
 /// the volume over and serves it under its id — the file written on the dead owner reading back through a
 /// real kernel mount of the successor where `mount_nfs` exists (elsewhere that step skips loudly; the
-/// deployment proof stands). Gated like the other process flows (`SLATES_TEST_CLI=1`): three daemons with
+/// deployment proof stands), while the other survivor refuses a mount of it by kind (`OwnedByAnotherHost`). Under load
+/// on macOS CI (run 42206043007) the successor itself refused its mount so: the takeover had recorded the new owner on
+/// the control shard alone, and the shard serving the client still named the dead creator. Gated like the other process flows (`SLATES_TEST_CLI=1`): three daemons with
 /// spinning shards need the machine to themselves.
 #[test]
 fn three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owners_death() {
@@ -3623,6 +3908,11 @@ fn three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owner
   assert_retired(&wait_fleet_views(&survivors, 2, 1), &owner_host);
   let successor = wait_successor(&survivors, &id);
   read_on_successor(&successor, &id, mountable);
+  let bystander = survivors
+    .iter()
+    .find(|instance| **instance != successor)
+    .unwrap();
+  mount_refused_by_kind(bystander, &id, mountable);
 
   drop(daemons);
   drop(scratch);

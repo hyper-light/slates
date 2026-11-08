@@ -61,68 +61,152 @@ impl Origin {
   /// Sorts every table by its key and drops a repeated key (the last declared wins), so the
   /// encoding is one sequence whatever order the service walked the snapshot in.
   pub fn canonicalize(&mut self) {
-    dedup_by_key(&mut self.specials, |(path, _)| path.clone());
-    dedup_by_key(&mut self.files, |(path, _)| path.clone());
+    dedup_by(&mut self.specials, |a, b| a.0.cmp(&b.0));
+    dedup_by(&mut self.files, |a, b| a.0.cmp(&b.0));
     self.dirs.sort();
     self.dirs.dedup();
-    dedup_by_key(&mut self.modes, |(path, _)| path.clone());
-    dedup_by_key(&mut self.symlinks, |(path, _)| path.clone());
-    dedup_by_key(&mut self.hardlinks, |(path, _)| path.clone());
-    dedup_by_key(&mut self.xattrs, |(path, name, _)| {
-      (path.clone(), name.clone())
-    });
+    dedup_by(&mut self.modes, |a, b| a.0.cmp(&b.0));
+    dedup_by(&mut self.symlinks, |a, b| a.0.cmp(&b.0));
+    dedup_by(&mut self.hardlinks, |a, b| a.0.cmp(&b.0));
+    dedup_by(&mut self.xattrs, |a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
   }
 
   /// The canonical bytes: the magic and version, then each table as a count and its entries, every
-  /// string and byte run length-prefixed, all little-endian. Canonicalizes a copy first, so two
-  /// equal origins encode identically whatever their declaration order.
+  /// string and byte run length-prefixed, all little-endian. An origin not already canonical is canonicalized in a
+  /// copy first, so two equal origins encode identically whatever their declaration order; a canonical one (what a
+  /// walk of a snapshot gives) is written as it stands, with no copy.
   pub fn encode(&self) -> Vec<u8> {
-    let mut canonical = self.clone();
-    canonical.canonicalize();
+    if !self.is_canonical() {
+      let mut canonical = self.clone();
+      canonical.canonicalize();
+      return canonical.encode();
+    }
     let mut out = Vec::new();
-    out.extend_from_slice(&MAGIC.to_le_bytes());
-    out.extend_from_slice(&VERSION.to_le_bytes());
-    put_count(&mut out, canonical.files.len());
-    for (path, bytes) in &canonical.files {
-      put_bytes(&mut out, path.as_bytes());
-      put_bytes(&mut out, bytes);
-    }
-    put_count(&mut out, canonical.dirs.len());
-    for path in &canonical.dirs {
-      put_bytes(&mut out, path.as_bytes());
-    }
-    put_count(&mut out, canonical.modes.len());
-    for (path, mode) in &canonical.modes {
-      put_bytes(&mut out, path.as_bytes());
-      out.extend_from_slice(&mode.to_le_bytes());
-    }
-    put_count(&mut out, canonical.symlinks.len());
-    for (path, target) in &canonical.symlinks {
-      put_bytes(&mut out, path.as_bytes());
-      put_bytes(&mut out, target.as_bytes());
-    }
-    put_count(&mut out, canonical.hardlinks.len());
-    for (path, target) in &canonical.hardlinks {
-      put_bytes(&mut out, path.as_bytes());
-      put_bytes(&mut out, target.as_bytes());
-    }
-    put_count(&mut out, canonical.xattrs.len());
-    for (path, name, value) in &canonical.xattrs {
-      put_bytes(&mut out, path.as_bytes());
-      put_bytes(&mut out, name.as_bytes());
-      put_bytes(&mut out, value);
-    }
-    put_count(&mut out, canonical.specials.len());
-    for (path, node) in &canonical.specials {
-      put_bytes(&mut out, path.as_bytes());
-      out.extend_from_slice(&node.encode());
+    let mut at = Some(Cursor::Header);
+    while let Some(cursor) = at {
+      at = self.emit(cursor, &mut |bytes| out.extend_from_slice(bytes));
     }
     out
   }
 
-  /// The origin's identity: the BLAKE3 of its canonical bytes.
+  /// The origin's identity: the BLAKE3 of its canonical bytes, hashed as they are written rather than gathered first
+  /// (a kernel-sized origin's encoding was a second whole copy of the tree, made only to be hashed).
   pub fn identity(&self) -> [u8; 32] {
-    *blake3::hash(&self.encode()).as_bytes()
+    let Some(mut cursor) = IdentityCursor::new(self) else {
+      let mut canonical = self.clone();
+      canonical.canonicalize();
+      return canonical.identity();
+    };
+    loop {
+      if let Some(identity) = cursor.step(self, usize::MAX) {
+        return identity;
+      }
+    }
+  }
+
+  /// Whether every table is in the order [`Origin::canonicalize`] leaves it: strictly increasing by its key, so
+  /// sorted and with no key twice.
+  pub fn is_canonical(&self) -> bool {
+    strictly(&self.files, |a, b| a.0 < b.0)
+      && strictly(&self.dirs, |a, b| a < b)
+      && strictly(&self.modes, |a, b| a.0 < b.0)
+      && strictly(&self.symlinks, |a, b| a.0 < b.0)
+      && strictly(&self.hardlinks, |a, b| a.0 < b.0)
+      && strictly(&self.xattrs, |a, b| (&a.0, &a.1) < (&b.0, &b.1))
+      && strictly(&self.specials, |a, b| a.0 < b.0)
+  }
+
+  /// Writes the canonical encoding's unit at `at` (the header, one table's count, or one entry) to `sink`; the next
+  /// unit's place, `None` past the last. The origin must be canonical; [`Origin::encode`] and [`IdentityCursor`] see
+  /// to it.
+  fn emit(&self, at: Cursor, sink: &mut impl FnMut(&[u8])) -> Option<Cursor> {
+    match at {
+      Cursor::Header => {
+        sink(&MAGIC.to_le_bytes());
+        sink(&VERSION.to_le_bytes());
+        Some(Cursor::Count(Table::Files))
+      }
+      Cursor::Count(table) => {
+        put_count_to(sink, self.table_len(table));
+        Some(self.after(table, 0))
+      }
+      Cursor::Entry(table, index) => {
+        self.emit_entry(table, index, sink);
+        Some(self.after(table, index.saturating_add(1)))
+      }
+      Cursor::Done => None,
+    }
+  }
+
+  /// The place after `table`'s entries up to `next`: its entry `next`, the next table's count, or [`Cursor::Done`] past
+  /// the last table.
+  fn after(&self, table: Table, next: usize) -> Cursor {
+    if next < self.table_len(table) {
+      return Cursor::Entry(table, next);
+    }
+    match table.next() {
+      Some(following) => Cursor::Count(following),
+      None => Cursor::Done,
+    }
+  }
+
+  fn table_len(&self, table: Table) -> usize {
+    match table {
+      Table::Files => self.files.len(),
+      Table::Dirs => self.dirs.len(),
+      Table::Modes => self.modes.len(),
+      Table::Symlinks => self.symlinks.len(),
+      Table::Hardlinks => self.hardlinks.len(),
+      Table::Xattrs => self.xattrs.len(),
+      Table::Specials => self.specials.len(),
+    }
+  }
+
+  fn emit_entry(&self, table: Table, index: usize, sink: &mut impl FnMut(&[u8])) {
+    match table {
+      Table::Files => {
+        if let Some((path, bytes)) = self.files.get(index) {
+          put_bytes_to(sink, path.as_bytes());
+          put_bytes_to(sink, bytes);
+        }
+      }
+      Table::Dirs => {
+        if let Some(path) = self.dirs.get(index) {
+          put_bytes_to(sink, path.as_bytes());
+        }
+      }
+      Table::Modes => {
+        if let Some((path, mode)) = self.modes.get(index) {
+          put_bytes_to(sink, path.as_bytes());
+          sink(&mode.to_le_bytes());
+        }
+      }
+      Table::Symlinks => {
+        if let Some((path, target)) = self.symlinks.get(index) {
+          put_bytes_to(sink, path.as_bytes());
+          put_bytes_to(sink, target.as_bytes());
+        }
+      }
+      Table::Hardlinks => {
+        if let Some((path, target)) = self.hardlinks.get(index) {
+          put_bytes_to(sink, path.as_bytes());
+          put_bytes_to(sink, target.as_bytes());
+        }
+      }
+      Table::Xattrs => {
+        if let Some((path, name, value)) = self.xattrs.get(index) {
+          put_bytes_to(sink, path.as_bytes());
+          put_bytes_to(sink, name.as_bytes());
+          put_bytes_to(sink, value);
+        }
+      }
+      Table::Specials => {
+        if let Some((path, node)) = self.specials.get(index) {
+          put_bytes_to(sink, path.as_bytes());
+          sink(&node.encode());
+        }
+      }
+    }
   }
 
   /// Decodes [`Origin::encode`]'s bytes — the inverse a recovery or a holder uses. Every count is
@@ -179,28 +263,125 @@ impl Origin {
   }
 }
 
-/// Sorts `table` by `key` and keeps the last entry of each repeated key.
-fn dedup_by_key<T, K: Ord>(table: &mut Vec<T>, key: impl Fn(&T) -> K) {
+/// A canonical encoding's table, in the order the encoding writes them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Table {
+  Files,
+  Dirs,
+  Modes,
+  Symlinks,
+  Hardlinks,
+  Xattrs,
+  Specials,
+}
+
+impl Table {
+  fn next(self) -> Option<Table> {
+    match self {
+      Table::Files => Some(Table::Dirs),
+      Table::Dirs => Some(Table::Modes),
+      Table::Modes => Some(Table::Symlinks),
+      Table::Symlinks => Some(Table::Hardlinks),
+      Table::Hardlinks => Some(Table::Xattrs),
+      Table::Xattrs => Some(Table::Specials),
+      Table::Specials => None,
+    }
+  }
+}
+
+/// A place in a canonical encoding: the unit [`Origin::emit`] writes next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cursor {
+  /// The magic and the version.
+  Header,
+  /// A table's count.
+  Count(Table),
+  /// A table's entry.
+  Entry(Table, usize),
+  /// Past the last table: nothing more to write.
+  Done,
+}
+
+/// An origin's identity hashed a share at a time (§4.16, A-217; §4.3 "Bounded work everywhere"): the BLAKE3 of its
+/// canonical bytes, fed unit by unit from where the last share stopped, so a kernel-sized origin's identity is taken in
+/// slices of a shard's step and never gathered into one buffer first. It borrows nothing between shares; its owner
+/// keeps the origin unchanged until the identity is out.
+#[derive(Debug)]
+pub struct IdentityCursor {
+  hasher: blake3::Hasher,
+  at: Cursor,
+}
+
+impl IdentityCursor {
+  /// A cursor at the start of `origin`'s canonical bytes; `None` when the origin is not canonical, since its bytes as
+  /// it stands would not be the canonical ones ([`Origin::canonicalize`] first).
+  pub fn new(origin: &Origin) -> Option<IdentityCursor> {
+    origin.is_canonical().then(|| IdentityCursor {
+      hasher: blake3::Hasher::new(),
+      at: Cursor::Header,
+    })
+  }
+
+  /// Hashes `origin`'s next units until at least `budget_bytes` have gone in or the encoding ends (a unit is one
+  /// entry, so a share overruns its budget by at most one file's bytes); the identity once the last unit is in.
+  pub fn step(&mut self, origin: &Origin, budget_bytes: usize) -> Option<[u8; 32]> {
+    let mut fed = 0usize;
+    let hasher = &mut self.hasher;
+    while self.at != Cursor::Done {
+      self.at = origin
+        .emit(self.at, &mut |bytes| {
+          fed = fed.saturating_add(bytes.len());
+          hasher.update(bytes);
+        })
+        .unwrap_or(Cursor::Done);
+      if fed >= budget_bytes {
+        break;
+      }
+    }
+    (self.at == Cursor::Done).then(|| *self.hasher.finalize().as_bytes())
+  }
+}
+
+/// Whether every neighbouring pair of `table` is in order by `before` (strictly: a key twice is out of order).
+fn strictly<T>(table: &[T], before: impl Fn(&T, &T) -> bool) -> bool {
+  table.windows(2).all(|pair| match pair {
+    [a, b] => before(a, b),
+    _ => true,
+  })
+}
+
+/// Sorts `table` by `order` (its key's order) and keeps the last entry of each repeated key. Compares the keys where
+/// they lie: a key cloned per comparison cost a kernel-sized origin (97,229 files) millions of string copies a sort.
+fn dedup_by<T>(table: &mut Vec<T>, order: impl Fn(&T, &T) -> std::cmp::Ordering) {
   // A stable sort keeps declaration order among equal keys, so "the last declared wins" is
   // reversing before the dedup (which keeps the first of a run) and reversing back.
-  table.sort_by_key(&key);
+  table.sort_by(&order);
   table.reverse();
-  table.dedup_by(|a, b| key(a) == key(b));
+  table.dedup_by(|a, b| order(a, b) == std::cmp::Ordering::Equal);
   table.reverse();
 }
 
-fn put_count(out: &mut Vec<u8>, count: usize) {
+pub(crate) fn put_count(out: &mut Vec<u8>, count: usize) {
   out.extend_from_slice(&u32::try_from(count).unwrap_or(u32::MAX).to_le_bytes());
 }
 
-fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+pub(crate) fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
   put_count(out, bytes.len());
   out.extend_from_slice(bytes);
 }
 
+fn put_count_to(sink: &mut impl FnMut(&[u8]), count: usize) {
+  sink(&u32::try_from(count).unwrap_or(u32::MAX).to_le_bytes());
+}
+
+fn put_bytes_to(sink: &mut impl FnMut(&[u8]), bytes: &[u8]) {
+  put_count_to(sink, bytes.len());
+  sink(bytes);
+}
+
 /// A table's declared count, refused before any allocation when the bytes that remain could not
 /// hold that many entries at the smallest entry size.
-fn take_count(reader: &mut Reader<'_>) -> Result<usize, DocDecodeError> {
+pub(crate) fn take_count(reader: &mut Reader<'_>) -> Result<usize, DocDecodeError> {
   let count = reader.u32()? as usize;
   if count > reader.remaining() / ENTRY_MIN_BYTES {
     return Err(DocDecodeError::Truncated);
@@ -208,12 +389,12 @@ fn take_count(reader: &mut Reader<'_>) -> Result<usize, DocDecodeError> {
   Ok(count)
 }
 
-fn reader_bytes<'a>(reader: &mut Reader<'a>) -> Result<&'a [u8], DocDecodeError> {
+pub(crate) fn reader_bytes<'a>(reader: &mut Reader<'a>) -> Result<&'a [u8], DocDecodeError> {
   let len = reader.u32()? as usize;
   reader.bytes(len)
 }
 
-fn take_str(reader: &mut Reader<'_>) -> Result<String, DocDecodeError> {
+pub(crate) fn take_str(reader: &mut Reader<'_>) -> Result<String, DocDecodeError> {
   let raw = reader_bytes(reader)?;
   std::str::from_utf8(raw)
     .map(str::to_owned)

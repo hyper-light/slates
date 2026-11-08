@@ -93,20 +93,7 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let work = session.workdir("fsx")?;
   let logs = run.scratch.fresh("fsx-logs")?;
   let bounds = run.bounds();
-  let args: Vec<String> = vec![
-    "-N".to_owned(),
-    bounds.fsx_operations.to_string(),
-    "-S".to_owned(),
-    bounds.fsx_seed.to_string(),
-    fetch::FSX_LENGTH_FLAG.to_owned(),
-    bounds.fsx_file_length.to_string(),
-    fetch::FSX_TRACE_FLAG.to_owned(),
-    "-P".to_owned(),
-    super::plain_path(&logs),
-    // Relative to the work directory: fsx names its .fsxgood/.fsxlog files `<-P dir>/<fname>.…`,
-    // so an absolute fname would nest one absolute path under another.
-    "fsx.bin".to_owned(),
-  ];
+  let args = fsx_args(bounds, &logs);
   let (success, output, ended) = run_bounded(&built.binary, &args, &work, FSX_WALL_BOUND)?;
   let verdict = fsx_verdict(success, &output, bounds.fsx_operations);
   // A run that failed is judged against the transport's reviewed list (A-209): one that failed its own verification by
@@ -151,6 +138,12 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   }
   if !verdict.ok {
     notes.push(format!("fsx output tail: {}", verdict.detail));
+    notes.push(keep_fsx_logs(
+      &logs,
+      &run.options.records,
+      run.transport.slug(),
+      bounds,
+    )?);
   }
   let (alive, live_note) = session.alive_and_shipped();
   if !alive {
@@ -194,6 +187,80 @@ const FSX_WALL_BOUND: Duration = PJDFSTEST_FILE_BOUND;
 
 /// Runs a suite binary until it exits or `bound` passes, capturing both streams together; past the bound it is killed.
 /// Whether it succeeded, its output, and whether it ended by itself.
+/// fsx's arguments under `bounds`, its `-P` files in `logs`, run in the work directory.
+fn fsx_args(bounds: super::Bounds, logs: &Path) -> Vec<String> {
+  vec![
+    "-N".to_owned(),
+    bounds.fsx_operations.to_string(),
+    "-S".to_owned(),
+    bounds.fsx_seed.to_string(),
+    fetch::FSX_LENGTH_FLAG.to_owned(),
+    bounds.fsx_file_length.to_string(),
+    fetch::FSX_TRACE_FLAG.to_owned(),
+    "-P".to_owned(),
+    super::plain_path(logs),
+    // Relative to the work directory: fsx names its .fsxgood/.fsxlog files `<-P dir>/<fname>.…`,
+    // so an absolute fname would nest one absolute path under another.
+    FSX_FILE.to_owned(),
+  ]
+}
+
+/// Format: the file fsx exercises, named relative to its work directory.
+const FSX_FILE: &str = "fsx.bin";
+
+/// Shape: the longest line fsx writes a run's `.fsxlog` (its output, an operation's replay at most: `NNNNN(NNN mod 256):
+/// MAPWRITE 0x… thru 0x… (0x… bytes) …`, under a hundred bytes), with room.
+const FSX_LOG_LINE_BYTES: u64 = 128;
+
+/// Keeps a failed fsx run's `-P` files, its `.fsxlog` (what it printed) and `.fsxgood` (the content it expected), beside
+/// its record in `<records>/<transport>.fsx-logs/`, so the artifact that carries the records carries them: CI run
+/// 42395077767 left them in the runner's scratch. Each is bounded by the run: at most the file length (`.fsxgood` is
+/// one copy of the file) plus a [`FSX_LOG_LINE_BYTES`] line per operation; a file past that keeps its end. The note
+/// says where they are and how much was kept.
+fn keep_fsx_logs(
+  logs: &Path,
+  records: &Path,
+  transport: &str,
+  bounds: super::Bounds,
+) -> Result<String, Failure> {
+  let bound = bounds
+    .fsx_file_length
+    .saturating_add(bounds.fsx_operations.saturating_mul(FSX_LOG_LINE_BYTES));
+  let kept = records.join(format!("{transport}.fsx-logs"));
+  super::create_dir(&kept)?;
+  let mut said = Vec::new();
+  #[allow(clippy::disallowed_methods)] // the development tool reads its own scratch.
+  let entries = std::fs::read_dir(logs).map_err(|e| Failure(format!("{}: {e}", logs.display())))?;
+  for entry in entries.flatten() {
+    let path = entry.path();
+    let Some(name) = path.file_name() else {
+      continue;
+    };
+    #[allow(clippy::disallowed_methods)] // the development tool reads its own scratch.
+    let Ok(bytes) = std::fs::read(&path) else {
+      continue;
+    };
+    let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let skip = usize::try_from(length.saturating_sub(bound)).unwrap_or(usize::MAX);
+    let tail = bytes.get(skip..).unwrap_or_default();
+    super::write_file(&kept.join(name), tail)?;
+    said.push(format!(
+      "{} ({} of {length} bytes)",
+      name.to_string_lossy(),
+      tail.len()
+    ));
+  }
+  said.sort();
+  Ok(format!(
+    "fsx's -P files kept beside the record, each bounded to {bound} bytes, in {}: {}",
+    kept
+      .file_name()
+      .map(|name| name.to_string_lossy().into_owned())
+      .unwrap_or_default(),
+    said.join(", ")
+  ))
+}
+
 fn run_bounded(
   program: &Path,
   args: &[String],
@@ -771,6 +838,91 @@ pub(crate) fn judged_pjdfstest(
 
 #[cfg(test)]
 mod tests {
+
+  /// CI run 42395077767's record of a failed fsx run held replay lines only, and its `-P` files stayed in the runner's
+  /// scratch. Do: build the pinned fsx, run it with the harness's own arguments on a plain directory of the build
+  /// output while another thread overwrites its file in place (never truncating: a truncation under a mapped read
+  /// kills fsx with SIGBUS before it reports), and judge and keep the run as `run_fsx` does. Expect fsx to fail, the
+  /// record's note to hold its failure line (`BAD DATA`), and its `.fsxlog` and `.fsxgood` beside the records. Skips
+  /// loudly without `SLATES_TEST_FSX`: it fetches fsx's pinned source and needs a C compiler.
+  #[cfg(not(windows))]
+  #[test]
+  #[allow(clippy::unwrap_used, clippy::disallowed_methods)]
+  fn a_forced_fsx_failure_keeps_its_failure_line_and_its_logs_beside_the_record() {
+    use std::os::unix::fs::FileExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    if std::env::var_os("SLATES_TEST_FSX").is_none() {
+      eprintln!("SKIP: set SLATES_TEST_FSX=1 to build the pinned fsx and force its failure");
+      return;
+    }
+    /// The test's directory in the build output, removed when dropped.
+    struct Removed(PathBuf);
+    impl Drop for Removed {
+      fn drop(&mut self) {
+        crate::conformance::remove_tree(&self.0);
+      }
+    }
+    /// Lowers the writer's stop flag however the run ends, so a failed run never leaves the scope waiting on it.
+    struct Stop<'a>(&'a AtomicBool);
+    impl Drop for Stop<'_> {
+      fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+      }
+    }
+    let dir = Removed(
+      crate::conformance::build_output(&format!("fsx-forced-{}", std::process::id())).unwrap(),
+    );
+    let [tools, work, logs, records] =
+      ["tools", "work", "logs", "records"].map(|name| dir.0.join(name));
+    for path in [&tools, &work, &logs, &records] {
+      crate::conformance::create_dir(path).unwrap();
+    }
+    let built = fetch::build_fsx(&tools).unwrap();
+    let bounds = crate::conformance::Bounds::default();
+    let stop = AtomicBool::new(false);
+    let target = work.join(FSX_FILE);
+    let (success, output, _ended) = std::thread::scope(|scope| {
+      let _stop = Stop(&stop);
+      scope.spawn(|| {
+        let mut at = 0u64;
+        while !stop.load(Ordering::Relaxed) {
+          if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&target) {
+            let _ = file.write_all_at(&[0xff; 64], at % 4096);
+          }
+          at = at.wrapping_add(64);
+          std::thread::yield_now();
+        }
+      });
+      run_bounded(
+        &built.binary,
+        &fsx_args(bounds, &logs),
+        &work,
+        FSX_WALL_BOUND,
+      )
+      .unwrap()
+    });
+    let verdict = fsx_verdict(success, &output, bounds.fsx_operations);
+    assert!(
+      !verdict.ok,
+      "fsx failed with its file overwritten: {output}"
+    );
+    let note = format!("fsx output tail: {}", verdict.detail);
+    assert!(
+      note.contains("BAD DATA"),
+      "the note holds fsx's failure line: {note}"
+    );
+    let kept = keep_fsx_logs(&logs, &records, "forced", bounds).unwrap();
+    eprintln!("{note}\n{kept}");
+    for name in ["fsx.bin.fsxlog", "fsx.bin.fsxgood"] {
+      let length = std::fs::metadata(records.join("forced.fsx-logs").join(name))
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+      assert!(length > 0, "{name} beside the records: {kept}");
+    }
+  }
   use super::{CaseStatus, Runner, parse_file, pjdfstest_runner};
 
   /// AC-3.1: request the root-capable lane from an unprivileged process. The simulated child

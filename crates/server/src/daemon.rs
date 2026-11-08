@@ -2102,10 +2102,9 @@ impl Daemon {
     object: slates_db::register::ObjectId,
   ) -> Result<bool, ObserveError> {
     self.observe(self.shard_of_object(object), move |s| {
-      let quorum = s.fleet.configuration().quorum;
       s.placed_heads
         .get(&object)
-        .is_some_and(|head| head.placement.placed(quorum))
+        .is_some_and(|head| head.placed_under(s.fleet.configuration(), object))
     })
   }
 
@@ -2290,7 +2289,7 @@ impl Daemon {
   }
 
   /// The chain of `green` as the shard that serves it holds it: each version's increment identity in
-  /// order (§4.16; AUD-14) — what a test compares between the departed owner and its successor to prove
+  /// order (§4.16; AUD-14), those folded into its checkpoint (W3) as the checkpoint keeps them — what a test compares between the departed owner and its successor to prove
   /// the full ledger prefix and the original results were preserved through the takeover. Empty for a
   /// green this daemon does not serve; the typed refusal when the shard could not be observed.
   pub fn merge_chain_identities(
@@ -2300,22 +2299,55 @@ impl Daemon {
     let object = slates_db::register::ObjectId(green.bytes);
     let volume = slates_db::catalog::VolumeId { bytes: green.bytes };
     self.observe(self.shard_of_object(object), move |s| {
-      s.db
-        .partition()
-        .green_chain(volume)
-        .iter()
-        .enumerate()
-        .filter_map(|(index, bytes)| {
+      // The versions up to the green's checkpoint (W3) are named by the identities it keeps with them; the chain
+      // holds the versions after it.
+      let partition = s.db.partition();
+      let (held, mut identities) =
+        partition
+          .green_checkpoint(volume)
+          .map_or((0, Vec::new()), |(held, bytes)| {
+            let accepted = slates_merge::checkpoint::Checkpoint::decode(bytes)
+              .map(|checkpoint| checkpoint.accepted)
+              .unwrap_or_default();
+            (
+              held,
+              accepted
+                .into_iter()
+                .map(|(id, version)| (version, id))
+                .collect(),
+            )
+          });
+      identities.sort_unstable();
+      identities.extend(partition.green_chain(volume).iter().enumerate().filter_map(
+        |(index, bytes)| {
           slates_merge::engine::Increment::decode(bytes)
             .ok()
             .map(|increment| {
               (
-                u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1),
+                u64::try_from(index)
+                  .unwrap_or(u64::MAX)
+                  .saturating_add(held)
+                  .saturating_add(1),
                 increment.id,
               )
             })
-        })
-        .collect()
+        },
+      ));
+      identities
+    })
+  }
+
+  /// The bytes the snapshot of `green`'s partition encodes to now (§4.8): what every snapshot taken when its log
+  /// fills writes, and what recovery reads first. A test reads it to hold the partition to what its volumes are rather
+  /// than what they have been (W3: a green's chain checkpointed at its reachable floor). Encodes the partition on the
+  /// green's owner shard; the typed refusal when it could not be observed.
+  pub fn partition_snapshot_bytes(
+    &self,
+    green: slates_ipc::protocol::VolumeId,
+  ) -> Result<usize, ObserveError> {
+    let object = slates_db::register::ObjectId(green.bytes);
+    self.observe(self.shard_of_object(object), move |s| {
+      slates_wire::Wire::to_bytes(&s.db.partition().to_snapshot(0)).len()
     })
   }
 
@@ -2832,6 +2864,11 @@ impl Daemon {
     if let Some(mut doorbell) = self.doorbell.take() {
       doorbell.stop();
     }
+    // The shutdown ends the control loop before the watchdog stops: told first, it does not take that end for one the
+    // anchor should restart (A-228).
+    if let Some(watchdog) = self.watchdog.as_ref() {
+      watchdog.stopping();
+    }
     if let Some(runtime) = self.runtime.take()
       && let Err(error) = runtime.shutdown()
     {
@@ -3324,7 +3361,7 @@ fn init_shard(
     seal_root,
     seal_state: sealing,
     seal_recipient: None,
-    pairs_delivered: std::collections::BTreeSet::new(),
+    pairs_delivered: std::collections::BTreeMap::new(),
     member_anchors: std::collections::BTreeMap::new(),
     peer_recipients: std::collections::BTreeMap::new(),
     content,
@@ -3365,6 +3402,8 @@ fn init_shard(
     origin_anchor,
     landing: crate::landing::LandingState::default(),
     image: crate::image::ImageState::default(),
+    configured_members: Vec::new(),
+    departed_owed: Vec::new(),
     direct_map: crate::direct_map::DirectMapState::default(),
     store,
     volumes: Slab::new(config.caps.segment_slots, config.caps.volumes),
@@ -3447,7 +3486,9 @@ fn init_shard(
     forward_lanes: crate::forward_lane::ForwardLanes::default(),
     staging: crate::staging::Staging::default(),
     member_boot_nonce: incarnation,
+    member_process_nonce: keyed_word(&issuer_secret, b"slates/member-process/v1"),
     learned_members: std::collections::BTreeMap::new(),
+    returned_members: std::collections::BTreeMap::new(),
     authenticated_members: std::collections::BTreeSet::new(),
     council_death_watch: std::collections::BTreeMap::new(),
     discovery: None,
@@ -3641,6 +3682,8 @@ async fn reap_loop() {
       // (`verbs::step_destroys`), rather than in a busy serve round.
       let _ = verbs::step_destroys(s);
     });
+    // Another host's attachments end once the fleet no longer counts that host a member (A-222; control shard).
+    crate::remote_attach::sweep_departed().await;
     let reaped = crate::reap::sweep(cadence).await;
     // The taken-back writable copies no holder claimed within the reconnect budget (A-197).
     #[cfg(target_os = "linux")]
@@ -4343,8 +4386,19 @@ async fn serve_loop() {
       // Announce idle, fence, re-check (the doorbell protocol, `verbs::announce_idle`): a request found
       // pending is served now; one published later is rung, and the ring wakes this poller.
       let serve_instead = state::with_state(verbs::announce_idle).unwrap_or(false);
+      // A forward its owner's full control channel refused is kept for the next round (§4.3, "backpressure, never a
+      // drop"), but no ring or kick says the channel has room: the owner drains it without a word to the shards that
+      // wait. So while one is kept the loop idles at most the idle window, then serves a round that sends it again.
+      // Idling until a ring woke it, a shard whose clients all waited on kept forwards slept until some other
+      // request came: at 10,000 clients over one green, requests waited 10 to 42 s with the daemon idle
+      // (`crates/server/tests/forward_retry.rs`).
+      let kept = state::with_state(|s| !s.pending_forwards.is_empty()).unwrap_or(false);
       if !serve_instead {
-        futures::idle().await;
+        if kept {
+          let _ = futures::within(idle_window_ns.max(1), futures::idle()).await;
+        } else {
+          futures::idle().await;
+        }
       }
       state::with_state(verbs::announce_polling);
     }

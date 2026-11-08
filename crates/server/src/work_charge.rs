@@ -180,7 +180,10 @@ mod tests {
         inserted,
       } => {
         let path = PATHS[*path];
-        let old = files.get(base, path).unwrap().map(<[u8]>::to_vec);
+        let old = files
+          .get(base, path)
+          .unwrap()
+          .map(std::borrow::Cow::into_owned);
         let ops = edit_ops(path, old.as_deref(), (*at, *delete_len, *inserted));
         let (spliced, removed) =
           files.splice_delta(path, old.as_deref(), (*at, *delete_len, *inserted));
@@ -248,7 +251,7 @@ mod tests {
         model.insert(PATHS[*path].to_owned(), vec![b'b'; *len]);
       }
       origin.files = model.iter().map(|(path, bytes)| (path.clone(), bytes.clone())).collect();
-      let green = Green::with_origin(&origin);
+      let green = Green::with_origin(origin.clone());
       let base = Base { green: Some(&green), version: 0 };
       let mut files = WorkFiles::default();
       let mut journal: Vec<VolumeOp> = Vec::new();
@@ -264,7 +267,8 @@ mod tests {
           .collect();
         prop_assert_eq!(&seen, &model, "after {:?}", step);
         for path in PATHS {
-          prop_assert_eq!(files.get(base, path).unwrap(), model.get(path).map(Vec::as_slice));
+          let seen = files.get(base, path).unwrap();
+          prop_assert_eq!(seen.as_deref(), model.get(path).map(Vec::as_slice));
         }
       }
     }

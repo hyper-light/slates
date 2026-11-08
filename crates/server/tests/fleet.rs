@@ -94,10 +94,10 @@ const RETIREMENT_DEADLINE: Duration = Duration::from_secs(30);
 /// than retirement: the returning node must establish, learn of its own death from the survivor's echo,
 /// self-refute, and have its refutation adopted — a few protocol periods past a fresh formation.
 const REJOIN_DEADLINE: Duration = Duration::from_secs(30);
-/// Shape: how long to wait for an N-node fleet to fully form (every node seeing every peer alive) before the
-/// test fails. Polled, not a fixed settle, so it returns the instant the mesh is up; the deadline is wide
-/// because a larger mesh has more sessions to establish (each node dials and accepts every peer) and the
-/// daemons start one after another.
+/// Shape: the wall time a wait on the fleet may also be given ([`poll_until`]'s `within`, which only ever widens its
+/// frozen window past [`FROZEN_CAP`]), and the reply wait of the one client call that waits out a formation. Waits on
+/// the fleet are judged by its progress, not by this (since 2026-11-07 for every [`audit_wait`]: a fixed 30 s failed
+/// formations that took 37 to 108 s under load while every coordinator turned).
 /// Overridable for an exceptionally slow environment via `SLATES_TEST_FLEET_DEADLINE_SECS` (the same knob that
 /// scales [`DEADLINE_NS`]'s reply wait): a heavily loaded or shared CI runner takes far longer to converge a
 /// multi-node takeover than an unloaded machine (`a_cross_region_client_finds_the_copyset_successor...` passed
@@ -2295,7 +2295,9 @@ fn restart_fleet_forms_and_seals(pid: u32) -> RestartFleet {
   });
   let voters = vec![host_b, host_a, host_c];
   assert!(
-    audit_wait(|| audit_voters_match(&daemons, &voters)),
+    audit_wait(&daemons.iter().collect::<Vec<_>>(), || audit_voters_match(
+      &daemons, &voters
+    )),
     "initial voters commit before sealing and restart"
   );
   let knew_old = daemons[1]
@@ -2938,11 +2940,12 @@ fn bootstrap_mesh(
     .expect("explicit first-time root bootstrap");
   let mut bootstrapped =
     std::collections::BTreeSet::from([regions.get(&seeds[0]).copied().unwrap_or(RegionId(0))]);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
   for (daemon, seed) in daemons.iter().zip(seeds).skip(1) {
     let region = regions.get(seed).copied().unwrap_or(RegionId(0));
     if bootstrapped.insert(region) {
       assert!(
-        audit_wait(|| daemon
+        poll_until(&observed, formation_deadline(), || daemon
           .root_regions()
           .map(|regions| regions.contains(&region))),
         "the root admits the new region before its regional bootstrap"
@@ -2985,7 +2988,11 @@ fn settle_initial_consensus(
   for (daemon, region) in daemons.iter().zip(&assigned) {
     bootstrappers.entry(*region).or_insert(daemon);
   }
-  let settled = audit_wait(|| {
+  // Judged by the fleet's own progress (`poll_until`: a budget of the slowest coordinator's periods, or a frozen
+  // window with none), not a fixed wall-clock wait: under 36 spinners on an 18-core Mac fleets formed in 3 to 10 s
+  // mostly, but now and then in 37 to 108 s, past the fixed 30 s this used, while every coordinator kept turning.
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let settled = poll_until(&observed, formation_deadline(), || {
     let mut voters = std::collections::BTreeMap::<RegionId, Vec<HostId>>::new();
     for (region, bootstrapper) in &bootstrappers {
       let Some(settled) = region_voters(bootstrapper, &regional[region], quorum)? else {
@@ -5244,7 +5251,7 @@ fn a_location_round_asks_a_peer_whose_session_was_out_once_it_returns() {
   // volume's creator is its owner until then, and the lookup forwards there without a round, refused
   // `OwnerUnreachable` once the takeover bound passes (§4.8 Lookup; the round this history examines never ran:
   // docs/bugs/2026-11-05-a-lookup-before-the-owners-death-was-known-never-ran-its-round.md).
-  let owner_known_dead = audit_wait(|| {
+  let owner_known_dead = audit_wait(&daemons.iter().collect::<Vec<_>>(), || {
     foreign_daemon.fleet_member_state(owner).map(|held| {
       held.is_some_and(|held| held.liveness == slates_cluster::membership::Liveness::Dead)
     })
@@ -5367,10 +5374,12 @@ fn a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_liv
     ObjectId(id.bytes)
   ));
   let mut interrupted = Client::connect(&foreign_instance);
-  assert!(audit_wait(|| Ok(matches!(
-    interrupted.call(&RequestBody::Status { volume: id }),
-    ReplyBody::Status { .. }
-  ))));
+  assert!(audit_wait(&daemons.iter().collect::<Vec<_>>(), || Ok(
+    matches!(
+      interrupted.call(&RequestBody::Status { volume: id }),
+      ReplyBody::Status { .. }
+    )
+  )));
   daemons.remove(owner_index).stop();
   let unavailable = interrupted.call(&RequestBody::Snapshot { volume: id });
   assert!(
@@ -5393,7 +5402,7 @@ fn a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_liv
   let mut last = ReplyBody::Refused {
     refusal: Refusal::NotFound,
   };
-  let served = audit_wait(|| {
+  let served = audit_wait(&daemons.iter().collect::<Vec<_>>(), || {
     last = foreign.call(&RequestBody::Status { volume: id });
     Ok(matches!(last, ReplyBody::Status { .. }))
   });
@@ -5412,7 +5421,8 @@ fn a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_liv
     location_counters(&counters_after)
   ));
   trace_routing_views(&daemons, ObjectId(id.bytes));
-  let resumed = retry_snapshot_until_served(&mut interrupted, id);
+  let resumed =
+    retry_snapshot_until_served(&daemons.iter().collect::<Vec<_>>(), &mut interrupted, id);
   let resumed_retry = interrupted.call_retry(&RequestBody::Snapshot { volume: id });
   trace::record(format_args!(
     "owner-lookup resumed={resumed:?} resumed_retry={resumed_retry:?}"
@@ -5562,7 +5572,9 @@ fn a_forward_answered_within_its_bounds_is_never_reported_stalled() {
   assert_successor_serves(&mut successor_client, successor_daemon, id);
   // The foreign node reaches the successor before the delay, so its sessions and the successor's claim are warm.
   let mut warm = Client::connect(&foreign_instance);
-  let reached = audit_wait(|| Ok(status_answers(&mut warm, id)));
+  let reached = audit_wait(&daemons.iter().collect::<Vec<_>>(), || {
+    Ok(status_answers(&mut warm, id))
+  });
   let delayed = successor_daemon.inject_serve_delay(Some(SLOW_OWNER_DELAY_NS));
   let deadlines = slates_client::Deadlines::derive(
     slates_server::daemon::LIVENESS_BUDGET_NS,
@@ -5645,25 +5657,31 @@ fn place_copyset_routing_case(
     .unwrap()
     .unwrap();
   assert!(
-    audit_wait(|| all_hold(holders.iter().map(|daemon| {
-      daemon.fleet_holder_head(ObjectId(id.bytes)).map(|held| {
-        held
-          .and_then(|(_, bytes)| HeadValue::from_record_bytes(&bytes))
-          .is_some_and(|head| head.manifest == Some(manifest))
+    audit_wait(&daemons.iter().collect::<Vec<_>>(), || all_hold(
+      holders.iter().map(|daemon| {
+        daemon.fleet_holder_head(ObjectId(id.bytes)).map(|held| {
+          held
+            .and_then(|(_, bytes)| HeadValue::from_record_bytes(&bytes))
+            .is_some_and(|head| head.manifest == Some(manifest))
+        })
       })
-    }))),
+    )),
     "every candidate holds the sealed head, not just its earlier creation record"
   );
   (id, successor, unrelated)
 }
 
 /// A routing refusal is temporary; retry the original write id after a successor is available.
-fn retry_snapshot_until_served(client: &mut Client, volume: VolumeId) -> ReplyBody {
+fn retry_snapshot_until_served(
+  daemons: &[&Daemon],
+  client: &mut Client,
+  volume: VolumeId,
+) -> ReplyBody {
   let mut reply = ReplyBody::Refused {
     refusal: Refusal::NotFound,
   };
   assert!(
-    audit_wait(|| {
+    audit_wait(daemons, || {
       reply = client.call_retry(&RequestBody::Snapshot { volume });
       Ok(matches!(reply, ReplyBody::Snapshotted { .. }))
     }),
@@ -5738,7 +5756,9 @@ fn trace_routing_views(daemons: &[Daemon], object: ObjectId) {
 
 /// Distinguishes a failed takeover prerequisite from the routing exchange this history tests.
 fn assert_copyset_adopted(daemons: &[Daemon], successor_daemon: &Daemon, object: ObjectId) {
-  let adopted = audit_wait(|| successor_daemon.fleet_head_placed(object));
+  let adopted = audit_wait(&daemons.iter().collect::<Vec<_>>(), || {
+    successor_daemon.fleet_head_placed(object)
+  });
   trace::record(format_args!("owner-lookup adopted={adopted}"));
   if !adopted {
     for daemon in daemons {
@@ -5768,7 +5788,7 @@ fn assert_successor_serves(client: &mut Client, successor_daemon: &Daemon, volum
     refusal: Refusal::NotFound,
   };
   let mut homed_elsewhere = 0_u32;
-  let served = audit_wait(|| {
+  let served = audit_wait(&[successor_daemon], || {
     last = client.call(&RequestBody::Status { volume });
     if matches!(
       last,
@@ -6050,6 +6070,56 @@ fn a_committed_promotion_reaches_every_shards_lookup_view() {
   );
 }
 
+/// §4.8, D-14, learners: a learner learns every configuration the council commits, not only those that change the
+/// membership. Do form five members at `f = 1` (three voters, two learners) and let the council commit what a forming
+/// fleet commits (voter changes, each owner's neighbourhood settlement), none of which changes the membership a learner
+/// sees. Expect every member's council configuration to reach the newest any member holds, within the fleet's progress
+/// budget. Found by live-fixes' run of raft-chaos's fresh-member flow (CI diag-live-fixes-21, runs 2 and 6): a learner
+/// held configuration version 12 while the others held 17, reported its neighbourhood settlement 359 times for a
+/// generation the council had moved past, and never settled, since a learner fetched only when its membership view
+/// diverged from its configuration.
+#[test]
+fn a_learner_learns_configurations_that_leave_the_membership_alone() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c", "d", "e"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 1);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let mut versions: Vec<Result<(u64, u64), ObserveError>> = Vec::new();
+  let caught_up = poll_until(&observed, formation_deadline(), || {
+    versions = daemons.iter().map(Daemon::configuration_versions).collect();
+    let councils: Vec<u64> = versions
+      .iter()
+      .filter_map(|version| version.as_ref().ok().map(|(_, council)| *council))
+      .collect();
+    let newest = councils.iter().copied().max().unwrap_or(0);
+    Ok(
+      councils.len() == daemons.len()
+        && newest > 0
+        && councils.iter().all(|council| *council == newest),
+    )
+  });
+  let voters = daemons[0].council_voters();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    caught_up,
+    "every member's council reached the newest configuration (installed, council) per member: {versions:?}; voters \
+     {voters:?}"
+  );
+}
+
 /// AC (§4.8, D-14, learners): the council votes with a **small** set — the members up to the candidate floor
 /// `2f + 1` — and the rest are **learners** that do not vote but fetch the committed configuration over the
 /// transport. Five members at `f = 1` gives three voters and two learners. A learner never leads; and when
@@ -6081,10 +6151,12 @@ fn a_learner_fetches_the_councils_committed_configuration_over_the_transport() {
   // committed voter set, never predicted from the ids.
   let mut voters: Vec<HostId> = Vec::new();
   assert!(
-    audit_wait(|| daemons[0].council_voters().map(|committed| {
-      voters = committed.unwrap_or_default();
-      voters.len() == 3
-    })),
+    audit_wait(&daemons.iter().collect::<Vec<_>>(), || daemons[0]
+      .council_voters()
+      .map(|committed| {
+        voters = committed.unwrap_or_default();
+        voters.len() == 3
+      })),
     "the council's initial voter set committed: {voters:?}"
   );
   let learner_hosts: Vec<HostId> = hosts
@@ -9920,6 +9992,170 @@ fn submit_one_version(client: &mut Client) -> (VolumeId, VolumeId) {
   (green, work)
 }
 
+/// Shape: how long the forwarded submit's client waits for any one answer: past the owner's liveness budget, after
+/// which a deferred acceptance is answered `Overloaded`, with the record plane's placement on top.
+const FORWARDED_ANSWER_WAIT: Duration = PLACEMENT_DEADLINE;
+
+/// Polls `client` for `word`'s reply within [`FORWARDED_ANSWER_WAIT`]: the reply or the refusal, `None` if neither
+/// came.
+fn answer_within(
+  client: &mut slates_client::Client,
+  word: u64,
+) -> Option<Result<ReplyBody, String>> {
+  let began = Instant::now();
+  while began.elapsed() < FORWARDED_ANSWER_WAIT {
+    match client.poll_reply_word(word) {
+      Ok(Some(reply)) => return Some(Ok(reply)),
+      Ok(None) => std::thread::yield_now(),
+      Err(slates_client::ClientError::Refused(refusal)) => {
+        return Some(Err(format!("{refusal:?}")));
+      }
+      Err(e) => return Some(Err(format!("{e}"))),
+    }
+  }
+  None
+}
+
+/// A green and a work over it, created through `instance`'s node, which owns them.
+fn green_and_work_on(instance: &str) -> (VolumeId, VolumeId) {
+  let mut owner_client = Client::connect(instance);
+  let ReplyBody::GreenCreated { id: green } = owner_client.call(&RequestBody::CreateGreen {
+    name: "forwarded-green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("create green");
+  };
+  let ReplyBody::WorkCreated { id: work, .. } = owner_client.call(&RequestBody::CreateWork {
+    green,
+    name: "forwarded-work".to_owned(),
+  }) else {
+    panic!("create work");
+  };
+  (green, work)
+}
+
+/// §4.9 "Exactly-once", §4.16 "Commit" (AUD-11), found by fixtures' 1,000-client `f = 1` rung on 2026-11-06 (447
+/// submits answered `DuplicateRequest`): in a two-node `f = 1` fleet whose holder B withholds every merge record, a
+/// client on B submits a work whose green A owns. The forwarded submit runs on A, and its acceptance waits for the
+/// commit past the owner's liveness budget, so B's client is answered with a refusal retryable under the same id:
+/// `Overloaded` when A's deferred answer reaches B (this Mac), `OwnerUnreachable` when B's forward gives up on A first
+/// (CI's Linux runners, run 42348339167). Do: the client acknowledges everything it may; the holder's fault is lifted
+/// and the version commits; the client sends the submit again under its id (`begin_again`). Expect: the first answer
+/// one of those two; the resend
+/// answered `Submitted { version: Some(1) }` from the completion the commit recorded. Before: the acknowledgement
+/// covered the refused id, so A pruned it and refused the resend `DuplicateRequest`.
+#[test]
+fn a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let (green, work) = green_and_work_on(&instance_a);
+  let withheld = daemon_b.inject_merge_fault(slates_server::merge_service::MergeFault {
+    refuse_content_puts: false,
+    corrupt_next_inputs: false,
+    refuse_records: true,
+  });
+  let mut client = common::client::connect(daemon_b.instance());
+  let edited = client.edit(work, "f", 0, 0, b"hello");
+  let submit = RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  };
+  let word = client.begin(&submit).map(|id| id.word());
+  let first = word
+    .as_ref()
+    .ok()
+    .and_then(|word| answer_within(&mut client, *word));
+  let acknowledged = client.acknowledge_all();
+  let lifted = daemon_b.inject_merge_fault(slates_server::merge_service::MergeFault::default());
+  let both = [&daemon_a, &daemon_b];
+  let committed = poll_until(&both, PLACEMENT_DEADLINE, || {
+    daemon_a.merge_record_placed(green, 1)
+  });
+  let answer = word
+    .as_ref()
+    .ok()
+    .and_then(|word| resent_answer(&mut client, *word, &submit));
+  drop(client);
+  daemon_a.stop();
+  daemon_b.stop();
+  assert_resent_under_its_id(&ForwardedResend {
+    faulted: withheld.is_ok() && lifted.is_ok(),
+    edited: edited.is_ok(),
+    sent: word.is_ok(),
+    first,
+    acknowledged: acknowledged.is_ok(),
+    committed,
+    answer,
+  });
+}
+
+/// What the forwarded resend run observed, for [`assert_resent_under_its_id`].
+struct ForwardedResend {
+  faulted: bool,
+  edited: bool,
+  sent: bool,
+  first: Option<Result<ReplyBody, String>>,
+  acknowledged: bool,
+  committed: bool,
+  answer: Option<Result<ReplyBody, String>>,
+}
+
+/// Sends `submit` again under `word` and waits for its answer; `None` if it could not be sent or none came.
+fn resent_answer(
+  client: &mut slates_client::Client,
+  word: u64,
+  submit: &RequestBody,
+) -> Option<Result<ReplyBody, String>> {
+  match client.begin_again(word, submit) {
+    Ok(true) => answer_within(client, word),
+    _ => None,
+  }
+}
+
+/// The forwarded resend's assertions: refused `Overloaded` first, then, after the acknowledgement and the commit,
+/// answered with version 1 under its own id.
+fn assert_resent_under_its_id(run: &ForwardedResend) {
+  let setup = [
+    ("the holder's fault installs and lifts", run.faulted),
+    ("the forwarded edit is served", run.edited),
+    ("the submit is sent", run.sent),
+    ("the client acknowledges", run.acknowledged),
+    (
+      "the version commits once the holder takes its record",
+      run.committed,
+    ),
+  ];
+  let failed: Vec<&str> = setup
+    .iter()
+    .filter(|(_, held)| !held)
+    .map(|(what, _)| *what)
+    .collect();
+  assert!(
+    failed.is_empty(),
+    "the run's steps: {failed:?} did not hold"
+  );
+  assert!(
+    matches!(
+      &run.first,
+      Some(Err(refusal)) if refusal.starts_with("Overloaded") || refusal.starts_with("OwnerUnreachable")
+    ),
+    "the forwarded submit's acceptance outlived a budget, answered retryable under its id: {:?}",
+    run.first
+  );
+  assert!(
+    matches!(
+      run.answer,
+      Some(Ok(ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }))
+    ),
+    "the resend under its id meets the committed result: {:?}",
+    run.answer
+  );
+}
+
 /// AC-8.19/T-8.17 and §4.16 "Commit" ("committed at f+1 acknowledgements … issued only when every
 /// identity the version references is placed"; §4.10 placed-before-committed): in a two-node `f = 1`
 /// fleet the holder B is made to **refuse every content put** (an injected placement refusal). A green's
@@ -10245,6 +10481,131 @@ fn a_fresh_restart_keeps_its_serve_session_while_the_predecessor_retires() {
   assert!(stable, "the re-admission held — the rejoin did not flap");
 }
 
+/// A-92 piece 4b across a whole-RAM replacement: do form three nodes, let their owner shards exchange pair keys, then
+/// replace one with a fresh daemon at the same machine anchor (its RAM, and with it every key it made and received,
+/// gone). Expect, within the formation wait: every survivor accepts the replacement's new pair keys (none refused), and
+/// every survivor delivers its own pair keys to the replacement again (the replacement is served pairs). Found by
+/// raft-chaos (CI diag-25, kill-at-ack): the survivors kept the old incarnation's key for that anchor and refused the
+/// new one 789 times in 793, so the replacement's sealed entries never covered them and its live writes waited for
+/// good; and a survivor marks a pair delivered by anchor, so it never delivered again to the replacement, which then
+/// could not open the survivors' heads as their successor.
+#[test]
+fn a_node_replaced_with_fresh_ram_at_its_anchor_exchanges_pair_keys_with_its_survivors() {
+  let _serial = serialize_fleet_tests();
+  let pid = std::process::id();
+  let profiles: Vec<MachineProfile> = ["pair-fresh-a", "pair-fresh-b", "pair-fresh-c"]
+    .into_iter()
+    .map(profile)
+    .collect();
+  let anchors: Vec<HostId> = profiles.iter().map(anchor_of).collect();
+  let seeds: Vec<HostId> = anchors.iter().map(|anchor| member_id(*anchor, 0)).collect();
+  let mut identities: Vec<Vec<Identity>> = profiles.iter().map(|_| same_identity(2)).collect();
+  let certificates: Vec<_> = identities
+    .iter()
+    .map(|pair| pair[0].certificate())
+    .collect();
+  let (_ports_lease, ports) = mesh_serve_ports(profiles.len());
+  let peers = |node: usize| -> Vec<FleetPeer> {
+    profiles
+      .iter()
+      .enumerate()
+      .filter(|(peer, _)| *peer != node)
+      .map(|(peer, _)| fleet_peer_at(anchors[peer], seeds[peer], ports[peer], &certificates[peer]))
+      .collect()
+  };
+  let configs: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      fleet_config(
+        profile,
+        &format!("pair-fresh-{node}-{pid}"),
+        anchors[node],
+        seeds[node],
+        &peers(node),
+        &Default::default(),
+      )
+    })
+    .collect();
+  let mut daemons: Vec<Daemon> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      start_fleet_node(
+        profile,
+        configs[node].clone(),
+        identities[node].pop().unwrap(),
+        ports[node],
+        peers(node),
+        SegmentSource::Create {
+          name: format!("pair-fresh-{node}-{pid}"),
+        },
+      )
+    })
+    .collect();
+  daemons[0]
+    .bootstrap(true)
+    .expect("the operator explicitly creates this test's new fleet");
+  settle_initial_consensus(&daemons, &seeds, &Default::default(), Quorum { f: 1 });
+  // Every node was delivered pairs by both others before the replacement.
+  assert!(
+    audit_wait(&daemons.iter().collect::<Vec<_>>(), || all_hold(
+      daemons.iter().map(|daemon| {
+        refusal_count(daemon, "fleet.seal.pair_served").map(|served| served >= 2)
+      })
+    )),
+    "the pairs were exchanged before the replacement"
+  );
+  let replaced = daemons
+    .iter()
+    .position(|daemon| daemon.root_leads() == Ok(false))
+    .unwrap();
+  let old = daemons[replaced].member_identity().unwrap();
+  daemons.remove(replaced).stop();
+  let refused_before: Vec<u64> = daemons
+    .iter()
+    .map(|daemon| refusal_count(daemon, "fleet.seal.pair_refused").unwrap_or(0))
+    .collect();
+  let replacement = start_fleet_node(
+    &profiles[replaced],
+    configs[replaced].clone(),
+    identities[replaced].pop().unwrap(),
+    ports[replaced],
+    peers(replaced),
+    SegmentSource::Create {
+      name: format!("pair-fresh-replacement-{pid}"),
+    },
+  );
+  let fresh = replacement.member_identity().unwrap();
+  assert_ne!(old, fresh, "the replacement is a new incarnation");
+  daemons.push(replacement);
+  let survivors = daemons.len() - 1;
+  // The replacement is served a pair by each survivor, and no survivor refuses one of its pairs: a survivor's
+  // refusal is retried every period, so a refusing survivor's count keeps growing.
+  let exchanged = audit_wait(&daemons.iter().collect::<Vec<_>>(), || {
+    let served = refusal_count(&daemons[survivors], "fleet.seal.pair_served")?;
+    Ok(served >= u64::try_from(survivors).unwrap_or(u64::MAX))
+  });
+  let refused_after: Vec<u64> = daemons[..survivors]
+    .iter()
+    .map(|daemon| refusal_count(daemon, "fleet.seal.pair_refused").unwrap_or(0))
+    .collect();
+  let served_on_replacement = refusal_count(&daemons[survivors], "fleet.seal.pair_served");
+  let undelivered_on_replacement =
+    refusal_count(&daemons[survivors], "fleet.seal.pair_undelivered");
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert_eq!(
+    refused_after, refused_before,
+    "no survivor refused the replacement's pairs (the replacement counted undelivered {undelivered_on_replacement:?})"
+  );
+  assert!(
+    exchanged,
+    "each survivor delivered its pairs to the replacement again: served {served_on_replacement:?}"
+  );
+}
+
 /// AC-8.1, §4.8, AUD-07: lose a whole anchor, rejoin through the surviving council under a
 /// fresh identity, then lose the leader and require the replacement's vote for the next election.
 /// The loss is **forced into the interrupted-discovery phase**: the victim holds its discovery replies
@@ -10327,11 +10688,13 @@ fn a_whole_ram_replacement_joins_as_a_fresh_voter_and_commits_after_another_loss
     .expect("the operator explicitly creates this test's new fleet");
   settle_initial_consensus(&daemons, &seeds, &Default::default(), Quorum { f: 1 });
   assert!(
-    audit_wait(|| all_hold(daemons.iter().map(|daemon| {
-      daemon
-        .council_members()
-        .map(|members| before.iter().all(|host| members.contains(host)))
-    }))),
+    audit_wait(&daemons.iter().collect::<Vec<_>>(), || all_hold(
+      daemons.iter().map(|daemon| {
+        daemon
+          .council_members()
+          .map(|members| before.iter().all(|host| members.contains(host)))
+      })
+    )),
     "the first bootstrap admits the live identities: {:?}",
     daemons
       .iter()
@@ -10366,11 +10729,13 @@ fn a_whole_ram_replacement_joins_as_a_fresh_voter_and_commits_after_another_loss
   assert_eq!(replacement.council_leads(), Ok(false));
   daemons.push(replacement);
   assert!(
-    audit_wait(|| all_hold(daemons.iter().map(|daemon| {
-      daemon.council_members().map(|members| {
-        members.len() == profiles.len() && members.contains(&fresh) && !members.contains(&old)
+    audit_wait(&daemons.iter().collect::<Vec<_>>(), || all_hold(
+      daemons.iter().map(|daemon| {
+        daemon.council_members().map(|members| {
+          members.len() == profiles.len() && members.contains(&fresh) && !members.contains(&old)
+        })
       })
-    }))),
+    )),
     "the surviving quorum admits the fresh member: {:?}",
     daemons
       .iter()
@@ -10383,14 +10748,18 @@ fn a_whole_ram_replacement_joins_as_a_fresh_voter_and_commits_after_another_loss
     .map(|daemon| daemon.member_identity().unwrap())
     .collect();
   assert!(
-    audit_wait(|| audit_voters_match(&daemons, &voters)),
+    audit_wait(&daemons.iter().collect::<Vec<_>>(), || audit_voters_match(
+      &daemons, &voters
+    )),
     "every replacement voter has received the committed membership transition: {:?}",
     daemons
       .iter()
       .map(Daemon::council_voters)
       .collect::<Vec<_>>()
   );
-  assert!(audit_wait(|| one_leader(&daemons)));
+  assert!(audit_wait(&daemons.iter().collect::<Vec<_>>(), || {
+    one_leader(&daemons)
+  }));
   let victim = daemons
     .iter()
     .position(|daemon| daemon.council_leads() == Ok(true) && daemon.member_identity() != Ok(fresh))
@@ -10410,7 +10779,9 @@ fn a_whole_ram_replacement_joins_as_a_fresh_voter_and_commits_after_another_loss
   // Targeted capture: on failure, dump every survivor's council and SWIM state before stopping them, so a
   // stalled second-loss commit names its stage (detection, election, or replication) instead of a bare
   // timeout (docs/wip/TBD_FIXES.md §1).
-  let committed = audit_wait(|| audit_voters_match(&daemons, &remaining));
+  let committed = audit_wait(&daemons.iter().collect::<Vec<_>>(), || {
+    audit_voters_match(&daemons, &remaining)
+  });
   let snapshot = council_snapshot(&daemons);
   for daemon in daemons {
     daemon.stop();
@@ -10566,7 +10937,7 @@ fn a_warm_fleet_restart_recovers_its_root_and_regional_quorums() {
     );
   }
   assert!(
-    audit_wait(|| Ok(
+    audit_wait(&daemons.iter().collect::<Vec<_>>(), || Ok(
       audit_voters_match(&daemons, &members)?
         && one_root_leader(&daemons)?
         && one_leader(&daemons)?
@@ -10583,7 +10954,9 @@ fn a_warm_fleet_restart_recovers_its_root_and_regional_quorums() {
     .map(|daemon| daemon.member_identity().unwrap())
     .collect();
   assert!(
-    audit_wait(|| audit_voters_match(&daemons, &survivors)),
+    audit_wait(&daemons.iter().collect::<Vec<_>>(), || audit_voters_match(
+      &daemons, &survivors
+    )),
     "the restarted voters must commit a new retirement: survivors {survivors:?}; {}",
     council_state(&daemons)
   );
@@ -10596,7 +10969,7 @@ fn a_warm_fleet_restart_recovers_its_root_and_regional_quorums() {
   recover_root_from_survivors(&daemons);
   let representative = *survivors.iter().min_by_key(|host| host.0).unwrap();
   assert!(
-    audit_wait(|| Ok(
+    audit_wait(&daemons.iter().collect::<Vec<_>>(), || Ok(
       all_hold(daemons.iter().map(|daemon| {
         daemon
           .root_voters()
@@ -10693,8 +11066,8 @@ fn hold_the_victims_discovery_replies(daemons: &[Daemon], replaced: usize, old: 
     "the withhold fault installs on the victim: {installed:?}"
   );
   assert!(
-    audit_wait(
-      || all_hold(daemons.iter().enumerate().map(|(node, daemon)| {
+    audit_wait(&daemons.iter().collect::<Vec<_>>(), || all_hold(
+      daemons.iter().enumerate().map(|(node, daemon)| {
         if node == replaced {
           return Ok(true);
         }
@@ -10704,8 +11077,8 @@ fn hold_the_victims_discovery_replies(daemons: &[Daemon], replaced: usize, old: 
         daemon
           .fleet_pending_discovery()
           .map(|pending| pending.contains(&old))
-      }))
-    ),
+      })
+    )),
     "each survivor has a discovery exchange to the victim pending: {:?}",
     daemons
       .iter()
@@ -10735,7 +11108,9 @@ fn discovery_ended_typed(daemon: &Daemon) -> Result<bool, ObserveError> {
 /// deliveries the unbounded exchange had stranded (271 replication attempts, no append).
 fn assert_survivors_reach_the_replacement(daemons: &[Daemon], survivors: usize, fresh: HostId) {
   assert!(
-    audit_wait(|| all_hold(daemons[..survivors].iter().map(discovery_ended_typed))),
+    audit_wait(&daemons.iter().collect::<Vec<_>>(), || all_hold(
+      daemons[..survivors].iter().map(discovery_ended_typed)
+    )),
     "each survivor's discovery exchange to the dead incarnation ended typed: {:?}; each survivor's record links \
      (host, out on loan), the members it holds, its periods and its exchange bound (ns) {:?}",
     daemons[..survivors]
@@ -10756,11 +11131,13 @@ fn assert_survivors_reach_the_replacement(daemons: &[Daemon], survivors: usize, 
       .collect::<Vec<_>>()
   );
   assert!(
-    audit_wait(|| all_hold(daemons[..survivors].iter().map(|daemon| {
-      daemon
-        .fleet_record_links()
-        .map(|links| links.iter().any(|(host, _)| *host == fresh))
-    }))),
+    audit_wait(&daemons.iter().collect::<Vec<_>>(), || all_hold(
+      daemons[..survivors].iter().map(|daemon| {
+        daemon
+          .fleet_record_links()
+          .map(|links| links.iter().any(|(host, _)| *host == fresh))
+      })
+    )),
     "each survivor holds a record link to the fresh member: {:?}",
     daemons[..survivors]
       .iter()
@@ -10771,40 +11148,21 @@ fn assert_survivors_reach_the_replacement(daemons: &[Daemon], survivors: usize, 
     .council_contact()
     .expect("the replacement's council contact is observed at its admission");
   assert!(
-    audit_wait(|| daemons[survivors]
+    audit_wait(&daemons.iter().collect::<Vec<_>>(), || daemons[survivors]
       .council_contact()
       .map(|contact| contact > contact_at_admission)),
     "the leader's appends reach the replacement: its council contact climbs past {contact_at_admission}"
   );
 }
 
-/// The audit run has a strict wall-clock bound, including when the normal fleet period budget
-/// would keep diagnosing a live but non-converging coordinator. The bound is the existing formation SLO.
-/// The verdicts are [`poll_until`]'s: an ask the daemons could not answer keeps the wait going, paced; one
-/// they can never answer ends it at once, saying why.
+/// A wait judged by the fleet's own progress, as [`poll_until`] judges one: the condition holds, or the slowest of
+/// `daemons` ran a whole budget of its own coordinator periods without it, or none of them advanced for the frozen
+/// window. Until 2026-11-07 this was a fixed 30 s of wall time (`formation_deadline`, a tuning number, R3): under 36
+/// spinners on an 18-core Mac the fleet suite failed 2 to 9 tests a run "initial membership did not commit" while
+/// every coordinator kept turning, and fleets measured forming in 37 to 108 s now and then, 3 to 10 s mostly.
 #[track_caller]
-fn audit_wait(mut condition: impl FnMut() -> Result<bool, ObserveError>) -> bool {
-  let site = std::panic::Location::caller();
-  let began = Instant::now();
-  let (_pace_sender, pace) = std::sync::mpsc::channel::<()>();
-  while began.elapsed() < formation_deadline() {
-    match verdict(condition()) {
-      Verdict::Holds => return true,
-      Verdict::Observed => {}
-      Verdict::Unavailable(_) => {
-        let _ = pace.recv_timeout(UNAVAILABLE_PACE);
-      }
-      Verdict::Terminal(refusal) => {
-        eprintln!(
-          "audit wait {} ended: the daemon can never answer — {refusal}",
-          site_of(site)
-        );
-        return false;
-      }
-    }
-    std::thread::yield_now();
-  }
-  false
+fn audit_wait(daemons: &[&Daemon], condition: impl FnMut() -> Result<bool, ObserveError>) -> bool {
+  poll_until(daemons, formation_deadline(), condition)
 }
 
 /// Every node has received the same committed voter set, with no joint transition remaining (a voter set
@@ -10928,7 +11286,7 @@ fn an_unlisted_node_enrolls_through_one_seed_and_joins_the_existing_quorum() {
     .iter()
     .map(|daemon| daemon.member_identity().unwrap())
     .collect();
-  let joined = audit_wait(|| {
+  let joined = audit_wait(&daemons.iter().collect::<Vec<_>>(), || {
     all_hold(daemons.iter().map(|daemon| {
       let voters = daemon.council_voters()?;
       let meshed = daemon.fleet_meshed()?;
@@ -11222,7 +11580,7 @@ fn a_submit_made_while_the_council_forms_is_answered_once_its_record_commits() {
   let mut created = ReplyBody::Refused {
     refusal: Refusal::ConsensusNotInitialized,
   };
-  let made = audit_wait(|| {
+  let made = audit_wait(&daemons.iter().collect::<Vec<_>>(), || {
     created = client.call(&RequestBody::CreateGreen {
       name: "green".to_owned(),
       require_evidence: false,
@@ -12930,7 +13288,7 @@ fn a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget()
     panic!("setup: the volume was not created on A");
   };
   let mut forwarded = Client::connect(daemons[1].instance());
-  let reached = audit_wait(|| {
+  let reached = audit_wait(&daemons.iter().collect::<Vec<_>>(), || {
     Ok(matches!(
       forwarded.call(&RequestBody::Status { volume: id }),
       ReplyBody::Status { .. }
@@ -13313,15 +13671,17 @@ fn the_network_exports_teardown_is_its_attachments() {
   let mut client = Client::connect(node.daemon.instance());
   // The group forms within a few protocol periods of the bootstrap; until then a create is refused typed.
   let mut created = None;
-  let formed = audit_wait(|| match client.call(&scratch("export-teardown")) {
-    ReplyBody::Created { id } => {
-      created = Some(id);
-      Ok(true)
+  let formed = audit_wait(&[&node.daemon], || {
+    match client.call(&scratch("export-teardown")) {
+      ReplyBody::Created { id } => {
+        created = Some(id);
+        Ok(true)
+      }
+      ReplyBody::Refused {
+        refusal: slates_ipc::protocol::Refusal::ConsensusNotInitialized,
+      } => Ok(false),
+      other => panic!("the volume is created: {other:?}"),
     }
-    ReplyBody::Refused {
-      refusal: slates_ipc::protocol::Refusal::ConsensusNotInitialized,
-    } => Ok(false),
-    other => panic!("the volume is created: {other:?}"),
   });
   let volume = created.unwrap_or_else(|| panic!("the group formed: {formed}"));
   let path = capability_path(&node.daemon, "export-teardown");
@@ -13631,7 +13991,9 @@ fn an_unanswered_forward_is_sent_again_within_the_takeover_bound() {
     panic!("create on the owner");
   };
   let mut warm = Client::connect(&foreign_instance);
-  let reached = audit_wait(|| Ok(status_answers(&mut warm, id)));
+  let reached = audit_wait(&daemons.iter().collect::<Vec<_>>(), || {
+    Ok(status_answers(&mut warm, id))
+  });
   /// Shape: the owner's delay: past one forward's budget on loopback (one liveness budget, the path's tail near zero).
   const LATE_NS: u64 = slates_server::daemon::LIVENESS_BUDGET_NS / 2 * 3;
   /// Shape: when the delay is lifted: inside the first forward's wait, so only that one goes unanswered.
@@ -13715,7 +14077,9 @@ fn a_read_whose_owner_answered_past_the_takeover_bound_is_retried_by_the_client(
   let (id, _snapshot) =
     write_and_snapshot(&mut Client::connect(owner_daemon.instance()), "retried");
   let mut warm = Client::connect(&foreign_instance);
-  let reached = audit_wait(|| Ok(status_answers(&mut warm, id)));
+  let reached = audit_wait(&daemons.iter().collect::<Vec<_>>(), || {
+    Ok(status_answers(&mut warm, id))
+  });
   let bound = Duration::from_nanos(slates_server::config::FAILOVER_SLO_NS);
   let delayed = owner_daemon.inject_serve_delay(Some(
     u64::try_from((bound + Duration::from_secs(2)).as_nanos()).unwrap(),

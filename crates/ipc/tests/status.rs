@@ -32,6 +32,7 @@ fn report() -> ReplyBody {
     refused_log: 83,
     voters: 89,
     joint: true,
+    voter_ids: vec![97, 101, 103],
   };
   ReplyBody::DaemonStatus {
     report: Box::new(DaemonReport {
