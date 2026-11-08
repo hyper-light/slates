@@ -1443,13 +1443,21 @@
     four profiles end to end, every volume taken over whole at epoch 2: unshaped 1,000 writes, p99 1.2 ms, 2.5 s;
     wan 300, p99 423 ms, 17.7 s; wan-loss 300, p99 407 ms, 18.8 s; ceiling 50, p50 1.55 s, 52.6 s. The five-node flow
     passed 7 of 8 with no fence or NoLoss violation, judged on the successor's recorded holders; in its decisive run
-    phase one waited 28 times for the stopped holder, then took the volume over whole. The eighth was the open register
-    stall (`fleet.takeover.lost`, live-fixes).
-  - Fixed since (live-fixes, 2026-11-07, f2f9477e; the entry "a node back at its anchor with fresh RAM had every
-    pair key refused" above): a node replaced at the same machine anchor (same certificate) never answered a live write. Its
+    phase one waited 28 times for the stopped holder, then took the volume over whole. The eighth counted
+    `fleet.takeover.lost`, and it is explained, no product defect: the flow's expectation was wrong. raft-chaos's diag-28
+    run 8 dumped the object's settled cohort [a_old, b, e]: a_old was the replaced member, its RAM gone, and the owner b
+    crashed before it had re-shipped and settled onto the new neighbourhood. That is two failures of one cohort at
+    f = 1, and §4.8 calls the object lost. raft-chaos's flow now waits for each node's settled generation to equal its
+    neighbourhood generation before it crashes the owner. A stall after that wait with no takeover counter moving is
+    live-fixes'.
+  - Fixed (2026-11-07, live-fixes, f2f9477e; the entry "a node back at its anchor with fresh RAM had every pair key
+    refused" above): a node replaced at the same machine anchor (same certificate) never answered a live write. Its
     neighbours kept the old node's pair key and refused the new one (`fleet.seal.pair_refused` 789 of 793 served, the
     owner `pair_undelivered` 1,580), so the whole entry never carried their keys (`held_back.keys` 394). Before the
-    answering gate such writes were answered and could not be served at a takeover (`takeover_refused.open`).
+    answering gate such writes were answered and could not be served at a takeover (`takeover_refused.open`). A pair key
+    from a successor lineage now retires the old one
+    (`docs/bugs/2026-11-07-a-node-back-at-its-anchor-with-fresh-ram-had-every-pair-key-refused.md`): 18 of 18 runs, 15
+    of them with a replaced-node owner.
   - **Fixed (2026-11-07): a holder set of 2f+1 under an f-count.** Once the shipper follows the placement, a set can
     have 2f+1 members (the placement moved off the owner: CI diag-20 run 7 recorded e, c, b at f = 1). The shipper
     counted a write durable at f of a set while phase one counts f+1, and 1 + 2 = |H|: the successor counted itself and
