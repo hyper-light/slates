@@ -1,8 +1,9 @@
 //! The dirty-page write-back rule's FUSE side, by use over a real volume bridge (§4.6 "Cache posture";
 //! `docs/bugs/2026-10-21-a-dirty-shared-map-page-overwrites-a-later-write-through-another-path.md`): a cache write-back
-//! is told from a process's write by its `FUSE_WRITE_CACHE` mark; a masked one keeps the volume's newer bytes and
-//! answers the whole size; the parts applied, which are also what the daemon logs, leave out exactly the stale ranges;
-//! and a file's first writable open drops the kernel's cache so every page cached after it has a known fetch.
+//! is told from a process's write by its `FUSE_WRITE_CACHE` mark; one is judged whole by the rule every transport shares
+//! (A-248: applied, applied over stale bytes equal to the file's, or refused), its stale bytes compared with the
+//! volume's bytes however many reads the bridge's cap takes; and a file's first writable open drops the kernel's cache
+//! so every page cached after it has a known fetch.
 #![allow(
   clippy::unwrap_used,
   clippy::expect_used,
@@ -12,12 +13,13 @@
 // Stale ranges are lists of byte ranges; a list holding one range is not the numbers inside it.
 #![allow(clippy::single_range_in_vec_init)]
 
+use slates_bridge_core::dax_backing::read_whole;
 use slates_bridge_core::{Attachments, Bridge, ObjectId, OpContext, Rights, View};
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode, WRITE_CACHE, open};
 use slates_bridge_fuse::bridge::{
   cache_writeback, clear_keep_cache, created_node, dispatch, granted_handle, opens_for_writing,
-  serve_cache_write, unmasked_segments,
 };
+use slates_bridge_fuse::coherence::{WritebackVerdict, judge_writeback};
 use slates_bridge_fuse::reply::EntryOut;
 use slates_bridge_fuse::volume_bridge::VolumeBridge;
 use slates_db::catalog::{Principal, VolumeId};
@@ -106,39 +108,30 @@ fn a_cache_write_back_is_told_from_a_process_write() {
   assert_eq!(cache_writeback(&read), None);
 }
 
-/// The parts a write-back applies, and that its log records. Do: ask for the unmasked parts of a 100-byte write at 1000
-/// against stale ranges before, inside, touching and covering it. Expect exactly the bytes outside the stale ranges, as
-/// file offsets and data ranges, in order.
-#[test]
-#[allow(clippy::single_range_in_vec_init)] // a list of one stale range, not the numbers inside it
-fn the_applied_parts_leave_out_exactly_the_stale_ranges() {
-  assert_eq!(
-    unmasked_segments(1000, 100, &[]),
-    vec![(1000, 0..100)],
-    "nothing stale: all of it"
-  );
-  assert_eq!(
-    unmasked_segments(1000, 100, &[0..10, 1020..1030, 1090..1200]),
-    vec![(1000, 0..20), (1030, 30..90)],
-    "a range before it changes nothing; inside, it splits; past the end, it trims"
-  );
-  assert_eq!(
-    unmasked_segments(1000, 100, &[1000..1050, 1050..1100]),
-    Vec::<(u64, std::ops::Range<usize>)>::new(),
-    "touching ranges that cover it leave nothing"
-  );
-  assert_eq!(
-    unmasked_segments(1000, 100, &[900..1000, 1100..1200]),
-    vec![(1000, 0..100)],
-    "ranges that only touch its ends leave all of it"
-  );
-}
+/// Shape: the judged file's length, twice the volume bridge's 256 KiB read cap, so one stale range over all of it is
+/// read back in more than one call.
+const JUDGED_BYTES: usize = 512 * 1024;
+/// Shape: the bytes the test writes the judged file in at a time.
+const WRITE_PIECE: usize = 64 * 1024;
 
-/// A masked write-back by use. Do: write a page of `A` through the bridge; then serve a cache write-back of a page of
-/// `M` held stale over bytes 100–200 (another path changed them after the page was fetched). Expect the reply to answer
-/// the whole page, 100 bytes kept back, and the volume to hold `M` everywhere but bytes 100–200, which keep their `A`.
+/// One write-back the rule judges: what it is, its stale ranges (`None` when the states cannot tell), its offset and
+/// bytes, and the verdict it must get.
+type Judged<'a> = (
+  &'a str,
+  Option<Vec<std::ops::Range<u64>>>,
+  u64,
+  &'a [u8],
+  WritebackVerdict,
+);
+
+/// A-248, the shared write-back rule by use over a real volume bridge, its reader the one the FUSE transports use. Do:
+/// fill a file of twice the bridge's read cap with `A` and judge write-backs of it. Expect: none stale, applied; stale
+/// bytes that differ from the file's (a store over another path's change), a conflict; stale bytes equal to the file's,
+/// identical, also when the stale range spans the whole file and so more than one capped read; a stale range past the
+/// file's end, which the file cannot show equal, a conflict; and states that cannot tell, unknown. Only the first and
+/// the identical ones apply.
 #[test]
-fn a_masked_write_back_keeps_the_newer_bytes_and_answers_the_whole_page() {
+fn a_write_back_is_judged_whole_against_the_files_bytes_now() {
   let mut store = store();
   let mut vol = volume(&mut store);
   let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
@@ -148,32 +141,91 @@ fn a_masked_write_back_keeps_the_newer_bytes_and_answers_the_whole_page() {
     .create(ObjectId::new(root, 0), &cx, "f", 0o644, 0)
     .unwrap();
   let object = ObjectId::new(file.ino, 0);
-  bridge.write(object, &cx, 0, &[b'A'; PAGE]).unwrap();
-
-  let request = message(
-    Opcode::Write,
-    9,
-    file.ino,
-    &write_body(0, WRITE_CACHE, &[b'M'; PAGE]),
+  for at in (0..JUDGED_BYTES).step_by(WRITE_PIECE) {
+    bridge
+      .write(
+        object,
+        &cx,
+        u64::try_from(at).unwrap(),
+        &[b'A'; WRITE_PIECE],
+      )
+      .unwrap();
+  }
+  let mut reads = 0usize;
+  let mut judge = |bridge: &mut VolumeBridge<'_>,
+                   stale: Option<&[std::ops::Range<u64>]>,
+                   at: u64,
+                   data: &[u8]| {
+    judge_writeback(stale, at, data, |offset, len, out| {
+      reads += 1;
+      read_whole(bridge, &cx, object, (offset, len), out).is_ok()
+    })
+  };
+  let page = vec![b'M'; PAGE];
+  let mut store_and_stale = vec![b'A'; PAGE];
+  store_and_stale[10] = b'M';
+  let whole = vec![b'A'; JUDGED_BYTES];
+  let whole_end = u64::try_from(JUDGED_BYTES).unwrap();
+  let cases: [Judged<'_>; 6] = [
+    (
+      "nothing stale",
+      Some(vec![]),
+      0,
+      &page,
+      WritebackVerdict::Apply,
+    ),
+    (
+      "a store over stale bytes another path changed",
+      Some(vec![100..200]),
+      0,
+      &page,
+      WritebackVerdict::Conflict,
+    ),
+    (
+      "stale bytes equal to the file's",
+      Some(vec![100..200]),
+      0,
+      &store_and_stale,
+      WritebackVerdict::Identical,
+    ),
+    (
+      "one stale range past the read cap",
+      Some(vec![0..whole_end]),
+      0,
+      &whole,
+      WritebackVerdict::Identical,
+    ),
+    (
+      "a stale range past the file's end",
+      Some(vec![whole_end..whole_end + 100]),
+      whole_end,
+      &[b'A'; 100],
+      WritebackVerdict::Conflict,
+    ),
+    (
+      "states that cannot tell",
+      None,
+      0,
+      &page,
+      WritebackVerdict::Unknown,
+    ),
+  ];
+  for (case, stale, at, data, expected) in cases {
+    let verdict = judge(&mut bridge, stale.as_deref(), at, data);
+    assert_eq!(verdict, expected, "{case}");
+    assert_eq!(
+      verdict.applies(),
+      matches!(
+        expected,
+        WritebackVerdict::Apply | WritebackVerdict::Identical
+      ),
+      "{case}: applied exactly when no stale byte differs"
+    );
+  }
+  assert!(
+    reads >= 4,
+    "non-vacuous: the stale bytes were read back, {reads} time(s)"
   );
-  let mut out = vec![0u8; REPLY_BYTES];
-  let (len, kept_back) = serve_cache_write(&request, &mut bridge, &cx, &[100..200], &mut out);
-  assert_eq!(kept_back, 100, "the stale bytes were kept back");
-  let error = i32::from_le_bytes(out[4..8].try_into().unwrap());
-  let size = u32::from_le_bytes(out[OUT_HEADER_LEN..OUT_HEADER_LEN + 4].try_into().unwrap());
-  assert_eq!(
-    (len > 0, error, size),
-    (true, 0, u32::try_from(PAGE).unwrap()),
-    "the whole page answered"
-  );
-
-  let mut held = Vec::new();
-  bridge
-    .read(object, &cx, 0, u32::try_from(PAGE).unwrap(), &mut held)
-    .unwrap();
-  let mut expected = vec![b'M'; PAGE];
-  expected[100..200].fill(b'A');
-  assert_eq!(held, expected, "the newer bytes survived the stale page");
 }
 
 /// A file with one forever-cached page, created through `bridge`: its node.

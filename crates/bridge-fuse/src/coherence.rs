@@ -663,6 +663,72 @@ impl FileStates {
   }
 }
 
+/// The verdict on a cache write-back by the dirty-page write-back rule, one rule for every transport that writes back a
+/// client's cached pages (§4.6 "Cache posture"): the host FUSE mount (`crate::channel`, A-248), a virtio-fs guest
+/// (`crate::guest_writeback`) and an NFS v3 connection (`slates-server`'s `nfs_writeback`, A-192). A write-back is the
+/// client's cached copy of a page coming back whole: its stores, and the rest as it was fetched. It is applied whole or
+/// refused whole, never applied around its stale bytes, since choosing bytes between the store and the other path's
+/// change is an inferred merge (CLAUDE.md, banned item 11; Ada's decision of 2026-11-07, "Refuse, like NFS").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WritebackVerdict {
+  /// No byte of it is stale: applied whole.
+  Apply,
+  /// Some bytes are stale, and each equals the file's byte now: applied whole, since it changes nothing there.
+  Identical,
+  /// A stale byte differs from the file's now: refused whole, `EIO`, and the other path's change survives.
+  Conflict,
+  /// Which bytes are stale cannot be told (the file's states lost, the journal no longer reaching back, an ambiguous
+  /// read): refused whole, `EIO`.
+  Unknown,
+}
+
+impl WritebackVerdict {
+  /// Whether the write-back is applied (whole, as every applied one is).
+  pub fn applies(self) -> bool {
+    matches!(self, WritebackVerdict::Apply | WritebackVerdict::Identical)
+  }
+}
+
+/// Judges a cache write-back of `data` at `at` whose stale bytes are `stale` ([`PageStates::stale_after`]; `None` when
+/// it cannot be told). Stale bytes are compared with the file's bytes now, read by `read_now(offset, len, out)`, which
+/// fills `out` with up to `len` bytes from `offset`, fewer only at the file's end, and answers `false` when the read is
+/// refused. A stale range the write does not hold, a short read or a refused one is a conflict: the rule refuses what it
+/// cannot show changes nothing.
+pub fn judge_writeback(
+  stale: Option<&[std::ops::Range<u64>]>,
+  at: u64,
+  data: &[u8],
+  mut read_now: impl FnMut(u64, u64, &mut Vec<u8>) -> bool,
+) -> WritebackVerdict {
+  let Some(stale) = stale else {
+    return WritebackVerdict::Unknown;
+  };
+  if stale.is_empty() {
+    return WritebackVerdict::Apply;
+  }
+  let mut now = Vec::new();
+  let identical = stale.iter().all(|range| {
+    let within = |offset: u64| {
+      offset
+        .checked_sub(at)
+        .and_then(|from| usize::try_from(from).ok())
+    };
+    let Some(written) = within(range.start)
+      .zip(within(range.end))
+      .and_then(|(from, to)| data.get(from..to))
+    else {
+      return false;
+    };
+    let len = u64::try_from(written.len()).unwrap_or(u64::MAX);
+    read_now(range.start, len, &mut now) && now == written
+  });
+  if identical {
+    WritebackVerdict::Identical
+  } else {
+    WritebackVerdict::Conflict
+  }
+}
+
 /// What this mount's kernel holds of the volume (§4.6 "Cache posture"; A-141): every node it references, with the
 /// lookups it holds on it, and every name it was handed out under. When the mount falls behind the journal's retention
 /// it is told [`slates_bridge_core::Invalidation::Everything`] and invalidates exactly these

@@ -1,0 +1,45 @@
+name: DIAG bug-sweep 20, A-248's refused pages left in the kernel's cache (not for main)
+
+# A diagnostics branch, never merged. The red-check of dropping a refused write-back's pages: this tree has the directed
+# test and the rest of A-248, with `refused_writebacks_told` sending nothing. Each run's own exit is printed.
+
+on:
+  push:
+    branches: [diag-bug-sweep-20]
+
+jobs:
+  red:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_INCREMENTAL: "0"
+      SLATES_TEST_CLI: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: FUSE and the operator's grant
+        run: |
+          command -v fusermount3 >/dev/null || { sudo apt-get update && sudo apt-get install -y fuse3; }
+          grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+          uname -a
+      - name: The directed test and the chaos history, three runs each
+        run: |
+          set +e
+          for run in 1 2 3; do
+            cargo test -p slates-bridge-fuse --test coherence_mount -- --test-threads=1 --nocapture --exact \
+              a_refused_write_back_drops_every_page_it_carried_from_the_kernels_cache
+            echo "=== directed run $run exit $?"
+            cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture --exact \
+              unsynced_map_stores_a_second_mount_and_the_sdk_agree_at_every_sync_point
+            echo "=== chaos run $run exit $?"
+          done
+          exit 0
