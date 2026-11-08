@@ -1,0 +1,39 @@
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' failed - Err(Error { kind: ToolExecError, message: "command did not execute successfully (status code exit code: 2): \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Tools\\\\MSVC\\\\14.51.36231\\\\bin\\\\HostX64\\\\x64\\\\cl.exe\" \"-nologo\" \"-MD\" \"-Z7\" \"-Brepro\" \"-WX\" \"-W4\" \"-FoD:\\\\a\\\\slates\\\\slates\\\\target\\\\debug\\\\build\\\\aws-lc-sys-0bf3c6c5352b74c6\\\\out\\\\out-stdalign_check\\\\e1bacabfea35bee3-stdalign_check.o\" \"-c\" \"D:\\\\a\\\\slates\\\\slates\\\\vendor\\\\aws-lc-sys\\\\aws-lc\\\\tests\\\\compiler_features_tests\\\\stdalign_check.c\"" }).
+test an_overlay_of_a_windows_directory_keeps_its_files_read_only_state_and_attributes ... slates anchor: instance wfattrbase9344 up; daemon pid 5848; 1 shards
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.74s
+exit 0
+test own_mounts::tests::the_set_records_its_own_mounts_up_to_its_bound ... ok
+test own_mounts::tests::a_forget_clears_every_slot_holding_its_id ... ok
+test tests::a_name_that_is_not_one_entry_is_refused_as_absent ... ok
+test tests::a_windows_entrys_mode_is_drvfs_mapping_and_its_bits_are_kept_apart ... ok
+test tests::the_granularity_table_is_what_the_racy_rule_assumes_and_unknown_is_the_coarse_arm ... ok
+test windows_records::tests::a_directory_chain_yields_its_names_in_order ... ok
+test windows_records::tests::a_link_record_yields_the_target_a_user_sees ... ok
+test windows_records::tests::a_malformed_directory_chain_is_refused_typed ... ok
+test windows_records::tests::a_malformed_link_record_is_refused_typed ... ok
+test own_mounts::tests::a_forget_after_two_threads_record_one_id_at_once_leaves_it_unrecorded ... ok
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+test a_lookup_that_is_not_one_entry_never_leaves_the_base ... ok
+test a_final_component_swapped_for_a_link_is_refused_and_an_open_file_keeps_its_bytes ... ok
+test an_overlay_over_the_workspace_tree_costs_one_open_and_reads_the_disk ... ok
+test a_retained_root_keeps_naming_the_base_after_its_path_becomes_a_junction ... ok
+test the_host_lists_opens_and_reads_the_workspace_tree ... ok
+test the_host_refuses_the_wrong_kind_and_releases_handles ... ok
+test an_overlay_over_the_workspace_tree_digests_a_file_as_the_disk_holds_it ... ok
+test an_intermediate_swapped_for_a_junction_is_never_traversed ... ok
+test a_files_times_are_unix_nanoseconds_and_an_in_place_edit_moves_them ... ok
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+exit 0
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' failed - Err(Error { kind: ToolExecError, message: "command did not execute successfully (status code exit code: 2): \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Tools\\\\MSVC\\\\14.51.36231\\\\bin\\\\HostX64\\\\x64\\\\cl.exe\" \"-nologo\" \"-MD\" \"-Z7\" \"-Brepro\" \"-WX\" \"-W4\" \"-FoD:\\\\a\\\\slates\\\\slates\\\\target\\\\debug\\\\build\\\\aws-lc-sys-0bf3c6c5352b74c6\\\\out\\\\out-stdalign_check\\\\e1bacabfea35bee3-stdalign_check.o\" \"-c\" \"D:\\\\a\\\\slates\\\\slates\\\\vendor\\\\aws-lc-sys\\\\aws-lc\\\\tests\\\\compiler_features_tests\\\\stdalign_check.c\"" }).
+test a_directory_holding_a_file_is_not_removed ... slates anchor: instance wsrmdir9212 up; daemon pid 4856; 2 shards
+test a_file_shrunk_then_extended_by_its_end_reaches_the_size ... slates anchor: instance wsextend9212 up; daemon pid 9540; 2 shards
+test a_file_shrunk_then_extended_by_zero_writes_reaches_the_size ... slates anchor: instance wschsize9212 up; daemon pid 6524; 2 shards
+test a_files_attributes_are_kept_and_its_read_only_state_refuses_a_delete ... slates anchor: instance wsattributes9212 up; daemon pid 1440; 2 shards
+test a_files_creation_time_set_through_the_drive_is_kept ... slates anchor: instance wscreated9212 up; daemon pid 8616; 2 shards
+test a_files_write_and_access_times_set_through_the_drive_are_kept ... slates anchor: instance wstimes9212 up; daemon pid 9472; 2 shards
+test a_move_asked_to_replace_a_directory_is_refused ... slates anchor: instance wsmovedir9212 up; daemon pid 8324; 2 shards
+test a_move_not_asked_to_replace_refuses_a_taken_name_and_leaves_both_files ... slates anchor: instance wsmove9212 up; daemon pid 5584; 2 shards
+test an_open_that_truncates_leaves_the_file_empty ... slates anchor: instance wstrunc9212 up; daemon pid 9664; 2 shards
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 606.76s
+exit 0
