@@ -1,0 +1,8 @@
+tested 2ae4e832cf2971ffd9e6931c838860d849160fee variant after on arm64,  cpus
+r1 exit 0 135s
+r2 exit 0 3s
+r3 exit 0 4s
+r4 exit 0 3s
+r5 exit 0 3s
+ack exit 0 24s
+  ack: test a_starved_but_working_shard_is_answered_past_the_wall_budget ... ok
