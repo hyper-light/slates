@@ -3180,6 +3180,80 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
   verdict.judge();
 }
 
+/// How many holders the takeover's old owner wrote to: the set the successor's catalog records, or, when it records
+/// none, every holder the successor names.
+fn write_set(recorded: &std::collections::BTreeSet<String>, named: &[String]) -> usize {
+  if recorded.is_empty() {
+    named
+      .iter()
+      .collect::<std::collections::BTreeSet<_>>()
+      .len()
+  } else {
+    recorded.len()
+  }
+}
+
+/// Whether an owner a takeover superseded could still commit, its `holders` holders with `unfenced` of them still below
+/// the takeover's fence: a write needs `W = max(n − f, f)` of `n` (`slates_db::live`'s `Shipper::reached_by`, stated
+/// here again so the judge does not take its rule from the code it judges), and only an unfenced holder can accept one.
+fn stale_owner_can_commit(holders: usize, unfenced: usize, tolerated: usize) -> bool {
+  unfenced > 0 && unfenced >= holders.saturating_sub(tolerated).max(tolerated)
+}
+
+/// StaleNeverCommits on the holders' fences: a violation only where the unfenced holders could still make a write count
+/// for the superseded owner. Phase one needs `f + 1` of the record's holders, not all of them, so a holder it did not
+/// wait for can stay below the fence: at load 132-244 on the Mac one of a record's three holders did, and with the other
+/// two fenced the dead owner could reach none of its two-of-three writes (run 3, 2026-11-08). Requiring every named
+/// holder fenced called that a violation.
+fn judge_fences(verdict: &mut Verdict, holders: usize, unfenced: Vec<String>) {
+  const INVARIANT: &str = "StaleNeverCommits (the counted holders' fences)";
+  if stale_owner_can_commit(holders, unfenced.len(), FLEET_F) {
+    verdict.check(INVARIANT, unfenced);
+  } else {
+    if !unfenced.is_empty() {
+      verdict.note(format!(
+        "below the takeover's fence, fewer than a write needs of {holders} holders: {unfenced:?}"
+      ));
+    }
+    verdict.check(INVARIANT, Vec::new());
+  }
+}
+
+/// §4.8's StaleNeverCommits as `live_chaos` judges it, on constructed fences. Do: judge holder sets with every count of
+/// unfenced holders around the write count, at `f = 1` through the verdict and at `f = 2` through the rule. Expect: a
+/// violation exactly where the unfenced holders reach `W = max(n − f, f)`: one of two, two of three, but not one of
+/// three, and three of five at `f = 2` but not two.
+#[test]
+fn a_superseded_owner_can_commit_only_where_its_unfenced_holders_reach_the_write_count() {
+  let judged = |holders: usize, unfenced: usize| {
+    let mut verdict = Verdict::new("constructed fences");
+    judge_fences(
+      &mut verdict,
+      holders,
+      (0..unfenced)
+        .map(|holder| format!("holder {holder}"))
+        .collect(),
+    );
+    !verdict.violations.is_empty()
+  };
+  assert!(!judged(3, 0), "every holder fenced");
+  assert!(
+    !judged(3, 1),
+    "one of three cannot make the two a write needs"
+  );
+  assert!(judged(3, 2), "two of three can");
+  assert!(judged(3, 3), "all three can");
+  assert!(judged(2, 1), "one of two is the write count at f = 1");
+  assert!(
+    !stale_owner_can_commit(5, 2, 2),
+    "two of five at f = 2 is short of three"
+  );
+  assert!(
+    stale_owner_can_commit(5, 3, 2),
+    "three of five at f = 2 is the write count"
+  );
+}
+
 /// The end of the fresh-member flow: a survivor serves `volume` with every acknowledged write, and every holder the
 /// takeover counted is fenced at its epoch. Those are read from the successor: the holder set its catalog records (the
 /// set its phase one counted, which a transition may have recorded before the old owner activated it) and its own
@@ -3194,8 +3268,12 @@ fn judge_served(verdict: &mut Verdict, survivors: &[&str], volume: &str, outcome
         .iter()
         .filter_map(|survivor| fleet_view(survivor).map(|(host, _, _)| (host, *survivor)))
         .collect();
-      let named: Vec<String> = live_states(successor, volume)
-        .unwrap_or_default()
+      let states = live_states(successor, volume).unwrap_or_default();
+      let recorded: std::collections::BTreeSet<String> = states
+        .iter()
+        .flat_map(|state| state.recorded.iter().cloned())
+        .collect();
+      let named: Vec<String> = states
         .into_iter()
         .flat_map(|state| state.recorded.into_iter().chain(state.holders))
         .collect();
@@ -3216,7 +3294,7 @@ fn judge_served(verdict: &mut Verdict, survivors: &[&str], volume: &str, outcome
           diagnosis(&shown, volume)
         ));
       }
-      verdict.check("StaleNeverCommits (the counted holders' fences)", unfenced);
+      judge_fences(verdict, write_set(&recorded, &named), unfenced);
       let others: Vec<&str> = survivors
         .iter()
         .copied()
