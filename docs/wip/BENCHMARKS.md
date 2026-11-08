@@ -10803,7 +10803,7 @@ A-198's crash defect, losing requests the driver delivered, so it is not restore
   `docs/bugs/2026-11-06-a-replayed-close-was-refused-after-takeover.md`).
 - A rename's durable name update spent a shard turn only to learn none was left: 2.27 turns a rename at 4.7 µs each on
   arm64 (main `c1e9e83f`, `a_rename_with_one_open_name_takes_one_shard_turn`).
-- Each received batch made two system allocations, its requests and their hints (`agents/winfsp-overlap-14`,
+- Each received batch made two system allocations, its requests and their hints (main `430efcee`,
   `tests/batch_allocations.rs`: 100 batches, 200 calls before, 0 after).
 
 **Kept, and why:**
@@ -11647,15 +11647,131 @@ Within each run, quiet p50:
 On one VM the fix does not slow an unlink (−23.6 and −3.8 µs), a stat or a rename. The open's and the close's
 millisecond outliers, present in both arms of earlier runs, separate nothing in two runs.
 
+### The allocation fix on one VM, five runs, in both forms
+
+**The question.** Run 42354811410's `unlink-arm` lane published two runs of five. Here four arms run interleaved on
+one windows-11-arm VM (4 logical CPUs, WinFsp 2.1.25156), quiet and loaded (two spinners a logical CPU), 5 runs of 5,
+0 failed (run 42404256322, lane `unlink-four`, diag `diag-winfsp-overlap-44`):
+- `combA` and `combB`: the combined form at two fixed workers before the allocation fix (`ea71f839`, diag tree
+  `2fd3041b`) and after it (`792977e9`, diag tree `6cbba703`);
+- `mainA` and `mainB`: main's form, the one that ships, before the allocation fix (`3feba7c5`) and with it (`430efcee`).
+
+**Cells worse beyond the other arm's spread** (p50 and p99, 18 a phase; abtable.py's rule):
+
+| comparison | quiet | loaded |
+|---|---|---|
+| `mainB` (the fix) worse than `mainA` | 0 | 0 |
+| `mainA` worse than `mainB` | 1 (fsync p50) | 2 (stat p50, stat p99) |
+| `combB` (the fix) worse than `combA` | 2 (open p50, close p50) | 0 |
+| `combA` worse than `combB` | 1 (create p50) | 2 (write p50, open p99) |
+
+**Within each run, the fix's arm minus the arm before it, p50, µs** (sorted, then the median and the runs the fix won):
+
+| op | main's form, quiet | main's form, loaded | combined form, quiet | combined form, loaded |
+|---|---|---|---|---|
+| unlink | -6.6 -3.8 -1.8 +1.8 +3.8 (median -1.8; 3 of 5 faster) | -5.9 -3.1 -2.6 +8.1 +9.1 (median -2.6; 3 of 5 faster) | -23.3 -5.4 +0.6 +33.9 +42.3 (median +0.6; 2 of 5 faster) | -145.8 +78.2 +91.7 +96.7 +317.6 (median +91.7; 1 of 5 faster) |
+| stat | -4.3 -3.0 -2.8 -1.8 -1.0 (median -2.8; 5 of 5 faster) | -5.3 -4.3 -2.9 -2.2 -2.0 (median -2.9; 5 of 5 faster) | -3.2 -2.8 -0.5 -0.1 +1.1 (median -0.5; 4 of 5 faster) | -142.0 +25.8 +57.9 +102.9 +148.8 (median +57.9; 1 of 5 faster) |
+| create | -7.4 -1.8 -1.7 +0.3 +1.4 (median -1.7; 3 of 5 faster) | -3.6 -2.8 -0.7 -0.6 -0.3 (median -0.7; 5 of 5 faster) | -18.1 -9.5 -8.6 +0.5 +2.8 (median -8.6; 3 of 5 faster) | -15.0 -13.1 -9.2 +5.0 +6.0 (median -9.2; 3 of 5 faster) |
+| rename | -14.5 -9.5 -1.0 +2.5 +2.9 (median -1.0; 3 of 5 faster) | -13.4 -6.6 +1.4 +1.8 +7.3 (median +1.4; 2 of 5 faster) | -85.3 -5.8 +12.3 +35.2 +79.6 (median +12.3; 2 of 5 faster) | -5.8 +7.2 +7.9 +32.6 +38.7 (median +7.9; 1 of 5 faster) |
+| write | -6.9 -5.0 -1.7 -1.4 +0.9 (median -1.7; 4 of 5 faster) | -1.2 -0.2 +0.0 +1.8 +13.2 (median +0.0; 2 of 5 faster) | -16.8 -3.3 -0.1 +0.0 +11.4 (median -0.1; 3 of 5 faster) | -22.7 -16.4 -12.7 -1.1 +16.2 (median -12.7; 4 of 5 faster) |
+| fsync | -8.9 -6.5 -2.1 -1.2 -1.2 (median -2.1; 5 of 5 faster) | -13.2 -12.4 -2.5 -2.4 +0.2 (median -2.5; 4 of 5 faster) | -4.6 -2.6 -0.9 -0.5 +3.4 (median -0.9; 4 of 5 faster) | -5.9 -3.2 -1.0 +1.1 +1.2 (median -1.0; 3 of 5 faster) |
+| read | -1.1 -1.1 -0.3 -0.2 -0.1 (median -0.3; 5 of 5 faster) | -0.9 -0.7 -0.4 -0.2 +0.7 (median -0.4; 4 of 5 faster) | -2.0 +0.7 +1.1 +1.8 +2.3 (median +1.1; 1 of 5 faster) | -1.2 -0.3 +0.1 +0.2 +0.6 (median +0.1; 2 of 5 faster) |
+| open | -118.7 -59.5 -40.6 -10.6 -6.1 (median -40.6; 5 of 5 faster) | -72.3 -6.2 +11.7 +13.1 +63.7 (median +11.7; 2 of 5 faster) | -105.6 -84.7 +2359.5 +2530.5 +2634.9 (median +2359.5; 2 of 5 faster) | -147.7 -102.9 +60.2 +62.1 +78.9 (median +60.2; 2 of 5 faster) |
+| close | -2485.5 -147.5 -116.9 -53.6 +3.3 (median -116.9; 4 of 5 faster) | -128.3 -107.2 -42.5 -18.6 +25.1 (median -42.5; 4 of 5 faster) | +556.8 +656.6 +681.3 +2695.8 +2831.4 (median +681.3; 0 of 5 faster) | -59.6 -51.2 +29.8 +64.8 +72.7 (median +29.8; 2 of 5 faster) |
+
+- **Main's form: the fix slows nothing, and is beyond the spread faster on a loaded stat.** Unlink −1.8 µs quiet and
+  −2.6 loaded. Stat −2.8 quiet and −2.9 loaded, faster in 5 of 5 runs each; fsync and read faster in 5 of 5 quiet.
+  Loaded stat p99 fell from 2,223–14,546 µs across runs to 661–8,736.
+- **The combined form: no unlink cost quiet (+0.6 µs, 2 of 5).** Loaded, its fix arm was slower in 4 of 5 runs on
+  stat (+57.9) and unlink (+91.7). The two arms' loaded stat p50 spread over 213–536 µs across runs, against main's
+  158–164. An allocation removed cannot add 90 µs, so that is the combined form's two workers under load.
+- **The close's and open's millisecond mode.** A quiet close's p50 sits near 1.1 ms or near 3.5–4.3 ms in a run, and
+  every arm has both (`mainA` 2 runs of 5 slow, `mainB` 1, `combA` 3). `combB` was slow in all 5 and its open in 3
+  (3.5 ms against 0.9), so those are its two worse cells. Run 42354811410's `alloc` arm, the same build, had one such
+  open. Unexplained, and only in the combined form, which does not ship. Main's form shows no such shift.
+
+### The CanDelete lever measured: a file's CanDelete answered from its context (`agents/winfsp-overlap-18`)
+
+**The lever.** CanDelete's shard check is kept (above), but only a directory's emptiness needs the volume. A file may
+always be marked. `agents/winfsp-overlap-18` (`10e7c2f8` on main `a2cf9af7`) carries the open's kind in its ledger
+context:
+- a CONTEXT_FORMAT bit and a CONTEXT_DIRECTORY bit;
+- the ledger at version 5 (WFO5), with an old-format context refused `Refusal::Format`, typed;
+- the takeover restore tested with both kinds.
+
+The callback answers a file's CanDelete on WinFsp's thread.
+
+**The test, red first** (diag `diag-winfsp-overlap-45`, run 42405814913, both runners): a client deletes a file and
+removes an empty directory, and the shard's CanDelete requests are counted. At `b21fec11` it counts 2 and fails, exit
+101. At `10e7c2f8` it counts 1, the directory's, with the bridge's 84 tests and the CLI's 15 passing. In the bench,
+main's form made 11,001 CanDelete shard trips a run before and 1 after.
+
+**The A/B: dead even.** Main `a2cf9af7` against `10e7c2f8`, interleaved on one windows-11-arm VM, quiet and loaded,
+5 runs of 5, 0 failed. Cells worse beyond the other arm's spread, of 18: 0 and 0 each way. Within each run, lever
+minus main, p50:
+
+| op | quiet | loaded |
+|---|---|---|
+| unlink | −9.7 −2.0 −0.8 −0.7 +3.7 (median −0.8) | −6.8 −5.8 −3.1 −1.0 +4.8 (median −3.1) |
+| stat | median +2.5 | median −0.8 |
+| create | median +3.8 | median −1.5 |
+| rename | median +3.0 | median +6.8 |
+| fsync | median −2.5 | median −2.4 |
+
+The trip it removes was 2.6 µs at the p50 (run 42185624364), and the unlink moved −0.8 µs quiet and −3.1 loaded,
+about what that predicts. Both are inside an unlink's run-to-run spread of 221–297 µs.
+
+### Every remaining per-request cost, with its number
+
+From main's form after the rename, allocation and CanDelete fixes (`10e7c2f8`, profiled at `245be856`), against the
+profiled DLL arm (`40ee5a65`). Diag `diag-winfsp-overlap-46` (run 42406233399): quiet, 5 runs a runner, each build's own
+shard count, the median over runs of each run's p50, µs, arm64 / x86_64.
+
+**Crash safety's own, kept:**
+
+| cost | arm64 | x86_64 | why it stays |
+|---|---|---|---|
+| The journal, in all | ≈1.3 | ≈1.1 | the receive journal |
+| — the receive buffer's begin | 0.2 | 0.2 | |
+| — the capture (1.2 before the allocation fix) | 0.3 | 0.3 | |
+| — the decode | 0.2 | 0.2 | |
+| — the response's save | 0.3–0.5 | 0.2–0.3 | |
+| — the acknowledgement | 0.2 | 0.2 | |
+| The copy into the working packet | 0.3–0.6 | 0.3–0.5 | WinFsp's op functions write into the request (a target-directory open trims the name in place), and a replay needs the original |
+| The ledger's write in the shard's serve, against dll's | Create +2.3, Open +0.8, Release +0.5 | — | the open ledger |
+| A-198's barrier: Release's round, against dll's | 6.7 against 5.0 | 10.7 against 4.4 | A-198 |
+| Cleanup's hop to the shard, against dll's | 17.9 against 9.7 | — | the shard is still publishing the previous request's barrier |
+| A rename's durable name update | 7.3 | — | one shard turn since `c1e9e83f` |
+
+**Not crash safety's:**
+
+| cost | arm64 | x86_64 | standing |
+|---|---|---|---|
+| The open's confirmation round, waited on after the send | 3.6 at the p50 (8.8 mean); the shard round 3.0 | 3.0; round 2.7 | on every open, 66,005 a run; proposed: post it after the send and take its answer once the next receive returns |
+| The separate send, with the kernel's IRP completion | 3.6–14.2 (Create 14.2, Cleanup 11.8, Close 3.6) | 2.7–14.6 | A-215's combined call, measured and rejected (above) |
+| A reply channel allocated per shard call (`sync_channel(1)`) | not timed alone; 0.1–0.2 estimated | — | the DLL arm pays it too; small |
+| An Open's and a Create's path decoded into a String for the shard | — | — | the DLL arm pays it too |
+
+The interface's `between` gaps show what the separate send costs the client. From Cleanup's return to the Close's entry,
+dll takes 25–27 µs and main 35. Flush is 25–28 against 38, VolumeInfo 31–33 against 40–47, and Write 62–69 against 76. A
+dash in a table: not broken out on that runner.
+
 ### Step 7's verdict
 
 - **Fixed wherever it was not crash safety:** the replayed Close's refusal, the rename's empty shard turn, the per-batch
   allocations.
-- **Kept, CanDelete's check:** the baseline skips it and lets a non-empty directory's removal report success.
+- **The allocation fix, five runs on one VM:** in main's form it slows nothing (unlink −1.8 µs quiet, −2.6 loaded,
+  within each run) and is beyond the spread faster on a loaded stat (−2.9 µs, 5 runs of 5).
+- **Kept, CanDelete's check:** the baseline skips it and lets a non-empty directory's removal report success. A file's
+  check answered from its ledger context (`agents/winfsp-overlap-18`) removes 11,001 shard trips a run and measured dead
+  even (unlink −0.8 µs quiet, −3.1 loaded).
 - **Kept, crash safety's price:** on arm64, quiet, about 18 µs a stat and 30 to 35 µs a rename or an unlink against the
   DLL dispatcher. The journal holds 3 to 4.5 µs a request, the ledger and A-198's barriers about 5 µs a stat, direct
   output 0.5 µs a call, and a kernel share of 3 to 5 µs a request inside the transaction call. R4 keeps it: the
   baseline's speed comes with A-198's crash defect.
+- **What is left that crash safety does not need:** the open's confirmation round on the worker's path, 3.6 µs an open
+  on arm64 and 3.0 on x86_64. The separate send is A-215's, rejected. A reply channel per shard call and a path's
+  String the DLL arm pays too.
 - **The form:** main's separate receiver, one worker. A-215's combined transact and A-219's second worker are measured
   and rejected.
 
