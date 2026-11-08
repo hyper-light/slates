@@ -520,7 +520,33 @@ impl Partition {
     *held = held.saturating_add(1);
   }
 
-  /// Applies a work floor's record (A-247).
+  /// The guard of a work's records on a partition (A-247). A floor is one per live work, so it is bounded as the volumes
+  /// are; a drop of none is a no-op (a destroy's message may meet the recovery's orphan check). A pending submit is one a
+  /// work: a second while one waits is refused, so the first is never lost.
+  fn check_work_record(&self, op: &Op) -> Result<(), DbError> {
+    match op {
+      Op::WorkFloorSet { green, work, .. } => {
+        if self.work_floors.contains_key(&(*green, *work))
+          || self.work_floors.len() < self.caps.volumes
+        {
+          Ok(())
+        } else {
+          Err(DbError::Capacity {
+            table: "work floors",
+          })
+        }
+      }
+      Op::WorkSubmitPending { record } => match self.pending_submits.get(&record.work) {
+        Some(pending) if pending != record => Err(DbError::AlreadyExists {
+          existing: record.work.bytes,
+        }),
+        _ => Ok(()),
+      },
+      _ => Ok(()),
+    }
+  }
+
+  /// Applies a work's floor or pending-submit record (A-247).
   fn apply_work_floor(&mut self, op: &Op) {
     match op {
       Op::WorkFloorSet { green, work, base } => self.set_work_floor(*green, *work, *base),
@@ -528,6 +554,12 @@ impl Partition {
         if let Some(base) = self.work_floors.remove(&(*green, *work)) {
           self.release_floor_count(*green, base);
         }
+      }
+      Op::WorkSubmitPending { record } => {
+        self.pending_submits.insert(record.work, record.clone());
+      }
+      Op::WorkSubmitSettled { work } => {
+        self.pending_submits.remove(work);
       }
       _ => {}
     }
@@ -1118,28 +1150,10 @@ impl Partition {
       | Op::NfsCallsCleared { .. }
       | Op::NfsPurgeOwed { .. }
       | Op::NfsPurgeSettled { .. } => Ok(()),
-      // A floor is one per live work, so it is bounded as the volumes are. A drop of none is a no-op (a destroy's
-      // message may meet the recovery's orphan check, A-247).
-      Op::WorkFloorSet { green, work, .. } => {
-        if self.work_floors.contains_key(&(*green, *work))
-          || self.work_floors.len() < self.caps.volumes
-        {
-          Ok(())
-        } else {
-          Err(DbError::Capacity {
-            table: "work floors",
-          })
-        }
-      }
-      Op::WorkFloorDropped { .. } => Ok(()),
-      // One a work: a second while one waits is refused, so the first is never lost (A-247).
-      Op::WorkSubmitPending { record } => match self.pending_submits.get(&record.work) {
-        Some(pending) if pending != record => Err(DbError::AlreadyExists {
-          existing: record.work.bytes,
-        }),
-        _ => Ok(()),
-      },
-      Op::WorkSubmitSettled { .. } => Ok(()),
+      Op::WorkFloorSet { .. }
+      | Op::WorkFloorDropped { .. }
+      | Op::WorkSubmitPending { .. }
+      | Op::WorkSubmitSettled { .. } => self.check_work_record(op),
       Op::NameAliasReserved { .. }
       | Op::NameAliasConfirmed { .. }
       | Op::NameAliasReleased { .. }
@@ -1488,15 +1502,10 @@ impl Partition {
         self.expired_attachments.push_back(*id);
         Ok(())
       }
-      Op::WorkSubmitPending { record } => {
-        self.pending_submits.insert(record.work, record.clone());
-        Ok(())
-      }
-      Op::WorkSubmitSettled { work } => {
-        self.pending_submits.remove(work);
-        Ok(())
-      }
-      Op::WorkFloorSet { .. } | Op::WorkFloorDropped { .. } => {
+      Op::WorkFloorSet { .. }
+      | Op::WorkFloorDropped { .. }
+      | Op::WorkSubmitPending { .. }
+      | Op::WorkSubmitSettled { .. } => {
         self.apply_work_floor(op);
         Ok(())
       }
