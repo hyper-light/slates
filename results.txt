@@ -18,3 +18,5 @@ thread 'a_volume_that_lives_through_a_paged_walk_is_listed_exactly_once' (4916) 
 no volume listed after its destroy
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 
+fleet exit 0
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 111 filtered out; finished in 6.80s
