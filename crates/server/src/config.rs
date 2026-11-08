@@ -933,24 +933,33 @@ impl DaemonConfig {
   /// shard sized like the rest refused 117 spawns in fixtures' 1,000-client replica-kill rung, and its channel 10,198
   /// to 10,298 forwards in `a_silent_owner_leaves_no_forward_the_lane_admitted_unrun`).
   pub fn control_shard_capacity(&self) -> Derived<slates_rt::ShardCapacity> {
-    let lane = forward_lane_bound(
-      self.clients_per_shard,
-      self.region.slots,
-      self.runtime.shards,
-    )
-    .get();
+    // The lane holds forwards to other nodes, so with no peers it admits none (R8: the formula's value, no mode): a
+    // laptop's control shard is sized like its other shards. Until 2026-11-08 a laptop's got the lane's bound too, a
+    // channel of 1,371,635 tasks on a Mac for forwards that cannot exist.
+    let peers = self.fleet.as_ref().map_or(0, |fleet| fleet.peers.len());
+    let lane = if peers == 0 {
+      0
+    } else {
+      forward_lane_bound(
+        self.clients_per_shard,
+        self.region.slots,
+        self.runtime.shards,
+      )
+      .get()
+    };
     derived!(
       slates_rt::ShardCapacity {
         tasks: self.runtime.tasks_per_shard.saturating_add(lane),
         timers: self.runtime.timers_per_shard.saturating_add(lane),
       },
-      "tasks_per_shard + forward_lane_bound, timers_per_shard + forward_lane_bound",
+      "tasks_per_shard + forward_lane_bound, timers_per_shard + forward_lane_bound (the lane's bound zero with no peers)",
       [
         "tasks_per_shard",
         "timers_per_shard",
         "clients_per_shard",
         "region.slots",
-        "shards"
+        "shards",
+        "fleet.peers"
       ]
     )
   }
@@ -1762,6 +1771,43 @@ mod tests {
         .any(|line| line.starts_with("fleet_tasks_per_shard")),
       "the boot log names the share with its input: {:?}",
       fleet.derivations
+    );
+  }
+
+  /// §4.3: with no peers a node's forward lane admits nothing, so a laptop's control shard is sized like its other
+  /// shards; a fleet node's holds the lane's bound beside its own share. Until 2026-11-08 a laptop's held the lane's
+  /// bound too, and `a_forward_kept_for_a_full_channel_is_sent_once_the_channel_has_room` flooded 1,371,635 tasks onto
+  /// a Mac's control shard, past the second its answer may take.
+  #[test]
+  fn a_laptops_control_shard_holds_no_forward_lane() {
+    let profile = crate::daemon::test_profile();
+    let solo = DaemonConfig::derive(&profile, "control-solo", None);
+    let capacity = solo.control_shard_capacity().get();
+    assert_eq!(
+      (capacity.tasks, capacity.timers),
+      (solo.runtime.tasks_per_shard, solo.runtime.timers_per_shard),
+      "a node with no peers has no forwards to other nodes to hold"
+    );
+    let fleet = DaemonConfig::derive(&profile, "control-fleet", None).with_fleet(FleetMembership {
+      quorum: Quorum { f: 1 },
+      peers: vec![HostId(1), HostId(2)],
+      host: HostId(0),
+      origin_anchor: HostId(0),
+      domains: BTreeMap::new(),
+      regions: BTreeMap::new(),
+      durability: None,
+      region_mirrors: BTreeMap::new(),
+    });
+    let lane = forward_lane_bound(
+      fleet.clients_per_shard,
+      fleet.region.slots,
+      fleet.runtime.shards,
+    )
+    .get();
+    assert_eq!(
+      fleet.control_shard_capacity().get().tasks,
+      fleet.runtime.tasks_per_shard + lane,
+      "a fleet node's control shard holds every forward its lane admits"
     );
   }
 
