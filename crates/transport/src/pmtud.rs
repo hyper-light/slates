@@ -538,13 +538,8 @@ mod tests {
     assert!(pmtu.current() <= 1_500 && 1_500 - pmtu.current() <= SEARCH_GRANULARITY);
   }
 
-  /// RFC 8899 §4.3 and §3 item 4: a probe timeout with nothing acknowledged (a stopped peer) only makes the size
-  /// suspect, and the size stands the moment a probe at it is acknowledged; no black hole is counted, however
-  /// many timeouts fire before.
-  #[test]
-  fn silence_makes_the_size_suspect_and_one_acknowledged_probe_restores_it() {
-    let mut pmtu = converged_on_jumbo();
-    let size = pmtu.current();
+  /// Times out until the size is suspect: the third in a row, and nothing more after it.
+  fn time_out_until_suspect(pmtu: &mut PathMtu, size: usize) {
     for _ in 1..BLACK_HOLE_LOSSES {
       assert!(
         !pmtu.on_silence(),
@@ -556,6 +551,16 @@ mod tests {
     for _ in 0..8 {
       assert!(!pmtu.on_silence(), "already suspect: nothing more");
     }
+  }
+
+  /// RFC 8899 §4.3 and §3 item 4: a probe timeout with nothing acknowledged (a stopped peer) only makes the size
+  /// suspect, and the size stands the moment a probe at it is acknowledged; no black hole is counted, however
+  /// many timeouts fire before.
+  #[test]
+  fn silence_makes_the_size_suspect_and_one_acknowledged_probe_restores_it() {
+    let mut pmtu = converged_on_jumbo();
+    let size = pmtu.current();
+    time_out_until_suspect(&mut pmtu, size);
     assert_eq!(pmtu.current(), BASE_PLPMTU);
     assert_eq!(pmtu.next_probe(1), Some(size));
     pmtu.on_probe_sent(7, size);
