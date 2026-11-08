@@ -6285,7 +6285,8 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > least the initial one, and never under a liveness budget (`Endpoint::persistent_congestion_duration`). Both must
 > hold. The probe timeout grows with the queueing a holder's acknowledgements reveal, so a lost holder whose session is
 > still taking the bytes is not cut. A fixed second was not enough: on the fabric it cut a live holder whose
-> acknowledgements its link's queue held back 1.1 to 2.0 s apart. A cut holder is unanswered: its
+> acknowledgements its link's queue held back 1.1 to 2.0 s apart. The cost: a holder stopped on a quiet path, whose sample is a
+> loopback's, is cut about 2 s into its silence (3 × the initial 666 ms probe timeout), not 1 s. A cut holder is unanswered: its
 > link is dropped and redialed, and the image it was cut on is re-sent once, unwatched (`LiveVolume::cut_installs`).
 > Held on the simulated fabric (`crates/cluster/tests/live.rs`, `live_ship::tests`). End to end it is measured only
 > where it does not fire (GAPS).
