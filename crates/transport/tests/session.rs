@@ -1797,6 +1797,230 @@ fn a_handshake_that_gives_up_names_the_bound_it_reached() {
   );
 }
 
+/// Shape: how many times [`accepted_end_replayed_at`] replays a dialer's flight: past the 32 retransmits the accepting
+/// end used to count them against.
+const REPLAYS_PAST_THE_OLD_COUNT: usize = 64;
+/// Shape: the gap between replays, a millisecond of the simulated clock.
+const REPLAY_GAP_NS: u64 = 1_000_000;
+/// Shape: the gap when a dialer keeps asking for the whole of a turn's deadline, a tenth of a simulated second.
+const LONG_REPLAY_GAP_NS: u64 = 100_000_000;
+/// Shape: how many of those long gaps cover the turn's deadline (about 22 s of simulated time) many times over.
+const LONG_REPLAYS: usize = 1_000;
+
+/// What ended an accepted end's `establish`, the peer replaying the dialer's first flight `replays` times `gap_ns`
+/// apart and then saying nothing, with the simulated time it took. Replays come from the real flight of a real dialer.
+fn accepted_end_replayed_at(replays: usize, gap_ns: u64) -> (Reported, u64) {
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = *sim.shard_ids().first().unwrap();
+  let identity = self_signed(NAME);
+  let certificate = identity.certificate();
+  let server_certificate = certificate.clone();
+  let dialer_identity = self_signed(NAME);
+  let roster = dialer_identity.certificate();
+  let (relay_tx, relay_rx) = channel();
+  let (accept_tx, accept_rx) = channel();
+  let (dialer_tx, dialer_rx) = channel();
+  let (done_tx, done_rx) = channel::<()>();
+  let (result_tx, result_rx) = channel();
+  // The dialer: its only job is to produce a real first flight, sent to the relay.
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(dialer_rx).await);
+      let mut dialer = Endpoint::client(
+        socket,
+        peer,
+        &dialer_identity,
+        &server_certificate,
+        NAME,
+        shape(),
+      )
+      .unwrap();
+      let _ = within(FIRST_FLIGHT_NS, dialer.establish()).await;
+    })
+    .unwrap();
+  // The accepting end.
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = accept_tx.send(socket.local_addr().unwrap().port());
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(relay_rx).await);
+      let mut server = Endpoint::server(
+        socket,
+        peer,
+        &identity,
+        std::slice::from_ref(&roster),
+        shape(),
+      )
+      .unwrap();
+      let began = slates_rt::futures::now_ns();
+      let outcome = server.establish().await;
+      assert!(
+        matches!(outcome, Err(EndpointError::NotReady)),
+        "{outcome:?}"
+      );
+      let _ = result_tx.send((
+        server.handshake_stall(),
+        slates_rt::futures::now_ns().saturating_sub(began),
+      ));
+      let _ = done_tx.send(());
+    })
+    .unwrap();
+  // The relay: takes the dialer's first flight whole, then plays it at the accepting end again and again.
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let port = socket.local_addr().unwrap().port();
+      let _ = relay_tx.send(port);
+      let _ = dialer_tx.send(port);
+      let server = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(accept_rx).await);
+      let mut flight: Vec<Vec<u8>> = Vec::new();
+      let mut buffer = [0u8; 2048];
+      while let Some(Ok((length, _))) = within(FIRST_FLIGHT_NS, socket.recv_from(&mut buffer)).await
+      {
+        let datagram = buffer.get(..length).unwrap().to_vec();
+        if flight.contains(&datagram) {
+          break;
+        }
+        flight.push(datagram);
+      }
+      assert!(!flight.is_empty(), "the dialer sent its first flight");
+      for _ in 0..=replays {
+        if done_rx.try_recv().is_ok() {
+          return;
+        }
+        for datagram in &flight {
+          let _ = socket.send_to(datagram, server);
+        }
+        slates_rt::futures::sleep(gap_ns).await.unwrap();
+      }
+    })
+    .unwrap();
+  sim.run_until_idle();
+  let (stall, took) = result_rx.try_recv().unwrap();
+  (Reported(stall), took)
+}
+
+/// Shape: how long the relay waits for the dialer's first flight, a few simulated milliseconds.
+const FIRST_FLIGHT_NS: u64 = 5_000_000;
+
+/// §4.8 formation: an accepting end does not give up because a dialer resent a flight it has already answered. Replays
+/// are the dialer's own resends, which load makes frequent, so counting them ended handshakes with a live dialer within
+/// a second or two (`fleet.accept.stall.repeats`, a 41.9 s formation at load 170, 2026-11-08). Do: replay a real dialer's
+/// first flight, more times than the old bound, then fall silent. Expect: the end gives up on the silence, not on the
+/// repeats.
+#[test]
+fn an_accepted_handshake_is_not_given_up_for_a_dialers_repeats() {
+  let (stall, _) = accepted_end_replayed_at(REPLAYS_PAST_THE_OLD_COUNT, REPLAY_GAP_NS);
+  assert_eq!(stall, Reported(Some(HandshakeStall::Silence)));
+}
+
+/// R3, the same bound on the other side: a dialer that keeps resending for ever cannot hold an accepting end for ever.
+/// Do: replay the flight for far longer than a handshake's turn may last. Expect: it ends on the repeats, within the
+/// turn's derived deadline of `33 × initial probe timeout`, about 22 s, and not sooner than a good part of it.
+#[test]
+fn a_dialer_that_only_repeats_is_given_up_at_the_handshakes_deadline() {
+  let (stall, took) = accepted_end_replayed_at(LONG_REPLAYS, LONG_REPLAY_GAP_NS);
+  assert_eq!(stall, Reported(Some(HandshakeStall::Repeats)));
+  let seconds = took / 1_000_000_000;
+  assert!((20..=24).contains(&seconds), "gave up after {took} ns");
+}
+
+/// §4.8 formation: a dialer that finished its side of TLS and whose peer never confirms says so, which is what makes it
+/// redial at once (`fleet::keeps_its_socket`). The peer's half is gone in the field, after giving up on the dialer's
+/// repeats; here a relay carries both ends' first flights and then drops the dialer's. Do: handshake through it. Expect:
+/// the dialer's `establish` ends `NotReady` with a confirmation stall.
+#[test]
+fn a_dialer_whose_peer_never_confirms_reports_a_confirmation_stall() {
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = *sim.shard_ids().first().unwrap();
+  let dialer_identity = self_signed(NAME);
+  let accepting_identity = self_signed(NAME);
+  let dialer_certificate = dialer_identity.certificate();
+  let accepting_certificate = accepting_identity.certificate();
+  let (relay_for_dialer_tx, relay_for_dialer_rx) = channel();
+  let (relay_for_accepting_tx, relay_for_accepting_rx) = channel();
+  let (dialer_port_tx, dialer_port_rx) = channel();
+  let (accepting_port_tx, accepting_port_rx) = channel();
+  let (done_tx, done_rx) = channel::<()>();
+  let (stall_tx, stall_rx) = channel();
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = dialer_port_tx.send(socket.local_addr().unwrap().port());
+      let relay = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(relay_for_dialer_rx).await);
+      let mut dialer = Endpoint::client(
+        socket,
+        relay,
+        &dialer_identity,
+        &accepting_certificate,
+        NAME,
+        shape(),
+      )
+      .unwrap();
+      let outcome = dialer.establish().await;
+      assert!(
+        matches!(outcome, Err(EndpointError::NotReady)),
+        "{outcome:?}"
+      );
+      let _ = stall_tx.send(dialer.handshake_stall());
+      let _ = done_tx.send(());
+    })
+    .unwrap();
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = accepting_port_tx.send(socket.local_addr().unwrap().port());
+      let relay = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(relay_for_accepting_rx).await);
+      let mut accepting = Endpoint::server(
+        socket,
+        relay,
+        &accepting_identity,
+        std::slice::from_ref(&dialer_certificate),
+        shape(),
+      )
+      .unwrap();
+      let _ = accepting.establish().await;
+    })
+    .unwrap();
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let port = socket.local_addr().unwrap().port();
+      let _ = relay_for_dialer_tx.send(port);
+      let _ = relay_for_accepting_tx.send(port);
+      let dialer_port = recv_port(dialer_port_rx).await;
+      let accepting_port = recv_port(accepting_port_rx).await;
+      let dialer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, dialer_port);
+      let accepting = SocketAddrV4::new(Ipv4Addr::LOCALHOST, accepting_port);
+      let mut answered = false;
+      let mut buffer = [0u8; 2048];
+      while done_rx.try_recv().is_err() {
+        let Some(Ok((length, from))) = within(FIRST_FLIGHT_NS, socket.recv_from(&mut buffer)).await
+        else {
+          continue;
+        };
+        let datagram = buffer.get(..length).unwrap();
+        if from == accepting {
+          answered = true;
+          let _ = socket.send_to(datagram, dialer);
+        } else if !answered {
+          let _ = socket.send_to(datagram, accepting);
+        }
+      }
+    })
+    .unwrap();
+  sim.run_until_idle();
+  let stall = stall_rx.try_recv().unwrap();
+  assert!(
+    matches!(
+      stall,
+      Some(HandshakeStall::ConfirmDeadline | HandshakeStall::ConfirmSilence)
+    ),
+    "{stall:?}"
+  );
+}
+
 /// AC (§4.8 formation; RFC 9002 §6.2 the probe timeout retransmits the pending flight): a dialer whose
 /// first `establish` ran out its retransmit budget against a peer that **lost every flight** (not listening
 /// yet: the fleet's boot-ordering shape, played here by the peer discarding everything queued before it

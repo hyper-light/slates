@@ -116,6 +116,8 @@ const HANDSHAKE_TURN_CEILING: usize = 16;
 /// Shape: it caps only the failure-and-formation path (a healthy handshake completes in its first few turns
 /// and never retransmits), so the exact value is not performance-tuned — only large enough that the wait,
 /// `MAX_HANDSHAKE_RETRANSMITS` × the initial probe timeout ≈ twenty seconds, spans a plausible boot skew.
+/// It bounds only waits paced by this end's own timer, so load cannot spend it; a peer's resends are bounded by
+/// [`Endpoint::handshake_deadline`] instead (a count of them ended handshakes with live dialers, 2026-11-08).
 const MAX_HANDSHAKE_RETRANSMITS: u32 = 32;
 /// Derived: the most datagrams one handshake turn accepts that do not complete a flight — the fragments a
 /// flight can span, once per retransmit the budget allows, plus the same again for strays — before the
@@ -972,6 +974,13 @@ impl Endpoint {
     // per retransmit the budget allows.
     let mut partial = 0usize;
     let mut backoff = GRANULARITY_NS;
+    // A peer that keeps resending a flight this end has already answered is bounded by time, not by how often it
+    // resends: its retransmits are load's to spend, and a count of them ended handshakes with a live dialer inside a
+    // second or two (`fleet.accept.stall.repeats`, a 41.9 s formation at load 170, 2026-11-08). This end answers such a
+    // resend at the pace of its own backoff, not once per datagram.
+    let deadline = self.handshake_deadline();
+    let mut resend_after = 0u64;
+    let mut resend_backoff = GRANULARITY_NS;
     loop {
       let period = backoff.min(self.handshake_probe_ceiling());
       match self.recv_within(period).await? {
@@ -989,16 +998,32 @@ impl Endpoint {
             backoff = GRANULARITY_NS;
             continue;
           }
-          // The peer retransmitted a flight this end already consumed (its reply raced this end's):
-          // it is still asking, so resend this end's flight; not re-fed to `read_hs`. Counted, so a
-          // flood cannot loop forever (banned item 8).
+          // The peer retransmitted a flight this end already consumed (its reply raced this end's): it is still asking,
+          // so resend this end's flight at this end's own pace. Not re-fed to `read_hs`. Bounded by the turn's deadline
+          // in time and by the datagram bound in work (banned item 8).
           crate::flight::Reassembly::Repeat => {
-            attempts = attempts.saturating_add(1);
-            if attempts > MAX_HANDSHAKE_RETRANSMITS {
+            partial = partial.saturating_add(1);
+            if partial > MAX_PARTIAL_FRAGMENTS_PER_TURN {
+              return Err(self.stalled(HandshakeStall::Fragments));
+            }
+            let now = now_ns();
+            if now >= deadline {
               return Err(self.stalled(HandshakeStall::Repeats));
             }
-            if !last_flight.is_empty() {
-              self.resend_flight(last_flight)?;
+            if now >= resend_after {
+              if !last_flight.is_empty() {
+                self.resend_flight(last_flight)?;
+              }
+              resend_after = now.saturating_add(resend_backoff.min(self.handshake_probe_ceiling()));
+              resend_backoff = resend_backoff.saturating_mul(2);
+            }
+            continue;
+          }
+          // A later fragment of that same retransmit: nothing more to answer, and bounded with the others.
+          crate::flight::Reassembly::RepeatRest => {
+            partial = partial.saturating_add(1);
+            if partial > MAX_PARTIAL_FRAGMENTS_PER_TURN {
+              return Err(self.stalled(HandshakeStall::Fragments));
             }
             continue;
           }
@@ -1059,7 +1084,7 @@ impl Endpoint {
   async fn confirm_as_client(&mut self, last_flight: &Flight) -> Result<(), EndpointError> {
     let mut retransmits = 0u32;
     let mut backoff = GRANULARITY_NS;
-    let deadline = self.confirmation_deadline();
+    let deadline = self.handshake_deadline();
     let mut invalid = 0usize;
     loop {
       let remaining = deadline.saturating_sub(slates_rt::futures::now_ns());
@@ -1120,7 +1145,7 @@ impl Endpoint {
     self.send_confirm()?;
     let mut silent = 0u32;
     let mut backoff = GRANULARITY_NS;
-    let deadline = self.confirmation_deadline();
+    let deadline = self.handshake_deadline();
     let mut invalid = 0usize;
     loop {
       let remaining = deadline.saturating_sub(slates_rt::futures::now_ns());
@@ -1169,9 +1194,9 @@ impl Endpoint {
     }
   }
 
-  /// Derived: confirmation permits at most the existing retry count plus the first attempt,
-  /// each no longer than the initial PTO. Traffic cannot renew that absolute budget (AUD-18).
-  fn confirmation_deadline(&self) -> u64 {
+  /// Derived: the absolute deadline of one wait in the handshake, a turn's or the confirmation's: at most the retransmit
+  /// count plus the first attempt, each no longer than the initial PTO, about 22 s. Traffic cannot renew it (AUD-18).
+  fn handshake_deadline(&self) -> u64 {
     slates_rt::futures::now_ns().saturating_add(
       self
         .handshake_probe_ceiling()
