@@ -3488,6 +3488,8 @@ fn init_shard(
     member_boot_nonce: incarnation,
     member_process_nonce: keyed_word(&issuer_secret, b"slates/member-process/v1"),
     learned_members: std::collections::BTreeMap::new(),
+    death_reports: std::collections::BTreeMap::new(),
+    death_watch_started_ns: None,
     returned_members: std::collections::BTreeMap::new(),
     authenticated_members: std::collections::BTreeSet::new(),
     council_death_watch: std::collections::BTreeMap::new(),
@@ -5855,6 +5857,65 @@ mod tests {
     state
       .fleet
       .install_configuration(configuration, &regional.members);
+  }
+
+  /// §4.8 "Promotion and takeover", the f + 1 rule: do make the audit node the leader-to-be of a three-voter `f = 1`
+  /// council, then judge who it may retire as the voters' views change. Expect its own lone death vote for a member the
+  /// others hold alive (a member it keyed slowly after a restart) to retire nothing, one other voter's fresh report to
+  /// make it `f + 1` and retire the member, and a report below the incarnation the leader holds the member alive at to
+  /// count for nothing. Before this rule the leader's own view alone retired a member.
+  #[test]
+  fn a_lone_voters_suspicion_never_retires_a_member() {
+    let (alone, confirmed, refuted) = audit_on_shard(|state| {
+      use slates_cluster::config_group::RegionalCouncil;
+      use slates_cluster::membership::{Liveness, MemberState};
+      use slates_db::register::{HostId, Quorum};
+      let local = state.fleet.host();
+      let (suspected, other) = (HostId(local.0 ^ 1), HostId(local.0 ^ 2));
+      state.council = RegionalCouncil::new(
+        local,
+        vec![local, suspected, other],
+        vec![local, suspected, other],
+        Quorum { f: 1 },
+        std::collections::BTreeMap::new(),
+        3,
+        false,
+      );
+      install_council(state);
+      // This node's own stable vote: its death watch past the confirmation window.
+      state.council_death_watch.insert(suspected, u32::MAX);
+      let alone = crate::fleet::confirmed_dead_council_members(state);
+      let now = slates_rt::futures::now_ns();
+      state
+        .death_reports
+        .entry(suspected)
+        .or_default()
+        .insert(other, (0, now));
+      let confirmed = crate::fleet::confirmed_dead_council_members(state);
+      // The member refuted at incarnation 3; the report names incarnation 0, so it no longer counts.
+      state.fleet.observe(
+        suspected,
+        MemberState {
+          liveness: Liveness::Alive,
+          incarnation: 3,
+        },
+      );
+      let refuted = crate::fleet::confirmed_dead_council_members(state);
+      (alone, confirmed, refuted)
+    });
+    assert!(
+      alone.is_empty(),
+      "one voter's vote retires nothing: {alone:?}"
+    );
+    assert_eq!(
+      confirmed.len(),
+      1,
+      "f + 1 voters retire the member: {confirmed:?}"
+    );
+    assert!(
+      refuted.is_empty(),
+      "a refutation cancels the reports below it: {refuted:?}"
+    );
   }
 
   /// Makes the audit node one of three members of an `f = 1` region whose council it alone votes in, holding

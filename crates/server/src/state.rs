@@ -693,6 +693,14 @@ pub struct ShardState {
   /// unreachable during a re-election or session churn — never reaches the window. Bounded by the council
   /// membership; only the leader writes it (`fleet::stable_dead_council_members`).
   pub(crate) council_death_watch: BTreeMap<slates_db::HostId, u32>,
+  /// The council members other voters report holding dead (§4.8 "Promotion and takeover", the f + 1 rule): per
+  /// member, per reporting voter, the incarnation it was held dead at and when the report came. The leader retires a
+  /// member only once its own death watch and these reach `f + 1` voters (`fleet::confirmed_dead_council_members`).
+  /// Bounded by the council's members times its voters; a report older than a membership horizon is dropped.
+  pub(crate) death_reports: BTreeMap<slates_db::HostId, BTreeMap<slates_db::HostId, (u64, u64)>>,
+  /// When this node's death watch first ran: a configured member never keyed since then, for a membership horizon,
+  /// is this node's own death vote (`fleet::unreached_since_start`).
+  pub(crate) death_watch_started_ns: Option<u64>,
   /// The control shard's bounded candidate table and enrollment authority.
   pub(crate) discovery: Option<crate::discovery::Discovery>,
   /// Authenticated candidate addresses included in the anchor publication.
