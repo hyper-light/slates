@@ -1,0 +1,116 @@
+leg real-on-x86, 4 CPUs, Sun Nov  8 17:07:46 UTC 2026, tree 467d9e58f5d9899321d59548481f545a818b5fe9
+== release build exit 0
+   r1 LD-TL stopped_on_install Some(6718) after 23.294µs
+   r1 LD-TL successor after 4.89485ms
+   r1 LD-TL caught Some(15.16669ms)
+   r1 LD-TL durable Some(5274) then Some(5285) after 9.377184ms
+   r1 LD-TL writes 5285
+   r1 counts: installs 2 taken 1 images 3 why 0
+== run 1 exit 0
+   r2 LD-TL stopped_on_install Some(7341) after 19.907µs
+   r2 LD-TL successor after 10.152399ms
+   r2 LD-TL caught Some(23.217541ms)
+   r2 LD-TL durable Some(5422) then Some(5430) after 18.268647ms
+   r2 LD-TL writes 5431
+   r2 counts: installs 2 taken 1 images 4 why 0
+== run 2 exit 0
+   r3 LD-TL stopped_on_install Some(7654) after 21.671µs
+   r3 LD-TL successor after 6.638425ms
+   r3 LD-TL caught Some(22.224334ms)
+   r3 LD-TL durable Some(750) then Some(751) after 15.080169ms
+   r3 LD-TL writes 749
+   r3 counts: installs 3 taken 2 images 2 why 1
+== run 3 exit 0
+   r4 LD-TL stopped_on_install Some(8584) after 18.965µs
+   r4 LD-TL successor after 8.141262ms
+   r4 LD-TL caught Some(25.31513ms)
+   r4 LD-TL durable Some(5815) then Some(5830) after 11.946867ms
+   r4 LD-TL writes 5831
+   r4 counts: installs 3 taken 1 images 3 why 2
+== run 4 exit 0
+   r5 LD-TL stopped_on_install Some(8896) after 23.384µs
+   r5 LD-TL successor after 20.27592ms
+   r5 LD-TL caught Some(53.017225ms)
+   r5 LD-TL durable Some(2196) then Some(2198) after 18.105644ms
+   r5 LD-TL writes 2197
+   r5 counts: installs 3 taken 2 images 2 why 1
+== run 5 exit 0
+   r6 LD-TL stopped_on_install Some(9748) after 24.236µs
+   r6 LD-TL successor after 11.460574ms
+   r6 LD-TL caught Some(23.170465ms)
+   r6 LD-TL durable Some(3741) then Some(3750) after 11.293171ms
+   r6 LD-TL writes 3750
+   r6 counts: installs 2 taken 1 images 4 why 0
+== run 6 exit 0
+   r7 LD-TL stopped_on_install Some(10049) after 24.005µs
+   r7 LD-TL successor after 15.261951ms
+   r7 LD-TL caught Some(45.297258ms)
+   r7 LD-TL durable Some(1731) then Some(1739) after 18.174503ms
+   r7 LD-TL writes 1739
+   r7 counts: installs 3 taken 2 images 2 why 1
+== run 7 exit 0
+   r8 LD-TL stopped_on_install Some(10907) after 19.737µs
+   r8 LD-TL successor after 5.044244ms
+   r8 LD-TL caught Some(24.107446ms)
+   r8 LD-TL durable Some(5530) then Some(5545) after 11.574788ms
+   r8 LD-TL writes 5548
+   r8 counts: installs 2 taken 1 images 2 why 0
+== run 8 exit 0
+   r9 LD-TL stopped_on_install Some(11218) after 21.14µs
+   r9 LD-TL successor after 10.477398ms
+   r9 LD-TL caught Some(35.204986ms)
+   r9 LD-TL durable Some(1704) then Some(1706) after 10.39832ms
+   r9 LD-TL writes 1706
+   r9 counts: installs 16 taken 2 images 2 why 1
+== run 9 exit 0
+   r10 LD-TL stopped_on_install Some(11840) after 25.138µs
+   r10 LD-TL successor after 6.355355ms
+   r10 LD-TL caught Some(17.853196ms)
+   r10 LD-TL durable Some(1761) then Some(1783) after 26.677804ms
+   r10 LD-TL writes 1783
+   r10 counts: installs 3 taken 2 images 2 why 1
+== run 10 exit 0
+   r11 LD-TL stopped_on_install Some(12761) after 24.295µs
+   r11 LD-TL successor after 7.07961ms
+   r11 LD-TL caught Some(18.902272ms)
+   r11 LD-TL durable Some(1529) then Some(1530) after 24.203646ms
+   r11 LD-TL writes 1530
+   r11 counts: installs 3 taken 2 images 5 why 1
+== run 11 exit 0
+   r12 LD-TL stopped_on_install Some(13295) after 25.137µs
+   r12 LD-TL successor after 12.291141ms
+   r12 LD-TL caught Some(29.532026ms)
+   r12 LD-TL durable Some(2884) then Some(2887) after 11.725317ms
+   r12 LD-TL writes 2886
+   r12 counts: installs 2 taken 1 images 3 why 0
+== run 12 exit 0
+   p1   7822 writes, 7822 acknowledged: p50 418 us, p99 2202 us, p999 13379 us, max 351451 us; 3 over 50ms (sent+took): 0.00s+157ms 2.23s+351ms 4.23s+286ms
+   p1 cut 0 installs 3
+== partition 1 exit 0
+   p2   7562 writes, 7562 acknowledged: p50 418 us, p99 2250 us, p999 33498 us, max 171678 us; 6 over 50ms (sent+took): 0.00s+172ms 1.28s+66ms 2.09s+73ms 2.25s+105ms 2.36s+96ms 3.57s+76ms
+   p2 cut 0 installs 2
+== partition 2 exit 0
+   p3   4412 writes, 4412 acknowledged: p50 617 us, p99 4017 us, p999 74240 us, max 149528 us; 5 over 50ms (sent+took): 0.00s+118ms 0.18s+150ms 2.22s+93ms 3.53s+74ms 4.41s+128ms
+   p3 cut 0 installs 3
+== partition 3 exit 0
+   p4   8060 writes, 8060 acknowledged: p50 405 us, p99 2128 us, p999 11538 us, max 241415 us; 3 over 50ms (sent+took): 0.00s+144ms 2.20s+241ms 3.01s+63ms
+   p4 cut 0 installs 2
+== partition 4 exit 0
+   p5   4717 writes, 4717 acknowledged: p50 625 us, p99 4112 us, p999 23542 us, max 148311 us; 4 over 50ms (sent+took): 0.00s+112ms 0.17s+148ms 2.21s+71ms 3.39s+54ms
+   p5 cut 0 installs 3
+== partition 5 exit 0
+   p6   4747 writes, 4747 acknowledged: p50 526 us, p99 4636 us, p999 91342 us, max 163515 us; 5 over 50ms (sent+took): 0.00s+146ms 2.22s+107ms 2.34s+91ms 4.37s+127ms 4.59s+164ms
+   p6 cut 0 installs 2
+== partition 6 exit 0
+   p7   2961 writes, 2961 acknowledged: p50 1059 us, p99 7985 us, p999 50855 us, max 174620 us; 3 over 50ms (sent+took): 0.00s+175ms 2.52s+51ms 4.68s+81ms
+   p7 cut 0 installs 2
+== partition 7 exit 0
+   p8   5216 writes, 5216 acknowledged: p50 526 us, p99 4347 us, p999 60832 us, max 158172 us; 6 over 50ms (sent+took): 0.00s+135ms 0.21s+141ms 2.23s+65ms 2.29s+102ms 3.59s+61ms 4.56s+158ms
+   p8 cut 0 installs 3
+== partition 8 exit 0
+   p9   7354 writes, 7354 acknowledged: p50 422 us, p99 1962 us, p999 10706 us, max 221216 us; 5 over 50ms (sent+took): 0.00s+146ms 0.20s+159ms 2.24s+126ms 2.39s+124ms 3.48s+221ms
+   p9 cut 0 installs 3
+== partition 9 exit 0
+   p10   5313 writes, 5313 acknowledged: p50 462 us, p99 3915 us, p999 31188 us, max 240666 us; 4 over 50ms (sent+took): 0.00s+128ms 0.16s+179ms 2.22s+241ms 4.29s+155ms
+   p10 cut 0 installs 3
+== partition 10 exit 0
