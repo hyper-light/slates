@@ -1,0 +1,6 @@
+tested 97d6aa5adaa535be725bef53f74389ff5ff12036 variant after on aarch64, 4 cpus
+fill exit 0 190s
+  fill: b: clients_per_shard 2576 slots 32 shards 2 tasks_per_shard 10314 lane bound 164864; 645 clients x 32 forwards
+  fill: 20640 of 20640 answered: 13672 served, 0 Overloaded, the last 94.159737926s after the hold; control tasks refused 0
+fleet exit 0 600s
+clippy exit 0 65s
