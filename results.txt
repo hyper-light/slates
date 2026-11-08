@@ -1,0 +1,39 @@
+runner windows-11-arm, 4 CPUs, e4cfa0b diag-liveness-slice-6-red2: the slicing test on Windows, main without th, Sun Nov  8 14:45:57 UTC 2026
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_PREBUILT_NASM': '0'
+warning: aws-lc-sys@0.45.0: Value: 0 is false.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'aarch64-pc-windows-msvc'
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CC_aarch64_pc_windows_msvc': 'clang-cl'
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CC_aarch64_pc_windows_msvc': 'clang-cl'
+warning: aws-lc-sys@0.45.0: Setting CC_aarch64_pc_windows_msvc: clang-cl
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CXX_aarch64_pc_windows_msvc': 'clang-cl'
+warning: aws-lc-sys@0.45.0: Setting CXX_aarch64_pc_windows_msvc: clang-cl
+warning: aws-lc-sys@0.45.0: C:\a\slates\slates\vendor\AWS-LC~2\aws-lc\tests\compiler_features_tests\stdalign_check.c(12,14): error: unused parameter 'argc' [-Werror,-Wunused-parameter]
+warning: aws-lc-sys@0.45.0:    12 | int main(int argc, char **argv) {
+warning: aws-lc-sys@0.45.0:       |              ^
+warning: aws-lc-sys@0.45.0: C:\a\slates\slates\vendor\AWS-LC~2\aws-lc\tests\compiler_features_tests\stdalign_check.c(12,27): error: unused parameter 'argv' [-Werror,-Wunused-parameter]
+warning: aws-lc-sys@0.45.0:    12 | int main(int argc, char **argv) {
+warning: aws-lc-sys@0.45.0:       |                           ^
+== clippy exit 0
+== spinners: 8
+slates daemon: shard 1 is spinning: 1046 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+slates-server: shard 1 is still starting; the control loop waits a further window
+slates-server: shard 1: recovered 1 volumes from their images (0 refused), 7 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 2 clone p
+slates daemon: shard 1 is spinning: 1015 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+slates-server: shard 1 is still starting; the control loop waits a further window
+slates-server: shard 1 is still starting; the control loop waits a further window
+thread 'a_daemon_keeps_its_beat_through_a_recovery_longer_than_a_window_and_recovers_everything' (7488) panicked at crates\server\tests\recovery_slicing.rs:338:3:
+the beat went 2.9306202s without advancing while the daemon recovered 8 greens, past the 1s window plus a 100ms beat: the watchdog withheld it
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_daemon_keeps_its_beat_through_a_recovery_longer_than_a_window_and_recovers_everything ... FAILED
+
+failures:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 32.12s
+
+error: test failed, to rerun pass `-p slates-server --test recovery_slicing`
+== the slicing test exit 101 in 36 s
