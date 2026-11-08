@@ -212,11 +212,11 @@ fn a_kernel_offering_every_bit_negotiates_only_the_named_flags() {
   // advertised `max_write` is never reached: the kernel keeps splitting at its own 32-page default.
   assert_ne!(n.flags & flags::MAX_PAGES, 0, "max pages is negotiated");
   assert_eq!(
-    u32::from(n.max_pages) * u32::try_from(rustix::param::page_size()).unwrap_or(4096),
+    u32::from(n.max_pages) * host_page_bytes(),
     slates_bridge_fuse::init::MAX_WRITE,
     "the pages offered carry exactly the largest write slates accepts ({} B on a {} B page)",
     slates_bridge_fuse::init::MAX_WRITE,
-    rustix::param::page_size()
+    host_page_bytes()
   );
   assert_eq!(
     n.flags & flags::WRITEBACK_CACHE,
@@ -830,4 +830,20 @@ fn an_attribute_marked_for_dax_carries_fuse_attr_dax_in_its_flags() {
   assert_eq!(plain[flags_at..], [0, 0, 0, 0]);
   assert_eq!(marked[flags_at..], [2, 0, 0, 0]);
   assert_eq!(plain[..flags_at], marked[..flags_at]);
+}
+
+/// The page size the codec sizes `max_pages` by, as `slates_bridge_fuse::init` reads it: the host's own on Unix.
+#[cfg(unix)]
+fn host_page_bytes() -> u32 {
+  u32::try_from(rustix::param::page_size()).unwrap_or(4096)
+}
+
+/// The paired arm: a platform with no `/dev/fuse` (Windows) sizes by the assumed 4 KiB page, as
+/// `slates_bridge_fuse::init` does there, and `rustix` is a Unix-only dependency. Before 2026-11-06 the test named
+/// `rustix` directly and did not compile for Windows (`cargo xwin clippy --workspace --all-targets`).
+#[cfg(not(unix))]
+fn host_page_bytes() -> u32 {
+  /// Shape: `slates_bridge_fuse::init`'s `ASSUMED_PAGE_BYTES`, the page it sizes by where no kernel is asked.
+  const ASSUMED_PAGE_BYTES: u32 = 4096;
+  ASSUMED_PAGE_BYTES
 }

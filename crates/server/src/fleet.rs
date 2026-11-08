@@ -1454,45 +1454,23 @@ async fn serve_peer_records(
           })
           .unwrap_or_default(),
           stream if is_content_stream(stream) => state::with_state(|s| {
-            // A test's injected placement refusal (§4.16 placed-before-reference): a holder that
-            // refuses every content placement — its offers and its chunks, since a complete stage
-            // acknowledges at the offer (AUD-29-55) — counted, so an owner's record is shown to wait on it.
-            if s.merge.fault.refuse_content_puts
-              && (stream == CONTENT_OFFER_STREAM || stream == CONTENT_CHUNK_STREAM)
-            {
-              s.count(crate::merge_service::CONTENT_PUT_REFUSED, 1);
-              return Vec::new();
-            }
-            // Authority for the object the request names is decided before any lookup (AUD-29-45),
-            // from the committed configuration and this holder's records — never from the content hash.
             let peer_host = s
               .learned_members
               .get(&peer_anchor)
               .map_or(seed, |learned| learned.host);
-            crate::content_holder::serve(
-              s,
-              local,
-              &request,
-              |regional, records, mirror, access, object| {
-                content_authorized(regional, records, local, peer_host, access, object)
-                  || mirror.admits_put(peer_host, access, object)
-              },
-            )
+            serve_content_request(s, local, peer_host, stream, &request)
           })
           .unwrap_or_default(),
-          // A green's merge record (§4.16 "Apply on holders"): recomputed before it is accepted.
-          crate::merge_service::MERGE_RECORD_STREAM => Record::decode(&request)
-            .ok()
-            .and_then(|record| {
-              state::with_state(|s| {
-                let peer_host = s
-                  .learned_members
-                  .get(&peer_anchor)
-                  .map_or(seed, |learned| learned.host);
-                crate::merge_service::accept_merge_record(s, local, peer_host, &record)
-              })
-            })
-            .unwrap_or_default(),
+          // A green's merge record with the inputs it names while this holder lacks them (§4.16 "Apply on holders",
+          // "Commit" in one exchange a version): the inputs are held, then the record recomputed and accepted.
+          crate::merge_service::MERGE_RECORD_STREAM => state::with_state(|s| {
+            let peer_host = s
+              .learned_members
+              .get(&peer_anchor)
+              .map_or(seed, |learned| learned.host);
+            serve_merge_shipment(s, local, peer_host, &request)
+          })
+          .unwrap_or_default(),
           CONFIG_STREAM => state::with_state(|s| {
             serve_council(
               s,
@@ -1708,6 +1686,70 @@ fn after_held_record(state: &mut ShardState, record: &Record) {
     // A newer head or ledger position may supersede content held for the object (AUD-29-43).
     crate::content_retention::retain_object(state, record.object);
   }
+}
+
+/// Serves one content request from `peer_host` on this holder (§4.10): the content plane's own stream, or a frame of
+/// a merge shipment that carries a record's inputs ([`serve_merge_shipment`]), through the one path.
+fn serve_content_request(
+  s: &mut ShardState,
+  local: HostId,
+  peer_host: HostId,
+  stream: u64,
+  request: &[u8],
+) -> Vec<u8> {
+  // A test's injected placement refusal (§4.16 placed-before-reference): a holder that refuses every content
+  // placement — its offers and its chunks, since a complete stage acknowledges at the offer (AUD-29-55) — counted,
+  // so an owner's record is shown to wait on it.
+  if s.merge.fault.refuse_content_puts
+    && (stream == CONTENT_OFFER_STREAM || stream == CONTENT_CHUNK_STREAM)
+  {
+    s.count(crate::merge_service::CONTENT_PUT_REFUSED, 1);
+    return Vec::new();
+  }
+  // Authority for the object the request names is decided before any lookup (AUD-29-45), from the committed
+  // configuration and this holder's records — never from the content hash.
+  crate::content_holder::serve(
+    s,
+    local,
+    request,
+    |regional, records, mirror, access, object| {
+      content_authorized(regional, records, local, peer_host, access, object)
+        || mirror.admits_put(peer_host, access, object)
+    },
+  )
+}
+
+/// Serves a merge shipment (§4.16 "Commit" in one exchange a version): its content frames — the offer of the record's
+/// inputs, then their chunks — through the content plane's own path, then the record. The record is accepted only if
+/// its inputs are held by then (`merge_service::accept_merge_record`), so a refused or partial placement answers no
+/// acknowledgement and the owner ships again; the content replies themselves are not the answer.
+fn serve_merge_shipment(
+  s: &mut ShardState,
+  local: HostId,
+  peer_host: HostId,
+  request: &[u8],
+) -> Vec<u8> {
+  let Some(frames) = crate::merge_service::decode_shipment(request) else {
+    return Vec::new();
+  };
+  let Some((record, content)) = frames.split_first() else {
+    return Vec::new();
+  };
+  let Ok(record) = Record::decode(record) else {
+    return Vec::new();
+  };
+  if !content.is_empty() {
+    s.count(crate::merge_service::INPUTS_CARRIED, 1);
+  }
+  for (index, frame) in content.iter().enumerate() {
+    let stream = if index == 0 {
+      CONTENT_OFFER_STREAM
+    } else {
+      CONTENT_CHUNK_STREAM
+    };
+    let _ = serve_content_request(s, local, peer_host, stream, frame);
+  }
+  crate::merge_service::accept_merge_record(s, local, peer_host, &record)
 }
 
 /// Validates a record against both the transport principal and installed authority before any effect

@@ -23,10 +23,6 @@
   clippy::indexing_slicing,
   clippy::unwrap_in_result
 )]
-// These integration tests drive the daemon's NFS-loopback transport, the fleet's TCP
-// transport and rustix syscalls — all macOS/Linux; on Windows the daemon mounts through WinFsp and
-// the fleet transport is QUIC-over-UDP, so these particular tests are unix (as `virtiofs.rs` is).
-#![cfg(unix)]
 
 use std::time::{Duration, Instant};
 
@@ -53,6 +49,9 @@ use slates_server::{
 mod common;
 use std::net::TcpStream;
 
+// The virtio-fs guest device is Unix-only: its loop rides the runtime's Unix descriptor readiness
+// (`slates_server::virtiofs` is `cfg(unix)`, §4.6 A-9), so the guest test and its fixtures are too.
+#[cfg(unix)]
 use common::guest::{message, my_uid, reply_error, round_trip, start_guest, with_guest};
 use common::nfs::{
   create, lookup, lookup_carries_attributes, lookup_status, mount, owner_and_mode_status,
@@ -12529,6 +12528,300 @@ fn a_submit_at_f1_is_answered_without_waiting_for_the_coordinators_period() {
   );
 }
 
+/// §4.16 "Commit" in one exchange a version (A-235's follow-up; the bug record of 2026-11-07, a version's inputs and
+/// record took five hops). A version's inputs were put through the content exchange (an offer, then the transfer) and
+/// its record shipped after, each behind its own wake of the record plane, so one submit at `f = 1` crossed five hops:
+/// 15 ms at load 130, 6.7 ms quiet. Do: on a settled three-node fleet at `f = 1`, submit twenty works over one green one
+/// after another. Expect every submit accepted as the next version, and every version's inputs carried to a holder
+/// inside the merge record that names them (`merge.inputs_carried`), in the one exchange that commits it.
+#[test]
+fn a_merge_version_reaches_each_holder_with_its_inputs_in_one_exchange() {
+  /// Shape: submits made, one after another (the same count as the coordinator-period test).
+  const SUBMITS: u64 = 20;
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<_> = names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<_> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<_> = nodes
+    .iter()
+    .map(|(_, _, identity)| identity.certificate())
+    .collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 1);
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("create green");
+  };
+  let answers = timed_submits(&mut client, green, SUBMITS);
+  let counters = merge_and_content_counters(&daemons);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  for (index, _, submitted, _) in &answers {
+    assert_eq!(
+      *submitted,
+      ReplyBody::Submitted {
+        version: Some(index + 1),
+        conflicts: Vec::new(),
+      },
+      "submit {index} is accepted as the next version"
+    );
+  }
+  let carried: u64 = counters
+    .iter()
+    .skip(1)
+    .flatten()
+    .filter(|(name, _)| name == "merge.inputs_carried")
+    .map(|(_, count)| count)
+    .sum();
+  assert!(
+    carried >= SUBMITS,
+    "every version's inputs reached a holder inside its merge record ({carried} of at least {SUBMITS}): {counters:?}"
+  );
+}
+
+/// §4.10 content retention, §4.16 "Commit" (the bug record of 2026-11-07, retention decoded every merge record per put).
+/// A holder's retention rule asked, for each manifest it held, whether any position of the green's merge ledger named it,
+/// decoding every position each time: quadratic in the green's history, so a submit at `f = 1` slowed by about 40 µs a
+/// version (247 µs over the first 50 submits, 20 ms by the 500th). Do: on a settled three-node fleet at `f = 1`, submit
+/// 300 works over one green one after another. Expect every submit accepted, and the median of the last 50 answers no
+/// more than four times the first 50's plus 2 ms: a submit late in a green's history costs what an early one does.
+#[test]
+fn a_submit_late_in_a_greens_history_is_answered_as_fast_as_an_early_one() {
+  /// Shape: submits made, one after another; enough history for a per-version cost to show (12 ms by the 300th).
+  const SUBMITS: u64 = 300;
+  /// Shape: the submits each end's median is taken over.
+  const WINDOW: usize = 50;
+  /// Shape: how much slower the late window may be than the early one before a per-version cost is declared, and the
+  /// absolute slack for a loaded machine's scheduling.
+  const SLOWER_AT_MOST: u32 = 4;
+  /// Shape: see [`SLOWER_AT_MOST`].
+  const SLACK: Duration = Duration::from_millis(2);
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<_> = names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<_> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<_> = nodes
+    .iter()
+    .map(|(_, _, identity)| identity.certificate())
+    .collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 1);
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("create green");
+  };
+  let answers = timed_submits(&mut client, green, SUBMITS);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  for (index, _, submitted, _) in &answers {
+    assert_eq!(
+      *submitted,
+      ReplyBody::Submitted {
+        version: Some(index + 1),
+        conflicts: Vec::new(),
+      },
+      "submit {index} is accepted as the next version"
+    );
+  }
+  let median_of = |window: &[(u64, ReplyBody, ReplyBody, Duration)]| {
+    let mut waits: Vec<Duration> = window.iter().map(|(_, _, _, waited)| *waited).collect();
+    waits.sort();
+    waits.get(waits.len() / 2).copied().unwrap_or(Duration::MAX)
+  };
+  let early = median_of(answers.get(..WINDOW).unwrap_or_default());
+  let late = median_of(
+    answers
+      .get(answers.len().saturating_sub(WINDOW)..)
+      .unwrap_or_default(),
+  );
+  eprintln!(
+    "submit answers at f = 1 over {SUBMITS} versions: early median {early:?}, late median {late:?}"
+  );
+  assert!(
+    late <= early * SLOWER_AT_MOST + SLACK,
+    "a submit late in the green's history is answered as fast as an early one: early median {early:?}, late median \
+     {late:?} over {WINDOW} submits each"
+  );
+}
+
+/// §4.16 "Commit" (AUD-11) across the owner's restart (the bug record of 2026-11-07, a version appended before its
+/// owner restarted never committed). Goal 4's primary-kill rung at 1,000 clients found versions on the green that no
+/// client was ever told: a restarted owner rebuilt each green from its chain but not the merge records it still owed its
+/// holders, so a version appended before the crash and not yet committed at `f + 1` was never shipped again. Do: on a
+/// settled three-node fleet at `f = 1` whose nodes keep their state across a restart, make a green, a work with one
+/// edit, and with both holders withholding merge records submit it, so version 1 is appended on the owner and its
+/// submit waits; restart the owner over its own segment; lift the holders' fault. Expect version 1's merge record to
+/// commit at the quorum within the placement deadline.
+#[test]
+fn a_version_appended_before_its_owner_restarted_commits_once_it_is_back() {
+  let _serial = serialize_fleet_tests();
+  let pid = std::process::id();
+  let profiles: Vec<_> = ["commit-restart-a", "commit-restart-b", "commit-restart-c"]
+    .into_iter()
+    .map(profile)
+    .collect();
+  let anchors: Vec<_> = profiles.iter().map(anchor_of).collect();
+  let seeds: Vec<_> = anchors.iter().map(|anchor| member_id(*anchor, 0)).collect();
+  let mut identities: Vec<_> = profiles.iter().map(|_| same_identity(2)).collect();
+  let certificates: Vec<_> = identities
+    .iter()
+    .map(|pair| pair[0].certificate())
+    .collect();
+  let (_ports_lease, ports) = mesh_serve_ports(profiles.len());
+  let peers = |node| {
+    profiles
+      .iter()
+      .enumerate()
+      .filter(|(peer, _)| *peer != node)
+      .map(|(peer, _)| fleet_peer_at(anchors[peer], seeds[peer], ports[peer], &certificates[peer]))
+      .collect::<Vec<_>>()
+  };
+  let configs: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      fleet_config(
+        profile,
+        &format!("commit-restart-{node}-{pid}"),
+        anchors[node],
+        seeds[node],
+        &peers(node),
+        &Default::default(),
+      )
+    })
+    .collect();
+  // Each node's segment carries a content object, so its volumes' content survives the owner's restart.
+  let anchors_held: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      common::anchor::held_anchor(
+        &format!("commit-restart-{node}-{pid}"),
+        profile,
+        &configs[node],
+      )
+    })
+    .collect();
+  let source = |node: usize| common::anchor::source_of(&anchors_held[node]);
+  let mut daemons: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      start_fleet_node(
+        profile,
+        configs[node].clone(),
+        identities[node].pop().unwrap(),
+        ports[node],
+        peers(node),
+        source(node),
+      )
+    })
+    .collect();
+  daemons[0].bootstrap(true).unwrap();
+  settle_initial_consensus(&daemons, &seeds, &Default::default(), Quorum { f: 1 });
+  let mut client = Client::connect(daemons[0].instance());
+  let created = client.call(&RequestBody::CreateGreen {
+    name: "green".to_owned(),
+    require_evidence: false,
+    base: None,
+  });
+  let ReplyBody::GreenCreated { id: green } = created else {
+    panic!("create green: {created:?}");
+  };
+  let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
+    green,
+    name: "work".to_owned(),
+  }) else {
+    panic!("create work");
+  };
+  let edited = client.call(&RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  let withheld = slates_server::merge_service::MergeFault {
+    refuse_content_puts: false,
+    corrupt_next_inputs: false,
+    refuse_records: true,
+  };
+  let faulted: Vec<_> = daemons[1..]
+    .iter()
+    .map(|holder| holder.inject_merge_fault(withheld))
+    .collect();
+  // The submit appends version 1 and waits for its record, which the holders withhold: no answer comes.
+  let unanswered = client
+    .try_call(
+      &RequestBody::Submit {
+        work,
+        evidence: Vec::new(),
+      },
+      LIVENESS_BUDGET_NS.saturating_mul(2),
+    )
+    .is_err();
+  let awaiting_before = daemons[0].merge_awaiting(green);
+  drop(client);
+  daemons.remove(0).stop();
+  daemons.insert(
+    0,
+    start_fleet_node(
+      &profiles[0],
+      configs[0].clone(),
+      identities[0].pop().unwrap(),
+      ports[0],
+      peers(0),
+      source(0),
+    ),
+  );
+  let lifted: Vec<_> = daemons[1..]
+    .iter()
+    .map(|holder| holder.inject_merge_fault(slates_server::merge_service::MergeFault::default()))
+    .collect();
+  let all: Vec<&Daemon> = daemons.iter().collect();
+  let committed = poll_until(&all, PLACEMENT_DEADLINE, || {
+    daemons[0].merge_record_placed(green, 1)
+  });
+  let counters = merge_and_content_counters(&daemons);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    matches!(edited, ReplyBody::Edited),
+    "the edit was declared: {edited:?}"
+  );
+  assert!(
+    faulted.iter().chain(&lifted).all(Result::is_ok),
+    "the holders' fault was set and lifted: {faulted:?} {lifted:?}"
+  );
+  assert!(unanswered, "the submit waited for its withheld record");
+  assert_eq!(
+    awaiting_before,
+    Ok(1),
+    "version 1 was appended and its submit waited before the restart"
+  );
+  assert!(
+    committed,
+    "version 1, appended before the owner restarted, committed at the quorum once it was back: {counters:?}"
+  );
+}
+
 /// `count` works over `green`, each with one edit declared and then submitted, one after another: each work's index,
 /// its edit's reply, its submit's reply and how long the submit took to answer.
 fn timed_submits(
@@ -12967,6 +13260,7 @@ fn an_isolated_owner_refuses_latest_state_reads_while_the_successor_advances_the
 
 /// Shape: heartbeats a guest's requests are watched for after the owner's lease lapsed — several of the
 /// intervals the fenced loop re-asks at, so a loop that served under the lapse would have answered them.
+#[cfg(unix)]
 const GUEST_HELD_HEARTBEATS: u64 = 5;
 
 /// AUD-29-83 (§4.8 "Leases and reads", R8): the guest device answers to the same owner lease as the NFS live
@@ -12978,6 +13272,8 @@ const GUEST_HELD_HEARTBEATS: u64 = 5;
 /// lease refusals were counted, and the hangup ended the loop although its requests were held. Before, the
 /// guest path checked only that the volume's slot existed and served both.
 #[test]
+// Unix-only: the virtio-fs guest device (see `use common::guest` above).
+#[cfg(unix)]
 fn an_isolated_owner_holds_its_guests_requests_rather_than_serve_them() {
   let _serial = serialize_fleet_tests();
   let names = ["a", "b", "c"];

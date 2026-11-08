@@ -7692,6 +7692,29 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > work reads one position per holder rather than rescanning the retained chain. Transfer to a new
 > candidate set and full green takeover remain owed (AUD-14).
 
+> **Status (2026-11-07, A-246: a restarted owner re-enqueues its chain's records).**
+> The pending merge records and the submits waiting on them live in memory, and a restarted owner rebuilt each green from
+> its chain without them. So a version appended before the crash and not yet committed at `f + 1` was never shipped
+> again, and its retried submit waited forever. Goal 4's primary-kill rung at 1,000 clients found it: versions 507 to
+> 514 on the green, no client told
+> (`docs/bugs/2026-11-07-a-version-appended-before-its-owner-restarted-never-committed.md`). Now the restart's replay
+> returns each version's record fields, with the green's head identity at that version, and the owner re-enqueues
+> them. A holder that already holds a version acknowledges it again at no cost. A takeover keeps its own path.
+
+> **Status (2026-11-07, A-244: a version commits in one exchange).** A-235 still put a
+> version's inputs through the content exchange (an offer, then the transfer) and shipped its record after, each behind
+> its own wake of the record plane: five hops, so one submit at `f = 1` took 6.7 ms at p50 quiet and 15 ms at load 130
+> (`docs/bugs/2026-11-07-a-versions-inputs-and-record-took-five-hops.md`). Now a record ships with its inputs while a
+> target lacks them, as one merge shipment: the record, then the content exchange's offer and chunks, which the holder
+> serves through the content plane's own path before it recomputes and accepts. One acknowledgement places both. The
+> separate inputs put is gone: "placed before referenced" holds by construction, since a holder accepts a record only
+> once it holds the inputs it names. A holder's retention rule now reads the one ledger position a held input can be
+> named by (its version's) rather than decoding the whole ledger per held manifest, which had made each put quadratic
+> in the green's history (`docs/bugs/2026-11-07-retention-decoded-every-merge-record-per-put.md`). 500 sequential
+> submits at `f = 1`, release, adacachy at load about 10: p50 265 µs, p99 731 µs, p999 and max 1.13 ms. Still owed:
+> a smaller per-version cost (the median of 50 submits grows from 116 µs to 473 µs across 500 versions), and more than
+> one version to a holder per pass.
+
 > **Status (2026-11-06, A-235: the record plane runs when there is merge work).**
 > The merge record plane ran once per coordinator period (100 ms), putting a version's inputs at one period and its
 > record at the next, so every answer at `f > 0` waited at least one period, and usually two. One submit at a time on an
@@ -7855,6 +7878,15 @@ owner with the piggyback rule (a refusal from a non-owner names the current owne
 placement refresh is single-flight per green). The caller parks and resumes with the verdict. A work volume with
 `stream = true` submits at every auto-seal; an agent that wants a review boundary submits
 explicitly. A green with `require_evidence` refuses increments without evidence references.
+
+**Edit and submit in one request (A-225).** `edit_and_submit(work_volume, path, at, delete_len, bytes, evidence?)` is
+`edit` and then `submit`, in one request: the work's owner applies the edit exactly as `edit` does and, when the edit
+is accepted, submits exactly as `submit` does. Both run inside the one durable step and under the one completion record
+of the request, so a restart replays both or neither and a retry answers from the record. Its reply is the edit's
+refusal when the edit is refused (nothing is submitted, as a client that saw `edit` refused would not submit), else the
+submit's reply: the same verdict, the same conflict windows, the same refusals. `edit` and `submit` stay separate verbs
+because they are separate operations (an agent edits many times and submits once); the combined verb is for a client
+that does both, and saves it one round trip, which across machines is the whole of a request's cost.
 
 **Rebase, the only corrective path.** `rebase(work_volume, to = head)`: map the work volume's
 pending operations (since its base) through the canonical deltas up to `to`; if every operation
@@ -12730,6 +12762,8 @@ Status: built 2026-10-08.
   such an export to uid 0 only where the host's root is trusted with the volume.
 
 ### A-117 — An idle shard gives back the recovery memory no restart reads (2026-10-08)
+> Amended 2026-11-06 by A-226: each region is given back only as far as it was written since its last give-back, not
+> whole at every publication (18 to 21 ms of a macOS shard's CPU each time).
 Applied in the same change to:
 - `crates/vfs/src/recover.rs` (`CommittedSlot::stale_slot`) and `crates/vfs/src/checkpoint_log.rs`
   (`Journal::dead_ranges`, `DeadRanges`);
@@ -13945,6 +13979,36 @@ GAPS, BENCHMARKS ("The spin policy, measured and rejected").
   keeps its tails under load. The decision rests on Ada's rule that p99 under load is the target. The true spin's change
   is kept on record, not landed (`agents/clients-spin`, a75f9213).
 
+### A-224 — A shard thread's scheduling slice: measured and rejected (2026-11-08; the supervisor's decisions of 2026-11-06 and 2026-11-07)
+Applied in the same change to: BENCHMARKS ("A shard's scheduling slice, measured and rejected"), GAPS. No code: the
+built change stays on agents/perf-2 (`7c04f873`, the runtime's request; `0d8a61d9`, the harness's sweep) for the
+record, and nothing of it is on main.
+
+Status: measured and rejected 2026-11-08.
+- What was tried. Each shard thread asks the fair scheduler for a short EEVDF slice as it starts (`sched_setattr(2)`'s
+  `sched_runtime` for a `SCHED_OTHER` thread, Linux 6.12+). The thread keeps its policy and nice, so no privilege is
+  needed: proven as uid 1000, CapEff 0, `Nice=19`, on Linux 6.19.10, `Held(100000)`. A shorter slice gives a woken
+  shard an earlier virtual deadline, so under oversubscription it runs before threads that never sleep.
+- The rule it was judged by (the supervisor): loaded p99 and max keep the gain, and loaded p50 is not worse than base
+  beyond the spread. The load: two spinners a core on two CPUs, a sibling fsync writer, 256 MB. Interleaved, on CI's
+  Linux 7.0 runners (x86_64 and arm64).
+- What it bought. On arm64, the loaded accept p99 fell from 22 to 35 ms (median 26.6) to 2.2 to 9.0 ms (median 6.0)
+  with the kernel's minimum, 100 µs, and the max from 29 to 39 ms to 3.9 to 12 ms. On x86_64 the max fell from 10.6
+  to 21 ms to 7.7 to 12.2 ms, but the p99 barely moved (median 6.0 to 5.2 ms). Quiet runs, paced and unpaced, were
+  even.
+- What it cost, and why it is rejected. Every slice tried had loaded p50 excursions of 0.8 to 4.0 ms in some
+  rounds, beyond base's spread:
+  - x86_64: base 12 to 14 µs; 100 µs reached 1,852 µs (accept); step budget × 32 (206 µs) 826 µs.
+  - arm64 conflict: base 15 to 21 µs; 100 µs reached 4,015 µs; 234 µs reached 3,785 µs.
+  - arm64 accept at 234 µs: a median p50 of 2,048 µs.
+  - The sweep before it (diag-perf-7, eight slices derived from each runner: none, the kernel's minimum, the step
+    budget doubled from × 16 to × 256, the kernel's default) showed the same excursions in four other slice arms, and
+    none in base.
+  No slice keeps the gain within the p50 rule, so none is taken.
+- Not established, and what would reopen it: why a sliced shard's median request waits milliseconds in some
+  rounds. A candidate, unproven: EEVDF's lag, which lets a short-slice thread that ran ahead wait out its peers'
+  slices. A slice that keeps the p50 (or a client that can ask for its own) would need the same rule met.
+
 ### A-228 — A daemon's liveness is judged in its shards' own CPU time, by an owned watchdog thread (accepted and built 2026-11-06)
 Applied in the same change to: §4.14 (its status on `daemon.alive`), `crates/server/src/watchdog.rs` (new),
 `crates/server/src/daemon.rs` (`Daemon::start`, `stop_parts`, `control_loop`, `heartbeat_loop`), `crates/cli/src/anchor.rs`
@@ -14177,6 +14241,83 @@ the server takes it as the work's delta over its new base (`WorkFiles::from_chan
   rebase's changes over it equals the twin's head after the accept, every change differing from the head (red with
   the changes under `d` dropped: the first case failed); a one-file edit of a thousand-file green rebases to that file
   alone. The server's library, daemon and client suites pass.
+
+### A-225 — Edit and submit in one request (accepted 2026-11-06, the supervisor's decision (b))
+Applied in the same change to: §4.16 ("Edit and submit in one request"), `crates/ipc/src/protocol.rs`
+(`RequestBody::EditSubmit`, `EditBytes`, appended), `crates/server/src/verbs.rs` (`edit_and_submit`, and the verb in
+`claims_placed_durability`), `crates/client/src/client.rs` (`Client::edit_and_submit`), the oracle
+`crates/client/tests/edit_and_submit.rs`, the harness's `accept_one` form (`crates/client/examples/edit_merge_bench.rs`),
+BENCHMARKS, GAPS.
+
+Status: built 2026-11-06.
+- Why: across machines a request costs its round trip. Measured over a Wi-Fi LAN (BENCHMARKS, "Edit and submit in one
+  request, across two machines"), an accepted edit and merge was two of them: edit then submit 14.1 to 18.6 ms at the
+  median, the edit and the submit each about one forwarded round trip (a ping 6.1 to 7.7 ms). One request does both.
+- The rule: `EditSubmit` names the work, the splice (path, offset, length removed, and the bytes inserted, carried
+  inline or as a staged buffer for an edit larger than one request) and the evidence. The work's owner runs `edit`
+  (or `EditStaged`'s edit); if it answers `Edited`, it runs `submit` and answers with that. Otherwise it answers the
+  edit's refusal and submits nothing. Both run in the request's one `Db::begin` … `commit` with its one completion
+  record, so the effects of both, or of the edit and a refused submit, are durable together or not at all. A retry,
+  across a restart too, answers from the record. The verb claims placed durability as `Submit` does, and is routed,
+  forwarded and republished by the work's volume, as `Edit` and `Submit` are.
+- What it does not change: `Edit` and `Submit` stay, as different operations, not a compatibility path. The verdict,
+  its conflict windows, the increment's identity and every refusal are the two verbs' own, since the combined verb
+  calls them.
+- Proven by an oracle that runs both forms over generated histories (two daemons' worth of works over one green,
+  each step an edit-and-submit through one client and edit-then-submit through another, with daemon restarts between
+  steps) and compares every verdict, every conflict report and the greens' heads and files. Exactly-once is
+  proven by a retry across a restart, which must answer the recorded verdict and leave the green one version ahead,
+  not two.
+- Measured (2026-11-06 07:49 to 07:59 UTC; server node adas-macbook-pro-2 at 192.168.1.71, client node kiln-a094a12d at
+  192.168.1.72, both on Wi-Fi; ICMP RTT 3.8 to 3.9 ms min, 5.3 to 8.5 ms average). The harness ran on the client
+  machine, attached to its own node, over a 100-file green owned by the server node (`edit_merge_bench --instance
+  perf-cli --green ID --files 100 --form ping --form accept --form accept_one`, three invocations with the two
+  accept forms' order alternated). p50 in each round: `accept`, edit then submit, 14.1, 18.6 and 14.8 ms; `accept_one`
+  6.93, 7.81 and 7.03 ms; a ping (one forwarded `versions`) 6.13, 7.74 and 7.66 ms. One request costs one round trip.
+  The p99 is the link's in both forms (70 to 158 ms).
+### A-226 — An idle shard gives back only the recovery memory written since its last give-back (accepted and built 2026-11-06; amends A-117; the supervisor's item (c), the macOS paced tail)
+Applied in the same change to:
+- `crates/vfs/src/checkpoint_log.rs` (`Journal`'s `committed_written`, `stale_written`, `log_written`,
+  `UNKNOWN_EXTENT`, `Journal::checkpointed`, `Journal::given_back`, the bounded `Journal::dead_ranges`);
+- `crates/server/src/daemon.rs` (`return_dead_recovery`, test support `Daemon::give_back_recovery_on_every_shard`) and
+  `crates/server/src/state.rs` (`recovery_returned_at` removed);
+- the tests `a_give_back_returns_only_recovery_memory_written_since_the_last` (`crates/server/tests/recovery.rs`, red
+  first) and the oracle `a_give_back_names_every_dead_written_byte_and_stops_at_the_last`
+  (`crates/vfs/tests/checkpoint_log.rs`);
+- A-117's entry, BENCHMARKS ("The macOS paced tail was the recovery give-back"), GAPS, and
+  `docs/bugs/2026-11-06-an-idle-shards-recovery-give-back-walked-18-gb-at-every-publication.md`.
+
+Status: built 2026-11-06.
+- Why: A-117 gave back the stale checkpoint slot and the log past its tail whole, at every publication. Only what was
+  written since the last give-back can be resident, but the walk covered the regions' whole length: 18,325,143,552
+  bytes a shard on adas-macbook-pro-2. On macOS that is one `MADV_FREE_REUSABLE` mark of the range, 18 to 21 ms of the
+  shard's CPU in a single poll of its reap loop, once per tick after any merge. Every request reaching the shard
+  meanwhile waited behind it. That was the paced macOS tail (p99 5.7 to 21 ms) that the doorbell had been blamed for.
+  The shard's own stamps and per-poll CPU named it (the bug record); it was not a lost or held wake.
+- The rule: the journal records how far each region may have been written since it was last given back:
+  - the committed slot as far as its checkpoint, or further where it held a longer image never given back;
+  - the stale slot as far as the image it held when it was committed;
+  - the log as far as any frame, or the zeroed header after one, reached.
+  A give-back covers those extents and no further, and records what the object took; a range the object refuses stays
+  owed. A journal opened over memories it did not write (a restart, or a predecessor torn before its first commit)
+  takes each region as written throughout, so each is given back whole once per boot. Nothing else in A-117 changes:
+  the given-back ranges were never read, and a busy shard never gives anything back.
+- Proven: the oracle runs generated histories of checkpoints, appends, give-backs and restarts over memories that
+  record each byte written. After every step, every written byte that no restart reads lies inside the named ranges,
+  the ranges lie inside what no restart reads and end at the last such write (except a region unseen since a
+  restart), and a restart recovers the full image. Two mutations each fail it: the longer-image rule dropped, or the
+  log's extent zeroed at a checkpoint.
+- Measured (adas-macbook-pro-2, Apple M5 Max, 18 cores, 128 GiB, 2026-11-06 05:16 to 06:05 UTC, load 50 to 95 from
+  other builds). The paced harness (`edit_merge_bench --quiet-only --pause-ns 2000000 --files 10 --form accept`,
+  3 × 1,000 calls) was run with every poll over 1 ms logged with its thread's CPU, a temporary diagnostic. Before:
+  46 reap-loop polls of 5 ms CPU or more, up to 48.5 ms. After: 6, each one of a shard's first two give-backs after
+  boot (12.1 to 42.7 ms, three shards, two each), and none later. Every other poll over 1 ms of wall time used under
+  1 ms of CPU: the host's load, not the shard's work. Latency, interleaved (10 of 12 runs finished before the time
+  limit): paced p99 before 12.3 to 39.2 ms at load 52 to 82 (149 and 234 ms in round 1, 142 to 361 ms at load 95),
+  after 6.8 to 29.2 ms (54 and 94 ms in one run); unpaced p99 before 0.64 to 32 ms, after 0.43 to 6.8 ms. That load
+  dominates both arms' tails, so the latency rows are informational and the CPU count is the measurement.
+- Owed: a boot's two whole give-backs a shard (memories this journal did not write) still hold the shard 12 to 43 ms
+  each. They should be given back in slices under the step quantum, from a measured discard rate (GAPS).
 
 ### A-214 — An idle shard keeps its last write burst's worth of free content pages pre-faulted (accepted 2026-11-05, VFS plan step 11; amends A-105)
 
@@ -15491,6 +15632,49 @@ Applied in the same change to: §4.7 (data model, wake strategy, status); `slate
 and settle, `DaemonEnd::reply`'s stamp and confirmation) and `crates/ipc/tests/rings.rs`; GAPS. Evidence:
 `docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`. A client and a daemon of
 different layout versions refuse each other by name; no consensus rule or capability changes.
+
+### A-246 — A restarted owner re-enqueues the merge records its chain holds (accepted 2026-11-07)
+
+AUD-11 answers a submit at `f > 0` once its version's record commits at the quorum. The records an owner owes and the
+submits waiting on them were in memory only, and a restart rebuilt greens from their chains without them, so a version
+appended before a crash and not yet placed was never shipped again. Replace that: the restart's replay of each green
+(`verbs::replay_green`) yields every replayed version's record fields with the green's head identity there. Those are
+version 0 when no checkpoint stands for it, then each chain entry. The owner enqueues them as pending records, placed
+from the configuration it holds when it ships. A holder that already applied a version re-acknowledges it from its
+acceptor, so re-shipping what was already placed costs one exchange a version and changes nothing.
+
+Rejected:
+- Persisting each record's placement. That is a durable write per commit, to save a re-ship only after a restart.
+- Asking the holders for their heads before shipping. That is a new exchange whose answer the re-acknowledgement
+  already gives.
+- Re-enqueueing on a takeover too. A takeover adopts its placed head under the promotion epoch and keeps that path.
+
+Applied in the same change to: §4.16 (Commit status); `slates-server` (`verbs::replay_green`, `rebuild_green`,
+`rebuild_recovered`; `merge_service::ReplayedVersion`, `enqueue_recovered_record`, `enqueue_record_with`); the fleet
+test; GAPS. Evidence: `docs/bugs/2026-11-07-a-version-appended-before-its-owner-restarted-never-committed.md`. No wire,
+layout or capability change.
+
+### A-244 — A merge record carries its inputs, so a version commits in one exchange (accepted 2026-11-07)
+
+A-235 woke the record plane per event, but a version still crossed five hops: a nudge, the inputs' offer, their transfer,
+a second nudge, the record. A submit at `f = 1` cost 6.7 ms at p50 quiet, against goal 4's 1 ms. Replace the separate
+inputs put. A record ships with its inputs whenever a target lacks them, as one merge shipment on the record's own
+stream: the record, then the content exchange's offer and every chunk. The holder serves the content frames through the
+content plane's own path (authority, retention at the door, the verified hold), then recomputes and accepts. Its one
+acknowledgement binds the record and places the inputs. Placed-before-referenced holds by construction, because a
+holder that does not hold the inputs a record names refuses it (`merge.inputs_unheld`). Also: a holder's retention rule
+reads only the ledger position at the sequence a held input was placed for, since a green's inputs are placed at their
+version's sequence. Rejected: keeping the put and sending it concurrently with the record, which is two paths for one
+fact and a record that can reach a holder before its inputs do. Also rejected: a larger content window, which leaves
+the second nudge and the second exchange.
+
+Applied in the same change to: §4.16 (Commit status); §4.10 content retention (the module doc); `slates-cluster`
+(`commit_record_sent_as`); `slates-db` (`Acceptor::value_at`); `slates-server` (`merge_service::carries_inputs`,
+`encode_shipment`, `decode_shipment`, `ship_record`, `fold_acknowledgements`, `INPUTS_CARRIED`, the removal of
+`put_inputs`; `fleet::serve_merge_shipment`, `serve_content_request`; `content_retention::named`); the fleet and unit
+tests; GAPS. Evidence: `docs/bugs/2026-11-07-a-versions-inputs-and-record-took-five-hops.md`,
+`docs/bugs/2026-11-07-retention-decoded-every-merge-record-per-put.md`. Wire: the merge record stream's payload is now a
+shipment. A holder of an older build fails to decode it and answers nothing, so a mixed fleet refuses safely.
 
 ### A-235 — The merge record plane runs when there is merge work, and a version's inputs go only to holders whose next record it is (accepted 2026-11-06)
 

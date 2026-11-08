@@ -1,5 +1,77 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A version appended before its owner restarted never committed: fixed (2026-11-07, §4.16 Commit, AUD-11;
+> A-246).** A restarted owner rebuilt its greens from their chains, but not the merge records
+> it still owed its holders (they lived in memory), so a version appended before the crash and not yet placed was never
+> shipped again and its retried submit was refused `Overloaded` until the client gave up. Goal 4's primary-kill rung
+> at 1,000 clients, `f = 1`: 1,770 oracle failures, versions 507 to 514 on the green with no client told. The restart
+> now re-enqueues every replayed version's record. Red test: the version never committed in 60 s after the restart;
+> now it commits, and the test ends in 3.3 s. Record:
+> `docs/bugs/2026-11-07-a-version-appended-before-its-owner-restarted-never-committed.md`.
+
+> **Open (fixtures, 2026-11-08; A-252 reserved): a submit resent after its owner's restart is applied a second time.**
+> A-246 commits the versions appended before the crash, and its test checked their placement, not the retry's answer.
+> The primary-kill rung (adacachy, 1,000 clients, `f = 1`, on loadtest-scale's 2ae4e832 with fixtures' b38a9d66) no
+> longer stalls (15.1 s, 3,000 accepted, 32 reconnects), but its oracle found 4,261 failures of one shape: the accepted
+> versions run 1 to 1,124 and then jump to 1,208, versions 1,125 to 1,207 are on the green with no submit to explain
+> them, and 83 clients were told acceptance at 1,208 and up. A submit's completion record is written only when its
+> version commits (AUD-11), and the waiting submit lived in memory, so after the restart its resend under the same
+> request id found no completion (`Seen::New`) and ran again against the restored journal, as a new version. That
+> breaks "a retry under its own id meets its original answer". The earlier primary kill on main e86fb417 with A-244
+> (1,770 failures) had the same shape, so A-246 did not introduce it. Owed, test first: the accept records, in the same
+> log entry as the version's append, that the request awaits version N, so a resend after a restart rejoins that wait
+> and is answered `Submitted { version: N }`, never run again. Log: adacachy
+> `~/.cache/slates-agents-scratch/fixtures/rungs10/r1k-kill0.{log,stall,samples}`.
+
+> **A version commits in one exchange, and retention no longer decodes the whole ledger per put: fixed (2026-11-07, §4.16
+> Commit, §4.10 retention; A-244).** A-235 left five hops a version (the inputs' offer
+> and transfer, then the record, each behind a wake), and a holder's retention decoded every merge record for every held
+> manifest per put, quadratic in a green's history. Now a record carries its inputs in one shipment, and retention reads
+> the one ledger position a held input can be named by. 500 sequential submits at `f = 1`, release, load about 10: p50
+> 265 µs, p99 731 µs, max 1.13 ms (was p50 6.7 ms, p99 34.7 ms, max 62.4 ms). Still owed: a smaller per-version cost
+> (116 µs to 473 µs median across 500 versions), and more than one version a holder per pass. Records:
+> `docs/bugs/2026-11-07-a-versions-inputs-and-record-took-five-hops.md`,
+> `docs/bugs/2026-11-07-retention-decoded-every-merge-record-per-put.md`.
+
+> **CI coverage on every platform (2026-11-06, VFS plan Step 15).** `docs/wip/ci-matrix.md` lists every test target of
+> the workspace (319: lib, bin and tests) against the lanes that run it.
+> - **Now run on both Windows lanes:** `crates/server/tests/fleet.rs`, which was `cfg(unix)` as a whole. Only its
+>   virtio-fs guest test stays Unix-only, and it runs one test at a time. `slates-server`'s unit tests join it with the
+>   Windows landing writer (two landing tests fail there until it lands; the step is `agents/release-wincov-lib`). On CI's Windows runners (4 logical CPUs, 16 GB each; diagnostics run
+>   42340483175, 2026-11-07), the fleet suite passed whole on both architectures: 85 passed, 3 ignored, in 418 s
+>   (x86_64) and 365 s (arm64). This was with liveness's UDP-reset fix merged in.
+> - **Open: six fleet tests fail on jupiter** (Windows x86_64, 32 logical CPUs, 128 GB, other projects running,
+>   2026-11-06/07), though they pass on the runners:
+>   - `a_taken_over_green_serves_every_version_and_accepts_new_work_on_the_successor` and
+>     `an_isolated_owner_refuses_latest_state_reads_while_the_successor_advances_the_green`: both holders never
+>     recomputed version 3 (after 1,685 s and 1,015 s).
+>   - `a_placed_snapshot_is_held_whole_by_f_plus_one_hosts_of_the_mirror_region`: the mirror lag never reached 0
+>     (691.7 s after 697 s).
+>   - `a_volume_awaited_in_the_mirror_is_served_there_after_its_home_region_is_lost_and_promoted`: the test process
+>     aborted, "memory allocation of 2233991168 bytes failed" (0xC0000409). This is the commit-limit oversubscription
+>     recorded for the client binary: every in-process daemon sizes itself from the whole machine.
+>   - `a_settled_fleet_admits_a_create_on_every_node`: three of its five nodes refused the create,
+>     `BudgetExceeded { available: 44252790784 }`.
+>   - `a_slow_first_round_candidate_is_hedged_after_the_measured_p95`: the hedged seal was placed after 20.57 s, against
+>     a 20 s window.
+>
+>   The logs are on jupiter under `C:\Users\corph\slates-wincov-each` and `slates-wincov-rest`. Handed to their owners
+>   through the supervisor.
+> - **Built for Windows by no lane:** the `slates` binary's unit tests and `slates-bridge-fuse`'s `abi` test did not
+>   compile there (fixed). Three `slates-cli` benchmark examples still do not compile (`nfs_writeback_ab`,
+>   `nfs_large_write`, `vfs_tails`), and `bridge-virtiofs`'s device and `land_bench` warn there (open).
+> - **Run by no lane on a platform they build for (open), with the cheapest lane for each:**
+>   - `slates-cli`'s `held_rendezvous`, `merge_kill`, `nfs_held` (ubuntu, macOS): every test skips without
+>     `SLATES_TEST_CLI`; add them to `gates`' CLI step.
+>   - `live_fleet`: no lane sets `SLATES_TEST_CLI` for it; a Linux step in `gates` on main and the nightly.
+>   - `live_chaos`: the nightly on ubuntu, after `ulimit -n "$(ulimit -Hn)"` (a systemd unit's 1,024 descriptors failed
+>     it).
+>   - ubuntu arm64: 299 of 304 targets; one `cargo test --workspace` step in `linux-arm64`.
+>   - Windows x64 and arm64: 217 and 216 of 258 targets (the pure crates among them); one `cargo test --workspace --lib
+>     --bins --tests --exclude slates-cli -- --test-threads=1` step in `windows-nightly` and `windows-arm64`, after a jupiter
+>     run of it.
+> - **Owed:** the table as a `cargo xtask` doc-truth check, so a target no lane runs fails CI.
+
 > **A clone's name is held at its name's partition (2026-11-06, A-236, bug-sweep; the supervisor's option 3).** A clone
 > whose name hashed to another partition than its origin's was unreachable by name over the mount transport, and its
 > name could be created twice (bug record of 2026-09-13).
@@ -162,6 +234,21 @@
 >   for 249 tries; a candidate refusing `no_catalog` for good). Eight full live fleet suites with the settled wait
 >   removed, with these fixes: no such stall; each first `no_catalog` refusal was followed by holding.
 
+> **A volume recovery could not rebuild (2026-11-06): its status names why, and Windows unmount passes over it
+> (fixed); destroying it (open).** Such a volume stays in the catalog and in `volume list`, but every verb on it answered
+> `NotFound`. It now answers `Refusal::NotRecovered { cause }`, a closed `RecoveryCause` kept from recovery
+> (`docs/bugs/2026-11-06-a-listed-volume-recovery-could-not-rebuild-answered-not-found.md`). Windows `slates unmount`
+> asked each volume's status and stopped at the first refusal, so one such volume blocked every drive; it now asks every
+> volume, names a refused one on standard error by kind, and releases the drive any volume reports. macOS and Linux
+> unmount is the OS's own and asks no volume; no other client loop asks a status per volume. Proven: the status test red
+> on macOS before the fix and with it removed, green after; on Linux green (diag-slabs-24, run 42319805779: the named
+> tests 6, the CLI flow 86) and red with it removed (diag-slabs-26, run 42319805390: "refused: NotFound"). On Windows,
+> on both runners, the unmount test green (diag-slabs-24, run 42319805783: the WinFsp suite 16), red with the old loop
+> (diag-slabs-25, run 42319805958: the drive was found first and the unrecovered volume never named), and red with the
+> status fix removed (diag-slabs-26, run 42319805581: "refused: NotFound"). Open:
+> - **Destroying such a volume.** `destroy` goes through the same lookup, so it is refused `NotRecovered` (before, `NotFound`)
+>   and the catalog record stays: a destroy must be able to remove a record with no live slot.
+
 > **A path on a volume this daemon serves is refused before any open (A-227, 2026-11-06): built on Linux, Windows and
 > macOS.** A base directory and every lookup below it, a landing's target and a FUSE mount point are refused typed
 > (`HostError::OwnMount`, `TargetRefusal::OwnMount`, the wire's `Refusal::OwnMount`) when they lie on a mount this
@@ -178,9 +265,7 @@
 > - **The macOS check's cost** with a mount recorded (one `F_GETPATH` a directory crossing) did not resolve from the
 >   noise at load 51 to 54 on 18 cores (BENCHMARKS, "The own-mount check on macOS"): a quiet re-measure is owed. With no
 >   mount recorded the check is one atomic load.
-> - **Windows `slates unmount` stops at the first volume whose status refuses** (`crates/cli/src/verbs.rs`
->   `unmount_verb`): a volume recovery refused (`NotFound`) keeps every drive from being unmounted by its letter until
->   it is destroyed. Found by A-227's reacquire test, which detaches by the attachment's id instead; not fixed here.
+> - **Windows `slates unmount` stopped at the first volume whose status refused**: fixed (the entry above this one).
 
 > **A purge that stopped between calls lost the blocks freed behind it (found 2026-11-07, main CI 42184319025; fixed
 > 2026-11-07).** A-205's give-back test failed on Windows: the daemon counted 118,337,536 of 134,217,728 deleted bytes
@@ -816,6 +901,13 @@
 
 
 
+> **Runtime: a shard's scheduling slice measured and rejected (A-224, 2026-11-08, agents/perf).** Under the
+> controlled load, a short EEVDF slice asked by each shard thread cut arm64's loaded p99 4 times (26.6 to 6.0 ms
+> median) and its max 5 times, and x86_64's max by about half. Every slice tried also had loaded p50 excursions of
+> 0.8 to 4.0 ms beyond base's spread (base 12 to 21 µs), on both runners, so none is taken (BENCHMARKS, "A shard's
+> scheduling slice, measured and rejected"). **Open:** the loaded Linux tail itself (p99 6 to 27 ms under two spinners
+> a core), and why a sliced shard's median request waited milliseconds in some rounds.
+>
 > **Merge: the same edit from two works was one increment; fixed 2026-11-04 (§4.16, agents/perf).** The increment's
 > identity left out its work and its base, so a second work's byte-identical edit from the same base was answered from
 > the retry cache with the first work's version, even where the green had since changed that range: a conflict reported
@@ -839,6 +931,28 @@
 > read, so a record at `f > 0` costs what its version changed; its format changed (golden vector in
 > `crates/merge/tests/origin.rs`), so records written before it would not match a newer holder. A daemon `SIGKILL`ed six times mid-merge
 > loses no told version and tells none twice (`crates/cli/tests/merge_kill.rs`, red with the durable append removed).
+>
+> **Merge: edit and submit in one request (A-225, 2026-11-06, agents/perf-2).** `Client::edit_and_submit`
+> (`RequestBody::EditSubmit`) is `edit` and then `submit` in one durable step under one completion record. Across the
+> Wi-Fi LAN an accepted edit and merge is one forwarded round trip, 6.9 to 7.8 ms p50, against 14.1 to 18.6 ms for
+> edit then submit (ping 6.1 to 7.7 ms). Oracle: `edit_and_submit_answers_what_edit_then_submit_does_over_generated_histories`
+> (`crates/client/tests/edit_and_submit.rs`) compares every answer and every head over generated histories, red under
+> both mutations tried. Exactly once: `an_edit_and_submit_retried_across_a_restart_answers_its_record_once`. **Open:**
+> the SDKs, MCP and the CLI do not offer the combined verb yet. Also open: the link's p99 (70 to 158 ms over Wi-Fi), a
+> wired pair, and Windows as either node.
+> **Merge, macOS: the paced tail was the recovery give-back, not the doorbell (A-226, 2026-11-06, agents/perf-2).** An
+> idle shard's give-back of the recovery memory no restart reads (A-117) marked the whole stale slot and log, 18 GB
+> a shard, at every publication: 18 to 21 ms of the shard's CPU in one reap-loop poll, which paced requests waited
+> behind. It now gives back only what was written since its last give-back. In one paced run, reap polls of 5 ms CPU
+> or more went from 46 to 6. Failing first: `a_give_back_returns_only_recovery_memory_written_since_the_last` (91.6 GB
+> given back after a one-file delta, against 0). Oracle: `a_give_back_names_every_dead_written_byte_and_stops_at_the_last`.
+> **Open:** the 6 left are each shard's first two give-backs after a boot, over memories the journal did not write
+> (12 to 43 ms each), owed slices under the step quantum (built on agents/perf-2, to land after this). On CI
+> (diag-perf-5, run 42173825162) A-226 is even on Linux and halves Windows x86_64's paced accept p99 (1.21 to 1.40 ms
+> became 0.42 to 0.76 ms). Also open: the latency A/B on a quiet Mac (this one ran at load 50 to 95), and the sibling of
+> the same shape, the Linux FUSE write log's purge (`crates/server/src/write_log.rs`, its whole capacity once per
+> emptying).
+>
 >
 
 > **Windows conformance runs, and the arm64 Linux suites (2026-11-05, A-209; VFS plan step 10).** WinFsp's own two
@@ -1311,9 +1425,10 @@
     passed 7 of 8 with no fence or NoLoss violation, judged on the successor's recorded holders; in its decisive run
     phase one waited 28 times for the stopped holder, then took the volume over whole. The eighth was the open register
     stall (`fleet.takeover.lost`, live-fixes).
-  - Open (live-fixes): a node replaced at the same machine anchor (same certificate) never answers a live write. Its
-    neighbours keep the old node's pair key and refuse the new one (`fleet.seal.pair_refused` 789 of 793 served, the
-    owner `pair_undelivered` 1,580), so the whole entry never carries their keys (`held_back.keys` 394). Before the
+  - Fixed since (live-fixes, 2026-11-07, f2f9477e; the entry "a node back at its anchor with fresh RAM had every
+    pair key refused" above): a node replaced at the same machine anchor (same certificate) never answered a live write. Its
+    neighbours kept the old node's pair key and refused the new one (`fleet.seal.pair_refused` 789 of 793 served, the
+    owner `pair_undelivered` 1,580), so the whole entry never carried their keys (`held_back.keys` 394). Before the
     answering gate such writes were answered and could not be served at a takeover (`takeover_refused.open`).
   - **Fixed (2026-11-07): a holder set of 2f+1 under an f-count.** Once the shipper follows the placement, a set can
     have 2f+1 members (the placement moved off the owner: CI diag-20 run 7 recorded e, c, b at f = 1). The shipper
