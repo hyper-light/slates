@@ -11849,3 +11849,26 @@ minute idle, either build).
 
 By the rule (loaded p99 and max keep the gain; loaded p50 not worse than base beyond the spread), no slice is taken,
 and A-224 is measured and rejected.
+
+## A give-back makes way for a granted landing (A-226's amendment; 2026-11-08)
+
+reland-a207 found a granted landing about 5 times slower under load on `agents/perf-b3`. The cause, measured: `purge_if_idle`
+went on stepping while the arena allocated nothing, which a landing does not, so give-back steps of a whole quantum
+alternated with the landing's short ones. Now a task that ran across the give-back's yield ends it for that reap tick.
+
+**Command.** `crates/server/tests/presentation_fairness.rs`, `a_granted_landing_never_holds_its_shard_while_it_is_planned`
+(1,000 files of 16 KiB, one shard, debug build), the time it prints. Three saved binaries, interleaved in reversed order
+on alternate rounds, 8 rounds each, every process at `nice -n 19`, beside 144 `nice -n 19 yes > /dev/null`. Script:
+`spin-run.sh 144 8 base current fix`.
+
+**Hardware and load.** adas-macbook-pro-2, Apple M5 Max, 18 CPUs, 128 GB, macOS, 2026-11-08 14:33 to 14:43 UTC; the
+one-minute load 11 to 191 at the start of each run, the Mac shared with other agents.
+
+| Build | Median | All eight, in run order within the arm (s) | Give-back steps a landing |
+|---|---|---|---|
+| base 9a996608 (without a30e4209) | 4.21 s | 3.6, 4.1, 8.8, 4.3, 5.6, 3.3, 3.6, 4.4 | not measured |
+| agents/perf-b3 fd0c41b2 | 21.47 s | 12.4, 30.7, 15.5, 22.1, 55.1, 20.9, 20.1, 34.8 | 2,859 to 4,965 |
+| fd0c41b2 + this fix | 4.16 s | 4.4, 4.2, 4.1, 3.3, 4.2, 3.4, 3.2, 4.7 | 3 to 5 |
+
+All 24 landings were `done` with 1,000 files written. Without the spinners, at load 80 to 110, the landing took 1.0 to 1.4 s
+with one step, so the cost needs a starved shard.

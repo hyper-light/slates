@@ -9,6 +9,11 @@
 > now it commits, and the test ends in 3.3 s. Record:
 > `docs/bugs/2026-11-07-a-version-appended-before-its-owner-restarted-never-committed.md`.
 
+> **Open (perf, 2026-11-08): the give-back's slice is learned from wall time.** `learn_give_back_rate` divides by the
+> shard's clock, so on a loaded host a preempted step teaches a small slice and a give-back takes thousands of steps
+> (2,572 to 3,042 at load about 100, on a Mac whose whole give-back is 18 to 21 ms of CPU) rather than hundreds. Since
+> A-226's amendment it no longer costs other work a turn, only time to finish on a shard otherwise idle. Not changed.
+
 > **Open (fixtures, 2026-11-08; A-252 reserved): a submit resent after its owner's restart is applied a second time.**
 > A-246 commits the versions appended before the crash, and its test checked their placement, not the retry's answer.
 > The primary-kill rung (adacachy, 1,000 clients, `f = 1`, on loadtest-scale's 2ae4e832 with fixtures' b38a9d66) no

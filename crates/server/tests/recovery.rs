@@ -3100,6 +3100,7 @@ fn a_give_back_returns_only_recovery_memory_written_since_the_last() {
 /// A-226, a give-back holds its shard no longer than a slice: do start a one-shard daemon over a fresh anchor (its
 /// journal has seen none of its recovery memory written, so its first idle ticks give back both checkpoint slots and
 /// the whole log, 18 GB a shard on a 128 GiB Mac) and probe the shard with a volume's status through those ticks; then
+/// leave it alone until the give-back finishes (the probes are other work, so while they run it takes a step a tick), and
 /// probe it for as long again with nothing left to give back, the test's own noise floor. Expect the recovery give-back
 /// counted in the first window (the non-vacuity count) and nothing more given back in the second, and the first window's
 /// longest probe no more than `FLOOR_MULTIPLE` times the second's. A closed-loop probe meets one stall as one sample,
@@ -3144,10 +3145,11 @@ fn a_boot_give_back_holds_its_shard_no_longer_than_its_noise_floor() {
       .copied()
       .unwrap_or(0)
   };
-  // The give-back window lasts until the give-back is done: under load its slices are small (each one quantum of wall
-  // time), so it may outlast one window. The quiet window then starts with nothing left to give back.
-  let (giving_back, after_give_back) =
-    probe_until_given_back(&mut client, volume, window, || returned(&daemon));
+  // The probes are other work on the shard, so while they run the give-back takes a step a tick (A-226's amendment): this
+  // window is what a probe meets beside those steps. Left alone, the shard then finishes, so the quiet window starts
+  // with nothing left to give back.
+  let giving_back = longest_probe(&mut client, volume, window);
+  let after_give_back = give_back_finished(window, || returned(&daemon));
   let quiet = longest_probe(&mut client, volume, window);
   let after_quiet = returned(&daemon);
   println!(
@@ -3183,29 +3185,24 @@ fn a_boot_give_back_holds_its_shard_no_longer_than_its_noise_floor() {
   drop(anchor);
 }
 
-/// Probes `volume` window after window until the recovery bytes `returned` reads have stopped moving (and moved), up to
-/// `SETTLE_WINDOWS`: the longest probe meanwhile, and the bytes given back.
-fn probe_until_given_back(
-  client: &mut Client,
-  volume: VolumeId,
-  window: Duration,
-  returned: impl Fn() -> u64,
-) -> (Duration, u64) {
-  /// Shape: the windows the give-back may take before the test calls it unfinished: its slices are a quantum of wall
-  /// time each, so a loaded host spreads 18 GB over several windows (two at load 90 on 18 cores, 2026-11-07).
+/// Leaves the shard alone until the recovery bytes `returned` reads have stopped moving (and moved), up to
+/// `SETTLE_WINDOWS`: the bytes given back. Each look is itself a task on the shard, so it is made a window apart.
+fn give_back_finished(window: Duration, returned: impl Fn() -> u64) -> u64 {
+  /// Shape: the windows the give-back may take before the test calls it unfinished: a loaded host's slices are small,
+  /// and a look interrupts it, so 18 GB may take several (two at load 90 on 18 cores, 2026-11-07).
   const SETTLE_WINDOWS: u32 = 8;
-  let mut longest = Duration::ZERO;
   let mut given_back = returned();
   for _ in 0..SETTLE_WINDOWS {
-    longest = longest.max(longest_probe(client, volume, window));
+    #[allow(clippy::disallowed_methods)]
+    // a test leaving the shard alone, which is the state it needs
+    std::thread::sleep(window);
     let now = returned();
-    let settled = now > 0 && now == given_back;
-    given_back = now;
-    if settled {
+    if now > 0 && now == given_back {
       break;
     }
+    given_back = now;
   }
-  (longest, given_back)
+  given_back
 }
 
 /// Gives `daemon`'s recovery memory back a step at a time, as the idle tick does, and holds its p99 step to

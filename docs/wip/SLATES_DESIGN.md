@@ -14273,6 +14273,14 @@ Status: built 2026-11-06.
   a call from the same measured slice. Failing first: `a_purge_gives_back_only_what_the_log_wrote_since_its_last`
   (12,288 bytes, the 16 KiB log's whole area, after one 15-byte record; Linux 6.19.10).
 
+- **A give-back makes way (amended 2026-11-08, reland-a207's measurement).** Sliced give-backs (a30e4209) took one step per
+  yield for as long as the arena allocated nothing, and a granted landing allocates nothing. So under load the landing
+  and the give-back took turns, one short landing step for each whole quantum of give-back: 2,859 to 4,965 give-back
+  steps ran through each landing. Now a task that ran across the yield ends the give-back for this reap tick
+  (`purge_if_idle`; `content.give_back.left_for_next_tick`), so a landing pays for at most one step a tick. An idle shard
+  still goes on to the end. Measured in BENCHMARKS ("A give-back makes way"): landing median 21.5 s -> 4.2 s, the base's
+  own 4.2 s, 8 interleaved rounds each. Proven by `a_give_back_leaves_the_rest_for_the_next_tick_when_another_task_is_running`.
+
 ### A-214 — An idle shard keeps its last write burst's worth of free content pages pre-faulted (accepted 2026-11-05, VFS plan step 11; amends A-105)
 
 > **Status (2026-11-05): reverted from main, then re-landed on `agents/nfs-write` with two fixes.** Main CI 42119714654

@@ -5,7 +5,7 @@
 
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[cfg(unix)]
 use slates_anchor::ENV_NFS_LISTENER;
@@ -2556,6 +2556,39 @@ impl Daemon {
     Ok(report)
   }
 
+  /// Test support: runs one idle give-back of the first shard's dead recovery memory, as a reap tick does, from a page
+  /// slice and over the whole of that memory as after a restart, with `neighbour` another task taking turns on the
+  /// shard the whole time: how many idle steps it took, `None` if the shard could not be asked or did not finish within
+  /// the budget. A neighbour that allocates nothing looks idle to the arena, as a granted landing does (A-226). The
+  /// answer comes through an atomic, because asking the shard for it would itself be another task on the shard.
+  pub fn give_back_beside(&self, neighbour: bool) -> Option<u64> {
+    let shard = self.shards.first().copied();
+    GIVE_BACK_PROBE.store(GIVE_BACK_PROBE_RUNNING, Ordering::Release);
+    self
+      .observe(shard, move |s| {
+        // Only a shard with a committed image has dead memory to give back.
+        let _ = crate::verbs::publish_shard(s);
+        s.journal.forget_what_was_given_back();
+        s.give_back_slice_bytes = 0;
+        s.purge_seen_allocations = s.store.content.arena().allocations();
+        if let Ok(task) = futures::spawn(probe_give_back(neighbour)) {
+          let _ = futures::detach(task);
+        }
+      })
+      .ok()?;
+    let started = slates_machine::clock::monotonic_ns();
+    loop {
+      let steps = GIVE_BACK_PROBE.load(Ordering::Acquire);
+      if steps != GIVE_BACK_PROBE_RUNNING {
+        return Some(steps);
+      }
+      if slates_machine::clock::monotonic_ns().saturating_sub(started) > OBSERVE_BUDGET_NS {
+        return None;
+      }
+      std::thread::yield_now();
+    }
+  }
+
   /// Test support: sets the memory-pressure hold on **every** shard's byte budget (§4.2; admission.md
   /// §5.5) — capacity withheld from new admission under host memory pressure. In production
   /// [`refresh_pressure_hold`] sets it from a sampled host shortfall at the liveness cadence; this
@@ -3954,6 +3987,34 @@ fn learn_give_back_rate(s: &mut ShardState, walked: usize, started: u64) {
   s.give_back_slice_bytes = usize::try_from(per_quantum).unwrap_or(usize::MAX);
 }
 
+/// The idle steps taken so far on this shard.
+fn idle_ticks(s: &ShardState) -> u64 {
+  s.refusals.get(TICKS_IDLE).copied().unwrap_or(0)
+}
+
+/// Format: [`GIVE_BACK_PROBE`] while a probed give-back runs.
+const GIVE_BACK_PROBE_RUNNING: u64 = u64::MAX;
+/// Test support ([`Daemon::give_back_beside`]): the steps a probed give-back took, or [`GIVE_BACK_PROBE_RUNNING`].
+static GIVE_BACK_PROBE: AtomicU64 = AtomicU64::new(GIVE_BACK_PROBE_RUNNING);
+
+/// [`Daemon::give_back_beside`]'s task on the shard.
+async fn probe_give_back(neighbour: bool) {
+  if neighbour && let Ok(task) = futures::spawn(a_neighbour_taking_turns()) {
+    let _ = futures::detach(task);
+  }
+  let before = state::with_state(|s| idle_ticks(s)).unwrap_or(0);
+  purge_if_idle().await;
+  let after = state::with_state(|s| idle_ticks(s)).unwrap_or(before);
+  GIVE_BACK_PROBE.store(after.saturating_sub(before), Ordering::Release);
+}
+
+/// Takes a turn on the shard until the probed give-back has finished, allocating nothing.
+async fn a_neighbour_taking_turns() {
+  while GIVE_BACK_PROBE.load(Ordering::Acquire) == GIVE_BACK_PROBE_RUNNING {
+    futures::yield_now().await;
+  }
+}
+
 /// What [`Daemon::give_back_recovery_by_steps`] measured (test support, A-226).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GiveBackSteps {
@@ -4088,9 +4149,25 @@ async fn purge_if_idle() {
     if step != Some(true) {
       return;
     }
+    // Whatever ran across this yield is work of the shard's, and this is only keeping RAM tidy: the rest waits for the
+    // next tick (one step a tick, at the worst). The arena's idle test cannot see such work when it allocates nothing,
+    // as a granted landing does, and a step of a whole quantum between each of its short ones made it 4 to 5 times
+    // slower under load (A-226). The poll this replaced stays gone: a step is no longer than it was.
+    let polls_before = futures::polls_so_far();
     futures::yield_now().await;
+    let others_ran = polls_before
+      .zip(futures::polls_so_far())
+      .is_some_and(|(before, after)| after.saturating_sub(before) > 1);
+    if others_ran {
+      let _ = state::with_state_counted(|s| s.count(GIVE_BACK_LEFT, 1));
+      return;
+    }
   }
 }
+
+/// Counter: give-backs that left the rest for the next reap tick because another task ran on the shard (A-226), the
+/// non-vacuity count of the check in [`purge_if_idle`].
+pub const GIVE_BACK_LEFT: &str = "content.give_back.left_for_next_tick";
 
 /// Counter: reap ticks whose idle sweep sealed content, and so published and left the purge for a later tick (A-105).
 pub const TICKS_SEALING: &str = "content.ticks.sealing";

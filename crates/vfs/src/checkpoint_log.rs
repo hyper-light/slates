@@ -374,6 +374,13 @@ impl Journal {
     }
   }
 
+  /// Test support: what a restart leaves: every byte of the dead regions may be resident, so the next give-back covers
+  /// them whole (A-226).
+  pub fn forget_what_was_given_back(&mut self) {
+    self.stale_written = UNKNOWN_EXTENT;
+    self.log_written = UNKNOWN_EXTENT;
+  }
+
   /// The journal after a checkpoint of `bytes` committed into what was the stale slot: that slot is now the committed
   /// one, written as far as this image or the longer one it held and never gave back; the slot that was committed is
   /// the stale one, written as far as its image reached; the log restarts, its old frames still written.
