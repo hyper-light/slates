@@ -350,12 +350,7 @@ fn share_with_client(primary: &str, green: &str, client: &str) {
   let account = rustix::process::getuid().as_raw();
   ok(
     primary,
-    &[
-      "share",
-      green,
-      &format!("uid:{account}@{anchor}"),
-      "--read",
-    ],
+    &["share", green, &format!("uid:{account}@{anchor}"), "--read"],
   );
 }
 
