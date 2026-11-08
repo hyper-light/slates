@@ -5788,7 +5788,7 @@ fn a_forward_lane_leaves_a_dead_session_for_the_restarted_owners_new_one() {
   daemons[0].bootstrap(true).unwrap();
   settle_initial_consensus(&daemons, &seeds, &Default::default(), Quorum { f: 1 });
   let mut owner = Client::connect(daemons[0].instance());
-  let volume = volume_owned_by(&mut owner, 1, "lane-restart", &daemons);
+  let volume = volume_owned_by(&mut owner, 0, "lane-restart", &daemons);
   let mut probe = Client::connect(daemons[1].instance());
   let (routed, last) = poll_status_served(&daemons, &mut probe, volume, COUNCIL_RETIRE_DEADLINE);
   let read = RequestBody::Status { volume };

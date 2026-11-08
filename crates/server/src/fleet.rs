@@ -7790,6 +7790,28 @@ pub(crate) fn take_sessions(
   .unwrap_or_default()
 }
 
+/// Drops a borrowed session its borrower judged dead (`forward_lane::judged_dead`) instead of returning it: the link's
+/// entry goes with it, so the link task dials the peer again at its next pace, as for any session it gives up. Only the
+/// entry the session left is removed; one the link re-established meanwhile stays. Counted.
+pub(crate) fn drop_dead_session(host: HostId, mut endpoint: Endpoint) {
+  let dropped = endpoint.connection_id().ok();
+  state::with_state(|s| {
+    let ours = s
+      .record_sessions
+      .get(&host)
+      .is_some_and(|link| link.endpoint.is_none() && link.borrowed == dropped);
+    if ours {
+      s.record_sessions.remove(&host);
+      s.count(LINK_DEAD_DROPPED, 1);
+    } else {
+      s.count(LINK_STALE_RETURN, 1);
+    }
+  });
+}
+
+/// The status count of a record link dropped because a borrower judged its session dead.
+const LINK_DEAD_DROPPED: &str = "fleet.link.dead_dropped";
+
 /// Returns borrowed sessions to the shard state after a dispatch. A slot is refilled only by the session
 /// that left it — the entry still there, its session out, and the returning session's connection id the
 /// one the borrow was tagged with. Anything else is a late return — a peer retired meanwhile (its entry

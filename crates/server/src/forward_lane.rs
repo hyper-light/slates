@@ -47,6 +47,9 @@ use crate::state;
 
 /// The status count of a forward refused because its lane held [`lane_bound`] forwards already.
 const LANE_FULL: &str = "fleet.forward.lane_full";
+/// The status count of a session a forward lane's borrower judged dead ([`judged_dead`]) and dropped for the link to
+/// replace: a peer gone or restarted without the session, or, on a starved node, a live peer judged so.
+const SESSION_JUDGED_DEAD: &str = "fleet.forward.session_judged_dead";
 /// The status count of a forward answered unanswered because its session was replaced while it was open.
 const SESSION_REPLACED: &str = "fleet.forward.session_replaced";
 /// The status count of a forward begun on the session (the non-vacuity count of the multiplexed path).
@@ -493,6 +496,11 @@ async fn turn(peer: HostId, left_ns: u64) -> Turn {
     return Turn::SessionOut;
   };
   let session = endpoint.connection_id().ok();
+  if judged_dead(&endpoint) {
+    answer_dead(peer);
+    crate::fleet::drop_dead_session(peer, endpoint);
+    return Turn::Failed;
+  }
   let mut any_reply = settle(peer, &mut endpoint, session);
   let consumed = endpoint.bytes_consumed();
   let driven = futures::within(left_ns, drive_or_queued(peer, &mut endpoint)).await;
@@ -506,6 +514,41 @@ async fn turn(peer: HostId, left_ns: u64) -> Turn {
     Ok(Some(Err(_))) | Err(_) => Turn::Failed,
     Ok(Some(Ok(()))) | Ok(None) => Turn::Driven { any_reply },
   }
+}
+
+/// Whether the borrowed session's peer is gone: data in flight and no authenticated packet back for a liveness budget.
+/// A live peer acknowledges within its probe timeout, far inside a budget. Read by the borrower itself at each turn
+/// from the session it holds, since a session lent turn after turn is never in its slot for the link to look at: on
+/// the f = 1 primary-kill rung the restarted primary kept its member id, so nothing in the membership told its new
+/// process from the old, and the client node forwarded into the old session 25 to 135 s (2026-11-08). A restarted peer
+/// that answers with a stateless reset (A-261) ends the session sooner, as a failed drive; this covers a reset lost and
+/// a peer that is silent. A starved node can judge a live peer dead: that costs a session replaced and the forwards
+/// sent again under their own ids, never run twice, and each judgement is counted ([`SESSION_JUDGED_DEAD`]).
+fn judged_dead(endpoint: &Endpoint) -> bool {
+  endpoint.bytes_in_flight() > 0
+    && endpoint.last_received_ns().is_some_and(|last| {
+      futures::now_ns().saturating_sub(last) >= crate::daemon::LIVENESS_BUDGET_NS
+    })
+}
+
+/// Answers unanswered every forward open on `peer`'s lane, its session judged dead ([`judged_dead`]): each forwarder
+/// is woken and its caller sends it again under its own id, on the session the link dials next.
+fn answer_dead(peer: HostId) {
+  let _ = state::with_state(|s| {
+    s.count(SESSION_JUDGED_DEAD, 1);
+    let Some(lane) = s.forward_lanes.lanes.get_mut(&peer) else {
+      return;
+    };
+    let mut forwarders = Vec::new();
+    for ticket in std::mem::take(&mut lane.open).into_values() {
+      if let Some(entry) = lane.tickets.get_mut(&ticket) {
+        entry.stage = Stage::Done(None);
+        forwarders.push(entry.forwarder);
+      }
+    }
+    lane.open_on = None;
+    let _ = wake_answered(lane, &forwarders);
+  });
 }
 
 /// Drives `endpoint` one turn, or returns as soon as a forward is queued on `peer`'s lane (the turn is cancel-safe:

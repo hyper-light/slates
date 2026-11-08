@@ -1877,6 +1877,16 @@ impl Endpoint {
     self.conn.next_timeout()
   }
 
+  /// The bytes in flight on the session: a borrower judging whether its peer is gone needs data outstanding.
+  pub fn bytes_in_flight(&self) -> u64 {
+    self.conn.bytes_in_flight()
+  }
+
+  /// When this end last handled an authenticated packet from the peer, `None` before the first (`slates_rt`'s clock).
+  pub fn last_received_ns(&self) -> Option<u64> {
+    self.conn.last_received_ns()
+  }
+
   /// The congestion window, bytes (for reports).
   pub fn congestion_window(&self) -> u64 {
     self.conn.congestion_window()
