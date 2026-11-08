@@ -5174,8 +5174,9 @@ fn a_silent_owner_leaves_no_forward_the_lane_admitted_unrun() {
   let config = daemons[1].config();
   let slots = usize::try_from(config.region.slots).unwrap();
   let shards = daemons[1].shards().len();
-  // Every shard's arena before the change, the control shard's too.
-  let arena_before = config.runtime.tasks_per_shard;
+  // The control shard's arena before it was sized from its lane: every shard's own share with the fleet's added to it
+  // (as every shard had until 2026-11-07).
+  let arena_before = config.runtime.tasks_per_shard + config.fleet_tasks_per_shard;
   let lane = config.clients_per_shard * slots * shards;
   // Enough clients, each with a full ring, to hold twice the arena the control shard had before in flight (the burst
   // is sent over some milliseconds, and the first run at one ring past the arena never filled it: refused 0), within
@@ -5183,9 +5184,9 @@ fn a_silent_owner_leaves_no_forward_the_lane_admitted_unrun() {
   let wanted = (2 * arena_before).div_ceil(slots);
   let clients = wanted.min(config.clients_per_shard * shards);
   eprintln!(
-    "b: clients_per_shard {} slots {slots} shards {shards} tasks_per_shard {} lane bound {lane}; {clients} clients \
-     x {slots} forwards",
-    config.clients_per_shard, config.runtime.tasks_per_shard
+    "b: clients_per_shard {} slots {slots} shards {shards} tasks_per_shard {} fleet_tasks_per_shard {} lane bound \
+     {lane}; {clients} clients x {slots} forwards",
+    config.clients_per_shard, config.runtime.tasks_per_shard, config.fleet_tasks_per_shard
   );
   assert!(
     clients * slots > arena_before && clients * slots <= lane,
