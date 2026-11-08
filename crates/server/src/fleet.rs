@@ -3253,7 +3253,10 @@ fn content_work(
       (hedge, content_budget_at(hedge, round))
     }
   };
-  let now = state.clock.monotonic_ns();
+  // The clock the first round's dispatch was stamped on (`put_seal_content`). Until 2026-11-08 this read the machine's
+  // boot clock against that shard-driver stamp, so the difference was the machine's uptime and every seal hedged at its
+  // next look, whatever the measured p95 said.
+  let now = futures::now_ns();
   let shard = state.shard;
   let job = seal_jobs(state, track).get_mut(&object)?;
   if job.content.placed(quorum) {
