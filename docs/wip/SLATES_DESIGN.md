@@ -4881,6 +4881,10 @@ and cannot replace an initialized group. Separate group genesis identities never
 state. Both regional and root groups follow this rule, as does N=1.
 An initialized learner keeps a fetched read view separate from its Raft fold, so catching up
 cannot apply a takeover or home change twice. The view is dropped when replay reaches its version.
+A regional learner fetches from every member of its region it holds a session to, not from the voters alone: its voter
+list is its join state's and a fetched view does not update it, so a learner that joined from the bootstrapper had no one
+to ask once that voter left (2026-11-08). Any member can answer, since what it serves is a configuration it applied, and
+adoption only moves forward.
 Bootstrap installs the current durability-policy result on every shard. Its loss calculation
 counts at most the admitted hosts as copies and includes single-copy loss, so missing peers
 cannot make a newly bootstrapped group appear protected.
