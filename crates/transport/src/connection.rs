@@ -307,6 +307,12 @@ pub struct Connection {
   loss_time: Option<u64>,
   /// Consecutive probe timeouts without an acknowledgement (RFC 9002 §6.2.1's `pto_count`).
   pto_count: u32,
+  /// When the peer was last heard: the last packet that opened under the session's keys.
+  heard_at: Option<u64>,
+  /// Since when the peer owes an answer and has given none: the first ack-eliciting send after it was last heard, or
+  /// that hearing itself while ack-eliciting packets were still in flight. `None` while nothing is owed (a session
+  /// that asked nothing since it last heard its peer is never silent, however long it idles).
+  asked_since: Option<u64>,
   /// Ack-eliciting packets the probe timeout allows past the window and the pacer (RFC 9002 §6.2.4).
   probes_owed: u32,
   /// The packet number at which the sender last found its window full with data waiting — the sender was
@@ -434,6 +440,8 @@ impl Connection {
       pacing_release: None,
       loss_time: None,
       pto_count: 0,
+      heard_at: None,
+      asked_since: None,
       probes_owed: 0,
       window_full_at: None,
       connection_sent: 0,
@@ -914,6 +922,7 @@ impl Connection {
     if let Some(largest) = ack_largest {
       self.sent_acks.insert(pn, largest);
     }
+    self.asked_since.get_or_insert(now);
     let bytes: u64 = reliable.iter().map(tracked_bytes).sum();
     for frame in &reliable {
       if let Frame::Stream {
@@ -1296,6 +1305,8 @@ impl Connection {
     if ack_eliciting {
       self.ack_owed = true;
     }
+    self.heard_at = Some(now);
+    self.asked_since = (self.recoverable_in_flight() > 0).then_some(now);
   }
 
   /// Processes one acknowledgement frame at `now` (RFC 9002 §B.4 `OnAckReceived`).
@@ -1817,6 +1828,15 @@ impl Connection {
   /// The bytes currently in flight.
   pub fn bytes_in_flight(&self) -> u64 {
     self.in_flight
+  }
+
+  /// How long the peer has owed an answer and given none at `now`: since the first ack-eliciting send after it was last
+  /// heard, or since that hearing while ack-eliciting packets were in flight. `None` while nothing is owed. A path-MTU
+  /// probe asks nothing here: one too large for the path is dropped and answered by no one.
+  pub fn peer_silence(&self, now: u64) -> Option<u64> {
+    // Red first: the naive rule, nothing heard since the last packet, asked or not.
+    let _ = self.asked_since;
+    self.heard_at.map(|at| now.saturating_sub(at))
   }
 
   /// The RTT estimator.
