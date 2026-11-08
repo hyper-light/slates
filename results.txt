@@ -1,0 +1,21 @@
+kind live: unshaped: installed and rolled out in 7.5 s
+kind live: unshaped: live-write: count=1000 acknowledged=1000 refused=0 p50_us=278 p99_us=1886 p999_us=9482 max_us=146473 first_refusal=""
+kind live: unshaped: phase one on slates-0: shard 0 refused diag.phase_one.answered: 1; shard 0 refused diag.phase_one.asked: 1; shard 0 refused diag.phase_one.no_session: 1; shard 0 refused diag.phase_one.rounds: 1
+kind live: unshaped: phase one on slates-1: 
+kind live: wan: installed and rolled out in 7.6 s
+kind live: wan: live-write: count=300 acknowledged=300 refused=0 p50_us=157107 p99_us=418235 p999_us=496216 max_us=496216 first_refusal=""
+kind live: wan: phase one on slates-0: shard 0 refused diag.phase_one.answered: 2; shard 0 refused diag.phase_one.asked: 2; shard 0 refused diag.phase_one.no_session: 2; shard 0 refused diag.phase_one.rounds: 2; shard 0 refused fleet.live.takeover_waits_quorum: 1
+kind live: wan: phase one on slates-1: 
+kind live: wan-loss: installed and rolled out in 8.5 s
+kind live: wan-loss: live-write: count=300 acknowledged=300 refused=0 p50_us=155755 p99_us=451625 p999_us=23607842 max_us=23607842 first_refusal=""
+kind live: wan-loss: phase one on slates-0: shard 0 refused diag.phase_one.answered: 3; shard 0 refused diag.phase_one.asked: 3; shard 0 refused diag.phase_one.no_session: 1; shard 0 refused diag.phase_one.rounds: 2; shard 0 refused fleet.live.takeover_waits_quorum: 1
+kind live: wan-loss: phase one on slates-1: 
+kind live: ceiling: installed and rolled out in 7.5 s
+kind live: ceiling: live-write: count=50 acknowledged=50 refused=0 p50_us=1400810 p99_us=5289368 p999_us=5289368 max_us=5289368 first_refusal=""
+kind live: ceiling: phase one on slates-0: 
+kind live: ceiling: phase one on slates-1: shard 0 refused diag.phase_one.answered: 3; shard 0 refused diag.phase_one.asked: 3; shard 0 refused diag.phase_one.no_session: 1; shard 0 refused diag.phase_one.rounds: 2; shard 0 refused fleet.live.takeover_waits_quorum: 1
+kind live:   unshaped: count=1000 acknowledged=1000 refused=0 p50_us=278 p99_us=1886 p999_us=9482 max_us=146473 first_refusal=""; converged at head Some(1001) epoch Some(1); 1 heads seen, one identity each; owner read back whole=1000 missing=0 torn=0; taken over by slates-0 after 3.6 s, epoch 2, read back whole=1000 missing=0 torn=0
+kind live:   wan: count=300 acknowledged=300 refused=0 p50_us=157107 p99_us=418235 p999_us=496216 max_us=496216 first_refusal=""; converged at head Some(357) epoch Some(1); 1 heads seen, one identity each; owner read back whole=300 missing=0 torn=0; taken over by slates-0 after 18.7 s, epoch 2, read back whole=300 missing=0 torn=0
+kind live:   wan-loss: count=300 acknowledged=300 refused=0 p50_us=155755 p99_us=451625 p999_us=23607842 max_us=23607842 first_refusal=""; converged at head Some(360) epoch Some(1); 1 heads seen, one identity each; owner read back whole=300 missing=0 torn=0; taken over by slates-0 after 18.8 s, epoch 2, read back whole=300 missing=0 torn=0
+kind live:   ceiling: count=50 acknowledged=50 refused=0 p50_us=1400810 p99_us=5289368 p999_us=5289368 max_us=5289368 first_refusal=""; converged at head Some(100) epoch Some(1); 1 heads seen, one identity each; owner read back whole=50 missing=0 torn=0; taken over by slates-1 after 79.3 s, epoch 3, read back whole=50 missing=0 torn=0
+exit 0
