@@ -5232,6 +5232,15 @@ fn summed_counters(daemon: &Daemon) -> std::collections::BTreeMap<&'static str, 
   sums
 }
 
+/// The longest single poll `daemon`'s control shard has run, nanoseconds (its registry pulse, read with no shard
+/// round-trip, so a shard held inside a poll is still read).
+fn control_longest_poll_ns(daemon: &Daemon) -> u64 {
+  daemon
+    .shard_pulses()
+    .first()
+    .map_or(0, |pulse| pulse.longest_step_ns)
+}
+
 /// The tasks `daemon`'s control shard has refused at admission so far (`tasks_refused` in `slates status`).
 fn control_tasks_refused(daemon: &Daemon) -> u64 {
   daemon
@@ -5316,6 +5325,7 @@ fn a_silent_owner_leaves_no_forward_the_lane_admitted_unrun() {
     .map(|_| Client::connect(daemons[1].instance()))
     .collect();
   let refused_before = control_tasks_refused(&daemons[1]);
+  let longest_before = control_longest_poll_ns(&daemons[1]);
   let measured = routed.then(|| {
     ADMITTED_OWNER_HELD.store(false, std::sync::atomic::Ordering::Release);
     let hold = daemons[0]
@@ -5443,12 +5453,13 @@ fn a_silent_owner_leaves_no_forward_the_lane_admitted_unrun() {
           || name.starts_with("fleet.owner_location")
       })
       .collect();
-    (refused_during, replies, hops, last_reply)
+    let longest_after = control_longest_poll_ns(&daemons[1]);
+    (refused_during, replies, hops, last_reply, longest_after)
   });
   for daemon in daemons {
     daemon.stop();
   }
-  let (refused_during, replies, hops, last_reply) = measured
+  let (refused_during, replies, hops, last_reply, longest_after) = measured
     .unwrap_or_else(|| panic!("b routed the read to a before the hold (last reply: {last:?})"));
   let answered: usize = replies.iter().map(Vec::len).sum();
   let served = replies
@@ -5484,6 +5495,23 @@ fn a_silent_owner_leaves_no_forward_the_lane_admitted_unrun() {
     answered,
     clients * slots,
     "every read is answered; b's hop counters summed over its shards: {hops:?}"
+  );
+  // §4.3 "a step longer than a peer's wake starves the shard", and the watchdog's window: a control shard that runs one
+  // poll as long as the anchor's liveness window has its beat withheld and is killed. fixtures' and loadtest-scale's
+  // f = 1 primary-kill rungs (2026-11-08, 6 of 6 runs) had the client node's control shard spin 1.09 s in one poll as
+  // the restarted primary's replies came back: the lane took every open forward's reply through a full drain of the
+  // session, a clock read each, so a turn cost the forwards open times the drain.
+  eprintln!(
+    "b's control shard: longest poll {} ms before the burst, {} ms after",
+    longest_before / 1_000_000,
+    longest_after / 1_000_000
+  );
+  assert!(
+    longest_after < slates_server::daemon::LIVENESS_BUDGET_NS,
+    "b's control shard ran one poll {} ms long draining the burst, a liveness window ({} ms) or more: the watchdog \
+     withholds its beat and the anchor kills the node",
+    longest_after / 1_000_000,
+    slates_server::daemon::LIVENESS_BUDGET_NS / 1_000_000
   );
 }
 
