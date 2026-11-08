@@ -14583,6 +14583,7 @@ runs on the box at load average 74 to 93, and never alone.
   count waits for the owner's barrier before its reply (`Volume::awaits_publication`, A-150's hook, renamed). The
   application never waits: a regular file's `RELEASE` comes after `close()` returned. An open and release both since
   the last publication wait for nothing.
-- **Open, a sibling:** a `FORGET` processed after the last publication leaves its lookup reference in the image, and the
-  kernel never resends a `FORGET`. It has no reply to wait behind, so it is a bounded leak under A-61's stated limits,
-  owed (a forget could be logged to anchor RAM as A-63 logs writes).
+- **A sibling, fixed 2026-11-08 (slabs):** a `FORGET` processed after the last publication left its lookup reference in
+  the image, and the kernel never resends a `FORGET`. Each `FORGET` is now logged beside the writes in the write log
+  (A-63), and the successor gives it back in its place (§4.6, "A `FORGET` after the last publication is logged").
+  Record: `docs/bugs/2026-11-08-a-forget-after-the-last-publication-leaked-its-lookup-reference.md`.

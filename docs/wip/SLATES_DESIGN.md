@@ -2562,6 +2562,15 @@ before the report is published, so a tool never reads attributes newer than the 
 > barrier's publication to its reply's write, is microseconds wide, too narrow for a kill to target, so no
 > end-to-end test reaches it. Per-shard channels were measured and rejected (A-62). Every acknowledged write now
 > survives (A-63).
+> **A `FORGET` after the last publication is logged (2026-11-08, A-154's sibling).** A `FORGET` gives back lookup
+> references the kernel held, takes no reply, and is never resent, so one served after the last publication and lost
+> with its daemon left the references the image recorded counted for good: an unlinked file the kernel had let go was
+> never reclaimed. Each turn's `FORGET`s are logged beside the writes in the write log (A-63; a record of its own kind:
+> the attachment, the inode and the count), and the replay gives them back in their place among the writes, as the
+> attachment's own (`Volume::forget_for`). A `FORGET` the log cannot take forces a publication; one still refused is
+> counted (`write_log.forget_unlogged`), never taken for a lost write. Proven by
+> `the_lookups_a_dead_daemon_was_given_back_after_its_last_publication_stay_given_back`
+> (`docs/bugs/2026-11-08-a-forget-after-the-last-publication-leaked-its-lookup-reference.md`).
 > **The takeover round is built (2026-10-23, A-158).** A restored mount tells its kernel what its predecessor may not
 > have: the epoch bump and an invalidation of the root and of every restored reference and replayed inode, in slices.
 > Proven on Linux 7.2.9 through the real binary, each test red with the change's files at the previous commit:

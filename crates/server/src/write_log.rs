@@ -16,9 +16,17 @@
 //! does the log record that it overflowed: the next daemon then cannot replay every write, and reports every file a
 //! taken-over mount had open as having lost writes (`slates_bridge_core::LostWrites`), never a silent hole.
 //!
+//! The log holds the `FORGET`s since the last publication too: a `FORGET` gives back lookup references the kernel
+//! held, takes no reply, and is never resent, so one served after the last publication and lost with its daemon left
+//! the references counted for good (GAPS, A-154's sibling). A successor gives back each logged `FORGET` after the
+//! writes logged before it. A `FORGET` the log cannot take forces a publication as a write does; a refused one is
+//! counted, never marked as an overflow, since no write was lost.
+//!
 //! Layout (little-endian): the stamp (`u64`), the record bytes in use (`u64`), the overflow flag (`u32`), padding,
-//! then the records, each the inode (`u64`), the offset (`u64`), the length (`u32`) and the bytes. A record is
-//! written before the length that covers it, so a daemon killed mid-append leaves it uncovered, never half-read.
+//! then the records, each its kind (`u32`), the inode (`u64`), the offset (`u64`), the length (`u32`) and that many
+//! bytes: a write's bytes, or a `FORGET`'s attachment (`u64`) and count (`u64`) with the offset unused. A record is
+//! written before the length that covers it, so a daemon killed mid-append leaves it uncovered, never half-read. A
+//! daemon reads only the log its own image wrote: the anchor restarts its own executable (A-145).
 
 use slates_mem::SparseObject;
 
@@ -30,8 +38,14 @@ const AT_USED: usize = size_of::<u64>();
 const AT_OVERFLOW: usize = 2 * size_of::<u64>();
 /// Format: the header's bytes, the three fields padded to a whole word.
 const HEADER_BYTES: usize = 3 * size_of::<u64>();
-/// Format: a record's head: the inode, the offset and the length.
-const RECORD_HEAD: usize = 2 * size_of::<u64>() + size_of::<u32>();
+/// Format: a record's head: the kind, the inode, the offset and the length.
+const RECORD_HEAD: usize = 2 * size_of::<u32>() + 2 * size_of::<u64>();
+/// Format: a write record's kind.
+const KIND_WRITE: u32 = 1;
+/// Format: a `FORGET` record's kind.
+const KIND_FORGET: u32 = 2;
+/// Format: a `FORGET` record's bytes: the attachment and the count.
+const FORGET_BYTES: usize = 2 * size_of::<u64>();
 
 /// The content object refused a span of the log (it would not back the memory): the caller counts it, and treats
 /// the write as unlogged.
@@ -58,11 +72,31 @@ pub(crate) struct Record {
   pub(crate) bytes: Vec<u8>,
 }
 
+/// One logged `FORGET`: lookups the kernel gave back on a file through an attachment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Forgotten {
+  /// The attachment, by its durable id: the owner of the references given back.
+  pub(crate) attachment: u64,
+  /// The file.
+  pub(crate) inode: u64,
+  /// The lookups given back.
+  pub(crate) count: u64,
+}
+
+/// One record of the log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Logged {
+  /// A write's bytes.
+  Write(Record),
+  /// A `FORGET`'s lookups.
+  Forget(Forgotten),
+}
+
 /// What a restarted daemon finds in the log.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Recovered {
-  /// The writes to replay, in the order they were acknowledged, when the log's stamp is the recovered image's.
-  pub(crate) records: Vec<Record>,
+  /// The writes and `FORGET`s to replay, in the order they were served, when the log's stamp is the recovered image's.
+  pub(crate) records: Vec<Logged>,
   /// Whether some acknowledged write could not be logged (the log overflowed, or the header reads wrong), so any
   /// file a taken-over mount had open may have lost writes.
   pub(crate) everything_lost: bool,
@@ -157,24 +191,34 @@ impl WriteLog {
     }
   }
 
-  /// The record at `cursor` of the records region and where the next begins, when it lies whole within `used`.
+  /// The record at `cursor` of the records region and where the next begins, when it lies whole within `used` and is
+  /// of a kind this daemon writes.
   fn record_at(
     &self,
     object: &SparseObject,
     cursor: usize,
     used: usize,
-  ) -> Option<(Record, usize)> {
+  ) -> Option<(Logged, usize)> {
     let base = self.start.checked_add(HEADER_BYTES)?.checked_add(cursor)?;
-    let inode = word(object, base)?;
-    let offset = word(object, base.checked_add(size_of::<u64>())?)?;
-    let mut length = [0u8; size_of::<u32>()];
-    object
-      .read(
-        base.checked_add(size_of::<u64>().checked_mul(2)?)?,
-        &mut length,
-      )
-      .ok()?;
-    let length = usize::try_from(u32::from_le_bytes(length)).ok()?;
+    let half = |at: usize| -> Option<u32> {
+      let mut bytes = [0u8; size_of::<u32>()];
+      object.read(at, &mut bytes).ok()?;
+      Some(u32::from_le_bytes(bytes))
+    };
+    let kind = half(base)?;
+    let inode = word(object, base.checked_add(size_of::<u32>())?)?;
+    let offset = word(
+      object,
+      base
+        .checked_add(size_of::<u32>())?
+        .checked_add(size_of::<u64>())?,
+    )?;
+    let length = usize::try_from(half(
+      base
+        .checked_add(size_of::<u32>())?
+        .checked_add(size_of::<u64>().checked_mul(2)?)?,
+    )?)
+    .ok()?;
     let next = cursor.checked_add(RECORD_HEAD)?.checked_add(length)?;
     if next > used {
       return None;
@@ -183,14 +227,23 @@ impl WriteLog {
     object
       .read(base.checked_add(RECORD_HEAD)?, &mut bytes)
       .ok()?;
-    Some((
-      Record {
+    let logged = match kind {
+      KIND_WRITE => Logged::Write(Record {
         inode,
         offset,
         bytes,
-      },
-      next,
-    ))
+      }),
+      KIND_FORGET if length == FORGET_BYTES => {
+        let (attachment, count) = bytes.split_at(size_of::<u64>());
+        Logged::Forget(Forgotten {
+          attachment: u64::from_le_bytes(attachment.try_into().ok()?),
+          inode,
+          count: u64::from_le_bytes(count.try_into().ok()?),
+        })
+      }
+      _ => return None,
+    };
+    Some((logged, next))
   }
 
   /// Appends a write of `bytes` to `inode` at `offset`, before its reply: the record, then the length that covers it.
@@ -201,6 +254,30 @@ impl WriteLog {
     offset: u64,
     bytes: &[u8],
   ) -> Result<(), Refused> {
+    self.append_record(object, KIND_WRITE, (inode, offset), bytes)
+  }
+
+  /// Appends a `FORGET` of `count` lookups on `inode` through `attachment`, once it is served.
+  pub(crate) fn append_forget(
+    &mut self,
+    object: &mut SparseObject,
+    forgotten: Forgotten,
+  ) -> Result<(), Refused> {
+    let mut bytes = [0u8; FORGET_BYTES];
+    let (attachment, count) = bytes.split_at_mut(size_of::<u64>());
+    attachment.copy_from_slice(&forgotten.attachment.to_le_bytes());
+    count.copy_from_slice(&forgotten.count.to_le_bytes());
+    self.append_record(object, KIND_FORGET, (forgotten.inode, 0), &bytes)
+  }
+
+  /// Appends a record of `kind` for `(inode, offset)` with `bytes`: the record, then the length that covers it.
+  fn append_record(
+    &mut self,
+    object: &mut SparseObject,
+    kind: u32,
+    (inode, offset): (u64, u64),
+    bytes: &[u8],
+  ) -> Result<(), Refused> {
     let length = u32::try_from(bytes.len()).map_err(|_| Refused::Full)?;
     let record = RECORD_HEAD.checked_add(bytes.len()).ok_or(Refused::Full)?;
     let end = self.used.checked_add(record).ok_or(Refused::Full)?;
@@ -208,6 +285,7 @@ impl WriteLog {
       return Err(Refused::Full);
     }
     let mut head = Vec::with_capacity(RECORD_HEAD);
+    head.extend_from_slice(&kind.to_le_bytes());
     head.extend_from_slice(&inode.to_le_bytes());
     head.extend_from_slice(&offset.to_le_bytes());
     head.extend_from_slice(&length.to_le_bytes());
@@ -350,7 +428,10 @@ mod tests {
     let written: Vec<(u64, u64, &[u8])> = recovered
       .records
       .iter()
-      .map(|record| (record.inode, record.offset, record.bytes.as_slice()))
+      .filter_map(|logged| match logged {
+        Logged::Write(record) => Some((record.inode, record.offset, record.bytes.as_slice())),
+        Logged::Forget(_) => None,
+      })
       .collect();
     assert_eq!(
       written,
@@ -363,6 +444,49 @@ mod tests {
       again.records.len(),
       4,
       "a new write follows the replayed ones"
+    );
+  }
+
+  /// GAPS (A-154's sibling, 2026-11-08). Do: under generation 4, append a write, a `FORGET` of three lookups on its
+  /// file through attachment 9, and another write; open the log as a restarted daemon whose image is generation 4.
+  /// Expect: the three records back in the order they were served, the `FORGET` whole; and a `FORGET` record whose
+  /// length is not a `FORGET`'s, a hostile or torn one, refused as everything lost rather than read short.
+  #[test]
+  fn a_forget_is_replayed_in_its_place_among_the_writes() {
+    let mut shared = object("forget");
+    let (mut log, _) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 4).unwrap();
+    log.append(&mut shared, 1, 0, b"alpha").unwrap();
+    let forgotten = Forgotten {
+      attachment: 9,
+      inode: 1,
+      count: 3,
+    };
+    log.append_forget(&mut shared, forgotten).unwrap();
+    log.append(&mut shared, 2, 0, b"beta").unwrap();
+    let (_, recovered) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 4).unwrap();
+    assert_eq!(
+      recovered.records,
+      vec![
+        Logged::Write(Record {
+          inode: 1,
+          offset: 0,
+          bytes: b"alpha".to_vec(),
+        }),
+        Logged::Forget(forgotten),
+        Logged::Write(Record {
+          inode: 2,
+          offset: 0,
+          bytes: b"beta".to_vec(),
+        }),
+      ]
+    );
+    let forget_length =
+      LOG_AT + HEADER_BYTES + RECORD_HEAD + b"alpha".len() + RECORD_HEAD - size_of::<u32>();
+    shared.write(forget_length, &1u32.to_le_bytes()).unwrap();
+    let (_, torn) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 4).unwrap();
+    assert!(
+      torn.everything_lost,
+      "a FORGET of the wrong length is not read short"
     );
   }
 

@@ -8401,6 +8401,74 @@ fn the_handles_a_dead_daemon_issued_give_back_their_references_at_release() {
   drop(anchor);
 }
 
+/// The lookups the kernel gave back after its daemon's last publication are given back through the successor too (GAPS,
+/// A-154's sibling; A-61, A-63). Do: write a file through a mount and unlink it there, so the unlink's barrier publishes
+/// the unlinked file still held by the kernel's lookup; wait until the kernel's `FORGET` has let it go and the volume's
+/// `referenced_bytes` is back where it was before the file (no publication follows the `FORGET`); `SIGKILL` the daemon
+/// and wait for the anchor's successor. Expect `referenced_bytes` where it was before the file: the successor's lookup
+/// count of the file is the kernel's, zero. Before the fix the successor restored the lookup the image recorded, which
+/// the kernel never gives back again, and the file stayed referenced until the mount ended. Linux only, to a kernel that
+/// can resend (6.9+), where a mount survives its daemon.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_lookups_a_dead_daemon_was_given_back_after_its_last_publication_stay_given_back() {
+  if !live_mount_runs() {
+    return;
+  }
+  if !kernel_resends_fuse_requests() {
+    eprintln!("SKIP: before Linux 6.9 a FUSE mount does not survive its daemon (A-61)");
+    return;
+  }
+  let instance = format!("cli-forget-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "forgets", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "a volume: {err}");
+  let id = value_of(&out, "id");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &id, &mount.path);
+  let referenced = || -> u64 {
+    let (code, out, err) = run(&instance, &["status", &id]);
+    assert_eq!(code, 0, "status: {err}");
+    value_of(&out, "referenced_bytes").parse().unwrap()
+  };
+  let before = referenced();
+  let path = format!("{}/forgotten.bin", mount.path);
+  #[allow(clippy::disallowed_methods)]
+  // the test's own file, written through the slates mount: RAM, not disk
+  std::fs::write(&path, vec![0x5Au8; HELD_FILE_BYTES]).unwrap();
+  #[allow(clippy::disallowed_methods)] // unlinked through the slates mount
+  std::fs::remove_file(&path).unwrap();
+  let deadline = Instant::now() + WAIT_FOR;
+  while referenced() > before && Instant::now() < deadline {
+    pause();
+  }
+  assert_eq!(
+    referenced(),
+    before,
+    "the kernel's FORGET let the unlinked file go while the daemon ran"
+  );
+  let killed = kill_the_daemon(&instance);
+  let restarted = await_daemon(&instance, Some(killed), &[]);
+  assert_ne!(restarted, killed, "a new daemon serves the mount");
+  let deadline = Instant::now() + WAIT_FOR;
+  let mut now = referenced();
+  while now > before && Instant::now() < deadline {
+    pause();
+    now = referenced();
+  }
+  assert_eq!(
+    now, before,
+    "the successor's lookups of the file are the kernel's: the FORGET after the last publication stays given back"
+  );
+  drop(mount);
+  drop(anchor);
+}
+
 /// A takeover recovers an overlay whose base directory an outsider changed after the last publication (§4.5 recovery,
 /// A-61; `docs/bugs/2026-10-22-a-takeover-refused-an-overlay-whose-base-directory-an-outsider-had-changed.md`). Do: create
 /// a volume over a base directory holding `notes.txt`, mount it, read the file (its directory's listing is loaded) and

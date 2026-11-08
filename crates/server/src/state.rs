@@ -259,9 +259,10 @@ pub struct ShardState {
   /// itself, by its write verifier).
   #[cfg(target_os = "linux")]
   pub(crate) write_log: Option<crate::write_log::WriteLog>,
-  /// What the previous daemon's log held to replay, consumed when the volumes are rebuilt (A-63).
+  /// What the previous daemon's log held to replay, its writes and `FORGET`s, consumed when the volumes are rebuilt
+  /// (A-63).
   #[cfg(target_os = "linux")]
-  pub(crate) replay: Vec<crate::write_log::Record>,
+  pub(crate) replay: Vec<crate::write_log::Logged>,
   /// Whether the previous daemon acknowledged a write it could not log (its log overflowed and the publication that
   /// would have emptied it was refused): every file a taken-over mount had open is then reported as having lost
   /// writes (A-61, A-63). Linux only, as FUSE is.
