@@ -517,6 +517,10 @@ pub struct RegionalCouncil {
   /// A changed learner view must survive before it is published to serving shards.
   view_pending: bool,
   learned: Option<RegionalConfiguration>,
+  /// The council's voters as the last fetched view named them, while this node is a learner. A learner's Raft state
+  /// is its join state's and nothing updates it, so these are how it knows who votes now; empty until a fetch has told
+  /// it. Bounded by the council's voters. Held in RAM: a restart fetches again.
+  learned_voters: Vec<HostId>,
   scatter: u64,
   /// Monotone count of the events that defer this node's own election — a leader's append answered here, or a
   /// vote this node granted a candidate (Raft Figure 2's two follower timer-resets). The drive loop's election
@@ -681,6 +685,7 @@ impl RegionalCouncil {
       raft,
       fold: Fold::new(configuration),
       learned: None,
+      learned_voters: Vec::new(),
       view_pending: false,
       scatter,
       leader_contact: 0,
@@ -1158,6 +1163,36 @@ impl RegionalCouncil {
       proposed |= self.propose(Reconfiguration::TakeOver(host));
     }
     proposed
+  }
+
+  /// Who this node knows to vote now: the Raft voter set on a voter, and on a learner the voters its last fetched view
+  /// named, or its join state's voters before any fetch has told it. A learner's Raft state never moves after its join,
+  /// so reading it alone left a learner contacting a voter long gone and dropping the leader it needed.
+  pub fn known_voters(&self) -> Vec<HostId> {
+    if self.learned_voters.is_empty() || self.raft.is_voter(self.raft.id()) {
+      self.voters()
+    } else {
+      self.learned_voters.clone()
+    }
+  }
+
+  /// Whether this node knows `node` to be a voter now ([`known_voters`](RegionalCouncil::known_voters)).
+  pub fn known_voter(&self, node: HostId) -> bool {
+    if self.learned_voters.is_empty() || self.raft.is_voter(self.raft.id()) {
+      self.is_voter(node)
+    } else {
+      self.learned_voters.contains(&node)
+    }
+  }
+
+  /// Records the voters a fetched configuration's answerer named, on a learner ([`known_voters`]). An empty list changes
+  /// nothing, so an answer that names none cannot erase what is known.
+  ///
+  /// [`known_voters`]: RegionalCouncil::known_voters
+  pub fn learn_voters(&mut self, voters: Vec<HostId>) {
+    if !voters.is_empty() {
+      self.learned_voters = voters;
+    }
   }
 
   /// Whether `node` is a **voter** of this council — a member of the Raft consensus set in effect now. A
