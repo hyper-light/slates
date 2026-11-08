@@ -103,7 +103,7 @@ use slates_rt::udp::UdpSocket;
 use slates_rt::udp::{Ipv4Addr, SocketAddrV4};
 use slates_transport::connection::{ConnectionShape, Priority};
 use slates_transport::demux::{Demux, DemuxId};
-use slates_transport::endpoint::{Endpoint, EndpointError};
+use slates_transport::endpoint::{Endpoint, EndpointError, HandshakeStall};
 use slates_transport::handshake::Identity;
 use slates_vfs::clock::Clock;
 use slates_vfs::export::{Progress, SnapshotArchiver};
@@ -1155,7 +1155,10 @@ async fn client_for(
 ) -> Option<Endpoint> {
   let (address, plane) = address;
   let peer = resolve_peer_address(address, plane, certificate, resolver).await?;
-  let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+  let Ok(socket) = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)) else {
+    count_refusal(DIAL_SOCKET_REFUSED);
+    return None;
+  };
   let shape = fleet_shape();
   let Some(built) =
     identity.with(|identity| Endpoint::client(socket, peer, identity, certificate, name, shape))
@@ -1163,7 +1166,13 @@ async fn client_for(
     count_refusal(KEPT_UNREACHABLE);
     return None;
   };
-  built.ok()
+  match built {
+    Ok(endpoint) => Some(endpoint),
+    Err(_) => {
+      count_refusal(DIAL_CLIENT_REFUSED);
+      None
+    }
+  }
 }
 
 /// The connection shape every fleet session is built with: the fleet frame cap, the derived receive
@@ -1218,9 +1227,11 @@ async fn establish_session(
       Err(EndpointError::NotReady)
         if endpoint.handshake_budgets_spent() < ESTABLISH_BUDGETS_BEFORE_REDIAL =>
       {
+        count_refusal(dial_stall_counter(endpoint.handshake_stall()));
         (Some(endpoint), None)
       }
       Err(EndpointError::NotReady) => {
+        count_refusal(dial_stall_counter(endpoint.handshake_stall()));
         // Counted, and said once: a dialer that keeps dialing afresh names the peer it cannot reach.
         if count_refusal(DIAL_REDIAL) == 1 {
           slates_machine::log_line!(
@@ -1230,6 +1241,7 @@ async fn establish_session(
         (None, None)
       }
       Err(e) => {
+        count_refusal(dial_fault_counter(&e));
         if count_refusal(DIAL_FAULT) == 1 {
           slates_machine::log_line!(
             "slates-server: fleet: the handshake to {address} faulted: {e:?}"
@@ -1279,7 +1291,7 @@ async fn serve_peer_records(
   driver: PeerDriver,
 ) {
   if let Err(e) = endpoint.establish().await {
-    count_accept_failure(&e, "record");
+    count_accept_failure(&e, endpoint.handshake_stall(), "record");
     return;
   }
   // Two ids for the authenticated peer (task #22 two-id model). `peer_anchor` is its **stable** anchor — the
@@ -3976,6 +3988,52 @@ pub(crate) const LENT_TO_LINK: &str = "fleet.lent_to.link";
 /// Format: refusal names in the daemon's status report, alongside the verbs' refusal kinds.
 const DIAL_REDIAL: &str = "fleet.dial.redial";
 const DIAL_FAULT: &str = "fleet.dial.fault";
+/// A dial that could not bind its socket.
+const DIAL_SOCKET_REFUSED: &str = "fleet.dial.socket_refused";
+/// A dial whose client endpoint could not be built.
+const DIAL_CLIENT_REFUSED: &str = "fleet.dial.client_refused";
+
+/// The counter for a dial's handshake budget spent, by which of the handshake's bounds spent it
+/// (`slates_transport::endpoint::HandshakeStall`): a formation stalled on dials says here why they are not completing.
+fn dial_stall_counter(stall: Option<HandshakeStall>) -> &'static str {
+  match stall {
+    Some(HandshakeStall::Silence) => "fleet.dial.stall.silence",
+    Some(HandshakeStall::Repeats) => "fleet.dial.stall.repeats",
+    Some(HandshakeStall::Fragments) => "fleet.dial.stall.fragments",
+    Some(HandshakeStall::TurnCeiling) => "fleet.dial.stall.turn_ceiling",
+    Some(HandshakeStall::ConfirmDeadline) => "fleet.dial.stall.confirm_deadline",
+    Some(HandshakeStall::ConfirmSilence) => "fleet.dial.stall.confirm_silence",
+    Some(HandshakeStall::ConfirmGarbage) => "fleet.dial.stall.confirm_garbage",
+    None => "fleet.dial.stall.unnamed",
+  }
+}
+
+/// The counter for an accepted handshake that gave up, by the bound that ended it ([`dial_stall_counter`]'s kinds).
+fn accept_stall_counter(stall: Option<HandshakeStall>) -> &'static str {
+  match stall {
+    Some(HandshakeStall::Silence) => "fleet.accept.stall.silence",
+    Some(HandshakeStall::Repeats) => "fleet.accept.stall.repeats",
+    Some(HandshakeStall::Fragments) => "fleet.accept.stall.fragments",
+    Some(HandshakeStall::TurnCeiling) => "fleet.accept.stall.turn_ceiling",
+    Some(HandshakeStall::ConfirmDeadline) => "fleet.accept.stall.confirm_deadline",
+    Some(HandshakeStall::ConfirmSilence) => "fleet.accept.stall.confirm_silence",
+    Some(HandshakeStall::ConfirmGarbage) => "fleet.accept.stall.confirm_garbage",
+    None => "fleet.accept.stall.unnamed",
+  }
+}
+
+/// The counter for a dial's handshake that faulted, by the transport's typed reason.
+fn dial_fault_counter(error: &EndpointError) -> &'static str {
+  match error {
+    EndpointError::Handshake(_) => "fleet.dial.fault.handshake",
+    EndpointError::Tls(_) => "fleet.dial.fault.tls",
+    EndpointError::Io(_) => "fleet.dial.fault.io",
+    EndpointError::Closed => "fleet.dial.fault.closed",
+    EndpointError::Admission(_) => "fleet.dial.fault.admission",
+    EndpointError::PeerParameters(_) => "fleet.dial.fault.peer_parameters",
+    _ => "fleet.dial.fault.other",
+  }
+}
 
 /// The status refusal count under which the serve side records an accepted session whose handshake did
 /// not complete (the dialer gave up, or its flight faulted); the log's first line says why.
@@ -3993,7 +4051,10 @@ const ACCEPT_PEER_CAPACITY: &str = "fleet.accept.peer_capacity";
 
 /// Classifies the transport's typed handshake result without hiding a real TLS or socket failure
 /// behind an expected replacement. Both serve planes use the same distinction.
-fn count_accept_failure(error: &EndpointError, plane: &str) {
+fn count_accept_failure(error: &EndpointError, stall: Option<HandshakeStall>, plane: &str) {
+  if matches!(error, EndpointError::NotReady) {
+    count_refusal(accept_stall_counter(stall));
+  }
   let counter = match error {
     EndpointError::Closed => ACCEPT_REPLACED,
     EndpointError::Admission(slates_transport::demux::SessionRefusal::PeerSessions) => {
