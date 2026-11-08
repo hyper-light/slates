@@ -1852,6 +1852,12 @@ impl Endpoint {
     self.conn.congestion_window()
   }
 
+  /// The largest packet number the peer has acknowledged: it moves whenever the peer takes any of this end's packets,
+  /// whatever exchange they carry, so a caller can tell a peer still taking a request's bytes from one gone silent.
+  pub fn largest_acked(&self) -> Option<u64> {
+    self.conn.tx_largest_acked()
+  }
+
   /// The stream bytes this end has consumed in order on the session ([`Connection::bytes_consumed`]): what a caller
   /// times its delivery rate by.
   pub fn bytes_consumed(&self) -> u64 {

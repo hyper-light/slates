@@ -79,10 +79,54 @@ pub struct Exchanged {
   /// sessions not among `reusable`: a session a peer stopped answering on may be dead at the peer's end, so the caller
   /// lets its link be dialed afresh rather than lend it again.
   pub unanswered: Vec<HostId>,
+  /// The holders among `unanswered` whose request a [`Watch`] ended, before its deadline.
+  pub cut: Vec<HostId>,
   /// The holders still in flight.
   pub stragglers: Stragglers,
   /// Whether the budget ran out first.
   pub timed_out: bool,
+}
+
+/// What ends a live request before its deadline: its holder lost to the caller (`lost`, asked about the holder) once the
+/// session has acknowledged nothing for `silence_ns`. A holder still taking the request's bytes is never cut off, so a
+/// false suspicion of a live holder costs nothing; one that went quiet and was given up is not waited for to the
+/// deadline, which a request's bytes set and so has no ceiling (an install measured at up to 614 s of budget).
+#[derive(Clone, Copy)]
+pub struct Watch {
+  /// Whether the caller has stopped keeping contact with this holder.
+  pub lost: fn(HostId) -> bool,
+  /// How long the session must have acknowledged nothing before a lost holder's request is ended.
+  pub silence_ns: u64,
+}
+
+/// [`exchange`], each request also ended as [`Watch`] says; the holders it ended that way are [`Exchanged::cut`].
+pub async fn exchange_watched(
+  message: (u64, &[u8]),
+  sessions: Vec<(HostId, Endpoint)>,
+  budget: CommitBudget,
+  watch: Option<Watch>,
+  enough: impl FnMut(HostId, &[u8]) -> bool,
+) -> Exchanged {
+  exchange_with(message, sessions, budget, watch, enough).await
+}
+
+/// One request on `endpoint`, as [`request_within`], also ended once `watch` says: `host` lost to the caller and the
+/// session's largest acknowledged packet unmoved for its silence. Checked each tenth of the silence (derived: the end
+/// then comes within a tenth of a silence of the moment both hold). The endpoint comes back however it ends, an
+/// unfinished exchange abandoned (`StopSending`, a late copy of the reply dropped by the closed stream's tombstone), and
+/// whether the watch ended it.
+async fn request_watched(
+  mut endpoint: Endpoint,
+  host: HostId,
+  (stream, priority): (u64, Priority),
+  request: &[u8],
+  deadline_ns: u64,
+  watch: Watch,
+) -> (crate::TimedReply, Endpoint, bool) {
+  // Red first: the watch is not built yet; the request runs to its reply or its deadline.
+  let _ = (host, watch);
+  let (reply, endpoint) = request_within(endpoint, stream, priority, request, deadline_ns).await;
+  (reply, endpoint, false)
 }
 
 /// Sends `message` to every holder over its session and gathers the replies until `enough` (shown each reply as it
@@ -90,9 +134,20 @@ pub struct Exchanged {
 /// [`Shipper`] lives on another shard than its sessions (the daemon: the volume's shard appends, the control shard
 /// sends): it decides from the raw replies, and the owner folds them where its shipper is.
 pub async fn exchange(
+  message: (u64, &[u8]),
+  sessions: Vec<(HostId, Endpoint)>,
+  budget: CommitBudget,
+  enough: impl FnMut(HostId, &[u8]) -> bool,
+) -> Exchanged {
+  exchange_with(message, sessions, budget, None, enough).await
+}
+
+/// [`exchange`] and [`exchange_watched`], by whether `watch` is set.
+async fn exchange_with(
   (stream, message): (u64, &[u8]),
   sessions: Vec<(HostId, Endpoint)>,
   budget: CommitBudget,
+  watch: Option<Watch>,
   mut enough: impl FnMut(HostId, &[u8]) -> bool,
 ) -> Exchanged {
   if sessions.is_empty() {
@@ -100,6 +155,7 @@ pub async fn exchange(
       replies: Vec::new(),
       reusable: sessions,
       unanswered: Vec::new(),
+      cut: Vec::new(),
       stragglers: Stragglers::none(),
       timed_out: false,
     };
@@ -110,13 +166,32 @@ pub async fn exchange(
     Priority::Control
   };
   let (tx, rx) = reply_channel();
+  let (cut_tx, cut_rx) = std::sync::mpsc::channel::<HostId>();
   let deadline_ns = budget.max_deadline_ns();
   let mut refused = Vec::new();
   for (host, endpoint) in sessions {
     let tx = tx.clone();
+    let cut_tx = cut_tx.clone();
     let bytes = message.to_vec();
     let spawned = spawn_child(async move {
-      let (reply, endpoint) = request_within(endpoint, stream, priority, &bytes, deadline_ns).await;
+      let (reply, endpoint) = match watch {
+        None => request_within(endpoint, stream, priority, &bytes, deadline_ns).await,
+        Some(watch) => {
+          let (reply, endpoint, cut) = request_watched(
+            endpoint,
+            host,
+            (stream, priority),
+            &bytes,
+            deadline_ns,
+            watch,
+          )
+          .await;
+          if cut {
+            let _ = cut_tx.send(host);
+          }
+          (reply, endpoint)
+        }
+      };
       tx.send(Reply(host, reply, Box::new(endpoint)));
     });
     // A refused spawn drops that holder's session with its future; the others still decide, and the holder is reported
@@ -129,11 +204,13 @@ pub async fn exchange(
     }
   }
   drop(tx);
+  drop(cut_tx);
   let mut wait = DispatchWait::new(budget, now_ns());
   let mut exchanged = Exchanged {
     replies: Vec::new(),
     reusable: Vec::new(),
     unanswered: refused,
+    cut: Vec::new(),
     stragglers: Stragglers::none(),
     timed_out: false,
   };
@@ -160,6 +237,7 @@ pub async fn exchange(
       Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
     }
   }
+  exchanged.cut = cut_rx.try_iter().collect();
   exchanged.stragglers = Stragglers::pending(rx);
   exchanged
 }
