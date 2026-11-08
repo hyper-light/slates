@@ -13578,6 +13578,7 @@ mod tests {
       access: Vec::new(),
       live_shipped: false,
       live_holders: None,
+      work_of: None,
     }
   }
 

@@ -13827,6 +13827,48 @@ fn a_share_of_a_green_made_after_its_last_version_survives_a_takeover() {
 /// Shape: how long a test watches for a work's head to be placed: several of the owner's seal rounds.
 const WORK_SEAL_WATCH: Duration = Duration::from_nanos(4 * LIVENESS_BUDGET_NS);
 
+/// A-255's route (§4.16 failure matrix, RIFL §3 "retry rendezvous"): a resend names only its work, so what a work's
+/// successor knows of the work's green is what its catalog register carries, and that holds only if a work's catalog is
+/// placed at all. Do: three nodes at `f = 1`; on a, a green, a work and a plain volume; watch each catalog over several
+/// of the owner's placement rounds. Expect: both placed. The plain volume's is the non-vacuity check.
+#[test]
+fn a_works_catalog_is_placed_like_a_plain_volumes() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut owner_client = Client::connect(daemons[0].instance());
+  let (_green, work) = green_with_work(&mut owner_client, "catalog-work", &daemons);
+  let ReplyBody::Created { id: plain } = owner_client.call(&scratch("catalog-plain")) else {
+    panic!("the plain volume was refused");
+  };
+  let everyone: Vec<&Daemon> = daemons.iter().collect();
+  let plain_placed = poll_until(&everyone, PLACEMENT_DEADLINE, || {
+    daemons[0].fleet_head_placed(ObjectId(plain.bytes).catalog())
+  });
+  let work_placed = poll_until(&everyone, WORK_SEAL_WATCH, || {
+    daemons[0].fleet_head_placed(ObjectId(work.bytes).catalog())
+  });
+  drop(everyone);
+  drop(owner_client);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!("catalog placed: plain {plain_placed}, work {work_placed}");
+  assert!(plain_placed, "a plain volume's catalog is placed");
+  assert!(work_placed, "a work's catalog is placed");
+}
+
 /// §4.16 "Commit", A-252: "nothing runs twice after a takeover" rests on a work never coming back on a successor, since
 /// a work come back with no completion record would run a resend again, and an older one would make a different
 /// increment and so a second version. Do: three nodes at `f = 1`; on a, a green and a work; through b's client an edit
@@ -13972,16 +14014,16 @@ fn resend_while_refused_retryable(
   }
 }
 
-/// §4.16 "Commit", A-252, the takeover case: the version committed at the quorum and its owner died before its client
-/// could be sure of the answer. The client resends under its id through its own node. Do: three nodes at `f = 1`; on a,
-/// a green and a work; through b's client, one edit and a submit, answered version 1; a dies and a survivor takes the
-/// green over; b's client sends the submit again under the same id. Expect: the green still holds one version, and the
-/// resend is never run as a new one: answered the version it was accepted as, or refused retryable. The work lived on
-/// the dead owner and is not taken over, and completion records stay where their calls were served (A-127), so today
-/// it is refused `OwnerUnreachable`: exactly-once holds, and the client's outcome is unknown until it reads the green.
+/// §4.16's failure matrix ("Green owner loss in a fleet: ... Masked after takeover"), T-8.11, A-255: the version
+/// committed at the quorum and its owner died before its client could be sure of the answer. The client resends under
+/// its id through its own node. Do: three nodes at `f = 1`; on a, a green and a work; through b's client, one edit and
+/// a submit, answered version 1; a dies and a survivor takes the green over; b's client sends the submit again under
+/// the same id. Expect: the green still holds one version, and the resend is answered the version it was accepted as
+/// (RIFL §3: "If the object migrates, then the completion record must move with it"). A-252 held only that nothing runs
+/// twice: the resend was refused `OwnerUnreachable` without end, so the client never learned its version.
 #[test]
 #[allow(clippy::cognitive_complexity)]
-fn a_submit_resent_after_its_owner_was_taken_over_is_not_applied_again() {
+fn a_submit_resent_after_its_owner_was_taken_over_is_answered_its_version() {
   let _serial = serialize_fleet_tests();
   let names = ["a", "b", "c"];
   let nodes: Vec<(MachineProfile, HostId, Identity)> =
@@ -14057,17 +14099,13 @@ fn a_submit_resent_after_its_owner_was_taken_over_is_not_applied_again() {
     ReplyBody::Versions { head: 1 },
     "the resend ran nothing again: the green holds the one version"
   );
-  assert!(
-    matches!(
-      again,
-      Ok(ReplyBody::Submitted {
-        version: Some(1),
-        ..
-      }) | Ok(ReplyBody::Refused {
-        refusal: Refusal::OwnerUnreachable { .. } | Refusal::Overloaded { .. }
-      })
-    ),
-    "the resend through the takeover is answered its version or refused retryable, never run as a new one: {again:?}"
+  assert_eq!(
+    again.expect("the resend through the takeover is answered"),
+    ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    },
+    "the resend through the takeover is answered the version it was accepted as"
   );
 }
 
