@@ -1101,9 +1101,10 @@
 > `windows-arm64`: winfstest (a Rust transcription of its Python 2.7 scripts, held to them by a golden of 733 cases)
 > and the WinFsp fsx port, each built from `billziss-gh/secfs.test@6ac65cd` with MSVC. winfstest: 628 cases, the same
 > verdicts on x86_64 and arm64 (254 pass; diagnostics run 42061904713, every step green), every failure on the reviewed list
-> (`docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt`) with its reason, the five Windows
-> features the drive does not keep (attribute bits, security descriptors, a settable creation time, reparse points and
-> symbolic links, named streams). The suites found four Win32 bugs in `crates/bridge-winfsp`, each fixed with a failing
+> (`docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt`) with its reason, the four Windows
+> features the drive does not keep (attribute bits, security descriptors, reparse points and symbolic links, named
+> streams). The fifth, a settable creation time, was built in A-259 (2026-11-08): the drive reports the volume's
+> birth time and keeps the one `SetFileTime` sets, and `t/base/06.t` case 5 came off the list (374 to 373 entries). The suites found four Win32 bugs in `crates/bridge-winfsp`, each fixed with a failing
 > test first (`crates/cli/tests/winfsp_semantics.rs`; `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`):
 > a move not asked to replace replaced a taken name (and one asked replaced a directory), a directory holding a file
 > answered its removal with success, `SetFileTime` kept nothing, and an open with `TRUNCATE_EXISTING` kept the file.

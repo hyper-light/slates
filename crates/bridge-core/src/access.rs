@@ -301,8 +301,8 @@ pub fn setattr_denial(
   if changes.size.is_some() && size_denied {
     return Some(Denial::NoAccess);
   }
-  if changes.atime.is_some() || changes.mtime.is_some() {
-    if explicit_times {
+  if changes.atime.is_some() || changes.mtime.is_some() || changes.btime.is_some() {
+    if explicit_times || changes.btime.is_some() {
       if !owner_or_root(caller, node) {
         return Some(Denial::NotOwner);
       }
@@ -363,6 +363,7 @@ mod tests {
       atime: 0,
       mtime: 0,
       ctime: 0,
+      btime: 0,
       change: 0,
     }
   }
@@ -676,6 +677,36 @@ mod tests {
       ),
       Some(Denial::NoAccess),
       "NFSv3 still refuses a non-owner the bits deny"
+    );
+  }
+
+  /// A-259. Do: ask to set a file's creation time as a caller who may write it but does not own it, then as its
+  /// owner. Expect: the first is refused `NotOwner`, the second allowed, since a creation time is only ever explicit
+  /// (WinFsp's `SetFileTime`), and an explicit time asks for the owner or root.
+  #[test]
+  fn a_creation_time_asks_for_the_owner() {
+    let file = node(Kind::File, 0o644, 1000, 1000);
+    let writable = node(Kind::File, 0o666, 1000, 1000);
+    let other = user(1001, 1001, &[]);
+    let created = SetAttr {
+      btime: Some(1),
+      ..SetAttr::default()
+    };
+    assert_eq!(
+      setattr_denial(&other, &writable, &created, false, IoAuthority::Mode, false),
+      Some(Denial::NotOwner),
+      "a creation time asks for the owner"
+    );
+    assert_eq!(
+      setattr_denial(
+        &user(1000, 1000, &[]),
+        &file,
+        &created,
+        false,
+        IoAuthority::Mode,
+        false
+      ),
+      None
     );
   }
 
