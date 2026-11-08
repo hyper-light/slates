@@ -72,6 +72,8 @@ const LIVE_IMAGE: &str = "fleet.live.install_image";
 const LIVE_INSTALL_BUILT: &str = "fleet.live.install_built";
 /// Counter: an install a holder applied (its log replaced by the owner's whole state).
 const LIVE_INSTALL_TAKEN: &str = "fleet.live.install_taken";
+/// Counter: an install a watch ended before its deadline, its holder lost and silent.
+const LIVE_INSTALL_CUT: &str = "fleet.live.install_cut";
 /// Counter: entries appended to a live volume's log on this owner shard.
 const LIVE_APPENDED: &str = "fleet.live.appended";
 /// Counter: entries a holder refused to keep (over its bound, unauthorized, malformed).
@@ -204,6 +206,9 @@ pub(crate) struct LiveVolume {
   /// of a session, so it was never busy: an install a write, a whole-volume clone on this shard each (a median of 2,396
   /// and 2,769 a run, 10.9 GB, against about 3.5 served, `live_chaos`'s rolling partition, diag-live-durability-54).
   unreachable: Vec<HostId>,
+  /// For each holder, the image head of the last install a watch cut short ([`watch_install`]). One entry a holder it ships
+  /// to: kept only for its targets ([`pending_sends`]), so at most the holders and the transition's target.
+  cut_installs: BTreeMap<HostId, Head>,
   /// The holders known to hold a version of the volume's catalog, which a holder's bound is derived from
   /// ([`hold_bound`]): every holder any of the catalog's placements named, kept. Bounded by the candidates.
   catalogued: Vec<HostId>,
@@ -823,6 +828,11 @@ struct Send {
   holder: HostId,
   stream: u64,
   bytes: Vec<u8>,
+  /// For an install, the image head it carries.
+  image: Option<Head>,
+  /// Whether its exchange may end once the holder is lost and silent ([`slates_cluster::live::Watch`]): every install
+  /// but a re-send of one a watch already cut ([`LiveVolume::cut_installs`]).
+  watched: bool,
 }
 
 /// Whether the volume with `id` is live-shipped, by its policy on this partition.
@@ -909,6 +919,7 @@ pub(crate) fn published(
       kept: 0,
       lanes: BTreeMap::new(),
       unreachable: Vec::new(),
+      cut_installs: BTreeMap::new(),
       catalogued: Vec::new(),
       recorded: None,
       recording: None,
@@ -1037,6 +1048,7 @@ fn refresh_image(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
   // An image sealed under no keys (a volume shipped in the clear) has none to judge.
   live.image_anchors = anchors;
   live.owes_image = false;
+  let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("LD-IMAGE wall_ns {} head {} bytes {}\n", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos()), head.position, live.whole.as_ref().map_or(0, |(_, image)| image.len())).as_bytes());
   state.count(LIVE_IMAGE, 1);
 }
 
@@ -1522,6 +1534,9 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
   let mut stale_checkpoint = false;
   let mut installs_built = 0_u64;
   let targets: Vec<HostId> = live.shipper.targets().collect();
+  live
+    .cut_installs
+    .retain(|holder, _| targets.contains(holder));
   for holder in &targets {
     // A holder that has not acknowledged the volume's catalog refuses the log (its bound is the catalog's size,
     // `hold_bound`): the record plane places the catalog there first, re-shipped each period, and the next dispatch after
@@ -1537,6 +1552,8 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
             holder: *holder,
             stream: slates_cluster::live::LIVE_ENTRY_STREAM,
             bytes: entry.encode(),
+            image: None,
+            watched: false,
           });
         }
       }
@@ -1561,6 +1578,14 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
 /// The install to send `holder`, and whether the image is too old for it. `None` and not stale while a fresh image is on
 /// its way ([`send_to_reached`]): one sent now would land the holder behind the tail. `None` and stale when there is no
 /// image, or the holder already holds what it carries.
+/// Whether an install of `image` may be cut by a watch, given the image of the last install one cut for this holder:
+/// at most once an image, so a holder silenced through every attempt is cut once and then sent the image unwatched, to
+/// finish or end at the deadline its bytes set, as before the watch. A re-send that a watch could cut again would start
+/// from nothing each time, so a large enough install to a holder starved over and over would never finish.
+fn watch_install(cut: Option<Head>, image: Head) -> bool {
+  cut != Some(image)
+}
+
 fn install_for(live: &LiveVolume, object: ObjectId, holder: HostId) -> (Option<Send>, bool) {
   if live.owes_image {
     return (None, false);
@@ -1587,6 +1612,10 @@ fn install_for(live: &LiveVolume, object: ObjectId, holder: HostId) -> (Option<S
     holder,
     stream: slates_cluster::live::LIVE_STATE_STREAM,
     bytes: install.encode(),
+    image: Some(*head),
+    // Diag only (live-durability-65, never on main): SLATES_DIAG_WATCH_OFF=1 sends every install unwatched.
+    watched: watch_install(live.cut_installs.get(&holder).copied(), *head)
+      && std::env::var("SLATES_DIAG_WATCH_OFF").is_err(),
   };
   (Some(send), false)
 }
@@ -1810,11 +1839,16 @@ async fn ship_to_holder(
       objects.push(send.object);
     }
   }
-  let answered = ship_lane(origin, holder, sends, budget).await;
+  let (answered, cuts) = ship_lane(origin, holder, sends, budget).await;
   // After the lane's own folds, so the owner sends what the holder lacks given its last answer.
   let control = state::with_state(|s| s.shard).unwrap_or(origin);
   crate::xshard::run_on_counted(control, origin, move |s| {
     lane_ended(s, holder, objects, answered);
+    for (object, image) in cuts {
+      if let Some(live) = s.live.shipping.get_mut(&object.0) {
+        live.cut_installs.insert(holder, image);
+      }
+    }
   });
 }
 
@@ -1824,15 +1858,36 @@ async fn ship_lane(
   holder: HostId,
   sends: Vec<Send>,
   budget: slates_cluster::CommitBudget,
-) -> bool {
+) -> (bool, Vec<(ObjectId, Head)>) {
+  let mut cuts = Vec::new();
   for send in sends {
     let sessions = borrow_session(holder, budget.max_deadline_ns()).await;
     // Each message under its own budget: the liveness budget plus its transfer on the session it rides, so an install of
     // the whole volume is not given up the moment an entry would be (`exchange_budget`).
     let exchange = exchange_budget(send.bytes.len(), &sessions);
-    let exchanged =
-      slates_cluster::live::exchange((send.stream, &send.bytes), sessions, exchange, |_, _| true)
-        .await;
+    let watch = send.watched.then_some(slates_cluster::live::Watch {
+      lost: holder_lost,
+      silence_ns: crate::daemon::LIVENESS_BUDGET_NS,
+    });
+    let diag_had = !sessions.is_empty();
+    let diag_began = slates_rt::futures::now_ns();
+    let exchanged = slates_cluster::live::exchange_watched(
+      (send.stream, &send.bytes),
+      sessions,
+      exchange,
+      watch,
+      |_, _| true,
+    )
+    .await;
+    if diag_had && send.stream == slates_cluster::live::LIVE_STATE_STREAM {
+      let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("LD-LANE install wall_ns {} holder {} bytes {} budget_ns {} took_ns {} answered {} cut {}\n", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos()), holder.0, send.bytes.len(), exchange.max_deadline_ns(), slates_rt::futures::now_ns().saturating_sub(diag_began), !exchanged.replies.is_empty(), exchanged.cut.contains(&holder)).as_bytes());
+    }
+    if let Some(image) = send.image
+      && exchanged.cut.contains(&holder)
+    {
+      cuts.push((send.object, image));
+      let _ = state::with_state(|s| s.count(LIVE_INSTALL_CUT, 1));
+    }
     let answered = !exchanged.replies.is_empty();
     if !answered {
       let _ = state::with_state(|s| s.count(LIVE_UNANSWERED, 1));
@@ -1851,10 +1906,16 @@ async fn ship_lane(
     // After the answers are on their way to the owner, so durability waits for no straggler.
     finish_stragglers(origin, send.object, exchanged.stragglers).await;
     if !answered {
-      return false;
+      return (false, cuts);
     }
   }
-  true
+  (true, cuts)
+}
+
+/// Whether this node has stopped keeping contact with `holder` (on the control shard, where membership lives): what
+/// lets a lane's install end before its deadline ([`slates_cluster::live::Watch`]).
+fn holder_lost(holder: HostId) -> bool {
+  state::with_state(|s| !crate::fleet::keeps_direct_contact_with(s, holder)).unwrap_or(false)
 }
 
 /// The budget one message to one holder gets: the liveness budget a reply gets, plus the time its bytes take at the
@@ -1881,8 +1942,12 @@ fn exchange_budget(
       .checked_div(endpoint.congestion_window().max(1))
       .unwrap_or(0)
   });
+  // Diag only (live-durability-65, never on main): an install's budget held at a floor, standing in for the uncapped case.
+  let floor_ns = if bytes >= 65_536 {
+    std::env::var("SLATES_DIAG_INSTALL_FLOOR_MS").ok().and_then(|ms| ms.parse::<u64>().ok()).map_or(0, |ms| ms.saturating_mul(1_000_000))
+  } else { 0 };
   slates_cluster::CommitBudget::hard(
-    live.deadline_ns.saturating_add(transfer_ns),
+    live.deadline_ns.saturating_add(transfer_ns).max(floor_ns),
     live.poll_interval_ns,
   )
 }
@@ -2264,6 +2329,15 @@ pub(crate) fn serve_install(
   peer: HostId,
   request: &[u8],
 ) -> Vec<u8> {
+  // Diag only (live-durability-65, never on main): the first install served after the file `any` appears stops this
+  // daemon before it answers, its pid left in `stopped`.
+  if let Ok(dir) = std::env::var("SLATES_DIAG_STOP_DIR") {
+    if std::fs::remove_file(format!("{dir}/any")).is_ok() {
+      let pid = std::process::id();
+      let _ = std::fs::write(format!("{dir}/stopped"), pid.to_string());
+      let _ = std::process::Command::new("kill").args(["-STOP", &pid.to_string()]).status();
+    }
+  }
   let object = slates_db::live::object_of_state(request);
   let bound = match admitted(state, local, peer, object) {
     Ok(bound) => bound,
@@ -2297,6 +2371,7 @@ pub(crate) fn serve_install(
     Err(error) => count_refused(state, refused_counter(error)),
     Ok(_) => state.count(LIVE_HELD, 1),
   }
+  let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("LD-TAKE wall_ns {} from {} reply {:?}\n", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos()), peer.0, reply.as_ref().map(|head| head.map(|head| head.position)).map_err(|error| format!("{error:?}"))).as_bytes());
   encode_reply(&reply)
 }
 
@@ -3070,6 +3145,28 @@ fn meta_of(inode: &InodeImage) -> slates_archive::NodeMeta {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A-200: a holder's install may be cut by a watch at most once an image. Do judge an image with no cut, the same image
+  /// once cut, and a newer image after an older one was cut. Expect watched, not watched, watched: a holder silenced
+  /// through every attempt is sent the image it was cut on unwatched, so it finishes or ends at its deadline instead of
+  /// starting from nothing each time.
+  #[test]
+  fn an_install_is_cut_at_most_once_an_image() {
+    let image = |position: u64| Head {
+      epoch: slates_db::register::HostEpoch(1),
+      position,
+      identity: [u8::try_from(position).unwrap_or(0); 32],
+    };
+    assert!(watch_install(None, image(4)), "never cut: watched");
+    assert!(
+      !watch_install(Some(image(4)), image(4)),
+      "cut on this image: sent unwatched"
+    );
+    assert!(
+      watch_install(Some(image(4)), image(9)),
+      "a newer image: watched again"
+    );
+  }
 
   /// A-240 with an install image beside the log: do ask whether the log covers candidates a and b when the last whole
   /// entry's anchors hold both keys and the install image's hold only a's. Expect not: a holder installed from the image

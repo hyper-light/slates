@@ -743,6 +743,8 @@ pub struct Shipper {
   /// The retained entries, oldest first, dense in position.
   retained: VecDeque<Entry>,
   /// What each holder holds on this chain, as last reported.
+  /// One head a host, for hosts it ships to only: a reply from any other is dropped ([`Shipper::on_reply`]) and a host
+  /// leaving the holder set is forgotten ([`Shipper::activate`]), so at most the holders and the transition's target.
   held: BTreeMap<HostId, Head>,
   /// The highest position held by the owner and enough holders that every `f + 1` a takeover counts meet it.
   durable: Option<u64>,
@@ -1038,7 +1040,8 @@ impl Shipper {
     let Some(head) = held else {
       return self.owe(holder, self.entries_after(None));
     };
-    if !self.on_chain(&head) {
+    if !self.on_chain(holder, &head) {
+      self.diag_install("off_chain", holder, Some(head));
       self.owed_install.insert(holder);
       return Next::Install;
     }
@@ -1056,6 +1059,9 @@ impl Shipper {
       Next::Nothing
     } else {
       let next = self.entries_after(Some(head.position));
+      if next == Next::Install {
+        self.diag_install("behind_tail", holder, Some(head));
+      }
       self.owe(holder, next)
     }
   }
@@ -1108,9 +1114,23 @@ impl Shipper {
     self.held.get(&holder).copied()
   }
 
-  /// Whether `head` is on this owner's chain: its head, its start, its last checkpoint, or a retained entry.
-  fn on_chain(&self, head: &Head) -> bool {
-    if Some(*head) == self.head || Some(*head) == self.start || Some(*head) == self.checkpoint {
+  /// Diag only (live-durability-65, never on main).
+  fn diag_install(&self, why: &str, holder: HostId, reported: Option<Head>) {
+    let bytes = self.retained.iter().fold(0usize, |sum, entry| sum.saturating_add(entry.payload.len()));
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("LD-WHY wall_ns {} {why} holder {} reported {:?} head {:?} checkpoint {:?} oldest {:?} retained {} bytes {bytes} retain_bytes {}\n", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos()), holder.0, reported.map(|h| h.position), self.head.map(|h| h.position), self.checkpoint.map(|h| h.position), self.retained.front().map(|e| e.position), self.retained.len(), self.retain_bytes).as_bytes());
+  }
+
+  /// Whether `head`, reported by `holder`, is on this owner's chain: its head, its start, its last checkpoint, a retained
+  /// entry, or the head this holder last acknowledged, which the tail may have passed: an entry every holder holds is
+  /// trimmed, so a holder repeating the head it last acknowledged (refusing an entry it is not ready for) was taken for
+  /// one off the chain and answered with an install, though the entries after it were all retained: a restarted holder's
+  /// catch-up took 42.8 s (`live_chaos`, diag-live-durability-62).
+  fn on_chain(&self, holder: HostId, head: &Head) -> bool {
+    if Some(*head) == self.head
+      || Some(*head) == self.start
+      || Some(*head) == self.checkpoint
+      || self.held.get(&holder) == Some(head)
+    {
       return true;
     }
     self

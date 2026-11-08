@@ -36,6 +36,9 @@ const DEADLINE_NS: u64 = 10_000_000_000;
 const POLL_NS: u64 = 10_000_000;
 /// Shape: a serve loop's park between checks of its stop channel.
 const SERVE_SLICE_NS: u64 = 1_000_000;
+/// Shape: how often a serving holder looks whether its scenario has let it go: a hundred serve slices, so a serve is cut
+/// rarely enough not to starve its session (cut every slice, it did).
+const SERVE_POLL_NS: u64 = 100 * SERVE_SLICE_NS;
 /// Shape: the writes shipped before the late holder joins: more than the retained tail ([`shipper`]'s two), so it
 /// is installed, and few enough that the fabric's growing round trip stays far inside the deadline.
 const WRITES: u64 = 6;
@@ -101,8 +104,17 @@ async fn holder(
   let mut state: Vec<u8> = Vec::new();
   let mut stopping = false;
   while !stopping {
-    endpoint
-      .serve_once(|kind, request| {
+    // Let go once the scenario has ended without stopping it (its session dropped, so no stop can come): a regression
+    // that leaves a holder serving then fails its test instead of hanging it.
+    if matches!(
+      start.try_recv(),
+      Err(std::sync::mpsc::TryRecvError::Disconnected)
+    ) {
+      return;
+    }
+    let served = slates_rt::futures::within(
+      SERVE_POLL_NS,
+      endpoint.serve_once(|kind, request| {
         if kind == LIVE_ENTRY_STREAM {
           serve_entry(&mut replica, &request, CAP, |entry| {
             state.extend_from_slice(&entry.payload);
@@ -117,9 +129,13 @@ async fn holder(
           stopping = kind == STOP_KIND;
           Vec::new()
         }
-      })
-      .await
-      .unwrap();
+      }),
+    )
+    .await
+    .unwrap();
+    if let Some(served) = served {
+      served.unwrap();
+    }
   }
   endpoint.settle().await.unwrap();
   let _ = done.send((host, replica.head(), state));
@@ -241,6 +257,160 @@ fn shipper(credit: u64, retain: usize) -> Shipper {
     None,
     (credit, retain),
   )
+}
+
+/// Shape: how long a lost holder's session must have acknowledged nothing before its request is ended, the daemon's
+/// liveness budget.
+const SILENCE_NS: u64 = 1_000_000_000;
+
+/// A-200: an exchange to a holder its caller has given up, whose session acknowledges nothing (a stopped process), ends
+/// within a silence of the loss, not at its deadline, and gives its session up at once. Do send an entry to both holders,
+/// holder 3 silent, with a watch that names holder 3 lost from the start and a deadline ten times the silence. Expect
+/// every request of the exchange to have reported within the silence and a tenth more, holder 2's reply among them, and
+/// holder 3 named cut and unanswered with its session not among those to lend again and no request still in flight when
+/// the exchange returns: the caller drops its link on the spot (the KIND stall was a lend left with nothing behind it). Before, nothing but the reply or the
+/// deadline ended it: an install to a stopped holder held its session for the whole of a 30 s budget in 12 of 12 runs
+/// (diag-live-durability-58), and a holder restarted meanwhile waited it out to catch up (15 of 23 runs over 1 s against 1
+/// of 24 with it ended, diag-live-durability-64).
+#[test]
+fn an_exchange_to_a_lost_silent_holder_ends_within_a_silence_not_at_its_deadline() {
+  type Lend = (Vec<HostId>, Vec<HostId>, Vec<HostId>, bool);
+  let (report_tx, report_rx) = channel::<(u64, Vec<HostId>, Lend)>();
+  let _ = run(
+    true,
+    Box::new(move |sessions, commands| {
+      Box::pin(async move {
+        let mut shipper = shipper(2, 2);
+        let entry = shipper.append(b"one".to_vec()).unwrap();
+        let bytes = entry.encode();
+        let began = slates_rt::futures::now_ns();
+        let exchanged = slates_cluster::live::exchange_watched(
+          (LIVE_ENTRY_STREAM, &bytes),
+          sessions,
+          CommitBudget::hard(10 * SILENCE_NS, POLL_NS),
+          Some(slates_cluster::live::Watch {
+            lost: |host| host == HOLDERS[1],
+            silence_ns: SILENCE_NS,
+          }),
+          |_, _| false,
+        )
+        .await;
+        let answered: Vec<HostId> = exchanged.replies.iter().map(|(host, _)| *host).collect();
+        let reusable: Vec<HostId> = exchanged.reusable.iter().map(|(host, _)| *host).collect();
+        let mut stragglers = exchanged.stragglers;
+        let (_, all_back) = stragglers.recover_replies();
+        let took = slates_rt::futures::now_ns().saturating_sub(began);
+        let _ = report_tx.send((
+          took,
+          answered,
+          (
+            exchanged.cut.clone(),
+            exchanged.unanswered.clone(),
+            reusable,
+            all_back,
+          ),
+        ));
+        for (_, mut endpoint) in exchanged.reusable {
+          let _ = endpoint
+            .request(
+              STOP_KIND,
+              slates_transport::connection::Priority::Control,
+              &[],
+            )
+            .await;
+        }
+        drop(commands);
+      })
+    }),
+  );
+  let (took, answered, (cut, unanswered, reusable, all_back)) = report_rx.try_recv().unwrap();
+  assert!(
+    answered.contains(&HOLDERS[0]),
+    "holder 2 answered: {answered:?}"
+  );
+  assert_eq!(cut, vec![HOLDERS[1]], "holder 3's request was cut");
+  assert!(
+    unanswered.contains(&HOLDERS[1]) && !reusable.contains(&HOLDERS[1]),
+    "its session is given up: {reusable:?}"
+  );
+  assert!(
+    all_back,
+    "no request is still in flight when the exchange returns"
+  );
+  assert!(
+    took <= SILENCE_NS + SILENCE_NS / 10,
+    "the exchange ended {took} ns after it began, past a silence ({SILENCE_NS} ns) of its holder's loss"
+  );
+}
+
+/// Shape: a link slow enough that an install of [`INSTALL_BYTES`] takes about two silences to cross it.
+const SLOW_LINK_BITS_PER_SECOND: u64 = 256_000;
+/// Shape: an install under the holders' bound ([`CAP`]) that takes several silences to cross [`SLOW_LINK_BITS_PER_SECOND`].
+const INSTALL_BYTES: usize = 60_000;
+
+/// A-200: a holder its caller has given up but whose session is still taking the request's bytes is never cut off, so a
+/// false suspicion of a live holder costs nothing. Do send holder 2 an install of 60 KB over a 256 kbit/s link, about two
+/// silences of transfer, with a watch that names it lost the whole time. Expect it answered, and no request cut.
+/// Non-vacuous: the exchange took longer than a silence, so a watch that read only the loss would have cut it.
+#[test]
+fn a_lost_holder_still_taking_the_request_is_never_cut_off() {
+  let (report_tx, report_rx) = channel::<(u64, Vec<HostId>, Vec<HostId>)>();
+  let _ = run(
+    false,
+    Box::new(move |sessions, commands| {
+      Box::pin(async move {
+        let mut shipper = shipper(2, 2);
+        let _ = shipper.append(b"one".to_vec()).unwrap();
+        let install = shipper.install(vec![7; INSTALL_BYTES]).unwrap();
+        let bytes = install.encode();
+        let link = slates_rt::sim::sim_udp_add_link(slates_rt::sim::SimLink {
+          rate_bits_per_second: SLOW_LINK_BITS_PER_SECOND,
+          queue_bytes: 1 << 20,
+        });
+        slates_rt::sim::sim_udp_set_path(slates_rt::sim::SimPath::in_order(0, 0).through(link));
+        let (to_two, rest): (Vec<_>, Vec<_>) = sessions
+          .into_iter()
+          .partition(|(host, _)| *host == HOLDERS[0]);
+        let began = slates_rt::futures::now_ns();
+        let exchanged = slates_cluster::live::exchange_watched(
+          (LIVE_STATE_STREAM, &bytes),
+          to_two,
+          CommitBudget::hard(10 * SILENCE_NS, POLL_NS),
+          Some(slates_cluster::live::Watch {
+            lost: |_| true,
+            silence_ns: SILENCE_NS,
+          }),
+          |_, _| true,
+        )
+        .await;
+        let took = slates_rt::futures::now_ns().saturating_sub(began);
+        let answered: Vec<HostId> = exchanged.replies.iter().map(|(host, _)| *host).collect();
+        let _ = report_tx.send((took, answered, exchanged.cut.clone()));
+        slates_rt::sim::sim_udp_set_path(slates_rt::sim::SimPath::NONE);
+        for (_, mut endpoint) in exchanged.reusable.into_iter().chain(rest) {
+          let _ = endpoint
+            .request(
+              STOP_KIND,
+              slates_transport::connection::Priority::Control,
+              &[],
+            )
+            .await;
+        }
+        drop(commands);
+      })
+    }),
+  );
+  let (took, answered, cut) = report_rx.try_recv().unwrap();
+  assert!(
+    took > SILENCE_NS,
+    "the install took longer than a silence: {took} ns"
+  );
+  assert_eq!(
+    answered,
+    vec![HOLDERS[0]],
+    "holder 2 answered (cut: {cut:?}, took {took} ns)"
+  );
+  assert!(cut.is_empty(), "no request was cut: {cut:?}");
 }
 
 /// A-200: a holder that joins late (it held nothing while six writes became durable through the other holder alone) is
