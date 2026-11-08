@@ -1,0 +1,4 @@
+tested b81e6fc81c5ba432cad6bfaf45becb55595d606b variant after on aarch64, 4 cpus
+restart exit 101 70s
+still-waits exit 101 2s
+takeover exit 101 2s
