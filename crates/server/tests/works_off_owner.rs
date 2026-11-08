@@ -139,9 +139,9 @@ fn history(client: &mut Client) -> Vec<String> {
   for name in ["shared", "shifted", "untouched"] {
     said.push(file(client, green, name));
   }
-  for index in 0..WORKS {
+  for (index, work) in works.iter().enumerate() {
     said.push(file(client, green, &format!("own-{index}")));
-    said.push(file(client, works[index], &format!("own-{index}")));
+    said.push(file(client, *work, &format!("own-{index}")));
   }
   client.destroy(left).unwrap();
   said.push(file(client, right, "untouched"));
@@ -230,6 +230,24 @@ fn submit_when_room(client: &mut Client, work: VolumeId) -> Submitted {
   }
 }
 
+/// Advances the green from `writer` until its chain refuses, a held floor having kept it from folding; the version the
+/// refused submit would have been, its edit still in the work.
+fn fill_the_chain(client: &mut Client, writer: VolumeId, delete: u64) -> u64 {
+  for next in 2..=VERSIONS {
+    client
+      .edit(writer, "file", 0, delete, &version_bytes(next))
+      .unwrap();
+    match client.submit(writer) {
+      Ok(Submitted::Accepted(version)) => assert_eq!(version, next),
+      Err(ClientError::Refused(Refusal::TableAtCapacity { table })) if table == "green_chains" => {
+        return next;
+      }
+      other => panic!("submit {next}: {other:?}"),
+    }
+  }
+  panic!("the held floor fills the chain within {VERSIONS} versions");
+}
+
 /// A-247, W3. Do: over a green with a small chain cap, on eight shards, leave two works off the green's shard based on
 /// version 1, and advance the green from a third until its chain is full. Expect: the chain is refused typed rather
 /// than folded past the works; the works still read their base and are judged at it; and once one is rebased and both
@@ -268,21 +286,7 @@ fn a_checkpoint_never_folds_past_a_work_on_another_shard() {
     .create_work(green, &off_owner_name(green, "floor-w"))
     .unwrap();
   let delete = u64::try_from(VERSION_BYTES).unwrap();
-  let mut next = 2u64;
-  let full_at = loop {
-    assert!(next <= VERSIONS, "the held floor fills the chain");
-    client
-      .edit(writer, "file", 0, delete, &version_bytes(next))
-      .unwrap();
-    match client.submit(writer) {
-      Ok(Submitted::Accepted(version)) => assert_eq!(version, next),
-      Err(ClientError::Refused(Refusal::TableAtCapacity { table })) if table == "green_chains" => {
-        break next;
-      }
-      other => panic!("submit {next}: {other:?}"),
-    }
-    next += 1;
-  };
+  let full_at = fill_the_chain(&mut client, writer, delete);
   assert_eq!(
     client.read(destroyed, "file", ReadAt::Head).unwrap(),
     first,
@@ -402,6 +406,67 @@ fn reply_of(client: &mut Client, id: RequestId) -> ReplyBody {
   }
 }
 
+/// One round of the pipelined-order test: a new work, four verbs sent without waiting, and what they left.
+fn pipelined_round(client: &mut Client, green: VolumeId, round: u8) {
+  let name = off_owner_name(green, &format!("order-{round}"));
+  let (work, base) = client.create_work(green, &name).unwrap();
+  let edit = |path: &str, fill: u8| RequestBody::Edit {
+    work,
+    path: path.to_owned(),
+    at: 0,
+    delete_len: 4,
+    bytes: vec![fill; 4],
+  };
+  let first = client.begin(&edit("first", b'A' + round)).unwrap();
+  let submit = client
+    .begin(&RequestBody::Submit {
+      work,
+      evidence: Vec::new(),
+    })
+    .unwrap();
+  let second = client.begin(&edit("second", b'c' + round)).unwrap();
+  // This one needs nothing of the owner (its file is the work's own by now), so only the work's order holds it back
+  // from running during the verdict and being lost to the accept's reset.
+  let held_back = client.begin(&edit("first", b'P' + round)).unwrap();
+  assert_eq!(reply_of(client, first), ReplyBody::Edited);
+  let accepted = u64::from(round) + 2;
+  assert_eq!(
+    reply_of(client, submit),
+    ReplyBody::Submitted {
+      version: Some(accepted),
+      conflicts: Vec::new(),
+    },
+    "based at {base}"
+  );
+  assert_eq!(reply_of(client, second), ReplyBody::Edited);
+  assert_eq!(reply_of(client, held_back), ReplyBody::Edited);
+  assert_eq!(
+    client
+      .read(green, "first", ReadAt::Version { version: accepted })
+      .unwrap(),
+    vec![b'A' + round; 4],
+    "the submit holds the edit before it"
+  );
+  assert_ne!(
+    client
+      .read(green, "second", ReadAt::Version { version: accepted })
+      .unwrap(),
+    vec![b'c' + round; 4],
+    "and not the edit after it"
+  );
+  assert_eq!(
+    client.read(work, "second", ReadAt::Head).unwrap(),
+    vec![b'c' + round; 4],
+    "which the work still holds"
+  );
+  assert_eq!(
+    client.read(work, "first", ReadAt::Head).unwrap(),
+    vec![b'P' + round; 4],
+    "an edit behind the submit lands on what the submit left"
+  );
+  client.destroy(work).unwrap();
+}
+
 /// A-247 "A work's order". Do: pipeline on a work off its green's shard an edit of a base file (which must ask the
 /// owner), a submit, and an edit of another base file, without waiting between them. Expect: the submit holds the
 /// first edit and not the second: the green has the first, and the work still holds the second for its next submit.
@@ -415,139 +480,159 @@ fn verbs_pipelined_on_a_work_off_its_greens_shard_keep_their_order() {
   client.edit(seed, "second", 0, 0, b"bbbb").unwrap();
   assert_eq!(client.submit(seed).unwrap(), Submitted::Accepted(1));
   for round in 0..16u8 {
-    let name = off_owner_name(green, &format!("order-{round}"));
-    let (work, base) = client.create_work(green, &name).unwrap();
-    let edit = |path: &str, fill: u8| RequestBody::Edit {
-      work,
-      path: path.to_owned(),
-      at: 0,
-      delete_len: 4,
-      bytes: vec![fill; 4],
-    };
-    let first = client.begin(&edit("first", b'A' + round)).unwrap();
-    let submit = client
-      .begin(&RequestBody::Submit {
-        work,
-        evidence: Vec::new(),
-      })
-      .unwrap();
-    let second = client.begin(&edit("second", b'c' + round)).unwrap();
-    assert_eq!(reply_of(&mut client, first), ReplyBody::Edited);
-    let accepted = u64::from(round) + 2;
-    assert_eq!(
-      reply_of(&mut client, submit),
-      ReplyBody::Submitted {
-        version: Some(accepted),
-        conflicts: Vec::new(),
-      },
-      "based at {base}"
-    );
-    assert_eq!(reply_of(&mut client, second), ReplyBody::Edited);
-    assert_eq!(
-      client
-        .read(green, "first", ReadAt::Version { version: accepted })
-        .unwrap(),
-      vec![b'A' + round; 4],
-      "the submit holds the edit before it"
-    );
-    assert_ne!(
-      client
-        .read(green, "second", ReadAt::Version { version: accepted })
-        .unwrap(),
-      vec![b'c' + round; 4],
-      "and not the edit after it"
-    );
-    assert_eq!(
-      client.read(work, "second", ReadAt::Head).unwrap(),
-      vec![b'c' + round; 4],
-      "which the work still holds"
-    );
-    client.destroy(work).unwrap();
+    pipelined_round(&mut client, green, round);
   }
   assert!(asked_of_the_owner(&daemon) > 0);
   drop(client);
   daemon.stop();
 }
 
-/// A-247 "Exactly once". Do: submit a work off its green's shard with the owner's answer lost on its way back, so the
-/// green advanced and the work did not, and the verb is answered `Overloaded`; then retry it under its id, once on the
-/// same daemon and once, for a second work, after a restart. Expect: the retry answers the one version the owner
-/// recorded, the green is one version ahead and not two, the file holds the edit once, and the work is reset to it.
+/// Waits for request `id` to be refused `Overloaded`, the answer a lost owner's reply leaves.
+fn await_overloaded(client: &mut Client, id: RequestId) {
+  let started = Instant::now();
+  loop {
+    match client.poll_reply(id) {
+      Ok(None) => {
+        assert!(started.elapsed() < WAIT, "the lost answer is refused");
+        std::thread::yield_now();
+      }
+      Err(ClientError::Refused(Refusal::Overloaded { .. })) => return,
+      other => panic!("the lost answer is a refusal the client retries: {other:?}"),
+    }
+  }
+}
+
+/// A green at version 1 and a work off its shard with one edit waiting.
+fn green_and_edited_work(client: &mut Client, tag: &str) -> (VolumeId, VolumeId) {
+  let green = client.create_green(&format!("{tag}-green"), false).unwrap();
+  let (seed, _) = client.create_work(green, &format!("{tag}-seed")).unwrap();
+  client.edit(seed, "f", 0, 0, b"....").unwrap();
+  assert_eq!(client.submit(seed).unwrap(), Submitted::Accepted(1));
+  let (work, _) = client
+    .create_work(green, &off_owner_name(green, tag))
+    .unwrap();
+  client.edit(work, "f", 0, 1, b"X").unwrap();
+  (green, work)
+}
+
+/// Submits `work` with the owner's answer lost: the green moved, the verb is refused `Overloaded`, and the id and the
+/// request are returned to retry.
+fn submit_with_the_answer_lost(
+  daemon: &Daemon,
+  client: &mut Client,
+  green: VolumeId,
+  work: VolumeId,
+) -> (RequestId, RequestBody) {
+  client.acknowledge_all().unwrap();
+  daemon.lose_next_owner_answer(owner_of(work)).unwrap();
+  let request = RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  };
+  let id = client.begin(&request).unwrap();
+  await_overloaded(client, id);
+  assert_eq!(client.versions(green).unwrap(), 2, "the owner moved");
+  (id, request)
+}
+
+const ACCEPTED_AT_TWO: ReplyBody = ReplyBody::Submitted {
+  version: Some(2),
+  conflicts: Vec::new(),
+};
+
+/// A-247 "Exactly once". Do: submit a work off its green's shard with the owner's answer lost, so the green advanced
+/// and the work did not, and the verb is answered `Overloaded`; retry it under its id. Expect: the retry answers the one
+/// version the owner recorded, the green is one version ahead and not two, and the work settled at it.
 #[test]
 fn a_submit_whose_answer_was_lost_is_answered_by_the_owners_record_once() {
+  let (daemon, instance) = daemon(MANY_SHARDS, "lost");
+  let mut client = connect(&instance);
+  let (green, work) = green_and_edited_work(&mut client, "lost");
+  let (id, request) = submit_with_the_answer_lost(&daemon, &mut client, green, work);
+  assert_eq!(client.retry(id, &request).unwrap(), ACCEPTED_AT_TWO);
+  assert_eq!(client.versions(green).unwrap(), 2, "one version");
+  assert_eq!(
+    client.read(work, "f", ReadAt::Head).unwrap(),
+    client.read(green, "f", ReadAt::Head).unwrap(),
+    "the work settled at the version the owner recorded"
+  );
+  assert_eq!(client.read(green, "f", ReadAt::Head).unwrap(), b"X...");
+  drop(client);
+  daemon.stop();
+}
+
+/// A-247 "Exactly once", across a restart. Do: as above, but restart the daemon before the retry, so the work comes
+/// back from its log still holding the edit the green already has. Expect: the same one version, the edit once, and a
+/// next edit and submit accepted on top of it.
+#[test]
+fn a_submit_whose_answer_was_lost_is_answered_once_across_a_restart() {
   let profile = common::machine_profile();
-  let instance = format!("srv-works-lost-{}", std::process::id());
+  let instance = format!("srv-works-lost-restart-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(MANY_SHARDS));
-  let anchor = common::anchor::held_anchor("works-lost", &profile, &config);
+  let anchor = common::anchor::held_anchor("works-lost-restart", &profile, &config);
   let first = Daemon::start(&profile, config.clone(), common::anchor::source_of(&anchor)).unwrap();
   first.bootstrap(true).unwrap();
   let mut client = connect(&instance);
-  let green = client.create_green("lost-green", false).unwrap();
-  let (seed, _) = client.create_work(green, "lost-seed").unwrap();
-  client.edit(seed, "f", 0, 0, b"....").unwrap();
+  let (green, work) = green_and_edited_work(&mut client, "lost-restart");
+  let (id, request) = submit_with_the_answer_lost(&first, &mut client, green, work);
+  first.stop();
+  let second = Daemon::start(&profile, config, common::anchor::source_of(&anchor)).unwrap();
+  assert_eq!(client.retry(id, &request).unwrap(), ACCEPTED_AT_TWO);
+  assert_eq!(client.versions(green).unwrap(), 2, "one version");
+  assert_eq!(client.read(green, "f", ReadAt::Head).unwrap(), b"X...");
+  client.edit(work, "f", 3, 1, b"Y").unwrap();
+  assert_eq!(client.submit(work).unwrap(), Submitted::Accepted(3));
+  assert_eq!(client.read(green, "f", ReadAt::Head).unwrap(), b"X..Y");
+  drop(client);
+  second.stop();
+  drop(anchor);
+}
+
+/// A-247 "Floors". Do: over a green with a small chain cap, lose the owner's answer to a work's creation, as a crash
+/// between the two steps would, leaving a floor at version 1 with no work; fill the chain; restart. Expect: the orphan
+/// floor is held against the chain before the restart (the chain refuses) and released by the start's reconcile (the
+/// next submit folds it and is accepted).
+#[test]
+fn a_floor_whose_work_was_never_made_is_released_at_the_next_start() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-works-orphan-{}", std::process::id());
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(MANY_SHARDS));
+  config.caps.green_chain_bytes = CHAIN_CAP_BYTES;
+  let anchor = common::anchor::held_anchor("works-orphan", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), common::anchor::source_of(&anchor)).unwrap();
+  first.bootstrap(true).unwrap();
+  let mut client = connect(&instance);
+  let green = client.create_green("orphan-green", false).unwrap();
+  let (seed, _) = client.create_work(green, "orphan-seed").unwrap();
+  client.edit(seed, "file", 0, 0, &version_bytes(1)).unwrap();
   assert_eq!(client.submit(seed).unwrap(), Submitted::Accepted(1));
-  for (version, restart) in [(2u64, false), (3, true)] {
-    let name = off_owner_name(green, &format!("lost-{version}"));
-    let (work, _) = client.create_work(green, &name).unwrap();
-    let at = version - 2;
-    client.edit(work, "f", at, 1, b"X").unwrap();
-    client.acknowledge_all().unwrap();
-    first.lose_next_owner_answer().unwrap();
-    let request = RequestBody::Submit {
-      work,
-      evidence: Vec::new(),
-    };
-    let id = client.begin(&request).unwrap();
-    let started = Instant::now();
-    loop {
-      match client.poll_reply(id) {
-        Ok(None) => {
-          assert!(started.elapsed() < WAIT, "the lost answer is refused");
-          std::thread::yield_now();
-        }
-        Err(ClientError::Refused(Refusal::Overloaded { .. })) => break,
-        other => panic!("the lost answer is a refusal the client retries: {other:?}"),
-      }
-    }
-    assert_eq!(client.versions(green).unwrap(), version, "the owner moved");
-    if restart {
-      first.stop();
-      let second =
-        Daemon::start(&profile, config.clone(), common::anchor::source_of(&anchor)).unwrap();
-      let retried = client.retry(id, &request).unwrap();
-      assert_eq!(
-        retried,
-        ReplyBody::Submitted {
-          version: Some(version),
-          conflicts: Vec::new(),
-        }
-      );
-      assert_eq!(client.versions(green).unwrap(), version, "one version");
-      client.edit(work, "f", 3, 1, b"Y").unwrap();
-      assert_eq!(
-        client.submit(work).unwrap(),
-        Submitted::Accepted(version + 1)
-      );
-      drop(client);
-      second.stop();
-      drop(anchor);
-      return;
-    }
-    let retried = client.retry(id, &request).unwrap();
-    assert_eq!(
-      retried,
-      ReplyBody::Submitted {
-        version: Some(version),
-        conflicts: Vec::new(),
-      }
-    );
-    assert_eq!(client.versions(green).unwrap(), version, "one version");
-    assert_eq!(
-      client.read(work, "f", ReadAt::Head).unwrap(),
-      client.read(green, "f", ReadAt::Head).unwrap(),
-      "the work settled at the version the owner recorded"
-    );
-  }
+  client.destroy(seed).unwrap();
+  let orphan = off_owner_name(green, "orphan");
+  first
+    .lose_next_owner_answer(owner_of_name(&orphan, usize::from(MANY_SHARDS)))
+    .unwrap();
+  let orphaned = client.create_work(green, &orphan);
+  assert!(
+    matches!(
+      orphaned,
+      Err(ClientError::Refused(Refusal::Overloaded { .. }))
+    ),
+    "the lost admission is a refusal: {orphaned:?}"
+  );
+  let (writer, _) = client
+    .create_work(green, &off_owner_name(green, "orphan-w"))
+    .unwrap();
+  let full_at = fill_the_chain(&mut client, writer, u64::try_from(VERSION_BYTES).unwrap());
+  first.stop();
+  let second = Daemon::start(&profile, config, common::anchor::source_of(&anchor)).unwrap();
+  assert_eq!(
+    submit_when_room(&mut client, writer),
+    Submitted::Accepted(full_at),
+    "the start released the orphan's floor"
+  );
+  drop(client);
+  second.stop();
+  drop(anchor);
 }
 
 /// One step of a generated history.
@@ -618,14 +703,14 @@ fn generated_step() -> impl Strategy<Value = Step> {
     .prop_map(
       |(draw, slot, file, other, at, delete_len, bytes)| match draw {
         0 => Step::NewWork { slot },
-        1 | 2 | 3 => Step::Edit {
+        1..=3 => Step::Edit {
           slot,
           file,
           at,
           delete_len,
           bytes,
         },
-        4 | 5 => Step::EditAndSubmit {
+        4..=5 => Step::EditAndSubmit {
           slot,
           file,
           at,

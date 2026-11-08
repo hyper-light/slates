@@ -2394,13 +2394,11 @@ impl Daemon {
     self.observe(self.shards.first().copied(), move |s| s.merge.fault = fault)
   }
 
-  /// Test support: loses the next verdict a work's shard is answered by its green's owner (A-247; never reachable from
-  /// the wire), as a crash between the owner's step and the work's would, on every shard.
-  pub fn lose_next_owner_answer(&self) -> Result<(), ObserveError> {
-    for shard in self.shards.iter().copied() {
-      self.observe(Some(shard), |s| s.work_home.lose_next_verdict = true)?;
-    }
-    Ok(())
+  /// Test support: loses the next verdict or admission the work's shard for `partition` is answered by its green's
+  /// owner (A-247; never reachable from the wire), as a crash between the owner's step and the work's would.
+  pub fn lose_next_owner_answer(&self, partition: u16) -> Result<(), ObserveError> {
+    let shard = self.shards.get(usize::from(partition)).copied();
+    self.observe(shard, |s| s.work_home.lose_next_answer = true)
   }
 
   /// Test support: holds every discovery reply this node's record serve side would send (never reachable
@@ -4440,6 +4438,24 @@ async fn restore_client_ids(listener: &mut Listener, origin: u16, shards: &[Shar
   true
 }
 
+/// Recovers what spans partitions, before any client is admitted: the names' aliases (A-236), the works off their
+/// green's shard, then every floor against the work it holds for (A-247).
+async fn recover_works_across_partitions(origin: u16, shards: &[ShardId]) {
+  let reconciled = reconcile_name_aliases(origin, shards).await;
+  if reconciled > 0 {
+    slates_machine::log_line!(
+      "slates-server: {reconciled} name alias(es) reconciled with their clones at recovery"
+    );
+  }
+  rebuild_remote_works(origin, shards).await;
+  let floors = reconcile_work_floors(origin, shards).await;
+  if floors > 0 {
+    slates_machine::log_line!(
+      "slates-server: {floors} work floor(s) reconciled with their works at recovery"
+    );
+  }
+}
+
 /// Replays each work whose green lives on another partition through that green's owner (A-247), its log being read
 /// from the work's partition. A shard that does not answer leaves its works unbuilt, and a retry of their verbs answers
 /// `NotFound`, as a work whose log would not replay does.
@@ -4742,21 +4758,9 @@ async fn control_loop(
   }
   // Every shard has recovered and no client is admitted yet, so no clone is between its steps: the names' aliases are
   // reconciled with the clones they name (A-236).
-  let reconciled = reconcile_name_aliases(control, &shards).await;
-  if reconciled > 0 {
-    slates_machine::log_line!(
-      "slates-server: {reconciled} name alias(es) reconciled with their clones at recovery"
-    );
-  }
   // Likewise no work is between its steps: a work whose green lives on another partition is replayed through that
   // green's owner, and only then is every floor compared with the work it holds for (A-247).
-  rebuild_remote_works(control, &shards).await;
-  let floors = reconcile_work_floors(control, &shards).await;
-  if floors > 0 {
-    slates_machine::log_line!(
-      "slates-server: {floors} work floor(s) reconciled with their works at recovery"
-    );
-  }
+  recover_works_across_partitions(control, &shards).await;
   // Clients this daemon handed out, so a wanted id that is live is not given twice; bounded
   // by the daemon's client capacity, refused typed beyond it (AC-2.6). A client's shard is
   // its id's residue, so a client reconnecting under its old id after a restart lands on the

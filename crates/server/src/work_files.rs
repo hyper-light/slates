@@ -16,6 +16,17 @@ use std::collections::BTreeMap;
 
 use slates_merge::engine::Green;
 
+/// A page of one base file the green's owner answered (A-247).
+#[derive(Debug)]
+pub struct FetchedPage {
+  /// The file.
+  pub path: String,
+  /// The offset the page starts at.
+  pub offset: u64,
+  /// Its bytes and the file's whole length; `None` when the base has no such file.
+  pub answer: Option<(Vec<u8>, u64)>,
+}
+
 /// What the green's owner answered for the one verb now running on a work's shard, when the green lives on another
 /// shard (A-247): the base's files the verb asked for, the page of a paged read, or the base's files and lengths.
 /// Taken by that verb and gone with it, so a base's bytes are never held for a work between verbs: nothing to
@@ -27,9 +38,8 @@ pub struct FetchedBase {
   pub gone: bool,
   /// The files asked for, `None` for one the base does not have.
   pub files: BTreeMap<String, Option<Vec<u8>>>,
-  /// A page of one file: its path, the offset it starts at, its bytes and the file's whole length; `None` in the
-  /// outer when no page was asked for, in the inner when the base has no such file.
-  pub page: Option<(String, u64, Option<(Vec<u8>, u64)>)>,
+  /// A page of one file, when one was asked for.
+  pub page: Option<FetchedPage>,
   /// Every file of the base with its length, when asked for.
   pub sizes: Option<Vec<(String, u64)>>,
 }
@@ -69,15 +79,15 @@ impl<'a> Base<'a> {
 
   /// The page of `path` the owner answered, cut to `want` bytes, when this verb asked for one at `offset`.
   fn fetched_page(self, path: &str, (offset, want): (u64, u64)) -> Option<Option<(Vec<u8>, u64)>> {
-    let (asked, at, answer) = self
+    let page = self
       .fetched
       .filter(|fetched| !fetched.gone)?
       .page
       .as_ref()?;
-    if asked != path || *at != offset {
+    if page.path != path || page.offset != offset {
       return None;
     }
-    Some(answer.as_ref().map(|(bytes, total)| {
+    Some(page.answer.as_ref().map(|(bytes, total)| {
       let keep = usize::try_from(want).unwrap_or(usize::MAX).min(bytes.len());
       (bytes.get(..keep).unwrap_or_default().to_vec(), *total)
     }))

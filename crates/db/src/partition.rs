@@ -506,6 +506,19 @@ impl Partition {
     *held = held.saturating_add(1);
   }
 
+  /// Applies a work floor's record (A-247).
+  fn apply_work_floor(&mut self, op: &Op) {
+    match op {
+      Op::WorkFloorSet { green, work, base } => self.set_work_floor(*green, *work, *base),
+      Op::WorkFloorDropped { green, work } => {
+        if let Some(base) = self.work_floors.remove(&(*green, *work)) {
+          self.release_floor_count(*green, base);
+        }
+      }
+      _ => {}
+    }
+  }
+
   /// Releases one work's hold of `base`.
   fn release_floor_count(&mut self, green: VolumeId, base: u64) {
     if let Some(held) = self.work_floor_counts.get_mut(&(green, base)) {
@@ -1429,14 +1442,8 @@ impl Partition {
         self.expired_attachments.push_back(*id);
         Ok(())
       }
-      Op::WorkFloorSet { green, work, base } => {
-        self.set_work_floor(*green, *work, *base);
-        Ok(())
-      }
-      Op::WorkFloorDropped { green, work } => {
-        if let Some(base) = self.work_floors.remove(&(*green, *work)) {
-          self.release_floor_count(*green, base);
-        }
+      Op::WorkFloorSet { .. } | Op::WorkFloorDropped { .. } => {
+        self.apply_work_floor(op);
         Ok(())
       }
       Op::NameAliasReserved { record } => {

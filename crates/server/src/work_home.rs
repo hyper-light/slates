@@ -136,8 +136,8 @@ pub(crate) struct WorkHome {
   pub(crate) unbuilt: Vec<Unbuilt>,
   /// Whether this shard's deadline timer for deferred verdicts is running.
   timer_armed: bool,
-  /// Test support (`Daemon::lose_next_owner_answer`): the next verdict an ask brings back is lost.
-  pub(crate) lose_next_verdict: bool,
+  /// Test support (`Daemon::lose_next_owner_answer`): the next verdict or admission an ask brings back is lost.
+  pub(crate) lose_next_answer: bool,
 }
 
 /// What [`gate`] decided for a verb.
@@ -569,8 +569,8 @@ fn start_ask(
     )
     .await;
     match answer {
-      Asked::Answered(Answered::Verdict(_))
-        if state::with_state(|s| std::mem::take(&mut s.work_home.lose_next_verdict))
+      Asked::Answered(Answered::Verdict(_) | Answered::Admitted(_))
+        if state::with_state(|s| std::mem::take(&mut s.work_home.lose_next_answer))
           .unwrap_or(false) =>
       {
         let _ = state::with_state_counted(|s| resolve(s, queue, None));

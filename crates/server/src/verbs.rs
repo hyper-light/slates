@@ -3602,6 +3602,25 @@ fn lease_gate(
   LeaseGate::Answer(refused(Refusal::LeaseUnconfirmed { version }))
 }
 
+/// The gates a verb passes before it runs: the owner's lease, and for a work whose green lives on another shard its
+/// owner for a base or a verdict (A-247): the verb is parked until the answer comes, and its later verbs park behind
+/// it (`crate::work_home`).
+fn gates(
+  state: &mut ShardState,
+  client_id: u32,
+  principal: &Principal,
+  body: RequestBody,
+) -> LeaseGate {
+  let body = match lease_gate(state, client_id, principal, body) {
+    LeaseGate::Run(body) => body,
+    answered @ LeaseGate::Answer(_) => return answered,
+  };
+  match crate::work_home::gate(state, client_id, principal, body) {
+    crate::work_home::Gate::Run(body) => LeaseGate::Run(body),
+    crate::work_home::Gate::Answer(reply) => LeaseGate::Answer(reply),
+  }
+}
+
 pub(crate) fn dispatch(
   state: &mut ShardState,
   client_id: u32,
@@ -3631,15 +3650,9 @@ pub(crate) fn dispatch(
   //
   // An unconfirmed lease is usually a confirmation in flight, so the verb is parked until it confirms or the
   // lease bound passes (`crate::lease_wait`), not refused at once; refused only when it cannot be parked.
-  let body = match lease_gate(state, client_id, principal, body) {
+  let body = match gates(state, client_id, principal, body) {
     LeaseGate::Run(body) => body,
     LeaseGate::Answer(reply) => return reply,
-  };
-  // A work whose green lives on another shard needs its owner for a base or a verdict (A-247): the verb is parked here
-  // until the answer comes, and its later verbs park behind it (`crate::work_home`).
-  let body = match crate::work_home::gate(state, client_id, principal, body) {
-    crate::work_home::Gate::Run(body) => body,
-    crate::work_home::Gate::Answer(reply) => return reply,
   };
   // The durability gate (§4.8 "Placement" — the operator's ε and coincident-failure size "gate a refusal"):
   // a write that would commit a new head or seal is refused, with the measured shortfall, while the
@@ -6800,7 +6813,11 @@ pub(crate) fn owner_page(
     return fetched;
   };
   let page = engine.content_page_at(&path, version, (offset, want));
-  fetched.page = Some((path, offset, page));
+  fetched.page = Some(crate::work_files::FetchedPage {
+    path,
+    offset,
+    answer: page,
+  });
   fetched
 }
 

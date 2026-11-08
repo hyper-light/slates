@@ -10089,6 +10089,120 @@ fn a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_
   });
 }
 
+/// A green on its owner's node and a work over it placed on another shard of that node, with one edit (A-247).
+fn green_and_off_shard_work(client: &mut Client) -> (VolumeId, VolumeId) {
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "off-shard-green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("create green");
+  };
+  let name = (0u32..)
+    .map(|suffix| format!("off-shard-work-{suffix}"))
+    .find(|name| {
+      slates_server::verbs::owner_of_name(name, usize::from(TWO_SHARDS))
+        != slates_server::verbs::owner_of(green)
+    })
+    .unwrap();
+  let ReplyBody::WorkCreated { id: work, .. } =
+    client.call(&RequestBody::CreateWork { green, name })
+  else {
+    panic!("create work");
+  };
+  (green, work)
+}
+
+/// A-247, AUD-11. Do: in a two-node `f = 1` fleet whose holder withholds every merge record, submit from a client on the
+/// green's node a work on another shard of that node, and pipeline an edit behind it. Expect: the acceptance waits at
+/// the quorum on the owner, and neither verb is answered; once the holder takes the record the submit is answered the
+/// version and the edit after it, in order, and the work reads the edit over the accepted version.
+#[test]
+fn a_submit_off_its_greens_shard_is_held_to_its_quorum_and_the_works_next_verb_behind_it() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let mut client = Client::connect(&instance_a);
+  let (green, work) = green_and_off_shard_work(&mut client);
+  let appended = |at: u64, bytes: &[u8]| RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at,
+    delete_len: 0,
+    bytes: bytes.to_vec(),
+  };
+  assert!(matches!(
+    client.call(&appended(0, b"hello")),
+    ReplyBody::Edited
+  ));
+  daemon_b
+    .inject_merge_fault(slates_server::merge_service::MergeFault {
+      refuse_content_puts: false,
+      corrupt_next_inputs: false,
+      refuse_records: true,
+    })
+    .unwrap();
+  let mut pipelined = common::client::connect(&instance_a);
+  let submit = pipelined
+    .begin(&RequestBody::Submit {
+      work,
+      evidence: Vec::new(),
+    })
+    .unwrap();
+  let both = [&daemon_a, &daemon_b];
+  assert!(
+    poll_until(&both, PLACEMENT_DEADLINE, || Ok(
+      daemon_a.merge_awaiting(green)? == 1
+    )),
+    "the acceptance waits at the owner"
+  );
+  let after = pipelined.begin(&appended(5, b"!")).unwrap();
+  assert!(
+    matches!(pipelined.poll_reply(after), Ok(None)),
+    "the edit behind the deferred submit is not answered"
+  );
+  daemon_b
+    .inject_merge_fault(slates_server::merge_service::MergeFault::default())
+    .unwrap();
+  let submitted = answer_within(&mut pipelined, submit.word());
+  let edited = answer_within(&mut pipelined, after.word());
+  let read = client.call(&RequestBody::Read {
+    volume: work,
+    path: "f".to_owned(),
+    at: ReadAt::Head,
+  });
+  drop(pipelined);
+  drop(client);
+  daemon_a.stop();
+  daemon_b.stop();
+  assert_held_to_its_quorum(submitted, edited, &read);
+}
+
+/// What [`a_submit_off_its_greens_shard_is_held_to_its_quorum_and_the_works_next_verb_behind_it`] must have seen.
+fn assert_held_to_its_quorum(
+  submitted: Option<Result<ReplyBody, String>>,
+  edited: Option<Result<ReplyBody, String>>,
+  read: &ReplyBody,
+) {
+  assert!(
+    matches!(
+      submitted,
+      Some(Ok(ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }))
+    ),
+    "the submit answers its version: {submitted:?}"
+  );
+  assert!(
+    matches!(edited, Some(Ok(ReplyBody::Edited))),
+    "and the edit after it: {edited:?}"
+  );
+  assert!(
+    matches!(read, ReplyBody::ReadBytes { bytes } if bytes == b"hello!"),
+    "the work reads the edit over the accepted version: {read:?}"
+  );
+}
+
 /// What the forwarded resend run observed, for [`assert_resent_under_its_id`].
 struct ForwardedResend {
   faulted: bool,
