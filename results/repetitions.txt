@@ -1,0 +1,32 @@
+runner macos-latest, arm64, 3 CPUs, 3b030c5 DIAG, not for main: the A-228 fleet at HEAD, ten repetitions of reader, , Sun Nov  8 14:18:15 UTC 2026
+clippy exit 0
+run 1 reader 0 rule 0 liveness 0
+starved shard: 6 spinners, its CPU clock stood still for 206.986209ms at most in 3.064459458s; largest beat gap 222.483375ms
+scheduler reader: thread_basic_info run_state, no wait time kept; asked once a beat: runnable 24, blocked 0, unread 0; run-queue wait first None ns, last None ns
+run 2 reader 0 rule 0 liveness 0
+starved shard: 6 spinners, its CPU clock stood still for 82.628333ms at most in 3.047401417s; largest beat gap 166.05525ms
+scheduler reader: thread_basic_info run_state, no wait time kept; asked once a beat: runnable 23, blocked 0, unread 0; run-queue wait first None ns, last None ns
+run 3 reader 0 rule 0 liveness 0
+starved shard: 6 spinners, its CPU clock stood still for 293.588125ms at most in 3.011228292s; largest beat gap 230.291667ms
+scheduler reader: thread_basic_info run_state, no wait time kept; asked once a beat: runnable 23, blocked 0, unread 0; run-queue wait first None ns, last None ns
+run 4 reader 0 rule 0 liveness 0
+starved shard: 6 spinners, its CPU clock stood still for 98.372417ms at most in 3.013630625s; largest beat gap 200.4305ms
+scheduler reader: thread_basic_info run_state, no wait time kept; asked once a beat: runnable 23, blocked 0, unread 0; run-queue wait first None ns, last None ns
+run 5 reader 0 rule 0 liveness 0
+starved shard: 6 spinners, its CPU clock stood still for 905.006917ms at most in 3.0191805s; largest beat gap 229.660042ms
+scheduler reader: thread_basic_info run_state, no wait time kept; asked once a beat: runnable 21, blocked 0, unread 0; run-queue wait first None ns, last None ns
+run 6 reader 0 rule 0 liveness 0
+starved shard: 6 spinners, its CPU clock stood still for 1.465353209s at most in 3.053183292s; largest beat gap 232.879916ms
+scheduler reader: thread_basic_info run_state, no wait time kept; asked once a beat: runnable 24, blocked 0, unread 0; run-queue wait first None ns, last None ns
+run 7 reader 0 rule 0 liveness 0
+starved shard: 6 spinners, its CPU clock stood still for 96.693458ms at most in 3.036249584s; largest beat gap 239.871833ms
+scheduler reader: thread_basic_info run_state, no wait time kept; asked once a beat: runnable 23, blocked 0, unread 0; run-queue wait first None ns, last None ns
+run 8 reader 0 rule 0 liveness 0
+starved shard: 6 spinners, its CPU clock stood still for 118.037417ms at most in 3.026793708s; largest beat gap 193.820375ms
+scheduler reader: thread_basic_info run_state, no wait time kept; asked once a beat: runnable 24, blocked 0, unread 0; run-queue wait first None ns, last None ns
+run 9 reader 0 rule 0 liveness 0
+starved shard: 6 spinners, its CPU clock stood still for 433.235292ms at most in 3.012511208s; largest beat gap 204.711417ms
+scheduler reader: thread_basic_info run_state, no wait time kept; asked once a beat: runnable 24, blocked 0, unread 0; run-queue wait first None ns, last None ns
+run 10 reader 0 rule 0 liveness 0
+starved shard: 6 spinners, its CPU clock stood still for 99.204917ms at most in 3.041275666s; largest beat gap 234.199542ms
+scheduler reader: thread_basic_info run_state, no wait time kept; asked once a beat: runnable 22, blocked 0, unread 0; run-queue wait first None ns, last None ns
