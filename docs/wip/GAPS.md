@@ -740,10 +740,10 @@
 >   is never runnable itself, so it is wedged by this rule. Not measured. Fixtures' shard 1 (S S S R R S S) may be one.
 > - **macOS is proven by replays (limit).** A full window of flat CPU came in 1 of 20 CI runs, so its real-thread test
 >   exercised the reader, and the rule's replays carry the rule there.
-> - **`a_spinning_shard_stops_the_beat` fails at extreme load (open).** It waits 10 s of wall for a window of the shard's
->   CPU: it failed on an 18-CPU Mac at load 185 and 209, and passed 8 of 8 at load 44-105 with this rule and 8 of 8
->   before it, 10 of 10 on CI macOS. The rule does not change the spinning path, but the code before it was not run at
->   load 185 or above, so a difference there is not excluded.
+> - **`a_spinning_shard_stops_the_beat` at extreme load: fixed 2026-11-08 (bug-sweep, eaab0a84).** It waited 10 s of
+>   wall, about one window of the shard's CPU at load 185; it now waits on the shard's own CPU clock for a window, then
+>   on the beat, with a 60-window wall backstop. Old 0 of 3 against new 3 of 3 at load 152-187 on the 18-CPU Mac,
+>   red-checked with the spinning verdict off (the bug record has the figures).
 
 > **`LIVENESS_BUDGET_NS` is still a fixed second (R3 debt, 2026-11-06; follow-on, not A-228).** It is A-228's window and
 > the reply-deadline unit of about 60 files (the client's and the server's deadlines, observations, the scatter's room
