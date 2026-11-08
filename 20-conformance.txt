@@ -8,3 +8,13 @@ conformance: scratch kept at /home/runner/work/slates/slates/target/pair/plain/s
 conformance: wrote target/pair/plain/records/oci-linux.fsstress.json
 conformance: oci-linux × fsstress: RAN(500 operations × 4 processes, seed 1, 2000 logged: passed; 2026-11-08; Ubuntu 24.04.5 LTS)
 conformance: scratch kept at /home/runner/work/slates/slates/target/pair/plain/scratch/oci-linux
+fsstress live exit=0 seconds=105 load=1.42 1.21 0.55
+conformance: wrote target/pair/live/records/native-linux-fuse.fsstress.json
+conformance: native-linux-fuse × fsstress: LIMITED(adapter: a root `mount -t nfs` by the Linux NFS client of the unprivileged daemon's NFSv3 loopback export (the same serving code as macOS); not covered: the daemon's own FUSE mount (`slates mount` on Linux, crates/server/src/fuse.rs): this lane mounts through the NFS adapter; the suites over the FUSE mount run in the Linux container lane (`oci-linux`, `slates mount --shared` with `user_allow_other`); 500 operations × 4 processes, seed 1, 2000 logged: passed; 2026-11-08; Ubuntu 24.04.5 LTS)
+conformance: scratch kept at /home/runner/work/slates/slates/target/pair/live/scratch/native-linux-fuse
+conformance: wrote target/pair/live/records/native-linux-nfs4.fsstress.json
+conformance: native-linux-nfs4 × fsstress: RAN(500 operations × 4 processes, seed 1, 2000 logged: passed; 2026-11-08; Ubuntu 24.04.5 LTS)
+conformance: scratch kept at /home/runner/work/slates/slates/target/pair/live/scratch/native-linux-nfs4
+conformance: wrote target/pair/live/records/oci-linux.fsstress.json
+conformance: oci-linux × fsstress: RAN(500 operations × 4 processes, seed 1, 2000 logged: passed; 2026-11-08; Ubuntu 24.04.5 LTS)
+conformance: scratch kept at /home/runner/work/slates/slates/target/pair/live/scratch/oci-linux
