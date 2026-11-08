@@ -121,6 +121,8 @@ fn report() -> ReplyBody {
           due_ns: 181,
           stated: 191,
         },
+        peers_in_contact: 3,
+        peers_unmeshed: 1,
       },
     }),
   }

@@ -2598,6 +2598,12 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
     "fleet_detector_granularity_ns: {}\n",
     report.fleet.detector_granularity_ns
   ));
+  // The probe mesh as the daemon judges it: the peers it keeps direct contact with, and how many of them are not probed
+  // yet. The mesh is up at zero unmeshed; `fleet_peers_probed` need not reach the member count less one.
+  out.push_str(&format!(
+    "fleet_peers_in_contact: {}\nfleet_peers_unmeshed: {}\n",
+    report.fleet.peers_in_contact, report.fleet.peers_unmeshed
+  ));
   for session in &report.fleet.sessions {
     out.push_str(&format!(
       "fleet_session {}: lent={} cwnd={} srtt_ns={} pto_ns={} spurious_losses={} persistent_collapses={} consumed={} mtu={}\n",

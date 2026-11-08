@@ -33,7 +33,7 @@ fn a_run_after_a_length_change_in_its_file_merges_its_own_bytes() {
     &profile,
     DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS)),
     slates_server::SegmentSource::Create {
-      name: format!("slates-seg-post-state-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "post-state"),
     },
   )
   .unwrap();

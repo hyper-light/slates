@@ -33,7 +33,7 @@
 //! link replaced the session meanwhile, the forward is answered as unanswered, as a forward cut off by its session's
 //! loss always was, and the caller's refusal and retry path takes it from there.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::task::{Poll, Waker};
 
 use slates_cluster::BatchReplies;
@@ -81,16 +81,23 @@ struct Ticket {
   stage: Stage,
   /// When it last made progress: queued, begun, or bytes of its own reply read while it was open.
   progress_ns: u64,
-  /// The bytes of its reply read when its progress was last marked ([`mark_progress`]).
-  reply_bytes: usize,
 }
 
 /// One peer's forwards.
 #[derive(Default)]
 struct Lane {
-  /// Forwards waiting to be begun, in the order they were queued.
-  queued: VecDeque<u64>,
+  /// Forwards waiting to be begun, in the order they were queued (ticket ids rise as they are issued). A set, so a
+  /// forwarder leaving takes its own out at log cost: a scan of the queue on each leave was quadratic in a burst.
+  queued: BTreeSet<u64>,
   tickets: BTreeMap<u64, Ticket>,
+  /// The open forwards by their exchange on the session they were begun on ([`Lane::open_on`]): a turn takes only
+  /// the replies that completed and marks only the exchanges that read bytes, as the session reports them
+  /// (`Endpoint::take_completed`, `take_progressed`), never asking every open forward. Asking every one, a drain of
+  /// the session each, held the client node's control shard 1.09 s in one poll with about 20,000 forwards open
+  /// (the f = 1 primary-kill rung, 2026-11-08, 6 of 6 runs; the watchdog withheld its beat and the anchor killed it).
+  open: BTreeMap<u64, u64>,
+  /// The session the open forwards were begun on.
+  open_on: Option<ConnectionId>,
   /// Exchanges whose forwarders gave up while they were open, to abandon on the next turn, with their session.
   abandon: Vec<(u64, ConnectionId)>,
   /// Whether a forwarder is driving the lane now.
@@ -156,10 +163,9 @@ fn enqueue(peer: HostId, requests: &[Vec<u8>]) -> Option<(u64, Vec<u64>)> {
           request: request.clone(),
           stage: Stage::Queued,
           progress_ns: now,
-          reply_bytes: 0,
         },
       );
-      lane.queued.push_back(*ticket);
+      lane.queued.insert(*ticket);
     }
     if let Some(driver) = lane.driver.take() {
       driver.wake();
@@ -214,17 +220,16 @@ fn leave(peer: HostId, forwarder: u64, tickets: &[u64], was_driving: bool) {
       return;
     };
     for ticket in tickets {
+      lane.queued.remove(ticket);
       if let Some(Ticket {
         stage: Stage::Open { exchange, session },
         ..
       }) = lane.tickets.remove(ticket)
       {
+        lane.open.remove(&exchange);
         lane.abandon.push((exchange, session));
       }
     }
-    lane
-      .queued
-      .retain(|ticket| lane.tickets.contains_key(ticket));
     lane.waiters.remove(&forwarder);
     if was_driving {
       lane.driving = false;
@@ -498,16 +503,18 @@ async fn drive_or_queued(peer: HostId, endpoint: &mut Endpoint) -> Result<(), En
 }
 
 /// Settles `peer`'s lane against the borrowed session: abandons what forwarders gave up, answers unanswered every
-/// forward begun on a session since replaced, begins every queued forward the session's stream credit admits, and
-/// takes every reply that has arrived, waking its forwarder. Whether any reply was taken.
+/// forward begun on a session since replaced, takes the replies that completed, begins every queued forward the
+/// session's stream credit admits, and wakes the forwarders answered. Its cost is what changed (replies completed,
+/// forwards begun), not the forwards held. Whether any reply was taken.
 fn settle(peer: HostId, endpoint: &mut Endpoint, session: Option<ConnectionId>) -> bool {
   let counts = state::with_state(|s| {
     let lane = s.forward_lanes.lanes.get_mut(&peer)?;
     abandon_given_up(lane, endpoint, session);
-    let replaced = answer_open(lane, endpoint, session);
-    let begun = session.map_or(0, |on| begin_queued(lane, endpoint, on));
-    let (any, woken) = wake_answered(lane);
-    Some((any, replaced, begun, woken))
+    let mut answered = Answered::default();
+    let replaced = answer_open(lane, endpoint, session, &mut answered);
+    let begun = session.map_or(0, |on| begin_queued(lane, endpoint, on, &mut answered));
+    let woken = wake_answered(lane, &answered.forwarders);
+    Some((answered.any_reply, replaced, begun, woken))
   })
   .flatten();
   let Some((any, replaced, begun, woken)) = counts else {
@@ -521,6 +528,13 @@ fn settle(peer: HostId, endpoint: &mut Endpoint, session: Option<ConnectionId>) 
   any
 }
 
+/// The forwards one settle answered: their forwarders, to wake, and whether any was a reply.
+#[derive(Default)]
+struct Answered {
+  forwarders: Vec<u64>,
+  any_reply: bool,
+}
+
 /// Abandons, on the session they were begun on, the exchanges whose forwarders gave up.
 fn abandon_given_up(lane: &mut Lane, endpoint: &mut Endpoint, session: Option<ConnectionId>) {
   for (exchange, on) in std::mem::take(&mut lane.abandon) {
@@ -530,25 +544,39 @@ fn abandon_given_up(lane: &mut Lane, endpoint: &mut Endpoint, session: Option<Co
   }
 }
 
-/// Takes each open forward's reply if it has arrived; a forward begun on a session since replaced is answered
-/// unanswered. How many were replaced.
-fn answer_open(lane: &mut Lane, endpoint: &mut Endpoint, session: Option<ConnectionId>) -> u64 {
+/// Takes the replies of the open forwards that completed; every forward open on a session since replaced is answered
+/// unanswered, once, when the replacement is first seen. How many were replaced.
+fn answer_open(
+  lane: &mut Lane,
+  endpoint: &mut Endpoint,
+  session: Option<ConnectionId>,
+  answered: &mut Answered,
+) -> u64 {
   let now = futures::now_ns();
   let mut replaced = 0u64;
-  for ticket in lane.tickets.values_mut() {
-    let Stage::Open {
-      exchange,
-      session: on,
-    } = ticket.stage
-    else {
+  if lane.open_on != session {
+    for ticket in std::mem::take(&mut lane.open).into_values() {
+      if let Some(entry) = lane.tickets.get_mut(&ticket) {
+        entry.stage = Stage::Done(None);
+        answered.forwarders.push(entry.forwarder);
+        replaced = replaced.saturating_add(1);
+      }
+    }
+    lane.open_on = session;
+  }
+  for exchange in endpoint.take_completed() {
+    let Some(ticket) = lane.open.get(&exchange).copied() else {
+      continue; // Another borrower's exchange on the shared session.
+    };
+    let Some(reply) = endpoint.take_reply(exchange) else {
       continue;
     };
-    if Some(on) != session {
-      ticket.stage = Stage::Done(None);
-      replaced = replaced.saturating_add(1);
-    } else if let Some(reply) = endpoint.take_reply(exchange) {
-      ticket.stage = Stage::Done(Some(reply));
-      ticket.progress_ns = now;
+    lane.open.remove(&exchange);
+    if let Some(entry) = lane.tickets.get_mut(&ticket) {
+      entry.stage = Stage::Done(Some(reply));
+      entry.progress_ns = now;
+      answered.forwarders.push(entry.forwarder);
+      answered.any_reply = true;
     }
   }
   replaced
@@ -557,12 +585,17 @@ fn answer_open(lane: &mut Lane, endpoint: &mut Endpoint, session: Option<Connect
 /// Begins queued forwards on session `on`, in order, while its stream credit admits them (a refusal past the credit,
 /// `Backlogged`, leaves the rest queued for a stream to free; any other refusal answers that forward unanswered).
 /// How many were begun.
-fn begin_queued(lane: &mut Lane, endpoint: &mut Endpoint, on: ConnectionId) -> u64 {
+fn begin_queued(
+  lane: &mut Lane,
+  endpoint: &mut Endpoint,
+  on: ConnectionId,
+  answered: &mut Answered,
+) -> u64 {
   let now = futures::now_ns();
   let mut begun = 0u64;
-  while let Some(ticket) = lane.queued.front().copied() {
+  while let Some(ticket) = lane.queued.first().copied() {
     let Some(entry) = lane.tickets.get_mut(&ticket) else {
-      lane.queued.pop_front();
+      lane.queued.remove(&ticket);
       continue;
     };
     match endpoint.begin(
@@ -576,74 +609,57 @@ fn begin_queued(lane: &mut Lane, endpoint: &mut Endpoint, on: ConnectionId) -> u
           session: on,
         };
         entry.progress_ns = now;
+        lane.open.insert(exchange, ticket);
         begun = begun.saturating_add(1);
       }
       Err(EndpointError::Stream(slates_transport::streams::StreamRefusal::Backlogged {
         ..
       })) => break,
-      Err(_) => entry.stage = Stage::Done(None),
+      Err(_) => {
+        entry.stage = Stage::Done(None);
+        answered.forwarders.push(entry.forwarder);
+      }
     }
-    lane.queued.pop_front();
+    lane.queued.remove(&ticket);
   }
   begun
 }
 
-/// Wakes every waiting forwarder with a forward answered: whether any reply was taken, and how many were woken.
-fn wake_answered(lane: &mut Lane) -> (bool, u64) {
-  let mut any = false;
-  let mut answered = Vec::new();
-  for ticket in lane.tickets.values() {
-    if let Stage::Done(reply) = &ticket.stage {
-      any |= reply.is_some();
-      answered.push(ticket.forwarder);
-    }
-  }
+/// Wakes the waiting forwarders this settle answered: how many were woken. A forwarder looks at its tickets and
+/// registers its wait in one poll, so one answered before it waited sees its answer without a wake.
+fn wake_answered(lane: &mut Lane, forwarders: &[u64]) -> u64 {
   let mut woken = 0u64;
-  for forwarder in answered {
-    if let Some(waker) = lane.waiters.remove(&forwarder) {
+  for forwarder in forwarders {
+    if let Some(waker) = lane.waiters.remove(forwarder) {
       woken = woken.saturating_add(1);
       waker.wake();
     }
   }
-  (any, woken)
+  woken
 }
 
-/// Marks each forward open on `session` whose own reply has more bytes read than when it was last marked as having made
-/// progress now. Bytes the session consumed for other exchanges are not this forward's progress.
+/// Marks each open forward whose own reply read bytes since the last turn as having made progress now, as the
+/// session reports them (`Endpoint::take_progressed`). Bytes the session consumed for other exchanges are not this
+/// forward's progress.
 fn mark_progress(peer: HostId, endpoint: &mut Endpoint, session: Option<ConnectionId>) {
   let now = futures::now_ns();
   let _ = state::with_state(|s| {
-    if let Some(lane) = s.forward_lanes.lanes.get_mut(&peer) {
-      for ticket in lane.tickets.values_mut() {
-        mark_ticket_progress(ticket, endpoint, session, now);
+    let Some(lane) = s.forward_lanes.lanes.get_mut(&peer) else {
+      return;
+    };
+    if lane.open_on != session {
+      return;
+    }
+    for exchange in endpoint.take_progressed() {
+      if let Some(entry) = lane
+        .open
+        .get(&exchange)
+        .and_then(|ticket| lane.tickets.get_mut(ticket))
+      {
+        entry.progress_ns = now;
       }
     }
   });
-}
-
-/// Marks `ticket` as having made progress at `now` when it is open on `session` and its own reply has more bytes read
-/// than when last marked ([`mark_progress`]).
-fn mark_ticket_progress(
-  ticket: &mut Ticket,
-  endpoint: &mut Endpoint,
-  session: Option<ConnectionId>,
-  now: u64,
-) {
-  let Stage::Open {
-    exchange,
-    session: on,
-  } = ticket.stage
-  else {
-    return;
-  };
-  if Some(on) != session {
-    return;
-  }
-  let read = endpoint.reply_bytes_read(exchange).unwrap_or(0);
-  if read > ticket.reply_bytes {
-    ticket.reply_bytes = read;
-    ticket.progress_ns = now;
-  }
 }
 
 /// What a peer's serve loop takes next ([`next_request_or_forwarded`]).

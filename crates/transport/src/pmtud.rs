@@ -13,9 +13,20 @@
 //! 36 lost probes per raise on a floor path, and each lost probe leaves a gap the peer reports as an extra
 //! ACK range; on a 64 kbit/s link that raised the ping p99 22 % (measured 2026-09-28, `congestion_bench`).
 //!
-//! Black holes (RFC 8899 §4.3): a path whose MTU shrank drops every packet above its new size, silently.
-//! [`BLACK_HOLE_LOSSES`] consecutive losses of packets above the floor, with no such packet acknowledged in
-//! between, fall the session back to the floor and search again, the lost size bounding the search.
+//! Black holes (RFC 8899 §4.3): a path whose MTU shrank drops every packet above its new size, silently. A
+//! black hole is "excessive loss of data sent with a specific packet size" (§4.3), never loss every size
+//! suffers, which is congestion the controller alone answers (§3 item 4 asks the same of a probe "lost due to other
+//! reasons (including link transmission error, congestion)"). So loss only makes the size suspect:
+//! [`BLACK_HOLE_LOSSES`] in a row, with none acknowledged between, of packets above the floor declared lost or
+//! probe timeouts with one in flight (nothing at all acknowledged: a peer stopped, or the path dead, at every
+//! size). A suspect session sends at the floor, so packets that cross keep the acknowledgements, and loss
+//! detection, running, and probes at the size it had: one acknowledged, or any packet above the floor, and the
+//! size stands; [`MAX_PROBES`] of them declared lost while the floor's packets cross (§5.2: "If MAX_PROBES
+//! successive PLPMTUD-sized probes fail to be acknowledged, the method enters the BASE state") is the black
+//! hole, and the session falls to the floor and searches again below the size that stopped crossing. A peer
+//! that answers nothing declares no probe lost, so it never makes one. Until 2026-11-08 the losses (and each
+//! probe timeout, counted as a loss of one) fell the session at once: a SIGSTOPped peer, or a burst a full
+//! receive buffer dropped, left a session at the floor on loopback (live-durability, diag-live-durability-42/43).
 //!
 //! This module is sans-io and clock-injected, like the connection that drives it: it says which size to
 //! probe next and folds in what became of each probe. Loss of a probe is never a congestion signal (RFC
@@ -38,7 +49,7 @@ pub const RAISE_TIMER_NS: u64 = 600_000_000_000;
 /// overhead in stream data per packet.
 pub const SEARCH_GRANULARITY: usize = crate::endpoint::PACKET_OVERHEAD_BYTES;
 /// Derived: [`MAX_PROBES`] — the losses of above-floor packets in a row, with none acknowledged between,
-/// that declare a black hole: the same evidence a probe needs before its size is judged too large.
+/// that make the size suspect (the confirming probes then decide): the same count a probe's size is judged by.
 pub const BLACK_HOLE_LOSSES: u32 = MAX_PROBES;
 
 /// The probe in flight: its packet number, its size, and how many probes of that size were lost before it.
@@ -46,6 +57,8 @@ pub const BLACK_HOLE_LOSSES: u32 = MAX_PROBES;
 struct Probe {
   pn: u64,
   size: usize,
+  /// Whether it confirms a suspect size (at the confirmed size) rather than searching above it.
+  confirming: bool,
 }
 
 /// Counted over a session's life: the evidence the tests and the status read.
@@ -88,6 +101,9 @@ pub struct PathMtu {
   recheck: Option<usize>,
   /// Consecutive losses of above-floor packets with none acknowledged between.
   large_losses: u32,
+  /// While the confirmed size is suspect: how many probes at it were declared lost since. The session sends
+  /// at the floor meanwhile; `None` when the size is not in doubt.
+  suspect: Option<u32>,
   stats: PathMtuStats,
 }
 
@@ -106,13 +122,23 @@ impl PathMtu {
       raise_at: None,
       recheck: None,
       large_losses: 0,
+      suspect: None,
       stats: PathMtuStats::default(),
     }
   }
 
-  /// The largest datagram the session sends now.
+  /// The largest datagram the session sends now: the confirmed size, or the floor while that size is suspect.
   pub fn current(&self) -> usize {
-    self.confirmed
+    if self.suspect.is_some() {
+      BASE_PLPMTU
+    } else {
+      self.confirmed
+    }
+  }
+
+  /// Whether the confirmed size is suspect, its confirming probes still deciding.
+  pub fn suspect(&self) -> bool {
+    self.suspect.is_some()
   }
 
   /// What the search has counted.
@@ -131,6 +157,10 @@ impl PathMtu {
   pub fn next_probe(&mut self, now: u64) -> Option<usize> {
     if self.probe.is_some() {
       return None;
+    }
+    // A suspect size is confirmed before anything is searched: a probe at it.
+    if self.suspect.is_some() {
+      return Some(self.confirmed);
     }
     if let Some(size) = self.recheck {
       return Some(size);
@@ -168,8 +198,13 @@ impl PathMtu {
 
   /// A probe of `size` bytes went out as packet `pn`.
   pub fn on_probe_sent(&mut self, pn: u64, size: usize) {
-    self.probe = Some(Probe { pn, size });
-    if !matches!(self.attempts, Some((attempted, _)) if attempted == size) {
+    let confirming = self.suspect.is_some() && size == self.confirmed;
+    self.probe = Some(Probe {
+      pn,
+      size,
+      confirming,
+    });
+    if !confirming && !matches!(self.attempts, Some((attempted, _)) if attempted == size) {
       self.attempts = Some((size, 0));
     }
     self.stats.probes_sent = self.stats.probes_sent.saturating_add(1);
@@ -192,8 +227,13 @@ impl PathMtu {
       return false;
     };
     self.probe = None;
-    self.attempts = None;
     self.stats.probes_acked = self.stats.probes_acked.saturating_add(1);
+    if probe.confirming {
+      // The suspect size still crosses: what was lost was not about size. The session sends at it again.
+      self.large_losses = 0;
+      return self.suspect.take().is_some();
+    }
+    self.attempts = None;
     let grew = probe.size > self.confirmed;
     if grew {
       self.confirmed = probe.size;
@@ -210,13 +250,34 @@ impl PathMtu {
   }
 
   /// The probe `pn` was declared lost at `now`. After [`MAX_PROBES`] losses of its size, the size bounds
-  /// the search from above.
+  /// the search from above; a suspect size's [`MAX_PROBES`]th lost confirming probe is a black hole.
   pub fn on_probe_lost(&mut self, pn: u64, now: u64) {
     let Some(probe) = self.probe.filter(|probe| probe.pn == pn) else {
       return;
     };
     self.probe = None;
     self.stats.probes_lost = self.stats.probes_lost.saturating_add(1);
+    if probe.confirming {
+      let Some(lost) = self.suspect.map(|lost| lost.saturating_add(1)) else {
+        return;
+      };
+      if lost < MAX_PROBES {
+        self.suspect = Some(lost);
+        return;
+      }
+      // Probes at the size declared lost while the floor's packets crossed (or nothing would have declared
+      // them lost): the path no longer carries it.
+      self.too_large = self.confirmed;
+      self.confirmed = BASE_PLPMTU;
+      self.suspect = None;
+      self.large_losses = 0;
+      self.attempts = None;
+      self.raise_at = None;
+      self.recheck = None;
+      self.stats.black_holes = self.stats.black_holes.saturating_add(1);
+      self.arm_raise_if_done(now);
+      return;
+    }
     let lost = match self.attempts {
       Some((size, lost)) if size == probe.size => lost.saturating_add(1),
       _ => 1,
@@ -246,30 +307,41 @@ impl PathMtu {
     self.arm_raise_if_done(now);
   }
 
-  /// A packet above the floor (not a probe) was acknowledged: the path carries the confirmed size.
-  pub fn on_large_packet_acked(&mut self) {
+  /// A packet above the floor (not a probe) was acknowledged: the path carries the confirmed size, and a
+  /// suspect one stands. `true` when the size the session sends grew back to it.
+  pub fn on_large_packet_acked(&mut self) -> bool {
     self.large_losses = 0;
+    self.suspect.take().is_some()
   }
 
-  /// A packet above the floor (not a probe) was declared lost at `now`. `true` when this makes a black
-  /// hole — the session falls back to the floor and searches again below the size that stopped crossing.
-  pub fn on_large_packet_lost(&mut self, now: u64) -> bool {
-    if self.confirmed <= BASE_PLPMTU {
+  /// A packet above the floor (not a probe) was declared lost. `true` when this makes the size suspect: the
+  /// session sends at the floor while probes at the size decide ([`PathMtu::on_probe_lost`]). Loss alone never
+  /// falls it: every size is lost to congestion too.
+  pub fn on_large_packet_lost(&mut self) -> bool {
+    self.note_large_evidence()
+  }
+
+  /// A probe timeout fired with a packet above the floor in flight and nothing acknowledged since. `true` when
+  /// this makes the size suspect, as [`PathMtu::on_large_packet_lost`], on the same count: after a path shrinks no
+  /// acknowledgement comes to declare any full-size packet lost, so the timeouts must start the confirmation, and
+  /// one spurious timeout must not send a session at the floor. It is no evidence of size (a stopped peer
+  /// acknowledges nothing at any size), so it counts toward no black hole: only failed probes make one.
+  pub fn on_silence(&mut self) -> bool {
+    self.note_large_evidence()
+  }
+
+  /// One more above-floor packet lost or timed out with none acknowledged between; [`BLACK_HOLE_LOSSES`] in a row
+  /// make the size suspect. `true` when this one did.
+  fn note_large_evidence(&mut self) -> bool {
+    if self.confirmed <= BASE_PLPMTU || self.suspect.is_some() {
       return false;
     }
     self.large_losses = self.large_losses.saturating_add(1);
     if self.large_losses < BLACK_HOLE_LOSSES {
       return false;
     }
-    self.too_large = self.confirmed;
-    self.confirmed = BASE_PLPMTU;
     self.large_losses = 0;
-    self.probe = None;
-    self.attempts = None;
-    self.raise_at = None;
-    self.recheck = None;
-    self.stats.black_holes = self.stats.black_holes.saturating_add(1);
-    self.arm_raise_if_done(now);
+    self.suspect = Some(0);
     true
   }
 
@@ -392,11 +464,8 @@ mod tests {
     assert_eq!(pmtu.stats().probes_lost, u64::from(MAX_PROBES));
   }
 
-  /// RFC 8899 §4.3: after the path's MTU shrinks, `BLACK_HOLE_LOSSES` consecutive losses of above-floor
-  /// packets fall the session to the floor, and the new search converges below the size that stopped
-  /// crossing; an acknowledgement between losses resets the count.
-  #[test]
-  fn a_black_hole_falls_back_to_the_floor_and_searches_again() {
+  /// A session converged on a 9,000-byte path, for the black-hole cases.
+  fn converged_on_jumbo() -> PathMtu {
     let mut pmtu = PathMtu::new(9_000);
     converge(
       &mut pmtu,
@@ -407,17 +476,57 @@ mod tests {
       0,
     );
     assert!(pmtu.current() > 8_900);
-    assert!(!pmtu.on_large_packet_lost(1));
-    pmtu.on_large_packet_acked();
-    for loss in 1..BLACK_HOLE_LOSSES {
-      assert!(!pmtu.on_large_packet_lost(u64::from(loss)), "not yet");
+    pmtu
+  }
+
+  /// Loses above-floor packets until the size is suspect: one loss, an acknowledgement (which resets the count),
+  /// then `BLACK_HOLE_LOSSES` in a row — suspect at the last, sent at the floor, no black hole counted.
+  fn lose_until_suspect(pmtu: &mut PathMtu) {
+    assert!(!pmtu.on_large_packet_lost());
+    assert!(!pmtu.on_large_packet_acked());
+    for _ in 1..BLACK_HOLE_LOSSES {
+      assert!(!pmtu.on_large_packet_lost(), "not yet");
     }
     assert!(
-      pmtu.on_large_packet_lost(5),
-      "the third consecutive loss is a black hole"
+      pmtu.on_large_packet_lost(),
+      "the third consecutive loss makes the size suspect"
     );
+    assert!(pmtu.suspect());
+    assert_eq!(
+      pmtu.current(),
+      BASE_PLPMTU,
+      "a suspect size is sent at the floor"
+    );
+    assert_eq!(pmtu.stats().black_holes, 0, "loss alone is no black hole");
+  }
+
+  /// Loses `MAX_PROBES` probes at the suspect `size` in a row: the black hole is counted at the last, not before.
+  fn lose_confirming_probes(pmtu: &mut PathMtu, size: usize) {
+    for (attempt, pn) in (1..=MAX_PROBES).zip(100_u64..) {
+      assert_eq!(pmtu.next_probe(5), Some(size), "the suspect size is probed");
+      pmtu.on_probe_sent(pn, size);
+      pmtu.on_probe_lost(pn, 5);
+      let fell = attempt == MAX_PROBES;
+      assert_eq!(
+        pmtu.stats().black_holes,
+        u64::from(fell),
+        "attempt {attempt}"
+      );
+    }
+  }
+
+  /// RFC 8899 §4.3 and §5.2: after the path's MTU shrinks, `BLACK_HOLE_LOSSES` consecutive losses of above-floor
+  /// packets make the size suspect — sent at the floor, the size kept, no black hole yet — and an acknowledgement
+  /// between losses resets the count; `MAX_PROBES` lost probes at the size are the black hole, and the new search
+  /// converges below the size that stopped crossing.
+  #[test]
+  fn a_black_hole_falls_back_to_the_floor_once_probes_at_its_size_fail() {
+    let mut pmtu = converged_on_jumbo();
+    let size = pmtu.current();
+    lose_until_suspect(&mut pmtu);
+    lose_confirming_probes(&mut pmtu, size);
+    assert!(!pmtu.suspect());
     assert_eq!(pmtu.current(), BASE_PLPMTU);
-    assert_eq!(pmtu.stats().black_holes, 1);
     converge(
       &mut pmtu,
       Path {
@@ -427,6 +536,53 @@ mod tests {
       5,
     );
     assert!(pmtu.current() <= 1_500 && 1_500 - pmtu.current() <= SEARCH_GRANULARITY);
+  }
+
+  /// Times out until the size is suspect: the third in a row, and nothing more after it.
+  fn time_out_until_suspect(pmtu: &mut PathMtu, size: usize) {
+    for _ in 1..BLACK_HOLE_LOSSES {
+      assert!(
+        !pmtu.on_silence(),
+        "one spurious timeout leaves the size standing"
+      );
+      assert_eq!(pmtu.current(), size);
+    }
+    assert!(pmtu.on_silence(), "the third in a row makes it suspect");
+    for _ in 0..8 {
+      assert!(!pmtu.on_silence(), "already suspect: nothing more");
+    }
+  }
+
+  /// RFC 8899 §4.3 and §3 item 4: a probe timeout with nothing acknowledged (a stopped peer) only makes the size
+  /// suspect, and the size stands the moment a probe at it is acknowledged; no black hole is counted, however
+  /// many timeouts fire before.
+  #[test]
+  fn silence_makes_the_size_suspect_and_one_acknowledged_probe_restores_it() {
+    let mut pmtu = converged_on_jumbo();
+    let size = pmtu.current();
+    time_out_until_suspect(&mut pmtu, size);
+    assert_eq!(pmtu.current(), BASE_PLPMTU);
+    assert_eq!(pmtu.next_probe(1), Some(size));
+    pmtu.on_probe_sent(7, size);
+    assert!(
+      pmtu.on_probe_acked(7, 1),
+      "the size the session sends grew back"
+    );
+    assert_eq!((pmtu.current(), pmtu.stats().black_holes), (size, 0));
+  }
+
+  /// RFC 8899 §3 item 4 (robust to congestion): a suspect size is restored when an above-floor packet sent before
+  /// the suspicion is acknowledged after it, with no probe lost against it.
+  #[test]
+  fn an_acknowledged_full_size_packet_clears_a_suspect_size() {
+    let mut pmtu = converged_on_jumbo();
+    let size = pmtu.current();
+    for _ in 0..BLACK_HOLE_LOSSES {
+      pmtu.on_large_packet_lost();
+    }
+    assert!(pmtu.suspect());
+    assert!(pmtu.on_large_packet_acked());
+    assert_eq!((pmtu.current(), pmtu.stats().black_holes), (size, 0));
   }
 
   /// RFC 8899 §5.1.1: a converged search waits `RAISE_TIMER_NS`, then searches again up to the peer's limit

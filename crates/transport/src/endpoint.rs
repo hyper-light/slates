@@ -137,6 +137,27 @@ const MAX_PARTIAL_FRAGMENTS_PER_TURN: usize =
 /// round trip, so a handful of silent timeouts is conclusive; the exact value is not performance-tuned.
 const HANDSHAKE_CONFIRM_SILENCE: u32 = 3;
 
+/// Why a handshake's `establish` gave up with [`EndpointError::NotReady`]: which of its bounds it reached (banned item 8:
+/// every wait in it is bounded). The kinds are what a caller counts, so a handshake that keeps failing says which bound
+/// is spending it: a peer that stays silent, or one that keeps asking and never gets further.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandshakeStall {
+  /// The peer's next flight never came, through every retransmit this end is allowed.
+  Silence,
+  /// The peer kept resending a flight this end had already taken, past the retransmit bound, without moving on.
+  Repeats,
+  /// Datagrams that never made a whole flight (fragments that stayed incomplete, or strays), past their bound.
+  Fragments,
+  /// The handshake took more turns than a TLS handshake's flights can.
+  TurnCeiling,
+  /// The two ends' last confirmation did not land within its absolute deadline.
+  ConfirmDeadline,
+  /// Confirmation retransmits ran out with the peer silent.
+  ConfirmSilence,
+  /// Confirmation met more invalid datagrams than its bound allows.
+  ConfirmGarbage,
+}
+
 /// A refusal on the endpoint.
 #[derive(Debug)]
 pub enum EndpointError {
@@ -463,6 +484,8 @@ pub struct Endpoint {
   /// Handshake budgets spent without establishing (`establish` calls that ended `NotReady`); reset to zero
   /// on establishment.
   handshake_budgets_spent: u32,
+  /// Why the last `establish` ended `NotReady`; `None` before any did, and once one succeeds.
+  handshake_stall: Option<HandshakeStall>,
   /// Datagrams an established session discarded rather than folded — a raw handshake retransmit, a
   /// packet naming another session, one that did not open under the keys (RFC 9000 §12.2: an
   /// undecryptable packet is discarded, never fatal). A counter, so a test can assert the discard path
@@ -492,6 +515,10 @@ pub struct Endpoint {
   /// many exchanges open asks only after these instead of probing every one each turn (a fetch with ~340 chunk
   /// requests open on a session spent its time doing that, 2026-10-05).
   completed: std::collections::BTreeSet<u64>,
+  /// This end's exchanges whose replies read more bytes since [`Endpoint::take_progressed`] last took them: a caller
+  /// judging many open exchanges' progress asks after these alone, as [`Endpoint::take_completed`] does for
+  /// completions. Both sets lose an exchange when it is taken or abandoned, so they hold only open exchanges.
+  progressed: std::collections::BTreeSet<u64>,
   /// Refused receives on this end's own socket that its receive read past, by kind ([`Endpoint::receive_refusals`]);
   /// a socket gone is the one refusal that ends a receive.
   receive_refused: crate::receive::ReceiveRefusals,
@@ -544,6 +571,7 @@ impl Endpoint {
       fragments_sent: 0,
       hs_sent: 0,
       handshake_budgets_spent: 0,
+      handshake_stall: None,
       discarded: 0,
       exchanges: BTreeMap::new(),
       by_stream: BTreeMap::new(),
@@ -552,6 +580,7 @@ impl Endpoint {
       arriving: BTreeMap::new(),
       ready: BTreeMap::new(),
       completed: std::collections::BTreeSet::new(),
+      progressed: std::collections::BTreeSet::new(),
       receive_refused: crate::receive::ReceiveRefusals::default(),
     })
   }
@@ -591,6 +620,7 @@ impl Endpoint {
       fragments_sent: 0,
       hs_sent: 0,
       handshake_budgets_spent: 0,
+      handshake_stall: None,
       discarded: 0,
       exchanges: BTreeMap::new(),
       by_stream: BTreeMap::new(),
@@ -599,6 +629,7 @@ impl Endpoint {
       arriving: BTreeMap::new(),
       ready: BTreeMap::new(),
       completed: std::collections::BTreeSet::new(),
+      progressed: std::collections::BTreeSet::new(),
       receive_refused: crate::receive::ReceiveRefusals::default(),
     })
   }
@@ -640,6 +671,7 @@ impl Endpoint {
       fragments_sent: 0,
       hs_sent: 0,
       handshake_budgets_spent: 0,
+      handshake_stall: None,
       discarded: 0,
       exchanges: BTreeMap::new(),
       by_stream: BTreeMap::new(),
@@ -648,6 +680,7 @@ impl Endpoint {
       arriving: BTreeMap::new(),
       ready: BTreeMap::new(),
       completed: std::collections::BTreeSet::new(),
+      progressed: std::collections::BTreeSet::new(),
       receive_refused: crate::receive::ReceiveRefusals::default(),
     })
   }
@@ -827,7 +860,10 @@ impl Endpoint {
     let mut last_flight = std::mem::take(&mut self.pending_flight);
     let outcome = self.establish_turns(&mut last_flight).await;
     match &outcome {
-      Ok(()) => self.handshake_budgets_spent = 0,
+      Ok(()) => {
+        self.handshake_budgets_spent = 0;
+        self.handshake_stall = None;
+      }
       Err(EndpointError::NotReady) => {
         self.pending_flight = last_flight;
         self.handshake_budgets_spent = self.handshake_budgets_spent.saturating_add(1);
@@ -835,6 +871,17 @@ impl Endpoint {
       Err(_) => {}
     }
     outcome
+  }
+
+  /// Why the last `establish` ended `NotReady`, for a caller to count: `None` before any did, and once one succeeds.
+  pub fn handshake_stall(&self) -> Option<HandshakeStall> {
+    self.handshake_stall
+  }
+
+  /// Records why this handshake is giving up, and the typed refusal that says so.
+  fn stalled(&mut self, why: HandshakeStall) -> EndpointError {
+    self.handshake_stall = Some(why);
+    EndpointError::NotReady
   }
 
   /// How many handshake budgets this end has spent without establishing: zero once established, one more
@@ -912,7 +959,7 @@ impl Endpoint {
       // rather than being fed to `read_hs` a second time.
       self.quic.read_hs(&received)?;
     }
-    Err(EndpointError::NotReady)
+    Err(self.stalled(HandshakeStall::TurnCeiling))
   }
 
   /// One turn's receive: the peer's next whole flight, rebuilt from its fragments, retransmitting this
@@ -944,7 +991,7 @@ impl Endpoint {
           crate::flight::Reassembly::Pending => {
             partial = partial.saturating_add(1);
             if partial > MAX_PARTIAL_FRAGMENTS_PER_TURN {
-              return Err(EndpointError::NotReady);
+              return Err(self.stalled(HandshakeStall::Fragments));
             }
             backoff = GRANULARITY_NS;
             continue;
@@ -955,7 +1002,7 @@ impl Endpoint {
           crate::flight::Reassembly::Repeat => {
             attempts = attempts.saturating_add(1);
             if attempts > MAX_HANDSHAKE_RETRANSMITS {
-              return Err(EndpointError::NotReady);
+              return Err(self.stalled(HandshakeStall::Repeats));
             }
             if !last_flight.is_empty() {
               self.resend_flight(last_flight)?;
@@ -968,7 +1015,7 @@ impl Endpoint {
             self.discarded = self.discarded.saturating_add(1);
             partial = partial.saturating_add(1);
             if partial > MAX_PARTIAL_FRAGMENTS_PER_TURN {
-              return Err(EndpointError::NotReady);
+              return Err(self.stalled(HandshakeStall::Fragments));
             }
             continue;
           }
@@ -976,7 +1023,7 @@ impl Endpoint {
         None => {
           attempts = attempts.saturating_add(1);
           if attempts > MAX_HANDSHAKE_RETRANSMITS {
-            return Err(EndpointError::NotReady);
+            return Err(self.stalled(HandshakeStall::Silence));
           }
           backoff = backoff.saturating_mul(2);
           // A server the demultiplexer opened has no flight until it has read the client's first, so it
@@ -1024,7 +1071,7 @@ impl Endpoint {
     loop {
       let remaining = deadline.saturating_sub(slates_rt::futures::now_ns());
       if remaining == 0 {
-        return Err(EndpointError::NotReady);
+        return Err(self.stalled(HandshakeStall::ConfirmDeadline));
       }
       let period = backoff.min(self.handshake_probe_ceiling()).min(remaining);
       match self.recv_within(period).await? {
@@ -1037,7 +1084,7 @@ impl Endpoint {
           invalid = invalid.saturating_add(1);
           self.discarded = self.discarded.saturating_add(1);
           if invalid > MAX_PARTIAL_FRAGMENTS_PER_TURN {
-            return Err(EndpointError::NotReady);
+            return Err(self.stalled(HandshakeStall::ConfirmGarbage));
           }
           if from != self.peer {
             continue;
@@ -1050,7 +1097,7 @@ impl Endpoint {
         None => {
           retransmits = retransmits.saturating_add(1);
           if retransmits > MAX_HANDSHAKE_RETRANSMITS {
-            return Err(EndpointError::NotReady);
+            return Err(self.stalled(HandshakeStall::ConfirmSilence));
           }
           backoff = backoff.saturating_mul(2);
           self.resend_flight(last_flight)?;
@@ -1085,7 +1132,7 @@ impl Endpoint {
     loop {
       let remaining = deadline.saturating_sub(slates_rt::futures::now_ns());
       if remaining == 0 {
-        return Err(EndpointError::NotReady);
+        return Err(self.stalled(HandshakeStall::ConfirmDeadline));
       }
       let period = backoff.min(self.handshake_probe_ceiling()).min(remaining);
       match self.recv_within(period).await? {
@@ -1100,7 +1147,7 @@ impl Endpoint {
           invalid = invalid.saturating_add(1);
           self.discarded = self.discarded.saturating_add(1);
           if invalid > MAX_PARTIAL_FRAGMENTS_PER_TURN {
-            return Err(EndpointError::NotReady);
+            return Err(self.stalled(HandshakeStall::ConfirmGarbage));
           }
           if from != self.peer {
             continue;
@@ -1628,6 +1675,19 @@ impl Endpoint {
       .collect()
   }
 
+  /// The exchanges whose replies read more bytes since the last call and are still open: what a caller judging each
+  /// open exchange's progress reads instead of asking every one ([`Endpoint::reply_bytes_read`]). The forward lane
+  /// asked every one, each ask a drain of the session, and with about 20,000 forwards open a turn held its shard
+  /// 1.09 s (the f = 1 primary-kill rung, 2026-11-08).
+  pub fn take_progressed(&mut self) -> Vec<u64> {
+    self.drain();
+    let progressed = std::mem::take(&mut self.progressed);
+    progressed
+      .into_iter()
+      .filter(|id| self.exchanges.contains_key(id))
+      .collect()
+  }
+
   /// The reply of exchange `id` if it has arrived whole, taking it (the exchange is then finished and its
   /// receiving half closed); `None` while it is still waiting or arriving, or for an unknown exchange. A
   /// receive stream counts complete only once every byte through its `fin` has been read, so the reply
@@ -1640,6 +1700,8 @@ impl Endpoint {
     }
     let exchange = self.exchanges.remove(&id)?;
     self.by_stream.remove(&stream);
+    self.completed.remove(&id);
+    self.progressed.remove(&id);
     self.conn.close_recv(stream);
     Some(exchange.reply)
   }
@@ -1659,6 +1721,8 @@ impl Endpoint {
     let Some(exchange) = self.exchanges.remove(&id) else {
       return;
     };
+    self.completed.remove(&id);
+    self.progressed.remove(&id);
     match exchange.stream {
       Some(stream) => {
         self.by_stream.remove(&stream);
@@ -1854,9 +1918,12 @@ impl Endpoint {
   /// anything else as a request arriving (a server's); a request that reached its `fin` moves to `ready`
   /// with its receiving half closed. Reading is what slides the flow-control window forward.
   fn drain(&mut self) {
-    let now = now_ns();
+    let readable = self.conn.take_readable();
+    // A drain with nothing readable reads no clock: the callers that ask after one exchange each drain first, and a
+    // clock read a call was a third of a spinning control shard's samples (the forward lane, 2026-11-08).
+    let now = if readable.is_empty() { 0 } else { now_ns() };
     let role = self.conn.role();
-    for id in self.conn.take_readable() {
+    for id in readable {
       let chunk = self.conn.read_stream(now, id);
       if crate::streams::initiator(id) == role {
         // A reply to this end's exchange. One no longer open (taken or abandoned) is already closed at the
@@ -1865,10 +1932,13 @@ impl Endpoint {
         match exchange_id.and_then(|exchange| self.exchanges.get_mut(&exchange)) {
           Some(exchange) => {
             exchange.reply.extend_from_slice(&chunk);
-            if let Some(exchange_id) = exchange_id
-              && self.conn.recv_stream_complete(id)
-            {
-              self.completed.insert(exchange_id);
+            if let Some(exchange_id) = exchange_id {
+              if !chunk.is_empty() {
+                self.progressed.insert(exchange_id);
+              }
+              if self.conn.recv_stream_complete(id) {
+                self.completed.insert(exchange_id);
+              }
             }
           }
           None => self.conn.stop_sending(id),
