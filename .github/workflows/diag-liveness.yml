@@ -1,0 +1,50 @@
+name: diag-liveness-a223-merged-macos
+
+# Diagnostics only, never on main (A-223 window-rule plan, step 1): the merged branch's gates and the machine and rt
+# suites on macos-latest. The result lines go to diag-results/liveness-26-macos-latest, read by git fetch.
+on:
+  push:
+    branches: ["diag-liveness-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  macos:
+    name: A-223 merged (macos-latest)
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: The gates and the suites on the merged branch
+        run: |
+          R=../results.txt
+          echo "runner macos-latest, $(sysctl -n hw.ncpu) CPUs, $(sw_vers -productVersion), $(date -u)" > $R
+          git log -1 --format='head %h %s' | cut -c1-90 | tee -a $R
+          git log -1 --format='first parent %h' HEAD^1 | tee -a $R
+          status=0; cargo fmt --all --check > ../fmt.log 2>&1 || status=$?; head -20 ../fmt.log | cut -c1-200 | tee -a $R; echo "== fmt exit $status" | tee -a $R
+          status=0; cargo xtask check > ../xtask.log 2>&1 || status=$?; tail -5 ../xtask.log | cut -c1-300 | tee -a $R; echo "== xtask check exit $status" | tee -a $R
+          status=0; cargo clippy --locked --workspace --all-targets -- -D warnings > ../clippy.log 2>&1 || status=$?; grep -E '^(error|warning: unused)' ../clippy.log | head -30 | cut -c1-200 | tee -a $R; echo "== clippy workspace exit $status" | tee -a $R
+          status=0; cargo test --locked -p slates-machine -p slates-rt > ../test.log 2>&1 || status=$?
+          grep -E '^test .*FAILED|^test result|panicked' ../test.log | cut -c1-400 | tee -a $R
+          echo "== tests merged exit $status" | tee -a $R
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/liveness-26-macos-latest"
+          git config user.name "diag-liveness"
+          git config user.email "diag-liveness@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-liveness-26 results, macos-latest"
+          git push -q -f origin "HEAD:refs/heads/$branch"
