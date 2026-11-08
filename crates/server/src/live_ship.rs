@@ -1534,6 +1534,12 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
           stale_checkpoint = true;
           continue;
         };
+        // Diag only (live-durability-54, never on main): what an install carries, against the log's head.
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), format!(
+          "LD-SEND wall_ns {} holder {} image_head {} log_head {:?} bytes {} owes_image {} owes_whole {}\n",
+          std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos()),
+          holder.0, head.position, live.shipper.head().map(|h| h.position), payload.len(), live.owes_image, live.owes_whole,
+        ).as_bytes());
         if live
           .shipper
           .held_by(*holder)
