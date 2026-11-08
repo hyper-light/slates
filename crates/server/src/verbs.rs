@@ -6473,12 +6473,16 @@ fn submit(
   // recorded — otherwise a full-chain refusal after an in-memory commit would strand the green ahead
   // of its log, hidden by the engine's idempotent `seen` cache on retry. A full chain refuses every
   // submit (it cannot advance regardless of the verdict).
-  let record = Op::GreenAdvanced {
+  // What the chain will hold is the increment and what its verdict resolves it to (A-257), known only after the verdict,
+  // so the admission charges the most an entry for this increment can be.
+  let increment_bytes = inc.encode();
+  let bound = slates_merge::chain_entry::entry_bound(increment_bytes.len(), &inc);
+  let admission = Op::GreenAdvanced {
     green: green_id,
-    increment: inc.encode(),
+    increment: vec![0; bound],
   };
   let now = state.clock.monotonic_ns();
-  if let Err(refusal) = chain_admits(state, green_id, &record, now) {
+  if let Err(refusal) = chain_admits(state, green_id, &admission, now) {
     return refused(refusal);
   }
   // So is the work's restatement an acceptance records with it (A-207): guard-then-apply, the whole submit is refused
@@ -6508,11 +6512,11 @@ fn submit(
     return refused(Refusal::BudgetExceeded { available });
   }
   let verdict_start = state.clock.monotonic_ns();
-  let outcome = {
+  let (outcome, applied) = {
     let Some(engine) = state.greens.get_mut(&green_id) else {
       return refused(Refusal::NotFound);
     };
-    engine.submit(&inc)
+    engine.submit_resolved(&inc)
   };
   // The `merge.verdict` chokepoint span (§4.14): one increment judged (accept, identical, or conflict),
   // opened within the `shard.op` span of the submit that caused it (set in `run_recorded`). The label
@@ -6540,10 +6544,14 @@ fn submit(
       // segment-full failure refuses like any other verb. A resubmit the engine answered from its
       // idempotent accept names a version the chain already holds: nothing is appended twice.
       // The durable head is the checkpoint's version and the increments after it (W3).
-      if state.db.partition().green_head(green_id) < version
-        && let Err(e) = state.db.mutate(&mut state.segment, &record, now)
-      {
-        return refused(refusal_of_db(&e));
+      if let Err(refusal) = record_accepted(
+        state,
+        green_id,
+        version,
+        (&increment_bytes, &inc),
+        applied.as_deref(),
+      ) {
+        return refused(refusal);
       }
       if let Err(e) = state.db.mutate(
         &mut state.segment,
@@ -6608,6 +6616,45 @@ fn submit(
 /// at its cap is checkpointed at its floor first, the doubling rule waived (A-238): the floor may have risen since the
 /// last accept (a work destroyed or rebased), and a full chain refuses every submit whose accept would take the
 /// checkpoint, so without it the green stayed full for good. What is still full is refused `TableAtCapacity`.
+/// Appends accepted `version`'s entry to `green`'s durable chain, unless an idempotent accept already holds it (A-257): the
+/// increment as submitted and what its verdict resolved it to. At a version whose record goes to holders the head's identity
+/// is read anyway, and goes beside it for a replay to compare; at `f = 0` the entries after the last checkpoint are checked
+/// by their digest alone.
+fn record_accepted(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  version: u64,
+  (increment_bytes, increment): (&[u8], &slates_merge::engine::Increment),
+  applied: Option<&[slates_merge::chain_entry::Applied]>,
+) -> Result<(), Refusal> {
+  if state.db.partition().green_head(green) >= version {
+    return Ok(());
+  }
+  let identity = crate::merge_service::record_goes_to_holders(state, green)
+    .then(|| {
+      state
+        .greens
+        .get_mut(&green)
+        .map(slates_merge::engine::Green::head_identity)
+    })
+    .flatten();
+  let record = Op::GreenAdvanced {
+    green,
+    increment: slates_merge::chain_entry::encode(
+      increment_bytes,
+      increment,
+      applied.unwrap_or_default(),
+      identity,
+    ),
+  };
+  let now = state.clock.monotonic_ns();
+  state
+    .db
+    .mutate(&mut state.segment, &record, now)
+    .map(|_| ())
+    .map_err(|e| refusal_of_db(&e))
+}
+
 fn chain_admits(
   state: &mut ShardState,
   green: DbVolumeId,
@@ -9136,10 +9183,32 @@ pub(crate) fn materialize_taken_over_green(
       return Err(Box::new(refused(refusal_of_db(&e))));
     }
   }
-  for increment in recovery.chain.iter().skip(already) {
+  // A holder's records carry the increments a successor judges afresh (§4.16 "Apply on holders"); what each resolves to
+  // here is what this node's chain records of it (A-257).
+  let mut engine = match replay_green(state, id) {
+    Ok((engine, _)) => engine,
+    Err(fence) => {
+      return Err(Box::new(refused(Refusal::BadRequest {
+        reason: format!("taken-over green does not replay locally: {fence:?}"),
+      })));
+    }
+  };
+  for increment_bytes in recovery.chain.iter().skip(already) {
+    let judged = slates_merge::engine::Increment::decode(increment_bytes)
+      .ok()
+      .map(|increment| {
+        let verdict = engine.submit_resolved(&increment);
+        (increment, verdict)
+      });
+    let Some((increment, (slates_merge::engine::Outcome::Accepted { .. }, Some(applied)))) = judged
+    else {
+      return Err(Box::new(refused(Refusal::BadRequest {
+        reason: "taken-over green's chain does not replay onto its adopted head".to_owned(),
+      })));
+    };
     let op = Op::GreenAdvanced {
       green: id,
-      increment: increment.clone(),
+      increment: slates_merge::chain_entry::encode(increment_bytes, &increment, &applied, None),
     };
     if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
       return Err(Box::new(refused(refusal_of_db(&e))));
@@ -10713,7 +10782,7 @@ fn replay_green(
   let origin = recovered_origin(state, id)?;
   let partition = state.db.partition();
   // A checkpointed green (W3) is restored at its checkpoint, and only the increments after it are replayed.
-  let (mut green, held) = match partition.green_checkpoint(id) {
+  let (mut green, held, head_check) = match partition.green_checkpoint(id) {
     Some((held, bytes)) => {
       let checkpoint = slates_merge::checkpoint::Checkpoint::decode(bytes)
         .ok()
@@ -10723,6 +10792,7 @@ fn replay_green(
       (
         slates_merge::engine::Green::restore(origin, &checkpoint),
         held,
+        checkpoint.head_check,
       )
     }
     None => (
@@ -10730,8 +10800,15 @@ fn replay_green(
         slates_merge::engine::Green::with_origin(origin)
       }),
       0,
+      None,
     ),
   };
+  // The identity the head had when the checkpoint was taken (A-257): compared once the replay reaches that version.
+  if head_check
+    .is_some_and(|(version, identity)| version == held && identity != green.head_identity())
+  {
+    return Err(GreenFence::IdentityDiverged { version: held });
+  }
   // Each replayed version's merge record, as its owner enqueued it: version 0 too when no checkpoint stands for
   // it, then every chain entry, each with the head identity the green has at that version.
   let mut replayed = Vec::new();
@@ -10749,26 +10826,30 @@ fn replay_green(
       .unwrap_or(u64::MAX)
       .saturating_add(held)
       .saturating_add(1);
-    let increment = slates_merge::engine::Increment::decode(bytes)
-      .map_err(|_| GreenFence::EntryCorrupt { version })?;
-    match green.submit(&increment) {
-      slates_merge::engine::Outcome::Accepted { version: accepted } if accepted == version => {
-        replayed.push(crate::merge_service::ReplayedVersion {
-          version,
-          increment: increment.id,
-          base: increment.base,
-          evidence: increment.evidence.clone(),
-          identity: green.head_identity(),
-        });
-      }
-      slates_merge::engine::Outcome::Accepted { version: accepted } => {
-        return Err(GreenFence::WrongVersion { version, accepted });
-      }
-      slates_merge::engine::Outcome::Conflict { .. }
-      | slates_merge::engine::Outcome::BaseUnavailable { .. } => {
-        return Err(GreenFence::NotAccepted { version });
-      }
+    // Applied as the verdict resolved it (A-257): a checkpoint's position cannot refuse it. A replay that does not reach
+    // the identity the entry recorded is fenced, in place of judging the entry again.
+    let entry =
+      slates_merge::chain_entry::decode(bytes).map_err(|_| GreenFence::EntryCorrupt { version })?;
+    let accepted = green.apply_recorded(&entry.increment, &entry.applied);
+    if accepted != version {
+      return Err(GreenFence::WrongVersion { version, accepted });
     }
+    let identity = green.head_identity();
+    let at_checkpoint = head_check.and_then(|(at, recorded)| (at == version).then_some(recorded));
+    if entry
+      .identity
+      .or(at_checkpoint)
+      .is_some_and(|recorded| recorded != identity)
+    {
+      return Err(GreenFence::IdentityDiverged { version });
+    }
+    replayed.push(crate::merge_service::ReplayedVersion {
+      version,
+      increment: entry.increment.id,
+      base: entry.increment.base,
+      evidence: entry.increment.evidence,
+      identity,
+    });
   }
   green.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
   Ok((green, replayed))

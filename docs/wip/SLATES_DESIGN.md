@@ -7777,6 +7777,26 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 >   (`docs/bugs/2026-11-07-a-greens-history-kept-a-copy-of-every-file-per-version.md`,
 >   `docs/bugs/2026-11-07-a-run-after-a-length-change-merged-zeros.md`.)
 
+> **Status (2026-11-08, A-257: a chain entry records what its verdict resolved, and recovery applies it).** A
+> checkpoint at the floor can pass the base of an entry left above it, and recovery re-judged each entry at its base,
+> which a restored green no longer holds: the entry was refused and the green fenced, every acknowledged version
+> unreadable (every restart of the load harness's state, 2026-11-08).
+> - The durable entry is now the increment as submitted, byte for byte, then the effects its verdict resolved it to
+>   (content by reference to its post-state; a splice whose ops were not mapped by its path alone), then a digest.
+>   Recovery applies the effects unconditionally (`slates_merge::chain_entry`, `Green::apply_recorded`). The position
+>   of a checkpoint no longer matters to replay, and a straggler pins nothing.
+> - A merge record's inputs are still the increment as submitted (`inputs_of`): holders ("Apply on holders") and a
+>   successor (`recover_green_inputs`) judge it afresh, so a wrong resolution on the owner cannot reach them.
+> - Integrity: the digest on every entry; the head identity recorded and compared at every checkpoint, at every
+>   version whose record goes to holders, and at the head wherever one is recorded (`GreenFence::IdentityDiverged`).
+>   At f = 0 the entries after the last checkpoint are checked by digest alone: a divergence there is found at the
+>   next recorded identity, not at its own version (an identity at every f = 0 accept cost 287-363 µs against a
+>   35-42 µs verdict). The oracle (`crates/merge/tests/chain_replay.rs`) compares identity at every version.
+> - Cost: 789 bytes an entry against the increment's 611 (+29%), and 4-5 µs on the p50 of an accept over a base behind
+>   the head (32 to 36-37 µs; p99 within noise). Layout 6; a version-5 segment is refused, and a green already fenced
+>   by a wrong checkpoint stays fenced.
+>   (`docs/bugs/2026-11-08-a-checkpoint-passed-a-retained-entrys-base-and-recovery-fenced-the-green.md`.)
+
 > **Status (2026-11-06, A-238: a green's chain is checkpointed at its reachable floor).** The partition kept
 > every accepted increment for good, and the "fold into checkpoint deltas" below had no durable form.
 > - Now, after each accept, the owner checkpoints the chain at the floor. The floor is the oldest version a live work
@@ -15795,6 +15815,27 @@ Applied in the same change to: §4.7 (data model, wake strategy, status); `slate
 and settle, `DaemonEnd::reply`'s stamp and confirmation) and `crates/ipc/tests/rings.rs`; GAPS. Evidence:
 `docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`. A client and a daemon of
 different layout versions refuse each other by name; no consensus rule or capability changes.
+
+### A-257 — A green's chain entry records what its verdict resolved, and recovery applies it (accepted and built 2026-11-08)
+
+A checkpoint at the reachable floor (A-238) can pass the base of an entry left in the chain, and recovery, which judged
+each entry again at its base, refused it and fenced the green. Holding the checkpoint below every retained base never
+folds under steady concurrency; carrying the deltas down to it is not enough, since a verdict reads files' lengths and
+bytes at the base. So the decision is recorded where it is made: the verdict at accept is the guard, the entry its
+result, and recovery applies it (`crates/db/src/partition.rs`'s guard-then-apply). The merge record's inputs stay the
+increment, so holders keep their independent judgement. Integrity at f = 0 between checkpoints is the entry's digest;
+the head identity is compared at checkpoints, holder-bound versions and recorded heads.
+
+Applied in the same change to:
+- §4.16: its status ("Commit").
+- GAPS: the load-test blockquote (W3's recovery).
+- `crates/merge`: `chain_entry.rs` (new), `Green::submit_resolved`, `Green::apply_recorded`, `Checkpoint::head_check`
+  (encoding version 2).
+- `crates/server`: `verbs::submit`, `record_accepted`, `replay_green`, the takeover's chain; `merge_service::inputs_of`,
+  `checkpoint_green_when`, `record_goes_to_holders`, `GreenFence::IdentityDiverged` (and `NotAccepted` removed).
+- `crates/anchor`: `LAYOUT_VERSION` 6.
+- Tests: `crates/merge/tests/chain_replay.rs` (new), `crates/server/tests/green_checkpoint.rs`.
+- Bug record: `docs/bugs/2026-11-08-a-checkpoint-passed-a-retained-entrys-base-and-recovery-fenced-the-green.md`.
 
 ### A-246 — A restarted owner re-enqueues the merge records its chain holds (accepted 2026-11-07)
 

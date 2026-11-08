@@ -494,6 +494,13 @@
 >     `docs/bugs/2026-11-06-a-greens-chain-kept-every-version-it-ever-took.md`).** A green's chain is checkpointed at
 >     its reachable floor once the increments to fold reach the checkpoint's size. Recovery restores from the
 >     checkpoint and replays only the tail. The settle before a submit folds until its claim fits.
+>     - **Its recovery fenced the green until 2026-11-08 (A-257).** A checkpoint at the floor passed the base of an
+>       entry left above it, and recovery re-judged that entry at a base the restored green no longer held:
+>       `BaseUnavailable`, the green fenced, every acknowledged version unreadable (5 of 5 restarts in every
+>       recovery-slicing run, 7 of 18 primary-kill rungs). A chain entry now records what its verdict resolved and
+>       recovery applies it; holders still judge the increment. Entries 789 bytes against 611, the accept's p50 +4-5 µs.
+>       At f = 0 the entries after the last checkpoint are checked by digest alone. A green fenced before stays fenced
+>       (`docs/bugs/2026-11-08-a-checkpoint-passed-a-retained-entrys-base-and-recovery-fenced-the-green.md`).
 >     - Under a 256 KiB cap, 200 versions of 8 KiB from a work that keeps up are all accepted. Before, the chain cap
 >       refused at version 31, and then the retention fold at version 34.
 >     - The partition's snapshot grows by at most 39,168 bytes from version 40 to 200; before, it grew 1,329,920
