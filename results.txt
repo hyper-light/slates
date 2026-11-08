@@ -1,0 +1,738 @@
+leg red-x86, 4 CPUs, Sun Nov  8 13:58:14 UTC 2026, tree e29caf36ea48bb7373895aeef75c081d3d010c05
+== release build exit 0
+live one install: 2 installs taken after the resume; then Some(("247", "247", "false")) [Some(("247", "none", "false")), Some(("247", "none", "false"))]
+thread 'a_holder_back_from_a_stop_takes_one_install' (6377) panicked at crates/cli/tests/live_fleet.rs:1124:3:
+assertion `left == right` failed: a holder back from a stop takes one install
+== flow 1 exit 101
+live one install: 2 installs taken after the resume; then Some(("247", "247", "false")) [Some(("247", "none", "false")), Some(("247", "none", "false"))]
+thread 'a_holder_back_from_a_stop_takes_one_install' (7292) panicked at crates/cli/tests/live_fleet.rs:1124:3:
+assertion `left == right` failed: a holder back from a stop takes one install
+== flow 2 exit 101
+live one install: 2 installs taken after the resume; then Some(("247", "247", "false")) [Some(("247", "none", "false")), Some(("247", "none", "false"))]
+thread 'a_holder_back_from_a_stop_takes_one_install' (8267) panicked at crates/cli/tests/live_fleet.rs:1124:3:
+assertion `left == right` failed: a holder back from a stop takes one install
+== flow 3 exit 101
+live one install: 2 installs taken after the resume; then Some(("247", "247", "false")) [Some(("247", "none", "false")), Some(("247", "none", "false"))]
+thread 'a_holder_back_from_a_stop_takes_one_install' (9121) panicked at crates/cli/tests/live_fleet.rs:1124:3:
+assertion `left == right` failed: a holder back from a stop takes one install
+== flow 4 exit 101
+live one install: 2 installs taken after the resume; then Some(("247", "247", "false")) [Some(("247", "none", "false")), Some(("247", "none", "false"))]
+thread 'a_holder_back_from_a_stop_takes_one_install' (10119) panicked at crates/cli/tests/live_fleet.rs:1124:3:
+assertion `left == right` failed: a holder back from a stop takes one install
+== flow 5 exit 101
+   r1   4738 writes, 4738 acknowledged: p50 576 us, p99 4095 us, p999 52494 us, max 149663 us; 6 over 50ms (sent+took): 0.00s+150ms 0.21s+149ms 2.14s+52ms 2.26s+80ms 3.45s+56ms 4.23s+52ms
+   r1 LD-DIAL slates-fleet to 127.0.0.1:44381 began_wall 1794146627130464485 ended_wall 1794146627184379096 ok true
+   r1 LD-DIAL slates-fleet to 127.0.0.1:44379 began_wall 1794146627182335717 ended_wall 1794146627184947818 ok true
+   r1 LD-DIAL slates-fleet to 127.0.0.1:44381 began_wall 1794146627250371727 ended_wall 1794146627252829159 ok true
+   r1 LD-DIAL slates-fleet to 127.0.0.1:44379 began_wall 1794146627250171262 ended_wall 1794146627253006321 ok true
+   r1 LD-DIAL slates-fleet to 127.0.0.1:44383 began_wall 1794146627130763044 ended_wall 1794146627257239250 ok true
+   r1 LD-DIAL slates-fleet to 127.0.0.1:44383 began_wall 1794146627182616823 ended_wall 1794146627257950602 ok true
+   r1 LD-DIAL slates-fleet to 127.0.0.1:44379 began_wall 1794146627285768182 ended_wall 1794146627287931994 ok true
+   r1 LD-DIAL slates-fleet to 127.0.0.1:44381 began_wall 1794146627286154856 ended_wall 1794146627287955698 ok true
+   r1 LD-DIAL slates-fleet to 127.0.0.1:44379 began_wall 1794146627353880746 ended_wall 1794146627355842467 ok true
+   r1 LD-DIAL slates-fleet to 127.0.0.1:44381 began_wall 1794146627356739166 ended_wall 1794146627358415625 ok true
+   r1 LD-DIAL slates-fleet to 127.0.0.1:44383 began_wall 1794146627359302929 ended_wall 1794146627361648531 ok true
+   r1 LD-DIAL slates-fleet to 127.0.0.1:44383 began_wall 1794146627359923842 ended_wall 1794146627363393589 ok true
+   r1 LD-SERVE wall_ns 1794146628476839574 install bytes 289992
+   r1 LD-RESUME chaos-rolling-a-11106 wall_ns 1794146630328420392
+   r1 LD-DIAL slates-fleet to 127.0.0.1:44379 began_wall 1794146630363679665 ended_wall 1794146630371706094 ok true
+   r1 LD-SERVE wall_ns 1794146630383099088 install bytes 289992
+   r1 LD-DIAL slates-fleet to 127.0.0.1:44379 began_wall 1794146630395879653 ended_wall 1794146630397669164 ok true
+   r1 LD-SERVE wall_ns 1794146630496389744 install bytes 8588834
+   r1 LD-RESUME chaos-rolling-b-11106 wall_ns 1794146632519084925
+   r1 LD-DIAL slates-fleet to 127.0.0.1:44381 began_wall 1794146632536062331 ended_wall 1794146632538996114 ok true
+   r1 LD-DIAL slates-fleet to 127.0.0.1:44381 began_wall 1794146632555650628 ended_wall 1794146632560370064 ok true
+   r1 LD-SERVE wall_ns 1794146632666021058 install bytes 15590962
+== partition 1 exit 0
+   r2   8280 writes, 8280 acknowledged: p50 401 us, p99 2396 us, p999 32715 us, max 129397 us; 6 over 50ms (sent+took): 0.00s+119ms 1.23s+61ms 2.12s+88ms 2.21s+70ms 2.31s+129ms 3.55s+101ms
+   r2 LD-DIAL slates-fleet to 127.0.0.1:23949 began_wall 1794146635594790281 ended_wall 1794146635649724141 ok true
+   r2 LD-DIAL slates-fleet to 127.0.0.1:23947 began_wall 1794146635647714296 ended_wall 1794146635650320445 ok true
+   r2 LD-DIAL slates-fleet to 127.0.0.1:23949 began_wall 1794146635709325012 ended_wall 1794146635712109465 ok true
+   r2 LD-DIAL slates-fleet to 127.0.0.1:23947 began_wall 1794146635709114108 ended_wall 1794146635713817194 ok true
+   r2 LD-DIAL slates-fleet to 127.0.0.1:23951 began_wall 1794146635595015203 ended_wall 1794146635714764675 ok true
+   r2 LD-DIAL slates-fleet to 127.0.0.1:23951 began_wall 1794146635647940550 ended_wall 1794146635717051770 ok true
+   r2 LD-DIAL slates-fleet to 127.0.0.1:23949 began_wall 1794146635750771671 ended_wall 1794146635753655309 ok true
+   r2 LD-DIAL slates-fleet to 127.0.0.1:23947 began_wall 1794146635751216133 ended_wall 1794146635754913417 ok true
+   r2 LD-DIAL slates-fleet to 127.0.0.1:23947 began_wall 1794146635816043711 ended_wall 1794146635817808438 ok true
+   r2 LD-DIAL slates-fleet to 127.0.0.1:23949 began_wall 1794146635815808621 ended_wall 1794146635819254825 ok true
+   r2 LD-DIAL slates-fleet to 127.0.0.1:23951 began_wall 1794146635817443815 ended_wall 1794146635820461772 ok true
+   r2 LD-DIAL slates-fleet to 127.0.0.1:23951 began_wall 1794146635818101414 ended_wall 1794146635821122289 ok true
+   r2 LD-RESUME chaos-rolling-a-11842 wall_ns 1794146639710214920
+   r2 LD-DIAL slates-fleet to 127.0.0.1:23947 began_wall 1794146639730337280 ended_wall 1794146639732757380 ok true
+   r2 LD-DIAL slates-fleet to 127.0.0.1:23947 began_wall 1794146639770380602 ended_wall 1794146639772084090 ok true
+   r2 LD-SERVE wall_ns 1794146639850609614 install bytes 10790510
+   r2 LD-SERVE wall_ns 1794146640044744879 install bytes 18634976
+   r2 LD-RESUME chaos-rolling-c-11842 wall_ns 1794146642025944362
+   r2 LD-DIAL slates-fleet to 127.0.0.1:23951 began_wall 1794146642046480729 ended_wall 1794146642048310194 ok true
+   r2 LD-DIAL slates-fleet to 127.0.0.1:23951 began_wall 1794146642107327605 ended_wall 1794146642108724660 ok true
+   r2 LD-SERVE wall_ns 1794146642208880895 install bytes 29010724
+== partition 2 exit 0
+   r3   5408 writes, 5408 acknowledged: p50 484 us, p99 4636 us, p999 32996 us, max 186788 us; 4 over 50ms (sent+took): 0.00s+113ms 0.15s+170ms 2.21s+143ms 4.31s+187ms
+   r3 LD-DIAL slates-fleet to 127.0.0.1:36011 began_wall 1794146646512776385 ended_wall 1794146646514944184 ok true
+   r3 LD-DIAL slates-fleet to 127.0.0.1:36013 began_wall 1794146646460399877 ended_wall 1794146646515442450 ok true
+   r3 LD-DIAL slates-fleet to 127.0.0.1:36011 began_wall 1794146646581101887 ended_wall 1794146646583867064 ok true
+   r3 LD-DIAL slates-fleet to 127.0.0.1:36013 began_wall 1794146646581381841 ended_wall 1794146646584492755 ok true
+   r3 LD-DIAL slates-fleet to 127.0.0.1:36015 began_wall 1794146646460680151 ended_wall 1794146646586453346 ok true
+   r3 LD-DIAL slates-fleet to 127.0.0.1:36015 began_wall 1794146646513059065 ended_wall 1794146646587347096 ok true
+   r3 LD-DIAL slates-fleet to 127.0.0.1:36011 began_wall 1794146646615866269 ended_wall 1794146646617984796 ok true
+   r3 LD-DIAL slates-fleet to 127.0.0.1:36013 began_wall 1794146646616908033 ended_wall 1794146646619217213 ok true
+   r3 LD-DIAL slates-fleet to 127.0.0.1:36011 began_wall 1794146646684774850 ended_wall 1794146646686664688 ok true
+   r3 LD-DIAL slates-fleet to 127.0.0.1:36013 began_wall 1794146646684998218 ended_wall 1794146646686985498 ok true
+   r3 LD-DIAL slates-fleet to 127.0.0.1:36015 began_wall 1794146646688806380 ended_wall 1794146646690330714 ok true
+   r3 LD-DIAL slates-fleet to 127.0.0.1:36015 began_wall 1794146646690698763 ended_wall 1794146646692274563 ok true
+   r3 LD-SERVE wall_ns 1794146647939143617 install bytes 233868
+   r3 LD-RESUME chaos-rolling-a-12770 wall_ns 1794146649769903487
+   r3 LD-DIAL slates-fleet to 127.0.0.1:36011 began_wall 1794146649799910559 ended_wall 1794146649801980612 ok true
+   r3 LD-DIAL slates-fleet to 127.0.0.1:36011 began_wall 1794146649828516031 ended_wall 1794146649830842768 ok true
+   r3 LD-SERVE wall_ns 1794146649833880698 install bytes 233868
+   r3 LD-SERVE wall_ns 1794146649955867230 install bytes 10287636
+   r3 LD-RESUME chaos-rolling-c-12770 wall_ns 1794146651826722259
+   r3 LD-DIAL slates-fleet to 127.0.0.1:36015 began_wall 1794146651829447951 ended_wall 1794146651834167900 ok true
+   r3 LD-DIAL slates-fleet to 127.0.0.1:36015 began_wall 1794146651875396749 ended_wall 1794146651879700971 ok true
+   r3 LD-SERVE wall_ns 1794146651902937711 install bytes 10287636
+   r3 LD-SERVE wall_ns 1794146652173432715 install bytes 23606468
+== partition 3 exit 0
+   r4   7894 writes, 7894 acknowledged: p50 403 us, p99 2284 us, p999 55905 us, max 185253 us; 10 over 50ms (sent+took): 0.00s+118ms 2.19s+136ms 2.33s+87ms 2.45s+52ms 3.44s+185ms 3.86s+56ms 4.01s+57ms 4.17s+59ms 4.33s+53ms 4.38s+113ms
+   r4 LD-DIAL slates-fleet to 127.0.0.1:43434 began_wall 1794146652771927617 ended_wall 1794146652774742042 ok true
+   r4 LD-DIAL slates-fleet to 127.0.0.1:43436 began_wall 1794146652723551888 ended_wall 1794146652775995296 ok true
+   r4 LD-DIAL slates-fleet to 127.0.0.1:43436 began_wall 1794146652824660406 ended_wall 1794146652828111582 ok true
+   r4 LD-DIAL slates-fleet to 127.0.0.1:43434 began_wall 1794146652824349284 ended_wall 1794146652828396625 ok true
+   r4 LD-DIAL slates-fleet to 127.0.0.1:43438 began_wall 1794146652723822394 ended_wall 1794146652831292463 ok true
+   r4 LD-DIAL slates-fleet to 127.0.0.1:43438 began_wall 1794146652772174809 ended_wall 1794146652831958346 ok true
+   r4 LD-DIAL slates-fleet to 127.0.0.1:43434 began_wall 1794146652875872611 ended_wall 1794146652878877890 ok true
+   r4 LD-DIAL slates-fleet to 127.0.0.1:43436 began_wall 1794146652877455131 ended_wall 1794146652881187053 ok true
+   r4 LD-DIAL slates-fleet to 127.0.0.1:43436 began_wall 1794146652929320879 ended_wall 1794146652930978871 ok true
+   r4 LD-DIAL slates-fleet to 127.0.0.1:43434 began_wall 1794146652930893781 ended_wall 1794146652932601997 ok true
+   r4 LD-DIAL slates-fleet to 127.0.0.1:43438 began_wall 1794146652933680632 ended_wall 1794146652935393990 ok true
+   r4 LD-DIAL slates-fleet to 127.0.0.1:43438 began_wall 1794146652933965207 ended_wall 1794146652936681549 ok true
+   r4 LD-RESUME chaos-rolling-a-13341 wall_ns 1794146655574828113
+   r4 LD-SERVE wall_ns 1794146655616129992 install bytes 5097
+   r4 LD-SERVE wall_ns 1794146655809864295 install bytes 19993222
+   r4 LD-RESUME chaos-rolling-b-13341 wall_ns 1794146657753646020
+   r4 LD-DIAL slates-fleet to 127.0.0.1:43436 began_wall 1794146657782320081 ended_wall 1794146657784509723 ok true
+   r4 LD-DIAL slates-fleet to 127.0.0.1:43436 began_wall 1794146657803162884 ended_wall 1794146657809146916 ok true
+   r4 LD-SERVE wall_ns 1794146657995618330 install bytes 29937050
+== partition 4 exit 0
+   r5   7121 writes, 7121 acknowledged: p50 484 us, p99 2704 us, p999 39189 us, max 180190 us; 5 over 50ms (sent+took): 0.00s+180ms 1.29s+55ms 2.19s+98ms 2.35s+96ms 2.45s+62ms
+   r5   Convergence: 1 violations
+   r5 thread 'candidates_partitioned_in_turn_mid_stream_lose_nothing' (13977) panicked at crates/cli/tests/live_chaos.rs:1132:5:
+   r5 LD-DIAL slates-fleet to 127.0.0.1:21689 began_wall 1794146660105116047 ended_wall 1794146660108452303 ok true
+   r5 LD-DIAL slates-fleet to 127.0.0.1:21691 began_wall 1794146660057779172 ended_wall 1794146660110303812 ok true
+   r5 LD-DIAL slates-fleet to 127.0.0.1:21691 began_wall 1794146660154435576 ended_wall 1794146660157182739 ok true
+   r5 LD-DIAL slates-fleet to 127.0.0.1:21689 began_wall 1794146660154155381 ended_wall 1794146660157348078 ok true
+   r5 LD-DIAL slates-fleet to 127.0.0.1:21693 began_wall 1794146660058030283 ended_wall 1794146660161029543 ok true
+   r5 LD-DIAL slates-fleet to 127.0.0.1:21693 began_wall 1794146660105413083 ended_wall 1794146660161608256 ok true
+   r5 LD-DIAL slates-fleet to 127.0.0.1:21689 began_wall 1794146660209470457 ended_wall 1794146660211088225 ok true
+   r5 LD-DIAL slates-fleet to 127.0.0.1:21691 began_wall 1794146660211296212 ended_wall 1794146660214681683 ok true
+   r5 LD-DIAL slates-fleet to 127.0.0.1:21689 began_wall 1794146660258967117 ended_wall 1794146660265182012 ok true
+   r5 LD-DIAL slates-fleet to 127.0.0.1:21691 began_wall 1794146660259250628 ended_wall 1794146660265281268 ok true
+   r5 LD-DIAL slates-fleet to 127.0.0.1:21693 began_wall 1794146660263201093 ended_wall 1794146660268666545 ok true
+   r5 LD-DIAL slates-fleet to 127.0.0.1:21693 began_wall 1794146660263263307 ended_wall 1794146660269023172 ok true
+   r5 LD-SERVE wall_ns 1794146661101583035 install bytes 117320
+   r5 LD-RESUME chaos-rolling-b-13976 wall_ns 1794146663139282729
+   r5 LD-DIAL slates-fleet to 127.0.0.1:21691 began_wall 1794146663141949191 ended_wall 1794146663145387327 ok true
+   r5 LD-DIAL slates-fleet to 127.0.0.1:21691 began_wall 1794146663153597174 ended_wall 1794146663155373870 ok true
+   r5 LD-SERVE wall_ns 1794146663223779278 install bytes 8704052
+   r5 LD-SERVE wall_ns 1794146663379940293 install bytes 15918946
+   r5 LD-RESUME chaos-rolling-c-13976 wall_ns 1794146665342480812
+   r5 LD-DIAL slates-fleet to 127.0.0.1:21693 began_wall 1794146665345221222 ended_wall 1794146665348993634 ok true
+   r5 LD-DIAL slates-fleet to 127.0.0.1:21693 began_wall 1794146665417583525 ended_wall 1794146665473341570 ok true
+   r5 LD-SERVE wall_ns 1794146665880695588 install bytes 23939506
+== partition 5 exit 101
+   r6   6014 writes, 6014 acknowledged: p50 467 us, p99 4317 us, p999 41763 us, max 142195 us; 5 over 50ms (sent+took): 0.00s+142ms 1.71s+108ms 2.04s+61ms 2.29s+66ms 3.36s+75ms
+   r6 LD-DIAL slates-fleet to 127.0.0.1:22759 began_wall 1794146706638348384 ended_wall 1794146706640612043 ok true
+   r6 LD-DIAL slates-fleet to 127.0.0.1:22761 began_wall 1794146706585037005 ended_wall 1794146706641246794 ok true
+   r6 LD-DIAL slates-fleet to 127.0.0.1:22759 began_wall 1794146706706573874 ended_wall 1794146706709287806 ok true
+   r6 LD-DIAL slates-fleet to 127.0.0.1:22761 began_wall 1794146706706868797 ended_wall 1794146706709740814 ok true
+   r6 LD-DIAL slates-fleet to 127.0.0.1:22763 began_wall 1794146706585269821 ended_wall 1794146706711408033 ok true
+   r6 LD-DIAL slates-fleet to 127.0.0.1:22763 began_wall 1794146706638664165 ended_wall 1794146706712815170 ok true
+   r6 LD-DIAL slates-fleet to 127.0.0.1:22759 began_wall 1794146706741795043 ended_wall 1794146706744100921 ok true
+   r6 LD-DIAL slates-fleet to 127.0.0.1:22761 began_wall 1794146706742711426 ended_wall 1794146706744890035 ok true
+   r6 LD-DIAL slates-fleet to 127.0.0.1:22759 began_wall 1794146706809998067 ended_wall 1794146706812055503 ok true
+   r6 LD-DIAL slates-fleet to 127.0.0.1:22761 began_wall 1794146706810378516 ended_wall 1794146706812575264 ok true
+   r6 LD-DIAL slates-fleet to 127.0.0.1:22763 began_wall 1794146706812829615 ended_wall 1794146706816086115 ok true
+   r6 LD-DIAL slates-fleet to 127.0.0.1:22763 began_wall 1794146706814711078 ended_wall 1794146706816901775 ok true
+   r6 LD-RESUME chaos-rolling-a-16366 wall_ns 1794146709827818250
+   r6 LD-DIAL slates-fleet to 127.0.0.1:22759 began_wall 1794146709721116115 ended_wall 1794146709841269197 ok true
+   r6 LD-SERVE wall_ns 1794146709891565502 install bytes 7611150
+   r6 LD-SERVE wall_ns 1794146710000488178 install bytes 13504806
+   r6 LD-RESUME chaos-rolling-c-16366 wall_ns 1794146711973261840
+   r6 LD-DIAL slates-fleet to 127.0.0.1:22763 began_wall 1794146712059613142 ended_wall 1794146712061820595 ok true
+   r6 LD-DIAL slates-fleet to 127.0.0.1:22763 began_wall 1794146712059291323 ended_wall 1794146712062244188 ok true
+   r6 LD-SERVE wall_ns 1794146712154140413 install bytes 20683942
+== partition 6 exit 0
+   r7   5569 writes, 5569 acknowledged: p50 474 us, p99 4636 us, p999 47052 us, max 214375 us; 5 over 50ms (sent+took): 0.00s+120ms 0.18s+153ms 2.22s+169ms 4.23s+78ms 4.42s+214ms
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31794 began_wall 1794146714288517122 ended_wall 1794146714290842218 ok true
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31796 began_wall 1794146714238235081 ended_wall 1794146714291321475 ok true
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31794 began_wall 1794146714341779737 ended_wall 1794146714345024332 ok true
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31796 began_wall 1794146714342032580 ended_wall 1794146714345903027 ok true
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31798 began_wall 1794146714238470070 ended_wall 1794146714347455230 ok true
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31798 began_wall 1794146714288774374 ended_wall 1794146714349119346 ok true
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31796 began_wall 1794146714392751199 ended_wall 1794146714394774958 ok true
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31794 began_wall 1794146714392292047 ended_wall 1794146714394799842 ok true
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31796 began_wall 1794146714448365602 ended_wall 1794146714451168239 ok true
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31794 began_wall 1794146714448776110 ended_wall 1794146714451294495 ok true
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31798 began_wall 1794146714450138614 ended_wall 1794146714452325819 ok true
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31798 began_wall 1794146714450615617 ended_wall 1794146714453108304 ok true
+   r7 LD-SERVE wall_ns 1794146716526791641 install bytes 337468
+   r7 LD-RESUME chaos-rolling-a-17061 wall_ns 1794146718374601181
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31794 began_wall 1794146718415562199 ended_wall 1794146718417237067 ok true
+   r7 LD-SERVE wall_ns 1794146718421611102 install bytes 337468
+   r7 LD-SERVE wall_ns 1794146718561145473 install bytes 14021970
+   r7 LD-RESUME chaos-rolling-c-17061 wall_ns 1794146720416383802
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31794 began_wall 1794146720421390577 ended_wall 1794146720424101775 ok true
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31798 began_wall 1794146720429268232 ended_wall 1794146720433154591 ok true
+   r7 LD-DIAL slates-fleet to 127.0.0.1:31798 began_wall 1794146720481709299 ended_wall 1794146720483871369 ok true
+   r7 LD-SERVE wall_ns 1794146720566649175 install bytes 14021970
+   r7 LD-SERVE wall_ns 1794146721023652448 install bytes 24200650
+== partition 7 exit 0
+   r8   7254 writes, 7254 acknowledged: p50 471 us, p99 2513 us, p999 11733 us, max 265520 us; 2 over 50ms (sent+took): 0.00s+143ms 2.28s+266ms
+   r8 LD-DIAL slates-fleet to 127.0.0.1:40868 began_wall 1794146721841917240 ended_wall 1794146721844347623 ok true
+   r8 LD-DIAL slates-fleet to 127.0.0.1:40870 began_wall 1794146721795587866 ended_wall 1794146721844347295 ok true
+   r8 LD-DIAL slates-fleet to 127.0.0.1:40868 began_wall 1794146721894667887 ended_wall 1794146721897528295 ok true
+   r8 LD-DIAL slates-fleet to 127.0.0.1:40870 began_wall 1794146721894955386 ended_wall 1794146721897991833 ok true
+   r8 LD-DIAL slates-fleet to 127.0.0.1:40872 began_wall 1794146721795865116 ended_wall 1794146721899752418 ok true
+   r8 LD-DIAL slates-fleet to 127.0.0.1:40872 began_wall 1794146721842240285 ended_wall 1794146721901011557 ok true
+   r8 LD-DIAL slates-fleet to 127.0.0.1:40870 began_wall 1794146721945191297 ended_wall 1794146721947294957 ok true
+   r8 LD-DIAL slates-fleet to 127.0.0.1:40868 began_wall 1794146721945172742 ended_wall 1794146721947719623 ok true
+   r8 LD-DIAL slates-fleet to 127.0.0.1:40870 began_wall 1794146721999085486 ended_wall 1794146722003507355 ok true
+   r8 LD-DIAL slates-fleet to 127.0.0.1:40868 began_wall 1794146721998741261 ended_wall 1794146722003672595 ok true
+   r8 LD-DIAL slates-fleet to 127.0.0.1:40872 began_wall 1794146722001894617 ended_wall 1794146722005334110 ok true
+   r8 LD-DIAL slates-fleet to 127.0.0.1:40872 began_wall 1794146722002856727 ended_wall 1794146722006770096 ok true
+   r8 LD-RESUME chaos-rolling-a-17759 wall_ns 1794146724653051848
+   r8 LD-DIAL slates-fleet to 127.0.0.1:40868 began_wall 1794146724656781580 ended_wall 1794146724668202228 ok true
+   r8 LD-DIAL slates-fleet to 127.0.0.1:40868 began_wall 1794146724711329317 ended_wall 1794146724713170749 ok true
+   r8 LD-SERVE wall_ns 1794146724762149202 install bytes 5187510
+   r8 LD-SERVE wall_ns 1794146725000147960 install bytes 16406282
+   r8 LD-RESUME chaos-rolling-b-17759 wall_ns 1794146726761222346
+   r8 LD-DIAL slates-fleet to 127.0.0.1:40870 began_wall 1794146726761169016 ended_wall 1794146726767076530 ok true
+   r8 LD-DIAL slates-fleet to 127.0.0.1:40870 began_wall 1794146726833954496 ended_wall 1794146726837889683 ok true
+   r8 LD-SERVE wall_ns 1794146726923845865 install bytes 16406282
+   r8 LD-SERVE wall_ns 1794146727494370330 install bytes 31616958
+== partition 8 exit 0
+   r9   7600 writes, 7600 acknowledged: p50 426 us, p99 2373 us, p999 21114 us, max 240260 us; 4 over 50ms (sent+took): 0.00s+182ms 1.29s+61ms 2.10s+67ms 2.28s+240ms
+   r9 LD-DIAL slates-fleet to 127.0.0.1:48135 began_wall 1794146728416692419 ended_wall 1794146728418921077 ok true
+   r9 LD-DIAL slates-fleet to 127.0.0.1:48137 began_wall 1794146728372804939 ended_wall 1794146728419580150 ok true
+   r9 LD-DIAL slates-fleet to 127.0.0.1:48137 began_wall 1794146728464999659 ended_wall 1794146728468080023 ok true
+   r9 LD-DIAL slates-fleet to 127.0.0.1:48135 began_wall 1794146728464728250 ended_wall 1794146728468591151 ok true
+   r9 LD-DIAL slates-fleet to 127.0.0.1:48139 began_wall 1794146728373040932 ended_wall 1794146728470882176 ok true
+   r9 LD-DIAL slates-fleet to 127.0.0.1:48139 began_wall 1794146728416963567 ended_wall 1794146728472724973 ok true
+   r9 LD-DIAL slates-fleet to 127.0.0.1:48135 began_wall 1794146728520357808 ended_wall 1794146728522483232 ok true
+   r9 LD-DIAL slates-fleet to 127.0.0.1:48137 began_wall 1794146728520761104 ended_wall 1794146728522495455 ok true
+   r9 LD-DIAL slates-fleet to 127.0.0.1:48137 began_wall 1794146728569232404 ended_wall 1794146728571511235 ok true
+   r9 LD-DIAL slates-fleet to 127.0.0.1:48135 began_wall 1794146728571012270 ended_wall 1794146728572831771 ok true
+   r9 LD-DIAL slates-fleet to 127.0.0.1:48139 began_wall 1794146728573406772 ended_wall 1794146728575476368 ok true
+   r9 LD-DIAL slates-fleet to 127.0.0.1:48139 began_wall 1794146728575481628 ended_wall 1794146728578253998 ok true
+   r9 LD-RESUME chaos-rolling-b-18318 wall_ns 1794146731531803779
+   r9 LD-DIAL slates-fleet to 127.0.0.1:48137 began_wall 1794146731560860035 ended_wall 1794146731563357314 ok true
+   r9 LD-DIAL slates-fleet to 127.0.0.1:48137 began_wall 1794146731582115037 ended_wall 1794146731584737261 ok true
+   r9 LD-SERVE wall_ns 1794146731626562812 install bytes 10444766
+   r9 LD-SERVE wall_ns 1794146731807974214 install bytes 17843264
+   r9 LD-RESUME chaos-rolling-c-18318 wall_ns 1794146733587851301
+   r9 LD-DIAL slates-fleet to 127.0.0.1:48139 began_wall 1794146733595750816 ended_wall 1794146733599092717 ok true
+   r9 LD-DIAL slates-fleet to 127.0.0.1:48139 began_wall 1794146733642230582 ended_wall 1794146733644403907 ok true
+   r9 LD-SERVE wall_ns 1794146733660820658 install bytes 17843264
+   r9 LD-SERVE wall_ns 1794146734014776645 install bytes 33236446
+== partition 9 exit 0
+   r10   7365 writes, 7365 acknowledged: p50 430 us, p99 2410 us, p999 43163 us, max 167487 us; 6 over 50ms (sent+took): 0.00s+136ms 0.18s+167ms 2.13s+51ms 2.23s+104ms 3.20s+67ms 3.45s+144ms
+   r10 LD-DIAL slates-fleet to 127.0.0.1:25480 began_wall 1794146734623792255 ended_wall 1794146734626216738 ok true
+   r10 LD-DIAL slates-fleet to 127.0.0.1:25482 began_wall 1794146734572586560 ended_wall 1794146734626760574 ok true
+   r10 LD-DIAL slates-fleet to 127.0.0.1:25482 began_wall 1794146734691919292 ended_wall 1794146734694501030 ok true
+   r10 LD-DIAL slates-fleet to 127.0.0.1:25480 began_wall 1794146734691541765 ended_wall 1794146734696301055 ok true
+   r10 LD-DIAL slates-fleet to 127.0.0.1:25484 began_wall 1794146734572940494 ended_wall 1794146734698374397 ok true
+   r10 LD-DIAL slates-fleet to 127.0.0.1:25484 began_wall 1794146734624162960 ended_wall 1794146734700185654 ok true
+   r10 LD-DIAL slates-fleet to 127.0.0.1:25480 began_wall 1794146734727281924 ended_wall 1794146734729475434 ok true
+   r10 LD-DIAL slates-fleet to 127.0.0.1:25482 began_wall 1794146734728330870 ended_wall 1794146734731915146 ok true
+   r10 LD-DIAL slates-fleet to 127.0.0.1:25482 began_wall 1794146734796231553 ended_wall 1794146734798107017 ok true
+   r10 LD-DIAL slates-fleet to 127.0.0.1:25480 began_wall 1794146734797904988 ended_wall 1794146734799590256 ok true
+   r10 LD-DIAL slates-fleet to 127.0.0.1:25484 began_wall 1794146734801782086 ended_wall 1794146734803827608 ok true
+   r10 LD-DIAL slates-fleet to 127.0.0.1:25484 began_wall 1794146734801284333 ended_wall 1794146734804349045 ok true
+   r10 LD-SERVE wall_ns 1794146736871198004 install bytes 320204
+   r10 LD-RESUME chaos-rolling-a-18883 wall_ns 1794146738704239010
+   r10 LD-DIAL slates-fleet to 127.0.0.1:25480 began_wall 1794146738714156440 ended_wall 1794146738715577683 ok true
+   r10 LD-DIAL slates-fleet to 127.0.0.1:25480 began_wall 1794146738747367768 ended_wall 1794146738749019383 ok true
+   r10 LD-SERVE wall_ns 1794146738756668278 install bytes 320204
+   r10 LD-SERVE wall_ns 1794146738905840024 install bytes 16538566
+   r10 LD-RESUME chaos-rolling-c-18883 wall_ns 1794146740913974334
+   r10 LD-DIAL slates-fleet to 127.0.0.1:25484 began_wall 1794146740916291145 ended_wall 1794146740921699449 ok true
+   r10 LD-DIAL slates-fleet to 127.0.0.1:25484 began_wall 1794146740932406649 ended_wall 1794146740934225737 ok true
+   r10 LD-SERVE wall_ns 1794146741044124791 install bytes 25867484
+== partition 10 exit 0
+   r11   7458 writes, 7458 acknowledged: p50 421 us, p99 2053 us, p999 21682 us, max 192938 us; 5 over 50ms (sent+took): 0.00s+111ms 0.15s+170ms 2.21s+193ms 2.55s+55ms 3.59s+63ms
+   r11 LD-DIAL slates-fleet to 127.0.0.1:36803 began_wall 1794146743655207364 ended_wall 1794146743657775597 ok true
+   r11 LD-DIAL slates-fleet to 127.0.0.1:36805 began_wall 1794146743608873409 ended_wall 1794146743658857965 ok true
+   r11 LD-DIAL slates-fleet to 127.0.0.1:36803 began_wall 1794146743702001194 ended_wall 1794146743704233376 ok true
+   r11 LD-DIAL slates-fleet to 127.0.0.1:36805 began_wall 1794146743702241975 ended_wall 1794146743704686375 ok true
+   r11 LD-DIAL slates-fleet to 127.0.0.1:36807 began_wall 1794146743609130642 ended_wall 1794146743706850880 ok true
+   r11 LD-DIAL slates-fleet to 127.0.0.1:36807 began_wall 1794146743655474395 ended_wall 1794146743707797136 ok true
+   r11 LD-DIAL slates-fleet to 127.0.0.1:36805 began_wall 1794146743761163318 ended_wall 1794146743763154639 ok true
+   r11 LD-DIAL slates-fleet to 127.0.0.1:36803 began_wall 1794146743760834234 ended_wall 1794146743763154651 ok true
+   r11 LD-DIAL slates-fleet to 127.0.0.1:36803 began_wall 1794146743804936908 ended_wall 1794146743807668018 ok true
+   r11 LD-DIAL slates-fleet to 127.0.0.1:36805 began_wall 1794146743807504371 ended_wall 1794146743809202623 ok true
+   r11 LD-DIAL slates-fleet to 127.0.0.1:36807 began_wall 1794146743809428627 ended_wall 1794146743811173827 ok true
+   r11 LD-DIAL slates-fleet to 127.0.0.1:36807 began_wall 1794146743809450866 ended_wall 1794146743811818645 ok true
+   r11 LD-SERVE wall_ns 1794146744525324883 install bytes 298624
+   r11 LD-RESUME chaos-rolling-a-19754 wall_ns 1794146746356977928
+   r11 LD-DIAL slates-fleet to 127.0.0.1:36803 began_wall 1794146746370506427 ended_wall 1794146746372378865 ok true
+   r11 LD-DIAL slates-fleet to 127.0.0.1:36803 began_wall 1794146746415737795 ended_wall 1794146746417434605 ok true
+   r11 LD-SERVE wall_ns 1794146746424864590 install bytes 298624
+   r11 LD-SERVE wall_ns 1794146746585016221 install bytes 17203878
+   r11 LD-RESUME chaos-rolling-b-19754 wall_ns 1794146748414473267
+   r11 LD-DIAL slates-fleet to 127.0.0.1:36805 began_wall 1794146748450674822 ended_wall 1794146748453553071 ok true
+   r11 LD-DIAL slates-fleet to 127.0.0.1:36805 began_wall 1794146748460400942 ended_wall 1794146748462044740 ok true
+   r11 LD-SERVE wall_ns 1794146748531691755 install bytes 17203878
+   r11 LD-SERVE wall_ns 1794146748907422630 install bytes 32533802
+== partition 11 exit 0
+   r12   5019 writes, 5019 acknowledged: p50 509 us, p99 4159 us, p999 44852 us, max 113894 us; 5 over 50ms (sent+took): 0.00s+114ms 2.29s+107ms 2.40s+78ms 3.51s+94ms 4.40s+66ms
+   r12 LD-DIAL slates-fleet to 127.0.0.1:43745 began_wall 1794146749922971861 ended_wall 1794146749925270476 ok true
+   r12 LD-DIAL slates-fleet to 127.0.0.1:43747 began_wall 1794146749872916885 ended_wall 1794146749926039533 ok true
+   r12 LD-DIAL slates-fleet to 127.0.0.1:43745 began_wall 1794146749989439256 ended_wall 1794146749992356639 ok true
+   r12 LD-DIAL slates-fleet to 127.0.0.1:43747 began_wall 1794146749989787748 ended_wall 1794146749992867235 ok true
+   r12 LD-DIAL slates-fleet to 127.0.0.1:43749 began_wall 1794146749873181470 ended_wall 1794146749994613087 ok true
+   r12 LD-DIAL slates-fleet to 127.0.0.1:43749 began_wall 1794146749923246335 ended_wall 1794146749996275931 ok true
+   r12 LD-DIAL slates-fleet to 127.0.0.1:43745 began_wall 1794146750026191729 ended_wall 1794146750028912494 ok true
+   r12 LD-DIAL slates-fleet to 127.0.0.1:43747 began_wall 1794146750027744319 ended_wall 1794146750030501242 ok true
+   r12 LD-DIAL slates-fleet to 127.0.0.1:43747 began_wall 1794146750093646515 ended_wall 1794146750095584545 ok true
+   r12 LD-DIAL slates-fleet to 127.0.0.1:43745 began_wall 1794146750093941017 ended_wall 1794146750096021884 ok true
+   r12 LD-DIAL slates-fleet to 127.0.0.1:43749 began_wall 1794146750096683224 ended_wall 1794146750098451927 ok true
+   r12 LD-DIAL slates-fleet to 127.0.0.1:43749 began_wall 1794146750098350908 ended_wall 1794146750100110182 ok true
+   r12 LD-SERVE wall_ns 1794146750664614115 install bytes 108688
+   r12 LD-RESUME chaos-rolling-a-20288 wall_ns 1794146752698621409
+   r12 LD-DIAL slates-fleet to 127.0.0.1:43745 began_wall 1794146752707122170 ended_wall 1794146752711061577 ok true
+   r12 LD-DIAL slates-fleet to 127.0.0.1:43745 began_wall 1794146752741917398 ended_wall 1794146752744103172 ok true
+   r12 LD-SERVE wall_ns 1794146752802870076 install bytes 7727678
+   r12 LD-SERVE wall_ns 1794146752977504361 install bytes 14662436
+   r12 LD-RESUME chaos-rolling-c-20288 wall_ns 1794146754923870369
+   r12 LD-DIAL slates-fleet to 127.0.0.1:43749 began_wall 1794146754929948934 ended_wall 1794146754932196345 ok true
+   r12 LD-DIAL slates-fleet to 127.0.0.1:43749 began_wall 1794146754937344810 ended_wall 1794146754939478828 ok true
+   r12 LD-SERVE wall_ns 1794146755092808702 install bytes 19258490
+== partition 12 exit 0
+   r13   5693 writes, 5693 acknowledged: p50 504 us, p99 3804 us, p999 38812 us, max 199368 us; 4 over 50ms (sent+took): 0.00s+163ms 0.24s+138ms 2.16s+59ms 2.31s+199ms
+   r13 LD-DIAL slates-fleet to 127.0.0.1:20936 began_wall 1794146756296284413 ended_wall 1794146756347577046 ok true
+   r13 LD-DIAL slates-fleet to 127.0.0.1:20934 began_wall 1794146756343074460 ended_wall 1794146756348447118 ok true
+   r13 LD-DIAL slates-fleet to 127.0.0.1:20934 began_wall 1794146756400143578 ended_wall 1794146756403444361 ok true
+   r13 LD-DIAL slates-fleet to 127.0.0.1:20936 began_wall 1794146756400410267 ended_wall 1794146756404464272 ok true
+   r13 LD-DIAL slates-fleet to 127.0.0.1:20938 began_wall 1794146756296566381 ended_wall 1794146756407560372 ok true
+   r13 LD-DIAL slates-fleet to 127.0.0.1:20938 began_wall 1794146756343406613 ended_wall 1794146756409817251 ok true
+   r13 LD-DIAL slates-fleet to 127.0.0.1:20936 began_wall 1794146756449276762 ended_wall 1794146756451615246 ok true
+   r13 LD-DIAL slates-fleet to 127.0.0.1:20934 began_wall 1794146756450446346 ended_wall 1794146756452747747 ok true
+   r13 LD-DIAL slates-fleet to 127.0.0.1:20934 began_wall 1794146756504442202 ended_wall 1794146756506129864 ok true
+   r13 LD-DIAL slates-fleet to 127.0.0.1:20936 began_wall 1794146756505951480 ended_wall 1794146756507585211 ok true
+   r13 LD-DIAL slates-fleet to 127.0.0.1:20938 began_wall 1794146756511457022 ended_wall 1794146756513426955 ok true
+   r13 LD-DIAL slates-fleet to 127.0.0.1:20938 began_wall 1794146756512316031 ended_wall 1794146756514265894 ok true
+   r13 LD-SERVE wall_ns 1794146758535360493 install bytes 307256
+   r13 LD-RESUME chaos-rolling-b-20841 wall_ns 1794146760398228488
+   r13 LD-DIAL slates-fleet to 127.0.0.1:20936 began_wall 1794146760420166767 ended_wall 1794146760421943065 ok true
+   r13 LD-DIAL slates-fleet to 127.0.0.1:20936 began_wall 1794146760466677301 ended_wall 1794146760469977764 ok true
+   r13 LD-SERVE wall_ns 1794146760473383986 install bytes 307256
+   r13 LD-SERVE wall_ns 1794146760656027293 install bytes 12393266
+   r13 LD-RESUME chaos-rolling-c-20841 wall_ns 1794146762471686561
+   r13 LD-DIAL slates-fleet to 127.0.0.1:20938 began_wall 1794146762506222782 ended_wall 1794146762508199996 ok true
+   r13 LD-DIAL slates-fleet to 127.0.0.1:20938 began_wall 1794146762559342227 ended_wall 1794146762560869448 ok true
+   r13 LD-SERVE wall_ns 1794146762616789450 install bytes 12393266
+   r13 LD-SERVE wall_ns 1794146762857052696 install bytes 24889516
+== partition 13 exit 0
+   r14   5778 writes, 5778 acknowledged: p50 494 us, p99 3589 us, p999 57615 us, max 153874 us; 9 over 50ms (sent+took): 0.00s+115ms 0.17s+154ms 2.20s+121ms 2.32s+52ms 3.34s+58ms 3.47s+131ms 4.38s+51ms 4.43s+55ms 4.49s+69ms
+   r14 LD-DIAL slates-fleet to 127.0.0.1:29490 began_wall 1794146763314490097 ended_wall 1794146763363772338 ok true
+   r14 LD-DIAL slates-fleet to 127.0.0.1:29488 began_wall 1794146763361116154 ended_wall 1794146763364771983 ok true
+   r14 LD-DIAL slates-fleet to 127.0.0.1:29490 began_wall 1794146763410811068 ended_wall 1794146763412831501 ok true
+   r14 LD-DIAL slates-fleet to 127.0.0.1:29488 began_wall 1794146763410559326 ended_wall 1794146763416970112 ok true
+   r14 LD-DIAL slates-fleet to 127.0.0.1:29492 began_wall 1794146763314795960 ended_wall 1794146763418710080 ok true
+   r14 LD-DIAL slates-fleet to 127.0.0.1:29492 began_wall 1794146763361393233 ended_wall 1794146763420548273 ok true
+   r14 LD-DIAL slates-fleet to 127.0.0.1:29490 began_wall 1794146763468367905 ended_wall 1794146763470093556 ok true
+   r14 LD-DIAL slates-fleet to 127.0.0.1:29488 began_wall 1794146763467967495 ended_wall 1794146763471507815 ok true
+   r14 LD-DIAL slates-fleet to 127.0.0.1:29490 began_wall 1794146763514428723 ended_wall 1794146763517296767 ok true
+   r14 LD-DIAL slates-fleet to 127.0.0.1:29488 began_wall 1794146763517688621 ended_wall 1794146763520330078 ok true
+   r14 LD-DIAL slates-fleet to 127.0.0.1:29492 began_wall 1794146763521132908 ended_wall 1794146763523855256 ok true
+   r14 LD-DIAL slates-fleet to 127.0.0.1:29492 began_wall 1794146763522801453 ended_wall 1794146763526382201 ok true
+   r14 LD-SERVE wall_ns 1794146765507833568 install bytes 277044
+   r14 LD-RESUME chaos-rolling-a-21499 wall_ns 1794146767354791906
+   r14 LD-DIAL slates-fleet to 127.0.0.1:29488 began_wall 1794146767383895792 ended_wall 1794146767398416675 ok true
+   r14 LD-SERVE wall_ns 1794146767402248748 install bytes 277044
+   r14 LD-DIAL slates-fleet to 127.0.0.1:29488 began_wall 1794146767436425344 ended_wall 1794146767438494579 ok true
+   r14 LD-SERVE wall_ns 1794146767564583344 install bytes 13507274
+   r14 LD-RESUME chaos-rolling-c-21499 wall_ns 1794146769606003717
+   r14 LD-DIAL slates-fleet to 127.0.0.1:29492 began_wall 1794146769665580935 ended_wall 1794146769667411623 ok true
+   r14 LD-DIAL slates-fleet to 127.0.0.1:29492 began_wall 1794146769663350130 ended_wall 1794146769669338915 ok true
+   r14 LD-SERVE wall_ns 1794146769805004066 install bytes 20658216
+== partition 14 exit 0
+   r15   2970 writes, 2970 acknowledged: p50 1039 us, p99 5218 us, p999 79018 us, max 165793 us; 3 over 50ms (sent+took): 0.01s+161ms 2.35s+166ms 4.45s+79ms
+   r15 LD-DIAL slates-fleet to 127.0.0.1:39355 began_wall 1794146771936451065 ended_wall 1794146771938762414 ok true
+   r15 LD-DIAL slates-fleet to 127.0.0.1:39357 began_wall 1794146771890942438 ended_wall 1794146771939556825 ok true
+   r15 LD-DIAL slates-fleet to 127.0.0.1:39355 began_wall 1794146771988182160 ended_wall 1794146771993107074 ok true
+   r15 LD-DIAL slates-fleet to 127.0.0.1:39359 began_wall 1794146771891174704 ended_wall 1794146771994550320 ok true
+   r15 LD-DIAL slates-fleet to 127.0.0.1:39359 began_wall 1794146771936750977 ended_wall 1794146771995450406 ok true
+   r15 LD-DIAL slates-fleet to 127.0.0.1:39355 began_wall 1794146772040584972 ended_wall 1794146772044536173 ok true
+   r15 LD-DIAL slates-fleet to 127.0.0.1:39357 began_wall 1794146772041116157 ended_wall 1794146772045155413 ok true
+   r15 LD-DIAL slates-fleet to 127.0.0.1:39355 began_wall 1794146772095993608 ended_wall 1794146772103575879 ok true
+   r15 LD-DIAL slates-fleet to 127.0.0.1:39357 began_wall 1794146772097699523 ended_wall 1794146772105285692 ok true
+   r15 LD-DIAL slates-fleet to 127.0.0.1:39359 began_wall 1794146772098928141 ended_wall 1794146772106464367 ok true
+   r15 LD-DIAL slates-fleet to 127.0.0.1:39359 began_wall 1794146772096490839 ended_wall 1794146772110054131 ok true
+   r15 LD-SERVE wall_ns 1794146772945617437 install bytes 74144
+   r15 LD-RESUME chaos-rolling-b-22258 wall_ns 1794146775014567772
+   r15 LD-DIAL slates-fleet to 127.0.0.1:39357 began_wall 1794146775052415752 ended_wall 1794146775055114267 ok true
+   r15 LD-DIAL slates-fleet to 127.0.0.1:39357 began_wall 1794146775055488771 ended_wall 1794146775058271513 ok true
+   r15 LD-SERVE wall_ns 1794146775104399212 install bytes 3943607
+   r15 LD-SERVE wall_ns 1794146775256869766 install bytes 7514576
+   r15 LD-RESUME chaos-rolling-c-22258 wall_ns 1794146777106169386
+   r15 LD-DIAL slates-fleet to 127.0.0.1:39359 began_wall 1794146777119309297 ended_wall 1794146777121518435 ok true
+   r15 LD-DIAL slates-fleet to 127.0.0.1:39359 began_wall 1794146777125561327 ended_wall 1794146777127815559 ok true
+   r15 LD-SERVE wall_ns 1794146777193863290 install bytes 7514576
+   r15 LD-SERVE wall_ns 1794146777368426717 install bytes 12936908
+== partition 15 exit 0
+   r16   8093 writes, 8093 acknowledged: p50 424 us, p99 1882 us, p999 51018 us, max 199720 us; 9 over 50ms (sent+took): 0.00s+200ms 1.31s+66ms 2.20s+78ms 2.28s+63ms 2.38s+117ms 2.50s+55ms 3.27s+51ms 3.51s+66ms 4.34s+54ms
+   r16 LD-DIAL slates-fleet to 127.0.0.1:46310 began_wall 1794146777833859308 ended_wall 1794146777836139899 ok true
+   r16 LD-DIAL slates-fleet to 127.0.0.1:46312 began_wall 1794146777787848150 ended_wall 1794146777836678178 ok true
+   r16 LD-DIAL slates-fleet to 127.0.0.1:46312 began_wall 1794146777882475227 ended_wall 1794146777886260290 ok true
+   r16 LD-DIAL slates-fleet to 127.0.0.1:46310 began_wall 1794146777882247541 ended_wall 1794146777888500716 ok true
+   r16 LD-DIAL slates-fleet to 127.0.0.1:46314 began_wall 1794146777788143203 ended_wall 1794146777890462408 ok true
+   r16 LD-DIAL slates-fleet to 127.0.0.1:46314 began_wall 1794146777834126839 ended_wall 1794146777892604803 ok true
+   r16 LD-DIAL slates-fleet to 127.0.0.1:46310 began_wall 1794146777937167010 ended_wall 1794146777939339657 ok true
+   r16 LD-DIAL slates-fleet to 127.0.0.1:46312 began_wall 1794146777938293437 ended_wall 1794146777940289666 ok true
+   r16 LD-DIAL slates-fleet to 127.0.0.1:46312 began_wall 1794146777987742971 ended_wall 1794146777989765269 ok true
+   r16 LD-DIAL slates-fleet to 127.0.0.1:46310 began_wall 1794146777989465247 ended_wall 1794146777991278072 ok true
+   r16 LD-DIAL slates-fleet to 127.0.0.1:46314 began_wall 1794146777993454980 ended_wall 1794146777997302186 ok true
+   r16 LD-DIAL slates-fleet to 127.0.0.1:46314 began_wall 1794146777993429672 ended_wall 1794146777998975760 ok true
+   r16 LD-RESUME chaos-rolling-b-22793 wall_ns 1794146781876114109
+   r16 LD-DIAL slates-fleet to 127.0.0.1:46312 began_wall 1794146781901883812 ended_wall 1794146781904287904 ok true
+   r16 LD-DIAL slates-fleet to 127.0.0.1:46312 began_wall 1794146781898206684 ended_wall 1794146781905755279 ok true
+   r16 LD-SERVE wall_ns 1794146781986861821 install bytes 10470674
+   r16 LD-SERVE wall_ns 1794146782164327536 install bytes 18379436
+   r16 LD-RESUME chaos-rolling-c-22793 wall_ns 1794146784124892049
+   r16 LD-DIAL slates-fleet to 127.0.0.1:46314 began_wall 1794146784181063087 ended_wall 1794146784183047190 ok true
+   r16 LD-DIAL slates-fleet to 127.0.0.1:46314 began_wall 1794146784211895700 ended_wall 1794146784213438118 ok true
+   r16 LD-SERVE wall_ns 1794146784311562733 install bytes 27415516
+== partition 16 exit 0
+   r17   7996 writes, 7996 acknowledged: p50 403 us, p99 2337 us, p999 22239 us, max 292390 us; 2 over 50ms (sent+took): 0.00s+115ms 2.19s+292ms
+   r17 LD-DIAL slates-fleet to 127.0.0.1:28766 began_wall 1794146788702220018 ended_wall 1794146788754315082 ok true
+   r17 LD-DIAL slates-fleet to 127.0.0.1:28764 began_wall 1794146788752326361 ended_wall 1794146788755007267 ok true
+   r17 LD-DIAL slates-fleet to 127.0.0.1:28766 began_wall 1794146788821921345 ended_wall 1794146788823294975 ok true
+   r17 LD-DIAL slates-fleet to 127.0.0.1:28764 began_wall 1794146788821732201 ended_wall 1794146788825449536 ok true
+   r17 LD-DIAL slates-fleet to 127.0.0.1:28768 began_wall 1794146788702534767 ended_wall 1794146788827796657 ok true
+   r17 LD-DIAL slates-fleet to 127.0.0.1:28768 began_wall 1794146788752539881 ended_wall 1794146788828488178 ok true
+   r17 LD-DIAL slates-fleet to 127.0.0.1:28764 began_wall 1794146788856143921 ended_wall 1794146788857800330 ok true
+   r17 LD-DIAL slates-fleet to 127.0.0.1:28766 began_wall 1794146788856098005 ended_wall 1794146788857817782 ok true
+   r17 LD-DIAL slates-fleet to 127.0.0.1:28766 began_wall 1794146788924204413 ended_wall 1794146788925918280 ok true
+   r17 LD-DIAL slates-fleet to 127.0.0.1:28764 began_wall 1794146788926695364 ended_wall 1794146788928448160 ok true
+   r17 LD-DIAL slates-fleet to 127.0.0.1:28768 began_wall 1794146788929964046 ended_wall 1794146788932164864 ok true
+   r17 LD-DIAL slates-fleet to 127.0.0.1:28768 began_wall 1794146788929989607 ended_wall 1794146788932542851 ok true
+   r17 LD-RESUME chaos-rolling-a-23751 wall_ns 1794146791910511731
+   r17 LD-DIAL slates-fleet to 127.0.0.1:28764 began_wall 1794146791940987328 ended_wall 1794146791943081057 ok true
+   r17 LD-DIAL slates-fleet to 127.0.0.1:28764 began_wall 1794146791966193484 ended_wall 1794146791967588517 ok true
+   r17 LD-SERVE wall_ns 1794146792000879537 install bytes 7070990
+   r17 LD-SERVE wall_ns 1794146792213741285 install bytes 18830800
+   r17 LD-RESUME chaos-rolling-c-23751 wall_ns 1794146793944306282
+   r17 LD-DIAL slates-fleet to 127.0.0.1:28768 began_wall 1794146793953372525 ended_wall 1794146793955137281 ok true
+   r17 LD-DIAL slates-fleet to 127.0.0.1:28768 began_wall 1794146794016496397 ended_wall 1794146794020366296 ok true
+   r17 LD-SERVE wall_ns 1794146794021877490 install bytes 18830800
+   r17 LD-SERVE wall_ns 1794146794478392014 install bytes 34966420
+== partition 17 exit 0
+   r18   5971 writes, 5971 acknowledged: p50 494 us, p99 3430 us, p999 28729 us, max 260971 us; 2 over 50ms (sent+took): 0.00s+169ms 2.28s+261ms
+   r18 LD-DIAL slates-fleet to 127.0.0.1:36267 began_wall 1794146795058892915 ended_wall 1794146795105164578 ok true
+   r18 LD-DIAL slates-fleet to 127.0.0.1:36265 began_wall 1794146795103220653 ended_wall 1794146795105821271 ok true
+   r18 LD-DIAL slates-fleet to 127.0.0.1:36265 began_wall 1794146795149327835 ended_wall 1794146795151655794 ok true
+   r18 LD-DIAL slates-fleet to 127.0.0.1:36267 began_wall 1794146795149584024 ended_wall 1794146795152038709 ok true
+   r18 LD-DIAL slates-fleet to 127.0.0.1:36269 began_wall 1794146795059145718 ended_wall 1794146795154906536 ok true
+   r18 LD-DIAL slates-fleet to 127.0.0.1:36269 began_wall 1794146795103419685 ended_wall 1794146795155978709 ok true
+   r18 LD-DIAL slates-fleet to 127.0.0.1:36267 began_wall 1794146795206420339 ended_wall 1794146795208326239 ok true
+   r18 LD-DIAL slates-fleet to 127.0.0.1:36265 began_wall 1794146795206471174 ended_wall 1794146795208344093 ok true
+   r18 LD-DIAL slates-fleet to 127.0.0.1:36265 began_wall 1794146795253280475 ended_wall 1794146795256231670 ok true
+   r18 LD-DIAL slates-fleet to 127.0.0.1:36267 began_wall 1794146795253553174 ended_wall 1794146795256527222 ok true
+   r18 LD-DIAL slates-fleet to 127.0.0.1:36269 began_wall 1794146795257882243 ended_wall 1794146795260373667 ok true
+   r18 LD-DIAL slates-fleet to 127.0.0.1:36269 began_wall 1794146795258146927 ended_wall 1794146795261912989 ok true
+   r18 LD-RESUME chaos-rolling-b-24328 wall_ns 1794146798230237478
+   r18 LD-DIAL slates-fleet to 127.0.0.1:36267 began_wall 1794146798259352056 ended_wall 1794146798267088546 ok true
+   r18 LD-DIAL slates-fleet to 127.0.0.1:36267 began_wall 1794146798327095170 ended_wall 1794146798328389254 ok true
+   r18 LD-SERVE wall_ns 1794146798361931895 install bytes 7706162
+   r18 LD-SERVE wall_ns 1794146798531827701 install bytes 13790314
+   r18 LD-RESUME chaos-rolling-c-24328 wall_ns 1794146800290144913
+   r18 LD-DIAL slates-fleet to 127.0.0.1:36269 began_wall 1794146800352451243 ended_wall 1794146800354984828 ok true
+   r18 LD-DIAL slates-fleet to 127.0.0.1:36269 began_wall 1794146800378858122 ended_wall 1794146800380445315 ok true
+   r18 LD-SERVE wall_ns 1794146800438924759 install bytes 13790314
+   r18 LD-SERVE wall_ns 1794146800810246053 install bytes 26100258
+== partition 18 exit 0
+   r19   5081 writes, 5081 acknowledged: p50 541 us, p99 4581 us, p999 33939 us, max 156475 us; 4 over 50ms (sent+took): 0.00s+156ms 2.27s+58ms 2.33s+108ms 3.65s+82ms
+   r19 LD-DIAL slates-fleet to 127.0.0.1:43521 began_wall 1794146801592023242 ended_wall 1794146801644320741 ok true
+   r19 LD-DIAL slates-fleet to 127.0.0.1:43519 began_wall 1794146801642076535 ended_wall 1794146801644906315 ok true
+   r19 LD-DIAL slates-fleet to 127.0.0.1:43521 began_wall 1794146801709800206 ended_wall 1794146801712953091 ok true
+   r19 LD-DIAL slates-fleet to 127.0.0.1:43519 began_wall 1794146801709511555 ended_wall 1794146801713456213 ok true
+   r19 LD-DIAL slates-fleet to 127.0.0.1:43523 began_wall 1794146801592281726 ended_wall 1794146801715215936 ok true
+   r19 LD-DIAL slates-fleet to 127.0.0.1:43523 began_wall 1794146801642284134 ended_wall 1794146801715975529 ok true
+   r19 LD-DIAL slates-fleet to 127.0.0.1:43519 began_wall 1794146801745698706 ended_wall 1794146801747479882 ok true
+   r19 LD-DIAL slates-fleet to 127.0.0.1:43521 began_wall 1794146801745393004 ended_wall 1794146801747504258 ok true
+   r19 LD-DIAL slates-fleet to 127.0.0.1:43521 began_wall 1794146801813610589 ended_wall 1794146801815187703 ok true
+   r19 LD-DIAL slates-fleet to 127.0.0.1:43519 began_wall 1794146801815079079 ended_wall 1794146801817649902 ok true
+   r19 LD-DIAL slates-fleet to 127.0.0.1:43523 began_wall 1794146801816572847 ended_wall 1794146801818981258 ok true
+   r19 LD-DIAL slates-fleet to 127.0.0.1:43523 began_wall 1794146801818080538 ended_wall 1794146801820058553 ok true
+   r19 LD-RESUME chaos-rolling-b-24886 wall_ns 1794146805563620603
+   r19 LD-DIAL slates-fleet to 127.0.0.1:43521 began_wall 1794146805587271401 ended_wall 1794146805589532124 ok true
+   r19 LD-DIAL slates-fleet to 127.0.0.1:43521 began_wall 1794146805625939991 ended_wall 1794146805629953827 ok true
+   r19 LD-SERVE wall_ns 1794146805663296411 install bytes 4833370
+   r19 LD-SERVE wall_ns 1794146805836730583 install bytes 12262080
+   r19 LD-RESUME chaos-rolling-c-24886 wall_ns 1794146807844479771
+   r19 LD-DIAL slates-fleet to 127.0.0.1:43523 began_wall 1794146807887405833 ended_wall 1794146807889366585 ok true
+   r19 LD-DIAL slates-fleet to 127.0.0.1:43523 began_wall 1794146807898072377 ended_wall 1794146807900045492 ok true
+   r19 LD-SERVE wall_ns 1794146808009192091 install bytes 18873968
+== partition 19 exit 0
+   r20   5256 writes, 5256 acknowledged: p50 503 us, p99 4189 us, p999 67765 us, max 159349 us; 6 over 50ms (sent+took): 0.00s+123ms 0.17s+159ms 2.22s+108ms 3.44s+68ms 4.41s+81ms 4.49s+68ms
+   r20 LD-DIAL slates-fleet to 127.0.0.1:22775 began_wall 1794146809328039037 ended_wall 1794146809330340627 ok true
+   r20 LD-DIAL slates-fleet to 127.0.0.1:22777 began_wall 1794146809280961160 ended_wall 1794146809331328086 ok true
+   r20 LD-DIAL slates-fleet to 127.0.0.1:22775 began_wall 1794146809376603698 ended_wall 1794146809379201783 ok true
+   r20 LD-DIAL slates-fleet to 127.0.0.1:22777 began_wall 1794146809376879123 ended_wall 1794146809380026818 ok true
+   r20 LD-DIAL slates-fleet to 127.0.0.1:22779 began_wall 1794146809281231195 ended_wall 1794146809382310214 ok true
+   r20 LD-DIAL slates-fleet to 127.0.0.1:22779 began_wall 1794146809328348115 ended_wall 1794146809383431481 ok true
+   r20 LD-DIAL slates-fleet to 127.0.0.1:22775 began_wall 1794146809431218516 ended_wall 1794146809433911752 ok true
+   r20 LD-DIAL slates-fleet to 127.0.0.1:22777 began_wall 1794146809433310626 ended_wall 1794146809435588048 ok true
+   r20 LD-DIAL slates-fleet to 127.0.0.1:22775 began_wall 1794146809480317257 ended_wall 1794146809483069203 ok true
+   r20 LD-DIAL slates-fleet to 127.0.0.1:22777 began_wall 1794146809482901008 ended_wall 1794146809486436666 ok true
+   r20 LD-DIAL slates-fleet to 127.0.0.1:22779 began_wall 1794146809485428712 ended_wall 1794146809487512794 ok true
+   r20 LD-DIAL slates-fleet to 127.0.0.1:22779 began_wall 1794146809485687366 ended_wall 1794146809488480135 ok true
+   r20 LD-SERVE wall_ns 1794146811518204655 install bytes 285676
+   r20 LD-RESUME chaos-rolling-a-25598 wall_ns 1794146813358926800
+   r20 LD-DIAL slates-fleet to 127.0.0.1:22775 began_wall 1794146813397525113 ended_wall 1794146813399658487 ok true
+   r20 LD-SERVE wall_ns 1794146813408532810 install bytes 285676
+   r20 LD-DIAL slates-fleet to 127.0.0.1:22775 began_wall 1794146813453018673 ended_wall 1794146813454678040 ok true
+   r20 LD-SERVE wall_ns 1794146813571210199 install bytes 10166776
+   r20 LD-RESUME chaos-rolling-b-25598 wall_ns 1794146815607797492
+   r20 LD-DIAL slates-fleet to 127.0.0.1:22777 began_wall 1794146815628727631 ended_wall 1794146815657810424 ok true
+   r20 LD-DIAL slates-fleet to 127.0.0.1:22777 began_wall 1794146815667774921 ended_wall 1794146815670464316 ok true
+   r20 LD-SERVE wall_ns 1794146815787983752 install bytes 16844184
+== partition 20 exit 0
+   r21   4710 writes, 4710 acknowledged: p50 544 us, p99 4061 us, p999 61295 us, max 165264 us; 6 over 50ms (sent+took): 0.01s+113ms 0.16s+165ms 2.03s+61ms 2.22s+95ms 3.07s+61ms 3.73s+75ms
+   r21 LD-DIAL slates-fleet to 127.0.0.1:33801 began_wall 1794146818566158204 ended_wall 1794146818619895883 ok true
+   r21 LD-DIAL slates-fleet to 127.0.0.1:33799 began_wall 1794146818617923217 ended_wall 1794146818620445520 ok true
+   r21 LD-DIAL slates-fleet to 127.0.0.1:33799 began_wall 1794146818688609447 ended_wall 1794146818693908741 ok true
+   r21 LD-DIAL slates-fleet to 127.0.0.1:33801 began_wall 1794146818688873972 ended_wall 1794146818694408567 ok true
+   r21 LD-DIAL slates-fleet to 127.0.0.1:33803 began_wall 1794146818566467313 ended_wall 1794146818695128843 ok true
+   r21 LD-DIAL slates-fleet to 127.0.0.1:33803 began_wall 1794146818618143469 ended_wall 1794146818696046484 ok true
+   r21 LD-DIAL slates-fleet to 127.0.0.1:33799 began_wall 1794146818721496756 ended_wall 1794146818723711994 ok true
+   r21 LD-DIAL slates-fleet to 127.0.0.1:33801 began_wall 1794146818721496262 ended_wall 1794146818723712151 ok true
+   r21 LD-DIAL slates-fleet to 127.0.0.1:33799 began_wall 1794146818794665461 ended_wall 1794146818796693818 ok true
+   r21 LD-DIAL slates-fleet to 127.0.0.1:33801 began_wall 1794146818795099904 ended_wall 1794146818797726234 ok true
+   r21 LD-DIAL slates-fleet to 127.0.0.1:33803 began_wall 1794146818797260612 ended_wall 1794146818800795601 ok true
+   r21 LD-DIAL slates-fleet to 127.0.0.1:33803 began_wall 1794146818797672300 ended_wall 1794146818802544145 ok true
+   r21 LD-SERVE wall_ns 1794146819947583177 install bytes 233868
+   r21 LD-RESUME chaos-rolling-a-26446 wall_ns 1794146821783102470
+   r21 LD-DIAL slates-fleet to 127.0.0.1:33799 began_wall 1794146821811769415 ended_wall 1794146821814293121 ok true
+   r21 LD-DIAL slates-fleet to 127.0.0.1:33799 began_wall 1794146821835493907 ended_wall 1794146821837469165 ok true
+   r21 LD-SERVE wall_ns 1794146821840719471 install bytes 233868
+   r21 LD-SERVE wall_ns 1794146821983259851 install bytes 12776836
+   r21 LD-DIAL slates-fleet to 127.0.0.1:33803 began_wall 1794146824001919454 ended_wall 1794146824006011484 ok true
+   r21 LD-DIAL slates-fleet to 127.0.0.1:33803 began_wall 1794146824044000674 ended_wall 1794146824047554398 ok true
+   r21 LD-SERVE wall_ns 1794146824141710955 install bytes 18440978
+== partition 21 exit 0
+   r22   7280 writes, 7280 acknowledged: p50 431 us, p99 2523 us, p999 48171 us, max 122149 us; 7 over 50ms (sent+took): 0.00s+122ms 2.12s+55ms 2.17s+63ms 2.29s+105ms 2.39s+62ms 3.52s+113ms 4.43s+56ms
+   r22 LD-DIAL slates-fleet to 127.0.0.1:41341 began_wall 1794146824892465714 ended_wall 1794146824940910234 ok true
+   r22 LD-DIAL slates-fleet to 127.0.0.1:41339 began_wall 1794146824938919373 ended_wall 1794146824941557653 ok true
+   r22 LD-DIAL slates-fleet to 127.0.0.1:41339 began_wall 1794146824986542692 ended_wall 1794146824988037531 ok true
+   r22 LD-DIAL slates-fleet to 127.0.0.1:41341 began_wall 1794146824988300253 ended_wall 1794146824991219549 ok true
+   r22 LD-DIAL slates-fleet to 127.0.0.1:41343 began_wall 1794146824939131059 ended_wall 1794146824993872399 ok true
+   r22 LD-DIAL slates-fleet to 127.0.0.1:41343 began_wall 1794146824892829405 ended_wall 1794146824994092849 ok true
+   r22 LD-DIAL slates-fleet to 127.0.0.1:41339 began_wall 1794146825042572702 ended_wall 1794146825044226318 ok true
+   r22 LD-DIAL slates-fleet to 127.0.0.1:41341 began_wall 1794146825042198321 ended_wall 1794146825045742807 ok true
+   r22 LD-DIAL slates-fleet to 127.0.0.1:41339 began_wall 1794146825090581155 ended_wall 1794146825092273834 ok true
+   r22 LD-DIAL slates-fleet to 127.0.0.1:41341 began_wall 1794146825092180519 ended_wall 1794146825093929955 ok true
+   r22 LD-DIAL slates-fleet to 127.0.0.1:41343 began_wall 1794146825095890242 ended_wall 1794146825098239814 ok true
+   r22 LD-DIAL slates-fleet to 127.0.0.1:41343 began_wall 1794146825096243707 ended_wall 1794146825098474865 ok true
+   r22 LD-RESUME chaos-rolling-a-27026 wall_ns 1794146828043154597
+   r22 LD-DIAL slates-fleet to 127.0.0.1:41339 began_wall 1794146828055059121 ended_wall 1794146828057687401 ok true
+   r22 LD-DIAL slates-fleet to 127.0.0.1:41339 began_wall 1794146828103074459 ended_wall 1794146828105188958 ok true
+   r22 LD-SERVE wall_ns 1794146828160756516 install bytes 7999760
+   r22 LD-SERVE wall_ns 1794146828317504916 install bytes 18793314
+   r22 LD-RESUME chaos-rolling-b-27026 wall_ns 1794146830281023366
+   r22 LD-DIAL slates-fleet to 127.0.0.1:41341 began_wall 1794146830317819094 ended_wall 1794146830320100295 ok true
+   r22 LD-DIAL slates-fleet to 127.0.0.1:41341 began_wall 1794146830347568052 ended_wall 1794146830349203433 ok true
+   r22 LD-SERVE wall_ns 1794146830456170324 install bytes 27526670
+== partition 22 exit 0
+   r23   5020 writes, 5020 acknowledged: p50 519 us, p99 4778 us, p999 22633 us, max 153517 us; 2 over 50ms (sent+took): 0.00s+154ms 2.37s+67ms
+   r23 LD-DIAL slates-fleet to 127.0.0.1:20181 began_wall 1794146832274066100 ended_wall 1794146832327203018 ok true
+   r23 LD-DIAL slates-fleet to 127.0.0.1:20179 began_wall 1794146832325183845 ended_wall 1794146832327845839 ok true
+   r23 LD-DIAL slates-fleet to 127.0.0.1:20179 began_wall 1794146832390821193 ended_wall 1794146832393552697 ok true
+   r23 LD-DIAL slates-fleet to 127.0.0.1:20181 began_wall 1794146832391059369 ended_wall 1794146832393899977 ok true
+   r23 LD-DIAL slates-fleet to 127.0.0.1:20183 began_wall 1794146832274333260 ended_wall 1794146832397766625 ok true
+   r23 LD-DIAL slates-fleet to 127.0.0.1:20183 began_wall 1794146832325407464 ended_wall 1794146832399557229 ok true
+   r23 LD-DIAL slates-fleet to 127.0.0.1:20179 began_wall 1794146832428688838 ended_wall 1794146832430661742 ok true
+   r23 LD-DIAL slates-fleet to 127.0.0.1:20181 began_wall 1794146832428413055 ended_wall 1794146832430720204 ok true
+   r23 LD-DIAL slates-fleet to 127.0.0.1:20181 began_wall 1794146832494498609 ended_wall 1794146832496138148 ok true
+   r23 LD-DIAL slates-fleet to 127.0.0.1:20179 began_wall 1794146832495993026 ended_wall 1794146832498369986 ok true
+   r23 LD-DIAL slates-fleet to 127.0.0.1:20183 began_wall 1794146832499111427 ended_wall 1794146832501305424 ok true
+   r23 LD-DIAL slates-fleet to 127.0.0.1:20183 began_wall 1794146832501214072 ended_wall 1794146832503416195 ok true
+   r23 LD-RESUME chaos-rolling-b-27706 wall_ns 1794146835386460097
+   r23 LD-DIAL slates-fleet to 127.0.0.1:20181 began_wall 1794146835443759438 ended_wall 1794146835451840346 ok true
+   r23 LD-DIAL slates-fleet to 127.0.0.1:20181 began_wall 1794146835466012900 ended_wall 1794146835471531410 ok true
+   r23 LD-SERVE wall_ns 1794146835511886321 install bytes 4608860
+   r23 LD-SERVE wall_ns 1794146835571909334 install bytes 7848222
+   r23 LD-RESUME chaos-rolling-c-27706 wall_ns 1794146837521433728
+   r23 LD-DIAL slates-fleet to 127.0.0.1:20183 began_wall 1794146837548685883 ended_wall 1794146837550465294 ok true
+   r23 LD-DIAL slates-fleet to 127.0.0.1:20183 began_wall 1794146837592308174 ended_wall 1794146837596220992 ok true
+   r23 LD-SERVE wall_ns 1794146837600160236 install bytes 7848222
+   r23 LD-SERVE wall_ns 1794146837873708212 install bytes 21910778
+== partition 23 exit 0
+   r24   5132 writes, 5132 acknowledged: p50 565 us, p99 3670 us, p999 42572 us, max 179500 us; 5 over 50ms (sent+took): 0.01s+180ms 2.18s+63ms 2.31s+55ms 3.22s+66ms 3.58s+109ms
+   r24 LD-DIAL slates-fleet to 127.0.0.1:27355 began_wall 1794146838464839906 ended_wall 1794146838467109595 ok true
+   r24 LD-DIAL slates-fleet to 127.0.0.1:27357 began_wall 1794146838420131074 ended_wall 1794146838467741961 ok true
+   r24 LD-DIAL slates-fleet to 127.0.0.1:27357 began_wall 1794146838516732168 ended_wall 1794146838520184621 ok true
+   r24 LD-DIAL slates-fleet to 127.0.0.1:27355 began_wall 1794146838516424472 ended_wall 1794146838521541050 ok true
+   r24 LD-DIAL slates-fleet to 127.0.0.1:27359 began_wall 1794146838420440033 ended_wall 1794146838524598534 ok true
+   r24 LD-DIAL slates-fleet to 127.0.0.1:27359 began_wall 1794146838465122485 ended_wall 1794146838525442884 ok true
+   r24 LD-DIAL slates-fleet to 127.0.0.1:27357 began_wall 1794146838569608545 ended_wall 1794146838571712513 ok true
+   r24 LD-DIAL slates-fleet to 127.0.0.1:27355 began_wall 1794146838569610195 ended_wall 1794146838572600125 ok true
+   r24 LD-DIAL slates-fleet to 127.0.0.1:27357 began_wall 1794146838622028291 ended_wall 1794146838624193875 ok true
+   r24 LD-DIAL slates-fleet to 127.0.0.1:27355 began_wall 1794146838622355444 ended_wall 1794146838624685866 ok true
+   r24 LD-DIAL slates-fleet to 127.0.0.1:27359 began_wall 1794146838627316133 ended_wall 1794146838629277955 ok true
+   r24 LD-DIAL slates-fleet to 127.0.0.1:27359 began_wall 1794146838627049301 ended_wall 1794146838629877906 ok true
+   r24 LD-RESUME chaos-rolling-b-28258 wall_ns 1794146842493688940
+   r24 LD-DIAL slates-fleet to 127.0.0.1:27357 began_wall 1794146842494696366 ended_wall 1794146842503208271 ok true
+   r24 LD-DIAL slates-fleet to 127.0.0.1:27357 began_wall 1794146842542113521 ended_wall 1794146842544693067 ok true
+   r24 LD-SERVE wall_ns 1794146842562765982 install bytes 7023550
+   r24 LD-SERVE wall_ns 1794146842671209525 install bytes 12490394
+   r24 LD-RESUME chaos-rolling-c-28258 wall_ns 1794146844658795469
+   r24 LD-DIAL slates-fleet to 127.0.0.1:27359 began_wall 1794146844701498425 ended_wall 1794146844705408062 ok true
+   r24 LD-DIAL slates-fleet to 127.0.0.1:27359 began_wall 1794146844747772619 ended_wall 1794146844750815624 ok true
+   r24 LD-SERVE wall_ns 1794146844839960179 install bytes 18898016
+== partition 24 exit 0
+   r25   6675 writes, 6675 acknowledged: p50 437 us, p99 3417 us, p999 22681 us, max 263902 us; 2 over 50ms (sent+took): 0.00s+125ms 2.28s+264ms
+   r25 LD-DIAL slates-fleet to 127.0.0.1:36260 began_wall 1794146846104908159 ended_wall 1794146846107419699 ok true
+   r25 LD-DIAL slates-fleet to 127.0.0.1:36262 began_wall 1794146846052330689 ended_wall 1794146846108031897 ok true
+   r25 LD-DIAL slates-fleet to 127.0.0.1:36260 began_wall 1794146846172529987 ended_wall 1794146846175137246 ok true
+   r25 LD-DIAL slates-fleet to 127.0.0.1:36262 began_wall 1794146846172817686 ended_wall 1794146846175532426 ok true
+   r25 LD-DIAL slates-fleet to 127.0.0.1:36264 began_wall 1794146846052690994 ended_wall 1794146846177918869 ok true
+   r25 LD-DIAL slates-fleet to 127.0.0.1:36264 began_wall 1794146846105182983 ended_wall 1794146846178198332 ok true
+   r25 LD-DIAL slates-fleet to 127.0.0.1:36260 began_wall 1794146846208475435 ended_wall 1794146846214491771 ok true
+   r25 LD-DIAL slates-fleet to 127.0.0.1:36262 began_wall 1794146846211322239 ended_wall 1794146846215024407 ok true
+   r25 LD-DIAL slates-fleet to 127.0.0.1:36260 began_wall 1794146846277197650 ended_wall 1794146846281693583 ok true
+   r25 LD-DIAL slates-fleet to 127.0.0.1:36262 began_wall 1794146846277439783 ended_wall 1794146846284613979 ok true
+   r25 LD-DIAL slates-fleet to 127.0.0.1:36264 began_wall 1794146846280723087 ended_wall 1794146846286348054 ok true
+   r25 LD-DIAL slates-fleet to 127.0.0.1:36264 began_wall 1794146846281941597 ended_wall 1794146846287104740 ok true
+   r25 LD-SERVE wall_ns 1794146847447478912 install bytes 203656
+   r25 LD-RESUME chaos-rolling-a-28943 wall_ns 1794146849449060146
+   r25 LD-DIAL slates-fleet to 127.0.0.1:36260 began_wall 1794146849524454783 ended_wall 1794146849526973839 ok true
+   r25 LD-SERVE wall_ns 1794146849570885964 install bytes 7524700
+   r25 LD-SERVE wall_ns 1794146849727145249 install bytes 14113568
+   r25 LD-RESUME chaos-rolling-c-28943 wall_ns 1794146851485651424
+   r25 LD-DIAL slates-fleet to 127.0.0.1:36260 began_wall 1794146851487020516 ended_wall 1794146851491590762 ok true
+   r25 LD-DIAL slates-fleet to 127.0.0.1:36264 began_wall 1794146851505918855 ended_wall 1794146851507781472 ok true
+   r25 LD-DIAL slates-fleet to 127.0.0.1:36264 began_wall 1794146851551579007 ended_wall 1794146851556184266 ok true
+   r25 LD-SERVE wall_ns 1794146851589081060 install bytes 14113568
+   r25 LD-SERVE wall_ns 1794146852082376633 install bytes 29148028
+== partition 25 exit 0
+   r26   6189 writes, 6189 acknowledged: p50 513 us, p99 2749 us, p999 25013 us, max 244387 us; 2 over 50ms (sent+took): 0.00s+141ms 2.25s+244ms
+   r26 LD-DIAL slates-fleet to 127.0.0.1:43776 began_wall 1794146852938222312 ended_wall 1794146852991875414 ok true
+   r26 LD-DIAL slates-fleet to 127.0.0.1:43774 began_wall 1794146852989267112 ended_wall 1794146852992790430 ok true
+   r26 LD-DIAL slates-fleet to 127.0.0.1:43774 began_wall 1794146853058150776 ended_wall 1794146853060868344 ok true
+   r26 LD-DIAL slates-fleet to 127.0.0.1:43776 began_wall 1794146853058431141 ended_wall 1794146853061266749 ok true
+   r26 LD-DIAL slates-fleet to 127.0.0.1:43778 began_wall 1794146852938533976 ended_wall 1794146853063017460 ok true
+   r26 LD-DIAL slates-fleet to 127.0.0.1:43778 began_wall 1794146852989478267 ended_wall 1794146853064065592 ok true
+   r26 LD-DIAL slates-fleet to 127.0.0.1:43776 began_wall 1794146853093933784 ended_wall 1794146853095740286 ok true
+   r26 LD-DIAL slates-fleet to 127.0.0.1:43774 began_wall 1794146853094123712 ended_wall 1794146853095756529 ok true
+   r26 LD-DIAL slates-fleet to 127.0.0.1:43776 began_wall 1794146853161965287 ended_wall 1794146853164753947 ok true
+   r26 LD-DIAL slates-fleet to 127.0.0.1:43774 began_wall 1794146853161709788 ended_wall 1794146853165474887 ok true
+   r26 LD-DIAL slates-fleet to 127.0.0.1:43778 began_wall 1794146853165164305 ended_wall 1794146853170288037 ok true
+   r26 LD-DIAL slates-fleet to 127.0.0.1:43778 began_wall 1794146853164731175 ended_wall 1794146853170541642 ok true
+   r26 LD-SERVE wall_ns 1794146854193347983 install bytes 130268
+   r26 LD-RESUME chaos-rolling-b-29521 wall_ns 1794146856225503573
+   r26 LD-DIAL slates-fleet to 127.0.0.1:43776 began_wall 1794146856307915150 ended_wall 1794146856309496550 ok true
+   r26 LD-SERVE wall_ns 1794146856340467460 install bytes 7058020
+   r26 LD-SERVE wall_ns 1794146856497117179 install bytes 13014986
+   r26 LD-RESUME chaos-rolling-c-29521 wall_ns 1794146858270946397
+   r26 LD-DIAL slates-fleet to 127.0.0.1:43776 began_wall 1794146858271273357 ended_wall 1794146858275102785 ok true
+   r26 LD-DIAL slates-fleet to 127.0.0.1:43778 began_wall 1794146858337408556 ended_wall 1794146858339496916 ok true
+   r26 LD-DIAL slates-fleet to 127.0.0.1:43778 began_wall 1794146858352935005 ended_wall 1794146858355711270 ok true
+   r26 LD-SERVE wall_ns 1794146858412389585 install bytes 13014986
+   r26 LD-SERVE wall_ns 1794146858827888988 install bytes 27026558
+== partition 26 exit 0
+   r27   4351 writes, 4351 acknowledged: p50 578 us, p99 4922 us, p999 35662 us, max 126470 us; 4 over 50ms (sent+took): 0.00s+126ms 2.24s+108ms 2.35s+80ms 3.61s+83ms
+   r27 LD-DIAL slates-fleet to 127.0.0.1:21366 began_wall 1794146859381271734 ended_wall 1794146859383829181 ok true
+   r27 LD-DIAL slates-fleet to 127.0.0.1:21368 began_wall 1794146859333151030 ended_wall 1794146859384647717 ok true
+   r27 LD-DIAL slates-fleet to 127.0.0.1:21368 began_wall 1794146859435398003 ended_wall 1794146859438677920 ok true
+   r27 LD-DIAL slates-fleet to 127.0.0.1:21366 began_wall 1794146859435153425 ended_wall 1794146859439424598 ok true
+   r27 LD-DIAL slates-fleet to 127.0.0.1:21370 began_wall 1794146859333382884 ended_wall 1794146859441013705 ok true
+   r27 LD-DIAL slates-fleet to 127.0.0.1:21370 began_wall 1794146859381543643 ended_wall 1794146859441929770 ok true
+   r27 LD-DIAL slates-fleet to 127.0.0.1:21368 began_wall 1794146859488153482 ended_wall 1794146859490272319 ok true
+   r27 LD-DIAL slates-fleet to 127.0.0.1:21366 began_wall 1794146859488153509 ended_wall 1794146859490272306 ok true
+   r27 LD-DIAL slates-fleet to 127.0.0.1:21368 began_wall 1794146859539545119 ended_wall 1794146859542274378 ok true
+   r27 LD-DIAL slates-fleet to 127.0.0.1:21366 began_wall 1794146859541770585 ended_wall 1794146859546779782 ok true
+   r27 LD-DIAL slates-fleet to 127.0.0.1:21370 began_wall 1794146859543968336 ended_wall 1794146859547410533 ok true
+   r27 LD-DIAL slates-fleet to 127.0.0.1:21370 began_wall 1794146859544810553 ended_wall 1794146859547971681 ok true
+   r27 LD-RESUME chaos-rolling-a-30105 wall_ns 1794146862106943700
+   r27 LD-DIAL slates-fleet to 127.0.0.1:21366 began_wall 1794146862162750352 ended_wall 1794146862164675696 ok true
+   r27 LD-SERVE wall_ns 1794146862166617521 install bytes 5097
+   r27 LD-DIAL slates-fleet to 127.0.0.1:21366 began_wall 1794146862198875753 ended_wall 1794146862200843917 ok true
+   r27 LD-SERVE wall_ns 1794146862335092644 install bytes 12945306
+   r27 LD-RESUME chaos-rolling-b-30105 wall_ns 1794146864282919212
+   r27 LD-DIAL slates-fleet to 127.0.0.1:21368 began_wall 1794146864302169376 ended_wall 1794146864304456377 ok true
+   r27 LD-DIAL slates-fleet to 127.0.0.1:21368 began_wall 1794146864312034707 ended_wall 1794146864316036188 ok true
+   r27 LD-SERVE wall_ns 1794146864396751236 install bytes 16506890
+== partition 27 exit 0
+   r28   7814 writes, 7814 acknowledged: p50 423 us, p99 2361 us, p999 18738 us, max 204667 us; 5 over 50ms (sent+took): 0.00s+187ms 0.22s+176ms 2.21s+205ms 3.50s+75ms 4.46s+53ms
+   r28 LD-DIAL slates-fleet to 127.0.0.1:28232 began_wall 1794146865585313629 ended_wall 1794146865632500006 ok true
+   r28 LD-DIAL slates-fleet to 127.0.0.1:28230 began_wall 1794146865630267223 ended_wall 1794146865633431457 ok true
+   r28 LD-DIAL slates-fleet to 127.0.0.1:28230 began_wall 1794146865678023494 ended_wall 1794146865680499579 ok true
+   r28 LD-DIAL slates-fleet to 127.0.0.1:28232 began_wall 1794146865678267020 ended_wall 1794146865681753249 ok true
+   r28 LD-DIAL slates-fleet to 127.0.0.1:28234 began_wall 1794146865585656060 ended_wall 1794146865683882776 ok true
+   r28 LD-DIAL slates-fleet to 127.0.0.1:28234 began_wall 1794146865630476715 ended_wall 1794146865686729735 ok true
+   r28 LD-DIAL slates-fleet to 127.0.0.1:28230 began_wall 1794146865734056640 ended_wall 1794146865738698500 ok true
+   r28 LD-DIAL slates-fleet to 127.0.0.1:28232 began_wall 1794146865734957887 ended_wall 1794146865740129458 ok true
+   r28 LD-DIAL slates-fleet to 127.0.0.1:28230 began_wall 1794146865782091142 ended_wall 1794146865783891061 ok true
+   r28 LD-DIAL slates-fleet to 127.0.0.1:28232 began_wall 1794146865783780094 ended_wall 1794146865785663569 ok true
+   r28 LD-DIAL slates-fleet to 127.0.0.1:28234 began_wall 1794146865788268960 ended_wall 1794146865790060771 ok true
+   r28 LD-DIAL slates-fleet to 127.0.0.1:28234 began_wall 1794146865788708169 ended_wall 1794146865795205232 ok true
+   r28 LD-SERVE wall_ns 1794146867819040148 install bytes 207972
+   r28 LD-RESUME chaos-rolling-b-30633 wall_ns 1794146869643561554
+   r28 LD-DIAL slates-fleet to 127.0.0.1:28232 began_wall 1794146869667501152 ended_wall 1794146869672875757 ok true
+   r28 LD-SERVE wall_ns 1794146869676365071 install bytes 207972
+   r28 LD-DIAL slates-fleet to 127.0.0.1:28232 began_wall 1794146869701179967 ended_wall 1794146869705327068 ok true
+   r28 LD-SERVE wall_ns 1794146869867487726 install bytes 17030008
+   r28 LD-RESUME chaos-rolling-c-30633 wall_ns 1794146871910698344
+   r28 LD-DIAL slates-fleet to 127.0.0.1:28234 began_wall 1794146871951033631 ended_wall 1794146871953399670 ok true
+   r28 LD-DIAL slates-fleet to 127.0.0.1:28234 began_wall 1794146871994554326 ended_wall 1794146871996135376 ok true
+   r28 LD-SERVE wall_ns 1794146872090823503 install bytes 25729256
+== partition 28 exit 0
+   r29   5377 writes, 5377 acknowledged: p50 533 us, p99 3877 us, p999 50708 us, max 147830 us; 6 over 50ms (sent+took): 0.00s+143ms 0.20s+148ms 2.24s+83ms 2.32s+96ms 3.52s+101ms 4.33s+51ms
+   r29 LD-DIAL slates-fleet to 127.0.0.1:41555 began_wall 1794146876931194966 ended_wall 1794146876933442293 ok true
+   r29 LD-DIAL slates-fleet to 127.0.0.1:41557 began_wall 1794146876877747995 ended_wall 1794146876934027265 ok true
+   r29 LD-DIAL slates-fleet to 127.0.0.1:41555 began_wall 1794146877003434866 ended_wall 1794146877005732627 ok true
+   r29 LD-DIAL slates-fleet to 127.0.0.1:41557 began_wall 1794146877003674594 ended_wall 1794146877006090487 ok true
+   r29 LD-DIAL slates-fleet to 127.0.0.1:41559 began_wall 1794146876877999877 ended_wall 1794146877007925896 ok true
+   r29 LD-DIAL slates-fleet to 127.0.0.1:41559 began_wall 1794146876931468808 ended_wall 1794146877009028029 ok true
+   r29 LD-DIAL slates-fleet to 127.0.0.1:41555 began_wall 1794146877034445504 ended_wall 1794146877037190724 ok true
+   r29 LD-DIAL slates-fleet to 127.0.0.1:41557 began_wall 1794146877035388670 ended_wall 1794146877038418400 ok true
+   r29 LD-DIAL slates-fleet to 127.0.0.1:41557 began_wall 1794146877107179650 ended_wall 1794146877109967810 ok true
+   r29 LD-DIAL slates-fleet to 127.0.0.1:41555 began_wall 1794146877106935823 ended_wall 1794146877111745320 ok true
+   r29 LD-DIAL slates-fleet to 127.0.0.1:41559 began_wall 1794146877111266814 ended_wall 1794146877115248907 ok true
+   r29 LD-DIAL slates-fleet to 127.0.0.1:41559 began_wall 1794146877110907963 ended_wall 1794146877116535345 ok true
+   r29 LD-SERVE wall_ns 1794146879010814503 install bytes 238184
+   r29 LD-RESUME chaos-rolling-b-31658 wall_ns 1794146880861941969
+   r29 LD-DIAL slates-fleet to 127.0.0.1:41557 began_wall 1794146880909675019 ended_wall 1794146880911705923 ok true
+   r29 LD-DIAL slates-fleet to 127.0.0.1:41557 began_wall 1794146880952576930 ended_wall 1794146880954264820 ok true
+   r29 LD-SERVE wall_ns 1794146880957099263 install bytes 238184
+   r29 LD-SERVE wall_ns 1794146881100827302 install bytes 11488602
+   r29 LD-RESUME chaos-rolling-c-31658 wall_ns 1794146883095012274
+   r29 LD-DIAL slates-fleet to 127.0.0.1:41559 began_wall 1794146883169991027 ended_wall 1794146883172527785 ok true
+   r29 LD-DIAL slates-fleet to 127.0.0.1:41559 began_wall 1794146883180021049 ended_wall 1794146883182065646 ok true
+   r29 LD-SERVE wall_ns 1794146883244086563 install bytes 18373104
+== partition 29 exit 0
+   r30   7764 writes, 7764 acknowledged: p50 422 us, p99 2611 us, p999 19468 us, max 202200 us; 4 over 50ms (sent+took): 0.00s+135ms 1.24s+63ms 2.15s+74ms 2.30s+202ms
+   r30 LD-DIAL slates-fleet to 127.0.0.1:21032 began_wall 1794146884762040992 ended_wall 1794146884764316853 ok true
+   r30 LD-DIAL slates-fleet to 127.0.0.1:21034 began_wall 1794146884711103332 ended_wall 1794146884765006386 ok true
+   r30 LD-DIAL slates-fleet to 127.0.0.1:21034 began_wall 1794146884826266048 ended_wall 1794146884830721886 ok true
+   r30 LD-DIAL slates-fleet to 127.0.0.1:21032 began_wall 1794146884825961197 ended_wall 1794146884830875904 ok true
+   r30 LD-DIAL slates-fleet to 127.0.0.1:21036 began_wall 1794146884711345555 ended_wall 1794146884834783922 ok true
+   r30 LD-DIAL slates-fleet to 127.0.0.1:21036 began_wall 1794146884762318131 ended_wall 1794146884835365057 ok true
+   r30 LD-DIAL slates-fleet to 127.0.0.1:21032 began_wall 1794146884865319750 ended_wall 1794146884867520499 ok true
+   r30 LD-DIAL slates-fleet to 127.0.0.1:21034 began_wall 1794146884866309475 ended_wall 1794146884868513130 ok true
+   r30 LD-DIAL slates-fleet to 127.0.0.1:21032 began_wall 1794146884933268916 ended_wall 1794146884935271442 ok true
+   r30 LD-DIAL slates-fleet to 127.0.0.1:21034 began_wall 1794146884932984314 ended_wall 1794146884935654449 ok true
+   r30 LD-DIAL slates-fleet to 127.0.0.1:21036 began_wall 1794146884937253495 ended_wall 1794146884939364006 ok true
+   r30 LD-DIAL slates-fleet to 127.0.0.1:21036 began_wall 1794146884938328948 ended_wall 1794146884941266407 ok true
+   r30 LD-RESUME chaos-rolling-a-32387 wall_ns 1794146888843019570
+   r30 LD-DIAL slates-fleet to 127.0.0.1:21032 began_wall 1794146888850433315 ended_wall 1794146888853822329 ok true
+   r30 LD-DIAL slates-fleet to 127.0.0.1:21032 began_wall 1794146888888199670 ended_wall 1794146888890048160 ok true
+   r30 LD-SERVE wall_ns 1794146888957314215 install bytes 9602596
+   r30 LD-SERVE wall_ns 1794146889148777335 install bytes 17225282
+   r30 LD-RESUME chaos-rolling-c-32387 wall_ns 1794146890965419671
+   r30 LD-DIAL slates-fleet to 127.0.0.1:21036 began_wall 1794146890996334360 ended_wall 1794146890998828890 ok true
+   r30 LD-DIAL slates-fleet to 127.0.0.1:21036 began_wall 1794146891047737920 ended_wall 1794146891049265329 ok true
+   r30 LD-SERVE wall_ns 1794146891065089320 install bytes 17225282
+   r30 LD-SERVE wall_ns 1794146891639889207 install bytes 33947128
+== partition 30 exit 0
