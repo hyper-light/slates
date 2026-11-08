@@ -11735,6 +11735,29 @@ Each copy's p50 against the three copies' mean in the same run, over every op (g
 - **So:** the bench rotates its list every run from now on (`windows-ab.sh`), and a cut is called only on its
   within-run differences against a do-nothing arm, measured beyond what identical arms show.
 
+### The Open and Release barriers: measured and rejected as a cut (audit step 7; 2026-11-08)
+
+**The proposal.** A-198's rule that "successful opens and closes publish their reference changes" puts a shard
+publication before an Open's and a Release's reply. Recovery already reconciles the restored open counts against the
+ledger's live contexts (`reconcile_opens`), so the barrier looked removable, a whole publication off each open and close.
+
+**The measurement.** From the per-phase profile of `diag-winfsp-overlap-46` (run 42406233399, five runs a runner): a
+round's mean less its hop-in, serve and to-answer leaves the shard's answer step, which is the barrier and the send.
+Means, µs:
+
+| answer step | arm64, main | arm64, dll | x86_64, main | x86_64, dll |
+|---|---|---|---|---|
+| Open (barrier) | 0.5 | 2.7 | 0.3 | 4.8 |
+| Release (barrier) | 0.8 | 3.6 | 0.7 | 8.0 |
+| Resolve (no barrier) | 0.6 | 0.6 | 0.4 | 0.3 |
+| Info (no barrier) | 0.6 | 1.1 | 0.5 | 0.6 |
+
+In main's form an Open's or a Release's barrier costs what an op with none does, within 0.2 µs; only the DLL arm still
+pays it. Removing it would save under 0.2 µs a request, against the bench's ±2% floor between identical arms (above), so
+it is **rejected**, and A-198 stays as written. The ledger's own writes, the other candidate named with it, show no cost
+against the DLL at the mean either (serve: Create 10.2 against 13.6 µs on arm64 and 7.3 against 8.7 on x86_64; Open
+2.3 against 3.2 and 2.0 against 2.8).
+
 ### Step 7's verdict
 
 - **Fixed wherever it was not crash safety:** the replayed Close's refusal, the rename's empty shard turn, the per-batch
