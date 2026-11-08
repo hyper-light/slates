@@ -8590,6 +8590,94 @@ fn the_lookups_a_dead_daemon_was_given_back_after_its_last_publication_stay_give
   drop(anchor);
 }
 
+/// Shape: the files the unmount sweep test looks up through the mount it then unmounts, and each one's bytes: 64 files
+/// of 64 KiB, 4 MiB held in all, plainly apart from the volume's own few kilobytes.
+#[cfg(target_os = "linux")]
+const LOOKED_UP_FILES: usize = 64;
+/// Shape: see [`LOOKED_UP_FILES`].
+#[cfg(target_os = "linux")]
+const LOOKED_UP_FILE_BYTES: usize = 64 << 10;
+
+/// Measure first (the supervisor's ask of 2026-11-08; bug-sweep, read and not measured): an ordinary FUSE mount gets no
+/// `DESTROY` at its unmount, and the kernel sends no `FORGET` for the inodes it still holds then, so the lookups a mount
+/// made would stay counted until the next restart. Do: mount a volume twice, once read-only; write 64 files of 64 KiB
+/// through the writable mount; look each up through the read-only mount (`stat`); unmount the read-only mount; unlink
+/// the files through the writable mount, and wait for its kernel's `FORGET`s. Expect `referenced_bytes` back where it
+/// was before the files: the unmounted mount's lookups are given back at its end. Linux only.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_lookups_an_unmounted_fuse_mount_held_are_given_back_at_its_end() {
+  if !live_mount_runs() {
+    return;
+  }
+  let instance = format!("cli-unmountsweep-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "swept", "--bounded", "16MiB"],
+  );
+  assert_eq!(code, 0, "a volume: {err}");
+  let id = value_of(&out, "id");
+  let writer = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &id, &writer.path);
+  let looker = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let (code, _, err) = run(&instance, &["mount", &id, &looker.path, "--read-only"]);
+  assert_eq!(code, 0, "the read-only mount: {err}");
+  let referenced = || -> u64 {
+    let (code, out, err) = run(&instance, &["status", &id]);
+    assert_eq!(code, 0, "status: {err}");
+    value_of(&out, "referenced_bytes").parse().unwrap()
+  };
+  let before = referenced();
+  write_and_look_up(&writer.path, &looker.path);
+  let (code, _, err) = unmount_through_the_cli(&instance, &looker.path);
+  assert_eq!(code, 0, "the read-only mount is unmounted: {err}");
+  for index in 0..LOOKED_UP_FILES {
+    #[allow(clippy::disallowed_methods)] // unlinked through the slates mount
+    std::fs::remove_file(format!("{}/looked-{index}.bin", writer.path)).unwrap();
+  }
+  let deadline = Instant::now() + WAIT_FOR;
+  let mut now = referenced();
+  while now > before && Instant::now() < deadline {
+    pause();
+    now = referenced();
+  }
+  println!(
+    "unmount sweep: referenced_bytes {before} before the files, {now} after the unmount and the unlinks ({} looked up)",
+    LOOKED_UP_FILES * LOOKED_UP_FILE_BYTES
+  );
+  assert_eq!(
+    now, before,
+    "the unmounted mount's lookups were given back at its end, so the unlinked files are freed"
+  );
+  drop(looker);
+  drop(writer);
+  drop(anchor);
+}
+
+/// Writes [`LOOKED_UP_FILES`] files through the mount at `writer` and looks each up through the mount at `looker`.
+#[cfg(target_os = "linux")]
+fn write_and_look_up(writer: &str, looker: &str) {
+  for index in 0..LOOKED_UP_FILES {
+    #[allow(clippy::disallowed_methods)]
+    // the test's own file, written through the slates mount: RAM, not disk
+    std::fs::write(
+      format!("{writer}/looked-{index}.bin"),
+      vec![0x6Bu8; LOOKED_UP_FILE_BYTES],
+    )
+    .unwrap();
+  }
+  for index in 0..LOOKED_UP_FILES {
+    #[allow(clippy::disallowed_methods)] // a lookup through the slates mount
+    let seen = std::fs::metadata(format!("{looker}/looked-{index}.bin")).unwrap();
+    assert_eq!(seen.len(), u64::try_from(LOOKED_UP_FILE_BYTES).unwrap());
+  }
+}
+
 /// A takeover recovers an overlay whose base directory an outsider changed after the last publication (§4.5 recovery,
 /// A-61; `docs/bugs/2026-10-22-a-takeover-refused-an-overlay-whose-base-directory-an-outsider-had-changed.md`). Do: create
 /// a volume over a base directory holding `notes.txt`, mount it, read the file (its directory's listing is loaded) and
