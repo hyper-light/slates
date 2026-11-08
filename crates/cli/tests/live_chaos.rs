@@ -1666,6 +1666,152 @@ fn judge_healed(
   }
 }
 
+/// Diag only (live-durability-68, never on main): a holder restarted while an install exchange to its old process is
+/// outstanding: how long the new process takes to catch up, and whether the writes go on.
+#[test]
+fn diag_a_holder_restarted_mid_install() {
+  if !gated("restart-mid-install") {
+    return;
+  }
+  /// How close to the owner's head counts as caught up under the stream.
+  const NEAR: u64 = 50;
+  let dir = std::env::var("SLATES_DIAG_STOP_DIR").unwrap();
+  let _ = std::fs::remove_file(format!("{dir}/stopped"));
+  let fleet = Fleet::start("restartmid", Supervision::Anchored);
+  let owner_index = fleet.owner_index();
+  let owner = fleet.instances[owner_index].clone();
+  let volume = create_volume(&owner, "restartmid", true);
+  let target = fleet.others(owner_index)[0];
+  let holder = fleet.instances[target].clone();
+  let (outcomes, _samples) = stream_through(&fleet.instances, &owner, &volume, 0..STREAM_FILES, |_began| {
+    after_writes(&owner, &volume, 40);
+    // Armed before the stop: the anchor may restart a stopped daemon, and whichever process serves the install stops.
+    std::fs::write(format!("{dir}/any"), b"").unwrap();
+    fleet.stop(target);
+    sleep(Duration::from_secs(2));
+    after_writes(&owner, &volume, 200);
+    let _ = daemon_pid(&holder).map(|pid| send_signal(pid, rustix::process::Signal::CONT));
+    let waiting = Instant::now();
+    let pid = loop {
+      if let Ok(text) = std::fs::read_to_string(format!("{dir}/stopped")) {
+        if let Ok(pid) = text.trim().parse::<u32>() {
+          break Some(pid);
+        }
+      }
+      if waiting.elapsed() > Duration::from_secs(20) {
+        break None;
+      }
+      sleep(Duration::from_millis(5));
+    };
+    eprintln!("LD-TL stopped_on_install {pid:?} after {:?}", waiting.elapsed());
+    let Some(pid) = pid else {
+      let _ = std::fs::remove_file(format!("{dir}/any"));
+      return;
+    };
+    sleep(Duration::from_secs(1));
+    send_signal(pid, rustix::process::Signal::KILL);
+    let restarted = Instant::now();
+    loop {
+      if daemon_pid(&holder).is_some_and(|new| new != pid) {
+        break;
+      }
+      assert!(restarted.elapsed() < START_WAIT, "no successor");
+      pause();
+    }
+    eprintln!("LD-TL successor after {:?}", restarted.elapsed());
+    let mut caught = None;
+    while restarted.elapsed() < Duration::from_secs(50) {
+      let shipping = live_states(&owner, &volume).unwrap_or_default().into_iter().find(|state| !state.holding).and_then(|state| state.head);
+      let held = live_states(&holder, &volume).unwrap_or_default().into_iter().find(|state| state.holding).and_then(|state| state.head);
+      if let (Some(shipping), Some(held)) = (shipping, held) && held + NEAR >= shipping {
+        caught = Some(restarted.elapsed());
+        break;
+      }
+      sleep(Duration::from_millis(20));
+    }
+    eprintln!("LD-TL caught {caught:?}");
+    if caught.is_none() {
+      eprintln!("LD-DUMP\n{}\nLD-DUMP-END", diagnosis(&fleet.instances, &volume));
+    }
+    let durable = || live_states(&owner, &volume).unwrap_or_default().into_iter().find(|state| !state.holding).and_then(|state| state.durable);
+    let (before, moved) = (durable(), Instant::now());
+    while moved.elapsed() < Duration::from_secs(5) && durable() == before {
+      sleep(Duration::from_millis(50));
+    }
+    eprintln!("LD-TL durable {before:?} then {:?} after {:?}", durable(), moved.elapsed());
+  });
+  eprintln!("LD-TL writes {}", outcomes.len());
+}
+
+/// Diag only (live-durability-68, never on main): a holder stopped on serving an install, kept stopped past the
+/// membership's loss of it and short of the install's budget, then resumed: when the owner's exchange to it ends, and
+/// how long the holder then takes to catch up.
+#[test]
+fn diag_a_holder_stopped_mid_install_stays_stopped() {
+  if !gated("stays-stopped") {
+    return;
+  }
+  /// How close to the owner's head counts as caught up under the stream.
+  const NEAR: u64 = 50;
+  /// How long the holder stays stopped: past the 1 to 15 s the owner took to drop it (-58), short of the 30 s floor.
+  const STOPPED: Duration = Duration::from_secs(20);
+  let dir = std::env::var("SLATES_DIAG_STOP_DIR").unwrap();
+  let _ = std::fs::remove_file(format!("{dir}/stopped"));
+  let fleet = Fleet::start("staysstopped", Supervision::Bare);
+  let owner_index = fleet.owner_index();
+  let owner = fleet.instances[owner_index].clone();
+  let volume = create_volume(&owner, "staysstopped", true);
+  let target = fleet.others(owner_index)[0];
+  let holder = fleet.instances[target].clone();
+  let (outcomes, _samples) = stream_through(&fleet.instances, &owner, &volume, 0..usize::MAX, |_began| {
+    after_writes(&owner, &volume, 40);
+    std::fs::write(format!("{dir}/any"), b"").unwrap();
+    fleet.stop(target);
+    sleep(Duration::from_secs(2));
+    after_writes(&owner, &volume, 200);
+    let _ = daemon_pid(&holder).map(|pid| send_signal(pid, rustix::process::Signal::CONT));
+    let waiting = Instant::now();
+    let pid = loop {
+      if let Ok(text) = std::fs::read_to_string(format!("{dir}/stopped")) {
+        if let Ok(pid) = text.trim().parse::<u32>() {
+          break Some(pid);
+        }
+      }
+      if waiting.elapsed() > Duration::from_secs(20) {
+        break None;
+      }
+      sleep(Duration::from_millis(5));
+    };
+    eprintln!("LD-TL stopped_on_install {pid:?} after {:?}", waiting.elapsed());
+    let Some(pid) = pid else {
+      let _ = std::fs::remove_file(format!("{dir}/any"));
+      return;
+    };
+    sleep(STOPPED);
+    eprintln!("LD-TL resume wall_ns {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos()));
+    send_signal(pid, rustix::process::Signal::CONT);
+    let resumed = Instant::now();
+    let mut caught = None;
+    while resumed.elapsed() < Duration::from_secs(50) {
+      let shipping = live_states(&owner, &volume).unwrap_or_default().into_iter().find(|state| !state.holding).and_then(|state| state.head);
+      let held = live_states(&holder, &volume).unwrap_or_default().into_iter().find(|state| state.holding).and_then(|state| state.head);
+      if let (Some(shipping), Some(held)) = (shipping, held) && held + NEAR >= shipping {
+        caught = Some(resumed.elapsed());
+        break;
+      }
+      sleep(Duration::from_millis(20));
+    }
+    eprintln!("LD-TL caught {caught:?}");
+    let durable = || live_states(&owner, &volume).unwrap_or_default().into_iter().find(|state| !state.holding).and_then(|state| state.durable);
+    let (before, moved) = (durable(), Instant::now());
+    while moved.elapsed() < Duration::from_secs(5) && durable() == before {
+      sleep(Duration::from_millis(50));
+    }
+    eprintln!("LD-TL durable {before:?} then {:?} after {:?}", durable(), moved.elapsed());
+  });
+  eprintln!("LD-TL writes {}", outcomes.len());
+}
+
 /// A-200 with candidates partitioned in turn mid-stream: do stream writes to a live volume and stop each candidate's
 /// process (SIGSTOP) for [`PARTITION`] in turn, the stream running throughout, then resume it. Expect every write
 /// acknowledged (durable through whichever candidate answers), none lost, both candidates caught up once healed, and one
