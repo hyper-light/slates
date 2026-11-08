@@ -82,6 +82,10 @@ impl Bridge for ScopedBridge<'_> {
     self.inner.awaits_publication()
   }
 
+  fn authorize_change(&self, cx: &OpContext) -> Result<(), VfsError> {
+    self.inner.authorize_change(cx)
+  }
+
   fn root(&mut self, _cx: &OpContext) -> Result<u64, VfsError> {
     Ok(self.scope)
   }

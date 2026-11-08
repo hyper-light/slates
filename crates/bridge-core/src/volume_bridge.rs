@@ -154,6 +154,19 @@ impl LostWrites {
   }
 }
 
+/// Format: the access-mode bits of an open's flags (`O_ACCMODE`), as the FUSE protocol carries them (Linux `O_*`).
+const OPEN_ACCESS_MODE: u32 = 0o3;
+/// Format: `O_RDONLY`, the one access mode that reads alone.
+const OPEN_READ_ONLY: u32 = 0;
+/// Format: `O_TRUNC` (Linux `0o1000`), an open that empties the file.
+const OPEN_TRUNCATE: u32 = 0o1000;
+
+/// Whether an open with `flags` (the FUSE protocol's, Linux `O_*`; a transport without open flags passes `O_RDONLY`)
+/// would change the file: a write access mode, or a truncation.
+fn opens_for_writing(flags: u32) -> bool {
+  flags & OPEN_ACCESS_MODE != OPEN_READ_ONLY || flags & OPEN_TRUNCATE != 0
+}
+
 impl std::fmt::Debug for VolumeBridge<'_> {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("VolumeBridge")
@@ -380,11 +393,18 @@ impl<'v> VolumeBridge<'v> {
     if cx.volume != self.volume_id {
       return Err(VfsError::NotPermitted);
     }
+    // An attachment that may read but not write, or a snapshot's view, is a read-only file system to its client, and
+    // answers as one (`EROFS`, POSIX), on every transport; one with no rights at all is refused for permission. Until
+    // 2026-11-08 both answered `NotPermitted`, so a read-only mount's client was told `EPERM`/`PERM`.
     if !cx.rights.write {
-      return Err(VfsError::NotPermitted);
+      return Err(if cx.rights.read {
+        VfsError::ReadOnly
+      } else {
+        VfsError::NotPermitted
+      });
     }
     if !matches!(cx.view, View::Current) {
-      return Err(VfsError::NotPermitted);
+      return Err(VfsError::ReadOnly);
     }
     Ok(())
   }
@@ -625,6 +645,10 @@ fn unpack_handle(word: u64) -> Handle<u64> {
 }
 
 impl Bridge for VolumeBridge<'_> {
+  fn authorize_change(&self, cx: &OpContext) -> Result<(), VfsError> {
+    self.authorize_write(cx)
+  }
+
   fn awaits_publication(&self) -> bool {
     self.volume.awaits_publication()
   }
@@ -675,8 +699,13 @@ impl Bridge for VolumeBridge<'_> {
     self.attr_of(object.inode)
   }
 
-  fn open(&mut self, object: ObjectId, cx: &OpContext, _flags: u32) -> Result<u64, VfsError> {
+  fn open(&mut self, object: ObjectId, cx: &OpContext, flags: u32) -> Result<u64, VfsError> {
     self.authorize_read(cx)?;
+    // An open for writing is itself a change: a read-only file system refuses it at the open (POSIX `EROFS`), never at
+    // each write through the handle it granted.
+    if opens_for_writing(flags) {
+      self.authorize_write(cx)?;
+    }
     if self
       .volume
       .kind(self.store, InodeNo(object.inode))?

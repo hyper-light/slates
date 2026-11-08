@@ -43,7 +43,7 @@ use crate::work_files::{Base, FetchedBase, WorkFiles};
 pub(crate) const ASKED_THE_OWNER: &str = "merge.work.asked_owner";
 /// Format: a deferred verdict resumed its parked verb when its record committed at the quorum (AUD-11), the non-vacuity
 /// count of [`answered_late`].
-pub const ANSWERED_LATE: &str = "merge.work.answered_late";
+pub(crate) const ANSWERED_LATE: &str = "merge.work.answered_late";
 /// Format: a verb refused because the shard's parked verbs are at their bound.
 const PARK_FULL: &str = "merge.work.park_full";
 /// Format: an ask of the green's owner unanswered within its deadline; the verb answers `Overloaded` and is retried.

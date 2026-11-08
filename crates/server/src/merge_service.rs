@@ -572,7 +572,7 @@ pub(crate) fn attachable_record(
 /// on this shard (the base volume's owner). Refused as [`check_origin_base`] refuses, and the volume core's own
 /// refusal for a torn read.
 pub(crate) fn seed_origin(
-  state: &ShardState,
+  state: &mut ShardState,
   principal: &Principal,
   base: GreenBase,
 ) -> Result<Origin, Refusal> {
@@ -586,7 +586,7 @@ pub(crate) fn seed_origin(
 /// or snapshot that does not exist here, `Forbidden` without the read right, `ConsistentBaseUnavailable` when the
 /// snapshot still depends on the host directory (an overlay not pinned whole before the freeze).
 pub(crate) fn check_origin_base(
-  state: &ShardState,
+  state: &mut ShardState,
   principal: &Principal,
   base: GreenBase,
 ) -> Result<slates_mem::Handle<crate::state::VolumeSlot>, Refusal> {
@@ -607,11 +607,22 @@ pub(crate) fn check_origin_base(
   {
     return Err(Refusal::NotFound);
   }
-  let slot = state.volumes.get(handle).map_err(|_| Refusal::NotFound)?;
-  match slot
-    .volume
-    .snapshot_is_complete(&state.store, core_snapshot(base.snapshot))
-  {
+  let slot = state
+    .volumes
+    .get_mut(handle)
+    .map_err(|_| Refusal::NotFound)?;
+  // An overlay's snapshot is judged with its host, so a directory whose listing this daemon has not read since a
+  // restart is read now rather than taken for incomplete (A-153's "read again on first use").
+  let complete = match slot.host.as_mut() {
+    Some(host) => slot
+      .volume
+      .with_host(host)
+      .snapshot_is_complete(&state.store, core_snapshot(base.snapshot)),
+    None => slot
+      .volume
+      .snapshot_is_complete(&state.store, core_snapshot(base.snapshot)),
+  };
+  match complete {
     Ok(true) => Ok(handle),
     Ok(false) => Err(Refusal::ConsistentBaseUnavailable),
     Err(e) => Err(refusal_of_vfs(&e)),
@@ -2458,6 +2469,85 @@ pub(crate) fn defer_acceptance(state: &mut ShardState, green: DbVolumeId, versio
   state.count(ACCEPTANCE_DEFERRED, 1);
 }
 
+/// Stages, in the running submit's transaction and ahead of its version's append, that its request waits for `version`
+/// of `green` to commit (A-252): the append and the wait are one durable step, so a restart keeps the wait wherever it
+/// falls. Its failure fails the accept, since a version durable without its wait is one a resend would run again. At
+/// `f = 0` the completion recorded in the same transaction replaces it. No recorded request is running in a rebuild's
+/// replay, and nothing is staged.
+pub(crate) fn stage_awaiting(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  version: u64,
+) -> Result<(), slates_db::DbError> {
+  let Some((origin, id)) = state.current_request else {
+    return Ok(());
+  };
+  let now = state.clock.monotonic_ns();
+  state
+    .db
+    .mutate(
+      &mut state.segment,
+      &slates_db::op::Op::CompletionAwaiting {
+        origin,
+        client: id.client,
+        sequence: id.sequence,
+        green,
+        version,
+      },
+      now,
+    )
+    .map(|_| ())
+}
+
+/// Serves a request the partition holds as waiting for `version` of `object` (A-252): typically its resend after the
+/// owner restarted and lost the in-memory wait. It never runs again. Answered now, the completion recorded, when the
+/// version has committed; else `None`, the request having joined the wait so [`resolve_accepted`] answers it. A
+/// completion that cannot be made durable is refused typed, for the client to retry.
+pub(crate) fn serve_awaiting(
+  state: &mut ShardState,
+  origin: u64,
+  id: RequestId,
+  (object, version): ([u8; 16], u64),
+) -> Option<ReplyBody> {
+  let object = ObjectId(object);
+  if placed_version(state, object).is_some_and(|placed| placed >= version) {
+    let reply = ReplyBody::Submitted {
+      version: Some(version),
+      conflicts: Vec::new(),
+    };
+    state.db.begin();
+    let recorded = crate::verbs::record_completion(state, origin, id, reply);
+    return match state.db.commit(&mut state.segment) {
+      Ok(_) => {
+        state.count(ACCEPTANCE_RESOLVED, 1);
+        Some(recorded)
+      }
+      Err(e) => {
+        state.count(ACCEPTANCE_UNRECORDED, 1);
+        Some(ReplyBody::Refused {
+          refusal: crate::error::refusal_of_db(&e),
+        })
+      }
+    };
+  }
+  if join_awaiting(state, origin, id) {
+    return None;
+  }
+  let route = state.reply_route.take();
+  state
+    .merge
+    .awaiting
+    .entry((object, version))
+    .or_default()
+    .push(AwaitingAcceptance { route, origin, id });
+  state
+    .merge
+    .awaiting_by_request
+    .insert((origin, id.client, id.sequence), (object, version));
+  state.count(ACCEPTANCE_REJOINED, 1);
+  None
+}
+
 /// A retry of a request whose acceptance is still waiting joins the waiting entry — it will be
 /// answered with the same reply when the version commits — rather than running the verb again.
 /// Returns whether the request was waiting.
@@ -2551,6 +2641,9 @@ pub(crate) fn awaiting_count(state: &ShardState, green: DbVolumeId) -> usize {
 const ACCEPTANCE_DEFERRED: &str = "merge.acceptance_deferred";
 /// A deferred acceptance resolved: the version committed, the completion recorded, the reply sent.
 const ACCEPTANCE_RESOLVED: &str = "merge.acceptance_resolved";
+/// A request the partition held as waiting rejoined its version's wait rather than run again: its resend under its id
+/// after the owner restarted (A-252).
+const ACCEPTANCE_REJOINED: &str = "merge.acceptance_rejoined";
 /// A resolved acceptance whose completion record could not be made durable (rolled back); the
 /// client's retry re-executes and meets the idempotent accept.
 const ACCEPTANCE_UNRECORDED: &str = "merge.acceptance_unrecorded";

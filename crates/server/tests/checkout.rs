@@ -27,7 +27,7 @@ fn daemon(tag: &str) -> (Daemon, Client, [u8; 32]) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-checkout-{tag}-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", &format!("checkout-{tag}")),
     },
   )
   .unwrap();

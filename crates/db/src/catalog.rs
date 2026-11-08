@@ -652,6 +652,17 @@ pub struct AttachmentRecord {
   pub token: [u8; 16],
 }
 
+/// A request that ran and waits for a version of a green to commit (§4.16 "Commit", A-252), as a snapshot carries it.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct AwaitingCompletion {
+  /// The sequence.
+  pub sequence: u32,
+  /// The green.
+  pub green: VolumeId,
+  /// The version it waits for.
+  pub version: u64,
+}
+
 /// A completion record (RIFL, §4.9). The idempotency key is **globally unique**: `origin` is the host whose
 /// client issued the request — this node's own host for a local client, and the *authenticated* forwarding
 /// peer for a cross-node forwarded verb (§4.8 "Lookup") — so a forwarded request from another node's client

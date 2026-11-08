@@ -352,7 +352,7 @@ fn a_volume_mounted_through_fuse_serves_the_kernel_and_ends_with_its_mount() {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-fuse-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "fuse"),
     },
   )
   .unwrap();
@@ -397,7 +397,7 @@ fn a_fenced_shards_fuse_mount_ends_with_the_daemon() {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-fuse-fenced-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "fuse-fenced"),
     },
   )
   .unwrap();
@@ -463,7 +463,7 @@ fn a_scoped_fuse_mount_presents_one_directory_and_follows_it() {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-fuse-scoped-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "fuse-scoped"),
     },
   )
   .unwrap();

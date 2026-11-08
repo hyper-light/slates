@@ -64,6 +64,8 @@ pub struct ClientCompletions {
   pub records: Vec<CompletionRecord>,
   /// The ids at or below `acknowledged_up_to` the client still owes, kept open (§4.9).
   pub owed: Vec<u32>,
+  /// The requests that ran and wait for a version to commit (A-252).
+  pub awaiting: Vec<crate::catalog::AwaitingCompletion>,
 }
 
 /// One green volume's merge chain as a snapshot carries it: the green, its origin when it was
@@ -1071,9 +1073,24 @@ impl Partition {
               .and_then(ClientWindow::acknowledged_up_to)
               .unwrap_or(0),
           }),
-          Seen::New | Seen::Completed(_) => Ok(()),
+          Seen::New | Seen::Completed(_) | Seen::Awaiting { .. } => Ok(()),
         }
       }
+      Op::CompletionAwaiting {
+        origin,
+        client,
+        sequence,
+        ..
+      } => match self.completion(*origin, *client, *sequence) {
+        Seen::Acknowledged => Err(DbError::StaleCompletion {
+          acknowledged_up_to: self
+            .completions
+            .get(&(*origin, *client))
+            .and_then(ClientWindow::acknowledged_up_to)
+            .unwrap_or(0),
+        }),
+        Seen::New | Seen::Completed(_) | Seen::Awaiting { .. } => Ok(()),
+      },
       Op::CompletionsAcknowledged { .. } | Op::ClientIdReserved { .. } => Ok(()),
       // The NFSv4 records mirror state their owner already bounded and admitted (A-37).
       Op::NfsOpenSet { .. }
@@ -1556,6 +1573,20 @@ impl Partition {
           .record(record.sequence, record.result.clone());
         Ok(())
       }
+      Op::CompletionAwaiting {
+        origin,
+        client,
+        sequence,
+        green,
+        version,
+      } => {
+        self
+          .completions
+          .entry((*origin, *client))
+          .or_default()
+          .await_version(*sequence, green.bytes, *version);
+        Ok(())
+      }
       Op::CompletionsAcknowledged {
         origin,
         client,
@@ -1863,6 +1894,16 @@ impl Partition {
               result: result.clone(),
             })
             .collect(),
+          awaiting: w
+            .awaiting_entries()
+            .map(
+              |(sequence, object, version)| crate::catalog::AwaitingCompletion {
+                sequence,
+                green: VolumeId { bytes: object },
+                version,
+              },
+            )
+            .collect(),
         })
         .collect(),
       grants: self.grants.values().cloned().collect(),
@@ -1987,6 +2028,9 @@ impl Partition {
       let w = self.completions.entry((c.origin, c.client)).or_default();
       for r in &c.records {
         w.record(r.sequence, r.result.clone());
+      }
+      for a in &c.awaiting {
+        w.await_version(a.sequence, a.green.bytes, a.version);
       }
       if let Some(up_to) = c.acknowledged_up_to {
         // A fresh window: the snapshot's open ids are restored exactly (each at or below its watermark, as every

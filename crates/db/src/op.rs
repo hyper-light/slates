@@ -462,6 +462,21 @@ pub enum Op {
     /// The shipper's epoch and holders.
     holders: crate::catalog::LiveHolders,
   },
+  /// A request ran and waits for a version of a green to commit before it completes (§4.16 "Commit", A-252): logged with
+  /// the version's append, in one transaction, so a resend under its id after a restart meets the wait and never runs
+  /// again. Its completion, recorded at the commit, replaces it. Appended (2026-11-08).
+  CompletionAwaiting {
+    /// The completion key's origin: this node for a local client, the authenticated forwarding peer for a forward.
+    origin: u64,
+    /// The client.
+    client: u32,
+    /// The sequence.
+    sequence: u32,
+    /// The green.
+    green: VolumeId,
+    /// The version it waits for.
+    version: u64,
+  },
 }
 
 impl Op {
@@ -534,6 +549,7 @@ impl Op {
       Op::AttachmentExpired { .. } => "attachment_expired",
       Op::LiveShippingChanged { .. } => "live_shipping_changed",
       Op::LiveHoldersCommitted { .. } => "live_holders_committed",
+      Op::CompletionAwaiting { .. } => "completion_awaiting",
     }
   }
 }
