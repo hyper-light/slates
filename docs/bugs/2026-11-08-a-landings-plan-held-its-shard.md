@@ -57,3 +57,7 @@ snapshot's log walk is a real defect, fixed separately, but 30 of 124 waits stil
 `return_dead_recovery`, reached from `reap_loop`'s tick through `seal_idle_content` and `purge_if_idle`, 115 to 171 ms of
 CPU in one poll. Perf's slicing of that give-back (`a30e4209` on `agents/perf-b3`) took it to 0 of 411 named waits at 100
 ms or more, the highest 78 ms, on the same test beside the same 144 spinners.
+
+That slicing has a cost this test measured and its owner has: a granted landing is about five times slower under the same
+load with `a30e4209` than without (median 20.9 s against 4.3 s, 8 runs each alternated at load 60 to 209), and landings
+past the test's 60 s grant term come back `partial`. Why is not yet measured.
