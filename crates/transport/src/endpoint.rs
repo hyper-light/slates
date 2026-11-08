@@ -829,6 +829,14 @@ impl Endpoint {
     self.conn.rtt().pto(0)
   }
 
+  /// How long this session may acknowledge nothing before its own loss detection would take the path for gone: RFC
+  /// 9002 §7.6.1's persistent-congestion duration, the probe timeout floored at the initial one
+  /// ([`RttEstimator::persistent_congestion_duration_floored`](crate::rtt::RttEstimator::persistent_congestion_duration_floored)).
+  /// The dialect negotiates no `max_ack_delay` (zero): a peer acknowledges on its next flush.
+  pub fn persistent_congestion_duration(&self) -> u64 {
+    self.conn.rtt().persistent_congestion_duration_floored(0)
+  }
+
   /// The next packet number the connection will assign — its packet-number cursor, monotonic across
   /// every exchange this endpoint carries (a test asserts it never regresses: no reuse under the keys).
   pub fn tx_packet_number(&self) -> u64 {

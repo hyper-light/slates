@@ -278,18 +278,19 @@ fn shipper(credit: u64, retain: usize) -> Shipper {
 const SILENCE_NS: u64 = 1_000_000_000;
 
 /// A-200: an exchange to a holder its caller has given up, whose session acknowledges nothing (a stopped process), ends
-/// within a silence of the loss, not at its deadline, and gives its session up at once. Do send an entry to both holders,
-/// holder 3 silent, with a watch that names holder 3 lost from the start and a deadline ten times the silence. Expect
-/// every request of the exchange to have reported within the silence and a tenth more, holder 2's reply among them, and
-/// holder 3 named cut and unanswered with its session not among those to lend again and no request still in flight when
+/// once that session's own loss detection would take the path for gone, not at its deadline and not before, and gives
+/// its session up at once. Do send an entry to both holders, holder 3 silent, with a watch that names holder 3 lost
+/// from the start and a deadline ten times the silence. Expect the exchange to end no sooner than holder 3's
+/// persistent-congestion duration (`Endpoint::persistent_congestion_duration`, read before it begins) and within a
+/// tick of the watch after it, holder 2's reply among its replies, and holder 3 named cut and unanswered with its session not among those to lend again and no request still in flight when
 /// the exchange returns: the caller drops its link on the spot (the KIND stall was a lend left with nothing behind it). Before, nothing but the reply or the
 /// deadline ended it: an install to a stopped holder held its session for the whole of a 30 s budget in 12 of 12 runs
 /// (diag-live-durability-58), and a holder restarted meanwhile waited it out to catch up (15 of 23 runs over 1 s against 1
 /// of 24 with it ended, diag-live-durability-64).
 #[test]
-fn an_exchange_to_a_lost_silent_holder_ends_within_a_silence_not_at_its_deadline() {
+fn an_exchange_to_a_lost_silent_holder_ends_when_its_session_would_take_the_path_for_gone() {
   type Lend = (Vec<HostId>, Vec<HostId>, Vec<HostId>, bool);
-  let (report_tx, report_rx) = channel::<(u64, Vec<HostId>, Lend)>();
+  let (report_tx, report_rx) = channel::<(u64, u64, Vec<HostId>, Lend)>();
   let _ = run(
     true,
     Box::new(move |sessions, commands| {
@@ -297,6 +298,10 @@ fn an_exchange_to_a_lost_silent_holder_ends_within_a_silence_not_at_its_deadline
         let mut shipper = shipper(2, 2);
         let entry = shipper.append(b"one".to_vec()).unwrap();
         let bytes = entry.encode();
+        let dead_after = sessions
+          .iter()
+          .find(|(host, _)| *host == HOLDERS[1])
+          .map_or(0, |(_, endpoint)| endpoint.persistent_congestion_duration());
         let began = slates_rt::futures::now_ns();
         let exchanged = slates_cluster::live::exchange_watched(
           (LIVE_ENTRY_STREAM, &bytes),
@@ -316,6 +321,7 @@ fn an_exchange_to_a_lost_silent_holder_ends_within_a_silence_not_at_its_deadline
         let took = slates_rt::futures::now_ns().saturating_sub(began);
         let _ = report_tx.send((
           took,
+          dead_after,
           answered,
           (
             exchanged.cut.clone(),
@@ -337,7 +343,8 @@ fn an_exchange_to_a_lost_silent_holder_ends_within_a_silence_not_at_its_deadline
       })
     }),
   );
-  let (took, answered, (cut, unanswered, reusable, all_back)) = report_rx.try_recv().unwrap();
+  let (took, dead_after, answered, (cut, unanswered, reusable, all_back)) =
+    report_rx.try_recv().unwrap();
   assert!(
     answered.contains(&HOLDERS[0]),
     "holder 2 answered: {answered:?}"
@@ -352,20 +359,26 @@ fn an_exchange_to_a_lost_silent_holder_ends_within_a_silence_not_at_its_deadline
     "no request is still in flight when the exchange returns"
   );
   assert!(
-    took <= SILENCE_NS + SILENCE_NS / 10,
-    "the exchange ended {took} ns after it began, past a silence ({SILENCE_NS} ns) of its holder's loss"
+    took >= dead_after && took <= dead_after + SILENCE_NS / 10,
+    "the exchange ended {took} ns after it began: holder 3's session takes its path for gone after {dead_after} ns, \
+     and the watch looks every tenth of a silence"
   );
 }
 
-/// Shape: a link slow enough that an install of [`INSTALL_BYTES`] takes about two silences to cross it.
+/// Shape: a slow link whose deep queue, shared by both directions, holds the holder's acknowledgements behind the
+/// owner's data for longer than a silence: with no MTU on the path, discovery climbs to 64 KB datagrams of 2 s each on
+/// it, and the live holder's acknowledgements came 1.1 to 2.0 s apart (2026-11-08).
 const SLOW_LINK_BITS_PER_SECOND: u64 = 256_000;
-/// Shape: an install under the holders' bound ([`CAP`]) that takes several silences to cross [`SLOW_LINK_BITS_PER_SECOND`].
+/// Shape: an install under the holders' bound ([`CAP`]).
 const INSTALL_BYTES: usize = 60_000;
+/// Shape: the install's budget, past the time its transfer takes over [`SLOW_LINK_BITS_PER_SECOND`] uncut.
+const SLOW_INSTALL_BUDGET_NS: u64 = 120 * SILENCE_NS;
 
 /// A-200: a holder its caller has given up but whose session is still taking the request's bytes is never cut off, so a
-/// false suspicion of a live holder costs nothing. Do send holder 2 an install of 60 KB over a 256 kbit/s link, about two
-/// silences of transfer, with a watch that names it lost the whole time. Expect it answered, and no request cut.
-/// Non-vacuous: the exchange took longer than a silence, so a watch that read only the loss would have cut it.
+/// false suspicion of a live holder costs nothing. Do send holder 2 an install of 60 KB over a slow link whose queue holds
+/// its acknowledgements back for longer than a silence, with a watch that names it lost the whole time. Expect it
+/// answered, and no request cut. Non-vacuous: a watch that read only the loss, or a fixed second of silence, cut it
+/// (at 1,011 ms, 2026-11-08).
 #[test]
 fn a_lost_holder_still_taking_the_request_is_never_cut_off() {
   let (report_tx, report_rx) = channel::<(u64, Vec<HostId>, Vec<HostId>)>();
@@ -389,7 +402,7 @@ fn a_lost_holder_still_taking_the_request_is_never_cut_off() {
         let exchanged = slates_cluster::live::exchange_watched(
           (LIVE_STATE_STREAM, &bytes),
           to_two,
-          CommitBudget::hard(10 * SILENCE_NS, POLL_NS),
+          CommitBudget::hard(SLOW_INSTALL_BUDGET_NS, POLL_NS),
           Some(slates_cluster::live::Watch {
             lost: |_| true,
             silence_ns: SILENCE_NS,
