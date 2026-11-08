@@ -7822,6 +7822,15 @@ placement refresh is single-flight per green). The caller parks and resumes with
 `stream = true` submits at every auto-seal; an agent that wants a review boundary submits
 explicitly. A green with `require_evidence` refuses increments without evidence references.
 
+**Edit and submit in one request (A-225).** `edit_and_submit(work_volume, path, at, delete_len, bytes, evidence?)` is
+`edit` and then `submit`, in one request: the work's owner applies the edit exactly as `edit` does and, when the edit
+is accepted, submits exactly as `submit` does. Both run inside the one durable step and under the one completion record
+of the request, so a restart replays both or neither and a retry answers from the record. Its reply is the edit's
+refusal when the edit is refused (nothing is submitted, as a client that saw `edit` refused would not submit), else the
+submit's reply: the same verdict, the same conflict windows, the same refusals. `edit` and `submit` stay separate verbs
+because they are separate operations (an agent edits many times and submits once); the combined verb is for a client
+that does both, and saves it one round trip, which across machines is the whole of a request's cost.
+
 **Rebase, the only corrective path.** `rebase(work_volume, to = head)`: map the work volume's
 pending operations (since its base) through the canonical deltas up to `to`; if every operation
 is `Accept` or `AcceptIdentical`, re-base the clone to `to` by extent surgery (its root becomes
@@ -12695,6 +12704,8 @@ Status: built 2026-10-08.
   such an export to uid 0 only where the host's root is trusted with the volume.
 
 ### A-117 — An idle shard gives back the recovery memory no restart reads (2026-10-08)
+> Amended 2026-11-06 by A-226: each region is given back only as far as it was written since its last give-back, not
+> whole at every publication (18 to 21 ms of a macOS shard's CPU each time).
 Applied in the same change to:
 - `crates/vfs/src/recover.rs` (`CommittedSlot::stale_slot`) and `crates/vfs/src/checkpoint_log.rs`
   (`Journal::dead_ranges`, `DeadRanges`);
@@ -14142,6 +14153,83 @@ the server takes it as the work's delta over its new base (`WorkFiles::from_chan
   rebase's changes over it equals the twin's head after the accept, every change differing from the head (red with
   the changes under `d` dropped: the first case failed); a one-file edit of a thousand-file green rebases to that file
   alone. The server's library, daemon and client suites pass.
+
+### A-225 — Edit and submit in one request (accepted 2026-11-06, the supervisor's decision (b))
+Applied in the same change to: §4.16 ("Edit and submit in one request"), `crates/ipc/src/protocol.rs`
+(`RequestBody::EditSubmit`, `EditBytes`, appended), `crates/server/src/verbs.rs` (`edit_and_submit`, and the verb in
+`claims_placed_durability`), `crates/client/src/client.rs` (`Client::edit_and_submit`), the oracle
+`crates/client/tests/edit_and_submit.rs`, the harness's `accept_one` form (`crates/client/examples/edit_merge_bench.rs`),
+BENCHMARKS, GAPS.
+
+Status: built 2026-11-06.
+- Why: across machines a request costs its round trip. Measured over a Wi-Fi LAN (BENCHMARKS, "Edit and submit in one
+  request, across two machines"), an accepted edit and merge was two of them: edit then submit 14.1 to 18.6 ms at the
+  median, the edit and the submit each about one forwarded round trip (a ping 6.1 to 7.7 ms). One request does both.
+- The rule: `EditSubmit` names the work, the splice (path, offset, length removed, and the bytes inserted, carried
+  inline or as a staged buffer for an edit larger than one request) and the evidence. The work's owner runs `edit`
+  (or `EditStaged`'s edit); if it answers `Edited`, it runs `submit` and answers with that. Otherwise it answers the
+  edit's refusal and submits nothing. Both run in the request's one `Db::begin` … `commit` with its one completion
+  record, so the effects of both, or of the edit and a refused submit, are durable together or not at all. A retry,
+  across a restart too, answers from the record. The verb claims placed durability as `Submit` does, and is routed,
+  forwarded and republished by the work's volume, as `Edit` and `Submit` are.
+- What it does not change: `Edit` and `Submit` stay, as different operations, not a compatibility path. The verdict,
+  its conflict windows, the increment's identity and every refusal are the two verbs' own, since the combined verb
+  calls them.
+- Proven by an oracle that runs both forms over generated histories (two daemons' worth of works over one green,
+  each step an edit-and-submit through one client and edit-then-submit through another, with daemon restarts between
+  steps) and compares every verdict, every conflict report and the greens' heads and files. Exactly-once is
+  proven by a retry across a restart, which must answer the recorded verdict and leave the green one version ahead,
+  not two.
+- Measured (2026-11-06 07:49 to 07:59 UTC; server node adas-macbook-pro-2 at 192.168.1.71, client node kiln-a094a12d at
+  192.168.1.72, both on Wi-Fi; ICMP RTT 3.8 to 3.9 ms min, 5.3 to 8.5 ms average). The harness ran on the client
+  machine, attached to its own node, over a 100-file green owned by the server node (`edit_merge_bench --instance
+  perf-cli --green ID --files 100 --form ping --form accept --form accept_one`, three invocations with the two
+  accept forms' order alternated). p50 in each round: `accept`, edit then submit, 14.1, 18.6 and 14.8 ms; `accept_one`
+  6.93, 7.81 and 7.03 ms; a ping (one forwarded `versions`) 6.13, 7.74 and 7.66 ms. One request costs one round trip.
+  The p99 is the link's in both forms (70 to 158 ms).
+### A-226 — An idle shard gives back only the recovery memory written since its last give-back (accepted and built 2026-11-06; amends A-117; the supervisor's item (c), the macOS paced tail)
+Applied in the same change to:
+- `crates/vfs/src/checkpoint_log.rs` (`Journal`'s `committed_written`, `stale_written`, `log_written`,
+  `UNKNOWN_EXTENT`, `Journal::checkpointed`, `Journal::given_back`, the bounded `Journal::dead_ranges`);
+- `crates/server/src/daemon.rs` (`return_dead_recovery`, test support `Daemon::give_back_recovery_on_every_shard`) and
+  `crates/server/src/state.rs` (`recovery_returned_at` removed);
+- the tests `a_give_back_returns_only_recovery_memory_written_since_the_last` (`crates/server/tests/recovery.rs`, red
+  first) and the oracle `a_give_back_names_every_dead_written_byte_and_stops_at_the_last`
+  (`crates/vfs/tests/checkpoint_log.rs`);
+- A-117's entry, BENCHMARKS ("The macOS paced tail was the recovery give-back"), GAPS, and
+  `docs/bugs/2026-11-06-an-idle-shards-recovery-give-back-walked-18-gb-at-every-publication.md`.
+
+Status: built 2026-11-06.
+- Why: A-117 gave back the stale checkpoint slot and the log past its tail whole, at every publication. Only what was
+  written since the last give-back can be resident, but the walk covered the regions' whole length: 18,325,143,552
+  bytes a shard on adas-macbook-pro-2. On macOS that is one `MADV_FREE_REUSABLE` mark of the range, 18 to 21 ms of the
+  shard's CPU in a single poll of its reap loop, once per tick after any merge. Every request reaching the shard
+  meanwhile waited behind it. That was the paced macOS tail (p99 5.7 to 21 ms) that the doorbell had been blamed for.
+  The shard's own stamps and per-poll CPU named it (the bug record); it was not a lost or held wake.
+- The rule: the journal records how far each region may have been written since it was last given back:
+  - the committed slot as far as its checkpoint, or further where it held a longer image never given back;
+  - the stale slot as far as the image it held when it was committed;
+  - the log as far as any frame, or the zeroed header after one, reached.
+  A give-back covers those extents and no further, and records what the object took; a range the object refuses stays
+  owed. A journal opened over memories it did not write (a restart, or a predecessor torn before its first commit)
+  takes each region as written throughout, so each is given back whole once per boot. Nothing else in A-117 changes:
+  the given-back ranges were never read, and a busy shard never gives anything back.
+- Proven: the oracle runs generated histories of checkpoints, appends, give-backs and restarts over memories that
+  record each byte written. After every step, every written byte that no restart reads lies inside the named ranges,
+  the ranges lie inside what no restart reads and end at the last such write (except a region unseen since a
+  restart), and a restart recovers the full image. Two mutations each fail it: the longer-image rule dropped, or the
+  log's extent zeroed at a checkpoint.
+- Measured (adas-macbook-pro-2, Apple M5 Max, 18 cores, 128 GiB, 2026-11-06 05:16 to 06:05 UTC, load 50 to 95 from
+  other builds). The paced harness (`edit_merge_bench --quiet-only --pause-ns 2000000 --files 10 --form accept`,
+  3 × 1,000 calls) was run with every poll over 1 ms logged with its thread's CPU, a temporary diagnostic. Before:
+  46 reap-loop polls of 5 ms CPU or more, up to 48.5 ms. After: 6, each one of a shard's first two give-backs after
+  boot (12.1 to 42.7 ms, three shards, two each), and none later. Every other poll over 1 ms of wall time used under
+  1 ms of CPU: the host's load, not the shard's work. Latency, interleaved (10 of 12 runs finished before the time
+  limit): paced p99 before 12.3 to 39.2 ms at load 52 to 82 (149 and 234 ms in round 1, 142 to 361 ms at load 95),
+  after 6.8 to 29.2 ms (54 and 94 ms in one run); unpaced p99 before 0.64 to 32 ms, after 0.43 to 6.8 ms. That load
+  dominates both arms' tails, so the latency rows are informational and the CPU count is the measurement.
+- Owed: a boot's two whole give-backs a shard (memories this journal did not write) still hold the shard 12 to 43 ms
+  each. They should be given back in slices under the step quantum, from a measured discard rate (GAPS).
 
 ### A-214 — An idle shard keeps its last write burst's worth of free content pages pre-faulted (accepted 2026-11-05, VFS plan step 11; amends A-105)
 

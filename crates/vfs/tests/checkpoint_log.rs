@@ -411,3 +411,208 @@ fn assert_recovered_calls(
     "the held NFSv3 replies, whole, in order"
   );
 }
+
+/// A memory that remembers which of its bytes were written since they were last given back: the oracle's view of what
+/// can be resident. It starts all written, since a memory this journal did not write may hold anything (A-226).
+struct Recorded {
+  bytes: Vec<u8>,
+  written: Vec<bool>,
+}
+
+impl Recorded {
+  fn new(len: usize) -> Self {
+    Recorded {
+      bytes: vec![0u8; len],
+      written: vec![true; len],
+    }
+  }
+
+  /// Gives `(offset, len)` back as the content object does: it reads zeros and holds nothing.
+  fn give_back(&mut self, (offset, len): (usize, usize)) {
+    for at in offset..offset + len {
+      self.bytes[at] = 0;
+      self.written[at] = false;
+    }
+  }
+}
+
+impl slates_vfs::recover::ImageRead for Recorded {
+  fn image_len(&self) -> usize {
+    self.bytes.len()
+  }
+
+  fn image_read(&self, offset: usize, into: &mut [u8]) -> Result<(), slates_vfs::VfsError> {
+    self.bytes.image_read(offset, into)
+  }
+}
+
+impl ImageWrite for Recorded {
+  fn image_write(&mut self, offset: usize, from: &[u8]) -> Result<(), slates_vfs::VfsError> {
+    self.bytes.image_write(offset, from)?;
+    for flag in &mut self.written[offset..offset + from.len()] {
+      *flag = true;
+    }
+    Ok(())
+  }
+}
+
+/// The regions whose writes the journal has not seen: every slot (by its offset) and the log since a restart, each until
+/// it is given back.
+struct Unknown {
+  slots: std::collections::BTreeSet<usize>,
+  log: bool,
+}
+
+impl Unknown {
+  fn all(slot_offsets: [usize; 2]) -> Self {
+    Unknown {
+      slots: slot_offsets.into_iter().collect(),
+      log: true,
+    }
+  }
+}
+
+/// One step of a generated journal history.
+#[derive(Clone, Copy, Debug)]
+enum JournalStep {
+  /// A checkpoint of the whole volume.
+  Checkpoint,
+  /// One file created and its delta appended (a checkpoint instead when the log is full).
+  ChangeAndAppend,
+  /// The dead ranges given back.
+  GiveBack,
+  /// The journal dropped and recovered from its memories, as a restarted daemon's is.
+  Restart,
+}
+
+/// Checks the dead ranges against what a restart reads and what was written: every byte written since its last
+/// give-back that no restart reads lies inside them (A-117 still gives back every resident dead page); they lie inside
+/// what no restart reads; and each ends where its region's writes do (A-226: a give-back costs what was written),
+/// except a region the journal cannot have seen written (`unknown`: since a restart, until its first give-back), which
+/// it gives back whole.
+fn check_dead_ranges(
+  journal: &Journal,
+  checkpoints: &Recorded,
+  log: &Recorded,
+  tail: usize,
+  unknown: &Unknown,
+) {
+  let Some(dead) = journal.dead_ranges(checkpoints.bytes.len(), log.bytes.len()) else {
+    return;
+  };
+  let committed = slates_vfs::recover::committed_slot(checkpoints).unwrap();
+  let stale = committed.stale_slot(checkpoints.bytes.len());
+  let regions = [
+    (
+      "the stale slot",
+      stale,
+      dead.stale_slot,
+      &checkpoints.written,
+      unknown.slots.contains(&stale.0),
+    ),
+    (
+      "the log past the tail",
+      (tail, log.bytes.len() - tail),
+      dead.log_past_tail,
+      &log.written,
+      unknown.log,
+    ),
+  ];
+  for (name, (region_at, region_len), (named_at, named_len), written, unseen) in regions {
+    let region_end = region_at + region_len;
+    let named_end = named_at + named_len;
+    assert!(
+      named_len == 0 || (region_at <= named_at && named_end <= region_end),
+      "{name}: the named range {named_at}..{named_end} leaves what no restart reads, {region_at}..{region_end}"
+    );
+    let furthest = (region_at..region_end).rev().find(|at| written[*at]);
+    if let Some(furthest) = furthest {
+      assert!(
+        named_at <= region_at && furthest < named_end,
+        "{name}: byte {furthest} was written and no restart reads it, but the named range {named_at}..{named_end} \
+         leaves it resident"
+      );
+    }
+    assert!(
+      unseen || named_len == 0 || furthest.is_some_and(|furthest| named_end <= furthest + 1),
+      "{name}: the named range {named_at}..{named_end} runs past the last write {furthest:?}"
+    );
+  }
+}
+
+proptest::proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(proptest::prelude::ProptestConfig {
+    cases: slates_test_seeds::cases(48),
+    ..proptest::prelude::ProptestConfig::default()
+  }))]
+
+  /// A-117 and A-226, the oracle: do run a generated history of checkpoints, appended deltas, give-backs and restarts
+  /// over memories that record each byte written; expect after every step that the dead ranges name every written
+  /// byte no restart reads, lie inside what no restart reads and end at the last such write, and that a restart
+  /// recovers the volume's full image whatever was given back.
+  #[test]
+  fn a_give_back_names_every_dead_written_byte_and_stops_at_the_last(
+    steps in proptest::collection::vec(
+      // Weights 1 : 4 : 2 : 1 over eight draws (no `prop_oneof!`, which boxes its arms in an `Arc`).
+      proptest::strategy::Strategy::prop_map(0u8..8, |draw| match draw {
+        0 => JournalStep::Checkpoint,
+        1..=4 => JournalStep::ChangeAndAppend,
+        5 | 6 => JournalStep::GiveBack,
+        _ => JournalStep::Restart,
+      }),
+      1..40,
+    )
+  ) {
+    /// Shape: each memory's length in this oracle: small, so a long history fills the log and checkpoints anew.
+    const ORACLE_MEMORY: usize = 1 << 16;
+    let mut store = store();
+    let mut vol = seeded(&mut store);
+    let (mut checkpoints, mut log) = (Recorded::new(ORACLE_MEMORY), Recorded::new(ORACLE_MEMORY));
+    let mut journal = Journal::default();
+    journal.checkpoint(&mut checkpoints, &full(&vol, &store)).unwrap();
+    vol.mark_published(&store);
+    let mut tail = 0usize;
+    let slot_offsets = [0, ORACLE_MEMORY / 2];
+    let mut unknown = Unknown::all(slot_offsets);
+    for (at, step) in steps.into_iter().enumerate() {
+      match step {
+        JournalStep::Checkpoint => {
+          journal.checkpoint(&mut checkpoints, &full(&vol, &store)).unwrap();
+          vol.mark_published(&store);
+          tail = 0;
+        }
+        JournalStep::ChangeAndAppend => {
+          create(&mut vol, &mut store, &format!("step{at}"), format!("step {at}").as_bytes());
+          let delta = delta_of(&mut vol, &store);
+          match journal.append(&mut log, &delta, &mut Vec::new()) {
+            Ok(total) => tail += total,
+            Err(slates_vfs::VfsError::NoSpace) => {
+              journal.checkpoint(&mut checkpoints, &full(&vol, &store)).unwrap();
+              tail = 0;
+            }
+            Err(other) => panic!("append refused: {other:?}"),
+          }
+        }
+        JournalStep::GiveBack => {
+          if let Some(dead) = journal.dead_ranges(ORACLE_MEMORY, ORACLE_MEMORY) {
+            checkpoints.give_back(dead.stale_slot);
+            log.give_back(dead.log_past_tail);
+            journal.given_back(true, true);
+            let stale = slates_vfs::recover::committed_slot(&checkpoints).unwrap().stale_slot(ORACLE_MEMORY);
+            unknown.slots.remove(&stale.0);
+            unknown.log = false;
+          }
+        }
+        JournalStep::Restart => {
+          let (image, recovered) = Journal::recover(&checkpoints, &log).unwrap();
+          proptest::prop_assert!(image.unwrap() == full(&vol, &store), "the restart recovered the full image");
+          journal = recovered;
+          unknown = Unknown::all(slot_offsets);
+        }
+      }
+      check_dead_ranges(&journal, &checkpoints, &log, tail, &unknown);
+      let (image, _) = Journal::recover(&checkpoints, &log).unwrap();
+      proptest::prop_assert!(image.unwrap() == full(&vol, &store), "step {at} ({step:?}): a restart recovers the full image");
+    }
+  }
+}

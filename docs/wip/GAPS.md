@@ -827,6 +827,28 @@
 > `crates/merge/tests/origin.rs`), so records written before it would not match a newer holder. A daemon `SIGKILL`ed six times mid-merge
 > loses no told version and tells none twice (`crates/cli/tests/merge_kill.rs`, red with the durable append removed).
 >
+> **Merge: edit and submit in one request (A-225, 2026-11-06, agents/perf-2).** `Client::edit_and_submit`
+> (`RequestBody::EditSubmit`) is `edit` and then `submit` in one durable step under one completion record. Across the
+> Wi-Fi LAN an accepted edit and merge is one forwarded round trip, 6.9 to 7.8 ms p50, against 14.1 to 18.6 ms for
+> edit then submit (ping 6.1 to 7.7 ms). Oracle: `edit_and_submit_answers_what_edit_then_submit_does_over_generated_histories`
+> (`crates/client/tests/edit_and_submit.rs`) compares every answer and every head over generated histories, red under
+> both mutations tried. Exactly once: `an_edit_and_submit_retried_across_a_restart_answers_its_record_once`. **Open:**
+> the SDKs, MCP and the CLI do not offer the combined verb yet. Also open: the link's p99 (70 to 158 ms over Wi-Fi), a
+> wired pair, and Windows as either node.
+> **Merge, macOS: the paced tail was the recovery give-back, not the doorbell (A-226, 2026-11-06, agents/perf-2).** An
+> idle shard's give-back of the recovery memory no restart reads (A-117) marked the whole stale slot and log, 18 GB
+> a shard, at every publication: 18 to 21 ms of the shard's CPU in one reap-loop poll, which paced requests waited
+> behind. It now gives back only what was written since its last give-back. In one paced run, reap polls of 5 ms CPU
+> or more went from 46 to 6. Failing first: `a_give_back_returns_only_recovery_memory_written_since_the_last` (91.6 GB
+> given back after a one-file delta, against 0). Oracle: `a_give_back_names_every_dead_written_byte_and_stops_at_the_last`.
+> **Open:** the 6 left are each shard's first two give-backs after a boot, over memories the journal did not write
+> (12 to 43 ms each), owed slices under the step quantum (built on agents/perf-2, to land after this). On CI
+> (diag-perf-5, run 42173825162) A-226 is even on Linux and halves Windows x86_64's paced accept p99 (1.21 to 1.40 ms
+> became 0.42 to 0.76 ms). Also open: the latency A/B on a quiet Mac (this one ran at load 50 to 95), and the sibling of
+> the same shape, the Linux FUSE write log's purge (`crates/server/src/write_log.rs`, its whole capacity once per
+> emptying).
+>
+>
 
 > **Windows conformance runs, and the arm64 Linux suites (2026-11-05, A-209; VFS plan step 10).** WinFsp's own two
 > suites run over the slates drive (`slates mount ID E:`) through `cargo xtask conformance` in `windows-lint` and
