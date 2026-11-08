@@ -6979,6 +6979,27 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > A shard's recovery still runs as one poll, which the watchdog counts as spinning past a window of CPU: GAPS holds it
 > open.
 
+> **Status (2026-11-08, A-228): a starved shard is not a stuck one.** A CPU clock cannot tell a thread held off the CPU
+> from one blocked in a call: both stand still. On adacachy at `CPUWeight=1` two anchors killed live daemons on
+> `shard N is wedged` lines, and the sampled shard read state `R` throughout. The watchdog now asks the scheduler about a
+> shard with no step and no CPU rise (`slates_rt::registry::shard_run_readings`, one batch a beat). **Wedged** is a whole
+> window in which the shard moved in no way: no CPU progress, never runnable, no wait for a CPU credited. **Starved** is
+> a whole window with no CPU progress but one of the others: it goes on beating and is logged once an episode.
+> **Spinning** is unchanged.
+>
+> | Platform | Source | Time waited for a CPU |
+> |---|---|---|
+> | Linux | `/proc/self/task/<tid>/stat` state and `schedstat` field 2 | Yes, credited late, so the state decides |
+> | macOS | `thread_basic_info.run_state` (`TH_RUN`, on a CPU or the run queue) | None per thread: the state at each look |
+> | Windows | `SYSTEM_THREAD_INFORMATION.ThreadState`, `NtQuerySystemInformation` linked at run time | None: the state at each look |
+> | Miri, or an unreadable source | None | The CPU clock stands alone, as before |
+>
+> Proven by `crates/server/tests/liveness.rs` and the rule's replays in `crates/server/src/watchdog.rs`, red first
+> (`docs/bugs/2026-11-08-a-starved-shard-was-judged-wedged.md`). Held off its CPU for 3.0 s, the beat gapped at most
+> 91.6 ms on Linux and 111.0 ms on Windows, where before it stopped for 2.01 s and 1.91 s; a shard blocked in a read
+> still stops the beat within 1.08 s on both. A frozen process is still killed at its lapse. macOS could not be held off
+> the CPU on demand (a full window in 1 of 20 CI runs), so there the replays carry the rule.
+
 > **Telemetry oracle correction (2026-09-20, AC-0.11).** A drain request itself emits spans.
 > The daemon integration oracle now derives convergence from the reply quota minus the
 > maximum spans a drain emits, and checks progress on each batch. A four-span reply scenario

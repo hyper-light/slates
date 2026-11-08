@@ -23,8 +23,16 @@
 //! - **alive** otherwise: busy inside one poll for less than a window, or given a little CPU at a time.
 //!
 //! What the scheduler says comes from `slates_rt::registry::shard_run_readings`, asked only about shards with no step
-//! and no CPU rise since the last look. Where it has no answer (Miri, or a source that cannot be read), the CPU clock
-//! stands alone, as it did before.
+//! and no CPU rise since the last look, once a beat (`slates_rt`'s `thread_clock` names each source). By platform:
+//! - **Linux**: the thread's state (`R` is runnable; asleep, in the kernel or stopped is not) and its run-queue wait. The
+//!   state decides: the kernel credits a wait only once the thread reaches a CPU or leaves the queue, so a thread held
+//!   off a CPU for 3 s showed no growth in 20 of 20 CI runs. A rise says it waited between two looks, seen in neither.
+//! - **macOS and Windows**: the state alone. Neither keeps a per-thread time waited for a CPU, so the state is sampled at
+//!   each look. That loses nothing the rule needs: a thread leaves the run queue for a block only by running first, which
+//!   its CPU clock shows.
+//! - **No answer** (Miri, or a source that cannot be read): the CPU clock stands alone, as it did before.
+//!
+//! A stopped thread never reads as runnable, so a frozen process is still killed.
 //!
 //! The window is the existing liveness budget ([`crate::daemon::LIVENESS_BUDGET_NS`]), a fixed number recorded as R3
 //! debt in GAPS. A-228 adds no number to it. While every shard is alive and the control loop lives, the thread beats; once
