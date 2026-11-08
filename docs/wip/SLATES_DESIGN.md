@@ -6279,9 +6279,13 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > **An install exchange ends when its holder is lost and silent (2026-11-08).** An install's deadline is derived from
 > its bytes and the session's rate, with no ceiling (77 s and 614 s measured), and a holder stopped mid-install held
 > its lane for all of it. The lane now watches the exchange: once the owner keeps no direct contact with the holder
-> (`keeps_direct_contact_with`) and the session's largest acknowledged packet has not moved for a liveness budget, the
-> exchange is abandoned within a tenth of that budget (`live::exchange_watched`). Both must hold. A lost holder whose
-> session is still taking the bytes is never cut, so a false suspicion costs nothing. A cut holder is unanswered: its
+> (`keeps_direct_contact_with`) and the session's largest acknowledged packet has not moved for as long as its own
+> loss detection takes to call the path gone, the exchange is abandoned within a tenth of a liveness budget
+> (`live::exchange_watched`). That span is RFC 9002's persistent-congestion duration: three probe timeouts, each at
+> least the initial one, and never under a liveness budget (`Endpoint::persistent_congestion_duration`). Both must
+> hold. The probe timeout grows with the queueing a holder's acknowledgements reveal, so a lost holder whose session is
+> still taking the bytes is not cut. A fixed second was not enough: on the fabric it cut a live holder whose
+> acknowledgements its link's queue held back 1.1 to 2.0 s apart. A cut holder is unanswered: its
 > link is dropped and redialed, and the image it was cut on is re-sent once, unwatched (`LiveVolume::cut_installs`).
 > Held on the simulated fabric (`crates/cluster/tests/live.rs`, `live_ship::tests`). End to end it is measured only
 > where it does not fire (GAPS).

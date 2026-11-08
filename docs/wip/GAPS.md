@@ -206,13 +206,19 @@
 > 30.02 s, -58), though the owner had dropped it from membership 1 to 15 s in; the transport has no idle timeout. A
 > bytes-only ceiling would be wrong: a 404 MB install took 21.6 s and was answered. An install exchange now also ends
 > once the owner keeps no direct contact with the holder (`fleet::keeps_direct_contact_with`) and the session's
-> largest acknowledged packet has not moved for a liveness budget (1 s), checked each tenth of it
-> (`live::exchange_watched`, `Endpoint::largest_acked`). The cut holder is reported unanswered, so its link is dropped
+> largest acknowledged packet has not moved for the session's own persistent-congestion duration. That is three probe
+> timeouts (RFC 9002 §7.6.1), each at least the initial 666 ms (§6.2.2), so at least 2 s, and never less than a
+> liveness budget (1 s). It is checked each tenth of a liveness budget (`live::exchange_watched`,
+> `Endpoint::persistent_congestion_duration`). A fixed second of silence, the first rule, cut a live holder on the
+> fabric: its link's queue held its acknowledgements back, and they came 1.1 to 2.0 s apart. The cut holder is reported unanswered, so its link is dropped
 > and redialed. An image is cut at most once a holder (`LiveVolume::cut_installs`, one entry for each holder shipped
 > to), so a false suspicion re-sends that image once, unwatched; counted as `fleet.live.install_cut`. Held by
-> `an_exchange_to_a_lost_silent_holder_ends_within_a_silence_not_at_its_deadline` (the 10 s deadline before, within
-> 1.1 s after, every session back), `a_lost_holder_still_taking_the_request_is_never_cut_off` (60 KB over 256 kbit/s,
-> named lost throughout: answered, nothing cut) and `an_install_is_cut_at_most_once_an_image`. **Open:** the watch is
+> `an_exchange_to_a_lost_silent_holder_ends_when_its_session_would_take_the_path_for_gone` (the 10 s deadline before;
+> after, cut at 2,089 ms against a 1,998 ms duration, every session back),
+> `a_lost_holder_still_taking_the_request_is_never_cut_off` (60 KB over a 256 kbit/s link whose queue held its
+> acknowledgements back, named lost throughout: answered after 48.7 s, nothing cut; cut at 1,011 ms by the fixed
+> second), `the_duration_a_dead_path_is_judged_by_is_floored_at_three_initial_probe_timeouts` and
+> `an_install_is_cut_at_most_once_an_image`. **Open:** the watch is
 > not measured end to end on the case it is for. In diag-live-durability-65's restart flow (BENCHMARKS, "The watch on
 > an install exchange") the stopped holder is killed after 1 s, and its successor serves under the same id 3 to 27 ms
 > later, so the owner never loses contact. No kept log shows a cut. At the budgets the code computes, catch-up was
@@ -220,11 +226,12 @@
 > partition runs passed, with one cut among them. Owed: the A/B on a holder that stays stopped (-58's flow), under a
 > floor standing in for a large install's long deadline.
 
-> **Open (live-durability, 2026-11-08): over the simulated fabric's rate-limited link, a lone `request_within` never
-> finished a 60 KB request.** Unanswered at 10 s and at 30 s of virtual time, at 256 kbit/s and at 2.56 Mbit/s, the run
-> idle meanwhile (`a_lost_holder_still_taking_the_request_is_never_cut_off` on its red stub, 8d46a1e5). The same
-> exchange, driven a tenth of a second at a time (`live::exchange_watched`), completes. The owner's request sat with no
-> timer due and no wake. Every install on main is sent this way; whether the real runtime shares this is not known.
+> **Explained (live-durability, 2026-11-08): over the simulated fabric's rate-limited link, a lone `request_within`
+> never finished a 60 KB request.** The test's sockets were OS sockets, which the simulation driver never watched, so
+> the link never applied and only timers woke the request
+> (`docs/bugs/2026-11-08-an-os-socket-awaited-on-the-simulation-driver-woke-only-on-its-timers.md`). On the fabric the
+> same request takes 48.7 s: the path set no MTU, and discovery climbed to 64 KB datagrams of 2 s each on the link
+> (GAPS, "a 60 KB request crossed a slow link in 47.7 s"). Not a defect of `request_within`.
 
 > **Open (live-durability, 2026-11-08): hundreds of writes reach the log as one entry.** Entries of 64 KiB or more were
 > 507 deltas and 178 whole records in 60 rolling partition runs (diag-live-durability-56); a delta carried a median of

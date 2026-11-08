@@ -88,14 +88,19 @@ pub struct Exchanged {
 }
 
 /// What ends a live request before its deadline: its holder lost to the caller (`lost`, asked about the holder) once the
-/// session has acknowledged nothing for `silence_ns`. A holder still taking the request's bytes is never cut off, so a
-/// false suspicion of a live holder costs nothing; one that went quiet and was given up is not waited for to the
-/// deadline, which a request's bytes set and so has no ceiling (an install measured at up to 614 s of budget).
+/// session has acknowledged nothing for as long as its own loss detection takes to call a path gone
+/// ([`Endpoint::persistent_congestion_duration`]: three probe timeouts, RFC 9002 §7.6.1, each at least the initial one),
+/// and never sooner than `silence_ns`. A fixed second was not enough: a live holder's acknowledgements, held back by its
+/// link's queue, came 1.1 to 2.0 s apart, and it was cut (2026-11-08, on the simulated fabric). The session's probe
+/// timeout grows with the queueing its acknowledgements reveal, so a holder still taking the request's bytes is not
+/// cut. One that went quiet and was given up is not waited for to the deadline, which a request's bytes set and so has
+/// no ceiling (an install measured at up to 614 s of budget).
 #[derive(Clone, Copy)]
 pub struct Watch {
   /// Whether the caller has stopped keeping contact with this holder.
   pub lost: fn(HostId) -> bool,
-  /// How long the session must have acknowledged nothing before a lost holder's request is ended.
+  /// The least the session must have acknowledged nothing before a lost holder's request is ended; the watch looks
+  /// every tenth of it.
   pub silence_ns: u64,
 }
 
@@ -111,8 +116,8 @@ pub async fn exchange_watched(
 }
 
 /// One request on `endpoint`, as [`request_within`], also ended once `watch` says: `host` lost to the caller and the
-/// session's largest acknowledged packet unmoved for its silence. Checked each tenth of the silence (derived: the end
-/// then comes within a tenth of a silence of the moment both hold). The endpoint comes back however it ends, an
+/// session's largest acknowledged packet unmoved for its persistent-congestion duration (at least the silence). Checked
+/// each tenth of the silence (derived: the end then comes within a tenth of a silence of the moment both hold). The endpoint comes back however it ends, an
 /// unfinished exchange abandoned (`StopSending`, a late copy of the reply dropped by the closed stream's tombstone), and
 /// whether the watch ended it.
 async fn request_watched(
@@ -144,7 +149,10 @@ async fn request_watched(
         if acked != progress.0 {
           progress = (acked, now);
         }
-        if now.saturating_sub(progress.1) >= watch.silence_ns && (watch.lost)(host) {
+        let dead_after = watch
+          .silence_ns
+          .max(endpoint.persistent_congestion_duration());
+        if now.saturating_sub(progress.1) >= dead_after && (watch.lost)(host) {
           cut = true;
           break None;
         }
