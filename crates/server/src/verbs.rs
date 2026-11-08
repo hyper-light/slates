@@ -3220,6 +3220,16 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     detector_relays: detector_relay_report(state),
     registry_attachments: u64::try_from(state.attachments.live()).unwrap_or(u64::MAX),
     live: crate::live_ship::reports(state),
+    peers_in_contact: if is_control_shard(state) {
+      peers_in_contact(state).0
+    } else {
+      0
+    },
+    peers_unmeshed: if is_control_shard(state) {
+      peers_in_contact(state).1
+    } else {
+      0
+    },
   }
 }
 
@@ -3305,6 +3315,29 @@ fn group_report(
 /// `FleetNode` advances identically (the control shard hands it each peer state it folds) — with the
 /// formed probe sessions summed over the shards' parts (only the control shard forms any) and the
 /// consensus groups' state taken from the control shard's part (the only live one).
+/// The members this node keeps direct contact with, this node left out (`fleet::keeps_direct_contact_with`), and how
+/// many of them have no formed probe session yet: the probe mesh's peers and what keeps it down. Counted over the
+/// members the membership holds alive (what `fleet_members` reports), not the configuration's members: before the
+/// council's first commit that list is empty, so every fleet read none in contact while it probed every peer
+/// (raft-chaos's and live-fixes' flows on CI, diag-live-fixes-32: `in_contact=0 probed=4` on a forming five-node fleet).
+fn peers_in_contact(state: &ShardState) -> (u32, u32) {
+  let host = state.fleet.host();
+  let (contact, unmeshed) = state
+    .fleet
+    .membership()
+    .alive()
+    .into_iter()
+    .filter(|peer| *peer != host && crate::fleet::keeps_direct_contact_with(state, *peer))
+    .fold((0usize, 0usize), |(contact, unmeshed), peer| {
+      let missing = usize::from(!state.formed_probe_peers.contains(&peer));
+      (contact.saturating_add(1), unmeshed.saturating_add(missing))
+    });
+  (
+    u32::try_from(contact).unwrap_or(u32::MAX),
+    u32::try_from(unmeshed).unwrap_or(u32::MAX),
+  )
+}
+
 fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
   let configuration = state.fleet.configuration();
   let control = shards.iter().find(|shard| shard.control);
@@ -3372,6 +3405,12 @@ fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
     served_sessions,
     detector_pool,
     detector_relays,
+    peers_in_contact: shards.iter().fold(0u32, |sum, shard| {
+      sum.saturating_add(shard.peers_in_contact)
+    }),
+    peers_unmeshed: shards
+      .iter()
+      .fold(0u32, |sum, shard| sum.saturating_add(shard.peers_unmeshed)),
   }
 }
 
