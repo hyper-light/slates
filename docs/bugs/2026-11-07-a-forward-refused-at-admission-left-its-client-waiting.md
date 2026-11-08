@@ -54,6 +54,9 @@ nothing deferred, every daemon idle.
 
 ## Not fixed here
 
+Both items below were fixed the same day, on the supervisor's order:
+`2026-11-07-the-control-shard-could-not-run-what-its-lane-admitted.md`.
+
 - The arena's size. A full control shard now refuses forwards `Overloaded`, and the clients resend them paced; it no
   longer stalls them. Sizing the control shard for every shard's in-flight forwards is a memory decision, raised with
   the supervisor.

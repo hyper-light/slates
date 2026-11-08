@@ -1347,6 +1347,7 @@ async fn serve_peer_records(
       } if kind == FORWARD_STREAM && enrolled => {
         let served = forwards.spawn(stream_id, async move {
           injected_serve_delay().await;
+          verbs::injected_forward_silence(&request).await;
           verbs::serve_forward(control, peer_anchor, &request).await
         });
         if let Some(reply) = served

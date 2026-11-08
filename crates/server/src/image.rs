@@ -263,16 +263,9 @@ pub(crate) fn deliver(state: &mut ShardState, reply: ReplyBody, route: Option<Re
   let Some(route) = route else {
     return;
   };
-  let delivery = slates_rt::task::SpawnRequest::new(
-    Box::pin(async move {
-      crate::state::deliver(route.client_index, route.request, reply, true);
-    }),
-    None,
-  );
-  if slates_rt::registry::send_control(
-    route.shard,
-    slates_rt::control::Control::Spawn(Box::new(delivery)),
-  )
+  if crate::xshard::hand_reply_home(route.shard, move || {
+    crate::state::deliver(route.client_index, route.request, reply, true);
+  })
   .is_err()
   {
     state.count(REPLY_UNDELIVERED, 1);

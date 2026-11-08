@@ -38,7 +38,6 @@ use std::task::{Poll, Waker};
 
 use slates_cluster::BatchReplies;
 use slates_db::HostId;
-use slates_machine::derived;
 use slates_rt::futures;
 use slates_transport::connection::Priority;
 use slates_transport::endpoint::{ConnectionId, Endpoint, EndpointError};
@@ -117,15 +116,10 @@ pub(crate) struct ForwardLanes {
 /// flight (`clients_per_shard × slots`, each shard's credit, over every shard). Forwards come only from those
 /// requests (and the cold control verbs), so a lane at its bound means a fault, refused rather than queued.
 fn lane_bound(state: &state::ShardState) -> usize {
-  derived!(
-    state
-      .config
-      .clients_per_shard
-      .saturating_mul(usize::try_from(state.config.region.slots).unwrap_or(usize::MAX))
-      .saturating_mul(state.shards.len().max(1))
-      .max(1),
-    "clients_per_shard × slots × shards",
-    ["clients_per_shard", "region.slots", "shards"]
+  crate::config::forward_lane_bound(
+    state.config.clients_per_shard,
+    state.config.region.slots,
+    u16::try_from(state.shards.len()).unwrap_or(u16::MAX),
   )
   .get()
 }
@@ -621,24 +615,35 @@ fn mark_progress(peer: HostId, endpoint: &mut Endpoint, session: Option<Connecti
   let _ = state::with_state(|s| {
     if let Some(lane) = s.forward_lanes.lanes.get_mut(&peer) {
       for ticket in lane.tickets.values_mut() {
-        let Stage::Open {
-          exchange,
-          session: on,
-        } = ticket.stage
-        else {
-          continue;
-        };
-        if Some(on) != session {
-          continue;
-        }
-        let read = endpoint.reply_bytes_read(exchange).unwrap_or(0);
-        if read > ticket.reply_bytes {
-          ticket.reply_bytes = read;
-          ticket.progress_ns = now;
-        }
+        mark_ticket_progress(ticket, endpoint, session, now);
       }
     }
   });
+}
+
+/// Marks `ticket` as having made progress at `now` when it is open on `session` and its own reply has more bytes read
+/// than when last marked ([`mark_progress`]).
+fn mark_ticket_progress(
+  ticket: &mut Ticket,
+  endpoint: &mut Endpoint,
+  session: Option<ConnectionId>,
+  now: u64,
+) {
+  let Stage::Open {
+    exchange,
+    session: on,
+  } = ticket.stage
+  else {
+    return;
+  };
+  if Some(on) != session {
+    return;
+  }
+  let read = endpoint.reply_bytes_read(exchange).unwrap_or(0);
+  if read > ticket.reply_bytes {
+    ticket.reply_bytes = read;
+    ticket.progress_ns = now;
+  }
 }
 
 /// What a peer's serve loop takes next ([`next_request_or_forwarded`]).
