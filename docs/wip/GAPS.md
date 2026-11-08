@@ -740,6 +740,16 @@
 >   is never runnable itself, so it is wedged by this rule. Not measured. Fixtures' shard 1 (S S S R R S S) may be one.
 > - **macOS is proven by replays (limit).** A full window of flat CPU came in 1 of 20 CI runs, so its real-thread test
 >   exercised the reader, and the rule's replays carry the rule there.
+> - **`a_shard_starved_off_its_cpu_keeps_the_beat` hinged on the nice it was started at: fixed 2026-11-08 (bug-sweep).**
+>   On adacachy2 (32 cores) it failed "did not starve" because ananicy-cpp renices `cargo` to 19 and the test inherits
+>   it: its 63 spinners then weighed 15 each against the SCHED_IDLE shard's 3, and the shard's clock stood still 81-142
+>   ms at most, 3 of 3, where the same binary at nice 0 starved it 2.5-3.0 s. The core count was not the cause: the shard
+>   and its spinners already share one CPU. Each spinner now takes nice 0 or the nearest RLIMIT_NICE allows, the count is
+>   derived from the kernel's weight of that nice, and the watch starts once every spinner has settled: 10 of 10 at nice 0
+>   and at nice 19 there. The beat is charged only to the rule: the watchdog now counts its looks and those that withheld
+>   the beat (`Daemon::watchdog_turns`), the test requires none withheld, and holds the gap under a window only where the
+>   spinners are pinned. On macOS they starve the watchdog's thread as well (12-14 looks in 3 s instead of 30 at load
+>   45), the gap the supervisor saw. Red-checked: starved judged wedged withholds 20 of 30 looks and fails the test.
 > - **`a_spinning_shard_stops_the_beat` at extreme load: fixed 2026-11-08 (bug-sweep, eaab0a84).** It waited 10 s of
 >   wall, about one window of the shard's CPU at load 185; it now waits on the shard's own CPU clock for a window, then
 >   on the beat, with a 60-window wall backstop. Old 0 of 3 against new 3 of 3 at load 152-187 on the 18-CPU Mac,

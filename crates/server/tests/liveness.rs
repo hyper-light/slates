@@ -262,11 +262,58 @@ fn a_shard_blocked_in_a_syscall_stops_the_beat() {
   a_blocked_shard_stops_the_beat("syscall", block_in_a_read);
 }
 
-/// Shape: spinners on the starved shard's CPU. Linux: 63, the most measured, which held a SCHED_IDLE thread off its CPU
-/// for 5.7 s (CachyOS 7.3) and 7.9 s (Fedora 6.19) of 8 s; 4 and 16 left it 0.4-5.1 s.
+/// Shape: spinners at nice 0 on the starved shard's CPU: 63, the most measured, which held a SCHED_IDLE thread off its
+/// CPU for 5.7 s (CachyOS 7.3) and 7.9 s (Fedora 6.19) of 8 s; 4 and 16 left it 0.4-5.1 s.
+#[cfg(target_os = "linux")]
+const SPINNERS_AT_NICE_ZERO: u64 = 63;
+
+/// Format: the kernel's scheduling weight of each nice value from 0 to 19 (`sched_prio_to_weight`, kernel/sched/core.c);
+/// nice 0 weighs 1024 and SCHED_IDLE 3.
+#[cfg(target_os = "linux")]
+const NICE_WEIGHT: [u64; 20] = [
+  1024, 820, 655, 526, 423, 335, 272, 215, 172, 137, 110, 87, 70, 56, 45, 36, 29, 23, 18, 15,
+];
+
+/// Shape: a spinner's stack. It runs one loop, and the weight-derived count can reach thousands.
+#[cfg(target_os = "linux")]
+const SPINNER_STACK: usize = 64 * 1024;
+
+/// The nice every spinner takes: 0, or the nearest to it this process may reach. A process started nice inherits it in
+/// every thread (adacachy2's ananicy-cpp renices `cargo` to 19, and a test it runs inherits that), and the spinners'
+/// weight against the shard's SCHED_IDLE is the test's precondition: at nice 19 the same 63 spinners left the shard's
+/// clock flat 81-142 ms at most, 3 of 3 failing to starve it, where at nice 0 it stood still 2.5-3.0 s (adacachy2,
+/// 2026-11-08). An unprivileged thread may lower its nice to `20 - RLIMIT_NICE`.
+#[cfg(target_os = "linux")]
+fn spinner_nice() -> i32 {
+  // SAFETY: plain values; `who` 0 names this process.
+  let now = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+  if now <= 0 {
+    return now;
+  }
+  let mut limit = libc::rlimit {
+    rlim_cur: 0,
+    rlim_max: 0,
+  };
+  // SAFETY: `limit` is this frame's own, written by the call.
+  let read = unsafe { libc::getrlimit(libc::RLIMIT_NICE, &raw mut limit) };
+  let floor = if read == 0 {
+    20 - i32::try_from(limit.rlim_cur.min(40)).unwrap()
+  } else {
+    now
+  };
+  now.min(floor.max(0))
+}
+
+/// Spinners enough that their weight against the shard's matches [`SPINNERS_AT_NICE_ZERO`] at nice 0, whatever nice
+/// [`spinner_nice`] reaches.
 #[cfg(target_os = "linux")]
 fn spinners_wanted() -> usize {
-  63
+  let weight = usize::try_from(spinner_nice())
+    .ok()
+    .and_then(|nice| NICE_WEIGHT.get(nice))
+    .copied()
+    .unwrap_or(NICE_WEIGHT[0]);
+  usize::try_from((SPINNERS_AT_NICE_ZERO * NICE_WEIGHT[0]).div_ceil(weight)).unwrap()
 }
 
 /// Shape: four TIME_CRITICAL spinners on its CPU held an IDLE-priority thread off it for all of 8.9 s (Windows x86_64).
@@ -295,10 +342,33 @@ fn starve_this_thread() -> usize {
   cpu
 }
 
-/// Keeps the calling thread (a spinner) on `cpu`, at normal priority, ahead of a SCHED_IDLE thread there.
+/// Keeps the calling thread (a spinner) on `cpu`, at [`spinner_nice`], ahead of a SCHED_IDLE thread there.
 #[cfg(target_os = "linux")]
 fn outrank_on(cpu: usize) {
   pin_to(cpu);
+  let nice = spinner_nice();
+  // SAFETY: takes no argument and returns the calling thread's id.
+  let thread = unsafe { libc::syscall(libc::SYS_gettid) };
+  // SAFETY: plain values; on Linux PRIO_PROCESS with a thread id sets that thread's nice alone.
+  let set = unsafe {
+    libc::setpriority(
+      libc::PRIO_PROCESS,
+      libc::id_t::try_from(thread).unwrap(),
+      nice,
+    )
+  };
+  assert_eq!(
+    set, 0,
+    "a spinner takes nice {nice}, which RLIMIT_NICE allows"
+  );
+}
+
+/// Starts a spinner: on Linux with a small stack, since the weight-derived count can reach thousands.
+fn spawn_spinner(work: impl FnOnce() + Send + 'static) -> std::thread::JoinHandle<()> {
+  let builder = std::thread::Builder::new();
+  #[cfg(target_os = "linux")]
+  let builder = builder.stack_size(SPINNER_STACK);
+  builder.spawn(work).unwrap()
 }
 
 #[cfg(target_os = "linux")]
@@ -465,10 +535,13 @@ fn watch_starving(
 /// A-228, §4.14, fixtures' false kills at CPUWeight=1, the starved extreme of starved-is-not-stuck. Do: lower the shard
 /// that is not the control shard as far as an unprivileged thread can, spin one poll on it without yielding, and keep it
 /// off its CPU with higher-priority spinners there, until its own clock has stood still long enough that the old rule
-/// withholds the beat for a whole window (two windows and three beats) and three windows have passed. Expect: the beat
-/// never gaps a window: the thread is runnable throughout. Linux and Windows must see that flat window, or the test
-/// fails saying it did not starve; macOS' scheduler will not hold a thread off for that long on demand (1.1 s at best,
-/// 0-0.1 s at more spinners), so there it prints what it saw and holds only the beat.
+/// withholds the beat for a whole window (two windows and three beats) and three windows have passed. Expect: the
+/// watchdog never withholds the beat: the thread is runnable throughout. Linux and Windows must see that flat window, or
+/// the test fails saying it did not starve; on Linux the spinners take nice 0 whatever nice the test inherited, and are
+/// counted by weight where it cannot ([`spinner_nice`]), so the precondition holds on any box. macOS' scheduler will not
+/// hold a thread off for that long on demand (1.1 s at best, 0-0.1 s at more spinners), so there it prints what it saw.
+/// The beat's gap is held under a window where the spinners are confined to the shard's CPU (Linux, Windows); on macOS
+/// they starve the watchdog's thread too, so there only a withheld look counts against the rule.
 #[test]
 fn a_shard_starved_off_its_cpu_keeps_the_beat() {
   let (daemon, _, other) = daemon("starved");
@@ -487,17 +560,9 @@ fn a_shard_starved_off_its_cpu_keeps_the_beat() {
     wait(SAMPLE);
   }
   let cpu = on_cpu.load(Ordering::Acquire);
-  let spinners: Vec<_> = (0..spinners_wanted())
-    .map(|_| {
-      std::thread::spawn(move || {
-        outrank_on(cpu);
-        while running.load(Ordering::Relaxed) {
-          std::hint::spin_loop();
-        }
-      })
-    })
-    .collect();
+  let spinners = settled_spinners(cpu, running);
   let holder = slates_rt::registry::holder_of(other.0).unwrap();
+  let turns_before = daemon.watchdog_turns().unwrap();
   let must_starve = !cfg!(target_os = "macos");
   let flat_enough = WINDOW * 2 + BEAT * 3;
   let bound = if must_starve { WINDOW * 10 } else { WINDOW * 3 };
@@ -507,15 +572,19 @@ fn a_shard_starved_off_its_cpu_keeps_the_beat() {
     longest_flat,
     scheduler,
   } = watch_starving(&daemon, holder, flat_enough, bound);
+  let turns_after = daemon.watchdog_turns().unwrap();
+  let looks = turns_after.0 - turns_before.0;
+  let withheld = turns_after.1 - turns_before.1;
   running.store(false, Ordering::Relaxed);
   for spinner in spinners {
     spinner.join().unwrap();
   }
   worker.join().unwrap();
   println!(
-    "starved shard: {} spinners, its CPU clock stood still for {longest_flat:?} at most in {:?}; largest beat gap \
-     {largest_gap:?}",
+    "starved shard: {} spinners at nice {}, its CPU clock stood still for {longest_flat:?} at most in {:?}; largest beat \
+     gap {largest_gap:?}; the watchdog looked {looks} times and withheld the beat at {withheld}",
     spinners_wanted(),
+    spinner_nice_shown(),
     started.elapsed()
   );
   println!(
@@ -536,11 +605,63 @@ fn a_shard_starved_off_its_cpu_keeps_the_beat() {
     );
   }
   assert!(
-    largest_gap < WINDOW,
-    "the beat stopped for {largest_gap:?} while the shard was starved (its CPU clock stood still for {longest_flat:?}): \
-     a starved shard was judged stuck"
+    looks > 0 && withheld == 0,
+    "the watchdog withheld the beat at {withheld} of its {looks} looks while the shard was starved (its CPU clock stood \
+     still for {longest_flat:?}): a starved shard was judged stuck"
   );
+  // The gap is the rule's to answer for only where the spinners are confined to the shard's CPU (Linux and Windows pin
+  // them); macOS cannot pin, so its spinners starve the watchdog's own thread as well, and a gap there with no withheld
+  // look is that thread's lateness (1.146 s with 36 spinners at load ~40 on the 18-CPU Mac, 2026-11-08).
+  if must_starve {
+    assert!(
+      largest_gap < WINDOW,
+      "the beat stopped for {largest_gap:?} while the shard was starved (its CPU clock stood still for \
+       {longest_flat:?}; the watchdog withheld {withheld} of {looks} looks)"
+    );
+  }
   daemon.stop();
+}
+
+/// Starts [`spinners_wanted`] spinners outranking the shard on `cpu` until `running` falls, and returns once every one
+/// has taken its CPU and its nice. Before that they spin at the nice the test inherited, and a shard given CPU in that
+/// moment was flat 2.31 s at most where the settled runs were 2.9-3.0 s (adacachy2 at nice 19, 2026-11-08).
+fn settled_spinners(cpu: usize, running: &'static AtomicBool) -> Vec<std::thread::JoinHandle<()>> {
+  let settled = &*Box::leak(Box::new(AtomicUsize::new(0)));
+  let spinners: Vec<_> = (0..spinners_wanted())
+    .map(|_| {
+      spawn_spinner(move || {
+        outrank_on(cpu);
+        settled.fetch_add(1, Ordering::AcqRel);
+        while running.load(Ordering::Relaxed) {
+          std::hint::spin_loop();
+        }
+      })
+    })
+    .collect();
+  let waited = Instant::now();
+  while settled.load(Ordering::Acquire) < spinners.len() {
+    assert!(
+      waited.elapsed() < WINDOW * 10,
+      "{} of {} spinners took their CPU and nice",
+      settled.load(Ordering::Acquire),
+      spinners.len()
+    );
+    wait(SAMPLE);
+  }
+  spinners
+}
+
+/// The nice the spinners run at, for the record: Linux's [`spinner_nice`]; elsewhere the platform's own priority scheme
+/// stands in for it, and 0 is printed.
+fn spinner_nice_shown() -> i32 {
+  #[cfg(target_os = "linux")]
+  {
+    spinner_nice()
+  }
+  #[cfg(not(target_os = "linux"))]
+  {
+    0
+  }
 }
 
 /// Shape: the least share of a CPU the spinning shard's thread is waited for: the CPU-clock wait ends at a window of its

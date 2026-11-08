@@ -86,3 +86,22 @@ wall; the wall is only a backstop of 60 windows, a sixtieth of a CPU, and a fail
   passed 3 of 3, a window of the shard's CPU taking 11.6 to 12.2 s of wall.
 - Red-checked: with the watchdog's spinning verdict disabled, the new test fails ("a shard that ran 16.6 s of CPU
   without a step never stopped the beat", 359 beats after its window).
+
+## The starved test's precondition and its charge (2026-11-08, bug-sweep)
+
+- **The precondition hinged on nice, not on the core count.** On adacachy2 the test failed "did not starve" (the clock
+  flat 890 ms at most, the supervisor's run). It pins the SCHED_IDLE shard and its 63 spinners to one CPU on any box,
+  so the core count was not the cause. adacachy2 runs ananicy-cpp, which renices `cargo` to 19; a test cargo starts
+  inherits it, and spinners at nice 19 weigh 15 against SCHED_IDLE's 3. The same binary under `nice -n 19` failed 3
+  of 3 (flat 81-142 ms at most) where at nice 0 it passed 3 of 3 (2.5-3.0 s). 13 of 13 passed at nice 0 before the
+  fix. Each spinner now takes nice 0, or the nearest `RLIMIT_NICE` allows (31 there), and the count is derived from the
+  kernel's weight of that nice, so the weight against the shard is 63 nice-0 spinners' anywhere. The watch starts once
+  every spinner has settled: at nice 19 they run at the inherited nice until they renice, and the shard got CPU then
+  (flat 2.31 s at most against 2.9-3.0 settled). After: 10 of 10 there, 5 at nice 0 and 5 at nice 19 (flat 2.3-3.0 s),
+  and the whole liveness suite at nice 19, 8 of 8.
+- **The beat is charged only to what the rule controls.** The watchdog thread now counts its looks and the looks at which
+  it withheld the beat for a stuck shard (`watchdog::Turns`, `Daemon::watchdog_turns`). The test requires looks and no
+  withheld one, and holds the beat's gap under a window only where the spinners are pinned to the shard's CPU (Linux,
+  Windows). On macOS the spinners cannot be pinned and starve the watchdog's thread too: 12-14 looks in 3 s where 30
+  were due, at load 45 on the 18-CPU Mac, which was the 1.146 s gap seen at load 40. Red-checked on adacachy2: a starved
+  shard judged wedged withheld the beat at 20 of 30 looks and the test failed saying so.
