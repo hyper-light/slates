@@ -7,9 +7,16 @@
 > chain. A new volume's name is bounded so its summary fits one page (4,025 bytes; `InvalidName` past it). 3,000 volumes
 > list on two shards, and a walk under churn lists each survivor once
 > (`docs/bugs/2026-11-08-a-volume-listing-outgrew-one-reply.md`).
-> - **Still open, the same one-reply shape:** `changed_since` (reproduced: refused at 800 changed files), and, by their
->   code and not reproduced, `audit`, `grants`, a status's `drifted` list, and the conflict and invalidation lists of
->   `Submitted`, `Rebased`, `GrantRequired` and `Advanced`. Each needs a cursor the way `List` and `ReadDir` have.
+> - **`changed_since`, the same shape: fixed the same way (A-264, 2026-11-08).** Refused at 800 changed files; now paged
+>   in path order after the last path, a walk answering every path changed before it began exactly once. And it reports
+>   every dimension (`changed_between(v, head)`), where it read the content index alone: 1.3 to 2.7 times the
+>   content-only cost over a walk on the kernel tree, no second index. One path always
+>   fits a page alone: a green's paths arrive in requests, whose framing is larger than a page's (the longest an edit
+>   carries, 4,044 bytes, is answered). Merging a mounted work is owed and must bound its paths to one page when it lands
+>   (`docs/bugs/2026-11-08-a-greens-changed-since-outgrew-one-reply.md`).
+> - **Still open, the same one-reply shape**, by their code and not reproduced: `audit`, `grants`, a status's `drifted`
+>   list, and the conflict and invalidation lists of `Submitted`, `Rebased`, `GrantRequired` and `Advanced`. Each needs
+>   a cursor the way `List`, `ChangedSince` and `ReadDir` have, or a derived bound and a typed refusal.
 
 > **A version appended before its owner restarted never committed: fixed (2026-11-07, §4.16 Commit, AUD-11;
 > A-246).** A restarted owner rebuilt its greens from their chains, but not the merge records

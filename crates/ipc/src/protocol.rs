@@ -198,12 +198,17 @@ pub enum RequestBody {
     /// The green.
     green: VolumeId,
   },
-  /// The files a green changed strictly after `version` (§4.16): what a lagging work reconciles.
+  /// One page of the files a green changed strictly after `version` (§4.16): what a lagging work reconciles. In path
+  /// order past `after`: `None` begins, and each page that says `more` is continued after its last path. A page holds
+  /// what one reply chunk holds (§4.3), so the client walks an answer of any length; a path changed after `version`
+  /// when the walk began is answered exactly once.
   ChangedSince {
     /// The green.
     green: VolumeId,
     /// The base version to compare against.
     version: u64,
+    /// The last path of the previous page, or `None` for the first page.
+    after: Option<String>,
   },
   /// Create a work volume over a green (§4.16): an agent's private clone to declare operations on.
   CreateWork {
@@ -3180,10 +3185,13 @@ pub enum ReplyBody {
     /// The head version.
     head: u64,
   },
-  /// The files changed since a version.
+  /// One page of the files changed since a version (`ChangedSince`), in path order.
   ChangedSince {
-    /// The changed file paths.
+    /// The changed file paths of this page.
     paths: Vec<String>,
+    /// Whether more follow: the next page is asked after this page's last path. A flag, not the path again, so a page
+    /// holding one long path need not hold it twice.
+    more: bool,
   },
   /// A work volume was created over a green.
   WorkCreated {

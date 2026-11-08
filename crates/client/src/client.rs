@@ -340,6 +340,9 @@ pub struct Client {
   /// flight at a time (bounded by `awaited_cap`, as each page is awaited), its steps filed under the public word as an
   /// edit's are.
   list_chains: std::collections::BTreeMap<u64, ListChain>,
+  /// Async `changed_since` answers, by the public word their caller awaits: each walks the answer's pages as a chain,
+  /// as a listing does.
+  changed_chains: std::collections::BTreeMap<u64, ChangedChain>,
   /// Derived: the outstanding operations admitted — the command ring's slots, the client's in-flight
   /// bound (the same bound the retryable set keeps).
   awaited_cap: usize,
@@ -481,6 +484,51 @@ impl ListChain {
     let mut volumes = self.volumes;
     volumes.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
     volumes
+  }
+}
+
+/// A green's `changed_since` answer walked page by page (§4.16): the paths taken so far, and the last of them, after
+/// which the next page is asked. One reply holds one page, so an answer of any length is a walk.
+#[derive(Debug)]
+struct ChangedChain {
+  green: VolumeId,
+  version: u64,
+  paths: Vec<String>,
+}
+
+impl ChangedChain {
+  fn new(green: VolumeId, version: u64) -> ChangedChain {
+    ChangedChain {
+      green,
+      version,
+      paths: Vec::new(),
+    }
+  }
+
+  /// The request for the next page: after the last path taken.
+  fn request(&self) -> RequestBody {
+    RequestBody::ChangedSince {
+      green: self.green,
+      version: self.version,
+      after: self.paths.last().cloned(),
+    }
+  }
+
+  /// Takes one page's reply: whether more follow. A page that says more but brings no path is refused, so a walk
+  /// always ends.
+  fn take(&mut self, body: ReplyBody) -> Result<bool, ClientError> {
+    let ReplyBody::ChangedSince { paths, more } = resolved(body)? else {
+      return Err(ClientError::UnexpectedReply {
+        verb: "changed_since",
+      });
+    };
+    if more && paths.is_empty() {
+      return Err(ClientError::UnexpectedReply {
+        verb: "changed_since",
+      });
+    }
+    self.paths.extend(paths);
+    Ok(more)
   }
 }
 
@@ -927,15 +975,6 @@ fn extract_versions(body: ReplyBody) -> Result<u64, ClientError> {
 }
 
 /// Extracts the changed-paths list from its reply, or a typed mismatch.
-fn extract_changed(body: ReplyBody) -> Result<Vec<String>, ClientError> {
-  match body {
-    ReplyBody::ChangedSince { paths } => Ok(paths),
-    _ => Err(ClientError::UnexpectedReply {
-      verb: "changed_since",
-    }),
-  }
-}
-
 /// Extracts a rebase's outcome — rebased onto a version, or a conflict — or a typed mismatch.
 fn extract_rebased(body: ReplyBody) -> Result<Rebased, ClientError> {
   match body {
@@ -1155,6 +1194,7 @@ impl Client {
       edit_chains: std::collections::BTreeMap::new(),
       chain_steps: std::collections::BTreeMap::new(),
       list_chains: std::collections::BTreeMap::new(),
+      changed_chains: std::collections::BTreeMap::new(),
       awaited_cap: unpublished_cap,
       unawaited_dropped: 0,
       attest_in_flight: None,
@@ -2190,7 +2230,10 @@ impl Client {
   /// dropped on arrival. Returns whether it was outstanding.
   pub fn abandon(&mut self, word: u64) -> bool {
     self.pending.retain(|(held, _)| *held != word);
-    if self.edit_chains.remove(&word).is_some() || self.list_chains.remove(&word).is_some() {
+    if self.edit_chains.remove(&word).is_some()
+      || self.list_chains.remove(&word).is_some()
+      || self.changed_chains.remove(&word).is_some()
+    {
       let steps: Vec<u64> = self
         .chain_steps
         .iter()
@@ -2218,6 +2261,7 @@ impl Client {
       .copied()
       .chain(self.edit_chains.keys().copied())
       .chain(self.list_chains.keys().copied())
+      .chain(self.changed_chains.keys().copied())
       .collect::<std::collections::BTreeSet<u64>>()
       .into_iter()
       .collect()
@@ -2256,8 +2300,9 @@ impl Client {
     if let Some(pos) = self.pending.iter().position(|(held, _)| *held == word) {
       let (_, body) = self.pending.remove(pos);
       self.awaited.remove(&word);
-      // A listing's page taken as a raw reply ends its walk: the caller has the page, and nothing waits on the chain.
+      // A page taken as a raw reply ends its walk: the caller has the page, and nothing waits on the chain.
       self.list_chains.remove(&word);
+      self.changed_chains.remove(&word);
       self.note_reply(word, &body, true);
       return resolved(body).map(Some);
     }
@@ -2266,6 +2311,7 @@ impl Client {
       if reply.request == word {
         self.awaited.remove(&word);
         self.list_chains.remove(&word);
+        self.changed_chains.remove(&word);
         self.note_reply(word, &body, true);
         return resolved(body).map(Some);
       }
@@ -2937,21 +2983,73 @@ impl Client {
     green: VolumeId,
     version: u64,
   ) -> Result<RequestId, ClientError> {
-    self.begin(&RequestBody::ChangedSince { green, version })
+    let chain = ChangedChain::new(green, version);
+    let id = self.begin(&chain.request())?;
+    self.changed_chains.insert(id.word(), chain);
+    Ok(id)
   }
 
-  /// Takes a changed-since reply within `spin_ns`.
+  /// Takes a changed-since answer within `spin_ns`: the whole answer when its first page is its last and comes in the
+  /// spin; else `None`, the next page in flight under the same word, for [`Client::changed_since_poll`].
   pub fn changed_since_spin(
     &mut self,
     id: RequestId,
     spin_ns: u64,
   ) -> Result<Option<Vec<String>>, ClientError> {
-    self.spin_as(id, spin_ns, extract_changed)
+    let started = Instant::now();
+    loop {
+      if let Some(body) = self.take_held(id.word())? {
+        return self.advance_changed(id.word(), body);
+      }
+      if elapsed_ns(started) >= spin_ns {
+        return Ok(None);
+      }
+      std::hint::spin_loop();
+    }
   }
 
-  /// Takes a changed-since reply by id word once the completion fd signals.
+  /// Takes a changed-since answer by id word once the completion fd signals: each page's reply sends the next page's
+  /// request, and the whole answer comes with the last page's.
   pub fn changed_since_poll(&mut self, word: u64) -> Result<Option<Vec<String>>, ClientError> {
-    self.poll_as(word, extract_changed)
+    match self.take_held(word)? {
+      Some(body) => self.advance_changed(word, body),
+      None => Ok(None),
+    }
+  }
+
+  /// Advances the changed-since walk `word` by one page's reply: the whole answer after its last page, else `None`
+  /// with the next page's request sent under the chain's word.
+  fn advance_changed(
+    &mut self,
+    word: u64,
+    body: ReplyBody,
+  ) -> Result<Option<Vec<String>>, ClientError> {
+    let Some(chain) = self.changed_chains.get_mut(&word) else {
+      return Err(ClientError::UnexpectedReply {
+        verb: "changed_since",
+      });
+    };
+    let more = match chain.take(body) {
+      Ok(more) => more,
+      Err(e) => {
+        self.changed_chains.remove(&word);
+        return Err(e);
+      }
+    };
+    if !more {
+      return Ok(self.changed_chains.remove(&word).map(|chain| chain.paths));
+    }
+    let request = chain.request();
+    match self.begin(&request) {
+      Ok(id) => {
+        self.chain_steps.insert(id.word(), word);
+        Ok(None)
+      }
+      Err(e) => {
+        self.changed_chains.remove(&word);
+        Err(e)
+      }
+    }
   }
 
   /// Begins a rebase of a work volume, returning its request id.
@@ -3341,17 +3439,19 @@ impl Client {
     }
   }
 
-  /// The files a green changed strictly after `version` (§4.16).
+  /// The files a green changed strictly after `version` (§4.16), in path order: the answer walked a page at a time,
+  /// as one reply holds one page, so an answer of any length is answered.
   pub fn changed_since(
     &mut self,
     green: VolumeId,
     version: u64,
   ) -> Result<Vec<String>, ClientError> {
-    match self.call(&RequestBody::ChangedSince { green, version })? {
-      ReplyBody::ChangedSince { paths } => Ok(paths),
-      _ => Err(ClientError::UnexpectedReply {
-        verb: "changed_since",
-      }),
+    let mut chain = ChangedChain::new(green, version);
+    loop {
+      let reply = self.call(&chain.request())?;
+      if !chain.take(reply)? {
+        return Ok(chain.paths);
+      }
     }
   }
 

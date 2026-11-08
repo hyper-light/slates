@@ -1182,3 +1182,54 @@ fn assert_fold_to_head(green: &mut Green, head: u64) {
   );
   assert_eq!(green.fold_history_to_budget(head, 0), 0, "idempotent");
 }
+
+/// §4.16 `changed_since` (A-264). Do: on a green, submit increments that change content, a symlink, a mode, an xattr,
+/// a hard link and a directory, at different versions; then ask what changed since each version, whole and in pages
+/// of two. Expect: exactly `changed_between(v, head)` each time, every dimension's path included, and the pages the
+/// same paths in the same order. Before 2026-11-08 `changed_since` read the content index alone and answered only the
+/// files whose content changed.
+#[test]
+fn changed_since_reports_every_dimension_as_changed_between_does() {
+  let mut green = Green::new();
+  green.submit(
+    &Build::new()
+      .create("a", b"alpha")
+      .create("b", b"beta")
+      .at(1, 0),
+  );
+  green.submit(&Build::new().symlink("s", "a").at(2, 1));
+  green.submit(&Build::new().setmode("b", 0o600).at(3, 2));
+  green.submit(&Build::new().setxattr("a", "user.k", b"v").at(4, 3));
+  green.submit(&Build::new().link("l", "b").at(5, 4));
+  green.submit(&Build::new().mkdir("d").at(6, 5));
+  let head = green.head();
+  for version in 0..=head {
+    let expected = green.changed_between(version, head);
+    assert_eq!(
+      green.changed_since(version),
+      expected,
+      "since {version}, whole"
+    );
+    let mut paged: Vec<String> = Vec::new();
+    loop {
+      let page: Vec<String> = green
+        .changed_since_after(version, paged.last().map(String::as_str))
+        .take(2)
+        .cloned()
+        .collect();
+      let full = page.len() == 2;
+      paged.extend(page);
+      if !full {
+        break;
+      }
+    }
+    assert_eq!(paged, expected, "since {version}, in pages of two");
+  }
+  let since_content = green.changed_since(1);
+  for path in ["s", "b", "a", "l", "d"] {
+    assert!(
+      since_content.iter().any(|changed| changed == path),
+      "{path} changed after version 1: {since_content:?}"
+    );
+  }
+}

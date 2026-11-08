@@ -1661,8 +1661,10 @@ metadata provisioning path, not arbitrary host pathname resolution. A scratch vo
   `rebase(work_volume, to?) → Rebased{version} | Conflict{windows}` (move the work volume's base to
   a newer green version by mapping its pending operations; unchanged on conflict);
   `advance(attachment, version)` (re-pin a green attachment; targeted invalidations);
-  `versions(green, from?, limit?)` and `changed_since(green, version, paths?)` (reads of the chain
-  and the per-path last-changed index); `edit(volume, path, at, delete_len, bytes)` (an SDK write
+  `versions(green, from?, limit?)` and `changed_since(green, version, paths?, after?)` (reads of the chain
+  and the per-dimension histories; `changed_since` names every path any dimension of which changed after the version,
+  as `advance` invalidates by, a page a reply in path order past `after`, so an answer of any length is walked and a path
+  changed when the walk began is answered once, 2026-11-08, A-264); `edit(volume, path, at, delete_len, bytes)` (an SDK write
   that declares a true insert or delete). A mount write to a green volume is `EROFS`; an SDK
   write is `ReadOnlyVolume`.
 
@@ -19525,3 +19527,18 @@ as a chain), `crates/server/tests/volume_list.rs`, `crates/cli/tests/cli.rs`, bo
 - **What it does not change:** the other replies that return a list whole (`changed_since`, `audit`, `grants`, a
   status's `drifted`, the merge verbs' conflict and invalidation lists), recorded open in GAPS; a volume recovered
   under a longer name is not refused.
+
+### A-264 — `changed_since` is answered a page at a time, and names every dimension (accepted 2026-11-08)
+Applied in the same change to: §4.16 (the merge verbs), `crates/merge/src/engine.rs` (`Green::changed_since_after`),
+`crates/ipc/src/protocol.rs` (`ChangedSince { green, version, after }`, `ChangedSince { paths, more }`),
+`crates/server/src/verbs.rs`, `crates/client/src/client.rs` (the walk, and the async form as a chain), GAPS,
+`docs/bugs/2026-11-08-a-greens-changed-since-outgrew-one-reply.md`.
+- **Paged:** the whole answer was one reply, refused at 800 changed files. A page now holds what one reply chunk holds,
+  in path order past the last path; `more` is a flag, so a page with one long path need not hold it twice.
+- **Every dimension:** it read the content index alone, so a symlink, mode, xattr, special, directory or link moved under
+  a work went unreported. It is `changed_between(v, head)`, walked lazily over every dimension's history.
+- **Cost, measured** (the kernel tree, 97,229 paths, 2,000 submits, release): a whole walk 1.0 to 4.4 ms against the
+  content index's 0.37 to 1.49 ms, 1.3 to 2.7 times; a page 16 to 22 µs at the larger answers.
+- **One path always fits a page:** a green's paths arrive in requests, whose framing is larger than a page's (the longest
+  an edit carries, 4,044 bytes, is answered); merging a mounted work is owed and must bound its paths when it lands.
+

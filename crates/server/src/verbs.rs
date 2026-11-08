@@ -4025,7 +4025,11 @@ fn dispatch_inner(
       base,
     } => create_green(state, principal, &name, require_evidence, base),
     RequestBody::Versions { green } => versions(state, principal, green),
-    RequestBody::ChangedSince { green, version } => changed_since(state, principal, green, version),
+    RequestBody::ChangedSince {
+      green,
+      version,
+      after,
+    } => changed_since(state, principal, green, version, after.as_deref()),
     RequestBody::CreateWork { green, name } => create_work(state, principal, green, &name),
     RequestBody::Edit {
       work,
@@ -5826,6 +5830,7 @@ fn changed_since(
   principal: &Principal,
   green: VolumeId,
   version: u64,
+  after: Option<&str>,
 ) -> ReplyBody {
   let record = match crate::merge_service::require_green(state, principal, green, "changed_since") {
     Ok(record) => record,
@@ -5834,9 +5839,37 @@ fn changed_since(
   let Some(engine) = state.greens.get(&record.id) else {
     return refused(Refusal::NotFound);
   };
-  ReplyBody::ChangedSince {
-    paths: engine.changed_since(version),
+  let room = changed_page_room();
+  let mut used = 0usize;
+  let mut paths = Vec::new();
+  let mut more = false;
+  for path in engine.changed_since_after(version, after) {
+    let bytes = encoded_len(path);
+    if !paths.is_empty() && used.saturating_add(bytes) > room {
+      more = true;
+      break;
+    }
+    used = used.saturating_add(bytes);
+    paths.push(path.clone());
   }
+  ReplyBody::ChangedSince { paths, more }
+}
+
+/// The bytes a `changed_since` page's paths may take: one reply chunk less the page's own framing.
+fn changed_page_room() -> usize {
+  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+  let empty = ReplyBody::ChangedSince {
+    paths: Vec::new(),
+    more: true,
+  };
+  chunk.saturating_sub(slates_ipc::protocol::framed_len(&empty))
+}
+
+/// The encoded bytes `value` adds to a reply.
+fn encoded_len<T: Wire>(value: &T) -> usize {
+  let mut encoded = Vec::new();
+  value.encode(&mut encoded);
+  encoded.len()
 }
 
 /// Creates a work volume over a green (§4.16): an agent's private place to declare operations,
@@ -9860,9 +9893,7 @@ fn list_page_room() -> usize {
 
 /// The encoded bytes one volume adds to a listing page.
 fn summary_bytes(summary: &VolumeSummary) -> usize {
-  let mut encoded = Vec::new();
-  summary.encode(&mut encoded);
-  encoded.len()
+  encoded_len(summary)
 }
 
 /// The first volumes of `volumes` (in id order) that fit `room`: at least one, so a listing always progresses.

@@ -2925,15 +2925,19 @@ fn merge_submit_scenario() {
   assert_eq!(head, 1, "the green advanced to version 1");
 
   // The chain's read side: the file A committed changed after version 0, but not after version 1.
-  let ReplyBody::ChangedSince { paths } =
-    client.call(&RequestBody::ChangedSince { green, version: 0 })
-  else {
+  let ReplyBody::ChangedSince { paths, .. } = client.call(&RequestBody::ChangedSince {
+    green,
+    version: 0,
+    after: None,
+  }) else {
     panic!("changed_since");
   };
   assert_eq!(paths, vec!["f".to_owned()], "f changed after version 0");
-  let ReplyBody::ChangedSince { paths } =
-    client.call(&RequestBody::ChangedSince { green, version: 1 })
-  else {
+  let ReplyBody::ChangedSince { paths, .. } = client.call(&RequestBody::ChangedSince {
+    green,
+    version: 1,
+    after: None,
+  }) else {
     panic!("changed_since");
   };
   assert!(
@@ -3794,6 +3798,7 @@ fn role_kind_mismatch_part(
   let changed_since_plain = RequestBody::ChangedSince {
     green: p,
     version: 0,
+    after: None,
   };
   assert_eq!(refusal_of(client, &changed_since_plain), Refusal::NotGreen);
   let work_over_plain = RequestBody::CreateWork {

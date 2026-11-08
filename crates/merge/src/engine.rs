@@ -600,6 +600,29 @@ fn history_touches<T>(history: &[(u64, T)], from: u64, to: u64) -> bool {
     .any(|(version, _)| *version > from && *version <= to)
 }
 
+/// Several path-ordered key streams merged into one, each path once (`Green::changed_since_after`).
+struct MergedPaths<'a> {
+  sources: Vec<std::iter::Peekable<Box<dyn Iterator<Item = &'a String> + 'a>>>,
+}
+
+impl<'a> Iterator for MergedPaths<'a> {
+  type Item = &'a String;
+
+  fn next(&mut self) -> Option<&'a String> {
+    let least = self
+      .sources
+      .iter_mut()
+      .filter_map(|source| source.peek().copied())
+      .min()?;
+    for source in &mut self.sources {
+      while source.peek().is_some_and(|path| *path == least) {
+        source.next();
+      }
+    }
+    Some(least)
+  }
+}
+
 /// The paths of a per-path history that changed at a version in `(from, to]`.
 fn paths_changed_in<T>(
   histories: &BTreeMap<String, Vec<(u64, T)>>,
@@ -1351,12 +1374,133 @@ impl Green {
   /// The files whose content changed strictly after `version` (§4.16 the last-changed index): what a
   /// lagging work must reconcile, and what a rebase remaps against. Sorted by path.
   pub fn changed_since(&self, version: u64) -> Vec<String> {
+    self.changed_since_after(version, None).cloned().collect()
+  }
+
+  /// The paths any dimension of which changed strictly after `version`, in path order, past `after` (§4.16
+  /// `changed_since`, paged; A-264): exactly [`Green::changed_between`]`(version, head)`, walked lazily. A work learns
+  /// from it which of its pending paths the green moved under, and a symlink, a mode, an xattr, a special or a link
+  /// moved under it is that as much as content is (before 2026-11-08 it read the content index alone). Each dimension's
+  /// history is keyed by path, so the walk ranges every one from the cursor and merges them: a page costs the paths it
+  /// passes, and a whole walk passes each path once. Histories are append-only, so a path changed after `version` when
+  /// the walk began stays changed, and a walk that resumes after the last path of its previous page answers it exactly
+  /// once; a path changed for the first time between pages, before the cursor, is the next walk's.
+  pub fn changed_since_after<'a>(
+    &'a self,
+    version: u64,
+    after: Option<&'a str>,
+  ) -> impl Iterator<Item = &'a String> + 'a {
+    let head = self.head();
+    let start = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+    let from = (start, std::ops::Bound::Unbounded);
+    let touched = move |history: &[(u64, bool)]| history_touches(history, version, head);
+    let keyed: Vec<Box<dyn Iterator<Item = &'a String> + 'a>> = vec![
+      Box::new(
+        self
+          .content_history
+          .range::<str, _>(from)
+          .filter(move |(_, h)| history_touches(h, version, head))
+          .map(|(path, _)| path),
+      ),
+      Box::new(
+        self
+          .special_history
+          .range::<str, _>(from)
+          .filter(move |(_, h)| history_touches(h, version, head))
+          .map(|(path, _)| path),
+      ),
+      Box::new(
+        self
+          .dir_history
+          .range::<str, _>(from)
+          .filter(move |(_, h)| touched(h))
+          .map(|(path, _)| path),
+      ),
+      Box::new(
+        self
+          .mode_history
+          .range::<str, _>(from)
+          .filter(move |(_, h)| history_touches(h, version, head))
+          .map(|(path, _)| path),
+      ),
+      Box::new(
+        self
+          .symlink_history
+          .range::<str, _>(from)
+          .filter(move |(_, h)| history_touches(h, version, head))
+          .map(|(path, _)| path),
+      ),
+      // A hard link is changed when its own history is, or when its target at either end is a special that changed
+      // (the rule `changed_between` applies).
+      Box::new(
+        self
+          .hardlink_history
+          .range::<str, _>(from)
+          .filter(move |(_, h)| {
+            history_touches(h, version, head)
+              || [history_at(h, version), history_at(h, head)]
+                .iter()
+                .flatten()
+                .any(|target| {
+                  self.special_history.contains_key(target)
+                    && self.dimensions_changed_between(target, version, head)
+                })
+          })
+          .map(|(path, _)| path),
+      ),
+      Box::new(
+        self
+          .xattr_history
+          .range(match after {
+            Some(after) => (
+              std::ops::Bound::Excluded((after.to_owned(), String::new())),
+              std::ops::Bound::Unbounded,
+            ),
+            None => (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+          })
+          .filter(move |((path, _), h)| {
+            after.is_none_or(|after| path.as_str() > after) && history_touches(h, version, head)
+          })
+          .map(|((path, _), _)| path),
+      ),
+    ];
+    MergedPaths {
+      sources: keyed.into_iter().map(Iterator::peekable).collect(),
+    }
+  }
+
+  /// Whether one of `path`'s own dimensions changed at a version in `(from, to]`.
+  fn dimensions_changed_between(&self, path: &str, from: u64, to: u64) -> bool {
+    let span = (from, to);
     self
-      .last_changed
-      .iter()
-      .filter(|(_, changed)| **changed > version)
-      .map(|(path, _)| path.clone())
-      .collect()
+      .content_history
+      .get(path)
+      .is_some_and(|h| history_touches(h, span.0, span.1))
+      || self
+        .special_history
+        .get(path)
+        .is_some_and(|h| history_touches(h, span.0, span.1))
+      || self
+        .dir_history
+        .get(path)
+        .is_some_and(|h| history_touches(h, span.0, span.1))
+      || self
+        .mode_history
+        .get(path)
+        .is_some_and(|h| history_touches(h, span.0, span.1))
+      || self
+        .symlink_history
+        .get(path)
+        .is_some_and(|h| history_touches(h, span.0, span.1))
+      || self
+        .hardlink_history
+        .get(path)
+        .is_some_and(|h| history_touches(h, span.0, span.1))
+      || self
+        .xattr_history
+        .range((path.to_owned(), String::new())..)
+        .take_while(|((xattr_path, _), _)| xattr_path == path)
+        .any(|(_, history)| history_touches(history, from, to))
   }
 
   /// The number of paths merged through the content fast path (the non-vacuity counter).
