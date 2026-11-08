@@ -5096,7 +5096,7 @@ const ADMITTED_FORWARDS_HOLD: Duration = Duration::from_nanos(2 * LIVENESS_BUDGE
 /// 98) and twice the SLO (9 to 76), each time all of them within the next read (CI runs 42426714842, 42427500000,
 /// 42429128963).
 const ADMITTED_FORWARDS_ANSWERED: Duration =
-  Duration::from_nanos(6 * slates_server::config::FAILOVER_SLO_NS);
+  Duration::from_nanos(2 * slates_server::config::FAILOVER_SLO_NS);
 /// The owner's shard is held ([`a_silent_owner_leaves_no_forward_the_lane_admitted_unrun`]).
 static ADMITTED_OWNER_HELD: std::sync::atomic::AtomicBool =
   std::sync::atomic::AtomicBool::new(false);
@@ -5230,14 +5230,41 @@ fn a_silent_owner_leaves_no_forward_the_lane_admitted_unrun() {
     }
     holder.join().unwrap().unwrap();
     let held_ended = Instant::now();
-    let tagged: Vec<Vec<(u32, ReplyBody)>> = burst
-      .iter_mut()
-      .map(|client| {
-        let left = ADMITTED_FORWARDS_ANSWERED.saturating_sub(held_ended.elapsed());
-        client.collect_tagged(slots, left)
-      })
-      .collect();
+    // At the first client left short: its request ring's requests the daemon has not taken, its reply ring's replies
+    // it has not taken, and each of b's shards' unwritten (`deferred`) replies, read before anything else touches
+    // them, so a reply held back is placed: never read, never written, or written and not seen. A shard too busy to
+    // run the observation within its budget reads `None`.
+    let mut at_first_short: Option<(usize, u64, u64, Vec<Option<usize>>)> = None;
+    let mut tagged: Vec<Vec<(u32, ReplyBody)>> = Vec::with_capacity(burst.len());
+    for (index, client) in burst.iter_mut().enumerate() {
+      let replies = client.collect_tagged(slots, ADMITTED_FORWARDS_ANSWERED);
+      if replies.len() < slots && at_first_short.is_none() {
+        let (requests, unread) = (client.requests_unread(), client.replies_unread());
+        let unwritten: Vec<Option<usize>> = daemons[1]
+          .shards()
+          .iter()
+          .map(|shard| {
+            daemons[1]
+              .observation(
+                Some(*shard),
+                slates_server::daemon::OBSERVE_BUDGET_NS,
+                |state: &mut slates_server::state::ShardState| state.deferred.len(),
+              )
+              .ok()
+              .and_then(|observation| observation.wait().ok())
+          })
+          .collect();
+        at_first_short = Some((index, requests, unread, unwritten));
+      }
+      tagged.push(replies);
+    }
     let last_reply = held_ended.elapsed();
+    if let Some((index, requests, unread, unwritten)) = &at_first_short {
+      eprintln!(
+        "at the first short client ({index}): its request ring held {requests} requests not taken, its reply ring \
+         {unread} replies not taken; b's shards held {unwritten:?} unwritten"
+      );
+    }
     // Where a missing reply is: each short client's missing sequences, any that arrive in a further budget (late past
     // the bound, counted apart), and the replies each of b's shards still holds unwritten.
     let mut missing = Vec::new();
@@ -7484,6 +7511,26 @@ impl Client {
         }
       }
     }
+  }
+
+  /// The requests on this client's request ring the daemon has not taken yet.
+  fn requests_unread(&self) -> u64 {
+    self
+      .end
+      .region()
+      .cmd()
+      .depth(self.end.region().object())
+      .unwrap_or(0)
+  }
+
+  /// The replies on this client's completion ring it has not taken yet.
+  fn replies_unread(&self) -> u64 {
+    self
+      .end
+      .region()
+      .cpl()
+      .depth(self.end.region().object())
+      .unwrap_or(0)
   }
 
   /// The sequences of this client's last `count` requests (a burst's).
