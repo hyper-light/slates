@@ -12,12 +12,15 @@
 #![cfg(unix)]
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
 use slates_client::{Client, ClientError, Rebased, Refusal, RequestId, Submitted};
 use slates_ipc::protocol::{ReadAt, ReplyBody, RequestBody, VolumeId, WorkOp};
+use slates_server::daemon::OBSERVE_BUDGET_NS;
+use slates_server::state::ShardState;
 use slates_server::verbs::{owner_of, owner_of_name};
 use slates_server::{Daemon, DaemonConfig};
 
@@ -633,6 +636,77 @@ fn a_floor_whose_work_was_never_made_is_released_at_the_next_start() {
   drop(client);
   second.stop();
   drop(anchor);
+}
+
+/// Shape: how long the green's owner is held while a submit waits on it: long enough for the verbs behind it to reach the
+/// work's shard on a loaded host.
+const OWNER_HOLD: Duration = Duration::from_millis(400);
+
+/// A-247 "A work's order". Do: hold the green's owner shard; submit a work off that shard, so the verdict waits; send
+/// an edit of a file the work already holds, which needs nothing of the owner; look at it near the hold's end; then
+/// let the owner go. Expect: the edit unanswered while the verdict is out, then the submit accepted with what the work
+/// held before it, and the edit standing on what the submit left. Without the order it ran during the verdict, was
+/// answered, and the accept's reset wiped it.
+#[test]
+fn an_edit_behind_a_submit_waiting_on_its_owner_lands_after_the_verdict() {
+  static HELD: AtomicBool = AtomicBool::new(false);
+  let (daemon, instance) = daemon(MANY_SHARDS, "behind");
+  let mut client = connect(&instance);
+  let green = client.create_green("behind-green", false).unwrap();
+  let (seed, _) = client.create_work(green, "behind-seed").unwrap();
+  client.edit(seed, "f", 0, 0, b"....").unwrap();
+  assert_eq!(client.submit(seed).unwrap(), Submitted::Accepted(1));
+  let (work, _) = client
+    .create_work(green, &off_owner_name(green, "behind"))
+    .unwrap();
+  client.edit(work, "f", 0, 4, b"AAAA").unwrap();
+  let owner = daemon.shards()[usize::from(owner_of(green))];
+  let holding = daemon
+    .observation(Some(owner), OBSERVE_BUDGET_NS, |_: &mut ShardState| {
+      HELD.store(true, Ordering::Release);
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(OWNER_HOLD);
+    })
+    .unwrap();
+  let waiter = std::thread::spawn(move || holding.wait().unwrap());
+  while !HELD.load(Ordering::Acquire) {
+    std::thread::yield_now();
+  }
+  let submit = client
+    .begin(&RequestBody::Submit {
+      work,
+      evidence: Vec::new(),
+    })
+    .unwrap();
+  let edit = client
+    .begin(&RequestBody::Edit {
+      work,
+      path: "f".to_owned(),
+      at: 0,
+      delete_len: 4,
+      bytes: b"BBBB".to_vec(),
+    })
+    .unwrap();
+  #[allow(clippy::disallowed_methods)]
+  std::thread::sleep(OWNER_HOLD / 2);
+  let early = client.poll_reply(edit);
+  waiter.join().unwrap();
+  assert_eq!(
+    reply_of(&mut client, submit),
+    ReplyBody::Submitted {
+      version: Some(2),
+      conflicts: Vec::new(),
+    }
+  );
+  assert!(
+    matches!(early, Ok(None)),
+    "the edit waits behind the verdict: {early:?}"
+  );
+  assert_eq!(reply_of(&mut client, edit), ReplyBody::Edited);
+  assert_eq!(client.read(green, "f", ReadAt::Head).unwrap(), b"AAAA");
+  assert_eq!(client.read(work, "f", ReadAt::Head).unwrap(), b"BBBB");
+  drop(client);
+  daemon.stop();
 }
 
 /// One step of a generated history.
