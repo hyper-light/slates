@@ -1,0 +1,72 @@
+name: DIAG raft-chaos interleaved A/B of stateless reset in loadtest-scale's restart case (not for main)
+
+# Diagnostics branch of the raft-chaos agent; never merged. Two arms of the same tree, built on each runner as CI's gate
+# builds the fleet tests (debug): after = A-261 as committed; before = the same with the node's reset never sent (the
+# one line in demux.rs), which is the transport as it was. Both arms wait up to 200 liveness budgets for the read
+# through b to reach the restarted a (the committed test stops at 10), so the before arm is measured, not cut off. The
+# arms alternate run by run, the first arm swapped between runners.
+
+on:
+  push:
+    branches: [diag-raft-chaos-ab-61]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ab:
+    name: A/B ${{ matrix.sample }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        sample: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: The other arm's tree
+        run: |
+          git fetch -q origin diag-raft-chaos-ab-61-before
+          git worktree add -q ../before FETCH_HEAD
+          git -C ../before log -1 --oneline
+          git log -1 --oneline
+      - name: Build both arms
+        run: |
+          CARGO_TARGET_DIR=$GITHUB_WORKSPACE/../t-after cargo test --locked -p slates-server --test fleet --no-run
+          (cd ../before && CARGO_TARGET_DIR=$GITHUB_WORKSPACE/../t-before cargo test --locked -p slates-server --test fleet --no-run)
+      - name: Interleaved runs
+        run: |
+          R=../results.txt
+          echo "runner ubuntu-latest, $(nproc) CPUs, $(date -u), after $(git rev-parse --short=8 HEAD), before $(git -C ../before rev-parse --short=8 HEAD), sample ${{ matrix.sample }}" > $R
+          bin_of() { ls -t ../t-$1/debug/deps/fleet-* | grep -v '\.d$' | head -1; }
+          echo "before $(bin_of before)" >> $R; echo "after $(bin_of after)" >> $R
+          if [ $(( ${{ matrix.sample }} % 2 )) -eq 0 ]; then ORDER="after before"; else ORDER="before after"; fi
+          for pair in 1 2 3 4 5; do
+            for arm in $ORDER; do
+              BIN=$(bin_of $arm)
+              echo "== pair $pair arm $arm at $(date -u +%H:%M:%S), load $(cut -d' ' -f1-3 /proc/loadavg)" >> $R
+              status=0
+              timeout 600 "$BIN" --nocapture --test-threads=1 --exact a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process > ../run.log 2>&1 || status=$?
+              grep -E 'the first read through b to reach the restarted a|test result|panicked' ../run.log | cut -c1-1600 >> $R
+              echo "== pair $pair arm $arm exit $status, load $(cut -d' ' -f1-3 /proc/loadavg)" >> $R
+            done
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          git config user.name "diag-raft-chaos"
+          git config user.email "diag-raft-chaos@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-raft-chaos-ab-61 results ${{ matrix.sample }}"
+          git push -q origin "HEAD:refs/heads/diag-results/diag-raft-chaos-ab-61-${{ matrix.sample }}"

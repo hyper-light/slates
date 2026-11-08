@@ -467,7 +467,7 @@ impl Demux {
     };
     inner.resets_sent_at.insert(from, now);
     // A refused send is a lost reset: the dialer's next packet after the interval draws another.
-    if self.send_to(&datagram, from).is_ok() {
+    if false && self.send_to(&datagram, from).is_ok() {
       inner.counters.resets_sent = inner.counters.resets_sent.saturating_add(1);
     }
   }
