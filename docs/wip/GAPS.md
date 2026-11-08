@@ -1279,6 +1279,19 @@
     passed 7 of 8 with no fence or NoLoss violation, judged on the successor's recorded holders; in its decisive run
     phase one waited 28 times for the stopped holder, then took the volume over whole. The eighth was the open register
     stall (`fleet.takeover.lost`, live-fixes).
+  - **Fixed (2026-11-08): the five-node flow's formation wait demanded a full mesh.** It required every node to have
+    probed every other member. §4.8 (amended 2026-10-10) keeps direct contact only with holders and voters, so a
+    five-node fleet's two non-voters, which hold nothing for each other, keep no record or probe session once
+    formation's first window closes. The flow took them for a stall at 3 of 4 peers probed (diag-live-fixes-30 runs 5
+    and 6, diag-raft-chaos-final-39 run 8), with no dial or failure counted, by design.
+    - The wait now judges each node's mesh by status's `fleet_peers_in_contact` (above zero) and
+      `fleet_peers_unmeshed` (zero), counted over the members held alive (live-fixes, 68fc082f).
+    - Two red rounds fixed the rule's two regimes. With the counts over the installed configuration's members, every
+      node read both at 0 before the council's first commit, and the wait never ended: diag-raft-chaos-final-41,
+      fresh-member 0/8 and kill-at-ack 0/3; diag-raft-chaos-mesh-42 printed (0, 0) with 4 of 4 probed on all five
+      nodes.
+    - Formation then passed 8 of 8 (diag-raft-chaos-final-43), 11 of 11 (diag-live-fixes-33) and 8 of 8
+      (diag-raft-chaos-mesh-48, whose one failure was the register stall above).
   - Open (live-fixes): a node replaced at the same machine anchor (same certificate) never answers a live write. Its
     neighbours keep the old node's pair key and refuse the new one (`fleet.seal.pair_refused` 789 of 793 served, the
     owner `pair_undelivered` 1,580), so the whole entry never carries their keys (`held_back.keys` 394). Before the
