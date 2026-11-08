@@ -511,7 +511,7 @@ fn transfers_across_a_dead_path(dead: DeadFor) -> DeadPathOutcome {
 }
 
 /// §4.10a (RFC 8899 §4.3: a black hole is "excessive loss of data sent with a specific packet size"; §3 item 4: robust
-/// to loss "due to other reasons (including link transmission error, congestion)"): a peer that answers nothing for a
+/// to probes "lost due to other reasons (including link transmission error, congestion)"): a peer that answers nothing for a
 /// while — stopped, as a SIGSTOPped daemon is — is a liveness event, not size evidence. Do: a transfer over a 1,500-byte
 /// path; the path then drops every datagram for two seconds (the rolling partition's stop) while a second transfer starts; then restored.
 /// Expect both transfers byte-exact and the confirmed size after it what it was before, with no black hole counted.

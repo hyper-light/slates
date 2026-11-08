@@ -15,8 +15,8 @@
 //!
 //! Black holes (RFC 8899 §4.3): a path whose MTU shrank drops every packet above its new size, silently. A
 //! black hole is "excessive loss of data sent with a specific packet size" (§4.3), never loss every size
-//! suffers, which is congestion the controller alone answers (§3 item 4: robust to loss "due to other reasons
-//! (including link transmission error, congestion)"). So loss only makes the size suspect:
+//! suffers, which is congestion the controller alone answers (§3 item 4 asks the same of a probe "lost due to other
+//! reasons (including link transmission error, congestion)"). So loss only makes the size suspect:
 //! [`BLACK_HOLE_LOSSES`] in a row, with none acknowledged between, of packets above the floor declared lost or
 //! probe timeouts with one in flight (nothing at all acknowledged: a peer stopped, or the path dead, at every
 //! size). A suspect session sends at the floor, so packets that cross keep the acknowledgements, and loss

@@ -4618,8 +4618,8 @@ hard links and snapshot versions. No live kernel endpoint state is part of the i
 >   `Ping` probes padded to size. It judges a size too large after three losses or at once on `EMSGSIZE`,
 >   stops within one packet overhead (29 bytes), and re-searches after 600 s.
 > - **Black holes** (amended 2026-11-08). A black hole needs size-specific evidence, never loss every size
->   suffers (RFC 8899 §4.3, "excessive loss of data sent with a specific packet size"; §3 item 4, robust to
->   loss "due to other reasons (including link transmission error, congestion)"). Three in a row of above-floor
+>   suffers (A-253; RFC 8899 §4.3, "excessive loss of data sent with a specific packet size"; §3 item 4, of a
+>   probe "lost due to other reasons (including link transmission error, congestion)"). Three in a row of above-floor
 >   packets lost or probe timeouts while one is out only make the size *suspect*: the session sends
 >   at the floor, so packets that cross keep loss detection running, and probes at the size it had. One
 >   acknowledged probe, or any above-floor packet, and the size stands. Three probes at it declared lost while
@@ -13582,6 +13582,45 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Arm64 Windows proven** since (2026-10-27): the direct-map client tests, 20 of 20, on CI's `windows-11-arm` (run
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
+
+### A-253 — A path-MTU black hole needs failed probes at the size, not loss every size suffers (accepted 2026-11-08, the supervisor's order; amends §4.10a's black-hole rule)
+
+Applied in the same change to:
+- §4.10a: the "Black holes" bullet and "Proven by use".
+- GAPS and `docs/bugs/2026-11-08-a-session-fell-to-the-mtu-floor-on-loss-every-size-suffered.md`.
+- `crates/transport`: `pmtud.rs` (`PathMtu`'s suspect state, `on_silence`, the confirming probes) and `connection.rs`
+  (`note_mtu_timeout`, `note_mtu_losses`, `note_mtu_acknowledged`).
+- The tests: `a_peer_silent_for_several_probe_timeouts_keeps_its_path_mtu` and
+  `a_burst_that_loses_every_size_keeps_the_path_mtu` (`tests/session.rs`), and the unit cases in `pmtud.rs`.
+
+- **The rule amended.** §4.10a said: "Losses of above-floor packets, and probe timeouts while such packets are out,
+  fall the session back to the floor."
+- **Why.** At a confirmed size of 65 KB every data packet is above the floor, so loss that hits every size counted the
+  same as a path that shrank. On loopback, a SIGSTOPped peer's third probe timeout dropped the session from 65,496 bytes
+  to 1,200: 89 falls in 60 rolling-partition runs, every one by probe timeout and none by a loss pass
+  (diag-live-durability-48), and resumed candidates ran there.
+- **What the RFCs say.**
+  - RFC 8899 §4.3 allows data loss as evidence through "a mechanism implemented within the PL to detect excessive loss
+    of data sent with a specific packet size", which can "conclude that this excessive loss could be a result of an
+    invalid PLPMTU".
+  - RFC 8899 §3 item 4: "The PL is REQUIRED to be robust in the case where probe packets are lost due to other reasons
+    (including link transmission error, congestion)." It speaks of probes; the rule applies the same reasoning to data.
+  - RFC 8899 §5.2, SEARCH_COMPLETE: "If MAX_PROBES successive PLPMTUD-sized probes fail to be acknowledged, the method
+    enters the BASE state."
+  - RFC 9000 §14 ties no PMTU reduction to data loss or to probe timeouts; its one loss-tied reduction is the provisional
+    ICMP one (§14.2.1).
+- **The rule now.** Three in a row, with none acknowledged between, of above-floor packets declared lost or probe
+  timeouts with one in flight make the size *suspect*. A suspect session sends at the floor and probes at the size it
+  had. One probe acknowledged, or any above-floor packet, and the size stands. `MAX_PROBES` of those probes declared lost
+  is the black hole, and the session falls to the floor and searches below the size that stopped.
+- **Stricter than the RFC.** §4.3 sets the lower PLPMTU first and confirms it after ("The PL then confirms that the new
+  PLPMTU can be successfully used across the path"); nothing there requires probing the old size before falling. This
+  rule does, because the evidence that reaches a session here is mostly not about size.
+- **Sending at the floor while suspect is what keeps the 2026-09-28 deadlock away.** In a real shrink nothing at the old
+  size is ever acknowledged, so a probe at it is declared lost only if smaller packets keep acknowledgements flowing.
+- **A probe timeout counts toward no black hole.** A stopped peer acknowledges nothing at any size, so it declares no
+  probe lost and never makes one. Three timeouts still start the confirmation; one does not (a single timeout was enough
+  in the first cut: at least 1,230 and 1,525 suspicions in 30 partition runs per arch, diag-live-durability-49).
 
 ### A-231 — A held NFS connection's byte states cross a takeover, and what the successor cannot know is judged stale (accepted 2026-11-07, the supervisor's decision)
 Applied in the same change to: §4.6 "NFS v3" (its status), A-192 (its restart line), GAPS, `crates/vfs`

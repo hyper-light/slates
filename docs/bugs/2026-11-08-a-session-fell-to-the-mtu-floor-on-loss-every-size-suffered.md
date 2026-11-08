@@ -26,8 +26,8 @@ above the floor, with none acknowledged between. It had two feeds:
 At a confirmed size of 65 KB every data packet is above the floor. So loss that hits every size counted the same
 as a path that shrank, whether it was a receiver's full buffer dropping a burst, or a stopped peer that answered
 nothing at all. RFC 8899 allows data loss as black-hole evidence only when it is "excessive loss of data sent
-with a specific packet size" (§4.3). It requires the PL to be robust to loss "due to other reasons (including link
-transmission error, congestion)" (§3 item 4). RFC 9000 §14 never lowers the PMTU on data loss or on probe
+with a specific packet size" (§4.3). It requires the PL to be robust when probe packets are "lost due to other reasons (including
+link transmission error, congestion)" (§3 item 4), and the same reasoning covers data. RFC 9000 §14 never lowers the PMTU on data loss or on probe
 timeouts. The rule also fell at once, without confirming the size with probes (§5.2: "If MAX_PROBES successive
 PLPMTUD-sized probes fail to be acknowledged, the method enters the BASE state").
 
