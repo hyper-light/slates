@@ -1,0 +1,53 @@
+name: DIAG live-fixes a learner stranded by its join voters, red arm (not for main)
+
+on:
+  push:
+    branches: [diag-live-fixes-51]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  arm:
+    name: Learner test red on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo test --locked -p slates-server --test fleet --no-run
+      - name: The test
+        shell: bash
+        run: |
+          R=../results.txt
+          echo "red on ${{ matrix.os }}, $(getconf _NPROCESSORS_ONLN) CPUs, $(date -u), head $(git rev-parse HEAD)" > $R
+          for run in 1 2 3 4; do
+            status=0
+            perl -e 'alarm shift; exec @ARGV' 1200 cargo test --locked -p slates-server --test fleet -- --nocapture --exact a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone > ../run.log 2>&1 || status=$?
+            echo "== run $run exit $status" | tee -a $R
+            grep -E -A3 'panicked|^test result' ../run.log | cut -c1-1500 >> $R || true
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          git config user.name "diag-live-fixes"
+          git config user.email "diag-live-fixes@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-live-fixes-51 ${{ matrix.os }} results"
+          git push -q origin "HEAD:refs/heads/diag-live-fixes-results-51-${{ matrix.os }}"
