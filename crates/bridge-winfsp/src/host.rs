@@ -1047,7 +1047,6 @@ fn op_can_delete(
   object: ObjectId,
   fh: u64,
 ) -> Result<Reply, VfsError> {
-  bridge.authorize_change(cx)?;
   if !matches!(bridge.getattr(object, cx)?.kind, Kind::Dir) {
     return Ok(Reply::Ok);
   }

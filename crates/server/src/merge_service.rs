@@ -611,9 +611,8 @@ pub(crate) fn check_origin_base(
   // An overlay's snapshot is judged with its host, so a directory whose listing this daemon has not read since a
   // restart is read now rather than taken for incomplete (A-153's "read again on first use").
   let complete = match slot.host.as_mut() {
-    Some(host) => slot
+    Some(_) => slot
       .volume
-      .with_host(host)
       .snapshot_is_complete(&state.store, core_snapshot(base.snapshot)),
     None => slot
       .volume

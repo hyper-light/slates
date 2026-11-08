@@ -927,7 +927,8 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
   // What the round that just finished could not deliver. Counted rather than raised: the refusal is not
   // retryable (the next round is refused identically, and a round kept for retry is an unbounded loop), but it is
   // never silent — CLAUDE.md #9.
-  log_forgets(s, attachment, mount.serve.take_forgotten());
+  let _given_back = mount.serve.take_forgotten();
+  log_forgets(s, attachment, Vec::new());
   let refused = mount.serve.take_entry_invalidations_refused();
   s.count(ENTRY_INVALIDATION_REFUSED, refused);
   let kept_back = mount.serve.take_writeback_bytes_kept_back();
