@@ -44,6 +44,14 @@ pub enum Seen<T> {
   New,
   /// Seen and completed: return the retained result.
   Completed(T),
+  /// Run, and waiting for a version of a green to commit before it completes (§4.16 "Commit", A-252): never run again,
+  /// answered that version once it commits.
+  Awaiting {
+    /// The green (a `VolumeId`'s bytes).
+    object: [u8; 16],
+    /// The version it waits for.
+    version: u64,
+  },
   /// Seen and already acknowledged by the client: a stale retry, refuse it.
   Acknowledged,
 }
@@ -56,6 +64,9 @@ pub struct ClientWindow<T> {
   /// complete.
   open: BTreeSet<u32>,
   completions: BTreeMap<u32, T>,
+  /// The requests that ran and wait for a version to commit (A-252): each leaves when its completion is recorded or the
+  /// client acknowledges it, and counts toward the window's retained entries, so the client's bound covers it.
+  awaiting: BTreeMap<u32, ([u8; 16], u64)>,
 }
 
 impl<T> Default for ClientWindow<T> {
@@ -64,6 +75,7 @@ impl<T> Default for ClientWindow<T> {
       acknowledged_up_to: None,
       open: BTreeSet::new(),
       completions: BTreeMap::new(),
+      awaiting: BTreeMap::new(),
     }
   }
 }
@@ -82,10 +94,25 @@ impl<T: Clone> ClientWindow<T> {
     if self.released(sequence) {
       return Seen::Acknowledged;
     }
-    match self.completions.get(&sequence) {
-      Some(result) => Seen::Completed(result.clone()),
+    if let Some(result) = self.completions.get(&sequence) {
+      return Seen::Completed(result.clone());
+    }
+    match self.awaiting.get(&sequence) {
+      Some((object, version)) => Seen::Awaiting {
+        object: *object,
+        version: *version,
+      },
       None => Seen::New,
     }
+  }
+
+  /// Records that `sequence` ran and waits for `version` of `object` to commit (A-252); one the client acknowledged is
+  /// a stale retry the client can never ask for again, so it is not retained.
+  pub fn await_version(&mut self, sequence: u32, object: [u8; 16], version: u64) {
+    if self.released(sequence) {
+      return;
+    }
+    self.awaiting.insert(sequence, (object, version));
   }
 
   /// Records a completion; one the client acknowledged is a stale retry the client can never ask for again, so it is
@@ -94,6 +121,7 @@ impl<T: Clone> ClientWindow<T> {
     if self.released(sequence) {
       return;
     }
+    self.awaiting.remove(&sequence);
     self.completions.insert(sequence, result);
   }
 
@@ -126,12 +154,15 @@ impl<T: Clone> ClientWindow<T> {
     self
       .completions
       .retain(|sequence, _| *sequence > watermark || open.contains(sequence));
+    self
+      .awaiting
+      .retain(|sequence, _| *sequence > watermark || open.contains(sequence));
     true
   }
 
-  /// Completions retained.
+  /// Entries retained: completions and requests awaiting a version, each holding the client's bound.
   pub fn retained(&self) -> usize {
-    self.completions.len()
+    self.completions.len().saturating_add(self.awaiting.len())
   }
 
   /// The highest sequence the client acknowledged, when it acknowledged any.
@@ -147,6 +178,14 @@ impl<T: Clone> ClientWindow<T> {
   /// The retained completions, by sequence (what a snapshot of the window carries).
   pub fn retained_entries(&self) -> impl Iterator<Item = (u32, &T)> {
     self.completions.iter().map(|(s, r)| (*s, r))
+  }
+
+  /// The requests awaiting a version: sequence, green, version (what a snapshot of the window carries).
+  pub fn awaiting_entries(&self) -> impl Iterator<Item = (u32, [u8; 16], u64)> + '_ {
+    self
+      .awaiting
+      .iter()
+      .map(|(sequence, (object, version))| (*sequence, *object, *version))
   }
 }
 
@@ -260,5 +299,51 @@ mod tests {
     assert_eq!(w.lookup(11), Seen::New, "the malformed one changed nothing");
     assert_eq!(w.lookup(15), Seen::New, "nor moved the watermark");
     assert_eq!(w.acknowledged_up_to(), Some(12));
+  }
+
+  /// §4.16 "Commit", A-252: a request awaiting a version is never `New`, its completion replaces the wait, and it counts
+  /// toward the client's bound.
+  #[test]
+  fn a_request_awaiting_a_version_is_never_new_and_its_completion_replaces_the_wait() {
+    let mut w: ClientWindow<&str> = ClientWindow::default();
+    w.await_version(5, [7; 16], 3);
+    assert_eq!(
+      w.lookup(5),
+      Seen::Awaiting {
+        object: [7; 16],
+        version: 3
+      }
+    );
+    assert_eq!(w.retained(), 1, "a wait holds the client's bound");
+    w.record(5, "version 3");
+    assert_eq!(w.lookup(5), Seen::Completed("version 3"));
+    assert_eq!(w.retained(), 1, "the completion replaced the wait");
+    assert_eq!(w.awaiting_entries().count(), 0);
+  }
+
+  /// A-252: an acknowledgement releases a wait it covers and does not name, keeps one it names owed, and a wait on an id
+  /// already released is not retained.
+  #[test]
+  fn an_acknowledgement_releases_a_wait_it_covers_and_keeps_one_it_names_owed() {
+    let mut w: ClientWindow<&str> = ClientWindow::default();
+    w.await_version(4, [1; 16], 1);
+    w.await_version(5, [1; 16], 2);
+    assert!(w.acknowledge(6, &[5]));
+    assert_eq!(w.lookup(4), Seen::Acknowledged);
+    assert_eq!(
+      w.lookup(5),
+      Seen::Awaiting {
+        object: [1; 16],
+        version: 2
+      }
+    );
+    assert_eq!(w.awaiting_entries().count(), 1);
+    w.await_version(3, [1; 16], 9);
+    assert_eq!(
+      w.lookup(3),
+      Seen::Acknowledged,
+      "a released id takes no wait"
+    );
+    assert_eq!(w.awaiting_entries().count(), 1);
   }
 }

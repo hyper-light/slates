@@ -9,19 +9,24 @@
 > now it commits, and the test ends in 3.3 s. Record:
 > `docs/bugs/2026-11-07-a-version-appended-before-its-owner-restarted-never-committed.md`.
 
-> **Open (fixtures, 2026-11-08; A-252 reserved): a submit resent after its owner's restart is applied a second time.**
-> A-246 commits the versions appended before the crash, and its test checked their placement, not the retry's answer.
-> The primary-kill rung (adacachy, 1,000 clients, `f = 1`, on loadtest-scale's 2ae4e832 with fixtures' b38a9d66) no
-> longer stalls (15.1 s, 3,000 accepted, 32 reconnects), but its oracle found 4,261 failures of one shape: the accepted
-> versions run 1 to 1,124 and then jump to 1,208, versions 1,125 to 1,207 are on the green with no submit to explain
-> them, and 83 clients were told acceptance at 1,208 and up. A submit's completion record is written only when its
-> version commits (AUD-11), and the waiting submit lived in memory, so after the restart its resend under the same
-> request id found no completion (`Seen::New`) and ran again against the restored journal, as a new version. That
-> breaks "a retry under its own id meets its original answer". The earlier primary kill on main e86fb417 with A-244
-> (1,770 failures) had the same shape, so A-246 did not introduce it. Owed, test first: the accept records, in the same
-> log entry as the version's append, that the request awaits version N, so a resend after a restart rejoins that wait
-> and is answered `Submitted { version: N }`, never run again. Log: adacachy
-> `~/.cache/slates-agents-scratch/fixtures/rungs10/r1k-kill0.{log,stall,samples}`.
+> **A submit resent after its owner's restart was applied a second time: fixed (2026-11-08, §4.16 "Commit", §4.9; A-252).**
+> The waiting submit lived in memory, so after a restart its resend under the same id found no completion and ran
+> again as a new version: 4,261 oracle failures on fixtures' 1,000-client primary kill, 83 versions no client was told.
+> The accept now records, in the same transaction as the version's append, a typed `Seen::Awaiting` (`Op::CompletionAwaiting`,
+> carried through snapshots), so a resend joins the wait or is answered its version, never run again. The rung after it:
+> oracle 0 on every run that finished (five of them 13.1 to 13.9 s), and 7 of 18 runs stalled on a fence that is W3's and
+> independent of this fix (`BaseUnavailable` at recovery; open, A-257, liveness).
+> `docs/bugs/2026-11-08-a-submit-resent-after-its-owner-restarted-was-applied-twice.md`.
+>
+> **Open and owed (A-255 reserved): after a takeover the resend is never answered its version.** It is refused
+> `OwnerUnreachable` without end, and §4.16's failure matrix promises otherwise ("Green owner loss in a fleet: Degraded
+> for the membership horizon, then Masked after takeover on a candidate that holds the ledger"), as do T-8.11 and §4.8's
+> walk-through ("its retries return their original completion records" from the new owner). Owed: the merge record
+> carries the submit's completion, and the resend reaches the green's successor. RIFL's rule, read 2026-11-08 (§3): "If
+> the object migrates, then the completion record must move with it." Nothing runs twice
+> meanwhile: `a_works_head_is_never_placed_so_a_takeover_cannot_bring_it_back_to_run_a_resend` (`fleet.rs`) holds that a
+> work never comes back on a successor, because `Snapshot` refuses a work, `LiveShip` finds no store slot for one, and
+> the seal schedule needs a head only those make, so a takeover has no work to run a resend against.
 
 > **A version commits in one exchange, and retention no longer decodes the whole ledger per put: fixed (2026-11-07, §4.16
 > Commit, §4.10 retention; A-244).** A-235 left five hops a version (the inputs' offer
@@ -5490,6 +5495,9 @@ submitted to it) so no exchange waits for another's.
 > own exchange, not on the session. Record: `docs/bugs/2026-11-07-the-control-shard-could-not-run-what-its-lane-admitted.md`;
 > the load-test entries "A forward refused at admission left its client waiting" and "A forward its owner never
 > answered stayed open on a busy session".
+>
+> The formation case is measured in the 2026-11-08 status below: not reproduced at 2 and 8 spinners per CPU, every
+> session returned, so the forward lane is the case for the shared session.
 
 ### 2026-09-29: a lone owner refused its own objects — fixed; campaign counters added for the open KIND items
 
