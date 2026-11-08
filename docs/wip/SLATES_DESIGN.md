@@ -14800,7 +14800,7 @@ green's base, the other half of the load test's first finding, is A-202's.
 - **Cost (measured on the branch it comes from):** every edit now appends to the partition log, so the partition's
   snapshots come at the rate edits arrive.
 
-### A-243 — The purge in progress is one slot the receive worker reads, never a channel it drains (accepted and built 2026-11-07, the supervisor's decision: option (a); amends A-190 and A-198)
+### A-249 — The purge in progress is one slot the receive worker reads, never a channel it drains (accepted and built 2026-11-07, the supervisor's decision: option (a); amends A-190 and A-198)
 
 Applied in the same change to:
 - §4.6 (Windows): this entry is its record; the purge's recognition is unchanged.

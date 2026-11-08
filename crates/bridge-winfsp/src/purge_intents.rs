@@ -1,4 +1,4 @@
-//! Where the purge in progress lives on Windows (A-243, A-190, A-198; §4.6): the slot of `crate::purge_slot` in an
+//! Where the purge in progress lives on Windows (A-249, A-190, A-198; §4.6): the slot of `crate::purge_slot` in an
 //! unnamed section both threads map, each through its own view (`slates_mem::SharedObject`, the slot's word declared
 //! and its purge bytes a racy span). The mount thread holds the writer's view and the receive worker the reader's, so
 //! neither borrows the other's memory and the section lives while either view does. The worker also keeps here the one
@@ -174,7 +174,7 @@ mod tests {
     assert_eq!(intents.current_for(PROGRAM).unwrap(), None);
   }
 
-  /// A-243. Do: the mount thread's view publishes 10,000 distinct purges while the worker's view reads as the client's
+  /// A-249. Do: the mount thread's view publishes 10,000 distinct purges while the worker's view reads as the client's
   /// Creates and a program's would, until the writer is done. Expect: the client's reads are no purge or one publication
   /// whole; a program's none; and once the writer is done, the last purge reads whole.
   #[test]

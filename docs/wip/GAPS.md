@@ -683,7 +683,7 @@
 > kernel refused a purge's open before any request reached slates, the third publish waited for the idle call's 1,000 ms
 > timeout: four such purges took 3.02 s on arm64 and 3.01 s on x86_64 (diag-winfsp-overlap-43). Cancelling the call
 > from the publisher (`CancelIoEx`, `agents/winfsp-overlap-17`) left 2.54 s and 2.65 s and was not landed. The fix
-> replaces the channel with one slot (A-243): a seqlock whose word names the client (`purge_slot.rs`), in a section both
+> replaces the channel with one slot (A-249): a seqlock whose word names the client (`purge_slot.rs`), in a section both
 > threads map (`purge_intents.rs`). Publishing never waits for the reader, and the worker reads the word once when a
 > Create arrives
 > (`docs/bugs/2026-11-07-a-private-purge-intent-waited-out-the-idle-receive.md`). Test:

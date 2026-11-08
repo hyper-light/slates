@@ -47,7 +47,7 @@ I/O issued on a synchronous file object, so it would have found no call at all.
   longer than the volume's `MaxComponentLength`, so the kernel refuses each open before slates sees it. Expect: all four
   outcomes within one transaction timeout. Its request channel's receiver is declared after the mount, so it drops
   first: the mount's thread joins only once that receiver is gone.
-- **The fix (A-243):** the channel becomes one slot (`crates/bridge-winfsp/src/purge_slot.rs`, cfg-free), a seqlock
+- **The fix (A-249):** the channel becomes one slot (`crates/bridge-winfsp/src/purge_slot.rs`, cfg-free), a seqlock
   whose word names the client's process id beside a writing flag and a count of publications. The mount thread's
   publish sets the flag, stores the purge's bytes in the slot's racy span and stores the word with the client
   (Release), and never waits for the reader. On Windows the slot is an unnamed section both threads map through their
@@ -59,8 +59,9 @@ I/O issued on a synchronous file object, so it would have found no call at all.
   the next publication is written.
 - The intent event, its signal and the control call's two-event wait go: the call waits only on its own completion
   (`dispatcher::transaction`). No callback drains anything first.
-- One `unsafe` block is added (borrowing the section's handle to duplicate it for the reader) and two go (the event's
-  `SetEvent` and `WaitForMultipleObjects`).
+- One `unsafe` block is added (borrowing the section's handle to duplicate it for the reader) and three go (the event's
+  `SetEvent`, the control call's `WaitForMultipleObjects` and the old channel test's `WaitForSingleObject`), so the
+  crate's ceiling falls from 132 to 130 (`unsafe-budget.toml`).
 - The tests besides the live one: in `purge_slot.rs`, 10,000 purges and their ends published with nothing reading all
   return, and a reader racing a writer of 10,000 distinct purges reads none or one whole, never a mix, and a program's
   read is always none; the same race under loom, in every interleaving within the workspace's bounds (CI's loom lane);

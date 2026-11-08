@@ -1,4 +1,4 @@
-//! The purge in progress, published in one slot (A-243, amending A-190 and A-198; §4.6 Windows). The mount thread
+//! The purge in progress, published in one slot (A-249, amending A-190 and A-198; §4.6 Windows). The mount thread
 //! publishes each purge, with its client's process id, before it asks the client to open the file through the drive, and
 //! publishes no purge once the client has answered (`crate::host`, `MountThread::purge`). The receive worker reads the
 //! slot when a Create arrives, to tell the purge's own open from a program's (`crate::dispatcher::PrivateOpens`). This
@@ -318,7 +318,7 @@ mod tests {
       assert_eq!(current_for(&slot, PROGRAM).unwrap(), None);
     }
 
-    /// A-243. Do: one thread publishes 10,000 distinct purges, every one for the same client, while another reads the
+    /// A-249. Do: one thread publishes 10,000 distinct purges, every one for the same client, while another reads the
     /// slot as that client's Creates would and as a program's would, until the writer is done. Expect: every read of the
     /// client's is no purge or one publication whole, never a mix of two; every read of the program's is no purge; and
     /// once the writer is done, the last purge reads whole.
@@ -361,7 +361,7 @@ mod tests {
     use super::*;
     use slates_mem::loom_bounds;
 
-    /// A-243 (AC-0.7). Do: a writer publishes two purges for the same client, then no purge, while a Create of that
+    /// A-249 (AC-0.7). Do: a writer publishes two purges for the same client, then no purge, while a Create of that
     /// client and a program's read the slot, in every interleaving within the workspace's bounds. Expect: the client's
     /// read is no purge or one of the two whole, never a mix; the program's is always no purge.
     #[test]
