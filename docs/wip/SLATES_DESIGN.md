@@ -4893,7 +4893,13 @@ retry must recover the same result and contents. Rebuilding a scratch volume fro
 and id loses acknowledged data. Live directory handles require an anchor handoff or validated
 reacquisition of the same source identity; reopening a path alone cannot substitute another
 base. The identity is the device, inode number and birth time (A-153): a change to a directory's
-entries is not a change of source, while a directory another replaced is. Missing resources return `RecoveryIncomplete`/`BaseUnavailable`, never empty success.
+entries is not a change of source, while a directory another replaced is. A recorded directory recovery cannot
+reacquire as the same one, gone from the disk, unreadable, or another at the path, is the failure matrix's "base
+directory unreadable or gone": its untouched entries refuse `BaseUnavailable{path, errno}` (`ENOENT` when the host says
+only that it is not there), the volume's own entries in it serve, and the next image keeps its record so a later
+recovery tries it again; it never refuses the whole volume, and another directory is never substituted for it
+(2026-11-07, `docs/bugs/2026-11-07-a-removed-base-directory-refused-the-whole-volume-at-recovery.md`). Missing resources
+return `RecoveryIncomplete`/`BaseUnavailable`, never empty success.
 The version-2 volume image now preserves overlay source paths and full directory fingerprints,
 witnesses, whiteouts, redirects, metadata copy-ups and private large-file ranges, including snapshots.
 Recovery validates no-follow source acquisition before reinstating lazy reads and invalidates caches.

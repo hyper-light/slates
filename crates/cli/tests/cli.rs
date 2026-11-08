@@ -12019,3 +12019,82 @@ fn a_base_a_kept_mount_covers_is_not_reacquired_through_it() {
   let _ = Command::new("rmdir").arg(&base).output();
   let _ = Command::new("rmdir").arg(&point).output();
 }
+
+/// Bug (GAPS, A-153's "Open, found here"; 2026-11-07), by use through a real mount: a loaded base directory removed after
+/// the last publication made the successor refuse the whole overlay (`RecoveryIncomplete`). §4.8's failure matrix: the
+/// gone directory's untouched entries refuse `BaseUnavailable`, while overlay entries serve. Do: an overlay over a
+/// directory holding `src/lib.rs`, `src/mod.rs` and `top`, mounted (FUSE on Linux, NFS on macOS); list `src` and write
+/// `src/agent.rs` through the mount; remove `src` from the disk and end the daemon with the mount kept
+/// ([`KEEPING_SIGNAL`]); wait for the successor. Expect: through the mount `src/agent.rs` reads back, `src/lib.rs` and
+/// `src/mod.rs` fail to read, and `top` reads the disk; `slates read` refuses `src/lib.rs` as `BaseUnavailable`. Neither
+/// base file in `src` is read before the restart, so no kernel cache can answer for the daemon.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn an_overlay_whose_base_directory_was_removed_serves_its_own_files_through_a_kept_mount() {
+  if !own_mount_tests_run() {
+    return;
+  }
+  let instance = format!("cli-goneunder-{}", std::process::id());
+  let _anchor = start_one_shard_anchor(&instance);
+  let base = ScratchDir {
+    path: build_output_dir("slates-goneunder"),
+  };
+  let src = format!("{}/src", base.path);
+  shell(&format!(
+    "mkdir {src} && printf base > {src}/lib.rs && printf base > {src}/mod.rs && printf top > {}/top",
+    base.path
+  ));
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "goneunder",
+      "--bounded",
+      "8MiB",
+      "--base",
+      &base.path,
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  own_mount_and_check(&instance, &id, &mount.path);
+  let listed = shell(&format!("ls {}/src", mount.path));
+  assert!(
+    listed.contains("lib.rs"),
+    "src is listed through the mount: {listed}"
+  );
+  shell(&format!(
+    "printf agent > {}/src/agent.rs && sync",
+    mount.path
+  ));
+  shell(&format!("rm -r {src}"));
+  let ended = end_keeping_mounts(&instance);
+  await_daemon(&instance, Some(ended), &[]);
+  assert_eq!(
+    shell(&format!("cat {}/src/agent.rs", mount.path)),
+    "agent",
+    "the overlay's own file reads back"
+  );
+  for name in ["lib.rs", "mod.rs"] {
+    let read = Command::new("cat")
+      .arg(format!("{}/src/{name}", mount.path))
+      .output()
+      .unwrap();
+    assert!(
+      !read.status.success(),
+      "src/{name}, an untouched entry of the gone directory, does not read: {}",
+      String::from_utf8_lossy(&read.stdout)
+    );
+  }
+  assert_eq!(shell(&format!("cat {}/top", mount.path)), "top");
+  let (code, _, err) = run(&instance, &["read", &id, "/src/lib.rs"]);
+  assert_ne!(code, 0);
+  assert!(
+    err.contains("BaseUnavailable"),
+    "the gone directory's base file is refused by kind: {err}"
+  );
+}

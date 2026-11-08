@@ -14350,9 +14350,13 @@ Found while fixing A-151.
 - **The fix (A-153).** A directory's identity is its device, inode number and birth time (`Fingerprint::same_object`).
   A directory whose entries changed recovers, and its listing is read again on first use. One another replaced is
   still refused.
-- **Open, found here:** a loaded base directory **removed** after the last publication still refuses the whole volume,
-  since reopening it fails (`open_source`). §4.8 allows `RecoveryIncomplete` there. The failure matrix's runtime rule,
-  `BaseUnavailable` for that directory's untouched entries while overlay entries serve, is the robust form, and is owed.
+- **Found here, fixed 2026-11-07 (slabs):** a loaded base directory **removed** after the last publication refused the
+  whole volume, since reopening it failed (`open_source`). Now the failure matrix's runtime rule holds: that
+  directory's untouched entries refuse `BaseUnavailable`, overlay entries serve, and the next image keeps its record. A
+  directory another replaced is treated the same (never substituted, no longer the whole volume). Proven by use:
+  SimHost (`crates/vfs/tests/base.rs`), the server's restart over NFS and the client (`crates/server/tests/recovery.rs`),
+  and a kernel mount kept across the restart (`crates/cli/tests/cli.rs`). Record:
+  `docs/bugs/2026-11-07-a-removed-base-directory-refused-the-whole-volume-at-recovery.md`.
 
 ### 2026-10-23: a release the dead daemon answered after the last publication came back as an open — fixed (A-154)
 
