@@ -758,6 +758,9 @@
 >   not stuck. `a_start_held_off_its_cpus_is_starved_not_stuck` (`crates/cli/src/anchor.rs`) holds a busy process off its
 >   CPU at SCHED_IDLE: without the reading, judged "made no progress for 1001 ms", 2 of 2 on adacachy2; with it, starved
 >   at 14-23 looks and never stuck, 7 of 7 (nice 0 and 19). A process with every thread blocked still reads stuck.
+>   Its spinning half reads each thread too since 2026-11-08 (liveness): the busiest thread's CPU, not the process's sum,
+>   which had killed every start of 23 shards on a 32-CPU Studio
+>   (`docs/bugs/2026-11-08-the-start-judgment-held-a-processs-summed-cpu-to-one-threads-window.md`).
 > - **A transitive wait reads as stuck (open, measured 2026-11-08 by bug-sweep).** A shard blocked for a whole window on
 >   something held by a starved thread is never runnable itself, so it is wedged by this rule. Measured on adacachy2 at
 >   load 0.2: a shard's poll parked until a thread released it, that thread at SCHED_IDLE pinned beside the starved test's
