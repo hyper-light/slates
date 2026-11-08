@@ -1454,3 +1454,5 @@ slates-server: shard 1 initialized in 2242 µs
 slates daemon: instance fsb-181-6-c serving on 3 shards under the anchor
 slates-winfsp: reply spin window = 11800 ns: the median one-way channel wake of 15 (the 2-competitive spin)
 ## run 6 of 6 done, 2026-11-08T15:07:31Z
+To https://github.com/hyper-light/slates
+   90bfaff..f088f8c  f088f8c8dc973fd95efe2472487ca06caf51a12a -> diag-winfsp-overlap-results-42486022157-aaa-rotated-arm
