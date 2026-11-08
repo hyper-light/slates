@@ -5707,8 +5707,10 @@ fn fill_task_arena(shard: u16) -> Vec<slates_rt::shard::TaskId> {
 /// and the read to be sent on the new session.
 const DEAD_SESSION_BOUND: Duration = Duration::from_nanos(2 * LIVENESS_BUDGET_NS);
 /// Shape: the clients that keep b's forward lane busy, so a waiting forwarder takes the session the moment another
-/// returns it and the link never finds it in its slot, as the rung's thousand clients did.
-const DEAD_SESSION_BURST_CLIENTS: usize = 32;
+/// returns it and the link never finds it in its slot, as the rung's thousand clients did. Measured 2026-11-08: at 32
+/// the link's own discovery refresh found the deaf session in its slot and replaced it, and the read was served in
+/// 267 ms without the dead-session check; at 256 it was refused `OwnerUnreachable` after 18.7 s, as on the rung.
+const DEAD_SESSION_BURST_CLIENTS: usize = 256;
 /// Whether [`a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one`]'s burst keeps sending.
 static DEAD_SESSION_BURST_ON: std::sync::atomic::AtomicBool =
   std::sync::atomic::AtomicBool::new(false);
