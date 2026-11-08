@@ -5806,6 +5806,14 @@ failure.
 > pin it (`a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id`;
 > `docs/bugs/2026-11-06-a-resend-under-its-id-was-already-acknowledged.md`).
 
+> **Status (2026-11-08, A-252: a request waiting for a version is a durable state).** A submit whose acceptance waits for
+> its version's commit was waited on in memory, so after a restart its resend under its own id found no record and ran
+> again as a new version. The accept now logs `Op::CompletionAwaiting` in the transaction that appends the version, so
+> the window answers `Seen::Awaiting` (never `New`) across any restart: the resend joins the wait, or is answered its
+> version once it has placed. The wait counts toward the client's bound and leaves when its completion replaces it or the
+> client acknowledges it. After a takeover the resend is refused retryable and nothing runs twice, but its version is not
+> named, short of the failure matrix's Masked: owed as A-255 (GAPS).
+
 > **Status (2026-11-07, A-245: an acknowledgement names the ids still owed).** A watermark is contiguous, so one held or
 > slow request kept every later completion of its client: the owner pruned none of them, and past `2 × slots` refused
 > the client's next requests `AcknowledgementOwed`. At `f = 1`, where nearly every slow submit is held, that was the
@@ -15795,6 +15803,33 @@ Applied in the same change to: §4.7 (data model, wake strategy, status); `slate
 and settle, `DaemonEnd::reply`'s stamp and confirmation) and `crates/ipc/tests/rings.rs`; GAPS. Evidence:
 `docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`. A client and a daemon of
 different layout versions refuse each other by name; no consensus rule or capability changes.
+
+### A-252 — A request waiting for a version to commit is a typed durable state, so a resend after a restart never runs again (accepted and built 2026-11-08, fixtures' primary-kill rung; supervisor's two changes to the first cut)
+
+Applied in the same change to:
+- §4.9: its status of 2026-11-08.
+- GAPS: the load-test blockquote.
+- `crates/wire/src/request.rs`: `Seen::Awaiting`, `ClientWindow::await_version`, `awaiting_entries`; `retained` counts a wait.
+- `crates/db`: `Op::CompletionAwaiting` (appended), `AwaitingCompletion`, `ClientCompletions::awaiting` (appended).
+- `crates/server`: `merge_service::stage_awaiting` (the `Accepted` arm, ahead of the append) and `serve_awaiting`; the
+  `Seen::Awaiting` arms in `serve`, `run_forwarded` and `await_deferred_completion`.
+- The tests: fixtures' restart test and the still-waiting and takeover cases (`fleet.rs`),
+  `a_wait_and_its_transaction_are_one_durable_step` and the owed model's wait step (`model.rs`), the window's unit tests.
+- **What was there.** At `f > 0` the wait for a version's commit was in memory, and the version's append and the work's
+  reset were durable. A restart lost the wait, and a resend under its id ran again as a new version.
+- **The rule.**
+  - A request that ran and waits for a version is `Seen::Awaiting`, never `New`: answered that version once it has
+    placed, else joined to the wait, and never run again.
+  - The wait is logged in the transaction that appends the version, staged first, so the two are one durable step and a
+    failure fails the accept.
+  - It counts toward the client's bound and leaves when its completion replaces it or the client acknowledges it.
+  - It is a type, not reply bytes, so no reply encoding can be mistaken for it, and recovery and snapshots carry it by
+    type.
+  - After a takeover the resend is refused retryable and nothing runs twice, but the version is not named. That falls
+    short of §4.16's failure matrix (Masked after takeover) and is owed as A-255, not accepted here.
+- **Measured.** The bug record (`docs/bugs/2026-11-08-a-submit-resent-after-its-owner-restarted-was-applied-twice.md`):
+  the rung's 109 to 4,261 oracle failures fall to 0 on every run that finished. 7 of 18 runs stalled on W3's checkpoint
+  fence, which is independent of this rule (A-257).
 
 ### A-246 — A restarted owner re-enqueues the merge records its chain holds (accepted 2026-11-07)
 
