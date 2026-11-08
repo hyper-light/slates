@@ -5230,14 +5230,41 @@ fn a_silent_owner_leaves_no_forward_the_lane_admitted_unrun() {
     }
     holder.join().unwrap().unwrap();
     let held_ended = Instant::now();
-    let tagged: Vec<Vec<(u32, ReplyBody)>> = burst
-      .iter_mut()
-      .map(|client| {
-        let left = ADMITTED_FORWARDS_ANSWERED.saturating_sub(held_ended.elapsed());
-        client.collect_tagged(slots, left)
-      })
-      .collect();
+    // At the first client left short: its ring's unread replies and each of b's shards' unwritten (`deferred`) ones,
+    // read before anything else touches either, so a reply held back is placed on the daemon's side or the client's.
+    let mut at_first_short: Option<(usize, u64, Vec<usize>)> = None;
+    let mut tagged: Vec<Vec<(u32, ReplyBody)>> = Vec::with_capacity(burst.len());
+    for (index, client) in burst.iter_mut().enumerate() {
+      let left = ADMITTED_FORWARDS_ANSWERED.saturating_sub(held_ended.elapsed());
+      let replies = client.collect_tagged(slots, left);
+      if replies.len() < slots && at_first_short.is_none() {
+        let unwritten: Vec<usize> = daemons[1]
+          .shards()
+          .iter()
+          .map(|shard| {
+            daemons[1]
+              .observation(
+                Some(*shard),
+                slates_server::daemon::OBSERVE_BUDGET_NS,
+                |state: &mut slates_server::state::ShardState| state.deferred.len(),
+              )
+              .unwrap()
+              .wait()
+              .unwrap()
+          })
+          .collect();
+        at_first_short = Some((index, client.replies_unread(), unwritten));
+      }
+      tagged.push(replies);
+    }
     let last_reply = held_ended.elapsed();
+    if let Some((index, unread, unwritten)) = &at_first_short {
+      eprintln!(
+        "at the first short client ({index}, {:?} after the hold): its ring held {unread} unread replies; b's shards \
+         held {unwritten:?} unwritten",
+        last_reply
+      );
+    }
     // Where a missing reply is: each short client's missing sequences, any that arrive in a further budget (late past
     // the bound, counted apart), and the replies each of b's shards still holds unwritten.
     let mut missing = Vec::new();
@@ -7484,6 +7511,16 @@ impl Client {
         }
       }
     }
+  }
+
+  /// The replies on this client's completion ring it has not taken yet.
+  fn replies_unread(&self) -> u64 {
+    self
+      .end
+      .region()
+      .cpl()
+      .depth(self.end.region().object())
+      .unwrap_or(0)
   }
 
   /// The sequences of this client's last `count` requests (a burst's).
