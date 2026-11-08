@@ -104,6 +104,14 @@
 >   with it.
 > - Main a2cf9af7 gave no rate: in an interleaved A/B (diag-raft-chaos-lent-45, 6 runs a side), each of main's 18
 >   shaped profiles timed out its writes at 600 s before any takeover. The stack passed all 24.
+> - With the fix, KIND passed all four profiles in 12 runs (diag-raft-chaos-unanswered-46 and -47 ×3 each,
+>   diag-raft-chaos-phase-one-50 ×6), with wan-loss takeovers in 16.9–23.7 s.
+> - Phase one's fixed liveness budget (1 s) against wan-loss's 1.41 s pto, measured: phase one's questions were counted
+>   by outcome over the 24 takeovers of diag-raft-chaos-phase-one-50. 61 were asked and 61 answered within the
+>   budget, with none unanswered or straggling. Every wait for the quorum was a holder with no session yet (the
+>   departed owner's, or a link still forming), never a question past the budget. So the budget is left as it is. A
+>   path-derived budget (srtt plus one pto, as the log fetch derives its own from the path) waits for a run that
+>   shows a miss.
 
 > **Fixed (live-fixes, 2026-11-07): a live shipper made before its candidates were known shipped to nobody** (A-200's
 > amendment of that date). A shipper kept the holders of its first publication, so a live volume made on a fleet's
