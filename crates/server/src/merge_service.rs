@@ -569,7 +569,7 @@ pub(crate) fn attachable_record(
 /// on this shard (the base volume's owner). Refused as [`check_origin_base`] refuses, and the volume core's own
 /// refusal for a torn read.
 pub(crate) fn seed_origin(
-  state: &ShardState,
+  state: &mut ShardState,
   principal: &Principal,
   base: GreenBase,
 ) -> Result<Origin, Refusal> {
@@ -583,7 +583,7 @@ pub(crate) fn seed_origin(
 /// or snapshot that does not exist here, `Forbidden` without the read right, `ConsistentBaseUnavailable` when the
 /// snapshot still depends on the host directory (an overlay not pinned whole before the freeze).
 pub(crate) fn check_origin_base(
-  state: &ShardState,
+  state: &mut ShardState,
   principal: &Principal,
   base: GreenBase,
 ) -> Result<slates_mem::Handle<crate::state::VolumeSlot>, Refusal> {
@@ -604,11 +604,22 @@ pub(crate) fn check_origin_base(
   {
     return Err(Refusal::NotFound);
   }
-  let slot = state.volumes.get(handle).map_err(|_| Refusal::NotFound)?;
-  match slot
-    .volume
-    .snapshot_is_complete(&state.store, core_snapshot(base.snapshot))
-  {
+  let slot = state
+    .volumes
+    .get_mut(handle)
+    .map_err(|_| Refusal::NotFound)?;
+  // An overlay's snapshot is judged with its host, so a directory whose listing this daemon has not read since a
+  // restart is read now rather than taken for incomplete (A-153's "read again on first use").
+  let complete = match slot.host.as_mut() {
+    Some(host) => slot
+      .volume
+      .with_host(host)
+      .snapshot_is_complete(&state.store, core_snapshot(base.snapshot)),
+    None => slot
+      .volume
+      .snapshot_is_complete(&state.store, core_snapshot(base.snapshot)),
+  };
+  match complete {
     Ok(true) => Ok(handle),
     Ok(false) => Err(Refusal::ConsistentBaseUnavailable),
     Err(e) => Err(refusal_of_vfs(&e)),

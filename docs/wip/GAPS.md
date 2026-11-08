@@ -14562,6 +14562,11 @@ Found while fixing A-151.
   and a kernel mount kept across the restart (`crates/cli/tests/cli.rs`; Linux FUSE with a kill, diag-slabs-33, run
   42434266219: the vfs base suite 47, recovery 49, the CLI flow 91; red with main's base plane, diag-slabs-34, run
   42434266313). Record: `docs/bugs/2026-11-07-a-removed-base-directory-refused-the-whole-volume-at-recovery.md`.
+- **A sibling, fixed 2026-11-08 (slabs; found by liveness):** after a restart a pinned overlay's snapshot was refused
+  as a new green's base (`ConsistentBaseUnavailable`): the completeness check read the recovered plane's listings, none
+  of which were read yet. It now reads a listing the plane has not read from the host, uncached.
+  `a_green_over_a_pinned_overlays_snapshot_is_made_after_a_restart` (`crates/server/tests/recovery.rs`), red before.
+  Record: `docs/bugs/2026-11-08-a-pinned-snapshot-was-refused-as-a-greens-base-after-a-restart.md`.
 
 ### 2026-10-23: a release the dead daemon answered after the last publication came back as an open — fixed (A-154)
 

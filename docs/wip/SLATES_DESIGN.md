@@ -4923,7 +4923,11 @@ reacquire as the same one, gone from the disk, unreadable, or another at the pat
 directory unreadable or gone": its untouched entries refuse `BaseUnavailable{path, errno}` (`ENOENT` when the host says
 only that it is not there), the volume's own entries in it serve, and the next image keeps its record so a later
 recovery tries it again; it never refuses the whole volume, and another directory is never substituted for it
-(2026-11-07, `docs/bugs/2026-11-07-a-removed-base-directory-refused-the-whole-volume-at-recovery.md`). Missing resources
+(2026-11-07, `docs/bugs/2026-11-07-a-removed-base-directory-refused-the-whole-volume-at-recovery.md`). A question that
+needs a listing the recovered plane has not read yet reads it then rather than take its absence for an answer: a green's
+base snapshot is judged complete against its directories' listings read from the host, uncached, so their first real
+listing still renumbers their untouched entries (A-151; 2026-11-08,
+`docs/bugs/2026-11-08-a-pinned-snapshot-was-refused-as-a-greens-base-after-a-restart.md`). Missing resources
 return `RecoveryIncomplete`/`BaseUnavailable`, never empty success.
 The version-2 volume image now preserves overlay source paths and full directory fingerprints,
 witnesses, whiteouts, redirects, metadata copy-ups and private large-file ranges, including snapshots.

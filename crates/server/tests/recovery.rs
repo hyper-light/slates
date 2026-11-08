@@ -4558,6 +4558,72 @@ fn a_greens_base_snapshot_is_held_and_its_origin_recovered_from_it() {
   second.stop();
 }
 
+/// A sibling of a removed base directory at recovery (found by liveness while slicing recovery, 2026-11-08): after a
+/// restart the rebuilt base plane holds no listings until each is read again on first use (A-153), and a pinned
+/// overlay's snapshot was judged against those empty listings. Do: an overlay over a directory holding `f` and `sub/g`;
+/// pin it whole and snapshot it; stop the daemon and start another over the same segment; create a green with that
+/// snapshot as its base. Expect: the green is made, and its files read the snapshot's bytes. Before, the snapshot read
+/// as incomplete and the green was refused `ConsistentBaseUnavailable`, though nothing about the snapshot had changed.
+#[test]
+fn a_green_over_a_pinned_overlays_snapshot_is_made_after_a_restart() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-greenafter-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let anchor = held_anchor("greenafter", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let target = common::target::target_dir();
+  target.seed("f", BEFORE);
+  assert!(
+    std::process::Command::new("mkdir")
+      .arg(format!("{}/sub", target.path))
+      .status()
+      .unwrap()
+      .success()
+  );
+  target.seed("sub/g", AFTER);
+  let mut client = connect(&instance);
+  let overlay = client
+    .create(&CreateSpec {
+      size: SizeClass::Bounded { limit: 1 << 30 },
+      base: Some(target.path.clone()),
+      ..scratch("green-after-base")
+    })
+    .unwrap();
+  assert_eq!(
+    client.pin(overlay, None).unwrap(),
+    2,
+    "both base files pinned"
+  );
+  let snapshot = client.snapshot(overlay).unwrap();
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let green = client
+    .create_green_over(
+      "green-after-restart",
+      false,
+      slates_client::GreenBase {
+        volume: overlay,
+        snapshot,
+      },
+    )
+    .expect("a green over the pinned snapshot is made after the restart");
+  for (path, bytes) in [("/f", BEFORE), ("/sub/g", AFTER)] {
+    assert_eq!(
+      client
+        .read(green, path, slates_ipc::protocol::ReadAt::Head)
+        .unwrap(),
+      bytes,
+      "{path} reads the snapshot's bytes"
+    );
+  }
+  drop(client);
+  second.stop();
+}
+
 /// A bounded overlay over `dir`, pinned and snapshotted, a green over the snapshot, and one accepted increment that
 /// replaces `g` with `G`. A second work stays at version 0, holding the reachable floor there, so version 0 stays
 /// readable across a restart: a version below the floor is folded into the green's checkpoint and refused

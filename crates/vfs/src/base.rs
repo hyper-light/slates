@@ -1129,6 +1129,33 @@ impl Overlay<'_> {
     self.vol
   }
 
+  /// [`Volume::snapshot_is_complete`], judged with the host: a merged directory whose listing this daemon has not read
+  /// since a recovery (each is read again on first use, A-153) is read now from the host, uncached, so the snapshot is
+  /// judged by what its directories hold, not by a plane that has not listed them yet. Uncached, so a recovered
+  /// directory's first listing still renumbers its untouched entries where it is meant to (A-151). A directory recovery
+  /// could not reacquire refuses `BaseUnavailable`. Until 2026-11-08 a pinned overlay's snapshot was refused as a green's
+  /// base after any restart (`ConsistentBaseUnavailable`).
+  pub fn snapshot_is_complete(&mut self, store: &Store, id: SnapshotId) -> Result<bool, VfsError> {
+    let host = &mut *self.host;
+    let vol = &*self.vol;
+    vol.snapshot_is_complete_under(store, id, &mut |no| {
+      let Some(plane) = vol.base_plane() else {
+        return Ok(None);
+      };
+      if let Some(names) = plane.listed_names(no) {
+        return Ok(Some(names));
+      }
+      if let Some(gone) = plane.unavailable.get(&no) {
+        return Err(VfsError::BaseUnavailable(gone.errno));
+      }
+      let Some(listing) = plane.listings.get(&no) else {
+        return Ok(None);
+      };
+      let entries = host.list(listing.dir).map_err(host_refusal)?;
+      Ok(Some(entries.into_iter().map(|entry| entry.name).collect()))
+    })
+  }
+
   fn plane(&mut self) -> Result<&mut BasePlane, VfsError> {
     self.vol.base.as_mut().ok_or(VfsError::NotOverlay)
   }
