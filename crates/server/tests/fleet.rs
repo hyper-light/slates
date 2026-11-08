@@ -671,6 +671,20 @@ const FALSE_DEATH_INCARNATION: u64 = 1_000;
 fn poll_until(
   daemons: &[&Daemon],
   within: Duration,
+  condition: impl FnMut() -> Result<bool, ObserveError>,
+) -> bool {
+  poll_for_periods(daemons, within, PERIOD_BUDGET, condition)
+}
+
+/// [`poll_until`] charged `periods` of the slowest observed daemon's own periods instead of [`PERIOD_BUDGET`]: for a
+/// watch that expects nothing to happen and holds that over a stated number of the fleet's rounds. [`poll_until`]'s
+/// budget is sized for an operation to converge however slowly, so a watch that never holds spent all of it: 4,000
+/// periods, about 400 s on CI for a watch of four liveness budgets (`a_works_head_is_never_placed...`, 2026-11-08).
+#[track_caller]
+fn poll_for_periods(
+  daemons: &[&Daemon],
+  within: Duration,
+  periods: u64,
   mut condition: impl FnMut() -> Result<bool, ObserveError>,
 ) -> bool {
   let mut wait = WaitTrace::begin("poll", std::panic::Location::caller(), daemons);
@@ -714,7 +728,7 @@ fn poll_until(
       last_advance = Instant::now();
     }
     wait.asked(took, daemons, &advances, last_advance.elapsed());
-    if charged >= PERIOD_BUDGET {
+    if charged >= periods {
       // Every observed daemon ran a whole budget of its own periods, condition never met: a genuine
       // non-convergence (judged in daemon-time, so CPU load cannot cause it — periods, not wall-clock).
       wait.end("poll", "period budget spent", daemons, &advances);
@@ -13409,7 +13423,10 @@ fn submit_resent_after_its_owner_restarted(before_lift: bool) {
       .ok()
       .and_then(|word| answer_while_waiting(&mut resender, *word));
     let mut reader = Client::connect(daemons[0].instance());
-    waiting = Some((early, reader.call(&RequestBody::Versions { green })));
+    waiting = Some((
+      early,
+      head_once_its_lease_confirms(&mut reader, green, &daemons),
+    ));
     lifted = lift(&daemons);
   }
   let answer = word
@@ -13417,7 +13434,7 @@ fn submit_resent_after_its_owner_restarted(before_lift: bool) {
     .ok()
     .and_then(|word| answer_within(&mut resender, *word));
   let mut reader = Client::connect(daemons[0].instance());
-  let head = reader.call(&RequestBody::Versions { green });
+  let head = head_once_its_lease_confirms(&mut reader, green, &daemons);
   let counters = merge_and_content_counters(&daemons);
   for daemon in daemons {
     daemon.stop();
@@ -13845,8 +13862,37 @@ fn a_share_of_a_green_made_after_its_last_version_survives_a_takeover() {
   );
 }
 
+/// The green's head as a client must read it from an owner that has just restarted or taken the green over (§4.8
+/// "Leases and reads", AUD-08): the owner parks the read until its lease confirms and refuses it `LeaseUnconfirmed`
+/// if the lease bound passes first, a refusal retryable by design. So the read is sent again while it is refused so,
+/// charged in the fleet's own periods like every wait here: on a loaded Mac (load about 40) one read met the lease
+/// unconfirmed (`LeaseUnconfirmed { version: 5 }`, the supervisor's stack gate, 2026-11-08). The last answer.
+fn head_once_its_lease_confirms(
+  reader: &mut Client,
+  green: VolumeId,
+  fleet: &[Daemon],
+) -> ReplyBody {
+  let observed: Vec<&Daemon> = fleet.iter().collect();
+  let mut last = None;
+  poll_until(&observed, PLACEMENT_DEADLINE, || {
+    let reply = reader.call(&RequestBody::Versions { green });
+    let confirmed = !matches!(
+      reply,
+      ReplyBody::Refused {
+        refusal: Refusal::LeaseUnconfirmed { .. }
+      }
+    );
+    last = Some(reply);
+    Ok(confirmed)
+  });
+  last.expect("the head was read at least once")
+}
+
 /// Shape: how long a test watches for a work's head to be placed: several of the owner's seal rounds.
 const WORK_SEAL_WATCH: Duration = Duration::from_nanos(4 * LIVENESS_BUDGET_NS);
+/// Shape: [`WORK_SEAL_WATCH`] as the fleet's own periods, one a heartbeat, so the watch is charged in daemon time like
+/// every poll and a loaded runner stretches it rather than failing it ([`poll_for_periods`]).
+const WORK_SEAL_WATCH_PERIODS: u64 = 4 * LIVENESS_BUDGET_NS / slates_server::daemon::HEARTBEAT_NS;
 
 /// §4.16 "Commit", A-252: "nothing runs twice after a takeover" rests on a work never coming back on a successor, since
 /// a work come back with no completion record would run a resend again, and an older one would make a different
@@ -13887,9 +13933,12 @@ fn a_works_head_is_never_placed_so_a_takeover_cannot_bring_it_back_to_run_a_rese
   });
   let object = ObjectId(work.bytes);
   let survivors_then: Vec<&Daemon> = daemons.iter().collect();
-  let placed = poll_until(&survivors_then, WORK_SEAL_WATCH, || {
-    daemons[0].fleet_head_placed(object)
-  });
+  let placed = poll_for_periods(
+    &survivors_then,
+    WORK_SEAL_WATCH,
+    WORK_SEAL_WATCH_PERIODS,
+    || daemons[0].fleet_head_placed(object),
+  );
   drop(survivors_then);
   let (caught_up, _) = holders_before_owner_death_at(&daemons, green, 1);
   daemons.remove(0).stop();
@@ -13905,7 +13954,7 @@ fn a_works_head_is_never_placed_so_a_takeover_cannot_bring_it_back_to_run_a_rese
   let mut reader = Client::connect(daemons[successor_index].instance());
   let status = reader.call(&RequestBody::Status { volume: work });
   let again = reader.call(&submit);
-  let head = reader.call(&RequestBody::Versions { green });
+  let head = head_once_its_lease_confirms(&mut reader, green, &daemons);
   for daemon in daemons {
     daemon.stop();
   }
@@ -14047,7 +14096,7 @@ fn a_submit_resent_after_its_owner_was_taken_over_is_not_applied_again() {
   });
   let again = resend_while_refused_retryable(&mut client, &submit);
   let mut reader = Client::connect(daemons[successor_index].instance());
-  let head = reader.call(&RequestBody::Versions { green });
+  let head = head_once_its_lease_confirms(&mut reader, green, &daemons);
   for daemon in daemons {
     daemon.stop();
   }
