@@ -102,7 +102,7 @@ pub(crate) fn backend() -> MountBackend {
 /// at `path`, under the mount `capability` (§4.13; AUD-01 — the attachment id and token `attach`
 /// returned, the bearer authority the daemon validates every request's file handle against; a mount
 /// path with no capability reaches nothing): the design's options (§4.6 — NFSv3 over TCP, the explicit
-/// `port`/`mountport` so no portmap query is needed, `soft,intr` so a wedged mount is escapable,
+/// `port`/`mountport` so no portmap query is needed, `hard,intr` so a call waits as long as the daemon asks and a signal still ends the wait,
 /// `locallocks`, `nosuid`, `nodev`, `rdirplus`), plus `noresvport` for the unprivileged mount (R10) and the
 /// derived attribute-cache timeout, and `rdonly` for a read-only mount (the kernel refuses writes at the
 /// mount, as the daemon does under the read-only capability). slates serves NFS and MOUNT on one port,
@@ -119,7 +119,7 @@ fn mount_args(
 ) -> Vec<String> {
   let access = if read_only { ",rdonly" } else { "" };
   let options = format!(
-    "vers=3,tcp,port={port},mountport={port},noresvport,soft,intr,locallocks,nosuid,nodev,rdirplus,\
+    "vers=3,tcp,port={port},mountport={port},noresvport,hard,intr,locallocks,nosuid,nodev,rdirplus,\
      actimeo={ATTR_CACHE_SECONDS}{access}"
   );
   vec![

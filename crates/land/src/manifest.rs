@@ -294,7 +294,7 @@ fn put_fingerprint(out: &mut Vec<u8>, fp: &Fingerprint) {
 
 /// Plans the manifest of `source` — the volume's head or one of its snapshots (A-49): the diverged entries
 /// with their witnesses and the overlay's identities (the bytes are hashed here, once, proportional to the
-/// delta), every one of them as the source holds it.
+/// delta), every one of them as the source holds it. [`PlanWalk`] run to its end, in one call.
 pub fn plan(
   vol: &mut Volume,
   store: &mut Store,
@@ -302,32 +302,116 @@ pub fn plan(
   filter: &Filter,
   source: Source,
 ) -> Result<Manifest, VfsError> {
-  let diverged = match source {
-    Source::Head => vol.diverged(store),
-    Source::Snapshot(id) => vol.diverged_in(store, id)?,
-  };
-  let mut entries = Vec::new();
-  let mut filtered_out = 0usize;
-  // A renamed base directory implies the whiteout at its origin; that whiteout is not a
-  // separate removal.
-  let origins: Vec<Box<str>> = diverged
-    .iter()
-    .filter(|d| d.kind == Divergence::Redirect)
-    .filter_map(|d| origin_of(vol, store, source, &d.path))
-    .collect();
-  for d in &diverged {
-    if !filter.keeps(&d.path) {
-      filtered_out = filtered_out.saturating_add(1);
-      continue;
-    }
-    if d.kind == Divergence::Whiteout && origins.iter().any(|o| o.as_ref() == d.path.as_str()) {
-      continue;
-    }
-    if let Some(entry) = entry_for(vol, store, host, source, d)? {
-      entries.push(entry);
+  let mut walk = PlanWalk::new(vol, source)?;
+  loop {
+    if let Some(manifest) = walk.unit(vol, store, host, filter)? {
+      return Ok(manifest);
     }
   }
-  Ok(Manifest::from_entries(entries, filtered_out))
+}
+
+/// A landing's plan in progress (§4.15 step 1; §4.3 "Bounded work everywhere"): the diverged set walked a directory a
+/// unit, then each diverged entry planned a unit (a file read and its identity hashed), then the manifest built, so a
+/// large landing is planned over many of a shard's steps instead of one poll (a presentation of 1,000 files of 16 KiB
+/// held its shard for one 6.2 s plan, 2026-11-08). It holds no borrow between units; what it walks must not move under
+/// it, so a sliced plan walks a snapshot (the head's, taken as the landing begins).
+#[derive(Debug)]
+pub struct PlanWalk {
+  source: Source,
+  stage: PlanStage,
+}
+
+#[derive(Debug)]
+enum PlanStage {
+  /// The diverged set being walked.
+  Diverged(slates_vfs::base::DivergedWalk),
+  /// Each diverged entry being planned, in path order.
+  Entries {
+    diverged: Vec<Diverged>,
+    /// The origins of the renamed base directories: a whiteout at one is implied by its rename.
+    origins: Vec<Box<str>>,
+    next: usize,
+    entries: Vec<LandingEntry>,
+    filtered_out: usize,
+  },
+  /// Ended: the manifest was given out.
+  Ended,
+}
+
+impl PlanWalk {
+  /// A plan of `source` from its start.
+  pub fn new(vol: &Volume, source: Source) -> Result<PlanWalk, VfsError> {
+    let walk = match source {
+      Source::Head => vol.diverged_walk(),
+      Source::Snapshot(id) => vol.diverged_walk_in(id)?,
+    };
+    Ok(PlanWalk {
+      source,
+      stage: PlanStage::Diverged(walk),
+    })
+  }
+
+  /// One unit: a directory of the diverged walk, one entry planned, or the manifest built; the manifest once built.
+  pub fn unit(
+    &mut self,
+    vol: &mut Volume,
+    store: &mut Store,
+    host: &mut dyn HostFs,
+    filter: &Filter,
+  ) -> Result<Option<Manifest>, VfsError> {
+    let source = self.source;
+    match std::mem::replace(&mut self.stage, PlanStage::Ended) {
+      PlanStage::Diverged(mut walk) => {
+        self.stage = match vol.diverged_unit(store, &mut walk) {
+          Some(diverged) => {
+            let origins: Vec<Box<str>> = diverged
+              .iter()
+              .filter(|d| d.kind == Divergence::Redirect)
+              .filter_map(|d| origin_of(vol, store, source, &d.path))
+              .collect();
+            PlanStage::Entries {
+              diverged,
+              origins,
+              next: 0,
+              entries: Vec::new(),
+              filtered_out: 0,
+            }
+          }
+          None => PlanStage::Diverged(walk),
+        };
+        Ok(None)
+      }
+      PlanStage::Entries {
+        diverged,
+        origins,
+        next,
+        mut entries,
+        mut filtered_out,
+      } => {
+        let Some(d) = diverged.get(next) else {
+          return Ok(Some(Manifest::from_entries(entries, filtered_out)));
+        };
+        if !filter.keeps(&d.path) {
+          filtered_out = filtered_out.saturating_add(1);
+        } else if d.kind == Divergence::Whiteout
+          && origins.iter().any(|o| o.as_ref() == d.path.as_str())
+        {
+          // A renamed base directory implies the whiteout at its origin; that whiteout is not a separate removal.
+        } else if let Some(entry) = entry_for(vol, store, host, source, d)? {
+          entries.push(entry);
+        }
+        self.stage = PlanStage::Entries {
+          diverged,
+          origins,
+          next: next.saturating_add(1),
+          entries,
+          filtered_out,
+        };
+        Ok(None)
+      }
+      PlanStage::Ended => Err(VfsError::Invalid),
+    }
+  }
 }
 
 fn origin_of(vol: &Volume, store: &Store, source: Source, path: &str) -> Option<Box<str>> {

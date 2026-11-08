@@ -724,6 +724,11 @@ impl Partition {
     self.seal_keys.get(owner)
   }
 
+  /// Every sealing key recorded at this partition, by owner.
+  pub fn seal_keys(&self) -> impl Iterator<Item = &SealKeyRecord> {
+    self.seal_keys.values()
+  }
+
   /// Applies one NFSv4 record operation (A-37): an upsert, a clear, or a client's purge.
   fn apply_nfs(&mut self, op: &Op) {
     match op {
@@ -930,6 +935,7 @@ impl Partition {
       | Op::VolumeHeadAdvanced { id, .. }
       | Op::AccessChanged { id, .. }
       | Op::LiveShippingChanged { id, .. }
+      | Op::LiveHoldersCommitted { id, .. }
       | Op::VolumeRebased { id, .. } => self.volume(*id).map(|_| ()).ok_or(DbError::NotFound),
       Op::SnapshotTaken { record } => {
         self.volume(record.volume).ok_or(DbError::NotFound)?;
@@ -1232,6 +1238,11 @@ impl Partition {
       // The catalog register carries the flag (a successor keeps shipping), so its version moves as an access change's.
       Op::LiveShippingChanged { id, live_shipped } => self.update_volume(*id, |v| {
         v.policy.live_shipped = *live_shipped;
+        v.catalog_version = v.catalog_version.saturating_add(1);
+      }),
+      // The catalog register carries the holder set (A-240), so its version moves as the flag's does.
+      Op::LiveHoldersCommitted { id, holders } => self.update_volume(*id, |v| {
+        v.policy.live_holders = Some(holders.clone());
         v.catalog_version = v.catalog_version.saturating_add(1);
       }),
       Op::VolumeDestroyed { id } => {

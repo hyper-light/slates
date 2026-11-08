@@ -32,6 +32,7 @@ fn report() -> ReplyBody {
     refused_log: 83,
     voters: 89,
     joint: true,
+    voter_ids: vec![97, 101, 103],
   };
   ReplyBody::DaemonStatus {
     report: Box::new(DaemonReport {
@@ -52,6 +53,7 @@ fn report() -> ReplyBody {
       anchor_hold_refusals: 97,
       log_lines_refused: 101,
       anchor_log_lines_refused: 103,
+      dumps_local_full: true,
       fleet: FleetReport {
         host: 19,
         f: 0,

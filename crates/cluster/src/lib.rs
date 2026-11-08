@@ -458,6 +458,27 @@ impl Stragglers {
     }
     (recovered, self.replies.iter().all(Option::is_none))
   }
+
+  /// Waits for every straggler to report, then returns what they brought back (as [`Stragglers::recover_replies`]) and
+  /// whether all have reported. For a caller about to end the task that made the dispatch: a straggler's request is a
+  /// child of that task, and a task's end cancels its children, so a request still in flight then is dropped with the
+  /// session in it and never reported, and the session's slot stays lent for good. Each request is bounded by its
+  /// dispatch's deadline, so this waits at most that. Checked once per timer tick, the finest park there is; a task off a
+  /// shard, which cannot be timed, gets what has come back so far and `false`.
+  pub async fn settle(&mut self) -> (Vec<(HostId, TimedReply, Endpoint)>, bool) {
+    let mut settled = Vec::new();
+    loop {
+      let (replies, done) = self.recover_replies();
+      settled.extend(replies);
+      if done {
+        return (settled, true);
+      }
+      // Shape: one tick of the shard's timer wheel (`sleep` rounds up to it).
+      if slates_rt::futures::sleep(1).await.is_err() {
+        return (settled, false);
+      }
+    }
+  }
 }
 
 /// Runs one request/reply on `endpoint` (its `request`), racing it against `deadline_ns`, and returns the
