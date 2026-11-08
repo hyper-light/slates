@@ -45,11 +45,12 @@ impl slates_vfs::recover::ImageWrite for ObjectImage {
 use slates_vfs::VfsError;
 use slates_vfs::clock::StepClock;
 use slates_vfs::ids::InodeNo;
+use slates_vfs::inode::WindowsAttributes;
 use slates_vfs::names::NameEquivalence;
 use slates_vfs::quota::{BudgetGrowth, Quota};
 use slates_vfs::recover::{
-  BodyImage, EntryImage, ImageOut, InodeImage, KeyedImage, KindImage, PolicyImage, ShardImage,
-  SharedSource, VolumeImage,
+  AttrsImage, BodyImage, EntryImage, ImageOut, InodeImage, KeyedImage, KindImage, PolicyImage,
+  ShardImage, SharedSource, VolumeImage,
 };
 use slates_vfs::volume::{Store, Volume, VolumeConfig};
 
@@ -2554,3 +2555,131 @@ fn a_writes_accounting_equals_a_recount_after_every_step() {
     );
   }
 }
+
+/// A-262. Do: create a file (the volume marks it `ARCHIVE`, as NTFS does), set `HIDDEN | SYSTEM` on a second and
+/// `READONLY | HIDDEN` on a directory, ask for a third file's `READONLY` (dropped: a file's read-only state is its
+/// mode), then image the volume, decode the image from its bytes and rebuild a volume from it. Expect: the image
+/// carries each inode's bits at Windows' values, and the rebuilt volume reports the same bits.
+#[test]
+fn windows_attributes_survive_an_image_and_a_rebuild() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let archived = vol
+    .create_file_no(&mut store, root, "archived", 0o644)
+    .unwrap();
+  let hidden = vol
+    .create_file_no(&mut store, root, "hidden", 0o644)
+    .unwrap();
+  let readonly = vol
+    .create_file_no(&mut store, root, "readonly", 0o644)
+    .unwrap();
+  let dir = vol.mkdir_no(&mut store, root, "dir", 0o755).unwrap();
+  let set = |bits: u32, kind| WindowsAttributes::kept(bits, kind);
+  let file = slates_vfs::inode::Kind::File;
+  vol
+    .set_windows_attributes(&mut store, hidden, set(0x2 | 0x4, file))
+    .unwrap();
+  vol
+    .set_windows_attributes(&mut store, readonly, set(0x1 | 0x20, file))
+    .unwrap();
+  vol
+    .set_windows_attributes(
+      &mut store,
+      dir,
+      set(0x1 | 0x2 | 0x10, slates_vfs::inode::Kind::Dir),
+    )
+    .unwrap();
+  let expected = [
+    (archived, 0x20),
+    (hidden, 0x2 | 0x4),
+    (readonly, 0x20),
+    (dir, 0x1 | 0x2),
+    (root, 0),
+  ];
+  let image = vol.to_image(&store, None).unwrap();
+  let image = VolumeImage::from_content(&image.to_content()).expect("the image decodes");
+  for (no, bits) in expected {
+    assert_eq!(
+      inode(&image, no).windows,
+      bits,
+      "the image carries {no:?}'s bits"
+    );
+  }
+  let mut fresh = common::surviving(&store);
+  let claims = common::claims(&mut fresh, &[&image]);
+  let rebuilt = Volume::from_image(
+    &mut fresh,
+    &image,
+    &claims,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
+  for (no, bits) in expected {
+    assert_eq!(
+      rebuilt.windows_attributes(&fresh, no).unwrap().bits(),
+      bits,
+      "the rebuilt volume keeps {no:?}'s bits"
+    );
+  }
+}
+
+/// A-262's golden vector: one file's inode image with `HIDDEN | ARCHIVE` kept, encoded as image version 23 writes it.
+/// The bits are the last two bytes, little-endian at Windows' own values (`22 00`), after the attribute-owner and
+/// sidecar options; a change to the layout fails it.
+#[test]
+fn an_inode_images_encoding_is_its_golden_vector() {
+  use slates_wire::Wire;
+  let image = InodeImage {
+    no: 2,
+    generation: 1,
+    born: 3,
+    kind: KindImage::File,
+    attrs: AttrsImage {
+      mode: 0o644,
+      uid: 501,
+      gid: 20,
+      nlink: 1,
+      size: 4,
+      atime: 10,
+      mtime: 11,
+      ctime: 12,
+      btime: 13,
+    },
+    version: 7,
+    home: None,
+    multi: false,
+    body: BodyImage::Inline {
+      bytes: b"data".to_vec(),
+    },
+    xattrs: Vec::new(),
+    attribute_of: None,
+    sidecar: None,
+    windows: 0x22,
+  };
+  let mut bytes = Vec::new();
+  image.encode(&mut bytes);
+  let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+  assert_eq!(hex, GOLDEN_INODE_IMAGE, "the inode image's encoding");
+  let back = InodeImage::decode(&mut bytes.as_slice()).unwrap();
+  assert_eq!(back, image, "the golden decodes to the image it encodes");
+}
+
+/// Format: the golden encoding of [`an_inode_images_encoding_is_its_golden_vector`]'s inode image.
+const GOLDEN_INODE_IMAGE: &str = concat!(
+  "0200000000000000",                                                 // no
+  "01000000",                                                         // generation
+  "0300000000000000",                                                 // born
+  "00000000",                                                         // kind: File
+  "a4010000f50100001400000001000000", // mode 0o644, uid 501, gid 20, nlink 1
+  "0400000000000000",                 // size
+  "0a000000000000000b000000000000000c000000000000000d00000000000000", // atime, mtime, ctime, btime
+  "0700000000000000",                 // version
+  "0000",                             // home: None; multi: false
+  "020000000400000064617461",         // body: Inline, 4 bytes, "data"
+  "00000000",                         // xattrs: none
+  "0000",                             // attribute_of: None; sidecar: None
+  "2200",                             // windows: HIDDEN | ARCHIVE (image version 23, A-262)
+);

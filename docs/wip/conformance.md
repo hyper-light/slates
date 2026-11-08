@@ -37,8 +37,8 @@
 > cases) and the WinFsp fsx port, over `slates mount ID E:` in `windows-lint` and `windows-arm64`. winfstest's 628
 > cases give the same verdicts on x86_64 and arm64: 254 pass, 374 fail, every failure on
 > `expected-failures/native-windows-winfsp.winfstest.txt` with one of A-209's five stated differences. Since
-> A-259 (2026-11-08) the drive keeps a creation time, so `t/base/06.t` case 5 passes and 373 are listed, with four
-> stated differences left. The suite found
+> A-259 (2026-11-08) the drive keeps a creation time, so `t/base/06.t` case 5 passes and 373 are listed; since A-262 it
+> keeps the attribute bits too, so the 18 ATTRIBUTES cases pass and 355 are listed, with three stated differences left. The suite found
 > four Win32 bugs, each fixed with a failing test first (`docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`).
 > fsx wedges over the drive (an open bug, listed as `fsx-seed-1-unfinished:10000` in
 > `expected-failures/native-windows-winfsp.fsx.txt`); every fsx run now has a 300 s bound and is judged against its
@@ -552,9 +552,9 @@ still be established separately.
   behaviour (environmental). Linux adapter records and its first root review are now tracked.
 - A daemon transport for the FUSE bridge, so the Linux cells can be RAN, not LIMITED.
 - A Windows workload roster over the drive (the mount step exists since A-209); an ETW tracer.
-- The Windows features the drive does not keep (A-209's stated differences: attribute bits, security descriptors,
-  reparse points and symbolic links, named streams), each a reason on winfstest's list; a feature built later strikes
-  its cases from the list, as the settable creation time did (A-259, `t/base/06.t` case 5).
+- The Windows features the drive does not keep (A-209's stated differences: security descriptors, reparse points and
+  symbolic links, named streams), each a reason on winfstest's list; a feature built later strikes its cases from the
+  list, as the settable creation time did (A-259, `t/base/06.t` case 5) and the attribute bits did (A-262, 18 cases).
 - A live virtio-fs guest and the OCI attachment form; then their cells.
 - Pressure and failure suites (Phase 9).
 - Sibling findings for their owners: the volume root directory lists as `root wheel` through the

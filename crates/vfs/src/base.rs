@@ -2396,6 +2396,18 @@ impl Overlay<'_> {
     self.vol.edit(store, no, at, delete_len, bytes)
   }
 
+  /// [`Volume::set_windows_attributes`] with a metadata-only copy-up (A-262): an untouched base file's bits are what
+  /// the disk reports until a caller sets its own.
+  pub fn set_windows_attributes(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    attributes: crate::inode::WindowsAttributes,
+  ) -> Result<(), VfsError> {
+    self.copy_up(store, no, CopyUp::Metadata)?;
+    self.vol.set_windows_attributes(store, no, attributes)
+  }
+
   /// `chmod` with a metadata-only copy-up.
   pub fn chmod(&mut self, store: &mut Store, no: InodeNo, mode: u32) -> Result<(), VfsError> {
     self.copy_up(store, no, CopyUp::Metadata)?;

@@ -77,9 +77,10 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// body carries the disk file it was made from, and every fingerprint the file's birth time, so a successor never takes
 /// the file now at a name for the one an old handle opened. 21 (A-152, 2026-10-22) each attachment's references carry how
 /// many of them are open handles, so a successor gives back the open of a handle the dead daemon issued at its release.
+/// 23 (A-262, 2026-11-08) every inode carries the Windows attribute bits kept beside its mode.
 /// Format: the image layout version, bumped with any change to the types below or to the held replicas'
 /// image they carry.
-const IMAGE_VERSION: u16 = 22;
+const IMAGE_VERSION: u16 = 23;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
@@ -358,6 +359,9 @@ pub struct InodeImage {
   /// The attribute inode holding a transport's working copy of this inode's attributes (the
   /// AppleDouble `._` bytes a client wrote, §4.6). Image version 6.
   pub sidecar: Option<u64>,
+  /// The Windows attribute bits kept beside the mode, at Windows' values (A-262,
+  /// [`crate::inode::WindowsAttributes`]). Image version 23.
+  pub windows: u16,
 }
 
 /// One extended attribute of an inode in an image: its name and the attribute inode (captured like
@@ -1714,6 +1718,7 @@ impl Volume {
         .as_deref()
         .and_then(crate::inode::XattrTable::sidecar)
         .map(|copy| copy.0),
+      windows: inode.windows.bits(),
     })
   }
 
@@ -1845,6 +1850,7 @@ impl Volume {
       .and_then(crate::inode::XattrTable::sidecar)
       .map(|copy| copy.0)
       .encode(out);
+    inode.windows.bits().encode(out);
     Ok(())
   }
 
@@ -3329,6 +3335,7 @@ fn restore_identity(inode: &mut Inode, image_inode: &InodeImage) {
     .and_then(|h| Home::new(InodeNo(h.parent), h.hash));
   inode.attrs = attrs_from_image(&image_inode.attrs);
   inode.set_attribute_of(image_inode.attribute_of.map(InodeNo));
+  inode.windows = crate::inode::WindowsAttributes::from_image(image_inode.windows);
 }
 
 fn child_for(

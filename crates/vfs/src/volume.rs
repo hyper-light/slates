@@ -576,6 +576,8 @@ pub struct Observed {
   pub attrs: Attrs,
   /// The change counter: it moves on every change to the object and never repeats.
   pub change: u64,
+  /// The Windows attribute bits kept beside the mode (A-262).
+  pub windows: crate::inode::WindowsAttributes,
 }
 
 /// A `readdir` row.
@@ -1089,6 +1091,7 @@ impl Volume {
       kind: inode.kind,
       attrs: inode.attrs,
       change: inode.version,
+      windows: inode.windows,
     })
   }
 
@@ -1687,6 +1690,9 @@ impl Volume {
     };
     let mut inode = Inode::new(no, self.epoch, kind, mode, body);
     inode.home = Home::new(parent, self.policy.hash(name));
+    if kind == Kind::File {
+      inode.windows = crate::inode::WindowsAttributes::new_file();
+    }
     stamp_all(&mut inode.attrs, now);
     let handle = self.install(store, no, inode)?;
     let child = match kind {
@@ -2632,6 +2638,35 @@ impl Volume {
     if mode & ALL_WRITE_BITS != ALL_WRITE_BITS {
       store.recall_gate.recall_on_write_restricted(no.0);
     }
+    Ok(())
+  }
+
+  /// The Windows attribute bits kept beside inode `no`'s mode (A-262; [`crate::inode::WindowsAttributes`]).
+  pub fn windows_attributes(
+    &self,
+    store: &Store,
+    no: InodeNo,
+  ) -> Result<crate::inode::WindowsAttributes, VfsError> {
+    Ok(self.inode(store, no)?.windows)
+  }
+
+  /// Sets the Windows attribute bits kept beside the mode (A-262; [`crate::inode::WindowsAttributes`]), as a
+  /// `SetFileAttributes` or a create's attributes ask. Copy-on-write; the change time advances, as NTFS advances it.
+  pub fn set_windows_attributes(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    attributes: crate::inode::WindowsAttributes,
+  ) -> Result<(), VfsError> {
+    self.live()?;
+    self.namespace_inode(store, no)?;
+    let handle = self.make_current_inode(store, no)?;
+    let now = self.clock.wall_ns();
+    let inode = store.inodes.get_mut(handle)?;
+    let prev = inode.version;
+    inode.windows = attributes;
+    inode.stamp_change(now);
+    self.record(&mut store.metadata, Op::Setattr, "", Some(no), prev);
     Ok(())
   }
 

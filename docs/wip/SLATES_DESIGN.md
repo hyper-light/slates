@@ -1805,7 +1805,10 @@ enum DirEntries { Small(InlineArray<Entry, 2> /* names inline, the measured cut-
 struct Entry { name_hash: u64, name: NameRef /* into the node or the block */, kind: Kind /* Dir | File | Symlink | Fifo | Socket | Whiteout */, child: Handle<DirNode> | InodeNo }
 enum Body { …, Directory(Handle<DirNode>) /* a directory inode names its current node (A-7) */ }
 struct Inode { no: InodeNo, gen: u32, kind, mode, uid, gid, nlink, size, atime, mtime, ctime, btime,
-               body: Body, identity: Option<Blake3>, born: Epoch, flags }
+               body: Body, identity: Option<Blake3>, born: Epoch, flags,
+               windows: WindowsAttributes /* A-262: HIDDEN, SYSTEM, ARCHIVE, OFFLINE, NOT_CONTENT_INDEXED, and a
+                                             directory's READONLY (a file's is its mode), at Windows' values, in the
+                                             two bytes of tail padding, so no inode grows */ }
 enum Body { Inline(SmallBytes), Extents(ExtentList), Open(OpenExtent, ExtentList), Symlink(NameRef),
             Base { witness: Option<Handle<Witness>>, pinned: ExtentList, fd: Option<BaseFd>, lost: bool } }
 struct Extent { off: u64, len: u64, src: ExtentSrc } enum ExtentSrc { Chunk{chunk: ChunkHandle, off: u32}, Zero, Base{fd: BaseFd} }
@@ -3009,9 +3012,9 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 
 > **Status (2026-11-05, A-209: Windows conformance).** WinFsp's own suites run over the drive in `windows-lint` and
 > `windows-arm64`. winfstest's 628 cases give the same verdicts on x86_64 and arm64; every failure is on the reviewed
-> list with one of four stated differences (attribute bits, security descriptors, reparse points and symbolic links,
-> named streams; the fifth, a settable creation time, was built in A-259 and `t/base/06.t` case 5 came off the
-> list). Four Win32 bugs it found are fixed with failing tests first
+> list with one of three stated differences (security descriptors, reparse points and symbolic links, named streams;
+> a settable creation time was built in A-259, `t/base/06.t` case 5 off the list, and the attribute bits in A-262, its
+> 18 cases off, leaving 355). Four Win32 bugs it found are fixed with failing tests first
 > (`crates/cli/tests/winfsp_semantics.rs`): a move not asked to replace, a directory holding a file, `SetFileTime`, and
 > an open with `TRUNCATE_EXISTING` (WinFsp's allocation below a file's size truncates it). Open: the fsx port wedges at an
 > extension after a cached write past a hole and a shrink, inside Windows below the single receiver; it is a listed
@@ -14303,7 +14306,9 @@ fsx verdict), `xtask/src/conformance` (the WinFsp mount step, the MSVC builds, t
   slates does not claim, five Windows features, each a reason on the reviewed list:
   - **ATTRIBUTES**: no Windows attribute bits. Every file reports `FILE_ATTRIBUTE_NORMAL` and every directory
     `FILE_ATTRIBUTE_DIRECTORY`; READONLY, HIDDEN, SYSTEM and ARCHIVE are neither reported nor enforced (the volume's
-    permission is POSIX's mode).
+    permission is POSIX's mode). **Amended by A-262 (2026-11-08):** the volume keeps HIDDEN, SYSTEM, ARCHIVE, OFFLINE,
+    NOT_CONTENT_INDEXED and a directory's READONLY beside the mode, and a file's READONLY is its mode's write bits, so
+    the reason stands for READONLY and no longer for the rest; the 18 cases are off the list.
   - **SECURITY**: no per-file security descriptor. Every object reports the volume's one descriptor and access is the
     volume's own rule; a DACL set or asked for at create is not kept.
   - **CREATION-TIME**: no settable birth time. The bridge's attributes carry none (creation time reports the change
@@ -16085,6 +16090,49 @@ Applied in the same change to: §4.7 (the rendezvous's status), GAPS, `crates/cl
 - **Proven** on this Mac by two tests that failed on the old order: `a_refused_second_anchor_leaves_the_live_instance_its_segment_and_its_bytes`
   (across processes: a live anchor and its daemon, a second anchor refused, the daemon killed, its successor adopting the
   segment by name and reading the file back) and `a_refused_second_daemon_leaves_the_live_ones_segment_in_place`.
+
+### A-262 — The volume keeps Windows' attribute bits beside the mode, and a file's read-only state is its mode (accepted 2026-11-08; the drive and the volume built, the merge, the landings and the base plane owed)
+Applied in the same change to: §4.5 (the inode), §4.6 (the Windows conformance status), A-209 (amended: ATTRIBUTES),
+GAPS, `docs/wip/conformance.md`, the winfstest list
+(`docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt`, 373 to 355 entries), `crates/vfs`
+(`inode::WindowsAttributes`, `Volume::set_windows_attributes` and the overlay's, the image v23 and delta v6 layouts),
+`crates/bridge-core` (`NodeAttr::windows`, `SetAttr::windows`, the owner rule, the AppleDouble view's refusal), the
+FUSE, NFS and FSKit bridges (each sets none), and `crates/bridge-winfsp` (the attribute decisions in `lib.rs`; create,
+overwrite, `SetBasicInfo`, `CanDelete` and rename in `host.rs`).
+- **Why A-209's reason no longer covers them.** A-209 left the bits out because "the volume's permission is POSIX's
+  mode": one permission model. That holds for `READONLY` alone. `HIDDEN`, `SYSTEM`, `ARCHIVE`, `OFFLINE` and
+  `NOT_CONTENT_INDEXED` are metadata, not permissions, and Windows tools rely on them: Git for Windows hides `.git`
+  (`core.hideDotFiles`), Explorer hides by them, and backups and `robocopy /A` read `ARCHIVE`. The drive answered
+  their `SetFileAttributes` success and kept nothing.
+- **The rule.**
+  - A file's `READONLY` is its mode's write bits, the one model. Setting it clears every class's write bit; clearing it
+    gives the owner's back. The drive reports `READONLY` for a file its owner may not write. This is WSL DrvFs's mapping,
+    and Samba's `map readonly`, so a POSIX tool sees what Windows set and the reverse.
+  - The other bits, and a directory's `READONLY` (Windows gives it no permission: Explorer reads it as a display
+    hint, and the mode keeps its POSIX meaning), are kept as metadata in `Inode::windows`, a `u16` at Windows' values.
+  - A file the volume makes is `ARCHIVE`, as NTFS and WinFsp's memfs mark every file they make. A create applies the
+    caller's word with `ARCHIVE`; an overwrite's supersede takes the caller's word and a plain overwrite adds it to the
+    file's, each with `ARCHIVE`; `SetBasicInfo` replaces the word, `INVALID_FILE_ATTRIBUTES` leaving it as it is.
+  - The Win32 rules on top: a read-only file refuses its delete (`STATUS_CANNOT_DELETE`, `ERROR_ACCESS_DENIED`) and a
+    rename replacing it (`ERROR_ACCESS_DENIED`). Setting the bits asks for the owner or root, as a mode change does.
+- **What it costs.** No inode grows: the `u16` sits in the two bytes of tail padding (measured with `offset_of!`;
+  `Inode` stays 168 bytes, `cargo run -p slates-vfs --example tree_heap` reads 260, 275 and 293 heap bytes per entry for
+  npm, pip and cargo trees, before and after). The image's inode gains two bytes (layout version 23, the delta's 6), with
+  a reviewed golden vector (`an_inode_images_encoding_is_its_golden_vector`). WinFsp's wire already carries the word.
+- **What other platforms do with them.** NFS, FUSE and FSKit expose none and set none. A Linux or macOS landing carries
+  them in the volume and applies none (not yet built on any platform; below). An overlay reports none of them for a
+  file whose disk attributes it never read: no bit, so `NORMAL`, or `READONLY` from the mode, whatever the disk's
+  Windows attributes are, until a Windows base plane reads them (owed, below).
+- **Owed, each its own change under this amendment.** (1) The merge's metadata dimension: the bits merged as the mode is,
+  accept, identical or conflict, never inferred (D-27); until then a merge carries none of them, so a green made by
+  merging keeps none. (2) A Windows landing applying them (`SetFileAttributesW`). (3) A Windows base plane reading
+  them from the disk.
+- **Proven** by `windows_attributes_survive_an_image_and_a_rebuild` and the golden vector (`crates/vfs/tests/recover.rs`),
+  `setattr_keeps_the_windows_attribute_bits_for_each_kind` (`crates/bridge-core/tests/volume_bridge.rs`; red with the
+  bridge's setter removed: the file reported 32 where 6 was set), `windows_attribute_bits_ask_for_the_owner`, the
+  drive's decisions unit-tested in `crates/bridge-winfsp/src/lib.rs`, and on CI's Windows runner by
+  `a_files_attributes_are_kept_and_its_read_only_state_refuses_a_delete` (`crates/cli/tests/winfsp_semantics.rs`) and
+  winfstest against the shortened list.
 
 ### A-260 — An NFSv4 open or delegation holds its file, so a file removed while open is preserved (accepted 2026-11-08)
 Applied in the same change to: §4.6 (NFSv4 state, "An open holds its file"), GAPS, `docs/wip/conformance.md`, the

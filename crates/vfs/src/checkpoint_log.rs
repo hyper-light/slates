@@ -34,8 +34,9 @@ const DELTA_MAGIC: u32 = u32::from_le_bytes(*b"SLD1");
 /// Format: the delta format's version, bumped with any change to the delta's types: 1 (A-68, 2026-10-04); 2 (A-126,
 /// 2026-10-09) a file changed only by writes to its chunked body is carried as its written windows
 /// (`delta::InodePatch`), not its whole image; 3 (A-127, 2026-10-09) the call records changed and purged since the
-/// last publication; 4 (A-128, 2026-10-09) the held NFSv3 replies, whole, when they changed.
-const DELTA_VERSION: u16 = 5;
+/// last publication; 4 (A-128, 2026-10-09) the held NFSv3 replies, whole, when they changed; 6 (A-262, 2026-11-08)
+/// every inode image it carries holds the Windows attribute bits kept beside the mode (image version 23).
+const DELTA_VERSION: u16 = 6;
 /// Format: a log frame's header — a little-endian payload length then a CRC-32C of the payload.
 const LOG_HEADER: usize = 2 * size_of::<u32>();
 /// Format: a log frame's payload prefix — its generation and its base checkpoint's generation.

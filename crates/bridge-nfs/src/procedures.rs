@@ -1937,6 +1937,8 @@ impl<'b> Export<'b> {
         ctime: None,
         // Nor a birth time.
         btime: None,
+        // No Windows attribute bits either: only the WinFsp drive sets them (A-262).
+        windows: None,
       },
       explicit_times,
     ))

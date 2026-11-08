@@ -1827,6 +1827,8 @@ fn setattr_changes(
     ctime: set(SetAttrIn::FATTR_CTIME).then_some(s.ctime),
     // FUSE carries no birth time to set.
     btime: None,
+    // No Windows attribute bits either: only the WinFsp drive sets them (A-262).
+    windows: None,
   })
 }
 

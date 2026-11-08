@@ -1,5 +1,15 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **The WinFsp drive keeps Windows' attribute bits, and a file's read-only state is its mode: built for the volume and
+> the drive (2026-11-08, §4.6; A-262).** A-209 had left HIDDEN, SYSTEM, ARCHIVE and READONLY out ("the volume's
+> permission is POSIX's mode"), so `SetFileAttributes` answered success and kept nothing and every file reported
+> `NORMAL`. Now a file's READONLY is its mode's write bits (DrvFs's and Samba's mapping), and the other bits, with a
+> directory's READONLY, are kept in the inode's two bytes of tail padding (168 B, unchanged; tree_heap 260, 275 and 293
+> B per entry, unchanged). winfstest's 18 ATTRIBUTES cases come off its list (373 to 355). **Still owed under A-262:** the
+> merge's dimension (a merge carries none of the bits yet), a Windows landing applying them (no landing applies them on
+> any platform; Linux and macOS will carry them unapplied), and a Windows base plane reading them (an overlay reports
+> none for a file it never saw set).
+
 > **A file removed while open over NFSv4 was reclaimed at once, and the client renamed it aside: fixed (2026-11-08,
 > §4.6 NFSv4 state; A-260).** An NFSv4 open held nothing in the volume, so a REMOVE of an open file reclaimed it (its
 > handle answered `NFS4ERR_STALE`), and the server never answered `OPEN4_RESULT_PRESERVE_UNLINKED`, so the Linux client
@@ -1114,7 +1124,8 @@
 > (`docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt`) with its reason, the four Windows
 > features the drive does not keep (attribute bits, security descriptors, reparse points and symbolic links, named
 > streams). The fifth, a settable creation time, was built in A-259 (2026-11-08): the drive reports the volume's
-> birth time and keeps the one `SetFileTime` sets, and `t/base/06.t` case 5 came off the list (374 to 373 entries). The suites found four Win32 bugs in `crates/bridge-winfsp`, each fixed with a failing
+> birth time and keeps the one `SetFileTime` sets, and `t/base/06.t` case 5 came off the list (374 to 373 entries). The
+> attribute bits followed in A-262 (2026-11-08), their 18 cases off (373 to 355), leaving three stated differences. The suites found four Win32 bugs in `crates/bridge-winfsp`, each fixed with a failing
 > test first (`crates/cli/tests/winfsp_semantics.rs`; `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`):
 > a move not asked to replace replaced a taken name (and one asked replaced a directory), a directory holding a file
 > answered its removal with success, `SetFileTime` kept nothing, and an open with `TRUNCATE_EXISTING` kept the file.
