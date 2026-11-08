@@ -5581,6 +5581,12 @@ round asked no one and it waited out a whole election timeout. No late grant was
   of 10 won their first pre-election.
 [Bug record](../bugs/2026-09-29-a-campaign-asked-no-one-while-a-session-was-out.md).
 
+**Open (A-251, raft-chaos): a holder's page can leave out a copy it holds and still count as its promise.** A successor counts a
+complete answer as a promise for every object not listed, so an omitted copy reads as a copy not held, and an older record can
+be adopted. **Fixed so far, step (c):** a copy the holder cannot promise (`HostPromise::unpromised`, record
+`docs/bugs/2026-11-08-a-holder-that-could-not-promise-a-copy-read-as-holding-nothing.md`). Still owed: the counting rule as a pure
+`crates/db` function with a paged model and an omission nemesis, then a per-object question by name, then the process test.
+
 **Open — one session per peer is lent exclusively.** A discovery page, a coordinator dispatch, a forward and
 a campaign each take the whole session out of its link, though the transport runs several exchanges on one
 session at once (`Endpoint::begin`/`drive`). Campaigns and forwards now wait for it. Replication rounds and
