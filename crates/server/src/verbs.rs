@@ -12290,6 +12290,145 @@ mod tests {
     }
   }
 
+  /// Measurement (not a gate): what a mutating verb's barrier costs as the one volume a shard hosts grows (§4.3, §4.8).
+  /// The barrier is usually a delta (A-68), whose cost is its changes. Once the deltas since the last checkpoint reach
+  /// the checkpoint's size, or the log has no room, the publish is instead a checkpoint of every volume, in the one
+  /// call. For each shape (`files` files of `bytes` bytes in one volume), this prints:
+  /// - a forced `publish_checkpoint`, best of [`ROUNDS`];
+  /// - the publishes of one 64-byte overwrite each, until one is a checkpoint: their count, their median and worst
+  ///   delta, and the checkpoint publish's own cost.
+  ///
+  /// A publish was a checkpoint when the log's tail is back at its start after it. Wall-clock, best-of-N (BENCHMARKS
+  /// discipline). Run: `cargo test --release -p slates-server --lib a_barriers_cost_against_the_shards_size -- --ignored
+  /// --nocapture`.
+  #[test]
+  #[ignore = "measurement, not a gate; prints a barrier's delta and checkpoint cost vs the shard's files and bytes"]
+  #[allow(clippy::cast_precision_loss)]
+  fn a_barriers_cost_against_the_shards_size() {
+    /// Shape: the best of this many forced checkpoints is reported.
+    const ROUNDS: usize = 3;
+    /// Shape: the overwrite each measured barrier publishes, small against every file.
+    const OVERWRITE: usize = 64;
+    /// Shape: the most overwrites tried before a checkpoint comes; past it, the count is reported as reached.
+    const MOST_WRITES: usize = 400_000;
+    for (files, bytes) in [
+      (1_000usize, 64usize),
+      (1_000, 16_384),
+      (4_000, 64),
+      (4_000, 16_384),
+      (16_000, 64),
+      (16_000, 16_384),
+    ] {
+      let line = crate::daemon::audit_on_shard_configured(
+        move |state| {
+          let principal = Principal::Uid { uid: 1234 };
+          let limit = u64::try_from(files.saturating_mul(bytes.max(4096)).saturating_mul(2))
+            .unwrap_or(u64::MAX)
+            .saturating_add(64 << 20);
+          let reply = super::dispatch(
+            state,
+            1,
+            &principal,
+            super::RequestBody::Create {
+              name: "sized".to_owned(),
+              size: super::SizeClass::Bounded { limit },
+              names: super::NamePolicy::Exact,
+              require_locked: false,
+              base: None,
+            },
+          );
+          let super::ReplyBody::Created { id } = reply else {
+            panic!("{reply:?}")
+          };
+          let handle = *state.by_id.get(&super::to_db_volume(id)).unwrap();
+          let content = vec![b'a'; bytes];
+          let first = {
+            let super::ShardState { store, volumes, .. } = &mut *state;
+            let slot = volumes.get_mut(handle).unwrap();
+            let root = slot.volume.root_inode(store).unwrap();
+            let mut first = None;
+            for n in 0..files {
+              let file = slot
+                .volume
+                .create_file_no(store, root, &format!("f{n:06}"), 0o644)
+                .unwrap();
+              slot.volume.write(store, file, 0, &content).unwrap();
+              first.get_or_insert(file);
+            }
+            first.unwrap()
+          };
+          super::publish_shard(state).expect("the shard publishes");
+          let mut checkpoint = u64::MAX;
+          for _ in 0..ROUNDS {
+            let t0 = slates_machine::clock::monotonic_ns();
+            super::publish_checkpoint(state).expect("a checkpoint publishes");
+            checkpoint = checkpoint.min(slates_machine::clock::monotonic_ns().saturating_sub(t0));
+          }
+          let tail = |state: &super::ShardState| {
+            state
+              .journal
+              .dead_ranges(usize::MAX, usize::MAX)
+              .map_or(0, |dead| dead.log_past_tail.0)
+          };
+          let mut deltas: Vec<u64> = Vec::new();
+          let mut checkpointed = None;
+          for n in 0..MOST_WRITES {
+            {
+              let super::ShardState { store, volumes, .. } = &mut *state;
+              let slot = volumes.get_mut(handle).unwrap();
+              let fill = [u8::try_from(n % 251).unwrap(); OVERWRITE];
+              slot.volume.write(store, first, 0, &fill).unwrap();
+            }
+            let t0 = slates_machine::clock::monotonic_ns();
+            super::publish_shard(state).expect("the shard publishes");
+            let took = slates_machine::clock::monotonic_ns().saturating_sub(t0);
+            if tail(state) == 0 {
+              checkpointed = Some(took);
+              break;
+            }
+            deltas.push(took);
+          }
+          deltas.sort_unstable();
+          let median = deltas.get(deltas.len() / 2).copied().unwrap_or(0);
+          let worst = deltas.last().copied().unwrap_or(0);
+          format!(
+            "barrier: {files} files of {bytes} B | forced checkpoint best {checkpoint} ns ({:.0} ns/file) | {} deltas \
+             before a checkpoint, median {median} ns, worst {worst} ns | the checkpoint publish {}",
+            checkpoint as f64 / files as f64,
+            deltas.len(),
+            checkpointed.map_or_else(
+              || format!("not reached in {MOST_WRITES}"),
+              |ns| format!("{ns} ns")
+            ),
+          )
+        },
+        move |config| {
+          let cap = files.saturating_add(files / 4).saturating_add(64);
+          config.store.max_inodes = config.store.max_inodes.max(cap);
+          config.store.max_dirs = config.store.max_dirs.max(cap);
+          config.store.max_dir_blocks = config.store.max_dir_blocks.max(cap);
+          config.store.max_chunks = config.store.max_chunks.max(
+            cap
+              .saturating_mul(bytes.div_ceil(4096).max(1))
+              .saturating_mul(2),
+          );
+          let cap64 = u64::try_from(cap).unwrap_or(u64::MAX);
+          config.store.metadata_class_bytes = config
+            .store
+            .metadata_class_bytes
+            .max(cap64.saturating_mul(1 << 12));
+          config.reserve_per_shard = config.reserve_per_shard.max(
+            cap64
+              .saturating_mul(u64::try_from(bytes.max(4096)).unwrap_or(u64::MAX))
+              .saturating_mul(4)
+              .saturating_add(256 << 20),
+          );
+        },
+      );
+      eprintln!("{line}");
+    }
+  }
+
   /// §4.2 (the resource vector's inode dimension; GAPS 2026-10-06). Do: on one shard, create four bounded volumes
   /// whose quotas together take the bytes the shard can admit. Expect: all four are admitted, so the inode allowances
   /// of volumes that fill the arena fit the version slab. Before, each volume asked quota ÷ `size_of::<Inode>()`

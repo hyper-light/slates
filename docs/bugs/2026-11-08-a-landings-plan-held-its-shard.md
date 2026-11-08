@@ -49,7 +49,11 @@ An earlier cut of the naming read such a step as "blocked in a call" by its CPU 
 preempted.
 
 So the stall was (b): a live, starved shard behind the client's fixed wall-second deadline, which is the clients' (A-232).
-Open beside it: 17 of the 62 waits held 100 to 164 ms of the shard's own CPU in at most 8 steps. That is one poll of
-around 100 ms, which the shard's wake estimate (4 to 57 µs) does not explain. A profile of a quiet run puts the
-candidate in a mutating verb's publication: a checkpoint of every volume (`publish_checkpoint`, `encode_head`), whose
-cost is the shard's size. It is not yet measured as that poll.
+Beside it: 17 of the 62 waits held 100 to 164 ms of the shard's own CPU in at most 8 steps. The shard's wake estimate (4
+to 57 µs) does not explain that. Two suspects read from a profile were wrong. A mutating verb's checkpoint costs about
+1.4 to 1.9 ms at these 1,000 files in debug, about 100 times too small (GAPS, "A checkpoint costs the whole shard"). The
+snapshot's log walk is a real defect, fixed separately, but 30 of 124 waits still held 100 ms or more without it
+(`2026-11-08-a-snapshot-decoded-the-log-it-released.md`). A per-poll CPU timer then named the poll:
+`return_dead_recovery`, reached from `reap_loop`'s tick through `seal_idle_content` and `purge_if_idle`, 115 to 171 ms of
+CPU in one poll. Perf's slicing of that give-back (`a30e4209` on `agents/perf-b3`) took it to 0 of 411 named waits at 100
+ms or more, the highest 78 ms, on the same test beside the same 144 spinners.
