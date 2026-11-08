@@ -13442,6 +13442,48 @@ fn a_taken_over_green_serves_every_version_and_accepts_new_work_on_the_successor
 /// Shape: how long a test watches for a work's head to be placed: several of the owner's seal rounds.
 const WORK_SEAL_WATCH: Duration = Duration::from_nanos(4 * LIVENESS_BUDGET_NS);
 
+/// A-255's route (§4.16 failure matrix, RIFL §3 "retry rendezvous"): a resend names only its work, so what a work's
+/// successor knows of the work's green is what its catalog register carries, and that holds only if a work's catalog is
+/// placed at all. Do: three nodes at `f = 1`; on a, a green, a work and a plain volume; watch each catalog over several
+/// of the owner's placement rounds. Expect: both placed. The plain volume's is the non-vacuity check.
+#[test]
+fn a_works_catalog_is_placed_like_a_plain_volumes() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut owner_client = Client::connect(daemons[0].instance());
+  let (_green, work) = green_with_work(&mut owner_client, "catalog-work");
+  let ReplyBody::Created { id: plain } = owner_client.call(&scratch("catalog-plain")) else {
+    panic!("the plain volume was refused");
+  };
+  let everyone: Vec<&Daemon> = daemons.iter().collect();
+  let plain_placed = poll_until(&everyone, PLACEMENT_DEADLINE, || {
+    daemons[0].fleet_head_placed(ObjectId(plain.bytes).catalog())
+  });
+  let work_placed = poll_until(&everyone, WORK_SEAL_WATCH, || {
+    daemons[0].fleet_head_placed(ObjectId(work.bytes).catalog())
+  });
+  drop(everyone);
+  drop(owner_client);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!("catalog placed: plain {plain_placed}, work {work_placed}");
+  assert!(plain_placed, "a plain volume's catalog is placed");
+  assert!(work_placed, "a work's catalog is placed");
+}
+
 /// §4.16 "Commit", A-252: "nothing runs twice after a takeover" rests on a work never coming back on a successor, since
 /// a work come back with no completion record would run a resend again, and an older one would make a different
 /// increment and so a second version. Do: three nodes at `f = 1`; on a, a green and a work; through b's client an edit
