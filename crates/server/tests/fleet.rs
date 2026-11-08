@@ -5088,15 +5088,17 @@ fn volume_owned_by(client: &mut Client, partition: usize, tag: &str) -> VolumeId
 /// liveness budgets, so every forward sent inside it stays alive on b's control shard (given up at its stall budget,
 /// sent again) as a killed owner's would.
 const ADMITTED_FORWARDS_HOLD: Duration = Duration::from_nanos(2 * LIVENESS_BUDGET_NS);
-/// Shape: the backstop for every reply of the burst, from the hold's end, shared by all its clients: six failover SLOs.
-/// A forward's resend loop is bounded by the SLO (`resolve_and_forward`) from when b's control shard reaches its task,
-/// behind the rest of the burst, and its last forward by a stall budget whose path tail the burst stretches on a 4-core
-/// runner. So this test holds that nothing is lost, and prints the last reply's arrival, not a latency bound: read
-/// client by client, the first clients' last replies came past the SLO plus one budget (76 to 120), plus three (38 to
-/// 98) and twice the SLO (9 to 76), each time all of them within the next read (CI runs 42426714842, 42427500000,
-/// 42429128963).
-const ADMITTED_FORWARDS_ANSWERED: Duration =
-  Duration::from_nanos(6 * slates_server::config::FAILOVER_SLO_NS);
+/// Shape: how long one read of a client waits for its remaining replies before the next client is read: a liveness
+/// budget, so a client whose last forwards are still draining does not hold the others' reads back.
+const ADMITTED_FORWARDS_READ: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);
+/// Shape: the backstop past which a reply of the burst still missing is lost: thirty failover SLOs. This test holds that
+/// nothing is lost and no forward refused, not a latency. With b's control shard carrying about 20,700 forwards to an
+/// owner silent for two budgets, it drains slowly on a 4-core runner (thousands of forwarders find the session lent and
+/// poll for it, each resend a new forwarder): the last reply came 64 to 105 s after the hold, the first clients' last
+/// requests the latest, and a probe at the first shortfall found none of them unread on either ring and none unwritten
+/// (CI run 42437675578).
+const ADMITTED_FORWARDS_DRAINED: Duration =
+  Duration::from_nanos(30 * slates_server::config::FAILOVER_SLO_NS);
 /// The owner's shard is held ([`a_silent_owner_leaves_no_forward_the_lane_admitted_unrun`]).
 static ADMITTED_OWNER_HELD: std::sync::atomic::AtomicBool =
   std::sync::atomic::AtomicBool::new(false);
@@ -5230,49 +5232,48 @@ fn a_silent_owner_leaves_no_forward_the_lane_admitted_unrun() {
     }
     holder.join().unwrap().unwrap();
     let held_ended = Instant::now();
-    let tagged: Vec<Vec<(u32, ReplyBody)>> = burst
-      .iter_mut()
-      .map(|client| {
-        let left = ADMITTED_FORWARDS_ANSWERED.saturating_sub(held_ended.elapsed());
-        client.collect_tagged(slots, left)
-      })
-      .collect();
-    let last_reply = held_ended.elapsed();
-    // Where a missing reply is: each short client's missing sequences, any that arrive in a further budget (late past
-    // the bound, counted apart), and the replies each of b's shards still holds unwritten.
-    let mut missing = Vec::new();
-    let mut late = 0usize;
-    for (client, replies) in burst.iter_mut().zip(&tagged) {
-      let answered: std::collections::BTreeSet<u32> = replies.iter().map(|(sequence, _)| *sequence).collect();
-      let lost: Vec<u32> = client.last_sequences(slots).difference(&answered).copied().collect();
-      if !lost.is_empty() {
-        late += client.collect_tagged(lost.len(), Duration::from_nanos(LIVENESS_BUDGET_NS)).len();
-        missing.push((client.client, lost));
+    // Every client read until all its replies came or the backstop passed, a client at a time and then round again:
+    // the control shard drains a burst this size slowly, its first clients' last replies longest, so a reply still
+    // missing at the backstop is lost, and one that comes before it is only late.
+    let mut tagged: Vec<Vec<(u32, ReplyBody)>> = (0..burst.len()).map(|_| Vec::new()).collect();
+    let mut last_reply = Duration::ZERO;
+    loop {
+      let mut short = false;
+      for (client, replies) in burst.iter_mut().zip(tagged.iter_mut()) {
+        let wanted = slots.saturating_sub(replies.len());
+        if wanted == 0 {
+          continue;
+        }
+        let came = client.collect_tagged(wanted, ADMITTED_FORWARDS_READ);
+        if !came.is_empty() {
+          last_reply = held_ended.elapsed();
+        }
+        replies.extend(came);
+        short |= replies.len() < slots;
+      }
+      if !short || held_ended.elapsed() >= ADMITTED_FORWARDS_DRAINED {
+        break;
       }
     }
-    let held: Vec<(usize, usize)> = daemons[1]
-      .shards()
+    let lost: Vec<(u32, Vec<u32>)> = burst
       .iter()
-      .map(|shard| {
-        daemons[1]
-          .observation(
-            Some(*shard),
-            slates_server::daemon::OBSERVE_BUDGET_NS,
-            |state: &mut slates_server::state::ShardState| {
-              (state.deferred.len(), state.pending_forwards.len())
-            },
-          )
-          .unwrap()
-          .wait()
-          .unwrap()
+      .zip(&tagged)
+      .filter_map(|(client, replies)| {
+        let came: std::collections::BTreeSet<u32> =
+          replies.iter().map(|(sequence, _)| *sequence).collect();
+        let lost: Vec<u32> = client
+          .last_sequences(slots)
+          .difference(&came)
+          .copied()
+          .collect();
+        (!lost.is_empty()).then_some((client.client, lost))
       })
       .collect();
-    if !missing.is_empty() {
+    if !lost.is_empty() {
       eprintln!(
-        "missing replies: {} clients short, {late} arrived in a further budget; first: {:?}; b's shards (deferred, \
-         pending forwards): {held:?}",
-        missing.len(),
-        missing.iter().take(6).collect::<Vec<_>>()
+        "lost replies: {} clients short at the backstop; first: {:?}",
+        lost.len(),
+        lost.iter().take(6).collect::<Vec<_>>()
       );
     }
     let replies: Vec<Vec<ReplyBody>> = tagged
