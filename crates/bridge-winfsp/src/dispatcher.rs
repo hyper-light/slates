@@ -435,7 +435,7 @@ fn replay_terminal(
     TRANSACT_BATCH,
     response,
     &mut [],
-    &mut owned.private.intents,
+    &owned.private.intents,
   )?;
   Ok(refused(response))
 }
@@ -463,7 +463,7 @@ fn settle(
           TRANSACT_BATCH,
           saved,
           &mut [],
-          &mut owned.private.intents,
+          &owned.private.intents,
         )?;
       } else if matches!(
         request.kind(),
@@ -485,7 +485,7 @@ fn settle(
           TRANSACT_BATCH,
           &response,
           &mut [],
-          &mut owned.private.intents,
+          &owned.private.intents,
         )?;
       }
     } else {
@@ -509,7 +509,7 @@ fn settle(
         TRANSACT_BATCH,
         response,
         &mut [],
-        &mut owned.private.intents,
+        &owned.private.intents,
       )?;
       if let Some((_, context)) =
         inflight::opened_context(response).map_err(WinFspError::Capture)?
@@ -618,7 +618,7 @@ fn receive_loop(
       TRANSACT_BATCH,
       &[],
       receiving.buffer_mut(),
-      &mut owned.private.intents,
+      &owned.private.intents,
     )?;
     // Keep a batch taken while stopping intact for the successor, without invoking another operation on this owner.
     if is_stopped(&stopped) {

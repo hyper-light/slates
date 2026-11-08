@@ -1844,7 +1844,7 @@ impl Mounted {
     wake: Waker,
     inherited: Option<(Record, OwnedHandle, OwnedHandle)>,
     purge_intents: crate::purge_intents::Sender,
-    private_opens: &mut crate::purge_intents::Intents,
+    private_opens: &crate::purge_intents::Intents,
   ) -> Result<Mounted, WinFspError> {
     let drive: [u16; 2] = mount_point
       .encode_utf16()
@@ -2279,7 +2279,7 @@ fn run_mount(
   };
   let confirmations = requests.clone();
   // The purge-intent slot: the mount thread publishes into it, and the receive worker reads it.
-  let (purge_intents, mut private_opens) = match crate::purge_intents::channel() {
+  let (purge_intents, private_opens) = match crate::purge_intents::channel() {
     Ok(channel) => channel,
     Err(error) => {
       report(Outcome::Mounted(Err(error)));
@@ -2337,7 +2337,7 @@ fn run_mount(
       wake.clone(),
       inherited,
       purge_intents,
-      &mut private_opens,
+      &private_opens,
     )?;
     let value = ledger
       .memory()
