@@ -787,6 +787,56 @@ fn sparse_seek_and_copy(root: &Path) {
   std::fs::remove_file(&sparse).unwrap();
 }
 
+/// A-260: through the kernel's own client, a file unlinked while open keeps serving through its descriptor at a link
+/// count of zero, and the client renames nothing aside (`.nfs*`) to keep it, since the server answered its OPEN with
+/// `OPEN4_RESULT_PRESERVE_UNLINKED` and keeps the file itself; once closed, it is gone. Before, the client
+/// silly-renamed every such file, and the name stayed in the directory until the close (a name a landing would carry).
+#[allow(clippy::disallowed_methods)] // file calls through the kernel mount under test (RAM-backed)
+fn an_unlinked_open_file_keeps_serving_with_no_silly_rename(root: &Path) {
+  use std::io::{Read, Seek, SeekFrom, Write};
+  use std::os::unix::fs::MetadataExt;
+  let dir = root.join("unlinked");
+  std::fs::create_dir(&dir).unwrap();
+  let path = dir.join("held.txt");
+  let contents = b"held open through its unlink\n";
+  let mut file = std::fs::OpenOptions::new()
+    .read(true)
+    .write(true)
+    .create_new(true)
+    .open(&path)
+    .unwrap();
+  file.write_all(contents).unwrap();
+  file.sync_all().unwrap();
+  std::fs::remove_file(&path).unwrap();
+  let names = |dir: &Path| -> Vec<String> {
+    std::fs::read_dir(dir)
+      .unwrap()
+      .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+      .collect()
+  };
+  assert_eq!(
+    names(&dir),
+    Vec::<String>::new(),
+    "the unlinked open file left no name behind (a silly rename's .nfs* would be here)"
+  );
+  assert_eq!(
+    file.metadata().unwrap().nlink(),
+    0,
+    "the unlinked open file reports a link count of zero"
+  );
+  file.seek(SeekFrom::Start(0)).unwrap();
+  let mut read = Vec::new();
+  file.read_to_end(&mut read).unwrap();
+  assert_eq!(read, contents, "the unlinked open file reads its bytes");
+  drop(file);
+  assert_eq!(
+    names(&dir),
+    Vec::<String>::new(),
+    "nothing appears at the close"
+  );
+  std::fs::remove_dir(&dir).unwrap();
+}
+
 /// §4.6 A-35: the Linux kernel's NFSv4.1 and NFSv4.2 clients mount a daemon volume through its
 /// capability and run ordinary file calls through it; NFSv3 reads what the kernel wrote.
 #[test]
@@ -805,6 +855,7 @@ fn the_linux_kernel_nfsv4_client_mounts_and_works_a_volume() {
     {
       let mounted = kernel_mount(&source, port, minor);
       exercise(&mounted.path, &payload);
+      an_unlinked_open_file_keeps_serving_with_no_silly_rename(&mounted.path);
       large_sequential_writes_round_trip(&mounted.path);
       #[cfg(target_os = "linux")]
       if minor == 2 {

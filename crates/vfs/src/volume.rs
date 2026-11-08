@@ -5374,7 +5374,7 @@ impl Volume {
   /// Each recorded attachment holding references, with its share by inode and how many of those references are open
   /// handles, in owner and inode order: what the recovery image carries, so a surviving attachment's kernel references
   /// and opens are given back to it after a restart (A-61, A-152). An owner this process alone knows is left out: its
-  /// references die with the process.
+  /// references die with the process. So are NFSv4 state's holds (A-260), whose record is the partition's journal.
   pub(crate) fn attachment_references(&self) -> Vec<crate::recover::AttachmentReferences> {
     self
       .attachment_refs
@@ -5391,7 +5391,7 @@ impl Volume {
             })
             .collect(),
         }),
-        RefOwner::Process(_) => None,
+        RefOwner::Process(_) | RefOwner::NfsState(_) => None,
       })
       .collect()
   }
@@ -5408,8 +5408,9 @@ impl Volume {
   }
 
   /// Settles references after a recovery (A-61): every recorded attachment whose record did not survive
-  /// (`survives` answers false for its id) gives its share back, and every orphan then left with no reference is
-  /// reclaimed — its last holder died with the process. Returns the owners swept and the orphans reclaimed.
+  /// (`survives` answers false for its id) gives its share back, as do NFSv4 state's holds made through one (A-260),
+  /// and every orphan then left with no reference is reclaimed — its last holder died with the process. Returns the
+  /// owners swept and the orphans reclaimed.
   pub fn settle_recovered_references(
     &mut self,
     store: &mut Store,
@@ -5419,7 +5420,9 @@ impl Volume {
       .attachment_refs
       .keys()
       .filter(|owner| match owner {
-        RefOwner::Attachment(id) => !survives(*id),
+        // NFSv4 state's holds were taken again from the partition's journal before this settle (A-260): they stay
+        // while their attachment's record does.
+        RefOwner::Attachment(id) | RefOwner::NfsState(id) => !survives(*id),
         RefOwner::Process(_) => true,
       })
       .copied()

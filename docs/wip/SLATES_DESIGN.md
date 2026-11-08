@@ -2748,6 +2748,23 @@ therefore one implementation shared by both versions.
     client, session and state id therefore names an instance no earlier life used.
   - Kept records come back even if a smaller bound was derived since; only new state is refused until
     the tables are back under their bounds.
+- **An open holds its file (A-260, built 2026-11-08).** Every open and every delegation holds one reference on its
+  file in the volume, owned by `RefOwner::NfsState` of the attachment whose handle made it. It is taken when the
+  record of the open or grant commits and given back when the record of its end does: a CLOSE, FREE_STATEID,
+  DELEGRETURN, a revocation, or a client's purge (its lease lapsed, it rebooted, it was destroyed). A file removed while
+  one is held keeps serving by its handle at a link count of zero, and its space comes back at the last end (POSIX's
+  unlink-while-open). The server promises this with `OPEN4_RESULT_PRESERVE_UNLINKED` (RFC 8881 §18.16.4), and the
+  Linux client then sends the REMOVE instead of renaming the file aside to `.nfs*` (kernel commit 43245eca, 2022), a
+  name a landing would carry. The standalone server's opens hold nothing, so it makes no such promise.
+  - The partition's journal is these holds' only record. The recovery image carries none; a recovery takes them again
+    from the journaled opens and delegations before it settles references and reclaims the files no one holds
+    (`nfs_state::hold_recovered`). So a removed open file is served across a restart, and one whose last open ended
+    before the restart is reclaimed by it.
+  - An attachment's end gives back every hold made through it (`nfs_state::release_attachment`): no request is served
+    under it again. Its opens stay in the file state until their client closes them or is purged, and those
+    give-backs find nothing left to give.
+  - A hold is bounded by the state's own bounds (the opens and the delegations it may record). A removed file's space
+    is charged at the REMOVE, as for any reference (§4.2), and freed at the reclaim.
 - **Open state** (§9, kept at the file's owner): one state id per (client, open-owner, file, **acting uid**),
   upgraded and advanced by a reopen;
   share reservations enforced across owners (`NFS4ERR_SHARE_DENIED`); a state id serves only its own
@@ -16068,6 +16085,41 @@ Applied in the same change to: §4.7 (the rendezvous's status), GAPS, `crates/cl
 - **Proven** on this Mac by two tests that failed on the old order: `a_refused_second_anchor_leaves_the_live_instance_its_segment_and_its_bytes`
   (across processes: a live anchor and its daemon, a second anchor refused, the daemon killed, its successor adopting the
   segment by name and reading the file back) and `a_refused_second_daemon_leaves_the_live_ones_segment_in_place`.
+
+### A-260 — An NFSv4 open or delegation holds its file, so a file removed while open is preserved (accepted 2026-11-08)
+Applied in the same change to: §4.6 (NFSv4 state, "An open holds its file"), GAPS, `docs/wip/conformance.md`, the
+NFSv4 pjdfstest list (`docs/wip/conformance/expected-failures/native-linux-nfs4.pjdfstest.txt`, `tests/unlink/14.t:4`
+struck), `crates/vfs` (`RefOwner::NfsState` and its settle), `crates/bridge-nfs` (`files::Holding`, `FileState`'s and
+`Delegations`' queues, `Backend::preserves_unlinked`, OPEN's result flags), and `crates/server` (`nfs_state::hold`,
+`hold_recovered`, `release_attachment`; the recovery and `end_attachment` call them).
+- **What was wrong.** An NFSv4 open lived only in the owner's file state and held nothing in the volume, so a REMOVE
+  reclaimed an open file at once and its handle answered `NFS4ERR_STALE`. The Linux client keeps POSIX's
+  unlink-while-open by renaming such a file aside (`.nfs<fileid><counter>`) unless the server answers its OPEN with
+  `OPEN4_RESULT_PRESERVE_UNLINKED`, which this server never did: every tool that removes a file it holds open (git,
+  editors, sqlite) left a `.nfs*` name in the volume until the close, a name a landing would carry. pjdfstest listed it
+  as `unlink/14.t:4` (NFS-OPEN).
+- **The rule.** Every open and delegation holds one volume reference on its file from the commit of its record to the
+  commit of its end's, owned by `RefOwner::NfsState(attachment)`. The journal is the holds' only record, and a
+  recovery takes them again from it before reclaiming unheld files. An attachment's end gives its holds back. The OPEN
+  reply carries `OPEN4_RESULT_PRESERVE_UNLINKED` from a server whose backend holds (the daemon's), and not from the
+  standalone server's.
+- **Why a third owner kind.** A kernel's references (a FUSE mount's, owned by its attachment) are carried in the
+  recovery image and settled by their attachment's survival; NFSv4 state is journaled and must be counted from its
+  journal. One count for both would let a recovery double a hold, or reclaim a file a FUSE kernel still holds.
+- **What it does not change.** The wire of the state extension procedures and of the journaled records, the recovery
+  image, NFSv3 (stateless: its client's silly rename stays, NFS-OPEN on the NFSv3 lists), and how a client's state ends.
+- **Proven** by `a_file_removed_while_open_over_nfsv4_serves_until_its_last_close`,
+  `..._serves_across_a_daemon_restart` and `..._is_freed_when_its_clients_lease_lapses`
+  (`crates/server/tests/recovery.rs`, each red on the old server: `NFS4ERR_STALE` at the first GETATTR by handle; the
+  restart one red again with the recovery's re-take removed, and the lease one with a purge's give-backs removed, its
+  file's 65,536 bytes kept), `every_open_and_delegation_takes_one_hold_and_gives_it_back_at_its_end`
+  (`crates/bridge-nfs/tests/v4_delegation.rs`), and through the Linux kernel's v4.1 and v4.2 clients by
+  `an_unlinked_open_file_keeps_serving_with_no_silly_rename` (`crates/server/tests/nfs_v4_kernel.rs`; with the
+  daemon's promise turned off, the kernel's client renamed the unlinked open file to `.nfs000100000000000b00000009`,
+  2026-11-08, Linux 7.2), the unlinked-open leg of `nfsv4_opens_and_locks_survive_a_daemon_restart`
+  (`crates/cli/tests/nfs_v4_restart.rs`, across a `SIGKILL`), and pjdfstest's `unlink/14.t:4` over the NFSv4 transport
+  (6,972 passed and 1,798 failed against the struck list, every failure listed). Record:
+  `docs/bugs/2026-11-08-an-nfsv4-file-removed-while-open-was-reclaimed-at-once.md`.
 
 ### A-259 — The WinFsp drive reports and keeps the creation time a caller sets (accepted 2026-11-08)
 Applied in the same change to: §4.6 (the Windows conformance status and its stated differences), A-53 (amended),

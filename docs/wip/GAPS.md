@@ -1,5 +1,15 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A file removed while open over NFSv4 was reclaimed at once, and the client renamed it aside: fixed (2026-11-08,
+> §4.6 NFSv4 state; A-260).** An NFSv4 open held nothing in the volume, so a REMOVE of an open file reclaimed it (its
+> handle answered `NFS4ERR_STALE`), and the server never answered `OPEN4_RESULT_PRESERVE_UNLINKED`, so the Linux client
+> renamed every such file to `.nfs*` until the close (pjdfstest `unlink/14.t:4`; git, editors and sqlite do it, and a
+> landing would carry the name). Every open and delegation now holds its file, from its record's commit to its end's
+> (a CLOSE, a return, a revocation, a client's purge), the hold taken again from the journal at a recovery and given
+> back at its attachment's end. Red tests: a removed open file's GETATTR answered `NFS4ERR_STALE`; now it serves at nlink
+> 0 with its bytes until its last close, also across a daemon restart, and its 64 KiB come back at the close or at its
+> client's lease lapse. Still owed: NFSv3 has no open, so its clients' silly renames stay (NFS-OPEN on the NFSv3 lists).
+
 > **A version appended before its owner restarted never committed: fixed (2026-11-07, §4.16 Commit, AUD-11;
 > A-246).** A restarted owner rebuilt its greens from their chains, but not the merge records
 > it still owed its holders (they lived in memory), so a version appended before the crash and not yet placed was never
