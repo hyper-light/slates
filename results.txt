@@ -1,0 +1,34 @@
+runner ubuntu-latest, 4 CPUs, commit 064d9ac5
+== a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover run 1 exit 101
+thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (7044) panicked at crates/cli/tests/live_chaos.rs:1130:5:
+chaos a candidate's store destroyed mid-stream: NoLoss (successor): no survivor served the volume within the fleet wait
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover --- FAILED
+      1 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 2.464582788s
+      1 chaos a candidate's store destroyed mid-stream: chaos-replaced-c-7043 refused the owner: {}
+      1 chaos a candidate's store destroyed mid-stream: chaos-replaced-b-7043 refused the owner: {}
+      1 chaos a candidate's store destroyed mid-stream: chaos-replaced-a-7043 refused the owner: {}
+      1 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-7043 destroyed at 497.090827ms
+      1 chaos a candidate's store destroyed mid-stream: NoLoss (successor): no survivor served the volume within the fleet wait
+== a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover run 2 exit 101
+thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (7646) panicked at crates/cli/tests/live_chaos.rs:1130:5:
+chaos a candidate's store destroyed mid-stream: NoLoss (successor): no survivor served the volume within the fleet wait
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover --- FAILED
+      1 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 2.448928185s
+      1 chaos a candidate's store destroyed mid-stream: chaos-replaced-c-7645 refused the owner: {}
+      1 chaos a candidate's store destroyed mid-stream: chaos-replaced-b-7645 refused the owner: {}
+      1 chaos a candidate's store destroyed mid-stream: chaos-replaced-a-7645 refused the owner: {}
+      1 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-b-7645 destroyed at 458.341247ms
+      1 chaos a candidate's store destroyed mid-stream: NoLoss (successor): no survivor served the volume within the fleet wait
+== a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover run 3 exit 101
+thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (8213) panicked at crates/cli/tests/live_chaos.rs:1130:5:
+chaos a candidate's store destroyed mid-stream: NoLoss (successor): no survivor served the volume within the fleet wait
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover --- FAILED
+      1 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 2.135450049s
+      1 chaos a candidate's store destroyed mid-stream: chaos-replaced-c-8212 refused the owner: {}
+      1 chaos a candidate's store destroyed mid-stream: chaos-replaced-b-8212 refused the owner: {}
+      1 chaos a candidate's store destroyed mid-stream: chaos-replaced-a-8212 refused the owner: {}
+      1 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-b-8212 destroyed at 360.627191ms
+      1 chaos a candidate's store destroyed mid-stream: NoLoss (successor): no survivor served the volume within the fleet wait
