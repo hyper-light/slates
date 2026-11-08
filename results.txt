@@ -1,0 +1,49 @@
+green on macos-latest, 3 CPUs, Sun Nov  8 14:57:35 UTC 2026, head 7eb24295968bca1889033511c62321eb9c92696d
+== run 1 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 6.30s
+
+== run 2 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 6.46s
+
+== run 3 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.26s
+
+== run 4 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.49s
+
+== run 5 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 5.19s
+
+== run 6 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.24s
+
+== run 7 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 5.92s
+
+== run 8 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 6.16s
+
+== run 9 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 5.27s
+
+== run 10 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 5.36s
+
+== run 11 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 4.88s
+
+== run 12 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 6.91s
+
+== run 13 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 4.07s
+
+== run 14 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 6.47s
+
+== run 15 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.64s
+
+== run 16 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.63s
+
