@@ -1,0 +1,8 @@
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' failed - Err(Error { kind: ToolExecError, message: "command did not execute successfully (status code exit code: 2): \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Tools\\\\MSVC\\\\14.51.36231\\\\bin\\\\HostX64\\\\x64\\\\cl.exe\" \"-nologo\" \"-MD\" \"-Z7\" \"-Brepro\" \"-WX\" \"-W4\" \"-FoD:\\\\a\\\\slates\\\\slates\\\\target\\\\debug\\\\build\\\\aws-lc-sys-0bf3c6c5352b74c6\\\\out\\\\out-stdalign_check\\\\e1bacabfea35bee3-stdalign_check.o\" \"-c\" \"D:\\\\a\\\\slates\\\\slates\\\\vendor\\\\aws-lc-sys\\\\aws-lc\\\\tests\\\\compiler_features_tests\\\\stdalign_check.c\"" }).
+test a_files_attributes_are_kept_and_its_read_only_state_refuses_a_delete ... slates anchor: instance wsattributes6884 up; daemon pid 7704; 2 shards
+thread 'a_files_attributes_are_kept_and_its_read_only_state_refuses_a_delete' (6880) panicked at crates\cli\tests\winfsp_semantics.rs:607:3:
+assertion `left == right` failed: a file created hidden is kept hidden, and archived
+  left: 128
+ right: 34
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.63s
+exit 101
