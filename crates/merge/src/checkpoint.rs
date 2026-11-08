@@ -29,7 +29,7 @@ use crate::special::SpecialNode;
 /// origin) is refused at the first word rather than misread.
 const MAGIC: u32 = u32::from_le_bytes(*b"GCKP");
 /// Format: the checkpoint encoding's version; a decoder refuses any other.
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 /// Format: an accepted increment's identity, a BLAKE3 hash.
 const IDENTITY_BYTES: usize = 32;
 /// Format: the byte that marks a value present (a key whose value at the checkpoint is set).
@@ -69,6 +69,9 @@ pub struct Checkpoint {
   pub specials: Vec<Changed<String, SpecialNode>>,
   /// Extended attributes changed since the origin, keyed by `(path, name)`.
   pub xattrs: Vec<Changed<(String, String), Vec<u8>>>,
+  /// The green's head when this checkpoint was taken and its identity there (A-257): a recovery's replay must reach that
+  /// identity when it reaches that version, or the green is fenced. `None` where the taker did not record one.
+  pub head_check: Option<(u64, [u8; 32])>,
 }
 
 impl Checkpoint {
@@ -152,6 +155,14 @@ impl Checkpoint {
       },
       |out, value| put_bytes(out, value),
     );
+    match canonical.head_check {
+      Some((head, identity)) => {
+        out.push(PRESENT);
+        out.extend_from_slice(&head.to_le_bytes());
+        out.extend_from_slice(&identity);
+      }
+      None => out.push(ABSENT),
+    }
     out
   }
 
@@ -187,6 +198,16 @@ impl Checkpoint {
       |r| Ok((take_str(r)?, take_str(r)?)),
       |r| Ok(reader_bytes(r)?.to_vec()),
     )?;
+    checkpoint.head_check = match reader.u8()? {
+      PRESENT => {
+        let head = reader.u64()?;
+        let mut identity = [0u8; IDENTITY_BYTES];
+        identity.copy_from_slice(reader.bytes(IDENTITY_BYTES)?);
+        Some((head, identity))
+      }
+      ABSENT => None,
+      _ => return Err(DocDecodeError::BadKind),
+    };
     if !reader.is_empty() {
       return Err(DocDecodeError::TrailingBytes);
     }

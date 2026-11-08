@@ -2475,17 +2475,15 @@ impl Daemon {
       identities.sort_unstable();
       identities.extend(partition.green_chain(volume).iter().enumerate().filter_map(
         |(index, bytes)| {
-          slates_merge::engine::Increment::decode(bytes)
-            .ok()
-            .map(|increment| {
-              (
-                u64::try_from(index)
-                  .unwrap_or(u64::MAX)
-                  .saturating_add(held)
-                  .saturating_add(1),
-                increment.id,
-              )
-            })
+          slates_merge::chain_entry::decode(bytes).ok().map(|entry| {
+            (
+              u64::try_from(index)
+                .unwrap_or(u64::MAX)
+                .saturating_add(held)
+                .saturating_add(1),
+              entry.increment.id,
+            )
+          })
         },
       ));
       identities

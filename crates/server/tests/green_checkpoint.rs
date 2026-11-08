@@ -388,3 +388,63 @@ fn a_chain_held_by_a_reader_is_refused_typed_at_its_cap_and_folds_once_released(
     "once the floor is released the refused version is accepted next: {after:?}"
   );
 }
+
+/// W3, A-257, §4.8 recovery. Do: under a played anchor with the chain capped at 256 KiB, two works take turns writing their
+/// own file, 8 KiB a version, 200 versions, each based on its own last version, so every entry's base trails it; restart.
+/// Expect: all accepted (the cap holds about 32 such increments, so the chain really folded with bases behind its head), and
+/// the recovered green holds every last write. A checkpoint held at or below every retained entry's base would never fold
+/// here; recovery re-deciding each entry would fence the green.
+#[test]
+fn two_clients_taking_turns_keep_folding_and_recover_whole() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-chain-turns-{}", std::process::id());
+  let config = config(&profile, &instance);
+  let anchor = common::anchor::held_anchor(
+    &format!("chain-turns-{}", std::process::id()),
+    &profile,
+    &config,
+  );
+  let first = Daemon::start(&profile, config.clone(), common::anchor::source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let green = client.create_green("chain-green", false).unwrap();
+  let works = [
+    client.create_work(green, "turn-0").unwrap().0,
+    client.create_work(green, "turn-1").unwrap().0,
+  ];
+  let names = ["turn-file-0", "turn-file-1"];
+  let mut last: [Option<Vec<u8>>; 2] = [None, None];
+  for n in 1..=VERSIONS {
+    let who = usize::try_from(n % 2).unwrap();
+    let delete = last[who].as_ref().map_or(0, |_| EDIT_BYTES as u64);
+    client
+      .edit(works[who], names[who], 0, delete, &bytes_of(n))
+      .unwrap();
+    assert_eq!(
+      client.submit(works[who]).unwrap(),
+      Submitted::Accepted(n),
+      "version {n} accepted though its base trails the head"
+    );
+    last[who] = Some(bytes_of(n));
+  }
+  drop(client);
+  first.stop();
+  let second = Daemon::start(&profile, config, common::anchor::source_of(&anchor)).unwrap();
+  second
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let head = client.versions(green);
+  let files: Vec<_> = names
+    .iter()
+    .map(|name| client.read(green, name, ReadAt::Head))
+    .collect();
+  drop(client);
+  second.stop();
+  assert_eq!(head.ok(), Some(VERSIONS), "the recovered head");
+  for (index, read) in files.into_iter().enumerate() {
+    assert_eq!(read.ok(), last[index], "{}'s last write", names[index]);
+  }
+}
