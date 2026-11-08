@@ -1,0 +1,231 @@
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded blake3 v1.8.7
+  Downloaded cc v1.4.5
+  Downloaded crc32c v0.6.8
+  Downloaded find-msvc-tools v0.1.12
+  Downloaded lz4_flex v0.11.6
+  Downloaded memmap2 v0.9.11
+  Downloaded tinyvec v1.13.2
+  Downloaded twox-hash v2.1.4
+  Downloaded zerocopy v0.8.56
+  Downloaded zstd v0.13.3
+  Downloaded zstd-safe v7.3.0
+  Downloaded constant_time_eq v0.4.2
+  Downloaded rand_xorshift v0.4.0
+  Downloaded wait-timeout v0.2.1
+  Downloaded quick-error v1.2.3
+  Downloaded rcgen v0.13.2
+  Downloaded yasna v0.5.2
+  Downloaded autocfg v1.5.1
+  Downloaded cfg-if v1.0.4
+  Downloaded unicode-normalization v0.1.25
+  Downloaded bitflags v2.13.1
+  Downloaded cmake v0.1.58
+  Downloaded deranged v0.5.8
+  Downloaded dunce v1.0.5
+  Downloaded errno v0.3.14
+  Downloaded fastrand v2.5.0
+  Downloaded fs_extra v1.3.0
+  Downloaded itoa v1.0.18
+  Downloaded jobserver v0.1.35
+  Downloaded getrandom v0.4.3
+  Downloaded once_cell v1.21.4
+  Downloaded powerfmt v0.2.0
+  Downloaded num-traits v0.2.19
+  Downloaded proc-macro2 v1.0.107
+  Downloaded cpufeatures v0.3.1
+  Downloaded memchr v2.8.3
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded quote v1.0.47
+  Downloaded getrandom v0.3.4
+  Downloaded rand_core v0.9.5
+  Downloaded rustls-webpki v0.103.15
+  Downloaded rusty-fork v0.3.1
+  Downloaded rand v0.9.5
+  Downloaded rustc_version v0.4.1
+  Downloaded fnv v1.0.7
+  Downloaded semver v1.0.28
+  Downloaded getrandom v0.2.17
+  Downloaded proptest v1.11.0
+  Downloaded subtle v2.6.1
+  Downloaded time-core v0.1.9
+  Downloaded serde_core v1.0.229
+  Downloaded shlex v2.0.1
+  Downloaded rustls-pki-types v1.15.1
+  Downloaded serde v1.0.229
+  Downloaded tinyvec_macros v0.1.1
+  Downloaded zeroize v1.9.0
+  Downloaded serde_json v1.0.151
+  Downloaded unarray v0.1.4
+  Downloaded unicode-ident v1.0.24
+  Downloaded tempfile v3.27.0
+  Downloaded zmij v1.0.23
+  Downloaded pkg-config v0.3.34
+  Downloaded untrusted v0.9.0
+  Downloaded thiserror v2.0.21
+  Downloaded bit-set v0.8.0
+  Downloaded serde_derive v1.0.229
+  Downloaded arrayvec v0.7.8
+  Downloaded bit-vec v0.8.0
+  Downloaded syn v2.0.119
+  Downloaded time v0.3.55
+  Downloaded num-conv v0.2.2
+  Downloaded rand_chacha v0.9.0
+  Downloaded regex-syntax v0.8.11
+  Downloaded rustix v1.1.4
+  Downloaded thiserror-impl v2.0.21
+  Downloaded libc v0.2.189
+  Downloaded zstd-sys v2.1.0+zstd.1.5.7
+  Downloaded syn v3.0.5
+  Downloaded ring v0.17.14
+  Downloaded rustls v0.23.44
+  Downloaded linux-raw-sys v0.12.1
+   Compiling libc v0.2.189
+   Compiling find-msvc-tools v0.1.12
+   Compiling shlex v2.0.1
+   Compiling cfg-if v1.0.4
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling pkg-config v0.3.34
+   Compiling quote v1.0.47
+   Compiling rustix v1.1.4
+   Compiling bitflags v2.13.1
+   Compiling linux-raw-sys v0.12.1
+   Compiling serde_core v1.0.229
+   Compiling syn v3.0.5
+   Compiling constant_time_eq v0.4.2
+   Compiling arrayvec v0.7.8
+   Compiling jobserver v0.1.35
+   Compiling zmij v1.0.23
+   Compiling cc v1.4.5
+   Compiling cpufeatures v0.3.1
+   Compiling blake3 v1.8.7
+   Compiling serde_json v1.0.151
+   Compiling serde v1.0.229
+   Compiling serde_derive v1.0.229
+   Compiling memchr v2.8.3
+   Compiling itoa v1.0.18
+   Compiling memmap2 v0.9.11
+   Compiling cmake v0.1.58
+   Compiling syn v2.0.119
+   Compiling fs_extra v1.3.0
+   Compiling dunce v1.0.5
+   Compiling aws-lc-sys v0.45.0 (/home/runner/work/slates/slates/vendor/aws-lc-sys)
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+   Compiling slates-machine v0.1.0 (/home/runner/work/slates/slates/crates/machine)
+   Compiling slates-mem v0.1.0 (/home/runner/work/slates/slates/crates/mem)
+   Compiling slates-wire-derive v0.1.0 (/home/runner/work/slates/slates/crates/wire-derive)
+   Compiling slates-wire v0.1.0 (/home/runner/work/slates/slates/crates/wire)
+   Compiling aws-lc-rs v1.18.1 (/home/runner/work/slates/slates/vendor/aws-lc-rs)
+   Compiling zstd-safe v7.3.0
+   Compiling zeroize v1.9.0
+   Compiling twox-hash v2.1.4
+   Compiling lz4_flex v0.11.6
+   Compiling tinyvec_macros v0.1.1
+   Compiling tinyvec v1.13.2
+   Compiling getrandom v0.4.3
+   Compiling slates-rt v0.1.0 (/home/runner/work/slates/slates/crates/rt)
+   Compiling unicode-normalization v0.1.25
+   Compiling slates-image v0.1.0 (/home/runner/work/slates/slates/crates/image)
+   Compiling once_cell v1.21.4
+   Compiling getrandom v0.3.4
+   Compiling slates-anchor v0.1.0 (/home/runner/work/slates/slates/crates/anchor)
+   Compiling semver v1.0.28
+   Compiling rustc_version v0.4.1
+   Compiling slates-db v0.1.0 (/home/runner/work/slates/slates/crates/db)
+   Compiling rustls-pki-types v1.15.1
+   Compiling zerocopy v0.8.56
+   Compiling rand_core v0.9.5
+   Compiling crc32c v0.6.8
+   Compiling thiserror v2.0.21
+   Compiling rustls v0.23.44
+   Compiling untrusted v0.9.0
+   Compiling autocfg v1.5.1
+   Compiling num-traits v0.2.19
+   Compiling slates-ipc v0.1.0 (/home/runner/work/slates/slates/crates/ipc)
+   Compiling thiserror-impl v2.0.21
+   Compiling zstd v0.13.3
+   Compiling slates-archive v0.1.0 (/home/runner/work/slates/slates/crates/archive)
+   Compiling subtle v2.6.1
+   Compiling fastrand v2.5.0
+   Compiling ppv-lite86 v0.2.21
+   Compiling tempfile v3.27.0
+   Compiling slates-vfs v0.1.0 (/home/runner/work/slates/slates/crates/vfs)
+   Compiling wait-timeout v0.2.1
+   Compiling bit-vec v0.8.0
+   Compiling fnv v1.0.7
+   Compiling hyper-timing v0.1.0 (/home/runner/work/slates/slates/vendor/hyper-raft/hyper-timing)
+   Compiling powerfmt v0.2.0
+   Compiling time-core v0.1.9
+   Compiling num-conv v0.2.2
+   Compiling quick-error v1.2.3
+   Compiling deranged v0.5.8
+   Compiling rusty-fork v0.3.1
+   Compiling hyper-swim v0.1.0 (/home/runner/work/slates/slates/vendor/hyper-raft/hyper-swim)
+   Compiling time v0.3.55
+   Compiling bit-set v0.8.0
+   Compiling rand_chacha v0.9.0
+   Compiling rand v0.9.5
+   Compiling rand_xorshift v0.4.0
+   Compiling regex-syntax v0.8.11
+   Compiling unarray v0.1.4
+   Compiling yasna v0.5.2
+   Compiling slates-bridge-core v0.1.0 (/home/runner/work/slates/slates/crates/bridge-core)
+   Compiling slates-base v0.1.0 (/home/runner/work/slates/slates/crates/base)
+   Compiling proptest v1.11.0
+   Compiling slates-bridge-fuse v0.1.0 (/home/runner/work/slates/slates/crates/bridge-fuse)
+   Compiling slates-bridge-virtiofs v0.1.0 (/home/runner/work/slates/slates/crates/bridge-virtiofs)
+   Compiling slates-land v0.1.0 (/home/runner/work/slates/slates/crates/land)
+   Compiling slates-bridge-nfs v0.1.0 (/home/runner/work/slates/slates/crates/bridge-nfs)
+   Compiling slates-bridge-oci v0.1.0 (/home/runner/work/slates/slates/crates/bridge-oci)
+   Compiling slates-merge v0.1.0 (/home/runner/work/slates/slates/crates/merge)
+   Compiling slates-test-seeds v0.1.0 (/home/runner/work/slates/slates/crates/test-seeds)
+   Compiling slates-conformance v0.1.0 (/home/runner/work/slates/slates/crates/conformance)
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+   Compiling rustls-webpki v0.103.15
+   Compiling slates-seal v0.1.0 (/home/runner/work/slates/slates/crates/seal)
+   Compiling hyper-seal v0.1.0 (/home/runner/work/slates/slates/vendor/hyper-raft/hyper-seal)
+   Compiling hyper-datagram v0.1.0 (/home/runner/work/slates/slates/vendor/hyper-raft/hyper-datagram)
+   Compiling slates-client v0.1.0 (/home/runner/work/slates/slates/crates/client)
+   Compiling rcgen v0.13.2
+   Compiling slates-transport v0.1.0 (/home/runner/work/slates/slates/crates/transport)
+   Compiling slates-cluster v0.1.0 (/home/runner/work/slates/slates/crates/cluster)
+   Compiling slates-server v0.1.0 (/home/runner/work/slates/slates/crates/server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 15s
+     Running tests/recovery.rs (target/debug/deps/recovery-b0648274904f9ee2)
+
+running 1 test
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates-server: shard 1 initialized in 2027 µs
+slates-server: shard 0 initialized in 2687 µs
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates-server: shard 0 initialized in 2528 µs
+slates-server: shard 1: recovered 1 volumes from their images (0 refused), 0 merge volumes (green chains and work logs replayed), reconciled out 0 unrecovered local snapshots and 0 attachments, trimmed 0 unacknowledged snapshots the images carried, completed 0 destroys in flight, corrected 0 clone pins, reclaimed 0 orphans no holder survived, took back 0 writable copies, replayed 0 logged writes
+slates-server: shard 1: held 0 replicas again from the image
+slates-server: shard 1 initialized in 3001 µs
+
+thread 'a_green_over_a_pinned_overlays_snapshot_is_made_after_a_restart' (5483) panicked at crates/server/tests/recovery.rs:4668:6:
+a green over the pinned snapshot is made after the restart: Refused(ConsistentBaseUnavailable)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_green_over_a_pinned_overlays_snapshot_is_made_after_a_restart ... FAILED
+
+failures:
+
+failures:
+    a_green_over_a_pinned_overlays_snapshot_is_made_after_a_restart
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 51 filtered out; finished in 1.20s
+
+error: test failed, to rerun pass `-p slates-server --test recovery`
+## red sibling exit 101
