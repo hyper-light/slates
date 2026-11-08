@@ -7,3 +7,7 @@ error[E0433]: cannot find module or crate `slates_bridge_nfs` in this scope
 error[E0433]: cannot find `time` in `rustix`
 error[E0433]: cannot find `time` in `rustix`
 error: could not compile `slates-cli` (example "nfs_large_write") due to 6 previous errors
+server exit 0
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.10s
