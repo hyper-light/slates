@@ -1,0 +1,5 @@
+runner windows-latest, eeefa2f diag: the Windows lane's own documentation step on the A-228 branch, Sun Nov  8 14:34:41 UTC 2026
+command: cargo doc -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-anchor -p slates-cli -p slates-mcp --no-deps --document-private-items
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 03s
+crates documented: 12
+== documentation step, exit 0
