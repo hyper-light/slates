@@ -1210,3 +1210,5 @@ slates daemon: instance fsb-27-5-purge serving on 3 shards under the anchor
 slates-server: shard 2 initialized in 3040 µs
 slates-winfsp: reply spin window = 9300 ns: the median one-way channel wake of 15 (the 2-competitive spin)
 ## run 5 of 5 done, 2026-11-08T10:01:00Z
+To https://github.com/hyper-light/slates
+   1387073..6636afd  6636afd50653887d9fbd96ab910624c9d88f48cf -> diag-winfsp-overlap-results-42463623854-three-arm
