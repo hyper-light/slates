@@ -5731,11 +5731,12 @@ submitted to it) so no exchange waits for another's.
 > - Over that run the shards were not short of CPU: control shards runnable in about 8 % of samples, 0.6–0.8 s of CPU.
 >   The machine was: 31–88 % in system code, idle 29 % on average, 11,654 disk operations a second, and timers running
 >   about 2.3 times late. Memory was not the limit (5.7–10 GB free, no swapping).
-> - So the slow formation is not this entry's lending and not shard starvation. Its logs show the lead: all three slow
->   formations (72.3 s, 40.0 s, 40.9 s) had an accepted handshake give up early and then dialers reporting no reply through
->   two handshake budgets, about 20 s each, just before formation completed; the seven fast runs of the second window
->   had neither. It is three cases, and what released them is not yet shown by counters. `fleet.dial.stall.<reason>`
->   and `fleet.accept.stall.<reason>` now name which bound ends a handshake. Formation adds no
+> - So the slow formation is not this entry's lending and not shard starvation. **Fixed (2026-11-08):** an accepting end
+>   gave up on a dialer's repeats, a count that load spends, and the dialer then waited out two 22 s confirmation deadlines
+>   before redialing (record `docs/bugs/2026-11-08-an-accepting-end-gave-up-on-repeats-and-its-dialer-waited-out-two-deadlines.md`).
+>   `fleet.dial.stall.<reason>` and `fleet.accept.stall.<reason>` name which bound ends a handshake. Still open: an
+>   accepting end gave up silently, so a dialer waited out one deadline: it now sends a close sealed under the Handshake
+  keys, and the dialer redials within a round trip (A-258, RFC 9000 §10.2.3). Formation adds no
 >   evidence for the shared session; the `live_ship` polls above are one dump from a build without the link fix.
 
 ### 2026-09-29: a lone owner refused its own objects — fixed; campaign counters added for the open KIND items

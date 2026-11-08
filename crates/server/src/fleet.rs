@@ -1410,7 +1410,10 @@ async fn establish_session(
       // budget ran out was kept forever and, its flight being a local of that first call, never sent
       // another byte (`docs/bugs/2026-09-14-handshake-retry-forgets-its-flight.md`).
       Err(EndpointError::NotReady)
-        if endpoint.handshake_budgets_spent() < ESTABLISH_BUDGETS_BEFORE_REDIAL =>
+        if keeps_its_socket(
+          endpoint.handshake_budgets_spent(),
+          endpoint.handshake_stall(),
+        ) =>
       {
         count_refusal(dial_stall_counter(endpoint.handshake_stall()));
         (Some(endpoint), None)
@@ -1437,6 +1440,21 @@ async fn establish_session(
     },
     None => (None, None),
   }
+}
+
+/// Whether a dialer whose `establish` ended `NotReady` retries on the same socket rather than dialing afresh. A peer
+/// that has not answered may still be booting or starved, so it gets [`ESTABLISH_BUDGETS_BEFORE_REDIAL`] budgets. A
+/// dialer past its confirmation has heard from its peer and is waiting on an end that gave up: another budget on this
+/// socket is another 22 s waiting on state that is gone, which is 44 s of a 41.9 s formation at load 170 (2026-11-08).
+fn keeps_its_socket(budgets_spent: u32, stall: Option<HandshakeStall>) -> bool {
+  !matches!(
+    stall,
+    Some(
+      HandshakeStall::ConfirmDeadline
+        | HandshakeStall::ConfirmSilence
+        | HandshakeStall::ConfirmGarbage
+    )
+  ) && budgets_spent < ESTABLISH_BUDGETS_BEFORE_REDIAL
 }
 
 /// Shape: the handshake budgets a dialer spends on one socket before it dials afresh from a new port. The
@@ -4351,6 +4369,7 @@ fn dial_fault_counter(error: &EndpointError) -> &'static str {
     EndpointError::Closed => "fleet.dial.fault.closed",
     EndpointError::Admission(_) => "fleet.dial.fault.admission",
     EndpointError::PeerParameters(_) => "fleet.dial.fault.peer_parameters",
+    EndpointError::PeerClosed => "fleet.dial.fault.peer_closed",
     _ => "fleet.dial.fault.other",
   }
 }
@@ -7861,6 +7880,37 @@ pub(crate) async fn forward_batch_over_leader_session(
   stall_ns: u64,
 ) -> Option<slates_cluster::BatchReplies> {
   crate::forward_lane::forward_batch(peer, requests, stall_ns).await
+}
+
+#[cfg(test)]
+mod dial_tests {
+  use super::{ESTABLISH_BUDGETS_BEFORE_REDIAL, HandshakeStall, keeps_its_socket};
+
+  /// §4.8 formation: a dialer past its confirmation redials at once; one whose peer has not answered keeps its socket
+  /// for the budgets a booting or starved peer may need. Do: ask for every stall at no budgets spent and at the limit.
+  /// Expect: a confirmation stall never keeps the socket; every other stall keeps it until the budgets are spent.
+  #[test]
+  fn a_dialer_past_its_confirmation_redials_at_once() {
+    for stall in [
+      HandshakeStall::ConfirmDeadline,
+      HandshakeStall::ConfirmSilence,
+      HandshakeStall::ConfirmGarbage,
+    ] {
+      assert!(!keeps_its_socket(1, Some(stall)), "{stall:?}");
+    }
+    for stall in [
+      HandshakeStall::Silence,
+      HandshakeStall::Repeats,
+      HandshakeStall::Fragments,
+      HandshakeStall::TurnCeiling,
+    ] {
+      assert!(keeps_its_socket(1, Some(stall)), "{stall:?}");
+      assert!(
+        !keeps_its_socket(ESTABLISH_BUDGETS_BEFORE_REDIAL, Some(stall)),
+        "{stall:?}"
+      );
+    }
+  }
 }
 
 #[cfg(test)]
