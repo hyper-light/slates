@@ -5097,7 +5097,15 @@ fn a_forward_waits_for_the_owners_session_while_it_is_out() {
   share_with_node(&mut client_a, id, &daemons[1], ALL_RIGHTS);
   let mut client_b = Client::connect(daemons[1].instance());
   let (routed, last) = poll_status_served(&daemons, &mut client_b, id, COUNCIL_RETIRE_DEADLINE);
-  let held = routed.then(|| daemons[1].hold_record_session(hosts[0], SESSION_HOLD_NS));
+  // Held until the write's forward meets it, however late a loaded machine runs that forward: a hold of a fixed span
+  // ended before it arrived (b counted no forward meeting the session out).
+  let held = routed.then(|| {
+    daemons[1].hold_record_session_until_met(
+      hosts[0],
+      SESSION_HOLD_NS,
+      slates_server::daemon::OBSERVE_BUDGET_NS,
+    )
+  });
   let written = routed.then(|| client_b.call(&RequestBody::Snapshot { volume: id }));
   let retry = routed.then(|| client_b.call_retry(&RequestBody::Snapshot { volume: id }));
   let counters = daemons[1].fleet_refusals();
@@ -5138,18 +5146,23 @@ fn a_forward_waits_for_the_owners_session_while_it_is_out() {
   );
 }
 
-/// Shape: how long [`forwards_to_one_owner_never_wait_behind_each_other`] holds the owner's non-control shard: half
-/// a liveness budget, so the forward of a read there waits that long inside its own one-budget bound, and a forward
-/// that waited behind it is told from one that did not by hundreds of milliseconds.
+/// Shape: the longest [`forwards_to_one_owner_never_wait_behind_each_other`] holds the owner's non-control shard in one
+/// round: half a liveness budget, so the shard stays inside the watchdog's window and the forward of a read there waits
+/// inside its own one-budget bound. A round ends as soon as the free shard's read is answered.
 const OWNER_SHARD_HOLD: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS / 2);
-/// Shape: how long after the slow forward is sent the fast one goes: a tenth of the hold, so the slow one has
-/// reached the owner and is waiting on its held shard.
-const SLOW_FORWARD_LEAD: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS / 20);
+/// Shape: the rounds of [`forwards_to_one_owner_never_wait_behind_each_other`]: one read of the free shard answered
+/// during a hold disproves that it waits behind the held forward, and a machine loaded enough to run a whole round's
+/// round trip past a hold will not do so every time.
+const OWNER_SHARD_ROUNDS: u32 = 8;
 /// Shape: the volumes made while looking for one a given shard of two owns; a run that finds none in this many is a
 /// fault of the placement, not luck.
 const PLACEMENT_TRIES: usize = 64;
 /// Raised by the owner's held shard when its hold begins.
 static OWNER_SHARD_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set once the free shard's read of a [`forwards_to_one_owner_never_wait_behind_each_other`] round is answered: the
+/// hold ends there rather than running out its span.
+static OWNER_SHARD_RELEASED: std::sync::atomic::AtomicBool =
+  std::sync::atomic::AtomicBool::new(false);
 
 /// A volume created through `client` that the daemon's shard at `partition` owns.
 fn volume_owned_by(client: &mut Client, partition: usize, tag: &str, fleet: &[Daemon]) -> VolumeId {
@@ -5690,15 +5703,113 @@ fn a_forward_refused_at_admission_answers_its_client() {
   );
 }
 
+/// One round of [`forwards_to_one_owner_never_wait_behind_each_other`].
+#[derive(Debug)]
+struct ForwardRound {
+  /// Both reads were served.
+  served: bool,
+  /// The held read's forward had begun on the session and the free shard's read was answered while the hold stood.
+  during_hold: bool,
+  /// The free shard's read, from send to answer (printed, never judged).
+  fast_took: Duration,
+}
+
+/// How many forwards `daemon` has begun on a session (`fleet.forward.begun`), or none when it could not be read.
+fn forwards_begun(daemon: &Daemon) -> u64 {
+  daemon.fleet_refusals().map_or(0, |counters| {
+    counters.get("fleet.forward.begun").copied().unwrap_or(0)
+  })
+}
+
+/// Rounds of the read of `volumes.0` on the held shard and `volumes.1` on the free one, through `clients` of
+/// `daemons[1]`, until the free shard's read is answered during a hold or [`OWNER_SHARD_ROUNDS`] have run.
+fn forward_rounds(
+  daemons: &[Daemon],
+  (mut slow_client, mut fast_client): (Client, Client),
+  (slow, fast): (VolumeId, VolumeId),
+) -> Vec<ForwardRound> {
+  let mut rounds = Vec::new();
+  for _ in 0..OWNER_SHARD_ROUNDS {
+    let (round, returned) = forward_round(daemons, slow_client, &mut fast_client, (slow, fast));
+    slow_client = returned;
+    let answered = round.during_hold;
+    rounds.push(round);
+    if answered {
+      break;
+    }
+  }
+  rounds
+}
+
+/// One hold of `daemons[0]`'s non-control shard with the two reads inside it; hands the held read's client back.
+fn forward_round(
+  daemons: &[Daemon],
+  mut slow_client: Client,
+  fast_client: &mut Client,
+  (slow, fast): (VolumeId, VolumeId),
+) -> (ForwardRound, Client) {
+  use std::sync::atomic::Ordering::{Acquire, Release};
+  OWNER_SHARD_HELD.store(false, Release);
+  OWNER_SHARD_RELEASED.store(false, Release);
+  let hold = daemons[0]
+    .observation(
+      Some(daemons[0].shards()[1]),
+      slates_server::daemon::OBSERVE_BUDGET_NS,
+      |_: &mut slates_server::state::ShardState| {
+        OWNER_SHARD_HELD.store(true, Release);
+        let began = Instant::now();
+        // The held shard's thread runs nothing else for the hold: the read of `slow` waits there.
+        while began.elapsed() < OWNER_SHARD_HOLD && !OWNER_SHARD_RELEASED.load(Acquire) {
+          #[allow(clippy::disallowed_methods)]
+          std::thread::sleep(Duration::from_millis(1));
+        }
+        OWNER_SHARD_HELD.store(false, Release);
+      },
+    )
+    .unwrap();
+  let holder = std::thread::spawn(move || hold.wait());
+  while !OWNER_SHARD_HELD.load(Acquire) && !holder.is_finished() {
+    std::thread::yield_now();
+  }
+  let begun_before = forwards_begun(&daemons[1]);
+  let slow_read = std::thread::spawn(move || {
+    let reply = slow_client.call(&RequestBody::Status { volume: slow });
+    (reply, slow_client)
+  });
+  while forwards_begun(&daemons[1]) <= begun_before && OWNER_SHARD_HELD.load(Acquire) {
+    std::thread::yield_now();
+  }
+  let in_flight = OWNER_SHARD_HELD.load(Acquire);
+  let sent = Instant::now();
+  let fast_reply = fast_client.call(&RequestBody::Status { volume: fast });
+  let fast_took = sent.elapsed();
+  let during_hold = in_flight && OWNER_SHARD_HELD.load(Acquire);
+  OWNER_SHARD_RELEASED.store(true, Release);
+  let (slow_reply, slow_client) = slow_read.join().unwrap();
+  holder.join().unwrap().unwrap();
+  let served = matches!(slow_reply, ReplyBody::Status { .. })
+    && matches!(fast_reply, ReplyBody::Status { .. });
+  (
+    ForwardRound {
+      served,
+      during_hold,
+      fast_took,
+    },
+    slow_client,
+  )
+}
+
 /// The network load test's fault one (GAPS, "The many-client load test over the network": a forwarded `CreateWork`
 /// p50 1.71 s at 300 clients and 4.30 s at 1,000, against 45 µs on the owner's own node). §4.8 "Lookup", §4.10. Do:
 /// three nodes, each its own region, two shards each. On a, create two volumes, `slow` owned by a's non-control
-/// shard and `fast` by its control shard. Through two clients of b read each once, so b routes both to a. Then hold
-/// a's non-control shard for half a liveness budget. Inside the hold, read `slow` through the first client of b; a
-/// tenth of the hold later, read `fast` through the second. Expect: both are served, and `fast` answers in under a
-/// quarter of the hold, since nothing it needs is held. Forwards to one owner share the origin's one session to
-/// it, and a forward that borrowed that session for its whole round trip, while the owner served one forward at a
-/// time a session, made every forward behind it wait for it.
+/// shard and `fast` by its control shard. Through two clients of b read each once, so b routes both to a. Then, for up
+/// to [`OWNER_SHARD_ROUNDS`] rounds, hold a's non-control shard for at most [`OWNER_SHARD_HOLD`], read `slow` through
+/// the first client of b, and once b counts that forward begun read `fast` through the second. Expect: both are served,
+/// and in some round `fast` is answered while the hold still stands, since nothing it needs is held. Judged by order,
+/// not by a time a loaded machine stretches (325 ms against a quarter of the hold under 36 spinners). Forwards to one
+/// owner share the origin's one session to it, and a forward that borrowed that session for its whole round trip, while
+/// the owner served one forward at a time a session, made every forward behind it wait for it: then `fast` is never
+/// answered inside a hold.
 #[test]
 fn forwards_to_one_owner_never_wait_behind_each_other() {
   let _serial = serialize_fleet_tests();
@@ -5738,62 +5849,31 @@ fn forwards_to_one_owner_never_wait_behind_each_other() {
     poll_status_served(&daemons, &mut slow_client, slow, COUNCIL_RETIRE_DEADLINE);
   let (fast_routed, fast_last) =
     poll_status_served(&daemons, &mut fast_client, fast, COUNCIL_RETIRE_DEADLINE);
-  let measured = (slow_routed && fast_routed).then(|| {
-    OWNER_SHARD_HELD.store(false, std::sync::atomic::Ordering::Release);
-    let hold = daemons[0]
-      .observation(
-        Some(daemons[0].shards()[1]),
-        slates_server::daemon::OBSERVE_BUDGET_NS,
-        |_: &mut slates_server::state::ShardState| {
-          OWNER_SHARD_HELD.store(true, std::sync::atomic::Ordering::Release);
-          // The held shard's thread runs nothing else for the hold: the read of `slow` waits there.
-          #[allow(clippy::disallowed_methods)]
-          std::thread::sleep(OWNER_SHARD_HOLD);
-        },
-      )
-      .unwrap();
-    let holder = std::thread::spawn(move || hold.wait());
-    let began = Instant::now();
-    while !OWNER_SHARD_HELD.load(std::sync::atomic::Ordering::Acquire) {
-      assert!(began.elapsed() < OWNER_SHARD_HOLD, "the hold began");
-      std::thread::yield_now();
-    }
-    let slow_read = std::thread::spawn(move || {
-      let reply = slow_client.call(&RequestBody::Status { volume: slow });
-      (reply, slow_client)
-    });
-    #[allow(clippy::disallowed_methods)]
-    std::thread::sleep(SLOW_FORWARD_LEAD);
-    let sent = Instant::now();
-    let fast_reply = fast_client.call(&RequestBody::Status { volume: fast });
-    let fast_took = sent.elapsed();
-    let (slow_reply, _) = slow_read.join().unwrap();
-    holder.join().unwrap().unwrap();
-    (fast_reply, fast_took, slow_reply)
-  });
+  let rounds = (slow_routed && fast_routed)
+    .then(|| forward_rounds(&daemons, (slow_client, fast_client), (slow, fast)));
   let counters = daemons[1].fleet_refusals();
   for daemon in daemons {
     daemon.stop();
   }
-  let (fast_reply, fast_took, slow_reply) = measured.unwrap_or_else(|| {
+  let rounds = rounds.unwrap_or_else(|| {
     panic!("b routed both reads to a before the hold (last replies: {slow_last:?}, {fast_last:?})")
   });
   eprintln!(
-    "the forward of a read on a free shard took {fast_took:?} while another forward to its owner waited out a \
-     {OWNER_SHARD_HOLD:?} hold; b's fleet counters {counters:?}"
+    "the forward of a read on a free shard took {:?} a round, while another forward to its owner waited on a \
+     {OWNER_SHARD_HOLD:?} hold: {rounds:?}; b's fleet counters {counters:?}",
+    rounds
+      .iter()
+      .map(|round| round.fast_took)
+      .collect::<Vec<_>>()
   );
   assert!(
-    matches!(slow_reply, ReplyBody::Status { .. }),
-    "the read on the held shard is served once the hold ends: {slow_reply:?}"
+    rounds.iter().all(|round| round.served),
+    "both reads are served in every round: {rounds:?}"
   );
   assert!(
-    matches!(fast_reply, ReplyBody::Status { .. }),
-    "the read on the free shard is served: {fast_reply:?}"
-  );
-  assert!(
-    fast_took < OWNER_SHARD_HOLD / 4,
-    "the forward of a read on a free shard took {fast_took:?}, waiting behind another forward to the same owner \
-     ({OWNER_SHARD_HOLD:?} hold)"
+    rounds.iter().any(|round| round.during_hold),
+    "the read on the free shard was never answered while the hold stood, waiting behind another forward to the same \
+     owner: {rounds:?}"
   );
 }
 
@@ -9397,10 +9477,13 @@ fn a_slow_first_round_candidate_is_hedged_after_the_measured_p95() {
   let placed = poll_snapshot_placed(&all, &mut client, id, second);
   let placed_after = started.elapsed();
   let manifest = daemons[0].fleet_head_manifest(object);
+  let holders = second_seal_holders(&all, &daemons[hedge_index], object, &manifest);
   let outcome = HedgeOutcome {
     measured,
     placed,
     placed_after,
+    first_candidate: hosts[first_index],
+    holders,
     hedge_holds: matches!(manifest, Ok(Some(manifest)) if daemons[hedge_index].fleet_holder_content(manifest) == Ok(true)),
     held_ns: hold.and_then(|done| done.answer()),
     after: daemons[0].fleet_put_latency(object),
@@ -9420,9 +9503,34 @@ struct HedgeOutcome {
   measured: Result<(usize, Option<u64>), ObserveError>,
   placed: bool,
   placed_after: Duration,
+  /// The first-round candidate the hold starves.
+  first_candidate: HostId,
+  /// The candidates the second seal's head records as having acknowledged its content.
+  holders: Option<Vec<HostId>>,
   hedge_holds: bool,
   held_ns: Result<u64, ObserveError>,
   after: Result<(usize, Option<u64>), ObserveError>,
+}
+
+/// The holders the head of `object`'s seal of `manifest` records, as `holder` durably holds that head, polled until it
+/// does: the candidates that acknowledged the content when the seal placed. `None` if no such head arrived.
+fn second_seal_holders(
+  all: &[&Daemon],
+  holder: &Daemon,
+  object: ObjectId,
+  manifest: &Result<Option<[u8; 32]>, ObserveError>,
+) -> Option<Vec<HostId>> {
+  let wanted = manifest.as_ref().ok().copied().flatten()?;
+  let mut holders = None;
+  poll_until(all, PLACEMENT_DEADLINE, || {
+    holders = holder
+      .fleet_holder_head(object)?
+      .and_then(|(_, bytes)| HeadValue::from_record_bytes(&bytes))
+      .filter(|head| head.manifest == Some(wanted))
+      .map(|head| head.holders());
+    Ok(holders.is_some())
+  });
+  holders
 }
 
 /// The hedge history's assertions: readings existed before the second seal, the hold held for its span,
@@ -9433,12 +9541,19 @@ fn assert_hedged_through_the_measured_p95(outcome: &HedgeOutcome) {
     measured,
     placed,
     placed_after,
+    first_candidate,
+    holders,
     hedge_holds,
     held_ns,
     after,
   } = outcome;
   let hold_ns = *HEDGE_STARVATION_NS;
-  let held_still_starved = *placed_after < Duration::from_nanos(hold_ns);
+  // Judged by who acknowledged, not by when the poll saw it (3.05 s against a 3 s hold under 36 spinners): the held
+  // candidate could not acknowledge during the hold, so a head recording no acknowledgement of it placed through the
+  // hedge while it was held.
+  let placed_without_the_held = holders
+    .as_ref()
+    .is_some_and(|holders| !holders.contains(first_candidate));
   assert!(
     measured
       .as_ref()
@@ -9454,9 +9569,9 @@ fn assert_hedged_through_the_measured_p95(outcome: &HedgeOutcome) {
      {placed_after:?} against a {hold_ns} ns hold; readings after {after:?}"
   );
   assert!(
-    *placed && held_still_starved,
-    "the second seal placed through the hedge while the first-round candidate was still held \
-     (placed={placed} after {placed_after:?}, hold {hold_ns} ns)"
+    *placed && placed_without_the_held,
+    "the second seal placed through the hedge while the first-round candidate was still held: its head records no \
+     acknowledgement of {first_candidate:?} (placed={placed} after {placed_after:?}, holders {holders:?}, hold {hold_ns} ns)"
   );
   assert!(
     hedge_holds,
@@ -14714,9 +14829,12 @@ const FALSE_DEATH_TRIALS: u32 = 5;
 /// gossiped and refuted): how long a node holding a live owner dead keeps its clients from that owner's volume. Do: on a
 /// three-node fleet, create a volume on A and reach it from B's client; then, [`FALSE_DEATH_TRIALS`] times, inject a
 /// false death of A into B alone and poll the forwarded status from B's client until it is served. Expect: no call
-/// refused, each trial served within one liveness budget (the forward's location allowance), the times printed for
-/// the A/B of the recovery path (`docs/wip/BENCHMARKS.md`). Before 2026-10-08 every false death refused at least one
-/// call `HomedElsewhere`; the forward now retries its owner's resolution within that allowance.
+/// refused and each trial served: the daemon refuses a forward past its own location allowance
+/// (`resolve_and_forward`'s bound), so a call answered is one the daemon served within it, on the daemon's own clock.
+/// The client's stopwatch is printed for the A/B of the recovery path (`docs/wip/BENCHMARKS.md`), never judged: it
+/// counts the scheduling of a loaded machine too (0.8-2.1 s under 36 spinners with nothing refused). Before 2026-10-08
+/// every false death refused at least one call `HomedElsewhere`; the forward now retries its owner's resolution within
+/// that allowance.
 #[test]
 fn a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget() {
   let _serial = serialize_fleet_tests();
@@ -14749,15 +14867,16 @@ fn a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget()
     reached,
     "B's client reached A's volume before the false deaths"
   );
-  for (injected, served, took, refused) in &outages {
+  for (injected, served, _took, refused) in &outages {
     assert!(*injected, "the false death landed on B");
     assert_eq!(
       *refused, 0,
       "no call was refused while the false death lasted: {outages:?}; B's counters {counters:?}"
     );
     assert!(
-      *served && *took < Duration::from_nanos(LIVENESS_BUDGET_NS),
-      "a forward recovered from a refuted false death within its location budget: {outages:?}; B's counters {counters:?}"
+      *served,
+      "a forward recovered from a refuted false death, answered within the daemon's location budget: {outages:?}; B's \
+       counters {counters:?}"
     );
   }
 }
