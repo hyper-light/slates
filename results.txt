@@ -4,3 +4,6 @@ quiet exit 0 2s load=2.52 0.96 0.35
     presentation of 1000 files of 16384 bytes: 142.915803ms, 1000 entries; 177 probes inside it — p50 409.061µs, p99 3.351863ms, longest of all 11.963858ms; before it the longest 505.721µs
     granted landing of 1000 files of 16384 bytes: 1.088028825s, Ok(Landed(LandingOutcome { landing: 1, state: "done", written: 1000, skipped: 0, conflicts: 0, failed: 0, bytes_written: 16384000, held: 0, durability: LandingDurability { data_synced: true, dirs_synced: true, media: false, media_requested: false, dirs: 1 }, degraded: [BarriersOnly], barriers: 250 })); 1496 probes inside it, the longest of all 31.898616ms
     test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.38s
+loaded run 1 exit 0 106s load=32.06 11.96 4.39
+    granted landing of 1000 files of 16384 bytes: 9.778960933s, Ok(Landed(LandingOutcome { landing: 1, state: "done", written: 1000, skipped: 0, conflicts: 0, failed: 0, bytes_written: 16384000, held: 0, durability: LandingDurability { data_synced: true, dirs_synced: true, media: false, media_requested: false, dirs: 1 }, degraded: [BarriersOnly], barriers: 250 })); 119 probes inside it, the longest of all 207.580151ms
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 104.69s
