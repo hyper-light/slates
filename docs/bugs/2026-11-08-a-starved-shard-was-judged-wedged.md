@@ -74,3 +74,15 @@ no evidence for it, and the drop from the baseline is not attributed to it (GAPS
 
 In GAPS, "A starved shard was judged wedged": the spinning kill in `ab-clean-2`, the siblings (`ShardTime`, the anchor's start
 judgment), a shard blocked on a starved one, macOS' limit, and `a_spinning_shard_stops_the_beat` at extreme load.
+
+## The spinning test judged by its shard's CPU (2026-11-08, bug-sweep)
+
+`a_spinning_shard_stops_the_beat` gave the spin ten windows of wall. At load 185 on the 18-CPU Mac the shard's thread
+got about a tenth of a CPU, so ten windows of wall were one window of its CPU and the beat had not yet had cause to stop
+("never stopped in 10 s"). The test now waits on the shard's own CPU clock (`slates_rt::registry::shard_cpu`), the
+quantity the rule reads, until the spin has run a window of it, then requires the beat to stand still for a window of
+wall; the wall is only a backstop of 60 windows, a sixtieth of a CPU, and a failure prints the CPU it saw.
+- Measured interleaved on the 18-CPU Mac with 160 spinners (load 152 to 187): the old test failed 3 of 3, the new
+  passed 3 of 3, a window of the shard's CPU taking 11.6 to 12.2 s of wall.
+- Red-checked: with the watchdog's spinning verdict disabled, the new test fails ("a shard that ran 16.6 s of CPU
+  without a step never stopped the beat", 359 beats after its window).

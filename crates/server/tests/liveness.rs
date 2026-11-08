@@ -543,43 +543,83 @@ fn a_shard_starved_off_its_cpu_keeps_the_beat() {
   daemon.stop();
 }
 
-/// A-228, §4.14. Do: on the shard that is not the control shard, spin one poll on the CPU without yielding, until the
-/// beat stops or ten windows pass. Expect: the beat stops (the shard has run a window of CPU without a step). How long
-/// that takes is the shard's own CPU's pace: a window on a free core, longer where the spinner itself is starved. Before
-/// A-228 nothing saw it.
+/// Shape: the least share of a CPU the spinning shard's thread is waited for: the CPU-clock wait ends at a window of its
+/// CPU or this many windows of wall, whichever comes first. At load 185 on the 18-CPU Mac a spinner got about a tenth of
+/// a CPU (the supervisor's measurement, 2026-11-08), so a window of its CPU took about ten of wall, the old test's whole
+/// bound; a sixtieth leaves six times that.
+const LEAST_CPU_SHARE_WINDOWS: u32 = 60;
+
+/// A-228, §4.14. Do: on the shard that is not the control shard, spin one poll on the CPU without yielding. Wait on the
+/// shard's own CPU clock, the quantity the rule reads, until the spin has run a window of it; then watch the beat for a
+/// window of wall from its last beat. Expect: the beat stops, as the rule says once a shard has run a window of CPU without
+/// a step. How long the CPU takes is the machine's: a window of wall on a free core, ten at load 185 on the 18-CPU Mac,
+/// where the old test's ten windows of wall were about one window of the shard's CPU and failed. Before A-228 nothing
+/// saw a spinning shard.
 #[test]
 fn a_spinning_shard_stops_the_beat() {
   let (daemon, _, other) = daemon("spinning");
   let _serving = beating(&daemon);
-  let bound = WINDOW * 10;
+  let backstop = WINDOW * LEAST_CPU_SHARE_WINDOWS;
   let running = &*Box::leak(Box::new(AtomicBool::new(true)));
+  let spinning = &*Box::leak(Box::new(AtomicBool::new(false)));
   let worker = on_shard(&daemon, other, move || {
+    spinning.store(true, Ordering::Release);
     let started = Instant::now();
-    while running.load(Ordering::Relaxed) && started.elapsed() < bound {
+    while running.load(Ordering::Relaxed) && started.elapsed() < backstop * 2 {
       std::hint::spin_loop();
     }
   });
+  let holder = slates_rt::registry::holder_of(other.0).unwrap();
+  let spent = || slates_rt::registry::shard_cpu(holder).map_or(0, |reading| reading.spent_ns);
+  let waited = Instant::now();
+  while !spinning.load(Ordering::Acquire) && waited.elapsed() < backstop {
+    wait(SAMPLE);
+  }
+  let at_spin = spent();
   let started = Instant::now();
+  let window_ns = u64::try_from(WINDOW.as_nanos()).unwrap();
+  // Phase one: the spin runs a window of the shard's CPU, the rule's own measure.
+  while spent().saturating_sub(at_spin) < window_ns && started.elapsed() < backstop {
+    wait(SAMPLE);
+  }
+  let cpu_at_window = Duration::from_nanos(spent().saturating_sub(at_spin));
+  let wall_to_window = started.elapsed();
+  // Phase two: from there the next look judges the shard spinning and no beat follows, so the beat word stands still for a
+  // window of wall. A watchdog starved itself only looks later, which stops the beat sooner, never later.
   let mut last = beat(&daemon);
   let mut last_seen = Instant::now();
-  let mut stopped_after = None;
-  while started.elapsed() < bound {
+  let mut beats_after = 0u32;
+  let mut stopped = false;
+  let watching = Instant::now();
+  while watching.elapsed() < backstop {
     wait(SAMPLE);
     let now = beat(&daemon);
     if now != last {
       last = now;
       last_seen = Instant::now();
+      beats_after += 1;
     } else if last_seen.elapsed() >= WINDOW {
-      stopped_after = Some(last_seen.duration_since(started));
+      stopped = true;
       break;
     }
   }
+  let cpu_at_end = Duration::from_nanos(spent().saturating_sub(at_spin));
   running.store(false, Ordering::Relaxed);
   worker.join().unwrap();
-  println!("spinning shard: the beat stopped {stopped_after:?} after the spin began");
+  println!(
+    "spinning shard: a window of its CPU ({cpu_at_window:?}) took {wall_to_window:?} of wall; {beats_after} beat(s) \
+     after; the beat stopped {stopped}; its CPU by the end {cpu_at_end:?}"
+  );
   assert!(
-    stopped_after.is_some(),
-    "a spinning shard never stopped the beat in {bound:?}"
+    cpu_at_window >= WINDOW,
+    "the spinning shard's CPU clock reached {cpu_at_window:?} in {wall_to_window:?}, under a window: it got less than a \
+     {LEAST_CPU_SHARE_WINDOWS}th of a CPU, which this test does not judge"
+  );
+  assert!(
+    stopped,
+    "a shard that ran {cpu_at_end:?} of CPU without a step never stopped the beat ({beats_after} beat(s) after its \
+     window of CPU, in {:?})",
+    watching.elapsed()
   );
   daemon.stop();
 }
