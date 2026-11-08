@@ -261,6 +261,44 @@ impl Install {
   }
 }
 
+/// Diag only (live-durability-47, never on main): a batch of entries in chain order, each length-prefixed after a
+/// count, for one exchange (the lane A/B).
+pub fn encode_entries(entries: &[Entry]) -> Vec<u8> {
+  let mut out = Vec::new();
+  out.extend_from_slice(&u32::try_from(entries.len()).unwrap_or(u32::MAX).to_le_bytes());
+  for entry in entries {
+    let bytes = entry.encode();
+    out.extend_from_slice(&u32::try_from(bytes.len()).unwrap_or(u32::MAX).to_le_bytes());
+    out.extend_from_slice(&bytes);
+  }
+  out
+}
+
+/// Diag only (live-durability-47, never on main): the entries of [`encode_entries`], each within `payload_cap`.
+pub fn decode_entries(bytes: &[u8], payload_cap: usize) -> Result<Vec<Entry>, LiveError> {
+  let word = |at: usize| -> Result<usize, LiveError> {
+    let slice = bytes.get(at..at.checked_add(4).ok_or(LiveError::Malformed)?).ok_or(LiveError::Malformed)?;
+    let array: [u8; 4] = slice.try_into().map_err(|_| LiveError::Malformed)?;
+    usize::try_from(u32::from_le_bytes(array)).map_err(|_| LiveError::Malformed)
+  };
+  let count = word(0)?;
+  let mut at = 4usize;
+  let mut entries = Vec::new();
+  for _ in 0..count {
+    let len = word(at)?;
+    let start = at.checked_add(4).ok_or(LiveError::Malformed)?;
+    let end = start.checked_add(len).ok_or(LiveError::Malformed)?;
+    entries.push(Entry::decode(bytes.get(start..end).ok_or(LiveError::Malformed)?, payload_cap)?);
+    at = end;
+  }
+  Ok(entries)
+}
+
+/// Diag only (live-durability-47, never on main): the object a batch's first entry names.
+pub fn object_of_entries(bytes: &[u8]) -> Option<ObjectId> {
+  object_of(bytes.get(8..)?)
+}
+
 /// The object an encoded entry or install names, read without decoding the rest: both begin with the owner's word and
 /// then the object (the formats above). `None` for bytes too short to hold it.
 pub fn object_of(bytes: &[u8]) -> Option<ObjectId> {

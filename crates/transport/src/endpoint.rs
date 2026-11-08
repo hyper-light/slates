@@ -1804,6 +1804,12 @@ impl Endpoint {
     self.conn.congestion_window()
   }
 
+  /// Diag only (live-durability-47, never on main): the connection's congestion and flow-control state
+  /// ([`Connection::diag_transport`]).
+  pub fn diag_transport(&self) -> (u64, u64, bool, bool, u64, u64, (u64, u64)) {
+    self.conn.diag_transport()
+  }
+
   /// The stream bytes this end has consumed in order on the session ([`Connection::bytes_consumed`]): what a caller
   /// times its delivery rate by.
   pub fn bytes_consumed(&self) -> u64 {
