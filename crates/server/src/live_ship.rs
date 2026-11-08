@@ -1524,7 +1524,7 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
     .collect();
   let mut sends = Vec::new();
   let mut stale_checkpoint = false;
-  let mut installs_built = 0_u64;
+  let mut installs_built: u64 = 0;
   let targets: Vec<HostId> = live.shipper.targets().collect();
   live
     .cut_installs

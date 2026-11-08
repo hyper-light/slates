@@ -115,6 +115,10 @@ pub async fn exchange_watched(
   exchange_with(message, sessions, budget, watch, enough).await
 }
 
+/// Derived: how many times a silence the watch looks, so a cut comes within a tenth of a silence of the moment its
+/// conditions hold (the liveness budget's tenth, 100 ms, against cuts that come seconds in).
+const WATCH_LOOKS_PER_SILENCE: u64 = 10;
+
 /// One request on `endpoint`, as [`request_within`], also ended once `watch` says: `host` lost to the caller and the
 /// session's largest acknowledged packet unmoved for its persistent-congestion duration (at least the silence). Checked
 /// each tenth of the silence (derived: the end then comes within a tenth of a silence of the moment both hold). The endpoint comes back however it ends, an
@@ -131,7 +135,7 @@ async fn request_watched(
   let sent_ns = now_ns();
   let before = endpoint.last_exchange();
   let deadline_at = sent_ns.saturating_add(deadline_ns);
-  let tick_ns = (watch.silence_ns / 10).max(1);
+  let tick_ns = (watch.silence_ns / WATCH_LOOKS_PER_SILENCE).max(1);
   let mut cut = false;
   let reply = match endpoint.begin(stream, priority, request) {
     Err(_) => None,
