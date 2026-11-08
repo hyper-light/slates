@@ -13,3 +13,4 @@ loaded run 2 exit 0 108s load=36.99 18.41 7.29
 loaded run 3 exit 0 100s load=38.54 24.27 10.53
     granted landing of 1000 files of 16384 bytes: 9.097007021s, Ok(Landed(LandingOutcome { landing: 1, state: "done", written: 1000, skipped: 0, conflicts: 0, failed: 0, bytes_written: 16384000, held: 0, durability: LandingDurability { data_synced: true, dirs_synced: true, media: false, media_requested: false, dirs: 1 }, degraded: [BarriersOnly], barriers: 250 })); 109 probes inside it, the longest of all 181.495644ms
     test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 99.07s
+DONE
