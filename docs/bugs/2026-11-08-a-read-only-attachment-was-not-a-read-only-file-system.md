@@ -31,7 +31,16 @@ read-only mount, and an application that opens read-write and falls back to read
   (`crates/server/tests/virtiofs.rs`), the read-only attachment's writable SETUPMAPPING
   (`crates/bridge-virtiofs/tests/device.rs`), the read-only export's WRITE (`crates/bridge-nfs/tests/procedures.rs`),
   and the WinFsp status table (`crates/bridge-winfsp/src/lib.rs`); and a read-only WinFsp drive's changes answered
-  `ERROR_WRITE_PROTECT` (`crates/cli/tests/winfsp.rs`), which Windows' own read-only volume flag already gave.
+  `ERROR_WRITE_PROTECT` (`crates/cli/tests/winfsp.rs`): Windows' own read-only volume flag refused the overwrite, the
+  create and the directory, but not the delete (below).
+
+**Found by the WinFsp test on CI** (diag-slabs-35, run 42438454720, both runners): through a read-only drive the
+overwrite, the create and the directory were refused `ERROR_WRITE_PROTECT`, but `DeleteFile` **succeeded**. Windows
+deletes by a disposition and the cleanup that follows, and WinFsp's `CanDelete` (`op_can_delete`,
+`crates/bridge-winfsp/src/host.rs`) checked only a directory's emptiness, never the attachment's rights; the cleanup's
+unlink was then refused with nowhere to report it. The bridge now answers `authorize_change(cx)` (a new `Bridge`
+method, `authorize_write` without a change) and `CanDelete` asks it first, so the delete is refused
+`STATUS_MEDIA_WRITE_PROTECTED` before Windows marks the file.
 
 **Unchanged.** An attachment with no rights at all is still refused for permission (`crates/server/tests/virtiofs.rs`'s
 unenrolled guest, `EPERM`). Ownership refusals (`chmod`, `chown`, a sticky directory) stay `EPERM`/`NFS3ERR_PERM`.

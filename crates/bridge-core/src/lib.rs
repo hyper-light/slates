@@ -311,6 +311,10 @@ pub trait Bridge {
   /// Whether an effect a client keeps across a restart waits for the volume's next publication
   /// ([`slates_vfs::volume::Volume::awaits_publication`]): a transport's reply then waits for the owner's barrier (D-18).
   fn awaits_publication(&self) -> bool;
+  /// Whether `cx` may change this volume at all (`ReadOnly` for an attachment that may read but not write or a
+  /// snapshot's view, `NotPermitted` for one with no rights or of another volume), asked before a transport grants
+  /// something that becomes a change later: WinFsp's `CanDelete`, whose delete happens at the cleanup that has no reply.
+  fn authorize_change(&self, cx: &OpContext) -> Result<(), VfsError>;
   /// Look `name` up in directory `parent` under `cx`; the child's attributes.
   fn lookup(&mut self, parent: ObjectId, cx: &OpContext, name: &str) -> Result<NodeAttr, VfsError>;
   /// The attributes of `object` under `cx`.

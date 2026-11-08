@@ -2016,7 +2016,8 @@ an open for writing (a write access mode or `O_TRUNC`) and at every mutating ver
 `authorize_write` (`VfsError::ReadOnly`), carried by every edge: FUSE, virtio-fs and the vhost route answer `EROFS`
 (the DAX windows' writable asks too); NFS answers `NFS3ERR_ROFS` and `NFS4ERR_ROFS`; WinFsp answers
 `STATUS_MEDIA_WRITE_PROTECTED` and reports the volume read-only (`ReadOnlyVolume`), so Windows refuses most changes
-before they reach a shard; the wire answers `ReadOnlyVolume`. An attachment with no rights at all is refused for
+before they reach a shard, and its `CanDelete` asks the bridge (`authorize_change`) before Windows marks a file for a
+delete that happens at the reply-less cleanup; the wire answers `ReadOnlyVolume`. An attachment with no rights at all is refused for
 permission (`EPERM`, `NFS3ERR_PERM`, `STATUS_ACCESS_DENIED`). A kernel that mounts the attachment `ro` (Linux FUSE,
 macOS NFS) refuses most changes itself before the request, with the same `EROFS`. Until 2026-11-08 the bridge granted
 an open for writing and answered each change `NotPermitted`

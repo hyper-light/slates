@@ -645,6 +645,10 @@ fn unpack_handle(word: u64) -> Handle<u64> {
 }
 
 impl Bridge for VolumeBridge<'_> {
+  fn authorize_change(&self, cx: &OpContext) -> Result<(), VfsError> {
+    self.authorize_write(cx)
+  }
+
   fn awaits_publication(&self) -> bool {
     self.volume.awaits_publication()
   }
