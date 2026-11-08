@@ -1541,32 +1541,10 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
         }
       }
       Next::Install => {
-        let Some((head, payload)) = &live.whole else {
-          stale_checkpoint = true;
-          continue;
-        };
-        if live
-          .shipper
-          .held_by(*holder)
-          .is_some_and(|held| held.rank() >= head.rank())
-        {
-          stale_checkpoint = true;
-          continue;
-        }
-        installs_built = installs_built.saturating_add(1);
-        let install = Install {
-          owner: live.shipper.owner(),
-          object,
-          epoch: live.shipper.epoch(),
-          head: *head,
-          state: payload.clone(),
-        };
-        sends.push(Send {
-          object,
-          holder: *holder,
-          stream: slates_cluster::live::LIVE_STATE_STREAM,
-          bytes: install.encode(),
-        });
+        let (send, stale) = install_for(live, object, *holder);
+        stale_checkpoint |= stale;
+        installs_built = installs_built.saturating_add(u64::from(send.is_some()));
+        sends.extend(send);
       }
       Next::Nothing | Next::Fenced(_) => {}
     }
@@ -1578,6 +1556,39 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
     state.count(LIVE_INSTALL_BUILT, installs_built);
   }
   sends
+}
+
+/// The install to send `holder`, and whether the image is too old for it. `None` and not stale while a fresh image is on
+/// its way ([`send_to_reached`]): one sent now would land the holder behind the tail. `None` and stale when there is no
+/// image, or the holder already holds what it carries.
+fn install_for(live: &LiveVolume, object: ObjectId, holder: HostId) -> (Option<Send>, bool) {
+  if live.owes_image {
+    return (None, false);
+  }
+  let Some((head, payload)) = &live.whole else {
+    return (None, true);
+  };
+  if live
+    .shipper
+    .held_by(holder)
+    .is_some_and(|held| held.rank() >= head.rank())
+  {
+    return (None, true);
+  }
+  let install = Install {
+    owner: live.shipper.owner(),
+    object,
+    epoch: live.shipper.epoch(),
+    head: *head,
+    state: payload.clone(),
+  };
+  let send = Send {
+    object,
+    holder,
+    stream: slates_cluster::live::LIVE_STATE_STREAM,
+    bytes: install.encode(),
+  };
+  (Some(send), false)
 }
 
 /// The candidates the latest placement of `object`'s catalog record names: holders that take its live log ([`hold_bound`]
@@ -1684,7 +1695,8 @@ fn lane_ended(state: &mut ShardState, holder: HostId, objects: Vec<ObjectId>, an
 }
 
 /// `holder`'s record session is established again (on the control shard): every shard sends it what it lacks at once,
-/// not at the next record period, so a resumed holder's catch-up does not wait on the period.
+/// not at the next record period, so a resumed holder's catch-up does not wait on the period. An install it is owed waits
+/// for a fresh image ([`send_to_reached`]).
 pub(crate) fn holder_reached(holder: HostId) {
   let Some((origin, shards)) = state::with_state(|s| (s.shard, s.shards.clone())) else {
     return;
@@ -1694,13 +1706,24 @@ pub(crate) fn holder_reached(holder: HostId) {
   }
 }
 
-/// Sends `holder` what this shard's live volumes that had given it up owe it ([`holder_reached`]).
+/// Sends `holder` what this shard's live volumes that had given it up owe it ([`holder_reached`]). A holder owed an
+/// install while the image is behind the log waits for one made at the log's head: the next publication makes it, or the
+/// record period for an idle writer ([`refresh_image`]). The image a holder fell behind on was a median of 1,332 and
+/// 1,395 entries old when last built, while an install's own transit added 0 or 1, so it landed past the retained tail
+/// and took a second whole install (`live_chaos`'s rolling partition, diag-live-durability-54).
 fn send_to_reached(state: &mut ShardState, holder: HostId) {
   let volumes: Vec<[u8; 16]> = state
     .live
     .shipping
     .iter_mut()
     .filter_map(|(volume, live)| {
+      let stale = live
+        .whole
+        .as_ref()
+        .is_some_and(|(head, _)| Some(*head) != live.shipper.head());
+      if stale && live.shipper.pending(holder) == Next::Install {
+        live.owes_image = true;
+      }
       let was = live.unreachable.contains(&holder);
       live
         .unreachable

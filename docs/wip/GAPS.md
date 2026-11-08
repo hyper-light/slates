@@ -121,6 +121,30 @@
 > Open: no process test yet takes over an old incarnation's volume after its replacement's key arrived (the retired
 > key's path). Bug record `docs/bugs/2026-11-07-a-node-back-at-its-anchor-with-fresh-ram-had-every-pair-key-refused.md`.
 
+> **Fixed (live-durability, 2026-11-08): a holder back from a stop took a second whole install, because the image it was
+> sent was stale.** The image was the one made when it fell behind: a median of 1,332 and 1,395 entries old when last
+> built, while the install's own transit added 0 or 1 (diag-live-durability-54). It landed past the retained tail and
+> took another. A holder owed an install when its session returns now waits for an image made at the log's head
+> (`live_ship::send_to_reached`). `a_holder_back_from_a_stop_takes_one_install`: 2 installs in 10 of 10 runs before, 1
+> in 10 of 10 after. Rolling partition, 30 runs a leg per arch (diag-live-durability-57): resumes that took one install,
+> 16 of 59 and 9 of 58 before, 59 of 59 on each arch after; the last install after a resume, median 242 to 324 ms on x86
+> and 270 to 264 ms on arm (the wait for a fresh image costs the typical x86 holder 82 ms), p90 557 to 471 ms and 473 to
+> 381 ms, worst 2,359 to 635 ms and 510 to 509 ms; writes in a run, median 6,014 to 10,426 and 6,138 to 6,455; 60 of 60
+> passed with it, 59 of 60 without.
+
+> **Open (live-durability, 2026-11-08): a lane's install exchange ends only on its reply or its deadline, and the
+> deadline has no ceiling.** `exchange_budget` derives it from the bytes and the session's srtt and cwnd at the start:
+> up to 77 s and 614 s measured (diag-live-durability-56). A holder stopped before replying held its exchange for the
+> whole of a 30 s budget in 12 of 12 runs (30.01 to 30.02 s, -58), though the owner had dropped it from membership 1 to
+> 15 s in; the transport has no idle timeout. A bytes-only ceiling would be wrong: a 404 MB install took 21.6 s and was
+> answered. Owed: end the exchange when the owner stops keeping contact with the holder, re-sending safely if it was a
+> false suspicion.
+
+> **Open (live-durability, 2026-11-08): hundreds of writes reach the log as one entry.** Entries of 64 KiB or more were
+> 507 deltas and 178 whole records in 60 rolling partition runs (diag-live-durability-56); a delta carried a median of
+> 638 inodes on x86 and 474 on arm, up to 3,112, about 4 KB each. That is what makes entries MB-sized and the tail's
+> byte bound run out. Why that many writes land in one publication is not known.
+
 > **Fixed (live-durability, 2026-11-08): the owner rebuilt a whole install for a stopped holder on every write.**
 > `pending_sends` skipped a holder whose lane was busy, but a holder with no session ended its lane at once, so it was
 > never busy, and each publication cloned and encoded the volume's whole image for it: a median of 2,396 and 2,769
