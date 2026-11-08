@@ -1,0 +1,133 @@
+runner ubuntu-latest, 4 CPUs, Sun Nov  8 13:53:17 UTC 2026, head 8749096ccb4278c9e215a74a5e5064372ecbdf91
+== run 1 at 13:53:17, load 1.75 1.94 0.93
+chaos: fleet kill-at-ack (Bare) formed and settled: hosts ["14355693976289048152", "1922864043000535814", "16547117258496317664"]
+chaos a write answered the instant before its owner dies: iteration 0 (ClientWrite): chaos-kill-at-ack-a-6155 served the probe 2.002849022s after the owner's death
+slates daemon: fleet node `c` of `slates-fleet`: member 2960688019471815291 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a write answered the instant before its owner dies: iteration 1 (NfsFileSync): chaos-kill-at-ack-b-6155 served the probe 2.095467078s after the owner's death
+slates daemon: fleet node `c` of `slates-fleet`: member 2960688019471815291 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a write answered the instant before its owner dies: iteration 2 (ClientWrite): chaos-kill-at-ack-a-6155 served the probe 2.088272968s after the owner's death
+slates daemon: fleet node `c` of `slates-fleet`: member 2960688019471815291 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a write answered the instant before its owner dies: iteration 3 (NfsFileSync): chaos-kill-at-ack-a-6155 served the probe 2.206293612s after the owner's death
+slates daemon: fleet node `c` of `slates-fleet`: member 2960688019471815291 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a write answered the instant before its owner dies: iteration 4 (ClientWrite): chaos-kill-at-ack-a-6155 served the probe 2.096680316s after the owner's death
+slates daemon: fleet node `c` of `slates-fleet`: member 2960688019471815291 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a write answered the instant before its owner dies: iteration 5 (NfsFileSync): chaos-kill-at-ack-a-6155 served the probe 2.265576402s after the owner's death
+slates daemon: fleet node `c` of `slates-fleet`: member 2960688019471815291 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a write answered the instant before its owner dies:
+  iteration 0 (ClientWrite): chaos-kill-at-ack-a-6155 served the probe 2.002849022s after the owner's death
+  NoLoss, iteration 0 (earlier files): held
+  iteration 1 (NfsFileSync): chaos-kill-at-ack-b-6155 served the probe 2.095467078s after the owner's death
+  NoLoss, iteration 1 (earlier files): held
+  iteration 2 (ClientWrite): chaos-kill-at-ack-a-6155 served the probe 2.088272968s after the owner's death
+  NoLoss, iteration 2 (earlier files): held
+  iteration 3 (NfsFileSync): chaos-kill-at-ack-a-6155 served the probe 2.206293612s after the owner's death
+  NoLoss, iteration 3 (earlier files): held
+  iteration 4 (ClientWrite): chaos-kill-at-ack-a-6155 served the probe 2.096680316s after the owner's death
+  NoLoss, iteration 4 (earlier files): held
+  iteration 5 (NfsFileSync): chaos-kill-at-ack-a-6155 served the probe 2.265576402s after the owner's death
+  NoLoss, iteration 5 (earlier files): held
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 21.30s
+
+== run 1 exit 0
+== run 2 at 13:53:39, load 1.37 1.85 0.92
+chaos: fleet kill-at-ack (Bare) formed and settled: hosts ["7926224111393397388", "2196073199139122604", "6409442044386473601"]
+chaos a write answered the instant before its owner dies: iteration 0 (ClientWrite): chaos-kill-at-ack-a-7367 served the probe 2.130747011s after the owner's death
+slates daemon: fleet node `c` of `slates-fleet`: member 702795441307123286 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a write answered the instant before its owner dies: iteration 1 (NfsFileSync): chaos-kill-at-ack-a-7367 served the probe 1.997684007s after the owner's death
+slates daemon: fleet node `c` of `slates-fleet`: member 702795441307123286 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a write answered the instant before its owner dies: iteration 2 (ClientWrite): chaos-kill-at-ack-a-7367 served the probe 1.997661563s after the owner's death
+slates daemon: fleet node `c` of `slates-fleet`: member 702795441307123286 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a write answered the instant before its owner dies: iteration 3 (NfsFileSync): chaos-kill-at-ack-a-7367 served the probe 1.998138878s after the owner's death
+slates daemon: fleet node `c` of `slates-fleet`: member 702795441307123286 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a write answered the instant before its owner dies: iteration 4 (ClientWrite): chaos-kill-at-ack-a-7367 served the probe 2.119647149s after the owner's death
+slates daemon: fleet node `c` of `slates-fleet`: member 702795441307123286 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a write answered the instant before its owner dies: iteration 5 (NfsFileSync): chaos-kill-at-ack-a-7367 served the probe 1.99520454s after the owner's death
+slates daemon: fleet node `c` of `slates-fleet`: member 702795441307123286 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a write answered the instant before its owner dies:
+  iteration 0 (ClientWrite): chaos-kill-at-ack-a-7367 served the probe 2.130747011s after the owner's death
+  NoLoss, iteration 0 (earlier files): held
+  iteration 1 (NfsFileSync): chaos-kill-at-ack-a-7367 served the probe 1.997684007s after the owner's death
+  NoLoss, iteration 1 (earlier files): held
+  iteration 2 (ClientWrite): chaos-kill-at-ack-a-7367 served the probe 1.997661563s after the owner's death
+  NoLoss, iteration 2 (earlier files): held
+  iteration 3 (NfsFileSync): chaos-kill-at-ack-a-7367 served the probe 1.998138878s after the owner's death
+  NoLoss, iteration 3 (earlier files): held
+  iteration 4 (ClientWrite): chaos-kill-at-ack-a-7367 served the probe 2.119647149s after the owner's death
+  NoLoss, iteration 4 (earlier files): held
+  iteration 5 (NfsFileSync): chaos-kill-at-ack-a-7367 served the probe 1.99520454s after the owner's death
+  NoLoss, iteration 5 (earlier files): held
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 21.58s
+
+== run 2 exit 0
+== run 3 at 13:54:01, load 1.45 1.83 0.94
+chaos: fleet kill-at-ack (Bare) formed and settled: hosts ["18261337955740767929", "16666549624639518532", "15562475170532111416"]
+chaos a write answered the instant before its owner dies: iteration 0 (ClientWrite): chaos-kill-at-ack-b-8654 served the probe 2.288104337s after the owner's death
+slates daemon: fleet node `a` of `slates-fleet`: member 6145766873153230265 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a write answered the instant before its owner dies: iteration 1 (NfsFileSync): chaos-kill-at-ack-b-8654 served the probe 2.289669171s after the owner's death
+slates daemon: fleet node `a` of `slates-fleet`: member 6145766873153230265 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a write answered the instant before its owner dies: iteration 2 (ClientWrite): chaos-kill-at-ack-b-8654 served the probe 1.985320759s after the owner's death
+slates daemon: fleet node `a` of `slates-fleet`: member 6145766873153230265 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a write answered the instant before its owner dies: iteration 3 (NfsFileSync): chaos-kill-at-ack-b-8654 served the probe 2.188575506s after the owner's death
+slates daemon: fleet node `a` of `slates-fleet`: member 6145766873153230265 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a write answered the instant before its owner dies: iteration 4 (ClientWrite): chaos-kill-at-ack-b-8654 served the probe 2.082560012s after the owner's death
+slates daemon: fleet node `a` of `slates-fleet`: member 6145766873153230265 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a write answered the instant before its owner dies: iteration 5 (NfsFileSync): chaos-kill-at-ack-b-8654 served the probe 2.008951817s after the owner's death
+slates daemon: fleet node `a` of `slates-fleet`: member 6145766873153230265 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+chaos a write answered the instant before its owner dies:
+  iteration 0 (ClientWrite): chaos-kill-at-ack-b-8654 served the probe 2.288104337s after the owner's death
+  NoLoss, iteration 0 (earlier files): held
+  iteration 1 (NfsFileSync): chaos-kill-at-ack-b-8654 served the probe 2.289669171s after the owner's death
+  NoLoss, iteration 1 (earlier files): held
+  iteration 2 (ClientWrite): chaos-kill-at-ack-b-8654 served the probe 1.985320759s after the owner's death
+  NoLoss, iteration 2 (earlier files): held
+  iteration 3 (NfsFileSync): chaos-kill-at-ack-b-8654 served the probe 2.188575506s after the owner's death
+  NoLoss, iteration 3 (earlier files): held
+  iteration 4 (ClientWrite): chaos-kill-at-ack-b-8654 served the probe 2.082560012s after the owner's death
+  NoLoss, iteration 4 (earlier files): held
+  iteration 5 (NfsFileSync): chaos-kill-at-ack-b-8654 served the probe 2.008951817s after the owner's death
+  NoLoss, iteration 5 (earlier files): held
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 20.53s
+
+== run 3 exit 0
