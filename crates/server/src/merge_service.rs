@@ -238,6 +238,7 @@ pub(crate) fn work_base<'a>(
 ) -> crate::work_files::Base<'a> {
   crate::work_files::Base {
     green: state.greens.get(&work.green),
+    fetched: state.work_home.fetched.as_ref(),
     version: work.base_version,
   }
 }
@@ -283,6 +284,9 @@ pub(crate) fn settle_green_retention_leaving(
   let wanted = u64::try_from(engine.retention_charge()).unwrap_or(u64::MAX);
   let charged = state.green_retention.get(&green).copied().unwrap_or(0);
   if wanted > charged {
+    // Capacity is claimed as it is needed (A-98), and a green's works, which claim it by their charges, live on other
+    // shards (A-247): the green's own retention claims what it charges.
+    state.store.make_room(wanted.saturating_sub(charged));
     state
       .store
       .budget
@@ -321,6 +325,7 @@ pub(crate) fn secure_green_retention(
   if charged.saturating_add(bytes) > cap {
     return Err(cap.saturating_sub(charged));
   }
+  state.store.make_room(bytes);
   state
     .store
     .budget
@@ -1275,16 +1280,6 @@ pub(crate) fn destroy_merge_volume(
     }
     state.merge.attachments.remove(attachment);
   }
-  // A destroyed work releases its hold on its green's base (A-247).
-  if let Some(green) = state.works.get(&id).map(|work| work.green)
-    && let Err(e) = state.db.mutate(
-      &mut state.segment,
-      &Op::WorkFloorDropped { green, work: id },
-      now,
-    )
-  {
-    return Some(refused(refusal_of_db(&e)));
-  }
   let ops = [
     Op::VolumeStateChanged {
       id,
@@ -1305,6 +1300,8 @@ pub(crate) fn destroy_merge_volume(
   // destroyed green credits everything it charged as retention.
   if let Some(work) = state.works.remove(&id) {
     crate::work_charge::release(state, work.charged);
+    // The floor goes with it: on this shard in this transaction, elsewhere by a message once it has committed (A-247).
+    crate::work_home::tell_floor(state, work.green, id, None);
     let _ = settle_green_retention(state, work.green);
   }
   crate::verbs::release_origin_snapshot(state, held.as_ref());
@@ -2401,6 +2398,9 @@ pub struct ReplyRoute {
   pub client_index: u32,
   /// The request word (the request id).
   pub request: u64,
+  /// The reply goes to the work's shard, which settles it before the client is answered (A-247), not to a client's
+  /// ring: `shard` is the work's, and `client_index` is unused.
+  pub through_work: bool,
 }
 
 /// One submit whose acceptance waits for its version's merge record to commit at the quorum
@@ -2501,8 +2501,15 @@ fn resolve_accepted(state: &mut ShardState, object: ObjectId, placed: u64) {
       let Some(route) = entry.route else {
         continue;
       };
+      let (origin, id) = (entry.origin, entry.id);
       let delivery = slates_rt::task::SpawnRequest::new(
         Box::pin(async move {
+          if route.through_work {
+            let _ = crate::state::with_state_counted(|s| {
+              crate::work_home::answered_late(s, origin, id, recorded);
+            });
+            return;
+          }
           crate::state::deliver(route.client_index, route.request, recorded, true);
         }),
         None,

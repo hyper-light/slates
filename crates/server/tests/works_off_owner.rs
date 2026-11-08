@@ -11,8 +11,14 @@
 )]
 #![cfg(unix)]
 
-use slates_client::{Client, Rebased, Submitted};
-use slates_ipc::protocol::{ReadAt, VolumeId};
+use std::cell::RefCell;
+use std::time::{Duration, Instant};
+
+use proptest::prelude::*;
+use proptest::test_runner::{Config, TestRunner};
+use slates_client::{Client, ClientError, Rebased, Refusal, RequestId, Submitted};
+use slates_ipc::protocol::{ReadAt, ReplyBody, RequestBody, VolumeId, WorkOp};
+use slates_server::verbs::{owner_of, owner_of_name};
 use slates_server::{Daemon, DaemonConfig};
 
 mod common;
@@ -173,4 +179,640 @@ fn a_greens_works_spread_over_shards_answer_as_they_do_on_one() {
     asked_on_many > 0,
     "the many-shard run is not vacuous: its works' shards asked the green's owner"
   );
+}
+
+/// Shape: how long a test waits for what the daemon does in its own time (a floor's message, a restart).
+const WAIT: Duration = Duration::from_secs(60);
+/// Shape: the chain cap of the floor test: small, so a held floor fills it within a few dozen versions.
+const CHAIN_CAP_BYTES: usize = 256 << 10;
+/// Shape: what each version overwrites in the floor test's file: well above an increment's framing.
+const VERSION_BYTES: usize = 8 << 10;
+/// Shape: the versions the floor test goes on to once released: several times what the cap holds.
+const VERSIONS: u64 = 120;
+
+/// A name of `prefix` that hashes to a partition other than `green`'s, so a work of that name is off its owner.
+fn off_owner_name(green: VolumeId, prefix: &str) -> String {
+  (0u32..)
+    .map(|suffix| format!("{prefix}-{suffix}"))
+    .find(|name| owner_of_name(name, usize::from(MANY_SHARDS)) != owner_of(green))
+    .unwrap()
+}
+
+/// The bytes version `n` writes over the file: distinct per version.
+fn version_bytes(n: u64) -> Vec<u8> {
+  format!("version-{n:06}-")
+    .bytes()
+    .cycle()
+    .take(VERSION_BYTES)
+    .collect()
+}
+
+fn asked_of_the_owner(daemon: &Daemon) -> u64 {
+  daemon
+    .refusals_on_every_shard()
+    .unwrap()
+    .get(ASKED_THE_OWNER)
+    .copied()
+    .unwrap_or(0)
+}
+
+/// Submits `work` until it answers, for a chain whose floor is on its way down from another shard.
+fn submit_when_room(client: &mut Client, work: VolumeId) -> Submitted {
+  let started = Instant::now();
+  loop {
+    match client.submit(work) {
+      Err(ClientError::Refused(Refusal::TableAtCapacity { table })) if table == "green_chains" => {
+        assert!(started.elapsed() < WAIT, "the chain's floor is released");
+        std::thread::yield_now();
+      }
+      other => return other.unwrap(),
+    }
+  }
+}
+
+/// A-247, W3. Do: over a green with a small chain cap, on eight shards, leave two works off the green's shard based on
+/// version 1, and advance the green from a third until its chain is full. Expect: the chain is refused typed rather
+/// than folded past the works; the works still read their base and are judged at it; and once one is rebased and both
+/// are destroyed the chain folds and the green goes on, with no version refused.
+#[test]
+fn a_checkpoint_never_folds_past_a_work_on_another_shard() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-works-floor-{}", std::process::id());
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(MANY_SHARDS));
+  config.caps.green_chain_bytes = CHAIN_CAP_BYTES;
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    slates_server::SegmentSource::Create {
+      name: format!("slates-seg-works-floor-{}", std::process::id()),
+    },
+  )
+  .unwrap();
+  daemon.bootstrap(true).unwrap();
+  let mut client = connect(&instance);
+  let green = client.create_green("floor-green", false).unwrap();
+  let (seed, _) = client.create_work(green, "floor-seed").unwrap();
+  let first = version_bytes(1);
+  client.edit(seed, "file", 0, 0, &first).unwrap();
+  assert_eq!(client.submit(seed).unwrap(), Submitted::Accepted(1));
+  // The seed would hold version 1 for good; only the two works under test may.
+  client.destroy(seed).unwrap();
+  let (rebased_later, _) = client
+    .create_work(green, &off_owner_name(green, "floor-a"))
+    .unwrap();
+  let (destroyed, _) = client
+    .create_work(green, &off_owner_name(green, "floor-b"))
+    .unwrap();
+  client.edit(rebased_later, "own", 0, 0, b"mine").unwrap();
+  let (writer, _) = client
+    .create_work(green, &off_owner_name(green, "floor-w"))
+    .unwrap();
+  let delete = u64::try_from(VERSION_BYTES).unwrap();
+  let mut next = 2u64;
+  let full_at = loop {
+    assert!(next <= VERSIONS, "the held floor fills the chain");
+    client
+      .edit(writer, "file", 0, delete, &version_bytes(next))
+      .unwrap();
+    match client.submit(writer) {
+      Ok(Submitted::Accepted(version)) => assert_eq!(version, next),
+      Err(ClientError::Refused(Refusal::TableAtCapacity { table })) if table == "green_chains" => {
+        break next;
+      }
+      other => panic!("submit {next}: {other:?}"),
+    }
+    next += 1;
+  };
+  assert_eq!(
+    client.read(destroyed, "file", ReadAt::Head).unwrap(),
+    first,
+    "a work reads its base across the chain the others filled"
+  );
+  assert_eq!(
+    client.rebase(rebased_later).unwrap(),
+    Rebased::Rebased(full_at - 1),
+    "the base is still there to be judged from"
+  );
+  client.destroy(rebased_later).unwrap();
+  client.destroy(destroyed).unwrap();
+  assert_eq!(
+    submit_when_room(&mut client, writer),
+    Submitted::Accepted(full_at)
+  );
+  for n in full_at + 1..=VERSIONS {
+    client
+      .edit(writer, "file", 0, delete, &version_bytes(n))
+      .unwrap();
+    assert_eq!(
+      submit_when_room(&mut client, writer),
+      Submitted::Accepted(n)
+    );
+  }
+  assert_eq!(
+    client.read(green, "file", ReadAt::Head).unwrap(),
+    version_bytes(VERSIONS)
+  );
+  drop(client);
+  daemon.stop();
+}
+
+/// A-247, A-207, D-18. Do: on eight shards, edit works off the green's shard (first touches of a base file and a file
+/// of their own), advance the green past their base, and restart the daemon over the same anchor. Expect: each work
+/// reads what it acknowledged; each is still based where it was, so its submit is judged and accepted in order; and the
+/// second daemon asked the green's owner, so it was the off-owner path that served it.
+#[test]
+fn a_work_off_its_greens_shard_keeps_its_edits_and_its_base_across_a_restart() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-works-restart-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(MANY_SHARDS));
+  let anchor = common::anchor::held_anchor("works-restart", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), common::anchor::source_of(&anchor)).unwrap();
+  first.bootstrap(true).unwrap();
+  let mut client = connect(&instance);
+  let green = client.create_green("restart-green", false).unwrap();
+  let (seed, _) = client.create_work(green, "restart-seed").unwrap();
+  client
+    .edit(seed, "shared", 0, 0, &[b'.'; FILE_BYTES])
+    .unwrap();
+  assert_eq!(client.submit(seed).unwrap(), Submitted::Accepted(1));
+  let mut works = Vec::new();
+  for index in 0..WORKS {
+    let (work, _) = client
+      .create_work(green, &off_owner_name(green, &format!("restart-{index}")))
+      .unwrap();
+    let slot = u64::try_from(index * SLOT_BYTES).unwrap();
+    let mark = [u8::try_from(index).unwrap() + 1; SLOT_BYTES];
+    client
+      .edit(
+        work,
+        "shared",
+        slot,
+        u64::try_from(SLOT_BYTES).unwrap(),
+        &mark,
+      )
+      .unwrap();
+    client
+      .edit(work, &format!("mine-{index}"), 0, 0, &mark)
+      .unwrap();
+    works.push(work);
+  }
+  // The green moves on past every work's base, from a file none of them touch.
+  client.edit(seed, "other", 0, 0, b"moved on").unwrap();
+  assert_eq!(client.submit(seed).unwrap(), Submitted::Accepted(2));
+  let before: Vec<_> = works
+    .iter()
+    .map(|work| client.read(*work, "shared", ReadAt::Head).unwrap())
+    .collect();
+  first.stop();
+  let second = Daemon::start(&profile, config, common::anchor::source_of(&anchor)).unwrap();
+  let asked_before = asked_of_the_owner(&second);
+  for (index, work) in works.iter().enumerate() {
+    assert_eq!(
+      client.read(*work, "shared", ReadAt::Head).unwrap(),
+      before[index],
+      "work {index} reads what it acknowledged"
+    );
+    let submitted = client.submit(*work).unwrap();
+    let version = u64::try_from(index).unwrap() + 3;
+    assert_eq!(submitted, Submitted::Accepted(version), "work {index}");
+  }
+  assert!(
+    asked_of_the_owner(&second) > asked_before,
+    "the works were served off their green's shard"
+  );
+  let merged = client.read(green, "shared", ReadAt::Head).unwrap();
+  for index in 0..WORKS {
+    let mark = [u8::try_from(index).unwrap() + 1; SLOT_BYTES];
+    assert_eq!(&merged[index * SLOT_BYTES..(index + 1) * SLOT_BYTES], mark);
+  }
+  drop(client);
+  second.stop();
+  drop(anchor);
+}
+
+/// Waits for request `id`'s reply.
+fn reply_of(client: &mut Client, id: RequestId) -> ReplyBody {
+  let started = Instant::now();
+  loop {
+    if let Some(reply) = client.poll_reply(id).unwrap() {
+      return reply;
+    }
+    assert!(started.elapsed() < WAIT, "request {id:?} is answered");
+    std::thread::yield_now();
+  }
+}
+
+/// A-247 "A work's order". Do: pipeline on a work off its green's shard an edit of a base file (which must ask the
+/// owner), a submit, and an edit of another base file, without waiting between them. Expect: the submit holds the
+/// first edit and not the second: the green has the first, and the work still holds the second for its next submit.
+#[test]
+fn verbs_pipelined_on_a_work_off_its_greens_shard_keep_their_order() {
+  let (daemon, instance) = daemon(MANY_SHARDS, "order");
+  let mut client = connect(&instance);
+  let green = client.create_green("order-green", false).unwrap();
+  let (seed, _) = client.create_work(green, "order-seed").unwrap();
+  client.edit(seed, "first", 0, 0, b"aaaa").unwrap();
+  client.edit(seed, "second", 0, 0, b"bbbb").unwrap();
+  assert_eq!(client.submit(seed).unwrap(), Submitted::Accepted(1));
+  for round in 0..16u8 {
+    let name = off_owner_name(green, &format!("order-{round}"));
+    let (work, base) = client.create_work(green, &name).unwrap();
+    let edit = |path: &str, fill: u8| RequestBody::Edit {
+      work,
+      path: path.to_owned(),
+      at: 0,
+      delete_len: 4,
+      bytes: vec![fill; 4],
+    };
+    let first = client.begin(&edit("first", b'A' + round)).unwrap();
+    let submit = client
+      .begin(&RequestBody::Submit {
+        work,
+        evidence: Vec::new(),
+      })
+      .unwrap();
+    let second = client.begin(&edit("second", b'c' + round)).unwrap();
+    assert_eq!(reply_of(&mut client, first), ReplyBody::Edited);
+    let accepted = u64::from(round) + 2;
+    assert_eq!(
+      reply_of(&mut client, submit),
+      ReplyBody::Submitted {
+        version: Some(accepted),
+        conflicts: Vec::new(),
+      },
+      "based at {base}"
+    );
+    assert_eq!(reply_of(&mut client, second), ReplyBody::Edited);
+    assert_eq!(
+      client
+        .read(green, "first", ReadAt::Version { version: accepted })
+        .unwrap(),
+      vec![b'A' + round; 4],
+      "the submit holds the edit before it"
+    );
+    assert_ne!(
+      client
+        .read(green, "second", ReadAt::Version { version: accepted })
+        .unwrap(),
+      vec![b'c' + round; 4],
+      "and not the edit after it"
+    );
+    assert_eq!(
+      client.read(work, "second", ReadAt::Head).unwrap(),
+      vec![b'c' + round; 4],
+      "which the work still holds"
+    );
+    client.destroy(work).unwrap();
+  }
+  assert!(asked_of_the_owner(&daemon) > 0);
+  drop(client);
+  daemon.stop();
+}
+
+/// A-247 "Exactly once". Do: submit a work off its green's shard with the owner's answer lost on its way back, so the
+/// green advanced and the work did not, and the verb is answered `Overloaded`; then retry it under its id, once on the
+/// same daemon and once, for a second work, after a restart. Expect: the retry answers the one version the owner
+/// recorded, the green is one version ahead and not two, the file holds the edit once, and the work is reset to it.
+#[test]
+fn a_submit_whose_answer_was_lost_is_answered_by_the_owners_record_once() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-works-lost-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(MANY_SHARDS));
+  let anchor = common::anchor::held_anchor("works-lost", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), common::anchor::source_of(&anchor)).unwrap();
+  first.bootstrap(true).unwrap();
+  let mut client = connect(&instance);
+  let green = client.create_green("lost-green", false).unwrap();
+  let (seed, _) = client.create_work(green, "lost-seed").unwrap();
+  client.edit(seed, "f", 0, 0, b"....").unwrap();
+  assert_eq!(client.submit(seed).unwrap(), Submitted::Accepted(1));
+  for (version, restart) in [(2u64, false), (3, true)] {
+    let name = off_owner_name(green, &format!("lost-{version}"));
+    let (work, _) = client.create_work(green, &name).unwrap();
+    let at = version - 2;
+    client.edit(work, "f", at, 1, b"X").unwrap();
+    client.acknowledge_all().unwrap();
+    first.lose_next_owner_answer().unwrap();
+    let request = RequestBody::Submit {
+      work,
+      evidence: Vec::new(),
+    };
+    let id = client.begin(&request).unwrap();
+    let started = Instant::now();
+    loop {
+      match client.poll_reply(id) {
+        Ok(None) => {
+          assert!(started.elapsed() < WAIT, "the lost answer is refused");
+          std::thread::yield_now();
+        }
+        Err(ClientError::Refused(Refusal::Overloaded { .. })) => break,
+        other => panic!("the lost answer is a refusal the client retries: {other:?}"),
+      }
+    }
+    assert_eq!(client.versions(green).unwrap(), version, "the owner moved");
+    if restart {
+      first.stop();
+      let second =
+        Daemon::start(&profile, config.clone(), common::anchor::source_of(&anchor)).unwrap();
+      let retried = client.retry(id, &request).unwrap();
+      assert_eq!(
+        retried,
+        ReplyBody::Submitted {
+          version: Some(version),
+          conflicts: Vec::new(),
+        }
+      );
+      assert_eq!(client.versions(green).unwrap(), version, "one version");
+      client.edit(work, "f", 3, 1, b"Y").unwrap();
+      assert_eq!(
+        client.submit(work).unwrap(),
+        Submitted::Accepted(version + 1)
+      );
+      drop(client);
+      second.stop();
+      drop(anchor);
+      return;
+    }
+    let retried = client.retry(id, &request).unwrap();
+    assert_eq!(
+      retried,
+      ReplyBody::Submitted {
+        version: Some(version),
+        conflicts: Vec::new(),
+      }
+    );
+    assert_eq!(client.versions(green).unwrap(), version, "one version");
+    assert_eq!(
+      client.read(work, "f", ReadAt::Head).unwrap(),
+      client.read(green, "f", ReadAt::Head).unwrap(),
+      "the work settled at the version the owner recorded"
+    );
+  }
+}
+
+/// One step of a generated history.
+#[derive(Clone, Debug)]
+enum Step {
+  NewWork {
+    slot: usize,
+  },
+  Edit {
+    slot: usize,
+    file: usize,
+    at: u64,
+    delete_len: u64,
+    bytes: Vec<u8>,
+  },
+  EditAndSubmit {
+    slot: usize,
+    file: usize,
+    at: u64,
+    delete_len: u64,
+    bytes: Vec<u8>,
+  },
+  Submit {
+    slot: usize,
+  },
+  Rebase {
+    slot: usize,
+  },
+  Read {
+    slot: usize,
+    file: usize,
+  },
+  Unlink {
+    slot: usize,
+    file: usize,
+  },
+  Rename {
+    slot: usize,
+    from: usize,
+    to: usize,
+  },
+  List {
+    slot: usize,
+  },
+}
+
+/// Shape: the base files and new names a history touches, few enough that its works collide.
+const GENERATED_FILES: usize = 4;
+/// Shape: the work slots of a generated history.
+const GENERATED_WORKS: usize = 4;
+/// Format: a generated file's name.
+fn generated_path(file: usize) -> String {
+  format!("g{file}")
+}
+
+fn generated_step() -> impl Strategy<Value = Step> {
+  let slot = 0..GENERATED_WORKS;
+  let file = 0..GENERATED_FILES;
+  (
+    0u8..12,
+    slot,
+    file.clone(),
+    file,
+    0u64..10,
+    0u64..4,
+    proptest::collection::vec(b'A'..=b'Z', 0..4),
+  )
+    .prop_map(
+      |(draw, slot, file, other, at, delete_len, bytes)| match draw {
+        0 => Step::NewWork { slot },
+        1 | 2 | 3 => Step::Edit {
+          slot,
+          file,
+          at,
+          delete_len,
+          bytes,
+        },
+        4 | 5 => Step::EditAndSubmit {
+          slot,
+          file,
+          at,
+          delete_len,
+          bytes,
+        },
+        6 => Step::Submit { slot },
+        7 => Step::Rebase { slot },
+        8 => Step::Read { slot, file },
+        9 => Step::Unlink { slot, file },
+        10 => Step::Rename {
+          slot,
+          from: file,
+          to: other,
+        },
+        _ => Step::List { slot },
+      },
+    )
+}
+
+/// One daemon's side of the differential.
+struct Side {
+  client: Client,
+  green: VolumeId,
+  works: Vec<VolumeId>,
+}
+
+impl Side {
+  fn begin(&mut self, name: &str) {
+    self.green = self.client.create_green(name, false).unwrap();
+    let (seed, _) = self
+      .client
+      .create_work(self.green, &format!("{name}-seed"))
+      .unwrap();
+    for file in 0..GENERATED_FILES {
+      self
+        .client
+        .edit(seed, &generated_path(file), 0, 0, b"0123456789")
+        .unwrap();
+    }
+    assert_eq!(self.client.submit(seed).unwrap(), Submitted::Accepted(1));
+    self.works = (0..GENERATED_WORKS)
+      .map(|slot| {
+        self
+          .client
+          .create_work(self.green, &format!("{name}-w{slot}"))
+          .unwrap()
+          .0
+      })
+      .collect();
+  }
+
+  fn run(&mut self, step: &Step, name: &str) -> String {
+    let client = &mut self.client;
+    match step {
+      Step::NewWork { slot } => {
+        let (work, base) = client.create_work(self.green, name).unwrap();
+        self.works[*slot] = work;
+        format!("created at {base}")
+      }
+      Step::Edit {
+        slot,
+        file,
+        at,
+        delete_len,
+        bytes,
+      } => format!(
+        "{:?}",
+        client.edit(
+          self.works[*slot],
+          &generated_path(*file),
+          *at,
+          *delete_len,
+          bytes
+        )
+      ),
+      Step::EditAndSubmit {
+        slot,
+        file,
+        at,
+        delete_len,
+        bytes,
+      } => format!(
+        "{:?}",
+        client.edit_and_submit(
+          (self.works[*slot], &generated_path(*file)),
+          *at,
+          *delete_len,
+          bytes,
+          &[],
+        )
+      ),
+      Step::Submit { slot } => submitted(client, self.works[*slot]),
+      Step::Rebase { slot } => rebased(client, self.works[*slot]),
+      Step::Read { slot, file } => file_of(client, self.works[*slot], &generated_path(*file)),
+      Step::Unlink { slot, file } => format!(
+        "{:?}",
+        client.declare(
+          self.works[*slot],
+          WorkOp::Unlink {
+            path: generated_path(*file)
+          }
+        )
+      ),
+      Step::Rename { slot, from, to } => format!(
+        "{:?}",
+        client.declare(
+          self.works[*slot],
+          WorkOp::Rename {
+            from: generated_path(*from),
+            to: generated_path(*to)
+          },
+        )
+      ),
+      Step::List { slot } => format!("{:?}", client.list_dir(self.works[*slot], "", ReadAt::Head)),
+    }
+  }
+
+  fn head(&mut self) -> Vec<String> {
+    let mut said = vec![format!("{:?}", self.client.versions(self.green))];
+    for file in 0..GENERATED_FILES {
+      said.push(file_of(&mut self.client, self.green, &generated_path(file)));
+    }
+    said
+  }
+}
+
+fn file_of(client: &mut Client, volume: VolumeId, path: &str) -> String {
+  file(client, volume, path)
+}
+
+/// A-247's oracle: do run generated histories of works over one green (new works, edits, edit-and-submits, submits,
+/// rebases, reads, unlinks, renames and listings, a length change among them) on one shard and on eight; expect every
+/// answer and every file of the green's head to agree, and the eight-shard side to have asked the green's owner.
+#[test]
+fn generated_histories_answer_the_same_on_one_shard_and_on_many() {
+  let (one_daemon, one_instance) = daemon(ONE_SHARD, "gen-one");
+  let (many_daemon, many_instance) = daemon(MANY_SHARDS, "gen-many");
+  let sides = RefCell::new((
+    Side {
+      client: connect(&one_instance),
+      green: VolumeId::default(),
+      works: Vec::new(),
+    },
+    Side {
+      client: connect(&many_instance),
+      green: VolumeId::default(),
+      works: Vec::new(),
+    },
+  ));
+  let histories = RefCell::new(0u64);
+  let mut runner = TestRunner::new(slates_test_seeds::unseeded(Config {
+    cases: slates_test_seeds::cases(32),
+    ..Config::default()
+  }));
+  let outcome = runner.run(
+    &proptest::collection::vec(generated_step(), 1..32),
+    |steps| {
+      let mut sides = sides.borrow_mut();
+      let (one, many) = &mut *sides;
+      let history = {
+        let mut histories = histories.borrow_mut();
+        *histories += 1;
+        *histories
+      };
+      one.begin(&format!("h{history}"));
+      many.begin(&format!("h{history}"));
+      for (at, step) in steps.iter().enumerate() {
+        let name = format!("h{history}n{at}");
+        prop_assert_eq!(
+          one.run(step, &name),
+          many.run(step, &name),
+          "step {} {:?}",
+          at,
+          step
+        );
+      }
+      prop_assert_eq!(one.head(), many.head(), "the greens after the history");
+      Ok(())
+    },
+  );
+  if let Err(failure) = outcome {
+    panic!("{failure}");
+  }
+  assert!(asked_of_the_owner(&many_daemon) > 0);
+  assert_eq!(asked_of_the_owner(&one_daemon), 0);
+  drop(sides);
+  one_daemon.stop();
+  many_daemon.stop();
 }

@@ -2394,6 +2394,15 @@ impl Daemon {
     self.observe(self.shards.first().copied(), move |s| s.merge.fault = fault)
   }
 
+  /// Test support: loses the next verdict a work's shard is answered by its green's owner (A-247; never reachable from
+  /// the wire), as a crash between the owner's step and the work's would, on every shard.
+  pub fn lose_next_owner_answer(&self) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), |s| s.work_home.lose_next_verdict = true)?;
+    }
+    Ok(())
+  }
+
   /// Test support: holds every discovery reply this node's record serve side would send (never reachable
   /// from the wire) while `withhold` is set, so a peer's refresh exchange to this node stays pending with
   /// its record endpoint borrowed by that exchange — the interrupted-discovery restart the
@@ -3487,6 +3496,7 @@ fn init_shard(
     current_request: None,
     acceptance_deferred: false,
     lease_waiters: crate::lease_wait::LeaseWaiters::default(),
+    work_home: crate::work_home::WorkHome::default(),
     forwarded_rings: std::collections::BTreeMap::new(),
     telemetry_quota: config.telemetry_spans_per_reply,
     last_drain_ns: now,
@@ -4430,6 +4440,120 @@ async fn restore_client_ids(listener: &mut Listener, origin: u16, shards: &[Shar
   true
 }
 
+/// Replays each work whose green lives on another partition through that green's owner (A-247), its log being read
+/// from the work's partition. A shard that does not answer leaves its works unbuilt, and a retry of their verbs answers
+/// `NotFound`, as a work whose log would not replay does.
+async fn rebuild_remote_works(origin: u16, shards: &[ShardId]) {
+  for shard in shards.iter().copied() {
+    let Some(unbuilt) = crate::xshard::call_within(
+      origin,
+      shard.0,
+      |s| std::mem::take(&mut s.work_home.unbuilt),
+      LIVENESS_BUDGET_NS,
+    )
+    .await
+    else {
+      continue;
+    };
+    for work in unbuilt {
+      let id = work.work;
+      let Some(entries) = crate::xshard::call_within(
+        origin,
+        shard.0,
+        move |s| s.db.partition().work_log(id).to_vec(),
+        LIVENESS_BUDGET_NS,
+      )
+      .await
+      else {
+        continue;
+      };
+      let partition = crate::verbs::owner_of(crate::verbs::to_wire_volume(work.green));
+      let Some(owner) = shards.get(usize::from(partition)) else {
+        continue;
+      };
+      let (green, created_at) = (work.green, work.created_at);
+      let Some(replayed) = crate::xshard::call_within(
+        origin,
+        owner.0,
+        move |s| crate::verbs::owner_replay(s, green, created_at, &entries),
+        LIVENESS_BUDGET_NS,
+      )
+      .await
+      else {
+        continue;
+      };
+      let _ = crate::xshard::call_within(
+        origin,
+        shard.0,
+        move |s| crate::verbs::install_replayed_work(s, &work, replayed),
+        LIVENESS_BUDGET_NS,
+      )
+      .await;
+    }
+  }
+}
+
+/// Compares every work floor with the work it holds for (A-247): one whose work is gone is dropped, and one that names
+/// a base the work no longer holds is moved to the work's. Only a crash between a work's step and its green's leaves
+/// either. Run before any client is admitted. Returns how many it changed.
+async fn reconcile_work_floors(origin: u16, shards: &[ShardId]) -> usize {
+  let mut reconciled = 0usize;
+  for shard in shards.iter().copied() {
+    let Some(floors) = crate::xshard::call_within(
+      origin,
+      shard.0,
+      |s| s.db.partition().work_floors().collect::<Vec<_>>(),
+      LIVENESS_BUDGET_NS,
+    )
+    .await
+    else {
+      continue;
+    };
+    for floor in floors {
+      let partition = crate::verbs::owner_of(crate::verbs::to_wire_volume(floor.work));
+      let Some(home) = shards.get(usize::from(partition)) else {
+        continue;
+      };
+      let work = floor.work;
+      let Some((exists, holds)) = crate::xshard::call_within(
+        origin,
+        home.0,
+        move |s| {
+          (
+            s.db.partition().volume(work).is_some(),
+            s.works.get(&work).map(|w| w.base_version),
+          )
+        },
+        LIVENESS_BUDGET_NS,
+      )
+      .await
+      else {
+        continue;
+      };
+      let change = match (exists, holds) {
+        (false, _) => Some(None),
+        (true, Some(base)) if base != floor.base => Some(Some(base)),
+        // A record whose work could not be rebuilt keeps its floor: its base may yet be read.
+        _ => None,
+      };
+      if let Some(base) = change {
+        let (green, work) = (floor.green, floor.work);
+        let moved = crate::xshard::call_within(
+          origin,
+          shard.0,
+          move |s| crate::verbs::owner_floor(s, green, work, base),
+          LIVENESS_BUDGET_NS,
+        )
+        .await;
+        if moved.is_some() {
+          reconciled = reconciled.saturating_add(1);
+        }
+      }
+    }
+  }
+  reconciled
+}
+
 /// A recovery's reconciliation of every name alias (A-236, `slates_db::alias::reconcile`): each shard's aliases asked
 /// for, the volume each names asked of its partition, and the alias confirmed when that volume holds the name, released
 /// when it does not. Run before any client is admitted, when no clone is between its steps. An alias whose question is
@@ -4622,6 +4746,15 @@ async fn control_loop(
   if reconciled > 0 {
     slates_machine::log_line!(
       "slates-server: {reconciled} name alias(es) reconciled with their clones at recovery"
+    );
+  }
+  // Likewise no work is between its steps: a work whose green lives on another partition is replayed through that
+  // green's owner, and only then is every floor compared with the work it holds for (A-247).
+  rebuild_remote_works(control, &shards).await;
+  let floors = reconcile_work_floors(control, &shards).await;
+  if floors > 0 {
+    slates_machine::log_line!(
+      "slates-server: {floors} work floor(s) reconciled with their works at recovery"
     );
   }
   // Clients this daemon handed out, so a wanted id that is live is not given twice; bounded

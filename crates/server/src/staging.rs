@@ -153,6 +153,16 @@ impl Staging {
     Ok(buffer.bytes)
   }
 
+  /// The full bytes of buffer `token` for `work`, looked at and left in place: an edit-and-submit's edit is applied to
+  /// what goes to the green's owner before the buffer is taken (A-247). `None` while it is not there or not yet full.
+  pub(crate) fn peek(&self, work: VolumeId, token: u64) -> Option<&[u8]> {
+    let buffer = self
+      .buffers
+      .get(&token)
+      .filter(|buffer| buffer.work == work)?;
+    (u64::try_from(buffer.bytes.len()).ok()? == buffer.len).then_some(buffer.bytes.as_slice())
+  }
+
   /// Releases every buffer expired at `now`.
   pub(crate) fn expire(&mut self, now: u64, budget: &mut MetadataBudget) {
     let expired: Vec<u64> = self

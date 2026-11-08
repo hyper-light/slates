@@ -80,6 +80,7 @@ mod member_task;
 pub mod merge_service;
 mod mirror;
 mod remote_attach;
+mod work_home;
 #[cfg(target_os = "linux")]
 mod write_log;
 // The Windows WinFsp transport (§4.6 "Windows"): a volume at a drive letter, served on its owner shard.

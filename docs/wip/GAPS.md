@@ -9,6 +9,15 @@
 > now it commits, and the test ends in 3.3 s. Record:
 > `docs/bugs/2026-11-07-a-version-appended-before-its-owner-restarted-never-committed.md`.
 
+> **Open (perf, 2026-11-08): A-247's step two, works across nodes.** Step one spreads a green's works over the shards of
+> its owner's node (`crates/server/src/work_home.rs`). A `CreateWork` forwarded from another node still places the work
+> on the green's shard, so the three-node `f = 1` rungs are not yet helped (every verb still forwards to the owner's
+> node). What it owes: a rule for the work's node (the creating client's, with its name reachable from any node), the
+> owner's asks over the fleet exchange, and the lease gate on the owner's half of a remote verdict.
+
+> **Open (perf, 2026-11-08): measurement of A-247 step one.** The owner's cost per verdict, loadtest-scale's one-node
+> 1k/3k/10k rungs and fixtures' interleaved A/B are owed; the amendment's *Measured* list names them.
+
 > **Open (fixtures, 2026-11-08; A-252 reserved): a submit resent after its owner's restart is applied a second time.**
 > A-246 commits the versions appended before the crash, and its test checked their placement, not the retry's answer.
 > The primary-kill rung (adacachy, 1,000 clients, `f = 1`, on loadtest-scale's 2ae4e832 with fixtures' b38a9d66) no

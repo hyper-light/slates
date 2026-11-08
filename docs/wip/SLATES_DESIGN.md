@@ -7813,6 +7813,11 @@ that holder, fatal-and-loud, before any read. On a laptop the owner is the only 
 second computation exists; that is the derived N=1 case, and the differential test proves the
 fleet path computes the same answers.
 
+> **Status (A-247, 2026-11-08).** A green's works are served on the partitions their names hash to, and only the verdict
+> and a first read of a base file are the green's: a verb that needs either is parked on the work's shard and resumed
+> by the owner's answer (`crates/server/src/work_home.rs`). Each work's base is held by a durable floor on the green's
+> partition. Across nodes (a work on the creating client's node) is not built.
+
 **Submission.** `submit(work_volume, evidence?)`: seal the work volume (drain open extents,
 compose the net op set, chunk; in a fleet, place the snapshot to its candidate holders now, at
 f+1 acknowledgements, if the auto-seal has not), build the increment, send it to green's owner: the same shard is a call, another
@@ -7894,7 +7899,7 @@ is refused `StaleEpoch` at the first holder and never applied; the paused owner 
 on resume; the submitter's retry lands at the new
 owner and returns `Accepted{46}`.
 
-**Laptop degenerate.** One node: the merge record is a partition log append, placement is local,
+**Laptop degenerate.** One shard: a green and all its works share a partition, and every ask of the owner is a direct call in the verb's own step (A-247). One node: the merge record is a partition log append, placement is local,
 the holder set is the owner, every arrow in the submission is an in-process call, and the
 merge path is microseconds.
 
@@ -13924,12 +13929,15 @@ GAPS, BENCHMARKS ("The spin policy, measured and rejected").
 ### A-247 — A green's works are served where they live; only the verdict is the green's (accepted 2026-11-07, the supervisor's W1)
 Applied in the same change to: §4.16 (Data model, Submission, Rebase, Laptop degenerate), §4.8 (Lookup: a work's id
 routes to its own shard and node), `crates/server/src/verbs.rs` (`create_work`, `edit`, `edit_staged`, `declare`,
-`submit`, `rebase`, `build_increment`), `crates/server/src/merge_service.rs` (the floor records, `reachable_floor`,
-the verdict call), `crates/server/src/work_files.rs` (the base cache), `crates/server/src/state.rs` (`WorkState`),
-`crates/db` (the `WorkFloor` record), the forward lanes (`crates/server/src/forward_lane.rs`) for a remote node,
-the tests named below, BENCHMARKS, GAPS.
+`submit`, `rebase`, `build_increment`), `crates/server/src/work_home.rs` (new: the parked verbs and the asks of the
+owner), `crates/server/src/merge_service.rs` (`reachable_floor`, the deferred reply's route),
+`crates/server/src/work_files.rs` (`FetchedBase`), `crates/server/src/daemon.rs` (recovery of works through their green's
+owner, the floors' reconcile), `crates/db` (`WorkFloorRecord`, `Op::WorkFloorSet`, `Op::WorkFloorDropped`), the tests
+named below, BENCHMARKS, GAPS.
 
-Status: accepted 2026-11-07; built in two steps (one node, then across nodes).
+Status: accepted 2026-11-07. Step one (one node, the shards) built 2026-11-08 on agents/perf-w1. Step two (a work on
+the creating client's node, with the forward lanes of `crates/server/src/forward_lane.rs`) is not built: a `CreateWork`
+forwarded from another node still places the work on the green's shard.
 
 - **Why.** Every operation of a green's works is served on the green's one owner shard, because a work is placed
   on its green's partition and reads its base from the green's engine there. A closed-loop client's latency is then
