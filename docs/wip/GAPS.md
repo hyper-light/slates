@@ -14385,7 +14385,22 @@ The guest now waits by the daemon's rule (`Guest::await_answer`): in windows of 
 of the daemon's shards ran on the CPU in the window just ended, and within `CREDIT_WAIT` of their CPU since the wait
 began; a daemon whose shards ran nothing for a window, or ran the budget without answering, fails the test by name.
 Red first: with the daemon's one shard held asleep, the new wait failed after 5.0 s, "ran nothing for a whole window".
-On `4811191a`, 10 of 10 runs passed on this Mac as its load fell from about 270 to 70 (runs 1–6 took 123–298 s).
+Each guest counts the answers it waited for past one window and its longest wait (`Waits`), and
+`a_guest_waits_past_one_window_for_a_starved_daemon_and_counts_it` asserts the count moved: with the daemon's one
+shard in a poll on the CPU a fifth of the time for 7.5 s, its map ask was answered after 7.53 s, one answer past one
+window (adacachy); with the old one-window wait it failed at 5.0 s. The loaded runs do not exercise it reliably: on
+`4811191a` plus the count, 10 runs under four spinners a core on this Mac (load 130–310 around each run) counted no
+answer past one window, the longest 0.53–1.17 s; the reproduction's 5.06 s at load 150–170 did not recur with that
+load. 9 of those 10 passed; the other failed on a different defect, recorded next.
+
+### 2026-11-07: the Shards DAX fixture names every daemon's segment alike, and one case's start found it gone — open
+
+In the same loaded runs, one case of `the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte` failed before
+its first act: "shard 0 failed to initialize after 273138 µs: segment: shared memory: shm_open refused (code
+Some(2))" (`ENOENT`), then `ConsensusNotInitialized` at its bootstrap. `dax_provisioned_in` names the segment
+`slates-seg-{name}` with neither the process id nor a per-daemon count, so a proptest's successive cases, and two
+processes of the binary, use one name; a dropped daemon that removes the name after its successor created it leaves
+the successor's shard nothing to open. Owed: a segment name unique to each daemon, failing test first.
 
 ### 2026-10-22: two pressure tests failed on a busy machine, not on the property — fixed
 
