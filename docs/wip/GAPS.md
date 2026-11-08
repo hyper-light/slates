@@ -68,8 +68,8 @@
 >   The logs are on jupiter under `C:\Users\corph\slates-wincov-each` and `slates-wincov-rest`. Handed to their owners
 >   through the supervisor.
 > - **Built for Windows by no lane:** the `slates` binary's unit tests and `slates-bridge-fuse`'s `abi` test did not
->   compile there (fixed). Three `slates-cli` benchmark examples still do not compile (`nfs_writeback_ab`,
->   `nfs_large_write`, `vfs_tails`), and `bridge-virtiofs`'s device and `land_bench` warn there (open).
+>   compile there (fixed). Three `slates-cli` benchmark examples did not compile and `land_bench` warned there; fixed
+>   2026-11-08, and the Windows lanes now lint `slates-cli` and `slates-land` with `--all-targets`.
 > - **Run by no lane on a platform they build for (open), with the cheapest lane for each:**
 >   - `slates-cli`'s `held_rendezvous`, `merge_kill`, `nfs_held` (ubuntu, macOS): every test skips without
 >     `SLATES_TEST_CLI`; add them to `gates`' CLI step.
