@@ -1,0 +1,75 @@
+runner ubuntu-latest, 4 CPUs, 32 spinners, 10 runs each, commit f70e6466
+a_forward_waits_for_the_owners_session_while_it_is_out run 1 exit 0 load 8.21
+a_forward_waits_for_the_owners_session_while_it_is_out run 2 exit 0 load 12.81
+a_forward_waits_for_the_owners_session_while_it_is_out run 3 exit 0 load 16.77
+a_forward_waits_for_the_owners_session_while_it_is_out run 4 exit 0 load 20.04
+a_forward_waits_for_the_owners_session_while_it_is_out run 5 exit 0 load 22.73
+a_forward_waits_for_the_owners_session_while_it_is_out run 6 exit 0 load 25.01
+a_forward_waits_for_the_owners_session_while_it_is_out run 7 exit 0 load 26.86
+a_forward_waits_for_the_owners_session_while_it_is_out run 8 exit 0 load 28.51
+a_forward_waits_for_the_owners_session_while_it_is_out run 9 exit 0 load 29.82
+a_forward_waits_for_the_owners_session_while_it_is_out run 10 exit 0 load 31.01
+== a_forward_waits_for_the_owners_session_while_it_is_out passed 10 failed 0
+a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget run 1 exit 0 load 32.64
+FALSE-DEATH outages: [(true, true, 546.038655ms, 0), (true, true, 382.942009ms, 0), (true, true, 557.362022ms, 0), (true, true, 522.464932ms, 0), (true, true, 510.794288ms, 0)]
+a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget run 2 exit 0 load 33.95
+FALSE-DEATH outages: [(true, true, 456.671952ms, 0), (true, true, 502.970233ms, 0), (true, true, 744.332735ms, 0), (true, true, 534.045291ms, 0), (true, true, 482.961395ms, 0)]
+a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget run 3 exit 0 load 34.71
+FALSE-DEATH outages: [(true, true, 808.947965ms, 0), (true, true, 399.370239ms, 0), (true, true, 647.742946ms, 0), (true, true, 432.776022ms, 0), (true, true, 499.437325ms, 0)]
+a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget run 4 exit 0 load 35.57
+FALSE-DEATH outages: [(true, true, 565.346959ms, 0), (true, true, 473.926562ms, 0), (true, true, 636.966266ms, 0), (true, true, 806.664717ms, 0), (true, true, 464.974091ms, 0)]
+a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget run 5 exit 0 load 36.18
+FALSE-DEATH outages: [(true, true, 626.68428ms, 0), (true, true, 516.894076ms, 0), (true, true, 464.929536ms, 0), (true, true, 380.04023ms, 0), (true, true, 895.996789ms, 0)]
+a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget run 6 exit 0 load 36.28
+FALSE-DEATH outages: [(true, true, 602.359109ms, 0), (true, true, 518.04231ms, 0), (true, true, 508.061137ms, 0), (true, true, 699.963493ms, 0), (true, true, 842.972203ms, 0)]
+a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget run 7 exit 0 load 36.33
+FALSE-DEATH outages: [(true, true, 620.787181ms, 0), (true, true, 708.924142ms, 0), (true, true, 522.920346ms, 0), (true, true, 589.461358ms, 0), (true, true, 528.062972ms, 0)]
+a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget run 8 exit 0 load 36.49
+FALSE-DEATH outages: [(true, true, 743.046328ms, 0), (true, true, 224.047948ms, 0), (true, true, 564.913351ms, 0), (true, true, 455.972062ms, 0), (true, true, 535.984095ms, 0)]
+a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget run 9 exit 0 load 36.64
+FALSE-DEATH outages: [(true, true, 635.329765ms, 0), (true, true, 795.202612ms, 0), (true, true, 466.050379ms, 0), (true, true, 649.940796ms, 0), (true, true, 516.679099ms, 0)]
+a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget run 10 exit 0 load 36.75
+FALSE-DEATH outages: [(true, true, 599.935977ms, 0), (true, true, 703.738041ms, 0), (true, true, 723.917998ms, 0), (true, true, 484.048152ms, 0), (true, true, 634.78541ms, 0)]
+== a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget passed 10 failed 0
+forwards_to_one_owner_never_wait_behind_each_other run 1 exit 0 load 36.64
+the forward of a read on a free shard took [31.147579ms] a round, while another forward to its owner waited on a 500ms hold: [ForwardRound { served: true, during_hold: true, fast_took: 31.147579ms }]; b's fleet counters Ok({"content.purged_bytes": 698343424, "content.ticks.idle": 5, "fleet.accept.replaced": 1, "fleet.discovery.pages": 20, "fleet.fan.sent": 3, "fleet.fan.unchanged": 19, "fleet.forward.batch_done": 4, "fleet.forward.begun": 4, "fleet.forward.client.control_started": 4, "fleet.forward.client.delivered_home": 2, "fleet.forward.client.resolved": 4, "fleet.forward.client.to_control": 2, "fleet.forward.taken_for_another": 1, "fleet.learner.fetch_paced": 4, "fleet.learner.fetches": 
+forwards_to_one_owner_never_wait_behind_each_other run 2 exit 0 load 36.70
+the forward of a read on a free shard took [35.633212ms] a round, while another forward to its owner waited on a 500ms hold: [ForwardRound { served: true, during_hold: true, fast_took: 35.633212ms }]; b's fleet counters Ok({"content.purged_bytes": 698343424, "content.ticks.idle": 4, "fleet.discovery.pages": 18, "fleet.fan.sent": 3, "fleet.fan.unchanged": 14, "fleet.forward.batch_done": 4, "fleet.forward.begun": 4, "fleet.forward.client.control_started": 4, "fleet.forward.client.delivered_home": 2, "fleet.forward.client.resolved": 4, "fleet.forward.client.to_control": 2, "fleet.forward.taken_for_another": 1, "fleet.learner.fetches": 1, "fleet.owner_location.direct": 4, "fleet.plane.announce_l
+forwards_to_one_owner_never_wait_behind_each_other run 3 exit 0 load 36.59
+the forward of a read on a free shard took [28.730995ms] a round, while another forward to its owner waited on a 500ms hold: [ForwardRound { served: true, during_hold: true, fast_took: 28.730995ms }]; b's fleet counters Ok({"content.purged_bytes": 698343424, "content.ticks.idle": 4, "fleet.accept.replaced": 1, "fleet.discovery.pages": 18, "fleet.fan.sent": 3, "fleet.fan.unchanged": 14, "fleet.forward.batch_done": 4, "fleet.forward.begun": 4, "fleet.forward.client.control_started": 4, "fleet.forward.client.delivered_home": 2, "fleet.forward.client.resolved": 4, "fleet.forward.client.to_control": 2, "fleet.forward.taken_for_another": 1, "fleet.learner.fetch_paced": 3, "fleet.learner.fetches": 
+forwards_to_one_owner_never_wait_behind_each_other run 4 exit 0 load 36.75
+the forward of a read on a free shard took [21.422992ms] a round, while another forward to its owner waited on a 500ms hold: [ForwardRound { served: true, during_hold: true, fast_took: 21.422992ms }]; b's fleet counters Ok({"content.purged_bytes": 698343424, "content.ticks.idle": 4, "fleet.discovery.pages": 17, "fleet.fan.sent": 3, "fleet.fan.unchanged": 14, "fleet.forward.batch_done": 4, "fleet.forward.begun": 4, "fleet.forward.client.control_started": 4, "fleet.forward.client.delivered_home": 2, "fleet.forward.client.resolved": 4, "fleet.forward.client.to_control": 2, "fleet.forward.taken_for_another": 1, "fleet.learner.fetches": 3, "fleet.owner_location.direct": 4, "fleet.plane.announce_l
+forwards_to_one_owner_never_wait_behind_each_other run 5 exit 0 load 36.80
+the forward of a read on a free shard took [20.550308ms] a round, while another forward to its owner waited on a 500ms hold: [ForwardRound { served: true, during_hold: true, fast_took: 20.550308ms }]; b's fleet counters Ok({"content.purged_bytes": 698343424, "content.ticks.idle": 4, "fleet.accept.replaced": 1, "fleet.discovery.pages": 18, "fleet.fan.sent": 3, "fleet.fan.unchanged": 13, "fleet.forward.batch_done": 4, "fleet.forward.begun": 4, "fleet.forward.client.control_started": 4, "fleet.forward.client.delivered_home": 2, "fleet.forward.client.resolved": 4, "fleet.forward.client.to_control": 2, "fleet.forward.taken_for_another": 1, "fleet.learner.fetch_paced": 2, "fleet.learner.fetches": 
+forwards_to_one_owner_never_wait_behind_each_other run 6 exit 0 load 36.68
+the forward of a read on a free shard took [31.033804ms] a round, while another forward to its owner waited on a 500ms hold: [ForwardRound { served: true, during_hold: true, fast_took: 31.033804ms }]; b's fleet counters Ok({"content.purged_bytes": 698343424, "content.ticks.idle": 4, "fleet.discovery.pages": 18, "fleet.fan.sent": 3, "fleet.fan.unchanged": 16, "fleet.forward.batch_done": 4, "fleet.forward.begun": 4, "fleet.forward.client.control_started": 4, "fleet.forward.client.delivered_home": 2, "fleet.forward.client.resolved": 4, "fleet.forward.client.to_control": 2, "fleet.forward.taken_for_another": 1, "fleet.learner.fetch_paced": 12, "fleet.learner.fetches": 3, "fleet.owner_location.di
+forwards_to_one_owner_never_wait_behind_each_other run 7 exit 0 load 36.82
+the forward of a read on a free shard took [23.940093ms] a round, while another forward to its owner waited on a 500ms hold: [ForwardRound { served: true, during_hold: true, fast_took: 23.940093ms }]; b's fleet counters Ok({"content.purged_bytes": 698343424, "content.ticks.idle": 5, "fleet.discovery.pages": 19, "fleet.fan.sent": 3, "fleet.fan.unchanged": 16, "fleet.forward.batch_done": 4, "fleet.forward.begun": 4, "fleet.forward.client.control_started": 4, "fleet.forward.client.delivered_home": 2, "fleet.forward.client.resolved": 4, "fleet.forward.client.to_control": 2, "fleet.forward.taken_for_another": 1, "fleet.learner.fetch_paced": 1, "fleet.learner.fetches": 2, "fleet.owner_location.dir
+forwards_to_one_owner_never_wait_behind_each_other run 8 exit 0 load 37.02
+the forward of a read on a free shard took [41.763725ms] a round, while another forward to its owner waited on a 500ms hold: [ForwardRound { served: true, during_hold: true, fast_took: 41.763725ms }]; b's fleet counters Ok({"content.purged_bytes": 698343424, "content.ticks.idle": 5, "fleet.discovery.invalidated": 1, "fleet.discovery.pages": 20, "fleet.fan.sent": 3, "fleet.fan.unchanged": 22, "fleet.forward.batch_done": 4, "fleet.forward.begun": 4, "fleet.forward.client.control_started": 4, "fleet.forward.client.delivered_home": 2, "fleet.forward.client.resolved": 4, "fleet.forward.client.to_control": 2, "fleet.forward.taken_for_another": 1, "fleet.learner.fetch_paced": 4, "fleet.learner.fetc
+forwards_to_one_owner_never_wait_behind_each_other run 9 exit 0 load 37.10
+the forward of a read on a free shard took [29.01261ms] a round, while another forward to its owner waited on a 500ms hold: [ForwardRound { served: true, during_hold: true, fast_took: 29.01261ms }]; b's fleet counters Ok({"content.purged_bytes": 698343424, "content.ticks.idle": 4, "fleet.discovery.pages": 17, "fleet.fan.sent": 3, "fleet.fan.unchanged": 14, "fleet.forward.batch_done": 4, "fleet.forward.begun": 4, "fleet.forward.client.control_started": 4, "fleet.forward.client.delivered_home": 2, "fleet.forward.client.resolved": 4, "fleet.forward.client.to_control": 2, "fleet.forward.taken_for_another": 1, "fleet.learner.fetch_paced": 2, "fleet.learner.fetches": 1, "fleet.owner_location.direc
+forwards_to_one_owner_never_wait_behind_each_other run 10 exit 0 load 37.23
+the forward of a read on a free shard took [105.122399ms] a round, while another forward to its owner waited on a 500ms hold: [ForwardRound { served: true, during_hold: true, fast_took: 105.122399ms }]; b's fleet counters Ok({"content.purged_bytes": 698343424, "content.ticks.idle": 5, "fleet.accept.replaced": 2, "fleet.discovery.pages": 20, "fleet.fan.sent": 3, "fleet.fan.unchanged": 15, "fleet.forward.batch_done": 4, "fleet.forward.begun": 4, "fleet.forward.client.control_started": 4, "fleet.forward.client.delivered_home": 2, "fleet.forward.client.resolved": 4, "fleet.forward.client.to_control": 2, "fleet.forward.taken_for_another": 1, "fleet.learner.fetches": 3, "fleet.owner_location.direc
+== forwards_to_one_owner_never_wait_behind_each_other passed 10 failed 0
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 1 exit 0 load 37.18
+hedge: measured before the hold Ok((1, Some(40141643))) (readings, p95 ns); second seal placed after 324.945764ms against a 3000000000 ns hold; readings after Ok((7, Some(35805110)))
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 2 exit 0 load 37.08
+hedge: measured before the hold Ok((1, Some(29896059))) (readings, p95 ns); second seal placed after 628.018015ms against a 3000000000 ns hold; readings after Ok((2, Some(27483062)))
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 3 exit 0 load 37.00
+hedge: measured before the hold Ok((1, Some(29738896))) (readings, p95 ns); second seal placed after 698.301784ms against a 3000000000 ns hold; readings after Ok((2, Some(29738896)))
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 4 exit 0 load 37.25
+hedge: measured before the hold Ok((1, Some(35874311))) (readings, p95 ns); second seal placed after 593.014301ms against a 3000000000 ns hold; readings after Ok((2, Some(33761194)))
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 5 exit 0 load 37.44
+hedge: measured before the hold Ok((1, Some(37444568))) (readings, p95 ns); second seal placed after 300.116313ms against a 3000000000 ns hold; readings after Ok((7, Some(37444568)))
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 6 exit 0 load 37.27
+hedge: measured before the hold Ok((1, Some(36789478))) (readings, p95 ns); second seal placed after 341.000201ms against a 3000000000 ns hold; readings after Ok((2, Some(36789478)))
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 7 exit 0 load 37.21
+hedge: measured before the hold Ok((1, Some(55431193))) (readings, p95 ns); second seal placed after 580.01464ms against a 3000000000 ns hold; readings after Ok((2, Some(37409525)))
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 8 exit 0 load 37.41
+hedge: measured before the hold Ok((1, Some(40014518))) (readings, p95 ns); second seal placed after 549.029972ms against a 3000000000 ns hold; readings after Ok((2, Some(38224691)))
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 9 exit 0 load 37.32
+hedge: measured before the hold Ok((1, Some(41946637))) (readings, p95 ns); second seal placed after 327.207819ms against a 3000000000 ns hold; readings after Ok((7, Some(36782474)))
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 10 exit 0 load 37.48
+hedge: measured before the hold Ok((1, Some(50074719))) (readings, p95 ns); second seal placed after 520.185353ms against a 3000000000 ns hold; readings after Ok((2, Some(27155157)))
+== a_slow_first_round_candidate_is_hedged_after_the_measured_p95 passed 10 failed 0
