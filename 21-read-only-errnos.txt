@@ -1,0 +1,10 @@
+== native-linux-fuse: what each failing pjdfstest case got
+   5035 ENOENT
+    548 EROFS
+    102 527
+     18 EACCES
+== native-linux-nfs4: what each failing pjdfstest case got
+   5035 ENOENT
+    548 EROFS
+    102 527
+     18 EACCES
