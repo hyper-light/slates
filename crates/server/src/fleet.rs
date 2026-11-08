@@ -1392,6 +1392,25 @@ async fn serve_peer_records(
           count_refusal(ACCEPT_REFUSED);
           return Vec::new();
         }
+        // Diag only (live-durability-47, never on main): SLATES_DIAG_LIVE_REPLY_DELAY_MS delays each live reply this
+        // node serves, a holder at a degraded round trip (the lane A/B).
+        if matches!(
+          stream,
+          slates_cluster::live::LIVE_ENTRY_STREAM
+            | slates_cluster::live::LIVE_STATE_STREAM
+            | slates_cluster::live::LIVE_ENTRIES_STREAM
+        ) {
+          static DELAY_NS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+          let delay = *DELAY_NS.get_or_init(|| {
+            std::env::var("SLATES_DIAG_LIVE_REPLY_DELAY_MS")
+              .ok()
+              .and_then(|value| value.parse::<u64>().ok())
+              .map_or(0, |ms| ms.saturating_mul(1_000_000))
+          });
+          if delay > 0 {
+            let _ = slates_rt::futures::sleep(delay).await;
+          }
+        }
         match stream {
           crate::member_task::PLANE_EPOCH_STREAM => plane_secret
             .and_then(|secret| {
@@ -1434,6 +1453,14 @@ async fn serve_peer_records(
               .get(&peer_anchor)
               .map_or(seed, |learned| learned.host);
             crate::live_ship::serve_state(s, local, peer_host, &request)
+          })
+          .unwrap_or_default(),
+          slates_cluster::live::LIVE_ENTRIES_STREAM => state::with_state(|s| {
+            let peer_host = s
+              .learned_members
+              .get(&peer_anchor)
+              .map_or(seed, |learned| learned.host);
+            crate::live_ship::serve_entries(s, local, peer_host, &request)
           })
           .unwrap_or_default(),
           crate::mirror::MIRROR_RECORD_STREAM => state::with_state(|s| {

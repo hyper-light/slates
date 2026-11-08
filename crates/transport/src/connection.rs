@@ -1451,6 +1451,7 @@ impl Connection {
       return;
     };
     let mut grew = false;
+    let diag_before = pmtu.diag_state();
     for packet in packets {
       if pmtu.is_probe(packet.pn) {
         grew |= pmtu.on_probe_acked(packet.pn, now);
@@ -1459,6 +1460,8 @@ impl Connection {
       }
     }
     if grew {
+      // Diag only (live-durability-46, never on main): a probe confirmed a larger size.
+      eprintln!("LD-PMTU at {now} trigger probe_acked before {diag_before:?} after {:?}", pmtu.diag_state());
       let size = pmtu.current();
       self
         .controller
@@ -1479,7 +1482,14 @@ impl Connection {
     let Some(pmtu) = self.path_mtu.as_mut() else {
       return;
     };
-    if pmtu.on_large_packet_lost(now) {
+    let diag_before = pmtu.diag_state();
+    let diag_fell = pmtu.on_large_packet_lost(now);
+    // Diag only (live-durability-46, never on main): a probe timeout counted as an above-floor loss.
+    eprintln!(
+      "LD-PMTU at {now} trigger pto fell {diag_fell} before {diag_before:?} after {:?}",
+      pmtu.diag_state()
+    );
+    if diag_fell {
       self
         .controller
         .set_max_datagram(crate::endpoint::packet_budget_for(BASE_PLPMTU) as u64);
@@ -1495,16 +1505,29 @@ impl Connection {
       return;
     };
     let mut fell = false;
+    let (mut diag_large, mut diag_probes, mut diag_small) = (0u64, 0u64, 0u64);
+    let diag_before = pmtu.diag_state();
     lost.packets.retain(|packet| {
       if pmtu.is_probe(packet.pn) {
+        diag_probes += 1;
         pmtu.on_probe_lost(packet.pn, now);
         return false;
       }
       if packet.size > BASE_PLPMTU as u64 {
+        diag_large += 1;
         fell |= pmtu.on_large_packet_lost(now);
+      } else {
+        diag_small += 1;
       }
       true
     });
+    // Diag only (live-durability-46, never on main): every loss pass that touched path MTU discovery.
+    if diag_large > 0 || diag_probes > 0 || fell {
+      eprintln!(
+        "LD-PMTU at {now} trigger loss_pass large_lost {diag_large} small_lost {diag_small} probes_lost {diag_probes} fell {fell} before {diag_before:?} after {:?}",
+        pmtu.diag_state()
+      );
+    }
     lost.frames.retain(|frame| !matches!(frame, Frame::Ping));
     if fell {
       self
@@ -1809,6 +1832,20 @@ impl Connection {
   /// The congestion controller (for the bake-off's reports).
   pub fn controller(&self) -> &Controller {
     &self.controller
+  }
+
+  /// Diag only (live-durability-47, never on main): (bytes in flight, cwnd, in slow start, competitive mode, connection
+  /// bytes sent, the peer's MaxData, the receive window advertised and its growths).
+  pub fn diag_transport(&self) -> (u64, u64, bool, bool, u64, u64, (u64, u64)) {
+    (
+      self.bytes_in_flight(),
+      self.congestion_window(),
+      self.controller.in_startup(),
+      self.controller.copa().competitive(),
+      self.connection_sent,
+      self.peer_max_data,
+      self.receive_window(),
+    )
   }
 
   /// The bytes currently in flight.

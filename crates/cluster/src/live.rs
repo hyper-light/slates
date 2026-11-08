@@ -31,6 +31,8 @@ pub const LIVE_ENTRY_STREAM: u64 = 22;
 /// apart by their tag (`slates_db::live::is_fetch`), never by guessing at the bytes.
 /// Format: as [`LIVE_ENTRY_STREAM`]; a whole state is large, so it rides the `Bulk` class.
 pub const LIVE_STATE_STREAM: u64 = 23;
+/// Diag only (live-durability-47, never on main): the request kind a batch of entries rides (the lane A/B).
+pub const LIVE_ENTRIES_STREAM: u64 = 24;
 
 /// What one dispatch left: the sessions that answered, for the next write, and those still in flight.
 pub struct Shipped {
