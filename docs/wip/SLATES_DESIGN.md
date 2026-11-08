@@ -4619,8 +4619,8 @@ hard links and snapshot versions. No live kernel endpoint state is part of the i
 >   stops within one packet overhead (29 bytes), and re-searches after 600 s.
 > - **Black holes** (amended 2026-11-08). A black hole needs size-specific evidence, never loss every size
 >   suffers (RFC 8899 §4.3, "excessive loss of data sent with a specific packet size"; §3 item 4, robust to
->   loss "due to other reasons (including link transmission error, congestion)"). Three consecutive losses of
->   above-floor packets, or a probe timeout while one is out, only make the size *suspect*: the session sends
+>   loss "due to other reasons (including link transmission error, congestion)"). Three in a row of above-floor
+>   packets lost or probe timeouts while one is out only make the size *suspect*: the session sends
 >   at the floor, so packets that cross keep loss detection running, and probes at the size it had. One
 >   acknowledged probe, or any above-floor packet, and the size stands. Three probes at it declared lost while
 >   the floor's packets cross (§5.2) are the black hole, and the session falls to the floor and searches below

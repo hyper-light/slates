@@ -1468,9 +1468,9 @@ impl Connection {
 
   /// A probe timeout fired with packets above the floor in flight and nothing acknowledged since (RFC 8899
   /// §4.3): after a path shrinks, every packet at the old size is dropped, so no acknowledgement comes to
-  /// declare any of them lost. The timeout makes the size suspect (`PathMtu::on_silence`) — the session sends
-  /// at the floor, the probe's copy split to fit it (`split_front_retransmission`), while probes at the size
-  /// decide — but counts toward no black hole: a stopped peer acknowledges nothing at any size. Without the
+  /// declare any of them lost. Three such timeouts in a row make the size suspect (`PathMtu::on_silence`) — the
+  /// session sends at the floor, the probe's copy split to fit it (`split_front_retransmission`), while probes at
+  /// the size decide — but count toward no black hole: a stopped peer acknowledges nothing at any size. Without the
   /// floor a session whose path shrank retried full-size copies forever
   /// (`docs/bugs/2026-09-28-a-shrunken-path-deadlocked-before-its-black-hole-was-seen.md`); counted as a loss,
   /// a SIGSTOPped peer's three timeouts fell the session to the floor for good (2026-11-08).

@@ -33,8 +33,8 @@ PLPMTUD-sized probes fail to be acknowledged, the method enters the BASE state")
 
 ## Fix
 
-Loss and silence only make the size suspect. Three consecutive above-floor losses, or a probe timeout with one in
-flight (`PathMtu::on_silence`), have this effect:
+Loss and silence only make the size suspect. Three in a row, with none acknowledged between, of above-floor packets
+declared lost or probe timeouts with one in flight (`PathMtu::on_silence`) have this effect:
 
 - The session sends at the floor (`PathMtu::current`), so packets that cross keep the acknowledgements, and so
   loss detection, running.
@@ -44,9 +44,12 @@ One confirming probe acknowledged, or any above-floor packet acknowledged, and t
 those probes declared lost while the floor's packets cross are the black hole, and the session falls and searches
 below the size that stopped.
 
-A probe timeout counts toward no black hole, so a peer that answers nothing never makes one. The timeout still
-starts the confirmation. After a path shrinks, nothing acknowledges a full-size packet, so the floor-size sending
-is what keeps the 2026-09-28 deadlock away
+A probe timeout counts toward no black hole, so a peer that answers nothing never makes one. Three of them in a row
+still start the confirmation. The first cut of this fix made a single timeout enough: at
+least 1,230 and 1,525 suspicions in 30 partition runs on x86 and arm (diag-live-durability-49), each sending at the floor
+until a probe at the size came back, against the 44 and 45 falls the old rule made in the same flow
+(diag-live-durability-48). After a path shrinks, nothing acknowledges a full-size packet, so the floor-size sending is
+what keeps the 2026-09-28 deadlock away
 (`docs/bugs/2026-09-28-a-shrunken-path-deadlocked-before-its-black-hole-was-seen.md`).
 
 ## Test

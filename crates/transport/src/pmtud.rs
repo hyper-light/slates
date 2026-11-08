@@ -17,8 +17,8 @@
 //! black hole is "excessive loss of data sent with a specific packet size" (§4.3), never loss every size
 //! suffers, which is congestion the controller alone answers (§3 item 4: robust to loss "due to other reasons
 //! (including link transmission error, congestion)"). So loss only makes the size suspect:
-//! [`BLACK_HOLE_LOSSES`] consecutive losses of packets above the floor with none acknowledged between, or a
-//! probe timeout with one in flight (nothing at all acknowledged: a peer stopped, or the path dead, at every
+//! [`BLACK_HOLE_LOSSES`] in a row, with none acknowledged between, of packets above the floor declared lost or
+//! probe timeouts with one in flight (nothing at all acknowledged: a peer stopped, or the path dead, at every
 //! size). A suspect session sends at the floor, so packets that cross keep the acknowledgements, and loss
 //! detection, running, and probes at the size it had: one acknowledged, or any packet above the floor, and the
 //! size stands; [`MAX_PROBES`] of them declared lost while the floor's packets cross (§5.2: "If MAX_PROBES
@@ -318,25 +318,26 @@ impl PathMtu {
   /// session sends at the floor while probes at the size decide ([`PathMtu::on_probe_lost`]). Loss alone never
   /// falls it: every size is lost to congestion too.
   pub fn on_large_packet_lost(&mut self) -> bool {
+    self.note_large_evidence()
+  }
+
+  /// A probe timeout fired with a packet above the floor in flight and nothing acknowledged since. `true` when
+  /// this makes the size suspect, as [`PathMtu::on_large_packet_lost`], on the same count: after a path shrinks no
+  /// acknowledgement comes to declare any full-size packet lost, so the timeouts must start the confirmation, and
+  /// one spurious timeout must not send a session at the floor. It is no evidence of size (a stopped peer
+  /// acknowledges nothing at any size), so it counts toward no black hole: only failed probes make one.
+  pub fn on_silence(&mut self) -> bool {
+    self.note_large_evidence()
+  }
+
+  /// One more above-floor packet lost or timed out with none acknowledged between; [`BLACK_HOLE_LOSSES`] in a row
+  /// make the size suspect. `true` when this one did.
+  fn note_large_evidence(&mut self) -> bool {
     if self.confirmed <= BASE_PLPMTU || self.suspect.is_some() {
       return false;
     }
     self.large_losses = self.large_losses.saturating_add(1);
     if self.large_losses < BLACK_HOLE_LOSSES {
-      return false;
-    }
-    self.large_losses = 0;
-    self.suspect = Some(0);
-    true
-  }
-
-  /// A probe timeout fired with a packet above the floor in flight and nothing acknowledged since. `true` when
-  /// this makes the size suspect, as [`PathMtu::on_large_packet_lost`]: after a path shrinks no acknowledgement
-  /// comes to declare any full-size packet lost, so the timeout must start the confirmation, sending at the
-  /// floor; and it is no evidence of size at all (a stopped peer acknowledges nothing at any size), so it counts
-  /// toward no black hole.
-  pub fn on_silence(&mut self) -> bool {
-    if self.confirmed <= BASE_PLPMTU || self.suspect.is_some() {
       return false;
     }
     self.large_losses = 0;
@@ -544,7 +545,14 @@ mod tests {
   fn silence_makes_the_size_suspect_and_one_acknowledged_probe_restores_it() {
     let mut pmtu = converged_on_jumbo();
     let size = pmtu.current();
-    assert!(pmtu.on_silence());
+    for _ in 1..BLACK_HOLE_LOSSES {
+      assert!(
+        !pmtu.on_silence(),
+        "one spurious timeout leaves the size standing"
+      );
+      assert_eq!(pmtu.current(), size);
+    }
+    assert!(pmtu.on_silence(), "the third in a row makes it suspect");
     for _ in 0..8 {
       assert!(!pmtu.on_silence(), "already suspect: nothing more");
     }
