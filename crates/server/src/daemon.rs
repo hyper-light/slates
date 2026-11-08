@@ -1262,6 +1262,23 @@ impl Daemon {
       .unwrap_or(0)
   }
 
+  /// Each shard's own CPU time now, in nanoseconds (§4.14; `slates_rt::registry::shard_cpu`): what its thread has run,
+  /// read from any thread. Over a wait it tells a shard held in its own work (its time moves with the wall) from one
+  /// off the CPU (its time barely moves); which of preempted and blocked in a call the latter was, the clock cannot
+  /// tell, and `slates_rt::registry::shard_run_state` sampled over the wait does (macOS). In shard order; a shard whose
+  /// thread recorded no clock is omitted.
+  pub fn shard_cpu_ns(&self) -> Vec<(u16, u64)> {
+    self
+      .shards
+      .iter()
+      .filter_map(|shard| {
+        registry::holder_of(shard.0)
+          .and_then(registry::shard_cpu)
+          .map(|reading| (shard.0, reading.spent_ns))
+      })
+      .collect()
+  }
+
   /// Every shard's forward-progress pulse ([`ShardPulse`], §4.14), read **directly** from the runtime's
   /// registry with no shard round-trip — the discipline of [`Self::fleet_progress`] — so it is reported even
   /// when a shard is too starved, or too wedged, to answer a query. In shard order; a shard whose registry
