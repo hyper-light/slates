@@ -2734,11 +2734,28 @@ fn assert_refused(refused: &Refused) {
   );
 }
 
+/// Shape: the memory a fleet test's node may size itself from: GitHub's Linux runners' 16 GiB, the machines these tests
+/// are gated on, whose derived sizes it leaves as they were. A node's client seats, task arenas and forward lane are
+/// derived from its memory, so on a larger machine a test that fills an arena or a lane worked at that machine's size.
+/// Measured on a 96 GiB Mac Studio (2026-11-08) for b in `a_silent_owner_leaves_no_forward_the_lane_admitted_unrun`:
+/// without it, `clients_per_shard` 15,420 and `tasks_per_shard` 61,690, a burst of 3,856 clients whose connects
+/// failed; with it, 2,570 and 10,294, 644 clients, as on CI (645 to 647).
+const FLEET_NODE_MEMORY_BYTES: u64 = 16 << 30;
+
 /// A fleet node's identity parts (no addresses — an N-node node serves each peer on its own socket, so
 /// addresses are per ordered pair, allocated in the mesh below, not per node).
 fn fleet_node(name: &str) -> (MachineProfile, HostId, Identity) {
   let mut profile = profile(name);
   profile.facts.identity.cpu = format!("{}-{}", profile.facts.identity.cpu, unique());
+  profile.facts.memory.limit = Some(
+    profile
+      .facts
+      .memory
+      .limit
+      .map_or(FLEET_NODE_MEMORY_BYTES, |limit| {
+        limit.min(FLEET_NODE_MEMORY_BYTES)
+      }),
+  );
   // Return the routing seed; callers observe the actual id after starting the daemon.
   let host = member_id(anchor_of(&profile), 0);
   (profile, host, self_signed())
@@ -5568,8 +5585,9 @@ fn a_silent_forward_gives_up_while_its_session_carries_others() {
   );
 }
 
-/// Shape: how long [`fill_task_arena`] may take to fill a shard's arena, and each filler's admission wait.
-const FILL_DEADLINE: Duration = Duration::from_secs(30);
+/// Shape: how long [`fill_task_arena`] may go without a filler admitted before it calls the shard stuck. It bounds a
+/// stall, not the fill, whose length is the arena's size.
+const FILL_STALL: Duration = Duration::from_secs(30);
 /// Shape: how long a forward refused at admission may take to be answered: a liveness budget is far more than
 /// the moment its guard takes, and far less than the forever it waited before.
 const UNSTARTED_ANSWER_NS: u64 = slates_server::daemon::LIVENESS_BUDGET_NS;
@@ -5578,11 +5596,11 @@ const UNSTARTED_ANSWER_NS: u64 = slates_server::daemon::LIVENESS_BUDGET_NS;
 /// admitted tasks, to cancel. A control channel momentarily full is waited out.
 fn fill_task_arena(shard: u16) -> Vec<slates_rt::shard::TaskId> {
   let mut admitted = Vec::new();
-  let began = Instant::now();
+  let mut progressed = Instant::now();
   loop {
     assert!(
-      began.elapsed() < FILL_DEADLINE,
-      "the arena filled within {FILL_DEADLINE:?} ({} admitted)",
+      progressed.elapsed() < FILL_STALL,
+      "the shard admitted a filler within {FILL_STALL:?} ({} admitted)",
       admitted.len()
     );
     let (request, receipt) =
@@ -5596,8 +5614,11 @@ fn fill_task_arena(shard: u16) -> Vec<slates_rt::shard::TaskId> {
       std::thread::yield_now();
       continue;
     }
-    match receipt.wait(FILL_DEADLINE) {
-      Some(slates_rt::task::Admission::Admitted(task)) => admitted.push(task),
+    match receipt.wait(FILL_STALL) {
+      Some(slates_rt::task::Admission::Admitted(task)) => {
+        admitted.push(task);
+        progressed = Instant::now();
+      }
       Some(slates_rt::task::Admission::Refused(_)) => return admitted,
       other => panic!("a filler's admission: {other:?}"),
     }
