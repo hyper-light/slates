@@ -1,0 +1,46 @@
+runner windows-latest, 4 CPUs, 3b17f2e diag: the A-228 scheduler reader's tests and clippy on both Windows runn, Sun Nov  8 13:29:18 UTC 2026
+test thread_clock::tests::a_snapshot_gives_the_state_of_the_thread_asked_for ... ok
+test thread_clock::tests::a_schedstat_line_gives_its_second_field ... ok
+test thread_clock::tests::a_stat_line_gives_the_state_after_the_last_parenthesis ... ok
+test thread_clock::tests::a_damaged_snapshot_is_refused_without_a_panic ... ok
+test thread_clock::tests::a_windows_thread_state_maps_to_a_run_state ... ok
+test thread_clock::tests::a_threads_run_state_tells_a_spinning_thread_from_a_waiting_one ... ok
+test thread_clock::tests::a_threads_cpu_clock_reads_from_another_thread_and_grows_as_it_runs ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 41 filtered out; finished in 0.02s
+== reader tests, run 1, exit 0
+test thread_clock::tests::a_snapshot_gives_the_state_of_the_thread_asked_for ... ok
+test thread_clock::tests::a_schedstat_line_gives_its_second_field ... ok
+test thread_clock::tests::a_stat_line_gives_the_state_after_the_last_parenthesis ... ok
+test thread_clock::tests::a_damaged_snapshot_is_refused_without_a_panic ... ok
+test thread_clock::tests::a_windows_thread_state_maps_to_a_run_state ... ok
+test thread_clock::tests::a_threads_run_state_tells_a_spinning_thread_from_a_waiting_one ... ok
+test thread_clock::tests::a_threads_cpu_clock_reads_from_another_thread_and_grows_as_it_runs ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 41 filtered out; finished in 0.02s
+== reader tests, run 2, exit 0
+test thread_clock::tests::a_snapshot_gives_the_state_of_the_thread_asked_for ... ok
+test thread_clock::tests::a_schedstat_line_gives_its_second_field ... ok
+test thread_clock::tests::a_stat_line_gives_the_state_after_the_last_parenthesis ... ok
+test thread_clock::tests::a_damaged_snapshot_is_refused_without_a_panic ... ok
+test thread_clock::tests::a_windows_thread_state_maps_to_a_run_state ... ok
+test thread_clock::tests::a_threads_run_state_tells_a_spinning_thread_from_a_waiting_one ... ok
+test thread_clock::tests::a_threads_cpu_clock_reads_from_another_thread_and_grows_as_it_runs ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 41 filtered out; finished in 0.02s
+== reader tests, run 3, exit 0
+test thread_clock::tests::a_schedstat_line_gives_its_second_field ... ok
+test thread_clock::tests::a_snapshot_gives_the_state_of_the_thread_asked_for ... ok
+test thread_clock::tests::a_stat_line_gives_the_state_after_the_last_parenthesis ... ok
+test thread_clock::tests::a_damaged_snapshot_is_refused_without_a_panic ... ok
+test thread_clock::tests::a_windows_thread_state_maps_to_a_run_state ... ok
+test thread_clock::tests::a_threads_run_state_tells_a_spinning_thread_from_a_waiting_one ... ok
+test thread_clock::tests::a_threads_cpu_clock_reads_from_another_thread_and_grows_as_it_runs ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 41 filtered out; finished in 0.02s
+== reader tests, run 4, exit 0
+test thread_clock::tests::a_schedstat_line_gives_its_second_field ... ok
+test thread_clock::tests::a_snapshot_gives_the_state_of_the_thread_asked_for ... ok
+test thread_clock::tests::a_stat_line_gives_the_state_after_the_last_parenthesis ... ok
+test thread_clock::tests::a_damaged_snapshot_is_refused_without_a_panic ... ok
+test thread_clock::tests::a_windows_thread_state_maps_to_a_run_state ... ok
+test thread_clock::tests::a_threads_run_state_tells_a_spinning_thread_from_a_waiting_one ... ok
+test thread_clock::tests::a_threads_cpu_clock_reads_from_another_thread_and_grows_as_it_runs ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 41 filtered out; finished in 0.02s
+== reader tests, run 5, exit 0
