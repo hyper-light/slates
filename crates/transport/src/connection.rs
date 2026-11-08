@@ -1459,6 +1459,8 @@ impl Connection {
       }
     }
     if grew {
+      // Diag only (live-durability-51, never on main).
+      let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("LD-PMTU trigger acked grew current {} suspect {} black_holes {}\n", pmtu.current(), pmtu.suspect(), pmtu.stats().black_holes).as_bytes());
       let size = pmtu.current();
       self
         .controller
@@ -1481,7 +1483,10 @@ impl Connection {
     let Some(pmtu) = self.path_mtu.as_mut() else {
       return;
     };
-    if pmtu.on_silence() {
+    let diag_suspected = pmtu.on_silence();
+    // Diag only (live-durability-51, never on main): one write, so processes' lines cannot interleave.
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("LD-PMTU trigger pto suspected {diag_suspected} current {} suspect {} black_holes {}\n", pmtu.current(), pmtu.suspect(), pmtu.stats().black_holes).as_bytes());
+    if diag_suspected {
       self
         .controller
         .set_max_datagram(crate::endpoint::packet_budget_for(BASE_PLPMTU) as u64);
@@ -1509,6 +1514,10 @@ impl Connection {
       true
     });
     lost.frames.retain(|frame| !matches!(frame, Frame::Ping));
+    // Diag only (live-durability-51, never on main).
+    if fell || pmtu.suspect() {
+      let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("LD-PMTU trigger loss_pass suspected {fell} current {} suspect {} black_holes {}\n", pmtu.current(), pmtu.suspect(), pmtu.stats().black_holes).as_bytes());
+    }
     if fell {
       self
         .controller
