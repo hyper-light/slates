@@ -5239,6 +5239,23 @@ integration still require the A-9 tests.
 > `a_submit_in_a_three_process_fleet_is_answered_once_its_record_commits` (CLI), and
 > `a_joint_placement_with_a_cohort_smaller_than_the_quorum_needs_every_member_of_it`.
 
+> **Status (2026-11-07, A-244, the supervisor's decision "A's tracking with B's confirmation";
+> `docs/bugs/2026-11-07-a-holder-restarted-warm-lost-its-copies-routing.md`).** A member that dies while a voter
+> restarts is now taken over. Two corrections:
+> - **Who declares a death.** The council's leader retires a member only once `f + 1` voters hold it dead, its own
+>   stable view being one vote, or by every voter while the council has fewer than `f + 1` besides the member (a
+>   forming council's sole voter decides alone). The other voters report their dead on the council's membership path once a period,
+>   never on a write, and a report below the incarnation the leader holds the member alive at counts for nothing. A
+>   restarted voter watches every configured member, so one it has not reached for the membership horizon since its
+>   start counts as dead even before its detector keyed it.
+> - **A restored copy is routed.** A holder restarted warm routes each copy from its held image to the owner its
+>   acceptor names. Unrouted, it never moved the copy to the successor and refused the successor's adoption
+>   `ForeignGeneration` every period, and it answered the successor's page empty while it held the copy unfenced.
+> Regressions: `a_lone_voters_suspicion_never_retires_a_member`,
+> `a_sole_voters_own_view_retires_a_member_while_its_council_forms`, `a_restored_holders_copy_moves_to_its_successor_and_accepts_its_adoption`, and
+> `a_member_down_through_a_voters_restart_is_still_taken_over` (CLI; 15 of 15 on adacachy). No TLA+ re-run is owed:
+> `Reconfig.tla` models the holder set's change once a retirement commits, not the decision to retire.
+
 **Leases and reads.** Epoch fencing alone does not authorize linearizable owner-local reads.
 Use the explicit lease safety obligations above: only an owner with a currently confirmed,
 conservatively bounded lease may serve the latest head locally. Expiry/uncertainty stops those
@@ -14842,6 +14859,55 @@ Applied in the same change to:
   - A rename copies its source's bytes into one chunk rather than sharing its pieces.
   - A base-seeded green's origin is held as chunks beside the head copy (W4, reland-a207's).
   - Greens merged before the fix may hold zeros a run after a length change put there.
+
+### A-244 — A member's death is retired at f + 1 voters, configured members are watched after a restart, and a restored copy is routed (accepted and built 2026-11-07, the supervisor's decision "A's tracking with B's confirmation")
+
+Applied in the same change to:
+- §4.8 "Promotion and takeover": a status note.
+- GAPS: the 2026-11-07 entry on a member down through a voter's restart.
+- `crates/server`:
+  - `fleet.rs`: `update_council_death_watch` with `unreached_since_start`, `confirmed_dead_council_members`,
+    `death_report`, `serve_death_report` and `send_death_report` on `DEATH_STREAM`, `follow_council_period`; held
+    records refused are counted by kind (`count_record_refusal`).
+  - `state.rs`: `death_reports`, `death_watch_started_ns`.
+  - `content_holder.rs`: `restore_held_registers` routes each restored copy.
+  - `takeover.rs`: the round's silent outcomes are counted.
+- The tests: `a_lone_voters_suspicion_never_retires_a_member`,
+  `a_sole_voters_own_view_retires_a_member_while_its_council_forms` and
+  `a_restored_holders_copy_moves_to_its_successor_and_accepts_its_adoption` (`crates/server/src/daemon.rs`), and
+  `a_member_down_through_a_voters_restart_is_still_taken_over` (`crates/cli/tests/live_fleet.rs`).
+- **What was there.**
+  - The council's leader retired a member on its own detector's view alone. After a warm restart the detector joins a
+    member only once its pair is keyed, and gossip about a member it has not joined is ignored (AUD-15). So a member
+    that died while the leader restarted was never judged at all and never retired.
+  - A copy restored from the held image got its acceptor back and no routing. Every install reaches a held copy only
+    through routing, so a restarted holder never moved the copy to its successor, never raised its generation, and
+    answered the successor's page empty. The successor's adoption was refused `ForeignGeneration` every period.
+- **The rule.**
+  1. A configured member is watched after a restart: one the detector has not reached for the membership horizon
+     since the watch began, unkeyed and not held alive, counts as dead.
+  2. A death is retired only at `f + 1` voters of the region, or every voter while the council has fewer than
+     `f + 1` besides the member (`Quorum::committed_within`, the floor a joint write takes): a forming council's sole
+     voter retires on its own view, since no other voter exists to report. The leader's own stable view is one vote.
+     Every other voter reports the members it holds dead on the council's membership path (`DEATH_STREAM`, once a
+     council period), never on a write. A report is kept for the membership horizon.
+  3. An incarnation cancels older reports: one below the incarnation the leader holds the member alive at counts for
+     nothing.
+  4. A restored copy is routed to the owner its acceptor names, as accepting a record does.
+- **TLA+.** No re-run is owed. `Reconfig.tla` models how the holder set changes once a retirement commits, not how
+  a death is decided. These rules change only who may propose a retirement and when, and a held copy's routing.
+- **Measured** (adacachy, 2026-11-07, `a_member_down_through_a_voters_restart_is_still_taken_over`, alone, under the
+  box's other sessions' load).
+  - With rule 2 alone (caf06d71): the restarted leader retired the owner in 2 of 2 runs it led; without its own vote,
+    red 3 of 3.
+  - Before rule 4: 4 stalls in 9 runs, each with the successor's 2 objects pending, and in the runs counted 1,058 to
+    1,130 unplaced adoptions in a minute.
+  - With rule 4: 15 of 15 in a row, each served in 3.7 to 7.4 s. Without it the unit test fails.
+  - Without rule 2's floor, `an_owner_killed_while_its_fleet_still_forms_is_taken_over` failed 3 of 3 alone: its
+    council's sole voter could never gather two votes.
+- **Owed.** A page still counts a holder's empty answer as its promise even when the holder leaves out a copy it
+  holds. With routing restored a restart no longer does this, but the rule belongs in phase one, for the takeover's
+  owner (the bug record's siblings).
 
 ### A-238 — A green's durable chain is checkpointed at its reachable floor, and a base below the checkpoint is unknown (accepted and built 2026-11-06, W3 of the load test's walls)
 

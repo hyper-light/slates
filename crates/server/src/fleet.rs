@@ -715,11 +715,12 @@ fn unreached_since_start(state: &ShardState, member: HostId, since_ns: u64) -> b
 }
 
 /// The council members this leader may retire now (§4.8 "Promotion and takeover"): those at least `f + 1` voters
-/// hold dead, this leader's own stable death watch ([`stable_dead_council_members`]) one of them and each other
-/// voter's fresh report ([`ShardState::death_reports`]) one more. A report is fresh within a membership horizon, and
-/// counts only at an incarnation at or above any this leader holds the member alive at, so a refutation cancels the
-/// reports below it. One voter's lone suspicion, the leader's own included, never retires a member; at `f = 0` the
-/// leader's own watch suffices (R8).
+/// hold dead, or every voter while the council has fewer than `f + 1` besides the member (`Quorum::committed_within`),
+/// this leader's own stable death watch ([`stable_dead_council_members`]) one of them and each other voter's fresh
+/// report ([`ShardState::death_reports`]) one more. A report is fresh within a membership horizon, and counts only at
+/// an incarnation at or above any this leader holds the member alive at, so a refutation cancels the reports below it.
+/// One voter's lone suspicion, the leader's own included, never retires a member while another voter could report;
+/// a forming council's sole voter, and the leader at `f = 0` (R8), retire on their own watch.
 pub(crate) fn confirmed_dead_council_members(state: &mut ShardState) -> Vec<HostId> {
   let now = futures::now_ns();
   let horizon = crate::lease::horizon_ns();
@@ -728,9 +729,7 @@ pub(crate) fn confirmed_dead_council_members(state: &mut ShardState) -> Vec<Host
   }
   state.death_reports.retain(|_, reports| !reports.is_empty());
   let own: Vec<HostId> = stable_dead_council_members(state);
-  let needed = usize::try_from(state.fleet.configuration().quorum.f)
-    .unwrap_or(usize::MAX)
-    .saturating_add(1);
+  let quorum = state.fleet.configuration().quorum;
   let local = state.fleet.host();
   let voters = state.council.voters();
   let mut candidates: Vec<HostId> = own.clone();
@@ -758,7 +757,12 @@ pub(crate) fn confirmed_dead_council_members(state: &mut ShardState) -> Vec<Host
           })
           .count()
       });
-      usize::from(own.contains(member)).saturating_add(reported) >= needed
+      // `f + 1` of the voters that can vote on the member (itself excluded), or every one of them while the council
+      // has fewer, as a joint write needs every member of a cohort smaller than `f + 1`: a forming council's sole voter
+      // retires on its own view, since no other voter exists to report, and three voters at `f = 1` still need two.
+      let electorate = voters.iter().filter(|voter| *voter != member).count();
+      let votes = usize::from(own.contains(member)).saturating_add(reported);
+      quorum.committed_within(votes, electorate)
     })
     .collect()
 }
@@ -780,8 +784,11 @@ fn death_report(state: &ShardState) -> Vec<u8> {
   out
 }
 
-/// Format: one report's entry, a member and an incarnation of 8 bytes each.
-const DEATH_REPORT_ENTRY_BYTES: usize = 16;
+/// Format: one field of a report's entry, a little-endian `u64` (a member id or an incarnation).
+const DEATH_REPORT_FIELD_BYTES: usize = size_of::<u64>();
+
+/// Format: one report's entry, a member then its incarnation ([`DEATH_REPORT_FIELD_BYTES`] each).
+const DEATH_REPORT_ENTRY_BYTES: usize = 2 * DEATH_REPORT_FIELD_BYTES;
 
 /// Takes a voter's death report ([`death_report`]) on [`DEATH_STREAM`]: kept only from a voter of this region's
 /// council, only about current members, at most one entry per member, and answered empty. Malformed bytes are
@@ -798,10 +805,10 @@ fn serve_death_report(state: &mut ShardState, reporter: HostId, request: &[u8]) 
   let members = state.council.configuration().members.clone();
   let now = futures::now_ns();
   for entry in request.as_chunks::<DEATH_REPORT_ENTRY_BYTES>().0 {
-    let (member, incarnation) = entry.split_at(8);
+    let (member, incarnation) = entry.split_at(DEATH_REPORT_FIELD_BYTES);
     let (Ok(member), Ok(incarnation)) = (
-      <[u8; 8]>::try_from(member),
-      <[u8; 8]>::try_from(incarnation),
+      <[u8; DEATH_REPORT_FIELD_BYTES]>::try_from(member),
+      <[u8; DEATH_REPORT_FIELD_BYTES]>::try_from(incarnation),
     ) else {
       continue;
     };
@@ -1757,7 +1764,7 @@ const RECORD_REFUSED_BY_FAULT: &str = "fleet.record.refused_by_fault";
 /// Every survivor computes the same routing winner, so this needs no coordination. Idempotent: an install
 /// of the same owner under an equal-or-higher generation is accepted, a lower one refused (ignored), so the
 /// authority only advances.
-fn reconcile_held_authority(state: &mut ShardState) {
+pub(crate) fn reconcile_held_authority(state: &mut ShardState) {
   let generation = state.fleet.configuration().version;
   let held: Vec<ObjectId> = state.holder_records.keys().copied().collect();
   for object in held {
@@ -1793,9 +1800,31 @@ pub(crate) fn accept_held_record(
     return Vec::new();
   }
   if let Err(error) = check_held_record(state, local, peer_host, record) {
+    count_record_refusal(state, &error);
     return encode_refusal(&error);
   }
   hold_checked_record(state, local, peer_host, record)
+}
+
+/// The status count of held records accepted into their acceptor whose owner the routing view refused to track (not a
+/// member of the council's configuration), so no acknowledgement was given. Format: a refusal name in the daemon's
+/// status report.
+const RECORD_REFUSED_UNTRACKED: &str = "fleet.record.refused.untracked";
+
+/// Counts a held record this holder refused, by its register refusal kind (`fleet.record.refused.<kind>`), so a sender
+/// whose commit never places shows on the holder why: before these, a holder restarted warm refused a successor's
+/// adoption `ForeignGeneration` every period without a trace. Format: refusal names in the daemon's status report.
+fn count_record_refusal(state: &mut ShardState, error: &RegisterError) {
+  let kind = match error {
+    RegisterError::StaleEpoch { .. } => "fleet.record.refused.stale_epoch",
+    RegisterError::ConfigurationStale { .. } => "fleet.record.refused.configuration_stale",
+    RegisterError::Unsupported { .. } => "fleet.record.refused.unsupported",
+    RegisterError::MalformedRecord => "fleet.record.refused.malformed",
+    RegisterError::Unauthorized => "fleet.record.refused.unauthorized",
+    RegisterError::ForeignGeneration { .. } => "fleet.record.refused.foreign_generation",
+    RegisterError::ConflictingPosition => "fleet.record.refused.conflicting_position",
+  };
+  state.count(kind, 1);
 }
 
 /// The status count of held records accepted but not acknowledged because the shard's publish carrying them was
@@ -1858,13 +1887,19 @@ pub(crate) fn hold_checked_record(
           }
           ack.encode()
         }
-        Err(error) => encode_refusal(&error),
+        Err(error) => {
+          state.count(RECORD_REFUSED_UNTRACKED, 1);
+          encode_refusal(&error)
+        }
       }
     }
     // A refusal the sender acts on rides back on the wire (a `ConfigurationStale` naming this node's newer
     // version, so a stale sender refreshes and retries); every other refusal is an empty reply the sender
     // counts as no acknowledgement ([`encode_refusal`]).
-    Err(error) => encode_refusal(&error),
+    Err(error) => {
+      count_record_refusal(state, &error);
+      encode_refusal(&error)
+    }
   }
 }
 

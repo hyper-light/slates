@@ -3197,6 +3197,16 @@ fn a_member_down_through_a_voters_restart_is_still_taken_over() {
       (survivor.clone(), fields, counts)
     })
     .collect();
+  if served.is_none() {
+    // Every survivor's whole status, for the record of a failing run.
+    for survivor in &survivors {
+      let (_, out, _) = run(survivor, &["status"]);
+      let path = format!("{}/{survivor}.status", env!("CARGO_TARGET_TMPDIR"));
+      #[allow(clippy::disallowed_methods)]
+      let _ = std::fs::write(&path, out);
+      eprintln!("voter restart: status of {survivor} at {path}");
+    }
+  }
   drop(fleet.daemons);
   drop(fleet.scratch);
   eprintln!("voter restart: restarted {restarted}; served by {served:?}; {views:?}");

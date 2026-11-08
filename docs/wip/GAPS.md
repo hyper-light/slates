@@ -14292,6 +14292,25 @@ because sixteen daemons share the test process, and was the second partition.
   working; one asleep (state `S`) using no CPU may be stuck. The current check cannot tell these apart. A refusal costs
   the start: in production the anchor restarts the daemon, with crash-loop backoff if it repeats (A-119).
 
+### 2026-11-07: a member down through a voter's restart was never taken over — fixed (A-244)
+
+`a_member_down_through_a_voters_restart_is_still_taken_over` (`crates/cli/tests/live_fleet.rs`) stops a voter and
+restarts it warm, then kills the owner of a volume. It failed for two causes in turn (adacachy):
+- **The restarted leader never condemned the dead owner.** It retired a member on its own detector alone, and after a
+  warm restart that detector never joined a member it could not key. Now a death is retired at `f + 1` voters, the
+  leader's own view one vote, other voters reporting theirs on the council's membership path, and a restarted voter
+  watches every configured member (caf06d71). Without the leader's own vote the test was red 3 of 3. As first built,
+  the rule also demanded two votes of a forming council's sole voter, so
+  `an_owner_killed_while_its_fleet_still_forms_is_taken_over` failed 3 of 3 alone; the threshold now takes
+  `Quorum::committed_within`'s floor, every voter while there are fewer than `f + 1` besides the member.
+- **A restarted holder refused the successor's adoption.** Its restored copies had no routing, so no install reached
+  them: 4 stalls in 9 runs, the successor's objects pending, about 1,100 adoptions refused `ForeignGeneration` a
+  minute. Restored copies are now routed, and the test passed 15 of 15 in a row
+  (`docs/bugs/2026-11-07-a-holder-restarted-warm-lost-its-copies-routing.md`).
+
+Open, reported to the takeover's owner: a holder's empty page still counts as its promise when it leaves out a copy it
+holds, and a record's sender on a restarted holder falls back to the seed's id until it relearns the peer.
+
 ### 2026-11-07: two nfs_hostile siblings under load — a MOUNT answered SYSTEM_ERR (already fixed) and a stop announced as a restart — fixed
 
 Seen running `crates/server/tests/nfs_hostile.rs` with its tests in parallel under two spinners a core (an 18-core
