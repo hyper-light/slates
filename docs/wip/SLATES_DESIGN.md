@@ -16150,6 +16150,15 @@ overwrite, `SetBasicInfo`, `CanDelete` and rename in `host.rs`).
   accept, identical or conflict, never inferred (D-27); until then a merge carries none of them, so a green made by
   merging keeps none. (2) A Windows landing applying them (`SetFileAttributesW`). (3) A Windows base plane reading
   them from the disk.
+- **Invisible to the merge and the landing until then (checked 2026-11-08).** A work's increment is composed from the
+  operations declared through the SDK (`WorkState::journal`: edits and declarations, `WorkOp`), and no `WorkOp` carries
+  the bits, so no work can set them and two increments can never differ in them alone; a mounted work would be derived
+  from its volume's journal, and the volume's ops document carries none of them
+  (`windows_attribute_bits_are_invisible_to_the_ops_document_until_the_merge_carries_them`, `crates/vfs/tests/derive.rs`:
+  a bits-only work derives the unchanged document byte for byte, and a rewrite derives the same with or without them).
+  A landing ignores them without error (`a_landing_ignores_windows_attribute_bits_without_error`,
+  `crates/land/tests/oracle.rs`: §4.15's worked example with the bits on an edited, a created and an untouched base file
+  lands `Done` and leaves the same disk, writing as many entries as without).
 - **Proven** by `windows_attributes_survive_an_image_and_a_rebuild` and the golden vector (`crates/vfs/tests/recover.rs`),
   `setattr_keeps_the_windows_attribute_bits_for_each_kind` (`crates/bridge-core/tests/volume_bridge.rs`; red with the
   bridge's setter removed: the file reported 32 where 6 was set), `windows_attribute_bits_ask_for_the_owner`, the
