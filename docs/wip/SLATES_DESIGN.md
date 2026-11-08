@@ -13992,9 +13992,14 @@ Status: accepted 2026-11-07; built in two steps (one node, then across nodes).
     - `slates read` and MCP's resource and `view_arg` reads default to `Head`, one request per interactive read, and
       could opt in;
     - the Python and Node SDKs issue no `ReadAt` read over the ring at all.
-  - *So the order is:* a named-version read needs no new form, since a committed version is immutable and any holder of
-    it can serve it, so it moves with the same root. `AtLeast` is for clients that read "recent enough" (the CLI's and
-    MCP's opt-in reads, and a `Versions` taking a floor).
+  - *The 60%, named-version reads, needs only a published root.* A committed version is immutable, so any holder of it
+    can serve it, with no new read form and no floor. It moves off the owner when the root below exists.
+  - *The 40%, the `Versions` calls, goes without a read path (the supervisor, 2026-11-08).* On a conflict, `Submitted`
+    and `Rebased` name the head the verdict was judged against, a reply field taken in the wire's next major. A client
+    reads its conflict windows at that version instead of asking `Versions`, so the bytes it reads are exactly the
+    bytes the verdict saw, where a `Versions` call could name a later head. About 13% of the retries. Test first: a
+    conflict's reply names the head it was judged against, and a read at that version shows exactly those bytes.
+  - *`AtLeast` comes last*, for clients that read "recent enough": the CLI's and MCP's opt-in reads.
   - *The root does not exist yet.* A green's committed state is the engine's `BTreeMap` and W2's shard-local `Chunks`,
     owned by one shard's thread. No epoch-published root exists for a green, so publishing one is part of this work.
   - *Test first:* a client never reads below its own accepted version, from any shard, over a model of commits and
