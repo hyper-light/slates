@@ -214,6 +214,17 @@
 > each side. An RTT seeded from the dropped session was considered and not built: none of 820 handshakes across 118
 > resumes waited on the retry cap it would shorten (diag-live-durability-50).
 
+> **Fixed (live-durability, 2026-11-08): a holder repeating the head it last acknowledged was taken for one off the
+> chain.** An entry every holder holds is trimmed, so `Shipper::on_chain` no longer knew a head its holder had already
+> had accepted, and a holder reporting it again (refusing an entry it was not ready for) was answered with an install,
+> though the entries after it were all retained. A head that holder last acknowledged is now on the chain: a head of the
+> same position and identity, from the same holder, while it is a holder. Being on the chain only reaches
+> `entries_after`, which still answers an install when the tail does not reach it. Holder restarted mid-install, 24 runs
+> at the budgets the code computes (diag-live-durability-62 and -63, on the live-durability stack at 53dfa6cc): slower
+> than 1 s in 2 to 0 of 24 (1.96 and 42.8 s before), install decisions 4,576 to 22. **Open:** under a 30 s install
+> budget forced for that measurement, 10 and 9 of 24 runs took over 1 s, with and without this; those holders report
+> positions well below the tail, and what holds them is not known.
+
 > **Fixed (live-fixes, 2026-11-07): a live write counted durable on too few holders when the owner fell outside its own
 > volume's placement.** The shipper counted a position durable at the `f`-th highest holder, right for `2f` holders but
 > not for `2f + 1` (every other candidate a holder): at f = 1 a write on one of three was "durable", and a successor
