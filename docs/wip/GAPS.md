@@ -746,8 +746,14 @@
 >   not stuck. `a_start_held_off_its_cpus_is_starved_not_stuck` (`crates/cli/src/anchor.rs`) holds a busy process off its
 >   CPU at SCHED_IDLE: without the reading, judged "made no progress for 1001 ms", 2 of 2 on adacachy2; with it, starved
 >   at 14-23 looks and never stuck, 7 of 7 (nice 0 and 19). A process with every thread blocked still reads stuck.
-> - **A transitive wait reads as stuck (open).** A shard blocked for a whole window on something held by a starved thread
->   is never runnable itself, so it is wedged by this rule. Not measured. Fixtures' shard 1 (S S S R R S S) may be one.
+> - **A transitive wait reads as stuck (open, measured 2026-11-08 by bug-sweep).** A shard blocked for a whole window on
+>   something held by a starved thread is never runnable itself, so it is wedged by this rule. Measured on adacachy2 at
+>   load 0.2: a shard's poll parked until a thread released it, that thread at SCHED_IDLE pinned beside the starved test's
+>   spinners and owing 50 ms of its own CPU first. The watchdog withheld the beat at 30 of 40 looks and the beat gapped
+>   3.05-3.09 s, 3 of 3, so the anchor would kill a live daemon. The holder was runnable throughout; the shard was asleep.
+>   Neither the shard's clock nor its state can tell this from a deadlock, so a fix needs the holder named: a wait on a
+>   thread the daemon owns could record whom it waits on, and the watchdog ask that thread's state. Decision owed.
+>   Fixtures' shard 1 (S S S R R S S) may be one.
 > - **macOS is proven by replays (limit).** A full window of flat CPU came in 1 of 20 CI runs, so its real-thread test
 >   exercised the reader, and the rule's replays carry the rule there.
 > - **`a_shard_starved_off_its_cpu_keeps_the_beat` hinged on the nice it was started at: fixed 2026-11-08 (bug-sweep).**
