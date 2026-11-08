@@ -143,7 +143,7 @@ fn spin_for(burst: Duration) {
 /// the whole poll.
 #[test]
 fn a_starved_poll_on_the_control_shard_does_not_stop_the_beat() {
-  let (daemon, control, _) = daemon("starved");
+  let (daemon, control, _) = daemon("starved-poll");
   let _serving = beating(&daemon);
   let span = WINDOW + WINDOW / 2;
   let worker = on_shard(&daemon, control, move || {
