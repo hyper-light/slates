@@ -1741,6 +1741,15 @@ pub(crate) async fn resolve_and_forward(
   )
 }
 
+/// Derived: the polls a forward's location round makes before it gives up: one liveness budget at the fleet's poll
+/// interval, a budget counted in the shard's own polls (A-232's rule: a starved shard polls late, it does not run out of
+/// time).
+pub const LOCATION_POLLS: u64 =
+  crate::daemon::LIVENESS_BUDGET_NS / (crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD);
+
+/// Counter: a forward's location budget ended by the operator's failover SLO, the owner still not found.
+const LOCATION_CEILING: &str = "fleet.owner_location.slo_ended";
+
 /// Counter: forwards sent again to an owner the detector has not confirmed dead because it did not answer the last within its
 /// budget (`resolve_and_forward`).
 const FORWARD_RETRIED: &str = "fleet.forward.retried";
@@ -1848,8 +1857,16 @@ async fn await_materialization(object: ObjectId) {
 /// and 111–224 ms; paced a tenth of a heartbeat, none refused and 21–218 ms. Each retry is counted
 /// (`fleet.owner_location.retried`); `None` once the budget is spent with no owner found.
 async fn locate_within_budget(query: crate::owner_location::Query) -> Option<HostId> {
-  let deadline = slates_rt::futures::now_ns().saturating_add(crate::daemon::LIVENESS_BUDGET_NS);
-  loop {
+  let pace = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
+  // The budget is counted in this shard's own polls, not on the wall (A-232's rule): a starved control shard polls late,
+  // so a wall second ran out while the gossip that refutes a false death was still waiting to be read, and the client
+  // was refused `HomedElsewhere` for the machine's load (1 or 2 calls in every false death at nice 19 beside two spinners
+  // a CPU). One round may itself wait a liveness budget for peers that do not answer, so the operator's failover SLO
+  // caps the whole: a stuck owner is refused within it, however many polls are left.
+  let began = slates_rt::futures::now_ns();
+  let ceiling = crate::state::with_state(|state| state.config.failover_slo_ns)
+    .unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
+  for _ in 0..LOCATION_POLLS {
     // The direct route first (the volume's creator, while eligible), as a fresh call would take it.
     if let Some(owner) = crate::state::with_state(|state| query.known_owner(state, None)).flatten()
     {
@@ -1858,14 +1875,16 @@ async fn locate_within_budget(query: crate::owner_location::Query) -> Option<Hos
     if let Ok(owner) = crate::owner_location::locate(query).await {
       return Some(owner);
     }
-    let pace = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
-    if slates_rt::futures::now_ns().saturating_add(pace) >= deadline
-      || slates_rt::futures::sleep(pace).await.is_err()
-    {
+    if slates_rt::futures::now_ns().saturating_sub(began) >= ceiling {
+      crate::state::with_state(|state| state.count(LOCATION_CEILING, 1));
+      return None;
+    }
+    if slates_rt::futures::sleep(pace).await.is_err() {
       return None;
     }
     crate::state::with_state(|state| state.count("fleet.owner_location.retried", 1));
   }
+  None
 }
 
 /// The refusal for a verb on a volume this node owns but has not materialized yet, asked on the control shard where
