@@ -1,0 +1,32 @@
+runner windows-latest, x86_64, 4 CPUs, 3b030c5 DIAG, not for main: the A-228 fleet at HEAD, ten repetitions of reader, , Sun Nov  8 14:18:15 UTC 2026
+clippy exit 0
+run 1 reader 0 rule 0 liveness 0
+starved shard: 4 spinners, its CPU clock stood still for 2.984812s at most in 3.001128s; largest beat gap 109.9784ms
+scheduler reader: NtQuerySystemInformation thread state, no wait time kept; asked once a beat: runnable 27, blocked 0, unread 0; run-queue wait first None ns, last None ns
+run 2 reader 0 rule 0 liveness 0
+starved shard: 4 spinners, its CPU clock stood still for 3.0028402s at most in 3.0032041s; largest beat gap 110.5722ms
+scheduler reader: NtQuerySystemInformation thread state, no wait time kept; asked once a beat: runnable 27, blocked 0, unread 0; run-queue wait first None ns, last None ns
+run 3 reader 0 rule 0 liveness 0
+starved shard: 4 spinners, its CPU clock stood still for 3.0009529s at most in 3.001341s; largest beat gap 110.4208ms
+scheduler reader: NtQuerySystemInformation thread state, no wait time kept; asked once a beat: runnable 27, blocked 0, unread 0; run-queue wait first None ns, last None ns
+run 4 reader 0 rule 0 liveness 0
+starved shard: 4 spinners, its CPU clock stood still for 3.0033815s at most in 3.0037774s; largest beat gap 99.0924ms
+scheduler reader: NtQuerySystemInformation thread state, no wait time kept; asked once a beat: runnable 28, blocked 0, unread 0; run-queue wait first None ns, last None ns
+run 5 reader 0 rule 0 liveness 0
+starved shard: 4 spinners, its CPU clock stood still for 3.0019348s at most in 3.0023194s; largest beat gap 104.582ms
+scheduler reader: NtQuerySystemInformation thread state, no wait time kept; asked once a beat: runnable 27, blocked 0, unread 0; run-queue wait first None ns, last None ns
+run 6 reader 0 rule 0 liveness 0
+starved shard: 4 spinners, its CPU clock stood still for 2.9872238s at most in 3.0033049s; largest beat gap 100.5638ms
+scheduler reader: NtQuerySystemInformation thread state, no wait time kept; asked once a beat: runnable 27, blocked 0, unread 0; run-queue wait first None ns, last None ns
+run 7 reader 0 rule 0 liveness 0
+starved shard: 4 spinners, its CPU clock stood still for 3.0003441s at most in 3.0123968s; largest beat gap 104.3165ms
+scheduler reader: NtQuerySystemInformation thread state, no wait time kept; asked once a beat: runnable 27, blocked 0, unread 0; run-queue wait first None ns, last None ns
+run 8 reader 0 rule 0 liveness 0
+starved shard: 4 spinners, its CPU clock stood still for 2.9850814s at most in 3.0012454s; largest beat gap 110.0027ms
+scheduler reader: NtQuerySystemInformation thread state, no wait time kept; asked once a beat: runnable 27, blocked 0, unread 0; run-queue wait first None ns, last None ns
+run 9 reader 0 rule 0 liveness 0
+starved shard: 4 spinners, its CPU clock stood still for 2.9952851s at most in 3.0057941s; largest beat gap 110.1209ms
+scheduler reader: NtQuerySystemInformation thread state, no wait time kept; asked once a beat: runnable 27, blocked 0, unread 0; run-queue wait first None ns, last None ns
+run 10 reader 0 rule 0 liveness 0
+starved shard: 4 spinners, its CPU clock stood still for 2.9908845s at most in 3.001368s; largest beat gap 100.6064ms
+scheduler reader: NtQuerySystemInformation thread state, no wait time kept; asked once a beat: runnable 27, blocked 0, unread 0; run-queue wait first None ns, last None ns

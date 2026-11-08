@@ -1,0 +1,128 @@
+ Downloading crates ...
+  Downloaded derive_more-impl v2.1.1
+  Downloaded proc-macro-error-attr2 v2.0.0
+  Downloaded proc-macro-error2 v2.0.1
+  Downloaded bincode v1.3.3
+  Downloaded iai-callgrind-macros v0.6.1
+  Downloaded derive_more v2.1.1
+  Downloaded iai-callgrind v0.16.1
+  Downloaded iai-callgrind-runner v0.16.1
+   Compiling cfg-if v1.0.4
+    Checking windows_x86_64_msvc v0.53.1
+    Checking serde_core v1.0.229
+   Compiling getrandom v0.4.3
+    Checking windows-targets v0.53.5
+    Checking cpufeatures v0.3.1
+    Checking windows-sys v0.60.2
+    Checking constant_time_eq v0.4.2
+   Compiling jobserver v0.1.35
+    Checking arrayvec v0.7.8
+   Compiling cc v1.4.5
+   Compiling syn v2.0.119
+    Checking serde v1.0.229
+   Compiling blake3 v1.8.7
+    Checking zmij v1.0.23
+    Checking memchr v2.8.3
+    Checking itoa v1.0.18
+    Checking serde_json v1.0.151
+    Checking memmap2 v0.9.11
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+   Compiling cmake v0.1.58
+   Compiling aws-lc-sys v0.45.0 (D:\a\slates\slates\vendor\aws-lc-sys)
+   Compiling slates-wire-derive v0.1.0 (D:\a\slates\slates\crates\wire-derive)
+    Checking twox-hash v2.1.4
+    Checking lz4_flex v0.11.6
+    Checking tinyvec_macros v0.1.1
+    Checking zeroize v1.9.0
+    Checking tinyvec v1.13.2
+    Checking unicode-normalization v0.1.25
+    Checking slates-image v0.1.0 (D:\a\slates\slates\crates\image)
+    Checking once_cell v1.21.4
+    Checking getrandom v0.3.4
+    Checking rustls-pki-types v1.15.1
+    Checking bitflags v2.13.1
+    Checking slates-machine v0.1.0 (D:\a\slates\slates\crates\machine)
+    Checking rand_core v0.9.5
+    Checking untrusted v0.9.0
+    Checking zerocopy v0.8.56
+    Checking slates-mem v0.1.0 (D:\a\slates\slates\crates\mem)
+    Checking slates-rt v0.1.0 (D:\a\slates\slates\crates\rt)
+    Checking slates-wire v0.1.0 (D:\a\slates\slates\crates\wire)
+    Checking slates-ipc v0.1.0 (D:\a\slates\slates\crates\ipc)
+    Checking errno v0.3.14
+    Checking subtle v2.6.1
+    Checking fastrand v2.5.0
+    Checking windows-link v0.2.1
+   Compiling zstd-safe v7.3.0
+    Checking windows-sys v0.61.2
+    Checking zstd v0.13.3
+    Checking slates-anchor v0.1.0 (D:\a\slates\slates\crates\anchor)
+    Checking slates-archive v0.1.0 (D:\a\slates\slates\crates\archive)
+    Checking slates-vfs v0.1.0 (D:\a\slates\slates\crates\vfs)
+    Checking slates-db v0.1.0 (D:\a\slates\slates\crates\db)
+    Checking tempfile v3.27.0
+    Checking thiserror v2.0.21
+    Checking rustix v1.1.4
+    Checking ppv-lite86 v0.2.21
+    Checking crc32c v0.6.8
+    Checking powerfmt v0.2.0
+    Checking deranged v0.5.8
+    Checking num-conv v0.2.2
+    Checking hyper-timing v0.1.0 (D:\a\slates\slates\vendor\hyper-raft\hyper-timing)
+    Checking fnv v1.0.7
+    Checking quick-error v1.2.3
+    Checking bit-vec v0.8.0
+    Checking wait-timeout v0.2.1
+    Checking time-core v0.1.9
+    Checking rusty-fork v0.3.1
+    Checking bit-set v0.8.0
+    Checking time v0.3.55
+    Checking hyper-swim v0.1.0 (D:\a\slates\slates\vendor\hyper-raft\hyper-swim)
+    Checking slates-bridge-core v0.1.0 (D:\a\slates\slates\crates\bridge-core)
+    Checking slates-base v0.1.0 (D:\a\slates\slates\crates\base)
+    Checking rand_chacha v0.9.0
+    Checking num-traits v0.2.19
+    Checking rand_xorshift v0.4.0
+    Checking rand v0.9.5
+    Checking unarray v0.1.4
+    Checking regex-syntax v0.8.11
+    Checking slates-bridge-nfs v0.1.0 (D:\a\slates\slates\crates\bridge-nfs)
+    Checking slates-bridge-fuse v0.1.0 (D:\a\slates\slates\crates\bridge-fuse)
+    Checking slates-bridge-winfsp v0.1.0 (D:\a\slates\slates\crates\bridge-winfsp)
+    Checking proptest v1.11.0
+    Checking yasna v0.5.2
+    Checking slates-land v0.1.0 (D:\a\slates\slates\crates\land)
+    Checking slates-merge v0.1.0 (D:\a\slates\slates\crates\merge)
+    Checking slates-client v0.1.0 (D:\a\slates\slates\crates\client)
+    Checking slates-conformance v0.1.0 (D:\a\slates\slates\crates\conformance)
+   Compiling derive_more-impl v2.1.1
+    Checking slates-test-seeds v0.1.0 (D:\a\slates\slates\crates\test-seeds)
+   Compiling proc-macro-error-attr2 v2.0.0
+   Compiling iai-callgrind-runner v0.16.1
+   Compiling proc-macro-error2 v2.0.1
+   Compiling derive_more v2.1.1
+   Compiling iai-callgrind v0.16.1
+    Checking bincode v1.3.3
+   Compiling iai-callgrind-macros v0.6.1
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_PREBUILT_NASM': '0'
+warning: aws-lc-sys@0.45.0: Value: 0 is false.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-pc-windows-msvc'
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' failed - Err(Error { kind: ToolExecError, message: "command did not execute successfully (status code exit code: 2): \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Tools\\\\MSVC\\\\14.51.36231\\\\bin\\\\HostX64\\\\x64\\\\cl.exe\" \"-nologo\" \"-MD\" \"-Z7\" \"-Brepro\" \"-WX\" \"-W4\" \"-FoD:\\\\a\\\\slates\\\\slates\\\\target\\\\debug\\\\build\\\\aws-lc-sys-adc05d15a5129420\\\\out\\\\out-stdalign_check\\\\e1bacabfea35bee3-stdalign_check.o\" \"-c\" \"D:\\\\a\\\\slates\\\\slates\\\\vendor\\\\aws-lc-sys\\\\aws-lc\\\\tests\\\\compiler_features_tests\\\\stdalign_check.c\"" }).
+   Compiling aws-lc-rs v1.18.1 (D:\a\slates\slates\vendor\aws-lc-rs)
+   Compiling rustls v0.23.44
+    Checking rustls-webpki v0.103.15
+    Checking hyper-datagram v0.1.0 (D:\a\slates\slates\vendor\hyper-raft\hyper-datagram)
+    Checking hyper-seal v0.1.0 (D:\a\slates\slates\vendor\hyper-raft\hyper-seal)
+    Checking rcgen v0.13.2
+    Checking slates-transport v0.1.0 (D:\a\slates\slates\crates\transport)
+    Checking slates-cluster v0.1.0 (D:\a\slates\slates\crates\cluster)
+    Checking slates-server v0.1.0 (D:\a\slates\slates\crates\server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 53.98s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
