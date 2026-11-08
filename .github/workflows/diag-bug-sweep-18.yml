@@ -1,0 +1,45 @@
+name: DIAG bug-sweep 18, A-248's failing test on Linux before the fix (not for main)
+
+# A diagnostics branch, never merged. The rewritten dirty-page test expects a FUSE cache write-back over bytes another
+# path changed to be refused whole (A-248, "Refuse, like NFS"). This tree has the test and not the fix, so it must fail
+# on both arches: the masked apply answers the sync 0.
+
+on:
+  push:
+    branches: [diag-bug-sweep-18]
+
+jobs:
+  red:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: "0"
+      SLATES_TEST_CLI: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: FUSE and the operator's grant
+        run: |
+          command -v fusermount3 >/dev/null || { sudo apt-get update && sudo apt-get install -y fuse3; }
+          grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+          uname -a
+      - name: Build
+        run: cargo test -p slates-cli --test cli --no-run
+      - name: The dirty-page test, three runs
+        run: |
+          for run in 1 2 3; do
+            echo "=== run $run"
+            if cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture --exact \
+              a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path 2>&1 | tee "run-$run.log"; then
+              echo "=== run $run PASSED"
+            else
+              echo "=== run $run FAILED"
+            fi
+            grep -E "panicked|assert|SKIP" "run-$run.log" | head -5 || true
+          done
