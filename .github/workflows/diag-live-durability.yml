@@ -1,0 +1,90 @@
+name: diag-live-durability
+
+# Diagnostics only, never on main (A-200): the watch (a lane's install ended once its holder is lost and silent), on and
+# off in one binary, at the budgets the code computes and at a 30 s floor: a holder restarted mid-install x12, then the
+# rolling partition x10, per leg per arch. Every restart over 5 s keeps its log. Results to
+# diag-results/live-durability-65-<leg>.
+on:
+  push:
+    branches: ["diag-live-durability-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  SLATES_TEST_CLI: "1"
+
+jobs:
+  check:
+    name: restart (${{ matrix.leg }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { leg: real-off-x86, os: ubuntu-latest, floor: "0", off: "1" }
+          - { leg: real-on-x86, os: ubuntu-latest, floor: "0", off: "" }
+          - { leg: floor-off-x86, os: ubuntu-latest, floor: "30000", off: "1" }
+          - { leg: floor-on-x86, os: ubuntu-latest, floor: "30000", off: "" }
+          - { leg: real-off-arm, os: ubuntu-24.04-arm, floor: "0", off: "1" }
+          - { leg: real-on-arm, os: ubuntu-24.04-arm, floor: "0", off: "" }
+          - { leg: floor-off-arm, os: ubuntu-24.04-arm, floor: "30000", off: "1" }
+          - { leg: floor-on-arm, os: ubuntu-24.04-arm, floor: "30000", off: "" }
+    runs-on: ${{ matrix.os }}
+    env:
+      SLATES_DIAG_INSTALL_FLOOR_MS: ${{ matrix.floor }}
+      SLATES_DIAG_WATCH_OFF_VALUE: ${{ matrix.off }}
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 467d9e58f5d9899321d59548481f545a818b5fe9
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+      - name: The runs
+        shell: bash {0}
+        run: |
+          R=../results.txt
+          mkdir -p ../kept
+          echo "leg ${{ matrix.leg }}, $(nproc) CPUs, $(date -u), tree $(git rev-parse HEAD)" > $R
+          timeout 1800 cargo build --release --locked -p slates-cli --bin slates --test live_chaos > ../build.log 2>&1; status=$?
+          echo "== release build exit $status" >> $R
+          [ $status -ne 0 ] && grep -E '^error' -A8 ../build.log | head -40 >> $R
+          [ -n "$SLATES_DIAG_WATCH_OFF_VALUE" ] && export SLATES_DIAG_WATCH_OFF=1
+          export SLATES_DIAG_STOP_DIR="$RUNNER_TEMP/stopdir"; mkdir -p "$SLATES_DIAG_STOP_DIR"
+          for run in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            rm -f "$SLATES_DIAG_STOP_DIR"/*
+            timeout 400 cargo test --release --locked -p slates-cli --test live_chaos -- --nocapture --test-threads=1 --exact diag_a_holder_restarted_mid_install > ../run.log 2>&1; status=$?
+            grep -E '^LD-TL|panicked' ../run.log | cut -c1-300 | sed "s/^/   r$run /" >> $R || true
+            echo "   r$run counts: installs $(grep -c '^LD-LANE install' ../run.log) taken $(grep -c '^LD-TAKE' ../run.log) images $(grep -c '^LD-IMAGE' ../run.log) why $(grep -c '^LD-WHY' ../run.log)" >> $R
+            echo "== run $run exit $status" >> $R
+            slow=$(grep -E '^LD-TL caught' ../run.log | grep -vE 'caught Some\(([0-9.]+(ms|µs)|[0-4]\.[0-9]+s)\)' | wc -l)
+            if [ $status -ne 0 ] || [ "$slow" -gt 0 ]; then
+              { grep -E '^LD-TL|^LD-LANE|^LD-TAKE|^LD-IMAGE|^LD-RESUME|^---|fleet_session|fleet\.live\.|panicked' ../run.log | cut -c1-400 | head -2500; grep '^LD-WHY' ../run.log | head -200 | cut -c1-300; } > ../kept/restart-$run.log
+            fi
+          done
+          for run in 1 2 3 4 5 6 7 8 9 10; do
+            timeout 900 cargo test --release --locked -p slates-cli --test live_chaos -- --nocapture --test-threads=1 --exact candidates_partitioned_in_turn_mid_stream_lose_nothing > ../run.log 2>&1; status=$?
+            grep -E '^  [0-9]+ writes|violations|panicked' ../run.log | grep -v '^chaos' | sort -u | cut -c1-260 | sed "s/^/   p$run /" >> $R || true
+            echo "   p$run cut $(grep -c 'cut true' ../run.log) installs $(grep -c '^LD-LANE install' ../run.log)" >> $R
+            echo "== partition $run exit $status" >> $R
+          done
+          exit 0
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/live-durability-65-${{ matrix.leg }}"
+          git config user.name "diag-live-durability"
+          git config user.email "diag-live-durability@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          cp ../kept/*.log . 2>/dev/null || true
+          git add results.txt *.log 2>/dev/null || git add results.txt
+          git commit -qm "diag-live-durability-65 results, ${{ matrix.leg }}"
+          git push -q origin "HEAD:refs/heads/$branch"
