@@ -1303,3 +1303,9 @@ slates-server: shard 0 initialized in 2536 µs
 slates-server: shard 1 initialized in 3533 µs
 slates daemon: a heartbeat came 581 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 1 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 1 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 21 ms and its timer overrun 481 ms
 ## run 1 of 1 done, 2026-11-08T17:26:49Z
+remote: 
+remote: Create a pull request for 'diag-winfsp-overlap-results-42497704518-profile-arm-reply-2' on GitHub by visiting:        
+remote:      https://github.com/hyper-light/slates/pull/new/diag-winfsp-overlap-results-42497704518-profile-arm-reply-2        
+remote: 
+To https://github.com/hyper-light/slates
+ * [new branch]      c6ea2b013a6b9d260986f31b6d26aae703509746 -> diag-winfsp-overlap-results-42497704518-profile-arm-reply-2
