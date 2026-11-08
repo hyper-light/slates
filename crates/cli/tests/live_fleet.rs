@@ -465,6 +465,41 @@ fn start_fleet_bootstrapped_as(tag: &str, verb: &str) -> Fleet {
   }
 }
 
+/// Each node of `instances` with its certificate anchor as `slates status` prints it, for [`share_with_nodes`]. Read while
+/// every node still answers: a flow that stops a node reads these first.
+fn anchors_of(instances: &[String]) -> Vec<(String, String)> {
+  instances
+    .iter()
+    .map(|instance| {
+      (
+        instance.clone(),
+        value_of(&run_ready(instance, &["status"]), "anchor"),
+      )
+    })
+    .collect()
+}
+
+/// Shares `volume` through `owner` with this test's account on every other node (A-237): a local account means something
+/// only on its host, so a volume an operator means to reach from the node that takes it over is shared with that node
+/// first.
+fn share_with_nodes(anchors: &[(String, String)], owner: &str, volume: &str) {
+  let account = rustix::process::getuid().as_raw();
+  for (node, anchor) in anchors.iter().filter(|(node, _)| node != owner) {
+    let (code, _, err) = run(
+      owner,
+      &[
+        "share",
+        volume,
+        &format!("uid:{account}@{anchor}"),
+        "--read",
+        "--write",
+        "--admin",
+      ],
+    );
+    assert_eq!(code, 0, "the share with {node}: {err}");
+  }
+}
+
 /// Creates a live-shipped volume on `owner`, attaches it for writing, and writes `files` files; its id.
 fn write_live_volume(owner: &str, files: usize) -> String {
   let id = value_of(
@@ -721,7 +756,9 @@ fn a_live_volumes_acknowledged_writes_survive_its_owners_death() {
   let mut fleet = start_fleet("live-takeover");
   let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
   let owner = fleet.instances[owner_index].clone();
-  let id = write_live_volume(&owner, FILES);
+  let id = create_live_volume(&owner, "shipped");
+  share_with_nodes(&anchors_of(&fleet.instances), &owner, &id);
+  write_files(&owner, &id, 0..FILES);
   // No wait for the creation head's placement here: a live write is answered only once the head is placed too, so the
   // owner may die the moment the last write returns.
   let survivors: Vec<&String> = fleet
@@ -1298,6 +1335,7 @@ fn a_superseded_owner_resumed_after_its_takeover_is_fenced() {
   let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
   let owner = fleet.instances[owner_index].clone();
   let id = create_live_volume(&owner, "fenced");
+  share_with_nodes(&anchors_of(&fleet.instances), &owner, &id);
   write_files(&owner, &id, 0..3);
   signal(&fleet.daemons[owner_index], rustix::process::Signal::STOP);
   let survivors: Vec<&String> = fleet
@@ -1818,6 +1856,7 @@ fn a_successor_that_holds_no_copy_still_takes_a_live_volume_over() {
   let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
   let owner = fleet.instances[owner_index].clone();
   let id = create_live_volume(&owner, "empty-successor");
+  share_with_nodes(&anchors_of(&fleet.instances), &owner, &id);
   let successor = successor_of(&fleet, &owner, &id);
   let successor_index = fleet
     .instances
@@ -2753,6 +2792,7 @@ fn an_owner_killed_while_its_fleet_still_forms_is_taken_over() {
   let count = fleet.instances.len();
   let owner_index = (fleet.bootstrap + 1) % count;
   let third_index = (fleet.bootstrap + 2) % count;
+  let anchors = anchors_of(&fleet.instances);
   signal(&fleet.daemons[third_index], rustix::process::Signal::STOP);
   let owner = fleet.instances[owner_index].clone();
   let bootstrap = fleet.instances[fleet.bootstrap].clone();
@@ -2763,6 +2803,7 @@ fn an_owner_killed_while_its_fleet_still_forms_is_taken_over() {
     ),
     "id",
   );
+  share_with_nodes(&anchors, &owner, &id);
   // The catalog and the head, placed on the owner and the bootstrap node (`f + 1`): a takeover can find the volume.
   let deadline = Instant::now() + FLEET_WAIT;
   while held_records(&bootstrap) < 2 {
@@ -2822,6 +2863,7 @@ fn a_live_volume_made_while_its_successor_was_stopped_is_served_by_it() {
   let count = fleet.instances.len();
   let owner_index = (fleet.bootstrap + 1) % count;
   let stopped_index = (fleet.bootstrap + 2) % count;
+  let anchors = anchors_of(&fleet.instances);
   signal(&fleet.daemons[stopped_index], rustix::process::Signal::STOP);
   let owner = fleet.instances[owner_index].clone();
   let stopped = fleet.instances[stopped_index].clone();
@@ -2868,6 +2910,7 @@ fn a_live_volume_made_while_its_successor_was_stopped_is_served_by_it() {
   {
     let (owner, id) = (owner.clone(), id.clone());
     std::thread::spawn(move || {
+      share_with_nodes(&anchors, &owner, &id);
       let (code, _, err) = run(&owner, &["live-ship", &id]);
       assert_eq!(code, 0, "live-ship: {err}");
       sender.send(write_files(&owner, &id, 0..FILES)).unwrap();
@@ -3129,6 +3172,7 @@ fn a_member_down_through_a_voters_restart_is_still_taken_over() {
   let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
   let owner = fleet.instances[owner_index].clone();
   let id = create_live_volume(&owner, "voter-restart");
+  share_with_nodes(&anchors_of(&fleet.instances), &owner, &id);
   write_files(&owner, &id, 0..FILES);
   let others: Vec<&String> = fleet
     .instances
