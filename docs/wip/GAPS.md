@@ -905,9 +905,11 @@
 > Wi-Fi LAN an accepted edit and merge is one forwarded round trip, 6.9 to 7.8 ms p50, against 14.1 to 18.6 ms for
 > edit then submit (ping 6.1 to 7.7 ms). Oracle: `edit_and_submit_answers_what_edit_then_submit_does_over_generated_histories`
 > (`crates/client/tests/edit_and_submit.rs`) compares every answer and every head over generated histories, red under
-> both mutations tried. Exactly once: `an_edit_and_submit_retried_across_a_restart_answers_its_record_once`. **Open:**
-> the SDKs, MCP and the CLI do not offer the combined verb yet. Also open: the link's p99 (70 to 158 ms over Wi-Fi), a
-> wired pair, and Windows as either node.
+> both mutations tried. Exactly once: `an_edit_and_submit_retried_across_a_restart_answers_its_record_once`. **Owed
+> (owner: agents/perf, after W1 unless clients asks sooner; the supervisor, 2026-11-07):** the combined verb in the
+> Python and Node SDKs, MCP and the CLI; Windows as either node of the two-machine measurement; and a wired pair.
+> Also open: the link's p99 (70 to 158 ms over Wi-Fi).
+>
 > **Merge, macOS: the paced tail was the recovery give-back, not the doorbell (A-226, 2026-11-06, agents/perf-2).** An
 > idle shard's give-back of the recovery memory no restart reads (A-117) marked the whole stale slot and log, 18 GB
 > a shard, at every publication: 18 to 21 ms of the shard's CPU in one reap-loop poll, which paced requests waited

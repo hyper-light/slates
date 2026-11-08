@@ -2497,6 +2497,65 @@ impl Daemon {
     Ok(returned)
   }
 
+  /// Test support: gives back every shard's dead recovery memory a slice at a time, as an idle shard's reap tick does
+  /// (`return_dead_recovery`, A-226), timing each step on the shard thread's own CPU clock, which a loaded host does
+  /// not inflate: the bytes given back, the steps, the CPU each step held its shard, and the step quantum the shard
+  /// holds its work to. `None` for the CPU where the shard's thread clock cannot be read (Windows' thread times tick
+  /// at about 15.6 ms, too coarse to time a step by).
+  pub fn give_back_recovery_by_steps(&self) -> Result<GiveBackSteps, ObserveError> {
+    let mut report = GiveBackSteps {
+      returned: 0,
+      steps: 0,
+      step_cpu_ns: Some(Vec::new()),
+      quantum_ns: 0,
+    };
+    for shard in self.shards.iter().copied() {
+      loop {
+        let (bytes, more, cpu_ns, quantum_ns) = self.observe(Some(shard), |s| {
+          let cpu = || {
+            registry::with_current(|ctx| ctx.id)
+              .and_then(registry::holder_of)
+              .and_then(registry::shard_cpu)
+              .filter(|_| cfg!(unix))
+              .map(|reading| reading.spent_ns)
+          };
+          let before = cpu();
+          let (bytes, more) = return_dead_recovery(s);
+          let after = cpu();
+          let quantum = futures::step_budget_ns().unwrap_or(s.config.runtime.step_budget_ns);
+          (
+            bytes,
+            more,
+            before
+              .zip(after)
+              .map(|(before, after)| after.saturating_sub(before)),
+            quantum,
+          )
+        })?;
+        report.returned = report
+          .returned
+          .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+        report.steps = report.steps.saturating_add(1);
+        report.step_cpu_ns = report
+          .step_cpu_ns
+          .take()
+          .zip(cpu_ns)
+          .map(|(mut steps, step)| {
+            steps.push(step);
+            steps
+          });
+        report.quantum_ns = report.quantum_ns.max(quantum_ns);
+        if !more {
+          break;
+        }
+      }
+    }
+    if let Some(steps) = report.step_cpu_ns.as_mut() {
+      steps.sort_unstable();
+    }
+    Ok(report)
+  }
+
   /// Test support: sets the memory-pressure hold on **every** shard's byte budget (§4.2; admission.md
   /// §5.5) — capacity withheld from new admission under host memory pressure. In production
   /// [`refresh_pressure_hold`] sets it from a sampled host shortfall at the liveness cadence; this
@@ -3893,6 +3952,20 @@ fn learn_give_back_rate(s: &mut ShardState, walked: usize, started: u64) {
     .checked_div(u128::from(took))
     .unwrap_or(0);
   s.give_back_slice_bytes = usize::try_from(per_quantum).unwrap_or(usize::MAX);
+}
+
+/// What [`Daemon::give_back_recovery_by_steps`] measured (test support, A-226).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GiveBackSteps {
+  /// Recovery bytes given back over every shard.
+  pub returned: u64,
+  /// The give-back steps taken.
+  pub steps: u64,
+  /// The CPU each step held its shard, nanoseconds, off the shard thread's own clock, sorted; `None` where it cannot be
+  /// read.
+  pub step_cpu_ns: Option<Vec<u64>>,
+  /// The step quantum the shards hold their work to, nanoseconds (the largest over the shards).
+  pub quantum_ns: u64,
 }
 
 /// Counter: content bytes an idle shard gave back to the OS (A-105).

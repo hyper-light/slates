@@ -3104,7 +3104,13 @@ fn a_give_back_returns_only_recovery_memory_written_since_the_last() {
 /// counted in the first window (the non-vacuity count) and nothing more given back in the second, and the first window's
 /// longest probe no more than `FLOOR_MULTIPLE` times the second's. A closed-loop probe meets one stall as one sample,
 /// so the longest probe is the judge and the p99 and p999 are printed beside it. A host too loaded to judge by (its
-/// quiet probe past `JUDGED_FLOOR`) skips loudly. Before the give-back was sliced, one step marked
+/// quiet probe past `JUDGED_FLOOR`) skips that judge loudly. Then do restart the daemon over the same anchor and give
+/// its recovery memory back a step at a time, as the idle tick does; expect the p99 step to have held its shard no
+/// more than `STEP_QUANTA` step quanta of the shard thread's own CPU. That judge runs wherever a thread clock is fine enough to
+/// time a step by: CI's `gates` job (`cargo test --workspace` on `ubuntu-latest` and `macos-latest`,
+/// `.github/workflows/ci.yml`), and every Linux and macOS development machine whatever its load; it skips loudly on
+/// Windows. Red-checked with the slice made unbounded
+/// (one step a whole region, as before A-226's slices). Before the give-back was sliced, one step marked
 /// 18,325,143,552 bytes reusable in 18 to 21 ms (macOS) while every probe that reached the shard waited.
 #[test]
 fn a_boot_give_back_holds_its_shard_no_longer_than_its_noise_floor() {
@@ -3122,7 +3128,7 @@ fn a_boot_give_back_holds_its_shard_no_longer_than_its_noise_floor() {
   let instance = format!("srv-recovery-slices-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(1));
   let anchor = held_anchor("recovery-slices", &profile, &config);
-  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let daemon = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -3138,8 +3144,10 @@ fn a_boot_give_back_holds_its_shard_no_longer_than_its_noise_floor() {
       .copied()
       .unwrap_or(0)
   };
-  let giving_back = longest_probe(&mut client, volume, window);
-  let after_give_back = returned(&daemon);
+  // The give-back window lasts until the give-back is done: under load its slices are small (each one quantum of wall
+  // time), so it may outlast one window. The quiet window then starts with nothing left to give back.
+  let (giving_back, after_give_back) =
+    probe_until_given_back(&mut client, volume, window, || returned(&daemon));
   let quiet = longest_probe(&mut client, volume, window);
   let after_quiet = returned(&daemon);
   println!(
@@ -3157,8 +3165,8 @@ fn a_boot_give_back_holds_its_shard_no_longer_than_its_noise_floor() {
   }
   if quiet > JUDGED_FLOOR {
     println!(
-      "SKIPPED (loudly): this host's own noise held a quiet probe {quiet:?}, past the {JUDGED_FLOOR:?} the test can \
-       judge a give-back step by"
+      "SKIPPED (loudly), the probe's judge: this host's own noise held a quiet probe {quiet:?}, past the \
+       {JUDGED_FLOOR:?} the test can judge a give-back step by; the step's own CPU below still judges"
     );
   } else {
     assert!(
@@ -3167,7 +3175,95 @@ fn a_boot_give_back_holds_its_shard_no_longer_than_its_noise_floor() {
     );
   }
   daemon.stop();
+  // The judge every Linux and macOS host can apply: a restarted daemon has not seen its recovery memory written, so it
+  // gives all of it back again, and each step's CPU on the shard's own thread clock is what the step held the shard.
+  let restarted = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  assert_each_give_back_step_takes_about_a_quantum(&restarted);
+  restarted.stop();
   drop(anchor);
+}
+
+/// Probes `volume` window after window until the recovery bytes `returned` reads have stopped moving (and moved), up to
+/// `SETTLE_WINDOWS`: the longest probe meanwhile, and the bytes given back.
+fn probe_until_given_back(
+  client: &mut Client,
+  volume: VolumeId,
+  window: Duration,
+  returned: impl Fn() -> u64,
+) -> (Duration, u64) {
+  /// Shape: the windows the give-back may take before the test calls it unfinished: its slices are a quantum of wall
+  /// time each, so a loaded host spreads 18 GB over several windows (two at load 90 on 18 cores, 2026-11-07).
+  const SETTLE_WINDOWS: u32 = 8;
+  let mut longest = Duration::ZERO;
+  let mut given_back = returned();
+  for _ in 0..SETTLE_WINDOWS {
+    longest = longest.max(longest_probe(client, volume, window));
+    let now = returned();
+    let settled = now > 0 && now == given_back;
+    given_back = now;
+    if settled {
+      break;
+    }
+  }
+  (longest, given_back)
+}
+
+/// Gives `daemon`'s recovery memory back a step at a time, as the idle tick does, and holds its p99 step to
+/// `STEP_QUANTA` step quanta of its shard's CPU, read off the shard thread's own clock, over at least `JUDGED_STEPS`
+/// steps; skips loudly where no such clock is fine enough (Windows). The longest step is printed: a slice is sized from
+/// the step before, so a step that crosses from memory never written into resident pages overshoots once, by their cost
+/// ratio, and the next corrects.
+fn assert_each_give_back_step_takes_about_a_quantum(daemon: &Daemon) {
+  /// Shape: the step quanta the p99 give-back step may take of its shard's CPU. A slice is the bytes the OS gave back
+  /// in one quantum the step before, so a step runs about a quantum; a region given back whole ran 18 to 21 ms,
+  /// thousands of quanta.
+  const STEP_QUANTA: u64 = 16;
+  /// Shape: the fewest steps a p99 is judged over. A give-back of one region in one step (before A-226's slices) takes
+  /// one step a region, and its p99 is its whole cost.
+  const JUDGED_STEPS: usize = 100;
+  let steps = daemon.give_back_recovery_by_steps().unwrap();
+  let Some(cpu) = steps
+    .step_cpu_ns
+    .as_ref()
+    .filter(|_| cfg!(any(target_os = "linux", target_os = "macos")))
+  else {
+    println!(
+      "SKIPPED (loudly), the CPU judge: no thread clock fine enough here to time a step by (Windows' ticks at about \
+       15.6 ms)"
+    );
+    return;
+  };
+  let at = |permille: usize| {
+    cpu
+      .get(cpu.len().saturating_mul(permille) / 1000)
+      .copied()
+      .unwrap_or(0)
+  };
+  let longest = cpu.last().copied().unwrap_or(0);
+  let p99 = if cpu.len() >= JUDGED_STEPS {
+    at(990)
+  } else {
+    longest
+  };
+  println!(
+    "give-back by steps after a restart: {} bytes in {} steps; the shard's CPU a step p50 {} ns, p99 {p99} ns, max \
+     {longest} ns; its quantum {} ns",
+    steps.returned,
+    steps.steps,
+    at(500),
+    steps.quantum_ns
+  );
+  assert!(
+    steps.returned > 0,
+    "the restarted daemon gave its recovery memory back"
+  );
+  assert!(
+    p99 <= steps.quantum_ns.saturating_mul(STEP_QUANTA),
+    "the p99 give-back step (over {} steps; the longest when fewer than {JUDGED_STEPS}) held its shard {p99} ns of CPU, \
+     past {STEP_QUANTA} quanta of {} ns",
+    cpu.len(),
+    steps.quantum_ns
+  );
 }
 
 /// The longest of the status probes of `volume` made back to back for `window`, with their p50, p99 and p999 printed.
