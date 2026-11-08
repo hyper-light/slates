@@ -3215,3 +3215,75 @@ fn a_member_down_through_a_voters_restart_is_still_taken_over() {
     "the survivors took the volume over though a voter restarted while the owner was down: {views:?}"
   );
 }
+
+/// DIAG, not for main: does a holder restarted warm refuse an owner's records Unauthorized before it relearns the
+/// owner's id, and for how long.
+#[test]
+fn diag_a_restarted_holder_refuses_records_before_relearning() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    return;
+  }
+  let fleet = start_fleet_as("restart-refused", "anchor");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let id = create_live_volume(&owner, "restart-refused");
+  write_files(&owner, &id, 0..FILES);
+  let others: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| **instance != owner)
+    .collect();
+  let (caught_up, _, held) = wait_caught_up(&owner, &others, &id);
+  assert!(caught_up, "both candidates held every write: {held:?}");
+  let restarted = (*others[0]).clone();
+  let stop = std::sync::atomic::AtomicBool::new(false);
+  std::thread::scope(|scope| {
+    scope.spawn(|| {
+      let mut file = FILES;
+      while !stop.load(std::sync::atomic::Ordering::Acquire) {
+        write_files(&owner, &id, file..file + 1);
+        file += 1;
+      }
+      eprintln!("diag-restart: wrote {} files", file - FILES);
+    });
+    restart_warm(&restarted);
+    let began = Instant::now();
+    let (mut seen, mut first, mut last) = (0_u64, None, None);
+    let mut samples = 0_u64;
+    while began.elapsed() < Duration::from_secs(20) {
+      let (code, out, _) = run(&restarted, &["status"]);
+      if code == 0 {
+        samples += 1;
+        let total: u64 = out
+          .lines()
+          .filter_map(|line| line.split_once(" refused fleet.record.refused.unauthorized: "))
+          .filter_map(|(_, count)| count.trim().parse::<u64>().ok())
+          .sum();
+        if total > seen {
+          first.get_or_insert(began.elapsed());
+          last = Some(began.elapsed());
+          seen = total;
+        }
+      }
+      pause();
+    }
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let (_, out, _) = run(&restarted, &["status"]);
+    let lines: Vec<&str> = out
+      .lines()
+      .filter(|line| {
+        line.contains("fleet.record")
+          || line.contains("hold_refused")
+          || line.contains("fleet.live.")
+          || line.starts_with("fleet_held_records")
+          || line.starts_with("fleet_members")
+          || line.starts_with("restarts")
+      })
+      .collect();
+    eprintln!(
+      "diag-restart: unauthorized {seen}; first {first:?}, last {last:?} after the restart; {samples} samples; {lines:?}"
+    );
+  });
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+}
