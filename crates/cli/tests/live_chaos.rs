@@ -2963,6 +2963,32 @@ fn configuration_versions(instances: &[String]) -> Vec<(Option<String>, Option<S
     .collect()
 }
 
+/// What each of `instances` but `skip` (stopped, so it cannot answer) holds of the member `host`: whether its detector
+/// holds it alive, its detector line (the window it derived, its suspicions and condemnations) and any retirement kept
+/// for it.
+fn held_of(instances: &[String], skip: usize, host: &str) -> Vec<String> {
+  instances
+    .iter()
+    .enumerate()
+    .filter(|(index, _)| *index != skip)
+    .map(|(_, instance)| {
+      let (_, out, _) = run(instance, &["status"]);
+      let alive = out
+        .lines()
+        .find_map(|line| line.strip_prefix("fleet_members: "))
+        .is_some_and(|members| members.split_whitespace().any(|member| member == host));
+      let lines: Vec<&str> = out
+        .lines()
+        .filter(|line| {
+          line.starts_with(&format!("fleet_detector {host}:"))
+            || line.starts_with(&format!("fleet_retirement: host={host} "))
+        })
+        .collect();
+      format!("{instance}: alive={alive} {lines:?}")
+    })
+    .collect()
+}
+
 /// The nodes of `fleet` holding a copy of `volume`'s log as candidates, by index.
 fn holders_of(fleet: &Fleet, volume: &str) -> Vec<usize> {
   (0..fleet.instances.len())
@@ -3015,6 +3041,7 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
       .collect::<Vec<_>>()
   ));
   let mut roles = None;
+  let mut stale_stop = None;
   let fleet_cell = std::cell::RefCell::new(&mut fleet);
   let (outcomes, _samples) =
     stream_through(&instances, &owner, &volume, 0..STREAM_FILES, |began| {
@@ -3070,6 +3097,7 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
       // Each node's configuration version as the holder stops: whether the stale holder was already behind the
       // council before its stop (diag-35 runs 5 and 8 found it at version 7 against 23 after it resumed).
       let versions = configuration_versions(&instances);
+      stale_stop = fleet_view(&instances[stale]).map(|(host, _, _)| (Instant::now(), host));
       fleet_cell.borrow().stop(stale);
       verdict.note(format!(
         "{} stopped at {:?}; configuration versions then {versions:?}",
@@ -3090,6 +3118,16 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
     .iter()
     .map(|survivor| counter(survivor, "fleet.takeover.adopted"))
     .sum();
+  // How long the stale holder has been stopped, and what the others hold of it, as the owner is crashed: whether the
+  // detector condemned it inside the stop, against the window it derived (diag-live-fixes-40 run 7: the stopped holder
+  // retired one version after the stop, and the owner's objects lost through its cohort).
+  if let Some((stopped_at, host)) = &stale_stop {
+    verdict.note(format!(
+      "the stale holder {host} had been stopped {:?} at the owner's crash; as the others held it: {:?}",
+      stopped_at.elapsed(),
+      held_of(&instances, stale, host)
+    ));
+  }
   // The writes since the stale holder stopped are durable on the owner and `current` alone. Once the stream has stopped
   // (every write answered), the owner is crashed and the stale holder resumed: nothing reaches it any more.
   fleet.kill_node(owner_index);
