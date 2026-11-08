@@ -1,0 +1,338 @@
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/home/runner/work/slates/slates/target/release/build/aws-lc-sys-3d7eb136a6063351/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Using flag: -ffile-prefix-map=/home/runner/work/slates/slates/vendor/aws-lc-sys=
+warning: aws-lc-sys@0.45.0: Using assembler flag: -Wa,--debug-prefix-map=/home/runner/work/slates/slates/vendor/aws-lc-sys=
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/release/build/aws-lc-sys-3d7eb136a6063351/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/release/build/aws-lc-sys-3d7eb136a6063351/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/runner/work/slates/slates/target/release/build/aws-lc-sys-3d7eb136a6063351/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+    Finished `release` profile [optimized] target(s) in 0.10s
+     Running tests/live_chaos.rs (target/release/deps/live_chaos-12e0e667394c1712)
+
+running 1 test
+test candidates_partitioned_in_turn_mid_stream_lose_nothing ... slates daemon: fleet node `a` of `slates-fleet`: member 11701537404381666362 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 16759308288: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 2793218048: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 8388608: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 698304512: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 2078287: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 9841: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 698304512: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 1396609024: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 30747: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 3024721920: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 14883: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: page_fault_ns = 1086: the profile's measured base-page fault cost (at least one) (anchors ["faults.base_ns"])
+slates daemon: prefault_reserve_bytes = min(the shard's last write burst, reserve_per_shard = 2793218048, the arena's free bytes): the free content pages an idle shard keeps pre-faulted; the burst is measured at each idle tick (anchors ["reserve_per_shard", "content.allocated_bytes"])
+slates daemon: codec = lz4 false, zstd levels [], byte worth 330 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 256: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 1212334: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 914609: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 681938: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 2793218048: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 113656: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 9: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 2583: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 16384: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5166: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 5171: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 984100: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_bandwidth_bytes_per_ns = 3: memcpy bytes per second at the largest measured copy size / 1e9 (at least one byte per nanosecond) (anchors ["memcpy"])
+slates daemon: guest_requests_credit = 20: the owning shard's admission limit (Little's law: request rate × p99 service time); one attachment may use its shard's whole in-flight budget, which the daemon splits among attachments (anchors ["rt.requests_in_flight_per_shard"])
+slates daemon: guest_bytes_credit = 4456544: clamp(bandwidth × rtt, one frame cap, bandwidth × class latency budget) (anchors ["wire.bandwidth", "wire.rtt_p50", "wire.frame_cap", "wire.class_budget"])
+slates daemon: guest_listing_entries = 131072: guest writable cap / smallest fuse_dirent (anchors ["guest.writable_cap"])
+slates daemon: inode_reserve = 262144: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 2568: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 349152256: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2424668: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2424668: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: fleet_sessions_per_plane = 1938: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120107: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77589122: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5173: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: instance chaos-rolling-a-39362 serving on 2 shards alone
+slates-server: shard 1 initialized in 1298 µs
+slates-server: shard 0 initialized in 1680 µs
+slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, extensions 10 × 100000000 ns; no path measured yet
+slates daemon: fleet node `b` of `slates-fleet`: member 16551698120901458881 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 16759308288: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 2793218048: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 8388608: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 698304512: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 2078287: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 9155: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 698304512: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 1396609024: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 29906: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 3171426265: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 14517: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: page_fault_ns = 1135: the profile's measured base-page fault cost (at least one) (anchors ["faults.base_ns"])
+slates daemon: prefault_reserve_bytes = min(the shard's last write burst, reserve_per_shard = 2793218048, the arena's free bytes): the free content pages an idle shard keeps pre-faulted; the burst is measured at each idle tick (anchors ["reserve_per_shard", "content.allocated_bytes"])
+slates daemon: codec = lz4 false, zstd levels [], byte worth 315 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 256: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 1212334: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 914609: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 681938: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 2793218048: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 113656: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 4: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 2583: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 16384: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5166: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 5171: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 915500: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_bandwidth_bytes_per_ns = 3: memcpy bytes per second at the largest measured copy size / 1e9 (at least one byte per nanosecond) (anchors ["memcpy"])
+slates daemon: guest_requests_credit = 20: the owning shard's admission limit (Little's law: request rate × p99 service time); one attachment may use its shard's whole in-flight budget, which the daemon splits among attachments (anchors ["rt.requests_in_flight_per_shard"])
+slates daemon: guest_bytes_credit = 4456544: clamp(bandwidth × rtt, one frame cap, bandwidth × class latency budget) (anchors ["wire.bandwidth", "wire.rtt_p50", "wire.frame_cap", "wire.class_budget"])
+slates daemon: guest_listing_entries = 131072: guest writable cap / smallest fuse_dirent (anchors ["guest.writable_cap"])
+slates daemon: inode_reserve = 262144: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 2568: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 349152256: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2424668: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2424668: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: fleet_sessions_per_plane = 1938: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120107: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77589122: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5173: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: instance chaos-rolling-b-39362 serving on 2 shards alone
+slates-server: shard 1 initialized in 845 µs
+slates-server: shard 0 initialized in 828 µs
+slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, extensions 10 × 100000000 ns; no path measured yet
+slates-cluster: fleet: HostId(5245335389751314200) holds HostId(9932838275441976658) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(9932838275441976658) holds HostId(5245335389751314200) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates daemon: fleet node `c` of `slates-fleet`: member 17035742400343559050 with 2 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 16759308288: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 2793218048: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 8388608: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 698304512: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 2078287: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 9314: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 698304512: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 1396609024: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 30055: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 3006752516: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 14002: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: page_fault_ns = 1295: the profile's measured base-page fault cost (at least one) (anchors ["faults.base_ns"])
+slates daemon: prefault_reserve_bytes = min(the shard's last write burst, reserve_per_shard = 2793218048, the arena's free bytes): the free content pages an idle shard keeps pre-faulted; the burst is measured at each idle tick (anchors ["reserve_per_shard", "content.allocated_bytes"])
+slates daemon: codec = lz4 false, zstd levels [], byte worth 332 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 256: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 1212334: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 914609: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 681938: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 2793218048: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 113656: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 6: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 2583: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 16384: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5166: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 5171: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 931400: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_bandwidth_bytes_per_ns = 3: memcpy bytes per second at the largest measured copy size / 1e9 (at least one byte per nanosecond) (anchors ["memcpy"])
+slates daemon: guest_requests_credit = 20: the owning shard's admission limit (Little's law: request rate × p99 service time); one attachment may use its shard's whole in-flight budget, which the daemon splits among attachments (anchors ["rt.requests_in_flight_per_shard"])
+slates daemon: guest_bytes_credit = 4456544: clamp(bandwidth × rtt, one frame cap, bandwidth × class latency budget) (anchors ["wire.bandwidth", "wire.rtt_p50", "wire.frame_cap", "wire.class_budget"])
+slates daemon: guest_listing_entries = 131072: guest writable cap / smallest fuse_dirent (anchors ["guest.writable_cap"])
+slates daemon: inode_reserve = 262144: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 2568: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 349152256: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2424668: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2424668: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: fleet_sessions_per_plane = 1938: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120107: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77589122: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5173: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
+slates daemon: instance chaos-rolling-c-39362 serving on 2 shards alone
+slates-server: shard 0 initialized in 841 µs
+slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, extensions 10 × 100000000 ns; no path measured yet
+slates-server: shard 1 initialized in 766 µs
+slates-cluster: fleet: HostId(12001531573888620679) holds HostId(5245335389751314200) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(5245335389751314200) holds HostId(12001531573888620679) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(5245335389751314200) holds HostId(9932838275441976658) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+slates-cluster: fleet: HostId(5245335389751314200) holds HostId(12001531573888620679) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+slates-cluster: fleet: HostId(12001531573888620679) holds HostId(5245335389751314200) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+slates-cluster: fleet: HostId(9932838275441976658) holds HostId(5245335389751314200) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+slates-cluster: fleet: HostId(9932838275441976658) holds HostId(12001531573888620679) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(12001531573888620679) holds HostId(9932838275441976658) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(9932838275441976658) holds HostId(12001531573888620679) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+slates-cluster: fleet: HostId(12001531573888620679) holds HostId(9932838275441976658) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+chaos: fleet rolling (Bare) formed and settled: hosts ["9932838275441976658", "5245335389751314200", "12001531573888620679"]
+LD-LANE at 1982811734 holder 9932838275441976658 stream 22 bytes 4842 budget_ns 1000004872 took_ns 1000332438 answered false unanswered 1 path_before Some((130934, 131763, Some(65496)))
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-39362 partitioned from 214.851075ms to 2.214988173s
+slates-cluster: fleet: HostId(12001531573888620679) holds HostId(9932838275441976658) alive: Some(MemberState { liveness: Dead, incarnation: 1 }) -> MemberState { liveness: Alive, incarnation: 2 }, folded at crates/server/src/member_task.rs:618:8
+slates daemon: the control shard's beat task ran 2033 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 1062 steps and 1153 polls (73 long in a task, 0 blocked in the kernel, 0 preempted by the host, 39 unattributed), fired 10 timers, waited 124 times, spawned 11 tasks and finished 11; 13 tasks live; its longest poll is 6 ms and its timer overrun 1978 ms
+slates-cluster: fleet: HostId(5245335389751314200) holds HostId(9932838275441976658) alive: Some(MemberState { liveness: Dead, incarnation: 1 }) -> MemberState { liveness: Alive, incarnation: 2 }, folded at crates/server/src/member_task.rs:618:8
+slates-cluster: fleet: HostId(5245335389751314200) holds HostId(9932838275441976658) alive: Some(MemberState { liveness: Dead, incarnation: 1 }) -> MemberState { liveness: Alive, incarnation: 2 }, folded at crates/server/src/member_task.rs:718:9
+slates-cluster: fleet: HostId(12001531573888620679) holds HostId(9932838275441976658) alive: Some(MemberState { liveness: Dead, incarnation: 1 }) -> MemberState { liveness: Alive, incarnation: 2 }, folded at crates/server/src/member_task.rs:718:9
+LD-LANE at 4405284233 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1000013100 took_ns 1000177449 answered false unanswered 1 path_before Some((185488, 501454, Some(65496)))
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-39362 partitioned from 2.636756594s to 4.636893753s
+slates-cluster: fleet: HostId(9932838275441976658) holds HostId(5245335389751314200) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:618:8
+slates daemon: the control shard's beat task ran 2066 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 3648 steps and 3790 polls (14 long in a task, 13 blocked in the kernel, 1 preempted by the host, 5 unattributed), fired 11 timers, waited 21 times, spawned 7 tasks and finished 7; 13 tasks live; its longest poll is 23 ms and its timer overrun 1971 ms
+slates-cluster: fleet: HostId(9932838275441976658) holds HostId(5245335389751314200) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:718:9
+slates-cluster: fleet: HostId(12001531573888620679) holds HostId(5245335389751314200) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:618:8
+slates-cluster: fleet: HostId(12001531573888620679) holds HostId(5245335389751314200) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:718:9
+chaos candidates partitioned in turn mid-stream: 5176 writes, 5176 acknowledged: p50 357 us, p99 13721 us, p999 72751 us, max 165185 us; 10 over 50ms (sent+took): 0.00s+165ms 1.22s+56ms 2.37s+93ms 2.47s+72ms 2.55s+54ms 3.64s+124ms 4.67s+147ms 4.82s+108ms 4.93s+67ms 4.99s+73ms
+LD-LANE at 6790793102 holder 5245335389751314200 stream 23 bytes 21947722 budget_ns 227543183201 took_ns 2526917039 answered true unanswered 0 path_before Some((11710, 120869978, Some(1200)))
+LD-LANE at 9409675411 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1000301008 took_ns 124934976 answered true unanswered 0 path_before Some((174974, 10868485, Some(65464)))
+LD-LANE at 9536514502 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1000663395 took_ns 248408121 answered true unanswered 0 path_before Some((174787, 23927561, Some(65464)))
+LD-LANE at 9786857810 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1001315071 took_ns 123714532 answered true unanswered 0 path_before Some((174787, 47432402, Some(65464)))
+LD-LANE at 9915204852 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1001381866 took_ns 245355404 answered true unanswered 0 path_before Some((174787, 49841597, Some(65464)))
+LD-LANE at 10164345409 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1001895393 took_ns 246490678 answered true unanswered 0 path_before Some((171155, 66943065, Some(65464)))
+LD-LANE at 10415826497 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1002317192 took_ns 245355259 answered true unanswered 0 path_before Some((167641, 80160239, Some(65464)))
+LD-LANE at 10664899437 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1002606116 took_ns 246573097 answered true unanswered 0 path_before Some((167641, 90155183, Some(65464)))
+LD-LANE at 10915194343 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1002831175 took_ns 246616807 answered true unanswered 0 path_before Some((167641, 97940779, Some(65464)))
+LD-LANE at 11166325692 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003003662 took_ns 245933632 answered true unanswered 0 path_before Some((167641, 103907767, Some(65464)))
+LD-LANE at 11416336682 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003133404 took_ns 246136764 answered true unanswered 0 path_before Some((167641, 108396013, Some(65464)))
+LD-LANE at 11666441402 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003233448 took_ns 246382863 answered true unanswered 0 path_before Some((167641, 111856885, Some(65464)))
+LD-LANE at 11918229230 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003310890 took_ns 244980357 answered true unanswered 0 path_before Some((167641, 114535918, Some(65464)))
+LD-LANE at 12167736883 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003365632 took_ns 245699560 answered true unanswered 0 path_before Some((167641, 116429630, Some(65464)))
+LD-LANE at 12418147990 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003409925 took_ns 245700654 answered true unanswered 0 path_before Some((167641, 117961907, Some(65464)))
+LD-LANE at 12668187097 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003443678 took_ns 245926844 answered true unanswered 0 path_before Some((167641, 119129540, Some(65464)))
+LD-LANE at 12918645482 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003470282 took_ns 245794229 answered true unanswered 0 path_before Some((167641, 120049862, Some(65464)))
+LD-LANE at 13168567397 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003490296 took_ns 246223643 answered true unanswered 0 path_before Some((167641, 120742223, Some(65464)))
+LD-LANE at 13419365548 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003506909 took_ns 245730427 answered true unanswered 0 path_before Some((167641, 121316932, Some(65464)))
+LD-LANE at 13669458766 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003518034 took_ns 245997213 answered true unanswered 0 path_before Some((167641, 121701767, Some(65464)))
+LD-LANE at 13919401178 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003527504 took_ns 246374528 answered true unanswered 0 path_before Some((167641, 122029375, Some(65464)))
+LD-LANE at 14169950465 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003536036 took_ns 246174587 answered true unanswered 0 path_before Some((167641, 122324530, Some(65464)))
+LD-LANE at 14419905670 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003541836 took_ns 246528140 answered true unanswered 0 path_before Some((167641, 122525187, Some(65464)))
+LD-LANE at 14670964157 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003547401 took_ns 245762385 answered true unanswered 0 path_before Some((167641, 122717687, Some(65464)))
+LD-LANE at 14921265676 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003549240 took_ns 245826020 answered true unanswered 0 path_before Some((167641, 122781303, Some(65464)))
+LD-LANE at 15171303788 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003550680 took_ns 246088700 answered true unanswered 0 path_before Some((167641, 122831135, Some(65464)))
+LD-LANE at 15421847591 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003552898 took_ns 245867276 answered true unanswered 0 path_before Some((167641, 122907859, Some(65464)))
+LD-LANE at 15671962032 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003553693 took_ns 246094026 answered true unanswered 0 path_before Some((167641, 122935347, Some(65464)))
+LD-LANE at 15922573586 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003555042 took_ns 245814041 answered true unanswered 0 path_before Some((167641, 122982036, Some(65464)))
+LD-LANE at 16172948758 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003555227 took_ns 245694747 answered true unanswered 0 path_before Some((167641, 122988435, Some(65464)))
+LD-LANE at 16423154876 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003555022 took_ns 245912601 answered true unanswered 0 path_before Some((167641, 122981341, Some(65464)))
+LD-LANE at 16673641133 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003555558 took_ns 245668707 answered true unanswered 0 path_before Some((167641, 122999866, Some(65464)))
+LD-LANE at 16923801071 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003555178 took_ns 245900771 answered true unanswered 0 path_before Some((167641, 122986718, Some(65464)))
+LD-LANE at 17174143742 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003555619 took_ns 245846276 answered true unanswered 0 path_before Some((167641, 123001973, Some(65464)))
+LD-LANE at 17424687298 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003555847 took_ns 245691435 answered true unanswered 0 path_before Some((167641, 123009885, Some(65464)))
+LD-LANE at 17674932463 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003555403 took_ns 245735799 answered true unanswered 0 path_before Some((167641, 122994518, Some(65464)))
+LD-LANE at 17924836672 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003555315 took_ns 246183109 answered true unanswered 0 path_before Some((167641, 122991452, Some(65464)))
+LD-LANE at 18175191400 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003556690 took_ns 246125302 answered true unanswered 0 path_before Some((167641, 123039034, Some(65464)))
+LD-LANE at 18425577957 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003557533 took_ns 247032491 answered true unanswered 0 path_before Some((167641, 123068201, Some(65464)))
+LD-LANE at 18677364004 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003558097 took_ns 244581583 answered true unanswered 0 path_before Some((167641, 123087716, Some(65464)))
+LD-LANE at 18926580296 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003553656 took_ns 245759952 answered true unanswered 0 path_before Some((167641, 122934066, Some(65464)))
+LD-LANE at 19176866560 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003553009 took_ns 245691632 answered true unanswered 0 path_before Some((167641, 122911691, Some(65464)))
+LD-LANE at 19427180175 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003553256 took_ns 245736088 answered true unanswered 0 path_before Some((167641, 122920250, Some(65464)))
+LD-LANE at 19676701348 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003553637 took_ns 246568079 answered true unanswered 0 path_before Some((167641, 122933413, Some(65464)))
+LD-LANE at 19927748156 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003556647 took_ns 245882194 answered true unanswered 0 path_before Some((167641, 123037561, Some(65464)))
+LD-LANE at 20178188910 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003556693 took_ns 245666487 answered true unanswered 0 path_before Some((167641, 123039141, Some(65464)))
+LD-LANE at 20428398332 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003556020 took_ns 245918124 answered true unanswered 0 path_before Some((167641, 123015862, Some(65464)))
+LD-LANE at 20678852221 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003556289 took_ns 245696155 answered true unanswered 0 path_before Some((167641, 123025146, Some(65464)))
+LD-LANE at 20929106996 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003555725 took_ns 245822644 answered true unanswered 0 path_before Some((167641, 123005654, Some(65464)))
+LD-LANE at 21179441172 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003555766 took_ns 245810498 answered true unanswered 0 path_before Some((167641, 123007083, Some(65464)))
+LD-LANE at 21429580463 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003555724 took_ns 246009125 answered true unanswered 0 path_before Some((167641, 123005624, Some(65464)))
+LD-LANE at 21679821983 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003556481 took_ns 246041218 answered true unanswered 0 path_before Some((167641, 123031798, Some(65464)))
+LD-LANE at 21929786444 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003557036 took_ns 246448869 answered true unanswered 0 path_before Some((167641, 123050986, Some(65464)))
+LD-LANE at 22180208046 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003558777 took_ns 246358720 answered true unanswered 0 path_before Some((167641, 123111235, Some(65464)))
+LD-LANE at 22430688268 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003559869 took_ns 246209134 answered true unanswered 0 path_before Some((167641, 123149006, Some(65464)))
+LD-LANE at 22681375351 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003560232 took_ns 245874565 answered true unanswered 0 path_before Some((167641, 123161580, Some(65464)))
+LD-LANE at 22931157596 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003559527 took_ns 246379244 answered true unanswered 0 path_before Some((167641, 123137187, Some(65464)))
+LD-LANE at 23181411805 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003560451 took_ns 246508022 answered true unanswered 0 path_before Some((167641, 123169155, Some(65464)))
+LD-LANE at 23432720841 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003561529 took_ns 245510607 answered true unanswered 0 path_before Some((167641, 123206433, Some(65464)))
+LD-LANE at 23682967175 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003559258 took_ns 245534166 answered true unanswered 0 path_before Some((167641, 123127852, Some(65464)))
+LD-LANE at 23932597894 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003557630 took_ns 246257164 answered true unanswered 0 path_before Some((167641, 123071566, Some(65464)))
+LD-LANE at 24182538468 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003558730 took_ns 246673542 answered true unanswered 0 path_before Some((167641, 123109611, Some(65464)))
+LD-LANE at 24433340509 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003560869 took_ns 246165726 answered true unanswered 0 path_before Some((167641, 123183593, Some(65464)))
+LD-LANE at 24683383596 holder 5245335389751314200 stream 22 bytes 4371429 budget_ns 4212214119 took_ns 2752667405 answered true unanswered 0 path_before Some((167641, 123185985, Some(65464)))
+LD-LANE at 27439015860 holder 5245335389751314200 stream 22 bytes 4476236 budget_ns 2864092106 took_ns 2865486294 answered false unanswered 0 path_before Some((130870, 54499748, Some(65464)))
+LD-LANE at 30687403356 holder 5245335389751314200 stream 22 bytes 4476236 budget_ns 2855027462 took_ns 2858155757 answered false unanswered 1 path_before Some((66670, 27629169, Some(33364)))
+LD-LANE at 33941606282 holder 5245335389751314200 stream 22 bytes 4476236 budget_ns 2659621264 took_ns 2662285371 answered false unanswered 1 path_before Some((66670, 24718748, Some(33364)))
+LD-LANE at 37070512686 holder 5245335389751314200 stream 22 bytes 4476236 budget_ns 6060657588 took_ns 2882863162 answered true unanswered 0 path_before Some((66670, 75374498, Some(33364)))
+LD-LANE at 39955484649 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003432328 took_ns 118987249 answered true unanswered 0 path_before Some((130934, 92738042, Some(65496)))
+LD-LANE at 40075002721 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003109146 took_ns 249750316 answered true unanswered 0 path_before Some((130934, 84005975, Some(65496)))
+LD-LANE at 40325330996 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003463325 took_ns 249736562 answered true unanswered 0 path_before Some((130934, 93575532, Some(65496)))
+LD-LANE at 40575663838 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003734422 took_ns 249772155 answered true unanswered 0 path_before Some((130934, 100900315, Some(65496)))
+LD-LANE at 40825981084 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003942158 took_ns 124917100 answered true unanswered 0 path_before Some((130934, 106513128, Some(65496)))
+LD-LANE at 40951499083 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003523652 took_ns 124256935 answered true unanswered 0 path_before Some((130934, 95205525, Some(65496)))
+LD-LANE at 41076297913 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003200259 took_ns 249756634 answered true unanswered 0 path_before Some((130934, 86467775, Some(65496)))
+LD-LANE at 41326641921 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003533040 took_ns 124862184 answered true unanswered 0 path_before Some((130934, 95459177, Some(65496)))
+LD-LANE at 41452064255 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003210183 took_ns 124369677 answered true unanswered 0 path_before Some((130934, 86735890, Some(65496)))
+LD-LANE at 41576987815 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1002960733 took_ns 124766279 answered true unanswered 0 path_before Some((130934, 79996018, Some(65496)))
+LD-LANE at 41702294956 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1002771490 took_ns 249760330 answered true unanswered 0 path_before Some((130934, 74882851, Some(65496)))
+LD-LANE at 41952588260 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003205060 took_ns 124575315 answered true unanswered 0 path_before Some((130934, 86597469, Some(65496)))
+LD-LANE at 42077694228 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1002957800 took_ns 249684400 answered true unanswered 0 path_before Some((130934, 79916754, Some(65496)))
+LD-LANE at 42327915119 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003347164 took_ns 249815421 answered true unanswered 0 path_before Some((130934, 90436974, Some(65496)))
+LD-LANE at 42578296778 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003645761 took_ns 249820365 answered true unanswered 0 path_before Some((130934, 98504777, Some(65496)))
+LD-LANE at 42828656494 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003874424 took_ns 249673434 answered true unanswered 0 path_before Some((130934, 104683007, Some(65496)))
+LD-LANE at 43078896010 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1004048820 took_ns 249773672 answered true unanswered 0 path_before Some((130934, 109395019, Some(65496)))
+LD-LANE at 43329205405 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1004182914 took_ns 249803406 answered true unanswered 0 path_before Some((130934, 113018095, Some(65496)))
+LD-LANE at 43579582622 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1004285635 took_ns 249770059 answered true unanswered 0 path_before Some((130934, 115793517, Some(65496)))
+LD-LANE at 43829885008 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1004364221 took_ns 124861706 answered true unanswered 0 path_before Some((130934, 117916829, Some(65496)))
+LD-LANE at 43955293802 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003846435 took_ns 124394779 answered true unanswered 0 path_before Some((130934, 103926775, Some(65496)))
+LD-LANE at 44080224970 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003448073 took_ns 249774284 answered true unanswered 0 path_before Some((130934, 93163433, Some(65496)))
+LD-LANE at 44330528390 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003722973 took_ns 124989968 answered true unanswered 0 path_before Some((130934, 100590952, Some(65496)))
+LD-LANE at 44456023548 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003356108 took_ns 124382001 answered true unanswered 0 path_before Some((130934, 90678643, Some(65496)))
+LD-LANE at 44580908894 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003072635 took_ns 249743054 answered true unanswered 0 path_before Some((130934, 83019490, Some(65496)))
+LD-LANE at 44831190089 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003435407 took_ns 249808115 answered true unanswered 0 path_before Some((130934, 92821233, Some(65496)))
+LD-LANE at 45081438131 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003713420 took_ns 249842836 answered true unanswered 0 path_before Some((130934, 100332845, Some(65496)))
+LD-LANE at 45331791906 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003926375 took_ns 124931400 answered true unanswered 0 path_before Some((130934, 106086674, Some(65496)))
+LD-LANE at 45457256175 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003511628 took_ns 249715449 answered true unanswered 0 path_before Some((130934, 94880635, Some(65496)))
+LD-LANE at 45707480297 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003771584 took_ns 250403792 answered true unanswered 0 path_before Some((130934, 101904374, Some(65496)))
+LD-LANE at 45959327657 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1003973275 took_ns 248280182 answered true unanswered 0 path_before Some((130934, 107353873, Some(65496)))
+LD-LANE at 46208164579 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1004118954 took_ns 249741957 answered true unanswered 0 path_before Some((130934, 111289961, Some(65496)))
+LD-LANE at 46458482421 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1004236560 took_ns 249879432 answered true unanswered 0 path_before Some((130934, 114467576, Some(65496)))
+LD-LANE at 46708899487 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1004327137 took_ns 249642284 answered true unanswered 0 path_before Some((130934, 116914857, Some(65496)))
+LD-LANE at 46959119124 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1004395452 took_ns 249795742 answered true unanswered 0 path_before Some((130934, 118760651, Some(65496)))
+LD-LANE at 47209498933 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1004448448 took_ns 249746024 answered true unanswered 0 path_before Some((130934, 120192570, Some(65496)))
+chaos candidates partitioned in turn mid-stream: converged: false: owner Some(LiveState { holding: false, head: Some(5181), durable: Some(5181), owed: false, epoch: Some(1), identity: Some("3c0c18d597ea01b821f90d47688987c1a9dea3777467d43d24b8803d5a969266"), fence: 1, holders: ["5245335389751314200", "9932838275441976658"], moving_to: [], recorded: ["5245335389751314200", "9932838275441976658"] }); candidates [Some(LiveState { holding: true, head: Some(5181), durable: None, owed: false, epoch: Some(1), identity: Some("3c0c18d597ea01b821f90d47688987c1a9dea3777467d43d24b8803d5a969266"), fence: 1, holders: [], moving_to: [], recorded: [] }), Some(LiveState { holding: true, head: Some(5138), durable: None, owed: false, epoch: Some(1), identity: Some("1c134e87fa4b787684e158dd0de40c96a2d9cbb642a79178113882028b4199c9"), fence: 1, holders: [], moving_to: [], recorded: [] })]
+    chaos-rolling-c-39362: {"fleet.live.appended": 5182, "fleet.live.awaited": 5176, "fleet.live.durable": 5182, "fleet.live.held_back.keys": 1, "fleet.live.held_back.placement": 1, "fleet.live.holders_recorded": 1, "fleet.live.install_image": 4, "fleet.live.link_lost": 5, "fleet.live.no_session": 506, "fleet.live.resolved": 5176, "fleet.live.unanswered": 495, "fleet.live.whole": 1}
+    chaos-rolling-a-39362: {"fleet.live.held": 2681}
+    chaos-rolling-b-39362: {"fleet.live.held": 2684}
+chaos candidates partitioned in turn mid-stream: 394 samples, 316 heads seen
+chaos candidates partitioned in turn mid-stream: chaos-rolling-c-39362 refused the owner: {}
+chaos candidates partitioned in turn mid-stream: chaos-rolling-a-39362 refused the owner: {}
+LD-LANE at 47459763880 holder 5245335389751314200 stream 22 bytes 4846 budget_ns 1004488851 took_ns 249694325 answered true unanswered 0 path_before Some((130934, 121284209, Some(65496)))
+chaos candidates partitioned in turn mid-stream: chaos-rolling-b-39362 refused the owner: {}
+chaos candidates partitioned in turn mid-stream:
+  chaos-rolling-a-39362 partitioned from 214.851075ms to 2.214988173s
+  chaos-rolling-b-39362 partitioned from 2.636756594s to 4.636893753s
+  every write acknowledged: held
+  5176 writes, 5176 acknowledged: p50 357 us, p99 13721 us, p999 72751 us, max 165185 us; 10 over 50ms (sent+took): 0.00s+165ms 1.22s+56ms 2.37s+93ms 2.47s+72ms 2.55s+54ms 3.64s+124ms 4.67s+147ms 4.82s+108ms 4.93s+67ms 4.99s+73ms
+  converged: false: owner Some(LiveState { holding: false, head: Some(5181), durable: Some(5181), owed: false, epoch: Some(1), identity: Some("3c0c18d597ea01b821f90d47688987c1a9dea3777467d43d24b8803d5a969266"), fence: 1, holders: ["5245335389751314200", "9932838275441976658"], moving_to: [], recorded: ["5245335389751314200", "9932838275441976658"] }); candidates [Some(LiveState { holding: true, head: Some(5181), durable: None, owed: false, epoch: Some(1), identity: Some("3c0c18d597ea01b821f90d47688987c1a9dea3777467d43d24b8803d5a969266"), fence: 1, holders: [], moving_to: [], recorded: [] }), Some(LiveState { holding: true, head: Some(5138), durable: None, owed: false, epoch: Some(1), identity: Some("1c134e87fa4b787684e158dd0de40c96a2d9cbb642a79178113882028b4199c9"), fence: 1, holders: [], moving_to: [], recorded: [] })]
+    chaos-rolling-c-39362: {"fleet.live.appended": 5182, "fleet.live.awaited": 5176, "fleet.live.durable": 5182, "fleet.live.held_back.keys": 1, "fleet.live.held_back.placement": 1, "fleet.live.holders_recorded": 1, "fleet.live.install_image": 4, "fleet.live.link_lost": 5, "fleet.live.no_session": 506, "fleet.live.resolved": 5176, "fleet.live.unanswered": 495, "fleet.live.whole": 1}
+    chaos-rolling-a-39362: {"fleet.live.held": 2681}
+    chaos-rolling-b-39362: {"fleet.live.held": 2684}
+  Convergence: 1 violations
+  394 samples, 316 heads seen
+  Agreement: held
+  NoLoss: held
+  chaos-rolling-c-39362 refused the owner: {}
+  chaos-rolling-a-39362 refused the owner: {}
+  chaos-rolling-b-39362 refused the owner: {}
+
+thread 'candidates_partitioned_in_turn_mid_stream_lose_nothing' (39363) panicked at crates/cli/tests/live_chaos.rs:1135:5:
+chaos candidates partitioned in turn mid-stream: Convergence: owner Some(LiveState { holding: false, head: Some(5181), durable: Some(5181), owed: false, epoch: Some(1), identity: Some("3c0c18d597ea01b821f90d47688987c1a9dea3777467d43d24b8803d5a969266"), fence: 1, holders: ["5245335389751314200", "9932838275441976658"], moving_to: [], recorded: ["5245335389751314200", "9932838275441976658"] }); candidates [Some(LiveState { holding: true, head: Some(5181), durable: None, owed: false, epoch: Some(1), identity: Some("3c0c18d597ea01b821f90d47688987c1a9dea3777467d43d24b8803d5a969266"), fence: 1, holders: [], moving_to: [], recorded: [] }), Some(LiveState { holding: true, head: Some(5138), durable: None, owed: false, epoch: Some(1), identity: Some("1c134e87fa4b787684e158dd0de40c96a2d9cbb642a79178113882028b4199c9"), fence: 1, holders: [], moving_to: [], recorded: [] })]
+    chaos-rolling-c-39362: {"fleet.live.appended": 5182, "fleet.live.awaited": 5176, "fleet.live.durable": 5182, "fleet.live.held_back.keys": 1, "fleet.live.held_back.placement": 1, "fleet.live.holders_recorded": 1, "fleet.live.install_image": 4, "fleet.live.link_lost": 5, "fleet.live.no_session": 506, "fleet.live.resolved": 5176, "fleet.live.unanswered": 495, "fleet.live.whole": 1}
+    chaos-rolling-a-39362: {"fleet.live.held": 2681}
+    chaos-rolling-b-39362: {"fleet.live.held": 2684}
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    candidates_partitioned_in_turn_mid_stream_lose_nothing
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 48.09s
+
+error: test failed, to rerun pass `-p slates-cli --test live_chaos`
