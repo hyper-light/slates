@@ -27,7 +27,8 @@
 //! touched must equal the version-ordered replay of the accepted submits over the files' version-0 bytes.
 //!
 //! Rows: `latency\t<n>\t<kind>\t<count>\t<p50>\t<p99>\t<p999>\t<max>` in nanoseconds, then `oracle\t<n>\t…` lines;
-//! a nonzero `oracle_failures` exits 1.
+//! a nonzero `oracle_failures` exits 1. Last, `lost\t<counter>\t<count>` for each of the daemon's counters of a lost
+//! reply or ask.
 // Bench harness code: an unwrap here is a failed run.
 #![allow(
   clippy::unwrap_used,
@@ -1854,6 +1855,34 @@ fn arg(name: &str) -> Option<String> {
   args.find(|a| a == name).and_then(|_| args.next())
 }
 
+/// Format: the daemon's counters of a reply or an ask that was lost or refused for want of room, read at the end of a
+/// run: `lost\t<counter>\t<count>`, all shards summed, a zero printed too. A lost reply leaves its client waiting out
+/// its whole reply deadline, so a run's latencies alone do not show one.
+const LOSS_COUNTERS: [&str; 7] = [
+  "xshard.reply_dropped",
+  "lease.wait.undelivered",
+  "merge.acceptance_undelivered",
+  "merge.work.ask_unanswered",
+  "merge.work.park_full",
+  "merge.work.pending_stuck",
+  "merge.work.floor_not_sent",
+];
+
+/// Prints [`LOSS_COUNTERS`] from the daemon's own report.
+fn report_losses(client: &mut Client) {
+  let report = client.daemon_status().unwrap();
+  for name in LOSS_COUNTERS {
+    let count: u64 = report
+      .shards
+      .iter()
+      .flat_map(|shard| shard.refusals.iter())
+      .filter(|refusal| refusal.kind == name)
+      .map(|refusal| refusal.count)
+      .sum();
+    println!("lost\t{name}\t{count}");
+  }
+}
+
 fn main() {
   let tree = arg("--tree").unwrap_or_default();
   let levels: Vec<usize> = arg("--clients")
@@ -1927,6 +1956,7 @@ fn main() {
       workers.min(n),
     );
   }
+  report_losses(&mut setup);
   drop(setup);
   if let Some(daemon) = daemon {
     daemon.stop();
