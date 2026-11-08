@@ -6732,24 +6732,28 @@ fn a_learner_learns_configurations_that_leave_the_membership_alone() {
   );
 }
 
-/// §4.8, D-14, learners: a learner keeps learning configurations after the voters it joined from are gone. Do form five
-/// members at `f = 1`, find a learner whose own Raft view names no voter but the bootstrapper (it joined while the
-/// council was the bootstrapper alone), stop the bootstrapper, and let the council retire it and commit what follows.
-/// Expect every survivor's council configuration to reach the newest any survivor holds, past the version at the stop,
-/// within the fleet's progress budget. Found by raft-chaos's fresh-member flow (CI diag-raft-chaos-mesh-52, runs 2 and
-/// 7): replacing the bootstrap voter left both non-voters at version 8 against 11 and 12 for a whole fleet wait. A
-/// learner asked only the voters of its join state, which a fetched configuration does not update, and with no session
-/// to any of them it asked no one and counted nothing.
-#[test]
-fn a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone() {
-  let _serial = serialize_fleet_tests();
+/// A five-member fleet at `f = 1` whose bootstrapper, a voter, has been stopped.
+struct LostBootstrapVoter {
+  /// The survivors.
+  daemons: Vec<Daemon>,
+  /// The highest council version any member held at the stop.
+  before: u64,
+  /// What each learner knew of the voters at the stop.
+  known: Vec<(HostId, Vec<HostId>)>,
+  /// Held so the serve ports stay reserved for the test's length.
+  _serve_lease: PortLease,
+}
+
+/// Forms the fleet of [`LostBootstrapVoter`] and stops its bootstrapper. The run says how many learners knew only the
+/// bootstrapper, the case the callers are for; one that joined later knows more.
+fn fleet_that_lost_its_bootstrap_voter() -> LostBootstrapVoter {
   let names = ["a", "b", "c", "d", "e"];
   let nodes: Vec<(MachineProfile, HostId, Identity)> =
     names.iter().map(|name| fleet_node(name)).collect();
   let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
   let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
-  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let (serve_lease, serve) = mesh_serve_ports(names.len());
   let mut daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 1);
   let hosts: Vec<HostId> = daemons
     .iter()
@@ -6767,8 +6771,6 @@ fn a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone() {
       })),
     "the council committed a voter set with the bootstrapper in its seat: {voters:?}"
   );
-  // Each learner's own Raft view of the voters. One that names only the bootstrapper is the case this test is for, and
-  // one that joined later names more; the outcome below must hold either way, so the run says which it was.
   let known: Vec<(HostId, Vec<HostId>)> = daemons
     .iter()
     .zip(&hosts)
@@ -6795,7 +6797,30 @@ fn a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone() {
     .max()
     .unwrap_or(0);
   daemons.remove(0).stop();
+  LostBootstrapVoter {
+    daemons,
+    before,
+    known,
+    _serve_lease: serve_lease,
+  }
+}
 
+/// §4.8, D-14, learners: a learner keeps learning configurations after the voters it joined from are gone. Do stop the
+/// bootstrap voter of five members at `f = 1` and let the council retire it and commit what follows. Expect every
+/// survivor's council configuration to reach the newest any survivor holds, past the version at the stop, within the
+/// fleet's progress budget. Found by raft-chaos's fresh-member flow (CI diag-raft-chaos-mesh-52, runs 2 and 7):
+/// replacing the bootstrap voter left both non-voters at version 8 against 11 and 12 for a whole fleet wait. A learner
+/// asked only the voters of its join state, which a fetched configuration does not update, and with no session to any
+/// of them it asked no one and counted nothing.
+#[test]
+fn a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone() {
+  let _serial = serialize_fleet_tests();
+  let LostBootstrapVoter {
+    daemons,
+    before,
+    known,
+    _serve_lease,
+  } = fleet_that_lost_its_bootstrap_voter();
   let observed: Vec<&Daemon> = daemons.iter().collect();
   let mut versions: Vec<Result<(u64, u64), ObserveError>> = Vec::new();
   let caught_up = poll_until(&observed, formation_deadline(), || {
@@ -6818,6 +6843,65 @@ fn a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone() {
     caught_up,
     "every survivor's council passed version {before} and reached the newest (installed, council) per survivor: \
      {versions:?}; the learners' views at the stop {known:?}"
+  );
+}
+
+/// One survivor's (settled, current) neighbourhood generations and (installed, council) configuration versions.
+type SettlementView = (
+  Result<Option<(u64, u64)>, ObserveError>,
+  Result<(u64, u64), ObserveError>,
+);
+
+/// §4.8 "Neighbourhood changes", D-14: a learner's reports still reach the council after the voters it joined from are
+/// gone. Do stop the bootstrap voter of five members at `f = 1`, so the survivors' neighbourhoods move. Expect every
+/// survivor's neighbourhood to be settled in its council's configuration, within the fleet's progress budget, and every
+/// survivor on the newest version. Found by raft-chaos's fresh-member flow (CI diag-raft-chaos-learner-56, run 1): a
+/// node's neighbourhood sat unsettled for a whole fleet wait with `fleet.report.sent` 662, since a learner sent its
+/// reports only to the voters of its join state, which were gone.
+#[test]
+fn a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone() {
+  let _serial = serialize_fleet_tests();
+  let LostBootstrapVoter {
+    daemons,
+    before,
+    known,
+    _serve_lease,
+  } = fleet_that_lost_its_bootstrap_voter();
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let mut views: Vec<SettlementView> = Vec::new();
+  let settled = poll_until(&observed, formation_deadline(), || {
+    views = daemons
+      .iter()
+      .map(|daemon| {
+        (
+          daemon
+            .member_identity()
+            .and_then(|member| daemon.council_settlement(member)),
+          daemon.configuration_versions(),
+        )
+      })
+      .collect();
+    let councils: Vec<u64> = views
+      .iter()
+      .filter_map(|(_, version)| version.as_ref().ok().map(|(_, council)| *council))
+      .collect();
+    let newest = councils.iter().copied().max().unwrap_or(0);
+    Ok(
+      councils.len() == daemons.len()
+        && newest > before
+        && councils.iter().all(|council| *council == newest)
+        && views.iter().all(|(generations, _)| {
+          matches!(generations, Ok(Some((settled, current))) if settled == current)
+        }),
+    )
+  });
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    settled,
+    "every survivor's neighbourhood settled at the newest configuration past version {before}, (settled, current) and \
+     (installed, council) per survivor: {views:?}; the learners' views at the stop {known:?}"
   );
 }
 
