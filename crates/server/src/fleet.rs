@@ -4404,6 +4404,11 @@ const LEARNER_FETCH_PACED: &str = "fleet.learner.fetch_paced";
 /// Counter: configuration fetch requests a learner sent, root and council (one per voter asked).
 const LEARNER_FETCHES: &str = "fleet.learner.fetches";
 
+/// The status count under which a learner with evidence it is behind records a period with no session to any member of
+/// its region to ask: what a fetch that never happened leaves, where before it left nothing at all.
+/// Format: a refusal name in the daemon's status report.
+const LEARNER_FETCH_NO_SESSION: &str = "fleet.learner.no_session";
+
 /// The member id the link should address now (task #22). A change — the peer restarted — removes the
 /// previous member's record entry (the session to its previous incarnation is dead by definition), drops a
 /// dial still in its handshake (it points at the old incarnation's address and keys, so driving it on is
@@ -5864,7 +5869,7 @@ async fn drive_config_council(
     })
     .unwrap_or(false);
     if wanted {
-      drive_learner_fetch(&voters, budget, in_flight).await;
+      drive_learner_fetch(budget, in_flight).await;
       let _ = state::with_state_counted(|s| {
         s.config_refresh_wanted = false;
         let still = !s.council.initialized();
@@ -6297,19 +6302,17 @@ async fn drive_root_learner_fetch(
   });
 }
 
-/// Drives a **learner** (a non-voter member) one period: fetches the committed regional configuration from
-/// the council voters it has a session to and adopts the newest (§4.8, D-14 — the council is a small elected
-/// set, so a non-voter learns the configuration rather than voting on it; the adopted configuration is then
-/// installed into placement by [`sync_config_from_council`] exactly as a voter's committed one is). The
-/// bare fetch is broadcast to every voter session and the highest-version reply adopted, so a lagging
-/// voter's stale copy never holds the learner back; every borrowed session is returned. A design refinement
-/// (owed) is the piggyback rule — fetching only when a stale-configuration refusal names a newer version
-/// (§4.8), rather than polling each period — but polling is correct and the config-commit rate is near zero.
-async fn drive_learner_fetch(
-  voters: &[HostId],
-  budget: CommitBudget,
-  in_flight: &mut Vec<Dispatch>,
-) {
+/// Drives a **learner** (a non-voter member) one period: fetches the committed regional configuration from every
+/// member of its region it holds a session to, and adopts the newest (§4.8, D-14 — the council is a small elected set,
+/// so a non-voter learns the configuration rather than voting on it; the adopted configuration is then installed into
+/// placement by [`sync_config_from_council`] exactly as a voter's committed one is). Any member can answer: what a member
+/// serves is a configuration it applied, so a committed one, the answer is empty unless it is newer than the asker's,
+/// and adoption only moves forward, so a lagging member's copy never holds the learner back. Asked of voters alone, a
+/// learner was stranded: its voters are those of its join state, which a fetched configuration does not update, so
+/// once a learner that joined from the bootstrapper lost it, it had no one to ask (CI diag-raft-chaos-mesh-52: both
+/// non-voters at version 8 against 11 and 12 for a whole fleet wait). A learner fetches only on evidence that it is
+/// behind (`drive_config_council`), so a converged region sends nothing. Every borrowed session is returned.
+async fn drive_learner_fetch(budget: CommitBudget, in_flight: &mut Vec<Dispatch>) {
   let regional_peers: Vec<HostId> = state::with_state(|s| {
     s.record_sessions
       .keys()
@@ -6319,9 +6322,10 @@ async fn drive_learner_fetch(
   })
   .unwrap_or_default();
   let sessions = take_sessions("fleet.lent_to.drive_learner_fetch", |host| {
-    regional_peers.contains(&host) && (voters.is_empty() || voters.contains(&host))
+    regional_peers.contains(&host)
   });
   if sessions.is_empty() {
+    let _ = state::with_state_counted(|s| s.count(LEARNER_FETCH_NO_SESSION, 1));
     return;
   }
   // The fetch carries this learner's current configuration version, so a voter returns the configuration
