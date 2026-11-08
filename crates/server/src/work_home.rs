@@ -22,6 +22,17 @@
 //! **Bounds.** A shard's parked verbs are bounded by its client credit, as `lease_wait`'s are; each ask has a deadline
 //! (the lease bound), past which the verb answers `Overloaded`, unrecorded, and its retry runs it again.
 //!
+//! **Asks are batched.** A shard keeps one batch of asks out to each owner at a time ([`Outbox`]), carrying what gathered
+//! while the last was answered, at most a client region's credit, and a batch waits for room on the owner's channel
+//! rather than failing. One message per ask flooded the owner's and the clients' channels at 3,000 clients on one node:
+//! about half the asks were refused at once, their retries refused in turn, and replies to resumed verbs were dropped
+//! (23 to 62 a run), so every run stalled. Batched, ten of ten runs finished with nothing refused or dropped.
+//!
+//! **A creation holds its id and name.** A work's id is the sequence of the transaction that creates it, and a verb
+//! parked for its owner commits nothing, so creations parked in one step were all given one id, queued behind it and
+//! looped a shard. A creation's own transaction now records it pending (`Op::WorkCreationPending`), which consumes the
+//! id and holds the name until the owner's answer is settled.
+//!
 //! The base a verb fetched is held for that verb alone ([`crate::work_files::FetchedBase`]): nothing of the green's is
 //! cached on a work's shard, so a base's bytes never need invalidating and the work's charge is unchanged.
 
@@ -149,6 +160,8 @@ pub(crate) struct WorkHome {
   pub(crate) unbuilt: Vec<Unbuilt>,
   /// Whether this shard's deadline timer for deferred verdicts is running.
   timer_armed: bool,
+  /// The asks waiting to go to each owner shard (A-247).
+  outboxes: BTreeMap<u16, Outbox>,
   /// Test support (`Daemon::lose_next_owner_answer`): the next verdict or admission an ask brings back is lost.
   pub(crate) lose_next_answer: bool,
 }
@@ -601,23 +614,11 @@ fn settle_pending_first(
   if running == Some(pending_key) || state.work_home.by_request.contains_key(&pending_key) {
     return None;
   }
-  // Run again in this pass and still pending: it did not reach the owner. The verb is answered retryable, unrecorded,
-  // rather than parked behind it again (which looped the pass on one shard for good: 9.7 cores for 900 s at 3,000
-  // clients), and the next verb of the work tries again.
+  // Run again in this pass and still pending: it did not reach the owner (its ask refused, or its verb refused before
+  // asking). The verb is answered retryable, unrecorded, rather than parked behind it again, which would run the two
+  // in turn for as long as the pass lasts; the next verb of the work tries again.
   if state.work_home.settling.contains(&pending_key) {
     state.count(PENDING_STUCK, 1);
-    if state.refusals.get(PENDING_STUCK) == Some(&1) {
-      slates_machine::log_line!(
-        "slates-server: partition {}: a pending submit of a work was run again and not settled: {:?}",
-        state.partition,
-        <RequestBody as slates_wire::Wire>::from_bytes(&pending.body).map(|body| format!(
-          "{body:?}"
-        )
-        .chars()
-        .take(160)
-        .collect::<String>())
-      );
-    }
     return Some(refuse_unrecorded(state));
   }
   let Ok(pending_body) = <RequestBody as slates_wire::Wire>::from_bytes(&pending.body) else {
@@ -694,7 +695,37 @@ enum Answered {
   Admitted(Result<Admitted, Refusal>),
 }
 
-/// Starts `need`'s ask as a task of this shard. Returns whether it started; the ask's completion resumes the queue.
+/// One ask waiting in a shard's outbox to its green's owner.
+struct AskItem {
+  queue: DbVolumeId,
+  need: Need,
+  green: DbVolumeId,
+  version: u64,
+  origin: u64,
+  id: RequestId,
+  principal: Principal,
+  back: ReplyRoute,
+}
+
+/// A shard's asks to one owner shard: those waiting, and whether a batch is out. One batch is out at a time, so a burst
+/// of asks rides a few messages, each carrying what gathered while the last was answered, and an owner's channel holds
+/// one message from each asking shard at most.
+#[derive(Default)]
+pub(crate) struct Outbox {
+  waiting: VecDeque<AskItem>,
+  sending: bool,
+}
+
+/// The most asks one batch carries: one client region's request credit (`slots`), what one client may hold in flight,
+/// so the owner's step for a batch is about as long as the step it gives one client's requests.
+fn batch_bound(state: &ShardState) -> usize {
+  usize::try_from(state.config.region.slots)
+    .unwrap_or(1)
+    .max(1)
+}
+
+/// Queues `need`'s ask to the green's owner, sending a batch if none is out. Returns whether it was queued; its answer
+/// resumes the queue.
 fn start_ask(
   state: &mut ShardState,
   queue: DbVolumeId,
@@ -722,172 +753,185 @@ fn start_ask(
   let Some(here) = crate::verbs::shard_of_partition(state, state.partition) else {
     return false;
   };
-  let principal = principal.clone();
   let back = ReplyRoute {
     shard: here,
     client_index: 0,
     request: id.word(),
     through_work: true,
   };
-  let deadline = crate::lease::lease_bound_ns();
-  let spawned = slates_rt::futures::spawn(async move {
-    let answer = ask(
-      need,
-      (here, owner),
-      green,
-      version,
-      (origin, id, principal, back),
-      deadline,
-    )
-    .await;
-    match answer {
-      Asked::Answered(Answered::Verdict(_) | Answered::Admitted(_))
-        if state::with_state(|s| std::mem::take(&mut s.work_home.lose_next_answer))
-          .unwrap_or(false) =>
-      {
-        let _ = state::with_state_counted(|s| resolve(s, queue, None));
-      }
-      Asked::Answered(answered) => {
-        let _ = state::with_state_counted(|s| resolve(s, queue, Some(answered)));
-      }
-      Asked::Unanswered => {
-        let _ = state::with_state_counted(|s| resolve(s, queue, None));
-      }
-      // Deferred at the owner: `answered_late` resumes the verb when its record commits at the quorum, and the
-      // deadline releases the work if it never does.
-      Asked::Deferred => {
-        let _ = state::with_state_counted(|s| defer_oldest(s, queue));
-      }
-    }
+  let outbox = state.work_home.outboxes.entry(owner).or_default();
+  outbox.waiting.push_back(AskItem {
+    queue,
+    need,
+    green,
+    version,
+    origin,
+    id,
+    principal: principal.clone(),
+    back,
   });
-  match spawned {
+  let already = std::mem::replace(&mut outbox.sending, true);
+  state.count(ASKED_THE_OWNER, 1);
+  if already {
+    return true;
+  }
+  match slates_rt::futures::spawn(send_batches(here, owner)) {
     Ok(task) => {
       let _ = slates_rt::futures::detach(task);
-      state.count(ASKED_THE_OWNER, 1);
       true
     }
-    Err(_) => false,
+    Err(_) => {
+      // Nothing will send what waits: every ask in this outbox is answered unanswered now.
+      let left = state
+        .work_home
+        .outboxes
+        .remove(&owner)
+        .map(|outbox| outbox.waiting)
+        .unwrap_or_default();
+      for item in left {
+        if item.queue != queue {
+          resolve(state, item.queue, None);
+        }
+      }
+      false
+    }
   }
 }
 
-/// How an ask ended.
-enum Asked {
+/// What the owner answered for one ask of a batch.
+enum Outcome {
   Answered(Answered),
   /// The owner took the verdict and answers when it commits.
   Deferred,
-  Unanswered,
 }
 
-async fn ask(
-  need: Need,
-  (here, owner): (u16, u16),
-  green: DbVolumeId,
-  version: u64,
-  (origin, id, principal, back): (u64, RequestId, Principal, ReplyRoute),
-  deadline: u64,
-) -> Asked {
-  use crate::xshard::call_within;
-  match need {
-    Need::Files(paths) => to_asked(
-      call_within(
-        here,
-        owner,
-        move |s| crate::verbs::owner_files(s, green, version, &paths),
-        deadline,
-      )
-      .await
-      .map(Answered::Base),
-    ),
-    Need::Page { path, offset, want } => to_asked(
-      call_within(
-        here,
-        owner,
-        move |s| crate::verbs::owner_page(s, green, version, path, (offset, want)),
-        deadline,
-      )
-      .await
-      .map(Answered::Base),
-    ),
-    Need::Sizes => to_asked(
-      call_within(
-        here,
-        owner,
-        move |s| crate::verbs::owner_sizes(s, green, version),
-        deadline,
-      )
-      .await
-      .map(Answered::Base),
-    ),
-    Need::Verdict { evidence, sealed } => {
-      // Only a submit whose pending record committed goes to the owner (`stage_pending`).
-      let work = sealed.work;
-      let staged = state::with_state(|s| {
-        s.db
-          .partition()
-          .pending_submit(work)
-          .is_some_and(|pending| {
-            (pending.origin, pending.client, pending.sequence) == (origin, id.client, id.sequence)
-          })
-      })
-      .unwrap_or(false);
-      if !staged {
-        return Asked::Unanswered;
-      }
-      match call_within(
-        here,
-        owner,
-        move |s| crate::verbs::owner_judge(s, (origin, id), sealed, evidence, back),
-        deadline,
-      )
-      .await
-      {
-        Some(Some(reply)) => Asked::Answered(Answered::Verdict(reply)),
-        Some(None) => Asked::Deferred,
-        None => Asked::Unanswered,
-      }
+/// Sends `here`'s outbox to `owner` a batch at a time until it is empty.
+async fn send_batches(here: u16, owner: u16) {
+  loop {
+    let batch = state::with_state(|s| take_batch(s, owner)).unwrap_or_default();
+    if batch.is_empty() {
+      return;
     }
-    Need::Rebase { sealed } => to_asked(
-      call_within(
-        here,
-        owner,
-        move |s| crate::verbs::owner_rebase(s, sealed),
-        deadline,
-      )
-      .await
-      .map(Answered::Rebased),
-    ),
-    Need::Admit {
-      green,
-      id: work,
-      name,
-    } => {
-      // Only a creation whose pending record committed goes to the owner (`create_need`).
-      let staged = state::with_state(|s| {
-        s.db
-          .partition()
-          .pending_creation(&name)
-          .is_some_and(|pending| pending.work == work)
-      })
-      .unwrap_or(false);
-      if !staged {
-        return Asked::Unanswered;
+    let keys: Vec<DbVolumeId> = batch.iter().map(|item| item.queue).collect();
+    let deadline = crate::lease::lease_bound_ns();
+    let answers = crate::xshard::call_within_room(
+      here,
+      owner,
+      move |s| {
+        batch
+          .into_iter()
+          .map(|item| answer_on_owner(s, item))
+          .collect::<Vec<_>>()
+      },
+      deadline,
+    )
+    .await;
+    let _ = state::with_state_counted(|s| match answers {
+      Some(answers) => {
+        for (queue, outcome) in keys.into_iter().zip(answers) {
+          settle_outcome(s, queue, outcome);
+        }
       }
-      to_asked(
-        call_within(
-          here,
-          owner,
-          move |s| crate::verbs::owner_admit(s, &principal, green, work),
-          deadline,
-        )
-        .await
-        .map(Answered::Admitted),
-      )
-    }
+      None => {
+        for queue in keys {
+          resolve(s, queue, None);
+        }
+      }
+    });
   }
 }
 
-fn to_asked(answer: Option<Answered>) -> Asked {
-  answer.map_or(Asked::Unanswered, Asked::Answered)
+/// The next batch of `owner`'s outbox, each ask checked to be durable first: a submit's pending record and a
+/// creation's committed before its ask goes (`stage_pending`, `create_need`); one whose verb's transaction did not
+/// commit is answered unanswered. An empty batch ends the sending.
+fn take_batch(state: &mut ShardState, owner: u16) -> Vec<AskItem> {
+  let bound = batch_bound(state);
+  let Some(outbox) = state.work_home.outboxes.get_mut(&owner) else {
+    return Vec::new();
+  };
+  let take = outbox.waiting.len().min(bound);
+  let items: Vec<AskItem> = outbox.waiting.drain(..take).collect();
+  if items.is_empty() {
+    outbox.sending = false;
+    return items;
+  }
+  let (ready, unstaged): (Vec<AskItem>, Vec<AskItem>) =
+    items.into_iter().partition(|item| staged(state, item));
+  for item in unstaged {
+    resolve(state, item.queue, None);
+  }
+  ready
+}
+
+/// Whether an ask's verb left what the owner's answer will be settled against: a submit's pending record, a creation's.
+fn staged(state: &ShardState, item: &AskItem) -> bool {
+  let partition = state.db.partition();
+  match &item.need {
+    Need::Verdict { sealed, .. } => partition
+      .pending_submit(sealed.work)
+      .is_some_and(|pending| {
+        (pending.origin, pending.client, pending.sequence)
+          == (item.origin, item.id.client, item.id.sequence)
+      }),
+    Need::Admit { id, name, .. } => partition
+      .pending_creation(name)
+      .is_some_and(|pending| pending.work == *id),
+    _ => true,
+  }
+}
+
+/// One ask answered on the owner's shard.
+fn answer_on_owner(state: &mut ShardState, item: AskItem) -> Outcome {
+  let AskItem {
+    need,
+    green,
+    version,
+    origin,
+    id,
+    principal,
+    back,
+    ..
+  } = item;
+  match need {
+    Need::Files(paths) => Outcome::Answered(Answered::Base(crate::verbs::owner_files(
+      state, green, version, &paths,
+    ))),
+    Need::Page { path, offset, want } => Outcome::Answered(Answered::Base(
+      crate::verbs::owner_page(state, green, version, path, (offset, want)),
+    )),
+    Need::Sizes => Outcome::Answered(Answered::Base(crate::verbs::owner_sizes(
+      state, green, version,
+    ))),
+    Need::Verdict { evidence, sealed } => {
+      match crate::verbs::owner_judge(state, (origin, id), sealed, evidence, back) {
+        Some(reply) => Outcome::Answered(Answered::Verdict(reply)),
+        None => Outcome::Deferred,
+      }
+    }
+    Need::Rebase { sealed } => {
+      Outcome::Answered(Answered::Rebased(crate::verbs::owner_rebase(state, sealed)))
+    }
+    Need::Admit {
+      green, id: work, ..
+    } => Outcome::Answered(Answered::Admitted(crate::verbs::owner_admit(
+      state, &principal, green, work,
+    ))),
+  }
+}
+
+/// Settles one ask's outcome on the work's shard.
+fn settle_outcome(state: &mut ShardState, queue: DbVolumeId, outcome: Outcome) {
+  match outcome {
+    Outcome::Answered(Answered::Verdict(_) | Answered::Admitted(_))
+      if std::mem::take(&mut state.work_home.lose_next_answer) =>
+    {
+      resolve(state, queue, None);
+    }
+    Outcome::Answered(answered) => resolve(state, queue, Some(answered)),
+    // `answered_late` resumes the verb when its record commits at the quorum, and the deadline releases the work if it
+    // never does.
+    Outcome::Deferred => defer_oldest(state, queue),
+  }
 }
 
 /// The owner answered a deferred verdict: its version committed at the quorum (AUD-11). Resumes the verb parked under
@@ -1103,7 +1147,7 @@ pub(crate) fn tell_floor(
     if !took {
       return;
     }
-    let sent = crate::xshard::call_within(
+    let sent = crate::xshard::call_within_room(
       here,
       owner,
       move |s| crate::verbs::owner_floor(s, green, work, base),

@@ -776,6 +776,21 @@ fn an_edit_behind_a_submit_waiting_on_its_owner_lands_after_the_verdict() {
   daemon.stop();
 }
 
+/// The answer request `id` came to within [`WAIT`], a refusal included; `None` if none came.
+fn answer_or_refusal(
+  client: &mut Client,
+  id: RequestId,
+) -> Option<Result<Option<ReplyBody>, ClientError>> {
+  let started = Instant::now();
+  while started.elapsed() < WAIT {
+    match client.poll_reply(id) {
+      Ok(None) => std::thread::yield_now(),
+      other => return Some(other),
+    }
+  }
+  None
+}
+
 /// Shape: the creations sent at once in the concurrent-creation test: below a client's 32 requests in flight with the
 /// repeated name beside them, and enough that several are parked together.
 const AT_ONCE: usize = 24;
@@ -816,16 +831,7 @@ fn works_created_at_once_off_their_greens_shard_get_their_own_ids() {
     .iter()
     .map(|id| reply_of(&mut client, *id))
     .collect();
-  let started = Instant::now();
-  let repeat = loop {
-    match client.poll_reply(*repeated) {
-      Ok(None) => {
-        assert!(started.elapsed() < WAIT, "the repeated name is answered");
-        std::thread::yield_now();
-      }
-      other => break other,
-    }
-  };
+  let repeat = answer_or_refusal(&mut client, *repeated);
   let mut works = Vec::new();
   for reply in &replies {
     let ReplyBody::WorkCreated { id, .. } = reply else {
@@ -838,7 +844,7 @@ fn works_created_at_once_off_their_greens_shard_get_their_own_ids() {
   assert!(
     matches!(
       repeat,
-      Err(ClientError::Refused(Refusal::AlreadyExists { .. }))
+      Some(Err(ClientError::Refused(Refusal::AlreadyExists { .. })))
     ),
     "a name sent twice is held once: {repeat:?}"
   );

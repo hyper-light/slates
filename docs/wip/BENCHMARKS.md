@@ -11996,3 +11996,36 @@ one-minute load 11 to 191 at the start of each run, the Mac shared with other ag
 
 All 24 landings were `done` with 1,000 files written. Without the spinners, at load 80 to 110, the landing took 1.0 to 1.4 s
 with one step, so the cost needs a starved shard.
+
+## A green's works on the shards their names hash to (A-247 step one; 2026-11-08)
+
+**Command.** `load_bench --tree <linux-v7.4-rc1>/kernel --clients <n> --hot-files <0.8 n> --per-connection 32 --rounds 3
+--reply-patience 60 --think-us 0`, release builds, the daemon in-process (no `--instance`): on main 92dcd16c
+`slates anchor --quick` never comes up on this machine (the anchor kills each start for 1.6 s of whole-process CPU
+before its first beat, 23 shards × about 70 ms of init; reported). Main 92dcd16c against agents/perf-w1, interleaved,
+reversed on alternate rounds, 4 rounds each. adas-mac-studio.local-2 (32 CPUs, Apple silicon, 23 shards), 2026-11-08,
+one-minute load 3.0 to 15.5. Oracle failures 0 in every run. Milliseconds, the range over the 4 runs:
+
+| Clients | Kind | main p50 | W1 p50 | main p99 | W1 p99 |
+|---|---|---|---|---|---|
+| 1,000 | wall (s) | 1.33–1.34 | 0.83–0.87 | | |
+| 1,000 | CreateWork | 9.1–10.5 | 7.0–8.4 | 15.4–24.5 | 12.0–14.2 |
+| 1,000 | Edit | 10.0–10.3 | 2.9–3.3 | 24.1–37.0 | 19.6–37.0 |
+| 1,000 | SubmitAccepted | 9.6–9.7 | 9.8–10.0 | 30.2–35.6 | 35.7–45.0 |
+| 1,000 | ReadHead | 10.4–10.6 | 5.5–5.6 | 32.8–37.2 | 9.4–30.5 |
+| 1,000 | Rebase | 10.4–10.6 | 9.7–10.0 | 23.3–37.2 | 36.1–44.7 |
+| 3,000 | wall (s) | 7.94–8.03 | 4.54–4.58 | | |
+| 3,000 | CreateWork | 101.5–103.8 | 9.3–16.9 | 110.4–115.9 | 17.5–28.5 |
+| 3,000 | Edit | 30.9–31.8 | 0.5 | 57.1–61.7 | 54.3–59.5 |
+| 3,000 | SubmitAccepted | 28.1–28.6 | 23.9–24.4 | 42.6–46.2 | 57.1–70.7 |
+| 3,000 | SubmitConflict | 32.3–32.6 | 34.8–35.2 | 43.3–58.4 | 79.5–80.9 |
+| 3,000 | ReadHead | 32.2–32.7 | 11.1–11.2 | 43.4–56.5 | 23.1–24.5 |
+| 3,000 | Rebase | 32.1–32.6 | 34.2–34.8 | 43.4–61.0 | 64.8–66.9 |
+
+- Everything off the verdict got faster, and the rung finishes in 57% of main's time at 3,000 clients.
+- **The verdict's tail got worse:** SubmitAccepted p99 at 3,000 clients 57–71 ms against 43–46, SubmitConflict
+  80–81 against 43–58, Rebase 65–67 against 43–61. The verdict is still the owner's one serialized step, and the
+  clients, no longer waiting on their edits, reach it more often at once (Little's law over one owner). The owner's cost
+  per verdict is the next lever.
+- Before the asks were batched, every 3,000-client run stalled (see `crates/server/src/work_home.rs`, "Asks are
+  batched").

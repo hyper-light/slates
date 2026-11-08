@@ -2072,6 +2072,21 @@ impl Partition {
     self.expired_attachments = snapshot.expired_attachments.iter().copied().collect();
   }
 
+  /// Restores the works' records a snapshot carries (A-247): their floors, pending submits and pending creations.
+  fn restore_work_records(&mut self, snapshot: &PartitionSnapshot) {
+    for pending in &snapshot.pending_creations {
+      self
+        .pending_creations
+        .insert(pending.name.clone(), pending.clone());
+    }
+    for pending in &snapshot.pending_submits {
+      self.pending_submits.insert(pending.work, pending.clone());
+    }
+    for floor in &snapshot.work_floors {
+      self.set_work_floor(floor.green, floor.work, floor.base);
+    }
+  }
+
   /// Restores the name aliases a snapshot carries (A-236).
   fn restore_name_aliases(&mut self, snapshot: &PartitionSnapshot) {
     for record in &snapshot.name_aliases {
@@ -2162,16 +2177,7 @@ impl Partition {
     p.restore_merge(snapshot);
     p.restore_nfs(snapshot);
     p.restore_name_aliases(snapshot);
-    for pending in &snapshot.pending_creations {
-      p.pending_creations
-        .insert(pending.name.clone(), pending.clone());
-    }
-    for pending in &snapshot.pending_submits {
-      p.pending_submits.insert(pending.work, pending.clone());
-    }
-    for floor in &snapshot.work_floors {
-      p.set_work_floor(floor.green, floor.work, floor.base);
-    }
+    p.restore_work_records(snapshot);
     p.restore_expired_attachments(snapshot);
     p.restore_consumers_and_tombstones(snapshot);
     Ok(p)

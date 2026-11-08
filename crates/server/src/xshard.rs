@@ -351,6 +351,48 @@ pub async fn call_within<T: Send + 'static>(
   within(call, deadline_ns).await
 }
 
+/// [`call_within`], waiting for room on the target's control channel within the same deadline rather than failing at
+/// once when it is full: for a shard that many others ask at once (a green's owner, A-247), where a refused call is
+/// asked again and a burst of them fills the channel for good.
+pub async fn call_within_room<T: Send + 'static>(
+  origin: u16,
+  shard: u16,
+  work: impl FnOnce(&mut ShardState) -> T + Send + 'static,
+  deadline_ns: u64,
+) -> Option<T> {
+  if shard == origin {
+    return state::with_state(work);
+  }
+  let started = slates_rt::futures::now_ns();
+  let id = register();
+  let task = SpawnRequest::new(
+    Box::pin(async move {
+      let result = state::with_state(work);
+      let back = SpawnRequest::new(
+        Box::pin(async move {
+          deliver(id, Box::new(result));
+        }),
+        None,
+      );
+      send_back(origin, back).await;
+    }),
+    None,
+  );
+  if !given_room_within(shard, Control::Spawn(Box::new(task)), deadline_ns).await {
+    forget(id);
+    return None;
+  }
+  // The target delivers what `state::with_state` answered, an `Option<T>`, which the call's future reads as such.
+  let call: CrossShardCall<T> = CrossShardCall {
+    target: shard,
+    id: Some(id),
+    ready: None,
+    _thread: PhantomData,
+  };
+  let left = deadline_ns.saturating_sub(slates_rt::futures::now_ns().saturating_sub(started));
+  within(call, left).await
+}
+
 /// Runs `work` on `shard` and awaits its result while the target is working, up to `budget_ns` of the target's own
 /// CPU time ([`within_shard_time`]); `None` as [`call_within`] answers, and when the target made no progress for a
 /// window or ran its budget without answering.

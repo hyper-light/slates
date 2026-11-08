@@ -4002,6 +4002,7 @@ async fn reap_loop() {
       CLIENTS_REAPED.fetch_add(u64::try_from(reaped).unwrap_or(u64::MAX), Ordering::AcqRel);
     }
     refresh_pressure_hold().await;
+
     crate::nfs::purge_owed_here().await;
     state::with_state(|s| {
       process_base_hints(s);

@@ -14219,6 +14219,12 @@ forwarded from another node still places the work on the green's shard.
     work had not changed, so the log's replay is given the base through the same ask of the owner, once the partitions
     are all recovered, and the work is unserved (`Unpublished`) until it has. A work's recovery no longer needs a local
     engine.
+  - *Asks are batched per owner.* A shard keeps one batch of asks out to each owner at a time, at most a client
+    region's credit, waiting for room on the owner's channel; one message an ask flooded the channels at 3,000 clients
+    and stalled every run.
+  - *A creation holds its id and its name* while the owner admits it (`Op::WorkCreationPending`, settled with the
+    creation, dropped at a start). The id is the creating transaction's sequence, so a parked creation, which commits
+    nothing, would share it with every other parked in the same step.
   - *A submit not yet settled.* When a submit goes to the owner, the work's partition records it, whole, in the
     verb's transaction (`Op::WorkSubmitPending`), and the settle clears it (`Op::WorkSubmitSettled`). While it is
     recorded, every other verb of the work waits behind it, and the submit runs again first, under its own key, to take

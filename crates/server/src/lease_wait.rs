@@ -222,12 +222,25 @@ fn run(state: &mut ShardState, waiter: LeaseWaiter, confirmed: bool) {
 
 /// Writes `reply`, unrecorded, where `route` says the request waits.
 pub(crate) fn send_reply(state: &mut ShardState, route: ReplyRoute, reply: ReplyBody) {
-  if crate::xshard::hand_reply_home(route.shard, move || {
-    crate::state::deliver(route.client_index, route.request, reply, true);
-  })
-  .is_err()
-  {
-    state.count(UNDELIVERED, 1);
+  reply_home(state, route, reply);
+}
+
+/// Carries a resumed verb's reply to the client's shard by a task of this shard that waits for room on that shard's
+/// channel (`crate::xshard::send_reply_home`), as a forwarded verb's reply goes. Handed over once with no wait, a burst
+/// of resumed verbs (a green's works answered together, A-247) met full channels and lost their replies, so their
+/// clients waited out their whole reply deadline: 5 a shard on every shard at 3,000 clients.
+fn reply_home(state: &mut ShardState, route: ReplyRoute, reply: ReplyBody) {
+  let carried = slates_rt::futures::spawn(async move {
+    crate::xshard::send_reply_home(route.shard, move || {
+      crate::state::deliver(route.client_index, route.request, reply, true);
+    })
+    .await;
+  });
+  match carried {
+    Ok(task) => {
+      let _ = slates_rt::futures::detach(task);
+    }
+    Err(_) => state.count(UNDELIVERED, 1),
   }
 }
 
@@ -290,13 +303,7 @@ pub(crate) fn run_resumed(
     },
     None => (route, recorded),
   };
-  if crate::xshard::hand_reply_home(route.shard, move || {
-    crate::state::deliver(route.client_index, route.request, recorded, true);
-  })
-  .is_err()
-  {
-    state.count(UNDELIVERED, 1);
-  }
+  reply_home(state, route, recorded);
 }
 
 /// Arms this shard's deadline timer if it is not running: one task that sleeps until the earliest deadline,
