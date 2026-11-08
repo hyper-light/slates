@@ -3006,6 +3006,51 @@ pub enum Refusal {
     /// The table.
     table: String,
   },
+  /// The volume is in this node's catalog, and listed, but recovery could not rebuild it after the daemon's restart
+  /// (§4.8): every verb on it answers this, naming why, rather than `NotFound`. Appended.
+  NotRecovered {
+    /// Why recovery could not rebuild it.
+    cause: RecoveryCause,
+  },
+}
+
+/// Why recovery could not rebuild a volume its catalog holds ([`Refusal::NotRecovered`], §4.8). Append-only.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum RecoveryCause {
+  /// The content image the anchor kept does not hold the volume.
+  NoImage,
+  /// The image's blocks could not be claimed in this daemon's arena.
+  BlocksUnclaimed,
+  /// The overlay's base directory is gone.
+  BaseMissing {
+    /// The base, as recorded.
+    path: String,
+  },
+  /// The overlay's base lies on a mount this daemon serves (§4.6, A-227), so it was not opened.
+  BaseOnOwnMount {
+    /// The base, as recorded.
+    path: String,
+  },
+  /// The host refused the overlay's base directory.
+  BaseUnavailable {
+    /// The base, as recorded.
+    path: String,
+    /// The host's refusal, as the base plane names it.
+    reason: String,
+  },
+  /// A clone's origin volume was not recovered.
+  OriginNotRecovered,
+  /// The volume core refused the image as it was rebuilt.
+  ImageRefused {
+    /// The volume core's refusal.
+    reason: String,
+  },
+  /// The volume's acknowledged resources do not fit this process: a byte budget, the lock capacity, the version slab,
+  /// the metadata ledger or the volume table.
+  ResourcesUnavailable {
+    /// Which, and the refusal.
+    reason: String,
+  },
 }
 
 /// What a path refused [`Refusal::OwnMount`] was given as (A-227). Append-only.
