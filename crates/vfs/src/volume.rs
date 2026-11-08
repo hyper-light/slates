@@ -8,7 +8,7 @@
 //! journal record. A refusal leaves nothing changed (T-1.1, T-1.9). The executable model in the
 //! tests is the specification this file must equal on every generated history.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::task::Waker;
 
 use slates_machine::{Derived, derived};
@@ -466,6 +466,18 @@ pub struct Volume {
   /// its content (§4.2: charged when the name went, because the last close cannot refuse; consumed
   /// at the reclaim, any surplus returned then). Bounded by open-unlinked files.
   pub(crate) orphans: BTreeMap<InodeNo, u64>,
+  /// The mounts that survived a takeover and may hold handles no publication counted (U10, the supervisor's option 2):
+  /// a handle a dead daemon issued after its last publication is unknown to its successor, so a file made before the
+  /// takeover that leaves the namespace with no reference this daemon knows is kept, not reclaimed, until the last of
+  /// these mounts ends ([`Volume::sweep_attachment`]). Bounded by the volume's attachments; empty outside a takeover.
+  pub(crate) takeover_holders: BTreeSet<u64>,
+  /// The first inode number not issued when the first of [`Volume::takeover_holders`] was named: a file below it may be
+  /// held by a handle the successor never counted; one at or past it was made since, and its handles are all counted.
+  pub(crate) takeover_below: InodeNo,
+  /// The orphans kept for [`Volume::takeover_holders`]: still charged to the volume, counted in its status
+  /// ([`Volume::takeover_kept`]), reclaimed when the last holder ends. Bounded by the volume's quota, which their content
+  /// stays charged to.
+  pub(crate) takeover_kept: BTreeSet<InodeNo>,
   /// What changed since this volume was last published (A-68): the inodes and directory entries a barrier's delta
   /// carries (`crate::recover`), cleared once the publication commits.
   pub(crate) dirty: crate::delta::Dirty,
@@ -704,6 +716,9 @@ impl Volume {
       committed_opens: BTreeMap::new(),
       releases_unpublished: false,
       orphans: BTreeMap::new(),
+      takeover_holders: BTreeSet::new(),
+      takeover_below: InodeNo(0),
+      takeover_kept: BTreeSet::new(),
       dirty: crate::delta::Dirty::default(),
       live_inodes: 1,
       inode_allowance: u64::MAX,
@@ -785,6 +800,9 @@ impl Volume {
       committed_opens: BTreeMap::new(),
       releases_unpublished: false,
       orphans: BTreeMap::new(),
+      takeover_holders: BTreeSet::new(),
+      takeover_below: InodeNo(0),
+      takeover_kept: BTreeSet::new(),
       dirty: crate::delta::Dirty::default(),
       live_inodes: origin.live_inodes,
       inode_allowance: u64::MAX,
@@ -885,6 +903,9 @@ impl Volume {
       committed_opens: BTreeMap::new(),
       releases_unpublished: false,
       orphans: BTreeMap::new(),
+      takeover_holders: BTreeSet::new(),
+      takeover_below: InodeNo(0),
+      takeover_kept: BTreeSet::new(),
       dirty: crate::delta::Dirty::default(),
       live_inodes: 1,
       inode_allowance: u64::MAX,
@@ -5148,11 +5169,15 @@ impl Volume {
     // At zero links the inode has left the namespace. If a transport still holds it open (a
     // reference), keep its content and table entry alive as an orphan and reclaim at the last
     // `unreference` (POSIX unlink-while-open); otherwise reclaim now.
-    if self.references.get(&no).is_some_and(|count| *count > 0) {
+    if self.references.get(&no).is_some_and(|count| *count > 0) || self.keeps_for_takeover(no) {
       // The reclaim waits for the last close, which cannot refuse: the retention the operation
-      // secured for this content rides with the orphan record until then.
+      // secured for this content rides with the orphan record until then. A file a mount that survived a takeover may
+      // hold through a handle no publication counted waits for that mount's end instead (U10).
       let secured = std::mem::take(&mut self.retention_prepaid);
       self.orphans.insert(no, secured);
+      if !self.references.get(&no).is_some_and(|count| *count > 0) {
+        self.takeover_kept.insert(no);
+      }
       Ok(())
     } else {
       self.reclaim_inode(store, no)
@@ -5242,7 +5267,11 @@ impl Volume {
       }
       None => 0,
     };
-    if remaining == 0 && self.orphans.contains_key(&no) {
+    if remaining == 0 && self.orphans.contains_key(&no) && self.keeps_for_takeover(no) {
+      // A file a mount that survived a takeover may still hold through a handle no publication counted: kept until that
+      // mount ends (U10).
+      self.takeover_kept.insert(no);
+    } else if remaining == 0 && self.orphans.contains_key(&no) {
       // Reclaim only if the inode is still unlinked. A re-link — a future `LINK` /
       // `linkat(AT_EMPTY_PATH)` on the still-open inode — revives it with a name, and it must not
       // be reclaimed then. No operation can re-link a nameless orphan today, so this guards that
@@ -5347,15 +5376,52 @@ impl Volume {
     self
       .committed_opens
       .retain(|(owner, _), _| *owner != attachment);
-    let Some(owned) = self.attachment_refs.remove(&attachment) else {
-      return Ok(());
-    };
-    for (no, count) in owned {
-      self.dirty.reference(attachment, no);
-      // Drop exactly this owner's count from the global; other owners' references keep the inode
-      // alive if they hold it. A reclamation failure is retained by the orphan record, as in
-      // `unreference_n`.
-      self.unreference_n(store, no, u64::from(count))?;
+    if let Some(owned) = self.attachment_refs.remove(&attachment) {
+      for (no, count) in owned {
+        self.dirty.reference(attachment, no);
+        // Drop exactly this owner's count from the global; other owners' references keep the inode
+        // alive if they hold it. A reclamation failure is retained by the orphan record, as in
+        // `unreference_n`.
+        self.unreference_n(store, no, u64::from(count))?;
+      }
+    }
+    if let RefOwner::Attachment(id) = attachment
+      && self.takeover_holders.remove(&id)
+      && self.takeover_holders.is_empty()
+    {
+      self.release_takeover_kept(store)?;
+    }
+    Ok(())
+  }
+
+  /// Names `attachment`, a mount that survived a takeover, as one that may hold handles no publication counted (U10):
+  /// from here a file made before the takeover that leaves the namespace unheld is kept until the last such mount ends.
+  /// The first one named fixes the bound: the inode numbers issued before it.
+  pub fn hold_detached_for(&mut self, attachment: u64) {
+    if self.takeover_holders.is_empty() {
+      self.takeover_below = self.issued_below();
+    }
+    self.takeover_holders.insert(attachment);
+  }
+
+  /// Whether a file of number `no` that leaves the namespace unheld is kept (U10): a mount that survived a takeover may
+  /// hold it through a handle no publication counted, which only a file made before the takeover can be.
+  fn keeps_for_takeover(&self, no: InodeNo) -> bool {
+    !self.takeover_holders.is_empty() && no < self.takeover_below
+  }
+
+  /// The orphans kept for mounts that survived a takeover (U10): what `slates status` reports.
+  pub fn takeover_kept(&self) -> usize {
+    self.takeover_kept.len()
+  }
+
+  /// Reclaims every orphan kept for the mounts that survived a takeover, once the last of them has ended (U10): each one
+  /// still unlinked and held by no reference this daemon knows.
+  fn release_takeover_kept(&mut self, store: &mut Store) -> Result<(), VfsError> {
+    for no in std::mem::take(&mut self.takeover_kept) {
+      if !self.references.contains_key(&no) {
+        self.unreference_n(store, no, 0)?;
+      }
     }
     Ok(())
   }
@@ -5409,12 +5475,18 @@ impl Volume {
 
   /// Settles references after a recovery (A-61): every recorded attachment whose record did not survive
   /// (`survives` answers false for its id) gives its share back, and every orphan then left with no reference is
-  /// reclaimed — its last holder died with the process. Returns the owners swept and the orphans reclaimed.
+  /// reclaimed — its last holder died with the process — except while a mount in `held_mounts`, one that survived the
+  /// takeover holding a kernel's handles, may still hold it through a handle no publication counted (U10): those are
+  /// named first ([`Volume::hold_detached_for`]). Returns the owners swept and the orphans reclaimed.
   pub fn settle_recovered_references(
     &mut self,
     store: &mut Store,
     survives: impl Fn(u64) -> bool,
+    held_mounts: &[u64],
   ) -> Result<(usize, usize), VfsError> {
+    for &mount in held_mounts {
+      self.hold_detached_for(mount);
+    }
     let gone: Vec<RefOwner> = self
       .attachment_refs
       .keys()

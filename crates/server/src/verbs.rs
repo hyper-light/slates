@@ -8515,6 +8515,7 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
   };
   let accounting = slot.volume.accounting();
   let journal = journal_report(&slot.volume);
+  let takeover_kept = u32::try_from(slot.volume.takeover_kept()).unwrap_or(u32::MAX);
   let (drifted, watcher) = match slot.host.as_mut() {
     Some(host) => match slot.volume.with_host(host).status(&mut state.store) {
       Ok(s) => (
@@ -8560,6 +8561,7 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
       mounts,
       mounts_elided,
       journal,
+      takeover_kept,
     }),
   }
 }
@@ -11595,13 +11597,22 @@ fn settle_references(state: &mut ShardState, record: &VolumeRecord) -> usize {
     return 0;
   };
   let partition = state.db.partition();
+  // The FUSE mounts of this volume whose records survived: the anchor held their devices, so their kernels may hold
+  // handles the dead daemon issued after its last publication (U10).
+  let held_mounts: Vec<u64> = partition
+    .attachments_of(record.id)
+    .into_iter()
+    .filter(|attachment| attachment.form.fuse_mount_point().is_some())
+    .map(|attachment| attachment.id)
+    .collect();
   let Ok(slot) = state.volumes.get_mut(handle) else {
     return 0;
   };
-  match slot
-    .volume
-    .settle_recovered_references(&mut state.store, |id| partition.attachment(id).is_some())
-  {
+  match slot.volume.settle_recovered_references(
+    &mut state.store,
+    |id| partition.attachment(id).is_some(),
+    &held_mounts,
+  ) {
     Ok((_, reclaimed)) => reclaimed,
     Err(_) => {
       state.count(REFERENCES_UNSETTLED, 1);

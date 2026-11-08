@@ -18179,6 +18179,24 @@ Applied in the same change to:
     value apart, but the counts already balance without it.
 - **Evidence.** See the bug record's verification.
 
+- **2026-11-07, U10 (the supervisor's option 2): what a successor cannot count is kept until the mount ends.** A handle
+  the dead daemon issued after its last publication is in no image, so its successor reclaimed the file when it left the
+  namespace, and the handle's next read was refused. Now a volume names the FUSE mounts that survived the takeover at
+  recovery (`Volume::settle_recovered_references`'s `held_mounts`, from the server's surviving mount records), and while
+  any of them lives, a file made before the takeover (an inode below the volume's counter then, A-150) that leaves the
+  namespace with no reference the successor knows is kept as an orphan (`takeover_kept`): charged to the volume's quota,
+  so a write past it is refused `NoSpace`, counted in `slates status` (`takeover_kept`), and reclaimed when the last such
+  mount ends (`sweep_attachment`). A file made after the takeover, and every file outside a takeover, is reclaimed at its
+  last close as before. This replaces A-152's "reclaimed at the kernel's forget" for pre-takeover files on a surviving
+  mount: the successor cannot know a handle no publication counted is not still open.
+  - `a_file_a_handle_no_publication_counted_may_hold_is_kept_until_its_mount_ends` (`crates/bridge-core/tests/
+    takeover_release.rs`): the file unlinked after the takeover still read through the uncounted handle, counted kept,
+    and reclaimed when the mount ends; a file made after the takeover reclaimed at once.
+  - `a_restart_loop_cannot_grow_the_kept_files_past_the_quota`: each takeover keeps one more file, the loop is refused
+    `NoSpace` with the volume's bytes never past its quota, and the mount's end frees them all.
+  - A-152's five takeover tests now hold the file to the mount's end, each asserting every reference given back first.
+  - Red-checked: with no held mount named, the uncounted handle's file is reclaimed and the loop never meets the quota.
+
 ### A-151 — An untouched base file is bound to the disk file it was made from (accepted 2026-10-22)
 Applied in the same change to:
 - §4.5 (the inode-number rule, the failure matrix, a status note) and A-61 ("What the kernel kept");

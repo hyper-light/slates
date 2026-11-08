@@ -14538,6 +14538,8 @@ Goal item 4 of 2026-10-22, the leak A-148 recorded.
   publication; the successor's own handle under a reissued value.
 - **Still open:** a pre-takeover handle opened after the last publication is not counted open by the successor (the
   A-151 sibling above). That is a refusal, never wrong bytes.
+  **Decided and built 2026-11-07 (U10, the supervisor's option 2):** such a file is kept, charged to the volume's quota
+  and counted (`takeover_kept`), until the surviving mount ends (A-152's note of that date).
 - **Found under load afterwards, fixed by A-154 (next section but two):** a handle released after the last publication
   left its open in the image, and nothing ever gave it back.
 

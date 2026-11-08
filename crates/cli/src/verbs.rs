@@ -2346,6 +2346,9 @@ fn mounts_text(report: &StatusReport) -> String {
   if report.mounts_elided > 0 {
     out.push_str(&format!("mounts_elided: {}\n", report.mounts_elided));
   }
+  if report.takeover_kept > 0 {
+    out.push_str(&format!("takeover_kept: {}\n", report.takeover_kept));
+  }
   out
 }
 
