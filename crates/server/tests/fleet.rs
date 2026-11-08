@@ -540,7 +540,7 @@ fn start_with_policy(
     &this.profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-fleet-{}-{pid}", this.host.0),
+      name: common::fixture_object("slates-seg", &format!("fleet-{}", this.host.0)),
     },
     Some(transport),
   )
@@ -2258,7 +2258,7 @@ fn restart_fleet_forms_and_seals(pid: u32) -> RestartFleet {
     &domains,
   );
   let fresh = |host: HostId| SegmentSource::Create {
-    name: format!("slates-seg-fleet3-{}-{pid}", host.0),
+    name: common::fixture_object("slates-seg", &format!("fleet3-{}", host.0)),
   };
   let daemon_a = start_fleet_node(
     &profile_a,
@@ -2358,7 +2358,7 @@ fn restart_b(fleet: &mut RestartFleet, pid: u32) -> (Daemon, (AnchorSegment, Hel
   );
   let (source, held) = incarnation_one_segment(
     (
-      &format!("slates-seg-fleet3-again-{}-{pid}", fleet.host_b.0),
+      &common::fixture_object("slates-seg", &format!("fleet3-again-{}", fleet.host_b.0)),
       &config.instance,
     ),
     &fleet.profile_b,
@@ -2594,11 +2594,14 @@ fn refusal_fleet_forms(pid: u32) -> RefusalFleet {
     serve[0],
     peers_of_a,
     SegmentSource::Create {
-      name: format!("slates-seg-{instance_a}"),
+      name: common::fixture_object("slates-seg", &instance_a),
     },
   );
   let (source_b, held_b) = incarnation_one_segment(
-    (&format!("slates-seg-{instance_b}"), &instance_b),
+    (
+      &common::fixture_object("slates-seg", &instance_b),
+      &instance_b,
+    ),
     &profile_b,
     config_b.geometry,
     pid,
@@ -2657,7 +2660,7 @@ fn announce_as_b(fleet: &mut RefusalFleet, anchor: HostId, pid: u32) -> Daemon {
     serve,
     peers,
     SegmentSource::Create {
-      name: format!("slates-seg-{instance}"),
+      name: common::fixture_object("slates-seg", &instance),
     },
   )
 }
@@ -2917,7 +2920,7 @@ fn start_mesh_unsettled(
         &profile,
         config,
         SegmentSource::Create {
-          name: format!("slates-seg-fleet3-{}-{pid}", host.0),
+          name: common::fixture_object("slates-seg", &format!("fleet3-{}", host.0)),
         },
         Some(transport),
       )
@@ -6640,7 +6643,7 @@ fn a_fleet_node_under_a_containers_memory_bound_still_admits_a_client() {
     serve[0],
     peers_of_a,
     SegmentSource::Create {
-      name: format!("slates-seg-{instance_a}"),
+      name: common::fixture_object("slates-seg", &instance_a),
     },
   );
   let daemon_b = start_fleet_node(
@@ -6650,7 +6653,7 @@ fn a_fleet_node_under_a_containers_memory_bound_still_admits_a_client() {
     serve[1],
     peers_of_b,
     SegmentSource::Create {
-      name: format!("slates-seg-{instance_b}"),
+      name: common::fixture_object("slates-seg", &instance_b),
     },
   );
   let host_a = daemon_a
@@ -10538,7 +10541,7 @@ fn a_node_replaced_with_fresh_ram_at_its_anchor_exchanges_pair_keys_with_its_sur
         ports[node],
         peers(node),
         SegmentSource::Create {
-          name: format!("pair-fresh-{node}-{pid}"),
+          name: common::fixture_object("pair-fresh", &node.to_string()),
         },
       )
     })
@@ -10573,7 +10576,7 @@ fn a_node_replaced_with_fresh_ram_at_its_anchor_exchanges_pair_keys_with_its_sur
     ports[replaced],
     peers(replaced),
     SegmentSource::Create {
-      name: format!("pair-fresh-replacement-{pid}"),
+      name: common::fixture_object("pair-fresh", "replacement"),
     },
   );
   let fresh = replacement.member_identity().unwrap();
@@ -10668,7 +10671,7 @@ fn a_whole_ram_replacement_joins_as_a_fresh_voter_and_commits_after_another_loss
         ports[node],
         peers(node),
         SegmentSource::Create {
-          name: format!("audit-voter-{node}-{pid}"),
+          name: common::fixture_object("audit-voter", &node.to_string()),
         },
       )
     })
@@ -10718,7 +10721,7 @@ fn a_whole_ram_replacement_joins_as_a_fresh_voter_and_commits_after_another_loss
     ports[replaced],
     peers(replaced),
     SegmentSource::Create {
-      name: format!("audit-voter-replacement-{pid}"),
+      name: common::fixture_object("audit-voter", "replacement"),
     },
   );
   let fresh = replacement.member_identity().unwrap();
@@ -10836,7 +10839,6 @@ fn council_snapshot(daemons: &[Daemon]) -> String {
 #[test]
 fn a_warm_fleet_restart_recovers_its_root_and_regional_quorums() {
   let _serial = serialize_fleet_tests();
-  let pid = std::process::id();
   let profiles: Vec<_> = ["warm-voter-a", "warm-voter-b", "warm-voter-c"]
     .into_iter()
     .map(profile)
@@ -10863,7 +10865,7 @@ fn a_warm_fleet_restart_recovers_its_root_and_regional_quorums() {
     .map(|(node, profile)| {
       fleet_config(
         profile,
-        &format!("warm-voter-{node}-{pid}"),
+        &common::fixture_object("warm-voter", &node.to_string()),
         anchors[node],
         seeds[node],
         &peers(node),
@@ -10876,7 +10878,7 @@ fn a_warm_fleet_restart_recovers_its_root_and_regional_quorums() {
     .enumerate()
     .map(|(node, profile)| {
       slates_anchor::AnchorSegment::create(
-        &format!("warm-voter-{node}-{pid}"),
+        &common::fixture_object("warm-voter", &node.to_string()),
         &profile.facts.identity,
         configs[node].geometry,
       )
@@ -11272,7 +11274,7 @@ fn an_unlisted_node_enrolls_through_one_seed_and_joins_the_existing_quorum() {
       &profile,
       config,
       SegmentSource::Create {
-        name: format!("slates-seg-{instance}"),
+        name: common::fixture_object("slates-seg", &instance),
       },
       Some(transport),
     )
@@ -13537,7 +13539,7 @@ impl ExportNode {
       &profile,
       config,
       SegmentSource::Create {
-        name: format!("slates-seg-{instance}"),
+        name: common::fixture_object("slates-seg", &instance),
       },
       Some(FleetTransport {
         identity: Identity::from_der(node_cert, node_key),

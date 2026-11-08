@@ -211,7 +211,7 @@ fn daemon(name: &str) -> (Daemon, String) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{name}"),
+      name: common::fixture_object("slates-seg", name),
     },
   )
   .unwrap();
@@ -324,7 +324,7 @@ fn shard_selection_daemon(name: &str, shards: u16) -> (Daemon, String) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{instance}"),
+      name: common::fixture_object("slates-seg", &instance),
     },
   )
   .unwrap();
@@ -399,7 +399,7 @@ fn status_pages_preserve_a_capture_and_refuse_foreign_or_cancelled_cursors() {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{instance}"),
+      name: common::fixture_object("slates-seg", &instance),
     },
   )
   .unwrap();
@@ -716,7 +716,7 @@ fn fleet_daemon(name: &str, durability: Option<DurabilityBound>) -> (Daemon, Str
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{name}"),
+      name: common::fixture_object("slates-seg", name),
     },
   )
   .unwrap();
@@ -2077,7 +2077,7 @@ fn capped_daemon(name: &str, max_inodes: usize) -> (Daemon, String) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{name}"),
+      name: common::fixture_object("slates-seg", name),
     },
   )
   .unwrap();
@@ -2292,7 +2292,7 @@ fn telemetry_scenario_with_quota(reply_quota: Option<usize>) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-telemetry-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "telemetry"),
     },
   )
   .unwrap();
@@ -3450,7 +3450,7 @@ fn a_metadata_class_bounds_the_volume_records_a_shard_admits() {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-metadata-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "metadata"),
     },
   )
   .unwrap();
@@ -4198,7 +4198,7 @@ fn a_connect_past_the_client_bound_is_refused_typed_at_the_rendezvous() {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-bound-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "bound"),
     },
   )
   .unwrap();
@@ -4246,7 +4246,7 @@ fn bootstrap_is_explicit_and_its_request_cannot_reset_a_replacement() {
       &profile,
       config.clone(),
       SegmentSource::Create {
-        name: format!("slates-seg-{instance}"),
+        name: common::fixture_object("slates-seg", &instance),
       },
     )
     .unwrap()
@@ -4405,7 +4405,7 @@ fn a_contended_wake_tail_does_not_shrink_the_client_seats() {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{instance}"),
+      name: common::fixture_object("slates-seg", &instance),
     },
   )
   .unwrap();

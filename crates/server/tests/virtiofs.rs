@@ -116,7 +116,7 @@ fn single_shard_daemon(name: &str) -> (Daemon, String) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{name}"),
+      name: common::fixture_object("slates-seg", name),
     },
   )
   .unwrap();
@@ -975,7 +975,7 @@ mod vhost_form {
       &profile,
       config,
       SegmentSource::Create {
-        name: format!("slates-seg-{tag}"),
+        name: common::fixture_object("slates-seg", tag),
       },
     )
     .unwrap();

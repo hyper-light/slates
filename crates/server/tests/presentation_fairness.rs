@@ -60,7 +60,7 @@ fn daemon(tag: &str) -> (Daemon, String) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-present-{tag}-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", &format!("present-{tag}")),
     },
   )
   .unwrap();
