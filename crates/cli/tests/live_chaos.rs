@@ -2580,10 +2580,20 @@ fn a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover() {
         fenced_at_or_above(&survivors, &volume, epoch),
       );
     }
-    None => verdict.check(
-      "NoLoss (successor)",
-      vec!["no survivor served the volume within the fleet wait".to_owned()],
-    ),
+    None => {
+      // Diag only (live-durability-66, never on main): every node's state when no survivor served.
+      eprintln!("LD-DUMP\n{}\nLD-DUMP-END", diagnosis(&instances, &volume));
+      for survivor in &survivors {
+        eprintln!("LD-COUNTERS {survivor} takeover {:?}", counters(survivor, "fleet.takeover"));
+        eprintln!("LD-COUNTERS {survivor} live {:?}", counters(survivor, "fleet.live."));
+        eprintln!("LD-COUNTERS {survivor} materialize {:?}", counters(survivor, "fleet.materialize"));
+        eprintln!("LD-STATUS {survivor}\n{}\nLD-STATUS-END", run(survivor, &["status"]).1);
+      }
+      verdict.check(
+        "NoLoss (successor)",
+        vec!["no survivor served the volume within the fleet wait".to_owned()],
+      )
+    }
   }
   drop(fleet);
   verdict.judge();
