@@ -3259,3 +3259,147 @@ fn a_member_down_through_a_voters_restart_is_still_taken_over() {
     "the survivors took the volume over though a voter restarted while the owner was down: {views:?}"
   );
 }
+
+/// DIAG, not for main: does a holder restarted warm refuse an owner's records Unauthorized before it relearns the
+/// owner's id, and for how long.
+#[test]
+fn diag_a_restarted_holder_refuses_records_before_relearning() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    return;
+  }
+  let fleet = start_fleet_as("restart-refused", "anchor");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let id = create_live_volume(&owner, "restart-refused");
+  write_files(&owner, &id, 0..FILES);
+  let others: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| **instance != owner)
+    .collect();
+  let (caught_up, _, held) = wait_caught_up(&owner, &others, &id);
+  assert!(caught_up, "both candidates held every write: {held:?}");
+  let restarted = (*others[0]).clone();
+  // The holder held to one CPU under contention: its anchor is pinned (the replacement daemon inherits it), and four busy
+  // loops share that CPU for the rest of the run.
+  let index = fleet
+    .instances
+    .iter()
+    .position(|instance| *instance == restarted)
+    .unwrap();
+  let anchor = fleet.daemons[index].child.id().to_string();
+  let pinned = Command::new("taskset")
+    .args(["-a", "-cp", "0", &anchor])
+    .status()
+    .unwrap();
+  assert!(pinned.success(), "taskset on the holder's anchor {anchor}");
+  let mut spinners: Vec<Child> = (0..2)
+    .map(|_| {
+      Command::new("taskset")
+        .args(["-c", "0", "sh", "-c", "while :; do :; done"])
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap()
+    })
+    .collect();
+  let stop = std::sync::atomic::AtomicBool::new(false);
+  struct StopOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+  impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+      self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+  }
+  std::thread::scope(|scope| {
+    let _stop_guard = StopOnDrop(&stop);
+    scope.spawn(|| {
+      let mut file = FILES;
+      while !stop.load(std::sync::atomic::Ordering::Acquire) {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| write_files(&owner, &id, file..file + 1))).is_err() {
+          eprintln!("diag-restart: write {file} failed");
+        }
+        file += 1;
+      }
+      eprintln!("diag-restart: wrote {} files", file - FILES);
+    });
+    scope.spawn(|| {
+      let (mut made, mut refused) = (0_u64, 0_u64);
+      while !stop.load(std::sync::atomic::Ordering::Acquire) {
+        let name = format!("restart-refused-{made}-{refused}");
+        let (code, out, _) = run(&owner, &["volume", "create", &name, "--bounded", "1MiB"]);
+        if code == 0 {
+          made += 1;
+          let id = value_of(&out, "id");
+          let _ = run(&owner, &["live-ship", &id]);
+        } else {
+          refused += 1;
+        }
+      }
+      eprintln!("diag-restart: made {made} volumes, {refused} refused");
+    });
+    let restarting = Instant::now();
+    let old_pid = daemon_pid_of(&restarted);
+    signal_pid(&old_pid, "-KILL");
+    loop {
+      let (code, out, _) = run(&restarted, &["status"]);
+      if code == 0 && value_of(&out, "pid") != old_pid {
+        break;
+      }
+      assert!(
+        restarting.elapsed() < Duration::from_secs(300),
+        "the anchor replaced {restarted}'s daemon within 300 s"
+      );
+      pause();
+    }
+    eprintln!("diag-restart: the replacement answered {:?} after the kill", restarting.elapsed());
+    let began = Instant::now();
+    let (mut seen, mut first, mut last) = (0_u64, None, None);
+    let (mut held_first, mut held_at_first_answer) = (None, None);
+    let mut samples = 0_u64;
+    while began.elapsed() < Duration::from_secs(20) {
+      let (code, out, _) = run(&restarted, &["status"]);
+      if code == 0 {
+        samples += 1;
+        let held = value_of(&out, "fleet_held_records").trim().parse::<u64>().unwrap_or(0);
+        if held_at_first_answer.is_none() {
+          held_at_first_answer = Some((began.elapsed(), held));
+        }
+        if held_first.is_none() && held > held_at_first_answer.map_or(0, |(_, count)| count) {
+          held_first = Some((began.elapsed(), held));
+        }
+        let total: u64 = out
+          .lines()
+          .filter_map(|line| line.split_once(" refused fleet.record.refused.unauthorized: "))
+          .filter_map(|(_, count)| count.trim().parse::<u64>().ok())
+          .sum();
+        if total > seen {
+          first.get_or_insert(began.elapsed());
+          last = Some(began.elapsed());
+          seen = total;
+        }
+      }
+      pause();
+    }
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let (_, out, _) = run(&restarted, &["status"]);
+    let lines: Vec<&str> = out
+      .lines()
+      .filter(|line| {
+        line.contains("fleet.record")
+          || line.contains("hold_refused")
+          || line.contains("fleet.live.")
+          || line.starts_with("fleet_held_records")
+          || line.starts_with("fleet_members")
+          || line.starts_with("restarts")
+      })
+      .collect();
+    eprintln!(
+      "diag-restart: unauthorized {seen}; first {first:?}, last {last:?} after the restart; restart returned, pinned to 1 CPU with 2 spinners; held records at first answer {held_at_first_answer:?}, first growth {held_first:?}; {samples} samples; {lines:?}"
+    );
+  });
+  for spinner in &mut spinners {
+    let _ = spinner.kill();
+    let _ = spinner.wait();
+  }
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+}
