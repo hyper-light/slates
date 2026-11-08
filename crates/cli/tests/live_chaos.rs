@@ -289,7 +289,33 @@ fn fleet_view(instance: &str) -> Option<(String, usize, u32)> {
   ))
 }
 
-/// Waits until every node holds all `members` members alive with every peer probed; returns their member ids.
+/// Whether a node's probe mesh is up as its daemon judges it, with `mesh` its `(fleet_peers_in_contact,
+/// fleet_peers_unmeshed)` ([`mesh_of`]): it keeps contact with at least one peer, and every peer in contact is probed.
+/// The peers in contact are counted over the members held alive: every member while the council forms, and after it
+/// only the holders and the voters (§4.8, amended 2026-10-10). So a five-node fleet's two non-voters, which keep no
+/// contact with each other, are not a stall at 3 of 4 peers probed (the flow took them for one, CI diag-live-fixes-30
+/// runs 5 and 6). Counted over the installed configuration's members instead, both counts read 0 on every node before
+/// the council's first commit, and the wait never ended (CI diag-raft-chaos-mesh-42).
+fn meshed(mesh: Option<(u32, u32)>) -> bool {
+  mesh.is_some_and(|(in_contact, unmeshed)| in_contact > 0 && unmeshed == 0)
+}
+
+/// `instance`'s probe mesh from `status`: the peers it keeps direct contact with (`fleet_peers_in_contact`) and how
+/// many of them have no formed probe session (`fleet_peers_unmeshed`); `None` when `status` does not answer.
+fn mesh_of(instance: &str) -> Option<(u32, u32)> {
+  let (code, out, _) = run(instance, &["status"]);
+  if code != 0 {
+    return None;
+  }
+  let count = |key: &str| value_of(&out, key).trim().parse::<u32>().ok();
+  Some((
+    count("fleet_peers_in_contact")?,
+    count("fleet_peers_unmeshed")?,
+  ))
+}
+
+/// Waits until every node holds all `members` members alive with its probe mesh up ([`meshed`]); returns their member
+/// ids.
 fn wait_formed(instances: &[String], members: usize) -> Vec<String> {
   let mut window = FrozenWindow::new();
   loop {
@@ -297,17 +323,21 @@ fn wait_formed(instances: &[String], members: usize) -> Vec<String> {
       .iter()
       .map(|instance| fleet_view(instance))
       .collect();
-    if views.iter().all(|view| {
-      view.as_ref().is_some_and(|(_, held, probed)| {
-        *held == members && usize::try_from(*probed).ok() == members.checked_sub(1)
-      })
+    // Each node's (in contact, unmeshed), as `status` prints them.
+    let meshes: Vec<Option<(u32, u32)>> =
+      instances.iter().map(|instance| mesh_of(instance)).collect();
+    if views.iter().zip(&meshes).all(|(view, mesh)| {
+      view
+        .as_ref()
+        .is_some_and(|(_, held, _)| *held == members && meshed(*mesh))
     }) {
       return views.into_iter().map(|view| view.unwrap().0).collect();
     }
-    if !window.moving(&format!("{views:?}")) {
-      // What the probe and record planes did, for a pair that never probed each other (diag-31 run 7; live-fixes).
+    // Progress counts a node's mesh coming up as well as its members and probes changing.
+    if !window.moving(&format!("{views:?} {meshes:?}")) {
+      // What the probe and record planes did, for a node whose in-contact peers never all probed it.
       panic!(
-        "the fleet formed, or kept changing, within each fleet wait: {views:?}\n{}",
+        "the fleet formed, or kept changing, within each fleet wait: {views:?} (in contact, unmeshed) {meshes:?}\n{}",
         diagnosis(instances, "")
       );
     }
@@ -315,12 +345,15 @@ fn wait_formed(instances: &[String], members: usize) -> Vec<String> {
   }
 }
 
-/// Waits until every node in `instances` has settled at its own neighbourhood generation (the fleet's objects re-placed
-/// onto the neighbourhood after a membership change), judged by progress ([`FrozenWindow`]).
+/// Waits until every node in `instances` holds the fleet's newest configuration and has settled at its own neighbourhood
+/// generation (the fleet's objects re-placed onto the neighbourhood after a membership change), judged by progress
+/// ([`FrozenWindow`]). Settled at its own generation alone certifies a learner left behind: in each of four runs that
+/// lost the takeover after this wait, one learner sat at configuration 7 or 8, settled == neighbourhood at 3 or 4,
+/// while the council was at 19–24 (diag-live-fixes-34 runs 1 and 3, -35 runs 5 and 8; live-fixes, 2026-11-08).
 fn wait_neighbourhood_settled(instances: &[String]) {
   let mut window = FrozenWindow::new();
   loop {
-    let views: Vec<(Option<u64>, Option<u64>)> = instances
+    let views: Vec<(Option<u64>, Option<u64>, Option<u64>)> = instances
       .iter()
       .map(|instance| {
         let (_, out, _) = run(instance, &["status"]);
@@ -333,22 +366,26 @@ fn wait_neighbourhood_settled(instances: &[String]) {
         (
           read("fleet_settled_generation"),
           read("fleet_neighbourhood_generation"),
+          read("fleet_configuration_version"),
         )
       })
       .collect();
+    // The configuration's version is the council's, one count for the whole fleet, so every node must reach the newest
+    // any node holds.
+    let newest = views.iter().filter_map(|(_, _, version)| *version).max();
     // Each node settled at its own neighbourhood generation. The generations are each node's own count and differ
     // between nodes in a settled fleet (3, 8 and 11 side by side in diag-31), so they are not compared across nodes; a
     // node retired while away is kept out by the stale holder's short stop instead.
-    if views
-      .iter()
-      .all(|(settled, neighbourhood)| settled.is_some() && settled == neighbourhood)
-    {
+    if views.iter().all(|(settled, neighbourhood, version)| {
+      settled.is_some() && settled == neighbourhood && version.is_some() && *version == newest
+    }) {
       return;
     }
     if !window.moving(&format!("{views:?}")) {
       // What the stuck node reported and shipped toward its new cohort (live-fixes, 2026-11-07).
       panic!(
-        "every neighbourhood settled, or kept changing, within each fleet wait: {views:?}\n{}",
+        "every node held the newest configuration and its neighbourhood settled, or kept changing, within each fleet \
+         wait (settled, neighbourhood, configuration version): {views:?}\n{}",
         diagnosis(instances, "")
       );
     }
@@ -632,8 +669,8 @@ impl Fleet {
     wait_answers(&self.instances[index]);
   }
 
-  /// Waits until every live node holds exactly the manifest's members, each probed by the others: a succeeded or
-  /// replaced node rejoined under its new identity and the old one retired.
+  /// Waits until every live node holds exactly the manifest's members with its probe mesh up ([`meshed`]): a succeeded
+  /// or replaced node rejoined under its new identity and the old one retired.
   fn wait_rejoined(&self) {
     let live: Vec<String> = (0..self.instances.len())
       .filter(|index| self.processes[*index].is_some())
@@ -929,6 +966,43 @@ struct Sampler<'a> {
   instances: &'a [String],
   volume: &'a str,
   began: Instant,
+  holds: &'a SamplerHolds,
+}
+
+/// A flow's way to take one node out of the [`Sampler`] before it stops that node. A `status` call to a stopped node
+/// returns only when its client gives up, and the flow waits for the sampler at the stream's end, so a holder meant to be
+/// stopped briefly stayed stopped 4 to 6 s, in whole seconds, past the failure detector (diag-live-fixes-44).
+struct SamplerHolds {
+  wanted: Vec<AtomicBool>,
+  idle: Vec<AtomicBool>,
+}
+
+impl SamplerHolds {
+  fn new(nodes: usize) -> SamplerHolds {
+    let flags = || (0..nodes).map(|_| AtomicBool::new(false)).collect();
+    SamplerHolds {
+      wanted: flags(),
+      idle: flags(),
+    }
+  }
+
+  /// Takes `node` out of the sampling, and returns once its thread has no `status` call in flight (within the fleet wait).
+  fn hold(&self, node: usize) {
+    self.wanted[node].store(true, Ordering::Release);
+    let deadline = Instant::now() + FLEET_WAIT;
+    while !self.idle[node].load(Ordering::Acquire) && Instant::now() < deadline {
+      pause();
+    }
+  }
+
+  /// Whether `node` is held; the sampling thread's asking says it has no call in flight.
+  fn held(&self, node: usize) -> bool {
+    let held = self.wanted[node].load(Ordering::Acquire);
+    if held {
+      self.idle[node].store(true, Ordering::Release);
+    }
+    held
+  }
 }
 
 impl Sampler<'_> {
@@ -946,10 +1020,14 @@ impl Sampler<'_> {
           scope.spawn(move || {
             let mut samples = Vec::new();
             while !stop.load(Ordering::Acquire) {
-              samples.extend(self.once(node, instance));
+              if !self.holds.held(node) {
+                samples.extend(self.once(node, instance));
+              }
               pause();
             }
-            samples.extend(self.once(node, instance));
+            if !self.holds.held(node) {
+              samples.extend(self.once(node, instance));
+            }
             samples
           })
         })
@@ -1153,7 +1231,20 @@ fn stream_through<F: FnOnce(&Instant)>(
   files: std::ops::Range<usize>,
   chaos: F,
 ) -> (Vec<Outcome>, Vec<Sample>) {
+  stream_through_holding(instances, owner, volume, files, |began, _| chaos(began))
+}
+
+/// [`stream_through`], for a chaos that stops a node and leaves it stopped past the stream's end: it gets the
+/// [`SamplerHolds`] to take that node out of the sampling first.
+fn stream_through_holding<F: FnOnce(&Instant, &SamplerHolds)>(
+  instances: &[String],
+  owner: &str,
+  volume: &str,
+  files: std::ops::Range<usize>,
+  chaos: F,
+) -> (Vec<Outcome>, Vec<Sample>) {
   let began = Instant::now();
+  let holds = SamplerHolds::new(instances.len());
   let stop_stream = AtomicBool::new(false);
   let stop_sampling = AtomicBool::new(false);
   std::thread::scope(|scope| {
@@ -1162,6 +1253,7 @@ fn stream_through<F: FnOnce(&Instant)>(
         instances,
         volume,
         began,
+        holds: &holds,
       }
       .run(&stop_sampling)
     });
@@ -1185,7 +1277,8 @@ fn stream_through<F: FnOnce(&Instant)>(
     let stop = StopAll(&stop_stream, &stop_sampling);
     // The chaos's own failure is passed on only after the stream is in hand, or a write never answered would hang the
     // scope's join behind it (one run did until its timeout, 2026-11-06).
-    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| chaos(&began))).err();
+    let failed =
+      std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| chaos(&began, &holds))).err();
     drop(stop);
     // A write the daemon never answers would hang the join for good (one run hung 20 minutes, 2026-11-06): past the
     // fleet wait, the fleet is shown whole and its daemons killed, so the client is told and the flow fails.
@@ -1334,6 +1427,7 @@ fn diagnosis(instances: &[String], volume: &str) -> String {
             || line.starts_with("fleet_configuration_version")
             || line.contains("anchor")
             || line.starts_with("fleet_host")
+            || line.starts_with("fleet_peers_")
             || line.contains("lent_to")
         })
         .collect();
@@ -1966,12 +2060,14 @@ fn clients_killed_while_their_writes_wait_leave_no_reply_held() {
   let mut verdict = Verdict::new("clients killed while their writes wait");
   let began = Instant::now();
   let stop_sampling = AtomicBool::new(false);
+  let holds = SamplerHolds::new(fleet.instances.len());
   let samples = std::thread::scope(|scope| {
     let sampler = scope.spawn(|| {
       Sampler {
         instances: &fleet.instances,
         volume: &volume,
         began,
+        holds: &holds,
       }
       .run(&stop_sampling)
     });
@@ -2972,8 +3068,15 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
   ));
   let mut roles = None;
   let fleet_cell = std::cell::RefCell::new(&mut fleet);
-  let (outcomes, _samples) =
-    stream_through(&instances, &owner, &volume, 0..STREAM_FILES, |began| {
+  // Read before the stale holder stops: a `status` call to a stopped node returns only when its client gives up.
+  let mut stale_adopted = 0;
+  let mut stale_stopped = None;
+  let (outcomes, _samples) = stream_through_holding(
+    &instances,
+    &owner,
+    &volume,
+    0..STREAM_FILES,
+    |began, holds| {
       after_writes(&owner, &volume, BETWEEN_EVENTS);
       let holders = wait_holders(&fleet_cell.borrow(), &volume, 2);
       // A member that holds none of the log is replaced: its successor joins under a fresh identity. One without a seat
@@ -3023,7 +3126,10 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
         .unwrap();
       roles = Some((current, stale));
       after_writes(&owner, &volume, BETWEEN_EVENTS);
+      stale_adopted = counter(&instances[stale], "fleet.takeover.adopted");
+      holds.hold(stale);
       fleet_cell.borrow().stop(stale);
+      stale_stopped = Some(Instant::now());
       verdict.note(format!(
         "{} stopped at {:?}",
         instances[stale],
@@ -3033,20 +3139,29 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
       // retires it: with the owner's crash that is two failures at f = 1, which the register takeover rightly calls lost
       // (diag-30 run 4, diag-28 run 8: the stale holder's configuration frozen at version 8 while the others moved on).
       after_writes(&owner, &volume, 1);
-    });
+    },
+  );
   let (current, stale) = roles.expect("the flow chose its holders' roles");
   let survivors: Vec<&str> = (0..instances.len())
     .filter(|index| *index != owner_index)
     .map(|index| instances[index].as_str())
     .collect();
-  let adopted_before: u64 = survivors
-    .iter()
-    .map(|survivor| counter(survivor, "fleet.takeover.adopted"))
-    .sum();
+  let adopted_before = stale_adopted
+    + survivors
+      .iter()
+      .filter(|survivor| **survivor != instances[stale].as_str())
+      .map(|survivor| counter(survivor, "fleet.takeover.adopted"))
+      .sum::<u64>();
   // The writes since the stale holder stopped are durable on the owner and `current` alone. Once the stream has stopped
   // (every write answered), the owner is crashed and the stale holder resumed: nothing reaches it any more.
   fleet.kill_node(owner_index);
   fleet.resume(stale);
+  if let Some(stopped) = stale_stopped {
+    verdict.note(format!(
+      "the stale holder stayed stopped {:?}",
+      stopped.elapsed()
+    ));
+  }
   let acknowledged = outcomes
     .iter()
     .filter(|outcome| outcome.refused.is_none())
@@ -3142,6 +3257,80 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
   verdict.judge();
 }
 
+/// How many holders the takeover's old owner wrote to: the set the successor's catalog records, or, when it records
+/// none, every holder the successor names.
+fn write_set(recorded: &std::collections::BTreeSet<String>, named: &[String]) -> usize {
+  if recorded.is_empty() {
+    named
+      .iter()
+      .collect::<std::collections::BTreeSet<_>>()
+      .len()
+  } else {
+    recorded.len()
+  }
+}
+
+/// Whether an owner a takeover superseded could still commit, its `holders` holders with `unfenced` of them still below
+/// the takeover's fence: a write needs `W = max(n − f, f)` of `n` (`slates_db::live`'s `Shipper::reached_by`, stated
+/// here again so the judge does not take its rule from the code it judges), and only an unfenced holder can accept one.
+fn stale_owner_can_commit(holders: usize, unfenced: usize, tolerated: usize) -> bool {
+  unfenced > 0 && unfenced >= holders.saturating_sub(tolerated).max(tolerated)
+}
+
+/// StaleNeverCommits on the holders' fences: a violation only where the unfenced holders could still make a write count
+/// for the superseded owner. Phase one needs `f + 1` of the record's holders, not all of them, so a holder it did not
+/// wait for can stay below the fence: at load 132-244 on the Mac one of a record's three holders did, and with the other
+/// two fenced the dead owner could reach none of its two-of-three writes (run 3, 2026-11-08). Requiring every named
+/// holder fenced called that a violation.
+fn judge_fences(verdict: &mut Verdict, holders: usize, unfenced: Vec<String>) {
+  const INVARIANT: &str = "StaleNeverCommits (the counted holders' fences)";
+  if stale_owner_can_commit(holders, unfenced.len(), FLEET_F) {
+    verdict.check(INVARIANT, unfenced);
+  } else {
+    if !unfenced.is_empty() {
+      verdict.note(format!(
+        "below the takeover's fence, fewer than a write needs of {holders} holders: {unfenced:?}"
+      ));
+    }
+    verdict.check(INVARIANT, Vec::new());
+  }
+}
+
+/// §4.8's StaleNeverCommits as `live_chaos` judges it, on constructed fences. Do: judge holder sets with every count of
+/// unfenced holders around the write count, at `f = 1` through the verdict and at `f = 2` through the rule. Expect: a
+/// violation exactly where the unfenced holders reach `W = max(n − f, f)`: one of two, two of three, but not one of
+/// three, and three of five at `f = 2` but not two.
+#[test]
+fn a_superseded_owner_can_commit_only_where_its_unfenced_holders_reach_the_write_count() {
+  let judged = |holders: usize, unfenced: usize| {
+    let mut verdict = Verdict::new("constructed fences");
+    judge_fences(
+      &mut verdict,
+      holders,
+      (0..unfenced)
+        .map(|holder| format!("holder {holder}"))
+        .collect(),
+    );
+    !verdict.violations.is_empty()
+  };
+  assert!(!judged(3, 0), "every holder fenced");
+  assert!(
+    !judged(3, 1),
+    "one of three cannot make the two a write needs"
+  );
+  assert!(judged(3, 2), "two of three can");
+  assert!(judged(3, 3), "all three can");
+  assert!(judged(2, 1), "one of two is the write count at f = 1");
+  assert!(
+    !stale_owner_can_commit(5, 2, 2),
+    "two of five at f = 2 is short of three"
+  );
+  assert!(
+    stale_owner_can_commit(5, 3, 2),
+    "three of five at f = 2 is the write count"
+  );
+}
+
 /// The end of the fresh-member flow: a survivor serves `volume` with every acknowledged write, and every holder the
 /// takeover counted is fenced at its epoch. Those are read from the successor: the holder set its catalog records (the
 /// set its phase one counted, which a transition may have recorded before the old owner activated it) and its own
@@ -3156,8 +3345,12 @@ fn judge_served(verdict: &mut Verdict, survivors: &[&str], volume: &str, outcome
         .iter()
         .filter_map(|survivor| fleet_view(survivor).map(|(host, _, _)| (host, *survivor)))
         .collect();
-      let named: Vec<String> = live_states(successor, volume)
-        .unwrap_or_default()
+      let states = live_states(successor, volume).unwrap_or_default();
+      let recorded: std::collections::BTreeSet<String> = states
+        .iter()
+        .flat_map(|state| state.recorded.iter().cloned())
+        .collect();
+      let named: Vec<String> = states
         .into_iter()
         .flat_map(|state| state.recorded.into_iter().chain(state.holders))
         .collect();
@@ -3178,7 +3371,7 @@ fn judge_served(verdict: &mut Verdict, survivors: &[&str], volume: &str, outcome
           diagnosis(&shown, volume)
         ));
       }
-      verdict.check("StaleNeverCommits (the counted holders' fences)", unfenced);
+      judge_fences(verdict, write_set(&recorded, &named), unfenced);
       let others: Vec<&str> = survivors
         .iter()
         .copied()

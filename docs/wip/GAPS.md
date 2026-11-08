@@ -255,6 +255,12 @@
 > An adoption's owner now reaches every shard (`takeover::track_owner_on_every_shard`); 10 of 10 green under the same
 > load. The test now also requires the other survivor to refuse the mount by kind. Bug record
 > `docs/bugs/2026-11-06-a-successor-refused-its-own-volumes-mount-on-a-shard-that-never-learned-the-takeover.md`.
+>
+> **Open again (2026-11-07): the macOS fleet mount was refused `OwnedByAnotherHost` on main CI once more**, after that
+> fix, the supervisor reported, on a main before 4811191a. Main CI on 4811191a (run 42434181746) passed 20 of 20 jobs,
+> the macOS lane among them; 4811191a's A-222 change ends a retired host's remote attachments within a liveness
+> budget, on the same path. One green run does not clear an intermittent: open until a cause is found or many runs are
+> clean (live-fixes).
 
 > **A forming fleet lost its takeovers (live-fixes, 2026-11-05, A-200 and §4.8; three fixed, for raft).** raft's soak
 > found that a fleet acting before it settled could leave a killed owner's volume unserved; the tests were made to wait
@@ -1539,6 +1545,19 @@
     f = 1, and §4.8 calls the object lost. raft-chaos's flow now waits for each node's settled generation to equal its
     neighbourhood generation before it crashes the owner. A stall after that wait with no takeover counter moving is
     live-fixes'.
+  - **Fixed (2026-11-08): the five-node flow's formation wait demanded a full mesh.** It required every node to have
+    probed every other member. §4.8 (amended 2026-10-10) keeps direct contact only with holders and voters, so a
+    five-node fleet's two non-voters, which hold nothing for each other, keep no record or probe session once
+    formation's first window closes. The flow took them for a stall at 3 of 4 peers probed (diag-live-fixes-30 runs 5
+    and 6, diag-raft-chaos-final-39 run 8), with no dial or failure counted, by design.
+    - The wait now judges each node's mesh by status's `fleet_peers_in_contact` (above zero) and
+      `fleet_peers_unmeshed` (zero), counted over the members held alive (live-fixes, 68fc082f).
+    - Two red rounds fixed the rule's two regimes. With the counts over the installed configuration's members, every
+      node read both at 0 before the council's first commit, and the wait never ended: diag-raft-chaos-final-41,
+      fresh-member 0/8 and kill-at-ack 0/3; diag-raft-chaos-mesh-42 printed (0, 0) with 4 of 4 probed on all five
+      nodes.
+    - Formation then passed 8 of 8 (diag-raft-chaos-final-43), 11 of 11 (diag-live-fixes-33) and 8 of 8
+      (diag-raft-chaos-mesh-48, whose one failure was the register stall above).
   - Fixed (2026-11-07, live-fixes, f2f9477e; the entry "a node back at its anchor with fresh RAM had every pair key
     refused" above): a node replaced at the same machine anchor (same certificate) never answered a live write. Its
     neighbours kept the old node's pair key and refused the new one (`fleet.seal.pair_refused` 789 of 793 served, the
@@ -5562,6 +5581,56 @@ submitted to it) so no exchange waits for another's.
 > The formation case is measured in the 2026-11-08 status below: not reproduced at 2 and 8 spinners per CPU, every
 > session returned, so the forward lane is the case for the shared session.
 
+> **Status (2026-11-08, the formation case, measured; the other half of this entry's case is the forward lane's,
+> loadtest-scale's status of 2026-11-07 here and `docs/bugs/2026-11-07-the-control-shard-could-not-run-what-its-lane-admitted.md`).**
+> The question was whether slow fleet formation under load (37–108 s on the shared Mac, live-fixes) is this exclusive
+> lending. Every record-session lend, return and stale return was counted per peer and borrower, with hold times, the
+> borrowers that found a session out, and dial attempts (diagnostic only, never on main). The five-node fresh-member
+> flow, on CI's 4-CPU runners and on the Mac:
+>
+> | Run | Load | Formation | Settlement | Passing |
+> |---|---|---|---|---|
+> | diag-raft-chaos-formation-49, ×8 | 8 spinners, about 2 per CPU | 0.4–2.4 s | 0.4–2.3 s | 7 of 8 |
+> | diag-raft-chaos-formation-53, ×8 | 32 spinners, load 34–43 | 1.4–6.2 s | 1.3–3.0 s | 7 of 8 |
+> | the Mac, ×2 | ambient load 60–90 | 0.1–1.3 s | 0.1–1.4 s | 2 of 2 |
+>
+> No wait came near the 40 s bound, so the slowness did not reproduce, and each failure above was the register takeover
+> stall (`fleet.takeover.lost`), not formation.
+> - One failing run's counters per CI round (passing runs print none), four survivors each. At 2 per CPU: discovery
+>   pages 925 lent, 915 returned, 10 dropped as unanswered; council replication 924 of 924; longest single hold 29 ms;
+>   32 times in all a borrower found a session out. At 8 per CPU: discovery 1,221 lent, 1,210 returned, 11 dropped;
+>   council replication 733 of 733; longest hold 1.18 s (one `ask_pages`), the next 101 ms; 40 found out.
+> - So formation gives this entry no evidence at these loads: every session came back, holds are short, and
+>   out-findings are a few dozen against thousands of lends. The forward lane's numbers (2,661–6,277 forwards polling
+>   one lent session) are the case for the shared session.
+> - **The Mac reproduced it at load 132–244** (2026-11-08, six runs, a build without the takeover link fix). One passed.
+>   Formation took 0.3–4.8 s but 40.0 s and 40.9 s in two runs; settlement took under 3.2 s but 22 s and 113.6 s in two.
+>   So the slowness is real and depends on load, and CI's spinners did not reach it. The failures: three fixed 40 s
+>   harness waits at load around 200, one takeover not served in time (the link fix was absent), and one judge false
+>   alarm, since fixed.
+> - One dump exists from that window, run 6 at 41.5 s into a settlement with the stream running, five nodes. Lends
+>   still match returns on every lane (`live_ship` 1,629 and 1,619, discovery 1,301 and 1,295 with 4 dropped), so
+>   sessions come back. Holds are long: `live_ship` 12.6 s at most, discovery 2.0 s, council replication 1.5 s. Borrowers
+>   found a session out 631,152 times, of which 570,478 were a `live_ship` lane finding the session lent to another
+>   `live_ship` lane, nearly all on the owner. Those are polls, not exchanges: many lanes spinning on one lent
+>   session, the forward lane's shape, and the strongest sign yet for the shared session.
+> - The two slow first formations of that window printed no counters, since they ended at the 40 s dump bound.
+> - **A second window captured one** (2026-11-08, eight runs at load 127–176, with the takeover link fix and the harness
+>   fixes; 7 passed, the eighth the register stall). Run 1's first formation took 72.3 s; every other took 0.16–2.1 s. Its
+>   dump at 15 s shows every node at 3 of 5 members with the council unformed (configuration 0), and **lending
+>   negligible**: longest hold 68 ms, discovery 437 lent and 437 returned, 17 out-findings in all. 29 record sessions were
+>   established by then, and three nodes refused 1, 2 and 7 accepted handshakes. (An earlier version of this entry
+>   reported 16 failed dials of 51: that counted every handshake step that had no session yet, not failures.)
+> - Over that run the shards were not short of CPU: control shards runnable in about 8 % of samples, 0.6–0.8 s of CPU.
+>   The machine was: 31–88 % in system code, idle 29 % on average, 11,654 disk operations a second, and timers running
+>   about 2.3 times late. Memory was not the limit (5.7–10 GB free, no swapping).
+> - So the slow formation is not this entry's lending and not shard starvation. Its logs show the lead: all three slow
+>   formations (72.3 s, 40.0 s, 40.9 s) had an accepted handshake give up early and then dialers reporting no reply through
+>   two handshake budgets, about 20 s each, just before formation completed; the seven fast runs of the second window
+>   had neither. It is three cases, and what released them is not yet shown by counters. `fleet.dial.stall.<reason>`
+>   and `fleet.accept.stall.<reason>` now name which bound ends a handshake. Formation adds no
+>   evidence for the shared session; the `live_ship` polls above are one dump from a build without the link fix.
+
 ### 2026-09-29: a lone owner refused its own objects — fixed; campaign counters added for the open KIND items
 
 **Fixed.** CI run 36567187754 (`2c6c034`, Ubuntu) failed a cross-region forwarding test, and a local full suite
@@ -8816,6 +8885,24 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   relay-retirement test. Both are intermittent, are owed root causes, and are not tolerated.
 - Nothing in this day's changes touches session formation or the contact rule: A-127 and A-128 are NFS state and its
   records, and the pressure hold is admission.
+
+### 2026-11-07: a bootstrapped node with no probe session counted itself meshed (fixed)
+
+- **Found** by the supervisor beside 518a1e82 (the same predicate in status). `Daemon::fleet_meshed` judged the mesh
+  over the council configuration's members, which name the bootstrapping node alone until the others are admitted, so a
+  fleet test's formation wait (`form_and_settle`, `assert_fleet_forms`) could pass with no session formed.
+- **Measured:** one node of a three-node manifest, its peers never started, bootstrapped alone: `fleet_meshed` true,
+  council members `[itself]`, two peers unmeshed, no session (red in 38 s). Before the bootstrap the old predicate
+  answered false.
+- **Fixed:** one predicate, `fleet::probe_mesh` over the members held alive, read by `fleet_meshed`, `fleet_unmeshed` and
+  status's `fleet_peers_in_contact`/`fleet_peers_unmeshed`. A fleet that knows another member is meshed only with a peer
+  in contact and every one probed; a laptop is meshed (R8). `assert_fleet_forms` asserts each node of a fleet of several
+  held a probe session when it passed. Tests: `a_node_whose_peers_never_answer_is_never_meshed`,
+  `a_mesh_over_no_peer_is_meshed_only_on_a_laptop`. Bug doc:
+  `docs/bugs/2026-11-07-a-fleet-with-no-probe-session-counted-itself-meshed.md`.
+- **Sibling, reported, not changed:** `verbs.rs` `owned_by_another_host` judges "a node alone" by the configuration's
+  members, so a bootstrapped node answers another member's volume `NotFound` as a laptop would until the others are
+  admitted.
 
 ### 2026-10-09: a refused admission claimed the whole content pool (fixed)
 

@@ -103,7 +103,7 @@ use slates_rt::udp::UdpSocket;
 use slates_rt::udp::{Ipv4Addr, SocketAddrV4};
 use slates_transport::connection::{ConnectionShape, Priority};
 use slates_transport::demux::{Demux, DemuxId};
-use slates_transport::endpoint::{Endpoint, EndpointError};
+use slates_transport::endpoint::{Endpoint, EndpointError, HandshakeStall};
 use slates_transport::handshake::Identity;
 use slates_vfs::clock::Clock;
 use slates_vfs::export::{Progress, SnapshotArchiver};
@@ -1334,7 +1334,10 @@ async fn client_for(
 ) -> Option<Endpoint> {
   let (address, plane) = address;
   let peer = resolve_peer_address(address, plane, certificate, resolver).await?;
-  let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+  let Ok(socket) = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)) else {
+    count_refusal(DIAL_SOCKET_REFUSED);
+    return None;
+  };
   let shape = fleet_shape();
   let Some(built) =
     identity.with(|identity| Endpoint::client(socket, peer, identity, certificate, name, shape))
@@ -1342,7 +1345,13 @@ async fn client_for(
     count_refusal(KEPT_UNREACHABLE);
     return None;
   };
-  built.ok()
+  match built {
+    Ok(endpoint) => Some(endpoint),
+    Err(_) => {
+      count_refusal(DIAL_CLIENT_REFUSED);
+      None
+    }
+  }
 }
 
 /// The connection shape every fleet session is built with: the fleet frame cap, the derived receive
@@ -1397,9 +1406,11 @@ async fn establish_session(
       Err(EndpointError::NotReady)
         if endpoint.handshake_budgets_spent() < ESTABLISH_BUDGETS_BEFORE_REDIAL =>
       {
+        count_refusal(dial_stall_counter(endpoint.handshake_stall()));
         (Some(endpoint), None)
       }
       Err(EndpointError::NotReady) => {
+        count_refusal(dial_stall_counter(endpoint.handshake_stall()));
         // Counted, and said once: a dialer that keeps dialing afresh names the peer it cannot reach.
         if count_refusal(DIAL_REDIAL) == 1 {
           slates_machine::log_line!(
@@ -1409,6 +1420,7 @@ async fn establish_session(
         (None, None)
       }
       Err(e) => {
+        count_refusal(dial_fault_counter(&e));
         if count_refusal(DIAL_FAULT) == 1 {
           slates_machine::log_line!(
             "slates-server: fleet: the handshake to {address} faulted: {e:?}"
@@ -1458,7 +1470,7 @@ async fn serve_peer_records(
   driver: PeerDriver,
 ) {
   if let Err(e) = endpoint.establish().await {
-    count_accept_failure(&e, "record");
+    count_accept_failure(&e, endpoint.handshake_stall(), "record");
     return;
   }
   // Two ids for the authenticated peer (task #22 two-id model). `peer_anchor` is its **stable** anchor — the
@@ -4293,6 +4305,52 @@ pub(crate) const LENT_TO_LINK: &str = "fleet.lent_to.link";
 /// Format: refusal names in the daemon's status report, alongside the verbs' refusal kinds.
 const DIAL_REDIAL: &str = "fleet.dial.redial";
 const DIAL_FAULT: &str = "fleet.dial.fault";
+/// A dial that could not bind its socket.
+const DIAL_SOCKET_REFUSED: &str = "fleet.dial.socket_refused";
+/// A dial whose client endpoint could not be built.
+const DIAL_CLIENT_REFUSED: &str = "fleet.dial.client_refused";
+
+/// The counter for a dial's handshake budget spent, by which of the handshake's bounds spent it
+/// (`slates_transport::endpoint::HandshakeStall`): a formation stalled on dials says here why they are not completing.
+fn dial_stall_counter(stall: Option<HandshakeStall>) -> &'static str {
+  match stall {
+    Some(HandshakeStall::Silence) => "fleet.dial.stall.silence",
+    Some(HandshakeStall::Repeats) => "fleet.dial.stall.repeats",
+    Some(HandshakeStall::Fragments) => "fleet.dial.stall.fragments",
+    Some(HandshakeStall::TurnCeiling) => "fleet.dial.stall.turn_ceiling",
+    Some(HandshakeStall::ConfirmDeadline) => "fleet.dial.stall.confirm_deadline",
+    Some(HandshakeStall::ConfirmSilence) => "fleet.dial.stall.confirm_silence",
+    Some(HandshakeStall::ConfirmGarbage) => "fleet.dial.stall.confirm_garbage",
+    None => "fleet.dial.stall.unnamed",
+  }
+}
+
+/// The counter for an accepted handshake that gave up, by the bound that ended it ([`dial_stall_counter`]'s kinds).
+fn accept_stall_counter(stall: Option<HandshakeStall>) -> &'static str {
+  match stall {
+    Some(HandshakeStall::Silence) => "fleet.accept.stall.silence",
+    Some(HandshakeStall::Repeats) => "fleet.accept.stall.repeats",
+    Some(HandshakeStall::Fragments) => "fleet.accept.stall.fragments",
+    Some(HandshakeStall::TurnCeiling) => "fleet.accept.stall.turn_ceiling",
+    Some(HandshakeStall::ConfirmDeadline) => "fleet.accept.stall.confirm_deadline",
+    Some(HandshakeStall::ConfirmSilence) => "fleet.accept.stall.confirm_silence",
+    Some(HandshakeStall::ConfirmGarbage) => "fleet.accept.stall.confirm_garbage",
+    None => "fleet.accept.stall.unnamed",
+  }
+}
+
+/// The counter for a dial's handshake that faulted, by the transport's typed reason.
+fn dial_fault_counter(error: &EndpointError) -> &'static str {
+  match error {
+    EndpointError::Handshake(_) => "fleet.dial.fault.handshake",
+    EndpointError::Tls(_) => "fleet.dial.fault.tls",
+    EndpointError::Io(_) => "fleet.dial.fault.io",
+    EndpointError::Closed => "fleet.dial.fault.closed",
+    EndpointError::Admission(_) => "fleet.dial.fault.admission",
+    EndpointError::PeerParameters(_) => "fleet.dial.fault.peer_parameters",
+    _ => "fleet.dial.fault.other",
+  }
+}
 
 /// The status refusal count under which the serve side records an accepted session whose handshake did
 /// not complete (the dialer gave up, or its flight faulted); the log's first line says why.
@@ -4310,7 +4368,10 @@ const ACCEPT_PEER_CAPACITY: &str = "fleet.accept.peer_capacity";
 
 /// Classifies the transport's typed handshake result without hiding a real TLS or socket failure
 /// behind an expected replacement. Both serve planes use the same distinction.
-fn count_accept_failure(error: &EndpointError, plane: &str) {
+fn count_accept_failure(error: &EndpointError, stall: Option<HandshakeStall>, plane: &str) {
+  if matches!(error, EndpointError::NotReady) {
+    count_refusal(accept_stall_counter(stall));
+  }
   let counter = match error {
     EndpointError::Closed => ACCEPT_REPLACED,
     EndpointError::Admission(slates_transport::demux::SessionRefusal::PeerSessions) => {
@@ -4337,6 +4398,59 @@ pub(crate) fn count_refusal(kind: &'static str) -> u64 {
     *count
   })
   .unwrap_or(0)
+}
+
+/// This node's **direct probe mesh** (§4.8): the members its membership holds alive that it keeps direct contact with
+/// ([`keeps_direct_contact_with`]), this node left out, and those of them with no formed probe session yet. Over the
+/// alive membership, not the council's configuration: from the bootstrap until the others are admitted the configuration
+/// names the bootstrapping node alone, so a mesh judged over it was formed over nothing, and a fleet test's formation
+/// wait could pass before any session existed (live-fixes, 2026-11-07, red in 38 s; status showed `in_contact=0
+/// probed=4` the same way, diag-live-fixes-32).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProbeMesh {
+  /// The peers held alive that this node keeps direct contact with.
+  pub(crate) in_contact: Vec<HostId>,
+  /// Those with no formed probe session.
+  pub(crate) unmeshed: Vec<HostId>,
+  /// Every member held alive, this node among them.
+  pub(crate) alive: Vec<HostId>,
+  /// Whether the membership knows any member but this node, alive, suspected or dead.
+  pub(crate) others_known: bool,
+}
+
+impl ProbeMesh {
+  /// Whether the mesh is up: every peer in contact has a formed probe session, and once the membership knows another
+  /// member at least one peer is in contact, so a fleet of several members never counts itself meshed over no peer
+  /// at all (its peers not reached yet, or all of them dead). A laptop, which knows no other member, is meshed (R8).
+  pub(crate) fn meshed(&self) -> bool {
+    self.unmeshed.is_empty() && (!self.others_known || !self.in_contact.is_empty())
+  }
+}
+
+/// This node's probe mesh as it stands ([`ProbeMesh`]).
+pub(crate) fn probe_mesh(state: &ShardState) -> ProbeMesh {
+  let host = state.fleet.host();
+  let membership = state.fleet.membership();
+  let alive = membership.alive();
+  let others_known = alive.iter().any(|member| *member != host)
+    || !membership.suspects().is_empty()
+    || !membership.dead().is_empty();
+  let in_contact: Vec<HostId> = alive
+    .iter()
+    .copied()
+    .filter(|peer| *peer != host && keeps_direct_contact_with(state, *peer))
+    .collect();
+  let unmeshed = in_contact
+    .iter()
+    .copied()
+    .filter(|peer| !state.formed_probe_peers.contains(peer))
+    .collect();
+  ProbeMesh {
+    in_contact,
+    unmeshed,
+    alive,
+    others_known,
+  }
 }
 
 /// Whether this node keeps **direct contact** with `peer` — a record session dialed and kept up for the
@@ -4517,6 +4631,8 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
     resolver,
   } = dial;
   let mut peer_host = seed;
+  // Whether this link is idling because the peer is out of direct contact, so the idle is counted once on entering it.
+  let mut idling = false;
   // When the next discovery page is due, and the wait after it (see `next_discovery_wait`).
   let mut discovery_due: u64 = 0;
   let mut discovery_wait: u64 = HEARTBEAT_NS;
@@ -4533,8 +4649,7 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
     // incarnation is dead by definition — drop it, and from here keep the link under the id the peer now
     // writes as (dialed again once the council admits it, as any newly admitted member is).
     peer_host = refresh_record_identity(anchor, peer_host, &mut client, &mut discovery_cursor);
-    let retired = state::with_state(|s| !keeps_direct_contact_with(s, peer_host));
-    if retired == Some(true) {
+    if out_of_contact(peer_host, &mut idling) {
       // The peer is retired. Drop its record session and **idle** — this task does not end, so if the peer
       // rejoins (its probe reaches this node's serve side, which re-admits it — [`serve_peer_probes`]) this
       // loop sees it back in the neighbourhood and re-establishes. A believed-dead peer is never dialed
@@ -4573,6 +4688,23 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
     crate::daemon::pace(HEARTBEAT_NS).await;
   }
 }
+
+/// Whether `peer` is out of this node's direct contact, so its record link idles; entering the idle is counted
+/// ([`LINK_OUT_OF_CONTACT`]), so a pair with no record session tells by design from a link that failed.
+fn out_of_contact(peer: HostId, idling: &mut bool) -> bool {
+  let out = state::with_state(|s| !keeps_direct_contact_with(s, peer)) == Some(true);
+  if out && !*idling {
+    count_refusal(LINK_OUT_OF_CONTACT);
+  }
+  *idling = out;
+  out
+}
+
+/// Counter: a record link that went idle because its peer is out of this node's direct contact (`keeps_direct_contact_with`:
+/// neither holds for the other, and neither votes nor is staged), counted on entering the idle. Two such members form
+/// no record session and no probe session by design (raft-chaos's five-node flow took such a pair for a stall: the two
+/// non-voters held 3 of 4 peers probed for a whole fleet wait, CI diag-live-fixes-30).
+const LINK_OUT_OF_CONTACT: &str = "fleet.link.out_of_contact";
 
 /// Counter: a discovery page sent over a record link (a settled roster's pages back off to one per horizon a peer).
 /// Format: a counter name in the daemon's status report.
@@ -7725,6 +7857,42 @@ pub(crate) async fn forward_batch_over_leader_session(
   stall_ns: u64,
 ) -> Option<slates_cluster::BatchReplies> {
   crate::forward_lane::forward_batch(peer, requests, stall_ns).await
+}
+
+#[cfg(test)]
+mod probe_mesh_tests {
+  use super::{HostId, ProbeMesh};
+
+  /// §4.8, the mesh's predicate at its edges: do judge a laptop (no other member known), a fleet with every
+  /// in-contact peer probed, one with a peer unprobed, and a fleet of several with no peer in contact (none reached, or
+  /// all dead). Expect only the laptop and the fully probed fleet meshed.
+  #[test]
+  fn a_mesh_over_no_peer_is_meshed_only_on_a_laptop() {
+    let (a, b, c) = (HostId(1), HostId(2), HostId(3));
+    let mesh =
+      |in_contact: &[HostId], unmeshed: &[HostId], alive: &[HostId], others_known| ProbeMesh {
+        in_contact: in_contact.to_vec(),
+        unmeshed: unmeshed.to_vec(),
+        alive: alive.to_vec(),
+        others_known,
+      };
+    assert!(
+      mesh(&[], &[], &[a], false).meshed(),
+      "a laptop is meshed (R8)"
+    );
+    assert!(
+      mesh(&[b, c], &[], &[a, b, c], true).meshed(),
+      "every peer probed"
+    );
+    assert!(
+      !mesh(&[b, c], &[c], &[a, b, c], true).meshed(),
+      "c unprobed"
+    );
+    assert!(
+      !mesh(&[], &[], &[a], true).meshed(),
+      "a fleet of several with no peer in contact"
+    );
+  }
 }
 
 #[cfg(test)]
