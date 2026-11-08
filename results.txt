@@ -1,0 +1,6 @@
+tested 295a9de706bc6139dd112e4cf89afd72bbd2d832 variant after on x86_64, 4 cpus
+cadence exit 0 20s
+cadence-again exit 0 2s
+rt exit 0 11s
+fill exit 0 142s
+clippy exit 0 74s
