@@ -1,0 +1,10 @@
+runner macos-latest, f793301 diag: the A-228 branch's documentation gate and xtask check, Sun Nov  8 14:29:35 UTC 2026
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 26s
+== documentation gate, exit 0
+structural: ok (33 shipped crates)
+literals: ok
+slates-rt                    99      99  ok
+unsafe: ok
+toolchain: every pin names 1.98.1
+capabilities: ok (15 rows, each proof a runnable test)
+== xtask check, exit 0
