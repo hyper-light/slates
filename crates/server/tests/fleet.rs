@@ -12822,6 +12822,261 @@ fn a_version_appended_before_its_owner_restarted_commits_once_it_is_back() {
   );
 }
 
+/// §4.16 "Commit" (AUD-11) and §4.9 exactly-once across the owner's restart (the bug record of 2026-11-07, a submit
+/// resent after its owner restarted was applied twice). Goal 4's primary-kill rung found 83 versions on the green that
+/// no client was told, and their clients told later versions: a submit whose version was appended before the crash, and
+/// not yet committed, was waited on only in memory and its completion was recorded only at the commit, so its resend
+/// under its own id after the restart ran the verb again and was accepted as a second version. Do: on a settled
+/// three-node fleet at `f = 1` whose nodes keep their state across a restart, make a green, a work with one edit, and
+/// with both holders withholding merge records submit it from a client that keeps its id, so version 1 is appended and
+/// the submit waits; restart the owner over its own segment; lift the holders' fault; reconnect the client under its id
+/// and send the submit again under the same request id. Expect it answered `Submitted { version: Some(1) }` and the
+/// green's head at version 1.
+#[test]
+fn a_submit_resent_under_its_id_after_its_owner_restarted_is_answered_its_version_once() {
+  submit_resent_after_its_owner_restarted(false);
+}
+
+/// §4.16 "Commit", A-252: the resend arrives while the version still cannot commit (the holders still withhold it) on an
+/// owner whose in-memory wait the restart lost. Expect: no answer and no second version while it waits (the partition's
+/// durable wait, never `Seen::New`), then the version it was accepted as once the record commits.
+#[test]
+fn a_submit_resent_while_its_version_still_waits_after_the_restart_joins_the_wait() {
+  submit_resent_after_its_owner_restarted(true);
+}
+
+/// Shape: how long a resend is watched for an answer it must not get while its version cannot commit: a liveness
+/// budget, past the owner's serve of the resend (microseconds) and short of the placement deadline.
+const RESEND_NOT_ANSWERED_WAIT: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);
+
+/// The restart cases of A-252. `before_lift`: the client resends while the holders still withhold the version's record
+/// and is held to no answer and no second version until they lift it; else the fault is lifted first.
+fn submit_resent_after_its_owner_restarted(before_lift: bool) {
+  let _serial = serialize_fleet_tests();
+  let pid = std::process::id();
+  let profiles: Vec<_> = ["once-restart-a", "once-restart-b", "once-restart-c"]
+    .into_iter()
+    .map(profile)
+    .collect();
+  let anchors: Vec<_> = profiles.iter().map(anchor_of).collect();
+  let seeds: Vec<_> = anchors.iter().map(|anchor| member_id(*anchor, 0)).collect();
+  let mut identities: Vec<_> = profiles.iter().map(|_| same_identity(2)).collect();
+  let certificates: Vec<_> = identities
+    .iter()
+    .map(|pair| pair[0].certificate())
+    .collect();
+  let (_ports_lease, ports) = mesh_serve_ports(profiles.len());
+  let peers = |node| {
+    profiles
+      .iter()
+      .enumerate()
+      .filter(|(peer, _)| *peer != node)
+      .map(|(peer, _)| fleet_peer_at(anchors[peer], seeds[peer], ports[peer], &certificates[peer]))
+      .collect::<Vec<_>>()
+  };
+  let configs: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      fleet_config(
+        profile,
+        &format!("once-restart-{node}-{pid}"),
+        anchors[node],
+        seeds[node],
+        &peers(node),
+        &Default::default(),
+      )
+    })
+    .collect();
+  // Each node's segment carries a content object, so its volumes' content survives the owner's restart.
+  let anchors_held: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      common::anchor::held_anchor(
+        &format!("once-restart-{node}-{pid}"),
+        profile,
+        &configs[node],
+      )
+    })
+    .collect();
+  let source = |node: usize| common::anchor::source_of(&anchors_held[node]);
+  let mut daemons: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      start_fleet_node(
+        profile,
+        configs[node].clone(),
+        identities[node].pop().unwrap(),
+        ports[node],
+        peers(node),
+        source(node),
+      )
+    })
+    .collect();
+  daemons[0].bootstrap(true).unwrap();
+  settle_initial_consensus(&daemons, &seeds, &Default::default(), Quorum { f: 1 });
+  let mut client = Client::connect(daemons[0].instance());
+  let created = client.call(&RequestBody::CreateGreen {
+    name: "green".to_owned(),
+    require_evidence: false,
+    base: None,
+  });
+  let ReplyBody::GreenCreated { id: green } = created else {
+    panic!("create green: {created:?}");
+  };
+  let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
+    green,
+    name: "work".to_owned(),
+  }) else {
+    panic!("create work");
+  };
+  let edited = client.call(&RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  let withheld = slates_server::merge_service::MergeFault {
+    refuse_content_puts: false,
+    corrupt_next_inputs: false,
+    refuse_records: true,
+  };
+  let faulted: Vec<_> = daemons[1..]
+    .iter()
+    .map(|holder| holder.inject_merge_fault(withheld))
+    .collect();
+  // The submit, sent by a library client that keeps its id across a restart, appends version 1 and waits for its record,
+  // which the holders withhold: no answer comes.
+  let submit = RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  };
+  let mut resender = common::client::connect(daemons[0].instance());
+  let word = resender.begin(&submit).map(|id| id.word());
+  let first = word
+    .as_ref()
+    .ok()
+    .and_then(|word| answer_within(&mut resender, *word));
+  let awaiting_before = daemons[0].merge_awaiting(green);
+  drop(client);
+  daemons.remove(0).stop();
+  daemons.insert(
+    0,
+    start_fleet_node(
+      &profiles[0],
+      configs[0].clone(),
+      identities[0].pop().unwrap(),
+      ports[0],
+      peers(0),
+      source(0),
+    ),
+  );
+  let lift = |daemons: &[Daemon]| -> Vec<_> {
+    daemons[1..]
+      .iter()
+      .map(|holder| holder.inject_merge_fault(slates_server::merge_service::MergeFault::default()))
+      .collect()
+  };
+  let mut lifted = if before_lift {
+    Vec::new()
+  } else {
+    lift(&daemons)
+  };
+  // The client reconnects under its id and sends the submit again under the same word, as the load harness does.
+  let reconnected = {
+    let began = Instant::now();
+    loop {
+      match resender.try_reconnect() {
+        Ok(true) => break true,
+        _ if began.elapsed() >= PLACEMENT_DEADLINE => break false,
+        _ => std::thread::sleep(Duration::from_millis(10)),
+      }
+    }
+  };
+  let resent = word
+    .as_ref()
+    .ok()
+    .map(|word| resender.resend_awaited(*word).map(|_| ()));
+  // While the record is withheld the resend joins the wait: no answer, and the green holds the one version.
+  let mut waiting = None;
+  if before_lift {
+    let began = Instant::now();
+    let mut early = None;
+    while began.elapsed() < RESEND_NOT_ANSWERED_WAIT && early.is_none() {
+      early = word
+        .as_ref()
+        .ok()
+        .and_then(|word| resender.poll_reply_word(*word).ok().flatten());
+      std::thread::yield_now();
+    }
+    let mut reader = Client::connect(daemons[0].instance());
+    waiting = Some((early, reader.call(&RequestBody::Versions { green })));
+    lifted = lift(&daemons);
+  }
+  let answer = word
+    .as_ref()
+    .ok()
+    .and_then(|word| answer_within(&mut resender, *word));
+  let mut reader = Client::connect(daemons[0].instance());
+  let head = reader.call(&RequestBody::Versions { green });
+  let counters = merge_and_content_counters(&daemons);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    matches!(edited, ReplyBody::Edited),
+    "the edit was declared: {edited:?}"
+  );
+  assert!(
+    faulted.iter().chain(&lifted).all(Result::is_ok),
+    "the holders' fault was set and lifted: {faulted:?} {lifted:?}"
+  );
+  assert!(
+    first.is_none(),
+    "the submit waited for its withheld record: {first:?}"
+  );
+  assert_eq!(
+    awaiting_before,
+    Ok(1),
+    "version 1 was appended and its submit waited before the restart"
+  );
+  assert!(
+    reconnected,
+    "the client reconnected under its id after the restart"
+  );
+  assert!(
+    matches!(resent, Some(Ok(()))),
+    "the submit was sent again: {resent:?}"
+  );
+  if let Some((early, held)) = &waiting {
+    assert_eq!(
+      *early, None,
+      "while its version cannot commit, the resend joined the wait: no answer"
+    );
+    assert_eq!(
+      *held,
+      ReplyBody::Versions { head: 1 },
+      "and nothing ran again: the green holds the one version appended before the restart"
+    );
+  }
+  assert_eq!(
+    answer,
+    Some(Ok(ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    })),
+    "the submit resent under its id after the restart is answered the version it was accepted as: {counters:?}"
+  );
+  assert_eq!(
+    head,
+    ReplyBody::Versions { head: 1 },
+    "the green holds the submit once: its head is version 1, not a second copy"
+  );
+}
+
 /// `count` works over `green`, each with one edit declared and then submitted, one after another: each work's index,
 /// its edit's reply, its submit's reply and how long the submit took to answer.
 fn timed_submits(
@@ -13131,6 +13386,101 @@ fn a_taken_over_green_serves_every_version_and_accepts_new_work_on_the_successor
   assert!(
     next,
     "the successor accepted the next version at the quorum and its retry met the record"
+  );
+}
+
+/// §4.16 "Commit", A-252, the takeover case: the version committed at the quorum and its owner died before its client
+/// could be sure of the answer. The client resends under its id through its own node, which now reaches the successor.
+/// Do: three nodes at `f = 1`; on a, a green and a work; through b's client, one edit and a submit, answered version 1;
+/// a dies and a survivor takes the green over; b's client sends the submit again under the same id. Expect: the green
+/// still holds one version, and the resend is answered that version.
+#[test]
+fn a_submit_resent_after_its_owner_was_taken_over_is_not_applied_again() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut owner_client = Client::connect(daemons[0].instance());
+  let (green, work) = green_with_work(&mut owner_client, "resent-over-takeover");
+  let mut client = Client::connect(daemons[1].instance());
+  let (routed, last) = poll_status_served(&daemons, &mut client, work, COUNCIL_RETIRE_DEADLINE);
+  let submit = RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  };
+  let edited = routed.then(|| {
+    client.call(&RequestBody::Edit {
+      work,
+      path: "f".to_owned(),
+      at: 0,
+      delete_len: 0,
+      bytes: b"hello".to_vec(),
+    })
+  });
+  let first = routed.then(|| client.call(&submit));
+  let (caught_up, _) = holders_before_owner_death_at(&daemons, green, 1);
+  daemons.remove(0).stop();
+  let object = ObjectId(green.bytes);
+  let successor_host =
+    rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over the green");
+  let successor_index = usize::from(successor_host != hosts[1]);
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let materialized = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    daemons[successor_index].merge_record_placed(green, 1)
+  });
+  let again = client.try_retry(
+    &submit,
+    u64::try_from(PLACEMENT_DEADLINE.as_nanos()).unwrap(),
+  );
+  let mut reader = Client::connect(daemons[successor_index].instance());
+  let head = reader.call(&RequestBody::Versions { green });
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!("the resend through the takeover was answered {again:?}; head {head:?}");
+  assert!(routed, "b routed the work to its owner: {last:?}");
+  assert!(
+    matches!(edited, Some(ReplyBody::Edited)),
+    "the edit: {edited:?}"
+  );
+  assert_eq!(
+    first,
+    Some(ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    }),
+    "the submit committed at version 1"
+  );
+  assert!(
+    caught_up,
+    "both holders held version 1 before the owner died"
+  );
+  assert!(
+    materialized,
+    "the successor took the green over at version 1"
+  );
+  assert_eq!(
+    head,
+    ReplyBody::Versions { head: 1 },
+    "the resend ran nothing again: the green holds the one version"
+  );
+  assert_eq!(
+    again.ok(),
+    Some(ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    }),
+    "the resend through the takeover is answered the version it was accepted as"
   );
 }
 
@@ -13906,6 +14256,15 @@ fn commit_three_versions(client: &mut Client, work: VolumeId) {
 /// what it rebuilds from; the general prefix transfer is owed separately), and whether neither holder
 /// reports a placed version — the green is held there, not owned.
 fn holders_before_owner_death(daemons: &[Daemon], green: VolumeId) -> (bool, bool) {
+  holders_before_owner_death_at(daemons, green, 3)
+}
+
+/// [`holders_before_owner_death`] for a green at `version`.
+fn holders_before_owner_death_at(
+  daemons: &[Daemon],
+  green: VolumeId,
+  version: u64,
+) -> (bool, bool) {
   let both_caught_up = poll_until(
     &daemons.iter().collect::<Vec<_>>(),
     PLACEMENT_DEADLINE,
@@ -13913,7 +14272,7 @@ fn holders_before_owner_death(daemons: &[Daemon], green: VolumeId) -> (bool, boo
       all_hold(daemons[1..].iter().map(|holder| {
         holder
           .merge_holder_state(green)
-          .map(|state| state.version == Some(3))
+          .map(|state| state.version == Some(version))
       }))
     },
   );
