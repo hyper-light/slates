@@ -25,8 +25,8 @@ use slates_wire::crc32c::{crc32c, crc32c_append};
 use crate::delta::VolumeRecord;
 use crate::error::VfsError;
 use crate::recover::{
-  CommittedSlot, HELD_CALL_KEY_BYTES, HeldCall, HeldNfsReply, HeldReply, ImageRead, ImageWrite,
-  ShardImage, StreamedImage,
+  CommittedSlot, HELD_CALL_KEY_BYTES, HeldCall, HeldNfsReply, HeldNfsStates, HeldReply, ImageRead,
+  ImageWrite, ShardImage, StreamedImage,
 };
 
 /// Format: a delta's magic, checked before anything else on decode.
@@ -35,7 +35,7 @@ const DELTA_MAGIC: u32 = u32::from_le_bytes(*b"SLD1");
 /// 2026-10-09) a file changed only by writes to its chunked body is carried as its written windows
 /// (`delta::InodePatch`), not its whole image; 3 (A-127, 2026-10-09) the call records changed and purged since the
 /// last publication; 4 (A-128, 2026-10-09) the held NFSv3 replies, whole, when they changed.
-const DELTA_VERSION: u16 = 4;
+const DELTA_VERSION: u16 = 5;
 /// Format: a log frame's header — a little-endian payload length then a CRC-32C of the payload.
 const LOG_HEADER: usize = 2 * size_of::<u32>();
 /// Format: a log frame's payload prefix — its generation and its base checkpoint's generation.
@@ -72,6 +72,8 @@ pub struct ShardDelta {
   pub calls_removed: Vec<[u8; HELD_CALL_KEY_BYTES]>,
   /// The held NFSv3 replies now, when they changed (A-128).
   pub nfs_replies: Option<Vec<HeldNfsReply>>,
+  /// The held connections' byte states now, when they changed (A-231).
+  pub nfs_states: Option<Vec<HeldNfsStates>>,
 }
 
 impl ShardDelta {
@@ -88,8 +90,8 @@ impl ShardDelta {
 
   /// Ends a streamed shard delta: the volume count patched in at `at`, then the volumes gone (sorted here), the held
   /// replicas' image, the replies, the call records changed and purged (each sorted here), and the held NFSv3 replies
-  /// when they changed, as `ShardDelta::new(volumes, removed, held, replies).with_calls(calls, calls_removed)
-  /// .with_nfs_replies(nfs_replies).encode` writes them.
+  /// and the held connections' byte states when they changed, as `ShardDelta::new(volumes, removed, held, replies)
+  /// .with_calls(calls, calls_removed).with_nfs_replies(nfs_replies).with_nfs_states(nfs_states).encode` writes them.
   #[allow(clippy::too_many_arguments)] // one delta's whole tail, each part written in the format's order
   pub fn encode_finish(
     out: &mut Vec<u8>,
@@ -99,7 +101,7 @@ impl ShardDelta {
     held: Option<&[u8]>,
     replies: Option<&[HeldReply]>,
     (calls, calls_removed): (&mut [HeldCall], &mut [[u8; HELD_CALL_KEY_BYTES]]),
-    nfs_replies: Option<&mut [HeldNfsReply]>,
+    (nfs_replies, nfs_states): (Option<&mut [HeldNfsReply]>, Option<&mut [HeldNfsStates]>),
   ) -> Result<(), VfsError> {
     if !slates_wire::codec::patch_len(out, at, volumes) {
       return Err(VfsError::RecoveryIncomplete);
@@ -141,6 +143,17 @@ impl ShardDelta {
         }
       }
     }
+    match nfs_states {
+      None => out.push(slates_wire::codec::OPTION_NONE),
+      Some(nfs_states) => {
+        nfs_states.sort_unstable_by_key(|states| (states.connection, states.volume));
+        out.push(slates_wire::codec::OPTION_SOME);
+        slates_wire::codec::encode_len(nfs_states.len(), out);
+        for states in nfs_states.iter() {
+          states.encode(out);
+        }
+      }
+    }
     Ok(())
   }
 
@@ -163,6 +176,7 @@ impl ShardDelta {
       calls: Vec::new(),
       calls_removed: Vec::new(),
       nfs_replies: None,
+      nfs_states: None,
     }
   }
 
@@ -187,6 +201,17 @@ impl ShardDelta {
     nfs_replies.sort_unstable_by_key(|reply| (reply.connection, reply.xid));
     ShardDelta {
       nfs_replies: Some(nfs_replies),
+      ..self
+    }
+  }
+}
+
+impl ShardDelta {
+  /// This delta carrying the held connections' byte states now (A-231), sorted by (connection, volume).
+  pub fn with_nfs_states(self, mut nfs_states: Vec<HeldNfsStates>) -> ShardDelta {
+    nfs_states.sort_unstable_by_key(|states| (states.connection, states.volume));
+    ShardDelta {
+      nfs_states: Some(nfs_states),
       ..self
     }
   }
@@ -252,13 +277,17 @@ impl ShardImage {
     if let Some(nfs_replies) = &delta.nfs_replies {
       self.nfs_replies.clone_from(nfs_replies);
     }
+    if let Some(nfs_states) = &delta.nfs_states {
+      self.nfs_states.clone_from(nfs_states);
+    }
     Ok(())
   }
 }
 
-/// A publisher's view of its journal (the module doc): the committed checkpoint, where the log's tail is, and how
-/// much has been logged since the checkpoint. Only the one process publishing into the memories may keep it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// A publisher's view of its journal (the module doc): the committed checkpoint, where the log's tail is, how much
+/// has been logged since the checkpoint, and how far each memory may hold pages written since they were last given
+/// back (A-226). Only the one process publishing into the memories may keep it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Journal {
   /// The committed checkpoint, as the last checkpoint publish returned it.
   committed: Option<CommittedSlot>,
@@ -270,31 +299,99 @@ pub struct Journal {
   checkpoint_bytes: usize,
   /// The bytes of delta frames written since it.
   logged_bytes: usize,
+  /// How far into the committed slot pages may be resident: its checkpoint's bytes, or more where the slot held a
+  /// longer image that was never given back. [`UNKNOWN_EXTENT`] for a journal opened over memories a predecessor wrote.
+  committed_written: usize,
+  /// How far into the stale slot pages may be resident since it was last given back ([`Journal::dead_ranges`]).
+  stale_written: usize,
+  /// How far into the log pages may be resident since the log past the tail was last given back: the furthest any
+  /// frame, or the zeroed header after it, reached.
+  log_written: usize,
 }
 
-/// What of a shard's recovery memory no restart reads (A-117), each as `(offset, len)` within its own region: the
-/// checkpoint slot older than the committed one, and the delta log past its tail.
+/// The extent of a memory whose writes this journal did not see (a predecessor's, or a torn first checkpoint's): all
+/// of it, clipped to the memory's length where a range is asked for. Format: a sentinel, not a size.
+const UNKNOWN_EXTENT: usize = usize::MAX;
+
+impl Default for Journal {
+  /// A journal that has committed nothing, over memories that may hold anything: a fresh object reads zeros, but one a
+  /// predecessor wrote before its first checkpoint committed holds a torn image, so both slots and the log are given
+  /// back whole the first time ([`Journal::dead_ranges`]).
+  fn default() -> Self {
+    Journal {
+      committed: None,
+      generation: 0,
+      tail: 0,
+      checkpoint_bytes: 0,
+      logged_bytes: 0,
+      committed_written: UNKNOWN_EXTENT,
+      stale_written: UNKNOWN_EXTENT,
+      log_written: UNKNOWN_EXTENT,
+    }
+  }
+}
+
+/// What of a shard's recovery memory no restart reads and was written since it was last given back (A-117, A-226),
+/// each as `(offset, len)` within its own region: the checkpoint slot older than the committed one, and the delta log
+/// past its tail, each only as far as it was written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeadRanges {
-  /// The stale checkpoint slot, within the checkpoint memory.
+  /// The stale checkpoint slot from its start, as far as it was written, within the checkpoint memory.
   pub stale_slot: (usize, usize),
-  /// The log past the next frame's start, within the log memory.
+  /// The log from the next frame's start, as far as it was written, within the log memory.
   pub log_past_tail: (usize, usize),
 }
 
 impl Journal {
-  /// What no restart reads (A-117), for checkpoint memory `checkpoint_total` and log memory `log_total` bytes long;
-  /// `None` before the first checkpoint commits. A restart takes the newer CRC-valid slot, then the log's frames from
-  /// its start while each is CRC-valid and names that checkpoint, so the other slot and every byte past the tail are
-  /// dead: frames there are torn or name an older base. Returning their pages leaves them reading zeros, which fail
-  /// the same checks.
+  /// What no restart reads and was written since it was last given back (A-117, A-226), for checkpoint memory
+  /// `checkpoint_total` and log memory `log_total` bytes long; `None` before the first checkpoint commits. A restart
+  /// takes the newer CRC-valid slot, then the log's frames from its start while each is CRC-valid and names that
+  /// checkpoint, so the other slot and every byte past the tail are dead: frames there are torn or name an older base.
+  /// Returning their pages leaves them reading zeros, which fail the same checks. Only what was written since the last
+  /// give-back ([`Journal::given_back`]) can be resident, so the ranges stop there: a give-back costs what the
+  /// publications since wrote, not the memories' length (18 GB a shard on a Mac Studio, whose mark of it took 18–21 ms
+  /// of the shard's CPU at every publication before A-226).
   pub fn dead_ranges(&self, checkpoint_total: usize, log_total: usize) -> Option<DeadRanges> {
     let committed = self.committed?;
     let tail = self.tail.min(log_total);
+    let (stale_offset, stale_len) = committed.stale_slot(checkpoint_total);
     Some(DeadRanges {
-      stale_slot: committed.stale_slot(checkpoint_total),
-      log_past_tail: (tail, log_total.saturating_sub(tail)),
+      stale_slot: (stale_offset, stale_len.min(self.stale_written)),
+      log_past_tail: (tail, self.log_written.min(log_total).saturating_sub(tail)),
     })
+  }
+
+  /// Records that the ranges [`Journal::dead_ranges`] last named were given back: the stale slot's when `stale_slot`,
+  /// the log's past the tail when `log_past_tail`. A range the memory refused stays owed, asked for again at the next
+  /// give-back.
+  pub fn given_back(&mut self, stale_slot: bool, log_past_tail: bool) {
+    if stale_slot {
+      self.stale_written = 0;
+    }
+    if log_past_tail {
+      self.log_written = self.log_written.min(self.tail);
+    }
+  }
+
+  /// The journal after a checkpoint of `bytes` committed into what was the stale slot: that slot is now the committed
+  /// one, written as far as this image or the longer one it held and never gave back; the slot that was committed is
+  /// the stale one, written as far as its image reached; the log restarts, its old frames still written.
+  fn checkpointed(&self, committed: CommittedSlot, bytes: usize) -> Journal {
+    Journal {
+      committed: Some(committed),
+      generation: committed.generation,
+      tail: 0,
+      checkpoint_bytes: bytes,
+      logged_bytes: 0,
+      committed_written: bytes.max(self.stale_written),
+      stale_written: if self.committed.is_some() {
+        self.committed_written
+      } else {
+        // Nothing was committed, so neither slot's earlier writes are known: the other slot is given back whole.
+        UNKNOWN_EXTENT
+      },
+      log_written: self.log_written,
+    }
   }
 
   /// The generation of the last committed publication: what a transport's write log since it is stamped with.
@@ -319,13 +416,7 @@ impl Journal {
       .committed
       .map(|committed| committed.advanced_to(self.generation));
     let (bytes, committed) = image.write_after(checkpoints, known)?;
-    *self = Journal {
-      committed: Some(committed),
-      generation: committed.generation,
-      tail: 0,
-      checkpoint_bytes: bytes,
-      logged_bytes: 0,
-    };
+    *self = self.checkpointed(committed, bytes);
     Ok(bytes)
   }
 
@@ -351,13 +442,7 @@ impl Journal {
     image: StreamedImage<'_, S>,
   ) -> Result<usize, VfsError> {
     let (bytes, committed) = image.finish()?;
-    *self = Journal {
-      committed: Some(committed),
-      generation: committed.generation,
-      tail: 0,
-      checkpoint_bytes: bytes,
-      logged_bytes: 0,
-    };
+    *self = self.checkpointed(committed, bytes);
     Ok(bytes)
   }
 
@@ -422,13 +507,16 @@ impl Journal {
     log.image_write(payload_at, &prefix)?;
     log.image_write(payload_at.saturating_add(LOG_PREFIX), body)?;
     // The next frame's length word reads zero until a frame is written there, so a replay stops at this tail.
+    let mut written = end;
     if end.saturating_add(LOG_HEADER) <= log.image_len() {
       log.image_write(end, &[0u8; LOG_HEADER])?;
+      written = end.saturating_add(LOG_HEADER);
     }
     log.image_write(self.tail, &header)?;
     self.generation = generation;
     self.tail = end;
     self.logged_bytes = self.logged_bytes.saturating_add(total);
+    self.log_written = self.log_written.max(written);
     Ok(total)
   }
 
@@ -451,6 +539,10 @@ impl Journal {
       // checkpoint, which re-establishes the size.
       checkpoint_bytes: 0,
       logged_bytes: 0,
+      // A predecessor wrote these memories, as far as this journal cannot tell: each is given back whole once.
+      committed_written: UNKNOWN_EXTENT,
+      stale_written: UNKNOWN_EXTENT,
+      log_written: UNKNOWN_EXTENT,
     };
     while let Some((generation, delta, total)) =
       read_frame(log, journal.tail, committed.generation)?

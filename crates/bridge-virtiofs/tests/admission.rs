@@ -512,7 +512,9 @@ fn owner_pass(
   if !pass.barrier_owed {
     return pass.served;
   }
-  let completed = admitted.complete_barrier(bridge, registry, true).unwrap();
+  let completed = admitted
+    .complete_barrier(bridge, registry, (true, None))
+    .unwrap();
   assert!(completed.is_some_and(|done| !done.refused));
   pass.served + 1
 }
@@ -824,12 +826,16 @@ fn served_through_the_loop(
   for _ in 0..DAX_TURNS {
     let turned = admitted.dax_turn(bridge, registry, slice).unwrap();
     if turned.barrier_owed {
-      admitted.complete_barrier(bridge, registry, true).unwrap();
+      admitted
+        .complete_barrier(bridge, registry, (true, None))
+        .unwrap();
     }
     if !turned.busy {
       let pass = admitted.service(bridge, registry).unwrap();
       if pass.barrier_owed {
-        admitted.complete_barrier(bridge, registry, true).unwrap();
+        admitted
+          .complete_barrier(bridge, registry, (true, None))
+          .unwrap();
       }
     }
     if let Some((id, len)) = admitted.seam_mut().guest_mut().reap(rq) {

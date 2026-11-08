@@ -90,6 +90,11 @@ const MOUNT_REFUSED: &str = "winfsp.mount_refused";
 const BARRIER_REFUSED: &str = "winfsp.barrier_refused";
 /// Format: see [`MOUNT_REFUSED`] — a reply whose dispatcher thread was gone (the mount was being torn down).
 const REPLY_UNDELIVERED: &str = "winfsp.reply_undelivered";
+/// Counter: flush replies held until their live-shipped volume was durable (A-200).
+const LIVE_FLUSH_HELD: &str = "winfsp.live_flush_held";
+/// Counter: held flush replies answered `STATUS_UNEXPECTED_IO_ERROR`: the wait passed, the volume was destroyed or its
+/// owner superseded, or the mount already held its bound of them.
+const LIVE_FLUSH_REFUSED: &str = "winfsp.live_flush_refused";
 /// Format: see [`MOUNT_REFUSED`] — a mount's thread ended without being asked (its file system is gone).
 const MOUNT_LOST: &str = "winfsp.mount_lost";
 /// Format: see [`MOUNT_REFUSED`] — an attachment end the database refused to record.
@@ -131,6 +136,9 @@ const PURGE_ECHOES: &str = "winfsp.purge_echoes";
 const RESTORED_READS: &str = "winfsp.restored_reads";
 /// Format: kernel requests settled from the retained receive journal before taking a new batch (A-198).
 const CAPTURED_SETTLED: &str = "winfsp.captured_requests_settled";
+/// Format: captured requests recovery answered with a refusal from the file system: a replayed Cleanup or Close whose
+/// open could not be ended. One whose open the dead daemon had already ended is answered done and not counted.
+const CAPTURED_REFUSED: &str = "winfsp.captured_requests_refused";
 /// Format: release attempts the anchor refused or did not answer, each repeated: the non-vacuity counter of the unmount
 /// oracle. A healthy anchor keeps it at zero.
 const HOLD_RELEASE_REFUSED: &str = "winfsp.hold_release_refused";
@@ -178,6 +186,43 @@ pub(crate) struct WinFspMount {
   detaching: bool,
   /// The anchor answered the release, so the mount's end asks nothing more of it.
   released: bool,
+  /// This volume's place in the daemon's own mounts (A-227), so no daemon thread opens a path on its drive; forgotten
+  /// when the mount is dropped. Held for its drop alone.
+  _own: OwnVolumeRecord,
+  /// Flush replies held until the live-shipped volume's log is durable where their barrier put it (A-200), oldest
+  /// first ([`settle_held`]); bounded by `live_ship::reply_hold_bound`. WinFsp's dispatcher waits on each meanwhile.
+  held: VecDeque<HeldFlush>,
+}
+
+/// A WinFsp volume's id in the process's set of its own mounts (`slates_base::own_mounts`, A-227): its kernel name's,
+/// the same name its drive letter's DOS device names, so a base path on the drive is refused before any open.
+#[derive(Debug)]
+struct OwnVolumeRecord(u64);
+
+impl OwnVolumeRecord {
+  fn of(volume: &[u16]) -> Result<Self, Refusal> {
+    let id = slates_base::own_mounts::volume_id(volume);
+    slates_base::own_mounts::record(id).map_err(|full| Refusal::TargetUnavailable {
+      reason: format!(
+        "the WinFsp volume is past the {} mounts this daemon records as its own",
+        full.capacity
+      ),
+    })?;
+    Ok(Self(id))
+  }
+}
+
+impl Drop for OwnVolumeRecord {
+  fn drop(&mut self) {
+    slates_base::own_mounts::forget(self.0);
+  }
+}
+
+/// A flush's reply held for durability (A-200): the reply, the log position it waits for and when it gives up.
+struct HeldFlush {
+  served: slates_bridge_winfsp::host::Served,
+  target: u64,
+  deadline_ns: u64,
 }
 
 /// The bounded held-ledger/image merge, one inode per owner turn. The held map has at most MAX_OPEN_HANDLES entries.
@@ -408,7 +453,7 @@ async fn await_mounted(
         ));
       }
       // No command (a round or a purge) is sent before the mount is up, so none can come back.
-      Some(Outcome::Notified(..) | Outcome::Purged(_) | Outcome::Recovered(_)) | None => {
+      Some(Outcome::Notified(..) | Outcome::Purged(_) | Outcome::Recovered { .. }) | None => {
         futures::idle().await
       }
     }
@@ -493,7 +538,23 @@ fn established(
     crate::verbs::release_unrecorded_lease(s, &pending.record);
     crate::verbs::refused(refusal)
   };
-  if let Err((refusal, thread)) = keep(s, &pending.record, thread, requests, waker, ready, false) {
+  // The volume is this daemon's own from here (A-227).
+  let own = match OwnVolumeRecord::of(&ready.offer.record.volume) {
+    Ok(own) => own,
+    Err(refusal) => {
+      drop(requests);
+      return (refused(s, refusal), Some(thread));
+    }
+  };
+  if let Err((refusal, thread)) = keep(
+    s,
+    &pending.record,
+    thread,
+    requests,
+    waker,
+    (ready, own),
+    false,
+  ) {
     return (refused(s, refusal), Some(thread));
   }
   if let Err(e) = s.db.mutate(&mut s.segment, &op, now) {
@@ -521,7 +582,7 @@ fn keep(
   thread: MountThread,
   requests: Receiver<Request>,
   waker: std::task::Waker,
-  ready: Ready,
+  (ready, own): (Ready, OwnVolumeRecord),
   takeover: bool,
 ) -> Result<(), (Refusal, MountThread)> {
   let registry = match s.attachments.attach(
@@ -582,6 +643,8 @@ fn keep(
       purge_out: false,
       detaching: false,
       released: false,
+      _own: own,
+      held: VecDeque::new(),
     },
   );
   open_journal_reader(s, record.volume, registry);
@@ -592,6 +655,9 @@ fn keep(
 pub(crate) struct InheritedMount {
   pub(crate) attachment: u64,
   held: Option<Inherited>,
+  /// The held volume recorded as this daemon's own before any shard starts, so no shard reacquires a base or resumes a
+  /// landing on its drive before its adoption (A-227); taken by the adoption, let go with any refusal.
+  own: Option<OwnVolumeRecord>,
 }
 
 impl InheritedMount {
@@ -612,9 +678,22 @@ pub(crate) fn split_held(
   let mut split: Vec<Vec<InheritedMount>> = (0..partitions).map(|_| Vec::new()).collect();
   for mount in handed {
     let attachment = mount.attachment;
+    let (held, own) = match checked_inherited(mount) {
+      Some(held) => match OwnVolumeRecord::of(&held.record.volume) {
+        Ok(own) => (Some(held), Some(own)),
+        Err(refusal) => {
+          slates_machine::log_line!(
+            "slates-server: held mount {attachment} could not be recorded as this daemon's own: {refusal:?}"
+          );
+          (None, None)
+        }
+      },
+      None => (None, None),
+    };
     let held = InheritedMount {
       attachment,
-      held: checked_inherited(mount),
+      held,
+      own,
     };
     let partition = usize::from(crate::verbs::owner_of_attachment(attachment));
     let target = if partition < partitions { partition } else { 0 };
@@ -691,7 +770,8 @@ pub(crate) fn adopt_held() {
 
 async fn adopt_mount(record: AttachmentRecord, held: InheritedMount) {
   let attachment = record.id;
-  let Some(held) = held.held else {
+  let InheritedMount { held, own, .. } = held;
+  let (Some(held), Some(own)) = (held, own) else {
     let _ = state::with_state_counted(|s| {
       refuse_adoption(s, &record, "the held mount record is unusable")
     });
@@ -712,7 +792,7 @@ async fn adopt_mount(record: AttachmentRecord, held: InheritedMount) {
     Err(error) => Err((error.to_string(), None)),
   };
   let adopted = state::with_state_counted(|s| match mounted {
-    Ok((thread, ready)) => match keep(s, &record, thread, requests, waker, ready, true) {
+    Ok((thread, ready)) => match keep(s, &record, thread, requests, waker, (ready, own), true) {
       Ok(()) => {
         s.count("winfsp.adopted", 1);
         Ok(())
@@ -884,7 +964,10 @@ async fn reap(mut thread: MountThread, attachment: u64, released: bool) {
         return;
       }
       Some(
-        Outcome::Mounted(_) | Outcome::Notified(..) | Outcome::Purged(_) | Outcome::Recovered(_),
+        Outcome::Mounted(_)
+        | Outcome::Notified(..)
+        | Outcome::Purged(_)
+        | Outcome::Recovered { .. },
       ) => {}
       Some(Outcome::Failed(error)) => {
         slates_machine::log_line!("slates-server: ending WinFsp receive worker: {error}")
@@ -911,6 +994,7 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
   if mount.ending {
     return Turned::Ended;
   }
+  let held_in = settle_held(s, mount);
   let deferred = match take_outcomes(s, mount) {
     Ok(deferred) => deferred,
     Err(()) => return Turned::Ended,
@@ -939,7 +1023,7 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
     Some(Err(TryRecvError::Disconnected)) | None => return Turned::Ended,
   };
   if request.is_none() && !changed && !mount.owed {
-    let retry_in = send_due_retries(s, mount);
+    let retry_in = earliest(send_due_retries(s, mount), held_in);
     return if deferred {
       Turned::RoundDeferred
     } else {
@@ -1013,7 +1097,7 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
     // so rearm at the delivered generation before parking (A-198's SDK-rename mapped-view regression).
     slot.volume.wait_for_change(mount.seen, &mount.waker);
   }
-  let retry_in = send_due_retries(s, mount);
+  let retry_in = earliest(send_due_retries(s, mount), held_in);
   match served {
     Some(served) => {
       answer(s, mount, served);
@@ -1112,7 +1196,10 @@ fn take_outcomes(s: &mut ShardState, mount: &mut WinFspMount) -> Result<bool, ()
         record_purges(s, &mut mount.retries, &purged);
       }
       Outcome::Mounted(_) => {}
-      Outcome::Recovered(count) => s.count(CAPTURED_SETTLED, count),
+      Outcome::Recovered { settled, refused } => {
+        s.count(CAPTURED_SETTLED, settled);
+        s.count(CAPTURED_REFUSED, refused);
+      }
       Outcome::Failed(error) => {
         slates_machine::log_line!("slates-server: WinFsp receive worker failed: {error}");
         mount.ending = true;
@@ -1310,8 +1397,56 @@ fn purges_owed(
   purges
 }
 
-/// Publishes when the served request needs it, then sends its reply.
-fn answer(s: &mut ShardState, mount: &WinFspMount, mut served: slates_bridge_winfsp::host::Served) {
+/// The sooner of two waits, either of which may be none.
+fn earliest(first: Option<u64>, second: Option<u64>) -> Option<u64> {
+  match (first, second) {
+    (Some(first), Some(second)) => Some(first.min(second)),
+    (first, second) => first.or(second),
+  }
+}
+
+/// Answers each held flush of `mount` that is settled: as served once its volume is durable at its position,
+/// `STATUS_UNEXPECTED_IO_ERROR` once its wait has passed or it never will be (destroyed, superseded). The rest stay
+/// held, the mount's task parked on the volume: how long until the soonest gives up, if one is held.
+fn settle_held(s: &mut ShardState, mount: &mut WinFspMount) -> Option<u64> {
+  let now = futures::now_ns();
+  let mut kept = VecDeque::new();
+  while let Some(mut held) = mount.held.pop_front() {
+    let settled = crate::live_ship::durability(s, mount.volume, held.target, Some(&mount.waker));
+    let refuse = match settled {
+      crate::live_ship::Durability::Durable => false,
+      crate::live_ship::Durability::Never => true,
+      crate::live_ship::Durability::Pending if now >= held.deadline_ns => true,
+      crate::live_ship::Durability::Pending => {
+        kept.push_back(held);
+        continue;
+      }
+    };
+    if refuse {
+      s.count(LIVE_FLUSH_REFUSED, 1);
+      held.served.refuse_unpublished();
+    }
+    if !held.served.send() {
+      s.count(REPLY_UNDELIVERED, 1);
+    }
+  }
+  mount.held = kept;
+  mount
+    .held
+    .iter()
+    .map(|held| held.deadline_ns.saturating_sub(now))
+    .min()
+}
+
+/// Publishes when the served request needs it, then sends its reply. A flush of a live-shipped volume is answered once
+/// its log is durable on `f` candidates too (A-200; AC-8.3): held on the mount and sent by [`settle_held`], so a
+/// `FlushFileBuffers` never claims what no candidate holds. Past the mount's bound it is answered
+/// `STATUS_UNEXPECTED_IO_ERROR`, counted.
+fn answer(
+  s: &mut ShardState,
+  mount: &mut WinFspMount,
+  mut served: slates_bridge_winfsp::host::Served,
+) {
   if served.is_restored_read() {
     s.count(RESTORED_READS, 1);
   }
@@ -1325,6 +1460,21 @@ fn answer(s: &mut ShardState, mount: &WinFspMount, mut served: slates_bridge_win
       s.count(BARRIER_REFUSED, 1);
       served.refuse_unpublished();
     }
+  }
+  if served.claims_durability()
+    && let Some(target) = crate::live_ship::durable_target(s, mount.volume)
+  {
+    if mount.held.len() < crate::live_ship::reply_hold_bound(s) {
+      mount.held.push_back(HeldFlush {
+        served,
+        target,
+        deadline_ns: futures::now_ns().saturating_add(crate::live_ship::durable_wait_ns()),
+      });
+      s.count(LIVE_FLUSH_HELD, 1);
+      return;
+    }
+    s.count(LIVE_FLUSH_REFUSED, 1);
+    served.refuse_unpublished();
   }
   if !served.send() {
     s.count(REPLY_UNDELIVERED, 1);

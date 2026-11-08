@@ -287,6 +287,10 @@ enum Op<T> {
   Flush {
     object: T,
   },
+  /// `FlushFileBuffers` on the volume (a null context): Windows has written every file's cached data back first, so
+  /// there is nothing to flush through the bridge, but the publication that makes it durable is owed as a handle's
+  /// flush owes it. Before 2026-11-05 it was answered success on WinFsp's thread with no publication at all.
+  FlushVolume,
   /// The last handle of a file object closed (`Cleanup`) after it changed the file: deletes the path when asked
   /// (a file's `unlink`, an empty directory's `rmdir`, decided by the resolved kind), and publishes.
   Cleanup {
@@ -316,6 +320,7 @@ impl<T> Op<T> {
         | Op::SetAllocation { .. }
         | Op::Rename { .. }
         | Op::Flush { .. }
+        | Op::FlushVolume
         | Op::Cleanup { .. }
     )
   }
@@ -323,8 +328,12 @@ impl<T> Op<T> {
 
 /// The shard's reply to an [`Op`].
 enum Reply {
-  /// The last context visited by a cooperative name update, or None when all live contexts were visited.
-  RenamedName(Option<u64>),
+  /// A cooperative name update's turn: the context it renamed (None when no open was beneath the old name), and whether
+  /// any open is still beneath it, so the receiver asks for no turn only to learn that none is left.
+  RenamedName {
+    renamed: Option<u64>,
+    more: bool,
+  },
   Volume {
     total: u64,
     free: u64,
@@ -360,6 +369,9 @@ pub struct Request {
   op: Op<u64>,
   reply: SyncSender<Reply>,
   hint: u64,
+  /// Whether recovery is replaying this request from a dead daemon's journal (`crate::dispatcher`), so a Close the
+  /// dead daemon already applied may be found done.
+  replayed: bool,
 }
 
 impl Request {
@@ -380,6 +392,7 @@ impl Request {
         barrier: false,
         echo: false,
         restored_read: false,
+        flush: false,
       };
     }
     if let Op::Confirm { context } = &self.op {
@@ -390,6 +403,7 @@ impl Request {
         barrier: false,
         echo: false,
         restored_read: false,
+        flush: false,
       };
     }
     self.serve_operation(bridge, cx, names, ledger)
@@ -413,18 +427,29 @@ impl Request {
       Op::Release { object } => Some(*object),
       _ => None,
     };
+    // A replayed Release (a Close) ends an open the dead daemon may already have ended: it served the Close, retired
+    // the open, and died before acknowledging it. Its open being gone is then the Close done, not a refusal. A Cleanup
+    // retires nothing, so a replayed Cleanup's stale context stays a refusal.
+    let ends_open = closed.is_some();
     let refused = admission_refusal(&self.op, names, ledger);
     let bound = bind(self.op, ledger);
     let barrier = bound.as_ref().is_ok_and(|op| {
       op.needs_barrier() && !matches!(op, Op::Cleanup { object, .. } if object.purge)
     });
     let echo = matches!(&bound, Ok(Op::Write { object, .. }) if object.purge);
+    let flush = matches!(&bound, Ok(Op::Flush { .. } | Op::FlushVolume));
     let restored_read =
       matches!(&bound, Ok(Op::Read { object, .. }) if object.fh == RESTORED_HANDLE);
     let mut reply = match (bound, refused) {
       (Ok(_op), Some(refusal)) => Reply::Err(ntstatus(&refusal).as_i32()),
       (Ok(op), None) => {
         run(bridge, cx, op).unwrap_or_else(|error| Reply::Err(ntstatus(&error).as_i32()))
+      }
+      (Err(crate::opens::Refusal::Stale), _) if self.replayed && ends_open => {
+        slates_machine::log_line!(
+          "slates-winfsp: a replayed close found its open already ended: answered done"
+        );
+        Reply::Ok
       }
       (Err(error), _) => {
         slates_machine::log_line!("slates-winfsp: context refused: {error}");
@@ -439,6 +464,7 @@ impl Request {
       barrier,
       echo,
       restored_read,
+      flush,
     }
   }
 }
@@ -460,7 +486,10 @@ fn rename_one_name(
   to: &str,
 ) -> Reply {
   let Some((context, inode)) = names.first_beneath(from) else {
-    return Reply::RenamedName(None);
+    return Reply::RenamedName {
+      renamed: None,
+      more: false,
+    };
   };
   let result = ledger
     .rename_name(context, from, to)
@@ -468,7 +497,10 @@ fn rename_one_name(
   match result {
     Ok(name) => {
       names.opened(context, inode, &name);
-      Reply::RenamedName(Some(context))
+      Reply::RenamedName {
+        renamed: Some(context),
+        more: names.first_beneath(from).is_some(),
+      }
     }
     Err(error) => {
       slates_machine::log_line!("slates-winfsp: durable kernel rename refused: {error}");
@@ -611,6 +643,7 @@ fn bind(op: Op<u64>, ledger: &Ledger<SparseObject>) -> Result<Op<Open>, crate::o
     Op::Flush { object } => Op::Flush {
       object: ledger.get(object)?,
     },
+    Op::FlushVolume => Op::FlushVolume,
     Op::Cleanup { object, delete } => Op::Cleanup {
       object: ledger.get(object)?,
       delete,
@@ -628,6 +661,8 @@ pub struct Served {
   barrier: bool,
   echo: bool,
   restored_read: bool,
+  /// The request was a flush (of a handle, or of the volume): its success tells the caller its data is durable.
+  flush: bool,
 }
 
 impl Served {
@@ -646,6 +681,13 @@ impl Served {
   /// Whether the request succeeded and changed what survives a restart: its reply waits for the shard's publication.
   pub fn needs_barrier(&self) -> bool {
     self.barrier
+  }
+
+  /// Whether the reply tells its caller the data is durable: a flush that succeeded (`FlushFileBuffers` of a handle or
+  /// of the volume). On a live-shipped volume the shard holds it until `f` candidates hold what its barrier published
+  /// (§4.10, A-200), and answers [`Served::refuse_unpublished`]'s status if they do not.
+  pub fn claims_durability(&self) -> bool {
+    self.flush && !matches!(self.reply, Reply::Err(_))
   }
 
   /// The publication was refused: the reply becomes `STATUS_UNEXPECTED_IO_ERROR`, the effect being in the volume but not
@@ -840,6 +882,7 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
       bridge.flush(object.object, cx, object.fh)?;
       object_reply(&bridge.getattr(object.object, cx)?, 0)?
     }
+    Op::FlushVolume => Reply::Ok,
     Op::Cleanup { object, delete } => {
       if object.purge {
         Reply::Ok
@@ -1092,6 +1135,7 @@ fn call_on(requests: &SyncSender<Request>, wake: &Waker, op: Op<u64>) -> Reply {
       op,
       reply,
       hint: crate::dispatcher::current_hint(),
+      replayed: crate::dispatcher::replaying(),
     })
     .is_err()
   {
@@ -1139,8 +1183,11 @@ pub(crate) fn rename_open_names(
         to: to.to_owned(),
       },
     ) {
-      Reply::RenamedName(None) => return Ok(()),
-      Reply::RenamedName(Some(context)) if previous != Some(context) => previous = Some(context),
+      Reply::RenamedName { more: false, .. } => return Ok(()),
+      Reply::RenamedName {
+        renamed: Some(context),
+        more: true,
+      } if previous != Some(context) => previous = Some(context),
       Reply::Err(status) => {
         return Err(WinFspError::Api {
           call: "record kernel rename",
@@ -1495,13 +1542,17 @@ extern "C" fn write(
 }
 
 extern "C" fn flush(fs: *mut FileSystem, context: Pvoid, p_info: *mut FileInfo) -> Ntstatus {
-  // A volume flush passes a null context: every publication already covers the whole shard, so there is nothing
-  // further to make durable than each handle's own flush does.
-  if context.is_null() {
-    return STATUS_SUCCESS.as_i32();
-  }
-  // SAFETY: our file system and a live open-file context.
+  // SAFETY: our file system, and a live open-file context when it is not null.
   let handler = unsafe { handler(fs) };
+  // A volume flush passes a null context: the shard publishes, as every handle's flush makes it, and answers once that
+  // is durable (on a live-shipped volume, once `f` candidates hold it).
+  if context.is_null() {
+    return match handler.call(Op::FlushVolume) {
+      Reply::Ok => STATUS_SUCCESS.as_i32(),
+      Reply::Err(status) => status,
+      _ => crate::status_unsuccessful(),
+    };
+  }
   match handler.call(Op::Flush {
     object: context_key(context),
   }) {
@@ -2099,8 +2150,15 @@ pub enum Outcome {
   Purged(Purged),
   /// The receive worker ended before the mount was intentionally stopped.
   Failed(WinFspError),
-  /// The receive journal was settled before any fresh receive. The owner counts it; the taken-read oracle requires it.
-  Recovered(u64),
+  /// The receive journal was settled before any fresh receive: how many captured requests were answered, and how many
+  /// of those were a replayed Cleanup or Close the file system refused. The owner counts both; the taken-request
+  /// oracles require the first and the replayed-Close oracle requires the second to be zero.
+  Recovered {
+    /// Captured requests answered.
+    settled: u64,
+    /// Of those, the replayed Cleanups and Closes the file system refused.
+    refused: u64,
+  },
   /// The file system is unmounted and deleted; the thread is ending.
   Stopped,
 }
@@ -2257,9 +2315,10 @@ fn run_mount(
       .memory()
       .read(at, &mut captured)
       .map_err(|error| WinFspError::Ledger(crate::opens::Refusal::Memory(error)))?;
+    let mut scratch = crate::inflight::Scratch::new().map_err(WinFspError::Capture)?;
     let saved_open = crate::inflight::capture::Capture::new(&mut captured)
       .map_err(WinFspError::Capture)?
-      .resume()
+      .resume(&mut scratch)
       .map_err(WinFspError::Capture)?
       .map(|batch| batch.saved_open())
       .transpose()

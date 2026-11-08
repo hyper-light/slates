@@ -458,6 +458,27 @@ impl Stragglers {
     }
     (recovered, self.replies.iter().all(Option::is_none))
   }
+
+  /// Waits for every straggler to report, then returns what they brought back (as [`Stragglers::recover_replies`]) and
+  /// whether all have reported. For a caller about to end the task that made the dispatch: a straggler's request is a
+  /// child of that task, and a task's end cancels its children, so a request still in flight then is dropped with the
+  /// session in it and never reported, and the session's slot stays lent for good. Each request is bounded by its
+  /// dispatch's deadline, so this waits at most that. Checked once per timer tick, the finest park there is; a task off a
+  /// shard, which cannot be timed, gets what has come back so far and `false`.
+  pub async fn settle(&mut self) -> (Vec<(HostId, TimedReply, Endpoint)>, bool) {
+    let mut settled = Vec::new();
+    loop {
+      let (replies, done) = self.recover_replies();
+      settled.extend(replies);
+      if done {
+        return (settled, true);
+      }
+      // Shape: one tick of the shard's timer wheel (`sleep` rounds up to it).
+      if slates_rt::futures::sleep(1).await.is_err() {
+        return (settled, false);
+      }
+    }
+  }
 }
 
 /// Runs one request/reply on `endpoint` (its `request`), racing it against `deadline_ns`, and returns the
@@ -481,6 +502,7 @@ pub async fn request_within(
   deadline_ns: u64,
 ) -> (TimedReply, Endpoint) {
   let sent_ns = now_ns();
+  let before = endpoint.last_exchange();
   // A delivered reply is preferred over the deadline when both are ready; a deadline that cannot be armed
   // (off a shard) fails the exchange like a transport error, never as a timeout (AUD-29-39).
   let reply =
@@ -494,9 +516,7 @@ pub async fn request_within(
     // half-sent frames do not ride the next flush on this reused session and reach the peer folded into an
     // unrelated request (`docs/bugs/2026-09-10-abandoned-request-retransmit-lockstep.md`); the peer is told
     // to stop its reply (`StopSending`), and any late copy of it is dropped by the closed stream's tombstone.
-    if let Some(abandoned) = endpoint.last_exchange() {
-      endpoint.abandon(abandoned);
-    }
+    endpoint.abandon_begun_since(before);
   }
   // The round trip is measured only for an exchange the peer answered (Karn's rule): a reply that came
   // back is a sample of the path, however empty; a deadline or a transport error is not.
@@ -872,6 +892,35 @@ pub async fn commit_record_on(
   remote_holders: Vec<(HostId, Endpoint)>,
   budget: CommitBudget,
 ) -> Committed {
+  commit_record_sent_as(
+    stream,
+    owner,
+    owner_acceptor,
+    placement,
+    record,
+    record.encode(),
+    quorum,
+    remote_holders,
+    budget,
+  )
+  .await
+}
+
+/// [`commit_record_on`] with the bytes each holder is sent chosen by the caller (`sent`): a record class whose
+/// message carries more than the record — a green's merge record travels with the inputs it names (§4.16
+/// "Commit", one exchange a version) — while the acknowledgement still binds the record alone.
+#[allow(clippy::too_many_arguments)]
+pub async fn commit_record_sent_as(
+  stream: u64,
+  owner: HostId,
+  owner_acceptor: &mut Acceptor,
+  placement: &Placement,
+  record: &Record,
+  sent: Vec<u8>,
+  quorum: Quorum,
+  remote_holders: Vec<(HostId, Endpoint)>,
+  budget: CommitBudget,
+) -> Committed {
   let mut acked: Vec<HostId> = Vec::new();
   // The owner's local hold — it is a candidate among the holders (§4.8 "the owner among them").
   if owner_acceptor.accept(record).is_ok() && placement.candidates.contains(&owner) {
@@ -899,7 +948,7 @@ pub async fn commit_record_on(
   // bounds the wait itself (its progress-extension policy), so no deadline task is needed. Children of
   // the calling task, so they end with it (no orphans), and each is bounded by the dispatch's span.
   let (tx, mut rx) = reply_channel();
-  let record_bytes = record.encode();
+  let record_bytes = sent;
   let deadline_ns = budget.max_deadline_ns();
   let mut tasks = Vec::new();
   for (host, endpoint) in remote_holders {

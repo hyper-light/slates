@@ -112,6 +112,8 @@ pub(crate) fn with_writer<T>(
     Ok((handle, _)) => handle,
     Err(reply) => return Err(refusal_in(*reply)),
   };
+  // A CLI attachment is renewed by the verb, or refused once its term lapsed (A-230).
+  crate::verbs::use_attachment(state, attachment)?;
   let Some(catalog) = state.db.partition().attachment(attachment).cloned() else {
     return Err(Refusal::NotFound);
   };
@@ -119,6 +121,8 @@ pub(crate) fn with_writer<T>(
     || catalog.principal != *principal
     || !catalog.rights.write
     || catalog.snapshot.is_some()
+    // Another host's attachment serves only that host's forwards, and this node's only this node (A-222).
+    || !crate::remote_attach::may_use(state, &catalog)
   {
     return Err(Refusal::Forbidden {
       verb: verb.to_owned(),

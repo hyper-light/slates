@@ -645,9 +645,11 @@ impl Lane {
   }
 
   /// Replaces `path` in volume `id` with `bytes` through `slates write` on pod 0, under a write attachment made for
-  /// it and ended after it. Each `slates` run is a client of its own whose attachments end when it exits, so one is
-  /// never kept across runs (an attachment kept across the map leg's pod start was gone by its detach, measured
-  /// 2026-10-25 on adacachy: `NotFound`).
+  /// it and ended after it. Each `slates` run is a client of its own. Since A-230 the attachment `slates attach` makes
+  /// is a CLI attachment: it outlives that run for a term (the failover SLO), and the `write` and the `detach` that name
+  /// it next each renew it, so the three runs no longer race the reaper. Before, the reaper ended it with the
+  /// attaching run, and a detach after a slow write answered `NotFound` (2026-10-27). One is still never kept across
+  /// the map leg's pod start, which can outlast a term (measured 2026-10-25 on adacachy).
   fn write_through_slates(&self, id: &str, path: &str, bytes: &[u8]) -> Result<(), Failure> {
     let pod = format!("{RELEASE}-0");
     let attached = self.verb(&pod, &["attach", id, "--write"])?;

@@ -199,6 +199,27 @@ pub struct Diverged {
   pub kind: Divergence,
 }
 
+/// A walk of a volume's diverged set in progress (AC-1.10; §4.3 "Bounded work everywhere"): the directories still to
+/// judge and what was found so far, so a landing's plan steps the walk a directory a unit and never walks a large tree
+/// in one call. Over a snapshot (`Volume::diverged_walk_in`) its handles name frozen nodes; over the head they may go
+/// stale between units, and a stale one is passed over.
+#[derive(Debug)]
+pub struct DivergedWalk {
+  snapshot: Option<SnapshotId>,
+  stack: Vec<(String, Handle<DirNode>)>,
+  out: Vec<Diverged>,
+}
+
+impl DivergedWalk {
+  fn new(snapshot: Option<SnapshotId>, root: Handle<DirNode>) -> DivergedWalk {
+    DivergedWalk {
+      snapshot,
+      stack: vec![(String::new(), root)],
+      out: Vec::new(),
+    }
+  }
+}
+
 /// A clean file's verified content digest (§4.15): the BLAKE3 of the bytes the disk holds for an
 /// untouched base entry and their length, verified against the file's identity and fingerprint
 /// at the moment of export.
@@ -704,7 +725,7 @@ fn host_refusal(e: HostError) -> VfsError {
     HostError::NotDirectory => VfsError::NotDirectory,
     HostError::NotFile => VfsError::IsDirectory,
     HostError::StaleHandle => VfsError::StaleHandle,
-    HostError::Unavailable(errno) => VfsError::BaseUnavailable(errno),
+    HostError::Unavailable(errno) | HostError::OwnMount(errno) => VfsError::BaseUnavailable(errno),
   }
 }
 
@@ -759,91 +780,106 @@ impl Volume {
   }
 
   /// The diverged set (AC-1.10): witnessed, created, whiteouted and redirected entries, by
-  /// path, over the loaded nodes only (cost proportional to what the volume touched).
+  /// path, over the loaded nodes only (cost proportional to what the volume touched). [`DivergedWalk`] run to its end.
   pub fn diverged(&self, store: &Store) -> Vec<Diverged> {
-    let plane = self.base.as_ref();
-    self.diverged_from(
-      store,
-      self.root,
-      |no| plane.is_some_and(|b| b.is_witnessed(no)),
-      |no| {
-        matches!(
-          self.inode(store, no).map(|i| &i.body),
-          Ok(Body::Base(_) | Body::BaseLink(_))
-        )
-      },
-    )
+    let mut walk = self.diverged_walk();
+    loop {
+      if let Some(diverged) = self.diverged_unit(store, &mut walk) {
+        return diverged;
+      }
+    }
   }
 
   /// The diverged set as snapshot `id` froze it (A-48): its tree, its inode versions and the witnesses
-  /// it read, never the head's.
+  /// it read, never the head's. [`DivergedWalk`] run to its end.
   pub fn diverged_in(&self, store: &Store, id: SnapshotId) -> Result<Vec<Diverged>, VfsError> {
-    let (epoch, root) = self.snapshot_info(id)?;
-    let plane = self.base.as_ref();
-    Ok(self.diverged_from(
-      store,
-      root,
-      |no| plane.is_some_and(|b| b.witness_at(no, epoch).is_some()),
-      |no| {
-        matches!(
-          self.inode_in(store, id, no).map(|i| &i.body),
-          Ok(Body::Base(_) | Body::BaseLink(_))
-        )
-      },
-    ))
+    let mut walk = self.diverged_walk_in(id)?;
+    loop {
+      if let Some(diverged) = self.diverged_unit(store, &mut walk) {
+        return Ok(diverged);
+      }
+    }
   }
 
-  /// The diverged walk from `root`: `witnessed` and `is_base` answer for the tree walked (the head's or a
-  /// snapshot's).
-  fn diverged_from(
-    &self,
-    store: &Store,
-    root: Handle<DirNode>,
-    witnessed: impl Fn(InodeNo) -> bool,
-    is_base: impl Fn(InodeNo) -> bool,
-  ) -> Vec<Diverged> {
-    let mut out = Vec::new();
-    let mut stack = vec![(String::new(), root)];
-    while let Some((prefix, dir)) = stack.pop() {
-      let Ok(node) = store.dirs.get(dir) else {
-        continue;
+  /// A walk of the head's diverged set, stepped a directory a unit ([`Volume::diverged_unit`]). The head moves between
+  /// units, so a walk that must see one state walks a snapshot ([`Volume::diverged_walk_in`]).
+  pub fn diverged_walk(&self) -> DivergedWalk {
+    DivergedWalk::new(None, self.root)
+  }
+
+  /// A walk of snapshot `id`'s diverged set, stepped a directory a unit ([`Volume::diverged_unit`]).
+  pub fn diverged_walk_in(&self, id: SnapshotId) -> Result<DivergedWalk, VfsError> {
+    let (_, root) = self.snapshot_info(id)?;
+    Ok(DivergedWalk::new(Some(id), root))
+  }
+
+  /// One unit of `walk`: one directory's entries judged; the whole diverged set, sorted by path, once the last
+  /// directory is done. A directory gone meanwhile (a stale handle of a walk over the head) is passed over, as the
+  /// one-call walk passed it.
+  pub fn diverged_unit(&self, store: &Store, walk: &mut DivergedWalk) -> Option<Vec<Diverged>> {
+    let Some((prefix, dir)) = walk.stack.pop() else {
+      let mut out = std::mem::take(&mut walk.out);
+      out.sort_by(|a, b| a.path.cmp(&b.path));
+      return Some(out);
+    };
+    let plane = self.base.as_ref();
+    let epoch = walk
+      .snapshot
+      .and_then(|id| self.snapshot_info(id).ok())
+      .map(|(epoch, _)| epoch);
+    let witnessed = |no: InodeNo| match (walk.snapshot, epoch) {
+      (Some(_), Some(epoch)) => plane.is_some_and(|b| b.witness_at(no, epoch).is_some()),
+      (Some(_), None) => false,
+      (None, _) => plane.is_some_and(|b| b.is_witnessed(no)),
+    };
+    let is_base = |no: InodeNo| {
+      let body = match walk.snapshot {
+        Some(id) => self.inode_in(store, id, no).map(|i| &i.body),
+        None => self.inode(store, no).map(|i| &i.body),
       };
-      for e in node.iter(&store.blocks) {
-        let path = format!("{prefix}/{}", e.name);
-        match e.child {
-          Child::Whiteout => out.push(Diverged {
-            path,
-            kind: Divergence::Whiteout,
-          }),
-          Child::Dir(h) => {
-            if let Ok(child) = store.dirs.get(h) {
-              if let Some(kind) = directory_divergence(child) {
-                out.push(Diverged {
-                  path: path.clone(),
-                  kind,
-                });
-              }
-              stack.push((path, h));
+      matches!(body, Ok(Body::Base(_) | Body::BaseLink(_)))
+    };
+    let Ok(node) = store.dirs.get(dir) else {
+      return None;
+    };
+    let mut found = Vec::new();
+    let mut deeper = Vec::new();
+    for e in node.iter(&store.blocks) {
+      let path = format!("{prefix}/{}", e.name);
+      match e.child {
+        Child::Whiteout => found.push(Diverged {
+          path,
+          kind: Divergence::Whiteout,
+        }),
+        Child::Dir(h) => {
+          if let Ok(child) = store.dirs.get(h) {
+            if let Some(kind) = directory_divergence(child) {
+              found.push(Diverged {
+                path: path.clone(),
+                kind,
+              });
             }
+            deeper.push((path, h));
           }
-          Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
-            if witnessed(no) {
-              out.push(Diverged {
-                path,
-                kind: Divergence::Witnessed,
-              });
-            } else if !is_base(no) {
-              out.push(Diverged {
-                path,
-                kind: Divergence::Created,
-              });
-            }
+        }
+        Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
+          if witnessed(no) {
+            found.push(Diverged {
+              path,
+              kind: Divergence::Witnessed,
+            });
+          } else if !is_base(no) {
+            found.push(Diverged {
+              path,
+              kind: Divergence::Created,
+            });
           }
         }
       }
     }
-    out.sort_by(|a, b| a.path.cmp(&b.path));
-    out
+    walk.out.extend(found);
+    walk.stack.extend(deeper);
+    None
   }
 
   /// The fingerprint of the base entry a whiteout at `dir/name` hides, recorded at the
@@ -988,6 +1024,45 @@ impl Volume {
       plane.forget_witness(no, at);
     }
     descriptor
+  }
+}
+
+/// A pin in progress (§4.4 `pin`; [`Overlay::pin_unit`]): the directories still to list, by absolute path, and the
+/// files listed and not yet pinned, by inode number, so a walk stepped a slice at a time holds no handle between its
+/// slices. Its size is the walk's frontier: the subdirectories of the directories listed so far and the files of the
+/// last listing, never the tree.
+#[derive(Debug, Default)]
+pub struct PinWalk {
+  dirs: Vec<String>,
+  files: Vec<InodeNo>,
+  pinned: usize,
+}
+
+impl PinWalk {
+  /// A walk of the named subtrees, or of the whole base when none are named.
+  pub fn new(paths: Option<&[String]>) -> PinWalk {
+    let mut dirs: Vec<String> = paths.map_or_else(|| vec!["/".to_owned()], <[String]>::to_vec);
+    // Popped from the end: reversed, so the named subtrees are walked in the order named.
+    dirs.reverse();
+    PinWalk {
+      dirs,
+      files: Vec::new(),
+      pinned: 0,
+    }
+  }
+
+  /// The files pinned so far.
+  pub fn pinned(&self) -> usize {
+    self.pinned
+  }
+}
+
+/// The absolute path of `name` in the directory at `parent`.
+fn child_path(parent: &str, name: &str) -> String {
+  if parent.ends_with('/') {
+    format!("{parent}{name}")
+  } else {
+    format!("{parent}/{name}")
   }
 }
 
@@ -3639,47 +3714,57 @@ impl Overlay<'_> {
   }
 
   /// `pin`: read the named subtrees (the whole base when none are named) into the store and
-  /// witness them; cost proportional to what is pinned, reported as the entry count.
+  /// witness them; cost proportional to what is pinned, reported as the entry count. The whole walk at once, by
+  /// [`Overlay::pin_unit`] to its end; a daemon steps the same walk a slice at a time instead (§4.3).
   pub fn pin(&mut self, store: &mut Store, paths: Option<&[String]>) -> Result<usize, VfsError> {
-    let roots: Vec<String> = paths.map_or_else(|| vec!["/".to_owned()], <[String]>::to_vec);
-    let mut pinned = 0usize;
-    for path in roots {
-      let located = self.resolve(store, &path)?;
-      let mut stack = vec![located];
-      while let Some(l) = stack.pop() {
-        match l.child {
-          Child::Dir(h) => {
-            let rows: Vec<(Kind, InodeNo, String)> = self
-              .readdir(store, h)?
-              .iter()
-              .map(|r| (r.kind, r.inode, r.name.to_owned()))
-              .collect();
-            let h = self.vol.head_dir(store, h)?;
-            for (kind, no, name) in rows {
-              let child = match kind {
-                Kind::Dir => match self.vol.lookup(store, h, &name)?.child {
-                  Child::Dir(d) => Child::Dir(d),
-                  other => other,
-                },
-                Kind::File => Child::File(no),
-                Kind::Symlink => Child::Symlink(no),
-                Kind::Fifo => Child::Fifo(no),
-                Kind::Socket => Child::Socket(no),
-              };
-              stack.push(Located { child, inode: no });
-            }
-          }
-          Child::File(no) => {
-            self.copy_up(store, no, CopyUp::Content)?;
-            let size = self.vol.inode(store, no)?.attrs.size;
-            self.pin_windows(store, no, 0, size)?;
-            pinned = pinned.saturating_add(1);
-          }
-          Child::Symlink(_) | Child::Fifo(_) | Child::Socket(_) | Child::Whiteout => {}
-        }
+    let mut walk = PinWalk::new(paths);
+    loop {
+      if let Some(pinned) = self.pin_unit(store, &mut walk)? {
+        return Ok(pinned);
       }
     }
-    Ok(pinned)
+  }
+
+  /// One unit of a pin's walk: a file of a listed directory pinned (copied up whole and witnessed), else the next
+  /// directory listed (its files queued, its subdirectories queued by path). `Some(pinned)` once nothing is left. A
+  /// unit's work is one file or one listing, never a subtree, so a caller bounding its slices against the clock
+  /// overruns by one unit at most. The walk holds no handle between units: a directory is resolved again by its path
+  /// when its turn comes, so one copied on write by another verb between two slices is read as it now stands, and a
+  /// file by its inode number.
+  pub fn pin_unit(
+    &mut self,
+    store: &mut Store,
+    walk: &mut PinWalk,
+  ) -> Result<Option<usize>, VfsError> {
+    if let Some(no) = walk.files.pop() {
+      self.copy_up(store, no, CopyUp::Content)?;
+      let size = self.vol.inode(store, no)?.attrs.size;
+      self.pin_windows(store, no, 0, size)?;
+      walk.pinned = walk.pinned.saturating_add(1);
+      return Ok(None);
+    }
+    let Some(path) = walk.dirs.pop() else {
+      return Ok(Some(walk.pinned));
+    };
+    match self.resolve(store, &path)?.child {
+      Child::Dir(handle) => {
+        let rows: Vec<(Kind, InodeNo, String)> = self
+          .readdir(store, handle)?
+          .iter()
+          .map(|row| (row.kind, row.inode, row.name.to_owned()))
+          .collect();
+        for (kind, no, name) in rows {
+          match kind {
+            Kind::Dir => walk.dirs.push(child_path(&path, &name)),
+            Kind::File => walk.files.push(no),
+            Kind::Symlink | Kind::Fifo | Kind::Socket => {}
+          }
+        }
+      }
+      Child::File(no) => walk.files.push(no),
+      Child::Symlink(_) | Child::Fifo(_) | Child::Socket(_) | Child::Whiteout => {}
+    }
+    Ok(None)
   }
 
   // ------------------------------------------------- metadata copy-ups and by-inode verbs

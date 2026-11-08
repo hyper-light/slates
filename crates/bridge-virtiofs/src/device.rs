@@ -42,7 +42,7 @@ use std::fmt;
 use slates_bridge_core::{Bridge, OpContext};
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
 use slates_bridge_fuse::bridge::{
-  EIO, dispatch, needs_barrier, reclaim_unreported, reply_error, success_reply_bytes, takes_reply,
+  EIO, needs_barrier, reclaim_unreported, reply_error, success_reply_bytes, takes_reply,
 };
 use slates_bridge_fuse::init::{InitNegotiation, MAX_WRITE, negotiate};
 use slates_bridge_fuse::reply::ReplyHeader;
@@ -278,6 +278,58 @@ struct ToldHeld {
   since_ns: Option<u64>,
 }
 
+/// Where a held `FSYNC` reply's volume stands on durability (§4.10, A-200): its owner's barrier published a live-shipped
+/// volume, and the guest's `fsync` claims durability only once `f` candidates hold the log at the barrier's position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Durability {
+  /// The candidates hold it: the reply is published as served.
+  Durable,
+  /// Not yet: the reply stays held, within its bound.
+  Pending,
+  /// It never will be (the volume destroyed, its owner superseded): the reply is answered `EIO`.
+  Never,
+}
+
+/// An `FSYNC` or `FSYNCDIR` chain answered and past its barrier whose used element waits for the volume's live-shipped
+/// log to be durable where the barrier put it (§4.10, A-200; [`Device::settle_durable`]). Its reply is in the guest's
+/// buffers; past its bound, or once it never can be durable, it is answered `EIO` in its place, since a guest's `fsync`
+/// must not claim what no candidate holds. The device serves later chains meanwhile, as it does for [`ToldHeld`]. Bounded
+/// as those are, by the chains the driver has outstanding.
+#[derive(Debug)]
+struct DurableHeld {
+  queue: u16,
+  chain: DescriptorChain,
+  written: u32,
+  unique: u64,
+  /// The journal record the reply then waits to have been told through, as every reply does ([`ToldHeld`]).
+  owes: Option<u64>,
+  /// The log position it waits to be durable at.
+  target: u64,
+  /// When [`Device::settle_durable`] first saw it, the start of its bound; `None` until then.
+  since_ns: Option<u64>,
+}
+
+/// The oldest `FSYNC` reply held for durability ([`Device::durable_oldest`]): what the device loop waits on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DurableOldest {
+  /// The log position it waits to be durable at.
+  pub target: u64,
+  /// When its bound began; `None` before the first [`Device::settle_durable`] saw it.
+  pub since_ns: Option<u64>,
+}
+
+/// What one [`Device::settle_durable`] did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DurableSettled {
+  /// The held chains it published, each with whether its queue's driver asks to be interrupted. A chain it passed on to
+  /// wait for the volume's FUSE mounts is not among them.
+  pub completed: Vec<Completed>,
+  /// Replies released once their volume was durable, having waited at least one settle for it.
+  pub waited: u64,
+  /// Replies answered `EIO`: not durable within the bound, or never to be.
+  pub refused: u64,
+}
+
 /// The oldest reply held for the volume's FUSE mounts ([`Device::told_oldest`]): what the device loop waits on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ToldOldest {
@@ -300,14 +352,14 @@ pub struct ToldSettled {
 
 /// What `serve_dax` did with a FUSE_SETUPMAPPING / FUSE_REMOVEMAPPING (§4.6): not a DAX verb (dispatch answers),
 /// a reply already in the out buffer, or — for a SETUPMAPPING — the window asked for, which the device holds the chain
-/// for while the window's backing is filled and its pieces mapped (`crate::backed`).
+/// for while the window's backing is filled and its pieces mapped (`crate::backed`). Unix only, as `serve_dax` is.
+#[cfg(unix)]
 enum DaxServed {
   /// Not a DAX verb, or no window offered: the FUSE codec's dispatch answers.
   NotHandled,
   /// This many reply bytes are in the out buffer; scatter and publish as usual.
   Replied(usize),
   /// A SETUPMAPPING was taken: its chain is held for the fill and the placer's map.
-  #[cfg(unix)]
   MapHeld {
     /// The request's `unique`, which its reply carries.
     unique: u64,
@@ -505,6 +557,9 @@ pub struct Device {
   queues: Vec<Virtqueue>,
   request: Vec<u8>,
   reply: Vec<u8>,
+  /// The dirty-page write-back rule for this guest (§4.6 "Cache posture"): its stale cache write-backs are refused,
+  /// never applied over another path's newer write (`slates_bridge_fuse::guest_writeback`).
+  writeback: slates_bridge_fuse::guest_writeback::GuestWriteback,
   negotiated: Option<InitNegotiation>,
   fault: Option<DeviceError>,
   awaiting: Option<AwaitingBarrier>,
@@ -525,6 +580,9 @@ pub struct Device {
   /// The replies waiting for the volume's FUSE mounts, in the order they were served ([`ToldHeld`]). Bounded by the
   /// configured queues' sizes, the most chains a driver can have outstanding at once ([`Device::told_capacity`]).
   told: std::collections::VecDeque<ToldHeld>,
+  /// The `FSYNC` replies waiting for their live-shipped volume's durability, in the order they were served
+  /// ([`DurableHeld`]); bounded as [`Device::told`] is.
+  durable: std::collections::VecDeque<DurableHeld>,
 }
 
 impl fmt::Debug for Device {
@@ -546,6 +604,7 @@ impl Device {
       queues: Vec::new(),
       request: Vec::new(),
       reply: Vec::new(),
+      writeback: slates_bridge_fuse::guest_writeback::GuestWriteback::new(),
       negotiated: None,
       fault: None,
       awaiting: None,
@@ -556,6 +615,7 @@ impl Device {
       backed: crate::backed::BackedDax::default(),
       holds_for_told: false,
       told: std::collections::VecDeque::new(),
+      durable: std::collections::VecDeque::new(),
     }
   }
 
@@ -1035,13 +1095,14 @@ impl Device {
   /// published as served; otherwise the guest is answered `EIO` in its place — the effect is in the volume
   /// but not promised to survive, as a refused NFS publication — and what the reply granted is given back
   /// ([`reclaim_unreported`]), since the guest never learns it. The chain's charge is released either way.
-  /// `None` when no chain is held.
+  /// An `FSYNC` or `FSYNCDIR` whose barrier published a live-shipped volume not yet durable (`durable`, the log position
+  /// it must wait for) is held until it is ([`Device::settle_durable`]). `None` when no chain is held, or it is held.
   pub fn complete_awaiting(
     &mut self,
     memory: &mut dyn GuestMemory,
     bridge: &mut dyn Bridge,
     cx: &OpContext,
-    captured: bool,
+    (captured, durable): (bool, Option<u64>),
     admission: &mut dyn ChainAdmission,
   ) -> Result<Option<Completed>, DeviceError> {
     let Some(held) = self.awaiting.take() else {
@@ -1069,6 +1130,24 @@ impl Device {
       }
       written = u32::try_from(n).unwrap_or(u32::MAX);
       self.counters.barriers_refused = self.counters.barriers_refused.saturating_add(1);
+    }
+    // A guest's `fsync` of a live-shipped volume is answered once `f` candidates hold what its barrier published (A-200),
+    // as a FUSE mount's is: held here, the guest's later chains served meanwhile. Its reply reveals nothing a refill
+    // could change, so it waits for no refill.
+    if captured
+      && let Some(target) = durable
+      && matches!(held.opcode, Some(Opcode::FSync | Opcode::FSyncDir))
+    {
+      self.durable.push_back(DurableHeld {
+        queue: held.queue,
+        chain: held.chain,
+        written,
+        unique: held.unique,
+        owes: held.owes,
+        target,
+        since_ns: None,
+      });
+      return Ok(None);
     }
     #[cfg(unix)]
     if captured && self.refill_owed(bridge) {
@@ -1313,9 +1392,7 @@ impl Device {
     // A request whose success reply cannot fit the room the guest posted is not dispatched (AUD-29-85): its
     // effect — a created file, an open handle, a reference, changed bytes — would happen and its reply, naming
     // what it granted, would be lost. It is answered `EIO` below, with no effect.
-    let room_short = header
-      .as_ref()
-      .and_then(|h| Opcode::from_wire(h.opcode))
+    let room_short = opcode
       .and_then(success_reply_bytes)
       .is_some_and(|need| reply_room < need);
     let mut written = if room_short {
@@ -1333,7 +1410,9 @@ impl Device {
           &mut self.backed,
           &mut self.reply,
         ) {
-          DaxServed::NotHandled => dispatch(&self.request, bridge, cx, &mut self.reply),
+          DaxServed::NotHandled => self
+            .writeback
+            .serve(&self.request, bridge, cx, &mut self.reply),
           DaxServed::Replied(n) => n,
           // A SETUPMAPPING was taken: hold the chain while its window's backing is filled and its pieces mapped. No
           // reply is scattered now; the turn (and the message placer's acks) answer the guest.
@@ -1359,7 +1438,9 @@ impl Device {
       }
       #[cfg(not(unix))]
       {
-        dispatch(&self.request, bridge, cx, &mut self.reply)
+        self
+          .writeback
+          .serve(&self.request, bridge, cx, &mut self.reply)
       }
     };
     // A write-back the volume refused before this request is answered where its asker reads an answer, so a guest's
@@ -1442,6 +1523,83 @@ impl Device {
     counters.bytes_scattered = counters
       .bytes_scattered
       .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
+  }
+}
+
+/// The `FSYNC` replies that wait for their live-shipped volume's log to be durable (§4.10, A-200).
+impl Device {
+  /// The oldest `FSYNC` reply waiting for durability, if one does.
+  #[must_use]
+  pub fn durable_oldest(&self) -> Option<DurableOldest> {
+    self.durable.front().map(|held| DurableOldest {
+      target: held.target,
+      since_ns: held.since_ns,
+    })
+  }
+
+  /// How many `FSYNC` replies wait for durability now (non-vacuity for tests).
+  #[must_use]
+  pub fn durable_held(&self) -> usize {
+    self.durable.len()
+  }
+
+  /// Settles every held `FSYNC` reply whose volume is durable at its position (`durability`), never will be, or has
+  /// waited `bound_ns` since this settle first saw it, as of `now_ns`: a durable one is released as served, the others
+  /// answered `EIO` in its place, and either then waits for the volume's FUSE mounts as every reply does
+  /// ([`Device::settle_told`]). The rest stay held.
+  pub fn settle_durable(
+    &mut self,
+    memory: &mut dyn GuestMemory,
+    durability: &mut dyn FnMut(u64) -> Durability,
+    (now_ns, bound_ns): (u64, u64),
+    admission: &mut dyn ChainAdmission,
+  ) -> Result<DurableSettled, DeviceError> {
+    let mut settled = DurableSettled::default();
+    let mut index = 0;
+    while let Some(held) = self.durable.get_mut(index) {
+      let first_sight = held.since_ns.is_none();
+      let since = *held.since_ns.get_or_insert(now_ns);
+      let refuse = match durability(held.target) {
+        Durability::Durable => false,
+        Durability::Never => true,
+        Durability::Pending if now_ns.saturating_sub(since) >= bound_ns => true,
+        Durability::Pending => {
+          index = index.saturating_add(1);
+          continue;
+        }
+      };
+      let Some(held) = self.durable.remove(index) else {
+        break;
+      };
+      let mut written = held.written;
+      if refuse {
+        let mut refusal = [0u8; OUT_HEADER_LEN];
+        let n = ReplyHeader::write_error(held.unique, EIO, &mut refusal).unwrap_or(0);
+        if let Err(refused) = scatter(
+          memory,
+          &held.chain.writable,
+          refusal.get(..n).unwrap_or(&[]),
+        ) {
+          return Err(self.record_fault(refused));
+        }
+        written = u32::try_from(n).unwrap_or(u32::MAX);
+        settled.refused = settled.refused.saturating_add(1);
+      } else if !first_sight {
+        settled.waited = settled.waited.saturating_add(1);
+      }
+      if let Some(completed) = self.hold_or_publish(
+        memory,
+        (held.queue, &held.chain, written),
+        held.owes,
+        admission,
+      )? {
+        settled.completed.push(Completed {
+          refused: refuse,
+          ..completed
+        });
+      }
+    }
+    Ok(settled)
   }
 }
 

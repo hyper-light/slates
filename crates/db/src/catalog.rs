@@ -214,6 +214,20 @@ pub struct PolicyRecord {
   /// barrier is answered only once the owner and `f` of them hold it. False at creation; set by `LiveShip`.
   /// Appended.
   pub live_shipped: bool,
+  /// The holder set the volume's live shipper ships to, under its epoch (A-240): committed at `f + 1` through the
+  /// catalog register before the shipper's first entry, so a takeover counts phase one's reports from exactly the hosts
+  /// a durable entry is held by. `None` until a shipper commits one. Appended.
+  pub live_holders: Option<LiveHolders>,
+}
+
+/// A live shipper's holder set and the epoch it ships under (A-240): the `2f` candidates it ships to, as their host
+/// ids, fixed for the shipper's life.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct LiveHolders {
+  /// The shipper's epoch.
+  pub epoch: u64,
+  /// The hosts it ships to.
+  pub holders: Vec<u64>,
 }
 
 /// What the volume sits on (§4.15).
@@ -388,6 +402,23 @@ pub enum Consumer {
   /// the record's principal names. It ends with the device: the guest's hangup, a revocation, a detach, the
   /// volume's destroy, and the daemon's process (recovery ends it, as it ends a FUSE mount). Appended.
   Guest,
+  /// A client of another host, its attachment recorded on this owner (§4.10, A-222): `host` is the forwarding peer's
+  /// authenticated member id, never a claim of the request's. It ends with a detach routed by its volume, its host's
+  /// reap of `client` (`RemoteReap`), the host's retirement, and the volume's destroy; a silent holder's write lease
+  /// ends at its term (D-16). Appended.
+  Remote {
+    /// The member id of the client's host.
+    host: u64,
+    /// The client's id on that host.
+    client: u32,
+  },
+  /// A CLI attachment (§4.7, A-230): one a process makes and exits, for later processes to name, so it outlives the
+  /// client that made it. It holds a term, the failover SLO as the write lease's does, renewed by every verb that names
+  /// it, and ends at the term's lapse: an abandoned one releases its volume's write lease within one term. Appended.
+  Termed {
+    /// When its term lapses, on the shard's monotonic clock.
+    expires_ns: u64,
+  },
 }
 
 /// The form of an attachment. Append-only.
@@ -922,6 +953,22 @@ pub struct NfsPurgeRecord {
   pub session: Option<[u8; 16]>,
 }
 
+/// A volume name held at its name's partition for a volume another partition holds (§4.8 "Lookup", A-236): a clone
+/// lives beside its origin, for copy-on-write, while its name hashes elsewhere. The name's partition is where the name
+/// is looked up and where its uniqueness is decided, so it holds this alias, which points at the clone. An alias is
+/// reserved before the clone is made and confirmed after: a reserved one holds the name (a create of it is refused) but
+/// resolves nothing until confirmed, and a daemon's recovery confirms or releases every reserved one by asking the
+/// clone's partition whether the clone exists under this name.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct NameAliasRecord {
+  /// The name.
+  pub name: String,
+  /// The volume it names, on the partition its id encodes.
+  pub volume: VolumeId,
+  /// Whether the clone was made and the alias confirmed; until then the alias holds the name and resolves nothing.
+  pub confirmed: bool,
+}
+
 /// Format: the bytes of hyper-seal's wrapped key record (version, parent id, parent generation, AES-256-KW of the key;
 /// seal.md §3.3).
 pub const SEAL_KEY_RECORD_BYTES: usize = 61;
@@ -968,6 +1015,18 @@ pub enum SealKeyOwner {
     host: u64,
     /// The owner's partition.
     partition: u16,
+  },
+  /// A pair key an earlier incarnation of `host` delivered for `partition` (A-92 piece 4b), kept on this node's control
+  /// shard while a head or live log this node holds is still sealed under it, so the volumes of a node that came back
+  /// with fresh RAM at the same anchor (its keys gone, a new pair made) can still be taken over: `key` is its id, which
+  /// a head's key entry names as its wrapping key. Appended.
+  PairRetired {
+    /// The owner node.
+    host: u64,
+    /// The owner's partition.
+    partition: u16,
+    /// The retired key's id.
+    key: [u8; 16],
   },
 }
 

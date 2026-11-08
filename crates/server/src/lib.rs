@@ -56,11 +56,15 @@ pub mod dns;
 pub mod doorbell;
 pub mod error;
 pub mod fleet;
+mod forward_lane;
 mod fs_verbs;
 #[cfg(target_os = "linux")]
 mod fuse;
 #[cfg(target_os = "linux")]
 mod fuse_hold;
+// The macOS NFS mounts this daemon serves, recorded as its own (A-227).
+#[cfg(target_os = "macos")]
+mod own_nfs;
 // A writable direct map's copy that outlives its daemon: held by the anchor, taken back by the successor (A-197).
 mod checkout;
 pub mod head;
@@ -75,6 +79,7 @@ mod live_ship;
 mod member_task;
 pub mod merge_service;
 mod mirror;
+mod remote_attach;
 #[cfg(target_os = "linux")]
 mod write_log;
 // The Windows WinFsp transport (§4.6 "Windows"): a volume at a drive letter, served on its owner shard.
@@ -98,12 +103,17 @@ mod owner_location;
 mod staging;
 mod work_charge;
 pub mod work_files;
+mod work_log;
 // The container bind form of `attach` (§4.6 A-9): the host mount verified through the kernel's mount
 // table and the runtime-specification entry; paired per platform inside, so it compiles everywhere.
 pub mod oci;
 pub mod peer;
 mod reap;
+// Whether Windows Error Reporting writes this daemon full crash dumps (A-239): read, logged once and reported.
+pub mod local_dumps;
 pub mod seal_keys;
+// A client's session key (GAP-A9-9's threat model): what a client resuming under its id proves before its seat is served.
+pub mod session_key;
 mod snapshot_view;
 // The Shards fs transport (§4.6, the Shards route; A-161): a volume served to a Shards microVM over an anonymous
 // stream, on the volume's owning shard: a socket pair on Unix, a duplex named pipe on Windows served by the runtime's
@@ -123,6 +133,7 @@ pub mod tombstone;
 // on this host); pure over one platform seam, so it compiles and tests everywhere.
 pub mod transports;
 pub mod verbs;
+pub mod watchdog;
 // The virtio-fs guest transport (§4.6 A-9): a guest device served on the volume's owning shard; its
 // loop rides the runtime's Unix descriptor readiness, so it is gated like the NFS transport.
 #[cfg(unix)]

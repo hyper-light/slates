@@ -1,6 +1,7 @@
 //! Live shipping's log (§4.10 "Live shipping", A-200; §4.8 the register rules it rides): the owner of a
 //! `live-shipped` volume ships each of its publications to the volume's other candidates as a fenced, hash-chained log,
-//! and a publication is durable once the owner and `f` holders hold it. This module is the protocol alone — sans-io,
+//! and a publication is durable once the owner and enough holders hold it that every `f + 1` of them a takeover can count
+//! meets one and `f` failures leave a copy (`max(n − f, f)` of `n`: `f` of the usual `2f`). This module is the protocol alone — sans-io,
 //! deterministic, no clock — so the same code is the laptop (`f = 0`: no holders, every entry durable at once) and the
 //! fleet (R8), and the simulation in `crates/db/tests/live.rs` drives it under a nemesis.
 //!
@@ -21,7 +22,18 @@
 //! **Takeover.** Every holder reports its head under the new epoch; the successor adopts the greatest
 //! `(epoch, position)` among `f + 1` reports ([`adopt`]). Along any chain `(epoch, position)` only grows, and a durable
 //! entry is held by `f + 1` candidates, which meet any `f + 1` reports, so the adopted head extends every durable entry
-//! (NoLoss; Raft's up-to-date rule, thesis §3.6.1).
+//! (NoLoss; Raft's up-to-date rule, thesis §3.6.1). The `f + 1` are counted among the holders the shipper being taken
+//! over committed before its first entry (A-240), never among the members placed now: a member that joined after the
+//! writes holds none of them, and counted in a holder's place it let a stale head be adopted and a fenced-out owner's
+//! entry commit (10 of 400 seeds in `tests/live.rs`, 2026-11-06). Each shipper, a successor's too, commits its own
+//! holders before it ships.
+//!
+//! **Holder change.** The holders follow the volume's candidates by a joint transition, as Vertical Paxos changes a
+//! configuration (Lamport, Malkhi and Zhou, PODC 2009): [`Shipper::begin_transition`] ships to the old and the new set
+//! and counts a position durable only once `f` of each hold it; [`Shipper::transferred`] says the new set holds every
+//! durable entry and the head the shipper started from; the record may name it only then, and
+//! [`Shipper::activate`] switches once it does. Replacing the holders outright let a takeover count a set that held none
+//! of the durable entries (NoLoss broken in `tests/live.rs`, 2026-11-07).
 //!
 //! **Bounds.** The owner holds at most `credit` entries not yet durable ([`LiveError::NoCredit`] past it: the writer
 //! waits, AC-8.9) and retains at most `retain` entries for laggards; a holder behind the retained tail is installed.
@@ -56,6 +68,8 @@ const INSTALL_PREFIX_BYTES: usize =
 const TAG_INSTALL: u8 = 1;
 /// Format: a whole-state message's first byte: a takeover's fetch (successor to holder).
 const TAG_FETCH: u8 = 2;
+/// Format: a whole-state message's first byte: phase one's report (successor to holder; A-240).
+const TAG_REPORT: u8 = 3;
 /// Format: a reply's first byte: a head held, a holder with nothing, or a fence refusal.
 const REPLY_HEAD: u8 = 1;
 /// Format: see [`REPLY_HEAD`].
@@ -286,9 +300,14 @@ pub fn object_of_state(bytes: &[u8]) -> Option<ObjectId> {
       reader.word().ok()?;
       reader.object().ok()
     }
-    TAG_FETCH => reader.object().ok(),
+    TAG_FETCH | TAG_REPORT => reader.object().ok(),
     _ => None,
   }
+}
+
+/// Whether a whole-state message is a [`Report`] (phase one's question, A-240).
+pub fn is_report(bytes: &[u8]) -> bool {
+  bytes.first() == Some(&TAG_REPORT)
 }
 
 /// Whether a whole-state message is a [`Fetch`] (otherwise an [`Install`], or malformed).
@@ -332,6 +351,62 @@ impl Fetch {
       Err(LiveError::Malformed)
     }
   }
+}
+
+/// Phase one's question for a live volume (A-200, A-240): the successor asks a holder to raise its fence to `epoch` and
+/// report its head and how many bytes it keeps, nothing more. Every answer is a few bytes, so phase one runs within the
+/// liveness budget over any path; the log itself is fetched afterwards from the one holder adopted ([`Fetch`]), under a
+/// budget its reported bytes derive. Asked in one exchange, every holder's whole log missed a 1 s budget over KIND's
+/// shaped paths, and no takeover finished (run 42357611870, `wan`, `wan-loss` and `ceiling`, 2026-11-07).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Report {
+  /// The volume.
+  pub object: ObjectId,
+  /// The epoch the successor ships under.
+  pub epoch: HostEpoch,
+}
+
+impl Report {
+  /// The canonical bytes: its tag, the object, the epoch.
+  pub fn encode(&self) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(TAG_REPORT);
+    out.extend_from_slice(&self.object.0);
+    out.extend_from_slice(&self.epoch.0.to_le_bytes());
+    out
+  }
+
+  /// Parses bytes that crossed the network.
+  pub fn decode(bytes: &[u8]) -> Result<Report, LiveError> {
+    let mut reader = Reader { bytes };
+    if reader.byte()? != TAG_REPORT {
+      return Err(LiveError::Malformed);
+    }
+    let report = Report {
+      object: reader.object()?,
+      epoch: HostEpoch(reader.word()?),
+    };
+    if reader.bytes.is_empty() {
+      Ok(report)
+    } else {
+      Err(LiveError::Malformed)
+    }
+  }
+}
+
+/// A holder's answer to a [`Report`]: the bytes it keeps of the log, then its reply (the head, or the fence refusing a
+/// stale successor).
+pub fn encode_reported(reply: &Result<Option<Head>, LiveError>, kept: u64) -> Vec<u8> {
+  let mut out = kept.to_le_bytes().to_vec();
+  out.extend_from_slice(&encode_reply(reply));
+  out
+}
+
+/// Parses a holder's answer to a [`Report`]: its reply and the bytes it keeps.
+pub fn decode_reported(bytes: &[u8]) -> Result<(Result<Option<Head>, LiveError>, u64), LiveError> {
+  let mut reader = Reader { bytes };
+  let kept = reader.word()?;
+  Ok((decode_reply(reader.bytes), kept))
 }
 
 /// A holder's answer to a [`Fetch`]: its reply (the head, or the fence refusing a stale successor) and the payloads it
@@ -609,12 +684,24 @@ impl Replica {
   }
 }
 
-/// Phase one's choice (A-200): among the reports of at least `f + 1` candidates (each holder's head; `None` for one
-/// that holds nothing), the holder whose head ranks highest, and that head. `None` when too few reported, or when
-/// every report is empty (nothing was ever shipped).
-pub fn adopt(reports: &[(HostId, Option<Head>)], quorum: Quorum) -> Option<(HostId, Head)> {
+/// Phase one's choice (A-200, A-240): the holder whose head ranks highest among `reports` (each candidate's head;
+/// `None` for one that holds nothing), and that head, once at least `f + 1` of the reports come from `holders`, the
+/// holder set the shipper being taken over committed before its first entry. A durable entry is held by the owner and
+/// `W` of those `n` holders, and `W + f + 1 > n` ([`Shipper::reached_by`]), so `f + 1` of them meet every durable entry;
+/// a report from any other member (one that
+/// joined after the writes) counts for nothing, since it can stand in for a holder that was never asked. `None` when
+/// fewer than `f + 1` holders reported, or when every report is empty (nothing was ever shipped).
+pub fn adopt(
+  reports: &[(HostId, Option<Head>)],
+  holders: &[HostId],
+  quorum: Quorum,
+) -> Option<(HostId, Head)> {
   let needed = usize::try_from(quorum.f).ok()?.checked_add(1)?;
-  if reports.len() < needed {
+  let counted = reports
+    .iter()
+    .filter(|(host, _)| holders.contains(host))
+    .count();
+  if counted < needed {
     return None;
   }
   reports
@@ -647,6 +734,8 @@ pub struct Shipper {
   holders: Vec<HostId>,
   credit: u64,
   retain: usize,
+  /// The payload bytes kept for laggards beyond `retain` entries ([`Shipper::retain_up_to`]); zero keeps `retain` alone.
+  retain_bytes: usize,
   /// The head the owner started from (a takeover's adopted head), which it holds and every holder may report.
   start: Option<Head>,
   /// The owner's head: its last entry, or `start` before its first.
@@ -655,7 +744,7 @@ pub struct Shipper {
   retained: VecDeque<Entry>,
   /// What each holder holds on this chain, as last reported.
   held: BTreeMap<HostId, Head>,
-  /// The highest position held by the owner and `f` holders.
+  /// The highest position held by the owner and enough holders that every `f + 1` a takeover counts meet it.
   durable: Option<u64>,
   /// The head of the last whole state the owner shipped ([`Shipper::mark_checkpoint`]): on the chain, and what an
   /// install names, so a holder installed there is credited even once the retained tail no longer reaches it.
@@ -663,10 +752,13 @@ pub struct Shipper {
   /// The holders whose last answer said they need an install (off the chain, or behind the retained tail), until one
   /// answers with a head on the chain: [`Shipper::pending`] answers `Install` for them.
   owed_install: std::collections::BTreeSet<HostId>,
+  /// The holder set it is moving to ([`Shipper::begin_transition`]), sorted, until the record names it.
+  transition: Option<Vec<HostId>>,
 }
 
 impl Shipper {
-  /// The owner's side for `object` under `epoch`, shipping to `holders` (the other `2f` candidates), starting from
+  /// The owner's side for `object` under `epoch`, shipping to `holders` (the candidates other than the owner: `2f` of
+  /// them usually, `2f + 1` when the placement moved off the owner, fewer while a fleet forms), starting from
   /// `start` (`None` for a new volume; a takeover's adopted head otherwise). `credit` bounds the entries appended here
   /// that are not yet durable and `retain` the entries kept for laggards; each is at least one.
   pub fn new(
@@ -688,6 +780,7 @@ impl Shipper {
         .collect(),
       credit: credit.max(1),
       retain: retain.max(1),
+      retain_bytes: 0,
       start,
       head: start,
       retained: VecDeque::new(),
@@ -695,6 +788,7 @@ impl Shipper {
       durable: None,
       checkpoint: None,
       owed_install: std::collections::BTreeSet::new(),
+      transition: None,
     };
     shipper.durable = shipper.recompute_durable();
     shipper
@@ -715,8 +809,8 @@ impl Shipper {
     self.epoch
   }
 
-  /// The highest position the owner and `f` holders hold (`None`: none yet). A barrier covering an entry at or below
-  /// it may answer (A-200).
+  /// The highest position the owner and enough holders hold that every `f + 1` of them a takeover can count meets it
+  /// (`n − f` of `n` holders; `None`: none yet). A barrier covering an entry at or below it may answer (A-200).
   pub fn durable(&self) -> Option<u64> {
     self.durable
   }
@@ -724,6 +818,124 @@ impl Shipper {
   /// The holders it ships to.
   pub fn holders(&self) -> &[HostId] {
     &self.holders
+  }
+
+  /// The holder set it is moving to, while a transition is under way ([`Shipper::begin_transition`]).
+  pub fn transition(&self) -> Option<&[HostId]> {
+    self.transition.as_deref()
+  }
+
+  /// Every host it ships to: the holders, then the transition's members not among them.
+  pub fn targets(&self) -> impl Iterator<Item = HostId> + '_ {
+    let joining = self
+      .transition
+      .iter()
+      .flatten()
+      .filter(|host| !self.holders.contains(host));
+    self.holders.iter().chain(joining).copied()
+  }
+
+  /// Begins moving to `next` (the volume's other candidates as the configuration now names them; the owner is left
+  /// out; refused for a set of `f` or fewer, from which no takeover counts `f + 1`), a change of holder set in the manner of Vertical Paxos (Lamport, Malkhi and Zhou, PODC 2009): until the
+  /// record names `next` ([`Shipper::activate`]), the shipper ships to both sets and counts a position durable only once
+  /// `f` of each hold it, so a takeover counting either set meets every durable entry. A member of `next` is owed
+  /// everything it lacks (entries, or an install once the retained tail no longer reaches back). Whether the target
+  /// changed.
+  ///
+  /// A target that already holds every durable entry ([`Shipper::transferred`]) is kept until it is activated, since its
+  /// record may be in flight; before that a new target replaces it, and naming the holders again ends the transition.
+  /// Replacing the holders outright let a takeover count a new set that held none of the durable entries: 0 of `f`
+  /// common members at `f = 1` broke NoLoss in the model (`tests/live.rs`, 2026-11-07).
+  pub fn begin_transition(&mut self, next: &[HostId]) -> bool {
+    let named = self.named(next);
+    // A set of `f` or fewer members is never moved to: no takeover can count `f + 1` reports from it, so a log recorded
+    // on it could not be taken over, and while the record named it every write waited on its few members. The current
+    // holders keep making `W` with the members still alive. Moving to such a set (a candidate found dead leaves one
+    // other at `f = 1`) stalled writes for a partition's length when the lone member stopped before the move back was
+    // recorded (live-durability's rolling partition flow, 4 of 6 runs on each arch at 8b0f0341).
+    let tolerated = usize::try_from(self.quorum.f).unwrap_or(usize::MAX);
+    if tolerated > 0 && named.len() <= tolerated {
+      return false;
+    }
+    if self.transition.as_deref() == Some(named.as_slice())
+      || (self.transition.is_some() && self.transferred())
+    {
+      return false;
+    }
+    let mut active = self.holders.clone();
+    active.sort_unstable();
+    let changed = if named == active {
+      self.transition.take().is_some()
+    } else {
+      self.transition = Some(named);
+      true
+    };
+    self.forget_unnamed();
+    self.durable = self.recompute_durable();
+    changed
+  }
+
+  /// Whether the transition's target holds every durable entry: `f` of its members each hold the durable position and
+  /// the head the shipper started from (always, while neither exists). Only then may the record name it, and the shipper activate it. `false` with no
+  /// transition.
+  pub fn transferred(&self) -> bool {
+    let Some(next) = &self.transition else {
+      return false;
+    };
+    // A successor's start may hold writes made durable under the owner it took over, which its own durable position
+    // has not counted yet: the target holds them too before the record may name it. Without this a successor moved to
+    // a set disjoint from the old at once, and the next takeover adopted nothing (the model, f = 2, 2026-11-07).
+    let start = self.start.map(|start| start.position);
+    let Some(floor) = self.durable.max(start) else {
+      return true;
+    };
+    self
+      .reached_by(next)
+      .is_some_and(|reached| reached >= floor)
+  }
+
+  /// Ends the transition once the record names its target: `recorded` is the holder set the volume's record now holds.
+  /// Refused (`false`) unless it is the transition's target and that target holds every durable entry
+  /// ([`Shipper::transferred`]); from then on the shipper ships to it alone and counts durability over it alone.
+  pub fn activate(&mut self, recorded: &[HostId]) -> bool {
+    let named = self.named(recorded);
+    if self.transition.as_deref() != Some(named.as_slice()) || !self.transferred() {
+      return false;
+    }
+    self.holders = named;
+    self.transition = None;
+    self.forget_unnamed();
+    self.durable = self.recompute_durable();
+    true
+  }
+
+  /// `hosts` without the owner, sorted, each once.
+  fn named(&self, hosts: &[HostId]) -> Vec<HostId> {
+    let mut named: Vec<HostId> = hosts
+      .iter()
+      .copied()
+      .filter(|host| *host != self.owner)
+      .collect();
+    named.sort_unstable();
+    named.dedup();
+    named
+  }
+
+  /// Whether the shipper ships to `host` (a holder, or a member of the transition's target).
+  fn ships_to(&self, host: HostId) -> bool {
+    self.holders.contains(&host)
+      || self
+        .transition
+        .as_ref()
+        .is_some_and(|next| next.contains(&host))
+  }
+
+  /// Forgets what hosts it no longer ships to reported, and trims for those it does.
+  fn forget_unnamed(&mut self) {
+    let named: Vec<HostId> = self.targets().collect();
+    self.held.retain(|host, _| named.contains(host));
+    self.owed_install.retain(|host| named.contains(host));
+    self.trim();
   }
 
   /// The entries appended here that are not yet durable.
@@ -805,7 +1017,7 @@ impl Shipper {
   /// acknowledgement of every position up to it; a head off the chain or behind the retained tail draws an install; a
   /// fence above this epoch means the owner has been superseded.
   pub fn on_reply(&mut self, holder: HostId, reply: Result<Option<Head>, LiveError>) -> Next {
-    if !self.holders.contains(&holder) {
+    if !self.ships_to(holder) {
       return Next::Nothing;
     }
     let held = match reply {
@@ -864,7 +1076,7 @@ impl Shipper {
   /// every write it took waited (`live_fleet`, a write stuck 21 minutes; the model, driven as the daemon drives it,
   /// failed Convergence).
   pub fn pending(&self, holder: HostId) -> Next {
-    if self.head.is_none() || !self.holders.contains(&holder) {
+    if self.head.is_none() || !self.ships_to(holder) {
       return Next::Nothing;
     }
     if self.owed_install.contains(&holder) {
@@ -877,8 +1089,9 @@ impl Shipper {
     }
   }
 
-  /// Records `head` as the last whole state shipped: the entry at it carries the owner's whole state, which an install
-  /// sends to a holder off the chain or behind the retained tail. Ignored unless it is the owner's head now.
+  /// Records `head` as the last whole state made: the owner's whole state as of the entry at it (that entry itself when
+  /// it is whole, or an image of the state it left, made beside the log), which an install sends to a holder off the
+  /// chain or behind the retained tail. Ignored unless it is the owner's head now.
   pub fn mark_checkpoint(&mut self, head: Head) {
     if Some(head) == self.head {
       self.checkpoint = Some(head);
@@ -932,40 +1145,83 @@ impl Shipper {
     }
   }
 
-  /// Drops retained entries every holder holds, then the oldest past `retain` (a laggard behind them is installed).
+  /// Drops retained entries every host it ships to holds, then the oldest past `retain` (a laggard behind them is
+  /// installed).
   fn trim(&mut self) {
     let everyone = self
-      .holders
-      .iter()
-      .map(|holder| self.held.get(holder).map(|head| head.position))
+      .targets()
+      .map(|holder| self.held.get(&holder).map(|head| head.position))
       .min()
       .flatten();
+    let mut bytes = self
+      .retained
+      .iter()
+      .fold(0usize, |sum, entry| sum.saturating_add(entry.payload.len()));
     while let Some(oldest) = self.retained.front() {
       let held_by_all = everyone.is_some_and(|position| oldest.position <= position);
-      if held_by_all || self.retained.len() > self.retain {
-        self.retained.pop_front();
-      } else {
+      let over = self.retained.len() > self.retain && bytes > self.retain_bytes;
+      if !(held_by_all || over) {
         break;
       }
+      bytes = bytes.saturating_sub(oldest.payload.len());
+      self.retained.pop_front();
     }
   }
 
-  /// The highest position the owner and `f` holders hold: the `f`-th highest holder position, capped at the owner's
-  /// head. At `f = 0` the owner's head.
+  /// Keeps entries for laggards up to `bytes` of payload as well as the `retain` entries: whichever keeps more.
+  /// Derived (by the caller): `bytes` is the size of the whole state an install would send, the owner's last whole
+  /// record; then a laggard is sent the entries it lacks for as long as they cost no more than an install. Kept to a count alone, an owner writing faster than an install's
+  /// round trip left a holder it had just installed behind the tail again, and installed it again without end
+  /// (2026-11-06, `crates/cli/tests/live_chaos.rs`: 803 installs, 571 MB, in one run).
+  pub fn retain_up_to(&mut self, bytes: usize) {
+    self.retain_bytes = bytes;
+    self.trim();
+  }
+
+  /// The highest position the owner and enough holders hold, capped at the owner's head: over the holders, every `f + 1`
+  /// of them a takeover can count meet it ([`Shipper::reached_by`]); during a transition, the lower of that over the
+  /// holders and over the target, so a takeover counting either meets it. At `f = 0` the owner's head. It never falls:
+  /// an older answer arriving late, or a set where too few hold anything, leaves it where it was.
   fn recompute_durable(&self) -> Option<u64> {
     let own = self.head?.position;
-    let needed = usize::try_from(self.quorum.f).ok()?;
-    let Some(rank) = needed.checked_sub(1) else {
+    if self.quorum.f == 0 {
       return Some(own);
+    }
+    let reached = match &self.transition {
+      None => self.reached_by(&self.holders),
+      Some(next) => self
+        .reached_by(&self.holders)
+        .zip(self.reached_by(next))
+        .map(|(holders, next)| holders.min(next)),
     };
-    let mut positions: Vec<u64> = self
-      .holders
+    match (reached.map(|reached| reached.min(own)), self.durable) {
+      (Some(reached), Some(durable)) => Some(durable.max(reached)),
+      (reached, durable) => reached.or(durable),
+    }
+  }
+
+  /// The highest position held by `W = max(n − f, f)` of `set`'s `n` members: every `f + 1` of them a takeover's phase
+  /// one can count meets one holding it (`W + f + 1 > n`), and the owner and `W` holders are `f + 1` copies, which
+  /// survive `f` failures. `f` of `2f`; `f + 1` of `2f + 1` (a set without the owner, whose placement moved off it); all
+  /// `f` of `f`; never for fewer than `f`. `None` too while fewer hold anything. At `f = 0`, the owner's head (R8, the
+  /// same formula). Counting the `f`-th highest whatever the set's size let a write held by one of three holders count as
+  /// durable, and a successor counted the other two (raft-chaos, CI diag-20 run 7); `n − f` alone answered a write on the
+  /// owner and one holder at `f = 2` with three holders, two copies that `f` failures lose (raft's review).
+  fn reached_by(&self, set: &[HostId]) -> Option<u64> {
+    let tolerated = usize::try_from(self.quorum.f).ok()?;
+    if tolerated == 0 {
+      return self.head.map(|head| head.position);
+    }
+    if set.len() < tolerated {
+      return None;
+    }
+    let needed = set.len().saturating_sub(tolerated).max(tolerated);
+    let rank = needed.checked_sub(1)?;
+    let mut positions: Vec<u64> = set
       .iter()
       .filter_map(|holder| self.held.get(holder).map(|head| head.position))
       .collect();
     positions.sort_unstable_by(|a, b| b.cmp(a));
-    let reached = positions.get(rank).copied()?.min(own);
-    // Durability only advances: an older answer arriving late never lowers it.
-    Some(self.durable.map_or(reached, |durable| durable.max(reached)))
+    positions.get(rank).copied()
   }
 }

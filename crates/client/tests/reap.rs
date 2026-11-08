@@ -86,9 +86,11 @@ fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
 
 /// Resumes a session under `client_id`, retrying the rendezvous while the daemon settles.
 fn resume_when_free(instance: &str, client_id: u32) -> Result<Client, ClientError> {
+  // Whether the id is free is all this asks: the resume connects under it and sends nothing, so no key is proven.
   let session = Session {
     client_id,
     next_sequence: 1,
+    key: [0u8; slates_client::SESSION_KEY_BYTES],
   };
   let started = Instant::now();
   loop {

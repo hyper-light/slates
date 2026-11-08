@@ -3363,13 +3363,20 @@ impl Volume {
     crate::derive::derive(self, store, base)
   }
 
-  /// The op log records after a snapshot (the deriver's input).
+  /// The op log records after a snapshot (the deriver's input), every one of them: when retention has dropped any
+  /// record after the snapshot's sequence, what it recorded is unknown, so the read is refused
+  /// [`VfsError::JournalIncomplete`] rather than handing back part of the work as all of it (§4.16).
   pub fn records_since(&self, id: SnapshotId) -> Result<Vec<crate::journal::OpRecord>, VfsError> {
     let snap = self
       .snapshots
       .get(snapshot_handle(id))
       .map_err(|_| VfsError::StaleHandle)?;
     let seq = snap.seq;
+    let needed = seq.saturating_add(1);
+    let oldest = self.journal.oldest_seq();
+    if oldest > needed {
+      return Err(VfsError::JournalIncomplete { needed, oldest });
+    }
     Ok(self.journal.since(seq).cloned().collect())
   }
 
@@ -3759,6 +3766,12 @@ impl Volume {
       store.counters_low = true;
     }
     Ok(no)
+  }
+
+  /// The first inode number this volume has not issued: every number it can issue from now on is at or past it, so a
+  /// number below it names an inode made before now (A-231: the files a client may have cached before a takeover).
+  pub fn issued_below(&self) -> InodeNo {
+    InodeNo::compose(self.prefix, self.next_counter)
   }
 
   /// The counter a publication records for this volume (A-150): its counter plus the store's reserve, never below the

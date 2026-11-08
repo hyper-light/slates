@@ -20,10 +20,10 @@ use slates_wire::request::{ClientWindow, Seen};
 use crate::Art;
 use crate::catalog::{
   AttachmentRecord, AuditRecord, CompletionRecord, Consumer, ConsumerRecord, GrantRecord,
-  LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge, NfsCallRecord, NfsClientRecord,
-  NfsDelegationRecord, NfsLockRecord, NfsOpenRecord, NfsPurgeRecord, NfsSessionRecord, Principal,
-  SEAL_KEY_RECORD_BYTES, SEAL_RECIPIENT_RECORD_MAX, SealKeyOwner, SealKeyRecord, SnapshotId,
-  SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
+  LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge, NameAliasRecord, NfsCallRecord,
+  NfsClientRecord, NfsDelegationRecord, NfsLockRecord, NfsOpenRecord, NfsPurgeRecord,
+  NfsSessionRecord, Principal, SEAL_KEY_RECORD_BYTES, SEAL_RECIPIENT_RECORD_MAX, SealKeyOwner,
+  SealKeyRecord, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
 };
 use crate::error::DbError;
 use crate::op::Op;
@@ -128,6 +128,58 @@ pub struct PartitionSnapshot {
   pub nfs_calls: Vec<NfsCallRecord>,
   /// The NFSv4 purges this partition's shard owes its owners, not yet acknowledged by all (2026-10-10; appended).
   pub nfs_purges: Vec<NfsPurgeRecord>,
+  /// Each work volume's log since its last restatement (§4.16, D-18; 2026-11-04; appended).
+  pub work_logs: Vec<WorkLog>,
+  /// Each green's origin held as a reference to its base snapshot (A-217; 2026-11-05; appended).
+  pub green_origin_refs: Vec<GreenOriginRef>,
+  /// The names this partition holds for volumes other partitions hold, by name (A-236; appended).
+  pub name_aliases: Vec<NameAliasRecord>,
+  /// The CLI attachments whose term lapsed, oldest first (A-230; appended).
+  pub expired_attachments: Vec<u64>,
+  /// Each green's checkpoint (W3; §4.16; 2026-11-06; appended).
+  pub green_checkpoints: Vec<GreenCheckpoint>,
+}
+
+/// One green's checkpoint, as a snapshot carries it (W3; §4.16): the version it is the green's state at, and its
+/// encoding (`slates_merge::checkpoint`). The green's chain holds only the increments after `version`.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct GreenCheckpoint {
+  /// The green.
+  pub green: VolumeId,
+  /// The version it is the green's state at.
+  pub version: u64,
+  /// The encoded checkpoint.
+  pub bytes: Vec<u8>,
+}
+
+/// A green's origin as a reference (A-217): the base volume and snapshot it was walked from, and the BLAKE3 of the
+/// origin's canonical encoding, which a recovery's walk of the same snapshot must reproduce.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OriginRef {
+  /// The base volume.
+  pub volume: VolumeId,
+  /// The snapshot of it.
+  pub snapshot: SnapshotId,
+  /// The origin's identity.
+  pub identity: [u8; 32],
+}
+
+/// One green's origin reference, as a snapshot carries it.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GreenOriginRef {
+  /// The green.
+  pub green: VolumeId,
+  /// Its origin.
+  pub origin: OriginRef,
+}
+
+/// One work volume's log: what recovery replays onto the work, in order.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct WorkLog {
+  /// The work volume.
+  pub work: VolumeId,
+  /// The encoded entries, oldest first: at most one restatement, first, then edits and declarations.
+  pub entries: Vec<Vec<u8>>,
 }
 
 /// The partition.
@@ -154,15 +206,27 @@ pub struct Partition {
   landing_leases: Art<LandingLeaseRecord>,
   landings: BTreeMap<u64, LandingRecord>,
   audit: Vec<AuditRecord>,
-  /// Each green volume's merge chain (§4.16): its accepted increments, encoded, in commit order, so
-  /// recovery replays them to rebuild the green. Bounded by `green_chain_bytes` against the cap.
+  /// Each green volume's merge chain (§4.16): its accepted increments after its checkpoint (all of them while it holds
+  /// none), encoded, in commit order, so recovery replays them to rebuild the green. Bounded by `green_chain_bytes`
+  /// against the cap.
   green_chains: BTreeMap<VolumeId, Vec<Vec<u8>>>,
+  /// Each checkpointed green's checkpoint (W3; §4.16): its version and its encoding, held in place of every increment
+  /// up to that version. Counted in `green_chain_bytes` against the same cap. Removed with the green.
+  green_checkpoints: BTreeMap<VolumeId, (u64, Vec<u8>)>,
   /// Each base-seeded green's origin (§4.16): its version-0 state, encoded, replayed before its
   /// chain on recovery. Counted in `green_chain_bytes` against the same cap.
   green_origins: BTreeMap<VolumeId, Vec<u8>>,
-  /// The total bytes held across all green chains, so a new increment can be refused at the cap
-  /// before it is appended (bounded growth; checkpointing to fold old chain entries is owed).
+  /// The total bytes held across all green chains, origins and checkpoints, so a new increment can be refused at the
+  /// cap before it is appended (bounded growth; a checkpoint folds the increments up to it, W3). The work logs count
+  /// here too: one merge byte budget per partition.
   green_chain_bytes: usize,
+  /// Each work volume's log since its last restatement (§4.16, D-18): what recovery replays onto the work so an
+  /// acknowledged edit survives a daemon restart. Counted in `green_chain_bytes` against the same cap; a work's
+  /// restatement (an accepted submit, a rebase) replaces its log, and its destroy reclaims it.
+  work_logs: BTreeMap<VolumeId, Vec<Vec<u8>>>,
+  /// Each green's origin held as a reference to its base snapshot (A-217): a few dozen bytes a green, whatever its
+  /// tree, where `green_origins` held the whole tree's bytes. Removed with the green.
+  green_origin_refs: BTreeMap<VolumeId, OriginRef>,
   /// The NFSv4 file state and clients (§4.6 A-37), each bounded before any operation is issued: the
   /// owner's file state bounds its opens and locks, the listener's session table its clients, and a
   /// replay reproduces only what they admitted.
@@ -178,6 +242,12 @@ pub struct Partition {
   /// The purges this shard owes its owners (2026-10-10): one per client dropped or session destroyed here and not yet
   /// acknowledged by every owner, bounded by the drops a round could not settle.
   nfs_purges: BTreeSet<NfsPurgeRecord>,
+  /// The names this partition holds for volumes other partitions hold (A-236): at most one a name, and at most
+  /// `caps.volumes` of them, since each stands for a volume another partition holds under the same cap.
+  name_aliases: BTreeMap<String, NameAliasRecord>,
+  /// The CLI attachments whose term lapsed, oldest first (A-230), so a later use is refused as expired rather than as
+  /// unknown. At most `caps.attachments` of them: the oldest leaves when a lapse would pass it.
+  expired_attachments: std::collections::VecDeque<u64>,
   nfs_instance: u32,
   /// The destroyed volumes whose tombstone this owner still owes its candidate holders (AUD-29-43), by volume,
   /// each with the register sequence it is written at. A tombstone keeps its volume's slot of the volume
@@ -231,6 +301,8 @@ impl Partition {
       nfs_sessions: BTreeMap::new(),
       nfs_calls: BTreeMap::new(),
       nfs_purges: BTreeSet::new(),
+      name_aliases: BTreeMap::new(),
+      expired_attachments: std::collections::VecDeque::new(),
       nfs_instance: 0,
       landing_leases: Art::new(),
       landings: BTreeMap::new(),
@@ -238,6 +310,9 @@ impl Partition {
       green_chains: BTreeMap::new(),
       green_origins: BTreeMap::new(),
       green_chain_bytes: 0,
+      work_logs: BTreeMap::new(),
+      green_origin_refs: BTreeMap::new(),
+      green_checkpoints: BTreeMap::new(),
       tombstones: BTreeMap::new(),
     }
   }
@@ -281,10 +356,91 @@ impl Partition {
     self.caps
   }
 
-  /// A green volume's merge chain (§4.16): its accepted increments, encoded, in commit order. Empty
-  /// for a green with no committed version and for any non-green volume.
+  /// A green volume's merge chain (§4.16): its accepted increments after its checkpoint
+  /// ([`Partition::green_checkpoint`]; all of them while it holds none), encoded, in commit order, so the chain's
+  /// entry `n` is version `checkpoint + n + 1`. Empty for a green with no version past its checkpoint and for any
+  /// non-green volume.
   pub fn green_chain(&self, green: VolumeId) -> &[Vec<u8>] {
     self.green_chains.get(&green).map_or(&[], Vec::as_slice)
+  }
+
+  /// A green's checkpoint (W3; §4.16): the version it is the green's state at and its encoding, or `None` while the
+  /// green holds none (and for any non-green volume).
+  pub fn green_checkpoint(&self, green: VolumeId) -> Option<(u64, &[u8])> {
+    self
+      .green_checkpoints
+      .get(&green)
+      .map(|(version, bytes)| (*version, bytes.as_slice()))
+  }
+
+  /// A green's head as its durable records hold it: its checkpoint's version and the increments after it.
+  pub fn green_head(&self, green: VolumeId) -> u64 {
+    let held = self
+      .green_checkpoints
+      .get(&green)
+      .map_or(0, |(version, _)| *version);
+    let chained = u64::try_from(self.green_chain(green).len()).unwrap_or(u64::MAX);
+    held.saturating_add(chained)
+  }
+
+  /// What a checkpoint at `version` folds of `green`'s records: the increments it drops and the bytes it releases (the
+  /// increments and the checkpoint it replaces), or the refusal when `version` is not past the checkpoint held or is
+  /// past the head (W3).
+  fn checkpoint_folds(&self, green: VolumeId, version: u64) -> Result<(usize, usize), DbError> {
+    let (held, held_bytes) = self
+      .green_checkpoints
+      .get(&green)
+      .map_or((0, 0), |(held, bytes)| (*held, bytes.len()));
+    let chain = self.green_chain(green);
+    let out_of_range = DbError::CheckpointOutOfRange {
+      version,
+      held,
+      head: self.green_head(green),
+    };
+    let folded = version
+      .checked_sub(held)
+      .filter(|folded| *folded > 0)
+      .and_then(|folded| usize::try_from(folded).ok())
+      .filter(|folded| *folded <= chain.len())
+      .ok_or(out_of_range)?;
+    let dropped: usize = chain.iter().take(folded).map(Vec::len).sum();
+    Ok((folded, dropped.saturating_add(held_bytes)))
+  }
+
+  /// The check of a green's checkpoint (W3): the green exists, the version is in range, and the bytes fit the merge
+  /// budget. A checkpoint no larger than what it releases is admitted at any fill, so a partition at its cap can
+  /// always fold back under it.
+  fn check_green_checkpoint(
+    &self,
+    green: VolumeId,
+    version: u64,
+    bytes: usize,
+  ) -> Result<(), DbError> {
+    self.volume(green).ok_or(DbError::NotFound)?;
+    let (_, released) = self.checkpoint_folds(green, version)?;
+    if bytes <= released {
+      return Ok(());
+    }
+    self.merge_bytes_fit(released, bytes)
+  }
+
+  /// Applies a green's checkpoint (W3): drops the increments up to its version and the checkpoint it replaces, and
+  /// holds it. Unconditional, as every apply is: a version the check would refuse folds nothing it does not hold.
+  fn apply_green_checkpoint(&mut self, green: VolumeId, version: u64, bytes: &[u8]) {
+    let (folded, released) = self.checkpoint_folds(green, version).unwrap_or((0, 0));
+    if let Some(chain) = self.green_chains.get_mut(&green) {
+      chain.drain(..folded.min(chain.len()));
+      if chain.is_empty() {
+        self.green_chains.remove(&green);
+      }
+    }
+    self.green_chain_bytes = self
+      .green_chain_bytes
+      .saturating_sub(released)
+      .saturating_add(bytes.len());
+    self
+      .green_checkpoints
+      .insert(green, (version, bytes.to_vec()));
   }
 
   /// A green volume's encoded origin (§4.16), or `None` for a green that started from scratch
@@ -299,6 +455,21 @@ impl Partition {
   pub fn volume(&self, id: VolumeId) -> Option<&VolumeRecord> {
     let h = *self.by_id.get(&id.bytes)?;
     self.volumes.get(h).ok()
+  }
+
+  /// Whether attachment `id` was a CLI attachment whose term lapsed (A-230), among the most recent the partition keeps.
+  pub fn attachment_expired(&self, id: u64) -> bool {
+    self.expired_attachments.contains(&id)
+  }
+
+  /// The alias this partition holds for `name`, if any (A-236): a name another partition's volume holds.
+  pub fn name_alias(&self, name: &str) -> Option<&NameAliasRecord> {
+    self.name_aliases.get(name)
+  }
+
+  /// Every alias this partition holds, by name (A-236): what a recovery reconciles.
+  pub fn name_aliases(&self) -> impl Iterator<Item = &NameAliasRecord> {
+    self.name_aliases.values()
   }
 
   /// A volume by name.
@@ -368,6 +539,22 @@ impl Partition {
       .filter(
         |(_, a)| matches!(a.principal, Principal::Consumer { consumer: c, .. } if c == consumer),
       )
+      .map(|(_, a)| a)
+      .collect()
+  }
+
+  /// Every attachment this partition holds, in slab order: what a sweep over all of them walks (A-230's lapse).
+  pub fn attachments(&self) -> impl Iterator<Item = &AttachmentRecord> {
+    self.attachments.iter().map(|(_, record)| record)
+  }
+
+  /// The attachments other hosts' clients hold here (§4.10, A-222: those of a host that left the configuration end).
+  /// A walk of the table, bounded by its cap; a configuration's install asks, never a hot path.
+  pub fn remote_attachments(&self) -> Vec<&AttachmentRecord> {
+    self
+      .attachments
+      .iter()
+      .filter(|(_, a)| matches!(a.consumer, Consumer::Remote { .. }))
       .map(|(_, a)| a)
       .collect()
   }
@@ -537,6 +724,11 @@ impl Partition {
     self.seal_keys.get(owner)
   }
 
+  /// Every sealing key recorded at this partition, by owner.
+  pub fn seal_keys(&self) -> impl Iterator<Item = &SealKeyRecord> {
+    self.seal_keys.values()
+  }
+
   /// Applies one NFSv4 record operation (A-37): an upsert, a clear, or a client's purge.
   fn apply_nfs(&mut self, op: &Op) {
     match op {
@@ -649,6 +841,41 @@ impl Partition {
 
   // ------------------------------------------------------------------ the guard
 
+  /// [`Partition::check`] for a name alias (A-236) and a CLI attachment's term (A-230).
+  fn check_alias_or_term(&self, op: &Op) -> Result<(), DbError> {
+    match op {
+      // A name is held once on its partition: by a volume there, or by one alias for another partition's volume.
+      Op::NameAliasReserved { record } => {
+        if let Some(existing) = self.volume_by_name(&record.name) {
+          return Err(DbError::AlreadyExists {
+            existing: existing.id.bytes,
+          });
+        }
+        if let Some(alias) = self.name_alias(&record.name) {
+          return Err(DbError::AlreadyExists {
+            existing: alias.volume.bytes,
+          });
+        }
+        if self.name_aliases.len() >= self.caps.volumes {
+          return Err(DbError::Capacity {
+            table: "name aliases",
+          });
+        }
+        Ok(())
+      }
+      Op::NameAliasConfirmed { name } | Op::NameAliasReleased { name } => {
+        self.name_alias(name).map(|_| ()).ok_or(DbError::NotFound)
+      }
+      // Only a CLI attachment holds a term.
+      Op::AttachmentRenewed { id, .. } | Op::AttachmentExpired { id } => match self.attachment(*id)
+      {
+        Some(record) if matches!(record.consumer, Consumer::Termed { .. }) => Ok(()),
+        _ => Err(DbError::NotFound),
+      },
+      _ => Ok(()),
+    }
+  }
+
   /// The guard the live path runs before appending: refuses what the log must never record.
   pub fn check(&self, op: &Op, now_ns: u64) -> Result<(), DbError> {
     match op {
@@ -661,6 +888,12 @@ impl Partition {
         if let Some(existing) = self.volume_by_name(&record.name) {
           return Err(DbError::AlreadyExists {
             existing: existing.id.bytes,
+          });
+        }
+        // A name this partition holds for another partition's volume is that volume's (A-236), confirmed or not.
+        if let Some(alias) = self.name_alias(&record.name) {
+          return Err(DbError::AlreadyExists {
+            existing: alias.volume.bytes,
           });
         }
         if self.tombstones.contains_key(&record.id) {
@@ -702,6 +935,7 @@ impl Partition {
       | Op::VolumeHeadAdvanced { id, .. }
       | Op::AccessChanged { id, .. }
       | Op::LiveShippingChanged { id, .. }
+      | Op::LiveHoldersCommitted { id, .. }
       | Op::VolumeRebased { id, .. } => self.volume(*id).map(|_| ()).ok_or(DbError::NotFound),
       Op::SnapshotTaken { record } => {
         self.volume(record.volume).ok_or(DbError::NotFound)?;
@@ -779,6 +1013,11 @@ impl Partition {
       | Op::NfsCallsCleared { .. }
       | Op::NfsPurgeOwed { .. }
       | Op::NfsPurgeSettled { .. } => Ok(()),
+      Op::NameAliasReserved { .. }
+      | Op::NameAliasConfirmed { .. }
+      | Op::NameAliasReleased { .. }
+      | Op::AttachmentRenewed { .. }
+      | Op::AttachmentExpired { .. } => self.check_alias_or_term(op),
       // A key is made once: a second record for its owner would leave two keys sealing one owner's content. A record
       // is hyper-seal's fixed length, so a malformed one never enters the log.
       Op::SealKeySet { record } => {
@@ -856,7 +1095,7 @@ impl Partition {
         self.volume(*green).ok_or(DbError::NotFound)?;
         // Bounded growth (§4.16; CLAUDE.md): the chain grows per accepted version, so a new increment
         // is refused once the partition's green chains would exceed their byte budget — the typed
-        // refusal at the bound, until checkpointing folds old chain entries (owed).
+        // refusal at the bound; a checkpoint (W3) folds the increments below the reachable floor.
         if self.green_chain_bytes.saturating_add(increment.len()) > self.caps.green_chain_bytes {
           return Err(DbError::Capacity {
             table: "green_chains",
@@ -864,11 +1103,40 @@ impl Partition {
         }
         Ok(())
       }
+      Op::WorkLogged { work, entry } => {
+        self.volume(*work).ok_or(DbError::NotFound)?;
+        self.merge_bytes_fit(0, entry.len())
+      }
+      Op::GreenOriginHeld { green, origin } => {
+        self.volume(*green).ok_or(DbError::NotFound)?;
+        self
+          .snapshot(origin.volume, origin.snapshot)
+          .ok_or(DbError::NotFound)?;
+        // Version 0, recorded once and only before any increment, whatever form the origin takes.
+        if self.green_origins.contains_key(green)
+          || self.green_origin_refs.contains_key(green)
+          || self.green_head(*green) > 0
+        {
+          return Err(DbError::AlreadyExists {
+            existing: green.bytes,
+          });
+        }
+        Ok(())
+      }
+      Op::WorkRestated { work, entry } => {
+        self.volume(*work).ok_or(DbError::NotFound)?;
+        self.merge_bytes_fit(self.work_log_bytes(*work), entry.len())
+      }
+      Op::GreenCheckpointed {
+        green,
+        version,
+        checkpoint,
+      } => self.check_green_checkpoint(*green, *version, checkpoint.len()),
       Op::GreenOriginated { green, origin } => {
         self.volume(*green).ok_or(DbError::NotFound)?;
         // An origin is version 0: recorded once, and only before any increment — a chain that has
         // advanced was based on whatever origin it had, so a later origin would rewrite history.
-        if self.green_origins.contains_key(green) || !self.green_chain(*green).is_empty() {
+        if self.green_origins.contains_key(green) || self.green_head(*green) > 0 {
           return Err(DbError::AlreadyExists {
             existing: green.bytes,
           });
@@ -913,15 +1181,21 @@ impl Partition {
     }
   }
 
-  /// One holder per target, whoever asks (§4.15 step 4; AUD-29-03): a take is refused while the current
-  /// lease is unexpired — even by its own holder, whose id names one landing attempt and is not a renewal —
-  /// and a lease's fencing generation never goes backwards. Before 2026-09-29 the same holder could take an
-  /// unexpired lease again; no path wrote these records then.
+  /// One holder per target (§4.15 step 4; AUD-29-03): a take by another attempt is refused while the current
+  /// lease is unexpired, and a lease's fencing generation never goes backwards. The holder is one landing attempt,
+  /// so its own take of a live lease is that attempt's renewal (the keepalive, AUD-29-25). Before 2026-09-29 the
+  /// holder was the caller's session, so two landings of one principal took each other's lease; from then until
+  /// 2026-11-07 the attempt's own renewal was refused while its lease held, so it only renewed once lapsed.
   fn check_landing_lease(&self, record: &LandingLeaseRecord, now_ns: u64) -> Result<(), DbError> {
     match self.landing_lease(&record.target) {
-      Some(held) if held.expires_ns > now_ns => Err(DbError::LeaseHeld {
-        epoch: held.generation,
-      }),
+      // A live lease is its holder's: another attempt is refused, and the holder itself takes it again to renew it
+      // (§4.15 "The lease keepalive", AUD-29-25) under the newer generation the next arm requires. Before 2026-11-07
+      // the holder was refused too, so a running landing's renewal only succeeded once its lease had lapsed.
+      Some(held) if held.expires_ns > now_ns && held.holder != record.holder => {
+        Err(DbError::LeaseHeld {
+          epoch: held.generation,
+        })
+      }
       Some(held) if record.generation <= held.generation => Err(DbError::StaleLease {
         current: held.generation,
       }),
@@ -964,6 +1238,11 @@ impl Partition {
       // The catalog register carries the flag (a successor keeps shipping), so its version moves as an access change's.
       Op::LiveShippingChanged { id, live_shipped } => self.update_volume(*id, |v| {
         v.policy.live_shipped = *live_shipped;
+        v.catalog_version = v.catalog_version.saturating_add(1);
+      }),
+      // The catalog register carries the holder set (A-240), so its version moves as the flag's does.
+      Op::LiveHoldersCommitted { id, holders } => self.update_volume(*id, |v| {
+        v.policy.live_holders = Some(holders.clone());
         v.catalog_version = v.catalog_version.saturating_add(1);
       }),
       Op::VolumeDestroyed { id } => {
@@ -1063,6 +1342,41 @@ impl Partition {
         self.apply_nfs(op);
         Ok(())
       }
+      Op::AttachmentRenewed { id, expires_ns } => {
+        let h = *self
+          .attachment_index
+          .get(&id.to_be_bytes())
+          .ok_or(DbError::NotFound)?;
+        let record = self.attachments.get_mut(h).map_err(|_| DbError::NotFound)?;
+        record.consumer = Consumer::Termed {
+          expires_ns: *expires_ns,
+        };
+        Ok(())
+      }
+      Op::AttachmentExpired { id } => {
+        self.remove_attachment(*id)?;
+        if self.expired_attachments.len() >= self.caps.attachments.max(1) {
+          self.expired_attachments.pop_front();
+        }
+        self.expired_attachments.push_back(*id);
+        Ok(())
+      }
+      Op::NameAliasReserved { record } => {
+        self
+          .name_aliases
+          .insert(record.name.clone(), record.clone());
+        Ok(())
+      }
+      Op::NameAliasConfirmed { name } => {
+        let alias = self.name_aliases.get_mut(name).ok_or(DbError::NotFound)?;
+        alias.confirmed = true;
+        Ok(())
+      }
+      Op::NameAliasReleased { name } => self
+        .name_aliases
+        .remove(name)
+        .map(|_| ())
+        .ok_or(DbError::NotFound),
       Op::SealKeySet { record } => {
         self.seal_keys.insert(record.owner, record.clone());
         Ok(())
@@ -1225,7 +1539,72 @@ impl Partition {
         self.green_origins.insert(*green, origin.clone());
         Ok(())
       }
+      Op::GreenOriginHeld { green, origin } => {
+        self.green_origin_refs.insert(*green, *origin);
+        Ok(())
+      }
+      Op::WorkLogged { work, entry } => {
+        self.green_chain_bytes = self.green_chain_bytes.saturating_add(entry.len());
+        self.work_logs.entry(*work).or_default().push(entry.clone());
+        Ok(())
+      }
+      Op::WorkRestated { work, entry } => {
+        let released = self.work_log_bytes(*work);
+        self.green_chain_bytes = self
+          .green_chain_bytes
+          .saturating_sub(released)
+          .saturating_add(entry.len());
+        self.work_logs.insert(*work, vec![entry.clone()]);
+        Ok(())
+      }
+      Op::GreenCheckpointed {
+        green,
+        version,
+        checkpoint,
+      } => {
+        self.apply_green_checkpoint(*green, *version, checkpoint);
+        Ok(())
+      }
     }
+  }
+
+  /// The bytes a work's log holds now.
+  fn work_log_bytes(&self, work: VolumeId) -> usize {
+    self
+      .work_logs
+      .get(&work)
+      .map_or(0, |log| log.iter().map(Vec::len).sum())
+  }
+
+  /// Whether replacing `released` bytes of the merge budget with `added` keeps it within the partition's cap: the
+  /// typed refusal at the bound otherwise (bounded growth, CLAUDE.md banned item 8).
+  fn merge_bytes_fit(&self, released: usize, added: usize) -> Result<(), DbError> {
+    if self
+      .green_chain_bytes
+      .saturating_sub(released)
+      .saturating_add(added)
+      > self.caps.green_chain_bytes
+    {
+      return Err(DbError::Capacity {
+        table: "green_chains",
+      });
+    }
+    Ok(())
+  }
+
+  /// A green's origin reference (A-217), if its origin is held as one.
+  pub fn green_origin_ref(&self, green: VolumeId) -> Option<&OriginRef> {
+    self.green_origin_refs.get(&green)
+  }
+
+  /// Every green origin reference, by green (A-217): what recovery counts as pins, and what a volume's destroy checks.
+  pub fn green_origin_refs(&self) -> impl Iterator<Item = (&VolumeId, &OriginRef)> {
+    self.green_origin_refs.iter()
+  }
+
+  /// A work volume's log since its last restatement, oldest first (§4.16, D-18): what recovery replays onto it.
+  pub fn work_log(&self, work: VolumeId) -> &[Vec<u8>] {
+    self.work_logs.get(&work).map_or(&[], Vec::as_slice)
   }
 
   fn insert_volume(&mut self, record: VolumeRecord) -> Result<(), DbError> {
@@ -1281,6 +1660,15 @@ impl Partition {
     }
     if let Some(origin) = self.green_origins.remove(&id) {
       self.green_chain_bytes = self.green_chain_bytes.saturating_sub(origin.len());
+    }
+    self.green_origin_refs.remove(&id);
+    if let Some((_, checkpoint)) = self.green_checkpoints.remove(&id) {
+      self.green_chain_bytes = self.green_chain_bytes.saturating_sub(checkpoint.len());
+    }
+    // A destroyed work's log can never be replayed either.
+    let log = self.work_log_bytes(id);
+    if self.work_logs.remove(&id).is_some() {
+      self.green_chain_bytes = self.green_chain_bytes.saturating_sub(log);
     }
     Ok(())
   }
@@ -1392,6 +1780,33 @@ impl Partition {
       nfs_sessions: self.nfs_sessions.values().cloned().collect(),
       nfs_calls: self.nfs_calls.values().cloned().collect(),
       nfs_purges: self.nfs_purges.iter().copied().collect(),
+      green_origin_refs: self
+        .green_origin_refs
+        .iter()
+        .map(|(green, origin)| GreenOriginRef {
+          green: *green,
+          origin: *origin,
+        })
+        .collect(),
+      green_checkpoints: self
+        .green_checkpoints
+        .iter()
+        .map(|(green, (version, bytes))| GreenCheckpoint {
+          green: *green,
+          version: *version,
+          bytes: bytes.clone(),
+        })
+        .collect(),
+      work_logs: self
+        .work_logs
+        .iter()
+        .map(|(work, entries)| WorkLog {
+          work: *work,
+          entries: entries.clone(),
+        })
+        .collect(),
+      name_aliases: self.name_aliases.values().cloned().collect(),
+      expired_attachments: self.expired_attachments.iter().copied().collect(),
       nfs_instance: self.nfs_instance,
       tombstones: self.tombstones().collect(),
       green_chains: {
@@ -1422,6 +1837,20 @@ impl Partition {
     }
     for tombstone in &snapshot.tombstones {
       self.tombstones.insert(tombstone.volume, tombstone.sequence);
+    }
+  }
+
+  /// Restores the expired CLI attachments a snapshot carries (A-230).
+  fn restore_expired_attachments(&mut self, snapshot: &PartitionSnapshot) {
+    self.expired_attachments = snapshot.expired_attachments.iter().copied().collect();
+  }
+
+  /// Restores the name aliases a snapshot carries (A-236).
+  fn restore_name_aliases(&mut self, snapshot: &PartitionSnapshot) {
+    for record in &snapshot.name_aliases {
+      self
+        .name_aliases
+        .insert(record.name.clone(), record.clone());
     }
   }
 
@@ -1498,12 +1927,38 @@ impl Partition {
       p.landings.insert(l.id, l.clone());
     }
     p.audit = snapshot.audit.clone();
-    for chain in &snapshot.green_chains {
-      p.restore_green_chain(chain);
-    }
+    p.restore_merge(snapshot);
     p.restore_nfs(snapshot);
+    p.restore_name_aliases(snapshot);
+    p.restore_expired_attachments(snapshot);
     p.restore_consumers_and_tombstones(snapshot);
     Ok(p)
+  }
+
+  /// Restores the merge plane a snapshot carries (§4.16): every green's chain and origin, every held origin reference
+  /// (A-217) and every work's log (A-207), each charged to the merge byte budget as when it was recorded.
+  fn restore_merge(&mut self, snapshot: &PartitionSnapshot) {
+    for chain in &snapshot.green_chains {
+      self.restore_green_chain(chain);
+    }
+    for held in &snapshot.green_origin_refs {
+      self.green_origin_refs.insert(held.green, held.origin);
+    }
+    for checkpoint in &snapshot.green_checkpoints {
+      self.green_chain_bytes = self
+        .green_chain_bytes
+        .saturating_add(checkpoint.bytes.len());
+      self.green_checkpoints.insert(
+        checkpoint.green,
+        (checkpoint.version, checkpoint.bytes.clone()),
+      );
+    }
+    for log in &snapshot.work_logs {
+      self.green_chain_bytes = self
+        .green_chain_bytes
+        .saturating_add(log.entries.iter().map(Vec::len).sum());
+      self.work_logs.insert(log.work, log.entries.clone());
+    }
   }
 
   /// Restores one green's chain and origin from a snapshot, charging both to the chain budget; a

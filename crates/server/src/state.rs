@@ -37,6 +37,10 @@ pub struct ClientSlot {
   pub last_seen_ns: u64,
   /// Dead ring admission is closed while its attachments are retired on all owner shards (§4.7).
   pub(crate) retiring: bool,
+  /// Set once the client has proven its id with its session key (`crate::session_key`), checked before its first
+  /// request is served. A slot never proven is ended without retiring its id's attachments (`reap::end_unproven`):
+  /// they belong to the id's owner, whom a stranger naming the id is not.
+  pub(crate) proven: bool,
   /// The control channel, where the platform has one (Linux: the socket whose close is how
   /// the daemon learns of a dead client, and whose peer end closing tells the client the
   /// daemon died; held for the client's life).
@@ -55,6 +59,9 @@ pub struct ClientSlot {
   /// to its window when a batch is delivered, and credited with the client when it goes — so a batch whose reply
   /// was never carried home (`crate::xshard::send_back`) holds its charge no longer than its client.
   pub(crate) read_ahead_pending: u64,
+  /// The volumes of other hosts this client asked for an attachment of in the record form (A-222), so its reap ends
+  /// them at their owners (`crate::remote_attach::reap_at_owners`). Bounded by `crate::remote_attach::bound`.
+  pub(crate) remote_volumes: Vec<slates_ipc::protocol::VolumeId>,
 }
 
 impl std::fmt::Debug for ClientSlot {
@@ -217,9 +224,15 @@ pub struct ShardState {
   /// The content arena's allocation count at the last reap tick: unchanged at the next means the shard allocated
   /// nothing in between, so its free blocks can go back to the OS (A-105, `daemon::purge_if_idle`).
   pub(crate) purge_seen_allocations: u64,
-  /// The journal generation whose dead recovery memory an idle shard last gave back (A-117,
-  /// `daemon::return_dead_recovery`): a later publication moves the generation and re-arms the return.
-  pub(crate) recovery_returned_at: Option<u64>,
+  /// The content arena's allocation count and allocated bytes at the last idle reap tick (A-214), `None` before the
+  /// first: a later idle tick with another count ends a busy period, whose net growth is the allocated bytes' rise.
+  pub(crate) burst_seen: Option<(u64, usize)>,
+  /// The net growth of the content arena's allocated bytes over its last busy period (A-214): the write burst an idle
+  /// shard keeps free pages pre-faulted for (`daemon::purge_if_idle`).
+  pub(crate) last_burst: usize,
+  /// The content arena's allocation count when the reserve's refill last found nothing to fault (A-214): until the
+  /// arena allocates again, or the burst measure moves, an idle moment's refill has nothing to do.
+  pub(crate) refill_settled: Option<u64>,
   /// The half-open byte range `[start, end)` of `content` this shard publishes into and recovers
   /// from; `0..0` when there is no content object.
   pub content_range: (usize, usize),
@@ -368,6 +381,12 @@ pub struct ShardState {
   pub landing: crate::landing::LandingState,
   /// The image builds and merges running on this shard (§4.6, A-160).
   pub(crate) image: crate::image::ImageState,
+  /// The anchors of the fleet's members as the control shard last looked (A-222): a host that leaves them has its
+  /// clients' attachments ended on every shard (`crate::remote_attach::sweep_departed`). Bounded by the fleet's members.
+  pub(crate) configured_members: Vec<u64>,
+  /// Anchors that departed and whose attachments some shard has not yet ended, owed to the next look (A-222). Bounded
+  /// by the fleet's members.
+  pub(crate) departed_owed: Vec<u64>,
   /// The same-kernel direct maps being filled on this shard (§4.6, A-171).
   pub(crate) direct_map: crate::direct_map::DirectMapState,
   /// The store.
@@ -394,10 +413,25 @@ pub struct ShardState {
   /// first request and revoked when the attachment ends (`verbs::end_attachment`). Bounded by the
   /// partition's attachment cap: one entry per live catalog attachment at most.
   pub mount_attachments: BTreeMap<u64, MountAttachment>,
+  /// The volumes this shard's catalog holds that recovery could not rebuild, and why (§4.8): each is listed, and every
+  /// verb on it answers `Refusal::NotRecovered` with its cause (`verbs::find`). Bounded by the partition's volume cap:
+  /// one entry per catalog volume at most, made once at the shard's start.
+  pub(crate) unrecovered:
+    BTreeMap<slates_db::catalog::VolumeId, slates_ipc::protocol::RecoveryCause>,
   /// The Linux FUSE mounts this shard serves, by attachment (§4.6 "Linux"; AUD-29-64; `crate::fuse`). Bounded
   /// by the partition's attachment cap: one entry per live FUSE attachment at most.
   #[cfg(target_os = "linux")]
   pub(crate) fuse_mounts: crate::fuse::FuseMounts,
+  /// The FUSE mounts a predecessor kept that this shard's catalog names, recorded as this daemon's own as the shard
+  /// starts, before any base or landing is served (A-227); each is taken by its mount's adoption (`crate::fuse`), and
+  /// what no adoption takes is let go once adoption ends. Bounded by the partition's attachment cap.
+  #[cfg(target_os = "linux")]
+  pub(crate) learned_fuse: BTreeMap<u64, crate::fuse::OwnMountRecord>,
+  /// The macOS NFS mounts this shard's attachments are bound to, recorded as this daemon's own (A-227,
+  /// `crate::own_nfs`): bound by the CLI or learned at the shard's start, each let go with its attachment. Bounded by
+  /// the partition's attachment cap.
+  #[cfg(target_os = "macos")]
+  pub(crate) own_nfs_mounts: BTreeMap<u64, crate::own_nfs::OwnNfsMount>,
   /// The Windows WinFsp mounts this shard serves, by attachment (§4.6 "Windows"; `crate::winfsp`). Bounded by the
   /// partition's attachment cap: one entry per live WinFsp attachment at most.
   #[cfg(windows)]
@@ -473,6 +507,9 @@ pub struct ShardState {
   /// (`landing::grant_proof`). Every shard reads the same secret, so a grant verifies on whichever shard
   /// serves the client; it is never sent on any channel.
   pub issuer_secret: [u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  /// The node's client session secret (`crate::session_key`), read from the anchor's supervision block at shard init:
+  /// what a client's session key is derived from and checked against on the shard that serves it. Never sent.
+  pub session_secret: [u8; slates_anchor::layout::SESSION_SECRET_BYTES],
   /// This shard's copy of the node's sealing root (A-92), in hyper-seal's locked region; `None` while sealing is
   /// unavailable. Tenant keys on this partition are wrapped under it.
   pub seal_root: Option<hyper_seal::keys::WrappingKey>,
@@ -483,8 +520,9 @@ pub struct ShardState {
   /// unavailable.
   pub seal_recipient: Option<hyper_seal::recipient::Recipient>,
   /// The candidate nodes, by stable anchor, this shard's pair key was delivered to in this daemon's life (A-92 piece 4b),
-  /// bounded by the fleet's peer capacity.
-  pub pairs_delivered: std::collections::BTreeSet<u64>,
+  /// each with the member id it was delivered to, so a node back at its anchor with fresh RAM (a new member id) is
+  /// delivered it again; bounded by the fleet's peer capacity.
+  pub pairs_delivered: std::collections::BTreeMap<u64, slates_db::HostId>,
   /// The stable anchor of each neighbour, by member id, as this owner shard's pair delivery last resolved them (A-92
   /// piece 4c): a head naming sealed content ships only once it carries a key entry for every remote candidate's
   /// anchor. Refreshed each record period, so a member that restarts under a new id with the same anchor resolves;
@@ -629,15 +667,25 @@ pub struct ShardState {
   pub nfs_service: crate::nfs::ServiceTimes,
   /// The NFSv4.1 back channels of the connections this shard serves (`crate::callback`).
   pub(crate) callbacks: crate::callback::Callbacks,
+  /// The forwards to each peer, multiplexed over its record session (`crate::forward_lane`; the control shard's).
+  pub(crate) forward_lanes: crate::forward_lane::ForwardLanes,
   /// The staging buffers of edits too large for one request, for the works this shard owns (`crate::staging`).
   pub(crate) staging: crate::staging::Staging,
   /// This start's random nonce, announced with its derived member id on SWIM contact (§4.8).
   /// It survives a warm restart with the complete retained Raft state; whole-anchor loss changes it.
   pub member_boot_nonce: u64,
+  /// A word fresh at every start of this daemon process (keyed from the issuer secret minted at each start), announced
+  /// with this node's identity so a peer tells a restarted process from a redial of this one (`member_task::Announcement`).
+  pub member_process_nonce: u64,
   /// One authenticated identity per rostered certificate anchor, bounded by the roster.
   /// A different nonce retires the previous id; nonces cannot establish numeric age order.
   /// Only the control shard updates it. Empty before contact, and on a laptop.
   pub learned_members: BTreeMap<slates_db::HostId, LearnedMember>,
+  /// Members this node holds dead that have since announced themselves over an authenticated record session, by the
+  /// incarnation they died at: their process is alive (an anchor's warm restart keeps the member id), so contact with
+  /// them is kept until they refute the death (`fleet::direct_contact`'s `Returned`). Only the control shard updates it;
+  /// bounded by the fleet's peer capacity.
+  pub returned_members: BTreeMap<slates_db::HostId, u64>,
   /// Reverse index of the current authenticated identities, bounded by learned_members.
   /// Relayed alive gossip may refute a failure, but cannot revive a superseded RAM identity.
   pub authenticated_members: std::collections::BTreeSet<slates_db::HostId>,

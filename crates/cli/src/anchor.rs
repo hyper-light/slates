@@ -2,9 +2,17 @@
 //! the profile, create the segment, publish the profile, supervise the daemon.
 //!
 //! The loop is the supervisor's `step` at the heartbeat cadence with two observations the
-//! supervisor itself does not make: a daemon that never beats inside the recovery budget is
-//! killed (a start that is not a start), and a daemon whose heartbeat lapses past the
-//! liveness budget is killed (wedged, so a failure like a crash; the policy then decides).
+//! supervisor itself does not make: a starting daemon that stops making progress before its
+//! first beat is killed (a start that is not a start), and a daemon whose heartbeat lapses past
+//! the liveness budget is killed (wedged, so a failure like a crash; the policy then decides).
+//! A start is judged in the daemon's own CPU time, read from the OS
+//! (`slates_machine::process_clock`), by the rule its watchdog judges each shard by once it runs
+//! (`slates_server::watchdog::ShardWatch`): no CPU progress for a liveness window is a start
+//! that is stuck, and a window of CPU with no first beat is one that spins; a start that keeps
+//! progressing, however slowly, is starved and waited for. Until 2026-11-07 a start that had not
+//! beaten within the fixed recovery budget, a wall second, was killed, and every restart started
+//! over: on this Mac at 144 spinners on 18 CPUs the anchor killed 153 starts of 153, each
+//! 1.07-1.22 s after its spawn, after it had used 16-18 ms of CPU.
 //! The restart policy is re-derived from the measured daemon start: the longest start seen
 //! is the p99 until enough starts exist to take a real one.
 
@@ -15,6 +23,7 @@ use slates_db::replay::RECOVERY_BUDGET_NS;
 use slates_machine::MachineProfile;
 use slates_server::DaemonConfig;
 use slates_server::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS};
+use slates_server::watchdog::{Look, ShardWatch, Verdict};
 use slates_vfs::clock::{Clock, HostClock};
 
 use crate::args::ProcessOptions;
@@ -330,6 +339,43 @@ fn stop_gracefully(supervisor: &mut Supervisor, clock: &mut HostClock) -> Result
   }
 }
 
+/// One look at the starting daemon in its own CPU time (`slates_machine::process_clock`), judged by the watchdog's
+/// rule over the liveness window ([`LIVENESS_BUDGET_NS`]; A-232 derives it for both): a start's first instructions are
+/// its one step, so it is alive while its CPU progresses and has run less than a window of it. With no reading (no
+/// process clock, or the process already gone) the wall window stands alone, as for a shard with no thread clock.
+fn judge_start(supervisor: &Supervisor, watch: &mut ShardWatch, now: u64) -> Verdict {
+  let cpu = supervisor
+    .child_pid()
+    .and_then(slates_machine::process_clock::process_cpu)
+    .map(|reading| (reading.spent_ns, reading.progress));
+  let look = Look {
+    steps: 0,
+    parked: false,
+    cpu,
+    now_ns: now,
+  };
+  let (verdict, next) = watch.judge(look, LIVENESS_BUDGET_NS);
+  *watch = next;
+  verdict
+}
+
+/// What a start's verdict says when it is to be killed: `None` while it is alive.
+fn start_stuck(verdict: Verdict) -> Option<String> {
+  match verdict {
+    Verdict::Alive => None,
+    Verdict::Wedged { for_ns } => Some(format!(
+      "made no progress for {} ms (the {} ms liveness window)",
+      for_ns / NS_PER_MS,
+      LIVENESS_BUDGET_NS / NS_PER_MS
+    )),
+    Verdict::Spinning { cpu_ns } => Some(format!(
+      "ran {} ms of CPU without beating (the {} ms liveness window)",
+      cpu_ns / NS_PER_MS,
+      LIVENESS_BUDGET_NS / NS_PER_MS
+    )),
+  }
+}
+
 /// The observation loop.
 fn observe(
   supervisor: &mut Supervisor,
@@ -337,12 +383,34 @@ fn observe(
   started: u64,
 ) -> Result<(), Failure> {
   let mut starting_since = Some(started);
+  // The start under way, judged in the daemon's own CPU time until its first beat (the module doc).
+  let mut start_watch = ShardWatch::default();
   let mut longest_start_ns = 0u64;
   let mut watch = Watch::default();
   let mut daemon_watch = DaemonWatch::default();
+  let mut lateness = Lateness::default();
+  slates_machine::log_line!(
+    "slates anchor: a daemon's beat is lapsed once older than the {} ms liveness window plus this anchor's own measured \
+     lateness p99, over its last {LATENESS_SAMPLES} timed waits",
+    LIVENESS_BUDGET_NS / NS_PER_MS
+  );
   // A kill already sent to the daemon that has not been reaped yet: it is not sent again, and the loop waits on the
   // daemon's exit (its exit watch ends the wait) rather than judging the same stale heartbeat each turn. Before
   // 2026-10-10 a lapsed daemon was killed and logged again every pause until reaped.
+  slates_machine::log_line!(
+    "slates anchor: a starting daemon is killed once it makes no CPU progress for the {} ms liveness window, or runs \
+     that much CPU without its first beat, in its own CPU time ({})",
+    LIVENESS_BUDGET_NS / NS_PER_MS,
+    if supervisor
+      .child_pid()
+      .and_then(slates_machine::process_clock::process_cpu)
+      .is_some()
+    {
+      "read from the OS"
+    } else {
+      "none read here: the wall window stands alone"
+    }
+  );
   let mut kill_sent = false;
   loop {
     if signal::stop_requested() {
@@ -350,6 +418,7 @@ fn observe(
       return Ok(());
     }
     let now = clock.monotonic_ns();
+    let bound = lateness.lapse_bound_ns();
     match supervisor.step(now).map_err(|e| failed("step", e))? {
       slates_anchor::Step::Running => {
         let (heartbeat_ns, alive) = {
@@ -357,7 +426,7 @@ fn observe(
             .segment()
             .supervision()
             .map_err(|e| failed("supervision", e))?;
-          let (dead, next) = lapsed(watch, sup.heartbeat_ns(), now, LIVENESS_BUDGET_NS);
+          let (dead, next) = lapsed(watch, sup.heartbeat_ns(), now, bound);
           watch = next;
           // Running and beaten at least once, as the segment judges it; the age is the watch's, which does not count
           // a span the anchor itself did not observe.
@@ -368,7 +437,7 @@ fn observe(
         let pause = if starting_since.is_some() {
           observation_pause()
         } else {
-          Duration::from_nanos(lapse_wait(watch, heartbeat_ns, now, LIVENESS_BUDGET_NS))
+          Duration::from_nanos(lapse_wait(watch, heartbeat_ns, now, bound))
         };
         match starting_since {
           Some(since) if heartbeat_ns >= since => {
@@ -377,17 +446,30 @@ fn observe(
               .set_policy(RestartPolicy::derive(RECOVERY_BUDGET_NS, longest_start_ns).get());
             starting_since = None;
           }
-          Some(since) if now.saturating_sub(since) > RECOVERY_BUDGET_NS && !kill_sent => {
-            slates_machine::log_line!(
-              "slates anchor: the daemon never beat inside the recovery budget; killing it"
-            );
-            supervisor.kill().map_err(|e| failed("kill", e))?;
-            kill_sent = true;
-            starting_since = None;
+          Some(_) if !kill_sent => {
+            if let Some(said) = start_stuck(judge_start(supervisor, &mut start_watch, now)) {
+              slates_machine::log_line!(
+                "slates anchor: the starting daemon (pid {}) {said}; killing it",
+                supervisor
+                  .child_pid()
+                  .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string())
+              );
+              supervisor.kill().map_err(|e| failed("kill", e))?;
+              kill_sent = true;
+              starting_since = None;
+            }
           }
           Some(_) => {}
           None if !alive && !kill_sent => {
-            slates_machine::log_line!("slates anchor: the daemon's heartbeat lapsed; killing it");
+            slates_machine::log_line!(
+              "slates anchor: the daemon's heartbeat lapsed ({} ms old, past {} ms: the {} ms window plus this anchor's \
+               lateness p99 of {} ms over {} waits); killing it",
+              now.saturating_sub(heartbeat_ns) / NS_PER_MS,
+              bound / NS_PER_MS,
+              LIVENESS_BUDGET_NS / NS_PER_MS,
+              lateness.p99_ns() / NS_PER_MS,
+              lateness.len()
+            );
             supervisor.kill().map_err(|e| failed("kill", e))?;
             kill_sent = true;
           }
@@ -398,16 +480,23 @@ fn observe(
         } else {
           pause
         };
+        let asked = u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX);
+        let waited_from = clock.monotonic_ns();
         await_observation(supervisor, &mut daemon_watch, pause);
+        lateness.record(asked, clock.monotonic_ns().saturating_sub(waited_from));
       }
       slates_anchor::Step::Restarted {
         exit_code,
         in_window,
       } => {
         slates_machine::log_line!(
-          "slates anchor: daemon exited ({exit_code:?}); restarted ({in_window} in the window)"
+          "slates anchor: daemon exited ({exit_code:?}); restarted as pid {} ({in_window} in the window)",
+          supervisor
+            .child_pid()
+            .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string())
         );
         starting_since = Some(clock.monotonic_ns());
+        start_watch = ShardWatch::default();
         kill_sent = false;
       }
       slates_anchor::Step::CrashLoop {
@@ -432,6 +521,59 @@ fn observe(
 
 /// Format: nanoseconds in a millisecond, for the anchor's log lines.
 const NS_PER_MS: u64 = 1_000_000;
+
+/// Shape: the anchor's own lateness samples kept (A-228): a hundred, the fewest whose nearest-rank p99 is a single
+/// reading, as the fleet's put-latency window keeps (`slates_server::fleet`, `PUT_LATENCY_SEALS`).
+const LATENESS_SAMPLES: usize = 100;
+/// Format: the percentile the anchor's lateness is read at, and the hundred it is out of (the p99).
+const LATENESS_PERCENTILE: usize = 99;
+const PERCENT: usize = 100;
+
+/// How late the anchor's own timed waits come back (§4.14, A-228): for each of its last [`LATENESS_SAMPLES`] waits that
+/// ran its whole pause, how much longer than the pause it took. A machine busy enough to starve the daemon's watchdog
+/// starves the anchor too, so the anchor holds the daemon's beat to the liveness window plus what its own clock shows of
+/// the machine's lateness, never to a fixed second. A wait that ended early (an exit, a hold, a signal) says nothing of
+/// lateness and is not kept. Bounded: the oldest sample leaves as the newest comes.
+#[derive(Debug, Default)]
+struct Lateness {
+  samples: std::collections::VecDeque<u64>,
+}
+
+impl Lateness {
+  /// Keeps a wait that asked for `asked_ns` and took `took_ns`, if it ran its whole pause.
+  fn record(&mut self, asked_ns: u64, took_ns: u64) {
+    if took_ns < asked_ns {
+      return;
+    }
+    if self.samples.len() >= LATENESS_SAMPLES {
+      self.samples.pop_front();
+    }
+    self.samples.push_back(took_ns.saturating_sub(asked_ns));
+  }
+
+  /// The p99 of the kept samples (nearest rank), zero before any.
+  fn p99_ns(&self) -> u64 {
+    let mut sorted: Vec<u64> = self.samples.iter().copied().collect();
+    sorted.sort_unstable();
+    let last = sorted.len().saturating_sub(1);
+    let rank = last
+      .saturating_mul(LATENESS_PERCENTILE)
+      .checked_div(PERCENT)
+      .unwrap_or(0);
+    sorted.get(rank).copied().unwrap_or(0)
+  }
+
+  /// How many samples are kept.
+  fn len(&self) -> usize {
+    self.samples.len()
+  }
+
+  /// Derived: the age past which a daemon's beat is lapsed: the liveness window plus the anchor's measured lateness p99
+  /// (A-228).
+  fn lapse_bound_ns(&self) -> u64 {
+    LIVENESS_BUDGET_NS.saturating_add(self.p99_ns())
+  }
+}
 
 /// What the observation loop knows between turns to judge a heartbeat fairly: when it last observed, and since when
 /// it may hold the daemon to the budget.
@@ -491,6 +633,27 @@ fn lapse_wait(watch: Watch, beat_ns: u64, now_ns: u64, budget_ns: u64) -> u64 {
 #[cfg(test)]
 mod lapse_tests {
   use super::*;
+
+  /// A-228, §4.14. Do: feed the anchor's lateness window a quiet history (waits on time), then a late one (each wait
+  /// 300 ms over its pause), with early-ended waits between, and more waits than it keeps. Expect: a quiet anchor holds a
+  /// beat to the window alone; a late one to the window plus its lateness p99; early waits change nothing; and the window
+  /// keeps only its last hundred samples.
+  #[test]
+  fn the_lapse_bound_is_the_window_plus_the_anchors_own_lateness() {
+    let mut lateness = Lateness::default();
+    assert_eq!(lateness.lapse_bound_ns(), LIVENESS_BUDGET_NS);
+    for _ in 0..50 {
+      lateness.record(TURN, TURN);
+      lateness.record(TURN, TURN / 2);
+    }
+    assert_eq!(lateness.len(), 50, "an early-ended wait is not kept");
+    assert_eq!(lateness.lapse_bound_ns(), LIVENESS_BUDGET_NS);
+    for _ in 0..LATENESS_SAMPLES {
+      lateness.record(TURN, TURN + 300_000_000);
+    }
+    assert_eq!(lateness.len(), LATENESS_SAMPLES);
+    assert_eq!(lateness.lapse_bound_ns(), LIVENESS_BUDGET_NS + 300_000_000);
+  }
 
   /// Shape: the budget the tests judge by (the anchor's, a second).
   const BUDGET: u64 = 1_000_000_000;

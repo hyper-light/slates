@@ -30,7 +30,11 @@ pub(crate) async fn sweep(silence_ns: u64) -> usize {
   };
   let mut reaped: usize = 0;
   for (handle, client_id) in clients {
-    let result = remove_on_owners(origin, &shards, batch, client_id, silence_ns).await;
+    let result = match remove_on_owners(origin, &shards, batch, client_id, silence_ns).await {
+      // Then its attachments of other hosts' volumes, at their owners (A-222).
+      Ok(()) => crate::remote_attach::reap_at_owners(origin, handle, client_id, silence_ns).await,
+      Err(refusal) => Err(refusal),
+    };
     state::with_state(|state| match result {
       Ok(()) => {
         if finish(state, handle, client_id) {
@@ -54,15 +58,21 @@ fn begin(state: &mut ShardState, silence_ns: u64) -> Vec<(Handle<ClientSlot>, u3
   // Abandoned staging buffers are released on this cadence too, a lease after their last use (`crate::staging`).
   state.staging.expire(now, &mut state.store.metadata);
   let mut clients = Vec::new();
+  let mut unproven = Vec::new();
   for (handle, client) in state.clients.iter_mut_all() {
     client.status_pages.expire(now, &mut state.store.metadata);
-    if client.retiring
-      || (now.saturating_sub(client.last_seen_ns) >= silence_ns
-        && crate::peer::peer_gone(client.control.as_ref(), client.pid))
-    {
+    let dead = now.saturating_sub(client.last_seen_ns) >= silence_ns
+      && crate::peer::peer_gone(client.control.as_ref(), client.pid);
+    // A dead slot that never proved its id is ended without retiring anything of the id's (`end_unproven`).
+    if dead && !client.proven && !client.retiring {
+      unproven.push(handle);
+    } else if client.retiring || dead {
       client.retiring = true;
       clients.push((handle, client.client_id));
     }
+  }
+  for handle in unproven {
+    end_unproven(state, handle);
   }
   let seats = &state.clients;
   state.pending_forwards.retain(|forward| {
@@ -162,6 +172,25 @@ pub(crate) fn remove_batch(
     crate::merge_service::forget_attachment(state, id);
   }
   Ok(())
+}
+
+/// Ends a slot whose client never proved its id (`crate::session_key`): its ring and seat go and the id is given back
+/// for its owner to resume, but nothing of the id's is retired. The attachments and completion records under the id
+/// are its owner's, and a slot that never proved the id is not its owner; it served nothing, so it left no work.
+pub(crate) fn end_unproven(state: &mut ShardState, handle: Handle<ClientSlot>) {
+  if state.clients.get(handle).is_ok_and(|client| client.proven) {
+    return;
+  }
+  state
+    .deferred
+    .retain(|reply| reply.client_index != handle.index());
+  let Ok(mut client) = state.clients.remove(handle) else {
+    return;
+  };
+  client.status_pages.clear(&mut state.store.metadata);
+  if let Some(control) = state.shards.first().copied() {
+    crate::daemon::release_client_id(client.client_id, control);
+  }
 }
 
 /// Return the seat last, after every owner replied. Slot generation and client id are checked

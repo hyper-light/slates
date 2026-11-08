@@ -238,12 +238,17 @@ const DONE: u32 = 2;
 /// the pooled sample is under the stopping rule's floor ([`MIN_SAMPLES`]), up to [`WAKE_ROUNDS`] more rounds
 /// run, each with twice the last one's budget: a slow machine gets exponentially more time, within
 /// `2 + 4 + 8 + 16 + 32 = 62` more shares. A short budget (the quick profile's 5 ms, so 1 ms shares) may then keep
-/// doubling until the full profile's own per-probe budget ([`PROBE_WALL_BUDGET`]) is spent, each round capped at what
-/// is left of it: on a machine whose cores are all busy (spinning shards of eight concurrent fleet tests, load 37 to
+/// doubling until the full profile's own per-probe budget ([`PROBE_WALL_BUDGET`]) is spent, each round at most one
+/// such window: on a machine whose cores are all busy (spinning shards of eight concurrent fleet tests, load 37 to
 /// 80, 2026-10-07) a fresh waiter takes tens of milliseconds to be scheduled, and 62 one-millisecond shares refused
-/// three test binaries' profiles. An idle machine pays nothing for this, and a full profile is unchanged (its 62
-/// shares already exceed the wall). Short of the floor even then, the probe refuses `MeasurementTimeout` rather
-/// than report a mean it did not measure.
+/// three test binaries' profiles. Past that wall the probe runs on while each round's waiter runs at all, each round
+/// twice the last from one window up to [`longest_round`] ([`extends`]): under 144 nice-19 spinners on 18 CPUs (this
+/// Mac, 2026-11-07) a wake took 68 to 174 ms at the median and up to 245 ms at p99, a fresh round needs its waiter
+/// scheduled, parked and woken before its first sample, and the 250 ms wall refused the quick profile, and the anchor's
+/// boot behind it, 19 times in 20. A starved probe measures what the machine is, within [`starved_extension`] more; a
+/// round whose waiter was never scheduled is a stuck one, and the probe refuses `MeasurementTimeout` rather than report
+/// a mean it did not measure. An idle machine pays nothing for any of this, and a full profile is unchanged (its 62
+/// shares already exceed the wall).
 pub fn wake(budget: Duration, placement: &Placement) -> Result<WakeLatency, MachineError> {
   let pairs = core_pairs(placement);
   let saved = SavedAffinity::of_calling_thread();
@@ -257,25 +262,32 @@ pub fn wake(budget: Duration, placement: &Placement) -> Result<WakeLatency, Mach
   let mut woke_running = 0u32;
   let mut rounds = 0u32;
   let began = Instant::now();
-  // A zero budget doubles to zero: no round could measure, so the wall extension is not given to it.
-  let short_of_floor = |kept: &[u64], rounds: u32| {
-    kept.len() < MIN_SAMPLES
-      && (rounds < WAKE_ROUNDS.saturating_mul(2)
-        || (!budget.is_zero() && began.elapsed() < PROBE_WALL_BUDGET))
-  };
-  while rounds < WAKE_ROUNDS || short_of_floor(&kept, rounds) {
-    if rounds >= WAKE_ROUNDS {
-      round_budget = round_budget.saturating_mul(2);
-    }
-    if rounds >= WAKE_ROUNDS.saturating_mul(2) {
-      round_budget = round_budget.min(PROBE_WALL_BUDGET.saturating_sub(began.elapsed()));
-    }
+  let mut last_ran = false;
+  while extends(
+    budget,
+    &Standing {
+      kept: kept.len(),
+      rounds,
+      waited: began.elapsed(),
+      last_budget: round_budget,
+      last_ran,
+    },
+  ) {
+    round_budget = next_round_budget(round_budget, rounds, began.elapsed());
+    // The planned and doubling rounds run as they always have; a round past them exists only to reach the floor, and
+    // ends there.
+    let enough = if rounds >= WAKE_ROUNDS.saturating_mul(2) {
+      MIN_SAMPLES.saturating_sub(kept.len())
+    } else {
+      usize::MAX
+    };
     let pair = usize::try_from(rounds)
       .ok()
       .and_then(|round| pairs.get(round.checked_rem(pairs.len())?))
       .copied();
     rounds = rounds.saturating_add(1);
-    let outcome = wake_round(pair, round_budget, &mut rng);
+    let outcome = wake_round(pair, round_budget, enough, &mut rng);
+    last_ran = outcome.ran;
     placement = weaker(placement, outcome.placement);
     same_cpu_samples = same_cpu_samples.saturating_add(outcome.same_cpu);
     asleep_confirmed &= outcome.asleep_confirmed;
@@ -309,6 +321,68 @@ pub fn wake(budget: Duration, placement: &Placement) -> Result<WakeLatency, Mach
     },
     &mut rng,
   ))
+}
+
+/// Where the probe stands after the rounds so far: what [`extends`] decides on.
+struct Standing {
+  /// The samples kept across the rounds.
+  kept: usize,
+  /// The rounds run.
+  rounds: u32,
+  /// The wall time since the probe began.
+  waited: Duration,
+  /// The last round's budget.
+  last_budget: Duration,
+  /// Whether the last round's waiter ran at all (it published itself, so the machine scheduled it).
+  last_ran: bool,
+}
+
+/// Derived: the longest round the probe runs past the full probe budget's wall: [`WAKE_ROUNDS`] rounds that double from
+/// one window ([`PROBE_WALL_BUDGET`]), as the doubling rounds before them double from a share, so the last is
+/// `PROBE_WALL_BUDGET · 2^(WAKE_ROUNDS − 1)` (4 s).
+fn longest_round() -> Duration {
+  PROBE_WALL_BUDGET.saturating_mul(1u32 << WAKE_ROUNDS.saturating_sub(1).min(u32::BITS - 1))
+}
+
+/// Derived: the most wall time the probe's rounds run past the full probe budget's wall: the rounds from one window
+/// to [`longest_round`], doubling, `PROBE_WALL_BUDGET · (2^WAKE_ROUNDS − 1)` (31 windows, 7.75 s).
+pub fn starved_extension() -> Duration {
+  longest_round()
+    .saturating_mul(2)
+    .saturating_sub(PROBE_WALL_BUDGET)
+}
+
+/// Whether the probe runs another round: the [`WAKE_ROUNDS`] planned ones always; then, while short of the sample
+/// floor, [`WAKE_ROUNDS`] more doubling ones, more until the full probe budget ([`PROBE_WALL_BUDGET`]) is spent, and
+/// past that wall, more while the last round's waiter ran, each twice the last, up to [`longest_round`]. That last part
+/// is the busy machine's (A-228's rule, the anchor's start judgment): a waiter the machine schedules, however slowly,
+/// is starved, and the probe measures what the machine is; one never scheduled in a whole round is stuck, and the
+/// probe refuses. A zero budget doubles to zero: no round could measure, so no extension is given to it.
+fn extends(budget: Duration, standing: &Standing) -> bool {
+  standing.rounds < WAKE_ROUNDS
+    || (standing.kept < MIN_SAMPLES
+      && (standing.rounds < WAKE_ROUNDS.saturating_mul(2)
+        || (!budget.is_zero()
+          && (standing.waited < PROBE_WALL_BUDGET
+            || (standing.last_ran && standing.last_budget < longest_round())))))
+}
+
+/// The budget of the round after `rounds` rounds, the last of which had `last`, `waited` into the probe: the planned
+/// rounds share the budget and the extension rounds double it; before the full probe budget's wall a round past the
+/// doubling ones is capped at what is left of it, and past the wall it gets at least one window
+/// ([`PROBE_WALL_BUDGET`]) and at most [`longest_round`].
+fn next_round_budget(last: Duration, rounds: u32, waited: Duration) -> Duration {
+  let mut next = last;
+  if rounds >= WAKE_ROUNDS {
+    next = next.saturating_mul(2);
+  }
+  if rounds >= WAKE_ROUNDS.saturating_mul(2) {
+    next = match PROBE_WALL_BUDGET.checked_sub(waited) {
+      Some(left) if !left.is_zero() => next.min(left),
+      _ => next.max(PROBE_WALL_BUDGET).min(longest_round()),
+    };
+  }
+  next
 }
 
 /// What the rounds found beside their samples.
@@ -390,6 +464,8 @@ pub fn core_pairs(placement: &Placement) -> Vec<(u32, u32)> {
 
 /// One round's outcome.
 struct Round {
+  /// Whether the waiter ran (published itself) within the round.
+  ran: bool,
   samples: Vec<u64>,
   same_cpu: u32,
   placement: Pinning,
@@ -419,8 +495,13 @@ struct Shared {
 }
 
 /// One round: a fresh waiter, pinned with the waker to `pair` when there is one, timed until its mean
-/// converges or `budget` ends.
-fn wake_round(pair: Option<(u32, u32)>, budget: Duration, rng: &mut Xorshift) -> Round {
+/// converges, it has `enough` samples, or `budget` ends.
+fn wake_round(
+  pair: Option<(u32, u32)>,
+  budget: Duration,
+  enough: usize,
+  rng: &mut Xorshift,
+) -> Round {
   let started = Instant::now();
   let waker_pin = pair.map_or(Pinning::Scheduled, |(waker, _)| pin_current_thread(waker));
   let shared = Shared {
@@ -436,6 +517,7 @@ fn wake_round(pair: Option<(u32, u32)>, budget: Duration, rng: &mut Xorshift) ->
   let epoch = Instant::now();
   let waker = std::thread::current();
   let mut round = Round {
+    ran: false,
     samples: Vec::new(),
     same_cpu: 0,
     placement: waker_pin,
@@ -449,6 +531,7 @@ fn wake_round(pair: Option<(u32, u32)>, budget: Duration, rng: &mut Xorshift) ->
       waiter.thread().unpark();
       return;
     };
+    round.ran = true;
     // Held for the round: the waiter outlives it (joined when the scope ends), so its id names it throughout.
     let watch = platform::Watch::open(id);
     let waiter_pin = pinning_from_code(shared.waiter_pin.load(Ordering::Acquire));
@@ -486,6 +569,9 @@ fn wake_round(pair: Option<(u32, u32)>, budget: Duration, rng: &mut Xorshift) ->
         }
       }
       round.samples.push(latency);
+      if round.samples.len() >= enough {
+        break;
+      }
       if round.samples.len() >= next_check {
         next_check = next_check.saturating_mul(2);
         if bootstrap_mean_interval(&round.samples, rng).is_some_and(|i| converged_mean(&i)) {
@@ -1183,6 +1269,71 @@ mod tests {
     assert_eq!(after, before);
   }
 
+  /// The standing of a probe past its doubling rounds and the full probe budget's wall, still short of the sample
+  /// floor, after a round of `last_budget`.
+  fn starved(last_ran: bool, last_budget: Duration) -> Standing {
+    Standing {
+      kept: MIN_SAMPLES.saturating_sub(1),
+      rounds: WAKE_ROUNDS.saturating_mul(3),
+      waited: PROBE_WALL_BUDGET.saturating_mul(2),
+      last_budget,
+      last_ran,
+    }
+  }
+
+  /// §4.1 refusals, judged by progress, not a wall (A-228's rule, the anchor's start judgment): a starved probe's waiter
+  /// runs slowly, a stuck one's never runs. Measured on this Mac under 144 nice-19 spinners on 18 CPUs (2026-11-07): a
+  /// wake took 68 ms at the median and 205 ms at p99, so the sample floor needs over a second, and `slates profile
+  /// --quick` was refused 19 times in 20, the anchor's boot with it. Do: decide on a probe past the full probe budget's
+  /// wall, still short of the floor, after a round whose waiter ran and after one whose waiter never did; after the
+  /// longest round; at the floor; with a zero budget; inside the wall. Expect: only the first and the last run another
+  /// round.
+  #[test]
+  fn a_probe_whose_waiter_runs_measures_past_the_wall_and_one_whose_waiter_never_runs_refuses() {
+    let budget = Duration::from_millis(5);
+    assert!(extends(budget, &starved(true, PROBE_WALL_BUDGET)));
+    assert!(!extends(budget, &starved(false, PROBE_WALL_BUDGET)));
+    assert!(!extends(budget, &starved(true, longest_round())));
+    let at_floor = Standing {
+      kept: MIN_SAMPLES,
+      ..starved(true, PROBE_WALL_BUDGET)
+    };
+    assert!(!extends(budget, &at_floor));
+    assert!(!extends(Duration::ZERO, &starved(true, PROBE_WALL_BUDGET)));
+    let inside_the_wall = Standing {
+      waited: PROBE_WALL_BUDGET.saturating_sub(Duration::from_millis(1)),
+      ..starved(false, PROBE_WALL_BUDGET)
+    };
+    assert!(extends(budget, &inside_the_wall));
+  }
+
+  /// The other half of the rule: past the wall a round gets at least one whole window, never the nothing left of a
+  /// spent wall, twice the last round's, and at most [`longest_round`]; inside the wall it gets at most what is left.
+  /// Do: ask the budget of a round past the doubling rounds after a short round, a window's round and the longest
+  /// round, past the wall and inside it. Expect: one window, two windows, the longest round, and what is left.
+  #[test]
+  fn a_round_past_the_wall_gets_a_window_and_doubles_to_the_longest_round() {
+    let rounds = WAKE_ROUNDS.saturating_mul(3);
+    let past = PROBE_WALL_BUDGET.saturating_mul(2);
+    let short = Duration::from_millis(1);
+    assert_eq!(next_round_budget(short, rounds, past), PROBE_WALL_BUDGET);
+    assert_eq!(
+      next_round_budget(PROBE_WALL_BUDGET, rounds, past),
+      PROBE_WALL_BUDGET.saturating_mul(2)
+    );
+    assert_eq!(
+      next_round_budget(longest_round(), rounds, past),
+      longest_round()
+    );
+    let left = Duration::from_millis(3);
+    let inside = PROBE_WALL_BUDGET.saturating_sub(left);
+    assert_eq!(next_round_budget(PROBE_WALL_BUDGET, rounds, inside), left);
+    assert_eq!(
+      starved_extension(),
+      PROBE_WALL_BUDGET.saturating_mul((1 << WAKE_ROUNDS) - 1)
+    );
+  }
+
   /// Shape: a wake budget too short for its rounds to confirm a sleeper: 10 µs, so 2 µs shares and at most 124 µs
   /// more from the doubling rounds, against a thread's schedule-and-wake of tens of microseconds at rest.
   const TOO_SHORT_BUDGET: Duration = Duration::from_micros(10);
@@ -1191,7 +1342,8 @@ mod tests {
   /// floor keeps doubling until the full profile's per-probe budget is spent, so a profile measured on a machine whose
   /// cores are busy still measures (three test binaries' quick profiles were refused at load 37 to 80, 2026-10-07).
   /// Do: measure the wake with [`TOO_SHORT_BUDGET`]. Expect: a measured mean, and no more wall time than the full
-  /// budget plus one round. Before the extension it refused `MeasurementTimeout` at once.
+  /// budget plus one round, plus a starved probe's rounds past it ([`starved_extension`]). Before the extension it
+  /// refused `MeasurementTimeout` at once.
   ///
   /// **What is asserted is the extension, not the success**, and that distinction is the test's whole
   /// robustness. A machine busy enough cannot reach the sample floor even in the full budget — this test
@@ -1215,8 +1367,12 @@ mod tests {
       Err(e) => panic!("the probe refused for another reason: {e:?}"),
     }
     assert!(
-      took <= PROBE_WALL_BUDGET.saturating_mul(2),
-      "the extension stays within the full probe budget and its last round: {took:?}"
+      took
+        <= PROBE_WALL_BUDGET
+          .saturating_mul(2)
+          .saturating_add(starved_extension()),
+      "the extension stays within the full probe budget, its last round, and a starved probe's rounds past it: \
+       {took:?}"
     );
   }
 }

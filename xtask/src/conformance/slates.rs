@@ -116,6 +116,12 @@ impl Reply {
 }
 
 impl SlatesBinary {
+  /// The binary at `path`, built elsewhere (a test given `SLATES_TEST_BINARY`).
+  #[cfg(test)]
+  pub(crate) fn at(path: PathBuf) -> SlatesBinary {
+    SlatesBinary { path }
+  }
+
   /// Builds `slates-cli` and locates the executable cargo reports.
   pub(crate) fn build(root: &Path) -> Result<SlatesBinary, Failure> {
     SlatesBinary::build_as(root, false)
@@ -217,6 +223,17 @@ impl Anchor {
     scratch: &Path,
     tracer: Option<&[String]>,
   ) -> Result<Anchor, Failure> {
+    Anchor::start_with(binary, instance, scratch, tracer, &[])
+  }
+
+  /// [`Anchor::start`] with `extra` arguments after the anchor's own (a fleet node's `--fleet PATH --node NAME`).
+  pub(crate) fn start_with(
+    binary: &SlatesBinary,
+    instance: &str,
+    scratch: &Path,
+    tracer: Option<&[String]>,
+    extra: &[String],
+  ) -> Result<Anchor, Failure> {
     let log = scratch.join(format!("anchor-{instance}.log"));
     let mut log_file = open_log(&log)?;
     let (mut drained, stderr) =
@@ -238,6 +255,7 @@ impl Anchor {
         "--shards",
         SHARDS,
       ])
+      .args(extra)
       .current_dir(scratch)
       .stdin(Stdio::null())
       .stdout(Stdio::null())
@@ -259,6 +277,12 @@ impl Anchor {
     };
     anchor.wait_ready(binary)?;
     Ok(anchor)
+  }
+
+  /// The anchor's own process id.
+  #[cfg(test)]
+  pub(crate) fn pid(&self) -> u32 {
+    self.child.id()
   }
 
   /// The anchor's log: its stderr and its daemon's, the processes' own standard stream.
@@ -846,6 +870,8 @@ pub(crate) struct Session {
   pub(crate) mount: Mount,
   pub(crate) anchor: Anchor,
   base: PathBuf,
+  /// With `--live-ship`, the fleet's candidates, dropped after the owner's mount and anchor.
+  live: Option<super::live_fleet::LiveFleet>,
 }
 
 /// Shape: how many lines of the anchor's log a record carries when the daemon stopped answering —
@@ -873,6 +899,9 @@ impl Session {
     (suite, size, fold): (&str, &str, bool),
     tracer: Option<&[String]>,
   ) -> Result<Session, Failure> {
+    if run.options.live_ship {
+      return Session::open_live(run, binary, (suite, size, fold), tracer);
+    }
     let instance = format!("conf-{suite}-{}", std::process::id());
     let anchor = Anchor::start(&binary, &instance, run.scratch.path(), tracer)?;
     // A fresh daemon serves no placement until its configuration group is bootstrapped (the
@@ -885,8 +914,59 @@ impl Session {
       .expect_ok("bootstrap root")?;
     let volume_name = format!("{suite}-vol");
     let created = create_volume(&binary, &instance, &volume_name, size, fold)?;
+    Session::mounted(run, binary, instance, anchor, created, (&volume_name, None))
+  }
+
+  /// A session whose volume is live-shipped on an `f = 1` fleet (`--live-ship`, A-200): the fleet started, the volume
+  /// created on its first node and turned live-shipped, then mounted through that node as a plain volume is.
+  fn open_live(
+    run: &Run<'_>,
+    binary: SlatesBinary,
+    (suite, size, fold): (&str, &str, bool),
+    tracer: Option<&[String]>,
+  ) -> Result<Session, Failure> {
+    if tracer.is_some() {
+      return Err(Failure(
+        "a live-shipped session runs no tracer: the hermeticity suite traces one anchor".to_owned(),
+      ));
+    }
+    let started = super::live_fleet::LiveFleet::start(&binary, suite, run.scratch.path())?;
+    let volume_name = format!("{suite}-vol");
+    let created = {
+      let deadline = Instant::now() + START_WAIT;
+      loop {
+        match create_volume(&binary, &started.owner_instance, &volume_name, size, fold) {
+          Err(Failure(why))
+            if why.contains("ConsensusNotInitialized") && Instant::now() < deadline =>
+          {
+            pause()
+          }
+          other => break other?,
+        }
+      }
+    };
+    super::live_fleet::LiveFleet::ship(&binary, &started.owner_instance, &created.id)?;
+    Session::mounted(
+      run,
+      binary,
+      started.owner_instance,
+      started.owner,
+      created,
+      (&volume_name, Some(started.fleet)),
+    )
+  }
+
+  /// Mounts a created volume and makes the session.
+  fn mounted(
+    run: &Run<'_>,
+    binary: SlatesBinary,
+    instance: String,
+    anchor: Anchor,
+    created: CreatedVolume,
+    (volume_name, live): (&str, Option<super::live_fleet::LiveFleet>),
+  ) -> Result<Session, Failure> {
     let volume_id = created.id;
-    let mount = mount_volume(run, &binary, &instance, &volume_id, &volume_name)?;
+    let mount = mount_volume(run, &binary, &instance, &volume_id, volume_name)?;
     let base = mount
       .path()
       .join(format!("conformance-{}", std::process::id()));
@@ -899,7 +979,33 @@ impl Session {
       mount,
       anchor,
       base,
+      live,
     })
+  }
+
+  /// Whether the daemon still answers and, for a live-shipped session, the run shipped ([`Session::live_shipped`]);
+  /// and the live note the record carries, for a live-shipped session.
+  pub(crate) fn alive_and_shipped(&self) -> (bool, Option<String>) {
+    let alive = self.daemon_alive();
+    match self.live_shipped() {
+      Some((shipped, note)) => (alive && shipped, Some(note)),
+      None => (alive, None),
+    }
+  }
+
+  /// The live fleet's candidates, for a test that stops them.
+  #[cfg(test)]
+  pub(crate) fn live_fleet(&self) -> Option<&super::live_fleet::LiveFleet> {
+    self.live.as_ref()
+  }
+
+  /// With `--live-ship`, whether the run shipped (the owner's log durable at its head, both candidates holding it) and
+  /// the note the record carries; `None` for a plain session.
+  pub(crate) fn live_shipped(&self) -> Option<(bool, String)> {
+    self
+      .live
+      .as_ref()
+      .map(|fleet| fleet.caught_up(&self.binary, &self.instance, &self.volume_id))
   }
 
   /// The tail of the anchor's log — what a record carries when the daemon stopped answering, so the

@@ -15,11 +15,13 @@ use crate::slot::Ring;
 pub const MAGIC: u32 = 0x5243_4C53;
 /// Format: the layout version. Version 2 (2026-09-25) added the spin estimate's shift to the header and
 /// the reply stamp to the words block (§4.7, the client's online wake estimate). Version 3 (2026-11-04)
-/// made the reply stamp two, one per park parity, named by the client's parked flag's value.
-pub const LAYOUT_VERSION: u32 = 3;
+/// made the reply stamp two, one per park parity, named by the client's parked flag's value. Version 4 (2026-11-07)
+/// added the client's session key to the header (`AT_SESSION_KEY`).
+pub const LAYOUT_VERSION: u32 = 4;
 /// Format: the header's size (two cache lines): magic (4), version (4), client id (4), shard
 /// (2), padding (2), slots per ring (4), spin ns (4), command ring offset (8), completion
-/// ring offset (8), bulk offset (8), bulk length (8), spin shift (4), padding.
+/// ring offset (8), bulk offset (8), bulk length (8), spin shift (4), padding to 64, then the client's session key (32)
+/// and padding.
 pub const HEADER_BYTES: usize = 128;
 /// Format: the magic's offset.
 const AT_MAGIC: usize = 0;
@@ -43,6 +45,15 @@ const AT_BULK: usize = 40;
 const AT_BULK_LEN: usize = 48;
 /// Format: the spin estimate's shift's offset.
 const AT_SPIN_SHIFT: usize = 56;
+/// Format: the header's fields the daemon writes once, at creation: every one before the session key.
+const FIXED_HEADER_BYTES: usize = 64;
+/// The client's session key (`slates_server::session_key`): what proves the client is the one its id was issued to.
+/// The daemon writes it here for an id it issues fresh; a client resuming an id writes its own key here before its
+/// first request, and the daemon checks it once before serving one. Only this region's holder reaches it.
+/// Format: the key's offset, the cache line after the fixed header fields.
+const AT_SESSION_KEY: usize = FIXED_HEADER_BYTES;
+/// Format: a session key's width, a BLAKE3 output (256 bits).
+pub const SESSION_KEY_BYTES: usize = 32;
 /// Format: the words block after the header, one cache line each: the wake word (the daemon
 /// bumps it per reply), the client's parked flag, the daemon's parked flag (a shard parked
 /// in its driver), the client's doorbell (the client bumps it per request when the daemon is
@@ -126,9 +137,10 @@ impl RegionGeometry {
   }
 }
 
-/// The region's own words: wake, the two parked flags and the doorbell, each a run of one, and the run of
-/// reply stamps.
-const REGION_WORDS: [WordRun; 5] = [
+/// The region's own words: wake, the two parked flags and the doorbell, each a run of one, the run of reply stamps, and
+/// the session key, racy (the client may write it while the daemon copies it).
+const REGION_WORDS: [WordRun; 6] = [
+  WordRun::racy(AT_SESSION_KEY, SESSION_KEY_BYTES),
   WordRun::one(AT_WAKE, Width::U32),
   WordRun::one(AT_CLIENT_PARKED, Width::U32),
   WordRun::one(AT_DAEMON_PARKED, Width::U32),
@@ -154,7 +166,14 @@ struct RegionIds {
 
 impl RegionIds {
   fn resolve(object: &SharedObject) -> Result<RegionIds, IpcError> {
-    let [wake, client_parked, daemon_parked, doorbell, reply_stamp] = REGION_WORDS;
+    let [
+      _session_key,
+      wake,
+      client_parked,
+      daemon_parked,
+      doorbell,
+      reply_stamp,
+    ] = REGION_WORDS;
     Ok(RegionIds {
       wake: object.resolve(&wake)?,
       client_parked: object.resolve(&client_parked)?,
@@ -273,7 +292,8 @@ impl ClientRegion {
       );
       put(bytes, AT_BULK_LEN, &geometry.bulk_bytes.to_le_bytes());
       put(bytes, AT_SPIN_SHIFT, &geometry.spin_shift.to_le_bytes());
-      object.write(0, &header)?;
+      // The fixed fields only: the session key is its own racy span, written by `set_session_key`, all zero until.
+      object.write(0, header.get(..FIXED_HEADER_BYTES).unwrap_or(&[]))?;
     }
     cmd.init(&object)?;
     cpl.init(&object)?;
@@ -304,13 +324,49 @@ impl ClientRegion {
 
   /// The client opens the region the daemon handed over.
   pub fn open(handoff: &Handoff, len: usize) -> Result<ClientRegion, IpcError> {
+    Self::check_len(len)?;
+    Self::from_object(SharedObject::open(handoff, len, Words::new())?)
+  }
+
+  /// The client maps the region whose descriptor the daemon handed over (macOS: a Mach fileport, GAP-A9-9).
+  #[cfg(unix)]
+  pub fn from_descriptor(fd: std::os::fd::OwnedFd, len: usize) -> Result<ClientRegion, IpcError> {
+    Self::check_len(len)?;
+    Self::from_object(SharedObject::from_descriptor(fd, len, Words::new())?)
+  }
+
+  /// A second, independent mapping of this region, through a duplicate of its descriptor: what a holder of the region
+  /// maps it again by, now that a macOS region has no name to open (GAP-A9-9).
+  #[cfg(unix)]
+  pub fn open_again(&self) -> Result<ClientRegion, IpcError> {
+    let fd =
+      rustix::io::fcntl_dupfd_cloexec(self.object.as_fd(), 0).map_err(|e| IpcError::OsRefused {
+        call: "fcntl(F_DUPFD_CLOEXEC)",
+        code: Some(e.raw_os_error()),
+      })?;
+    Self::from_descriptor(fd, self.object.len())
+  }
+
+  /// Removes the region's name (macOS), so only a descriptor the daemon hands on reaches it (GAP-A9-9).
+  #[cfg(target_os = "macos")]
+  pub fn unlink_name(&mut self) -> Result<(), IpcError> {
+    Ok(self.object.unlink_name()?)
+  }
+
+  /// Refuses a length that cannot hold the header and the words.
+  fn check_len(len: usize) -> Result<(), IpcError> {
     if len < RINGS_OFFSET {
       return Err(IpcError::Layout {
         reason: "a region shorter than its header and words",
       });
     }
+    Ok(())
+  }
+
+  /// The region over `object`, its rings found from the header it carries.
+  fn from_object(object: SharedObject) -> Result<ClientRegion, IpcError> {
+    let len = object.len();
     // The header first, by copy, before any word is declared: the rings' places come from it.
-    let object = SharedObject::open(handoff, len, Words::new())?;
     let mut header = [0u8; HEADER_BYTES];
     object.read(0, &mut header)?;
     let bytes = &header[..];
@@ -388,6 +444,19 @@ impl ClientRegion {
   /// The client id.
   pub fn client_id(&self) -> u32 {
     self.client_id
+  }
+
+  /// Writes the client's session key into the region: the daemon, for an id it issued fresh; the client, for an id it
+  /// resumes, before its first request.
+  pub fn set_session_key(&mut self, key: &[u8; SESSION_KEY_BYTES]) -> Result<(), IpcError> {
+    Ok(self.object.write_racy(AT_SESSION_KEY, key)?)
+  }
+
+  /// The session key the region holds now: all zero until one is written.
+  pub fn session_key(&self) -> Result<[u8; SESSION_KEY_BYTES], IpcError> {
+    let mut key = [0u8; SESSION_KEY_BYTES];
+    self.object.read_racy(AT_SESSION_KEY, &mut key)?;
+    Ok(key)
   }
 
   /// The shard the client is pinned to.

@@ -493,13 +493,30 @@ impl Record {
   }
 }
 
-/// Truncates a suite's message to [`DETAIL_CHARS`] characters, marking the cut.
-pub fn detail(text: &str) -> String {
-  let mut out: String = text.chars().take(DETAIL_CHARS).collect();
-  if text.chars().count() > DETAIL_CHARS {
+/// The first `chars` characters of `text`, marking a cut at the end.
+pub fn first_chars(text: &str, chars: usize) -> String {
+  let mut out: String = text.chars().take(chars).collect();
+  if text.chars().count() > chars {
     out.push('…');
   }
   out
+}
+
+/// The last `chars` characters of `text`, marking a cut at the front: the end of an output, where an exerciser prints
+/// last, survives.
+pub fn last_chars(text: &str, chars: usize) -> String {
+  let count = text.chars().count();
+  if count <= chars {
+    return text.to_owned();
+  }
+  let mut out = String::from('…');
+  out.extend(text.chars().skip(count.saturating_sub(chars)));
+  out
+}
+
+/// Truncates a suite's message to [`DETAIL_CHARS`] characters, marking the cut.
+pub fn detail(text: &str) -> String {
+  first_chars(text, DETAIL_CHARS)
 }
 
 #[cfg(test)]

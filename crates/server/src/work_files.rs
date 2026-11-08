@@ -11,6 +11,7 @@
 //! A work whose green is gone has no base to read: a file it did not change answers `UnknownBase`, as its submit
 //! does (§4.16 failure matrix), and the files it changed stay readable.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use slates_merge::engine::Green;
@@ -33,7 +34,7 @@ pub struct Base<'a> {
 impl<'a> Base<'a> {
   /// The base's bytes of `path`: `Ok(None)` when the base has no such file, `Err(BaseGone)` when the green is gone
   /// and the base cannot be read.
-  fn file(self, path: &str) -> Result<Option<&'a [u8]>, BaseGone> {
+  fn file(self, path: &str) -> Result<Option<Cow<'a, [u8]>>, BaseGone> {
     match self.green {
       Some(green) => Ok(green.content_ref_at(path, self.version)),
       None => Err(BaseGone),
@@ -56,24 +57,24 @@ fn held(path: &str, entry: Option<&Option<Vec<u8>>>) -> u64 {
 
 impl WorkFiles {
   /// The file at `path` as the work sees it: its own bytes, nothing where it removed one, else the base's.
-  pub fn get<'a>(&'a self, base: Base<'a>, path: &str) -> Result<Option<&'a [u8]>, BaseGone> {
+  pub fn get<'a>(&'a self, base: Base<'a>, path: &str) -> Result<Option<Cow<'a, [u8]>>, BaseGone> {
     match self.changed.get(path) {
-      Some(entry) => Ok(entry.as_deref()),
+      Some(entry) => Ok(entry.as_deref().map(Cow::Borrowed)),
       None => base.file(path),
     }
   }
 
   /// Every file the work sees, sorted by path: the base's files it did not change and the files it holds. Without
   /// the base (its green gone) only the files the work holds are known.
-  pub fn files<'a>(&'a self, base: Base<'a>) -> Vec<(&'a str, &'a [u8])> {
-    let mut files: BTreeMap<&str, &[u8]> = base
+  pub fn files<'a>(&'a self, base: Base<'a>) -> Vec<(&'a str, Cow<'a, [u8]>)> {
+    let mut files: BTreeMap<&str, Cow<'a, [u8]>> = base
       .green
       .map(|green| green.files_at(base.version).into_iter().collect())
       .unwrap_or_default();
     for (path, entry) in &self.changed {
       match entry {
         Some(bytes) => {
-          files.insert(path.as_str(), bytes.as_slice());
+          files.insert(path.as_str(), Cow::Borrowed(bytes.as_slice()));
         }
         None => {
           files.remove(path.as_str());
@@ -81,6 +82,60 @@ impl WorkFiles {
       }
     }
     files.into_iter().collect()
+  }
+
+  /// A page of the file at `path` as the work sees it: its bytes in `[offset, offset + want)` and its length, from its
+  /// own bytes or the base's ([`Green::content_page_at`], which never copies the whole file).
+  pub fn page(
+    &self,
+    base: Base<'_>,
+    path: &str,
+    (offset, want): (u64, u64),
+  ) -> Result<Option<(Vec<u8>, u64)>, BaseGone> {
+    match self.changed.get(path) {
+      Some(Some(bytes)) => {
+        let total = bytes.len();
+        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(total);
+        let end = usize::try_from(offset.saturating_add(want))
+          .unwrap_or(usize::MAX)
+          .min(total);
+        let page = bytes.get(start..end).unwrap_or_default().to_vec();
+        Ok(Some((page, u64::try_from(total).unwrap_or(u64::MAX))))
+      }
+      Some(None) => Ok(None),
+      None => match base.green {
+        Some(green) => Ok(green.content_page_at(path, base.version, (offset, want))),
+        None => Err(BaseGone),
+      },
+    }
+  }
+
+  /// Every file the work sees with its length, sorted by path: [`WorkFiles::files`] without the bytes.
+  pub fn sizes<'a>(&'a self, base: Base<'a>) -> Vec<(&'a str, u64)> {
+    let mut sizes: BTreeMap<&str, u64> = base
+      .green
+      .map(|green| {
+        green
+          .file_lens_at(base.version)
+          .into_iter()
+          .map(|(path, len)| (path, u64::try_from(len).unwrap_or(u64::MAX)))
+          .collect()
+      })
+      .unwrap_or_default();
+    for (path, entry) in &self.changed {
+      match entry {
+        Some(bytes) => {
+          sizes.insert(
+            path.as_str(),
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+          );
+        }
+        None => {
+          sizes.remove(path.as_str());
+        }
+      }
+    }
+    sizes.into_iter().collect()
   }
 
   /// The footprint of everything the delta holds (the work's charge less its journal's).
@@ -125,7 +180,7 @@ impl WorkFiles {
     bytes: &[u8],
   ) -> Result<(), BaseGone> {
     if !self.changed.contains_key(path) {
-      let from_base = base.file(path)?.map(<[u8]>::to_vec);
+      let from_base = base.file(path)?.map(Cow::into_owned);
       self.changed.insert(path.to_owned(), from_base);
     }
     let entry = self.changed.entry(path.to_owned()).or_default();
@@ -213,7 +268,7 @@ impl WorkFiles {
         self.remove_as(path, removal);
       }
       VolumeOp::Rename { from, to } if from != to => {
-        let Some(bytes) = self.get(base, from)?.map(<[u8]>::to_vec) else {
+        let Some(bytes) = self.get(base, from)?.map(Cow::into_owned) else {
           return Ok(());
         };
         let removal = self.removal(base, from)?;
@@ -225,10 +280,18 @@ impl WorkFiles {
     Ok(())
   }
 
-  /// A work's delta as a clean rebase leaves it (`Rebased::changed`): per path its bytes where they differ from the
-  /// new base, `None` where it removes the base's file.
+  /// A work's delta as a clean rebase leaves it (`Rebased::changed`), or as a restatement in its log replays it
+  /// (A-207): per path its bytes where they differ from the base, `None` where it removes the base's file.
   pub fn from_changed(changed: BTreeMap<String, Option<Vec<u8>>>) -> WorkFiles {
     WorkFiles { changed }
+  }
+
+  /// What the work holds of its own, in path order (A-207: what a restatement in its log carries).
+  pub fn changed_entries(&self) -> impl Iterator<Item = (&str, Option<&[u8]>)> {
+    self
+      .changed
+      .iter()
+      .map(|(path, entry)| (path.as_str(), entry.as_deref()))
   }
 
   /// Forgets every change: the work now equals its (new) base.

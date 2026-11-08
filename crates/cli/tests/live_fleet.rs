@@ -11,13 +11,26 @@
   clippy::unwrap_used,
   clippy::expect_used,
   clippy::panic,
-  clippy::indexing_slicing
+  clippy::indexing_slicing,
+  clippy::string_slice
 )]
 #![cfg(unix)]
 
 #[path = "../../server/tests/common/nfs.rs"]
 #[allow(dead_code)]
 mod nfs;
+#[path = "../../server/tests/common/nfs4.rs"]
+#[allow(dead_code)]
+mod nfs4;
+// The vhost-user front end a VMM speaks, over the guest driver it rides (`super::guest`), for the virtio-fs flow.
+#[cfg(target_os = "linux")]
+#[path = "../../server/tests/common/guest.rs"]
+#[allow(dead_code)]
+mod guest;
+#[cfg(target_os = "linux")]
+#[path = "../../server/tests/common/vhost_front_end.rs"]
+#[allow(dead_code)]
+mod vhost_front_end;
 
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -285,14 +298,16 @@ fn wait_formed(instances: &[String]) -> Vec<String> {
 }
 
 /// Waits until the bootstrapped fleet is whole on every node: all three members voting in the council, all three in the
-/// committed configuration, and a record session to each peer. A test that kills or stops a node before then can take
+/// committed configuration, a record session to each peer, and a pair key from each shard of each peer (A-92 piece 4b;
+/// `fleet.seal.pair_served`): a live log is durable only once its whole entry carries a key for every candidate
+/// (`live_ship::covers_candidates`), so a candidate stopped before its pairs came holds every live write back. A test that kills or stops a node before then can take
 /// the council below its quorum (the third member is promoted to voter about 1.5 s after the bootstrap when quiet, later
 /// under load) or find no session to a candidate: under load at 36–46 a killed owner left a council of two voters that
 /// never elected again, and an owner found no session to its only reachable candidate (2026-11-05, `live_fleet`).
 fn wait_settled(instances: &[String]) {
   let deadline = Instant::now() + FLEET_WAIT;
   loop {
-    let views: Vec<(String, String, usize)> = instances
+    let views: Vec<(String, String, usize, u64)> = instances
       .iter()
       .map(|instance| {
         let (_, out, _) = run(instance, &["status"]);
@@ -300,24 +315,33 @@ fn wait_settled(instances: &[String]) {
           .lines()
           .filter(|line| line.starts_with("fleet_session "))
           .count();
+        let pairs: u64 = out
+          .lines()
+          .filter_map(|line| line.split_once(" refused fleet.seal.pair_served: "))
+          .filter_map(|(_, count)| count.trim().parse::<u64>().ok())
+          .sum();
         (
           value_of(&out, "fleet_council_voters"),
           value_of(&out, "fleet_configuration_members"),
           sessions,
+          pairs,
         )
       })
       .collect();
-    let whole = views.iter().all(|(voters, members, sessions)| {
+    let pairs_wanted =
+      u64::try_from((FLEET_NODES.len() - 1) * SHARDS.parse::<usize>().unwrap()).unwrap();
+    let whole = views.iter().all(|(voters, members, sessions, pairs)| {
       voters.trim() == FLEET_NODES.len().to_string()
         && members.trim() == FLEET_NODES.len().to_string()
         && *sessions == FLEET_NODES.len() - 1
+        && *pairs >= pairs_wanted
     });
     if whole {
       return;
     }
     assert!(
       Instant::now() < deadline,
-      "the fleet settled (council voters, configuration members, record sessions): {views:?}"
+      "the fleet settled (council voters, configuration members, record sessions, pairs served): {views:?}"
     );
     pause();
   }
@@ -379,10 +403,20 @@ struct Fleet {
   daemons: Vec<FleetProcess>,
   instances: Vec<String>,
   bootstrap: usize,
+  /// Each node's member id, in the order of `instances`.
+  hosts: Vec<String>,
 }
 
 /// Starts three daemon processes from one manifest, waits until they form, and bootstraps the root once.
 fn start_fleet(tag: &str) -> Fleet {
+  let fleet = start_fleet_bootstrapped(tag);
+  wait_settled(&fleet.instances);
+  fleet
+}
+
+/// Starts three daemon processes from one manifest, waits until they form, and bootstraps the root once; returns as
+/// soon as the bootstrap does, with the fleet still forming.
+fn start_fleet_bootstrapped(tag: &str) -> Fleet {
   let pid = std::process::id();
   let scratch = scratch_dir(tag);
   for node in FLEET_NODES {
@@ -410,12 +444,12 @@ fn start_fleet(tag: &str) -> Fleet {
     .unwrap();
   let (code, _, error) = run(&instances[bootstrap], &["bootstrap", "root"]);
   assert_eq!(code, 0, "one bootstrap of the fresh fleet: {error}");
-  wait_settled(&instances);
   Fleet {
     scratch,
     daemons,
     instances,
     bootstrap,
+    hosts,
   }
 }
 
@@ -711,9 +745,37 @@ fn a_live_volumes_acknowledged_writes_survive_its_owners_death() {
 // clients cut off mid-write. SIGSTOP is the unprivileged partition: a stopped process answers nothing, its sockets keep
 // their ports, and SIGCONT returns it with every timer late, as a healed partition or a long scheduling stall does.
 
-/// Sends `signal` to a fleet daemon's process.
+/// Sends `signal` to a fleet daemon's process; a stop is waited for until the kernel shows the process stopped
+/// ([`wait_stopped`]).
 fn signal(process: &FleetProcess, signal: rustix::process::Signal) {
   rustix::process::kill_process(rustix::process::Pid::from_child(&process.child), signal).unwrap();
+  if signal == rustix::process::Signal::STOP {
+    wait_stopped(process.child.id());
+  }
+}
+
+/// Waits, within the fleet wait, until `pid` is shown stopped (`ps`'s state `T`). `kill` returns as soon as a stop is
+/// sent, and the process runs on until it is delivered: under load a "stopped" candidate went on to acknowledge the
+/// entry written next, so a FUSE `fsync` made after both candidates were stopped answered success in 0.28–3 ms with a
+/// candidate truly holding it (3 of 40 loaded runs, CI x86_64, `diag-live-durability-26`), and the flow read it as a
+/// false claim of durability.
+fn wait_stopped(pid: u32) {
+  let deadline = Instant::now() + FLEET_WAIT;
+  loop {
+    let state = Command::new("ps")
+      .args(["-o", "stat=", "-p", &pid.to_string()])
+      .output()
+      .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+      .unwrap_or_default();
+    if state.starts_with('T') {
+      return;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "process {pid} shown stopped within the fleet wait: state {state:?}"
+    );
+    pause();
+  }
 }
 
 /// Creates a live-shipped volume on `owner`: its id.
@@ -796,6 +858,203 @@ fn a_paused_candidate_neither_stops_writes_nor_stays_behind() {
   assert!(
     caught_up,
     "the resumed candidate caught up: {shipping:?} {held:?}"
+  );
+}
+
+/// A-200 with each candidate stopped in turn: do stop one candidate's process, write files, resume it and wait for it
+/// to catch up, then the same with the other. Expect no write to wait on the stopped candidate ([`STOPPED_WAIT`]), since
+/// the other answers throughout, and each resumed candidate to catch up to the owner's head. Before the holders were
+/// shipped to at once, a dispatch folded a write's answers only once every holder's exchange had ended, so the first
+/// write after each stop waited for the stopped holder's exchange to give up: 489–783 ms in 20 of 20 stops on main
+/// (CI, both Linux arches, release, `diag-live-durability-20`), against 3–5 ms for every write after it; under the
+/// rolling partition, writes at p50 1.01 s and p99 5.5 s (2026-11-06, `live_chaos`). And an exchange still in flight when its dispatch ended was dropped with its holder's session in it, so a
+/// resumed candidate was never sent to again (KIND, raft-chaos run 42178128960: both of an owner's sessions
+/// `lent=true` with its log stuck).
+#[test]
+fn each_candidate_stopped_in_turn_holds_no_write_and_catches_up() {
+  /// Shape: writes made while each candidate is stopped.
+  const WRITES_PER_STOP: usize = 4;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping stop-in-turn flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-turns");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = &fleet.instances[owner_index];
+  let others: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| *instance != owner)
+    .collect();
+  let id = create_live_volume(owner, "turns");
+  write_files(owner, &id, 0..1);
+  let liveness = Duration::from_nanos(STOPPED_WAIT);
+  let mut waited = Vec::new();
+  let mut behind = Vec::new();
+  let mut next = 1;
+  for step in 1..fleet.instances.len() {
+    let stopped = (owner_index + step) % fleet.instances.len();
+    signal(&fleet.daemons[stopped], rustix::process::Signal::STOP);
+    let latencies = write_files(owner, &id, next..next + WRITES_PER_STOP);
+    next += WRITES_PER_STOP;
+    signal(&fleet.daemons[stopped], rustix::process::Signal::CONT);
+    let (caught_up, shipping, held) = wait_caught_up(owner, &others, &id);
+    eprintln!(
+      "live turns: {} stopped: writes {latencies:?}; then {shipping:?} {held:?}",
+      fleet.instances[stopped]
+    );
+    waited.extend(
+      latencies
+        .into_iter()
+        .filter(|took| *took >= liveness)
+        .map(|took| (fleet.instances[stopped].clone(), took)),
+    );
+    if !caught_up {
+      behind.push((fleet.instances[stopped].clone(), shipping, held));
+    }
+  }
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  assert!(
+    waited.is_empty(),
+    "no write waits for the stopped candidate: {waited:?}"
+  );
+  assert!(
+    behind.is_empty(),
+    "each resumed candidate catches up: {behind:?}"
+  );
+}
+
+/// Shape: how long a write may take while a candidate is stopped before it counts as having waited on that candidate: a
+/// quarter of the liveness budget. A write that waits for the stopped holder's exchange to give up takes most of the
+/// budget (489–783 ms measured, [`each_candidate_stopped_in_turn_holds_no_write_and_catches_up`]); one that does not
+/// takes the other holder's round trip (3–5 ms). The bound sits between, far from both.
+const STOPPED_WAIT: u64 = slates_server::daemon::LIVENESS_BUDGET_NS / 4;
+
+/// A-200 with both candidates stopped: do stop both candidates' processes, make a write so the owner has entries to
+/// ship (it waits, since no candidate can hold it), keep them stopped for three liveness budgets, then resume them.
+/// Expect the owner's sends that went unanswered to stay within what a holder's lane can end unanswered: once per record
+/// period and once per publication, for each holder. Found 2026-11-07 (CI macos-latest, `diag-live-durability-23`):
+/// a lane ending unanswered sent what every other holder lacked; with both links dropped, each holder's lane ended at
+/// once and sent the other's, and the two went back and forth at the shards' speed (1,658 unanswered sends in one stop,
+/// against 5-13 otherwise).
+#[test]
+fn both_candidates_stopped_draw_no_storm_of_sends() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping both-stopped flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-storm");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let others: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| **instance != owner)
+    .collect();
+  let id = create_live_volume(&owner, "storm");
+  write_files(&owner, &id, 0..1);
+  let before = counter(&owner, "fleet.live.unanswered");
+  let stopped: Vec<usize> = (1..fleet.instances.len())
+    .map(|step| (owner_index + step) % fleet.instances.len())
+    .collect();
+  for index in &stopped {
+    signal(&fleet.daemons[*index], rustix::process::Signal::STOP);
+  }
+  // The write waits for durability no candidate can give; its answer, whatever it is, is not what this judges.
+  let writer = {
+    let (owner, id) = (owner.clone(), id.clone());
+    std::thread::spawn(move || {
+      let attachment = value_of(
+        &run_ready(&owner, &["attach", &id, "--write"]),
+        "attachment",
+      );
+      let _ = run_with_stdin(
+        &owner,
+        &["write", &id, &attachment, "/while-stopped"],
+        live_body(1).as_bytes(),
+      );
+    })
+  };
+  let stop = Duration::from_nanos(3 * slates_server::daemon::LIVENESS_BUDGET_NS);
+  // The test holds the stop for its length; shipped code parks on its driver (D-9).
+  #[allow(clippy::disallowed_methods)]
+  std::thread::sleep(stop);
+  let during = counter(&owner, "fleet.live.unanswered").saturating_sub(before);
+  for index in &stopped {
+    signal(&fleet.daemons[*index], rustix::process::Signal::CONT);
+  }
+  let _ = writer.join();
+  let (caught_up, shipping, held) = wait_caught_up(&owner, &others, &id);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  // Derived: each holder's lane ends unanswered at most once per record period (the period re-sends what it lacks) and
+  // once per publication (the write and its attach), plus the lane in flight when the stop began.
+  let periods = u64::try_from(stop.as_nanos() / u128::from(slates_server::daemon::HEARTBEAT_NS))
+    .unwrap_or(u64::MAX);
+  let publications = 2;
+  let bound = u64::try_from(others.len()).unwrap_or(u64::MAX) * (periods + publications + 1);
+  eprintln!(
+    "live storm: unanswered sends while both stopped {during} (bound {bound}); then {shipping:?} {held:?}"
+  );
+  assert!(
+    during <= bound,
+    "unanswered sends while both candidates were stopped: {during}, over {bound}"
+  );
+  assert!(
+    caught_up,
+    "both candidates caught up once resumed: {shipping:?} {held:?}"
+  );
+}
+
+/// A-200: a new live volume's log is shipped only to candidates that hold its catalog. Do make a volume live-shipped and
+/// write files to it at once. Expect neither candidate to refuse an entry for not holding the volume's catalog
+/// (`fleet.live.hold_refused.no_catalog`): a candidate derives what it keeps from the catalog, which the record plane
+/// places within a record period, so an entry sent before that is refused, and with it the session it rode. Found
+/// 2026-11-06 in `live_chaos`: 116 and 119 such refusals on the two candidates of one run, and the installs they drew
+/// held a session against the record plane's own re-ship of the catalog.
+#[test]
+fn a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping catalog flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-catalog");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = &fleet.instances[owner_index];
+  let others: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| *instance != owner)
+    .collect();
+  let id = create_live_volume(owner, "catalogued");
+  write_files(owner, &id, 0..FILES);
+  let (caught_up, shipping, held) = wait_caught_up(owner, &others, &id);
+  let refused: Vec<(String, u64)> = others
+    .iter()
+    .map(|other| {
+      (
+        (*other).clone(),
+        counter(other, "fleet.live.hold_refused.no_catalog"),
+      )
+    })
+    .collect();
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!("live catalog: refusals {refused:?}; then {shipping:?} {held:?}");
+  assert!(
+    caught_up,
+    "both candidates hold the owner's head: {shipping:?} {held:?}"
+  );
+  assert!(
+    refused.iter().all(|(_, count)| *count == 0),
+    "no entry sent to a candidate without the volume's catalog: {refused:?}"
   );
 }
 
@@ -1103,10 +1362,193 @@ fn a_superseded_owner_resumed_after_its_takeover_is_fenced() {
   );
 }
 
+/// A-200, AC-8.9: a live log ships a write's change, not the volume. Do make `WRITES` stable NFS writes, one at a time,
+/// to a live-shipped volume. Expect one whole record, the log's first: a whole record copies every byte of the volume.
+/// Until 2026-11-05 every local checkpoint shipped one, and a shard checkpoints once its deltas reach the size of its
+/// metadata, so one write in four copied the volume's content (532 whole records in 2,050 writes, and the ones behind
+/// them refused for credit, 431).
+#[test]
+fn a_live_volumes_writes_ship_their_changes_not_the_volume() {
+  /// Shape: enough writes for the shard's journal to checkpoint many times over.
+  const WRITES: u32 = 200;
+  /// Shape: each write's bytes, a page.
+  const WRITE_BYTES: usize = 4096;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping change-only flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-changes");
+  let owner = &fleet.instances[(fleet.bootstrap + 1) % fleet.instances.len()];
+  let (mut live, file, _) = stable_session(owner, "changes", true);
+  let data = vec![0x5a_u8; WRITE_BYTES];
+  for write in 0..WRITES {
+    nfs::write(&mut live, &file, &data, 100 + write);
+  }
+  let counters = live_counters(owner);
+  drop(live);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!("live changes: {WRITES} writes: {counters:?}");
+  let of = |name: &str| counters.get(name).copied().unwrap_or(0);
+  assert!(
+    of("appended") >= u64::from(WRITES),
+    "every write reached the log: {counters:?}"
+  );
+  assert_eq!(
+    of("whole"),
+    1,
+    "only the log's first record is whole: {counters:?}"
+  );
+  assert_eq!(
+    of("refused"),
+    0,
+    "a sequential writer stays within its credit: {counters:?}"
+  );
+}
+
+/// A-200: a candidate that falls behind the owner's retained entries is installed, and the log stays a chain of changes.
+/// Do make stable NFS writes to a live volume from one sequential writer (so the credit never refuses a write), stop one
+/// candidate's process for the middle third of them, then resume it. Expect the paused candidate to catch up to the
+/// owner's head, at least one install image made (it fell behind the retained tail), and the log's first record still
+/// the only whole one. Found 2026-11-07 (CI, `diag-live-durability-14`): a laggard that already held the last whole record set
+/// `owes_whole`, so the next write's record carried the whole volume (20–45 MB in the chaos flows) to every holder. The
+/// up-to-date candidate had to take it before any later write was durable: 100–600 ms a time, and 1.2–1.9 s writes.
+#[test]
+fn a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log() {
+  /// Shape: writes before, during and after the pause, each enough to outrun the retained tail.
+  const WRITES_PER_THIRD: u32 = 60;
+  /// Shape: each write's bytes, a page.
+  const WRITE_BYTES: usize = 4096;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping laggard-install flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-laggard");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = &fleet.instances[owner_index];
+  let paused_index = (owner_index + 1) % fleet.instances.len();
+  let others: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| *instance != owner)
+    .collect();
+  let (mut live, file, id) = stable_session(owner, "laggard", true);
+  let data = vec![0x5a_u8; WRITE_BYTES];
+  let mut xid = 100;
+  let mut write_third = |live: &mut std::net::TcpStream| {
+    for _ in 0..WRITES_PER_THIRD {
+      xid += 1;
+      nfs::write(live, &file, &data, xid);
+    }
+  };
+  write_third(&mut live);
+  signal(&fleet.daemons[paused_index], rustix::process::Signal::STOP);
+  write_third(&mut live);
+  signal(&fleet.daemons[paused_index], rustix::process::Signal::CONT);
+  write_third(&mut live);
+  let (caught_up, shipping, held) = wait_caught_up(owner, &others, &id);
+  let counters = live_counters(owner);
+  drop(live);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!("live laggard: {counters:?}; then {shipping:?} {held:?}");
+  let of = |name: &str| counters.get(name).copied().unwrap_or(0);
+  assert!(
+    caught_up,
+    "the paused candidate caught up: {shipping:?} {held:?}"
+  );
+  // The non-vacuity counter: an install image is made only for a holder behind the retained tail.
+  assert!(
+    of("install_image") >= 1,
+    "the paused candidate fell behind the retained tail and was installed: {counters:?}"
+  );
+  assert_eq!(
+    of("whole"),
+    1,
+    "only the log's first record is whole: {counters:?}"
+  );
+  assert_eq!(
+    of("refused"),
+    0,
+    "a sequential writer stays within its credit: {counters:?}"
+  );
+}
+
+/// A-200, AC-8.9: a candidate's copy of a live log stays within its bound however long the writer runs. Do make stable
+/// NFS writes to a live volume bounded at 1 MiB until the changes shipped are three times its size. Expect every write
+/// answered, no candidate refusing an entry for its bound, and whole records shipped as the changes grow: a candidate
+/// keeps a whole record and the changes after it, at most twice the volume's size, so the owner ships a whole record
+/// once the changes since the last reach the volume's size. Found 2026-11-06: with whole records only at the log's
+/// start, the candidates' copies grew to the bound and both refused every entry after it, so no write was durable.
+#[test]
+fn a_long_writer_keeps_the_candidates_copies_within_their_bound() {
+  /// Shape: each write's bytes, a page.
+  const WRITE_BYTES: usize = 4096;
+  /// Shape: the volume's bound, and three times its size in writes of a page.
+  const VOLUME: &str = "1MiB";
+  /// Shape: see [`VOLUME`].
+  const WRITES: u32 = 3 * 256;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping bound flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-bound");
+  let owner = fleet.instances[(fleet.bootstrap + 1) % fleet.instances.len()].clone();
+  let (mut live, file, _) = stable_session_of(&owner, "bounded", true, VOLUME);
+  let data = vec![0x5a_u8; WRITE_BYTES];
+  let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    for write in 0..WRITES {
+      nfs::write(&mut live, &file, &data, 100 + write);
+    }
+  }))
+  .is_ok();
+  let counters: Vec<_> = fleet
+    .instances
+    .iter()
+    .map(|instance| (instance.clone(), live_counters(instance)))
+    .collect();
+  drop(live);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!("live bound: {WRITES} writes, all answered {written}: {counters:?}");
+  let sum = |name: &str| -> u64 {
+    counters
+      .iter()
+      .map(|(_, counts)| counts.get(name).copied().unwrap_or(0))
+      .sum()
+  };
+  assert!(written, "every write was answered: {counters:?}");
+  assert_eq!(
+    sum("hold_refused.malformed"),
+    0,
+    "no candidate refused an entry for its bound: {counters:?}"
+  );
+  assert!(
+    sum("whole") >= 2,
+    "whole records shipped as the changes grew: {counters:?}"
+  );
+}
+
 /// A stable-write NFS session to a fresh volume's export on `owner`: the stream, the file, and the volume's id.
 fn stable_session(owner: &str, name: &str, live: bool) -> (std::net::TcpStream, Vec<u8>, String) {
+  stable_session_of(owner, name, live, "64MiB")
+}
+
+/// [`stable_session`] for a volume bounded at `size`.
+fn stable_session_of(
+  owner: &str,
+  name: &str,
+  live: bool,
+  size: &str,
+) -> (std::net::TcpStream, Vec<u8>, String) {
   let id = value_of(
-    &run_ready(owner, &["volume", "create", name, "--bounded", "64MiB"]),
+    &run_ready(owner, &["volume", "create", name, "--bounded", size]),
     "id",
   );
   if live {
@@ -1296,6 +1738,24 @@ fn a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it() {
   );
 }
 
+/// The survivor among `hosts` (each member id with its instance) that takes `volume` over, as [`successor_of`] ranks it.
+fn successor_among(hosts: &[(slates_db::register::HostId, String)], volume: &str) -> String {
+  let mut bytes = [0u8; 16];
+  for (byte, pair) in bytes.iter_mut().zip(volume.as_bytes().chunks(2)) {
+    *byte = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
+  }
+  let mut sorted = hosts.to_vec();
+  sorted.sort_by_key(|(host, _)| host.0);
+  let ids: Vec<slates_db::register::HostId> = sorted.iter().map(|(host, _)| *host).collect();
+  let first =
+    slates_db::register::rendezvous_first(&ids, slates_db::register::ObjectId(bytes)).unwrap();
+  sorted
+    .into_iter()
+    .find(|(host, _)| *host == first)
+    .map(|(_, instance)| instance)
+    .unwrap()
+}
+
 /// The survivor that takes `volume` over when `owner` dies, as the configuration ranks it: the rendezvous winner for the
 /// volume's object among the other members (`RegionalConfiguration::successor` over a three-node fleet, whose recovery
 /// cohort is every survivor).
@@ -1418,4 +1878,1192 @@ fn a_successor_that_holds_no_copy_still_takes_a_live_volume_over() {
     Some(&successor),
     "the successor, which held no copy, served every acknowledged write: {counters:?}"
   );
+}
+
+// ── Every transport's durability claim on a live volume (A-200, AC-8.3): FUSE `fsync` and the NFS stable write and
+// `COMMIT` wait above; each other transport whose reply tells its client the data is durable is held to the same rule
+// here. With both candidates' processes stopped, the claim fails (an errno, a refusal), never succeeds; healthy and once
+// they resume, it succeeds.
+
+/// Format: the environment variables that make this test binary the program `slates shards` runs as a Shards fs device:
+/// its role and the descriptor number its stream end arrives at.
+const SHARDS_ROLE: &str = "SLATES_LIVE_TEST_SHARDS_ROLE";
+/// Format: see [`SHARDS_ROLE`].
+const SHARDS_ROLE_FD: &str = "SLATES_LIVE_TEST_SHARDS_FD";
+/// Shape: the descriptor the device is handed its end at, past the standard three.
+const SHARDS_FD: &str = "7";
+/// Format: this flow's test name, which the re-invoked binary is told to run (`--exact`), so the run plays the device.
+const SHARDS_FSYNC_TEST: &str =
+  "a_shards_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it";
+/// Format: the tag before each `FSYNC` the device reports: its phase, its errno and how long it took in microseconds.
+/// The re-invoked test binary prints libtest's banner first, so the tag is looked for anywhere in a line.
+const FSYNC_TAG: &str = "live-shards-fsync: ";
+/// Format: the tag the device prints once it waits for the test's next line on its standard input.
+const READY_TAG: &str = "live-shards-ready";
+/// Format: the FUSE protocol a guest kernel offers (7.31) and the node id of the attachment's root.
+const FUSE_MAJOR: u32 = 7;
+/// Format: see [`FUSE_MAJOR`].
+const FUSE_MINOR: u32 = 31;
+/// Format: see [`FUSE_MAJOR`].
+const ROOT_NODE: u64 = 1;
+/// Format: `O_RDWR`.
+const READ_WRITE: u32 = 2;
+/// Shape: the read-ahead the device offers at INIT (a Linux guest's default, 128 KiB).
+const READAHEAD: u32 = 128 << 10;
+
+/// Shards' fs device as the probe plays it over its stream end: one request at a time, as Shards' VMM forwards them.
+struct ShardsDevice {
+  stream: std::os::unix::net::UnixStream,
+  unique: u64,
+}
+
+impl ShardsDevice {
+  /// One request framed as Shards frames it (a length word, then the FUSE request), and its reply frame.
+  fn ask(&mut self, opcode: slates_bridge_fuse::abi::Opcode, node: u64, body: &[u8]) -> Vec<u8> {
+    use std::io::{Read, Write};
+    self.unique += 1;
+    let total = slates_bridge_fuse::abi::IN_HEADER_LEN + body.len();
+    let length = u32::try_from(total).unwrap().to_le_bytes();
+    let mut request = vec![0u8; total];
+    request[0..4].copy_from_slice(&length);
+    request[4..8].copy_from_slice(&opcode.to_wire().to_le_bytes());
+    request[8..16].copy_from_slice(&self.unique.to_le_bytes());
+    request[16..24].copy_from_slice(&node.to_le_bytes());
+    request[slates_bridge_fuse::abi::IN_HEADER_LEN..].copy_from_slice(body);
+    self.stream.write_all(&length).unwrap();
+    self.stream.write_all(&request).unwrap();
+    let mut word = [0u8; 4];
+    self.stream.read_exact(&mut word).unwrap();
+    let mut reply = vec![0u8; usize::try_from(u32::from_le_bytes(word)).unwrap()];
+    self.stream.read_exact(&mut reply).unwrap();
+    reply
+  }
+
+  /// A `WRITE` of `data` at `offset` through `handle`, then an `FSYNC` of it: the `FSYNC`'s errno and its time.
+  fn write_and_fsync(
+    &mut self,
+    (node, handle): (u64, u64),
+    offset: u64,
+    data: &[u8],
+  ) -> (i32, Duration) {
+    use slates_bridge_fuse::abi::Opcode;
+    let mut write = handle.to_le_bytes().to_vec();
+    write.extend_from_slice(&offset.to_le_bytes());
+    write.extend_from_slice(&u32::try_from(data.len()).unwrap().to_le_bytes());
+    write.extend_from_slice(&[0u8; 20]);
+    write.extend_from_slice(data);
+    assert_eq!(
+      shards_errno(&self.ask(Opcode::Write, node, &write)),
+      0,
+      "WRITE"
+    );
+    self.fsync((node, handle))
+  }
+
+  /// An `FSYNC` of `handle`: its errno and its time.
+  fn fsync(&mut self, (node, handle): (u64, u64)) -> (i32, Duration) {
+    let mut fsync = handle.to_le_bytes().to_vec();
+    fsync.extend_from_slice(&[0u8; 8]);
+    let began = Instant::now();
+    let reply = self.ask(slates_bridge_fuse::abi::Opcode::FSync, node, &fsync);
+    (shards_errno(&reply), began.elapsed())
+  }
+}
+
+fn shards_errno(reply: &[u8]) -> i32 {
+  -i32::from_le_bytes(reply[4..8].try_into().unwrap())
+}
+
+fn shards_word_at(bytes: &[u8], at: usize) -> u64 {
+  u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+}
+
+/// The device's side of [`a_shards_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it`]: mounts the
+/// attachment over its end, opens `/file-0` for writing, then writes and syncs once healthy, once after the test's first
+/// line (the candidates stopped) and syncs once more after its second (the candidates resumed), printing each `FSYNC`.
+fn shards_fsyncer() {
+  use slates_bridge_fuse::abi::{OUT_HEADER_LEN, Opcode};
+  use std::io::{BufRead, Write};
+  use std::os::fd::FromRawFd;
+  let number: i32 = std::env::var(SHARDS_ROLE_FD).unwrap().parse().unwrap();
+  // SAFETY: `slates shards` placed the stream end at this number before the exec; nothing in this process opened it,
+  // so this is its one owner.
+  let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(number) };
+  stream.set_read_timeout(Some(FLEET_WAIT)).unwrap();
+  let mut device = ShardsDevice { stream, unique: 0 };
+  let mut init = Vec::new();
+  for word in [FUSE_MAJOR, FUSE_MINOR, READAHEAD, 0] {
+    init.extend_from_slice(&word.to_le_bytes());
+  }
+  assert_eq!(shards_errno(&device.ask(Opcode::Init, 0, &init)), 0, "INIT");
+  let found = device.ask(Opcode::Lookup, ROOT_NODE, b"file-0\0");
+  assert_eq!(shards_errno(&found), 0, "LOOKUP");
+  let node = shards_word_at(&found, OUT_HEADER_LEN);
+  let mut open = READ_WRITE.to_le_bytes().to_vec();
+  open.extend_from_slice(&0u32.to_le_bytes());
+  let opened = device.ask(Opcode::Open, node, &open);
+  assert_eq!(shards_errno(&opened), 0, "OPEN");
+  let file = (node, shards_word_at(&opened, OUT_HEADER_LEN));
+  let report = |phase: &str, (errno, took): (i32, Duration)| {
+    println!("{FSYNC_TAG}{phase} {errno} {}", took.as_micros());
+    std::io::stdout().flush().unwrap();
+  };
+  report(
+    "healthy",
+    device.write_and_fsync(file, 0, b"held by a candidate"),
+  );
+  let mut line = String::new();
+  println!("{READY_TAG}");
+  std::io::stdout().flush().unwrap();
+  std::io::stdin().lock().read_line(&mut line).unwrap();
+  report(
+    "alone",
+    device.write_and_fsync(file, 19, b", then by no one"),
+  );
+  println!("{READY_TAG}");
+  std::io::stdout().flush().unwrap();
+  std::io::stdin().lock().read_line(&mut line).unwrap();
+  report("resumed", device.fsync(file));
+}
+
+/// Reads `lines` until one holds `tag`: the rest of that line after the tag.
+fn line_after(lines: &mut impl Iterator<Item = std::io::Result<String>>, tag: &str) -> String {
+  for line in lines {
+    let line = line.unwrap();
+    if let Some(at) = line.find(tag) {
+      return line[at + tag.len()..].to_owned();
+    }
+  }
+  panic!("the device ended before printing {tag:?}");
+}
+
+/// An `FSYNC` report's errno and time.
+fn fsync_report(text: &str, phase: &str) -> (i32, Duration) {
+  let mut words = text.split_whitespace();
+  assert_eq!(words.next(), Some(phase), "{text}");
+  let errno = words.next().unwrap().parse().unwrap();
+  let micros = words.next().unwrap().parse().unwrap();
+  (errno, Duration::from_micros(micros))
+}
+
+/// A-200 over the Shards route (§4.6, A-161): a Shards fs device's `FSYNC` is its guest's `fsync`. Do: on a live
+/// volume, run `slates shards ID --fd 7 -- <this test binary>` playing the device; write and `FSYNC` through it once
+/// healthy, once with both candidates' processes stopped (SIGSTOP), and once more after they resume. Expect: healthy,
+/// `0`; stopped, `EIO` after the liveness budget (never `0`, which claimed what no candidate held); resumed, `0`.
+#[test]
+fn a_shards_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it() {
+  use std::io::{BufRead, Write};
+  if std::env::var_os(SHARDS_ROLE).is_some() {
+    shards_fsyncer();
+    return;
+  }
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping Shards fsync flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-shards");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let id = create_live_volume(&owner, "shards-fsynced");
+  write_files(&owner, &id, 0..1);
+  let mut device = slates()
+    .args(["--instance", &owner, "shards", &id, "--fd", SHARDS_FD, "--"])
+    .arg(std::env::current_exe().unwrap())
+    .args(["--exact", SHARDS_FSYNC_TEST, "--nocapture"])
+    .env(SHARDS_ROLE, "fsyncer")
+    .env(SHARDS_ROLE_FD, SHARDS_FD)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let mut input = device.stdin.take().unwrap();
+  let mut lines = std::io::BufReader::new(device.stdout.take().unwrap()).lines();
+  let healthy = fsync_report(&line_after(&mut lines, FSYNC_TAG), "healthy");
+  line_after(&mut lines, READY_TAG);
+  let candidates: Vec<usize> = (0..fleet.daemons.len())
+    .filter(|index| *index != owner_index)
+    .collect();
+  for index in &candidates {
+    signal(&fleet.daemons[*index], rustix::process::Signal::STOP);
+  }
+  writeln!(input).unwrap();
+  let alone = fsync_report(&line_after(&mut lines, FSYNC_TAG), "alone");
+  line_after(&mut lines, READY_TAG);
+  for index in &candidates {
+    signal(&fleet.daemons[*index], rustix::process::Signal::CONT);
+  }
+  writeln!(input).unwrap();
+  let resumed = fsync_report(&line_after(&mut lines, FSYNC_TAG), "resumed");
+  drop(input);
+  let ended = device.wait().unwrap();
+  let counters = live_counters(&owner);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!(
+    "live shards fsync: healthy {healthy:?}; candidates stopped {alone:?}; resumed {resumed:?}; device {ended:?}; \
+     owner's live counters {counters:?}"
+  );
+  assert_eq!(healthy.0, 0, "an FSYNC a candidate holds succeeds");
+  assert_eq!(
+    alone.0,
+    rustix::io::Errno::IO.raw_os_error(),
+    "an FSYNC no candidate can hold fails EIO, not success, after {:?}",
+    alone.1
+  );
+  assert_eq!(resumed.0, 0, "once the candidates are back, FSYNC succeeds");
+}
+
+/// The volume id `slates` prints (32 hex digits) as the client's id.
+fn volume_id_of(text: &str) -> slates_ipc::protocol::VolumeId {
+  let mut bytes = [0u8; 16];
+  for (at, byte) in bytes.iter_mut().enumerate() {
+    *byte = u8::from_str_radix(&text[at * 2..at * 2 + 2], 16).unwrap();
+  }
+  slates_ipc::protocol::VolumeId { bytes }
+}
+
+/// A client of `instance` under the deadlines a client derives from the daemon's budgets.
+fn live_client(instance: &str) -> slates_client::Client {
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  slates_client::Client::connect(instance, deadlines).unwrap()
+}
+
+/// A-200 for a writable direct map (§4.6, A-186): `MapSync` answers `MapSynced` once the stores are written into the
+/// file and published, which on a live volume is a claim that `f` candidates hold them, as every other verb that changes
+/// the volume claims (`live_ship::defer`). Do: map `/file-0` of a live volume for writing through the client library,
+/// store and sync once healthy; stop both candidates' processes, store and sync again; resume them. Expect: healthy,
+/// `MapSynced`; stopped, no answer while no candidate can hold the stores (the writer waits, never a false success),
+/// and the owner's log not durable at its head when it does answer; resumed, the waiting sync answers `MapSynced` and the
+/// log is durable at its head.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_writable_maps_sync_on_a_live_volume_answers_only_once_a_candidate_holds_it() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping map sync flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-map");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let id = create_live_volume(&owner, "map-synced");
+  write_files(&owner, &id, 0..1);
+  let volume = volume_id_of(&id);
+  let mut client = live_client(&owner);
+  let attachment = client
+    .attach(volume, None, slates_ipc::protocol::Intent::Write)
+    .unwrap()
+    .attachment;
+  let mapped = client
+    .map_write(
+      (volume, attachment),
+      "/file-0",
+      slates_client::page_bytes().unwrap(),
+    )
+    .unwrap();
+  mapped.write_at(0, b"HELD").unwrap();
+  let healthy = client.map_sync(&mapped);
+  let candidates: Vec<usize> = (0..fleet.daemons.len())
+    .filter(|index| *index != owner_index)
+    .collect();
+  for index in &candidates {
+    signal(&fleet.daemons[*index], rustix::process::Signal::STOP);
+  }
+  mapped.write_at(0, b"LONE").unwrap();
+  // Three liveness budgets: well past the one a transport's reply waits before it answers "not durable".
+  let quiet = Duration::from_nanos(3 * slates_server::daemon::LIVENESS_BUDGET_NS);
+  let (synced_tx, synced_rx) = std::sync::mpsc::channel();
+  let (alone, after_quiet, resumed, at_resume) = std::thread::scope(|scope| {
+    let mapped = &mapped;
+    let client = &mut client;
+    scope.spawn(move || {
+      let began = Instant::now();
+      let synced = client.map_sync(mapped);
+      let _ = synced_tx.send((synced, began.elapsed()));
+    });
+    let alone = synced_rx.recv_timeout(quiet).ok();
+    let after_quiet = live_line(&owner, "shipping", &id);
+    for index in &candidates {
+      signal(&fleet.daemons[*index], rustix::process::Signal::CONT);
+    }
+    let resumed = alone
+      .is_none()
+      .then(|| synced_rx.recv_timeout(FLEET_WAIT).ok())
+      .flatten();
+    (
+      alone,
+      after_quiet,
+      resumed,
+      live_line(&owner, "shipping", &id),
+    )
+  });
+  let counters = live_counters(&owner);
+  drop(mapped);
+  drop(client);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!(
+    "live map sync: healthy {healthy:?}; candidates stopped {alone:?} (log {after_quiet:?}); resumed {resumed:?} \
+     (log {at_resume:?}); owner's live counters {counters:?}"
+  );
+  assert!(
+    healthy.is_ok(),
+    "a sync a candidate holds succeeds: {healthy:?}"
+  );
+  assert!(
+    alone.is_none(),
+    "a sync no candidate can hold is not answered while the candidates are stopped: {alone:?}, log {after_quiet:?}"
+  );
+  let (resumed, _) = resumed.expect("the waiting sync answers once the candidates resume");
+  assert!(resumed.is_ok(), "and answers MapSynced: {resumed:?}");
+}
+
+/// The `id` of a JSON reply.
+fn json_id(json: &str) -> String {
+  let value: serde_json::Value = serde_json::from_str(json).unwrap();
+  value["id"].as_str().unwrap().to_owned()
+}
+
+/// A-200 for a green's checkout (§4.16, A-201): `checkout` writes the green's head into its base volume and answers
+/// `CheckedOut` once it is published, which on a live-shipped base is a claim that `f` candidates hold it. Do: overlay a
+/// project directory as a live volume, green it at a snapshot, accept one increment, attach the volume for writing; stop
+/// both candidates' processes and check the head out; resume them. Expect: no answer while no candidate can hold the
+/// checkout's writes (never `CheckedOut` with nothing durable), then `CheckedOut` at version 1 once they resume.
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn a_checkout_into_a_live_volume_answers_only_once_a_candidate_holds_it() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping checkout flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-checkout");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let project = format!("{}/project", fleet.scratch.path);
+  std::fs::create_dir_all(format!("{project}/src")).unwrap();
+  std::fs::write(format!("{project}/src/one.txt"), "one: original line").unwrap();
+  let volume = json_id(&run_ready(
+    &owner,
+    &[
+      "volume",
+      "create",
+      "project",
+      "--dynamic",
+      "64MiB",
+      "--base",
+      &project,
+      "--json",
+    ],
+  ));
+  run_ready(&owner, &["base", "pin", &volume]);
+  let (code, _, err) = run(&owner, &["live-ship", &volume]);
+  assert_eq!(code, 0, "live-ship: {err}");
+  let snapshot: serde_json::Value = serde_json::from_str(&run_ready(
+    &owner,
+    &["volume", "snapshot", &volume, "--json"],
+  ))
+  .unwrap();
+  let snapshot = snapshot["snapshot"].to_string();
+  let green = json_id(&run_ready(
+    &owner,
+    &[
+      "green",
+      "project-green",
+      "--base",
+      &volume,
+      "--snapshot",
+      &snapshot,
+      "--json",
+    ],
+  ));
+  let work = json_id(&run_ready(&owner, &["work", &green, "first", "--json"]));
+  run_ready(&owner, &["edit", &work, "src/one.txt", "0", "3", "ONE"]);
+  assert_eq!(run_ready(&owner, &["submit", &work]).trim(), "accepted: 1");
+  let attached: serde_json::Value = serde_json::from_str(&run_ready(
+    &owner,
+    &["attach", &volume, "--write", "--json"],
+  ))
+  .unwrap();
+  let attachment = attached["attachment"].to_string();
+  let candidates: Vec<usize> = (0..fleet.daemons.len())
+    .filter(|index| *index != owner_index)
+    .collect();
+  for index in &candidates {
+    signal(&fleet.daemons[*index], rustix::process::Signal::STOP);
+  }
+  let quiet = Duration::from_nanos(3 * slates_server::daemon::LIVENESS_BUDGET_NS);
+  let (done_tx, done_rx) = std::sync::mpsc::channel();
+  let (alone, resumed) = std::thread::scope(|scope| {
+    let (owner, green, volume, attachment, snapshot) =
+      (&owner, &green, &volume, &attachment, &snapshot);
+    scope.spawn(move || {
+      let checked = run(
+        owner,
+        &[
+          "checkout",
+          green,
+          volume,
+          attachment,
+          "--snapshot",
+          snapshot,
+          "--json",
+        ],
+      );
+      let _ = done_tx.send(checked);
+    });
+    let alone = done_rx.recv_timeout(quiet).ok();
+    for index in &candidates {
+      signal(&fleet.daemons[*index], rustix::process::Signal::CONT);
+    }
+    let resumed = alone
+      .is_none()
+      .then(|| done_rx.recv_timeout(FLEET_WAIT).ok())
+      .flatten();
+    (alone, resumed)
+  });
+  let counters = live_counters(&owner);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!(
+    "live checkout: candidates stopped {alone:?}; resumed {resumed:?}; owner's live counters {counters:?}"
+  );
+  assert!(
+    alone.is_none(),
+    "a checkout no candidate can hold is not answered while the candidates are stopped: {alone:?}"
+  );
+  let (code, out, err) = resumed.expect("the waiting checkout answers once the candidates resume");
+  assert_eq!(code, 0, "checkout: {err}");
+  let checkout: serde_json::Value = serde_json::from_str(&out).unwrap();
+  assert_eq!(checkout["version"], 1, "{out}");
+}
+
+/// Format: `NFS4ERR_DELAY` (RFC 8881 §15.1.1.3), the "try again" a v4 client is told; the same value as NFSv3's
+/// `NFS3ERR_JUKEBOX`.
+const NFS4ERR_DELAY: u32 = 10008;
+/// Format: `stable_how4`'s `UNSTABLE4` and `FILE_SYNC4` (RFC 8881 §18.32.1).
+const UNSTABLE4: u32 = 0;
+/// Format: see [`UNSTABLE4`].
+const FILE_SYNC4: u32 = 2;
+
+/// One NFSv4.2 `WRITE` of `data` at `offset` to `file` under the mount `capability`, `stable` as asked, with the
+/// anonymous state id (RFC 8881 §8.2.3): the result body or the failing status, and how long it took.
+fn v4_write(
+  session: &mut nfs4::Session,
+  (capability, file): (&str, &str),
+  (offset, stable): (u64, u32),
+  data: &[u8],
+) -> (Result<Vec<u8>, u32>, Duration) {
+  let began = Instant::now();
+  let written = session.at(capability, &[file], |args| {
+    args.u32(slates_bridge_nfs::v4::compound::op::WRITE);
+    args.u32(0);
+    args.fixed(&[0u8; 12]);
+    args.u64(offset);
+    args.u32(stable);
+    args.opaque(data);
+  });
+  (written, began.elapsed())
+}
+
+/// One NFSv4.2 `COMMIT` of the whole of `file` under the mount `capability`: the result body or the failing status,
+/// and how long it took.
+fn v4_commit(
+  session: &mut nfs4::Session,
+  (capability, file): (&str, &str),
+) -> (Result<Vec<u8>, u32>, Duration) {
+  let began = Instant::now();
+  let committed = session.at(capability, &[file], |args| {
+    args.u32(slates_bridge_nfs::v4::compound::op::COMMIT);
+    args.u64(0);
+    args.u32(0);
+  });
+  (committed, began.elapsed())
+}
+
+/// Sends `signal` to every candidate's process: each fleet daemon but the owner's.
+fn signal_candidates(fleet: &Fleet, owner_index: usize, sent: rustix::process::Signal) {
+  for (index, daemon) in fleet.daemons.iter().enumerate() {
+    if index != owner_index {
+      signal(daemon, sent);
+    }
+  }
+}
+
+/// A `COMMIT` retried while it is told to try again, within the fleet wait, as a v4 client retries `NFS4ERR_DELAY`:
+/// resumed, the owner's lease is confirmed again within a heartbeat or two, and until then every call is told to try
+/// again (the live-tree fence, AUD-29-83). The last answer.
+fn v4_commit_once_served(
+  session: &mut nfs4::Session,
+  file: (&str, &str),
+) -> (Result<Vec<u8>, u32>, Duration) {
+  let deadline = Instant::now() + FLEET_WAIT;
+  loop {
+    let committed = v4_commit(session, file);
+    if committed.0 != Err(NFS4ERR_DELAY) || Instant::now() >= deadline {
+      return committed;
+    }
+    pause();
+  }
+}
+
+/// A-200 over NFSv4.2 (A-35): the v4 front end serves `WRITE` and `COMMIT` through the NFSv3 procedures, so they wait
+/// as NFSv3's do (`stable_once_durable`), and this holds them to it. Do: export a live volume, create a file over NFSv3,
+/// open a v4 session; write `UNSTABLE` and `COMMIT` healthy; stop both candidates' processes, write `UNSTABLE` and
+/// `COMMIT`, then write `FILE_SYNC`; resume them and `COMMIT` again. Expect: healthy, both succeed; stopped, the
+/// `UNSTABLE` write succeeds (it claims nothing) while the `COMMIT` and the `FILE_SYNC` write each answer
+/// `NFS4ERR_DELAY`, never `NFS4_OK` (the `COMMIT` by the durability wait, after the liveness budget); resumed, the
+/// `COMMIT` succeeds once the lease is confirmed again.
+#[test]
+fn an_nfs_v4_commit_and_stable_write_to_a_live_volume_answer_only_once_a_candidate_holds_them() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping NFSv4 flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-nfs4");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let id = create_live_volume(&owner, "nfs4-shipped");
+  let (code, out, err) = run(&owner, &["export", &id, "--json"]);
+  assert_eq!(code, 0, "export: {err}");
+  let (path, port) = (json_field(&out, "path"), json_field(&out, "port"));
+  let port = port.parse::<u16>().unwrap();
+  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  stream.set_read_timeout(Some(FLEET_WAIT)).unwrap();
+  let root = nfs::mount(&mut stream, &path, 1);
+  nfs::create(&mut stream, &root, "v4", 2);
+  let mut session =
+    nfs4::Session::open(port, format!("live-nfs4-{}", std::process::id()).as_bytes());
+  let file = (path.as_str(), "v4");
+  let healthy_write = v4_write(&mut session, file, (0, UNSTABLE4), b"held by a candidate");
+  let healthy = v4_commit(&mut session, file);
+  signal_candidates(&fleet, owner_index, rustix::process::Signal::STOP);
+  let unstable = v4_write(&mut session, file, (19, UNSTABLE4), b", then by no one");
+  let alone = v4_commit(&mut session, file);
+  let stable = v4_write(&mut session, file, (35, FILE_SYNC4), b", nor this");
+  let late = counter(&owner, "fleet.live.durable_late");
+  signal_candidates(&fleet, owner_index, rustix::process::Signal::CONT);
+  let resumed = v4_commit_once_served(&mut session, file);
+  let counters = live_counters(&owner);
+  drop(stream);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  let status =
+    |outcome: &(Result<Vec<u8>, u32>, Duration)| (outcome.0.as_ref().err().copied(), outcome.1);
+  eprintln!(
+    "live nfs4: healthy write {:?} commit {:?}; candidates stopped: unstable write {:?}, commit {:?}, stable write \
+     {:?}; resumed commit {:?}; owner's live counters {counters:?}",
+    status(&healthy_write),
+    status(&healthy),
+    status(&unstable),
+    status(&alone),
+    status(&stable),
+    status(&resumed)
+  );
+  assert!(
+    healthy_write.0.is_ok() && healthy.0.is_ok(),
+    "a COMMIT a candidate holds succeeds"
+  );
+  assert!(
+    unstable.0.is_ok(),
+    "an UNSTABLE write claims nothing, so it is answered"
+  );
+  assert_eq!(
+    alone.0.err(),
+    Some(NFS4ERR_DELAY),
+    "a COMMIT no candidate can hold is told to try again"
+  );
+  // The non-vacuity counter: the COMMIT was told so by the durability wait, not by the lease's fence, which answers
+  // every call once the stopped candidates' confirmations lapse.
+  assert!(
+    late >= 1,
+    "the COMMIT waited for durability and was answered late: {late}"
+  );
+  // The FILE_SYNC write is told to try again by the durability wait or, once the lease lapsed, by the fence: either way
+  // never `NFS4_OK`.
+  assert_eq!(
+    stable.0.err(),
+    Some(NFS4ERR_DELAY),
+    "so is a FILE_SYNC write"
+  );
+  assert!(
+    resumed.0.is_ok(),
+    "once the candidates are back, COMMIT succeeds: {:?}",
+    status(&resumed)
+  );
+}
+
+/// Format: the environment variable that makes this test binary the VMM `slates vhost-user` runs, and the argument
+/// prefix the device's socket descriptor arrives in (`{fd}`, which libtest takes as a name filter matching nothing).
+#[cfg(target_os = "linux")]
+const VHOST_ROLE: &str = "SLATES_LIVE_TEST_VHOST_ROLE";
+/// Format: see [`VHOST_ROLE`].
+#[cfg(target_os = "linux")]
+const VHOST_FD_ARG: &str = "vhost-fd=";
+/// Format: this flow's test name, which the re-invoked binary is told to run (`--exact`), so the run plays the VMM.
+#[cfg(target_os = "linux")]
+const VHOST_FSYNC_TEST: &str =
+  "a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it";
+/// Format: the request queue a vhost-user guest's driver submits FUSE requests on (virtio-fs: queue 0 is hiprio).
+#[cfg(target_os = "linux")]
+const VHOST_REQUEST_QUEUE: usize = 1;
+
+/// The VMM's guest over the device `slates vhost-user` handed it: one FUSE request at a time on the request queue.
+#[cfg(target_os = "linux")]
+struct VhostGuest {
+  front: vhost_front_end::FrontEnd,
+  guest: guest::Guest<slates_bridge_virtiofs::vhost_user::GuestRegions>,
+  unique: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl VhostGuest {
+  /// One request, kicked, its interrupt awaited: the reply.
+  fn ask(&mut self, opcode: slates_bridge_fuse::abi::Opcode, node: u64, body: &[u8]) -> Vec<u8> {
+    self.unique += 1;
+    let head = self.guest.submit(
+      &guest::message(opcode.to_wire(), self.unique, node, body),
+      guest::REPLY_CAP,
+    );
+    self.front.kick_and_wait(VHOST_REQUEST_QUEUE);
+    let (id, len) = self
+      .guest
+      .reap()
+      .expect("a used element after the interrupt");
+    assert_eq!(id, head, "the request's own element");
+    self.guest.reply_of(head, len)
+  }
+
+  /// A `WRITE` of `data` at the file's start through `handle`, then an `FSYNC`: the `FSYNC`'s errno and its time.
+  fn write_and_fsync(&mut self, (node, handle): (u64, u64), data: &[u8]) -> (i32, Duration) {
+    let written = self.ask(
+      slates_bridge_fuse::abi::Opcode::Write,
+      node,
+      &guest::write_body(handle, data),
+    );
+    assert_eq!(guest::reply_error(&written), 0, "WRITE");
+    self.fsync((node, handle))
+  }
+
+  /// An `FSYNC` of `handle`: its errno (positive) and its time.
+  fn fsync(&mut self, (node, handle): (u64, u64)) -> (i32, Duration) {
+    let mut body = handle.to_le_bytes().to_vec();
+    body.extend_from_slice(&[0u8; 8]);
+    let began = Instant::now();
+    let reply = self.ask(slates_bridge_fuse::abi::Opcode::FSync, node, &body);
+    (-guest::reply_error(&reply), began.elapsed())
+  }
+}
+
+/// The VMM's side of [`a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it`]: adopts the device's
+/// socket, hands it the guest's memory and queues, opens `/file-0` for writing, then writes and syncs once healthy, once
+/// after the test's first line (the candidates stopped) and syncs once more after its second (the candidates resumed),
+/// printing each `FSYNC` as the Shards flow does.
+#[cfg(target_os = "linux")]
+fn vhost_fsyncer() {
+  use slates_bridge_fuse::abi::{OUT_HEADER_LEN, Opcode};
+  use std::io::{BufRead, Write};
+  use std::os::fd::FromRawFd;
+  let number: i32 = std::env::args()
+    .find_map(|arg| arg.strip_prefix(VHOST_FD_ARG).map(str::to_owned))
+    .unwrap()
+    .parse()
+    .unwrap();
+  // SAFETY: `slates vhost-user` placed the device's socket at this number before the exec; nothing in this process
+  // opened it, so this is its one owner.
+  let socket = unsafe { std::os::fd::OwnedFd::from_raw_fd(number) };
+  let front = vhost_front_end::FrontEnd::over(socket);
+  let ram = vhost_front_end::guest_ram(true);
+  let guest = vhost_front_end::guest_over(&ram);
+  assert_eq!(
+    front.negotiate_memory(&ram),
+    0,
+    "the memory table is accepted"
+  );
+  front.configure_queues(&guest);
+  let mut vm = VhostGuest {
+    front,
+    guest,
+    unique: 0,
+  };
+  let found = vm.ask(Opcode::Lookup, ROOT_NODE, b"file-0\0");
+  assert_eq!(guest::reply_error(&found), 0, "LOOKUP");
+  let node = guest::u64_at(&found, OUT_HEADER_LEN);
+  let mut open = READ_WRITE.to_le_bytes().to_vec();
+  open.extend_from_slice(&0u32.to_le_bytes());
+  let opened = vm.ask(Opcode::Open, node, &open);
+  assert_eq!(guest::reply_error(&opened), 0, "OPEN");
+  let file = (node, guest::u64_at(&opened, OUT_HEADER_LEN));
+  let report = |phase: &str, (errno, took): (i32, Duration)| {
+    println!("{FSYNC_TAG}{phase} {errno} {}", took.as_micros());
+    std::io::stdout().flush().unwrap();
+  };
+  let mut line = String::new();
+  report("healthy", vm.write_and_fsync(file, b"held by a candidate"));
+  println!("{READY_TAG}");
+  std::io::stdout().flush().unwrap();
+  std::io::stdin().lock().read_line(&mut line).unwrap();
+  report("alone", vm.write_and_fsync(file, b"then by no one"));
+  println!("{READY_TAG}");
+  std::io::stdout().flush().unwrap();
+  std::io::stdin().lock().read_line(&mut line).unwrap();
+  report("resumed", vm.fsync(file));
+}
+
+/// A-200 over virtio-fs (§4.6, A-9): a guest's `fsync` is its device's `FSYNC`, which a vhost-user device answers once
+/// the owner's barrier has published it, and on a live volume only once `f` candidates hold it. Do: on a live volume,
+/// run `slates vhost-user ID -- <this test binary> vhost-fd={fd}` playing the VMM and its guest; write and `FSYNC`
+/// through it once healthy, once with both candidates' processes stopped (SIGSTOP), and once more after they resume.
+/// Expect: healthy, `0`; stopped, `EIO` after the liveness budget, never `0`; resumed, `0`. Linux only, where vhost-user
+/// is built.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it() {
+  use std::io::{BufRead, Write};
+  if std::env::var_os(VHOST_ROLE).is_some() {
+    vhost_fsyncer();
+    return;
+  }
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping virtio-fs fsync flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-vhost");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let id = create_live_volume(&owner, "vhost-fsynced");
+  write_files(&owner, &id, 0..1);
+  let mut vmm = slates()
+    .args(["--instance", &owner, "vhost-user", &id, "--"])
+    .arg(std::env::current_exe().unwrap())
+    .args(["--exact", VHOST_FSYNC_TEST, "--nocapture"])
+    .arg(format!("{VHOST_FD_ARG}{{fd}}"))
+    .env(VHOST_ROLE, "fsyncer")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let mut input = vmm.stdin.take().unwrap();
+  let mut lines = std::io::BufReader::new(vmm.stdout.take().unwrap()).lines();
+  let healthy = fsync_report(&line_after(&mut lines, FSYNC_TAG), "healthy");
+  line_after(&mut lines, READY_TAG);
+  signal_candidates(&fleet, owner_index, rustix::process::Signal::STOP);
+  writeln!(input).unwrap();
+  let alone = fsync_report(&line_after(&mut lines, FSYNC_TAG), "alone");
+  line_after(&mut lines, READY_TAG);
+  // Where the owner's log stood when the stopped FSYNC was answered, and what the device's hold did, before the
+  // candidates resume: an FSYNC answered 0 here must be explained by these (CI's x86_64 lane, 1 of 3, 2026-11-06).
+  let log_alone = live_line(&owner, "shipping", &id);
+  let held_alone = (
+    counter(&owner, "virtiofs.live_fsync_waited"),
+    counter(&owner, "virtiofs.live_fsync_refused"),
+  );
+  signal_candidates(&fleet, owner_index, rustix::process::Signal::CONT);
+  writeln!(input).unwrap();
+  let resumed = fsync_report(&line_after(&mut lines, FSYNC_TAG), "resumed");
+  drop(input);
+  let ended = vmm.wait().unwrap();
+  let counters = live_counters(&owner);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!(
+    "live vhost fsync: healthy {healthy:?}; candidates stopped {alone:?} (log {log_alone:?}, hold (waited, refused) \
+     {held_alone:?}); resumed {resumed:?}; vmm {ended:?}; owner's live counters {counters:?}"
+  );
+  assert_eq!(healthy.0, 0, "an FSYNC a candidate holds succeeds");
+  assert_eq!(
+    alone.0,
+    rustix::io::Errno::IO.raw_os_error(),
+    "an FSYNC no candidate can hold fails EIO, not success, after {:?}",
+    alone.1
+  );
+  assert!(
+    alone.1 >= Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS),
+    "at the liveness budget: {:?}",
+    alone.1
+  );
+  // The non-vacuity counter: the stopped FSYNC's EIO is the hold's, not another refusal's.
+  assert!(
+    held_alone.1 >= 1,
+    "the device's hold answered the stopped FSYNC: {held_alone:?}"
+  );
+  assert_eq!(resumed.0, 0, "once the candidates are back, FSYNC succeeds");
+}
+
+/// This node's council voters, as `status` reports them (`None` while it does not answer).
+fn council_voters(instance: &str) -> Option<usize> {
+  let (code, out, _) = run(instance, &["status"]);
+  (code == 0).then(|| value_of(&out, "fleet_council_voters").trim().parse().ok())?
+}
+
+/// The records `instance` holds for others, as `status` reports them (`fleet_held_records`; 0 while it does not answer).
+fn held_records(instance: &str) -> u64 {
+  let (code, out, _) = run(instance, &["status"]);
+  if code != 0 {
+    return 0;
+  }
+  value_of(&out, "fleet_held_records")
+    .trim()
+    .parse()
+    .unwrap_or(0)
+}
+
+/// §4.8 while a fleet is still forming: do bootstrap a fresh three-node fleet and, at once, stop the node that is
+/// neither the bootstrap nor the owner (SIGSTOP), create a volume on the owner and wait until the bootstrap node holds
+/// its catalog and head, then kill the owner (SIGKILL) and resume the stopped node. Expect a survivor to take the volume
+/// over and serve it. Found 2026-11-05 by raft's soak under load: the council grew a voter at a time, so with its third
+/// member slow to catch up it sat at two voters, the bootstrap node and the owner; two voters can lose neither, and the
+/// owner's death left both survivors at term 1, no election and no takeover, every read refused `OwnerUnreachable`
+/// (red here: two voters at the kill, 40 s with no leader). The council now grows only by steps that raise the
+/// failures it tolerates (`slates_cluster::config_group::widening`), so it stays at the bootstrap node alone until
+/// both others vote.
+#[test]
+fn an_owner_killed_while_its_fleet_still_forms_is_taken_over() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the forming-fleet takeover flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let mut fleet = start_fleet_bootstrapped("forming");
+  let count = fleet.instances.len();
+  let owner_index = (fleet.bootstrap + 1) % count;
+  let third_index = (fleet.bootstrap + 2) % count;
+  signal(&fleet.daemons[third_index], rustix::process::Signal::STOP);
+  let owner = fleet.instances[owner_index].clone();
+  let bootstrap = fleet.instances[fleet.bootstrap].clone();
+  let id = value_of(
+    &run_ready(
+      &owner,
+      &["volume", "create", "forming", "--bounded", "8MiB"],
+    ),
+    "id",
+  );
+  // The catalog and the head, placed on the owner and the bootstrap node (`f + 1`): a takeover can find the volume.
+  let deadline = Instant::now() + FLEET_WAIT;
+  while held_records(&bootstrap) < 2 {
+    assert!(
+      Instant::now() < deadline,
+      "the bootstrap node holds the volume's catalog and head"
+    );
+    pause();
+  }
+  let voters_at_kill = council_voters(&bootstrap);
+  let third = fleet.daemons.remove(third_index);
+  drop(fleet.daemons.remove(if owner_index > third_index {
+    owner_index - 1
+  } else {
+    owner_index
+  }));
+  signal(&third, rustix::process::Signal::CONT);
+  fleet.daemons.push(third);
+  let survivors: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| **instance != owner)
+    .collect();
+  eprintln!(
+    "forming: the bootstrap node's council held {voters_at_kill:?} voters when the owner was killed"
+  );
+  let (successor, took) = wait_served_whole(&survivors, &id, 0);
+  eprintln!("forming: served by {successor} after {took:?}");
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+}
+
+/// Shape: volumes a test may create to find one whose successor is a chosen node: each is that node's with
+/// probability one half among two survivors, so twenty all miss once in about a million runs.
+const SUCCESSOR_TRIES: usize = 20;
+/// Shape: how long the test keeps the candidate stopped once the writes are under way: several record periods.
+const STOPPED_HOLD: Duration = Duration::from_millis(500);
+
+/// A-200 with A-92 piece 4c: do bootstrap a fresh fleet and, at once, stop one candidate (SIGSTOP), before the owner's
+/// shards have delivered their pair keys to it; create volumes on the owner until one's successor is the stopped node,
+/// turn it live-shipped, write to it, resume the candidate, then kill the owner once the writes return. Expect the
+/// writes to return, and the successor to serve every one. Found 2026-11-05: the log's whole entry was sealed while the
+/// candidate was stopped, so it carried no copy of the lineage key for it (no pair had been delivered); the owner never
+/// sealed another, and the successor refused the rebuild 145 times without serving the volume. A write is now durable
+/// only once the log's last whole entry covers every candidate, and the owner checkpoints again once the pairs it
+/// lacked are delivered (`live_ship::covers_candidates`). In a settled fleet every pair is delivered before any volume
+/// is made, so only a forming fleet shows it.
+#[test]
+fn a_live_volume_made_while_its_successor_was_stopped_is_served_by_it() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping key flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let mut fleet = start_fleet_bootstrapped("live-keyed");
+  let count = fleet.instances.len();
+  let owner_index = (fleet.bootstrap + 1) % count;
+  let stopped_index = (fleet.bootstrap + 2) % count;
+  signal(&fleet.daemons[stopped_index], rustix::process::Signal::STOP);
+  let owner = fleet.instances[owner_index].clone();
+  let stopped = fleet.instances[stopped_index].clone();
+  let hosts: Vec<(slates_db::register::HostId, String)> = fleet
+    .hosts
+    .iter()
+    .zip(&fleet.instances)
+    .filter(|(_, instance)| **instance != owner)
+    .map(|(host, instance)| {
+      (
+        slates_db::register::HostId(host.parse().unwrap()),
+        instance.clone(),
+      )
+    })
+    .collect();
+  let began = Instant::now();
+  let id = (0..SUCCESSOR_TRIES)
+    .map(|attempt| {
+      let id = value_of(
+        &run_ready(
+          &owner,
+          &[
+            "volume",
+            "create",
+            &format!("keyed-{attempt}"),
+            "--bounded",
+            "8MiB",
+          ],
+        ),
+        "id",
+      );
+      eprintln!("live keyed: created {id} after {:?}", began.elapsed());
+      id
+    })
+    .find(|id| successor_among(&hosts, id) == stopped)
+    .expect("a volume whose successor is the stopped node");
+  eprintln!(
+    "live keyed: {id}'s successor is the stopped node, after {:?}",
+    began.elapsed()
+  );
+  // `live-ship` is answered once its own publication is durable, which waits for the stopped candidate too, so it runs
+  // beside the writes, off this thread.
+  let (sender, receiver) = std::sync::mpsc::channel();
+  {
+    let (owner, id) = (owner.clone(), id.clone());
+    std::thread::spawn(move || {
+      let (code, _, err) = run(&owner, &["live-ship", &id]);
+      assert_eq!(code, 0, "live-ship: {err}");
+      sender.send(write_files(&owner, &id, 0..FILES)).unwrap();
+    });
+  }
+  eprintln!(
+    "live keyed: live-shipped and writing, after {:?}",
+    began.elapsed()
+  );
+  let returned_while_stopped = receiver.recv_timeout(STOPPED_HOLD).is_ok();
+  signal(&fleet.daemons[stopped_index], rustix::process::Signal::CONT);
+  if !returned_while_stopped {
+    receiver
+      .recv_timeout(FLEET_WAIT)
+      .expect("the writes return once the candidate is back");
+  }
+  drop(fleet.daemons.remove(owner_index));
+  let survivors: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| **instance != owner)
+    .collect();
+  let (successor, took) = wait_served_whole(&survivors, &id, FILES);
+  eprintln!(
+    "live keyed: the writes returned while the candidate was stopped: {returned_while_stopped}; served whole by \
+     {successor} after {took:?}"
+  );
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+}
+
+/// Shape: how long the test keeps both candidates stopped while a change waits on the macOS mount: past the give-up a
+/// soft mount imposed, measured at 57.1 s on 2026-11-05 (conformance's `a_live_shipped_volume_makes_a_writer_wait_…`,
+/// both candidates stopped), with a margin of a few of the client's own retry waits.
+#[cfg(target_os = "macos")]
+const PAST_SOFT_GIVE_UP: Duration = Duration::from_secs(75);
+
+/// A kernel mount made by `slates mount`, unmounted when dropped, by force if the plain unmount is refused. Declared
+/// after the fleet it mounts, so it drops first: no daemon is stopped under it.
+#[cfg(target_os = "macos")]
+struct KernelMount {
+  path: String,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for KernelMount {
+  fn drop(&mut self) {
+    let plain = Command::new("umount").arg(&self.path).output();
+    if !plain.is_ok_and(|out| out.status.success()) {
+      let _ = Command::new("umount").args(["-f", &self.path]).output();
+    }
+  }
+}
+
+/// A-200 through the macOS kernel's own NFS client (§4.6): do mount a live-shipped volume with `slates mount`, open a
+/// file there, stop both candidates (SIGSTOP), ask the file for a new size, and resume the candidates once the
+/// soft mount's measured give-up has passed. Expect the size change to wait for the candidates and then succeed: A-200
+/// "holders that do not answer make the writer wait: backpressure, never a false success". Found 2026-11-05 by the
+/// conformance agent: the macOS mount was `soft,intr`, so the kernel itself ended the waiting call `ETIMEDOUT` after
+/// 57.1 s whatever the daemon answered (a held reply or `NFS3ERR_JUKEBOX`). The mount is now `hard,intr`
+/// (`slates_bridge_nfs::client::MountArgs`): the kernel waits as long as the daemon asks, and a signal still interrupts
+/// the caller. Only the candidates stop; the daemon serving the mount never does.
+#[cfg(target_os = "macos")]
+#[test]
+#[allow(clippy::disallowed_methods)] // a program's calls on the slates mount, the point of the test
+fn a_writer_on_a_macos_mount_waits_for_stopped_candidates_rather_than_fail() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping kernel-mount flow: set SLATES_TEST_CLI=1 to run it (three daemons, a kernel mount)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-mounted");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let id = write_live_volume(&owner, 1);
+  let path = format!("{}/mnt", fleet.scratch.path);
+  assert!(
+    Command::new("mkdir")
+      .args(["-p", &path])
+      .output()
+      .unwrap()
+      .status
+      .success()
+  );
+  let (code, _, err) = run(&owner, &["mount", &id, &path]);
+  assert_eq!(code, 0, "slates mount: {err}");
+  let mount = KernelMount { path: path.clone() };
+  #[allow(clippy::disallowed_methods)]
+  // a program's call on the slates mount, the point of the test
+  let handle = std::fs::OpenOptions::new()
+    .read(true)
+    .write(true)
+    .create(true)
+    .truncate(true)
+    .open(format!("{path}/sized.bin"))
+    .unwrap();
+  let candidates: Vec<usize> = (0..fleet.instances.len())
+    .filter(|index| *index != owner_index)
+    .collect();
+  for index in &candidates {
+    signal(&fleet.daemons[*index], rustix::process::Signal::STOP);
+  }
+  let began = Instant::now();
+  let (changed, answered) = std::thread::scope(|scope| {
+    let change = scope.spawn(|| (handle.set_len(4096), began.elapsed()));
+    while !change.is_finished() && began.elapsed() < PAST_SOFT_GIVE_UP {
+      pause();
+    }
+    for index in &candidates {
+      signal(&fleet.daemons[*index], rustix::process::Signal::CONT);
+    }
+    change.join().unwrap()
+  });
+  eprintln!("live mounted: the size change answered after {answered:?}: {changed:?}");
+  drop(handle);
+  drop(mount);
+  assert!(
+    changed.is_ok(),
+    "a writer waiting for stopped candidates failed after {answered:?}: {changed:?}"
+  );
+  assert!(
+    answered >= PAST_SOFT_GIVE_UP,
+    "the change waited for the candidates rather than answering while both were stopped: {answered:?}"
+  );
+}
+
+/// A-200 on the node that bootstrapped the fleet: do bootstrap a fresh fleet and, at once, make a live-shipped volume on
+/// the bootstrap node and write to it. Expect each write to return durable and both candidates to hold the owner's head.
+/// Found 2026-11-07 by the Linux conformance pair (diag run 42325923902, native-linux-fuse fsx over a live volume on node
+/// a, which had bootstrapped): the owner's log stood at head=2 durable=none owed=true for the whole run with 49
+/// publications refused for credit, and both candidates' `fleet.live` counters were empty: nothing was ever sent to them.
+/// The owner's shipper had taken its holders from the configuration at the volume's first publication, when the
+/// bootstrap node's configuration named only itself, and kept that empty set for good.
+#[test]
+fn a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the bootstrap-node live flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet_bootstrapped("live-bootstrap");
+  let owner = fleet.instances[fleet.bootstrap].clone();
+  let others: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| **instance != owner)
+    .collect();
+  let (sender, receiver) = std::sync::mpsc::channel();
+  {
+    let owner = owner.clone();
+    std::thread::spawn(move || {
+      let id = create_live_volume(&owner, "bootstrapped");
+      sender.send(id.clone()).unwrap();
+      write_files(&owner, &id, 0..FILES);
+      sender.send(id).unwrap();
+    });
+  }
+  let id = receiver
+    .recv_timeout(FLEET_WAIT)
+    .expect("the live volume was made");
+  let written = receiver.recv_timeout(FLEET_WAIT).is_ok();
+  let (caught_up, shipping, held) = wait_caught_up(&owner, &others, &id);
+  let counters: Vec<_> = fleet
+    .instances
+    .iter()
+    .map(|instance| (instance.clone(), live_counters(instance)))
+    .collect();
+  eprintln!(
+    "live bootstrap: written={written} caught_up={caught_up} shipping={shipping:?} held={held:?} {counters:?}"
+  );
+  if !(written && caught_up) {
+    for instance in &fleet.instances {
+      let (_, out, _) = run(instance, &["status"]);
+      let lines: Vec<&str> = out
+        .lines()
+        .filter(|line| {
+          line.starts_with("fleet_host")
+            || line.starts_with("fleet_configuration_version")
+            || line.starts_with("fleet_configuration_members")
+            || line.starts_with("fleet_council_voters")
+            || line.starts_with("fleet_council_leads")
+            || line.starts_with("fleet_members")
+            || line.starts_with("fleet_session ")
+            || line.contains("learner")
+            || line.contains("consensus")
+            || line.contains("join")
+            || line.contains("fleet.record")
+            || line.contains("fleet.accept")
+            || line.contains("head")
+            || line.contains("catalog")
+            || line.contains("place")
+            || line.contains("commit")
+            || line.contains(" live ")
+        })
+        .filter(|line| !line.contains("catalog.volumes"))
+        .collect();
+      eprintln!("live bootstrap --- {instance}\n{}", lines.join("\n"));
+    }
+    let (_, stat, stat_err) = run(&owner, &["volume", "stat", &id]);
+    eprintln!("live bootstrap --- the owner's volume stat\n{stat}{stat_err}");
+  }
+  assert!(
+    written && caught_up,
+    "the bootstrap node's live writes became durable and both candidates hold them: {shipping:?} {held:?} \
+     {counters:?}"
+  );
+  drop(fleet.daemons);
+  drop(fleet.scratch);
 }

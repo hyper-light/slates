@@ -179,7 +179,7 @@ struct Reader {
 /// The log.
 #[derive(Debug)]
 pub struct OpLog {
-  records: VecDeque<OpRecord>,
+  records: Ring,
   bytes: usize,
   budget_bytes: usize,
   next_seq: u64,
@@ -200,7 +200,7 @@ impl OpLog {
   /// A log retaining up to `budget_bytes` of records.
   pub fn new(budget_bytes: usize) -> Self {
     Self {
-      records: VecDeque::new(),
+      records: Ring::new(),
       bytes: 0,
       budget_bytes,
       next_seq: 1,
@@ -372,28 +372,11 @@ impl OpLog {
       self.dropped = self.dropped.saturating_add(1);
     }
     self.bytes = self.bytes.saturating_add(incoming);
-    self.reserve_within_budget();
-    self.records.push_back(record);
+    let budget_bytes = self.budget_bytes;
+    self
+      .records
+      .push_back(record, || records_within(budget_bytes));
     seq
-  }
-
-  /// Grows the ring, when full, by doubling but never past the records the budget can hold: every record is charged
-  /// at least its fixed size and the oldest leave before the newest lands, so `budget_bytes / size_of::<OpRecord>()`
-  /// records is the most retention ever keeps (one, when a single record is larger than the budget). Plain doubling let the allocation reach twice the budget the
-  /// volume is charged for (§4.2; 2026-10-04: a 43 MB budget's ring had grown to a 33.8 MB allocation on its way to
-  /// 64 MB).
-  fn reserve_within_budget(&mut self) {
-    let len = self.records.len();
-    if len < self.records.capacity() {
-      return;
-    }
-    let most = self
-      .budget_bytes
-      .checked_div(std::mem::size_of::<OpRecord>())
-      .unwrap_or(0)
-      .max(len.saturating_add(1));
-    let target = len.saturating_mul(2).max(1).min(most);
-    self.records.reserve_exact(target.saturating_sub(len));
   }
 
   /// Records since `seq` (exclusive), oldest first. Sequences are contiguous (each append takes the next, and
@@ -405,7 +388,7 @@ impl OpLog {
     let skip = usize::try_from(seq.saturating_add(1).saturating_sub(oldest))
       .unwrap_or(usize::MAX)
       .min(self.records.len());
-    self.records.range(skip..)
+    self.records.range_from(skip)
   }
 
   /// The newest sequence assigned.
@@ -427,11 +410,7 @@ impl OpLog {
   /// `budget_bytes / size_of::<OpRecord>()`, and one when a single record is larger than the budget. A reader that
   /// tracks sequences of its own bounds them by this: more than it are more than the log can still be asked about.
   pub fn capacity(&self) -> usize {
-    self
-      .budget_bytes
-      .checked_div(std::mem::size_of::<OpRecord>())
-      .unwrap_or(0)
-      .max(1)
+    records_within(self.budget_bytes)
   }
 
   /// Records dropped by retention.
@@ -448,6 +427,144 @@ impl OpLog {
   pub fn is_empty(&self) -> bool {
     self.records.is_empty()
   }
+}
+
+/// Shape: the bit width of a full segment's record count: 2⁷ = 128 records of `OpRecord` (88 bytes on a 64-bit host,
+/// its paths apart) are 11 KiB, under three pages, the most one append allocates or copies past the first segment
+/// ([`Ring`] says why that bound, and what it costs).
+const SEGMENT_SHIFT: u32 = 7;
+/// Derived: the records a full segment holds, `1 << SEGMENT_SHIFT`.
+const SEGMENT_RECORDS: usize = 1 << SEGMENT_SHIFT;
+/// Derived: the offset bits of a record's place past the first segment, `SEGMENT_RECORDS - 1`.
+const SEGMENT_MASK: usize = SEGMENT_RECORDS - 1;
+
+/// The log's records, oldest first, in segments of at most [`SEGMENT_RECORDS`] (the shape of `slates_image::Segments`,
+/// with a front that pops). A doubling ring copied every retained record in the one append that needed room (2.75 MiB,
+/// 302 µs against a slice of 23.7 µs; GAPS 2026-10-24); one segment is a microsecond's copy. Its price is the
+/// allocation's slack once a journal outgrows a segment: the oldest segment's departed slots and the newest one's
+/// unfilled ones, two segments at most (22 KiB), against a doubling ring's twice the budget (2026-10-04). The list of
+/// segments is a 128th of the records long, so its own growth stays under a segment's to two million records. Every segment but the first and the last is full, so a record's place follows from its
+/// distance from the oldest. The first segment grows by doubling within the records the budget can hold, so a journal
+/// within one segment allocates exactly as before (§4.2: never past what the volume is charged for). Each later
+/// segment is allocated whole and never grows, so no append copies more than one segment, and the oldest segment is
+/// freed when its last record leaves.
+#[derive(Debug, Default)]
+struct Ring {
+  /// The oldest segment, held directly so the oldest record is one step away (every append asks for it).
+  first: VecDeque<OpRecord>,
+  /// The segments after the first, oldest first: each full but the last.
+  rest: VecDeque<VecDeque<OpRecord>>,
+  len: usize,
+}
+
+impl Ring {
+  const fn new() -> Self {
+    Self {
+      first: VecDeque::new(),
+      rest: VecDeque::new(),
+      len: 0,
+    }
+  }
+
+  const fn len(&self) -> usize {
+    self.len
+  }
+
+  const fn is_empty(&self) -> bool {
+    self.len == 0
+  }
+
+  fn front(&self) -> Option<&OpRecord> {
+    self.first.front()
+  }
+
+  fn pop_front(&mut self) -> Option<OpRecord> {
+    let record = self.first.pop_front()?;
+    self.len = self.len.saturating_sub(1);
+    if self.first.is_empty()
+      && let Some(next) = self.rest.pop_front()
+    {
+      self.first = next;
+    }
+    Some(record)
+  }
+
+  /// Appends `record`; `budget_records` answers the most records the budget holds ([`OpLog::capacity`]), which bounds
+  /// the first segment's growth. It is asked only when that segment must grow, so a full ring's append asks nothing.
+  fn push_back(&mut self, record: OpRecord, budget_records: impl FnOnce() -> usize) {
+    self.len = self.len.saturating_add(1);
+    if self.rest.is_empty() && self.first.len() < SEGMENT_RECORDS {
+      let held = self.first.len();
+      if held == self.first.capacity() {
+        let target = held
+          .saturating_mul(2)
+          .clamp(1, SEGMENT_RECORDS)
+          .min(budget_records())
+          .max(held.saturating_add(1));
+        self.first.reserve_exact(target.saturating_sub(held));
+      }
+      self.first.push_back(record);
+      return;
+    }
+    if let Some(last) = self.rest.back_mut()
+      && last.len() < SEGMENT_RECORDS
+    {
+      last.push_back(record);
+      return;
+    }
+    // A later segment is made whole: the ring only reaches one once the budget holds more than a segment.
+    let mut segment = VecDeque::with_capacity(SEGMENT_RECORDS);
+    segment.push_back(record);
+    self.rest.push_back(segment);
+  }
+
+  /// The records from the `skip`-th oldest on, oldest first; the cost is the records returned.
+  fn range_from(&self, skip: usize) -> impl Iterator<Item = &OpRecord> {
+    let first = self.first.len();
+    let past = skip.saturating_sub(first);
+    let segment = past
+      .checked_shr(SEGMENT_SHIFT)
+      .unwrap_or(0)
+      .min(self.rest.len());
+    let offset = past & SEGMENT_MASK;
+    let in_first = self.first.range(skip.min(first)..);
+    let later = self
+      .rest
+      .range(segment..)
+      .enumerate()
+      .flat_map(move |(index, records)| {
+        let from = if index == 0 {
+          offset.min(records.len())
+        } else {
+          0
+        };
+        records.range(from..)
+      });
+    in_first.chain(later)
+  }
+
+  #[cfg(test)]
+  fn iter(&self) -> impl Iterator<Item = &OpRecord> {
+    self.first.iter().chain(self.rest.iter().flatten())
+  }
+
+  /// The records the ring's segments have room for, held or not.
+  #[cfg(test)]
+  fn capacity(&self) -> usize {
+    self
+      .first
+      .capacity()
+      .saturating_add(self.rest.iter().map(VecDeque::capacity).sum())
+  }
+}
+
+/// The most records `budget_bytes` holds: every record is charged at least its fixed size, so
+/// `budget_bytes / size_of::<OpRecord>()`, and one when a single record is larger than the budget.
+fn records_within(budget_bytes: usize) -> usize {
+  budget_bytes
+    .checked_div(std::mem::size_of::<OpRecord>())
+    .unwrap_or(0)
+    .max(1)
 }
 
 /// A charge in bytes as the measurement's width (`usize` → `u64`, saturating where a `usize` is wider).
@@ -940,8 +1057,67 @@ mod tests {
     }
   }
 
-  /// §4.2: do append far past the budget; expect the ring's allocation never to exceed the records the budget holds
-  /// (doubling would reach twice that), with retention as before.
+  /// A-96 across segments: do append several segments' worth past a budget of more than one segment, so the oldest
+  /// segment is part-drained and segments have left; expect the records since every sequence, from before the oldest
+  /// retained to past the newest, to be exactly the retained records with a later sequence, in order.
+  #[test]
+  fn records_since_any_sequence_cross_segments_exactly() {
+    let budget = (3 * SEGMENT_RECORDS + SEGMENT_RECORDS / 2) * std::mem::size_of::<OpRecord>();
+    let mut log = OpLog::new(budget);
+    for i in 0..(9 * SEGMENT_RECORDS + 5) as u64 {
+      log.append(
+        &mut unbounded(),
+        Op::Create,
+        "",
+        Some(InodeNo(i)),
+        Epoch(0),
+        i,
+        0,
+      );
+    }
+    assert!(
+      log.dropped() > 0 && log.len() > 2 * SEGMENT_RECORDS,
+      "segments left and several are held"
+    );
+    for seq in 0..=log.head_seq() + 2 {
+      let indexed: Vec<u64> = log.since(seq).map(|r| r.seq).collect();
+      let filtered: Vec<u64> = log
+        .records
+        .iter()
+        .filter(|r| r.seq > seq)
+        .map(|r| r.seq)
+        .collect();
+      assert_eq!(indexed, filtered, "since {seq}");
+    }
+  }
+
+  /// §4.2 within one segment: do append past a budget smaller than a segment; expect the ring's allocation never past
+  /// the records the budget holds, as before segments.
+  #[test]
+  fn a_journal_within_one_segment_never_allocates_past_its_budget() {
+    let records = SEGMENT_RECORDS / 3;
+    let mut log = OpLog::new(records * std::mem::size_of::<OpRecord>());
+    for i in 0..(4 * SEGMENT_RECORDS) as u64 {
+      log.append(
+        &mut unbounded(),
+        Op::Create,
+        "",
+        Some(InodeNo(i)),
+        Epoch(0),
+        i,
+        0,
+      );
+      assert!(
+        log.records.capacity() <= records,
+        "capacity {} past {records}",
+        log.records.capacity()
+      );
+    }
+  }
+
+  /// §4.2: do append far past the budget; expect the ring's allocation never to exceed the records the budget holds by
+  /// more than two segments' slack (the oldest one's departed slots and the newest one's unfilled ones; doubling would
+  /// reach twice the budget), with retention as before.
   #[test]
   fn the_ring_never_allocates_past_its_budget() {
     let budget = 1000 * std::mem::size_of::<OpRecord>();
@@ -957,8 +1133,8 @@ mod tests {
         0,
       );
       assert!(
-        log.records.capacity() <= 1000,
-        "capacity {} past the budget's 1000 records",
+        log.records.capacity() <= 1000 + 2 * SEGMENT_RECORDS,
+        "capacity {} past the budget's 1000 records and two segments",
         log.records.capacity()
       );
     }

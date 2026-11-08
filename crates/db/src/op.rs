@@ -8,8 +8,9 @@ use slates_wire::Wire;
 use crate::catalog::{
   AccessEntry, AttachmentRecord, AuditRecord, BaseRecord, CompletionRecord, ConsumerRecord,
   GrantRecord, GrantState, LandingLeaseRecord, LandingRecord, LandingState, LeaseRecord,
-  LineageEdge, NfsClientRecord, NfsDelegationRecord, NfsLockRecord, NfsOpenRecord, PlacementState,
-  SizeClass, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord, VolumeState,
+  LineageEdge, NameAliasRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord, NfsOpenRecord,
+  PlacementState, SizeClass, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
+  VolumeState,
 };
 
 /// One mutation.
@@ -362,6 +363,85 @@ pub enum Op {
     /// Whether it is live-shipped now.
     live_shipped: bool,
   },
+  /// A work volume's change since its last restatement, as the verb applied it (A-207; §4.16; D-18: a local
+  /// acknowledgement promises daemon-restart survival only when it is recoverable from anchor-owned RAM). The entry
+  /// is the server's encoded work-log entry (an edit or a declaration); the database stores it opaquely, appended to
+  /// the work's log, and the server replays the log onto the recovered work. Counted against the merge byte budget the
+  /// green chains share. Appended (2026-11-04).
+  WorkLogged {
+    /// The work volume.
+    work: VolumeId,
+    /// The encoded entry.
+    entry: Vec<u8>,
+  },
+  /// A green volume's origin, recorded as a reference to the complete immutable snapshot it starts from (A-217;
+  /// §4.16; the A-9 requirement that a chain starts "from scratch or a complete immutable base"): the base volume,
+  /// the snapshot, and the identity of the origin walked from it, so recovery walks the same snapshot again and
+  /// refuses one that no longer gives the same origin. The green holds the snapshot while it lives, so nothing frees
+  /// it under the reference. Recorded once, before any increment. Appended (2026-11-05).
+  GreenOriginHeld {
+    /// The green volume.
+    green: VolumeId,
+    /// The snapshot it names.
+    origin: crate::partition::OriginRef,
+  },
+  /// A work volume restated whole (§4.16): its base, the files it holds of its own and its journal, after an accepted
+  /// submit or a rebase. Replaces the work's log with this one entry. Appended (2026-11-04).
+  WorkRestated {
+    /// The work volume.
+    work: VolumeId,
+    /// The encoded restatement.
+    entry: Vec<u8>,
+  },
+  /// A name was reserved at its name's partition for a clone another partition is about to make (A-236): the name is
+  /// held from here, and resolves nothing until confirmed. Appended.
+  NameAliasReserved {
+    /// The alias, unconfirmed.
+    record: NameAliasRecord,
+  },
+  /// A reserved name's clone was made: the alias resolves from here (A-236). Appended.
+  NameAliasConfirmed {
+    /// The name.
+    name: String,
+  },
+  /// A name's alias was released: its clone was destroyed, never made, or no longer holds the name (A-236). Appended.
+  NameAliasReleased {
+    /// The name.
+    name: String,
+  },
+  /// A CLI attachment's term was renewed by a verb naming it (A-230). Appended.
+  AttachmentRenewed {
+    /// The attachment.
+    id: u64,
+    /// When its renewed term lapses.
+    expires_ns: u64,
+  },
+  /// A CLI attachment's term lapsed: it is removed, and its id kept among the expired so a later use is refused by kind
+  /// (A-230). Appended.
+  AttachmentExpired {
+    /// The attachment.
+    id: u64,
+  },
+  /// A green's checkpoint (W3; §4.16 "Deltas older than the derived retention fold into checkpoint deltas"): the
+  /// green's state at `version` beyond its origin, encoded (`slates_merge::checkpoint`), held in place of every
+  /// increment up to `version`, which applying it drops. Refused at or below the checkpoint held and past the head.
+  /// Appended (2026-11-06).
+  GreenCheckpointed {
+    /// The green volume.
+    green: VolumeId,
+    /// The version the checkpoint is the green's state at.
+    version: u64,
+    /// The encoded checkpoint.
+    checkpoint: Vec<u8>,
+  },
+  /// A live-shipped volume's shipper committed its holder set (A-240): carried by the catalog register to `f + 1`
+  /// before the shipper's first entry. Appended (2026-11-06).
+  LiveHoldersCommitted {
+    /// The volume.
+    id: VolumeId,
+    /// The shipper's epoch and holders.
+    holders: crate::catalog::LiveHolders,
+  },
 }
 
 impl Op {
@@ -369,6 +449,10 @@ impl Op {
   pub fn name(&self) -> &'static str {
     match self {
       Op::VolumeCreated { .. } => "volume_created",
+      Op::WorkLogged { .. } => "work_logged",
+      Op::GreenOriginHeld { .. } => "green_origin_held",
+      Op::WorkRestated { .. } => "work_restated",
+      Op::GreenCheckpointed { .. } => "green_checkpointed",
       Op::VolumeStateChanged { .. } => "volume_state_changed",
       Op::VolumeResized { .. } => "volume_resized",
       Op::VolumeAccounted { .. } => "volume_accounted",
@@ -421,7 +505,13 @@ impl Op {
       Op::NfsCallsCleared { .. } => "nfs_calls_cleared",
       Op::NfsPurgeOwed { .. } => "nfs_purge_owed",
       Op::NfsPurgeSettled { .. } => "nfs_purge_settled",
+      Op::NameAliasReserved { .. } => "name_alias_reserved",
+      Op::NameAliasConfirmed { .. } => "name_alias_confirmed",
+      Op::NameAliasReleased { .. } => "name_alias_released",
+      Op::AttachmentRenewed { .. } => "attachment_renewed",
+      Op::AttachmentExpired { .. } => "attachment_expired",
       Op::LiveShippingChanged { .. } => "live_shipping_changed",
+      Op::LiveHoldersCommitted { .. } => "live_holders_committed",
     }
   }
 }

@@ -534,3 +534,124 @@ fn the_completion_socket_becomes_readable_on_an_armed_reply() {
     "the daemon issued exactly one wake for the parked client"
   );
 }
+
+/// A create whose framed body is larger than a slot's inline payload, so it travels through the bulk area. Every name
+/// has the same length, so one request's body read as another's decodes cleanly: the silent case.
+fn bulk_create(n: u64) -> slates_ipc::protocol::RequestBody {
+  slates_ipc::protocol::RequestBody::Create {
+    name: format!("bulk-request-{n:08}-padded-past-the-inline-payload"),
+    size: slates_ipc::protocol::SizeClass::Bounded { limit: 1 << 20 },
+    names: slates_ipc::protocol::NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }
+}
+
+/// §4.7 `Ring`, the bulk area. Do: fill the command ring with bulk requests, let the daemon end take the first (its
+/// slot is released to the client), let the client send one more (whose body takes the same bulk chunk, the ring's
+/// position modulo its slots), and only then decode the first request. Expect: the first request's own body. The slot
+/// was released before its body was read, so a client that kept sending wrote the next request's body over it: the
+/// daemon then ran the next request's body under the first request's id (found by the multiplexing load harness as
+/// `BadRequest { "body does not decode" }`, one `CreateWork` and one or two `Edit`s in every 300-client run at 32
+/// clients a connection, 2026-11-06).
+#[test]
+fn a_request_taken_from_the_ring_keeps_its_bulk_body_when_the_client_sends_on() {
+  use slates_ipc::protocol::{Direction, RequestBody, pack, unpack};
+  let (mut daemon, mut client) = pair("slates-ipc-rings-bulk-req");
+  let slots = u64::from(SLOTS);
+  for n in 0..slots {
+    let index = client.next_request_index();
+    let slot = pack(
+      client.region_mut(),
+      Direction::Request,
+      index,
+      n,
+      &bulk_create(n),
+    )
+    .unwrap();
+    assert_eq!(
+      slot.kind,
+      SlotKind::Bulk,
+      "the body travels through the bulk area"
+    );
+    client.send(&slot).unwrap();
+  }
+  let first = daemon.try_take().unwrap().unwrap();
+  let index = client.next_request_index();
+  let later = pack(
+    client.region_mut(),
+    Direction::Request,
+    index,
+    slots,
+    &bulk_create(slots),
+  )
+  .unwrap();
+  client.send(&later).unwrap();
+  let read: RequestBody = unpack(daemon.region(), first.kind, &first.payload).unwrap();
+  assert_eq!(read, bulk_create(0), "the first request decodes as itself");
+}
+
+/// §4.7 `Ring`, the bulk area, the reply direction. Do: fill the completion ring with bulk replies, let the client end
+/// take the first, let the daemon end write one more (into the same bulk chunk), then decode the first. Expect: the
+/// first reply's own body: a daemon writing a deferred reply as soon as a slot frees must never change a reply the
+/// client has taken but not yet read.
+#[test]
+fn a_reply_taken_from_the_ring_keeps_its_bulk_body_when_the_daemon_replies_on() {
+  use slates_ipc::protocol::{Direction, ReplyBody, pack, unpack};
+  let (mut daemon, mut client) = pair("slates-ipc-rings-bulk-reply");
+  let slots = u64::from(SLOTS);
+  let reply = |n: u64| ReplyBody::Refused {
+    refusal: slates_ipc::protocol::Refusal::BadRequest {
+      reason: format!("bulk-reply-{n:08}-padded-past-the-inline-payload"),
+    },
+  };
+  for n in 0..slots {
+    let index = daemon.next_reply_index();
+    let slot = pack(daemon.region_mut(), Direction::Reply, index, n, &reply(n)).unwrap();
+    assert_eq!(
+      slot.kind,
+      SlotKind::Bulk,
+      "the body travels through the bulk area"
+    );
+    daemon.reply(&slot).unwrap();
+  }
+  let first = client.try_take().unwrap().unwrap();
+  let index = daemon.next_reply_index();
+  let later = pack(
+    daemon.region_mut(),
+    Direction::Reply,
+    index,
+    slots,
+    &reply(slots),
+  )
+  .unwrap();
+  daemon.reply(&later).unwrap();
+  let read: ReplyBody = unpack(client.region(), first.kind, &first.payload).unwrap();
+  assert_eq!(read, reply(0), "the first reply decodes as itself");
+}
+
+/// §4.7 `Ring`, the bulk area, the producer's side. Do: fill the command ring with bulk requests through
+/// `ClientEnd::send_message`, offer one more while the daemon has taken none, then let the daemon take and decode the
+/// first. Expect: the offer is refused `RingFull`, and the first request decodes as itself. A producer that packed a
+/// body before it knew the ring had room wrote it into the bulk chunk of its ring position, which belongs to the oldest
+/// request still unread. A client below its in-flight bound reaches a full ring whenever unawaited acknowledgements share
+/// it, and the multiplexing load harness met it in every 300-client run at 32 clients a connection.
+#[test]
+fn a_request_refused_ring_full_never_writes_over_an_unread_body() {
+  use slates_ipc::protocol::{RequestBody, unpack};
+  let (mut daemon, mut client) = pair("slates-ipc-rings-bulk-full");
+  let slots = u64::from(SLOTS);
+  for n in 0..slots {
+    client.send_message(n, &bulk_create(n)).unwrap();
+  }
+  assert!(
+    matches!(
+      client.send_message(slots, &bulk_create(slots)),
+      Err(IpcError::RingFull)
+    ),
+    "the ring is full"
+  );
+  let first = daemon.try_take().unwrap().unwrap();
+  let read: RequestBody = unpack(daemon.region(), first.kind, &first.payload).unwrap();
+  assert_eq!(read, bulk_create(0), "the first request decodes as itself");
+}

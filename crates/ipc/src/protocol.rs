@@ -754,6 +754,56 @@ pub enum RequestBody {
     /// Whether it is live-shipped from now on.
     live_shipped: bool,
   },
+  /// Detach an attachment of `volume` (§4.10, A-222): `Detach` routed by the volume, so an attachment another host's
+  /// owner holds is ended there (an attachment id names its owner partition, not its host). Appended.
+  DetachOf {
+    /// The volume the attachment is of.
+    volume: VolumeId,
+    /// The attachment.
+    attachment: u64,
+  },
+  /// End every attachment the sending host's dead `client` holds on `volume` (§4.10, A-222): sent by a node's reap of
+  /// a dead client to the owner of each volume that client attached from it. The owner trusts only the authenticated
+  /// peer as the host, so a node ends only its own clients' attachments. Never sent by a client. Appended.
+  RemoteReap {
+    /// The volume the dead client attached.
+    volume: VolumeId,
+    /// The dead client's id on the sending host.
+    client: u32,
+  },
+  /// Edit a work volume and submit it, in one request (§4.16, A-225): exactly `Edit` (or `EditStaged`'s edit) and then,
+  /// when the edit is accepted, `Submit`, in one durable step under one completion record. Answered with the edit's
+  /// refusal, or with the submit's reply. Appended.
+  EditSubmit {
+    /// The work volume.
+    work: VolumeId,
+    /// The file.
+    path: String,
+    /// The offset.
+    at: u64,
+    /// Bytes removed at `at`.
+    delete_len: u64,
+    /// The bytes inserted at `at`.
+    insert: EditBytes,
+    /// The evidence references (opaque to slates), possibly none.
+    evidence: Vec<[u8; 32]>,
+  },
+}
+
+/// The bytes an [`RequestBody::EditSubmit`] inserts (A-225): carried in the request, or, for an edit larger than one
+/// request, staged on the work's owner first (`StageBegin`, `StagePut`) and named by its buffer, as `EditStaged` does.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum EditBytes {
+  /// The bytes themselves.
+  Inline {
+    /// The bytes.
+    bytes: Vec<u8>,
+  },
+  /// A staged buffer on the work's owner.
+  Staged {
+    /// The buffer's token.
+    token: u64,
+  },
 }
 
 /// Format: the name of the image file in an image volume's root (§4.6, A-160): what a VMM is pointed at.
@@ -1073,6 +1123,9 @@ pub struct GroupReport {
   pub voters: u64,
   /// Whether a joint change of the voter set is in flight (Raft §6).
   pub joint: bool,
+  /// The member ids of the voters in force (both sets while a joint change is in flight), ascending: which members a
+  /// loss costs the group a vote. Appended (2026-11-07).
+  pub voter_ids: Vec<u64>,
 }
 
 /// One shard's part of the daemon's status.
@@ -1216,6 +1269,25 @@ pub struct LiveReport {
   /// On the owner: publications are owed to the log (a burst outran the credit, or one could not be shipped), so its
   /// head is behind the volume until the whole record it owes is appended.
   pub owed: bool,
+  /// The head's epoch: the owner's epoch that made the entry at the head (`None`: nothing yet). Appended.
+  pub head_epoch: Option<u64>,
+  /// The head's chain identity: the BLAKE3 of the entry at the head, which binds every entry before it (`None`: nothing
+  /// yet). Two copies at one epoch and position hold the same log exactly when these agree (Agreement). Appended.
+  pub head_identity: Option<[u8; 32]>,
+  /// On a candidate, the fence its copy has promised: no message made under a lower epoch is served. On the owner, the
+  /// epoch it ships under. Appended.
+  pub fence: u64,
+  /// On the owner, the member ids of the holders its durability counts (during a transition, the set it is moving
+  /// from), ascending; empty on a candidate. Appended (2026-11-07).
+  pub holders: Vec<u64>,
+  /// On the owner, the member ids of the set a holder transition is moving to, ascending; empty when none is in
+  /// flight, and on a candidate. Appended (2026-11-07).
+  pub moving_to: Vec<u64>,
+  /// On the owner, the member ids of the holder set its volume's catalog records (A-240: what a takeover's phase one
+  /// counts), ascending; it can name a transition's target before the shipper activates it. On a candidate, the same
+  /// when the volume is served here (a successor before its first publication); otherwise empty, as when nothing is
+  /// recorded. Appended (2026-11-07).
+  pub recorded: Vec<u64>,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.
@@ -1320,6 +1392,7 @@ impl RequestBody {
       | RequestBody::StageBegin { work: volume, .. }
       | RequestBody::StagePut { work: volume, .. }
       | RequestBody::EditStaged { work: volume, .. }
+      | RequestBody::EditSubmit { work: volume, .. }
       | RequestBody::FsWrite { volume, .. }
       | RequestBody::FsWriteStaged { volume, .. }
       | RequestBody::FsRemove { volume, .. }
@@ -1351,7 +1424,10 @@ impl RequestBody {
       | RequestBody::Enroll { .. }
       | RequestBody::Attest { .. }
       | RequestBody::Revoke { .. } => None,
-      RequestBody::Share { volume, .. } | RequestBody::LiveShip { volume, .. } => Some(*volume),
+      RequestBody::Share { volume, .. }
+      | RequestBody::LiveShip { volume, .. }
+      | RequestBody::DetachOf { volume, .. }
+      | RequestBody::RemoteReap { volume, .. } => Some(*volume),
     }
   }
 
@@ -1365,6 +1441,7 @@ impl RequestBody {
         | RequestBody::CreateWork { .. }
         | RequestBody::Edit { .. }
         | RequestBody::EditStaged { .. }
+        | RequestBody::EditSubmit { .. }
         | RequestBody::Declare { .. }
         | RequestBody::Submit { .. }
         | RequestBody::Rebase { .. }
@@ -1409,7 +1486,18 @@ impl RequestBody {
   /// record (§4.8 "Lookup"): a volume-scoped mutation ([`Self::volume`] names the volume, [`Self::mutates_shard_image`]
   /// changes it).
   pub fn forwards_as_write(&self) -> bool {
-    self.volume().is_some() && self.mutates_shard_image()
+    self.volume().is_some()
+      && (self.mutates_shard_image()
+        // An attachment in the record form, and its detach by volume, are recorded on the volume's owner whatever
+        // host the client is on (§4.10, A-222). Every other form hands the client something of the owner's host (a
+        // mount, a device, a stream), so it is not forwarded and is refused from another host by its kind.
+        || matches!(
+          self,
+          RequestBody::Attach {
+            form: AttachRequest::Root,
+            ..
+          } | RequestBody::DetachOf { .. }
+        ))
   }
 
   /// Whether a node may forward this verb to another node, so its reply can take a location round and a forward
@@ -1577,6 +1665,11 @@ pub struct DaemonReport {
   pub log_lines_refused: u64,
   /// Log lines the anchor could not write over its life, as it last wrote the count to the segment (A-213). Appended.
   pub anchor_log_lines_refused: u64,
+  /// Windows Error Reporting is set to write a full-memory dump of the daemon when it crashes (A-239: `LocalDumps`, for
+  /// every program or for the daemon's own image), which carries every byte the daemon holds, tenant content and keys
+  /// included. An administrator's setting the daemon cannot override (R10); it reports it and serves. Always `false` on
+  /// Unix, where the process is excluded from core dumps whole. Appended.
+  pub dumps_local_full: bool,
 }
 
 /// The node's sealing at rest (A-92): how its root came (`unavailable`, `minted`, `minted-daemon-only` or
@@ -2145,6 +2238,9 @@ pub enum UnsupportedReason {
   /// WinFsp's user-mode library (`winfsp-x64.dll`) could not be loaded: WinFsp is not installed on this host. slates
   /// installs nothing (R10); WinFsp's own installer is the one privileged piece (§4.6). Appended.
   WinFspNotInstalled,
+  /// The volume's owner is another host, and this form hands the client something of the owner's host (a mount, a
+  /// device, a stream, a container bind); only the record form is served across hosts (§4.10, A-222). Appended.
+  OwnedByAnotherHost,
 }
 
 /// One transport's report (§4.6 A-9: "supported transport, target-path constraints, read/write policy,
@@ -2282,6 +2378,10 @@ pub enum AttachRequest {
     /// The drive letter and its colon (`S:`).
     mount_point: String,
   },
+  /// A CLI attachment (§4.7, A-230): the record form, made by a process that exits for later processes to name. It
+  /// outlives its client for a term, the failover SLO as the write lease's, renewed by every verb that names it, and
+  /// ends at the term's lapse; a verb naming it after is refused `AttachmentExpired`. Appended.
+  Termed,
 }
 
 impl AttachRequest {
@@ -2871,6 +2971,97 @@ pub enum Refusal {
     /// The writable maps held under the attachment.
     maps: u64,
   },
+  /// A client already holds as many attachments of other hosts' volumes as its node keeps for it (§4.10, A-222):
+  /// the node remembers each so its reap can end them at their owners, and that memory is bounded. Nothing was
+  /// attached. Appended.
+  RemoteAttachmentsFull {
+    /// The bound.
+    bound: u64,
+  },
+  /// A host path the daemon was given lies on a mount it serves itself (§4.6: no daemon thread opens a path on a volume
+  /// the daemon serves; A-227): opening it would send the daemon a request only it can answer. Nothing was opened.
+  /// Appended.
+  OwnMount {
+    /// The path as given.
+    path: String,
+    /// What the daemon was asked to use it as.
+    used_as: OwnMountUse,
+  },
+  /// A verb named a CLI attachment whose term lapsed (§4.7, A-230): it ended then, its write lease with it, and is
+  /// named here rather than as unknown, so a user who paused past the term learns why. Attach again. Appended.
+  AttachmentExpired {
+    /// The attachment.
+    attachment: u64,
+  },
+  /// A client named an id its session key does not prove (§4.9; `slates_server::session_key`): the seat and the
+  /// completion records under that id belong to the client it was issued to, so nothing is served on this channel,
+  /// which the daemon then ends. A client resumes only the session it was handed (`Session`, with its key). Appended.
+  SessionUnproven,
+  /// A durable table of the partition the verb records into is at its derived capacity (§4.8; CLAUDE.md banned item
+  /// 8): `green_chains`, the merge byte budget a partition's green chains, origins, checkpoints and work logs share,
+  /// when what live readers still hold below their greens' checkpoints fills it. Nothing was recorded. Until 2026-11-06
+  /// (A-238) it reached the client as `BadRequest { reason: "<table> at capacity" }`, as if the request were
+  /// malformed. Appended.
+  TableAtCapacity {
+    /// The table.
+    table: String,
+  },
+  /// The volume is in this node's catalog, and listed, but recovery could not rebuild it after the daemon's restart
+  /// (§4.8): every verb on it answers this, naming why, rather than `NotFound`. Appended.
+  NotRecovered {
+    /// Why recovery could not rebuild it.
+    cause: RecoveryCause,
+  },
+}
+
+/// Why recovery could not rebuild a volume its catalog holds ([`Refusal::NotRecovered`], §4.8). Append-only.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum RecoveryCause {
+  /// The content image the anchor kept does not hold the volume.
+  NoImage,
+  /// The image's blocks could not be claimed in this daemon's arena.
+  BlocksUnclaimed,
+  /// The overlay's base directory is gone.
+  BaseMissing {
+    /// The base, as recorded.
+    path: String,
+  },
+  /// The overlay's base lies on a mount this daemon serves (§4.6, A-227), so it was not opened.
+  BaseOnOwnMount {
+    /// The base, as recorded.
+    path: String,
+  },
+  /// The host refused the overlay's base directory.
+  BaseUnavailable {
+    /// The base, as recorded.
+    path: String,
+    /// The host's refusal, as the base plane names it.
+    reason: String,
+  },
+  /// A clone's origin volume was not recovered.
+  OriginNotRecovered,
+  /// The volume core refused the image as it was rebuilt.
+  ImageRefused {
+    /// The volume core's refusal.
+    reason: String,
+  },
+  /// The volume's acknowledged resources do not fit this process: a byte budget, the lock capacity, the version slab,
+  /// the metadata ledger or the volume table.
+  ResourcesUnavailable {
+    /// Which, and the refusal.
+    reason: String,
+  },
+}
+
+/// What a path refused [`Refusal::OwnMount`] was given as (A-227). Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnMountUse {
+  /// A volume's base directory, or an entry below it.
+  Base,
+  /// A granted landing's target.
+  LandingTarget,
+  /// A FUSE mount point.
+  MountPoint,
 }
 
 /// The writes a snapshot is known to include (§4.6 "Writeback and snapshot barrier"): every write the
@@ -3429,6 +3620,50 @@ pub fn pack<M: Wire>(
   })
 }
 
+/// The framed body a bulk slot's `payload` names in `region`'s bulk area, copied out; a reference of the wrong size or
+/// outside the area is a typed refusal.
+fn bulk_body(region: &ClientRegion, payload: &[u8]) -> Result<Vec<u8>, IpcError> {
+  if payload.len() != BULK_REF_BYTES {
+    return Err(IpcError::BadSlot {
+      reason: "bulk reference of the wrong size",
+    });
+  }
+  let (offset, len) = payload
+    .split_at_checked(size_of::<u64>())
+    .unwrap_or_default();
+  let word = |bytes: &[u8]| {
+    usize::try_from(u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]))).unwrap_or(usize::MAX)
+  };
+  let (offset, len) = (word(offset), word(len));
+  if offset
+    .checked_add(len)
+    .is_none_or(|end| end > region.bulk_len())
+  {
+    return Err(IpcError::BadSlot {
+      reason: "bulk reference outside the area",
+    });
+  }
+  let mut body = vec![0u8; len];
+  region.read_bulk(offset, &mut body)?;
+  Ok(body)
+}
+
+/// A slot taken from a ring, its body owned: a bulk slot's body copied out of the bulk area and carried inline, as
+/// [`unpack`] reads an inline one, so the ring may release the slot (and with it the chunk) at once. Any other slot is
+/// returned as it is. Called by each end's take before it releases the slot (`Ring::peek`, `Ring::release`): the chunk
+/// is the next message's at that ring position, which the producer writes as soon as the slot is released, and a body
+/// read after that was the next message's (`a_request_taken_from_the_ring_keeps_its_bulk_body_when_the_client_sends_on`).
+pub fn owned(region: &ClientRegion, slot: Slot) -> Result<Slot, IpcError> {
+  if slot.kind != SlotKind::Bulk {
+    return Ok(slot);
+  }
+  Ok(Slot {
+    kind: SlotKind::Inline,
+    request: slot.request,
+    payload: bulk_body(region, &slot.payload)?,
+  })
+}
+
 /// Decodes the message a slot carries, inline or from the bulk chunk it names; a reference
 /// outside the bulk area is a typed refusal.
 pub fn unpack<M: Wire>(
@@ -3438,32 +3673,7 @@ pub fn unpack<M: Wire>(
 ) -> Result<M, IpcError> {
   match kind {
     SlotKind::Inline => unframe(payload),
-    SlotKind::Bulk => {
-      if payload.len() != BULK_REF_BYTES {
-        return Err(IpcError::BadSlot {
-          reason: "bulk reference of the wrong size",
-        });
-      }
-      let (offset, len) = payload
-        .split_at_checked(size_of::<u64>())
-        .unwrap_or_default();
-      let word = |bytes: &[u8]| {
-        usize::try_from(u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8])))
-          .unwrap_or(usize::MAX)
-      };
-      let (offset, len) = (word(offset), word(len));
-      if offset
-        .checked_add(len)
-        .is_none_or(|end| end > region.bulk_len())
-      {
-        return Err(IpcError::BadSlot {
-          reason: "bulk reference outside the area",
-        });
-      }
-      let mut body = vec![0u8; len];
-      region.read_bulk(offset, &mut body)?;
-      unframe(&body)
-    }
+    SlotKind::Bulk => unframe(&bulk_body(region, payload)?),
     SlotKind::Cancel | SlotKind::Heartbeat => Err(IpcError::BadSlot {
       reason: "not a message",
     }),
