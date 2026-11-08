@@ -1,0 +1,88 @@
+name: diag-liveness-start
+
+# Diagnostics only, never on main (A-257: a green's chain entry records what its verdict resolved). On four runners: the
+# merge, db and anchor suites, the server's unit tests, the green and recovery suites (Unix), and the whole fleet suite
+# one test at a time. Results go to diag-results/liveness-start-3-<os>.
+on:
+  push:
+    branches: ["diag-liveness-start-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  SLATES_FLEET_TRACE: "1"
+  SLATES_TEST_HEDGE_STARVATION_SECS: "20"
+  SLATES_TEST_RESTART_SLOWDOWN: "10"
+  SLATES_TEST_FLEET_DEADLINE_SECS: "120"
+
+jobs:
+  suites:
+    name: a257 (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64 Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64 Windows)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Grant user_allow_other (Linux)
+        if: runner.os == 'Linux'
+        run: grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+      - name: The suites
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: "0"
+        run: |
+          R=../results.txt
+          echo "runner ${{ matrix.os }}, $(git log --oneline -1 | cut -c1-80), $(date -u)" > $R
+          suite() {
+            name="$1"; shift
+            status=0
+            started=$(date +%s)
+            "$@" > ../suite.log 2>&1 || status=$?
+            grep -E '^test .*FAILED$|panicked|^test result|fenced|IdentityDiverged' ../suite.log | cut -c1-300 | tee -a $R || true
+            echo "== $name exit $status in $(( $(date +%s) - started )) s" | tee -a $R
+            cp ../suite.log "../log-$(echo $name | tr ' ' '-').txt"
+          }
+          suite "machine" cargo test --locked -p slates-machine
+          suite "anchor" cargo test --locked -p slates-anchor
+          suite "anchor unit tests in the binary" cargo test --locked -p slates-cli --bins -- anchor --nocapture
+          suite "start judgment" cargo test --locked -p slates-cli --test start_judgment -- --test-threads=1
+          if [ "$RUNNER_OS" = Linux ]; then
+            suite "cli start tests" env SLATES_TEST_CLI=1 cargo test --locked -p slates-cli --test cli -- --test-threads=1 --nocapture a_start_whose_shards_sum a_stuck_start_is_killed a_starved_start_that_makes_progress
+          fi
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/liveness-start-3-${{ matrix.os }}"
+          git config user.name "diag-liveness"
+          git config user.email "diag-liveness@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          for f in ../log-*.txt; do [ -f "$f" ] && grep -E 'FAILED|panicked|fenced|IdentityDiverged' "$f" | head -40 > "$(basename $f)"; done
+          git add results.txt log-*.txt 2>/dev/null || git add results.txt
+          git commit -qm "diag-liveness-start-3 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
