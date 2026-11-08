@@ -810,6 +810,9 @@ pub struct ShardState {
   /// set, the session carrying its other replies as before, as an owner alive but never answering one exchange is to
   /// its asker (`Daemon::inject_forward_silence`). `None` in production.
   pub injected_forward_silence: Option<slates_ipc::protocol::VolumeId>,
+  /// Test support (never reachable from the wire): the record session to this peer, by its connection id, that drops
+  /// everything it receives once seen (`Daemon::inject_session_deafness`). `None` in production.
+  pub injected_deaf_session: Option<(slates_db::HostId, slates_transport::endpoint::ConnectionId)>,
   /// Test support: while set, this control shard delivers no pair keys (`Daemon::inject_pair_withhold`), as a
   /// neighbour's recipient answer that has not yet arrived holds a delivery back.
   pub injected_pair_withhold: bool,

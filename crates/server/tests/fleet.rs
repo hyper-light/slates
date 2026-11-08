@@ -5702,93 +5702,44 @@ fn fill_task_arena(shard: u16) -> Vec<slates_rt::shard::TaskId> {
   }
 }
 
-/// Shape: how long after its owner's restart a forward through b may take to reach the new process: one liveness
-/// budget for the lane to tell its session dead (data in flight and no packet back), one for the link to dial the
-/// restarted owner and the forward to be sent again.
+/// Shape: how long after b's session to a goes deaf a read through b may take to be served on a new one: one liveness
+/// budget for the lane to judge the session dead (data in flight and nothing back), one for the link to dial a again
+/// and the read to be sent on the new session.
 const DEAD_SESSION_BOUND: Duration = Duration::from_nanos(2 * LIVENESS_BUDGET_NS);
-/// Shape: the clients that keep b's forward lane busy through the restart: enough that a waiting forwarder takes the
-/// session the moment another returns it, as the rung's thousand clients did.
+/// Shape: the clients that keep b's forward lane busy, so a waiting forwarder takes the session the moment another
+/// returns it and the link never finds it in its slot, as the rung's thousand clients did.
 const DEAD_SESSION_BURST_CLIENTS: usize = 32;
-/// Whether [`a_forward_lane_leaves_a_dead_session_for_the_restarted_owners_new_one`]'s burst keeps sending.
+/// Whether [`a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one`]'s burst keeps sending.
 static DEAD_SESSION_BURST_ON: std::sync::atomic::AtomicBool =
   std::sync::atomic::AtomicBool::new(false);
 
-/// §4.8 "Lookup", found on the f = 1 primary-kill rung under load (2026-11-08): the restarted primary keeps its member
-/// id, so the client node's record session to it looked valid, and its forward lane, borrowing the session turn after
-/// turn, kept forwarding into a session the new process had no state for. Every request through the client node waited
-/// 25 to 135 s, until the forwarders had given up enough for the link to find the session in its slot. Do: three nodes;
-/// a volume on a read through b; a burst of reads through b kept going while a restarts with its identity; then one
-/// read through b. Expect: that read is answered by the restarted a (served, or refused by a, never b's
-/// `OwnerUnreachable`) within [`DEAD_SESSION_BOUND`] of the restart.
+/// §4.8 "Lookup", found on the f = 1 primary-kill rung under load (2026-11-08): the restarted primary kept its member id,
+/// so the client node's record session to it looked valid, and its forward lane, borrowing the session turn after turn,
+/// kept forwarding into a session the new process had no state for; every request through the client node waited 25 to
+/// 135 s. The condition is injected here rather than hoped for from the load: b's session to a drops everything it
+/// receives (`Daemon::inject_session_deafness`, cut at the session's receive path, so the lane's own judgment runs).
+/// Do: three nodes; a volume on a read through b; a burst of reads through b kept going; b's session to a made deaf;
+/// one read through b. Expect: it is served by a, on a new session, within [`DEAD_SESSION_BOUND`]. Before: the lane
+/// kept the deaf session and the read waited out its forwarders' give-ups.
 #[test]
 #[allow(clippy::cognitive_complexity)]
-fn a_forward_lane_leaves_a_dead_session_for_the_restarted_owners_new_one() {
+fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
   let _serial = serialize_fleet_tests();
-  let pid = std::process::id();
-  let profiles: Vec<_> = ["lane-restart-a", "lane-restart-b", "lane-restart-c"]
-    .into_iter()
-    .map(profile)
-    .collect();
-  let anchors: Vec<_> = profiles.iter().map(anchor_of).collect();
-  let seeds: Vec<_> = anchors.iter().map(|anchor| member_id(*anchor, 0)).collect();
-  let mut identities: Vec<_> = profiles.iter().map(|_| same_identity(2)).collect();
-  let certificates: Vec<_> = identities
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
     .iter()
-    .map(|pair| pair[0].certificate())
+    .map(|daemon| daemon.member_identity().unwrap())
     .collect();
-  let (_ports_lease, ports) = mesh_serve_ports(profiles.len());
-  let peers = |node| {
-    profiles
-      .iter()
-      .enumerate()
-      .filter(|(peer, _)| *peer != node)
-      .map(|(peer, _)| fleet_peer_at(anchors[peer], seeds[peer], ports[peer], &certificates[peer]))
-      .collect::<Vec<_>>()
-  };
-  let configs: Vec<_> = profiles
-    .iter()
-    .enumerate()
-    .map(|(node, profile)| {
-      fleet_config(
-        profile,
-        &format!("lane-restart-{node}-{pid}"),
-        anchors[node],
-        seeds[node],
-        &peers(node),
-        &Default::default(),
-      )
-    })
-    .collect();
-  let anchors_held: Vec<_> = profiles
-    .iter()
-    .enumerate()
-    .map(|(node, profile)| {
-      common::anchor::held_anchor(
-        &format!("lane-restart-{node}-{pid}"),
-        profile,
-        &configs[node],
-      )
-    })
-    .collect();
-  let source = |node: usize| common::anchor::source_of(&anchors_held[node]);
-  let mut daemons: Vec<_> = profiles
-    .iter()
-    .enumerate()
-    .map(|(node, profile)| {
-      start_fleet_node(
-        profile,
-        configs[node].clone(),
-        identities[node].pop().unwrap(),
-        ports[node],
-        peers(node),
-        source(node),
-      )
-    })
-    .collect();
-  daemons[0].bootstrap(true).unwrap();
-  settle_initial_consensus(&daemons, &seeds, &Default::default(), Quorum { f: 1 });
+  assert_fleet_forms(&daemons, &hosts, &names);
   let mut owner = Client::connect(daemons[0].instance());
-  let volume = volume_owned_by(&mut owner, 0, "lane-restart", &daemons);
+  let volume = volume_owned_by(&mut owner, 0, "deaf-session", &daemons);
   let mut probe = Client::connect(daemons[1].instance());
   let (routed, last) = poll_status_served(&daemons, &mut probe, volume, COUNCIL_RETIRE_DEADLINE);
   let read = RequestBody::Status { volume };
@@ -5812,75 +5763,51 @@ fn a_forward_lane_leaves_a_dead_session_for_the_restarted_owners_new_one() {
     }
     rounds
   });
-  // The lane busy for a budget before the restart, as the rung's was when its primary died.
+  // The lane busy for a budget before the session goes deaf.
   let busy_until = Instant::now() + Duration::from_nanos(LIVENESS_BUDGET_NS);
   while Instant::now() < busy_until {
     std::thread::yield_now();
   }
-  drop(owner);
-  daemons.remove(0).stop();
-  daemons.insert(
-    0,
-    start_fleet_node(
-      &profiles[0],
-      configs[0].clone(),
-      identities[0].pop().unwrap(),
-      ports[0],
-      peers(0),
-      source(0),
-    ),
-  );
-  let restarted = Instant::now();
-  let mut answers = Vec::new();
-  let reached = loop {
-    let reply = probe.call(&read);
-    let from_b = matches!(
-      reply,
-      ReplyBody::Refused {
-        refusal: Refusal::OwnerUnreachable { .. } | Refusal::HomedElsewhere { .. }
-      }
-    );
-    answers.push((restarted.elapsed(), reply));
-    if !from_b {
-      break Some(restarted.elapsed());
-    }
-    if restarted.elapsed() > 10 * DEAD_SESSION_BOUND {
-      break None;
-    }
-  };
+  // Marked once the control shard answers with the session found (busy with the burst, an observation can miss it).
+  let mut marked = Ok(false);
+  let marking = Instant::now();
+  while marked != Ok(true) && marking.elapsed() < DEAD_SESSION_BOUND {
+    marked = daemons[1].inject_session_deafness(hosts[0]);
+  }
+  let deafened = Instant::now();
+  let reply = probe.call(&read);
+  let served_after = deafened.elapsed();
   DEAD_SESSION_BURST_ON.store(false, std::sync::atomic::Ordering::Release);
   let rounds = burst.join().unwrap();
   let counters: Vec<(&'static str, u64)> = summed_counters(&daemons[1])
     .into_iter()
-    .filter(|(name, _)| name.starts_with("fleet.forward") || name.starts_with("fleet.link"))
+    .filter(|(name, _)| {
+      name.contains("judged_dead") || name.contains("dead_dropped") || name.contains("given_up")
+    })
     .collect();
+  drop(owner);
   for daemon in daemons {
     daemon.stop();
   }
   eprintln!(
-    "the first read through b to reach the restarted a came {reached:?} after its restart ({} answers before, the \
-     last {:?}); burst rounds {rounds}; b's forward and link counters {counters:?}",
-    answers.len().saturating_sub(1),
-    answers.last()
+    "after b's session to a went deaf, a read through b was answered in {served_after:?}: {}; burst rounds {rounds}; \
+     b's counters {counters:?}",
+    match &reply {
+      ReplyBody::Status { .. } => "served".to_owned(),
+      other => format!("{other:?}"),
+    }
+  );
+  assert!(routed, "b routed the volume to a: {last:?}");
+  assert_eq!(marked, Ok(true), "b's session to a was marked deaf");
+  assert!(rounds > 0, "the burst kept b's lane busy");
+  assert!(
+    matches!(reply, ReplyBody::Status { .. }),
+    "the read through b was served by a on a new session: {reply:?}"
   );
   assert!(
-    routed,
-    "b routed the volume to a before the restart: {last:?}"
-  );
-  assert!(
-    rounds > 0,
-    "the burst kept b's lane busy through the restart"
-  );
-  let reached = reached.unwrap_or_else(|| {
-    panic!(
-      "no read through b reached the restarted a within {:?}: {answers:?}",
-      10 * DEAD_SESSION_BOUND
-    )
-  });
-  assert!(
-    reached <= DEAD_SESSION_BOUND,
-    "a read through b reached the restarted a {reached:?} after its restart, past {DEAD_SESSION_BOUND:?}: b's lane kept \
-     forwarding into the session a's old process held"
+    served_after <= DEAD_SESSION_BOUND,
+    "the read through b was served {served_after:?} after the session went deaf, past {DEAD_SESSION_BOUND:?}: b's \
+     lane kept the session that hears nothing"
   );
 }
 

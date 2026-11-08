@@ -496,7 +496,7 @@ async fn turn(peer: HostId, left_ns: u64) -> Turn {
     return Turn::SessionOut;
   };
   let session = endpoint.connection_id().ok();
-  if judged_dead(&endpoint) {
+  if judged_dead(&endpoint, awaiting_replies(peer, session)) {
     answer_dead(peer);
     crate::fleet::drop_dead_session(peer, endpoint);
     return Turn::Failed;
@@ -516,19 +516,33 @@ async fn turn(peer: HostId, left_ns: u64) -> Turn {
   }
 }
 
-/// Whether the borrowed session's peer is gone: data in flight and no authenticated packet back for a liveness budget.
-/// A live peer acknowledges within its probe timeout, far inside a budget. Read by the borrower itself at each turn
+/// Whether the borrowed session's peer is gone: forwards open on it awaiting their replies (`awaiting`) and no
+/// authenticated packet back for a liveness budget. A live peer acknowledges within its probe timeout, far inside a
+/// budget. Judged on the lane's own open forwards, not the transport's bytes in flight: a session whose peer is gone
+/// declares its packets lost at each probe timeout, and its bytes in flight read zero between sends (measured with the
+/// deaf session of `a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one`: the check never fired). Read by the borrower itself at each turn
 /// from the session it holds, since a session lent turn after turn is never in its slot for the link to look at: on
 /// the f = 1 primary-kill rung the restarted primary kept its member id, so nothing in the membership told its new
 /// process from the old, and the client node forwarded into the old session 25 to 135 s (2026-11-08). A restarted peer
 /// that answers with a stateless reset (A-261) ends the session sooner, as a failed drive; this covers a reset lost and
 /// a peer that is silent. A starved node can judge a live peer dead: that costs a session replaced and the forwards
 /// sent again under their own ids, never run twice, and each judgement is counted ([`SESSION_JUDGED_DEAD`]).
-fn judged_dead(endpoint: &Endpoint) -> bool {
-  endpoint.bytes_in_flight() > 0
+fn judged_dead(endpoint: &Endpoint, awaiting: bool) -> bool {
+  awaiting
     && endpoint.last_received_ns().is_some_and(|last| {
       futures::now_ns().saturating_sub(last) >= crate::daemon::LIVENESS_BUDGET_NS
     })
+}
+
+/// Whether `peer`'s lane has forwards open on `session`, awaiting their replies.
+fn awaiting_replies(peer: HostId, session: Option<ConnectionId>) -> bool {
+  state::with_state(|s| {
+    s.forward_lanes
+      .lanes
+      .get(&peer)
+      .is_some_and(|lane| lane.open_on == session && !lane.open.is_empty())
+  })
+  .unwrap_or(false)
 }
 
 /// Answers unanswered every forward open on `peer`'s lane, its session judged dead ([`judged_dead`]): each forwarder

@@ -497,6 +497,9 @@ pub struct Endpoint {
   /// undecryptable packet is discarded, never fatal). A counter, so a test can assert the discard path
   /// ran.
   discarded: u64,
+  /// Test support (never set in production): drops every datagram this end receives before the connection sees it, as
+  /// a session whose peer went away without a word does (`slates_server`'s `Daemon::inject_session_deafness`).
+  deaf: bool,
   /// This end's open exchanges by exchange id (requests begun, replies not yet taken), each with its stream
   /// once bound and the reply bytes read so far — bounded by the stream credit (a limit's worth bound past
   /// it) and the queue below, and each reply by its flow-control window.
@@ -579,6 +582,7 @@ impl Endpoint {
       handshake_budgets_spent: 0,
       handshake_stall: None,
       discarded: 0,
+      deaf: false,
       exchanges: BTreeMap::new(),
       by_stream: BTreeMap::new(),
       queued: VecDeque::new(),
@@ -628,6 +632,7 @@ impl Endpoint {
       handshake_budgets_spent: 0,
       handshake_stall: None,
       discarded: 0,
+      deaf: false,
       exchanges: BTreeMap::new(),
       by_stream: BTreeMap::new(),
       queued: VecDeque::new(),
@@ -679,6 +684,7 @@ impl Endpoint {
       handshake_budgets_spent: 0,
       handshake_stall: None,
       discarded: 0,
+      deaf: false,
       exchanges: BTreeMap::new(),
       by_stream: BTreeMap::new(),
       queued: VecDeque::new(),
@@ -1546,6 +1552,9 @@ impl Endpoint {
   /// acknowledgement newly frees a packet (RFC 9002 §5.1: the round trip is now minus that packet's send
   /// time).
   fn ingest(&mut self, datagram: &[u8]) -> Result<(), EndpointError> {
+    if self.deaf {
+      return Ok(());
+    }
     let now = now_ns();
     let cid = self.connection_id()?;
     let keys = self.keys.as_mut().ok_or(EndpointError::NotReady)?;
@@ -1875,6 +1884,12 @@ impl Endpoint {
   /// The earliest time the connection needs its timer (loss, probe timeout, pacing), for reports.
   pub fn next_timeout(&self) -> Option<u64> {
     self.conn.next_timeout()
+  }
+
+  /// Test support (never called in production): makes this end drop every datagram it receives from now on, before the
+  /// connection sees it: what the session's holder then judges is the product's own judgment, unchanged.
+  pub fn set_deaf(&mut self) {
+    self.deaf = true;
   }
 
   /// The bytes in flight on the session: a borrower judging whether its peer is gone needs data outstanding.

@@ -7781,6 +7781,12 @@ pub(crate) fn take_sessions(
       {
         // The borrow is tagged with the session's own identity, so only this session returns to the slot.
         link.borrowed = endpoint.connection_id().ok();
+        if s
+          .injected_deaf_session
+          .is_some_and(|(deaf, id)| deaf == *host && link.borrowed == Some(id))
+        {
+          endpoint.set_deaf();
+        }
         link.lent_to = Some(lent_to);
         taken.push((*host, endpoint));
       }

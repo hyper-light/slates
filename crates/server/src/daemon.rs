@@ -2886,6 +2886,27 @@ impl Daemon {
     })
   }
 
+  /// Test support: makes this node's record session to `peer`, as it stands now, drop everything it receives from now on:
+  /// a session whose peer is gone without a word (a restarted process that kept its member id, a reset that was lost).
+  /// Marked by its connection id, so the session the link dials to replace it is healthy. Delivered like
+  /// [`Self::inject_serve_delay`]; `Ok` once marked, else the typed refusal.
+  pub fn inject_session_deafness(&self, peer: slates_db::HostId) -> Result<bool, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      let Some(link) = s.record_sessions.get_mut(&peer) else {
+        return false;
+      };
+      let id = match link.endpoint.as_mut() {
+        Some(endpoint) => {
+          endpoint.set_deaf();
+          endpoint.connection_id().ok()
+        }
+        None => link.borrowed,
+      };
+      s.injected_deaf_session = id.map(|id| (peer, id));
+      id.is_some()
+    })
+  }
+
   /// Test support: leaves every forwarded verb on `volume` unanswered while set, on the session that keeps carrying
   /// this node's other replies (`None` lifts it, and the held verbs are served then). An owner alive and answering
   /// others but never this exchange, as the 205 submits a restarted primary could not commit were (fixtures' 1,000-client
@@ -3809,6 +3830,7 @@ fn init_shard(
     probe_deaf_to: std::collections::BTreeSet::new(),
     injected_serve_delay_ns: None,
     injected_forward_silence: None,
+    injected_deaf_session: None,
     injected_pair_withhold: false,
     served_sessions: std::collections::BTreeMap::new(),
     campaign_session_hold: None,
