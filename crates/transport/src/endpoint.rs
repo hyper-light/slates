@@ -1644,6 +1644,14 @@ impl Endpoint {
     Some(exchange.reply)
   }
 
+  /// The bytes of exchange `id`'s reply read so far (`None` for an unknown exchange): how far that one reply has
+  /// come, for a caller that must tell an exchange still arriving from one that is silent while the session carries
+  /// other exchanges' bytes (the forward lane's stall budget, 2026-11-07).
+  pub fn reply_bytes_read(&mut self, id: u64) -> Option<usize> {
+    self.drain();
+    self.exchanges.get(&id).map(|exchange| exchange.reply.len())
+  }
+
   /// Abandons exchange `id`: a bound one's request stops sending (`ResetStream`) and its reply is refused
   /// (`StopSending`), so the path stops carrying either; one still waiting is dropped from the queue. The
   /// session's other exchanges are untouched.

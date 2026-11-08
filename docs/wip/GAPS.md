@@ -369,7 +369,39 @@
 >   (`a_verdict_consults_only_the_deltas_that_changed_its_paths`: 2,000 deltas consulted before, 1 after, CI run
 >   42376010762; `docs/bugs/2026-11-07-a-verdict-walked-every-delta-since-its-base.md`). **Open, the next wall:** the
 >   owner partition's snapshot, re-encoded whole each time its log fills (about 1,800 of 2,241 samples of the owner
->   shard at 10,000 works), wants §4.8's snapshot incremental or sized to the partition.
+>   shard at 10,000 works), wants §4.8's snapshot incremental or sized to the partition. **Closed by A-243 (2026-11-07):**
+>   the cadence was a 1 MB boot guess for a fresh daemon's whole life; a partition now snapshots once the log since its
+>   last snapshot has taken the recovery budget's replay work, as each commit's append and apply measure it, and is at
+>   least that snapshot's size, so snapshots cost at most about twice the log
+>   (`snapshot_cadence.rs`, red on CI run 42385009677;
+>   `docs/bugs/2026-11-07-a-partitions-snapshot-cadence-never-left-its-boot-guess.md`). The local 10k rung went from
+>   2,197 to 3,128 clients done in 900 s. Still owed: the snapshot is encoded whole on the committing shard's turn.
+>
+> - **A forward refused at admission left its client waiting** (found 2026-11-07 by fixtures' f = 1 replica-kill
+>   rung, placed by the forward hop counters). A shard with a full task arena drops a spawn unrun, and the forwards
+>   owing a client its reply read no admission, so 87 vanished and their clients waited for good. A guard in each
+>   such task now answers its client `Overloaded` if it is dropped unrun (red on both Linux runners, run 42417663905;
+>   `docs/bugs/2026-11-07-a-forward-refused-at-admission-left-its-client-waiting.md`). The same day, on the
+>   supervisor's order, the control shard is sized from its lane's bound, a full channel is answered `Overloaded` (not
+>   `HomedElsewhere`), and every reply carried home runs whether admitted or not (§4.3's status;
+>   `docs/bugs/2026-11-07-the-control-shard-could-not-run-what-its-lane-admitted.md`). Still owed: a same-node owner
+>   shard is sized for its own clients' forwards only; and the control shard's work under a large in-flight set,
+>   O(forwarders) a tick while its session is lent (64 to 105 s to drain 20,700 forwards on a 4-core runner), which
+>   is the shared session owed by "Open — one session per peer is lent exclusively" (its 2026-11-07 status).
+>
+> - **A forward its owner never answered stayed open on a busy session** (found 2026-11-07 by fixtures' f = 1
+>   primary kill). A forward's stall budget counted any byte its session consumed, so 298 forwards to an owner that
+>   never answered them stayed open for good while the session carried other replies. Progress is now its own
+>   reply's bytes, landed in 2bdaa7c0 beside A-245's docs (red 4/4 on both Linux runners, run 42425119057;
+>   `docs/bugs/2026-11-07-a-forward-its-owner-never-answered-stayed-open-on-a-busy-session.md`). The owner's side of
+>   that rung, a membership split after the primary's restart that never merged, is open with membership's owner.>
+> - **A held request kept every later completion of its client** (found 2026-11-07 by fixtures' `f = 1` rungs, and
+>   the quiet arm's 10k backpressure). The acknowledgement was one watermark, which stopped below the lowest id still
+>   owed, so one submit held for its resend kept all its client's later records, and past `2 × slots` the owner
+>   refused the client's next requests `AcknowledgementOwed`: 906,317 against 59,646 served on fixtures' 1k owner
+>   shard, 2.46 million at the 10k. An acknowledgement now names the ids still owed and every partition releases the
+>   rest; an owed id closes once and never reopens (A-245, §4.9's status; red on both Linux runners, run 42396554623: refused
+>   at the 64th edit past a held submit; `docs/bugs/2026-11-07-a-held-request-kept-every-later-completion-of-its-client.md`).
 >
 > - **A kept forward waited for another request** (found 2026-11-07, the 10k stall). A forward refused by its owner
 >   shard's full control channel was kept, but the serve loop idled until a ring woke it, so a shard whose clients
@@ -5409,6 +5441,23 @@ a campaign each take the whole session out of its link, though the transport run
 session at once (`Endpoint::begin`/`drive`). Campaigns and forwards now wait for it. Replication rounds and
 record dispatches retry a missed voter next period. Owed: a shared session (one owner driving it, exchanges
 submitted to it) so no exchange waits for another's.
+
+> **Status (2026-11-07, the forward lane's case, measured under load).** The forward lane shares one record session
+> among a peer's forwards, but the lane still borrows it whole from its link for each turn, as discovery, dispatches
+> and campaigns do. A forwarder that finds it lent polls for it at a tenth of a heartbeat, and each resend begins a new
+> forwarder. So the work is O(forwarders) a tick on the control shard.
+> - `a_silent_owner_leaves_no_forward_the_lane_admitted_unrun` (`crates/server/tests/fleet.rs`) puts about 20,700
+>   forwards to an owner silent for two liveness budgets in flight through one control shard.
+> - On CI's 4-core runners the shard was too busy to run an observation within its budget, and the last reply came 64
+>   to 105 s after the hold.
+> - `fleet.forward.session_never_returned` and `fleet.owner_location.forward_unsent` read 2,661 to 6,277 each; nothing
+>   was lost or refused.
+> - At fixtures' 100,000-client target that is the same work a tick on one shard, a hundredfold.
+>
+> The shared session owed above is what removes it: one driver and submitted exchanges, so a forwarder waits on its
+> own exchange, not on the session. Record: `docs/bugs/2026-11-07-the-control-shard-could-not-run-what-its-lane-admitted.md`;
+> the load-test entries "A forward refused at admission left its client waiting" and "A forward its owner never
+> answered stayed open on a busy session".
 
 ### 2026-09-29: a lone owner refused its own objects — fixed; campaign counters added for the open KIND items
 

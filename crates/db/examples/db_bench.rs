@@ -202,13 +202,11 @@ fn log_rows() {
     assert_eq!(stats.replayed_records, VOLUMES + RECORDS);
     recoveries.push(elapsed);
     per_record.push(elapsed / (VOLUMES + RECORDS));
-    let policy = SnapshotPolicy::derive(RECOVERY_BUDGET_NS, stats.replay_bytes_per_us());
     println!(
-      "  recovery {run}: {elapsed} ns for {} records ({} bytes); throughput {} bytes/us; snapshot every {} bytes",
+      "  recovery {run}: {elapsed} ns for {} records ({} bytes); throughput {} bytes/us",
       stats.replayed_records,
       stats.replayed_bytes,
-      stats.replay_bytes_per_us(),
-      policy.value.bytes_between_snapshots
+      stats.replay_bytes_per_us()
     );
   }
   row("db.mutate_guard_append_apply_per_record", mutate);

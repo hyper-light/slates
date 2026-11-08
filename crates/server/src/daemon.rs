@@ -710,7 +710,8 @@ impl Daemon {
       slates_machine::log_line!("slates-server: descriptor limit raised from {was} to {now}");
     }
     let retained = crate::retention::load(&segment)?;
-    let runtime = Runtime::start(&config.runtime)?;
+    // The control shard first, in start order (`shards.first()`): sized for every forward its lane admits.
+    let runtime = Runtime::start_sized(&config.runtime, &[config.control_shard_capacity().get()])?;
     let shards: Vec<ShardId> = runtime.shard_ids().to_vec();
     // The lock ledger's entry for this daemon starts empty, before any shard recovers and reserves again.
     crate::lock_ledger::reset(shards.first().map_or(0, |shard| shard.0));
@@ -1322,7 +1323,13 @@ impl Daemon {
     };
     // Bounded at twice the arena: a fill that is not refused by then is reported as not reaching the
     // bound, never spun on.
-    for _ in 0..self.config.runtime.tasks_per_shard.saturating_mul(2) {
+    for _ in 0..self
+      .config
+      .control_shard_capacity()
+      .get()
+      .tasks
+      .saturating_mul(2)
+    {
       let (release, released) = std::sync::mpsc::channel::<()>();
       let receipt = runtime
         .spawn_on_with_receipt(shard, async move {
@@ -2767,6 +2774,19 @@ impl Daemon {
     })
   }
 
+  /// Test support: leaves every forwarded verb on `volume` unanswered while set, on the session that keeps carrying
+  /// this node's other replies (`None` lifts it, and the held verbs are served then). An owner alive and answering
+  /// others but never this exchange, as the 205 submits a restarted primary could not commit were (fixtures' 1,000-client
+  /// primary-kill rung, 2026-11-07). Delivered like [`Self::inject_serve_delay`].
+  pub fn inject_forward_silence(
+    &self,
+    volume: Option<slates_ipc::protocol::VolumeId>,
+  ) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_forward_silence = volume;
+    })
+  }
+
   /// The owner's sealed manifest for `object` once its content has placed on its holders (§4.10), read on the shard
   /// that owns it; `Ok(None)` before then or when this node does not own it. A test or an operator reads it to follow
   /// a seal before its head ships.
@@ -3668,6 +3688,7 @@ fn init_shard(
     probe_windows: crate::fleet::ProbeWindows::default(),
     probe_deaf_to: std::collections::BTreeSet::new(),
     injected_serve_delay_ns: None,
+    injected_forward_silence: None,
     injected_pair_withhold: false,
     served_sessions: std::collections::BTreeMap::new(),
     campaign_session_hold: None,

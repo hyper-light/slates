@@ -801,6 +801,10 @@ pub struct ShardState {
   /// client's reply deadline while each step stays inside its own bound. `None` in production
   /// (`Daemon::inject_serve_delay`).
   pub injected_serve_delay_ns: Option<u64>,
+  /// Test support (never reachable from the wire): a volume whose forwarded verbs this node leaves unanswered while
+  /// set, the session carrying its other replies as before, as an owner alive but never answering one exchange is to
+  /// its asker (`Daemon::inject_forward_silence`). `None` in production.
+  pub injected_forward_silence: Option<slates_ipc::protocol::VolumeId>,
   /// Test support: while set, this control shard delivers no pair keys (`Daemon::inject_pair_withhold`), as a
   /// neighbour's recipient answer that has not yet arrived holds a delivery back.
   pub injected_pair_withhold: bool,
@@ -1197,8 +1201,11 @@ pub fn ring_ready_in(s: &ShardState) -> bool {
   }) || !s.deferred.is_empty()
 }
 
+/// Counter: a reply [`deliver`] dropped because its client's slot was gone, retiring or reused by another client.
+pub(crate) const REPLY_UNDELIVERABLE: &str = "reply.undeliverable";
+
 /// A reply that came back from another shard (or a scatter's part): queued for the client's
-/// ring and the server task woken.
+/// ring and the server task woken; dropped and counted ([`REPLY_UNDELIVERABLE`]) when its client is gone.
 pub fn deliver(client_index: u32, request: u64, reply: ReplyBody, recorded: bool) {
   let server = with_state(|s| {
     // The origin's `ring.request` span (§4.14), opened at the slot read and kept while the request was
@@ -1216,6 +1223,9 @@ pub fn deliver(client_index: u32, request: u64, reply: ReplyBody, recorded: bool
       !client.retiring
         && client.client_id == slates_wire::request::RequestId::from_word(request).client
     }) {
+      // Its client is gone or its slot reused: nobody can take the reply. Counted, since a client still waiting would
+      // otherwise wait with nothing to show where its reply went.
+      s.count(REPLY_UNDELIVERABLE, 1);
       return None;
     }
     s.deferred.push(Deferred {

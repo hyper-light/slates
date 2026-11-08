@@ -295,9 +295,9 @@ pub struct Client {
   /// acknowledgement costs one request in that many.
   ack_every: u32,
   /// The sequences answered `Unpublished` and not yet retried (AC-2.3; AUD-06): the daemon rolled
-  /// those verbs back and asked for a retry under the same id, so the acknowledgement watermark
-  /// stops below the lowest of them — an acknowledged sequence's record is released, and its retry
-  /// would be refused `DuplicateRequest` (the CI Linux lane's failure: a small ring acknowledged
+  /// those verbs back and asked for a retry under the same id, so the acknowledgement names them
+  /// owed — an acknowledged sequence's record is released, and its retry would be refused
+  /// `DuplicateRequest` (the CI Linux lane's failure: a small ring acknowledged
   /// between the refusal and the retry). A retry answered anything else releases the id. Numeric
   /// order: sequences wrap after 2^32 requests.
   unpublished: std::collections::BTreeSet<u32>,
@@ -309,10 +309,9 @@ pub struct Client {
   unpublished_forgotten: u64,
   /// The sequences an async caller was answered `Overloaded` or `OwnerUnreachable`, the refusals retryable under the
   /// same id, with when (§4.9, §4.16 "Commit"): a forwarded submit whose acceptance outlived the owner's budget ran,
-  /// and its completion is recorded once the version commits, so its resend must meet that record. The watermark stops
-  /// below the lowest held within the reconnect budget, the window in which a resend under the id is made, renewed by
-  /// each refusal; past it the id is released, so a caller that never resends cannot hold its watermark (and with it
-  /// the daemon's completion records, refused `AcknowledgementOwed` past their bound) for good. Before 2026-11-06 the
+  /// and its completion is recorded once the version commits, so its resend must meet that record. The acknowledgement
+  /// names each one held within the reconnect budget owed, the window in which a resend under the id is made, renewed
+  /// by each refusal; past it the id is released, so a caller that never resends cannot keep its record for good. Before 2026-11-06 the
   /// next acknowledgement covered the refused id and its resend was refused `DuplicateRequest` (447 submits of
   /// fixtures' 1,000-client `f = 1` rung). Bounded by `unpublished_cap`, the oldest forgotten and counted.
   retry_held: std::collections::BTreeMap<u32, Instant>,
@@ -1219,6 +1218,12 @@ impl Client {
     self.end.park_ratio()
   }
 
+  /// The client's ring slots: the requests it may hold in flight, and half the completion records the daemon keeps
+  /// for it unacknowledged (§4.9; the server's `completion_bound` is twice this).
+  pub fn ring_slots(&self) -> usize {
+    self.end.region().cmd().slots()
+  }
+
   /// Parks a wake ended with no reply waiting, so the client parked again.
   pub fn unanswered_wakes(&self) -> u64 {
     self.end.unanswered_wakes()
@@ -1226,10 +1231,9 @@ impl Client {
 
   /// Sends `body` as the next request and returns the reply body, refusals typed.
   pub fn call(&mut self, body: &RequestBody) -> Result<ReplyBody, ClientError> {
-    // Every `ack_every` replies, the client acknowledges them first (one request), so the
-    // daemon's retained records stay bounded without the caller's help (§4.9) — up to the
-    // watermark, which an unpublished id not yet retried holds back.
-    let up_to = self.ack_watermark();
+    // Every `ack_every` requests, the client acknowledges them first (one request), so the daemon's retained records
+    // stay bounded without the caller's help (§4.9): all of them but the ids it still owes.
+    let (up_to, _) = self.acknowledgement();
     if up_to.saturating_sub(self.acknowledged) >= self.ack_every {
       self.acknowledge(up_to)?;
     }
@@ -1743,39 +1747,42 @@ impl Client {
     }
   }
 
-  /// The highest sequence the client may acknowledge now: everything it has received, unless a verb
-  /// answered `Unpublished` awaits its retry — then the sequence just below the lowest such id, so
-  /// the daemon keeps the ids above it new and the retry re-executes rather than meeting
-  /// `DuplicateRequest` (AC-2.3; AUD-06). And never at or past a request still awaited whose reply has not come
-  /// (§4.9 "Exactly-once"; RIFL's first incomplete RPC, Lee et al., SOSP 2015): its completion record is what its
-  /// resend after a lost channel meets, and what a deferred verb (a fleet forward, a submit awaiting its commit)
-  /// records into when it ends, refused `StaleCompletion` below the watermark. A client with several requests in
-  /// flight had acknowledged them all: an applied create resent after a restart was answered `DuplicateRequest`
-  /// (`an_acknowledgement_never_covers_a_request_still_awaited`). A reply already drained into `pending` is received,
-  /// and its own poll answers from there first.
-  fn ack_watermark(&self) -> u32 {
-    let received = self
-      .unpublished
-      .first()
-      .map_or(self.sequence, |&lowest| lowest.saturating_sub(1));
-    let first_incomplete = self
+  /// What the client may acknowledge now (§4.9 "Exactly-once"; RIFL, Lee et al., SOSP 2015): every sequence it has
+  /// issued, except the ids it still owes, which the daemon keeps open.
+  /// - An id answered `Unpublished` and not yet retried (AC-2.3; AUD-06): the daemon rolled the verb back and asked for
+  ///   a retry under the same id, which must re-execute rather than meet `DuplicateRequest`.
+  /// - A request still awaited whose reply has not come: its completion record is what its resend after a lost
+  ///   channel meets, and what a deferred verb (a fleet forward, a submit awaiting its commit) records into when it
+  ///   ends (`an_acknowledgement_never_covers_a_request_still_awaited`). A reply already drained into `pending` is
+  ///   received, and its own poll answers from there first.
+  /// - An id answered `Overloaded` or `OwnerUnreachable` and held for a resend under it, within the reconnect budget
+  ///   (`retry_held`): the verb may have run, and its resend must meet its record.
+  ///
+  /// The owed ids are at most the ring's slots and the hold's cap. Before, the acknowledgement was the watermark below
+  /// the lowest owed id, so one held or slow request kept every later completion of its client, and the daemon's
+  /// bound refused the client's next requests `AcknowledgementOwed`
+  /// (`a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound`).
+  fn acknowledgement(&self) -> (u32, Vec<u32>) {
+    let up_to = self.sequence;
+    let awaited = self
       .awaited
       .keys()
       .filter(|word| !self.pending.iter().any(|(held, _)| held == *word))
-      .map(|word| RequestId::from_word(*word).sequence)
-      .min();
-    let first_held = self
+      .map(|word| RequestId::from_word(*word).sequence);
+    let held = self
       .retry_held
       .iter()
       .filter(|(_, refused)| elapsed_ns(**refused) < self.deadlines.reconnect_ns)
-      .map(|(sequence, _)| *sequence)
-      .next();
-    [first_incomplete, first_held]
-      .into_iter()
-      .flatten()
-      .fold(received, |watermark, lowest| {
-        watermark.min(lowest.saturating_sub(1))
-      })
+      .map(|(sequence, _)| *sequence);
+    let owed: std::collections::BTreeSet<u32> = self
+      .unpublished
+      .iter()
+      .copied()
+      .chain(awaited)
+      .chain(held)
+      .filter(|sequence| *sequence <= up_to)
+      .collect();
+    (up_to, owed.into_iter().collect())
   }
 
   /// Notes what `word`'s reply means for the retryable set: an `Unpublished` refusal keeps the id
@@ -1828,7 +1835,7 @@ impl Client {
   }
 
   /// Releases `word`, an id the caller was answered with a refusal retryable under it and will not send again: the
-  /// acknowledgement watermark no longer stops below it, so the daemon may release its completion records past it.
+  /// acknowledgement no longer names it owed, so the daemon releases its completion record.
   pub fn release_retryable(&mut self, word: u64) {
     let sequence = RequestId::from_word(word).sequence;
     if self.retry_held.remove(&sequence).is_some() {
@@ -1994,8 +2001,8 @@ impl Client {
 
   /// Sends `body` again under `word`, an id the caller already used and was answered with a refusal the protocol
   /// marks retryable under the same id (`Overloaded`, `OwnerUnreachable`, `Unpublished`): the daemon answers from the
-  /// verb's completion record once it is durable, or runs it if it never ran. The acknowledgement watermark stops
-  /// below such an id from its refusal until this resend (within the reconnect budget for the first two;
+  /// verb's completion record once it is durable, or runs it if it never ran. The acknowledgement names such an id
+  /// owed from its refusal until this resend (within the reconnect budget for the first two;
   /// [`Self::release_retryable`] releases one the caller gives up). The word is
   /// awaited again, so its reply is taken as a [`Self::begin`]'s is, within the same in-flight bound. `Ok(false)` when
   /// the ring has no slot (nothing was sent).
@@ -2183,6 +2190,20 @@ impl Client {
       .collect()
   }
 
+  /// Where this client's replies stand, for a caller diagnosing a stall: the replies the daemon published on the
+  /// completion ring that this client has not taken (`None` when the ring cannot be read), the replies taken and
+  /// held for a caller that has not asked for them, and the requests awaited. A stalled request whose reply is in
+  /// either of the first two was answered and not collected; one in neither was never answered.
+  pub fn reply_state(&self) -> (Option<u64>, usize, usize) {
+    let unread = self
+      .end
+      .region()
+      .cpl()
+      .depth(self.end.region().object())
+      .ok();
+    (unread, self.pending.len(), self.awaited.len())
+  }
+
   /// Replies dropped on arrival because nothing awaited them (a protocol-only acknowledgement's, or an
   /// abandoned operation's) — the counter a test reads to see the drop path ran.
   pub fn unawaited_dropped(&self) -> u64 {
@@ -2352,16 +2373,28 @@ impl Client {
   /// sync path, without a blocking round trip on the event loop. The acknowledged mark advances
   /// optimistically; a lost ack only means the daemon holds a little more until the next one.
   pub fn begin_ack_if_due(&mut self) -> Result<(), ClientError> {
-    let up_to = self.ack_watermark();
+    let (up_to, owed) = self.acknowledgement();
     if up_to.saturating_sub(self.acknowledged) >= self.ack_every {
       // A full ring or a lost channel defers the acknowledgement to the next call that finds it due.
-      match self.begin_unawaited(&RequestBody::Acknowledge { up_to }) {
+      match self.begin_unawaited(&RequestBody::Acknowledge { up_to, owed }) {
         Ok(_) => self.acknowledged = self.acknowledged.max(up_to),
         Err(ClientError::RingFull | ClientError::ChannelLost) => {}
         Err(other) => return Err(other),
       }
     }
     Ok(())
+  }
+
+  /// The pause before sending again a request the daemon refused for now (`LeaseUnconfirmed`, `AcknowledgementOwed`,
+  /// or a refusal retryable under its id), after `previous_ns` (zero for the first): the reconnect pacing's rule
+  /// ([`next_pause_ns`]), starting at the daemon's published spin window and doubling to a tenth of the reconnect
+  /// budget, so a caller that resends at once into a refusal for now does not make the refusal (a lease starved of its
+  /// probes by the resends; 20,000 a second in fixtures' 1,000-client primary-kill rung, 2026-11-07).
+  pub fn retry_pause_ns(&self, previous_ns: u64) -> u64 {
+    if previous_ns == 0 {
+      return self.published_spin_ns().max(1);
+    }
+    next_pause_ns(previous_ns, self.deadlines.reconnect_ns)
   }
 
   /// The spin window the daemon published (nanoseconds): the async fast path spins this long taking
@@ -4005,11 +4038,17 @@ impl Client {
     }
   }
 
-  /// Acknowledges every completion up to `up_to` (releases their records) — held below an
-  /// unpublished id awaiting its retry, whatever `up_to` asks (AC-2.3; AUD-06).
+  /// Acknowledges every completion up to `up_to` (releases their records) except the ids the client still owes
+  /// ([`Self::acknowledgement`]: an unpublished id awaiting its retry, a request still awaited, an id held for a
+  /// resend), whatever `up_to` asks (AC-2.3; AUD-06; §4.9).
   pub fn acknowledge(&mut self, up_to: u32) -> Result<(), ClientError> {
-    let up_to = up_to.min(self.ack_watermark());
-    match self.call_plain(&RequestBody::Acknowledge { up_to })? {
+    let (issued, owed) = self.acknowledgement();
+    let up_to = up_to.min(issued);
+    let owed = owed
+      .into_iter()
+      .filter(|sequence| *sequence <= up_to)
+      .collect();
+    match self.call_plain(&RequestBody::Acknowledge { up_to, owed })? {
       ReplyBody::Acknowledged => {
         self.acknowledged = self.acknowledged.max(up_to);
         Ok(())
@@ -4025,10 +4064,9 @@ impl Client {
     self.acknowledged
   }
 
-  /// Acknowledges everything this client has received so far — short of an unpublished id awaiting
-  /// its retry.
+  /// Acknowledges everything this client has received so far, except the ids it still owes.
   pub fn acknowledge_all(&mut self) -> Result<(), ClientError> {
-    let up_to = self.ack_watermark();
+    let (up_to, _) = self.acknowledgement();
     self.acknowledge(up_to)
   }
 

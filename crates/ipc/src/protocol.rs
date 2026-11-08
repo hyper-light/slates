@@ -288,10 +288,13 @@ pub enum RequestBody {
   },
   /// List the caller's volumes.
   List,
-  /// Acknowledge completions up to a sequence (releases their records).
+  /// Acknowledge completions up to a sequence except the ids still owed (releases the others' records, §4.9).
   Acknowledge {
-    /// Every sequence up to and including this one.
+    /// Every sequence up to and including this one, except `owed`.
     up_to: u32,
+    /// The ids at or below `up_to` the client still owes (awaited, or held for a resend under the same id), whose
+    /// records stay: at most the ring's slots and the client's hold.
+    owed: Vec<u32>,
   },
   /// The base entry as the disk holds it now (§4.4 `read_base`).
   ReadBase {
@@ -1251,6 +1254,30 @@ pub struct ShardReport {
   /// Live shipping on this shard (A-200): each live volume it ships, and on the control shard each it holds as a
   /// candidate. Appended.
   pub live: Vec<LiveReport>,
+  /// This shard's partition snapshots against the log they absorb, and the cadence they follow (A-243). Appended.
+  pub snapshots: DbSnapshotReport,
+}
+
+/// A partition's snapshots and their cadence, as `slates status` shows them (A-243).
+#[derive(Wire, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DbSnapshotReport {
+  /// Snapshots taken since the daemon recovered.
+  pub snapshots: u64,
+  /// The bytes they wrote.
+  pub bytes_written: u64,
+  /// The longest one took, encode and publish, nanoseconds (it runs on this shard's turn).
+  pub longest_ns: u64,
+  /// The log bytes appended since the daemon recovered.
+  pub log_bytes_appended: u64,
+  /// The log since the last snapshot, bytes.
+  pub tail_bytes: u64,
+  /// The replay work its commits measured (each record's append and apply), nanoseconds: the next snapshot comes once
+  /// it reaches `budget_ns` and `tail_bytes` reaches `floor_bytes`.
+  pub tail_replay_ns: u64,
+  /// The recovery budget the tail's work is held to, nanoseconds.
+  pub budget_ns: u64,
+  /// The last snapshot's size, bytes: the doubling rule's floor for the tail.
+  pub floor_bytes: u64,
 }
 
 /// One live-shipped volume's log as a shard sees it (A-200): as its owner (`holding` false: the head it appended and

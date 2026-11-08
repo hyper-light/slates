@@ -779,16 +779,9 @@ fn answer(state: &mut ShardState, entry: Awaiting, reply: slates_ipc::protocol::
   let Some(route) = entry.route else {
     return;
   };
-  let delivery = slates_rt::task::SpawnRequest::new(
-    Box::pin(async move {
-      crate::state::deliver(route.client_index, route.request, recorded, true);
-    }),
-    None,
-  );
-  if slates_rt::registry::send_control(
-    route.shard,
-    slates_rt::control::Control::Spawn(Box::new(delivery)),
-  )
+  if crate::xshard::hand_reply_home(route.shard, move || {
+    crate::state::deliver(route.client_index, route.request, recorded, true);
+  })
   .is_err()
   {
     state.count(LIVE_UNDELIVERED, 1);

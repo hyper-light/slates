@@ -2494,16 +2494,9 @@ fn resolve_accepted(state: &mut ShardState, object: ObjectId, placed: u64) {
       let Some(route) = entry.route else {
         continue;
       };
-      let delivery = slates_rt::task::SpawnRequest::new(
-        Box::pin(async move {
-          crate::state::deliver(route.client_index, route.request, recorded, true);
-        }),
-        None,
-      );
-      if slates_rt::registry::send_control(
-        route.shard,
-        slates_rt::control::Control::Spawn(Box::new(delivery)),
-      )
+      if crate::xshard::hand_reply_home(route.shard, move || {
+        crate::state::deliver(route.client_index, route.request, recorded, true);
+      })
       .is_err()
       {
         state.count(ACCEPTANCE_UNDELIVERED, 1);
