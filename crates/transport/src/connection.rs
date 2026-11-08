@@ -326,7 +326,7 @@ pub struct Connection {
   /// Received packets discarded as duplicates of a packet number already processed (RFC 9000 §12.3).
   duplicates: u64,
   /// Stream frames the peer sent in breach of flow control or a stream's final size (RFC 9000 §4.1,
-  /// §4.5), dropped and counted; and reset tokens sent where none belongs ([`Connection::on_reset_token`]).
+  /// §4.5), dropped and counted; and a reset token unlike the one the peer sent first ([`Connection::on_reset_token`]).
   violations: u64,
   /// The token the peer's stateless resets of this session end in (`crate::reset`, A-261), from its first
   /// `ResetToken` frame: learned only inside the session, so only the peer could have sent a datagram ending in it.
@@ -1977,21 +1977,13 @@ impl Connection {
     self.peer_reset_token
   }
 
-  /// A-261: the peer's reset token, kept from its first frame. Only a dialer is sent one: only the accepting end's
-  /// address outlives its restart (a dialer comes back on another port), as RFC 9000 §18.2 has only a server send a
-  /// token in its parameters. The token is a function of the session and the sender's identity, so a token sent to
-  /// an accepting end, or a second token unlike the first, is a protocol violation, counted, and the first kept.
+  /// A-261: the peer's reset token, kept from its first frame. The token is a function of the session and the sender's
+  /// identity, so a second token unlike the first is a protocol violation, counted, and the first kept.
   fn on_reset_token(&mut self, token: crate::reset::ResetToken) {
-    let violation = match (self.role(), self.peer_reset_token) {
-      (Role::Server, _) => true,
-      (Role::Client, None) => {
-        self.peer_reset_token = Some(token);
-        false
-      }
-      (Role::Client, Some(held)) => held != token,
-    };
-    if violation {
-      self.violations = self.violations.saturating_add(1);
+    match self.peer_reset_token {
+      None => self.peer_reset_token = Some(token),
+      Some(held) if held != token => self.violations = self.violations.saturating_add(1),
+      Some(_) => {}
     }
   }
 
@@ -2041,7 +2033,7 @@ impl Connection {
   }
 
   /// How many stream frames the peer sent in breach of flow control or a final size (dropped), and reset tokens
-  /// sent where none belongs.
+  /// unlike the peer's first.
   pub fn protocol_violations(&self) -> u64 {
     self.violations
   }
@@ -2653,18 +2645,18 @@ mod tests {
     assert_eq!(dialer.protocol_violations(), 0);
   }
 
-  /// Hostile input, A-261: a token sent to an accepting end, or a second token unlike the first, is a protocol
-  /// violation, counted, and never replaces the token held. Do: hand an accepting end a token, and a dialer two.
-  /// Expect: the accepting end holds none, the dialer the first, one violation each; a repeat of the first is no
-  /// violation (a retransmit).
+  /// Hostile input, A-261: a second token unlike the first is a protocol violation, counted, and never replaces the
+  /// token held; either end keeps its peer's first. Do: hand an accepting end a token, and a dialer the same token twice
+  /// and then another. Expect: each holds the first; one violation, at the dialer, for the changed token (a repeat of
+  /// the first is a retransmit).
   #[test]
-  fn a_misplaced_or_changed_reset_token_is_a_violation() {
+  fn a_changed_reset_token_is_a_violation() {
     let first = [1u8; crate::reset::RESET_TOKEN_BYTES];
     let second = [2u8; crate::reset::RESET_TOKEN_BYTES];
     let mut accepting = fixed(FRAME_CAP, Role::Server);
     accepting.handle_incoming(0, 0, &[Frame::ResetToken { token: first }]);
-    assert_eq!(accepting.peer_reset_token(), None);
-    assert_eq!(accepting.protocol_violations(), 1);
+    assert_eq!(accepting.peer_reset_token(), Some(first));
+    assert_eq!(accepting.protocol_violations(), 0);
     let mut dialer = fixed(FRAME_CAP, Role::Client);
     dialer.handle_incoming(0, 0, &[Frame::ResetToken { token: first }]);
     dialer.handle_incoming(0, 1, &[Frame::ResetToken { token: first }]);

@@ -1361,6 +1361,10 @@ async fn serve_peer_records(
     let next =
       match crate::forward_lane::next_request_or_forwarded(&mut endpoint, &mut forwards).await {
         Ok(next) => next,
+        Err(EndpointError::PeerReset) => {
+          count_refusal(SERVE_PEER_RESET);
+          return;
+        }
         Err(_) => return,
       };
     let (stream_id, stream, request) = match next {
@@ -3973,6 +3977,11 @@ const LINK_STALE_RETURN: &str = "fleet.link.stale_return";
 /// under the same identity and no longer holds it), its link dropped so the link task dials the new process.
 /// Format: a counter name in the daemon's status report.
 const LINK_PEER_RESET: &str = "fleet.link.peer_reset";
+
+/// Counter: a served record session its dialer reset (A-261: a process restarted onto the dialer's port, under its
+/// identity), its serve loop ended.
+/// Format: a counter name in the daemon's status report.
+const SERVE_PEER_RESET: &str = "fleet.serve.peer_reset";
 /// Why a campaign's round did not ask a voter ([`take_campaign_sessions`]), counted per voter per round: no
 /// record link to it (never established, or removed at its retirement), its session lent to a coordinator
 /// dispatch, or its session held by the link task itself (a discovery page, or a dial after one ended). So a

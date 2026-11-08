@@ -497,11 +497,16 @@ pub struct Endpoint {
   handshake_stall: Option<HandshakeStall>,
   /// Closes sent on abandoning a handshake ([`Endpoint::close_abandoned_handshake`]).
   closes_sent: u64,
-  /// The key this end's stateless reset tokens are made with (`crate::reset`): an accepting end's, from its identity;
-  /// `None` on a dialer, which issues none (only an accepting end's address outlives its restart).
+  /// The key this end's stateless reset tokens are made with (`crate::reset`), from its identity; `None` when it could
+  /// not be derived, and then this end issues no token and answers nothing with a reset.
   reset_key: Option<crate::reset::ResetKey>,
   /// Whether the peer reset the session ([`EndpointError::PeerReset`]): once set, the session is drained.
   reset_heard: bool,
+  /// When this end, on its own socket, last answered a packet for another session with a stateless reset: at most one
+  /// per initial probe timeout ([`Endpoint::answer_stray`]).
+  reset_answered_at: Option<u64>,
+  /// Stateless resets this end sent from its own socket.
+  resets_sent: u64,
   /// Datagrams an established session discarded rather than folded — a raw handshake retransmit, a
   /// packet naming another session, one that did not open under the keys (RFC 9000 §12.2: an
   /// undecryptable packet is discarded, never fatal). A counter, so a test can assert the discard path
@@ -585,8 +590,10 @@ impl Endpoint {
       handshake_budgets_spent: 0,
       handshake_stall: None,
       closes_sent: 0,
-      reset_key: None,
+      reset_key: identity.reset_key(),
       reset_heard: false,
+      reset_answered_at: None,
+      resets_sent: 0,
       discarded: 0,
       exchanges: BTreeMap::new(),
       by_stream: BTreeMap::new(),
@@ -638,6 +645,8 @@ impl Endpoint {
       closes_sent: 0,
       reset_key: identity.reset_key(),
       reset_heard: false,
+      reset_answered_at: None,
+      resets_sent: 0,
       discarded: 0,
       exchanges: BTreeMap::new(),
       by_stream: BTreeMap::new(),
@@ -691,6 +700,8 @@ impl Endpoint {
       closes_sent: 0,
       reset_key: on.reset_key(),
       reset_heard: false,
+      reset_answered_at: None,
+      resets_sent: 0,
       discarded: 0,
       exchanges: BTreeMap::new(),
       by_stream: BTreeMap::new(),
@@ -764,8 +775,9 @@ impl Endpoint {
     self
       .conn
       .enable_path_mtu(usize::try_from(peer_params.max_udp_payload).unwrap_or(usize::MAX));
-    // An accepting end tells a dialer that reads it the token its stateless resets of this session will end in
-    // (A-261), inside the session, once.
+    // Each end tells a peer that reads it the token its stateless resets of this session will end in (A-261), inside
+    // the session, once. The accepting end's is the one that matters: its address outlives its restart. A dialer's
+    // serves only the rare restart that rebinds its old port.
     if peer_params.reads_reset_tokens
       && let Some(key) = &self.reset_key
     {
@@ -860,8 +872,8 @@ impl Endpoint {
     self.reset_heard
   }
 
-  /// Whether the peer has issued this end the token its stateless resets of the session end in (`crate::reset`): a
-  /// dialer holds one once the accepting end's first packets after the handshake arrive.
+  /// Whether the peer has issued this end the token its stateless resets of the session end in (`crate::reset`): held
+  /// once the peer's first packets after the handshake arrive.
   pub fn holds_reset_token(&self) -> bool {
     self.conn.peer_reset_token().is_some()
   }
@@ -1609,8 +1621,8 @@ impl Endpoint {
       return Err(EndpointError::PeerReset);
     }
     match self.recv_within(timeout_ns).await? {
-      Some((datagram, _from)) => {
-        self.fold_or_discard(&datagram)?;
+      Some((datagram, from)) => {
+        self.fold_or_discard(&datagram, from)?;
         Ok(true)
       }
       None => Ok(false),
@@ -1624,7 +1636,7 @@ impl Endpoint {
   /// does not open under the keys, is dropped as RFC 9000 §12.2 has it, never fatal to the session. Only
   /// a decoded packet whose frames are malformed (the peer broke the protocol), a closed session, or a
   /// socket refusal end the exchange.
-  fn fold_or_discard(&mut self, datagram: &[u8]) -> Result<(), EndpointError> {
+  fn fold_or_discard(&mut self, datagram: &[u8], from: SocketAddrV4) -> Result<(), EndpointError> {
     if !is_short_header(datagram) {
       self.discarded = self.discarded.saturating_add(1);
       // At most one answer per probe timeout: repeated raw traffic — a peer's retransmits, or a flood from
@@ -1662,10 +1674,49 @@ impl Endpoint {
           return Err(EndpointError::PeerReset);
         }
         self.discarded = self.discarded.saturating_add(1);
+        self.answer_stray(datagram, from);
         Ok(())
       }
       Err(other) => Err(other),
     }
+  }
+
+  /// Answers a short-header packet that names another session with a stateless reset (RFC 9000 §10.3: any endpoint
+  /// may answer a packet it cannot associate), when this end has its own socket: a process restarted onto the port an
+  /// old session's dialer held is then heard by that session's accepting end within a round trip. On a shared socket
+  /// the demultiplexer decides (it never resets a source with a session there). At most one per initial probe
+  /// timeout, shorter than its trigger; a packet naming this session, or one too short to answer, draws none.
+  fn answer_stray(&mut self, datagram: &[u8], from: SocketAddrV4) {
+    let Link::Own(socket) = &self.link else {
+      return;
+    };
+    let (Some(key), Some(id)) = (&self.reset_key, connection_id_of(datagram)) else {
+      return;
+    };
+    if !is_short_header(datagram) || self.cid == Some(id) {
+      return;
+    }
+    let now = now_ns();
+    if self
+      .reset_answered_at
+      .is_some_and(|at| now.saturating_sub(at) < self.conn.rtt().initial_pto())
+    {
+      return;
+    }
+    let Some(reset) = crate::reset::reset_datagram(&key.token(&id), datagram.len(), |out| {
+      crate::handshake::secure_random(out).is_ok()
+    }) else {
+      return;
+    };
+    self.reset_answered_at = Some(now);
+    if socket.send_to(&reset, from).is_ok() {
+      self.resets_sent = self.resets_sent.saturating_add(1);
+    }
+  }
+
+  /// Stateless resets this end sent from its own socket ([`Endpoint::answer_stray`]).
+  pub fn resets_sent(&self) -> u64 {
+    self.resets_sent
   }
 
   /// Folds one received datagram into the connection: reconstructs its packet number against the persistent
@@ -2424,13 +2475,13 @@ mod tests {
         };
         let raw = crate::flight::fragment(&[2; 10], 0).unwrap().remove(0);
         for _ in 0..50 {
-          client.fold_or_discard(&raw).unwrap();
+          client.fold_or_discard(&raw, client.peer).unwrap();
         }
         let burst = client.fragments_sent();
         slates_rt::futures::sleep(client.handshake_probe_ceiling())
           .await
           .unwrap();
-        client.fold_or_discard(&raw).unwrap();
+        client.fold_or_discard(&raw, client.peer).unwrap();
         let _ = sent.send((burst, client.fragments_sent()));
       })
       .unwrap();

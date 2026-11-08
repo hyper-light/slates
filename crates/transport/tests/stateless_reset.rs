@@ -438,3 +438,247 @@ fn the_reset_key_is_the_private_keys_not_the_certificates() {
   assert_eq!(token, from(&key.serialize_der()));
   assert_ne!(token, from(certificate.der()));
 }
+
+/// Shape: how long the old dialer waits on its second request before it is dropped: long enough for the request to
+/// reach the accepting end, which holds its reply until the dialer is gone.
+const SECOND_REQUEST_NS: u64 = 50_000_000;
+/// Shape: the pause between the new process's requests to its own peer, so simulated time advances and the old
+/// session's retransmissions reach it between them.
+const NEW_PROCESS_PAUSE_NS: u64 = 1_000_000;
+
+/// What the accepting end of a session saw once its dialer's port was taken by a new process.
+struct Rebound {
+  /// The accepting end's wait for its last reply to be acknowledged: its result, or `None` at [`BOUND_NS`].
+  settled: Option<String>,
+  /// Resets the new process sent.
+  resets_sent: u64,
+  /// Whether the old dialer held the accepting end's token, and the accepting end the dialer's.
+  tokens_held: (bool, bool),
+}
+
+/// A dialer holds a session with node `first` and asks a second request, which `first` holds its reply to; the dialer's
+/// process ends, and a new process (with the dialer's identity when `same`, else another) takes its port while talking
+/// to node `second`; then `first` replies and waits for the acknowledgement. The simulated fabric assigns every socket a
+/// fresh port, so the port is a relay's: `first` knows the dialer by the relay's address, and the relay passes `first`'s
+/// packets to the old dialer before the restart and to the new process after it, and the new process's answers back.
+fn dialer_restarted_onto_its_port(same: bool) -> Rebound {
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let shard = sim.shard_ids()[0];
+  let mut dialer = identity(2);
+  let restarted = dialer.pop().unwrap();
+  let original = dialer.pop().unwrap();
+  let other = identity(1).pop().unwrap();
+  let roster = vec![original.certificate(), other.certificate()];
+  let replacement = if same { restarted } else { other };
+  let first_node = identity(1).pop().unwrap();
+  let second_node = identity(1).pop().unwrap();
+  let (first_certificate, second_certificate) =
+    (first_node.certificate(), second_node.certificate());
+  let (ports_tx, ports_rx) = channel::<(u16, u16)>();
+  let (relay_ports_tx, relay_ports_rx) = channel::<u16>();
+  let (relay_tx, relay_rx) = channel::<u16>();
+  let (old_port_tx, old_port_rx) = channel::<u16>();
+  let (new_port_tx, new_port_rx) = channel::<u16>();
+  let (asked_tx, asked_rx) = channel::<()>();
+  let (gone_tx, gone_rx) = channel::<()>();
+  let (settled_tx, settled_rx) = channel::<(Option<String>, bool)>();
+  let (finished_tx, finished_rx) = channel::<()>();
+  let (relay_done_tx, relay_done_rx) = channel::<()>();
+  let (stop_tx, stop_rx) = channel::<()>();
+  let (rebound_tx, rebound_rx) = channel::<(u64, bool)>();
+
+  // The nodes: the second serves whatever the new process asks; the first serves the first request, takes the second,
+  // replies once the dialer is gone, and waits for the acknowledgement.
+  sim
+    .spawn_on(shard, async move {
+      let first = start_demux(first_node, roster.clone());
+      let second = start_demux(second_node, roster);
+      let port = |demux: slates_transport::demux::DemuxId| {
+        demux.with(Demux::local_addr).unwrap().unwrap().port()
+      };
+      ports_tx.send((port(first), port(second))).unwrap();
+      relay_ports_tx.send(port(first)).unwrap();
+      let serving = futures::spawn(async move {
+        let mut accepted = within(BOUND_NS, second.accept()).await.unwrap().unwrap();
+        within(BOUND_NS, accepted.establish())
+          .await
+          .unwrap()
+          .unwrap();
+        while stop_rx.try_recv().is_err() {
+          let _ = within(BOUND_NS, accepted.serve_once(|_, request| request)).await;
+        }
+      })
+      .unwrap();
+      futures::detach(serving).unwrap();
+      let mut accepted = within(BOUND_NS, first.accept()).await.unwrap().unwrap();
+      within(BOUND_NS, accepted.establish())
+        .await
+        .unwrap()
+        .unwrap();
+      within(BOUND_NS, accepted.serve_once(|_, request| request))
+        .await
+        .unwrap()
+        .unwrap();
+      let (stream, _, request) = within(BOUND_NS, accepted.next_request())
+        .await
+        .unwrap()
+        .unwrap();
+      asked_tx.send(()).unwrap();
+      received(gone_rx).await;
+      accepted.reply(stream, &request).unwrap();
+      let settled = within(BOUND_NS, accepted.settle())
+        .await
+        .map(|result| format!("{result:?}"));
+      settled_tx
+        .send((settled, accepted.holds_reset_token()))
+        .unwrap();
+      finished_tx.send(()).unwrap();
+    })
+    .unwrap();
+
+  // The dialer's process, then the one that takes its port.
+  sim
+    .spawn_on(shard, async move {
+      let (_, second) = received(ports_rx).await;
+      let relay = SocketAddrV4::new(Ipv4Addr::LOCALHOST, received(relay_rx).await);
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      old_port_tx
+        .send(socket.local_addr().unwrap().port())
+        .unwrap();
+      let mut old =
+        Endpoint::client(socket, relay, &original, &first_certificate, NAME, shape()).unwrap();
+      within(BOUND_NS, old.establish()).await.unwrap().unwrap();
+      within(BOUND_NS, old.request(1, Priority::Control, b"one"))
+        .await
+        .unwrap()
+        .unwrap();
+      let _ = within(SECOND_REQUEST_NS, old.request(1, Priority::Control, b"two")).await;
+      received(asked_rx).await;
+      let held = old.holds_reset_token();
+      drop(old);
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      new_port_tx
+        .send(socket.local_addr().unwrap().port())
+        .unwrap();
+      let mut new = Endpoint::client(
+        socket,
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, second),
+        &replacement,
+        &second_certificate,
+        NAME,
+        shape(),
+      )
+      .unwrap();
+      within(BOUND_NS, new.establish()).await.unwrap().unwrap();
+      gone_tx.send(()).unwrap();
+      let began = futures::now_ns();
+      while finished_rx.try_recv().is_err()
+        && futures::now_ns().saturating_sub(began) < BOUND_NS + ROUND_TRIP_NS
+      {
+        let _ = within(BOUND_NS, new.request(1, Priority::Control, b"new")).await;
+        futures::sleep(NEW_PROCESS_PAUSE_NS).await.unwrap();
+      }
+      let _ = stop_tx.send(());
+      let _ = relay_done_tx.send(());
+      rebound_tx.send((new.resets_sent(), held)).unwrap();
+    })
+    .unwrap();
+
+  // The relay: the dialer's port as the first node knows it. Before the restart it passes between the old dialer and
+  // the first node; once the new process has a port, the first node's packets go to it and its answers back.
+  sim
+    .spawn_on(shard, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      relay_tx.send(socket.local_addr().unwrap().port()).unwrap();
+      let first = SocketAddrV4::new(Ipv4Addr::LOCALHOST, received(relay_ports_rx).await);
+      let old = SocketAddrV4::new(Ipv4Addr::LOCALHOST, received(old_port_rx).await);
+      let mut new: Option<SocketAddrV4> = None;
+      let mut buffer = [0u8; 2048];
+      let mut line: VecDeque<(u64, Vec<u8>, SocketAddrV4)> = VecDeque::new();
+      while relay_done_rx.try_recv().is_err() {
+        if new.is_none()
+          && let Ok(port) = new_port_rx.try_recv()
+        {
+          new = Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+        }
+        let now = futures::now_ns();
+        while line.front().is_some_and(|(due, _, _)| *due <= now) {
+          let (_, datagram, to) = line.pop_front().unwrap();
+          let _ = socket.send_to(&datagram, to);
+        }
+        let wait = line
+          .front()
+          .map_or(RELAY_PAUSE_NS, |(due, _, _)| due.saturating_sub(now).max(1));
+        let Some(Ok((length, from))) = within(wait, socket.recv_from(&mut buffer)).await else {
+          continue;
+        };
+        let to = if from == first {
+          new.unwrap_or(old)
+        } else if from == old && new.is_none() || Some(from) == new {
+          first
+        } else {
+          continue;
+        };
+        line.push_back((
+          futures::now_ns() + ONE_WAY_NS,
+          buffer[..length].to_vec(),
+          to,
+        ));
+      }
+    })
+    .unwrap();
+
+  sim.run_until_idle();
+  let (settled, accepting_held) = settled_rx.try_recv().expect("the first node finished");
+  let (resets_sent, dialer_held) = rebound_rx.try_recv().expect("the new process finished");
+  Rebound {
+    settled,
+    resets_sent,
+    tokens_held: (dialer_held, accepting_held),
+  }
+}
+
+/// RFC 9000 §10.3, the supervisor's addition to A-261: any endpoint may answer a packet it cannot associate with a reset,
+/// so a process restarted onto the port its old session's dialer held ends that session at the accepting end, which
+/// would otherwise retransmit into it until its own timers gave up. Do: hold a session from port P, leave a reply owed,
+/// end the dialer, and bind P again with the dialer's identity in a process talking to another node. Expect: both ends
+/// had been issued tokens; the new process sent a reset; the accepting end's wait for its reply's acknowledgement ended
+/// `PeerReset`.
+#[test]
+fn a_dialer_restarted_onto_its_port_resets_the_accepting_ends_session() {
+  let rebound = dialer_restarted_onto_its_port(true);
+  eprintln!(
+    "the accepting end's wait ended {:?}; the new process sent {} resets; tokens held {:?}",
+    rebound.settled, rebound.resets_sent, rebound.tokens_held
+  );
+  assert_eq!(
+    rebound.tokens_held,
+    (true, true),
+    "each end was issued its peer's token"
+  );
+  assert!(rebound.resets_sent >= 1);
+  assert_eq!(rebound.settled.as_deref(), Some("Err(PeerReset)"));
+}
+
+/// Hostile input on the same path: a process with another identity on that port answers with a reset the accepting end
+/// was never issued the token for, and the session is not ended by it. Expect: resets sent, at most one per initial probe
+/// timeout (6 in the 4 s bound when measured), and the accepting end still waiting at the bound.
+#[test]
+fn a_reset_from_another_process_on_the_dialers_port_is_ignored() {
+  let rebound = dialer_restarted_onto_its_port(false);
+  assert!(
+    rebound.resets_sent >= 1,
+    "the new process answered the strays"
+  );
+  // The accepting end retransmitted into the port for the whole bound, and the new process answered at most once per
+  // initial probe timeout.
+  assert!(
+    rebound.resets_sent <= 1 + BOUND_NS / INITIAL_PTO_NS,
+    "{} resets in {BOUND_NS} ns",
+    rebound.resets_sent
+  );
+  assert_eq!(
+    rebound.settled, None,
+    "the accepting end kept waiting on its own timers"
+  );
+}

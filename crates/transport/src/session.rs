@@ -145,10 +145,10 @@ pub enum Frame {
   /// frame (`crate::pmtud`), its packet padded to the size under test. Never retransmitted — a lost probe
   /// is an answer, not data to recover.
   Ping,
-  /// The token a stateless reset of this session ends in (RFC 9000 §10.3; `crate::reset`, A-261): sent once by the
-  /// accepting end, inside the encrypted session, so only its peer learns it, and only to a peer whose parameters say
-  /// it reads this frame (`crate::params`). Ack-eliciting and retransmitted on loss, so the dialer holds it before a
-  /// restart of the accepting end can strand it.
+  /// The token a stateless reset of this session ends in (RFC 9000 §10.3; `crate::reset`, A-261): sent once by each
+  /// end, inside the encrypted session, so only its peer learns it, and only to a peer whose parameters say it reads
+  /// this frame (`crate::params`). Ack-eliciting and retransmitted on loss, so the peer holds it before a restart of
+  /// the sender can strand it.
   ResetToken {
     /// The token: a stateless reset of this session ends in these bytes.
     token: crate::reset::ResetToken,

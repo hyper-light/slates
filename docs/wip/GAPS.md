@@ -8613,8 +8613,9 @@ identity derives. The client node ends the session `PeerReset`, drops the link (
 new process. In simulation the session ended one round trip after its first packet (10.0 ms against 10 ms). Record:
 `docs/bugs/2026-11-08-a-restarted-node-left-its-peers-sessions-to-it-in-place.md`.
 - **Still open:**
-  - An accepting session whose dialer restarted is not reset: the dialer came back on another port. It ends on its own
-    timers, as before.
+  - An accepting session whose dialer restarted onto another port is not reset, since nothing answers at the old
+    port. It ends on its own timers, as before. A restart that rebinds the old port does reset it: a dialer's own
+    socket answers strays too.
   - A peer restarted under another identity, a lost reset, and an older build all fall to loadtest-scale's lane-side
     check (the peer's generation changed).
 

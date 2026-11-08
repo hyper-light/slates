@@ -12,7 +12,9 @@
 //! is answered with a stateless reset: this node lost that session (it restarted under the same identity), and the
 //! token at the reset's tail, made from the identity's private key and the packet's connection id, is the one this node
 //! issued its dialer inside the session, so the dialer ends it at once instead of waiting out its own timers on a
-//! session that is gone. A source with a session here gets none (a dialer's packet can outrun the binding of its new
+//! session that is gone. A 1-RTT packet naming no session from an established session's dialer goes to that session
+//! instead: it may be the dialer's own reset, from a process restarted onto its port, which only the session holds the
+//! token to recognise. A source with a session here gets none (a dialer's packet can outrun the binding of its new
 //! id: a reset then would end a session about to exist). Each reset is shorter than its trigger (§10.3.3), and a
 //! source draws at most one per initial probe timeout, from a table no larger than the pool, so a flood of strays
 //! costs the path at most what it sent.
@@ -589,8 +591,19 @@ impl Demux {
         Some(slot) => inner.deliver(self.inbox_datagrams, slot, datagram),
         None => {
           inner.counters.unknown_id = inner.counters.unknown_id.saturating_add(1);
-          if let Some(id) = id {
-            self.reset_unknown(&mut inner, id, datagram.len(), from);
+          // From an established session's dialer it may be that dialer's stateless reset (a process restarted onto
+          // its port): the session compares it with the token its dialer issued (RFC 9000 §10.3.1, the tokens for
+          // that remote address). A session still in its handshake is never handed one.
+          match inner.by_source.get(&from).copied() {
+            Some(slot) if inner.established(slot) => {
+              inner.deliver(self.inbox_datagrams, slot, datagram)
+            }
+            Some(_) => {}
+            None => {
+              if let Some(id) = id {
+                self.reset_unknown(&mut inner, id, datagram.len(), from);
+              }
+            }
           }
         }
       }
@@ -637,6 +650,13 @@ impl Inner {
       return None;
     }
     self.slots.get_mut(index)?.as_mut()
+  }
+
+  /// Whether the session at `slot` is established (its connection id bound).
+  fn established(&mut self, slot: Slot) -> bool {
+    self
+      .inbox_mut(slot)
+      .is_some_and(|inbox| inbox.connection_id.is_some())
   }
 
   /// Queues a datagram for a session and wakes its reader; an inbox at `capacity` drops it, counted.

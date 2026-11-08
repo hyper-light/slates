@@ -17,15 +17,17 @@ eventually dropped it.
 lost or wrongly answered: the forwards were refused and retried.
 
 **Edits (A-261).**
-- The accepting end issues its dialer a token inside the encrypted session.
+- Each end issues its peer a token inside the encrypted session.
   - The token is HMAC of the session's id under a key that only the node's identity can derive.
   - It is sent in a `ResetToken` frame, only to a peer that says it reads one.
 - A restarted node's demultiplexer answers a packet for an unknown session with a stateless reset ending in that token.
   - It never sends one to a source that has a session there.
   - It sends a source at most one per initial probe timeout.
   - Each reset is shorter than the packet that drew it.
-- The dialer ends the session `PeerReset` on a datagram whose tail is its token. A tail that matches nothing is
-  discarded, as before.
+- An endpoint on its own socket answers a packet naming another session with a reset too (RFC 9000 §10.3). This covers
+  a process restarted onto its old session's dialer port.
+- An end receiving a datagram whose tail is its peer's token ends the session `PeerReset`. A tail that matches nothing
+  is discarded, as before.
 - The fleet drops a reset session's link (`fleet.link.peer_reset`) instead of putting the session back, and the link task
   dials the new process.
 
@@ -39,6 +41,11 @@ lost or wrongly answered: the forwards were refused and retried.
   triggers, none to a 21-byte trigger, none inside the interval, and none to a source mid-handshake. Red without each of
   those limits.
 - `the_reset_key_is_the_private_keys_not_the_certificates`: red with the key derived from the certificate.
+- `a_dialer_restarted_onto_its_port_resets_the_accepting_ends_session`: the accepting end's wait ended `PeerReset`
+  after one reset from the new process. Red with no stray answered, with the demultiplexer dropping the stray, with an
+  accepting end refusing its dialer's token, and with a dialer issuing none.
+- `a_reset_from_another_process_on_the_dialers_port_is_ignored`: 6 resets in the 4 s bound, one per initial probe
+  timeout, and the accepting end still waiting at the bound.
 - The process test is loadtest-scale's case: `a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process`.
   Its CI figures are added when the run reports.
 
