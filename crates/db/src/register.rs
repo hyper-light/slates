@@ -4562,9 +4562,10 @@ mod tests {
       HostPrepare::decode(&flag),
       Err(RegisterError::MalformedRecord)
     );
-    // The entry count sits after the header words, the next page (presence byte and object) and the fence
-    // (presence byte and epoch); claim every count there is.
-    let count_at = 4 * size_of::<u64>() + 1 + OBJECT_BYTES + 1 + size_of::<u64>();
+    // The entry count sits after the header words, the next page (presence byte and object), the fence (presence byte
+    // and epoch) and the unpromised count; claim every count there is.
+    let count_at =
+      4 * size_of::<u64>() + 1 + OBJECT_BYTES + 1 + size_of::<u64>() + size_of::<u32>();
     let mut lying = answer.clone();
     lying[count_at..count_at + size_of::<u32>()].copy_from_slice(&u32::MAX.to_le_bytes());
     assert_eq!(
