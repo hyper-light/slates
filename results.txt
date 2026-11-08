@@ -1,0 +1,28 @@
+red on ubuntu-latest, 4 CPUs, Sun Nov  8 08:20:09 UTC 2026, head c249ef5ed82e746ee306d7451e09af381d3139a3
+== run 1 exit 101
+thread 'a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone' (5730) panicked at crates/server/tests/fleet.rs:6183:6:
+settle_initial_consensus committed the voters
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone ... FAILED
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 99 filtered out; finished in 1.87s
+
+error: test failed, to rerun pass `-p slates-server --test fleet`
+== run 2 exit 101
+thread 'a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone' (5759) panicked at crates/server/tests/fleet.rs:6203:3:
+a learner joined while the council was the bootstrapper alone: voters [HostId(4600682579740929743), HostId(6843359096364889712), HostId(18012430784231313834)], each learner's view [(HostId(17204351961498109954), [HostId(4600682579740929743), HostId(6843359096364889712), HostId(18012430784231313834)]), (HostId(9795328179463745453), [HostId(4600682579740929743), HostId(6843359096364889712), HostId(18012430784231313834)])]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone ... FAILED
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 99 filtered out; finished in 2.00s
+
+error: test failed, to rerun pass `-p slates-server --test fleet`
+== run 3 exit 101
+thread 'a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone' (5787) panicked at crates/server/tests/fleet.rs:6235:3:
+every survivor's council passed version 9 and reached the newest (installed, council) per survivor: [Ok((13, 13)), Ok((9, 9)), Ok((13, 13)), Ok((13, 13))]; the learners' views at the stop [(HostId(15497699963604822959), [HostId(463214656487268345)]), (HostId(15253904320328890860), [HostId(463214656487268345)])]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone ... FAILED
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 99 filtered out; finished in 408.47s
+
+error: test failed, to rerun pass `-p slates-server --test fleet`
