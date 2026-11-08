@@ -1,0 +1,55 @@
+name: diag-clients
+
+# Diagnostics only, never on main: each rewritten fleet timing test against the fault it must catch.
+on:
+  push:
+    branches: ["diag-clients-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cross-shard-wait:
+    name: R3 class A on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 330
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Build the tests
+        run: cargo test --locked -p slates-server --test fleet --no-run
+      - name: The mutants
+        run: bash .github/diag-timing-mutants.sh
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/clients-mutants-4-${{ matrix.os }}"
+          git config user.name "diag-clients"
+          git config user.email "diag-clients@users.noreply.github.com"
+          git stash -q || true
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-clients mutants-4 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
