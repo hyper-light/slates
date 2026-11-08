@@ -45,6 +45,17 @@ CI, one test binary per platform, five daemons:
 
 Each failure left one survivor at version 7 or 8 against 10 to 12 for the others.
 
+## A second use of the same list: a learner's reports
+
+`send_council_report`, which carries a learner's settlements and takeover confirmations, also went only to the join
+state's voters, and counted itself sent before knowing anyone was there. In CI diag-raft-chaos-learner-56 run 1 a node's
+neighbourhood stayed unsettled for a whole fleet wait with `fleet.report.sent` 662. A report now goes to every member of
+the region this node holds a session to; the leader proposes it and any other member answers `NotLeader`.
+`fleet.report.no_session` counts a report with no session to go on. Test
+`a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone`: without the fix 5 of 8 failed (macOS 2 of
+4, Linux 3 of 4, CI diag-live-fixes-51), with it 23 of 24 passed (diag-live-fixes-52). The whole fleet suite was not run
+on this change alone.
+
 ## Sibling, reported and not changed
 
 `drive_root_learner_fetch` filters on the root group's voters the same way. It needs its own test.
