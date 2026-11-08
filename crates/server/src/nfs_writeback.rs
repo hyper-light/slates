@@ -56,7 +56,9 @@
 
 use std::collections::BTreeMap;
 
-use slates_bridge_fuse::coherence::{MOST_ADDED_BY_AN_UPDATE, OwnRecords, PageStates, RANGE_BYTES};
+use slates_bridge_fuse::coherence::{
+  MOST_ADDED_BY_AN_UPDATE, OwnRecords, PageStates, RANGE_BYTES, WritebackVerdict, judge_writeback,
+};
 use slates_db::catalog::VolumeId;
 use slates_mem::budget::MetadataCredit;
 use slates_vfs::ids::InodeNo;
@@ -146,28 +148,19 @@ struct Connection {
   late: bool,
 }
 
-/// A WRITE's verdict.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Verdict {
-  /// No byte of it is a stale copy over a newer change: apply it.
-  Apply,
-  /// It would put stale bytes back over another path's newer change: refuse it.
-  Conflict,
-  /// The states cannot tell: refuse it.
-  Unknown,
-}
-
 /// Judges connection `connection`'s WRITE of `data` at `at` to inode `ino` of `volume`, consuming every pending change
-/// first. A volume not on this shard is applied: its call is refused where it is served.
+/// first, by the rule every transport shares ([`judge_writeback`], A-248): applied whole, or refused whole when a stale
+/// byte differs from the file's or the states cannot tell. A volume not on this shard is applied: its call is refused
+/// where it is served.
 pub(crate) fn judge(
   s: &mut ShardState,
   connection: u64,
   (volume, ino): (VolumeId, u64),
   at: u64,
   data: &[u8],
-) -> Verdict {
+) -> WritebackVerdict {
   if !tracking(s, volume) {
-    return Verdict::Apply;
+    return WritebackVerdict::Apply;
   }
   consume(s, volume);
   let history = prepare(s, connection, (volume, ino));
@@ -179,7 +172,7 @@ pub(crate) fn judge(
       ..
     } = &mut *s;
     let Some(tracker) = nfs_writeback.trackers.get_mut(&volume) else {
-      return Verdict::Apply;
+      return WritebackVerdict::Apply;
     };
     let conn = tracker.connections.entry(connection).or_default();
     open_untracked(&mut store.metadata, conn, ino, &history);
@@ -188,64 +181,33 @@ pub(crate) fn judge(
     (stale, lost)
   };
   s.count(LOST_FOR_ROOM, stale.1);
-  let verdict = match stale.0 {
-    None => Verdict::Unknown,
-    Some(ranges) if ranges.is_empty() => Verdict::Apply,
-    Some(ranges) if equal_to_the_file(s, (volume, ino), at, data, &ranges) => {
-      s.count(IDENTICAL, 1);
-      Verdict::Apply
-    }
-    Some(_) => Verdict::Conflict,
+  let verdict = {
+    let slot = s
+      .by_id
+      .get(&volume)
+      .and_then(|&handle| s.volumes.get(handle).ok());
+    judge_writeback(stale.0.as_deref(), at, data, |offset, len, out| {
+      let (Some(slot), Ok(len)) = (slot, usize::try_from(len)) else {
+        return false;
+      };
+      out.clear();
+      out.resize(len, 0);
+      match slot.volume.read(&s.store, InodeNo(ino), offset, out) {
+        Ok(read) => {
+          out.truncate(read);
+          true
+        }
+        Err(_) => false,
+      }
+    })
   };
   match verdict {
-    Verdict::Conflict => s.count(CONFLICTS, 1),
-    Verdict::Unknown => s.count(UNKNOWN, 1),
-    Verdict::Apply => {}
+    WritebackVerdict::Conflict => s.count(CONFLICTS, 1),
+    WritebackVerdict::Unknown => s.count(UNKNOWN, 1),
+    WritebackVerdict::Identical => s.count(IDENTICAL, 1),
+    WritebackVerdict::Apply => {}
   }
   verdict
-}
-
-/// Whether `data`, written at `at`, equals the file's bytes now over every stale range: a write that changes nothing
-/// there.
-fn equal_to_the_file(
-  s: &ShardState,
-  (volume, ino): (VolumeId, u64),
-  at: u64,
-  data: &[u8],
-  ranges: &[std::ops::Range<u64>],
-) -> bool {
-  let Some(slot) = s
-    .by_id
-    .get(&volume)
-    .and_then(|&handle| s.volumes.get(handle).ok())
-  else {
-    return false;
-  };
-  ranges.iter().all(|range| {
-    let (Some(from), Some(to)) = (
-      range
-        .start
-        .checked_sub(at)
-        .and_then(|from| usize::try_from(from).ok()),
-      range
-        .end
-        .checked_sub(at)
-        .and_then(|to| usize::try_from(to).ok()),
-    ) else {
-      return false;
-    };
-    let Some(written) = data.get(from..to.min(data.len())) else {
-      return false;
-    };
-    let mut now = vec![0u8; written.len()];
-    match slot
-      .volume
-      .read(&s.store, InodeNo(ino), range.start, &mut now)
-    {
-      Ok(read) => read == written.len() && now == written,
-      Err(_) => false,
-    }
-  })
 }
 
 /// Connection `connection` was answered bytes `range` of inode `ino` of `volume`: fresh as of the journal's head.
