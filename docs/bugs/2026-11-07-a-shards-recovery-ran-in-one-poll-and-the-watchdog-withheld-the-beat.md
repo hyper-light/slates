@@ -61,11 +61,18 @@ lateness, and every successor ran the same recovery: a restart loop the start ju
   than 496 ms, at load 160-220 on this Mac; every green's every file read back. On all four CI runners with the earlier
   slice rule (diag-liveness-24): ubuntu-latest reached 256 greens, 3.0 s of CPU, the beat no older than 203 ms.
 - Recovery's cost against the unsliced build, interleaved on this Mac over the same recipe, 5 restarts each, release
-  binaries built alike (no LTO), shard 0's CPU from the boot log, median of 5, at 166-206 runnable processes without
-  and 317-357 with 8 nice-19 spinners a CPU (this shared Mac was never quiet; 0 spinning and 0 wedged lines in all 40
-  restarts, the recovered counts right every time). State A (1,000 works): 245.3 to 86.8 ms (-64.6%), 328.6 to 113.1 ms
-  (-65.6%). State B (100 works): 74.3 to 73.6 ms (-1.0%), 88.0 to 71.1 ms (-19.2%). State A falls because the records'
-  sort no longer lists the catalog at each comparison.
+  binaries built alike (no LTO), shard 0's CPU from the boot log, median of 5; 0 spinning and 0 wedged lines in every
+  restart below, the recovered counts right every time. State A (1,000 works, 1,001 merge volumes), quiet (5-10
+  runnable processes): 274.0 to 83.7 ms (-69.4%); at 166-206 runnable: 245.3 to 86.8 ms (-64.6%); with 8 nice-19
+  spinners a CPU (154-162 and 317-351 runnable): 319.2 to 107.9 ms (-66.2%), 328.6 to 113.1 ms (-65.6%). State B (100
+  works over a kernel-tree green), at 166-206 runnable: 74.3 to 73.6 ms (-1.0%); with spinners (300-302 and 343-357
+  runnable): 91.1 to 92.5 ms (+1.5%), 88.0 to 71.1 ms (-19.2%). State A falls because the records' sort no longer lists
+  the catalog at each comparison.
+- State B quiet, which one 5-run pair put at +20.4% (67.2 to 80.9 ms, one sliced restart at 153 runnable): rerun as
+  three alternating-order pairs of 5 restarts, each build started only under a 1-minute load of 30 (4-16 runnable): 15
+  restarts each, 72.6 to 74.2 ms (+2.2%, ranges 49.1-87.1 and 50.2-97.6 ms), the yields' own time 1.5-2.9 ms. Per round
+  the medians are 76.2 to 67.0, 74.2 to 74.2 and 61.8 to 82.5 ms: a single 5-run median on this Mac moves by more than
+  the limit either way, so the pool of 15 is the figure and no one round's is.
 - `crates/server/src/recovery_slices.rs`: a recovery of 4,096 units each as long as this machine's cheapest yield spends
   at most the plan's 10% of its time yielding (red before the rule: 4,097 slices, 18.5%); a slice at the ceiling ends
   whatever the yields cost, and a slice past its floor ends only once its yield is paid for.

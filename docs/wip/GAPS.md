@@ -766,8 +766,8 @@
 > - **2026-11-07, recovery in one poll closed:** a shard's start runs alone and its recovery yields between units (each
 >   record, a green's held origin a directory listing or file a unit, its chain an entry a unit, each logged write),
 >   at least half the live step quantum a slice, its yields held to 5% of its time, at most a heartbeat period a slice
->   (state B's CPU -1.0% and -19.2% against the unsliced build, state A's -64.6% and -65.6%, 5 restarts each, 0 spinning
->   lines; at the live quantum alone state B had risen 8.7% and 13.8%); the records' sort computes each key once (it recomputed the lineage depth,
+>   (state B's CPU +2.2% quiet over 15 restarts a build, -1.0%, +1.5% and -19.2% under load, state A's -64.6% to -69.4%,
+>   0 spinning lines in every restart; at the live quantum alone state B had risen 8.7% and 13.8%); the records' sort computes each key once (it recomputed the lineage depth,
 >   listing the whole catalog, at every comparison: 132-141 ms of a 1,001-volume recovery) and recovery decodes only the
 >   newest snapshot slot that decodes. The boot log names each shard's slices, units, CPU and its most CPU in one slice.
 >   Still one unit each: the catalog's replay (206-261 ms for 1,001 volumes on this Mac) and a green's engine built over
