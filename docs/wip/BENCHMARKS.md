@@ -11761,6 +11761,82 @@ The interface's `between` gaps show what the separate send costs the client. Fro
 dll takes 25–27 µs and main 35. Flush is 25–28 against 38, VolumeInfo 31–33 against 40–47, and Write 62–69 against 76. A
 dash in a table: not broken out on that runner.
 
+### The bench's own noise: a control arm, and identical arms (audit step 7; 2026-11-08)
+
+**A do-nothing arm.** Diag `diag-winfsp-overlap-47` (run 42463623854) ran main (`4811191a`), cut 0 (`58bf8310`: the
+receive protocol moved into `inflight/settle.rs` and its crash oracle, nothing on the request path changed) and the
+purge slot (`d0492b10`, A-249) interleaved on one VM of each runner, quiet and loaded, 5 runs of 5, 0 failed. Cells
+worse beyond the other arm's spread, p50 and p99, of 18 a phase:
+
+| | arm64 quiet | arm64 loaded | x86_64 quiet | x86_64 loaded |
+|---|---|---|---|---|
+| cut 0 worse than main | 1 | 2 | 0 | 0 |
+| main worse than cut 0 | 2 | 7 | 7 | 2 |
+| purge slot worse than main | 3 | 0 | 0 | 0 |
+| main worse than the purge slot | 2 | 4 | 2 | 6 |
+| purge slot worse than cut 0 | 1 | 1 | 3 | 0 |
+| cut 0 worse than the purge slot | 1 | 1 | 0 | 4 |
+
+Main looks "worse" in up to 7 cells against a tree that changes nothing on the request path, and x86_64's quiet
+unlink moves 19.0 µs within each run (median, 4 runs of 5). So the bench's noise floor, or a bias against the arm
+listed first, is at least that large, and cut 0 is read as the control: the purge slot against it is 1 and 1 cells on
+arm64 and 3 and 4 on x86_64, no effect claimed. **Every later cut carries a do-nothing arm.**
+
+**Identical arms.** Diag `diag-winfsp-overlap-48` (run 42486022157) ran three copies of one binary (main `4811191a`,
+built once a lane, the three files' SHA-256 equal) on one VM of each runner, quiet and loaded, six runs. In a round the
+bench takes the arms in its list's order from `(round + offset) % arms`. The lanes ran that list fixed, as the bench had
+it, or rotated each run to start with the run's first-started arm. The windows-latest fixed lane stalled after its
+first run (no further output in 1 h 40 m, the job still alive), as diag-42's unlink lane once did; it is not used.
+
+Cells one copy was worse than another beyond its spread, per pair and phase, of 18:
+
+| lane | runs | most cells, one pair and phase | cells each copy is worse, both phases (a, b, c) |
+|---|---|---|---|
+| windows-11-arm, list fixed | 6 | 4 | 7, 4, 9 |
+| windows-11-arm, list rotated | 6 | 5 | 3, 7, 6 |
+| windows-latest, list rotated | 6 | 6 | 8, 1, 4 |
+
+Each copy's p50 against the three copies' mean in the same run, over every op (geometric):
+
+| lane | quiet (a, b, c) | loaded (a, b, c) |
+|---|---|---|
+| windows-11-arm, list fixed | −3.15%, −0.75%, +3.90% | +1.19%, −0.30%, −0.89% |
+| windows-11-arm, list rotated | +1.01%, −0.18%, −0.83% | −0.53%, +0.24%, +0.28% |
+| windows-latest, list rotated | +2.33%, −1.92%, −0.41% | +0.77%, −1.08%, +0.31% |
+
+- **The rule's floor.** Identical binaries are "worse" in up to 6 cells of 18 for one pair and phase. A verdict of a few
+  worse cells cannot tell two arms apart, which is why the A/Bs above (diag-44's, diag-45's dead even) are read within
+  each run as well.
+- **The list's order.** Fixed, the first-listed copy ran 3.15% under the run's mean in arm64's quiet pass and the last
+  3.90% over, most of it in open and close, whose millisecond mode it falls in. Rotated, no copy is more than 1.01% off
+  on arm64. A copy still sits 2.33% off on windows-latest rotated, so a run's arms differ by about ±2% with nothing
+  between them.
+- **So:** the bench rotates its list every run from now on (`windows-ab.sh`), and a cut is called only on its
+  within-run differences against a do-nothing arm, measured beyond what identical arms show.
+
+### The Open and Release barriers: measured and rejected as a cut (audit step 7; 2026-11-08)
+
+**The proposal.** A-198's rule that "successful opens and closes publish their reference changes" puts a shard
+publication before an Open's and a Release's reply. Recovery already reconciles the restored open counts against the
+ledger's live contexts (`reconcile_opens`), so the barrier looked removable, a whole publication off each open and close.
+
+**The measurement.** From the per-phase profile of `diag-winfsp-overlap-46` (run 42406233399, five runs a runner): a
+round's mean less its hop-in, serve and to-answer leaves the shard's answer step, which is the barrier and the send.
+Means, µs:
+
+| answer step | arm64, main | arm64, dll | x86_64, main | x86_64, dll |
+|---|---|---|---|---|
+| Open (barrier) | 0.5 | 2.7 | 0.3 | 4.8 |
+| Release (barrier) | 0.8 | 3.6 | 0.7 | 8.0 |
+| Resolve (no barrier) | 0.6 | 0.6 | 0.4 | 0.3 |
+| Info (no barrier) | 0.6 | 1.1 | 0.5 | 0.6 |
+
+In main's form an Open's or a Release's barrier costs what an op with none does, within 0.2 µs; only the DLL arm still
+pays it. Removing it would save under 0.2 µs a request, against the bench's ±2% floor between identical arms (above), so
+it is **rejected**, and A-198 stays as written. The ledger's own writes, the other candidate named with it, show no cost
+against the DLL at the mean either (serve: Create 10.2 against 13.6 µs on arm64 and 7.3 against 8.7 on x86_64; Open
+2.3 against 3.2 and 2.0 against 2.8).
+
 ### Step 7's verdict
 
 - **Fixed wherever it was not crash safety:** the replayed Close's refusal, the rename's empty shard turn, the per-batch
