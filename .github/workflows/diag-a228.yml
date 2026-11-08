@@ -1,0 +1,55 @@
+name: diag-a228
+
+# Diagnostics only, never on main (A-228). The `windows-lint` lane's own documentation step, its exact command, on the
+# branch's code. Results go to diag-results/a228-7-windows-latest.
+on:
+  push:
+    branches: ["diag-a228-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  windows-doc:
+    name: the Windows lane's documentation step
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - uses: ilammy/setup-nasm@v1.5.2
+      - name: The documentation step
+        env:
+          RUSTDOCFLAGS: -D warnings -A rustdoc::private_intra_doc_links
+        run: |
+          R=../results.txt
+          echo "runner windows-latest, $(git log --oneline -1 | cut -c1-80), $(date -u)" > $R
+          echo "command: cargo doc -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-anchor -p slates-cli -p slates-mcp --no-deps --document-private-items" >> $R
+          status=0
+          cargo doc -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-anchor -p slates-cli -p slates-mcp --no-deps --document-private-items > ../doc.log 2>&1 || status=$?
+          grep -E '^error|^warning: unresolved|Finished|-->' ../doc.log | cut -c1-240 | tail -20 | tee -a $R || true
+          grep -c Documenting ../doc.log | sed 's/^/crates documented: /' | tee -a $R || true
+          echo "== documentation step, exit $status" | tee -a $R
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/a228-7-windows-latest"
+          git config user.name "diag-a228"
+          git config user.email "diag-a228@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-a228-7 results"
+          git push -q origin "HEAD:refs/heads/$branch"
