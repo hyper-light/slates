@@ -1,0 +1,36 @@
+tested 7b0d71be10706490e318dc4690ab664769f80f75 variant after on aarch64, 4 cpus
+restart exit 0 145s
+still-waits exit 0 63s
+takeover exit 101 5s
+  takeover: the resend through the takeover was answered Ok(Refused { refusal: OwnerUnreachable { region: 0 } }); head Versions { head: 1 }
+  takeover: thread 'a_submit_resent_after_its_owner_was_taken_over_is_not_applied_again' (5581) panicked at crates/server/tests/fleet.rs:13477:3:
+  takeover: assertion `left == right` failed: the resend through the takeover is answered the version it was accepted as
+  takeover:   left: Some(Refused { refusal: OwnerUnreachable { region: 0 } })
+  takeover:  right: Some(Submitted { version: Some(1), conflicts: [] })
+  takeover: test a_submit_resent_after_its_owner_was_taken_over_is_not_applied_again ... FAILED
+  takeover: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 107 filtered out; finished in 4.77s
+  takeover: error: test failed, to rerun pass `-p slates-server --test fleet`
+wire exit 0 9s
+db exit 0 72s
+held exit 0 109s
+fleet-merge exit 101 265s
+  fleet-merge: test a_submit_resent_after_its_owner_was_taken_over_is_not_applied_again ... FAILED
+  fleet-merge: ---- a_submit_resent_after_its_owner_was_taken_over_is_not_applied_again stdout ----
+  fleet-merge: the resend through the takeover was answered Ok(Refused { refusal: OwnerUnreachable { region: 0 } }); head Versions { head: 1 }
+  fleet-merge: thread 'a_submit_resent_after_its_owner_was_taken_over_is_not_applied_again' (6756) panicked at crates/server/tests/fleet.rs:13477:3:
+  fleet-merge: assertion `left == right` failed: the resend through the takeover is answered the version it was accepted as
+  fleet-merge:   left: Some(Refused { refusal: OwnerUnreachable { region: 0 } })
+  fleet-merge:  right: Some(Submitted { version: Some(1), conflicts: [] })
+  fleet-merge: test result: FAILED. 13 passed; 1 failed; 1 ignored; 0 measured; 93 filtered out; finished in 264.74s
+  fleet-merge: error: test failed, to rerun pass `-p slates-server --test fleet`
+  fleet-merge: error: 1 target failed:
+server-lib exit 0 29s
+server exit 0 53s
+clippy exit 101 61s
+  clippy: error: the function has a cognitive complexity of (20/10)
+  clippy:      --> crates/server/tests/fleet.rs:12854:4
+  clippy:       = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#cognitive_complexity
+  clippy:       = note: requested on the command line with `-D clippy::cognitive-complexity`
+  clippy: error: use of a disallowed method `std::thread::sleep`
+  clippy:      --> crates/server/tests/fleet.rs:12995:14
+  clippy: error: could not compile `slates-server` (test "fleet") due to 2 previous errors
