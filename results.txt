@@ -1,0 +1,47 @@
+runner windows-11-arm, 4 CPUs, Sun Nov  8 14:02:45 UTC 2026, commit 6040cbd6
+== cargo test --locked -q -p slates-wire
+test result: ok. 35 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.14s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 34.39s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-db
+test result: ok. 63 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.61s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.56s
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 40.19s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots --- FAILED
+thread 'every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots' (7100) panicked at crates\db\tests\model.rs:68:4:
+thread 'every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots' (7100) panicked at crates\db\tests\model.rs:1064:1:
+    every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots
+test result: FAILED. 16 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.79s
+== exit 101
+== cargo test --locked -q -p slates-anchor -- --test-threads=1
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 16 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 1.03s
+test result: ok. 8 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out; finished in 0.71s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-server --lib
+test result: ok. 204 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 2.00s
+== exit 0
+== cargo test --locked -q -p slates-server --test consumers
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+== exit 0
+== cargo test --locked -q -p slates-server --test presentations
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-server --test live_ship
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-server --test forward_retry
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-server --test recovery
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-server --test liveness
+test result: ok. 6 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 6.45s
+== exit 0
