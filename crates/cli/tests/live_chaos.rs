@@ -590,6 +590,8 @@ impl Fleet {
 
   fn resume(&self, index: usize) {
     send_signal(self.daemon_pid(index), rustix::process::Signal::CONT);
+    // Diag only (live-durability-53, never on main).
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("LD-RESUME {} wall_ns {}\n", self.instances[index], std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos())).as_bytes());
   }
 
   /// Kills node `index` whole (its anchor too): what a crashed machine is.
@@ -1531,6 +1533,100 @@ fn judge_healed(
       counters(instance, "fleet.live.hold_refused.")
     ));
   }
+}
+
+/// Diag only (live-durability-58, never on main): a holder that stops itself mid-install: how long the owner's lane holds
+/// its session, and what the owner believes meanwhile.
+#[test]
+fn diag_a_holder_stopped_mid_install() {
+  if !gated("mid-install") {
+    return;
+  }
+  const OBSERVE_SECS: u64 = 40;
+  let dir = std::env::var("SLATES_DIAG_STOP_DIR").unwrap();
+  let fleet = Fleet::start("midinstall", Supervision::Bare);
+  let owner_index = fleet.owner_index();
+  let owner = fleet.instances[owner_index].clone();
+  let volume = create_volume(&owner, "midinstall", true);
+  let target = fleet.others(owner_index)[0];
+  let holder_status = run(&fleet.instances[target], &["status"]).1;
+  let holder_id = holder_status.lines().find_map(|line| line.strip_prefix("fleet_host: ")).unwrap().trim().to_owned();
+  eprintln!("LD-TL holder {} id {holder_id}", fleet.instances[target]);
+  let (_outcomes, _samples) = stream_through(&fleet.instances, &owner, &volume, 0..usize::MAX, |_began| {
+    after_writes(&owner, &volume, 40);
+    fleet.stop(target);
+    sleep(Duration::from_secs(2));
+    after_writes(&owner, &volume, 200);
+    std::fs::write(format!("{dir}/{}", fleet.daemon_pid(target)), b"").unwrap();
+    fleet.resume(target);
+    let start = Instant::now();
+    for second in 0..OBSERVE_SECS {
+      let status = run(&owner, &["status"]).1;
+      let session = status.lines().find(|line| line.starts_with(&format!("fleet_session {holder_id}:"))).unwrap_or("no session line").to_owned();
+      let members = status.lines().find(|line| line.starts_with("fleet_members")).unwrap_or("").to_owned();
+      eprintln!("LD-TL t={second} at {:?} {session} | {members}", start.elapsed());
+      sleep(Duration::from_secs(1));
+    }
+    fleet.resume(target);
+    after_writes(&owner, &volume, 20);
+  });
+}
+
+/// Diag only (live-durability-59, never on main): a holder restarted while an install exchange to its old process is
+/// outstanding: how long the new process takes to catch up.
+#[test]
+fn diag_a_holder_restarted_mid_install() {
+  if !gated("restart-mid-install") {
+    return;
+  }
+  /// How close to the owner's head counts as caught up under the stream.
+  const NEAR: u64 = 50;
+  let dir = std::env::var("SLATES_DIAG_STOP_DIR").unwrap();
+  let fleet = Fleet::start("restartmid", Supervision::Anchored);
+  let owner_index = fleet.owner_index();
+  let owner = fleet.instances[owner_index].clone();
+  let volume = create_volume(&owner, "restartmid", true);
+  let target = fleet.others(owner_index)[0];
+  let holder = fleet.instances[target].clone();
+  let (_outcomes, _samples) = stream_through(&fleet.instances, &owner, &volume, 0..usize::MAX, |_began| {
+    after_writes(&owner, &volume, 40);
+    fleet.stop(target);
+    sleep(Duration::from_secs(2));
+    after_writes(&owner, &volume, 200);
+    let pid = fleet.daemon_pid(target);
+    std::fs::write(format!("{dir}/{pid}"), b"").unwrap();
+    fleet.resume(target);
+    // Until the holder has stopped itself on the install.
+    let waiting = Instant::now();
+    let stopped = loop {
+      let state = Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().unwrap();
+      if String::from_utf8_lossy(&state.stdout).trim_start().starts_with('T') {
+        break true;
+      }
+      if waiting.elapsed() > Duration::from_secs(20) {
+        break false;
+      }
+      sleep(Duration::from_millis(5));
+    };
+    eprintln!("LD-TL stopped_on_install {stopped} after {:?}", waiting.elapsed());
+    sleep(Duration::from_secs(1));
+    let new_pid = fleet.kill_daemon_and_await_successor(target);
+    let restarted = Instant::now();
+    eprintln!("LD-TL restarted pid {new_pid}");
+    let mut caught = None;
+    while restarted.elapsed() < Duration::from_secs(50) {
+      let shipping = live_states(&owner, &volume).unwrap_or_default().into_iter().find(|state| !state.holding).and_then(|state| state.head);
+      let held = live_states(&holder, &volume).unwrap_or_default().into_iter().find(|state| state.holding).and_then(|state| state.head);
+      if let (Some(shipping), Some(held)) = (shipping, held) && held + NEAR >= shipping {
+        caught = Some(restarted.elapsed());
+        eprintln!("LD-TL caught_up after {:?}: holder {held} owner {shipping}", restarted.elapsed());
+        break;
+      }
+      sleep(Duration::from_millis(20));
+    }
+    eprintln!("LD-TL result caught {:?}", caught);
+    after_writes(&owner, &volume, 20);
+  });
 }
 
 /// A-200 with candidates partitioned in turn mid-stream: do stream writes to a live volume and stop each candidate's
