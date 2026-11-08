@@ -354,7 +354,7 @@ fn choosing_fewer_shards_keeps_the_hosts_capacity_available_for_admission() {
       "create {sequence}: {reply:?}"
     );
   }
-  let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+  let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
     panic!("list the admitted volumes");
   };
   assert_eq!(volumes.len(), SDK_CREATE_COUNT);
@@ -434,7 +434,7 @@ fn status_pages_preserve_a_capture_and_refuse_foreign_or_cancelled_cursors() {
   );
   let cancelled = status_cursor(&first.call_once(&RequestBody::DaemonStatus));
   assert!(matches!(
-    first.call(&RequestBody::List),
+    first.call(&RequestBody::List { after: None }),
     ReplyBody::Listed { .. }
   ));
   assert_eq!(
@@ -587,7 +587,7 @@ fn a_pending_rendezvous_does_not_repeatedly_kick_the_shards() {
   for _ in 0..TEST_SHARDS {
     let mut client = Client::connect(&instance);
     assert!(matches!(
-      client.call(&RequestBody::List),
+      client.call(&RequestBody::List { after: None }),
       ReplyBody::Listed { .. }
     ));
   }
@@ -670,7 +670,7 @@ fn an_idle_daemon_parks_once_its_clients_windows_have_passed() {
   for _ in 0..TEST_SHARDS {
     let mut client = Client::connect(&instance);
     assert!(matches!(
-      client.call(&RequestBody::List),
+      client.call(&RequestBody::List { after: None }),
       ReplyBody::Listed { .. }
     ));
   }
@@ -771,7 +771,7 @@ fn a_write_the_declared_durability_cannot_cover_is_refused_typed() {
     "the failure count is the one the policy was stated under"
   );
   // Reads continue: the listing answers (empty — nothing was created), and the status counts the refusal.
-  let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+  let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
     strict.stop();
     panic!("a read is served while writes are refused");
   };
@@ -885,7 +885,7 @@ fn attach_and_status(client: &mut Client, id: slates_ipc::protocol::VolumeId) ->
 
 /// List shows both volumes; detach releases the lease.
 fn list_and_detach(client: &mut Client, id: slates_ipc::protocol::VolumeId, attachment: u64) {
-  let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+  let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
     panic!("list");
   };
   let mut names: Vec<String> = volumes.iter().map(|v| v.name.clone()).collect();
@@ -925,7 +925,7 @@ fn resize_and_destroy(client: &mut Client, id: slates_ipc::protocol::VolumeId) {
   ));
   let started = Instant::now();
   loop {
-    let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+    let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
       panic!("list");
     };
     let names: Vec<String> = volumes.iter().map(|v| v.name.clone()).collect();
@@ -970,7 +970,7 @@ fn rifl_scenario() {
     panic!("retry");
   };
   assert_eq!(again, volume);
-  let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+  let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
     panic!("list");
   };
   assert_eq!(volumes.len(), 1, "the retry did not execute again");
@@ -1620,7 +1620,7 @@ fn a_consumer_lists_the_shared_volume_and_not_an_unshared_one(
   let ReplyBody::Created { id: private } = owner.call(&scratch("owner-kept-private")) else {
     panic!("create the owner-only volume");
   };
-  let ReplyBody::Listed { volumes } = workload.call(&RequestBody::List) else {
+  let ReplyBody::Listed { volumes, .. } = workload.call(&RequestBody::List { after: None }) else {
     panic!("the consumer lists its accessible volumes");
   };
   let ids: Vec<VolumeId> = volumes.iter().map(|v| v.id).collect();
@@ -1799,7 +1799,7 @@ fn once_revoked_every_verb_refuses_before_any_effect(
     }
   ));
   assert!(matches!(
-    workload.call(&RequestBody::List),
+    workload.call(&RequestBody::List { after: None }),
     ReplyBody::Refused {
       refusal: Refusal::ConsumerRevoked
     }
@@ -2149,7 +2149,7 @@ fn version_reservation_scenario() {
   ));
   let started = Instant::now();
   loop {
-    let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+    let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
       panic!("list");
     };
     if volumes.is_empty() {
@@ -2600,7 +2600,7 @@ fn snapshot_destroy_scenario() {
   ));
   let started = Instant::now();
   loop {
-    let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+    let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
       panic!("list");
     };
     if volumes.iter().all(|v| v.name != "clone") {
@@ -3572,7 +3572,7 @@ fn create_until_the_ledger_refuses(client: &mut Client) -> Vec<slates_ipc::proto
 fn wait_for_volume_count(client: &mut Client, count: usize) {
   let started = Instant::now();
   loop {
-    let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+    let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
       panic!("list");
     };
     if volumes.len() == count {

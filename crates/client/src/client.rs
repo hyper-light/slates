@@ -336,6 +336,10 @@ pub struct Client {
   /// The word of each chain step in flight, mapped to its chain's public word: a step's reply is filed under the
   /// public word, so the caller's event loop sees one operation.
   chain_steps: std::collections::BTreeMap<u64, u64>,
+  /// Async listings, by the public word their caller awaits: each walks the listing's pages as a chain, one page in
+  /// flight at a time (bounded by `awaited_cap`, as each page is awaited), its steps filed under the public word as an
+  /// edit's are.
+  list_chains: std::collections::BTreeMap<u64, ListChain>,
   /// Derived: the outstanding operations admitted — the command ring's slots, the client's in-flight
   /// bound (the same bound the retryable set keeps).
   awaited_cap: usize,
@@ -444,6 +448,40 @@ struct EditChain {
   token: u64,
   /// How many of `bytes` are put (or in flight).
   offset: usize,
+}
+
+/// A listing walked page by page (§4.4 `list`): the volumes of the pages taken so far and the cursor the next page is
+/// asked after. One reply holds one page, so a listing of any length is a walk, synchronous ([`Client::list`]) or a
+/// chain of requests under one word ([`Client::list_begin`]).
+#[derive(Debug, Default)]
+struct ListChain {
+  volumes: Vec<VolumeSummary>,
+  after: Option<VolumeId>,
+}
+
+impl ListChain {
+  /// Takes one page's reply: the cursor for the next page, or `None` when the listing is complete. A page that does
+  /// not move the cursor forward is refused, so a walk always ends.
+  fn take(&mut self, body: ReplyBody) -> Result<Option<VolumeId>, ClientError> {
+    let ReplyBody::Listed { volumes, next } = resolved(body)? else {
+      return Err(ClientError::UnexpectedReply { verb: "list" });
+    };
+    if let Some(next) = next
+      && self.after.is_some_and(|after| next <= after)
+    {
+      return Err(ClientError::UnexpectedReply { verb: "list" });
+    }
+    self.volumes.extend(volumes);
+    self.after = next;
+    Ok(next)
+  }
+
+  /// The whole listing, in name order (and id order within a name).
+  fn into_listing(self) -> Vec<VolumeSummary> {
+    let mut volumes = self.volumes;
+    volumes.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+    volumes
+  }
 }
 
 /// A file's bytes delivered to a same-kernel client (§4.6, A-171): mapped from the daemon's copy of the file with no
@@ -798,13 +836,6 @@ fn extract_status(body: ReplyBody) -> Result<StatusReport, ClientError> {
 }
 
 /// Extracts the volume list from its reply, or a typed mismatch.
-fn extract_listed(body: ReplyBody) -> Result<Vec<VolumeSummary>, ClientError> {
-  match body {
-    ReplyBody::Listed { volumes } => Ok(volumes),
-    _ => Err(ClientError::UnexpectedReply { verb: "list" }),
-  }
-}
-
 /// Confirms a resize's reply, or a typed mismatch. A unit verb yields `true` (not the `None` a poll
 /// returns when the reply has not come), so an async pump can tell "done" from "not yet".
 fn extract_resized(body: ReplyBody) -> Result<bool, ClientError> {
@@ -1123,6 +1154,7 @@ impl Client {
       awaited: std::collections::BTreeMap::new(),
       edit_chains: std::collections::BTreeMap::new(),
       chain_steps: std::collections::BTreeMap::new(),
+      list_chains: std::collections::BTreeMap::new(),
       awaited_cap: unpublished_cap,
       unawaited_dropped: 0,
       attest_in_flight: None,
@@ -2158,7 +2190,7 @@ impl Client {
   /// dropped on arrival. Returns whether it was outstanding.
   pub fn abandon(&mut self, word: u64) -> bool {
     self.pending.retain(|(held, _)| *held != word);
-    if self.edit_chains.remove(&word).is_some() {
+    if self.edit_chains.remove(&word).is_some() || self.list_chains.remove(&word).is_some() {
       let steps: Vec<u64> = self
         .chain_steps
         .iter()
@@ -2185,6 +2217,7 @@ impl Client {
       .filter(|word| !self.chain_steps.contains_key(word))
       .copied()
       .chain(self.edit_chains.keys().copied())
+      .chain(self.list_chains.keys().copied())
       .collect::<std::collections::BTreeSet<u64>>()
       .into_iter()
       .collect()
@@ -2223,6 +2256,8 @@ impl Client {
     if let Some(pos) = self.pending.iter().position(|(held, _)| *held == word) {
       let (_, body) = self.pending.remove(pos);
       self.awaited.remove(&word);
+      // A listing's page taken as a raw reply ends its walk: the caller has the page, and nothing waits on the chain.
+      self.list_chains.remove(&word);
       self.note_reply(word, &body, true);
       return resolved(body).map(Some);
     }
@@ -2230,6 +2265,7 @@ impl Client {
       let body: ReplyBody = unpack(self.end.region(), reply.kind, &reply.payload)?;
       if reply.request == word {
         self.awaited.remove(&word);
+        self.list_chains.remove(&word);
         self.note_reply(word, &body, true);
         return resolved(body).map(Some);
       }
@@ -2474,23 +2510,84 @@ impl Client {
     self.poll_as(word, extract_status)
   }
 
-  /// Begins a list, returning its request id.
+  /// Begins a listing, returning its request id: the word of a chain that walks the listing's pages, the first in
+  /// flight now ([`ListChain`]).
   pub fn list_begin(&mut self) -> Result<RequestId, ClientError> {
-    self.begin(&RequestBody::List)
+    let id = self.begin(&RequestBody::List { after: None })?;
+    self.list_chains.insert(id.word(), ListChain::default());
+    Ok(id)
   }
 
-  /// Takes a list reply within `spin_ns`.
+  /// Takes a listing within `spin_ns`: the whole listing when its first page is its last and comes in the spin; else
+  /// `None`, and the next page is in flight under the same word, for [`Client::list_poll`].
   pub fn list_spin(
     &mut self,
     id: RequestId,
     spin_ns: u64,
   ) -> Result<Option<Vec<VolumeSummary>>, ClientError> {
-    self.spin_as(id, spin_ns, extract_listed)
+    let started = Instant::now();
+    loop {
+      if let Some(body) = self.take_held(id.word())? {
+        return self.advance_list(id.word(), body);
+      }
+      if elapsed_ns(started) >= spin_ns {
+        return Ok(None);
+      }
+      std::hint::spin_loop();
+    }
   }
 
-  /// Takes a list reply by id word once the completion fd signals.
+  /// Takes a listing by id word once the completion fd signals: each page's reply sends the next page's request, and
+  /// the whole listing, in name order, comes with the last page's.
   pub fn list_poll(&mut self, word: u64) -> Result<Option<Vec<VolumeSummary>>, ClientError> {
-    self.poll_as(word, extract_listed)
+    match self.take_held(word)? {
+      Some(body) => self.advance_list(word, body),
+      None => Ok(None),
+    }
+  }
+
+  /// The reply held for the chain `word` once the ring is drained (a step's reply is filed under its chain's word),
+  /// still typed: a chain advances on a refusal by ending.
+  fn take_held(&mut self, word: u64) -> Result<Option<ReplyBody>, ClientError> {
+    self.take_ready()?;
+    let Some(pos) = self.pending.iter().position(|(held, _)| *held == word) else {
+      return Ok(None);
+    };
+    let (_, body) = self.pending.remove(pos);
+    self.awaited.remove(&word);
+    Ok(Some(body))
+  }
+
+  /// Advances the listing `word` by one page's reply: the whole listing after its last page, else `None` with the next
+  /// page's request sent under the chain's word.
+  fn advance_list(
+    &mut self,
+    word: u64,
+    body: ReplyBody,
+  ) -> Result<Option<Vec<VolumeSummary>>, ClientError> {
+    let Some(chain) = self.list_chains.get_mut(&word) else {
+      return Err(ClientError::UnexpectedReply { verb: "list" });
+    };
+    let next = match chain.take(body) {
+      Ok(next) => next,
+      Err(e) => {
+        self.list_chains.remove(&word);
+        return Err(e);
+      }
+    };
+    let Some(after) = next else {
+      return Ok(self.list_chains.remove(&word).map(ListChain::into_listing));
+    };
+    match self.begin(&RequestBody::List { after: Some(after) }) {
+      Ok(id) => {
+        self.chain_steps.insert(id.word(), word);
+        Ok(None)
+      }
+      Err(e) => {
+        self.list_chains.remove(&word);
+        Err(e)
+      }
+    }
   }
 
   /// Begins a resize, returning its request id.
@@ -3899,11 +3996,15 @@ impl Client {
     }
   }
 
-  /// The caller's volumes.
+  /// The caller's volumes, in name order: the listing walked a page at a time, as one reply holds one page (§4.4
+  /// `list`), so a listing of any length is answered.
   pub fn list(&mut self) -> Result<Vec<VolumeSummary>, ClientError> {
-    match self.call(&RequestBody::List)? {
-      ReplyBody::Listed { volumes } => Ok(volumes),
-      _ => Err(ClientError::UnexpectedReply { verb: "list" }),
+    let mut chain = ListChain::default();
+    loop {
+      let reply = self.call(&RequestBody::List { after: chain.after })?;
+      if chain.take(reply)?.is_none() {
+        return Ok(chain.into_listing());
+      }
     }
   }
 

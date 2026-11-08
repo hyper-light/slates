@@ -141,6 +141,21 @@ test('async lifecycle over a live daemon', async (t) => {
     assert.equal(ids.length, CONCURRENCY);
     assert.equal(new Set(ids).size, CONCURRENCY, 'each concurrent create got a distinct volume id');
 
+    // A listing longer than one reply (§4.4 `list`): about three pages at these names (a page holds about 80
+    // summaries in a 4,096-byte reply chunk), and one await walks every page, each volume listed once. Before
+    // 2026-11-08 the whole listing was one reply, refused past about 80 volumes.
+    const PAGED_VOLUMES = 250;
+    const PAGED_BYTES = 1024 * 1024;
+    const pagedIds = [];
+    for (let start = 0; start < PAGED_VOLUMES; start += CONCURRENCY) {
+      const batch = Array.from({ length: Math.min(CONCURRENCY, PAGED_VOLUMES - start) }, (_, i) => `node-async-paged-${String(start + i).padStart(4, '0')}`);
+      pagedIds.push(...(await Promise.all(batch.map((name) => client.create(name, PAGED_BYTES)))));
+    }
+    const listedIds = (await client.list()).map((v) => v.id);
+    for (const id of pagedIds) {
+      assert.equal(listedIds.filter((listed) => listed === id).length, 1, `${id} listed once`);
+    }
+
     // Merge workflow (§4.16): a green, a work over it, a content edit, a clean submit — the async
     // merge loop, awaited on the same loop.
     const green = await client.createGreen('g-node-async');

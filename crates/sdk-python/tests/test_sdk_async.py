@@ -48,6 +48,10 @@ POLL_SECS = 0.02
 VOLUME_BYTES = 8 * 1024 * 1024
 # How many creates to drive at once, to prove concurrent awaits each get their own reply.
 CONCURRENCY = 8
+# A listing longer than one reply (§4.4 `list`): about three pages at these names, a page holding about 80 summaries
+# in a 4,096-byte reply chunk; each volume the smallest bound that leaves room for all of them.
+PAGED_VOLUMES = 250
+PAGED_BYTES = 1024 * 1024
 
 
 def _daemon_binary():
@@ -156,6 +160,17 @@ class SlatesAsyncRoundTrip(unittest.TestCase):
             self.assertEqual(
                 len(set(ids)), CONCURRENCY, "each concurrent create got a distinct volume id"
             )
+
+            # A listing longer than one reply (§4.4 `list`): one await walks every page, each volume listed
+            # once. Before 2026-11-08 the whole listing was one reply, refused past about 80 volumes.
+            paged = [f"async-paged-{i:04d}" for i in range(PAGED_VOLUMES)]
+            paged_ids = []
+            for start in range(0, PAGED_VOLUMES, CONCURRENCY):
+                batch = paged[start:start + CONCURRENCY]
+                paged_ids += await asyncio.gather(*(client.create(name, PAGED_BYTES) for name in batch))
+            listed_ids = [v["id"] for v in await client.list()]
+            for volume_id in paged_ids:
+                self.assertEqual(listed_ids.count(volume_id), 1, f"{volume_id} listed once")
 
             # Merge workflow (§4.16): a green, a work over it, a content edit, a clean submit — the
             # async form of the sync suite's merge loop, awaited on the same loop.

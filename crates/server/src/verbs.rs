@@ -2163,8 +2163,8 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
   if let RequestBody::Revoke { consumer, proof } = body {
     return revoke_on_channel(state, client.index(), request.request, consumer, proof);
   }
-  if let RequestBody::List = body {
-    return scatter_list(state, client.index(), request.request, principal);
+  if let RequestBody::List { after } = body {
+    return scatter_list(state, client.index(), request.request, principal, after);
   }
   if let RequestBody::Grants = body {
     return scatter_grants(state, client.index(), request.request, principal);
@@ -2907,6 +2907,7 @@ fn scatter_list(
   client_index: u32,
   request: u64,
   principal: Principal,
+  after: Option<VolumeId>,
 ) -> Served {
   let others: Vec<u16> = state
     .shards
@@ -2914,25 +2915,20 @@ fn scatter_list(
     .copied()
     .filter(|s| *s != state.shard)
     .collect();
-  let mine = match list(state, &principal) {
-    ReplyBody::Listed { volumes } => volumes,
-    other => return Served::Reply(other),
-  };
+  let mine = list_part(state, &principal, after);
   if others.is_empty() {
-    return Served::Reply(ReplyBody::Listed { volumes: mine });
+    return Served::Reply(list_page(vec![mine]));
   }
   state
     .scatters
-    .insert(request, (client_index, others.len(), mine));
+    .insert(request, (client_index, others.len(), vec![mine]));
   let origin = state.shard;
   for shard in others {
     let principal = principal.clone();
     let task = SpawnRequest::new(
       Box::pin(async move {
-        let part = match crate::state::with_state(|s| list(s, &principal)) {
-          Some(ReplyBody::Listed { volumes }) => volumes,
-          _ => Vec::new(),
-        };
+        let part =
+          crate::state::with_state(|s| list_part(s, &principal, after)).unwrap_or_default();
         crate::xshard::send_reply_home(origin, move || {
           gather(request, part);
         })
@@ -3175,7 +3171,7 @@ fn settle_gone(state: &mut ShardState, kind: ScatterKind, request: u64) {
 
 /// Counts one part of a scatter in `table` down; its client slot when that was the last part (the entry is gone).
 fn count_down<T>(
-  table: &mut std::collections::BTreeMap<u64, (u32, usize, Vec<T>)>,
+  table: &mut std::collections::BTreeMap<u64, (u32, usize, T)>,
   request: u64,
 ) -> Option<u32> {
   let entry = table.get_mut(&request)?;
@@ -3762,10 +3758,10 @@ fn seal_report(state: &ShardState, recipient_id: Vec<u8>) -> slates_ipc::protoco
 }
 
 /// One shard's part of a listing arrives at the origin; the last part completes the reply.
-fn gather(request: u64, part: Vec<VolumeSummary>) {
+fn gather(request: u64, part: ListPart) {
   let done = crate::state::with_state(|s| {
     let entry = s.scatters.get_mut(&request)?;
-    entry.2.extend(part);
+    entry.2.push(part);
     entry.1 = entry.1.saturating_sub(1);
     if entry.1 == 0 {
       let refused_for = s.scatter_refusals.remove(&request);
@@ -3777,9 +3773,8 @@ fn gather(request: u64, part: Vec<VolumeSummary>) {
     }
   })
   .flatten();
-  if let Some(((client_index, _, mut volumes), unsent)) = done {
-    volumes.sort_by(|a, b| a.name.cmp(&b.name));
-    let reply = unsent.unwrap_or(ReplyBody::Listed { volumes });
+  if let Some(((client_index, _, parts), unsent)) = done {
+    let reply = unsent.unwrap_or_else(|| list_page(parts));
     crate::state::deliver(client_index, request, reply, false);
   }
 }
@@ -3920,8 +3915,8 @@ pub(crate) fn dispatch(
   body: RequestBody,
 ) -> ReplyBody {
   let republish = mutates_shard_image(&body);
-  if republish && !state.consensus_ready {
-    return refused(Refusal::ConsensusNotInitialized);
+  if let Some(refusal) = refused_before_dispatch(state, &body, republish) {
+    return refused(refusal);
   }
   let touched = volume_of(&body).map(to_db_volume);
   // The owner-lease gate (§4.8 "Leases and reads"; AUD-08): a read of an owned object's **latest state** —
@@ -4177,7 +4172,7 @@ fn dispatch_inner(
     RequestBody::Resize { volume, size } => resize(state, principal, volume, size),
     RequestBody::Destroy { volume } => destroy(state, principal, volume),
     RequestBody::Status { volume } => status(state, principal, volume),
-    RequestBody::List => list(state, principal),
+    RequestBody::List { after } => list_page(vec![list_part(state, principal, after)]),
     RequestBody::DaemonStatus => {
       let mine = shard_report(state);
       daemon_report(state, vec![mine])
@@ -9795,33 +9790,143 @@ fn restore_node(
 /// Format: POSIX `0755`, the mode a restored directory takes when the archive carries none for it.
 const DEFAULT_DIRECTORY_MODE: u32 = 0o755;
 
-fn list(state: &mut ShardState, principal: &Principal) -> ReplyBody {
-  let volumes = state
+/// What a verb is refused before it runs: a mutation before the consensus group exists, and a new volume whose name
+/// no listing page could hold ([`longest_listable_name`]).
+fn refused_before_dispatch(
+  state: &ShardState,
+  body: &RequestBody,
+  republish: bool,
+) -> Option<Refusal> {
+  if republish && !state.consensus_ready {
+    return Some(Refusal::ConsensusNotInitialized);
+  }
+  new_volume_name(body)
+    .is_some_and(|name| name.len() > longest_listable_name())
+    .then_some(Refusal::InvalidName)
+}
+
+/// The name of the volume a request would create, if it creates one.
+fn new_volume_name(body: &RequestBody) -> Option<&str> {
+  match body {
+    RequestBody::Create { name, .. }
+    | RequestBody::CreateGreen { name, .. }
+    | RequestBody::CreateWork { name, .. }
+    | RequestBody::Clone { name, .. }
+    | RequestBody::ImageBuild { name, .. }
+    | RequestBody::ImageMerge { name, .. } => Some(name),
+    _ => None,
+  }
+}
+
+/// Derived: the longest volume name, in bytes, whose summary one listing page holds alone (§4.4 `list`): the page's
+/// room less a summary's bytes with an empty name. Every volume a client can create is one it can list; a longer name
+/// is refused `InvalidName` before anything is made. A `create` request carried names up to 4,062 bytes in a reply
+/// chunk of 4,096 (2026-11-08), whose summary no page held.
+fn longest_listable_name() -> usize {
+  let unnamed = VolumeSummary {
+    id: VolumeId::default(),
+    name: String::new(),
+    referenced_bytes: u64::MAX,
+    unique_bytes: u64::MAX,
+    overlay: false,
+    live_shipped: false,
+  };
+  list_page_room().saturating_sub(summary_bytes(&unnamed))
+}
+
+/// One shard's part of a listing page (§4.4 `list`, §4.3): the volumes it owns that the caller may read, past
+/// `after` in volume-id order, as many as one page can hold, and whether it holds more past them. No page takes more
+/// than one page's worth from any shard, so a shard's part never needs more, and a gather holds at most a page a shard.
+#[derive(Debug, Default)]
+pub(crate) struct ListPart {
+  volumes: Vec<VolumeSummary>,
+  more: bool,
+}
+
+/// The parts of a listing page gathered so far, one a shard.
+pub(crate) type ListParts = Vec<ListPart>;
+
+/// The bytes a listing page's volumes may take: one reply chunk less the page's own framing, its cursor included.
+fn list_page_room() -> usize {
+  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+  let empty = ReplyBody::Listed {
+    volumes: Vec::new(),
+    next: Some(VolumeId {
+      bytes: [u8::MAX; 16],
+    }),
+  };
+  chunk.saturating_sub(slates_ipc::protocol::framed_len(&empty))
+}
+
+/// The encoded bytes one volume adds to a listing page.
+fn summary_bytes(summary: &VolumeSummary) -> usize {
+  let mut encoded = Vec::new();
+  summary.encode(&mut encoded);
+  encoded.len()
+}
+
+/// The first volumes of `volumes` (in id order) that fit `room`: at least one, so a listing always progresses.
+fn fitting(
+  volumes: impl Iterator<Item = VolumeSummary>,
+  room: usize,
+) -> (Vec<VolumeSummary>, bool) {
+  let mut used = 0usize;
+  let mut page = Vec::new();
+  let mut volumes = volumes.peekable();
+  while let Some(summary) = volumes.peek() {
+    let bytes = summary_bytes(summary);
+    if !page.is_empty() && used.saturating_add(bytes) > room {
+      break;
+    }
+    used = used.saturating_add(bytes);
+    if let Some(summary) = volumes.next() {
+      page.push(summary);
+    }
+  }
+  (page, volumes.peek().is_some())
+}
+
+/// This shard's part of the listing page after `after` ([`ListPart`]).
+fn list_part(state: &ShardState, principal: &Principal, after: Option<VolumeId>) -> ListPart {
+  let mut volumes: Vec<VolumeSummary> = state
     .db
     .partition()
     .volumes()
     .into_iter()
     .filter(|v| rights_of(v, principal).read && v.state != VolumeState::Destroyed)
-    .map(|v| VolumeSummary {
-      id: to_wire_volume(v.id),
-      name: v.name.clone(),
-      referenced_bytes: state
+    .filter(|v| after.is_none_or(|after| to_wire_volume(v.id) > after))
+    .map(|v| {
+      let live = state
         .by_id
         .get(&v.id)
         .and_then(|h| state.volumes.get(*h).ok())
-        .map_or(v.referenced_bytes, |s| {
-          s.volume.accounting().referenced_bytes
-        }),
-      unique_bytes: state
-        .by_id
-        .get(&v.id)
-        .and_then(|h| state.volumes.get(*h).ok())
-        .map_or(v.unique_bytes, |s| s.volume.accounting().unique_bytes),
-      overlay: matches!(v.base, BaseRecord::Path { .. }),
-      live_shipped: v.policy.live_shipped,
+        .map(|s| s.volume.accounting());
+      VolumeSummary {
+        id: to_wire_volume(v.id),
+        name: v.name.clone(),
+        referenced_bytes: live.map_or(v.referenced_bytes, |a| a.referenced_bytes),
+        unique_bytes: live.map_or(v.unique_bytes, |a| a.unique_bytes),
+        overlay: matches!(v.base, BaseRecord::Path { .. }),
+        live_shipped: v.policy.live_shipped,
+      }
     })
     .collect();
-  ReplyBody::Listed { volumes }
+  volumes.sort_by_key(|summary| summary.id);
+  let (volumes, more) = fitting(volumes.into_iter(), list_page_room());
+  ListPart { volumes, more }
+}
+
+/// The listing page the shards' `parts` make: their volumes in id order, as many as one reply chunk holds, and the
+/// cursor past the last when any part, or the merge, left more.
+fn list_page(parts: ListParts) -> ReplyBody {
+  let more_elsewhere = parts.iter().any(|part| part.more);
+  let mut volumes: Vec<VolumeSummary> = parts.into_iter().flat_map(|part| part.volumes).collect();
+  volumes.sort_by_key(|summary| summary.id);
+  let (volumes, more_here) = fitting(volumes.into_iter(), list_page_room());
+  let next = (more_here || more_elsewhere)
+    .then(|| volumes.last().map(|summary| summary.id))
+    .flatten();
+  ReplyBody::Listed { volumes, next }
 }
 
 fn acknowledge(state: &mut ShardState, client_id: u32, up_to: u32, owed: &[u32]) -> ReplyBody {
