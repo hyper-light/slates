@@ -280,7 +280,10 @@ fn vid(n: u64) -> VolumeId {
 }
 
 fn principal(n: u32) -> Principal {
-  Principal::Uid { uid: 1000 + n }
+  Principal::Uid {
+    host: slates_db::HostId(0),
+    uid: 1000 + n,
+  }
 }
 
 fn volume(n: u64, name: &str) -> VolumeRecord {
@@ -995,12 +998,14 @@ fn failed(error: impl std::fmt::Debug) -> TestCaseError {
 }
 
 /// Runs a generated history under `cadence`, crashing where it says: after every crash, and at the end, the recovered
-/// partition equals the live one whole; refused operations were never recorded.
+/// partition equals the live one whole; refused operations were never recorded. Each caller names its own segment:
+/// libtest runs the callers at once, and Windows refuses a second object of one name while the first is held (A-176).
 fn every_recovery_equals_the_live_partition_under(
+  segment_name: &str,
   steps: &[Step],
   cadence: Cadence,
 ) -> Result<(), TestCaseError> {
-  let mut seg = segment("slates-db-model", LOG_BYTES);
+  let mut seg = segment(segment_name, LOG_BYTES);
   let mut db = open(&mut seg);
   hold_to(&mut db, cadence);
   let mut ids = Ids::default();
@@ -1066,7 +1071,7 @@ proptest! {
   /// recorded; the snapshot cadence and the log trim never lose a record.
   #[test]
   fn every_recovery_equals_the_live_partition(steps in proptest::collection::vec(step(), 1..250), snapshot_every in 1u64..20_000) {
-    every_recovery_equals_the_live_partition_under(&steps, Cadence::Pinned(snapshot_every))?;
+    every_recovery_equals_the_live_partition_under("slates-db-model-pinned", &steps, Cadence::Pinned(snapshot_every))?;
   }
 
   /// AC-2.3, A-243 (raft): the same under the measured trigger, a recovery budget of 0 to 200 µs, so snapshots fall
@@ -1074,7 +1079,7 @@ proptest! {
   /// live partition whole, wherever the snapshots fell.
   #[test]
   fn every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots(steps in proptest::collection::vec(step(), 1..250), budget_ns in 0u64..200_000) {
-    every_recovery_equals_the_live_partition_under(&steps, Cadence::Measured(budget_ns))?;
+    every_recovery_equals_the_live_partition_under("slates-db-model-measured", &steps, Cadence::Measured(budget_ns))?;
   }
 }
 
@@ -1744,7 +1749,8 @@ fn a_tenants_key_is_erased_with_its_last_volume_on_the_partition() {
   let mut segment = segment("slates-db-tenant-erase", LOG_BYTES);
   let mut db = open(&mut segment);
   let (first, other) = (principal(0), principal(1));
-  let (first_account, other_account) = (1000u64, 1001u64);
+  // Each tenant is its owner's, as sealing names it (A-237: a host account's tenant includes its host).
+  let (first_account, other_account) = (first.tenant(), other.tenant());
   for (n, owner) in [(1, &first), (2, &first), (3, &other)] {
     let record = VolumeRecord {
       owner: owner.clone(),

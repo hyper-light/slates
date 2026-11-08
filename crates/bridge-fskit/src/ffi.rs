@@ -102,7 +102,11 @@ fn build_harness_volume() -> Option<InProcessVolume> {
         bytes: HARNESS_VOLUME_ID,
       },
       View::Current,
-      Principal::Uid { uid: 0 },
+      // The harness's one host: any anchor names it (A-237).
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 0,
+      },
       Rights {
         read: true,
         write: true,

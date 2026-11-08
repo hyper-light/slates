@@ -651,16 +651,23 @@ pub(crate) fn authenticated_alive(state: &ShardState) -> Vec<HostId> {
 /// death history across an election, rather than restarting the confirmation window each time leadership
 /// moves. A suspected member never accumulates (it is not `Dead`), so it can never be retired.
 fn update_council_death_watch(state: &mut ShardState) {
+  let now = futures::now_ns();
+  let started = *state.death_watch_started_ns.get_or_insert(now);
   let members: Vec<HostId> = state.council.configuration().members.clone();
   state
     .council_death_watch
     .retain(|host, _| members.contains(host));
+  let local = state.fleet.host();
   for member in members {
+    if member == local {
+      continue;
+    }
     let dead = state
       .fleet
       .membership()
       .state(member)
-      .is_some_and(|belief| belief.liveness == Liveness::Dead);
+      .is_some_and(|belief| belief.liveness == Liveness::Dead)
+      || unreached_since_start(state, member, now.saturating_sub(started));
     if dead {
       let count = state.council_death_watch.entry(member).or_insert(0);
       *count = count.saturating_add(1);
@@ -689,6 +696,178 @@ fn stable_dead_council_members(state: &ShardState) -> Vec<HostId> {
     .filter(|(_, count)| **count >= window)
     .map(|(host, _)| *host)
     .collect()
+}
+
+/// Whether this node, a membership horizon (`lease::horizon_ns`) after its death watch began, has never keyed
+/// `member` (no probe-plane epoch installed) and holds it alive in no view: its own evidence that `member` is gone.
+/// A node that restarted while `member` was down never hears from it, so its detector never holds it at all (it
+/// joins a member only once keyed), and without this it never voted the member dead: a restarted council leader then
+/// never retired it and no takeover began (`a_member_down_through_a_voters_restart_is_still_taken_over`, 2026-11-07).
+/// A live member slow to key may draw this vote too, but alone it is one of the `f + 1` a retirement needs.
+fn unreached_since_start(state: &ShardState, member: HostId, since_ns: u64) -> bool {
+  since_ns >= crate::lease::horizon_ns()
+    && !state.plane.keyed.contains_key(&member)
+    && state
+      .fleet
+      .membership()
+      .state(member)
+      .is_none_or(|belief| belief.liveness != Liveness::Alive)
+}
+
+/// The council members this leader may retire now (§4.8 "Promotion and takeover"): those at least `f + 1` voters
+/// hold dead, or every voter while the council has fewer than `f + 1` besides the member (`Quorum::committed_within`),
+/// this leader's own stable death watch ([`stable_dead_council_members`]) one of them and each other voter's fresh
+/// report ([`ShardState::death_reports`]) one more. A report is fresh within a membership horizon, and counts only at
+/// an incarnation at or above any this leader holds the member alive at, so a refutation cancels the reports below it.
+/// One voter's lone suspicion, the leader's own included, never retires a member while another voter could report;
+/// a forming council's sole voter, and the leader at `f = 0` (R8), retire on their own watch.
+pub(crate) fn confirmed_dead_council_members(state: &mut ShardState) -> Vec<HostId> {
+  let now = futures::now_ns();
+  let horizon = crate::lease::horizon_ns();
+  for reports in state.death_reports.values_mut() {
+    reports.retain(|_, (_, at)| now.saturating_sub(*at) <= horizon);
+  }
+  state.death_reports.retain(|_, reports| !reports.is_empty());
+  let own: Vec<HostId> = stable_dead_council_members(state);
+  let quorum = state.fleet.configuration().quorum;
+  let local = state.fleet.host();
+  let voters = state.council.voters();
+  let mut candidates: Vec<HostId> = own.clone();
+  for member in state.death_reports.keys() {
+    if !candidates.contains(member) {
+      candidates.push(*member);
+    }
+  }
+  candidates
+    .into_iter()
+    .filter(|member| {
+      let alive_at = state
+        .fleet
+        .membership()
+        .state(*member)
+        .filter(|belief| belief.liveness == Liveness::Alive)
+        .map(|belief| belief.incarnation);
+      let reported = state.death_reports.get(member).map_or(0, |reports| {
+        reports
+          .iter()
+          .filter(|(voter, (incarnation, _))| {
+            **voter != local
+              && voters.contains(voter)
+              && alive_at.is_none_or(|alive| *incarnation >= alive)
+          })
+          .count()
+      });
+      // `f + 1` of the voters that can vote on the member (itself excluded), or every one of them while the council
+      // has fewer, as a joint write needs every member of a cohort smaller than `f + 1`: a forming council's sole voter
+      // retires on its own view, since no other voter exists to report, and three voters at `f = 1` still need two.
+      let electorate = voters.iter().filter(|voter| *voter != member).count();
+      let votes = usize::from(own.contains(member)).saturating_add(reported);
+      quorum.committed_within(votes, electorate)
+    })
+    .collect()
+}
+
+/// This node's death votes as a report: each council member its stable death watch holds dead, with the incarnation
+/// its view holds it at (0 when it holds none). Format: per member, its id and that incarnation, 8 bytes each, little
+/// endian.
+fn death_report(state: &ShardState) -> Vec<u8> {
+  let mut out = Vec::new();
+  for member in stable_dead_council_members(state) {
+    let incarnation = state
+      .fleet
+      .membership()
+      .state(member)
+      .map_or(0, |belief| belief.incarnation);
+    out.extend_from_slice(&member.0.to_le_bytes());
+    out.extend_from_slice(&incarnation.to_le_bytes());
+  }
+  out
+}
+
+/// Format: one field of a report's entry, a little-endian `u64` (a member id or an incarnation).
+const DEATH_REPORT_FIELD_BYTES: usize = size_of::<u64>();
+
+/// Format: one report's entry, a member then its incarnation ([`DEATH_REPORT_FIELD_BYTES`] each).
+const DEATH_REPORT_ENTRY_BYTES: usize = 2 * DEATH_REPORT_FIELD_BYTES;
+
+/// Takes a voter's death report ([`death_report`]) on [`DEATH_STREAM`]: kept only from a voter of this region's
+/// council, only about current members, at most one entry per member, and answered empty. Malformed bytes are
+/// counted and dropped whole.
+fn serve_death_report(state: &mut ShardState, reporter: HostId, request: &[u8]) -> Vec<u8> {
+  if !same_region(state, reporter) || !state.council.voters().contains(&reporter) {
+    state.count(DEATH_REPORT_REFUSED, 1);
+    return Vec::new();
+  }
+  if !request.len().is_multiple_of(DEATH_REPORT_ENTRY_BYTES) {
+    state.count(DEATH_REPORT_REFUSED, 1);
+    return Vec::new();
+  }
+  let members = state.council.configuration().members.clone();
+  let now = futures::now_ns();
+  for entry in request.as_chunks::<DEATH_REPORT_ENTRY_BYTES>().0 {
+    let (member, incarnation) = entry.split_at(DEATH_REPORT_FIELD_BYTES);
+    let (Ok(member), Ok(incarnation)) = (
+      <[u8; DEATH_REPORT_FIELD_BYTES]>::try_from(member),
+      <[u8; DEATH_REPORT_FIELD_BYTES]>::try_from(incarnation),
+    ) else {
+      continue;
+    };
+    let member = HostId(u64::from_le_bytes(member));
+    if !members.contains(&member) || member == reporter {
+      continue;
+    }
+    state
+      .death_reports
+      .entry(member)
+      .or_default()
+      .insert(reporter, (u64::from_le_bytes(incarnation), now));
+  }
+  state.count(DEATH_REPORT_TAKEN, 1);
+  Vec::new()
+}
+
+/// Counter: a death report taken from a voter.
+const DEATH_REPORT_TAKEN: &str = "fleet.council.death_report_taken";
+/// Counter: a death report refused (not a voter of this region's council, or malformed bytes).
+const DEATH_REPORT_REFUSED: &str = "fleet.council.death_report_refused";
+
+/// Format: the stream a voter's death report rides on a record session (§4.8 "Promotion and takeover"): a
+/// membership-path message, sent once a period by a voter that holds a council member dead, never per write
+/// (D-14). Distinct from every other stream the session multiplexes.
+const DEATH_STREAM: u64 = 24;
+
+/// Sends this voter's death report to the other voters ([`death_report`]), once a period while it holds any member
+/// dead: the leader among them counts it toward the `f + 1` a retirement needs.
+async fn send_death_report(others: &[HostId], budget: CommitBudget, in_flight: &mut Vec<Dispatch>) {
+  let Some(report) = state::with_state(|s| death_report(s)) else {
+    return;
+  };
+  if report.is_empty() {
+    return;
+  }
+  let sessions = take_sessions("fleet.lent_to.send_death_report", |host| {
+    others.contains(&host)
+  });
+  if sessions.is_empty() {
+    return;
+  }
+  let requests: Vec<(HostId, Vec<u8>, Endpoint)> = sessions
+    .into_iter()
+    .map(|(host, endpoint)| (host, report.clone(), endpoint))
+    .collect();
+  let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
+  let (replied, stragglers) = broadcast(requests, DEATH_STREAM, Priority::Metadata, budget).await;
+  let recovered: Vec<(HostId, Endpoint)> = replied
+    .into_iter()
+    .map(|(host, _, endpoint)| (host, endpoint))
+    .collect();
+  in_flight.push(Dispatch::new(
+    sent,
+    &recovered,
+    stragglers,
+    LateReplies::Discard,
+  ));
+  return_sessions(recovered);
 }
 
 /// The regional council serves only its declared region. Root traffic spans all regions.
@@ -1393,6 +1572,13 @@ async fn serve_peer_records(
           count_refusal(ACCEPT_REFUSED);
           return Vec::new();
         }
+        // Test support: a fault holds a live-state reply after its request arrived (never reachable from the wire),
+        // so a takeover's question to this node misses its budget while the probe plane still answers.
+        if stream == slates_cluster::live::LIVE_STATE_STREAM {
+          while state::with_state(|state| state.live_state_withhold_replies).unwrap_or(false) {
+            crate::daemon::pace(HEARTBEAT_NS / POLL_PER_PERIOD).await;
+          }
+        }
         match stream {
           crate::member_task::PLANE_EPOCH_STREAM => plane_secret
             .and_then(|secret| {
@@ -1489,6 +1675,14 @@ async fn serve_peer_records(
           }
           PAIR_KEY_STREAM => state::with_state(|s| accept_pair_delivery(s, peer_anchor, &request))
             .unwrap_or_default(),
+          DEATH_STREAM => state::with_state(|s| {
+            let peer_host = s
+              .learned_members
+              .get(&peer_anchor)
+              .map_or(seed, |member| member.host);
+            serve_death_report(s, peer_host, &request)
+          })
+          .unwrap_or_default(),
           REPORT_STREAM => state::with_state(|s| {
             let peer_host = s
               .learned_members
@@ -1556,7 +1750,7 @@ const RECORD_REFUSED_BY_FAULT: &str = "fleet.record.refused_by_fault";
 /// Every survivor computes the same routing winner, so this needs no coordination. Idempotent: an install
 /// of the same owner under an equal-or-higher generation is accepted, a lower one refused (ignored), so the
 /// authority only advances.
-fn reconcile_held_authority(state: &mut ShardState) {
+pub(crate) fn reconcile_held_authority(state: &mut ShardState) {
   let generation = state.fleet.configuration().version;
   let held: Vec<ObjectId> = state.holder_records.keys().copied().collect();
   for object in held {
@@ -1592,9 +1786,31 @@ pub(crate) fn accept_held_record(
     return Vec::new();
   }
   if let Err(error) = check_held_record(state, local, peer_host, record) {
+    count_record_refusal(state, &error);
     return encode_refusal(&error);
   }
   hold_checked_record(state, local, peer_host, record)
+}
+
+/// The status count of held records accepted into their acceptor whose owner the routing view refused to track (not a
+/// member of the council's configuration), so no acknowledgement was given. Format: a refusal name in the daemon's
+/// status report.
+const RECORD_REFUSED_UNTRACKED: &str = "fleet.record.refused.untracked";
+
+/// Counts a held record this holder refused, by its register refusal kind (`fleet.record.refused.<kind>`), so a sender
+/// whose commit never places shows on the holder why: before these, a holder restarted warm refused a successor's
+/// adoption `ForeignGeneration` every period without a trace. Format: refusal names in the daemon's status report.
+fn count_record_refusal(state: &mut ShardState, error: &RegisterError) {
+  let kind = match error {
+    RegisterError::StaleEpoch { .. } => "fleet.record.refused.stale_epoch",
+    RegisterError::ConfigurationStale { .. } => "fleet.record.refused.configuration_stale",
+    RegisterError::Unsupported { .. } => "fleet.record.refused.unsupported",
+    RegisterError::MalformedRecord => "fleet.record.refused.malformed",
+    RegisterError::Unauthorized => "fleet.record.refused.unauthorized",
+    RegisterError::ForeignGeneration { .. } => "fleet.record.refused.foreign_generation",
+    RegisterError::ConflictingPosition => "fleet.record.refused.conflicting_position",
+  };
+  state.count(kind, 1);
 }
 
 /// The status count of held records accepted but not acknowledged because the shard's publish carrying them was
@@ -1657,13 +1873,19 @@ pub(crate) fn hold_checked_record(
           }
           ack.encode()
         }
-        Err(error) => encode_refusal(&error),
+        Err(error) => {
+          state.count(RECORD_REFUSED_UNTRACKED, 1);
+          encode_refusal(&error)
+        }
       }
     }
     // A refusal the sender acts on rides back on the wire (a `ConfigurationStale` naming this node's newer
     // version, so a stale sender refreshes and retries); every other refusal is an empty reply the sender
     // counts as no acknowledgement ([`encode_refusal`]).
-    Err(error) => encode_refusal(&error),
+    Err(error) => {
+      count_record_refusal(state, &error);
+      encode_refusal(&error)
+    }
   }
 }
 
@@ -1917,21 +2139,8 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
       }
       continue;
     }
-    // The catalog register first (AUD-29-17): what a successor serves the volume as, shipped at every
-    // catalog change. The head waits until the catalog's current version is committed, so an adopted head
-    // always meets an adopted catalog as new as the head's own volume.
-    let catalog = object.catalog();
-    let catalog_owed = owed_record(
-      state,
-      config,
-      (catalog, record.catalog_version),
-      crate::catalog::CatalogValue::of(record).to_record_bytes(),
-      local,
-    );
-    let catalog_committed = state.placed_heads.get(&catalog).is_some_and(|head| {
-      head.sequence == record.catalog_version && head.placed_under(config, catalog)
-    });
-    let catalog_ready = catalog_owed.is_none() || catalog_committed;
+    // The catalog register first (AUD-29-17): the head waits until the catalog's current version is committed.
+    let (catalog_owed, catalog_ready) = owed_catalog(state, config, record, local);
     heads.extend(catalog_owed);
     if !catalog_ready {
       continue;
@@ -1950,10 +2159,55 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
       local,
     ));
   }
+  // A green's catalog register too (AUD-29-17): its access list is what a successor admits by, and the merge plane
+  // ships no record of the green before the register's current version is committed (`green_catalog_committed`).
+  for id in state.greens.keys() {
+    if let Some(record) = state.db.partition().volume(*id) {
+      heads.extend(owed_catalog(state, config, record, local).0);
+    }
+  }
   for tombstone in state.db.partition().tombstones() {
     heads.extend(owed_tombstone(state, config, tombstone, local));
   }
   heads
+}
+
+/// The catalog register of `record` (AUD-29-17) as this owner still owes it to some remote candidate, and whether
+/// its current version is ready to be built on: owed to nobody, or committed at the quorum. The register is what a
+/// successor serves the volume or green as — its owner, policy and access list — shipped at every catalog change,
+/// and a record that names the object's later state (a volume's head, a green's merge record) waits until it is
+/// ready, so an adopted record always meets an adopted catalog as new as its own object.
+fn owed_catalog(
+  state: &ShardState,
+  config: &slates_db::register::Configuration,
+  record: &VolumeRecord,
+  local: HostId,
+) -> (Option<Head>, bool) {
+  let catalog = ObjectId(record.id.bytes).catalog();
+  let owed = owed_record(
+    state,
+    config,
+    (catalog, record.catalog_version),
+    crate::catalog::CatalogValue::of(record).to_record_bytes(),
+    local,
+  );
+  let committed = state.placed_heads.get(&catalog).is_some_and(|head| {
+    head.sequence == record.catalog_version && head.placed_under(config, catalog)
+  });
+  let ready = owed.is_none() || committed;
+  (owed, ready)
+}
+
+/// Whether the green `id`'s catalog register is ready for its merge records to ship (AUD-29-17; see [`owed_catalog`]):
+/// a successor materializes a green only with its adopted catalog, so a merge record that could be adopted without
+/// one would leave the green unserved. A green with no record here owes no catalog: a destroyed green's tombstone
+/// stands for both registers (AUD-29-43). Read on the green's owner shard.
+pub(crate) fn green_catalog_committed(state: &ShardState, id: DbVolumeId, local: HostId) -> bool {
+  state
+    .db
+    .partition()
+    .volume(id)
+    .is_none_or(|record| owed_catalog(state, state.fleet.configuration(), record, local).1)
 }
 
 /// The stage of a destroyed volume's tombstone this owner still owes some candidate (AUD-29-43; see
@@ -3551,9 +3805,23 @@ async fn materialize_pending_greens(origin: u16) {
   })
   .unwrap_or_default();
   for (object, adopted) in pending {
-    let recovery =
-      state::with_state(|s| crate::merge_service::recover_green_inputs(s, object, &adopted))
-        .flatten();
+    // The green's catalog register, adopted in the same round as its merge record (the owner ships no merge
+    // record before its current catalog is committed): the green's access list. Until it and its
+    // placement are adopted the materialization waits, as a volume's does (AUD-29-17).
+    let catalog = state::with_state(|s| {
+      let catalog = s.pending_catalogs.get(&object).cloned();
+      let placed = s.placed_heads.get(&object.catalog()).cloned();
+      catalog.zip(placed)
+    })
+    .flatten();
+    let Some(((catalog_sequence, catalog), catalog_placed)) = catalog else {
+      count_refusal(GREEN_TAKEOVER_WAITS_CATALOG);
+      continue;
+    };
+    let recovery = state::with_state(|s| {
+      crate::merge_service::recover_green_inputs(s, object, &adopted, (catalog_sequence, &catalog))
+    })
+    .flatten();
     let Some(recovery) = recovery else {
       count_refusal(GREEN_TAKEOVER_INCOMPLETE);
       continue;
@@ -3580,6 +3848,7 @@ async fn materialize_pending_greens(origin: u16) {
             .is_ok();
         if served {
           s.placed_heads.insert(object, placed);
+          s.placed_heads.insert(object.catalog(), catalog_placed);
         }
         served
       },
@@ -3589,6 +3858,7 @@ async fn materialize_pending_greens(origin: u16) {
     state::with_state(|s| {
       if served == Some(true) {
         s.pending_green_materializations.remove(&object);
+        s.pending_catalogs.remove(&object);
       } else {
         s.count(GREEN_TAKEOVER_REFUSED, 1);
       }
@@ -3655,6 +3925,10 @@ const MATERIALIZE_WAITS_CATALOG_PLACEMENT: &str = "fleet.materialize.waits.catal
 /// Format: a counter name in the daemon's status report.
 const MATERIALIZE_WAITS_SHARD: &str = "fleet.materialize.waits.shard";
 
+/// A taken-over green whose catalog register (its access list) or that register's placement was not yet
+/// adopted this period; it stays pending and is retried.
+/// Format: a counter name in the daemon's status report.
+const GREEN_TAKEOVER_WAITS_CATALOG: &str = "merge.takeover_waits_catalog";
 /// A taken-over green whose chain could not be gathered this period (an input not held, or the adopted
 /// version beyond this node's accepted prefix); it stays pending and is retried.
 const GREEN_TAKEOVER_INCOMPLETE: &str = "merge.takeover_incomplete";
@@ -5654,7 +5928,8 @@ fn reconcile_council_membership(s: &mut ShardState) {
   // retiring it there is an irreversible consensus action on a revocable belief, and it drops a live
   // member — leaving a later loss's survivors short of a majority
   // (docs/bugs/2026-09-17-council-retires-a-suspected-voter.md). The window lets the refutation land first.
-  let dead = stable_dead_council_members(s);
+  // And only once f + 1 voters hold it dead, this leader's watch one of them (§4.8 "Promotion and takeover").
+  let dead = confirmed_dead_council_members(s);
   s.council.reconcile_alive(&alive, &dead);
   // The voter set follows the committed membership (Raft §6, one joint change at a time): a voter taken
   // over leaves the consensus set — it stops counting toward every majority — and a member this node
@@ -5875,12 +6150,33 @@ async fn drive_config_council(
     timer.reset();
     return;
   }
+  follow_council_period(
+    &others,
+    budget,
+    timer,
+    &timing,
+    (contact, local, rank),
+    in_flight,
+  )
+  .await;
+}
+
+/// One period as a council **follower** ([`drive_config_council`]): its election timer, and its death report to the
+/// leader, which retires a member only once f + 1 voters hold it dead.
+async fn follow_council_period(
+  others: &[HostId],
+  budget: CommitBudget,
+  timer: &mut ElectionTimer,
+  timing: &ElectionTiming,
+  (contact, local, rank): (u64, HostId, usize),
+  in_flight: &mut Vec<Dispatch>,
+) {
   // A follower: the timer resets while the leader keeps making contact; otherwise it ages toward its
   // jittered timeout under this period's derived timing and campaigns there. Silent past the minimum
   // election timeout, it forgets its leader so the voter it yields to wins its pre-vote (thesis §4.2.3).
-  match timer.follower_period(contact, &timing, local, rank) {
+  match timer.follower_period(contact, timing, local, rank) {
     FollowerStep::Campaign => {
-      drive_council_election(&others, budget, in_flight).await;
+      drive_council_election(others, budget, in_flight).await;
       // Re-baseline the contact counter so a fresh campaign is not immediately retriggered: a won election
       // makes this node leader next period; a lost one waits out the timer again.
       if let Some(contact) = state::with_state(|s| s.council.leader_contact()) {
@@ -5892,6 +6188,8 @@ async fn drive_config_council(
     }
     FollowerStep::Follow => {}
   }
+  // A voter's deaths reach the leader, which retires a member only once f + 1 voters hold it dead.
+  send_death_report(others, budget, in_flight).await;
 }
 
 /// Each alive region's **representative** host as this node sees it (§4.8, D-14): the lowest-id host of the

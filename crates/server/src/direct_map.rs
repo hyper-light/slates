@@ -1519,7 +1519,7 @@ mod served {
   /// Unix the peer's uid against the daemon's.
   #[cfg(unix)]
   fn is_the_daemons_user(principal: &Principal) -> bool {
-    matches!(principal, Principal::Uid { uid } if *uid == rustix::process::geteuid().as_raw())
+    matches!(principal, Principal::Uid { uid, .. } if *uid == rustix::process::geteuid().as_raw())
   }
 
   /// Whether `principal` may be handed a copy on Windows: a client's own principal (no enrolled consumer), whose

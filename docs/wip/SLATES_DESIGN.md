@@ -5259,6 +5259,23 @@ integration still require the A-9 tests.
 > `a_submit_in_a_three_process_fleet_is_answered_once_its_record_commits` (CLI), and
 > `a_joint_placement_with_a_cohort_smaller_than_the_quorum_needs_every_member_of_it`.
 
+> **Status (2026-11-07, A-250, the supervisor's decision "A's tracking with B's confirmation";
+> `docs/bugs/2026-11-07-a-holder-restarted-warm-lost-its-copies-routing.md`).** A member that dies while a voter
+> restarts is now taken over. Two corrections:
+> - **Who declares a death.** The council's leader retires a member only once `f + 1` voters hold it dead, its own
+>   stable view being one vote, or by every voter while the council has fewer than `f + 1` besides the member (a
+>   forming council's sole voter decides alone). The other voters report their dead on the council's membership path once a period,
+>   never on a write, and a report below the incarnation the leader holds the member alive at counts for nothing. A
+>   restarted voter watches every configured member, so one it has not reached for the membership horizon since its
+>   start counts as dead even before its detector keyed it.
+> - **A restored copy is routed.** A holder restarted warm routes each copy from its held image to the owner its
+>   acceptor names. Unrouted, it never moved the copy to the successor and refused the successor's adoption
+>   `ForeignGeneration` every period, and it answered the successor's page empty while it held the copy unfenced.
+> Regressions: `a_lone_voters_suspicion_never_retires_a_member`,
+> `a_sole_voters_own_view_retires_a_member_while_its_council_forms`, `a_restored_holders_copy_moves_to_its_successor_and_accepts_its_adoption`, and
+> `a_member_down_through_a_voters_restart_is_still_taken_over` (CLI; 15 of 15 on adacachy). No TLA+ re-run is owed:
+> `Reconfig.tla` models the holder set's change once a retirement commits, not the decision to retire.
+
 **Leases and reads.** Epoch fencing alone does not authorize linearizable owner-local reads.
 Use the explicit lease safety obligations above: only an owner with a currently confirmed,
 conservatively bounded lease may serve the latest head locally. Expiry/uncertainty stops those
@@ -6389,6 +6406,9 @@ mirroring have no targets and their verbs refuse `Unsupported`.
 >   register.
 > - **Class bytes.** Register values lead with a class byte. Volume ids refuse typed at the class bit
 >   (`docs/bugs/2026-09-30-a-takeover-rebuilt-a-weaker-volume-and-lost-its-grants.md`).
+> - **Greens (2026-11-07).** A green ships its catalog register too, and no merge record of it ships before the
+>   register's current version is committed. Its successor waits for the adopted register and rebuilds the green with
+>   its access list (`docs/bugs/2026-11-07-a-taken-over-green-lost-its-access-list.md`).
 >
 > **Status (2026-09-30, connection credit in priority order).** A control exchange no longer waits for
 > connection credit that a bulk exchange spent (the constrained-link design §5.3).
@@ -6762,6 +6782,13 @@ peer uid alone cannot establish consumer identity. Between hosts, authenticated 
 also binds the delegated consumer scope. Rights are checked before resource admission,
 namespace lookup that reveals protected content, queue creation or any VFS/device effect.
 Replay/session resumption preserves that binding; it cannot change the authenticated consumer.
+
+> **Status (2026-11-07, A-237): a host account carries its host.** Every principal names the host whose account it is
+> by that host's certificate anchor, a forwarded request is rescoped by its TLS session's anchor, and owner and access
+> entries record (host, account), so a uid is never taken for another host's. A client of another node is refused
+> `NotShared` naming the (anchor, account) a share would name. On Windows the account is still recorded as uid 0 (the
+> rendezvous authenticates by the bootstrap object's mode and reads no SID), now host-qualified; naming it by its SID is
+> held.
 
 This requires a harness boundary when untrusted processes share an OS account. Slates cannot
 prevent an unsandboxed same-uid process from reading other process memory or writing host files
@@ -7682,6 +7709,8 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > chain, pipelined and hedged merge records.
 
 > **Status (2026-09-18, AUD-14: a taken-over green is servable).** The generic takeover promoted one adopted record and materialized content only for a plain volume's `HeadValue`; a green's adopted `MergeRecordValue` left the successor with a holder replica and nothing to serve — no catalog record, origin, chain, engine or placed version. Now the record value carries the green's name, evidence policy and owner (from the catalog, at `enqueue_record`), the takeover completion routes an adopted merge record to `pending_green_materializations`, and `materialize_pending_greens` gathers the chain from the successor's **own accepted records** (its holder acceptor's persisted positions give every version's input manifest; the held content gives the origin and each increment, `recover_green_inputs`) and materializes it on the shard the id routes to (`materialize_taken_over_green`): the catalog entry, the origin and every increment re-recorded durably, the engine replayed by the boot derivation and its head identity checked against the adopted record's — a mismatch refuses the green loudly — then the head placed. A successor whose accepted prefix is shorter than the adopted head stays pending, counted (`merge.takeover_incomplete`): the ledger-prefix transfer is GAP-A9-7's contract. Regression: three-node `f = 1`, three versions, owner dies, the successor's chain identities equal the owner's, `versions`/reads/a new submit and its retry serve through the public client (`docs/bugs/2026-09-18-green-takeover-left-no-servable-chain.md`).
+>
+> **Status (2026-11-07, AUD-29-17: a taken-over green keeps its shares).** The rebuilt green's access list was empty: a green shipped no catalog register. It now does, its merge records wait for the register's current version to commit, and the successor rebuilds the green from the adopted register's access list and sequence, waiting for it counted (`merge.takeover_waits_catalog`). Regression: `a_share_of_a_green_made_after_its_last_version_survives_a_takeover` (`docs/bugs/2026-11-07-a-taken-over-green-lost-its-access-list.md`).
 
 > **Status (2026-09-18, AUD-11: acceptance waits for the commit).** `submit` returned `Submitted{version}` on the owner's local append, with the version's merge record still pending on the record plane at `f > 0` — a version a surviving quorum might not hold, and a completion record saying otherwise. Now the acceptance **waits for the commit**: when `placed_version` has not reached the version, the verb registers the request as awaiting (`MergeShardState::awaiting`: the reply route and the completion key, bounded by the clients' credit) and `run_recorded` commits its effects with no completion and no reply; when `record_merge_acks` places the version at the quorum, `resolve_accepted` records the acceptance as each waiting request's completion on the owner partition (one durable step) and delivers the reply by a task on the request's shard. A retry while waiting joins the wait; a cross-node forward polls the completion within the liveness budget, else is refused retryable. At `f = 0` the append is the commit and nothing changes (R8). Regression: two-node `f = 1`, the holder withholding content puts, then acknowledgements (`MergeFault::refuse_records`) — no acceptance under either, the wait resolving once both lift, the retry answered from the record (`docs/bugs/2026-09-18-submit-acceptance-before-fleet-commit.md`). The retry after the owner's loss belongs to AUD-14's takeover recovery.
 
@@ -14017,6 +14046,59 @@ Status: measured and rejected 2026-11-08.
   rounds. A candidate, unproven: EEVDF's lag, which lets a short-slice thread that ran ahead wait out its peers'
   slices. A slice that keeps the p50 (or a client that can ask for its own) would need the same rule met.
 
+### A-237 — A host account means something only on its host: every principal that crosses hosts is scoped by its origin's certificate anchor (accepted and built 2026-11-07)
+Applied in the same change to: §4.13 (its status on principals), `slates_db::catalog::Principal` (a host on `Uid`,
+`Sid` and `Consumer`; the tenant and the index key over it; `rehosted`), `slates_ipc::protocol` (the wire `Principal`'s
+host, `DaemonReport::anchor`, `Refusal::NotShared`), `slates_wire::header::MAJOR` (2), `slates_anchor::layout`
+(`LAYOUT_VERSION` 5, a typed refusal of layout 4), `crates/server/src/verbs.rs` (`serve_forward` rescopes the forwarded
+principal by the session's anchor; `not_shared_with`; `to_db_principal`, `to_wire_principal`), `crates/server/src/daemon.rs`
+(`local_anchor`, the rendezvous's principal, `Daemon::anchor`), `crates/server/src/nfs.rs` (an NFS caller's host),
+`crates/bridge-virtiofs/src/vhost_user.rs` (`adopt` takes the host), the CLI (`slates status` prints `anchor:`; `slates
+share` takes `@ANCHOR`), GAPS, `docs/bugs/2026-11-07-a-principal-was-compared-across-hosts-with-no-host.md`, and the
+tests named below.
+- **Why.** A verb forwarded to a volume's owner on another node carried the requester's principal "as the origin node
+  authenticated it", and the owner judged it by `rights_of`'s bare equality: a principal is equal to an owner or an
+  access entry, and a uid carried no host. So one uid on two hosts was one principal; every Windows channel is
+  recorded as uid 0 (the bootstrap object's mode is the authentication), so any two Windows users on different nodes
+  were one principal, and a Windows user was Unix root's principal. Found 2026-11-07 while checking a wrong premise
+  (that a Windows consumer could never attest; it can, `crates/server/tests/consumers.rs`).
+- **The rule.** A local account is meaningful only on its host. A uid, a SID and a consumer each carry the host whose
+  account it is, by that host's certificate anchor: the fleet's pinned certificate's, else the machine identity's
+  (`daemon::local_anchor`), stable across the host's restarts and never the per-boot member id, which would orphan every
+  user's volumes at a restart. A local request is the local anchor's; a forwarded request is rescoped by the anchor of
+  the TLS session it arrived on (`Principal::rehosted`), never by a host the origin's request names. Owner and access
+  entries record (host, account), and `rights_of`'s equality compares them whole. A certificate names itself on every
+  host. This is §4.13's "between hosts, authenticated transport also binds the delegated consumer scope".
+- **What a user meets.** A client of node B reaching a volume owned on node A is refused `NotShared { verb, principal }`,
+  naming (B's anchor, its account): the share that lets it in. `slates status` prints each node's `anchor:`, and `slates
+  share ID uid:N@ANCHOR` (or `consumer:ACCOUNT/ID@ANCHOR`) names another node's account. One person's accounts on
+  several hosts as one principal, a fleet account mapping, is not part of this: an open design item for Ada (GAPS).
+- **A taken-over green kept no shares.** Found by this change's tests: a green shipped no catalog register, so its
+  successor rebuilt it with an empty access list, which uid equality had hidden. Fixed in its own change just before
+  this one (AUD-29-17's catalog register for greens; `docs/bugs/2026-11-07-a-taken-over-green-lost-its-access-list.md`),
+  so it could land first. Here its test names node a's account by its anchor.
+- **Format.** The wire principal and the catalog's records change shape, so the wire major is 2 (a major-1 peer is
+  refused before its body is read) and the segment layout is 5 (a layout-4 segment is refused at start, saying to start
+  afresh and re-enroll and re-share). Pre-release; no shim. Neither SDK encodes a principal or `Enroll`.
+- **Tests:** `crates/server/tests/fleet.rs`
+  `a_forwarded_read_by_the_same_uid_on_another_host_is_forbidden_without_a_share` (three in-process daemons, one uid,
+  each its own region: before, a client of node b read node a's volume, served in 22 s; after, refused `NotShared`
+  naming node b's anchor, 7.7 s, macOS arm64, 2026-11-07); `crates/anchor/tests/anchor.rs`
+  `a_segment_from_before_host_scoped_principals_is_refused_at_start_saying_to_re_enroll`; the CLI's share parse
+  (`@ANCHOR`); and every fleet test that reaches a volume from another node now shares it with that node's account by
+  its anchor (`share_with_node`), the two takeover tests before the owner dies, so a survivor enforces the scoped owner.
+  The sealing tenant's test derives each tenant from its owner (`Principal::tenant`), since a tenant is no longer the
+  bare uid. The two-host test's second half shares the volume with exactly the principal the refusal named, and node
+  b's read is then served. Takeover: `a_dead_owners_volume_refuses_an_unshared_host_through_its_successor` (the
+  survivor whose share was withdrawn is refused `NotShared`, naming its own anchor, through the successor) and
+  `a_restarted_peer_is_learned_on_contact_under_its_fresh_identity` (the owner's account, through its restarted host,
+  reaches its volume on the successor, since a restart keeps the anchor). Windows→Unix-root by rule:
+  `verbs::tests::uid_zero_on_another_host_is_not_this_hosts_root`. CI (diag `clients-host-5`, on main `e86fb417`,
+  2026-11-07): wire, db, anchor, the server's unit tests, consumers, daemon, virtiofs and the CLI green on ubuntu x86_64
+  and arm64; the fleet suite 94 of 95 on both, the one a test new on main whose forward needed its share
+  (`green_and_work_on`, fixed after); Windows x86_64 and arm64 green but for the two landing tests that fail on main
+  there too.
+
 ### A-228 — A daemon's liveness is judged in its shards' own CPU time, by an owned watchdog thread (accepted and built 2026-11-06)
 Applied in the same change to: §4.14 (its status on `daemon.alive`), `crates/server/src/watchdog.rs` (new),
 `crates/server/src/daemon.rs` (`Daemon::start`, `stop_parts`, `control_loop`, `heartbeat_loop`), `crates/cli/src/anchor.rs`
@@ -15089,6 +15171,38 @@ Applied in the same change to:
   - The snapshot runs whole on the committing shard's turn (an 8 MiB encode stalls it; `longest_ns` names it).
   - An incremental snapshot for partitions far past the budget.
 
+### A-249 — The purge in progress is one slot the receive worker reads, never a channel it drains (accepted and built 2026-11-07, the supervisor's decision: option (a); amends A-190 and A-198)
+
+Applied in the same change to:
+- §4.6 (Windows): this entry is its record; the purge's recognition is unchanged.
+- GAPS: "A private purge's intent can wait up to the 1 s transaction timeout", fixed.
+- `crates/bridge-winfsp`:
+  - `purge_slot.rs` (new, cfg-free): the slot's protocol, `Writer::publish` and `current_for`, over a `Memory` trait.
+  - `purge_intents.rs`: the slot in an unnamed section, each thread through its own `SharedObject` view, and the worker's
+    completion event. The channel, the intent event and its two-event wait are gone.
+  - `dispatcher.rs`: `PrivateOpens::authenticate` reads the slot when a Create arrives; `transaction` waits only on its
+    own completion.
+  - `host.rs`: `WinFspError::Intent`.
+- `docs/bugs/2026-11-07-a-private-purge-intent-waited-out-the-idle-receive.md`.
+- The tests: `purges_the_kernel_refuses_on_an_idle_drive_do_not_wait_out_the_transaction_timeout` (live, first), the
+  slot's plain and loom models in `purge_slot.rs`, and the section's two views in `purge_intents.rs`. CI's loom lane runs
+  `slates-bridge-winfsp` too.
+- **What was there.** A channel of two messages the worker drained after each control call. WinFsp's call never goes
+  pending, so when the kernel refused a purge's open before any request reached slates, the third publish waited for the
+  idle call's 1,000 ms timeout: four such purges took 3.02 s on arm64 and 3.01 s on x86_64 (diag-winfsp-overlap-43).
+  Cancelling the call from the publisher (`CancelIoEx`) left 2.54 s and 2.65 s and was not landed.
+- **The rule.**
+  - The mount thread is the slot's only writer and publishes the purge in progress, or none, without waiting.
+  - The slot's word names the client's process id beside a writing flag and a count. A publication sets the flag,
+    stores the purge's bytes, then stores the word with the client: Release on the publish, Acquire on the read.
+  - A Create reads the word once. Ada authorized that one atomic read on every Create (2026-11-07, asked through the
+    supervisor), replacing the channel's `try_recv` before every callback; the authorization covers that load only.
+    Only the purge's own opens read further, and a read that finds the flag set or the word changed is no purge.
+  - The word sits a cache-line pair (128 bytes) apart from the purge's bytes.
+  - The lint wall keeps no list of allowed atomic sites (`clippy.toml` disallows `Arc`, `Rc`, `Mutex`, `RwLock` and
+    `Condvar`), so the authorization is recorded at the load and here.
+- **Measured.** The red above; the green on both runners is owed to diag-winfsp-overlap-47.
+
 ### A-242 — A green's content history is copy-on-write, and an increment's post-state holds only the runs it adds (accepted and built 2026-11-07, W2 of the load test's walls)
 
 Applied in the same change to:
@@ -15131,6 +15245,55 @@ Applied in the same change to:
   - A rename copies its source's bytes into one chunk rather than sharing its pieces.
   - A base-seeded green's origin is held as chunks beside the head copy (W4, reland-a207's).
   - Greens merged before the fix may hold zeros a run after a length change put there.
+
+### A-250 — A member's death is retired at f + 1 voters, configured members are watched after a restart, and a restored copy is routed (accepted and built 2026-11-07, the supervisor's decision "A's tracking with B's confirmation")
+
+Applied in the same change to:
+- §4.8 "Promotion and takeover": a status note.
+- GAPS: the 2026-11-07 entry on a member down through a voter's restart.
+- `crates/server`:
+  - `fleet.rs`: `update_council_death_watch` with `unreached_since_start`, `confirmed_dead_council_members`,
+    `death_report`, `serve_death_report` and `send_death_report` on `DEATH_STREAM`, `follow_council_period`; held
+    records refused are counted by kind (`count_record_refusal`).
+  - `state.rs`: `death_reports`, `death_watch_started_ns`.
+  - `content_holder.rs`: `restore_held_registers` routes each restored copy.
+  - `takeover.rs`: the round's silent outcomes are counted.
+- The tests: `a_lone_voters_suspicion_never_retires_a_member`,
+  `a_sole_voters_own_view_retires_a_member_while_its_council_forms` and
+  `a_restored_holders_copy_moves_to_its_successor_and_accepts_its_adoption` (`crates/server/src/daemon.rs`), and
+  `a_member_down_through_a_voters_restart_is_still_taken_over` (`crates/cli/tests/live_fleet.rs`).
+- **What was there.**
+  - The council's leader retired a member on its own detector's view alone. After a warm restart the detector joins a
+    member only once its pair is keyed, and gossip about a member it has not joined is ignored (AUD-15). So a member
+    that died while the leader restarted was never judged at all and never retired.
+  - A copy restored from the held image got its acceptor back and no routing. Every install reaches a held copy only
+    through routing, so a restarted holder never moved the copy to its successor, never raised its generation, and
+    answered the successor's page empty. The successor's adoption was refused `ForeignGeneration` every period.
+- **The rule.**
+  1. A configured member is watched after a restart: one the detector has not reached for the membership horizon
+     since the watch began, unkeyed and not held alive, counts as dead.
+  2. A death is retired only at `f + 1` voters of the region, or every voter while the council has fewer than
+     `f + 1` besides the member (`Quorum::committed_within`, the floor a joint write takes): a forming council's sole
+     voter retires on its own view, since no other voter exists to report. The leader's own stable view is one vote.
+     Every other voter reports the members it holds dead on the council's membership path (`DEATH_STREAM`, once a
+     council period), never on a write. A report is kept for the membership horizon.
+  3. An incarnation cancels older reports: one below the incarnation the leader holds the member alive at counts for
+     nothing.
+  4. A restored copy is routed to the owner its acceptor names, as accepting a record does.
+- **TLA+.** No re-run is owed. `Reconfig.tla` models how the holder set changes once a retirement commits, not how
+  a death is decided. These rules change only who may propose a retirement and when, and a held copy's routing.
+- **Measured** (adacachy, 2026-11-07, `a_member_down_through_a_voters_restart_is_still_taken_over`, alone, under the
+  box's other sessions' load).
+  - With rule 2 alone (caf06d71): the restarted leader retired the owner in 2 of 2 runs it led; without its own vote,
+    red 3 of 3.
+  - Before rule 4: 4 stalls in 9 runs, each with the successor's 2 objects pending, and in the runs counted 1,058 to
+    1,130 unplaced adoptions in a minute.
+  - With rule 4: 15 of 15 in a row, each served in 3.7 to 7.4 s. Without it the unit test fails.
+  - Without rule 2's floor, `an_owner_killed_while_its_fleet_still_forms_is_taken_over` failed 3 of 3 alone: its
+    council's sole voter could never gather two votes.
+- **Owed.** A page still counts a holder's empty answer as its promise even when the holder leaves out a copy it
+  holds. With routing restored a restart no longer does this, but the rule belongs in phase one, for the takeover's
+  owner (the bug record's siblings).
 
 ### A-238 — A green's durable chain is checkpointed at its reachable floor, and a base below the checkpoint is unknown (accepted and built 2026-11-06, W3 of the load test's walls)
 
