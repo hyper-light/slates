@@ -1,0 +1,13 @@
+red on macos-latest, 3 CPUs, Sun Nov  8 23:09:31 UTC 2026, head ccc0bf502d79f22f7869243214bc673eb8fb9cd4
+== run 1 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 114 filtered out; finished in 14.50s
+
+== run 2 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 114 filtered out; finished in 14.29s
+
+== run 3 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 114 filtered out; finished in 13.81s
+
+== run 4 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 114 filtered out; finished in 13.67s
+
