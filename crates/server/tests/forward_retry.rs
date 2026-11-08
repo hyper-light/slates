@@ -143,6 +143,7 @@ fn a_forward_kept_for_a_full_channel_is_sent_once_the_channel_has_room() {
     std::thread::yield_now();
   }
   let waited = released.elapsed();
+  eprintln!("owner shard {owner}; flooded {flooded}; answered after {waited:?}: {answer:?}");
   drop(client);
   daemon.stop();
   assert!(flooded > 0, "the owner's control channel was filled");
