@@ -125,7 +125,10 @@ for run in $(seq 1 "$RUNS"); do
     start_arm $(( (first + offset) % count )) "$run"
   done
   arms=() shown=
-  for index in "${!NAMES[@]}"; do
+  for offset in "${!NAMES[@]}"; do
+    # ROTATE_ARMS (diag-48): the list the bench goes through each round starts with this run's first arm.
+    index=$offset
+    if [ -n "${ROTATE_ARMS:-}" ]; then index=$(( (first + offset) % count )); fi
     arms+=(--arm "${NAMES[$index]}=${DRIVES[$index]}/")
     shown="$shown ${NAMES[$index]}=${DRIVES[$index]}"
   done
