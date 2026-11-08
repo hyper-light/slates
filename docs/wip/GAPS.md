@@ -121,6 +121,16 @@
 > Open: no process test yet takes over an old incarnation's volume after its replacement's key arrived (the retired
 > key's path). Bug record `docs/bugs/2026-11-07-a-node-back-at-its-anchor-with-fresh-ram-had-every-pair-key-refused.md`.
 
+> **Fixed (live-durability, 2026-11-08): the owner rebuilt a whole install for a stopped holder on every write.**
+> `pending_sends` skipped a holder whose lane was busy, but a holder with no session ended its lane at once, so it was
+> never busy, and each publication cloned and encoded the volume's whole image for it: a median of 2,396 and 2,769
+> builds a run, 10.9 GB, against about 3.5 installs served (diag-live-durability-54). A holder whose lane ends
+> unanswered is now left alone until the record period retries it or its session is back (`live_ship::holder_reached`),
+> so a returning link does not wait for the period. `a_stopped_holders_install_is_built_once_a_period_not_once_a_write`:
+> 402 to 412 builds over 200 writes before, 8 to 11 after (bound 12). Rolling partition, 30 runs a leg per arch
+> (diag-live-durability-55): writes in a run, median 4,467 to 8,430 on x86 and 4,061 to 5,772 on arm; write p99, median
+> 8 to 3 ms and 6 to 4 ms; resume to the first install unchanged (114 to 114 ms and 108 to 101 ms); 120 of 120 passed.
+
 > **Fixed (live-durability, 2026-11-08): a record link's redial waited a whole link period before its handshake began.**
 > `establish_session` built a fresh dial in one call and ran its handshake in the next, a median of 101 ms later over
 > 487 redials (diag-live-durability-50), on the way of every resumed peer's catch-up. It now runs the handshake in the
