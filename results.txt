@@ -1,0 +1,35 @@
+tested 82992d58000239a725f55376f4551e6a42c45ef5 on windows-latest
+clippy exit 0
+test exit 101
+test result: ok. 63 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.31s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.73s
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 30.42s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots ... FAILED
+test every_recovery_equals_the_live_partition ... FAILED
+thread 'every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots' (5552) panicked at crates\db\tests\model.rs:68:4:
+thread 'every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots' (5552) panicked at crates\db\tests\model.rs:68:4:
+thread 'every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots' (5552) panicked at crates\db\tests\model.rs:68:4:
+thread 'every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots' (5552) panicked at crates\db\tests\model.rs:68:4:
+thread 'every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots' (5552) panicked at crates\db\tests\model.rs:68:4:
+thread 'every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots' (5552) panicked at crates\db\tests\model.rs:68:4:
+thread 'every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots' (5552) panicked at crates\db\tests\model.rs:68:4:
+thread 'every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots' (5552) panicked at crates\db\tests\model.rs:68:4:
+thread 'every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots' (5552) panicked at crates\db\tests\model.rs:68:4:
+thread 'every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots' (5552) panicked at crates\db\tests\model.rs:68:4:
+thread 'every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots' (5552) panicked at crates\db\tests\model.rs:68:4:
+thread 'every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots' (5552) panicked at crates\db\tests\model.rs:68:4:
+thread 'every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots' (5552) panicked at crates\db\tests\model.rs:68:4:
+thread 'every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots' (5552) panicked at crates\db\tests\model.rs:68:4:
+thread 'every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots' (5552) panicked at crates\db\tests\model.rs:68:4:
+thread 'every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots' (5552) panicked at crates\db\tests\model.rs:68:4:
+thread 'every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots' (5552) panicked at crates\db\tests\model.rs:68:4:
+thread 'every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots' (5552) panicked at crates\db\tests\model.rs:68:4:
+thread 'every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots' (5552) panicked at crates\db\tests\model.rs:68:4:
+thread 'every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots' (5552) panicked at crates\db\tests\model.rs:68:4:
+thread 'every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots' (5552) panicked at crates\db\tests\model.rs:68:4:
+thread 'every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots' (5552) panicked at crates\db\tests\model.rs:68:4:
+thread 'every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots' (5552) panicked at crates\db\tests\model.rs:68:4:
+test no_owed_id_is_released_whatever_order_its_acknowledgements_arrive_in ... ok
+DONE
