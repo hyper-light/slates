@@ -774,3 +774,78 @@ fn a_receive_on_a_socket_that_is_gone_names_it_gone() {
     "{refusal}"
   );
 }
+
+/// A socket bound off a shard is an OS socket, and the simulation driver cannot watch it: it took the descriptor for
+/// the fabric port of the same number, where no datagram ever arrives, so a task awaiting it was woken only by its own
+/// timers. The cluster's live tests bound their sessions' sockets on the test thread and ran that way, every turn ended
+/// by a probe timeout, and a lone request over a rate-limited link never finished (2026-11-08,
+/// `docs/bugs/2026-11-08-an-os-socket-awaited-on-the-simulation-driver-woke-only-on-its-timers.md`). Do await an
+/// OS socket's readability and writability on the simulation runtime. Expect each refused, typed, at once.
+#[test]
+fn an_os_socket_awaited_on_the_simulation_driver_is_refused() {
+  use slates_rt::sim::SimRuntime;
+
+  let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = sim.shard_ids()[0];
+  let (tx, rx) = channel();
+  sim
+    .spawn_on(id, async move {
+      let readable = socket.readable().await;
+      let writable = socket.writable().await;
+      let _ = tx.send((readable, writable));
+    })
+    .unwrap();
+  sim.run_until_idle();
+  let outcome = rx.try_recv();
+  assert!(
+    matches!(
+      outcome,
+      Ok((
+        Err(slates_rt::error::RtError::BadConfig { .. }),
+        Err(slates_rt::error::RtError::BadConfig { .. })
+      ))
+    ),
+    "both waits refused at once, not left to a fabric port (none answered: the task was still waiting): {outcome:?}"
+  );
+}
+
+/// The mirror: a fabric port awaited on a real driver would be registered as the OS descriptor of the same number
+/// (port 1 is a process's standard output). Do bind a socket on the simulation runtime and await it on a real one.
+/// Expect both waits refused, typed.
+#[test]
+fn a_fabric_port_awaited_on_a_real_driver_is_refused() {
+  use slates_rt::sim::SimRuntime;
+
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let sim_id = sim.shard_ids()[0];
+  let (socket_tx, socket_rx) = channel();
+  sim
+    .spawn_on(sim_id, async move {
+      let _ = socket_tx.send(UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap());
+    })
+    .unwrap();
+  sim.run_until_idle();
+  let socket = socket_rx.try_recv().unwrap();
+  let rt = Runtime::start(&config()).unwrap();
+  let id = rt.shard_ids()[0];
+  let (tx, rx) = channel();
+  rt.spawn_on(id, async move {
+    let readable = socket.readable().await;
+    let writable = socket.writable().await;
+    let _ = tx.send((readable, writable));
+  })
+  .unwrap();
+  let outcome = rx.recv_timeout(Duration::from_secs(5));
+  shutdown_within(rt, "after the fabric port's waits").unwrap();
+  assert!(
+    matches!(
+      outcome,
+      Ok((
+        Err(slates_rt::error::RtError::BadConfig { .. }),
+        Err(slates_rt::error::RtError::BadConfig { .. })
+      ))
+    ),
+    "both waits refused at once: {outcome:?}"
+  );
+}
