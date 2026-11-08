@@ -5319,7 +5319,19 @@ submitted to it) so no exchange waits for another's.
 > - So formation gives this entry no evidence at these loads: every session came back, holds are short, and
 >   out-findings are a few dozen against thousands of lends. The forward lane's numbers (2,661–6,277 forwards polling
 >   one lent session) are the case for the shared session.
-> - Not ruled out: the Mac at its load of 150–340, which these runs did not reach.
+> - **The Mac reproduced it at load 132–244** (2026-11-08, six runs, a build without the takeover link fix). One passed.
+>   Formation took 0.3–4.8 s but 40.0 s and 40.9 s in two runs; settlement took under 3.2 s but 22 s and 113.6 s in two.
+>   So the slowness is real and depends on load, and CI's spinners did not reach it. The failures: three fixed 40 s
+>   harness waits at load around 200, one takeover not served in time (the link fix was absent), and one judge false
+>   alarm, since fixed.
+> - One dump exists from that window, run 6 at 41.5 s into a settlement with the stream running, five nodes. Lends
+>   still match returns on every lane (`live_ship` 1,629 and 1,619, discovery 1,301 and 1,295 with 4 dropped), so
+>   sessions come back. Holds are long: `live_ship` 12.6 s at most, discovery 2.0 s, council replication 1.5 s. Borrowers
+>   found a session out 631,152 times, of which 570,478 were a `live_ship` lane finding the session lent to another
+>   `live_ship` lane, nearly all on the owner. Those are polls, not exchanges: many lanes spinning on one lent
+>   session, the forward lane's shape, and the strongest sign yet for the shared session.
+> - The two slow first formations printed no counters, since they ended at the 40 s dump bound. **The formation case
+>   itself still has no counters from a slow run**, and CPU, disk and memory were not separated.
 
 ### 2026-09-29: a lone owner refused its own objects — fixed; campaign counters added for the open KIND items
 
