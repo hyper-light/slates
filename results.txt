@@ -1,0 +1,82 @@
+leg stopwait-arm, batch 1, delay 250 ms on node a, 4 CPUs, Sun Nov  8 08:23:09 UTC 2026, tree 0a1ec76bb335cc5c75545aee8fc30cd3c9194457
+== release build exit 0
+  2832 writes, 2832 acknowledged: p50 560 us, p99 3732 us, p999 254614 us, max 779122 us; 8 over 50ms (sent+took): 0.00s+133ms 2.03s+52ms 2.24s+779ms 3.02s+253ms 3.28s+527ms 3.80s+252ms 4.06s+255ms 4.31s+209ms
+  chaos-rolling-a-6014 partitioned from 188.581791ms to 2.188659261s
+  chaos-rolling-c-6014 partitioned from 2.244768549s to 4.244858411s
+== partition 1 exit 0 lane_lines_stream24 0
+  3760 writes, 3760 acknowledged: p50 918 us, p99 4072 us, p999 40161 us, max 423816 us; 2 over 50ms (sent+took): 0.00s+146ms 2.26s+424ms
+  chaos-rolling-b-8389 partitioned from 201.632952ms to 2.201743178s
+  chaos-rolling-c-8389 partitioned from 2.261615078s to 4.261698761s
+== partition 2 exit 0 lane_lines_stream24 0
+  4653 writes, 4653 acknowledged: p50 483 us, p99 6689 us, p999 31984 us, max 275958 us; 4 over 50ms (sent+took): 0.00s+185ms 2.31s+72ms 2.39s+276ms 4.41s+71ms
+  chaos-rolling-b-8973 partitioned from 236.897331ms to 2.236991662s
+  chaos-rolling-c-8973 partitioned from 2.391900497s to 4.392050586s
+== partition 3 exit 0 lane_lines_stream24 0
+  4921 writes, 4921 acknowledged: p50 363 us, p99 2410 us, p999 253652 us, max 835016 us; 8 over 50ms (sent+took): 0.00s+132ms 2.15s+74ms 2.26s+835ms 3.10s+254ms 3.35s+553ms 3.91s+254ms 4.16s+260ms 4.42s+53ms
+  chaos-rolling-a-9665 partitioned from 167.908275ms to 2.168036383s
+  chaos-rolling-c-9665 partitioned from 2.264318258s to 4.26440314s
+== partition 4 exit 0 lane_lines_stream24 0
+  2498 writes, 2498 acknowledged: p50 806 us, p99 15022 us, p999 46400 us, max 140623 us; 2 over 50ms (sent+took): 0.01s+141ms 2.37s+68ms
+  chaos-rolling-b-12024 partitioned from 248.225287ms to 2.248317645s
+  chaos-rolling-c-12024 partitioned from 2.509304083s to 4.509386082s
+== partition 5 exit 0 lane_lines_stream24 0
+  2548 writes, 2548 acknowledged: p50 647 us, p99 4495 us, p999 252341 us, max 717337 us; 8 over 50ms (sent+took): 0.00s+126ms 2.13s+72ms 2.30s+717ms 3.01s+252ms 3.26s+521ms 3.79s+252ms 4.04s+252ms 4.29s+190ms
+  chaos-rolling-a-12741 partitioned from 174.46152ms to 2.174570232s
+  chaos-rolling-c-12741 partitioned from 2.294698301s to 4.294784935s
+== partition 6 exit 0 lane_lines_stream24 0
+  3964 writes, 3964 acknowledged: p50 444 us, p99 2491 us, p999 254230 us, max 862968 us; 7 over 50ms (sent+took): 0.00s+156ms 2.24s+863ms 3.11s+253ms 3.36s+254ms 3.61s+547ms 4.16s+255ms 4.41s+73ms
+  chaos-rolling-a-15256 partitioned from 190.894021ms to 2.190996542s
+  chaos-rolling-b-15256 partitioned from 2.241210792s to 4.24130353s
+== partition 7 exit 0 lane_lines_stream24 0
+  3574 writes, 3574 acknowledged: p50 527 us, p99 5490 us, p999 30090 us, max 263547 us; 3 over 50ms (sent+took): 0.01s+162ms 2.18s+71ms 2.33s+264ms
+  chaos-rolling-b-17664 partitioned from 238.661048ms to 2.239794764s
+  chaos-rolling-c-17664 partitioned from 2.334479408s to 4.335443437s
+== partition 8 exit 0 lane_lines_stream24 0
+  4432 writes, 4432 acknowledged: p50 488 us, p99 5278 us, p999 51718 us, max 431437 us; 5 over 50ms (sent+took): 0.00s+184ms 0.23s+156ms 2.19s+52ms 2.29s+431ms 4.31s+272ms
+  chaos-rolling-b-18361 partitioned from 234.17435ms to 2.234281357s
+  chaos-rolling-c-18361 partitioned from 2.294524933s to 4.294602485s
+== partition 9 exit 0 lane_lines_stream24 0
+  4798 writes, 4798 acknowledged: p50 353 us, p99 2406 us, p999 253170 us, max 810396 us; 9 over 50ms (sent+took): 0.00s+146ms 0.15s+102ms 2.27s+71ms 2.39s+810ms 3.20s+254ms 3.46s+548ms 4.00s+253ms 4.26s+253ms 4.51s+171ms
+  chaos-rolling-a-19069 partitioned from 277.828472ms to 2.277911142s
+  chaos-rolling-b-19069 partitioned from 2.391264443s to 4.391429334s
+== partition 10 exit 0 lane_lines_stream24 0
+  3758 writes, 3758 acknowledged: p50 426 us, p99 3427 us, p999 254103 us, max 829966 us; 8 over 50ms (sent+took): 0.00s+131ms 0.13s+102ms 1.93s+70ms 2.33s+830ms 3.16s+540ms 3.70s+254ms 3.96s+252ms 4.21s+316ms
+  chaos-rolling-a-21832 partitioned from 282.403012ms to 2.282899908s
+  chaos-rolling-c-21832 partitioned from 2.333433361s to 4.333521025s
+== partition 11 exit 0 lane_lines_stream24 0
+  3820 writes, 3820 acknowledged: p50 498 us, p99 5938 us, p999 46432 us, max 264309 us; 2 over 50ms (sent+took): 0.00s+152ms 2.30s+264ms
+  chaos-rolling-b-24376 partitioned from 198.548585ms to 2.198641822s
+  chaos-rolling-c-24376 partitioned from 2.302251338s to 4.302387567s
+== partition 12 exit 0 lane_lines_stream24 0
+  4884 writes, 4884 acknowledged: p50 370 us, p99 1639 us, p999 253521 us, max 907798 us; 8 over 50ms (sent+took): 0.00s+152ms 0.15s+103ms 2.06s+54ms 2.31s+908ms 3.22s+546ms 3.77s+254ms 4.02s+254ms 4.28s+327ms
+  chaos-rolling-a-24982 partitioned from 283.301883ms to 2.283390077s
+  chaos-rolling-c-24982 partitioned from 2.314494124s to 4.314581063s
+== partition 13 exit 0 lane_lines_stream24 0
+  2719 writes, 2719 acknowledged: p50 757 us, p99 3453 us, p999 252967 us, max 771809 us; 7 over 50ms (sent+took): 0.00s+138ms 2.26s+772ms 3.03s+253ms 3.28s+525ms 3.81s+252ms 4.06s+252ms 4.31s+205ms
+  chaos-rolling-a-28162 partitioned from 202.111002ms to 2.202228713s
+  chaos-rolling-c-28162 partitioned from 2.256235883s to 4.256422548s
+== partition 14 exit 0 lane_lines_stream24 0
+  2167 writes, 2167 acknowledged: p50 788 us, p99 4997 us, p999 453323 us, max 700065 us; 7 over 50ms (sent+took): 0.00s+131ms 0.13s+102ms 2.38s+700ms 3.08s+523ms 3.61s+252ms 3.86s+252ms 4.11s+453ms
+  chaos-rolling-a-29869 partitioned from 293.483393ms to 2.298623636s
+  chaos-rolling-c-29869 partitioned from 2.381279635s to 4.381458248s
+== partition 15 exit 0 lane_lines_stream24 0
+  4325 writes, 4325 acknowledged: p50 410 us, p99 2828 us, p999 256269 us, max 902180 us; 6 over 50ms (sent+took): 0.00s+145ms 2.21s+902ms 3.11s+259ms 3.37s+558ms 3.93s+261ms 4.19s+256ms
+  chaos-rolling-a-32364 partitioned from 175.630798ms to 2.176042316s
+  chaos-rolling-c-32364 partitioned from 2.209476897s to 4.20955977s
+== partition 16 exit 0 lane_lines_stream24 0
+  2407 writes, 2407 acknowledged: p50 642 us, p99 8571 us, p999 321645 us, max 647188 us; 8 over 50ms (sent+took): 0.00s+114ms 2.11s+68ms 2.36s+647ms 3.01s+255ms 3.26s+528ms 3.79s+253ms 4.04s+253ms 4.30s+322ms
+  chaos-rolling-a-34902 partitioned from 166.857375ms to 2.166929204s
+  chaos-rolling-c-34902 partitioned from 2.360506545s to 4.360614652s
+== partition 17 exit 0 lane_lines_stream24 0
+  3502 writes, 3502 acknowledged: p50 593 us, p99 5177 us, p999 53935 us, max 397223 us; 4 over 50ms (sent+took): 0.00s+180ms 0.23s+156ms 2.08s+54ms 2.30s+397ms
+  chaos-rolling-b-36465 partitioned from 229.840897ms to 2.230039344s
+  chaos-rolling-c-36465 partitioned from 2.298127117s to 4.298201516s
+== partition 18 exit 0 lane_lines_stream24 0
+  4485 writes, 4485 acknowledged: p50 398 us, p99 2602 us, p999 261135 us, max 918425 us; 7 over 50ms (sent+took): 0.00s+156ms 0.16s+102ms 2.32s+918ms 3.23s+261ms 3.50s+571ms 4.07s+278ms 4.34s+264ms
+  chaos-rolling-a-37049 partitioned from 282.55519ms to 2.282921492s
+  chaos-rolling-b-37049 partitioned from 2.316092432s to 4.316210381s
+== partition 19 exit 0 lane_lines_stream24 0
+  2373 writes, 2373 acknowledged: p50 727 us, p99 7324 us, p999 253988 us, max 609752 us; 9 over 50ms (sent+took): 0.01s+121ms 2.22s+54ms 2.39s+610ms 3.00s+251ms 3.25s+251ms 3.50s+526ms 4.03s+252ms 4.28s+254ms 4.54s+67ms
+  chaos-rolling-a-39730 partitioned from 202.785928ms to 2.202957802s
+  chaos-rolling-b-39730 partitioned from 2.390210564s to 4.390289028s
+== partition 20 exit 0 lane_lines_stream24 0
