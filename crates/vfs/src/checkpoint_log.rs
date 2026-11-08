@@ -348,7 +348,7 @@ impl Journal {
   /// takes the newer CRC-valid slot, then the log's frames from its start while each is CRC-valid and names that
   /// checkpoint, so the other slot and every byte past the tail are dead: frames there are torn or name an older base.
   /// Returning their pages leaves them reading zeros, which fail the same checks. Only what was written since the last
-  /// give-back ([`Journal::given_back`]) can be resident, so the ranges stop there: a give-back costs what the
+  /// give-back ([`Journal::given_back_from`]) can be resident, so the ranges stop there: a give-back costs what the
   /// publications since wrote, not the memories' length (18 GB a shard on a Mac Studio, whose mark of it took 18–21 ms
   /// of the shard's CPU at every publication before A-226).
   pub fn dead_ranges(&self, checkpoint_total: usize, log_total: usize) -> Option<DeadRanges> {
@@ -361,16 +361,24 @@ impl Journal {
     })
   }
 
-  /// Records that the ranges [`Journal::dead_ranges`] last named were given back: the stale slot's when `stale_slot`,
-  /// the log's past the tail when `log_past_tail`. A range the memory refused stays owed, asked for again at the next
-  /// give-back.
-  pub fn given_back(&mut self, stale_slot: bool, log_past_tail: bool) {
-    if stale_slot {
-      self.stale_written = 0;
+  /// Records what of the ranges [`Journal::dead_ranges`] last named was given back, each from the top down so a
+  /// give-back may take them a slice at a time: of the stale slot, everything from `stale_from` bytes into it; of the
+  /// log, everything from offset `log_from` (never below the tail). `None` records nothing for that region: a range the
+  /// memory refused stays owed, asked for at the next give-back.
+  pub fn given_back_from(&mut self, stale_from: Option<usize>, log_from: Option<usize>) {
+    if let Some(from) = stale_from {
+      self.stale_written = self.stale_written.min(from);
     }
-    if log_past_tail {
-      self.log_written = self.log_written.min(self.tail);
+    if let Some(from) = log_from {
+      self.log_written = self.log_written.min(from.max(self.tail));
     }
+  }
+
+  /// Test support: what a restart leaves: every byte of the dead regions may be resident, so the next give-back covers
+  /// them whole (A-226).
+  pub fn forget_what_was_given_back(&mut self) {
+    self.stale_written = UNKNOWN_EXTENT;
+    self.log_written = UNKNOWN_EXTENT;
   }
 
   /// The journal after a checkpoint of `bytes` committed into what was the stale slot: that slot is now the committed
