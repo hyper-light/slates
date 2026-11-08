@@ -831,14 +831,16 @@ fn a_start_whose_shards_sum_past_a_window_comes_up() {
   loop {
     line.clear();
     let read = std::io::BufRead::read_line(&mut stderr, &mut line).unwrap();
-    if read == 0 || line.starts_with(CRASH_LOOP_LINE) || line.starts_with(&serving_line) {
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
+    // Looked for anywhere in a line: the anchor's and the daemon's lines share one pipe and can arrive glued.
+    if read == 0 || line.contains(CRASH_LOOP_LINE) || line.contains(&serving_line) {
       break;
     }
     if line.contains(START_KILL_LINE) {
       kills.push(line.trim_end().to_owned());
     }
   }
-  let served = line.starts_with(&serving_line);
+  let served = line.contains(&serving_line);
   drop(anchor);
   assert!(
     kills.is_empty() && served,

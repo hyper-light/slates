@@ -746,8 +746,10 @@
 > - **Siblings with the same blind spot (open, reported, unchanged).** `crate::observe::ShardTime`
 >   (`next_window_ns`), used by observations and the cross-shard waits (`xshard`), gives up on a window with no CPU
 >   progress, so a starved shard's observation or call can end early. The anchor's start judgment
->   (`crates/cli/src/anchor.rs`, `process_clock`) judges a whole process by CPU time, has no thread to ask about, and
->   passes no reading: a start starved for a whole window is still killed.
+>   (`crates/cli/src/anchor.rs`, `process_clock`) passes no scheduler reading: a start starved for a whole window is still
+>   killed. Since 2026-11-08 its spinning half reads each thread (the busiest one's CPU), not the process's sum, which
+>   had killed every start of 23 shards on a 32-CPU Studio
+>   (`docs/bugs/2026-11-08-the-start-judgment-held-a-processs-summed-cpu-to-one-threads-window.md`).
 > - **A transitive wait reads as stuck (open).** A shard blocked for a whole window on something held by a starved thread
 >   is never runnable itself, so it is wedged by this rule. Not measured. Fixtures' shard 1 (S S S R R S S) may be one.
 > - **macOS is proven by replays (limit).** A full window of flat CPU came in 1 of 20 CI runs, so its real-thread test
