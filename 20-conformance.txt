@@ -48,3 +48,13 @@ conformance: scratch kept at /home/runner/work/slates/slates/target/pair/plain/s
 conformance: wrote target/pair/plain/records/oci-linux.pjdfstest.json
 conformance: oci-linux × pjdfstest: RAN(238 files, 8798 cases: 6972 passed, 1798 failed (1798 expected, 0 unexpected, 0 listed-now-passing), 0 needs-root, 28 todo; 2026-11-08; Ubuntu 24.04.5 LTS)
 conformance: scratch kept at /home/runner/work/slates/slates/target/pair/plain/scratch/oci-linux
+pjdfstest live exit=0 seconds=554 load=1.55 0.90 0.68
+conformance: wrote target/pair/live/records/native-linux-fuse.pjdfstest.json
+conformance: native-linux-fuse × pjdfstest: LIMITED(adapter: a root `mount -t nfs` by the Linux NFS client of the unprivileged daemon's NFSv3 loopback export (the same serving code as macOS); not covered: the daemon's own FUSE mount (`slates mount` on Linux, crates/server/src/fuse.rs): this lane mounts through the NFS adapter; the suites over the FUSE mount run in the Linux container lane (`oci-linux`, `slates mount --shared` with `user_allow_other`); 238 files, 8798 cases: 6970 passed, 1800 failed (1800 expected, 0 unexpected, 0 listed-now-passing), 0 needs-root, 28 todo; 2026-11-08; Ubuntu 
+conformance: scratch kept at /home/runner/work/slates/slates/target/pair/live/scratch/native-linux-fuse
+conformance: wrote target/pair/live/records/native-linux-nfs4.pjdfstest.json
+conformance: native-linux-nfs4 × pjdfstest: RAN(238 files, 8798 cases: 6971 passed, 1799 failed (1799 expected, 0 unexpected, 0 listed-now-passing), 0 needs-root, 28 todo; 2026-11-08; Ubuntu 24.04.5 LTS)
+conformance: scratch kept at /home/runner/work/slates/slates/target/pair/live/scratch/native-linux-nfs4
+conformance: wrote target/pair/live/records/oci-linux.pjdfstest.json
+conformance: oci-linux × pjdfstest: RAN(238 files, 8798 cases: 6972 passed, 1798 failed (1798 expected, 0 unexpected, 0 listed-now-passing), 0 needs-root, 28 todo; 2026-11-08; Ubuntu 24.04.5 LTS)
+conformance: scratch kept at /home/runner/work/slates/slates/target/pair/live/scratch/oci-linux
