@@ -7136,6 +7136,9 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > (`slates_rt::process_runnable`), as the watchdog asks of a shard: a start whose CPU stands still a window while one of its
 > threads waits for a CPU is starved and waited for. Before, a start held off its CPUs was killed ("made no progress for
 > 1014 ms" on CI's Windows runner; red 2 of 2 on adacachy2 by `a_start_held_off_its_cpus_is_starved_not_stuck`).
+> Since 2026-11-08 the spinning half is judged on the start's busiest thread, as the rule is a thread's: the process's
+> summed CPU, held to one window, killed every start of 23 shards on a 32-CPU Studio and of 48 on an 18-CPU Mac
+> (`docs/bugs/2026-11-08-the-start-judgment-held-a-processs-summed-cpu-to-one-threads-window.md`).
 > A shard's recovery still runs as one poll, which the watchdog counts as spinning past a window of CPU: GAPS holds it
 > open.
 

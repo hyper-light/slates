@@ -758,6 +758,9 @@
 >   not stuck. `a_start_held_off_its_cpus_is_starved_not_stuck` (`crates/cli/src/anchor.rs`) holds a busy process off its
 >   CPU at SCHED_IDLE: without the reading, judged "made no progress for 1001 ms", 2 of 2 on adacachy2; with it, starved
 >   at 14-23 looks and never stuck, 7 of 7 (nice 0 and 19). A process with every thread blocked still reads stuck.
+>   Its spinning half reads each thread too since 2026-11-08 (liveness): the busiest thread's CPU, not the process's sum,
+>   which had killed every start of 23 shards on a 32-CPU Studio
+>   (`docs/bugs/2026-11-08-the-start-judgment-held-a-processs-summed-cpu-to-one-threads-window.md`).
 > - **A transitive wait reads as stuck: fixed 2026-11-08 (bug-sweep), the supervisor's order, scoped to the shard's
 >   joins.** The waits in which a shard thread blocks on another thread of the process are three: the FUSE notify
 >   thread's join (`slates_bridge_fuse::channel::Notifier`'s drop, which waits out the round in flight), the landing
@@ -776,7 +779,16 @@
 >   15 looks on the Mac); `a_shard_joining_a_thread_reads_as_the_thread_runs` (`crates/rt/tests/waited_thread.rs`) holds
 >   the reading across a real join, and found a join made at once after the spawn unmarked before the starting mark.
 >   Not covered: a wait on another process, or on a lock (there are none on data paths), or a join a future site adds
->   without `spawn_waited`. The measurement that led here:
+>   without `spawn_waited`.
+>   - **Open: the lock a starved test thread held is not named.** With the three starving tests of
+>     `crates/server/tests/liveness.rs` able to run at once, the suite hung 2 of about 9 parallel runs on adacachy2: two
+>     of them stood still while starting their spinners, neither reaching its ten-window bound, with their test threads
+>     asleep on a futex. A thread made SCHED_IDLE and held off its CPU while it holds a process-wide lock (an allocator
+>     arena, the standard error stream) would do it, but ptrace is refused there and no stack was read. The tests now
+>     take one turn at a time (`one_starving_test_at_a_time`): 20 of 20 since. A daemon thread starved while holding such
+>     a lock would stall every thread that needs it the same way; the daemon makes no thread SCHED_IDLE, so only a host
+>     that starves it does. To name it: a stack of the hung threads (`eu-stack` where ptrace is allowed).
+>   The measurement that led here:
 > - **(Measured 2026-11-08 by bug-sweep, before the fix.)** A shard blocked for a whole window on
 >   something held by a starved thread is never runnable itself, so it is wedged by this rule. Measured on adacachy2 at
 >   load 0.2: a shard's poll parked until a thread released it, that thread at SCHED_IDLE pinned beside the starved test's

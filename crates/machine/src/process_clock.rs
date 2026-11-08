@@ -16,6 +16,18 @@
 //!   default), and `QueryProcessCycleTime`, the cycles the process has run, exact, as the progress [B: Microsoft Learn,
 //!   "QueryProcessCycleTime", "GetProcessTimes"].
 //! - Elsewhere: `None`; the caller's wall window stands alone.
+//!
+//! A reading also carries the most CPU any one of the process's threads has run ([`ProcessCpu::busiest_thread_ns`]), what
+//! the watchdog's spinning rule asks of a shard (a window of CPU on one thread without a step). The sum of the threads is
+//! no such reading: a start whose shards begin in parallel sums past a window while no thread nears one, and the anchor
+//! that held the sum to a window crash-looped every start of 23 shards on a 32-CPU Studio and of 48 on an 18-CPU Mac
+//! (2026-11-08, A-228's start judgment):
+//! - Linux: each `/proc/<pid>/task/<tid>/schedstat`'s first field, the nanoseconds that thread has run.
+//! - macOS: `proc_pidinfo(PROC_PIDLISTTHREADS)` for the threads, then `PROC_PIDTHREADINFO` for each one's user plus
+//!   system time in nanoseconds; both answer for a process of the same user without any entitlement.
+//! - Windows: the process's threads from a ToolHelp snapshot, each opened with the limited query right for
+//!   `GetThreadTimes`' kernel plus user time.
+//! - Elsewhere, or where the threads cannot be listed: `None`, and the caller judges no spinning at all.
 
 /// One reading of a process's CPU clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,11 +37,18 @@ pub struct ProcessCpu {
   /// A count that grows whenever the process runs (its CPU time on Linux, its raw time on macOS, its cycles on
   /// Windows).
   pub progress: u64,
+  /// The most CPU any one of its threads has run, nanoseconds; `None` where its threads cannot be read.
+  pub busiest_thread_ns: Option<u64>,
 }
 
 /// The CPU clock of process `pid`, or `None` when the OS gives no reading (the process gone, or no query here).
 pub fn process_cpu(pid: u32) -> Option<ProcessCpu> {
-  platform::process_cpu(pid)
+  platform::process_cpu(pid).map(|cpu| ProcessCpu {
+    busiest_thread_ns: cpu
+      .busiest_thread_ns
+      .or_else(|| platform::busiest_thread_ns(pid)),
+    ..cpu
+  })
 }
 
 #[cfg(target_os = "linux")]
@@ -62,7 +81,18 @@ mod platform {
     Some(ProcessCpu {
       spent_ns: ran,
       progress: ran,
+      busiest_thread_ns: None,
     })
+  }
+
+  /// The most any one thread of `pid` has run: each `/proc/<pid>/task/<tid>/schedstat`'s first field, in nanoseconds.
+  pub(super) fn busiest_thread_ns(pid: u32) -> Option<u64> {
+    let tasks = std::fs::read_dir(format!("/proc/{pid}/task")).ok()?;
+    tasks
+      .filter_map(Result::ok)
+      .filter_map(|task| std::fs::read_to_string(task.path().join("schedstat")).ok())
+      .filter_map(|text| text.split_whitespace().next()?.parse::<u64>().ok())
+      .max()
   }
 
   /// Format: nanoseconds a second.
@@ -115,7 +145,72 @@ mod platform {
     Some(ProcessCpu {
       spent_ns,
       progress: raw,
+      busiest_thread_ns: busiest_of(pid, info.pti_threadnum),
     })
+  }
+
+  /// Nothing more to read: [`process_cpu`] reads the threads with the thread count its task reading gives.
+  pub(super) fn busiest_thread_ns(_pid: u32) -> Option<u64> {
+    None
+  }
+
+  /// Format: `PROC_PIDLISTTHREADS` (`<sys/proc_info.h>`), the flavor that lists a task's thread handles, which `libc`
+  /// does not bind.
+  const PROC_PIDLISTTHREADS: libc::c_int = 6;
+
+  /// The most any one thread of `pid` has run: its thread handles (`PROC_PIDLISTTHREADS`), then each one's user plus
+  /// system time (`PROC_PIDTHREADINFO`, nanoseconds). The list is sized at twice `threads`, the count the task reported
+  /// a moment before, for threads started between the two calls.
+  fn busiest_of(pid: libc::c_int, threads: i32) -> Option<u64> {
+    let room = usize::try_from(threads).ok()?.max(1).checked_mul(2)?;
+    let mut handles = vec![0u64; room];
+    let list_size = libc::c_int::try_from(room.checked_mul(std::mem::size_of::<u64>())?).ok()?;
+    // SAFETY: `handles` is this frame's own buffer of `list_size` bytes; the call writes at most that many and returns
+    // how many it wrote, and only that many are read.
+    let listed = unsafe {
+      libc::proc_pidinfo(
+        pid,
+        PROC_PIDLISTTHREADS,
+        0,
+        handles.as_mut_ptr().cast(),
+        list_size,
+      )
+    };
+    let count = usize::try_from(listed)
+      .ok()?
+      .checked_div(std::mem::size_of::<u64>())?;
+    let info_size = libc::c_int::try_from(std::mem::size_of::<libc::proc_threadinfo>()).ok()?;
+    handles
+      .get(..count)?
+      .iter()
+      .filter_map(|handle| {
+        let mut info = libc::proc_threadinfo {
+          pth_user_time: 0,
+          pth_system_time: 0,
+          pth_cpu_usage: 0,
+          pth_policy: 0,
+          pth_run_state: 0,
+          pth_flags: 0,
+          pth_sleep_time: 0,
+          pth_curpri: 0,
+          pth_priority: 0,
+          pth_maxpriority: 0,
+          pth_name: [0; libc::MAXTHREADNAMESIZE],
+        };
+        // SAFETY: `info` is this frame's own record of `info_size` bytes, the flavor's struct, and the handle is one the
+        // listing just returned; the byte count written is checked before it is read.
+        let wrote = unsafe {
+          libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTHREADINFO,
+            *handle,
+            (&raw mut info).cast(),
+            info_size,
+          )
+        };
+        (wrote == info_size).then(|| info.pth_user_time.saturating_add(info.pth_system_time))
+      })
+      .max()
   }
 }
 
@@ -171,7 +266,68 @@ mod platform {
         .checked_add(units(user))?
         .checked_mul(NS_PER_FILETIME_UNIT)?,
       progress: cycles,
+      busiest_thread_ns: None,
     })
+  }
+
+  /// The most any one thread of `pid` has run: the threads a ToolHelp snapshot lists for it, each opened with the limited
+  /// query right for `GetThreadTimes`' kernel plus user time.
+  pub(super) fn busiest_thread_ns(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+      CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::Threading::{
+      GetThreadTimes, OpenThread, THREAD_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: takes a snapshot of every thread on the system; a failure is the invalid handle, checked here.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+      return None;
+    }
+    let snapshot = Opened(snapshot);
+    let mut entry = THREADENTRY32 {
+      dwSize: u32::try_from(std::mem::size_of::<THREADENTRY32>()).ok()?,
+      cntUsage: 0,
+      th32ThreadID: 0,
+      th32OwnerProcessID: 0,
+      tpBasePri: 0,
+      tpDeltaPri: 0,
+      dwFlags: 0,
+    };
+    let units =
+      |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
+    let mut busiest: Option<u64> = None;
+    // SAFETY: a live snapshot handle and this frame's own entry, its size set as the call requires; the status is
+    // checked before the entry is read.
+    let mut more = unsafe { Thread32First(snapshot.0, &mut entry) } != 0;
+    while more {
+      if entry.th32OwnerProcessID == pid {
+        // SAFETY: opens a thread by id with the limited query right only; a refusal is a null handle, checked here.
+        let thread = unsafe { OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, entry.th32ThreadID) };
+        if !thread.is_null() {
+          let thread = Opened(thread);
+          let unset = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+          };
+          let (mut created, mut exited, mut kernel, mut user) = (unset, unset, unset, unset);
+          // SAFETY: a live handle with the limited query right, which `GetThreadTimes` accepts, and four of this frame's
+          // own values for the call to write; the status is checked before they are read.
+          let timed =
+            unsafe { GetThreadTimes(thread.0, &mut created, &mut exited, &mut kernel, &mut user) };
+          let ran = units(kernel)
+            .checked_add(units(user))
+            .and_then(|units| units.checked_mul(NS_PER_FILETIME_UNIT));
+          if let (true, Some(ran)) = (timed != 0, ran) {
+            busiest = Some(busiest.map_or(ran, |most| most.max(ran)));
+          }
+        }
+      }
+      // SAFETY: the same live snapshot and entry; the status ends the walk.
+      more = unsafe { Thread32Next(snapshot.0, &mut entry) } != 0;
+    }
+    busiest
   }
 }
 
@@ -181,6 +337,11 @@ mod platform {
 
   /// No process clock here.
   pub(super) fn process_cpu(_pid: u32) -> Option<ProcessCpu> {
+    None
+  }
+
+  /// No thread clocks here.
+  pub(super) fn busiest_thread_ns(_pid: u32) -> Option<u64> {
     None
   }
 }
@@ -275,6 +436,66 @@ mod tests {
     assert!(
       matches!((before, after), (Some(b), Some(a)) if a.progress > b.progress && a.spent_ns >= b.spent_ns),
       "{before:?} → {after:?}"
+    );
+  }
+
+  /// Shape: the spinning threads [`spinners_on_several_threads`] runs: two at least, so the busiest is not the sum.
+  const SEVERAL: usize = 4;
+
+  /// The child [`a_process_whose_threads_spin_reads_its_busiest_thread_below_its_sum`] watches: [`SEVERAL`] threads spin
+  /// while the main thread waits on them. Ignored, run by its parent with `--ignored`.
+  #[test]
+  #[ignore = "the several-thread spinner; run by its parent with --ignored"]
+  fn spinners_on_several_threads() {
+    if std::env::var_os(SPINNER).is_none() {
+      return;
+    }
+    let spinners: Vec<_> = (0..SEVERAL)
+      .map(|_| {
+        std::thread::spawn(|| {
+          let started = std::time::Instant::now();
+          let mut spin = 0u64;
+          while started.elapsed() < SPIN * SPINNER_SPANS {
+            spin = std::hint::black_box(spin.wrapping_add(1));
+          }
+        })
+      })
+      .collect();
+    for spinner in spinners {
+      let _ = spinner.join();
+    }
+  }
+
+  /// A-228, the anchor's start judgment: the spinning rule is one thread's, so a reading names the busiest thread's CPU
+  /// apart from the process's sum. Do: start a child of this binary whose [`SEVERAL`] threads spin, let them run two
+  /// spans, and read its clock. Expect the busiest thread's CPU read, more than nothing, and less than the sum: the other
+  /// threads ran too. A judgment of the sum killed every start of 23 shards on a 32-CPU Studio (2026-11-08).
+  #[test]
+  #[allow(clippy::disallowed_methods)] // the spans the child is watched across
+  fn a_process_whose_threads_spin_reads_its_busiest_thread_below_its_sum() {
+    if !cfg!(any(target_os = "linux", target_os = "macos", windows)) {
+      eprintln!("skipped: no thread clocks on this platform");
+      return;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+      .args([
+        "--ignored",
+        "--exact",
+        "process_clock::tests::spinners_on_several_threads",
+      ])
+      .env(SPINNER, "1")
+      .stdout(std::process::Stdio::null())
+      .spawn()
+      .unwrap();
+    std::thread::sleep(SPIN * 2);
+    let reading = process_cpu(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+      reading.is_some_and(|cpu| cpu
+        .busiest_thread_ns
+        .is_some_and(|busiest| busiest > 0 && busiest < cpu.spent_ns)),
+      "{reading:?}"
     );
   }
 
