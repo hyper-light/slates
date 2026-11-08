@@ -1,0 +1,19 @@
+head 8960414dccd32da32ef5394049d2821c1ba1d651, 4 CPUs
+== run 1 exit 124
+thread 'diag_a_restarted_holder_refuses_records_before_relearning' (6380) panicked at crates/cli/tests/live_fleet.rs:3148:5:
+thread '<unnamed>' (6539) panicked at crates/cli/tests/live_fleet.rs:854:7:
+== run 2 exit 124
+thread 'diag_a_restarted_holder_refuses_records_before_relearning' (140669) panicked at crates/cli/tests/live_fleet.rs:3148:5:
+thread '<unnamed>' (140929) panicked at crates/cli/tests/live_fleet.rs:854:7:
+== run 3 exit 124
+thread 'diag_a_restarted_holder_refuses_records_before_relearning' (245665) panicked at crates/cli/tests/live_fleet.rs:3148:5:
+thread '<unnamed>' (245836) panicked at crates/cli/tests/live_fleet.rs:854:7:
+== run 4 exit 124
+== run 5 exit 124
+== run 6 exit 124
+thread 'diag_a_restarted_holder_refuses_records_before_relearning' (637789) panicked at crates/cli/tests/live_fleet.rs:3148:5:
+thread '<unnamed>' (637948) panicked at crates/cli/tests/live_fleet.rs:854:7:
+== run 7 exit 124
+== run 8 exit 124
+thread 'diag_a_restarted_holder_refuses_records_before_relearning' (887120) panicked at crates/cli/tests/live_fleet.rs:3148:5:
+thread '<unnamed>' (887280) panicked at crates/cli/tests/live_fleet.rs:854:7:
