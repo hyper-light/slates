@@ -31,6 +31,7 @@ use slates_ipc::protocol::{
   Direction, Intent, NamePolicy, Refusal, ReplyBody, RequestBody, SizeClass, VolumeId, pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect};
+use slates_rt::registry::SlotHolder;
 use slates_server::shards::{ShardsAsk, ShardsAttached};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 use slates_wire::request::RequestId;
@@ -193,6 +194,31 @@ fn my_uid() -> u32 {
   rustix::process::getuid().as_raw()
 }
 
+/// An attachment as [`attach`] hands it to a test: the daemon's answer, and the daemon's shards, by whose CPU clocks a
+/// guest waiting on the stream judges whether the daemon still works on its answer ([`Guest::await_answer`]).
+#[derive(Debug)]
+struct Attached {
+  answer: ShardsAttached,
+  shards: Vec<SlotHolder>,
+}
+
+/// The registrations of `daemon`'s shards, whose CPU clocks say whether it still works on a guest's answer.
+fn shard_holders(daemon: &Daemon) -> Vec<SlotHolder> {
+  daemon
+    .shards()
+    .iter()
+    .filter_map(|shard| slates_rt::registry::holder_of(shard.0))
+    .collect()
+}
+
+impl std::ops::Deref for Attached {
+  type Target = ShardsAttached;
+
+  fn deref(&self) -> &ShardsAttached {
+    &self.answer
+  }
+}
+
 /// Attaches `volume` over a stream as this test's user, presenting `subtree` with `intent`: the attachment, or the
 /// typed refusal.
 fn attach(
@@ -200,7 +226,7 @@ fn attach(
   volume: VolumeId,
   subtree: Option<&str>,
   intent: Intent,
-) -> Result<ShardsAttached, Refusal> {
+) -> Result<Attached, Refusal> {
   let (tx, rx) = channel();
   daemon
     .attach_shards_stream(
@@ -215,7 +241,10 @@ fn attach(
       }),
     )
     .unwrap();
-  rx.recv_timeout(CREDIT_WAIT).expect("the attach answered")
+  let shards = shard_holders(daemon);
+  rx.recv_timeout(CREDIT_WAIT)
+    .expect("the attach answered")
+    .map(|answer| Attached { answer, shards })
 }
 
 // --- Shards' fs device, as seen from its socket. ---
@@ -226,13 +255,16 @@ struct Guest {
   unique: u64,
   /// When the guest last sent a frame: how long an answer that never came was waited for.
   sent_at: Instant,
+  /// The daemon's shards, by whose CPU clocks the guest judges whether the daemon still works on its answer.
+  shards: Vec<SlotHolder>,
 }
 
 impl Guest {
-  fn over(attached: ShardsAttached) -> Guest {
-    let stream = UnixStream::from(attached.stream);
+  fn over(attached: Attached) -> Guest {
+    let stream = UnixStream::from(attached.answer.stream);
     stream.set_read_timeout(Some(CREDIT_WAIT)).unwrap();
     Guest {
+      shards: attached.shards,
       stream,
       unique: 0,
       sent_at: Instant::now(),
@@ -255,8 +287,68 @@ impl Guest {
     self.stream.write_all(bytes).unwrap();
   }
 
+  /// Waits until the daemon has sent this guest something, for as long as the daemon works on it: in windows of
+  /// [`CREDIT_WAIT`], the next only while one of its shards ran on the CPU in the window just ended, and within
+  /// [`CREDIT_WAIT`] of their CPU since the wait began (A-65 and A-228's rule: the watchdog and the daemon's own
+  /// cross-shard waits judge a shard by its own time). A daemon starved by a loaded machine is waited for; one whose
+  /// shards ran nothing for a window (wedged), or ran the budget without answering (spinning), fails the test, naming
+  /// which. Before 2026-11-07 the guest gave the daemon a fixed [`CREDIT_WAIT`] of wall time: under load 120 to 156 on
+  /// macOS a writable DAX map's fill, a 16 KiB page a turn, took longer, and the read failed `EAGAIN` with the daemon
+  /// working (live-durability's runs).
+  fn await_answer(&self) {
+    use rustix::event::{PollFd, PollFlags, Timespec};
+    let window = Timespec {
+      tv_sec: i64::try_from(CREDIT_WAIT.as_secs()).unwrap_or(i64::MAX),
+      tv_nsec: i64::from(CREDIT_WAIT.subsec_nanos()),
+    };
+    let readings = || -> Vec<Option<(u64, u64)>> {
+      self
+        .shards
+        .iter()
+        .map(|holder| {
+          slates_rt::registry::shard_cpu(*holder)
+            .map(|reading| (reading.spent_ns, reading.progress))
+        })
+        .collect()
+    };
+    let began = readings();
+    let mut mark = began.clone();
+    loop {
+      let mut fds = [PollFd::new(&self.stream, PollFlags::IN)];
+      match rustix::event::poll(&mut fds, Some(&window)) {
+        Ok(ready) if ready > 0 => return,
+        Ok(_) | Err(rustix::io::Errno::INTR) => {}
+        Err(errno) => panic!("polling the guest's stream: {errno:?}"),
+      }
+      let now = readings();
+      let ran = now
+        .iter()
+        .zip(&mark)
+        .any(|(now, then)| matches!((now, then), (Some((_, now)), Some((_, then))) if now > then));
+      let spent: u64 = now
+        .iter()
+        .zip(&began)
+        .filter_map(|(now, then)| Some(now.as_ref()?.0.saturating_sub(then.as_ref()?.0)))
+        .sum();
+      let budget = u64::try_from(CREDIT_WAIT.as_nanos()).unwrap_or(u64::MAX);
+      assert!(
+        ran && spent < budget,
+        "the daemon has not answered this guest {:?} after its last frame, and its shards {} (CPU since the wait began: \
+         {spent} ns of a {budget} ns budget)",
+        self.sent_at.elapsed(),
+        if ran {
+          "ran the budget without answering"
+        } else {
+          "ran nothing for a whole window"
+        }
+      );
+      mark = now;
+    }
+  }
+
   /// Reads one frame: whether it is a control frame, and its bytes; `None` at the stream's end.
   fn reply_frame(&mut self) -> Option<(bool, Vec<u8>)> {
+    self.await_answer();
     let mut word = [0u8; 4];
     match self.stream.read_exact(&mut word) {
       Ok(()) => {}
@@ -482,6 +574,7 @@ impl Guest {
   /// byte, then the payload.
   fn descriptor_answer(&mut self) -> Result<OwnedFd, i32> {
     use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
+    self.await_answer();
     let mut header = [0u8; 5];
     let mut space = [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut control = RecvAncillaryBuffer::new(&mut space);
@@ -2544,10 +2637,13 @@ mod route {
       &mut || false,
     )
     .unwrap();
-    let mut guest = Guest::over(ShardsAttached {
-      attachment,
-      lease_epoch: None,
-      stream,
+    let mut guest = Guest::over(Attached {
+      answer: ShardsAttached {
+        attachment,
+        lease_epoch: None,
+        stream,
+      },
+      shards: shard_holders(&daemon),
     });
     guest.init();
     assert_eq!(guest.lookup(ROOT, "nothing"), Err(ENOENT));
@@ -2605,7 +2701,7 @@ mod route {
       // The churn stops however the claims end, a failed assertion included: the scope waits for its threads, so a
       // churn left running would hold a failed test forever.
       let _stop = StopOnDrop(&stop);
-      claims_under_churn(&mut client, id, &instance)
+      claims_under_churn(&daemon, &mut client, id, &instance)
     });
     assert_eq!(
       flushed, 0,
@@ -2630,7 +2726,12 @@ mod route {
 
   /// Makes [`CLAIMS_UNDER_CHURN`] offers of `id` and claims each, running `INIT` through every live end: the ends that
   /// arrived flushed, refused by the client (`Flushed`) or, were that check gone, reading a zero receive buffer.
-  fn claims_under_churn(client: &mut Client, id: VolumeId, instance: &str) -> usize {
+  fn claims_under_churn(
+    daemon: &Daemon,
+    client: &mut Client,
+    id: VolumeId,
+    instance: &str,
+  ) -> usize {
     let mut flushed = 0usize;
     for _ in 0..CLAIMS_UNDER_CHURN {
       let (attachment, secret) = offer(client, id);
@@ -2654,10 +2755,13 @@ mod route {
         flushed += 1;
         continue;
       }
-      let mut guest = Guest::over(ShardsAttached {
-        attachment,
-        lease_epoch: None,
-        stream,
+      let mut guest = Guest::over(Attached {
+        answer: ShardsAttached {
+          attachment,
+          lease_epoch: None,
+          stream,
+        },
+        shards: shard_holders(daemon),
       });
       guest.init();
     }

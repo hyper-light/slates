@@ -14372,6 +14372,21 @@ Red first: `the_workload_environment_keeps_a_parents_git_configuration_out` comm
 configures signing with a program that always fails; under the old environment the commit failed ("gpg failed to sign
 the data"), and it is made unsigned now (adacachy).
 
+### 2026-11-07: the Shards tests' guest gave a live daemon five seconds of wall time — fixed
+
+`the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte` (`crates/server/tests/shards.rs`) failed in
+live-durability's macOS runs at load 120–156 with `EAGAIN` from the guest's 5 s socket read timeout (`CREDIT_WAIT`) on
+its setup's writable DAX map, the "hostile_descriptor" flake's same read. Reproduced on this Mac (load 150–170): 1 of 2
+runs failed, `EAGAIN` after 5.06 s, while that run's other answers took 1.0–3.0 s and the watchdog logged no wedged or
+spinning shard. Under that load the machine profile's memcpy rate measured low, so the copy slice was one 16 KiB page
+and the fill took about 128 shard turns. The daemon was answering; the fixed wall wait was the test's assumption.
+
+The guest now waits by the daemon's rule (`Guest::await_answer`): in windows of `CREDIT_WAIT`, the next only while one
+of the daemon's shards ran on the CPU in the window just ended, and within `CREDIT_WAIT` of their CPU since the wait
+began; a daemon whose shards ran nothing for a window, or ran the budget without answering, fails the test by name.
+Red first: with the daemon's one shard held asleep, the new wait failed after 5.0 s, "ran nothing for a whole window".
+On `4811191a`, 10 of 10 runs passed on this Mac as its load fell from about 270 to 70 (runs 1–6 took 123–298 s).
+
 ### 2026-10-22: two pressure tests failed on a busy machine, not on the property — fixed
 
 `a_stale_handle_never_reads_a_reused_inode_under_churn` and
