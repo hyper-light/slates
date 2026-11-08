@@ -54,8 +54,8 @@ use std::net::TcpStream;
 #[cfg(unix)]
 use common::guest::{message, my_uid, reply_error, round_trip, start_guest, with_guest};
 use common::nfs::{
-  create, lookup, lookup_carries_attributes, lookup_status, mount, owner_and_mode_status,
-  read_bytes_status, read_status, write,
+  NFS3ERR_JUKEBOX, create, lookup, lookup_carries_attributes, lookup_status, mount,
+  owner_and_mode_status, read_bytes_status, read_status, write,
 };
 use common::trace;
 use common::wait::{ProgressCharge, Verdict, verdict};
@@ -13555,9 +13555,6 @@ const NFS3_OK: u32 = 0;
 const NFS3ERR_ACCES: u32 = 13;
 /// Format: `NFS3ERR_STALE` (RFC 1813 §2.6) — what a handle to a volume the node's set does not hold answers.
 const NFS3ERR_STALE: u32 = 70;
-/// Format: `NFS3ERR_JUKEBOX` (RFC 1813 §2.6) — the retry-later status the mount answers while the owner lease
-/// is unconfirmed (§4.8 "Leases and reads"; AUD-08).
-const NFS3ERR_JUKEBOX: u32 = 10008;
 
 /// AC (§4.8 "Leases and reads"; AUD-08; §4.13 AUD-01): the owner-lease gate answers only for what a node
 /// holds, and only to a caller it authorizes. In a three-node `f = 1` fleet A holds a volume mounted over NFS
@@ -13635,6 +13632,91 @@ fn a_lapsed_lease_refuses_only_what_the_node_holds_and_authorizes() {
     },
     "after the lapse the gate refused only the held, authorized reads"
   );
+}
+
+/// The lease gate's refusals `daemon` has counted on every shard (`lease.refused.unconfirmed`): each NFS call the
+/// gate answers `NFS3ERR_JUKEBOX` counts one.
+fn lease_gate_refusals(daemon: &Daemon) -> u64 {
+  daemon
+    .refusals_on_every_shard()
+    .map(|counts| {
+      counts
+        .get(slates_server::lease::LEASE_UNCONFIRMED)
+        .copied()
+        .unwrap_or(0)
+    })
+    .unwrap_or(0)
+}
+
+/// RFC 1813 §2.6 (`NFS3ERR_JUKEBOX`: the server cannot complete the call now, and the client is to retry it later)
+/// with §4.8 "Leases and reads" (AUD-08): do isolate the owner until its lease lapses, so its mount answers
+/// `NFS3ERR_JUKEBOX` through the owner-lease gate; make a GETATTR through the harness's asserting helper
+/// ([`common::nfs::owner_and_mode`]) from another thread, and heal the isolation once the daemon has counted
+/// that call's refusal; expect the helper to return the held file's mode, as an NFS client's retry of the
+/// retry-later answer does. The helper failed on the first `NFS3ERR_JUKEBOX` before, which made three fleet
+/// tests red under load wherever a lease was a moment late (two CREATEs and a GETATTR, 2026-11-08). The
+/// refusal counted while the helper waits is the non-vacuity evidence: a helper that asked only after the heal
+/// would never meet the gate.
+#[test]
+fn the_nfs_helper_retries_a_lapsed_owners_retry_later_answer_until_it_is_served() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let scene = set_the_lease_scene(&daemons);
+  let held = ObjectId(scene.held.bytes);
+  let confirmed = poll_until(&[&daemons[0]], RETIREMENT_DEADLINE, || {
+    daemons[0].fleet_lease_holds(held)
+  });
+  isolate_owner_on_the_probe_plane(&daemons, &hosts);
+  let lapsed = poll_until(&[&daemons[0]], RETIREMENT_DEADLINE, || {
+    daemons[0].fleet_lease_holds(held).map(|holds| !holds)
+  });
+  let port = daemons[0].nfs_port().expect("the daemon serves NFS");
+  let mut probe = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
+  let refused_before = read_status(&mut probe, &scene.live, 1);
+  let counted_before = lease_gate_refusals(&daemons[0]);
+  let (answer, refused_while_asked) = std::thread::scope(|scope| {
+    let live = scene.live.clone();
+    let asking = scope.spawn(move || {
+      let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
+      common::nfs::owner_and_mode(&mut stream, &live, 2)
+    });
+    let refused_while_asked = poll_until(&[&daemons[0]], RETIREMENT_DEADLINE, || {
+      Ok(lease_gate_refusals(&daemons[0]) > counted_before)
+    });
+    for daemon in &daemons {
+      daemon
+        .inject_probe_deafness(&[])
+        .expect("the isolation heals");
+    }
+    (asking.join(), refused_while_asked)
+  });
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(confirmed, "A's lease was confirmed before the isolation");
+  assert!(lapsed, "A's lease lapsed once no holder confirmed it");
+  assert_eq!(
+    refused_before, NFS3ERR_JUKEBOX,
+    "the lapsed owner's mount answered retry-later"
+  );
+  assert!(
+    refused_while_asked,
+    "the gate refused the helper's call before the heal"
+  );
+  let (mode, _, _) = answer.expect("the helper retried the retry-later answer until it was served");
+  assert_eq!(mode & 0o777, 0o644, "the helper read the held file's mode");
 }
 
 /// §4.8 "Leases and reads" (AUD-08; lease reads wait, 2026-10-04): do isolate the owner until its lease lapses,
