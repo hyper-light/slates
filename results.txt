@@ -1,2 +1,6 @@
 tested 83d64eb4f9ed195b8b1672b498095bd34222fb7e on aarch64, 4 cpus
 build exit 0
+quiet exit 0 4s load=2.20 0.86 0.31
+    presentation of 1000 files of 16384 bytes: 768.768211ms, 1000 entries; 710 probes inside it — p50 625.306µs, p99 1.255482ms, longest of all 17.795302ms; before it the longest 677.318µs
+    granted landing of 1000 files of 16384 bytes: 1.653168655s, Ok(Landed(LandingOutcome { landing: 1, state: "done", written: 1000, skipped: 0, conflicts: 0, failed: 0, bytes_written: 16384000, held: 0, durability: LandingDurability { data_synced: true, dirs_synced: true, media: false, media_requested: false, dirs: 1 }, degraded: [BarriersOnly], barriers: 250 })); 1430 probes inside it, the longest of all 52.288548ms
+    test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.42s
