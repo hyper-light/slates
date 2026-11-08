@@ -101,7 +101,10 @@ fn volume(n: u64) -> VolumeRecord {
     unique_bytes: 0,
     state: VolumeState::Live,
     lease: None,
-    owner: Principal::Uid { uid: 1000 },
+    owner: Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 1000,
+    },
     access: Vec::new(),
     created_ns: NOW_NS,
     catalog_version: 0,

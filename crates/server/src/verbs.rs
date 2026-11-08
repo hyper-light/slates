@@ -12667,7 +12667,10 @@ mod tests {
     ] {
       let line = crate::daemon::audit_on_shard_configured(
         move |state| {
-          let principal = Principal::Uid { uid: 1234 };
+          let principal = Principal::Uid {
+            host: slates_db::HostId(0),
+            uid: 1234,
+          };
           let limit = u64::try_from(files.saturating_mul(bytes.max(4096)).saturating_mul(2))
             .unwrap_or(u64::MAX)
             .saturating_add(64 << 20);

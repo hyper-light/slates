@@ -355,6 +355,8 @@ fn judge_start(supervisor: &Supervisor, watch: &mut ShardWatch, now: u64) -> Ver
     steps: 0,
     parked: false,
     cpu,
+    // The anchor judges a whole process by its CPU time; a scheduler reading is of one thread (GAPS, A-228's siblings).
+    run: None,
     now_ns: now,
   };
   let (verdict, next) = watch.judge(look, LIVENESS_BUDGET_NS);
@@ -365,7 +367,8 @@ fn judge_start(supervisor: &Supervisor, watch: &mut ShardWatch, now: u64) -> Ver
 /// What a start's verdict says when it is to be killed: `None` while it is alive.
 fn start_stuck(verdict: Verdict) -> Option<String> {
   match verdict {
-    Verdict::Alive => None,
+    // A start has no scheduler reading, so it is never found starved; were it, it would not be stuck.
+    Verdict::Alive | Verdict::Starved { .. } => None,
     Verdict::Wedged { for_ns } => Some(format!(
       "made no progress for {} ms (the {} ms liveness window)",
       for_ns / NS_PER_MS,

@@ -640,7 +640,8 @@
 >   built:** it is a task on a shard, not a thread of its own.
 > - **Fixed by A-228** (2026-11-06): the beat is written by an owned watchdog thread pinned to no core, which judges
 >   each shard in its own CPU time (A-65's rule): stuck once a window passes with no step and no CPU progress, or with a
->   window's CPU run; starved otherwise, and alive. The anchor holds the beat to the window plus its own measured
+>   window's CPU run; starved otherwise, and alive. (2026-11-08: a shard the scheduler has waiting for a CPU is starved
+>   too, however long its clock stands still; see "A starved shard was judged wedged".) The anchor holds the beat to the window plus its own measured
 >   lateness p99. Tests, each failing first where it can: `crates/server/tests/liveness.rs` — a starved control-shard
 >   poll gapped the beat 1.53 s on main and 0.26 s with A-228 (macOS arm64, load 54–70); a wedged non-control shard
 >   and a spinning one never stopped main's beat, and with A-228 stop it (1.007 s after the wedge; after 1,063 ms of the
@@ -682,6 +683,48 @@
 > on its host, so one person's accounts on several hosts are several principals: a volume shared across the fleet needs
 > an access entry for each (host, account). Whether the fleet should map accounts to one fleet principal, and who may
 > assert such a mapping (it is an authority over every node's volumes), is undecided.
+
+> **Starved is not stuck: the r3k clean rung at `CPUWeight=1` did not exercise the rule (2026-11-08, adacachy).** One
+> 3,000-client clean rung on `47de249b` (fixtures' arguments, `capped3.sh` unit, 100 ms sampler; run by the A-228 step 5
+> agent because fixtures was paused on its weekly limit) logged 0 wedged, 0 starved, 0 spinning and 0 lapsed lines. No
+> Starved line appeared and no shard thread sat 800 ms with flat CPU, so the run says nothing either way about the rule;
+> the replays and the real-thread tests carry it. It ran at load 17–22, beside loadtest-scale's `CPUWeight=1` build.
+> Baselines, on older trees: `rungs8/r3k-clean2` (3,000 clients, load 22–60) logged 8 wedged and 2 lapsed;
+> `rungs9/ab-clean-2` (10,000 clients) logged 2 wedged, 4 spinning and 1 lapsed, both wedged shards state R throughout
+> their flat windows on its samples.
+>
+> | Rung | Reconnects | Resends | Longest outage | SubmitAccepted p99 |
+> |---|---|---|---|---|
+> | `rungs8/r3k-clean2` | 86 | 420 | 1.78 s | 31.5 s |
+> | `rungs9/ab-clean-2` | 0 | 0 | 0 | 5.02 s |
+> | `rungs11-a228/r3k-clean-a228` | 0 | 0 | 0 | 2.04 s |
+>
+> The drop from the first row is not attributed to the rule: the load was lower and the tree newer. Log, samples, unit
+> list and the analyzer are under `~/.cache/slates-agents-scratch/fixtures/rungs11-a228/` on adacachy
+> (`r3k-clean-a228.log`, `.samples`, `.units`, `analyze.py`).
+
+> **A starved shard was judged wedged (found 2026-11-07 by fixtures, fixed 2026-11-08, A-228).** A shard held off its CPU
+> shows no CPU progress, as a blocked one does, so the watchdog withheld the beat and the anchor killed a live daemon. The
+> watchdog now asks the scheduler; a shard waiting for a CPU is `Starved` and goes on beating (§4.14 status). Linux reads
+> task state and run-queue wait; macOS and Windows have no per-thread wait time, so the rule goes by the state at each
+> look; with no reading the CPU clock stands alone. Record:
+> `docs/bugs/2026-11-08-a-starved-shard-was-judged-wedged.md`. Still open from it:
+> - **A kill the rule does not touch (open).** `rungs9/ab-clean-2`'s lapse came 6.4 s after its last wedged line and right
+>   after `shard 0 is spinning: 1045 ms of CPU without a step`, on a shard that had run 580 ms of CPU in the last 1.3 s.
+>   A poll that long at `CPUWeight=1` is still killed; whether it is a real non-yielding task is not established.
+> - **Siblings with the same blind spot (open, reported, unchanged).** `crate::observe::ShardTime`
+>   (`next_window_ns`), used by observations and the cross-shard waits (`xshard`), gives up on a window with no CPU
+>   progress, so a starved shard's observation or call can end early. The anchor's start judgment
+>   (`crates/cli/src/anchor.rs`, `process_clock`) judges a whole process by CPU time, has no thread to ask about, and
+>   passes no reading: a start starved for a whole window is still killed.
+> - **A transitive wait reads as stuck (open).** A shard blocked for a whole window on something held by a starved thread
+>   is never runnable itself, so it is wedged by this rule. Not measured. Fixtures' shard 1 (S S S R R S S) may be one.
+> - **macOS is proven by replays (limit).** A full window of flat CPU came in 1 of 20 CI runs, so its real-thread test
+>   exercised the reader, and the rule's replays carry the rule there.
+> - **`a_spinning_shard_stops_the_beat` fails at extreme load (open).** It waits 10 s of wall for a window of the shard's
+>   CPU: it failed on an 18-CPU Mac at load 185 and 209, and passed 8 of 8 at load 44-105 with this rule and 8 of 8
+>   before it, 10 of 10 on CI macOS. The rule does not change the spinning path, but the code before it was not run at
+>   load 185 or above, so a difference there is not excluded.
 
 > **`LIVENESS_BUDGET_NS` is still a fixed second (R3 debt, 2026-11-06; follow-on, not A-228).** It is A-228's window and
 > the reply-deadline unit of about 60 files (the client's and the server's deadlines, observations, the scatter's room
