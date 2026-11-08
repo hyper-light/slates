@@ -70,6 +70,8 @@ const LIVE_WHOLE: &str = "fleet.live.whole";
 const LIVE_IMAGE: &str = "fleet.live.install_image";
 /// Counter: an install built to send a holder, the volume's whole state copied on the owner's shard.
 const LIVE_INSTALL_BUILT: &str = "fleet.live.install_built";
+/// Counter: an install a holder applied (its log replaced by the owner's whole state).
+const LIVE_INSTALL_TAKEN: &str = "fleet.live.install_taken";
 /// Counter: entries appended to a live volume's log on this owner shard.
 const LIVE_APPENDED: &str = "fleet.live.appended";
 /// Counter: entries a holder refused to keep (over its bound, unauthorized, malformed).
@@ -1539,6 +1541,10 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
         }
       }
       Next::Install => {
+        // A fresh image is on its way ([`send_to_reached`]); one sent now would land the holder behind the tail.
+        if live.owes_image {
+          continue;
+        }
         let Some((head, payload)) = &live.whole else {
           stale_checkpoint = true;
           continue;
@@ -1682,7 +1688,8 @@ fn lane_ended(state: &mut ShardState, holder: HostId, objects: Vec<ObjectId>, an
 }
 
 /// `holder`'s record session is established again (on the control shard): every shard sends it what it lacks at once,
-/// not at the next record period, so a resumed holder's catch-up does not wait on the period.
+/// not at the next record period, so a resumed holder's catch-up does not wait on the period. An install it is owed waits
+/// for a fresh image ([`send_to_reached`]).
 pub(crate) fn holder_reached(holder: HostId) {
   let Some((origin, shards)) = state::with_state(|s| (s.shard, s.shards.clone())) else {
     return;
@@ -1692,13 +1699,24 @@ pub(crate) fn holder_reached(holder: HostId) {
   }
 }
 
-/// Sends `holder` what this shard's live volumes that had given it up owe it ([`holder_reached`]).
+/// Sends `holder` what this shard's live volumes that had given it up owe it ([`holder_reached`]). A holder owed an
+/// install while the image is behind the log waits for one made at the log's head: the next publication makes it, or the
+/// record period for an idle writer ([`refresh_image`]). The image a holder fell behind on was a median of 1,332 and
+/// 1,395 entries old when last built, while an install's own transit added 0 or 1, so it landed past the retained tail
+/// and took a second whole install (`live_chaos`'s rolling partition, diag-live-durability-54).
 fn send_to_reached(state: &mut ShardState, holder: HostId) {
   let volumes: Vec<[u8; 16]> = state
     .live
     .shipping
     .iter_mut()
     .filter_map(|(volume, live)| {
+      let stale = live
+        .whole
+        .as_ref()
+        .is_some_and(|(head, _)| Some(*head) != live.shipper.head());
+      if stale && live.shipper.pending(holder) == Next::Install {
+        live.owes_image = true;
+      }
       let was = live.unreachable.contains(&holder);
       live
         .unreachable
@@ -1805,10 +1823,19 @@ async fn ship_lane(
     // Each message under its own budget: the liveness budget plus its transfer on the session it rides, so an install of
     // the whole volume is not given up the moment an entry would be (`exchange_budget`).
     let exchange = exchange_budget(send.bytes.len(), &sessions);
+    let diag_had = !sessions.is_empty();
+    let diag_began = slates_rt::futures::now_ns();
     let exchanged =
       slates_cluster::live::exchange((send.stream, &send.bytes), sessions, exchange, |_, _| true)
         .await;
     let answered = !exchanged.replies.is_empty();
+    if diag_had && send.stream == slates_cluster::live::LIVE_STATE_STREAM {
+      let wall = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos());
+      let _ = std::io::Write::write_all(&mut std::io::stderr(), format!(
+        "LD-LANE install wall_ns {wall} holder {} bytes {} budget_ns {} took_ns {} answered {answered}\n",
+        holder.0, send.bytes.len(), exchange.max_deadline_ns(), slates_rt::futures::now_ns().saturating_sub(diag_began),
+      ).as_bytes());
+    }
     if !answered {
       let _ = state::with_state(|s| s.count(LIVE_UNANSWERED, 1));
     }
@@ -1856,8 +1883,12 @@ fn exchange_budget(
       .checked_div(endpoint.congestion_window().max(1))
       .unwrap_or(0)
   });
+  // Diag only (live-durability-58, never on main): an install's budget held at a floor, standing in for the uncapped case.
+  let floor_ns = if bytes >= 65_536 {
+    std::env::var("SLATES_DIAG_INSTALL_FLOOR_MS").ok().and_then(|ms| ms.parse::<u64>().ok()).map_or(0, |ms| ms.saturating_mul(1_000_000))
+  } else { 0 };
   slates_cluster::CommitBudget::hard(
-    live.deadline_ns.saturating_add(transfer_ns),
+    live.deadline_ns.saturating_add(transfer_ns).max(floor_ns),
     live.poll_interval_ns,
   )
 }
@@ -2239,6 +2270,16 @@ pub(crate) fn serve_install(
   peer: HostId,
   request: &[u8],
 ) -> Vec<u8> {
+  // Diag only (live-durability-58, never on main): stop this daemon once, armed by a file named for its pid, before it
+  // answers an install: a holder that dies mid-install, the request delivered and the reply never sent.
+  if let Ok(dir) = std::env::var("SLATES_DIAG_STOP_DIR") {
+    let pid = std::process::id();
+    if std::fs::remove_file(format!("{dir}/{pid}")).is_ok() {
+      let _ = std::process::Command::new("kill").args(["-STOP", &pid.to_string()]).status();
+    }
+  }
+  // Diag only (live-durability-53, never on main).
+  let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("LD-SERVE wall_ns {} install bytes {}\n", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos()), request.len()).as_bytes());
   let object = slates_db::live::object_of_state(request);
   let bound = match admitted(state, local, peer, object) {
     Ok(bound) => bound,
@@ -2259,11 +2300,15 @@ pub(crate) fn serve_install(
         held.bytes = 0;
         keep(held, &install.state, bound)?;
         held.replica.commit(install.epoch, head);
-        Ok(Some(head))
+        Ok((Some(head), true))
       }
-      Admitted::Held => Ok(held.replica.head()),
+      Admitted::Held => Ok((held.replica.head(), false)),
     }
   });
+  if matches!(reply, Ok((_, true))) {
+    state.count(LIVE_INSTALL_TAKEN, 1);
+  }
+  let reply = reply.map(|(head, _)| head);
   match &reply {
     Err(error) => count_refused(state, refused_counter(error)),
     Ok(_) => state.count(LIVE_HELD, 1),
