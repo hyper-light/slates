@@ -779,16 +779,9 @@ fn answer(state: &mut ShardState, entry: Awaiting, reply: slates_ipc::protocol::
   let Some(route) = entry.route else {
     return;
   };
-  let delivery = slates_rt::task::SpawnRequest::new(
-    Box::pin(async move {
-      crate::state::deliver(route.client_index, route.request, recorded, true);
-    }),
-    None,
-  );
-  if slates_rt::registry::send_control(
-    route.shard,
-    slates_rt::control::Control::Spawn(Box::new(delivery)),
-  )
+  if crate::xshard::hand_reply_home(route.shard, move || {
+    crate::state::deliver(route.client_index, route.request, recorded, true);
+  })
   .is_err()
   {
     state.count(LIVE_UNDELIVERED, 1);
@@ -1753,14 +1746,12 @@ async fn ship_lane(
     let exchanged =
       slates_cluster::live::exchange((send.stream, &send.bytes), sessions, exchange, |_, _| true)
         .await;
-    let answered = !exchanged.replies.is_empty();
+    let (replies, stragglers) = settle_sessions(exchanged);
+    let answered = !replies.is_empty();
     if !answered {
       let _ = state::with_state(|s| s.count(LIVE_UNANSWERED, 1));
     }
-    lose_links(&exchanged.unanswered);
-    crate::fleet::return_sessions(exchanged.reusable);
-    let replies: Vec<(ObjectId, HostId, Vec<u8>)> = exchanged
-      .replies
+    let replies: Vec<(ObjectId, HostId, Vec<u8>)> = replies
       .into_iter()
       .map(|(host, bytes)| (send.object, host, bytes))
       .collect();
@@ -1769,7 +1760,7 @@ async fn ship_lane(
       crate::xshard::run_on_counted(control, origin, move |s| fold_into(s, replies));
     }
     // After the answers are on their way to the owner, so durability waits for no straggler.
-    finish_stragglers(origin, send.object, exchanged.stragglers).await;
+    finish_stragglers(origin, send.object, stragglers).await;
     if !answered {
       return false;
     }
@@ -1928,6 +1919,24 @@ async fn finish_stragglers(
   if !done {
     settle_stragglers(origin, object, stragglers);
   }
+}
+
+/// Puts one live exchange's sessions where they belong, on the control shard where the links live: each answering
+/// holder's session back to its link ([`crate::fleet::return_sessions`]), and each unanswered holder's link dropped to be
+/// dialed afresh ([`lose_links`]). The replies and the stragglers still in flight are handed back, the stragglers for
+/// the caller to finish or queue. Every caller of `slates_cluster::live::exchange` goes through it, so none can leave a
+/// holder's slot lent with no session behind it: a timed-out request's session is dropped inside the exchange, and
+/// the takeover's phase one and log fetch read only the answered sessions, so the slot of a holder whose report missed
+/// the liveness budget stayed lent for good and every later phase one skipped it (KIND wan-loss: 425 waits for the
+/// quorum with the holder alive at the head, CI diag-raft-chaos-final-41;
+/// `docs/bugs/2026-11-08-a-takeover-question-that-timed-out-left-its-holders-link-lent-for-good.md`).
+#[must_use]
+fn settle_sessions(
+  exchanged: slates_cluster::live::Exchanged,
+) -> (Vec<(HostId, Vec<u8>)>, slates_cluster::Stragglers) {
+  lose_links(&exchanged.unanswered);
+  crate::fleet::return_sessions(exchanged.reusable);
+  (exchanged.replies, exchanged.stragglers)
 }
 
 /// Drops the record links of holders that answered nothing (on the control shard, where the links live): their link
@@ -2488,6 +2497,34 @@ pub(crate) struct Fetched {
   pub(crate) naming: Option<crate::head::HeadNaming>,
 }
 
+/// Phase one's question, on the control shard: each of `others` with a session in its link is asked to raise its copy
+/// of `object`'s fence to `epoch` and report its head and kept bytes (`slates_db::live::Report`), under `budget`. The
+/// replies, each with the host that sent it; a host with no session to ride, or none that answered, is not among them.
+pub(crate) async fn ask_reports(
+  object: ObjectId,
+  epoch: slates_db::register::HostEpoch,
+  others: &[HostId],
+  budget: slates_cluster::CommitBudget,
+) -> Vec<(HostId, Vec<u8>)> {
+  let sessions =
+    crate::fleet::take_sessions("fleet.lent_to.live_takeover", |host| others.contains(&host));
+  let request = slates_db::live::Report { object, epoch }.encode();
+  let exchanged = slates_cluster::live::exchange(
+    (slates_cluster::live::LIVE_STATE_STREAM, &request),
+    sessions,
+    budget,
+    |_, _| false,
+  )
+  .await;
+  let (replies, stragglers) = settle_sessions(exchanged);
+  settle_stragglers(
+    state::with_state(|s| s.shard).unwrap_or_default(),
+    object,
+    stragglers,
+  );
+  replies
+}
+
 /// Phase one for a live volume (A-200), on the control shard: raises this node's own copy's fence to `epoch`, asks every
 /// other candidate in `candidates` to do the same and report its head and kept bytes (`slates_db::live::Report`), adopts
 /// the greatest head among the answers (`slates_db::live::adopt`), and then fetches the adopted holder's log alone
@@ -2535,23 +2572,7 @@ pub(crate) async fn fetch(
   }
   // Phase one proper: every other candidate and recorded holder reports its head and the bytes it keeps, a few bytes
   // each, within the liveness budget whatever the path.
-  let sessions =
-    crate::fleet::take_sessions("fleet.lent_to.live_takeover", |host| others.contains(&host));
-  let request = slates_db::live::Report { object, epoch }.encode();
-  let exchanged = slates_cluster::live::exchange(
-    (slates_cluster::live::LIVE_STATE_STREAM, &request),
-    sessions,
-    crate::fleet::live_budget(),
-    |_, _| false,
-  )
-  .await;
-  crate::fleet::return_sessions(exchanged.reusable);
-  settle_stragglers(
-    state::with_state(|s| s.shard).unwrap_or_default(),
-    object,
-    exchanged.stragglers,
-  );
-  for (host, bytes) in exchanged.replies {
+  for (host, bytes) in ask_reports(object, epoch, &others, crate::fleet::live_budget()).await {
     if let Ok((Ok(head), bytes)) = slates_db::live::decode_reported(&bytes) {
       reports.push((host, head));
       kept.insert(host, bytes);
@@ -2672,14 +2693,13 @@ async fn fetch_log(
     |_, _| false,
   )
   .await;
-  crate::fleet::return_sessions(exchanged.reusable);
+  let (replies, stragglers) = settle_sessions(exchanged);
   settle_stragglers(
     state::with_state(|s| s.shard).unwrap_or_default(),
     object,
-    exchanged.stragglers,
+    stragglers,
   );
-  let fetched = exchanged
-    .replies
+  let fetched = replies
     .into_iter()
     .find(|(host, _)| *host == holder)
     .ok_or("fleet.live.takeover_waits_log")?;
@@ -3092,7 +3112,10 @@ mod tests {
         name: "v".to_owned(),
         size: slates_db::catalog::SizeClass::Bounded { limit: 1 << 20 },
         names: slates_db::catalog::NamePolicy::Exact,
-        owner: slates_db::catalog::Principal::Uid { uid: 501 },
+        owner: slates_db::catalog::Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 501,
+        },
         require_locked: false,
         access: Vec::new(),
         live_shipped: true,

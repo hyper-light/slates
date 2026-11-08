@@ -58,6 +58,32 @@ const TAKEOVER_STALE_CONFIGURATION: &str = "fleet.takeover.stale_configuration";
 /// The status count of takeover rounds refused because no epoch could supersede what they must fence — a
 /// holder's fence or a held record at `u64::MAX` (AUD-29-26's sibling): the round never reuses an epoch.
 const TAKEOVER_EPOCH_EXHAUSTED: &str = "fleet.takeover.epoch_exhausted";
+/// The status count of takeover pages a holder did not answer because the round's configuration differs from the
+/// one it installed: refused `ConfigurationStale` when the round's is older, unanswered (the holder fetches) when it
+/// is newer, or when the holder's council has not installed its own placement's version yet. Format: a refusal name in
+/// the daemon's status report.
+const TAKEOVER_PAGE_UNMATCHED: &str = "fleet.takeover.page_unmatched";
+/// The status count of takeover periods whose page requests went unsent: every member asked was lent elsewhere or had
+/// no session. Format: a refusal name in the daemon's status report.
+const TAKEOVER_PAGES_UNSENT: &str = "fleet.takeover.pages_unsent";
+/// The status count of page answers a successor could not bind to its request (no promise, another holder's, or
+/// another round's), which count as no promise. Format: a refusal name in the daemon's status report.
+const TAKEOVER_PAGE_UNBOUND: &str = "fleet.takeover.page_unbound";
+/// The status count of takeover periods skipped because this node's placement is behind its council's configuration.
+/// Format: a refusal name in the daemon's status report.
+const TAKEOVER_ROUND_BEHIND: &str = "fleet.takeover.round_behind";
+/// The status count of adoptions this period that did not place: the re-committed record reached too few candidates.
+/// The object stays learned and is adopted again next period. Format: a refusal name in the daemon's status report.
+const TAKEOVER_ADOPT_UNPLACED: &str = "fleet.takeover.adopt_unplaced";
+/// Of [`TAKEOVER_ADOPT_UNPLACED`]: this node's own hold of the adopted record was refused or is not a candidate.
+const TAKEOVER_ADOPT_LOCAL_REFUSED: &str = "fleet.takeover.adopt_unplaced.local";
+/// Of [`TAKEOVER_ADOPT_UNPLACED`]: no other candidate's session could be taken for the commit.
+const TAKEOVER_ADOPT_NO_HOLDERS: &str = "fleet.takeover.adopt_unplaced.no_holders";
+/// Of [`TAKEOVER_ADOPT_UNPLACED`]: the candidates taken answered without a binding acknowledgement.
+const TAKEOVER_ADOPT_UNACKED: &str = "fleet.takeover.adopt_unplaced.unacked";
+/// The status count of learned objects a period left unadopted because a recovery cohort had not promised them yet.
+/// Format: a refusal name in the daemon's status report.
+const TAKEOVER_UNPROMISED: &str = "fleet.takeover.unpromised";
 
 /// The status refusal count under which a holder records a takeover page it deferred because its own answers
 /// to the retired owner's probes may still feed that owner's lease (§4.8 "Leases and reads", AUD-08); the
@@ -277,6 +303,7 @@ pub(crate) fn serve_host_prepare(
   }
   let installed = state.fleet.configuration().version;
   if prepare.generation != installed || state.council.configuration().version != installed {
+    state.count(TAKEOVER_PAGE_UNMATCHED, 1);
     if prepare.generation > installed {
       state.config_refresh_wanted = true;
       return Vec::new();
@@ -364,6 +391,7 @@ fn list_page(state: &mut ShardState, local: HostId, prepare: &HostPrepare) -> Ho
     entries: Vec::new(),
     next: None,
     fenced: None,
+    unpromised: 0,
   };
   let mut used = slates_db::register::HOST_PROMISE_HEADER_BYTES;
   let mut last = prepare.after;
@@ -381,16 +409,44 @@ fn list_page(state: &mut ShardState, local: HostId, prepare: &HostPrepare) -> Ho
         used = used.saturating_add(size);
         promise.entries.push((object, highest));
       }
+      // The acceptor holds nothing for this object, and promised that by raising its fence.
       Ok(None) => {}
-      Err(RegisterError::StaleEpoch { current }) => {
-        let fence = HostEpoch(current);
-        promise.fenced = Some(promise.fenced.map_or(fence, |seen| seen.max(fence)));
-      }
-      Err(_) => {}
+      Err(refusal) => note_refusal(&mut promise, refusal, &mut state.refusals),
     }
     last = Some(object);
   }
   promise
+}
+
+/// Counter: a copy a holder could not promise for a reason other than a higher fence (a generation newer than the
+/// asker's), so its page is no answer for it.
+const TAKEOVER_PAGE_UNPROMISED: &str = "fleet.takeover.page_unpromised";
+
+/// Records why `promise` could not cover one held copy. A fence above the epoch is the asker's to retry above; any
+/// other refusal leaves the page short of an answer ([`HostPromise::unpromised`]), since a copy left out would otherwise
+/// read as a copy not held, and a successor could adopt an older record over it.
+fn note_refusal(
+  promise: &mut HostPromise,
+  refusal: RegisterError,
+  counters: &mut BTreeMap<&'static str, u64>,
+) {
+  if let RegisterError::StaleEpoch { current } = refusal {
+    let fence = HostEpoch(current);
+    promise.fenced = Some(promise.fenced.map_or(fence, |seen| seen.max(fence)));
+  } else {
+    promise.unpromised = promise.unpromised.saturating_add(1);
+    let count = counters.entry(TAKEOVER_PAGE_UNPROMISED).or_insert(0);
+    *count = count.saturating_add(1);
+  }
+}
+
+/// How far a holder's answer has come: where its next page starts, and whether it has answered in full. A page that
+/// could not promise a copy it holds is not a full answer, however little was left to list.
+fn page_of(promise: &HostPromise) -> Page {
+  Page {
+    after: promise.next,
+    complete: promise.next.is_none() && promise.unpromised == 0,
+  }
 }
 
 /// Promises `object` to the asker: installs the asker's authority under the round's generation and runs the
@@ -484,6 +540,7 @@ pub(crate) fn begin_round(
 ) -> Option<Vec<(HostId, HostPrepare)>> {
   let regional = state.council.configuration().clone();
   if state.fleet.configuration().version != regional.version {
+    state.count(TAKEOVER_ROUND_BEHIND, 1);
     return None;
   }
   let Some(first_epoch) = initial_epoch(state, &regional, departed, local) else {
@@ -633,6 +690,7 @@ async fn ask_pages(
   let wanted: BTreeMap<HostId, HostPrepare> = requests.into_iter().collect();
   let sessions = take_sessions("fleet.lent_to.ask_pages", |host| wanted.contains_key(&host));
   if sessions.is_empty() {
+    let _ = state::with_state(|s| s.count(TAKEOVER_PAGES_UNSENT, 1));
     return None;
   }
   let sent: Vec<HostId> = sessions.iter().map(|(host, _)| *host).collect();
@@ -648,6 +706,7 @@ async fn ask_pages(
   let mut recovered = Vec::with_capacity(replied.len());
   let mut answers = Vec::new();
   let mut stale = None;
+  let mut unbound: u64 = 0;
   for (host, reply, endpoint) in replied {
     if let Some(slates_db::register::Refusal::ConfigurationStale { version }) =
       slates_db::register::decode_refusal(&reply.bytes)
@@ -661,6 +720,8 @@ async fn ask_pages(
         .is_some_and(|prepare| promise.binds(prepare))
     {
       answers.push((host, promise));
+    } else {
+      unbound = unbound.saturating_add(1);
     }
     recovered.push((host, endpoint));
   }
@@ -675,6 +736,9 @@ async fn ask_pages(
     if stale.is_some_and(|version| version > s.council.configuration().version) {
       s.config_refresh_wanted = true;
       s.count(TAKEOVER_STALE_CONFIGURATION, 1);
+    }
+    if unbound > 0 {
+      s.count(TAKEOVER_PAGE_UNBOUND, unbound);
     }
     fold_answers(s, departed, answers);
   });
@@ -694,6 +758,7 @@ fn fold_answers(state: &mut ShardState, departed: HostId, answers: Vec<(HostId, 
       take.fenced = Some(take.fenced.map_or(fence, |seen| seen.max(fence)));
       continue;
     }
+    let page = page_of(&promise);
     for (object, highest) in promise.entries {
       if !take.adopted.contains(&object) {
         take
@@ -703,13 +768,7 @@ fn fold_answers(state: &mut ShardState, departed: HostId, answers: Vec<(HostId, 
           .insert(host, highest);
       }
     }
-    take.pages.insert(
-      host,
-      Page {
-        after: promise.next,
-        complete: promise.next.is_none(),
-      },
-    );
+    take.pages.insert(host, page);
   }
 }
 
@@ -730,6 +789,7 @@ pub(crate) fn ready_objects(
   };
   let mut ready = Vec::new();
   let mut lost = Vec::new();
+  let mut unpromised: u64 = 0;
   for (object, reports) in &take.learned {
     let mut promised_everywhere = true;
     for cohort in regional.recovery_cohorts(departed, *object) {
@@ -756,7 +816,13 @@ pub(crate) fn ready_objects(
     }
     if promised_everywhere && let Some(newest) = reports.values().cloned().reduce(newest_of) {
       ready.push((*object, newest));
+    } else if !lost.contains(object) {
+      unpromised = unpromised.saturating_add(1);
     }
+  }
+  if unpromised > 0 {
+    let count = state.refusals.entry(TAKEOVER_UNPROMISED).or_insert(0);
+    *count = count.saturating_add(unpromised);
   }
   for object in lost {
     take.learned.remove(&object);
@@ -860,6 +926,7 @@ async fn adopt(
     host != local && shape.candidates.contains(&host)
   });
   let taken: Vec<HostId> = holders.iter().map(|(host, _)| *host).collect();
+  let no_holders = taken.is_empty();
   let committed = commit_record(
     local,
     &mut acceptor,
@@ -890,6 +957,20 @@ async fn adopt(
     LateReplies::Discard,
   );
   return_sessions(committed.reusable);
+  let acked = match &committed.outcome {
+    Ok(placement)
+    | Err(ClusterError::Uncertain { placement } | ClusterError::NotPlaced { placement }) => {
+      placement.acked.clone()
+    }
+    Err(_) => Vec::new(),
+  };
+  let unplaced_cause = if !acked.contains(&local) {
+    TAKEOVER_ADOPT_LOCAL_REFUSED
+  } else if no_holders {
+    TAKEOVER_ADOPT_NO_HOLDERS
+  } else {
+    TAKEOVER_ADOPT_UNACKED
+  };
   let placement = match committed.outcome {
     Ok(placement) if placement.placed(quorum) => Some(placement),
     Ok(_) | Err(ClusterError::Uncertain { .. } | ClusterError::NotPlaced { .. }) => None,
@@ -899,6 +980,9 @@ async fn adopt(
     s.holder_records.insert(object, acceptor);
     if let Some(placement) = placement {
       record_adoption(s, departed, object, &record, placement, local);
+    } else {
+      s.count(TAKEOVER_ADOPT_UNPLACED, 1);
+      s.count(unplaced_cause, 1);
     }
   });
   Some(dispatch)
@@ -983,7 +1067,112 @@ fn round_done(state: &ShardState, departed: HostId, local: HostId) -> bool {
 mod tests {
   use super::*;
   use crate::head::{HeadKey, HeadSealing};
-  use slates_db::register::HostEpoch;
+  use slates_db::register::{Authority, HostEpoch, HostId as RegisterHost, Record};
+
+  /// §4.8 phase one: a holder's page is a promise only for what it could actually promise. Do: have a real acceptor,
+  /// holding a record under a newer generation, refuse a prepare from an older one, and record that refusal in a page;
+  /// also record a higher fence. Expect: the generation refusal leaves the page not complete and counted, so the holder is
+  /// not read as holding nothing; the fence is left for the asker to retry above and does not.
+  #[test]
+  fn a_holder_that_could_not_promise_a_copy_has_not_answered_for_it() {
+    let host = RegisterHost(7);
+    let object = ObjectId::new(host, 1);
+    let mut acceptor = Acceptor::new(
+      RegisterHost(2),
+      Authority {
+        generation: 9,
+        owner: host,
+      },
+    );
+    acceptor
+      .accept(&Record {
+        owner: host,
+        object,
+        sequence: 1,
+        epoch: HostEpoch(1),
+        generation: 9,
+        value: b"newer".to_vec(),
+      })
+      .unwrap();
+    let prepare = HostPrepare {
+      departed: host,
+      owner: RegisterHost(3),
+      epoch: HostEpoch(4),
+      generation: 5,
+      after: None,
+    };
+    let refusal = promise_object(&mut acceptor, object, &prepare).unwrap_err();
+    let mut promise = HostPromise {
+      holder: RegisterHost(2),
+      departed: host,
+      epoch: prepare.epoch,
+      generation: prepare.generation,
+      entries: Vec::new(),
+      next: None,
+      fenced: None,
+      unpromised: 0,
+    };
+    let mut counters = BTreeMap::new();
+    assert!(page_of(&promise).complete, "an empty answer is a full one");
+    note_refusal(&mut promise, refusal, &mut counters);
+    assert_eq!(promise.unpromised, 1);
+    assert!(
+      !page_of(&promise).complete,
+      "a copy left out is not answered for"
+    );
+    assert_eq!(counters.get(TAKEOVER_PAGE_UNPROMISED), Some(&1));
+
+    let mut fenced = HostPromise {
+      unpromised: 0,
+      ..promise.clone()
+    };
+    note_refusal(
+      &mut fenced,
+      RegisterError::StaleEpoch { current: 8 },
+      &mut counters,
+    );
+    assert_eq!(fenced.fenced, Some(HostEpoch(8)));
+    assert_eq!(
+      fenced.unpromised, 0,
+      "the fence is the asker's to retry above"
+    );
+  }
+
+  /// §4.8 phase one: `None` from a holder means it holds nothing, so the empty promise stands. Do: prepare on a fresh
+  /// acceptor and on one holding a record. Expect: `None` and the record.
+  #[test]
+  fn a_holder_lists_every_copy_it_holds_and_only_those() {
+    let host = RegisterHost(7);
+    let object = ObjectId::new(host, 1);
+    let authority = Authority {
+      generation: 5,
+      owner: host,
+    };
+    let prepare = HostPrepare {
+      departed: host,
+      owner: host,
+      epoch: HostEpoch(4),
+      generation: 5,
+      after: None,
+    };
+    let mut empty = Acceptor::new(RegisterHost(2), authority);
+    assert_eq!(promise_object(&mut empty, object, &prepare), Ok(None));
+    let mut holding = Acceptor::new(RegisterHost(2), authority);
+    holding
+      .accept(&Record {
+        owner: host,
+        object,
+        sequence: 1,
+        epoch: HostEpoch(1),
+        generation: 5,
+        value: b"held".to_vec(),
+      })
+      .unwrap();
+    assert!(matches!(
+      promise_object(&mut holding, object, &prepare),
+      Ok(Some(_))
+    ));
+  }
 
   fn sealed(keys: &[u64], manifest: u8) -> HeadValue {
     HeadValue {

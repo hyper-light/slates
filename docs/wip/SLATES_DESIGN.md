@@ -1455,6 +1455,26 @@ cluster.
 
 > **Status (2026-09-25, A-31: the shard learns its wake and attributes its long polls).** The boot probe's mean wake is `quick` on a virtual machine: at a coefficient of variation of five to seven, ±5 % needs 38,000–75,000 wakes where the 250 ms probe buys three to six thousand. A shard built from a profile now carries that mean as the prior of an online estimate (`WakeTracking`; `slates_machine::wake::WakeEstimate`, an exponentially weighted mean over about `2^shift` wakes, `shift` = ⌈log₂ (1.96 · sd / (0.05 · mean))²⌉ from the probe's own spread, kept in fixed point so no small correction rounds away) and folds in each wake it pays: the first sender to kick a park stamps the host clock, and the woken shard times the stamp to its own return. Only the probe's event counts — a sleeper woken: a stamp from before the park's announcement is stale, one from the park's setup found the shard awake, and on Linux a wait across which the thread's voluntary context switches (`getrusage(RUSAGE_THREAD)`) did not move never slept; each is counted (`wake_stale`, `wake_unslept`), none is measured. The step quantum, the idle spin (× the daemon's idle-window ratio), the I/O harvest cadence, the destroy and archive slices (`DaemonConfig::step_quantum_ns`) and the serve loop's idle window read the estimate live; the timer tick, fixed by the wheel's construction, keeps the boot mean. Each shard's estimate is mirrored in its pulse (`ShardPulse::wake_cost_ns`) and printed in the fleet suite's diagnostics. A poll past the quantum by the wall clock is now attributed (`slates_rt::attribution`): the task's when it ran past the quantum on the CPU or waited inside a call (the base plane's synchronous `pread`; the runtime's yield to a full peer ring), the host's when it stayed within the quantum on the CPU and never waited (preempted, or its virtual CPU stolen), else unattributed. The shard reads the thread's CPU clock and (Linux) its voluntary switches only at the end of a long poll and, while a long poll went unattributed, at each step's start and wait's end; a busy period with no long poll stops the reads. Measured in a Linux container on Apple silicon (2026-09-25, best of five rounds of 200,000 calls): `CLOCK_THREAD_CPUTIME_ID` 155–161 ns, `getrusage(RUSAGE_THREAD)` 130–134 ns. Proven by use in `crates/rt/tests/wake_estimate.rs` (a sleeping shard's kicks teach the estimate; a spinning poll is the task's; a sleeping poll is the task's on Linux and unattributed on macOS; a runnable poll held off its CPU by a pinned competitor is the host's, Linux) and the attribution module's cfg-free unit tests; 30 of 30 repeated runs on each platform. Record: `docs/bugs/2026-09-25-wake-estimate-frozen-at-boot-and-preemptions-counted-as-long-steps.md`. Only a shard that tracks an estimate on a real clock times its wakes (`Parking::time_wakes`, set as it is built): a simulated shard's parks and kicks read no host clock (D-20), which the first push broke — callgrind faulted in rustix's vDSO setup under the simulation's instruction-count benches, and Miri refused the boot clock (`docs/bugs/2026-09-25-simulated-parks-read-the-host-clock.md`).
 
+> **Status (2026-11-07, the control shard is sized for what its forward lane admits).** Every shard's arena, control
+> channel (bounded by the same capacity) and timers were sized for its own clients with one request each, while the
+> control shard runs every shard's forwards to other nodes and its lane admits `clients_per_shard × slots × shards`
+> (164,864 against 10,314 on CI's runners). A forward refused at admission was dropped unrun and its client waited for
+> good (117 refused in fixtures' f = 1 replica-kill rung), and one refused at the channel was answered `HomedElsewhere`.
+> - The runtime builds a shard from its own capacity when given one (`Runtime::start_sized`, `ShardCapacity`).
+> - The daemon gives the control shard its lane's bound beyond every shard's share
+>   (`DaemonConfig::control_shard_capacity`, logged at boot).
+> - A full channel is answered `Overloaded`, retryable under the same id.
+> - A task owing a client its reply answers it if dropped unrun (`xshard::AnswerUnstarted`), and a reply carried home
+>   runs on the client's shard whether that shard's arena admits it or not (`xshard::send_reply_home`,
+>   `hand_reply_home`).
+>
+> Test: `a_silent_owner_leaves_no_forward_the_lane_admitted_unrun` (about 20,700 forwards in flight through one control
+> shard, none refused). Records: `docs/bugs/2026-11-07-a-forward-refused-at-admission-left-its-client-waiting.md` and
+> `docs/bugs/2026-11-07-the-control-shard-could-not-run-what-its-lane-admitted.md`. Owed:
+> - a same-node owner shard receives forwards from every shard's clients and is sized for its own (answered
+>   `Overloaded` past it);
+> - the fleet's tasks are added to every shard though they run on the control shard alone.
+
 **Failure matrix.** Driver setup refused (seccomp): Masked (epoll). Task arena full: Refused
 (`TooManyTasks`, admission). A task exceeding the bounded-work rule (a poll past the step quantum on
 the CPU, or waiting inside a call past it): Degraded, counted (`long_steps`, `blocked_steps`), the
@@ -2010,6 +2030,19 @@ neither the server nor a mounted client is granted device activation by a volume
 Device-metadata preservation is a separate, unimplemented decision. Mounted acceptance
 must exercise local communication and isolation between clones as well as namespace calls.
 
+**A read-only attachment is a read-only file system (decided 2026-11-08, from POSIX).** An attachment that may read but
+not write, and a snapshot's view, refuse every change as POSIX's read-only file system does: `EROFS`, at the open for
+an open for writing (a write access mode or `O_TRUNC`) and at every mutating verb. One mapping makes it, the bridge's
+`authorize_write` (`VfsError::ReadOnly`), carried by every edge: FUSE, virtio-fs and the vhost route answer `EROFS`
+(the DAX windows' writable asks too); NFS answers `NFS3ERR_ROFS` and `NFS4ERR_ROFS`; WinFsp answers
+`STATUS_MEDIA_WRITE_PROTECTED` and reports the volume read-only (`ReadOnlyVolume`), so Windows refuses most changes
+before they reach a shard, and its `CanDelete` asks the bridge (`authorize_change`) before Windows marks a file for a
+delete that happens at the reply-less cleanup; the wire answers `ReadOnlyVolume`. An attachment with no rights at all is refused for
+permission (`EPERM`, `NFS3ERR_PERM`, `STATUS_ACCESS_DENIED`). A kernel that mounts the attachment `ro` (Linux FUSE,
+macOS NFS) refuses most changes itself before the request, with the same `EROFS`. Until 2026-11-08 the bridge granted
+an open for writing and answered each change `NotPermitted`
+(`docs/bugs/2026-11-08-a-read-only-attachment-was-not-a-read-only-file-system.md`).
+
 **Kubernetes publication without privilege (AUD-29-75; decided 2026-10-01).** Kubernetes has two ways to put a
 mount a component makes into a pod, and both need a privilege R10 forbids:
 
@@ -2549,6 +2582,15 @@ before the report is published, so a tool never reads attributes newer than the 
 > barrier's publication to its reply's write, is microseconds wide, too narrow for a kill to target, so no
 > end-to-end test reaches it. Per-shard channels were measured and rejected (A-62). Every acknowledged write now
 > survives (A-63).
+> **A `FORGET` after the last publication is logged (2026-11-08, A-154's sibling).** A `FORGET` gives back lookup
+> references the kernel held, takes no reply, and is never resent, so one served after the last publication and lost
+> with its daemon left the references the image recorded counted for good: an unlinked file the kernel had let go was
+> never reclaimed. Each turn's `FORGET`s are logged beside the writes in the write log (A-63; a record of its own kind:
+> the attachment, the inode and the count), and the replay gives them back in their place among the writes, as the
+> attachment's own (`Volume::forget_for`). A `FORGET` the log cannot take forces a publication; one still refused is
+> counted (`write_log.forget_unlogged`), never taken for a lost write. Proven by
+> `the_lookups_a_dead_daemon_was_given_back_after_its_last_publication_stay_given_back`
+> (`docs/bugs/2026-11-08-a-forget-after-the-last-publication-leaked-its-lookup-reference.md`).
 > **The takeover round is built (2026-10-23, A-158).** A restored mount tells its kernel what its predecessor may not
 > have: the epoch bump and an invalidation of the root and of every restored reference and replayed inode, in slices.
 > Proven on Linux 7.2.9 through the real binary, each test red with the change's files at the previous commit:
@@ -4353,6 +4395,10 @@ well-known name.
 > Mach bootstrap name registered at the top of the caller's bootstrap chain, which launchd gives its first registrant
 > and frees when that registrant's port dies (`crates/ipc/src/owner_name.rs`). Proven on this Mac and fedora, and
 > the refusal across processes on every platform; red-checked.
+>
+> **Status (2026-11-08, A-254).** The owner is decided before anything is created: an anchor holds the rendezvous, and a
+> daemon opens its listener, before a segment is created or attached, so a start refused as a live instance's second
+> owner has created and unlinked nothing, on every platform.
 
 **Protocol.** Requests and replies are fixed-layout 64-byte slots; request ids are `(client_id,
 sequence)`; the daemon keeps a completion record per client until acknowledged (RIFL), so a retry
@@ -4617,13 +4663,25 @@ hard links and snapshot versions. No live kernel endpoint state is part of the i
 > - **The search** (`crates/transport/src/pmtud.rs`) binary-searches from the 1,200-byte floor with
 >   `Ping` probes padded to size. It judges a size too large after three losses or at once on `EMSGSIZE`,
 >   stops within one packet overhead (29 bytes), and re-searches after 600 s.
-> - **Black holes.** Losses of above-floor packets, and probe timeouts while such packets are out, fall
->   the session back to the floor.
+> - **Black holes** (amended 2026-11-08). A black hole needs size-specific evidence, never loss every size
+>   suffers (A-253; RFC 8899 §4.3, "excessive loss of data sent with a specific packet size"; §3 item 4, of a
+>   probe "lost due to other reasons (including link transmission error, congestion)"). Three in a row of above-floor
+>   packets lost or probe timeouts while one is out only make the size *suspect*: the session sends
+>   at the floor, so packets that cross keep loss detection running, and probes at the size it had. One
+>   acknowledged probe, or any above-floor packet, and the size stands. Three probes at it declared lost while
+>   the floor's packets cross (§5.2) are the black hole, and the session falls to the floor and searches below
+>   the size that stopped. A probe timeout counts toward no black hole: a stopped peer acknowledges nothing at
+>   any size. Before, the losses, and each timeout counted as a loss of one, fell the session at once. A
+>   SIGSTOPped peer, or a burst a full receive buffer dropped, left a loopback session at the floor
+>   (`docs/bugs/2026-11-08-a-session-fell-to-the-mtu-floor-on-loss-every-size-suffered.md`).
 > - **Probes stay out of the controller.** Probes never enter congestion accounting or RTT samples.
 > - **The congestion gate.** It is sized by the controller following each datagram-size change: Copa's
 >   window is lifted to at least two datagrams at the new size, so the 2026-09-13 stall cannot recur.
 > - **Proven by use.** A session finds a 9,000-byte simulated path, falls back through a shrink to 1,500
->   and loses nothing (`a_session_finds_its_paths_mtu_and_falls_back_when_the_path_shrinks`).
+>   and loses nothing (`a_session_finds_its_paths_mtu_and_falls_back_when_the_path_shrinks`). A peer silent
+>   for two seconds and a burst lost at every size each leave a 1,500-byte path's size standing with no black
+>   hole counted (`a_peer_silent_for_several_probe_timeouts_keeps_its_path_mtu`,
+>   `a_burst_that_loses_every_size_keeps_the_path_mtu`; both red on the earlier rule).
 > - **Records.** The research note's slices 3a–3c, and
 >   `docs/bugs/2026-09-28-a-lone-path-probe-silenced-the-blocked-report.md` and
 >   `docs/bugs/2026-09-28-a-shrunken-path-deadlocked-before-its-black-hole-was-seen.md`.
@@ -4906,7 +4964,17 @@ retry must recover the same result and contents. Rebuilding a scratch volume fro
 and id loses acknowledged data. Live directory handles require an anchor handoff or validated
 reacquisition of the same source identity; reopening a path alone cannot substitute another
 base. The identity is the device, inode number and birth time (A-153): a change to a directory's
-entries is not a change of source, while a directory another replaced is. Missing resources return `RecoveryIncomplete`/`BaseUnavailable`, never empty success.
+entries is not a change of source, while a directory another replaced is. A recorded directory recovery cannot
+reacquire as the same one, gone from the disk, unreadable, or another at the path, is the failure matrix's "base
+directory unreadable or gone": its untouched entries refuse `BaseUnavailable{path, errno}` (`ENOENT` when the host says
+only that it is not there), the volume's own entries in it serve, and the next image keeps its record so a later
+recovery tries it again; it never refuses the whole volume, and another directory is never substituted for it
+(2026-11-07, `docs/bugs/2026-11-07-a-removed-base-directory-refused-the-whole-volume-at-recovery.md`). A question that
+needs a listing the recovered plane has not read yet reads it then rather than take its absence for an answer: a green's
+base snapshot is judged complete against its directories' listings read from the host, uncached, so their first real
+listing still renumbers their untouched entries (A-151; 2026-11-08,
+`docs/bugs/2026-11-08-a-pinned-snapshot-was-refused-as-a-greens-base-after-a-restart.md`). Missing resources
+return `RecoveryIncomplete`/`BaseUnavailable`, never empty success.
 The version-2 volume image now preserves overlay source paths and full directory fingerprints,
 witnesses, whiteouts, redirects, metadata copy-ups and private large-file ranges, including snapshots.
 Recovery validates no-follow source acquisition before reinstating lazy reads and invalidates caches.
@@ -5239,6 +5307,23 @@ integration still require the A-9 tests.
 > `a_submit_in_a_three_process_fleet_is_answered_once_its_record_commits` (CLI), and
 > `a_joint_placement_with_a_cohort_smaller_than_the_quorum_needs_every_member_of_it`.
 
+> **Status (2026-11-07, A-250, the supervisor's decision "A's tracking with B's confirmation";
+> `docs/bugs/2026-11-07-a-holder-restarted-warm-lost-its-copies-routing.md`).** A member that dies while a voter
+> restarts is now taken over. Two corrections:
+> - **Who declares a death.** The council's leader retires a member only once `f + 1` voters hold it dead, its own
+>   stable view being one vote, or by every voter while the council has fewer than `f + 1` besides the member (a
+>   forming council's sole voter decides alone). The other voters report their dead on the council's membership path once a period,
+>   never on a write, and a report below the incarnation the leader holds the member alive at counts for nothing. A
+>   restarted voter watches every configured member, so one it has not reached for the membership horizon since its
+>   start counts as dead even before its detector keyed it.
+> - **A restored copy is routed.** A holder restarted warm routes each copy from its held image to the owner its
+>   acceptor names. Unrouted, it never moved the copy to the successor and refused the successor's adoption
+>   `ForeignGeneration` every period, and it answered the successor's page empty while it held the copy unfenced.
+> Regressions: `a_lone_voters_suspicion_never_retires_a_member`,
+> `a_sole_voters_own_view_retires_a_member_while_its_council_forms`, `a_restored_holders_copy_moves_to_its_successor_and_accepts_its_adoption`, and
+> `a_member_down_through_a_voters_restart_is_still_taken_over` (CLI; 15 of 15 on adacachy). No TLA+ re-run is owed:
+> `Reconfig.tla` models the holder set's change once a retirement commits, not the decision to retire.
+
 **Leases and reads.** Epoch fencing alone does not authorize linearizable owner-local reads.
 Use the explicit lease safety obligations above: only an owner with a currently confirmed,
 conservatively bounded lease may serve the latest head locally. Expiry/uncertainty stops those
@@ -5564,6 +5649,19 @@ snapshot's record and content are acknowledged there; elapsed time includes any 
 content transfer and quorum acknowledgement, not a guaranteed single WAN round trip. Region loss promotes the mirror through the root group at operator cadence; the loss
 window is the mirror lag at that moment, zero for every operation that awaited the mirror.
 
+> **Status (2026-11-07, A-243: a partition's snapshot cadence follows the partition).** The cadence was derived once at
+> boot from the replay throughput recovery measured. A daemon booted fresh replayed nothing, took one byte a
+> microsecond, and re-encoded its whole partition every 1 MB of log for its whole life: at 10,000 works the green's
+> owner shard spent about 1,800 of 2,241 samples doing it. A partition now snapshots once the log since its last
+> snapshot has taken the recovery budget's worth of replay work and is at least that snapshot's size
+> (`replay::snapshot_due`). The work is timed on each commit's append and apply, the work a replay repeats per record,
+> and never extrapolated from one stretch of log to the next, whose records may differ in size. So snapshot work stays
+> within about twice the log it absorbs, whatever the partition's size, and `slates status` shows each shard's
+> snapshots, their bytes and longest duration, the log appended, the tail's bytes and measured work, the budget and
+> the floor.
+> Recovery's bound changes with it (the paragraph below). The snapshot still runs whole on the committing shard's
+> turn; slicing it is owed. (`docs/bugs/2026-11-07-a-partitions-snapshot-cadence-never-left-its-boot-guess.md`.)
+
 **Recovery.** Node restart: the anchor segment replays the local log and `put_wal` into fresh
 indexes; the node rejoins with a new ephemeral id (a restart is a join); its owned objects are
 taken over by its neighbours after the membership horizon. A **warm** restart, with the anchor
@@ -5572,7 +5670,13 @@ its shard's recovery image carrying the put is committed into anchor-owned RAM, 
 the image's replicas again, re-verified, before the node serves (A-51). A whole-anchor loss is the
 RAM-fault case; that node holds nothing for others until re-replication fills it. RAMCloud's recovery-time budget is a reference, not a Slates result;
 metadata takeover uses a configuration decision and phase-one exchange. A read may additionally
-need content fetch and a confirmed lease; measure that complete recovery boundary.
+need content fetch and a confirmed lease; measure that complete recovery boundary. A partition's own part is decoding
+its last snapshot and replaying the log after it. A snapshot comes once that log has taken the budget's worth of
+replay work, as its commits measured it, and is at least the last snapshot's size (A-243). So a partition's recovery is
+at most decode(P) + max(budget, the replay of P bytes of log), where P is its snapshot's size: the budget while the
+partition is small enough, about twice its own snapshot's cost once it outgrows it. The commits' measure errs early,
+since it is slower per byte than the replay (17 against 24 to 27 bytes a microsecond on CI's x86_64, debug) and counts
+a preempted commit's stall.
 
 **Failure matrix.** A candidate holder slow: Masked (the hedge completes the put elsewhere;
 the slow holder goes on probation after the derived count and the group replaces it). Fewer than
@@ -5716,8 +5820,9 @@ sender refuses with `StaleEpoch{current}`. Refreshes consume the operation's bou
 budget; the latter refusal ends the sender's authority.
 
 **Exactly-once.** `(client id, sequence)` request ids; completion records kept until acknowledged
-(the client acknowledges by advancing its sequence window); retries return the original result;
-provisioning is therefore safe to retry after any failure.
+(the client acknowledges by advancing its sequence window, naming the ids at or below it that it
+still owes); retries return the original result; provisioning is therefore safe to retry after any
+failure.
 
 > **Status (2026-10-07, the bound built).** The bound this section requires ("exhaustion refuses admission") was not
 > built: a client's records grew until it acknowledged, and a client that never did grew them without end. Each
@@ -5748,6 +5853,31 @@ provisioning is therefore safe to retry after any failure.
 > it is resent or released (`release_retryable`), within the reconnect budget, so a caller that never resends cannot
 > pin it (`a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id`;
 > `docs/bugs/2026-11-06-a-resend-under-its-id-was-already-acknowledged.md`).
+
+> **Status (2026-11-08, A-252: a request waiting for a version is a durable state).** A submit whose acceptance waits for
+> its version's commit was waited on in memory, so after a restart its resend under its own id found no record and ran
+> again as a new version. The accept now logs `Op::CompletionAwaiting` in the transaction that appends the version, so
+> the window answers `Seen::Awaiting` (never `New`) across any restart: the resend joins the wait, or is answered its
+> version once it has placed. The wait counts toward the client's bound and leaves when its completion replaces it or the
+> client acknowledges it. After a takeover the resend is refused retryable and nothing runs twice, but its version is not
+> named, short of the failure matrix's Masked: owed as A-255 (GAPS).
+
+> **Status (2026-11-07, A-245: an acknowledgement names the ids still owed).** A watermark is contiguous, so one held or
+> slow request kept every later completion of its client: the owner pruned none of them, and past `2 × slots` refused
+> the client's next requests `AcknowledgementOwed`. At `f = 1`, where nearly every slow submit is held, that was the
+> steady state: 906,317 refused against 59,646 served on the owner shard of fixtures' 1,000-client rung, 2.46 million
+> at the quiet arm's 10,000. An `Acknowledge { up_to, owed }` now covers every id the client issued and names the
+> ones at or below it still owed (awaited, held for a resend, `Unpublished`): at most the ring's slots and the hold's
+> cap. Every partition releases the rest and keeps the owed ones open, answerable and recordable. An acknowledgement
+> closes only what it speaks for: an open id at or below its `up_to` that it does not name is closed, one above its
+> `up_to` is left open, and a closed id is never opened again, so an acknowledgement that arrives late, by a scatter
+> or a relay, can close only ids it covers and reopen none, and a released id is never executed twice. One naming an
+> owed id above its `up_to`, or more than `2 × slots` of them, is refused whole (`BadRequest`, `ack.malformed`), never
+> cut, since a cut would release ids still owed (raft). The origin relays the owed ids beside the watermark
+> with a forwarded write, so the owner keeps a held submit's record too (`slates_wire::request::ClientWindow`,
+> `Op::CompletionsAcknowledged`, `ClientCompletions::owed`, `ForwardedRequest::ack_owed`, `slates_client`
+> `acknowledgement`; `a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound`;
+> `docs/bugs/2026-11-07-a-held-request-kept-every-later-completion-of-its-client.md`).
 
 > **Status (2026-11-05, A-216: an acknowledgement is answered once its own shard has released).** An `Acknowledge
 > { up_to }` releases the client's records at or below `up_to` on every partition that may hold them. Its reply now
@@ -6324,6 +6454,9 @@ mirroring have no targets and their verbs refuse `Unsupported`.
 >   register.
 > - **Class bytes.** Register values lead with a class byte. Volume ids refuse typed at the class bit
 >   (`docs/bugs/2026-09-30-a-takeover-rebuilt-a-weaker-volume-and-lost-its-grants.md`).
+> - **Greens (2026-11-07).** A green ships its catalog register too, and no merge record of it ships before the
+>   register's current version is committed. Its successor waits for the adopted register and rebuilds the green with
+>   its access list (`docs/bugs/2026-11-07-a-taken-over-green-lost-its-access-list.md`).
 >
 > **Status (2026-09-30, connection credit in priority order).** A control exchange no longer waits for
 > connection credit that a bulk exchange spent (the constrained-link design §5.3).
@@ -6698,6 +6831,13 @@ also binds the delegated consumer scope. Rights are checked before resource admi
 namespace lookup that reveals protected content, queue creation or any VFS/device effect.
 Replay/session resumption preserves that binding; it cannot change the authenticated consumer.
 
+> **Status (2026-11-07, A-237): a host account carries its host.** Every principal names the host whose account it is
+> by that host's certificate anchor, a forwarded request is rescoped by its TLS session's anchor, and owner and access
+> entries record (host, account), so a uid is never taken for another host's. A client of another node is refused
+> `NotShared` naming the (anchor, account) a share would name. On Windows the account is still recorded as uid 0 (the
+> rendezvous authenticates by the bootstrap object's mode and reads no SID), now host-qualified; naming it by its SID is
+> held.
+
 This requires a harness boundary when untrusted processes share an OS account. Slates cannot
 prevent an unsandboxed same-uid process from reading other process memory or writing host files
 through unrelated syscalls. It supplies scoped VFS access and grant checks; the harness owns
@@ -6978,6 +7118,27 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > were killed at 183-292 runnable processes, and a stuck start was killed at 1,001-1,294 ms on macOS, Linux and Windows.
 > A shard's recovery still runs as one poll, which the watchdog counts as spinning past a window of CPU: GAPS holds it
 > open.
+
+> **Status (2026-11-08, A-228): a starved shard is not a stuck one.** A CPU clock cannot tell a thread held off the CPU
+> from one blocked in a call: both stand still. On adacachy at `CPUWeight=1` two anchors killed live daemons on
+> `shard N is wedged` lines, and the sampled shard read state `R` throughout. The watchdog now asks the scheduler about a
+> shard with no step and no CPU rise (`slates_rt::registry::shard_run_readings`, one batch a beat). **Wedged** is a whole
+> window in which the shard moved in no way: no CPU progress, never runnable, no wait for a CPU credited. **Starved** is
+> a whole window with no CPU progress but one of the others: it goes on beating and is logged once an episode.
+> **Spinning** is unchanged.
+>
+> | Platform | Source | Time waited for a CPU |
+> |---|---|---|
+> | Linux | `/proc/self/task/<tid>/stat` state and `schedstat` field 2 | Yes, credited late, so the state decides |
+> | macOS | `thread_basic_info.run_state` (`TH_RUN`, on a CPU or the run queue) | None per thread: the state at each look |
+> | Windows | `SYSTEM_THREAD_INFORMATION.ThreadState`, `NtQuerySystemInformation` linked at run time | None: the state at each look |
+> | Miri, or an unreadable source | None | The CPU clock stands alone, as before |
+>
+> Proven by `crates/server/tests/liveness.rs` and the rule's replays in `crates/server/src/watchdog.rs`, red first
+> (`docs/bugs/2026-11-08-a-starved-shard-was-judged-wedged.md`). Held off its CPU for 3.0 s, the beat gapped at most
+> 91.6 ms on Linux and 111.0 ms on Windows, where before it stopped for 2.01 s and 1.91 s; a shard blocked in a read
+> still stops the beat within 1.08 s on both. A frozen process is still killed at its lapse. macOS could not be held off
+> the CPU on demand (a full window in 1 of 20 CI runs), so there the replays carry the rule.
 
 > **Telemetry oracle correction (2026-09-20, AC-0.11).** A drain request itself emits spans.
 > The daemon integration oracle now derives convergence from the reply quota minus the
@@ -7617,6 +7778,8 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > chain, pipelined and hedged merge records.
 
 > **Status (2026-09-18, AUD-14: a taken-over green is servable).** The generic takeover promoted one adopted record and materialized content only for a plain volume's `HeadValue`; a green's adopted `MergeRecordValue` left the successor with a holder replica and nothing to serve — no catalog record, origin, chain, engine or placed version. Now the record value carries the green's name, evidence policy and owner (from the catalog, at `enqueue_record`), the takeover completion routes an adopted merge record to `pending_green_materializations`, and `materialize_pending_greens` gathers the chain from the successor's **own accepted records** (its holder acceptor's persisted positions give every version's input manifest; the held content gives the origin and each increment, `recover_green_inputs`) and materializes it on the shard the id routes to (`materialize_taken_over_green`): the catalog entry, the origin and every increment re-recorded durably, the engine replayed by the boot derivation and its head identity checked against the adopted record's — a mismatch refuses the green loudly — then the head placed. A successor whose accepted prefix is shorter than the adopted head stays pending, counted (`merge.takeover_incomplete`): the ledger-prefix transfer is GAP-A9-7's contract. Regression: three-node `f = 1`, three versions, owner dies, the successor's chain identities equal the owner's, `versions`/reads/a new submit and its retry serve through the public client (`docs/bugs/2026-09-18-green-takeover-left-no-servable-chain.md`).
+>
+> **Status (2026-11-07, AUD-29-17: a taken-over green keeps its shares).** The rebuilt green's access list was empty: a green shipped no catalog register. It now does, its merge records wait for the register's current version to commit, and the successor rebuilds the green from the adopted register's access list and sequence, waiting for it counted (`merge.takeover_waits_catalog`). Regression: `a_share_of_a_green_made_after_its_last_version_survives_a_takeover` (`docs/bugs/2026-11-07-a-taken-over-green-lost-its-access-list.md`).
 
 > **Status (2026-09-18, AUD-11: acceptance waits for the commit).** `submit` returned `Submitted{version}` on the owner's local append, with the version's merge record still pending on the record plane at `f > 0` — a version a surviving quorum might not hold, and a completion record saying otherwise. Now the acceptance **waits for the commit**: when `placed_version` has not reached the version, the verb registers the request as awaiting (`MergeShardState::awaiting`: the reply route and the completion key, bounded by the clients' credit) and `run_recorded` commits its effects with no completion and no reply; when `record_merge_acks` places the version at the quorum, `resolve_accepted` records the acceptance as each waiting request's completion on the owner partition (one durable step) and delivers the reply by a task on the request's shard. A retry while waiting joins the wait; a cross-node forward polls the completion within the liveness budget, else is refused retryable. At `f = 0` the append is the commit and nothing changes (R8). Regression: two-node `f = 1`, the holder withholding content puts, then acknowledgements (`MergeFault::refuse_records`) — no acceptance under either, the wait resolving once both lift, the retry answered from the record (`docs/bugs/2026-09-18-submit-acceptance-before-fleet-commit.md`). The retry after the owner's loss belongs to AUD-14's takeover recovery.
 
@@ -7634,6 +7797,29 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > the remaining holders' input debt, so their catch-up transfers inputs before records. Selecting
 > work reads one position per holder rather than rescanning the retained chain. Transfer to a new
 > candidate set and full green takeover remain owed (AUD-14).
+
+> **Status (2026-11-07, A-246: a restarted owner re-enqueues its chain's records).**
+> The pending merge records and the submits waiting on them live in memory, and a restarted owner rebuilt each green from
+> its chain without them. So a version appended before the crash and not yet committed at `f + 1` was never shipped
+> again, and its retried submit waited forever. Goal 4's primary-kill rung at 1,000 clients found it: versions 507 to
+> 514 on the green, no client told
+> (`docs/bugs/2026-11-07-a-version-appended-before-its-owner-restarted-never-committed.md`). Now the restart's replay
+> returns each version's record fields, with the green's head identity at that version, and the owner re-enqueues
+> them. A holder that already holds a version acknowledges it again at no cost. A takeover keeps its own path.
+
+> **Status (2026-11-07, A-244: a version commits in one exchange).** A-235 still put a
+> version's inputs through the content exchange (an offer, then the transfer) and shipped its record after, each behind
+> its own wake of the record plane: five hops, so one submit at `f = 1` took 6.7 ms at p50 quiet and 15 ms at load 130
+> (`docs/bugs/2026-11-07-a-versions-inputs-and-record-took-five-hops.md`). Now a record ships with its inputs while a
+> target lacks them, as one merge shipment: the record, then the content exchange's offer and chunks, which the holder
+> serves through the content plane's own path before it recomputes and accepts. One acknowledgement places both. The
+> separate inputs put is gone: "placed before referenced" holds by construction, since a holder accepts a record only
+> once it holds the inputs it names. A holder's retention rule now reads the one ledger position a held input can be
+> named by (its version's) rather than decoding the whole ledger per held manifest, which had made each put quadratic
+> in the green's history (`docs/bugs/2026-11-07-retention-decoded-every-merge-record-per-put.md`). 500 sequential
+> submits at `f = 1`, release, adacachy at load about 10: p50 265 µs, p99 731 µs, p999 and max 1.13 ms. Still owed:
+> a smaller per-version cost (the median of 50 submits grows from 116 µs to 473 µs across 500 versions), and more than
+> one version to a holder per pass.
 
 > **Status (2026-11-06, A-235: the record plane runs when there is merge work).**
 > The merge record plane ran once per coordinator period (100 ms), putting a version's inputs at one period and its
@@ -7667,6 +7853,26 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 >   16 of 64 accepted before and 64 after. The corruption's test: the green's head was `cd\0\0`, now `cdXY`.
 >   (`docs/bugs/2026-11-07-a-greens-history-kept-a-copy-of-every-file-per-version.md`,
 >   `docs/bugs/2026-11-07-a-run-after-a-length-change-merged-zeros.md`.)
+
+> **Status (2026-11-08, A-257: a chain entry records what its verdict resolved, and recovery applies it).** A
+> checkpoint at the floor can pass the base of an entry left above it, and recovery re-judged each entry at its base,
+> which a restored green no longer holds: the entry was refused and the green fenced, every acknowledged version
+> unreadable (every restart of the load harness's state, 2026-11-08).
+> - The durable entry is now the increment as submitted, byte for byte, then the effects its verdict resolved it to
+>   (content by reference to its post-state; a splice whose ops were not mapped by its path alone), then a digest.
+>   Recovery applies the effects unconditionally (`slates_merge::chain_entry`, `Green::apply_recorded`). The position
+>   of a checkpoint no longer matters to replay, and a straggler pins nothing.
+> - A merge record's inputs are still the increment as submitted (`inputs_of`): holders ("Apply on holders") and a
+>   successor (`recover_green_inputs`) judge it afresh, so a wrong resolution on the owner cannot reach them.
+> - Integrity: the digest on every entry; the head identity recorded and compared at every checkpoint, at every
+>   version whose record goes to holders, and at the head wherever one is recorded (`GreenFence::IdentityDiverged`).
+>   At f = 0 the entries after the last checkpoint are checked by digest alone: a divergence there is found at the
+>   next recorded identity, not at its own version (an identity at every f = 0 accept cost 287-363 µs against a
+>   35-42 µs verdict). The oracle (`crates/merge/tests/chain_replay.rs`) compares identity at every version.
+> - Cost: 789 bytes an entry against the increment's 611 (+29%), and 4-5 µs on the p50 of an accept over a base behind
+>   the head (32 to 36-37 µs; p99 within noise). Layout 6; a version-5 segment is refused, and a green already fenced
+>   by a wrong checkpoint stays fenced.
+>   (`docs/bugs/2026-11-08-a-checkpoint-passed-a-retained-entrys-base-and-recovery-fenced-the-green.md`.)
 
 > **Status (2026-11-06, A-238: a green's chain is checkpointed at its reachable floor).** The partition kept
 > every accepted increment for good, and the "fold into checkpoint deltas" below had no durable form.
@@ -7798,6 +8004,15 @@ owner with the piggyback rule (a refusal from a non-owner names the current owne
 placement refresh is single-flight per green). The caller parks and resumes with the verdict. A work volume with
 `stream = true` submits at every auto-seal; an agent that wants a review boundary submits
 explicitly. A green with `require_evidence` refuses increments without evidence references.
+
+**Edit and submit in one request (A-225).** `edit_and_submit(work_volume, path, at, delete_len, bytes, evidence?)` is
+`edit` and then `submit`, in one request: the work's owner applies the edit exactly as `edit` does and, when the edit
+is accepted, submits exactly as `submit` does. Both run inside the one durable step and under the one completion record
+of the request, so a restart replays both or neither and a retry answers from the record. Its reply is the edit's
+refusal when the edit is refused (nothing is submitted, as a client that saw `edit` refused would not submit), else the
+submit's reply: the same verdict, the same conflict windows, the same refusals. `edit` and `submit` stay separate verbs
+because they are separate operations (an agent edits many times and submits once); the combined verb is for a client
+that does both, and saves it one round trip, which across machines is the whole of a request's cost.
 
 **Rebase, the only corrective path.** `rebase(work_volume, to = head)`: map the work volume's
 pending operations (since its base) through the canonical deltas up to `to`; if every operation
@@ -8184,7 +8399,8 @@ SDKs.
    daemon (start, restart on exit, hand back held fds later in Phase 3/4).
 2. Partition data model and indexes; the op log in the segment; replay on start; snapshots of
    partition state into the segment on a cadence derived from measured replay throughput and the
-   recovery budget.
+   recovery budget (since A-243: once the log since the last snapshot has taken the budget's replay work, as each
+   commit's append and apply measure it, and is at least the last snapshot's size).
 3. Rendezvous per OS; ring regions; wake words; the completion fd; peer authentication.
 4. The lifecycle verbs of Part 4.4 through the server, with completion records (exactly-once),
    leases with epochs, attachments (client form only), quotas fed by the real pressure sources.
@@ -12672,6 +12888,8 @@ Status: built 2026-10-08.
   such an export to uid 0 only where the host's root is trusted with the volume.
 
 ### A-117 — An idle shard gives back the recovery memory no restart reads (2026-10-08)
+> Amended 2026-11-06 by A-226: each region is given back only as far as it was written since its last give-back, not
+> whole at every publication (18 to 21 ms of a macOS shard's CPU each time).
 Applied in the same change to:
 - `crates/vfs/src/recover.rs` (`CommittedSlot::stale_slot`) and `crates/vfs/src/checkpoint_log.rs`
   (`Journal::dead_ranges`, `DeadRanges`);
@@ -13571,6 +13789,48 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
+### A-253 — A path-MTU black hole needs failed probes at the size, not loss every size suffers (accepted 2026-11-08, the supervisor's order; amends §4.10a's black-hole rule)
+
+Applied in the same change to:
+- §4.10a: the "Black holes" bullet and "Proven by use".
+- GAPS and `docs/bugs/2026-11-08-a-session-fell-to-the-mtu-floor-on-loss-every-size-suffered.md`.
+- `crates/transport`: `pmtud.rs` (`PathMtu`'s suspect state, `on_silence`, the confirming probes) and `connection.rs`
+  (`note_mtu_timeout`, `note_mtu_losses`, `note_mtu_acknowledged`).
+- The tests: `a_peer_silent_for_several_probe_timeouts_keeps_its_path_mtu` and
+  `a_burst_that_loses_every_size_keeps_the_path_mtu` (`tests/session.rs`), and the unit cases in `pmtud.rs`.
+
+- **The rule amended.** §4.10a said: "Losses of above-floor packets, and probe timeouts while such packets are out,
+  fall the session back to the floor."
+- **Why.** At a confirmed size of 65 KB every data packet is above the floor, so loss that hits every size counted the
+  same as a path that shrank. On loopback, a SIGSTOPped peer's third probe timeout dropped the session from 65,496 bytes
+  to 1,200: 89 falls in 60 rolling-partition runs, every one by probe timeout and none by a loss pass
+  (diag-live-durability-48), and resumed candidates ran there.
+- **What the RFCs say.**
+  - RFC 8899 §4.3 allows data loss as evidence through "a mechanism implemented within the PL to detect excessive loss
+    of data sent with a specific packet size", which can "conclude that this excessive loss could be a result of an
+    invalid PLPMTU".
+  - RFC 8899 §3 item 4: "The PL is REQUIRED to be robust in the case where probe packets are lost due to other reasons
+    (including link transmission error, congestion)." It speaks of probes; the rule applies the same reasoning to data.
+  - RFC 8899 §5.2, SEARCH_COMPLETE: "If MAX_PROBES successive PLPMTUD-sized probes fail to be acknowledged, the method
+    enters the BASE state."
+  - RFC 9000 §14 ties no PMTU reduction to data loss or to probe timeouts; its one loss-tied reduction is the provisional
+    ICMP one (§14.2.1).
+- **The rule now.** Three in a row, with none acknowledged between, of above-floor packets declared lost or probe
+  timeouts with one in flight make the size *suspect*. A suspect session sends at the floor and probes at the size it
+  had. One probe acknowledged, or any above-floor packet, and the size stands. `MAX_PROBES` of those probes declared lost
+  is the black hole, and the session falls to the floor and searches below the size that stopped.
+- **Stricter than the RFC.** §4.3 sets the lower PLPMTU first and confirms it after ("The PL then confirms that the new
+  PLPMTU can be successfully used across the path"); nothing there requires probing the old size before falling. This
+  rule does, because the evidence that reaches a session here is mostly not about size.
+- **Sending at the floor while suspect is what keeps the 2026-09-28 deadlock away.** In a real shrink nothing at the old
+  size is ever acknowledged, so a probe at it is declared lost only if smaller packets keep acknowledgements flowing.
+- **A probe timeout counts toward no black hole.** A stopped peer acknowledges nothing at any size, so it declares no
+  probe lost and never makes one. Three timeouts still start the confirmation; one does not (a single timeout was enough
+  in the first cut: at least 1,230 and 1,525 suspicions in 30 partition runs per arch, diag-live-durability-49).
+- **Measured.** Rolling partition, 60 runs on each build: 89 falls to the floor on the old rule (diag-live-durability-48);
+  87 suspicions and no black hole on this rule (-51), every suspicion by probe timeout. No session of those runs lost
+  its size. The stall rate is unchanged within what 60 runs can show (0 stalls against 1, at about 1 in 100).
+
 ### A-231 — A held NFS connection's byte states cross a takeover, and what the successor cannot know is judged stale (accepted 2026-11-07, the supervisor's decision)
 Applied in the same change to: §4.6 "NFS v3" (its status), A-192 (its restart line), GAPS, `crates/vfs`
 (`recover.rs`: `HeldNfsStates`, `CarriedFile`, `CarriedRange`, `CarriedByte`, `ShardImage::nfs_states`, image version
@@ -13887,6 +14147,89 @@ GAPS, BENCHMARKS ("The spin policy, measured and rejected").
   keeps its tails under load. The decision rests on Ada's rule that p99 under load is the target. The true spin's change
   is kept on record, not landed (`agents/clients-spin`, a75f9213).
 
+### A-224 — A shard thread's scheduling slice: measured and rejected (2026-11-08; the supervisor's decisions of 2026-11-06 and 2026-11-07)
+Applied in the same change to: BENCHMARKS ("A shard's scheduling slice, measured and rejected"), GAPS. No code: the
+built change stays on agents/perf-2 (`7c04f873`, the runtime's request; `0d8a61d9`, the harness's sweep) for the
+record, and nothing of it is on main.
+
+Status: measured and rejected 2026-11-08.
+- What was tried. Each shard thread asks the fair scheduler for a short EEVDF slice as it starts (`sched_setattr(2)`'s
+  `sched_runtime` for a `SCHED_OTHER` thread, Linux 6.12+). The thread keeps its policy and nice, so no privilege is
+  needed: proven as uid 1000, CapEff 0, `Nice=19`, on Linux 6.19.10, `Held(100000)`. A shorter slice gives a woken
+  shard an earlier virtual deadline, so under oversubscription it runs before threads that never sleep.
+- The rule it was judged by (the supervisor): loaded p99 and max keep the gain, and loaded p50 is not worse than base
+  beyond the spread. The load: two spinners a core on two CPUs, a sibling fsync writer, 256 MB. Interleaved, on CI's
+  Linux 7.0 runners (x86_64 and arm64).
+- What it bought. On arm64, the loaded accept p99 fell from 22 to 35 ms (median 26.6) to 2.2 to 9.0 ms (median 6.0)
+  with the kernel's minimum, 100 µs, and the max from 29 to 39 ms to 3.9 to 12 ms. On x86_64 the max fell from 10.6
+  to 21 ms to 7.7 to 12.2 ms, but the p99 barely moved (median 6.0 to 5.2 ms). Quiet runs, paced and unpaced, were
+  even.
+- What it cost, and why it is rejected. Every slice tried had loaded p50 excursions of 0.8 to 4.0 ms in some
+  rounds, beyond base's spread:
+  - x86_64: base 12 to 14 µs; 100 µs reached 1,852 µs (accept); step budget × 32 (206 µs) 826 µs.
+  - arm64 conflict: base 15 to 21 µs; 100 µs reached 4,015 µs; 234 µs reached 3,785 µs.
+  - arm64 accept at 234 µs: a median p50 of 2,048 µs.
+  - The sweep before it (diag-perf-7, eight slices derived from each runner: none, the kernel's minimum, the step
+    budget doubled from × 16 to × 256, the kernel's default) showed the same excursions in four other slice arms, and
+    none in base.
+  No slice keeps the gain within the p50 rule, so none is taken.
+- Not established, and what would reopen it: why a sliced shard's median request waits milliseconds in some
+  rounds. A candidate, unproven: EEVDF's lag, which lets a short-slice thread that ran ahead wait out its peers'
+  slices. A slice that keeps the p50 (or a client that can ask for its own) would need the same rule met.
+
+### A-237 — A host account means something only on its host: every principal that crosses hosts is scoped by its origin's certificate anchor (accepted and built 2026-11-07)
+Applied in the same change to: §4.13 (its status on principals), `slates_db::catalog::Principal` (a host on `Uid`,
+`Sid` and `Consumer`; the tenant and the index key over it; `rehosted`), `slates_ipc::protocol` (the wire `Principal`'s
+host, `DaemonReport::anchor`, `Refusal::NotShared`), `slates_wire::header::MAJOR` (2), `slates_anchor::layout`
+(`LAYOUT_VERSION` 5, a typed refusal of layout 4), `crates/server/src/verbs.rs` (`serve_forward` rescopes the forwarded
+principal by the session's anchor; `not_shared_with`; `to_db_principal`, `to_wire_principal`), `crates/server/src/daemon.rs`
+(`local_anchor`, the rendezvous's principal, `Daemon::anchor`), `crates/server/src/nfs.rs` (an NFS caller's host),
+`crates/bridge-virtiofs/src/vhost_user.rs` (`adopt` takes the host), the CLI (`slates status` prints `anchor:`; `slates
+share` takes `@ANCHOR`), GAPS, `docs/bugs/2026-11-07-a-principal-was-compared-across-hosts-with-no-host.md`, and the
+tests named below.
+- **Why.** A verb forwarded to a volume's owner on another node carried the requester's principal "as the origin node
+  authenticated it", and the owner judged it by `rights_of`'s bare equality: a principal is equal to an owner or an
+  access entry, and a uid carried no host. So one uid on two hosts was one principal; every Windows channel is
+  recorded as uid 0 (the bootstrap object's mode is the authentication), so any two Windows users on different nodes
+  were one principal, and a Windows user was Unix root's principal. Found 2026-11-07 while checking a wrong premise
+  (that a Windows consumer could never attest; it can, `crates/server/tests/consumers.rs`).
+- **The rule.** A local account is meaningful only on its host. A uid, a SID and a consumer each carry the host whose
+  account it is, by that host's certificate anchor: the fleet's pinned certificate's, else the machine identity's
+  (`daemon::local_anchor`), stable across the host's restarts and never the per-boot member id, which would orphan every
+  user's volumes at a restart. A local request is the local anchor's; a forwarded request is rescoped by the anchor of
+  the TLS session it arrived on (`Principal::rehosted`), never by a host the origin's request names. Owner and access
+  entries record (host, account), and `rights_of`'s equality compares them whole. A certificate names itself on every
+  host. This is §4.13's "between hosts, authenticated transport also binds the delegated consumer scope".
+- **What a user meets.** A client of node B reaching a volume owned on node A is refused `NotShared { verb, principal }`,
+  naming (B's anchor, its account): the share that lets it in. `slates status` prints each node's `anchor:`, and `slates
+  share ID uid:N@ANCHOR` (or `consumer:ACCOUNT/ID@ANCHOR`) names another node's account. One person's accounts on
+  several hosts as one principal, a fleet account mapping, is not part of this: an open design item for Ada (GAPS).
+- **A taken-over green kept no shares.** Found by this change's tests: a green shipped no catalog register, so its
+  successor rebuilt it with an empty access list, which uid equality had hidden. Fixed in its own change just before
+  this one (AUD-29-17's catalog register for greens; `docs/bugs/2026-11-07-a-taken-over-green-lost-its-access-list.md`),
+  so it could land first. Here its test names node a's account by its anchor.
+- **Format.** The wire principal and the catalog's records change shape, so the wire major is 2 (a major-1 peer is
+  refused before its body is read) and the segment layout is 5 (a layout-4 segment is refused at start, saying to start
+  afresh and re-enroll and re-share). Pre-release; no shim. Neither SDK encodes a principal or `Enroll`.
+- **Tests:** `crates/server/tests/fleet.rs`
+  `a_forwarded_read_by_the_same_uid_on_another_host_is_forbidden_without_a_share` (three in-process daemons, one uid,
+  each its own region: before, a client of node b read node a's volume, served in 22 s; after, refused `NotShared`
+  naming node b's anchor, 7.7 s, macOS arm64, 2026-11-07); `crates/anchor/tests/anchor.rs`
+  `a_segment_from_before_host_scoped_principals_is_refused_at_start_saying_to_re_enroll`; the CLI's share parse
+  (`@ANCHOR`); and every fleet test that reaches a volume from another node now shares it with that node's account by
+  its anchor (`share_with_node`), the two takeover tests before the owner dies, so a survivor enforces the scoped owner.
+  The sealing tenant's test derives each tenant from its owner (`Principal::tenant`), since a tenant is no longer the
+  bare uid. The two-host test's second half shares the volume with exactly the principal the refusal named, and node
+  b's read is then served. Takeover: `a_dead_owners_volume_refuses_an_unshared_host_through_its_successor` (the
+  survivor whose share was withdrawn is refused `NotShared`, naming its own anchor, through the successor) and
+  `a_restarted_peer_is_learned_on_contact_under_its_fresh_identity` (the owner's account, through its restarted host,
+  reaches its volume on the successor, since a restart keeps the anchor). Windows→Unix-root by rule:
+  `verbs::tests::uid_zero_on_another_host_is_not_this_hosts_root`. CI (diag `clients-host-5`, on main `e86fb417`,
+  2026-11-07): wire, db, anchor, the server's unit tests, consumers, daemon, virtiofs and the CLI green on ubuntu x86_64
+  and arm64; the fleet suite 94 of 95 on both, the one a test new on main whose forward needed its share
+  (`green_and_work_on`, fixed after); Windows x86_64 and arm64 green but for the two landing tests that fail on main
+  there too.
+
 ### A-228 — A daemon's liveness is judged in its shards' own CPU time, by an owned watchdog thread (accepted and built 2026-11-06)
 Applied in the same change to: §4.14 (its status on `daemon.alive`), `crates/server/src/watchdog.rs` (new),
 `crates/server/src/daemon.rs` (`Daemon::start`, `stop_parts`, `control_loop`, `heartbeat_loop`), `crates/cli/src/anchor.rs`
@@ -14119,6 +14462,103 @@ the server takes it as the work's delta over its new base (`WorkFiles::from_chan
   rebase's changes over it equals the twin's head after the accept, every change differing from the head (red with
   the changes under `d` dropped: the first case failed); a one-file edit of a thousand-file green rebases to that file
   alone. The server's library, daemon and client suites pass.
+
+### A-225 — Edit and submit in one request (accepted 2026-11-06, the supervisor's decision (b))
+Applied in the same change to: §4.16 ("Edit and submit in one request"), `crates/ipc/src/protocol.rs`
+(`RequestBody::EditSubmit`, `EditBytes`, appended), `crates/server/src/verbs.rs` (`edit_and_submit`, and the verb in
+`claims_placed_durability`), `crates/client/src/client.rs` (`Client::edit_and_submit`), the oracle
+`crates/client/tests/edit_and_submit.rs`, the harness's `accept_one` form (`crates/client/examples/edit_merge_bench.rs`),
+BENCHMARKS, GAPS.
+
+Status: built 2026-11-06.
+- Why: across machines a request costs its round trip. Measured over a Wi-Fi LAN (BENCHMARKS, "Edit and submit in one
+  request, across two machines"), an accepted edit and merge was two of them: edit then submit 14.1 to 18.6 ms at the
+  median, the edit and the submit each about one forwarded round trip (a ping 6.1 to 7.7 ms). One request does both.
+- The rule: `EditSubmit` names the work, the splice (path, offset, length removed, and the bytes inserted, carried
+  inline or as a staged buffer for an edit larger than one request) and the evidence. The work's owner runs `edit`
+  (or `EditStaged`'s edit); if it answers `Edited`, it runs `submit` and answers with that. Otherwise it answers the
+  edit's refusal and submits nothing. Both run in the request's one `Db::begin` … `commit` with its one completion
+  record, so the effects of both, or of the edit and a refused submit, are durable together or not at all. A retry,
+  across a restart too, answers from the record. The verb claims placed durability as `Submit` does, and is routed,
+  forwarded and republished by the work's volume, as `Edit` and `Submit` are.
+- What it does not change: `Edit` and `Submit` stay, as different operations, not a compatibility path. The verdict,
+  its conflict windows, the increment's identity and every refusal are the two verbs' own, since the combined verb
+  calls them.
+- Proven by an oracle that runs both forms over generated histories (two daemons' worth of works over one green,
+  each step an edit-and-submit through one client and edit-then-submit through another, with daemon restarts between
+  steps) and compares every verdict, every conflict report and the greens' heads and files. Exactly-once is
+  proven by a retry across a restart, which must answer the recorded verdict and leave the green one version ahead,
+  not two.
+- Measured (2026-11-06 07:49 to 07:59 UTC; server node adas-macbook-pro-2 at 192.168.1.71, client node kiln-a094a12d at
+  192.168.1.72, both on Wi-Fi; ICMP RTT 3.8 to 3.9 ms min, 5.3 to 8.5 ms average). The harness ran on the client
+  machine, attached to its own node, over a 100-file green owned by the server node (`edit_merge_bench --instance
+  perf-cli --green ID --files 100 --form ping --form accept --form accept_one`, three invocations with the two
+  accept forms' order alternated). p50 in each round: `accept`, edit then submit, 14.1, 18.6 and 14.8 ms; `accept_one`
+  6.93, 7.81 and 7.03 ms; a ping (one forwarded `versions`) 6.13, 7.74 and 7.66 ms. One request costs one round trip.
+  The p99 is the link's in both forms (70 to 158 ms).
+### A-226 — An idle shard gives back only the recovery memory written since its last give-back (accepted and built 2026-11-06; amends A-117; the supervisor's item (c), the macOS paced tail)
+Applied in the same change to:
+- `crates/vfs/src/checkpoint_log.rs` (`Journal`'s `committed_written`, `stale_written`, `log_written`,
+  `UNKNOWN_EXTENT`, `Journal::checkpointed`, `Journal::given_back`, the bounded `Journal::dead_ranges`);
+- `crates/server/src/daemon.rs` (`return_dead_recovery`, test support `Daemon::give_back_recovery_on_every_shard`) and
+  `crates/server/src/state.rs` (`recovery_returned_at` removed);
+- the tests `a_give_back_returns_only_recovery_memory_written_since_the_last` (`crates/server/tests/recovery.rs`, red
+  first) and the oracle `a_give_back_names_every_dead_written_byte_and_stops_at_the_last`
+  (`crates/vfs/tests/checkpoint_log.rs`);
+- A-117's entry, BENCHMARKS ("The macOS paced tail was the recovery give-back"), GAPS, and
+  `docs/bugs/2026-11-06-an-idle-shards-recovery-give-back-walked-18-gb-at-every-publication.md`.
+
+Status: built 2026-11-06.
+- Why: A-117 gave back the stale checkpoint slot and the log past its tail whole, at every publication. Only what was
+  written since the last give-back can be resident, but the walk covered the regions' whole length: 18,325,143,552
+  bytes a shard on adas-macbook-pro-2. On macOS that is one `MADV_FREE_REUSABLE` mark of the range, 18 to 21 ms of the
+  shard's CPU in a single poll of its reap loop, once per tick after any merge. Every request reaching the shard
+  meanwhile waited behind it. That was the paced macOS tail (p99 5.7 to 21 ms) that the doorbell had been blamed for.
+  The shard's own stamps and per-poll CPU named it (the bug record); it was not a lost or held wake.
+- The rule: the journal records how far each region may have been written since it was last given back:
+  - the committed slot as far as its checkpoint, or further where it held a longer image never given back;
+  - the stale slot as far as the image it held when it was committed;
+  - the log as far as any frame, or the zeroed header after one, reached.
+  A give-back covers those extents and no further, and records what the object took; a range the object refuses stays
+  owed. A journal opened over memories it did not write (a restart, or a predecessor torn before its first commit)
+  takes each region as written throughout, so each is given back whole once per boot. Nothing else in A-117 changes:
+  the given-back ranges were never read, and a busy shard never gives anything back.
+- Proven: the oracle runs generated histories of checkpoints, appends, give-backs and restarts over memories that
+  record each byte written. After every step, every written byte that no restart reads lies inside the named ranges,
+  the ranges lie inside what no restart reads and end at the last such write (except a region unseen since a
+  restart), and a restart recovers the full image. Two mutations each fail it: the longer-image rule dropped, or the
+  log's extent zeroed at a checkpoint.
+- Measured (adas-macbook-pro-2, Apple M5 Max, 18 cores, 128 GiB, 2026-11-06 05:16 to 06:05 UTC, load 50 to 95 from
+  other builds). The paced harness (`edit_merge_bench --quiet-only --pause-ns 2000000 --files 10 --form accept`,
+  3 × 1,000 calls) was run with every poll over 1 ms logged with its thread's CPU, a temporary diagnostic. Before:
+  46 reap-loop polls of 5 ms CPU or more, up to 48.5 ms. After: 6, each one of a shard's first two give-backs after
+  boot (12.1 to 42.7 ms, three shards, two each), and none later. Every other poll over 1 ms of wall time used under
+  1 ms of CPU: the host's load, not the shard's work. Latency, interleaved (10 of 12 runs finished before the time
+  limit): paced p99 before 12.3 to 39.2 ms at load 52 to 82 (149 and 234 ms in round 1, 142 to 361 ms at load 95),
+  after 6.8 to 29.2 ms (54 and 94 ms in one run); unpaced p99 before 0.64 to 32 ms, after 0.43 to 6.8 ms. That load
+  dominates both arms' tails, so the latency rows are informational and the CPU count is the measurement.
+- Sliced (2026-11-06, the supervisor's item 3): a give-back no longer takes a region whole in one step. Each idle step
+  gives back one slice from the top of each region down, and the journal records it (`Journal::given_back_from`).
+  The slice is what the OS gave back in one step quantum the previous step, measured by each step for the next
+  (`give_back_slice`, `learn_give_back_rate`; a page the first time). `purge_if_idle` yields between slices while any
+  is left. So a boot's give-back of memories the journal did not write (18 GB a shard on adas-macbook-pro-2, 12 to 43
+  ms in one poll before) holds the shard one quantum a step. The oracle gives back generated shares from the top
+  (`JournalStep::GiveBack { quarters }`). The test of the shard held is
+  `a_boot_give_back_holds_its_shard_no_longer_than_its_noise_floor`: a probe's longest wait through the boot's
+  give-back against its own quiet floor, skipping loudly on a host too loaded to judge.
+- The sibling of the same shape, sliced the same day: the Linux FUSE write log (A-63) gave back its whole record
+  area once per emptying (`WriteLog::purge`), whatever its records had reached. It now gives back only as far as
+  records reached since its last give-back (the whole area once, for a log opened over a predecessor's object), a slice
+  a call from the same measured slice. Failing first: `a_purge_gives_back_only_what_the_log_wrote_since_its_last`
+  (12,288 bytes, the 16 KiB log's whole area, after one 15-byte record; Linux 6.19.10).
+
+- **A give-back makes way (amended 2026-11-08, reland-a207's measurement).** Sliced give-backs (a30e4209) took one step per
+  yield for as long as the arena allocated nothing, and a granted landing allocates nothing. So under load the landing
+  and the give-back took turns, one short landing step for each whole quantum of give-back: 2,859 to 4,965 give-back
+  steps ran through each landing. Now a task that ran across the yield ends the give-back for this reap tick
+  (`purge_if_idle`; `content.give_back.left_for_next_tick`), so a landing pays for at most one step a tick. An idle shard
+  still goes on to the end. Measured in BENCHMARKS ("A give-back makes way"): landing median 21.5 s -> 4.2 s, the base's
+  own 4.2 s, 8 interleaved rounds each. Proven by `a_give_back_leaves_the_rest_for_the_next_tick_when_another_task_is_running`.
 
 ### A-214 — An idle shard keeps its last write burst's worth of free content pages pre-faulted (accepted 2026-11-05, VFS plan step 11; amends A-105)
 
@@ -14800,6 +15240,120 @@ green's base, the other half of the load test's first finding, is A-202's.
 - **Cost (measured on the branch it comes from):** every edit now appends to the partition log, so the partition's
   snapshots come at the rate edits arrive.
 
+### A-245 — An acknowledgement names the ids its client still owes, and every partition releases the rest (accepted and built 2026-11-07, fixtures' f = 1 rungs and the 10,000-client rung's backpressure; raft agreed)
+
+Applied in the same change to:
+- §4.9: "Exactly-once" (the acknowledgement names its owed ids) and its status of 2026-11-07.
+- GAPS: the load-test blockquote.
+- `crates/wire/src/request.rs`: `ClientWindow` keeps an open set; `acknowledge(up_to, owed)` and its rule.
+- `crates/db`: `Op::CompletionsAcknowledged` and the snapshot's `ClientCompletions` carry `owed`;
+  `owed_completions`.
+- `crates/ipc`: `RequestBody::Acknowledge { up_to, owed }`.
+- `crates/server`: `acknowledgement_owing` (a malformed acknowledgement refused whole, `ack.malformed`);
+  `ForwardedRequest::ack_owed` and `prune_forwarded`.
+- `crates/client`: `Client::acknowledgement` names the awaited, held and `Unpublished` ids.
+- The tests: `a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound` (`fleet.rs`),
+  `no_owed_id_is_released_whatever_order_its_acknowledgements_arrive_in` and the generated histories (`model.rs`),
+  the window's unit tests, and `an_unpublished_verb_stays_retryable_across_the_clients_acknowledgement` (`recovery.rs`)
+  restated for the rule.
+- **What was there.** One watermark (RIFL's, Lee et al., SOSP 2015), stopping below the lowest id still owed. A
+  watermark is contiguous, so one held or slow request kept every later completion of its client, and past
+  `2 × slots` the owner refused the client's next requests `AcknowledgementOwed`. At `f = 1`, where nearly every slow
+  submit is held for its resend, that was the steady state.
+- **The rule.**
+  - `up_to` covers every id issued; `owed` names those at or below it still owed (awaited, held within the reconnect
+    budget, `Unpublished`), at most the ring's slots and the hold's cap.
+  - An acknowledgement closes only what it speaks for (raft's rule): an open id at or below its `up_to` it does not
+    name is closed, an open id above its `up_to` is left open, a named id above the old watermark is opened, and a
+    closed id is never opened again. So a late, duplicated or reordered acknowledgement (a scatter, a relay) closes
+    only ids it covers and reopens none, and a released id is never executed twice. The watermark never moves back.
+  - One naming an owed id above its own `up_to`, or more owed ids than the completion bound, is refused whole
+    (`BadRequest`), never cut, since a cut releases ids still owed. The window ignores one whole if it were ever
+    logged, so replay stays a pure function of the log.
+  - The op changes in place: replay refuses an entry whose schema hash differs (`record.rs`), so an old log is refused,
+    never misread, as an appended op would be (raft).
+  - The origin relays its owed ids with a forwarded write, so the owner keeps a held submit's record too.
+- **Measured.** The bug record (`docs/bugs/2026-11-07-a-held-request-kept-every-later-completion-of-its-client.md`):
+  - the owner's `acknowledgement_owed` was 906,317 against 59,646 served at fixtures' 1k `f = 1`, and 513k at its 3k;
+  - after the change, 15 at the 3k, with oracle 0;
+  - the held-submit test was red 6/6 and is green.
+- **Owed.** The sync `call` path holds only `Unpublished` ids. A relayed acknowledgement rides only a forwarded write.
+
+### A-243 — A partition snapshots once its log's measured replay work reaches the recovery budget and the log reaches the last snapshot's size (accepted and built 2026-11-07, the 10,000-client rung's snapshot wall; raft agreed)
+
+Applied in the same change to:
+- §4.8: its status and the Recovery paragraph's bound.
+- Phase 2 task 2's cadence.
+- GAPS: the load-test blockquote.
+- `crates/db/src/replay.rs`: `snapshot_due`, `Tail`, `DbStats`, `Db::stats`, the timed append and apply,
+  `set_policy` pinning, `set_recovery_budget`; `SnapshotPolicy::derive` and the boot rate removed.
+- `crates/ipc` (`ShardReport::snapshots`, `DbSnapshotReport`), `crates/server` (`shard_report`) and `crates/cli`
+  (`slates status`).
+- The tests in `crates/db/tests/snapshot_cadence.rs`, and in `crates/db/tests/model.rs` the generated histories under
+  the measured trigger and the trigger's rule.
+- **What was there.**
+  - `bytes_between_snapshots = budget × replay throughput`, measured once at boot.
+  - A fresh boot replayed nothing, took 1 B/µs, and kept a 1 MB cadence for life.
+  - Each snapshot re-encodes the whole partition, so snapshot work was partition size / 1 MB per byte of log.
+- **The rule.**
+  - Snapshot when the tail's measured replay work ≥ the budget **and** its bytes ≥ the last snapshot's size. Work
+    alone would break the doubling bound; bytes alone is an extrapolation (raft's conditions).
+  - The work is timed on each commit's append (encode, checksum, copy into the ring) and its apply, never on a wait
+    outside them, so an idle partition never snapshots for nothing. That is the work a replay repeats per record, the append
+    mirroring the replay's read, checksum and decode. After a boot the tail's work starts at the recovery's own time,
+    the snapshot's decode included, and the floor at the recovered snapshot's size.
+  - Two versions came before it, each failed by a test that times recovery against the budget. A cadence of
+    `budget × rate` timed on the apply alone let a tail run 16 to 21 times the budget, since the decode is most of a
+    replay. Timed on the append and apply, but extrapolated from the last stretch of log, it let a tail of small
+    records after large ones run past the budget with no snapshot due for 40 to 56 times longer.
+  - The budget is the operator's input (`Db::set_recovery_budget`, GAPS §5), one second by default.
+  - The second condition is the doubling rule, so snapshot work stays within about twice the log written.
+  - The decision is the commit's, never the apply's: replay sees no clock.
+  - A cadence a caller sets is pinned.
+  - A log ring smaller than the cadence still forces a snapshot when full; at a ring about the partition's size the
+    same bound holds (tested).
+  - Recovery is bounded by decode(P) + max(budget, the replay of P bytes of log): the budget while P fits it, about
+    twice P's own cost beyond (raft's request that the change be stated).
+  - Snapshot points follow the clock, so two runs of one history snapshot at different points; recovery must give the
+    same state wherever they fell. The model's generated histories run under a pinned cadence and under the measured
+    trigger, the state compared whole after every crash.
+- **Measured.** The bug record.
+- **Owed.**
+  - The snapshot runs whole on the committing shard's turn (an 8 MiB encode stalls it; `longest_ns` names it).
+  - An incremental snapshot for partitions far past the budget.
+
+### A-249 — The purge in progress is one slot the receive worker reads, never a channel it drains (accepted and built 2026-11-07, the supervisor's decision: option (a); amends A-190 and A-198)
+
+Applied in the same change to:
+- §4.6 (Windows): this entry is its record; the purge's recognition is unchanged.
+- GAPS: "A private purge's intent can wait up to the 1 s transaction timeout", fixed.
+- `crates/bridge-winfsp`:
+  - `purge_slot.rs` (new, cfg-free): the slot's protocol, `Writer::publish` and `current_for`, over a `Memory` trait.
+  - `purge_intents.rs`: the slot in an unnamed section, each thread through its own `SharedObject` view, and the worker's
+    completion event. The channel, the intent event and its two-event wait are gone.
+  - `dispatcher.rs`: `PrivateOpens::authenticate` reads the slot when a Create arrives; `transaction` waits only on its
+    own completion.
+  - `host.rs`: `WinFspError::Intent`.
+- `docs/bugs/2026-11-07-a-private-purge-intent-waited-out-the-idle-receive.md`.
+- The tests: `purges_the_kernel_refuses_on_an_idle_drive_do_not_wait_out_the_transaction_timeout` (live, first), the
+  slot's plain and loom models in `purge_slot.rs`, and the section's two views in `purge_intents.rs`. CI's loom lane runs
+  `slates-bridge-winfsp` too.
+- **What was there.** A channel of two messages the worker drained after each control call. WinFsp's call never goes
+  pending, so when the kernel refused a purge's open before any request reached slates, the third publish waited for the
+  idle call's 1,000 ms timeout: four such purges took 3.02 s on arm64 and 3.01 s on x86_64 (diag-winfsp-overlap-43).
+  Cancelling the call from the publisher (`CancelIoEx`) left 2.54 s and 2.65 s and was not landed.
+- **The rule.**
+  - The mount thread is the slot's only writer and publishes the purge in progress, or none, without waiting.
+  - The slot's word names the client's process id beside a writing flag and a count. A publication sets the flag,
+    stores the purge's bytes, then stores the word with the client: Release on the publish, Acquire on the read.
+  - A Create reads the word once. Ada authorized that one atomic read on every Create (2026-11-07, asked through the
+    supervisor), replacing the channel's `try_recv` before every callback; the authorization covers that load only.
+    Only the purge's own opens read further, and a read that finds the flag set or the word changed is no purge.
+  - The word sits a cache-line pair (128 bytes) apart from the purge's bytes.
+  - The lint wall keeps no list of allowed atomic sites (`clippy.toml` disallows `Arc`, `Rc`, `Mutex`, `RwLock` and
+    `Condvar`), so the authorization is recorded at the load and here.
+- **Measured.** The red above; the green on both runners is owed to diag-winfsp-overlap-47.
+
 ### A-242 — A green's content history is copy-on-write, and an increment's post-state holds only the runs it adds (accepted and built 2026-11-07, W2 of the load test's walls)
 
 Applied in the same change to:
@@ -14842,6 +15396,55 @@ Applied in the same change to:
   - A rename copies its source's bytes into one chunk rather than sharing its pieces.
   - A base-seeded green's origin is held as chunks beside the head copy (W4, reland-a207's).
   - Greens merged before the fix may hold zeros a run after a length change put there.
+
+### A-250 — A member's death is retired at f + 1 voters, configured members are watched after a restart, and a restored copy is routed (accepted and built 2026-11-07, the supervisor's decision "A's tracking with B's confirmation")
+
+Applied in the same change to:
+- §4.8 "Promotion and takeover": a status note.
+- GAPS: the 2026-11-07 entry on a member down through a voter's restart.
+- `crates/server`:
+  - `fleet.rs`: `update_council_death_watch` with `unreached_since_start`, `confirmed_dead_council_members`,
+    `death_report`, `serve_death_report` and `send_death_report` on `DEATH_STREAM`, `follow_council_period`; held
+    records refused are counted by kind (`count_record_refusal`).
+  - `state.rs`: `death_reports`, `death_watch_started_ns`.
+  - `content_holder.rs`: `restore_held_registers` routes each restored copy.
+  - `takeover.rs`: the round's silent outcomes are counted.
+- The tests: `a_lone_voters_suspicion_never_retires_a_member`,
+  `a_sole_voters_own_view_retires_a_member_while_its_council_forms` and
+  `a_restored_holders_copy_moves_to_its_successor_and_accepts_its_adoption` (`crates/server/src/daemon.rs`), and
+  `a_member_down_through_a_voters_restart_is_still_taken_over` (`crates/cli/tests/live_fleet.rs`).
+- **What was there.**
+  - The council's leader retired a member on its own detector's view alone. After a warm restart the detector joins a
+    member only once its pair is keyed, and gossip about a member it has not joined is ignored (AUD-15). So a member
+    that died while the leader restarted was never judged at all and never retired.
+  - A copy restored from the held image got its acceptor back and no routing. Every install reaches a held copy only
+    through routing, so a restarted holder never moved the copy to its successor, never raised its generation, and
+    answered the successor's page empty. The successor's adoption was refused `ForeignGeneration` every period.
+- **The rule.**
+  1. A configured member is watched after a restart: one the detector has not reached for the membership horizon
+     since the watch began, unkeyed and not held alive, counts as dead.
+  2. A death is retired only at `f + 1` voters of the region, or every voter while the council has fewer than
+     `f + 1` besides the member (`Quorum::committed_within`, the floor a joint write takes): a forming council's sole
+     voter retires on its own view, since no other voter exists to report. The leader's own stable view is one vote.
+     Every other voter reports the members it holds dead on the council's membership path (`DEATH_STREAM`, once a
+     council period), never on a write. A report is kept for the membership horizon.
+  3. An incarnation cancels older reports: one below the incarnation the leader holds the member alive at counts for
+     nothing.
+  4. A restored copy is routed to the owner its acceptor names, as accepting a record does.
+- **TLA+.** No re-run is owed. `Reconfig.tla` models how the holder set changes once a retirement commits, not how
+  a death is decided. These rules change only who may propose a retirement and when, and a held copy's routing.
+- **Measured** (adacachy, 2026-11-07, `a_member_down_through_a_voters_restart_is_still_taken_over`, alone, under the
+  box's other sessions' load).
+  - With rule 2 alone (caf06d71): the restarted leader retired the owner in 2 of 2 runs it led; without its own vote,
+    red 3 of 3.
+  - Before rule 4: 4 stalls in 9 runs, each with the successor's 2 objects pending, and in the runs counted 1,058 to
+    1,130 unplaced adoptions in a minute.
+  - With rule 4: 15 of 15 in a row, each served in 3.7 to 7.4 s. Without it the unit test fails.
+  - Without rule 2's floor, `an_owner_killed_while_its_fleet_still_forms_is_taken_over` failed 3 of 3 alone: its
+    council's sole voter could never gather two votes.
+- **Owed.** A page still counts a holder's empty answer as its promise even when the holder leaves out a copy it
+  holds. With routing restored a restart no longer does this, but the rule belongs in phase one, for the takeover's
+  owner (the bug record's siblings).
 
 ### A-238 — A green's durable chain is checkpointed at its reachable floor, and a base below the checkpoint is unknown (accepted and built 2026-11-06, W3 of the load test's walls)
 
@@ -15351,6 +15954,116 @@ Applied in the same change to: §4.7 (data model, wake strategy, status); `slate
 and settle, `DaemonEnd::reply`'s stamp and confirmation) and `crates/ipc/tests/rings.rs`; GAPS. Evidence:
 `docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`. A client and a daemon of
 different layout versions refuse each other by name; no consensus rule or capability changes.
+
+### A-257 — A green's chain entry records what its verdict resolved, and recovery applies it (accepted and built 2026-11-08)
+
+A checkpoint at the reachable floor (A-238) can pass the base of an entry left in the chain, and recovery, which judged
+each entry again at its base, refused it and fenced the green. Holding the checkpoint below every retained base never
+folds under steady concurrency; carrying the deltas down to it is not enough, since a verdict reads files' lengths and
+bytes at the base. So the decision is recorded where it is made: the verdict at accept is the guard, the entry its
+result, and recovery applies it (`crates/db/src/partition.rs`'s guard-then-apply). The merge record's inputs stay the
+increment, so holders keep their independent judgement. Integrity at f = 0 between checkpoints is the entry's digest;
+the head identity is compared at checkpoints, holder-bound versions and recorded heads.
+
+Applied in the same change to:
+- §4.16: its status ("Commit").
+- GAPS: the load-test blockquote (W3's recovery).
+- `crates/merge`: `chain_entry.rs` (new), `Green::submit_resolved`, `Green::apply_recorded`, `Checkpoint::head_check`
+  (encoding version 2).
+- `crates/server`: `verbs::submit`, `record_accepted`, `replay_green`, the takeover's chain; `merge_service::inputs_of`,
+  `checkpoint_green_when`, `record_goes_to_holders`, `GreenFence::IdentityDiverged` (and `NotAccepted` removed).
+- `crates/anchor`: `LAYOUT_VERSION` 6.
+- Tests: `crates/merge/tests/chain_replay.rs` (new), `crates/server/tests/green_checkpoint.rs`.
+- Bug record: `docs/bugs/2026-11-08-a-checkpoint-passed-a-retained-entrys-base-and-recovery-fenced-the-green.md`.
+
+### A-252 — A request waiting for a version to commit is a typed durable state, so a resend after a restart never runs again (accepted and built 2026-11-08, fixtures' primary-kill rung; supervisor's two changes to the first cut)
+
+Applied in the same change to:
+- §4.9: its status of 2026-11-08.
+- GAPS: the load-test blockquote.
+- `crates/wire/src/request.rs`: `Seen::Awaiting`, `ClientWindow::await_version`, `awaiting_entries`; `retained` counts a wait.
+- `crates/db`: `Op::CompletionAwaiting` (appended), `AwaitingCompletion`, `ClientCompletions::awaiting` (appended).
+- `crates/server`: `merge_service::stage_awaiting` (the `Accepted` arm, ahead of the append) and `serve_awaiting`; the
+  `Seen::Awaiting` arms in `serve`, `run_forwarded` and `await_deferred_completion`.
+- The tests: fixtures' restart test and the still-waiting and takeover cases (`fleet.rs`),
+  `a_wait_and_its_transaction_are_one_durable_step` and the owed model's wait step (`model.rs`), the window's unit tests.
+- **What was there.** At `f > 0` the wait for a version's commit was in memory, and the version's append and the work's
+  reset were durable. A restart lost the wait, and a resend under its id ran again as a new version.
+- **The rule.**
+  - A request that ran and waits for a version is `Seen::Awaiting`, never `New`: answered that version once it has
+    placed, else joined to the wait, and never run again.
+  - The wait is logged in the transaction that appends the version, staged first, so the two are one durable step and a
+    failure fails the accept.
+  - It counts toward the client's bound and leaves when its completion replaces it or the client acknowledges it.
+  - It is a type, not reply bytes, so no reply encoding can be mistaken for it, and recovery and snapshots carry it by
+    type.
+  - After a takeover the resend is refused retryable and nothing runs twice, but the version is not named. That falls
+    short of §4.16's failure matrix (Masked after takeover) and is owed as A-255, not accepted here.
+- **Measured.** The bug record (`docs/bugs/2026-11-08-a-submit-resent-after-its-owner-restarted-was-applied-twice.md`):
+  the rung's 109 to 4,261 oracle failures fall to 0 on every run that finished. 7 of 18 runs stalled on W3's checkpoint
+  fence, which is independent of this rule (A-257).
+
+### A-246 — A restarted owner re-enqueues the merge records its chain holds (accepted 2026-11-07)
+
+AUD-11 answers a submit at `f > 0` once its version's record commits at the quorum. The records an owner owes and the
+submits waiting on them were in memory only, and a restart rebuilt greens from their chains without them, so a version
+appended before a crash and not yet placed was never shipped again. Replace that: the restart's replay of each green
+(`verbs::replay_green`) yields every replayed version's record fields with the green's head identity there. Those are
+version 0 when no checkpoint stands for it, then each chain entry. The owner enqueues them as pending records, placed
+from the configuration it holds when it ships. A holder that already applied a version re-acknowledges it from its
+acceptor, so re-shipping what was already placed costs one exchange a version and changes nothing.
+
+Rejected:
+- Persisting each record's placement. That is a durable write per commit, to save a re-ship only after a restart.
+- Asking the holders for their heads before shipping. That is a new exchange whose answer the re-acknowledgement
+  already gives.
+- Re-enqueueing on a takeover too. A takeover adopts its placed head under the promotion epoch and keeps that path.
+
+Applied in the same change to: §4.16 (Commit status); `slates-server` (`verbs::replay_green`, `rebuild_green`,
+`rebuild_recovered`; `merge_service::ReplayedVersion`, `enqueue_recovered_record`, `enqueue_record_with`); the fleet
+test; GAPS. Evidence: `docs/bugs/2026-11-07-a-version-appended-before-its-owner-restarted-never-committed.md`. No wire,
+layout or capability change.
+
+### A-244 — A merge record carries its inputs, so a version commits in one exchange (accepted 2026-11-07)
+
+A-235 woke the record plane per event, but a version still crossed five hops: a nudge, the inputs' offer, their transfer,
+a second nudge, the record. A submit at `f = 1` cost 6.7 ms at p50 quiet, against goal 4's 1 ms. Replace the separate
+inputs put. A record ships with its inputs whenever a target lacks them, as one merge shipment on the record's own
+stream: the record, then the content exchange's offer and every chunk. The holder serves the content frames through the
+content plane's own path (authority, retention at the door, the verified hold), then recomputes and accepts. Its one
+acknowledgement binds the record and places the inputs. Placed-before-referenced holds by construction, because a
+holder that does not hold the inputs a record names refuses it (`merge.inputs_unheld`). Also: a holder's retention rule
+reads only the ledger position at the sequence a held input was placed for, since a green's inputs are placed at their
+version's sequence. Rejected: keeping the put and sending it concurrently with the record, which is two paths for one
+fact and a record that can reach a holder before its inputs do. Also rejected: a larger content window, which leaves
+the second nudge and the second exchange.
+
+Applied in the same change to: §4.16 (Commit status); §4.10 content retention (the module doc); `slates-cluster`
+(`commit_record_sent_as`); `slates-db` (`Acceptor::value_at`); `slates-server` (`merge_service::carries_inputs`,
+`encode_shipment`, `decode_shipment`, `ship_record`, `fold_acknowledgements`, `INPUTS_CARRIED`, the removal of
+`put_inputs`; `fleet::serve_merge_shipment`, `serve_content_request`; `content_retention::named`); the fleet and unit
+tests; GAPS. Evidence: `docs/bugs/2026-11-07-a-versions-inputs-and-record-took-five-hops.md`,
+`docs/bugs/2026-11-07-retention-decoded-every-merge-record-per-put.md`. Wire: the merge record stream's payload is now a
+shipment. A holder of an older build fails to decode it and answers nothing, so a mixed fleet refuses safely.
+
+### A-254 — The owner of an instance is decided before anything is created (accepted 2026-11-08)
+Applied in the same change to: §4.7 (the rendezvous's status), GAPS, `crates/cli/src/anchor.rs` (`run`),
+`crates/server/src/daemon.rs` (`Daemon::start_with_fleet`), `crates/cli/tests/cli.rs` and `crates/server/tests/daemon.rs`
+(the tests below), and `docs/bugs/2026-11-08-a-refused-second-anchor-unlinked-the-live-instances-segment.md`.
+- **What was wrong.** A-176 and A-178 made the rendezvous refuse a live instance's second owner, but both start paths
+  created their segment first. On macOS a shared-memory name is the user's, a creation unlinks any holder's, and the
+  creator's drop unlinks the name again, so a refused second anchor or lone daemon took the live instance's segment name
+  with it. The live anchor's next daemon could not attach (`shm_open` `ENOENT`) and looped until the anchor was restarted.
+- **The rule.** A start decides that it owns the instance before it creates anything: the anchor holds the rendezvous, and
+  a daemon opens its listener, ahead of the segment and the content object. A refused start has created nothing, so it
+  unlinks nothing and a running instance is untouched.
+- **On every platform, though two hid it.** Linux's segment has no name (a memfd), and on Windows a live section's name
+  refuses the second creation. Both took the same wrong order; all three now take one.
+- **What it does not change.** The owner's token on each platform, the adoption of a held rendezvous (A-114), and what a
+  client sees: a daemon opens its listener a few steps earlier in its start, and a claim waits for it as before.
+- **Proven** on this Mac by two tests that failed on the old order: `a_refused_second_anchor_leaves_the_live_instance_its_segment_and_its_bytes`
+  (across processes: a live anchor and its daemon, a second anchor refused, the daemon killed, its successor adopting the
+  segment by name and reading the file back) and `a_refused_second_daemon_leaves_the_live_ones_segment_in_place`.
 
 ### A-235 — The merge record plane runs when there is merge work, and a version's inputs go only to holders whose next record it is (accepted 2026-11-06)
 
@@ -17445,7 +18158,7 @@ Applied in the same change to:
   five seconds; with a close mid-frame taken for a clean one the truncated count stays 0.
 - **Found on the way, recorded in GAPS, not changed here:** a read-only attachment grants a write-mode open and answers
   each write `EPERM` on every FUSE transport, and NFS answers `PERM`, where a read-only file system answers `EROFS` at
-  the open; `INIT`'s page count follows the host's page, so a 4 KiB-page guest of a 16 KiB-page Mac is told 16 pages,
+  the open (fixed 2026-11-08, §4.6 "A read-only attachment is a read-only file system"); `INIT`'s page count follows the host's page, so a 4 KiB-page guest of a 16 KiB-page Mac is told 16 pages,
   64 KiB a request, a quarter of the largest write.
 - **Over the wire on Linux (2026-10-24, part 1 step 2).** `attach` takes `AttachRequest::ShardsFs { subtree }`. On the
   volume's owner shard, inside the verb's transaction, the stream is made and served as above and its end kept under
@@ -18089,10 +18802,49 @@ Applied in the same change to:
   (`a_release_of_an_open_no_publication_counted_waits_for_nothing`).
 - **Left open:** a `FORGET` processed after the last publication leaves its lookup reference counted in the image, and
   the kernel never resends a `FORGET` either. It has no reply to wait behind; it stays under A-61's stated limits, as
-  a bounded leak (GAPS).
+  a bounded leak (GAPS). **Closed 2026-11-08 by a1b44bb1:** each `FORGET` is logged beside the writes (A-63), and a
+  successor gives it back in its place (§4.6, "A `FORGET` after the last publication is logged").
 - **Evidence.** See the bug record's verification.
 
+### A-256 — A base directory recovery cannot reacquire costs only its own untouched entries (accepted 2026-11-08, the supervisor's confirmation)
+Applied in the same change to (the code and tests in 4db8c179, this entry and A-153's pointer after them):
+- §4.8 ("Required persistence and protocol invariants");
+- `docs/wip/recovery.md`;
+- `crates/vfs/src/base.rs` (`BasePlane::unavailable`) and `crates/vfs/src/base_recovery.rs` (`BasePlane::recover`,
+  `image`);
+- the tests:
+  - `crates/vfs/tests/base.rs`: A-153's guard as it now stands,
+    `an_overlay_whose_base_directory_another_replaced_never_serves_the_other` (it was
+    `an_overlay_whose_base_directory_another_replaced_is_refused`), and
+    `an_overlay_whose_loaded_base_directory_was_removed_recovers_and_refuses_only_that_directory`;
+  - `crates/server/tests/recovery.rs` `an_overlay_whose_base_directory_was_removed_serves_its_own_files_after_a_restart`;
+  - `crates/cli/tests/cli.rs` `an_overlay_whose_base_directory_was_removed_serves_its_own_files_through_a_kept_mount`;
+- GAPS;
+- `docs/bugs/2026-11-07-a-removed-base-directory-refused-the-whole-volume-at-recovery.md`.
+
+- **What A-153 said.** A directory another directory replaced is not the same source, and is refused: the restart
+  refused the whole volume (`RecoveryIncomplete`), and the guard test named that. It left open a loaded directory
+  removed after the last publication, which refused the whole volume the same way.
+- **What it says now.** A recorded directory recovery cannot reacquire as the same one, gone from the disk, unreadable,
+  or another at the path, costs only its own untouched entries.
+  - The volume recovers.
+  - Those entries refuse `BaseUnavailable{path, errno}` (`ENOENT` when the host says only that it is not there).
+  - The volume's own entries in that directory serve.
+  - The next image keeps the directory's record, so a later recovery tries it again.
+- **What it does not change.** A-153's identity rule (device, inode number and birth time) still decides whether a
+  directory is the recorded one. Another directory is never substituted for it: reopening a path alone cannot substitute
+  another base. Only the price of a failed reacquisition changed, from the whole volume to that directory.
+- **Why.** §4.8's failure matrix already gives the runtime rule in its row "Base directory unreadable or gone": refused
+  `BaseUnavailable` for untouched entries under it, witnessed and pinned entries serving. Recovery was harsher than that
+  row, and one directory removed beneath a base cost the user every file the volume held, its own writes included (the
+  bug record).
+- **Not covered.** A directory that comes back while the daemon runs stays unavailable until the next restart.
+- **Evidence.** See the bug record and GAPS (A-153's "Open, found here", closed).
+
 ### A-153 — A recovered base directory is judged by its identity, not its entries (accepted 2026-10-22)
+**Amended by A-256 (2026-11-08):** a directory recovery cannot reacquire, replaced or removed, now costs only its own
+untouched entries rather than the whole volume; the identity rule below stands.
+
 Applied in the same change to:
 - §4.8 ("Required persistence and protocol invariants");
 - `docs/wip/recovery.md`;

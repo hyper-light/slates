@@ -623,10 +623,16 @@ mod delivered {
       .enroll(account, enroll_proof(&secret, account))
       .unwrap();
     let id = volume(&mut owner, "revoked");
+    // The consumer is of this daemon's host's account (A-237).
+    let anchor = owner.daemon_status().unwrap().anchor;
     owner
       .share(
         id,
-        slates_client::Principal::Consumer { account, consumer },
+        slates_client::Principal::Consumer {
+          host: anchor,
+          account,
+          consumer,
+        },
         slates_client::Rights {
           read: true,
           write: true,

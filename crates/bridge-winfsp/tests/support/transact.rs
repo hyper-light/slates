@@ -370,7 +370,7 @@ fn transact_cost() {
   }
   let drive = free_drive();
   let (requests, _unused) = sync_channel(REQUEST_BOUND);
-  let (purge_intents, mut private_opens) = crate::purge_intents::channel().unwrap();
+  let (purge_intents, private_opens) = crate::purge_intents::channel().unwrap();
   let mounted = Mounted::new(
     &drive,
     true,
@@ -378,7 +378,7 @@ fn transact_cost() {
     Waker::noop().clone(),
     None,
     purge_intents,
-    &mut private_opens,
+    &private_opens,
   )
   .unwrap();
   // SAFETY: the DLL object is live until `mounted` drops at the end, after the client has stopped.
@@ -632,7 +632,7 @@ fn open_and_close(drive: &str, stop: &AtomicBool) -> (Vec<u64>, u64) {
 fn measure_serving(serving: &Serving, opens: usize) {
   let drive = free_drive();
   let (requests, _unused) = sync_channel(REQUEST_BOUND);
-  let (purge_intents, mut private_opens) = crate::purge_intents::channel().unwrap();
+  let (purge_intents, private_opens) = crate::purge_intents::channel().unwrap();
   let mounted = Mounted::new(
     &drive,
     true,
@@ -640,7 +640,7 @@ fn measure_serving(serving: &Serving, opens: usize) {
     Waker::noop().clone(),
     None,
     purge_intents,
-    &mut private_opens,
+    &private_opens,
   )
   .unwrap();
   // SAFETY: the DLL object is live until `mounted` drops, after every thread here has joined.

@@ -117,7 +117,7 @@ fn daemon(name: &str) -> (Daemon, String) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-ackrel-{name}-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", &format!("ackrel-{name}")),
     },
   )
   .unwrap();
@@ -274,6 +274,7 @@ fn run_lagging() -> Lagging {
   let held_at = Instant::now();
   let (_, acknowledged) = client.call(&RequestBody::Acknowledge {
     up_to: created_id.sequence,
+    owed: Vec::new(),
   });
   let acknowledged_in = held_at.elapsed();
   let retried = client.call_as(created_id, &create(&first));
@@ -402,12 +403,16 @@ fn run_refused() -> RefusedRelease {
   let flooded = daemon.flood_control_channel_of(other).unwrap();
   let (_, acknowledged) = client.call(&RequestBody::Acknowledge {
     up_to: client.sequence,
+    owed: Vec::new(),
   });
   holding.join().unwrap();
   let counted = (before, release_refusals(&daemon));
   let (served, owed) = statuses_until_owed(&mut client, volume, slots * 6);
   let answered = client.sequence - 1;
-  let (_, released) = client.call(&RequestBody::Acknowledge { up_to: answered });
+  let (_, released) = client.call(&RequestBody::Acknowledge {
+    up_to: answered,
+    owed: Vec::new(),
+  });
   let (_, fresh) = client.call(&RequestBody::Status { volume });
   daemon.stop();
   RefusedRelease {

@@ -152,6 +152,25 @@ impl Build {
     self
   }
 
+  pub(crate) fn special(
+    &mut self,
+    path: &str,
+    node: slates_merge::special::SpecialNode,
+  ) -> &mut Build {
+    let path_idx = self.idx(path);
+    let bytes = node.encode();
+    let src = self.stash(&bytes);
+    self.doc.ops.push(Op {
+      kind: OpKind::Mknod,
+      flags: 0,
+      path: path_idx,
+      at: 0,
+      len: bytes.len() as u64,
+      src,
+    });
+    self
+  }
+
   pub(crate) fn removexattr(&mut self, path: &str, name: &str) -> &mut Build {
     let path_idx = self.idx(path);
     let name_idx = self.idx(name);

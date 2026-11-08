@@ -892,6 +892,35 @@ pub async fn commit_record_on(
   remote_holders: Vec<(HostId, Endpoint)>,
   budget: CommitBudget,
 ) -> Committed {
+  commit_record_sent_as(
+    stream,
+    owner,
+    owner_acceptor,
+    placement,
+    record,
+    record.encode(),
+    quorum,
+    remote_holders,
+    budget,
+  )
+  .await
+}
+
+/// [`commit_record_on`] with the bytes each holder is sent chosen by the caller (`sent`): a record class whose
+/// message carries more than the record — a green's merge record travels with the inputs it names (§4.16
+/// "Commit", one exchange a version) — while the acknowledgement still binds the record alone.
+#[allow(clippy::too_many_arguments)]
+pub async fn commit_record_sent_as(
+  stream: u64,
+  owner: HostId,
+  owner_acceptor: &mut Acceptor,
+  placement: &Placement,
+  record: &Record,
+  sent: Vec<u8>,
+  quorum: Quorum,
+  remote_holders: Vec<(HostId, Endpoint)>,
+  budget: CommitBudget,
+) -> Committed {
   let mut acked: Vec<HostId> = Vec::new();
   // The owner's local hold — it is a candidate among the holders (§4.8 "the owner among them").
   if owner_acceptor.accept(record).is_ok() && placement.candidates.contains(&owner) {
@@ -919,7 +948,7 @@ pub async fn commit_record_on(
   // bounds the wait itself (its progress-extension policy), so no deadline task is needed. Children of
   // the calling task, so they end with it (no orphans), and each is bounded by the dispatch's span.
   let (tx, mut rx) = reply_channel();
-  let record_bytes = record.encode();
+  let record_bytes = sent;
   let deadline_ns = budget.max_deadline_ns();
   let mut tasks = Vec::new();
   for (host, endpoint) in remote_holders {

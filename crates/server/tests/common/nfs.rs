@@ -13,6 +13,9 @@
 )]
 
 use std::io::{Read, Write};
+use std::time::{Duration, Instant};
+
+use slates_server::daemon::{HEARTBEAT_NS, OBSERVE_BUDGET_NS};
 
 /// Format: the MOUNT program number (RFC 1813).
 pub(crate) const MOUNT_PROGRAM: u32 = 100_005;
@@ -115,6 +118,52 @@ pub(crate) fn status(results: &[u8]) -> u32 {
   u32::from_be_bytes(results[0..4].try_into().unwrap())
 }
 
+/// Format: `NFS3ERR_JUKEBOX` (RFC 1813 §2.6) — the server cannot complete the call now, and the client is to
+/// retry it later. The daemon answers it while its owner lease is unconfirmed (§4.8 "Leases and reads", AUD-08) and
+/// when a stable write is not durable within its wait (A-200).
+pub(crate) const NFS3ERR_JUKEBOX: u32 = 10_008;
+
+/// Derived: the pause before a call answered [`NFS3ERR_JUKEBOX`] is made again, one heartbeat ([`HEARTBEAT_NS`]):
+/// the probe period's floor, the soonest a lease confirmation can arrive (§4.8), so no retry comes before the
+/// condition could have cleared.
+const RETRY_LATER_PAUSE: Duration = Duration::from_nanos(HEARTBEAT_NS);
+
+/// Derived: how long a call is made again while it is answered [`NFS3ERR_JUKEBOX`], the observe budget
+/// ([`OBSERVE_BUDGET_NS`], ten liveness budgets): the longest the harness waits on any one answer of the daemon's.
+const RETRY_LATER_BOUND: Duration = Duration::from_nanos(OBSERVE_BUDGET_NS);
+
+/// One NFS call of `procedure`, made again while the server answers [`NFS3ERR_JUKEBOX`], as an NFS client retries
+/// the retry-later answer (RFC 1813 §2.6): the first reply with any other status, which is never retried. A call still
+/// answered retry-later at [`RETRY_LATER_BOUND`] fails the test naming `what`, the answer and how often it came.
+/// Each retry keeps the call's `xid`, since the daemon keeps no reply cache to replay the refusal from. A call whose
+/// effect happened but was not durable in time is answered retry-later too (A-200), so a retried MKDIR can meet its
+/// own directory; that answer is reported as it is, as a client's would be.
+pub(crate) fn served_past_retry_later(
+  stream: &mut (impl Read + Write),
+  procedure: u32,
+  args: &[u8],
+  xid: u32,
+  what: &str,
+) -> Vec<u8> {
+  let began = Instant::now();
+  let mut refused = 0u32;
+  loop {
+    let reply = call(stream, NFS_PROGRAM, procedure, args, xid);
+    if status(&reply) != NFS3ERR_JUKEBOX {
+      return reply;
+    }
+    refused += 1;
+    assert!(
+      began.elapsed() < RETRY_LATER_BOUND,
+      "{what}: answered NFS3ERR_JUKEBOX ({NFS3ERR_JUKEBOX}) {refused} times over {:?}, the bound {RETRY_LATER_BOUND:?}",
+      began.elapsed()
+    );
+    // A test's NFS client pauses between retries as a kernel client does; it runs no shard.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(RETRY_LATER_PAUSE);
+  }
+}
+
 /// MOUNT MNT `path` → the root file handle.
 pub(crate) fn mount(stream: &mut (impl Read + Write), path: &str, xid: u32) -> Vec<u8> {
   let mut args = Vec::new();
@@ -179,8 +228,30 @@ pub(crate) fn lookup(
   name: &str,
   xid: u32,
 ) -> Vec<u8> {
-  lookup_status(stream, dir_fh, name, xid)
-    .unwrap_or_else(|status| panic!("LOOKUP {name}: status {status}, expected 0"))
+  let reply = served_past_retry_later(
+    stream,
+    3,
+    &lookup_args(dir_fh, name),
+    xid,
+    &format!("LOOKUP {name}"),
+  );
+  looked_up(&reply).unwrap_or_else(|status| panic!("LOOKUP {name}: status {status}, expected 0"))
+}
+
+/// LOOKUP3args: `name` in `dir_fh`.
+fn lookup_args(dir_fh: &[u8], name: &str) -> Vec<u8> {
+  let mut args = Vec::new();
+  opaque(dir_fh, &mut args);
+  opaque(name.as_bytes(), &mut args);
+  args
+}
+
+/// A LOOKUP reply → the child's file handle, or the status the server answered instead.
+fn looked_up(reply: &[u8]) -> Result<Vec<u8>, u32> {
+  match status(reply) {
+    0 => Ok(read_opaque(reply, 4).0),
+    answered => Err(answered),
+  }
 }
 
 /// NFS LOOKUP `name` in `dir_fh` → the child's file handle, or the status the server answered instead — so a
@@ -191,14 +262,13 @@ pub(crate) fn lookup_status(
   name: &str,
   xid: u32,
 ) -> Result<Vec<u8>, u32> {
-  let mut args = Vec::new();
-  opaque(dir_fh, &mut args);
-  opaque(name.as_bytes(), &mut args);
-  let reply = call(stream, NFS_PROGRAM, 3, &args, xid);
-  match status(&reply) {
-    0 => Ok(read_opaque(&reply, 4).0),
-    answered => Err(answered),
-  }
+  looked_up(&call(
+    stream,
+    NFS_PROGRAM,
+    3,
+    &lookup_args(dir_fh, name),
+    xid,
+  ))
 }
 
 /// NFS GETATTR of `fh` → its `(mode, uid, gid)` — what `stat` shows through a kernel mount, and what a
@@ -208,8 +278,26 @@ pub(crate) fn owner_and_mode(
   fh: &[u8],
   xid: u32,
 ) -> (u32, u32, u32) {
-  owner_and_mode_status(stream, fh, xid)
-    .unwrap_or_else(|status| panic!("GETATTR: status {status}, expected 0"))
+  let reply = served_past_retry_later(stream, 1, &handle_args(fh), xid, "GETATTR");
+  owner_and_mode_of(&reply).unwrap_or_else(|status| panic!("GETATTR: status {status}, expected 0"))
+}
+
+/// The arguments of a call that names only `fh` (GETATTR3args, among others).
+fn handle_args(fh: &[u8]) -> Vec<u8> {
+  let mut args = Vec::new();
+  opaque(fh, &mut args);
+  args
+}
+
+/// A GETATTR reply → the object's `(mode, uid, gid)`, or the status the server answered instead.
+fn owner_and_mode_of(reply: &[u8]) -> Result<(u32, u32, u32), u32> {
+  match status(reply) {
+    0 => {
+      let field = |at: usize| u32::from_be_bytes(reply[at..at + 4].try_into().unwrap());
+      Ok((field(8), field(16), field(20)))
+    }
+    answered => Err(answered),
+  }
 }
 
 /// NFS GETATTR of `fh` → its `(mode, uid, gid)`, or the status the server answered instead.
@@ -218,16 +306,7 @@ pub(crate) fn owner_and_mode_status(
   fh: &[u8],
   xid: u32,
 ) -> Result<(u32, u32, u32), u32> {
-  let mut args = Vec::new();
-  opaque(fh, &mut args);
-  let reply = call(stream, NFS_PROGRAM, 1, &args, xid);
-  match status(&reply) {
-    0 => {
-      let field = |at: usize| u32::from_be_bytes(reply[at..at + 4].try_into().unwrap());
-      Ok((field(8), field(16), field(20)))
-    }
-    answered => Err(answered),
-  }
+  owner_and_mode_of(&call(stream, NFS_PROGRAM, 1, &handle_args(fh), xid))
 }
 
 /// NFS CREATE (UNCHECKED) `name` in `dir_fh` with mode 0644 → the new file's handle.
@@ -249,7 +328,7 @@ pub(crate) fn create(
   args.extend_from_slice(&0u32.to_be_bytes()); // set_size: no
   args.extend_from_slice(&0u32.to_be_bytes()); // atime: DONT_CHANGE
   args.extend_from_slice(&0u32.to_be_bytes()); // mtime: DONT_CHANGE
-  let reply = call(stream, NFS_PROGRAM, 8, &args, xid);
+  let reply = served_past_retry_later(stream, 8, &args, xid, &format!("CREATE {name}"));
   assert_eq!(status(&reply), 0, "CREATE {name}");
   // CREATE3resok: obj (post_op_fh: follows bool, then the handle), then attributes and dir wcc.
   assert_eq!(
@@ -391,7 +470,7 @@ pub(crate) fn mkdir(
   for _unset in 0..5 {
     args.extend_from_slice(&0u32.to_be_bytes()); // uid, gid, size: no; atime, mtime: DONT_CHANGE
   }
-  let reply = call(stream, NFS_PROGRAM, 9, &args, xid);
+  let reply = served_past_retry_later(stream, 9, &args, xid, &format!("MKDIR {name}"));
   assert_eq!(status(&reply), 0, "MKDIR {name}");
   // MKDIR3resok: obj (post_op_fh: follows bool, then the handle), then attributes and dir wcc.
   assert_eq!(
@@ -410,7 +489,7 @@ pub(crate) fn write(stream: &mut (impl Read + Write), file_fh: &[u8], data: &[u8
   args.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes()); // count
   args.extend_from_slice(&2u32.to_be_bytes()); // stable: FILE_SYNC
   opaque(data, &mut args);
-  let reply = call(stream, NFS_PROGRAM, 7, &args, xid);
+  let reply = served_past_retry_later(stream, 7, &args, xid, "WRITE");
   assert_eq!(status(&reply), 0, "WRITE succeeded");
 }
 
@@ -450,22 +529,22 @@ pub(crate) fn write_at_status(
 
 /// NFS READ up to 400 bytes at offset zero from `file_fh`.
 pub(crate) fn read(stream: &mut (impl Read + Write), file_fh: &[u8], xid: u32) -> Vec<u8> {
-  read_bytes_status(stream, file_fh, xid)
-    .unwrap_or_else(|status| panic!("READ: status {status}, expected 0"))
+  let reply = served_past_retry_later(stream, 6, &read_args(file_fh), xid, "READ");
+  read_bytes_of(&reply).unwrap_or_else(|status| panic!("READ: status {status}, expected 0"))
 }
 
-/// NFS READ of `file_fh` from offset 0 → the bytes, or the status the server answered instead.
-pub(crate) fn read_bytes_status(
-  stream: &mut (impl Read + Write),
-  file_fh: &[u8],
-  xid: u32,
-) -> Result<Vec<u8>, u32> {
+/// READ3args: up to 400 bytes of `file_fh` from offset zero.
+fn read_args(file_fh: &[u8]) -> Vec<u8> {
   let mut args = Vec::new();
   opaque(file_fh, &mut args);
   args.extend_from_slice(&0u64.to_be_bytes()); // offset
   args.extend_from_slice(&400u32.to_be_bytes()); // count
-  let reply = call(stream, NFS_PROGRAM, 6, &args, xid);
-  let answered = status(&reply);
+  args
+}
+
+/// A READ reply → the bytes, or the status the server answered instead.
+fn read_bytes_of(reply: &[u8]) -> Result<Vec<u8>, u32> {
+  let answered = status(reply);
   if answered != 0 {
     return Err(answered);
   }
@@ -476,7 +555,16 @@ pub(crate) fn read_bytes_status(
     off += 84; // post_op_attr fattr3
   }
   off += 8; // count and eof
-  Ok(read_opaque(&reply, off).0)
+  Ok(read_opaque(reply, off).0)
+}
+
+/// NFS READ of `file_fh` from offset 0 → the bytes, or the status the server answered instead.
+pub(crate) fn read_bytes_status(
+  stream: &mut (impl Read + Write),
+  file_fh: &[u8],
+  xid: u32,
+) -> Result<Vec<u8>, u32> {
+  read_bytes_of(&call(stream, NFS_PROGRAM, 6, &read_args(file_fh), xid))
 }
 
 /// NFS FSSTAT `fh` → the volume's (total bytes, free bytes): the quota the export serves as the
@@ -485,7 +573,7 @@ pub(crate) fn read_bytes_status(
 pub(crate) fn fsstat(stream: &mut (impl Read + Write), fh: &[u8], xid: u32) -> (u64, u64) {
   let mut args = Vec::new();
   opaque(fh, &mut args);
-  let reply = call(stream, NFS_PROGRAM, 18, &args, xid);
+  let reply = served_past_retry_later(stream, 18, &args, xid, "FSSTAT");
   assert_eq!(status(&reply), 0, "FSSTAT succeeded");
   let mut off = 4;
   let follows = u32::from_be_bytes(reply[off..off + 4].try_into().unwrap());
@@ -511,7 +599,7 @@ pub(crate) fn readdirplus(
   args.extend_from_slice(&[0u8; 8]); // cookieverf
   args.extend_from_slice(&512u32.to_be_bytes()); // dircount (advisory)
   args.extend_from_slice(&8192u32.to_be_bytes()); // maxcount
-  let reply = call(stream, NFS_PROGRAM, 17, &args, xid);
+  let reply = served_past_retry_later(stream, 17, &args, xid, "READDIRPLUS");
   assert_eq!(status(&reply), 0, "READDIRPLUS");
   let mut off = 4;
   let dir_follows = u32::from_be_bytes(reply[off..off + 4].try_into().unwrap());
@@ -563,7 +651,7 @@ pub(crate) fn readdirplus_entries(
   args.extend_from_slice(&[0u8; 8]); // cookieverf
   args.extend_from_slice(&512u32.to_be_bytes()); // dircount (advisory)
   args.extend_from_slice(&8192u32.to_be_bytes()); // maxcount
-  let reply = call(stream, NFS_PROGRAM, 17, &args, xid);
+  let reply = served_past_retry_later(stream, 17, &args, xid, "READDIRPLUS");
   assert_eq!(status(&reply), 0, "READDIRPLUS");
   let mut off = 4;
   let dir_follows = u32::from_be_bytes(reply[off..off + 4].try_into().unwrap());
@@ -631,7 +719,7 @@ pub(crate) type Time3 = (u32, u32);
 pub(crate) fn times(stream: &mut (impl Read + Write), fh: &[u8], xid: u32) -> [Time3; 3] {
   let mut args = Vec::new();
   opaque(fh, &mut args);
-  let reply = call(stream, NFS_PROGRAM, 1, &args, xid);
+  let reply = served_past_retry_later(stream, 1, &args, xid, "GETATTR");
   assert_eq!(status(&reply), 0, "GETATTR");
   // fattr3 after the status: type, mode, nlink, uid, gid (4 bytes each), size, used, rdev, fsid,
   // fileid (8 each), then atime, mtime, ctime (each two words).
@@ -662,7 +750,7 @@ pub(crate) fn set_times(
     }
   }
   args.extend_from_slice(&0u32.to_be_bytes()); // no guard
-  let reply = call(stream, NFS_PROGRAM, 2, &args, xid);
+  let reply = served_past_retry_later(stream, 2, &args, xid, "SETATTR of the times");
   assert_eq!(status(&reply), 0, "SETATTR of the times");
 }
 
@@ -679,12 +767,12 @@ pub(crate) fn read_whole(stream: &mut (impl Read + Write), file_fh: &[u8], xid: 
     opaque(file_fh, &mut args);
     args.extend_from_slice(&offset.to_be_bytes());
     args.extend_from_slice(&READ_CHUNK.to_be_bytes());
-    let reply = call(
+    let reply = served_past_retry_later(
       stream,
-      NFS_PROGRAM,
       6,
       &args,
       xid.wrapping_add(u32::try_from(offset / u64::from(READ_CHUNK)).unwrap()),
+      &format!("READ at {offset}"),
     );
     assert_eq!(status(&reply), 0, "READ at {offset}");
     let mut off = 4;

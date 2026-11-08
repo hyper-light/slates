@@ -1467,7 +1467,7 @@ impl Connection {
       if pmtu.is_probe(packet.pn) {
         grew |= pmtu.on_probe_acked(packet.pn, now);
       } else if packet.size > BASE_PLPMTU as u64 {
-        pmtu.on_large_packet_acked();
+        grew |= pmtu.on_large_packet_acked();
       }
     }
     if grew {
@@ -1480,18 +1480,20 @@ impl Connection {
 
   /// A probe timeout fired with packets above the floor in flight and nothing acknowledged since (RFC 8899
   /// §4.3): after a path shrinks, every packet at the old size is dropped, so no acknowledgement comes to
-  /// declare any of them lost — the timeout is the only evidence. It counts as one loss of an above-floor
-  /// packet; at the black-hole threshold the session falls to the floor, and the probe's copy is split to fit
-  /// it (`split_front_retransmission`). Without this a session whose path shrank retried full-size copies
-  /// forever (`docs/bugs/2026-09-28-a-shrunken-path-deadlocked-before-its-black-hole-was-seen.md`).
-  fn note_mtu_timeout(&mut self, now: u64) {
+  /// declare any of them lost. Three such timeouts in a row make the size suspect (`PathMtu::on_silence`) — the
+  /// session sends at the floor, the probe's copy split to fit it (`split_front_retransmission`), while probes at
+  /// the size decide — but count toward no black hole: a stopped peer acknowledges nothing at any size. Without the
+  /// floor a session whose path shrank retried full-size copies forever
+  /// (`docs/bugs/2026-09-28-a-shrunken-path-deadlocked-before-its-black-hole-was-seen.md`); counted as a loss,
+  /// a SIGSTOPped peer's three timeouts fell the session to the floor for good (2026-11-08).
+  fn note_mtu_timeout(&mut self) {
     if !self.sent.any_in_flight_larger_than(BASE_PLPMTU as u64) {
       return;
     }
     let Some(pmtu) = self.path_mtu.as_mut() else {
       return;
     };
-    if pmtu.on_large_packet_lost(now) {
+    if pmtu.on_silence() {
       self
         .controller
         .set_max_datagram(crate::endpoint::packet_budget_for(BASE_PLPMTU) as u64);
@@ -1499,9 +1501,10 @@ impl Connection {
   }
 
   /// Takes path-MTU probes out of a loss pass before the controller sees it (RFC 9000 §14.4: a lost probe is
-  /// no congestion signal) and folds every loss into discovery: a lost probe counts against its size, and
-  /// losses of other above-floor packets are black-hole evidence — on a black hole the session falls to the
-  /// floor and the controller follows. A `Ping` is never retransmitted.
+  /// no congestion signal) and folds every loss into discovery: a lost probe counts against its size (a lost
+  /// confirming probe against a suspect size, `PathMtu::on_probe_lost`), and losses of other above-floor
+  /// packets can make the size suspect — the session then sends at the floor and the controller follows. A
+  /// `Ping` is never retransmitted.
   fn note_mtu_losses(&mut self, lost: &mut Lost, now: u64) {
     let Some(pmtu) = self.path_mtu.as_mut() else {
       return;
@@ -1513,7 +1516,7 @@ impl Connection {
         return false;
       }
       if packet.size > BASE_PLPMTU as u64 {
-        fell |= pmtu.on_large_packet_lost(now);
+        fell |= pmtu.on_large_packet_lost();
       }
       true
     });
@@ -1711,7 +1714,7 @@ impl Connection {
     }
     self.pto_count = self.pto_count.saturating_add(1);
     self.probes_owed = 1;
-    self.note_mtu_timeout(now);
+    self.note_mtu_timeout();
     // The probe carries new data only if new data can actually leave now — a stream with data inside its
     // own credit but no connection credit left cannot, and a probe that sends nothing leaves the timer
     // firing at the same instant forever (found by the loss oracle, 2026-09-27).

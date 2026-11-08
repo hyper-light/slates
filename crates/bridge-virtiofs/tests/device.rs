@@ -1289,8 +1289,8 @@ mod backed {
   const ARENA_PAGES: usize = 64;
   /// Shape: the pages of the file whose write-back the arena cannot hold: twice the fixture's whole arena.
   const PAST_THE_ARENA_PAGES: usize = 2 * ARENA_PAGES;
-  /// Format: Linux `EPERM`, `EISDIR` and `EINVAL`, as a guest reads them.
-  const EPERM: i32 = 1;
+  /// Format: Linux `EROFS`, `EISDIR` and `EINVAL`, as a guest reads them.
+  const EROFS: i32 = 30;
   const EISDIR: i32 = 21;
   const EINVAL: i32 = 22;
 
@@ -2551,7 +2551,7 @@ mod backed {
   /// every window and forget both files. Expect: each overlapping SETUPMAPPING answered, the windows under it unmapped
   /// first (one unmap a piece, for the message placer) and the window then showing the second file; the map past the end
   /// answered and reading zero; the never-mapped removal answered with no unmap and the windows unchanged; the writable
-  /// ask refused `EPERM` with no window and no backing made; and at the end nothing mapped, held, counted or placed.
+  /// ask refused `EROFS` with no window and no backing made; and at the end nothing mapped, held, counted or placed.
   #[test]
   fn a_hostile_front_ends_asks_are_answered_as_before_and_leave_nothing_held() {
     for placer in placers() {
@@ -2617,7 +2617,7 @@ mod backed {
   }
 
   /// The read-only half of [`a_hostile_front_ends_asks_are_answered_as_before_and_leave_nothing_held`]: through a
-  /// read-only attachment, a writable SETUPMAPPING is refused `EPERM` with no window, nothing sent and no backing made.
+  /// read-only attachment, a writable SETUPMAPPING is refused `EROFS` with no window, nothing sent and no backing made.
   fn upgrade_without_write_rights_is_refused(placer: Placer) {
     let mut f = read_only_fixture(placer, "upgrade-ro");
     let node = f.file("f", &vec![0x41; f.page]);
@@ -2629,7 +2629,7 @@ mod backed {
     );
     assert_eq!(
       f.answer(FIRST_REQUEST_QUEUE, head),
-      -EPERM,
+      -EROFS,
       "{placer:?}: a writable ask through a read-only attachment is refused"
     );
     f.assert_nothing_sent("nothing sent for a refused ask");
@@ -2643,7 +2643,10 @@ mod backed {
       .attach(
         vid(),
         slates_bridge_core::View::Current,
-        slates_db::catalog::Principal::Uid { uid: 0 },
+        slates_db::catalog::Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 0,
+        },
         slates_bridge_core::Rights {
           read: true,
           write: false,
@@ -3136,7 +3139,7 @@ mod backed {
 
   /// §4.6, the backed route's L1 (A-193), through a read-only attachment, whose windows a guest can still hammer by
   /// reading, for both placers. Do: ask a window over a one-page file writable; then ask it read-only; then remove it and
-  /// forget the node. Expect: the writable ask refused `EPERM` with no window recorded, nothing sent, and no backing made
+  /// forget the node. Expect: the writable ask refused `EROFS` with no window recorded, nothing sent, and no backing made
   /// or placed; the read-only ask served (mapped read-only at the front end, for the message placer), its range placed
   /// (or counted refused) and, placed, one PMD page in slates' view; and, the node forgotten, nothing placed, held or
   /// counted.
@@ -3159,7 +3162,7 @@ mod backed {
       );
       assert_eq!(
         f.answer(FIRST_REQUEST_QUEUE, head),
-        -EPERM,
+        -EROFS,
         "{placer:?}: a writable ask through a read-only attachment is refused"
       );
       f.assert_nothing_sent("nothing sent to the front end");
@@ -3504,7 +3507,10 @@ fn guest_and_other_path() -> (OpContext, OpContext) {
       .attach(
         vid(),
         View::Current,
-        Principal::Uid { uid: 0 },
+        Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 0,
+        },
         Rights {
           read: true,
           write: true,

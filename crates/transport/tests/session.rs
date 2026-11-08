@@ -342,6 +342,232 @@ fn a_session_finds_its_paths_mtu_and_falls_back_when_the_path_shrinks() {
   assert!(stats.probes_lost > 0 && stats.probes_acked > 0, "{stats:?}");
 }
 
+/// The shape the fleet's sessions are built with (`slates_server::fleet`'s `FLEET_FRAME_CAP`): frames as large as a
+/// datagram carries, so a transfer's packets fill the path's size — what makes a lost one an above-floor loss.
+fn fleet_shape() -> slates_transport::connection::ConnectionShape {
+  let cap = slates_transport::endpoint::MAX_PACKET_PAYLOAD;
+  slates_transport::connection::ConnectionShape::for_frame_cap(
+    cap,
+    RECEIVE_CEILING_WINDOWS * slates_transport::connection::initial_receive_window(cap),
+  )
+}
+
+/// Shape: at most this many transfers find the path's size before the fault (each a few hundred packets; the search
+/// loses each too-large size `MAX_PROBES` times on its way down from the peer's limit).
+const FIND_TRANSFERS: usize = 16;
+
+/// Format: the request that tells the dead-path server the client is done.
+const END_MARKER: &[u8] = b"end";
+
+/// How long the path stays dead under a fault in the black-hole regressions.
+#[derive(Clone, Copy)]
+enum DeadFor {
+  /// Shape: two seconds, the rolling partition flow's stop of a candidate (`live_chaos`'s `PARTITION`): many
+  /// backed-off probe timeouts fire inside it with nothing acknowledged, as at a stopped peer.
+  Stopped,
+  /// Shape: four of the path's round trips (2 ms each here), under one probe timeout: a window's worth is lost
+  /// and declared by the acknowledgements after it (a loss pass), as a receiver's full buffer drops a burst.
+  Burst,
+}
+
+impl DeadFor {
+  /// The dead time, nanoseconds.
+  fn nanos(self) -> u64 {
+    match self {
+      DeadFor::Stopped => 2_000_000_000,
+      DeadFor::Burst => 8_000_000,
+    }
+  }
+}
+
+/// What the black-hole regressions observe: both transfers byte-exact, the confirmed size before the fault and after,
+/// the discovery counts after, and the datagrams the dead path dropped.
+struct DeadPathOutcome {
+  exact: bool,
+  before: Option<usize>,
+  after: Option<usize>,
+  stats: Option<slates_transport::pmtud::PathMtuStats>,
+  dropped: u64,
+}
+
+/// Two transfers over an Ethernet path (a window holds a dozen above-floor packets), the path dead for `dead` (losing
+/// every datagram, of every size) from just before the second, then restored.
+fn transfers_across_a_dead_path(dead: DeadFor) -> DeadPathOutcome {
+  let jumbo = slates_rt::sim::SimPath::in_order(1_000_000, 0).with_mtu(ETHERNET_MTU);
+  let lost = jumbo.with_loss(slates_rt::sim::SimLoss::random(slates_rt::sim::PPM));
+  let mut sim = SimRuntime::new(&config(), 11).unwrap();
+  let id = *sim.shard_ids().first().unwrap();
+  slates_rt::sim::sim_udp_set_path(jumbo);
+  let server_identity = self_signed(NAME);
+  let client_identity = self_signed(NAME);
+  let server_cert = server_identity.certificate();
+  let client_cert = client_identity.certificate();
+  let (server_port_tx, server_port_rx) = channel();
+  let (client_port_tx, client_port_rx) = channel();
+  let (result_tx, result_rx) = channel();
+  let (restore_tx, restore_rx) = channel::<u64>();
+  // The restorer: told how long the path stays dead, waits that long on the simulated clock, then restores it.
+  sim
+    .spawn_on(id, async move {
+      loop {
+        if let Ok(dead_ns) = restore_rx.try_recv() {
+          let _ = slates_rt::futures::sleep(dead_ns).await;
+          slates_rt::sim::sim_udp_set_path(jumbo);
+          return;
+        }
+        if slates_rt::futures::sleep(100_000).await.is_err() {
+          return;
+        }
+      }
+    })
+    .unwrap();
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = server_port_tx.send(socket.local_addr().unwrap().port());
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(client_port_rx).await);
+      let mut server = Endpoint::server(
+        socket,
+        peer,
+        &server_identity,
+        std::slice::from_ref(&client_cert),
+        fleet_shape(),
+      )
+      .unwrap();
+      server.establish().await.unwrap();
+      // Every request until the client's end marker: the finding transfers and the one across the dead path.
+      loop {
+        let (request, _kind, received) = server.next_request().await.unwrap();
+        server.reply(request, &digest(&received)).unwrap();
+        if received == END_MARKER {
+          break;
+        }
+      }
+      server.settle().await.unwrap();
+    })
+    .unwrap();
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = client_port_tx.send(socket.local_addr().unwrap().port());
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(server_port_rx).await);
+      let mut client = Endpoint::client(
+        socket,
+        peer,
+        &client_identity,
+        &server_cert,
+        NAME,
+        fleet_shape(),
+      )
+      .unwrap();
+      client.establish().await.unwrap();
+      let first: Vec<u8> = (0..TRANSFER_BYTES)
+        .map(|at| u8::try_from(at % 251).unwrap_or(0))
+        .collect();
+      // Transfers until discovery has found the path (within its granularity), at most `FIND_TRANSFERS`.
+      let mut first_exact = true;
+      for _ in 0..FIND_TRANSFERS {
+        let reply = client
+          .request(STREAM_ID, Priority::Bulk, &first)
+          .await
+          .unwrap();
+        first_exact &= reply == digest(&first);
+        if client
+          .path_mtu()
+          .is_some_and(|mtu| ETHERNET_MTU - mtu <= slates_transport::pmtud::SEARCH_GRANULARITY)
+        {
+          break;
+        }
+      }
+      let before = client.path_mtu();
+      let dead_ns = dead.nanos();
+      let dropped_before = slates_rt::sim::sim_udp_stats().dropped_loss;
+      slates_rt::sim::sim_udp_set_path(lost);
+      let _ = restore_tx.send(dead_ns);
+      let second: Vec<u8> = (0..TRANSFER_BYTES)
+        .map(|at| u8::try_from(at % 241).unwrap_or(0))
+        .collect();
+      let second_reply = client
+        .request(STREAM_ID, Priority::Bulk, &second)
+        .await
+        .unwrap();
+      let _ = client
+        .request(STREAM_ID, Priority::Bulk, END_MARKER)
+        .await
+        .unwrap();
+      let _ = result_tx.send(DeadPathOutcome {
+        exact: first_exact && second_reply == digest(&second),
+        before,
+        after: client.path_mtu(),
+        stats: client.path_mtu_stats(),
+        dropped: slates_rt::sim::sim_udp_stats()
+          .dropped_loss
+          .saturating_sub(dropped_before),
+      });
+    })
+    .unwrap();
+  sim.run_until_idle();
+  result_rx.try_recv().unwrap()
+}
+
+/// §4.10a (RFC 8899 §4.3: a black hole is "excessive loss of data sent with a specific packet size"; §3 item 4: robust
+/// to probes "lost due to other reasons (including link transmission error, congestion)"): a peer that answers nothing for a
+/// while — stopped, as a SIGSTOPped daemon is — is a liveness event, not size evidence. Do: a transfer over a 1,500-byte
+/// path; the path then drops every datagram for two seconds (the rolling partition's stop) while a second transfer starts; then restored.
+/// Expect both transfers byte-exact and the confirmed size after it what it was before, with no black hole counted.
+/// Before, each probe timeout with full-size packets in flight counted as a loss of one, and three fell the session
+/// to the 1,200-byte floor: on loopback a resumed holder's session ran at the floor (live-durability, diag-42/43).
+/// Non-vacuous: the dead path dropped datagrams, and a size above the floor was found first.
+#[test]
+fn a_peer_silent_for_several_probe_timeouts_keeps_its_path_mtu() {
+  let outcome = transfers_across_a_dead_path(DeadFor::Stopped);
+  assert!(outcome.exact, "both transfers arrived byte-exact");
+  let before = outcome.before.unwrap();
+  assert!(
+    before > slates_transport::pmtud::BASE_PLPMTU
+      && ETHERNET_MTU - before <= slates_transport::pmtud::SEARCH_GRANULARITY,
+    "the Ethernet path was found first: {before}"
+  );
+  assert!(outcome.dropped > 0, "the dead path dropped datagrams");
+  let stats = outcome.stats.unwrap();
+  assert_eq!(
+    (outcome.after, stats.black_holes),
+    (Some(before), 0),
+    "a silent peer is no black hole: the size it had, none counted ({stats:?}, {} dropped)",
+    outcome.dropped
+  );
+}
+
+/// §4.10a (RFC 8899 §4.3 and §3 item 4, as above): a burst that loses every size — a receiver's full buffer drops
+/// whatever arrives — is congestion, which the congestion controller answers, not a smaller path. Do: as the silent
+/// peer, but the path dead for four round trips (under one probe timeout), so the loss is declared by the acknowledgements after it. Expect
+/// the same: both byte-exact, the size kept, no black hole. Before, three full-size packets declared lost in a row fell
+/// the session to the floor whatever else was lost with them. Non-vacuous: at least `BLACK_HOLE_LOSSES` datagrams
+/// were dropped.
+#[test]
+fn a_burst_that_loses_every_size_keeps_the_path_mtu() {
+  let outcome = transfers_across_a_dead_path(DeadFor::Burst);
+  assert!(outcome.exact, "both transfers arrived byte-exact");
+  let before = outcome.before.unwrap();
+  assert!(
+    before > slates_transport::pmtud::BASE_PLPMTU
+      && ETHERNET_MTU - before <= slates_transport::pmtud::SEARCH_GRANULARITY,
+    "the Ethernet path was found first: {before}"
+  );
+  assert!(
+    outcome.dropped >= u64::from(slates_transport::pmtud::BLACK_HOLE_LOSSES),
+    "the burst dropped a black hole's worth of datagrams: {}",
+    outcome.dropped
+  );
+  let stats = outcome.stats.unwrap();
+  assert_eq!(
+    (outcome.after, stats.black_holes),
+    (Some(before), 0),
+    "a burst lost at every size is no black hole: the size it had, none counted ({stats:?}, {} dropped)",
+    outcome.dropped
+  );
+}
+
 /// A request/reply exchange completes over a live session, the server producing its reply
 /// **asynchronously** (`serve_once_async`, the shape a forwarded verb needs — its reply comes from another
 /// shard or await; here the handler yields before replying, exercising the pending-await path): the client

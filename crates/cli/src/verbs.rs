@@ -310,29 +310,52 @@ fn mount_verb(
 }
 
 /// `unmount` on Windows (§4.6 "Windows"): the WinFsp volume at drive `path` is the daemon's own, so it is unmounted by
-/// detaching its attachment, found among the volumes' reported mounts; the daemon then removes the drive.
+/// detaching its attachment, found among the volumes' reported mounts; the daemon then removes the drive. Every volume
+/// is asked: one whose status is refused (a volume recovery could not rebuild answers `NotFound`) cannot report its
+/// mounts, so it is passed over and named on standard error by its refusal, and the drive is still released when
+/// another volume reports it. Only when no volume that answered reports the drive is the unmount refused, naming the
+/// volumes that did not answer. A channel or daemon failure ends the scan, since no later volume can be asked either.
 #[cfg(windows)]
 fn unmount_verb(instance: &str, path: &str) -> Result<(), Failure> {
   let mut client = connect(instance)?;
   let volumes = client.list().map_err(|e| failure_of(e, instance))?;
+  let mut found = None;
+  let mut unreported = Vec::new();
   for summary in volumes {
-    let report = client
-      .status(summary.id)
-      .map_err(|e| failure_of(e, instance))?;
-    if let Some(mount) = report
-      .mounts
-      .iter()
-      .find(|mount| mount.path.eq_ignore_ascii_case(path))
-    {
-      client
-        .detach(mount.attachment)
-        .map_err(|e| failure_of(e, instance))?;
-      return Ok(());
+    match client.status(summary.id) {
+      Ok(report) => {
+        if found.is_none() {
+          found = report
+            .mounts
+            .iter()
+            .find(|mount| mount.path.eq_ignore_ascii_case(path))
+            .map(|mount| mount.attachment);
+        }
+      }
+      Err(ClientError::Refused(refusal)) => unreported.push(format!(
+        "volume {} ({}) refused {refusal:?}",
+        summary.name,
+        volume_id_text(summary.id)
+      )),
+      Err(other) => return Err(failure_of(other, instance)),
     }
   }
-  Err(Failure::Refused(format!(
-    "no slates volume is mounted at {path}"
-  )))
+  for volume in &unreported {
+    slates_machine::log_line!("slates: {volume}: its mounts are unknown");
+  }
+  match found {
+    Some(attachment) => client
+      .detach(attachment)
+      .map_err(|e| failure_of(e, instance)),
+    None if unreported.is_empty() => Err(Failure::Refused(format!(
+      "no slates volume is mounted at {path}"
+    ))),
+    None => Err(Failure::Refused(format!(
+      "no slates volume that reported its mounts is mounted at {path}; {} did not report: {}",
+      unreported.len(),
+      unreported.join("; ")
+    ))),
+  }
 }
 
 /// `unmount` off Windows is the OS's own (`umount`, `fusermount3 -u`): it needs no daemon, so a stale mount is
@@ -1553,9 +1576,22 @@ fn emit_share(
   rights: Rights,
   json: bool,
 ) -> Result<(), ClientError> {
+  // A principal with no host named is this daemon's own host's (A-237).
+  let here = match principal {
+    SharePrincipal::Uid { host: Some(_), .. } | SharePrincipal::Consumer { host: Some(_), .. } => 0,
+    _ => client.daemon_status()?.anchor,
+  };
   let principal = match principal {
-    SharePrincipal::Uid(uid) => Principal::Uid { uid: *uid },
-    SharePrincipal::Consumer { account, consumer } => Principal::Consumer {
+    SharePrincipal::Uid { uid, host } => Principal::Uid {
+      host: host.unwrap_or(here),
+      uid: *uid,
+    },
+    SharePrincipal::Consumer {
+      account,
+      consumer,
+      host,
+    } => Principal::Consumer {
+      host: host.unwrap_or(here),
       account: account.unwrap_or_else(current_account),
       consumer: *consumer,
     },
@@ -2508,6 +2544,9 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
     report.fleet.takeovers_pending,
     report.fleet.configuration_version
   );
+  // This node's certificate anchor (A-237): what a share from another host names this host's accounts by
+  // (`slates share ID uid:N@ANCHOR`).
+  out.push_str(&format!("anchor: {}\n", report.anchor));
   let root: String = report
     .seal
     .root_id
@@ -2640,6 +2679,20 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
     out.push_str(&format!(
       "shard {} registry_attachments: {}\n",
       shard.partition, shard.registry_attachments
+    ));
+    let snapshots = &shard.snapshots;
+    out.push_str(&format!(
+      "shard {} snapshots: taken={} written={} longest_ns={} log_appended={} tail_bytes={} tail_replay_ns={} \
+       budget_ns={} floor_bytes={}\n",
+      shard.partition,
+      snapshots.snapshots,
+      snapshots.bytes_written,
+      snapshots.longest_ns,
+      snapshots.log_bytes_appended,
+      snapshots.tail_bytes,
+      snapshots.tail_replay_ns,
+      snapshots.budget_ns,
+      snapshots.floor_bytes
     ));
     for live in &shard.live {
       out.push_str(&format!(

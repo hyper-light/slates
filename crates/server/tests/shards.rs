@@ -31,6 +31,7 @@ use slates_ipc::protocol::{
   Direction, Intent, NamePolicy, Refusal, ReplyBody, RequestBody, SizeClass, VolumeId, pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect};
+use slates_rt::registry::SlotHolder;
 use slates_server::shards::{ShardsAsk, ShardsAttached};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 use slates_wire::request::RequestId;
@@ -67,7 +68,8 @@ const DAX_RANGE: u64 = slates_mem::DAX_RANGE_BYTES;
 const UNKNOWN_OPCODE: u32 = 9_999;
 /// Format: Linux errnos a reply carries, negated.
 const ENOSYS: i32 = 38;
-const EPERM: i32 = 1;
+/// Format: Linux `EROFS`, a read-only file system's answer to any change.
+const EROFS: i32 = 30;
 const ENOENT: i32 = 2;
 const EIO: i32 = 5;
 /// Linux's `EISDIR`, a descriptor ask for a directory.
@@ -167,7 +169,7 @@ fn single_shard_daemon(name: &str) -> (Daemon, String) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{name}"),
+      name: common::fixture_object("slates-seg", name),
     },
   )
   .unwrap();
@@ -193,6 +195,31 @@ fn my_uid() -> u32 {
   rustix::process::getuid().as_raw()
 }
 
+/// An attachment as [`attach`] hands it to a test: the daemon's answer, and the daemon's shards, by whose CPU clocks a
+/// guest waiting on the stream judges whether the daemon still works on its answer ([`Guest::await_answer`]).
+#[derive(Debug)]
+struct Attached {
+  answer: ShardsAttached,
+  shards: Vec<SlotHolder>,
+}
+
+/// The registrations of `daemon`'s shards, whose CPU clocks say whether it still works on a guest's answer.
+fn shard_holders(daemon: &Daemon) -> Vec<SlotHolder> {
+  daemon
+    .shards()
+    .iter()
+    .filter_map(|shard| slates_rt::registry::holder_of(shard.0))
+    .collect()
+}
+
+impl std::ops::Deref for Attached {
+  type Target = ShardsAttached;
+
+  fn deref(&self) -> &ShardsAttached {
+    &self.answer
+  }
+}
+
 /// Attaches `volume` over a stream as this test's user, presenting `subtree` with `intent`: the attachment, or the
 /// typed refusal.
 fn attach(
@@ -200,12 +227,16 @@ fn attach(
   volume: VolumeId,
   subtree: Option<&str>,
   intent: Intent,
-) -> Result<ShardsAttached, Refusal> {
+) -> Result<Attached, Refusal> {
   let (tx, rx) = channel();
   daemon
     .attach_shards_stream(
       ShardsAsk {
-        principal: Principal::Uid { uid: my_uid() },
+        // This node's account (A-237): the volume's owner, as the rendezvous recorded it, named by this node's anchor.
+        principal: Principal::Uid {
+          host: slates_db::HostId(daemon.anchor().expect("the daemon reports its anchor")),
+          uid: my_uid(),
+        },
         volume,
         subtree: subtree.map(str::to_owned),
         intent,
@@ -215,7 +246,10 @@ fn attach(
       }),
     )
     .unwrap();
-  rx.recv_timeout(CREDIT_WAIT).expect("the attach answered")
+  let shards = shard_holders(daemon);
+  rx.recv_timeout(CREDIT_WAIT)
+    .expect("the attach answered")
+    .map(|answer| Attached { answer, shards })
 }
 
 // --- Shards' fs device, as seen from its socket. ---
@@ -226,13 +260,29 @@ struct Guest {
   unique: u64,
   /// When the guest last sent a frame: how long an answer that never came was waited for.
   sent_at: Instant,
+  /// The daemon's shards, by whose CPU clocks the guest judges whether the daemon still works on its answer.
+  shards: Vec<SlotHolder>,
+  /// The answers this guest waited for past one [`CREDIT_WAIT`] window ([`Guest::await_answer`]'s extension, which
+  /// the fixed wall wait before 2026-11-07 would have failed), and the longest wait for any answer.
+  waits: Waits,
+}
+
+/// What a guest's waits for the daemon came to: the non-vacuity count of [`Guest::await_answer`]'s extension.
+#[derive(Clone, Copy, Debug, Default)]
+struct Waits {
+  /// Answers that came after more than one [`CREDIT_WAIT`] window.
+  extended: u32,
+  /// The longest any answer took.
+  longest: Duration,
 }
 
 impl Guest {
-  fn over(attached: ShardsAttached) -> Guest {
-    let stream = UnixStream::from(attached.stream);
+  fn over(attached: Attached) -> Guest {
+    let stream = UnixStream::from(attached.answer.stream);
     stream.set_read_timeout(Some(CREDIT_WAIT)).unwrap();
     Guest {
+      shards: attached.shards,
+      waits: Waits::default(),
       stream,
       unique: 0,
       sent_at: Instant::now(),
@@ -255,8 +305,85 @@ impl Guest {
     self.stream.write_all(bytes).unwrap();
   }
 
+  /// Waits until the daemon has sent this guest something, for as long as the daemon works on it: in windows of
+  /// [`CREDIT_WAIT`], the next only while one of its shards ran on the CPU in the window just ended, and within
+  /// [`CREDIT_WAIT`] of their CPU since the wait began (A-65 and A-228's rule: the watchdog and the daemon's own
+  /// cross-shard waits judge a shard by its own time). A daemon starved by a loaded machine is waited for; one whose
+  /// shards ran nothing for a window (wedged), or ran the budget without answering (spinning), fails the test, naming
+  /// which. Before 2026-11-07 the guest gave the daemon a fixed [`CREDIT_WAIT`] of wall time: under load 120 to 156 on
+  /// macOS a writable DAX map's fill, a 16 KiB page a turn, took longer, and the read failed `EAGAIN` with the daemon
+  /// working (live-durability's runs).
+  fn await_answer(&mut self) {
+    use rustix::event::{PollFd, PollFlags, Timespec};
+    let window = Timespec {
+      tv_sec: i64::try_from(CREDIT_WAIT.as_secs()).unwrap_or(i64::MAX),
+      tv_nsec: i64::from(CREDIT_WAIT.subsec_nanos()),
+    };
+    let readings = || -> Vec<Option<(u64, u64)>> {
+      self
+        .shards
+        .iter()
+        .map(|holder| {
+          slates_rt::registry::shard_cpu(*holder)
+            .map(|reading| (reading.spent_ns, reading.progress))
+        })
+        .collect()
+    };
+    let began = readings();
+    let mut mark = began.clone();
+    let mut windows = 0u32;
+    loop {
+      let mut fds = [PollFd::new(&self.stream, PollFlags::IN)];
+      match rustix::event::poll(&mut fds, Some(&window)) {
+        Ok(ready) if ready > 0 => {
+          let waited = self.sent_at.elapsed();
+          self.waits.longest = self.waits.longest.max(waited);
+          if windows > 0 {
+            self.waits.extended = self.waits.extended.saturating_add(1);
+          }
+          return;
+        }
+        Ok(_) | Err(rustix::io::Errno::INTR) => {}
+        Err(errno) => panic!("polling the guest's stream: {errno:?}"),
+      }
+      let now = readings();
+      let ran = now
+        .iter()
+        .zip(&mark)
+        .any(|(now, then)| matches!((now, then), (Some((_, now)), Some((_, then))) if now > then));
+      let spent: u64 = now
+        .iter()
+        .zip(&began)
+        .filter_map(|(now, then)| Some(now.as_ref()?.0.saturating_sub(then.as_ref()?.0)))
+        .sum();
+      let budget = u64::try_from(CREDIT_WAIT.as_nanos()).unwrap_or(u64::MAX);
+      assert!(
+        ran && spent < budget,
+        "the daemon has not answered this guest {:?} after its last frame, and its shards {} (CPU since the wait began: \
+         {spent} ns of a {budget} ns budget)",
+        self.sent_at.elapsed(),
+        if ran {
+          "ran the budget without answering"
+        } else {
+          "ran nothing for a whole window"
+        }
+      );
+      mark = now;
+      windows = windows.saturating_add(1);
+    }
+  }
+
+  /// Prints this guest's waits, named `who`: how many answers came past one window, and the longest.
+  fn report_waits(&self, who: &str) {
+    eprintln!(
+      "{who}'s waits for the daemon: {} answers past one {CREDIT_WAIT:?} window, the longest {:?}",
+      self.waits.extended, self.waits.longest
+    );
+  }
+
   /// Reads one frame: whether it is a control frame, and its bytes; `None` at the stream's end.
   fn reply_frame(&mut self) -> Option<(bool, Vec<u8>)> {
+    self.await_answer();
     let mut word = [0u8; 4];
     match self.stream.read_exact(&mut word) {
       Ok(()) => {}
@@ -482,6 +609,7 @@ impl Guest {
   /// byte, then the payload.
   fn descriptor_answer(&mut self) -> Result<OwnedFd, i32> {
     use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
+    self.await_answer();
     let mut header = [0u8; 5];
     let mut space = [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut control = RecvAncillaryBuffer::new(&mut space);
@@ -758,31 +886,34 @@ fn a_guest_history_over_the_stream_is_the_volume_the_host_sees() {
   drop(daemon);
 }
 
-/// Every change a read-only guest asks for is refused: a create, a directory, an unlink, a rename, a truncating
-/// SETATTR, and a write through a handle opened for reading or for writing (`EPERM`, the shared bridge's answer).
+/// Every change a read-only guest asks for is refused as a read-only file system refuses it, `EROFS` (POSIX): a create,
+/// a directory, an unlink, a rename, a truncating SETATTR, an open for writing (at the open), and a write through a
+/// handle opened for reading.
 fn every_change_is_refused(guest: &mut Guest) {
-  assert!(guest.create(ROOT, "new.txt").is_err());
-  assert!(guest.mkdir(ROOT, "new-dir").is_err());
-  assert_ne!(guest.unlink(ROOT, "kept.txt"), 0);
-  assert_ne!(guest.rename(ROOT, "kept.txt", ROOT, "moved.txt"), 0);
+  assert_eq!(guest.create(ROOT, "new.txt").err(), Some(EROFS));
+  assert_eq!(guest.mkdir(ROOT, "new-dir").err(), Some(EROFS));
+  assert_eq!(guest.unlink(ROOT, "kept.txt"), EROFS);
+  assert_eq!(guest.rename(ROOT, "kept.txt", ROOT, "moved.txt"), EROFS);
   let node = guest.lookup(ROOT, "kept.txt").unwrap();
-  assert_ne!(
+  assert_eq!(
     guest.truncate(node, 0),
-    0,
+    EROFS,
     "a truncating SETATTR is refused"
   );
-  let writable = guest.open(node, O_RDWR).unwrap();
-  assert_eq!(guest.write(node, writable, 0, b"no"), Err(EPERM));
-  assert_eq!(guest.close(node, writable), (0, 0));
+  assert_eq!(
+    guest.open(node, O_RDWR).err(),
+    Some(EROFS),
+    "an open for writing is refused at the open"
+  );
   let fh = guest.open(node, O_RDONLY).unwrap();
-  assert_eq!(guest.write(node, fh, 0, b"no"), Err(EPERM));
+  assert_eq!(guest.write(node, fh, 0, b"no"), Err(EROFS));
   assert_eq!(guest.read(node, fh, 0, 4096).unwrap(), FROM_HOST);
 }
 
 /// AC (Shards part 1, step 1), by use: an attachment for reading refuses every change (CREATE, MKDIR, UNLINK, RENAME,
 /// a WRITE through any handle it opens, a truncating SETATTR) and nothing lands in the volume, while it reads what the
-/// host wrote. A handle opened for writing is granted and every write through it refused `EPERM`, as on every FUSE
-/// transport (the shared bridge's answer, recorded in GAPS: a read-only filesystem would answer `EROFS` at the open).
+/// host wrote. Every refusal is a read-only file system's, `EROFS`, and an open for writing is refused at the open. Until
+/// 2026-11-08 that open was granted and each write through it refused `EPERM`, as on every FUSE transport.
 #[test]
 fn a_read_only_stream_refuses_every_change() {
   let (daemon, client, id) = provisioned("shards-read-only");
@@ -873,7 +1004,10 @@ fn status(client: &mut Client, volume: VolumeId) -> slates_ipc::protocol::Status
   };
   let up_to = client.sequence;
   assert!(matches!(
-    client.call(&RequestBody::Acknowledge { up_to }),
+    client.call(&RequestBody::Acknowledge {
+      up_to,
+      owed: Vec::new(),
+    }),
     ReplyBody::Acknowledged
   ));
   report
@@ -1235,7 +1369,7 @@ fn dax_provisioned_in(
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{name}"),
+      name: common::fixture_object("slates-seg", &name),
     },
   )
   .unwrap();
@@ -1447,6 +1581,105 @@ fn two_asks_for_one_node_answer_one_object_the_peer_cannot_resize() {
   drop(daemon);
 }
 
+/// Shape: a starved poll's CPU burst and its time off the CPU, a fifth of the time on it, as a thread kept off its core
+/// by spinners runs a little at a time (as `tests/liveness.rs`).
+const STARVED_BURST: Duration = Duration::from_millis(10);
+const STARVED_OFF: Duration = Duration::from_millis(40);
+
+/// Holds `daemon`'s first shard in one poll for `span`, on the CPU a fifth of the time, as a starved shard runs.
+/// Returns once the poll has begun, with the thread that waits for it to end.
+fn hold_starved(daemon: &Daemon, span: Duration) -> std::thread::JoinHandle<()> {
+  let began: &'static std::sync::atomic::AtomicBool =
+    Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false)));
+  let observation = daemon
+    .observation(
+      Some(*daemon.shards().first().unwrap()),
+      slates_server::daemon::OBSERVE_BUDGET_NS,
+      move |_: &mut slates_server::state::ShardState| {
+        began.store(true, std::sync::atomic::Ordering::Release);
+        let started = Instant::now();
+        while started.elapsed() < span {
+          let burst = Instant::now();
+          while burst.elapsed() < STARVED_BURST {
+            std::hint::spin_loop();
+          }
+          let (_hold, off) = channel::<()>();
+          let _ = off.recv_timeout(STARVED_OFF);
+        }
+      },
+    )
+    .unwrap();
+  let waiter = std::thread::spawn(move || {
+    let _ = observation.wait();
+  });
+  let started = Instant::now();
+  while !began.load(std::sync::atomic::Ordering::Acquire) {
+    assert!(started.elapsed() < CREDIT_WAIT, "the hold began");
+    std::thread::yield_now();
+  }
+  waiter
+}
+
+/// The guest waits for a working daemon past one window, and counts it (2026-11-07). Do: on a one-shard daemon, write
+/// a 3 MiB file; hold the shard in one poll for a window and a half of [`CREDIT_WAIT`], on the CPU a fifth of the time
+/// as a starved shard runs; meanwhile ask for the file's writable DAX map. Expect the map answered once the poll ends,
+/// and the guest's extension counted (`Waits::extended`): it waited past one window because the shard kept running.
+/// The guest before 2026-11-07 gave the daemon one window of wall time, and the ask failed `EAGAIN`, as a starved
+/// daemon's did under load 150 to 170 on macOS.
+#[test]
+fn a_guest_waits_past_one_window_for_a_starved_daemon_and_counts_it() {
+  let (daemon, client, id) = dax_provisioned("shards-dax-starved", 8 << 20, None);
+  let mut guest = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+  guest.init();
+  let file = guest_writes_large(&mut guest, "starved", &patterned(3 << 20, 0x5a));
+  let held = hold_starved(&daemon, CREDIT_WAIT * 3 / 2);
+  let answer = guest.descriptor(file, true, Some((0, DAX_RANGE)));
+  held.join().unwrap();
+  guest.report_waits("the starved daemon's guest");
+  assert!(
+    answer.is_ok(),
+    "the map was answered once the starved shard served it: {:?}",
+    answer.err()
+  );
+  assert!(
+    guest.waits.extended >= 1 && guest.waits.longest > CREDIT_WAIT,
+    "the guest waited past one window for the working daemon: {:?}",
+    guest.waits
+  );
+  drop(client);
+  drop(daemon);
+}
+
+/// Each fixture daemon's segment is its own (2026-11-07). Do: create two segments in turn under one fixture name, as a
+/// proptest's successive cases and two processes of this binary do, drop the first, and attach to the second by its
+/// handoff, as an anchor's next daemon does. Expect the attach to succeed. On macOS a shared-memory name is the user's,
+/// a creation first unlinks any holder's, and a creator's drop unlinks the name again; with one name for both, the
+/// first's drop unlinked the second's, and a loaded run's next case failed its shard's start (`shm_open` `ENOENT`, then
+/// `ConsensusNotInitialized`). Linux names no segment (a memfd), so there the attach holds either way.
+#[test]
+fn a_dropped_fixture_segment_leaves_the_next_ones_in_place() {
+  let profile = common::machine_profile();
+  let config = DaemonConfig::derive(&profile, "shards-segment-twice", Some(1));
+  let create = || {
+    slates_anchor::AnchorSegment::create(
+      &common::fixture_object("slates-seg", "shards-segment-twice"),
+      &profile.facts.identity,
+      config.geometry,
+    )
+    .unwrap()
+  };
+  let first = create();
+  let second = create();
+  let (handoff, len) = second.handoff().unwrap();
+  drop(first);
+  let attached = slates_anchor::AnchorSegment::attach(&handoff, len, &profile.facts.identity);
+  assert!(
+    attached.is_ok(),
+    "the second fixture's segment is still there once the first is dropped: {:?}",
+    attached.err()
+  );
+}
+
 /// AC (Shards part 3, step 2), hostile input. Do: send descriptor asks cut short, with a range whose end overflows, with
 /// a range past the object, for the root directory, for a node that does not exist, for a node outside a scoped
 /// attachment's directory, and a writable ask of a read-only attachment. Expect each refused with its errno and no
@@ -1526,13 +1759,13 @@ fn a_scoped_attachment_reaches_no_node_outside(daemon: &Daemon, id: VolumeId, ou
   );
 }
 
-/// A read-only attachment's writable ask is refused `EPERM`, and its read-only ask answered.
+/// A read-only attachment's writable ask is refused `EROFS`, and its read-only ask answered.
 fn a_read_only_attachment_may_not_ask_to_write(daemon: &Daemon, id: VolumeId, file: u64) {
   let mut reader = Guest::over(attach(daemon, id, None, Intent::Read).unwrap());
   reader.init();
   assert_eq!(
     reader.descriptor(file, true, Some((0, DAX_RANGE))).err(),
-    Some(EPERM),
+    Some(EROFS),
     "a writable ask of a read-only attachment"
   );
   assert!(
@@ -2091,6 +2324,8 @@ fn every_byte_holds_its_latest_write(
       act
     );
   }
+  guest.report_waits("the mapping guest");
+  other.report_waits("the writing guest");
   drop(client);
   drop(daemon);
   Ok(())
@@ -2544,10 +2779,13 @@ mod route {
       &mut || false,
     )
     .unwrap();
-    let mut guest = Guest::over(ShardsAttached {
-      attachment,
-      lease_epoch: None,
-      stream,
+    let mut guest = Guest::over(Attached {
+      answer: ShardsAttached {
+        attachment,
+        lease_epoch: None,
+        stream,
+      },
+      shards: shard_holders(&daemon),
     });
     guest.init();
     assert_eq!(guest.lookup(ROOT, "nothing"), Err(ENOENT));
@@ -2605,7 +2843,7 @@ mod route {
       // The churn stops however the claims end, a failed assertion included: the scope waits for its threads, so a
       // churn left running would hold a failed test forever.
       let _stop = StopOnDrop(&stop);
-      claims_under_churn(&mut client, id, &instance)
+      claims_under_churn(&daemon, &mut client, id, &instance)
     });
     assert_eq!(
       flushed, 0,
@@ -2630,7 +2868,12 @@ mod route {
 
   /// Makes [`CLAIMS_UNDER_CHURN`] offers of `id` and claims each, running `INIT` through every live end: the ends that
   /// arrived flushed, refused by the client (`Flushed`) or, were that check gone, reading a zero receive buffer.
-  fn claims_under_churn(client: &mut Client, id: VolumeId, instance: &str) -> usize {
+  fn claims_under_churn(
+    daemon: &Daemon,
+    client: &mut Client,
+    id: VolumeId,
+    instance: &str,
+  ) -> usize {
     let mut flushed = 0usize;
     for _ in 0..CLAIMS_UNDER_CHURN {
       let (attachment, secret) = offer(client, id);
@@ -2654,10 +2897,13 @@ mod route {
         flushed += 1;
         continue;
       }
-      let mut guest = Guest::over(ShardsAttached {
-        attachment,
-        lease_epoch: None,
-        stream,
+      let mut guest = Guest::over(Attached {
+        answer: ShardsAttached {
+          attachment,
+          lease_epoch: None,
+          stream,
+        },
+        shards: shard_holders(daemon),
       });
       guest.init();
     }

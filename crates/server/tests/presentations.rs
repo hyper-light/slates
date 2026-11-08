@@ -37,7 +37,7 @@ fn daemon(tag: &str, awaiting_bound: Option<usize>) -> (Daemon, String) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-presented-{tag}-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", &format!("presented-{tag}")),
     },
   )
   .unwrap();
