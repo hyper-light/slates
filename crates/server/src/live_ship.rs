@@ -1750,10 +1750,31 @@ async fn ship_lane(
     // Each message under its own budget: the liveness budget plus its transfer on the session it rides, so an install of
     // the whole volume is not given up the moment an entry would be (`exchange_budget`).
     let exchange = exchange_budget(send.bytes.len(), &sessions);
+    // Diag only (live-durability-43, never on main): the session's path before the exchange, and the exchange's time.
+    let diag_path = sessions.first().map(|(_, endpoint)| diag_path_of(endpoint));
+    let diag_began = slates_rt::futures::now_ns();
+    let diag_had_session = !sessions.is_empty();
     let exchanged =
       slates_cluster::live::exchange((send.stream, &send.bytes), sessions, exchange, |_, _| true)
         .await;
     let answered = !exchanged.replies.is_empty();
+    let diag_took = slates_rt::futures::now_ns().saturating_sub(diag_began);
+    let diag_after = exchanged.reusable.first().map(|(_, endpoint)| diag_path_of(endpoint));
+    if diag_had_session && (diag_took >= crate::daemon::LIVENESS_BUDGET_NS / 10 || !answered) {
+      eprintln!(
+        "LD-LANE at {} holder {} stream {} bytes {} budget_ns {} took_ns {} answered {} unanswered {} path_before {:?} path_after {:?}",
+        diag_began,
+        holder.0,
+        send.stream,
+        send.bytes.len(),
+        exchange.max_deadline_ns(),
+        diag_took,
+        answered,
+        exchanged.unanswered.len(),
+        diag_path,
+        diag_after
+      );
+    }
     if !answered {
       let _ = state::with_state(|s| s.count(LIVE_UNANSWERED, 1));
     }
@@ -2029,6 +2050,7 @@ pub(crate) async fn period(origin: u16, shard: u16) {
         // A writer may wait on a condition that changes with no acknowledgement to fold (the head placed once its
         // neighbourhood settles, a pair delivered): answered here at the latest.
         resolve(s, *volume);
+        diag_waiters(s, *volume);
         // A log whose last whole entry no successor among the candidates could open is checkpointed again once this
         // shard has delivered the pairs that would let it ([`covers_candidates`]).
         if !covers_candidates(s, *volume)
@@ -2053,6 +2075,57 @@ pub(crate) async fn period(origin: u16, shard: u16) {
     crate::fleet::live_budget().max_deadline_ns(),
   )
   .await;
+}
+
+thread_local! {
+  /// Diag only (live-durability-44, never on main): when each waiting position was first seen by a period, ns.
+  static DIAG_FIRST_SEEN: std::cell::RefCell<BTreeMap<([u8; 16], u64), u64>> =
+    const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+
+/// Diag only (live-durability-44, never on main): after a period's `resolve`, names each waiter on `volume` older than a
+/// liveness budget, with the shipper's head and durable position and every gate of [`answerable`], so a writer woken
+/// late says which gate held it; and the period's own time, so a gap in these lines says the period did not run.
+fn diag_waiters(state: &ShardState, volume: [u8; 16]) {
+  let now = slates_rt::futures::now_ns();
+  let positions: Vec<u64> = state
+    .live
+    .awaiting
+    .range((volume, 0)..=(volume, u64::MAX))
+    .map(|((_, position), _)| *position)
+    .collect();
+  let old = DIAG_FIRST_SEEN.with(|seen| {
+    let mut seen = seen.borrow_mut();
+    seen.retain(|(v, position), _| *v != volume || positions.contains(position));
+    positions
+      .iter()
+      .map(|position| (*position, *seen.entry((volume, *position)).or_insert(now)))
+      .filter(|(_, first)| now.saturating_sub(*first) >= crate::daemon::LIVENESS_BUDGET_NS)
+      .collect::<Vec<(u64, u64)>>()
+  });
+  if old.is_empty() {
+    return;
+  }
+  let live = state.live.shipping.get(&volume);
+  eprintln!(
+    "LD-WAIT at {now} shard {} waiters {:?} (position, age_ns) head {:?} durable {:?} whole_entry {:?} \
+     head_placed {} active_set_recorded {} covers_candidates {} recorded {:?} recording {:?} transition {:?} \
+     owes_whole {} owes_image {} fenced {:?}",
+    state.shard,
+    old.iter().map(|(position, first)| (*position, now.saturating_sub(*first))).collect::<Vec<_>>(),
+    live.and_then(|live| live.shipper.head()).map(|head| head.position),
+    live.and_then(|live| live.shipper.durable()),
+    live.and_then(|live| live.whole_entry).map(|head| head.position),
+    head_placed(state, volume),
+    active_set_recorded(state, volume),
+    covers_candidates(state, volume),
+    live.and_then(|live| live.recorded),
+    live.and_then(|live| live.recording.as_ref().map(|(version, _)| *version)),
+    live.and_then(|live| live.shipper.transition().map(<[HostId]>::to_vec)),
+    live.is_some_and(|live| live.owes_whole),
+    live.is_some_and(|live| live.owes_image),
+    live.and_then(|live| live.fenced),
+  );
 }
 
 /// This shard's live logs for `status` (A-200): each it ships, then each it holds as a candidate.
@@ -2135,6 +2208,48 @@ fn hold_bound(state: &ShardState, object: ObjectId) -> Option<usize> {
   usize::try_from(limit.saturating_mul(2)).ok()
 }
 
+/// Diag only (live-durability-45, never on main): a session's path for the LD lines: cwnd, srtt, pto, mtu, spurious
+/// losses, persistent collapses, and path MTU discovery's (probes sent, acked, lost, black holes).
+fn diag_path_of(
+  endpoint: &slates_transport::endpoint::Endpoint,
+) -> (u64, u64, u64, Option<usize>, u64, u64, Option<(u64, u64, u64, u64)>) {
+  (
+    endpoint.congestion_window(),
+    endpoint.smoothed_rtt(),
+    endpoint.pto(),
+    endpoint.path_mtu(),
+    endpoint.spurious_losses(),
+    endpoint.persistent_collapses(),
+    endpoint
+      .path_mtu_stats()
+      .map(|stats| (stats.probes_sent, stats.probes_acked, stats.probes_lost, stats.black_holes)),
+  )
+}
+
+thread_local! {
+  /// Diag only (live-durability-45, never on main): the last live message served per (peer, object), ns.
+  static DIAG_LAST_SERVED: std::cell::RefCell<BTreeMap<(u64, [u8; 16]), u64>> =
+    const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+
+/// Diag only (live-durability-45, never on main): a holder's serve of a live message from `peer`, begun at `began`: a
+/// line when it took 1 ms or more, or came 100 ms to 2 s after the last from that peer for that object.
+fn diag_served(kind: &str, peer: HostId, object: Option<ObjectId>, bytes: usize, began: u64) {
+  let now = slates_rt::futures::now_ns();
+  let took = now.saturating_sub(began);
+  let key = (peer.0, object.map_or([0; 16], |object| object.0));
+  let gap = DIAG_LAST_SERVED.with(|last| {
+    let mut last = last.borrow_mut();
+    let gap = last.get(&key).map(|then| began.saturating_sub(*then));
+    last.insert(key, now);
+    gap
+  });
+  let gapped = gap.is_some_and(|gap| (100_000_000..2_000_000_000).contains(&gap));
+  if took >= 1_000_000 || gapped {
+    eprintln!("LD-SERVE at {began} {kind} from {} bytes {bytes} took_ns {took} gap_ns {gap:?}", peer.0);
+  }
+}
+
 /// A candidate's answer to an entry from `peer` (A-200): authorized as a content placement (`fleet::content_authorized`),
 /// checked against the replica's chain and fence, kept within its bound, answered with the head held.
 pub(crate) fn serve_entry(
@@ -2143,6 +2258,7 @@ pub(crate) fn serve_entry(
   peer: HostId,
   request: &[u8],
 ) -> Vec<u8> {
+  let diag_began = slates_rt::futures::now_ns();
   let object = slates_db::live::object_of(request);
   let bound = match admitted(state, local, peer, object) {
     Ok(bound) => bound,
@@ -2170,6 +2286,7 @@ pub(crate) fn serve_entry(
     Err(error) => count_refused(state, refused_counter(error)),
     Ok(_) => state.count(LIVE_HELD, 1),
   }
+  diag_served("entry", peer, slates_db::live::object_of(request), request.len(), diag_began);
   encode_reply(&reply)
 }
 
@@ -2180,6 +2297,7 @@ pub(crate) fn serve_install(
   peer: HostId,
   request: &[u8],
 ) -> Vec<u8> {
+  let diag_began = slates_rt::futures::now_ns();
   let object = slates_db::live::object_of_state(request);
   let bound = match admitted(state, local, peer, object) {
     Ok(bound) => bound,
@@ -2209,6 +2327,7 @@ pub(crate) fn serve_install(
     Err(error) => count_refused(state, refused_counter(error)),
     Ok(_) => state.count(LIVE_HELD, 1),
   }
+  diag_served("install", peer, slates_db::live::object_of_state(request), request.len(), diag_began);
   encode_reply(&reply)
 }
 
