@@ -25,7 +25,7 @@ fn daemon(name: &str) -> (Daemon, String) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{name}"),
+      name: format!("slates-seg-{name}-{}", std::process::id()),
     },
   )
   .unwrap();

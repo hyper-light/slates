@@ -3236,7 +3236,7 @@ fn a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted() {
     .attach(volume, None, slates_ipc::protocol::Intent::Write)
     .unwrap()
     .attachment;
-  let content = format!("slates-con-{tag}");
+  let content = common::anchor::content_name(&tag);
   let at_start = allocated_in_content(&content);
   client
     .fs_write((volume, attachment), "first", &body, 0o644)
@@ -3338,7 +3338,7 @@ fn a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it() {
     .attach(volume, None, slates_ipc::protocol::Intent::Write)
     .unwrap()
     .attachment;
-  let content = format!("slates-con-{tag}");
+  let content = common::anchor::content_name(&tag);
   let idle_ticks = || {
     daemon
       .refusals_on_every_shard()
@@ -3436,7 +3436,7 @@ fn a_deleted_files_memory_goes_back_to_the_os() {
   };
   let purged_before = purged();
   #[cfg(target_os = "linux")]
-  let content = format!("slates-con-{tag}");
+  let content = common::anchor::content_name(&tag);
   #[cfg(target_os = "linux")]
   let written = allocated_in_content(&content);
   client.fs_remove((volume, attachment), "big").unwrap();
@@ -3509,7 +3509,7 @@ fn a_deleted_files_plaintext_leaves_the_content_object() {
   client
     .fs_write((volume, attachment), "gone", &MARKER.repeat(32), 0o644)
     .unwrap();
-  let content = format!("slates-con-{tag}");
+  let content = common::anchor::content_name(&tag);
   // Published while still open, as a FUSE `close` publishes it: the image names the file's plaintext block, so the
   // delete below can only defer its free.
   daemon.publish_every_shard().unwrap();
@@ -3580,7 +3580,7 @@ fn a_sealed_files_plaintext_leaves_the_content_object() {
   client
     .fs_write((volume, attachment), "secret", &bytes, 0o644)
     .unwrap();
-  let content = format!("slates-con-{tag}");
+  let content = common::anchor::content_name(&tag);
   let written = occurrences_in_content(&content, MARKER);
   let started = Instant::now();
   while counter(&mut client, "content.sealed") == 0 && started.elapsed() < START_WAIT {

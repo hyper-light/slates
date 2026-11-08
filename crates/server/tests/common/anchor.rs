@@ -18,18 +18,26 @@ pub(crate) struct Anchor {
   rendezvous: HeldRendezvous,
 }
 
+/// The name of the content object [`held_anchor`] makes for `name`.
+pub(crate) fn content_name(name: &str) -> String {
+  format!("slates-con-{name}-{}", std::process::id())
+}
+
 /// The anchor's segment and content object for a test, the content object sized as the anchor sizes it
 /// (`DaemonConfig::content_bytes`: per shard, the write log, the two image slots and the arena range; lazily
 /// backed, so the unused tail costs no RAM), and the rendezvous of `config`'s instance.
 pub(crate) fn held_anchor(name: &str, profile: &MachineProfile, config: &DaemonConfig) -> Anchor {
   let content_bytes = config.content_bytes();
+  // Each name carries the process id: a kernel object's name is per user, and creating one removes a same-named object
+  // first, so two copies of a suite on one machine (other agents' runs, a developer's) would take each other's objects
+  // (a restart's `shm_open` then answers ENOENT).
   let segment = AnchorSegment::create(
-    &format!("slates-seg-{name}"),
+    &format!("slates-seg-{name}-{}", std::process::id()),
     &profile.facts.identity,
     config.geometry,
   )
   .unwrap()
-  .with_content(&format!("slates-con-{name}"), content_bytes)
+  .with_content(&content_name(name), content_bytes)
   .unwrap();
   Anchor {
     segment,
