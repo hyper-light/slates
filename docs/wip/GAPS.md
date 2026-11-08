@@ -14357,6 +14357,21 @@ ended with no answer, which it had not checked. Red first, on adacachy: the old 
 probe failed as in the field, and the new one passed; with the edge's arrival bound removed, the new close check
 failed after its 10 s wait. Under two spinners a core: 10 of 10.
 
+### 2026-11-07: the git workload signed its commits where the harness's parent did — fixed
+
+`a_host_reference_run_over_a_kept_scratch_starts_from_an_empty_tree` (`xtask/src/conformance/workloads.rs`) failed on
+this Mac at load ~14 (bug-sweep): the two host runs' `git log --format='%H %T %P'` agreed on the tree and differed in
+the commit and its parent. kiln configures commit signing for its agent sessions through the environment
+(`GIT_CONFIG_COUNT=11` with `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`: `commit.gpgsign true`, an x509 signer), which
+`GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1` do not reach. So the workload's commits were signed, each
+signature carrying its signing time: two runs inside one second matched, and two a second apart did not. The same
+leak would make a host and a mount run differ on any machine that signs this way; CI's runners set no such variables.
+
+The workload's environment now sets `GIT_CONFIG_COUNT=0` and removes `GIT_CONFIG_PARAMETERS` (`workload_environment`).
+Red first: `the_workload_environment_keeps_a_parents_git_configuration_out` commits from a parent environment that
+configures signing with a program that always fails; under the old environment the commit failed ("gpg failed to sign
+the data"), and it is made unsigned now (adacachy).
+
 ### 2026-10-22: two pressure tests failed on a busy machine, not on the property — fixed
 
 `a_stale_handle_never_reads_a_reused_inode_under_churn` and
