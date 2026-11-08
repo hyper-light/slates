@@ -300,6 +300,9 @@
 >   held-rendezvous answer bound (`docs/bugs/2026-11-07-the-crash-loop-test-timed-its-children-on-the-wall.md` and the
 >   start judgment's bug). Still the client's (clients, A-232): its wall-second reply deadline stalls a verb against a
 >   live, starved daemon ("no reply within 1000000000 ns" for `bootstrap root`, 5 of 15 runs at 8 spinners a CPU).
+>   The same deadline gave up on a probe of `presentation_fairness.rs`'s granted test once in Stack B1's gate. Its
+>   naming since then found every long wait starved, not held: 62 probes of 504 to 982 ms on `4811191a` at 144 spinners,
+>   with the shard runnable in 6,581 of 6,582 samples (`docs/bugs/2026-11-08-a-landings-plan-held-its-shard.md`).
 > The bug record of 2026-11-07 has the per-phase table.
 
 > **A Windows UDP socket died on an earlier send's ICMP error (found 2026-11-06, fixed 2026-11-06).** With Windows'
