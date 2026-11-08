@@ -12790,6 +12790,190 @@ fn a_version_appended_before_its_owner_restarted_commits_once_it_is_back() {
       source(0),
     ),
   );
+  let lifted: Vec<_> = daemons[1..]
+    .iter()
+    .map(|holder| holder.inject_merge_fault(slates_server::merge_service::MergeFault::default()))
+    .collect();
+  let all: Vec<&Daemon> = daemons.iter().collect();
+  let committed = poll_until(&all, PLACEMENT_DEADLINE, || {
+    daemons[0].merge_record_placed(green, 1)
+  });
+  let counters = merge_and_content_counters(&daemons);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    matches!(edited, ReplyBody::Edited),
+    "the edit was declared: {edited:?}"
+  );
+  assert!(
+    faulted.iter().chain(&lifted).all(Result::is_ok),
+    "the holders' fault was set and lifted: {faulted:?} {lifted:?}"
+  );
+  assert!(unanswered, "the submit waited for its withheld record");
+  assert_eq!(
+    awaiting_before,
+    Ok(1),
+    "version 1 was appended and its submit waited before the restart"
+  );
+  assert!(
+    committed,
+    "version 1, appended before the owner restarted, committed at the quorum once it was back: {counters:?}"
+  );
+}
+
+/// §4.16 "Commit" (AUD-11) and §4.9 exactly-once across the owner's restart (the bug record of 2026-11-07, a submit
+/// resent after its owner restarted was applied twice). Goal 4's primary-kill rung found 83 versions on the green that
+/// no client was told, and their clients told later versions: a submit whose version was appended before the crash, and
+/// not yet committed, was waited on only in memory and its completion was recorded only at the commit, so its resend
+/// under its own id after the restart ran the verb again and was accepted as a second version. Do: on a settled
+/// three-node fleet at `f = 1` whose nodes keep their state across a restart, make a green, a work with one edit, and
+/// with both holders withholding merge records submit it from a client that keeps its id, so version 1 is appended and
+/// the submit waits; restart the owner over its own segment; lift the holders' fault; reconnect the client under its id
+/// and send the submit again under the same request id. Expect it answered `Submitted { version: Some(1) }` and the
+/// green's head at version 1.
+#[test]
+fn a_submit_resent_under_its_id_after_its_owner_restarted_is_answered_its_version_once() {
+  submit_resent_after_its_owner_restarted(false);
+}
+
+/// §4.16 "Commit", A-252: the resend arrives while the version still cannot commit (the holders still withhold it) on an
+/// owner whose in-memory wait the restart lost. Expect: no answer and no second version while it waits (the partition's
+/// durable wait, never `Seen::New`), then the version it was accepted as once the record commits.
+#[test]
+fn a_submit_resent_while_its_version_still_waits_after_the_restart_joins_the_wait() {
+  submit_resent_after_its_owner_restarted(true);
+}
+
+/// Shape: how long a resend is watched for an answer it must not get while its version cannot commit: a liveness
+/// budget, past the owner's serve of the resend (microseconds) and short of the placement deadline.
+const RESEND_NOT_ANSWERED_WAIT: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);
+
+/// The restart cases of A-252. `before_lift`: the client resends while the holders still withhold the version's record
+/// and is held to no answer and no second version until they lift it; else the fault is lifted first.
+fn submit_resent_after_its_owner_restarted(before_lift: bool) {
+  let _serial = serialize_fleet_tests();
+  let pid = std::process::id();
+  let profiles: Vec<_> = ["once-restart-a", "once-restart-b", "once-restart-c"]
+    .into_iter()
+    .map(profile)
+    .collect();
+  let anchors: Vec<_> = profiles.iter().map(anchor_of).collect();
+  let seeds: Vec<_> = anchors.iter().map(|anchor| member_id(*anchor, 0)).collect();
+  let mut identities: Vec<_> = profiles.iter().map(|_| same_identity(2)).collect();
+  let certificates: Vec<_> = identities
+    .iter()
+    .map(|pair| pair[0].certificate())
+    .collect();
+  let (_ports_lease, ports) = mesh_serve_ports(profiles.len());
+  let peers = |node| {
+    profiles
+      .iter()
+      .enumerate()
+      .filter(|(peer, _)| *peer != node)
+      .map(|(peer, _)| fleet_peer_at(anchors[peer], seeds[peer], ports[peer], &certificates[peer]))
+      .collect::<Vec<_>>()
+  };
+  let configs: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      fleet_config(
+        profile,
+        &format!("once-restart-{node}-{pid}"),
+        anchors[node],
+        seeds[node],
+        &peers(node),
+        &Default::default(),
+      )
+    })
+    .collect();
+  // Each node's segment carries a content object, so its volumes' content survives the owner's restart.
+  let anchors_held: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      common::anchor::held_anchor(
+        &format!("once-restart-{node}-{pid}"),
+        profile,
+        &configs[node],
+      )
+    })
+    .collect();
+  let source = |node: usize| common::anchor::source_of(&anchors_held[node]);
+  let mut daemons: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      start_fleet_node(
+        profile,
+        configs[node].clone(),
+        identities[node].pop().unwrap(),
+        ports[node],
+        peers(node),
+        source(node),
+      )
+    })
+    .collect();
+  daemons[0].bootstrap(true).unwrap();
+  settle_initial_consensus(&daemons, &seeds, &Default::default(), Quorum { f: 1 });
+  let mut client = Client::connect(daemons[0].instance());
+  let created = client.call(&RequestBody::CreateGreen {
+    name: "green".to_owned(),
+    require_evidence: false,
+    base: None,
+  });
+  let ReplyBody::GreenCreated { id: green } = created else {
+    panic!("create green: {created:?}");
+  };
+  let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
+    green,
+    name: "work".to_owned(),
+  }) else {
+    panic!("create work");
+  };
+  let edited = client.call(&RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  let withheld = slates_server::merge_service::MergeFault {
+    refuse_content_puts: false,
+    corrupt_next_inputs: false,
+    refuse_records: true,
+  };
+  let faulted: Vec<_> = daemons[1..]
+    .iter()
+    .map(|holder| holder.inject_merge_fault(withheld))
+    .collect();
+  // The submit, sent by a library client that keeps its id across a restart, appends version 1 and waits for its record,
+  // which the holders withhold: no answer comes.
+  let submit = RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  };
+  let mut resender = common::client::connect(daemons[0].instance());
+  let word = resender.begin(&submit).map(|id| id.word());
+  let first = word
+    .as_ref()
+    .ok()
+    .and_then(|word| answer_within(&mut resender, *word));
+  let awaiting_before = daemons[0].merge_awaiting(green);
+  drop(client);
+  daemons.remove(0).stop();
+  daemons.insert(
+    0,
+    start_fleet_node(
+      &profiles[0],
+      configs[0].clone(),
+      identities[0].pop().unwrap(),
+      ports[0],
+      peers(0),
+      source(0),
+    ),
+  );
   let lift = |daemons: &[Daemon]| -> Vec<_> {
     daemons[1..]
       .iter()
