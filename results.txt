@@ -1,0 +1,46 @@
+leg ubuntu-24.04-arm, 4 CPUs, Sun Nov  8 14:14:01 UTC 2026, tree d515721cb54dc231b3f2d4047675a2163380cb98
+== release build exit 0
+   r1 LD-LANE install wall_ns 1794147502868924644 holder 10450850706315910958 bytes 233868 budget_ns 30000000000 took_ns 3134149 answered true
+   r1 LD-LANE install wall_ns 1794147503835825537 holder 1336158323727209275 bytes 5278444 budget_ns 30000000000 took_ns 46127868 answered true
+   r1 LD-TL stopped_on_install false after 20.006402463s
+   r1 LD-TL restarted pid 9917
+   r1 LD-LANE install wall_ns 1794147528516993525 holder 1336158323727209275 bytes 40558086 budget_ns 30000000000 took_ns 373824965 answered true
+   r1 LD-TL caught_up after 2.885611293s: holder 9631 owner 9681
+   r1 LD-TL result caught Some(2.885611141s)
+== run 1 exit 0
+   r2 LD-LANE install wall_ns 1794147532583795953 holder 9141121044628171149 bytes 8669492 budget_ns 30000000000 took_ns 44797478 answered true
+   r2 LD-TL stopped_on_install false after 20.006488039s
+   r2 LD-TL restarted pid 14381
+   r2 LD-LANE install wall_ns 1794147556777252787 holder 9141121044628171149 bytes 43578736 budget_ns 30000000000 took_ns 342253695 answered true
+   r2 LD-TL caught_up after 2.114199197s: holder 10074 owner 10124
+   r2 LD-TL result caught Some(2.114199109s)
+== run 2 exit 0
+   r3 LD-LANE install wall_ns 1794147559247790053 holder 11348828469055289934 bytes 7062354 budget_ns 30000000000 took_ns 44944768 answered true
+   r3 LD-TL stopped_on_install false after 20.002765226s
+   r3 LD-TL restarted pid 18389
+   r3 LD-TL caught_up after 1.695344283s: holder 5049 owner 5070
+   r3 LD-TL result caught Some(1.695344035s)
+   r3 LD-LANE install wall_ns 1794147583653205922 holder 11348828469055289934 bytes 22064462 budget_ns 30000000000 took_ns 212425310 answered true
+== run 3 exit 0
+   r4 LD-LANE install wall_ns 1794147585923091279 holder 12151835462655766433 bytes 7701770 budget_ns 30000000000 took_ns 47928239 answered true
+   r4 LD-TL stopped_on_install false after 20.01707751s
+   r4 LD-TL restarted pid 22485
+   r4 LD-LANE install wall_ns 1794147609999217276 holder 12151835462655766433 bytes 35599142 budget_ns 30000000000 took_ns 211676164 answered true
+   r4 LD-TL caught_up after 1.754913967s: holder 8129 owner 8157
+   r4 LD-TL result caught Some(1.754913863s)
+== run 4 exit 0
+   r5 LD-LANE install wall_ns 1794147612164043735 holder 2757834490128975483 bytes 8254570 budget_ns 30000000000 took_ns 47201945 answered true
+   r5 LD-TL stopped_on_install false after 20.00739751s
+   r5 LD-TL restarted pid 26637
+   r5 LD-LANE install wall_ns 1794147636958116556 holder 2757834490128975483 bytes 77353687 budget_ns 30000000000 took_ns 524154133 answered true
+   r5 LD-TL caught_up after 3.118324095s: holder 18076 owner 18119
+   r5 LD-TL result caught Some(3.118323919s)
+== run 5 exit 0
+   r6 LD-LANE install wall_ns 1794147639120347179 holder 4832589294324276927 bytes 294308 budget_ns 30000000000 took_ns 2273548 answered true
+   r6 LD-LANE install wall_ns 1794147640163726637 holder 15574647422791317262 bytes 9472726 budget_ns 30000000000 took_ns 54839620 answered true
+   r6 LD-TL stopped_on_install false after 20.012064739s
+   r6 LD-TL restarted pid 31033
+   r6 LD-LANE install wall_ns 1794147664924648995 holder 15574647422791317262 bytes 65233034 budget_ns 30000000000 took_ns 525477797 answered true
+   r6 LD-TL caught_up after 2.933306372s: holder 15016 owner 15042
+   r6 LD-TL result caught Some(2.933306196s)
+== run 6 exit 0
