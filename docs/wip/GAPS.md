@@ -121,6 +121,15 @@
 > Open: no process test yet takes over an old incarnation's volume after its replacement's key arrived (the retired
 > key's path). Bug record `docs/bugs/2026-11-07-a-node-back-at-its-anchor-with-fresh-ram-had-every-pair-key-refused.md`.
 
+> **Fixed (live-durability, 2026-11-08): a record link's redial waited a whole link period before its handshake began.**
+> `establish_session` built a fresh dial in one call and ran its handshake in the next, a median of 101 ms later over
+> 487 redials (diag-live-durability-50), on the way of every resumed peer's catch-up. It now runs the handshake in the
+> call that builds the dial (`a_redial_starts_its_handshake_in_the_call_that_builds_it`). Rolling partition, main
+> against the fix, 30 runs a leg on each arch (diag-live-durability-53): resume to established, median 124 to 36 ms on
+> x86 and 127 to 33 ms on arm; resume to the first install, median 231 to 118 ms and 224 to 95 ms; 60 of 60 passed on
+> each side. An RTT seeded from the dropped session was considered and not built: none of 820 handshakes across 118
+> resumes waited on the retry cap it would shorten (diag-live-durability-50).
+
 > **Fixed (live-fixes, 2026-11-07): a live write counted durable on too few holders when the owner fell outside its own
 > volume's placement.** The shipper counted a position durable at the `f`-th highest holder, right for `2f` holders but
 > not for `2f + 1` (every other candidate a holder): at f = 1 a write on one of three was "durable", and a successor
