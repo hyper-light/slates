@@ -11,7 +11,7 @@ lateness, and every successor ran the same recovery: a restart loop the start ju
 
 ## Root cause, measured
 
-- **One poll.** `crates/server/tests/recovery.rs`
+- **One poll.** `crates/server/tests/recovery_slicing.rs`
   `a_daemon_keeps_its_beat_through_a_recovery_longer_than_a_window_and_recovers_everything` holds this crate's own
   source tree (77 files) as a snapshot and creates greens over it (A-217: each walks its origin again from the
   snapshot at every recovery), doubling them and restarting until a recovery reaches the least CPU an unsliced daemon

@@ -14,7 +14,7 @@
 //! its chain one entry at a time, and each work's log replay. Only where a poll ends moves: no unit is reordered or
 //! split, and nothing else on the shard runs until the start ends, since the shard runs it alone.
 //!
-//! Before 2026-11-07 the whole start was one poll. Measured on this Mac (`crates/server/tests/recovery.rs`, the
+//! Before 2026-11-07 the whole start was one poll. Measured on this Mac (`crates/server/tests/recovery_slicing.rs`, the
 //! recovery test): 1,024 merge units recovered in 5.52 s of CPU in one poll, and the beat went 9.3 s without
 //! advancing; the anchor would kill such a daemon at every restart.
 
