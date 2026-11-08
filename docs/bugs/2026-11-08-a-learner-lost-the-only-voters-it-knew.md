@@ -56,6 +56,21 @@ the region this node holds a session to; the leader proposes it and any other me
 4, Linux 3 of 4, CI diag-live-fixes-51), with it 23 of 24 passed (diag-live-fixes-52). The whole fleet suite was not run
 on this change alone.
 
+## A third use of the same list: who the learner keeps contact with
+
+With reports going to every session, 2 of 60 runs of the report test still left a node unsettled (CI diag-live-fixes-53).
+In both, that node's own view of the voters was the stopped bootstrapper alone, and its contact reason for the real
+leader was `OutsideNeighbourhood`: the contact rule read the same frozen list, so the learner dropped the session its
+reports needed. A fetched configuration's reply now names the council's voters, and a learner keeps them
+(`RegionalCouncil::learn_voters`, `known_voters`), which the contact rule reads. They move only with a newer view or a
+first answer, so a late reply cannot put an older set back. Test
+`a_learner_learns_who_votes_once_the_voter_it_joined_from_is_gone`: without it 8 of 8 failed on macOS and Linux (CI
+diag-live-fixes-54), with it 32 of 32 passed (diag-live-fixes-55), and the report test passed 60 of 60 on Linux
+(diag-live-fixes-56).
+
+A limit: the voters arrive with a newer configuration, so a voter promoted after the last configuration commit is unknown
+to a learner until the next one. Held in RAM: a restarted learner relearns them at its next fetch.
+
 ## Sibling, reported and not changed
 
-`drive_root_learner_fetch` filters on the root group's voters the same way. It needs its own test.
+`drive_root_learner_fetch` filters on the root group's voters the same way, and a root learner's contact rule reads them. It needs its own test.
