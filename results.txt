@@ -1,0 +1,5 @@
+tested eecb020a59babd90831236c5117ce62deafac137 variant after on aarch64, 4 cpus
+config exit 0 80s
+flood exit 0 64s
+admitted exit 0 131s
+clippy exit 0 62s
