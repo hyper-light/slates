@@ -1,0 +1,20 @@
+tested 4608ee7aa623b64143552b566757e69b21367185 variant after on x86_64, 4 cpus
+admitted exit 0 125s
+  admitted: b: clients_per_shard 2583 slots 32 shards 2 tasks_per_shard 10344 lane bound 165312; 647 clients x 32 forwards
+  admitted: unbroken wait of client 2 for 16 replies: 16 came, at [7.602µs, 41.763µs, 70.476µs, 103.045µs, 133.821µs, 177.477µs] into the wait
+  admitted: unbroken wait of client 3 for 16 replies: 16 came, at [5.498µs, 42.484µs, 71.367µs, 104.417µs, 133.2µs, 165.479µs] into the wait
+  admitted: unbroken wait of client 4 for 16 replies: 16 came, at [6.289µs, 35.043µs, 73.08µs, 114.432µs, 155.804µs, 184.818µs] into the wait
+  admitted: unbroken wait of client 5 for 16 replies: 16 came, at [6.911µs, 39.51µs, 68.183µs, 103.876µs, 132.93µs, 168.013µs] into the wait
+  admitted: unbroken wait of client 6 for 16 replies: 16 came, at [5.218µs, 38.448µs, 70.216µs, 103.105µs, 132.089µs, 164.728µs] into the wait
+  admitted: unbroken wait of client 7 for 16 replies: 16 came, at [6.991µs, 36.896µs, 69.735µs, 99.019µs, 134.412µs, 163.276µs] into the wait
+  admitted: 20704 of 20704 answered: 13765 served, 0 Overloaded, the last 50.514052581s after the hold; control tasks refused 0
+admitted-again exit 0 58s
+  admitted-again: b: clients_per_shard 2583 slots 32 shards 2 tasks_per_shard 10344 lane bound 165312; 647 clients x 32 forwards
+  admitted-again: unbroken wait of client 2 for 14 replies: 14 came, at [10.375µs, 42.864µs, 75.302µs, 103.945µs, 136.333µs] into the wait
+  admitted-again: unbroken wait of client 3 for 14 replies: 14 came, at [6.69µs, 39.479µs, 68.161µs, 100.76µs, 131.586µs] into the wait
+  admitted-again: unbroken wait of client 4 for 14 replies: 14 came, at [6.65µs, 39.579µs, 68.302µs, 100.4µs, 128.892µs] into the wait
+  admitted-again: unbroken wait of client 5 for 14 replies: 14 came, at [6.149µs, 35.002µs, 70.445µs, 99.087µs, 131.676µs] into the wait
+  admitted-again: unbroken wait of client 6 for 14 replies: 14 came, at [6.57µs, 46.409µs, 75.212µs, 108.141µs, 138.657µs] into the wait
+  admitted-again: unbroken wait of client 7 for 14 replies: 14 came, at [5.759µs, 37.336µs, 70.505µs, 99.749µs, 132.357µs] into the wait
+  admitted-again: 20704 of 20704 answered: 14657 served, 0 Overloaded, the last 54.572057226s after the hold; control tasks refused 0
+clippy exit 0 65s
