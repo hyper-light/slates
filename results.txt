@@ -1,0 +1,33 @@
+head cab7bd54bd6a3ee01b04e42defd6fc814d895859, 4 CPUs
+== run 1 exit 0
+diag-restart: unauthorized 0; first None, last None after the restart; 740 samples; ["restarts: 1", "fleet_members: 2412237322450373787 5240874942387469444 8202143729777459933", "fleet_held_records: 2", "shard 0 refused fleet.live.held: 1749"]
+diag-restart: wrote 1854 files
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 21.20s
+== run 2 exit 0
+diag-restart: wrote 1661 files
+diag-restart: unauthorized 0; first None, last None after the restart; 755 samples; ["restarts: 1", "fleet_members: 7939843249314420221 12719209468229252843 13977735976507085044", "fleet_held_records: 2", "shard 0 refused fleet.live.held: 1529"]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 22.16s
+== run 3 exit 0
+diag-restart: wrote 2037 files
+diag-restart: unauthorized 0; first None, last None after the restart; 770 samples; ["restarts: 1", "fleet_members: 2286353201753272664 7086739582732665148 9296911236812418014", "fleet_held_records: 2", "shard 0 refused fleet.live.held: 1914"]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 21.37s
+== run 4 exit 0
+diag-restart: wrote 1744 files
+diag-restart: unauthorized 0; first None, last None after the restart; 771 samples; ["restarts: 1", "fleet_members: 5237112655382623011 15115201790954291856 16414833099078817269", "fleet_held_records: 2", "shard 0 refused fleet.live.held: 1605"]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 21.26s
+== run 5 exit 0
+diag-restart: wrote 1805 files
+diag-restart: unauthorized 0; first None, last None after the restart; 765 samples; ["restarts: 1", "fleet_members: 1870355176958657284 8502108768973374598 18204097707399700320", "fleet_held_records: 2", "shard 0 refused fleet.live.held: 1675"]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 21.46s
+== run 6 exit 0
+diag-restart: wrote 1822 files
+diag-restart: unauthorized 0; first None, last None after the restart; 767 samples; ["restarts: 1", "fleet_members: 5872257830839031484 7328496303468934270 10124775864251762894", "fleet_held_records: 2", "shard 0 refused fleet.live.held: 1685"]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 21.26s
+== run 7 exit 0
+diag-restart: wrote 1867 files
+diag-restart: unauthorized 0; first None, last None after the restart; 775 samples; ["restarts: 1", "fleet_members: 10196058234317583650 11511864687477464077 12679500892091581941", "fleet_held_records: 2", "shard 0 refused fleet.live.held: 1739"]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 22.07s
+== run 8 exit 0
+diag-restart: unauthorized 0; first None, last None after the restart; 772 samples; ["restarts: 1", "fleet_members: 4992467702211180018 11571068705974621661 17064262663379457390", "fleet_held_records: 2", "shard 0 refused fleet.live.held: 1745"]
+diag-restart: wrote 1887 files
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 21.38s
