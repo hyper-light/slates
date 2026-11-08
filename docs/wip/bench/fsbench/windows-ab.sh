@@ -125,7 +125,11 @@ for run in $(seq 1 "$RUNS"); do
     start_arm $(( (first + offset) % count )) "$run"
   done
   arms=() shown=
-  for index in "${!NAMES[@]}"; do
+  # The list the bench takes each round's arms from starts with this run's first arm, so every arm is listed first as
+  # often as it starts first. With the list fixed, the arm listed first ran 3.15% under its run's mean and the last 3.90%
+  # over in arm64's quiet pass, between copies of one binary (diag-winfsp-overlap-48, BENCHMARKS).
+  for offset in "${!NAMES[@]}"; do
+    index=$(( (first + offset) % count ))
     arms+=(--arm "${NAMES[$index]}=${DRIVES[$index]}/")
     shown="$shown ${NAMES[$index]}=${DRIVES[$index]}"
   done
