@@ -1,0 +1,49 @@
+name: diag-perf
+
+# A-226's bounded-work siblings, red then green on CI: the shard-held test,
+# `a_boot_give_back_holds_its_shard_no_longer_than_its_noise_floor`, whose CPU judge runs on every Linux and macOS
+# host, over the sliced give-back (this commit's parent) and over the same code with the slice made unbounded (one
+# step a whole region, as before the slices), interleaved three times. macOS is run because the cost is macOS's (`madvise(MADV_FREE_REUSABLE)` over the range); Linux for the
+# contrast. A diagnostics lane run only from `diag-perf-*` branches (never main).
+
+on:
+  push:
+    branches: ["diag-perf-*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  give-back-probe:
+    name: give-back probe (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Sliced and unbounded, interleaved
+        shell: bash
+        run: |
+          cp crates/server/src/daemon.rs "$RUNNER_TEMP/daemon.rs.sliced"
+          uname -a; (nproc || sysctl -n hw.ncpu)
+          for round in 1 2 3; do
+            for arm in sliced unbounded; do
+              cp "$RUNNER_TEMP/daemon.rs.sliced" crates/server/src/daemon.rs
+              if [ $arm = unbounded ]; then
+                perl -0pi -e 's/\n  s\.give_back_slice_bytes\.max\(page\)\n/\n  let _ = (s.give_back_slice_bytes, page);\n  usize::MAX\n/' crates/server/src/daemon.rs
+                grep -c '^  usize::MAX$' crates/server/src/daemon.rs
+              fi
+              echo "== round $round arm [$arm] $(date -u +%FT%TZ) $(uptime)"
+              cargo test -p slates-server --test recovery a_boot_give_back -- --nocapture 2>&1 \
+                | grep -E 'probes:|longest probe|SKIPPED|give-back by steps|held its shard|^test |test result|panicked'
+            done
+          done
