@@ -4353,6 +4353,10 @@ well-known name.
 > Mach bootstrap name registered at the top of the caller's bootstrap chain, which launchd gives its first registrant
 > and frees when that registrant's port dies (`crates/ipc/src/owner_name.rs`). Proven on this Mac and fedora, and
 > the refusal across processes on every platform; red-checked.
+>
+> **Status (2026-11-08, A-254).** The owner is decided before anything is created: an anchor holds the rendezvous, and a
+> daemon opens its listener, before a segment is created or attached, so a start refused as a live instance's second
+> owner has created and unlinked nothing, on every platform.
 
 **Protocol.** Requests and replies are fixed-layout 64-byte slots; request ids are `(client_id,
 sequence)`; the daemon keeps a completion record per client until acknowledged (RIFL), so a retry
@@ -15351,6 +15355,25 @@ Applied in the same change to: §4.7 (data model, wake strategy, status); `slate
 and settle, `DaemonEnd::reply`'s stamp and confirmation) and `crates/ipc/tests/rings.rs`; GAPS. Evidence:
 `docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`. A client and a daemon of
 different layout versions refuse each other by name; no consensus rule or capability changes.
+
+### A-254 — The owner of an instance is decided before anything is created (accepted 2026-11-08)
+Applied in the same change to: §4.7 (the rendezvous's status), GAPS, `crates/cli/src/anchor.rs` (`run`),
+`crates/server/src/daemon.rs` (`Daemon::start_with_fleet`), `crates/cli/tests/cli.rs` and `crates/server/tests/daemon.rs`
+(the tests below), and `docs/bugs/2026-11-08-a-refused-second-anchor-unlinked-the-live-instances-segment.md`.
+- **What was wrong.** A-176 and A-178 made the rendezvous refuse a live instance's second owner, but both start paths
+  created their segment first. On macOS a shared-memory name is the user's, a creation unlinks any holder's, and the
+  creator's drop unlinks the name again, so a refused second anchor or lone daemon took the live instance's segment name
+  with it. The live anchor's next daemon could not attach (`shm_open` `ENOENT`) and looped until the anchor was restarted.
+- **The rule.** A start decides that it owns the instance before it creates anything: the anchor holds the rendezvous, and
+  a daemon opens its listener, ahead of the segment and the content object. A refused start has created nothing, so it
+  unlinks nothing and a running instance is untouched.
+- **On every platform, though two hid it.** Linux's segment has no name (a memfd), and on Windows a live section's name
+  refuses the second creation. Both took the same wrong order; all three now take one.
+- **What it does not change.** The owner's token on each platform, the adoption of a held rendezvous (A-114), and what a
+  client sees: a daemon opens its listener a few steps earlier in its start, and a claim waits for it as before.
+- **Proven** on this Mac by two tests that failed on the old order: `a_refused_second_anchor_leaves_the_live_instance_its_segment_and_its_bytes`
+  (across processes: a live anchor and its daemon, a second anchor refused, the daemon killed, its successor adopting the
+  segment by name and reading the file back) and `a_refused_second_daemon_leaves_the_live_ones_segment_in_place`.
 
 ### A-235 — The merge record plane runs when there is merge work, and a version's inputs go only to holders whose next record it is (accepted 2026-11-06)
 

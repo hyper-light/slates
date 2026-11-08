@@ -648,6 +648,14 @@ impl Daemon {
       SegmentSource::FromEnv => Adoption::from_env()?,
       SegmentSource::Handoff { rendezvous, .. } => Some(rendezvous.clone()),
     };
+    // The owner first (A-254, the rule of A-176 and A-178): a second daemon of a live instance is refused here, having
+    // created nothing. On macOS a segment's creation unlinks any holder of its name and its drop unlinks the name again,
+    // so a refused start that had created one took the live daemon's name with it. Every Linux rendezvous is sealed
+    // (§4.7, A-187), so the seal is installed before the listener can answer a claim; a second daemon in this process
+    // installs the same one.
+    #[cfg(target_os = "linux")]
+    slates_seal::install();
+    let listener = Listener::open(&config.instance, adoption.as_ref())?;
     let mut segment = match source {
       SegmentSource::Create { name } => {
         let content_name = content_name_of(&name);
@@ -791,11 +799,7 @@ impl Daemon {
         }
       })?;
     }
-    // The rendezvous and the doorbell. Every Linux rendezvous is sealed (§4.7, A-187), so the seal is installed before
-    // the listener can answer a claim; a second daemon in this process installs the same one.
-    #[cfg(target_os = "linux")]
-    slates_seal::install();
-    let listener = Listener::open(&config.instance, adoption.as_ref())?;
+    // The doorbell, on the rendezvous opened above.
     let kicks: Vec<slates_rt::driver::Kick> = shards
       .iter()
       .filter_map(|s| registry::with_entry(s.0, |e| e.kick))

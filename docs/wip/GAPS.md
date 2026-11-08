@@ -14393,7 +14393,7 @@ window (adacachy); with the old one-window wait it failed at 5.0 s. The loaded r
 answer past one window, the longest 0.53–1.17 s; the reproduction's 5.06 s at load 150–170 did not recur with that
 load. 9 of those 10 passed; the other failed on a different defect, recorded next.
 
-### 2026-11-07: the Shards DAX fixture named every daemon's segment alike, and one case's start found it gone — fixed (the product's ordering open)
+### 2026-11-07: the Shards DAX fixture named every daemon's segment alike, and one case's start found it gone — fixed
 
 In the same loaded runs, one case of `the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte` failed before
 its first act: "shard 0 failed to initialize after 273138 µs: segment: shared memory: shm_open refused (code
@@ -14409,12 +14409,8 @@ first, and attaches to the second by its handoff; on this Mac it failed `shm_ope
 no segment, so there it holds either way). Not swept: about a dozen other server test files name a segment
 `slates-seg-{name}` with no pid in the format itself.
 
-Open, the product's side of it: `slates anchor` creates its segment (`crates/cli/src/anchor.rs`, `AnchorSegment::create`)
-before it holds the instance's rendezvous, and `Daemon::start` with `SegmentSource::Create` (a daemon run alone)
-creates it before its rendezvous too. On macOS a second anchor or lone daemon started for a live instance would unlink
-the live one's segment name before its own start is refused, and unlink it again as it drops, so the live anchor could
-no longer hand its segment to its next daemon by name. A-176's rule asks for a name made afresh at every start, or an
-owner decided by a token only the owner holds, before anything is unlinked. Not reproduced; read from the code.
+The product's side of it was fixed by A-254: `slates anchor` and a daemon run alone decide the instance's owner before
+they create a segment, so a refused start unlinks nothing (`docs/bugs/2026-11-08-a-refused-second-anchor-unlinked-the-live-instances-segment.md`).
 
 ### 2026-10-22: two pressure tests failed on a busy machine, not on the property — fixed
 
