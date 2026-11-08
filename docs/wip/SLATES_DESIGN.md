@@ -13972,6 +13972,33 @@ Status: accepted 2026-11-07; built in two steps (one node, then across nodes).
   - *Exactly once.* Each cross-shard or cross-node call is part of a client request with its own completion
     record. The verdict's increment identity (work, base, ops, post-state) is the engine's retry key, and a retried
     request meets its record at the work's shard, as A-225 and A-226's tests hold.
+- **Reads of a green off its owner (the supervisor's decision of 2026-11-08).**
+  - *`ReadAt::Head` is unchanged.* It stays on the owner, as §4.8 pins it ("head reads at the owner under its lease or
+    from f+1 candidates"). A replica's own head answered as `Head` could be older than the client's own accepted
+    version. A lease that kept it the latest would have to be revoked before each commit, which is coordination on
+    the write path (banned item 10).
+  - *The additive form, `ReadAt::AtLeast { version }`.* A committed version at least as new as a floor the client
+    names, and the reply names the version served. The floor is what the client already saw: its last accepted or
+    last read version of that green, which gives read-your-writes and monotonic reads. Any shard may serve it from an
+    epoch-published immutable root (R2), never holding the owner's shard. A shard behind the floor forwards to the
+    owner rather than answer older. The merge engine already tolerates an older base through its verdict and
+    rebase, so a work reading its base does not need the strict head. Strict readers, the load harness's oracle among
+    them, stay on `Head`.
+  - *What each form can take, measured before building it.* Fixtures' 10,000-client `f = 1` run (adacachy,
+    `rungs9/ab-clean-1.log`), the 33% of retries the harness calls `ReadHead`: 312,218 operations and no `ReadAt::Head`
+    among them. Each conflict's resolve is one `Versions` and then a `ReadRange` of each window at that **named
+    version**, and it ends in one `Rebase`, so 125,615 (40%) are `Versions` and 186,603 (60%) are named-version reads.
+    The harness's only `ReadAt::Head` reads are its oracle's and its setup's. The other callers:
+    - `slates read` and MCP's resource and `view_arg` reads default to `Head`, one request per interactive read, and
+      could opt in;
+    - the Python and Node SDKs issue no `ReadAt` read over the ring at all.
+  - *So the order is:* a named-version read needs no new form, since a committed version is immutable and any holder of
+    it can serve it, so it moves with the same root. `AtLeast` is for clients that read "recent enough" (the CLI's and
+    MCP's opt-in reads, and a `Versions` taking a floor).
+  - *The root does not exist yet.* A green's committed state is the engine's `BTreeMap` and W2's shard-local `Chunks`,
+    owned by one shard's thread. No epoch-published root exists for a green, so publishing one is part of this work.
+  - *Test first:* a client never reads below its own accepted version, from any shard, over a model of commits and
+    reads. Non-vacuity counter: reads served off the owner.
 - **Laptop degenerate (R8).** One node with one shard: the work's shard is the owner's, every fetch and verdict call is
   a direct call (`xshard`'s own-shard path), and the behaviour is today's. The same code, `f = 0`.
 - **What it does not change.** The verdict, its windows, the merge record, the increment's identity and format, the
