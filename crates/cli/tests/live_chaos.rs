@@ -317,7 +317,8 @@ fn mesh_of(instance: &str) -> Option<(u32, u32)> {
 /// DIAG (never for main): once a formation wait has run past [`FLEET_WAIT`], prints the fleet's record-session lends,
 /// returns, hold times and the borrowers that found each session out, with the discovery and link counters, once.
 fn slow_formation(began: Instant, dumped: &mut bool, stage: &str, instances: &[String]) {
-  if !*dumped && began.elapsed() >= FLEET_WAIT {
+  // Window 2: dump at 15 s, since window 1's two slow first formations ended at the 40 s bound and printed nothing.
+  if !*dumped && began.elapsed() >= Duration::from_secs(15) {
     *dumped = true;
     eprintln!(
       "DIAG slow formation: {stage} still waiting after {:?}\n{}",

@@ -549,6 +549,51 @@ fn boot_durability(
   }
 }
 
+/// DIAG (never for main): a thread reading every shard's scheduler state ten times a second and its CPU clock once a
+/// second, printing one line a second: for each shard how many samples found it runnable, blocked or unread, and the CPU
+/// it spent. It separates a shard starved of a CPU (runnable, little CPU) from one blocked in a call. It ends with the
+/// process, which is all a diagnostics branch needs.
+fn diag_sample_shards(shards: Vec<u16>) {
+  #[allow(clippy::disallowed_methods)]
+  let _ = std::thread::Builder::new()
+    .name("diag-shard-sampler".to_owned())
+    .spawn(move || {
+      let tenth = std::time::Duration::from_millis(100);
+      let mut last: Vec<u64> = vec![0; shards.len()];
+      let began = std::time::Instant::now();
+      loop {
+        let mut tallies = vec![(0u32, 0u32, 0u32); shards.len()];
+        for _ in 0..10 {
+          #[allow(clippy::disallowed_methods)]
+          std::thread::sleep(tenth);
+          for (shard, tally) in shards.iter().zip(tallies.iter_mut()) {
+            match registry::holder_of(*shard).and_then(registry::shard_run_state) {
+              Some(slates_rt::RunState::Runnable) => tally.0 += 1,
+              Some(slates_rt::RunState::Blocked) => tally.1 += 1,
+              None => tally.2 += 1,
+            }
+          }
+        }
+        let mut line = format!("DIAG shards pid={} t={}s", std::process::id(), began.elapsed().as_secs());
+        for ((shard, tally), spent) in shards.iter().zip(&tallies).zip(last.iter_mut()) {
+          let now = registry::holder_of(*shard)
+            .and_then(registry::shard_cpu)
+            .map_or(0, |reading| reading.spent_ns);
+          let delta = now.saturating_sub(*spent);
+          *spent = now;
+          line.push_str(&format!(
+            " {shard}:R{}/B{}/U{}/cpu{}ms",
+            tally.0,
+            tally.1,
+            tally.2,
+            delta / 1_000_000
+          ));
+        }
+        eprintln!("{line}");
+      }
+    });
+}
+
 impl Daemon {
   /// This start's fresh member identity. The instance name and certificate anchor remain stable. An
   /// observation the daemon could not make is its typed refusal ([`Self::observation`]).
@@ -877,6 +922,9 @@ impl Daemon {
     let nfs_port = start_nfs_transport(&runtime, control, &config, handed_connections)?;
     #[cfg(target_os = "macos")]
     start_shards_route(&runtime, control, &config)?;
+    // DIAG (never for main): each shard's run state sampled ten times a second, a line a second to the error stream.
+    let sampled: Vec<u16> = shards.iter().map(|shard| shard.0).collect();
+    diag_sample_shards(sampled);
     Ok(Daemon {
       runtime: Some(runtime),
       segment,

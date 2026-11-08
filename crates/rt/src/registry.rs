@@ -551,6 +551,18 @@ pub fn shard_cpu(holder: SlotHolder) -> Option<crate::thread_clock::CpuReading> 
   .and_then(crate::thread_clock::read)
 }
 
+/// The scheduler state of the shard `holder` names at this instant: `None` when that registration no longer holds its
+/// slot, its thread recorded no clock, or the platform reads no run state (macOS only). With [`shard_cpu`] over a
+/// window, it tells a starved shard (runnable, its clock barely moving) from one blocked in a call.
+pub fn shard_run_state(holder: SlotHolder) -> Option<crate::thread_clock::RunState> {
+  with_entry(holder.shard, |entry| {
+    (entry.holder() == holder).then(|| entry.cpu_clock.load(Ordering::Acquire))
+  })
+  .flatten()
+  .filter(|handle| *handle != 0)
+  .and_then(crate::thread_clock::run_state)
+}
+
 /// Release the reader pin even when a test callback unwinds.
 struct Reader<'a>(&'a AtomicU32);
 impl Drop for Reader<'_> {
