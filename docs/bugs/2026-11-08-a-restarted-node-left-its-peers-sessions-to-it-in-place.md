@@ -44,11 +44,15 @@ lost or wrongly answered: the forwards were refused and retried.
 - `a_dialer_restarted_onto_its_port_resets_the_accepting_ends_session`: the accepting end's wait ended `PeerReset`
   after one reset from the new process. Red with no stray answered, with the demultiplexer dropping the stray, with an
   accepting end refusing its dialer's token, and with a dialer issuing none.
+- `a_stray_to_a_session_in_its_handshake_leaves_it_unaffected`: eight reset-shaped strays from the dialer's address
+  before the handshake completed. Both ends established, the accepting end discarded none, and no reset was sent. Red
+  with the demultiplexer handing strays to a session in its handshake.
 - `a_reset_from_another_process_on_the_dialers_port_is_ignored`: 6 resets in the 4 s bound, one per initial probe
   timeout, and the accepting end still waiting at the bound.
 - The process test is loadtest-scale's case: `a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process`.
   Its CI figures are added when the run reports.
 
 **R3.** The token's 16 bytes, the 21-byte minimum and the 43-byte send length are RFC 9000 §10.3 constants. The
-interval between resets to one source is the initial probe timeout (RFC 9002 §6.2.2). The source table is bounded by the
+interval between resets to one source is the initial probe timeout, 666 ms: RFC 9002 §6.2.2's 333 ms `kInitialRtt`,
+doubled (`rtt::INITIAL_PTO_NS`). The source table is bounded by the
 demultiplexer's session pool.

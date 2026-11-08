@@ -682,3 +682,129 @@ fn a_reset_from_another_process_on_the_dialers_port_is_ignored() {
     "the accepting end kept waiting on its own timers"
   );
 }
+
+/// Shape: the strays sent from a dialer's address while its session is still in its handshake.
+const HANDSHAKE_STRAYS: usize = 8;
+
+/// What the two ends of a handshake saw when strays came from the dialer's address before it completed.
+struct StrayedHandshake {
+  /// The dialer's and the accepting end's handshake results.
+  outcomes: (String, String),
+  /// Datagrams the accepting end discarded.
+  discarded: u64,
+  /// The demultiplexer's counters once both ends were done.
+  counters: DemuxCounters,
+}
+
+/// A dialer's handshake through a relay that, once it has passed the dialer's first flight, sends the accepting node
+/// [`HANDSHAKE_STRAYS`] short-header packets from the same address, each shaped as a reset with a plausible tail (one of
+/// the dialer's own tokens, for a session that does not exist).
+fn handshake_with_strays_from_its_dialer() -> StrayedHandshake {
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let shard = sim.shard_ids()[0];
+  let node = identity(1).pop().unwrap();
+  let node_certificate = node.certificate();
+  let dialer = identity(1).pop().unwrap();
+  let dialer_certificate = dialer.certificate();
+  let stray_token = dialer.reset_key().unwrap().token(&[0xEE; 8]);
+  let (node_port_tx, node_port_rx) = channel::<u16>();
+  let (relay_tx, relay_rx) = channel::<u16>();
+  let (dialer_port_tx, dialer_port_rx) = channel::<u16>();
+  let (done_tx, done_rx) = channel::<()>();
+  let (dialed_tx, dialed_rx) = channel::<String>();
+  let (accepted_tx, accepted_rx) = channel::<(String, u64, DemuxCounters)>();
+
+  sim
+    .spawn_on(shard, async move {
+      let demux = start_demux(node, vec![dialer_certificate]);
+      node_port_tx
+        .send(demux.with(Demux::local_addr).unwrap().unwrap().port())
+        .unwrap();
+      let mut accepted = within(BOUND_NS, demux.accept()).await.unwrap().unwrap();
+      let outcome = within(BOUND_NS, accepted.establish()).await;
+      // The session binds its id on its first use after the handshake, as every caller's does.
+      let _ = accepted.connection_id();
+      accepted_tx
+        .send((
+          format!("{outcome:?}"),
+          accepted.discarded(),
+          demux.with(Demux::counters).unwrap(),
+        ))
+        .unwrap();
+    })
+    .unwrap();
+  sim
+    .spawn_on(shard, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      dialer_port_tx
+        .send(socket.local_addr().unwrap().port())
+        .unwrap();
+      let relay = SocketAddrV4::new(Ipv4Addr::LOCALHOST, received(relay_rx).await);
+      let mut endpoint =
+        Endpoint::client(socket, relay, &dialer, &node_certificate, NAME, shape()).unwrap();
+      let outcome = within(BOUND_NS, endpoint.establish()).await;
+      dialed_tx.send(format!("{outcome:?}")).unwrap();
+      done_tx.send(()).unwrap();
+    })
+    .unwrap();
+  sim
+    .spawn_on(shard, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      relay_tx.send(socket.local_addr().unwrap().port()).unwrap();
+      let node = SocketAddrV4::new(Ipv4Addr::LOCALHOST, received(node_port_rx).await);
+      let dialer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, received(dialer_port_rx).await);
+      let mut strayed = false;
+      let mut buffer = [0u8; 2048];
+      while done_rx.try_recv().is_err() {
+        let Some(Ok((length, from))) = within(RELAY_PAUSE_NS, socket.recv_from(&mut buffer)).await
+        else {
+          continue;
+        };
+        let to = if from == dialer { node } else { dialer };
+        let _ = socket.send_to(&buffer[..length], to);
+        if from == dialer && !strayed {
+          strayed = true;
+          for seed in 0..HANDSHAKE_STRAYS {
+            let stray = slates_transport::reset::reset_datagram(&stray_token, STRAY_BYTES, |out| {
+              out.fill(u8::try_from(seed).unwrap());
+              true
+            })
+            .unwrap();
+            let _ = socket.send_to(&stray, node);
+          }
+        }
+      }
+    })
+    .unwrap();
+  sim.run_until_idle();
+  let dialed = dialed_rx.try_recv().expect("the dialer finished");
+  let (accepted, discarded, counters) = accepted_rx.try_recv().expect("the node finished");
+  StrayedHandshake {
+    outcomes: (dialed, accepted),
+    discarded,
+    counters,
+  }
+}
+
+/// A-261's guard: a 1-RTT packet naming no session, from a source whose session is still in its handshake, is never
+/// handed to that session, nor answered with a reset. Before the handshake binds its id, the session has no token to
+/// compare it with; a stray there could only be garbage in its reassembly. Do: hand the accepting node, from the
+/// dialer's address and before the handshake completes, short-header packets shaped as resets with a plausible tail.
+/// Expect: both ends' handshakes complete; the accepting end discarded nothing (none reached it); the demultiplexer
+/// counted every stray as naming no session and sent no reset.
+#[test]
+fn a_stray_to_a_session_in_its_handshake_leaves_it_unaffected() {
+  let strayed = handshake_with_strays_from_its_dialer();
+  assert_eq!(
+    strayed.outcomes,
+    ("Some(Ok(()))".to_owned(), "Some(Ok(()))".to_owned())
+  );
+  assert_eq!(strayed.discarded, 0, "no stray reached the handshake");
+  assert_eq!(
+    strayed.counters.unknown_id,
+    u64::try_from(HANDSHAKE_STRAYS).unwrap(),
+    "{:?}",
+    strayed.counters
+  );
+  assert_eq!(strayed.counters.resets_sent, 0, "{:?}", strayed.counters);
+}

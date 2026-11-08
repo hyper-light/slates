@@ -16782,7 +16782,7 @@ fn a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process() {
   daemons[0].bootstrap(true).unwrap();
   settle_initial_consensus(&daemons, &seeds, &Default::default(), Quorum { f: 1 });
   let mut owner = Client::connect(daemons[0].instance());
-  let volume = volume_owned_by(&mut owner, 0, "reset-lane");
+  let volume = volume_owned_by(&mut owner, 0, "reset-lane", &daemons);
   let mut probe = Client::connect(daemons[1].instance());
   let (routed, last) = poll_status_served(&daemons, &mut probe, volume, COUNCIL_RETIRE_DEADLINE);
   let read = RequestBody::Status { volume };
@@ -16859,12 +16859,6 @@ fn a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process() {
     "a read through b reached the restarted a {reached:?} after its restart, past {RESET_LANE_BOUND:?}"
   );
 }
-/// R3 class A, the forwarded verbs (`verbs.rs` `serve_forward`: the forwarded read's call from the control shard to the
-/// volume's owner shard), A-65, §4.3, §4.8. Do: three daemons of two shards, each its own region; create a volume node
-/// a's second shard owns; from a client on node b, read its `Status` until the forward path is up, then read it again
-/// while node a's second shard runs one starved poll for a window and a half (on the CPU a fifth of the time). Expect:
-/// the read is served, after more than a wall window. On main node a's control shard gave up on its owner shard at the
-/// wall second and answered `NotFound`: a live volume reported missing across the fleet.
 
 /// Shape: how long the owner's shard is kept in one starved poll: a window and a half, so an answer behind it comes past
 /// a wall window.
@@ -16877,6 +16871,12 @@ const STARVED_OFF: Duration = Duration::from_millis(40);
 /// none in this many is a fault of the placement, not luck.
 const OWNER_TRIES: usize = 48;
 
+/// R3 class A, the forwarded verbs (`verbs.rs` `serve_forward`: the forwarded read's call from the control shard to the
+/// volume's owner shard), A-65, §4.3, §4.8. Do: three daemons of two shards, each its own region; create a volume node
+/// a's second shard owns; from a client on node b, read its `Status` until the forward path is up, then read it again
+/// while node a's second shard runs one starved poll for a window and a half (on the CPU a fifth of the time). Expect:
+/// the read is served, after more than a wall window. On main node a's control shard gave up on its owner shard at the
+/// wall second and answered `NotFound`: a live volume reported missing across the fleet.
 #[test]
 fn a_forwarded_read_whose_owner_shard_is_starved_is_served_past_a_wall_window() {
   let _serial = serialize_fleet_tests();

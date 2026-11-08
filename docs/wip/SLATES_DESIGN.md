@@ -19589,14 +19589,22 @@ otherwise silent.
   Three limits govern when it is sent:
   - **No reset to a source that has a session there.** A dialer's first 1-RTT packet can outrun the binding of its new
     id, and a reset then would end a session about to exist.
-  - **At most one reset per source per initial probe timeout (666 ms).** The first packet draws a reset at once; the
-    interval bounds only a lost reset's repeat and a flood.
+  - **At most one reset per source per initial probe timeout (666 ms).** The interval is the transport's initial PTO:
+    RFC 9002 §6.2.2's `kInitialRtt` of 333 ms, doubled as the PTO before any RTT sample is
+    (`rtt::INITIAL_PTO_NS`). It is the same constant the handshake's own pacing uses, not a separate tuning. A peer
+    whose session is gone sends its next packet within its own probe timeout, so the first packet draws a reset at
+    once. The interval bounds only a lost reset's repeat and a flood: a flood from one source costs the path at most
+    one reset, smaller than its trigger, per 666 ms.
   - **The table of sources answered is no larger than the session pool.**
 - **An endpoint on its own socket answers too** (§10.3: any endpoint may answer a packet it cannot associate). A
   dialer's endpoint answers a short-header packet that names another session with a reset under the dialer's identity.
   It sends at most one per initial probe timeout, each shorter than its trigger. So a process restarted onto the port
   its old session's dialer held ends that session at the accepting end within a round trip. Otherwise the accepting
   end would retransmit into it until its own timers gave up. On a shared socket the demultiplexer decides alone.
+  - **A session in its handshake is handed no stray.** It has no token to compare one with until its id is bound, and
+    a stray there could only be garbage in its reassembly. `a_stray_to_a_session_in_its_handshake_leaves_it_unaffected`
+    holds this: strays shaped as resets, from the dialer's address before the handshake completes, reach neither the
+    session nor a reset.
 - **The receiving end detects it.** When a datagram cannot be opened as the session's packet, its tail is compared with
   the held token in constant time (§10.3.1). A match ends the session `EndpointError::PeerReset`, and every later use
   refuses the same. A tail that matches nothing is discarded like any other stray.
