@@ -7128,6 +7128,10 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > CPU-time clock: `/proc/<pid>/schedstat`, read first, is the main thread's alone
 > (`docs/bugs/2026-11-07-the-linux-process-clock-read-the-main-thread-alone.md`). At the extremes, 0 progressing starts
 > were killed at 183-292 runnable processes, and a stuck start was killed at 1,001-1,294 ms on macOS, Linux and Windows.
+> **2026-11-08:** the start judgment also asks the OS whether any of the start's threads is runnable
+> (`slates_rt::process_runnable`), as the watchdog asks of a shard: a start whose CPU stands still a window while one of its
+> threads waits for a CPU is starved and waited for. Before, a start held off its CPUs was killed ("made no progress for
+> 1014 ms" on CI's Windows runner; red 2 of 2 on adacachy2 by `a_start_held_off_its_cpus_is_starved_not_stuck`).
 > A shard's recovery still runs as one poll, which the watchdog counts as spinning past a window of CPU: GAPS holds it
 > open.
 

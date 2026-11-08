@@ -117,3 +117,16 @@ progress now ends the wait only if the scheduler does not have the shard runnabl
 `shard_run_readings`). After: answered 6 of 6 there (3 at nice 0, 3 at nice 19); the liveness suite 9 of 9;
 `tests/observe.rs`, whose wedged questions sleep and are not runnable, still ends them, 8 of 8. A stored run-queue wait
 was left out: Linux credits one only once the thread reaches a CPU, so the state decides, as the watchdog's notes say.
+
+## The anchor's start judgment (2026-11-08, bug-sweep)
+
+The anchor judges a start, before its first beat, in the whole process's CPU time (`slates_machine::process_clock`) and
+passed the watchdog's rule no scheduler reading, so a start whose CPU stood still for a window was "made no progress" and
+killed, however starved: "the starting daemon made no progress for 1014 ms; killing it" in `held_rendezvous` on CI's
+Windows runner. `slates_rt::process_runnable` now answers whether any thread of another process is runnable
+(`/proc/<pid>/task/*/stat` on Linux; `proc_pidinfo(PROC_PIDTASKALLINFO)`'s `pti_numrunning` on macOS; one system snapshot
+on Windows, walked by `process_thread_states_in`), and the start judgment passes it as the run reading.
+`a_start_held_off_its_cpus_is_starved_not_stuck` starts a busy shell at SCHED_IDLE pinned beside spinners (an Idle-class
+PowerShell beside High-class ones on Windows) and judges it a look a beat for three windows: with no reading, 2 of 2
+judged it "made no progress for 1001 ms" on adacachy2; with it, starved at 14-23 looks and never stuck, 7 of 7 there,
+at nice 0 and 19. `process_runnable` itself is held by use on every platform (`a_running_process_reads_runnable`).

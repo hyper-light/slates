@@ -737,9 +737,15 @@
 >   does not have the shard runnable (`ShardTime::runnable`, the watchdog's source). Red first:
 >   `an_observation_of_a_starved_shard_is_answered` (`crates/server/tests/liveness.rs`) ended `Deadline` at its
 >   one-window budget 3 of 3 on adacachy2 while the shard's clock stood still 3.0 s; after, answered 6 of 6 (3 at nice 0,
->   3 at nice 19); the wedged cases of `tests/observe.rs` still end, 8 of 8. **Open:** the anchor's start judgment
->   (`crates/cli/src/anchor.rs`, `process_clock`) judges a whole process by CPU time, has no thread to ask about, and
->   passes no reading: a start starved for a whole window is still killed.
+>   3 at nice 19); the wedged cases of `tests/observe.rs` still end, 8 of 8. The anchor's start judgment
+>   (`crates/cli/src/anchor.rs`, `process_clock`) judged a whole process by CPU time with no scheduler reading, so a
+>   start starved for a whole window was killed ("the starting daemon made no progress for 1014 ms; killing it", in
+>   `held_rendezvous` on CI's Windows runner): **fixed 2026-11-08 (bug-sweep).** It now asks whether any of the start's
+>   threads is runnable (`slates_rt::process_runnable`: `/proc/<pid>/task/*/stat` on Linux, `proc_pidinfo`'s
+>   `pti_numrunning` on macOS, the thread snapshot on Windows), and a runnable start with its CPU standing still is starved,
+>   not stuck. `a_start_held_off_its_cpus_is_starved_not_stuck` (`crates/cli/src/anchor.rs`) holds a busy process off its
+>   CPU at SCHED_IDLE: without the reading, judged "made no progress for 1001 ms", 2 of 2 on adacachy2; with it, starved
+>   at 14-23 looks and never stuck, 7 of 7 (nice 0 and 19). A process with every thread blocked still reads stuck.
 > - **A transitive wait reads as stuck (open).** A shard blocked for a whole window on something held by a starved thread
 >   is never runnable itself, so it is wedged by this rule. Not measured. Fixtures' shard 1 (S S S R R S S) may be one.
 > - **macOS is proven by replays (limit).** A full window of flat CPU came in 1 of 20 CI runs, so its real-thread test
