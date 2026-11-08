@@ -1,0 +1,8 @@
+tested aa20e8dcded6ff5a7a5b1e7ebfea6b6b4d19b2ef variant after on x86_64, 4 cpus
+burst exit 0 87s
+  burst: b: clients_per_shard 2583 slots 32 shards 2 tasks_per_shard 10344 lane bound 165312; 647 clients x 32 forwards
+  burst: 20704 of 20704 answered: 2170 served, 0 Overloaded, the last 9.431029326s after the hold; control tasks refused 0
+forwards exit 0 61s
+retry exit 0 2s
+transport exit 0 119s
+clippy exit 0 61s
