@@ -21,8 +21,8 @@ mod common;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use slates_rt::SlotHolder;
 use slates_rt::shard::ShardId;
+use slates_rt::{RunState, SlotHolder};
 use slates_server::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS};
 use slates_server::state::ShardState;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -345,14 +345,62 @@ fn outrank_on(_cpu: usize) {
   assert_eq!(status, 0);
 }
 
+/// Where this platform's scheduler reader gets its answer (`slates_rt::thread_clock` says why).
+fn scheduler_source() -> &'static str {
+  if cfg!(target_os = "linux") {
+    "/proc task stat state and schedstat run-queue wait"
+  } else if cfg!(windows) {
+    "NtQuerySystemInformation thread state, no wait time kept"
+  } else {
+    "thread_basic_info run_state, no wait time kept"
+  }
+}
+
+/// What the scheduler reader said of the shard over a watch, asked once a beat as the watchdog asks.
+#[derive(Default)]
+struct SchedulerSeen {
+  runnable: u32,
+  blocked: u32,
+  unread: u32,
+  waited_first_ns: Option<u64>,
+  waited_last_ns: Option<u64>,
+}
+
+impl SchedulerSeen {
+  fn look(&mut self, holder: SlotHolder) {
+    match slates_rt::registry::shard_run_readings(&[holder])
+      .pop()
+      .flatten()
+    {
+      None => self.unread += 1,
+      Some(reading) => {
+        match reading.state {
+          RunState::Runnable => self.runnable += 1,
+          RunState::Blocked => self.blocked += 1,
+        }
+        self.waited_first_ns = self.waited_first_ns.or(reading.waited_ns);
+        self.waited_last_ns = reading.waited_ns.or(self.waited_last_ns);
+      }
+    }
+  }
+}
+
+/// What a watch of a starved shard saw.
+struct Starving {
+  largest_gap: Duration,
+  longest_flat: Duration,
+  scheduler: SchedulerSeen,
+}
+
 /// Watches the beat and the shard's own CPU clock together, for three windows at the least and on until the clock has
-/// stood still for `flat_enough` or `bound` passes: the largest gap between beats, and the clock's longest standstill.
+/// stood still for `flat_enough` or `bound` passes: the largest gap between beats, the clock's longest standstill, and
+/// what the scheduler reader said meanwhile.
 fn watch_starving(
   daemon: &Daemon,
   holder: SlotHolder,
   flat_enough: Duration,
   bound: Duration,
-) -> (Duration, Duration) {
+) -> Starving {
   let progress = || slates_rt::registry::shard_cpu(holder).map(|reading| reading.progress);
   let least = WINDOW * 3;
   let started = Instant::now();
@@ -362,8 +410,14 @@ fn watch_starving(
   let mut last_progress = progress();
   let mut progressed = Instant::now();
   let mut longest_flat = Duration::ZERO;
+  let mut scheduler = SchedulerSeen::default();
+  let mut last_asked = Instant::now();
   while started.elapsed() < bound && (started.elapsed() < least || longest_flat < flat_enough) {
     wait(SAMPLE);
+    if last_asked.elapsed() >= BEAT {
+      last_asked = Instant::now();
+      scheduler.look(holder);
+    }
     let now = beat(daemon);
     if now != last_beat {
       last_beat = now;
@@ -377,7 +431,11 @@ fn watch_starving(
     }
     longest_flat = longest_flat.max(progressed.elapsed());
   }
-  (largest_gap, longest_flat)
+  Starving {
+    largest_gap,
+    longest_flat,
+    scheduler,
+  }
 }
 
 /// A-228, §4.14, fixtures' false kills at CPUWeight=1, the starved extreme of starved-is-not-stuck. Do: lower the shard
@@ -420,7 +478,11 @@ fn a_shard_starved_off_its_cpu_keeps_the_beat() {
   let flat_enough = WINDOW * 2 + BEAT * 3;
   let bound = if must_starve { WINDOW * 10 } else { WINDOW * 3 };
   let started = Instant::now();
-  let (largest_gap, longest_flat) = watch_starving(&daemon, holder, flat_enough, bound);
+  let Starving {
+    largest_gap,
+    longest_flat,
+    scheduler,
+  } = watch_starving(&daemon, holder, flat_enough, bound);
   running.store(false, Ordering::Relaxed);
   for spinner in spinners {
     spinner.join().unwrap();
@@ -431,6 +493,16 @@ fn a_shard_starved_off_its_cpu_keeps_the_beat() {
      {largest_gap:?}",
     spinners_wanted(),
     started.elapsed()
+  );
+  println!(
+    "scheduler reader: {}; asked once a beat: runnable {}, blocked {}, unread {}; run-queue wait first {:?} ns, last \
+     {:?} ns",
+    scheduler_source(),
+    scheduler.runnable,
+    scheduler.blocked,
+    scheduler.unread,
+    scheduler.waited_first_ns,
+    scheduler.waited_last_ns
   );
   if must_starve {
     assert!(
