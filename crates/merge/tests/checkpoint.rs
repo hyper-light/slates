@@ -101,6 +101,7 @@ proptest! {
 /// A checkpoint touching every table, for the codec's tests.
 fn every_table() -> Checkpoint {
   Checkpoint {
+    head_check: Some((9, [4; 32])),
     version: 7,
     accepted: vec![([3; 32], 2), ([1; 32], 5)],
     files: vec![
@@ -194,10 +195,17 @@ fn a_hostile_checkpoint_is_refused_typed() {
   }
   .encode();
   let mut presence = empty_tables.clone();
-  // The files table's one entry ends with its presence byte, after its key and version; the six empty tables follow.
-  let presence_at = empty_tables.len() - 1 - 6 * size_of::<u32>();
+  // The files table's one entry ends with its presence byte, after its key and version; the six empty tables and the
+  // head check's own presence byte follow.
+  let presence_at = empty_tables.len() - 1 - 1 - 6 * size_of::<u32>();
   presence[presence_at] = 7;
   assert_eq!(Checkpoint::decode(&presence), Err(DocDecodeError::BadKind));
+  let mut head_check = empty_tables.clone();
+  *head_check.last_mut().unwrap() = 7;
+  assert_eq!(
+    Checkpoint::decode(&head_check),
+    Err(DocDecodeError::BadKind)
+  );
   let mut trailing = bytes;
   trailing.push(0);
   assert_eq!(
