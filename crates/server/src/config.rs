@@ -329,6 +329,10 @@ pub struct DaemonConfig {
   pub fleet: Option<FleetMembership>,
   /// Derived: available fleet task slots divided by the tasks one peer requires; never below the seeds.
   pub fleet_peer_capacity: usize,
+  /// Derived: the fleet's own tasks (its loops, and a serve task for each slot of its session pool), all spawned on
+  /// the control shard (`fleet::run_membership`), so the control shard's capacity alone holds them
+  /// ([`Self::control_shard_capacity`]); zero for a laptop. Until 2026-11-07 they were added to every shard's.
+  pub fleet_tasks_per_shard: usize,
   /// Derived: `SESSION_SLOTS_PER_PEER × fleet_peer_capacity` accepted endpoints per plane.
   /// The transport owns the multiplier: one pending handshake plus a live/replaced authenticated
   /// pair. Admission and task/timer budgeting use the same peer capacity and shape. Zero on a laptop.
@@ -911,6 +915,7 @@ impl DaemonConfig {
       fleet: None,
       recovery_key: None,
       fleet_peer_capacity: 0,
+      fleet_tasks_per_shard: 0,
       fleet_sessions_per_plane: 0,
       fleet_session_receive_bytes: 0,
       read_ahead_bytes: 0,
@@ -939,30 +944,47 @@ impl DaemonConfig {
       self.runtime.shards,
     )
     .get();
+    let beyond = lane.saturating_add(self.fleet_tasks_per_shard);
     derived!(
       slates_rt::ShardCapacity {
-        tasks: self.runtime.tasks_per_shard.saturating_add(lane),
-        timers: self.runtime.timers_per_shard.saturating_add(lane),
+        tasks: self.runtime.tasks_per_shard.saturating_add(beyond),
+        timers: self.runtime.timers_per_shard.saturating_add(beyond),
       },
-      "tasks_per_shard + forward_lane_bound, timers_per_shard + forward_lane_bound",
+      "tasks_per_shard + forward_lane_bound + fleet_tasks_per_shard, and the same for timers",
       [
         "tasks_per_shard",
         "timers_per_shard",
         "clients_per_shard",
         "region.slots",
-        "shards"
+        "shards",
+        "fleet_tasks_per_shard"
       ]
     )
   }
 
-  /// This configuration with its control shard's capacity in the boot log, in place of any earlier line for it (the
-  /// capacity follows `runtime`'s, which [`Self::with_fleet`] raises).
+  /// Derived: every other shard's task and timer capacities: its own clients' share alone (`runtime.tasks_per_shard`,
+  /// `runtime.timers_per_shard`), since the fleet's tasks and the forwards to other nodes run on the control shard.
+  pub fn shard_capacity(&self) -> Derived<slates_rt::ShardCapacity> {
+    derived!(
+      slates_rt::ShardCapacity {
+        tasks: self.runtime.tasks_per_shard,
+        timers: self.runtime.timers_per_shard,
+      },
+      "tasks_per_shard, timers_per_shard (the shard's own clients and loops)",
+      ["clients_per_shard"]
+    )
+  }
+
+  /// This configuration with each shard's capacity in the boot log, the control shard's and every other's, in place of
+  /// any earlier lines for them (the control shard's follows the fleet's share, which [`Self::with_fleet`] sets).
   fn with_control_shard_noted(mut self) -> DaemonConfig {
-    let line = note("control_shard_capacity", &self.control_shard_capacity());
-    self
-      .derivations
-      .retain(|kept| !kept.starts_with("control_shard_capacity "));
-    self.derivations.push(line);
+    let control = note("control_shard_capacity", &self.control_shard_capacity());
+    let others = note("shard_capacity", &self.shard_capacity());
+    self.derivations.retain(|kept| {
+      !kept.starts_with("control_shard_capacity ") && !kept.starts_with("shard_capacity ")
+    });
+    self.derivations.push(control);
+    self.derivations.push(others);
     self
   }
 }
@@ -1375,14 +1397,8 @@ impl DaemonConfig {
     self
       .derivations
       .push(note("fleet_tasks_per_shard", &fleet_tasks));
-    self.runtime.tasks_per_shard = self
-      .runtime
-      .tasks_per_shard
-      .saturating_add(fleet_tasks.get());
-    self.runtime.timers_per_shard = self
-      .runtime
-      .timers_per_shard
-      .saturating_add(fleet_tasks.get());
+    // On the control shard alone, where every fleet task runs (`control_shard_capacity`).
+    self.fleet_tasks_per_shard = fleet_tasks.get();
     self.fleet = Some(membership);
     self.with_control_shard_noted()
   }
@@ -1746,14 +1762,42 @@ mod tests {
       + fleet.fleet_sessions_per_plane * FLEET_PLANES
       + FLEET_LOOPS_PER_SHARD;
     assert_eq!(
-      fleet.runtime.tasks_per_shard,
-      solo.runtime.tasks_per_shard + share,
-      "the fleet's task share is derived from the peer count and added to the shard's budget"
+      fleet.fleet_tasks_per_shard, share,
+      "the fleet's task share is derived from the peer count"
     );
+    let lane = forward_lane_bound(
+      fleet.clients_per_shard,
+      fleet.region.slots,
+      fleet.runtime.shards,
+    )
+    .get();
+    let control = fleet.control_shard_capacity().get();
     assert_eq!(
-      fleet.runtime.timers_per_shard,
-      solo.runtime.timers_per_shard + share,
-      "every fleet task may hold a timer"
+      (control.tasks, control.timers),
+      (
+        solo.runtime.tasks_per_shard + lane + share,
+        solo.runtime.timers_per_shard + lane + share
+      ),
+      "the control shard, where every fleet task runs, holds the fleet's share beside its lane's forwards, and every \
+       fleet task may hold a timer"
+    );
+    let other = fleet.shard_capacity().get();
+    assert_eq!(
+      (other.tasks, other.timers),
+      (solo.runtime.tasks_per_shard, solo.runtime.timers_per_shard),
+      "every other shard keeps its own clients' share alone: the fleet adds nothing there (2026-11-07)"
+    );
+    assert!(
+      fleet
+        .derivations
+        .iter()
+        .any(|line| line.starts_with("control_shard_capacity "))
+        && fleet
+          .derivations
+          .iter()
+          .any(|line| line.starts_with("shard_capacity ")),
+      "the boot log names each shard's capacity with its inputs: {:?}",
+      fleet.derivations
     );
     assert!(
       fleet
