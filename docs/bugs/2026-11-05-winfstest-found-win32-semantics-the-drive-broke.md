@@ -17,7 +17,8 @@ Four calls answered success, or kept what they should not, where Windows answers
 2. **A directory holding a file answered its removal with success** (`t/base/03.t` case 3). `RemoveDirectoryW(dir)`
    with `dir\foo` in it answered success, and `dir` stayed; Windows answers `ERROR_DIR_NOT_EMPTY`.
 3. **`SetFileTime` answered success and kept nothing** (`t/base/06.t` cases 5 and 6). The access and write times set
-   through a handle were not applied, though the volume keeps all of them (A-53).
+   through a handle were not applied, though the volume keeps all of them (A-53). Case 5's creation time stayed listed
+   (CREATION-TIME) until A-259 (2026-11-08) gave the bridges' attributes the birth time.
 4. **An open with `TRUNCATE_EXISTING` kept the file's bytes** (`t/base/05.t` case 12): a 42-byte file stayed 42 bytes.
 
 ## Root cause
