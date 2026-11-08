@@ -8953,6 +8953,21 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
     `making_room_the_pool_cannot_cover_claims_nothing`, `room_another_arena_took_first_returns_what_was_claimed`.
   - Bug doc: `docs/bugs/2026-10-09-a-refused-admission-claimed-the-whole-pool.md`.
 
+### 2026-11-08: a mirror holder that loses its copy is never repaired (open, AC-8.15)
+
+- **Found** reading the mirror path while fixing the healer (live-fixes, 2026-11-08; not run). A snapshot's mirror
+  shipment is due only while its mirror placement is unrecorded (`fleet::mirror_due`: `PlacementState::Placed { mirror:
+  None, .. }`). Once recorded, nothing re-checks the mirror holders: there is no mirror healer. A mirror holder that
+  loses its copy (a RAM-only holder's restart) is never re-shipped to, and the mirror's head record keeps naming it.
+- **Impact.** A region's only protection against its own loss is its mirror. Promotion after a lost home region reads the
+  mirror's records (`mirror::successor_of` ranks the holders the mirror head names), so it can name a holder that holds
+  nothing, and the promoted region cannot serve the content although the mirror placement was recorded whole.
+- **What it needs** (ruling, 2026-11-08): a mirror healer on the coordinator's period that re-checks the mirror holders
+  against the recorded mirror placement, re-ships what was lost, and republishes the mirror head at the next sequence,
+  since a mirror holder keeps the first value at a position (`MirrorRecords::accept`). Red test: a mirror holder loses
+  its copy, the home region is lost, and the promoted mirror serves the content. Owner: live-fixes, after the home
+  healer fix and its siblings.
+
 ### 2026-11-08: a learner lost the only voters it knew and stopped learning configurations (fixed)
 
 - **Found** by raft-chaos's five-node flow (diag-raft-chaos-mesh-52, runs 2 and 7 of 8): after the bootstrap voter was
