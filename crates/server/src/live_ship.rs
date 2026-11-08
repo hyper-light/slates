@@ -1061,27 +1061,14 @@ pub(crate) fn published(
   }
 }
 
-/// Whether `id`'s next publication ships whole: once the changes since the last whole entry are as large as it, or
-/// once what a candidate keeps reaches the volume's size. A
+/// Whether what a candidate keeps of `id`'s log has reached the volume's size, so its next publication ships whole: a
 /// candidate keeps a whole entry and the entries since, within twice the volume's size ([`hold_bound`]), and a whole
 /// entry clears them. Shipped at the volume's size, the entry that crosses it still fits under the bound whatever it
 /// is, since no publication is larger than the volume. Never the case for a volume this shard does not know.
 fn kept_reaches_size(state: &ShardState, id: slates_db::catalog::VolumeId) -> bool {
-  let Some((kept, whole)) = state.live.shipping.get(&id.bytes).map(|live| {
-    (
-      live.kept,
-      live.whole.as_ref().map_or(0, |(_, payload)| payload.len()),
-    )
-  }) else {
+  let Some(kept) = state.live.shipping.get(&id.bytes).map(|live| live.kept) else {
     return false;
   };
-  // The changes since the last whole entry are as large as it: a whole entry now costs no more than they did, so the
-  // log ships at most twice the bytes it must, and a candidate keeps about two whole entries. Held only to the
-  // volume's size, a candidate kept up to that size of changes to a volume holding one page, and its recovery image,
-  // committed before each acknowledgement, carried them all (a live write added 1.4-4.5 ms at the median, 2026-11-06).
-  if whole > 0 && kept.saturating_sub(whole) >= whole {
-    return true;
-  }
   let Some(volume) = state.db.partition().volume(id) else {
     return false;
   };

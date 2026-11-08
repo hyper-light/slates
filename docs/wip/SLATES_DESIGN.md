@@ -6086,10 +6086,12 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > `content_holder::HeldImage`), and an entry, an install or a fetch is answered only once the publication carrying it
 > commits (`live_ship::acknowledged`), as content and register holders answer; a warm restart holds it again
 > (`restore_copies`). The cost is that publication on each acknowledgement, and the held image is rebuilt whole at each
-> one, so the owner ships a whole entry once the changes since the last are as large as it (at most twice the bytes the
-> log must ship; a candidate keeps about two whole entries). Measured (release, adacachy, load 58–107): a live stable
-> 4 KiB write adds 193–196 µs at the median, p99 513–715 µs, where it added 95–134 µs without the publication. Owed:
-> an incremental held image, so the cost no longer grows with what a candidate keeps of a large volume.
+> one, so it grows with what a candidate keeps (up to the volume's size of changes since the last whole entry). An
+> earlier form of this change also shipped a whole entry once the changes since the last were as large as it, which kept
+> that small (193–196 µs added at the median, p99 513–715 µs, at load 58–107); it is withdrawn, since the install image
+> kept beside the log (live-durability) means a whole entry on the log is shipped only at the holder's bound. Owed, and
+> now needed: an incremental held image (each entry held by identity in the content hold, the image naming only the
+> identities), so the acknowledgement's cost no longer grows with what a candidate keeps.
 >
 > **One lane a holder, only to holders of the catalog, and no session left with a cancelled request (2026-11-07).**
 > The dispatch round (`live_ship::dispatch`, `send_from_control`) now ships the way the record plane's sessions allow.
