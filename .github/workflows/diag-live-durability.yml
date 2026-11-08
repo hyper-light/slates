@@ -1,0 +1,77 @@
+name: diag-live-durability
+
+# Diagnostics only, never on main (A-200): a holder killed and restarted while an install exchange to its old process is
+# outstanding, reached every run (the trigger armed before the stop, for whichever process serves the install), with a
+# 30 s install budget. On the stacked tip 53dfa6cc and on main: the owner's reason for each install (LD-WHY), each image
+# made (LD-IMAGE), the holder's answers (LD-TAKE), each install exchange (LD-LANE), and whether catch-up and the writes
+# go on. x8 per leg per arch. Results to diag-results/live-durability-61-<leg>.
+on:
+  push:
+    branches: ["diag-live-durability-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  SLATES_TEST_CLI: "1"
+  SLATES_DIAG_INSTALL_FLOOR_MS: "30000"
+
+jobs:
+  check:
+    name: restart (${{ matrix.leg }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { leg: tip-x86, os: ubuntu-latest, ref: beeefb395b403558609ae7991b677d69d1c7ed01 }
+          - { leg: main-x86, os: ubuntu-latest, ref: 6880041fb7498994bf6c7197dafa806173f8788d }
+          - { leg: tip-arm, os: ubuntu-24.04-arm, ref: beeefb395b403558609ae7991b677d69d1c7ed01 }
+          - { leg: main-arm, os: ubuntu-24.04-arm, ref: 6880041fb7498994bf6c7197dafa806173f8788d }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+      - name: The runs
+        shell: bash {0}
+        run: |
+          R=../results.txt
+          mkdir -p ../kept
+          echo "leg ${{ matrix.leg }}, $(nproc) CPUs, $(date -u), tree $(git rev-parse HEAD)" > $R
+          timeout 1800 cargo build --release --locked -p slates-cli --bin slates --test live_chaos > ../build.log 2>&1; status=$?
+          echo "== release build exit $status" >> $R
+          [ $status -ne 0 ] && grep -E '^error' -A8 ../build.log | head -40 >> $R
+          export SLATES_DIAG_STOP_DIR="$RUNNER_TEMP/stopdir"; mkdir -p "$SLATES_DIAG_STOP_DIR"
+          for run in 1 2 3 4 5 6 7 8; do
+            rm -f "$SLATES_DIAG_STOP_DIR"/*
+            timeout 400 cargo test --release --locked -p slates-cli --test live_chaos -- --nocapture --test-threads=1 --exact diag_a_holder_restarted_mid_install > ../run.log 2>&1; status=$?
+            grep -E '^LD-TL|panicked' ../run.log | cut -c1-300 | sed "s/^/   r$run /" >> $R || true
+            echo "   r$run counts: installs $(grep -c '^LD-LANE install' ../run.log) taken $(grep -c '^LD-TAKE' ../run.log) images $(grep -c '^LD-IMAGE' ../run.log) why $(grep -c '^LD-WHY' ../run.log)" >> $R
+            echo "== run $run exit $status" >> $R
+            if [ $status -ne 0 ] || [ "$(grep -c '^LD-LANE install' ../run.log)" -gt 12 ]; then
+              grep -E '^LD-|^---|fleet_session|panicked' ../run.log | cut -c1-400 | head -3000 > ../kept/run-$run.log
+            fi
+          done
+          exit 0
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/live-durability-61-${{ matrix.leg }}"
+          git config user.name "diag-live-durability"
+          git config user.email "diag-live-durability@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          cp ../kept/*.log . 2>/dev/null || true
+          git add results.txt *.log 2>/dev/null || git add results.txt
+          git commit -qm "diag-live-durability-61 results, ${{ matrix.leg }}"
+          git push -q origin "HEAD:refs/heads/$branch"
