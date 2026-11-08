@@ -1,0 +1,41 @@
+head 0577c63335144baa930b0855a51d4d85082c2d01, 4 CPUs
+== run 1 exit 0
+diag-restart: made 2236 volumes, 0 refused
+diag-restart: unauthorized 0; first None, last None after the restart; held records at first answer Some((11.471538ms, 2)), first growth Some((284.906954ms, 77)); 716 samples; ["restarts: 1", "fleet_members: 1166407564522300673 13227923119757729778 15828307574331461070", "fleet_held_records: 4298", "shard 0 refused fleet.live.held: 585"]
+diag-restart: wrote 727 files
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 21.35s
+== run 2 exit 0
+diag-restart: made 2696 volumes, 0 refused
+diag-restart: unauthorized 0; first None, last None after the restart; held records at first answer Some((7.873962ms, 2)), first growth Some((1.176294453s, 7)); 706 samples; ["restarts: 1", "fleet_members: 905575597224527051 2414489698766338594 9260279642072032967", "fleet_held_records: 4743", "shard 0 refused fleet.live.held: 570"]
+diag-restart: wrote 763 files
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 21.31s
+== run 3 exit 0
+diag-restart: wrote 725 files
+diag-restart: unauthorized 0; first None, last None after the restart; held records at first answer Some((13.227532ms, 2)), first growth Some((171.489012ms, 46)); 713 samples; ["restarts: 1", "fleet_members: 422697308919613374 7798047415378095825 16425036154604686915", "fleet_held_records: 3846", "shard 0 refused fleet.live.held: 655"]
+diag-restart: made 2050 volumes, 0 refused
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 21.48s
+== run 4 exit 0
+diag-restart: made 2634 volumes, 0 refused
+diag-restart: unauthorized 0; first None, last None after the restart; held records at first answer Some((7.059826ms, 2)), first growth Some((159.890104ms, 38)); 708 samples; ["restarts: 1", "fleet_members: 755053403932267171 10153668388027606748 14815584583156014652", "fleet_held_records: 4937", "shard 0 refused fleet.live.held: 584"]
+diag-restart: wrote 720 files
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 22.16s
+== run 5 exit 0
+diag-restart: made 1869 volumes, 0 refused
+diag-restart: unauthorized 0; first None, last None after the restart; held records at first answer Some((12.341189ms, 2)), first growth Some((155.535221ms, 4)); 729 samples; ["restarts: 1", "fleet_members: 6529777609543930014 7692746017665696973 14555068607563074307", "fleet_held_records: 3527", "shard 0 refused fleet.live.held: 569"]
+diag-restart: wrote 676 files
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 21.25s
+== run 6 exit 0
+diag-restart: unauthorized 0; first None, last None after the restart; held records at first answer Some((8.943071ms, 2)), first growth Some((178.735884ms, 37)); 718 samples; ["restarts: 1", "fleet_members: 13665766005327531554 17682603736018827127 17949427026989644482", "fleet_held_records: 3883", "shard 0 refused fleet.live.held: 591"]
+diag-restart: made 2119 volumes, 0 refused
+diag-restart: wrote 726 files
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 21.29s
+== run 7 exit 0
+diag-restart: made 2042 volumes, 0 refused
+diag-restart: unauthorized 0; first None, last None after the restart; held records at first answer Some((5.208752ms, 2)), first growth Some((191.817663ms, 4)); 722 samples; ["restarts: 1", "fleet_members: 7416213970520679585 12093205969843922385 12600734017870939639", "fleet_held_records: 3936", "shard 0 refused fleet.live.held: 636"]
+diag-restart: wrote 751 files
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 21.33s
+== run 8 exit 0
+diag-restart: unauthorized 0; first None, last None after the restart; held records at first answer Some((6.919454ms, 2)), first growth Some((175.913836ms, 5)); 717 samples; ["restarts: 1", "fleet_members: 3549468307135035648 16487481553503204283 17764596471899187369", "fleet_held_records: 3400", "shard 0 refused fleet.live.held: 629"]
+diag-restart: made 1978 volumes, 0 refused
+diag-restart: wrote 753 files
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 21.38s
