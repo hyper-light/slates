@@ -1,5 +1,5 @@
 //! A real VM over a slates mount, with DAX (`docs/wip/virtiofs.md` §8 item 7; §4.6 "Cache posture"; A-139, A-140,
-//! A-146). A slates volume reaches a VM as a host mount the VMM shares in, with its own DAX window over the host's
+//! A-146, A-248). A slates volume reaches a VM as a host mount the VMM shares in, with its own DAX window over the host's
 //! cached copy of each file. Here crosvm's own virtio-fs device shares a `slates mount` folder into a guest whose
 //! `/init` is `slates-guest-probe`. The test drives the guest over its serial console ([`slates_guest_probe::protocol`])
 //! while it writes the same file through a second mount of the volume, the guest's other path.
@@ -59,8 +59,8 @@ const SEED_BYTE: u8 = b'.';
 const GUEST_FIRST: u8 = 1;
 /// Format: see [`GUEST_FIRST`].
 const HOST_FIRST: u8 = 128;
-/// Format: the daemon's status counter of bytes kept back from cache write-backs (A-140).
-const KEPT_BACK: &str = "fuse.writeback_bytes_kept_back: ";
+/// Format: the daemon's status counter of cache write-backs refused whole as conflicts (A-248).
+const CONFLICTS: &str = "fuse.writeback_conflicts: ";
 
 /// The paths the test needs from the environment, or `None` after saying loudly which are missing.
 struct Gate {
@@ -121,24 +121,98 @@ fn boot_crosvm(gate: &Gate, initrd: &str, shared: &str, most_bytes: usize) -> Gu
   )
 }
 
-/// What each byte of a shared file must hold: the value of the latest write to it from either side. That is the one
-/// page cache the mount route must behave as. The history makes it exact: after each of the other path's writes, the
-/// guest waits until both ends of the write show in its map, so the guest's later stores land in pages already
-/// re-fetched (the AC-3.3 residual, a store into a page whose change is still on its way, never arises).
+/// What each byte of a shared file may hold once the guest has synced, by the dirty-page write-back rule (A-248). The
+/// latest write to it from either side, exactly, unless its page is at risk: the other path wrote into the page, or a
+/// dirty page contiguous with it, while it held guest stores not yet synced, so the page's write-back, the guest's
+/// stores with the bytes it fetched before the other write, may have been refused whole. Then the byte holds its settled value (the seed, the other path's
+/// write, or what the last check saw) or one of the guest's stores since, never anything older, and never a stale byte
+/// over the other path's write. The history makes the rest exact: after each of the other path's writes, the guest
+/// waits until both ends of the write show in its map, so the guest's later stores land in pages already re-fetched
+/// (the AC-3.3 residual, a store into a page whose change is still on its way, never arises).
 struct Expected {
+  /// The latest write to each byte from either side.
   bytes: Vec<u8>,
+  /// Each byte's settled value and the guest's stores to it since, in order.
+  history: Vec<(u8, Vec<u8>)>,
+  /// The system's page size: the unit of a write-back.
+  page: u64,
+  /// Pages the guest stored into since its last sync.
+  dirty: std::collections::BTreeSet<u64>,
+  /// Pages the other path wrote into while they held unsynced guest stores, since the last check.
+  at_risk: std::collections::BTreeSet<u64>,
 }
 
 impl Expected {
-  fn write(&mut self, at: u64, len: u64, value: u8) {
-    let start = usize::try_from(at).unwrap();
-    let end = usize::try_from(at.checked_add(len).unwrap()).unwrap();
-    self.bytes[start..end].fill(value);
+  fn new(len: u64) -> Expected {
+    let bytes = vec![SEED_BYTE; usize::try_from(len).unwrap()];
+    Expected {
+      history: bytes.iter().map(|&byte| (byte, Vec::new())).collect(),
+      bytes,
+      page: u64::try_from(rustix::param::page_size()).unwrap(),
+      dirty: std::collections::BTreeSet::new(),
+      at_risk: std::collections::BTreeSet::new(),
+    }
   }
 
-  /// Panics naming the first bytes that differ from `actual`, and which side wrote each.
+  /// The byte range `[at, at + len)` and the pages it touches.
+  fn span(&self, at: u64, len: u64) -> (std::ops::Range<usize>, std::ops::RangeInclusive<u64>) {
+    let end = at.checked_add(len).unwrap();
+    let bytes = usize::try_from(at).unwrap()..usize::try_from(end).unwrap();
+    (bytes, at / self.page..=end.saturating_sub(1) / self.page)
+  }
+
+  /// The guest stored `value` over `[at, at + len)`, unsynced.
+  fn guest_stored(&mut self, at: u64, len: u64, value: u8) {
+    let (bytes, pages) = self.span(at, len);
+    self.bytes[bytes.clone()].fill(value);
+    for (_, stores) in &mut self.history[bytes] {
+      stores.push(value);
+    }
+    self.dirty.extend(pages);
+  }
+
+  /// The other path wrote `value` over `[at, at + len)`: every page it touched that held unsynced guest stores is at
+  /// risk, with the dirty pages contiguous with it, which can share its `WRITE`.
+  fn other_path_wrote(&mut self, at: u64, len: u64, value: u8) {
+    let (bytes, pages) = self.span(at, len);
+    self.bytes[bytes.clone()].fill(value);
+    for byte in &mut self.history[bytes] {
+      *byte = (value, Vec::new());
+    }
+    let touched: Vec<u64> = pages.filter(|page| self.dirty.contains(page)).collect();
+    for page in touched {
+      let before = (0..page)
+        .rev()
+        .take_while(|neighbour| self.dirty.contains(neighbour));
+      let after = (page + 1..).take_while(|neighbour| self.dirty.contains(neighbour));
+      let run: Vec<u64> = before.chain(std::iter::once(page)).chain(after).collect();
+      self.at_risk.extend(run);
+    }
+  }
+
+  /// The guest synced: its stores so far were written back, or refused if their page is at risk.
+  fn guest_synced(&mut self) {
+    self.dirty.clear();
+  }
+
+  /// Whether byte `at` may hold `value` (see the type).
+  fn allows(&self, at: usize, value: u8) -> bool {
+    let page = u64::try_from(at).unwrap() / self.page;
+    if !self.at_risk.contains(&page) {
+      return self.bytes[at] == value;
+    }
+    let (settled, stores) = &self.history[at];
+    *settled == value || stores.contains(&value)
+  }
+
+  /// Panics naming the first bytes of `actual` the rule does not allow, and which side wrote each.
   fn assert_held_by(&self, actual: &[u8], what: &str, guest: &Guest) {
-    if actual == self.bytes.as_slice() {
+    let allowed = actual.len() == self.bytes.len()
+      && actual
+        .iter()
+        .enumerate()
+        .all(|(at, &value)| self.allows(at, value));
+    if allowed {
       return;
     }
     let writer = |value: u8| match value {
@@ -146,28 +220,45 @@ impl Expected {
       value if value >= HOST_FIRST => "the other path",
       _ => "the guest",
     };
-    let wrong: Vec<String> = self
-      .bytes
+    let wrong: Vec<String> = actual
       .iter()
-      .zip(actual)
       .enumerate()
-      .filter(|(_, (expected, held))| expected != held)
+      .filter(|&(at, &value)| at >= self.bytes.len() || !self.allows(at, value))
       .take(8)
-      .map(|(at, (expected, held))| {
+      .map(|(at, &held)| {
+        let latest = self.bytes.get(at).copied().unwrap_or(0);
         format!(
-          "byte {at}: holds {held} ({}), expected {expected} ({})",
-          writer(*held),
-          writer(*expected)
+          "byte {at}: holds {held} ({}), the latest write {latest} ({}), page at risk {}",
+          writer(held),
+          writer(latest),
+          self
+            .at_risk
+            .contains(&(u64::try_from(at).unwrap() / self.page))
         )
       })
       .collect();
     panic!(
-      "{what} differs from the latest write to each byte (lengths {} and {}):\n{}\n{}",
+      "{what} holds a byte the write-back rule does not allow (lengths {} and {}):\n{}\n{}",
       actual.len(),
       self.bytes.len(),
       wrong.join("\n"),
       guest.transcript()
     );
+  }
+
+  /// A check saw `held`, which the rule allowed: it is every byte's settled value from here on. Answers how many bytes
+  /// held something older than their latest write: guest stores lost with a refused write-back.
+  fn settle(&mut self, held: &[u8]) -> usize {
+    let lost = held
+      .iter()
+      .zip(&self.bytes)
+      .filter(|(held, latest)| held != latest)
+      .count();
+    self.bytes = held.to_vec();
+    self.history = held.iter().map(|&byte| (byte, Vec::new())).collect();
+    self.dirty.clear();
+    self.at_risk.clear();
+    lost
   }
 }
 
@@ -203,7 +294,12 @@ struct Tally {
   stores: u32,
   writes: u32,
   syncs: u32,
+  /// Syncs the guest was told failed: a write-back of its stores was refused (A-248).
+  refused_syncs: u32,
   checks: u32,
+  /// Bytes a check saw hold something older than their latest write: the guest's stores lost with a refused
+  /// write-back.
+  lost_bytes: usize,
   slowest_arrival_micros: u64,
 }
 
@@ -257,9 +353,7 @@ impl<'r> History<'r> {
       guest_file: rig.guest_side.file(file),
       host_file: rig.host_side.file(file),
       len,
-      expected: Expected {
-        bytes: vec![SEED_BYTE; usize::try_from(len).unwrap()],
-      },
+      expected: Expected::new(len),
       state: seed,
       guest_counter: 0,
       host_counter: 0,
@@ -302,7 +396,7 @@ impl<'r> History<'r> {
       len: run,
       byte: value,
     });
-    self.expected.write(at, run, value);
+    self.expected.guest_stored(at, run, value);
     self.tally.stores = self.tally.stores.saturating_add(1);
   }
 
@@ -319,7 +413,7 @@ impl<'r> History<'r> {
       let arrival = arrival_in_the_map((at, run), value, guest);
       self.tally.slowest_arrival_micros = self.tally.slowest_arrival_micros.max(arrival);
     }
-    self.expected.write(at, run, value);
+    self.expected.other_path_wrote(at, run, value);
     self.tally.writes = self.tally.writes.saturating_add(1);
   }
 
@@ -331,20 +425,31 @@ impl<'r> History<'r> {
       match roll % 10 {
         0..=3 => self.guest_stores(span, guest),
         4..=6 => self.other_path_writes(span, Some(guest)),
-        7 | 8 => {
-          guest.done(&Ask::Sync);
-          self.tally.syncs = self.tally.syncs.saturating_add(1);
-        }
+        7 | 8 => self.sync(guest),
         _ => self.check(guest),
       }
     }
   }
 
-  /// Syncs the guest, then holds the volume, read through slates itself past both mounts, and the guest's map to the
-  /// latest write to every byte.
+  /// The guest syncs its map. A sync may be refused, `EIO`, where a write-back of the guest's stores was (A-248): the
+  /// guest is told, as a program is at its `msync`.
+  fn sync(&mut self, guest: &mut Guest) {
+    match guest.ask(&Ask::Sync, REPLY_WAIT) {
+      Reply::Done => {}
+      Reply::Refused(why) if why.starts_with("msync") => {
+        self.tally.refused_syncs = self.tally.refused_syncs.saturating_add(1);
+      }
+      other => panic!("sync → {other:?}\n{}", guest.transcript()),
+    }
+    self.expected.guest_synced();
+    self.tally.syncs = self.tally.syncs.saturating_add(1);
+  }
+
+  /// Syncs the guest, then holds the volume, read through slates itself past both mounts, to the write-back rule, and
+  /// the guest's map to the volume, byte for byte; what they hold is settled from here on.
   fn check(&mut self, guest: &mut Guest) {
-    guest.done(&Ask::Sync);
-    self.volume_holds_the_latest_writes(guest);
+    self.sync(guest);
+    let held = self.volume_holds_the_latest_writes(guest);
     match guest.ask(
       &Ask::Read {
         at: 0,
@@ -352,19 +457,23 @@ impl<'r> History<'r> {
       },
       REPLY_WAIT,
     ) {
-      Reply::Bytes(mapped) => {
-        self
-          .expected
-          .assert_held_by(&mapped, &format!("the guest's map of {}", self.file), guest)
-      }
+      Reply::Bytes(mapped) => assert!(
+        mapped == held,
+        "the guest's map of {} differs from the volume: {} byte(s)\n{}",
+        self.file,
+        mapped.iter().zip(&held).filter(|(a, b)| a != b).count(),
+        guest.transcript()
+      ),
       other => panic!("read → {other:?}\n{}", guest.transcript()),
     }
+    let lost = self.expected.settle(&held);
+    self.tally.lost_bytes = self.tally.lost_bytes.saturating_add(lost);
     self.tally.checks = self.tally.checks.saturating_add(1);
   }
 
-  /// Holds the volume's file, read through slates itself past both mounts, to the latest write to every byte; `guest`
-  /// only lends its console's transcript to a failure.
-  fn volume_holds_the_latest_writes(&self, guest: &Guest) {
+  /// Holds the volume's file, read through slates itself past both mounts, to the write-back rule ([`Expected`]), and
+  /// answers its bytes; `guest` only lends its console's transcript to a failure.
+  fn volume_holds_the_latest_writes(&self, guest: &Guest) -> Vec<u8> {
     let (code, held, err) = run(
       &self.rig.instance,
       &["read", &self.rig.shared, &format!("/{}", self.file)],
@@ -379,16 +488,17 @@ impl<'r> History<'r> {
       &format!("the volume's {}, read through slates", self.file),
       guest,
     );
+    held
   }
 }
 
-/// The daemon's bytes kept back from cache write-backs so far, over every shard.
-fn kept_back(instance: &str) -> u64 {
+/// The daemon's cache write-backs refused as conflicts so far, over every shard.
+fn conflicts(instance: &str) -> u64 {
   let (code, out, err) = run(instance, &["status"]);
   assert_eq!(code, 0, "slates status: {err}");
   String::from_utf8_lossy(&out)
     .lines()
-    .filter_map(|line| line.split_once(KEPT_BACK))
+    .filter_map(|line| line.split_once(CONFLICTS))
     .filter_map(|(_, count)| count.trim().parse::<u64>().ok())
     .sum()
 }
@@ -448,25 +558,25 @@ const UNSYNCED_STORES: usize = 6;
 /// Shape: the other path's writes after a VM's death, over spans its unsynced stores may share.
 const WRITES_AFTER_THE_KILL: usize = 4;
 
-/// Syncs `path` through its slates mount from the host, so what the host's page cache holds dirty is written back.
+/// Syncs `path` through its slates mount from the host, so what the host's page cache holds dirty is written back. A
+/// refused write-back (A-248) fails the sync, which is one of the rule's outcomes: answered, not raised.
 #[allow(clippy::disallowed_methods)] // the test's own sync through a slates mount: RAM, not disk
-fn sync_through(path: &str) {
-  std::fs::File::open(path)
-    .and_then(|file| file.sync_all())
-    .unwrap_or_else(|e| panic!("fsync {path}: {e}"));
+fn sync_through(path: &str) -> std::io::Result<()> {
+  std::fs::File::open(path)?.sync_all()
 }
 
-/// §4.6 (the mount route, A-139/A-140/A-146) through a real guest with DAX. Do: share a slates mount into a crosvm
+/// §4.6 (the mount route, A-140/A-146/A-248) through a real guest with DAX. Do: share a slates mount into a crosvm
 /// guest with DAX, and over each of three fixed-seed files run a generated history of the guest's unsynced stores into
 /// its shared map, its syncs, and the other path's writes through a second mount of the volume, each waited for in the
 /// guest's map as memory alone. At random points and at the end, sync the guest and read the file through slates
 /// itself, past both mounts, and through the guest's map.
 ///
 /// Expect: the guest's file is in DAX mode; every write of the other path reaches the guest's map as memory alone; and
-/// at every check, every byte of the volume and of the map holds the latest write to it from either side. That is one
-/// page cache's behaviour, which a dirty guest page written back over a later write would break (A-139/A-140). The
-/// keep-back count must move, or no history put a guest store and a later write on one page, and the test proved
-/// nothing.
+/// at every check the guest's map equals the volume, and every byte holds what the write-back rule allows
+/// ([`Expected`]): its latest write, unless the other path wrote into its page over guest stores not yet synced, whose
+/// write-back is then refused whole; never a stale byte over the other path's write, which a dirty guest page written
+/// back whole would put there (A-139). The conflict count must move, or no history put a guest store and a later write
+/// on one page, and the test proved nothing.
 #[test]
 fn a_guest_maps_a_slates_mount_with_dax_and_holds_the_latest_write_to_every_byte() {
   let Some(gate) = Gate::from_env() else {
@@ -482,8 +592,14 @@ fn a_guest_maps_a_slates_mount_with_dax_and_holds_the_latest_write_to_every_byte
     let tally = std::mem::take(&mut history.tally);
     eprintln!(
       "history {index} (seed {seed:#x}): {} guest stores, {} other-path writes (slowest to reach the map: {} µs), \
-       {} syncs, {} checks",
-      tally.stores, tally.writes, tally.slowest_arrival_micros, tally.syncs, tally.checks
+       {} syncs ({} refused), {} checks, {} byte(s) of guest stores lost with refused write-backs",
+      tally.stores,
+      tally.writes,
+      tally.slowest_arrival_micros,
+      tally.syncs,
+      tally.refused_syncs,
+      tally.checks,
+      tally.lost_bytes
     );
     tallies.push(tally);
   }
@@ -493,10 +609,10 @@ fn a_guest_maps_a_slates_mount_with_dax_and_holds_the_latest_write_to_every_byte
     "the VM powered off cleanly: {status}\n{}",
     guest.transcript()
   );
-  let kept = kept_back(&rig.instance);
-  eprintln!("bytes kept back from the guest's write-backs: {kept}");
+  let refused = conflicts(&rig.instance);
+  eprintln!("the guest's write-backs refused as conflicts: {refused}");
   assert!(
-    kept > 0,
+    refused > 0,
     "non-vacuous: some history wrote through the other path over a page the guest had stored into unsynced"
   );
   assert!(
@@ -511,8 +627,8 @@ fn a_guest_maps_a_slates_mount_with_dax_and_holds_the_latest_write_to_every_byte
 /// guest's stores unsynced in its map; kill the daemon with `SIGKILL` while the guest holds the live map; wait for the
 /// anchor's successor to answer; run the rest of the history on the same map.
 ///
-/// Expect: the successor is a new process, and every check before and after holds every byte of the volume and of the
-/// map to its latest write, the stores left unsynced across the kill included. The restored mount judges the guest's
+/// Expect: the successor is a new process, and every check before and after holds the map equal to the volume and every
+/// byte to the write-back rule ([`Expected`]), the stores left unsynced across the kill included. The restored mount judges the guest's
 /// write-backs without the dead daemon's byte states, against every record since it started (GAPS), which this history
 /// stays well inside.
 #[test]
@@ -556,9 +672,11 @@ fn a_daemon_killed_under_a_guests_live_map_is_taken_over_and_the_guest_goes_on()
 /// the other path; then fsync the file through the guest's side of the mount from the host. Then boot a second guest
 /// on the same mount and map the file.
 ///
-/// Expect: the volume holds the latest write to every byte, the dead guest's unsynced stores included wherever nothing
-/// later wrote over them, and the second guest's map holds the same. The host's page cache outlives the VM that
-/// dirtied it, so its stores are written back, judged by the write-back rule like any other (A-140).
+/// Expect: the volume holds what the write-back rule allows ([`Expected`]): the dead guest's unsynced stores wherever no
+/// later write touched their page, the other path's writes everywhere they wrote, and where they wrote into a page of
+/// unsynced stores, those stores or what the page held before them; and the second guest's map equals the volume. The
+/// host's page cache outlives the VM that dirtied it, so its stores are written back, judged by the rule like any other
+/// (A-140, A-248); the host's sync fails where one of them was refused, which the test prints.
 #[test]
 fn a_guest_killed_with_unsynced_stores_leaves_them_to_land_and_a_new_guest_reads_them() {
   let Some(gate) = Gate::from_env() else {
@@ -578,14 +696,23 @@ fn a_guest_killed_with_unsynced_stores_leaves_them_to_land_and_a_new_guest_reads
     let span = history.span();
     history.other_path_writes(span, None);
   }
-  sync_through(&history.guest_file);
+  history.expected.guest_synced();
+  let synced = sync_through(&history.guest_file);
+  assert!(
+    synced
+      .as_ref()
+      .err()
+      .is_none_or(|e| e.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error())),
+    "the host's sync succeeds, or is refused EIO for a refused write-back: {synced:?}"
+  );
   history.volume_holds_the_latest_writes(&first);
   let mut second = rig.boot(&gate);
   history.map(&mut second);
   history.check(&mut second);
   eprintln!(
-    "the first VM killed with {UNSYNCED_STORES} unsynced stores, {WRITES_AFTER_THE_KILL} writes after it: the volume \
-     and a second guest's map hold the latest write to every byte"
+    "the first VM killed with {UNSYNCED_STORES} unsynced stores, {WRITES_AFTER_THE_KILL} writes after it, the host's \
+     sync {synced:?}: the volume and a second guest's map hold what the write-back rule allows, {} byte(s) lost",
+    history.tally.lost_bytes
   );
   let status = second.quit();
   assert!(

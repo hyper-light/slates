@@ -2426,8 +2426,8 @@ guest's later requests meanwhile, completing the held reply out of order, which 
 Shards stream, whose VMM sends one request at a time, holds its reply frame. **A guest's own stale page** is judged
 too (2026-11-06): its device delivers no invalidation, so a page the guest dirtied and launders at a revalidation can
 carry bytes another path changed since. The device keeps per-guest byte states, fed by the guest's reads, its own
-writes and the journal's other changes, and refuses a `FUSE_WRITE_CACHE` write-back holding a stale byte `EIO` whole:
-A-192's rule, not the host mount's mask (`slates_bridge_fuse::guest_writeback`). Each mount's told point is its coherence
+writes and the journal's other changes, and refuses a `FUSE_WRITE_CACHE` write-back whose stale bytes differ from the
+file's `EIO` whole: the rule every transport shares since A-248 (`slates_bridge_fuse::guest_writeback`). Each mount's told point is its coherence
 cursor, held back while a round is out (`ServeState::told_through`); the writer's reply waits on the volume's owner shard
 without blocking it, at most half the liveness budget, past which it is answered and the late mount counted. A write through a FUSE mount is still answered first, since requests on two mounts, each waiting for the
 other mount's notification, could deadlock; AC-3.3 states that window. **What the kernel is told to
@@ -2441,9 +2441,18 @@ A directory's listing, an outsider's change beneath a base, and a mount fallen b
 having no byte range. A guest's DAX map of a file shared through a mount lives in that cache. Under a whole-file drop
 for every change, each one-byte change elsewhere to a 128 MiB file made the guest's next scan of its map take 356–382
 ms, against 0.2–0.3 ms warm (Linux 7.2.9, crosvm, 2026-10-22). **A page the kernel writes back from its cache is applied
-only where it is not stale** (A-139, A-140). A `WRITE` carrying `FUSE_WRITE_CACHE` is
-applied except over the bytes another path changed after the kernel's copy of them was fetched, the mount's own writes
-since excepted. That is what one shared page cache would hold. For each byte of a file open for writing, the mount keeps
+whole or refused whole** (A-248, Ada's decision of 2026-11-07: "Refuse, like NFS"). A `WRITE` carrying
+`FUSE_WRITE_CACHE` whose bytes include any another path changed after the kernel's copy of them was fetched (the
+mount's own writes since excepted), and that differ from the file's bytes now, is refused `EIO` whole: the other path's
+change survives, and the program learns at its `msync` or `fsync` that its store did not land. Whole means the whole
+`WRITE`: Linux gathers contiguous dirty pages into one, so a page no other path touched can go with it. The kernel marks
+every page of a refused write-back clean, so the mount drops them all from its cache at the next round, after the reply,
+and the next read fetches what the volume holds. Stale bytes equal to the file's change nothing, so such a write-back is
+applied whole. It is one rule for every transport that writes back a
+client's cache, the host mount, a virtio-fs guest and an NFS v3 connection (`slates_bridge_fuse::coherence::judge_writeback`),
+and the write log records a refused write-back nowhere. Until A-248 the mount applied the write-back outside its stale
+bytes (A-139, A-140), which chose bytes between the store and the other path's change: an inferred merge, banned item
+11. For each byte of a file open for writing, the mount keeps
 the journal point its kernel's copy is as of and whether another path changed it since. These states are fed from the
 records its invalidation rounds already walk, so a copy fetched any time ago is judged. A file's first writable open on a
 mount drops the kernel's cached pages (no `FOPEN_KEEP_CACHE`), so every byte starts fresh. **A mount taken over by a
@@ -2451,7 +2460,7 @@ restarted daemon** (A-61) never saw the opens its kernel made before. At its fir
 publication counted open for it, fresh as of its start, and its rounds feed them from there (A-156). A request naming a
 handle opened after that publication adopts its file (A-147): fresh as of the mount's start, with the journal's changes
 to it since then applied, and judged from there like any other. Untracked, such a file was judged against every change
-since the mount's start. A store made after a re-fetch of bytes another path had changed was then kept back, and
+since the mount's start. A store made after a re-fetch of bytes another path had changed was then judged stale, and
 lost. **A READ through a handle
 opened `O_DIRECT` is ambiguous** (A-144). It is a direct read, which leaves the kernel's copy as it was, or a fill of
 that copy (a fault on a map of the handle, a buffered fallback), and FUSE carries nothing that tells them apart. So it
@@ -13571,6 +13580,57 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
+### A-248 — A FUSE cache write-back is refused whole when a stale byte differs from the file's, as NFS's is: one rule for every transport (accepted 2026-11-07, Ada's decision: "Refuse, like NFS")
+Applied in the same change to: §4.6 ("Cache posture": the write-back paragraph, the guest's sentence), A-139 and A-140
+(superseded), GAPS (the 2026-10-21 dirty-page entry), `crates/bridge-fuse` (`coherence.rs`: `WritebackVerdict`,
+`judge_writeback`, new; `channel.rs`: `serve_writeback` judges by it and `Dispatched` keeps no kept-back ranges;
+`bridge.rs`: `unmasked_segments` and `serve_cache_write` removed; `guest_writeback.rs`: the same rule;
+`tests/writeback.rs`, `tests/coherence_mount.rs`), `crates/bridge-core` (`dax_backing::read_whole`, now public: the
+rule's reader), `crates/server` (`fuse.rs`: `fuse.writeback_conflicts` and `fuse.writeback_identical` replace
+`fuse.writeback_bytes_kept_back`, and the write log takes the whole write; `nfs_writeback.rs` and `nfs.rs`: the same
+rule), `crates/cli` (`tests/cli.rs`: the dirty-page, truncation and unsynced-history tests, and A-152's release test for
+U10's rule; `tests/guest_dax.rs`: the oracle), the bug record
+`docs/bugs/2026-11-07-a-fuse-write-back-was-applied-around-its-stale-bytes.md`.
+- **The decision.** Ada, 2026-11-07, asked whether the host FUSE mount should go on applying a stale write-back outside
+  its stale bytes (A-139, A-140) or refuse it as NFS does (A-192): "Refuse, like NFS."
+- **Changes §4.6.** A `FUSE_WRITE_CACHE` write-back is applied whole or refused whole. One whose stale bytes (another
+  path changed them after the kernel's copy was fetched) all equal the file's bytes now is applied, since it changes
+  nothing there; one with a stale byte that differs is refused `EIO`, a conflict; one whose stale bytes cannot be told is
+  refused, unknown, as before. The other path's change survives, and the program learns at its `msync` or `fsync`. A
+  refused write-back changes nothing, and the write log records nothing of it.
+- **Whole is the whole `WRITE`, and what it carried is dropped.** A neighbouring page in the same `WRITE` loses its
+  unsynced stores, and the program is told at its sync. Linux gathers contiguous dirty pages into one `WRITE`, so a page
+  no other path touched can share a stale page's refusal. A per-page split would be a partial apply again; Ada's rule is
+  "A stale write-back fails with an I/O error at msync or fsync … and nothing is silently mixed". The kernel marks every
+  page of a refused `WRITE` clean whatever the answer.
+  No change names an untouched page, so it would go on serving a store the volume refused. Every byte a refused write-back
+  carried is therefore owed an inode invalidation (`ServeState::refused_writebacks`, one covering range a file), sent
+  through the notify thread by the next round after the reply. Found by reading while rewriting the three-writer
+  history's oracle for this change. Every refusal, conflict or unknown, is covered.
+- **Why.** The mask chose bytes between the program's store and the other path's change, which is an inferred merge
+  (banned item 11), and it hid its losses: a store over stale bytes was dropped while the `msync` answered 0 (GAPS,
+  A-147's entry). Refusal is what NFS already did since A-192, and what the guest device did since 2026-11-06.
+- **One rule.** `judge_writeback` takes a write-back's stale ranges, its bytes and a reader of the file's bytes now; the
+  host mount and the guest device read through their bridge (`read_whole`, past the bridge's read cap), NFS through the
+  volume. Before, the guest device refused any stale byte, equal or not, against its own module doc; it now applies an
+  identical one, as NFS did.
+- **Proven.** `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` (`crates/cli/tests/cli.rs`,
+  Linux) was rewritten first: a stale whole page refused with the replacement whole and the sync failing; a write-back
+  after a refetch applied whole; a stale page over a second mount's bytes 100–200 refused, the second mount's bytes kept
+  and the sync failing. `a_refused_write_back_drops_every_page_it_carried_from_the_kernels_cache`
+  (`crates/bridge-fuse/tests/coherence_mount.rs`) holds the batch: three contiguous pages, the last stale, one refused
+  `WRITE`, and every page coming to read what the volume holds. The dirty-page test was red before the change, 3 of 3 on each Linux arch (`diag-bug-sweep-18`, run 42438497719, Linux
+  7.0.0-1017-azure), each at the stale page's sync, which the masked apply answered `Ok`. By use over a real volume
+  bridge, `a_write_back_is_judged_whole_against_the_files_bytes_now` (`crates/bridge-fuse/tests/writeback.rs`) holds the
+  rule's four verdicts, an identical range twice the bridge's read cap, and a range past the file's end.
+- **What it does not change.** How staleness is judged (A-140's byte states, A-144's ambiguous reads, A-147's adopted
+  handles), the first writable open's cache drop, invalidation delivery, and `write(2)` through a mount, which is
+  write-through and never judged. AC-3.3's residual is still a race between two writers on one page, but its loser is
+  now told: a store concurrent with another path's call to the same page is refused with its page, not kept back.
+- **Residual, stated.** A transport that cannot invalidate cannot drop a refused batch's pages: a virtio-fs guest's
+  device delivers no invalidation, and an NFS client is told only the refusal. Pages that shared the refused `WRITE`
+  there stay cached, holding the stores, until the client next revalidates them. Found by reading, not measured.
+
 ### A-231 — A held NFS connection's byte states cross a takeover, and what the successor cannot know is judged stale (accepted 2026-11-07, the supervisor's decision)
 Applied in the same change to: §4.6 "NFS v3" (its status), A-192 (its restart line), GAPS, `crates/vfs`
 (`recover.rs`: `HeldNfsStates`, `CarriedFile`, `CarriedRange`, `CarriedByte`, `ShardImage::nfs_states`, image version
@@ -18192,7 +18252,8 @@ Applied in the same change to:
   any of them lives, a file made before the takeover (an inode below the volume's counter then, A-150) that leaves the
   namespace with no reference the successor knows is kept as an orphan (`takeover_kept`): charged to the volume's quota,
   so a write past it is refused `NoSpace`, counted in `slates status` (`takeover_kept`), and reclaimed when the last such
-  mount ends (`sweep_attachment`). A file made after the takeover, and every file outside a takeover, is reclaimed at its
+  mount ends (`Volume::end_takeover_holder`, from the attachment's end: Linux sends `FUSE_DESTROY` only to fuseblk and
+  virtio-fs mounts, so the sweep alone never ran for an ordinary one). A file made after the takeover, and every file outside a takeover, is reclaimed at its
   last close as before. This replaces A-152's "reclaimed at the kernel's forget" for pre-takeover files on a surviving
   mount: the successor cannot know a handle no publication counted is not still open.
   - `a_file_a_handle_no_publication_counted_may_hold_is_kept_until_its_mount_ends` (`crates/bridge-core/tests/
@@ -18200,7 +18261,12 @@ Applied in the same change to:
     and reclaimed when the mount ends; a file made after the takeover reclaimed at once.
   - `a_restart_loop_cannot_grow_the_kept_files_past_the_quota`: each takeover keeps one more file, the loop is refused
     `NoSpace` with the volume's bytes never past its quota, and the mount's end frees them all.
-  - A-152's five takeover tests now hold the file to the mount's end, each asserting every reference given back first.
+  - A-152's five takeover tests now hold the file to the mount's end, each asserting every reference given back first,
+    as does the real-mount release test (`the_handles_a_dead_daemon_issued_give_back_their_references_at_release`,
+    `crates/cli/tests/cli.rs`, Linux), which U10's first commit left expecting the bytes at the last close. Updated to
+    the rule, it found that the first commit never freed a kept file at a real unmount: red on both Linux arches
+    (`diag-bug-sweep-21`, run 42463819520, 1,048,576 bytes still referenced), where the in-process tests had called the
+    sweep directly.
   - Red-checked: with no held mount named, the uncounted handle's file is reclaimed and the loop never meets the quota.
 
 ### A-151 — An untouched base file is bound to the disk file it was made from (accepted 2026-10-22)
@@ -18652,6 +18718,9 @@ tests in `bridge-core/tests/invalidation.rs`, `bridge-fuse/tests/kernel_changes.
   their write-backs `EIO`), and the journal's budget, which stays as the ledger records it.
 
 ### A-140 — A cache write-back is judged by byte states the mount keeps as it consumes the journal (accepted 2026-10-22)
+> Its masked apply superseded 2026-11-07 by A-248 (Ada's decision, "Refuse, like NFS"): a stale write-back whose stale
+> bytes differ from the file's is now refused whole, `EIO`. The byte states below, and how they are fed, stand.
+
 Applied in the same change to: §4.6 (cache posture); A-139 (its basis superseded); `crates/bridge-core`
 (`changed.rs` `DataChange`/`data_change`; `Bridge::data_changes` replaces `Bridge::changed_since`; `volume_bridge.rs`,
 `scoped.rs`; `tests/data_changes.rs` replaces `tests/changed_since.rs`); `crates/bridge-fuse` (`coherence.rs`
@@ -18695,7 +18764,9 @@ mount's own requests and at reads, and judged at write-back); `crates/server/src
 
 ### A-139 — A cache write-back is applied only where it is not stale, judged by its page's fetch (accepted 2026-10-21)
 > Basis superseded 2026-10-22 by A-140: the walk back from each page's fetch point below needed records the journal no
-> longer held for a long-lived map (2 runs of 3 refused `EIO`, measured). The rule itself and its evidence stand.
+> longer held for a long-lived map (2 runs of 3 refused `EIO`, measured). The rule itself superseded 2026-11-07 by A-248
+> (Ada's decision, "Refuse, like NFS"): a write-back is no longer applied outside its stale bytes but refused whole. The
+> evidence of the bug stands.
 
 Applied in the same change to: §4.6 (cache posture); `crates/bridge-core` (`changed.rs`, `Bridge::changed_since`,
 `Bridge::journal_capacity`); `crates/vfs/src/journal.rs` (`OpLog::oldest_seq`, `OpLog::capacity`); `crates/bridge-fuse`

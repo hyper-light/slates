@@ -8002,6 +8002,16 @@ pub(crate) fn end_attachment(
   };
   state.db.mutate(&mut state.segment, &removal, now)?;
   crate::merge_service::forget_attachment(state, record.id);
+  // A mount that survived a takeover holds its volume's kept files until it ends, however it ends (U10).
+  if let Some(&handle) = state.by_id.get(&record.volume)
+    && let Ok(slot) = state.volumes.get_mut(handle)
+    && slot
+      .volume
+      .end_takeover_holder(&mut state.store, record.id)
+      .is_err()
+  {
+    state.count(TAKEOVER_KEPT_UNRELEASED, 1);
+  }
   // A guest device's record ends its device: the loop is asked to revoke and runs its terminal step, which
   // sweeps the device's references through its view and only then closes it (AUD-29-68).
   #[cfg(unix)]
@@ -11620,6 +11630,10 @@ fn settle_references(state: &mut ShardState, record: &VolumeRecord) -> usize {
     }
   }
 }
+
+/// Format: mounts that ended with the files kept for them (U10) refused reclamation: they stay charged to the volume until
+/// its next restart. Zero is the healthy reading.
+const TAKEOVER_KEPT_UNRELEASED: &str = "recovery.takeover_kept_unreleased";
 
 /// Format: the refusal counter of a write-log span the content object refused (A-63): that write is not logged.
 #[cfg(target_os = "linux")]
