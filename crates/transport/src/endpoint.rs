@@ -858,6 +858,32 @@ impl Endpoint {
     self.conn.rtt().pto(0)
   }
 
+  /// How long this session may hear nothing from its peer, while it owes an answer, before its own loss detection
+  /// takes the path for gone: RFC 9002 §7.6.1's persistent-congestion duration, three probe timeouts each floored at
+  /// the initial one
+  /// ([`RttEstimator::persistent_congestion_duration_floored`](crate::rtt::RttEstimator::persistent_congestion_duration_floored)).
+  /// The dialect negotiates no `max_ack_delay` (zero): a peer acknowledges on its next flush.
+  pub fn persistent_congestion_duration(&self) -> u64 {
+    self.conn.rtt().persistent_congestion_duration_floored(0)
+  }
+
+  /// How long the peer has owed this end an answer and given none, now
+  /// ([`Connection::peer_silence`](crate::connection::Connection::peer_silence)); `None` while nothing is owed.
+  pub fn peer_silence_ns(&self) -> Option<u64> {
+    self.conn.peer_silence(now_ns())
+  }
+
+  /// Whether the peer has been silent past its duration: this end sent an ack-eliciting packet, and nothing that opened
+  /// under the session's keys has come back for the longer of `floor_ns` and
+  /// [`persistent_congestion_duration`](Endpoint::persistent_congestion_duration). The one judgement of a dead session
+  /// for every caller that must end an exchange before its deadline (the live lane's watch, the forward lane). A peer
+  /// whose answers a queue holds back is not judged dead: its probe timeout grows with the delay its answers reveal.
+  pub fn peer_silent_past(&self, floor_ns: u64) -> bool {
+    self
+      .peer_silence_ns()
+      .is_some_and(|silence| silence >= floor_ns.max(self.persistent_congestion_duration()))
+  }
+
   /// The next packet number the connection will assign — its packet-number cursor, monotonic across
   /// every exchange this endpoint carries (a test asserts it never regresses: no reuse under the keys).
   pub fn tx_packet_number(&self) -> u64 {

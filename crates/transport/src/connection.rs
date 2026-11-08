@@ -307,6 +307,12 @@ pub struct Connection {
   loss_time: Option<u64>,
   /// Consecutive probe timeouts without an acknowledgement (RFC 9002 §6.2.1's `pto_count`).
   pto_count: u32,
+  /// When the peer was last heard: the last packet that opened under the session's keys.
+  heard_at: Option<u64>,
+  /// Since when the peer owes an answer and has given none: the first ack-eliciting send after it was last heard, or
+  /// that hearing itself while ack-eliciting packets were still in flight. `None` while nothing is owed (a session
+  /// that asked nothing since it last heard its peer is never silent, however long it idles).
+  asked_since: Option<u64>,
   /// Ack-eliciting packets the probe timeout allows past the window and the pacer (RFC 9002 §6.2.4).
   probes_owed: u32,
   /// The packet number at which the sender last found its window full with data waiting — the sender was
@@ -325,9 +331,6 @@ pub struct Connection {
   sent_acks: BTreeMap<u64, u64>,
   /// Received packets discarded as duplicates of a packet number already processed (RFC 9000 §12.3).
   duplicates: u64,
-  /// When this end last handled an authenticated packet from the peer (`handle_incoming`), `None` before the first:
-  /// what tells a borrower a session whose peer is gone (data in flight and nothing back) from a quiet one.
-  last_received_ns: Option<u64>,
   /// Stream frames the peer sent in breach of flow control or a stream's final size (RFC 9000 §4.1,
   /// §4.5), dropped and counted.
   violations: u64,
@@ -437,6 +440,8 @@ impl Connection {
       pacing_release: None,
       loss_time: None,
       pto_count: 0,
+      heard_at: None,
+      asked_since: None,
       probes_owed: 0,
       window_full_at: None,
       connection_sent: 0,
@@ -448,7 +453,6 @@ impl Connection {
       reserve_frame_cap,
       sent_acks: BTreeMap::new(),
       duplicates: 0,
-      last_received_ns: None,
       violations: 0,
       resets_owed: std::collections::BTreeSet::new(),
       probe_copies: VecDeque::new(),
@@ -918,6 +922,7 @@ impl Connection {
     if let Some(largest) = ack_largest {
       self.sent_acks.insert(pn, largest);
     }
+    self.asked_since.get_or_insert(now);
     let bytes: u64 = reliable.iter().map(tracked_bytes).sum();
     for frame in &reliable {
       if let Frame::Stream {
@@ -1235,7 +1240,6 @@ impl Connection {
       self.duplicates = self.duplicates.saturating_add(1);
       return;
     }
-    self.last_received_ns = Some(now);
     self.acks.record(pn);
     let mut ack_eliciting = false;
     for frame in frames {
@@ -1301,6 +1305,8 @@ impl Connection {
     if ack_eliciting {
       self.ack_owed = true;
     }
+    self.heard_at = Some(now);
+    self.asked_since = (self.recoverable_in_flight() > 0).then_some(now);
   }
 
   /// Processes one acknowledgement frame at `now` (RFC 9002 §B.4 `OnAckReceived`).
@@ -1824,9 +1830,11 @@ impl Connection {
     self.in_flight
   }
 
-  /// When this end last handled an authenticated packet from the peer, `None` before the first.
-  pub fn last_received_ns(&self) -> Option<u64> {
-    self.last_received_ns
+  /// How long the peer has owed an answer and given none at `now`: since the first ack-eliciting send after it was last
+  /// heard, or since that hearing while ack-eliciting packets were in flight. `None` while nothing is owed. A path-MTU
+  /// probe asks nothing here: one too large for the path is dropped and answered by no one.
+  pub fn peer_silence(&self, now: u64) -> Option<u64> {
+    self.asked_since.map(|since| now.saturating_sub(since))
   }
 
   /// The RTT estimator.
