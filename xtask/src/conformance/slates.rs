@@ -636,14 +636,23 @@ fn fresh_mount_point() -> Result<PathBuf, Failure> {
 }
 
 /// Mounts the volume: `slates mount` on macOS; the root NFS client on Linux, or for the Linux container form
-/// the daemon's shared FUSE mount.
+/// the daemon's shared FUSE mount. With `read_only`, a read attachment under a writable kernel mount, so each change
+/// reaches slates and is answered there: only the Linux NFS export allows that, since every other `--read-only` mount is
+/// read-only at the kernel too, and a suite over it would measure the kernel's refusal, not slates'.
 pub(crate) fn mount_volume(
   run: &Run<'_>,
   binary: &SlatesBinary,
-  instance: &str,
-  id: &str,
-  name: &str,
+  (instance, id, name): (&str, &str, &str),
+  read_only: bool,
 ) -> Result<Mount, Failure> {
+  let linux_nfs = run.os == HostOs::Linux && run.transport != Transport::OciLinux;
+  if read_only && !linux_nfs {
+    return Err(Failure(format!(
+      "--read-only runs over the Linux NFS export only: {}'s read-only mount is read-only at the kernel, which would \
+       refuse each change before slates answered it",
+      run.transport.slug()
+    )));
+  }
   let mount = match run.os {
     // WinFsp mounts at a drive letter (§4.6 "Windows", A-177): no directory is made.
     HostOs::Windows => {
@@ -702,7 +711,7 @@ pub(crate) fn mount_volume(
         id,
         name,
         LINUX_NFS_SERVER,
-        mount_deadlines(),
+        (mount_deadlines(), read_only),
       )?);
       let (kind, options) = if run.transport == Transport::NativeLinuxNfs4 {
         ("nfs4", format!("{LINUX_NFS4_OPTIONS},port={port}"))
@@ -740,6 +749,22 @@ pub(crate) fn mount_volume(
     pause();
   }
   Ok(mount)
+}
+
+/// Waits until `path`, made through another mount of the same volume, shows on this one: an NFS client caches a
+/// directory's attributes for the mount's `actimeo` (a second here), within [`MOUNT_WAIT`].
+pub(crate) fn visible(path: &Path) -> Result<(), Failure> {
+  let started = Instant::now();
+  while !path.exists() {
+    if started.elapsed() > MOUNT_WAIT {
+      return Err(Failure(format!(
+        "{} made through the setup mount does not show on the read-only mount after {MOUNT_WAIT:?}",
+        path.display()
+      )));
+    }
+    pause();
+  }
+  Ok(())
 }
 
 /// Whether a directory's filesystem folds names (`probe-a` and `probe-A` are one entry), so the
@@ -868,6 +893,9 @@ pub(crate) struct Session {
   /// notes, which name the admitted size.
   pub(crate) size_note: Option<String>,
   pub(crate) mount: Mount,
+  /// With `--read-only`, a writable mount of the same volume, through which the session makes what the suite's own
+  /// read-only mount cannot: its work directories, and the probe's tree. Dropped with the suite's mount.
+  setup: Option<(Mount, PathBuf)>,
   pub(crate) anchor: Anchor,
   base: PathBuf,
   /// With `--live-ship`, the fleet's candidates, dropped after the owner's mount and anchor.
@@ -966,17 +994,29 @@ impl Session {
     (volume_name, live): (&str, Option<super::live_fleet::LiveFleet>),
   ) -> Result<Session, Failure> {
     let volume_id = created.id;
-    let mount = mount_volume(run, &binary, &instance, &volume_id, volume_name)?;
-    let base = mount
-      .path()
-      .join(format!("conformance-{}", std::process::id()));
-    create_dir(&base)?;
+    let names = (instance.as_str(), volume_id.as_str(), volume_name);
+    let directory = format!("conformance-{}", std::process::id());
+    let setup = if run.options.read_only {
+      let writable = mount_volume(run, &binary, names, false)?;
+      let base = writable.path().join(&directory);
+      create_dir(&base)?;
+      Some((writable, base))
+    } else {
+      None
+    };
+    let mount = mount_volume(run, &binary, names, run.options.read_only)?;
+    let base = mount.path().join(&directory);
+    match &setup {
+      Some(_) => visible(&base)?,
+      None => create_dir(&base)?,
+    }
     Ok(Session {
       binary,
       instance,
       volume_id,
       size_note: created.note,
       mount,
+      setup,
       anchor,
       base,
       live,
@@ -1014,11 +1054,24 @@ impl Session {
     self.anchor.log_tail(ANCHOR_LOG_TAIL_LINES)
   }
 
-  /// A fresh working directory inside the mount.
+  /// A fresh working directory inside the mount; with `--read-only`, made through the writable setup mount and
+  /// returned once the suite's own mount shows it.
   pub(crate) fn workdir(&self, name: &str) -> Result<PathBuf, Failure> {
     let path = self.base.join(name);
-    create_dir(&path)?;
+    match &self.setup {
+      Some((_, base)) => {
+        create_dir(&base.join(name))?;
+        visible(&path)?;
+      }
+      None => create_dir(&path)?,
+    }
     Ok(path)
+  }
+
+  /// With `--read-only`, the writable path matching `path`, a path under the suite's own mount; `None` otherwise.
+  pub(crate) fn writable(&self, path: &Path) -> Option<PathBuf> {
+    let (_, base) = self.setup.as_ref()?;
+    Some(base.join(path.strip_prefix(&self.base).ok()?))
   }
 
   /// Whether the daemon still answers.

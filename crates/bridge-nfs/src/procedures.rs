@@ -1935,6 +1935,8 @@ impl<'b> Export<'b> {
         mtime: resolve_set_time(mtime_how, mtime_client, server_now)?,
         // An NFSv3 `sattr3` has no change time (RFC 1813 §2.3.5): it advances to the server clock.
         ctime: None,
+        // Nor a birth time.
+        btime: None,
       },
       explicit_times,
     ))

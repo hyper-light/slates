@@ -265,7 +265,10 @@ impl VolumeBridge<'_> {
       .is_none_or(|mode| mode & PERMISSION_BITS == current.mode);
     let same_owner = changes.uid.is_none_or(|uid| uid == current.uid)
       && changes.gid.is_none_or(|gid| gid == current.gid);
-    let times = changes.atime.is_some() || changes.mtime.is_some() || changes.ctime.is_some();
+    let times = changes.atime.is_some()
+      || changes.mtime.is_some()
+      || changes.ctime.is_some()
+      || changes.btime.is_some();
     if !same_mode || !same_owner || times {
       return Err(VfsError::NotPermitted);
     }
@@ -335,6 +338,7 @@ impl VolumeBridge<'_> {
       atime: mtime,
       mtime,
       ctime,
+      btime: owner_attrs.btime,
       change: self.volume.view_change(self.store, owner)?,
     })
   }

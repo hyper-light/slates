@@ -75,6 +75,10 @@ pub(crate) struct Options {
   keep: bool,
   /// Run each suite over a live-shipped volume on an `f = 1` fleet (A-200; `live_fleet.rs`), not one daemon's.
   live_ship: bool,
+  /// `--read-only`: the suite's mount is a read attachment under a writable kernel mount, so each change reaches
+  /// slates and is answered as a read-only file system is (`EROFS`, slabs' change); its work directories are made through
+  /// a second, writable mount of the same volume. A diagnostic: the reviewed lists judge writable runs.
+  read_only: bool,
   /// `run`: the suite.
   suite: Option<Suite>,
   /// `run`: only this one of the host's transports (every one when absent).
@@ -181,6 +185,7 @@ pub(crate) fn parse(root: &Path, args: &[String]) -> Result<Options, Failure> {
     scratch: value_after(args, "--scratch").map(PathBuf::from),
     keep: args.iter().any(|a| a == "--keep"),
     live_ship: args.iter().any(|a| a == "--live-ship"),
+    read_only: args.iter().any(|a| a == "--read-only"),
     suite,
     write: args.iter().any(|a| a == "--write"),
     outputs: value_after(args, "--outputs").map(PathBuf::from),

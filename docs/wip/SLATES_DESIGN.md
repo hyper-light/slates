@@ -2992,8 +2992,9 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 
 > **Status (2026-11-05, A-209: Windows conformance).** WinFsp's own suites run over the drive in `windows-lint` and
 > `windows-arm64`. winfstest's 628 cases give the same verdicts on x86_64 and arm64; every failure is on the reviewed
-> list with one of five stated differences (attribute bits, security descriptors, a settable creation time, reparse
-> points and symbolic links, named streams). Four Win32 bugs it found are fixed with failing tests first
+> list with one of four stated differences (attribute bits, security descriptors, reparse points and symbolic links,
+> named streams; the fifth, a settable creation time, was built in A-259 and `t/base/06.t` case 5 came off the
+> list). Four Win32 bugs it found are fixed with failing tests first
 > (`crates/cli/tests/winfsp_semantics.rs`): a move not asked to replace, a directory holding a file, `SetFileTime`, and
 > an open with `TRUNCATE_EXISTING` (WinFsp's allocation below a file's size truncates it). Open: the fsx port wedges at an
 > extension after a cached write past a hole and a shrink, inside Windows below the single receiver; it is a listed
@@ -10792,6 +10793,8 @@ vfs, cluster and server crates.
   NFS (red with the attribute restore disabled, green with it).
 - What it does not change: the bridges' own time surfaces (WinFsp's creation time is a reported sibling),
   the merge engine's metadata dimension, R1–R10.
+- **Amended by A-259 (2026-11-08):** the bridges' attributes carry the birth time now, and WinFsp reports it as the
+  creation time and sets it through `SetFileTime`.
 
 ### A-54 — Content transfers resume from verified chunks, and holders progress independently (2026-10-01)
 Applied in the same change to: §4.10 "Content replication", GAPS (AUD-29-55–58), the shard image version (9),
@@ -14287,7 +14290,8 @@ fsx verdict), `xtask/src/conformance` (the WinFsp mount step, the MSVC builds, t
   - **SECURITY**: no per-file security descriptor. Every object reports the volume's one descriptor and access is the
     volume's own rule; a DACL set or asked for at create is not kept.
   - **CREATION-TIME**: no settable birth time. The bridge's attributes carry none (creation time reports the change
-    time), and POSIX has no setter.
+    time), and POSIX has no setter. **Amended by A-259 (2026-11-08):** the bridges' attributes carry the volume's
+    birth time, the drive reports it and keeps the one `SetFileTime` sets, and `t/base/06.t` case 5 is off the list.
   - **REPARSE and SYMLINK**: no reparse points, so no Windows symbolic links through the drive
     (`ERROR_INVALID_FUNCTION`).
   - **STREAMS**: no named streams (`ERROR_INVALID_NAME`; stream enumeration refused).
@@ -16064,6 +16068,31 @@ Applied in the same change to: §4.7 (the rendezvous's status), GAPS, `crates/cl
 - **Proven** on this Mac by two tests that failed on the old order: `a_refused_second_anchor_leaves_the_live_instance_its_segment_and_its_bytes`
   (across processes: a live anchor and its daemon, a second anchor refused, the daemon killed, its successor adopting the
   segment by name and reading the file back) and `a_refused_second_daemon_leaves_the_live_ones_segment_in_place`.
+
+### A-259 — The WinFsp drive reports and keeps the creation time a caller sets (accepted 2026-11-08)
+Applied in the same change to: §4.6 (the Windows conformance status and its stated differences), A-53 (amended),
+GAPS, `docs/wip/conformance.md`, the winfstest list
+(`docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt`, 374 to 373 entries),
+`crates/bridge-core` (`NodeAttr::btime`, `SetAttr::btime`, the access rule, the volume bridge and its read-only view),
+`crates/bridge-winfsp/src/host.rs` (`SetBasicInfo`, `file_info`), the FUSE, NFS and FSKit bridges (each sets none), and
+the record `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`.
+- **What was missing.** The volume keeps a birth time per object (A-53, `Volume::set_times` takes one), but the bridges'
+  attributes carried none. WinFsp reported the change time as every object's creation time and dropped the creation
+  time `SetFileTime` set, so winfstest's `t/base/06.t` case 5 was listed as CREATION-TIME, one of A-209's five stated
+  differences.
+- **The rule.** A bridge's attributes report the volume's birth time, and a `setattr` may set it. Only a host whose API
+  sets a creation time asks for one (WinFsp's `SetBasicInfo`, from `SetFileTime` and `SetFileInformationByHandle`);
+  POSIX has no call that sets a birth time, so the FUSE, NFS and FSKit bridges never set it. Setting it is an explicit
+  time, so it asks for the owner or root, as an explicit access or modification time does (`setattr_denial`); a read-only
+  view refuses it, as it refuses every time.
+- **What it does not change.** The wire and the archive (the birth time was already in both, A-53), FUSE, NFS and FSKit's
+  answers, and the other stated differences (ATTRIBUTES, SECURITY, REPARSE and SYMLINK, STREAMS).
+- **Proven** by `setattr_sets_and_reports_a_birth_time` (`crates/bridge-core/tests/volume_bridge.rs`; with the volume
+  bridge passing no birth time, as before, the reply read back 1794155205189903000 instead of the 333 set),
+  `a_creation_time_asks_for_the_owner` (`crates/bridge-core/src/access.rs`; with the birth time out of the owner check,
+  a writer who is not the owner was allowed), and on CI's Windows runner by
+  `a_files_creation_time_set_through_the_drive_is_kept` (`crates/cli/tests/winfsp_semantics.rs`) and winfstest judged
+  against the shortened list.
 
 ### A-235 — The merge record plane runs when there is merge work, and a version's inputs go only to holders whose next record it is (accepted 2026-11-06)
 
