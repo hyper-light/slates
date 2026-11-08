@@ -289,7 +289,33 @@ fn fleet_view(instance: &str) -> Option<(String, usize, u32)> {
   ))
 }
 
-/// Waits until every node holds all `members` members alive with every peer probed; returns their member ids.
+/// Whether a node's probe mesh is up as its daemon judges it, with `mesh` its `(fleet_peers_in_contact,
+/// fleet_peers_unmeshed)` ([`mesh_of`]): it keeps contact with at least one peer, and every peer in contact is probed.
+/// The peers in contact are counted over the members held alive: every member while the council forms, and after it
+/// only the holders and the voters (§4.8, amended 2026-10-10). So a five-node fleet's two non-voters, which keep no
+/// contact with each other, are not a stall at 3 of 4 peers probed (the flow took them for one, CI diag-live-fixes-30
+/// runs 5 and 6). Counted over the installed configuration's members instead, both counts read 0 on every node before
+/// the council's first commit, and the wait never ended (CI diag-raft-chaos-mesh-42).
+fn meshed(mesh: Option<(u32, u32)>) -> bool {
+  mesh.is_some_and(|(in_contact, unmeshed)| in_contact > 0 && unmeshed == 0)
+}
+
+/// `instance`'s probe mesh from `status`: the peers it keeps direct contact with (`fleet_peers_in_contact`) and how
+/// many of them have no formed probe session (`fleet_peers_unmeshed`); `None` when `status` does not answer.
+fn mesh_of(instance: &str) -> Option<(u32, u32)> {
+  let (code, out, _) = run(instance, &["status"]);
+  if code != 0 {
+    return None;
+  }
+  let count = |key: &str| value_of(&out, key).trim().parse::<u32>().ok();
+  Some((
+    count("fleet_peers_in_contact")?,
+    count("fleet_peers_unmeshed")?,
+  ))
+}
+
+/// Waits until every node holds all `members` members alive with its probe mesh up ([`meshed`]); returns their member
+/// ids.
 fn wait_formed(instances: &[String], members: usize) -> Vec<String> {
   let mut window = FrozenWindow::new();
   loop {
@@ -297,17 +323,21 @@ fn wait_formed(instances: &[String], members: usize) -> Vec<String> {
       .iter()
       .map(|instance| fleet_view(instance))
       .collect();
-    if views.iter().all(|view| {
-      view.as_ref().is_some_and(|(_, held, probed)| {
-        *held == members && usize::try_from(*probed).ok() == members.checked_sub(1)
-      })
+    // Each node's (in contact, unmeshed), as `status` prints them.
+    let meshes: Vec<Option<(u32, u32)>> =
+      instances.iter().map(|instance| mesh_of(instance)).collect();
+    if views.iter().zip(&meshes).all(|(view, mesh)| {
+      view
+        .as_ref()
+        .is_some_and(|(_, held, _)| *held == members && meshed(*mesh))
     }) {
       return views.into_iter().map(|view| view.unwrap().0).collect();
     }
-    if !window.moving(&format!("{views:?}")) {
-      // What the probe and record planes did, for a pair that never probed each other (diag-31 run 7; live-fixes).
+    // Progress counts a node's mesh coming up as well as its members and probes changing.
+    if !window.moving(&format!("{views:?} {meshes:?}")) {
+      // What the probe and record planes did, for a node whose in-contact peers never all probed it.
       panic!(
-        "the fleet formed, or kept changing, within each fleet wait: {views:?}\n{}",
+        "the fleet formed, or kept changing, within each fleet wait: {views:?} (in contact, unmeshed) {meshes:?}\n{}",
         diagnosis(instances, "")
       );
     }
@@ -315,12 +345,15 @@ fn wait_formed(instances: &[String], members: usize) -> Vec<String> {
   }
 }
 
-/// Waits until every node in `instances` has settled at its own neighbourhood generation (the fleet's objects re-placed
-/// onto the neighbourhood after a membership change), judged by progress ([`FrozenWindow`]).
+/// Waits until every node in `instances` holds the fleet's newest configuration and has settled at its own neighbourhood
+/// generation (the fleet's objects re-placed onto the neighbourhood after a membership change), judged by progress
+/// ([`FrozenWindow`]). Settled at its own generation alone certifies a learner left behind: in each of four runs that
+/// lost the takeover after this wait, one learner sat at configuration 7 or 8, settled == neighbourhood at 3 or 4,
+/// while the council was at 19–24 (diag-live-fixes-34 runs 1 and 3, -35 runs 5 and 8; live-fixes, 2026-11-08).
 fn wait_neighbourhood_settled(instances: &[String]) {
   let mut window = FrozenWindow::new();
   loop {
-    let views: Vec<(Option<u64>, Option<u64>)> = instances
+    let views: Vec<(Option<u64>, Option<u64>, Option<u64>)> = instances
       .iter()
       .map(|instance| {
         let (_, out, _) = run(instance, &["status"]);
@@ -333,22 +366,26 @@ fn wait_neighbourhood_settled(instances: &[String]) {
         (
           read("fleet_settled_generation"),
           read("fleet_neighbourhood_generation"),
+          read("fleet_configuration_version"),
         )
       })
       .collect();
+    // The configuration's version is the council's, one count for the whole fleet, so every node must reach the newest
+    // any node holds.
+    let newest = views.iter().filter_map(|(_, _, version)| *version).max();
     // Each node settled at its own neighbourhood generation. The generations are each node's own count and differ
     // between nodes in a settled fleet (3, 8 and 11 side by side in diag-31), so they are not compared across nodes; a
     // node retired while away is kept out by the stale holder's short stop instead.
-    if views
-      .iter()
-      .all(|(settled, neighbourhood)| settled.is_some() && settled == neighbourhood)
-    {
+    if views.iter().all(|(settled, neighbourhood, version)| {
+      settled.is_some() && settled == neighbourhood && version.is_some() && *version == newest
+    }) {
       return;
     }
     if !window.moving(&format!("{views:?}")) {
       // What the stuck node reported and shipped toward its new cohort (live-fixes, 2026-11-07).
       panic!(
-        "every neighbourhood settled, or kept changing, within each fleet wait: {views:?}\n{}",
+        "every node held the newest configuration and its neighbourhood settled, or kept changing, within each fleet \
+         wait (settled, neighbourhood, configuration version): {views:?}\n{}",
         diagnosis(instances, "")
       );
     }
@@ -632,8 +669,8 @@ impl Fleet {
     wait_answers(&self.instances[index]);
   }
 
-  /// Waits until every live node holds exactly the manifest's members, each probed by the others: a succeeded or
-  /// replaced node rejoined under its new identity and the old one retired.
+  /// Waits until every live node holds exactly the manifest's members with its probe mesh up ([`meshed`]): a succeeded
+  /// or replaced node rejoined under its new identity and the old one retired.
   fn wait_rejoined(&self) {
     let live: Vec<String> = (0..self.instances.len())
       .filter(|index| self.processes[*index].is_some())
@@ -1334,6 +1371,7 @@ fn diagnosis(instances: &[String], volume: &str) -> String {
             || line.starts_with("fleet_configuration_version")
             || line.contains("anchor")
             || line.starts_with("fleet_host")
+            || line.starts_with("fleet_peers_")
             || line.contains("lent_to")
         })
         .collect();
