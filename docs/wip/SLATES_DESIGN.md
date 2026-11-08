@@ -14800,6 +14800,38 @@ green's base, the other half of the load test's first finding, is A-202's.
 - **Cost (measured on the branch it comes from):** every edit now appends to the partition log, so the partition's
   snapshots come at the rate edits arrive.
 
+### A-243 — The purge in progress is one slot the receive worker reads, never a channel it drains (accepted and built 2026-11-07, the supervisor's decision: option (a); amends A-190 and A-198)
+
+Applied in the same change to:
+- §4.6 (Windows): this entry is its record; the purge's recognition is unchanged.
+- GAPS: "A private purge's intent can wait up to the 1 s transaction timeout", fixed.
+- `crates/bridge-winfsp`:
+  - `purge_slot.rs` (new, cfg-free): the slot's protocol, `Writer::publish` and `current_for`, over a `Memory` trait.
+  - `purge_intents.rs`: the slot in an unnamed section, each thread through its own `SharedObject` view, and the worker's
+    completion event. The channel, the intent event and its two-event wait are gone.
+  - `dispatcher.rs`: `PrivateOpens::authenticate` reads the slot when a Create arrives; `transaction` waits only on its
+    own completion.
+  - `host.rs`: `WinFspError::Intent`.
+- `docs/bugs/2026-11-07-a-private-purge-intent-waited-out-the-idle-receive.md`.
+- The tests: `purges_the_kernel_refuses_on_an_idle_drive_do_not_wait_out_the_transaction_timeout` (live, first), the
+  slot's plain and loom models in `purge_slot.rs`, and the section's two views in `purge_intents.rs`. CI's loom lane runs
+  `slates-bridge-winfsp` too.
+- **What was there.** A channel of two messages the worker drained after each control call. WinFsp's call never goes
+  pending, so when the kernel refused a purge's open before any request reached slates, the third publish waited for the
+  idle call's 1,000 ms timeout: four such purges took 3.02 s on arm64 and 3.01 s on x86_64 (diag-winfsp-overlap-43).
+  Cancelling the call from the publisher (`CancelIoEx`) left 2.54 s and 2.65 s and was not landed.
+- **The rule.**
+  - The mount thread is the slot's only writer and publishes the purge in progress, or none, without waiting.
+  - The slot's word names the client's process id beside a writing flag and a count. A publication sets the flag,
+    stores the purge's bytes, then stores the word with the client: Release on the publish, Acquire on the read.
+  - A Create reads the word once. Ada authorized that one atomic read on every Create (2026-11-07, asked through the
+    supervisor), replacing the channel's `try_recv` before every callback; the authorization covers that load only.
+    Only the purge's own opens read further, and a read that finds the flag set or the word changed is no purge.
+  - The word sits a cache-line pair (128 bytes) apart from the purge's bytes.
+  - The lint wall keeps no list of allowed atomic sites (`clippy.toml` disallows `Arc`, `Rc`, `Mutex`, `RwLock` and
+    `Condvar`), so the authorization is recorded at the load and here.
+- **Measured.** The red above; the green on both runners is owed to diag-winfsp-overlap-47.
+
 ### A-242 — A green's content history is copy-on-write, and an increment's post-state holds only the runs it adds (accepted and built 2026-11-07, W2 of the load test's walls)
 
 Applied in the same change to:

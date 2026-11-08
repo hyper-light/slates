@@ -93,6 +93,8 @@ pub enum WinFspError {
   Capture(crate::inflight::Refusal),
   /// The loaded DLL is not the version this host's receiver was written from (`crate::dll_version`).
   UnsupportedDll(crate::dll_version::UnsupportedVersion),
+  /// The purge-intent slot refused (`crate::purge_intents`).
+  Intent(crate::purge_slot::Refusal),
   /// A Windows object operation refused, preserving its system error code.
   Os {
     /// The Windows object operation.
@@ -114,6 +116,7 @@ impl std::fmt::Display for WinFspError {
       Self::MountThread => write!(f, "the mount thread could not run"),
       Self::Record(reason) => write!(f, "the held mount record was refused: {reason:?}"),
       Self::Ledger(reason) => write!(f, "{reason}"),
+      Self::Intent(reason) => write!(f, "{reason}"),
       Self::Capture(reason) => write!(f, "{reason}"),
       Self::UnsupportedDll(refusal) => write!(f, "{refusal}"),
       Self::Os { call, code } => write!(f, "{call} refused: {code:?}"),
@@ -2040,7 +2043,7 @@ impl Mounted {
       };
       self
         .purge_intents
-        .publish(Some(crate::purge_intents::Intent {
+        .publish(Some(&crate::purge_intents::Intent {
           purge: purge.clone(),
           client,
         }))?;
@@ -2275,7 +2278,7 @@ fn run_mount(
     wake.wake_by_ref();
   };
   let confirmations = requests.clone();
-  // Shape: the preceding purge's End and the next purge's Begin can be queued before a fresh kernel Create arrives.
+  // The purge-intent slot: the mount thread publishes into it, and the receive worker reads it.
   let (purge_intents, mut private_opens) = match crate::purge_intents::channel() {
     Ok(channel) => channel,
     Err(error) => {

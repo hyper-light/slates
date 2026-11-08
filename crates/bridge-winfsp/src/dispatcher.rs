@@ -58,8 +58,9 @@ pub(crate) fn private_path(path: &str) -> Result<Option<crate::purge::PrivatePat
   })
 }
 
-/// The command thread brackets one purge at a time, each naming the purge client's process. Its bounded channel carries the old End and next Begin; the
-/// receiver drains it before each callback and while control I/O waits: a refused drive open may produce no callback.
+/// The command thread brackets one purge at a time, each naming the purge client's process, and publishes it in one slot
+/// the receiver reads when a Create arrives (`crate::purge_intents`): nothing waits on the receiver, so a drive open the
+/// kernel refuses before any callback holds no publisher.
 pub(crate) struct PrivateOpens {
   marker: crate::purge_token::Marker,
   intents: crate::purge_intents::Intents,
@@ -77,17 +78,15 @@ impl PrivateOpens {
     &mut self,
     request: &Request<'_>,
   ) -> Result<Option<crate::purge::Purge>, WinFspError> {
-    self.intents.progress()?;
     // Only the purge client's process makes a purge's opens (`crate::purge_client`); no daemon thread opens its own
     // volume (§4.6). Without a purge in progress, or from any other process, a Create is a program's.
-    let Some(client) = self.intents.current().map(|intent| intent.client) else {
-      return Ok(None);
-    };
-    if request.kind() != inflight::CREATE_KIND
-      || request.process_id().map_err(WinFspError::Capture)? != client
-    {
+    if request.kind() != inflight::CREATE_KIND {
       return Ok(None);
     }
+    let process = request.process_id().map_err(WinFspError::Capture)?;
+    let Some(intent) = self.intents.current_for(process)? else {
+      return Ok(None);
+    };
     let value = usize::try_from(request.access_token().map_err(WinFspError::Capture)?)
       .map_err(|_| WinFspError::Capture(Refusal::Length))?;
     if value == 0 {
@@ -99,12 +98,7 @@ impl PrivateOpens {
     if !self.marker.matches(token)? {
       return Ok(None);
     }
-    self
-      .intents
-      .current()
-      .map(|intent| intent.purge.clone())
-      .map(Some)
-      .ok_or(WinFspError::Capture(Refusal::State))
+    Ok(Some(intent.purge))
   }
 }
 
@@ -118,7 +112,7 @@ pub(crate) fn record_terminal_refusal(status: i32) {
 
 pub(crate) fn announce_ready(
   control: HANDLE,
-  intents: &mut crate::purge_intents::Intents,
+  intents: &crate::purge_intents::Intents,
 ) -> Result<(), WinFspError> {
   transaction(control, TRANSACT_READY, &[], &mut [], intents).map(|_| ())
 }
@@ -254,7 +248,7 @@ fn transaction(
   code: u32,
   input: &[u8],
   output: &mut [u8],
-  intents: &mut crate::purge_intents::Intents,
+  intents: &crate::purge_intents::Intents,
 ) -> Result<usize, WinFspError> {
   let mut overlapped = OVERLAPPED {
     hEvent: intents.completion_event(),
@@ -294,16 +288,12 @@ fn transaction(
         code: error.raw_os_error(),
       });
     }
-    let progress = intents.wait();
     // SAFETY: this is the same outstanding overlapped I/O, with all its buffers and event still owned. Waiting settles
     // the request before any return can free them; an idle receive has the volume's finite transaction wait.
     if unsafe { GetOverlappedResult(control, &overlapped, &mut done, 1) } == 0 {
       return Err(os_error("complete WinFsp control transaction"));
     }
-    // Even a failed event wait or channel drain cannot return before the control I/O has settled its borrowed pages.
-    progress?;
   }
-  intents.progress()?;
   usize::try_from(done).map_err(|_| WinFspError::Capture(Refusal::Length))
 }
 

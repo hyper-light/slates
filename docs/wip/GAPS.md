@@ -676,18 +676,18 @@
 >   killed (`~/.cache/slates-agents-scratch/loadtest-scale/mem-liveness/live-k32-r3-n1000/anchor.err`). Slicing the
 >   recovery is liveness's next goal.
 
-> **A private purge's intent can wait up to the 1 s transaction timeout (found 2026-11-05, audit step 7; open).**
-> WinFsp's transact never goes pending: the control dispatch calls `FspVolumeTransact` inline (v2.1 `src/sys/fsctl.c:95-99`),
-> which waits for a request inside the call (`src/sys/volume.c:1171`). So `purge_intents::Intents::wait`, which drains
-> intents while a call is pending, never runs; 0 of 161,073 receives went pending on arm64 (BENCHMARKS, run 41977769822).
-> Intents are drained only after a call returns. `Sender::publish` blocks when its two-message channel is full: a previous
-> End and the next Begin are queued, and that Begin's drive open was refused before any request reached slates. It then
-> waits for the receiver's next return, which on an idle drive is the 1,000 ms transaction timeout. **Planned fix, after
-> audit step 7 lands, as its own change with a failing test first** (a purge whose Begin's open is refused while the
-> drive is idle must not wait out the transaction timeout): a publisher that would block cancels the receive thread's
-> call (`CancelSynchronousIo`), retrying while the cancel finds no call in progress. WinFsp ends a cancelled wait with
-> nothing delivered (`src/sys/driver.h:954-955`, `src/sys/ioq.c:617`, `volume.c:1181-1185`), provided the receiver reads
-> the cancellation as "nothing delivered".
+> **A private purge's intent can wait up to the 1 s transaction timeout (found 2026-11-05, audit step 7; fixed
+> 2026-11-07, `agents/winfsp-overlap-21`; Windows CI owed).** WinFsp's transact never goes pending: the control dispatch
+> calls `FspVolumeTransact` inline (v2.1 `src/sys/fsctl.c:95-99`), which waits for a request inside the call
+> (`src/sys/volume.c:1171`). The intents' two-message channel was drained only after a call returned, so when the
+> kernel refused a purge's open before any request reached slates, the third publish waited for the idle call's 1,000 ms
+> timeout: four such purges took 3.02 s on arm64 and 3.01 s on x86_64 (diag-winfsp-overlap-43). Cancelling the call
+> from the publisher (`CancelIoEx`, `agents/winfsp-overlap-17`) left 2.54 s and 2.65 s and was not landed. The fix
+> replaces the channel with one slot (A-243): a seqlock whose word names the client (`purge_slot.rs`), in a section both
+> threads map (`purge_intents.rs`). Publishing never waits for the reader, and the worker reads the word once when a
+> Create arrives
+> (`docs/bugs/2026-11-07-a-private-purge-intent-waited-out-the-idle-receive.md`). Test:
+> `purges_the_kernel_refuses_on_an_idle_drive_do_not_wait_out_the_transaction_timeout`.
 
 > **WinFsp: a second receive thread would win arm64's remaining ~9 us an IRP and cost x86_64 ~7, and needs a crash
 > proof first (2026-11-05, audit step 7; lever, not planned).** Measured with the open-cost harness (run 42123092900,

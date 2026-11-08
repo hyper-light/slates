@@ -1,126 +1,126 @@
-//! Progress for private coherence opens (A-198, §4.6 Windows). A drive open may be refused before WinFsp calls
-//! the host. Such an open cannot be relied upon to drain its Begin/End messages. The bounded channel therefore
-//! signals an owned Windows event: the receiver drains messages while its overlapped control I/O is pending, as
-//! well as before a callback. A full publisher wakes the reader before waiting for room and again after publishing.
-//! Every wait still owns its kernel buffers until completion; a wake never cancels the held volume's receive.
+//! Where the purge in progress lives on Windows (A-243, A-190, A-198; §4.6): the slot of `crate::purge_slot` in an
+//! unnamed section both threads map, each through its own view (`slates_mem::SharedObject`, the slot's word declared
+//! and its purge bytes a racy span). The mount thread holds the writer's view and the receive worker the reader's, so
+//! neither borrows the other's memory and the section lives while either view does. The worker also keeps here the one
+//! completion event of its control calls. The protocol and its reasons are in `crate::purge_slot`.
 
 use crate::host::WinFspError;
-use crate::purge::Purge;
-use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
-use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
-use windows_sys::Win32::System::Threading::{
-  CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects,
-};
+use crate::purge_slot::{self, Memory, PURGE_AT, Refusal, SLOT_BYTES, WORD_AT, Writer};
+use slates_mem::{SharedObject, WordRun, Words, words::Width};
+use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
+use std::sync::atomic::Ordering;
+use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::System::Threading::CreateEventW;
 
-/// Shape: the previous purge's End and the next Begin can precede that Begin's synchronous drive open.
-const BOUND: usize = 2;
-/// Format: the intent event follows the control completion event in WaitForMultipleObjects' array.
-const INTENT_READY: u32 = WAIT_OBJECT_0 + 1;
+pub(crate) use crate::purge_slot::Intent;
 
-/// One purge in progress: the purge, and the process id of the client making its opens (`crate::purge_client`).
-#[derive(Clone, Debug)]
-pub(crate) struct Intent {
-  pub(crate) purge: Purge,
-  pub(crate) client: u32,
-}
-
+/// The mount thread's side: the only writer.
 pub(crate) struct Sender {
-  messages: SyncSender<Option<Intent>>,
-  event: OwnedHandle,
+  slot: SharedObject,
+  writer: Writer,
 }
 
+/// The receive worker's side: the only reader, and the completion event of its control calls.
 pub(crate) struct Intents {
-  messages: Receiver<Option<Intent>>,
-  event: OwnedHandle,
+  slot: SharedObject,
   /// The one completion event of this receiver's control transactions, which run one at a time. Every transaction
   /// names it in its OVERLAPPED, and the system clears it as each begins, so none makes its own (A-212).
   completed: OwnedHandle,
-  current: Option<Intent>,
 }
 
-/// A new unnamed event, initially unsignalled, its reset automatic or by hand as `manual_reset` says.
-fn new_event(manual_reset: i32, call: &'static str) -> Result<OwnedHandle, WinFspError> {
+/// The slot's declared words: its word, and the purge's bytes as one racy span.
+fn words() -> Words {
+  Words::new()
+    .with(WordRun::one(WORD_AT, Width::U64))
+    .with(WordRun::racy(PURGE_AT, SLOT_BYTES - PURGE_AT))
+}
+
+impl Memory for SharedObject {
+  fn load(&self, order: Ordering) -> Result<u64, Refusal> {
+    Ok(
+      self
+        .atomic_u64(WORD_AT)
+        .map_err(Refusal::Memory)?
+        .load(order),
+    )
+  }
+  fn store(&self, value: u64, order: Ordering) -> Result<(), Refusal> {
+    self
+      .atomic_u64(WORD_AT)
+      .map_err(Refusal::Memory)?
+      .store(value, order);
+    Ok(())
+  }
+  fn copy_out(&self, at: usize, into: &mut [u8]) -> Result<(), Refusal> {
+    self
+      .read_racy(PURGE_AT.saturating_add(at), into)
+      .map_err(Refusal::Memory)
+  }
+  fn copy_in(&mut self, at: usize, from: &[u8]) -> Result<(), Refusal> {
+    self
+      .write_racy(PURGE_AT.saturating_add(at), from)
+      .map_err(Refusal::Memory)
+  }
+}
+
+/// A new unnamed event, initially unsignalled, reset by hand.
+fn new_event(call: &'static str) -> Result<OwnedHandle, WinFspError> {
   // SAFETY: no borrowed descriptor or name; the flags are plain values.
-  let raw = unsafe { CreateEventW(std::ptr::null(), manual_reset, 0, std::ptr::null()) };
+  let raw = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
   if raw.is_null() {
-    return Err(os_error(call));
+    return Err(WinFspError::Os {
+      call,
+      code: std::io::Error::last_os_error().raw_os_error(),
+    });
   }
   // SAFETY: the successful call returned this one newly owned handle.
   Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
 }
 
+/// The slot, holding no purge, and its reader.
 pub(crate) fn channel() -> Result<(Sender, Intents), WinFspError> {
-  let event = new_event(0, "create private-intent event")?;
-  let completed = new_event(1, "create transaction completion event")?;
-  let producer = event
+  let slot = SharedObject::unnamed(SLOT_BYTES, words())
+    .map_err(|error| WinFspError::Intent(Refusal::Memory(error)))?;
+  let value = slot
+    .handle_value()
+    .map_err(|error| WinFspError::Intent(Refusal::Memory(error)))?;
+  let raw = usize::try_from(value).map_err(|_| WinFspError::MountThread)? as *mut core::ffi::c_void;
+  // SAFETY: the writer's object owns this live section, and the borrowed handle lasts only until duplication returns.
+  let duplicate = unsafe { BorrowedHandle::borrow_raw(raw) }
     .as_handle()
     .try_clone_to_owned()
     .map_err(|error| WinFspError::Os {
-      call: "duplicate private-intent event",
+      call: "duplicate the purge slot's section",
       code: error.raw_os_error(),
     })?;
-  let (sender, messages) = sync_channel(BOUND);
+  let view = SharedObject::from_held_handle(duplicate, SLOT_BYTES, words())
+    .map_err(|error| WinFspError::Intent(Refusal::Memory(error)))?;
   Ok((
     Sender {
-      messages: sender,
-      event: producer,
+      slot,
+      writer: Writer::new(),
     },
     Intents {
-      messages,
-      event,
-      completed,
-      current: None,
+      slot: view,
+      completed: new_event("create transaction completion event")?,
     },
   ))
 }
 
 impl Sender {
-  pub(crate) fn publish(&self, intent: Option<Intent>) -> Result<(), WinFspError> {
-    match self.messages.try_send(intent) {
-      Ok(()) => {}
-      Err(TrySendError::Full(intent)) => {
-        // Wake before a blocking send: a rejected drive open may have produced no callback at all.
-        self.signal()?;
-        self
-          .messages
-          .send(intent)
-          .map_err(|_| WinFspError::MountThread)?;
-      }
-      Err(TrySendError::Disconnected(_)) => return Err(WinFspError::MountThread),
-    }
-    // Signal after publication as well: the reader may have drained the prior full queue before this send finished.
-    self.signal()
-  }
-
-  fn signal(&self) -> Result<(), WinFspError> {
-    // SAFETY: this producer owns the event with modification rights for the whole synchronous call.
-    if unsafe { SetEvent(self.event.as_raw_handle()) } == 0 {
-      return Err(os_error("signal private intents"));
-    }
-    Ok(())
+  /// Publishes `intent` as the purge in progress, or no purge: never waits for the reader.
+  pub(crate) fn publish(&mut self, intent: Option<&Intent>) -> Result<(), WinFspError> {
+    self
+      .writer
+      .publish(&mut self.slot, intent)
+      .map_err(WinFspError::Intent)
   }
 }
 
 impl Intents {
-  pub(crate) fn current(&self) -> Option<&Intent> {
-    self.current.as_ref()
-  }
-
-  /// One bounded drain. Further messages keep the event signalled and are drained at the next wait or callback.
-  pub(crate) fn progress(&mut self) -> Result<usize, WinFspError> {
-    let mut received = 0usize;
-    for _ in 0..BOUND {
-      match self.messages.try_recv() {
-        Ok(intent) => {
-          self.current = intent;
-          received = received.saturating_add(1);
-        }
-        Err(TryRecvError::Empty) => break,
-        Err(TryRecvError::Disconnected) => return Err(WinFspError::MountThread),
-      }
-    }
-    Ok(received)
+  /// The purge in progress whose opens `process` makes, or `None` (`crate::purge_slot::current_for`).
+  pub(crate) fn current_for(&self, process: u32) -> Result<Option<Intent>, WinFspError> {
+    purge_slot::current_for(&self.slot, process).map_err(WinFspError::Intent)
   }
 
   /// The event a control transaction names in its OVERLAPPED. It stays valid as long as this value, which outlives
@@ -128,83 +128,80 @@ impl Intents {
   pub(crate) fn completion_event(&self) -> HANDLE {
     self.completed.as_raw_handle()
   }
-
-  /// Waits for the control transaction's completion event while servicing private intents. The caller must still settle
-  /// its I/O before returning on an error here: this method owns neither its OVERLAPPED nor its borrowed kernel buffers.
-  pub(crate) fn wait(&mut self) -> Result<(), WinFspError> {
-    let events = [self.completed.as_raw_handle(), self.event.as_raw_handle()];
-    let count = u32::try_from(events.len()).map_err(|_| WinFspError::MountThread)?;
-    loop {
-      // SAFETY: both handles remain owned throughout this wait; these are events, not abandoned mutex objects.
-      match unsafe { WaitForMultipleObjects(count, events.as_ptr(), 0, INFINITE) } {
-        WAIT_OBJECT_0 => return Ok(()),
-        INTENT_READY => {
-          self.progress()?;
-        }
-        _ => return Err(os_error("wait for control or private intents")),
-      }
-    }
-  }
-}
-
-fn os_error(call: &'static str) -> WinFspError {
-  WinFspError::Os {
-    call,
-    code: std::io::Error::last_os_error().raw_os_error(),
-  }
 }
 
 #[cfg(test)]
 mod tests {
-  #![allow(clippy::unwrap_used, clippy::expect_used)]
+  #![allow(clippy::unwrap_used)]
   use super::*;
-  use windows_sys::Win32::System::Threading::WaitForSingleObject;
-  /// Shape: the existing Windows process fixture's ten-second wait; a missed wake fails within it.
-  const WAIT_MS: u32 = 10_000;
-  /// Shape: two complete purges, exceeding the channel's two-message capacity without any kernel callback.
-  const PURGES: usize = 2;
+  use crate::purge::Purge;
 
-  /// A-198. Do: publish two Begin/End pairs with no kernel request or callback. Expect: event wakes let the reader
-  /// consume all four messages and let the owned publisher finish; a full channel cannot depend on a refused open.
+  /// Shape: enough publications that a writer that waited for its reader would be caught many times over.
+  const PUBLICATIONS: u32 = 10_000;
+  /// Shape: the client the racing test's purges name, and a process that is not it.
+  const CLIENT: u32 = 7;
+  /// Shape: see [`CLIENT`].
+  const PROGRAM: u32 = 8;
+
+  fn intent(seed: u32) -> Intent {
+    Intent {
+      purge: Purge {
+        object: slates_bridge_core::ObjectId::new(u64::from(seed), u64::from(seed) + 1),
+        path: format!("\\{seed}"),
+        offset: u64::from(seed) * 4096,
+        len: 4096,
+      },
+      client: CLIENT,
+    }
+  }
+
+  /// GAPS, "A private purge's intent can wait up to the 1 s transaction timeout". Do: through the section's two views,
+  /// publish 10,000 purges and their ends with nothing reading. Expect: every publication returns, and the reader's view
+  /// then sees no purge, then the next purge whole for its client only. The channel this replaced blocked on the third.
   #[test]
-  fn private_purges_make_progress_without_a_kernel_callback() {
+  fn a_publisher_never_waits_for_its_reader_across_the_sections_views() {
+    let (mut sender, intents) = channel().unwrap();
+    for seed in 1..=PUBLICATIONS {
+      sender.publish(Some(&intent(seed))).unwrap();
+      sender.publish(None).unwrap();
+    }
+    assert_eq!(intents.current_for(CLIENT).unwrap(), None);
+    sender.publish(Some(&intent(PUBLICATIONS + 1))).unwrap();
+    assert_eq!(
+      intents.current_for(CLIENT).unwrap(),
+      Some(intent(PUBLICATIONS + 1))
+    );
+    assert_eq!(intents.current_for(PROGRAM).unwrap(), None);
+  }
+
+  /// A-243. Do: the mount thread's view publishes 10,000 distinct purges while the worker's view reads as the client's
+  /// Creates and a program's would, until the writer is done. Expect: the client's reads are no purge or one publication
+  /// whole; a program's none; and once the writer is done, the last purge reads whole.
+  #[test]
+  fn a_publish_racing_a_create_reads_no_purge_or_a_whole_one_across_the_sections_views() {
+    let (mut sender, intents) = channel().unwrap();
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let mut racing = 0u32;
     std::thread::scope(|scope| {
-      let (sender, mut intents) = channel().unwrap();
-      let publisher = scope.spawn(move || {
-        for _ in 0..PURGES {
-          sender.publish(Some(Intent {
-            purge: Purge {
-              object: slates_bridge_core::ObjectId::new(1, 0),
-              path: "\\file".to_owned(),
-              offset: 0,
-              len: 4096,
-            },
-            client: std::process::id(),
-          }))?;
-          sender.publish(None)?;
+      scope.spawn(|| {
+        for seed in 1..=PUBLICATIONS {
+          sender.publish(Some(&intent(seed))).unwrap();
         }
-        Ok::<_, WinFspError>(sender)
+        done.store(true, Ordering::Release);
       });
-      let mut received = 0usize;
-      let mut missed = None;
-      while received < PURGES * BOUND {
-        // SAFETY: this reader owns the event until the wait returns; it has no outstanding kernel I/O.
-        let ready = unsafe { WaitForSingleObject(intents.event.as_raw_handle(), WAIT_MS) };
-        if ready != WAIT_OBJECT_0 {
-          missed = Some(ready);
-          break;
+      while !done.load(Ordering::Acquire) {
+        assert_eq!(intents.current_for(PROGRAM).unwrap(), None);
+        if let Some(read) = intents.current_for(CLIENT).unwrap() {
+          let seed = u32::try_from(read.purge.object.inode).unwrap();
+          assert_eq!(read, intent(seed), "a torn read of purge {seed}");
         }
-        received += intents.progress().unwrap();
+        racing += 1;
       }
-      // Dropping the receiver also unblocks a broken publisher before the test joins it and reports the failure.
-      drop(intents);
-      let published = publisher.join().unwrap();
-      assert_eq!(
-        missed, None,
-        "the private publisher must wake an idle receiver"
-      );
-      assert!(published.is_ok(), "all private messages must be published");
-      assert_eq!(received, PURGES * BOUND);
     });
+    assert!(racing > 0, "no read raced the writer");
+    assert_eq!(
+      intents.current_for(CLIENT).unwrap(),
+      Some(intent(PUBLICATIONS))
+    );
   }
 }
