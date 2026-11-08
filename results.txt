@@ -1,0 +1,11 @@
+tested b81e6fc81c5ba432cad6bfaf45becb55595d606b variant after on x86_64, 4 cpus
+restart exit 101 68s
+still-waits exit 101 1s
+takeover exit 101 2s
+wire exit 0 8s
+db exit 0 44s
+held exit 101 1s
+fleet-merge exit 101 2s
+server-lib exit 0 19s
+server exit 0 49s
+clippy exit 101 59s
