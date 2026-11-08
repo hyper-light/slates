@@ -5584,8 +5584,12 @@ round asked no one and it waited out a whole election timeout. No late grant was
 **Open (A-251, raft-chaos): a holder's page can leave out a copy it holds and still count as its promise.** A successor counts a
 complete answer as a promise for every object not listed, so an omitted copy reads as a copy not held, and an older record can
 be adopted. **Fixed so far, step (c):** a copy the holder cannot promise (`HostPromise::unpromised`, record
-`docs/bugs/2026-11-08-a-holder-that-could-not-promise-a-copy-read-as-holding-nothing.md`). Still owed: the counting rule as a pure
-`crates/db` function with a paged model and an omission nemesis, then a per-object question by name, then the process test.
+`docs/bugs/2026-11-08-a-holder-that-could-not-promise-a-copy-read-as-holding-nothing.md`). **Step (a), built:** the counting rule is
+`slates_db::takeover::readiness`, and `crates/db/tests/takeover_model.rs` models a paged, multi-object takeover with an omission
+nemesis. Over 2,000 histories today's rule lost 166 committed records with the nemesis on and none with it off; A-251's
+by-name rule lost none. Still owed: (b) the per-object question by name and the switch to `CountingRule::NamedAnswer`,
+then (d) the process test. **Not covered by (b):** an object that every holder of it leaves out of its pages, and the
+successor does not hold, is never learned, so a round can confirm without it under either rule (A-251).
 
 **Open — one session per peer is lent exclusively.** A discovery page, a coordinator dispatch, a forward and
 a campaign each take the whole session out of its link, though the transport runs several exchanges on one

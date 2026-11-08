@@ -37,6 +37,7 @@ use slates_db::register::{
   Accepted, Acceptor, Authority, HostEpoch, HostId, HostPrepare, HostPromise, Lineage, ObjectId,
   Placement, Prepare, Record, RegionalConfiguration, RegisterError, encode_refusal,
 };
+use slates_db::takeover::{CountingRule, Heard, Readiness, readiness};
 use slates_transport::connection::Priority;
 use slates_transport::endpoint::Endpoint;
 
@@ -776,7 +777,9 @@ fn fold_answers(state: &mut ShardState, departed: HostId, answers: Vec<(HostId, 
 /// one of its recovery cohorts has its recovery quorum of members that promised it — `cohort − f`, `f + 1` at
 /// the floor, at least one ([`slates_db::register::Quorum::recovery`]) — this node, a member whose answer is
 /// complete, or one that listed it. An object with a cohort left with fewer members than that quorum is lost,
-/// counted and never adopted: more of that cohort failed than the region tolerates.
+/// counted and never adopted: more of that cohort failed than the region tolerates. The rule is
+/// [`slates_db::takeover::readiness`], under [`CountingRule::CompleteAnswer`] until A-251 (b) asks by name; the model in
+/// `crates/db/tests/takeover_model.rs` finds where that rule adopts an older record than a committed one.
 pub(crate) fn ready_objects(
   state: &mut ShardState,
   departed: HostId,
@@ -790,34 +793,35 @@ pub(crate) fn ready_objects(
   let mut ready = Vec::new();
   let mut lost = Vec::new();
   let mut unpromised: u64 = 0;
+  let complete: BTreeSet<HostId> = take
+    .pages
+    .iter()
+    .filter(|(_, page)| page.complete)
+    .map(|(host, _)| *host)
+    .collect();
+  let named_nothing = BTreeSet::new();
   for (object, reports) in &take.learned {
-    let mut promised_everywhere = true;
-    for cohort in regional.recovery_cohorts(departed, *object) {
-      let needed = regional.quorum.recovery(cohort.len());
-      let members: Vec<HostId> = cohort
-        .into_iter()
-        .filter(|host| regional.members.contains(host))
-        .collect();
-      if members.len() < needed {
-        lost.push(*object);
-        promised_everywhere = false;
-        break;
+    let heard = Heard {
+      reports,
+      complete: &complete,
+      named_nothing: &named_nothing,
+      local: local_promises.then_some(local),
+    };
+    let cohorts = regional.recovery_cohorts(departed, *object);
+    match readiness(
+      &cohorts,
+      |host| regional.members.contains(&host),
+      regional.quorum,
+      &heard,
+      CountingRule::CompleteAnswer,
+    ) {
+      Readiness::Ready => {
+        if let Some(newest) = reports.values().cloned().reduce(newest_of) {
+          ready.push((*object, newest));
+        }
       }
-      let promised = members
-        .iter()
-        .filter(|host| {
-          if **host == local {
-            return local_promises;
-          }
-          reports.contains_key(host) || take.pages.get(host).is_some_and(|page| page.complete)
-        })
-        .count();
-      promised_everywhere &= promised >= needed;
-    }
-    if promised_everywhere && let Some(newest) = reports.values().cloned().reduce(newest_of) {
-      ready.push((*object, newest));
-    } else if !lost.contains(object) {
-      unpromised = unpromised.saturating_add(1);
+      Readiness::Lost => lost.push(*object),
+      Readiness::Waiting => unpromised = unpromised.saturating_add(1),
     }
   }
   if unpromised > 0 {

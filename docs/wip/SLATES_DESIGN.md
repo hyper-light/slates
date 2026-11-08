@@ -19499,3 +19499,53 @@ Applied in the same change to: §4.6 (macOS fallback options, failure matrix), T
 - **What it does not change:** Linux's mounts (FUSE; conformance's own NFS options), Windows, or the daemon's answers:
   a stable reply still waits for durability up to the liveness budget and is then answered "try again", which the hard
   mount retries.
+
+### A-251 — A host takeover counts a holder's promise of an object only when the holder spoke for that object (accepted 2026-11-08; step (a) built)
+
+A host takeover's phase one (§4.8 "Promotion and takeover") counted a holder's complete paged answer as a promise of
+every object of the retired host the holder did not list: listing nothing meant holding nothing. A holder whose page
+leaves out a copy it holds therefore reads as holding nothing. Two things left copies out:
+- its routing disagreed with the successor's (`takeover::list_page` lists only objects whose owner, by the holder's
+  routing, is the asker);
+- it could not promise the copy (closed by step (c), `docs/bugs/2026-11-08-a-holder-that-could-not-promise-a-copy-read-as-holding-nothing.md`).
+
+The successor can then reach an object's recovery quorum with such an empty promise and adopt an older record over a
+committed newer one. That breaks NoLoss.
+
+The change, in four steps:
+- **(c), landed:** a copy a holder cannot promise is a typed refusal that keeps its answer incomplete
+  (`HostPromise::unpromised`).
+- **(a), built:** the counting rule is a pure function, `slates_db::takeover::readiness`, under a `CountingRule`.
+  `takeover::ready_objects` calls it with today's rule (`CompleteAnswer`), so this step changes no behaviour.
+  `crates/db/tests/takeover_model.rs` models a paged, multi-object takeover:
+  - one or two cohorts per object;
+  - writes to one cohort (a later owner in the recovery chain) or to all of them (a joint write), each committed by
+    `Quorum::committed_within` in every cohort it targets;
+  - the successor's own copies behind its lease gate;
+  - pages answered in a generated order;
+  - a nemesis that leaves objects out of holders' pages while the pages still end complete.
+
+  Its oracle is NoLoss: an adopted record is at least as new as every committed one. Over 2,000 generated histories,
+  today's rule lost 0 records with the nemesis off and 166 with it on. A-251's rule (below) lost none, and 280 of its
+  adoptions came only from a holder's answer by name. Each of three mutants of the rule turns the model red:
+  - the named rule also counting a complete page;
+  - only an object's first cohort judged;
+  - the recovery quorum one short. The minimal history is
+  `today_s_rule_adopts_an_older_record_when_a_holder_leaves_a_copy_out`.
+- **(b), owed:** after a holder's pages are complete, the successor asks it by name for each learned object it did not
+  list. The holder answers from a direct `holder_records` look-up, with no routing filter: its highest record, or
+  "nothing held" for that object alone. The rule becomes `CountingRule::NamedAnswer`: a member promised an object when
+  it listed it or answered for it by name, and a whole answer's silence counts for nothing. The 2026-09-29 empty-promise
+  case (a survivor that never received an object) still completes: that survivor answers "nothing held" by name. The
+  wire change appends a question and an answer on the takeover stream, with hostile-input tests on both sides.
+- **(d), owed:** the process test.
+
+What (b) does not cover: an object that every holder of it leaves out of its pages, and the successor does not hold
+itself, is never learned. The round can then confirm without it under either rule. The model holds its nemesis to (b)'s
+scope (some survivor lists every object a survivor holds), and GAPS records the case.
+
+Applied in the same change to:
+- `crates/db/src/takeover.rs` (new): `CountingRule`, `Heard`, `Readiness`, `readiness`, with unit tests.
+- `crates/db/tests/takeover_model.rs` (new).
+- `crates/server/src/takeover.rs`: `ready_objects`.
+- GAPS's A-251 entry.
