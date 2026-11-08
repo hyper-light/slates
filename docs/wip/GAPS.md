@@ -81,12 +81,21 @@
 > acting owner's entries though its configuration lags (`live_ship::live_admission`, red with the exception removed).
 > The A/B, rolling partition x10 per leg per arch (diag-live-durability-39): without, `not_a_candidate` in 4 of 20 runs,
 > a write over 1 s in 4, Convergence failed in 1; with, none of the three in 20.
-> **Open (live-durability, 2026-11-07; shape unknown): a write held about 2.3 s when the second candidate stops within a
-> quarter second of the first's resume.** With the fix above, 1 of 40 rolling partition runs (diag-live-durability-40
-> and -41: x86, sent at 2.48 s as c stopped, b resumed at 2.23 s, answered 0.31 s after c resumed, no refusal anywhere).
-> The resumed holder was not yet counting: its catch-up (an install, after 2 s away) or the owner's redial of its
-> session. A passing run prints no counters, so which is not known (the diag runs' stuck-write watcher,
-> diag-live-durability-38, dumps only from 3 s). Before the merge 1 of 6 runs had one too (2.6 s, no refusal).
+> **Open (live-durability, 2026-11-07, diagnosed in part 2026-11-08): a write held about 2.3 s when the second candidate
+> stops within a quarter second of the first's resume, and the same catch-up once failed Convergence.** About 1 rolling
+> partition run in 100 on main (5 of some 660, diag-live-durability-41 to -48). It is not a lost wakeup: in a captured
+> stall (-44, arm) the waiter's every gate of `answerable` was open, its position one past `durable`, and the owner's
+> period ran every 100 ms. It waited for a holder, and the resumed one was still catching up, by installs. In -44: 7.1
+> MB answered in 324 ms, then 10.8 MB whose budget (`exchange_budget`, 1.50 s, from srtt and cwnd at its start) ran out
+> and dropped the link, then 10.9 MB re-installs of about 3.2 s each. In -45: the first install about 1 s after the
+> resume, a second 1.35 s later, the write answered within about 10 ms of it. The holder's work is not the cost (a 7.9
+> MB install served in 6.3 ms). Over 118 resumes (-50) the first install came 229 to 246 ms after the resume at the
+> median and 574 to 702 ms at worst, and no handshake waited on its retry cap. Why a second full install follows a
+> successful one, rather than the entries after it, is not known. Convergence failed once in 120 runs (-43, x86): a 21.9
+> MB install and then about 246 ms an entry exchange on a session whose srtt sat near 123 ms on loopback, cause unknown,
+> left a candidate 43 entries behind when the 40 s fleet wait ended; NoLoss and Agreement held. A-253 and the redial's
+> wasted link period are fixed or in hand and the install budget is owed; the rate after them is not measured. The diag
+> runs' watcher lines stay on.
 > **Open (live-durability, 2026-11-07; cause unknown, a lost wakeup until shown otherwise): a write answered 16 s after
 > both candidates were back.** One rolling partition run at d26f35d1 (diag-live-durability-37, tip-x86 run 1): a
 > partitioned 0.15–2.15 s, c 2.34–4.34 s; a write sent at 2.34 s as c stopped took 20.07 s, answered near 22.4 s; no

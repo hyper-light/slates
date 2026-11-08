@@ -8547,6 +8547,29 @@ and on a large volume would copy all of it each time. Round 3's slow tail on the
 slowed as well (p999 465.7 µs).
 
 
+### Measured and rejected: a batch of entries an exchange on a holder's lane (A-200; 2026-11-08)
+
+The lane ships one entry an exchange, so a holder on a slow session catches up at one entry a round trip. The batch
+variant sent up to 64 entries in one exchange, applied in order by the holder, on the same binary and toggled by the
+environment (diag only, never landed). The fault was one candidate's live replies delayed 250 ms, the exchange time
+diag-live-durability-43 measured on the session whose candidate never caught up. Rolling partition, 20 runs a leg on 4
+CPUs (diag-live-durability-52); the table counts only runs where the delayed node was a holder.
+
+| | Stop-and-wait, x86 | Batch, x86 | Stop-and-wait, arm | Batch, arm |
+|---|---|---|---|---|
+| Runs counted | 12 | 11 | 13 | 14 |
+| Convergence passed | 12 | 11 | 13 | 14 |
+| Runs with a write over 1 s | 4 | 1 | 0 | 0 |
+| Longest write in a run, median | 905 ms | 869 ms | 810 ms | 790 ms |
+| Worst write | 2,595 ms | 1,056 ms | 918 ms | 901 ms |
+| Writes in a run, median | 6,450 | 6,218 | 3,758 | 3,568 |
+
+Dead even, so it does not land. Stop-and-wait never failed Convergence, so batching had nothing to fix; 4 of 12 against
+1 of 11 writes over 1 s is within chance on one arch and absent on the other. An earlier pass at 120 ms
+(diag-live-durability-47) was the same: 20 of 20 Convergence on every leg. **What this does not show:** the fault did not
+reproduce diag-43's failure, which followed a 21.9 MB install and left a backlog at 246 ms an exchange, so batching is
+untested on that condition. It is a measurement of this fault only.
+
 ### Measured and rejected: queueing the deltas the credit turns away (A-200; 2026-11-06)
 
 **Hardware:** this Mac (Apple arm64, 128 GiB), other agents' work running, load 40–63. **Command (the contract):**
