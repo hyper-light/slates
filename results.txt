@@ -1,0 +1,25 @@
+green on ubuntu-latest, 4 CPUs, Sun Nov  8 08:19:43 UTC 2026, head c4e96835e8070732afab9e312430e344d18e2823
+== run 1 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 99 filtered out; finished in 2.71s
+
+== run 2 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 99 filtered out; finished in 5.11s
+
+== run 3 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 99 filtered out; finished in 3.26s
+
+== run 4 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 99 filtered out; finished in 4.55s
+
+== run 5 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 99 filtered out; finished in 5.19s
+
+== run 6 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 99 filtered out; finished in 4.90s
+
+== run 7 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 99 filtered out; finished in 3.57s
+
+== run 8 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 99 filtered out; finished in 5.13s
+
