@@ -539,6 +539,15 @@ pub fn record_cpu_clock(shard: u16) {
   }
 }
 
+/// The calling thread's CPU clock now, or `None` where the platform reads none (Miri): for a caller that judges its own
+/// work by the CPU it spent rather than the wall time it took, which a loaded machine stretches (§4.14's rule for an
+/// observation's budget, applied by `crates/db/tests/snapshot_cadence.rs` to a recovery's cost). Windows charges the
+/// time a scheduler tick at a time (15.6 ms by default; see `thread_clock`), so a span shorter than a few ticks reads
+/// coarsely there.
+pub fn calling_thread_cpu() -> Option<crate::thread_clock::CpuReading> {
+  crate::thread_clock::current().and_then(crate::thread_clock::read)
+}
+
 /// The CPU clock of the shard `holder` names: `None` when that registration no longer holds its slot, its thread
 /// recorded no clock, or the platform has none. An observer reads it to tell a starved shard, still consuming CPU, from
 /// a wedged one (§4.14).

@@ -102,6 +102,12 @@ impl Future for Join {
   }
 }
 
+/// The task polls this shard has made; `None` off a shard thread. Read across a [`yield_now`], more than the yielding
+/// task's own return is another task having run meanwhile.
+pub fn polls_so_far() -> Option<u64> {
+  registry::with_current(|ctx| ctx.counters().polls)
+}
+
 /// Yields once: the task is re-queued and resumes after the rest of the batch.
 pub fn yield_now() -> YieldNow {
   YieldNow { yielded: false }
