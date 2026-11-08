@@ -5083,6 +5083,11 @@ const REPORT_REFUSED: &str = "fleet.report.refused";
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 const REPORT_SENT: &str = "fleet.report.sent";
 
+/// The status count under which a member records a period whose report found no session to send it on: a report that
+/// was not sent, which [`REPORT_SENT`] does not count.
+/// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
+const REPORT_NO_SESSION: &str = "fleet.report.no_session";
+
 /// This node's neighbourhood change the council has not settled yet (§4.8 "Neighbourhood changes"): the
 /// council's configuration version and the version its current neighbourhood was fixed at, when it differs from
 /// its settled one and this node has installed that configuration; `None` when settled, or while this node's
@@ -5163,9 +5168,13 @@ async fn report_settlement(
   .await;
 }
 
-/// Sends a report this node makes about itself to the council (§4.8): proposed at once when this node leads
-/// the council, else sent to every voter it holds a session to over [`REPORT_STREAM`], where the leader
-/// proposes it. Counted [`REPORT_SENT`]. The sessions return with the replies; a late reply is dropped (the
+/// Sends a report this node makes about itself to the council (§4.8): proposed at once when this node leads the
+/// council, else sent to every member of its region it holds a session to over [`REPORT_STREAM`], where the leader
+/// proposes it and any other member answers `NotLeader`. Counted [`REPORT_SENT`], or [`REPORT_NO_SESSION`] with no one
+/// to send it to. Not to the voters alone: on a learner they are its join state's, which nothing updates, so a learner
+/// that joined from the bootstrapper reported to nobody once that voter left, and its settlements and takeover
+/// confirmations never reached the council (CI diag-raft-chaos-learner-56 run 1: `fleet.report.sent` 662 with the node's
+/// neighbourhood unsettled for a whole fleet wait). The sessions return with the replies; a late reply is dropped (the
 /// caller reports again next period if the configuration does not show it).
 pub(crate) async fn send_council_report(
   command: slates_cluster::config_group::ConfigCommand,
@@ -5174,17 +5183,35 @@ pub(crate) async fn send_council_report(
   in_flight: &mut Vec<Dispatch>,
 ) {
   let request = command.encode();
-  let voters = state::with_state(|s| {
-    s.count(REPORT_SENT, 1);
+  let Some(targets) = state::with_state(|s| {
     if s.council.is_leader() {
+      s.count(REPORT_SENT, 1);
       let _ = s.council.report(local, command);
-      return Vec::new();
+      return None;
     }
-    s.council.voters()
+    Some(
+      s.record_sessions
+        .keys()
+        .copied()
+        .filter(|host| *host != local && same_region(s, *host))
+        .collect::<Vec<HostId>>(),
+    )
   })
-  .unwrap_or_default();
+  .flatten() else {
+    return;
+  };
   let sessions = take_sessions("fleet.lent_to.send_council_report", |host| {
-    host != local && voters.contains(&host)
+    targets.contains(&host)
+  });
+  let _ = state::with_state_counted(|s| {
+    s.count(
+      if sessions.is_empty() {
+        REPORT_NO_SESSION
+      } else {
+        REPORT_SENT
+      },
+      1,
+    );
   });
   if sessions.is_empty() {
     return;
