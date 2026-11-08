@@ -1,0 +1,17 @@
+mutants, commit 3a00e005, 4 CPUs
+== session_out_gives_up a_forward_waits_for_the_owners_session_while_it_is_out exit 101
+thread 'a_forward_waits_for_the_owners_session_while_it_is_out' (5782) panicked at crates/server/tests/fleet.rs:6391:5:
+b's write not served: Refused { refusal: OwnerUnreachable { region: 0 } }; 
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+a_forward_waits_for_the_owners_session_while_it_is_out --- FAILED
+== location_tried_once a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget exit 101
+thread 'a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget' (5877) panicked at crates/server/tests/fleet.rs:14851:5:
+assertion `left == right` failed: no call was refused while the false death lasted: [(true, true, 50.745908ms, 4), (true, true, 220.929611ms, 5), (true, true, 259.385489ms, 11), (true, true, 350.834259ms, 13), (true, true, 257.45464ms, 8)]; B's counters Ok({"content.purged_bytes": 12570247168, "content.ticks.idle": 7, "fleet.discovery.pages": 45, "fleet.forward.batch_done": 6, "fleet.forward.begun": 6, "fleet.forward.client.control_started": 47, "fleet.forward.client.delivered_home": 47, "fleet.forward.client.resolved": 47, "fleet.forward.client.to_control": 47, "fleet.forward.no_session": 4, 
+  left: 4
+ right: 0
+== free_read_on_the_held_shard forwards_to_one_owner_never_wait_behind_each_other exit 101
+thread 'forwards_to_one_owner_never_wait_behind_each_other' (5941) panicked at crates/server/tests/fleet.rs:5880:3:
+the read on the free shard was never answered while the hold stood, waiting behind another forward to the same owner: [ForwardRound { served: true, during_hold: false, fast_took: 4.988768193s }, ForwardRound { served: true, during_hold: false, fast_took: 5.002461156s }, ForwardRound { served: true, during_hold: false, fast_took: 5.002135649s }]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+forwards_to_one_owner_never_wait_behind_each_other --- FAILED
+== hedge_after_the_hold a_slow_first_round_candidate_is_hedged_after_the_measured_p95 exit 0
