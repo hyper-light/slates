@@ -1,5 +1,11 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A green's and a work's listings left out their hard links: fixed (found and fixed 2026-11-08, §4.12, §4.16).** A
+> hard-linked path was in no directory listing of a green (at its head or any version) or of a work. Now listed as a
+> file of its target's size (`docs/bugs/2026-11-08-a-greens-listing-left-out-its-hard-links.md`). Open beside it:
+> `changed_since` reports file content only, so it leaves out a hard link and every other non-content change, which
+> `changed_between` (what `advance` invalidates by) does report; its intended contract is to be decided.
+
 > **A version appended before its owner restarted never committed: fixed (2026-11-07, §4.16 Commit, AUD-11;
 > A-246).** A restarted owner rebuilt its greens from their chains, but not the merge records
 > it still owed its holders (they lived in memory), so a version appended before the crash and not yet placed was never

@@ -1439,6 +1439,25 @@ impl Green {
     }
   }
 
+  /// The hard links at `version`, `(path, target)` in path order: what [`Green::base_at`] gives as `hardlinks`, read from
+  /// the hard-link history alone, so a work's listing does not rebuild the whole base to name them.
+  pub fn hardlinks_at(&self, version: u64) -> Vec<(String, String)> {
+    if version >= self.head() {
+      return self
+        .hardlinks
+        .iter()
+        .map(|(path, target)| (path.clone(), target.clone()))
+        .collect();
+    }
+    self
+      .hardlink_history
+      .iter()
+      .filter_map(|(path, history)| {
+        history_at(history, version).map(|target| (path.clone(), target))
+      })
+      .collect()
+  }
+
   /// The base of `version` that composing `journal` reads (§4.16 "Composition at seal"): every
   /// dimension's entry at each path the journal names
   /// ([`VolumeOp::names`](crate::increment::VolumeOp::names)), and the hard links aimed at those

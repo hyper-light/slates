@@ -151,11 +151,19 @@ fn listed(paths: Vec<(String, EntryKind, u64)>, dir: &str) -> Option<Vec<DirEntr
   exists.then(|| entries.into_values().collect())
 }
 
-/// Every path a work holds: its files, and the directories and symlinks its journal declared and did not later
-/// remove.
+/// Every path a work holds: its files, the directories and symlinks its journal declared and did not later remove, and
+/// its hard links (those of its green's version that it kept, and those its journal declared), each a file of the
+/// linked file's size.
 fn work_paths(state: &ShardState, work: &crate::state::WorkState) -> Vec<(String, EntryKind, u64)> {
   let mut dirs: BTreeSet<String> = BTreeSet::new();
   let mut symlinks: BTreeSet<String> = BTreeSet::new();
+  let mut links: BTreeMap<String, String> = state
+    .greens
+    .get(&work.green)
+    .map(|green| green.hardlinks_at(work.base_version))
+    .unwrap_or_default()
+    .into_iter()
+    .collect();
   for op in &work.journal {
     match op {
       VolumeOp::Mkdir { path } => {
@@ -167,8 +175,12 @@ fn work_paths(state: &ShardState, work: &crate::state::WorkState) -> Vec<(String
       VolumeOp::Symlink { path, .. } => {
         symlinks.insert(path.clone());
       }
+      VolumeOp::Link { path, target } => {
+        links.insert(path.clone(), target.clone());
+      }
       VolumeOp::Unlink { path } => {
         symlinks.remove(path);
+        links.remove(path);
       }
       VolumeOp::Rename { from, to } => {
         if dirs.remove(from) {
@@ -177,17 +189,31 @@ fn work_paths(state: &ShardState, work: &crate::state::WorkState) -> Vec<(String
         if symlinks.remove(from) {
           symlinks.insert(to.clone());
         }
+        if let Some(target) = links.remove(from) {
+          links.insert(to.clone(), target);
+        }
       }
       _ => {}
     }
   }
   // Its files: the base's it did not change and its own (`crate::work_files`).
-  let files = work
+  let sizes: BTreeMap<String, u64> = work
     .files
     .sizes(crate::merge_service::work_base(state, work))
     .into_iter()
-    .map(|(path, len)| (path.to_owned(), EntryKind::File, len));
-  files
+    .map(|(path, len)| (path.to_owned(), len))
+    .collect();
+  let linked: Vec<(String, EntryKind, u64)> = links
+    .into_iter()
+    .map(|(path, target)| {
+      let len = sizes.get(&target).copied().unwrap_or(0);
+      (path, EntryKind::File, len)
+    })
+    .collect();
+  sizes
+    .into_iter()
+    .map(|(path, len)| (path, EntryKind::File, len))
+    .chain(linked)
     .chain(dirs.into_iter().map(|path| (path, EntryKind::Dir, 0)))
     .chain(
       symlinks
@@ -207,6 +233,20 @@ fn green_entries(
   let engine = state.greens.get(&green).ok_or(Refusal::NotFound)?;
   let version = crate::merge_service::green_version(state, engine, green, at)?;
   let base = engine.base_at(version);
+  // A hard link is an entry of its directory, a file of the linked file's size (2026-11-08: never listed before).
+  let sizes: BTreeMap<&str, u64> = base
+    .files
+    .iter()
+    .map(|(path, size)| (path.as_str(), *size))
+    .collect();
+  let linked: Vec<(String, EntryKind, u64)> = base
+    .hardlinks
+    .iter()
+    .map(|(path, target)| {
+      let len = sizes.get(target.as_str()).copied().unwrap_or(0);
+      (path.clone(), EntryKind::File, len)
+    })
+    .collect();
   let paths = base
     .files
     .into_iter()
@@ -224,6 +264,7 @@ fn green_entries(
         .into_iter()
         .map(|(path, _)| (path, EntryKind::Other, 0)),
     )
+    .chain(linked)
     .collect();
   listed(paths, dir).ok_or(Refusal::NotFound)
 }
