@@ -279,7 +279,7 @@ fn transaction_untimed(
   code: u32,
   input: &[u8],
   output: &mut [u8],
-  intents: &mut crate::purge_intents::Intents,
+  intents: &crate::purge_intents::Intents,
 ) -> Result<usize, WinFspError> {
   let mut overlapped = OVERLAPPED {
     hEvent: intents.completion_event(),

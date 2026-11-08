@@ -86,6 +86,19 @@ pub(crate) fn await_reply<T>(answer: &Receiver<T>) -> Result<T, RecvError> {
   wait_within(answer, WINDOW.get()).0
 }
 
+/// [`await_reply`], answering too whether the thread parked and how long it spun first, in nanoseconds (diag only).
+pub(crate) fn await_reply_timed<T>(answer: &Receiver<T>) -> (Result<T, RecvError>, bool, u64) {
+  let started = Instant::now();
+  let (answered, waited) = wait_within(answer, WINDOW.get());
+  let parked = waited == Waited::Parked;
+  let spun = if parked {
+    u64::try_from(WINDOW.get().as_nanos()).unwrap_or(u64::MAX)
+  } else {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+  };
+  (answered, parked, spun)
+}
+
 fn wait_within<T>(answer: &Receiver<T>, window: Duration) -> (Result<T, RecvError>, Waited) {
   let started = Instant::now();
   while started.elapsed() < window {
