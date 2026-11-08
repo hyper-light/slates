@@ -1,0 +1,9 @@
+tested 2e1220459e62388886f516558d8531691ed7d697 on windows-latest
+clippy exit 101
+error[E0433]: cannot find module or crate `slates_bridge_nfs` in this scope
+error[E0433]: cannot find module or crate `slates_bridge_nfs` in this scope
+error[E0433]: cannot find module or crate `slates_bridge_nfs` in this scope
+error[E0433]: cannot find module or crate `slates_bridge_nfs` in this scope
+error[E0433]: cannot find `time` in `rustix`
+error[E0433]: cannot find `time` in `rustix`
+error: could not compile `slates-cli` (example "nfs_large_write") due to 6 previous errors
