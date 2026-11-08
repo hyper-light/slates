@@ -1,0 +1,205 @@
+== 02:03:03 load 1.81 1.38 0.67
+    PID %CPU     TIME STAT COMMAND
+  10546 84.6 00:00:12 SLl  slates
+  10604 30.4 00:00:04 SLl  slates
+  10575 29.7 00:00:04 SLl  slates
+  10868  4.3 00:00:00 S    fsx
+   1906  3.4 00:00:14 Sl   provjobd2566113
+   1067  3.0 00:00:13 Ssl  dockerd
+  10589  1.1 00:00:00 SL   slates
+  10560  1.0 00:00:00 SL   slates
+   2001  1.0 00:00:03 Sl   Runner.Worker
+  10530  1.0 00:00:00 SL   slates
+      1  0.6 00:00:02 Ss   systemd
+-- conf-oci-fsx-a-9988 pid 10546 cpu 84.6 00:00:12
+slates-cluster: fleet: HostId(5036097391841795275) holds HostId(3268587474951596629) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+slates-cluster: fleet: HostId(5036097391841795275) holds HostId(1502349573710205377) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(5036097391841795275) holds HostId(1502349573710205377) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+anchor_log_lines_refused: 0
+log_lines_refused: 0
+clients_refused: 0
+fleet_host: 5036097391841795275
+fleet_f: 1
+fleet_host_epoch: 1
+fleet_members: 1502349573710205377 3268587474951596629 5036097391841795275
+fleet_peers_probed: 2
+fleet_unknown_id: 0
+fleet_inbox_full: 0
+fleet_sessions_refused: 0
+fleet_replaced: 0
+fleet_held_records: 0
+fleet_takeovers_pending: 0
+fleet_configuration_version: 4
+fleet_configuration_members: 3
+fleet_settled_generation: 2
+fleet_neighbourhood_generation: 2
+fleet_council_leads: false
+fleet_council_base_periods: 10
+fleet_council_span_periods: 10
+fleet_council_rtt_tail_ns: 2608664
+fleet_council_rtt_spread_ns: 1737420
+fleet_council_samples: 366
+fleet_council_term: 1
+fleet_council_priority_ns: 756438
+fleet_council_priority_spread_ns: 1484964
+fleet_council_rank: 0
+fleet_council_leader_lease: true
+fleet_council_pre_elections: 0
+fleet_council_elections: 0
+fleet_council_pre_votes_granted: 0
+fleet_council_pre_votes_refused: 0
+fleet_council_refused_role: 0
+fleet_council_refused_leased: 0
+fleet_council_refused_term: 0
+fleet_council_refused_log: 0
+fleet_council_voters: 3
+fleet_council_joint: false
+fleet_council_voter_ids: 1502349573710205377 3268587474951596629 5036097391841795275
+fleet_root_leads: false
+fleet_root_base_periods: 10
+fleet_root_span_periods: 10
+fleet_root_rtt_tail_ns: 2241402
+fleet_root_rtt_spread_ns: 1484964
+fleet_root_samples: 147
+fleet_root_term: 1
+fleet_root_priority_ns: 0
+fleet_root_priority_spread_ns: 0
+fleet_root_rank: 0
+fleet_root_leader_lease: false
+fleet_root_pre_elections: 0
+fleet_root_elections: 0
+fleet_root_pre_votes_granted: 0
+fleet_root_pre_votes_refused: 0
+fleet_root_refused_role: 0
+fleet_root_refused_leased: 0
+fleet_root_refused_term: 0
+fleet_root_refused_log: 0
+fleet_root_voters: 1
+-- conf-oci-fsx-c-9988 pid 10604 cpu 30.4 00:00:04
+slates-server: fleet: a dialer's record-plane handshake ended: Closed
+slates-cluster: fleet: HostId(1502349573710205377) holds HostId(3268587474951596629) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+slates-cluster: fleet: HostId(1502349573710205377) holds HostId(5036097391841795275) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+anchor_log_lines_refused: 0
+log_lines_refused: 0
+clients_refused: 0
+fleet_host: 1502349573710205377
+fleet_f: 1
+fleet_host_epoch: 1
+fleet_members: 1502349573710205377 3268587474951596629 5036097391841795275
+fleet_peers_probed: 2
+fleet_unknown_id: 0
+fleet_inbox_full: 0
+fleet_sessions_refused: 0
+fleet_replaced: 0
+fleet_held_records: 2
+fleet_takeovers_pending: 0
+fleet_configuration_version: 4
+fleet_configuration_members: 3
+fleet_settled_generation: 2
+fleet_neighbourhood_generation: 2
+fleet_council_leads: true
+fleet_council_base_periods: 10
+fleet_council_span_periods: 10
+fleet_council_rtt_tail_ns: 1751799
+fleet_council_rtt_spread_ns: 1195888
+fleet_council_samples: 704
+fleet_council_term: 1
+fleet_council_priority_ns: 465509
+fleet_council_priority_spread_ns: 1195888
+fleet_council_rank: 0
+fleet_council_leader_lease: false
+fleet_council_pre_elections: 0
+fleet_council_elections: 1
+fleet_council_pre_votes_granted: 0
+fleet_council_pre_votes_refused: 0
+fleet_council_refused_role: 0
+fleet_council_refused_leased: 0
+fleet_council_refused_term: 0
+fleet_council_refused_log: 0
+fleet_council_voters: 3
+fleet_council_joint: false
+fleet_council_voter_ids: 1502349573710205377 3268587474951596629 5036097391841795275
+fleet_root_leads: true
+fleet_root_base_periods: 10
+fleet_root_span_periods: 10
+fleet_root_rtt_tail_ns: 0
+fleet_root_rtt_spread_ns: 0
+fleet_root_samples: 0
+fleet_root_term: 1
+fleet_root_priority_ns: 0
+fleet_root_priority_spread_ns: 0
+fleet_root_rank: 0
+fleet_root_leader_lease: false
+fleet_root_pre_elections: 0
+fleet_root_elections: 1
+fleet_root_pre_votes_granted: 0
+fleet_root_pre_votes_refused: 0
+fleet_root_refused_role: 0
+fleet_root_refused_leased: 0
+fleet_root_refused_term: 0
+fleet_root_refused_log: 0
+fleet_root_voters: 1
+-- conf-oci-fsx-b-9988 pid 10575 cpu 29.7 00:00:04
+slates-server: fleet: a dialer's record-plane handshake ended: Closed
+slates-cluster: fleet: HostId(3268587474951596629) holds HostId(1502349573710205377) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(3268587474951596629) holds HostId(1502349573710205377) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/member_task.rs:718:9
+anchor_log_lines_refused: 0
+log_lines_refused: 0
+clients_refused: 0
+fleet_host: 3268587474951596629
+fleet_f: 1
+fleet_host_epoch: 1
+fleet_members: 1502349573710205377 3268587474951596629 5036097391841795275
+fleet_peers_probed: 2
+fleet_unknown_id: 0
+fleet_inbox_full: 0
+fleet_sessions_refused: 0
+fleet_replaced: 2
+fleet_held_records: 2
+fleet_takeovers_pending: 0
+fleet_configuration_version: 4
+fleet_configuration_members: 3
+fleet_settled_generation: 2
+fleet_neighbourhood_generation: 2
+fleet_council_leads: false
+fleet_council_base_periods: 10
+fleet_council_span_periods: 10
+fleet_council_rtt_tail_ns: 1845018
+fleet_council_rtt_spread_ns: 1217508
+fleet_council_samples: 364
+fleet_council_term: 1
+fleet_council_priority_ns: 352047
+fleet_council_priority_spread_ns: 1000000
+fleet_council_rank: 0
+fleet_council_leader_lease: true
+fleet_council_pre_elections: 0
+fleet_council_elections: 0
+fleet_council_pre_votes_granted: 0
+fleet_council_pre_votes_refused: 0
+fleet_council_refused_role: 0
+fleet_council_refused_leased: 0
+fleet_council_refused_term: 0
+fleet_council_refused_log: 0
+fleet_council_voters: 3
+fleet_council_joint: false
+fleet_council_voter_ids: 1502349573710205377 3268587474951596629 5036097391841795275
+fleet_root_leads: false
+fleet_root_base_periods: 10
+fleet_root_span_periods: 10
+fleet_root_rtt_tail_ns: 1352047
+fleet_root_rtt_spread_ns: 1000000
+fleet_root_samples: 146
+fleet_root_term: 1
+fleet_root_priority_ns: 0
+fleet_root_priority_spread_ns: 0
+fleet_root_rank: 0
+fleet_root_leader_lease: false
+fleet_root_pre_elections: 0
+fleet_root_elections: 0
+fleet_root_pre_votes_granted: 0
+fleet_root_pre_votes_refused: 0
+fleet_root_refused_role: 0
+fleet_root_refused_leased: 0
+fleet_root_refused_term: 0
+fleet_root_refused_log: 0
+fleet_root_voters: 1

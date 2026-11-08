@@ -28,3 +28,13 @@ conformance: scratch kept at /home/runner/work/slates/slates/target/pair/plain/s
 conformance: wrote target/pair/plain/records/oci-linux.fsx.json
 conformance: oci-linux × fsx: RAN(10000 operations, seed 1, file length 262144: passed; 2026-11-08; Ubuntu 24.04.5 LTS)
 conformance: scratch kept at /home/runner/work/slates/slates/target/pair/plain/scratch/oci-linux
+fsx live exit=0 seconds=63 load=1.83 1.39 0.68
+conformance: wrote target/pair/live/records/native-linux-fuse.fsx.json
+conformance: native-linux-fuse × fsx: LIMITED(adapter: a root `mount -t nfs` by the Linux NFS client of the unprivileged daemon's NFSv3 loopback export (the same serving code as macOS); not covered: the daemon's own FUSE mount (`slates mount` on Linux, crates/server/src/fuse.rs): this lane mounts through the NFS adapter; the suites over the FUSE mount run in the Linux container lane (`oci-linux`, `slates mount --shared` with `user_allow_other`); 10000 operations, seed 1, file length 262144: passed; 2026-11-08; Ubuntu 24.04.5 LTS)
+conformance: scratch kept at /home/runner/work/slates/slates/target/pair/live/scratch/native-linux-fuse
+conformance: wrote target/pair/live/records/native-linux-nfs4.fsx.json
+conformance: native-linux-nfs4 × fsx: RAN(10000 operations, seed 1, file length 262144: passed; 2026-11-08; Ubuntu 24.04.5 LTS)
+conformance: scratch kept at /home/runner/work/slates/slates/target/pair/live/scratch/native-linux-nfs4
+conformance: wrote target/pair/live/records/oci-linux.fsx.json
+conformance: oci-linux × fsx: RAN(10000 operations, seed 1, file length 262144: passed; 2026-11-08; Ubuntu 24.04.5 LTS)
+conformance: scratch kept at /home/runner/work/slates/slates/target/pair/live/scratch/oci-linux
