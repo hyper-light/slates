@@ -1,0 +1,197 @@
+green on ubuntu-latest, 4 CPUs, Sun Nov  8 14:31:39 UTC 2026, head a3ee709f61ba009f408b061ff38c3c526d3a2277
+== run 1 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 5.21s
+
+== run 2 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.62s
+
+== run 3 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 5.45s
+
+== run 4 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 6.06s
+
+== run 5 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.09s
+
+== run 6 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 4.02s
+
+== run 7 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.90s
+
+== run 8 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 2.81s
+
+== run 9 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 5.99s
+
+== run 10 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.68s
+
+== run 11 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.23s
+
+== run 12 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.32s
+
+== run 13 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.39s
+
+== run 14 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.72s
+
+== run 15 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.57s
+
+== run 16 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.50s
+
+== run 17 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.30s
+
+== run 18 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.60s
+
+== run 19 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.36s
+
+== run 20 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 2.95s
+
+== run 21 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.28s
+
+== run 22 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.42s
+
+== run 23 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 5.22s
+
+== run 24 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.47s
+
+== run 25 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.17s
+
+== run 26 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.77s
+
+== run 27 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.57s
+
+== run 28 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 5.53s
+
+== run 29 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.04s
+
+== run 30 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 5.32s
+
+== run 31 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 5.11s
+
+== run 32 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.61s
+
+== run 33 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.50s
+
+== run 34 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.17s
+
+== run 35 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.26s
+
+== run 36 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 7.81s
+
+== run 37 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.78s
+
+== run 38 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.93s
+
+== run 39 exit 101
+DIAG contacts: [(Ok(HostId(6145326888668619083)), Ok(false), Ok(Some([HostId(1282237835416395321), HostId(6145326888668619083), HostId(7748293564494308774)])), Ok([HostId(1282237835416395321), HostId(7748293564494308774), HostId(14602400730465569666)]), Ok([(HostId(1282237835416395321), "Neighbour keyed=Some(true) canonical=Some(false)"), (HostId(7748293564494308774), "Neighbour keyed=Some(true) canonical=Some(false)"), (HostId(14602400730465569666), "Holder keyed=Some(true) canonical=Some(false)")])), (Ok(HostId(1282237835416395321)), Ok(true), Ok(Some([HostId(1282237835416395321), HostId(6145326888668619083), HostId(7748293564494308774)])), Ok([HostId(6145326888668619083), HostId(7748293564494308774), HostId(14602400730465569666)]), Ok([(HostId(6145326888668619083), "Neighbour keyed=Some(true) canonical=Some(true)"), (HostId(7748293564494308774), "Neighbour keyed=Some(true) canonical=Some(true)"), (HostId(14602400730465569666), "AsVoter keyed=Some(true) canonical=Some(true)")])), (Ok(HostId(14602400730465569666)), Ok(false), Ok(Some([HostId(14078556552806318873)])), Ok([HostId(1282237835416395321), HostId(6145326888668619083), HostId(7748293564494308774)]), Ok([(HostId(1282237835416395321), "OutsideNeighbourhood keyed=Some(true) canonical=Some(false)"), (HostId(6145326888668619083), "Neighbour keyed=Some(true) canonical=Some(true)"), (HostId(7748293564494308774), "Neighbour keyed=Some(true) canonical=Some(false)")])), (Ok(HostId(7748293564494308774)), Ok(false), Ok(Some([HostId(1282237835416395321), HostId(6145326888668619083), HostId(7748293564494308774)])), Ok([HostId(1282237835416395321), HostId(6145326888668619083), HostId(14602400730465569666)]), Ok([(HostId(1282237835416395321), "Neighbour keyed=Some(true) canonical=Some(false)"), (HostId(6145326888668619083), "Neighbour keyed=Some(true) canonical=Some(true)"), (HostId(14602400730465569666), "Holder keyed=Some(true) canonical=Some(true)")]))]
+
+thread 'a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone' (6614) panicked at crates/server/tests/fleet.rs:6336:3:
+every survivor's neighbourhood settled at the newest configuration past version 7, (settled, current) and (installed, council) per survivor: [(Ok(Some((3, 3))), Ok((9, 9))), (Ok(Some((3, 3))), Ok((9, 9))), (Ok(Some((4, 8))), Ok((9, 9))), (Ok(Some((3, 3))), Ok((9, 9)))]; the learners' views at the stop [(HostId(14602400730465569666), [HostId(14078556552806318873)]), (HostId(7748293564494308774), [HostId(14078556552806318873)])]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone ... FAILED
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 100 filtered out; finished in 408.81s
+
+error: test failed, to rerun pass `-p slates-server --test fleet`
+== run 40 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.17s
+
+== run 41 exit 101
+DIAG contacts: [(Ok(HostId(509888922518196256)), Ok(true), Ok(Some([HostId(509888922518196256), HostId(1562890315301584248), HostId(1574961319392340936)])), Ok([HostId(1562890315301584248), HostId(1574961319392340936), HostId(16447359131327765636)]), Ok([(HostId(1562890315301584248), "Neighbour keyed=Some(true) canonical=Some(false)"), (HostId(1574961319392340936), "Neighbour keyed=Some(true) canonical=Some(false)"), (HostId(16447359131327765636), "AsVoter keyed=Some(true) canonical=Some(false)")])), (Ok(HostId(16447359131327765636)), Ok(false), Ok(Some([HostId(13695605152992647005)])), Ok([HostId(509888922518196256), HostId(1562890315301584248), HostId(1574961319392340936)]), Ok([(HostId(509888922518196256), "OutsideNeighbourhood keyed=Some(true) canonical=Some(true)"), (HostId(1562890315301584248), "Neighbour keyed=Some(true) canonical=Some(true)"), (HostId(1574961319392340936), "Neighbour keyed=Some(true) canonical=Some(true)")])), (Ok(HostId(1562890315301584248)), Ok(false), Ok(Some([HostId(509888922518196256), HostId(1562890315301584248), HostId(1574961319392340936)])), Ok([HostId(509888922518196256), HostId(1574961319392340936), HostId(16447359131327765636)]), Ok([(HostId(509888922518196256), "Holder keyed=Some(true) canonical=Some(true)"), (HostId(1574961319392340936), "Neighbour keyed=Some(true) canonical=Some(false)"), (HostId(16447359131327765636), "Neighbour keyed=Some(true) canonical=Some(false)")])), (Ok(HostId(1574961319392340936)), Ok(false), Ok(Some([HostId(509888922518196256), HostId(1562890315301584248), HostId(1574961319392340936)])), Ok([HostId(509888922518196256), HostId(1562890315301584248), HostId(16447359131327765636)]), Ok([(HostId(509888922518196256), "Neighbour keyed=Some(true) canonical=Some(true)"), (HostId(1562890315301584248), "Neighbour keyed=Some(true) canonical=Some(true)"), (HostId(16447359131327765636), "Holder keyed=Some(true) canonical=Some(false)")]))]
+
+thread 'a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone' (6787) panicked at crates/server/tests/fleet.rs:6336:3:
+every survivor's neighbourhood settled at the newest configuration past version 7, (settled, current) and (installed, council) per survivor: [(Ok(Some((3, 3))), Ok((10, 10))), (Ok(Some((4, 8))), Ok((10, 10))), (Ok(Some((4, 4))), Ok((10, 10))), (Ok(Some((8, 8))), Ok((10, 10)))]; the learners' views at the stop [(HostId(16447359131327765636), [HostId(13695605152992647005)]), (HostId(1574961319392340936), [HostId(13695605152992647005)])]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone ... FAILED
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 100 filtered out; finished in 406.60s
+
+error: test failed, to rerun pass `-p slates-server --test fleet`
+== run 42 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 4.37s
+
+== run 43 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 4.33s
+
+== run 44 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 5.07s
+
+== run 45 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.05s
+
+== run 46 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 2.93s
+
+== run 47 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.84s
+
+== run 48 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.28s
+
+== run 49 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 4.16s
+
+== run 50 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.52s
+
+== run 51 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.40s
+
+== run 52 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.56s
+
+== run 53 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 6.18s
+
+== run 54 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.68s
+
+== run 55 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 5.44s
+
+== run 56 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.34s
+
+== run 57 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.54s
+
+== run 58 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.39s
+
+== run 59 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.62s
+
+== run 60 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.70s
+
