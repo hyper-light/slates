@@ -1,0 +1,76 @@
+name: diag-live-durability
+
+# Diagnostics only, never on main (A-200): the whole validation of agents/live-durability-lane-c @ 53dfa6cc (the redial,
+# the stopped holder's install and the fresh image, stacked on main 9a996608, unmodified). The rolling partition x10, then
+# server lib and live_ship, cluster live, db live and the whole live_fleet, both Linux arches. Results to
+# diag-results/live-durability-60-<os>.
+on:
+  push:
+    branches: ["diag-live-durability-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  SLATES_TEST_CLI: "1"
+
+jobs:
+  check:
+    name: stack (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: The runs
+        shell: bash {0}
+        run: |
+          R=../results.txt
+          echo "runner ${{ matrix.os }}, $(nproc) CPUs, $(date -u), tree $(git rev-parse HEAD)" > $R
+          timeout 1800 cargo build --release --locked -p slates-cli --bin slates --test live_fleet --test live_chaos > ../build.log 2>&1; status=$?
+          echo "== release build exit $status" >> $R
+          [ $status -ne 0 ] && grep -E '^error' -A8 ../build.log | head -40 >> $R
+          for run in $(seq 1 10); do
+            timeout 900 cargo test --release --locked -p slates-cli --test live_chaos -- --nocapture --test-threads=1 --exact candidates_partitioned_in_turn_mid_stream_lose_nothing > ../run.log 2>&1; status=$?
+            grep -E '^  [0-9]+ writes|violations|refused the owner|converged: false|panicked|^  chaos-rolling.*partitioned' ../run.log | grep -v '^chaos' | sort -u | cut -c1-1200 >> $R || true
+            [ $status -ne 0 ] && { echo "-- tail"; tail -40 ../run.log | cut -c1-600; } >> $R
+            echo "== partition $run exit $status" >> $R
+          done
+          timeout 1800 cargo test --locked -p slates-server --lib > ../run.log 2>&1; status=$?
+          grep -E '^test .* FAILED|test result|panicked at' ../run.log >> $R || true
+          echo "== server lib exit $status" >> $R
+          timeout 1800 cargo test --locked -p slates-server --test live_ship > ../run.log 2>&1; status=$?
+          grep -E '^test .* FAILED|test result' ../run.log >> $R || true
+          echo "== server live_ship exit $status" >> $R
+          timeout 900 cargo test --locked -p slates-cluster --test live > ../run.log 2>&1; status=$?
+          grep -E '^test .* FAILED|test result' ../run.log >> $R || true
+          echo "== cluster live exit $status" >> $R
+          timeout 1800 cargo test --locked -p slates-db --test live > ../run.log 2>&1; status=$?
+          grep -E '^test .* FAILED|test result' ../run.log >> $R || true
+          echo "== db live exit $status" >> $R
+          timeout 2400 cargo test --release --locked -p slates-cli --test live_fleet -- --test-threads=2 > ../run.log 2>&1; status=$?
+          grep -E '^test .* FAILED|test result|panicked at' ../run.log >> $R || true
+          [ $status -ne 0 ] && tail -60 ../run.log | cut -c1-300 >> $R
+          echo "== live_fleet exit $status" >> $R
+          exit 0
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/live-durability-60-${{ matrix.os }}"
+          git config user.name "diag-live-durability"
+          git config user.email "diag-live-durability@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-live-durability-60 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
