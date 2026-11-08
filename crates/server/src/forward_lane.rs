@@ -13,8 +13,9 @@
 //! exchanges open, the replies taken. Whichever waiting forwarder finds the lane undriven drives it, one turn at a
 //! time. A turn borrows the session, abandons what forwarders gave up, begins every queued forward and takes every
 //! reply that has arrived, waking its forwarder. It then drives the session until a packet or a timer, or until a
-//! forward is queued (a queued forward wakes the driver, so it never waits for the open ones' silence), and returns
-//! the session. Between turns the session is back in its slot, so record commits and discovery pages borrow it as
+//! forward is newly queued (a new forward wakes the driver, so it never waits for the open ones' silence; one still
+//! queued behind the session's stream credit does not end the turn), returns the session, and yields to the shard
+//! before its next turn. Between turns the session is back in its slot, so record commits and discovery pages borrow it as
 //! before. A forwarder whose replies have all come stops driving and wakes the next waiter. An exchange left open
 //! is taken by whichever forwarder drives next.
 //!
@@ -98,6 +99,14 @@ struct Lane {
   open: BTreeMap<u64, u64>,
   /// The session the open forwards were begun on.
   open_on: Option<ConnectionId>,
+  /// Whether a forward was queued since the driver's last settle: what ends a driving turn early so the forward is
+  /// begun at once. Forwards still queued from before, waiting for the session's stream credit, do not: a turn that
+  /// returned while any forward was queued returned at once whenever the credit was full, and its forwarder turned
+  /// again in the same poll without end. With about 20,000 forwards waiting on a restarted owner, that held the client
+  /// node's control shard 1.08 s in one poll (`forward_to_owner` → `forward_batch_over_leader_session` →
+  /// `drive_or_queued`, sampled with frame pointers in the f = 1 primary-kill rung, 2026-11-08), and the watchdog
+  /// withheld its beat.
+  fresh_queued: bool,
   /// Exchanges whose forwarders gave up while they were open, to abandon on the next turn, with their session.
   abandon: Vec<(u64, ConnectionId)>,
   /// Whether a forwarder is driving the lane now.
@@ -167,6 +176,7 @@ fn enqueue(peer: HostId, requests: &[Vec<u8>]) -> Option<(u64, Vec<u64>)> {
       );
       lane.queued.insert(*ticket);
     }
+    lane.fresh_queued = true;
     if let Some(driver) = lane.driver.take() {
       driver.wake();
     }
@@ -304,25 +314,15 @@ pub(crate) async fn forward_batch(
     }
     let left_ns = stall_ns.saturating_sub(quiet_ns);
     if held.driving {
-      match turn(peer, left_ns).await {
-        Turn::Driven { any_reply } => {
-          begun = true;
-          if any_reply && first_reply.is_none() {
-            first_reply = first_answered(peer, &held.tickets);
-          }
-        }
-        Turn::SessionOut => {
-          count_miss(peer, &mut missed);
-          if futures::sleep(crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD)
-            .await
-            .is_err()
-          {
-            return None;
-          }
-        }
-        // The session failed under the turn: what came back is kept, the rest answered unanswered, as a batch cut off
-        // by its session's loss always was.
-        Turn::Failed => return given_up(peer, &held, true),
+      if let Some(ended) = drive_turn(
+        peer,
+        left_ns,
+        &held,
+        (&mut begun, &mut first_reply, &mut missed),
+      )
+      .await
+      {
+        return ended;
       }
     } else {
       // Woken when one of this batch's replies is taken, or when the driver leaves; bounded by the budget left.
@@ -333,6 +333,40 @@ pub(crate) async fn forward_batch(
       }
     }
   }
+}
+
+/// One driving turn of a forwarder ([`forward_batch`]): `Some` with what the forwarder returns when the batch ends on
+/// it (its session failed, or the shard is stopping), else `None` to look again.
+async fn drive_turn(
+  peer: HostId,
+  left_ns: u64,
+  held: &Held,
+  (begun, first_reply, missed): (&mut bool, &mut Option<(u64, usize)>, &mut bool),
+) -> Option<Option<BatchReplies>> {
+  match turn(peer, left_ns).await {
+    Turn::Driven { any_reply } => {
+      *begun = true;
+      if any_reply && first_reply.is_none() {
+        *first_reply = first_answered(peer, &held.tickets);
+      }
+      // A turn's drive returns Ready whenever a packet is already there, so under a burst of replies the turns
+      // never wait: each turn ends the poll's slice, and the shard steps between them (the bounded-work rule).
+      futures::yield_now().await;
+    }
+    Turn::SessionOut => {
+      count_miss(peer, missed);
+      if futures::sleep(crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD)
+        .await
+        .is_err()
+      {
+        return Some(None);
+      }
+    }
+    // The session failed under the turn: what came back is kept, the rest answered unanswered, as a batch cut off
+    // by its session's loss always was.
+    Turn::Failed => return Some(given_up(peer, held, true)),
+  }
+  None
 }
 
 /// The batch's replies so far, its budget spent: `None` when none of it was ever begun (the session never came),
@@ -484,11 +518,11 @@ async fn drive_or_queued(peer: HostId, endpoint: &mut Endpoint) -> Result<(), En
     }
     let queued = state::with_state(|s| {
       let lane = s.forward_lanes.lanes.get_mut(&peer)?;
-      if lane.queued.is_empty() {
+      if lane.fresh_queued {
+        Some(true)
+      } else {
         lane.driver = Some(cx.waker().clone());
         Some(false)
-      } else {
-        Some(true)
       }
     })
     .flatten()
@@ -593,6 +627,7 @@ fn begin_queued(
 ) -> u64 {
   let now = futures::now_ns();
   let mut begun = 0u64;
+  lane.fresh_queued = false;
   while let Some(ticket) = lane.queued.first().copied() {
     let Some(entry) = lane.tickets.get_mut(&ticket) else {
       lane.queued.remove(&ticket);
