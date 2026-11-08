@@ -1,0 +1,67 @@
+runner ubuntu-latest, 4 CPUs, d3d2057 diag-liveness-23: the recovery-slicing extremes on four runners (diagnos, Sun Nov  8 04:23:07 UTC 2026
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-42c31b829b6af06e/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-42c31b829b6af06e/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-42c31b829b6af06e/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-42c31b829b6af06e/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+error: the function has a cognitive complexity of (13/10)
+error: the function has a cognitive complexity of (16/10)
+error: large size difference between variants
+error: could not compile `slates-server` (lib) due to 3 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `slates-server` (lib test) due to 3 previous errors
+== clippy exit 101
+== spinners: 8
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+== rt alone exit 0 in 0 s, load 3.44
+test result: ok. 210 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 1.27s
+== server lib exit 0 in 2 s, load 4.12
+long recovery: 1 greens over 78 files recovered in 99.963979ms of CPU, the beat's largest gap 102.827899ms
+long recovery: 2 greens over 78 files recovered in 100.296084ms of CPU, the beat's largest gap 102.920256ms
+long recovery: 4 greens over 78 files recovered in 104.294106ms of CPU, the beat's largest gap 200.144783ms
+long recovery: 8 greens over 78 files recovered in 110.364271ms of CPU, the beat's largest gap 102.912753ms
+long recovery: 16 greens over 78 files recovered in 206.625431ms of CPU, the beat's largest gap 102.907275ms
+long recovery: 32 greens over 78 files recovered in 389.275118ms of CPU, the beat's largest gap 100.141417ms
+long recovery: 64 greens over 78 files recovered in 735.444143ms of CPU, the beat's largest gap 102.518859ms
+long recovery: 128 greens over 78 files recovered in 1.449209648s of CPU, the beat's largest gap 200.192965ms
+long recovery: 256 greens over 78 files recovered in 2.838630854s of CPU, the beat's largest gap 103.005646ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 49 filtered out; finished in 36.74s
+== the slicing test exit 0 in 37 s, load 6.83
+slates daemon: shard 3 is wedged: no step and no CPU progress for 1004 ms, past the 1000 ms window; the watchdog withholds the beat
+slates daemon: shard 7 is spinning: 1066 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+slates daemon: shard 5 is wedged: no step and no CPU progress for 1004 ms, past the 1000 ms window; the watchdog withholds the beat
+slates daemon: shard 4 is spinning: 1072 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 50.73s
+== recovery suite exit 0 in 51 s, load 11.29
+slates daemon: shard 1 is spinning: 1009 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1000 ms, past the 1000 ms window; the watchdog withholds the beat
+test result: ok. 6 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 12.64s
+== liveness suite exit 0 in 12 s, load 11.55
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.80s
+== daemon suite exit 0 in 3 s, load 11.55
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.13s
+== green checkpoint exit 0 in 2 s, load 12.06
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.87s
+== held_rendezvous exit 0 in 3 s, load 12.06
+slates anchor: daemon exited (None); restarted as pid 10164 (1 in the window)
+slates anchor: daemon exited (None); restarted as pid 10215 (1 in the window)
+slates anchor: daemon exited (None); restarted as pid 10251 (1 in the window)
+slates anchor: the daemon's heartbeat lapsed (1000 ms old, past 1000 ms: the 1000 ms window plus this anchor's lateness p99 of 0 ms over 6 waits); killing it
+slates anchor: daemon exited (None); restarted as pid 10296 (1 in the window)
+slates anchor: daemon exited (None); restarted as pid 10356 (1 in the window)
+slates anchor: daemon exited (None); restarted as pid 10429 (1 in the window)
+slates anchor: daemon exited (None); restarted as pid 10580 (1 in the window)
+slates anchor: daemon exited (None); restarted as pid 10632 (1 in the window)
+slates anchor: daemon exited (None); restarted as pid 10684 (1 in the window)
+slates anchor: the starting daemon (pid 10684) made no progress for 1003 ms (the 1000 ms liveness window); killing it
+slates anchor: daemon exited (None); restarted as pid 10686 (1 in the window)
+slates anchor: daemon exited (None); restarted as pid 10764 (1 in the window)
+slates anchor: daemon exited (None); restarted as pid 10830 (1 in the window)
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 74 filtered out; finished in 19.60s
+== cli restart exit 0 in 19 s, load 11.38
