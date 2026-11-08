@@ -34,7 +34,10 @@ mod nfs;
 
 use std::collections::BTreeMap;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// Diag only (live-durability-44): the stream's write in flight, ms since the start + 1; 0 for none.
+static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 use std::time::{Duration, Instant};
 
 use slates_client::{Client, Deadlines, Intent, ReadAt, VolumeId};
@@ -241,7 +244,12 @@ fn start_node(
     Supervision::Bare => "daemon",
     Supervision::Anchored => "anchor",
   };
-  let child = slates()
+  let mut command = slates();
+  // Diag only (live-durability-47, never on main): the reply delay goes to the one node SLATES_DIAG_DELAY_NODE names.
+  if std::env::var("SLATES_DIAG_DELAY_NODE").ok().as_deref() != Some(node) {
+    command.env_remove("SLATES_DIAG_LIVE_REPLY_DELAY_MS");
+  }
+  let child = command
     .args([
       "--instance",
       instance,
@@ -767,6 +775,7 @@ impl Stream<'_> {
       let body = chaos_body(file);
       let sent = self.began.elapsed();
       let started = Instant::now();
+      IN_FLIGHT.store(u64::try_from(sent.as_millis()).unwrap_or(u64::MAX - 1) + 1, Ordering::Release);
       let written = client.fs_write(
         (self.volume, attachment),
         &chaos_path(file),
@@ -774,6 +783,7 @@ impl Stream<'_> {
         FILE_MODE,
       );
       let took = started.elapsed();
+      IN_FLIGHT.store(0, Ordering::Release);
       let refused = written.err().map(|error| error.to_string());
       let failed = refused.is_some();
       outcomes.push(Outcome {
@@ -1156,6 +1166,7 @@ fn stream_through<F: FnOnce(&Instant)>(
   let began = Instant::now();
   let stop_stream = AtomicBool::new(false);
   let stop_sampling = AtomicBool::new(false);
+  let stop_watch = AtomicBool::new(false);
   std::thread::scope(|scope| {
     let sampler = scope.spawn(|| {
       Sampler {
@@ -1164,6 +1175,31 @@ fn stream_through<F: FnOnce(&Instant)>(
         began,
       }
       .run(&stop_sampling)
+    });
+    let _watcher = scope.spawn(|| {
+      let mut dumped = (0u64, 0usize);
+      while !stop_watch.load(Ordering::Acquire) {
+        let since = IN_FLIGHT.load(Ordering::Acquire);
+        if since > 0 {
+          let now = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
+          let stuck = now.saturating_sub(since - 1);
+          if dumped.0 != since {
+            dumped = (since, 0);
+          }
+          // Diag only: multiples of the daemon's liveness budget, in ms: the 2.3 s stall's and the 20 s write's.
+          let budget = slates_server::daemon::LIVENESS_BUDGET_NS / 1_000_000;
+          let marks = [budget, 2 * budget, 3 * budget, 8 * budget, 15 * budget];
+          if dumped.1 < marks.len() && stuck >= marks[dumped.1] {
+            dumped.1 += 1;
+            eprintln!(
+              "LD-STUCK write sent at {}ms, in flight {stuck}ms (at {now}ms):\n{}\nLD-END",
+              since - 1,
+              diagnosis(instances, volume)
+            );
+          }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+      }
     });
     let streamer = scope.spawn(|| {
       Stream {
@@ -1207,6 +1243,7 @@ fn stream_through<F: FnOnce(&Instant)>(
       pause();
     }
     let outcomes = streamer.join().unwrap();
+    stop_watch.store(true, Ordering::Release);
     if let Some(failure) = failed {
       std::panic::resume_unwind(failure);
     }

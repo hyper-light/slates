@@ -1,0 +1,75 @@
+name: diag-live-durability
+
+# Diagnostics only, never on main (A-200, §4.10a): the PMTU fix (agents/live-durability-pmtu-1 @ 4c697a11: loss and
+# silence make the size suspect, only failed probes at it make a black hole) with diag-only LD-PMTU lines and the
+# stuck-write watcher. The rolling partition x30 per arch: how often a session was suspect, how often a black hole was
+# counted, and the stalls, against diag-48 on main (89 falls to 1,200 in 60 runs, every one a probe timeout).
+# Results to diag-results/live-durability-49-<os>.
+on:
+  push:
+    branches: ["diag-live-durability-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  SLATES_TEST_CLI: "1"
+  SLATES_CHAOS_PRINT_SLOW: "1"
+
+jobs:
+  check:
+    name: partition (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: The runs
+        shell: bash {0}
+        run: |
+          R=../results.txt
+          mkdir -p ../kept
+          echo "runner ${{ matrix.os }}, $(nproc) CPUs, $(date -u), tree $(git rev-parse HEAD)" > $R
+          timeout 1800 cargo build --release --locked -p slates-cli --bin slates --test live_chaos > ../build.log 2>&1; status=$?
+          echo "== release build exit $status" >> $R
+          [ $status -ne 0 ] && grep -E '^error' -A8 ../build.log | head -40 >> $R
+          captured=0
+          for run in $(seq 1 30); do
+            timeout 900 cargo test --release --locked -p slates-cli --test live_chaos -- --nocapture --test-threads=1 --exact candidates_partitioned_in_turn_mid_stream_lose_nothing > ../run.log 2>&1; status=$?
+            grep -E '^  [0-9]+ writes|violations|refused the owner|panicked|^  chaos-rolling.*partitioned' ../run.log | grep -v '^chaos' | sort -u | cut -c1-600 >> $R || true
+            stuck=$(grep -c '^LD-STUCK' ../run.log)
+            long=$(grep -cE 'in flight [0-9]{4,}ms' ../run.log | head -1)
+            long5=$(grep -oE 'in flight [0-9]+ms' ../run.log | grep -oE '[0-9]+' | awk '$1>=5000' | wc -l)
+            echo "== partition $run exit $status stuck $stuck long5 $long5" >> $R
+            echo "   pmtu: pto_suspects $(grep -c '^LD-PMTU trigger pto suspected true' ../run.log) loss_suspects $(grep -c '^LD-PMTU trigger loss_pass suspected true' ../run.log) grew $(grep -c '^LD-PMTU trigger acked grew' ../run.log) black_holes_max $(grep -oE 'black_holes [0-9]+' ../run.log | awk '{if ($2>m) m=$2} END {print m+0}')" >> $R
+            if [ "$long5" -gt 0 ] || [ $status -ne 0 ]; then
+              cut -c1-2000 ../run.log > ../kept/run-$run.log
+            elif [ "$stuck" -gt 0 ] && [ $captured -lt 4 ]; then
+              captured=$((captured + 1))
+              cut -c1-2000 ../run.log > ../kept/run-$run.log
+            fi
+          done
+          echo "== captured $captured" >> $R
+          exit 0
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/live-durability-49-${{ matrix.os }}"
+          git config user.name "diag-live-durability"
+          git config user.email "diag-live-durability@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          cp ../kept/*.log . 2>/dev/null || true
+          git add results.txt *.log 2>/dev/null || git add results.txt
+          git commit -qm "diag-live-durability-49 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
