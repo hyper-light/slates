@@ -104,6 +104,13 @@ pub enum WinFspError {
   },
 }
 
+impl From<crate::inflight::Refusal> for WinFspError {
+  /// A journal refusal ends the receive worker as a capture refusal (`crate::inflight::settle`).
+  fn from(refusal: crate::inflight::Refusal) -> Self {
+    Self::Capture(refusal)
+  }
+}
+
 impl std::fmt::Display for WinFspError {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
@@ -2323,14 +2330,8 @@ fn run_mount(
       .read(at, &mut captured)
       .map_err(|error| WinFspError::Ledger(crate::opens::Refusal::Memory(error)))?;
     let mut scratch = crate::inflight::Scratch::new().map_err(WinFspError::Capture)?;
-    let saved_open = crate::inflight::capture::Capture::new(&mut captured)
-      .map_err(WinFspError::Capture)?
-      .resume(&mut scratch)
-      .map_err(WinFspError::Capture)?
-      .map(|batch| batch.saved_open())
-      .transpose()
-      .map_err(WinFspError::Capture)?
-      .flatten();
+    let saved_open = crate::inflight::settle::saved_open(&mut captured, &mut scratch)
+      .map_err(WinFspError::Capture)?;
     ledger
       .settle_pending(saved_open)
       .map_err(WinFspError::Ledger)?;

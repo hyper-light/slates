@@ -9,6 +9,11 @@
 > now it commits, and the test ends in 3.3 s. Record:
 > `docs/bugs/2026-11-07-a-version-appended-before-its-owner-restarted-never-committed.md`.
 
+> **Open (perf, 2026-11-08): the give-back's slice is learned from wall time.** `learn_give_back_rate` divides by the
+> shard's clock, so on a loaded host a preempted step teaches a small slice and a give-back takes thousands of steps
+> (2,572 to 3,042 at load about 100, on a Mac whose whole give-back is 18 to 21 ms of CPU) rather than hundreds. Since
+> A-226's amendment it no longer costs other work a turn, only time to finish on a shard otherwise idle. Not changed.
+
 > **A submit resent after its owner's restart was applied a second time: fixed (2026-11-08, §4.16 "Commit", §4.9; A-252).**
 > The waiting submit lived in memory, so after a restart its resend under the same id found no completion and ran
 > again as a new version: 4,261 oracle failures on fixtures' 1,000-client primary kill, 83 versions no client was told.
@@ -451,6 +456,17 @@
 >   shard is sized for its own clients' forwards only; and the control shard's work under a large in-flight set,
 >   O(forwarders) a tick while its session is lent (64 to 105 s to drain 20,700 forwards on a 4-core runner), which
 >   is the shared session owed by "Open — one session per peer is lent exclusively" (its 2026-11-07 status).
+>
+> - **A forward lane turned without end while its forwards waited on the stream credit** (found 2026-11-08 on the f = 1
+>   primary-kill rung). After the primary restarted, a turn ended at once whenever any forward was queued, and with
+>   about 20,000 queued behind the stream credit the forwarder turned in one poll until its stall budget: client-0's
+>   control shard spun about 1.09 s, 6 of 6 runs, and its anchor killed it. A turn now ends early only for a newly
+>   queued forward, and the forwarder yields between turns: 0 of 6, one restart a run, oracle 0. With it, a turn costs
+>   what changed (completed and progressed exchanges), and the endpoint's completed set, which grew with every exchange
+>   a record session completed, holds only open ones
+>   (`docs/bugs/2026-11-08-a-forward-lane-turned-without-end-while-its-forwards-waited-on-the-stream-credit.md`).
+>   `slates_cluster`'s `take_completed_replies` still asks each of a dispatch's exchanges: a lookup a holder, since a
+>   second consumer of the completed set would take the lane's.
 >
 > - **A forward its owner never answered stayed open on a busy session** (found 2026-11-07 by fixtures' f = 1
 >   primary kill). A forward's stall budget counted any byte its session consumed, so 298 forwards to an owner that
@@ -1072,21 +1088,22 @@
 > Wi-Fi LAN an accepted edit and merge is one forwarded round trip, 6.9 to 7.8 ms p50, against 14.1 to 18.6 ms for
 > edit then submit (ping 6.1 to 7.7 ms). Oracle: `edit_and_submit_answers_what_edit_then_submit_does_over_generated_histories`
 > (`crates/client/tests/edit_and_submit.rs`) compares every answer and every head over generated histories, red under
-> both mutations tried. Exactly once: `an_edit_and_submit_retried_across_a_restart_answers_its_record_once`. **Open:**
-> the SDKs, MCP and the CLI do not offer the combined verb yet. Also open: the link's p99 (70 to 158 ms over Wi-Fi), a
-> wired pair, and Windows as either node.
+> both mutations tried. Exactly once: `an_edit_and_submit_retried_across_a_restart_answers_its_record_once`. **Owed
+> (owner: agents/perf, after W1 unless clients asks sooner; the supervisor, 2026-11-07):** the combined verb in the
+> Python and Node SDKs, MCP and the CLI; Windows as either node of the two-machine measurement; and a wired pair.
+> Also open: the link's p99 (70 to 158 ms over Wi-Fi).
+>
 > **Merge, macOS: the paced tail was the recovery give-back, not the doorbell (A-226, 2026-11-06, agents/perf-2).** An
 > idle shard's give-back of the recovery memory no restart reads (A-117) marked the whole stale slot and log, 18 GB
 > a shard, at every publication: 18 to 21 ms of the shard's CPU in one reap-loop poll, which paced requests waited
 > behind. It now gives back only what was written since its last give-back. In one paced run, reap polls of 5 ms CPU
 > or more went from 46 to 6. Failing first: `a_give_back_returns_only_recovery_memory_written_since_the_last` (91.6 GB
 > given back after a one-file delta, against 0). Oracle: `a_give_back_names_every_dead_written_byte_and_stops_at_the_last`.
-> **Open:** the 6 left are each shard's first two give-backs after a boot, over memories the journal did not write
-> (12 to 43 ms each), owed slices under the step quantum (built on agents/perf-2, to land after this). On CI
-> (diag-perf-5, run 42173825162) A-226 is even on Linux and halves Windows x86_64's paced accept p99 (1.21 to 1.40 ms
-> became 0.42 to 0.76 ms). Also open: the latency A/B on a quiet Mac (this one ran at load 50 to 95), and the sibling of
-> the same shape, the Linux FUSE write log's purge (`crates/server/src/write_log.rs`, its whole capacity once per
-> emptying).
+> The 6 left were each shard's first two give-backs after a boot, over memories the journal did not write (12 to 43 ms
+> each). **Sliced 2026-11-07:** a give-back takes one measured slice a step from the top down. So does its sibling,
+> the Linux FUSE write log's purge, which gave back its whole area per emptying (red first: 12,288 bytes for one
+> 15-byte record). On CI (diag-perf-5, run 42173825162) A-226 is even on Linux and halves Windows x86_64's paced accept
+> p99 (1.21 to 1.40 ms became 0.42 to 0.76 ms). **Open:** the latency A/B on a quiet Mac.
 >
 >
 
@@ -5574,6 +5591,12 @@ round asked no one and it waited out a whole election timeout. No late grant was
 - On KIND over ten trials each, the median successor fell from 2.77 to 1.91 s, no voter went unasked, and 9
   of 10 won their first pre-election.
 [Bug record](../bugs/2026-09-29-a-campaign-asked-no-one-while-a-session-was-out.md).
+
+**Open (A-251, raft-chaos): a holder's page can leave out a copy it holds and still count as its promise.** A successor counts a
+complete answer as a promise for every object not listed, so an omitted copy reads as a copy not held, and an older record can
+be adopted. **Fixed so far, step (c):** a copy the holder cannot promise (`HostPromise::unpromised`, record
+`docs/bugs/2026-11-08-a-holder-that-could-not-promise-a-copy-read-as-holding-nothing.md`). Still owed: the counting rule as a pure
+`crates/db` function with a paged model and an omission nemesis, then a per-object question by name, then the process test.
 
 **Open — one session per peer is lent exclusively.** A discovery page, a coordinator dispatch, a forward and
 a campaign each take the whole session out of its link, though the transport runs several exchanges on one

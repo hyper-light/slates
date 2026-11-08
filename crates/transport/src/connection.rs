@@ -325,6 +325,9 @@ pub struct Connection {
   sent_acks: BTreeMap<u64, u64>,
   /// Received packets discarded as duplicates of a packet number already processed (RFC 9000 §12.3).
   duplicates: u64,
+  /// When this end last handled an authenticated packet from the peer (`handle_incoming`), `None` before the first:
+  /// what tells a borrower a session whose peer is gone (data in flight and nothing back) from a quiet one.
+  last_received_ns: Option<u64>,
   /// Stream frames the peer sent in breach of flow control or a stream's final size (RFC 9000 §4.1,
   /// §4.5), dropped and counted.
   violations: u64,
@@ -445,6 +448,7 @@ impl Connection {
       reserve_frame_cap,
       sent_acks: BTreeMap::new(),
       duplicates: 0,
+      last_received_ns: None,
       violations: 0,
       resets_owed: std::collections::BTreeSet::new(),
       probe_copies: VecDeque::new(),
@@ -1231,6 +1235,7 @@ impl Connection {
       self.duplicates = self.duplicates.saturating_add(1);
       return;
     }
+    self.last_received_ns = Some(now);
     self.acks.record(pn);
     let mut ack_eliciting = false;
     for frame in frames {
@@ -1817,6 +1822,11 @@ impl Connection {
   /// The bytes currently in flight.
   pub fn bytes_in_flight(&self) -> u64 {
     self.in_flight
+  }
+
+  /// When this end last handled an authenticated packet from the peer, `None` before the first.
+  pub fn last_received_ns(&self) -> Option<u64> {
+    self.last_received_ns
   }
 
   /// The RTT estimator.

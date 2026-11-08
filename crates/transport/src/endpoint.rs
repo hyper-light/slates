@@ -262,6 +262,12 @@ pub struct EndpointCensus {
   pub arriving: usize,
   /// The peer's complete requests not yet served.
   pub ready: usize,
+  /// Exchanges marked completed and not yet taken ([`Endpoint::take_completed`]); an exchange taken by
+  /// [`Endpoint::take_reply`] or abandoned leaves it. Until 2026-11-08 only `take_completed` emptied it, which a record
+  /// session never calls, so the set grew with every exchange such a session ever completed.
+  pub completed: usize,
+  /// Exchanges marked as having read reply bytes and not yet taken ([`Endpoint::take_progressed`]).
+  pub progressed: usize,
 }
 
 impl EndpointCensus {
@@ -1871,6 +1877,16 @@ impl Endpoint {
     self.conn.next_timeout()
   }
 
+  /// The bytes in flight on the session: a borrower judging whether its peer is gone needs data outstanding.
+  pub fn bytes_in_flight(&self) -> u64 {
+    self.conn.bytes_in_flight()
+  }
+
+  /// When this end last handled an authenticated packet from the peer, `None` before the first (`slates_rt`'s clock).
+  pub fn last_received_ns(&self) -> Option<u64> {
+    self.conn.last_received_ns()
+  }
+
   /// The congestion window, bytes (for reports).
   pub fn congestion_window(&self) -> u64 {
     self.conn.congestion_window()
@@ -1905,6 +1921,8 @@ impl Endpoint {
       exchanges: self.exchanges.len(),
       arriving: self.arriving.len(),
       ready: self.ready.len(),
+      completed: self.completed.len(),
+      progressed: self.progressed.len(),
     }
   }
 
