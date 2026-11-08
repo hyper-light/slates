@@ -1,0 +1,177 @@
+runner ubuntu-latest, 4 CPUs, e4f834c diag: the A-228 rule on every platform, the liveness tests ten times, Sun Nov  8 13:50:12 UTC 2026
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 43 filtered out; finished in 0.02s
+== reader tests, exit 0
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 211 filtered out; finished in 0.00s
+== rule tests, exit 0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 55.59s
+== clippy, exit 0
+test a_daemon_beside_two_spinners_a_core_keeps_beating ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a C
+largest beat gap beside 8 spinners: 102.998292ms
+test a_shard_blocked_in_a_syscall_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is 
+wedged shard (syscall): the block began 288µs in, and the beat stopped 1.010518733s after it
+test a_shard_starved_off_its_cpu_keeps_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is s
+slates daemon: shard 1 is starved: no step and no CPU progress for 1002 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+starved shard: 63 spinners, its CPU clock stood still for 3.009634745s at most in 3.012468433s; largest beat gap 91.026824ms
+test a_slow_blocking_call_shorter_than_a_window_does_not_stop_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard
+largest beat gap through a half-window block: 100.286373ms
+test a_spinning_shard_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not
+spinning shard: the beat stopped Some(1.001238293s) after the spin began
+test a_starved_poll_on_the_control_shard_does_not_stop_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waitin
+largest beat gap through a starved poll: 100.200643ms
+test a_wedged_shard_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not s
+wedged shard (wedged): the block began 303µs in, and the beat stopped 1.003199924s after it
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 18.72s
+== liveness run 1 exit 0
+test a_daemon_beside_two_spinners_a_core_keeps_beating ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a C
+largest beat gap beside 8 spinners: 104.828001ms
+test a_shard_blocked_in_a_syscall_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is 
+wedged shard (syscall): the block began 393µs in, and the beat stopped 1.001945042s after it
+test a_shard_starved_off_its_cpu_keeps_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is s
+slates daemon: shard 1 is starved: no step and no CPU progress for 1002 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+starved shard: 63 spinners, its CPU clock stood still for 3.008740298s at most in 3.011149487s; largest beat gap 91.008234ms
+test a_slow_blocking_call_shorter_than_a_window_does_not_stop_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard
+largest beat gap through a half-window block: 100.328002ms
+test a_spinning_shard_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not
+spinning shard: the beat stopped Some(1.008623259s) after the spin began
+test a_starved_poll_on_the_control_shard_does_not_stop_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waitin
+largest beat gap through a starved poll: 100.193541ms
+test a_wedged_shard_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not s
+wedged shard (wedged): the block began 357µs in, and the beat stopped 1.003124683s after it
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 18.73s
+== liveness run 2 exit 0
+test a_daemon_beside_two_spinners_a_core_keeps_beating ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a C
+largest beat gap beside 8 spinners: 102.99804ms
+test a_shard_blocked_in_a_syscall_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is 
+wedged shard (syscall): the block began 301µs in, and the beat stopped 1.002566188s after it
+test a_shard_starved_off_its_cpu_keeps_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is s
+slates daemon: shard 1 is starved: no step and no CPU progress for 1002 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+starved shard: 63 spinners, its CPU clock stood still for 3.007106296s at most in 3.00931769s; largest beat gap 90.964957ms
+test a_slow_blocking_call_shorter_than_a_window_does_not_stop_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard
+largest beat gap through a half-window block: 100.295104ms
+test a_spinning_shard_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not
+spinning shard: the beat stopped Some(1.010958875s) after the spin began
+test a_starved_poll_on_the_control_shard_does_not_stop_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waitin
+largest beat gap through a starved poll: 100.16157ms
+test a_wedged_shard_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not s
+wedged shard (wedged): the block began 303µs in, and the beat stopped 1.002633902s after it
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 18.72s
+== liveness run 3 exit 0
+test a_daemon_beside_two_spinners_a_core_keeps_beating ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a C
+largest beat gap beside 8 spinners: 104.368224ms
+test a_shard_blocked_in_a_syscall_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is 
+wedged shard (syscall): the block began 285µs in, and the beat stopped 1.002465856s after it
+test a_shard_starved_off_its_cpu_keeps_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is s
+slates daemon: shard 1 is starved: no step and no CPU progress for 1002 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+starved shard: 63 spinners, its CPU clock stood still for 3.00722027s at most in 3.009553953s; largest beat gap 90.917068ms
+test a_slow_blocking_call_shorter_than_a_window_does_not_stop_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard
+largest beat gap through a half-window block: 100.311402ms
+test a_spinning_shard_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not
+spinning shard: the beat stopped Some(1.002525472s) after the spin began
+test a_starved_poll_on_the_control_shard_does_not_stop_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waitin
+largest beat gap through a starved poll: 100.188412ms
+test a_wedged_shard_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not s
+wedged shard (wedged): the block began 277µs in, and the beat stopped 1.002993952s after it
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 18.73s
+== liveness run 4 exit 0
+test a_daemon_beside_two_spinners_a_core_keeps_beating ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a C
+largest beat gap beside 8 spinners: 104.302139ms
+test a_shard_blocked_in_a_syscall_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is 
+wedged shard (syscall): the block began 336µs in, and the beat stopped 1.002569523s after it
+test a_shard_starved_off_its_cpu_keeps_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is s
+slates daemon: shard 1 is starved: no step and no CPU progress for 1002 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+starved shard: 63 spinners, its CPU clock stood still for 3.005590225s at most in 3.00800507s; largest beat gap 91.466766ms
+test a_slow_blocking_call_shorter_than_a_window_does_not_stop_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard
+largest beat gap through a half-window block: 100.318747ms
+test a_spinning_shard_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not
+spinning shard: the beat stopped Some(1.010885993s) after the spin began
+test a_starved_poll_on_the_control_shard_does_not_stop_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waitin
+largest beat gap through a starved poll: 100.221405ms
+test a_wedged_shard_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not s
+wedged shard (wedged): the block began 275µs in, and the beat stopped 1.002153218s after it
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 18.73s
+== liveness run 5 exit 0
+test a_daemon_beside_two_spinners_a_core_keeps_beating ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a C
+largest beat gap beside 8 spinners: 102.356209ms
+test a_shard_blocked_in_a_syscall_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is 
+wedged shard (syscall): the block began 224µs in, and the beat stopped 1.002389006s after it
+test a_shard_starved_off_its_cpu_keeps_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is s
+slates daemon: shard 1 is starved: no step and no CPU progress for 1002 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+starved shard: 63 spinners, its CPU clock stood still for 3.006337983s at most in 3.008473196s; largest beat gap 90.909709ms
+test a_slow_blocking_call_shorter_than_a_window_does_not_stop_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard
+largest beat gap through a half-window block: 100.267395ms
+test a_spinning_shard_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not
+spinning shard: the beat stopped Some(1.0089126s) after the spin began
+test a_starved_poll_on_the_control_shard_does_not_stop_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waitin
+largest beat gap through a starved poll: 100.153411ms
+test a_wedged_shard_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not s
+wedged shard (wedged): the block began 321µs in, and the beat stopped 1.002922774s after it
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 18.72s
+== liveness run 6 exit 0
+test a_daemon_beside_two_spinners_a_core_keeps_beating ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a C
+largest beat gap beside 8 spinners: 102.870373ms
+test a_shard_blocked_in_a_syscall_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is 
+wedged shard (syscall): the block began 263µs in, and the beat stopped 1.002796735s after it
+test a_shard_starved_off_its_cpu_keeps_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is s
+slates daemon: shard 1 is starved: no step and no CPU progress for 1002 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+starved shard: 63 spinners, its CPU clock stood still for 3.001510921s at most in 3.003837001s; largest beat gap 91.457347ms
+test a_slow_blocking_call_shorter_than_a_window_does_not_stop_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard
+largest beat gap through a half-window block: 100.307156ms
+test a_spinning_shard_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not
+spinning shard: the beat stopped Some(1.00142714s) after the spin began
+test a_starved_poll_on_the_control_shard_does_not_stop_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waitin
+largest beat gap through a starved poll: 100.162096ms
+test a_wedged_shard_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not s
+wedged shard (wedged): the block began 302µs in, and the beat stopped 1.002923033s after it
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 18.74s
+== liveness run 7 exit 0
+test a_daemon_beside_two_spinners_a_core_keeps_beating ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a C
+largest beat gap beside 8 spinners: 102.800558ms
+test a_shard_blocked_in_a_syscall_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is 
+wedged shard (syscall): the block began 276µs in, and the beat stopped 1.002801743s after it
+test a_shard_starved_off_its_cpu_keeps_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is s
+slates daemon: shard 1 is starved: no step and no CPU progress for 1002 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+starved shard: 63 spinners, its CPU clock stood still for 2.920596806s at most in 3.004265181s; largest beat gap 91.453963ms
+test a_slow_blocking_call_shorter_than_a_window_does_not_stop_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard
+largest beat gap through a half-window block: 100.325611ms
+test a_spinning_shard_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not
+spinning shard: the beat stopped Some(1.008473664s) after the spin began
+test a_starved_poll_on_the_control_shard_does_not_stop_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waitin
+largest beat gap through a starved poll: 100.180995ms
+test a_wedged_shard_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not s
+wedged shard (wedged): the block began 315µs in, and the beat stopped 1.002873207s after it
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 18.71s
+== liveness run 8 exit 0
+test a_daemon_beside_two_spinners_a_core_keeps_beating ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a C
+largest beat gap beside 8 spinners: 103.002712ms
+test a_shard_blocked_in_a_syscall_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is 
+wedged shard (syscall): the block began 305µs in, and the beat stopped 1.001630788s after it
+test a_shard_starved_off_its_cpu_keeps_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is s
+slates daemon: shard 1 is starved: no step and no CPU progress for 1002 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+starved shard: 63 spinners, its CPU clock stood still for 3.005944722s at most in 3.008382538s; largest beat gap 90.870659ms
+test a_slow_blocking_call_shorter_than_a_window_does_not_stop_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard
+largest beat gap through a half-window block: 100.311049ms
+test a_spinning_shard_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not
+spinning shard: the beat stopped Some(1.00112204s) after the spin began
+test a_starved_poll_on_the_control_shard_does_not_stop_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waitin
+slates daemon: the control shard's beat task ran largest beat gap through a starved poll: 100.158808ms
+test a_wedged_shard_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not s
+wedged shard (wedged): the block began 328µs in, and the beat stopped 1.002129028s after it
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 18.70s
+== liveness run 9 exit 0
+test a_daemon_beside_two_spinners_a_core_keeps_beating ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a C
+largest beat gap beside 8 spinners: 105.252678ms
+test a_shard_blocked_in_a_syscall_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is 
+wedged shard (syscall): the block began 286µs in, and the beat stopped 1.003757548s after it
+test a_shard_starved_off_its_cpu_keeps_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is s
+slates daemon: shard 1 is starved: no step and no CPU progress for 1002 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+starved shard: 63 spinners, its CPU clock stood still for 3.006608865s at most in 3.009347475s; largest beat gap 90.893734ms
+test a_slow_blocking_call_shorter_than_a_window_does_not_stop_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard
+largest beat gap through a half-window block: 100.292341ms
+test a_spinning_shard_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not
+spinning shard: the beat stopped Some(1.008902849s) after the spin began
+test a_starved_poll_on_the_control_shard_does_not_stop_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waitin
+largest beat gap through a starved poll: 100.166526ms
+test a_wedged_shard_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not s
+wedged shard (wedged): the block began 292µs in, and the beat stopped 1.003030457s after it
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 18.73s
+== liveness run 10 exit 0
