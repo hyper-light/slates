@@ -12029,3 +12029,22 @@ one-minute load 3.0 to 15.5. Oracle failures 0 in every run. Milliseconds, the r
   per verdict is the next lever.
 - Before the asks were batched, every 3,000-client run stalled (see `crates/server/src/work_home.rs`, "Asks are
   batched").
+
+**Measured and rejected the same day: a smaller batch of asks.** The verdict's tail might have been a batch of 32 asks
+holding the owner for one step. W1 with the batch bound at 32 (the client region's credit, shipped), 8 and 2, 3,000
+clients, the same command and machine, 4 interleaved rounds each (one-minute load 1.6 to 17.4; the first round of each
+arm is the coldest), oracle 0. Milliseconds, p50 / p99:
+
+| Bound | Wall (s) | SubmitAccepted | SubmitConflict | Rebase | ReadHead | Edit |
+|---|---|---|---|---|---|---|
+| 32 (shipped) | 4.48–5.20 | 23.6–27.3 / 67.5–78.7 | 34.3–39.8 / 78.1–86.3 | 33.7–39.5 / 63.6–71.4 | 10.9–12.7 / 22.5–26.1 | 0.5–0.6 / 59.1–66.4 |
+| 8 | 4.42–4.87 | 28.7–31.2 / 75.0–80.1 | 41.8–46.1 / 92.6–98.4 | 42.0–46.4 / 84.9–90.9 | 2.7–3.0 / 6.6–7.0 | 0.3 / 51.3–62.0 |
+| 2 | 5.05–6.06 | 33.2–43.9 / 79.6–93.6 | 48.9–59.6 / 101.5–124.0 | 49.5–60.1 / 99.4–124.2 | 0.8–1.0 / 1.8–2.2 | 0.2 / 65.9–77.1 |
+
+A smaller batch makes every verdict's tail worse, so the batch is not what holds it back: reads gain (they stop riding
+with verdicts), and the verdicts lose the batching. Rejected.
+
+**Where the owner's time goes** (`sample`, 2 s in the middle of one 3,000-client run, W1 b4936073, shard 19, the green's
+owner, 1,121 samples): 799 (71%) in the batches of asks. Of those, `map_rebase` 333, `judge_submission` 226, and
+`build_increment` 241 inside those two. Rebases, 60,000 a run against 34,000 submits, cost the owner more than the
+verdicts do.
