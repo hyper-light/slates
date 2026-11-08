@@ -2180,6 +2180,8 @@ pub(crate) fn serve_install(
   peer: HostId,
   request: &[u8],
 ) -> Vec<u8> {
+  // Diag only (live-durability-53, never on main).
+  let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("LD-SERVE wall_ns {} install bytes {}\n", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos()), request.len()).as_bytes());
   let object = slates_db::live::object_of_state(request);
   let bound = match admitted(state, local, peer, object) {
     Ok(bound) => bound,
