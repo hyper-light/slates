@@ -1,0 +1,65 @@
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_PREBUILT_NASM': '0'
+warning: aws-lc-sys@0.45.0: Value: 0 is false.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'aarch64-unknown-linux-gnu'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-43fa5e8888459ead/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-43fa5e8888459ead/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-43fa5e8888459ead/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'neon_sha3_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-43fa5e8888459ead/out/out-neon_sha3_check/7dfda64fdf5a526c-neon_sha3_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-43fa5e8888459ead/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running tests/liveness.rs (target/debug/deps/liveness-71c34d5eaf7240cb)
+
+running 9 tests
+test a_daemon_beside_two_spinners_a_core_keeps_beating ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 1656 µs
+slates-server: shard 0 initialized in 2313 µs
+largest beat gap beside 8 spinners: 102.999414ms
+ok
+test a_shard_blocked_in_a_syscall_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 1168 µs
+slates-server: shard 0 initialized in 1813 µs
+slates daemon: shard 1 is wedged: no step, no CPU progress and no wait for a CPU for 1001 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard (syscall): the block began 407µs in, and the beat stopped 1.00647803s after it
+ok
+test a_shard_starved_off_its_cpu_keeps_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 1096 µs
+slates-server: shard 0 initialized in 1691 µs
+slates daemon: shard 1 is starved: no step and no CPU progress for 1001 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+starved shard: 63 spinners, its CPU clock stood still for 3.003360238s at most in 3.005140875s; largest beat gap 90.789046ms
+scheduler reader: /proc task stat state and schedstat run-queue wait; asked once a beat: runnable 29, blocked 0, unread 0; run-queue wait first Some(0) ns, last Some(0) ns
+ok
+test a_slow_blocking_call_shorter_than_a_window_does_not_stop_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 1158 µs
+slates-server: shard 0 initialized in 1801 µs
+slates daemon: the control shard's beat task ran 599 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 7 steps and 6 polls (4 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 1 timers, waited 2 times, spawned 2 tasks and finished 3; 5 tasks live; its longest poll is 500 ms and its timer overrun 0 ms
+largest beat gap through a half-window block: 100.383632ms
+ok
+test a_spinning_shard_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 1075 µs
+slates-server: shard 0 initialized in 1693 µs
+slates daemon: shard 1 is spinning: 1001 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+spinning shard: the beat stopped Some(1.006612227s) after the spin began
+ok
+test a_starved_poll_on_the_control_shard_does_not_stop_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 1079 µs
+slates-server: shard 0 initialized in 1713 µs
+slates daemon: the control shard's beat task ran 1607 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 7 steps and 6 polls (4 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 2 timers, waited 2 times, spawned 2 tasks and finished 3; 5 tasks live; its longest poll is 1507 ms and its timer overrun 0 ms
+largest beat gap through a starved poll: 101.500121ms
+ok
+test a_stopped_daemon_does_not_say_its_control_loop_ended ... ok
+test a_stopping_daemon_role ... ignored, a role: run by a_stopped_daemon_does_not_say_its_control_loop_ended in a child process
+test a_wedged_shard_stops_the_beat ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 1089 µs
+slates-server: shard 0 initialized in 1668 µs
+slates daemon: shard 1 is wedged: no step, no CPU progress and no wait for a CPU for 1002 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard (wedged): the block began 381µs in, and the beat stopped 1.006984908s after it
+ok
+
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 19.01s
+
