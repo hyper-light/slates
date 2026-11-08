@@ -158,6 +158,23 @@
 > Open: no process test yet takes over an old incarnation's volume after its replacement's key arrived (the retired
 > key's path). Bug record `docs/bugs/2026-11-07-a-node-back-at-its-anchor-with-fresh-ram-had-every-pair-key-refused.md`.
 
+> **Fixed (live-durability, 2026-11-08): an OS socket awaited on the simulation driver woke only on its timers.**
+> The simulation driver took a readiness wait's handle for a fabric port, so an OS socket bound off a shard waited
+> on the fabric port of its descriptor's number, where nothing arrives. `crates/cluster/tests/live.rs` bound its
+> sessions that way, and everything it showed about the fabric's timing came from its probe timeouts. A wait on a
+> driver that cannot watch the socket is now refused, typed (`UdpSocket::readable`, `writable`), and the test binds
+> on the shard and asserts its datagrams crossed the fabric. Only that file was affected (a sweep of rt, transport,
+> cluster and the server's lib); its two tests' assertions hold on the fabric
+> (`docs/bugs/2026-11-08-an-os-socket-awaited-on-the-simulation-driver-woke-only-on-its-timers.md`).
+
+> **Explained (live-durability, 2026-11-08): on the simulated fabric a 60 KB request crossed a slow link in 47.7 s.**
+> One `Endpoint::request` was made after a 256 kbit/s link with a 1 MiB queue was added, mid-session, to both
+> directions. It was answered after 47,661 ms of virtual time. The path set no MTU, so path-MTU discovery climbed to
+> 65,512-byte datagrams (13 probes, 12 acknowledged). Each such datagram takes 2.05 s to cross the link, and the data
+> went in datagrams that size as well. The queue peaked at 132 KB, never near its 1 MiB. With the path's MTU at
+> 1,200 bytes the same request took 2,563 ms (the 60 KB alone is 1.9 s at the link's rate), and the queue peaked at
+> 9,672 bytes. A fabric path at a WAN rate wants an MTU; real ones have one.
+
 > **Fixed (live-durability, 2026-11-08): the transport fell a session to the 1,200-byte MTU floor on loss every size
 > suffered (A-253, §4.10a, RFC 8899 §4.3).** Three consecutive above-floor losses, or three probe timeouts while a
 > full-size packet was out, declared a black hole, so a SIGSTOPped peer or a burst a full receive buffer dropped left a
@@ -1458,10 +1475,11 @@
 > and f=2, Agreement, NoLoss, StaleNeverCommits and Convergence held, each check red under a mutation; §4.10 status).
 > Over the fleet transport (`crates/cluster/src/live.rs`) a live-shipped write is durable on two hosts in 17–20 µs at
 > the median for 64 B and 23–27 µs for 4 KiB, every quiet p99 under 1 ms (64 KiB: 160–292 µs), unchanged with one
-> holder dead (BENCHMARKS "Live shipping over the transport"). Open, found on the way: on the simulated fabric one
-> session's round trip grew about 1.7 times an exchange over sequential exchanges (9, 14, 23 … 621 ms of virtual time,
-> nine writes, `crates/cluster/tests/live.rs`), which the real runtime does not show; it is unexplained and owes a
-> failing test in the transport. The policy is built: `slates live-ship ID [--off]` records it on the owner partition,
+> holder dead (BENCHMARKS "Live shipping over the transport"). Found on the way, and explained 2026-11-08: a
+> session's round trip in `crates/cluster/tests/live.rs` grew about 1.7 times an exchange (9, 14, 23 … 621 ms of virtual
+> time). That test's sockets were OS sockets, which the simulation driver never watched, so its sessions were woken
+> only by their timers (`docs/bugs/2026-11-08-an-os-socket-awaited-on-the-simulation-driver-woke-only-on-its-timers.md`).
+> Bound on the fabric, each write takes no virtual time. The policy is built: `slates live-ship ID [--off]` records it on the owner partition,
 > `list` shows it, the catalog register carries it, and the db model test recovers it
 > (`crates/server/tests/live_ship.rs`). The daemon ships (2026-11-05, §4.10 status "slice one"): across three real
 > daemon processes a live volume's writes reach both candidates and become durable (`crates/cli/tests/live_fleet.rs`,
