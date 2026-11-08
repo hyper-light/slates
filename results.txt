@@ -1,0 +1,144 @@
+runner ubuntu-24.04-arm, 4 CPUs, Sun Nov  8 14:01:07 UTC 2026, commit 6040cbd6
+== cargo test --locked -q -p slates-wire
+test result: ok. 35 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.59s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-db
+test result: ok. 63 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.08s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.09s
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 35.54s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.81s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.05s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.63s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-anchor -- --test-threads=1
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 19 passed; 0 failed; 10 ignored; 0 measured; 0 filtered out; finished in 0.85s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-server --lib
+test result: ok. 217 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 1.38s
+== exit 0
+== cargo test --locked -q -p slates-server --test consumers
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+== exit 0
+== cargo test --locked -q -p slates-cli --bins
+test result: ok. 50 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.21s
+== exit 0
+== cargo test --locked -q -p slates-server --test ack_release
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.65s
+== exit 0
+== cargo test --locked -q -p slates-server --test attach_forms
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.32s
+== exit 0
+== cargo test --locked -q -p slates-server --test attachment_term
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.39s
+== exit 0
+== cargo test --locked -q -p slates-server --test checkout
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.57s
+== exit 0
+== cargo test --locked -q -p slates-server --test cross_shard_wait
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.94s
+== exit 0
+== cargo test --locked -q -p slates-server --test daemon
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.62s
+== exit 0
+== cargo test --locked -q -p slates-server --test dump_exclusion
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-server --test fleet
+test result: ok. 109 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 590.26s
+== exit 0
+== cargo test --locked -q -p slates-server --test forward_retry
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.69s
+== exit 0
+== cargo test --locked -q -p slates-server --test fuse_idle
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.93s
+== exit 0
+== cargo test --locked -q -p slates-server --test fuse_mount
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.59s
+== exit 0
+== cargo test --locked -q -p slates-server --test fuse_told
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.94s
+== exit 0
+== cargo test --locked -q -p slates-server --test give_back
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-server --test green_checkpoint
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.09s
+== exit 0
+== cargo test --locked -q -p slates-server --test green_fairness
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.83s
+== exit 0
+== cargo test --locked -q -p slates-server --test green_post_state
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+== exit 0
+== cargo test --locked -q -p slates-server --test green_retention
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s
+== exit 0
+== cargo test --locked -q -p slates-server --test landing_fairness
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 748.37s
+== exit 0
+== cargo test --locked -q -p slates-server --test lease
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.56s
+== exit 0
+== cargo test --locked -q -p slates-server --test live_ship
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+== exit 0
+== cargo test --locked -q -p slates-server --test liveness
+test result: ok. 6 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 5.24s
+== exit 0
+== cargo test --locked -q -p slates-server --test merge_load
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.44s
+== exit 0
+== cargo test --locked -q -p slates-server --test nfs_hostile
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.74s
+== exit 0
+== cargo test --locked -q -p slates-server --test nfs_mount
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.22s
+== exit 0
+== cargo test --locked -q -p slates-server --test nfs_tls
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+== exit 0
+== cargo test --locked -q -p slates-server --test nfs_v4_kernel
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-server --test nfs_writeback
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.30s
+== exit 0
+== cargo test --locked -q -p slates-server --test observe
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.67s
+== exit 0
+== cargo test --locked -q -p slates-server --test pin_fairness
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.30s
+== exit 0
+== cargo test --locked -q -p slates-server --test presentation_fairness
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.79s
+== exit 0
+== cargo test --locked -q -p slates-server --test presentations
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+== exit 0
+== cargo test --locked -q -p slates-server --test recovery
+test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 39.24s
+== exit 0
+== cargo test --locked -q -p slates-server --test seal
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
+== exit 0
+== cargo test --locked -q -p slates-server --test shards
+test result: ok. 23 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 19.43s
+== exit 0
+== cargo test --locked -q -p slates-server --test snapshot_landing
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.68s
+== exit 0
+== cargo test --locked -q -p slates-server --test virtiofs
+test result: ok. 28 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.11s
+== exit 0
