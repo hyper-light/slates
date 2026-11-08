@@ -4049,6 +4049,7 @@ fn dial_fault_counter(error: &EndpointError) -> &'static str {
     EndpointError::Closed => "fleet.dial.fault.closed",
     EndpointError::Admission(_) => "fleet.dial.fault.admission",
     EndpointError::PeerParameters(_) => "fleet.dial.fault.peer_parameters",
+    EndpointError::PeerClosed => "fleet.dial.fault.peer_closed",
     _ => "fleet.dial.fault.other",
   }
 }

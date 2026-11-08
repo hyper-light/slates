@@ -5344,7 +5344,8 @@ submitted to it) so no exchange waits for another's.
 >   gave up on a dialer's repeats, a count that load spends, and the dialer then waited out two 22 s confirmation deadlines
 >   before redialing (record `docs/bugs/2026-11-08-an-accepting-end-gave-up-on-repeats-and-its-dialer-waited-out-two-deadlines.md`).
 >   `fleet.dial.stall.<reason>` and `fleet.accept.stall.<reason>` name which bound ends a handshake. Still open: an
->   accepting end gives up silently, so a dialer waits out one deadline (RFC 9000 §10.2.3's immediate close). Formation adds no
+>   accepting end gave up silently, so a dialer waited out one deadline: it now sends a close sealed under the Handshake
+  keys, and the dialer redials within a round trip (A-258, RFC 9000 §10.2.3). Formation adds no
 >   evidence for the shared session; the `live_ship` polls above are one dump from a build without the link fix.
 
 ### 2026-09-29: a lone owner refused its own objects — fixed; campaign counters added for the open KIND items

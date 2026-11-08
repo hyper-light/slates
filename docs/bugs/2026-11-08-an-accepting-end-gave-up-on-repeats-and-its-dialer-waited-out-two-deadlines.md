@@ -47,6 +47,6 @@ at most one probe timeout is a time bound. It remains a shape constant, sized to
 - `a_dialer_whose_peer_never_confirms_reports_a_confirmation_stall` and
   `a_handshake_that_gives_up_names_the_bound_it_reached`.
 
-**Not fixed here.** The accepting end still gives up silently, so a dialer waits out one 22 s deadline for an end that has
-gone. RFC 9000 §10.2.3 has an abandoning end send CONNECTION_CLOSE at the keys the peer may hold; this transport has no such
-message yet.
+**Then also fixed (A-258).** The accepting end gave up silently, so a dialer waited out one 22 s deadline for an end that had
+gone. It now sends a close sealed under the Handshake keys (RFC 9000 §10.2.3), and the dialer ends `PeerClosed` within a
+round trip; a close that does not open under those keys is ignored.

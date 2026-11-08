@@ -184,6 +184,9 @@ pub enum EndpointError {
   Closed,
   /// The authenticated peer exceeded its session reservation, or admission capacity is invalid.
   Admission(crate::demux::SessionRefusal),
+  /// The accepting end abandoned the handshake and said so in a close sealed under the Handshake keys (RFC 9000
+  /// §10.2.3): its half is gone, so the dialer dials afresh at once rather than waiting out its deadline.
+  PeerClosed,
   /// This end's handshake flight exceeds the largest flight the fragmenter carries
   /// (`crate::flight::MAX_FLIGHT_BYTES`): a certificate chain beyond a generous bound. Refused here,
   /// typed, before a byte leaves. Below that a flight of any size crosses as fragments each fitting the
@@ -488,6 +491,8 @@ pub struct Endpoint {
   handshake_budgets_spent: u32,
   /// Why the last `establish` ended `NotReady`; `None` before any did, and once one succeeds.
   handshake_stall: Option<HandshakeStall>,
+  /// Closes sent on abandoning a handshake ([`Endpoint::close_abandoned_handshake`]).
+  closes_sent: u64,
   /// Datagrams an established session discarded rather than folded — a raw handshake retransmit, a
   /// packet naming another session, one that did not open under the keys (RFC 9000 §12.2: an
   /// undecryptable packet is discarded, never fatal). A counter, so a test can assert the discard path
@@ -570,6 +575,7 @@ impl Endpoint {
       hs_sent: 0,
       handshake_budgets_spent: 0,
       handshake_stall: None,
+      closes_sent: 0,
       discarded: 0,
       exchanges: BTreeMap::new(),
       by_stream: BTreeMap::new(),
@@ -618,6 +624,7 @@ impl Endpoint {
       hs_sent: 0,
       handshake_budgets_spent: 0,
       handshake_stall: None,
+      closes_sent: 0,
       discarded: 0,
       exchanges: BTreeMap::new(),
       by_stream: BTreeMap::new(),
@@ -668,6 +675,7 @@ impl Endpoint {
       hs_sent: 0,
       handshake_budgets_spent: 0,
       handshake_stall: None,
+      closes_sent: 0,
       discarded: 0,
       exchanges: BTreeMap::new(),
       by_stream: BTreeMap::new(),
@@ -873,10 +881,55 @@ impl Endpoint {
     self.handshake_stall
   }
 
-  /// Records why this handshake is giving up, and the typed refusal that says so.
+  /// Records why this handshake is giving up, and the typed refusal that says so. An accepting end also tells its peer.
   fn stalled(&mut self, why: HandshakeStall) -> EndpointError {
     self.handshake_stall = Some(why);
+    self.close_abandoned_handshake();
     EndpointError::NotReady
+  }
+
+  /// An accepting end abandoning its handshake tells its dialer, in a close sealed under the Handshake keys (RFC 9000
+  /// §10.2.3), so the dialer redials within a round trip instead of waiting out a 22 s deadline on state that is gone.
+  /// Only once it holds those keys: before them it has answered nothing, and an unprotected close at the Initial level
+  /// is not sent, since a stranger could forge one and cost the dialer its socket. A dialer sends none: it may yet retry on
+  /// this socket. Within the anti-amplification allowance (RFC 9000 §8.1), which a received flight leaves ample.
+  fn close_abandoned_handshake(&mut self) {
+    if self.quic.is_client() {
+      return;
+    }
+    let Some(keys) = self.levels.keys.as_ref() else {
+      return;
+    };
+    let Ok(close) = crate::flight::seal_close(keys.local.packet.as_ref(), &mut self.levels.numbers)
+    else {
+      return;
+    };
+    if let Some(account) = self.amplification.as_mut()
+      && !account.allow(close.len())
+    {
+      self.amplification_holds = self.amplification_holds.saturating_add(1);
+      return;
+    }
+    if self.send(&close).is_ok() {
+      self.closes_sent = self.closes_sent.saturating_add(1);
+    }
+  }
+
+  /// Whether `datagram`, from this end's peer, is a close sealed under the Handshake keys: the peer abandoned.
+  fn is_peer_close(&self, datagram: &[u8], from: SocketAddrV4) -> bool {
+    from == self.peer
+      && crate::flight::is_sealed_close(datagram)
+      && self
+        .levels
+        .keys
+        .as_ref()
+        .is_some_and(|keys| crate::flight::open_close(datagram, keys.remote.packet.as_ref()))
+  }
+
+  /// Closes this end sent to a dialer on abandoning its handshake: a non-vacuity counter for
+  /// [`Self::close_abandoned_handshake`].
+  pub fn closes_sent(&self) -> u64 {
+    self.closes_sent
   }
 
   /// How many handshake budgets this end has spent without establishing: zero once established, one more
@@ -984,6 +1037,9 @@ impl Endpoint {
     loop {
       let period = backoff.min(self.handshake_probe_ceiling());
       match self.recv_within(period).await? {
+        Some((datagram, from)) if self.is_peer_close(&datagram, from) => {
+          return Err(EndpointError::PeerClosed);
+        }
         Some((datagram, from)) => match self.receive_handshake(datagram, from) {
           // A whole flight this end has not consumed: feed it to `read_hs` below.
           crate::flight::Reassembly::Flight(flight) => return Ok(flight),
@@ -1093,6 +1149,9 @@ impl Endpoint {
       }
       let period = backoff.min(self.handshake_probe_ceiling()).min(remaining);
       match self.recv_within(period).await? {
+        Some((datagram, from)) if self.is_peer_close(&datagram, from) => {
+          return Err(EndpointError::PeerClosed);
+        }
         Some((datagram, from)) => {
           // A packet that unprotects under the 1-RTT keys is the server's confirmation: it has its keys,
           // so it received our final flight, and the handshake is complete both ways.

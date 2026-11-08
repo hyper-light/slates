@@ -2021,6 +2021,150 @@ fn a_dialer_whose_peer_never_confirms_reports_a_confirmation_stall() {
   );
 }
 
+/// What a relay between a dialer and an accepting end does once the accepting end has answered.
+#[derive(Clone, Copy)]
+enum AfterAnswer {
+  /// Floods the accepting end with datagrams that make no flight, so it abandons, and passes what it sends.
+  FloodTheAcceptingEnd,
+  /// Drops what the accepting end sends, and sends the dialer closes nobody sealed.
+  ForgeClosesToTheDialer,
+}
+
+/// Shape: how many forged closes [`dial_through_relay`] sends, a simulated millisecond apart.
+const FORGED_CLOSES: usize = 64;
+
+/// A dialer's `establish` through a relay that passes the handshake until the accepting end answers and then does
+/// `after`. Its outcome, the simulated time it took, and the closes the accepting end sent.
+fn dial_through_relay(after: AfterAnswer) -> (String, u64, u64) {
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = *sim.shard_ids().first().unwrap();
+  let dialer_identity = self_signed(NAME);
+  let accepting_identity = self_signed(NAME);
+  let dialer_certificate = dialer_identity.certificate();
+  let accepting_certificate = accepting_identity.certificate();
+  let (relay_for_dialer_tx, relay_for_dialer_rx) = channel();
+  let (relay_for_accepting_tx, relay_for_accepting_rx) = channel();
+  let (dialer_port_tx, dialer_port_rx) = channel();
+  let (accepting_port_tx, accepting_port_rx) = channel();
+  let (done_tx, done_rx) = channel::<()>();
+  let (dialer_tx, dialer_rx) = channel();
+  let (closes_tx, closes_rx) = channel();
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = dialer_port_tx.send(socket.local_addr().unwrap().port());
+      let relay = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(relay_for_dialer_rx).await);
+      let mut dialer = Endpoint::client(
+        socket,
+        relay,
+        &dialer_identity,
+        &accepting_certificate,
+        NAME,
+        shape(),
+      )
+      .unwrap();
+      let began = slates_rt::futures::now_ns();
+      let outcome = dialer.establish().await;
+      let took = slates_rt::futures::now_ns().saturating_sub(began);
+      let _ = dialer_tx.send((format!("{outcome:?}"), took));
+      let _ = done_tx.send(());
+    })
+    .unwrap();
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = accepting_port_tx.send(socket.local_addr().unwrap().port());
+      let relay = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(relay_for_accepting_rx).await);
+      let mut accepting = Endpoint::server(
+        socket,
+        relay,
+        &accepting_identity,
+        std::slice::from_ref(&dialer_certificate),
+        shape(),
+      )
+      .unwrap();
+      let _ = accepting.establish().await;
+      let _ = closes_tx.send(accepting.closes_sent());
+    })
+    .unwrap();
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let port = socket.local_addr().unwrap().port();
+      let _ = relay_for_dialer_tx.send(port);
+      let _ = relay_for_accepting_tx.send(port);
+      let dialer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(dialer_port_rx).await);
+      let accepting = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(accepting_port_rx).await);
+      let mut answered = false;
+      let mut forged = 0usize;
+      let mut buffer = [0u8; 2048];
+      while done_rx.try_recv().is_err() {
+        if answered {
+          match after {
+            AfterAnswer::FloodTheAcceptingEnd => {
+              for _ in 0..FLOOD_BURST_DATAGRAMS {
+                let _ = socket.send_to(&[0xFFu8; 64], accepting);
+              }
+            }
+            AfterAnswer::ForgeClosesToTheDialer if forged < FORGED_CLOSES => {
+              forged += 1;
+              let mut close = vec![0x82u8];
+              close.extend_from_slice(&u32::try_from(forged).unwrap().to_le_bytes());
+              close.extend_from_slice(&[0x01; 17]);
+              let _ = socket.send_to(&close, dialer);
+            }
+            AfterAnswer::ForgeClosesToTheDialer => {}
+          }
+        }
+        let Some(Ok((length, from))) = within(FLOOD_PAUSE_NS, socket.recv_from(&mut buffer)).await
+        else {
+          continue;
+        };
+        let datagram = buffer.get(..length).unwrap();
+        if from == accepting {
+          answered = true;
+          if matches!(after, AfterAnswer::FloodTheAcceptingEnd) {
+            let _ = socket.send_to(datagram, dialer);
+          }
+        } else if !answered {
+          let _ = socket.send_to(datagram, accepting);
+        }
+      }
+    })
+    .unwrap();
+  sim.run_until_idle();
+  let (outcome, took) = dialer_rx.try_recv().unwrap();
+  (outcome, took, closes_rx.try_recv().unwrap_or(0))
+}
+
+/// RFC 9000 §10.2.3: an accepting end that abandons its handshake says so in a close sealed under the Handshake keys,
+/// and its dialer ends at once instead of waiting out its 22 s deadline on a half that is gone (the second of the two
+/// waits in a 41.9 s formation at load 170, 2026-11-08). Do: let the accepting end answer, then flood it until it
+/// abandons. Expect: it sent one close, and the dialer's `establish` ended `PeerClosed` within a simulated second.
+#[test]
+fn a_dialer_hears_its_peer_abandon_the_handshake_within_a_round_trip() {
+  let (outcome, took, closes) = dial_through_relay(AfterAnswer::FloodTheAcceptingEnd);
+  assert_eq!(closes, 1, "the accepting end said it abandoned");
+  assert_eq!(outcome, "Err(PeerClosed)");
+  assert!(
+    took < 1_000_000_000,
+    "the dialer heard it at once, not at its deadline: {took} ns"
+  );
+}
+
+/// Hostile input on the same path: a close that no one sealed under the Handshake keys is ignored, so a stranger cannot
+/// cost a dialer its socket. Do: after the accepting end answers, drop everything it sends and send the dialer closes
+/// that are well formed in shape but not sealed. Expect: the dialer ends on its own deadline, never `PeerClosed`.
+#[test]
+fn a_dialer_ignores_a_close_no_one_sealed() {
+  let (outcome, took, _) = dial_through_relay(AfterAnswer::ForgeClosesToTheDialer);
+  assert_eq!(outcome, "Err(NotReady)");
+  assert!(
+    took > 1_000_000_000,
+    "it waited out its own deadline: {took} ns"
+  );
+}
+
 /// AC (§4.8 formation; RFC 9002 §6.2 the probe timeout retransmits the pending flight): a dialer whose
 /// first `establish` ran out its retransmit budget against a peer that **lost every flight** (not listening
 /// yet: the fleet's boot-ordering shape, played here by the peer discarding everything queued before it

@@ -149,6 +149,65 @@ pub fn is_sealed_fragment(datagram: &[u8]) -> bool {
   !is_short_header(datagram) && datagram.first() == Some(&SEALED_FRAGMENT_TAG)
 }
 
+/// Format: the first byte of a **sealed close**: an accepting end that abandons its handshake tells its dialer so, sealed
+/// under the Handshake keys (RFC 9000 §10.2.3's immediate close during the handshake). The fixed bit clear and the high
+/// bit set, as the fragment tags, and distinct from both. Never sent unprotected: a close anyone could forge would let a
+/// stranger cost a dialer its socket.
+pub const SEALED_CLOSE_TAG: u8 = 0x82;
+/// Format: the one byte a sealed close's body carries, so an opened close is told from an opened fragment.
+const CLOSE_BODY: u8 = 0x01;
+
+/// Whether `datagram` is shaped as a sealed close. Whether it is one is [`open_close`]'s to say.
+pub fn is_sealed_close(datagram: &[u8]) -> bool {
+  !is_short_header(datagram) && datagram.first() == Some(&SEALED_CLOSE_TAG)
+}
+
+/// Seals a close under `key`, numbered `next_number` (advanced, so no nonce is used twice under the key the sealed
+/// fragments share).
+pub fn seal_close(
+  key: &dyn rustls::quic::PacketKey,
+  next_number: &mut u32,
+) -> Result<Vec<u8>, SealRefusal> {
+  let number = *next_number;
+  *next_number = number.checked_add(1).ok_or(SealRefusal::NumbersExhausted)?;
+  let mut datagram = Vec::with_capacity(
+    SEALED_HEADER
+      .saturating_add(1)
+      .saturating_add(key.tag_len()),
+  );
+  datagram.push(SEALED_CLOSE_TAG);
+  datagram.extend_from_slice(&number.to_le_bytes());
+  let mut body = vec![CLOSE_BODY];
+  let tag = key
+    .encrypt_in_place(u64::from(number), &datagram, &mut body)
+    .map_err(|_| SealRefusal::Sealing)?;
+  datagram.extend_from_slice(&body);
+  datagram.extend_from_slice(tag.as_ref());
+  Ok(datagram)
+}
+
+/// Whether `datagram` is a close sealed under `key`. A forged, tampered, truncated or other-keyed one is not, and is
+/// dropped like any datagram that does not open.
+pub fn open_close(datagram: &[u8], key: &dyn rustls::quic::PacketKey) -> bool {
+  if !is_sealed_close(datagram) {
+    return false;
+  }
+  let (Some(header), Some(number), Some(sealed)) = (
+    datagram.get(..SEALED_HEADER),
+    datagram.get(1..SEALED_HEADER),
+    datagram.get(SEALED_HEADER..),
+  ) else {
+    return false;
+  };
+  let Ok(number) = <[u8; SEALED_NUMBER_BYTES]>::try_from(number) else {
+    return false;
+  };
+  let mut body = sealed.to_vec();
+  key
+    .decrypt_in_place(u64::from(u32::from_le_bytes(number)), header, &mut body)
+    .is_ok_and(|plain| plain == [CLOSE_BODY])
+}
+
 /// Why a flight could not be sealed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SealRefusal {
@@ -380,6 +439,79 @@ mod tests {
   /// AUD-29-47 (the sealed codec, by use): do: seal a multi-fragment flight from the client's keys and open
   /// every fragment with the server's; expect the plain fragments back, the reassembled flight equal to the
   /// original, numbers advanced one per fragment, and no plaintext byte of the flight on the wire.
+  /// A close sealed by the server's end, with the keys both ends hold: (sealed close, client keys, server keys).
+  fn a_sealed_close() -> (Vec<u8>, rustls::quic::Keys, rustls::quic::Keys) {
+    let (client, server) = (
+      keys(b"cid", rustls::Side::Client),
+      keys(b"cid", rustls::Side::Server),
+    );
+    let mut numbers = 0u32;
+    let close = seal_close(server.local.packet.as_ref(), &mut numbers).unwrap();
+    assert_eq!(
+      numbers, 1,
+      "a close uses a number of the counter the sealed fragments share"
+    );
+    (close, client, server)
+  }
+
+  /// RFC 9000 §10.2.3 under this dialect's keys: a close sealed by one end opens at the other and under no other keys.
+  /// Do: open a sealed close under the peer's keys, its own end's, and another connection's. Expect: only the first.
+  #[test]
+  fn a_sealed_close_opens_only_under_its_peers_keys() {
+    let (close, client, server) = a_sealed_close();
+    assert!(open_close(&close, client.remote.packet.as_ref()));
+    assert!(
+      !open_close(&close, server.remote.packet.as_ref()),
+      "its own end's keys"
+    );
+    let other = keys(b"other", rustls::Side::Client);
+    assert!(
+      !open_close(&close, other.remote.packet.as_ref()),
+      "another connection's keys"
+    );
+    assert!(
+      open(&close, client.remote.packet.as_ref()).is_none(),
+      "a close is no fragment"
+    );
+  }
+
+  /// Hostile input: a close that is not whole does not open. Do: open it truncated at every length and with each byte
+  /// flipped. Expect: none opens.
+  #[test]
+  fn a_truncated_or_altered_close_does_not_open() {
+    let (close, client, _) = a_sealed_close();
+    let key = client.remote.packet;
+    for cut in 0..close.len() {
+      assert!(
+        !open_close(close.get(..cut).unwrap(), key.as_ref()),
+        "truncated at {cut}"
+      );
+    }
+    for index in 0..close.len() {
+      let mut flipped = close.clone();
+      if let Some(byte) = flipped.get_mut(index) {
+        *byte ^= 0x01;
+      }
+      assert!(!open_close(&flipped, key.as_ref()), "byte {index} flipped");
+    }
+  }
+
+  /// Hostile input: a fragment sealed under the right keys is no close, even under the close's tag. Do: open a sealed
+  /// fragment as a close, as it is and retagged. Expect: neither opens.
+  #[test]
+  fn a_sealed_fragment_is_no_close() {
+    let (_, client, server) = a_sealed_close();
+    let mut numbers = 1u32;
+    let sealed_fragment = seal(b"flight", 0, server.local.packet.as_ref(), &mut numbers).unwrap();
+    let fragment = sealed_fragment.first().unwrap();
+    assert!(!open_close(fragment, client.remote.packet.as_ref()));
+    let mut retagged = fragment.clone();
+    if let Some(first) = retagged.first_mut() {
+      *first = SEALED_CLOSE_TAG;
+    }
+    assert!(!open_close(&retagged, client.remote.packet.as_ref()));
+  }
+
   #[test]
   fn sealed_fragments_open_to_the_flight_and_hide_it() {
     let (client, server) = (
