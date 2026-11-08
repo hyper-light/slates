@@ -7484,10 +7484,17 @@ impl MappedThroughAMount {
   /// that leave a map's stores unsynced are.
   #[cfg(any(target_os = "linux", target_os = "macos"))]
   fn sync_map(&mut self) {
-    // SAFETY: syncs exactly the live map made in `with_pages`.
-    let synced =
-      unsafe { rustix::mm::msync(self.map.cast(), self.length, rustix::mm::MsyncFlags::SYNC) };
+    let synced = self.try_sync_map();
     assert!(synced.is_ok(), "the map is flushed: {synced:?}");
+  }
+
+  /// Syncs the map, then its file: the first error either reports, as a program sees a refused write-back (A-248) at
+  /// its `msync` or its `fsync`.
+  #[allow(clippy::disallowed_methods)] // the test's own fsync of a file in a slates mount: RAM, not disk
+  fn try_sync_map(&mut self) -> Result<(), rustix::io::Errno> {
+    // SAFETY: syncs exactly the live map made in `with_pages`.
+    unsafe { rustix::mm::msync(self.map.cast(), self.length, rustix::mm::MsyncFlags::SYNC) }?;
+    rustix::fs::fsync(&self.file)
   }
 
   /// `map.bin` as slates itself holds it, read through the fixture's SDK client: no mount's cache in the way.
@@ -7854,17 +7861,18 @@ fn a_shared_map_a_second_mount_and_the_sdk_agree_with_the_volume_through_a_gener
   );
 }
 
-/// §4.6 cache posture, the mount route's dirty pages
-/// (`docs/bugs/2026-10-21-a-dirty-shared-map-page-overwrites-a-later-write-through-another-path.md`). A store through a
-/// shared map leaves its page dirty in that mount's cache until the kernel writes it back — which is what a guest's DAX
-/// stores are on the host — and a write another path made meanwhile must not be undone by that write-back. Do: store a
-/// byte through the map and leave it unsynced; replace the whole file through the SDK; sync the map. Expect every byte
-/// the replacement's, in slates and in the map. Then store again, write other bytes of the same page through a second
-/// mount, sync. Expect both: the store and the second mount's bytes, as one shared page cache would hold them.
+/// §4.6 cache posture, the mount route's dirty pages (A-248, Ada's decision of 2026-11-07: "Refuse, like NFS";
+/// `docs/bugs/2026-10-21-a-dirty-shared-map-page-overwrites-a-later-write-through-another-path.md`). A store through a
+/// shared map leaves its page dirty in that mount's cache until the kernel writes it back, which is what a guest's DAX
+/// stores are on the host, and a write another path made meanwhile must never be undone by that write-back. Since
+/// A-248 a write-back holding any stale byte that differs from the file is refused whole, `EIO`, which the program sees
+/// at its `msync` or `fsync`: never applied around the stale bytes, which was a merge (banned item 11). Do: store a byte
+/// through the map and leave it unsynced; replace the whole file through the SDK; sync the map. Expect every byte the
+/// replacement's and the sync refused. Then, once the map reads the replacement, store and sync (the control: applied
+/// whole). Then store again, write other bytes of the same page through a second mount, sync. Expect the file the
+/// control's and the second mount's bytes, the second store not applied, and the sync refused.
 ///
-/// Linux only. On macOS an NFS v3 client cannot be told of the other write, and since A-192 the server refuses the dirty
-/// page's stale write-back: the replacement survives (the test after this one), but the store goes with the refusal,
-/// and keeping both, as the second half here does, would take a byte-level merge, which is banned.
+/// Linux only: on macOS the NFS v3 mount does the same since A-192 (the test after this one).
 #[cfg(target_os = "linux")]
 #[test]
 fn a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path() {
@@ -7876,29 +7884,43 @@ fn a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path() {
   let length = fixture.length;
   fixture.view()[10] = b'M';
   fixture.replace_through_slates(b'S');
-  fixture.sync_map();
+  let stale_whole = fixture.try_sync_map();
   assert!(
     fixture.volume_bytes() == vec![b'S'; length],
     "the later replacement survives the dirty page's write-back"
+  );
+  assert!(
+    stale_whole.is_err(),
+    "the write-back of a page the replacement made stale is refused, and the sync says so: {stale_whole:?}"
   );
   assert!(
     fixture.follows(b'S'),
     "the map reads the replacement within {WAIT_FOR:?}"
   );
   fixture.view()[10] = b'M';
-  let written = 100..200;
-  second.write_at(written.start, &vec![b'R'; written.len()]);
-  fixture.sync_map();
+  let fresh = fixture.try_sync_map();
   let mut expected = vec![b'S'; length];
   expected[10] = b'M';
+  assert!(
+    fresh.is_ok() && fixture.volume_bytes() == expected,
+    "a write-back of a page fetched after the replacement is applied whole: {fresh:?}"
+  );
+  fixture.view()[20] = b'N';
+  let written = 100..200;
+  second.write_at(written.start, &vec![b'R'; written.len()]);
+  let stale_part = fixture.try_sync_map();
   expected[written.clone()].fill(b'R');
   assert!(
     fixture.volume_bytes() == expected,
-    "the store and the second mount's later bytes on the same page are both kept"
+    "the second mount's bytes are kept and the stale page's store is not applied around them"
+  );
+  assert!(
+    stale_part.is_err(),
+    "the write-back of a page another mount changed is refused whole, and the sync says so: {stale_part:?}"
   );
   assert!(
     fixture.follows_bytes(&expected),
-    "the map reads both within {WAIT_FOR:?}"
+    "the map reads the file as slates holds it within {WAIT_FOR:?}"
   );
 }
 

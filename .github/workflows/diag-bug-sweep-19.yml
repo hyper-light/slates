@@ -1,0 +1,70 @@
+name: DIAG bug-sweep 19, A-248 on Linux with the fix (not for main)
+
+# A diagnostics branch, never merged. A-248 refuses a FUSE cache write-back whole when a stale byte differs from the
+# file's ("Refuse, like NFS"). The supervisor's gate, on both arches: the bridge-fuse suites, the server's FUSE suites,
+# fuse_mount, the CLI suite with the rewritten dirty-page test, and the conformance suites (pjdfstest, fsx, fsstress)
+# over every Linux transport, native-linux-fuse among them. Each step runs whatever the one before answered.
+
+on:
+  push:
+    branches: [diag-bug-sweep-19]
+
+jobs:
+  a248:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    env:
+      CARGO_INCREMENTAL: "0"
+      SLATES_TEST_CLI: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: Suite tools and the operator's grant
+        run: |
+          sudo apt-get update && sudo apt-get install -y strace nfs-common fuse3 inotify-tools ripgrep sqlite3 vim
+          grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+          uname -a
+      - name: The dirty-page test, three runs
+        if: ${{ !cancelled() }}
+        run: |
+          for run in 1 2 3; do
+            cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture --exact \
+              a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path 2>&1 | tee "dirty-$run.log"
+            grep -q "test result: ok. 1 passed" "dirty-$run.log"
+          done
+      - name: bridge-fuse, every suite
+        if: ${{ !cancelled() }}
+        run: cargo test -p slates-bridge-fuse -- --test-threads=1 --nocapture 2>&1 | tail -400
+      - name: The server's FUSE suites and the NFS write-back suite
+        if: ${{ !cancelled() }}
+        run: cargo test -p slates-server --lib --test fuse_mount --test fuse_told --test fuse_idle --test nfs_writeback -- --test-threads=1 2>&1 | tail -200
+      - name: The virtio-fs device (a guest's write-backs)
+        if: ${{ !cancelled() }}
+        run: cargo test -p slates-bridge-virtiofs -- --test-threads=1 2>&1 | tail -200
+      - name: The CLI suite
+        if: ${{ !cancelled() }}
+        run: cargo test -p slates-cli --test cli -- --test-threads=1 2>&1 | tail -200
+      - name: fsx over every Linux transport
+        if: ${{ !cancelled() }}
+        run: cargo xtask conformance run --suite fsx --records target/conformance-records --scratch target/conformance-scratch --keep
+      - name: fsstress over every Linux transport
+        if: ${{ !cancelled() }}
+        run: cargo xtask conformance run --suite fsstress --records target/conformance-records --scratch target/conformance-scratch --keep
+      - name: pjdfstest over every Linux transport, against the reviewed lists
+        if: ${{ !cancelled() }}
+        run: cargo xtask conformance run --suite pjdfstest --records target/conformance-records --scratch target/conformance-scratch --keep
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diag19-records-${{ matrix.os }}
+          path: |
+            target/conformance-records
+            target/conformance-scratch/*/*.log
+            dirty-*.log
+          if-no-files-found: ignore

@@ -101,8 +101,9 @@ struct Report {
   overruns: u64,
   /// `WRITE` requests the kernel sent, write-backs from its page cache included.
   writes: u64,
-  /// Bytes of cache write-backs kept back as stale (the dirty-page write-back rule, A-140).
-  kept_back: u64,
+  /// Cache write-backs refused whole because a stale byte differed from the file's (the dirty-page write-back rule,
+  /// A-248).
+  conflicts: u64,
   /// Cache write-backs refused because which bytes were stale could not be told.
   unknown: u64,
   /// Entry invalidations the kernel refused, as `fuse.entry_invalidation_refused` counts them.
@@ -208,7 +209,7 @@ fn serve(
   let mut reads = 0u64;
   let mut overruns = 0u64;
   let mut writes = 0u64;
-  let mut kept_back = 0u64;
+  let mut conflicts = 0u64;
   let mut unknown = 0u64;
   let mut entry_refusals = 0u64;
   let mut report_pending = false;
@@ -352,7 +353,7 @@ fn serve(
       _ => {}
     }
     overruns += state.take_journal_overruns();
-    kept_back += state.take_writeback_bytes_kept_back();
+    conflicts += state.take_writeback_conflicts();
     unknown += state.take_writebacks_unknown();
     entry_refusals += state.take_entry_invalidations_refused();
     if std::mem::take(&mut report_pending) {
@@ -363,7 +364,7 @@ fn serve(
           reads,
           overruns,
           writes,
-          kept_back,
+          conflicts,
           unknown,
           entry_refusals,
         })
@@ -1048,14 +1049,14 @@ fn write_through_the_mount_at(path: &str, offset: u64, bytes: &[u8]) {
   file.write_all_at(bytes, offset).unwrap();
 }
 
-/// A-144 (§4.6 cache posture; the dirty-page write-back rule, A-140;
+/// A-144 (§4.6 cache posture; the dirty-page write-back rule, A-140 and A-248;
 /// `docs/bugs/2026-10-22-a-direct-read-made-a-stale-cached-page-fresh.md`). A direct READ is answered from the volume
 /// and leaves the kernel's cached page as it was, so it must not make that page's bytes fresh. Do, for a file mapped
 /// shared through the mount with its page faulted in: hold the mount's invalidation rounds; replace the file through
 /// another attachment; [read the page with `O_DIRECT`]; store a byte through the map into the page the kernel still
 /// caches; release the rounds, so the kernel launders the page, and sync the map. Expect the replacement whole in the
-/// volume: without the direct read the stale page's bytes are kept back and the sync succeeds; with it, which bytes are
-/// stale cannot be told, so the write-back is refused and the sync reports it. Run without and then with the direct
+/// volume and the sync refused: without the direct read the stale page's write-back is refused as a conflict (A-248);
+/// with it, which bytes are stale cannot be told, so it is refused as unknown. Run without and then with the direct
 /// read, so it is the only difference. Before A-144 the direct read made the page fresh and its write-back reverted all
 /// 4,096 bytes of the replacement (3 of 3 on the box, 2026-10-22).
 #[test]
@@ -1129,9 +1130,9 @@ fn store_into_a_stale_cached_page(
   }
 }
 
-/// The write-back judged as A-144 says: it reached the mount; without the direct read every byte of the stale page was
-/// kept back and the sync succeeded; with it, the write-back was refused as one the states cannot tell and the sync
-/// reports it; either way the volume holds the replacement whole.
+/// The write-back judged as A-144 and A-248 say: it reached the mount; without the direct read it was refused as a
+/// conflict; with it, as one the states cannot tell; either way the sync reports it and the volume holds the
+/// replacement whole.
 fn judge_the_write_back(
   control: &Loop,
   name: &str,
@@ -1145,10 +1146,10 @@ fn judge_the_write_back(
     synced,
   } = outcome;
   eprintln!(
-    "direct read {direct}: {} WRITE(s) after the store, {} byte(s) kept back, {} refused unknown; the map's sync \
+    "direct read {direct}: {} WRITE(s) after the store, {} refused as conflicts, {} refused unknown; the map's sync \
      {synced:?}",
     written.writes - stored.writes,
-    written.kept_back - stored.kept_back,
+    written.conflicts - stored.conflicts,
     written.unknown - stored.unknown
   );
   assert!(
@@ -1158,11 +1159,11 @@ fn judge_the_write_back(
   let judged = if direct {
     written.unknown > stored.unknown && synced.is_err()
   } else {
-    written.kept_back - stored.kept_back == u64::try_from(page).unwrap() && synced.is_ok()
+    written.conflicts > stored.conflicts && synced.is_err()
   };
   assert!(
     judged,
-    "with the direct read {direct}: without it every stale byte is kept back and the sync succeeds; with it the \
+    "with the direct read {direct}: without it the write-back is refused as a conflict and the sync says so; with it the \
      write-back is refused unknown and the sync says so ({synced:?})"
   );
   let held = control
@@ -1332,9 +1333,10 @@ struct ByteHistory {
 }
 
 impl ByteHistory {
-  /// Whether the volume may hold `value` for this byte after a sync, by the write-back rule (A-140, A-144): the other
+  /// Whether the volume may hold `value` for this byte after a sync, by the write-back rule (A-140, A-144, A-248): the other
   /// path's latest write, or a mount write made after it — never anything older; with no other write, zero or any
-  /// mount write. A mount write may be lost (kept back as stale, or refused unknown); another path's write never is.
+  /// mount write. A mount write may be lost (its write-back refused, a conflict or unknown); another path's write never
+  /// is.
   fn allows(&self, value: u8) -> bool {
     match self.other {
       Some((step, stamp)) => {
@@ -1352,7 +1354,7 @@ impl ByteHistory {
 /// What a generated write-back history exercised, summed over its syncs: the rule's paths, each of which must run.
 #[derive(Clone, Copy, Default)]
 struct WriteBackPaths {
-  kept_back: u64,
+  conflicts: u64,
   unknown: u64,
   direct_reads: u64,
 }
@@ -1422,7 +1424,7 @@ fn writeback_history(control: &Loop, mount_point: &str, seed: u64) -> WriteBackP
   control.ask(Ask::ReleaseGathers);
   check_writeback(control, &mapped, &name, &history, (seed, WRITEBACK_STEPS));
   let end = control.report();
-  paths.kept_back = end.kept_back - start.kept_back;
+  paths.conflicts = end.conflicts - start.conflicts;
   paths.unknown = end.unknown - start.unknown;
   paths
 }
@@ -1460,12 +1462,12 @@ fn check_writeback(
   }
 }
 
-/// A-140 and A-144 under generated histories over a real mount: a shared map of three pages takes stores, the mount
+/// A-140, A-144 and A-248 under generated histories over a real mount: a shared map of three pages takes stores, the mount
 /// writes with `pwrite`, another attachment writes runs, pages are read directly and through the cache, and the
 /// mount's rounds are held and released, so stale cached pages, ambiguous reads and write-backs meet in every order.
 /// Do: three fixed seeds of 80 steps, syncing the map now and then. Expect after every sync: each byte holds the other
 /// path's latest write to it or a mount write made after that, never anything older. Non-vacuous: across the seeds,
-/// stale bytes were kept back, a write-back over unknown bytes was refused, and direct reads were made.
+/// a write-back was refused as a conflict, one over unknown bytes was refused, and direct reads were made.
 #[test]
 fn generated_map_stores_direct_reads_and_other_writes_never_revert_another_paths_write() {
   with_mounted_loop("writeback-chaos", |control, mount_point| {
@@ -1473,17 +1475,17 @@ fn generated_map_stores_direct_reads_and_other_writes_never_revert_another_paths
     for seed in CHAOS_SEEDS {
       let paths = writeback_history(control, mount_point, seed);
       eprintln!(
-        "seed {seed:#x}: {} byte(s) kept back, {} write-back(s) refused unknown, {} direct read(s)",
-        paths.kept_back, paths.unknown, paths.direct_reads
+        "seed {seed:#x}: {} write-back(s) refused as conflicts, {} refused unknown, {} direct read(s)",
+        paths.conflicts, paths.unknown, paths.direct_reads
       );
-      total.kept_back += paths.kept_back;
+      total.conflicts += paths.conflicts;
       total.unknown += paths.unknown;
       total.direct_reads += paths.direct_reads;
     }
     assert!(
-      total.kept_back > 0 && total.unknown > 0 && total.direct_reads > 0,
-      "non-vacuous: stale bytes kept back ({}), unknown write-backs refused ({}) and direct reads made ({})",
-      total.kept_back,
+      total.conflicts > 0 && total.unknown > 0 && total.direct_reads > 0,
+      "non-vacuous: write-backs refused as conflicts ({}), unknown ones refused ({}) and direct reads made ({})",
+      total.conflicts,
       total.unknown,
       total.direct_reads
     );

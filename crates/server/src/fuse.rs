@@ -104,11 +104,15 @@ const RESENT: &str = "fuse.resent";
 /// mount cannot see), or refused to drop an entry it goes on serving, as Linux 6.19 did for a negative entry
 /// (`docs/bugs/2026-10-19-linux-6-19-refuses-the-entry-invalidation-slates-swallows.md`).
 const ENTRY_INVALIDATION_REFUSED: &str = "fuse.entry_invalidation_refused";
-/// Format: bytes of cache write-backs kept back because another path changed them after the kernel's copy was fetched
-/// — each a byte of a stale dirty page that would have undone a later write
-/// (`docs/bugs/2026-10-21-a-dirty-shared-map-page-overwrites-a-later-write-through-another-path.md`). The dirty-page
-/// write-back rule's non-vacuity count: it moves only when the rule protected a write.
-const WRITEBACK_BYTES_KEPT_BACK: &str = "fuse.writeback_bytes_kept_back";
+/// Format: cache write-backs refused `EIO` whole because a byte another path changed after the kernel's copy was
+/// fetched differed from the file's: each a stale dirty page that would have undone a later write (A-248;
+/// `docs/bugs/2026-10-21-a-dirty-shared-map-page-overwrites-a-later-write-through-another-path.md`). The dirty-page
+/// write-back rule's non-vacuity count: it moves only when the rule protected a write. NFS counts the same as
+/// `nfs.writeback_conflicts`.
+const WRITEBACK_CONFLICTS: &str = "fuse.writeback_conflicts";
+/// Format: cache write-backs applied whole over stale bytes that equal the file's bytes now (A-248), as NFS counts
+/// `nfs.writeback_identical`.
+const WRITEBACK_IDENTICAL: &str = "fuse.writeback_identical";
 /// Format: cache write-backs refused `EIO` because which of their bytes were stale could not be told: the file's byte
 /// states were lost (the metadata ledger refused their room, or the journal no longer held the records since the
 /// mount last consumed it), or a file with no states was judged against records already gone. Zero is the healthy
@@ -927,8 +931,10 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
   // never silent — CLAUDE.md #9.
   let refused = mount.serve.take_entry_invalidations_refused();
   s.count(ENTRY_INVALIDATION_REFUSED, refused);
-  let kept_back = mount.serve.take_writeback_bytes_kept_back();
-  s.count(WRITEBACK_BYTES_KEPT_BACK, kept_back);
+  let conflicts = mount.serve.take_writeback_conflicts();
+  s.count(WRITEBACK_CONFLICTS, conflicts);
+  let identical = mount.serve.take_writeback_identical();
+  s.count(WRITEBACK_IDENTICAL, identical);
   let unknown = mount.serve.take_writebacks_unknown();
   s.count(WRITEBACKS_UNKNOWN, unknown);
   let overruns = mount.serve.take_journal_overruns();
@@ -1195,18 +1201,15 @@ fn log_write(s: &mut ShardState, dispatched: &Dispatched) {
   if dispatched.opcode != Some(slates_bridge_fuse::Opcode::Write) || dispatched.error != 0 {
     return;
   }
-  // What the write applied: the whole write, or for a cache write-back the parts outside the bytes another path had
-  // changed since (the dirty-page write-back rule), so a recovery never replays bytes the volume refused.
-  let mut appended = Ok(());
-  for (offset, data) in dispatched.written() {
-    appended = match (s.write_log.as_mut(), s.content.as_mut()) {
-      (Some(log), Some(object)) => log.append(object, dispatched.nodeid(), offset, data),
-      _ => return,
-    };
-    if appended.is_err() {
-      break;
-    }
-  }
+  // What the write applied: the whole write, a cache write-back's too, since one is applied whole or refused whole
+  // (A-248), and a refused one answered an error above.
+  let Some((offset, data)) = dispatched.written() else {
+    return;
+  };
+  let appended = match (s.write_log.as_mut(), s.content.as_mut()) {
+    (Some(log), Some(object)) => log.append(object, dispatched.nodeid(), offset, data),
+    _ => return,
+  };
   let logged = match appended {
     Ok(()) => true,
     Err(crate::write_log::Refused::Full) => {
