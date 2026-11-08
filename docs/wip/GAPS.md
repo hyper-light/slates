@@ -1372,9 +1372,10 @@
     passed 7 of 8 with no fence or NoLoss violation, judged on the successor's recorded holders; in its decisive run
     phase one waited 28 times for the stopped holder, then took the volume over whole. The eighth was the open register
     stall (`fleet.takeover.lost`, live-fixes).
-  - Open (live-fixes): a node replaced at the same machine anchor (same certificate) never answers a live write. Its
-    neighbours keep the old node's pair key and refuse the new one (`fleet.seal.pair_refused` 789 of 793 served, the
-    owner `pair_undelivered` 1,580), so the whole entry never carries their keys (`held_back.keys` 394). Before the
+  - Fixed since (live-fixes, 2026-11-07, f2f9477e; the entry "a node back at its anchor with fresh RAM had every
+    pair key refused" above): a node replaced at the same machine anchor (same certificate) never answered a live write. Its
+    neighbours kept the old node's pair key and refused the new one (`fleet.seal.pair_refused` 789 of 793 served, the
+    owner `pair_undelivered` 1,580), so the whole entry never carried their keys (`held_back.keys` 394). Before the
     answering gate such writes were answered and could not be served at a takeover (`takeover_refused.open`).
   - **Fixed (2026-11-07): a holder set of 2f+1 under an f-count.** Once the shipper follows the placement, a set can
     have 2f+1 members (the placement moved off the owner: CI diag-20 run 7 recorded e, c, b at f = 1). The shipper
