@@ -291,8 +291,13 @@ pub enum RequestBody {
     /// The volume.
     volume: VolumeId,
   },
-  /// List the caller's volumes.
-  List,
+  /// One page of the volumes the caller may read (§4.4 `list`), in volume-id order: `after` `None` begins, and each
+  /// page's `next` continues it. A page holds what one reply chunk holds (§4.3), so the client walks a listing of any
+  /// length; a volume that exists throughout the walk is listed exactly once. A read; never recorded.
+  List {
+    /// The last volume of the previous page, or `None` for the first page.
+    after: Option<VolumeId>,
+  },
   /// Acknowledge completions up to a sequence except the ids still owed (releases the others' records, §4.9).
   Acknowledge {
     /// Every sequence up to and including this one, except `owed`.
@@ -1454,7 +1459,7 @@ impl RequestBody {
       | RequestBody::Advance { .. }
       | RequestBody::Detach { .. }
       | RequestBody::BindMount { .. }
-      | RequestBody::List
+      | RequestBody::List { .. }
       | RequestBody::DaemonStatus
       | RequestBody::DaemonStatusNext { .. }
       | RequestBody::Bootstrap { .. }
@@ -3242,10 +3247,12 @@ pub enum ReplyBody {
     /// The report. Boxed: a cold, wide report that would otherwise size every reply's move.
     report: Box<StatusReport>,
   },
-  /// The listing.
+  /// One page of the listing (`List`), in volume-id order.
   Listed {
-    /// The volumes.
+    /// The volumes of this page.
     volumes: Vec<VolumeSummary>,
+    /// The cursor that continues the listing (the last volume of this page), or `None` when this page ends it.
+    next: Option<VolumeId>,
   },
   /// Acknowledged.
   Acknowledged,

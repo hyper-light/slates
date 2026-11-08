@@ -1216,6 +1216,55 @@ fn a_cli_attachment_outlives_the_process_that_made_it() {
   drop(anchor);
 }
 
+/// Shape: the volumes the paged-listing test creates through the CLI: about five listing pages' worth, at about 50 bytes
+/// a summary (`paged-NNNNN`, its id and counters) in a 4,096-byte reply chunk; past the 100 that one reply held.
+const PAGED_VOLUMES: usize = 400;
+
+/// §4.4 `list`, by use. Do: on a real anchor (two shards) create [`PAGED_VOLUMES`] volumes with `slates volume
+/// create`, then run `slates volume list` and `slates volume list --json`. Expect: both exit 0 and hold every volume
+/// exactly once. Before 2026-11-08 both were refused "reply too large for the bulk area" at 100 volumes (2,000 tried by
+/// hand: refused at every count from 100).
+#[test]
+fn volume_list_answers_a_listing_longer_than_one_reply() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the paged volume listing: set SLATES_TEST_CLI=1 to run it (needs the machine to itself)"
+    );
+    return;
+  }
+  let instance = format!("cli-paged-list-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let mut ids = Vec::new();
+  for n in 0..PAGED_VOLUMES {
+    let name = format!("paged-{n:05}");
+    let (code, out, err) = run(&instance, &["volume", "create", &name, "--bounded", "1MiB"]);
+    assert_eq!(code, 0, "create {name}: {err}");
+    ids.push(value_of(&out, "id"));
+  }
+  let (code, out, err) = run(&instance, &["volume", "list"]);
+  assert_eq!(code, 0, "volume list: {err}");
+  for id in &ids {
+    assert_eq!(
+      out
+        .lines()
+        .filter(|line| line.starts_with(id.as_str()))
+        .count(),
+      1,
+      "volume {id} listed once"
+    );
+  }
+  let (code, out, err) = run(&instance, &["volume", "list", "--json"]);
+  assert_eq!(code, 0, "volume list --json: {err}");
+  for id in &ids {
+    assert_eq!(
+      out.matches(&format!("\"id\":\"{id}\"")).count(),
+      1,
+      "volume {id} in the JSON once"
+    );
+  }
+  drop(anchor);
+}
+
 #[test]
 fn the_anchor_supervises_a_daemon_the_verbs_answer_and_the_daemon_leaves_with_the_anchor() {
   // This spawns a real anchor and daemon (subprocesses with spinning shards) and a `slates`

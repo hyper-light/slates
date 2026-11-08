@@ -518,7 +518,7 @@ fn check_typed_refusal(verb: &str, (other, reply, took): (usize, ReplyBody, Dura
 fn a_listing_whose_part_cannot_be_sent_is_refused_overloaded() {
   check_typed_refusal(
     "list",
-    scattered_with_the_other_shard_full("list-full", &RequestBody::List),
+    scattered_with_the_other_shard_full("list-full", &RequestBody::List { after: None }),
   );
 }
 
