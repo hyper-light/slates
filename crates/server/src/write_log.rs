@@ -121,6 +121,55 @@ fn word(object: &SparseObject, at: usize) -> Option<u64> {
   Some(u64::from_le_bytes(bytes))
 }
 
+/// A record's head as the log holds it: its kind, the inode and offset it names, and the length of the bytes after it.
+struct RecordHead {
+  kind: u32,
+  inode: u64,
+  offset: u64,
+  length: usize,
+}
+
+/// The little-endian `u32` at `at`.
+fn half_word(object: &SparseObject, at: usize) -> Option<u32> {
+  let mut bytes = [0u8; size_of::<u32>()];
+  object.read(at, &mut bytes).ok()?;
+  Some(u32::from_le_bytes(bytes))
+}
+
+/// The record head at `base`, laid out as [`RECORD_HEAD`] counts it: kind, inode, offset, length.
+fn head_at(object: &SparseObject, base: usize) -> Option<RecordHead> {
+  let at_inode = base.checked_add(size_of::<u32>())?;
+  let at_offset = at_inode.checked_add(size_of::<u64>())?;
+  let at_length = at_offset.checked_add(size_of::<u64>())?;
+  Some(RecordHead {
+    kind: half_word(object, base)?,
+    inode: word(object, at_inode)?,
+    offset: word(object, at_offset)?,
+    length: usize::try_from(half_word(object, at_length)?).ok()?,
+  })
+}
+
+/// The record `head` introduces, holding `bytes`. `None` for a kind this daemon does not write or a `FORGET` of the
+/// wrong length.
+fn logged_of(head: &RecordHead, bytes: Vec<u8>) -> Option<Logged> {
+  match head.kind {
+    KIND_WRITE => Some(Logged::Write(Record {
+      inode: head.inode,
+      offset: head.offset,
+      bytes,
+    })),
+    KIND_FORGET if head.length == FORGET_BYTES => {
+      let (attachment, count) = bytes.split_at_checked(size_of::<u64>())?;
+      Some(Logged::Forget(Forgotten {
+        attachment: u64::from_le_bytes(attachment.try_into().ok()?),
+        inode: head.inode,
+        count: u64::from_le_bytes(count.try_into().ok()?),
+      }))
+    }
+    _ => None,
+  }
+}
+
 impl WriteLog {
   /// The log of `bytes` at `start` in `object`, continued from what the previous daemon left when its stamp is
   /// `image_generation` (the writes since that publication, still owed), else emptied and stamped with it; with what
@@ -200,50 +249,16 @@ impl WriteLog {
     used: usize,
   ) -> Option<(Logged, usize)> {
     let base = self.start.checked_add(HEADER_BYTES)?.checked_add(cursor)?;
-    let half = |at: usize| -> Option<u32> {
-      let mut bytes = [0u8; size_of::<u32>()];
-      object.read(at, &mut bytes).ok()?;
-      Some(u32::from_le_bytes(bytes))
-    };
-    let kind = half(base)?;
-    let inode = word(object, base.checked_add(size_of::<u32>())?)?;
-    let offset = word(
-      object,
-      base
-        .checked_add(size_of::<u32>())?
-        .checked_add(size_of::<u64>())?,
-    )?;
-    let length = usize::try_from(half(
-      base
-        .checked_add(size_of::<u32>())?
-        .checked_add(size_of::<u64>().checked_mul(2)?)?,
-    )?)
-    .ok()?;
-    let next = cursor.checked_add(RECORD_HEAD)?.checked_add(length)?;
+    let head = head_at(object, base)?;
+    let next = cursor.checked_add(RECORD_HEAD)?.checked_add(head.length)?;
     if next > used {
       return None;
     }
-    let mut bytes = vec![0u8; length];
+    let mut bytes = vec![0u8; head.length];
     object
       .read(base.checked_add(RECORD_HEAD)?, &mut bytes)
       .ok()?;
-    let logged = match kind {
-      KIND_WRITE => Logged::Write(Record {
-        inode,
-        offset,
-        bytes,
-      }),
-      KIND_FORGET if length == FORGET_BYTES => {
-        let (attachment, count) = bytes.split_at(size_of::<u64>());
-        Logged::Forget(Forgotten {
-          attachment: u64::from_le_bytes(attachment.try_into().ok()?),
-          inode,
-          count: u64::from_le_bytes(count.try_into().ok()?),
-        })
-      }
-      _ => return None,
-    };
-    Some((logged, next))
+    Some((logged_of(&head, bytes)?, next))
   }
 
   /// Appends a write of `bytes` to `inode` at `offset`, before its reply: the record, then the length that covers it.
