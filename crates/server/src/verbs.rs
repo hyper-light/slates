@@ -1701,7 +1701,10 @@ pub(crate) async fn resolve_and_forward(
       });
       Some(owner)
     }
-    None => locate_within_budget(query).await,
+    None => match locate_within_budget(query).await {
+      Some(owner) => Some(owner),
+      None => locate_work_green(volume, region).await,
+    },
   };
   let (decoded, later) = loop {
     let (decoded, later) = forward_once(owner, &requests).await;
@@ -1832,6 +1835,36 @@ async fn await_materialization(object: ObjectId) {
       return;
     }
   }
+}
+
+/// The status count of a request for a work no member owns, sent to its green's owner by the work's catalog record this
+/// node holds (A-255).
+const ROUTED_BY_WORK_GREEN: &str = "fleet.owner_location.routed_by_work_green";
+
+/// The owner of the green that `volume` is a work of, for a request no member owns the work for (A-255): after its
+/// owner's takeover a work has no owner (its head is never placed, so a successor never takes it over), but every holder
+/// of its catalog record knows its green (`CatalogValue::work_of`), whose owner holds the work's submits' completions
+/// (their merge records). This node's own held copy of that record is a hint and grants nothing (§4.8 "Lookup"): the
+/// green's owner answers only a completion recorded under the request's own key, and refuses anything else typed
+/// without running it. `None` when this node holds no catalog record naming a green for `volume`, or the green's owner is
+/// not found within the location budget.
+async fn locate_work_green(volume: VolumeId, region: u64) -> Option<HostId> {
+  let query = crate::state::with_state(|state| {
+    let catalog = ObjectId(volume.bytes).catalog();
+    let (_, bytes) = state.holder_records.get(&catalog)?.highest(catalog)?;
+    let green = crate::catalog::CatalogValue::from_record_bytes(bytes)?.work_of?;
+    Some(crate::owner_location::Query::new(
+      state,
+      ObjectId(green.bytes),
+      region,
+    ))
+  })
+  .flatten()?;
+  let owner = locate_within_budget(query).await;
+  if owner.is_some() {
+    crate::state::with_state(|state| state.count(ROUTED_BY_WORK_GREEN, 1));
+  }
+  owner
 }
 
 /// The owner of `query`'s object, resolved again within the one liveness budget a forward allows for finding its owner:
