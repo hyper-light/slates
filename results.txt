@@ -1,0 +1,12 @@
+tested 2ae4e832cf2971ffd9e6931c838860d849160fee variant after on aarch64, 4 cpus
+config exit 0 85s
+admitted exit 0 135s
+  admitted: b: clients_per_shard 2576 slots 32 shards 2 tasks_per_shard 5157 fleet_tasks_per_shard 5157 lane bound 164864; 645 clients x 32 forwards
+  admitted: first round: 19220 of 20640 replies in 97.333242855s; backstop 219.048713062s after the hold
+  admitted: 20640 of 20640 answered: 12903 served, 0 Overloaded, the last 97.351819029s after the hold; control tasks refused 0
+unstarted exit 0 8s
+fleet-forward exit 0 253s
+server-lib exit 0 2s
+server exit 0 68s
+cli exit 0 46s
+clippy exit 0 64s
