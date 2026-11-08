@@ -1259,6 +1259,8 @@ pub struct ShardReport {
   /// Live shipping on this shard (A-200): each live volume it ships, and on the control shard each it holds as a
   /// candidate. Appended.
   pub live: Vec<LiveReport>,
+  /// This shard's partition snapshots against the log they absorb, and the cadence they follow (A-243). Appended.
+  pub snapshots: DbSnapshotReport,
   /// The members this node keeps direct contact with (§4.8: its holders, the consensus voters and staged members, and
   /// every member while it is a voter itself), this node left out: the peers its probe mesh and record links reach.
   /// Counted on the control shard only; zero elsewhere and on a laptop. Appended.
@@ -1266,8 +1268,6 @@ pub struct ShardReport {
   /// Of `peers_in_contact`, those with no formed probe session yet: zero once this node's mesh is up
   /// (`Daemon::fleet_meshed`). Appended.
   pub peers_unmeshed: u32,
-  /// This shard's partition snapshots against the log they absorb, and the cadence they follow (A-243). Appended.
-  pub snapshots: DbSnapshotReport,
 }
 
 /// A partition's snapshots and their cadence, as `slates status` shows them (A-243).
