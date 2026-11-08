@@ -5088,15 +5088,9 @@ fn volume_owned_by(client: &mut Client, partition: usize, tag: &str) -> VolumeId
 /// liveness budgets, so every forward sent inside it stays alive on b's control shard (given up at its stall budget,
 /// sent again) as a killed owner's would.
 const ADMITTED_FORWARDS_HOLD: Duration = Duration::from_nanos(2 * LIVENESS_BUDGET_NS);
-/// Shape: the backstop for every reply of the burst, from the hold's end, shared by all its clients: six failover SLOs.
-/// A forward's resend loop is bounded by the SLO (`resolve_and_forward`) from when b's control shard reaches its task,
-/// behind the rest of the burst, and its last forward by a stall budget whose path tail the burst stretches on a 4-core
-/// runner. So this test holds that nothing is lost, and prints the last reply's arrival, not a latency bound: read
-/// client by client, the first clients' last replies came past the SLO plus one budget (76 to 120), plus three (38 to
-/// 98) and twice the SLO (9 to 76), each time all of them within the next read (CI runs 42426714842, 42427500000,
-/// 42429128963).
-const ADMITTED_FORWARDS_ANSWERED: Duration =
-  Duration::from_nanos(6 * slates_server::config::FAILOVER_SLO_NS);
+/// Shape: how long one read of a client waits for its remaining replies before the next client is read: a liveness
+/// budget, so a client whose last forwards are still draining does not hold the others' reads back.
+const ADMITTED_FORWARDS_READ: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);
 /// The owner's shard is held ([`a_silent_owner_leaves_no_forward_the_lane_admitted_unrun`]).
 static ADMITTED_OWNER_HELD: std::sync::atomic::AtomicBool =
   std::sync::atomic::AtomicBool::new(false);
@@ -5230,49 +5224,92 @@ fn a_silent_owner_leaves_no_forward_the_lane_admitted_unrun() {
     }
     holder.join().unwrap().unwrap();
     let held_ended = Instant::now();
-    let tagged: Vec<Vec<(u32, ReplyBody)>> = burst
+    // Every client read until all its replies came or the backstop passed, a client at a time and then round again:
+    // the control shard drains a burst this size slowly, its first clients' last replies longest, so a reply still
+    // missing at the backstop is lost, and one that comes before it is only late.
+    // First every client once for a read's budget; then each client still short in one unbroken wait to the backstop,
+    // each reply's arrival timed from that wait's start. A reply that comes during the unbroken wait was being produced
+    // while the client waited; one that came only when a wait ended or began again would be a lost wake (the
+    // supervisor's question, 2026-11-07: the park and doorbell pairs are fenced and modelled, `ipc::park`,
+    // `ipc::doorbell`, but a read that restarts its wait would hide one).
+    let mut tagged: Vec<Vec<(u32, ReplyBody)>> = burst
       .iter_mut()
-      .map(|client| {
-        let left = ADMITTED_FORWARDS_ANSWERED.saturating_sub(held_ended.elapsed());
-        client.collect_tagged(slots, left)
-      })
+      .map(|client| client.collect_tagged(slots, ADMITTED_FORWARDS_READ))
       .collect();
-    let last_reply = held_ended.elapsed();
-    // Where a missing reply is: each short client's missing sequences, any that arrive in a further budget (late past
-    // the bound, counted apart), and the replies each of b's shards still holds unwritten.
-    let mut missing = Vec::new();
-    let mut late = 0usize;
-    for (client, replies) in burst.iter_mut().zip(&tagged) {
-      let answered: std::collections::BTreeSet<u32> = replies.iter().map(|(sequence, _)| *sequence).collect();
-      let lost: Vec<u32> = client.last_sequences(slots).difference(&answered).copied().collect();
-      if !lost.is_empty() {
-        late += client.collect_tagged(lost.len(), Duration::from_nanos(LIVENESS_BUDGET_NS)).len();
-        missing.push((client.client, lost));
+    // Derived: the backstop past which a missing reply is lost, from this burst's own measurements. The first round
+    // measures the rate b's control shard served the burst at (replies taken over the round's time); the rest of the
+    // burst takes at most twice what that rate needs to serve it all, and a forward's resend loop adds at most the
+    // failover SLO (`resolve_and_forward`). A round that took no reply measures no rate, and the test says so.
+    let first_round = held_ended.elapsed();
+    let served_first: usize = tagged.iter().map(Vec::len).sum();
+    assert!(
+      served_first > 0,
+      "the first round of reads took a reply in {first_round:?} (no rate to derive the backstop from)"
+    );
+    let in_flight = clients * slots;
+    let drained = Duration::from_nanos(
+      u64::try_from(
+        first_round
+          .as_nanos()
+          .saturating_mul(2 * u128::try_from(in_flight).unwrap())
+          / u128::try_from(served_first).unwrap(),
+      )
+      .unwrap_or(u64::MAX)
+      .saturating_add(slates_server::config::FAILOVER_SLO_NS),
+    );
+    eprintln!(
+      "first round: {served_first} of {in_flight} replies in {first_round:?}; backstop {drained:?} after the hold"
+    );
+    let mut unbroken: Vec<(u32, usize, Vec<Duration>)> = Vec::new();
+    for (client, replies) in burst.iter_mut().zip(tagged.iter_mut()) {
+      let wanted = slots.saturating_sub(replies.len());
+      if wanted == 0 {
+        continue;
       }
+      let began = Instant::now();
+      let left = drained.saturating_sub(held_ended.elapsed());
+      let came = client.collect_timed(wanted, left, began);
+      unbroken.push((
+        client.client,
+        wanted,
+        came.iter().map(|(at, _, _)| *at).collect(),
+      ));
+      replies.extend(
+        came
+          .into_iter()
+          .map(|(_, sequence, reply)| (sequence, reply)),
+      );
     }
-    let held: Vec<(usize, usize)> = daemons[1]
-      .shards()
+    let last_reply = held_ended.elapsed();
+    for (client, wanted, arrivals) in unbroken.iter().take(6) {
+      eprintln!(
+        "unbroken wait of client {client} for {wanted} replies: {} came, at {:?} into the wait",
+        arrivals.len(),
+        arrivals
+          .iter()
+          .step_by(arrivals.len().div_ceil(6).max(1))
+          .collect::<Vec<_>>()
+      );
+    }
+    let lost: Vec<(u32, Vec<u32>)> = burst
       .iter()
-      .map(|shard| {
-        daemons[1]
-          .observation(
-            Some(*shard),
-            slates_server::daemon::OBSERVE_BUDGET_NS,
-            |state: &mut slates_server::state::ShardState| {
-              (state.deferred.len(), state.pending_forwards.len())
-            },
-          )
-          .unwrap()
-          .wait()
-          .unwrap()
+      .zip(&tagged)
+      .filter_map(|(client, replies)| {
+        let came: std::collections::BTreeSet<u32> =
+          replies.iter().map(|(sequence, _)| *sequence).collect();
+        let lost: Vec<u32> = client
+          .last_sequences(slots)
+          .difference(&came)
+          .copied()
+          .collect();
+        (!lost.is_empty()).then_some((client.client, lost))
       })
       .collect();
-    if !missing.is_empty() {
+    if !lost.is_empty() {
       eprintln!(
-        "missing replies: {} clients short, {late} arrived in a further budget; first: {:?}; b's shards (deferred, \
-         pending forwards): {held:?}",
-        missing.len(),
-        missing.iter().take(6).collect::<Vec<_>>()
+        "lost replies: {} clients short at the backstop; first: {:?}",
+        lost.len(),
+        lost.iter().take(6).collect::<Vec<_>>()
       );
     }
     let replies: Vec<Vec<ReplyBody>> = tagged
@@ -7484,6 +7521,35 @@ impl Client {
         }
       }
     }
+  }
+
+  /// [`collect_tagged`](Self::collect_tagged) in one unbroken wait: each reply with when it came, from `began`.
+  fn collect_timed(
+    &mut self,
+    count: usize,
+    deadline: Duration,
+    began: Instant,
+  ) -> Vec<(Duration, u32, ReplyBody)> {
+    let mut replies = Vec::with_capacity(count);
+    while replies.len() < count {
+      let left = deadline.saturating_sub(began.elapsed());
+      if left.is_zero() {
+        break;
+      }
+      let Ok(reply) = self
+        .end
+        .wait(Some(u64::try_from(left.as_nanos()).unwrap_or(u64::MAX)))
+      else {
+        break;
+      };
+      let sequence = RequestId::from_word(reply.request).sequence;
+      replies.push((
+        began.elapsed(),
+        sequence,
+        unpack(self.end.region(), reply.kind, &reply.payload).unwrap(),
+      ));
+    }
+    replies
   }
 
   /// The sequences of this client's last `count` requests (a burst's).

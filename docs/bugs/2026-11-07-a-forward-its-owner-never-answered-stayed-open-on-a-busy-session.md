@@ -34,6 +34,9 @@ exchanges' replies, and nothing ended it:
 
 ## Fix
 
+Landed in 2bdaa7c0, the commit whose summary names A-245's docs: `git add -A` took the fix in with them (reported to
+the supervisor, 2026-11-07). The test that holds it came in 98d7b964.
+
 - A forward's progress is bytes of its own reply read: `Endpoint::reply_bytes_read(exchange)` (`slates-transport`),
   compared with the bytes read when its progress was last marked (`Ticket::reply_bytes`, `mark_ticket_progress`).
 - Bytes the session consumed for other exchanges are not its progress.

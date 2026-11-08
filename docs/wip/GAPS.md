@@ -283,12 +283,14 @@
 >   supervisor's order, the control shard is sized from its lane's bound, a full channel is answered `Overloaded` (not
 >   `HomedElsewhere`), and every reply carried home runs whether admitted or not (§4.3's status;
 >   `docs/bugs/2026-11-07-the-control-shard-could-not-run-what-its-lane-admitted.md`). Still owed: a same-node owner
->   shard is sized for its own clients' forwards only.
+>   shard is sized for its own clients' forwards only; and the control shard's work under a large in-flight set,
+>   O(forwarders) a tick while its session is lent (64 to 105 s to drain 20,700 forwards on a 4-core runner), which
+>   is the shared session owed by "Open — one session per peer is lent exclusively" (its 2026-11-07 status).
 >
 > - **A forward its owner never answered stayed open on a busy session** (found 2026-11-07 by fixtures' f = 1
 >   primary kill). A forward's stall budget counted any byte its session consumed, so 298 forwards to an owner that
 >   never answered them stayed open for good while the session carried other replies. Progress is now its own
->   reply's bytes (red 4/4 on both Linux runners, run 42425119057;
+>   reply's bytes, landed in 2bdaa7c0 beside A-245's docs (red 4/4 on both Linux runners, run 42425119057;
 >   `docs/bugs/2026-11-07-a-forward-its-owner-never-answered-stayed-open-on-a-busy-session.md`). The owner's side of
 >   that rung, a membership split after the primary's restart that never merged, is open with membership's owner.>
 > - **A held request kept every later completion of its client** (found 2026-11-07 by fixtures' `f = 1` rungs, and
@@ -5307,6 +5309,23 @@ a campaign each take the whole session out of its link, though the transport run
 session at once (`Endpoint::begin`/`drive`). Campaigns and forwards now wait for it. Replication rounds and
 record dispatches retry a missed voter next period. Owed: a shared session (one owner driving it, exchanges
 submitted to it) so no exchange waits for another's.
+
+> **Status (2026-11-07, the forward lane's case, measured under load).** The forward lane shares one record session
+> among a peer's forwards, but the lane still borrows it whole from its link for each turn, as discovery, dispatches
+> and campaigns do. A forwarder that finds it lent polls for it at a tenth of a heartbeat, and each resend begins a new
+> forwarder. So the work is O(forwarders) a tick on the control shard.
+> - `a_silent_owner_leaves_no_forward_the_lane_admitted_unrun` (`crates/server/tests/fleet.rs`) puts about 20,700
+>   forwards to an owner silent for two liveness budgets in flight through one control shard.
+> - On CI's 4-core runners the shard was too busy to run an observation within its budget, and the last reply came 64
+>   to 105 s after the hold.
+> - `fleet.forward.session_never_returned` and `fleet.owner_location.forward_unsent` read 2,661 to 6,277 each; nothing
+>   was lost or refused.
+> - At fixtures' 100,000-client target that is the same work a tick on one shard, a hundredfold.
+>
+> The shared session owed above is what removes it: one driver and submitted exchanges, so a forwarder waits on its
+> own exchange, not on the session. Record: `docs/bugs/2026-11-07-the-control-shard-could-not-run-what-its-lane-admitted.md`;
+> the load-test entries "A forward refused at admission left its client waiting" and "A forward its owner never
+> answered stayed open on a busy session".
 
 ### 2026-09-29: a lone owner refused its own objects — fixed; campaign counters added for the open KIND items
 
