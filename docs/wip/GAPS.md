@@ -14261,7 +14261,11 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   attachment with no rights stays `EPERM`. Windows' disposition delete asks `CanDelete` first (`authorize_change`): a
   read-only drive's four changes are each refused `ERROR_WRITE_PROTECT` on both Windows runners (diag-slabs-37, run
   42483804345: the WinFsp unit tests 80, the CLI suite 17); `DeleteFile` succeeded with that check taken out
-  (diag-slabs-38, run 42483804058). Record: `docs/bugs/2026-11-08-a-read-only-attachment-was-not-a-read-only-file-system.md`.
+  (diag-slabs-38, run 42483804058). On Linux at c275acbb the bridges, the server suite and the CLI flow passed
+  (diag-slabs-39, run 42486855316). Nobody has run the conformance suites on this branch: conformance expects no change
+  to its records, from reading the harness (no suite mounts read-only, and pjdfstest's `EROFS` cases are FreeBSD-only),
+  and its expected-failure lists have no `EROFS` entries.
+  Record: `docs/bugs/2026-11-08-a-read-only-attachment-was-not-a-read-only-file-system.md`.
 - **Open, performance: `INIT`'s page count follows the host's page.** `init::max_pages` is `MAX_WRITE` in host pages,
   so a 4 KiB-page guest of a 16 KiB-page Mac is told 16 pages: 64 KiB a request where a write may be 256 KiB. The
   kernel mount needs the host's count (its channel buffer is fixed); a VM route could name 64. Not measured yet; owed
@@ -14679,7 +14683,12 @@ Found while fixing A-151.
   SimHost (`crates/vfs/tests/base.rs`), the server's restart over NFS and the client (`crates/server/tests/recovery.rs`),
   and a kernel mount kept across the restart (`crates/cli/tests/cli.rs`; Linux FUSE with a kill, diag-slabs-33, run
   42434266219: the vfs base suite 47, recovery 49, the CLI flow 91; red with main's base plane, diag-slabs-34, run
-  42434266313). Record: `docs/bugs/2026-11-07-a-removed-base-directory-refused-the-whole-volume-at-recovery.md`.
+  42434266313). The rule is A-256. At c275acbb, the Linux run for this entry, the sibling below, the `FORGET` entry
+  (under A-154) and the read-only attachment's: diag-slabs-39, run 42486855316, workspace clippy, the whole server suite
+  and the CLI flow's 93 passed. The Windows runs and the red-checks of the sibling, `CanDelete` and the `FORGET` log ran
+  at ca4e8a32 (diag-slabs-37 and -38); c275acbb changed only the Linux-only write log and this ledger. The whole server
+  suite has not yet run on macOS at this tip.
+  Record: `docs/bugs/2026-11-07-a-removed-base-directory-refused-the-whole-volume-at-recovery.md`.
 - **A sibling, fixed 2026-11-08 (slabs; found by liveness):** after a restart a pinned overlay's snapshot was refused
   as a new green's base (`ConsistentBaseUnavailable`): the completeness check read the recovered plane's listings, none
   of which were read yet. It now reads a listing the plane has not read from the host, uncached.

@@ -18308,7 +18308,45 @@ Applied in the same change to:
   a bounded leak (GAPS).
 - **Evidence.** See the bug record's verification.
 
+### A-256 — A base directory recovery cannot reacquire costs only its own untouched entries (accepted 2026-11-08, the supervisor's confirmation)
+Applied in the same change to (the code and tests in 4db8c179, this entry and A-153's pointer after them):
+- §4.8 ("Required persistence and protocol invariants");
+- `docs/wip/recovery.md`;
+- `crates/vfs/src/base.rs` (`BasePlane::unavailable`) and `crates/vfs/src/base_recovery.rs` (`BasePlane::recover`,
+  `image`);
+- the tests:
+  - `crates/vfs/tests/base.rs`: A-153's guard as it now stands,
+    `an_overlay_whose_base_directory_another_replaced_never_serves_the_other` (it was
+    `an_overlay_whose_base_directory_another_replaced_is_refused`), and
+    `an_overlay_whose_loaded_base_directory_was_removed_recovers_and_refuses_only_that_directory`;
+  - `crates/server/tests/recovery.rs` `an_overlay_whose_base_directory_was_removed_serves_its_own_files_after_a_restart`;
+  - `crates/cli/tests/cli.rs` `an_overlay_whose_base_directory_was_removed_serves_its_own_files_through_a_kept_mount`;
+- GAPS;
+- `docs/bugs/2026-11-07-a-removed-base-directory-refused-the-whole-volume-at-recovery.md`.
+
+- **What A-153 said.** A directory another directory replaced is not the same source, and is refused: the restart
+  refused the whole volume (`RecoveryIncomplete`), and the guard test named that. It left open a loaded directory
+  removed after the last publication, which refused the whole volume the same way.
+- **What it says now.** A recorded directory recovery cannot reacquire as the same one, gone from the disk, unreadable,
+  or another at the path, costs only its own untouched entries.
+  - The volume recovers.
+  - Those entries refuse `BaseUnavailable{path, errno}` (`ENOENT` when the host says only that it is not there).
+  - The volume's own entries in that directory serve.
+  - The next image keeps the directory's record, so a later recovery tries it again.
+- **What it does not change.** A-153's identity rule (device, inode number and birth time) still decides whether a
+  directory is the recorded one. Another directory is never substituted for it: reopening a path alone cannot substitute
+  another base. Only the price of a failed reacquisition changed, from the whole volume to that directory.
+- **Why.** §4.8's failure matrix already gives the runtime rule in its row "Base directory unreadable or gone": refused
+  `BaseUnavailable` for untouched entries under it, witnessed and pinned entries serving. Recovery was harsher than that
+  row, and one directory removed beneath a base cost the user every file the volume held, its own writes included (the
+  bug record).
+- **Not covered.** A directory that comes back while the daemon runs stays unavailable until the next restart.
+- **Evidence.** See the bug record and GAPS (A-153's "Open, found here", closed).
+
 ### A-153 — A recovered base directory is judged by its identity, not its entries (accepted 2026-10-22)
+**Amended by A-256 (2026-11-08):** a directory recovery cannot reacquire, replaced or removed, now costs only its own
+untouched entries rather than the whole volume; the identity rule below stands.
+
 Applied in the same change to:
 - §4.8 ("Required persistence and protocol invariants");
 - `docs/wip/recovery.md`;
