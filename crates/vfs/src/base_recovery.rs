@@ -5,9 +5,9 @@
 //! The witness tables are kept with every version a snapshot still reads (A-48), so a recovered volume
 //! lands and clones its snapshots against the witnesses they froze.
 
-use super::{BaseConfig, BasePlane, DriftKind, Listing, UnavailableDir, Version};
+use super::{BaseConfig, BasePlane, DriftKind, Listing, Version};
 use crate::error::VfsError;
-use crate::host::{HostDir, HostError, HostFacts, HostFs, WatchState};
+use crate::host::{HostDir, HostFacts, HostFs, WatchState};
 use crate::ids::{Epoch, InodeNo};
 use crate::inode::{Fingerprint, Witness};
 use slates_wire::Wire;
@@ -89,7 +89,7 @@ impl BasePlane {
   }
 
   pub(crate) fn image(&self, host: &mut dyn HostFs) -> Result<BaseImage, VfsError> {
-    let mut directories = self
+    let directories = self
       .listings
       .iter()
       .map(|(inode, listing)| {
@@ -101,15 +101,7 @@ impl BasePlane {
             .map_err(super::host_refusal)?,
         })
       })
-      .collect::<Result<Vec<_>, VfsError>>()?;
-    // A directory a recovery could not reacquire keeps the record it was recovered from, so a later recovery tries the
-    // recorded directory again rather than lose it; in inode order with the rest, so the image is deterministic.
-    directories.extend(self.unavailable.iter().map(|(inode, gone)| Directory {
-      inode: inode.0,
-      source: gone.source.clone(),
-      fingerprint: gone.fingerprint,
-    }));
-    directories.sort_by_key(|directory| directory.inode);
+      .collect::<Result<_, VfsError>>()?;
     // The head's witnesses each keep their home: drift checks and descriptors need it.
     if self
       .witnesses
@@ -195,40 +187,28 @@ impl BasePlane {
         if (directory.inode == root_no.0) != directory.source.is_empty() {
           return Err(VfsError::RecoveryIncomplete);
         }
-        let inode = InodeNo(directory.inode);
-        if plane.listings.contains_key(&inode) || plane.unavailable.contains_key(&inode) {
-          return Err(VfsError::RecoveryIncomplete);
-        }
-        // A directory recovery cannot reacquire as the recorded one, gone from the disk, unreadable, or another at the
-        // path, refuses its untouched entries `BaseUnavailable` while the volume's own entries in it serve (§4.8's
-        // failure matrix). Until 2026-11-07 such a directory refused the whole volume `RecoveryIncomplete`: a base
-        // directory removed after the last publication cost every file in the volume
-        // (`docs/bugs/2026-11-07-a-removed-base-directory-refused-the-whole-volume-at-recovery.md`).
-        let opened = match open_source(host, root, &directory.source)? {
-          Ok(opened) => opened,
-          Err(refused) => {
-            plane
-              .unavailable
-              .insert(inode, unavailable(directory, refused));
-            continue;
-          }
-        };
+        let opened = open_source(host, root, &directory.source)?;
+        let fingerprint = host.fingerprint_dir(opened).map_err(super::host_refusal);
         // The same source is the same directory, not the same entries (§4.8, A-153): a directory whose entries an
         // outsider changed since the image is still the one recorded (its listing is read again on first use, and every
-        // entry beneath is checked then), while one another directory replaced is not, and is never substituted.
-        let refused = match host.fingerprint_dir(opened) {
-          Ok(now) if now.same_object(&directory.fingerprint) => None,
-          Ok(_) => Some(HostError::NotFound),
-          Err(refused) => Some(refused),
-        };
-        if let Some(refused) = refused {
+        // entry beneath is checked then), while one another directory replaced is refused. Until 2026-10-22 the whole
+        // fingerprint had to match, so any change beneath a loaded directory since the last publication cost the volume
+        // (`docs/bugs/2026-10-22-a-takeover-refused-an-overlay-whose-base-directory-an-outsider-had-changed.md`).
+        if !fingerprint
+          .as_ref()
+          .is_ok_and(|now| now.same_object(&directory.fingerprint))
+        {
           if opened != root {
             host.close_dir(opened);
           }
-          plane
-            .unavailable
-            .insert(inode, unavailable(directory, refused));
-          continue;
+          fingerprint?;
+          return Err(VfsError::RecoveryIncomplete);
+        }
+        if plane.listings.contains_key(&InodeNo(directory.inode)) {
+          if opened != root {
+            host.close_dir(opened);
+          }
+          return Err(VfsError::RecoveryIncomplete);
         }
         plane.listings.insert(
           InodeNo(directory.inode),
@@ -247,12 +227,12 @@ impl BasePlane {
         return Err(VfsError::RecoveryIncomplete);
       }
       restore_versions(&mut plane, image)?;
-      // Every head witness keeps a home in a directory the image recorded, as it did when it was imaged: reacquired, or
-      // unavailable, where the witness refuses with its directory.
+      // Every head witness keeps a home in a reacquired directory, as it did when it was imaged.
       let homeless = plane.witnesses.iter_head().any(|(inode, _)| {
-        !plane.witness_homes.head(inode).is_some_and(|(parent, _)| {
-          plane.listings.contains_key(parent) || plane.unavailable.contains_key(parent)
-        })
+        !plane
+          .witness_homes
+          .head(inode)
+          .is_some_and(|(parent, _)| plane.listings.contains_key(parent))
       });
       if homeless {
         return Err(VfsError::RecoveryIncomplete);
@@ -322,23 +302,7 @@ fn version<V>(from: u64, value: Option<V>) -> Version<V> {
   }
 }
 
-/// A directory recovery could not reacquire, with the host's refusal ([`UnavailableDir`]).
-fn unavailable(directory: &Directory, refused: HostError) -> UnavailableDir {
-  UnavailableDir {
-    source: directory.source.clone(),
-    fingerprint: directory.fingerprint,
-    errno: super::unavailable_errno(refused),
-  }
-}
-
-/// Reopens a recorded source directory below `root`, one component at a time without following links: the inner
-/// result is the host's refusal of a directory that is not there to open; the outer refuses a recorded path that is not
-/// one (`RecoveryIncomplete`).
-fn open_source(
-  host: &mut dyn HostFs,
-  root: HostDir,
-  path: &[String],
-) -> Result<Result<HostDir, HostError>, VfsError> {
+fn open_source(host: &mut dyn HostFs, root: HostDir, path: &[String]) -> Result<HostDir, VfsError> {
   let mut current = root;
   for component in path {
     if component.is_empty()
@@ -355,10 +319,7 @@ fn open_source(
     if current != root {
       host.close_dir(current);
     }
-    match next {
-      Ok(next) => current = next,
-      Err(refused) => return Ok(Err(refused)),
-    }
+    current = next.map_err(super::host_refusal)?;
   }
-  Ok(Ok(current))
+  Ok(current)
 }
