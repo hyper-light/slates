@@ -73,6 +73,27 @@ pub const OBSERVE_BUDGET_NS: u64 = 10 * LIVENESS_BUDGET_NS;
 /// inside the observation's budget.
 pub const SESSION_WAIT_NS: u64 = LIVENESS_BUDGET_NS;
 
+/// How many forwards this control shard has counted meeting a record session out.
+fn forwards_met_out() -> u64 {
+  crate::state::with_state(|s| {
+    s.refusals
+      .get("fleet.forward.session_out")
+      .copied()
+      .unwrap_or(0)
+  })
+  .unwrap_or(0)
+}
+
+/// Waits, on the control shard's timer, for [`forwards_met_out`] to rise past `before` or for `within_ns` to pass.
+async fn await_forward_met(before: u64, within_ns: u64) {
+  let began = slates_rt::futures::now_ns();
+  while forwards_met_out() <= before
+    && slates_rt::futures::now_ns().saturating_sub(began) < within_ns
+  {
+    pace(HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD).await;
+  }
+}
+
 /// What [`Daemon::hold_record_session`] found: the session taken (and how long it waited for it), or, after
 /// [`SESSION_WAIT_NS`], why there was none — a link for the peer whose session never came back to it, or no
 /// link for the peer at all.
@@ -1120,6 +1141,30 @@ impl Daemon {
     peer: slates_db::HostId,
     span_ns: u64,
   ) -> Result<SessionHold, ObserveError> {
+    self.hold_session(peer, span_ns, 0)
+  }
+
+  /// [`Self::hold_record_session`], held until a forward has met the session out
+  /// (`fleet.forward.session_out` rises past its count when the hold took the session) or `meet_within_ns` has passed,
+  /// and for `span_ns` after that: a test's forward meets the hold however late a loaded machine runs it, where a hold
+  /// of a fixed span can end before the forward arrives.
+  pub fn hold_record_session_until_met(
+    &self,
+    peer: slates_db::HostId,
+    span_ns: u64,
+    meet_within_ns: u64,
+  ) -> Result<SessionHold, ObserveError> {
+    self.hold_session(peer, span_ns, meet_within_ns)
+  }
+
+  /// The hold of [`Self::hold_record_session`] and [`Self::hold_record_session_until_met`]: `meet_within_ns` zero holds
+  /// for `span_ns` alone.
+  fn hold_session(
+    &self,
+    peer: slates_db::HostId,
+    span_ns: u64,
+    meet_within_ns: u64,
+  ) -> Result<SessionHold, ObserveError> {
     let shard = self.shards.first().copied().ok_or(ObserveError::NoTarget)?;
     let runtime = self.runtime.as_ref().ok_or(ObserveError::NoRuntime)?;
     let (taken, took) = std::sync::mpsc::sync_channel::<SessionHold>(1);
@@ -1145,8 +1190,10 @@ impl Daemon {
           }
           pace(HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD).await;
         };
+        let met_before = forwards_met_out();
         let _ = taken.send(outcome);
         if !sessions.is_empty() {
+          await_forward_met(met_before, meet_within_ns).await;
           pace(span_ns).await;
           crate::fleet::return_sessions(sessions);
         }
@@ -2187,6 +2234,19 @@ impl Daemon {
   /// starvation it relied on actually held. Returns once admitted: the caller watches the rest of the
   /// fleet while the shard is held. The hold's budget is the observe budget past the span it holds for.
   pub fn starve_control_shard(&self, span_ns: u64) -> Result<Admitted<u64>, ObserveError> {
+    /// Never set: a plain hold runs out its span.
+    static NEVER_RELEASED: AtomicBool = AtomicBool::new(false);
+    self.starve_control_shard_until(span_ns, &NEVER_RELEASED)
+  }
+
+  /// [`Self::starve_control_shard`], ended early once `released` is set: a test releases the shard as soon as it has
+  /// seen what the hold was for, so its span is a ceiling, not a time a loaded machine has to beat. The answer is the
+  /// measured span, under `span_ns` when the release came first.
+  pub fn starve_control_shard_until(
+    &self,
+    span_ns: u64,
+    released: &'static AtomicBool,
+  ) -> Result<Admitted<u64>, ObserveError> {
     // The hold announces the moment it takes the shard, so this call returns only once the shard is
     // genuinely spinning on it. A question submitted after it is then ordered behind a busy shard that
     // cannot step its scheduler to admit it, so the queued-behind-a-hold path deadlines in the
@@ -2202,7 +2262,7 @@ impl Daemon {
           let _ = spinning.send(());
           let begin = slates_rt::futures::now_ns();
           let end = begin.saturating_add(span_ns);
-          while slates_rt::futures::now_ns() < end {
+          while slates_rt::futures::now_ns() < end && !released.load(Ordering::Acquire) {
             std::hint::spin_loop();
           }
           Ok(slates_rt::futures::now_ns().saturating_sub(begin))

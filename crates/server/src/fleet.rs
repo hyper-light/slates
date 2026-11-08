@@ -3281,6 +3281,17 @@ fn content_work(
   })
 }
 
+/// Counter: a seal's content round sent to the remaining candidates, its first round outstanding past the measured hedge
+/// delay with no placement ([`hedge_delay_ns`], on the owner shard's clock).
+const SEAL_HEDGED: &str = "fleet.seal.hedged";
+
+/// Counts a content round that hedges to `targets`.
+fn count_hedge_round(hedged: bool, targets: &[HostId]) {
+  if hedged && !targets.is_empty() {
+    state::with_state(|s| s.count(SEAL_HEDGED, 1));
+  }
+}
+
 /// The holders one content round goes to (§4.8 mechanism 1: "content is sent to `f + 1` candidates first,
 /// hedged to the remaining candidates after the measured p95 put latency"): until the first round has been
 /// outstanding for the hedge delay, the first `f` remote candidates in rendezvous order (the owner is the
@@ -3322,6 +3333,7 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
     .filter(|host| *host != local && !work.acked.contains(host))
     .collect();
   let targets = hedge_targets(work.hedged, remote, hedge);
+  count_hedge_round(work.hedged, &targets);
   let holders = take_sessions("fleet.lent_to.put_seal_content", |host| {
     targets.contains(&host)
   });
