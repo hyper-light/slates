@@ -13587,16 +13587,16 @@ fn resend_while_refused_retryable(
   }
 }
 
-/// §4.16 "Commit", A-252, the takeover case: the version committed at the quorum and its owner died before its client
-/// could be sure of the answer. The client resends under its id through its own node. Do: three nodes at `f = 1`; on a,
-/// a green and a work; through b's client, one edit and a submit, answered version 1; a dies and a survivor takes the
-/// green over; b's client sends the submit again under the same id. Expect: the green still holds one version, and the
-/// resend is never run as a new one: answered the version it was accepted as, or refused retryable. The work lived on
-/// the dead owner and is not taken over, and completion records stay where their calls were served (A-127), so today
-/// it is refused `OwnerUnreachable`: exactly-once holds, and the client's outcome is unknown until it reads the green.
+/// §4.16's failure matrix ("Green owner loss in a fleet: ... Masked after takeover"), T-8.11, A-255: the version
+/// committed at the quorum and its owner died before its client could be sure of the answer. The client resends under
+/// its id through its own node. Do: three nodes at `f = 1`; on a, a green and a work; through b's client, one edit and
+/// a submit, answered version 1; a dies and a survivor takes the green over; b's client sends the submit again under
+/// the same id. Expect: the green still holds one version, and the resend is answered the version it was accepted as
+/// (RIFL §3: "If the object migrates, then the completion record must move with it"). A-252 held only that nothing runs
+/// twice: the resend was refused `OwnerUnreachable` without end, so the client never learned its version.
 #[test]
 #[allow(clippy::cognitive_complexity)]
-fn a_submit_resent_after_its_owner_was_taken_over_is_not_applied_again() {
+fn a_submit_resent_after_its_owner_was_taken_over_is_answered_its_version() {
   let _serial = serialize_fleet_tests();
   let names = ["a", "b", "c"];
   let nodes: Vec<(MachineProfile, HostId, Identity)> =
@@ -13672,17 +13672,13 @@ fn a_submit_resent_after_its_owner_was_taken_over_is_not_applied_again() {
     ReplyBody::Versions { head: 1 },
     "the resend ran nothing again: the green holds the one version"
   );
-  assert!(
-    matches!(
-      again,
-      Ok(ReplyBody::Submitted {
-        version: Some(1),
-        ..
-      }) | Ok(ReplyBody::Refused {
-        refusal: Refusal::OwnerUnreachable { .. } | Refusal::Overloaded { .. }
-      })
-    ),
-    "the resend through the takeover is answered its version or refused retryable, never run as a new one: {again:?}"
+  assert_eq!(
+    again.expect("the resend through the takeover is answered"),
+    ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    },
+    "the resend through the takeover is answered the version it was accepted as"
   );
 }
 
