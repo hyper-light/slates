@@ -452,6 +452,17 @@
 >   O(forwarders) a tick while its session is lent (64 to 105 s to drain 20,700 forwards on a 4-core runner), which
 >   is the shared session owed by "Open — one session per peer is lent exclusively" (its 2026-11-07 status).
 >
+> - **A forward lane turned without end while its forwards waited on the stream credit** (found 2026-11-08 on the f = 1
+>   primary-kill rung). After the primary restarted, a turn ended at once whenever any forward was queued, and with
+>   about 20,000 queued behind the stream credit the forwarder turned in one poll until its stall budget: client-0's
+>   control shard spun about 1.09 s, 6 of 6 runs, and its anchor killed it. A turn now ends early only for a newly
+>   queued forward, and the forwarder yields between turns: 0 of 6, one restart a run, oracle 0. With it, a turn costs
+>   what changed (completed and progressed exchanges), and the endpoint's completed set, which grew with every exchange
+>   a record session completed, holds only open ones
+>   (`docs/bugs/2026-11-08-a-forward-lane-turned-without-end-while-its-forwards-waited-on-the-stream-credit.md`).
+>   `slates_cluster`'s `take_completed_replies` still asks each of a dispatch's exchanges: a lookup a holder, since a
+>   second consumer of the completed set would take the lane's.
+>
 > - **A forward its owner never answered stayed open on a busy session** (found 2026-11-07 by fixtures' f = 1
 >   primary kill). A forward's stall budget counted any byte its session consumed, so 298 forwards to an owner that
 >   never answered them stayed open for good while the session carried other replies. Progress is now its own
