@@ -1,0 +1,62 @@
+runner ubuntu-24.04-arm, 4 CPUs, d3d2057 diag-liveness-23: the recovery-slicing extremes on four runners (diagnos, Sun Nov  8 04:25:36 UTC 2026
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'aarch64-unknown-linux-gnu'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-7b3f3ac13613ef88/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-7b3f3ac13613ef88/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-7b3f3ac13613ef88/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'neon_sha3_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-7b3f3ac13613ef88/out/out-neon_sha3_check/7dfda64fdf5a526c-neon_sha3_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-7b3f3ac13613ef88/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+error: the function has a cognitive complexity of (13/10)
+error: the function has a cognitive complexity of (16/10)
+error: large size difference between variants
+error: could not compile `slates-server` (lib) due to 3 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `slates-server` (lib test) due to 3 previous errors
+== clippy exit 101
+== spinners: 8
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+== rt alone exit 0 in 1 s, load 3.39
+test result: ok. 210 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 1.69s
+== server lib exit 0 in 1 s, load 3.39
+long recovery: 1 greens over 78 files recovered in 170.351632ms of CPU, the beat's largest gap 100.096371ms
+long recovery: 2 greens over 78 files recovered in 332.145968ms of CPU, the beat's largest gap 102.415011ms
+long recovery: 4 greens over 78 files recovered in 649.04796ms of CPU, the beat's largest gap 102.801863ms
+long recovery: 8 greens over 78 files recovered in 1.279151712s of CPU, the beat's largest gap 200.1953ms
+long recovery: 16 greens over 78 files recovered in 2.541376464s of CPU, the beat's largest gap 102.91169ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 49 filtered out; finished in 19.73s
+== the slicing test exit 0 in 20 s, load 4.92
+slates daemon: shard 4 is wedged: no step and no CPU progress for 1010 ms, past the 1000 ms window; the watchdog withholds the beat
+slates daemon: shard 1 is spinning: 1076 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 43.77s
+== recovery suite exit 0 in 44 s, load 9.73
+slates daemon: shard 1 is spinning: 1002 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1007 ms, past the 1000 ms window; the watchdog withholds the beat
+test result: ok. 6 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 12.99s
+== liveness suite exit 0 in 13 s, load 10.31
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.90s
+== daemon suite exit 0 in 3 s, load 10.31
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.71s
+== green checkpoint exit 0 in 2 s, load 10.20
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.90s
+== held_rendezvous exit 0 in 3 s, load 10.20
+slates anchor: daemon exited (None); restarted as pid 9991 (1 in the window)
+slates anchor: daemon exited (None); restarted as pid 10042 (1 in the window)
+slates anchor: daemon exited (None); restarted as pid 10088 (1 in the window)
+slates anchor: the daemon's heartbeat lapsed (1002 ms old, past 1001 ms: the 1000 ms window plus this anchor's lateness p99 of 1 ms over 6 waits); killing it
+slates anchor: daemon exited (None); restarted as pid 10134 (1 in the window)
+slates anchor: daemon exited (None); restarted as pid 10193 (1 in the window)
+slates anchor: daemon exited (None); restarted as pid 10266 (1 in the window)
+slates anchor: daemon exited (None); restarted as pid 10417 (1 in the window)
+slates anchor: daemon exited (None); restarted as pid 10470 (1 in the window)
+slates anchor: daemon exited (None); restarted as pid 10524 (1 in the window)
+slates anchor: the starting daemon (pid 10524) made no progress for 1003 ms (the 1000 ms liveness window); killing it
+slates anchor: daemon exited (None); restarted as pid 10526 (1 in the window)
+slates anchor: daemon exited (None); restarted as pid 10618 (1 in the window)
+slates anchor: daemon exited (None); restarted as pid 10683 (1 in the window)
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 74 filtered out; finished in 20.58s
+== cli restart exit 0 in 21 s, load 10.08
