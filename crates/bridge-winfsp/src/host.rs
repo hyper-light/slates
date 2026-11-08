@@ -287,7 +287,8 @@ enum Reply {
 /// from the channel [`MountThread::start`] was given and serves it on the owner shard ([`Request::serve`]).
 pub struct Request {
   op: Op,
-  reply: SyncSender<Reply>,
+  /// The reply, with the shard's send stamp for the profile's `to_answer` (diag only).
+  reply: SyncSender<(Reply, u64)>,
   /// DIAG ONLY: when it was posted, and its operation's profile slot.
   posted: u64,
   slot: usize,
@@ -388,7 +389,7 @@ impl Request {
 /// A served request whose reply is still to be sent.
 pub struct Served {
   reply: Reply,
-  sender: SyncSender<Reply>,
+  sender: SyncSender<(Reply, u64)>,
   barrier: bool,
   echo: bool,
 }
@@ -413,8 +414,7 @@ impl Served {
 
   /// Sends the reply to the waiting dispatcher thread. `false` when that thread is gone (the mount is being torn down).
   pub fn send(self) -> bool {
-    crate::phases::LAST_SENT.store(crate::phases::now(), std::sync::atomic::Ordering::Relaxed);
-    self.sender.send(self.reply).is_ok()
+    self.sender.send((self.reply, crate::phases::now())).is_ok()
   }
 }
 
@@ -706,15 +706,17 @@ impl Handler {
       return Reply::Err(crate::status_unsuccessful());
     }
     self.wake.wake_by_ref();
-    let reply = answer
-      .recv()
-      .unwrap_or(Reply::Err(crate::status_unsuccessful()));
+    let answered = answer.recv();
     let end = crate::phases::now();
     crate::phases::record(slot, crate::phases::ROUND, start, end);
-    let sent = crate::phases::LAST_SENT.load(std::sync::atomic::Ordering::Relaxed);
-    if sent >= start {
-      crate::phases::record(slot, crate::phases::TO_ANSWER, sent, end);
-    }
+    let Ok((reply, sent)) = answered else {
+      return Reply::Err(crate::status_unsuccessful());
+    };
+    // This request's own send stamp, carried with its reply: the old global stamp was often another dispatcher thread's.
+    // The DLL arm's threads never spin for a reply, so every wait is a park (std's channel spins a few microseconds
+    // inside `recv` first, which this cannot separate).
+    crate::phases::record(slot, crate::phases::TO_ANSWER, sent, end);
+    crate::phases::record(slot, crate::phases::TO_ANSWER_PARKED, sent, end);
     reply
   }
 }
