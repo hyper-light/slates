@@ -13610,7 +13610,13 @@ last), `crates/cli/tests/nfs_held.rs` (the history test).
 - **2026-11-07, a regression fixed** (`docs/bugs/2026-11-07-a-held-connections-own-write-back-was-refused-as-stale.md`):
   the carry consumed the live trackers inside a call, before the call's own records were noted, so a held connection's
   own write went stale and its next write-back was refused (main CI 42395077767, fsx over the macOS mount). The carry
-  now reads a copy and leaves the live states alone.
+  now reads a copy and leaves the live states alone. The A/B that decides it is `diag-bug-sweep-17` (run 42425914509;
+  one macos-latest runner, macOS 26.7.2; each tree built into its own target dir; `cargo xtask conformance all`
+  interleaved): e86fb417 failed fsx seed 1 over native-macos-nfs in both of its rounds, the fix passed both, and
+  pjdfstest was identical in all four (6,781 passed, 1,905 expected failures, 0 unexpected). Main's first green macOS
+  conformance after the fix landed agrees (4811191a, run 42434181746). Two runs a side is a small sample, but nothing
+  else differed. `diag-bug-sweep-15` and `-16` do not count: their trees shared one target dir, so each harness may
+  have run the last binary built.
 ### A-239 — On Windows the daemon reports an administrator's full crash dumps; it registers no region exclusion (accepted 2026-11-07, the supervisor's decision: option b)
 Applied in the same change to: §1's RAM-only guarantee 2, GAPS (`8a-win-dumps`), `crates/server` (`local_dumps.rs`,
 new; the daemon's start reads it; `verbs.rs`: the status field; `tests/dump_exclusion.rs`, new), `crates/ipc`
