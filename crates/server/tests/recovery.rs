@@ -158,8 +158,10 @@ fn an_unpublished_verb_is_refused_typed_a_retry_re_executes_and_a_restart_agrees
 /// ring is small that acknowledgement fell between the refusal and the retry, took the refused
 /// sequence with it, and the retry was answered `DuplicateRequest` — the contract's "retry under the
 /// same id" lost to the bookkeeping. Here the acknowledgement is forced right after the refusal: the
-/// retry must still re-execute, so the client's watermark must stop below an unpublished id until it
-/// is retried. Non-vacuous: before the fix the retry was refused `DuplicateRequest`.
+/// retry must still re-execute, so the acknowledgement must name an unpublished id owed until it is
+/// retried (since 2026-11-07 it covers the id and names it, rather than stopping below it, §4.9).
+/// Non-vacuous: the acknowledgement's watermark passes the id, and before the 2026-09 fix the retry was
+/// refused `DuplicateRequest`.
 #[test]
 fn an_unpublished_verb_stays_retryable_across_the_clients_acknowledgement() {
   let profile = common::machine_profile();
@@ -180,8 +182,8 @@ fn an_unpublished_verb_stays_retryable_across_the_clients_acknowledgement() {
     .acknowledge_all()
     .expect("the acknowledgement is served");
   assert!(
-    client.acknowledged() < create_id.sequence,
-    "the watermark stops below the unpublished id ({} < {})",
+    client.acknowledged() >= create_id.sequence,
+    "the acknowledgement covers the unpublished id ({} >= {}), naming it owed",
     client.acknowledged(),
     create_id.sequence
   );
@@ -191,13 +193,30 @@ fn an_unpublished_verb_stays_retryable_across_the_clients_acknowledgement() {
     panic!("the retry re-executes the create after the acknowledgement: {retried:?}");
   };
   assert_ne!(created, durable, "a distinct volume");
-  // Retried and answered, the id no longer holds the watermark back.
+  // Retried and answered, the id is no longer owed: the next acknowledgement releases it like any other.
   client
     .acknowledge_all()
     .expect("the acknowledgement is served");
+  let again = client.retry(
+    create_id,
+    &RequestBody::Create {
+      name: "unpublished".to_owned(),
+      size: SizeClass::Bounded { limit: 1 << 20 },
+      names: NamePolicy::Exact,
+      require_locked: false,
+      base: None,
+    },
+  );
   assert!(
-    client.acknowledged() >= create_id.sequence,
-    "once retried the id is acknowledged like any other"
+    matches!(
+      again,
+      Err(ClientError::Refused(
+        slates_ipc::protocol::Refusal::DuplicateRequest
+      )) | Ok(ReplyBody::Refused {
+        refusal: slates_ipc::protocol::Refusal::DuplicateRequest
+      })
+    ),
+    "once retried and acknowledged, the id is released like any other: {again:?}"
   );
   assert_eq!(
     names_listed(&mut client),
@@ -3040,6 +3059,61 @@ fn recovery_memory_no_restart_reads_goes_back_and_a_restart_recovers_every_file(
       "the restarted daemon gave it back again"
     );
   }
+}
+
+/// A-117 and A-226, an idle shard gives back only the recovery memory written since its last give-back: do write a
+/// round of files, publish (a checkpoint) and give the dead memory back; then write one small file, publish again (a
+/// delta appended past the tail) and give back again. Expect the second give-back to return nothing, since the delta
+/// is live and nothing past it was written; then expect every file after a restart. Before A-226 every publication
+/// re-armed a give-back of the whole stale slot and the whole log past the tail, written or not: 18,325,143,552 bytes
+/// marked reusable on a Mac Studio, 18–21 ms of the shard's CPU in one poll, which every request arriving meanwhile
+/// waited behind (the late-request tail of BENCHMARKS' macOS paced runs).
+#[test]
+fn a_give_back_returns_only_recovery_memory_written_since_the_last() {
+  /// Shape: files in the first round, so its checkpoint is many times the later delta.
+  const ROUND: u64 = 200;
+  let profile = common::machine_profile();
+  let instance = format!("srv-recovery-written-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let anchor = held_anchor("recovery-written", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let volume = client
+    .create(&CreateSpec {
+      size: SizeClass::Bounded { limit: 64 << 20 },
+      ..scratch("written")
+    })
+    .unwrap();
+  let attachment = client
+    .attach(volume, None, slates_ipc::protocol::Intent::Write)
+    .unwrap()
+    .attachment;
+  for index in 0..ROUND {
+    let body = format!("file {index} of round 0").into_bytes();
+    client
+      .fs_write((volume, attachment), &format!("r{index}"), &body, 0o644)
+      .unwrap();
+  }
+  first.publish_every_shard().unwrap();
+  let _ = first.give_back_recovery_on_every_shard().unwrap();
+  let body = format!("file {ROUND} of round 1").into_bytes();
+  client
+    .fs_write((volume, attachment), &format!("r{ROUND}"), &body, 0o644)
+    .unwrap();
+  first.publish_every_shard().unwrap();
+  let after_delta = first.give_back_recovery_on_every_shard().unwrap();
+  assert_eq!(
+    after_delta, 0,
+    "a delta-only publication left nothing dead to give back, yet {after_delta} bytes were given back"
+  );
+  first.stop();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  assert_every_file(&mut client, volume, ROUND + 1, ROUND);
+  second.stop();
+  drop(anchor);
 }
 
 /// The recovery bytes `daemon` counts given back once its shard goes idle, above `before`, waiting up to the bound.

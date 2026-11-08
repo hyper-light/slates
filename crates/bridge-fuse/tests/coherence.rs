@@ -30,7 +30,10 @@ fn attach(attachments: &mut Attachments, uid: u32) -> AttachmentId {
     .attach(
       VOLUME,
       View::Current,
-      Principal::Uid { uid },
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid,
+      },
       Rights {
         read: true,
         write: true,

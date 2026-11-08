@@ -343,6 +343,7 @@ fn a_client_node_pushes_files_to_a_server_nodes_green_and_the_server_presents_th
   let project = format!("{}/project", dir.path);
   seed_project(&project);
   let (volume, snapshot, green) = server_green(&server, &project);
+  share_with_client(&server, &green, &client);
   the_client_pushes(&client, &green);
   assert_eq!(
     ok(&server, &["read", &green, "src/two.txt"]),
@@ -351,6 +352,28 @@ fn a_client_node_pushes_files_to_a_server_nodes_green_and_the_server_presents_th
   the_server_checks_out_and_presents(&server, &green, (&volume, &snapshot), &project);
   drop(daemons);
   drop(dir);
+}
+
+/// Shares `volume` through `server` with this test's account on `client`'s node (A-237): a local account means something
+/// only on its host, so the operator of a server a client node reaches shares what that node works on.
+fn share_with_client(server: &str, volume: &str, client: &str) {
+  let status = ok(client, &["status"]);
+  let anchor = status
+    .lines()
+    .find_map(|line| line.strip_prefix("anchor: "))
+    .unwrap_or_else(|| panic!("no anchor in {status:?}"));
+  let account = rustix::process::getuid().as_raw();
+  ok(
+    server,
+    &[
+      "share",
+      volume,
+      &format!("uid:{account}@{anchor}"),
+      "--read",
+      "--write",
+      "--admin",
+    ],
+  );
 }
 
 /// From the client node, through the fleet's forward (both nodes run as this test's user): reads the server's green,
@@ -492,6 +515,7 @@ fn a_client_node_attaches_a_server_volume_for_writing_and_writes_through_it() {
       "--json",
     ],
   ));
+  share_with_client(&server, &volume, &client);
   // The client holds one session for its work, as an agent does (A-222: a CLI `attach` and a later `write` are two
   // processes, and the first's client is reaped within two liveness budgets of its exit).
   let mut session = sdk(&client);
@@ -649,6 +673,7 @@ fn a_killed_remote_holder_is_reaped_at_the_owner_and_its_lease_ends_within_its_t
       "--json",
     ],
   ));
+  share_with_client(&server, &volume, &client);
   assert_eq!(
     eventually(&client, &["read", &volume, "README"]),
     "readme original"
@@ -694,8 +719,8 @@ fn a_killed_remote_holder_is_reaped_at_the_owner_and_its_lease_ends_within_its_t
 }
 
 /// A-222 hostile forward. Do: the server attaches its own volume for writing, locally; from the client node, write and
-/// detach through that attachment's id. Expect: both refused `Forbidden` (a forward may act only through its own
-/// host's attachment), and the server's attachment and file unchanged.
+/// detach through that attachment's id. Expect: both refused (a forward may act only through its own host's attachment;
+/// A-237 reports a forwarded `Forbidden` as `NotShared`), and the server's attachment and file unchanged.
 #[test]
 fn a_forward_naming_another_hosts_attachment_is_refused() {
   if std::env::var_os("SLATES_TEST_CLI").is_none() || std::env::var_os(HOLDER_ROLE).is_some() {
@@ -718,6 +743,7 @@ fn a_forward_naming_another_hosts_attachment_is_refused() {
       "--json",
     ],
   ));
+  share_with_client(&server, &volume, &client);
   let local: serde_json::Value =
     serde_json::from_str(&ok(&server, &["attach", &volume, "--write", "--json"])).unwrap();
   let attachment = local["attachment"].to_string();
@@ -732,8 +758,8 @@ fn a_forward_naming_another_hosts_attachment_is_refused() {
   );
   assert_eq!(code, 1, "{out}{err}");
   assert!(
-    err.contains("Forbidden"),
-    "the write is refused Forbidden: {out}{err}"
+    err.contains("NotShared"),
+    "the write is refused NotShared: {out}{err}"
   );
   let (code, out, err) = run(
     &client,
@@ -741,8 +767,8 @@ fn a_forward_naming_another_hosts_attachment_is_refused() {
   );
   assert_eq!(code, 1, "{out}{err}");
   assert!(
-    err.contains("Forbidden"),
-    "the detach is refused Forbidden: {out}{err}"
+    err.contains("NotShared"),
+    "the detach is refused NotShared: {out}{err}"
   );
   assert_eq!(ok(&server, &["read", &volume, "README"]), "readme original");
   assert_eq!(
@@ -786,6 +812,7 @@ fn a_retired_hosts_attachments_end_at_the_owner() {
       "--json",
     ],
   ));
+  share_with_client(&server, &volume, &client);
   assert_eq!(
     eventually(&client, &["read", &volume, "README"]),
     "readme original"

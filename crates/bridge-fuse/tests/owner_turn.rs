@@ -160,7 +160,15 @@ fn serve(mut channel: FuseChannel, refuse: Receiver<()>, counts: Sender<Counts>)
     write: true,
   };
   let transport = attachments
-    .attach(VOLUME, View::Current, Principal::Uid { uid }, rights)
+    .attach(
+      VOLUME,
+      View::Current,
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid,
+      },
+      rights,
+    )
     .unwrap();
   attachments.set_coherence(transport, slates_bridge_core::CacheCoherence::Invalidated);
   let mut bridge = VolumeBridge::new(VOLUME, &mut volume, &mut store);

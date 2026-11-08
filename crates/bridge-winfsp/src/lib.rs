@@ -60,6 +60,7 @@ pub mod purge;
 pub mod purge_client;
 #[cfg(windows)]
 mod purge_intents;
+pub mod purge_slot;
 #[cfg(windows)]
 mod purge_token;
 // How the receive thread waits for a shard's reply: spin for what a wake costs, then park (A-212).

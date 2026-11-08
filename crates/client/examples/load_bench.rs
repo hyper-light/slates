@@ -166,11 +166,17 @@ struct Agent {
   /// submit waiting on the fleet commit is answered `Overloaded` while its acceptance commits), and only the same id
   /// meets its completion record; the client keeps its acknowledgement below the id until the resend.
   retry: Option<(u64, u64, Kind)>,
+  /// The pause before this client sends again after a refusal for now (`LeaseUnconfirmed`, `AcknowledgementOwed`, a
+  /// refusal retryable under its id), doubling while they repeat (`Client::retry_pause_ns`), zero once a reply moves
+  /// it on. Resent at once, 1,000 clients refused `LeaseUnconfirmed` after a primary's kill sent 20,000 a second.
+  pause_ns: u64,
 }
 
 /// What a worker brings back.
 #[derive(Default)]
 struct Tally {
+  /// Replies taken: a worker's sign of motion, for its stall dump.
+  answered: u64,
   latencies: BTreeMap<Kind, Vec<u64>>,
   submits: Vec<SubmitEvent>,
   refusals: BTreeMap<String, u64>,
@@ -245,10 +251,12 @@ fn walk(client: &mut Client, green: VolumeId) -> Vec<(String, u64)> {
   let mut files = Vec::new();
   let mut dirs = vec![String::new()];
   while let Some(dir) = dirs.pop() {
-    for entry in client
-      .list_dir(green, &dir, ReadAt::Version { version: 0 })
-      .unwrap()
-    {
+    // Patient: a kill rung's node may go down while the setup walks (fixtures' 1,000-client primary kill answered a
+    // listing `OwnerUnreachable` 23 s in, 2026-11-07).
+    let entries = patiently(client, &format!("list {dir}"), |client| {
+      client.list_dir(green, &dir, ReadAt::Version { version: 0 })
+    });
+    for entry in entries {
       let path = if dir.is_empty() {
         entry.name.clone()
       } else {
@@ -727,6 +735,11 @@ const REBASE_CONFLICTS_NAMED: u64 = 5;
 const PROGRESS_NAMED: usize = 4;
 /// Shape: how often a worker prints its progress, so a long or stuck level shows where it is.
 const PROGRESS_EVERY: Duration = Duration::from_secs(5);
+/// Shape: how long a worker goes with no reply before it dumps where every connection's replies stand
+/// ([`Worker::stall_dump`]), once per stall. Twelve progress reports: a stall, not a slow commit.
+const STALL_DUMP_AFTER: Duration = Duration::from_secs(60);
+/// Shape: the stuck requests a stall dump names per connection.
+const STALL_NAMED: usize = 4;
 /// Shape: how many times per reply deadline a worker looks for overdue requests: often enough that a lost reply is
 /// named within a few percent of the deadline past it, rarely enough that the scan costs nothing next to the sweeps.
 const OVERDUE_CHECKS_PER_DEADLINE: u64 = 16;
@@ -889,6 +902,7 @@ impl Worker {
         }
       };
       answered = true;
+      self.tally.answered += 1;
       let agent = &mut self.agents[a];
       let Some((_, sent_ns, kind)) = agent.inflight.take() else {
         continue;
@@ -910,14 +924,30 @@ impl Worker {
           continue;
         }
         agent.retry = Some((word, sent_ns, kind));
-        self.ready.push(std::cmp::Reverse((now, a)));
-        continue;
-      }
-      agent.advance(reply, (sent_ns, now, kind), &mut self.tally);
-      if agent.step != Step::Done {
+        agent.pause_ns = self.conns[agent.conn].client.retry_pause_ns(agent.pause_ns);
         self
           .ready
-          .push(std::cmp::Reverse((now.saturating_add(self.think_ns), a)));
+          .push(std::cmp::Reverse((now.saturating_add(agent.pause_ns), a)));
+        continue;
+      }
+      let for_now = matches!(
+        &reply,
+        ReplyBody::Refused {
+          refusal: Refusal::LeaseUnconfirmed { .. } | Refusal::AcknowledgementOwed { .. }
+        }
+      );
+      agent.advance(reply, (sent_ns, now, kind), &mut self.tally);
+      if agent.step != Step::Done {
+        let wait = if for_now {
+          agent.pause_ns = self.conns[agent.conn].client.retry_pause_ns(agent.pause_ns);
+          agent.pause_ns
+        } else {
+          agent.pause_ns = 0;
+          self.think_ns
+        };
+        self
+          .ready
+          .push(std::cmp::Reverse((now.saturating_add(wait), a)));
       }
     }
     // The daemon keeps every reply's completion record until the client acknowledges it, and refuses a client that
@@ -1034,6 +1064,47 @@ impl Worker {
     }
   }
 
+  /// Where every connection with a request in flight stands, printed once per stall, so a stalled level names its hop
+  /// without a debugger (fixtures' f = 1 stalls of 2026-11-07, where ptrace was not allowed): `ring_unread` or `held`
+  /// above zero is a reply that came and was not collected (the harness's side); both zero with requests awaited is a
+  /// reply that never came (the daemon's side, placed by its `fleet.forward.*` hop counters).
+  fn stall_dump(&self, worker: usize, quiet: Duration) {
+    let now = ns_since(self.epoch);
+    for (c, conn) in self.conns.iter().enumerate() {
+      if conn.inflight.is_empty() {
+        continue;
+      }
+      let (unread, held, awaited) = conn.client.reply_state();
+      let named: Vec<String> = conn
+        .inflight
+        .iter()
+        .take(STALL_NAMED)
+        .map(|(word, a)| {
+          let agent = &self.agents[*a];
+          let age = agent
+            .inflight
+            .map_or(0, |(_, sent, _)| now.saturating_sub(sent) / 1_000_000);
+          let kind = agent.inflight.map(|(_, _, kind)| kind);
+          format!(
+            "{word:#x}:{kind:?}:{age}ms:defers={}",
+            conn.client.defers(*word)
+          )
+        })
+        .collect();
+      println!(
+        "stall\t{worker}\tquiet_ms\t{}\tconn\t{c}\tinflight\t{}\toutstanding\t{}\tawaited\t{awaited}\tring_unread\t{unread:?}\theld\t{held}\tunawaited_dropped\t{}\treconnecting\t{}\tresend\t{}\tdaemon_gone\t{}\tstuck\t{}",
+        quiet.as_millis(),
+        conn.inflight.len(),
+        conn.client.outstanding().len(),
+        conn.client.unawaited_dropped(),
+        conn.reconnecting.is_some(),
+        conn.resend.len(),
+        conn.client.daemon_gone(),
+        named.join(",")
+      );
+    }
+  }
+
   fn progress(&self, worker: usize) {
     let done = self
       .agents
@@ -1088,6 +1159,10 @@ fn drive(conns: Vec<Connection>, agents: Vec<Agent>, epoch: Instant, worker: usi
   };
   let mut reported = Instant::now();
   let mut checked = ns_since(epoch);
+  // The last time any reply moved a client on, and whether this stall was dumped.
+  let mut moved = Instant::now();
+  let mut answers = 0u64;
+  let mut dumped = false;
   while state.agents.iter().any(|agent| agent.step != Step::Done) {
     let sweep = Instant::now();
     for c in 0..state.conns.len() {
@@ -1109,6 +1184,15 @@ fn drive(conns: Vec<Connection>, agents: Vec<Agent>, epoch: Instant, worker: usi
     if reported.elapsed() >= PROGRESS_EVERY {
       reported = Instant::now();
       state.progress(worker);
+    }
+    let answered = state.tally.answered;
+    if answered != answers {
+      answers = answered;
+      moved = Instant::now();
+      dumped = false;
+    } else if !dumped && moved.elapsed() >= STALL_DUMP_AFTER {
+      dumped = true;
+      state.stall_dump(worker, moved.elapsed());
     }
   }
   state.tally
@@ -1434,7 +1518,7 @@ fn resolve_unknown(
   head_before: u64,
   submits: &mut [SubmitEvent],
 ) -> Vec<u64> {
-  let head = reader.versions(green).unwrap().saturating_sub(head_before);
+  let head = versions_patiently(reader, green).saturating_sub(head_before);
   let known: BTreeSet<u64> = submits
     .iter()
     .filter_map(|e| match e.outcome {
@@ -1489,14 +1573,57 @@ fn read_files(
     .collect()
 }
 
-/// A file read that a busy daemon may stall past one reply deadline: tried again up to `reply_patience` times (the
-/// oracle's reads come after every client is done, so a stall here is the daemon draining, never a lost answer).
+/// A file read that a busy daemon may stall past one reply deadline, or refuse for now: tried again (`patiently`).
 fn read_patiently(client: &mut Client, green: VolumeId, path: &str, at: ReadAt) -> Vec<u8> {
-  let mut tries = 0;
+  patiently(client, &format!("read {path}"), |client| {
+    client.read(green, path, at)
+  })
+}
+
+/// The green's version count, asked patiently.
+fn versions_patiently(client: &mut Client, green: VolumeId) -> u64 {
+  patiently(client, "versions", |client| client.versions(green))
+}
+
+/// An oracle or setup call tried again while its answer is only late or refused for now: a stall past one reply
+/// deadline (the daemon draining after every client is done), its daemon gone for longer than one reconnect budget, `LeaseUnconfirmed` (an owner confirming its lease after a node's
+/// kill: fixtures' 1,000-client replica-kill rung aborted the harness on one, 2026-11-07), `Overloaded` or
+/// `OwnerUnreachable`. Paced by the client's own retry pause and bounded by `reply_patience` reconnect budgets, past
+/// which the harness stops with the last answer named.
+fn patiently<T>(
+  client: &mut Client,
+  what: &str,
+  mut call: impl FnMut(&mut Client) -> Result<T, ClientError>,
+) -> T {
+  let started = Instant::now();
+  let bound = Duration::from_nanos(
+    client
+      .deadlines()
+      .reconnect_ns
+      .saturating_mul(reply_patience()),
+  );
+  let mut pause_ns = 0;
   loop {
-    match client.read(green, path, at) {
-      Err(ClientError::Stalled { .. }) if tries < reply_patience() => tries += 1,
-      other => return other.unwrap(),
+    match call(client) {
+      Ok(answer) => return answer,
+      Err(
+        ClientError::Stalled { .. }
+        // A kill rung's restarted node may take longer than one reconnect budget to come back; each call reconnects
+        // again (fixtures' 1,000-client primary kill: `versions` met `DaemonGone` 7.52 s in, 2026-11-07).
+        | ClientError::DaemonGone { .. }
+        | ClientError::Refused(
+          Refusal::LeaseUnconfirmed { .. }
+          | Refusal::Overloaded { .. }
+          | Refusal::OwnerUnreachable { .. },
+        ),
+      ) if started.elapsed() < bound => {
+        pause_ns = client.retry_pause_ns(pause_ns);
+        let resume = Instant::now() + Duration::from_nanos(pause_ns);
+        while Instant::now() < resume {
+          std::thread::yield_now();
+        }
+      }
+      Err(e) => panic!("harness {what}: {e} after {:?}", started.elapsed()),
     }
   }
 }
@@ -1536,6 +1663,7 @@ fn spread(
       resolutions: 0,
       inflight: None,
       retry: None,
+      pause_ns: 0,
     });
   }
   groups
@@ -1589,7 +1717,7 @@ fn level(
     .map(|slot| slot.path.clone())
     .collect();
   let mut reader = connect(first_instance(instance)).unwrap();
-  let head_before = reader.versions(green).unwrap();
+  let head_before = versions_patiently(&mut reader, green);
   let base = read_files(&mut reader, green, &paths, ReadAt::Head);
   let connect_started = Instant::now();
   let per_connection = per_connection();
@@ -1668,6 +1796,9 @@ fn level(
       *v -= head_before;
     }
   }
+  // The oracle reads through a connection made now: the one made before the load may belong to a daemon a kill rung
+  // has since restarted (its `versions` answered `DaemonGone` after the primary's kill, 2026-11-07).
+  let mut reader = connect(first_instance(instance)).unwrap();
   let unexplained = resolve_unknown(&mut reader, green, head_before, &mut total.submits);
   let head = read_files(&mut reader, green, &paths, ReadAt::Head);
   if std::env::args().any(|a| a == "--events") {

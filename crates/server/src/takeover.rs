@@ -58,6 +58,32 @@ const TAKEOVER_STALE_CONFIGURATION: &str = "fleet.takeover.stale_configuration";
 /// The status count of takeover rounds refused because no epoch could supersede what they must fence — a
 /// holder's fence or a held record at `u64::MAX` (AUD-29-26's sibling): the round never reuses an epoch.
 const TAKEOVER_EPOCH_EXHAUSTED: &str = "fleet.takeover.epoch_exhausted";
+/// The status count of takeover pages a holder did not answer because the round's configuration differs from the
+/// one it installed: refused `ConfigurationStale` when the round's is older, unanswered (the holder fetches) when it
+/// is newer, or when the holder's council has not installed its own placement's version yet. Format: a refusal name in
+/// the daemon's status report.
+const TAKEOVER_PAGE_UNMATCHED: &str = "fleet.takeover.page_unmatched";
+/// The status count of takeover periods whose page requests went unsent: every member asked was lent elsewhere or had
+/// no session. Format: a refusal name in the daemon's status report.
+const TAKEOVER_PAGES_UNSENT: &str = "fleet.takeover.pages_unsent";
+/// The status count of page answers a successor could not bind to its request (no promise, another holder's, or
+/// another round's), which count as no promise. Format: a refusal name in the daemon's status report.
+const TAKEOVER_PAGE_UNBOUND: &str = "fleet.takeover.page_unbound";
+/// The status count of takeover periods skipped because this node's placement is behind its council's configuration.
+/// Format: a refusal name in the daemon's status report.
+const TAKEOVER_ROUND_BEHIND: &str = "fleet.takeover.round_behind";
+/// The status count of adoptions this period that did not place: the re-committed record reached too few candidates.
+/// The object stays learned and is adopted again next period. Format: a refusal name in the daemon's status report.
+const TAKEOVER_ADOPT_UNPLACED: &str = "fleet.takeover.adopt_unplaced";
+/// Of [`TAKEOVER_ADOPT_UNPLACED`]: this node's own hold of the adopted record was refused or is not a candidate.
+const TAKEOVER_ADOPT_LOCAL_REFUSED: &str = "fleet.takeover.adopt_unplaced.local";
+/// Of [`TAKEOVER_ADOPT_UNPLACED`]: no other candidate's session could be taken for the commit.
+const TAKEOVER_ADOPT_NO_HOLDERS: &str = "fleet.takeover.adopt_unplaced.no_holders";
+/// Of [`TAKEOVER_ADOPT_UNPLACED`]: the candidates taken answered without a binding acknowledgement.
+const TAKEOVER_ADOPT_UNACKED: &str = "fleet.takeover.adopt_unplaced.unacked";
+/// The status count of learned objects a period left unadopted because a recovery cohort had not promised them yet.
+/// Format: a refusal name in the daemon's status report.
+const TAKEOVER_UNPROMISED: &str = "fleet.takeover.unpromised";
 
 /// The status refusal count under which a holder records a takeover page it deferred because its own answers
 /// to the retired owner's probes may still feed that owner's lease (§4.8 "Leases and reads", AUD-08); the
@@ -343,6 +369,7 @@ pub(crate) fn serve_host_prepare(
   }
   let installed = state.fleet.configuration().version;
   if prepare.generation != installed || state.council.configuration().version != installed {
+    state.count(TAKEOVER_PAGE_UNMATCHED, 1);
     if prepare.generation > installed {
       state.config_refresh_wanted = true;
       return Vec::new();
@@ -550,6 +577,7 @@ pub(crate) fn begin_round(
 ) -> Option<Vec<(HostId, HostPrepare)>> {
   let regional = state.council.configuration().clone();
   if state.fleet.configuration().version != regional.version {
+    state.count(TAKEOVER_ROUND_BEHIND, 1);
     return None;
   }
   let Some(first_epoch) = initial_epoch(state, &regional, departed, local) else {
@@ -699,6 +727,7 @@ async fn ask_pages(
   let wanted: BTreeMap<HostId, HostPrepare> = requests.into_iter().collect();
   let sessions = take_sessions("fleet.lent_to.ask_pages", |host| wanted.contains_key(&host));
   if sessions.is_empty() {
+    let _ = state::with_state(|s| s.count(TAKEOVER_PAGES_UNSENT, 1));
     return None;
   }
   let sent: Vec<HostId> = sessions.iter().map(|(host, _)| *host).collect();
@@ -714,6 +743,7 @@ async fn ask_pages(
   let mut recovered = Vec::with_capacity(replied.len());
   let mut answers = Vec::new();
   let mut stale = None;
+  let mut unbound: u64 = 0;
   for (host, reply, endpoint) in replied {
     if let Some(slates_db::register::Refusal::ConfigurationStale { version }) =
       slates_db::register::decode_refusal(&reply.bytes)
@@ -727,6 +757,8 @@ async fn ask_pages(
         .is_some_and(|prepare| promise.binds(prepare))
     {
       answers.push((host, promise));
+    } else {
+      unbound = unbound.saturating_add(1);
     }
     recovered.push((host, endpoint));
   }
@@ -741,6 +773,9 @@ async fn ask_pages(
     if stale.is_some_and(|version| version > s.council.configuration().version) {
       s.config_refresh_wanted = true;
       s.count(TAKEOVER_STALE_CONFIGURATION, 1);
+    }
+    if unbound > 0 {
+      s.count(TAKEOVER_PAGE_UNBOUND, unbound);
     }
     fold_answers(s, departed, answers);
   });
@@ -796,6 +831,7 @@ pub(crate) fn ready_objects(
   };
   let mut ready = Vec::new();
   let mut lost = Vec::new();
+  let mut unpromised: u64 = 0;
   for (object, reports) in &take.learned {
     let mut promised_everywhere = true;
     for (owner, cohort) in regional
@@ -826,7 +862,16 @@ pub(crate) fn ready_objects(
     }
     if promised_everywhere && let Some(newest) = reports.values().cloned().reduce(newest_of) {
       ready.push((*object, newest));
+    } else if !lost
+      .iter()
+      .any(|judged: &LostJudgement| judged.object == *object)
+    {
+      unpromised = unpromised.saturating_add(1);
     }
+  }
+  if unpromised > 0 {
+    let count = state.refusals.entry(TAKEOVER_UNPROMISED).or_insert(0);
+    *count = count.saturating_add(unpromised);
   }
   for judgement in lost {
     take.learned.remove(&judgement.object);
@@ -944,6 +989,7 @@ async fn adopt(
     host != local && shape.candidates.contains(&host)
   });
   let taken: Vec<HostId> = holders.iter().map(|(host, _)| *host).collect();
+  let no_holders = taken.is_empty();
   let committed = commit_record(
     local,
     &mut acceptor,
@@ -974,6 +1020,20 @@ async fn adopt(
     LateReplies::Discard,
   );
   return_sessions(committed.reusable);
+  let acked = match &committed.outcome {
+    Ok(placement)
+    | Err(ClusterError::Uncertain { placement } | ClusterError::NotPlaced { placement }) => {
+      placement.acked.clone()
+    }
+    Err(_) => Vec::new(),
+  };
+  let unplaced_cause = if !acked.contains(&local) {
+    TAKEOVER_ADOPT_LOCAL_REFUSED
+  } else if no_holders {
+    TAKEOVER_ADOPT_NO_HOLDERS
+  } else {
+    TAKEOVER_ADOPT_UNACKED
+  };
   let placement = match committed.outcome {
     Ok(placement) if placement.placed(quorum) => Some(placement),
     Ok(_) | Err(ClusterError::Uncertain { .. } | ClusterError::NotPlaced { .. }) => None,
@@ -983,6 +1043,9 @@ async fn adopt(
     s.holder_records.insert(object, acceptor);
     if let Some(placement) = placement {
       record_adoption(s, departed, object, &record, placement, local);
+    } else {
+      s.count(TAKEOVER_ADOPT_UNPLACED, 1);
+      s.count(unplaced_cause, 1);
     }
   });
   Some(dispatch)
