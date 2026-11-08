@@ -3386,7 +3386,7 @@ fn init_shard(
     journal: slates_vfs::checkpoint_log::Journal::default(),
     checkpoint_buffer: Vec::new(),
     published_keys: std::collections::BTreeSet::new(),
-    published_held: Vec::new(),
+    published_held: crate::content_holder::PublishedHeld::default(),
     #[cfg(target_os = "linux")]
     write_log,
     #[cfg(target_os = "linux")]
@@ -3505,7 +3505,7 @@ fn init_shard(
     discovery: None,
     enrolled: Vec::new(),
     demuxes: Vec::new(),
-    holder_records: std::collections::BTreeMap::new(),
+    holder_records: crate::tracked::Tracked::default(),
     live: crate::live_ship::LiveState::default(),
     host_takeovers: std::collections::BTreeMap::new(),
     config_refresh_wanted: false,

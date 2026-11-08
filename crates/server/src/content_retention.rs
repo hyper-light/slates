@@ -130,7 +130,7 @@ fn keeps(
 /// Applies the retention rule to what this holder holds for `object` now; returns how many manifests went.
 pub(crate) fn retain_object(state: &mut ShardState, object: ObjectId) -> usize {
   let local = state.fleet.host();
-  let newest = newest(&state.holder_records, object);
+  let newest = newest(state.holder_records.as_map(), object);
   let newest_placed = state.held_content.newest_placed(object).unwrap_or(0);
   let space = &mut crate::content_holder::hold_space(&mut state.store);
   let released = state

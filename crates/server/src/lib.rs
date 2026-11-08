@@ -129,6 +129,7 @@ pub mod telemetry;
 // A writer outside FUSE answered once every FUSE mount of its volume was told (AC-3.3).
 mod told;
 pub mod tombstone;
+mod tracked;
 // The transport capability report of §4.6 A-9 (what `attach` and `status` say each transport can do
 // on this host); pure over one platform seam, so it compiles and tests everywhere.
 pub mod transports;

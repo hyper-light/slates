@@ -25,8 +25,8 @@ use slates_wire::crc32c::{crc32c, crc32c_append};
 use crate::delta::VolumeRecord;
 use crate::error::VfsError;
 use crate::recover::{
-  CommittedSlot, HELD_CALL_KEY_BYTES, HeldCall, HeldNfsReply, HeldNfsStates, HeldReply, ImageRead,
-  ImageWrite, ShardImage, StreamedImage,
+  CommittedSlot, HELD_CALL_KEY_BYTES, HELD_PIECE_KEY_BYTES, HeldCall, HeldNfsReply, HeldNfsStates,
+  HeldPiece, HeldReply, ImageRead, ImageWrite, ShardImage, StreamedImage,
 };
 
 /// Format: a delta's magic, checked before anything else on decode.
@@ -34,8 +34,10 @@ const DELTA_MAGIC: u32 = u32::from_le_bytes(*b"SLD1");
 /// Format: the delta format's version, bumped with any change to the delta's types: 1 (A-68, 2026-10-04); 2 (A-126,
 /// 2026-10-09) a file changed only by writes to its chunked body is carried as its written windows
 /// (`delta::InodePatch`), not its whole image; 3 (A-127, 2026-10-09) the call records changed and purged since the
-/// last publication; 4 (A-128, 2026-10-09) the held NFSv3 replies, whole, when they changed.
-const DELTA_VERSION: u16 = 5;
+/// last publication; 4 (A-128, 2026-10-09) the held NFSv3 replies, whole, when they changed; 5 (A-231, 2026-11-05) the
+/// held connections' byte states; 6 (A-251, 2026-11-07) what the shard holds for other owners as the pieces put and the
+/// keys removed since the last publication, never the whole held image.
+pub const DELTA_VERSION: u16 = 6;
 /// Format: a log frame's header — a little-endian payload length then a CRC-32C of the payload.
 const LOG_HEADER: usize = 2 * size_of::<u32>();
 /// Format: a log frame's payload prefix — its generation and its base checkpoint's generation.
@@ -62,8 +64,10 @@ pub struct ShardDelta {
   pub volumes: Vec<KeyedRecord>,
   /// The volumes no longer held, in key order.
   pub removed: Vec<[u8; 16]>,
-  /// The held replicas' image now, when it changed.
-  pub held: Option<Vec<u8>>,
+  /// The held pieces put since the last publication (A-251), in key order, each whole.
+  pub held_put: Vec<HeldPiece>,
+  /// The held pieces removed since the last publication, in key order.
+  pub held_removed: Vec<[u8; HELD_PIECE_KEY_BYTES]>,
   /// The undelivered barrier replies now, when they changed.
   pub replies: Option<Vec<HeldReply>>,
   /// The call records changed since the last publication (A-127), in key order, each whole.
@@ -98,7 +102,7 @@ impl ShardDelta {
     at: usize,
     volumes: usize,
     removed: &mut [[u8; 16]],
-    held: Option<&[u8]>,
+    (held_put, held_removed): (&mut [HeldPiece], &mut [[u8; HELD_PIECE_KEY_BYTES]]),
     replies: Option<&[HeldReply]>,
     (calls, calls_removed): (&mut [HeldCall], &mut [[u8; HELD_CALL_KEY_BYTES]]),
     (nfs_replies, nfs_states): (Option<&mut [HeldNfsReply]>, Option<&mut [HeldNfsStates]>),
@@ -111,7 +115,16 @@ impl ShardDelta {
     for key in removed.iter() {
       key.encode(out);
     }
-    slates_wire::codec::encode_option_bytes(held, out);
+    held_put.sort_unstable_by_key(|piece| piece.key);
+    slates_wire::codec::encode_len(held_put.len(), out);
+    for piece in held_put.iter() {
+      piece.encode(out);
+    }
+    held_removed.sort_unstable();
+    slates_wire::codec::encode_len(held_removed.len(), out);
+    for key in held_removed.iter() {
+      key.encode(out);
+    }
     match replies {
       None => out.push(slates_wire::codec::OPTION_NONE),
       Some(replies) => {
@@ -161,17 +174,20 @@ impl ShardDelta {
   pub fn new(
     mut volumes: Vec<KeyedRecord>,
     mut removed: Vec<[u8; 16]>,
-    held: Option<Vec<u8>>,
+    (mut held_put, mut held_removed): (Vec<HeldPiece>, Vec<[u8; HELD_PIECE_KEY_BYTES]>),
     replies: Option<Vec<HeldReply>>,
   ) -> ShardDelta {
     volumes.sort_by_key(|volume| volume.key);
     removed.sort_unstable();
+    held_put.sort_unstable_by_key(|piece| piece.key);
+    held_removed.sort_unstable();
     ShardDelta {
       magic: DELTA_MAGIC,
       version: DELTA_VERSION,
       volumes,
       removed,
-      held,
+      held_put,
+      held_removed,
       replies,
       calls: Vec::new(),
       calls_removed: Vec::new(),
@@ -221,8 +237,14 @@ impl ShardImage {
   /// Applies a delta (the module doc): afterwards this image is the shard's image at the delta's publication. A
   /// volume delta over a volume this image does not hold is refused [`VfsError::RecoveryIncomplete`].
   pub fn apply(&mut self, delta: &ShardDelta) -> Result<(), VfsError> {
-    if delta.magic != DELTA_MAGIC || delta.version != DELTA_VERSION {
+    if delta.magic != DELTA_MAGIC {
       return Err(VfsError::RecoveryIncomplete);
+    }
+    if delta.version != DELTA_VERSION {
+      return Err(VfsError::RecoveryVersion {
+        found: delta.version,
+        expected: DELTA_VERSION,
+      });
     }
     for keyed in &delta.volumes {
       let at = self
@@ -255,9 +277,19 @@ impl ShardImage {
     self
       .volumes
       .retain(|volume| delta.removed.binary_search(&volume.key).is_err());
-    if let Some(held) = &delta.held {
-      self.held.clone_from(held);
+    for piece in &delta.held_put {
+      match self.held.binary_search_by_key(&piece.key, |held| held.key) {
+        Ok(at) => {
+          if let Some(held) = self.held.get_mut(at) {
+            held.bytes.clone_from(&piece.bytes);
+          }
+        }
+        Err(at) => self.held.insert(at, piece.clone()),
+      }
     }
+    self
+      .held
+      .retain(|held| delta.held_removed.binary_search(&held.key).is_err());
     if let Some(replies) = &delta.replies {
       self.replies.clone_from(replies);
     }
@@ -601,6 +633,17 @@ fn read_frame<L: ImageRead + ?Sized>(
   let Some((generation, body, total)) = read_raw(log, at, base)? else {
     return Ok(None);
   };
+  // A CRC-valid frame of another build's delta version is refused by its version, never read as torn: ending the
+  // replay there would recover the checkpoint without the acknowledged deltas after it.
+  if let Some((magic, version)) = crate::recover::read_header(&body)
+    && magic == DELTA_MAGIC
+    && version != DELTA_VERSION
+  {
+    return Err(VfsError::RecoveryVersion {
+      found: version,
+      expected: DELTA_VERSION,
+    });
+  }
   let Ok(delta) = ShardDelta::from_bytes(&body) else {
     return Ok(None);
   };

@@ -1261,6 +1261,88 @@ fn an_acknowledged_held_record_survives_a_warm_daemon_restart() {
   );
 }
 
+/// Shape: the held records the incremental-image test holds, one publication each; and how many of the first and of
+/// the last it compares (a median over each, so the periodic checkpoint, which carries everything held, sits apart).
+const HELD_RECORDS: u64 = 64;
+const HELD_WINDOW: usize = 16;
+/// Shape: one held record's value, bytes.
+const HELD_VALUE_BYTES: usize = 1024;
+
+/// §4.8 "persistence before reply", raft-5's incremental held image: a holder publishes before it acknowledges a
+/// record, and what that publication carries must be the record, not everything the holder already holds. Do: hold
+/// [`HELD_RECORDS`] records of distinct objects on a daemon through the holder's production path, reading after each
+/// the held bytes its publication's delta carried, then restart the daemon warm over the same anchor. Expect the
+/// median carried by the last [`HELD_WINDOW`] holds to be within twice that of the first (after the first, which
+/// starts the journal), and every record held after the restart. Before: each delta carried the whole held image, so
+/// the cost of an acknowledgement grew with what the holder held (raft-4's c6e178aa: +193–196 µs a live write).
+#[test]
+fn a_holders_publication_carries_the_record_it_acknowledges_not_everything_it_holds() {
+  use slates_db::register::{HostEpoch, HostId, ObjectId, Record};
+
+  let profile = common::machine_profile();
+  let instance = format!("srv-held-delta-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let anchor = held_anchor("held-delta", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let owner = first.member_identity().unwrap();
+  let carried = |daemon: &Daemon| {
+    daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get("publish.delta_held_bytes")
+      .copied()
+      .unwrap_or(0)
+  };
+  let mut per_hold = Vec::new();
+  for sequence in 1..=HELD_RECORDS {
+    let before = carried(&first);
+    let record = Record {
+      owner,
+      object: ObjectId::new(HostId(owner.0), sequence),
+      sequence,
+      epoch: HostEpoch(1),
+      generation: 0,
+      value: vec![u8::try_from(sequence % 251).unwrap(); HELD_VALUE_BYTES],
+    };
+    let reply = first.hold_record_as_authorized(owner, record).unwrap();
+    assert!(!reply.is_empty(), "record {sequence} acknowledged");
+    per_hold.push(carried(&first).saturating_sub(before));
+  }
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let held_after: Vec<bool> = (1..=HELD_RECORDS)
+    .map(|sequence| {
+      matches!(
+        second.fleet_held_record(ObjectId::new(HostId(owner.0), sequence)),
+        Ok(Some(held)) if held.sequence == sequence
+      )
+    })
+    .collect();
+  second.stop();
+  drop(anchor);
+
+  let median = |window: &[u64]| {
+    let mut sorted = window.to_vec();
+    sorted.sort_unstable();
+    sorted.get(sorted.len() / 2).copied().unwrap_or(0)
+  };
+  let early = median(&per_hold[1..=HELD_WINDOW]);
+  let late = median(&per_hold[per_hold.len() - HELD_WINDOW..]);
+  assert!(early > 0, "a delta carries the record it holds: {per_hold:?}");
+  assert!(
+    late <= 2 * early,
+    "a delta's held bytes do not grow with what is held: early median {early}, late {late}: {per_hold:?}"
+  );
+  assert!(
+    held_after.iter().all(|held| *held),
+    "every acknowledged record is held after a warm restart: {held_after:?}"
+  );
+}
+
 // -------------------------------------------- crash injection at every durable step (AC-2.3, AC-2.12)
 //
 // A scenario of single-transaction steps, so each crash point is a real state a kill can leave. Two

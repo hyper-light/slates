@@ -120,6 +120,15 @@ pub enum VfsError {
     /// The oldest sequence the journal still holds.
     oldest: u64,
   },
+  /// A recovery image or journal frame was written in a format version this build does not read (§4.8 "Recovery"): a
+  /// predecessor of another build published it. It is refused by its version before any of it is decoded, never read
+  /// under this build's layout, and the shard starts without it.
+  RecoveryVersion {
+    /// The version the bytes carry.
+    found: u16,
+    /// The version this build reads.
+    expected: u16,
+  },
 }
 
 impl VfsError {
@@ -159,7 +168,8 @@ impl VfsError {
       | Self::BaseDrift
       | Self::RecoveryIncomplete
       | Self::Integrity
-      | Self::JournalIncomplete { .. } => "EIO",
+      | Self::JournalIncomplete { .. }
+      | Self::RecoveryVersion { .. } => "EIO",
       Self::NotOverlay => "ENODEV",
       Self::DigestNotClean => "ENODATA",
       Self::DigestUnverified | Self::PublishNeeded | Self::Delegated => "EAGAIN",

@@ -248,8 +248,9 @@ pub struct ShardState {
   pub checkpoint_buffer: Vec<u8>,
   /// The volume keys the committed journal holds, so a delta names the volumes gone since (A-68).
   pub published_keys: std::collections::BTreeSet<[u8; 16]>,
-  /// The held replicas' image the committed journal holds, so a delta carries it only when it changed (A-68).
-  pub published_held: Vec<u8>,
+  /// What of the held pieces the committed journal holds that a delta cannot tell from the tracked maps alone
+  /// (A-251; `crate::content_holder::held_changes`): the whole pieces' bytes and each live copy's published slots.
+  pub(crate) published_held: crate::content_holder::PublishedHeld,
   /// The FUSE writes acknowledged since the last complete publication, kept whole in the region before
   /// `content_range` in the anchor's content object (A-63; `crate::write_log`); `None` without a content object.
   /// Linux only: the log serves a FUSE mount taken over across a restart (an NFS client resends what a restart lost
@@ -715,8 +716,9 @@ pub struct ShardState {
   /// to serve several owners at once is the owed refinement noted on [`slates_db::register::Authority`]),
   /// and lets a promotion for an object route to its hold by object id regardless of which peer socket
   /// carried the message. The acceptor's authority owner is the socket's TLS-authenticated peer, so a
-  /// record whose owner field is not that peer is refused. Empty on a laptop (no fleet loop runs).
-  pub holder_records: BTreeMap<ObjectId, Acceptor>,
+  /// record whose owner field is not that peer is refused. Empty on a laptop (no fleet loop runs). Tracked
+  /// (`crate::tracked`), so a publication carries only the registers reached since the last (A-251).
+  pub(crate) holder_records: crate::tracked::Tracked<ObjectId, Acceptor>,
   /// Live shipping (§4.10, A-200; [`crate::live_ship`]): the live volumes this shard owns and ships, and on the control
   /// shard what this node holds of others' as a candidate.
   pub(crate) live: crate::live_ship::LiveState,
