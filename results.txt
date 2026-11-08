@@ -1,0 +1,37 @@
+tested 2ae4e832cf2971ffd9e6931c838860d849160fee on windows-latest
+clippy exit 0
+test exit 101
+test result: ok. 63 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.28s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.60s
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.23s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test every_recovery_equals_the_live_partition ... FAILED
+test result: FAILED. 16 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.19s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.39s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test a_tail_whose_records_change_size_still_replays_within_its_recovery_budget ... FAILED
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.86s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+thread 'every_recovery_equals_the_live_partition' (3316) panicked at crates\db\tests\model.rs:68:4:
+called `Result::unwrap()` on an `Err` value: Memory(OsRefused { call: "CreateFileMappingW (the name is already a live section)", code: Some(183) })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'every_recovery_equals_the_live_partition' (3316) panicked at crates\db\tests\model.rs:68:4:
+called `Result::unwrap()` on an `Err` value: Memory(OsRefused { call: "CreateFileMappingW (the name is already a live section)", code: Some(183) })
+
+thread 'every_recovery_equals_the_live_partition' (3316) panicked at crates\db\tests\model.rs:68:4:
+called `Result::unwrap()` on an `Err` value: Memory(OsRefused { call: "CreateFileMappingW (the name is already a live section)", code: Some(183) })
+
+thread 'every_recovery_equals_the_live_partition' (3316) panicked at crates\db\tests\model.rs:68:4:
+called `Result::unwrap()` on an `Err` value: Memory(OsRefused { call: "CreateFileMappingW (the name is already a live section)", code: Some(183) })
+
+thread 'every_recovery_equals_the_live_partition' (3316) panicked at crates\db\tests\model.rs:68:4:
+called `Result::unwrap()` on an `Err` value: Memory(OsRefused { call: "CreateFileMappingW (the name is already a live section)", code: Some(183) })
+
+thread 'every_recovery_equals_the_live_partition' (3316) panicked at crates\db\tests\model.rs:68:4:
+called `Result::unwrap()` on an `Err` value: Memory(OsRefused { call: "CreateFileMappingW (the name is already a live section)", code: Some(183) })
+
+test no_owed_id_is_released_whatever_order_its_acknowledgements_arrive_in ... ok
+DONE
