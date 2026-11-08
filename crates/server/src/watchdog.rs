@@ -33,7 +33,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel}
 use std::thread::JoinHandle;
 
 use slates_anchor::AnchorSegment;
-use slates_rt::SlotHolder;
+use slates_rt::{RunState, SlotHolder};
 use slates_vfs::clock::{Clock, HostClock};
 
 use crate::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS};
@@ -137,8 +137,17 @@ pub struct ShardWatch {
   progressed_ns: u64,
 }
 
+/// What the scheduler says of a shard's thread at one look.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunReading {
+  /// Whether the thread is on a CPU or waiting for one, or off them both.
+  pub state: RunState,
+  /// The time it has waited for a CPU so far, nanoseconds, where the platform keeps one.
+  pub waited_ns: Option<u64>,
+}
+
 /// One look at a shard: its step count, whether it is parked, its thread clock reading (CPU nanoseconds, progress),
-/// and the watchdog's clock.
+/// what the scheduler says of its thread, and the watchdog's clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Look {
   /// The shard's step count.
@@ -147,6 +156,8 @@ pub struct Look {
   pub parked: bool,
   /// Its thread's CPU clock, when it has one: `(spent_ns, progress)`.
   pub cpu: Option<(u64, u64)>,
+  /// What the scheduler says of its thread, when it can be read.
+  pub run: Option<RunReading>,
   /// The watchdog's clock, nanoseconds.
   pub now_ns: u64,
 }
@@ -276,6 +287,7 @@ fn look_at(holder: SlotHolder, now_ns: u64) -> Option<Look> {
     steps,
     parked,
     cpu,
+    run: None,
     now_ns,
   })
 }
@@ -313,8 +325,52 @@ mod tests {
       steps,
       parked,
       cpu,
+      run: None,
       now_ns,
     }
+  }
+
+  /// What the scheduler says of a thread on a CPU or waiting for one.
+  fn runnable(waited_ns: Option<u64>) -> Option<RunReading> {
+    Some(RunReading {
+      state: RunState::Runnable,
+      waited_ns,
+    })
+  }
+
+  /// What the scheduler says of a thread off the CPU and not ready.
+  fn blocked(waited_ns: Option<u64>) -> Option<RunReading> {
+    Some(RunReading {
+      state: RunState::Blocked,
+      waited_ns,
+    })
+  }
+
+  /// Replays `readings`, one a turn from the second turn on, over a shard that took its last step at the first turn and
+  /// whose CPU clock never moves again; the verdicts in order, the first of them the second turn's.
+  fn replay(readings: &[Option<RunReading>]) -> Vec<Verdict> {
+    let (_, mut watch) = ShardWatch::default().judge(look(5, false, Some((10, 10)), TURN), WINDOW);
+    let mut verdicts = Vec::new();
+    for (turn, run) in (2_u64..).zip(readings) {
+      let (verdict, next) = watch.judge(
+        Look {
+          run: *run,
+          ..look(5, false, Some((10, 10)), turn * TURN)
+        },
+        WINDOW,
+      );
+      watch = next;
+      verdicts.push(verdict);
+    }
+    verdicts
+  }
+
+  /// The turn of a replay's first wedged verdict.
+  fn first_wedged(verdicts: &[Verdict]) -> Option<u64> {
+    (2_u64..)
+      .zip(verdicts)
+      .find(|(_, verdict)| matches!(verdict, Verdict::Wedged { .. }))
+      .map(|(turn, _)| turn)
   }
 
   /// Runs `turns` looks from `start`, the shard's CPU advancing by `cpu_per_turn` each look and its steps by
@@ -405,5 +461,67 @@ mod tests {
       "spinning at a window of CPU since its first look: {verdicts:?}"
     );
     assert!(verdicts.iter().take(10).all(|v| *v == Verdict::Alive));
+  }
+
+  /// Shape: the run-queue wait of fixtures' shard 0 as it stood frozen (`rungs9/ab-clean-2.samples`, nanoseconds).
+  const FROZEN_WAIT: u64 = 17_746_660_969;
+  /// Shape: the same counter once the kernel credited the wait, 100 ms before that shard's wedged line.
+  const CREDITED_WAIT: u64 = 18_491_698_042;
+
+  /// A-228, §4.14, fixtures' shard 0 on adacachy at CPUWeight=1. Do: replay a shard with no step and no CPU, runnable at
+  /// every look, its run-queue wait frozen for 900 ms and then credited all at once (Linux adds a wait only when the
+  /// task reaches a CPU or leaves the queue). Expect: never wedged, however long it goes on.
+  #[test]
+  fn a_runnable_shard_whose_wait_is_credited_late_is_not_wedged() {
+    let mut readings = vec![runnable(Some(FROZEN_WAIT)); 9];
+    readings.extend(vec![runnable(Some(CREDITED_WAIT)); 41]);
+    let verdicts = replay(&readings);
+    assert_eq!(first_wedged(&verdicts), None, "{verdicts:?}");
+  }
+
+  /// A-228, §4.14, measured on two Linux kernels: a thread starved for 5.7-7.9 s showed run-queue growth of 0 and state R
+  /// on every sample. Do: replay a shard runnable at every look whose wait never moves. Expect: never wedged.
+  #[test]
+  fn a_runnable_shard_whose_wait_stands_still_is_not_wedged() {
+    let verdicts = replay(&vec![runnable(Some(FROZEN_WAIT)); 50]);
+    assert_eq!(first_wedged(&verdicts), None, "{verdicts:?}");
+  }
+
+  /// A-228, §4.14: macOS and Windows keep no per-thread wait, so their reading is the state alone. Do: replay a shard
+  /// runnable at every look with no wait to read. Expect: never wedged.
+  #[test]
+  fn a_runnable_shard_with_no_wait_to_read_is_not_wedged() {
+    let verdicts = replay(&vec![runnable(None); 50]);
+    assert_eq!(first_wedged(&verdicts), None, "{verdicts:?}");
+  }
+
+  /// A-228, §4.14, fixtures' shard 1 (S S S R R S S): asleep, woken, kept waiting for a CPU, asleep again, with its wait
+  /// credited once it ran. Do: replay that shape, then let it stay asleep. Expect: not wedged across the wake, and wedged
+  /// a whole window after the last sign of it, which here is the wait credited at the eighth reading (turn 9).
+  #[test]
+  fn a_shard_woken_and_kept_waiting_is_wedged_a_window_after_it_last_moved() {
+    let mut readings = vec![blocked(Some(FROZEN_WAIT)); 4];
+    readings.extend(vec![runnable(Some(FROZEN_WAIT)); 3]);
+    readings.extend(vec![blocked(Some(CREDITED_WAIT)); 20]);
+    let verdicts = replay(&readings);
+    assert_eq!(first_wedged(&verdicts), Some(19), "{verdicts:?}");
+  }
+
+  /// A-228, §4.14. Do: replay a shard with no step and no CPU that the scheduler never saw runnable: asleep with a wait
+  /// that never moves (Linux), asleep with no wait to read (macOS, Windows), stopped (which reads as blocked, so a frozen
+  /// process is still killed), and with no reading at all (Miri). Expect: each wedged a whole window after its last
+  /// step, as before, at turn 11.
+  #[test]
+  fn a_shard_the_scheduler_never_saw_runnable_is_wedged_within_the_window() {
+    let cases = [
+      ("asleep, with its wait", blocked(Some(FROZEN_WAIT))),
+      ("asleep, no wait to read", blocked(None)),
+      ("stopped", blocked(Some(FROZEN_WAIT))),
+      ("no reading", None),
+    ];
+    for (name, reading) in cases {
+      let verdicts = replay(&vec![reading; 20]);
+      assert_eq!(first_wedged(&verdicts), Some(11), "{name}: {verdicts:?}");
+    }
   }
 }
