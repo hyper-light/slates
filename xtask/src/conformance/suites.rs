@@ -687,6 +687,11 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let session = Session::open(run, "pjdfstest", super::VOLUME_SIZE, false, None)?;
   let work = session.workdir("pjd")?;
   let (as_root, runner) = pjdfstest_runner(run.root_available, this_user());
+  let probe = if run.options.read_only {
+    Some(read_only_probe(&session, &work, &tree.binary, as_root)?)
+  } else {
+    None
+  };
   let files = test_files(&tree.root)?;
   // Every file's raw TAP output is kept in the scratch (`--keep`), so a failure can be reviewed by
   // its own message before it is listed as expected.
@@ -726,6 +731,7 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     tree.binary.display()
   );
   let mut notes = vec![tree.note];
+  notes.extend(probe);
   notes.extend(daemon_note);
   notes.extend(live_note);
   notes.extend(size_note);
@@ -741,6 +747,87 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       notes,
     },
   )
+}
+
+/// Format: pjdfstest's read-only cases, the files of its suite that expect `EROFS`, each one call of its helper over the
+/// probe's tree (`ro/`: the file `f`, the directory `d`, the symlink `l`, made through the writable mount). Upstream they
+/// run on FreeBSD alone, which can make a read-only file system for them (`mdconfig`, then `mount -ur`); a read
+/// attachment is one here. Every name a call makes is new, since Linux answers `EEXIST` before `EROFS` for one that
+/// exists, and BSD's `chflags` and `lchmod` are left out.
+const READ_ONLY_PROBE: &[(&str, &[&str])] = &[
+  ("open/14.t", &["open", "ro/f", "O_WRONLY"]),
+  ("open/14.t", &["open", "ro/f", "O_RDWR"]),
+  ("open/14.t", &["open", "ro/f", "O_RDONLY,O_TRUNC"]),
+  ("open/15.t", &["open", "ro/new", "O_RDONLY,O_CREAT", "0644"]),
+  ("mkdir/09.t", &["mkdir", "ro/newdir", "0755"]),
+  ("rmdir/14.t", &["rmdir", "ro/d"]),
+  ("unlink/12.t", &["unlink", "ro/f"]),
+  ("link/16.t", &["link", "ro/f", "ro/f2"]),
+  ("rename/16.t", &["rename", "ro/f", "ro/f3"]),
+  ("symlink/10.t", &["symlink", "test", "ro/newlink"]),
+  ("mkfifo/08.t", &["mkfifo", "ro/fifo", "0644"]),
+  ("truncate/10.t", &["truncate", "ro/f", "1234"]),
+  ("chmod/09.t", &["chmod", "ro/f", "0600"]),
+  ("chown/09.t", &["chown", "ro/f", "65533", "65533"]),
+];
+
+/// Format: what each of [`READ_ONLY_PROBE`]'s calls must answer.
+const READ_ONLY_ANSWER: &str = "EROFS";
+
+/// Runs [`READ_ONLY_PROBE`] in `work`, under the session's read-only mount, over a tree made first through its writable
+/// one, with pjdfstest's helper `helper` (as root when `as_root`, so no ownership check refuses first): the note that
+/// says how many calls answered [`READ_ONLY_ANSWER`] and what each other one answered.
+fn read_only_probe(
+  session: &Session,
+  work: &Path,
+  helper: &Path,
+  as_root: bool,
+) -> Result<String, Failure> {
+  let writable = session
+    .writable(work)
+    .ok_or_else(|| Failure("the read-only probe needs the session's writable mount".to_owned()))?
+    .join("ro");
+  super::create_dir(&writable.join("d"))?;
+  super::write_file(&writable.join("f"), b"the read-only probe's file\n")?;
+  #[cfg(unix)]
+  std::os::unix::fs::symlink("f", writable.join("l"))
+    .map_err(|e| Failure(format!("the probe's symlink: {e}")))?;
+  for made in ["f", "d", "l"] {
+    super::slates::visible(&work.join("ro").join(made))?;
+  }
+  let mut others = Vec::new();
+  for (file, call) in READ_ONLY_PROBE {
+    let mut command = if as_root {
+      let mut sudo = Command::new("sudo");
+      sudo.arg("-n").arg(helper);
+      sudo
+    } else {
+      Command::new(helper)
+    };
+    let output = command.args(*call).current_dir(work).output()?;
+    let answer = String::from_utf8_lossy(&output.stdout)
+      .lines()
+      .last()
+      .unwrap_or_default()
+      .trim()
+      .to_owned();
+    if answer != READ_ONLY_ANSWER {
+      others.push(format!("{file} `{}` answered {answer:?}", call.join(" ")));
+    }
+  }
+  let note = format!(
+    "read-only probe, pjdfstest's {READ_ONLY_ANSWER} cases over a read attachment: {} of {} answered \
+     {READ_ONLY_ANSWER}{}",
+    READ_ONLY_PROBE.len().saturating_sub(others.len()),
+    READ_ONLY_PROBE.len(),
+    if others.is_empty() {
+      String::new()
+    } else {
+      format!("; the others: {}", others.join("; "))
+    }
+  );
+  eprintln!("conformance: {note}");
+  Ok(note)
 }
 
 /// What a pjdfstest run did, for [`judged_pjdfstest`].
