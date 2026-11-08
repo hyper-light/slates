@@ -252,7 +252,8 @@ mod mattr {
 
 /// Format: the `NFS_MFLAG_*` flag numbers the slates mount sets or clears (`<nfs/nfs.h>`).
 mod mflag {
-  /// Format: `NFS_MFLAG_SOFT`: requests fail rather than hang on an unresponsive daemon.
+  /// Format: `NFS_MFLAG_SOFT`: set, the kernel ends a request it has waited on past its own bound, whatever the server
+  /// answered meanwhile. Cleared by the slates mount (a hard mount), so a call waits as long as the daemon asks.
   pub(super) const SOFT: u32 = 0;
   /// Format: `NFS_MFLAG_INTR`: a waiting call can be interrupted.
   pub(super) const INTR: u32 = 1;
@@ -333,7 +334,14 @@ impl MountArgs {
     ] {
       set_bit(&mut mask, flag);
     }
-    for flag in [mflag::SOFT, mflag::INTR, mflag::CALLUMNT, mflag::RDIRPLUS] {
+    // Hard (`SOFT` in the mask, cleared in the value) and interruptible (§4.6, 2026-11-06). A soft mount's kernel ends
+    // any call it has waited on for about a minute, held or answered "try again", so a writer on a live-shipped volume
+    // whose candidates were stopped failed `ETIMEDOUT` after 57.2 s instead of waiting (A-200: "holders that do not
+    // answer make the writer wait"; `a_writer_on_a_macos_mount_waits_for_stopped_candidates_rather_than_fail` in
+    // `crates/cli/tests/live_fleet.rs`). Hard, the kernel waits as long as the daemon asks; `INTR` lets a signal end the
+    // caller's wait (`EINTR`), and the anchor holds the listener and its connections across a daemon restart (A-113), so
+    // a restart is a slow reply.
+    for flag in [mflag::INTR, mflag::CALLUMNT, mflag::RDIRPLUS] {
       set_bit(&mut value, flag);
     }
 

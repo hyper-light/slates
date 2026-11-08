@@ -26,7 +26,7 @@ proptest! {
     origin in proptest::collection::vec(raw(), 0..24),
     history in proptest::collection::vec(raw(), 1..40),
   ) {
-    let mut green = Green::with_origin(&origin_of(&origin));
+    let mut green = Green::with_origin(origin_of(&origin));
     prop_assert_eq!(green.head_identity(), green.head_identity_from_scratch(), "after the origin");
     // A create at a path outside the alphabet always commits, so every case runs the commit path at least once.
     let mut accepted = 0u32;
@@ -73,8 +73,8 @@ fn one_state_reached_in_two_orders_has_one_identity() {
       .setxattr("d", "user.k", b"v")
       .at(2, 0),
   ];
-  let mut forward = Green::with_origin(&origin);
-  let mut backward = Green::with_origin(&origin);
+  let mut forward = Green::with_origin(origin.clone());
+  let mut backward = Green::with_origin(origin.clone());
   for step in &steps {
     assert!(matches!(forward.submit(step), Outcome::Accepted { .. }));
   }
@@ -97,7 +97,7 @@ fn one_differing_byte_anywhere_changes_the_identity() {
     modes: vec![("f".to_owned(), 0o644)],
     ..Origin::default()
   };
-  let mut green = Green::with_origin(&origin);
+  let mut green = Green::with_origin(origin.clone());
   let start = green.head_identity();
   assert!(matches!(
     green.submit(&Build::new().overwrite("f", 63, &[8]).at(1, 0)),
@@ -114,12 +114,12 @@ fn one_differing_byte_anywhere_changes_the_identity() {
     start,
     "restoring the byte restores the identity"
   );
-  let mut moded = Green::with_origin(&Origin {
+  let mut moded = Green::with_origin(Origin {
     modes: vec![("f".to_owned(), 0o645)],
     ..origin.clone()
   });
   assert_ne!(moded.head_identity(), start);
-  let mut as_dir = Green::with_origin(&Origin {
+  let mut as_dir = Green::with_origin(Origin {
     files: Vec::new(),
     dirs: vec!["f".to_owned()],
     ..origin

@@ -199,6 +199,27 @@ pub struct Diverged {
   pub kind: Divergence,
 }
 
+/// A walk of a volume's diverged set in progress (AC-1.10; §4.3 "Bounded work everywhere"): the directories still to
+/// judge and what was found so far, so a landing's plan steps the walk a directory a unit and never walks a large tree
+/// in one call. Over a snapshot (`Volume::diverged_walk_in`) its handles name frozen nodes; over the head they may go
+/// stale between units, and a stale one is passed over.
+#[derive(Debug)]
+pub struct DivergedWalk {
+  snapshot: Option<SnapshotId>,
+  stack: Vec<(String, Handle<DirNode>)>,
+  out: Vec<Diverged>,
+}
+
+impl DivergedWalk {
+  fn new(snapshot: Option<SnapshotId>, root: Handle<DirNode>) -> DivergedWalk {
+    DivergedWalk {
+      snapshot,
+      stack: vec![(String::new(), root)],
+      out: Vec::new(),
+    }
+  }
+}
+
 /// A clean file's verified content digest (§4.15): the BLAKE3 of the bytes the disk holds for an
 /// untouched base entry and their length, verified against the file's identity and fingerprint
 /// at the moment of export.
@@ -759,91 +780,106 @@ impl Volume {
   }
 
   /// The diverged set (AC-1.10): witnessed, created, whiteouted and redirected entries, by
-  /// path, over the loaded nodes only (cost proportional to what the volume touched).
+  /// path, over the loaded nodes only (cost proportional to what the volume touched). [`DivergedWalk`] run to its end.
   pub fn diverged(&self, store: &Store) -> Vec<Diverged> {
-    let plane = self.base.as_ref();
-    self.diverged_from(
-      store,
-      self.root,
-      |no| plane.is_some_and(|b| b.is_witnessed(no)),
-      |no| {
-        matches!(
-          self.inode(store, no).map(|i| &i.body),
-          Ok(Body::Base(_) | Body::BaseLink(_))
-        )
-      },
-    )
+    let mut walk = self.diverged_walk();
+    loop {
+      if let Some(diverged) = self.diverged_unit(store, &mut walk) {
+        return diverged;
+      }
+    }
   }
 
   /// The diverged set as snapshot `id` froze it (A-48): its tree, its inode versions and the witnesses
-  /// it read, never the head's.
+  /// it read, never the head's. [`DivergedWalk`] run to its end.
   pub fn diverged_in(&self, store: &Store, id: SnapshotId) -> Result<Vec<Diverged>, VfsError> {
-    let (epoch, root) = self.snapshot_info(id)?;
-    let plane = self.base.as_ref();
-    Ok(self.diverged_from(
-      store,
-      root,
-      |no| plane.is_some_and(|b| b.witness_at(no, epoch).is_some()),
-      |no| {
-        matches!(
-          self.inode_in(store, id, no).map(|i| &i.body),
-          Ok(Body::Base(_) | Body::BaseLink(_))
-        )
-      },
-    ))
+    let mut walk = self.diverged_walk_in(id)?;
+    loop {
+      if let Some(diverged) = self.diverged_unit(store, &mut walk) {
+        return Ok(diverged);
+      }
+    }
   }
 
-  /// The diverged walk from `root`: `witnessed` and `is_base` answer for the tree walked (the head's or a
-  /// snapshot's).
-  fn diverged_from(
-    &self,
-    store: &Store,
-    root: Handle<DirNode>,
-    witnessed: impl Fn(InodeNo) -> bool,
-    is_base: impl Fn(InodeNo) -> bool,
-  ) -> Vec<Diverged> {
-    let mut out = Vec::new();
-    let mut stack = vec![(String::new(), root)];
-    while let Some((prefix, dir)) = stack.pop() {
-      let Ok(node) = store.dirs.get(dir) else {
-        continue;
+  /// A walk of the head's diverged set, stepped a directory a unit ([`Volume::diverged_unit`]). The head moves between
+  /// units, so a walk that must see one state walks a snapshot ([`Volume::diverged_walk_in`]).
+  pub fn diverged_walk(&self) -> DivergedWalk {
+    DivergedWalk::new(None, self.root)
+  }
+
+  /// A walk of snapshot `id`'s diverged set, stepped a directory a unit ([`Volume::diverged_unit`]).
+  pub fn diverged_walk_in(&self, id: SnapshotId) -> Result<DivergedWalk, VfsError> {
+    let (_, root) = self.snapshot_info(id)?;
+    Ok(DivergedWalk::new(Some(id), root))
+  }
+
+  /// One unit of `walk`: one directory's entries judged; the whole diverged set, sorted by path, once the last
+  /// directory is done. A directory gone meanwhile (a stale handle of a walk over the head) is passed over, as the
+  /// one-call walk passed it.
+  pub fn diverged_unit(&self, store: &Store, walk: &mut DivergedWalk) -> Option<Vec<Diverged>> {
+    let Some((prefix, dir)) = walk.stack.pop() else {
+      let mut out = std::mem::take(&mut walk.out);
+      out.sort_by(|a, b| a.path.cmp(&b.path));
+      return Some(out);
+    };
+    let plane = self.base.as_ref();
+    let epoch = walk
+      .snapshot
+      .and_then(|id| self.snapshot_info(id).ok())
+      .map(|(epoch, _)| epoch);
+    let witnessed = |no: InodeNo| match (walk.snapshot, epoch) {
+      (Some(_), Some(epoch)) => plane.is_some_and(|b| b.witness_at(no, epoch).is_some()),
+      (Some(_), None) => false,
+      (None, _) => plane.is_some_and(|b| b.is_witnessed(no)),
+    };
+    let is_base = |no: InodeNo| {
+      let body = match walk.snapshot {
+        Some(id) => self.inode_in(store, id, no).map(|i| &i.body),
+        None => self.inode(store, no).map(|i| &i.body),
       };
-      for e in node.iter(&store.blocks) {
-        let path = format!("{prefix}/{}", e.name);
-        match e.child {
-          Child::Whiteout => out.push(Diverged {
-            path,
-            kind: Divergence::Whiteout,
-          }),
-          Child::Dir(h) => {
-            if let Ok(child) = store.dirs.get(h) {
-              if let Some(kind) = directory_divergence(child) {
-                out.push(Diverged {
-                  path: path.clone(),
-                  kind,
-                });
-              }
-              stack.push((path, h));
+      matches!(body, Ok(Body::Base(_) | Body::BaseLink(_)))
+    };
+    let Ok(node) = store.dirs.get(dir) else {
+      return None;
+    };
+    let mut found = Vec::new();
+    let mut deeper = Vec::new();
+    for e in node.iter(&store.blocks) {
+      let path = format!("{prefix}/{}", e.name);
+      match e.child {
+        Child::Whiteout => found.push(Diverged {
+          path,
+          kind: Divergence::Whiteout,
+        }),
+        Child::Dir(h) => {
+          if let Ok(child) = store.dirs.get(h) {
+            if let Some(kind) = directory_divergence(child) {
+              found.push(Diverged {
+                path: path.clone(),
+                kind,
+              });
             }
+            deeper.push((path, h));
           }
-          Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
-            if witnessed(no) {
-              out.push(Diverged {
-                path,
-                kind: Divergence::Witnessed,
-              });
-            } else if !is_base(no) {
-              out.push(Diverged {
-                path,
-                kind: Divergence::Created,
-              });
-            }
+        }
+        Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
+          if witnessed(no) {
+            found.push(Diverged {
+              path,
+              kind: Divergence::Witnessed,
+            });
+          } else if !is_base(no) {
+            found.push(Diverged {
+              path,
+              kind: Divergence::Created,
+            });
           }
         }
       }
     }
-    out.sort_by(|a, b| a.path.cmp(&b.path));
-    out
+    walk.out.extend(found);
+    walk.stack.extend(deeper);
+    None
   }
 
   /// The fingerprint of the base entry a whiteout at `dir/name` hides, recorded at the
