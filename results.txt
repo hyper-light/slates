@@ -1,0 +1,43 @@
+green on ubuntu-latest, 4 CPUs, Sun Nov  8 14:16:32 UTC 2026, head 47de83c614862a626c5ca5ccd08e9d9c9e9c3bcc
+== run 1 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.66s
+
+== run 2 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 2.98s
+
+== run 3 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.51s
+
+== run 4 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.50s
+
+== run 5 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 5.19s
+
+== run 6 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.67s
+
+== run 7 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.25s
+
+== run 8 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.57s
+
+== run 9 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 5.75s
+
+== run 10 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 5.03s
+
+== run 11 exit 101
+thread 'a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone' (5778) panicked at crates/server/tests/fleet.rs:6321:3:
+every survivor's neighbourhood settled at the newest configuration past version 8, (settled, current) and (installed, council) per survivor: [(Ok(Some((9, 9))), Ok((13, 13))), (Ok(Some((9, 9))), Ok((13, 13))), (Ok(Some((5, 5))), Ok((13, 13))), (Ok(Some((5, 9))), Ok((13, 13)))]; the learners' views at the stop [(HostId(5863191228281910831), [HostId(1565570018433516838)]), (HostId(7619447765398140990), [HostId(1565570018433516838)])]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone ... FAILED
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 100 filtered out; finished in 405.80s
+
+error: test failed, to rerun pass `-p slates-server --test fleet`
+== run 12 exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 3.35s
+
