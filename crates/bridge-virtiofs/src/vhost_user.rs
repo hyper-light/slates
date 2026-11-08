@@ -2286,7 +2286,7 @@ mod shmem_tests {
     for (name, bytes, reason) in cases {
       let (frontend, backend) = stream_pair();
       let config = crate::device::DeviceConfig::new(crate::device::FsTag::new("slates").unwrap());
-      let mut seam = VhostUserSeam::adopt(backend, &config).unwrap();
+      let mut seam = VhostUserSeam::adopt(backend, &config, slates_db::HostId(0)).unwrap();
       seam.enable_dax(DAX_REGION_FOR_TESTS);
       send_front_raw(&frontend, &bytes);
       drop(frontend);
@@ -2317,7 +2317,7 @@ mod shmem_tests {
     ] {
       let (frontend, backend) = stream_pair();
       let config = crate::device::DeviceConfig::new(crate::device::FsTag::new("slates").unwrap());
-      let mut seam = VhostUserSeam::adopt(backend, &config).unwrap();
+      let mut seam = VhostUserSeam::adopt(backend, &config, slates_db::HostId(0)).unwrap();
       seam.enable_dax(DAX_REGION_FOR_TESTS);
       if !prefix.is_empty() {
         send_front_raw(&frontend, &prefix);
@@ -2698,7 +2698,7 @@ mod shmem_tests {
   fn a_dax_device_negotiates_the_backend_req_channel_and_it_carries_a_map() {
     let (frontend, backend) = stream_pair();
     let config = crate::device::DeviceConfig::new(crate::device::FsTag::new("slates").unwrap());
-    let mut seam = VhostUserSeam::adopt(backend, &config).unwrap();
+    let mut seam = VhostUserSeam::adopt(backend, &config, slates_db::HostId(0)).unwrap();
     seam.enable_dax(0x1000_0000); // a 256 MiB cache window (test value; Piece B only stores it)
 
     // GET_PROTOCOL_FEATURES: the reply carries the DAX features.
@@ -2754,7 +2754,7 @@ mod shmem_tests {
   fn a_dax_device_reports_one_cache_region_of_the_configured_size() {
     let (frontend, backend) = stream_pair();
     let config = crate::device::DeviceConfig::new(crate::device::FsTag::new("slates").unwrap());
-    let mut seam = VhostUserSeam::adopt(backend, &config).unwrap();
+    let mut seam = VhostUserSeam::adopt(backend, &config, slates_db::HostId(0)).unwrap();
     let region = 0x0400_0000u64; // a 64 MiB cache window (test value)
     seam.enable_dax(region);
 
@@ -2789,7 +2789,7 @@ mod shmem_tests {
   fn a_non_dax_device_offers_no_dax_features_and_refuses_the_backend_req_fd() {
     let (frontend, backend) = stream_pair();
     let config = crate::device::DeviceConfig::new(crate::device::FsTag::new("slates").unwrap());
-    let mut seam = VhostUserSeam::adopt(backend, &config).unwrap();
+    let mut seam = VhostUserSeam::adopt(backend, &config, slates_db::HostId(0)).unwrap();
     // no enable_dax
 
     send_front_message(&frontend, request::GET_PROTOCOL_FEATURES, 0, None);
