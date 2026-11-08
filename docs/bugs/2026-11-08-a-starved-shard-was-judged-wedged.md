@@ -118,6 +118,21 @@ progress now ends the wait only if the scheduler does not have the shard runnabl
 `tests/observe.rs`, whose wedged questions sleep and are not runnable, still ends them, 8 of 8. A stored run-queue wait
 was left out: Linux credits one only once the thread reaches a CPU, so the state decides, as the watchdog's notes say.
 
+## The transitive wait (2026-11-08, bug-sweep, the supervisor's order)
+
+A shard blocked on another thread that is itself starved never runs and is never runnable, so the rule read it wedged:
+on adacachy2 a shard's poll parked on a thread held off its CPU withheld the beat at 30 of 40 looks, gaps 3.05-3.09 s, 3
+of 3. The shard's joins of another thread are three (GAPS lists them: the FUSE notify thread, the landing barrier
+thread, the WinFsp mount thread). Each is now spawned by `slates_rt::registry::spawn_waited` and joined by
+`WaitedThread::join`, which marks the shard's registry entry with the joined thread's clock handle for the join, and
+`shard_run_readings` reads a blocked shard as runnable while the thread it waits on is runnable. A joined thread that is
+blocked too is still a deadlock. `a_shard_waiting_on_a_starved_thread_keeps_the_beat`: red 3 of 3, green 6 of 6
+(adacachy2, nice 0 and 19). `a_shard_waiting_on_a_blocked_thread_stops_the_beat` holds the deadlock.
+`a_shard_joining_a_thread_reads_as_the_thread_runs` (`crates/rt/tests/waited_thread.rs`) found the first version's
+hole: a join made at once after the spawn ran before the thread had published its handle and was never marked. Such a
+join now waits for the handle marked as waiting on a starting thread, which is runnable until it runs. Red-checked with
+the consult removed: the shard read blocked while the joined thread spun.
+
 ## The anchor's start judgment (2026-11-08, bug-sweep)
 
 The anchor judges a start, before its first beat, in the whole process's CPU time (`slates_machine::process_clock`) and

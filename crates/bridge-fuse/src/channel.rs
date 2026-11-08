@@ -301,7 +301,9 @@ struct Notifier {
   rounds: Option<std::sync::mpsc::SyncSender<Round>>,
   /// Each round's outcome.
   outcomes: std::sync::mpsc::Receiver<Outcome>,
-  thread: Option<std::thread::JoinHandle<()>>,
+  /// Joined on the mount's shard when the notifier drops, which is marked as waiting on it meanwhile: the join waits out
+  /// the round in flight (A-228's transitive wait).
+  thread: Option<slates_rt::registry::WaitedThread<()>>,
   /// The round out, if one is: where the cursor stood before it, to put it back if the kernel refuses the write.
   out: Option<Option<slates_bridge_core::InvalidationCursor>>,
 }
@@ -313,9 +315,9 @@ impl Notifier {
   fn start(device: OwnedFd, wake: Option<ChangeNotifier>) -> Result<Notifier, ChannelError> {
     let (rounds, inbox) = std::sync::mpsc::sync_channel::<Round>(1);
     let (send, outcomes) = std::sync::mpsc::sync_channel(1);
-    let thread = std::thread::Builder::new()
-      .name("slates-fuse-notify".to_owned())
-      .spawn(move || {
+    let thread = slates_rt::registry::spawn_waited(
+      std::thread::Builder::new().name("slates-fuse-notify".to_owned()),
+      move || {
         // Until the owner closes the round channel: each round written whole, its outcome sent and the loop woken.
         while let Ok(messages) = inbox.recv() {
           // The receiver outlives the thread (its owner joins before it drops), so the send cannot fail; were it to,
@@ -327,11 +329,12 @@ impl Notifier {
             let _ = wake.notify();
           }
         }
-      })
-      .map_err(|e| ChannelError::Device {
-        call: "notify-thread",
-        code: e.raw_os_error(),
-      })?;
+      },
+    )
+    .map_err(|e| ChannelError::Device {
+      call: "notify-thread",
+      code: e.raw_os_error(),
+    })?;
     Ok(Notifier {
       rounds: Some(rounds),
       outcomes,

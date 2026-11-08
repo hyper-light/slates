@@ -758,7 +758,26 @@
 >   not stuck. `a_start_held_off_its_cpus_is_starved_not_stuck` (`crates/cli/src/anchor.rs`) holds a busy process off its
 >   CPU at SCHED_IDLE: without the reading, judged "made no progress for 1001 ms", 2 of 2 on adacachy2; with it, starved
 >   at 14-23 looks and never stuck, 7 of 7 (nice 0 and 19). A process with every thread blocked still reads stuck.
-> - **A transitive wait reads as stuck (open, measured 2026-11-08 by bug-sweep).** A shard blocked for a whole window on
+> - **A transitive wait reads as stuck: fixed 2026-11-08 (bug-sweep), the supervisor's order, scoped to the shard's
+>   joins.** The waits in which a shard thread blocks on another thread of the process are three: the FUSE notify
+>   thread's join (`slates_bridge_fuse::channel::Notifier`'s drop, which waits out the round in flight), the landing
+>   barrier thread's join (`slates_server::landing::BarrierThread`; past its outcome the thread has only to exit, but a
+>   drop before it waits out a host durability call), and the WinFsp mount thread's join (`MountThread::join`, from
+>   `slates_server::winfsp`'s reap, `end_all` and `drop_all`). The doorbell thread is joined on a process thread
+>   (`Daemon::stop`), cross-shard calls are awaited, not blocked on, and observations are waited for off the shards. Each
+>   of the three is now spawned by `slates_rt::registry::spawn_waited`, which has the thread publish its handle first, and
+>   joined by `WaitedThread::join`, which marks the shard's registry entry (`Entry::waits_on`) for the join; a join made
+>   before the thread has run is marked as waiting on a thread starting, which is runnable until it runs.
+>   `shard_run_readings`, which the watchdog and observations read, then reads a blocked shard as the thread it waits on
+>   when that thread is runnable: starved, not stuck. A waited-on thread that is blocked too still reads blocked, a
+>   deadlock. Proven: `a_shard_waiting_on_a_starved_thread_keeps_the_beat` (`crates/server/tests/liveness.rs`), red 3 of
+>   3 on adacachy2 (the beat withheld at 30 of 40 looks, gaps 3.05-3.08 s), green 6 of 6 there at nice 0 and 19 (0
+>   withheld, gaps 100 ms); `a_shard_waiting_on_a_blocked_thread_stops_the_beat` holds the deadlock (withheld at 10 of
+>   15 looks on the Mac); `a_shard_joining_a_thread_reads_as_the_thread_runs` (`crates/rt/tests/waited_thread.rs`) holds
+>   the reading across a real join, and found a join made at once after the spawn unmarked before the starting mark.
+>   Not covered: a wait on another process, or on a lock (there are none on data paths), or a join a future site adds
+>   without `spawn_waited`. The measurement that led here:
+> - **(Measured 2026-11-08 by bug-sweep, before the fix.)** A shard blocked for a whole window on
 >   something held by a starved thread is never runnable itself, so it is wedged by this rule. Measured on adacachy2 at
 >   load 0.2: a shard's poll parked until a thread released it, that thread at SCHED_IDLE pinned beside the starved test's
 >   spinners and owing 50 ms of its own CPU first. The watchdog withheld the beat at 30 of 40 looks and the beat gapped
