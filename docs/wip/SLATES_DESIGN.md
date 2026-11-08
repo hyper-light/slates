@@ -7115,6 +7115,9 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > (`crates/cli/src/anchor.rs`, `Lateness`). The window is the existing liveness budget, still a fixed number (GAPS, R3
 > debt). Proven by `crates/server/tests/liveness.rs`: a starved control-shard poll, which gapped the beat 1.53 s on main,
 > keeps it under 0.26 s; a wedged or spinning non-control shard, which main never saw, stops it.
+> **2026-11-08:** `ShardTime` itself now asks the scheduler before it ends a wait on a window with no CPU progress: a
+> shard it has runnable is starved and waited for another window, so an observation or a cross-shard call no longer
+> gives up on one (`an_observation_of_a_starved_shard_is_answered`, red 3 of 3 before on adacachy2).
 
 > **Status (2026-11-07): a start is judged by its progress too.** Until its first beat the anchor judges a starting
 > daemon by the same rule, in the daemon's own CPU time read from the OS (`slates_machine::process_clock`;

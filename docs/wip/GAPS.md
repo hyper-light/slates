@@ -731,9 +731,13 @@
 > - **A kill the rule does not touch (open).** `rungs9/ab-clean-2`'s lapse came 6.4 s after its last wedged line and right
 >   after `shard 0 is spinning: 1045 ms of CPU without a step`, on a shard that had run 580 ms of CPU in the last 1.3 s.
 >   A poll that long at `CPUWeight=1` is still killed; whether it is a real non-yielding task is not established.
-> - **Siblings with the same blind spot (open, reported, unchanged).** `crate::observe::ShardTime`
->   (`next_window_ns`), used by observations and the cross-shard waits (`xshard`), gives up on a window with no CPU
->   progress, so a starved shard's observation or call can end early. The anchor's start judgment
+> - **Siblings with the same blind spot.** `crate::observe::ShardTime` (`next_window_ns`), used by observations and the
+>   cross-shard waits (`xshard`), gave up on a window with no CPU progress, so a starved shard's observation or call
+>   ended early: **fixed 2026-11-08 (bug-sweep).** A window with no CPU progress now ends the wait only if the scheduler
+>   does not have the shard runnable (`ShardTime::runnable`, the watchdog's source). Red first:
+>   `an_observation_of_a_starved_shard_is_answered` (`crates/server/tests/liveness.rs`) ended `Deadline` at its
+>   one-window budget 3 of 3 on adacachy2 while the shard's clock stood still 3.0 s; after, answered 6 of 6 (3 at nice 0,
+>   3 at nice 19); the wedged cases of `tests/observe.rs` still end, 8 of 8. **Open:** the anchor's start judgment
 >   (`crates/cli/src/anchor.rs`, `process_clock`) judges a whole process by CPU time, has no thread to ask about, and
 >   passes no reading: a start starved for a whole window is still killed.
 > - **A transitive wait reads as stuck (open).** A shard blocked for a whole window on something held by a starved thread

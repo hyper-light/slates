@@ -105,3 +105,15 @@ wall; the wall is only a backstop of 60 windows, a sixtieth of a CPU, and a fail
   Windows). On macOS the spinners cannot be pinned and starve the watchdog's thread too: 12-14 looks in 3 s where 30
   were due, at load 45 on the 18-CPU Mac, which was the 1.146 s gap seen at load 40. Red-checked on adacachy2: a starved
   shard judged wedged withheld the beat at 20 of 30 looks and the test failed saying so.
+
+## The `ShardTime` sibling (2026-11-08, bug-sweep)
+
+`crate::observe::ShardTime::next_window_ns`, which observations and the cross-shard waits (`xshard::within_shard_time`)
+judge a shard's time by, ended a wait at the first window with no CPU progress without asking the scheduler. A starved
+shard, runnable with its clock standing still, was given up on. `an_observation_of_a_starved_shard_is_answered` starves
+the non-control shard as the beat's test does and observes it with a one-window budget: on adacachy2 it ended
+`Deadline { stage: Admission }` at 1.0 s, 3 of 3, while the shard's clock stood still 3.0 s. A window with no CPU
+progress now ends the wait only if the scheduler does not have the shard runnable (`ShardTime::runnable`, from
+`shard_run_readings`). After: answered 6 of 6 there (3 at nice 0, 3 at nice 19); the liveness suite 9 of 9;
+`tests/observe.rs`, whose wedged questions sleep and are not runnable, still ends them, 8 of 8. A stored run-queue wait
+was left out: Linux credits one only once the thread reaches a CPU, so the state decides, as the watchdog's notes say.

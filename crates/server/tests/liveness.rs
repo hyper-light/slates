@@ -745,6 +745,69 @@ fn a_spinning_shard_stops_the_beat() {
   daemon.stop();
 }
 
+/// A-228's sibling in `ShardTime` (§4.14, A-65): a wait judged in a starved shard's own time must not give up on it. Do:
+/// starve the shard that is not the control shard as the test above does (one poll spinning on it, held off its CPU by
+/// higher-priority spinners there); submit an observation of it with a budget of one window, which waits behind that
+/// poll; keep the shard starved until its clock has stood still past the observation's deadline (two windows and three
+/// beats), then let the poll end. Expect: the observation is answered. A starved shard is runnable while its clock
+/// stands still, which the scheduler says; one wedged is not. Linux and Windows must see the flat window or the test
+/// fails saying it did not starve; macOS cannot hold a thread off on demand, so there it says so and passes.
+#[test]
+fn an_observation_of_a_starved_shard_is_answered() {
+  if cfg!(target_os = "macos") {
+    eprintln!(
+      "SKIP an_observation_of_a_starved_shard_is_answered: macOS will not hold a thread off its CPU on demand"
+    );
+    return;
+  }
+  let (daemon, _, other) = daemon("observe-starved");
+  let _serving = beating(&daemon);
+  let on_cpu = &*Box::leak(Box::new(AtomicUsize::new(usize::MAX)));
+  let running = &*Box::leak(Box::new(AtomicBool::new(true)));
+  let worker = on_shard(&daemon, other, move || {
+    on_cpu.store(starve_this_thread(), Ordering::Release);
+    while running.load(Ordering::Relaxed) {
+      std::hint::spin_loop();
+    }
+  });
+  let waited = Instant::now();
+  while on_cpu.load(Ordering::Acquire) == usize::MAX {
+    assert!(waited.elapsed() < WINDOW * 10, "the poll reached its shard");
+    wait(SAMPLE);
+  }
+  let spinners = settled_spinners(on_cpu.load(Ordering::Acquire), running);
+  let budget_ns = u64::try_from(WINDOW.as_nanos()).unwrap();
+  let observation = daemon
+    .observation(Some(other), budget_ns, |_: &mut ShardState| 42u32)
+    .unwrap();
+  let asked = Instant::now();
+  let answer = std::thread::spawn(move || observation.wait());
+  let holder = slates_rt::registry::holder_of(other.0).unwrap();
+  let flat_enough = WINDOW * 2 + BEAT * 3;
+  let Starving { longest_flat, .. } = watch_starving(&daemon, holder, flat_enough, WINDOW * 10);
+  running.store(false, Ordering::Relaxed);
+  for spinner in spinners {
+    spinner.join().unwrap();
+  }
+  worker.join().unwrap();
+  let answered = answer.join().unwrap();
+  println!(
+    "observation of a starved shard: its CPU clock stood still for {longest_flat:?} at most; answered {answered:?} \
+     {:?} after it was asked, against a budget of {WINDOW:?}",
+    asked.elapsed()
+  );
+  assert!(
+    longest_flat >= flat_enough,
+    "did not starve: the shard's CPU clock stood still for {longest_flat:?} at most, under the {flat_enough:?} that \
+     tests the rule"
+  );
+  assert!(
+    matches!(answered, Ok(42)),
+    "a starved shard's observation was given up on: {answered:?} (its CPU clock stood still for {longest_flat:?})"
+  );
+  daemon.stop();
+}
+
 /// A-228, §4.14. Do: on the control shard, block one poll for half a window (a slow host call that finishes). Expect:
 /// the beat never gaps a window: a block shorter than the window is not a hang.
 #[test]
