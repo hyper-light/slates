@@ -41,6 +41,8 @@ pub const DIALECT_VERSION: u32 = 2;
 pub const DEFAULT_MAX_UDP_PAYLOAD: u32 = 65_527;
 /// Format: the bytes of an entry's identifier and length fields.
 const ENTRY_HEADER_BYTES: usize = 4;
+/// Format: the most entries this build encodes: the dialect, the largest UDP payload and reads-reset-tokens.
+const MAX_ENTRIES: usize = 3;
 
 /// One end's transport parameters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,7 +143,7 @@ impl TransportParameters {
     let mut out = Vec::with_capacity(
       ENTRY_HEADER_BYTES
         .saturating_add(size_of::<u32>())
-        .saturating_mul(3),
+        .saturating_mul(MAX_ENTRIES),
     );
     put_u32(&mut out, ID_DIALECT, DIALECT_VERSION);
     put_u32(&mut out, ID_MAX_UDP_PAYLOAD, self.max_udp_payload);
