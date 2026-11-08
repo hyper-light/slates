@@ -1,0 +1,73 @@
+name: diag-clients
+
+# Diagnostics only, never on main: the fleet timing tests under spinners. Results go to diag-results/clients-timing-1-<os>.
+on:
+  push:
+    branches: ["diag-clients-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cross-shard-wait:
+    name: R3 class A on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 330
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Build the tests
+        run: cargo test --locked -p slates-server --test fleet --no-run
+      - name: The timing tests under spinners
+        run: |
+          set +e
+          R=../results.txt
+          cpus=$(nproc)
+          spinners=$((cpus * 8))
+          echo "runner ${{ matrix.os }}, $cpus CPUs, $spinners spinners, 10 runs each, commit $(git rev-parse --short HEAD)" > $R
+          pids=()
+          for i in $(seq $spinners); do (while :; do :; done) & pids+=($!); done
+          for t in a_forward_waits_for_the_owners_session_while_it_is_out a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget forwards_to_one_owner_never_wait_behind_each_other a_slow_first_round_candidate_is_hedged_after_the_measured_p95; do
+            pass=0; fail=0
+            for run in $(seq 10); do
+              out=$(cargo test --locked -q -p slates-server --test fleet -- --exact $t --nocapture 2>&1); code=$?
+              if [ $code -eq 0 ]; then pass=$((pass+1)); else fail=$((fail+1)); fi
+              echo "$t run $run exit $code load $(cut -d' ' -f1 /proc/loadavg)" | tee -a $R
+              echo "$out" | grep -E 'FALSE-DEATH|^hedge:|the forward of a read|panicked|^[a-z].*(within|while|met|took|placed|recovered)' | cut -c1-700 | tee -a $R
+            done
+            echo "== $t passed $pass failed $fail" | tee -a $R
+          done
+          kill "${pids[@]}" 2>/dev/null
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/clients-timing-1-${{ matrix.os }}"
+          git config user.name "diag-clients"
+          git config user.email "diag-clients@users.noreply.github.com"
+          git stash -q || true
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-clients timing-1 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
