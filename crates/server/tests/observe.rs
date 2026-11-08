@@ -90,7 +90,7 @@ fn laptop(name: &str) -> Daemon {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-observe-{name}"),
+      name: common::fixture_object("slates-seg", &format!("observe-{name}")),
     },
   )
   .expect("the laptop daemon starts")

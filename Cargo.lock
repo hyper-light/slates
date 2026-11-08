@@ -1407,6 +1407,7 @@ dependencies = [
 name = "slates-bridge-winfsp"
 version = "0.1.0"
 dependencies = [
+ "loom",
  "slates-anchor",
  "slates-bridge-core",
  "slates-db",
@@ -1662,6 +1663,7 @@ dependencies = [
  "blake3",
  "hyper-datagram",
  "hyper-seal",
+ "libc",
  "proptest",
  "rcgen",
  "rustix",

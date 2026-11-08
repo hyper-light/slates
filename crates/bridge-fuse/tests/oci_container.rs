@@ -314,7 +314,10 @@ fn an_oci_container_consumes_a_fuse_host_mount_through_the_runtime_bind() {
       .attach(
         volume_id,
         View::Current,
-        Principal::Uid { uid },
+        Principal::Uid {
+          host: slates_db::HostId(0),
+          uid,
+        },
         Rights {
           read: true,
           write: true,

@@ -231,12 +231,136 @@ fn an_overlay_recovers_after_an_outsider_changed_its_base_directories_since_its_
   }
 }
 
+/// Format: the errno a base directory that is gone is refused with, `ENOENT` (2 wherever slates ships).
+const GONE_ERRNO: i32 = 2;
+
+/// Recovers `image` over `host` as a daemon's successor does: every descriptor closed, the store's surviving content.
+fn recover_over(
+  host: &mut SimHost,
+  store: &Store,
+  image: &slates_vfs::recover::VolumeImage,
+) -> (Store, Result<Volume, VfsError>) {
+  host.close_files();
+  let root = host.root();
+  let mut after = common::surviving(store);
+  let claims = common::claims(&mut after, &[image]);
+  let recovered = Volume::from_image(
+    &mut after,
+    image,
+    &claims,
+    Box::new(StepClock::new(0, 1)),
+    1 << 20,
+    Some((host, root)),
+  );
+  (after, recovered)
+}
+
+/// What a recovered overlay answers once its loaded base directory `/src` is gone: the overlay's own file reads back,
+/// the untouched base entries there refuse `BaseUnavailable` with the host's errno, listing `/src` refuses the same, and
+/// the rest of the base reads the disk.
+fn answers_without_src(vol: &mut Volume, host: &mut SimHost, store: &mut Store) {
+  assert_eq!(
+    read_all(vol, host, store, "/src/agent.rs").unwrap(),
+    b"the overlay's own",
+    "the overlay entry in the gone directory serves"
+  );
+  for path in ["/src/lib.rs", "/src/mod.rs"] {
+    assert_eq!(
+      read_all(vol, host, store, path),
+      Err(VfsError::BaseUnavailable(GONE_ERRNO)),
+      "{path}, an untouched base entry of the gone directory, refuses typed"
+    );
+  }
+  let src = vol.with_host(host).resolve(store, "/src").unwrap();
+  assert!(
+    vol.with_host(host).stat(store, src.inode).is_ok(),
+    "the gone directory is the volume's own node, and answers for itself"
+  );
+  let Child::Dir(src) = src.child else {
+    panic!("/src is a directory");
+  };
+  assert!(
+    matches!(
+      vol.with_host(host).readdir(store, src),
+      Err(VfsError::BaseUnavailable(GONE_ERRNO))
+    ),
+    "listing the gone directory refuses rather than show part of it"
+  );
+  assert_eq!(
+    read_all(vol, host, store, "/top.txt").unwrap(),
+    b"at the root"
+  );
+}
+
+/// Bug (GAPS, A-153's "Open, found here"; 2026-11-07): a loaded base directory removed after the last publication made
+/// recovery refuse the whole volume (`RecoveryIncomplete`), since reopening it failed. §4.8's failure matrix: a base
+/// directory gone refuses `BaseUnavailable` for the untouched entries under it, while overlay entries serve. Do: over a
+/// base of `/src/lib.rs`, `/src/mod.rs` and `/top.txt`, read `/src/lib.rs` (so `/src` is listed and its file witnessed),
+/// write `/src/agent.rs` in the overlay, and image; remove `/src` from the disk and recover. Expect: the volume
+/// recovers and answers as `answers_without_src` says; imaged and recovered again, it answers the same (the gone
+/// directory's record is kept); and with another directory made at `/src` since, it answers the same again, the other
+/// directory never substituted for the recorded one.
+#[test]
+fn an_overlay_whose_loaded_base_directory_was_removed_recovers_and_refuses_only_that_directory() {
+  let mut host = SimHost::new();
+  host.mkdir("/src");
+  host.replace_file("/src/lib.rs", b"the base's own");
+  host.replace_file("/src/mod.rs", b"never read");
+  host.replace_file("/top.txt", b"at the root");
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/src/lib.rs").unwrap(),
+    b"the base's own"
+  );
+  let src = vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/src")
+    .unwrap();
+  let Child::Dir(src) = src.child else {
+    panic!("/src is a directory");
+  };
+  let agent = vol
+    .with_host(&mut host)
+    .create_file(&mut store, src, "agent.rs", 0o644)
+    .unwrap();
+  vol
+    .with_host(&mut host)
+    .write(&mut store, agent, 0, b"the overlay's own")
+    .unwrap();
+  let image = vol.to_image(&store, Some(&mut host)).unwrap();
+  host.advance_ns(10);
+  host.remove("/src");
+  let (mut after, recovered) = recover_over(&mut host, &store, &image);
+  let mut recovered =
+    recovered.expect("an overlay whose loaded base directory is gone still recovers");
+  answers_without_src(&mut recovered, &mut host, &mut after);
+  let again = recovered.to_image(&after, Some(&mut host)).unwrap();
+  let (mut after_again, recovered_again) = recover_over(&mut host, &after, &again);
+  let mut recovered_again = recovered_again.expect("its next image recovers too");
+  answers_without_src(&mut recovered_again, &mut host, &mut after_again);
+  // A directory made again at the path is another directory, never the recorded one (§4.8, A-153): it is not
+  // substituted, and the volume still recovers.
+  host.mkdir("/src");
+  host.replace_file("/src/lib.rs", b"put back");
+  host.replace_file("/src/mod.rs", b"put back");
+  let back = recovered_again
+    .to_image(&after_again, Some(&mut host))
+    .unwrap();
+  let (mut after_back, recovered_back) = recover_over(&mut host, &after_again, &back);
+  let mut recovered_back =
+    recovered_back.expect("with another directory at the path, the overlay still recovers");
+  answers_without_src(&mut recovered_back, &mut host, &mut after_back);
+}
+
 /// The guard beside it: a base directory another directory replaced is not the directory the image recorded, and
 /// reopening a path alone never substitutes another base (§4.5 recovery, "validated source identity"). Do: read a file
 /// in a subdirectory and image the overlay; then make another directory and rename it over the subdirectory; recover.
-/// Expect `RecoveryIncomplete`.
+/// Expect: the volume recovers, and the replaced directory's file refuses `BaseUnavailable` rather than read the other
+/// directory's. Until 2026-11-07 the whole volume was refused `RecoveryIncomplete` (the failure matrix's runtime rule:
+/// `docs/bugs/2026-11-07-a-removed-base-directory-refused-the-whole-volume-at-recovery.md`).
 #[test]
-fn an_overlay_whose_base_directory_another_replaced_is_refused() {
+fn an_overlay_whose_base_directory_another_replaced_never_serves_the_other() {
   let mut host = SimHost::new();
   host.mkdir("/src");
   host.replace_file("/src/lib.rs", b"the recorded tree");
@@ -248,21 +372,13 @@ fn an_overlay_whose_base_directory_another_replaced_is_refused() {
   host.mkdir("/elsewhere");
   host.replace_file("/elsewhere/lib.rs", b"another tree");
   host.rename("/elsewhere", "/src");
-  host.close_files();
-  let root = host.root();
-  let mut after = common::surviving(&store);
-  let claims = common::claims(&mut after, &[&image]);
-  assert!(matches!(
-    Volume::from_image(
-      &mut after,
-      &image,
-      &claims,
-      Box::new(StepClock::new(0, 1)),
-      1 << 20,
-      Some((&mut host, root)),
-    ),
-    Err(VfsError::RecoveryIncomplete)
-  ));
+  let (mut after, recovered) = recover_over(&mut host, &store, &image);
+  let mut recovered = recovered.expect("a replaced base directory costs only its own entries");
+  assert_eq!(
+    read_all(&mut recovered, &mut host, &mut after, "/src/lib.rs"),
+    Err(VfsError::BaseUnavailable(GONE_ERRNO)),
+    "the other directory's file is never served as the recorded one"
+  );
 }
 
 /// AC-2.12 / T-2.14, AC-1.11: recover redirected directories, whiteouts, a snapshot, metadata

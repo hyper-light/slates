@@ -577,18 +577,24 @@ pub(crate) fn restore_held_registers(
         )
       })
       .collect();
+    let (object, owner) = (ObjectId(register.object), HostId(register.owner));
     let acceptor = Acceptor::recovered(
       local,
       Authority {
         generation: register.generation,
-        owner: HostId(register.owner),
+        owner,
       },
       HostEpoch(register.promised),
       accepted,
     );
-    state
-      .holder_records
-      .insert(ObjectId(register.object), acceptor);
+    state.holder_records.insert(object, acceptor);
+    // The routing view is not persisted, and every install reaches a held object only through it: the takeover's
+    // resolve moves it to its successor, the authority reconcile raises it to the installed generation, and a page
+    // lists and fences it. So the restored copy is routed to the owner its acceptor names, as accepting a record does.
+    // Unrouted, a holder restarted warm answered a successor's page empty, leaving its copy unfenced, and refused the
+    // successor's adoption `ForeignGeneration` every period
+    // (`a_restored_holders_copy_moves_to_its_successor_and_accepts_its_adoption`).
+    state.fleet.track_object_owner(object, owner);
   }
   count
 }

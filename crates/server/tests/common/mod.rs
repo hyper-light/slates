@@ -14,7 +14,7 @@ pub(crate) mod landing;
 #[cfg(unix)]
 pub(crate) mod lease;
 pub(crate) mod nfs;
-#[cfg(unix)]
+// The NFSv4.2 client speaks TCP alone, and the daemon serves NFS on Windows too (A-184).
 pub(crate) mod nfs4;
 pub(crate) mod target;
 // The vhost-user front end a VMM speaks, over `guest`'s driver (Linux, where vhost-user is built).
@@ -50,6 +50,12 @@ const MOST_NAMED_TEST_SHARDS: u16 = 2;
 /// Production runs one daemon per process, so its region is always its own; a test process runs many, and whichever
 /// started first sized the region for its own shards, so a later daemon with more shards found sealing unavailable
 /// depending on test order (2026-10-05: 512 slots held against 1024 needed, one run in three of the recovery suite).
+/// This process's host, as an in-process daemon with no fleet names it (A-237): the machine identity's host id, the
+/// anchor `slates_server::daemon::local_anchor` takes. A share to an account of the test's own daemon names it.
+pub(crate) fn this_host() -> u64 {
+  slates_server::daemon::host_id_of(&machine_profile().facts.identity)
+}
+
 pub(crate) fn machine_profile() -> MachineProfile {
   static PROFILE: OnceLock<Result<MachineProfile, MachineError>> = OnceLock::new();
   PROFILE
@@ -69,4 +75,19 @@ pub(crate) fn machine_profile() -> MachineProfile {
     })
     .clone()
     .expect("the machine profile measures")
+}
+
+/// The name of one fixture's shared object (its segment, `slates-seg`, or its content object, `slates-con`), unique to
+/// this process and this call: `{prefix}-{name}-{pid}-{n}`. On macOS a shared-memory name is the user's, a creation first
+/// unlinks any holder's, and a creator's drop unlinks the name again, so two fixtures under one name, a proptest's
+/// successive cases or two processes of one binary, let the first's drop unlink the second's: a loaded run's shard then
+/// found its segment gone (`shm_open` `ENOENT`, 2026-11-07). `daemon.rs`'s audit fixtures name one instance per call for
+/// the same reason (2026-09-15). The platform's name limit is kept by `slates-mem`, which hashes a long name.
+pub(crate) fn fixture_object(prefix: &str, name: &str) -> String {
+  static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+  format!(
+    "{prefix}-{name}-{}-{}",
+    std::process::id(),
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+  )
 }

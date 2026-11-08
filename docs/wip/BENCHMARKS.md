@@ -10803,7 +10803,7 @@ A-198's crash defect, losing requests the driver delivered, so it is not restore
   `docs/bugs/2026-11-06-a-replayed-close-was-refused-after-takeover.md`).
 - A rename's durable name update spent a shard turn only to learn none was left: 2.27 turns a rename at 4.7 µs each on
   arm64 (main `c1e9e83f`, `a_rename_with_one_open_name_takes_one_shard_turn`).
-- Each received batch made two system allocations, its requests and their hints (`agents/winfsp-overlap-14`,
+- Each received batch made two system allocations, its requests and their hints (main `430efcee`,
   `tests/batch_allocations.rs`: 100 batches, 200 calls before, 0 after).
 
 **Kept, and why:**
@@ -11647,15 +11647,212 @@ Within each run, quiet p50:
 On one VM the fix does not slow an unlink (−23.6 and −3.8 µs), a stat or a rename. The open's and the close's
 millisecond outliers, present in both arms of earlier runs, separate nothing in two runs.
 
+### The allocation fix on one VM, five runs, in both forms
+
+**The question.** Run 42354811410's `unlink-arm` lane published two runs of five. Here four arms run interleaved on
+one windows-11-arm VM (4 logical CPUs, WinFsp 2.1.25156), quiet and loaded (two spinners a logical CPU), 5 runs of 5,
+0 failed (run 42404256322, lane `unlink-four`, diag `diag-winfsp-overlap-44`):
+- `combA` and `combB`: the combined form at two fixed workers before the allocation fix (`ea71f839`, diag tree
+  `2fd3041b`) and after it (`792977e9`, diag tree `6cbba703`);
+- `mainA` and `mainB`: main's form, the one that ships, before the allocation fix (`3feba7c5`) and with it (`430efcee`).
+
+**Cells worse beyond the other arm's spread** (p50 and p99, 18 a phase; abtable.py's rule):
+
+| comparison | quiet | loaded |
+|---|---|---|
+| `mainB` (the fix) worse than `mainA` | 0 | 0 |
+| `mainA` worse than `mainB` | 1 (fsync p50) | 2 (stat p50, stat p99) |
+| `combB` (the fix) worse than `combA` | 2 (open p50, close p50) | 0 |
+| `combA` worse than `combB` | 1 (create p50) | 2 (write p50, open p99) |
+
+**Within each run, the fix's arm minus the arm before it, p50, µs** (sorted, then the median and the runs the fix won):
+
+| op | main's form, quiet | main's form, loaded | combined form, quiet | combined form, loaded |
+|---|---|---|---|---|
+| unlink | -6.6 -3.8 -1.8 +1.8 +3.8 (median -1.8; 3 of 5 faster) | -5.9 -3.1 -2.6 +8.1 +9.1 (median -2.6; 3 of 5 faster) | -23.3 -5.4 +0.6 +33.9 +42.3 (median +0.6; 2 of 5 faster) | -145.8 +78.2 +91.7 +96.7 +317.6 (median +91.7; 1 of 5 faster) |
+| stat | -4.3 -3.0 -2.8 -1.8 -1.0 (median -2.8; 5 of 5 faster) | -5.3 -4.3 -2.9 -2.2 -2.0 (median -2.9; 5 of 5 faster) | -3.2 -2.8 -0.5 -0.1 +1.1 (median -0.5; 4 of 5 faster) | -142.0 +25.8 +57.9 +102.9 +148.8 (median +57.9; 1 of 5 faster) |
+| create | -7.4 -1.8 -1.7 +0.3 +1.4 (median -1.7; 3 of 5 faster) | -3.6 -2.8 -0.7 -0.6 -0.3 (median -0.7; 5 of 5 faster) | -18.1 -9.5 -8.6 +0.5 +2.8 (median -8.6; 3 of 5 faster) | -15.0 -13.1 -9.2 +5.0 +6.0 (median -9.2; 3 of 5 faster) |
+| rename | -14.5 -9.5 -1.0 +2.5 +2.9 (median -1.0; 3 of 5 faster) | -13.4 -6.6 +1.4 +1.8 +7.3 (median +1.4; 2 of 5 faster) | -85.3 -5.8 +12.3 +35.2 +79.6 (median +12.3; 2 of 5 faster) | -5.8 +7.2 +7.9 +32.6 +38.7 (median +7.9; 1 of 5 faster) |
+| write | -6.9 -5.0 -1.7 -1.4 +0.9 (median -1.7; 4 of 5 faster) | -1.2 -0.2 +0.0 +1.8 +13.2 (median +0.0; 2 of 5 faster) | -16.8 -3.3 -0.1 +0.0 +11.4 (median -0.1; 3 of 5 faster) | -22.7 -16.4 -12.7 -1.1 +16.2 (median -12.7; 4 of 5 faster) |
+| fsync | -8.9 -6.5 -2.1 -1.2 -1.2 (median -2.1; 5 of 5 faster) | -13.2 -12.4 -2.5 -2.4 +0.2 (median -2.5; 4 of 5 faster) | -4.6 -2.6 -0.9 -0.5 +3.4 (median -0.9; 4 of 5 faster) | -5.9 -3.2 -1.0 +1.1 +1.2 (median -1.0; 3 of 5 faster) |
+| read | -1.1 -1.1 -0.3 -0.2 -0.1 (median -0.3; 5 of 5 faster) | -0.9 -0.7 -0.4 -0.2 +0.7 (median -0.4; 4 of 5 faster) | -2.0 +0.7 +1.1 +1.8 +2.3 (median +1.1; 1 of 5 faster) | -1.2 -0.3 +0.1 +0.2 +0.6 (median +0.1; 2 of 5 faster) |
+| open | -118.7 -59.5 -40.6 -10.6 -6.1 (median -40.6; 5 of 5 faster) | -72.3 -6.2 +11.7 +13.1 +63.7 (median +11.7; 2 of 5 faster) | -105.6 -84.7 +2359.5 +2530.5 +2634.9 (median +2359.5; 2 of 5 faster) | -147.7 -102.9 +60.2 +62.1 +78.9 (median +60.2; 2 of 5 faster) |
+| close | -2485.5 -147.5 -116.9 -53.6 +3.3 (median -116.9; 4 of 5 faster) | -128.3 -107.2 -42.5 -18.6 +25.1 (median -42.5; 4 of 5 faster) | +556.8 +656.6 +681.3 +2695.8 +2831.4 (median +681.3; 0 of 5 faster) | -59.6 -51.2 +29.8 +64.8 +72.7 (median +29.8; 2 of 5 faster) |
+
+- **Main's form: the fix slows nothing, and is beyond the spread faster on a loaded stat.** Unlink −1.8 µs quiet and
+  −2.6 loaded. Stat −2.8 quiet and −2.9 loaded, faster in 5 of 5 runs each; fsync and read faster in 5 of 5 quiet.
+  Loaded stat p99 fell from 2,223–14,546 µs across runs to 661–8,736.
+- **The combined form: no unlink cost quiet (+0.6 µs, 2 of 5).** Loaded, its fix arm was slower in 4 of 5 runs on
+  stat (+57.9) and unlink (+91.7). The two arms' loaded stat p50 spread over 213–536 µs across runs, against main's
+  158–164. An allocation removed cannot add 90 µs, so that is the combined form's two workers under load.
+- **The close's and open's millisecond mode.** A quiet close's p50 sits near 1.1 ms or near 3.5–4.3 ms in a run, and
+  every arm has both (`mainA` 2 runs of 5 slow, `mainB` 1, `combA` 3). `combB` was slow in all 5 and its open in 3
+  (3.5 ms against 0.9), so those are its two worse cells. Run 42354811410's `alloc` arm, the same build, had one such
+  open. Unexplained, and only in the combined form, which does not ship. Main's form shows no such shift.
+
+### The CanDelete lever: measured and rejected (a file's CanDelete answered from its context, `agents/winfsp-overlap-18`)
+
+**The lever.** CanDelete's shard check is kept (above), but only a directory's emptiness needs the volume. A file may
+always be marked. `agents/winfsp-overlap-18` (`10e7c2f8` on main `a2cf9af7`) carries the open's kind in its ledger
+context:
+- a CONTEXT_FORMAT bit and a CONTEXT_DIRECTORY bit;
+- the ledger at version 5 (WFO5), with an old-format context refused `Refusal::Format`, typed;
+- the takeover restore tested with both kinds.
+
+The callback answers a file's CanDelete on WinFsp's thread.
+
+**The test, red first** (diag `diag-winfsp-overlap-45`, run 42405814913, both runners): a client deletes a file and
+removes an empty directory, and the shard's CanDelete requests are counted. At `b21fec11` it counts 2 and fails, exit
+101. At `10e7c2f8` it counts 1, the directory's, with the bridge's 84 tests and the CLI's 15 passing. In the bench,
+main's form made 11,001 CanDelete shard trips a run before and 1 after.
+
+**The A/B: dead even.** Main `a2cf9af7` against `10e7c2f8`, interleaved on one windows-11-arm VM, quiet and loaded,
+5 runs of 5, 0 failed. Cells worse beyond the other arm's spread, of 18: 0 and 0 each way. Within each run, lever
+minus main, p50:
+
+| op | quiet | loaded |
+|---|---|---|
+| unlink | −9.7 −2.0 −0.8 −0.7 +3.7 (median −0.8) | −6.8 −5.8 −3.1 −1.0 +4.8 (median −3.1) |
+| stat | median +2.5 | median −0.8 |
+| create | median +3.8 | median −1.5 |
+| rename | median +3.0 | median +6.8 |
+| fsync | median −2.5 | median −2.4 |
+
+The trip it removes was 2.6 µs at the p50 (run 42185624364), and the unlink moved −0.8 µs quiet and −3.1 loaded,
+about what that predicts. Both are inside an unlink's run-to-run spread of 221–297 µs.
+
+**Rejected (the supervisor's decision, 2026-11-07).** The request-level saving is real: 11,001 CanDelete shard trips a
+run become 1, each 2.6 µs at the p50. At the bench the A/B is dead even, and a dead-even change does not land, least of
+all one that costs a ledger format (version 4 → 5, versioned contexts). `agents/winfsp-overlap-18` stays off main; a
+file's CanDelete still asks the shard, and its check stays as kept above.
+
+### Every remaining per-request cost, with its number
+
+From main's form after the rename, allocation and CanDelete fixes (`10e7c2f8`, profiled at `245be856`), against the
+profiled DLL arm (`40ee5a65`). Diag `diag-winfsp-overlap-46` (run 42406233399): quiet, 5 runs a runner, each build's own
+shard count, the median over runs of each run's p50, µs, arm64 / x86_64.
+
+**Crash safety's own, kept:**
+
+| cost | arm64 | x86_64 | why it stays |
+|---|---|---|---|
+| The journal, in all | ≈1.3 | ≈1.1 | the receive journal |
+| — the receive buffer's begin | 0.2 | 0.2 | |
+| — the capture (1.2 before the allocation fix) | 0.3 | 0.3 | |
+| — the decode | 0.2 | 0.2 | |
+| — the response's save | 0.3–0.5 | 0.2–0.3 | |
+| — the acknowledgement | 0.2 | 0.2 | |
+| The copy into the working packet | 0.3–0.6 | 0.3–0.5 | WinFsp's op functions write into the request (a target-directory open trims the name in place), and a replay needs the original |
+| The ledger's write in the shard's serve, against dll's | Create +2.3, Open +0.8, Release +0.5 | — | the open ledger |
+| A-198's barrier: Release's round, against dll's | 6.7 against 5.0 | 10.7 against 4.4 | A-198 |
+| Cleanup's hop to the shard, against dll's | 17.9 against 9.7 | — | the shard is still publishing the previous request's barrier |
+| A rename's durable name update | 7.3 | — | one shard turn since `c1e9e83f` |
+
+**Not crash safety's:**
+
+| cost | arm64 | x86_64 | standing |
+|---|---|---|---|
+| The open's confirmation round, waited on after the send | 3.6 at the p50 (8.8 mean); the shard round 3.0 | 3.0; round 2.7 | on every open, 66,005 a run; proposed: post it after the send and take its answer once the next receive returns |
+| The separate send, with the kernel's IRP completion | 3.6–14.2 (Create 14.2, Cleanup 11.8, Close 3.6) | 2.7–14.6 | A-215's combined call, measured and rejected (above) |
+| A reply channel allocated per shard call (`sync_channel(1)`) | not timed alone; 0.1–0.2 estimated | — | the DLL arm pays it too; small |
+| An Open's and a Create's path decoded into a String for the shard | — | — | the DLL arm pays it too |
+
+The interface's `between` gaps show what the separate send costs the client. From Cleanup's return to the Close's entry,
+dll takes 25–27 µs and main 35. Flush is 25–28 against 38, VolumeInfo 31–33 against 40–47, and Write 62–69 against 76. A
+dash in a table: not broken out on that runner.
+
+### The bench's own noise: a control arm, and identical arms (audit step 7; 2026-11-08)
+
+**A do-nothing arm.** Diag `diag-winfsp-overlap-47` (run 42463623854) ran main (`4811191a`), cut 0 (`58bf8310`: the
+receive protocol moved into `inflight/settle.rs` and its crash oracle, nothing on the request path changed) and the
+purge slot (`d0492b10`, A-249) interleaved on one VM of each runner, quiet and loaded, 5 runs of 5, 0 failed. Cells
+worse beyond the other arm's spread, p50 and p99, of 18 a phase:
+
+| | arm64 quiet | arm64 loaded | x86_64 quiet | x86_64 loaded |
+|---|---|---|---|---|
+| cut 0 worse than main | 1 | 2 | 0 | 0 |
+| main worse than cut 0 | 2 | 7 | 7 | 2 |
+| purge slot worse than main | 3 | 0 | 0 | 0 |
+| main worse than the purge slot | 2 | 4 | 2 | 6 |
+| purge slot worse than cut 0 | 1 | 1 | 3 | 0 |
+| cut 0 worse than the purge slot | 1 | 1 | 0 | 4 |
+
+Main looks "worse" in up to 7 cells against a tree that changes nothing on the request path, and x86_64's quiet
+unlink moves 19.0 µs within each run (median, 4 runs of 5). So the bench's noise floor, or a bias against the arm
+listed first, is at least that large, and cut 0 is read as the control: the purge slot against it is 1 and 1 cells on
+arm64 and 3 and 4 on x86_64, no effect claimed. **Every later cut carries a do-nothing arm.**
+
+**Identical arms.** Diag `diag-winfsp-overlap-48` (run 42486022157) ran three copies of one binary (main `4811191a`,
+built once a lane, the three files' SHA-256 equal) on one VM of each runner, quiet and loaded, six runs. In a round the
+bench takes the arms in its list's order from `(round + offset) % arms`. The lanes ran that list fixed, as the bench had
+it, or rotated each run to start with the run's first-started arm. The windows-latest fixed lane stalled after its
+first run (no further output in 1 h 40 m, the job still alive), as diag-42's unlink lane once did; it is not used.
+
+Cells one copy was worse than another beyond its spread, per pair and phase, of 18:
+
+| lane | runs | most cells, one pair and phase | cells each copy is worse, both phases (a, b, c) |
+|---|---|---|---|
+| windows-11-arm, list fixed | 6 | 4 | 7, 4, 9 |
+| windows-11-arm, list rotated | 6 | 5 | 3, 7, 6 |
+| windows-latest, list rotated | 6 | 6 | 8, 1, 4 |
+
+Each copy's p50 against the three copies' mean in the same run, over every op (geometric):
+
+| lane | quiet (a, b, c) | loaded (a, b, c) |
+|---|---|---|
+| windows-11-arm, list fixed | −3.15%, −0.75%, +3.90% | +1.19%, −0.30%, −0.89% |
+| windows-11-arm, list rotated | +1.01%, −0.18%, −0.83% | −0.53%, +0.24%, +0.28% |
+| windows-latest, list rotated | +2.33%, −1.92%, −0.41% | +0.77%, −1.08%, +0.31% |
+
+- **The rule's floor.** Identical binaries are "worse" in up to 6 cells of 18 for one pair and phase. A verdict of a few
+  worse cells cannot tell two arms apart, which is why the A/Bs above (diag-44's, diag-45's dead even) are read within
+  each run as well.
+- **The list's order.** Fixed, the first-listed copy ran 3.15% under the run's mean in arm64's quiet pass and the last
+  3.90% over, most of it in open and close, whose millisecond mode it falls in. Rotated, no copy is more than 1.01% off
+  on arm64. A copy still sits 2.33% off on windows-latest rotated, so a run's arms differ by about ±2% with nothing
+  between them.
+- **So:** the bench rotates its list every run from now on (`windows-ab.sh`), and a cut is called only on its
+  within-run differences against a do-nothing arm, measured beyond what identical arms show.
+
+### The Open and Release barriers: measured and rejected as a cut (audit step 7; 2026-11-08)
+
+**The proposal.** A-198's rule that "successful opens and closes publish their reference changes" puts a shard
+publication before an Open's and a Release's reply. Recovery already reconciles the restored open counts against the
+ledger's live contexts (`reconcile_opens`), so the barrier looked removable, a whole publication off each open and close.
+
+**The measurement.** From the per-phase profile of `diag-winfsp-overlap-46` (run 42406233399, five runs a runner): a
+round's mean less its hop-in, serve and to-answer leaves the shard's answer step, which is the barrier and the send.
+Means, µs:
+
+| answer step | arm64, main | arm64, dll | x86_64, main | x86_64, dll |
+|---|---|---|---|---|
+| Open (barrier) | 0.5 | 2.7 | 0.3 | 4.8 |
+| Release (barrier) | 0.8 | 3.6 | 0.7 | 8.0 |
+| Resolve (no barrier) | 0.6 | 0.6 | 0.4 | 0.3 |
+| Info (no barrier) | 0.6 | 1.1 | 0.5 | 0.6 |
+
+In main's form an Open's or a Release's barrier costs what an op with none does, within 0.2 µs; only the DLL arm still
+pays it. Removing it would save under 0.2 µs a request, against the bench's ±2% floor between identical arms (above), so
+it is **rejected**, and A-198 stays as written. The ledger's own writes, the other candidate named with it, show no cost
+against the DLL at the mean either (serve: Create 10.2 against 13.6 µs on arm64 and 7.3 against 8.7 on x86_64; Open
+2.3 against 3.2 and 2.0 against 2.8).
+
 ### Step 7's verdict
 
 - **Fixed wherever it was not crash safety:** the replayed Close's refusal, the rename's empty shard turn, the per-batch
   allocations.
-- **Kept, CanDelete's check:** the baseline skips it and lets a non-empty directory's removal report success.
+- **The allocation fix, five runs on one VM:** in main's form it slows nothing (unlink −1.8 µs quiet, −2.6 loaded,
+  within each run) and is beyond the spread faster on a loaded stat (−2.9 µs, 5 runs of 5).
+- **Kept, CanDelete's check:** the baseline skips it and lets a non-empty directory's removal report success. Answering a
+  file's check from its ledger context (`agents/winfsp-overlap-18`) removes 11,001 shard trips a run but measured dead
+  even at the bench (unlink −0.8 µs quiet, −3.1 loaded), so it is rejected and every CanDelete still asks the shard.
 - **Kept, crash safety's price:** on arm64, quiet, about 18 µs a stat and 30 to 35 µs a rename or an unlink against the
   DLL dispatcher. The journal holds 3 to 4.5 µs a request, the ledger and A-198's barriers about 5 µs a stat, direct
   output 0.5 µs a call, and a kernel share of 3 to 5 µs a request inside the transaction call. R4 keeps it: the
   baseline's speed comes with A-198's crash defect.
+- **What is left that crash safety does not need:** the open's confirmation round on the worker's path, 3.6 µs an open
+  on arm64 and 3.0 on x86_64. The separate send is A-215's, rejected. A reply channel per shard call and a path's
+  String the DLL arm pays too.
 - **The form:** main's separate receiver, one worker. A-215's combined transact and A-219's second worker are measured
   and rejected.
 
@@ -11699,3 +11896,103 @@ canonicalize.
   against main's 11 to 12. On the quiet CI runners above, the sliced walk took 1.1 to 1.9 times main's one poll. Main's
   number is a poll that held the shard throughout.
 - Every run's harness ended with 0 oracle failures.
+
+## A shard's scheduling slice, measured and rejected (A-224; 2026-11-06 to 2026-11-08)
+
+CI's Linux runners (`ubuntu-latest`, x86_64; `ubuntu-24.04-arm`, arm64; kernel 7.0.0-1017-azure), from diagnostics
+branches never merged (`diag-perf-*`). Loaded = the supervisor's controlled load: `systemd-run --user --scope -p
+AllowedCPUs=0-1 -p MemoryMax=256M`, two spinning threads a core, a sibling `dd conv=fsync` writer. Harness:
+`edit_merge_bench` (agents/perf-2 `82e1f011`), `--loaded-only --spinners-per-core 2 --client-spin-ns default
+--shard-slice-ns N --files 10 --form accept --form conflict`. The in-process daemon's shards ask for slice N as they
+start; N = 0 asks nothing. Quiet: `--quiet-only`, paced (`--pause-ns 2000000`) and unpaced. Each invocation is 3 runs
+× up to 1,000 samples.
+
+The confirmation run (diag-perf-9, run 42423446888, 2026-11-07 22:40 to 23:38 UTC; six interleaved rounds an arm).
+Ranges over the six rounds, loaded, 10 files; medians in parentheses:
+
+| Runner, arm | accept p50 µs | accept p99 ms | accept max ms | conflict p50 µs | conflict p99 ms |
+|---|---|---|---|---|---|
+| x86_64, none | 12–13 | 1.02–13.34 (5.95) | 10.6–21.0 (17.5) | 13–14 | 1.05–9.50 (6.01) |
+| x86_64, kernel minimum 100 µs | **16–1,852** | 4.00–6.49 (5.22) | 7.7–12.2 (9.4) | **16–17** | 4.17–7.87 (6.33) |
+| x86_64, step budget × 32, 206 µs | **14–826** | 3.99–6.97 (6.27) | 8.0–10.9 (9.9) | 13–16 | 4.15–6.83 (5.22) |
+| arm64, none | 35–2,063 (80) | 22.00–34.99 (26.57) | 29.1–39.1 (37.1) | 15–21 | 14.80–35.00 (25.98) |
+| arm64, kernel minimum 100 µs | 86–1,994 (152) | 2.15–9.00 (6.02) | 3.9–12.0 (7.0) | **15–4,015** | 2.83–9.00 (4.90) |
+| arm64, step budget × 32, 234 µs | **19–3,911 (2,048)** | 2.52–9.01 (9.00) | 4.2–12.0 (10.8) | **15–3,785** | 3.26–9.00 (9.00) |
+
+Bold: a loaded p50 beyond base's spread. Quiet, every arm, both runners: accept p99 0.02 to 0.13 ms, even. The run
+before it (diag-perf-7, run 42328692666, three rounds) swept eight slices each runner derived: none, the kernel's
+minimum, the step budget (8.27 µs x86_64, 7.02 µs arm64) × 16 to × 256, and the kernel's default (2.25 ms). Slices
+above × 32 lost the gain (arm64 p99 10 to 26 ms at × 64 to the default), and the p50 excursions (2.0 to 7.4 ms on
+arm64) appeared in four slice arms and in none of base's rounds. The runtime's own A/B (diag-perf-6, run 42188445711,
+base `20c74c56` against `7c04f873` asking 100 µs) had shown the same: arm64 p99 13–25 to 6.7–9.0 ms, x86_64
+overlapping, the arm64 p50 3.8 to 4.0 ms in some rounds, and nothing at rest (657 voluntary switches and 4 CPU ticks a
+minute idle, either build).
+
+By the rule (loaded p99 and max keep the gain; loaded p50 not worse than base beyond the spread), no slice is taken,
+and A-224 is measured and rejected.
+
+### The load test's quiet arm after its walls: 3,000 and 10,000 clients on one node (2026-11-07, agents/loadtest-scale)
+
+The same command (`rung.sh` / `rung-ab.sh <label> <bound> --tree <linux-v7.4-rc1>/kernel --clients <n> --hot-files
+<0.8 n> --per-connection 32 --rounds 3 --reply-patience 60 --think-us 0`, think time 0 named), against a single-node
+`slates anchor --quick`. Mac Studio (adas-mac-studio.local-2, 32 CPUs, Apple silicon), release binaries (LTO) of
+agents/loadtest-scale-1. Linux v7.4-rc1 (6628e7d4) `kernel/`, 754 files.
+
+**3,000 clients, A/B of the history (A-242).** Main 4326a9d8 (3 runs) and W3 888e3ae3 (3 runs, interleaved), then W2
+26c0eff4 (2 runs). Load 1.9 to 13. Milliseconds, `SubmitAccepted`:
+
+| Build | Wall s | Accepted | `BudgetExceeded` | p50 | p99 | max | Peak RSS GB |
+|---|---|---|---|---|---|---|---|
+| main 4326a9d8 | 80.9 / 83.1 / 87.3 | 3,786 / 3,740 / 3,743 | 2,416 / 2,419 / 2,410 | 679 / 717 / 659 | 1,368 / 1,354 / 1,572 | 1,560 / 1,510 / 1,758 | 10.96 / 7.02 / 19.61 |
+| W3 888e3ae3 | 72.2 / 77.0 / 104.7 | 3,729 / 3,753 / 3,768 | 2,417 / 2,456 / 2,440 | 639 / 584 / 915 | 1,072 / 1,516 / 1,731 | 1,221 / 1,797 / 1,998 | 21.0 / 15.97 / 16.95 |
+| W2 26c0eff4 | 39.5 / 35.4 | 9,000 / 9,000 | 0 / 0 | 136 / 123 | 264 / 219 | 338 / 256 | 2.91 / 5.15 |
+
+The peak RSS of one build ranges 7 to 21 GB across runs (macOS keeps freed large blocks resident), so it is no
+measure of W3 against main. W2 took every version where the others refused about 2,400 at the retention cap, in half
+the wall.
+
+**10,000 clients, accac5c5** (main ecb86b4f with A-238, the retry hold, A-242, the kept-forward wake, the verdict's
+history walk and A-243), one run, load 4.1 before and 21.7 after, 313 connections. Before these the rung did not finish
+in 30 minutes. Milliseconds:
+
+| Kind | Count | p50 | p99 | p999 | max |
+|---|---|---|---|---|---|
+| CreateWork | 10,000 | 98.6 | 906.7 | 920.8 | 924.6 |
+| Edit | 1,488,140 | 85.7 | 337.9 | 853.4 | 1,042.7 |
+| SubmitAccepted | 26,598 | 50.0 | 214.3 | 355.9 | 798.3 |
+| SubmitConflict | 111,708 | 81.4 | 306.4 | 421.4 | 1,017.3 |
+| ReadHead | 1,405,676 | 92.2 | 275.3 | 413.5 | 1,045.1 |
+| Rebase | 498,562 | 89.5 | 267.1 | 407.9 | 1,038.1 |
+| Destroy | 10,000 | 39.9 | 165.3 | 290.4 | 405.8 |
+
+- **Wall:** 75.9 s.
+- **Correctness:** the oracle and every own file had 0 failures, 0 unknown outcomes, 0 reconnects.
+- **Starved:** 1,204 agents gave up after the harness's conflict-resolution bound: 10,000 agents over 8,000 hot files.
+- **Backpressure:** 2,463,549 requests refused `AcknowledgementOwed` and sent again (a multiplexed connection's older
+  request holds its acknowledgement), owed a look before 100,000.
+- **Daemon:** peak RSS 3.28 GB; CPU 15 min 48 s in the 75.9 s, about 12.5 cores.
+- **The 1 ms bound:** at think time 0 the closed-loop latency is Little's law over the green's one owner shard, p50
+  50 ms at 10,000 clients; W1 (a green's works off its owner) is the lever.
+
+## A give-back makes way for a granted landing (A-226's amendment; 2026-11-08)
+
+reland-a207 found a granted landing about 5 times slower under load on `agents/perf-b3`. The cause, measured: `purge_if_idle`
+went on stepping while the arena allocated nothing, which a landing does not, so give-back steps of a whole quantum
+alternated with the landing's short ones. Now a task that ran across the give-back's yield ends it for that reap tick.
+
+**Command.** `crates/server/tests/presentation_fairness.rs`, `a_granted_landing_never_holds_its_shard_while_it_is_planned`
+(1,000 files of 16 KiB, one shard, debug build), the time it prints. Three saved binaries, interleaved in reversed order
+on alternate rounds, 8 rounds each, every process at `nice -n 19`, beside 144 `nice -n 19 yes > /dev/null`. Script:
+`spin-run.sh 144 8 base current fix`.
+
+**Hardware and load.** adas-macbook-pro-2, Apple M5 Max, 18 CPUs, 128 GB, macOS, 2026-11-08 14:33 to 14:43 UTC; the
+one-minute load 11 to 191 at the start of each run, the Mac shared with other agents.
+
+| Build | Median | All eight, in run order within the arm (s) | Give-back steps a landing |
+|---|---|---|---|
+| base 9a996608 (without a30e4209) | 4.21 s | 3.6, 4.1, 8.8, 4.3, 5.6, 3.3, 3.6, 4.4 | not measured |
+| agents/perf-b3 fd0c41b2 | 21.47 s | 12.4, 30.7, 15.5, 22.1, 55.1, 20.9, 20.1, 34.8 | 2,859 to 4,965 |
+| fd0c41b2 + this fix | 4.16 s | 4.4, 4.2, 4.1, 3.3, 4.2, 3.4, 3.2, 4.7 | 3 to 5 |
+
+All 24 landings were `done` with 1,000 files written. Without the spinners, at load 80 to 110, the landing took 1.0 to 1.4 s
+with one step, so the cost needs a starved shard.

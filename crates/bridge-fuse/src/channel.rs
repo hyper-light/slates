@@ -600,6 +600,11 @@ pub struct ServeState {
   /// entry it still serves. Counted so a mount losing coherence is visible instead of silent (CLAUDE.md #9); read and
   /// cleared by the owner that reports it.
   entry_invalidations_refused: u64,
+  /// The lookups the kernel gave back (each `FORGET`'s node and count) since its owner last took them, when the owner
+  /// logs them ([`ServeState::logs_forgets`]): a `FORGET` takes no reply and is never resent, so the server logs each
+  /// beside the writes it logs, for a successor to give back. Taken every turn, so it holds one request's `FORGET`s at
+  /// most; `None` for an owner that does not log them, which collects nothing.
+  forgotten: Option<Vec<(u64, u64)>>,
   /// The journal records this mount's own requests made: the bytes they wrote are fresh in its kernel, so a later cache
   /// write-back is not held stale there (the dirty-page write-back rule, [`dispatch_request`]).
   own: OwnRecords,
@@ -676,6 +681,7 @@ impl ServeState {
       notifier: None,
       notify_wake: None,
       entry_invalidations_refused: 0,
+      forgotten: None,
       own: OwnRecords::default(),
       writable: WritableOpens::default(),
       states: PageStates::default(),
@@ -775,6 +781,21 @@ impl ServeState {
   /// serving names this mount has tried to invalidate.
   pub fn take_entry_invalidations_refused(&mut self) -> u64 {
     std::mem::take(&mut self.entry_invalidations_refused)
+  }
+
+  /// Collects the lookups each `FORGET` gives back, for an owner that logs them ([`Self::take_forgotten`]).
+  pub fn logs_forgets(&mut self) {
+    self.forgotten.get_or_insert_with(Vec::new);
+  }
+
+  /// The lookups the kernel gave back since this was last asked, each a node and a count, in the order served; empty
+  /// for an owner that does not log them.
+  pub fn take_forgotten(&mut self) -> Vec<(u64, u64)> {
+    self
+      .forgotten
+      .as_mut()
+      .map(std::mem::take)
+      .unwrap_or_default()
   }
 
   /// Wakes this state's serve loop whenever a round of invalidations finishes being written (§4.6): the round runs
@@ -1442,9 +1463,15 @@ fn adopt_unseen_handle(
 fn note_delivered(request: &[u8], len: usize, state: &mut ServeState) {
   let reply = state.reply.get(..len).unwrap_or(&[]);
   let holds = &mut state.holds;
+  let forgotten = &mut state.forgotten;
   crate::bridge::kernel_changes(request, reply, &mut |change| match change {
     KernelChange::HandedOut { parent, name, node } => holds.handed_out(parent, name, node),
-    KernelChange::Forgot { node, count } => holds.forgot(node, count),
+    KernelChange::Forgot { node, count } => {
+      holds.forgot(node, count);
+      if let Some(forgotten) = forgotten.as_mut() {
+        forgotten.push((node, count));
+      }
+    }
     KernelChange::Unnamed { parent, name } => holds.unnamed(parent, name),
     KernelChange::Renamed { from, to, exchange } => holds.renamed(from, to, exchange),
   });

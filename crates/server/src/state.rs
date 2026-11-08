@@ -233,6 +233,10 @@ pub struct ShardState {
   /// The content arena's allocation count when the reserve's refill last found nothing to fault (A-214): until the
   /// arena allocates again, or the burst measure moves, an idle moment's refill has nothing to do.
   pub(crate) refill_settled: Option<u64>,
+  /// The bytes one idle give-back step walks (A-226), the recovery memory's and the write log's alike: what the OS gave
+  /// back in one step quantum the last time, measured by each step for the next (`daemon::learn_give_back_rate`); zero
+  /// until the first, which takes a page.
+  pub(crate) give_back_slice_bytes: usize,
   /// The half-open byte range `[start, end)` of `content` this shard publishes into and recovers
   /// from; `0..0` when there is no content object.
   pub content_range: (usize, usize),
@@ -257,9 +261,10 @@ pub struct ShardState {
   /// itself, by its write verifier).
   #[cfg(target_os = "linux")]
   pub(crate) write_log: Option<crate::write_log::WriteLog>,
-  /// What the previous daemon's log held to replay, consumed when the volumes are rebuilt (A-63).
+  /// What the previous daemon's log held to replay, its writes and `FORGET`s, consumed when the volumes are rebuilt
+  /// (A-63).
   #[cfg(target_os = "linux")]
-  pub(crate) replay: Vec<crate::write_log::Record>,
+  pub(crate) replay: Vec<crate::write_log::Logged>,
   /// Whether the previous daemon acknowledged a write it could not log (its log overflowed and the publication that
   /// would have emptied it was refused): every file a taken-over mount had open is then reported as having lost
   /// writes (A-61, A-63). Linux only, as FUSE is.
@@ -414,6 +419,11 @@ pub struct ShardState {
   /// first request and revoked when the attachment ends (`verbs::end_attachment`). Bounded by the
   /// partition's attachment cap: one entry per live catalog attachment at most.
   pub mount_attachments: BTreeMap<u64, MountAttachment>,
+  /// The volumes this shard's catalog holds that recovery could not rebuild, and why (§4.8): each is listed, and every
+  /// verb on it answers `Refusal::NotRecovered` with its cause (`verbs::find`). Bounded by the partition's volume cap:
+  /// one entry per catalog volume at most, made once at the shard's start.
+  pub(crate) unrecovered:
+    BTreeMap<slates_db::catalog::VolumeId, slates_ipc::protocol::RecoveryCause>,
   /// The Linux FUSE mounts this shard serves, by attachment (§4.6 "Linux"; AUD-29-64; `crate::fuse`). Bounded
   /// by the partition's attachment cap: one entry per live FUSE attachment at most.
   #[cfg(target_os = "linux")]
@@ -691,6 +701,14 @@ pub struct ShardState {
   /// unreachable during a re-election or session churn — never reaches the window. Bounded by the council
   /// membership; only the leader writes it (`fleet::stable_dead_council_members`).
   pub(crate) council_death_watch: BTreeMap<slates_db::HostId, u32>,
+  /// The council members other voters report holding dead (§4.8 "Promotion and takeover", the f + 1 rule): per
+  /// member, per reporting voter, the incarnation it was held dead at and when the report came. The leader retires a
+  /// member only once its own death watch and these reach `f + 1` voters (`fleet::confirmed_dead_council_members`).
+  /// Bounded by the council's members times its voters; a report older than a membership horizon is dropped.
+  pub(crate) death_reports: BTreeMap<slates_db::HostId, BTreeMap<slates_db::HostId, (u64, u64)>>,
+  /// When this node's death watch first ran: a configured member never keyed since then, for a membership horizon,
+  /// is this node's own death vote (`fleet::unreached_since_start`).
+  pub(crate) death_watch_started_ns: Option<u64>,
   /// The control shard's bounded candidate table and enrollment authority.
   pub(crate) discovery: Option<crate::discovery::Discovery>,
   /// Authenticated candidate addresses included in the anchor publication.
@@ -765,6 +783,11 @@ pub struct ShardState {
   /// borrowed — the interrupted-discovery restart the replacement-voter regression forces by stopping this
   /// node while it holds (`Daemon::inject_discovery_fault`).
   pub discovery_withhold_replies: bool,
+  /// Test support (never reachable from the wire): while set, the record serve side holds every live-state reply (a
+  /// takeover's report or log fetch, `slates_cluster::live::LIVE_STATE_STREAM`) after its request arrived, while every
+  /// other stream and the probe plane answer as usual: a holder alive and in contact whose report misses an asker's
+  /// budget, as one retransmission on a lossy path made it (`Daemon::inject_live_state_withhold`).
+  pub live_state_withhold_replies: bool,
   /// The measured **path** to each peer (§4.8 "Derived constants": "election timeout ≥ 10 × broadcast RTT
   /// p99"; `slates_cluster::timing::PathRtt`): the transport's RFC 9002 estimator over every round trip
   /// this node timed to that peer — its SWIM probe's acknowledgement each period, and every consensus
@@ -785,6 +808,10 @@ pub struct ShardState {
   /// client's reply deadline while each step stays inside its own bound. `None` in production
   /// (`Daemon::inject_serve_delay`).
   pub injected_serve_delay_ns: Option<u64>,
+  /// Test support (never reachable from the wire): a volume whose forwarded verbs this node leaves unanswered while
+  /// set, the session carrying its other replies as before, as an owner alive but never answering one exchange is to
+  /// its asker (`Daemon::inject_forward_silence`). `None` in production.
+  pub injected_forward_silence: Option<slates_ipc::protocol::VolumeId>,
   /// Test support: while set, this control shard delivers no pair keys (`Daemon::inject_pair_withhold`), as a
   /// neighbour's recipient answer that has not yet arrived holds a delivery back.
   pub injected_pair_withhold: bool,
@@ -1181,8 +1208,11 @@ pub fn ring_ready_in(s: &ShardState) -> bool {
   }) || !s.deferred.is_empty()
 }
 
+/// Counter: a reply [`deliver`] dropped because its client's slot was gone, retiring or reused by another client.
+pub(crate) const REPLY_UNDELIVERABLE: &str = "reply.undeliverable";
+
 /// A reply that came back from another shard (or a scatter's part): queued for the client's
-/// ring and the server task woken.
+/// ring and the server task woken; dropped and counted ([`REPLY_UNDELIVERABLE`]) when its client is gone.
 pub fn deliver(client_index: u32, request: u64, reply: ReplyBody, recorded: bool) {
   let server = with_state(|s| {
     // The origin's `ring.request` span (§4.14), opened at the slot read and kept while the request was
@@ -1200,6 +1230,9 @@ pub fn deliver(client_index: u32, request: u64, reply: ReplyBody, recorded: bool
       !client.retiring
         && client.client_id == slates_wire::request::RequestId::from_word(request).client
     }) {
+      // Its client is gone or its slot reused: nobody can take the reply. Counted, since a client still waiting would
+      // otherwise wait with nothing to show where its reply went.
+      s.count(REPLY_UNDELIVERABLE, 1);
       return None;
     }
     s.deferred.push(Deferred {

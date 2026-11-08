@@ -23,8 +23,11 @@
 //! (`fleet.forward.lane_full`), never queued. The session's own stream credit bounds the open exchanges, and a
 //! forward past it waits queued (`Backlogged`, refused typed by the endpoint) until a stream frees. Each forwarder
 //! bounds its own wait: the batch is given up once none of its forwards has made progress for its stall budget,
-//! where progress is a reply completed or bytes consumed on the session while one of them was open. Its open
-//! exchanges are abandoned on the next turn and its queued ones dropped.
+//! where progress is a reply completed or bytes of one of its own replies read. Its open exchanges are abandoned on
+//! the next turn and its queued ones dropped. Until 2026-11-07 progress was any byte the session consumed while a
+//! forward was open: a session busy with other replies kept a forward its owner never answered alive for good (298 in
+//! fixtures' 1,000-client primary-kill rung, the owner unable to commit and the session full of `LeaseUnconfirmed`
+//! replies), so the origin's resend and its `OwnerUnreachable` never came.
 //!
 //! **What a session change does.** An exchange is tied to the session it was begun on (its connection id). If the
 //! link replaced the session meanwhile, the forward is answered as unanswered, as a forward cut off by its session's
@@ -35,7 +38,6 @@ use std::task::{Poll, Waker};
 
 use slates_cluster::BatchReplies;
 use slates_db::HostId;
-use slates_machine::derived;
 use slates_rt::futures;
 use slates_transport::connection::Priority;
 use slates_transport::endpoint::{ConnectionId, Endpoint, EndpointError};
@@ -51,6 +53,12 @@ const BEGUN: &str = "fleet.forward.begun";
 /// The status count of a waiting forwarder woken by the driver with its reply taken: a reply begun on the session
 /// and taken by another forwarder's turn (the count that shows forwards sharing the session rather than taking turns).
 const TAKEN_FOR_ANOTHER: &str = "fleet.forward.taken_for_another";
+/// The status count of a forwarder whose forwards were all answered (or answered unanswered by a replaced session):
+/// with [`BATCH_GIVEN_UP`], every forwarder that ended, so the forwarders still waiting are the ones begun and not
+/// counted here.
+const BATCH_DONE: &str = "fleet.forward.batch_done";
+/// The status count of a forwarder that gave up its batch at its stall budget, or because its session failed.
+const BATCH_GIVEN_UP: &str = "fleet.forward.batch_given_up";
 
 /// Where one forward is.
 enum Stage {
@@ -71,8 +79,10 @@ struct Ticket {
   forwarder: u64,
   request: Vec<u8>,
   stage: Stage,
-  /// When it last made progress: queued, begun, or bytes consumed on its session while it was open.
+  /// When it last made progress: queued, begun, or bytes of its own reply read while it was open.
   progress_ns: u64,
+  /// The bytes of its reply read when its progress was last marked ([`mark_progress`]).
+  reply_bytes: usize,
 }
 
 /// One peer's forwards.
@@ -106,15 +116,10 @@ pub(crate) struct ForwardLanes {
 /// flight (`clients_per_shard × slots`, each shard's credit, over every shard). Forwards come only from those
 /// requests (and the cold control verbs), so a lane at its bound means a fault, refused rather than queued.
 fn lane_bound(state: &state::ShardState) -> usize {
-  derived!(
-    state
-      .config
-      .clients_per_shard
-      .saturating_mul(usize::try_from(state.config.region.slots).unwrap_or(usize::MAX))
-      .saturating_mul(state.shards.len().max(1))
-      .max(1),
-    "clients_per_shard × slots × shards",
-    ["clients_per_shard", "region.slots", "shards"]
+  crate::config::forward_lane_bound(
+    state.config.clients_per_shard,
+    state.config.region.slots,
+    u16::try_from(state.shards.len()).unwrap_or(u16::MAX),
   )
   .get()
 }
@@ -151,6 +156,7 @@ fn enqueue(peer: HostId, requests: &[Vec<u8>]) -> Option<(u64, Vec<u64>)> {
           request: request.clone(),
           stage: Stage::Queued,
           progress_ns: now,
+          reply_bytes: 0,
         },
       );
       lane.queued.push_back(*ticket);
@@ -273,6 +279,7 @@ pub(crate) async fn forward_batch(
     let look = look(peer, &held.tickets)?;
     let (drive, progress_ns) = match look {
       Look::Done(replies) => {
+        state::with_state(|s| s.count(BATCH_DONE, 1));
         let last_ns = futures::now_ns();
         let bytes: usize = replies.iter().flatten().map(Vec::len).sum();
         let (first_ns, first_len) = first_reply.unwrap_or((last_ns, bytes));
@@ -326,6 +333,7 @@ pub(crate) async fn forward_batch(
 /// The batch's replies so far, its budget spent: `None` when none of it was ever begun (the session never came),
 /// else the replies with `None` for those not answered.
 fn given_up(peer: HostId, held: &Held, begun: bool) -> Option<BatchReplies> {
+  state::with_state(|s| s.count(BATCH_GIVEN_UP, 1));
   let replies: Vec<Option<Vec<u8>>> = state::with_state(|s| {
     let lane = s.forward_lanes.lanes.get(&peer);
     held
@@ -452,7 +460,7 @@ async fn turn(peer: HostId, left_ns: u64) -> Turn {
   let progressed = endpoint.bytes_consumed() != consumed;
   any_reply |= settle(peer, &mut endpoint, session);
   if progressed {
-    mark_progress(peer, session);
+    mark_progress(peer, &mut endpoint, session);
   }
   crate::fleet::return_sessions(vec![(peer, endpoint)]);
   match driven {
@@ -600,18 +608,42 @@ fn wake_answered(lane: &mut Lane) -> (bool, u64) {
   (any, woken)
 }
 
-/// Marks every forward open on `session` as having made progress now (bytes were consumed on it).
-fn mark_progress(peer: HostId, session: Option<ConnectionId>) {
+/// Marks each forward open on `session` whose own reply has more bytes read than when it was last marked as having made
+/// progress now. Bytes the session consumed for other exchanges are not this forward's progress.
+fn mark_progress(peer: HostId, endpoint: &mut Endpoint, session: Option<ConnectionId>) {
   let now = futures::now_ns();
   let _ = state::with_state(|s| {
     if let Some(lane) = s.forward_lanes.lanes.get_mut(&peer) {
       for ticket in lane.tickets.values_mut() {
-        if matches!(ticket.stage, Stage::Open { session: on, .. } if Some(on) == session) {
-          ticket.progress_ns = now;
-        }
+        mark_ticket_progress(ticket, endpoint, session, now);
       }
     }
   });
+}
+
+/// Marks `ticket` as having made progress at `now` when it is open on `session` and its own reply has more bytes read
+/// than when last marked ([`mark_progress`]).
+fn mark_ticket_progress(
+  ticket: &mut Ticket,
+  endpoint: &mut Endpoint,
+  session: Option<ConnectionId>,
+  now: u64,
+) {
+  let Stage::Open {
+    exchange,
+    session: on,
+  } = ticket.stage
+  else {
+    return;
+  };
+  if Some(on) != session {
+    return;
+  }
+  let read = endpoint.reply_bytes_read(exchange).unwrap_or(0);
+  if read > ticket.reply_bytes {
+    ticket.reply_bytes = read;
+    ticket.progress_ns = now;
+  }
 }
 
 /// What a peer's serve loop takes next ([`next_request_or_forwarded`]).

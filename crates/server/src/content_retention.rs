@@ -8,7 +8,8 @@
 //! these holds:
 //!
 //! - **Named.** The object's newest accepted record names it: a head naming it and listing this holder among
-//!   its content holders, or any position of a green's merge ledger naming it as its inputs. A head that names
+//!   its content holders, or the green's merge ledger position at the sequence it was placed for naming it as its
+//!   inputs (a green's inputs are placed at their version's sequence). A head that names
 //!   it without listing this holder is a **late copy** — hedged here after the head's acknowledging set was
 //!   fixed — which a reader never fetches from this holder; it goes.
 //! - **The newest placement ahead of the records.** It was placed for a sequence newer than any record
@@ -77,15 +78,24 @@ fn newest(records: &BTreeMap<ObjectId, Acceptor>, object: ObjectId) -> Newest<'_
 }
 
 /// Whether the object's accepted records name `manifest` as content this holder (`local`) backs.
-fn named(newest: &Newest<'_>, object: ObjectId, local: HostId, manifest: &[u8; 32]) -> bool {
+fn named(
+  newest: &Newest<'_>,
+  object: ObjectId,
+  local: HostId,
+  (manifest, sequence): (&[u8; 32], u64),
+) -> bool {
   match newest {
     Newest::Head(_, head) => {
       head.manifest.as_ref() == Some(manifest) && head.content_holders.contains(&local.0)
     }
-    Newest::Ledger(_, acceptor) => acceptor.values(object).any(|value| {
-      MergeRecordValue::from_record_bytes(value)
-        .is_some_and(|record| record.inputs.as_ref() == Some(manifest))
-    }),
+    // A green's inputs are placed at their own version's sequence (`merge_service::ship_record`), so they are named
+    // only by the ledger's position at that sequence: one lookup. Asking every position decoded the whole ledger for
+    // each held manifest on every retention pass, quadratic in a green's history: at 500 versions a submit at
+    // `f = 1` spent 20 ms there (the bug record of 2026-11-07, retention decoded every merge record per put).
+    Newest::Ledger(_, acceptor) => acceptor
+      .value_at(object, sequence)
+      .and_then(MergeRecordValue::from_record_bytes)
+      .is_some_and(|record| record.inputs.as_ref() == Some(manifest)),
     Newest::Nothing | Newest::Tombstone | Newest::Other(_) => false,
   }
 }
@@ -111,7 +121,7 @@ pub(crate) fn admits(
   manifest: &[u8; 32],
 ) -> bool {
   let newest = newest(records, object);
-  named(&newest, object, local, manifest) || ahead(&newest, sequence)
+  named(&newest, object, local, (manifest, sequence)) || ahead(&newest, sequence)
 }
 
 /// Whether a held manifest is kept: named by the holder's records, or ahead of them and placed for the newest
@@ -123,7 +133,7 @@ fn keeps(
   (manifest, placed): (&[u8; 32], Placed),
   newest_placed: u64,
 ) -> bool {
-  named(newest, object, local, manifest)
+  named(newest, object, local, (manifest, placed.sequence))
     || (ahead(newest, placed.sequence) && placed.sequence >= newest_placed)
 }
 
