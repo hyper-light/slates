@@ -167,13 +167,13 @@
 > cluster and the server's lib); its two tests' assertions hold on the fabric
 > (`docs/bugs/2026-11-08-an-os-socket-awaited-on-the-simulation-driver-woke-only-on-its-timers.md`).
 
-> **Open (live-durability, 2026-11-08): on the simulated fabric a 60 KB request crossed a deep shared link in 47.7
-> s.** One `Endpoint::request` was made after a 256 kbit/s link with a 1 MiB queue was added, mid-session, to both
-> directions. The request was answered after 47,661 ms of virtual time. The serialization time is 1.9 s, and with the
-> link one way from the start the request took 2,837 ms. At 2.56 Mbit/s it took 4,753 ms. The queue peaked at 132 KB,
-> more than twice the request. Nothing was dropped, and a 100 ms re-poll changed nothing. A link shared by both
-> directions with 32 s of buffer is an extreme path; why the sender takes 20 times the link's time on it is not
-> known.
+> **Explained (live-durability, 2026-11-08): on the simulated fabric a 60 KB request crossed a slow link in 47.7 s.**
+> One `Endpoint::request` was made after a 256 kbit/s link with a 1 MiB queue was added, mid-session, to both
+> directions. It was answered after 47,661 ms of virtual time. The path set no MTU, so path-MTU discovery climbed to
+> 65,512-byte datagrams (13 probes, 12 acknowledged). Each such datagram takes 2.05 s to cross the link, and the data
+> went in datagrams that size as well. The queue peaked at 132 KB, never near its 1 MiB. With the path's MTU at
+> 1,200 bytes the same request took 2,563 ms (the 60 KB alone is 1.9 s at the link's rate), and the queue peaked at
+> 9,672 bytes. A fabric path at a WAN rate wants an MTU; real ones have one.
 
 > **Fixed (live-durability, 2026-11-08): the transport fell a session to the 1,200-byte MTU floor on loss every size
 > suffered (A-253, §4.10a, RFC 8899 §4.3).** Three consecutive above-floor losses, or three probe timeouts while a
