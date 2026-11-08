@@ -63,9 +63,17 @@ fn identity() -> Identity {
   }
 }
 
+/// Tells this process's segments apart: libtest runs the tests at once, two of them over the same log size, and Windows
+/// refuses a second object of one name while the first is held (A-176).
+static NEXT_SEGMENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn segment(log_bytes: u64) -> AnchorSegment {
+  let unique = NEXT_SEGMENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
   AnchorSegment::create(
-    &format!("slates-db-cadence-{log_bytes}-{}", std::process::id()),
+    &format!(
+      "slates-db-cadence-{log_bytes}-{}-{unique}",
+      std::process::id()
+    ),
     &identity(),
     Geometry {
       partitions: 1,
