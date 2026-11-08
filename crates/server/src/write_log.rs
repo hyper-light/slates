@@ -61,6 +61,17 @@ pub(crate) enum Refused {
   Unwritten,
 }
 
+/// What one [`WriteLog::purge`] gave back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Purged {
+  /// The bytes the OS took (whole pages).
+  pub(crate) bytes: usize,
+  /// The bytes of the log walked, the slice's cost.
+  pub(crate) walked: usize,
+  /// Whether some of the log is still to give back.
+  pub(crate) more: bool,
+}
+
 /// One logged write.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Record {
@@ -111,8 +122,9 @@ pub(crate) struct WriteLog {
   stamp: u64,
   /// Whether an acknowledged write has gone unlogged since the last clear: then only a publication makes it survive.
   overflowed: bool,
-  /// Whether the record area's pages were given back since the last append ([`WriteLog::purge`]).
-  purged: bool,
+  /// How far into the record area pages may be resident since they were last given back ([`WriteLog::purge`]): the
+  /// furthest any record reached, or the whole area for a log opened over memory a predecessor may have written.
+  written: usize,
 }
 
 fn word(object: &SparseObject, at: usize) -> Option<u64> {
@@ -184,7 +196,7 @@ impl WriteLog {
     let mut log = WriteLog {
       start,
       capacity,
-      purged: false,
+      written: capacity,
       used: 0,
       stamp: image_generation,
       overflowed: false,
@@ -320,7 +332,7 @@ impl WriteLog {
       .store(object, AT_USED, &covered.to_le_bytes())
       .map_err(|_| Refused::Unwritten)?;
     self.used = end;
-    self.purged = false;
+    self.written = self.written.max(end);
     Ok(())
   }
 
@@ -369,17 +381,30 @@ impl WriteLog {
 
   /// Gives the record area's pages back to the OS while the log is empty (A-105): run by an idle shard, so a log that
   /// a burst of writes filled stops costing RAM once the burst is published and the shard goes quiet, while a busy
-  /// shard keeps its pages for the next appends. Once per emptying: an append re-arms it. The bytes given back.
-  pub(crate) fn purge(&mut self, object: &mut SparseObject) -> usize {
-    if self.used > 0 || self.purged {
-      return 0;
+  /// shard keeps its pages for the next appends. Only as far as records reached since the last give-back (A-226's
+  /// rule), and at most `budget` bytes a call, from the top down, so an idle shard walks a slice a step, never the log's
+  /// whole capacity (gigabytes on a large machine). The bytes the OS took, the bytes walked, and whether any is left.
+  /// A range the object refuses stays owed.
+  pub(crate) fn purge(&mut self, object: &mut SparseObject, budget: usize) -> Purged {
+    if self.used > 0 || self.written == 0 {
+      return Purged::default();
     }
-    self.purged = true;
-    self
+    let piece = self.written.min(budget);
+    let from = self.written.saturating_sub(piece);
+    let Some(bytes) = self
       .start
       .checked_add(HEADER_BYTES)
-      .and_then(|at| object.discard(at, self.capacity).ok())
-      .unwrap_or(0)
+      .and_then(|at| at.checked_add(from))
+      .and_then(|at| object.discard(at, piece).ok())
+    else {
+      return Purged::default();
+    };
+    self.written = from;
+    Purged {
+      bytes,
+      walked: piece,
+      more: from > 0,
+    }
   }
 
   fn store(&self, object: &mut SparseObject, offset: usize, bytes: &[u8]) -> Result<(), Unwritten> {
@@ -428,6 +453,44 @@ mod tests {
     );
     let (_, recovered) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 2).unwrap();
     assert!(recovered.records.is_empty(), "and replays nothing");
+  }
+
+  /// A-226's sibling (bounded work): do append one small write to a log of many pages, clear it as a publication does,
+  /// and give its pages back; expect the give-back to take no more than the pages the record reached, never the log's
+  /// whole capacity (which a 128 GiB machine sizes in gigabytes, walked in one step of the idle shard). A log opened
+  /// over a predecessor's object gives back what it cannot know was not written, once.
+  #[test]
+  fn a_purge_gives_back_only_what_the_log_wrote_since_its_last() {
+    let mut shared = object("purge-extent");
+    let (mut log, _) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 1).unwrap();
+    // The first give-back after opening covers what a predecessor may have written, a page a call.
+    let page = 4096;
+    let mut calls = 0;
+    loop {
+      let purged = log.purge(&mut shared, page);
+      assert!(purged.walked <= page, "a call walks at most its budget");
+      calls += 1;
+      if !purged.more {
+        break;
+      }
+    }
+    assert!(
+      calls > 1,
+      "the predecessor's log was given back a slice at a time"
+    );
+    log.append(&mut shared, 1, 0, b"one small write").unwrap();
+    log.clear(&mut shared, 2).unwrap();
+    let returned = log.purge(&mut shared, usize::MAX);
+    assert!(
+      returned.walked <= page,
+      "a purge after one small record walked {} bytes, more than the page it reached",
+      returned.walked
+    );
+    assert_eq!(
+      log.purge(&mut shared, usize::MAX),
+      Purged::default(),
+      "and nothing more until the next append"
+    );
   }
 
   /// A-63. Do: append three writes under the image of generation 7; open the log as a restarted daemon whose image is

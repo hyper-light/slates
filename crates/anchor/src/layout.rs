@@ -7,8 +7,9 @@
 pub const MAGIC: u32 = 0x4E41_4C53;
 /// Format: the layout version, changed for header, region, timestamp or record semantics: 3 a host-wide monotonic
 /// origin, 4 the content pool's owner words (A-98), 5 every principal recorded with the host whose account it is
-/// (A-237). An older segment is refused, never read under semantics it was not written with.
-pub const LAYOUT_VERSION: u32 = 5;
+/// (A-237), 6 a green's chain entries record what each version changed (A-257). An older segment is refused, never read
+/// under semantics it was not written with.
+pub const LAYOUT_VERSION: u32 = 6;
 /// Format: the layout before A-237's host-scoped principals, refused with what to do about it.
 pub const LAYOUT_BEFORE_HOST_SCOPED_PRINCIPALS: u32 = 4;
 /// Format: one content-pool extent's owner word (A-98): 0 while the extent is free, else its owning partition plus

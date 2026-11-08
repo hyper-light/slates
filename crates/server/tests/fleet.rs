@@ -671,6 +671,20 @@ const FALSE_DEATH_INCARNATION: u64 = 1_000;
 fn poll_until(
   daemons: &[&Daemon],
   within: Duration,
+  condition: impl FnMut() -> Result<bool, ObserveError>,
+) -> bool {
+  poll_for_periods(daemons, within, PERIOD_BUDGET, condition)
+}
+
+/// [`poll_until`] charged `periods` of the slowest observed daemon's own periods instead of [`PERIOD_BUDGET`]: for a
+/// watch that expects nothing to happen and holds that over a stated number of the fleet's rounds. [`poll_until`]'s
+/// budget is sized for an operation to converge however slowly, so a watch that never holds spent all of it: 4,000
+/// periods, about 400 s on CI for a watch of four liveness budgets (`a_works_head_is_never_placed...`, 2026-11-08).
+#[track_caller]
+fn poll_for_periods(
+  daemons: &[&Daemon],
+  within: Duration,
+  periods: u64,
   mut condition: impl FnMut() -> Result<bool, ObserveError>,
 ) -> bool {
   let mut wait = WaitTrace::begin("poll", std::panic::Location::caller(), daemons);
@@ -714,7 +728,7 @@ fn poll_until(
       last_advance = Instant::now();
     }
     wait.asked(took, daemons, &advances, last_advance.elapsed());
-    if charged >= PERIOD_BUDGET {
+    if charged >= periods {
       // Every observed daemon ran a whole budget of its own periods, condition never met: a genuine
       // non-convergence (judged in daemon-time, so CPU load cannot cause it — periods, not wall-clock).
       wait.end("poll", "period budget spent", daemons, &advances);
@@ -2737,11 +2751,28 @@ fn assert_refused(refused: &Refused) {
   );
 }
 
+/// Shape: the memory a fleet test's node may size itself from: GitHub's Linux runners' 16 GiB, the machines these tests
+/// are gated on, whose derived sizes it leaves as they were. A node's client seats, task arenas and forward lane are
+/// derived from its memory, so on a larger machine a test that fills an arena or a lane worked at that machine's size.
+/// Measured on a 96 GiB Mac Studio (2026-11-08) for b in `a_silent_owner_leaves_no_forward_the_lane_admitted_unrun`:
+/// without it, `clients_per_shard` 15,420 and `tasks_per_shard` 61,690, a burst of 3,856 clients whose connects
+/// failed; with it, 2,570 and 10,294, 644 clients, as on CI (645 to 647).
+const FLEET_NODE_MEMORY_BYTES: u64 = 16 << 30;
+
 /// A fleet node's identity parts (no addresses — an N-node node serves each peer on its own socket, so
 /// addresses are per ordered pair, allocated in the mesh below, not per node).
 fn fleet_node(name: &str) -> (MachineProfile, HostId, Identity) {
   let mut profile = profile(name);
   profile.facts.identity.cpu = format!("{}-{}", profile.facts.identity.cpu, unique());
+  profile.facts.memory.limit = Some(
+    profile
+      .facts
+      .memory
+      .limit
+      .map_or(FLEET_NODE_MEMORY_BYTES, |limit| {
+        limit.min(FLEET_NODE_MEMORY_BYTES)
+      }),
+  );
   // Return the routing seed; callers observe the actual id after starting the daemon.
   let host = member_id(anchor_of(&profile), 0);
   (profile, host, self_signed())
@@ -5603,8 +5634,9 @@ fn a_silent_forward_gives_up_while_its_session_carries_others() {
   );
 }
 
-/// Shape: how long [`fill_task_arena`] may take to fill a shard's arena, and each filler's admission wait.
-const FILL_DEADLINE: Duration = Duration::from_secs(30);
+/// Shape: how long [`fill_task_arena`] may go without a filler admitted before it calls the shard stuck. It bounds a
+/// stall, not the fill, whose length is the arena's size.
+const FILL_STALL: Duration = Duration::from_secs(30);
 /// Shape: how long a forward refused at admission may take to be answered: a liveness budget is far more than
 /// the moment its guard takes, and far less than the forever it waited before.
 const UNSTARTED_ANSWER_NS: u64 = slates_server::daemon::LIVENESS_BUDGET_NS;
@@ -5613,11 +5645,11 @@ const UNSTARTED_ANSWER_NS: u64 = slates_server::daemon::LIVENESS_BUDGET_NS;
 /// admitted tasks, to cancel. A control channel momentarily full is waited out.
 fn fill_task_arena(shard: u16) -> Vec<slates_rt::shard::TaskId> {
   let mut admitted = Vec::new();
-  let began = Instant::now();
+  let mut progressed = Instant::now();
   loop {
     assert!(
-      began.elapsed() < FILL_DEADLINE,
-      "the arena filled within {FILL_DEADLINE:?} ({} admitted)",
+      progressed.elapsed() < FILL_STALL,
+      "the shard admitted a filler within {FILL_STALL:?} ({} admitted)",
       admitted.len()
     );
     let (request, receipt) =
@@ -5631,8 +5663,11 @@ fn fill_task_arena(shard: u16) -> Vec<slates_rt::shard::TaskId> {
       std::thread::yield_now();
       continue;
     }
-    match receipt.wait(FILL_DEADLINE) {
-      Some(slates_rt::task::Admission::Admitted(task)) => admitted.push(task),
+    match receipt.wait(FILL_STALL) {
+      Some(slates_rt::task::Admission::Admitted(task)) => {
+        admitted.push(task);
+        progressed = Instant::now();
+      }
       Some(slates_rt::task::Admission::Refused(_)) => return admitted,
       other => panic!("a filler's admission: {other:?}"),
     }
@@ -13541,7 +13576,10 @@ fn submit_resent_after_its_owner_restarted(before_lift: bool) {
       .ok()
       .and_then(|word| answer_while_waiting(&mut resender, *word));
     let mut reader = Client::connect(daemons[0].instance());
-    waiting = Some((early, reader.call(&RequestBody::Versions { green })));
+    waiting = Some((
+      early,
+      head_once_its_lease_confirms(&mut reader, green, &daemons),
+    ));
     lifted = lift(&daemons);
   }
   let answer = word
@@ -13549,7 +13587,7 @@ fn submit_resent_after_its_owner_restarted(before_lift: bool) {
     .ok()
     .and_then(|word| answer_within(&mut resender, *word));
   let mut reader = Client::connect(daemons[0].instance());
-  let head = reader.call(&RequestBody::Versions { green });
+  let head = head_once_its_lease_confirms(&mut reader, green, &daemons);
   let counters = merge_and_content_counters(&daemons);
   for daemon in daemons {
     daemon.stop();
@@ -13977,8 +14015,37 @@ fn a_share_of_a_green_made_after_its_last_version_survives_a_takeover() {
   );
 }
 
+/// The green's head as a client must read it from an owner that has just restarted or taken the green over (§4.8
+/// "Leases and reads", AUD-08): the owner parks the read until its lease confirms and refuses it `LeaseUnconfirmed`
+/// if the lease bound passes first, a refusal retryable by design. So the read is sent again while it is refused so,
+/// charged in the fleet's own periods like every wait here: on a loaded Mac (load about 40) one read met the lease
+/// unconfirmed (`LeaseUnconfirmed { version: 5 }`, the supervisor's stack gate, 2026-11-08). The last answer.
+fn head_once_its_lease_confirms(
+  reader: &mut Client,
+  green: VolumeId,
+  fleet: &[Daemon],
+) -> ReplyBody {
+  let observed: Vec<&Daemon> = fleet.iter().collect();
+  let mut last = None;
+  poll_until(&observed, PLACEMENT_DEADLINE, || {
+    let reply = reader.call(&RequestBody::Versions { green });
+    let confirmed = !matches!(
+      reply,
+      ReplyBody::Refused {
+        refusal: Refusal::LeaseUnconfirmed { .. }
+      }
+    );
+    last = Some(reply);
+    Ok(confirmed)
+  });
+  last.expect("the head was read at least once")
+}
+
 /// Shape: how long a test watches for a work's head to be placed: several of the owner's seal rounds.
 const WORK_SEAL_WATCH: Duration = Duration::from_nanos(4 * LIVENESS_BUDGET_NS);
+/// Shape: [`WORK_SEAL_WATCH`] as the fleet's own periods, one a heartbeat, so the watch is charged in daemon time like
+/// every poll and a loaded runner stretches it rather than failing it ([`poll_for_periods`]).
+const WORK_SEAL_WATCH_PERIODS: u64 = 4 * LIVENESS_BUDGET_NS / slates_server::daemon::HEARTBEAT_NS;
 
 /// §4.16 "Commit", A-252: "nothing runs twice after a takeover" rests on a work never coming back on a successor, since
 /// a work come back with no completion record would run a resend again, and an older one would make a different
@@ -14019,9 +14086,12 @@ fn a_works_head_is_never_placed_so_a_takeover_cannot_bring_it_back_to_run_a_rese
   });
   let object = ObjectId(work.bytes);
   let survivors_then: Vec<&Daemon> = daemons.iter().collect();
-  let placed = poll_until(&survivors_then, WORK_SEAL_WATCH, || {
-    daemons[0].fleet_head_placed(object)
-  });
+  let placed = poll_for_periods(
+    &survivors_then,
+    WORK_SEAL_WATCH,
+    WORK_SEAL_WATCH_PERIODS,
+    || daemons[0].fleet_head_placed(object),
+  );
   drop(survivors_then);
   let (caught_up, _) = holders_before_owner_death_at(&daemons, green, 1);
   daemons.remove(0).stop();
@@ -14037,7 +14107,7 @@ fn a_works_head_is_never_placed_so_a_takeover_cannot_bring_it_back_to_run_a_rese
   let mut reader = Client::connect(daemons[successor_index].instance());
   let status = reader.call(&RequestBody::Status { volume: work });
   let again = reader.call(&submit);
-  let head = reader.call(&RequestBody::Versions { green });
+  let head = head_once_its_lease_confirms(&mut reader, green, &daemons);
   for daemon in daemons {
     daemon.stop();
   }
@@ -14179,7 +14249,7 @@ fn a_submit_resent_after_its_owner_was_taken_over_is_not_applied_again() {
   });
   let again = resend_while_refused_retryable(&mut client, &submit);
   let mut reader = Client::connect(daemons[successor_index].instance());
-  let head = reader.call(&RequestBody::Versions { green });
+  let head = head_once_its_lease_confirms(&mut reader, green, &daemons);
   for daemon in daemons {
     daemon.stop();
   }

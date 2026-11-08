@@ -173,6 +173,17 @@ pub(crate) enum Doubling {
   Now,
 }
 
+/// Whether the merge record of a version of `green` goes to holders rather than being placed by the owner's append alone
+/// (the laptop): where [`enqueue_record`] reads the head's identity anyway, so the chain entry can record it (A-257).
+pub(crate) fn record_goes_to_holders(state: &ShardState, green: DbVolumeId) -> bool {
+  let config = state.fleet.configuration();
+  let local_hold = Placement {
+    acked: vec![state.fleet.host()],
+    ..config.place(ObjectId(green.bytes))
+  };
+  !local_hold.placed(config.quorum)
+}
+
 /// [`checkpoint_green`], with the doubling rule waived when `doubling` is [`Doubling::Now`]: what a submit refused at
 /// the chain's cap does first (`verbs::submit`, A-238), since the floor may have risen since the last accept (a work
 /// destroyed, rebased or reset), and a chain at its cap refuses every submit whose accept would take it.
@@ -198,11 +209,12 @@ pub(crate) fn checkpoint_green_when(state: &mut ShardState, green: DbVolumeId, d
   if doubling == Doubling::Wait && folded < held_bytes {
     return;
   }
-  let Some(checkpoint) = state
-    .greens
-    .get(&green)
-    .and_then(|engine| engine.checkpoint(floor))
-  else {
+  // The head's identity beside it (A-257): the amortized rule above bounds how often this reads the identity.
+  let Some(checkpoint) = state.greens.get_mut(&green).and_then(|engine| {
+    let mut checkpoint = engine.checkpoint(floor)?;
+    checkpoint.head_check = Some((engine.head(), engine.head_identity()));
+    Some(checkpoint)
+  }) else {
     state.count(CHECKPOINT_UNAVAILABLE, 1);
     return;
   };
@@ -1537,8 +1549,8 @@ pub enum GreenFence {
     /// The version the entry was acknowledged as.
     version: u64,
   },
-  /// The chain entry for `version` was not accepted on replay (a conflict).
-  NotAccepted {
+  /// Replaying the chain entry for `version` did not reach the head identity the entry recorded (A-257).
+  IdentityDiverged {
     /// The version the entry was acknowledged as.
     version: u64,
   },
@@ -1762,7 +1774,11 @@ fn inputs_of(state: &ShardState, green: DbVolumeId, version: u64) -> Option<Vec<
     .green_checkpoint(green)
     .map_or(0, |(held, _)| held);
   let index = usize::try_from(version.checked_sub(held)?.checked_sub(1)?).ok()?;
-  state.db.partition().green_chain(green).get(index).cloned()
+  let entry = state.db.partition().green_chain(green).get(index)?;
+  // The record's inputs are the increment a holder judges afresh (§4.16 "Apply on holders"), not what this node resolved.
+  slates_merge::chain_entry::increment_bytes(entry)
+    .ok()
+    .map(<[u8]>::to_vec)
 }
 
 /// The page the inputs archive is chunked at (informational in the header; the identity is the
