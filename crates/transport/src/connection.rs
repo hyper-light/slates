@@ -1834,9 +1834,7 @@ impl Connection {
   /// heard, or since that hearing while ack-eliciting packets were in flight. `None` while nothing is owed. A path-MTU
   /// probe asks nothing here: one too large for the path is dropped and answered by no one.
   pub fn peer_silence(&self, now: u64) -> Option<u64> {
-    // Red first: the naive rule, nothing heard since the last packet, asked or not.
-    let _ = self.asked_since;
-    self.heard_at.map(|at| now.saturating_sub(at))
+    self.asked_since.map(|since| now.saturating_sub(since))
   }
 
   /// The RTT estimator.

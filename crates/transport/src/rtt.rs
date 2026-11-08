@@ -179,8 +179,10 @@ impl RttEstimator {
   /// probe timeout drawn from it (a millisecond on a quiet link) would take a live peer behind that queue for a dead
   /// one, where the initial RTT is the RFC's assumption for a path not yet measured.
   pub fn persistent_congestion_duration_floored(&self, max_ack_delay: u64) -> u64 {
-    // Red first: not floored yet.
-    self.persistent_congestion_duration(max_ack_delay)
+    self
+      .pto(max_ack_delay)
+      .max(self.initial_pto())
+      .saturating_mul(PERSISTENT_CONGESTION_THRESHOLD)
   }
 
   /// The RTT variation (nanoseconds).
