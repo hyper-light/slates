@@ -314,6 +314,55 @@ fn mesh_of(instance: &str) -> Option<(u32, u32)> {
   ))
 }
 
+/// DIAG (never for main): the time series of why dials fail. Once a second through a formation wait, each node's
+/// `fleet.dial.`, `fleet.accept.` and member and contact lines, printed only when they changed, with the wait's time.
+struct DialSeries {
+  began: Instant,
+  next: Duration,
+  last: BTreeMap<String, String>,
+}
+
+impl DialSeries {
+  fn new(began: Instant) -> DialSeries {
+    DialSeries {
+      began,
+      next: Duration::ZERO,
+      last: BTreeMap::new(),
+    }
+  }
+
+  fn sample(&mut self, stage: &str, instances: &[String]) {
+    let at = self.began.elapsed();
+    if at < self.next {
+      return;
+    }
+    self.next = at + Duration::from_secs(1);
+    for instance in instances {
+      let (code, out, _) = run(instance, &["status"]);
+      if code != 0 {
+        continue;
+      }
+      let line = out
+        .lines()
+        .filter(|line| {
+          line.contains("fleet.dial.")
+            || line.contains("fleet.accept.")
+            || line.starts_with("fleet_peers_")
+            || line.starts_with("fleet_configuration_version")
+        })
+        .map(|line| line.trim().replace("shard 0 refused ", ""))
+        .collect::<Vec<_>>()
+        .join("; ");
+      let members = value_of(&out, "fleet_members").split_whitespace().count();
+      let line = format!("members {members}; {line}");
+      if self.last.get(instance) != Some(&line) {
+        eprintln!("DIAG dials {stage} t={:.1}s {instance}: {line}", at.as_secs_f64());
+        self.last.insert(instance.clone(), line);
+      }
+    }
+  }
+}
+
 /// DIAG (never for main): once a formation wait has run past [`FLEET_WAIT`], prints the fleet's record-session lends,
 /// returns, hold times and the borrowers that found each session out, with the discovery and link counters, once.
 fn slow_formation(began: Instant, dumped: &mut bool, stage: &str, instances: &[String]) {
@@ -333,8 +382,10 @@ fn slow_formation(began: Instant, dumped: &mut bool, stage: &str, instances: &[S
 fn wait_formed(instances: &[String], members: usize) -> Vec<String> {
   let mut window = FrozenWindow::new();
   let (began, mut dumped) = (Instant::now(), false);
+  let mut series = DialSeries::new(began);
   loop {
     slow_formation(began, &mut dumped, "formation", instances);
+    series.sample("formation", instances);
     let views: Vec<_> = instances
       .iter()
       .map(|instance| fleet_view(instance))
@@ -442,8 +493,10 @@ impl FrozenWindow {
 fn wait_settled(instances: &[String], members: usize) {
   let mut window = FrozenWindow::new();
   let (began, mut dumped) = (Instant::now(), false);
+  let mut series = DialSeries::new(began);
   loop {
     slow_formation(began, &mut dumped, "settlement", instances);
+    series.sample("settlement", instances);
     let views: Vec<(String, String, usize)> = instances
       .iter()
       .map(|instance| {
@@ -1434,6 +1487,7 @@ fn diagnosis(instances: &[String], volume: &str) -> String {
             || line.starts_with("fleet_record_link")
             || line.contains("fleet.link.")
             || line.contains("diag.link.")
+            || line.contains("fleet.dial.")
             || line.contains("fleet.discovery")
             || line.starts_with("fleet_peers_")
             || line.starts_with("fleet_council")
