@@ -1,0 +1,72 @@
+name: diag-live-durability
+
+# Diagnostics only, never on main (A-200, GAPS "a write held about 2.3 s when the second candidate stops within a
+# quarter second of the first's resume", now live-durability's): main 4811191a with the stuck-write watcher (this
+# commit's harness change, diag only) dumping every node's status at 1, 2 and 3 liveness budgets of a write in flight,
+# and SLATES_CHAOS_PRINT_SLOW's sampled window for every write over a liveness budget. The rolling partition until two
+# runs are captured or 60 have run, per arch, with a diag-only LD-LANE line from the daemon for every lane exchange of 100 ms or more or unanswered; each captured run's whole log is kept. Results to
+# diag-results/live-durability-43-<os>.
+on:
+  push:
+    branches: ["diag-live-durability-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  SLATES_TEST_CLI: "1"
+  SLATES_CHAOS_PRINT_SLOW: "1"
+
+jobs:
+  check:
+    name: partition (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: The runs
+        shell: bash {0}
+        run: |
+          R=../results.txt
+          mkdir -p ../kept
+          echo "runner ${{ matrix.os }}, $(nproc) CPUs, $(date -u), tree $(git rev-parse HEAD)" > $R
+          timeout 1800 cargo build --release --locked -p slates-cli --bin slates --test live_chaos > ../build.log 2>&1; status=$?
+          echo "== release build exit $status" >> $R
+          [ $status -ne 0 ] && grep -E '^error' -A8 ../build.log | head -40 >> $R
+          captured=0
+          for run in $(seq 1 60); do
+            timeout 900 cargo test --release --locked -p slates-cli --test live_chaos -- --nocapture --test-threads=1 --exact candidates_partitioned_in_turn_mid_stream_lose_nothing > ../run.log 2>&1; status=$?
+            grep -E '^  [0-9]+ writes|violations|refused the owner|panicked|^  chaos-rolling.*partitioned' ../run.log | grep -v '^chaos' | sort -u | cut -c1-600 >> $R || true
+            stuck=$(grep -c '^LD-STUCK' ../run.log)
+            echo "== partition $run exit $status stuck $stuck" >> $R
+            if [ "$stuck" -gt 0 ] || [ $status -ne 0 ]; then
+              captured=$((captured + 1))
+              cut -c1-2000 ../run.log > ../kept/run-$run.log
+              [ $captured -ge 2 ] && break
+            fi
+          done
+          echo "== captured $captured" >> $R
+          exit 0
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/live-durability-43-${{ matrix.os }}"
+          git config user.name "diag-live-durability"
+          git config user.email "diag-live-durability@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          cp ../kept/*.log . 2>/dev/null || true
+          git add results.txt *.log 2>/dev/null || git add results.txt
+          git commit -qm "diag-live-durability-43 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"

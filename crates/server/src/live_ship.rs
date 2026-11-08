@@ -1750,10 +1750,31 @@ async fn ship_lane(
     // Each message under its own budget: the liveness budget plus its transfer on the session it rides, so an install of
     // the whole volume is not given up the moment an entry would be (`exchange_budget`).
     let exchange = exchange_budget(send.bytes.len(), &sessions);
+    // Diag only (live-durability-43, never on main): the session's path before the exchange, and the exchange's time.
+    let diag_path = sessions.first().map(|(_, endpoint)| {
+      (endpoint.congestion_window(), endpoint.smoothed_rtt(), endpoint.path_mtu())
+    });
+    let diag_began = slates_rt::futures::now_ns();
+    let diag_had_session = !sessions.is_empty();
     let exchanged =
       slates_cluster::live::exchange((send.stream, &send.bytes), sessions, exchange, |_, _| true)
         .await;
     let answered = !exchanged.replies.is_empty();
+    let diag_took = slates_rt::futures::now_ns().saturating_sub(diag_began);
+    if diag_had_session && (diag_took >= crate::daemon::LIVENESS_BUDGET_NS / 10 || !answered) {
+      eprintln!(
+        "LD-LANE at {} holder {} stream {} bytes {} budget_ns {} took_ns {} answered {} unanswered {} path_before {:?}",
+        diag_began,
+        holder.0,
+        send.stream,
+        send.bytes.len(),
+        exchange.max_deadline_ns(),
+        diag_took,
+        answered,
+        exchanged.unanswered.len(),
+        diag_path
+      );
+    }
     if !answered {
       let _ = state::with_state(|s| s.count(LIVE_UNANSWERED, 1));
     }
