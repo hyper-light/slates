@@ -690,6 +690,8 @@ impl Daemon {
     // The client session secret (`crate::session_key`): adopted from the daemon before this one under the anchor, or
     // made and published by the first, so a client's session key still opens its session after a restart.
     crate::session_key::adopt_or_mint(&mut segment)?;
+    // A full crash dump an administrator's setting would write of this daemon (A-239): read and logged once at start.
+    let _ = crate::local_dumps::full();
     // The node's sealing root (A-92): adopted from the previous daemon under this anchor, or made and published into
     // the anchor's locked page; sealing reports itself unavailable, never unlocked, where the OS refuses the lock.
     let sealing = crate::seal_keys::init(&mut segment, config.seal_key_slots);
@@ -2107,10 +2109,9 @@ impl Daemon {
     object: slates_db::register::ObjectId,
   ) -> Result<bool, ObserveError> {
     self.observe(self.shard_of_object(object), move |s| {
-      let quorum = s.fleet.configuration().quorum;
       s.placed_heads
         .get(&object)
-        .is_some_and(|head| head.placement.placed(quorum))
+        .is_some_and(|head| head.placed_under(s.fleet.configuration(), object))
     })
   }
 
@@ -3380,7 +3381,7 @@ fn init_shard(
     seal_root,
     seal_state: sealing,
     seal_recipient: None,
-    pairs_delivered: std::collections::BTreeSet::new(),
+    pairs_delivered: std::collections::BTreeMap::new(),
     member_anchors: std::collections::BTreeMap::new(),
     peer_recipients: std::collections::BTreeMap::new(),
     content,
@@ -3421,6 +3422,8 @@ fn init_shard(
     origin_anchor,
     landing: crate::landing::LandingState::default(),
     image: crate::image::ImageState::default(),
+    configured_members: Vec::new(),
+    departed_owed: Vec::new(),
     direct_map: crate::direct_map::DirectMapState::default(),
     store,
     volumes: Slab::new(config.caps.segment_slots, config.caps.volumes),
@@ -3503,7 +3506,9 @@ fn init_shard(
     forward_lanes: crate::forward_lane::ForwardLanes::default(),
     staging: crate::staging::Staging::default(),
     member_boot_nonce: incarnation,
+    member_process_nonce: keyed_word(&issuer_secret, b"slates/member-process/v1"),
     learned_members: std::collections::BTreeMap::new(),
+    returned_members: std::collections::BTreeMap::new(),
     authenticated_members: std::collections::BTreeSet::new(),
     council_death_watch: std::collections::BTreeMap::new(),
     discovery: None,
@@ -3698,6 +3703,8 @@ async fn reap_loop() {
       // (`verbs::step_destroys`), rather than in a busy serve round.
       let _ = verbs::step_destroys(s);
     });
+    // Another host's attachments end once the fleet no longer counts that host a member (A-222; control shard).
+    crate::remote_attach::sweep_departed().await;
     let reaped = crate::reap::sweep(cadence).await;
     // The taken-back writable copies no holder claimed within the reconnect budget (A-197).
     #[cfg(target_os = "linux")]

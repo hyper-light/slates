@@ -31,7 +31,7 @@ fn id(n: usize, tag: u8) -> [u8; 32] {
 /// Builds a green from `origin_rows` and submits `chain` at the head: the green and the increments it accepted, each
 /// with its version.
 fn chain_of(origin_rows: &[Raw], chain: &[Raw]) -> (Green, Vec<(Increment, u64)>) {
-  let mut green = Green::with_origin(&origin_of(origin_rows));
+  let mut green = Green::with_origin(origin_of(origin_rows));
   let mut accepted = Vec::new();
   for (n, step) in chain.iter().enumerate() {
     let increment = increment_of(step).with_id(id(n, 0xA0), green.head());
@@ -69,7 +69,7 @@ proptest! {
     }
     let checkpoint = green.checkpoint(at).expect("a checkpoint at or below the head, at or above the floor");
     prop_assert_eq!(&Checkpoint::decode(&checkpoint.encode()).unwrap(), &checkpoint);
-    let mut restored = Green::restore(&origin_of(&origin_rows), &checkpoint);
+    let mut restored = Green::restore(origin_of(&origin_rows), &checkpoint);
     prop_assert_eq!(restored.head(), at);
     for (increment, version) in accepted.iter().filter(|(_, version)| *version > at) {
       prop_assert_eq!(restored.submit(increment), Outcome::Accepted { version: *version });

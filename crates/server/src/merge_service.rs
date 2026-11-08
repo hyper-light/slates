@@ -566,15 +566,27 @@ pub(crate) fn attachable_record(
 }
 
 /// Captures the origin a green starts from: the complete immutable snapshot `base` names, walked
-/// on this shard (the base volume's owner). Refused `NotFound` for a volume or snapshot that does
-/// not exist here, `Forbidden` without the read right, `ConsistentBaseUnavailable` when the
-/// snapshot still depends on the host directory (an overlay not pinned whole before the freeze),
-/// and the volume core's own refusal for a torn read.
+/// on this shard (the base volume's owner). Refused as [`check_origin_base`] refuses, and the volume core's own
+/// refusal for a torn read.
 pub(crate) fn seed_origin(
   state: &ShardState,
   principal: &Principal,
   base: GreenBase,
 ) -> Result<Origin, Refusal> {
+  let handle = check_origin_base(state, principal, base)?;
+  let slot = state.volumes.get(handle).map_err(|_| Refusal::NotFound)?;
+  walk_origin(&slot.volume, &state.store, core_snapshot(base.snapshot))
+    .map_err(|e| refusal_of_vfs(&e))
+}
+
+/// Whether `base` can be a green's origin for `principal`, and the slot of its volume: refused `NotFound` for a volume
+/// or snapshot that does not exist here, `Forbidden` without the read right, `ConsistentBaseUnavailable` when the
+/// snapshot still depends on the host directory (an overlay not pinned whole before the freeze).
+pub(crate) fn check_origin_base(
+  state: &ShardState,
+  principal: &Principal,
+  base: GreenBase,
+) -> Result<slates_mem::Handle<crate::state::VolumeSlot>, Refusal> {
   let (handle, record) = find(state, base.volume).map_err(|reply| match *reply {
     ReplyBody::Refused { refusal } => refusal,
     _ => Refusal::NotFound,
@@ -593,19 +605,21 @@ pub(crate) fn seed_origin(
     return Err(Refusal::NotFound);
   }
   let slot = state.volumes.get(handle).map_err(|_| Refusal::NotFound)?;
-  let snapshot = core_snapshot(base.snapshot);
-  match slot.volume.snapshot_is_complete(&state.store, snapshot) {
-    Ok(true) => {}
-    Ok(false) => return Err(Refusal::ConsistentBaseUnavailable),
-    Err(e) => return Err(refusal_of_vfs(&e)),
+  match slot
+    .volume
+    .snapshot_is_complete(&state.store, core_snapshot(base.snapshot))
+  {
+    Ok(true) => Ok(handle),
+    Ok(false) => Err(Refusal::ConsistentBaseUnavailable),
+    Err(e) => Err(refusal_of_vfs(&e)),
   }
-  walk_origin(&slot.volume, &state.store, snapshot).map_err(|e| refusal_of_vfs(&e))
 }
 
 /// The identity a held origin is recorded under and checked against at recovery (A-217): the BLAKE3 of the origin's
 /// canonical encoding (`Origin::encode`, sorted and length-prefixed), so the same snapshot walked again reproduces it.
+/// Hashed as it is written ([`Origin::identity`]), never gathered into a second copy of the tree first.
 pub(crate) fn origin_identity(origin: &Origin) -> [u8; 32] {
-  *blake3::hash(&origin.encode()).as_bytes()
+  origin.identity()
 }
 
 /// The origin a green holds as a reference (A-217), walked again from its base snapshot on this shard: `NotFound` when
@@ -634,36 +648,92 @@ pub(crate) fn walk_held_origin(
 /// Walks a complete snapshot into an [`Origin`]: every file with its bytes, every directory, every
 /// mode, every symlink, and every further name of a multiply-linked inode as a hard link to the
 /// first name met. Paths are the snapshot's absolute paths without the leading slash, as the ops
-/// document names them; the root itself is not an entry.
+/// document names them; the root itself is not an entry. [`OriginWalk`] run to its end, in one call: for a recovery
+/// and a checkout; `CreateGreen` steps the walk a slice at a time.
 fn walk_origin(
   volume: &Volume,
   store: &Store,
   snapshot: slates_vfs::ids::SnapshotId,
 ) -> Result<Origin, slates_vfs::error::VfsError> {
-  let (_, root) = volume.snapshot_info(snapshot)?;
-  let mut origin = Origin::default();
-  let mut first_name: BTreeMap<InodeNo, String> = BTreeMap::new();
-  let mut stack: Vec<(String, slates_mem::Handle<slates_vfs::dir::DirNode>)> =
-    vec![(String::new(), root)];
-  while let Some((prefix, dir)) = stack.pop() {
+  let mut walk = OriginWalk::new(snapshot);
+  loop {
+    if let Some(origin) = walk.unit(volume, store)? {
+      return Ok(origin);
+    }
+  }
+}
+
+/// A walk of a complete snapshot into an [`Origin`] in progress (§4.16 "Green creation", A-217; §4.3 "Bounded work
+/// everywhere"): the directories still to list, by path, and the files listed and not yet read, so a walk stepped a
+/// slice at a time holds no handle between its slices, as a pin's walk does (`slates_vfs::base::PinWalk`). One unit is
+/// one directory's listing or one file's read. It visits what the one-call walk visited, in its order — the
+/// directories on one stack, each listing's rows in order — and gives a multiply-linked inode's first name the
+/// same way, at the listing that meets it, so the origin, and so a held origin's recorded identity, is the one the
+/// one-call walk gave.
+#[derive(Debug)]
+pub(crate) struct OriginWalk {
+  snapshot: slates_vfs::ids::SnapshotId,
+  dirs: Vec<String>,
+  files: Vec<(String, InodeNo, u64)>,
+  first_name: BTreeMap<InodeNo, String>,
+  origin: Origin,
+}
+
+impl OriginWalk {
+  /// A walk of `snapshot` from its root.
+  pub(crate) fn new(snapshot: slates_vfs::ids::SnapshotId) -> OriginWalk {
+    OriginWalk {
+      snapshot,
+      dirs: vec![String::new()],
+      files: Vec::new(),
+      first_name: BTreeMap::new(),
+      origin: Origin::default(),
+    }
+  }
+
+  /// One unit of the walk over `volume`'s snapshot: a file read, else a directory listed; the canonical origin once
+  /// the last is done. A snapshot gone meanwhile is the volume core's refusal (`StaleHandle`, `NotFound`).
+  pub(crate) fn unit(
+    &mut self,
+    volume: &Volume,
+    store: &Store,
+  ) -> Result<Option<Origin>, slates_vfs::error::VfsError> {
+    if let Some((path, inode, size)) = self.files.pop() {
+      let mut bytes = vec![0u8; usize::try_from(size).unwrap_or(usize::MAX)];
+      let read = volume.read_in(store, self.snapshot, inode, 0, &mut bytes)?;
+      bytes.truncate(read);
+      self.origin.files.push((path, bytes));
+      return Ok(None);
+    }
+    let Some(prefix) = self.dirs.pop() else {
+      let mut origin = std::mem::take(&mut self.origin);
+      origin.canonicalize();
+      return Ok(Some(origin));
+    };
+    let Child::Dir(dir) = volume.resolve_in(store, self.snapshot, &prefix)?.child else {
+      return Err(slates_vfs::error::VfsError::NotDirectory);
+    };
+    // The listing's files are read one a unit after it, last row first; the rows are met here in order, so the
+    // directories stack, the modes and the first names come out as the one-call walk made them.
+    let mut listed = Vec::new();
     for row in volume.readdir_in(store, dir)? {
       let path = if prefix.is_empty() {
         row.name.to_owned()
       } else {
         format!("{prefix}/{}", row.name)
       };
-      let attrs = volume.stat_in(store, snapshot, row.inode)?;
+      let attrs = volume.stat_in(store, self.snapshot, row.inode)?;
       match row.kind {
         Kind::Dir => {
-          origin.dirs.push(path.clone());
-          origin.modes.push((path.clone(), attrs.mode));
-          if let Child::Dir(child) = volume.lookup_in(store, dir, row.name)?.child {
-            stack.push((path, child));
+          self.origin.dirs.push(path.clone());
+          self.origin.modes.push((path.clone(), attrs.mode));
+          if let Child::Dir(_) = volume.lookup_in(store, dir, row.name)?.child {
+            self.dirs.push(path);
           }
         }
         Kind::Fifo | Kind::Socket => {
-          if let Some(first) = first_name.get(&row.inode) {
-            origin.hardlinks.push((path, first.clone()));
+          if let Some(first) = self.first_name.get(&row.inode) {
+            self.origin.hardlinks.push((path, first.clone()));
             continue;
           }
           use slates_merge::special::{SpecialKind, SpecialNode};
@@ -672,9 +742,9 @@ fn walk_origin(
           } else {
             SpecialKind::Socket
           };
-          origin.modes.push((path.clone(), attrs.mode));
-          first_name.insert(row.inode, path.clone());
-          origin.specials.push((
+          self.origin.modes.push((path.clone(), attrs.mode));
+          self.first_name.insert(row.inode, path.clone());
+          self.origin.specials.push((
             path,
             SpecialNode {
               kind,
@@ -688,28 +758,26 @@ fn walk_origin(
           ));
         }
         Kind::Symlink => {
-          let target = volume.readlink_in(store, snapshot, row.inode)?;
-          origin.symlinks.push((path, target.into_string()));
+          let target = volume.readlink_in(store, self.snapshot, row.inode)?;
+          self.origin.symlinks.push((path, target.into_string()));
         }
         Kind::File => {
-          if let Some(first) = first_name.get(&row.inode) {
-            origin.hardlinks.push((path, first.clone()));
+          if let Some(first) = self.first_name.get(&row.inode) {
+            self.origin.hardlinks.push((path, first.clone()));
             continue;
           }
-          let mut bytes = vec![0u8; usize::try_from(attrs.size).unwrap_or(usize::MAX)];
-          let read = volume.read_in(store, snapshot, row.inode, 0, &mut bytes)?;
-          bytes.truncate(read);
-          origin.modes.push((path.clone(), attrs.mode));
+          self.origin.modes.push((path.clone(), attrs.mode));
           if attrs.nlink > 1 {
-            first_name.insert(row.inode, path.clone());
+            self.first_name.insert(row.inode, path.clone());
           }
-          origin.files.push((path, bytes));
+          listed.push((path, row.inode, attrs.size));
         }
       }
     }
+    listed.reverse();
+    self.files.extend(listed);
+    Ok(None)
   }
-  origin.canonicalize();
-  Ok(origin)
 }
 
 /// A read attachment of a green pins its head version (§4.16 "Attachments and versions"); a write
@@ -2572,7 +2640,7 @@ fn recompute(
     match inputs {
       None => Green::new(),
       Some(bytes) => Green::with_origin(
-        &slates_merge::origin::Origin::decode(bytes).map_err(|_| INPUTS_UNDECODABLE)?,
+        slates_merge::origin::Origin::decode(bytes).map_err(|_| INPUTS_UNDECODABLE)?,
       ),
     }
   } else {
@@ -2751,7 +2819,7 @@ mod tests {
       "no stream is represented as file bytes"
     );
     assert_eq!(origin.specials.len(), 2);
-    let green = Green::with_origin(&origin);
+    let green = Green::with_origin(origin.clone());
     for (path, kind) in [
       ("pipe", slates_merge::special::SpecialKind::Fifo),
       ("socket", slates_merge::special::SpecialKind::Socket),
@@ -2763,8 +2831,8 @@ mod tests {
     assert_eq!(origin.hardlinks.len(), 2);
     assert_eq!(origin.encode(), encoded);
     assert_eq!(
-      Green::with_origin(&origin).head_identity(),
-      Green::with_origin(&Origin::decode(&encoded).expect("holder origin")).head_identity()
+      Green::with_origin(origin.clone()).head_identity(),
+      Green::with_origin(Origin::decode(&encoded).expect("holder origin")).head_identity()
     );
   }
 

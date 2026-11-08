@@ -8547,6 +8547,27 @@ and on a large volume would copy all of it each time. Round 3's slow tail on the
 slowed as well (p999 465.7 µs).
 
 
+### Measured and rejected: queueing the deltas the credit turns away (A-200; 2026-11-06)
+
+**Hardware:** this Mac (Apple arm64, 128 GiB), other agents' work running, load 40–63. **Command (the contract):**
+`SLATES_TEST_CLI=1 cargo test -p slates-cli --test live_chaos -- candidates_partitioned_in_turn --nocapture` (debug),
+each arm from its own worktree and target directory, the arms alternating, five pairs.
+
+A delta the credit (two entries not yet durable) turns away leaves the volume owing a whole record, which the next
+publication ships to every holder: 4.27 MB in one run, with writes queued behind it. The experiment queued such deltas
+in order, up to the last whole record's size, and appended them as the credit freed. Rolling partition, base
+(9afea76d) then queue (with the lanes' straggler wait), p50 / p99 / max write in ms, caught-up times in s:
+
+| pair | base | queue |
+|---|---|---|
+| 1 | pass, 688 writes, 2.0 / 189 / 501, 0.91 0.26 | pass, 482 writes, 1.8 / 210 / 880, 0.26 0.86 |
+| 2 | fail (one write ≥ 1 s), 573 writes, 2.2 / 299 / 1,176, 1.52 1.16 | fail (catch-up 2.99 s), 499 writes, 5.8 / 266 / 957 |
+| 3 | fail, 140 writes, 129 / 1,396 / 1,414, 1.58 none | fail, 193 writes, 78 / 816 / 1,095, 1.25 1.99 |
+| 4 | pass, 844 writes, 1.6 / 88 / 577, 0.30 0.34 | pass, 1,030 writes, 1.5 / 93 / 811, 0.44 0.66 |
+| 5 | pass, 1,075 writes, 1.5 / 89 / 611, 0.51 0.22 | fail (one write 2.3 s), 737 writes, 1.5 / 109 / 2,330 |
+
+Dead even (3 of 5 against 2 of 5, medians and tails overlapping), so it does not land; the patch is kept off the tree.
+
 ## What a WinFsp mount and unmount wait for the Windows anchor (A-213; 2026-11-05)
 
 Each WinFsp mount sends the anchor a hold and each unmount a release, and waits for the answer (A-198, A-206). The
@@ -11579,6 +11600,47 @@ millisecond outliers, present in both arms of earlier runs, separate nothing in 
   baseline's speed comes with A-198's crash defect.
 - **The form:** main's separate receiver, one worker. A-215's combined transact and A-219's second worker are measured
   and rejected.
+
+## CreateGreen sliced: its shard and peak RSS over `fs/` and the whole kernel (2026-11-07)
+
+`agents/reland-a207-3` (`CreateGreen { base }` walked, hashed and seeded in slices with its reply deferred; the
+identity hashed with no buffer; `with_origin` by value; canonicalizing without cloning keys) against its base, main
+`4326a9d8`.
+
+**The shard** (`crates/server/tests/green_fairness.rs`: 1,000 files of 16 KiB, one shard, a second client probing it;
+CI, quiet 4-vCPU runners, 3 runs each):
+
+| Runner | main `4326a9d8` + the test (diag run 42371545928) | sliced (diag run 42371546045) |
+|---|---|---|
+| ubuntu-latest | one poll of 134.0 / 134.5 / 134.5 ms, 0 probes inside | 155 / 149 / 166 ms, 306 / 259 / 288 probes inside, longest 13.5 / 13.6 / 13.4 ms |
+| ubuntu-24.04-arm | one poll of 961 / 960 / 962 ms, 0 probes inside | 1.71 / 1.74 / 1.76 s, 1,193 / 1,404 / 1,456 probes inside, longest 7.6 / 10.0 / 9.8 ms |
+
+At 4,000 files (diag runs 42365451658, 42367880917) main held the shard 549 to 556 ms on x86_64 and about 3.8 s on
+arm64. The first sliced build left one unit of about 255 ms on arm64, which turned out to be the key cloning in
+canonicalize.
+
+**Memory and time** (`load_bench --tree <linux-v7.4-rc1>/<tree> --clients 1`, release, in-process daemon, under
+`/usr/bin/time -l`; Apple M5 Max, 18 cores, 128 GiB, macOS 26.4.1; interleaved; 2026-11-07 12:00-15:00 UTC; main
+`load_bench` MD5 `951c8406…`, the branch's `6b000576…`, each built in its own target dir; other agents' load as shown):
+
+| Tree | Build | Peak RSS (bytes), runs 1 / 2 / 3 | CreateGreen (ns), runs 1 / 2 / 3 | Load at each run's end |
+|---|---|---|---|---|
+| `fs/` (2,365 files, 51 MB) | main | 360,808,448 / 423,182,336 / 512,589,824 | 1,163,369,916 / 666,684,709 / 681,655,833 | 57 / 49 / 48 |
+| `fs/` | sliced | 282,722,304 / 304,676,864 / 292,438,016 | 2,296,340,458 / 1,466,747,791 / 1,619,755,917 | 53 / 51 / 46 |
+| whole (97,229 files, 1.68 GB) | main | 9,622,224,896 / 9,418,211,328 | 48,226,987,000 / 89,095,751,125 | 11 / 12 |
+| whole | sliced | 8,017,805,312 / 8,017,379,328 | 82,290,335,459 / 269,366,051,209 | 84 / 91 |
+
+- **Peak RSS:** best of runs, `fs/` 360.8 to 282.7 MB (22% less); the whole kernel 9.42 to 8.02 GB (15% less, about
+  0.84 of the tree's bytes). That is the two transient copies gone: `encode()`'s clone and buffer, made only to hash,
+  and `with_origin`'s clone.
+- **What is left:** the store's pinned copy (the pin alone took the whole kernel's RSS to 3.4 GB, GAPS), the origin
+  the walk reads out, and the engine's two lifetime copies (head content and version 0's history). The second engine
+  copy is loadtest-scale's to share after W2.
+- **The time is the slicing's price, not comparable here.** The sliced green yields after every slice of its step
+  quantum, so its creation is longer and grows with the shard's load. Its whole-kernel runs ran at load 84 to 91
+  against main's 11 to 12. On the quiet CI runners above, the sliced walk took 1.1 to 1.9 times main's one poll. Main's
+  number is a poll that held the shard throughout.
+- Every run's harness ended with 0 oracle failures.
 
 ### The load test's quiet arm after its walls: 3,000 and 10,000 clients on one node (2026-11-07, agents/loadtest-scale)
 

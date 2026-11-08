@@ -98,7 +98,9 @@ pub fn defers_reply(body: &RequestBody) -> bool {
   body.may_be_forwarded()
     || matches!(
       body,
-      RequestBody::Land { grant: Some(_), .. }
+      // A landing is planned in slices on the owner shard, as long as its tree takes, and a granted one runs in them
+      // (AUD-29-25; a presentation since 2026-11-08).
+      RequestBody::Land { .. }
         // An image's build and merge run in slices on the owner shard, as long as the image takes (A-160).
         | RequestBody::ImageBuild { .. }
         | RequestBody::ImageMerge { .. }
@@ -108,6 +110,9 @@ pub fn defers_reply(body: &RequestBody) -> bool {
         // A pin reads the subtrees it names into the store in slices on the owner shard, as long as the tree takes
         // (§4.4, §4.3).
         | RequestBody::Pin { .. }
+        // A green over a base walks the base snapshot into its origin in slices on the owner shard, as long as the
+        // tree takes (§4.16 "Green creation"); a scratch green is answered at once.
+        | RequestBody::CreateGreen { base: Some(_), .. }
         // A direct map's copy is filled in slices on the owner shard, as long as the file takes (A-171).
         | RequestBody::MapRead { .. }
         // A writable map's copy is filled the same way, and its stores are compared back into the file in slices at

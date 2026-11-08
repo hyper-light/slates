@@ -1019,3 +1019,63 @@ fn a_stale_write_back_is_refused_at_every_crash_point_of_its_history() {
     "a successor took back carried states"
   );
 }
+
+/// A-231's regression (main CI 42395077767: fsx over the macOS NFS mount failed once the stack landed). Do: on a
+/// connection the anchor holds, fetch a page, write it back with one byte stored, then write it back again with another
+/// byte stored, as a client writing its dirty page back twice does (fsx's MAPWRITE); twenty rounds, each over the bytes
+/// the round before wrote. Expect: every write-back applied `NFS3_OK`, and the file the last page, byte for byte. Each
+/// write-back's bytes are the connection's own last write, never another path's change.
+#[test]
+fn a_held_connections_own_write_backs_are_never_refused_as_stale() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the own write-back flow: set SLATES_TEST_CLI=1 to run it (an anchor and its daemons)"
+    );
+    return;
+  }
+  if cfg!(target_os = "linux") {
+    eprintln!(
+      "skipping the own write-back flow: Linux does not hold NFS connections yet (A-113, GAPS)"
+    );
+    return;
+  }
+  /// Shape: write-backs of the same page, each storing one byte more.
+  const ROUNDS: usize = 20;
+  let instance = format!("nfs-own-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let mut owner = HeldSession::open(&instance);
+  let mut xid = 50u32;
+  assert_eq!(
+    nfs::status(&call_once(
+      &mut owner.stream,
+      WRITE,
+      &write_args(&owner.file, 0, &vec![0x11u8; PAGE]),
+      xid
+    )),
+    0,
+    "the file's first page"
+  );
+  xid += 1;
+  let mut page = read_whole(&mut owner.stream, &owner.file, PAGE, xid);
+  xid += 1;
+  let mut refused = Vec::new();
+  for round in 0..ROUNDS {
+    page[(round * 97) % PAGE] = u8::try_from(round + 1).unwrap();
+    let status = nfs::status(&call_once(
+      &mut owner.stream,
+      WRITE,
+      &write_args(&owner.file, 0, &page),
+      xid,
+    ));
+    xid += 1;
+    if status != 0 {
+      refused.push((round, status));
+    }
+  }
+  let file = read_whole(&mut owner.stream, &owner.file, PAGE, xid);
+  assert!(
+    refused.is_empty(),
+    "the connection's own write-backs were refused (round, status): {refused:?}"
+  );
+  assert!(file == page, "the file is the last page written back");
+}

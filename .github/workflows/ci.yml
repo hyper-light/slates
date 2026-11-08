@@ -531,6 +531,29 @@ jobs:
       # BlobNotFound), and one step running five binaries could not say which hung. A step compiles one
       # crate's tests and runs them; clippy of every crate here took 23-66 s over four runs (2026-09-25),
       # so fifteen minutes is over ten times the slowest measured build, and a hang is cut with its log.
+      # A-239 (GAPS 8a-win-dumps), what a Windows crash dump holds of the daemon's private bytes. First under WER's defaults
+      # (nothing kept), then with an administrator's `LocalDumps` full dumps, a machine setting made on this throwaway
+      # runner with the OS's own registry provider (every mapping kept, and the daemon reports the setting).
+      - name: Test that a crash under WER's defaults keeps nothing (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        env:
+          SLATES_WER_SCAN_DEFAULT_REPORT: "1"
+        run: cargo test -p slates-server --test dump_exclusion -- --exact a_default_crash_report_carries_no_content_region_shared_view_or_key_slot --nocapture
+      - name: Have WER write full crash dumps (LocalDumps)
+        run: |
+          $dumps = Join-Path $env:RUNNER_TEMP 'wer-dumps'
+          New-Item -ItemType Directory -Force -Path $dumps | Out-Null
+          $key = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps'
+          New-Item -Force -Path $key | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpFolder -PropertyType ExpandString -Value $dumps | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpType -PropertyType DWord -Value 2 | Out-Null
+          New-ItemProperty -Force -Path $key -Name DumpCount -PropertyType DWord -Value 10 | Out-Null
+          "SLATES_WER_DUMP_DIR=$dumps" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Test that an administrator's full dump carries every mapping, and is reported (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-server --test dump_exclusion -- --exact an_administrators_local_full_dump_carries_every_mapping --nocapture
       - name: Test the Win32 shared memory (native Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 15
@@ -1354,6 +1377,13 @@ jobs:
       # below; the rest of the scratch (a cargo target, fsstress's tree) stays on the runner.
       # The cache restores the last run's `target/`, scratch included: every suite's own directory is
       # emptied before it runs (`Scratch::fresh`), and only the tool builds are reused.
+      # A failed fsx run's record must hold fsx's own failure line and keep its -P files beside the record (CI run
+      # 42395077767 kept replay lines only, and its .fsxlog stayed in the scratch): the pinned fsx is run with its file
+      # overwritten in place, and the harness's note and kept logs are checked.
+      - name: A forced fsx failure keeps its failure line and its logs with the record
+        env:
+          SLATES_TEST_FSX: "1"
+        run: cargo test -p xtask --bin xtask a_forced_fsx_failure_keeps_its_failure_line_and_its_logs_beside_the_record -- --nocapture
       - name: Plan, then run every suite this runner can (each verdict gates the step; records kept)
         run: cargo xtask conformance all --records target/conformance-records --scratch target/conformance-scratch --keep
       - name: Upload the records

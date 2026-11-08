@@ -1732,6 +1732,11 @@ pub(crate) fn content_authorized(
 
 /// [`content_authorized`], with the counter naming why not: `peer` is not a member, the object's acting owner is
 /// unknown here, `peer` is not it, or (placing) this node is not among its candidates.
+/// Counter and reason: a placement refused because this node is not among the object's candidates in its own
+/// configuration, the sender being the acting owner ([`content_authority`]); a live holder the volume's record names
+/// admits the entry anyway (`live_ship::admitted`).
+pub(crate) const CONTENT_NOT_A_CANDIDATE: &str = "content.refused.not_a_candidate";
+
 pub(crate) fn content_authority(
   regional: &slates_db::register::RegionalConfiguration,
   records: &std::collections::BTreeMap<ObjectId, slates_db::register::Acceptor>,
@@ -1763,7 +1768,7 @@ pub(crate) fn content_authority(
       Err("content.refused.not_the_acting_owner")
     }
     slates_cluster::content::ContentAccess::Place if !candidates.contains(&local) => {
-      Err("content.refused.not_a_candidate")
+      Err(CONTENT_NOT_A_CANDIDATE)
     }
     slates_cluster::content::ContentAccess::Place => Ok(()),
     slates_cluster::content::ContentAccess::Read => {
@@ -1882,7 +1887,7 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
       local,
     );
     let catalog_committed = state.placed_heads.get(&catalog).is_some_and(|head| {
-      head.sequence == record.catalog_version && head.placement.placed(config.quorum)
+      head.sequence == record.catalog_version && head.placed_under(config, catalog)
     });
     let catalog_ready = catalog_owed.is_none() || catalog_committed;
     heads.extend(catalog_owed);
@@ -3167,7 +3172,7 @@ fn record_placed_seals(state: &mut ShardState) {
         return None;
       }
       let head = state.placed_heads.get(object)?;
-      if head.sequence != job.sequence || !head.placement.placed(quorum) {
+      if head.sequence != job.sequence || !head.placed_under(state.fleet.configuration(), *object) {
         return None;
       }
       let region = job.content.acked.iter().map(|host| host.0).collect();
@@ -3681,9 +3686,15 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
     None => return,
   };
   // A live-shipped volume is served from its live log, which holds every acknowledged write (A-200): phase one over its
-  // candidates under the takeover's epoch, the greatest head adopted. A volume whose log was never shipped has none and
-  // is served from its placed seal as before.
-  let live = if catalog.live_shipped {
+  // candidates under the takeover's epoch, the greatest head adopted, `f + 1` counted among the holders the catalog
+  // records (A-240). A catalog that records none had a shipper that never shipped (it ships only once its holders are
+  // placed with the catalog, `live_ship::holders_placed`): no log exists, and the volume is served from its placed seal.
+  let live = if let Some(recorded) = catalog
+    .live_holders
+    .as_ref()
+    .filter(|_| catalog.live_shipped)
+  {
+    let holders: Vec<HostId> = recorded.holders.iter().copied().map(HostId).collect();
     let mut candidates = placed.placement.candidates.clone();
     let current =
       state::with_state(|s| s.fleet.configuration().place(object).candidates).unwrap_or_default();
@@ -3692,7 +3703,7 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
         candidates.push(host);
       }
     }
-    match crate::live_ship::fetch(object, placed.epoch, candidates).await {
+    match crate::live_ship::fetch(object, placed.epoch, candidates, holders).await {
       Ok(fetched) => fetched,
       Err(waits) => {
         count_refusal(waits);
@@ -3703,6 +3714,9 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
     None
   };
   let region = head.content_holders.clone();
+  // The head the live log was adopted at, kept apart from the log (moved to the owner shard), so a refused rebuild is
+  // remembered at it (`live_ship::note_rebuild`).
+  let adopted_head = live.as_ref().map(|fetched| fetched.head);
   // The successor's own copy of the volume's lineage key (A-92 piece 4c), unwrapped here on the control shard, which
   // holds the pair keys, and handed to the owner shard wrapped under this node's root.
   let successor_lineage = head.sealing.as_ref().and_then(|sealing| {
@@ -3769,6 +3783,13 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
     HEARTBEAT_NS,
   )
   .await;
+  if let Some(adopted) = adopted_head {
+    match &served {
+      Some(Ok(())) => crate::live_ship::note_rebuild(object, adopted, None),
+      Some(Err(refusal)) => crate::live_ship::note_rebuild(object, adopted, Some(refusal)),
+      None => {}
+    }
+  }
   state::with_state(|s| match served {
     Some(Ok(())) => {
       s.pending_materializations.remove(&object);
@@ -4074,6 +4095,10 @@ enum DirectContact {
   /// dropped a member outside its neighbourhood, never announced the pair's epoch once formation's
   /// everyone-contacts-everyone window closed, and the member's probes to it went unanswered for 4,000 periods.
   AsVoter,
+  /// Believed dead, but it announced itself since over an authenticated session at the incarnation it died at: its
+  /// process lives under the same id (an anchor's warm restart). Contact is kept so the pair's plane is keyed and its
+  /// probes, answered with the death, let it refute (hyper-swim's refutation needs the dead member's probe to be heard).
+  Returned,
   /// Dropped: this node believes the peer dead.
   BelievedDead,
   /// Dropped: a council member outside this node's neighbourhood and no voter.
@@ -4086,6 +4111,27 @@ impl DirectContact {
   }
 }
 
+/// The contact kept with `peer`, which this node holds dead: see [`DirectContact`]'s first three dead variants.
+fn dead_contact(state: &ShardState, peer: HostId) -> DirectContact {
+  if is_unlearned_seed(state, peer) {
+    DirectContact::UnlearnedSeed
+  } else if returned_since_death(state, peer) {
+    DirectContact::Returned
+  } else {
+    DirectContact::BelievedDead
+  }
+}
+
+/// Whether `peer`, held dead here, has announced itself since at the incarnation it died at (`ShardState::returned_members`).
+fn returned_since_death(state: &ShardState, peer: HostId) -> bool {
+  let incarnation = state
+    .fleet
+    .membership()
+    .state(peer)
+    .map(|belief| belief.incarnation);
+  incarnation.is_some() && state.returned_members.get(&peer).copied() == incarnation
+}
+
 fn direct_contact(state: &ShardState, peer: HostId) -> DirectContact {
   let believed_dead = state
     .fleet
@@ -4093,11 +4139,7 @@ fn direct_contact(state: &ShardState, peer: HostId) -> DirectContact {
     .state(peer)
     .is_some_and(|belief| belief.liveness == Liveness::Dead);
   if believed_dead {
-    if is_unlearned_seed(state, peer) {
-      DirectContact::UnlearnedSeed
-    } else {
-      DirectContact::BelievedDead
-    }
+    dead_contact(state, peer)
   } else if !state.council.initialized() || !state.root.initialized() {
     DirectContact::Forming
   } else if !state.council.configuration().members.contains(&peer) {
@@ -5523,6 +5565,21 @@ async fn drive_council_election(
 /// to admit a newcomer, retire a departed member, or take over a failed owner's objects (the quiescent
 /// successor's only cue, as it receives no records for the dead owner's objects). Equal in steady state, so a
 /// converged learner fetches nothing. Compared as sets; both include this node.
+/// Whether a member of this node's region has announced, on its probes, a configuration newer than the one this node's
+/// council holds (`AnswersGiven::announced_versions`): evidence that the council committed a change this learner has not
+/// fetched. A change that leaves the membership alone (a voter change, an owner's settlement) shows no divergence in
+/// the learner's own view, so before this a learner held version 12 while its region stood at 17, and reported its
+/// settlement 359 times for a generation the council had moved past (CI diag-live-fixes-21). Another region's members
+/// announce their own council's versions, another counter, so only this region's count.
+fn region_announces_newer_configuration(state: &ShardState) -> bool {
+  let own = state.council.configuration().version;
+  state
+    .answers_given
+    .announced_versions
+    .iter()
+    .any(|(peer, announced)| *announced > own && same_region(state, *peer))
+}
+
 fn membership_diverges_from_config(state: &ShardState) -> bool {
   let alive: std::collections::BTreeSet<HostId> =
     state.fleet.membership().alive().into_iter().collect();
@@ -5732,7 +5789,7 @@ async fn drive_config_council(
         due
       } else {
         s.council_learner_pace.reset();
-        membership_diverges_from_config(s)
+        membership_diverges_from_config(s) || region_announces_newer_configuration(s)
       }
     })
     .unwrap_or(false);
@@ -6315,8 +6372,6 @@ fn sync_config_from_council(local: HostId) {
     // module).
     crate::takeover::resolve_held_objects(s, local);
     reconcile_held_authority(s);
-    // A retired host's clients' attachments end here: no reap of theirs will come (A-222).
-    crate::remote_attach::end_departed(s, &members);
   });
 }
 
@@ -6486,8 +6541,6 @@ impl Fan {
         .and_then(|membership| membership.durability)
         .and_then(|bound| bound.shortfall(&placement));
       s.fleet.install_configuration(placement, &members);
-      // A retired host's clients' attachments on this shard end with its departure (A-222).
-      crate::remote_attach::end_departed(s, &members);
     }
     if let Some(root) = self.root {
       s.root.adopt(root);
@@ -6803,10 +6856,14 @@ async fn deliver_pairs(origin: u16, shard: u16, local: HostId, budget: CommitBud
       .collect()
   })
   .unwrap_or_default();
+  // A pair is owed to a neighbour this shard has not delivered one to, or delivered one to another incarnation of: a
+  // node back at its anchor with fresh RAM holds none of the keys it was delivered, and one marked delivered by anchor
+  // alone was never delivered again, so the replacement could not open this node's heads as their successor (the same
+  // key again is accepted by a node that kept it, so a redelivery to a warm restart changes nothing).
   let owed: Vec<(HostId, u64)> = anchors
     .iter()
     .copied()
-    .filter(|(_, anchor)| !delivered.contains(anchor))
+    .filter(|(member, anchor)| delivered.get(anchor) != Some(member))
     .collect();
   // The owner shard learns every neighbour's anchor, so it can tell which candidates a head's sealing covers.
   let resolved: std::collections::BTreeMap<HostId, u64> = anchors.into_iter().collect();
@@ -6858,8 +6915,10 @@ async fn deliver_pairs(origin: u16, shard: u16, local: HostId, budget: CommitBud
         origin,
         shard,
         move |s| {
-          if s.pairs_delivered.len() < s.config.fleet_peer_capacity.max(1) {
-            s.pairs_delivered.insert(anchor);
+          if s.pairs_delivered.len() < s.config.fleet_peer_capacity.max(1)
+            || s.pairs_delivered.contains_key(&anchor)
+          {
+            s.pairs_delivered.insert(anchor, member);
           }
         },
         HEARTBEAT_NS,
@@ -7082,7 +7141,13 @@ async fn ship_head(
   let holders = take_sessions("fleet.lent_to.ship_head", |host| {
     head.shape.candidates.contains(&host) && !head.acked.contains(&host)
   });
+  let catalog = head.object.is_catalog();
   if holders.is_empty() {
+    count_refusal(if catalog {
+      SHIP_CATALOG_NO_SESSION
+    } else {
+      SHIP_HEAD_NO_SESSION
+    });
     return None; // No live session to a candidate that still needs the head; retry next period.
   }
   let taken: Vec<HostId> = holders.iter().map(|(host, _)| *host).collect();
@@ -7108,6 +7173,11 @@ async fn ship_head(
       }
     });
   }
+  count_refusal(ship_outcome_counter(
+    catalog,
+    &committed.outcome,
+    head.quorum,
+  ));
   let dispatch = Dispatch::new(
     taken,
     &committed.reusable,
@@ -7131,6 +7201,46 @@ async fn ship_head(
   });
   Some(dispatch)
 }
+
+/// The counter naming one head or catalog commit's outcome: placed at `f + 1`, acknowledged short of it, uncertain, or
+/// refused before anything was dispatched.
+fn ship_outcome_counter(
+  catalog: bool,
+  outcome: &Result<Placement, ClusterError>,
+  quorum: Quorum,
+) -> &'static str {
+  match (catalog, outcome) {
+    (true, Ok(placement)) if placement.placed(quorum) => SHIP_CATALOG_PLACED,
+    (false, Ok(placement)) if placement.placed(quorum) => SHIP_HEAD_PLACED,
+    (true, Ok(_) | Err(ClusterError::NotPlaced { .. })) => SHIP_CATALOG_SHORT,
+    (false, Ok(_) | Err(ClusterError::NotPlaced { .. })) => SHIP_HEAD_SHORT,
+    (true, Err(ClusterError::Uncertain { .. })) => SHIP_CATALOG_UNCERTAIN,
+    (false, Err(ClusterError::Uncertain { .. })) => SHIP_HEAD_UNCERTAIN,
+    (true, Err(_)) => SHIP_CATALOG_FAILED,
+    (false, Err(_)) => SHIP_HEAD_FAILED,
+  }
+}
+
+/// Counter: a volume's head (or tombstone) committed at `f + 1` by one ship.
+const SHIP_HEAD_PLACED: &str = "fleet.ship.head.placed";
+/// Counter: a head ship acknowledged by fewer than `f + 1` candidates.
+const SHIP_HEAD_SHORT: &str = "fleet.ship.head.short";
+/// Counter: a head ship whose outcome is uncertain (the dispatch's budget ran out).
+const SHIP_HEAD_UNCERTAIN: &str = "fleet.ship.head.uncertain";
+/// Counter: a head ship refused by the runtime before anything was dispatched.
+const SHIP_HEAD_FAILED: &str = "fleet.ship.head.failed";
+/// Counter: a head owed to candidates none of which had a session to ride.
+const SHIP_HEAD_NO_SESSION: &str = "fleet.ship.head.no_session";
+/// Counter: a volume's catalog record committed at `f + 1` by one ship.
+const SHIP_CATALOG_PLACED: &str = "fleet.ship.catalog.placed";
+/// Counter: a catalog ship acknowledged by fewer than `f + 1` candidates.
+const SHIP_CATALOG_SHORT: &str = "fleet.ship.catalog.short";
+/// Counter: a catalog ship whose outcome is uncertain.
+const SHIP_CATALOG_UNCERTAIN: &str = "fleet.ship.catalog.uncertain";
+/// Counter: a catalog ship refused by the runtime before anything was dispatched.
+const SHIP_CATALOG_FAILED: &str = "fleet.ship.catalog.failed";
+/// Counter: a catalog owed to candidates none of which had a session to ride.
+const SHIP_CATALOG_NO_SESSION: &str = "fleet.ship.catalog.no_session";
 
 /// Merges an acknowledging set into the object's recorded placement at `sequence` — never overwriting it
 /// within a sequence: the union of every round's acknowledgements is the true region placement, since each
@@ -7179,6 +7289,8 @@ fn record_acks_in(
   crate::live_ship::resolve(state, object.0);
   // A destroy is answered once its tombstone is placed (`live_ship::defer_destroy`).
   crate::live_ship::resolve_destroys(state, object.0);
+  // A live shipper waits for its holders' catalog to be placed before it ships (A-240).
+  crate::live_ship::catalog_placed(state, object);
 }
 
 /// Borrows out of the shard state the live sessions of the holders satisfying `wanted`, leaving each borrowed
