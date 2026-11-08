@@ -334,8 +334,9 @@ volume.
   the reacquired handle.
 - **Other fidelity extensions.** Base-backed volumes (a live base restored only through retained
   handles or validated source identity — "reopening a path alone cannot substitute another base"; the identity is the
-  device, inode number and birth time, so a directory whose entries changed recovers and one another replaced does not,
-  A-153);
+  device, inode number and birth time, so a directory whose entries changed recovers, A-153, and one another replaced,
+  or one that is gone, is never served as the recorded one: the volume recovers and that directory's untouched entries
+  refuse `BaseUnavailable`, A-256);
   the live pressure source of a dynamic quota is re-supplied on recovery like the clock (its counters
   and granted growth do travel, and the growth is re-acquired from the rebuilt budget).
 - **§4.2 reservation accounting.** BUG-2 (admit against usable arena capacity), BUG-1 (a strict

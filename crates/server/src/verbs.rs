@@ -12026,12 +12026,24 @@ fn clear_write_log(state: &mut ShardState, captured_every_volume: bool, generati
 /// that cannot be replayed is counted and the run carries on; the file then lacks it, as the record says. A write
 /// refused `PublishNeeded` (the arena's freed blocks wait on a publication, A-64) publishes, puts every record not
 /// yet replayed back in the log under the new image's stamp — the publication cleared the log, and a crash before
-/// the replay ends must still find them — and is tried once more.
+/// the replay ends must still find them — and is tried once more. A logged `FORGET` gives its lookups back in its
+/// place among the writes (GAPS, A-154's sibling): the kernel never resends one, so without it the references a dead
+/// daemon was given back after its last publication stayed counted, and an unlinked file the kernel had let go was
+/// never reclaimed.
 #[cfg(target_os = "linux")]
 fn replay_writes(state: &mut ShardState) -> usize {
   let records = std::mem::take(&mut state.replay);
   let mut replayed: usize = 0;
-  for (index, record) in records.iter().enumerate() {
+  for (index, logged) in records.iter().enumerate() {
+    let record = match logged {
+      crate::write_log::Logged::Write(record) => record,
+      crate::write_log::Logged::Forget(forgotten) => {
+        if replay_forget(state, *forgotten).is_none_or(|given| given.is_err()) {
+          state.count(FORGET_REPLAY_REFUSED, 1);
+        }
+        continue;
+      }
+    };
     let mut written = replay_one(state, record);
     if matches!(written, Some(Err(slates_vfs::VfsError::PublishNeeded))) {
       let _ = publish_shard(state);
@@ -12046,19 +12058,44 @@ fn replay_writes(state: &mut ShardState) -> usize {
   replayed
 }
 
+/// The volume slot whose prefix `inode` carries, when recovery rebuilt it.
+#[cfg(target_os = "linux")]
+fn slot_of_inode(
+  state: &mut ShardState,
+  inode: u64,
+) -> Option<slates_mem::Handle<crate::state::VolumeSlot>> {
+  let prefix = u16::try_from(inode >> slates_vfs::ids::InodeNo::COUNTER_BITS).unwrap_or(u16::MAX);
+  state
+    .volumes
+    .iter()
+    .find(|(_, slot)| slot.volume.prefix() == prefix)
+    .map(|(handle, _)| handle)
+}
+
+/// Gives back one logged `FORGET`'s lookups, as its attachment's own, in the volume its inode names; `None` when no
+/// rebuilt volume has it.
+#[cfg(target_os = "linux")]
+fn replay_forget(
+  state: &mut ShardState,
+  forgotten: crate::write_log::Forgotten,
+) -> Option<Result<(), slates_vfs::VfsError>> {
+  let handle = slot_of_inode(state, forgotten.inode)?;
+  let slot = state.volumes.get_mut(handle).ok()?;
+  Some(slot.volume.forget_for(
+    &mut state.store,
+    slates_vfs::ids::InodeNo(forgotten.inode),
+    slates_vfs::ids::RefOwner::Attachment(forgotten.attachment),
+    forgotten.count,
+  ))
+}
+
 /// Writes one logged record into the volume whose prefix its inode carries; `None` when no rebuilt volume has it.
 #[cfg(target_os = "linux")]
 fn replay_one(
   state: &mut ShardState,
   record: &crate::write_log::Record,
 ) -> Option<Result<usize, slates_vfs::VfsError>> {
-  let prefix =
-    u16::try_from(record.inode >> slates_vfs::ids::InodeNo::COUNTER_BITS).unwrap_or(u16::MAX);
-  let handle = state
-    .volumes
-    .iter()
-    .find(|(_, slot)| slot.volume.prefix() == prefix)
-    .map(|(handle, _)| handle)?;
+  let handle = slot_of_inode(state, record.inode)?;
   let slot = state.volumes.get_mut(handle).ok()?;
   let inode = slates_vfs::ids::InodeNo(record.inode);
   let written = slot
@@ -12075,18 +12112,20 @@ fn replay_one(
 /// replay has not yet applied survive a crash before it ends. A record the log cannot take marks it overflowed
 /// (A-63: the next daemon reports every taken-over file as having lost writes).
 #[cfg(target_os = "linux")]
-fn relog_remaining(state: &mut ShardState, remaining: &[crate::write_log::Record]) {
+fn relog_remaining(state: &mut ShardState, remaining: &[crate::write_log::Logged]) {
   let generation = state.journal.generation();
   let (Some(object), Some(log)) = (state.content.as_mut(), state.write_log.as_mut()) else {
     return;
   };
   let mut kept = log.clear(object, generation).is_ok();
-  for record in remaining {
-    if kept
-      && log
-        .append(object, record.inode, record.offset, &record.bytes)
-        .is_err()
-    {
+  for logged in remaining {
+    let appended = match logged {
+      crate::write_log::Logged::Write(record) => {
+        log.append(object, record.inode, record.offset, &record.bytes)
+      }
+      crate::write_log::Logged::Forget(forgotten) => log.append_forget(object, *forgotten),
+    };
+    if kept && appended.is_err() {
       kept = false;
     }
   }
@@ -12099,6 +12138,11 @@ fn relog_remaining(state: &mut ShardState, remaining: &[crate::write_log::Record
 /// Format: the refusal counter of a logged write recovery could not replay (A-63).
 #[cfg(target_os = "linux")]
 const WRITE_REPLAY_REFUSED: &str = "recovery.write_replay_refused";
+
+/// Format: the refusal counter of a logged `FORGET` recovery could not give back (no rebuilt volume holds its inode,
+/// or the volume refused it).
+#[cfg(target_os = "linux")]
+const FORGET_REPLAY_REFUSED: &str = "recovery.forget_replay_refused";
 
 /// Format: the refusal counter of a volume whose recovered references could not be settled.
 const REFERENCES_UNSETTLED: &str = "recovery.references_unsettled";

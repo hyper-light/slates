@@ -2030,6 +2030,19 @@ neither the server nor a mounted client is granted device activation by a volume
 Device-metadata preservation is a separate, unimplemented decision. Mounted acceptance
 must exercise local communication and isolation between clones as well as namespace calls.
 
+**A read-only attachment is a read-only file system (decided 2026-11-08, from POSIX).** An attachment that may read but
+not write, and a snapshot's view, refuse every change as POSIX's read-only file system does: `EROFS`, at the open for
+an open for writing (a write access mode or `O_TRUNC`) and at every mutating verb. One mapping makes it, the bridge's
+`authorize_write` (`VfsError::ReadOnly`), carried by every edge: FUSE, virtio-fs and the vhost route answer `EROFS`
+(the DAX windows' writable asks too); NFS answers `NFS3ERR_ROFS` and `NFS4ERR_ROFS`; WinFsp answers
+`STATUS_MEDIA_WRITE_PROTECTED` and reports the volume read-only (`ReadOnlyVolume`), so Windows refuses most changes
+before they reach a shard, and its `CanDelete` asks the bridge (`authorize_change`) before Windows marks a file for a
+delete that happens at the reply-less cleanup; the wire answers `ReadOnlyVolume`. An attachment with no rights at all is refused for
+permission (`EPERM`, `NFS3ERR_PERM`, `STATUS_ACCESS_DENIED`). A kernel that mounts the attachment `ro` (Linux FUSE,
+macOS NFS) refuses most changes itself before the request, with the same `EROFS`. Until 2026-11-08 the bridge granted
+an open for writing and answered each change `NotPermitted`
+(`docs/bugs/2026-11-08-a-read-only-attachment-was-not-a-read-only-file-system.md`).
+
 **Kubernetes publication without privilege (AUD-29-75; decided 2026-10-01).** Kubernetes has two ways to put a
 mount a component makes into a pod, and both need a privilege R10 forbids:
 
@@ -2569,6 +2582,15 @@ before the report is published, so a tool never reads attributes newer than the 
 > barrier's publication to its reply's write, is microseconds wide, too narrow for a kill to target, so no
 > end-to-end test reaches it. Per-shard channels were measured and rejected (A-62). Every acknowledged write now
 > survives (A-63).
+> **A `FORGET` after the last publication is logged (2026-11-08, A-154's sibling).** A `FORGET` gives back lookup
+> references the kernel held, takes no reply, and is never resent, so one served after the last publication and lost
+> with its daemon left the references the image recorded counted for good: an unlinked file the kernel had let go was
+> never reclaimed. Each turn's `FORGET`s are logged beside the writes in the write log (A-63; a record of its own kind:
+> the attachment, the inode and the count), and the replay gives them back in their place among the writes, as the
+> attachment's own (`Volume::forget_for`). A `FORGET` the log cannot take forces a publication; one still refused is
+> counted (`write_log.forget_unlogged`), never taken for a lost write. Proven by
+> `the_lookups_a_dead_daemon_was_given_back_after_its_last_publication_stay_given_back`
+> (`docs/bugs/2026-11-08-a-forget-after-the-last-publication-leaked-its-lookup-reference.md`).
 > **The takeover round is built (2026-10-23, A-158).** A restored mount tells its kernel what its predecessor may not
 > have: the epoch bump and an invalidation of the root and of every restored reference and replayed inode, in slices.
 > Proven on Linux 7.2.9 through the real binary, each test red with the change's files at the previous commit:
@@ -4926,7 +4948,17 @@ retry must recover the same result and contents. Rebuilding a scratch volume fro
 and id loses acknowledged data. Live directory handles require an anchor handoff or validated
 reacquisition of the same source identity; reopening a path alone cannot substitute another
 base. The identity is the device, inode number and birth time (A-153): a change to a directory's
-entries is not a change of source, while a directory another replaced is. Missing resources return `RecoveryIncomplete`/`BaseUnavailable`, never empty success.
+entries is not a change of source, while a directory another replaced is. A recorded directory recovery cannot
+reacquire as the same one, gone from the disk, unreadable, or another at the path, is the failure matrix's "base
+directory unreadable or gone": its untouched entries refuse `BaseUnavailable{path, errno}` (`ENOENT` when the host says
+only that it is not there), the volume's own entries in it serve, and the next image keeps its record so a later
+recovery tries it again; it never refuses the whole volume, and another directory is never substituted for it
+(2026-11-07, `docs/bugs/2026-11-07-a-removed-base-directory-refused-the-whole-volume-at-recovery.md`). A question that
+needs a listing the recovered plane has not read yet reads it then rather than take its absence for an answer: a green's
+base snapshot is judged complete against its directories' listings read from the host, uncached, so their first real
+listing still renumbers their untouched entries (A-151; 2026-11-08,
+`docs/bugs/2026-11-08-a-pinned-snapshot-was-refused-as-a-greens-base-after-a-restart.md`). Missing resources
+return `RecoveryIncomplete`/`BaseUnavailable`, never empty success.
 The version-2 volume image now preserves overlay source paths and full directory fingerprints,
 witnesses, whiteouts, redirects, metadata copy-ups and private large-file ranges, including snapshots.
 Recovery validates no-follow source acquisition before reinstating lazy reads and invalidates caches.
@@ -17967,7 +17999,7 @@ Applied in the same change to:
   five seconds; with a close mid-frame taken for a clean one the truncated count stays 0.
 - **Found on the way, recorded in GAPS, not changed here:** a read-only attachment grants a write-mode open and answers
   each write `EPERM` on every FUSE transport, and NFS answers `PERM`, where a read-only file system answers `EROFS` at
-  the open; `INIT`'s page count follows the host's page, so a 4 KiB-page guest of a 16 KiB-page Mac is told 16 pages,
+  the open (fixed 2026-11-08, §4.6 "A read-only attachment is a read-only file system"); `INIT`'s page count follows the host's page, so a 4 KiB-page guest of a 16 KiB-page Mac is told 16 pages,
   64 KiB a request, a quarter of the largest write.
 - **Over the wire on Linux (2026-10-24, part 1 step 2).** `attach` takes `AttachRequest::ShardsFs { subtree }`. On the
   volume's owner shard, inside the verb's transaction, the stream is made and served as above and its end kept under
@@ -18611,10 +18643,49 @@ Applied in the same change to:
   (`a_release_of_an_open_no_publication_counted_waits_for_nothing`).
 - **Left open:** a `FORGET` processed after the last publication leaves its lookup reference counted in the image, and
   the kernel never resends a `FORGET` either. It has no reply to wait behind; it stays under A-61's stated limits, as
-  a bounded leak (GAPS).
+  a bounded leak (GAPS). **Closed 2026-11-08 by a1b44bb1:** each `FORGET` is logged beside the writes (A-63), and a
+  successor gives it back in its place (§4.6, "A `FORGET` after the last publication is logged").
 - **Evidence.** See the bug record's verification.
 
+### A-256 — A base directory recovery cannot reacquire costs only its own untouched entries (accepted 2026-11-08, the supervisor's confirmation)
+Applied in the same change to (the code and tests in 4db8c179, this entry and A-153's pointer after them):
+- §4.8 ("Required persistence and protocol invariants");
+- `docs/wip/recovery.md`;
+- `crates/vfs/src/base.rs` (`BasePlane::unavailable`) and `crates/vfs/src/base_recovery.rs` (`BasePlane::recover`,
+  `image`);
+- the tests:
+  - `crates/vfs/tests/base.rs`: A-153's guard as it now stands,
+    `an_overlay_whose_base_directory_another_replaced_never_serves_the_other` (it was
+    `an_overlay_whose_base_directory_another_replaced_is_refused`), and
+    `an_overlay_whose_loaded_base_directory_was_removed_recovers_and_refuses_only_that_directory`;
+  - `crates/server/tests/recovery.rs` `an_overlay_whose_base_directory_was_removed_serves_its_own_files_after_a_restart`;
+  - `crates/cli/tests/cli.rs` `an_overlay_whose_base_directory_was_removed_serves_its_own_files_through_a_kept_mount`;
+- GAPS;
+- `docs/bugs/2026-11-07-a-removed-base-directory-refused-the-whole-volume-at-recovery.md`.
+
+- **What A-153 said.** A directory another directory replaced is not the same source, and is refused: the restart
+  refused the whole volume (`RecoveryIncomplete`), and the guard test named that. It left open a loaded directory
+  removed after the last publication, which refused the whole volume the same way.
+- **What it says now.** A recorded directory recovery cannot reacquire as the same one, gone from the disk, unreadable,
+  or another at the path, costs only its own untouched entries.
+  - The volume recovers.
+  - Those entries refuse `BaseUnavailable{path, errno}` (`ENOENT` when the host says only that it is not there).
+  - The volume's own entries in that directory serve.
+  - The next image keeps the directory's record, so a later recovery tries it again.
+- **What it does not change.** A-153's identity rule (device, inode number and birth time) still decides whether a
+  directory is the recorded one. Another directory is never substituted for it: reopening a path alone cannot substitute
+  another base. Only the price of a failed reacquisition changed, from the whole volume to that directory.
+- **Why.** §4.8's failure matrix already gives the runtime rule in its row "Base directory unreadable or gone": refused
+  `BaseUnavailable` for untouched entries under it, witnessed and pinned entries serving. Recovery was harsher than that
+  row, and one directory removed beneath a base cost the user every file the volume held, its own writes included (the
+  bug record).
+- **Not covered.** A directory that comes back while the daemon runs stays unavailable until the next restart.
+- **Evidence.** See the bug record and GAPS (A-153's "Open, found here", closed).
+
 ### A-153 — A recovered base directory is judged by its identity, not its entries (accepted 2026-10-22)
+**Amended by A-256 (2026-11-08):** a directory recovery cannot reacquire, replaced or removed, now costs only its own
+untouched entries rather than the whole volume; the identity rule below stands.
+
 Applied in the same change to:
 - §4.8 ("Required persistence and protocol invariants");
 - `docs/wip/recovery.md`;

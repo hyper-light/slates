@@ -2269,6 +2269,121 @@ fn an_overlays_copied_up_and_created_files_survive_a_restart_over_their_base() {
   second.stop();
 }
 
+/// Format: `NFS3ERR_IO` (RFC 1813 §2.6), what NFS answers for a base entry that cannot be served (`BaseUnavailable`).
+const NFS3ERR_IO: u32 = 5;
+
+/// What the restarted daemon answers for the overlay whose base directory `src` is gone: `src/agent.rs`, the overlay's
+/// own, reads back over NFS and through the client; `src/lib.rs` and `src/mod.rs` answer `NFS3ERR_IO` over NFS and
+/// `BaseUnavailable` through the client; `top` still reads the disk.
+fn answers_with_src_gone(
+  stream: &mut TcpStream,
+  root: &[u8],
+  client: &mut Client,
+  overlay: VolumeId,
+) {
+  let src_fh = lookup(stream, root, "src", 7);
+  let agent = lookup(stream, &src_fh, "agent.rs", 8);
+  assert_eq!(
+    read(stream, &agent, 9),
+    AFTER,
+    "the overlay's own file reads back"
+  );
+  for (name, xid) in [("lib.rs", 10), ("mod.rs", 11)] {
+    assert_eq!(
+      common::nfs::lookup_status(stream, &src_fh, name, xid).err(),
+      Some(NFS3ERR_IO),
+      "src/{name}, an untouched entry of the gone directory, answers NFS3ERR_IO"
+    );
+    assert!(
+      matches!(
+        client.read(
+          overlay,
+          &format!("/src/{name}"),
+          slates_ipc::protocol::ReadAt::Head
+        ),
+        Err(ClientError::Refused(Refusal::BaseUnavailable { .. }))
+      ),
+      "src/{name} is refused BaseUnavailable through the client"
+    );
+  }
+  assert_eq!(
+    client
+      .read(overlay, "/src/agent.rs", slates_ipc::protocol::ReadAt::Head)
+      .unwrap(),
+    AFTER
+  );
+  let top = lookup(stream, root, "top", 12);
+  assert_eq!(
+    read(stream, &top, 13),
+    BEFORE,
+    "the rest of the base reads the disk"
+  );
+}
+
+/// Bug (GAPS, A-153's "Open, found here"; 2026-11-07): a loaded base directory removed after the last publication made
+/// the restart refuse the whole overlay (`RecoveryIncomplete`). §4.8's failure matrix: the untouched entries of a base
+/// directory that is gone refuse `BaseUnavailable`, while overlay entries serve. Do: an overlay over a directory holding
+/// `src/lib.rs`, `src/mod.rs` and `top`; over NFS read `src/lib.rs` (so `src` is listed) and create `src/agent.rs`;
+/// stop the daemon, remove `src` from the disk, and restart over the same segment. Expect: the overlay is served;
+/// `src/agent.rs` reads back over NFS and through the client; `src/lib.rs` and `src/mod.rs` answer `NFS3ERR_IO` over NFS
+/// and `BaseUnavailable` through the client; `top` still reads the disk.
+#[test]
+fn an_overlay_whose_base_directory_was_removed_serves_its_own_files_after_a_restart() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-goneunder-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let anchor = held_anchor("goneunder", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let target = common::target::target_dir();
+  let src = format!("{}/src", target.path);
+  assert!(
+    std::process::Command::new("mkdir")
+      .arg(&src)
+      .status()
+      .unwrap()
+      .success()
+  );
+  target.seed("src/lib.rs", BEFORE);
+  target.seed("src/mod.rs", BEFORE);
+  target.seed("top", BEFORE);
+  let mut client = connect(&instance);
+  let overlay = client
+    .create(&CreateSpec {
+      base: Some(target.path.clone()),
+      ..scratch("gone-under")
+    })
+    .unwrap();
+  let (mut stream, root) = mounted_on(&first, "gone-under");
+  let src_fh = lookup(&mut stream, &root, "src", 2);
+  let lib = lookup(&mut stream, &src_fh, "lib.rs", 3);
+  assert_eq!(read(&mut stream, &lib, 4), BEFORE);
+  let agent = create(&mut stream, &src_fh, "agent.rs", 5);
+  write(&mut stream, &agent, AFTER, 6);
+  drop(stream);
+  first.stop();
+  assert!(
+    std::process::Command::new("rm")
+      .args(["-r", &src])
+      .status()
+      .unwrap()
+      .success()
+  );
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  assert!(
+    client.status(overlay).is_ok(),
+    "the overlay is served after the restart, its gone directory costing only its own entries"
+  );
+  let (mut stream, root) = mounted_on(&second, "gone-under");
+  answers_with_src_gone(&mut stream, &root, &mut client, overlay);
+  drop(stream);
+  drop(client);
+  second.stop();
+}
+
 /// §4.8, A-64 (a clone recovers beside its origin, sharing its origin snapshot's records). Do: write a file into a
 /// volume over NFS, snapshot it, clone the snapshot, write the clone's own file, then restart the daemon over the
 /// same segment. Expect: the recovered clone serves the inherited file's bytes and its own, and the origin its file.
@@ -4513,6 +4628,72 @@ fn a_greens_base_snapshot_is_held_and_its_origin_recovered_from_it() {
   client
     .destroy_snapshot(overlay, snapshot)
     .expect("with the green gone nothing holds the snapshot");
+  drop(client);
+  second.stop();
+}
+
+/// A sibling of a removed base directory at recovery (found by liveness while slicing recovery, 2026-11-08): after a
+/// restart the rebuilt base plane holds no listings until each is read again on first use (A-153), and a pinned
+/// overlay's snapshot was judged against those empty listings. Do: an overlay over a directory holding `f` and `sub/g`;
+/// pin it whole and snapshot it; stop the daemon and start another over the same segment; create a green with that
+/// snapshot as its base. Expect: the green is made, and its files read the snapshot's bytes. Before, the snapshot read
+/// as incomplete and the green was refused `ConsistentBaseUnavailable`, though nothing about the snapshot had changed.
+#[test]
+fn a_green_over_a_pinned_overlays_snapshot_is_made_after_a_restart() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-greenafter-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let anchor = held_anchor("greenafter", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let target = common::target::target_dir();
+  target.seed("f", BEFORE);
+  assert!(
+    std::process::Command::new("mkdir")
+      .arg(format!("{}/sub", target.path))
+      .status()
+      .unwrap()
+      .success()
+  );
+  target.seed("sub/g", AFTER);
+  let mut client = connect(&instance);
+  let overlay = client
+    .create(&CreateSpec {
+      size: SizeClass::Bounded { limit: 1 << 30 },
+      base: Some(target.path.clone()),
+      ..scratch("green-after-base")
+    })
+    .unwrap();
+  assert_eq!(
+    client.pin(overlay, None).unwrap(),
+    2,
+    "both base files pinned"
+  );
+  let snapshot = client.snapshot(overlay).unwrap();
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let green = client
+    .create_green_over(
+      "green-after-restart",
+      false,
+      slates_client::GreenBase {
+        volume: overlay,
+        snapshot,
+      },
+    )
+    .expect("a green over the pinned snapshot is made after the restart");
+  for (path, bytes) in [("/f", BEFORE), ("/sub/g", AFTER)] {
+    assert_eq!(
+      client
+        .read(green, path, slates_ipc::protocol::ReadAt::Head)
+        .unwrap(),
+      bytes,
+      "{path} reads the snapshot's bytes"
+    );
+  }
   drop(client);
   second.stop();
 }

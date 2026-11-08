@@ -14379,11 +14379,19 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     (harness-only exposure: `writable_dax`, DAX unadvertised);
   - `DaxRegistry::has_writable_of` keys by number alone: the backed session's `EBUSY` over-refuses across volumes;
   - `volume_config` wraps `next_prefix` at 65,535 with no check against live volumes' prefixes.
-- **Open, found by the new tests: a read-only attachment is not a read-only file system to its client.** On every FUSE
-  transport (the shared bridge) an open for writing is granted and each write through it refused `EPERM`; NFS answers
-  `PERM`. A read-only file system answers `EROFS`, at the open for an open. Every change is refused and nothing lands,
-  so nothing is unsafe; a client's message and its retry logic differ. The decision spans every transport: the bridge's
-  `authorize_write` maps a read-only attachment to `NotPermitted`, which every edge maps to its permission error.
+- **Fixed 2026-11-08 (slabs), found by the new tests: a read-only attachment was not a read-only file system to its
+  client.** On every FUSE transport an open for writing was granted and each write refused `EPERM`; NFS answered `PERM`.
+  Now an attachment that may read but not write, and a snapshot's view, answer `EROFS` (at the open for a write-mode
+  open, and at every mutating verb): `NFS3ERR_ROFS`/`NFS4ERR_ROFS` over NFS, `STATUS_MEDIA_WRITE_PROTECTED` from WinFsp,
+  one mapping in the bridge's `authorize_write` (§4.6 "A read-only attachment is a read-only file system"). An
+  attachment with no rights stays `EPERM`. Windows' disposition delete asks `CanDelete` first (`authorize_change`): a
+  read-only drive's four changes are each refused `ERROR_WRITE_PROTECT` on both Windows runners (diag-slabs-37, run
+  42483804345: the WinFsp unit tests 80, the CLI suite 17); `DeleteFile` succeeded with that check taken out
+  (diag-slabs-38, run 42483804058). On Linux at c275acbb the bridges, the server suite and the CLI flow passed
+  (diag-slabs-39, run 42486855316). Nobody has run the conformance suites on this branch: conformance expects no change
+  to its records, from reading the harness (no suite mounts read-only, and pjdfstest's `EROFS` cases are FreeBSD-only),
+  and its expected-failure lists have no `EROFS` entries.
+  Record: `docs/bugs/2026-11-08-a-read-only-attachment-was-not-a-read-only-file-system.md`.
 - **Open, performance: `INIT`'s page count follows the host's page.** `init::max_pages` is `MAX_WRITE` in host pages,
   so a 4 KiB-page guest of a 16 KiB-page Mac is told 16 pages: 64 KiB a request where a write may be 256 KiB. The
   kernel mount needs the host's count (its channel buffer is fixed); a VM route could name 64. Not measured yet; owed
@@ -14874,9 +14882,25 @@ Found while fixing A-151.
 - **The fix (A-153).** A directory's identity is its device, inode number and birth time (`Fingerprint::same_object`).
   A directory whose entries changed recovers, and its listing is read again on first use. One another replaced is
   still refused.
-- **Open, found here:** a loaded base directory **removed** after the last publication still refuses the whole volume,
-  since reopening it fails (`open_source`). §4.8 allows `RecoveryIncomplete` there. The failure matrix's runtime rule,
-  `BaseUnavailable` for that directory's untouched entries while overlay entries serve, is the robust form, and is owed.
+- **Found here, fixed 2026-11-07 (slabs):** a loaded base directory **removed** after the last publication refused the
+  whole volume, since reopening it failed (`open_source`). Now the failure matrix's runtime rule holds: that
+  directory's untouched entries refuse `BaseUnavailable`, overlay entries serve, and the next image keeps its record. A
+  directory another replaced is treated the same (never substituted, no longer the whole volume). Proven by use:
+  SimHost (`crates/vfs/tests/base.rs`), the server's restart over NFS and the client (`crates/server/tests/recovery.rs`),
+  and a kernel mount kept across the restart (`crates/cli/tests/cli.rs`; Linux FUSE with a kill, diag-slabs-33, run
+  42434266219: the vfs base suite 47, recovery 49, the CLI flow 91; red with main's base plane, diag-slabs-34, run
+  42434266313). The rule is A-256. At c275acbb, the Linux run for this entry, the sibling below, the `FORGET` entry
+  (under A-154) and the read-only attachment's: diag-slabs-39, run 42486855316, workspace clippy, the whole server suite
+  and the CLI flow's 93 passed. The Windows runs and the red-checks of the sibling, `CanDelete` and the `FORGET` log ran
+  at ca4e8a32 (diag-slabs-37 and -38); c275acbb changed only the Linux-only write log and this ledger. The whole server
+  suite has not yet run on macOS at this tip.
+  Record: `docs/bugs/2026-11-07-a-removed-base-directory-refused-the-whole-volume-at-recovery.md`.
+- **A sibling, fixed 2026-11-08 (slabs; found by liveness):** after a restart a pinned overlay's snapshot was refused
+  as a new green's base (`ConsistentBaseUnavailable`): the completeness check read the recovered plane's listings, none
+  of which were read yet. It now reads a listing the plane has not read from the host, uncached.
+  `a_green_over_a_pinned_overlays_snapshot_is_made_after_a_restart` (`crates/server/tests/recovery.rs`): on Linux green
+  in the whole server suite (diag-slabs-37, run 42483804268), red with the host taken out of the check,
+  `Refused(ConsistentBaseUnavailable)` (diag-slabs-38, run 42483804055). Record: `docs/bugs/2026-11-08-a-pinned-snapshot-was-refused-as-a-greens-base-after-a-restart.md`.
 
 ### 2026-10-23: a release the dead daemon answered after the last publication came back as an open — fixed (A-154)
 
@@ -14893,6 +14917,8 @@ runs on the box at load average 74 to 93, and never alone.
   count waits for the owner's barrier before its reply (`Volume::awaits_publication`, A-150's hook, renamed). The
   application never waits: a regular file's `RELEASE` comes after `close()` returned. An open and release both since
   the last publication wait for nothing.
-- **Open, a sibling:** a `FORGET` processed after the last publication leaves its lookup reference in the image, and the
-  kernel never resends a `FORGET`. It has no reply to wait behind, so it is a bounded leak under A-61's stated limits,
-  owed (a forget could be logged to anchor RAM as A-63 logs writes).
+- **A sibling, fixed 2026-11-08 (slabs):** a `FORGET` processed after the last publication left its lookup reference in
+  the image, and the kernel never resends a `FORGET`. Each `FORGET` is now logged beside the writes in the write log
+  (A-63), and the successor gives it back in its place (§4.6, "A `FORGET` after the last publication is logged").
+  Through a FUSE mount kept across a `SIGKILL`, the file the kernel let go is freed (diag-slabs-37, run 42483804268, the
+  CLI flow 93); with the logging taken out its 1,048,576 bytes stay referenced (diag-slabs-38, run 42483804055). Record: `docs/bugs/2026-11-08-a-forget-after-the-last-publication-leaked-its-lookup-reference.md`.

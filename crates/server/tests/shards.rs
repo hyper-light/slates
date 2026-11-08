@@ -68,7 +68,8 @@ const DAX_RANGE: u64 = slates_mem::DAX_RANGE_BYTES;
 const UNKNOWN_OPCODE: u32 = 9_999;
 /// Format: Linux errnos a reply carries, negated.
 const ENOSYS: i32 = 38;
-const EPERM: i32 = 1;
+/// Format: Linux `EROFS`, a read-only file system's answer to any change.
+const EROFS: i32 = 30;
 const ENOENT: i32 = 2;
 const EIO: i32 = 5;
 /// Linux's `EISDIR`, a descriptor ask for a directory.
@@ -885,31 +886,34 @@ fn a_guest_history_over_the_stream_is_the_volume_the_host_sees() {
   drop(daemon);
 }
 
-/// Every change a read-only guest asks for is refused: a create, a directory, an unlink, a rename, a truncating
-/// SETATTR, and a write through a handle opened for reading or for writing (`EPERM`, the shared bridge's answer).
+/// Every change a read-only guest asks for is refused as a read-only file system refuses it, `EROFS` (POSIX): a create,
+/// a directory, an unlink, a rename, a truncating SETATTR, an open for writing (at the open), and a write through a
+/// handle opened for reading.
 fn every_change_is_refused(guest: &mut Guest) {
-  assert!(guest.create(ROOT, "new.txt").is_err());
-  assert!(guest.mkdir(ROOT, "new-dir").is_err());
-  assert_ne!(guest.unlink(ROOT, "kept.txt"), 0);
-  assert_ne!(guest.rename(ROOT, "kept.txt", ROOT, "moved.txt"), 0);
+  assert_eq!(guest.create(ROOT, "new.txt").err(), Some(EROFS));
+  assert_eq!(guest.mkdir(ROOT, "new-dir").err(), Some(EROFS));
+  assert_eq!(guest.unlink(ROOT, "kept.txt"), EROFS);
+  assert_eq!(guest.rename(ROOT, "kept.txt", ROOT, "moved.txt"), EROFS);
   let node = guest.lookup(ROOT, "kept.txt").unwrap();
-  assert_ne!(
+  assert_eq!(
     guest.truncate(node, 0),
-    0,
+    EROFS,
     "a truncating SETATTR is refused"
   );
-  let writable = guest.open(node, O_RDWR).unwrap();
-  assert_eq!(guest.write(node, writable, 0, b"no"), Err(EPERM));
-  assert_eq!(guest.close(node, writable), (0, 0));
+  assert_eq!(
+    guest.open(node, O_RDWR).err(),
+    Some(EROFS),
+    "an open for writing is refused at the open"
+  );
   let fh = guest.open(node, O_RDONLY).unwrap();
-  assert_eq!(guest.write(node, fh, 0, b"no"), Err(EPERM));
+  assert_eq!(guest.write(node, fh, 0, b"no"), Err(EROFS));
   assert_eq!(guest.read(node, fh, 0, 4096).unwrap(), FROM_HOST);
 }
 
 /// AC (Shards part 1, step 1), by use: an attachment for reading refuses every change (CREATE, MKDIR, UNLINK, RENAME,
 /// a WRITE through any handle it opens, a truncating SETATTR) and nothing lands in the volume, while it reads what the
-/// host wrote. A handle opened for writing is granted and every write through it refused `EPERM`, as on every FUSE
-/// transport (the shared bridge's answer, recorded in GAPS: a read-only filesystem would answer `EROFS` at the open).
+/// host wrote. Every refusal is a read-only file system's, `EROFS`, and an open for writing is refused at the open. Until
+/// 2026-11-08 that open was granted and each write through it refused `EPERM`, as on every FUSE transport.
 #[test]
 fn a_read_only_stream_refuses_every_change() {
   let (daemon, client, id) = provisioned("shards-read-only");
@@ -1725,13 +1729,13 @@ fn a_scoped_attachment_reaches_no_node_outside(daemon: &Daemon, id: VolumeId, ou
   );
 }
 
-/// A read-only attachment's writable ask is refused `EPERM`, and its read-only ask answered.
+/// A read-only attachment's writable ask is refused `EROFS`, and its read-only ask answered.
 fn a_read_only_attachment_may_not_ask_to_write(daemon: &Daemon, id: VolumeId, file: u64) {
   let mut reader = Guest::over(attach(daemon, id, None, Intent::Read).unwrap());
   reader.init();
   assert_eq!(
     reader.descriptor(file, true, Some((0, DAX_RANGE))).err(),
-    Some(EPERM),
+    Some(EROFS),
     "a writable ask of a read-only attachment"
   );
   assert!(
