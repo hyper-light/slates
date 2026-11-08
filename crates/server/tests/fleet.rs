@@ -12790,14 +12790,54 @@ fn a_version_appended_before_its_owner_restarted_commits_once_it_is_back() {
       source(0),
     ),
   );
-  let lifted: Vec<_> = daemons[1..]
-    .iter()
-    .map(|holder| holder.inject_merge_fault(slates_server::merge_service::MergeFault::default()))
-    .collect();
-  let all: Vec<&Daemon> = daemons.iter().collect();
-  let committed = poll_until(&all, PLACEMENT_DEADLINE, || {
-    daemons[0].merge_record_placed(green, 1)
-  });
+  let lift = |daemons: &[Daemon]| -> Vec<_> {
+    daemons[1..]
+      .iter()
+      .map(|holder| holder.inject_merge_fault(slates_server::merge_service::MergeFault::default()))
+      .collect()
+  };
+  let mut lifted = if before_lift {
+    Vec::new()
+  } else {
+    lift(&daemons)
+  };
+  // The client reconnects under its id and sends the submit again under the same word, as the load harness does.
+  let reconnected = {
+    let began = Instant::now();
+    loop {
+      match resender.try_reconnect() {
+        Ok(true) => break true,
+        _ if began.elapsed() >= PLACEMENT_DEADLINE => break false,
+        _ => std::thread::sleep(Duration::from_millis(10)),
+      }
+    }
+  };
+  let resent = word
+    .as_ref()
+    .ok()
+    .map(|word| resender.resend_awaited(*word).map(|_| ()));
+  // While the record is withheld the resend joins the wait: no answer, and the green holds the one version.
+  let mut waiting = None;
+  if before_lift {
+    let began = Instant::now();
+    let mut early = None;
+    while began.elapsed() < RESEND_NOT_ANSWERED_WAIT && early.is_none() {
+      early = word
+        .as_ref()
+        .ok()
+        .and_then(|word| resender.poll_reply_word(*word).ok().flatten());
+      std::thread::yield_now();
+    }
+    let mut reader = Client::connect(daemons[0].instance());
+    waiting = Some((early, reader.call(&RequestBody::Versions { green })));
+    lifted = lift(&daemons);
+  }
+  let answer = word
+    .as_ref()
+    .ok()
+    .and_then(|word| answer_within(&mut resender, *word));
+  let mut reader = Client::connect(daemons[0].instance());
+  let head = reader.call(&RequestBody::Versions { green });
   let counters = merge_and_content_counters(&daemons);
   for daemon in daemons {
     daemon.stop();
@@ -12810,15 +12850,46 @@ fn a_version_appended_before_its_owner_restarted_commits_once_it_is_back() {
     faulted.iter().chain(&lifted).all(Result::is_ok),
     "the holders' fault was set and lifted: {faulted:?} {lifted:?}"
   );
-  assert!(unanswered, "the submit waited for its withheld record");
+  assert!(
+    first.is_none(),
+    "the submit waited for its withheld record: {first:?}"
+  );
   assert_eq!(
     awaiting_before,
     Ok(1),
     "version 1 was appended and its submit waited before the restart"
   );
   assert!(
-    committed,
-    "version 1, appended before the owner restarted, committed at the quorum once it was back: {counters:?}"
+    reconnected,
+    "the client reconnected under its id after the restart"
+  );
+  assert!(
+    matches!(resent, Some(Ok(()))),
+    "the submit was sent again: {resent:?}"
+  );
+  if let Some((early, held)) = &waiting {
+    assert_eq!(
+      *early, None,
+      "while its version cannot commit, the resend joined the wait: no answer"
+    );
+    assert_eq!(
+      *held,
+      ReplyBody::Versions { head: 1 },
+      "and nothing ran again: the green holds the one version appended before the restart"
+    );
+  }
+  assert_eq!(
+    answer,
+    Some(Ok(ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    })),
+    "the submit resent under its id after the restart is answered the version it was accepted as: {counters:?}"
+  );
+  assert_eq!(
+    head,
+    ReplyBody::Versions { head: 1 },
+    "the green holds the submit once: its head is version 1, not a second copy"
   );
 }
 
@@ -13131,6 +13202,101 @@ fn a_taken_over_green_serves_every_version_and_accepts_new_work_on_the_successor
   assert!(
     next,
     "the successor accepted the next version at the quorum and its retry met the record"
+  );
+}
+
+/// §4.16 "Commit", A-252, the takeover case: the version committed at the quorum and its owner died before its client
+/// could be sure of the answer. The client resends under its id through its own node, which now reaches the successor.
+/// Do: three nodes at `f = 1`; on a, a green and a work; through b's client, one edit and a submit, answered version 1;
+/// a dies and a survivor takes the green over; b's client sends the submit again under the same id. Expect: the green
+/// still holds one version, and the resend is answered that version.
+#[test]
+fn a_submit_resent_after_its_owner_was_taken_over_is_not_applied_again() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut owner_client = Client::connect(daemons[0].instance());
+  let (green, work) = green_with_work(&mut owner_client, "resent-over-takeover");
+  let mut client = Client::connect(daemons[1].instance());
+  let (routed, last) = poll_status_served(&daemons, &mut client, work, COUNCIL_RETIRE_DEADLINE);
+  let submit = RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  };
+  let edited = routed.then(|| {
+    client.call(&RequestBody::Edit {
+      work,
+      path: "f".to_owned(),
+      at: 0,
+      delete_len: 0,
+      bytes: b"hello".to_vec(),
+    })
+  });
+  let first = routed.then(|| client.call(&submit));
+  let (caught_up, _) = holders_before_owner_death_at(&daemons, green, 1);
+  daemons.remove(0).stop();
+  let object = ObjectId(green.bytes);
+  let successor_host =
+    rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over the green");
+  let successor_index = usize::from(successor_host != hosts[1]);
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let materialized = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    daemons[successor_index].merge_record_placed(green, 1)
+  });
+  let again = client.try_retry(
+    &submit,
+    u64::try_from(PLACEMENT_DEADLINE.as_nanos()).unwrap(),
+  );
+  let mut reader = Client::connect(daemons[successor_index].instance());
+  let head = reader.call(&RequestBody::Versions { green });
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!("the resend through the takeover was answered {again:?}; head {head:?}");
+  assert!(routed, "b routed the work to its owner: {last:?}");
+  assert!(
+    matches!(edited, Some(ReplyBody::Edited)),
+    "the edit: {edited:?}"
+  );
+  assert_eq!(
+    first,
+    Some(ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    }),
+    "the submit committed at version 1"
+  );
+  assert!(
+    caught_up,
+    "both holders held version 1 before the owner died"
+  );
+  assert!(
+    materialized,
+    "the successor took the green over at version 1"
+  );
+  assert_eq!(
+    head,
+    ReplyBody::Versions { head: 1 },
+    "the resend ran nothing again: the green holds the one version"
+  );
+  assert_eq!(
+    again.ok(),
+    Some(ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    }),
+    "the resend through the takeover is answered the version it was accepted as"
   );
 }
 
@@ -13906,6 +14072,15 @@ fn commit_three_versions(client: &mut Client, work: VolumeId) {
 /// what it rebuilds from; the general prefix transfer is owed separately), and whether neither holder
 /// reports a placed version — the green is held there, not owned.
 fn holders_before_owner_death(daemons: &[Daemon], green: VolumeId) -> (bool, bool) {
+  holders_before_owner_death_at(daemons, green, 3)
+}
+
+/// [`holders_before_owner_death`] for a green at `version`.
+fn holders_before_owner_death_at(
+  daemons: &[Daemon],
+  green: VolumeId,
+  version: u64,
+) -> (bool, bool) {
   let both_caught_up = poll_until(
     &daemons.iter().collect::<Vec<_>>(),
     PLACEMENT_DEADLINE,
@@ -13913,7 +14088,7 @@ fn holders_before_owner_death(daemons: &[Daemon], green: VolumeId) -> (bool, boo
       all_hold(daemons[1..].iter().map(|holder| {
         holder
           .merge_holder_state(green)
-          .map(|state| state.version == Some(3))
+          .map(|state| state.version == Some(version))
       }))
     },
   );
