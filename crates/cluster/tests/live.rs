@@ -195,6 +195,13 @@ fn run(
     })
     .unwrap();
   sim.run_until_idle();
+  // Non-vacuity of every scenario here: its sessions' datagrams crossed the simulated fabric (its paths, links and
+  // clock), not an OS socket beside it.
+  let fabric = slates_rt::sim::sim_udp_stats();
+  assert!(
+    fabric.delivered > 0,
+    "the sessions ran over the simulated fabric: {fabric:?}"
+  );
   drop(done_tx);
   done_rx
     .try_iter()
