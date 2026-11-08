@@ -887,6 +887,97 @@ fn a_daemon_killed_after_its_anchors_executable_is_replaced_restarts_from_the_an
   drop(anchor);
 }
 
+/// A-254, under A-176 and A-178's rule. Do: start an anchor with its daemon and write a file through the SDK; run a second
+/// anchor for the same instance and let it be refused; kill the live anchor's daemon. Expect the second anchor to exit
+/// refused, the live anchor's next daemon to adopt its segment by name and serve, and the file to read back whole. A start
+/// that is refused must leave the running instance untouched: before, on macOS, the second anchor created its segment
+/// before it asked who owned the instance, and that creation and its drop each unlinked the live segment's name, so the
+/// next daemon found nothing to attach (`shm_open` `ENOENT`, a crash loop). Linux's segment has no name, so there the
+/// test holds either way.
+#[cfg(unix)]
+#[test]
+fn a_refused_second_anchor_leaves_the_live_instance_its_segment_and_its_bytes() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the refused second anchor: set SLATES_TEST_CLI=1 to run it (starts daemons)"
+    );
+    return;
+  }
+  const BYTES: &[u8] =
+    b"the live anchor's volume keeps these bytes through a refused second anchor";
+  let instance = format!("cli-second-anchor-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "kept", "--bounded", "4MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let volume = volume_id_of(&value_of(&out, "id"));
+  let deadlines = || {
+    slates_client::Deadlines::derive(
+      slates_server::daemon::LIVENESS_BUDGET_NS,
+      slates_db::replay::RECOVERY_BUDGET_NS,
+    )
+    .get()
+  };
+  let mut writer = slates_client::Client::connect(&instance, deadlines()).unwrap();
+  let attachment = writer
+    .attach(volume, None, slates_client::Intent::Write)
+    .unwrap()
+    .attachment;
+  writer
+    .fs_write((volume, attachment), "kept.txt", BYTES, FILE_MODE)
+    .unwrap();
+  drop(writer);
+  let mut second = Command::new(env!("CARGO_BIN_EXE_slates"))
+    .args([
+      "--instance",
+      &instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      SHARDS,
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .unwrap();
+  // It measures the machine before it is refused, which a loaded host stretches: the file's widest wait for a process.
+  let began = Instant::now();
+  let mut refused = second.try_wait().unwrap();
+  while refused.is_none() && began.elapsed() < FLEET_WAIT {
+    pause();
+    refused = second.try_wait().unwrap();
+  }
+  let exited = refused.is_some();
+  if !exited {
+    let _ = second.kill();
+    let _ = second.wait();
+  }
+  assert!(
+    exited && refused.is_some_and(|status| !status.success()),
+    "the second anchor for a live instance was refused: {refused:?}"
+  );
+  let killed = daemon_pid(&instance).expect("the live anchor's daemon answers");
+  assert!(
+    Command::new("kill")
+      .args(["-9", &killed.to_string()])
+      .status()
+      .unwrap()
+      .success()
+  );
+  await_daemon(&instance, Some(killed), &[]);
+  let mut reader = slates_client::Client::connect(&instance, deadlines()).unwrap();
+  let read = reader
+    .read(volume, "kept.txt", slates_ipc::protocol::ReadAt::Head)
+    .unwrap();
+  assert_eq!(
+    read, BYTES,
+    "the file reads back whole through the next daemon"
+  );
+  drop(anchor);
+}
+
 /// Shape: what replaces the anchor's executable in the test above: another program, which exits at once.
 #[cfg(unix)]
 const REPLACEMENT_SCRIPT: &str = "#!/bin/sh\nexit 3\n";
@@ -3634,10 +3725,32 @@ fn write_payload_through(path: &str) {
   );
 }
 
+/// Shares `id` through `owner` with this test's account on each of `peers`, by the anchor `slates status` prints.
+fn share_with_peers(owner: &str, peers: &[String], id: &str) {
+  let account = rustix::process::getuid().as_raw();
+  for peer in peers {
+    let (code, status, err) = run(peer, &["status"]);
+    assert_eq!(code, 0, "{err}");
+    let anchor = value_of(&status, "anchor");
+    let (code, _, err) = run(
+      owner,
+      &[
+        "share",
+        id,
+        &format!("uid:{account}@{anchor}"),
+        "--read",
+        "--write",
+        "--admin",
+      ],
+    );
+    assert_eq!(code, 0, "the share with {peer}: {err}");
+  }
+}
+
 /// Provisions the volume on the owner, writes the payload into it through a real kernel mount where
 /// `mount_nfs` exists (the mount is released before the owner dies, so no kernel client is left talking to
 /// a dead server), and seals it; returns the id and the snapshot.
-fn seal_on_owner(instance: &str, mountable: bool) -> (String, String) {
+fn seal_on_owner(instance: &str, peers: &[String], mountable: bool) -> (String, String) {
   // The mesh forms before a fresh learner imports the bootstrapped groups. The explicit refusal
   // precedes any create effect, so only that refusal is retried, within the existing formation bound.
   let deadline = Instant::now() + FLEET_WAIT;
@@ -3662,6 +3775,8 @@ fn seal_on_owner(instance: &str, mountable: bool) -> (String, String) {
     break out;
   };
   let id = value_of(&out, "id");
+  // The survivors' clients are other hosts' accounts (A-237): they reach this volume only through a share naming them.
+  share_with_peers(instance, peers, &id);
   if mountable {
     let mount_point = MountPoint {
       path: fresh_mount_point(),
@@ -3893,7 +4008,13 @@ fn three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owner
 
   // Placement across processes, then the owner's death as a crash would deal it.
   let mountable = mount_nfs_available();
-  let (id, snapshot) = seal_on_owner(&instances[owner], mountable);
+  let peers: Vec<String> = instances
+    .iter()
+    .enumerate()
+    .filter(|(index, _)| *index != owner)
+    .map(|(_, instance)| instance.clone())
+    .collect();
+  let (id, snapshot) = seal_on_owner(&instances[owner], &peers, mountable);
   wait_placed(&instances[owner], &id, &snapshot);
   let survivors: Vec<String> = instances
     .iter()
@@ -8401,6 +8522,74 @@ fn the_handles_a_dead_daemon_issued_give_back_their_references_at_release() {
   drop(anchor);
 }
 
+/// The lookups the kernel gave back after its daemon's last publication are given back through the successor too (GAPS,
+/// A-154's sibling; A-61, A-63). Do: write a file through a mount and unlink it there, so the unlink's barrier publishes
+/// the unlinked file still held by the kernel's lookup; wait until the kernel's `FORGET` has let it go and the volume's
+/// `referenced_bytes` is back where it was before the file (no publication follows the `FORGET`); `SIGKILL` the daemon
+/// and wait for the anchor's successor. Expect `referenced_bytes` where it was before the file: the successor's lookup
+/// count of the file is the kernel's, zero. Before the fix the successor restored the lookup the image recorded, which
+/// the kernel never gives back again, and the file stayed referenced until the mount ended. Linux only, to a kernel that
+/// can resend (6.9+), where a mount survives its daemon.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_lookups_a_dead_daemon_was_given_back_after_its_last_publication_stay_given_back() {
+  if !live_mount_runs() {
+    return;
+  }
+  if !kernel_resends_fuse_requests() {
+    eprintln!("SKIP: before Linux 6.9 a FUSE mount does not survive its daemon (A-61)");
+    return;
+  }
+  let instance = format!("cli-forget-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "forgets", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "a volume: {err}");
+  let id = value_of(&out, "id");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &id, &mount.path);
+  let referenced = || -> u64 {
+    let (code, out, err) = run(&instance, &["status", &id]);
+    assert_eq!(code, 0, "status: {err}");
+    value_of(&out, "referenced_bytes").parse().unwrap()
+  };
+  let before = referenced();
+  let path = format!("{}/forgotten.bin", mount.path);
+  #[allow(clippy::disallowed_methods)]
+  // the test's own file, written through the slates mount: RAM, not disk
+  std::fs::write(&path, vec![0x5Au8; HELD_FILE_BYTES]).unwrap();
+  #[allow(clippy::disallowed_methods)] // unlinked through the slates mount
+  std::fs::remove_file(&path).unwrap();
+  let deadline = Instant::now() + WAIT_FOR;
+  while referenced() > before && Instant::now() < deadline {
+    pause();
+  }
+  assert_eq!(
+    referenced(),
+    before,
+    "the kernel's FORGET let the unlinked file go while the daemon ran"
+  );
+  let killed = kill_the_daemon(&instance);
+  let restarted = await_daemon(&instance, Some(killed), &[]);
+  assert_ne!(restarted, killed, "a new daemon serves the mount");
+  let deadline = Instant::now() + WAIT_FOR;
+  let mut now = referenced();
+  while now > before && Instant::now() < deadline {
+    pause();
+    now = referenced();
+  }
+  assert_eq!(
+    now, before,
+    "the successor's lookups of the file are the kernel's: the FORGET after the last publication stays given back"
+  );
+  drop(mount);
+  drop(anchor);
+}
+
 /// A takeover recovers an overlay whose base directory an outsider changed after the last publication (§4.5 recovery,
 /// A-61; `docs/bugs/2026-10-22-a-takeover-refused-an-overlay-whose-base-directory-an-outsider-had-changed.md`). Do: create
 /// a volume over a base directory holding `notes.txt`, mount it, read the file (its directory's listing is loaded) and
@@ -12048,6 +12237,85 @@ fn a_base_a_kept_mount_covers_is_not_reacquired_through_it() {
   drop(mount);
   let _ = Command::new("rmdir").arg(&base).output();
   let _ = Command::new("rmdir").arg(&point).output();
+}
+
+/// Bug (GAPS, A-153's "Open, found here"; 2026-11-07), by use through a real mount: a loaded base directory removed after
+/// the last publication made the successor refuse the whole overlay (`RecoveryIncomplete`). §4.8's failure matrix: the
+/// gone directory's untouched entries refuse `BaseUnavailable`, while overlay entries serve. Do: an overlay over a
+/// directory holding `src/lib.rs`, `src/mod.rs` and `top`, mounted (FUSE on Linux, NFS on macOS); list `src` and write
+/// `src/agent.rs` through the mount; remove `src` from the disk and end the daemon with the mount kept
+/// ([`KEEPING_SIGNAL`]); wait for the successor. Expect: through the mount `src/agent.rs` reads back, `src/lib.rs` and
+/// `src/mod.rs` fail to read, and `top` reads the disk; `slates read` refuses `src/lib.rs` as `BaseUnavailable`. Neither
+/// base file in `src` is read before the restart, so no kernel cache can answer for the daemon.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn an_overlay_whose_base_directory_was_removed_serves_its_own_files_through_a_kept_mount() {
+  if !own_mount_tests_run() {
+    return;
+  }
+  let instance = format!("cli-goneunder-{}", std::process::id());
+  let _anchor = start_one_shard_anchor(&instance);
+  let base = ScratchDir {
+    path: build_output_dir("slates-goneunder"),
+  };
+  let src = format!("{}/src", base.path);
+  shell(&format!(
+    "mkdir {src} && printf base > {src}/lib.rs && printf base > {src}/mod.rs && printf top > {}/top",
+    base.path
+  ));
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "goneunder",
+      "--bounded",
+      "8MiB",
+      "--base",
+      &base.path,
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  own_mount_and_check(&instance, &id, &mount.path);
+  let listed = shell(&format!("ls {}/src", mount.path));
+  assert!(
+    listed.contains("lib.rs"),
+    "src is listed through the mount: {listed}"
+  );
+  shell(&format!(
+    "printf agent > {}/src/agent.rs && sync",
+    mount.path
+  ));
+  shell(&format!("rm -r {src}"));
+  let ended = end_keeping_mounts(&instance);
+  await_daemon(&instance, Some(ended), &[]);
+  assert_eq!(
+    shell(&format!("cat {}/src/agent.rs", mount.path)),
+    "agent",
+    "the overlay's own file reads back"
+  );
+  for name in ["lib.rs", "mod.rs"] {
+    let read = Command::new("cat")
+      .arg(format!("{}/src/{name}", mount.path))
+      .output()
+      .unwrap();
+    assert!(
+      !read.status.success(),
+      "src/{name}, an untouched entry of the gone directory, does not read: {}",
+      String::from_utf8_lossy(&read.stdout)
+    );
+  }
+  assert_eq!(shell(&format!("cat {}/top", mount.path)), "top");
+  let (code, _, err) = run(&instance, &["read", &id, "/src/lib.rs"]);
+  assert_ne!(code, 0);
+  assert!(
+    err.contains("BaseUnavailable"),
+    "the gone directory's base file is refused by kind: {err}"
+  );
 }
 
 /// Bug (2026-11-06, found by A-227's reacquire test): a volume recovery could not rebuild stays in the catalog, and

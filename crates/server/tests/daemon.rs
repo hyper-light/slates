@@ -212,7 +212,7 @@ fn daemon(name: &str) -> (Daemon, String) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{name}"),
+      name: common::fixture_object("slates-seg", name),
     },
   )
   .unwrap();
@@ -220,6 +220,41 @@ fn daemon(name: &str) -> (Daemon, String) {
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
   (daemon, instance)
+}
+
+/// A-254, under A-176 and A-178's rule. Do: start a daemon that creates its own segment (run alone, with no anchor); start a
+/// second daemon for the same instance and segment name. Expect the second refused and the first's segment still there
+/// to attach by its handoff: a refused start leaves a running instance untouched. Before, on macOS, the second start
+/// created its segment before it asked who owned the instance, and that creation and its drop each unlinked the first's
+/// name (`shm_open` `ENOENT` at the attach). Linux's segment has no name, so there the attach holds either way.
+#[test]
+fn a_refused_second_daemon_leaves_the_live_ones_segment_in_place() {
+  let profile = common::machine_profile();
+  let name = format!("second-daemon-{}", std::process::id());
+  let instance = format!("srv-{name}");
+  let start = || {
+    Daemon::start(
+      &profile,
+      DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS)),
+      SegmentSource::Create {
+        name: format!("slates-seg-{name}"),
+      },
+    )
+  };
+  let first = start().unwrap();
+  let second = start();
+  assert!(
+    second.is_err(),
+    "a second daemon of a live instance is refused"
+  );
+  drop(second);
+  let (handoff, len) = first.segment().handoff().unwrap();
+  let attached = slates_anchor::AnchorSegment::attach(&handoff, len, &profile.facts.identity);
+  assert!(
+    attached.is_ok(),
+    "the live daemon's segment is still there: {:?}",
+    attached.err()
+  );
 }
 
 /// §4.8 "Lookup" (found 2026-10-10 by the CLI's anchor flow): a daemon with no other host has nobody to forward a
@@ -290,7 +325,7 @@ fn shard_selection_daemon(name: &str, shards: u16) -> (Daemon, String) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{instance}"),
+      name: common::fixture_object("slates-seg", &instance),
     },
   )
   .unwrap();
@@ -365,7 +400,7 @@ fn status_pages_preserve_a_capture_and_refuse_foreign_or_cancelled_cursors() {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{instance}"),
+      name: common::fixture_object("slates-seg", &instance),
     },
   )
   .unwrap();
@@ -682,7 +717,7 @@ fn fleet_daemon(name: &str, durability: Option<DurabilityBound>) -> (Daemon, Str
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{name}"),
+      name: common::fixture_object("slates-seg", name),
     },
   )
   .unwrap();
@@ -2058,7 +2093,7 @@ fn capped_daemon(name: &str, max_inodes: usize) -> (Daemon, String) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{name}"),
+      name: common::fixture_object("slates-seg", name),
     },
   )
   .unwrap();
@@ -2273,7 +2308,7 @@ fn telemetry_scenario_with_quota(reply_quota: Option<usize>) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-telemetry-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "telemetry"),
     },
   )
   .unwrap();
@@ -3438,7 +3473,7 @@ fn a_metadata_class_bounds_the_volume_records_a_shard_admits() {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-metadata-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "metadata"),
     },
   )
   .unwrap();
@@ -4186,7 +4221,7 @@ fn a_connect_past_the_client_bound_is_refused_typed_at_the_rendezvous() {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-bound-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "bound"),
     },
   )
   .unwrap();
@@ -4234,7 +4269,7 @@ fn bootstrap_is_explicit_and_its_request_cannot_reset_a_replacement() {
       &profile,
       config.clone(),
       SegmentSource::Create {
-        name: format!("slates-seg-{instance}"),
+        name: common::fixture_object("slates-seg", &instance),
       },
     )
     .unwrap()
@@ -4393,7 +4428,7 @@ fn a_contended_wake_tail_does_not_shrink_the_client_seats() {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{instance}"),
+      name: common::fixture_object("slates-seg", &instance),
     },
   )
   .unwrap();

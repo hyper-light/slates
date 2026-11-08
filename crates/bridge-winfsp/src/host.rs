@@ -1039,14 +1039,18 @@ fn op_set_times(
 /// first, and one child, which is enough to refuse.
 const DOTS_AND_ONE_CHILD: usize = 3;
 
-/// Whether `object` may be deleted: a directory refuses `NotEmpty` (`STATUS_DIRECTORY_NOT_EMPTY`) while it has any child,
-/// read from the first few entries of its listing; any other object may.
+/// Whether `object` may be deleted: refused before Windows marks it for deletion when the attachment may not change the
+/// volume (`ReadOnly`, `STATUS_MEDIA_WRITE_PROTECTED`: the delete itself happens at the cleanup, which has no reply, so
+/// a refusal there was silent and `DeleteFile` reported success); a directory refuses `NotEmpty`
+/// (`STATUS_DIRECTORY_NOT_EMPTY`) while it has any child, read from the first few entries of its listing; any other
+/// object may.
 fn op_can_delete(
   bridge: &mut dyn Bridge,
   cx: &OpContext,
   object: ObjectId,
   fh: u64,
 ) -> Result<Reply, VfsError> {
+  bridge.authorize_change(cx)?;
   if !matches!(bridge.getattr(object, cx)?.kind, Kind::Dir) {
     return Ok(Reply::Ok);
   }

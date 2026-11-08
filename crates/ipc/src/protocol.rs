@@ -1261,6 +1261,13 @@ pub struct ShardReport {
   pub live: Vec<LiveReport>,
   /// This shard's partition snapshots against the log they absorb, and the cadence they follow (A-243). Appended.
   pub snapshots: DbSnapshotReport,
+  /// The members this node keeps direct contact with (§4.8: its holders, the consensus voters and staged members, and
+  /// every member while it is a voter itself), this node left out: the peers its probe mesh and record links reach.
+  /// Counted on the control shard only; zero elsewhere and on a laptop. Appended.
+  pub peers_in_contact: u32,
+  /// Of `peers_in_contact`, those with no formed probe session yet: zero once this node's mesh is up
+  /// (`Daemon::fleet_meshed`). Appended.
+  pub peers_unmeshed: u32,
 }
 
 /// A partition's snapshots and their cadence, as `slates status` shows them (A-243).
@@ -1335,8 +1342,9 @@ pub struct FleetReport {
   pub host_epoch: u64,
   /// The members the membership view holds alive, this node among them.
   pub members: Vec<u64>,
-  /// Peers with a formed probe session (the direct mesh), summed over the shards: the mesh is up when
-  /// this reaches the member count less one.
+  /// Peers with a formed probe session (the direct mesh), summed over the shards: the mesh is up when this reaches
+  /// [`FleetReport::peers_in_contact`], not the member count less one, since two members that neither hold for each
+  /// other nor vote keep no direct contact (§4.8).
   pub peers_probed: u32,
   /// Packets the node's serve sockets dropped because their connection id named no live session (a
   /// stale packet, a stray, or a session already closed), summed over the planes.
@@ -1385,6 +1393,11 @@ pub struct FleetReport {
   /// The control shard's failure detector's relay-stage timer: its timeout, and how many relayed answers came late.
   /// Empty on a laptop. Appended.
   pub detector_relays: DetectorRelayReport,
+  /// The members this node keeps direct contact with, this node left out: what [`FleetReport::peers_probed`] reaches
+  /// once the mesh is up. Zero on a laptop. Appended.
+  pub peers_in_contact: u32,
+  /// Of `peers_in_contact`, those with no formed probe session yet: the mesh is up at zero. Appended.
+  pub peers_unmeshed: u32,
 }
 
 impl RequestBody {

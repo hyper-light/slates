@@ -188,7 +188,7 @@ fn a_large_landing_leaves_its_shard_serving_between_its_slices() {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-fairland-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "fairland"),
     },
   )
   .unwrap();
@@ -430,11 +430,7 @@ fn daemon_with_term(term_ns: Option<u64>) -> (Daemon, Client) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!(
-        "slates-seg-renewland-{}-{}",
-        std::process::id(),
-        term_ns.unwrap_or(0)
-      ),
+      name: common::fixture_object("slates-seg", &format!("renewland-{}", term_ns.unwrap_or(0))),
     },
   )
   .unwrap();
@@ -609,7 +605,7 @@ fn an_async_patient_landing_outlasting_the_reply_deadline_is_waited_for() {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-patientland-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "patientland"),
     },
   )
   .unwrap();

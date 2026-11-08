@@ -903,29 +903,7 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
   // A remembered route is only a hint. If this node has learned a different owner or home,
   // refuse before dispatch (and before recording a forwarded completion), so the client can
   // refresh its hint and retry its original request id without a speculative second write.
-  let redirect = crate::state::with_state(|state| {
-    let object = ObjectId(volume.bytes);
-    let local = state.fleet.host();
-    let superseded = state
-      .fleet
-      .object_owner(object)
-      .is_some_and(|owner| owner != local);
-    let redirect = homed_elsewhere(state, volume)
-      .map(|region| (region, "fleet.forward.redirect.homed_elsewhere"))
-      .or_else(|| {
-        superseded.then(|| {
-          (
-            state.node_regions.get(&local).map_or(0, |region| region.0),
-            "fleet.forward.redirect.superseded",
-          )
-        })
-      });
-    if let Some((_, reason)) = redirect {
-      state.count(reason, 1);
-    }
-    redirect.map(|(region, _)| region)
-  })
-  .flatten();
+  let redirect = forward_redirect(volume);
   if let Some(region) = redirect {
     return encode_body(&refused(Refusal::HomedElsewhere { region }));
   }
@@ -958,38 +936,116 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
       crate::daemon::LIVENESS_BUDGET_NS,
     )
     .await;
-    match forwarded {
-      Some((Some(reply), owed)) => {
-        // A change the verb recorded is told to every FUSE mount of its volume before the exchange answers (AC-3.3):
-        // the wait runs on the owner shard, where the mounts are, and is bounded by its own deadline.
-        if let Some(owed) = owed {
-          let _ = crate::xshard::task_in_shard_time(
-            control,
-            shard,
-            move || crate::told::wait(owed),
-            crate::daemon::LIVENESS_BUDGET_NS,
-          )
-          .await;
-        }
-        Some(reply)
-      }
-      // The verb deferred its acceptance to a fleet commit (AUD-11): this exchange waits for the
-      // completion record the commit writes, within the same liveness budget.
-      Some((None, _)) => await_deferred_completion(control, shard, origin_host, id).await,
-      None => None,
-    }
+    answer_forwarded_write(forwarded, (control, shard), origin_host, id).await
   } else {
     // A peer's reap of its dead client (A-222) is the one verb served here that is neither; any other is refused.
     Some(crate::remote_attach::serve_unforwardable(control, shard, origin_host, body).await)
   };
-  encode_body(&not_shared_with(
-    reply.unwrap_or_else(|| refused(Refusal::NotFound)),
-    &requester,
-  ))
+  encode_body(&named_if_unshared(reply, (control, shard), volume, requester).await)
 }
 
-/// A forwarded request's `Forbidden` as the refusal that names its fix (A-237): the requester is another host's
-/// account, which only a share naming (its host, its account) lets in, so the client is told exactly that principal.
+/// The answer to a forwarded write once its verb has run on the owner `shard`: its reply after the mounts its change owes
+/// are told, or, when the verb deferred its acceptance to a fleet commit, the completion that commit records.
+async fn answer_forwarded_write(
+  forwarded: Option<(Option<ReplyBody>, Option<crate::told::Owed>)>,
+  (control, shard): (u16, u16),
+  origin_host: u64,
+  id: RequestId,
+) -> Option<ReplyBody> {
+  match forwarded {
+    Some((Some(reply), owed)) => {
+      // A change the verb recorded is told to every FUSE mount of its volume before the exchange answers (AC-3.3):
+      // the wait runs on the owner shard, where the mounts are, and is bounded by its own deadline.
+      if let Some(owed) = owed {
+        let _ = crate::xshard::task_in_shard_time(
+          control,
+          shard,
+          move || crate::told::wait(owed),
+          crate::daemon::LIVENESS_BUDGET_NS,
+        )
+        .await;
+      }
+      Some(reply)
+    }
+    // The verb deferred its acceptance to a fleet commit (AUD-11): this exchange waits for the
+    // completion record the commit writes, within the same liveness budget.
+    Some((None, _)) => await_deferred_completion(control, shard, origin_host, id).await,
+    None => None,
+  }
+}
+
+/// The region a forward of `volume` should be redirected to, when this node has learned a different owner or home.
+fn forward_redirect(volume: VolumeId) -> Option<u64> {
+  crate::state::with_state(|state| {
+    let object = ObjectId(volume.bytes);
+    let local = state.fleet.host();
+    let superseded = state
+      .fleet
+      .object_owner(object)
+      .is_some_and(|owner| owner != local);
+    let redirect = homed_elsewhere(state, volume)
+      .map(|region| (region, "fleet.forward.redirect.homed_elsewhere"))
+      .or_else(|| {
+        superseded.then(|| {
+          (
+            state.node_regions.get(&local).map_or(0, |region| region.0),
+            "fleet.forward.redirect.superseded",
+          )
+        })
+      });
+    if let Some((_, reason)) = redirect {
+      state.count(reason, 1);
+    }
+    redirect.map(|(region, _)| region)
+  })
+  .flatten()
+}
+
+/// A forwarded `Forbidden` as [`not_shared_with`] when the requester has no rights on `volume` at all, judged on its
+/// owner `shard`, where the record is ([`rights_of`]). A requester that holds rights was refused for something a share
+/// cannot fix (a forward naming another host's attachment), so its `Forbidden` stands. Every other reply as it is; no
+/// reply at all is `NotFound`.
+async fn named_if_unshared(
+  reply: Option<ReplyBody>,
+  (control, shard): (u16, u16),
+  volume: VolumeId,
+  requester: Principal,
+) -> ReplyBody {
+  let reply = reply.unwrap_or_else(|| refused(Refusal::NotFound));
+  if !matches!(
+    reply,
+    ReplyBody::Refused {
+      refusal: Refusal::Forbidden { .. }
+    }
+  ) {
+    return reply;
+  }
+  let judged = requester.clone();
+  let unshared = crate::xshard::call_in_shard_time(
+    control,
+    shard,
+    move |s| {
+      let id = slates_db::catalog::VolumeId {
+        bytes: volume.bytes,
+      };
+      s.db
+        .partition()
+        .volume(id)
+        .is_some_and(|record| rights_of(record, &judged) == Rights::default())
+    },
+    crate::daemon::LIVENESS_BUDGET_NS,
+  )
+  .await
+  .unwrap_or(false);
+  if unshared {
+    not_shared_with(reply, &requester)
+  } else {
+    reply
+  }
+}
+
+/// A forwarded request's `Forbidden` as the refusal that names its fix (A-237), for a requester holding no rights on the
+/// volume ([`named_if_unshared`]): it is another host's account, which only a share naming (its host, its account) lets in, so the client is told exactly that principal.
 /// Every other reply, and a requester with no wire form (a certificate), as it is.
 fn not_shared_with(reply: ReplyBody, requester: &Principal) -> ReplyBody {
   match (reply, to_wire_principal(requester)) {
@@ -1030,7 +1086,7 @@ async fn await_deferred_completion(
         .completion(origin_host, id.client, id.sequence)
       {
         Seen::Completed(bytes) => Some(bytes),
-        Seen::Acknowledged | Seen::New => None,
+        Seen::Acknowledged | Seen::New | Seen::Awaiting { .. } => None,
       },
       crate::daemon::LIVENESS_BUDGET_NS,
     )
@@ -2032,6 +2088,11 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
       );
     }
     Seen::Acknowledged => return Served::Reply(refused(Refusal::DuplicateRequest)),
+    // It ran and waits for its version's commit (A-252): answered, or joined to the wait, never run again.
+    Seen::Awaiting { object, version } => {
+      return crate::merge_service::serve_awaiting(state, origin, id, (object, version))
+        .map_or(Served::Forwarded, Served::Reply);
+    }
     Seen::New => {
       // A retry of a submit whose acceptance still waits for its commit joins the wait: it is answered
       // with the committed result when the version places, never a success from memory. A retry of a
@@ -2453,6 +2514,9 @@ fn run_forwarded(
       );
     }
     Seen::Acknowledged => return Some(refused(Refusal::DuplicateRequest)),
+    Seen::Awaiting { object, version } => {
+      return crate::merge_service::serve_awaiting(state, origin, id, (object, version));
+    }
     Seen::New => {
       // A retry of a submit whose acceptance still waits for its commit joins the wait, as does a retry
       // of a granted landing still running (AUD-29-03).
@@ -3427,6 +3491,16 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     registry_attachments: u64::try_from(state.attachments.live()).unwrap_or(u64::MAX),
     live: crate::live_ship::reports(state),
     snapshots: snapshot_report(state.db.stats()),
+    peers_in_contact: if is_control_shard(state) {
+      peers_in_contact(state).0
+    } else {
+      0
+    },
+    peers_unmeshed: if is_control_shard(state) {
+      peers_in_contact(state).1
+    } else {
+      0
+    },
   }
 }
 
@@ -3526,6 +3600,20 @@ fn group_report(
 /// `FleetNode` advances identically (the control shard hands it each peer state it folds) — with the
 /// formed probe sessions summed over the shards' parts (only the control shard forms any) and the
 /// consensus groups' state taken from the control shard's part (the only live one).
+/// The members this node keeps direct contact with, this node left out (`fleet::keeps_direct_contact_with`), and how
+/// many of them have no formed probe session yet: the probe mesh's peers and what keeps it down. Counted over the
+/// members the membership holds alive (what `fleet_members` reports), not the configuration's members: from the
+/// bootstrap until the others are admitted that list names the bootstrapping node alone, so a forming fleet read none
+/// in contact while it probed every peer
+/// (raft-chaos's and live-fixes' flows on CI, diag-live-fixes-32: `in_contact=0 probed=4` on a forming five-node fleet).
+fn peers_in_contact(state: &ShardState) -> (u32, u32) {
+  let mesh = crate::fleet::probe_mesh(state);
+  (
+    u32::try_from(mesh.in_contact.len()).unwrap_or(u32::MAX),
+    u32::try_from(mesh.unmeshed.len()).unwrap_or(u32::MAX),
+  )
+}
+
 fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
   let configuration = state.fleet.configuration();
   let control = shards.iter().find(|shard| shard.control);
@@ -3593,6 +3681,12 @@ fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
     served_sessions,
     detector_pool,
     detector_relays,
+    peers_in_contact: shards.iter().fold(0u32, |sum, shard| {
+      sum.saturating_add(shard.peers_in_contact)
+    }),
+    peers_unmeshed: shards
+      .iter()
+      .fold(0u32, |sum, shard| sum.saturating_add(shard.peers_unmeshed)),
   }
 }
 
@@ -6536,6 +6630,10 @@ fn submit(
   crate::telemetry::emit(state, verdict.end(accepted, verdict_end));
   match outcome {
     slates_merge::engine::Outcome::Accepted { version } => {
+      // The wait goes first, in this transaction, so a version is never durable without it (A-252).
+      if let Err(e) = crate::merge_service::stage_awaiting(state, green_id, version) {
+        return refused(refusal_of_db(&e));
+      }
       // The pre-check passed and the shard is single-threaded, so this append fits the budget; a
       // segment-full failure refuses like any other verb. A resubmit the engine answered from its
       // idempotent accept names a version the chain already holds: nothing is appended twice.
@@ -12014,12 +12112,24 @@ fn clear_write_log(state: &mut ShardState, captured_every_volume: bool, generati
 /// that cannot be replayed is counted and the run carries on; the file then lacks it, as the record says. A write
 /// refused `PublishNeeded` (the arena's freed blocks wait on a publication, A-64) publishes, puts every record not
 /// yet replayed back in the log under the new image's stamp — the publication cleared the log, and a crash before
-/// the replay ends must still find them — and is tried once more.
+/// the replay ends must still find them — and is tried once more. A logged `FORGET` gives its lookups back in its
+/// place among the writes (GAPS, A-154's sibling): the kernel never resends one, so without it the references a dead
+/// daemon was given back after its last publication stayed counted, and an unlinked file the kernel had let go was
+/// never reclaimed.
 #[cfg(target_os = "linux")]
 fn replay_writes(state: &mut ShardState) -> usize {
   let records = std::mem::take(&mut state.replay);
   let mut replayed: usize = 0;
-  for (index, record) in records.iter().enumerate() {
+  for (index, logged) in records.iter().enumerate() {
+    let record = match logged {
+      crate::write_log::Logged::Write(record) => record,
+      crate::write_log::Logged::Forget(forgotten) => {
+        if replay_forget(state, *forgotten).is_none_or(|given| given.is_err()) {
+          state.count(FORGET_REPLAY_REFUSED, 1);
+        }
+        continue;
+      }
+    };
     let mut written = replay_one(state, record);
     if matches!(written, Some(Err(slates_vfs::VfsError::PublishNeeded))) {
       let _ = publish_shard(state);
@@ -12034,19 +12144,44 @@ fn replay_writes(state: &mut ShardState) -> usize {
   replayed
 }
 
+/// The volume slot whose prefix `inode` carries, when recovery rebuilt it.
+#[cfg(target_os = "linux")]
+fn slot_of_inode(
+  state: &mut ShardState,
+  inode: u64,
+) -> Option<slates_mem::Handle<crate::state::VolumeSlot>> {
+  let prefix = u16::try_from(inode >> slates_vfs::ids::InodeNo::COUNTER_BITS).unwrap_or(u16::MAX);
+  state
+    .volumes
+    .iter()
+    .find(|(_, slot)| slot.volume.prefix() == prefix)
+    .map(|(handle, _)| handle)
+}
+
+/// Gives back one logged `FORGET`'s lookups, as its attachment's own, in the volume its inode names; `None` when no
+/// rebuilt volume has it.
+#[cfg(target_os = "linux")]
+fn replay_forget(
+  state: &mut ShardState,
+  forgotten: crate::write_log::Forgotten,
+) -> Option<Result<(), slates_vfs::VfsError>> {
+  let handle = slot_of_inode(state, forgotten.inode)?;
+  let slot = state.volumes.get_mut(handle).ok()?;
+  Some(slot.volume.forget_for(
+    &mut state.store,
+    slates_vfs::ids::InodeNo(forgotten.inode),
+    slates_vfs::ids::RefOwner::Attachment(forgotten.attachment),
+    forgotten.count,
+  ))
+}
+
 /// Writes one logged record into the volume whose prefix its inode carries; `None` when no rebuilt volume has it.
 #[cfg(target_os = "linux")]
 fn replay_one(
   state: &mut ShardState,
   record: &crate::write_log::Record,
 ) -> Option<Result<usize, slates_vfs::VfsError>> {
-  let prefix =
-    u16::try_from(record.inode >> slates_vfs::ids::InodeNo::COUNTER_BITS).unwrap_or(u16::MAX);
-  let handle = state
-    .volumes
-    .iter()
-    .find(|(_, slot)| slot.volume.prefix() == prefix)
-    .map(|(handle, _)| handle)?;
+  let handle = slot_of_inode(state, record.inode)?;
   let slot = state.volumes.get_mut(handle).ok()?;
   let inode = slates_vfs::ids::InodeNo(record.inode);
   let written = slot
@@ -12063,18 +12198,20 @@ fn replay_one(
 /// replay has not yet applied survive a crash before it ends. A record the log cannot take marks it overflowed
 /// (A-63: the next daemon reports every taken-over file as having lost writes).
 #[cfg(target_os = "linux")]
-fn relog_remaining(state: &mut ShardState, remaining: &[crate::write_log::Record]) {
+fn relog_remaining(state: &mut ShardState, remaining: &[crate::write_log::Logged]) {
   let generation = state.journal.generation();
   let (Some(object), Some(log)) = (state.content.as_mut(), state.write_log.as_mut()) else {
     return;
   };
   let mut kept = log.clear(object, generation).is_ok();
-  for record in remaining {
-    if kept
-      && log
-        .append(object, record.inode, record.offset, &record.bytes)
-        .is_err()
-    {
+  for logged in remaining {
+    let appended = match logged {
+      crate::write_log::Logged::Write(record) => {
+        log.append(object, record.inode, record.offset, &record.bytes)
+      }
+      crate::write_log::Logged::Forget(forgotten) => log.append_forget(object, *forgotten),
+    };
+    if kept && appended.is_err() {
       kept = false;
     }
   }
@@ -12087,6 +12224,11 @@ fn relog_remaining(state: &mut ShardState, remaining: &[crate::write_log::Record
 /// Format: the refusal counter of a logged write recovery could not replay (A-63).
 #[cfg(target_os = "linux")]
 const WRITE_REPLAY_REFUSED: &str = "recovery.write_replay_refused";
+
+/// Format: the refusal counter of a logged `FORGET` recovery could not give back (no rebuilt volume holds its inode,
+/// or the volume refused it).
+#[cfg(target_os = "linux")]
+const FORGET_REPLAY_REFUSED: &str = "recovery.forget_replay_refused";
 
 /// Format: the refusal counter of a volume whose recovered references could not be settled.
 const REFERENCES_UNSETTLED: &str = "recovery.references_unsettled";
@@ -12577,6 +12719,148 @@ mod tests {
       eprintln!(
         "checkpoint: {hosted} volumes hosted, {published} published | best {best_ns} ns ({per:.1} ns/volume)"
       );
+    }
+  }
+
+  /// Measurement (not a gate): what a mutating verb's barrier costs as the one volume a shard hosts grows (§4.3, §4.8).
+  /// The barrier is usually a delta (A-68), whose cost is its changes. Once the deltas since the last checkpoint reach
+  /// the checkpoint's size, or the log has no room, the publish is instead a checkpoint of every volume, in the one
+  /// call. For each shape (`files` files of `bytes` bytes in one volume), this prints:
+  /// - a forced `publish_checkpoint`, best of [`ROUNDS`];
+  /// - the publishes of one 64-byte overwrite each, until one is a checkpoint: their count, their median and worst
+  ///   delta, and the checkpoint publish's own cost.
+  ///
+  /// A publish was a checkpoint when the log's tail is back at its start after it. Wall-clock, best-of-N (BENCHMARKS
+  /// discipline). Run: `cargo test --release -p slates-server --lib a_barriers_cost_against_the_shards_size -- --ignored
+  /// --nocapture`.
+  #[test]
+  #[ignore = "measurement, not a gate; prints a barrier's delta and checkpoint cost vs the shard's files and bytes"]
+  #[allow(clippy::cast_precision_loss)]
+  fn a_barriers_cost_against_the_shards_size() {
+    /// Shape: the best of this many forced checkpoints is reported.
+    const ROUNDS: usize = 3;
+    /// Shape: the overwrite each measured barrier publishes, small against every file.
+    const OVERWRITE: usize = 64;
+    /// Shape: the most overwrites tried before a checkpoint comes; past it, the count is reported as reached.
+    const MOST_WRITES: usize = 400_000;
+    for (files, bytes) in [
+      (1_000usize, 64usize),
+      (1_000, 16_384),
+      (4_000, 64),
+      (4_000, 16_384),
+      (16_000, 64),
+      (16_000, 16_384),
+    ] {
+      let line = crate::daemon::audit_on_shard_configured(
+        move |state| {
+          let principal = Principal::Uid {
+            host: slates_db::HostId(0),
+            uid: 1234,
+          };
+          let limit = u64::try_from(files.saturating_mul(bytes.max(4096)).saturating_mul(2))
+            .unwrap_or(u64::MAX)
+            .saturating_add(64 << 20);
+          let reply = super::dispatch(
+            state,
+            1,
+            &principal,
+            super::RequestBody::Create {
+              name: "sized".to_owned(),
+              size: super::SizeClass::Bounded { limit },
+              names: super::NamePolicy::Exact,
+              require_locked: false,
+              base: None,
+            },
+          );
+          let super::ReplyBody::Created { id } = reply else {
+            panic!("{reply:?}")
+          };
+          let handle = *state.by_id.get(&super::to_db_volume(id)).unwrap();
+          let content = vec![b'a'; bytes];
+          let first = {
+            let super::ShardState { store, volumes, .. } = &mut *state;
+            let slot = volumes.get_mut(handle).unwrap();
+            let root = slot.volume.root_inode(store).unwrap();
+            let mut first = None;
+            for n in 0..files {
+              let file = slot
+                .volume
+                .create_file_no(store, root, &format!("f{n:06}"), 0o644)
+                .unwrap();
+              slot.volume.write(store, file, 0, &content).unwrap();
+              first.get_or_insert(file);
+            }
+            first.unwrap()
+          };
+          super::publish_shard(state).expect("the shard publishes");
+          let mut checkpoint = u64::MAX;
+          for _ in 0..ROUNDS {
+            let t0 = slates_machine::clock::monotonic_ns();
+            super::publish_checkpoint(state).expect("a checkpoint publishes");
+            checkpoint = checkpoint.min(slates_machine::clock::monotonic_ns().saturating_sub(t0));
+          }
+          let tail = |state: &super::ShardState| {
+            state
+              .journal
+              .dead_ranges(usize::MAX, usize::MAX)
+              .map_or(0, |dead| dead.log_past_tail.0)
+          };
+          let mut deltas: Vec<u64> = Vec::new();
+          let mut checkpointed = None;
+          for n in 0..MOST_WRITES {
+            {
+              let super::ShardState { store, volumes, .. } = &mut *state;
+              let slot = volumes.get_mut(handle).unwrap();
+              let fill = [u8::try_from(n % 251).unwrap(); OVERWRITE];
+              slot.volume.write(store, first, 0, &fill).unwrap();
+            }
+            let t0 = slates_machine::clock::monotonic_ns();
+            super::publish_shard(state).expect("the shard publishes");
+            let took = slates_machine::clock::monotonic_ns().saturating_sub(t0);
+            if tail(state) == 0 {
+              checkpointed = Some(took);
+              break;
+            }
+            deltas.push(took);
+          }
+          deltas.sort_unstable();
+          let median = deltas.get(deltas.len() / 2).copied().unwrap_or(0);
+          let worst = deltas.last().copied().unwrap_or(0);
+          format!(
+            "barrier: {files} files of {bytes} B | forced checkpoint best {checkpoint} ns ({:.0} ns/file) | {} deltas \
+             before a checkpoint, median {median} ns, worst {worst} ns | the checkpoint publish {}",
+            checkpoint as f64 / files as f64,
+            deltas.len(),
+            checkpointed.map_or_else(
+              || format!("not reached in {MOST_WRITES}"),
+              |ns| format!("{ns} ns")
+            ),
+          )
+        },
+        move |config| {
+          let cap = files.saturating_add(files / 4).saturating_add(64);
+          config.store.max_inodes = config.store.max_inodes.max(cap);
+          config.store.max_dirs = config.store.max_dirs.max(cap);
+          config.store.max_dir_blocks = config.store.max_dir_blocks.max(cap);
+          config.store.max_chunks = config.store.max_chunks.max(
+            cap
+              .saturating_mul(bytes.div_ceil(4096).max(1))
+              .saturating_mul(2),
+          );
+          let cap64 = u64::try_from(cap).unwrap_or(u64::MAX);
+          config.store.metadata_class_bytes = config
+            .store
+            .metadata_class_bytes
+            .max(cap64.saturating_mul(1 << 12));
+          config.reserve_per_shard = config.reserve_per_shard.max(
+            cap64
+              .saturating_mul(u64::try_from(bytes.max(4096)).unwrap_or(u64::MAX))
+              .saturating_mul(4)
+              .saturating_add(256 << 20),
+          );
+        },
+      );
+      eprintln!("{line}");
     }
   }
 
