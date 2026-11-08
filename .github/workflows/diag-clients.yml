@@ -1,0 +1,66 @@
+name: diag-clients
+
+# Diagnostics only, never on main: the process-level suites A-237 reaches.
+on:
+  push:
+    branches: ["diag-clients-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cross-shard-wait:
+    name: R3 class A on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 330
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Build the tests
+        run: cargo test --locked -p slates-server -p slates-cli --no-run
+      - name: The process-level suites
+        env:
+          SLATES_TEST_CLI: "1"
+        run: |
+          set +e
+          grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+          R=../results.txt
+          echo "runner ${{ matrix.os }}, $(nproc) CPUs, commit $(git rev-parse --short HEAD)" > $R
+          for cmd in "cargo test --locked -q -p slates-server --lib" "cargo test --locked -q -p slates-server --test fleet" "cargo test --locked -q -p slates-cli --test cli --test fs_server -- --test-threads=1" "cargo test --locked -q -p slates-cli --test live_fleet -- --test-threads=1" "cargo test --locked -q -p slates-cli --test live_chaos -- --test-threads=1"; do
+            echo "== $cmd" | tee -a $R
+            $cmd 2>&1 | grep -E 'test result|FAILED|panicked|^    [a-z_:]+$|^error' | cut -c1-400 | tee -a $R
+            echo "== exit ${PIPESTATUS[0]}" | tee -a $R
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/clients-a237fix-1-${{ matrix.os }}"
+          git config user.name "diag-clients"
+          git config user.email "diag-clients@users.noreply.github.com"
+          git stash -q || true
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-clients a237fix-1 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
