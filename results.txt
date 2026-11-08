@@ -1,0 +1,3 @@
+runner macos-latest, 3 CPUs, Sun Nov  8 03:14:42 UTC 2026, head b13ba7c8327deb81f07c226342a661f90dff105f
+spinners: 6
+== round 1 at 03:14:43, load 14.71 12.89 9.63
