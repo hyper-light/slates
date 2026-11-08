@@ -5077,23 +5077,265 @@ fn volume_owned_by(client: &mut Client, partition: usize, tag: &str) -> VolumeId
   panic!("no volume of {PLACEMENT_TRIES} landed on partition {partition}");
 }
 
-/// Shape: how long [`a_silent_forward_gives_up_while_its_session_carries_others`] holds the owner's shard: three
-/// liveness budgets, past a forward's stall budget (one budget plus the path's tail, near zero here).
-const SILENT_OWNER_HOLD: Duration = Duration::from_nanos(3 * LIVENESS_BUDGET_NS);
-/// Shape: how long the other client keeps the session busy inside that hold: all of it but half a budget, so the
-/// counters are read while the silent forward's owner is still held.
-const BUSY_SESSION_FOR: Duration = Duration::from_nanos(5 * LIVENESS_BUDGET_NS / 2);
-/// The owner's shard is held ([`a_silent_forward_gives_up_while_its_session_carries_others`]).
-static SILENT_OWNER_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Shape: how long [`a_silent_owner_leaves_no_forward_the_lane_admitted_unrun`] holds the owner's shard: two
+/// liveness budgets, so every forward sent inside it stays alive on b's control shard (given up at its stall budget,
+/// sent again) as a killed owner's would.
+const ADMITTED_FORWARDS_HOLD: Duration = Duration::from_nanos(2 * LIVENESS_BUDGET_NS);
+/// Shape: the backstop for the burst's replies after the hold: twice the failover SLO. A forward's resend loop is
+/// bounded by the SLO (`resolve_and_forward`) and its last forward by a stall budget, a liveness budget plus the path's
+/// measured tail, which this burst stretches on a 4-core runner. This test holds that nothing is lost, not a latency:
+/// at the SLO plus one budget 76 to 120 replies came in the budget after, and at the SLO plus three 38 to 98 did, none
+/// lost (CI runs 42426714842, 42427500000).
+const ADMITTED_FORWARDS_ANSWERED: Duration =
+  Duration::from_nanos(2 * slates_server::config::FAILOVER_SLO_NS);
+/// The owner's shard is held ([`a_silent_owner_leaves_no_forward_the_lane_admitted_unrun`]).
+static ADMITTED_OWNER_HELD: std::sync::atomic::AtomicBool =
+  std::sync::atomic::AtomicBool::new(false);
+
+/// Every shard's counters on `daemon`, summed by name: the forward's hop counters span the client's shards and the
+/// control shard, so a lost reply is placed by the first sum that falls behind the one before it.
+fn summed_counters(daemon: &Daemon) -> std::collections::BTreeMap<&'static str, u64> {
+  let mut sums = std::collections::BTreeMap::new();
+  for shard in daemon.shards() {
+    let counters = daemon
+      .observation(
+        Some(*shard),
+        slates_server::daemon::OBSERVE_BUDGET_NS,
+        |state: &mut slates_server::state::ShardState| state.refusals.clone(),
+      )
+      .unwrap()
+      .wait()
+      .unwrap();
+    for (name, count) in counters {
+      *sums.entry(name).or_insert(0) += count;
+    }
+  }
+  sums
+}
+
+/// The tasks `daemon`'s control shard has refused at admission so far (`tasks_refused` in `slates status`).
+fn control_tasks_refused(daemon: &Daemon) -> u64 {
+  daemon
+    .observation(
+      Some(daemon.shards()[0]),
+      slates_server::daemon::OBSERVE_BUDGET_NS,
+      |_: &mut slates_server::state::ShardState| {
+        slates_rt::registry::with_current(|context| context.counters().admission_refused)
+          .unwrap_or(0)
+      },
+    )
+    .unwrap()
+    .wait()
+    .unwrap()
+}
+
+/// §4.3 "Task arena full", §4.8 "Lookup", the supervisor's order of 2026-11-07 after fixtures' f = 1 kill rungs: a
+/// lane that admits work its shard's arena cannot run is the defect. b's control shard runs every forward of b's
+/// clients, and its lane admits `clients_per_shard × slots × shards` of them, while its arena was sized for its own
+/// clients with one request each. Do: three nodes, each its own region; on a, a volume on its non-control shard; hold
+/// that shard silent for two liveness budgets, as a killed owner is to b; inside the hold, send through b a full
+/// ring of reads from each of enough clients to put more forwards in flight on b's control shard than its arena held
+/// before (and within its lane's bound). Expect: b's control shard refuses no spawn while they are in flight, and
+/// every read is answered once the hold ends (served, or refused past the failover SLO). Before: the arena refused
+/// the forwards past it.
+#[test]
+fn a_silent_owner_leaves_no_forward_the_lane_admitted_unrun() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let regions: std::collections::BTreeMap<HostId, RegionId> = hosts
+    .iter()
+    .enumerate()
+    .map(|(index, host)| (*host, RegionId(u64::try_from(index).unwrap())))
+    .collect();
+  let daemons = start_mesh_with(
+    nodes,
+    &hosts,
+    &certs,
+    &serve,
+    1,
+    2,
+    &regions,
+    &std::collections::BTreeMap::new(),
+  );
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let config = daemons[1].config();
+  let slots = usize::try_from(config.region.slots).unwrap();
+  let shards = daemons[1].shards().len();
+  // Every shard's arena before the change, the control shard's too.
+  let arena_before = config.runtime.tasks_per_shard;
+  let lane = config.clients_per_shard * slots * shards;
+  // Enough clients, each with a full ring, to hold twice the arena the control shard had before in flight (the burst
+  // is sent over some milliseconds, and the first run at one ring past the arena never filled it: refused 0), within
+  // the lane's bound and within the clients b seats.
+  let wanted = (2 * arena_before).div_ceil(slots);
+  let clients = wanted.min(config.clients_per_shard * shards);
+  eprintln!(
+    "b: clients_per_shard {} slots {slots} shards {shards} tasks_per_shard {} lane bound {lane}; {clients} clients \
+     x {slots} forwards",
+    config.clients_per_shard, config.runtime.tasks_per_shard
+  );
+  assert!(
+    clients * slots > arena_before && clients * slots <= lane,
+    "the burst ({clients} x {slots}) passes the old arena ({arena_before}) within the lane ({lane})"
+  );
+  let mut client_a = Client::connect(daemons[0].instance());
+  let volume = volume_owned_by(&mut client_a, 1, "admitted");
+  let mut routing = Client::connect(daemons[1].instance());
+  let (routed, last) = poll_status_served(&daemons, &mut routing, volume, COUNCIL_RETIRE_DEADLINE);
+  let read = RequestBody::Status { volume };
+  let mut burst: Vec<Client> = (0..clients)
+    .map(|_| Client::connect(daemons[1].instance()))
+    .collect();
+  let refused_before = control_tasks_refused(&daemons[1]);
+  let measured = routed.then(|| {
+    ADMITTED_OWNER_HELD.store(false, std::sync::atomic::Ordering::Release);
+    let hold = daemons[0]
+      .observation(
+        Some(daemons[0].shards()[1]),
+        slates_server::daemon::OBSERVE_BUDGET_NS,
+        |_: &mut slates_server::state::ShardState| {
+          ADMITTED_OWNER_HELD.store(true, std::sync::atomic::Ordering::Release);
+          #[allow(clippy::disallowed_methods)]
+          std::thread::sleep(ADMITTED_FORWARDS_HOLD);
+        },
+      )
+      .unwrap();
+    let holder = std::thread::spawn(move || hold.wait());
+    let began = Instant::now();
+    while !ADMITTED_OWNER_HELD.load(std::sync::atomic::Ordering::Acquire) {
+      assert!(began.elapsed() < ADMITTED_FORWARDS_HOLD, "the hold began");
+      std::thread::yield_now();
+    }
+    for client in &mut burst {
+      client.send_burst(&read, slots);
+    }
+    holder.join().unwrap().unwrap();
+    let tagged: Vec<Vec<(u32, ReplyBody)>> = burst
+      .iter_mut()
+      .map(|client| client.collect_tagged(slots, ADMITTED_FORWARDS_ANSWERED))
+      .collect();
+    // Where a missing reply is: each short client's missing sequences, any that arrive in a further budget (late past
+    // the bound, counted apart), and the replies each of b's shards still holds unwritten.
+    let mut missing = Vec::new();
+    let mut late = 0usize;
+    for (client, replies) in burst.iter_mut().zip(&tagged) {
+      let answered: std::collections::BTreeSet<u32> = replies.iter().map(|(sequence, _)| *sequence).collect();
+      let lost: Vec<u32> = client.last_sequences(slots).difference(&answered).copied().collect();
+      if !lost.is_empty() {
+        late += client.collect_tagged(lost.len(), Duration::from_nanos(LIVENESS_BUDGET_NS)).len();
+        missing.push((client.client, lost));
+      }
+    }
+    let held: Vec<(usize, usize)> = daemons[1]
+      .shards()
+      .iter()
+      .map(|shard| {
+        daemons[1]
+          .observation(
+            Some(*shard),
+            slates_server::daemon::OBSERVE_BUDGET_NS,
+            |state: &mut slates_server::state::ShardState| {
+              (state.deferred.len(), state.pending_forwards.len())
+            },
+          )
+          .unwrap()
+          .wait()
+          .unwrap()
+      })
+      .collect();
+    if !missing.is_empty() {
+      eprintln!(
+        "missing replies: {} clients short, {late} arrived in a further budget; first: {:?}; b's shards (deferred, \
+         pending forwards): {held:?}",
+        missing.len(),
+        missing.iter().take(6).collect::<Vec<_>>()
+      );
+    }
+    let replies: Vec<Vec<ReplyBody>> = tagged
+      .into_iter()
+      .map(|replies| replies.into_iter().map(|(_, reply)| reply).collect())
+      .collect();
+    // Read once the burst is answered: a full arena would refuse the observation's own task.
+    let refused_during = control_tasks_refused(&daemons[1]) - refused_before;
+    let hops: std::collections::BTreeMap<&'static str, u64> = summed_counters(&daemons[1])
+      .into_iter()
+      .filter(|(name, _)| {
+        name.starts_with("fleet.forward")
+          || name.starts_with("xshard")
+          || name.starts_with("reply.")
+          || name.starts_with("fleet.owner_location")
+      })
+      .collect();
+    (refused_during, replies, hops)
+  });
+  for daemon in daemons {
+    daemon.stop();
+  }
+  let (refused_during, replies, hops) = measured
+    .unwrap_or_else(|| panic!("b routed the read to a before the hold (last reply: {last:?})"));
+  let answered: usize = replies.iter().map(Vec::len).sum();
+  let served = replies
+    .iter()
+    .flatten()
+    .filter(|reply| matches!(reply, ReplyBody::Status { .. }))
+    .count();
+  let overloaded = replies
+    .iter()
+    .flatten()
+    .filter(|reply| {
+      matches!(
+        reply,
+        ReplyBody::Refused {
+          refusal: Refusal::Overloaded { .. }
+        }
+      )
+    })
+    .count();
+  eprintln!(
+    "{answered} of {} answered: {served} served, {overloaded} Overloaded; control tasks refused {refused_during}",
+    clients * slots
+  );
+  assert_eq!(
+    refused_during,
+    0,
+    "b's control shard refused no forward its lane admitted ({} in flight, {answered} answered, {served} served, \
+     {overloaded} Overloaded); b's hop counters summed over its shards: {hops:?}",
+    clients * slots
+  );
+  assert_eq!(
+    answered,
+    clients * slots,
+    "every read is answered; b's hop counters summed over its shards: {hops:?}"
+  );
+}
+
+/// Shape: how long [`a_silent_forward_gives_up_while_its_session_carries_others`] keeps the silent volume's forwards
+/// unanswered: two and a half liveness budgets, past a forward's stall budget (one budget plus the path's tail, near
+/// zero here) twice over.
+const SILENCE_FOR: Duration = Duration::from_nanos(5 * LIVENESS_BUDGET_NS / 2);
+/// Shape: how long the silent read may take once its silence is lifted: a resend's round, within a liveness budget.
+const SILENT_READ_AFTER: u64 = LIVENESS_BUDGET_NS;
 
 /// §4.8 "Lookup", the forward lane's stall budget, found by fixtures' 1,000-client primary-kill rung (2026-11-07): 298
 /// forwards an owner never answered stayed open in the lane for good, neither done nor given up, because the session
 /// kept carrying other replies, and progress was any byte the session consumed. Do: three nodes, each its own region;
-/// on a, a volume `silent` on its non-control shard and `busy` on its control shard; route b's two clients to them.
-/// Hold a's non-control shard for three liveness budgets; inside it, read `silent` through the first client and read
-/// `busy` over and over through the second, so b's session to a keeps carrying replies. Expect: before the hold ends,
-/// b's lane has given up at least one forwarder (`fleet.forward.batch_given_up`), so the read on the held shard is
-/// sent again and, after the hold, served. Before: none given up while the session was busy.
+/// on a, volumes `silent` and `busy`; route b's two clients to them. Make a leave `silent`'s forwarded verbs unanswered
+/// (`inject_forward_silence`); read `silent` through the first client and read `busy` over and over through the
+/// second for two and a half liveness budgets, so b's session to a keeps carrying replies; then lift the silence.
+/// Expect: inside the silence b's lane gave up at least one forwarder (`fleet.forward.batch_given_up`), and once it is
+/// lifted the silent read, sent again, is served. Before: none given up while the session was busy. (A first form held
+/// a's owner shard instead, and a answered the held verb with a refusal at its own cross-shard budget, so the forward
+/// was never silent: red with the fix and without.)
 #[test]
 fn a_silent_forward_gives_up_while_its_session_carries_others() {
   let _serial = serialize_fleet_tests();
@@ -5138,32 +5380,17 @@ fn a_silent_forward_gives_up_while_its_session_carries_others() {
   let (busy_routed, busy_last) =
     poll_status_served(&daemons, &mut busy_client, busy, COUNCIL_RETIRE_DEADLINE);
   let measured = (silent_routed && busy_routed).then(|| {
-    SILENT_OWNER_HELD.store(false, std::sync::atomic::Ordering::Release);
-    let hold = daemons[0]
-      .observation(
-        Some(daemons[0].shards()[1]),
-        slates_server::daemon::OBSERVE_BUDGET_NS,
-        |_: &mut slates_server::state::ShardState| {
-          SILENT_OWNER_HELD.store(true, std::sync::atomic::Ordering::Release);
-          // The held shard's thread runs nothing else for the hold: the read of `silent` waits there.
-          #[allow(clippy::disallowed_methods)]
-          std::thread::sleep(SILENT_OWNER_HOLD);
-        },
-      )
-      .unwrap();
-    let holder = std::thread::spawn(move || hold.wait());
-    let began = Instant::now();
-    while !SILENT_OWNER_HELD.load(std::sync::atomic::Ordering::Acquire) {
-      assert!(began.elapsed() < SILENT_OWNER_HOLD, "the hold began");
-      std::thread::yield_now();
-    }
+    daemons[0].inject_forward_silence(Some(silent)).unwrap();
     let silent_read = std::thread::spawn(move || {
-      let reply = silent_client.call(&RequestBody::Status { volume: silent });
+      let reply = silent_client.try_call(
+        &RequestBody::Status { volume: silent },
+        u64::try_from(SILENCE_FOR.as_nanos()).unwrap() + SILENT_READ_AFTER + LIVENESS_BUDGET_NS,
+      );
       (reply, silent_client)
     });
     let busy_began = Instant::now();
     let mut busy_served = 0u64;
-    while busy_began.elapsed() < BUSY_SESSION_FOR {
+    while busy_began.elapsed() < SILENCE_FOR {
       if matches!(
         busy_client.call(&RequestBody::Status { volume: busy }),
         ReplyBody::Status { .. }
@@ -5172,8 +5399,8 @@ fn a_silent_forward_gives_up_while_its_session_carries_others() {
       }
     }
     let during = daemons[1].fleet_refusals();
+    daemons[0].inject_forward_silence(None).unwrap();
     let (silent_reply, _) = silent_read.join().unwrap();
-    holder.join().unwrap().unwrap();
     (busy_served, during, silent_reply)
   });
   for daemon in daemons {
@@ -5181,7 +5408,7 @@ fn a_silent_forward_gives_up_while_its_session_carries_others() {
   }
   let (busy_served, during, silent_reply) = measured.unwrap_or_else(|| {
     panic!(
-      "b routed both reads to a before the hold (last replies: {silent_last:?}, {busy_last:?})"
+      "b routed both reads to a before the silence (last replies: {silent_last:?}, {busy_last:?})"
     )
   });
   let given_up = during
@@ -5195,7 +5422,7 @@ fn a_silent_forward_gives_up_while_its_session_carries_others() {
     .unwrap_or(0);
   assert!(
     busy_served > 0,
-    "the session carried other replies through the hold"
+    "the session carried other replies through the silence"
   );
   assert!(
     given_up >= 1,
@@ -5203,8 +5430,8 @@ fn a_silent_forward_gives_up_while_its_session_carries_others() {
      other replies: batch_given_up {given_up}; b's counters {during:?}"
   );
   assert!(
-    matches!(silent_reply, ReplyBody::Status { .. }),
-    "the silent read, sent again, is served once the hold ends: {silent_reply:?}"
+    matches!(silent_reply, Ok(ReplyBody::Status { .. })),
+    "the silent read, sent again, is served once the silence is lifted: {silent_reply:?}"
   );
 }
 
@@ -7147,6 +7374,87 @@ impl Client {
     self.end.send(&slot)?;
     let reply = self.end.wait(Some(deadline_ns))?;
     Ok(unpack(self.end.region(), reply.kind, &reply.payload).unwrap())
+  }
+
+  /// Sends `count` requests of `body` under new ids without waiting for any reply, as an async client holds a ring of
+  /// them in flight; a full request ring is waited out within `CREDIT_WAIT`. Their replies are read with
+  /// [`collect`](Self::collect).
+  fn send_burst(&mut self, body: &RequestBody, count: usize) {
+    for _ in 0..count {
+      self.sequence += 1;
+      let id = RequestId {
+        client: self.client,
+        sequence: self.sequence,
+      };
+      let index = self.end.next_request_index();
+      let slot = pack(
+        self.end.region_mut(),
+        Direction::Request,
+        index,
+        id.word(),
+        body,
+      )
+      .unwrap();
+      let started = Instant::now();
+      loop {
+        match self.end.send(&slot) {
+          Ok(()) => break,
+          Err(IpcError::RingFull) if started.elapsed() < CREDIT_WAIT => std::thread::yield_now(),
+          Err(e) => panic!("a burst's send: {e}"),
+        }
+      }
+    }
+  }
+
+  /// The sequences of this client's last `count` requests (a burst's).
+  fn last_sequences(&self, count: usize) -> std::collections::BTreeSet<u32> {
+    let first = self.sequence + 1 - u32::try_from(count).unwrap();
+    (first..=self.sequence).collect()
+  }
+
+  /// Reads `count` replies, waiting at most `deadline` for all of them: the replies that came, in arrival order, with
+  /// the sequence each answers.
+  fn collect_tagged(&mut self, count: usize, deadline: Duration) -> Vec<(u32, ReplyBody)> {
+    let started = Instant::now();
+    let mut replies = Vec::with_capacity(count);
+    while replies.len() < count {
+      let left = deadline.saturating_sub(started.elapsed());
+      if left.is_zero() {
+        break;
+      }
+      let Ok(reply) = self
+        .end
+        .wait(Some(u64::try_from(left.as_nanos()).unwrap_or(u64::MAX)))
+      else {
+        break;
+      };
+      let sequence = RequestId::from_word(reply.request).sequence;
+      replies.push((
+        sequence,
+        unpack(self.end.region(), reply.kind, &reply.payload).unwrap(),
+      ));
+    }
+    replies
+  }
+
+  /// Reads `count` replies, waiting at most `deadline` for all of them: the replies that came, in arrival order.
+  fn collect(&mut self, count: usize, deadline: Duration) -> Vec<ReplyBody> {
+    let started = Instant::now();
+    let mut replies = Vec::with_capacity(count);
+    while replies.len() < count {
+      let left = deadline.saturating_sub(started.elapsed());
+      if left.is_zero() {
+        break;
+      }
+      let Ok(reply) = self
+        .end
+        .wait(Some(u64::try_from(left.as_nanos()).unwrap_or(u64::MAX)))
+      else {
+        break;
+      };
+      replies.push(unpack(self.end.region(), reply.kind, &reply.payload).unwrap());
+    }
+    replies
   }
 
   /// Discards every reply already in the ring (the late reply to a [`try_call`](Self::try_call) that
