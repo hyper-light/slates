@@ -12949,6 +12949,7 @@ fn check_resent_after_restart(seen: ResentAfterRestart) {
 
 /// The restart cases of A-252. `before_lift`: the client resends while the holders still withhold the version's record
 /// and is held to no answer and no second version until they lift it; else the fault is lifted first.
+#[allow(clippy::cognitive_complexity)]
 fn submit_resent_after_its_owner_restarted(before_lift: bool) {
   let _serial = serialize_fleet_tests();
   let pid = std::process::id();
@@ -13474,6 +13475,7 @@ fn resend_while_refused_retryable(
 /// the dead owner and is not taken over, and completion records stay where their calls were served (A-127), so today
 /// it is refused `OwnerUnreachable`: exactly-once holds, and the client's outcome is unknown until it reads the green.
 #[test]
+#[allow(clippy::cognitive_complexity)]
 fn a_submit_resent_after_its_owner_was_taken_over_is_not_applied_again() {
   let _serial = serialize_fleet_tests();
   let names = ["a", "b", "c"];

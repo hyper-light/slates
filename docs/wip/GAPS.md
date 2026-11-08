@@ -9,19 +9,15 @@
 > now it commits, and the test ends in 3.3 s. Record:
 > `docs/bugs/2026-11-07-a-version-appended-before-its-owner-restarted-never-committed.md`.
 
-> **Open (fixtures, 2026-11-08; A-252 reserved): a submit resent after its owner's restart is applied a second time.**
-> A-246 commits the versions appended before the crash, and its test checked their placement, not the retry's answer.
-> The primary-kill rung (adacachy, 1,000 clients, `f = 1`, on loadtest-scale's 2ae4e832 with fixtures' b38a9d66) no
-> longer stalls (15.1 s, 3,000 accepted, 32 reconnects), but its oracle found 4,261 failures of one shape: the accepted
-> versions run 1 to 1,124 and then jump to 1,208, versions 1,125 to 1,207 are on the green with no submit to explain
-> them, and 83 clients were told acceptance at 1,208 and up. A submit's completion record is written only when its
-> version commits (AUD-11), and the waiting submit lived in memory, so after the restart its resend under the same
-> request id found no completion (`Seen::New`) and ran again against the restored journal, as a new version. That
-> breaks "a retry under its own id meets its original answer". The earlier primary kill on main e86fb417 with A-244
-> (1,770 failures) had the same shape, so A-246 did not introduce it. Owed, test first: the accept records, in the same
-> log entry as the version's append, that the request awaits version N, so a resend after a restart rejoins that wait
-> and is answered `Submitted { version: N }`, never run again. Log: adacachy
-> `~/.cache/slates-agents-scratch/fixtures/rungs10/r1k-kill0.{log,stall,samples}`.
+> **A submit resent after its owner's restart was applied a second time: fixed (2026-11-08, §4.16 "Commit", §4.9; A-252).**
+> The waiting submit lived in memory, so after a restart its resend under the same id found no completion and ran
+> again as a new version: 4,261 oracle failures on fixtures' 1,000-client primary kill, 83 versions no client was told.
+> The accept now records, in the same transaction as the version's append, a typed `Seen::Awaiting` (`Op::CompletionAwaiting`,
+> carried through snapshots), so a resend joins the wait or is answered its version, never run again. The rung after it:
+> five runs, oracle 0, 13.1 to 13.9 s. Owed: after a takeover the resend is refused `OwnerUnreachable` (nothing runs
+> twice), since a dead owner's work is not taken over and its records stay where they were served (A-127); naming the
+> version there would need the merge record to carry the request's key.
+> `docs/bugs/2026-11-08-a-submit-resent-after-its-owner-restarted-was-applied-twice.md`.
 
 > **A version commits in one exchange, and retention no longer decodes the whole ledger per put: fixed (2026-11-07, §4.16
 > Commit, §4.10 retention; A-244).** A-235 left five hops a version (the inputs' offer
