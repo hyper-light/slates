@@ -2515,6 +2515,10 @@ pub(crate) async fn ask_reports(
 ) -> Vec<(HostId, Vec<u8>)> {
   let sessions =
     crate::fleet::take_sessions("fleet.lent_to.live_takeover", |host| others.contains(&host));
+  let asked = u64::try_from(sessions.len()).unwrap_or(u64::MAX);
+  let without = u64::try_from(others.len())
+    .unwrap_or(u64::MAX)
+    .saturating_sub(asked);
   let request = slates_db::live::Report { object, epoch }.encode();
   let exchanged = slates_cluster::live::exchange(
     (slates_cluster::live::LIVE_STATE_STREAM, &request),
@@ -2523,6 +2527,20 @@ pub(crate) async fn ask_reports(
     |_, _| false,
   )
   .await;
+  // DIAG (never for main): what each of phase one's questions came to, so its misses per takeover are counted.
+  let answered = u64::try_from(exchanged.replies.len()).unwrap_or(u64::MAX);
+  let unanswered = u64::try_from(exchanged.unanswered.len()).unwrap_or(u64::MAX);
+  let _ = state::with_state(|s| {
+    s.count("diag.phase_one.rounds", 1);
+    s.count("diag.phase_one.asked", asked);
+    s.count("diag.phase_one.no_session", without);
+    s.count("diag.phase_one.answered", answered);
+    s.count("diag.phase_one.unanswered", unanswered);
+    s.count(
+      "diag.phase_one.straggled",
+      asked.saturating_sub(answered).saturating_sub(unanswered),
+    );
+  });
   let (replies, stragglers) = settle_sessions(exchanged);
   settle_stragglers(
     state::with_state(|s| s.shard).unwrap_or_default(),

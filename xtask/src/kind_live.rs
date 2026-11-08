@@ -250,6 +250,23 @@ fn profile(lane: &Lane, name: &str, shaping: Option<&Shaping>) -> Result<String,
       }
     }
   }
+  // DIAG (never for main): phase one's questions and waits on every survivor, after a takeover that succeeded too.
+  for survivor in &survivors {
+    if let Ok(status) = lane.kubectl(&["exec", survivor, "--", "/slates", "status"]) {
+      let counts: Vec<&str> = status
+        .stdout
+        .lines()
+        .filter(|line| {
+          line.contains("diag.phase_one.") || line.contains("fleet.live.takeover_waits")
+        })
+        .map(str::trim)
+        .collect();
+      eprintln!(
+        "kind live: {name}: phase one on {survivor}: {}",
+        counts.join("; ")
+      );
+    }
+  }
   Ok(format!(
     "{name}: {wrote}; converged {converged}; {} heads seen, one identity each; owner read back {on_owner}; taken over \
      by {successor} after {:.1} s, epoch {epoch}, read back {on_successor}",
@@ -576,6 +593,7 @@ fn diagnose_pod(lane: &Lane, each: &str) {
         .lines()
         .filter(|line| {
           line.contains(" live ")
+            || line.contains("diag.phase_one.")
             || line.contains("fleet.live.")
             || line.contains("fleet.takeover")
             || line.contains("fleet.materialize")
