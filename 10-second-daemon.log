@@ -1,0 +1,263 @@
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded bitflags v2.13.1
+  Downloaded cmake v0.1.58
+  Downloaded constant_time_eq v0.4.2
+  Downloaded getrandom v0.4.3
+  Downloaded cfg-if v1.0.4
+  Downloaded cpufeatures v0.3.1
+  Downloaded quote v1.0.47
+  Downloaded arrayvec v0.7.8
+  Downloaded memmap2 v0.9.11
+  Downloaded serde_derive v1.0.229
+  Downloaded unicode-normalization v0.1.25
+  Downloaded jobserver v0.1.35
+  Downloaded memchr v2.8.3
+  Downloaded dunce v1.0.5
+  Downloaded rustc_version v0.4.1
+  Downloaded deranged v0.5.8
+  Downloaded rcgen v0.13.2
+  Downloaded rustls-webpki v0.103.15
+  Downloaded proc-macro2 v1.0.107
+  Downloaded find-msvc-tools v0.1.12
+  Downloaded crc32c v0.6.8
+  Downloaded thiserror v2.0.21
+  Downloaded powerfmt v0.2.0
+  Downloaded time v0.3.55
+  Downloaded semver v1.0.28
+  Downloaded itoa v1.0.18
+  Downloaded serde_core v1.0.229
+  Downloaded unicode-ident v1.0.24
+  Downloaded yasna v0.5.2
+  Downloaded fs_extra v1.3.0
+  Downloaded subtle v2.6.1
+  Downloaded untrusted v0.9.0
+  Downloaded pkg-config v0.3.34
+  Downloaded rustls-pki-types v1.15.1
+  Downloaded time-core v0.1.9
+  Downloaded tinyvec v1.13.2
+  Downloaded zmij v1.0.23
+  Downloaded syn v2.0.119
+  Downloaded getrandom v0.2.17
+  Downloaded windows-targets v0.53.5
+  Downloaded once_cell v1.21.4
+  Downloaded zstd v0.13.3
+  Downloaded lz4_flex v0.11.6
+  Downloaded rustix v1.1.4
+  Downloaded windows_x86_64_msvc v0.53.1
+  Downloaded errno v0.3.14
+  Downloaded blake3 v1.8.7
+  Downloaded windows-link v0.2.1
+  Downloaded serde v1.0.229
+  Downloaded tinyvec_macros v0.1.1
+  Downloaded zeroize v1.9.0
+  Downloaded shlex v2.0.1
+  Downloaded thiserror-impl v2.0.21
+  Downloaded num-conv v0.2.2
+  Downloaded cc v1.4.5
+  Downloaded serde_json v1.0.151
+  Downloaded twox-hash v2.1.4
+  Downloaded syn v3.0.5
+  Downloaded zstd-safe v7.3.0
+  Downloaded zstd-sys v2.1.0+zstd.1.5.7
+  Downloaded ring v0.17.14
+  Downloaded rustls v0.23.44
+  Downloaded windows-sys v0.61.2
+  Downloaded windows-sys v0.60.2
+   Compiling cfg-if v1.0.4
+   Compiling getrandom v0.4.3
+   Compiling find-msvc-tools v0.1.12
+   Compiling shlex v2.0.1
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling pkg-config v0.3.34
+   Compiling windows_x86_64_msvc v0.53.1
+   Compiling serde_core v1.0.229
+   Compiling zstd-safe v7.3.0
+   Compiling jobserver v0.1.35
+   Compiling windows-targets v0.53.5
+   Compiling constant_time_eq v0.4.2
+   Compiling cc v1.4.5
+   Compiling arrayvec v0.7.8
+   Compiling zmij v1.0.23
+   Compiling cpufeatures v0.3.1
+   Compiling syn v3.0.5
+   Compiling windows-sys v0.60.2
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+   Compiling blake3 v1.8.7
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling twox-hash v2.1.4
+   Compiling lz4_flex v0.11.6
+   Compiling serde_derive v1.0.229
+   Compiling memchr v2.8.3
+   Compiling itoa v1.0.18
+   Compiling memmap2 v0.9.11
+   Compiling syn v2.0.119
+   Compiling cmake v0.1.58
+   Compiling dunce v1.0.5
+   Compiling fs_extra v1.3.0
+   Compiling aws-lc-sys v0.45.0 (D:\a\slates\slates\vendor\aws-lc-sys)
+   Compiling aws-lc-rs v1.18.1 (D:\a\slates\slates\vendor\aws-lc-rs)
+   Compiling zeroize v1.9.0
+   Compiling tinyvec_macros v0.1.1
+   Compiling tinyvec v1.13.2
+   Compiling unicode-normalization v0.1.25
+   Compiling slates-image v0.1.0 (D:\a\slates\slates\crates\image)
+   Compiling zstd v0.13.3
+   Compiling slates-machine v0.1.0 (D:\a\slates\slates\crates\machine)
+   Compiling slates-wire-derive v0.1.0 (D:\a\slates\slates\crates\wire-derive)
+   Compiling slates-archive v0.1.0 (D:\a\slates\slates\crates\archive)
+   Compiling slates-mem v0.1.0 (D:\a\slates\slates\crates\mem)
+   Compiling slates-wire v0.1.0 (D:\a\slates\slates\crates\wire)
+   Compiling slates-rt v0.1.0 (D:\a\slates\slates\crates\rt)
+   Compiling semver v1.0.28
+   Compiling slates-ipc v0.1.0 (D:\a\slates\slates\crates\ipc)
+   Compiling slates-vfs v0.1.0 (D:\a\slates\slates\crates\vfs)
+   Compiling slates-anchor v0.1.0 (D:\a\slates\slates\crates\anchor)
+   Compiling slates-db v0.1.0 (D:\a\slates\slates\crates\db)
+   Compiling rustc_version v0.4.1
+   Compiling rustls-pki-types v1.15.1
+   Compiling crc32c v0.6.8
+   Compiling rustix v1.1.4
+   Compiling untrusted v0.9.0
+   Compiling rustls v0.23.44
+   Compiling thiserror v2.0.21
+   Compiling slates-bridge-core v0.1.0 (D:\a\slates\slates\crates\bridge-core)
+   Compiling errno v0.3.14
+   Compiling thiserror-impl v2.0.21
+   Compiling once_cell v1.21.4
+   Compiling bitflags v2.13.1
+   Compiling windows-link v0.2.1
+   Compiling subtle v2.6.1
+   Compiling windows-sys v0.61.2
+   Compiling slates-base v0.1.0 (D:\a\slates\slates\crates\base)
+   Compiling hyper-timing v0.1.0 (D:\a\slates\slates\vendor\hyper-raft\hyper-timing)
+   Compiling hyper-swim v0.1.0 (D:\a\slates\slates\vendor\hyper-raft\hyper-swim)
+   Compiling num-conv v0.2.2
+   Compiling time-core v0.1.9
+   Compiling deranged v0.5.8
+   Compiling powerfmt v0.2.0
+   Compiling slates-land v0.1.0 (D:\a\slates\slates\crates\land)
+   Compiling time v0.3.55
+   Compiling slates-bridge-fuse v0.1.0 (D:\a\slates\slates\crates\bridge-fuse)
+   Compiling slates-bridge-nfs v0.1.0 (D:\a\slates\slates\crates\bridge-nfs)
+   Compiling slates-bridge-winfsp v0.1.0 (D:\a\slates\slates\crates\bridge-winfsp)
+   Compiling slates-client v0.1.0 (D:\a\slates\slates\crates\client)
+   Compiling slates-merge v0.1.0 (D:\a\slates\slates\crates\merge)
+   Compiling yasna v0.5.2
+   Compiling slates-guest-probe v0.1.0 (D:\a\slates\slates\crates\guest-probe)
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_PREBUILT_NASM': '0'
+warning: aws-lc-sys@0.45.0: Value: 0 is false.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-pc-windows-msvc'
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' failed - Err(Error { kind: ToolExecError, message: "command did not execute successfully (status code exit code: 2): \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Tools\\\\MSVC\\\\14.51.36231\\\\bin\\\\HostX64\\\\x64\\\\cl.exe\" \"-nologo\" \"-MD\" \"-Z7\" \"-Brepro\" \"-WX\" \"-W4\" \"-FoD:\\\\a\\\\slates\\\\slates\\\\target\\\\debug\\\\build\\\\aws-lc-sys-0bf3c6c5352b74c6\\\\out\\\\out-stdalign_check\\\\e1bacabfea35bee3-stdalign_check.o\" \"-c\" \"D:\\\\a\\\\slates\\\\slates\\\\vendor\\\\aws-lc-sys\\\\aws-lc\\\\tests\\\\compiler_features_tests\\\\stdalign_check.c\"" }).
+   Compiling rustls-webpki v0.103.15
+   Compiling hyper-datagram v0.1.0 (D:\a\slates\slates\vendor\hyper-raft\hyper-datagram)
+   Compiling hyper-seal v0.1.0 (D:\a\slates\slates\vendor\hyper-raft\hyper-seal)
+   Compiling slates-mcp v0.1.0 (D:\a\slates\slates\crates\mcp)
+   Compiling rcgen v0.13.2
+   Compiling slates-transport v0.1.0 (D:\a\slates\slates\crates\transport)
+   Compiling slates-cluster v0.1.0 (D:\a\slates\slates\crates\cluster)
+   Compiling slates-server v0.1.0 (D:\a\slates\slates\crates\server)
+   Compiling slates-cli v0.1.0 (D:\a\slates\slates\crates\cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 40s
+     Running tests\winfsp.rs (target\debug\deps\winfsp-911e0a4854f0b270.exe)
+
+running 1 test
+test a_second_daemon_cannot_take_an_instance_with_a_live_winfsp_drive ... slates anchor: instance wfsecond5688 up; daemon pid 2408; 2 shards
+slates anchor: issuer surface: export SLATES_ANCHOR=slates-seg-wfsecond5688 SLATES_ANCHOR_LEN=12880842752 SLATES_ANCHOR_CONTENT=slates-con-wfsecond5688 SLATES_ANCHOR_CONTENT_LEN=24330502144
+slates anchor: a daemon's beat is lapsed once older than the 1000 ms liveness window plus this anchor's own measured lateness p99, over its last 100 timed waits
+slates anchor: a starting daemon is killed once it makes no CPU progress for the 1000 ms liveness window, or runs that much CPU without its first beat, in its own CPU time (read from the OS)
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 17174360064: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 2862393344: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 1413120: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 715598336: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 2129756: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 988: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 715598336: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 1431196672: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 1117: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 3767451720: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 1861: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: page_fault_ns = 598: the profile's measured base-page fault cost (at least one) (anchors ["faults.base_ns"])
+slates daemon: prefault_reserve_bytes = min(the shard's last write burst, reserve_per_shard = 2862393344, the arena's free bytes): the free content pages an idle shard keeps pre-faulted; the burst is measured at each idle tick (anchors ["reserve_per_shard", "content.allocated_bytes"])
+slates daemon: codec = lz4 false, zstd levels [], byte worth 265 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 256: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 1242358: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 937260: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 698826: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 2862393344: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 116471: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 16: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 2647: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 698826: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5294: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 5299: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 98800: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_listing_entries = 0: none: a Windows guest's stream ends with its daemon, so no number it holds outlives a restart (anchors [])
+slates daemon: inode_reserve = 18876: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 2632: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 357799168: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2484716: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2484716: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: control_shard_capacity = ShardCapacity { tasks: 5299, timers: 5299 }: tasks_per_shard + forward_lane_bound, timers_per_shard + forward_lane_bound (the lane's bound zero with no peers) (anchors ["tasks_per_shard", "timers_per_shard", "clients_per_shard", "region.slots", "shards", "fleet.peers"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates daemon: instance wfsecond5688 serving on 2 shards under the anchor
+slates-server: shard 1 initialized in 6963 µs
+slates-server: shard 0 initialized in 16881 µs
+slates-winfsp: reply spin window = 25900 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 17174360064: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 2862393344: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 1413120: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 715598336: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 2129756: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 323: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 715598336: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 1431196672: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 374: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 3996097560: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 645: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: page_fault_ns = 496: the profile's measured base-page fault cost (at least one) (anchors ["faults.base_ns"])
+slates daemon: prefault_reserve_bytes = min(the shard's last write burst, reserve_per_shard = 2862393344, the arena's free bytes): the free content pages an idle shard keeps pre-faulted; the burst is measured at each idle tick (anchors ["reserve_per_shard", "content.allocated_bytes"])
+slates daemon: codec = lz4 false, zstd levels [], byte worth 250 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 256: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 1242358: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 937260: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 698826: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 2862393344: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 116471: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 12: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 2647: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 698826: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5294: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 5299: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 32300: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_listing_entries = 0: none: a Windows guest's stream ends with its daemon, so no number it holds outlives a restart (anchors [])
+slates daemon: inode_reserve = 18876: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 2632: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 357799168: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2484716: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2484716: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: control_shard_capacity = ShardCapacity { tasks: 5299, timers: 5299 }: tasks_per_shard + forward_lane_bound, timers_per_shard + forward_lane_bound (the lane's bound zero with no peers) (anchors ["tasks_per_shard", "timers_per_shard", "clients_per_shard", "region.slots", "shards", "fleet.peers"])
+slates: start: ipc: a live process already holds instance wfsecond5688's rendezvous (a daemon of the instance or its anchor)
+WINFSP FOREIGN: second daemon refused; original owner 2408 still serves
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.83s
+
+exit 0
