@@ -5297,6 +5297,30 @@ session at once (`Endpoint::begin`/`drive`). Campaigns and forwards now wait for
 record dispatches retry a missed voter next period. Owed: a shared session (one owner driving it, exchanges
 submitted to it) so no exchange waits for another's.
 
+> **Status (2026-11-08, the formation case, measured; the other half of this entry's case is the forward lane's,
+> loadtest-scale's status of 2026-11-07 here and `docs/bugs/2026-11-07-the-control-shard-could-not-run-what-its-lane-admitted.md`).**
+> The question was whether slow fleet formation under load (37–108 s on the shared Mac, live-fixes) is this exclusive
+> lending. Every record-session lend, return and stale return was counted per peer and borrower, with hold times, the
+> borrowers that found a session out, and dial attempts (diagnostic only, never on main). The five-node fresh-member
+> flow, on CI's 4-CPU runners and on the Mac:
+>
+> | Run | Load | Formation | Settlement | Passing |
+> |---|---|---|---|---|
+> | diag-raft-chaos-formation-49, ×8 | 8 spinners, about 2 per CPU | 0.4–2.4 s | 0.4–2.3 s | 7 of 8 |
+> | diag-raft-chaos-formation-53, ×8 | 32 spinners, load 34–43 | 1.4–6.2 s | 1.3–3.0 s | 7 of 8 |
+> | the Mac, ×2 | ambient load 60–90 | 0.1–1.3 s | 0.1–1.4 s | 2 of 2 |
+>
+> No wait came near the 40 s bound, so the slowness did not reproduce, and each failure above was the register takeover
+> stall (`fleet.takeover.lost`), not formation.
+> - One failing run's counters per CI round (passing runs print none), four survivors each. At 2 per CPU: discovery
+>   pages 925 lent, 915 returned, 10 dropped as unanswered; council replication 924 of 924; longest single hold 29 ms;
+>   32 times in all a borrower found a session out. At 8 per CPU: discovery 1,221 lent, 1,210 returned, 11 dropped;
+>   council replication 733 of 733; longest hold 1.18 s (one `ask_pages`), the next 101 ms; 40 found out.
+> - So formation gives this entry no evidence at these loads: every session came back, holds are short, and
+>   out-findings are a few dozen against thousands of lends. The forward lane's numbers (2,661–6,277 forwards polling
+>   one lent session) are the case for the shared session.
+> - Not ruled out: the Mac at its load of 150–340, which these runs did not reach.
+
 ### 2026-09-29: a lone owner refused its own objects — fixed; campaign counters added for the open KIND items
 
 **Fixed.** CI run 36567187754 (`2c6c034`, Ubuntu) failed a cross-region forwarding test, and a local full suite
