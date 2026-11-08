@@ -23,6 +23,9 @@ pub enum VfsError {
   NoAttribute,
   /// `EPERM` (a hard link to a directory).
   NotPermitted,
+  /// `EROFS`: the file system is read-only to this caller, an attachment that may read but not write, or a snapshot's
+  /// view. Refused at the first change it asks for, an open for writing included, as POSIX's read-only file system is.
+  ReadOnly,
   /// `EACCES`: a symlink whose target leaves the volume, followed by a caller who does not own it (A-107, Linux's
   /// `protected_symlinks` rule applied at the volume's edge).
   LinkProtected,
@@ -145,6 +148,7 @@ impl VfsError {
       Self::Invalid => "EINVAL",
       Self::NoAttribute => "ENOATTR",
       Self::NotPermitted => "EPERM",
+      Self::ReadOnly => "EROFS",
       Self::LinkProtected => "EACCES",
       Self::SpecialFileOperation => "EOPNOTSUPP",
       Self::InvalidName => "EINVAL",

@@ -94,7 +94,7 @@ fn a_green_behind_a_held_floor_retains_what_its_versions_changed_not_the_file() 
     &profile,
     config,
     slates_server::SegmentSource::Create {
-      name: format!("slates-seg-retention-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "retention"),
     },
   )
   .unwrap();

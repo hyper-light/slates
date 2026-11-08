@@ -245,6 +245,28 @@ fn usage(pid: u32) -> (u64, u64) {
   (rss, ticks)
 }
 
+/// Shares `green` through `server` with this test's account on the `client` node, which reaches it from there (A-237: a
+/// local account means something only on its host).
+fn share_with_client(server: &str, green: &str, client: &str) {
+  let status = ok(client, &["status"]);
+  let anchor = status
+    .lines()
+    .find_map(|line| line.strip_prefix("anchor: "))
+    .unwrap_or_else(|| panic!("no anchor in {status:?}"));
+  let account = rustix::process::getuid().as_raw();
+  ok(
+    server,
+    &[
+      "share",
+      green,
+      &format!("uid:{account}@{anchor}"),
+      "--read",
+      "--write",
+      "--admin",
+    ],
+  );
+}
+
 /// The green over a bounded overlay of `tree` on `server`, pinned and snapshotted: its id.
 fn server_green(server: &str, tree: &str) -> String {
   let du = Command::new("du").args(["-sb", tree]).output().unwrap();
@@ -390,6 +412,7 @@ fn many_clients_through_a_client_node_against_a_server_nodes_green() {
   }
   eventually(&server_instance, &["bootstrap", "root"]);
   let green = server_green(&server_instance, &tree);
+  share_with_client(&server_instance, &green, &client_instance);
   eventually(&client_instance, &["versions", &green]);
   println!("rung\tgreen\t{green}\ttree\t{tree}");
   for clients in rungs.split(',') {

@@ -191,7 +191,8 @@ pub fn ntstatus(error: &VfsError) -> Ntstatus {
     VfsError::NameTooLong => STATUS_NAME_TOO_LONG,
     VfsError::CrossVolumeMove => STATUS_NOT_SAME_DEVICE,
     VfsError::StaleHandle => STATUS_INVALID_HANDLE,
-    VfsError::Pinned => STATUS_MEDIA_WRITE_PROTECTED,
+    // A read-only attachment or a snapshot's view is a write-protected volume to Windows, as `Pinned` is.
+    VfsError::Pinned | VfsError::ReadOnly => STATUS_MEDIA_WRITE_PROTECTED,
     VfsError::SpecialFileOperation => STATUS_NOT_SUPPORTED,
     VfsError::Delegated => STATUS_SHARING_VIOLATION,
     _ => STATUS_UNSUCCESSFUL,
@@ -269,6 +270,7 @@ mod tests {
       (VfsError::NotEmpty, STATUS_DIRECTORY_NOT_EMPTY),
       (VfsError::NoSpace, STATUS_DISK_FULL),
       (VfsError::NotPermitted, STATUS_ACCESS_DENIED),
+      (VfsError::ReadOnly, STATUS_MEDIA_WRITE_PROTECTED),
       (VfsError::Invalid, STATUS_INVALID_PARAMETER),
       (VfsError::InvalidName, STATUS_INVALID_PARAMETER),
       (VfsError::NameTooLong, STATUS_NAME_TOO_LONG),

@@ -111,7 +111,7 @@ fn a_forward_kept_for_a_full_channel_is_sent_once_the_channel_has_room() {
     &profile,
     DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS)),
     SegmentSource::Create {
-      name: format!("slates-seg-forward-retry-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "forward-retry"),
     },
   )
   .unwrap();

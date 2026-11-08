@@ -665,6 +665,14 @@ impl Daemon {
       SegmentSource::FromEnv => Adoption::from_env()?,
       SegmentSource::Handoff { rendezvous, .. } => Some(rendezvous.clone()),
     };
+    // The owner first (A-254, the rule of A-176 and A-178): a second daemon of a live instance is refused here, having
+    // created nothing. On macOS a segment's creation unlinks any holder of its name and its drop unlinks the name again,
+    // so a refused start that had created one took the live daemon's name with it. Every Linux rendezvous is sealed
+    // (§4.7, A-187), so the seal is installed before the listener can answer a claim; a second daemon in this process
+    // installs the same one.
+    #[cfg(target_os = "linux")]
+    slates_seal::install();
+    let listener = Listener::open(&config.instance, adoption.as_ref())?;
     let mut segment = match source {
       SegmentSource::Create { name } => {
         let content_name = content_name_of(&name);
@@ -809,11 +817,7 @@ impl Daemon {
         }
       })?;
     }
-    // The rendezvous and the doorbell. Every Linux rendezvous is sealed (§4.7, A-187), so the seal is installed before
-    // the listener can answer a claim; a second daemon in this process installs the same one.
-    #[cfg(target_os = "linux")]
-    slates_seal::install();
-    let listener = Listener::open(&config.instance, adoption.as_ref())?;
+    // The doorbell, on the rendezvous opened above.
     let kicks: Vec<slates_rt::driver::Kick> = shards
       .iter()
       .filter_map(|s| registry::with_entry(s.0, |e| e.kick))
@@ -1584,10 +1588,10 @@ impl Daemon {
     })
   }
 
-  /// Whether this daemon's fleet has formed its **direct probe mesh** (§4.8): every peer this node keeps
-  /// direct contact with — its record neighbourhood and its council and root voters
-  /// (`fleet::keeps_direct_contact_with`) — has a live probe session: the handshake completed and the peer
-  /// was recorded in `formed_probe_peers`. Unlike [`fleet_members`](Daemon::fleet_members), which reads the
+  /// Whether this daemon's fleet has formed its **direct probe mesh** (§4.8, [`crate::fleet::ProbeMesh`]): every
+  /// member held alive that this node keeps direct contact with — its record neighbourhood and its council and root
+  /// voters (`fleet::keeps_direct_contact_with`) — has a live probe session: the handshake completed and the peer was
+  /// recorded in `formed_probe_peers`. Unlike [`fleet_members`](Daemon::fleet_members), which reads the
   /// membership's optimistically **seeded** alive set (every configured peer is believed alive from boot,
   /// before any is contacted), this reflects sessions that have actually formed. A formation observer
   /// waits on this so it does not act on a fleet whose mesh is not yet up — for instance retiring a node
@@ -1597,34 +1601,23 @@ impl Daemon {
   /// control shard; an observation the daemon could not make is its typed refusal ([`Self::observation`]),
   /// which a caller must treat as *unknown*, never as "not meshed".
   pub fn fleet_meshed(&self) -> Result<bool, ObserveError> {
+    // The peers to reach are every member held alive that this node keeps direct contact with, less this node
+    // (`fleet::probe_mesh`, the predicate status reports); the mesh is up when every one has a formed probe session
+    // and, in a fleet of several, at least one is in contact. A laptop is meshed at once. Judged over the
+    // configuration's members instead, it was true over nothing from the bootstrap until the others were admitted.
     self.observe(self.shards.first().copied(), |s| {
-      // The peers to reach are every configured member this node keeps direct contact with, less this
-      // node; the mesh is up when every one has a formed probe session. A laptop has an empty peer set
-      // and is meshed at once.
-      let host = s.fleet.host();
-      s.fleet
-        .members()
-        .iter()
-        .filter(|&&peer| peer != host && crate::fleet::keeps_direct_contact_with(s, peer))
-        .all(|peer| s.formed_probe_peers.contains(peer))
+      crate::fleet::probe_mesh(s).meshed()
     })
   }
 
-  /// The configured members this node keeps direct contact with but has no formed probe session to — what
-  /// keeps [`Self::fleet_meshed`] false — with the members it holds, for a failure's diagnosis.
+  /// The members held alive that this node keeps direct contact with but has no formed probe session to — what
+  /// keeps [`Self::fleet_meshed`] false — with the members it holds alive, for a failure's diagnosis.
   pub fn fleet_unmeshed(
     &self,
   ) -> Result<(Vec<slates_db::HostId>, Vec<slates_db::HostId>), ObserveError> {
     self.observe(self.shards.first().copied(), |s| {
-      let host = s.fleet.host();
-      let members: Vec<slates_db::HostId> = s.fleet.members().to_vec();
-      let missing = members
-        .iter()
-        .copied()
-        .filter(|&peer| peer != host && crate::fleet::keeps_direct_contact_with(s, peer))
-        .filter(|peer| !s.formed_probe_peers.contains(peer))
-        .collect();
-      (missing, members)
+      let mesh = crate::fleet::probe_mesh(s);
+      (mesh.unmeshed, mesh.alive)
     })
   }
 

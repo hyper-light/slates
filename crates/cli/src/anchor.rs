@@ -188,6 +188,13 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   signal::install().map_err(Failure::Failed)?;
   let profile: MachineProfile = measure(options.quick)?;
   let config = DaemonConfig::derive(&profile, &options.instance, options.shards);
+  // The owner first (A-254, the rule of A-176 and A-178): a second anchor of a live instance is refused here, having
+  // created nothing. On macOS a segment's creation unlinks any holder of its name and its drop unlinks the name again,
+  // so a refused start that had created one left the live anchor's next daemon nothing to attach. The client rendezvous
+  // is then held the same way as the segment (A-114): a client that connects while a daemon restarts waits for the next
+  // one instead of failing "no daemon". Kept for the anchor's life; the daemon adopts it from the environment.
+  let rendezvous = slates_ipc::rendezvous::HeldRendezvous::hold(&options.instance)
+    .map_err(|e| failed("rendezvous", e))?;
   // The anchor-owned content object that holds each shard's recovery image (§4.8): one shard's
   // reserve times the partitions, lazily backed so its unused tail costs no RAM. The anchor holds
   // it across daemon restarts and hands it off, so an agent's writes survive a restart (BUG-11).
@@ -265,10 +272,6 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   if let Some((was, now)) = slates_server::daemon::raise_descriptor_limit() {
     slates_machine::log_line!("slates anchor: descriptor limit raised from {was} to {now}");
   }
-  // The client rendezvous is held the same way (A-114): a client that connects while a daemon restarts waits for the
-  // next one instead of failing "no daemon". Kept for the anchor's life; the daemon adopts it from the environment.
-  let rendezvous = slates_ipc::rendezvous::HeldRendezvous::hold(&options.instance)
-    .map_err(|e| failed("rendezvous", e))?;
   supervisor.hold_environment(
     slates_ipc::rendezvous::ENV_RENDEZVOUS,
     rendezvous.adoption().env_value().to_owned(),
@@ -352,6 +355,8 @@ fn judge_start(supervisor: &Supervisor, watch: &mut ShardWatch, now: u64) -> Ver
     steps: 0,
     parked: false,
     cpu,
+    // The anchor judges a whole process by its CPU time; a scheduler reading is of one thread (GAPS, A-228's siblings).
+    run: None,
     now_ns: now,
   };
   let (verdict, next) = watch.judge(look, LIVENESS_BUDGET_NS);
@@ -362,7 +367,8 @@ fn judge_start(supervisor: &Supervisor, watch: &mut ShardWatch, now: u64) -> Ver
 /// What a start's verdict says when it is to be killed: `None` while it is alive.
 fn start_stuck(verdict: Verdict) -> Option<String> {
   match verdict {
-    Verdict::Alive => None,
+    // A start has no scheduler reading, so it is never found starved; were it, it would not be stuck.
+    Verdict::Alive | Verdict::Starved { .. } => None,
     Verdict::Wedged { for_ns } => Some(format!(
       "made no progress for {} ms (the {} ms liveness window)",
       for_ns / NS_PER_MS,

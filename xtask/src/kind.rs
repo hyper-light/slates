@@ -80,6 +80,9 @@ const BASE_PORT: u16 = 7000;
 const PORTS_PER_NODE: u16 = 2;
 /// Shape: the fleet sizes the lane proves: three (f = 1), and five (f = 2) for the scale step.
 const LANE_REPLICAS: u64 = 3;
+/// Shape: the account `kubectl exec` runs `slates` as in a lane's pods: the chart's `runAsUser`
+/// (`deploy/helm/slates/templates/statefulset.yaml`).
+const LANE_ACCOUNT: u32 = 65532;
 const SCALED_REPLICAS: u64 = 5;
 /// Shape: how long the smoke run waits for the container's daemon to answer `status` — the anchor measures
 /// a full machine profile first (seconds), then the daemon boots.
@@ -1620,6 +1623,34 @@ impl Lane {
     self.kubectl(&full)
   }
 
+  /// Shares `id` through `owner` with the lane's account on every other pod, so a survivor can reach it after a takeover
+  /// (A-237: a local account means something only on its host, and each pod has its own certificate anchor).
+  pub(crate) fn share_with_pods(&self, owner: &str, id: &str) -> Result<(), Failure> {
+    for pod in (0..LANE_REPLICAS).map(|index| self.pod(index)) {
+      if pod == owner {
+        continue;
+      }
+      let status = self.kubectl(&["exec", &pod, "--", "/slates", "status"])?;
+      let anchor = status
+        .stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("anchor: "))
+        .ok_or_else(|| Failure(format!("kind: {pod} printed no anchor: {}", status.stdout)))?
+        .to_owned();
+      let principal = format!("uid:{LANE_ACCOUNT}@{anchor}");
+      let shared = self.kubectl(&[
+        "exec", owner, "--", "/slates", "share", id, &principal, "--read", "--write", "--admin",
+      ])?;
+      if shared.code != 0 {
+        return Err(Failure(format!(
+          "kind: the share with {pod} failed (exit {}): {}",
+          shared.code, shared.stderr
+        )));
+      }
+    }
+    Ok(())
+  }
+
   /// Writes [`LANE_FILES`] files into volume `id` on `pod` under a write attachment, through `slates write`.
   fn write_lane_files(&self, pod: &str, id: &str) -> Result<(), Failure> {
     let attached = self.verb(pod, &["attach", id, "--write"])?;
@@ -1724,6 +1755,7 @@ impl Lane {
       .and_then(serde_json::Value::as_str)
       .ok_or_else(|| Failure(format!("kind: create answered no id: {created}")))?
       .to_owned();
+    self.share_with_pods(&owner, &id)?;
     self.write_lane_files(&owner, &id)?;
     let snapshot = self.verb(&owner, &["volume", "snapshot", &id])?;
     let snapshot: serde_json::Value = serde_json::from_str(&snapshot.stdout).map_err(|e| {

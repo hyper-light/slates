@@ -31,7 +31,7 @@ fn daemon(name: &str) -> (Daemon, String) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-merge-load-{name}"),
+      name: common::fixture_object("slates-seg", &format!("merge-load-{name}")),
     },
   )
   .unwrap();

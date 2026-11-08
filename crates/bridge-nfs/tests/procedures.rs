@@ -848,8 +848,8 @@ fn a_write_through_a_read_only_export_is_refused() {
     .unwrap();
   assert_eq!(
     XdrReader::new(&wreply).u32().unwrap(),
-    Nfsstat3::Perm.wire(),
-    "a read-only export refuses WRITE before any effect"
+    Nfsstat3::Rofs.wire(),
+    "a read-only export refuses WRITE before any effect, as a read-only file system (NFS3ERR_ROFS)"
   );
 
   // A READ through the same export is allowed.
