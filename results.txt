@@ -1,0 +1,78 @@
+runner ubuntu-latest, 4 CPUs, commit 2d087d46
+== a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover run 1 exit 0
+chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-6824 destroyed at 353.581ms
+chaos a candidate's store destroyed mid-stream: replacement answering at 830.015516ms
+chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.560018173s
+chaos a candidate's store destroyed mid-stream: 180 writes, 180 acknowledged: p50 4816 us, p99 173664 us, p999 1336987 us, max 1336987 us; 3 over 50ms (sent+took): 0.00s+174ms 0.91s+1337ms 2.36s+126ms
+chaos a candidate's store destroyed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(180), durable: Some(180), owed: false, epoch: Some(1), identity: Some("fa14a0a3cc98c49c0c27d46869c47e04616c6155c9f33e5486d341cfc128fd72"), fence: 1, holders: ["3668417396763242099", "17757197270025563322"], moving_to: [], recorded: ["3668417396763242099", "17757197270025563322"] }); c
+chaos a candidate's store destroyed mid-stream: 213 samples, 73 heads seen
+chaos a candidate's store destroyed mid-stream: chaos-replaced-b-6824 refused the owner: {}
+chaos a candidate's store destroyed mid-stream: chaos-replaced-a-6824 refused the owner: {}
+chaos a candidate's store destroyed mid-stream: chaos-replaced-c-6824 refused the owner: {}
+chaos a candidate's store destroyed mid-stream: taken over by chaos-replaced-c-6824 after 2.378523729s
+chaos a candidate's store destroyed mid-stream:
+== a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover run 2 exit 101
+thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (7412) panicked at crates/cli/tests/live_chaos.rs:1169:5:
+chaos a candidate's store destroyed mid-stream: NoLoss (successor): no survivor served the volume within the fleet wait
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover --- FAILED
+
+failures:
+
+failures:
+    a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 44.79s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-7411 destroyed at 402.305296ms
+chaos a candidate's store destroyed mid-stream: replacement answering at 961.536971ms
+chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.290240469s
+chaos a candidate's store destroyed mid-stream: 189 writes, 189 acknowledged: p50 5531 us, p99 231676 us, p999 1142625 us, max 1142625 us; 3 over 50ms (sent+took): 0.01s+166ms 1.00s+1143ms 2.37s+232ms
+chaos a candidate's store destroyed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(190), durable: Some(190), owed: false, epoch: Some(1), identity: Some("f46c7bca1246a517c600220108079248bc20603093591667ca1d9d3f5fe3fa15"), fence: 1, holders: ["7688804927798041179", "18379079172587256324"], moving_to: [], recorded: ["7688804927798041179", "18379079172587256324"] }); c
+chaos a candidate's store destroyed mid-stream: 212 samples, 87 heads seen
+chaos a candidate's store destroyed mid-stream: chaos-replaced-b-7411 refused the owner: {}
+chaos a candidate's store destroyed mid-stream: chaos-replaced-a-7411 refused the owner: {}
+chaos a candidate's store destroyed mid-stream: chaos-replaced-c-7411 refused the owner: {}
+chaos a candidate's store destroyed mid-stream:
+chaos a candidate's store destroyed mid-stream: NoLoss (successor): no survivor served the volume within the fleet wait
+== a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover run 3 exit 101
+thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (7995) panicked at crates/cli/tests/live_chaos.rs:1169:5:
+chaos a candidate's store destroyed mid-stream: NoLoss (successor): no survivor served the volume within the fleet wait
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover --- FAILED
+
+failures:
+
+failures:
+    a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 45.34s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-7994 destroyed at 331.695312ms
+chaos a candidate's store destroyed mid-stream: replacement answering at 852.703261ms
+chaos a candidate's store destroyed mid-stream: the fleet rejoined at 2.560733028s
+chaos a candidate's store destroyed mid-stream: 392 writes, 392 acknowledged: p50 4210 us, p99 21965 us, p999 356500 us, max 356500 us; 3 over 50ms (sent+took): 0.00s+178ms 0.91s+357ms 1.27s+184ms
+chaos a candidate's store destroyed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(393), durable: Some(393), owed: false, epoch: Some(1), identity: Some("211c71f9fa1260a6cdadc2c7da323d00719a6b7dfd3998a429ebaba6170a1233"), fence: 1, holders: ["5169567102480489849", "17175596065598470836"], moving_to: [], recorded: ["5169567102480489849", "17175596065598470836"] }); c
+chaos a candidate's store destroyed mid-stream: 219 samples, 150 heads seen
+chaos a candidate's store destroyed mid-stream: chaos-replaced-c-7994 refused the owner: {}
+chaos a candidate's store destroyed mid-stream: chaos-replaced-a-7994 refused the owner: {}
+chaos a candidate's store destroyed mid-stream: chaos-replaced-b-7994 refused the owner: {}
+chaos a candidate's store destroyed mid-stream:
+chaos a candidate's store destroyed mid-stream: NoLoss (successor): no survivor served the volume within the fleet wait
+== a_long_live_log_is_taken_over_whole run 1 exit 0
+chaos a long live log taken over: 997 writes, 997 acknowledged: p50 12695 us, p99 31778 us, p999 175211 us, max 175211 us; 2 over 50ms (sent+took): 0.01s+175ms 11.58s+61ms
+chaos a long live log taken over: 1159 samples, 727 heads seen
+chaos a long live log taken over: taken over by chaos-long-log-c-8648 after 2.155835336s
+chaos a long live log taken over:
+== a_long_live_log_is_taken_over_whole run 2 exit 0
+chaos a long live log taken over: 1000 writes, 1000 acknowledged: p50 3369 us, p99 7710 us, p999 32502 us, max 118009 us; 1 over 50ms (sent+took): 0.00s+118ms
+chaos a long live log taken over: 604 samples, 365 heads seen
+chaos a long live log taken over: taken over by chaos-long-log-a-10431 after 2.613471199s
+chaos a long live log taken over:
+== a_long_live_log_is_taken_over_whole run 3 exit 0
+chaos a long live log taken over: 1000 writes, 1000 acknowledged: p50 6475 us, p99 19512 us, p999 37671 us, max 150620 us; 1 over 50ms (sent+took): 0.00s+151ms
+chaos a long live log taken over: 661 samples, 486 heads seen
+chaos a long live log taken over: taken over by chaos-long-log-a-11570 after 2.01371237s
+chaos a long live log taken over:
