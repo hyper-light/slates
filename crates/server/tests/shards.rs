@@ -168,7 +168,7 @@ fn single_shard_daemon(name: &str) -> (Daemon, String) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{name}"),
+      name: common::fixture_object("slates-seg", name),
     },
   )
   .unwrap();
@@ -1358,7 +1358,7 @@ fn dax_provisioned_in(
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{name}"),
+      name: common::fixture_object("slates-seg", &name),
     },
   )
   .unwrap();
@@ -1637,6 +1637,36 @@ fn a_guest_waits_past_one_window_for_a_starved_daemon_and_counts_it() {
   );
   drop(client);
   drop(daemon);
+}
+
+/// Each fixture daemon's segment is its own (2026-11-07). Do: create two segments in turn under one fixture name, as a
+/// proptest's successive cases and two processes of this binary do, drop the first, and attach to the second by its
+/// handoff, as an anchor's next daemon does. Expect the attach to succeed. On macOS a shared-memory name is the user's,
+/// a creation first unlinks any holder's, and a creator's drop unlinks the name again; with one name for both, the
+/// first's drop unlinked the second's, and a loaded run's next case failed its shard's start (`shm_open` `ENOENT`, then
+/// `ConsensusNotInitialized`). Linux names no segment (a memfd), so there the attach holds either way.
+#[test]
+fn a_dropped_fixture_segment_leaves_the_next_ones_in_place() {
+  let profile = common::machine_profile();
+  let config = DaemonConfig::derive(&profile, "shards-segment-twice", Some(1));
+  let create = || {
+    slates_anchor::AnchorSegment::create(
+      &common::fixture_object("slates-seg", "shards-segment-twice"),
+      &profile.facts.identity,
+      config.geometry,
+    )
+    .unwrap()
+  };
+  let first = create();
+  let second = create();
+  let (handoff, len) = second.handoff().unwrap();
+  drop(first);
+  let attached = slates_anchor::AnchorSegment::attach(&handoff, len, &profile.facts.identity);
+  assert!(
+    attached.is_ok(),
+    "the second fixture's segment is still there once the first is dropped: {:?}",
+    attached.err()
+  );
 }
 
 /// AC (Shards part 3, step 2), hostile input. Do: send descriptor asks cut short, with a range whose end overflows, with

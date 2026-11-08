@@ -24,12 +24,12 @@ pub(crate) struct Anchor {
 pub(crate) fn held_anchor(name: &str, profile: &MachineProfile, config: &DaemonConfig) -> Anchor {
   let content_bytes = config.content_bytes();
   let segment = AnchorSegment::create(
-    &format!("slates-seg-{name}"),
+    &super::fixture_object("slates-seg", name),
     &profile.facts.identity,
     config.geometry,
   )
   .unwrap()
-  .with_content(&format!("slates-con-{name}"), content_bytes)
+  .with_content(&super::fixture_object("slates-con", name), content_bytes)
   .unwrap();
   Anchor {
     segment,

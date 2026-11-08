@@ -70,3 +70,18 @@ pub(crate) fn machine_profile() -> MachineProfile {
     .clone()
     .expect("the machine profile measures")
 }
+
+/// The name of one fixture's shared object (its segment, `slates-seg`, or its content object, `slates-con`), unique to
+/// this process and this call: `{prefix}-{name}-{pid}-{n}`. On macOS a shared-memory name is the user's, a creation first
+/// unlinks any holder's, and a creator's drop unlinks the name again, so two fixtures under one name, a proptest's
+/// successive cases or two processes of one binary, let the first's drop unlink the second's: a loaded run's shard then
+/// found its segment gone (`shm_open` `ENOENT`, 2026-11-07). `daemon.rs`'s audit fixtures name one instance per call for
+/// the same reason (2026-09-15). The platform's name limit is kept by `slates-mem`, which hashes a long name.
+pub(crate) fn fixture_object(prefix: &str, name: &str) -> String {
+  static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+  format!(
+    "{prefix}-{name}-{}-{}",
+    std::process::id(),
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+  )
+}
