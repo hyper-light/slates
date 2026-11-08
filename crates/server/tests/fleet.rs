@@ -13286,7 +13286,10 @@ fn submit_resent_after_its_owner_restarted(before_lift: bool) {
       .ok()
       .and_then(|word| answer_while_waiting(&mut resender, *word));
     let mut reader = Client::connect(daemons[0].instance());
-    waiting = Some((early, reader.call(&RequestBody::Versions { green })));
+    waiting = Some((
+      early,
+      head_once_its_lease_confirms(&mut reader, green, &daemons),
+    ));
     lifted = lift(&daemons);
   }
   let answer = word
@@ -13294,7 +13297,7 @@ fn submit_resent_after_its_owner_restarted(before_lift: bool) {
     .ok()
     .and_then(|word| answer_within(&mut resender, *word));
   let mut reader = Client::connect(daemons[0].instance());
-  let head = reader.call(&RequestBody::Versions { green });
+  let head = head_once_its_lease_confirms(&mut reader, green, &daemons);
   let counters = merge_and_content_counters(&daemons);
   for daemon in daemons {
     daemon.stop();
@@ -13626,6 +13629,32 @@ fn a_taken_over_green_serves_every_version_and_accepts_new_work_on_the_successor
   );
 }
 
+/// The green's head as a client must read it from an owner that has just restarted or taken the green over (§4.8
+/// "Leases and reads", AUD-08): the owner parks the read until its lease confirms and refuses it `LeaseUnconfirmed`
+/// if the lease bound passes first, a refusal retryable by design. So the read is sent again while it is refused so,
+/// charged in the fleet's own periods like every wait here: on a loaded Mac (load about 40) one read met the lease
+/// unconfirmed (`LeaseUnconfirmed { version: 5 }`, the supervisor's stack gate, 2026-11-08). The last answer.
+fn head_once_its_lease_confirms(
+  reader: &mut Client,
+  green: VolumeId,
+  fleet: &[Daemon],
+) -> ReplyBody {
+  let observed: Vec<&Daemon> = fleet.iter().collect();
+  let mut last = None;
+  poll_until(&observed, PLACEMENT_DEADLINE, || {
+    let reply = reader.call(&RequestBody::Versions { green });
+    let confirmed = !matches!(
+      reply,
+      ReplyBody::Refused {
+        refusal: Refusal::LeaseUnconfirmed { .. }
+      }
+    );
+    last = Some(reply);
+    Ok(confirmed)
+  });
+  last.expect("the head was read at least once")
+}
+
 /// Shape: how long a test watches for a work's head to be placed: several of the owner's seal rounds.
 const WORK_SEAL_WATCH: Duration = Duration::from_nanos(4 * LIVENESS_BUDGET_NS);
 /// Shape: [`WORK_SEAL_WATCH`] as the fleet's own periods, one a heartbeat, so the watch is charged in daemon time like
@@ -13734,7 +13763,7 @@ fn a_works_head_is_never_placed_so_a_takeover_cannot_bring_it_back_to_run_a_rese
   let mut reader = Client::connect(daemons[successor_index].instance());
   let status = reader.call(&RequestBody::Status { volume: work });
   let again = reader.call(&submit);
-  let head = reader.call(&RequestBody::Versions { green });
+  let head = head_once_its_lease_confirms(&mut reader, green, &daemons);
   for daemon in daemons {
     daemon.stop();
   }
@@ -13876,7 +13905,7 @@ fn a_submit_resent_after_its_owner_was_taken_over_is_answered_its_version() {
   });
   let again = resend_while_refused_retryable(&mut client, &submit);
   let mut reader = Client::connect(daemons[successor_index].instance());
-  let head = reader.call(&RequestBody::Versions { green });
+  let head = head_once_its_lease_confirms(&mut reader, green, &daemons);
   for daemon in daemons {
     daemon.stop();
   }
