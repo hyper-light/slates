@@ -1,0 +1,229 @@
+slates daemon: fleet_sessions_per_plane = 1932: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120168: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77388192: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5157: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: fleet_sessions_per_plane = 1932: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120168: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77388192: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5157: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: fleet_sessions_per_plane = 1932: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120168: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77388192: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5157: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: fleet_sessions_per_plane = 1932: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120168: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77388192: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5157: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+LD-IMAGE wall_ns 1794159327875956286 head 2309 bytes 9973923
+slates daemon: fleet_sessions_per_plane = 1932: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120168: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77388192: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5157: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+LD-TL stopped_on_install Some(8111) after 37.877µs
+LD-IMAGE wall_ns 1794159329004648837 head 4198 bytes 18281891
+LD-TL successor after 8.029299ms
+LD-TAKE wall_ns 1794159329985603252 from 8313036896449228220 reply Ok(Some(4198))
+LD-LANE install wall_ns 1794159329987108227 holder 15294503694649084214 bytes 18281976 budget_ns 30000000000 took_ns 90539663 answered true cut false
+LD-TL caught Some(13.050809665s)
+LD-TL durable Some(8528) then Some(8532) after 14.353123ms
+LD-TL writes 8519
+LD-WHY wall_ns 1794159330914757407 off_chain holder 15294503694649084214 reported Some(4546) head Some(5759) checkpoint Some(4198) oldest Some(4834) retained 926 bytes 18280687 retain_bytes 18281891
+LD-WHY wall_ns 1794159330917603368 off_chain holder 15294503694649084214 reported Some(4547) head Some(5759) checkpoint Some(4198) oldest Some(4834) retained 926 bytes 18280687 retain_bytes 18281891
+LD-WHY wall_ns 1794159330921296402 off_chain holder 15294503694649084214 reported Some(4548) head Some(5760) checkpoint Some(4198) oldest Some(4955) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330922130590 off_chain holder 15294503694649084214 reported Some(4549) head Some(5760) checkpoint Some(4198) oldest Some(4955) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330922974081 off_chain holder 15294503694649084214 reported Some(4550) head Some(5760) checkpoint Some(4198) oldest Some(4955) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330923934710 off_chain holder 15294503694649084214 reported Some(4551) head Some(5760) checkpoint Some(4198) oldest Some(4955) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330924528710 off_chain holder 15294503694649084214 reported Some(4552) head Some(5760) checkpoint Some(4198) oldest Some(4955) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330926554210 off_chain holder 15294503694649084214 reported Some(4553) head Some(5760) checkpoint Some(4198) oldest Some(4955) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330927293146 off_chain holder 15294503694649084214 reported Some(4554) head Some(5760) checkpoint Some(4198) oldest Some(4955) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330927856916 off_chain holder 15294503694649084214 reported Some(4555) head Some(5760) checkpoint Some(4198) oldest Some(4955) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330930258876 off_chain holder 15294503694649084214 reported Some(4556) head Some(5760) checkpoint Some(4198) oldest Some(4955) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330930781632 off_chain holder 15294503694649084214 reported Some(4557) head Some(5760) checkpoint Some(4198) oldest Some(4955) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330931194266 off_chain holder 15294503694649084214 reported Some(4558) head Some(5760) checkpoint Some(4198) oldest Some(4955) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330931600500 off_chain holder 15294503694649084214 reported Some(4559) head Some(5760) checkpoint Some(4198) oldest Some(4955) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330931982104 off_chain holder 15294503694649084214 reported Some(4560) head Some(5760) checkpoint Some(4198) oldest Some(4955) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330932418361 off_chain holder 15294503694649084214 reported Some(4561) head Some(5760) checkpoint Some(4198) oldest Some(4955) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330932796237 off_chain holder 15294503694649084214 reported Some(4562) head Some(5760) checkpoint Some(4198) oldest Some(4955) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330933220502 off_chain holder 15294503694649084214 reported Some(4563) head Some(5760) checkpoint Some(4198) oldest Some(4955) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330933616273 off_chain holder 15294503694649084214 reported Some(4564) head Some(5760) checkpoint Some(4198) oldest Some(4955) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330934007884 off_chain holder 15294503694649084214 reported Some(4565) head Some(5760) checkpoint Some(4198) oldest Some(4955) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330934415510 off_chain holder 15294503694649084214 reported Some(4566) head Some(5760) checkpoint Some(4198) oldest Some(4955) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330934843343 off_chain holder 15294503694649084214 reported Some(4567) head Some(5760) checkpoint Some(4198) oldest Some(4955) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330937420846 off_chain holder 15294503694649084214 reported Some(4568) head Some(5760) checkpoint Some(4198) oldest Some(4955) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330938460862 off_chain holder 15294503694649084214 reported Some(4569) head Some(5761) checkpoint Some(4198) oldest Some(4956) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330938944628 off_chain holder 15294503694649084214 reported Some(4570) head Some(5761) checkpoint Some(4198) oldest Some(4956) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330939352551 off_chain holder 15294503694649084214 reported Some(4571) head Some(5761) checkpoint Some(4198) oldest Some(4956) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330939740794 off_chain holder 15294503694649084214 reported Some(4572) head Some(5761) checkpoint Some(4198) oldest Some(4956) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330940489258 off_chain holder 15294503694649084214 reported Some(4573) head Some(5761) checkpoint Some(4198) oldest Some(4956) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330942449161 off_chain holder 15294503694649084214 reported Some(4574) head Some(5761) checkpoint Some(4198) oldest Some(4956) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330942865675 off_chain holder 15294503694649084214 reported Some(4575) head Some(5761) checkpoint Some(4198) oldest Some(4956) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330944379090 off_chain holder 15294503694649084214 reported Some(4576) head Some(5762) checkpoint Some(4198) oldest Some(4957) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330944860297 off_chain holder 15294503694649084214 reported Some(4577) head Some(5762) checkpoint Some(4198) oldest Some(4957) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330945275226 off_chain holder 15294503694649084214 reported Some(4578) head Some(5762) checkpoint Some(4198) oldest Some(4957) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330945666430 off_chain holder 15294503694649084214 reported Some(4579) head Some(5762) checkpoint Some(4198) oldest Some(4957) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330947473397 off_chain holder 15294503694649084214 reported Some(4580) head Some(5762) checkpoint Some(4198) oldest Some(4957) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330948132930 off_chain holder 15294503694649084214 reported Some(4581) head Some(5763) checkpoint Some(4198) oldest Some(4958) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330948555107 off_chain holder 15294503694649084214 reported Some(4582) head Some(5763) checkpoint Some(4198) oldest Some(4958) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330949145980 off_chain holder 15294503694649084214 reported Some(4583) head Some(5764) checkpoint Some(4198) oldest Some(4959) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330951658910 off_chain holder 15294503694649084214 reported Some(4584) head Some(5764) checkpoint Some(4198) oldest Some(4959) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330952179082 off_chain holder 15294503694649084214 reported Some(4585) head Some(5765) checkpoint Some(4198) oldest Some(4960) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330952607643 off_chain holder 15294503694649084214 reported Some(4586) head Some(5766) checkpoint Some(4198) oldest Some(4961) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330952979703 off_chain holder 15294503694649084214 reported Some(4587) head Some(5766) checkpoint Some(4198) oldest Some(4961) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330955569589 off_chain holder 15294503694649084214 reported Some(4588) head Some(5766) checkpoint Some(4198) oldest Some(4961) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330956031156 off_chain holder 15294503694649084214 reported Some(4589) head Some(5767) checkpoint Some(4198) oldest Some(4962) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330956435383 off_chain holder 15294503694649084214 reported Some(4590) head Some(5767) checkpoint Some(4198) oldest Some(4962) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330956823002 off_chain holder 15294503694649084214 reported Some(4591) head Some(5767) checkpoint Some(4198) oldest Some(4962) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330957223933 off_chain holder 15294503694649084214 reported Some(4592) head Some(5767) checkpoint Some(4198) oldest Some(4962) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330959839497 off_chain holder 15294503694649084214 reported Some(4593) head Some(5767) checkpoint Some(4198) oldest Some(4962) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330960337606 off_chain holder 15294503694649084214 reported Some(4594) head Some(5768) checkpoint Some(4198) oldest Some(4963) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330964300579 off_chain holder 15294503694649084214 reported Some(4595) head Some(5768) checkpoint Some(4198) oldest Some(4963) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330964921346 off_chain holder 15294503694649084214 reported Some(4596) head Some(5769) checkpoint Some(4198) oldest Some(4964) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330965323516 off_chain holder 15294503694649084214 reported Some(4597) head Some(5769) checkpoint Some(4198) oldest Some(4964) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330965722503 off_chain holder 15294503694649084214 reported Some(4598) head Some(5770) checkpoint Some(4198) oldest Some(4965) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330966149464 off_chain holder 15294503694649084214 reported Some(4599) head Some(5770) checkpoint Some(4198) oldest Some(4965) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330969227804 off_chain holder 15294503694649084214 reported Some(4600) head Some(5771) checkpoint Some(4198) oldest Some(4966) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330969653645 off_chain holder 15294503694649084214 reported Some(4601) head Some(5772) checkpoint Some(4198) oldest Some(4967) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330970054896 off_chain holder 15294503694649084214 reported Some(4602) head Some(5772) checkpoint Some(4198) oldest Some(4967) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330970473169 off_chain holder 15294503694649084214 reported Some(4603) head Some(5772) checkpoint Some(4198) oldest Some(4967) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330970956528 off_chain holder 15294503694649084214 reported Some(4604) head Some(5773) checkpoint Some(4198) oldest Some(4968) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330971473284 off_chain holder 15294503694649084214 reported Some(4605) head Some(5773) checkpoint Some(4198) oldest Some(4968) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330971938883 off_chain holder 15294503694649084214 reported Some(4606) head Some(5774) checkpoint Some(4198) oldest Some(4969) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330972296672 off_chain holder 15294503694649084214 reported Some(4607) head Some(5774) checkpoint Some(4198) oldest Some(4969) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330972754752 off_chain holder 15294503694649084214 reported Some(4608) head Some(5774) checkpoint Some(4198) oldest Some(4969) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330973319226 off_chain holder 15294503694649084214 reported Some(4609) head Some(5775) checkpoint Some(4198) oldest Some(4970) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330976102277 off_chain holder 15294503694649084214 reported Some(4610) head Some(5775) checkpoint Some(4198) oldest Some(4970) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330976561644 off_chain holder 15294503694649084214 reported Some(4611) head Some(5776) checkpoint Some(4198) oldest Some(4971) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330977001877 off_chain holder 15294503694649084214 reported Some(4612) head Some(5776) checkpoint Some(4198) oldest Some(4971) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330977353594 off_chain holder 15294503694649084214 reported Some(4613) head Some(5777) checkpoint Some(4198) oldest Some(4972) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330980195634 off_chain holder 15294503694649084214 reported Some(4614) head Some(5778) checkpoint Some(4198) oldest Some(4973) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330980636219 off_chain holder 15294503694649084214 reported Some(4615) head Some(5778) checkpoint Some(4198) oldest Some(4973) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330981059916 off_chain holder 15294503694649084214 reported Some(4616) head Some(5778) checkpoint Some(4198) oldest Some(4973) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330981413010 off_chain holder 15294503694649084214 reported Some(4617) head Some(5779) checkpoint Some(4198) oldest Some(4974) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330983943762 off_chain holder 15294503694649084214 reported Some(4618) head Some(5779) checkpoint Some(4198) oldest Some(4974) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330984486133 off_chain holder 15294503694649084214 reported Some(4619) head Some(5779) checkpoint Some(4198) oldest Some(4974) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330984866641 off_chain holder 15294503694649084214 reported Some(4620) head Some(5779) checkpoint Some(4198) oldest Some(4974) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330985253469 off_chain holder 15294503694649084214 reported Some(4621) head Some(5780) checkpoint Some(4198) oldest Some(4975) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330985690733 off_chain holder 15294503694649084214 reported Some(4622) head Some(5780) checkpoint Some(4198) oldest Some(4975) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330988088517 off_chain holder 15294503694649084214 reported Some(4623) head Some(5781) checkpoint Some(4198) oldest Some(4976) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330988536717 off_chain holder 15294503694649084214 reported Some(4624) head Some(5781) checkpoint Some(4198) oldest Some(4976) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330988918665 off_chain holder 15294503694649084214 reported Some(4625) head Some(5781) checkpoint Some(4198) oldest Some(4976) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330989329195 off_chain holder 15294503694649084214 reported Some(4626) head Some(5781) checkpoint Some(4198) oldest Some(4976) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330989845799 off_chain holder 15294503694649084214 reported Some(4627) head Some(5781) checkpoint Some(4198) oldest Some(4976) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330992235056 off_chain holder 15294503694649084214 reported Some(4628) head Some(5781) checkpoint Some(4198) oldest Some(4976) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330992722494 off_chain holder 15294503694649084214 reported Some(4629) head Some(5781) checkpoint Some(4198) oldest Some(4976) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330993052244 off_chain holder 15294503694649084214 reported Some(4630) head Some(5782) checkpoint Some(4198) oldest Some(4977) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330993266697 off_chain holder 15294503694649084214 reported Some(4631) head Some(5782) checkpoint Some(4198) oldest Some(4977) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330993483941 off_chain holder 15294503694649084214 reported Some(4632) head Some(5782) checkpoint Some(4198) oldest Some(4977) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330993768214 off_chain holder 15294503694649084214 reported Some(4633) head Some(5783) checkpoint Some(4198) oldest Some(4978) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330994042327 off_chain holder 15294503694649084214 reported Some(4634) head Some(5783) checkpoint Some(4198) oldest Some(4978) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330994288642 off_chain holder 15294503694649084214 reported Some(4635) head Some(5783) checkpoint Some(4198) oldest Some(4978) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330994435202 off_chain holder 15294503694649084214 reported Some(4636) head Some(5783) checkpoint Some(4198) oldest Some(4978) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330994576747 off_chain holder 15294503694649084214 reported Some(4637) head Some(5783) checkpoint Some(4198) oldest Some(4978) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330994732771 off_chain holder 15294503694649084214 reported Some(4638) head Some(5783) checkpoint Some(4198) oldest Some(4978) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330997133626 off_chain holder 15294503694649084214 reported Some(4639) head Some(5784) checkpoint Some(4198) oldest Some(4979) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330997325448 off_chain holder 15294503694649084214 reported Some(4640) head Some(5784) checkpoint Some(4198) oldest Some(4979) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330997469912 off_chain holder 15294503694649084214 reported Some(4641) head Some(5784) checkpoint Some(4198) oldest Some(4979) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330997667094 off_chain holder 15294503694649084214 reported Some(4642) head Some(5784) checkpoint Some(4198) oldest Some(4979) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330997806111 off_chain holder 15294503694649084214 reported Some(4643) head Some(5784) checkpoint Some(4198) oldest Some(4979) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330997948143 off_chain holder 15294503694649084214 reported Some(4644) head Some(5784) checkpoint Some(4198) oldest Some(4979) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330998134749 off_chain holder 15294503694649084214 reported Some(4645) head Some(5784) checkpoint Some(4198) oldest Some(4979) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330998295964 off_chain holder 15294503694649084214 reported Some(4646) head Some(5784) checkpoint Some(4198) oldest Some(4979) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330998563286 off_chain holder 15294503694649084214 reported Some(4647) head Some(5785) checkpoint Some(4198) oldest Some(4980) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330998709542 off_chain holder 15294503694649084214 reported Some(4648) head Some(5785) checkpoint Some(4198) oldest Some(4980) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330999094970 off_chain holder 15294503694649084214 reported Some(4649) head Some(5785) checkpoint Some(4198) oldest Some(4980) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330999514707 off_chain holder 15294503694649084214 reported Some(4650) head Some(5786) checkpoint Some(4198) oldest Some(4981) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159330999834506 off_chain holder 15294503694649084214 reported Some(4651) head Some(5786) checkpoint Some(4198) oldest Some(4981) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331000263651 off_chain holder 15294503694649084214 reported Some(4652) head Some(5786) checkpoint Some(4198) oldest Some(4981) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331001729349 off_chain holder 15294503694649084214 reported Some(4653) head Some(5787) checkpoint Some(4198) oldest Some(4982) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331006557195 off_chain holder 15294503694649084214 reported Some(4654) head Some(5789) checkpoint Some(4198) oldest Some(4984) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331008669595 off_chain holder 15294503694649084214 reported Some(4655) head Some(5790) checkpoint Some(4198) oldest Some(4985) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331011316517 off_chain holder 15294503694649084214 reported Some(4656) head Some(5792) checkpoint Some(4198) oldest Some(4987) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331012648646 off_chain holder 15294503694649084214 reported Some(4657) head Some(5792) checkpoint Some(4198) oldest Some(4987) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331014720968 off_chain holder 15294503694649084214 reported Some(4658) head Some(5793) checkpoint Some(4198) oldest Some(4988) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331017896894 off_chain holder 15294503694649084214 reported Some(4659) head Some(5795) checkpoint Some(4198) oldest Some(4990) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331018813789 off_chain holder 15294503694649084214 reported Some(4660) head Some(5795) checkpoint Some(4198) oldest Some(4990) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331019342921 off_chain holder 15294503694649084214 reported Some(4661) head Some(5795) checkpoint Some(4198) oldest Some(4990) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331019769018 off_chain holder 15294503694649084214 reported Some(4662) head Some(5795) checkpoint Some(4198) oldest Some(4990) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331020148678 off_chain holder 15294503694649084214 reported Some(4663) head Some(5795) checkpoint Some(4198) oldest Some(4990) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331020549097 off_chain holder 15294503694649084214 reported Some(4664) head Some(5795) checkpoint Some(4198) oldest Some(4990) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331020926052 off_chain holder 15294503694649084214 reported Some(4665) head Some(5795) checkpoint Some(4198) oldest Some(4990) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331023345075 off_chain holder 15294503694649084214 reported Some(4666) head Some(5797) checkpoint Some(4198) oldest Some(4992) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331024448480 off_chain holder 15294503694649084214 reported Some(4667) head Some(5798) checkpoint Some(4198) oldest Some(4993) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331027460472 off_chain holder 15294503694649084214 reported Some(4668) head Some(5798) checkpoint Some(4198) oldest Some(4993) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331027804453 off_chain holder 15294503694649084214 reported Some(4669) head Some(5798) checkpoint Some(4198) oldest Some(4993) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331029765757 off_chain holder 15294503694649084214 reported Some(4670) head Some(5798) checkpoint Some(4198) oldest Some(4993) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331032079665 off_chain holder 15294503694649084214 reported Some(4671) head Some(5800) checkpoint Some(4198) oldest Some(4995) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331033648621 off_chain holder 15294503694649084214 reported Some(4672) head Some(5801) checkpoint Some(4198) oldest Some(4996) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331035165580 off_chain holder 15294503694649084214 reported Some(4673) head Some(5802) checkpoint Some(4198) oldest Some(4997) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331036140104 off_chain holder 15294503694649084214 reported Some(4674) head Some(5803) checkpoint Some(4198) oldest Some(4998) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331036810277 off_chain holder 15294503694649084214 reported Some(4675) head Some(5803) checkpoint Some(4198) oldest Some(4998) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331038760700 off_chain holder 15294503694649084214 reported Some(4676) head Some(5804) checkpoint Some(4198) oldest Some(4999) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331039529251 off_chain holder 15294503694649084214 reported Some(4677) head Some(5805) checkpoint Some(4198) oldest Some(5000) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331039936534 off_chain holder 15294503694649084214 reported Some(4678) head Some(5805) checkpoint Some(4198) oldest Some(5000) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331042357500 off_chain holder 15294503694649084214 reported Some(4679) head Some(5806) checkpoint Some(4198) oldest Some(5001) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331043658743 off_chain holder 15294503694649084214 reported Some(4680) head Some(5806) checkpoint Some(4198) oldest Some(5001) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331045199237 off_chain holder 15294503694649084214 reported Some(4681) head Some(5807) checkpoint Some(4198) oldest Some(5002) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331046267940 off_chain holder 15294503694649084214 reported Some(4682) head Some(5808) checkpoint Some(4198) oldest Some(5003) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331048191293 off_chain holder 15294503694649084214 reported Some(4683) head Some(5808) checkpoint Some(4198) oldest Some(5003) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331048550218 off_chain holder 15294503694649084214 reported Some(4684) head Some(5808) checkpoint Some(4198) oldest Some(5003) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331048982211 off_chain holder 15294503694649084214 reported Some(4685) head Some(5808) checkpoint Some(4198) oldest Some(5003) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331049874075 off_chain holder 15294503694649084214 reported Some(4686) head Some(5809) checkpoint Some(4198) oldest Some(5004) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331050666849 off_chain holder 15294503694649084214 reported Some(4687) head Some(5810) checkpoint Some(4198) oldest Some(5005) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331051529715 off_chain holder 15294503694649084214 reported Some(4688) head Some(5811) checkpoint Some(4198) oldest Some(5006) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331051922838 off_chain holder 15294503694649084214 reported Some(4689) head Some(5811) checkpoint Some(4198) oldest Some(5006) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331052360319 off_chain holder 15294503694649084214 reported Some(4690) head Some(5811) checkpoint Some(4198) oldest Some(5006) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331053362217 off_chain holder 15294503694649084214 reported Some(4691) head Some(5812) checkpoint Some(4198) oldest Some(5007) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331053787730 off_chain holder 15294503694649084214 reported Some(4692) head Some(5812) checkpoint Some(4198) oldest Some(5007) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331054177118 off_chain holder 15294503694649084214 reported Some(4693) head Some(5812) checkpoint Some(4198) oldest Some(5007) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331054568241 off_chain holder 15294503694649084214 reported Some(4694) head Some(5812) checkpoint Some(4198) oldest Some(5007) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331058262564 off_chain holder 15294503694649084214 reported Some(4695) head Some(5813) checkpoint Some(4198) oldest Some(5008) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331058677557 off_chain holder 15294503694649084214 reported Some(4696) head Some(5813) checkpoint Some(4198) oldest Some(5008) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331059064529 off_chain holder 15294503694649084214 reported Some(4697) head Some(5813) checkpoint Some(4198) oldest Some(5008) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331059446084 off_chain holder 15294503694649084214 reported Some(4698) head Some(5813) checkpoint Some(4198) oldest Some(5008) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331059858494 off_chain holder 15294503694649084214 reported Some(4699) head Some(5813) checkpoint Some(4198) oldest Some(5008) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331062503657 off_chain holder 15294503694649084214 reported Some(4700) head Some(5813) checkpoint Some(4198) oldest Some(5008) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331063154462 off_chain holder 15294503694649084214 reported Some(4701) head Some(5814) checkpoint Some(4198) oldest Some(5009) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331063580064 off_chain holder 15294503694649084214 reported Some(4702) head Some(5815) checkpoint Some(4198) oldest Some(5010) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331063952476 off_chain holder 15294503694649084214 reported Some(4703) head Some(5815) checkpoint Some(4198) oldest Some(5010) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331066326029 off_chain holder 15294503694649084214 reported Some(4704) head Some(5815) checkpoint Some(4198) oldest Some(5010) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331067797862 off_chain holder 15294503694649084214 reported Some(4705) head Some(5816) checkpoint Some(4198) oldest Some(5011) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331070387204 off_chain holder 15294503694649084214 reported Some(4706) head Some(5820) checkpoint Some(4198) oldest Some(5015) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331070900449 off_chain holder 15294503694649084214 reported Some(4707) head Some(5820) checkpoint Some(4198) oldest Some(5015) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331071512072 off_chain holder 15294503694649084214 reported Some(4708) head Some(5821) checkpoint Some(4198) oldest Some(5016) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331072134847 off_chain holder 15294503694649084214 reported Some(4709) head Some(5821) checkpoint Some(4198) oldest Some(5016) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331072517739 off_chain holder 15294503694649084214 reported Some(4710) head Some(5821) checkpoint Some(4198) oldest Some(5016) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331074967488 off_chain holder 15294503694649084214 reported Some(4711) head Some(5821) checkpoint Some(4198) oldest Some(5016) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331075564488 off_chain holder 15294503694649084214 reported Some(4712) head Some(5822) checkpoint Some(4198) oldest Some(5017) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331075943548 off_chain holder 15294503694649084214 reported Some(4713) head Some(5823) checkpoint Some(4198) oldest Some(5018) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331076444313 off_chain holder 15294503694649084214 reported Some(4714) head Some(5824) checkpoint Some(4198) oldest Some(5019) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331076967701 off_chain holder 15294503694649084214 reported Some(4715) head Some(5824) checkpoint Some(4198) oldest Some(5019) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331077388215 off_chain holder 15294503694649084214 reported Some(4716) head Some(5825) checkpoint Some(4198) oldest Some(5020) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331077760259 off_chain holder 15294503694649084214 reported Some(4717) head Some(5825) checkpoint Some(4198) oldest Some(5020) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331078164653 off_chain holder 15294503694649084214 reported Some(4718) head Some(5825) checkpoint Some(4198) oldest Some(5020) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331078559840 off_chain holder 15294503694649084214 reported Some(4719) head Some(5825) checkpoint Some(4198) oldest Some(5020) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331079004144 off_chain holder 15294503694649084214 reported Some(4720) head Some(5825) checkpoint Some(4198) oldest Some(5020) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331079376676 off_chain holder 15294503694649084214 reported Some(4721) head Some(5825) checkpoint Some(4198) oldest Some(5020) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331079786639 off_chain holder 15294503694649084214 reported Some(4722) head Some(5825) checkpoint Some(4198) oldest Some(5020) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331082387628 off_chain holder 15294503694649084214 reported Some(4723) head Some(5827) checkpoint Some(4198) oldest Some(5022) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331082783335 off_chain holder 15294503694649084214 reported Some(4724) head Some(5827) checkpoint Some(4198) oldest Some(5022) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331084368994 off_chain holder 15294503694649084214 reported Some(4725) head Some(5827) checkpoint Some(4198) oldest Some(5022) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331088143496 off_chain holder 15294503694649084214 reported Some(4726) head Some(5828) checkpoint Some(4198) oldest Some(5023) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331088603808 off_chain holder 15294503694649084214 reported Some(4727) head Some(5829) checkpoint Some(4198) oldest Some(5024) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331088808013 off_chain holder 15294503694649084214 reported Some(4728) head Some(5829) checkpoint Some(4198) oldest Some(5024) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331088974228 off_chain holder 15294503694649084214 reported Some(4729) head Some(5829) checkpoint Some(4198) oldest Some(5024) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331089239078 off_chain holder 15294503694649084214 reported Some(4730) head Some(5829) checkpoint Some(4198) oldest Some(5024) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331089562493 off_chain holder 15294503694649084214 reported Some(4731) head Some(5830) checkpoint Some(4198) oldest Some(5025) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331089739659 off_chain holder 15294503694649084214 reported Some(4732) head Some(5830) checkpoint Some(4198) oldest Some(5025) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331089903811 off_chain holder 15294503694649084214 reported Some(4733) head Some(5830) checkpoint Some(4198) oldest Some(5025) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331090091841 off_chain holder 15294503694649084214 reported Some(4734) head Some(5830) checkpoint Some(4198) oldest Some(5025) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331090301189 off_chain holder 15294503694649084214 reported Some(4735) head Some(5830) checkpoint Some(4198) oldest Some(5025) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331091582825 off_chain holder 15294503694649084214 reported Some(4736) head Some(5831) checkpoint Some(4198) oldest Some(5026) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331092066431 off_chain holder 15294503694649084214 reported Some(4737) head Some(5832) checkpoint Some(4198) oldest Some(5027) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331092303146 off_chain holder 15294503694649084214 reported Some(4738) head Some(5832) checkpoint Some(4198) oldest Some(5027) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331092507344 off_chain holder 15294503694649084214 reported Some(4739) head Some(5832) checkpoint Some(4198) oldest Some(5027) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331092808272 off_chain holder 15294503694649084214 reported Some(4740) head Some(5833) checkpoint Some(4198) oldest Some(5028) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331092992174 off_chain holder 15294503694649084214 reported Some(4741) head Some(5833) checkpoint Some(4198) oldest Some(5028) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331093259735 off_chain holder 15294503694649084214 reported Some(4742) head Some(5833) checkpoint Some(4198) oldest Some(5028) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331093689920 off_chain holder 15294503694649084214 reported Some(4743) head Some(5834) checkpoint Some(4198) oldest Some(5029) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331094008047 off_chain holder 15294503694649084214 reported Some(4744) head Some(5834) checkpoint Some(4198) oldest Some(5029) retained 806 bytes 18280673 retain_bytes 18281891
+LD-WHY wall_ns 1794159331094329662 off_chain holder 15294503694649084214 reported Some(4745) head Some(5834) checkpoint Some(4198) oldest Some(5029) retained 806 bytes 18280673 retain_bytes 18281891
