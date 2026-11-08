@@ -1853,6 +1853,9 @@ pub struct VolumeSummary {
   pub overlay: bool,
   /// Whether it is live-shipped (A-200). Appended.
   pub live_shipped: bool,
+  /// Why recovery could not rebuild it after the daemon's restart, when it could not (§4.8): every verb on it but its
+  /// destroy answers [`Refusal::NotRecovered`] with this cause. Appended.
+  pub not_recovered: Option<RecoveryCause>,
 }
 
 /// A merge conflict window (§4.16): the file, the range in base coordinates that met an intervening

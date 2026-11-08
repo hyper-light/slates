@@ -426,9 +426,16 @@ pub(crate) fn merge_role(state: &ShardState, volume: DbVolumeId) -> Option<Merge
 }
 
 /// The catalog record of any live volume — plain, green or work — or the typed refusal: `NotFound`
-/// with no record, `Destroying` for one on its way out. (Unlike [`find`], no store slot is needed:
+/// with no record, `Destroying` for one on its way out, `NotRecovered` for one recovery could not rebuild. (Unlike [`find`], no store slot is needed:
 /// a merge volume has none.)
 pub(crate) fn find_record(state: &ShardState, volume: VolumeId) -> Result<VolumeRecord, Refusal> {
+  // A volume recovery could not rebuild answers why to every verb that reads its record alone, a share among them, as
+  // `verbs::find` does for the rest (GAPS, 2026-11-08); only its destroy is served (`verbs::destroy_unrecovered`).
+  if let Some(cause) = state.unrecovered.get(&to_db_volume(volume)) {
+    return Err(Refusal::NotRecovered {
+      cause: cause.clone(),
+    });
+  }
   let record = state
     .db
     .partition()

@@ -4974,7 +4974,12 @@ needs a listing the recovered plane has not read yet reads it then rather than t
 base snapshot is judged complete against its directories' listings read from the host, uncached, so their first real
 listing still renumbers their untouched entries (A-151; 2026-11-08,
 `docs/bugs/2026-11-08-a-pinned-snapshot-was-refused-as-a-greens-base-after-a-restart.md`). Missing resources
-return `RecoveryIncomplete`/`BaseUnavailable`, never empty success.
+return `RecoveryIncomplete`/`BaseUnavailable`, never empty success. A volume whose record survives but which recovery
+cannot rebuild at all is listed with its cause (`VolumeSummary::not_recovered`), and every verb on it answers
+`NotRecovered { cause }` but its destroy. The destroy removes the record, which has no live slot, in one step, as a merge
+volume's does: its attachments end, then `Destroying`, the lease's release and `VolumeDestroyed`, which takes its
+snapshots' records, lineage and keys and leaves its tombstone, with nothing materialized (2026-11-08,
+`docs/bugs/2026-11-08-a-volume-recovery-could-not-rebuild-could-not-be-destroyed.md`).
 The version-2 volume image now preserves overlay source paths and full directory fingerprints,
 witnesses, whiteouts, redirects, metadata copy-ups and private large-file ranges, including snapshots.
 Recovery validates no-follow source acquisition before reinstating lazy reads and invalidates caches.

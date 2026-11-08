@@ -312,7 +312,7 @@
 >   removed, with these fixes: no such stall; each first `no_catalog` refusal was followed by holding.
 
 > **A volume recovery could not rebuild (2026-11-06): its status names why, and Windows unmount passes over it
-> (fixed); destroying it (open).** Such a volume stays in the catalog and in `volume list`, but every verb on it answered
+> (fixed); destroying it (fixed 2026-11-08).** Such a volume stays in the catalog and in `volume list`, but every verb on it answered
 > `NotFound`. It now answers `Refusal::NotRecovered { cause }`, a closed `RecoveryCause` kept from recovery
 > (`docs/bugs/2026-11-06-a-listed-volume-recovery-could-not-rebuild-answered-not-found.md`). Windows `slates unmount`
 > asked each volume's status and stopped at the first refusal, so one such volume blocked every drive; it now asks every
@@ -322,9 +322,19 @@
 > tests 6, the CLI flow 86) and red with it removed (diag-slabs-26, run 42319805390: "refused: NotFound"). On Windows,
 > on both runners, the unmount test green (diag-slabs-24, run 42319805783: the WinFsp suite 16), red with the old loop
 > (diag-slabs-25, run 42319805958: the drive was found first and the unrecovered volume never named), and red with the
-> status fix removed (diag-slabs-26, run 42319805581: "refused: NotFound"). Open:
-> - **Destroying such a volume.** `destroy` goes through the same lookup, so it is refused `NotRecovered` (before, `NotFound`)
->   and the catalog record stays: a destroy must be able to remove a record with no live slot.
+> status fix removed (diag-slabs-26, run 42319805581: "refused: NotFound").
+> - **Destroying such a volume: fixed 2026-11-08 (slabs).** `destroy` was refused `NotRecovered` too, so the record, its
+>   snapshots' records and its name stayed for good (banned item 8). It now removes a record with no live slot in one
+>   step: the volume's attachments end, then `Destroying`, the lease's release and `VolumeDestroyed`, and its name alias,
+>   its origin pin and its live shipping are given back, with nothing materialized. The sweep: `volume list` names the
+>   cause (`not_recovered=<kind>`; JSON `"not_recovered"`), and `share`, which read only the catalog and went through,
+>   is refused `NotRecovered` with every catalog-only lookup (`find_record`). Proven on macOS: the destroy test red
+>   before (`refused: NotRecovered`) and green after, the volume still gone after a second restart; the sweep test red
+>   at the list line before and at the share with `find_record`'s check taken out. Record:
+>   `docs/bugs/2026-11-08-a-volume-recovery-could-not-rebuild-could-not-be-destroyed.md`.
+> - **Open, found here:** on Linux a kept FUSE mount of such a volume is let go but never unmounted (the stale-mount
+>   unmount is skipped for it), so it answers `ENOTCONN` until someone unmounts it (from reading the code, not yet run);
+>   and the Python and Node SDKs' listings carry neither `live_shipped` nor `not_recovered`.
 
 > **A path on a volume this daemon serves is refused before any open (A-227, 2026-11-06): built on Linux, Windows and
 > macOS.** A base directory and every lookup below it, a landing's target and a FUSE mount point are refused typed
