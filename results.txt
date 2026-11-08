@@ -1,0 +1,11 @@
+tested b50858608d53080e69e00794e03513ccaa17301c variant after on x86_64, 4 cpus
+catalog exit 0 79s
+takeover exit 101 9s
+  takeover: thread 'a_submit_resent_after_its_owner_was_taken_over_is_answered_its_version' (5489) panicked at crates/server/tests/fleet.rs:13890:3:
+  takeover:   left: Refused { refusal: OwnerUnreachable { region: 0 } }
+  takeover:  right: Submitted { version: Some(1), conflicts: [] }
+  takeover: test a_submit_resent_after_its_owner_was_taken_over_is_answered_its_version ... FAILED
+  takeover: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 114 filtered out; finished in 8.59s
+  takeover: error: test failed, to rerun pass `-p slates-server --test fleet`
+share exit 0 415s
+restart exit 0 124s
