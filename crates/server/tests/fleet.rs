@@ -6905,6 +6905,80 @@ fn a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone() 
   );
 }
 
+/// One survivor's known voters and its contact reason for each peer.
+type VotersView = (
+  Result<Vec<HostId>, ObserveError>,
+  Result<Vec<(HostId, String)>, ObserveError>,
+);
+
+/// §4.8, D-14, learners: a learner knows who votes now, and so keeps contact with the council. Do stop the bootstrap voter
+/// of five members at `f = 1` and let the council replace it. Expect every survivor to name the leader's voters, within
+/// the fleet's progress budget, and none to hold a voter outside its direct contact. Found by repeating the learner
+/// report test on CI (diag-live-fixes-53, 2 of 60): the node left unsettled knew only the stopped bootstrapper as a voter,
+/// so it held the real leader `OutsideNeighbourhood` and dropped the session its reports needed.
+#[test]
+fn a_learner_learns_who_votes_once_the_voter_it_joined_from_is_gone() {
+  let _serial = serialize_fleet_tests();
+  let LostBootstrapVoter {
+    daemons,
+    before,
+    known,
+    _serve_lease,
+  } = fleet_that_lost_its_bootstrap_voter();
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let mut views: Vec<VotersView> = Vec::new();
+  let mut leaders: Vec<Vec<HostId>> = Vec::new();
+  let agreed = poll_until(&observed, formation_deadline(), || {
+    views = daemons
+      .iter()
+      .map(|daemon| (daemon.council_known_voters(), daemon.fleet_contacts()))
+      .collect();
+    leaders = daemons
+      .iter()
+      .filter(|daemon| daemon.council_leads() == Ok(true))
+      .filter_map(|daemon| daemon.council_voters().ok().flatten())
+      .collect();
+    let Some(voters) = leaders.first().map(|voters| {
+      let mut sorted = voters.clone();
+      sorted.sort_unstable();
+      sorted
+    }) else {
+      return Ok(false);
+    };
+    let newest = daemons
+      .iter()
+      .filter_map(|daemon| daemon.configuration_versions().ok())
+      .map(|(_, council)| council)
+      .max()
+      .unwrap_or(0);
+    Ok(
+      newest > before
+        && voters.len() == 3
+        && views.iter().all(|(known_voters, contacts)| {
+          let named = known_voters.as_ref().is_ok_and(|named| {
+            let mut sorted = named.clone();
+            sorted.sort_unstable();
+            sorted == voters
+          });
+          let in_contact = contacts.as_ref().is_ok_and(|contacts| {
+            contacts.iter().all(|(peer, reason)| {
+              !voters.contains(peer) || !reason.starts_with("OutsideNeighbourhood")
+            })
+          });
+          named && in_contact
+        }),
+    )
+  });
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    agreed,
+    "every survivor named the leader's voters and kept contact with each: leaders' voters {leaders:?}; (known voters, \
+     contacts) per survivor {views:?}; the learners' views at the stop {known:?}"
+  );
+}
+
 /// AC (§4.8, D-14, learners): the council votes with a **small** set — the members up to the candidate floor
 /// `2f + 1` — and the rest are **learners** that do not vote but fetch the committed configuration over the
 /// transport. Five members at `f = 1` gives three voters and two learners. A learner never leads; and when
