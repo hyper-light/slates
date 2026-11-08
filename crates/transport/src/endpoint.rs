@@ -113,11 +113,11 @@ const HANDSHAKE_TURN_CEILING: usize = 16;
 /// the handshake yields an RTT sample), so this covers a peer that boots many seconds after this node first
 /// dials it — a fleet forms as its nodes come up one after another — while still terminating on a peer that
 /// never answers.
+/// It bounds only waits paced by this end's own timer, so load cannot spend it; a peer's resends are bounded by
+/// [`Endpoint::handshake_deadline`] instead (a count of them ended handshakes with live dialers, 2026-11-08).
 /// Shape: it caps only the failure-and-formation path (a healthy handshake completes in its first few turns
 /// and never retransmits), so the exact value is not performance-tuned — only large enough that the wait,
 /// `MAX_HANDSHAKE_RETRANSMITS` × the initial probe timeout ≈ twenty seconds, spans a plausible boot skew.
-/// It bounds only waits paced by this end's own timer, so load cannot spend it; a peer's resends are bounded by
-/// [`Endpoint::handshake_deadline`] instead (a count of them ended handshakes with live dialers, 2026-11-08).
 const MAX_HANDSHAKE_RETRANSMITS: u32 = 32;
 /// Derived: the most datagrams one handshake turn accepts that do not complete a flight — the fragments a
 /// flight can span, once per retransmit the budget allows, plus the same again for strays — before the
