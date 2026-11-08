@@ -1,0 +1,116 @@
+kind live: unshaped: installed and rolled out in 8.9 s
+kind live: unshaped: live-write: count=1000 acknowledged=1000 refused=0 p50_us=737 p99_us=1272 p999_us=2739 max_us=35995 first_refusal=""
+kind live: wan: installed and rolled out in 7.8 s
+kind live: slates-0:
+  fleet_host: 247817956195795005
+  fleet_host_epoch: 1
+  fleet_members: 247817956195795005 1420742273367513129 2799832622893180737
+  fleet_session 1420742273367513129: lent=true cwnd=5032 srtt_ns=195505464 pto_ns=385099700 spurious_losses=0 persistent_collapses=0 consumed=223452 mtu=1466
+  fleet_session 2799832622893180737: lent=true cwnd=7261 srtt_ns=83446452 pto_ns=133959316 spurious_losses=0 persistent_collapses=0 consumed=223116 mtu=1466
+  shard 0 refused fleet.live.held: 3170
+  shard 0 refused fleet.live.hold_refused: 4
+  shard 0 refused fleet.live.hold_refused.behind: 4
+  shard 0 live held 26db00efb6192741000000000000000c head=100 durable=none owed=false epoch=1 identity=4c72f42cffcd116bc59dc72bf725ebd4720f60158aefae1a5132b32fe8ff891e fence=1
+kind live: slates-1:
+  fleet_host: 1420742273367513129
+  fleet_host_epoch: 1
+  fleet_members: 247817956195795005 1420742273367513129 2799832622893180737
+  fleet_session 247817956195795005: lent=false cwnd=9648 srtt_ns=343840156 pto_ns=1606721204 spurious_losses=1 persistent_collapses=0 consumed=10088 mtu=1466
+  fleet_session 2799832622893180737: lent=false cwnd=11494 srtt_ns=79405711 pto_ns=134491535 spurious_losses=0 persistent_collapses=0 consumed=9352 mtu=1466
+  shard 0 refused fleet.live.held: 3180
+  shard 0 refused fleet.live.hold_refused: 14
+  shard 0 refused fleet.live.hold_refused.behind: 14
+  shard 0 live held 26db00efb6192741000000000000000c head=100 durable=none owed=false epoch=1 identity=4c72f42cffcd116bc59dc72bf725ebd4720f60158aefae1a5132b32fe8ff891e fence=1
+kind live: slates-2:
+  fleet_host: 2799832622893180737
+  fleet_host_epoch: 1
+  fleet_members: 247817956195795005 1420742273367513129 2799832622893180737
+  fleet_session 247817956195795005: lent=true cwnd=119972 srtt_ns=68180333 pto_ns=97976393 spurious_losses=0 persistent_collapses=0 consumed=160134 mtu=1466
+  fleet_session 1420742273367513129: lent=true cwnd=112184 srtt_ns=62777605 pto_ns=71692913 spurious_losses=0 persistent_collapses=0 consumed=161255 mtu=1466
+  shard 0 refused fleet.live.appended: 101
+  shard 0 refused fleet.live.awaited: 49
+  shard 0 refused fleet.live.durable: 61
+  shard 0 refused fleet.live.no_session: 32830
+  shard 0 refused fleet.live.refused: 32
+  shard 0 refused fleet.live.refused.no_credit: 32
+  shard 0 refused fleet.live.resolved: 48
+  shard 0 refused fleet.live.unanswered: 29683
+  shard 0 refused fleet.live.whole: 38
+  shard 0 live shipping 26db00efb6192741000000000000000c head=100 durable=97 owed=false epoch=1 identity=4c72f42cffcd116bc59dc72bf725ebd4720f60158aefae1a5132b32fe8ff891e fence=1
+kind live: wan: kind live: the probe live-writer did not finish within 600s
+kind live: wan-loss: installed and rolled out in 7.8 s
+kind live: slates-0:
+  fleet_host: 7772448900263305556
+  fleet_host_epoch: 1
+  fleet_members: 562268991077639916 7772448900263305556 8359610518796623750
+  fleet_session 562268991077639916: lent=false cwnd=4791 srtt_ns=203397170 pto_ns=406222846 spurious_losses=0 persistent_collapses=0 consumed=216810 mtu=1466
+  fleet_session 8359610518796623750: lent=false cwnd=7144 srtt_ns=80388441 pto_ns=105424157 spurious_losses=1 persistent_collapses=0 consumed=223814 mtu=1466
+  shard 0 refused fleet.live.held: 1460
+  shard 0 refused fleet.live.hold_refused: 676
+  shard 0 refused fleet.live.hold_refused.no_catalog: 676
+  shard 0 live held 74034d79c97ddf860000000000000007 head=171 durable=none owed=false epoch=1 identity=056a6ab19e6601c118f4633424e12ca64a36db3fd4fd4578e4b18388ec4b6205 fence=1
+kind live: slates-1:
+  fleet_host: 562268991077639916
+  fleet_host_epoch: 1
+  fleet_members: 562268991077639916 7772448900263305556 8359610518796623750
+  fleet_session 7772448900263305556: lent=true cwnd=11710 srtt_ns=152847272 pto_ns=387087640 spurious_losses=0 persistent_collapses=0 consumed=995 mtu=1466
+  fleet_session 8359610518796623750: lent=false cwnd=11499 srtt_ns=75999303 pto_ns=114444847 spurious_losses=1 persistent_collapses=0 consumed=10071 mtu=1466
+  shard 0 refused fleet.live.held: 2314
+  shard 0 refused fleet.live.hold_refused: 5
+  shard 0 refused fleet.live.hold_refused.behind: 5
+  shard 0 live held 74034d79c97ddf860000000000000007 head=171 durable=none owed=false epoch=1 identity=056a6ab19e6601c118f4633424e12ca64a36db3fd4fd4578e4b18388ec4b6205 fence=1
+kind live: slates-2:
+  fleet_host: 8359610518796623750
+  fleet_host_epoch: 1
+  fleet_members: 562268991077639916 7772448900263305556 8359610518796623750
+  fleet_session 562268991077639916: lent=true cwnd=88135 srtt_ns=68379653 pto_ns=98733137 spurious_losses=0 persistent_collapses=0 consumed=71800 mtu=1466
+  fleet_session 7772448900263305556: lent=true cwnd=121316 srtt_ns=65760294 pto_ns=91879846 spurious_losses=0 persistent_collapses=0 consumed=76270 mtu=1466
+  shard 0 refused fleet.live.appended: 172
+  shard 0 refused fleet.live.awaited: 86
+  shard 0 refused fleet.live.durable: 154
+  shard 0 refused fleet.live.link_lost: 1
+  shard 0 refused fleet.live.no_session: 29858
+  shard 0 refused fleet.live.refused: 47
+  shard 0 refused fleet.live.refused.no_credit: 47
+  shard 0 refused fleet.live.resolved: 85
+  shard 0 refused fleet.live.unanswered: 27225
+  shard 0 refused fleet.live.whole: 49
+  shard 0 live shipping 74034d79c97ddf860000000000000007 head=171 durable=168 owed=true epoch=1 identity=056a6ab19e6601c118f4633424e12ca64a36db3fd4fd4578e4b18388ec4b6205 fence=1
+kind live: wan-loss: kind live: the probe live-writer did not finish within 600s
+kind live: ceiling: installed and rolled out in 8.9 s
+kind live: slates-0:
+  fleet_host: 5543436038949684200
+  fleet_host_epoch: 1
+  fleet_members: 5543436038949684200 8249331090508614913 8781285414056390521
+  fleet_session 8249331090508614913: lent=true cwnd=11710 srtt_ns=350210180 pto_ns=351210180 spurious_losses=0 persistent_collapses=0 consumed=70442 mtu=1466
+  fleet_session 8781285414056390521: lent=true cwnd=11710 srtt_ns=700231448 pto_ns=701231448 spurious_losses=0 persistent_collapses=0 consumed=71166 mtu=1466
+  shard 0 refused fleet.live.held: 303
+  shard 0 refused fleet.live.hold_refused: 553
+  shard 0 refused fleet.live.hold_refused.no_catalog: 553
+  shard 0 live held 727b82eb845a0d010000000000000009 head=1 durable=none owed=false epoch=1 identity=7ff767a3aedde505791389fa9203618e6712a05f0373734007616d20027ca06b fence=1
+kind live: slates-1:
+  fleet_host: 8781285414056390521
+  fleet_host_epoch: 1
+  fleet_members: 5543436038949684200 8249331090508614913 8781285414056390521
+  fleet_session 5543436038949684200: lent=false cwnd=11710 srtt_ns=700359832 pto_ns=701665616 spurious_losses=0 persistent_collapses=0 consumed=7910 mtu=1466
+  fleet_session 8249331090508614913: lent=false cwnd=11710 srtt_ns=350171522 pto_ns=351171522 spurious_losses=0 persistent_collapses=0 consumed=8211 mtu=1466
+  shard 0 refused fleet.live.held: 855
+  shard 0 live held 727b82eb845a0d010000000000000009 head=1 durable=none owed=false epoch=1 identity=7ff767a3aedde505791389fa9203618e6712a05f0373734007616d20027ca06b fence=1
+kind live: slates-2:
+  fleet_host: 8249331090508614913
+  fleet_host_epoch: 1
+  fleet_members: 5543436038949684200 8249331090508614913 8781285414056390521
+  fleet_session 5543436038949684200: lent=true cwnd=11710 srtt_ns=350163249 pto_ns=351163249 spurious_losses=0 persistent_collapses=0 consumed=19376 mtu=1466
+  fleet_session 8781285414056390521: lent=true cwnd=11710 srtt_ns=350165312 pto_ns=351165312 spurious_losses=0 persistent_collapses=0 consumed=45189 mtu=1466
+  shard 0 refused fleet.live.appended: 2
+  shard 0 refused fleet.live.awaited: 1
+  shard 0 refused fleet.live.no_session: 23135
+  shard 0 refused fleet.live.unanswered: 22030
+  shard 0 refused fleet.live.whole: 1
+  shard 0 live shipping 727b82eb845a0d010000000000000009 head=1 durable=none owed=false epoch=1 identity=7ff767a3aedde505791389fa9203618e6712a05f0373734007616d20027ca06b fence=1
+kind live: ceiling: kind live: the probe live-writer did not finish within 600s
+kind live:   unshaped: count=1000 acknowledged=1000 refused=0 p50_us=737 p99_us=1272 p999_us=2739 max_us=35995 first_refusal=""; converged at head Some(1001) epoch Some(1); 1 heads seen, one identity each; owner read back whole=1000 missing=0 torn=0; taken over by slates-0 after 3.9 s, epoch 2, read back whole=1000 missing=0 torn=0
+kind live:   wan: FAILED: kind live: the probe live-writer did not finish within 600s
+kind live:   wan-loss: FAILED: kind live: the probe live-writer did not finish within 600s
+kind live:   ceiling: FAILED: kind live: the probe live-writer did not finish within 600s
+exit 1 arm main head a2cf9af737e85df69884869d8bbf1ebdd0d32cd0
