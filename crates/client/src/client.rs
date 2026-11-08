@@ -4239,11 +4239,22 @@ impl Client {
     }
   }
 
-  /// The caller's grants.
+  /// The caller's grants, in grant-id order: walked a page at a time, as one reply holds one page (§4.3).
   pub fn grants(&mut self) -> Result<Vec<GrantSummary>, ClientError> {
-    match self.call(&RequestBody::Grants)? {
-      ReplyBody::Grants { grants } => Ok(grants),
-      _ => Err(ClientError::UnexpectedReply { verb: "grants" }),
+    let mut grants: Vec<GrantSummary> = Vec::new();
+    let mut after = None;
+    loop {
+      let ReplyBody::Grants { grants: page, next } = self.call(&RequestBody::Grants { after })?
+      else {
+        return Err(ClientError::UnexpectedReply { verb: "grants" });
+      };
+      grants.extend(page);
+      match next {
+        None => return Ok(grants),
+        // A page must move the cursor forward, so a walk always ends.
+        Some(next) if after.is_none_or(|after| next > after) => after = Some(next),
+        Some(_) => return Err(ClientError::UnexpectedReply { verb: "grants" }),
+      }
     }
   }
 

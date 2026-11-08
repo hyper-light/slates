@@ -431,8 +431,13 @@ pub enum RequestBody {
     /// A grant the caller already holds (from `slates grant`), or none to be presented.
     grant: Option<u64>,
   },
-  /// The caller's grants (a read; creating a grant is off-ring).
-  Grants,
+  /// One page of the caller's grants (a read; creating a grant is off-ring), in grant-id order past `after`: `None`
+  /// begins, and each page's `next` continues it. A page holds what one reply chunk holds (§4.3), so a principal's
+  /// grants of any number are walked; a grant that exists throughout the walk is answered exactly once.
+  Grants {
+    /// The last grant of the previous page, or `None` for the first page.
+    after: Option<u64>,
+  },
   /// One page of the audit (§4.15, A-265): the records from sequence `since` on, in sequence order, as many as one
   /// reply chunk holds. One partition holds the audit, the control shard's, so the sequence numbers the daemon's
   /// records and a walk continues from one past the last record a page held. A read.
@@ -1475,7 +1480,7 @@ impl RequestBody {
       | RequestBody::RecoveryPlan { .. }
       | RequestBody::Recover { .. }
       | RequestBody::PromoteRegion { .. }
-      | RequestBody::Grants
+      | RequestBody::Grants { .. }
       | RequestBody::Audit { .. }
       | RequestBody::Acknowledge { .. }
       | RequestBody::Telemetry { .. }
@@ -3336,10 +3341,12 @@ pub enum ReplyBody {
     /// The outcome.
     outcome: LandingOutcome,
   },
-  /// The caller's grants.
+  /// One page of the caller's grants (`Grants`), in grant-id order.
   Grants {
-    /// The grants.
+    /// The grants of this page.
     grants: Vec<GrantSummary>,
+    /// The cursor that continues the walk (the last grant of this page), or `None` when this page ends it.
+    next: Option<u64>,
   },
   /// One page of the audit (`Audit`, A-265): records in sequence order, as many as one reply chunk holds (§4.3).
   Audit {

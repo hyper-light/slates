@@ -20,10 +20,10 @@ use slates_wire::request::{ClientWindow, Seen};
 use crate::Art;
 use crate::catalog::{
   AttachmentRecord, AuditRecord, CompletionRecord, Consumer, ConsumerRecord, GrantRecord,
-  LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge, NameAliasRecord, NfsCallRecord,
-  NfsClientRecord, NfsDelegationRecord, NfsLockRecord, NfsOpenRecord, NfsPurgeRecord,
-  NfsSessionRecord, Principal, SEAL_KEY_RECORD_BYTES, SEAL_RECIPIENT_RECORD_MAX, SealKeyOwner,
-  SealKeyRecord, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
+  GrantState, LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge, NameAliasRecord,
+  NfsCallRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord, NfsOpenRecord,
+  NfsPurgeRecord, NfsSessionRecord, Principal, SEAL_KEY_RECORD_BYTES, SEAL_RECIPIENT_RECORD_MAX,
+  SealKeyOwner, SealKeyRecord, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
 };
 use crate::error::DbError;
 use crate::op::Op;
@@ -150,6 +150,8 @@ pub struct PartitionSnapshot {
   pub audit_next_seq: u64,
   /// The audit records dropped past the bound (A-265; appended).
   pub audit_dropped: u64,
+  /// The highest grant id ever issued here (A-266; appended): the table holds live grants only.
+  pub grants_issued_through: u64,
 }
 
 /// One green's checkpoint, as a snapshot carries it (W3; §4.16): the version it is the green's state at, and its
@@ -224,6 +226,9 @@ pub struct Partition {
   /// The sequence the next audit record takes (A-265): a counter of the partition's own, snapshotted, so the numbers
   /// never depend on which records are retained.
   audit_next_seq: u64,
+  /// The highest grant id ever issued here (A-266): the table holds live grants only, so this mark, snapshotted, is
+  /// what keeps an ended grant's id from being issued again after a restart.
+  grants_issued_through: u64,
   /// Each green volume's merge chain (§4.16): its accepted increments after its checkpoint (all of them while it holds
   /// none), encoded, in commit order, so recovery replays them to rebuild the green. Bounded by `green_chain_bytes`
   /// against the cap.
@@ -333,6 +338,7 @@ impl Partition {
       green_origin_refs: BTreeMap::new(),
       green_checkpoints: BTreeMap::new(),
       audit_next_seq: 0,
+      grants_issued_through: 0,
       tombstones: BTreeMap::new(),
     }
   }
@@ -701,6 +707,25 @@ impl Partition {
   /// Every grant, by id order: what a restarted shard rebuilds its runtime grants from (AUD-29-06).
   pub fn grants(&self) -> impl Iterator<Item = &GrantRecord> {
     self.grants.values()
+  }
+
+  /// A grant's state change: at a terminal step (consumed, expired, revoked) it leaves the table (A-266), which holds
+  /// live grants; its history is the audit log.
+  fn change_grant_state(&mut self, id: u64, state: GrantState) -> Result<(), DbError> {
+    if matches!(
+      state,
+      GrantState::Consumed | GrantState::Expired | GrantState::Revoked
+    ) {
+      self.grants.remove(&id).ok_or(DbError::NotFound)?;
+    } else {
+      self.grants.get_mut(&id).ok_or(DbError::NotFound)?.state = state;
+    }
+    Ok(())
+  }
+
+  /// The highest grant id ever issued here (A-266), whatever grants have since ended and left the table.
+  pub fn grants_issued_through(&self) -> u64 {
+    self.grants_issued_through
   }
 
   /// An enrolled consumer's record (§4.13), or `None` if no such consumer was ever enrolled.
@@ -1552,13 +1577,11 @@ impl Partition {
         Ok(())
       }
       Op::GrantIssued { record } => {
+        self.grants_issued_through = self.grants_issued_through.max(record.id);
         self.grants.insert(record.id, record.clone());
         Ok(())
       }
-      Op::GrantStateChanged { id, state } => {
-        self.grants.get_mut(id).ok_or(DbError::NotFound)?.state = *state;
-        Ok(())
-      }
+      Op::GrantStateChanged { id, state } => self.change_grant_state(*id, *state),
       Op::ConsumerEnrolled { record } => {
         self.consumers.insert(record.consumer, record.clone());
         Ok(())
@@ -1899,6 +1922,7 @@ impl Partition {
       expired_attachments: self.expired_attachments.iter().copied().collect(),
       audit_next_seq: self.audit_next_seq,
       audit_dropped: self.audit_dropped,
+      grants_issued_through: self.grants_issued_through,
       nfs_instance: self.nfs_instance,
       tombstones: self.tombstones().collect(),
       green_chains: {
@@ -2026,6 +2050,7 @@ impl Partition {
     p.audit = snapshot.audit.iter().cloned().collect();
     p.audit_dropped = snapshot.audit_dropped;
     p.audit_next_seq = snapshot.audit_next_seq;
+    p.grants_issued_through = snapshot.grants_issued_through;
     p.restore_merge(snapshot);
     p.restore_nfs(snapshot);
     p.restore_name_aliases(snapshot);

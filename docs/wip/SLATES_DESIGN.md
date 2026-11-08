@@ -20148,3 +20148,23 @@ send after a verb's transaction), `crates/ipc/src/protocol.rs` (`Audit { since }
 - **Proven:** numbering and recovery, and the bounded window over a replay and a snapshot, in the database; a client on
   either of two shards reads every shard's records at once after a landing's reply
   (`a_client_on_any_shard_reads_every_shards_audit`); the audit paged by use.
+
+### A-266 — A principal's grants are paged, and the table holds live grants (accepted 2026-11-08)
+Applied in the same change to: §4.15 (grants), `crates/db/src/partition.rs` (`change_grant_state`,
+`grants_issued_through`), `crates/land/src/grant.rs` (`end`, `expired_at`, `restore_issued_through`, an absent id at or
+below the highest issued refused as spent), `crates/server/src/landing.rs` (`grants_part`, `grants_page`,
+`longest_grantable_target`, `end_grants_recorded_ended`, `end_expired_grants`), `crates/server/src/daemon.rs` (the reap
+tick), `crates/server/src/verbs.rs` (the gather, the target bound), `crates/ipc/src/protocol.rs` (`Grants { after }`,
+`Grants { grants, next }`), `crates/client/src/client.rs`, GAPS,
+`docs/bugs/2026-11-08-a-principals-grants-outgrew-one-reply-and-were-kept-for-good.md`.
+- **Paged:** the whole list was one reply, refused between 25 and 50 grants. A page holds what one reply chunk holds,
+  in grant-id order past a cursor, each shard sending at most a page.
+- **Live grants only:** every grant stayed in the table for the daemon's life. A grant leaves it at its terminal step,
+  in `apply`, and the runtime table once that commits; its history is the audit log. The highest id issued is kept and
+  snapshotted, so an id is never reused and a spent one is refused `GrantInvalid`.
+- **Ended at its term:** the reap tick ends grants past their term, counted.
+- **A target that a grant can be listed with:** a `land` request carries a target of about 4,046 bytes; a target past
+  `longest_grantable_target` (3,995 bytes, a grants page's room less a summary with an empty target) is refused
+  `TargetUnavailable` before presenting. Landing runs on macOS and Linux; macOS's `PATH_MAX` (1,023 bytes) is the
+  smaller there, so the bound binds on Linux.
+- **Open:** an expiry writes no audit record.

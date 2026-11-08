@@ -1076,8 +1076,8 @@ fn grant_scenario() {
     0,
     "a grant for one target wrote into another"
   );
-  // The landing runs under its grant, and `grants` lists it — across shards (the grant record lives on
-  // the volume's owner shard, not necessarily the client's).
+  // The landing runs under its grant. A grant once used is consumed, and a consumed grant leaves the table (A-266):
+  // `grants`, across shards (the record lives on the volume's owner shard), lists none, and its history is the audit's.
   let landed = client.call(&RequestBody::Land {
     volume: id,
     snapshot: Some(snapshot),
@@ -1090,9 +1090,19 @@ fn grant_scenario() {
   };
   assert_landed_reply_carries_what_it_achieved(&outcome);
   assert!(matches!(
-    client.call(&RequestBody::Grants),
-    ReplyBody::Grants { grants } if grants.len() == 1 && grants[0].id == grant
+    client.call(&RequestBody::Grants { after: None }),
+    ReplyBody::Grants { grants, .. } if grants.is_empty()
   ));
+  let ReplyBody::Audit { records, .. } = client.call(&RequestBody::Audit { since: 0 }) else {
+    panic!("the audit");
+  };
+  assert!(
+    records
+      .iter()
+      .any(|r| r.kind == "grant_issued" && r.grant == Some(grant))
+      && records.iter().any(|r| r.kind == "landing_finished"),
+    "the consumed grant's history is the audit's: {records:?}"
+  );
   daemon.stop();
 }
 
@@ -1371,8 +1381,8 @@ fn forged_approval_is_refused(client: &mut Client, landing: u64, manifest: [u8; 
   );
   assert!(
     matches!(
-      client.call(&RequestBody::Grants),
-      ReplyBody::Grants { grants } if grants.is_empty()
+      client.call(&RequestBody::Grants { after: None }),
+      ReplyBody::Grants { grants, .. } if grants.is_empty()
     ),
     "a forged approval issued nothing"
   );
@@ -1428,8 +1438,8 @@ fn landing_refusal_scenario() {
   ));
   // The caller has no grants and the audit log is empty (the refused landing recorded nothing).
   assert!(matches!(
-    client.call(&RequestBody::Grants),
-    ReplyBody::Grants { grants } if grants.is_empty()
+    client.call(&RequestBody::Grants { after: None }),
+    ReplyBody::Grants { grants, .. } if grants.is_empty()
   ));
   assert!(matches!(
     client.call(&RequestBody::Audit { since: 0 }),

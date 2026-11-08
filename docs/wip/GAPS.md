@@ -63,7 +63,13 @@
 >   removed, every record held by the control shard's partition, and the read paged. **Open:** a record made on another
 >   shard reaches the control partition after its own atom commits, so a crash between the two loses that batch
 >   (`docs/bugs/2026-11-08-the-audit-numbered-nothing-and-kept-everything.md`).
-> - **Still open, the same one-reply shape**, by their code and not reproduced: `grants`, a status's `drifted`
+> - **`grants`: paged, and the table holds live grants (A-266, 2026-11-08).** Refused between 25 and 50 grants; paging
+>   it found every grant kept for the daemon's life and none ended at its term. Now paged in grant-id order, a grant
+>   leaves the table at its terminal step (its history is the audit), the reap ends grants past their term, and a
+>   target past what a grant's summary holds on one page (3,995 bytes) is refused before presenting. **Open:** an expiry
+>   writes no audit record, so an expired grant's history is its `grant_issued` alone
+>   (`docs/bugs/2026-11-08-a-principals-grants-outgrew-one-reply-and-were-kept-for-good.md`).
+> - **Still open, the same one-reply shape**, by their code and not reproduced: a status's `drifted`
 >   list, and the conflict and invalidation lists of `Submitted`, `Rebased`, `GrantRequired` and `Advanced`. Each needs
 >   a cursor the way `List`, `ChangedSince` and `ReadDir` have, or a derived bound and a typed refusal.
 

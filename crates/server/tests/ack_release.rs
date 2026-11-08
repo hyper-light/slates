@@ -528,7 +528,7 @@ fn a_listing_whose_part_cannot_be_sent_is_refused_overloaded() {
 fn a_grants_listing_whose_part_cannot_be_sent_is_refused_overloaded() {
   check_typed_refusal(
     "grants",
-    scattered_with_the_other_shard_full("grants-full", &RequestBody::Grants),
+    scattered_with_the_other_shard_full("grants-full", &RequestBody::Grants { after: None }),
   );
 }
 

@@ -2166,8 +2166,8 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
   if let RequestBody::List { after } = body {
     return scatter_list(state, client.index(), request.request, principal, after);
   }
-  if let RequestBody::Grants = body {
-    return scatter_grants(state, client.index(), request.request, principal);
+  if let RequestBody::Grants { after } = body {
+    return scatter_grants(state, client.index(), request.request, principal, after);
   }
   if matches!(
     &body,
@@ -2955,6 +2955,7 @@ fn scatter_grants(
   client_index: u32,
   request: u64,
   principal: Principal,
+  after: Option<u64>,
 ) -> Served {
   let others: Vec<u16> = state
     .shards
@@ -2962,25 +2963,20 @@ fn scatter_grants(
     .copied()
     .filter(|s| *s != state.shard)
     .collect();
-  let mine = match crate::landing::grants_verb(state, &principal) {
-    ReplyBody::Grants { grants } => grants,
-    other => return Served::Reply(other),
-  };
+  let mine = crate::landing::grants_part(state, &principal, after);
   if others.is_empty() {
-    return Served::Reply(ReplyBody::Grants { grants: mine });
+    return Served::Reply(crate::landing::grants_page(vec![mine]));
   }
   state
     .grant_scatters
-    .insert(request, (client_index, others.len(), mine));
+    .insert(request, (client_index, others.len(), vec![mine]));
   let origin = state.shard;
   for shard in others {
     let principal = principal.clone();
     let task = SpawnRequest::new(
       Box::pin(async move {
-        let part = match crate::state::with_state(|s| crate::landing::grants_verb(s, &principal)) {
-          Some(ReplyBody::Grants { grants }) => grants,
-          _ => Vec::new(),
-        };
+        let part = crate::state::with_state(|s| crate::landing::grants_part(s, &principal, after))
+          .unwrap_or_default();
         crate::xshard::send_reply_home(origin, move || {
           gather_grants(request, part);
         })
@@ -2995,12 +2991,11 @@ fn scatter_grants(
   Served::Forwarded
 }
 
-/// Folds one shard's part of a `grants` read into the scatter and, on the last part, delivers the merged
-/// grants in id order.
-fn gather_grants(request: u64, part: Vec<slates_ipc::protocol::GrantSummary>) {
+/// Folds one shard's part of a `grants` page into the scatter and, on the last part, delivers the merged page.
+fn gather_grants(request: u64, part: PagePart<slates_ipc::protocol::GrantSummary>) {
   let done = crate::state::with_state(|s| {
     let entry = s.grant_scatters.get_mut(&request)?;
-    entry.2.extend(part);
+    entry.2.push(part);
     entry.1 = entry.1.saturating_sub(1);
     if entry.1 == 0 {
       let refused_for = s.scatter_refusals.remove(&request);
@@ -3012,9 +3007,8 @@ fn gather_grants(request: u64, part: Vec<slates_ipc::protocol::GrantSummary>) {
     }
   })
   .flatten();
-  if let Some(((client_index, _, mut grants), unsent)) = done {
-    grants.sort_by_key(|g| g.id);
-    let reply = unsent.unwrap_or(ReplyBody::Grants { grants });
+  if let Some(((client_index, _, parts), unsent)) = done {
+    let reply = unsent.unwrap_or_else(|| crate::landing::grants_page(parts));
     crate::state::deliver(client_index, request, reply, false);
   }
 }
@@ -4274,7 +4268,9 @@ fn dispatch_inner(
       (volume, attachment),
       crate::fs_verbs::FsOp::Mkdir { path: &path, mode },
     ),
-    RequestBody::Grants => crate::landing::grants_verb(state, principal),
+    RequestBody::Grants { after } => {
+      crate::landing::grants_page(vec![crate::landing::grants_part(state, principal, after)])
+    }
     RequestBody::Audit { since } => crate::landing::audit_verb(state, since),
     RequestBody::Acknowledge { up_to, owed } => acknowledge(state, client_id, up_to, &owed),
     RequestBody::ReadBase { volume, path } => read_base(state, principal, volume, &path),
@@ -9980,8 +9976,9 @@ fn restore_node(
 /// Format: POSIX `0755`, the mode a restored directory takes when the archive carries none for it.
 const DEFAULT_DIRECTORY_MODE: u32 = 0o755;
 
-/// What a verb is refused before it runs: a mutation before the consensus group exists, and a new volume whose name
-/// no listing page could hold ([`longest_listable_name`]).
+/// What a verb is refused before it runs: a mutation before the consensus group exists, a landing whose target no
+/// grants page could hold (`landing::longest_grantable_target`), and a new volume whose name no listing page could hold
+/// ([`longest_listable_name`]).
 fn refused_before_dispatch(
   state: &ShardState,
   body: &RequestBody,
@@ -9989,6 +9986,17 @@ fn refused_before_dispatch(
 ) -> Option<Refusal> {
   if republish && !state.consensus_ready {
     return Some(Refusal::ConsensusNotInitialized);
+  }
+  if let RequestBody::Land { target, .. } = body
+    && target.len() > crate::landing::longest_grantable_target()
+  {
+    return Some(Refusal::TargetUnavailable {
+      reason: format!(
+        "a target of {} bytes is longer than the {} a grant's listing holds",
+        target.len(),
+        crate::landing::longest_grantable_target()
+      ),
+    });
   }
   if new_volume_name(body).is_some_and(|name| name.len() > longest_listable_name()) {
     return Some(Refusal::InvalidName);
@@ -10091,7 +10099,7 @@ fn longest_listable_name() -> usize {
       live_shipped: false,
       not_recovered: Some(cause),
     })
-    .map(|summary| summary_bytes(&summary))
+    .map(|summary| encoded_len(&summary))
     .max()
     .unwrap_or(0);
   list_page_room().saturating_sub(unnamed)
@@ -10129,7 +10137,7 @@ fn bare_causes() -> [slates_ipc::protocol::RecoveryCause; 8] {
 /// [`longest_listable_name`], always fits beside a cause's fixed part, so only the cause's text is ever cut; the cause
 /// names an unrecovered volume's trouble, and a path or a reason of any length cannot refuse the listing it is in.
 fn listed(mut summary: VolumeSummary) -> VolumeSummary {
-  let over = summary_bytes(&summary).saturating_sub(list_page_room());
+  let over = encoded_len(&summary).saturating_sub(list_page_room());
   if over > 0
     && let Some(cause) = summary.not_recovered.as_mut()
   {
@@ -10164,17 +10172,44 @@ fn shorten_cause(cause: &mut slates_ipc::protocol::RecoveryCause, mut over: usiz
   }
 }
 
-/// One shard's part of a listing page (§4.4 `list`, §4.3): the volumes it owns that the caller may read, past
-/// `after` in volume-id order, as many as one page can hold, and whether it holds more past them. No page takes more
-/// than one page's worth from any shard, so a shard's part never needs more, and a gather holds at most a page a shard.
-#[derive(Debug, Default)]
-pub(crate) struct ListPart {
-  volumes: Vec<VolumeSummary>,
-  more: bool,
+/// One shard's part of a page gathered from every shard (§4.3; a listing, §4.4 `list`, or a principal's grants): the
+/// items it holds past the page's cursor in key order, as many as one page can hold, and whether it holds more past
+/// them. No page takes more than one page's worth from any shard, so a shard's part never needs more, and a gather
+/// holds at most a page a shard.
+#[derive(Debug)]
+pub(crate) struct PagePart<T> {
+  pub(crate) items: Vec<T>,
+  pub(crate) more: bool,
 }
+
+impl<T> Default for PagePart<T> {
+  fn default() -> Self {
+    PagePart {
+      items: Vec::new(),
+      more: false,
+    }
+  }
+}
+
+/// A shard's part of a listing page.
+pub(crate) type ListPart = PagePart<VolumeSummary>;
 
 /// The parts of a listing page gathered so far, one a shard.
 pub(crate) type ListParts = Vec<ListPart>;
+
+/// The page the shards' `parts` make, merged in `key` order: as many items as `room` holds, and whether any part, or
+/// the merge, left more.
+pub(crate) fn merged_page<T: Wire, K: Ord>(
+  parts: Vec<PagePart<T>>,
+  room: usize,
+  key: impl Fn(&T) -> K,
+) -> (Vec<T>, bool) {
+  let more_elsewhere = parts.iter().any(|part| part.more);
+  let mut items: Vec<T> = parts.into_iter().flat_map(|part| part.items).collect();
+  items.sort_by_key(|item| key(item));
+  let (items, more_here) = fitting(items.into_iter(), room);
+  (items, more_here || more_elsewhere)
+}
 
 /// The bytes a listing page's volumes may take: one reply chunk less the page's own framing, its cursor included.
 fn list_page_room() -> usize {
@@ -10188,30 +10223,23 @@ fn list_page_room() -> usize {
   chunk.saturating_sub(slates_ipc::protocol::framed_len(&empty))
 }
 
-/// The encoded bytes one volume adds to a listing page.
-fn summary_bytes(summary: &VolumeSummary) -> usize {
-  encoded_len(summary)
-}
-
-/// The first volumes of `volumes` (in id order) that fit `room`: at least one, so a listing always progresses.
-fn fitting(
-  volumes: impl Iterator<Item = VolumeSummary>,
-  room: usize,
-) -> (Vec<VolumeSummary>, bool) {
+/// The first of `items` (in the page's order) that fit `room`, and whether any are left: at least one, so a walk
+/// always progresses.
+pub(crate) fn fitting<T: Wire>(items: impl Iterator<Item = T>, room: usize) -> (Vec<T>, bool) {
   let mut used = 0usize;
   let mut page = Vec::new();
-  let mut volumes = volumes.peekable();
-  while let Some(summary) = volumes.peek() {
-    let bytes = summary_bytes(summary);
+  let mut items = items.peekable();
+  while let Some(item) = items.peek() {
+    let bytes = encoded_len(item);
     if !page.is_empty() && used.saturating_add(bytes) > room {
       break;
     }
     used = used.saturating_add(bytes);
-    if let Some(summary) = volumes.next() {
-      page.push(summary);
+    if let Some(item) = items.next() {
+      page.push(item);
     }
   }
-  (page, volumes.peek().is_some())
+  (page, items.peek().is_some())
 }
 
 /// This shard's part of the listing page after `after` ([`ListPart`]).
@@ -10241,18 +10269,15 @@ fn list_part(state: &ShardState, principal: &Principal, after: Option<VolumeId>)
     })
     .collect();
   volumes.sort_by_key(|summary| summary.id);
-  let (volumes, more) = fitting(volumes.into_iter(), list_page_room());
-  ListPart { volumes, more }
+  let (items, more) = fitting(volumes.into_iter(), list_page_room());
+  ListPart { items, more }
 }
 
 /// The listing page the shards' `parts` make: their volumes in id order, as many as one reply chunk holds, and the
 /// cursor past the last when any part, or the merge, left more.
 fn list_page(parts: ListParts) -> ReplyBody {
-  let more_elsewhere = parts.iter().any(|part| part.more);
-  let mut volumes: Vec<VolumeSummary> = parts.into_iter().flat_map(|part| part.volumes).collect();
-  volumes.sort_by_key(|summary| summary.id);
-  let (volumes, more_here) = fitting(volumes.into_iter(), list_page_room());
-  let next = (more_here || more_elsewhere)
+  let (volumes, more) = merged_page(parts, list_page_room(), |summary| summary.id);
+  let next = more
     .then(|| volumes.last().map(|summary| summary.id))
     .flatten();
   ReplyBody::Listed { volumes, next }
@@ -13228,11 +13253,11 @@ mod tests {
       reason: long,
     });
     assert!(
-      super::summary_bytes(&whole) > super::list_page_room(),
+      super::encoded_len(&whole) > super::list_page_room(),
       "uncut, it fits no page"
     );
     let listed = super::listed(whole);
-    assert!(super::summary_bytes(&listed) <= super::list_page_room());
+    assert!(super::encoded_len(&listed) <= super::list_page_room());
     assert_eq!(listed.name.len(), super::longest_listable_name());
     assert!(matches!(
       listed.not_recovered,

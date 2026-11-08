@@ -199,6 +199,28 @@ impl Grants {
     self.records.entry(record.id).or_insert(record);
   }
 
+  /// Restores the highest grant id the durable records ever issued (A-266): the table holds live grants only, so an
+  /// ended grant's id is known by this mark alone, and the next grant takes an id past it.
+  pub fn restore_issued_through(&mut self, id: u64) {
+    self.next = self.next.max(id);
+  }
+
+  /// Ends `id`'s grant: it leaves the table at its terminal step (A-266; consumed, expired or revoked), its history
+  /// kept by the audit log. An id it held stays refused as ended ([`Grants::check`]).
+  pub fn end(&mut self, id: GrantId) {
+    self.records.remove(&id);
+  }
+
+  /// The grants past their term at `now_ns` that are still usable, for the sweep that ends them.
+  pub fn expired_at(&self, now_ns: u64) -> Vec<GrantId> {
+    self
+      .records
+      .values()
+      .filter(|g| g.state == GrantState::Issued && now_ns > g.expires_ns)
+      .map(|g| g.id)
+      .collect()
+  }
+
   /// Revokes a grant.
   pub fn revoke(&mut self, id: GrantId) {
     if let Some(g) = self.records.get_mut(&id) {
@@ -215,10 +237,14 @@ impl Grants {
     now_ns: u64,
   ) -> Result<GrantRecord, GrantRefusal> {
     let id = id.ok_or(GrantRefusal::GrantRequired)?;
-    let g = self
-      .records
-      .get_mut(&id)
-      .ok_or(GrantRefusal::GrantRequired)?;
+    // An id this table issued that is no longer held has ended (A-266): refused as ended, never taken for a grant the
+    // caller still needs (which would present the landing again).
+    let issued_here = id.0 >= 1 && id.0 <= self.next;
+    let g = self.records.get_mut(&id).ok_or(if issued_here {
+      GrantRefusal::GrantExpired
+    } else {
+      GrantRefusal::GrantRequired
+    })?;
     if g.state == GrantState::Issued && now_ns > g.expires_ns {
       g.state = GrantState::Expired;
     }

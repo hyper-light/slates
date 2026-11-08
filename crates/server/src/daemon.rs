@@ -4085,6 +4085,8 @@ async fn reap_loop() {
       // A destroy whose completion the catalog refused is recorded again here, at the reaper's cadence
       // (`verbs::step_destroys`), rather than in a busy serve round.
       let _ = verbs::step_destroys(s);
+      // A grant past its term leaves the tables (A-266); its history is the audit log.
+      crate::landing::end_expired_grants(s);
     });
     // Another host's attachments end once the fleet no longer counts that host a member (A-222; control shard).
     crate::remote_attach::sweep_departed().await;

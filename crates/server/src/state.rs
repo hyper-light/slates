@@ -548,7 +548,14 @@ pub struct ShardState {
   /// `grants` reads in flight: the caller's grants live on the shards that presented their landings (a
   /// grant record is written where its landing was), so the read is a scatter-gather like a listing — by
   /// request word, the client slot, the shards still to answer, and the summaries so far.
-  pub grant_scatters: BTreeMap<u64, (u32, usize, Vec<slates_ipc::protocol::GrantSummary>)>,
+  pub(crate) grant_scatters: BTreeMap<
+    u64,
+    (
+      u32,
+      usize,
+      Vec<crate::verbs::PagePart<slates_ipc::protocol::GrantSummary>>,
+    ),
+  >,
   /// Every shard of the daemon, for the scatter.
   pub shards: Vec<u16>,
   /// What the last start's recovery found (the status reports it).

@@ -1713,9 +1713,10 @@ fn approve(
 /// runtime grant (every grant was lost at a restart, and the first grant after it re-minted a recorded id,
 /// refused `AlreadyExists`), and every landing recorded its grant consumed, a session grant included. Do:
 /// land under a single-use grant; approve a session grant for another volume; restart the daemon over the
-/// same segment; land twice under the session grant; list the grants; approve a new landing. Expect: both
-/// session landings land; the single-use grant is listed consumed and the session grant issued; the new
-/// grant's id is neither earlier one.
+/// same segment; land twice under the session grant; list the grants; present the single-use grant again;
+/// approve a new landing. Expect: both session landings land; the session grant is listed issued, and the
+/// single-use grant, used up, is not listed (A-266: the table holds live grants) and is refused `GrantInvalid`;
+/// the new grant's id is neither earlier one.
 #[test]
 fn a_session_grant_outlives_a_restart_and_a_single_use_grant_stays_spent() {
   use slates_ipc::protocol::GrantScope;
@@ -1784,10 +1785,23 @@ fn a_session_grant_outlives_a_restart_and_a_single_use_grant_stays_spent() {
     .into_iter()
     .map(|grant| (grant.id, grant.state))
     .collect();
-  assert_eq!(
-    states.get(&once).map(String::as_str),
-    Some("consumed"),
-    "{states:?}"
+  // A used-up grant leaves the table (A-266): it is not listed, and presented again it is still refused as spent.
+  assert_eq!(states.get(&once), None, "{states:?}");
+  let again = client.land(
+    spent,
+    Some(spent_snapshot),
+    &target.path,
+    Filter::default(),
+    Some(once),
+  );
+  assert!(
+    matches!(
+      again,
+      Err(slates_client::ClientError::Refused(
+        slates_client::Refusal::GrantInvalid
+      ))
+    ),
+    "the single-use grant stays spent across the restart: {again:?}"
   );
   assert_eq!(
     states.get(&session).map(String::as_str),

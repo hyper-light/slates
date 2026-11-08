@@ -2382,6 +2382,8 @@ fn finish(
   if let Err(e) = write_audit(state, records, now) {
     return refused(crate::error::refusal_of_db(&e));
   }
+  // A grant whose consumption committed leaves the runtime table as it left the durable one (A-266).
+  end_grants_recorded_ended(state, &ops);
   if let Some(refusal) = publish_landed(state, ids, report) {
     return refusal;
   }
@@ -2401,6 +2403,38 @@ fn finish(
     },
   }
 }
+
+/// Ends in the runtime table every grant `ops` recorded at a terminal step (A-266), once those ops committed.
+#[cfg(unix)]
+fn end_grants_recorded_ended(state: &mut ShardState, ops: &[Op]) {
+  for op in ops {
+    if let Op::GrantStateChanged { id, state: ended } = op
+      && !matches!(ended, DbGrantState::Issued)
+    {
+      state.landing.grants.end(slates_land::grant::GrantId(*id));
+    }
+  }
+}
+
+/// The grants past their term end (A-266), once a reap tick: each is recorded `Expired`, which takes it out of the
+/// durable table, and then leaves the runtime one. A grant that cannot be recorded stays, and the next tick tries
+/// again; one in use by a running landing is unaffected, since the run holds its own copy of the grant it checked.
+pub fn end_expired_grants(state: &mut ShardState) {
+  let now = state.clock.monotonic_ns();
+  for id in state.landing.grants.expired_at(now) {
+    let op = Op::GrantStateChanged {
+      id: id.0,
+      state: DbGrantState::Expired,
+    };
+    if state.db.mutate(&mut state.segment, &op, now).is_ok() {
+      state.landing.grants.end(id);
+      state.count(GRANTS_EXPIRED, 1);
+    }
+  }
+}
+
+/// Counter: grants ended at their term by the reap tick's sweep (A-266).
+pub const GRANTS_EXPIRED: &str = "landing.grants_expired";
 
 /// The ops that close a finished landing's records: its grant's transition, and the volume's new base when
 /// the landing made a scratch volume an overlay.
@@ -2758,15 +2792,23 @@ pub fn restore_grants(state: &mut ShardState) {
       },
     });
   }
+  // The table holds live grants only (A-266): an ended grant's id is known by the partition's mark alone.
+  let issued_through = state.db.partition().grants_issued_through();
+  state.landing.grants.restore_issued_through(issued_through);
 }
 
 /// The caller's grants, from the durable records.
-pub fn grants_verb(state: &ShardState, principal: &Principal) -> ReplyBody {
+pub(crate) fn grants_part(
+  state: &ShardState,
+  principal: &Principal,
+  after: Option<u64>,
+) -> crate::verbs::PagePart<GrantSummary> {
   let grants = state
     .db
     .partition()
     .grants_of(principal)
     .into_iter()
+    .filter(|g| after.is_none_or(|after| g.id > after))
     .map(|g| GrantSummary {
       id: g.id,
       volume: to_wire_volume(g.volume),
@@ -2774,9 +2816,54 @@ pub fn grants_verb(state: &ShardState, principal: &Principal) -> ReplyBody {
       manifest: g.manifest,
       scope: wire_grant_scope(&g.scope),
       state: grant_state_name(g.state),
-    })
-    .collect();
-  ReplyBody::Grants { grants }
+    });
+  // `grants_of` walks the partition's grants in id order, so the first that fit are the page's.
+  let (items, more) = crate::verbs::fitting(grants, grants_page_room());
+  crate::verbs::PagePart { items, more }
+}
+
+/// The bytes a grants page's summaries may take: one reply chunk less the page's own framing, its cursor included.
+pub(crate) fn grants_page_room() -> usize {
+  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+  let empty = ReplyBody::Grants {
+    grants: Vec::new(),
+    next: Some(u64::MAX),
+  };
+  chunk.saturating_sub(slates_ipc::protocol::framed_len(&empty))
+}
+
+/// Derived: the longest landing target, in bytes, a grant's summary on one grants page holds alone (§4.15, §4.3): the
+/// page's room less a summary with an empty target in its longest state. A grant is issued for a presented landing and
+/// listed with its target, so a presentation past it is refused `TargetUnavailable` before anything is made. A `land`
+/// request carries a target of about 4,046 bytes, past what a page held beside a grant's other fields (2026-11-08).
+pub fn longest_grantable_target() -> usize {
+  let longest_state = [
+    DbGrantState::Issued,
+    DbGrantState::Consumed,
+    DbGrantState::Expired,
+    DbGrantState::Revoked,
+  ]
+  .into_iter()
+  .map(grant_state_name)
+  .max_by_key(String::len)
+  .unwrap_or_default();
+  let untargeted = GrantSummary {
+    id: u64::MAX,
+    volume: VolumeId::default(),
+    target: String::new(),
+    manifest: [u8::MAX; 32],
+    scope: slates_ipc::protocol::GrantScope::Session,
+    state: longest_state,
+  };
+  grants_page_room().saturating_sub(crate::verbs::encoded_len(&untargeted))
+}
+
+/// The grants page the shards' `parts` make: their grants in id order, as many as one reply chunk holds, and the
+/// cursor past the last when any part, or the merge, left more.
+pub(crate) fn grants_page(parts: Vec<crate::verbs::PagePart<GrantSummary>>) -> ReplyBody {
+  let (grants, more) = crate::verbs::merged_page(parts, grants_page_room(), |grant| grant.id);
+  let next = more.then(|| grants.last().map(|grant| grant.id)).flatten();
+  ReplyBody::Grants { grants, next }
 }
 
 /// One page of the audit (§4.15, A-265), answered on the control shard, whose partition holds every record: the
