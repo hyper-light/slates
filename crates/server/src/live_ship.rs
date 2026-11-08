@@ -1575,9 +1575,7 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
 /// finish or end at the deadline its bytes set, as before the watch. A re-send that a watch could cut again would start
 /// from nothing each time, so a large enough install to a holder starved over and over would never finish.
 fn watch_install(cut: Option<Head>, image: Head) -> bool {
-  // Red first: every install watched, however often it was cut.
-  let _ = (cut, image);
-  true
+  cut != Some(image)
 }
 
 fn install_for(live: &LiveVolume, object: ObjectId, holder: HostId) -> (Option<Send>, bool) {

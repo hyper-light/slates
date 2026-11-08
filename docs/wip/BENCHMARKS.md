@@ -8626,6 +8626,40 @@ in order, up to the last whole record's size, and appended them as the credit fr
 
 Dead even (3 of 5 against 2 of 5, medians and tails overlapping), so it does not land; the patch is kept off the tree.
 
+### The watch on an install exchange, end to end (A-200; 2026-11-08, diag-live-durability-65)
+
+**Runners:** GitHub `ubuntu-latest` (x86_64) and `ubuntu-24.04-arm`, 4 CPUs each, release. **Tree:** 53dfa6cc with
+the on-chain fix (cea7589e) and the watch, diag hooks added. The watch is switched on or off in the same binary
+(`SLATES_DIAG_WATCH_OFF`). It runs at the install budgets the code computes (`real`) and at a 30 s floor on installs
+of 64 KiB or more (`floor`), standing in for a large install's long deadline. Per leg:
+
+- *Restart*, 12 runs: the holder stops on serving an install and is killed 1 s later. Its successor is up 3 to 27 ms
+  after. Catch-up is the time from the kill until the holder is within 50 entries of the owner's head (not within
+  50 s: none).
+- *Rolling partition* (`candidates_partitioned_in_turn_mid_stream_lose_nothing`), 10 runs.
+
+| leg | restarts over 1 s | over 5 s | not within 50 s | catch-up median | worst | partitions passed | cuts | write p99 median | write max |
+|---|---|---|---|---|---|---|---|---|---|
+| real, watch off, x86 | 1 of 12 | 0 | 0 | 31 ms | 3.87 s | 10 of 10 | 0 | 3.4 ms | 344 ms |
+| real, watch on, x86 | 0 of 12 | 0 | 0 | 24 ms | 0.05 s | 10 of 10 | 0 | 4.0 ms | 351 ms |
+| real, watch off, arm | 0 of 12 | 0 | 0 | 22 ms | 0.04 s | 10 of 10 | 0 | 3.3 ms | 288 ms |
+| real, watch on, arm | 0 of 12 | 0 | 0 | 22 ms | 0.04 s | 10 of 10 | 0 | 3.3 ms | 248 ms |
+| floor, watch off, x86 | 4 of 12 | 1 | 1 | 894 ms | 7.01 s | 10 of 10 | 0 | 2.3 ms | 326 ms |
+| floor, watch on, x86 | 2 of 12 | 2 | 0 | 25 ms | 32.42 s | 10 of 10 | 1 | 2.6 ms | 339 ms |
+| floor, watch off, arm | 7 of 12 | 5 | 0 | 2,038 ms | 13.05 s | 10 of 10 | 0 | 3.9 ms | 832 ms |
+| floor, watch on, arm | 1 of 12 | 1 | 3 | 21 ms | 29.14 s | 10 of 10 | 0 | 2.7 ms | 2,207 ms |
+
+Cuts are counted in the partition runs. Of the restarts, only the 13 slower than 5 s or never caught kept their logs,
+and none shows a cut: the successor answers under the holder's id, so the owner never loses contact.
+
+**Reading.** At the budgets the code computes, the A/B is even: 1 of 48 restarts over 1 s, without the watch, and
+medians and partition tails overlap. The floor's slow restarts are not the watch's case. With the watch, every slow
+restart (6) had an install exchange on the killed process's session run its whole 30 s. Without it, 1 did (a floor:
+a run can end before such an exchange does). Of the other six without it over 5 s (5.3 to 13.1 s), five made 404 to
+758 off-chain install decisions and one (7.0 s) made none (GAPS, "a holder repeating the head"). This run cannot show
+what the watch does, since its case did not occur; the A/B on a holder that stays stopped is owed (GAPS). 176 of 176
+runs passed.
+
 ## What a WinFsp mount and unmount wait for the Windows anchor (A-213; 2026-11-05)
 
 Each WinFsp mount sends the anchor a hold and each unmount a release, and waits for the answer (A-198, A-206). The

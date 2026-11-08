@@ -6276,6 +6276,16 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > for the middle third of 180 sequential stable writes: one whole record, at least one install, and the candidate caught
 > up).
 >
+> **An install exchange ends when its holder is lost and silent (2026-11-08).** An install's deadline is derived from
+> its bytes and the session's rate, with no ceiling (77 s and 614 s measured), and a holder stopped mid-install held
+> its lane for all of it. The lane now watches the exchange: once the owner keeps no direct contact with the holder
+> (`keeps_direct_contact_with`) and the session's largest acknowledged packet has not moved for a liveness budget, the
+> exchange is abandoned within a tenth of that budget (`live::exchange_watched`). Both must hold. A lost holder whose
+> session is still taking the bytes is never cut, so a false suspicion costs nothing. A cut holder is unanswered: its
+> link is dropped and redialed, and the image it was cut on is re-sent once, unwatched (`LiveVolume::cut_installs`).
+> Held on the simulated fabric (`crates/cluster/tests/live.rs`, `live_ship::tests`). End to end it is measured only
+> where it does not fire (GAPS).
+>
 > **Chaos from outside the processes (2026-11-06).** `crates/cli/tests/live_chaos.rs` streams writes through the Rust
 > client while it partitions or kills processes. It ends every flow with Agreement, NoLoss, StaleNeverCommits and
 > Convergence, checked from every node's `status`; each live line now carries its head's epoch and chain identity and

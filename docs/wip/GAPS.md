@@ -182,13 +182,32 @@
 > 381 ms, worst 2,359 to 635 ms and 510 to 509 ms; writes in a run, median 6,014 to 10,426 and 6,138 to 6,455; 60 of 60
 > passed with it, 59 of 60 without.
 
-> **Open (live-durability, 2026-11-08): a lane's install exchange ends only on its reply or its deadline, and the
-> deadline has no ceiling.** `exchange_budget` derives it from the bytes and the session's srtt and cwnd at the start:
-> up to 77 s and 614 s measured (diag-live-durability-56). A holder stopped before replying held its exchange for the
-> whole of a 30 s budget in 12 of 12 runs (30.01 to 30.02 s, -58), though the owner had dropped it from membership 1 to
-> 15 s in; the transport has no idle timeout. A bytes-only ceiling would be wrong: a 404 MB install took 21.6 s and was
-> answered. Owed: end the exchange when the owner stops keeping contact with the holder, re-sending safely if it was a
-> false suspicion.
+> **Fixed on the simulated fabric, not yet measured end to end (live-durability, 2026-11-08): a lane's install
+> exchange ended only on its reply or its deadline, and the deadline has no ceiling.** `exchange_budget` derives it
+> from the bytes and the session's srtt and cwnd at the start: up to 77 s and 614 s measured (diag-live-durability-56).
+> A holder stopped before replying held its exchange for the whole of a 30 s budget in 12 of 12 runs (30.01 to
+> 30.02 s, -58), though the owner had dropped it from membership 1 to 15 s in; the transport has no idle timeout. A
+> bytes-only ceiling would be wrong: a 404 MB install took 21.6 s and was answered. An install exchange now also ends
+> once the owner keeps no direct contact with the holder (`fleet::keeps_direct_contact_with`) and the session's
+> largest acknowledged packet has not moved for a liveness budget (1 s), checked each tenth of it
+> (`live::exchange_watched`, `Endpoint::largest_acked`). The cut holder is reported unanswered, so its link is dropped
+> and redialed. An image is cut at most once a holder (`LiveVolume::cut_installs`, one entry for each holder shipped
+> to), so a false suspicion re-sends that image once, unwatched; counted as `fleet.live.install_cut`. Held by
+> `an_exchange_to_a_lost_silent_holder_ends_within_a_silence_not_at_its_deadline` (the 10 s deadline before, within
+> 1.1 s after, every session back), `a_lost_holder_still_taking_the_request_is_never_cut_off` (60 KB over 256 kbit/s,
+> named lost throughout: answered, nothing cut) and `an_install_is_cut_at_most_once_an_image`. **Open:** the watch is
+> not measured end to end on the case it is for. In diag-live-durability-65's restart flow (BENCHMARKS, "The watch on
+> an install exchange") the stopped holder is killed after 1 s, and its successor serves under the same id 3 to 27 ms
+> later, so the owner never loses contact. No kept log shows a cut. At the budgets the code computes, catch-up was
+> even: 0 of 24 restarts over 1 s with the watch and 1 of 24 without, medians 22 to 31 ms either way. 80 of 80
+> partition runs passed, with one cut among them. Owed: the A/B on a holder that stays stopped (-58's flow), under a
+> floor standing in for a large install's long deadline.
+
+> **Open (live-durability, 2026-11-08): over the simulated fabric's rate-limited link, a lone `request_within` never
+> finished a 60 KB request.** Unanswered at 10 s and at 30 s of virtual time, at 256 kbit/s and at 2.56 Mbit/s, the run
+> idle meanwhile (`a_lost_holder_still_taking_the_request_is_never_cut_off` on its red stub, 8d46a1e5). The same
+> exchange, driven a tenth of a second at a time (`live::exchange_watched`), completes. The owner's request sat with no
+> timer due and no wake. Every install on main is sent this way; whether the real runtime shares this is not known.
 
 > **Open (live-durability, 2026-11-08): hundreds of writes reach the log as one entry.** Entries of 64 KiB or more were
 > 507 deltas and 178 whole records in 60 rolling partition runs (diag-live-durability-56); a delta carried a median of
@@ -223,7 +242,15 @@
 > at the budgets the code computes (diag-live-durability-62 and -63, on the live-durability stack at 53dfa6cc): slower
 > than 1 s in 2 to 0 of 24 (1.96 and 42.8 s before), install decisions 4,576 to 22. **Open:** under a 30 s install
 > budget forced for that measurement, 10 and 9 of 24 runs took over 1 s, with and without this; those holders report
-> positions well below the tail, and what holds them is not known.
+> positions well below the tail, and what holds them is not known. diag-live-durability-65 (BENCHMARKS, "The watch on
+> an install exchange") shows two shapes at that floor, neither ended by the watch:
+> - *An exchange on the killed process's session runs its whole budget.* 7 of 48 runs (6 with the watch, 1 without;
+>   a run can end before such an exchange does, so the count without is a floor). The successor answers under the
+>   holder's id, so the owner keeps contact. Those holders caught up 28.1 to 32.4 s after the restart, or not within
+>   50 s (4).
+> - *The installed holder's heads are off the chain.* 5 of the 6 other runs over 5 s (5.3 to 13.1 s) made 404 to 758
+>   off-chain install decisions; the sixth (7.0 s) made none. 6 of the 7 stalled runs above made 209 to 1,946 as well.
+> Owed: end an exchange to a holder's replaced process once its successor answers.
 
 > **Fixed (live-fixes, 2026-11-07): a live write counted durable on too few holders when the owner fell outside its own
 > volume's placement.** The shipper counted a position durable at the `f`-th highest holder, right for `2f` holders but

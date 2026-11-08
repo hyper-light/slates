@@ -123,10 +123,51 @@ async fn request_watched(
   deadline_ns: u64,
   watch: Watch,
 ) -> (crate::TimedReply, Endpoint, bool) {
-  // Red first: the watch is not built yet; the request runs to its reply or its deadline.
-  let _ = (host, watch);
-  let (reply, endpoint) = request_within(endpoint, stream, priority, request, deadline_ns).await;
-  (reply, endpoint, false)
+  let sent_ns = now_ns();
+  let before = endpoint.last_exchange();
+  let deadline_at = sent_ns.saturating_add(deadline_ns);
+  let tick_ns = (watch.silence_ns / 10).max(1);
+  let mut cut = false;
+  let reply = match endpoint.begin(stream, priority, request) {
+    Err(_) => None,
+    Ok(id) => {
+      let mut progress = (endpoint.largest_acked(), sent_ns);
+      loop {
+        if let Some(reply) = endpoint.take_reply(id) {
+          break Some(reply);
+        }
+        let now = now_ns();
+        if now >= deadline_at {
+          break None;
+        }
+        let acked = endpoint.largest_acked();
+        if acked != progress.0 {
+          progress = (acked, now);
+        }
+        if now.saturating_sub(progress.1) >= watch.silence_ns && (watch.lost)(host) {
+          cut = true;
+          break None;
+        }
+        let wait = tick_ns.min(deadline_at.saturating_sub(now));
+        match slates_rt::futures::within(wait, endpoint.drive()).await {
+          Ok(Some(Ok(()))) | Ok(None) => {}
+          Ok(Some(Err(_))) | Err(_) => break None,
+        }
+      }
+    }
+  };
+  if reply.is_none() {
+    endpoint.abandon_begun_since(before);
+  }
+  let round_trip_ns = reply.is_some().then(|| now_ns().saturating_sub(sent_ns));
+  (
+    crate::TimedReply {
+      bytes: reply.unwrap_or_default(),
+      round_trip_ns,
+    },
+    endpoint,
+    cut,
+  )
 }
 
 /// Sends `message` to every holder over its session and gathers the replies until `enough` (shown each reply as it
