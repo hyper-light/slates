@@ -1,0 +1,69 @@
+name: diag-clients
+
+# Diagnostics only, never on main: the process-level suites A-237 reaches.
+on:
+  push:
+    branches: ["diag-clients-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cross-shard-wait:
+    name: R3 class A on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 330
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Build the tests
+        run: cargo test --locked -p slates-server -p slates-cli --no-run
+      - name: The process-level suites
+        env:
+          SLATES_TEST_CLI: "1"
+        run: |
+          set +e
+          grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+          R=../results.txt
+          echo "runner ${{ matrix.os }}, $(nproc) CPUs, commit $(git rev-parse --short HEAD)" > $R
+          for t in a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover; do
+            for run in 1 2 3; do
+              out=$(cargo test --locked -q -p slates-cli --test live_chaos -- --exact $t --nocapture --test-threads=1 2>&1); code=$?
+              echo "== $t run $run exit $code" | tee -a $R
+              echo "$out" | grep -E -A3 'panicked' | cut -c1-600 | head -12 | tee -a $R
+              echo "$out" | grep -E '^chaos .*(taken over|NoLoss|refused the owner|rejoined|destroyed at)|^SERVEDIAG' | cut -c1-400 | sort | uniq -c | sort -rn | head -20 | tee -a $R
+            done
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/clients-chaos-now-${{ matrix.os }}"
+          git config user.name "diag-clients"
+          git config user.email "diag-clients@users.noreply.github.com"
+          git stash -q || true
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-clients chaos-now results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"

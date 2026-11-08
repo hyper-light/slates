@@ -1610,9 +1610,11 @@ fn wait_serving<'a>(
         continue;
       };
       let serves = acknowledged.last().is_none_or(|last| {
-        client
-          .read(id, &format!("/{}", chaos_path(*last)), ReadAt::Head)
-          .is_ok_and(|bytes| bytes == chaos_body(*last))
+        let got = client.read(id, &format!("/{}", chaos_path(*last)), ReadAt::Head);
+        if !got.as_ref().is_ok_and(|bytes| bytes == &chaos_body(*last)) {
+          eprintln!("SERVEDIAG {survivor}: {:?}", got.as_ref().map(Vec::len));
+        }
+        got.is_ok_and(|bytes| bytes == chaos_body(*last))
       });
       if serves
         && (counter(survivor, "fleet.live.taken_over") > 0 || serving_epoch(survivor, volume) > 0)
