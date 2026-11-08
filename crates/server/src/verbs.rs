@@ -1703,7 +1703,23 @@ pub(crate) async fn resolve_and_forward(
     }
     None => match locate_within_budget(query).await {
       Some(owner) => Some(owner),
-      None => locate_work_green(volume, region).await,
+      None => match locate_work_green(volume, region).await {
+        WorkGreen::Remote(owner) => Some(owner),
+        WorkGreen::Here => {
+          // The work's green is this node's own, and the request missed its completion window on the way here (a
+          // local request is answered from it first): no completion is recorded under its key, and the work is
+          // gone with its owner, so nothing runs (§4.16's failure matrix: the work's loss window).
+          crate::state::with_state(|state| state.count(WORK_GONE_HERE, 1));
+          return (
+            OwnerReplies {
+              first: refused(Refusal::NotFound),
+              later: Vec::new(),
+            },
+            None,
+          );
+        }
+        WorkGreen::Unknown => None,
+      },
     },
   };
   let (decoded, later) = loop {
@@ -1848,24 +1864,50 @@ const ROUTED_BY_WORK_GREEN: &str = "fleet.owner_location.routed_by_work_green";
 /// green's owner answers only a completion recorded under the request's own key, and refuses anything else typed
 /// without running it. `None` when this node holds no catalog record naming a green for `volume`, or the green's owner is
 /// not found within the location budget.
-async fn locate_work_green(volume: VolumeId, region: u64) -> Option<HostId> {
-  let query = crate::state::with_state(|state| {
+async fn locate_work_green(volume: VolumeId, region: u64) -> WorkGreen {
+  let found = crate::state::with_state(|state| {
     let catalog = ObjectId(volume.bytes).catalog();
     let (_, bytes) = state.holder_records.get(&catalog)?.highest(catalog)?;
-    let green = crate::catalog::CatalogValue::from_record_bytes(bytes)?.work_of?;
-    Some(crate::owner_location::Query::new(
-      state,
-      ObjectId(green.bytes),
-      region,
+    let green = ObjectId(
+      crate::catalog::CatalogValue::from_record_bytes(bytes)?
+        .work_of?
+        .bytes,
+    );
+    let here = state.fleet.object_owner(green) == Some(state.fleet.host());
+    Some((
+      here,
+      crate::owner_location::Query::new(state, green, region),
     ))
   })
-  .flatten()?;
-  let owner = locate_within_budget(query).await;
-  if owner.is_some() {
-    crate::state::with_state(|state| state.count(ROUTED_BY_WORK_GREEN, 1));
+  .flatten();
+  let Some((here, query)) = found else {
+    return WorkGreen::Unknown;
+  };
+  if here {
+    return WorkGreen::Here;
   }
-  owner
+  match locate_within_budget(query).await {
+    Some(owner) => {
+      crate::state::with_state(|state| state.count(ROUTED_BY_WORK_GREEN, 1));
+      WorkGreen::Remote(owner)
+    }
+    None => WorkGreen::Unknown,
+  }
 }
+
+/// Where the green of a work no member owns is ([`locate_work_green`]).
+enum WorkGreen {
+  /// Owned by this node.
+  Here,
+  /// Owned by this member.
+  Remote(HostId),
+  /// Not known: this node holds no catalog record naming one, or its owner was not found within the budget.
+  Unknown,
+}
+
+/// The status count of a request for a work no member owns, whose green this node owns and whose completion it does not
+/// hold: refused `NotFound`, run nowhere (A-255).
+const WORK_GONE_HERE: &str = "fleet.owner_location.work_gone_here";
 
 /// The owner of `query`'s object, resolved again within the one liveness budget a forward allows for finding its owner:
 /// the direct route (the volume's creator while eligible) and then a location round, asked again every tenth of a

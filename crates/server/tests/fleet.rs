@@ -14020,7 +14020,9 @@ fn resend_while_refused_retryable(
 /// a submit, answered version 1; a dies and a survivor takes the green over; b's client sends the submit again under
 /// the same id. Expect: the green still holds one version, and the resend is answered the version it was accepted as
 /// (RIFL §3: "If the object migrates, then the completion record must move with it"). A-252 held only that nothing runs
-/// twice: the resend was refused `OwnerUnreachable` without end, so the client never learned its version.
+/// twice: the resend was refused `OwnerUnreachable` without end, so the client never learned its version. The route is a
+/// hint (§4.8): the green's owner answers only the completion recorded under the request's own key, so a fresh submit of
+/// the work from another client of b, and from a client of c (another origin), is refused typed and runs nothing.
 #[test]
 #[allow(clippy::cognitive_complexity)]
 fn a_submit_resent_after_its_owner_was_taken_over_is_answered_its_version() {
@@ -14067,12 +14069,19 @@ fn a_submit_resent_after_its_owner_was_taken_over_is_answered_its_version() {
     daemons[successor_index].merge_record_placed(green, 1)
   });
   let again = resend_while_refused_retryable(&mut client, &submit);
+  let mut stranger_b = Client::connect(daemons[0].instance());
+  let from_another_client = resend_while_refused_retryable(&mut stranger_b, &submit);
+  let mut stranger_c = Client::connect(daemons[1].instance());
+  let from_another_origin = resend_while_refused_retryable(&mut stranger_c, &submit);
   let mut reader = Client::connect(daemons[successor_index].instance());
   let head = reader.call(&RequestBody::Versions { green });
   for daemon in daemons {
     daemon.stop();
   }
-  eprintln!("the resend through the takeover was answered {again:?}; head {head:?}");
+  eprintln!(
+    "the resend through the takeover was answered {again:?}; another client of b {from_another_client:?}; a client of \
+     c {from_another_origin:?}; head {head:?}"
+  );
   assert!(routed, "b routed the work to its owner: {last:?}");
   assert!(
     matches!(edited, Some(ReplyBody::Edited)),
@@ -14107,6 +14116,21 @@ fn a_submit_resent_after_its_owner_was_taken_over_is_answered_its_version() {
     },
     "the resend through the takeover is answered the version it was accepted as"
   );
+  for (who, answer) in [
+    ("another client of b", &from_another_client),
+    ("a client of c", &from_another_origin),
+  ] {
+    assert!(
+      matches!(
+        answer,
+        Ok(ReplyBody::Refused {
+          refusal: Refusal::NotFound
+        })
+      ),
+      "a fresh submit of the work from {who} is refused NotFound (the work is gone with its owner), never run: \
+       {answer:?}"
+    );
+  }
 }
 
 /// AC (§4.8 "Leases and reads"; AUD-08): in a three-node `f = 1` fleet a green advances three versions on
