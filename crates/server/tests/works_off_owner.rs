@@ -564,6 +564,48 @@ fn a_submit_whose_answer_was_lost_is_answered_by_the_owners_record_once() {
   daemon.stop();
 }
 
+/// A-247 "Exactly once". Do: a work edits two regions of a file; the green changes the first, so its submit conflicts
+/// there, with the owner's answer lost; the green then changes the second; retry under the same id. Expect: the first
+/// verdict, one window, from the owner's record. Judged again it would name two; the engine's identity cache keeps
+/// only accepts' verdicts, so only the record can answer this.
+#[test]
+fn a_conflict_whose_answer_was_lost_is_answered_as_it_was_first_judged() {
+  let (daemon, instance) = daemon(MANY_SHARDS, "lost-conflict");
+  let mut client = connect(&instance);
+  let green = client.create_green("lost-conflict-green", false).unwrap();
+  let (other, _) = client.create_work(green, "lost-conflict-other").unwrap();
+  client.edit(other, "f", 0, 0, &[b'.'; 64]).unwrap();
+  assert_eq!(client.submit(other).unwrap(), Submitted::Accepted(1));
+  let (work, _) = client
+    .create_work(green, &off_owner_name(green, "lost-conflict"))
+    .unwrap();
+  client.edit(work, "f", 0, 4, b"WWWW").unwrap();
+  client.edit(work, "f", 32, 4, b"WWWW").unwrap();
+  client.edit(other, "f", 0, 4, b"AAAA").unwrap();
+  assert_eq!(client.submit(other).unwrap(), Submitted::Accepted(2));
+  client.acknowledge_all().unwrap();
+  daemon.lose_next_owner_answer(owner_of(work)).unwrap();
+  let request = RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  };
+  let id = client.begin(&request).unwrap();
+  await_overloaded(&mut client, id);
+  client.edit(other, "f", 32, 4, b"BBBB").unwrap();
+  assert_eq!(client.submit(other).unwrap(), Submitted::Accepted(3));
+  let ReplyBody::Submitted { version, conflicts } = client.retry(id, &request).unwrap() else {
+    panic!("the retry answers a submit");
+  };
+  assert_eq!(version, None);
+  assert_eq!(
+    conflicts.len(),
+    1,
+    "the verdict the owner recorded: {conflicts:?}"
+  );
+  drop(client);
+  daemon.stop();
+}
+
 /// A-247 "Exactly once", across a restart. Do: as above, but restart the daemon before the retry, so the work comes
 /// back from its log still holding the edit the green already has. Expect: the same one version, the edit once, and a
 /// next edit and submit accepted on top of it.

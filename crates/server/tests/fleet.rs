@@ -10879,6 +10879,35 @@ fn a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_
   });
 }
 
+/// A formed two-node `f = 1` fleet of two shards a node, and node A's instance (A-247: a work can be on another shard).
+fn two_shard_fleet() -> (PortLease, Daemon, Daemon, String) {
+  let (ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
+  let a = node("a", pa_probe, pa_record);
+  let b = node("b", pb_probe, pb_record);
+  let instance_a = format!("fleet-{}-{}", a.host.0, std::process::id());
+  let peer_of_a = Peer {
+    anchor: b.origin_anchor,
+    host: b.host,
+    address: b.address,
+    record_address: b.record_address,
+    certificate: b.identity.certificate(),
+  };
+  let peer_of_b = Peer {
+    anchor: a.origin_anchor,
+    host: a.host,
+    address: a.address,
+    record_address: a.record_address,
+    certificate: a.identity.certificate(),
+  };
+  let daemon_a = start_sharded(a, peer_of_a, TWO_SHARDS);
+  let daemon_b = start_sharded(b, peer_of_b, TWO_SHARDS);
+  assert!(
+    form_and_settle(&[&daemon_a, &daemon_b]),
+    "the fleet's groups formed before the test acts"
+  );
+  (ports, daemon_a, daemon_b, instance_a)
+}
+
 /// A green on its owner's node and a work over it placed on another shard of that node, with one edit (A-247).
 fn green_and_off_shard_work(client: &mut Client) -> (VolumeId, VolumeId) {
   let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
@@ -10910,7 +10939,7 @@ fn green_and_off_shard_work(client: &mut Client) -> (VolumeId, VolumeId) {
 #[test]
 fn a_submit_off_its_greens_shard_is_held_to_its_quorum_and_the_works_next_verb_behind_it() {
   let _serial = serialize_fleet_tests();
-  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_shard_fleet();
   let mut client = Client::connect(&instance_a);
   let (green, work) = green_and_off_shard_work(&mut client);
   let appended = |at: u64, bytes: &[u8]| RequestBody::Edit {
@@ -10955,6 +10984,12 @@ fn a_submit_off_its_greens_shard_is_held_to_its_quorum_and_the_works_next_verb_b
     .unwrap();
   let submitted = answer_within(&mut pipelined, submit.word());
   let edited = answer_within(&mut pipelined, after.word());
+  let answered_late = daemon_a
+    .refusals_on_every_shard()
+    .unwrap()
+    .get("merge.work.answered_late")
+    .copied()
+    .unwrap_or(0);
   let read = client.call(&RequestBody::Read {
     volume: work,
     path: "f".to_owned(),
@@ -10964,6 +10999,10 @@ fn a_submit_off_its_greens_shard_is_held_to_its_quorum_and_the_works_next_verb_b
   drop(client);
   daemon_a.stop();
   daemon_b.stop();
+  assert!(
+    answered_late > 0,
+    "the quorum's commit resumed the parked submit, not a deadline and a retry"
+  );
   assert_held_to_its_quorum(submitted, edited, &read);
 }
 
