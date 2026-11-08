@@ -4066,3 +4066,9 @@ slates daemon: control_shard_capacity = ShardCapacity { tasks: 10593, timers: 10
 slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
 slates daemon: instance fsb-630-5-main serving on 1 shards under the anchor
 ## run 5 of 5 done, 2026-11-08T19:43:39Z
+To https://github.com/hyper-light/slates
+   6db0be3..fbb83d9  fbb83d91bb3d6ca09f85ea11f9fda83d49fc077d -> diag-results/winfsp-overlap-42506936806-x86-quiet
+# teardown: fsb-630-5-dll's drive '' was gone before its unmount
+# teardown: fsb-630-5-main's drive '' was gone before its unmount
+## crash events listed
+# Application Error, Windows Error Reporting and .NET runtime records naming slates since 2026-11-08T16:43:41.2649836+00:00: 0
