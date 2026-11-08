@@ -1,0 +1,6 @@
+tested 295a9de706bc6139dd112e4cf89afd72bbd2d832 variant after on aarch64, 4 cpus
+cadence exit 0 22s
+cadence-again exit 0 2s
+rt exit 0 15s
+fill exit 0 193s
+clippy exit 0 64s
