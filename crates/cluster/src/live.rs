@@ -85,6 +85,59 @@ pub struct Exchanged {
   pub timed_out: bool,
 }
 
+thread_local! {
+  /// Diag only (live-durability-64, never on main): whether this shard's owner has stopped keeping contact with a holder.
+  pub static DIAG_LOST: std::cell::Cell<Option<fn(HostId) -> bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Diag only (live-durability-64, never on main): [`request_within`] that also ends when the holder is lost, checked each
+/// tenth of a second, the session returned through the same abandon a deadline uses.
+async fn diag_request_within(
+  mut endpoint: Endpoint,
+  host: HostId,
+  stream: u64,
+  priority: Priority,
+  request: &[u8],
+  deadline_ns: u64,
+) -> (crate::TimedReply, Endpoint) {
+  const TICK_NS: u64 = 100_000_000;
+  let sent_ns = now_ns();
+  let before = endpoint.last_exchange();
+  let reply = {
+    let mut work = std::pin::pin!(endpoint.request(stream, priority, request));
+    let mut deadline = std::pin::pin!(slates_rt::futures::sleep(deadline_ns));
+    let mut tick = Box::pin(slates_rt::futures::sleep(TICK_NS));
+    std::future::poll_fn(|cx| {
+      use std::task::Poll;
+      if let Poll::Ready(output) = work.as_mut().poll(cx) {
+        return Poll::Ready(output.ok());
+      }
+      if deadline.as_mut().poll(cx).is_ready() {
+        return Poll::Ready(None);
+      }
+      while tick.as_mut().poll(cx).is_ready() {
+        if DIAG_LOST.with(std::cell::Cell::get).is_some_and(|lost| lost(host)) {
+          return Poll::Ready(None);
+        }
+        tick = Box::pin(slates_rt::futures::sleep(TICK_NS));
+      }
+      Poll::Pending
+    })
+    .await
+  };
+  if reply.is_none() {
+    endpoint.abandon_begun_since(before);
+  }
+  let round_trip_ns = reply.is_some().then(|| now_ns().saturating_sub(sent_ns));
+  (
+    crate::TimedReply {
+      bytes: reply.unwrap_or_default(),
+      round_trip_ns,
+    },
+    endpoint,
+  )
+}
+
 /// Sends `message` to every holder over its session and gathers the replies until `enough` (shown each reply as it
 /// lands) says so, every holder has answered, or the budget runs out. The transport half of [`ship`], for a caller whose
 /// [`Shipper`] lives on another shard than its sessions (the daemon: the volume's shard appends, the control shard
@@ -116,7 +169,7 @@ pub async fn exchange(
     let tx = tx.clone();
     let bytes = message.to_vec();
     let spawned = spawn_child(async move {
-      let (reply, endpoint) = request_within(endpoint, stream, priority, &bytes, deadline_ns).await;
+      let (reply, endpoint) = diag_request_within(endpoint, host, stream, priority, &bytes, deadline_ns).await;
       tx.send(Reply(host, reply, Box::new(endpoint)));
     });
     // A refused spawn drops that holder's session with its future; the others still decide, and the holder is reported
