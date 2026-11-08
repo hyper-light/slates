@@ -60,6 +60,11 @@ the lane's bound).
 - `DaemonConfig::control_shard_capacity()`: `tasks_per_shard + forward_lane_bound` and
   `timers_per_shard + forward_lane_bound`, logged at boot as `control_shard_capacity` and noted again after
   `with_fleet` raises the base. `forward_lane_bound` is the one formula the lane and the capacity read.
+- With no peers the lane's bound is zero, so a laptop's control shard is sized like its other shards (corrected
+  2026-11-08). The first form added the bound on every daemon: a laptop's control shard took a channel of 1,371,635
+  tasks on a Mac, for forwards that cannot exist, and `a_forward_kept_for_a_full_channel_is_sent_once_the_channel_has_room`,
+  whose flood fills that channel, failed there 3 of 3 (it passed on CI's Linux and on GitHub's macOS runners, where the
+  derived sizes are small). With the bound zero: 20 of 20 on the Studio, a flood of 30,845, answered in 44 to 88 ms.
 - A full control channel is answered `Overloaded { shard }` (retryable under the same id; the verb never ran), and
   `HomedElsewhere` only when the control shard is gone (`control_refusal`).
 - `xshard::send_reply_home` (asynchronous) and `xshard::hand_reply_home` (synchronous, the channel's refusal returned
