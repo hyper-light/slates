@@ -522,16 +522,19 @@ mod tests {
       let mut seen = (None, None);
       while settled.elapsed() < std::time::Duration::from_secs(2) {
         seen = (first.and_then(state), second.and_then(state));
-        if matches!(
-          seen,
-          (
-            Some(super::RunState::Runnable),
-            Some(super::RunState::Blocked)
-          ) | (
-            Some(super::RunState::Blocked),
-            Some(super::RunState::Runnable)
+        // Miri reads nothing, so there is no state to settle on.
+        if cfg!(miri)
+          || matches!(
+            seen,
+            (
+              Some(super::RunState::Runnable),
+              Some(super::RunState::Blocked)
+            ) | (
+              Some(super::RunState::Blocked),
+              Some(super::RunState::Runnable)
+            )
           )
-        ) {
+        {
           break;
         }
         std::thread::yield_now();
