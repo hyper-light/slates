@@ -128,24 +128,33 @@ impl std::fmt::Debug for Db {
   }
 }
 
-/// The newest valid snapshot slot of a partition.
+/// The newest valid snapshot slot of a partition: of the slots that decode, the one with the highest sequence (the
+/// lower slot on a tie). A snapshot's sequence is its encoding's first field, so the slots are ordered by it before
+/// either is decoded, the newer is decoded first, and the older only when the newer does not decode. Until 2026-11-07
+/// both were decoded whole and the older dropped: of a 1,001-volume partition's 184-218 ms snapshot read on this Mac,
+/// one decode was waste, and the read is the longest step of a shard's recovery (§2.6 boot step 2).
 fn newest_snapshot(
   segment: &AnchorSegment,
   index: u16,
 ) -> Result<Option<(u8, PartitionSnapshot)>, DbError> {
-  let mut best: Option<(u8, PartitionSnapshot)> = None;
+  let mut slots: Vec<(u64, u8, Vec<u8>)> = Vec::new();
   for slot in 0..2u8 {
     let Ok(Some(bytes)) = segment.read_published(RegionKind::Snapshot(index, slot)) else {
       continue;
     };
-    let Ok(snapshot) = PartitionSnapshot::from_bytes(&bytes) else {
+    let Ok(seq) = u64::decode(&mut bytes.as_slice()) else {
       continue;
     };
-    if best.as_ref().is_none_or(|(_, b)| snapshot.seq > b.seq) {
-      best = Some((slot, snapshot));
+    slots.push((seq, slot, bytes));
+  }
+  // Newest first; the sort is stable, so on a tie the lower slot stays first, as before.
+  slots.sort_by(|a, b| b.0.cmp(&a.0));
+  for (_, slot, bytes) in slots {
+    if let Ok(snapshot) = PartitionSnapshot::from_bytes(&bytes) {
+      return Ok(Some((slot, snapshot)));
     }
   }
-  Ok(best)
+  Ok(None)
 }
 
 /// Recovers partition `index` from the segment: the newest valid snapshot, then the records

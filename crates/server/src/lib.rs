@@ -106,6 +106,7 @@ mod work_log;
 pub mod oci;
 pub mod peer;
 mod reap;
+mod recovery_slices;
 pub mod seal_keys;
 mod snapshot_view;
 // The Shards fs transport (§4.6, the Shards route; A-161): a volume served to a Shards microVM over an anonymous

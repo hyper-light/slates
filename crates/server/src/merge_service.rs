@@ -498,20 +498,66 @@ pub(crate) fn walk_held_origin(
   state: &ShardState,
   held: &slates_db::partition::OriginRef,
 ) -> Result<Origin, Refusal> {
+  let mut walk = HeldWalk::begin(state, held)?;
+  while !walk.step(state)? {}
+  walk.finish()
+}
+
+/// [`walk_held_origin`] a directory at a time, so a recovery can end its slice between two (§2.6 boot step 2,
+/// `crate::recovery_slices`). Holds no borrow of the state between steps: each step finds the base volume again.
+pub(crate) struct HeldWalk {
+  /// The base volume walked.
+  volume: DbVolumeId,
+  /// The identity the green recorded for its origin, which the finished walk must reproduce.
+  identity: [u8; 32],
+  /// The walk so far.
+  walk: OriginWalk,
+}
+
+impl HeldWalk {
+  /// The walk of `held`'s base snapshot, not yet begun: `NotFound` when the base volume is not here.
+  pub(crate) fn begin(
+    state: &ShardState,
+    held: &slates_db::partition::OriginRef,
+  ) -> Result<HeldWalk, Refusal> {
+    let slot = held_base(state, held.volume)?;
+    let snapshot = core_snapshot(SnapshotId {
+      value: held.snapshot.value,
+    });
+    Ok(HeldWalk {
+      volume: held.volume,
+      identity: held.identity,
+      walk: OriginWalk::begin(&slot.volume, snapshot).map_err(|e| refusal_of_vfs(&e))?,
+    })
+  }
+
+  /// Walks one directory; true once every directory is walked.
+  pub(crate) fn step(&mut self, state: &ShardState) -> Result<bool, Refusal> {
+    let slot = held_base(state, self.volume)?;
+    self
+      .walk
+      .step(&slot.volume, &state.store)
+      .map_err(|e| refusal_of_vfs(&e))
+  }
+
+  /// The walked origin: `ContentUnavailable` when it is not the one the green was created from.
+  pub(crate) fn finish(self) -> Result<Origin, Refusal> {
+    let origin = self.walk.finish();
+    if origin_identity(&origin) != self.identity {
+      return Err(Refusal::ContentUnavailable);
+    }
+    Ok(origin)
+  }
+}
+
+/// The base volume a held origin is walked from, on this shard: `NotFound` when it is not here.
+fn held_base(state: &ShardState, volume: DbVolumeId) -> Result<&crate::state::VolumeSlot, Refusal> {
   let handle = state
     .by_id
-    .get(&held.volume)
+    .get(&volume)
     .copied()
     .ok_or(Refusal::NotFound)?;
-  let slot = state.volumes.get(handle).map_err(|_| Refusal::NotFound)?;
-  let snapshot = core_snapshot(SnapshotId {
-    value: held.snapshot.value,
-  });
-  let origin = walk_origin(&slot.volume, &state.store, snapshot).map_err(|e| refusal_of_vfs(&e))?;
-  if origin_identity(&origin) != held.identity {
-    return Err(Refusal::ContentUnavailable);
-  }
-  Ok(origin)
+  state.volumes.get(handle).map_err(|_| Refusal::NotFound)
 }
 
 /// Walks a complete snapshot into an [`Origin`]: every file with its bytes, every directory, every
@@ -523,12 +569,46 @@ fn walk_origin(
   store: &Store,
   snapshot: slates_vfs::ids::SnapshotId,
 ) -> Result<Origin, slates_vfs::error::VfsError> {
-  let (_, root) = volume.snapshot_info(snapshot)?;
-  let mut origin = Origin::default();
-  let mut first_name: BTreeMap<InodeNo, String> = BTreeMap::new();
-  let mut stack: Vec<(String, slates_mem::Handle<slates_vfs::dir::DirNode>)> =
-    vec![(String::new(), root)];
-  while let Some((prefix, dir)) = stack.pop() {
+  let mut walk = OriginWalk::begin(volume, snapshot)?;
+  while !walk.step(volume, store)? {}
+  Ok(walk.finish())
+}
+
+/// [`walk_origin`] a directory at a time: the directories still to walk, and what the walk has found.
+struct OriginWalk {
+  /// The snapshot walked.
+  snapshot: slates_vfs::ids::SnapshotId,
+  /// What the walk has found so far.
+  origin: Origin,
+  /// The first name met of each multiply-linked inode, which its later names link to.
+  first_name: BTreeMap<InodeNo, String>,
+  /// The directories still to walk, each with its path.
+  stack: Vec<(String, slates_mem::Handle<slates_vfs::dir::DirNode>)>,
+}
+
+impl OriginWalk {
+  /// The walk of `snapshot` of `volume`, from its root.
+  fn begin(
+    volume: &Volume,
+    snapshot: slates_vfs::ids::SnapshotId,
+  ) -> Result<OriginWalk, slates_vfs::error::VfsError> {
+    let (_, root) = volume.snapshot_info(snapshot)?;
+    Ok(OriginWalk {
+      snapshot,
+      origin: Origin::default(),
+      first_name: BTreeMap::new(),
+      stack: vec![(String::new(), root)],
+    })
+  }
+
+  /// Walks the next directory; true once none is left.
+  fn step(&mut self, volume: &Volume, store: &Store) -> Result<bool, slates_vfs::error::VfsError> {
+    let Some((prefix, dir)) = self.stack.pop() else {
+      return Ok(true);
+    };
+    let snapshot = self.snapshot;
+    let origin = &mut self.origin;
+    let first_name = &mut self.first_name;
     for row in volume.readdir_in(store, dir)? {
       let path = if prefix.is_empty() {
         row.name.to_owned()
@@ -541,7 +621,7 @@ fn walk_origin(
           origin.dirs.push(path.clone());
           origin.modes.push((path.clone(), attrs.mode));
           if let Child::Dir(child) = volume.lookup_in(store, dir, row.name)?.child {
-            stack.push((path, child));
+            self.stack.push((path, child));
           }
         }
         Kind::Fifo | Kind::Socket => {
@@ -590,9 +670,14 @@ fn walk_origin(
         }
       }
     }
+    Ok(self.stack.is_empty())
   }
-  origin.canonicalize();
-  Ok(origin)
+
+  /// The walked origin, in its canonical order.
+  fn finish(mut self) -> Origin {
+    self.origin.canonicalize();
+    self.origin
+  }
 }
 
 /// A read attachment of a green pins its head version (§4.16 "Attachments and versions"); a write
