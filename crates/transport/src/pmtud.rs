@@ -41,6 +41,9 @@ pub const SEARCH_GRANULARITY: usize = crate::endpoint::PACKET_OVERHEAD_BYTES;
 /// that declare a black hole: the same evidence a probe needs before its size is judged too large.
 pub const BLACK_HOLE_LOSSES: u32 = MAX_PROBES;
 
+/// Diag only (live-durability-46, never on main): the next PathMtu's id.
+static DIAG_NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// The probe in flight: its packet number, its size, and how many probes of that size were lost before it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Probe {
@@ -80,6 +83,8 @@ pub struct PathMtu {
   /// The size the last probes were for, and how many of them were lost.
   attempts: Option<(usize, u32)>,
   /// When a completed search resumes.
+  /// Diag only (live-durability-46): this search's id.
+  diag_id: u64,
   raise_at: Option<u64>,
   /// A resumed search's recheck: the smallest size that failed before, probed first and alone. Only if it
   /// now crosses does the search reopen up to the peer's limit; a path that has not changed costs at most
@@ -92,6 +97,12 @@ pub struct PathMtu {
 }
 
 impl PathMtu {
+  /// Diag only (live-durability-46, never on main): this search's id for the LD-PMTU lines, and its state now:
+  /// (id, confirmed, too large, large losses in a row, searching, raise timer).
+  pub fn diag_state(&self) -> (u64, usize, usize, u32, bool, Option<u64>) {
+    (self.diag_id, self.confirmed, self.too_large, self.large_losses, self.searching(), self.raise_at)
+  }
+
   /// A session's path MTU, starting at the floor and free to search up to `peer_max` bytes (the peer's
   /// declared largest UDP payload, clamped to at least the floor).
   pub fn new(peer_max: usize) -> PathMtu {
@@ -103,6 +114,7 @@ impl PathMtu {
       local_cap: None,
       probe: None,
       attempts: None,
+      diag_id: DIAG_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
       raise_at: None,
       recheck: None,
       large_losses: 0,
