@@ -5633,7 +5633,7 @@ fn found_green(
   engine.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
   state.greens.insert(id, engine);
   // Version 0's merge record — the origin, placed before the record names it (§4.16 "Commit").
-  crate::merge_service::enqueue_record(state, id, 0, [0u8; 32], 0, Vec::new());
+  crate::merge_service::enqueue_record(state, id, 0, [0u8; 32], 0, Vec::new(), None);
   ReplyBody::GreenCreated {
     id: to_wire_volume(id),
   }
@@ -6661,6 +6661,7 @@ fn submit(
       reset_accepted_work(state, work_id, version);
       // The version's merge record, issued only once its inputs — the increment just appended — are
       // placed (§4.16 "Commit"; at `f = 0` the append is the placement).
+      let completion = crate::merge_service::SubmitCompletion::of_current(state);
       crate::merge_service::enqueue_record(
         state,
         green_id,
@@ -6668,6 +6669,7 @@ fn submit(
         inc.id,
         inc.base,
         inc.evidence,
+        completion,
       );
       // The work's base moved to the version, so the reachable floor may have risen: fold the histories
       // to it and true the retention charge up to what the commit retained (the secured surplus credited).
@@ -6742,6 +6744,8 @@ fn record_accepted(
       increment_bytes,
       increment,
       applied.unwrap_or_default(),
+      crate::merge_service::SubmitCompletion::of_current(state)
+        .map(crate::merge_service::SubmitCompletion::to_entry),
       identity,
     ),
   };
@@ -9291,7 +9295,12 @@ pub(crate) fn materialize_taken_over_green(
       })));
     }
   };
-  for increment_bytes in recovery.chain.iter().skip(already) {
+  for (increment_bytes, completion) in recovery
+    .chain
+    .iter()
+    .zip(&recovery.completions)
+    .skip(already)
+  {
     let judged = slates_merge::engine::Increment::decode(increment_bytes)
       .ok()
       .map(|increment| {
@@ -9306,7 +9315,13 @@ pub(crate) fn materialize_taken_over_green(
     };
     let op = Op::GreenAdvanced {
       green: id,
-      increment: slates_merge::chain_entry::encode(increment_bytes, &increment, &applied, None),
+      increment: slates_merge::chain_entry::encode(
+        increment_bytes,
+        &increment,
+        &applied,
+        completion.map(crate::merge_service::SubmitCompletion::to_entry),
+        None,
+      ),
     };
     if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
       return Err(Box::new(refused(refusal_of_db(&e))));
@@ -9337,10 +9352,71 @@ pub(crate) fn materialize_taken_over_green(
       reason: "taken-over green does not reproduce its adopted head".to_owned(),
     })));
   }
+  record_taken_over_completions(state, &recovery.completions);
   let object = ObjectId(id.bytes);
   let placed = state.merge.placed.entry(object).or_insert(recovery.head);
   *placed = (*placed).max(recovery.head);
   Ok(())
+}
+
+/// The status count of a taken-over submit's completion recorded on its green's successor (A-255).
+const TAKEN_OVER_COMPLETION_RECORDED: &str = "merge.takeover.completion_recorded";
+/// The status count of a taken-over submit's completion left out because its client's newer completions filled the
+/// client's bound ([`completion_bound`]): its resend is refused typed and runs nothing.
+const TAKEN_OVER_COMPLETION_PAST_BOUND: &str = "merge.takeover.completion_past_bound";
+/// The status count of a taken-over submit's completion the partition could not make durable.
+const TAKEN_OVER_COMPLETION_UNRECORDED: &str = "merge.takeover.completion_unrecorded";
+
+/// Records, on a taken-over green's partition, the completions its merge records carried (A-255; RIFL §3, "If the
+/// object migrates, then the completion record must move with it"): each submit's resend after the takeover is then
+/// answered its version here, the request's key the one it was accepted under, and never run again.
+///
+/// Bounded per client as any client's records are ([`completion_bound`]): a client holds at most that many unacknowledged
+/// at once, so its newest that many submits are the ones it may still resend. Older ones it had acknowledged (the
+/// acknowledgements stayed with the departed owner), and their resend, which a conforming client never sends, is refused
+/// typed and runs nothing (the work is gone with its owner). Counted.
+fn record_taken_over_completions(
+  state: &mut ShardState,
+  completions: &[Option<crate::merge_service::SubmitCompletion>],
+) {
+  let bound = usize::try_from(completion_bound(state)).unwrap_or(usize::MAX);
+  let mut by_client: std::collections::BTreeMap<(u64, u32), Vec<(u32, u64)>> =
+    std::collections::BTreeMap::new();
+  for (index, key) in completions.iter().enumerate() {
+    let Some(key) = key else {
+      continue;
+    };
+    let version = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+    by_client
+      .entry((key.origin, key.client))
+      .or_default()
+      .push((key.sequence, version));
+  }
+  for ((origin, client), mut submits) in by_client {
+    submits.sort_unstable();
+    let past = submits.len().saturating_sub(bound);
+    state.count(
+      TAKEN_OVER_COMPLETION_PAST_BOUND,
+      u64::try_from(past).unwrap_or(u64::MAX),
+    );
+    for (sequence, version) in submits.into_iter().skip(past) {
+      let reply = record_completion(
+        state,
+        origin,
+        RequestId { client, sequence },
+        ReplyBody::Submitted {
+          version: Some(version),
+          conflicts: Vec::new(),
+        },
+      );
+      let counter = if matches!(reply, ReplyBody::Refused { .. }) {
+        TAKEN_OVER_COMPLETION_UNRECORDED
+      } else {
+        TAKEN_OVER_COMPLETION_RECORDED
+      };
+      state.count(counter, 1);
+    }
+  }
 }
 
 /// A taken-over green whose recovered chain did not reproduce the adopted head's identity: refused on
@@ -10917,6 +10993,7 @@ fn replay_green(
       base: 0,
       evidence: Vec::new(),
       identity: green.head_identity(),
+      completion: None,
     });
   }
   let mut below_checkpoint = 0usize;
@@ -10951,6 +11028,9 @@ fn replay_green(
       base: entry.increment.base,
       evidence: entry.increment.evidence,
       identity,
+      completion: entry
+        .completion
+        .map(crate::merge_service::SubmitCompletion::of_entry),
     });
   }
   if held > 0 {

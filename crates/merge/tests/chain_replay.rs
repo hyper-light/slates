@@ -90,6 +90,13 @@ fn recovered(
   for bytes in &durable.chain {
     let entry = chain_entry::decode(bytes).unwrap();
     let version = green.apply_recorded(&entry.increment, &entry.applied);
+    if let Some(key) = entry.completion {
+      assert_eq!(
+        key,
+        completion_of(version),
+        "version {version}'s completion key, as its entry recorded it (A-255)"
+      );
+    }
     assert_eq!(
       identities.get(&version).copied(),
       Some(green.head_identity()),
@@ -284,10 +291,13 @@ impl History {
         .next_id
         .is_multiple_of(3)
         .then(|| self.live.head_identity());
+      // A request made most versions (A-255): its completion key rides the entry, and recovery reads it back.
+      let completion = (!self.next_id.is_multiple_of(5)).then(|| completion_of(*version));
       self.durable.chain.push(chain_entry::encode(
         &increment.encode(),
         &increment,
         &applied,
+        completion,
         recorded,
       ));
       self.accepted.push((increment, *version));
@@ -626,6 +636,7 @@ fn two_clients_taking_turns_keep_folding_and_stay_bounded() {
       &increment.encode(),
       &increment,
       &applied.unwrap(),
+      Some(completion_of(version)),
       None,
     ));
     accepted.push((increment, version));
@@ -657,6 +668,15 @@ fn two_clients_taking_turns_keep_folding_and_stay_bounded() {
   assert_same(&mut live, &mut twin, durable.held, &accepted, &[]);
 }
 
+/// The completion key a test's version `version` was made under: distinct per version, every field used.
+fn completion_of(version: u64) -> chain_entry::Completion {
+  chain_entry::Completion {
+    origin: version.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+    client: u32::try_from(version % 1_000).unwrap(),
+    sequence: u32::try_from(version % 65_521).unwrap(),
+  }
+}
+
 /// Hostile bytes are refused typed: every truncation, a flipped byte, a foreign magic and a bare increment.
 #[test]
 fn a_hostile_chain_entry_is_refused_typed() {
@@ -664,8 +684,18 @@ fn a_hostile_chain_entry_is_refused_typed() {
   let raw: Raw = (0, 0, 0, 3, 7);
   let increment = increment_of(&raw).with_id(id(1), 0);
   let (_, applied) = green.submit_resolved(&increment);
-  let bytes = chain_entry::encode(&increment.encode(), &increment, &applied.unwrap(), None);
-  assert!(chain_entry::decode(&bytes).is_ok(), "the entry decodes");
+  let bytes = chain_entry::encode(
+    &increment.encode(),
+    &increment,
+    &applied.unwrap(),
+    Some(completion_of(1)),
+    None,
+  );
+  assert_eq!(
+    chain_entry::decode(&bytes).map(|entry| entry.completion),
+    Ok(Some(completion_of(1))),
+    "the entry decodes, its completion key with it"
+  );
   for len in 0..bytes.len() {
     assert!(
       chain_entry::decode(&bytes[..len]).is_err(),

@@ -1517,6 +1517,52 @@ pub struct MergeRecordValue {
   pub require_evidence: bool,
   /// The owning principal, so a successor enforces the same rights.
   pub owner: Principal,
+  /// The completion key of the submit that made this version, where a request made it (A-255): the record is the
+  /// green's, and RIFL ties a request's completion record to the object it changed ("If the object migrates, then the
+  /// completion record must move with it", Lee et al., SOSP 2015, §3). A green's successor records it, so the submit's
+  /// resend after a takeover is answered its version. Appended.
+  pub completion: Option<SubmitCompletion>,
+}
+
+/// A submit's completion key as a merge record carries it ([`MergeRecordValue::completion`]): the client's host, the
+/// client and the request's sequence, the key a partition's completion window holds it under.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubmitCompletion {
+  /// The client's host (`HostId.0`): this node for a local client, the authenticated origin for a forwarded one.
+  pub origin: u64,
+  /// The client.
+  pub client: u32,
+  /// The request's sequence within the client.
+  pub sequence: u32,
+}
+
+impl SubmitCompletion {
+  /// The key of the request now running on `state`, if a request is running (`ShardState::current_request`).
+  pub(crate) fn of_current(state: &ShardState) -> Option<SubmitCompletion> {
+    state.current_request.map(|(origin, id)| SubmitCompletion {
+      origin,
+      client: id.client,
+      sequence: id.sequence,
+    })
+  }
+
+  /// As the green's chain entry records it.
+  pub(crate) fn to_entry(self) -> slates_merge::chain_entry::Completion {
+    slates_merge::chain_entry::Completion {
+      origin: self.origin,
+      client: self.client,
+      sequence: self.sequence,
+    }
+  }
+
+  /// As a chain entry recorded it.
+  pub(crate) fn of_entry(key: slates_merge::chain_entry::Completion) -> SubmitCompletion {
+    SubmitCompletion {
+      origin: key.origin,
+      client: key.client,
+      sequence: key.sequence,
+    }
+  }
 }
 
 impl MergeRecordValue {
@@ -1795,12 +1841,13 @@ pub(crate) fn enqueue_record(
   increment: [u8; 32],
   base: u64,
   evidence: Vec<[u8; 32]>,
+  completion: Option<SubmitCompletion>,
 ) {
   enqueue_record_with(
     state,
     green,
     version,
-    (increment, base, evidence),
+    (increment, base, evidence, completion),
     |state| {
       state
         .greens
@@ -1824,6 +1871,8 @@ pub(crate) struct ReplayedVersion {
   pub(crate) evidence: Vec<[u8; 32]>,
   /// The green's head identity at this version.
   pub(crate) identity: [u8; 32],
+  /// The completion key of the submit that made it, as its chain entry recorded it (A-255).
+  pub(crate) completion: Option<SubmitCompletion>,
 }
 
 /// Enqueues a recovered version's merge record on a restarted owner (§4.16 "Commit", AUD-11): the pending records
@@ -1843,12 +1892,13 @@ pub(crate) fn enqueue_recovered_record(
     base,
     evidence,
     identity,
+    completion,
   } = replayed;
   enqueue_record_with(
     state,
     green,
     version,
-    (increment, base, evidence),
+    (increment, base, evidence, completion),
     move |_| identity,
   );
 }
@@ -1859,7 +1909,7 @@ fn enqueue_record_with(
   state: &mut ShardState,
   green: DbVolumeId,
   version: u64,
-  (increment, base, evidence): ([u8; 32], u64, Vec<[u8; 32]>),
+  (increment, base, evidence, completion): ([u8; 32], u64, Vec<[u8; 32]>, Option<SubmitCompletion>),
   identity_of: impl FnOnce(&mut ShardState) -> [u8; 32],
 ) {
   let object = ObjectId(green.bytes);
@@ -1936,6 +1986,7 @@ fn enqueue_record_with(
         name,
         require_evidence,
         owner,
+        completion,
       },
       inputs: local_hold,
       record: Placement {
@@ -2836,6 +2887,8 @@ pub(crate) struct GreenRecovery {
   pub origin: Option<Vec<u8>>,
   /// The increments' bytes, version 1 first.
   pub chain: Vec<Vec<u8>>,
+  /// Each version's submit completion key as its merge record carried it, version 1 first, beside `chain` (A-255).
+  pub completions: Vec<Option<SubmitCompletion>>,
   /// The adopted head version.
   pub head: u64,
   /// The adopted head's identity, which the rebuilt engine must reproduce.
@@ -2869,6 +2922,7 @@ pub(crate) fn recover_green_inputs(
   // The prefix must be complete: every version from 0 to the adopted head, each with its inputs held.
   let mut origin = None;
   let mut chain = Vec::with_capacity(usize::try_from(adopted.version).unwrap_or(0));
+  let mut completions = Vec::with_capacity(chain.capacity());
   for version in 0..=adopted.version {
     let value = values.get(&version)?;
     let inputs = match value.inputs {
@@ -2878,7 +2932,10 @@ pub(crate) fn recover_green_inputs(
     };
     match (version, inputs) {
       (0, bytes) => origin = bytes,
-      (_, Some(bytes)) => chain.push(bytes),
+      (_, Some(bytes)) => {
+        chain.push(bytes);
+        completions.push(value.completion);
+      }
       (_, None) => return None,
     }
   }
@@ -2890,6 +2947,7 @@ pub(crate) fn recover_green_inputs(
     catalog_sequence,
     origin,
     chain,
+    completions,
     head: adopted.version,
     identity: adopted.identity,
   })
@@ -3007,6 +3065,7 @@ mod tests {
           host: slates_db::HostId(0),
           uid: 0,
         },
+        completion: None,
       },
       inputs: Placement {
         candidates: candidates.clone(),
@@ -3101,6 +3160,7 @@ mod tests {
                 host: slates_db::HostId(0),
                 uid: 0,
               },
+              completion: None,
             },
             inputs: Placement {
               candidates: candidates.clone(),
@@ -3187,6 +3247,7 @@ mod tests {
         host: slates_db::HostId(0),
         uid: 1000,
       },
+      completion: None,
     }
   }
 
@@ -3209,6 +3270,7 @@ mod tests {
         host: slates_db::HostId(0),
         uid: 0,
       },
+      completion: None,
     };
     assert_eq!(
       MergeRecordValue::from_record_bytes(&origin_only.to_record_bytes()),
