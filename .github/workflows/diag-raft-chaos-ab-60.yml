@@ -1,0 +1,86 @@
+name: DIAG raft-chaos interleaved A/B of the handshake fixes on one CPU under heavy syscall and disk load (not for main)
+
+# Diagnostics branch of the raft-chaos agent; never merged. Two arms built on each runner, both with the same diagnostic
+# harness: before = 1d1bac87 (the dial stall counters, no fix) and after = 4c73c048 (fixes (1), (2) and the sealed close).
+# They alternate run by run, the first arm swapped between runners. Condition (a): the test and its five daemons on CPU 0
+# alone, and on the same CPU 4 busy loops, 6 one-byte dd copies, 2 direct-I/O writers and 1 dsync writer. Condition: the test and its five daemons pinned to CPUs 0-1 (taskset), and on the
+# same two CPUs four busy loops, two one-byte dd copies (system time) and one direct-I/O disk writer, each in its own
+# process group, started before a run and stopped by that group after it.
+
+on:
+  push:
+    branches: [diag-raft-chaos-ab-60]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  SLATES_TEST_CLI: "1"
+
+jobs:
+  ab:
+    name: A/B ${{ matrix.sample }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        sample: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: The other arms' trees
+        run: |
+          git fetch -q origin diag-raft-chaos-ab-60-before
+          git worktree add -q ../before FETCH_HEAD
+          git -C ../before log -1 --oneline
+          git log -1 --oneline
+      - name: Build both arms
+        run: |
+          CARGO_TARGET_DIR=$GITHUB_WORKSPACE/../t-after cargo test --release --locked -p slates-cli --test live_chaos --no-run
+          (cd ../before && CARGO_TARGET_DIR=$GITHUB_WORKSPACE/../t-before cargo test --release --locked -p slates-cli --test live_chaos --no-run)
+      - name: Interleaved runs
+        run: |
+          R=../results.txt
+          echo "runner ubuntu-latest, $(nproc) CPUs, $(date -u), after $(git rev-parse --short=8 HEAD), before $(git -C ../before rev-parse --short=8 HEAD), sample ${{ matrix.sample }}" > $R
+          bin_of() { ls -t ../t-$1/release/deps/live_chaos-* | grep -v '\.d$' | head -1; }
+          echo "before $(bin_of before)" >> $R; echo "after $(bin_of after)" >> $R
+          if [ $(( ${{ matrix.sample }} % 2 )) -eq 0 ]; then ORDER="after before"; else ORDER="before after"; fi
+          for pair in 1 2 3 4 5 6; do
+            for arm in $ORDER; do
+              BIN=$(bin_of $arm)
+              # The load, each generator its own process group on CPUs 0-1.
+              LOADPG=""
+              for i in 1 2 3 4; do setsid taskset -c 0 bash -c 'while :; do :; done' & LOADPG="$LOADPG $!"; done
+              for i in 1 2 3 4 5 6; do setsid taskset -c 0 bash -c 'while :; do dd if=/dev/zero of=/dev/null bs=1 count=2000000 status=none; done' & LOADPG="$LOADPG $!"; done
+              for i in 1 2; do setsid taskset -c 0 bash -c "while :; do dd if=/dev/zero of=$RUNNER_TEMP/load-$i.bin bs=1M count=128 oflag=direct status=none; done" & LOADPG="$LOADPG $!"; done
+              setsid taskset -c 0 bash -c "while :; do dd if=/dev/zero of=$RUNNER_TEMP/sync.bin bs=4k count=256 oflag=dsync status=none; done" & LOADPG="$LOADPG $!"
+              sleep 2
+              echo "== pair $pair arm $arm at $(date -u +%H:%M:%S), load $(cut -d' ' -f1-3 /proc/loadavg)" >> $R
+              status=0
+              timeout 900 taskset -c 0 "$BIN" --nocapture --test-threads=1 --exact a_member_that_never_held_the_log_never_stands_in_for_its_holder > ../run.log 2>&1 || status=$?
+              for g in $LOADPG; do kill -KILL -- -$g 2>/dev/null; done
+              wait 2>/dev/null
+              grep -E '^DIAG (formation|settlement) took|^DIAG slow formation|test result|panicked|no survivor adopted the registers; the|every node held the newest|stayed stopped|the fleet formed, or kept changing' ../run.log | cut -c1-900 >> $R
+              grep -E '^DIAG dials (formation|settlement)' ../run.log | tail -80 | cut -c1-400 >> $R
+              grep -oE '(fleet\.(dial|accept)\.(stall\.[a-z_]+|redial|fault[a-z_.]*)): [0-9]+' ../run.log | sort | uniq -c | sort -rn | head -12 >> $R
+              echo "== pair $pair arm $arm exit $status, load $(cut -d' ' -f1-3 /proc/loadavg)" >> $R
+            done
+          done
+          rm -f $RUNNER_TEMP/load-*.bin $RUNNER_TEMP/sync.bin
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          git config user.name "diag-raft-chaos"
+          git config user.email "diag-raft-chaos@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-raft-chaos-ab-60 results ${{ matrix.sample }}"
+          git push -q origin "HEAD:refs/heads/diag-results/diag-raft-chaos-ab-60-${{ matrix.sample }}"
