@@ -2159,17 +2159,31 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
       local,
     ));
   }
-  // A green's catalog register too (AUD-29-17): its access list is what a successor admits by, and the merge plane
-  // ships no record of the green before the register's current version is committed (`green_catalog_committed`).
-  for id in state.greens.keys() {
-    if let Some(record) = state.db.partition().volume(*id) {
-      heads.extend(owed_catalog(state, config, record, local).0);
-    }
-  }
+  heads.extend(owed_merge_catalogs(state, config, local));
   for tombstone in state.db.partition().tombstones() {
     heads.extend(owed_tombstone(state, config, tombstone, local));
   }
   heads
+}
+
+/// The catalog registers of this shard's merge volumes, which have no store slot, as this owner still owes them.
+/// - A green's (AUD-29-17): its access list is what a successor admits by, and the merge plane ships no record of the
+///   green before the register's current version is committed (`green_catalog_committed`).
+/// - A work's (A-255): a work's head is never placed, so its catalog is the only record of it a successor holds, and
+///   it names the work's green. A resend that names the work reaches the work's successor, which sends it on to the
+///   green's owner, where the submit's completion is (in its merge record).
+fn owed_merge_catalogs(
+  state: &ShardState,
+  config: &slates_db::register::Configuration,
+  local: HostId,
+) -> Vec<Head> {
+  state
+    .greens
+    .keys()
+    .chain(state.works.keys())
+    .filter_map(|id| state.db.partition().volume(*id))
+    .filter_map(|record| owed_catalog(state, config, record, local).0)
+    .collect()
 }
 
 /// The catalog register of `record` (AUD-29-17) as this owner still owes it to some remote candidate, and whether
