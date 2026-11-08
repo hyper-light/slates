@@ -1,0 +1,5 @@
+tested 363d185b03ff94eb918cdece6a8bc29ef914e6df variant after on aarch64, 4 cpus
+placed exit 0 96s
+resent exit 0 133s
+resent-again exit 0 133s
+clippy exit 0 68s
