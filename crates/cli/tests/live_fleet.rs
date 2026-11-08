@@ -757,9 +757,37 @@ fn a_live_volumes_acknowledged_writes_survive_its_owners_death() {
 // clients cut off mid-write. SIGSTOP is the unprivileged partition: a stopped process answers nothing, its sockets keep
 // their ports, and SIGCONT returns it with every timer late, as a healed partition or a long scheduling stall does.
 
-/// Sends `signal` to a fleet daemon's process.
+/// Sends `signal` to a fleet daemon's process; a stop is waited for until the kernel shows the process stopped
+/// ([`wait_stopped`]).
 fn signal(process: &FleetProcess, signal: rustix::process::Signal) {
   rustix::process::kill_process(rustix::process::Pid::from_child(&process.child), signal).unwrap();
+  if signal == rustix::process::Signal::STOP {
+    wait_stopped(process.child.id());
+  }
+}
+
+/// Waits, within the fleet wait, until `pid` is shown stopped (`ps`'s state `T`). `kill` returns as soon as a stop is
+/// sent, and the process runs on until it is delivered: under load a "stopped" candidate went on to acknowledge the
+/// entry written next, so a FUSE `fsync` made after both candidates were stopped answered success in 0.28–3 ms with a
+/// candidate truly holding it (3 of 40 loaded runs, CI x86_64, `diag-live-durability-26`), and the flow read it as a
+/// false claim of durability.
+fn wait_stopped(pid: u32) {
+  let deadline = Instant::now() + FLEET_WAIT;
+  loop {
+    let state = Command::new("ps")
+      .args(["-o", "stat=", "-p", &pid.to_string()])
+      .output()
+      .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+      .unwrap_or_default();
+    if state.starts_with('T') {
+      return;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "process {pid} shown stopped within the fleet wait: state {state:?}"
+    );
+    pause();
+  }
 }
 
 /// Creates a live-shipped volume on `owner`: its id.
@@ -842,6 +870,203 @@ fn a_paused_candidate_neither_stops_writes_nor_stays_behind() {
   assert!(
     caught_up,
     "the resumed candidate caught up: {shipping:?} {held:?}"
+  );
+}
+
+/// A-200 with each candidate stopped in turn: do stop one candidate's process, write files, resume it and wait for it
+/// to catch up, then the same with the other. Expect no write to wait on the stopped candidate ([`STOPPED_WAIT`]), since
+/// the other answers throughout, and each resumed candidate to catch up to the owner's head. Before the holders were
+/// shipped to at once, a dispatch folded a write's answers only once every holder's exchange had ended, so the first
+/// write after each stop waited for the stopped holder's exchange to give up: 489–783 ms in 20 of 20 stops on main
+/// (CI, both Linux arches, release, `diag-live-durability-20`), against 3–5 ms for every write after it; under the
+/// rolling partition, writes at p50 1.01 s and p99 5.5 s (2026-11-06, `live_chaos`). And an exchange still in flight when its dispatch ended was dropped with its holder's session in it, so a
+/// resumed candidate was never sent to again (KIND, raft-chaos run 42178128960: both of an owner's sessions
+/// `lent=true` with its log stuck).
+#[test]
+fn each_candidate_stopped_in_turn_holds_no_write_and_catches_up() {
+  /// Shape: writes made while each candidate is stopped.
+  const WRITES_PER_STOP: usize = 4;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping stop-in-turn flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-turns");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = &fleet.instances[owner_index];
+  let others: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| *instance != owner)
+    .collect();
+  let id = create_live_volume(owner, "turns");
+  write_files(owner, &id, 0..1);
+  let liveness = Duration::from_nanos(STOPPED_WAIT);
+  let mut waited = Vec::new();
+  let mut behind = Vec::new();
+  let mut next = 1;
+  for step in 1..fleet.instances.len() {
+    let stopped = (owner_index + step) % fleet.instances.len();
+    signal(&fleet.daemons[stopped], rustix::process::Signal::STOP);
+    let latencies = write_files(owner, &id, next..next + WRITES_PER_STOP);
+    next += WRITES_PER_STOP;
+    signal(&fleet.daemons[stopped], rustix::process::Signal::CONT);
+    let (caught_up, shipping, held) = wait_caught_up(owner, &others, &id);
+    eprintln!(
+      "live turns: {} stopped: writes {latencies:?}; then {shipping:?} {held:?}",
+      fleet.instances[stopped]
+    );
+    waited.extend(
+      latencies
+        .into_iter()
+        .filter(|took| *took >= liveness)
+        .map(|took| (fleet.instances[stopped].clone(), took)),
+    );
+    if !caught_up {
+      behind.push((fleet.instances[stopped].clone(), shipping, held));
+    }
+  }
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  assert!(
+    waited.is_empty(),
+    "no write waits for the stopped candidate: {waited:?}"
+  );
+  assert!(
+    behind.is_empty(),
+    "each resumed candidate catches up: {behind:?}"
+  );
+}
+
+/// Shape: how long a write may take while a candidate is stopped before it counts as having waited on that candidate: a
+/// quarter of the liveness budget. A write that waits for the stopped holder's exchange to give up takes most of the
+/// budget (489–783 ms measured, [`each_candidate_stopped_in_turn_holds_no_write_and_catches_up`]); one that does not
+/// takes the other holder's round trip (3–5 ms). The bound sits between, far from both.
+const STOPPED_WAIT: u64 = slates_server::daemon::LIVENESS_BUDGET_NS / 4;
+
+/// A-200 with both candidates stopped: do stop both candidates' processes, make a write so the owner has entries to
+/// ship (it waits, since no candidate can hold it), keep them stopped for three liveness budgets, then resume them.
+/// Expect the owner's sends that went unanswered to stay within what a holder's lane can end unanswered: once per record
+/// period and once per publication, for each holder. Found 2026-11-07 (CI macos-latest, `diag-live-durability-23`):
+/// a lane ending unanswered sent what every other holder lacked; with both links dropped, each holder's lane ended at
+/// once and sent the other's, and the two went back and forth at the shards' speed (1,658 unanswered sends in one stop,
+/// against 5-13 otherwise).
+#[test]
+fn both_candidates_stopped_draw_no_storm_of_sends() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping both-stopped flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-storm");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let others: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| **instance != owner)
+    .collect();
+  let id = create_live_volume(&owner, "storm");
+  write_files(&owner, &id, 0..1);
+  let before = counter(&owner, "fleet.live.unanswered");
+  let stopped: Vec<usize> = (1..fleet.instances.len())
+    .map(|step| (owner_index + step) % fleet.instances.len())
+    .collect();
+  for index in &stopped {
+    signal(&fleet.daemons[*index], rustix::process::Signal::STOP);
+  }
+  // The write waits for durability no candidate can give; its answer, whatever it is, is not what this judges.
+  let writer = {
+    let (owner, id) = (owner.clone(), id.clone());
+    std::thread::spawn(move || {
+      let attachment = value_of(
+        &run_ready(&owner, &["attach", &id, "--write"]),
+        "attachment",
+      );
+      let _ = run_with_stdin(
+        &owner,
+        &["write", &id, &attachment, "/while-stopped"],
+        live_body(1).as_bytes(),
+      );
+    })
+  };
+  let stop = Duration::from_nanos(3 * slates_server::daemon::LIVENESS_BUDGET_NS);
+  // The test holds the stop for its length; shipped code parks on its driver (D-9).
+  #[allow(clippy::disallowed_methods)]
+  std::thread::sleep(stop);
+  let during = counter(&owner, "fleet.live.unanswered").saturating_sub(before);
+  for index in &stopped {
+    signal(&fleet.daemons[*index], rustix::process::Signal::CONT);
+  }
+  let _ = writer.join();
+  let (caught_up, shipping, held) = wait_caught_up(&owner, &others, &id);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  // Derived: each holder's lane ends unanswered at most once per record period (the period re-sends what it lacks) and
+  // once per publication (the write and its attach), plus the lane in flight when the stop began.
+  let periods = u64::try_from(stop.as_nanos() / u128::from(slates_server::daemon::HEARTBEAT_NS))
+    .unwrap_or(u64::MAX);
+  let publications = 2;
+  let bound = u64::try_from(others.len()).unwrap_or(u64::MAX) * (periods + publications + 1);
+  eprintln!(
+    "live storm: unanswered sends while both stopped {during} (bound {bound}); then {shipping:?} {held:?}"
+  );
+  assert!(
+    during <= bound,
+    "unanswered sends while both candidates were stopped: {during}, over {bound}"
+  );
+  assert!(
+    caught_up,
+    "both candidates caught up once resumed: {shipping:?} {held:?}"
+  );
+}
+
+/// A-200: a new live volume's log is shipped only to candidates that hold its catalog. Do make a volume live-shipped and
+/// write files to it at once. Expect neither candidate to refuse an entry for not holding the volume's catalog
+/// (`fleet.live.hold_refused.no_catalog`): a candidate derives what it keeps from the catalog, which the record plane
+/// places within a record period, so an entry sent before that is refused, and with it the session it rode. Found
+/// 2026-11-06 in `live_chaos`: 116 and 119 such refusals on the two candidates of one run, and the installs they drew
+/// held a session against the record plane's own re-ship of the catalog.
+#[test]
+fn a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping catalog flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-catalog");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = &fleet.instances[owner_index];
+  let others: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| *instance != owner)
+    .collect();
+  let id = create_live_volume(owner, "catalogued");
+  write_files(owner, &id, 0..FILES);
+  let (caught_up, shipping, held) = wait_caught_up(owner, &others, &id);
+  let refused: Vec<(String, u64)> = others
+    .iter()
+    .map(|other| {
+      (
+        (*other).clone(),
+        counter(other, "fleet.live.hold_refused.no_catalog"),
+      )
+    })
+    .collect();
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!("live catalog: refusals {refused:?}; then {shipping:?} {held:?}");
+  assert!(
+    caught_up,
+    "both candidates hold the owner's head: {shipping:?} {held:?}"
+  );
+  assert!(
+    refused.iter().all(|(_, count)| *count == 0),
+    "no entry sent to a candidate without the volume's catalog: {refused:?}"
   );
 }
 
@@ -1209,6 +1434,76 @@ fn a_live_volumes_writes_ship_their_changes_not_the_volume() {
   assert!(
     of("whole_bytes") <= of("change_bytes") + file_bound,
     "the whole records' bytes are at most the changes' and one whole record: {counters:?}"
+  );
+  assert_eq!(
+    of("refused"),
+    0,
+    "a sequential writer stays within its credit: {counters:?}"
+  );
+}
+
+/// A-200: a candidate that falls behind the owner's retained entries is installed, and the log stays a chain of changes.
+/// Do make stable NFS writes to a live volume from one sequential writer (so the credit never refuses a write), stop one
+/// candidate's process for the middle third of them, then resume it. Expect the paused candidate to catch up to the
+/// owner's head, at least one install image made (it fell behind the retained tail), and the log's first record still
+/// the only whole one. Found 2026-11-07 (CI, `diag-live-durability-14`): a laggard that already held the last whole record set
+/// `owes_whole`, so the next write's record carried the whole volume (20–45 MB in the chaos flows) to every holder. The
+/// up-to-date candidate had to take it before any later write was durable: 100–600 ms a time, and 1.2–1.9 s writes.
+#[test]
+fn a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log() {
+  /// Shape: writes before, during and after the pause, each enough to outrun the retained tail.
+  const WRITES_PER_THIRD: u32 = 60;
+  /// Shape: each write's bytes, a page.
+  const WRITE_BYTES: usize = 4096;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping laggard-install flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-laggard");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = &fleet.instances[owner_index];
+  let paused_index = (owner_index + 1) % fleet.instances.len();
+  let others: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| *instance != owner)
+    .collect();
+  let (mut live, file, id) = stable_session(owner, "laggard", true);
+  let data = vec![0x5a_u8; WRITE_BYTES];
+  let mut xid = 100;
+  let mut write_third = |live: &mut std::net::TcpStream| {
+    for _ in 0..WRITES_PER_THIRD {
+      xid += 1;
+      nfs::write(live, &file, &data, xid);
+    }
+  };
+  write_third(&mut live);
+  signal(&fleet.daemons[paused_index], rustix::process::Signal::STOP);
+  write_third(&mut live);
+  signal(&fleet.daemons[paused_index], rustix::process::Signal::CONT);
+  write_third(&mut live);
+  let (caught_up, shipping, held) = wait_caught_up(owner, &others, &id);
+  let counters = live_counters(owner);
+  drop(live);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!("live laggard: {counters:?}; then {shipping:?} {held:?}");
+  let of = |name: &str| counters.get(name).copied().unwrap_or(0);
+  assert!(
+    caught_up,
+    "the paused candidate caught up: {shipping:?} {held:?}"
+  );
+  // The non-vacuity counter: an install image is made only for a holder behind the retained tail.
+  assert!(
+    of("install_image") >= 1,
+    "the paused candidate fell behind the retained tail and was installed: {counters:?}"
+  );
+  assert_eq!(
+    of("whole"),
+    1,
+    "only the log's first record is whole: {counters:?}"
   );
   assert_eq!(
     of("refused"),

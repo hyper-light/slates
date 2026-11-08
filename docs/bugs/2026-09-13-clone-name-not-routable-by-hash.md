@@ -60,4 +60,5 @@ Evidence:
   shards and one, restart included. It was red at main and red with the alias routing disabled.
 
 Siblings left as they were and reported: `ImageBuild` and `ImageMerge` name a volume on the origin's partition with
-the same local-only check.
+the same local-only check. Fixed 2026-11-07 on the same protocol (A-236's note of that date;
+`an_image_and_its_merge_named_on_another_partition_are_held_once`).

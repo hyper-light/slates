@@ -482,34 +482,66 @@ pub(crate) fn note_connection(s: &mut ShardState, connection: u64, held: bool, i
   }
 }
 
-/// The held connections' byte states, for a publication (A-231): each tracker consumed through its journal's head first,
-/// so the states carried are as of this moment and nothing the publication carries is left unconsumed.
-pub(crate) fn carry(s: &mut ShardState) -> Vec<slates_vfs::recover::HeldNfsStates> {
+/// The held connections' byte states, for a publication (A-231): for each, a copy of its states with every change its
+/// tracker has not consumed yet applied to the copy, so the states carried are as of this moment and nothing the
+/// publication carries is left out. The live states and their cursor are left alone: a publication runs inside a call,
+/// before that call's own records are noted ([`made`]), and consuming them here took the connection's own write for
+/// another path's, so its next write-back of the same page was refused as stale (main CI 42395077767, fsx over the macOS
+/// NFS mount; `a_held_connections_own_write_backs_are_never_refused_as_stale`: 19 of 20 refused). In the copy a record
+/// not yet noted counts as another path's, which only makes a successor more careful.
+pub(crate) fn carry(s: &ShardState) -> Vec<slates_vfs::recover::HeldNfsStates> {
   if s.nfs_writeback.held.is_empty() {
     return Vec::new();
   }
-  let volumes: Vec<VolumeId> = s.nfs_writeback.trackers.keys().copied().collect();
-  for volume in &volumes {
-    consume(s, *volume);
-  }
   let held = &s.nfs_writeback.held;
-  s.nfs_writeback
-    .trackers
-    .iter()
-    .flat_map(|(volume, tracker)| {
-      tracker
-        .connections
-        .iter()
-        .filter(|(connection, _)| held.contains(connection))
-        .map(
-          move |(&connection, conn)| slates_vfs::recover::HeldNfsStates {
-            connection,
-            volume: volume.bytes,
-            files: conn.states.carried(ABSENT),
-          },
-        )
-    })
-    .collect()
+  let mut carried = Vec::new();
+  for (volume, tracker) in &s.nfs_writeback.trackers {
+    let Some(log) = s
+      .by_id
+      .get(volume)
+      .and_then(|&handle| s.volumes.get(handle).ok())
+      .map(|slot| slot.volume.op_log())
+    else {
+      continue;
+    };
+    let head = log.head_seq();
+    let overran = tracker.cursor.saturating_add(1) < log.oldest_seq();
+    let pending: Vec<slates_bridge_core::DataChange> = if head > tracker.cursor && !overran {
+      log
+        .since(tracker.cursor)
+        .filter_map(slates_bridge_core::changed::data_change)
+        .collect()
+    } else {
+      Vec::new()
+    };
+    for (&connection, conn) in &tracker.connections {
+      if !held.contains(&connection) {
+        continue;
+      }
+      let mut states = conn.states.clone();
+      // The copy is not charged to the ledger: it lives only while this publication is encoded.
+      states.grow_room(usize::MAX.saturating_sub(states.room()));
+      if overran {
+        states.lose_all();
+      } else if head > tracker.cursor {
+        for change in &pending {
+          states.changed(
+            change.ino,
+            change.range.clone(),
+            change.seq,
+            conn.own.took(change.seq),
+          );
+        }
+        states.consumed(head);
+      }
+      carried.push(slates_vfs::recover::HeldNfsStates {
+        connection,
+        volume: volume.bytes,
+        files: states.carried(ABSENT),
+      });
+    }
+  }
+  carried
 }
 
 /// Takes back the held connections' byte states the last publication carried (A-231), once the volumes are rebuilt:

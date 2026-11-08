@@ -129,7 +129,9 @@ Four separate claims follow from it, each needing its own evidence:
    hold a byte, or refuse to start — core size limit 0 soft and hard (every Unix) and an empty
    core filter (Linux), observed from outside the real processes (AUD-29-41 in part, 2026-10-01). Not claimed
    yet: pageout — only a strict create locks the content arena; metadata, rings, logs, completion records,
-   codec and transport buffers are pageable; and Windows dump exclusion (WER) is not set (AUD-29-41).
+   codec and transport buffers are pageable; and Windows has no unprivileged dump exclusion (AUD-29-41): under WER's
+   defaults a crash kept nothing locally, and an administrator's `LocalDumps` full dump keeps everything, which the
+   daemon detects and reports as `dumps_local_full` (A-239).
 3. *No private byte is disclosed across consumers or hosts.* A grant binds its consumer (AUD-29-01); owed:
    per-consumer authority for fleet content (AUD-29-45).
 4. *Ownership is bounded through cancellation, restart and destroy.* Partly evidenced by §4.2's admission;
@@ -5954,7 +5956,9 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   same way; `Shipper` now remembers holders owed an install, the model passes again (f=1: 309 installs, f=2: 455).
 >   And an install at a checkpoint a holder already holds is refreshed by a new whole record, which may go one entry
 >   past the credit (`Shipper::append_checkpoint`): with both candidates behind, waiting for credit no laggard could
->   free deadlocked the stall flow.
+>   free deadlocked the stall flow. (Since 2026-11-07 the refresh is an image beside the log while the log itself is
+>   whole; the whole record past the credit remains for a log that lost a change, as with both candidates behind. See
+>   "An install image beside the log" below.)
 > - *Clients cut off mid-write*: ten writers SIGKILLed right after starting, between finished writes: the log whole on
 >   every candidate, every deferred reply resolved (awaited 10, resolved 10).
 > - *A live volume destroyed*: its candidates let their copy of its log go once the tombstone reaches them
@@ -6086,6 +6090,73 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > log must ship; a candidate keeps about two whole entries). Measured (release, adacachy, load 58–107): a live stable
 > 4 KiB write adds 193–196 µs at the median, p99 513–715 µs, where it added 95–134 µs without the publication. Owed:
 > an incremental held image, so the cost no longer grows with what a candidate keeps of a large volume.
+>
+> **One lane a holder, only to holders of the catalog, and no session left with a cancelled request (2026-11-07).**
+> The dispatch round (`live_ship::dispatch`, `send_from_control`) now ships the way the record plane's sessions allow.
+> - *One lane a holder, the holders at once.* A dispatch sent a write's messages to the holders one after another, and
+>   folded their answers only once every holder's exchange had ended, so with one candidate stopped every write it
+>   carried waited for that candidate's exchange to give up. Now each holder has one lane, a dispatch's lanes run
+>   together on the control shard, each lane's answers are folded on the owner as its exchange ends, and a holder whose
+>   lane is shipping is sent nothing new until the lane ends (`lane_ended`), then what it lacks: only that holder's, and
+>   only when it answered. Sending every holder's let two holders with no link (both stopped) end each other's lanes
+>   at the shards' speed, 565,202 unanswered sends in one stop (`both_candidates_stopped_draw_no_storm_of_sends`).
+> - *Only to holders of the catalog.* A candidate derives what it keeps of a live log from the volume's catalog, which
+>   the record plane places within a record period; an entry sent before was refused
+>   (`fleet.live.hold_refused.no_catalog`), and installs drawn by it held the candidate's one session against the record
+>   plane's re-ship of that catalog. The owner now ships to the candidates any placement of the catalog named
+>   (`catalogued_holders`), kept as a union so a candidate away during one round is not dropped for good, and builds
+>   nothing for a holder whose lane is busy (an install clones the whole volume).
+> - *No session left with a cancelled request.* An exchange's requests are children of the task that made it, and a
+>   task's end cancels its children: a request still in flight when its lane ended was dropped with the holder's
+>   session in it, and the slot stayed lent for good, so the owner never shipped that holder again. A lane now waits for
+>   its exchange's stragglers to report before it ends (`finish_stragglers`).
+> Held by two failing tests in `crates/cli/tests/live_fleet.rs`, run on four trees (CI, release, both Linux arches, 5
+> runs each, `diag-live-durability-21`):
+> | tree | `each_candidate_stopped_in_turn_holds_no_write_and_catches_up` | `a_new_live_volumes_first_writes_go_only_to_candidates_holding_its_catalog` |
+> |---|---|---|
+> | main | 0 of 10 (the first write after each stop 406–1,064 ms) | 1 of 10 |
+> | one lane a holder | 10 of 10 (2.8–99.5 ms) | 1 of 10 |
+> | and only to catalog holders | 10 of 10 | 10 of 10 |
+> | and the stragglers' wait | 10 of 10 | 10 of 10 |
+> And `both_candidates_stopped_draw_no_storm_of_sends`: main 10 of 10 (30–58 unanswered sends while both are stopped),
+> the lanes without the rule above 8 of 10 (565,202 and 555,320 in the two failures), the whole series 10 of 10 (17–42,
+> bound 66; `diag-live-durability-24`).
+> On KIND (raft-chaos, release, real pods), main stalled with both of the owner's sessions `lent=true` (run
+> 42318867890: `wan` at durable 123 of 126, `wan-loss` 199 of 202, `ceiling` 0 of 3). The lanes with the catalogued
+> holders alone acknowledged every write in every profile (run 42357764313: `wan` p99 979 ms, max 1.59 s), and so did
+> the lanes with the stragglers' wait (run 42326682216: `wan` p99 1.36 s). So KIND does not separate the stragglers'
+> wait's own effect. Its failing test is on the simulated fabric, where the mechanism is deterministic:
+> `a_lane_that_ends_with_a_holder_unanswered_gets_every_session_back` (`crates/cluster/tests/live.rs`) ships from a task
+> of its own with one holder silent, settles (`Stragglers::settle`, which the lane's `finish_stragglers` calls) and ends;
+> both sessions come back. With the settle removed, only the answering holder's does ([HostId(2)] against both). The first write's ~99 ms in some runs is a lane waiting one record period for its holder's session,
+> lent to the record plane (`ship_head`); open.
+>
+> **An install image beside the log (2026-11-07).** A holder that falls behind the retained tail is installed with the
+> owner's last whole state. If it already holds that state, a newer one is needed. Until now that set `owes_whole`, so
+> the next write's record carried the whole volume as an entry to every holder. The up-to-date candidate had to take it
+> before any later write was durable, and `durable_target` made every waiting write wait for that record.
+>
+> The trigger was common because the retained tail's byte bound was the last whole record's size, fixed while the
+> volume grew. In the chaos flows (CI, `diag-live-durability-14`, release, both Linux arches) every run made such
+> records:
+> - 20–45 MB each, each exchange 100–600 ms;
+> - the lanes they held turned later writes away for credit, which owed further whole records;
+> - writes of 1.2–1.9 s followed.
+>
+> Now the stale checkpoint sets `owes_image` instead (`LiveVolume::owes_image`), and the log is untouched:
+> - the next publication appends its change as usual, and the volume's whole state, which is that publication's
+>   state, becomes the install at the head just appended (`live_ship::refresh_image`);
+> - on the record period a volume with nothing unpublished makes it the same way, so an idle writer leaves no holder
+>   waiting;
+> - the retained tail's bound follows the image, so a laggard is sent entries while they cost less than installing the
+>   volume as it is now;
+> - nothing waits on `owes_image`; only the lagging holder is installed;
+> - a log that lost a change (`owes_whole`) still takes a whole record, and an image is never made then, since the
+>   volume's state is past its head.
+>
+> Held by `a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log` (one candidate stopped
+> for the middle third of 180 sequential stable writes: one whole record, at least one install, and the candidate caught
+> up).
 >
 > **Chaos from outside the processes (2026-11-06).** `crates/cli/tests/live_chaos.rs` streams writes through the Rust
 > client while it partitions or kills processes. It ends every flow with Agreement, NoLoss, StaleNeverCommits and
@@ -6776,7 +6847,10 @@ it uses content addressing. The RAM-only trust boundary and any allowed sharing 
 > - **Bound to the object.** Every offer, put and fetch names its object (`Fetch` gained it). The holder
 >   decides authority from the committed configuration and its own records before any lookup or allocation.
 >   - A placement needs the object's acting owner (its owner, or a departed owner's takeover successor) and
->     must land on that owner's candidates.
+>     must land on that owner's candidates. A live log's entry (A-200) also lands on a holder the volume's
+>     newest catalog record names among its live holders (A-240), though the holder's own configuration does
+>     not place it yet: phase one counts the recorded holders, and a holder whose view lagged refused every
+>     entry while the other was stopped (2026-11-07, `live_ship::live_admission`).
 >   - A read needs the acting owner, one of its candidates, or a holder of its recovery cohort.
 > - **Scoped answers.** Answers come only from what the holder holds for that object: another object's
 >   chunks count as missing, cannot be leaned on by a put, and are never fetched. A refused request draws the
@@ -7345,6 +7419,14 @@ stays in the overlay.
 > - **The source.** An unnamed landing lands an implicit snapshot of the head, taken when it begins.
 > - **One at a time.** One granted landing per volume runs at a time.
 > - **Large files.** A large file is copied one content window per unit, so no unit grows with a file.
+> - **The plan.** A landing's beginning, the diverged walk, the plan and a presentation's preliminary verdicts, runs a
+>   unit at a time like its writes: a presentation's reply is deferred to it, on an implicit snapshot of the head, and
+>   a granted landing plans inside its task with its lease kept alive. Until 2026-11-08 it was one poll
+>   (`docs/bugs/2026-11-08-a-landings-plan-held-its-shard.md`).
+> - **The fences' clock.** Every entry is fenced against its lease and grant on the landing's clock, which counts from
+>   the instant its request's clock was read: the plan, the sweep and the validation count. Until 2026-11-08 it
+>   counted from the first write, so a landing paused before it wrote past its term
+>   (`docs/bugs/2026-11-08-a-landings-fence-counted-its-time-from-its-first-write.md`).
 > - **The lease keepalive.** A running landing renews its target lease between slices once half its term
 >   has passed, by taking it again as its own holder. Until 2026-11-07 the partition refused that take while the
 >   lease held, so a renewal only succeeded once the lease had lapsed. The entries a landing reached in between
@@ -13537,6 +13619,37 @@ last), `crates/cli/tests/nfs_held.rs` (the history test).
   and both encodings of the image and the delta are compared with the field (`crates/vfs/tests`).
 - **Format.** Image version 22, delta version 5: earlier images and logs are refused by version, as before.
 
+- **2026-11-07, a regression fixed** (`docs/bugs/2026-11-07-a-held-connections-own-write-back-was-refused-as-stale.md`):
+  the carry consumed the live trackers inside a call, before the call's own records were noted, so a held connection's
+  own write went stale and its next write-back was refused (main CI 42395077767, fsx over the macOS mount). The carry
+  now reads a copy and leaves the live states alone.
+### A-239 — On Windows the daemon reports an administrator's full crash dumps; it registers no region exclusion (accepted 2026-11-07, the supervisor's decision: option b)
+Applied in the same change to: §1's RAM-only guarantee 2, GAPS (`8a-win-dumps`), `crates/server` (`local_dumps.rs`,
+new; the daemon's start reads it; `verbs.rs`: the status field; `tests/dump_exclusion.rs`, new), `crates/ipc`
+(`DaemonReport::dumps_local_full`, appended), `crates/cli` (`dumps.rs`: the Windows arm's doc; the status line),
+`crates/mcp` (the status field), `.github/workflows/ci.yml` (the default crash and `LocalDumps` on the Windows job).
+- **What was asked.** GAPS `8a-win-dumps`: Windows has no unprivileged way to keep a process out of a crash dump. The
+  supervisor's first call was to exclude the private mappings with `WerRegisterExcludedMemoryBlock` as each is mapped,
+  and prove it with a dump of a crashed child.
+- **What was measured** (windows-latest, Windows Server 2025 Datacenter, build 26100; a child that writes a known
+  pattern into a content region, a shared object's view, a key slot and, as a control, the heap):
+  - An administrator's `LocalDumps` full dump ignored the registration: every registered region's pattern was in it,
+    once each, beside the heap's (runs 42355310061 and 42362092866; 17 to 18 MB dumps), though every registration
+    returned `S_OK`.
+  - Under WER's defaults a crash kept no file in the machine's or the user's report queue or archive within 60 s (run
+    42362092866).
+  - WER's own report, the one dump the call is documented to govern ("excluded from the WER error report"), could not be
+    produced: `WerReportSubmit` answered `WerDisabled` with `Disabled` 0, WerSvc running and no policy (run 42364879358).
+  - CI's runner hands its steps error mode `0x8003` (`SEM_NOGPFAULTERRORBOX` in it), so WER sees no crash there unless the
+    child clears it; its job refuses a breakaway.
+- **The decision (b).** No registration: its one measurement shows no effect, and R4 accepts complexity only on evidence
+  (the patch is kept in scratch for a Windows client that can measure WER's own report). The daemon reads the
+  `LocalDumps` setting, unprivileged, logs it once and reports `dumps_local_full`; it serves either way (R10).
+- **Evidence.** `local_dumps_settings_are_judged_as_wer_applies_them` (the setting's rules, every host);
+  `a_default_crash_report_carries_no_content_region_shared_view_or_key_slot` and
+  `an_administrators_local_full_dump_carries_every_mapping` (Windows CI, before and after the job sets `LocalDumps`; the
+  second also asserts the daemon's detection reads it), each holding the residual as measured.
+
 ### A-241 — A client proves its id with a session key, and a request names its own client (accepted 2026-11-07, the supervisor's order)
 Applied in the same change to: §4.9 (its status), GAPS (GAP-A9-9's entry), the bug record of 2026-11-07,
 `crates/anchor` (`layout::SUP_SESSION_PRESENT`, `SUP_SESSION_SECRET`, `SESSION_SECRET_BYTES`, appended;
@@ -13634,6 +13747,14 @@ recovery's reconcile, and `mount_capability` follows the alias; `image.rs`: `pub
 - **What it does not change.** Lookups by id, and a create whose name hashes to its own partition. The siblings found
   are left as they were: `ImageBuild` and `ImageMerge` make a named volume on the origin's partition with the same
   local-only name check, and a fleet takeover that moves a clone off its host is outside this daemon's partitions.
+- **2026-11-07: the image verbs on the same protocol** (the supervisor's order). `ImageBuild` and `ImageMerge` make
+  their volume beside its source for copy-on-write, as a clone is made, and now hold a name that hashes elsewhere the
+  same way (`crates/server/src/image.rs`: `name_alias`, `reserve`, `settle`): the volume's id minted first, the alias
+  reserved at the name's partition before the build or merge starts, confirmed or released before the reply; the name
+  checked against the name's partition's aliases as well as its volumes. Destroy's release and recovery's reconcile were
+  already the protocol's for any volume. `an_image_and_its_merge_named_on_another_partition_are_held_once`
+  (`crates/server/tests/recovery.rs`) was red (the merge was not served under its name), is green on two shards and on
+  one (R8) across a restart, and is red again with the alias turned off.
 
 ### A-233 — macOS hands a client its region as a Mach fileport, never by a name a stranger could open (accepted 2026-11-06, GAP-A9-9's ring half)
 Renumbered 2026-11-07 from A-220 (the supervisor's allocation: A-220 was taken elsewhere). The commit that made it,
@@ -13706,7 +13827,13 @@ name unlinked; `completion.rs`: the bridge's mappings by duplicate), `crates/mem
      client's ring slots, `remote_attach::bound`; past it `RemoteAttachmentsFull`), and its reap of a dead client
      sends each owner `RemoteReap { volume, client }`, which ends that host's client's attachments there (the host
      again the authenticated peer's, so a node reaps only its own clients). A host that leaves the configuration has
-     every remote attachment it held ended at each install that no longer lists it (`remote_attach::end_departed`).
+     every remote attachment it held ended: each liveness budget the control shard maps the configuration's members
+     to their certificate anchors (the id a forward authenticates, which `Remote` records; a member id is fresh per
+     incarnation), names each anchor among them at the last look and absent now, and has every shard end that
+     anchor's attachments (`remote_attach::sweep_departed`), owed again until every shard answered. **Corrected
+     2026-11-07:** the first form ended them at two of the nine paths that install a configuration, compared member
+     ids with anchors, and ended a not-yet-configured host's attachment mid-formation; main CI 42335884062 held a
+     retired host's attachment for 40 s (`docs/bugs/2026-11-07-a-retired-hosts-remote-attachment-was-never-ended.md`).
   6. **The bound on a silent holder is its write lease's term**, `failover_slo_ns` (derived in `take_write_lease`; 10
      s by default): a reap, like a local one, ends the record and leaves the lease to its term (D-16 "Lease holder
      crash: writes refused until the lease expires"); the owner's lease sweep releases it within one liveness budget
@@ -14804,9 +14931,22 @@ Applied in the same change to: §4.16's status, A-9's "recorded durably" (now: r
   is placed.
 - **Measured** (BENCHMARKS): one client over the kernel's `fs/` (48 MB), interleaved best of three, peak RSS 549,520 KiB
   before and 225,776 KiB after; `CreateGreen` 415,498,814 ns before and 157,915,124 ns after.
-- **Owed.** A green taken over by another host still records its origin as bytes (the successor holds no base snapshot;
-  raft's fleet path). The engine still holds the origin twice (current content and history), and the overlay holds the
-  pinned copy.
+- **Created in slices (2026-11-07).** `CreateGreen { base }` checks at once, then defers its reply to a task of the
+  owner shard. The task walks the snapshot one listing or one file a unit (`merge_service::OriginWalk`), hashes the
+  origin's identity as its canonical bytes are written (`slates_merge::origin::IdentityCursor`, no buffer), and seeds
+  the engine a share at a time (`slates_merge::engine::OriginLoad`; `Green::with_origin` takes the origin by value).
+  Each unit runs through `image::sliced`, and the green's records commit with the request's completion as one atom. It
+  was one poll: the whole kernel for 48 to 69 s, and 1,000 files of 16 KiB for 134 ms on CI's x86_64 runner, with no
+  other verb on the shard answered (`crates/server/tests/green_fairness.rs`;
+  `docs/bugs/2026-11-07-creating-a-green-held-its-shard-for-the-whole-walk.md`). Peak RSS over `fs/` and the whole kernel
+  is in BENCHMARKS.
+- **Owed.**
+  - A green taken over by another host still records its origin as bytes (the successor holds no base snapshot; raft's
+    fleet path).
+  - The engine still holds the origin twice (current content and version 0's history value); loadtest-scale shares
+    them after W2.
+  - The overlay holds the pinned copy.
+  - Recovery walks a held origin in `init_shard` in one call.
 
 ### A-201 — A green's head lands through a checkout: written into the volume the green was created from, which lands under a grant like any volume (accepted and built 2026-11-04)
 

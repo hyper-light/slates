@@ -135,7 +135,7 @@ impl WritableOpens {
 /// failed 9 runs of 10, since Linux 6.12 writes back from a temporary copy an invalidation passes. Judged by walking the
 /// journal back from each page's fetch, a long-lived map outlived the journal's retention and its write-backs were
 /// refused, 2 runs of 3.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct PageStates {
   files: std::collections::BTreeMap<u64, FileStates>,
   /// The files changed since the last [`PageStates::consumed`], each listed once: only their points can need raising.

@@ -1,5 +1,43 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A clone's name is held at its name's partition (2026-11-06, A-236, bug-sweep; the supervisor's option 3).** A clone
+> whose name hashed to another partition than its origin's was unreachable by name over the mount transport, and its
+> name could be created twice (bug record of 2026-09-13).
+> - Now the name's partition holds an alias pointing at the clone. It is made by a reservation protocol (reserve, make
+>   the clone, confirm), released on a refused clone and on a destroy, and reconciled at every recovery before clients
+>   are admitted.
+> - `crates/db/tests/alias.rs` crashes at every step. `a_clone_named_on_another_partition_is_reached_by_name_and_held_once`
+>   runs two shards and its one-shard differential, restart included; it was red at main and red with the routing off.
+> - **Siblings:** `ImageBuild` and `ImageMerge` made a named volume on the origin's partition with a local-only name
+>   check, the same bug class; fixed 2026-11-07 on the same protocol (A-236's note). Still open: an alias step the name's shard did not take (`names.alias_step_untaken`)
+>   leaves a reserved alias that resolves nothing until the next recovery.
+
+> **GAP-A9-9 on macOS, the ring half: a client's region crosses as a Mach fileport, never by name (2026-11-06, A-233,
+> bug-sweep; the rest open).** A same-uid stranger could open any client's ring by the name the claim slot published
+> (measured 2026-10-18). Now:
+> - The daemon unlinks a region's name before it answers, and the region reaches its claimant only as a fileport through
+>   the owner's Mach token, which launchd refuses to any other process while its holder lives.
+> - The owner keeps a region only from itself or its child, and hands it only to the claimant's audit-token pid.
+>
+> Red first: `a_stranger_finds_no_clients_region_by_name` (the slot named the region and the stranger opened it), then
+> green. `mach_claim`'s stranger test was red-checked with the parent check disabled. Still open:
+> - **The anchor's segment and content objects are opened by name** (`/slates-seg-…`, `/slates-con-…`). A stranger maps
+>   the daemon's whole RAM read-write: the largest exposure. Closing them is easy, since the daemon can inherit the
+>   descriptor as on Linux. But the segment's name is also macOS's issuer surface: `slates grant` and the other issuer
+>   verbs read the issuer secret through it. Options sent to the supervisor for Ada:
+>   1. close it as Linux does, the issuer verbs then working only from the anchor's children (recommended);
+>   2. accept that same-uid processes are trusted with the daemon's RAM;
+>   3. build the issuer surface as a Mach service first.
+> - **The bootstrap object** stays named: its doorbell (writing it was measured harmless) and its claim slots, which a
+>   stranger can scribble to refuse claims. That is a denial of service, never a ring.
+> - **Windows**, the same shape by name (`Local\` sections with the default DACL); the fix is a section DACL and handle
+>   duplication, as `delivery.rs` already does.
+> - **Found on the way, every platform: a wanted client id was granted to whoever asked while it was not live.** Fixed
+>   2026-11-07 by A-241, with a sibling found on the way: any client could run a request under another client's id and
+>   plant its reply there, where that client's own request of the id later met it. A client now proves its id with a
+>   session key only it holds, and a request naming another client is refused
+>   (`docs/bugs/2026-11-07-a-stranger-took-a-dead-clients-seat-and-planted-its-replies.md`).
+>
 > **Fixed (live-fixes, 2026-11-07): a node back at its anchor with fresh RAM had every pair key refused (A-92 piece 4b).**
 > A receiver kept one pair key per sender anchor and shard and refused any other, so a node replaced at its anchor (its
 > keys gone) was refused for good (789 of 793, raft-chaos's kill-at-ack, CI diag-raft-chaos-three-25): its sealed live
@@ -26,6 +64,37 @@
 > no catalog candidate receives that record only when the configuration names it again, by then a counted member of the
 > next transition. A safe release needs a holder-set generation the entries and replies carry. raft-chaos's five-node
 > flow notes the copies dropped holders keep, and asserts their release once that lands.
+>
+> **Fixed (live-fixes b5601dea, found by live-durability, 2026-11-07): a holder set was moved to one of `f` or fewer,
+> and writes waited on its lone member.** With `W` allowing `n = f`, a candidate found dead moved the holders `{X,Y}` to
+> `{Y}` at `f = 1`; once X resumed, the move back kept each write on `{Y}` until it was recorded, and Y stopped inside
+> that window held every write for a partition's length (the rolling partition flow at 8b0f0341,
+> diag-live-durability-35: a 2.2–3.1 s write in 4 of 6 runs on each arch, 1 of 6 before the floor; on the Mac, the
+> stalled runs were exactly those with two transitions). Such a set is no longer moved to: no takeover counts `f + 1`
+> reports from it. With the fix, 1 of 12 CI runs (diag-live-durability-36) and 0 of 6 Mac runs had a write over 1 s; the
+> Mac runs counted no transition.
+> **Fixed (live-fixes 1b41b1dd and 07daf5fa, 2026-11-07): a resumed candidate refused entries while its own view still
+> placed the volume elsewhere.** The resumed X refused its owner's entries `not_a_candidate` while the other holder was
+> stopped, so no holder answered: a write held 2.34 s (diag-live-durability-36), and once a refusal for a whole fleet
+> wait, the candidate never caught up and Convergence failed (195,928 refusals, diag-live-durability-39; the shape of
+> diag-34's two arm failures). A holder the volume's newest catalog record names among its live holders now takes the
+> acting owner's entries though its configuration lags (`live_ship::live_admission`, red with the exception removed).
+> The A/B, rolling partition x10 per leg per arch (diag-live-durability-39): without, `not_a_candidate` in 4 of 20 runs,
+> a write over 1 s in 4, Convergence failed in 1; with, none of the three in 20.
+> **Open (live-durability, 2026-11-07; shape unknown): a write held about 2.3 s when the second candidate stops within a
+> quarter second of the first's resume.** With the fix above, 1 of 40 rolling partition runs (diag-live-durability-40
+> and -41: x86, sent at 2.48 s as c stopped, b resumed at 2.23 s, answered 0.31 s after c resumed, no refusal anywhere).
+> The resumed holder was not yet counting: its catch-up (an install, after 2 s away) or the owner's redial of its
+> session. A passing run prints no counters, so which is not known (the diag runs' stuck-write watcher,
+> diag-live-durability-38, dumps only from 3 s). Before the merge 1 of 6 runs had one too (2.6 s, no refusal).
+> **Open (raft-chaos, 2026-11-07; cause unknown): a live takeover over KIND's lossy WAN path never finished.** At
+> e140ca3a, 1 of 4 runs of the KIND lane's live takeover under 80 ms ± 20 ms with 1 % loss (raft-chaos's diag-41, the
+> tip plus a counter only) found no survivor serving the volume within `TAKEOVER_WAIT` (120 s, `xtask/src/kind.rs`);
+> the other 3 took it over in 17–21 s. Nothing was lost: all 300 writes read back, and both survivors hold one head.
+> The candidate received only its own report and retried phase one 425 times, while its session to the other holder
+> stayed lent out throughout; phase one losing its own session was ruled out. Main's rate is not measured (its one
+> sample, run 42403976587, passed). Owed before any fix: each session's lends and returns counted and dumped at the
+> missed budget, and an interleaved A/B of the lane against main.
 
 > **Fixed (live-fixes, 2026-11-07): a live shipper made before its candidates were known shipped to nobody** (A-200's
 > amendment of that date). A shipper kept the holders of its first publication, so a live volume made on a fleet's
@@ -92,44 +161,6 @@
 > - **Not reproduced: raft's other two formation findings** (an owner with no session to its only reachable candidate
 >   for 249 tries; a candidate refusing `no_catalog` for good). Eight full live fleet suites with the settled wait
 >   removed, with these fixes: no such stall; each first `no_catalog` refusal was followed by holding.
-
-> **A clone's name is held at its name's partition (2026-11-06, A-236, bug-sweep; the supervisor's option 3).** A clone
-> whose name hashed to another partition than its origin's was unreachable by name over the mount transport, and its
-> name could be created twice (bug record of 2026-09-13).
-> - Now the name's partition holds an alias pointing at the clone. It is made by a reservation protocol (reserve, make
->   the clone, confirm), released on a refused clone and on a destroy, and reconciled at every recovery before clients
->   are admitted.
-> - `crates/db/tests/alias.rs` crashes at every step. `a_clone_named_on_another_partition_is_reached_by_name_and_held_once`
->   runs two shards and its one-shard differential, restart included; it was red at main and red with the routing off.
-> - **Siblings open:** `ImageBuild` and `ImageMerge` make a named volume on the origin's partition with a local-only
->   name check, the same bug class. Also, an alias step the name's shard did not take (`names.alias_step_untaken`)
->   leaves a reserved alias that resolves nothing until the next recovery.
-
-> **GAP-A9-9 on macOS, the ring half: a client's region crosses as a Mach fileport, never by name (2026-11-06, A-233,
-> bug-sweep; the rest open).** A same-uid stranger could open any client's ring by the name the claim slot published
-> (measured 2026-10-18). Now:
-> - The daemon unlinks a region's name before it answers, and the region reaches its claimant only as a fileport through
->   the owner's Mach token, which launchd refuses to any other process while its holder lives.
-> - The owner keeps a region only from itself or its child, and hands it only to the claimant's audit-token pid.
->
-> Red first: `a_stranger_finds_no_clients_region_by_name` (the slot named the region and the stranger opened it), then
-> green. `mach_claim`'s stranger test was red-checked with the parent check disabled. Still open:
-> - **The anchor's segment and content objects are opened by name** (`/slates-seg-…`, `/slates-con-…`). A stranger maps
->   the daemon's whole RAM read-write: the largest exposure. Closing them is easy, since the daemon can inherit the
->   descriptor as on Linux. But the segment's name is also macOS's issuer surface: `slates grant` and the other issuer
->   verbs read the issuer secret through it. Options sent to the supervisor for Ada:
->   1. close it as Linux does, the issuer verbs then working only from the anchor's children (recommended);
->   2. accept that same-uid processes are trusted with the daemon's RAM;
->   3. build the issuer surface as a Mach service first.
-> - **The bootstrap object** stays named: its doorbell (writing it was measured harmless) and its claim slots, which a
->   stranger can scribble to refuse claims. That is a denial of service, never a ring.
-> - **Windows**, the same shape by name (`Local\` sections with the default DACL); the fix is a section DACL and handle
->   duplication, as `delivery.rs` already does.
-> - **Found on the way, every platform: a wanted client id was granted to whoever asked while it was not live.** Fixed
->   2026-11-07 by A-241, with a sibling found on the way: any client could run a request under another client's id and
->   plant its reply there, where that client's own request of the id later met it. A client now proves its id with a
->   session key only it holds, and a request naming another client is refused
->   (`docs/bugs/2026-11-07-a-stranger-took-a-dead-clients-seat-and-planted-its-replies.md`).
 
 > **A path on a volume this daemon serves is refused before any open (A-227, 2026-11-06): built on Linux, Windows and
 > macOS.** A base directory and every lookup below it, a landing's target and a FUSE mount point are refused typed
@@ -266,8 +297,15 @@
 >   - Open: an `Overloaded` raised inside a verb is recorded as its completion, so a resend under its id meets it for
 >     good.
 >
-> - **The whole kernel as the workload: the pin holds, creating the green does not** (open; reported to fixtures, A-217's
->   re-lander, 2026-11-06). In-process daemon on the Mac (loaded arm, load 30 to 47), Linux v7.4-rc1 whole (97,229
+> - **The whole kernel as the workload: the pin holds; creating the green held its shard until 2026-11-07** (the
+>   `CreateGreen` half fixed on `agents/reland-a207-3`). It is now walked, hashed and seeded in slices with its reply
+>   deferred, the identity hashed with no buffer, and `with_origin` takes the origin by value.
+>   - `green_fairness.rs`, 1,000 files of 16 KiB: main held its shard for one poll of 134 ms (x86_64) and 960 ms
+>     (arm64) with 0 probes answered; sliced, 259 to 1,456 probes inside, the longest 13.6 ms.
+>   - Peak RSS over the whole kernel 9.42 to 8.02 GB, `fs/` 361 to 283 MB (BENCHMARKS, "CreateGreen sliced").
+>   - Still open: the engine's second lifetime copy (loadtest-scale, after W2), and recovery's walk in `init_shard`.
+>
+>   The 2026-11-06 record, as it was found (reported to fixtures, A-217's re-lander): In-process daemon on the Mac (loaded arm, load 30 to 47), Linux v7.4-rc1 whole (97,229
 >   files on APFS, 1.67 GB), the sliced pin:
 >   - pin 64.4 s, RSS 42 MB to 3.4 GB (the content, granule-rounded);
 >   - snapshot 0.71 s;
@@ -1109,7 +1147,13 @@
 > load 8–30 (2026-11-05). The rare 100 ms tail is explained and removed (two waits for the record period; and a
 > superseded owner that held a write unanswered is now refused, and a destroyed volume's shipper is let go: §4.10
 > status "The tail and three more defects"). Open: the added median is the cross-shard dispatch round (50 µs not met);
-> p999 under 1 ms at load 30. Open: one exchange per message to every holder starved the second holder (never
+> p999 under 1 ms at load 30. Since 2026-11-07 a live volume's log goes to each holder on its own lane, the holders at once, only
+> to holders of its catalog, and a lane waits for its requests before it ends (§4.10 status "One lane a holder"): a
+> write no longer waits for a stopped candidate (main: 406–1,064 ms for the first write after a stop, now 3–99 ms), and
+> no holder's session is left lent with a cancelled request (KIND `wan`, `wan-loss` and `ceiling` acknowledged every
+> write, where main stalled; the lanes alone did too, so KIND does not separate the stragglers' wait; its failing test is on the simulated fabric, `a_lane_that_ends_with_a_holder_unanswered_gets_every_session_back`). Open: a large install over a slow path is still cut at the live budget, as on main; it
+> waits on raft-chaos's size-derived exchange budget. And a lane may wait one record period for a session the record
+> plane has lent (`ship_head`). Fixed the same day: a holder behind the retained tail no longer puts a whole copy of the volume on the log ahead of every later write; it is installed from an image made beside the log (§4.10 status "An install image beside the log"). Open: one exchange per message to every holder starved the second holder (never
 > accepted an entry, in six of nine process flows) and was rejected; why is not pinned down. Open, toward a filesystem
 > server replicated per write in under 1 ms: AC-8.9's credit backpressure (since 2026-11-05 a local checkpoint ships a
 > live volume's changes, not a whole copy: 1 whole record in 2,051 where main made about 420; the credit itself is
@@ -1289,9 +1333,12 @@
 > **A client on another node writes a volume (fs-server, 2026-11-05, A-222).** `slates attach ID --write` from another
 > fleet node now attaches the owner's volume in the record form, `slates write` writes through it, and `slates detach
 > ATTACHMENT --volume ID` ends it; a killed holder's attachment ends at the owner within two liveness budgets of its
-> node's reap and its lease at its term (10 s); a retired host's at the next install. Proven by six two- and
-> three-daemon tests in `crates/cli/tests/fs_server.rs`, each red-checked (A-222). Open: ownership migration to a
-> writer that stays, and the read-only remote attach of a snapshot (§4.10).
+> node's reap and its lease at its term (10 s); a retired host's within a liveness budget of its retirement. Proven by
+> six two- and three-daemon tests in `crates/cli/tests/fs_server.rs`, each red-checked (A-222). Open: ownership
+> migration to a writer that stays, and the read-only remote attach of a snapshot (§4.10). **Fixed 2026-11-07** (main CI
+> 42335884062, red): a retired host's attachment stood for good, the sweep reaching two of nine install paths and
+> comparing member ids with the anchors `Remote` records; it is now the control shard's look each budget, by anchor
+> (`docs/bugs/2026-11-07-a-retired-hosts-remote-attachment-was-never-ended.md`).
 
 > **A green's head reaches the disk (fs-server, 2026-11-04, A-201).** `slates checkout GREEN VOLUME ATTACHMENT --snapshot
 > N` writes a green's head into the volume it was created from, and that volume lands under a grant. Proven by
@@ -2924,7 +2971,22 @@ restores no-opinion over vendor and stages zero files.
 
 **Proven** on run 39528936826: `aarch64 windows (native, by test)` success, against failure on the parent commit's run 39527867650. Native Windows cannot be executed from this machine, so CI was the arbiter.
 
-### 8a-win-dumps. Windows has no unprivileged core-dump exclusion, and the CLI now says so (2026-10-20, OPEN — needs Ada)
+### 8a-win-dumps. Windows has no unprivileged core-dump exclusion, and the daemon says when a full dump is set (2026-10-20; decided 2026-11-07, A-239)
+
+> **2026-11-07, A-239 (the supervisor's decision: option b).** Region exclusion was built, measured and set aside;
+> the daemon reports an administrator's full dumps instead. Measured on windows-latest (build 26100):
+> - An administrator's `LocalDumps` full dump ignores `WerRegisterExcludedMemoryBlock`: every registered region's
+>   pattern was in it, beside the heap's (runs 42355310061, 42362092866).
+> - WER's defaults keep nothing locally: no file in either report queue or archive within 60 s (run 42362092866).
+> - WER's own report, the dump the call governs, could not be produced: `WerReportSubmit` answered `WerDisabled` with
+>   `Disabled` 0, WerSvc running and no policy (run 42364879358). Open: measure it on a Windows client; the
+>   registration patch is kept in scratch for that.
+> - CI's runner hands its steps error mode `0x8003` (`SEM_NOGPFAULTERRORBOX`), so WER sees no crash there unless a
+>   process clears it.
+>
+> The daemon reads the `LocalDumps` setting unprivileged, logs it once and reports `dumps_local_full` in `slates status`;
+> it serves either way (R10). Residual, stated: with that setting a crash dump holds every byte the daemon serves.
+
 
 Compiling `slates-cli` for Windows for the first time turned up three Unix-only sites in the shipped
 binary, and one of them is a security property rather than a portability detail. `dumps::exclude_from_dumps`
@@ -14266,9 +14328,14 @@ Mac, binaries built on `d61c3be2`):
   ends. `a_stopped_daemon_does_not_say_its_control_loop_ended` (`crates/server/tests/liveness.rs`) stops a daemon
   while a poll holds a shard for three beats, in a child process whose standard error it reads: 3 of 3 said it before
   the fix, 10 of 10 under two spinners a core did not after (adacachy).
-- Found with them, not fixed here: when an honest client's thread panics,
-  `a_mount_survives_connections_broken_and_tampered_mid_call_under_load` never lowers its stop flags, so its breakers
-  and spinners run on and the scope never ends. One run hung for 36 minutes at load ~100 until stopped by hand.
+- Found with them, and fixed after: when an honest client's thread panicked,
+  `a_mount_survives_connections_broken_and_tampered_mid_call_under_load` never lowered its stop flags, so its breakers
+  and spinners ran on and the scope never ended. One run hung for 36 minutes at load ~100 until stopped by hand. Its
+  scope body lowered them on its last line; four more scopes in the file did the same after an `expect` or `unwrap`.
+  Each now sets `LowerOnDrop` at its top, which lowers them however the body ends. Red first:
+  `a_scope_whose_body_panics_still_stops_its_spinners` timed out at its 10 s bound with the guard made a no-op; and with
+  a panic injected into one honest client, the test failed in 12.85 s, where main's ran on past a 120 s bound
+  (adacachy).
 
 ### 2026-11-07: a daemon killed inside its profile's republication refused every successor — fixed
 
