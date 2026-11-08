@@ -375,7 +375,7 @@ fn settle(history: &History, round: &mut Round, rule: CountingRule, gate_open: b
           .unwrap();
         round.adopted.insert(*object, newest);
       }
-      Readiness::Lost => {
+      Readiness::Lost { .. } => {
         round.lost.insert(*object);
       }
       Readiness::Waiting => {}

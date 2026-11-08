@@ -820,7 +820,7 @@ pub(crate) fn ready_objects(
           ready.push((*object, newest));
         }
       }
-      Readiness::Lost => lost.push(*object),
+      Readiness::Lost { .. } => lost.push(*object),
       Readiness::Waiting => unpromised = unpromised.saturating_add(1),
     }
   }

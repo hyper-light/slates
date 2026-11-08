@@ -47,8 +47,16 @@ pub enum Readiness {
   Ready,
   /// A cohort has not promised enough yet.
   Waiting,
-  /// A cohort has fewer members left than its recovery quorum: the object cannot be recovered.
-  Lost,
+  /// A cohort has fewer members left than its recovery quorum: the object cannot be recovered. Carries what was
+  /// judged, so a caller can say why without recomputing it.
+  Lost {
+    /// The short cohort's index in the cohorts [`readiness`] was given.
+    cohort: usize,
+    /// Its recovery quorum.
+    needed: usize,
+    /// How many of its hosts are still members.
+    members: usize,
+  },
 }
 
 impl Heard<'_> {
@@ -75,7 +83,7 @@ pub fn readiness(
   rule: CountingRule,
 ) -> Readiness {
   let mut ready = true;
-  for cohort in cohorts {
+  for (index, cohort) in cohorts.iter().enumerate() {
     let needed = quorum.recovery(cohort.len());
     let members: Vec<HostId> = cohort
       .iter()
@@ -83,7 +91,11 @@ pub fn readiness(
       .filter(|host| is_member(*host))
       .collect();
     if members.len() < needed {
-      return Readiness::Lost;
+      return Readiness::Lost {
+        cohort: index,
+        needed,
+        members: members.len(),
+      };
     }
     let promised = members
       .iter()
@@ -167,8 +179,9 @@ mod tests {
   }
 
   /// A cohort with fewer members left than its recovery quorum is lost under either rule, and every cohort must have
-  /// its quorum. Do: two cohorts at f = 1, one of them left with a single member of three; then two whole cohorts, only
-  /// one of which has promised. Expect: lost; then waiting.
+  /// its quorum. Do: two cohorts at f = 1, the second left with a single member of three; then two whole cohorts, only
+  /// one of which has promised. Expect: lost, naming the second cohort, its quorum of two and its one member; then
+  /// waiting.
   #[test]
   fn every_cohort_needs_its_quorum_and_a_short_one_is_lost() {
     let (departed, gone, a, b, c) = (HostId(9), HostId(8), HostId(1), HostId(2), HostId(3));
@@ -186,7 +199,11 @@ mod tests {
     for rule in [CountingRule::CompleteAnswer, CountingRule::NamedAnswer] {
       assert_eq!(
         readiness(&short, is_member, quorum, &heard, rule),
-        Readiness::Lost
+        Readiness::Lost {
+          cohort: 1,
+          needed: 2,
+          members: 1
+        }
       );
     }
     let whole = vec![vec![departed, a, b], vec![departed, b, c]];
