@@ -18305,7 +18305,8 @@ Applied in the same change to:
   (`a_release_of_an_open_no_publication_counted_waits_for_nothing`).
 - **Left open:** a `FORGET` processed after the last publication leaves its lookup reference counted in the image, and
   the kernel never resends a `FORGET` either. It has no reply to wait behind; it stays under A-61's stated limits, as
-  a bounded leak (GAPS).
+  a bounded leak (GAPS). **Closed 2026-11-08 by a1b44bb1:** each `FORGET` is logged beside the writes (A-63), and a
+  successor gives it back in its place (§4.6, "A `FORGET` after the last publication is logged").
 - **Evidence.** See the bug record's verification.
 
 ### A-256 — A base directory recovery cannot reacquire costs only its own untouched entries (accepted 2026-11-08, the supervisor's confirmation)
