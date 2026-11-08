@@ -1,0 +1,26 @@
+runner ubuntu-latest, 4 CPUs, Sun Nov  8 17:23:06 UTC 2026, head 6310b00bf7ecf8558b9ad0e581e1af9dbe89a2f6
+spinners: 8
+== round 1 at 17:23:06, load 3.63, 1.39, 0.52
+test a_taken_over_scratch_volume_becomes_servable_and_never_answers_notfound ... ignored, heavy fleet regression (1024-volume takeover); run alone
+test takeover_periods_scale_with_the_retired_hosts_object_count ... ignored, measurement, not a gate; prints periods-to-recover vs the retired host's object count
+test transient_false_condemnation_cost_is_flat_in_the_owners_object_count ... ignored, heavy fleet measurement (false condemnation of an N-object owner); run alone
+test result: ok. 115 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 1456.66s
+== round 1 exit 0, load 12.14, 11.87, 9.66
+== round 2 at 17:47:23, load 12.14, 11.87, 9.66
+test a_forward_refused_at_admission_answers_its_client ... FAILED
+test a_taken_over_scratch_volume_becomes_servable_and_never_answers_notfound ... ignored, heavy fleet regression (1024-volume takeover); run alone
+test takeover_periods_scale_with_the_retired_hosts_object_count ... ignored, measurement, not a gate; prints periods-to-recover vs the retired host's object count
+test transient_false_condemnation_cost_is_flat_in_the_owners_object_count ... ignored, heavy fleet measurement (false condemnation of an N-object owner); run alone
+thread 'a_forward_refused_at_admission_answers_its_client' (6975) panicked at crates/server/tests/fleet.rs:5618:5:
+    a_forward_refused_at_admission_answers_its_client
+test result: FAILED. 114 passed; 1 failed; 3 ignored; 0 measured; 0 filtered out; finished in 1619.37s
+== round 2 exit 101, load 11.65, 11.86, 11.58
+== round 3 at 18:14:23, load 11.65, 11.86, 11.58
+test a_share_of_a_green_made_after_its_last_version_survives_a_takeover ... FAILED
+test a_taken_over_scratch_volume_becomes_servable_and_never_answers_notfound ... ignored, heavy fleet regression (1024-volume takeover); run alone
+test takeover_periods_scale_with_the_retired_hosts_object_count ... ignored, measurement, not a gate; prints periods-to-recover vs the retired host's object count
+test transient_false_condemnation_cost_is_flat_in_the_owners_object_count ... ignored, heavy fleet measurement (false condemnation of an N-object owner); run alone
+thread 'a_share_of_a_green_made_after_its_last_version_survives_a_takeover' (8348) panicked at crates/server/tests/fleet.rs:14060:3:
+    a_share_of_a_green_made_after_its_last_version_survives_a_takeover
+test result: FAILED. 114 passed; 1 failed; 3 ignored; 0 measured; 0 filtered out; finished in 1942.69s
+== round 3 exit 101, load 11.43, 11.40, 11.56
