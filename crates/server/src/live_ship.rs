@@ -68,6 +68,8 @@ const LIVE_WHOLE: &str = "fleet.live.whole";
 /// Counter: install images made from a publication's state (or a clean volume's, on the record period) for a holder
 /// behind the retained tail, beside the log rather than on it ([`refresh_image`]).
 const LIVE_IMAGE: &str = "fleet.live.install_image";
+/// Counter: an install built to send a holder, the volume's whole state copied on the owner's shard.
+const LIVE_INSTALL_BUILT: &str = "fleet.live.install_built";
 /// Counter: entries appended to a live volume's log on this owner shard.
 const LIVE_APPENDED: &str = "fleet.live.appended";
 /// Counter: entries a holder refused to keep (over its bound, unauthorized, malformed).
@@ -195,6 +197,11 @@ pub(crate) struct LiveVolume {
   /// The holders a lane is shipping to now, each with when it began ([`dispatch`]): at most one lane a holder, so the
   /// messages a holder lacks queue here, not as tasks waiting for its one session.
   lanes: BTreeMap<HostId, u64>,
+  /// The holders whose last lane ended unanswered: nothing is built for them until the record period retries or their
+  /// session is back ([`holder_reached`]). A publication built their messages anyway, and the lane ended at once for want
+  /// of a session, so it was never busy: an install a write, a whole-volume clone on this shard each (a median of 2,396
+  /// and 2,769 a run, 10.9 GB, against about 3.5 served, `live_chaos`'s rolling partition, diag-live-durability-54).
+  unreachable: Vec<HostId>,
   /// The holders known to hold a version of the volume's catalog, which a holder's bound is derived from
   /// ([`hold_bound`]): every holder any of the catalog's placements named, kept. Bounded by the candidates.
   catalogued: Vec<HostId>,
@@ -899,6 +906,7 @@ pub(crate) fn published(
       fenced: None,
       kept: 0,
       lanes: BTreeMap::new(),
+      unreachable: Vec::new(),
       catalogued: Vec::new(),
       recorded: None,
       recording: None,
@@ -1177,6 +1185,21 @@ fn payload(
   record: Vec<u8>,
 ) -> Option<(Vec<u8>, Option<Vec<u64>>)> {
   let runs = content_runs(state, id, &record)?;
+  // Diag only (live-durability-56, never on main): what a large entry is.
+  {
+    let run_bytes: usize = runs.iter().map(|run| run.bytes.len()).sum();
+    if record.len().saturating_add(run_bytes) >= 65_536 {
+      let (kind, inodes, patches) = match <VolumeRecord as Wire>::decode(&mut &record[..]) {
+        Ok(VolumeRecord::Full { image }) => ("full", image.inodes.len(), 0),
+        Ok(VolumeRecord::Delta { delta }) => ("delta", delta.inodes.len(), delta.patches.len()),
+        Err(_) => ("undecoded", 0, 0),
+      };
+      let _ = std::io::Write::write_all(&mut std::io::stderr(), format!(
+        "LD-ENTRY whole {whole} record {kind} inodes {inodes} patches {patches} record_bytes {} run_bytes {run_bytes} runs {}\n",
+        record.len(), runs.len(),
+      ).as_bytes());
+    }
+  }
   let body = LivePublication { record, runs }.to_bytes();
   let kind = if whole { KIND_WHOLE } else { KIND_DELTA };
   if state.seal_root.is_none() {
@@ -1510,12 +1533,13 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
     .collect();
   let mut sends = Vec::new();
   let mut stale_checkpoint = false;
+  let mut installs_built = 0_u64;
   let targets: Vec<HostId> = live.shipper.targets().collect();
   for holder in &targets {
     // A holder that has not acknowledged the volume's catalog refuses the log (its bound is the catalog's size,
     // `hold_bound`): the record plane places the catalog there first, re-shipped each period, and the next dispatch after
     // that ships it the log.
-    if !catalogued.contains(holder) || busy.contains(holder) {
+    if !catalogued.contains(holder) || busy.contains(holder) || live.unreachable.contains(holder) {
       continue;
     }
     match live.shipper.pending(*holder) {
@@ -1542,6 +1566,7 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
           stale_checkpoint = true;
           continue;
         }
+        installs_built = installs_built.saturating_add(1);
         let install = Install {
           owner: live.shipper.owner(),
           object,
@@ -1561,6 +1586,9 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
   }
   if stale_checkpoint {
     live.owes_image = true;
+  }
+  if installs_built > 0 {
+    state.count(LIVE_INSTALL_BUILT, installs_built);
   }
   sends
 }
@@ -1637,9 +1665,9 @@ fn lane_expiry_ns() -> u64 {
 }
 
 /// A lane to `holder` has ended for `objects`: each volume's lane is closed, and what the holder lacks now is sent at
-/// once when it `answered` ([`dispatch`]). A holder that did not answer is left to the next publication or the record
-/// period: sent again at once, a holder with no link (dropped to be dialed afresh) would end each new lane at once and
-/// loop between the shards at their speed.
+/// once when it `answered` ([`dispatch`]). A holder that did not answer is left unreachable until the record period
+/// retries it or its session is back ([`holder_reached`]): sent again at once, a holder with no link (dropped to be
+/// dialed afresh) would end each new lane at once and loop between the shards at their speed.
 fn lane_ended(state: &mut ShardState, holder: HostId, objects: Vec<ObjectId>, answered: bool) {
   let mut sends = Vec::new();
   for object in objects {
@@ -1647,6 +1675,12 @@ fn lane_ended(state: &mut ShardState, holder: HostId, objects: Vec<ObjectId>, an
       continue;
     };
     live.lanes.remove(&holder);
+    live
+      .unreachable
+      .retain(|unreachable| *unreachable != holder);
+    if !answered {
+      live.unreachable.push(holder);
+    }
     // Only the ended holder's own messages, and only when it answered: every other holder is sent its own when its lane
     // ends, a publication comes or the record period runs. Sent what every other holder lacked, two holders with no link
     // (both stopped) each ended its lane at once and sent the other's, back and forth at the shards' speed (1,658
@@ -1658,6 +1692,42 @@ fn lane_ended(state: &mut ShardState, holder: HostId, objects: Vec<ObjectId>, an
           .filter(|send| send.holder == holder),
       );
     }
+  }
+  dispatch(state, sends);
+}
+
+/// `holder`'s record session is established again (on the control shard): every shard sends it what it lacks at once,
+/// not at the next record period, so a resumed holder's catch-up does not wait on the period.
+pub(crate) fn holder_reached(holder: HostId) {
+  let Some((origin, shards)) = state::with_state(|s| (s.shard, s.shards.clone())) else {
+    return;
+  };
+  for shard in shards {
+    crate::xshard::run_on_counted(origin, shard, move |s| send_to_reached(s, holder));
+  }
+}
+
+/// Sends `holder` what this shard's live volumes that had given it up owe it ([`holder_reached`]).
+fn send_to_reached(state: &mut ShardState, holder: HostId) {
+  let volumes: Vec<[u8; 16]> = state
+    .live
+    .shipping
+    .iter_mut()
+    .filter_map(|(volume, live)| {
+      let was = live.unreachable.contains(&holder);
+      live
+        .unreachable
+        .retain(|unreachable| *unreachable != holder);
+      (was && live.fenced.is_none()).then_some(*volume)
+    })
+    .collect();
+  let mut sends = Vec::new();
+  for volume in volumes {
+    sends.extend(
+      pending_sends(state, volume)
+        .into_iter()
+        .filter(|send| send.holder == holder),
+    );
   }
   dispatch(state, sends);
 }
@@ -1750,10 +1820,20 @@ async fn ship_lane(
     // Each message under its own budget: the liveness budget plus its transfer on the session it rides, so an install of
     // the whole volume is not given up the moment an entry would be (`exchange_budget`).
     let exchange = exchange_budget(send.bytes.len(), &sessions);
+    // Diag only (live-durability-56, never on main): each install's budget, time and outcome.
+    let diag_path = sessions.first().map(|(_, endpoint)| (endpoint.congestion_window(), endpoint.smoothed_rtt(), endpoint.path_mtu()));
+    let diag_had = !sessions.is_empty();
+    let diag_began = slates_rt::futures::now_ns();
     let exchanged =
       slates_cluster::live::exchange((send.stream, &send.bytes), sessions, exchange, |_, _| true)
         .await;
     let answered = !exchanged.replies.is_empty();
+    if diag_had && send.stream == slates_cluster::live::LIVE_STATE_STREAM {
+      let _ = std::io::Write::write_all(&mut std::io::stderr(), format!(
+        "LD-LANE install holder {} bytes {} budget_ns {} took_ns {} answered {answered} path_before {diag_path:?}\n",
+        holder.0, send.bytes.len(), exchange.max_deadline_ns(), slates_rt::futures::now_ns().saturating_sub(diag_began),
+      ).as_bytes());
+    }
     if !answered {
       let _ = state::with_state(|s| s.count(LIVE_UNANSWERED, 1));
     }
@@ -2026,6 +2106,10 @@ pub(crate) async fn period(origin: u16, shard: u16) {
       for volume in &volumes {
         let id = slates_db::catalog::VolumeId { bytes: *volume };
         follow_candidates(s, *volume);
+        // The period is what retries a holder whose last lane went unanswered ([`LiveVolume::unreachable`]).
+        if let Some(live) = s.live.shipping.get_mut(volume) {
+          live.unreachable.clear();
+        }
         // A writer may wait on a condition that changes with no acknowledgement to fold (the head placed once its
         // neighbourhood settles, a pair delivered): answered here at the latest.
         resolve(s, *volume);

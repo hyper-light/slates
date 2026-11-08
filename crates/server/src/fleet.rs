@@ -4441,6 +4441,7 @@ async fn enroll_record_session(
         .record_sessions
         .insert(peer_host, crate::state::RecordLink::up(session));
     });
+    crate::live_ship::holder_reached(peer_host);
   }
 }
 
