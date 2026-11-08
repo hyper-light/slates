@@ -166,6 +166,35 @@ impl BaseRead {
   fn of(seed: u8) -> BaseRead {
     Self::ALL[usize::from(seed) % Self::ALL.len()]
   }
+
+  /// The increments that make `name`, change it, and change it again over the base before that change.
+  fn builds(self, name: &str) -> (common::Build, common::Build, common::Build) {
+    let (mut made, mut changed, mut late) = (
+      common::Build::new(),
+      common::Build::new(),
+      common::Build::new(),
+    );
+    match self {
+      BaseRead::OverlapBytes => {
+        made.create(name, b"0123456789");
+        changed.overwrite(name, 0, b"ab");
+        late
+          .content(OpKind::Delete, name, 0, b"01")
+          .content(OpKind::Insert, name, 0, b"ab");
+      }
+      BaseRead::FitsLength => {
+        made.create(name, b"0123456789");
+        changed.content(OpKind::Extend, name, 10, b"XY");
+        late.overwrite(name, 8, b"zz");
+      }
+      BaseRead::SpecialKind => {
+        made.special(name, common::generated::node(2));
+        changed.special(name, common::generated::node(4));
+        late.setmode(name, 0o600);
+      }
+    }
+    (made, changed, late)
+  }
 }
 
 /// What a history did, for the non-vacuity assertions.
@@ -362,39 +391,13 @@ impl History {
   /// base the last work was based on. Each of the three is accepted live.
   fn over_a_change(&mut self, read: BaseRead) -> u64 {
     let name = format!("over-{}", self.next_id);
-    let mut made = common::Build::new();
-    match read {
-      BaseRead::SpecialKind => {
-        made.special(&name, common::generated::node(2));
-      }
-      BaseRead::OverlapBytes | BaseRead::FitsLength => {
-        made.create(&name, b"0123456789");
-      }
-    }
+    let (made, changed, late) = read.builds(&name);
     let base = self.base(0);
     assert!(matches!(self.submit(&made, base), Outcome::Accepted { .. }));
     if !matches!(read, BaseRead::SpecialKind) {
-      self.fresh.push(name.clone());
+      self.fresh.push(name);
     }
     let before = self.base(0);
-    let mut changed = common::Build::new();
-    let mut late = common::Build::new();
-    match read {
-      BaseRead::OverlapBytes => {
-        changed.overwrite(&name, 0, b"ab");
-        late
-          .content(OpKind::Delete, &name, 0, b"01")
-          .content(OpKind::Insert, &name, 0, b"ab");
-      }
-      BaseRead::FitsLength => {
-        changed.content(OpKind::Extend, &name, 10, b"XY");
-        late.overwrite(&name, 8, b"zz");
-      }
-      BaseRead::SpecialKind => {
-        changed.special(&name, common::generated::node(4));
-        late.setmode(&name, 0o600);
-      }
-    }
     assert!(matches!(
       self.submit(&changed, before),
       Outcome::Accepted { .. }
