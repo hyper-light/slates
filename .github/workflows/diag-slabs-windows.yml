@@ -1,0 +1,124 @@
+name: "DIAG slabs -- gap items on main 9a996608, clippy and the WinFsp suite (not vacuous, both runners) (not for main)"
+
+# The rule of 2026-11-06 (§4.6): no daemon thread opens a path on a volume the daemon serves. Each diag commit runs
+# the CLI's WinFsp suite (A-227's one-shard base test among them) on both Windows runners. Each runner's output goes to
+# its own results branch, named after the diag branch, after each step.
+
+on:
+  push:
+    branches: ['diag-slabs-[0-9]*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+  WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+
+jobs:
+  live:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            msvc: x64
+          - runner: windows-11-arm
+            msvc: arm64
+    name: WinFsp oracles on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+      RESULTS_BRANCH: diag-slabs-results-${{ github.ref_name }}-${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: The results publisher
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/publish.sh" <<'PUBLISH'
+          #!/bin/bash
+          # One commit per call on the results branch; a failed publish is reported and does not end the job.
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          cd "$GITHUB_WORKSPACE" || exit 0
+          touch clippy.txt cli.txt
+          entries=""
+          for f in clippy.txt cli.txt; do
+            blob=$(git hash-object -w "$f") || exit 0
+            entries="$entries$(printf '100644 blob %s\t%s' "$blob" "$f")\n"
+          done
+          tree=$(printf "$entries" | git mktree) || exit 0
+          parent=$(cat "$RUNNER_TEMP/results-parent" 2>/dev/null || true)
+          commit=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "results of run $GITHUB_RUN_ID at $(date -u +%FT%TZ)") || exit 0
+          if git push origin "$commit:refs/heads/$RESULTS_BRANCH"; then
+            echo "$commit" > "$RUNNER_TEMP/results-parent"
+          else
+            echo "::warning::could not publish the results"
+          fi
+          PUBLISH
+          chmod +x "$RUNNER_TEMP/publish.sh"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64)
+        if: matrix.msvc == 'x64'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64)
+        if: matrix.msvc == 'arm64'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install WinFsp, pinned
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi
+          $found = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
+          $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Native clippy
+        shell: bash
+        timeout-minutes: 40
+        run: |
+          set +e
+          set -o pipefail
+          {
+            cargo clippy --locked -p slates-base -p slates-server --all-targets -- -D warnings && \
+              cargo clippy --locked -p slates-cli --bin slates --test winfsp -- -D warnings
+            echo "## clippy exit $?"
+          } 2>&1 | tee clippy.txt
+          "$RUNNER_TEMP/publish.sh"
+          exit 0
+      - name: The WinFsp mount through the CLI
+        shell: bash
+        timeout-minutes: 25
+        run: |
+          set +e
+          {
+            cargo test --locked -p slates-bridge-winfsp --lib
+            echo "## winfsp unit tests exit $?"
+            SLATES_TEST_CLI=1 WINFSP_TEST_MOUNT=1 cargo test --locked -p slates-cli --test winfsp -- --test-threads=1 --nocapture
+            echo "## cli mount tests exit $?"
+          } 2>&1 | tee cli.txt
+          "$RUNNER_TEMP/publish.sh"
+          exit 0
+      - name: Publish whatever ran
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/publish.sh" ]; then bash "$RUNNER_TEMP/publish.sh"; fi
+      - name: Fail on a failed step
+        if: always()
+        shell: bash
+        run: cat clippy.txt cli.txt | grep -c '^## .* exit 0$' | grep -qx 3

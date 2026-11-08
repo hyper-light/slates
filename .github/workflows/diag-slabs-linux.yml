@@ -1,0 +1,89 @@
+name: "DIAG slabs -- gap items on main 9a996608, clippy, base, bridges, vfs base, the server suite and the CLI flow, Linux (not for main)"
+
+# The rule of 2026-11-06 (§4.6): no daemon thread opens a path on a volume the daemon serves. Each diag commit runs the
+# A-227 tests (a one-shard daemon given a base, a landing target or a FUSE mount point on its own FUSE mount, and a
+# successor given a base on or under a mount it kept) and
+# the CLI's Linux FUSE suite on ubuntu-latest. The output goes to a results branch named after the diag branch.
+
+on:
+  push:
+    branches: ['diag-slabs-[0-9]*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  linux:
+    name: A-227 on ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 170
+    env:
+      RESULTS_BRANCH: diag-slabs-results-${{ github.ref_name }}-ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The results publisher
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/publish.sh" <<'PUBLISH'
+          #!/bin/bash
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          cd "$GITHUB_WORKSPACE" || exit 0
+          touch own.txt cli.txt
+          entries=""
+          for f in cli.txt own.txt; do
+            blob=$(git hash-object -w "$f") || exit 0
+            entries="$entries$(printf '100644 blob %s\t%s' "$blob" "$f")\n"
+          done
+          tree=$(printf "$entries" | git mktree) || exit 0
+          parent=$(cat "$RUNNER_TEMP/results-parent" 2>/dev/null || true)
+          commit=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "results of run $GITHUB_RUN_ID at $(date -u +%FT%TZ)") || exit 0
+          if git push origin "$commit:refs/heads/$RESULTS_BRANCH"; then echo "$commit" > "$RUNNER_TEMP/results-parent"; else echo "::warning::could not publish"; fi
+          PUBLISH
+          chmod +x "$RUNNER_TEMP/publish.sh"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: FUSE and user_allow_other
+        run: |
+          command -v fusermount3 >/dev/null || { sudo apt-get update && sudo apt-get install -y fuse3; }
+          grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+      - name: The A-227 tests
+        shell: bash
+        timeout-minutes: 100
+        run: |
+          set +e
+          {
+            cargo clippy --locked --workspace --all-targets -- -D warnings
+            echo "## workspace clippy exit $?"
+            cargo test --locked -p slates-base
+            echo "## base unit tests exit $?"
+            cargo test --locked -p slates-bridge-core -p slates-bridge-fuse -p slates-bridge-nfs -p slates-bridge-virtiofs
+            echo "## bridges exit $?"
+            cargo test --locked -p slates-vfs --test base
+            echo "## vfs base exit $?"
+            cargo test --locked -p slates-server --no-fail-fast
+            echo "## server suite exit $?"
+          } 2>&1 | tee own.txt
+          "$RUNNER_TEMP/publish.sh"
+          exit 0
+      - name: The CLI flow on Linux
+        shell: bash
+        timeout-minutes: 40
+        run: |
+          set +e
+          {
+            SLATES_TEST_CLI=1 cargo test --locked -p slates-cli --test cli -- --test-threads=1 --nocapture
+            echo "## cli flow exit $?"
+          } 2>&1 | tee cli.txt
+          "$RUNNER_TEMP/publish.sh"
+          exit 0
+      - name: Fail on a failed step
+        if: always()
+        shell: bash
+        run: cat own.txt cli.txt | grep -c '^## .* exit 0$' | grep -qx 6
