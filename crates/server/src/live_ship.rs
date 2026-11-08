@@ -1027,6 +1027,7 @@ fn refresh_image(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
   // An image sealed under no keys (a volume shipped in the clear) has none to judge.
   live.image_anchors = anchors;
   live.owes_image = false;
+  let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("LD-IMAGE wall_ns {} head {} bytes {}\n", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos()), head.position, live.whole.as_ref().map_or(0, |(_, image)| image.len())).as_bytes());
   state.count(LIVE_IMAGE, 1);
 }
 
@@ -1750,10 +1751,15 @@ async fn ship_lane(
     // Each message under its own budget: the liveness budget plus its transfer on the session it rides, so an install of
     // the whole volume is not given up the moment an entry would be (`exchange_budget`).
     let exchange = exchange_budget(send.bytes.len(), &sessions);
+    let diag_had = !sessions.is_empty();
+    let diag_began = slates_rt::futures::now_ns();
     let exchanged =
       slates_cluster::live::exchange((send.stream, &send.bytes), sessions, exchange, |_, _| true)
         .await;
     let answered = !exchanged.replies.is_empty();
+    if diag_had && send.stream == slates_cluster::live::LIVE_STATE_STREAM {
+      let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("LD-LANE install wall_ns {} holder {} bytes {} budget_ns {} took_ns {} answered {answered}\n", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos()), holder.0, send.bytes.len(), exchange.max_deadline_ns(), slates_rt::futures::now_ns().saturating_sub(diag_began)).as_bytes());
+    }
     if !answered {
       let _ = state::with_state(|s| s.count(LIVE_UNANSWERED, 1));
     }
@@ -1801,8 +1807,12 @@ fn exchange_budget(
       .checked_div(endpoint.congestion_window().max(1))
       .unwrap_or(0)
   });
+  // Diag only (live-durability-61, never on main): an install's budget held at a floor, standing in for the uncapped case.
+  let floor_ns = if bytes >= 65_536 {
+    std::env::var("SLATES_DIAG_INSTALL_FLOOR_MS").ok().and_then(|ms| ms.parse::<u64>().ok()).map_or(0, |ms| ms.saturating_mul(1_000_000))
+  } else { 0 };
   slates_cluster::CommitBudget::hard(
-    live.deadline_ns.saturating_add(transfer_ns),
+    live.deadline_ns.saturating_add(transfer_ns).max(floor_ns),
     live.poll_interval_ns,
   )
 }
@@ -2180,6 +2190,15 @@ pub(crate) fn serve_install(
   peer: HostId,
   request: &[u8],
 ) -> Vec<u8> {
+  // Diag only (live-durability-61, never on main): the first install served after the file `any` appears stops this
+  // daemon before it answers, its pid left in `stopped`.
+  if let Ok(dir) = std::env::var("SLATES_DIAG_STOP_DIR") {
+    if std::fs::remove_file(format!("{dir}/any")).is_ok() {
+      let pid = std::process::id();
+      let _ = std::fs::write(format!("{dir}/stopped"), pid.to_string());
+      let _ = std::process::Command::new("kill").args(["-STOP", &pid.to_string()]).status();
+    }
+  }
   let object = slates_db::live::object_of_state(request);
   let bound = match admitted(state, local, peer, object) {
     Ok(bound) => bound,
@@ -2209,6 +2228,7 @@ pub(crate) fn serve_install(
     Err(error) => count_refused(state, refused_counter(error)),
     Ok(_) => state.count(LIVE_HELD, 1),
   }
+  let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("LD-TAKE wall_ns {} from {} reply {:?}\n", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos()), peer.0, reply.as_ref().map(|head| head.map(|head| head.position)).map_err(|error| format!("{error:?}"))).as_bytes());
   encode_reply(&reply)
 }
 
