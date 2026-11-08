@@ -393,18 +393,12 @@ impl<'v> VolumeBridge<'v> {
     if cx.volume != self.volume_id {
       return Err(VfsError::NotPermitted);
     }
-    // An attachment that may read but not write, or a snapshot's view, is a read-only file system to its client, and
-    // answers as one (`EROFS`, POSIX), on every transport; one with no rights at all is refused for permission. Until
-    // 2026-11-08 both answered `NotPermitted`, so a read-only mount's client was told `EPERM`/`PERM`.
+    // RED-CHECK (diag only): the answer before 2026-11-08.
     if !cx.rights.write {
-      return Err(if cx.rights.read {
-        VfsError::ReadOnly
-      } else {
-        VfsError::NotPermitted
-      });
+      return Err(VfsError::NotPermitted);
     }
     if !matches!(cx.view, View::Current) {
-      return Err(VfsError::ReadOnly);
+      return Err(VfsError::NotPermitted);
     }
     Ok(())
   }
@@ -697,11 +691,8 @@ impl Bridge for VolumeBridge<'_> {
 
   fn open(&mut self, object: ObjectId, cx: &OpContext, flags: u32) -> Result<u64, VfsError> {
     self.authorize_read(cx)?;
-    // An open for writing is itself a change: a read-only file system refuses it at the open (POSIX `EROFS`), never at
-    // each write through the handle it granted.
-    if opens_for_writing(flags) {
-      self.authorize_write(cx)?;
-    }
+    // RED-CHECK (diag only): the open ignores its flags, as before 2026-11-08.
+    let _ = opens_for_writing(flags);
     if self
       .volume
       .kind(self.store, InodeNo(object.inode))?
