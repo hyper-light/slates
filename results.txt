@@ -1,0 +1,9 @@
+runner ubuntu-24.04-arm, 4 CPUs, Sun Nov  8 08:40:00 UTC 2026
+fix 097b8886 merge: origin/main 9a996608 into the A-223 branch -- main's starved-probe rul
+== fmt exit 0
+slates-wire-derive            0       0  ok
+unsafe: ok
+version: ok (0.1.0 in Cargo.toml; the Python wheel derives it through maturin; @hyper-light/slates and its 7 platform packages pinned to it)
+toolchain: every pin names 1.98.1
+capabilities: ok (15 rows, each proof a runnable test)
+== xtask check exit 0
