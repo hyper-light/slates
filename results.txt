@@ -1,0 +1,21 @@
+mutants, commit 3fa66adb, 4 CPUs
+== session_out_gives_up a_forward_waits_for_the_owners_session_while_it_is_out exit 101
+thread 'a_forward_waits_for_the_owners_session_while_it_is_out' (5763) panicked at crates/server/tests/fleet.rs:6391:5:
+b's write not served: Refused { refusal: OwnerUnreachable { region: 0 } }; 
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+a_forward_waits_for_the_owners_session_while_it_is_out --- FAILED
+== location_tried_once a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget exit 101
+thread 'a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget' (5875) panicked at crates/server/tests/fleet.rs:14851:5:
+assertion `left == right` failed: no call was refused while the false death lasted: [(true, true, 51.812335ms, 4), (true, true, 343.172323ms, 12), (true, true, 246.207813ms, 7), (true, true, 240.048846ms, 7), (true, true, 258.606241ms, 4)]; B's counters Ok({"content.purged_bytes": 12570247168, "content.ticks.idle": 7, "fleet.discovery.pages": 45, "fleet.forward.batch_done": 6, "fleet.forward.begun": 6, "fleet.forward.client.control_started": 40, "fleet.forward.client.delivered_home": 40, "fleet.forward.client.resolved": 40, "fleet.forward.client.to_control": 40, "fleet.forward.no_session": 4, 
+  left: 4
+ right: 0
+== free_read_on_the_held_shard forwards_to_one_owner_never_wait_behind_each_other exit 101
+thread 'forwards_to_one_owner_never_wait_behind_each_other' (5939) panicked at crates/server/tests/fleet.rs:5880:3:
+the read on the free shard was never answered while the hold stood, waiting behind another forward to the same owner: [ForwardRound { served: true, during_hold: false, fast_took: 4.99063051s }, ForwardRound { served: true, during_hold: false, fast_took: 5.002025417s }, ForwardRound { served: true, during_hold: false, fast_took: 5.002024615s }]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+forwards_to_one_owner_never_wait_behind_each_other --- FAILED
+== hedge_after_the_hold a_slow_first_round_candidate_is_hedged_after_the_measured_p95 exit 101
+thread 'a_slow_first_round_candidate_is_hedged_after_the_measured_p95' (6039) panicked at crates/server/tests/fleet.rs:9545:3:
+the first-round candidate's control shard was still held when the hedge was seen, released before its 20000000000 ns ceiling (Ok(20000000226) ns)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 --- FAILED
