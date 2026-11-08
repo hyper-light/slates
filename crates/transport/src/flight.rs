@@ -222,6 +222,9 @@ pub enum Reassembly {
   /// to be fed again (a repeated `read_hs` of a consumed flight faults the stream), but a live sign the
   /// peer is still asking, so the caller resends its own flight.
   Repeat,
+  /// A later fragment of a flight already consumed: the same retransmit as its first fragment's [`Reassembly::Repeat`],
+  /// so one retransmitted flight is one repeat however many fragments it spans.
+  RepeatRest,
   /// The fragment did not parse, named a flight past the bounds, one ahead of the stream (impossible in
   /// TLS), or one inconsistent with the fragments already held: dropped and counted by the caller,
   /// never a fault.
@@ -274,7 +277,11 @@ impl Reassembler {
     // flight awaited. A retransmit that would straddle the consumed prefix is corrupt.
     if start < self.consumed {
       return if start.saturating_add(total) <= self.consumed {
-        Reassembly::Repeat
+        if within == 0 {
+          Reassembly::Repeat
+        } else {
+          Reassembly::RepeatRest
+        }
       } else {
         Reassembly::Malformed
       };
@@ -563,6 +570,7 @@ mod tests {
         }
         Reassembly::Pending => assert!(step < complete_at, "pending only before completion"),
         Reassembly::Repeat => assert!(step > complete_at, "a repeat only after completion"),
+        Reassembly::RepeatRest => assert!(step > complete_at, "a repeat only after completion"),
         Reassembly::Malformed => panic!("a well-formed fragment was refused at step {step}"),
       }
     }
@@ -586,15 +594,20 @@ mod tests {
       last = reassembler.push(frag);
     }
     assert_eq!(last, Reassembly::Flight(first.clone()));
-    // The whole first flight again: a repeat, on every fragment.
-    for frag in &f1 {
-      assert_eq!(reassembler.push(frag), Reassembly::Repeat);
+    // The whole first flight again: one repeat, on its first fragment, however many fragments it has.
+    for (index, frag) in f1.iter().enumerate() {
+      let expected = if index == 0 {
+        Reassembly::Repeat
+      } else {
+        Reassembly::RepeatRest
+      };
+      assert_eq!(reassembler.push(frag), expected);
     }
     // The second flight begins; a stale fragment of the first arrives in the middle of it.
     assert_eq!(reassembler.push(&f2[0]), Reassembly::Pending);
     assert_eq!(
       reassembler.push(&f1[1]),
-      Reassembly::Repeat,
+      Reassembly::RepeatRest,
       "the stale fragment is placed by its start"
     );
     assert_eq!(
