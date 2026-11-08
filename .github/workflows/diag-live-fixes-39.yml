@@ -1,0 +1,65 @@
+name: DIAG live-fixes the whole fleet suite under load on main 4811191a (not for main)
+
+# Diagnostics branch of the live-fixes agent; never merged. The fleet suite (crates/server/tests/fleet.rs, debug, the
+# default test threads as `cargo test --workspace` runs it) three rounds a runner under two busy loops a logical CPU,
+# for the formation wait's counts (ae1b5d6e, in main). Results go to diag-live-fixes-results-39-<os> by git push.
+
+on:
+  push:
+    branches: [diag-live-fixes-39]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  suite:
+    name: Fleet suite under load on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo test --locked -p slates-server --test fleet --no-run
+      - name: The suite under load
+        shell: bash
+        run: |
+          R=../results.txt
+          cpus=$(getconf _NPROCESSORS_ONLN)
+          echo "runner ${{ matrix.os }}, $cpus CPUs, $(date -u), head $(git rev-parse HEAD)" > $R
+          spin=$((cpus * 2))
+          pids=()
+          for i in $(seq 1 $spin); do (while :; do :; done) & pids+=($!); done
+          echo "spinners: $spin" | tee -a $R
+          for round in 1 2 3; do
+            load=$(uptime | sed 's/.*load average[s]*: //')
+            echo "== round $round at $(date -u +%H:%M:%S), load $load" | tee -a $R
+            status=0
+            perl -e 'alarm shift; exec @ARGV' 3600 cargo test --locked -p slates-server --test fleet > ../round.log 2>&1 || status=$?
+            grep -E '^test .* \.\.\. (FAILED|ignored)|^test result|panicked at|^    [a-z_0-9]+$' ../round.log | cut -c1-400 >> $R || true
+            echo "== round $round exit $status, load $(uptime | sed 's/.*load average[s]*: //')" | tee -a $R
+          done
+          kill "${pids[@]}" 2>/dev/null || true
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          git config user.name "diag-live-fixes"
+          git config user.email "diag-live-fixes@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-live-fixes-39 ${{ matrix.os }} results"
+          git push -q origin "HEAD:refs/heads/diag-live-fixes-results-39-${{ matrix.os }}"
