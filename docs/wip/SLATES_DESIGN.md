@@ -4617,13 +4617,25 @@ hard links and snapshot versions. No live kernel endpoint state is part of the i
 > - **The search** (`crates/transport/src/pmtud.rs`) binary-searches from the 1,200-byte floor with
 >   `Ping` probes padded to size. It judges a size too large after three losses or at once on `EMSGSIZE`,
 >   stops within one packet overhead (29 bytes), and re-searches after 600 s.
-> - **Black holes.** Losses of above-floor packets, and probe timeouts while such packets are out, fall
->   the session back to the floor.
+> - **Black holes** (amended 2026-11-08). A black hole needs size-specific evidence, never loss every size
+>   suffers (RFC 8899 §4.3, "excessive loss of data sent with a specific packet size"; §3 item 4, robust to
+>   loss "due to other reasons (including link transmission error, congestion)"). Three consecutive losses of
+>   above-floor packets, or a probe timeout while one is out, only make the size *suspect*: the session sends
+>   at the floor, so packets that cross keep loss detection running, and probes at the size it had. One
+>   acknowledged probe, or any above-floor packet, and the size stands. Three probes at it declared lost while
+>   the floor's packets cross (§5.2) are the black hole, and the session falls to the floor and searches below
+>   the size that stopped. A probe timeout counts toward no black hole: a stopped peer acknowledges nothing at
+>   any size. Before, the losses, and each timeout counted as a loss of one, fell the session at once. A
+>   SIGSTOPped peer, or a burst a full receive buffer dropped, left a loopback session at the floor
+>   (`docs/bugs/2026-11-08-a-session-fell-to-the-mtu-floor-on-loss-every-size-suffered.md`).
 > - **Probes stay out of the controller.** Probes never enter congestion accounting or RTT samples.
 > - **The congestion gate.** It is sized by the controller following each datagram-size change: Copa's
 >   window is lifted to at least two datagrams at the new size, so the 2026-09-13 stall cannot recur.
 > - **Proven by use.** A session finds a 9,000-byte simulated path, falls back through a shrink to 1,500
->   and loses nothing (`a_session_finds_its_paths_mtu_and_falls_back_when_the_path_shrinks`).
+>   and loses nothing (`a_session_finds_its_paths_mtu_and_falls_back_when_the_path_shrinks`). A peer silent
+>   for two seconds and a burst lost at every size each leave a 1,500-byte path's size standing with no black
+>   hole counted (`a_peer_silent_for_several_probe_timeouts_keeps_its_path_mtu`,
+>   `a_burst_that_loses_every_size_keeps_the_path_mtu`; both red on the earlier rule).
 > - **Records.** The research note's slices 3a–3c, and
 >   `docs/bugs/2026-09-28-a-lone-path-probe-silenced-the-blocked-report.md` and
 >   `docs/bugs/2026-09-28-a-shrunken-path-deadlocked-before-its-black-hole-was-seen.md`.
