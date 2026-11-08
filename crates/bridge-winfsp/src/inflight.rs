@@ -5,6 +5,9 @@
 //! taken-read test; WinFsp v2.1 fsctl.h and sys/volume.c define these layouts and copy-before-processing order.
 
 pub mod capture;
+#[cfg(test)]
+mod oracle;
+pub mod settle;
 
 /// Format: the public FSP_FSCTL_TRANSACT_BATCH_BUFFER_SIZEMIN, in bytes (WinFsp v2.1 fsctl.h).
 pub const BATCH_BYTES: usize = 64 * 1024;
