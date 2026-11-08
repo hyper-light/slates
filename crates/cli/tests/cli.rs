@@ -3725,10 +3725,32 @@ fn write_payload_through(path: &str) {
   );
 }
 
+/// Shares `id` through `owner` with this test's account on each of `peers`, by the anchor `slates status` prints.
+fn share_with_peers(owner: &str, peers: &[String], id: &str) {
+  let account = rustix::process::getuid().as_raw();
+  for peer in peers {
+    let (code, status, err) = run(peer, &["status"]);
+    assert_eq!(code, 0, "{err}");
+    let anchor = value_of(&status, "anchor");
+    let (code, _, err) = run(
+      owner,
+      &[
+        "share",
+        id,
+        &format!("uid:{account}@{anchor}"),
+        "--read",
+        "--write",
+        "--admin",
+      ],
+    );
+    assert_eq!(code, 0, "the share with {peer}: {err}");
+  }
+}
+
 /// Provisions the volume on the owner, writes the payload into it through a real kernel mount where
 /// `mount_nfs` exists (the mount is released before the owner dies, so no kernel client is left talking to
 /// a dead server), and seals it; returns the id and the snapshot.
-fn seal_on_owner(instance: &str, mountable: bool) -> (String, String) {
+fn seal_on_owner(instance: &str, peers: &[String], mountable: bool) -> (String, String) {
   // The mesh forms before a fresh learner imports the bootstrapped groups. The explicit refusal
   // precedes any create effect, so only that refusal is retried, within the existing formation bound.
   let deadline = Instant::now() + FLEET_WAIT;
@@ -3753,6 +3775,8 @@ fn seal_on_owner(instance: &str, mountable: bool) -> (String, String) {
     break out;
   };
   let id = value_of(&out, "id");
+  // The survivors' clients are other hosts' accounts (A-237): they reach this volume only through a share naming them.
+  share_with_peers(instance, peers, &id);
   if mountable {
     let mount_point = MountPoint {
       path: fresh_mount_point(),
@@ -3984,7 +4008,13 @@ fn three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owner
 
   // Placement across processes, then the owner's death as a crash would deal it.
   let mountable = mount_nfs_available();
-  let (id, snapshot) = seal_on_owner(&instances[owner], mountable);
+  let peers: Vec<String> = instances
+    .iter()
+    .enumerate()
+    .filter(|(index, _)| *index != owner)
+    .map(|(_, instance)| instance.clone())
+    .collect();
+  let (id, snapshot) = seal_on_owner(&instances[owner], &peers, mountable);
   wait_placed(&instances[owner], &id, &snapshot);
   let survivors: Vec<String> = instances
     .iter()

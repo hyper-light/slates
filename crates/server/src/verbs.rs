@@ -903,29 +903,7 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
   // A remembered route is only a hint. If this node has learned a different owner or home,
   // refuse before dispatch (and before recording a forwarded completion), so the client can
   // refresh its hint and retry its original request id without a speculative second write.
-  let redirect = crate::state::with_state(|state| {
-    let object = ObjectId(volume.bytes);
-    let local = state.fleet.host();
-    let superseded = state
-      .fleet
-      .object_owner(object)
-      .is_some_and(|owner| owner != local);
-    let redirect = homed_elsewhere(state, volume)
-      .map(|region| (region, "fleet.forward.redirect.homed_elsewhere"))
-      .or_else(|| {
-        superseded.then(|| {
-          (
-            state.node_regions.get(&local).map_or(0, |region| region.0),
-            "fleet.forward.redirect.superseded",
-          )
-        })
-      });
-    if let Some((_, reason)) = redirect {
-      state.count(reason, 1);
-    }
-    redirect.map(|(region, _)| region)
-  })
-  .flatten();
+  let redirect = forward_redirect(volume);
   if let Some(region) = redirect {
     return encode_body(&refused(Refusal::HomedElsewhere { region }));
   }
@@ -958,38 +936,116 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
       crate::daemon::LIVENESS_BUDGET_NS,
     )
     .await;
-    match forwarded {
-      Some((Some(reply), owed)) => {
-        // A change the verb recorded is told to every FUSE mount of its volume before the exchange answers (AC-3.3):
-        // the wait runs on the owner shard, where the mounts are, and is bounded by its own deadline.
-        if let Some(owed) = owed {
-          let _ = crate::xshard::task_in_shard_time(
-            control,
-            shard,
-            move || crate::told::wait(owed),
-            crate::daemon::LIVENESS_BUDGET_NS,
-          )
-          .await;
-        }
-        Some(reply)
-      }
-      // The verb deferred its acceptance to a fleet commit (AUD-11): this exchange waits for the
-      // completion record the commit writes, within the same liveness budget.
-      Some((None, _)) => await_deferred_completion(control, shard, origin_host, id).await,
-      None => None,
-    }
+    answer_forwarded_write(forwarded, (control, shard), origin_host, id).await
   } else {
     // A peer's reap of its dead client (A-222) is the one verb served here that is neither; any other is refused.
     Some(crate::remote_attach::serve_unforwardable(control, shard, origin_host, body).await)
   };
-  encode_body(&not_shared_with(
-    reply.unwrap_or_else(|| refused(Refusal::NotFound)),
-    &requester,
-  ))
+  encode_body(&named_if_unshared(reply, (control, shard), volume, requester).await)
 }
 
-/// A forwarded request's `Forbidden` as the refusal that names its fix (A-237): the requester is another host's
-/// account, which only a share naming (its host, its account) lets in, so the client is told exactly that principal.
+/// The answer to a forwarded write once its verb has run on the owner `shard`: its reply after the mounts its change owes
+/// are told, or, when the verb deferred its acceptance to a fleet commit, the completion that commit records.
+async fn answer_forwarded_write(
+  forwarded: Option<(Option<ReplyBody>, Option<crate::told::Owed>)>,
+  (control, shard): (u16, u16),
+  origin_host: u64,
+  id: RequestId,
+) -> Option<ReplyBody> {
+  match forwarded {
+    Some((Some(reply), owed)) => {
+      // A change the verb recorded is told to every FUSE mount of its volume before the exchange answers (AC-3.3):
+      // the wait runs on the owner shard, where the mounts are, and is bounded by its own deadline.
+      if let Some(owed) = owed {
+        let _ = crate::xshard::task_in_shard_time(
+          control,
+          shard,
+          move || crate::told::wait(owed),
+          crate::daemon::LIVENESS_BUDGET_NS,
+        )
+        .await;
+      }
+      Some(reply)
+    }
+    // The verb deferred its acceptance to a fleet commit (AUD-11): this exchange waits for the
+    // completion record the commit writes, within the same liveness budget.
+    Some((None, _)) => await_deferred_completion(control, shard, origin_host, id).await,
+    None => None,
+  }
+}
+
+/// The region a forward of `volume` should be redirected to, when this node has learned a different owner or home.
+fn forward_redirect(volume: VolumeId) -> Option<u64> {
+  crate::state::with_state(|state| {
+    let object = ObjectId(volume.bytes);
+    let local = state.fleet.host();
+    let superseded = state
+      .fleet
+      .object_owner(object)
+      .is_some_and(|owner| owner != local);
+    let redirect = homed_elsewhere(state, volume)
+      .map(|region| (region, "fleet.forward.redirect.homed_elsewhere"))
+      .or_else(|| {
+        superseded.then(|| {
+          (
+            state.node_regions.get(&local).map_or(0, |region| region.0),
+            "fleet.forward.redirect.superseded",
+          )
+        })
+      });
+    if let Some((_, reason)) = redirect {
+      state.count(reason, 1);
+    }
+    redirect.map(|(region, _)| region)
+  })
+  .flatten()
+}
+
+/// A forwarded `Forbidden` as [`not_shared_with`] when the requester has no rights on `volume` at all, judged on its
+/// owner `shard`, where the record is ([`rights_of`]). A requester that holds rights was refused for something a share
+/// cannot fix (a forward naming another host's attachment), so its `Forbidden` stands. Every other reply as it is; no
+/// reply at all is `NotFound`.
+async fn named_if_unshared(
+  reply: Option<ReplyBody>,
+  (control, shard): (u16, u16),
+  volume: VolumeId,
+  requester: Principal,
+) -> ReplyBody {
+  let reply = reply.unwrap_or_else(|| refused(Refusal::NotFound));
+  if !matches!(
+    reply,
+    ReplyBody::Refused {
+      refusal: Refusal::Forbidden { .. }
+    }
+  ) {
+    return reply;
+  }
+  let judged = requester.clone();
+  let unshared = crate::xshard::call_in_shard_time(
+    control,
+    shard,
+    move |s| {
+      let id = slates_db::catalog::VolumeId {
+        bytes: volume.bytes,
+      };
+      s.db
+        .partition()
+        .volume(id)
+        .is_some_and(|record| rights_of(record, &judged) == Rights::default())
+    },
+    crate::daemon::LIVENESS_BUDGET_NS,
+  )
+  .await
+  .unwrap_or(false);
+  if unshared {
+    not_shared_with(reply, &requester)
+  } else {
+    reply
+  }
+}
+
+/// A forwarded request's `Forbidden` as the refusal that names its fix (A-237), for a requester holding no rights on the
+/// volume ([`named_if_unshared`]): it is another host's account, which only a share naming (its host, its account) lets in, so the client is told exactly that principal.
 /// Every other reply, and a requester with no wire form (a certificate), as it is.
 fn not_shared_with(reply: ReplyBody, requester: &Principal) -> ReplyBody {
   match (reply, to_wire_principal(requester)) {

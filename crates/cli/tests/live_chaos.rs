@@ -541,6 +541,8 @@ struct Fleet {
   blocks: Vec<HeldBlock>,
   processes: Vec<Option<FleetProcess>>,
   instances: Vec<String>,
+  /// Each node's instance and certificate anchor, read as the fleet formed: a restart keeps a node's anchor.
+  anchors: Vec<(String, String)>,
   supervision: Supervision,
   bootstrap: usize,
   /// The manifest's node names, one per node index.
@@ -590,16 +592,53 @@ impl Fleet {
     wait_settled(&instances, nodes.len());
     eprintln!("chaos: fleet {tag} ({supervision:?}) formed and settled: hosts {hosts:?}");
     DIAGNOSED.with(|diagnosed| *diagnosed.borrow_mut() = instances.clone());
+    let anchors = instances
+      .iter()
+      .map(|instance| {
+        (
+          instance.clone(),
+          value_of(&run_ready(instance, &["status"]), "anchor"),
+        )
+      })
+      .collect();
     Fleet {
       _scratch: scratch,
       manifest,
       blocks,
       processes,
       instances,
+      anchors,
       supervision,
       bootstrap,
       nodes,
     }
+  }
+
+  /// Shares `id` through `owner` with this test's account on every other node, so a survivor can reach it after a
+  /// takeover (A-237: a local account means something only on its host, and the survivors' clients are other hosts').
+  fn share(&self, owner: &str, id: &str) {
+    let account = rustix::process::getuid().as_raw();
+    for (node, anchor) in self.anchors.iter().filter(|(node, _)| node != owner) {
+      let (code, _, err) = run(
+        owner,
+        &[
+          "share",
+          id,
+          &format!("uid:{account}@{anchor}"),
+          "--read",
+          "--write",
+          "--admin",
+        ],
+      );
+      assert_eq!(code, 0, "the share with {node}: {err}");
+    }
+  }
+
+  /// [`create_volume`] on `owner`, shared with every other node ([`Self::share`]).
+  fn create_volume(&self, owner: &str, name: &str, live: bool) -> String {
+    let id = create_volume(owner, name, live);
+    self.share(owner, &id);
+    id
   }
 
   /// The node index that is not the bootstrap node: owners are made there, as `live_fleet.rs` does.
@@ -1470,7 +1509,7 @@ fn a_candidate_killed_mid_stream_catches_up_and_its_copy_serves_a_takeover() {
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let killed_index = fleet.others(owner_index)[0];
-  let volume = create_volume(&owner, "killed-candidate", true);
+  let volume = fleet.create_volume(&owner, "killed-candidate", true);
   let mut verdict = Verdict::new("a candidate killed mid-stream");
   let instances = fleet.instances.clone();
   let (outcomes, samples) = stream_through(&instances, &owner, &volume, 0..STREAM_FILES, |began| {
@@ -1642,7 +1681,7 @@ fn candidates_partitioned_in_turn_mid_stream_lose_nothing() {
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
-  let volume = create_volume(&owner, "rolling", true);
+  let volume = fleet.create_volume(&owner, "rolling", true);
   let mut verdict = Verdict::new("candidates partitioned in turn mid-stream");
   let (outcomes, samples) = stream_through(
     &fleet.instances,
@@ -1703,7 +1742,7 @@ fn writes_stream_through_random_candidate_stalls() {
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
-  let volume = create_volume(&owner, "jitter", true);
+  let volume = fleet.create_volume(&owner, "jitter", true);
   let mut verdict = Verdict::new("writes through random candidate stalls");
   let pids: Vec<u32> = fleet
     .others(owner_index)
@@ -1796,7 +1835,7 @@ fn an_owner_partitioned_mid_stream_is_fenced_and_loses_nothing() {
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
   let survivors: Vec<&str> = candidates.iter().map(String::as_str).collect();
-  let volume = create_volume(&owner, "owner-stop", true);
+  let volume = fleet.create_volume(&owner, "owner-stop", true);
   let mut verdict = Verdict::new("an owner partitioned mid-stream");
   let mut resumed_at = Duration::ZERO;
   let mut successor_outcomes = Vec::new();
@@ -1914,7 +1953,7 @@ fn a_live_volume_destroyed_with_writes_waiting_refuses_them_and_keeps_nothing() 
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
-  let volume = create_volume(&owner, "destroy-wait", true);
+  let volume = fleet.create_volume(&owner, "destroy-wait", true);
   let mut verdict = Verdict::new("a live volume destroyed with writes waiting");
   let mut destroyed_at = Duration::ZERO;
   let (outcomes, samples) = stream_through(
@@ -2056,7 +2095,7 @@ fn clients_killed_while_their_writes_wait_leave_no_reply_held() {
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
-  let volume = create_volume(&owner, "cut-waiting", true);
+  let volume = fleet.create_volume(&owner, "cut-waiting", true);
   let mut verdict = Verdict::new("clients killed while their writes wait");
   let began = Instant::now();
   let stop_sampling = AtomicBool::new(false);
@@ -2180,7 +2219,7 @@ fn a_destroy_then_the_owners_loss(live: bool, unheard: bool) {
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
-  let volume = create_volume(&owner, tag, live);
+  let volume = fleet.create_volume(&owner, tag, live);
   let mut verdict = Verdict::new(match (live, unheard) {
     (true, true) => "a live volume's unheard destroy, then its owner's loss",
     (true, false) => "a live volume's destroy, then its owner's loss",
@@ -2495,7 +2534,7 @@ fn a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover() {
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let replaced_index = fleet.others(owner_index)[0];
-  let volume = create_volume(&owner, "replaced-candidate", true);
+  let volume = fleet.create_volume(&owner, "replaced-candidate", true);
   let mut verdict = Verdict::new("a candidate's store destroyed mid-stream");
   let instances = fleet.instances.clone();
   let fleet_cell = std::cell::RefCell::new(&mut fleet);
@@ -2565,7 +2604,7 @@ fn writes_stream_on_a_quiet_fleet() {
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
-  let volume = create_volume(&owner, "quiet", true);
+  let volume = fleet.create_volume(&owner, "quiet", true);
   let mut verdict = Verdict::new("writes on a quiet fleet");
   let (outcomes, samples) =
     stream_through(&fleet.instances, &owner, &volume, 0..STREAM_FILES, |_| {
@@ -2634,6 +2673,7 @@ fn clients_cut_off_mid_merge_leave_the_green_whole_across_a_takeover() {
   let candidates = candidates_of(&fleet, owner_index);
   let mut verdict = Verdict::new("clients cut off mid-merge");
   let green = value_of(&run_ready(&owner, &["green", "cut-merge"]), "id");
+  fleet.share(&owner, &green);
   let base = green_head(&owner, &green).unwrap_or(0);
   let mut told: Vec<(usize, u64)> = Vec::new();
   for round in 0..=ROUNDS {
@@ -2871,7 +2911,7 @@ fn a_long_live_log_is_taken_over_whole() {
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
-  let volume = create_volume(&owner, "long-log", true);
+  let volume = fleet.create_volume(&owner, "long-log", true);
   let mut verdict = Verdict::new("a long live log taken over");
   // Streamed in steps the stall guard watches (40 durable writes within the fleet wait each), so a write the daemon
   // never answers fails the flow with the fleet printed, where one long stream ran into the test's own timeout.
@@ -2941,7 +2981,7 @@ fn a_live_entry_past_one_chunk_is_taken_over_whole() {
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
-  let volume = create_volume(&owner, "big-entry", true);
+  let volume = fleet.create_volume(&owner, "big-entry", true);
   let mut verdict = Verdict::new("a live entry past one chunk taken over");
   let id = volume_id_of(&volume);
   let big: Vec<u8> = (0..BIG).map(|at| u8::try_from(at % 251).unwrap()).collect();
@@ -3057,7 +3097,7 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
     .min_by_key(|index| *index == fleet.bootstrap)
     .expect("a five-member fleet seats three voters, so two members hold no seat");
   let owner = instances[owner_index].clone();
-  let volume = create_volume(&owner, "fresh-member", true);
+  let volume = fleet.create_volume(&owner, "fresh-member", true);
   let mut verdict = Verdict::new("a member that never held the log at a takeover");
   verdict.note(format!(
     "owner {owner}; council seats at {:?}",
@@ -3619,7 +3659,7 @@ fn a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor
       Barrier::NfsFileSync
     };
     let owner = fleet.instances[owner_index].clone();
-    let volume = create_volume(&owner, &format!("kill-at-ack-{iteration}"), true);
+    let volume = fleet.create_volume(&owner, &format!("kill-at-ack-{iteration}"), true);
     let files: Vec<(String, Vec<u8>)> = (0..=BEFORE)
       .map(|file| {
         let name = format!("ack-{iteration}-{file}");
