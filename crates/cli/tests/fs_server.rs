@@ -719,8 +719,8 @@ fn a_killed_remote_holder_is_reaped_at_the_owner_and_its_lease_ends_within_its_t
 }
 
 /// A-222 hostile forward. Do: the server attaches its own volume for writing, locally; from the client node, write and
-/// detach through that attachment's id. Expect: both refused `Forbidden` (a forward may act only through its own
-/// host's attachment), and the server's attachment and file unchanged.
+/// detach through that attachment's id. Expect: both refused (a forward may act only through its own host's attachment;
+/// A-237 reports a forwarded `Forbidden` as `NotShared`), and the server's attachment and file unchanged.
 #[test]
 fn a_forward_naming_another_hosts_attachment_is_refused() {
   if std::env::var_os("SLATES_TEST_CLI").is_none() || std::env::var_os(HOLDER_ROLE).is_some() {
@@ -758,8 +758,8 @@ fn a_forward_naming_another_hosts_attachment_is_refused() {
   );
   assert_eq!(code, 1, "{out}{err}");
   assert!(
-    err.contains("Forbidden"),
-    "the write is refused Forbidden: {out}{err}"
+    err.contains("NotShared"),
+    "the write is refused NotShared: {out}{err}"
   );
   let (code, out, err) = run(
     &client,
@@ -767,8 +767,8 @@ fn a_forward_naming_another_hosts_attachment_is_refused() {
   );
   assert_eq!(code, 1, "{out}{err}");
   assert!(
-    err.contains("Forbidden"),
-    "the detach is refused Forbidden: {out}{err}"
+    err.contains("NotShared"),
+    "the detach is refused NotShared: {out}{err}"
   );
   assert_eq!(ok(&server, &["read", &volume, "README"]), "readme original");
   assert_eq!(
