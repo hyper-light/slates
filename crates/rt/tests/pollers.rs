@@ -18,13 +18,6 @@ use slates_rt::runtime::{Runtime, RuntimeConfig};
 /// lands inside the spin, not after the park, even on a loaded machine (the timing the test asserts
 /// with `spin_hits`).
 const SPIN_NS: u64 = 2_000_000_000;
-/// Shape: how long the ring gets to wake the poller before the test fails — far past a step, far
-/// below the client's one-second claim wait the lost ring would otherwise be paid in.
-const WAKE_DEADLINE: Duration = Duration::from_secs(2);
-/// Shape: how long the shard gets to finish the step that polled the task and settle into its idle
-/// spin before the ring is sent (a step is microseconds; a generous margin on a loaded machine), far
-/// inside the spin window — so the ring lands in the spin, not in the step before it.
-const SETTLE: Duration = Duration::from_millis(50);
 
 fn config() -> RuntimeConfig {
   RuntimeConfig {
@@ -75,47 +68,65 @@ fn wait_until(deadline: Duration, done: impl Fn() -> bool) -> bool {
   done()
 }
 
-/// A ring that lands while the shard is idle-spinning wakes the consuming poller: the spin saw it
-/// (`spin_hits` moved — the ring landed in the spin, not after the park) and the task was woken
-/// (`poller_wakes` moved, `SERVED` advanced), within the wake deadline. The ring is sent as the
-/// daemon's doorbell thread sends it: the flag set, then the shard kicked (a spinning shard needs no
-/// kick; a parked one does).
+/// Shape: rings the idle-spin test sends, each into a window the shard has just opened: more than one, so a ring that
+/// a loaded machine delays past the window, into the park the kick ends, does not leave the spin untested.
+const RINGS: u64 = 8;
+
+/// How many of the window-opening tasks have run.
+static NOTED: AtomicU64 = AtomicU64::new(0);
+
+/// A ring that lands while the shard is idle-spinning wakes the consuming poller. Do: [`RINGS`] times, have the shard
+/// run a task that notes activity, which opens its idle window; once it has run, ring as the daemon's doorbell thread
+/// does (the flag set, then the shard kicked, which wakes only a parked shard); wait until the doorbell task is served.
+/// Expect: every ring served, by the poller (`poller_wakes`), and the spin found work (`spin_hits`). A spin that asks a
+/// consuming question and drops the answer loses a ring that lands in it, and the kick does not save it (the shard is
+/// not parked): that ring is never served. Each wait is on what it waits for, with [`BACKSTOP`] only for a shard that
+/// stopped: under load the old fixed 50 ms settle and 2 s deadline were the test's, not the shard's.
 #[test]
 fn a_ring_during_the_idle_spin_wakes_a_consuming_poller() {
   let rt = Runtime::start(&config()).unwrap();
   let shard = rt.shard_ids()[0];
-  // A client's earlier request opened the shard's idle window, as the server notes one it served.
-  rt.spawn_on(shard, async {
-    registry::with_current(|ctx| ctx.note_activity());
-  })
-  .unwrap();
   rt.spawn_on(shard, doorbell_loop()).unwrap();
   assert!(
-    wait_until(WAKE_DEADLINE, || SERVED.load(Ordering::Acquire) >= 1),
+    wait_until(BACKSTOP, || SERVED.load(Ordering::Acquire) >= 1),
     "the doorbell task ran once and went idle"
   );
-  // Let the step that polled the task end and the shard, inside its window with nothing to do, settle
-  // into its spin; then ring.
-  let _ = wait_until(SETTLE, || false);
-  RUNG.store(true, Ordering::Release);
-  let _ = registry::with_entry(shard.0, |entry| entry.kick.kick());
-  let woken = wait_until(WAKE_DEADLINE, || SERVED.load(Ordering::Acquire) >= 2);
+  let mut served_all = true;
+  for ring in 1..=RINGS {
+    let noted = NOTED.load(Ordering::Acquire);
+    rt.spawn_on(shard, async {
+      registry::with_current(|ctx| ctx.note_activity());
+      NOTED.fetch_add(1, Ordering::AcqRel);
+    })
+    .unwrap();
+    assert!(
+      wait_until(BACKSTOP, || NOTED.load(Ordering::Acquire) > noted),
+      "ring {ring}: the shard opened its idle window"
+    );
+    RUNG.store(true, Ordering::Release);
+    let _ = registry::with_entry(shard.0, |entry| entry.kick.kick());
+    if !wait_until(BACKSTOP, || SERVED.load(Ordering::Acquire) > ring) {
+      served_all = false;
+      break;
+    }
+  }
   let counters = rt.shutdown().unwrap();
   let shard_counters = &counters[0];
   assert!(
-    shard_counters.spin_hits >= 1,
-    "the ring landed inside the idle spin (spin hits {}); the test's timing premise",
-    shard_counters.spin_hits
-  );
-  assert!(
-    woken,
-    "the ring during the spin woke the poller: served {} times, poller wakes {}",
-    SERVED.load(Ordering::Acquire),
+    served_all,
+    "every ring woke the poller: served {} times for {RINGS} rings, poller wakes {}",
+    SERVED.load(Ordering::Acquire) - 1,
     shard_counters.poller_wakes
   );
   assert!(
-    shard_counters.poller_wakes >= 1,
-    "non-vacuity: the loop woke the poller, not a foreign wake"
+    shard_counters.spin_hits >= 1,
+    "the spin found work (spin hits {}): some ring landed in it",
+    shard_counters.spin_hits
+  );
+  assert!(
+    shard_counters.poller_wakes >= RINGS,
+    "non-vacuity: the loop woke the poller for every ring ({} wakes), not a foreign wake",
+    shard_counters.poller_wakes
   );
 }
 
