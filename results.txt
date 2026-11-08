@@ -1,0 +1,113 @@
+runner windows-latest, 4 CPUs, d3d2057 diag-liveness-23: the recovery-slicing extremes on four runners (diagnos, Sun Nov  8 04:28:25 UTC 2026
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_PREBUILT_NASM': '0'
+warning: aws-lc-sys@0.45.0: Value: 0 is false.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-pc-windows-msvc'
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' failed - Err(Error { kind: ToolExecError, message: "command did not execute successfully (status code exit code: 2): \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Tools\\\\MSVC\\\\14.51.36231\\\\bin\\\\HostX64\\\\x64\\\\cl.exe\" \"-nologo\" \"-MD\" \"-Z7\" \"-Brepro\" \"-WX\" \"-W4\" \"-FoD:\\\\a\\\\slates\\\\slates\\\\target\\\\debug\\\\build\\\\aws-lc-sys-adc05d15a5129420\\\\out\\\\out-stdalign_check\\\\e1bacabfea35bee3-stdalign_check.o\" \"-c\" \"D:\\\\a\\\\slates\\\\slates\\\\vendor\\\\aws-lc-sys\\\\aws-lc\\\\tests\\\\compiler_features_tests\\\\stdalign_check.c\"" }).
+error: the function has a cognitive complexity of (13/10)
+error: the function has a cognitive complexity of (14/10)
+error: large size difference between variants
+error: could not compile `slates-server` (lib) due to 3 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `slates-server` (lib test) due to 3 previous errors
+== clippy exit 101
+== spinners: 8
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.50s
+== rt alone exit 0 in 7 s
+slates-server: shard 0 initialized in 17053 µs, 15625 µs of its CPU, in 4 slices of 6 units; the longest slice 15082 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 152 µs)
+slates-server: shard 0 initialized in 14255 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 13049 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 180 µs)
+slates-server: shard 0 initialized in 15512 µs, 15625 µs of its CPU, in 4 slices of 6 units; the longest slice 13827 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 152 µs)
+slates-server: shard 0 initialized in 14126 µs, 15625 µs of its CPU, in 6 slices of 6 units; the longest slice 13070 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 7 µs)
+slates-server: shard 0 initialized in 14214 µs, 15625 µs of its CPU, in 5 slices of 6 units; the longest slice 13050 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 7 µs)
+slates-server: shard 0 initialized in 14241 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 13093 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 143 µs)
+slates-server: shard 0 initialized in 14507 µs, 15625 µs of its CPU, in 5 slices of 6 units; the longest slice 13347 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 7 µs)
+slates-server: shard 0 initialized in 14110 µs, 15625 µs of its CPU, in 5 slices of 6 units; the longest slice 13072 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 7 µs)
+slates-server: shard 0 initialized in 13843 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 12753 µs, the most CPU in one 15625 µs, ending at unit 6 (a slice's budget 203 µs)
+slates-server: shard 0 initialized in 14164 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 13016 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 146 µs)
+slates-server: shard 0 initialized in 14390 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 13285 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 174 µs)
+slates-server: shard 0 initialized in 14334 µs, 15625 µs of its CPU, in 5 slices of 6 units; the longest slice 13367 µs, the most CPU in one 15625 µs, ending at unit 3 (a slice's budget 7 µs)
+slates-server: shard 0 initialized in 14603 µs, 15625 µs of its CPU, in 5 slices of 6 units; the longest slice 13394 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 7 µs)
+slates-server: shard 0 initialized in 14720 µs, 15625 µs of its CPU, in 6 slices of 6 units; the longest slice 13566 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 7 µs)
+slates-server: shard 0 initialized in 14283 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 13232 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 214 µs)
+slates-server: shard 0 initialized in 20553 µs, 15625 µs of its CPU, in 6 slices of 6 units; the longest slice 19449 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 7 µs)
+slates-server: shard 0 initialized in 14196 µs, 0 µs of its CPU, in 3 slices of 6 units; the longest slice 13083 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's budget 257 µs)
+slates-server: shard 0 initialized in 14153 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 12973 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 159 µs)
+slates-server: shard 0 initialized in 61031 µs, 15625 µs of its CPU, in 6 slices of 6 units; the longest slice 47587 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 7 µs)
+slates-server: shard 0 initialized in 13882 µs, 0 µs of its CPU, in 3 slices of 6 units; the longest slice 12862 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's budget 154 µs)
+test dns::tests::a_bad_name_is_refused_by_reason ... slates-server: shard 0 initialized in 14094 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 12990 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 142 µs)
+slates-server: shard 0 initialized in 14347 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 13132 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 203 µs)
+slates-server: shard 0 initialized in 13783 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 12726 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 197 µs)
+slates-server: shard 0 initialized in 14164 µs, 15625 µs of its CPU, in 5 slices of 6 units; the longest slice 13077 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 7 µs)
+slates-server: shard 0 initialized in 14329 µs, 0 µs of its CPU, in 3 slices of 6 units; the longest slice 13157 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's budget 213 µs)
+slates-server: shard 0 initialized in 15708 µs, 15625 µs of its CPU, in 5 slices of 6 units; the longest slice 14696 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 7 µs)
+slates-server: shard 0 initialized in 13921 µs, 15625 µs of its CPU, in 5 slices of 6 units; the longest slice 12818 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 7 µs)
+slates-server: shard 0 initialized in 65859 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 64721 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 178 µs)
+slates-server: shard 0 initialized in 14077 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 13010 µs, the most CPU in one 15625 µs, ending at unit 6 (a slice's budget 148 µs)
+slates-server: shard 0 initialized in 14099 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 13025 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 188 µs)
+slates-server: shard 0 initialized in 14112 µs, 0 µs of its CPU, in 6 slices of 6 units; the longest slice 12965 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's budget 7 µs)
+slates-server: shard 0 initialized in 14438 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 13251 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 189 µs)
+slates-server: shard 0 initialized in 14309 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 13094 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 235 µs)
+slates-server: shard 0 initialized in 431013 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 430362 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 196 µs)
+slates-server: shard 0 initialized in 14198 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 12952 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 210 µs)
+slates-server: shard 0 initialized in 14191 µs, 15625 µs of its CPU, in 6 slices of 6 units; the longest slice 13088 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 7 µs)
+slates-server: shard 0 initialized in 14135 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 13009 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 167 µs)
+slates-server: shard 0 initialized in 14151 µs, 15625 µs of its CPU, in 6 slices of 6 units; the longest slice 13069 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 7 µs)
+slates-server: shard 0 initialized in 15009 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 13767 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 213 µs)
+slates-server: shard 0 initialized in 14115 µs, 0 µs of its CPU, in 5 slices of 6 units; the longest slice 13060 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's budget 7 µs)
+slates-server: shard 0 initialized in 13910 µs, 15625 µs of its CPU, in 6 slices of 6 units; the longest slice 12903 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 7 µs)
+slates-server: shard 0 initialized in 14234 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 13010 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 190 µs)
+slates-server: shard 0 initialized in 14293 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 13112 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 144 µs)
+slates-server: shard 0 initialized in 14183 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 13072 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 160 µs)
+slates-server: shard 0 initialized in 14288 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 13140 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 143 µs)
+slates-server: shard 0 initialized in 14178 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 13060 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 161 µs)
+slates-server: shard 0 initialized in 14035 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 12912 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 309 µs)
+slates-server: shard 0 initialized in 13795 µs, 15625 µs of its CPU, in 5 slices of 6 units; the longest slice 12780 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 7 µs)
+slates-server: shard 0 initialized in 13721 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 12712 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 235 µs)
+slates-server: shard 0 initialized in 14172 µs, 0 µs of its CPU, in 3 slices of 6 units; the longest slice 13015 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's budget 157 µs)
+slates-server: shard 0 initialized in 13992 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 12927 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 234 µs)
+slates-server: shard 0 initialized in 14228 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 13102 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 165 µs)
+slates-server: shard 0 initialized in 14293 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 13095 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 174 µs)
+slates-server: shard 0 initialized in 16088 µs, 15625 µs of its CPU, in 6 slices of 6 units; the longest slice 15023 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 7 µs)
+slates-server: shard 0 initialized in 14201 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 13028 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 174 µs)
+slates-server: shard 0 initialized in 14321 µs, 15625 µs of its CPU, in 6 slices of 6 units; the longest slice 13041 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 7 µs)
+slates-server: shard 0 initialized in 14287 µs, 15625 µs of its CPU, in 5 slices of 6 units; the longest slice 13232 µs, the most CPU in one 15625 µs, ending at unit 3 (a slice's budget 7 µs)
+slates-server: shard 0 initialized in 15840 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 14724 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 204 µs)
+slates-server: shard 0 initialized in 14298 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 13107 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 215 µs)
+test result: ok. 197 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 42.98s
+== server lib exit 0 in 50 s
+slates-server: shard 0 initialized in 17780 µs, 15625 µs of its CPU, in 4 slices of 6 units; the longest slice 15539 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 228 µs)
+slates-server: shard 1 initialized in 43947 µs, 0 µs of its CPU, in 3 slices of 6 units; the longest slice 43117 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's budget 235 µs)
+slates-server: shard 0 initialized in 14253 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 13268 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 175 µs)
+slates-server: shard 1 initialized in 2075 µs, 0 µs of its CPU, in 3 slices of 6 units; the longest slice 1269 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's budget 252 µs)
+slates-server: shard 1 initialized in 2301 µs, 0 µs of its CPU, in 3 slices of 6 units; the longest slice 1313 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's budget 144 µs)
+slates-server: shard 0 initialized in 75406 µs, 15625 µs of its CPU, in 4 slices of 6 units; the longest slice 62064 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 144 µs)
+slates daemon: shard 1 is spinning: 1015 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+slates-server: shard 1 initialized in 2245 µs, 15625 µs of its CPU, in 6 slices of 6 units; the longest slice 1296 µs, the most CPU in one 15625 µs, ending at unit 4 (a slice's budget 7 µs)
+slates-server: shard 0 initialized in 13820 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 12905 µs, the most CPU in one 15625 µs, ending at unit 6 (a slice's budget 160 µs)
+slates-server: shard 1 initialized in 2109 µs, 0 µs of its CPU, in 3 slices of 6 units; the longest slice 1250 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's budget 237 µs)
+slates-server: shard 0 initialized in 13860 µs, 15625 µs of its CPU, in 3 slices of 6 units; the longest slice 12919 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 199 µs)
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1051 ms, past the 1000 ms window; the watchdog withholds the beat
+test result: ok. 6 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 27.84s
+== server liveness exit 0 in 33 s
+thread 'a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon' (7164) panicked at crates\cli\tests\held_rendezvous.rs:199:5:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.86s
+== held_rendezvous exit 101 in 25 s
+slates-server: shard 1 initialized in 2708 µs, 0 µs of its CPU, in 7 slices of 6 units; the longest slice 1242 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's budget 20 µs)
+slates-server: shard 0 initialized in 15468 µs, 31250 µs of its CPU, in 4 slices of 6 units; the longest slice 14338 µs, the most CPU in one 15625 µs, ending at unit 1 (a slice's budget 20 µs)
+slates anchor: daemon exited (Some(1)); restarted as pid 8672 (1 in the window)
+slates-server: shard 1 initialized in 5230 µs, 0 µs of its CPU, in 7 slices of 6 units; the longest slice 2825 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's budget 20 µs)
+slates-server: shard 0 initialized in 26669 µs, 15625 µs of its CPU, in 5 slices of 6 units; the longest slice 25155 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 20 µs)
+slates-server: shard 1 initialized in 6090 µs, 15625 µs of its CPU, in 5 slices of 6 units; the longest slice 2409 µs, the most CPU in one 15625 µs, ending at unit 6 (a slice's budget 70 µs)
+slates-server: shard 0 initialized in 15321 µs, 15625 µs of its CPU, in 4 slices of 6 units; the longest slice 14281 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 70 µs)
+slates anchor: daemon exited (Some(1)); restarted as pid 8940 (1 in the window)
+slates anchor: the starting daemon (pid 8940) made no progress for 1016 ms (the 1000 ms liveness window); killing it
+slates anchor: daemon exited (Some(1)); restarted as pid 6540 (1 in the window)
+slates-server: shard 1 initialized in 2745 µs, 15625 µs of its CPU, in 5 slices of 6 units; the longest slice 1466 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's budget 70 µs)
+slates-server: shard 0 initialized in 22420 µs, 31250 µs of its CPU, in 4 slices of 6 units; the longest slice 20936 µs, the most CPU in one 31250 µs, ending at unit 2 (a slice's budget 70 µs)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 46.48s
+== start_judgment exit 0 in 53 s
