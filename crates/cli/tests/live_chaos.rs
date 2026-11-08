@@ -1423,6 +1423,7 @@ fn diagnosis(instances: &[String], volume: &str) -> String {
             || line.starts_with("fleet_settled_generation")
             || line.starts_with("fleet_neighbourhood_generation")
             || line.starts_with("fleet_takeovers_pending")
+            || line.starts_with("fleet_takeover_lost")
             || line.starts_with("fleet_held_records")
             || line.starts_with("fleet_configuration_version")
             || line.contains("anchor")
