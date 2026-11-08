@@ -706,7 +706,11 @@ impl Handler {
       return Reply::Err(crate::status_unsuccessful());
     }
     self.wake.wake_by_ref();
-    let answered = answer.recv();
+    // Diag only: a reply already there when the thread comes to wait needs no wake.
+    let (answered, late) = match answer.try_recv() {
+      Ok(reply) => (Ok(reply), true),
+      Err(_) => (answer.recv(), false),
+    };
     let end = crate::phases::now();
     crate::phases::record(slot, crate::phases::ROUND, start, end);
     let Ok((reply, sent)) = answered else {
@@ -716,7 +720,11 @@ impl Handler {
     // The DLL arm's threads never spin for a reply, so every wait is a park (std's channel spins a few microseconds
     // inside `recv` first, which this cannot separate).
     crate::phases::record(slot, crate::phases::TO_ANSWER, sent, end);
-    crate::phases::record(slot, crate::phases::TO_ANSWER_PARKED, sent, end);
+    if late {
+      crate::phases::record(slot, crate::phases::TO_ANSWER_LATE, sent, end);
+    } else {
+      crate::phases::record(slot, crate::phases::TO_ANSWER_PARKED, sent, end);
+    }
     reply
   }
 }
