@@ -12,12 +12,19 @@
 //! Each beat, for every shard, from its registry pulse (`steps`), its parking flag and its thread's CPU clock
 //! (`slates_rt::registry::shard_cpu`, which counts cycles on Windows):
 //! - **alive** while it is parked in its driver, or has completed a step since the last look;
-//! - otherwise, since its last step, **stuck (wedged)** once a whole window has passed with no CPU progress at all. A
-//!   deadlock, and a host call that never returns, consume none; a starved shard, runnable but given little CPU, keeps
-//!   consuming some;
+//! - otherwise, since its last step, **stuck (wedged)** once a whole window has passed in which it moved in no way: no
+//!   CPU progress, never seen runnable, and no wait for a CPU credited to it. A deadlock, and a host call that never
+//!   returns, do none of these;
 //! - **stuck (spinning)** once it has run a whole window of CPU without completing a step: a task that does not yield.
 //!   A cooperative task yields within the shard's step budget, microseconds, so a window of CPU is no poll's;
-//! - **alive** otherwise: starved, or busy inside one poll for less than a window.
+//! - **starved** once a whole window has passed with no CPU progress while the scheduler had it waiting for a CPU. It is
+//!   not stuck (A-228: on adacachy at CPUWeight=1 a shard held off its CPU was runnable throughout while its clock stood
+//!   still, and the anchor killed a live daemon); it beats, and is logged once an episode;
+//! - **alive** otherwise: busy inside one poll for less than a window, or given a little CPU at a time.
+//!
+//! What the scheduler says comes from `slates_rt::registry::shard_run_readings`, asked only about shards with no step
+//! and no CPU rise since the last look. Where it has no answer (Miri, or a source that cannot be read), the CPU clock
+//! stands alone, as it did before.
 //!
 //! The window is the existing liveness budget ([`crate::daemon::LIVENESS_BUDGET_NS`]), a fixed number recorded as R3
 //! debt in GAPS. A-228 adds no number to it. While every shard is alive and the control loop lives, the thread beats; once
@@ -33,7 +40,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel}
 use std::thread::JoinHandle;
 
 use slates_anchor::AnchorSegment;
-use slates_rt::{RunReading, SlotHolder};
+use slates_rt::{RunReading, RunState, SlotHolder};
 use slates_vfs::clock::{Clock, HostClock};
 
 use crate::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS};
@@ -63,8 +70,9 @@ impl Watchdog {
   ) -> std::io::Result<Watchdog> {
     let (stop, stop_signal) = channel();
     slates_machine::log_line!(
-      "slates daemon: the watchdog beats every {} ms and finds a shard stuck after a {} ms window without a step and \
-       with no CPU progress, or with a window's CPU run (the window is the liveness budget)",
+      "slates daemon: the watchdog beats every {} ms and finds a shard stuck after a {} ms window without a step, with \
+       no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard \
+       waiting for a CPU is starved, not stuck, and the beat goes on",
       HEARTBEAT_NS / NS_PER_MS,
       LIVENESS_BUDGET_NS / NS_PER_MS
     );
@@ -108,11 +116,16 @@ const NS_PER_MS: u64 = 1_000_000;
 /// What the watchdog found of one shard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
-  /// Parked, stepping, starved or inside one poll for less than a window.
+  /// Parked, stepping, given a little CPU at a time, or inside one poll for less than a window.
   Alive,
-  /// No step and no CPU progress for `for_ns` (at least a window).
-  Wedged {
+  /// No step and no CPU progress for `for_ns` (at least a window), but the scheduler had it waiting for a CPU. It beats.
+  Starved {
     /// How long the shard has run no CPU without a step.
+    for_ns: u64,
+  },
+  /// No step, no CPU progress and no wait for a CPU for `for_ns` (at least a window).
+  Wedged {
+    /// How long the shard has not moved at all.
     for_ns: u64,
   },
   /// No step while it ran `cpu_ns` of CPU (at least a window).
@@ -120,6 +133,13 @@ pub enum Verdict {
     /// The CPU the shard ran since its last step.
     cpu_ns: u64,
   },
+}
+
+impl Verdict {
+  /// Whether a shard with this verdict lets the watchdog beat: a starved shard is not a stuck one.
+  fn beats(self) -> bool {
+    matches!(self, Verdict::Alive | Verdict::Starved { .. })
+  }
 }
 
 /// One shard's history since its last step, as the watchdog keeps it.
@@ -135,6 +155,10 @@ pub struct ShardWatch {
   progress: Option<u64>,
   /// When its progress last rose.
   progressed_ns: u64,
+  /// When it last moved in any way: its progress rose, it was runnable, or a wait for a CPU was credited to it.
+  moved_ns: u64,
+  /// Its thread's time waited for a CPU at the last look, nanoseconds, where the scheduler says.
+  waited_ns: Option<u64>,
 }
 
 /// One look at a shard: its step count, whether it is parked, its thread clock reading (CPU nanoseconds, progress),
@@ -171,6 +195,7 @@ impl ShardWatch {
     let (spent, progress) = look.cpu.map_or((None, None), |(spent, progress)| {
       (Some(spent), Some(progress))
     });
+    let waited_ns = look.run.and_then(|run| run.waited_ns);
     if look.parked || look.steps != self.steps || self.stepped_ns == 0 {
       return (
         Verdict::Alive,
@@ -180,6 +205,8 @@ impl ShardWatch {
           cpu_at_step_ns: spent,
           progress,
           progressed_ns: look.now_ns,
+          moved_ns: look.now_ns,
+          waited_ns,
         },
       );
     }
@@ -188,6 +215,10 @@ impl ShardWatch {
       // No thread clock (Miri): the wall window stands alone, as for observations.
       _ => false,
     };
+    // Linux credits a wait only once the thread reaches a CPU or leaves the queue, so a thread waiting now shows no
+    // rise; the state says so instead. A rise says it waited between two looks, seen in neither.
+    let waiting = look.run.is_some_and(|run| run.state == RunState::Runnable)
+      || matches!((self.waited_ns, waited_ns), (Some(before), Some(now)) if now > before);
     let next = ShardWatch {
       progress: if rose { progress } else { self.progress },
       progressed_ns: if rose {
@@ -195,9 +226,15 @@ impl ShardWatch {
       } else {
         self.progressed_ns
       },
+      moved_ns: if rose || waiting {
+        look.now_ns
+      } else {
+        self.moved_ns
+      },
+      waited_ns,
       ..self
     };
-    let still_for = look.now_ns.saturating_sub(next.progressed_ns);
+    let still_for = look.now_ns.saturating_sub(next.moved_ns);
     if still_for >= window_ns {
       return (Verdict::Wedged { for_ns: still_for }, next);
     }
@@ -213,6 +250,10 @@ impl ShardWatch {
         next,
       );
     }
+    let no_cpu_for = look.now_ns.saturating_sub(next.progressed_ns);
+    if no_cpu_for >= window_ns {
+      return (Verdict::Starved { for_ns: no_cpu_for }, next);
+    }
     (Verdict::Alive, next)
   }
 }
@@ -227,7 +268,7 @@ fn run(
 ) {
   let mut clock = HostClock::new();
   let mut watches = vec![ShardWatch::default(); holders.len()];
-  let mut reported = vec![false; holders.len()];
+  let mut reported = vec![None; holders.len()];
   let mut control_ended = false;
   let mut stopping = false;
   loop {
@@ -261,15 +302,8 @@ fn run(
       let Some(said) = reported.get_mut(index) else {
         continue;
       };
-      if verdict == Verdict::Alive {
-        *said = false;
-        continue;
-      }
-      all_alive = false;
-      if !*said {
-        *said = true;
-        log_stuck(holder.shard(), verdict);
-      }
+      report(said, holder.shard(), verdict);
+      all_alive &= verdict.beats();
     }
     if all_alive
       && !control_ended
@@ -317,12 +351,32 @@ fn read_runs(holders: &[SlotHolder], watches: &[ShardWatch], looks: &mut [Option
   }
 }
 
-/// Logs a stuck shard once per episode, with what the watchdog saw.
-fn log_stuck(shard: u16, verdict: Verdict) {
+/// Logs what the watchdog found of a shard the first look it finds it: `said` holds the kind last logged, cleared once
+/// the shard is alive. A starved shard that then blocks is logged again as wedged.
+fn report(said: &mut Option<std::mem::Discriminant<Verdict>>, shard: u16, verdict: Verdict) {
+  if verdict == Verdict::Alive {
+    *said = None;
+    return;
+  }
+  let kind = std::mem::discriminant(&verdict);
+  if *said != Some(kind) {
+    *said = Some(kind);
+    log_verdict(shard, verdict);
+  }
+}
+
+/// Logs one episode's verdict, with what the watchdog saw.
+fn log_verdict(shard: u16, verdict: Verdict) {
   match verdict {
+    Verdict::Starved { for_ns } => slates_machine::log_line!(
+      "slates daemon: shard {shard} is starved: no step and no CPU progress for {} ms, past the {} ms window, while its \
+       thread waits for a CPU; the watchdog goes on beating",
+      for_ns / NS_PER_MS,
+      LIVENESS_BUDGET_NS / NS_PER_MS
+    ),
     Verdict::Wedged { for_ns } => slates_machine::log_line!(
-      "slates daemon: shard {shard} is wedged: no step and no CPU progress for {} ms, past the {} ms window; the \
-       watchdog withholds the beat",
+      "slates daemon: shard {shard} is wedged: no step, no CPU progress and no wait for a CPU for {} ms, past the {} ms \
+       window; the watchdog withholds the beat",
       for_ns / NS_PER_MS,
       LIVENESS_BUDGET_NS / NS_PER_MS
     ),
@@ -338,8 +392,6 @@ fn log_stuck(shard: u16, verdict: Verdict) {
 
 #[cfg(test)]
 mod tests {
-  use slates_rt::RunState;
-
   use super::*;
 
   /// Shape: the window the rule is tested at (a second, the liveness budget).
@@ -534,6 +586,11 @@ mod tests {
     readings.extend(vec![runnable(Some(CREDITED_WAIT)); 41]);
     let verdicts = replay(&readings);
     assert_eq!(first_wedged(&verdicts), None, "{verdicts:?}");
+    assert!(verdicts.iter().all(|verdict| verdict.beats()));
+    assert_eq!(
+      verdicts.last(),
+      Some(&Verdict::Starved { for_ns: 50 * TURN })
+    );
   }
 
   /// A-228, §4.14, measured on two Linux kernels: a thread starved for 5.7-7.9 s showed run-queue growth of 0 and state R
@@ -542,6 +599,45 @@ mod tests {
   fn a_runnable_shard_whose_wait_stands_still_is_not_wedged() {
     let verdicts = replay(&vec![runnable(Some(FROZEN_WAIT)); 50]);
     assert_eq!(first_wedged(&verdicts), None, "{verdicts:?}");
+  }
+
+  /// A-228, §4.14. Do: find a shard starved, then wedged, then alive, and starved again. Expect: only a stuck shard
+  /// stops the beat, and each kind is logged once an episode, a starved shard that then blocks being logged again.
+  #[test]
+  fn each_kind_of_verdict_is_logged_once_an_episode_and_only_a_stuck_shard_stops_the_beat() {
+    let starved = Verdict::Starved { for_ns: WINDOW };
+    let wedged = Verdict::Wedged { for_ns: WINDOW };
+    let spinning = Verdict::Spinning { cpu_ns: WINDOW };
+    assert!(Verdict::Alive.beats() && starved.beats());
+    assert!(!wedged.beats() && !spinning.beats());
+    let mut said = None;
+    report(&mut said, 1, starved);
+    assert_eq!(said, Some(std::mem::discriminant(&starved)));
+    report(&mut said, 1, Verdict::Starved { for_ns: 2 * WINDOW });
+    assert_eq!(
+      said,
+      Some(std::mem::discriminant(&starved)),
+      "the same episode"
+    );
+    report(&mut said, 1, wedged);
+    assert_eq!(said, Some(std::mem::discriminant(&wedged)), "now stuck");
+    report(&mut said, 1, Verdict::Alive);
+    assert_eq!(said, None);
+  }
+
+  /// A-228, §4.14. Do: replay a shard runnable at every look that then blocks for good. Expect: starved while it waits,
+  /// and wedged a whole window after the last look it was runnable, however long it starved first.
+  #[test]
+  fn a_starved_shard_that_then_blocks_is_wedged_a_window_later() {
+    let mut readings = vec![runnable(Some(FROZEN_WAIT)); 20];
+    readings.extend(vec![blocked(Some(FROZEN_WAIT)); 20]);
+    let verdicts = replay(&readings);
+    assert_eq!(first_wedged(&verdicts), Some(31), "{verdicts:?}");
+    assert!(
+      verdicts
+        .iter()
+        .any(|verdict| matches!(verdict, Verdict::Starved { .. }))
+    );
   }
 
   /// A-228, §4.14: macOS and Windows keep no per-thread wait, so their reading is the state alone. Do: replay a shard
