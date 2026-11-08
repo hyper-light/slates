@@ -5330,8 +5330,18 @@ submitted to it) so no exchange waits for another's.
 >   found a session out 631,152 times, of which 570,478 were a `live_ship` lane finding the session lent to another
 >   `live_ship` lane, nearly all on the owner. Those are polls, not exchanges: many lanes spinning on one lent
 >   session, the forward lane's shape, and the strongest sign yet for the shared session.
-> - The two slow first formations printed no counters, since they ended at the 40 s dump bound. **The formation case
->   itself still has no counters from a slow run**, and CPU, disk and memory were not separated.
+> - The two slow first formations of that window printed no counters, since they ended at the 40 s dump bound.
+> - **A second window captured one** (2026-11-08, eight runs at load 127–176, with the takeover link fix and the harness
+>   fixes; 7 passed, the eighth the register stall). Run 1's first formation took 72.3 s; every other took 0.16–2.1 s. Its
+>   dump at 15 s shows every node at 3 of 5 members with the council unformed (configuration 0), and **lending
+>   negligible**: longest hold 68 ms, discovery 437 lent and 437 returned, 17 out-findings in all. Of 51 record dials, 29
+>   were established and 16 failed, and three nodes refused 1, 2 and 7 accepted handshakes.
+> - Over that run the shards were not short of CPU: control shards runnable in about 8 % of samples, 0.6–0.8 s of CPU.
+>   The machine was: 31–88 % in system code, idle 29 % on average, 11,654 disk operations a second, and timers running
+>   about 2.3 times late. Memory was not the limit (5.7–10 GB free, no swapping).
+> - So the slow formation is not this entry's lending and not shard starvation. The lead is record dials and handshakes
+>   failing under that machine. It is one case and one dump, and what released it is not known. Formation adds no
+>   evidence for the shared session; the `live_ship` polls above are one dump from a build without the link fix.
 
 ### 2026-09-29: a lone owner refused its own objects — fixed; campaign counters added for the open KIND items
 
