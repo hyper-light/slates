@@ -200,7 +200,11 @@
 > runs of clients' recipe at 183-292 runnable processes and in loadtest-scale's memrung beside the same spinners; stuck
 > starts killed at 1,001-1,294 ms on this Mac, both Linux and both Windows CI runners; the restart, handoff and start
 > suites green on all four. Open:
-> - a shard's recovery is one poll, which past a window of CPU stops the watchdog's beat;
+> - ~~a shard's recovery is one poll, which past a window of CPU stops the watchdog's beat~~ **closed 2026-11-07**: the
+>   shard's start runs alone (`slates_rt::futures::spawn_alone`) and its recovery yields between units at half the live
+>   step quantum; 16 greens over a held 77-file tree recovered in 2.51 s of CPU in 1,320 slices with the beat never older
+>   than 495 ms, where main went 2.20 s without a beat
+>   (`docs/bugs/2026-11-07-a-shards-recovery-ran-in-one-poll-and-the-watchdog-withheld-the-beat.md`);
 > - the client's reconnect budget (recovery + liveness, 2 s) can still be outlasted by a starved restart (owner clients);
 > - `Facts::query()` gathers every fact to read the identity (676 ms p50 under that load);
 > - the anchor's own profile was refused under the same load (`measurement timeout: wake`). Closed the same day: the
@@ -670,11 +674,17 @@
 >   the normal case. A busy machine must not kill a daemon that is making progress, and a client's reconnect budget
 >   follows the same constant.
 > - **2026-11-07, the start judgment closed** (the entry "The anchor killed every start a busy machine starved"): a
->   start is judged in its own CPU time, not by the fixed second. Recovery in one poll and the client's reconnect
->   budget stay open here. Seen since by loadtest-scale (memrung on a24e8e40, run A): after a restart, shard 0 recovered
+>   start is judged in its own CPU time, not by the fixed second. The client's reconnect budget stays open here;
+>   recovery in one poll closed the same day (below). Seen since by loadtest-scale (memrung on a24e8e40, run A): after a restart, shard 0 recovered
 >   one volume image and 1,001 merge volumes in 1,498,306 µs, past the 1 s window, and the start was waited for, not
->   killed (`~/.cache/slates-agents-scratch/loadtest-scale/mem-liveness/live-k32-r3-n1000/anchor.err`). Slicing the
->   recovery is liveness's next goal.
+>   killed (`~/.cache/slates-agents-scratch/loadtest-scale/mem-liveness/live-k32-r3-n1000/anchor.err`).
+> - **2026-11-07, recovery in one poll closed:** a shard's start runs alone and its recovery yields between units (each
+>   record, a green's held origin a directory listing or file a unit, its chain an entry a unit, each logged write),
+>   half the live step quantum a slice; the records' sort computes each key once (it recomputed the lineage depth,
+>   listing the whole catalog, at every comparison: 132-141 ms of a 1,001-volume recovery) and recovery decodes only the
+>   newest snapshot slot that decodes. The boot log names each shard's slices, units, CPU and its most CPU in one slice.
+>   Still one unit each: the catalog's replay (206-261 ms for 1,001 volumes on this Mac) and a green's engine built over
+>   its origin (`docs/bugs/2026-11-07-a-shards-recovery-ran-in-one-poll-and-the-watchdog-withheld-the-beat.md`).
 
 > **A private purge's intent can wait up to the 1 s transaction timeout (found 2026-11-05, audit step 7; open).**
 > WinFsp's transact never goes pending: the control dispatch calls `FspVolumeTransact` inline (v2.1 `src/sys/fsctl.c:95-99`),

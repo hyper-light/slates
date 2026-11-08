@@ -629,20 +629,71 @@ pub(crate) fn walk_held_origin(
   state: &ShardState,
   held: &slates_db::partition::OriginRef,
 ) -> Result<Origin, Refusal> {
-  let handle = state
-    .by_id
-    .get(&held.volume)
-    .copied()
-    .ok_or(Refusal::NotFound)?;
-  let slot = state.volumes.get(handle).map_err(|_| Refusal::NotFound)?;
-  let snapshot = core_snapshot(SnapshotId {
-    value: held.snapshot.value,
-  });
-  let origin = walk_origin(&slot.volume, &state.store, snapshot).map_err(|e| refusal_of_vfs(&e))?;
-  if origin_identity(&origin) != held.identity {
-    return Err(Refusal::ContentUnavailable);
+  let mut walk = HeldWalk::begin(state, held)?;
+  while !walk.step(state)? {}
+  walk.finish()
+}
+
+/// [`walk_held_origin`] a unit at a time ([`OriginWalk::unit`]: a directory's listing or a file's read), so a
+/// recovery can end its slice between two (§2.6 boot step 2, `crate::recovery_slices`). Holds no borrow of the state
+/// between steps: each step finds the base volume again.
+pub(crate) struct HeldWalk {
+  /// The base volume walked.
+  volume: DbVolumeId,
+  /// The identity the green recorded for its origin, which the finished walk must reproduce.
+  identity: [u8; 32],
+  /// The walk so far.
+  walk: OriginWalk,
+  /// The walked origin, once the last unit is done.
+  walked: Option<Origin>,
+}
+
+impl HeldWalk {
+  /// The walk of `held`'s base snapshot, not yet begun: `NotFound` when the base volume is not here.
+  pub(crate) fn begin(
+    state: &ShardState,
+    held: &slates_db::partition::OriginRef,
+  ) -> Result<HeldWalk, Refusal> {
+    held_base(state, held.volume)?;
+    let snapshot = core_snapshot(SnapshotId {
+      value: held.snapshot.value,
+    });
+    Ok(HeldWalk {
+      volume: held.volume,
+      identity: held.identity,
+      walk: OriginWalk::new(snapshot),
+      walked: None,
+    })
   }
-  Ok(origin)
+
+  /// One unit of the walk; true once the whole snapshot is walked.
+  pub(crate) fn step(&mut self, state: &ShardState) -> Result<bool, Refusal> {
+    if self.walked.is_some() {
+      return Ok(true);
+    }
+    let slot = held_base(state, self.volume)?;
+    self.walked = self
+      .walk
+      .unit(&slot.volume, &state.store)
+      .map_err(|e| refusal_of_vfs(&e))?;
+    Ok(self.walked.is_some())
+  }
+
+  /// The walked origin: `ContentUnavailable` when it is not the one the green was created from, `NotFound` when the
+  /// walk was not stepped to its end.
+  pub(crate) fn finish(self) -> Result<Origin, Refusal> {
+    let origin = self.walked.ok_or(Refusal::NotFound)?;
+    if origin_identity(&origin) != self.identity {
+      return Err(Refusal::ContentUnavailable);
+    }
+    Ok(origin)
+  }
+}
+
+/// The base volume a held origin is walked from, on this shard: `NotFound` when it is not here.
+fn held_base(state: &ShardState, volume: DbVolumeId) -> Result<&crate::state::VolumeSlot, Refusal> {
+  let handle = state.by_id.get(&volume).copied().ok_or(Refusal::NotFound)?;
+  state.volumes.get(handle).map_err(|_| Refusal::NotFound)
 }
 
 /// Walks a complete snapshot into an [`Origin`]: every file with its bytes, every directory, every

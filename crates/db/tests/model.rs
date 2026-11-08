@@ -1534,6 +1534,48 @@ fn a_green_checkpoint_folds_its_chain_and_recovery_holds_it() {
   );
 }
 
+/// §4.8 recovery, §2.6 boot step 2: recovery takes the newest snapshot slot that decodes. Do: take snapshots until both
+/// slots hold one, recover to learn which is newer, then publish into the newer slot bytes that begin with a higher
+/// sequence than either but do not decode, and recover again. Expect: the second recovery starts from the older
+/// slot, at its lower sequence, and recovers without a refusal; a slot whose sequence reads newest is never trusted
+/// for it alone.
+#[test]
+fn a_newest_snapshot_that_does_not_decode_leaves_recovery_the_older_one() {
+  let mut seg = segment("slates-db-snapshot-fallback", LOG_BYTES);
+  let mut db = open(&mut seg);
+  db.set_policy(SnapshotPolicy {
+    bytes_between_snapshots: 2_000,
+  });
+  for n in 0..200 {
+    db.mutate(
+      &mut seg,
+      &Op::VolumeCreated {
+        record: volume(n, &format!("v{n}")),
+      },
+      0,
+    )
+    .unwrap();
+  }
+  assert!(db.snapshots_taken() >= 2, "both slots hold a snapshot");
+  drop(db);
+  let (_, first) = recover(&mut seg, 0, caps(), 0).unwrap();
+  let (newer_slot, newer_seq) = first.snapshot.unwrap();
+  let older_slot = 1 - newer_slot;
+  let mut unreadable = u64::MAX.to_le_bytes().to_vec();
+  unreadable.extend_from_slice(b"not a partition snapshot");
+  seg
+    .publish(RegionKind::Snapshot(0, newer_slot), &unreadable)
+    .unwrap();
+  let (recovered, second) = recover(&mut seg, 0, caps(), 0).unwrap();
+  let (slot, seq) = second.snapshot.unwrap();
+  assert_eq!(slot, older_slot, "recovery fell back to the older slot");
+  assert!(
+    seq < newer_seq,
+    "at the older slot's sequence: {seq} against {newer_seq}"
+  );
+  assert!(recovered.partition().volume_count() > 0);
+}
+
 /// A ring too small for many records: the append snapshots and retries, never refuses.
 #[test]
 fn a_full_log_snapshots_and_retries() {

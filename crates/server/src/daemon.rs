@@ -754,40 +754,29 @@ impl Daemon {
       #[cfg(windows)]
       let learning = ();
       runtime.spawn_on(*shard, async move {
+        // This daemon's learning gate is entered on the shard's own thread before its start (A-227).
         #[cfg(unix)]
         gate.enter();
-        // How long a shard's start takes (its recovery included) is in the boot log: the control loop's first call to
-        // each shard queues behind it (GAPS, boot, 2026-10-05).
-        let started = std::time::Instant::now();
-        if let Some(fault) = config
-          .boot_fault
-          .filter(|fault| fault.partition == partition)
-        {
-          hold_start(fault);
-        }
-        let outcome = init_shard(
-          &config,
-          &env,
-          &identity,
+        // The start runs alone on its shard (§2.6 boot step 2): nothing else the shard is sent runs until it ends, as
+        // behind one long poll, while its recovery yields between slices so the shard keeps stepping (A-228). Built
+        // here, on its shard, since it owns the shard's state before installing it, which never moves between threads.
+        let start = futures::spawn_alone(start_shard(
+          config,
+          env,
+          identity,
           (partition, sealing, learning),
-          &all,
+          all,
           retained,
           #[cfg(target_os = "linux")]
           (held, copies),
           #[cfg(windows)]
           windows_holds,
-        );
-        let took_us = started.elapsed().as_micros();
-        match outcome {
-          Ok(()) => slates_machine::log_line!(
-            "slates-server: shard {partition} initialized in {took_us} µs"
-          ),
-          Err(e) => {
-            INIT_FAILURES.fetch_add(1, Ordering::AcqRel);
-            slates_machine::log_line!(
-              "slates-server: shard {partition} failed to initialize after {took_us} µs: {e}"
-            );
-          }
+        ));
+        if let Err(e) = start.and_then(futures::detach) {
+          INIT_FAILURES.fetch_add(1, Ordering::AcqRel);
+          slates_machine::log_line!(
+            "slates-server: shard {partition}'s start could not be seated: {e}"
+          );
         }
       })?;
     }
@@ -3126,6 +3115,73 @@ fn shard_arena(
   Ok((arena, slice))
 }
 
+/// A shard's start, run alone on its shard ([`futures::spawn_alone`]): its boot fault if the tests set one, then
+/// [`init_shard`], and the boot log's line of how long it took and in how many slices.
+async fn start_shard(
+  config: DaemonConfig,
+  env: Vec<(String, String)>,
+  identity: Identity,
+  (partition, sealing, learning): (u16, crate::seal_keys::RootState, ShardLearning),
+  all: Vec<u16>,
+  retained: Option<crate::retention::Retained>,
+  #[cfg(target_os = "linux")] held: (
+    Vec<crate::fuse_hold::HeldDevice>,
+    Vec<crate::held_copy::InheritedCopy>,
+  ),
+  #[cfg(windows)] windows_holds: (
+    Vec<crate::winfsp::InheritedMount>,
+    Option<std::os::windows::io::OwnedHandle>,
+  ),
+) {
+  // How long a shard's start takes (its recovery included) is in the boot log: the control loop's first call to each
+  // shard queues behind it (GAPS, boot, 2026-10-05).
+  let started = std::time::Instant::now();
+  if let Some(fault) = config
+    .boot_fault
+    .filter(|fault| fault.partition == partition)
+  {
+    hold_start(fault);
+  }
+  let outcome = init_shard(
+    &config,
+    &env,
+    &identity,
+    (partition, sealing, learning),
+    &all,
+    retained,
+    #[cfg(target_os = "linux")]
+    held,
+    #[cfg(windows)]
+    windows_holds,
+  )
+  .await;
+  let took_us = started.elapsed().as_micros();
+  match outcome {
+    Ok(sliced) => slates_machine::log_line!(
+      "slates-server: shard {partition} initialized in {took_us} µs, {} µs of its CPU, in {} slices of {} units; the longest slice {} µs, the most CPU in one {} µs, ending at unit {} (a slice's budget {} µs)",
+      sliced.cpu_ns.map_or_else(
+        || "unread".to_owned(),
+        |cpu| (cpu / NANOS_PER_MICRO).to_string()
+      ),
+      sliced.slices,
+      sliced.units,
+      sliced.longest_ns / NANOS_PER_MICRO,
+      sliced.longest_cpu_ns / NANOS_PER_MICRO,
+      sliced.longest_cpu_ended_at,
+      sliced.budget_ns / NANOS_PER_MICRO
+    ),
+    Err(e) => {
+      INIT_FAILURES.fetch_add(1, Ordering::AcqRel);
+      slates_machine::log_line!(
+        "slates-server: shard {partition} failed to initialize after {took_us} µs: {e}"
+      );
+    }
+  }
+}
+
+/// Format: nanoseconds in a microsecond, for the boot log's slice times.
+const NANOS_PER_MICRO: u64 = 1_000;
+
 /// Holds a shard's start as a [`crate::config::BootFault`] says: on the CPU (a long recovery) or asleep (a stuck
 /// shard), for its duration. Only the boot tests set one.
 fn hold_start(fault: crate::config::BootFault) {
@@ -3203,8 +3259,9 @@ type ShardLearning = Option<slates_base::own_mounts::Learning>;
 type ShardLearning = ();
 
 /// Runs on the shard: attaches the segment, recovers the partition, builds the store and
-/// installs the state, then spawns the server loop as a poller.
-fn init_shard(
+/// installs the state, then spawns the server loop as a poller. Its recovery runs in slices
+/// (`crate::recovery_slices`), which it reports.
+async fn init_shard(
   config: &DaemonConfig,
   env: &[(String, String)],
   identity: &Identity,
@@ -3219,12 +3276,14 @@ fn init_shard(
     Vec<crate::winfsp::InheritedMount>,
     Option<std::os::windows::io::OwnedHandle>,
   ),
-) -> Result<(), ServerError> {
+) -> Result<crate::recovery_slices::SliceReport, ServerError> {
+  let mut slices = crate::recovery_slices::RecoverySlices::begin(config.copy_slice_ns());
   let (handoff, len) = handoff_of(env)?;
   let mut segment = AnchorSegment::attach(&handoff, len, identity)?;
   let mut clock = HostClock::new();
   let now = slates_vfs::clock::Clock::monotonic_ns(&mut clock);
   let (db, recovered) = slates_db::replay::recover(&mut segment, partition, config.caps, now)?;
+  slices.unit_done().await;
   let (arena, slice_capacity) = shard_arena(config, partition, env, identity)?;
   let headroom = operation_headroom(config, slice_capacity);
   // The store owns the shard budget (§4.2): it is over what the arena can actually hand out (its
@@ -3598,7 +3657,8 @@ fn init_shard(
       }
     };
   }
-  let rebuilt = verbs::rebuild_recovered(&mut state);
+  slices.unit_done().await;
+  let rebuilt = verbs::rebuild_recovered(&mut state, &mut slices).await;
   if rebuilt.skipped > 0 {
     RECOVERY_SKIPPED.fetch_add(
       u64::try_from(rebuilt.skipped).unwrap_or(u64::MAX),
@@ -3658,7 +3718,7 @@ fn init_shard(
   let _ = futures::detach(serve);
   let reap = futures::spawn(reap_loop()).map_err(ServerError::Runtime)?;
   let _ = futures::detach(reap);
-  Ok(())
+  Ok(slices.finish())
 }
 
 /// The shard's sweep for dead clients and expired leases, at the liveness cadence: the same

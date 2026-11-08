@@ -9998,7 +9998,14 @@ pub struct Rebuilt {
 /// and its completion record) is dropped from the rebuilt volume, so no unacknowledged effect is
 /// partially present (AC-2.3). Leases keep their terms (the wheel was rebuilt by recovery) and
 /// expire on their own. The counts name what happened, never more.
-pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
+///
+/// It runs in `slices` (`crate::recovery_slices`): each record rebuilt is a unit, a green's held origin a directory
+/// a unit and its chain an entry a unit, and the slice may end after any unit, so the shard steps through a recovery
+/// of any length. The order is the one recovery always took; only where a poll ends moves.
+pub(crate) async fn rebuild_recovered(
+  state: &mut ShardState,
+  slices: &mut crate::recovery_slices::RecoverySlices,
+) -> Rebuilt {
   let records: Vec<VolumeRecord> = state
     .db
     .partition()
@@ -10081,8 +10088,10 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
   // Plain volumes first, origins before their clones (A-64: a clone is rebuilt over its recovered origin's snapshot);
   // then greens, whose held origin is walked from a plain volume's snapshot (A-217); then works, each replayed over its
   // rebuilt green (§4.16, A-207). Every record is then reconciled the same way.
+  // Each record's key is computed once: computed at every comparison, with a lineage walk that listed the whole catalog
+  // each time, the sort alone took 132-141 ms of a 1,001-volume recovery's CPU (2026-11-07, step 1 of the slicing plan).
   let mut records = records;
-  records.sort_by_key(|record| {
+  records.sort_by_cached_key(|record| {
     let pass = match record.policy.role {
       Role::Plain => 0u8,
       Role::Green { .. } => 1,
@@ -10090,10 +10099,11 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
     };
     (pass, lineage_depth(state, record.id))
   });
+  slices.unit_done().await;
   for record in &records {
     match record.policy.role {
       Role::Green { .. } => {
-        rebuild_green(state, record);
+        rebuild_green_sliced(state, record, slices).await;
         rebuilt.merge_volumes = rebuilt.merge_volumes.saturating_add(1);
       }
       Role::Work { green, .. } => {
@@ -10116,6 +10126,7 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
               state.partition,
               record.name
             );
+            slices.unit_done().await;
             continue;
           }
         }
@@ -10127,21 +10138,26 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
     rebuilt.orphans_reclaimed = rebuilt
       .orphans_reclaimed
       .saturating_add(settle_references(state, record));
+    slices.unit_done().await;
   }
   rebuilt.blocks_swept = sweep_claims(state, claims);
+  slices.unit_done().await;
   // The FUSE writes acknowledged after the last publication, back on top of the rebuilt volumes (A-63).
   #[cfg(target_os = "linux")]
   {
     // The writable copies the anchor held are taken back first, so every write the replay applies is written into them
     // by the volume's write boundary (A-197).
     rebuilt.copies_adopted = crate::held_copy::adopt_inherited(state);
-    rebuilt.writes_replayed = replay_writes(state);
+    slices.unit_done().await;
+    rebuilt.writes_replayed = replay_writes(state, slices).await;
   }
   // Hand out prefixes past every recovered one, so a new volume never collides with a recovered
   // volume's inode numbers (the prefixes came from the images, not from `next_prefix`).
   state.next_prefix = max_prefix;
   rebuilt.destroys_completed = complete_recovered_destroys(state);
+  slices.unit_done().await;
   rebuilt.pins_reconciled = reconcile_clone_pins(state);
+  slices.unit_done().await;
   // The recorded snapshot mounts' views, once the volumes and their pins are back (AUD-29-76).
   rebuilt.snapshot_views = crate::snapshot_view::rebuild(state);
   // The held connections' byte states, once the volumes are back and every write since the publication replayed onto
@@ -10154,7 +10170,7 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
 /// Bounded by the catalog's volume count, so a cycle in a corrupt catalog ends.
 fn lineage_depth(state: &ShardState, volume: DbVolumeId) -> usize {
   let partition = state.db.partition();
-  let bound = partition.volumes().len();
+  let bound = partition.volume_count();
   let mut depth = 0;
   let mut at = volume;
   while depth < bound {
@@ -10342,7 +10358,28 @@ fn reconcile_clone_pins(state: &mut ShardState) -> usize {
 /// before the restart. A corrupt chain entry stops the replay there — the green recovers to its last
 /// good version, logged, rather than presenting a wrong later state.
 fn rebuild_green(state: &mut ShardState, record: &VolumeRecord) {
-  let green = match replay_green(state, record.id) {
+  let replayed = replay_green(state, record.id);
+  install_green(state, record, replayed);
+}
+
+/// [`rebuild_green`] in a recovery's slices (§2.6 boot step 2): the same replay, a directory of the held origin or a
+/// chain entry a unit.
+async fn rebuild_green_sliced(
+  state: &mut ShardState,
+  record: &VolumeRecord,
+  slices: &mut crate::recovery_slices::RecoverySlices,
+) {
+  let replayed = replay_green_sliced(state, record.id, slices).await;
+  install_green(state, record, replayed);
+}
+
+/// Installs a replayed green, or fences it with why its replay was refused (AUD-29-18).
+fn install_green(
+  state: &mut ShardState,
+  record: &VolumeRecord,
+  replayed: Result<slates_merge::engine::Green, crate::merge_service::GreenFence>,
+) {
+  let green = match replayed {
     Ok(green) => green,
     Err(fence) => return fence_green(state, record, fence),
   };
@@ -10365,77 +10402,181 @@ fn rebuild_green(state: &mut ShardState, record: &VolumeRecord) {
 
 /// Replays green `id`'s durable origin and chain into a fresh engine (§4.16): every chain entry was an
 /// acknowledged version, so each must decode and be accepted at exactly its own version — version `n` for
-/// the `n`-th entry, over the origin's version 0 — or the replay is refused with the fence naming why
-/// (AUD-29-18). Until 2026-09-30 a corrupt origin installed an empty green, a corrupt entry stopped the replay
-/// and installed the shorter one, and a submit's outcome was not checked at all.
+/// the `n`-th entry after the checkpoint (W3) or over the origin's version 0 — or the replay is refused with the fence
+/// naming why (AUD-29-18). Until 2026-09-30 a corrupt origin installed an empty green, a corrupt entry stopped the
+/// replay and installed the shorter one, and a submit's outcome was not checked at all.
 fn replay_green(
   state: &ShardState,
   id: DbVolumeId,
 ) -> Result<slates_merge::engine::Green, crate::merge_service::GreenFence> {
+  let mut replay = GreenReplay::begin(state, id)?;
+  while !replay.step(state)? {}
+  replay.finish(state)
+}
+
+/// [`replay_green`] in a recovery's slices: the slice may end after any unit.
+async fn replay_green_sliced(
+  state: &ShardState,
+  id: DbVolumeId,
+  slices: &mut crate::recovery_slices::RecoverySlices,
+) -> Result<slates_merge::engine::Green, crate::merge_service::GreenFence> {
+  let mut replay = GreenReplay::begin(state, id)?;
+  while !replay.step(state)? {
+    slices.unit_done().await;
+  }
+  replay.finish(state)
+}
+
+/// A green's replay a unit at a time ([`replay_green`]): its held origin walked a directory a step (A-217), then the
+/// engine restored at its checkpoint (W3) or built over the origin, then its chain an entry a step. Holds no borrow of
+/// the state between steps.
+struct GreenReplay {
+  /// The green replayed.
+  id: DbVolumeId,
+  /// Where the replay is.
+  phase: GreenReplayPhase,
+}
+
+/// Where a [`GreenReplay`] is.
+enum GreenReplayPhase {
+  /// Walking the held origin's base snapshot.
+  Origin(crate::merge_service::HeldWalk),
+  /// Replaying the chain: the engine so far, the version its checkpoint holds (0 with none), and the index of the next
+  /// entry.
+  Chain {
+    green: slates_merge::engine::Green,
+    held: u64,
+    next: usize,
+  },
+}
+
+impl GreenReplay {
+  /// The replay of green `id`: its held origin's walk begun, or its engine built from the origin it records.
+  fn begin(
+    state: &ShardState,
+    id: DbVolumeId,
+  ) -> Result<GreenReplay, crate::merge_service::GreenFence> {
+    use crate::merge_service::GreenFence;
+    let partition = state.db.partition();
+    let phase = match (partition.green_origin_ref(id), partition.green_origin(id)) {
+      // A held origin (A-217) is walked again from its base snapshot, rebuilt before any green, and must give the
+      // origin the green was created from.
+      (Some(held), _) => GreenReplayPhase::Origin(
+        crate::merge_service::HeldWalk::begin(state, held).map_err(held_origin_fence)?,
+      ),
+      (None, Some(bytes)) => chain_phase(
+        state,
+        id,
+        Some(slates_merge::origin::Origin::decode(bytes).map_err(|_| GreenFence::OriginCorrupt)?),
+      )?,
+      (None, None) => chain_phase(state, id, None)?,
+    };
+    Ok(GreenReplay { id, phase })
+  }
+
+  /// One unit: a directory of the held origin, the engine built from the walked origin, or one chain entry submitted
+  /// at its own version. True once the chain is replayed.
+  fn step(&mut self, state: &ShardState) -> Result<bool, crate::merge_service::GreenFence> {
+    use crate::merge_service::GreenFence;
+    match &mut self.phase {
+      GreenReplayPhase::Origin(walk) => {
+        if walk.step(state).map_err(held_origin_fence)? {
+          // The walk is whole: the engine is built from it, the next unit.
+          let placeholder = GreenReplayPhase::Chain {
+            green: slates_merge::engine::Green::new(),
+            held: 0,
+            next: 0,
+          };
+          if let GreenReplayPhase::Origin(walk) = std::mem::replace(&mut self.phase, placeholder) {
+            let origin = walk.finish().map_err(held_origin_fence)?;
+            self.phase = chain_phase(state, self.id, Some(origin))?;
+          }
+        }
+        Ok(false)
+      }
+      GreenReplayPhase::Chain { green, held, next } => {
+        let Some(bytes) = state.db.partition().green_chain(self.id).get(*next) else {
+          return Ok(true);
+        };
+        let version = u64::try_from(*next)
+          .unwrap_or(u64::MAX)
+          .saturating_add(*held)
+          .saturating_add(1);
+        let increment = slates_merge::engine::Increment::decode(bytes)
+          .map_err(|_| GreenFence::EntryCorrupt { version })?;
+        match green.submit(&increment) {
+          slates_merge::engine::Outcome::Accepted { version: accepted } if accepted == version => {}
+          slates_merge::engine::Outcome::Accepted { version: accepted } => {
+            return Err(GreenFence::WrongVersion { version, accepted });
+          }
+          slates_merge::engine::Outcome::Conflict { .. }
+          | slates_merge::engine::Outcome::BaseUnavailable { .. } => {
+            return Err(GreenFence::NotAccepted { version });
+          }
+        }
+        *next = next.saturating_add(1);
+        Ok(false)
+      }
+    }
+  }
+
+  /// The replayed engine, with the shard's rejected-cache budget; `OriginUnavailable` if called before the origin's
+  /// walk was whole (a caller that stopped stepping early).
+  fn finish(
+    self,
+    state: &ShardState,
+  ) -> Result<slates_merge::engine::Green, crate::merge_service::GreenFence> {
+    match self.phase {
+      GreenReplayPhase::Chain { mut green, .. } => {
+        green.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
+        Ok(green)
+      }
+      GreenReplayPhase::Origin(_) => Err(crate::merge_service::GreenFence::OriginUnavailable),
+    }
+  }
+}
+
+/// Green `id`'s engine before its chain, from the origin recovery found (`None` for a green that started from
+/// scratch): a checkpointed green (W3) restored at its checkpoint, so only the increments after it are replayed;
+/// any other built over the origin.
+fn chain_phase(
+  state: &ShardState,
+  id: DbVolumeId,
+  origin: Option<slates_merge::origin::Origin>,
+) -> Result<GreenReplayPhase, crate::merge_service::GreenFence> {
   use crate::merge_service::GreenFence;
-  let origin = recovered_origin(state, id)?;
-  let partition = state.db.partition();
-  // A checkpointed green (W3) is restored at its checkpoint, and only the increments after it are replayed.
-  let (mut green, held) = match partition.green_checkpoint(id) {
+  let (green, held) = match state.db.partition().green_checkpoint(id) {
     Some((held, bytes)) => {
       let checkpoint = slates_merge::checkpoint::Checkpoint::decode(bytes)
         .ok()
         .filter(|checkpoint| checkpoint.version == held)
         .ok_or(GreenFence::CheckpointCorrupt)?;
-      let origin = origin.unwrap_or_default();
       (
-        slates_merge::engine::Green::restore(origin, &checkpoint),
+        slates_merge::engine::Green::restore(origin.unwrap_or_default(), &checkpoint),
         held,
       )
     }
     None => (
-      origin.map_or_else(slates_merge::engine::Green::new, |origin| {
-        slates_merge::engine::Green::with_origin(origin)
-      }),
+      origin.map_or_else(
+        slates_merge::engine::Green::new,
+        slates_merge::engine::Green::with_origin,
+      ),
       0,
     ),
   };
-  for (index, bytes) in partition.green_chain(id).iter().enumerate() {
-    let version = u64::try_from(index)
-      .unwrap_or(u64::MAX)
-      .saturating_add(held)
-      .saturating_add(1);
-    let increment = slates_merge::engine::Increment::decode(bytes)
-      .map_err(|_| GreenFence::EntryCorrupt { version })?;
-    match green.submit(&increment) {
-      slates_merge::engine::Outcome::Accepted { version: accepted } if accepted == version => {}
-      slates_merge::engine::Outcome::Accepted { version: accepted } => {
-        return Err(GreenFence::WrongVersion { version, accepted });
-      }
-      slates_merge::engine::Outcome::Conflict { .. }
-      | slates_merge::engine::Outcome::BaseUnavailable { .. } => {
-        return Err(GreenFence::NotAccepted { version });
-      }
-    }
-  }
-  green.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
-  Ok(green)
+  Ok(GreenReplayPhase::Chain {
+    green,
+    held,
+    next: 0,
+  })
 }
 
-/// Green `id`'s origin as recovery finds it (§4.16): a held origin (A-217) walked again from its base snapshot,
-/// rebuilt before any green, which must give the origin the green was created from; the origin's bytes; or `None`
-/// for a green that started from scratch. A fence when it cannot be had.
-fn recovered_origin(
-  state: &ShardState,
-  id: DbVolumeId,
-) -> Result<Option<slates_merge::origin::Origin>, crate::merge_service::GreenFence> {
-  use crate::merge_service::GreenFence;
-  let partition = state.db.partition();
-  match (partition.green_origin_ref(id), partition.green_origin(id)) {
-    (Some(held), _) => match crate::merge_service::walk_held_origin(state, held) {
-      Ok(origin) => Ok(Some(origin)),
-      Err(Refusal::ContentUnavailable) => Err(GreenFence::OriginCorrupt),
-      Err(_) => Err(GreenFence::OriginUnavailable),
-    },
-    (None, Some(bytes)) => slates_merge::origin::Origin::decode(bytes)
-      .map(Some)
-      .map_err(|_| GreenFence::OriginCorrupt),
-    (None, None) => Ok(None),
+/// The fence a held origin's refused walk puts on its green: `OriginCorrupt` when the walk no longer gives the origin
+/// the green was created from, `OriginUnavailable` when the base is not here to walk.
+fn held_origin_fence(refusal: Refusal) -> crate::merge_service::GreenFence {
+  match refusal {
+    Refusal::ContentUnavailable => crate::merge_service::GreenFence::OriginCorrupt,
+    _ => crate::merge_service::GreenFence::OriginUnavailable,
   }
 }
 
@@ -11639,10 +11780,16 @@ fn clear_write_log(state: &mut ShardState, captured_every_volume: bool, generati
 /// yet replayed back in the log under the new image's stamp — the publication cleared the log, and a crash before
 /// the replay ends must still find them — and is tried once more.
 #[cfg(target_os = "linux")]
-fn replay_writes(state: &mut ShardState) -> usize {
+async fn replay_writes(
+  state: &mut ShardState,
+  slices: &mut crate::recovery_slices::RecoverySlices,
+) -> usize {
   let records = std::mem::take(&mut state.replay);
   let mut replayed: usize = 0;
   for (index, record) in records.iter().enumerate() {
+    if index > 0 {
+      slices.unit_done().await;
+    }
     let mut written = replay_one(state, record);
     if matches!(written, Some(Err(slates_vfs::VfsError::PublishNeeded))) {
       let _ = publish_shard(state);
