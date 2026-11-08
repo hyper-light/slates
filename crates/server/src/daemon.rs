@@ -570,6 +570,14 @@ impl Daemon {
     })
   }
 
+  /// Who this node knows to vote in its region's council now ([`RegionalCouncil::known_voters`]): on a learner, the voters
+  /// its last fetched view named. A one-shot control-shard observation.
+  ///
+  /// [`RegionalCouncil::known_voters`]: slates_cluster::config_group::RegionalCouncil::known_voters
+  pub fn council_known_voters(&self) -> Result<Vec<slates_db::HostId>, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| s.council.known_voters())
+  }
+
   /// The root's committed voter configuration — `Ok(None)` during initialization or a joint change, observed
   /// state kept apart from the typed refusal of an observation the daemon could not make.
   pub fn root_voters(&self) -> Result<Option<Vec<slates_db::register::HostId>>, ObserveError> {

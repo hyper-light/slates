@@ -4582,7 +4582,7 @@ fn direct_contact(state: &ShardState, peer: HostId) -> DirectContact {
     .holds_for(peer, state.fleet.host())
   {
     DirectContact::Holder
-  } else if state.council.is_voter(peer) || state.root.is_voter(peer) {
+  } else if state.council.known_voter(peer) || state.root.is_voter(peer) {
     DirectContact::Voter
   } else if state.council.is_staged(peer) || state.root.is_staged(peer) {
     DirectContact::Staged
