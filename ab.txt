@@ -1586,3 +1586,9 @@ slates daemon: control_shard_capacity = ShardCapacity { tasks: 10593, timers: 10
 slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step and with no CPU progress, or with a window's CPU run (the window is the liveness budget)
 slates daemon: instance fsb-998-1-main serving on 1 shards under the anchor
 ## run 1 of 1 done, 2026-11-08T17:35:41Z
+remote: 
+remote: Create a pull request for 'diag-winfsp-overlap-results-42497704518-profile-x86-reply-5' on GitHub by visiting:        
+remote:      https://github.com/hyper-light/slates/pull/new/diag-winfsp-overlap-results-42497704518-profile-x86-reply-5        
+remote: 
+To https://github.com/hyper-light/slates
+ * [new branch]      4cce0fd32877b8db4ad0a66f90f627cb087d9d41 -> diag-winfsp-overlap-results-42497704518-profile-x86-reply-5
