@@ -63,3 +63,20 @@ After (debug build, adacachy, 2026-11-06): 5 of 5 runs passed, with medians of 2
 slowest answer in any run was 42.7 ms. `merge.inputs_unheld` and `fleet.content.released` stayed at 0 on every node.
 With the nudge alone and the put still made to every candidate, the medians were 3.0 to 85.6 ms, and 1 of 5 runs
 failed at 102.7 ms.
+
+## The test judges in the daemon's terms (2026-11-07)
+
+The failing test first held the median answer under a wall bound of one coordinator period (100 ms). Under load that
+bound measured the machine, not the claim: live-fixes saw a median of 909 ms under 36 spinners on a Mac, where every
+period and every exchange stretch alike. The claim is that an answer does not wait for the coordinator's period, so
+the test now asks the daemon itself.
+
+- The coordinator counts its periods (`MergeShardState::coordinator_period`).
+- The record plane stamps each pending version with the period it first works it in (`PendingMergeRecord::first_period`).
+- When a version places at the quorum, the owner counts it `merge.placed_within_period` if that is the same period, and
+  `merge.placed_after_periods` if a period began first.
+- The test expects every version judged, and most placed within their period.
+
+Red check, with A-235's nudge disabled (the coordinator only sleeps out its period, as before A-235): 1 within, 20
+after, answers about 202 ms each. Green on `4811191a`: 21 within, 0 after, quietly and under two spinners a core
+(4 CPUs, 8 busy loops, 3 of 3 runs, median answers 285 to 342 µs).

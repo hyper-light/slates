@@ -60,6 +60,9 @@ use crate::verbs::{
 /// rest of the daemon is a single line there and a single line at init.
 #[derive(Default)]
 pub struct MergeShardState {
+  /// On the control shard: the coordinator periods run so far (`crate::fleet`'s coordinator counts one a period),
+  /// the clock the record plane stamps each version's first pass with.
+  pub coordinator_period: u64,
   /// The version each green attachment pins, by attachment id (§4.16 "Attachments and versions").
   pub attachments: BTreeMap<u64, PinnedAttachment>,
   /// The merge records this owner shard still owes its candidate holders, by green then version
@@ -1439,6 +1442,13 @@ pub(crate) const MERGE_RECORD_STREAM: u64 = 12;
 /// non-vacuity counter of placed-before-reference.
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 pub(crate) const INPUTS_UNPLACED: &str = "merge.inputs_unplaced";
+/// Counted on the owner for each version placed at the quorum in the same coordinator period the record plane first
+/// worked it (§4.16 "Commit", A-235): its submit's answer did not wait for the coordinator's period.
+pub(crate) const PLACED_WITHIN_PERIOD: &str = "merge.placed_within_period";
+/// Counted on the owner for each version placed at the quorum only after one or more coordinator periods began since
+/// the record plane first worked it: the answer waited for the period (every version before A-235, which put the
+/// inputs at one period and shipped the record at the next).
+pub(crate) const PLACED_AFTER_PERIODS: &str = "merge.placed_after_periods";
 /// Counted on a holder that refused a content put under an injected fault (a test's placement
 /// refusal), so a record's wait is shown to be the refusal's doing.
 /// Format: a refusal name in the daemon's status report.
@@ -1638,6 +1648,9 @@ pub struct PendingMergeRecord {
   pub inputs: Placement,
   /// The record's placement so far (the owner's own hold is counted by the commit).
   pub record: Placement,
+  /// The coordinator period in which the record plane first worked this version (`None` until it has): what
+  /// [`PLACED_WITHIN_PERIOD`] and [`PLACED_AFTER_PERIODS`] are judged from when the version places.
+  pub first_period: Option<u64>,
 }
 
 /// Faults a test injects on a holder (never reachable from the wire): refuse every content put
@@ -1840,6 +1853,7 @@ pub(crate) fn enqueue_record(
         mirror_acked: None,
         ..shape
       },
+      first_period: None,
     },
   );
   nudge_record_plane(state);
@@ -1990,7 +2004,13 @@ pub(crate) enum MergeWork {
 /// version, grouped by version so one dispatch can still reach a quorum. Each candidate appears in
 /// at most one dispatch per green; input placement precedes that version's record. A lagging holder
 /// cannot hold another holder at its own old position (AUD-13).
-pub(crate) fn next_merge_work(state: &mut ShardState, local: HostId) -> Vec<MergeWork> {
+/// Runs in coordinator period `period`: each version this pass works is stamped with the period it was first worked in,
+/// which its placement is judged against ([`PLACED_WITHIN_PERIOD`]).
+pub(crate) fn next_merge_work(
+  state: &mut ShardState,
+  local: HostId,
+  period: u64,
+) -> Vec<MergeWork> {
   let config = state.fleet.configuration().clone();
   let page = archive_page(state);
   let mut work = Vec::new();
@@ -2002,6 +2022,11 @@ pub(crate) fn next_merge_work(state: &mut ShardState, local: HostId) -> Vec<Merg
     };
     pending_green.retarget(&placement);
     let selected = pending_green.next(local);
+    for version in selected.keys() {
+      if let Some(pending) = pending_green.records.get_mut(version) {
+        pending.first_period.get_or_insert(period);
+      }
+    }
     for (version, targets) in selected {
       let Some(pending) = state
         .merge
@@ -2085,10 +2110,12 @@ pub(crate) async fn run_merge_period(
   owner_acceptor: &mut Acceptor,
   in_flight: &mut Vec<Dispatch>,
 ) {
+  // The coordinator period this pass runs in, read on the control shard, where the coordinator counts them.
+  let period = crate::state::with_state(|s| s.merge.coordinator_period).unwrap_or(0);
   let work = call_within(
     origin,
     shard,
-    move |s| next_merge_work(s, local),
+    move |s| next_merge_work(s, local, period),
     crate::daemon::HEARTBEAT_NS,
   )
   .await
@@ -2130,7 +2157,7 @@ pub(crate) async fn run_merge_period(
           targets,
           shape,
           quorum,
-          budget,
+          (budget, period),
         )
         .await
       }
@@ -2232,7 +2259,7 @@ async fn ship_record(
   targets: Vec<HostId>,
   shape: Placement,
   quorum: Quorum,
-  budget: CommitBudget,
+  (budget, period): (CommitBudget, u64),
 ) -> Option<Dispatch> {
   let holders = take_sessions("fleet.lent_to.ship_record", |host| targets.contains(&host));
   if holders.is_empty() {
@@ -2263,7 +2290,7 @@ async fn ship_record(
     Err(_) => return Some(dispatch),
   };
   crate::xshard::run_on_counted(origin, shard, move |s| {
-    record_merge_acks(s, local, object, version, placement, quorum);
+    record_merge_acks_in(s, local, object, version, placement, quorum, period);
   });
   Some(dispatch)
 }
@@ -2303,6 +2330,38 @@ pub(crate) fn greens_placed_on_current_cohort(state: &ShardState) -> bool {
 /// Merges a round's acknowledgements into the version's pending record (never overwriting them: each
 /// holder's acceptance is durable there), marks the version placed once the quorum holds, and drops
 /// the entry once every remote candidate acknowledged it.
+/// [`record_merge_acks`] for acknowledgements gathered in coordinator period `period`: a version they newly place is
+/// counted [`PLACED_WITHIN_PERIOD`] when the record plane first worked it in that same period, else
+/// [`PLACED_AFTER_PERIODS`] (§4.16 "Commit", A-235: an answer that waited for the coordinator's period).
+fn record_merge_acks_in(
+  state: &mut ShardState,
+  local: HostId,
+  object: ObjectId,
+  version: u64,
+  placement: Placement,
+  quorum: Quorum,
+  period: u64,
+) {
+  let before = state
+    .merge
+    .pending
+    .get(&object)
+    .and_then(|pending_green| pending_green.records.get(&version))
+    .map(|pending| (pending.record.placed(quorum), pending.first_period));
+  record_merge_acks(state, local, object, version, placement, quorum);
+  if let Some((false, first)) = before
+    && placed_version(state, object).is_some_and(|placed| placed >= version)
+  {
+    let waited = period.saturating_sub(first.unwrap_or(period));
+    let counter = if waited == 0 {
+      PLACED_WITHIN_PERIOD
+    } else {
+      PLACED_AFTER_PERIODS
+    };
+    state.count(counter, 1);
+  }
+}
+
 fn record_merge_acks(
   state: &mut ShardState,
   local: HostId,
@@ -2874,6 +2933,7 @@ mod tests {
         mirror_acked: None,
         joint: Vec::new(),
       },
+      first_period: None,
     };
     assert_eq!(
       record_targets(&pending, &[second, third], quorum),
@@ -2923,6 +2983,7 @@ mod tests {
               mirror_acked: None,
               joint: Vec::new(),
             },
+            first_period: None,
           },
         );
       }
@@ -2941,7 +3002,7 @@ mod tests {
         quorum,
       );
       let shipments = |state: &mut ShardState| {
-        next_merge_work(state, local)
+        next_merge_work(state, local, 0)
           .into_iter()
           .filter_map(|work| match work {
             MergeWork::Ship {
