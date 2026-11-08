@@ -3968,6 +3968,11 @@ const DISCOVERY_UNBOUNDED: &str = "fleet.discovery.unbounded";
 /// A record session returned to a slot that no longer expects it — a retired peer's, a slot re-established
 /// since, or a session other than the one borrowed — dropped rather than installed over a newer one.
 const LINK_STALE_RETURN: &str = "fleet.link.stale_return";
+
+/// Counter: a borrowed record session returned reset by its peer (A-261, `EndpointError::PeerReset`: the peer restarted
+/// under the same identity and no longer holds it), its link dropped so the link task dials the new process.
+/// Format: a counter name in the daemon's status report.
+const LINK_PEER_RESET: &str = "fleet.link.peer_reset";
 /// Why a campaign's round did not ask a voter ([`take_campaign_sessions`]), counted per voter per round: no
 /// record link to it (never established, or removed at its retirement), its session lent to a coordinator
 /// dispatch, or its session held by the link task itself (a discovery page, or a dial after one ended). So a
@@ -7473,12 +7478,20 @@ pub(crate) fn take_sessions(
 /// one the borrow was tagged with. Anything else is a late return — a peer retired meanwhile (its entry
 /// removed by its link task), a slot the link task re-established since (holding a newer session, or
 /// lending it), or a session other than the one borrowed — dropped and counted (`fleet.link.stale_return`),
-/// never installed over a newer session.
+/// never installed over a newer session. A session its peer reset (A-261) is never put back: its link is dropped, so the
+/// link task dials the peer's new process at its next pace rather than lending a dead session to every later borrower
+/// (a restarted primary's client node forwarded into one for 25 to 135 s, loadtest-scale 2026-11-08).
 pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
   state::with_state(|s| {
     for (host, mut endpoint) in sessions {
       let returned = endpoint.connection_id().ok();
       match s.record_sessions.get_mut(&host) {
+        Some(link)
+          if link.endpoint.is_none() && link.borrowed == returned && endpoint.peer_reset() =>
+        {
+          s.record_sessions.remove(&host);
+          s.count(LINK_PEER_RESET, 1);
+        }
         Some(link) if link.endpoint.is_none() && link.borrowed == returned => {
           link.last_seen = Some(crate::state::RecordLink::seen(host, &endpoint));
           link.endpoint = Some(endpoint);

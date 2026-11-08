@@ -18792,3 +18792,86 @@ Applied in the same change to:
   `a_dialer_ignores_a_close_no_one_sealed` (red with a dialer that believed any close-shaped datagram), and the sealed
   close's hostile-input tests in `flight.rs`.
 
+
+### A-261 — Stateless reset: a node restarted under its identity ends its peers' old sessions within a round trip (accepted 2026-11-08)
+
+On loadtest-scale's f = 1 primary-kill rung (2026-11-08), a primary restarted under the same member id. The client
+node's record session to it stayed in its slot, lent and dead, for 25 to 135 s: nothing told the client node that the
+process at the other end no longer held the session. The transport had no stateless reset (RFC 9000 §10.3). A
+restarted node's demultiplexer dropped every packet naming a session it did not hold, counted (`unknown_id`) and
+otherwise silent.
+
+- **The key** is HKDF-SHA256 over the node's identity's private key, salted and labelled for this use alone
+  (`reset::ResetKey`, `Identity::reset_key`). It is secret because only the node holds that key. It is never derived
+  from the certificate: every peer sees the certificate, so a key derived from it would let any peer forge a reset and
+  end any session.
+  - **The same identity must make the same tokens.** A restarted process holds no state for its old sessions. To end
+    them it has to recompute their tokens from what survives the restart, which is the identity and not the boot
+    (§10.3.2: "an endpoint that loses state can use the same method to generate a valid stateless reset token").
+  - **A new identity must not.** It is another node, and a node that could end another node's sessions could end
+    anyone's.
+- **The token** is HMAC-SHA256 of the session's connection id under that key, truncated to 16 bytes (§10.3.2). Each
+  session has one id, which both ends derive from the TLS exporter and which never changes. So each session has one
+  token, and connection ids (NEW_CONNECTION_ID, §19.15) are not needed first.
+- **Only the accepting end issues a token, and only inside the encrypted session.**
+  - It sends a `ResetToken` frame (kind 12) once the session's id is bound. The frame is ack-eliciting and retransmitted
+    until acknowledged.
+  - A token is unforgeable only because it never travels outside the encrypted session. So the dialer takes a token
+    only from that frame. A token sent to an accepting end, or a second token unlike the first, is a protocol
+    violation: it is counted, and the first token is kept.
+  - It is not a transport parameter, as §18.2's server token is: the id comes from the exporter, which exists only once
+    the handshake is done.
+  - A dialer issues no token. A restarted dialer comes back on another ephemeral port, so its peer's packets for the
+    old session reach a port that nothing holds, and nothing could answer them with a reset. §18.2 likewise lets only a
+    server issue a token in its parameters.
+- **Compatibility.** The frame goes only to a peer that states transport parameter 3 (`ID_READS_RESET_TOKENS`). An
+  older peer skips that parameter (§7.4.2) and is never sent a frame kind it would refuse. Dialect 2 is unchanged, so
+  mixed builds still talk during a rolling upgrade.
+- **The reset is sent by the demultiplexer.** It answers a 1-RTT packet that names no session, from a source with no
+  session there, with a datagram shaped as a short header. The datagram is unpredictable except for its last 16 bytes,
+  the token (§10.3), and its length obeys three bounds:
+  - it is shorter than its trigger (§10.3.3), so two endpoints cannot loop resets;
+  - it is at least 21 bytes, so a trigger of 21 bytes or fewer draws none;
+  - it is at most 43 bytes, at least the 41 below which a reset might be told from a short packet.
+
+  Three limits govern when it is sent:
+  - **No reset to a source that has a session there.** A dialer's first 1-RTT packet can outrun the binding of its new
+    id, and a reset then would end a session about to exist.
+  - **At most one reset per source per initial probe timeout (666 ms).** The first packet draws a reset at once; the
+    interval bounds only a lost reset's repeat and a flood.
+  - **The table of sources answered is no larger than the session pool.**
+- **The dialer detects it.** When a datagram cannot be opened as the session's packet, its tail is compared with the
+  held token in constant time (§10.3.1). A match ends the session `EndpointError::PeerReset`, and every later use
+  refuses the same. A tail that matches nothing is discarded like any other stray.
+  - Detection sits in the dialing endpoint, not the demultiplexer, because the reset reaches the dialer's own socket.
+  - The demultiplexer needs no table of tokens. The accepting sessions behind it never hold one, for the reason above.
+  - This departs from the design as first read (detection in the demultiplexer against a per-source table).
+- **The fleet** never puts a reset session back in its slot (`fleet::return_sessions`). It drops the link instead,
+  counted as `fleet.link.peer_reset`, and the link task dials the new process at its next pace (one heartbeat). Every
+  borrower returns through that one place: the forward lane, live shipping and the coordinator's dispatches.
+  loadtest-scale's lane-side check (the peer's generation changed) stays as the backstop for a lost reset, for a peer
+  restarted under another identity, and for an older build.
+- **What it does not cover.** An accepting end whose dialer restarted holds a session no reset can end. The dialer came
+  back on another port, so that session ends on its own timers or the link's discovery deadline, as before.
+- **If the transport moves to `quinn-proto`** (`docs/wip/transport-quic.md`), its stateless reset replaces the frame,
+  the demultiplexer's sending and the endpoint's detection. The key's derivation and the fleet's handling stay.
+
+Applied in the same change to:
+- `crates/transport/src/reset.rs` (new): the key, the token, the datagram and its detection.
+- `crates/transport/src/session.rs`: `Frame::ResetToken`.
+- `crates/transport/src/params.rs`: `ID_READS_RESET_TOKENS`.
+- `crates/transport/src/connection.rs`: `issue_reset_token`, `peer_reset_token`, and the frame's receipt and resend.
+- `crates/transport/src/endpoint.rs`: `EndpointError::PeerReset`, the issuing, the detection, `peer_reset` and
+  `holds_reset_token`.
+- `crates/transport/src/demux.rs`: `reset_unknown`, `resets_sent` and `resets_withheld`.
+- `crates/transport/src/handshake.rs`: `Identity::reset_key`.
+- `crates/server/src/fleet.rs`: `return_sessions` and `fleet.link.peer_reset`.
+- Bug record `docs/bugs/2026-11-08-a-restarted-node-left-its-peers-sessions-to-it-in-place.md`; GAPS.
+- Tests, each red-checked:
+  - `crates/transport/tests/stateless_reset.rs`: `a_session_with_a_restarted_node_ends_within_a_round_trip` (10.0 ms
+    against a 10 ms round trip through the relay), `a_reset_from_another_identity_is_ignored`,
+    `a_node_resets_only_a_stranger_at_most_once_per_interval_and_shorter_than_it_sent`, and
+    `the_reset_key_is_the_private_keys_not_the_certificates`.
+  - The reset, frame, parameter and connection unit tests.
+  - The process test, loadtest-scale's case: `a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process`
+    (`crates/server/tests/fleet.rs`).

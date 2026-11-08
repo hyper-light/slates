@@ -145,6 +145,14 @@ pub enum Frame {
   /// frame (`crate::pmtud`), its packet padded to the size under test. Never retransmitted — a lost probe
   /// is an answer, not data to recover.
   Ping,
+  /// The token a stateless reset of this session ends in (RFC 9000 §10.3; `crate::reset`, A-261): sent once by the
+  /// accepting end, inside the encrypted session, so only its peer learns it, and only to a peer whose parameters say
+  /// it reads this frame (`crate::params`). Ack-eliciting and retransmitted on loss, so the dialer holds it before a
+  /// restart of the accepting end can strand it.
+  ResetToken {
+    /// The token: a stateless reset of this session ends in these bytes.
+    token: crate::reset::ResetToken,
+  },
 }
 
 /// Format: a `Stream` frame's bytes before its data — kind (1), stream id (8), offset (8), flags (1),
@@ -161,6 +169,8 @@ const ONE_WORD_FRAME_BYTES: usize = 1 + 8;
 const TWO_WORD_FRAME_BYTES: usize = 1 + 8 + 8;
 /// Format: a `Ping` frame's bytes (the kind alone).
 const PING_FRAME_BYTES: usize = 1;
+/// Format: a `ResetToken` frame's bytes — kind (1), token (16).
+const RESET_TOKEN_FRAME_BYTES: usize = 1 + crate::reset::RESET_TOKEN_BYTES;
 
 impl Frame {
   /// The bytes this frame encodes to — exactly the length [`encode_frames`] writes for it, so a packet is
@@ -181,6 +191,7 @@ impl Frame {
         TWO_WORD_FRAME_BYTES
       }
       Frame::Ping => PING_FRAME_BYTES,
+      Frame::ResetToken { .. } => RESET_TOKEN_FRAME_BYTES,
     }
   }
 }
@@ -211,6 +222,9 @@ const KIND_STREAM_DATA_BLOCKED: u8 = 9;
 const KIND_STREAMS_BLOCKED: u8 = 10;
 /// Format: the ping frame kind (RFC 9000 §19.2 `PING`), added with dialect 2 (`crate::params`).
 const KIND_PING: u8 = 11;
+/// Format: the reset-token frame kind (`crate::reset`, A-261), sent only to a peer that declared it reads it
+/// (`crate::params::ID_READS_RESET_TOKENS`), so dialect 2 is unchanged for a peer that did not.
+const KIND_RESET_TOKEN: u8 = 12;
 
 /// Format: the `Stream` frame's `fin` flag bit; every other bit of the flags byte must be zero.
 const STREAM_FIN: u8 = 0b0000_0001;
@@ -291,6 +305,10 @@ impl Frame {
         out.extend_from_slice(&limit.to_le_bytes());
       }
       Frame::Ping => out.push(KIND_PING),
+      Frame::ResetToken { token } => {
+        out.push(KIND_RESET_TOKEN);
+        out.extend_from_slice(token);
+      }
     }
   }
 }
@@ -383,6 +401,13 @@ pub fn decode_frames(bytes: &[u8]) -> Result<Vec<Frame>, SessionError> {
         limit: reader.u64().map_err(|_| SessionError::Truncated)?,
       },
       KIND_PING => Frame::Ping,
+      KIND_RESET_TOKEN => Frame::ResetToken {
+        token: reader
+          .bytes(crate::reset::RESET_TOKEN_BYTES)
+          .ok()
+          .and_then(|bytes| crate::reset::ResetToken::try_from(bytes).ok())
+          .ok_or(SessionError::Truncated)?,
+      },
       other => return Err(SessionError::UnknownFrame(other)),
     };
     frames.push(frame);
@@ -431,6 +456,7 @@ mod tests {
         stream_id: 11,
         limit: 4096,
       },
+      Frame::ResetToken { token: [0xA5; 16] },
     ]
   }
 
@@ -538,6 +564,12 @@ mod tests {
       }]),
       vec![9, 6, 0, 0, 0, 0, 0, 0, 0, 4, 3, 0, 0, 0, 0, 0, 0]
     );
+    // ResetToken: kind 12, then the sixteen token bytes as they are.
+    let token: crate::reset::ResetToken =
+      core::array::from_fn(|index| u8::try_from(index).unwrap_or(0));
+    let mut golden = vec![12];
+    golden.extend(0..16u8);
+    assert_eq!(encode_frames(&[Frame::ResetToken { token }]), golden);
     // PADDING is a single zero byte the decoder consumes with no frame produced.
     assert_eq!(decode_frames(&[0]), Ok(Vec::new()));
   }
@@ -586,6 +618,20 @@ mod tests {
         decode_frames(&stop[..cut]),
         Err(SessionError::Truncated),
         "stop cut at {cut}"
+      );
+    }
+  }
+
+  /// Hostile input, A-261: a reset-token frame cut anywhere before its sixteenth token byte is a typed truncation,
+  /// never a short token.
+  #[test]
+  fn a_truncated_reset_token_frame_refuses() {
+    let token = encode_frames(&[Frame::ResetToken { token: [0x5A; 16] }]);
+    for cut in 1..token.len() {
+      assert_eq!(
+        decode_frames(&token[..cut]),
+        Err(SessionError::Truncated),
+        "reset token cut at {cut}"
       );
     }
   }

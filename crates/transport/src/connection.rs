@@ -326,8 +326,14 @@ pub struct Connection {
   /// Received packets discarded as duplicates of a packet number already processed (RFC 9000 §12.3).
   duplicates: u64,
   /// Stream frames the peer sent in breach of flow control or a stream's final size (RFC 9000 §4.1,
-  /// §4.5), dropped and counted.
+  /// §4.5), dropped and counted; and reset tokens sent where none belongs ([`Connection::on_reset_token`]).
   violations: u64,
+  /// The token the peer's stateless resets of this session end in (`crate::reset`, A-261), from its first
+  /// `ResetToken` frame: learned only inside the session, so only the peer could have sent a datagram ending in it.
+  peer_reset_token: Option<crate::reset::ResetToken>,
+  /// Whether this end's `ResetToken` was sent and not yet acknowledged: a lost copy is resent only while it is, so a
+  /// packet declared lost after another copy was acknowledged sends it no more.
+  reset_token_owed: bool,
   /// Streams this end has reset whose `ResetStream` the peer has not yet acknowledged — owed to the peer
   /// as much as unacknowledged stream data is (the peer is waiting on the stream until it learns).
   resets_owed: std::collections::BTreeSet<u64>,
@@ -446,6 +452,8 @@ impl Connection {
       sent_acks: BTreeMap::new(),
       duplicates: 0,
       violations: 0,
+      peer_reset_token: None,
+      reset_token_owed: false,
       resets_owed: std::collections::BTreeSet::new(),
       probe_copies: VecDeque::new(),
       probe_copy_pending: false,
@@ -1271,6 +1279,10 @@ impl Connection {
         }
         // A path-MTU probe asks only to be acknowledged (`crate::pmtud`).
         Frame::Ping => ack_eliciting = true,
+        Frame::ResetToken { token } => {
+          ack_eliciting = true;
+          self.on_reset_token(*token);
+        }
         Frame::StopSending { stream_id } => {
           ack_eliciting = true;
           // RFC 9000 §3.5: a STOP_SENDING is answered by resetting the stream (a peer's stream not yet
@@ -1555,6 +1567,8 @@ impl Connection {
         .is_some_and(|offsets| offsets.contains(offset)),
       // A reset another copy already had acknowledged is not resent.
       Frame::ResetStream { stream_id, .. } => self.resets_owed.contains(stream_id),
+      // Nor is a reset token another copy already had acknowledged.
+      Frame::ResetToken { .. } => self.reset_token_owed,
       // A blocked report is resent only while the sender is still blocked at the same limit.
       Frame::DataBlocked { limit } => {
         *limit == self.peer_max_data && self.connection_credit_blocked()
@@ -1580,6 +1594,7 @@ impl Connection {
         Frame::ResetStream { stream_id, .. } => {
           self.resets_owed.remove(stream_id);
         }
+        Frame::ResetToken { .. } => self.reset_token_owed = false,
         // A blocked report the peer has acknowledged while this end is still blocked at the same limit is
         // re-armed: its answering credit may have been lost, so the next poll reports again (at most once
         // per round trip) until the credit rises.
@@ -1949,6 +1964,37 @@ impl Connection {
     self.stops
   }
 
+  /// Sends `token`, the token this end's stateless resets of the session end in (`crate::reset`, A-261), to the
+  /// peer once: queued with the stream control frames, so it leaves in the next packet, elicits an acknowledgement
+  /// and is retransmitted until acknowledged.
+  pub fn issue_reset_token(&mut self, token: crate::reset::ResetToken) {
+    self.reset_token_owed = true;
+    self.control.push_back(Frame::ResetToken { token });
+  }
+
+  /// The token the peer's stateless resets of this session end in, once its `ResetToken` frame arrived.
+  pub fn peer_reset_token(&self) -> Option<crate::reset::ResetToken> {
+    self.peer_reset_token
+  }
+
+  /// A-261: the peer's reset token, kept from its first frame. Only a dialer is sent one: only the accepting end's
+  /// address outlives its restart (a dialer comes back on another port), as RFC 9000 §18.2 has only a server send a
+  /// token in its parameters. The token is a function of the session and the sender's identity, so a token sent to
+  /// an accepting end, or a second token unlike the first, is a protocol violation, counted, and the first kept.
+  fn on_reset_token(&mut self, token: crate::reset::ResetToken) {
+    let violation = match (self.role(), self.peer_reset_token) {
+      (Role::Server, _) => true,
+      (Role::Client, None) => {
+        self.peer_reset_token = Some(token);
+        false
+      }
+      (Role::Client, Some(held)) => held != token,
+    };
+    if violation {
+      self.violations = self.violations.saturating_add(1);
+    }
+  }
+
   /// The role this end plays (which stream ids it opens).
   pub fn role(&self) -> Role {
     self.streams.role()
@@ -1994,7 +2040,8 @@ impl Connection {
     self.retransmitted
   }
 
-  /// How many stream frames the peer sent in breach of flow control or a final size (dropped).
+  /// How many stream frames the peer sent in breach of flow control or a final size (dropped), and reset tokens
+  /// sent where none belongs.
   pub fn protocol_violations(&self) -> u64 {
     self.violations
   }
@@ -2570,6 +2617,65 @@ mod tests {
     );
     assert!(sender.poll_transmit(0, FRAME_CAP).is_none());
     assert_eq!(sender.retransmitted(), retransmitted_before);
+  }
+
+  /// A-261: the accepting end's reset token reaches its dialer even when the packet that first carried it is lost:
+  /// it is ack-eliciting and retransmitted, and once acknowledged it is sent no more. Do: issue a token at the
+  /// accepting end, lose its first packet, let the probe timer fire, deliver the resend, return the acknowledgement.
+  /// Expect: the dialer holds the token, the resend counted, and nothing more is sent, not even when the lost first
+  /// copy is declared lost after the resend was acknowledged.
+  #[test]
+  fn a_reset_token_lost_once_reaches_the_dialer() {
+    let token: crate::reset::ResetToken = [0x3C; crate::reset::RESET_TOKEN_BYTES];
+    let mut accepting = fixed(FRAME_CAP, Role::Server);
+    let mut dialer = fixed(FRAME_CAP, Role::Client);
+    accepting.issue_reset_token(token);
+    let (_lost, frames) = accepting
+      .poll_transmit(0, FRAME_CAP)
+      .expect("the token leaves");
+    assert_eq!(frames, vec![Frame::ResetToken { token }]);
+    let due = accepting.next_timeout().expect("a probe timer runs for it");
+    accepting.on_timeout(due);
+    let (pn, frames) = accepting
+      .poll_transmit(due, FRAME_CAP)
+      .expect("the lost token is sent again");
+    assert!(frames.contains(&Frame::ResetToken { token }), "{frames:?}");
+    assert!(accepting.retransmitted() >= 1, "the resend path ran");
+    dialer.handle_incoming(due, pn, &frames);
+    assert_eq!(dialer.peer_reset_token(), Some(token));
+    let (ack_pn, ack) = dialer
+      .poll_transmit(due, FRAME_CAP)
+      .expect("the token elicits an acknowledgement");
+    accepting.handle_incoming(due, ack_pn, &ack);
+    assert_eq!(accepting.in_flight_count(), 0, "nothing of it is owed");
+    let after = accepting.poll_transmit(due, FRAME_CAP);
+    assert!(after.is_none(), "{after:?}");
+    assert_eq!(dialer.protocol_violations(), 0);
+  }
+
+  /// Hostile input, A-261: a token sent to an accepting end, or a second token unlike the first, is a protocol
+  /// violation, counted, and never replaces the token held. Do: hand an accepting end a token, and a dialer two.
+  /// Expect: the accepting end holds none, the dialer the first, one violation each; a repeat of the first is no
+  /// violation (a retransmit).
+  #[test]
+  fn a_misplaced_or_changed_reset_token_is_a_violation() {
+    let first = [1u8; crate::reset::RESET_TOKEN_BYTES];
+    let second = [2u8; crate::reset::RESET_TOKEN_BYTES];
+    let mut accepting = fixed(FRAME_CAP, Role::Server);
+    accepting.handle_incoming(0, 0, &[Frame::ResetToken { token: first }]);
+    assert_eq!(accepting.peer_reset_token(), None);
+    assert_eq!(accepting.protocol_violations(), 1);
+    let mut dialer = fixed(FRAME_CAP, Role::Client);
+    dialer.handle_incoming(0, 0, &[Frame::ResetToken { token: first }]);
+    dialer.handle_incoming(0, 1, &[Frame::ResetToken { token: first }]);
+    assert_eq!(
+      dialer.protocol_violations(),
+      0,
+      "a retransmit of the same token"
+    );
+    dialer.handle_incoming(0, 2, &[Frame::ResetToken { token: second }]);
+    assert_eq!(dialer.peer_reset_token(), Some(first));
+    assert_eq!(dialer.protocol_violations(), 1);
   }
 
   /// AC (§4.10a §8, RFC 9000 §12.3): a packet whose number was already processed is discarded — its
