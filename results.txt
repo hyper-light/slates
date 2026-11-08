@@ -1,0 +1,7 @@
+tested 4608ee7aa623b64143552b566757e69b21367185 variant after on x86_64, 4 cpus
+admitted exit 0 105s
+  admitted: b: clients_per_shard 2583 slots 32 shards 2 tasks_per_shard 10344 lane bound 165312; 647 clients x 32 forwards
+  admitted: 20704 of 20704 answered: 20600 served, 0 Overloaded, the last 36.125594889s after the hold; control tasks refused 0
+admitted-again exit 0 42s
+  admitted-again: b: clients_per_shard 2583 slots 32 shards 2 tasks_per_shard 10344 lane bound 165312; 647 clients x 32 forwards
+  admitted-again: 20704 of 20704 answered: 20600 served, 0 Overloaded, the last 37.519647312s after the hold; control tasks refused 0
